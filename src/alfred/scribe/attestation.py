@@ -17,6 +17,15 @@ present + pinned on synthetic records; real clinician-auth wiring is deferred.
     record's creator (no self-attestation). Auto-attestation by the pipeline is
     structurally impossible — the drafter identity is refused as an attester.
 
+⚠️ NOT-YET-WIRED — false-coverage warning (P1-c review). The P1-b vault scope
+gate ``stayc_clinical_attest_only`` is a field-NAME allowlist ONLY. It does NOT
+enforce the forward-only status lifecycle or the distinct-attester identity
+check — those are HERE, in :func:`authorize_attestation`, which is NOT yet
+wired. The pipeline (P2) MUST route every clinical_note status/attested_by
+write (create AND edit) through :func:`authorize_attestation`; the scope
+field-allowlist is necessary but NOT sufficient. Do not mistake that gate for
+attestation enforcement.
+
 Observability (intentionally-left-blank): every authorization decision emits a
 ``scribe.attestation`` event (``authorized`` + ``reason`` + from/to status) so
 a refused attestation is distinguishable from an idle pipeline.
@@ -96,7 +105,8 @@ def validate_attester(
     Args:
         attester: the identity performing the attestation.
         creator: the identity that created the ai_draft (the scribe drafter in
-            the normal flow). ``attester`` must differ from it.
+            the normal flow). REQUIRED non-empty (fail-closed — see the
+            ``creator_missing`` check); ``attester`` must differ from it.
         clinician_ids: the designated-clinician allowlist. ``attester`` must be
             in it. Fail-closed: an empty allowlist refuses everyone (no real
             clinician-auth is wired in P1-c — the mechanism is present + pinned).
@@ -115,7 +125,21 @@ def validate_attester(
             f"attest — attestation requires a distinct human clinician. "
             f"Auto-attestation by the pipeline is structurally forbidden.",
         )
-    if creator and a == creator.strip():
+    # NOTE-2 fail-closed hardening (P1-c review): REQUIRE a non-empty creator.
+    # A medico-legal self-attest guard must not be disable-able by omitting the
+    # creator — the old ``if creator and a == creator`` short-circuited the
+    # equality check when creator was empty/None/blank, silently skipping the
+    # self-attest refusal. Fail closed: no creator => no attestation.
+    c = (creator or "").strip()
+    if not c:
+        raise AttestationError(
+            "creator_missing",
+            "a non-empty draft-creator identity is required — the "
+            "self-attestation guard must not be disable-able by omitting the "
+            "creator. A clinical_note records who drafted it; attestation "
+            "cannot proceed without it.",
+        )
+    if a == c:
         raise AttestationError(
             "self_attest",
             "the attester must differ from the draft creator — the identity "

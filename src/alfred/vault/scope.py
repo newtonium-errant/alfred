@@ -2083,6 +2083,15 @@ def check_scope(
         return
 
     if permission == "stayc_clinical_attest_only":
+        # ⚠️ FALSE-COVERAGE WARNING (P1-c review). This is a field-NAME
+        # allowlist ONLY. It does NOT enforce the forward-only status
+        # lifecycle or the distinct-attester identity check — those are in
+        # scribe.authorize_attestation, which is NOT yet wired. The pipeline
+        # (P2) MUST route every clinical_note status/attested_by write (create
+        # AND edit) through scribe.authorize_attestation; the scope
+        # field-allowlist is necessary but NOT sufficient. Do not mistake this
+        # gate for attestation enforcement.
+        #
         # Sovereign ambient-scribe ATTEST gate (scribe P1-b). The clinical
         # note CONTENT is frozen after draft; the ONLY thing an edit may do is
         # flip the attest metadata (a clinician reviews the AI draft and

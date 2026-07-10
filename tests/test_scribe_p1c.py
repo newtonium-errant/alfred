@@ -211,6 +211,28 @@ def test_empty_attester_refused():
     assert exc.value.reason == "attester_missing"
 
 
+@pytest.mark.parametrize("bad_creator", ["", "   ", None])
+def test_empty_creator_fail_closed(bad_creator):
+    # NOTE-2 hardening (mutation pin): a medico-legal self-attest guard must
+    # not be disable-able by passing an empty creator — the old
+    # ``if creator and ...`` short-circuit skipped the self-attest check when
+    # creator was blank. Fail closed: empty/None/blank creator => refuse.
+    with pytest.raises(AttestationError) as exc:
+        validate_attester(
+            attester="dr_synthetic", creator=bad_creator, clinician_ids=_CLINICIANS,
+        )
+    assert exc.value.reason == "creator_missing"
+
+
+def test_authorize_attestation_refuses_empty_creator():
+    with pytest.raises(AttestationError) as exc:
+        authorize_attestation(
+            current_status=STATUS_AI_DRAFT, new_status=STATUS_ATTESTED,
+            attester="dr_synthetic", creator="", clinician_ids=_CLINICIANS,
+        )
+    assert exc.value.reason == "creator_missing"
+
+
 def test_empty_clinician_allowlist_refuses_everyone():
     # Fail-closed: no designated clinicians => no attester passes.
     with pytest.raises(AttestationError):
