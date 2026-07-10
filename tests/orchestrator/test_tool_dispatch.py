@@ -68,6 +68,10 @@ EXPECTED_TOOLS = {
     # routing message-records into per-project inboxes. Auto-starts on
     # instances with ``message_bus.enabled: true`` (KAL-LE the broker).
     "message_bus",
+    # STAY-C sovereign scribe (scribe P1-d) — the sovereign clinical slot
+    # standup. Auto-starts on a ``scribe:`` block; boundary-enforced +
+    # guard-armed in its own process. Idle-ready, no audio pipeline yet (P2).
+    "scribe",
 }
 
 TWO_ARG_TOOLS = {
@@ -81,6 +85,7 @@ TWO_ARG_TOOLS = {
     "ticket_forward",
     "fix_drafter",
     "message_bus",
+    "scribe",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 

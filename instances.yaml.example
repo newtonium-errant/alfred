@@ -37,3 +37,17 @@ instances:
     display: Hypatia
     config: ./config.hypatia.yaml
     enabled: true
+  # STAY-C — sovereign ambient clinical scribe (scribe P1-d).
+  #
+  # ⚠️ enabled: false ON PURPOSE. STAY-C must NOT be started via the shared
+  # ``alfred instance up`` fan-out: that fan-out inherits the caller's shell
+  # env (which normally holds cloud keys for Salem/KAL-LE) and does NOT scrub
+  # it — so STAY-C would hit barrier (c) and fail-close (exit 79). The row is
+  # here for visibility; START STAY-C with its dedicated cloud-key-SCRUBBED
+  # wrapper (see the header of config.stayc-clinical.yaml):
+  #   env -u ANTHROPIC_API_KEY -u ... -u RESEND_API_KEY \
+  #       alfred --config /data/algernon/stayc-clinical/config.stayc-clinical.yaml up
+  - name: stayc-clinical
+    display: STAY-C
+    config: /data/algernon/stayc-clinical/config.stayc-clinical.yaml
+    enabled: false

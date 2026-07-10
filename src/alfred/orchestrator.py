@@ -409,6 +409,40 @@ def _run_surveyor(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(daemon.run())
 
 
+def _run_scribe(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Sovereign scribe daemon process entry point (scribe P1-d).
+
+    The STAY-C slot standup: boundary-enforced + guard-armed + idle-ready, no
+    audio pipeline (P2). Re-validates the sovereign boundary AND self-installs
+    the SovereignHttpGuard in THIS process (a spawn-launched child does not
+    inherit the run_all parent gate/guard — the daemon self-check is the real
+    per-process coverage). A boundary breach exits ``_SOVEREIGN_BREACH_EXIT``
+    (79) — NON-RESTARTABLE: the orchestrator refuses to re-enter a
+    cloud-reachable state.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/scribe.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    # Reuse brief's setup_logging — same signature; the scribe module has no
+    # utils.py of its own yet (mirrors the mail webhook borrow).
+    from alfred.brief.utils import setup_logging
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
+    from alfred.scribe.daemon import run as scribe_run
+    from alfred.sovereign import SovereignBoundaryError
+    try:
+        asyncio.run(scribe_run(raw, suppress_stdout=suppress_stdout))
+    except SovereignBoundaryError as e:
+        import structlog
+        structlog.get_logger(__name__).error(
+            "scribe.daemon.sovereign_breach_abort",
+            reason=e.reason,
+            detail=e.detail,
+            exit_code=_SOVEREIGN_BREACH_EXIT,
+        )
+        sys.exit(_SOVEREIGN_BREACH_EXIT)
+
+
 def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Mail webhook receiver process entry point.
 
@@ -1075,6 +1109,7 @@ TOOL_RUNNERS = {
     "friction_analyzer": _run_friction_analyzer,
     "cloudflared": _run_cloudflared,
     "routine": _run_routine,
+    "scribe": _run_scribe,
 }
 
 
@@ -1163,6 +1198,11 @@ SPAWN_PRIORITY: tuple[str, ...] = (
     "digest",
     "radar_day",
     "friction_analyzer",
+    # STAY-C sovereign scribe (scribe P1-d) — batch tier: an idle-ready
+    # sovereign slot with no input pipeline yet (P2), nothing latency-sensitive
+    # at boot. Slots last. Auto-starts on a ``scribe:`` block; boundary-enforced
+    # + guard-armed in its own process.
+    "scribe",
 )
 
 
@@ -1263,6 +1303,12 @@ def run_all(
         # bot shouldn't have a daemon spinning in a retry loop on 78 exits.
         if "telegram" in raw:
             tools.append("talker")
+        # STAY-C sovereign scribe (scribe P1-d) auto-starts on a ``scribe:``
+        # block. The daemon self-requires sovereign:{enabled:true} and refuses
+        # to boot without it (exit 79) — so a stray scribe block on a
+        # non-sovereign instance fail-closes rather than running unguarded.
+        if "scribe" in raw:
+            tools.append("scribe")
         # Instructor auto-starts when ``instructor:`` is in config.
         # Without the section, the daemon has no Anthropic API key to
         # work with and would spin in a retry loop on every directive.
@@ -1441,7 +1487,7 @@ def run_all(
         # ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` in
         # ``tests/orchestrator/test_tool_dispatch.py`` so a missing
         # entry trips a test rather than a TypeError on first spawn.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "ticket_forward", "fix_drafter", "message_bus", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "ticket_forward", "fix_drafter", "message_bus", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine", "scribe"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

@@ -1,0 +1,97 @@
+# STAY-C — sovereign ambient clinical scribe (Jamie's NP-clinic instance)
+#
+# This is the REPO TEMPLATE (``.example``). Per-instance ``config.*.yaml`` are
+# gitignored (they hold deploy-specific paths); at deploy, copy this to the box
+# path referenced by the launch wrapper below:
+#   /data/algernon/stayc-clinical/config.stayc-clinical.yaml
+#
+# scribe P1-d — the "STAY-C exists as a running sovereign instance" standup.
+# On-box, LOCAL-MODEL-ONLY: local STT (faster-whisper) + local LLM (qwen via
+# Ollama on loopback). This instance is PROVABLY unable to reach any cloud
+# STT/TTS/LLM — the sovereign no-egress boundary (P1-a) is enforced at load
+# and re-checked + http-guard-armed in the scribe daemon's own process.
+#
+# 🔒 FAIL-CLOSED / NO SECRETS. STAY-C needs ZERO secret keys — it is local-only.
+# This config contains ONLY the barrier-(d) allowlisted top-level sections
+# {instance, sovereign, scribe, vault, logging, daemon} (+ the synthetic
+# _config_path stamped at load). There is NO `agent`, NO `transport`, NO
+# `telegram`/`brief`/`mail`, NO cloud key, and NO ${...CLOUD_KEY} placeholder.
+# Adding any non-allowlisted section makes the sovereign boundary REFUSE at
+# load (exit 79, non-restartable). No transport section => NO network server
+# binds => no port is needed.
+#
+# ── LAUNCH (cloud-key-SCRUBBED — the wrapper IS the sovereign guarantee) ──
+# Launch STAY-C DIRECTLY with a scrubbed env, NOT via `alfred instance up`
+# (the fan-out does not scrub the shell env):
+#
+#   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+#       -u GROQ_API_KEY -u DEEPGRAM_API_KEY -u OPENAI_API_KEY \
+#       -u OPENROUTER_API_KEY -u ELEVENLABS_API_KEY -u TOGETHER_API_KEY \
+#       -u ZO_API_KEY -u RESEND_API_KEY \
+#       alfred --config /data/algernon/stayc-clinical/config.stayc-clinical.yaml up
+#
+# Belt AND braces: the scrubbed env (env -u) removes cloud keys from the shell,
+# AND there is no cloud-key sibling .env at /data/algernon/stayc-clinical/ to
+# re-introduce them. Barrier (c) refuses at load if either fails.
+#
+# P1-d is the STANDUP only — the daemon boots in synthetic mode, validates the
+# boundary, arms the http guard, emits `scribe.daemon.up`, and sits idle-ready.
+# The audio→note pipeline is P2. `scribe.mode: synthetic` is the fail-closed
+# legal line: the pipeline refuses any input without a `synthetic: true`
+# provenance tag; flipping to `clinical` is a single deliberate edit gated on
+# the legal de-id/attestation standard.
+
+# ---------------------------------------------------------------------------
+# Instance identity — templating/attribution only, no network surface.
+# ---------------------------------------------------------------------------
+instance:
+  name: "STAY-C"
+  canonical: "STAY-C"
+  aliases: ["Stacy", "Stay-C"]
+
+# ---------------------------------------------------------------------------
+# Sovereign no-egress boundary — THE enablement gate. Presence + enabled:true
+# arms the four-barrier gate at load AND the scribe daemon's self-check +
+# http-guard self-install.
+# ---------------------------------------------------------------------------
+sovereign:
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# Scribe — local STT + local LLM. Barrier (a) validates stt.provider is on the
+# local allowlist {faster-whisper, local-whisper, fake}; barrier (b) validates
+# llm.base_url resolves to loopback. LOCAL-ONLY: no api_key, no cloud endpoint.
+# ---------------------------------------------------------------------------
+scribe:
+  mode: synthetic          # FAIL-CLOSED default; flip to `clinical` (legal gate) is the LAST switch
+  input_dir: "/data/algernon/stayc-clinical/inbox"
+  stt:
+    provider: faster-whisper
+    model: distil-large-v3
+  llm:
+    base_url: "http://127.0.0.1:11434"     # loopback Ollama — barrier (b) enforced
+    model: "qwen2.5:14b-instruct-q4_K_M"
+
+# ---------------------------------------------------------------------------
+# Vault — STAY-C's OWN PHI vault, physically separate from every other vault
+# (Salem / KAL-LE / Hypatia / VERA). clinical_note records land here and NEVER
+# leave the box (schema._NEVER_PUSH_TYPES + no transport wired).
+# ---------------------------------------------------------------------------
+vault:
+  path: "/data/algernon/stayc-clinical/vault"
+  dont_scan_dirs: ["_bases", ".obsidian"]
+  dont_index_dirs: []
+  ignore_files: [".gitkeep"]
+
+# ---------------------------------------------------------------------------
+# Logging — the scribe daemon logs to <dir>/scribe.log.
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  dir: "/data/algernon/stayc-clinical/data"
+
+# ---------------------------------------------------------------------------
+# Daemon — PID file location (filesystem only, per-instance collision-avoid).
+# ---------------------------------------------------------------------------
+daemon:
+  pid_path: "/data/algernon/stayc-clinical/data/alfred.pid"
