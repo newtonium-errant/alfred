@@ -59,6 +59,7 @@ never adds, removes, or "fixes" a claim.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -97,7 +98,33 @@ _DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
 #     Only the NATIVE /api/chat ``options`` block honors num_ctx.
 #   * temperature=0: faithfulness-critical extract-not-infer task — remove the
 #     nondeterminism the model's default temperature adds.
-_NOTEGEN_OLLAMA_OPTIONS: dict = {"num_ctx": 8192, "temperature": 0}
+#   * num_predict=2048: bound the model's OUTPUT explicitly (scribe P3-b2) so
+#     the reserved output window is a KNOWN quantity the context-budget guard
+#     can subtract — an unbounded num_predict lets a long generation collide
+#     with the prompt inside num_ctx.
+_NOTEGEN_OLLAMA_OPTIONS: dict = {"num_ctx": 8192, "temperature": 0, "num_predict": 2048}
+
+# --- context-budget guard (scribe P3-b2, full-regen fail-loud cap) -----------
+# The checkpoint co-pilot re-generates the note from the FULL accumulated
+# transcript each checkpoint. A long encounter can grow past what fits in
+# num_ctx alongside the system prompt + the reserved output window. A silent
+# overflow makes Ollama TRUNCATE the prompt → earlier segments' findings vanish
+# from the regen → a note that looks complete but dropped content. The operator
+# chose FAIL-LOUD over silent truncation: estimate the prompt size BEFORE the
+# call and, if it will not fit, REFUSE (raise) so the last-good draft stays.
+#
+# Estimator is deliberately CONSERVATIVE (over-estimates tokens → fails early
+# rather than late): ~3.5 chars/token. The rendered prompt string already
+# includes each segment's ``S## [x-y s]: `` header, so counting its characters
+# captures the per-segment header overhead without a separate per-segment add.
+_CHARS_PER_TOKEN = 3.5
+_OUTPUT_RESERVE_TOKENS = 2048   # == num_predict — the reserved generation window
+_BUDGET_SAFETY_MARGIN = 512     # slack for tokenizer variance vs the char estimate
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative (over-estimating) token count for ``text`` — ceil(chars/3.5)."""
+    return math.ceil(len(text) / _CHARS_PER_TOKEN)
 
 # The clinical extract-not-infer system prompt (scribe P2-c). Authored to the
 # FROZEN CONTRACT above: the model emits EXACTLY the four-SOAP-section JSON object
@@ -279,6 +306,14 @@ class NoteGenError(Exception):
     PHI-derived, safe only on the transport-less sovereign box)."""
 
 
+class ContextBudgetExceeded(NoteGenError):
+    """The rendered prompt would not fit in num_ctx alongside the system prompt +
+    the reserved output window (scribe P3-b2). Raised BEFORE the Ollama call so a
+    silently-truncated regen never reaches the draft — the LAST GOOD draft stays
+    intact. The checkpoint caller treats this as a CAP (skip this checkpoint's
+    update, keep folding later chunks), not a failure."""
+
+
 @dataclass
 class Claim:
     """One SOAP claim + its segment citations. Per the frozen contract each
@@ -434,6 +469,32 @@ async def generate_structured(
     prompt = build_prompt(transcript)
     endpoint = (config.llm.base_url or "").strip() or _DEFAULT_ENDPOINT
     model = (config.llm.model or "").strip() or _DEFAULT_MODEL
+
+    # PRE-FLIGHT CONTEXT-BUDGET GUARD (scribe P3-b2) — fire BEFORE the Ollama
+    # call so a silently-truncated regen never reaches the draft. The system
+    # prompt is measured DYNAMICALLY (never a hardcoded token count that drifts
+    # when the prompt is edited).
+    num_ctx = int(_NOTEGEN_OLLAMA_OPTIONS.get("num_ctx", 8192))
+    sys_tokens = _estimate_tokens(SYSTEM_PROMPT)
+    prompt_tokens = _estimate_tokens(prompt)
+    budget = num_ctx - sys_tokens - _OUTPUT_RESERVE_TOKENS - _BUDGET_SAFETY_MARGIN
+    if prompt_tokens > budget:
+        log.warning(
+            "scribe.notegen.context_budget_exceeded",
+            source_id=transcript.source_id,          # opaque encounter id (NOTE-4)
+            est_tokens=prompt_tokens,
+            budget=budget,
+            num_ctx=num_ctx,
+            segment_count=len(transcript.segments),
+        )
+        raise ContextBudgetExceeded(
+            f"note-gen prompt (~{prompt_tokens} tok, "
+            f"{len(transcript.segments)} segments) exceeds the context budget "
+            f"({budget} tok = num_ctx {num_ctx} − system {sys_tokens} − output "
+            f"{_OUTPUT_RESERVE_TOKENS} − margin {_BUDGET_SAFETY_MARGIN}). "
+            f"Refusing to regen — a truncated regen would silently drop earlier "
+            f"segments' findings; the last-good draft stays intact."
+        )
 
     text, _meta = await call_ollama_no_tools(
         prompt,

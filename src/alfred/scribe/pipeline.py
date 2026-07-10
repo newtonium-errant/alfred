@@ -51,13 +51,17 @@ from alfred.scribe.grounding import verify as verify_grounding
 from alfred.scribe.identity import compute_encounter_id
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
 from alfred.scribe.notegen import (
+    ContextBudgetExceeded,
     StructuredNote,
     generate_structured,
     render_soap,
 )
 from alfred.scribe.state import (
+    STATE_BUDGET_CAPPED,
     STATE_DRAFTED,
     STATE_FAILED,
+    STATE_HUMAN_EDITED,
+    STATE_READY,
     STATE_REFUSED,
     STATE_STRUCTURING,
     STATE_TRANSCRIBING,
@@ -490,25 +494,179 @@ def accumulate_encounter(
     return result
 
 
+# --- P3-b2 checkpoint note-gen trigger --------------------------------------
+
+# checkpoint outcome → run_sweep counts key (outcomes not present = no count).
+_CHECKPOINT_COUNT_KEY = {
+    "drafted": "checkpoint_drafted",
+    "budget_capped": "budget_capped",
+    "human_edited": "human_edited",
+    "ready": "ready",
+    "attested_refused": "checkpoint_refused",
+}
+
+
+def _body_sha(body: str) -> str:
+    """sha256 of a note body — the clobber-detect fingerprint. Irreversible, so
+    PHI-FREE: safe to persist in the PHI-free ScribeState."""
+    return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
+
+async def _regen_checkpoint(
+    encounter_dir: Path, *, encounter_id: str, config: ScribeConfig,
+    state: ScribeState, vault_path: Path,
+) -> str:
+    """FULL-REGEN the ai_draft from the ACCUMULATED transcript, guarded by
+    clobber-detect (before) + the context-budget cap (inside generate). Returns
+    an outcome tag: ``drafted`` / ``budget_capped`` / ``human_edited`` /
+    ``attested_refused`` / ``noop``."""
+    transcript = ledger_mod.load_ledger(
+        ledger_mod.ledger_path(encounter_dir, encounter_id)
+    )
+    if transcript is None or not transcript.segments:
+        return "noop"                    # nothing to draft yet
+
+    title = f"Encounter {encounter_id}"  # STABLE across checkpoints (opaque id)
+    prior = state.get(encounter_id)
+    note_path = prior.note_path if prior else ""
+
+    # CLOBBER-DETECT — before ANY write, compare the on-disk body sha against the
+    # sha the pipeline recorded on its LAST write. Differ ⇒ a human edited the
+    # draft ⇒ FREEZE (never clobber a clinician correction — the load-bearing
+    # guard). Also short-circuit an already-sealed note (defense before regen).
+    if note_path:
+        try:
+            rec = vault_read(vault_path, note_path)
+        except VaultError:
+            note_path = ""               # note vanished → treat as first-draft
+        else:
+            status = (rec.get("frontmatter") or {}).get("status")
+            if status in ("attested", "amended"):
+                log.warning(
+                    "scribe.pipeline.checkpoint_refused_sealed",
+                    encounter_id=encounter_id, status=status,
+                )
+                return "attested_refused"
+            on_disk = _body_sha(rec.get("body", ""))
+            if prior and prior.pipeline_body_sha and on_disk != prior.pipeline_body_sha:
+                state.set(encounter_id, state=STATE_HUMAN_EDITED)
+                log.warning(
+                    "scribe.pipeline.human_edit_detected",
+                    encounter_id=encounter_id,
+                    detail="on-disk body differs from the last pipeline write — "
+                           "auto-evolution FROZEN, operator opt-in required to resume",
+                )
+                return "human_edited"
+
+    # FULL-REGEN — the budget guard fires INSIDE generate_structured BEFORE the
+    # LLM call, so an over-budget checkpoint never reaches body_replace and the
+    # last-good draft stays intact.
+    try:
+        vnote = await generate_verified_note(transcript, config=config, title=title)
+    except ContextBudgetExceeded:
+        state.set(encounter_id, state=STATE_BUDGET_CAPPED)
+        log.warning(
+            "scribe.pipeline.budget_capped",
+            encounter_id=encounter_id,
+            segment_count=len(transcript.segments),
+            detail="regen over context budget — last-good draft intact; encounter "
+                   "CAPPED (complete through the prior checkpoint), still folding",
+        )
+        return "budget_capped"
+
+    # UPDATE-IN-PLACE (P3-a create-or-update: create on the first checkpoint,
+    # body_replace after; refuse if the draft was sealed mid-flight).
+    try:
+        new_path = _create_ai_draft(vault_path, title, encounter_id, config, vnote)
+    except VaultError as e:
+        if "SEALED" in str(e):
+            log.warning(
+                "scribe.pipeline.checkpoint_refused_sealed",
+                encounter_id=encounter_id,
+            )
+            return "attested_refused"
+        raise
+    # Record the sha of the ACTUAL on-disk body (post-write) so the next
+    # checkpoint's clobber-detect compares like-for-like. note_path + sha are set
+    # in ONE state.set — no window where a path is stored without its sha.
+    written = vault_read(vault_path, new_path)
+    state.set(
+        encounter_id, state=STATE_DRAFTED, note_path=new_path,
+        pipeline_body_sha=_body_sha(written.get("body", "")),
+    )
+    log.info(
+        "scribe.pipeline.checkpoint_drafted",
+        encounter_id=encounter_id,
+        segment_count=len(transcript.segments),
+        grounding_flags=vnote.flag_count,
+    )
+    return "drafted"
+
+
+async def checkpoint_encounter(
+    encounter_dir: Path, *, encounter_id: str, config: ScribeConfig,
+    state: ScribeState, vault_path: Path, did_fold: bool, closed: bool,
+) -> str:
+    """The checkpoint trigger (scribe P3-b2). After P3-b1 folds a chunk, evolve
+    the ai_draft in place; the ``_CLOSED`` sentinel finalizes to a ``ready``
+    state (close does NOT attest — attest stays orchestrator-only). A
+    ``human_edited`` encounter is SKIPPED: the ledger keeps accumulating but the
+    draft is never auto-touched until the operator opts in."""
+    prior = state.get(encounter_id)
+    if prior and prior.state == STATE_HUMAN_EDITED:
+        log.info(
+            "scribe.pipeline.checkpoint_frozen",
+            encounter_id=encounter_id, reason="human_edited",
+        )
+        return "human_edited_frozen"
+
+    outcome = "noop"
+    if did_fold:
+        outcome = await _regen_checkpoint(
+            encounter_dir, encounter_id=encounter_id, config=config,
+            state=state, vault_path=vault_path,
+        )
+
+    # _CLOSED finalize — promote ONLY a clean current draft to `ready`. A capped
+    # / frozen / refused encounter keeps its distinct state (the draft is not the
+    # full transcript, or is awaiting opt-in) — close does not paper over that.
+    if closed:
+        cur = state.get(encounter_id)
+        if cur and cur.state == STATE_DRAFTED:
+            state.set(encounter_id, state=STATE_READY)
+            log.info(
+                "scribe.pipeline.encounter_ready",
+                encounter_id=encounter_id,
+                detail="_CLOSED — draft complete, ready for attestation "
+                       "(attest stays orchestrator-only)",
+            )
+            outcome = "ready"
+    return outcome
+
+
 async def run_sweep(
     config: ScribeConfig, state: ScribeState, vault_path: Path,
 ) -> dict[str, int]:
     """Scan input_dir once. Walks BOTH legacy flat files (P2 one-shot back-comp)
-    AND one level of per-encounter subdirs (P3-b1 checkpoint accumulator). The
-    P2 ``iterdir()+is_file()`` SILENTLY SKIPPED subdirs — this fixes that.
+    AND one level of per-encounter subdirs (P3-b1 accumulator + P3-b2 checkpoint
+    note-gen). The P2 ``iterdir()+is_file()`` SILENTLY SKIPPED subdirs.
 
     Intentionally-left-blank: emits ``scribe.pipeline.idle`` (ran, nothing to do)
     when the sweep produced no new work — so idle is distinguishable from broken
     — and ``scribe.pipeline.swept`` with counts when it did.
 
-    P3-b1 FOUNDATION: subdir encounters ACCUMULATE into their transcript ledger
-    only; the note-gen trigger from the accumulated ledger is P3-b2.
+    P3-b2: each subdir encounter ACCUMULATES settled chunks into its ledger, then
+    a checkpoint EVOLVES the ai_draft in place from the full accumulated
+    transcript (guarded by clobber-detect + the context-budget cap).
     """
     input_dir = Path(config.input_dir)
     counts = {
         "scanned": 0, "drafted": 0, "refused": 0, "failed": 0, "skipped": 0,
         "encounters": 0, "chunks_folded": 0, "held": 0, "frozen": 0,
         "chunks_refused": 0,
+        # P3-b2 checkpoint outcomes
+        "checkpoint_drafted": 0, "budget_capped": 0, "human_edited": 0,
+        "ready": 0, "checkpoint_refused": 0,
     }
 
     if not input_dir.is_dir():
@@ -537,7 +695,7 @@ async def run_sweep(
         )
         counts[outcome] = counts.get(outcome, 0) + 1
 
-    # (2) per-encounter checkpoint accumulator (P3-b1 — NO note-gen trigger yet).
+    # (2) per-encounter accumulate (P3-b1 fold) → checkpoint (P3-b2 note-gen).
     for enc_dir in subdirs:
         r = accumulate_encounter(enc_dir, config=config)
         counts["encounters"] += 1
@@ -545,9 +703,24 @@ async def run_sweep(
         counts["held"] += r.held
         counts["chunks_refused"] += r.refused
         counts["frozen"] += 1 if r.frozen else 0
+        # Checkpoint trigger — evolve the draft when a chunk folded, and finalize
+        # on _CLOSED. (No fold + not closed ⇒ nothing to do; don't call.)
+        if r.folded > 0 or r.closed:
+            outcome = await checkpoint_encounter(
+                enc_dir, encounter_id=r.encounter_id, config=config,
+                state=state, vault_path=vault_path,
+                did_fold=r.folded > 0, closed=r.closed,
+            )
+            key = _CHECKPOINT_COUNT_KEY.get(outcome)
+            if key:
+                counts[key] += 1
 
     flat_work = counts["drafted"] + counts["refused"] + counts["failed"]
-    acc_work = counts["chunks_folded"] + counts["frozen"] + counts["chunks_refused"]
+    acc_work = (
+        counts["chunks_folded"] + counts["frozen"] + counts["chunks_refused"]
+        + counts["checkpoint_drafted"] + counts["budget_capped"]
+        + counts["human_edited"] + counts["ready"] + counts["checkpoint_refused"]
+    )
     if flat_work == 0 and acc_work == 0:
         log.info(
             "scribe.pipeline.idle",

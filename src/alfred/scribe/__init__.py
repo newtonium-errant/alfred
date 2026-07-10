@@ -42,6 +42,7 @@ from .notegen import (
     REASONING_NOT_STATED,
     SOAP_SECTIONS,
     Claim,
+    ContextBudgetExceeded,
     NoteGenError,
     StructuredNote,
     generate_structured,
@@ -67,6 +68,7 @@ from .pipeline import (  # noqa: E402
     AccumResult,
     VerifiedNote,
     accumulate_encounter,
+    checkpoint_encounter,
     generate_verified_note,
     is_chunk_settled,
     process_source,
@@ -74,8 +76,11 @@ from .pipeline import (  # noqa: E402
 )
 from .state import (  # noqa: E402
     STATE_ATTESTED,
+    STATE_BUDGET_CAPPED,
     STATE_DRAFTED,
     STATE_FAILED,
+    STATE_HUMAN_EDITED,
+    STATE_READY,
     STATE_RECORDED,
     STATE_REFUSED,
     STATE_STRUCTURING,
@@ -135,6 +140,7 @@ __all__ = [
     "StructuredNote",
     "Claim",
     "NoteGenError",
+    "ContextBudgetExceeded",
     "SOAP_SECTIONS",
     "NOT_ADDRESSED",
     "REASONING_NOT_STATED",
@@ -147,6 +153,8 @@ __all__ = [
     "VerifiedNote",
     "process_source",
     "run_sweep",
+    # checkpoint co-pilot (P3-b2)
+    "checkpoint_encounter",
     "ScribeState",
     "SourceState",
     "STATE_RECORDED",
@@ -156,4 +164,7 @@ __all__ = [
     "STATE_ATTESTED",
     "STATE_REFUSED",
     "STATE_FAILED",
+    "STATE_BUDGET_CAPPED",
+    "STATE_HUMAN_EDITED",
+    "STATE_READY",
 ]

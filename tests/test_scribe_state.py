@@ -78,8 +78,12 @@ def test_is_done_gate():
 
 def test_state_field_is_phi_free_by_shape():
     # The SourceState shape carries NO free-text — only ids, a state enum, a
-    # derived path, an int, and an exception CLASS name. NOTE-4 by construction.
+    # derived path, an int, an exception CLASS name, and a body sha256 (P3-b2
+    # clobber-detect: an IRREVERSIBLE hash, not the body text). NOTE-4 by
+    # construction. Widening this set is a deliberate contract change — update
+    # this pin in the same commit (pre-commit checklist #6).
     fields = set(SourceState.__dataclass_fields__)
     assert fields == {
-        "source_id", "state", "note_path", "attempts", "last_error_class", "updated_at",
+        "source_id", "state", "note_path", "attempts", "last_error_class",
+        "updated_at", "pipeline_body_sha",
     }

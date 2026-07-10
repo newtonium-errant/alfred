@@ -38,9 +38,18 @@ STATE_DRAFTED = "drafted"
 STATE_ATTESTED = "attested"
 STATE_REFUSED = "refused"   # non-synthetic input rejected by the mode gate
 STATE_FAILED = "failed"     # mid-pipeline exception (retriable until the cap)
+# --- P3-b2 checkpoint co-pilot states ---------------------------------------
+STATE_BUDGET_CAPPED = "budget_capped"   # regen over context budget; last-good draft kept, still folding
+STATE_HUMAN_EDITED = "human_edited"     # a human edited the draft; auto-evolution FROZEN (opt-in to resume)
+STATE_READY = "ready"                   # _CLOSED: draft complete, ready for attestation (attest stays orchestrator-only)
 
-# Success/terminal states — never reprocessed.
-_DONE_STATES = frozenset({STATE_DRAFTED, STATE_ATTESTED, STATE_REFUSED})
+# Success/terminal states — never reprocessed by the flat one-shot path.
+# NOTE: the checkpoint (subdir) path does NOT gate on this — it makes its own
+# state decisions (a ``budget_capped`` encounter keeps FOLDING; a ``ready`` one
+# is finalized). ``budget_capped`` / ``human_edited`` are deliberately NOT
+# "done": the encounter is still live (folding / awaiting operator opt-in), just
+# not auto-drafting this checkpoint.
+_DONE_STATES = frozenset({STATE_DRAFTED, STATE_ATTESTED, STATE_REFUSED, STATE_READY})
 
 # A failed source is retried until it has been attempted this many times, then
 # it becomes terminal (skipped, logged) to bound the retry loop.
@@ -55,6 +64,12 @@ class SourceState:
     attempts: int = 0
     last_error_class: str = ""   # exception CLASS name only — NEVER PHI
     updated_at: str = ""
+    # P3-b2 clobber-detect: sha256 of the note BODY as the pipeline last WROTE
+    # it (re-read from disk after the write). A HASH — PHI-FREE (irreversible),
+    # NOT the body text. The checkpoint compares the on-disk body's sha against
+    # this before body_replace: a mismatch means a HUMAN edited the draft →
+    # freeze auto-evolution rather than clobber a clinician correction.
+    pipeline_body_sha: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SourceState":
