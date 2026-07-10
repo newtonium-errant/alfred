@@ -289,3 +289,60 @@ def test_note3_pipeline_has_no_subprocess_or_claude_p():
     assert "subprocess." not in code
     assert "claude_subprocess_env" not in code
     assert "claude" not in code  # no claude anything in the code body
+
+
+# ---------------------------------------------------------------------------
+# _create_ai_draft — the crash-window already-exists recovery branch
+# (functionally correct but was untested + STRING-PARSE-COUPLED to the
+# VaultError message; pin the current behavior so a message-format change
+# can't silently break the idempotent resume).
+# ---------------------------------------------------------------------------
+
+def test_create_ai_draft_recovers_on_already_exists(tmp_path, monkeypatch):
+    # Crash-window: a prior run created the note but crashed before persisting
+    # DRAFTED → the resume hits VaultError("File already exists: <path>"),
+    # recovers the path, and treats it as drafted (no duplicate note).
+    from alfred.vault.ops import VaultError
+
+    def _raise_exists(*a, **k):
+        raise VaultError("File already exists: clinical_note/Encounter x.md")
+
+    monkeypatch.setattr(pipeline_mod, "vault_create", _raise_exists)
+    vnote = pipeline_mod.VerifiedNote(body="b", grounding_flags=[], flag_count=0)
+    path = pipeline_mod._create_ai_draft(
+        tmp_path / "vault", "Encounter x", "x", _config(), vnote,
+    )
+    # the rel_path is recovered from the message (STRING-PARSE-COUPLED — pinned)
+    assert path == "clinical_note/Encounter x.md"
+
+
+def test_create_ai_draft_reraises_other_vaulterror(tmp_path, monkeypatch):
+    # A VaultError that is NOT the already-exists case must PROPAGATE (fail-
+    # closed) — never silently swallowed as a spurious "drafted".
+    from alfred.vault.ops import VaultError
+
+    def _raise_other(*a, **k):
+        raise VaultError("some other validation error")
+
+    monkeypatch.setattr(pipeline_mod, "vault_create", _raise_other)
+    vnote = pipeline_mod.VerifiedNote(body="b", grounding_flags=[], flag_count=0)
+    with pytest.raises(VaultError):
+        pipeline_mod._create_ai_draft(tmp_path / "vault", "t", "x", _config(), vnote)
+
+
+def test_process_source_recovers_drafted_on_crash_window(tmp_path, monkeypatch):
+    # End-to-end crash-window: process_source that hits already-exists still
+    # reaches DRAFTED (idempotent resume — no re-raise, no partial/failed state).
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake_ollama_returning(_CANNED_CLEAN))
+    from alfred.vault.ops import VaultError
+
+    def _raise_exists(*a, **k):
+        raise VaultError("File already exists: clinical_note/Encounter enc1.wav.md")
+
+    monkeypatch.setattr(pipeline_mod, "vault_create", _raise_exists)
+    input_dir = tmp_path / "inbox"
+    audio = _drop_input(input_dir)
+    state = ScribeState(tmp_path / "state.json")
+    outcome = asyncio.run(process_source(audio, config=_config(), state=state, vault_path=tmp_path / "vault"))
+    assert outcome == "drafted"
+    assert state.get("enc1.wav").state == STATE_DRAFTED

@@ -9,6 +9,7 @@ and the barrier-d allowlist over the real template.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -18,7 +19,7 @@ import yaml
 
 from alfred.orchestrator import _MISSING_DEPS_EXIT, _SOVEREIGN_BREACH_EXIT, _run_scribe
 from alfred.scribe import SCRIBE_MODE_SYNTHETIC, load_from_unified
-from alfred.scribe.daemon import startup
+from alfred.scribe.daemon import _state_path, run as scribe_run, startup
 from alfred.sovereign import (
     CLOUD_KEY_ENV_VARS,
     SOVEREIGN_ALLOWED_SECTIONS,
@@ -194,3 +195,53 @@ def test_config_template_mutation_non_allowlisted_section_refused():
     with pytest.raises(SovereignBoundaryError) as exc:
         validate_sovereign_boundary(raw, env={})
     assert exc.value.reason == "barrier_d"
+
+
+# ---------------------------------------------------------------------------
+# run() WIRING — the assembly seam the P2-d suite missed (production BLOCK:
+# a missing `from pathlib import Path` made daemon.run() DOA at NameError).
+# ---------------------------------------------------------------------------
+
+def test_state_path_builds_under_logging_dir():
+    # Direct, cheap pin — _state_path uses Path (the missing import).
+    assert _state_path({"logging": {"dir": "/data/x"}}, None) == "/data/x/scribe_state.json"
+    # default when logging.dir absent
+    assert _state_path({}, None).endswith("scribe_state.json")
+
+
+class _StopLoop(BaseException):
+    """A one-shot sentinel to break run()'s infinite loop. BaseException so the
+    loop's ``except Exception`` does not swallow it."""
+
+
+def test_run_wires_state_path_and_enters_loop_without_nameerror(tmp_path, monkeypatch):
+    # Exercises the run() ASSEMBLY SEAM: startup() → _state_path() →
+    # ScribeState() → run_sweep(). Before the fix, _state_path()'s bare Path
+    # raised NameError here (the daemon was DOA). This reaches run_sweep, proving
+    # the wiring holds.
+    #
+    # MUTATION-BIND: remove `from pathlib import Path` from daemon.py and this
+    # test goes RED — run() raises NameError from _state_path() before
+    # run_sweep is ever reached, so pytest.raises(_StopLoop) fails.
+    seen = {}
+
+    async def _one_shot(config, state, vault_path):
+        seen["state_type"] = type(state).__name__
+        seen["vault_path_type"] = type(vault_path).__name__
+        raise _StopLoop
+
+    import alfred.scribe.pipeline as pl
+    monkeypatch.setattr(pl, "run_sweep", _one_shot)
+
+    raw = _sovereign_raw(
+        logging={"dir": str(tmp_path)},
+        vault={"path": str(tmp_path / "vault")},
+    )
+    with pytest.raises(_StopLoop):
+        asyncio.run(scribe_run(raw, env={}))
+
+    # run() built ScribeState + a Path vault_path and entered the sweep loop.
+    assert seen["state_type"] == "ScribeState"
+    assert seen["vault_path_type"] == "PosixPath"
+    # the state file path was under logging.dir (no NameError building it)
+    assert (tmp_path / "scribe_state.json") == Path(_state_path(raw, None))
