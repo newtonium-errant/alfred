@@ -84,6 +84,18 @@ from alfred.scribe.transcript import Transcript
 
 log = structlog.get_logger(__name__)
 
+
+class GroundingIntegrityError(Exception):
+    """The transcript itself is structurally corrupt — DUPLICATE segment ids.
+
+    Raised FAIL-CLOSED by :func:`verify` before the ``{id: segment}`` map is
+    built. A duplicate id would make the map silently last-wins overwrite, so a
+    claim citing ``[S3]`` could be grounded against the WRONG ``S3`` — passing
+    grounding CLEAN against text it never cited. That silent mis-grounding is the
+    exact medico-legal failure this system exists to prevent, so a corrupt
+    transcript is refused outright rather than verified.
+    """
+
 # Number+unit (dose / vital / measurement). Word-final unit boundary.
 _UNIT = (
     r"(?:mg|mcg|g|kg|ml|l|units?|iu|%|mmhg|bpm|cm|mm|/min|/day|/week|/hr|c|f)"
@@ -264,6 +276,18 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
     :class:`GroundingResult` (no mutation of the claim objects — ``render_soap``
     reads flags via ``GroundingResult.flag_for``, so a note can never be
     rendered without the grounding result)."""
+    # FAIL-CLOSED integrity gate (scribe P3-b1) — refuse a transcript with
+    # DUPLICATE segment ids BEFORE building the {id: segment} map. Last-wins map
+    # overwrite would ground a claim against the wrong same-id segment and pass
+    # clean. Mutation-bound: remove this and a dup-id transcript verifies clean.
+    ids = [s.id for s in transcript.segments]
+    if len(set(ids)) != len(ids):
+        dupes = sorted({sid for sid in ids if ids.count(sid) > 1})
+        raise GroundingIntegrityError(
+            f"transcript has duplicate segment ids {dupes} — refusing to verify "
+            f"(a same-id collision silently grounds claims against the wrong "
+            f"segment). Segment count={len(ids)}, unique={len(set(ids))}."
+        )
     seg_by_id = {s.id: s for s in transcript.segments}
     result = GroundingResult()
 

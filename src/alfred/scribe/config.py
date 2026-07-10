@@ -87,6 +87,18 @@ class ScribeConfig:
     # refused (attester_not_clinician) until the operator populates it. The
     # scribe.attest orchestrator passes this to authorize_attestation.
     clinicians: list[str] = field(default_factory=list)
+    # Per-instance SECRET that salts the opaque encounter_id (scribe P3-b1). The
+    # id is ``"enc-" + hmac_sha256(encounter_salt, raw_label)[:16]`` — an UNsalted
+    # sha256 of a low-entropy patient label is trivially reversible, so the salt
+    # is what makes the opaque id non-reversible (defeats the P2 synthetic-label
+    # leak). SECRET by construction: it is NEVER written to the vault, a log, or
+    # the attest audit. FAIL-LOUD (not fail-closed-silent) the moment an
+    # encounter_id is computed with an empty salt — a sovereign clinical scribe
+    # cannot safely opaque PHI labels without it (see
+    # ``identity.compute_encounter_id`` + ``feedback_hardcoding_and_alfred_naming``
+    # fail-loud-on-missing-name). Set via ``${SCRIBE_ENCOUNTER_SALT}`` (env
+    # substitution runs on this block), never inline in a committed config.
+    encounter_salt: str = ""
 
     @property
     def is_clinical(self) -> bool:
@@ -145,4 +157,5 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
         stt=_build(ScribeSttConfig, scribe.get("stt")),
         llm=_build(ScribeLlmConfig, scribe.get("llm")),
         clinicians=clinicians,
+        encounter_salt=str(scribe.get("encounter_salt") or ""),
     )

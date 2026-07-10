@@ -34,12 +34,24 @@ from alfred.scribe import (
 from alfred.scribe.transcript import Segment, Transcript
 
 
+# Obviously-fake test salt (NOT a real-provider-shaped secret) — the sovereign
+# scribe fail-louds without one (P3-b1), so every fixture config carries it.
+_SALT = "DUMMY_SCRIBE_TEST_SALT"
+
+
 def _config(mode="synthetic"):
     return load_from_unified({"scribe": {
         "mode": mode,
+        "encounter_salt": _SALT,
         "stt": {"provider": "fake"},
         "llm": {"base_url": "http://127.0.0.1:11434", "model": "qwen2.5:14b-instruct-q4_K_M"},
     }})
+
+
+# The salted, opaque source_id the pipeline derives for the default drop-input
+# (filename "enc1.wav"). P3-b1 replaced the P2 verbatim-filename leak.
+from alfred.scribe import compute_encounter_id  # noqa: E402
+_EID = compute_encounter_id("enc1.wav", salt=_SALT)
 
 
 # A canned qwen response with a DOSE FLIP (5mg cited to a 500mg segment) so the
@@ -141,13 +153,14 @@ def test_process_source_drafts_ai_draft_with_grounding_flags(tmp_path, monkeypat
     assert outcome == "drafted"
 
     # the note landed as ai_draft (NOTE-2) with source-id provenance (NOTE-4)
-    st = state.get("enc1.wav")
+    st = state.get(_EID)
     assert st.state == STATE_DRAFTED
     note = frontmatter.load(str(vault / st.note_path))
     assert note["status"] == "ai_draft"
     assert note["ai_draft"] is True
     assert note["synthetic"] is True
-    assert note["source_id"] == "enc1.wav"           # synthetic → filename
+    assert note["source_id"] == _EID                 # salted-opaque (P3-b1, no leak)
+    assert "enc1" not in note["source_id"]            # the raw label never appears
     assert note["drafted_by"] == "stayc_scribe"
     assert "attested_by" not in note.metadata        # NOTE-2: never attested
     # the grounding pass ran → the dose flip is in the frontmatter + inline body
@@ -184,7 +197,7 @@ def test_resume_after_reload_skips_drafted(tmp_path, monkeypatch):
     # simulate a restart: fresh state object, load from disk
     s2 = ScribeState(sp)
     s2.load()
-    assert s2.get("enc1.wav").state == STATE_DRAFTED
+    assert s2.get(_EID).state == STATE_DRAFTED
     assert asyncio.run(process_source(audio, config=_config(), state=s2, vault_path=vault)) == "skipped"
 
 
@@ -201,7 +214,7 @@ def test_non_synthetic_input_refused_fail_closed(tmp_path, monkeypatch):
     state = ScribeState(tmp_path / "state.json")
     outcome = asyncio.run(process_source(audio, config=_config(), state=state, vault_path=vault))
     assert outcome == "refused"
-    assert state.get("enc1.wav").state == STATE_REFUSED
+    assert state.get(_EID).state == STATE_REFUSED
     # NO note written
     assert not (vault / "clinical_note").exists()
 
@@ -230,14 +243,14 @@ def test_exception_leaves_source_retriable_no_partial_note(tmp_path, monkeypatch
     with structlog.testing.capture_logs() as caps:
         outcome = asyncio.run(process_source(audio, config=_config(), state=state, vault_path=vault))
     assert outcome == "failed"
-    st = state.get("enc1.wav")
+    st = state.get(_EID)
     assert st.state == STATE_FAILED and st.attempts == 1
     assert st.last_error_class == "STTError"     # class only, NO PHI
     assert not (vault / "clinical_note").exists()  # no partial note
     # the failure log carries source_id + state + error_class (no PHI)
     fail = [c for c in caps if c.get("event") == "scribe.pipeline.failed"]
     assert len(fail) == 1
-    assert fail[0]["source_id"] == "enc1.wav" and fail[0]["error_class"] == "STTError"
+    assert fail[0]["source_id"] == _EID and fail[0]["error_class"] == "STTError"
     assert "synthetic boom" not in json.dumps(fail[0])  # the message never logged
 
 
@@ -410,14 +423,14 @@ def test_process_source_recovers_drafted_on_crash_window(tmp_path, monkeypatch):
 
     # First pass drafts the note.
     assert asyncio.run(process_source(audio, config=_config(), state=state, vault_path=vault)) == "drafted"
-    note_path = state.get("enc1.wav").note_path
+    note_path = state.get(_EID).note_path
 
     # Simulate the crash: rewind state to an intermediate (non-done) status so
     # the resume re-processes — the note file is still on disk.
-    state.set("enc1.wav", state=STATE_STRUCTURING)
+    state.set(_EID, state=STATE_STRUCTURING)
 
     outcome = asyncio.run(process_source(audio, config=_config(), state=state, vault_path=vault))
     assert outcome == "drafted"
-    assert state.get("enc1.wav").state == STATE_DRAFTED
-    assert state.get("enc1.wav").note_path == note_path       # same note
+    assert state.get(_EID).state == STATE_DRAFTED
+    assert state.get(_EID).note_path == note_path       # same note
     assert len(list((vault / "clinical_note").glob("*.md"))) == 1  # no dup

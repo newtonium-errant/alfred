@@ -24,7 +24,7 @@ _CLINICIANS = {"np_jamie", "dr_synthetic"}
 _NOW = datetime(2026, 7, 9, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _make_ai_draft(tmp_path, *, source_id="sha256:abc0123456789def", drafted_by=SCRIBE_DRAFTER_IDENTITY):
+def _make_ai_draft(tmp_path, *, source_id="enc-abc0123456789d", drafted_by=SCRIBE_DRAFTER_IDENTITY):
     """Create a born-ai_draft clinical_note under the agent scope; return rel_path."""
     result = vault_create(
         tmp_path, "clinical_note", "Synthetic encounter chest pain",
@@ -39,24 +39,38 @@ def _make_ai_draft(tmp_path, *, source_id="sha256:abc0123456789def", drafted_by=
 
 
 # ---------------------------------------------------------------------------
-# source_id — opaque hash in clinical mode
+# source_id — SALTED opaque id in EVERY mode (P3-b1 leak fix). The P2 verbatim-
+# in-synthetic + "sha256:" colon-prefix behaviors are GONE.
 # ---------------------------------------------------------------------------
 
-def test_source_id_hash_in_clinical_mode():
-    sid = source_id_for(mode="clinical", filename="patient_jane_doe_2026-07-09.wav")
-    assert sid.startswith("sha256:")
-    assert "jane" not in sid and "doe" not in sid  # NO PHI-bearing filename leaks
-    assert len(sid) == len("sha256:") + 16
+_SALT = "DUMMY_SCRIBE_TEST_SALT"
 
 
-def test_source_id_hash_prefers_bytes_in_clinical_mode():
-    sid = source_id_for(mode="clinical", filename="x.wav", audio_bytes=b"synthetic-audio")
-    assert sid.startswith("sha256:")
+def test_source_id_is_salted_opaque_no_label_leak():
+    sid = source_id_for("patient_jane_doe_2026-07-09.wav", salt=_SALT)
+    assert sid.startswith("enc-")              # colon-free (no "sha256:" filename bug)
+    assert "jane" not in sid and "doe" not in sid  # NO PHI-bearing label leaks
+    assert len(sid) == len("enc-") + 16
 
 
-def test_source_id_filename_in_synthetic_mode():
-    assert source_id_for(mode="synthetic", filename="synth1.wav") == "synth1.wav"
-    assert source_id_for(mode="synthetic", filename=None) == "synthetic"
+def test_source_id_no_verbatim_leak_in_any_mode():
+    # The P2 leak: synthetic mode returned the label VERBATIM. Now it is opaque.
+    assert source_id_for("synth1.wav", salt=_SALT) != "synth1.wav"
+    assert source_id_for("synth1.wav", salt=_SALT).startswith("enc-")
+
+
+def test_source_id_deterministic_and_salt_sensitive():
+    # Same label + same salt → same id (stable across an encounter's chunks);
+    # different salt → different id (the salt is what makes it non-reversible).
+    a = source_id_for("enc-label", salt=_SALT)
+    assert a == source_id_for("enc-label", salt=_SALT)
+    assert a != source_id_for("enc-label", salt="DIFFERENT_SALT")
+
+
+def test_source_id_fail_loud_on_missing_salt():
+    from alfred.scribe import EncounterIdentityError
+    with pytest.raises(EncounterIdentityError):
+        source_id_for("synth1.wav", salt="")
 
 
 # ---------------------------------------------------------------------------
@@ -87,14 +101,14 @@ def test_attest_happy_path_writes_triad_and_audit(tmp_path):
 
 
 def test_attest_audit_is_phi_free(tmp_path):
-    rel = _make_ai_draft(tmp_path, source_id="sha256:deadbeefdeadbeef")
+    rel = _make_ai_draft(tmp_path, source_id="enc-deadbeefdeadbe")
     audit = tmp_path / "clinical_attest_audit.jsonl"
     attest(tmp_path, rel, new_status="attested", attester="np_jamie",
            clinician_ids=_CLINICIANS, audit_path=audit, now=_NOW)
     raw = audit.read_text()
-    # The audit carries the OPAQUE source_id (a hash), clinician id, statuses —
-    # NEVER the note body / transcript / patient content.
-    assert "sha256:deadbeefdeadbeef" in raw
+    # The audit carries the OPAQUE source_id (the salted enc- id), clinician id,
+    # statuses — NEVER the note body / transcript / patient content.
+    assert "enc-deadbeefdeadbe" in raw
     assert "chest pain" not in raw
     assert "Subjective" not in raw
 

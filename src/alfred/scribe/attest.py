@@ -24,7 +24,6 @@ Deliberately a scribe-layer orchestrator, NOT a ``vault_attest`` op in
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +35,7 @@ from alfred.scribe.attestation import (
     AttestationError,
     authorize_attestation,
 )
+from alfred.scribe.identity import compute_encounter_id
 from alfred.vault.ops import vault_edit, vault_read
 
 log = structlog.get_logger(__name__)
@@ -50,26 +50,19 @@ _TRIAD_STATUS = "status"
 _TRIAD_ATTESTED_BY = "attested_by"
 _TRIAD_ATTESTED_AT = "attested_at"
 
-_CLINICAL_MODE = "clinical"
 
+def source_id_for(raw_label: str | None, *, salt: str) -> str:
+    """Return the SALTED, opaque ``source_id`` for logs / the attest audit.
 
-def source_id_for(
-    *,
-    mode: str,
-    filename: str | None = None,
-    audio_bytes: bytes | None = None,
-) -> str:
-    """Return the ``source_id`` for logs / the attest audit.
-
-    In CLINICAL mode the source_id MUST be an OPAQUE HASH — a PHI-bearing
-    filename must never land in a log or audit trail. ``sha256(...)[:16]`` of
-    the audio bytes when available, else of the filename string. In synthetic
-    mode the filename is safe (no real PHI) and is returned verbatim.
-    """
-    if mode == _CLINICAL_MODE:
-        basis = audio_bytes if audio_bytes is not None else (filename or "").encode("utf-8")
-        return "sha256:" + hashlib.sha256(basis).hexdigest()[:16]
-    return filename or "synthetic"
+    Delegates to :func:`alfred.scribe.identity.compute_encounter_id` — a salted
+    HMAC of the raw label, non-reversible without the per-instance secret
+    (``scribe.encounter_salt``). This REPLACED the P2 implementation, which (a)
+    returned the operator label VERBATIM in synthetic mode — a PHI leak the salt
+    now closes — and (b) prefixed clinical ids with ``"sha256:"``, a colon that
+    corrupted note filenames. There is no ``mode`` branch: the salt makes
+    label-hashing safe in EVERY mode, and the id is stable across an encounter's
+    chunks (the label is the identity, not the per-chunk bytes)."""
+    return compute_encounter_id(raw_label or "synthetic", salt=salt)
 
 
 def _append_attest_audit(audit_path: str | Path, entry: dict) -> None:

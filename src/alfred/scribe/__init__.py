@@ -28,8 +28,14 @@ from .config import (
     load_from_unified,
 )
 from .attest import ATTEST_SCOPE, attest, source_id_for
-from .grounding import GroundingResult, verify as verify_grounding
+from .identity import EncounterIdentityError, compute_encounter_id
+from .grounding import (
+    GroundingIntegrityError,
+    GroundingResult,
+    verify as verify_grounding,
+)
 from .ingest import ScribeIngestRefused, guard_ingest
+from .ledger import ledger_path, load_ledger, save_ledger
 from .notegen import (
     GROUNDING_UNVERIFIED,
     NOT_ADDRESSED,
@@ -49,12 +55,20 @@ from .stt import (
     ensure_backend_available,
     transcribe,
 )
-from .transcript import Segment, Transcript, make_segment_id
+from .transcript import (
+    Segment,
+    SegmentInvariantError,
+    Transcript,
+    make_segment_id,
+)
 # pipeline + state imported LAST — pipeline pulls in stt/notegen/transcript, so
 # they must already be package submodules to avoid a partial-init ordering trap.
 from .pipeline import (  # noqa: E402
+    AccumResult,
     VerifiedNote,
+    accumulate_encounter,
     generate_verified_note,
+    is_chunk_settled,
     process_source,
     run_sweep,
 )
@@ -94,6 +108,9 @@ __all__ = [
     "attest",
     "source_id_for",
     "ATTEST_SCOPE",
+    # salted opaque encounter identity (P3-b1)
+    "compute_encounter_id",
+    "EncounterIdentityError",
     # STT + transcript (P2-b)
     "transcribe",
     "ensure_backend_available",
@@ -102,7 +119,15 @@ __all__ = [
     "STTError",
     "Transcript",
     "Segment",
+    "SegmentInvariantError",
     "make_segment_id",
+    # transcript ledger + checkpoint accumulator (P3-b1)
+    "ledger_path",
+    "load_ledger",
+    "save_ledger",
+    "accumulate_encounter",
+    "is_chunk_settled",
+    "AccumResult",
     # note-gen + grounding (P2-c)
     "generate_structured",
     "parse_structured_json",
@@ -116,6 +141,7 @@ __all__ = [
     "GROUNDING_UNVERIFIED",
     "verify_grounding",
     "GroundingResult",
+    "GroundingIntegrityError",
     # pipeline + state machine (P2-d)
     "generate_verified_note",
     "VerifiedNote",

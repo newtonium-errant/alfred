@@ -20,9 +20,11 @@ NOTE-2 (type-change guard): the pipeline creates clinical_note status=ai_draft
 ONLY — never attested_by / status=attested (that is scribe/attest.py's exclusive
 path; the create-bypass scope guard refuses a born-attested note anyway).
 
-NOTE-4 (PHI): source ids are opaque hashes in clinical mode (source_id_for);
-logs / state / audit carry ids + counts + state-name ONLY — never title /
-transcript / note text.
+NOTE-4 (PHI): source ids are SALTED, opaque encounter ids in EVERY mode
+(``identity.compute_encounter_id`` — HMAC-SHA256 of the raw label under the
+per-instance ``encounter_salt``); logs / state / audit carry ids + counts +
+state-name ONLY — never title / transcript / note text. (P3-b1 closed the P2
+leak where the synthetic-mode source_id was the operator label verbatim.)
 
 FAIL-CLOSED (PHI): any exception leaves the source in a retriable state (never
 advanced past its real phase), logs the failure with source_id + state +
@@ -31,18 +33,22 @@ error-class (no PHI), and emits NO partial/unverified note to the vault.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import structlog
 
+from alfred.scribe import ledger as ledger_mod
 from alfred.scribe import stt as stt_mod
-from alfred.scribe.attest import source_id_for
 from alfred.scribe.attestation import SCRIBE_DRAFTER_IDENTITY
 from alfred.scribe.config import ScribeConfig
 from alfred.scribe.grounding import verify as verify_grounding
+from alfred.scribe.identity import compute_encounter_id
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
 from alfred.scribe.notegen import (
     StructuredNote,
@@ -65,6 +71,21 @@ log = structlog.get_logger(__name__)
 # Audio files the sweep treats as pipeline inputs. Sidecars (``.meta.json``
 # provenance, ``.txt`` fake-STT transcript) are NOT primary inputs.
 _AUDIO_EXTENSIONS = frozenset({".wav", ".ogg", ".mp3", ".m4a", ".flac", ".webm"})
+
+# --- P3-b1 checkpoint-accumulator input convention --------------------------
+# A per-encounter subdir holds ``chunk_NNN.<audio-ext>`` chunk files, each with
+# a ``<chunk>.meta.json`` sidecar ``{synthetic: true, seq: N}``. The integer
+# ``NNN`` in the filename is the ordering key (parsed as an int — NOT
+# lexicographic, so ``chunk_10`` sorts AFTER ``chunk_2``). An explicit
+# ``_CLOSED`` sentinel file finalizes the encounter (no more chunks coming).
+_CHUNK_NAME_RE = re.compile(r"^chunk_(\d+)$")
+_META_SUFFIX = ".meta.json"
+_CLOSED_SENTINEL = "_CLOSED"
+# Settle floor for the no-meta fallback path (a recorder that does not drop a
+# commit-marker sidecar): a chunk whose audio mtime is younger than this is
+# never hashed/STT'd. The mandated convention's ``.meta.json`` commit marker is
+# the PRIMARY (deterministic) settle signal; this floor guards the fallback.
+_SETTLE_MIN_AGE_S = 2.0
 
 
 @dataclass
@@ -113,12 +134,14 @@ def _read_provenance(audio_path: Path) -> dict[str, Any]:
 
 
 def _source_id_for_input(audio_path: Path, config: ScribeConfig) -> str:
-    """Opaque source id (NOTE-4). Clinical mode hashes the audio bytes; synthetic
-    mode uses the filename (synthetic, no real PHI)."""
-    audio_bytes = audio_path.read_bytes() if config.is_clinical else None
-    return source_id_for(
-        mode=config.mode, filename=audio_path.name, audio_bytes=audio_bytes,
-    )
+    """Salted, opaque encounter id for a flat (legacy single-chunk) input.
+
+    NOTE-4: the id is ``compute_encounter_id(filename, salt)`` in EVERY mode — a
+    salted HMAC of the operator label, non-reversible without the per-instance
+    secret. This closed the P2 leak (synthetic mode returned the label verbatim)
+    + the ``"sha256:"`` colon-in-filename bug. FAIL-LOUD if the salt is missing
+    (``EncounterIdentityError`` propagates)."""
+    return compute_encounter_id(audio_path.name, salt=config.encounter_salt)
 
 
 async def process_source(
@@ -285,17 +308,172 @@ def _update_or_refuse_ai_draft(
     return rel_path
 
 
+# --- P3-b1 checkpoint accumulator (identity + input walk + ledger + fold) ---
+
+
+@dataclass
+class AccumResult:
+    """Per-encounter outcome of one accumulate pass (NO note-gen in P3-b1)."""
+
+    encounter_id: str
+    folded: int = 0          # chunks freshly folded into the ledger this pass
+    held: int = 0            # unsettled chunks left for a later sweep
+    frozen: bool = False     # a seq gap → encounter frozen (never fold over a hole)
+    closed: bool = False     # the _CLOSED sentinel finalized the encounter
+    segments: int = 0        # accumulated segment count after this pass
+
+
+def is_chunk_settled(
+    chunk_path: Path,
+    *,
+    meta_path: Path,
+    now: float,
+    min_age_s: float = _SETTLE_MIN_AGE_S,
+    prev_stat: tuple[int, float] | None = None,
+) -> bool:
+    """True iff ``chunk_path`` is safe to hash/STT (fully written, not mid-flush).
+
+    Two settle signals (decision 6):
+      * PRIMARY — the ``.meta.json`` commit marker is present. The recorder
+        writes the sidecar LAST, so its presence ⇒ the audio is fully written.
+      * FALLBACK (no marker) — size+mtime unchanged since the previous sweep
+        observation (``prev_stat``) AND the audio older than ``min_age_s``.
+
+    Never hash/STT an unsettled file: a partial-write race would fold a truncated
+    transcript IMMUTABLY into the ledger.
+    """
+    if Path(meta_path).is_file():
+        return True  # commit marker ⇒ fully written
+    try:
+        st = Path(chunk_path).stat()
+    except OSError:
+        return False
+    if (now - st.st_mtime) < min_age_s:
+        return False  # too fresh — may still be flushing
+    if prev_stat is None:
+        return False  # need a prior observation to confirm 2-sweep stability
+    return (st.st_size, st.st_mtime) == prev_stat
+
+
+def _discover_chunks(encounter_dir: Path) -> list[tuple[Path, int]]:
+    """``(chunk_path, seq)`` for every ``chunk_NNN.<audio-ext>``, ordered by
+    INTEGER seq (so ``chunk_10`` follows ``chunk_2`` — NOT the lexicographic
+    ``sorted()`` bug). ``seq`` is parsed from the filename, so ordering +
+    gap-detection work even before a chunk's ``.meta.json`` marker lands."""
+    found: list[tuple[Path, int]] = []
+    for p in encounter_dir.iterdir():
+        if not p.is_file() or p.suffix.lower() not in _AUDIO_EXTENSIONS:
+            continue
+        m = _CHUNK_NAME_RE.match(p.stem)
+        if m:
+            found.append((p, int(m.group(1))))
+    found.sort(key=lambda c: c[1])   # integer seq order (the fix)
+    return found
+
+
+def _chunk_content_hash(chunk_path: Path) -> str:
+    """The chunk's content-hash — the ``chunk_key`` idempotency key. A replay of
+    identical bytes folds as a no-op."""
+    return hashlib.sha256(chunk_path.read_bytes()).hexdigest()
+
+
+def accumulate_encounter(
+    encounter_dir: Path, *, config: ScribeConfig, now: float | None = None,
+) -> AccumResult:
+    """Fold an encounter's settled chunks into its transcript ledger, in seq
+    order (scribe P3-b1 FOUNDATION — NO note-gen trigger; that is P3-b2).
+
+    Idempotent + fail-closed:
+      * ordered by integer seq; a seq GAP FREEZES the encounter (logs loudly,
+        folds nothing past the hole — never build over a hole);
+      * each chunk must be SETTLED (commit marker) before hash/STT;
+      * folding is idempotent on the chunk content-hash (replay = no-op);
+      * the ledger is persisted ATOMICALLY after the pass.
+    """
+    now = time.time() if now is None else now
+    encounter_id = compute_encounter_id(
+        encounter_dir.name, salt=config.encounter_salt,
+    )
+    lpath = ledger_mod.ledger_path(encounter_dir, encounter_id)
+    transcript = ledger_mod.load_ledger(lpath) or Transcript(
+        source_id=encounter_id, mode=config.mode,
+    )
+
+    folded_seqs = {p.get("seq") for p in transcript.chunk_provenance}
+    expected = (max(folded_seqs) + 1) if folded_seqs else 1
+
+    result = AccumResult(encounter_id=encounter_id)
+    for chunk_path, seq in _discover_chunks(encounter_dir):
+        if seq < expected:
+            continue                      # already folded (content-hash is the real guard)
+        if seq > expected:
+            # the expected seq is absent while a higher one is present → an
+            # INTERIOR hole (a lost/skipped chunk). Freeze — never fold over it.
+            result.frozen = True
+            log.warning(
+                "scribe.accumulator.seq_gap",
+                encounter_id=encounter_id,
+                expected_seq=expected,
+                found_seq=seq,
+                detail="seq gap — encounter FROZEN, refusing to fold over a hole",
+            )
+            break
+        meta_path = chunk_path.with_suffix(_META_SUFFIX)
+        if not is_chunk_settled(chunk_path, meta_path=meta_path, now=now):
+            result.held += 1              # not committed yet — hold for a later sweep
+            break                         # cannot skip the expected chunk → stop
+        chunk_key = _chunk_content_hash(chunk_path)
+        if transcript.has_folded(chunk_key):
+            expected += 1                 # idempotent: this content already folded
+            continue
+        chunk_tx = stt_mod.transcribe(config, chunk_path, source_id=encounter_id)
+        offset = transcript.segments[-1].end_s if transcript.segments else 0.0
+        if transcript.append_chunk(
+            chunk_tx, audio_offset_s=offset, chunk_key=chunk_key, seq=seq,
+        ):
+            result.folded += 1
+        expected += 1
+
+    if (encounter_dir / _CLOSED_SENTINEL).exists():
+        transcript.closed = True
+    result.closed = transcript.closed
+    result.segments = len(transcript.segments)
+
+    # Persist the authoritative ledger (atomic) BEFORE any downstream draft
+    # (none in P3-b1). Intentionally-left-blank: always log the pass so an idle
+    # encounter (nothing new settled) is distinguishable from a broken one.
+    ledger_mod.save_ledger(lpath, transcript)
+    log.info(
+        "scribe.accumulator.folded",
+        encounter_id=encounter_id,
+        folded=result.folded,
+        held=result.held,
+        frozen=result.frozen,
+        closed=result.closed,
+        segments=result.segments,
+    )
+    return result
+
+
 async def run_sweep(
     config: ScribeConfig, state: ScribeState, vault_path: Path,
 ) -> dict[str, int]:
-    """Scan input_dir once, process each source. Returns per-outcome counts.
+    """Scan input_dir once. Walks BOTH legacy flat files (P2 one-shot back-comp)
+    AND one level of per-encounter subdirs (P3-b1 checkpoint accumulator). The
+    P2 ``iterdir()+is_file()`` SILENTLY SKIPPED subdirs — this fixes that.
 
-    Intentionally-left-blank: emits ``scribe.pipeline.idle`` (ran, nothing to
-    do) when the sweep produced no new work — so idle is distinguishable from
-    broken — and ``scribe.pipeline.swept`` with counts when it did.
+    Intentionally-left-blank: emits ``scribe.pipeline.idle`` (ran, nothing to do)
+    when the sweep produced no new work — so idle is distinguishable from broken
+    — and ``scribe.pipeline.swept`` with counts when it did.
+
+    P3-b1 FOUNDATION: subdir encounters ACCUMULATE into their transcript ledger
+    only; the note-gen trigger from the accumulated ledger is P3-b2.
     """
     input_dir = Path(config.input_dir)
-    counts = {"scanned": 0, "drafted": 0, "refused": 0, "failed": 0, "skipped": 0}
+    counts = {
+        "scanned": 0, "drafted": 0, "refused": 0, "failed": 0, "skipped": 0,
+        "encounters": 0, "chunks_folded": 0, "held": 0, "frozen": 0,
+    }
 
     if not input_dir.is_dir():
         log.info(
@@ -306,25 +484,41 @@ async def run_sweep(
         )
         return counts
 
-    audio_files = sorted(
-        p for p in input_dir.iterdir()
+    entries = sorted(input_dir.iterdir(), key=lambda p: p.name)
+    flat_files = [
+        p for p in entries
         if p.is_file() and p.suffix.lower() in _AUDIO_EXTENSIONS
-    )
-    counts["scanned"] = len(audio_files)
+    ]
+    subdirs = [p for p in entries if p.is_dir() and not p.name.startswith(".")]
+    counts["scanned"] = len(flat_files)
 
-    for audio in audio_files:
+    # (1) legacy flat one-shot (P2 back-comp) — a bare audio file directly under
+    # input_dir is a single-chunk encounter; its path is unchanged (only its
+    # source_id is now salted-opaque).
+    for audio in flat_files:
         outcome = await process_source(
             audio, config=config, state=state, vault_path=vault_path,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
 
-    new_work = counts["drafted"] + counts["refused"] + counts["failed"]
-    if new_work == 0:
+    # (2) per-encounter checkpoint accumulator (P3-b1 — NO note-gen trigger yet).
+    for enc_dir in subdirs:
+        r = accumulate_encounter(enc_dir, config=config)
+        counts["encounters"] += 1
+        counts["chunks_folded"] += r.folded
+        counts["held"] += r.held
+        counts["frozen"] += 1 if r.frozen else 0
+
+    flat_work = counts["drafted"] + counts["refused"] + counts["failed"]
+    acc_work = counts["chunks_folded"] + counts["frozen"]
+    if flat_work == 0 and acc_work == 0:
         log.info(
             "scribe.pipeline.idle",
             input_dir=str(input_dir),
             scanned=counts["scanned"],
-            detail="ran, nothing to do — no new sources to process",
+            encounters=counts["encounters"],
+            held=counts["held"],
+            detail="ran, nothing to do — no new settled work",
         )
     else:
         log.info("scribe.pipeline.swept", **counts)

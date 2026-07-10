@@ -32,6 +32,42 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class SegmentInvariantError(Exception):
+    """The accumulated segment sequence violated its post-append invariant — ids
+    are NOT unique + strictly increasing. Raised FAIL-CLOSED by
+    :meth:`Transcript.append_chunk`: a broken segment-id sequence means a later
+    ``[S#]`` grounding cite could resolve to the WRONG segment (the exact
+    medico-legal failure the scribe exists to prevent), so the fold aborts rather
+    than persist a corrupt transcript."""
+
+
+def _assert_segment_ids_monotonic(segments: list["Segment"]) -> None:
+    """FAIL-CLOSED invariant: segment ids are UNIQUE and STRICTLY INCREASING.
+
+    The ids are canonical ``S1``, ``S2``, ... (see :func:`make_segment_id`), so a
+    correct accumulated transcript has strictly-increasing integer suffixes with
+    no duplicates. This guards the append fold against an id-minting bug: a
+    duplicate id would make grounding's ``{id: segment}`` map silently last-wins
+    overwrite, grounding a claim against the wrong segment.
+    """
+    ids = [s.id for s in segments]
+    if len(set(ids)) != len(ids):
+        raise SegmentInvariantError(
+            f"duplicate segment ids after append (n={len(ids)}, "
+            f"unique={len(set(ids))}) — refusing to persist a corrupt transcript."
+        )
+    try:
+        nums = [int(sid[1:]) for sid in ids]  # "S3" -> 3
+    except (ValueError, IndexError) as e:
+        raise SegmentInvariantError(
+            f"non-canonical segment id in accumulated transcript: {ids!r}"
+        ) from e
+    if any(b <= a for a, b in zip(nums, nums[1:])):
+        raise SegmentInvariantError(
+            f"segment ids not strictly increasing: {ids!r}"
+        )
+
+
 def make_segment_id(index_zero_based: int) -> str:
     """Canonical stable segment id: ``S1``, ``S2``, ... (1-indexed).
 
@@ -79,6 +115,14 @@ class Transcript:
     segments: list[Segment] = field(default_factory=list)
     version: int = 1
     processed_through_segment: str | None = None
+    # P3-b1 checkpoint-accumulator provenance. One entry per FOLDED chunk (see
+    # ``append_chunk``): ``{chunk_key, seq, first_id, last_id, n_segments}``.
+    # ``chunk_key`` (a chunk's content-hash) is the idempotency key — a replay of
+    # the same chunk is a no-op. ``closed`` latches when the ``_CLOSED`` sentinel
+    # finalizes the encounter (no more chunks). Both round-trip through
+    # to_dict/from_dict (schema-tolerant), so the persisted ledger resumes.
+    chunk_provenance: list[dict[str, Any]] = field(default_factory=list)
+    closed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +131,8 @@ class Transcript:
             "version": self.version,
             "processed_through_segment": self.processed_through_segment,
             "segments": [s.to_dict() for s in self.segments],
+            "chunk_provenance": [dict(p) for p in self.chunk_provenance],
+            "closed": self.closed,
         }
 
     @classmethod
@@ -96,7 +142,78 @@ class Transcript:
         known["segments"] = [
             Segment.from_dict(s) for s in raw_segments if isinstance(s, dict)
         ]
+        raw_prov = known.get("chunk_provenance")
+        known["chunk_provenance"] = [
+            dict(p) for p in raw_prov if isinstance(p, dict)
+        ] if isinstance(raw_prov, list) else []
         return cls(**known)
+
+    def has_folded(self, chunk_key: str) -> bool:
+        """True iff a chunk with this content-hash was already folded (the
+        idempotency check — replay/dup detection)."""
+        return any(p.get("chunk_key") == chunk_key for p in self.chunk_provenance)
+
+    def append_chunk(
+        self,
+        chunk: "Transcript",
+        *,
+        audio_offset_s: float,
+        chunk_key: str,
+        seq: int,
+    ) -> bool:
+        """Fold ``chunk``'s segments onto the end of this accumulated transcript.
+
+        The segment-id continuity CORE (scribe P3-b1). Guarantees:
+
+          (a) IDEMPOTENT on ``chunk_key`` (the chunk's content-hash): a replay or
+              duplicate is a NO-OP (returns ``False``), never a second append.
+          (b) Final ids are minted at APPEND time as
+              ``make_segment_id(len(self.segments) + i)`` — the chunk's own
+              STT-local ids are DISCARDED. Already-appended segments are
+              IMMUTABLE (prior chunks are never re-STT'd or renumbered).
+          (c) Incoming ``start_s`` / ``end_s`` are offset by ``audio_offset_s`` so
+              timestamps stay globally monotonic across chunk boundaries.
+          (d) Records ``chunk_key`` + ``seq`` + contributed ``[S#]`` id-range in
+              ``chunk_provenance``.
+          (e) ASSERTS the post-append invariant (ids unique + strictly
+              increasing) and fails CLOSED (:class:`SegmentInvariantError`)
+              otherwise — no corrupt transcript is ever persisted.
+
+        Returns ``True`` if the chunk was folded, ``False`` on an idempotent
+        no-op.
+        """
+        if self.has_folded(chunk_key):
+            return False  # (a) idempotent replay/dup — no second append
+
+        base = len(self.segments)
+        new_segments = [
+            Segment(
+                id=make_segment_id(base + i),          # (b) final ids at APPEND
+                start_s=seg.start_s + audio_offset_s,  # (c) global-monotonic offset
+                end_s=seg.end_s + audio_offset_s,
+                text=seg.text,
+                speaker=seg.speaker,
+            )
+            for i, seg in enumerate(chunk.segments)
+        ]
+        self.segments.extend(new_segments)
+        # (e) fail-closed BEFORE recording provenance — a corrupt fold must not
+        # leave a provenance entry claiming success. Roll the extend back on
+        # violation so a caught error leaves the transcript UNMUTATED (never a
+        # half-corrupt object that a later save could persist).
+        try:
+            _assert_segment_ids_monotonic(self.segments)
+        except SegmentInvariantError:
+            del self.segments[base:]
+            raise
+        self.chunk_provenance.append({           # (d) provenance
+            "chunk_key": chunk_key,
+            "seq": seq,
+            "first_id": new_segments[0].id if new_segments else None,
+            "last_id": new_segments[-1].id if new_segments else None,
+            "n_segments": len(new_segments),
+        })
+        return True
 
     def unprocessed_segments(self) -> list[Segment]:
         """Segments AFTER ``processed_through_segment`` (the P3 delta cursor).

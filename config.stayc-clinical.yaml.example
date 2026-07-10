@@ -65,6 +65,13 @@ sovereign:
 scribe:
   mode: synthetic          # FAIL-CLOSED default; flip to `clinical` (legal gate) is the LAST switch
   input_dir: "/data/algernon/stayc-clinical/inbox"
+  # Per-instance SECRET that salts the opaque encounter_id (scribe P3-b1):
+  #   encounter_id = "enc-" + hmac_sha256(encounter_salt, raw_label)[:16]
+  # An UNsalted hash of a low-entropy patient label is trivially reversible, so
+  # the salt is what makes the id non-reversible. FAIL-LOUD: the scribe refuses
+  # to ingest any encounter until this is set. Provide via env — NEVER commit a
+  # real salt inline. It is NEVER written to the vault, a log, or the audit.
+  encounter_salt: "${SCRIBE_ENCOUNTER_SALT}"
   stt:
     provider: faster-whisper
     model: distil-large-v3
