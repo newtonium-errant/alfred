@@ -83,6 +83,9 @@ def test_startup_boots_boundary_validated_guard_armed():
     assert len(up) == 1
     assert up[0]["sovereign_ok"] is True
     assert up[0]["http_guard_installed"] is True
+    # #40: the sovereign attestation reflects aiohttp web-transport coverage
+    # (True in this venv where aiohttp is installed).
+    assert up[0]["aiohttp_guard_installed"] is True
     assert up[0]["mode"] == SCRIBE_MODE_SYNTHETIC
     assert up[0]["has_input"] is False
 

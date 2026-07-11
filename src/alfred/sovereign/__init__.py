@@ -15,9 +15,12 @@ Public surface:
     maps it to exit 79 and refuses to auto-restart into a cloud-reachable
     state).
   * :func:`install_sovereign_http_guard` / :func:`uninstall_sovereign_http_guard`
-    / :func:`is_sovereign_http_guard_installed` — the per-call HTTP guard that
-    asserts loopback-before-connect on every outbound httpx request (catches
-    code drift the config-time barriers cannot see).
+    / :func:`is_sovereign_http_guard_installed` / :func:`is_aiohttp_guard_installed`
+    — the per-call HTTP guard that asserts loopback-before-connect on every
+    outbound httpx AND aiohttp request (catches code drift the config-time
+    barriers cannot see; the aiohttp wrap — task #40, the web STT/TTS transport —
+    is import-guarded, so ``is_aiohttp_guard_installed`` reports whether it is
+    live in this venv).
   * Constants (:data:`SOVEREIGN_STT_ALLOWLIST`, :data:`CLOUD_KEY_ENV_VARS`,
     :data:`EGRESS_CONFIG_SECTIONS`, :data:`LOOPBACK_HOSTS`) — the frozen
     policy the barriers enforce; imported by tests as the contract pins.
@@ -37,6 +40,7 @@ from .boundary import (
 )
 from .http_guard import (
     install_sovereign_http_guard,
+    is_aiohttp_guard_installed,
     is_sovereign_http_guard_installed,
     uninstall_sovereign_http_guard,
 )
@@ -51,6 +55,7 @@ __all__ = [
     "host_is_loopback",
     "validate_sovereign_boundary",
     "install_sovereign_http_guard",
+    "is_aiohttp_guard_installed",
     "is_sovereign_http_guard_installed",
     "uninstall_sovereign_http_guard",
 ]

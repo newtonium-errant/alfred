@@ -35,6 +35,7 @@ from alfred.scribe.config import ScribeConfig, load_from_unified
 from alfred.sovereign import (
     SovereignBoundaryError,
     install_sovereign_http_guard,
+    is_aiohttp_guard_installed,
     is_sovereign_http_guard_installed,
     validate_sovereign_boundary,
 )
@@ -90,6 +91,7 @@ def startup(
         "scribe.daemon.up",
         sovereign_ok=True,
         http_guard_installed=is_sovereign_http_guard_installed(),
+        aiohttp_guard_installed=is_aiohttp_guard_installed(),  # #40 web-transport coverage
         mode=config.mode,
         input_dir=config.input_dir,
         has_input=False,

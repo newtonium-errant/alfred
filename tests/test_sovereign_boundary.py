@@ -12,6 +12,8 @@ provider prefixes — scanner-hygiene per builder discipline.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import structlog
@@ -24,11 +26,12 @@ from alfred.sovereign import (
     SovereignBoundaryError,
     host_is_loopback,
     install_sovereign_http_guard,
+    is_aiohttp_guard_installed,
     is_sovereign_http_guard_installed,
     uninstall_sovereign_http_guard,
     validate_sovereign_boundary,
 )
-from alfred.sovereign.http_guard import _assert_request_loopback
+from alfred.sovereign.http_guard import _assert_aiohttp_loopback, _assert_request_loopback
 from alfred import orchestrator
 
 
@@ -402,3 +405,137 @@ def test_assert_request_loopback_refuses_cloud():
     with pytest.raises(SovereignBoundaryError) as exc:
         _assert_request_loopback(req)
     assert exc.value.reason == "http_guard"
+
+
+# --- SovereignHttpGuard: aiohttp coverage (#40, PWA scribe prereq) ----------
+
+class _FakeSession:
+    """Mimics aiohttp.ClientSession's ``_build_url`` (base_url + relative join)
+    for a loop-free unit test of the aiohttp loopback assert."""
+
+    def __init__(self, base=None):
+        import yarl
+        self._base_url = yarl.URL(base) if base else None
+
+    def _build_url(self, str_or_url):
+        import yarl
+        url = yarl.URL(str_or_url)
+        if self._base_url and not url.absolute:
+            return self._base_url.join(url)
+        return url
+
+
+def test_assert_aiohttp_loopback_permits_loopback():
+    import yarl
+    s = _FakeSession()
+    _assert_aiohttp_loopback(s, "http://127.0.0.1:11434/v1/chat")   # str, no raise
+    _assert_aiohttp_loopback(s, yarl.URL("http://localhost:8000/x"))  # yarl.URL, no raise
+    _assert_aiohttp_loopback(s, "wss://[::1]:9000/live")            # ipv6 loopback ws
+
+
+def test_assert_aiohttp_loopback_refuses_cloud():
+    s = _FakeSession()
+    with pytest.raises(SovereignBoundaryError) as exc:
+        _assert_aiohttp_loopback(s, "wss://api.deepgram.com/v1/listen")
+    assert exc.value.reason == "http_guard"
+
+
+def test_assert_aiohttp_loopback_resolves_base_url_relative():
+    # base_url + relative path — a LOOPBACK base is not false-blocked; a CLOUD
+    # base IS blocked (resolved exactly as aiohttp resolves it).
+    _assert_aiohttp_loopback(_FakeSession("http://127.0.0.1:11434"), "/v1/chat")  # no raise
+    with pytest.raises(SovereignBoundaryError):
+        _assert_aiohttp_loopback(_FakeSession("https://api.elevenlabs.io"), "/v1/tts")
+
+
+def test_aiohttp_guard_installed_and_reversible(guard_cleanup):
+    import aiohttp
+    orig = aiohttp.ClientSession._request
+    assert is_aiohttp_guard_installed() is False
+    install_sovereign_http_guard()
+    assert is_aiohttp_guard_installed() is True
+    assert aiohttp.ClientSession._request is not orig      # wrapped
+    wrapped = aiohttp.ClientSession._request
+    install_sovereign_http_guard()                          # idempotent, no double-wrap
+    assert aiohttp.ClientSession._request is wrapped
+    uninstall_sovereign_http_guard()
+    assert is_aiohttp_guard_installed() is False
+    assert aiohttp.ClientSession._request is orig           # restored
+
+
+def test_aiohttp_guard_blocks_non_loopback_request(guard_cleanup):
+    # THE mutation-bind: remove the aiohttp wrap → this non-loopback aiohttp
+    # request is NOT blocked (proceeds to connect) → RED.
+    import aiohttp
+    install_sovereign_http_guard()
+
+    async def _go():
+        async with aiohttp.ClientSession() as s:
+            await s.get("https://api.deepgram.com/v1/listen")
+
+    with pytest.raises(SovereignBoundaryError) as exc:
+        asyncio.run(_go())
+    assert exc.value.reason == "http_guard"
+
+
+def test_aiohttp_guard_blocks_non_loopback_websocket(guard_cleanup):
+    # The web STT/TTS surfaces use ws_connect (deepgram/elevenlabs); the WS
+    # handshake flows through _request → the guard must block it too.
+    import aiohttp
+    install_sovereign_http_guard()
+
+    async def _go():
+        async with aiohttp.ClientSession() as s:
+            await s.ws_connect("wss://api.deepgram.com/v1/listen")
+
+    with pytest.raises(SovereignBoundaryError) as exc:
+        asyncio.run(_go())
+    assert exc.value.reason == "http_guard"
+
+
+def test_aiohttp_guard_allows_loopback_request(guard_cleanup):
+    # A loopback aiohttp request PASSES the guard (fails at the transport with a
+    # connection error since nothing is listening — NOT a SovereignBoundaryError).
+    import aiohttp
+    install_sovereign_http_guard()
+
+    async def _go():
+        async with aiohttp.ClientSession() as s:
+            await s.get("http://127.0.0.1:1/x")
+
+    with pytest.raises(aiohttp.ClientError):     # transport error, guard passed
+        asyncio.run(_go())
+
+
+def test_aiohttp_guard_noop_when_aiohttp_absent(guard_cleanup, monkeypatch):
+    # aiohttp not installed in this venv → install cleanly (httpx-only), no crash.
+    import alfred.sovereign.http_guard as hg
+    monkeypatch.setattr(hg, "_try_import_aiohttp", lambda: None)
+    with structlog.testing.capture_logs() as caps:
+        install_sovereign_http_guard()
+    assert is_sovereign_http_guard_installed() is True     # httpx still wrapped
+    assert is_aiohttp_guard_installed() is False           # aiohttp no-op'd, no crash
+    ev = [c for c in caps if c.get("event") == "sovereign.http_guard.installed"]
+    assert len(ev) == 1 and ev[0]["httpx"] is True and ev[0]["aiohttp"] is False
+
+
+def test_aiohttp_guard_covers_on_reinstall_after_available(guard_cleanup, monkeypatch):
+    # The "aiohttp installed later (web mount)" case: a fresh install AFTER
+    # aiohttp becomes importable must then cover it.
+    import aiohttp
+    import alfred.sovereign.http_guard as hg
+    monkeypatch.setattr(hg, "_try_import_aiohttp", lambda: None)
+    install_sovereign_http_guard()                 # httpx-only (aiohttp "absent")
+    assert is_aiohttp_guard_installed() is False
+    monkeypatch.setattr(hg, "_try_import_aiohttp", lambda: aiohttp)  # now "available"
+    install_sovereign_http_guard()                 # re-install → covers aiohttp
+    assert is_aiohttp_guard_installed() is True
+
+
+def test_http_guard_install_logs_coverage(guard_cleanup):
+    # Observability pin (#9): install surfaces which transports are guarded.
+    with structlog.testing.capture_logs() as caps:
+        install_sovereign_http_guard()
+    ev = [c for c in caps if c.get("event") == "sovereign.http_guard.installed"]
+    assert len(ev) == 1
+    assert ev[0]["httpx"] is True and ev[0]["aiohttp"] is True
