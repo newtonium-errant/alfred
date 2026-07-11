@@ -48,14 +48,17 @@ import html
 # makes the BROWSER itself refuse any off-box fetch even if the page were tampered
 # — a second belt under the sovereign no-egress boundary. ``script-src`` inherits
 # ``default-src 'self'`` (no inline scripts). ``base-uri 'none'`` + ``form-action
-# 'none'`` kill base-tag hijack + form exfil.
+# 'none'`` kill base-tag hijack + form exfil. ``frame-ancestors 'none'`` refuses
+# framing (clickjacking hardening — a framed page can't be tricked into toggling
+# an on-box recording; SOP already makes the frame's DOM/token unreadable).
 CSP_VALUE = (
     "default-src 'self'; "
     "connect-src 'self'; "
     "img-src 'self' data:; "
     "style-src 'self' 'unsafe-inline'; "
     "base-uri 'none'; "
-    "form-action 'none'"
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
 )
 
 # The token placeholder in the HTML template — replaced (HTML-attribute-escaped)
@@ -111,6 +114,7 @@ APP_JS = r"""'use strict';
   let recorder = null;
   let windowTimer = null;
   let chain = Promise.resolve();    // serial-in-flight: strict per-encounter chain
+  let stopped = false;              // latched once the encounter is halted (manual or terminal)
 
   const startBtn = document.getElementById('start');
   const stopBtn = document.getElementById('stop');
@@ -131,10 +135,14 @@ APP_JS = r"""'use strict';
 
   // Serial POST of one self-contained window blob. Retries the SAME seq on a
   // network/5xx error; treats a 409 (a retry after a possibly-lost 200) as
-  // 'already accepted -> advance'. Returns true iff the seq is now accepted.
-  async function postChunk(blob, chunkSeq, isFinal) {
+  // 'already accepted -> advance'. Returns true iff the seq is now accepted, or
+  // false on a TERMINAL 4xx (413 cap / 403 / 401 / 400) or exhausted retries —
+  // the CALLER then actually stops (N1: recording must not keep hammering the
+  // same seq against a cap). The encounter is closed by the dedicated
+  // /scribe/close (robust even if the final chunk's 200 was lost), never a
+  // close-flag on a chunk that might itself be the lost one.
+  async function postChunk(blob, chunkSeq) {
     const params = new URLSearchParams({ label: label, seq: String(chunkSeq), ext: EXT, synthetic: 'true' });
-    if (isFinal) { params.set('close', 'true'); }
     const url = '/scribe/ingest-chunk?' + params.toString();
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
@@ -146,18 +154,14 @@ APP_JS = r"""'use strict';
         });
         if (resp.status === 200) { return true; }
         if (resp.status === 409) { return true; }           // already accepted -> advance
-        if (resp.status >= 400 && resp.status < 500) {      // hard client error (413/403/400)
-          show('Chunk ' + chunkSeq + ' rejected (' + resp.status + '). Stopping.');
-          return false;
-        }
+        if (resp.status >= 400 && resp.status < 500) { return false; }  // TERMINAL 4xx -> caller stops
         // 5xx -> fall through to retry
       } catch (e) {
         // network error -> retry same seq (idempotent by content-hash server-side)
       }
       await sleep(400 * (attempt + 1));
     }
-    show('Chunk ' + chunkSeq + ' failed after retries.');
-    return false;
+    return false;                                           // retries exhausted -> caller stops
   }
 
   // B2 — ONE fresh MediaRecorder per window. NO timeslice: start() with no arg
@@ -170,7 +174,7 @@ APP_JS = r"""'use strict';
     recorder.onstop = () => {
       const captured = blob;
       blob = null;                                          // R5: drop the reference (memory-only)
-      if (captured && captured.size > 0) {
+      if (captured && captured.size > 0 && !stopped) {      // don't enqueue after a stop (no stray post-close chunk)
         chain = chain.then(async () => {                    // serial: enqueue on the chain
           // seq is computed HERE (inside the chain), AFTER the prior chunk has
           // advanced it — NOT at onstop time. Recording windows are continuous,
@@ -178,8 +182,9 @@ APP_JS = r"""'use strict';
           // seq at onstop time would collide both on seq (the backend seq check is
           // check-then-write across the await → duplicate seq = last-writer-wins).
           const chunkSeq = seq + 1;
-          const ok = await postChunk(captured, chunkSeq, false);
+          const ok = await postChunk(captured, chunkSeq);
           if (ok) { seq = chunkSeq; }
+          else { stopEncounter('Chunk ' + chunkSeq + ' rejected — recording stopped, encounter closed.'); }
         });
       }
       if (recording) { startWindow(); }                     // next window = a NEW recorder
@@ -215,6 +220,7 @@ APP_JS = r"""'use strict';
     label = newLabel();
     seq = 0;
     recording = true;
+    stopped = false;
     chain = Promise.resolve();
     stopBtn.disabled = false;
     show('Recording. chunks=0 state=recording');
@@ -222,11 +228,38 @@ APP_JS = r"""'use strict';
     pollStatus();
   }
 
-  async function stop() {
-    stopBtn.disabled = true;
+  // N1 — halt recording + finalize. SHARED by the manual Stop button AND a
+  // terminal chunk failure (a 4xx cap/reject or exhausted retries). Idempotent
+  // (latched by `stopped`). Enqueues the /scribe/close on the chain but does NOT
+  // await it here, so it is safe to call from INSIDE a chain link (awaiting the
+  // chain from within a chain link would self-deadlock). The manual Stop handler
+  // awaits the chain separately to reflect the final state.
+  function stopEncounter(msg) {
+    if (stopped) { return; }
+    stopped = true;
     recording = false;
     clearTimeout(windowTimer);
-    // Flush the in-progress window (its onstop enqueues its POST on the chain).
+    try { if (recorder && recorder.state === 'recording') { recorder.stop(); } } catch (e) {}
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    stopBtn.disabled = true;
+    // Drain every queued chunk POST, THEN an explicit /scribe/close (robust even
+    // if a final chunk's 200 was lost — the close finalizes to ready regardless).
+    chain = chain.then(async () => {
+      try {
+        await fetch('/scribe/close?label=' + encodeURIComponent(label), {
+          method: 'POST', headers: { 'Authorization': 'Bearer ' + TOKEN }, cache: 'no-store',
+        });
+      } catch (e) { /* operator can re-close from status if needed */ }
+      show(msg || 'Finished. Encounter closed.');
+      startBtn.disabled = false;
+    });
+  }
+
+  async function stop() {
+    // Stop spawning new windows FIRST (so the flushed window's onstop, which sees
+    // `stopped` still false, enqueues its final chunk but does NOT start another).
+    recording = false;
+    clearTimeout(windowTimer);
     if (recorder && recorder.state === 'recording') {
       await new Promise((res) => {
         const prev = recorder.onstop;
@@ -234,19 +267,8 @@ APP_JS = r"""'use strict';
         recorder.stop();
       });
     }
-    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
-    // Drain every queued chunk POST, THEN close (an explicit /scribe/close so a
-    // lost final-chunk 200 still finalizes the encounter to ready).
-    chain = chain.then(async () => {
-      try {
-        await fetch('/scribe/close?label=' + encodeURIComponent(label), {
-          method: 'POST', headers: { 'Authorization': 'Bearer ' + TOKEN }, cache: 'no-store',
-        });
-      } catch (e) { /* operator can re-close from status if needed */ }
-      show('Finished. Encounter closed (chunks=' + seq + ').');
-    });
-    await chain;
-    startBtn.disabled = false;
+    stopEncounter('Finished. Encounter closed.');           // latch + enqueue close
+    await chain;                                            // drain queued POSTs + the close
   }
 
   startBtn.addEventListener('click', start);

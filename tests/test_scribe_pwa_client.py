@@ -171,6 +171,38 @@ def test_page_not_reachable_cross_origin_no_cors(tmp_path):
     assert not any(k.lower().startswith("access-control-") for k in headers)
 
 
+def test_static_page_rejects_cross_origin_sec_fetch_site(tmp_path):
+    # NOTE-1 belt: the token-bearing page is not even SERVED to a CROSS-ORIGIN
+    # fetch (Sec-Fetch-Site cross-site/same-site → refused), while a direct
+    # operator nav ('none' / absent) and the same-origin app.js subresource still
+    # load. FAIL-OPEN on an absent header (older nav) — must not break the page.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for name, sfs in (("cross", "cross-site"), ("samesite", "same-site")):
+                async with s.get(base + iw.PAGE_ROUTE, headers={"Sec-Fetch-Site": sfs}) as r:
+                    out[name] = (r.status, _TOKEN in await r.text())
+            # direct nav (Sec-Fetch-Site: none) → served
+            async with s.get(base + iw.PAGE_ROUTE, headers={"Sec-Fetch-Site": "none"}) as r:
+                out["none"] = r.status
+            # same-origin app.js subresource → served
+            async with s.get(base + iw.APP_JS_ROUTE, headers={"Sec-Fetch-Site": "same-origin"}) as r:
+                out["appjs_same_origin"] = r.status
+            # absent header (older nav / non-browser) → FAIL-OPEN, served
+            async with s.get(base + iw.PAGE_ROUTE) as r:
+                out["absent"] = r.status
+        return out
+
+    out = asyncio.run(_go())
+    assert out["cross"] == (421, False)        # cross-site refused, token NOT served
+    assert out["samesite"] == (421, False)     # same-site (cross-origin) refused
+    assert out["none"] == 200                  # direct operator nav served
+    assert out["appjs_same_origin"] == 200     # same-origin subresource served
+    assert out["absent"] == 200                # fail-open — real page load not broken
+
+
 def test_csp_value_is_strict():
     # The exact directives the sovereign lens requires. Note: NO script-src
     # override → scripts inherit default-src 'self' (inline scripts blocked).
@@ -181,6 +213,7 @@ def test_csp_value_is_strict():
         "style-src 'self' 'unsafe-inline'",
         "base-uri 'none'",
         "form-action 'none'",
+        "frame-ancestors 'none'",       # NOTE-2: clickjacking — page can't be framed
     ):
         assert directive in CSP_VALUE
     assert "script-src" not in CSP_VALUE                   # scripts fall back to 'self' (no unsafe-inline)
@@ -275,6 +308,27 @@ def test_pwa_serial_in_flight_and_409_advance():
     assert "const chunkSeq = seq + 1" not in APP_JS.split("chain = chain.then")[0]
     # close is enqueued on the chain AFTER the last chunk drains.
     assert "/scribe/close?label=" in APP_JS
+
+
+def test_pwa_terminal_4xx_actually_stops():
+    # N1 (FIX 3) — a TERMINAL 4xx (cap/reject) or exhausted retries returns false
+    # from postChunk, and the caller ACTUALLY stops (halt recording + close) rather
+    # than keep hammering the same seq against the cap.
+    assert "if (resp.status >= 400 && resp.status < 500) { return false; }" in APP_JS
+    # the chunk closure calls stopEncounter on a non-ok result.
+    assert re.search(r"if \(ok\) \{ seq = chunkSeq; \}\s*else \{ stopEncounter\(", APP_JS)
+    # stopEncounter halts recording (latched) and enqueues the close.
+    assert "function stopEncounter(" in APP_JS
+    assert "stopped = true;" in APP_JS and "recording = false;" in APP_JS
+
+
+def test_pwa_no_dead_close_flag_on_chunk():
+    # N2 (FIX 4) — the dead close-on-chunk branch is removed. The client NEVER sets
+    # close=true on an ingest-chunk; the encounter is finalized solely by the
+    # dedicated /scribe/close (robust even if a final chunk's 200 was lost).
+    assert "close" not in APP_JS.split("/scribe/ingest-chunk")[1].split("for (let attempt")[0]
+    assert "isFinal" not in APP_JS                          # the dead parameter is gone
+    assert "postChunk(captured, chunkSeq)" in APP_JS        # call site has no isFinal arg
 
 
 def test_pwa_no_browser_storage():

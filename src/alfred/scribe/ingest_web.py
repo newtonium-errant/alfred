@@ -222,10 +222,21 @@ def _build_security_middleware(config: ScribeConfig):
         if not _peername_is_loopback(request):
             log.warning("scribe.ingest_web.rejected", route=request.path, reason="non_loopback_peer")
             return _reject("forbidden", 403)
-        # (R3.3) bearer token — constant-time compare, fail-closed on an empty
-        # configured or provided token. REQUIRED on the API routes; EXEMPT on the
-        # static page + app.js (a navigation GET carries no bearer).
-        if request.path not in _BEARER_EXEMPT_PATHS:
+        if request.path in _BEARER_EXEMPT_PATHS:
+            # NOTE-1 belt — the static page carries the ingest token, so refuse to
+            # even SERVE it to a CROSS-ORIGIN fetch (SOP-blocks-READ stays the real
+            # guarantee; this is defense-in-depth). ``Sec-Fetch-Site`` is ``none``
+            # for a direct operator navigation and ``same-origin`` for the app.js
+            # subresource; ``cross-site`` / ``same-site`` is a cross-origin fetch →
+            # refused. FAIL-OPEN when the header is ABSENT (older browsers /
+            # non-browser clients omit it — must not break the real page load).
+            sfs = request.headers.get("Sec-Fetch-Site")
+            if sfs is not None and sfs not in ("same-origin", "none"):
+                log.warning("scribe.ingest_web.rejected", route=request.path, reason="cross_origin_fetch")
+                return _reject("cross_origin", 421)
+        else:
+            # (R3.3) bearer token — constant-time compare, fail-closed on an empty
+            # configured or provided token. REQUIRED on the API routes.
             provided = _bearer(request)
             if not (token and provided and secrets.compare_digest(provided, token)):
                 log.warning("scribe.ingest_web.rejected", route=request.path, reason="bad_token")
