@@ -5,7 +5,7 @@ title: "{{title}}"
 name: "{{title}}"
 created: "{{date}}"
 # --- AI-draft provenance (the sovereign scribe contract) ---
-ai_draft: true # true until a clinician attests; flips to false on attestation
+ai_draft: true # set true at create; the live-vs-sealed source of truth is 'status', not this boolean
 synthetic: true # PROVENANCE / the mode line — true = synthetic input (fail-closed default). A clinical (real-PHI) note carries synthetic: false ONLY once scribe.mode is flipped to clinical (gated on the legal de-id standard).
 # --- Attestation (set ONLY on the attest flip — the sole editable metadata) ---
 attested_by: null # clinician identity that reviewed + signed the note; null while ai_draft
@@ -34,9 +34,9 @@ permitted body mutation on a live draft). body_append / body_rewriter are DENIED
 even while ai_draft (P3-a WARN least-privilege + grounding-integrity: they would
 mutate the body WITHOUT refreshing grounding_flags, desyncing the draft from its
 grounding report), and mid-document body_insert_at stays denied. grounding_flags
-is the ONLY draft-editable
-frontmatter field (STAYC_CLINICAL_DRAFT_EDIT_FIELDS), refreshed alongside the
-body. The body is SEALED (anti-spoliation) the moment the note is attested or
+and draft_original are the ONLY draft-editable frontmatter fields
+(STAYC_CLINICAL_DRAFT_EDIT_FIELDS), refreshed alongside the body. The body is
+SEALED (anti-spoliation) the moment the note is attested or
 amended (status in {attested, amended}) — every body mutation is then frozen;
 fail-closed on missing/unknown status. The attest triad (attested_by /
 attested_at / status) is NEVER flipped in place here — it is orchestrator-only
