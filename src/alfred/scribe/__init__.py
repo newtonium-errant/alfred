@@ -20,9 +20,11 @@ from .attestation import (
     validate_status_transition,
 )
 from .config import (
+    INGEST_WEB_ALLOWED_KEYS,
     SCRIBE_MODE_CLINICAL,
     SCRIBE_MODE_SYNTHETIC,
     ScribeConfig,
+    ScribeIngestWebConfig,
     ScribeLlmConfig,
     ScribeSttConfig,
     load_from_unified,
@@ -95,6 +97,8 @@ __all__ = [
     "ScribeConfig",
     "ScribeSttConfig",
     "ScribeLlmConfig",
+    "ScribeIngestWebConfig",
+    "INGEST_WEB_ALLOWED_KEYS",
     "SCRIBE_MODE_SYNTHETIC",
     "SCRIBE_MODE_CLINICAL",
     "load_from_unified",

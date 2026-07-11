@@ -67,6 +67,65 @@ class ScribeLlmConfig:
     model: str = ""
 
 
+# The complete, closed set of keys the ``scribe.ingest_web`` sub-tree may carry.
+# Barrier (e) (boundary.py) refuses ANY other key when the server is enabled —
+# a ``base_url`` / ``webhook`` / ``forward_to`` / cloud-endpoint field in this
+# sub-tree would be an egress surface, so the sub-tree is allowlist-closed the
+# same way barrier (d) closes the top-level sections. Keep this in lockstep with
+# :class:`ScribeIngestWebConfig`'s fields.
+INGEST_WEB_ALLOWED_KEYS: frozenset[str] = frozenset({
+    "enabled", "host", "port", "token",
+    "max_chunk_bytes", "max_chunks_per_encounter", "max_encounter_bytes",
+})
+
+
+def coerce_ingest_web_enabled(value: Any) -> bool:
+    """Truthiness for the ``ingest_web.enabled`` flag — the SHARED contract used
+    by BOTH the typed loader (``_build_ingest_web``) AND barrier (e) in the
+    sovereign boundary. Sharing it guarantees "does the barrier validate the
+    bind" == "does the server actually bind": a quoted ``enabled: "false"`` is
+    inert in BOTH (not a false-positive barrier-e breach), and no value can bind
+    the server without also arming the barrier."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+@dataclass
+class ScribeIngestWebConfig:
+    """The loopback PWA ingest server (#49 STAY-C, Slice A).
+
+    INERT by default (``enabled: false``) — the daemon starts NO server unless
+    the operator flips it on. LOOPBACK-ONLY by construction: barrier (e) in the
+    sovereign boundary POSITIVELY asserts ``host`` is provably loopback at
+    config-load (a ``0.0.0.0`` bind is a LAN-reachable PHI-ingest hole that must
+    fail at the BARRIER, not merely at socket-bind → exit 79, non-restartable).
+    NO cloud/egress field belongs here — the sub-tree is allowlist-closed
+    (:data:`INGEST_WEB_ALLOWED_KEYS`); an unexpected key breaches barrier (e).
+
+    The server WRITES chunk audio + ``.meta.json`` sidecars into the encounter
+    inbox; the EXISTING sweep→accumulate→guard_ingest→local-STT→checkpoint
+    pipeline consumes them. The server writes NOTHING to the ledger or
+    ScribeState (the pipeline owns both) — it is a thin, write-only ingest face.
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8760
+    # Bearer token (``secrets.compare_digest``). Barrier (e) requires it PRESENT
+    # when enabled — a tokenless loopback ingest face is refused at load. Set via
+    # ``${SCRIBE_INGEST_TOKEN}`` (env substitution runs on this block), never
+    # inline in a committed config.
+    token: str = ""
+    # N3 caps — an explicit, signalled ceiling (never a silent drop). aiohttp's
+    # ``client_max_size`` is pinned to ``max_chunk_bytes``; the per-encounter
+    # chunk-count + total-byte caps are enforced in the route with a "cap hit"
+    # observability signal.
+    max_chunk_bytes: int = 25 * 1024 * 1024          # 25 MiB per POST
+    max_chunks_per_encounter: int = 4096
+    max_encounter_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GiB per encounter
+
+
 @dataclass
 class ScribeConfig:
     """Typed ``scribe:`` block.
@@ -80,6 +139,9 @@ class ScribeConfig:
     input_dir: str = _DEFAULT_INPUT_DIR
     stt: ScribeSttConfig = field(default_factory=ScribeSttConfig)
     llm: ScribeLlmConfig = field(default_factory=ScribeLlmConfig)
+    # The loopback PWA ingest server (#49). INERT by default; barrier (e)
+    # validates its host is loopback + token present when enabled.
+    ingest_web: ScribeIngestWebConfig = field(default_factory=ScribeIngestWebConfig)
     # Designated human-clinician identities allowed to ATTEST a clinical_note
     # (scribe P2-a, #41). A plain identity list — NOT a network sub-field, so
     # no boundary barrier applies (barriers a/b gate only stt/llm). FAIL-CLOSED:
@@ -156,6 +218,34 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
         input_dir=str(input_dir),
         stt=_build(ScribeSttConfig, scribe.get("stt")),
         llm=_build(ScribeLlmConfig, scribe.get("llm")),
+        ingest_web=_build_ingest_web(scribe.get("ingest_web")),
         clinicians=clinicians,
         encounter_salt=str(scribe.get("encounter_salt") or ""),
     )
+
+
+def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:
+    """Schema-tolerant build of :class:`ScribeIngestWebConfig` with explicit type
+    coercion (``enabled`` truthy→bool, ports/caps→int) so a YAML string value
+    (``enabled: "true"``, ``port: "8760"``) can't slip a wrong-typed field into
+    the server. Unknown keys are dropped by the ``__dataclass_fields__`` filter
+    (the load-time schema-tolerance contract); barrier (e) SEPARATELY refuses an
+    unknown key at load when the server is enabled (that is the security gate —
+    this coercion is convenience, not the boundary)."""
+    if not isinstance(data, dict):
+        return ScribeIngestWebConfig()
+    known = {k: v for k, v in data.items() if k in ScribeIngestWebConfig.__dataclass_fields__}
+    cfg = ScribeIngestWebConfig()
+    if "enabled" in known:
+        cfg.enabled = coerce_ingest_web_enabled(known["enabled"])
+    if "host" in known:
+        cfg.host = str(known["host"])
+    if "token" in known:
+        cfg.token = str(known["token"])
+    for int_field in ("port", "max_chunk_bytes", "max_chunks_per_encounter", "max_encounter_bytes"):
+        if int_field in known:
+            try:
+                setattr(cfg, int_field, int(known[int_field]))
+            except (TypeError, ValueError):
+                pass  # keep the default; a nonsense value never crashes the load
+    return cfg

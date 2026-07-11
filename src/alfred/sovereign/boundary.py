@@ -27,6 +27,11 @@ never pay for it. When enforcement IS requested, the boundary raises
   (d) No egress transport wired — ``transport`` / peer-push / brief-push /
       ticket-forward / mail / message_bus / pending_items / daily_sync /
       telegram. A sovereign slot has no network surface to push PHI over.
+  (e) The loopback PWA ingest server (#49), when ``scribe.ingest_web.enabled``,
+      binds ONLY to a provably-loopback host (0.0.0.0/:: refused at LOAD, before
+      any socket binds), carries a bearer token, and has NO egress-shaped field
+      in its allowlist-closed sub-tree. A no-op when the server is INERT (the
+      default).
 
 Plus a per-call :class:`SovereignHttpGuard` (see :mod:`alfred.sovereign.http_guard`)
 that asserts loopback before connect on every outbound httpx request, to catch
@@ -209,7 +214,7 @@ class SovereignBoundaryError(Exception):
     Non-restartable. The orchestrator maps this to exit 79
     (``_SOVEREIGN_BREACH_EXIT``) and MUST NOT auto-restart — a restart would
     only re-attempt a cloud-reachable start. ``reason`` is the barrier id
-    (``barrier_a`` .. ``barrier_d`` / ``http_guard``) for greppable triage;
+    (``barrier_a`` .. ``barrier_e`` / ``http_guard``) for greppable triage;
     ``detail`` is the operator-facing specifics.
     """
 
@@ -374,6 +379,76 @@ def _check_no_egress(raw: dict[str, Any]) -> None:
         )
 
 
+def _check_ingest_web_loopback(raw: dict[str, Any]) -> None:
+    """Barrier (e) — the loopback PWA ingest server (#49) is bind-safe. Fail-closed.
+
+    A NO-OP unless ``scribe.ingest_web.enabled`` is truthy (the server is INERT by
+    default). When the server IS enabled, POSITIVELY assert THREE things at
+    config-load — BEFORE any socket binds — so a LAN-reachable PHI-ingest hole
+    can never reach ``AppRunner``:
+
+      1. ``host`` is provably loopback (REUSES :func:`host_is_loopback` — accepts
+         127.0.0.1/::1/localhost, rejects 0.0.0.0/:: /a resolvable LAN name).
+         This is the must-have: a ``0.0.0.0`` bind must fail HERE, not merely at
+         socket-bind (which would already be listening on the LAN).
+      2. a bearer ``token`` is PRESENT (non-empty) — a tokenless loopback ingest
+         face is refused (defense-in-depth beyond loopback: an on-box hostile
+         process could otherwise POST PHI-adjacent audio).
+      3. NO unexpected key in the ``ingest_web`` sub-tree — it is allowlist-closed
+         to :data:`~alfred.scribe.config.INGEST_WEB_ALLOWED_KEYS`. A ``base_url`` /
+         ``webhook`` / ``forward_to`` / cloud-endpoint field here would be an
+         egress surface, so it is fail-closed the same way barrier (d) closes the
+         top-level sections.
+
+    All three raise ``barrier_e`` (→ exit 79, non-restartable).
+    """
+    from alfred.scribe.config import INGEST_WEB_ALLOWED_KEYS, coerce_ingest_web_enabled
+
+    scribe = raw.get("scribe") or {}
+    if not isinstance(scribe, dict):
+        return
+    ingest = scribe.get("ingest_web") or {}
+    # Use the SHARED enabled-coercion so "does the barrier validate the bind" ==
+    # "does the server actually bind" (a quoted ``enabled: "false"`` is inert in
+    # BOTH — no false-positive breach; and nothing can bind without arming this).
+    if not isinstance(ingest, dict) or not coerce_ingest_web_enabled(ingest.get("enabled")):
+        return  # INERT — no server binds, nothing to validate
+
+    # (3) allowlist-closed sub-tree — refuse any egress-shaped field.
+    unexpected = sorted(k for k in ingest if k not in INGEST_WEB_ALLOWED_KEYS)
+    if unexpected:
+        allowed = ", ".join(sorted(INGEST_WEB_ALLOWED_KEYS))
+        raise SovereignBoundaryError(
+            "barrier_e",
+            f"scribe.ingest_web carries unexpected field(s): "
+            f"{', '.join(unexpected)}. The ingest sub-tree is allowlist-closed to "
+            f"[{allowed}] — a cloud endpoint / webhook / forward field here would "
+            f"be an egress surface and is refused (fail-closed).",
+        )
+
+    # (1) loopback host — the must-have.
+    host = str(ingest.get("host") or "").strip()
+    if not host_is_loopback(host):
+        raise SovereignBoundaryError(
+            "barrier_e",
+            f"scribe.ingest_web.host {host or '(unset)'!r} is not provably "
+            f"loopback ({', '.join(sorted(LOOPBACK_HOSTS))}). A sovereign PWA "
+            f"ingest server may bind ONLY to loopback — a 0.0.0.0/:: (or a "
+            f"resolvable LAN) bind is a LAN-reachable PHI-ingest hole. Refusing "
+            f"at load (before any socket binds).",
+        )
+
+    # (2) token present.
+    token = str(ingest.get("token") or "").strip()
+    if not token:
+        raise SovereignBoundaryError(
+            "barrier_e",
+            "scribe.ingest_web.token is unset — a sovereign PWA ingest server "
+            "requires a bearer token (loopback alone is insufficient: an on-box "
+            "process could POST). Set ${SCRIBE_INGEST_TOKEN}.",
+        )
+
+
 # --- Public gate ------------------------------------------------------------
 
 def validate_sovereign_boundary(
@@ -416,6 +491,7 @@ def validate_sovereign_boundary(
         _check_llm_loopback(raw)
         _check_no_cloud_key(raw, env)
         _check_no_egress(raw)
+        _check_ingest_web_loopback(raw)
     except SovereignBoundaryError as e:
         log.error(
             "sovereign_boundary_refused",

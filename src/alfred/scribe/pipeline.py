@@ -33,6 +33,7 @@ error-class (no PHI), and emits NO partial/unverified note to the vault.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -174,9 +175,14 @@ async def process_source(
         return "refused"
 
     try:
-        # recorded → transcribing (STT, local).
+        # recorded → transcribing (STT, local). W1 — the sync, CPU-bound whisper
+        # decode runs OFF the event loop (asyncio.to_thread) so a multi-second
+        # transcribe never stalls the shared loop (the ingest server rides the
+        # same loop; a blocked loop would freeze in-flight ingest POSTs).
         state.set(source_id, state=STATE_TRANSCRIBING)
-        transcript = stt_mod.transcribe(config, audio_path, source_id=source_id)
+        transcript = await asyncio.to_thread(
+            stt_mod.transcribe, config, audio_path, source_id=source_id,
+        )
 
         # transcribing → structuring (delta → note-gen → verify → render).
         state.set(source_id, state=STATE_STRUCTURING)
@@ -338,6 +344,9 @@ class AccumResult:
     frozen: bool = False     # a seq gap → encounter frozen (never fold over a hole)
     closed: bool = False     # the _CLOSED sentinel finalized the encounter
     segments: int = 0        # accumulated segment count after this pass
+    decode_failed: bool = False  # W2: a chunk failed to STT-decode → THIS encounter
+                                 # held this pass, isolated (the sweep + other
+                                 # encounters are unaffected)
 
 
 def is_chunk_settled(
@@ -476,7 +485,29 @@ def accumulate_encounter(
                 detail="chunk not synthetic in synthetic mode — REFUSED, not folded",
             )
             break                         # fail-closed: never fold past a refusal
-        chunk_tx = stt_mod.transcribe(config, chunk_path, source_id=encounter_id)
+        # W2 — per-chunk STT ISOLATION. One undecodable chunk (a corrupt/headerless
+        # blob — the #1 client trap, B2) must NOT propagate out and kill the whole
+        # sweep (which would re-fail every 30s forever, STARVING every other
+        # encounter). Isolate it: this encounter is HELD at this seq this pass
+        # (never fold over a hole → fail-closed, same posture as a seq gap), an
+        # explicit signal is emitted (intentionally-left-blank — a decode failure
+        # is distinguishable from idle), and we STOP folding THIS encounter but
+        # return normally so run_sweep continues to the next one.
+        try:
+            chunk_tx = stt_mod.transcribe(config, chunk_path, source_id=encounter_id)
+        except Exception as e:  # noqa: BLE001 — fail-isolated, not fail-whole
+            result.decode_failed = True
+            log.warning(
+                "scribe.accumulator.chunk_decode_failed",
+                encounter_id=encounter_id,     # opaque id only — NO PHI (NOTE-4)
+                seq=seq,
+                error_class=type(e).__name__,  # class only — never the message
+                detail=(
+                    "chunk failed to STT-decode — encounter HELD at this seq "
+                    "(isolated); the sweep + other encounters are unaffected"
+                ),
+            )
+            break                              # hold this encounter; do not fold over the hole
         offset = transcript.segments[-1].end_s if transcript.segments else 0.0
         if transcript.append_chunk(
             chunk_tx, audio_offset_s=offset, chunk_key=chunk_key, seq=seq,
@@ -502,6 +533,7 @@ def accumulate_encounter(
         frozen=result.frozen,
         closed=result.closed,
         segments=result.segments,
+        decode_failed=result.decode_failed,
     )
     return result
 
@@ -733,24 +765,43 @@ async def run_sweep(
         counts[outcome] = counts.get(outcome, 0) + 1
 
     # (2) per-encounter accumulate (P3-b1 fold) → checkpoint (P3-b2 note-gen).
+    # W1 — accumulate_encounter is sync + CPU-bound (it runs the whisper decode);
+    # run it OFF the event loop so the shared loop (which the ingest server rides)
+    # stays free to service ingest POSTs during a multi-second decode.
+    # W2 — per-SUBDIR isolation: one broken encounter (an undecodable chunk it
+    # couldn't self-isolate, a corrupt dir, a ledger/OS error) must NOT kill the
+    # sweep and starve every OTHER encounter every 30s. Wrap each subdir; a
+    # failure logs an explicit signal and the sweep CONTINUES to the next one.
     for enc_dir in subdirs:
-        r = accumulate_encounter(enc_dir, config=config)
         counts["encounters"] += 1
-        counts["chunks_folded"] += r.folded
-        counts["held"] += r.held
-        counts["chunks_refused"] += r.refused
-        counts["frozen"] += 1 if r.frozen else 0
-        # Checkpoint trigger — evolve the draft when a chunk folded, and finalize
-        # on _CLOSED. (No fold + not closed ⇒ nothing to do; don't call.)
-        if r.folded > 0 or r.closed:
-            outcome = await checkpoint_encounter(
-                enc_dir, encounter_id=r.encounter_id, config=config,
-                state=state, vault_path=vault_path,
-                did_fold=r.folded > 0, closed=r.closed,
+        try:
+            r = await asyncio.to_thread(accumulate_encounter, enc_dir, config=config)
+            counts["chunks_folded"] += r.folded
+            counts["held"] += r.held
+            counts["chunks_refused"] += r.refused
+            counts["frozen"] += 1 if r.frozen else 0
+            # Checkpoint trigger — evolve the draft when a chunk folded, and
+            # finalize on _CLOSED. (No fold + not closed ⇒ nothing to do.)
+            if r.folded > 0 or r.closed:
+                outcome = await checkpoint_encounter(
+                    enc_dir, encounter_id=r.encounter_id, config=config,
+                    state=state, vault_path=vault_path,
+                    did_fold=r.folded > 0, closed=r.closed,
+                )
+                key = _CHECKPOINT_COUNT_KEY.get(outcome)
+                if key:
+                    counts[key] += 1
+        except Exception as e:  # noqa: BLE001 — per-subdir fail-isolated, not fail-whole
+            counts["failed"] += 1
+            log.warning(
+                "scribe.pipeline.encounter_error",
+                error_class=type(e).__name__,   # class only — NO PHI, NO dir name (may be label)
+                detail=(
+                    "an encounter subdir failed this sweep — ISOLATED; the sweep "
+                    "continues to the remaining encounters (fail-isolated)"
+                ),
             )
-            key = _CHECKPOINT_COUNT_KEY.get(outcome)
-            if key:
-                counts[key] += 1
+            continue
 
     flat_work = counts["drafted"] + counts["refused"] + counts["failed"]
     acc_work = (

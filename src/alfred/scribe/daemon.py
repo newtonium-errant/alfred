@@ -110,6 +110,37 @@ def _state_path(raw: dict, config) -> str:
     return str(Path(log_dir) / "scribe_state.json")
 
 
+async def _maybe_start_ingest_server(config: ScribeConfig):
+    """Start the loopback PWA ingest server IFF ``ingest_web.enabled``.
+
+    Returns the started :class:`~alfred.scribe.ingest_web.IngestWebServer`, or
+    ``None`` when the server is INERT (the default). Attests
+    ``scribe.ingest_web.up`` either way (intentionally-left-blank: an inert
+    server is distinguishable from a broken one). The bind host is already proven
+    loopback by barrier (e) at load — this trusts that gate.
+    """
+    web_cfg = config.ingest_web
+    if not web_cfg.enabled:
+        log.info(
+            "scribe.ingest_web.up",
+            enabled=False,
+            detail="ingest server INERT (scribe.ingest_web.enabled:false) — no socket bound",
+        )
+        return None
+    from alfred.scribe.ingest_web import IngestWebServer
+
+    server = IngestWebServer(config)
+    await server.start()
+    log.info(
+        "scribe.ingest_web.up",
+        enabled=True,
+        host=web_cfg.host,
+        port=web_cfg.port,
+        detail="sovereign loopback PWA ingest server bound (barrier-e validated).",
+    )
+    return server
+
+
 async def run(
     raw: dict,
     *,
@@ -140,9 +171,21 @@ async def run(
         detail="sovereign scribe pipeline watching input_dir (synthetic-gated).",
     )
 
-    while True:
-        try:
-            await run_sweep(config, state, vault_path)
-        except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop
-            log.exception("scribe.daemon.sweep_error")
-        await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+    # The loopback PWA ingest server (#49) rides THIS event loop alongside the
+    # sweep — the guard is already installed (startup step c), so the server
+    # comes up AFTER it. INERT unless enabled. Stopped in the shutdown finally so
+    # a graceful terminate tears the socket down cleanly. Exit/restart semantics
+    # are UNCHANGED: a bind error propagates like any sweep-stack error (generic
+    # restartable exit), NOT a sovereign/dep exit (79/78).
+    server = await _maybe_start_ingest_server(config)
+    try:
+        while True:
+            try:
+                await run_sweep(config, state, vault_path)
+            except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop
+                log.exception("scribe.daemon.sweep_error")
+            await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+    finally:
+        if server is not None:
+            await server.stop()
+            log.info("scribe.ingest_web.down", detail="ingest server stopped (graceful shutdown)")
