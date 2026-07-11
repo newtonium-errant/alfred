@@ -18,6 +18,19 @@ CURATION POLICY (locked by design review):
     gap (an abbreviated inferred dx isn't flagged) — the SAFE direction under the
     precision>recall posture (attest is the backstop; the recall gap is what the
     self-correcting increment grows).
+  * SCREENING-TOOL-NAME COLLISION (the same false-CLEAR class, generalised):
+    EXCLUDE any abbreviation that is a SUBSTRING of a screening-tool / scale name,
+    not only abbrevs that collide with another DIAGNOSIS. ``\\bgad\\b`` matches
+    INSIDE the instrument name ``GAD-7`` / ``GAD-2`` (the hyphen is a word
+    boundary), so a cited "GAD-7 score is 15" segment would be read as the
+    DIAGNOSIS being stated and would spuriously CLEAR an inferred GAD fabrication
+    (a high-harm false-NEGATIVE on anxiety, the 2nd-most-common inferred dx). So
+    ``gad`` is NOT a matchable form; only the full ``generalized/generalised
+    anxiety disorder`` is. Reviewer audit (2026-07-11): GAD-7/GAD-2 is the ONLY
+    current tool-name collision — PHQ-9 ∌ ``mdd``; the ADHD/PTSD/OCD instruments
+    are ASRS / PCL / Y-BOCS (no embedded dx abbrev); the medical-dx abbrevs are
+    clean — but the RULE prevents recurrence as the set grows (e.g. a future entry
+    must not add an abbrev embedded in its own screening scale).
   * WORD-BOUNDARY PHRASE match, NEVER substring — ``depression`` never matches
     inside ``major depression``; ``\\bMDD\\b`` never matches inside a longer token.
 
@@ -51,7 +64,10 @@ def _entry(canonical: str, *synonyms: str) -> DiagnosisEntry:
 DIAGNOSIS_LEXICON: tuple[DiagnosisEntry, ...] = (
     # --- mental health (the #48 core surface — SSRI/score-inferred) ---
     _entry("major depressive disorder", "major depression", "mdd"),
-    _entry("generalized anxiety disorder", "generalised anxiety disorder", "gad"),
+    # "gad" abbrev EXCLUDED — it is a substring of the screening tool GAD-7/GAD-2
+    # (the hyphen is a word boundary), so a cited "GAD-7 score" would false-CLEAR
+    # an inferred GAD. Full labels only (see the SCREENING-TOOL-NAME COLLISION rule).
+    _entry("generalized anxiety disorder", "generalised anxiety disorder"),
     _entry("panic disorder"),
     _entry("post-traumatic stress disorder", "posttraumatic stress disorder", "ptsd"),
     _entry("bipolar disorder", "bipolar affective disorder"),

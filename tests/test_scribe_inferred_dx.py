@@ -86,6 +86,28 @@ def test_3_inferred_mdd_the_48_case_flagged():
     assert flags[0].section == "assessment"
 
 
+def test_3b_inferred_gad_screening_tool_collision_flagged():
+    # REVIEW BLOCK — the GAD ← GAD-7 tool-name collision (same false-CLEAR class as
+    # the MS/MI abbrev exclusions). An inferred GAD assessment citing a "GAD-7
+    # score is 15" segment (no dx LABEL) MUST be FLAGGED. Pre-fix, "gad" matched
+    # INSIDE "GAD-7" → the score segment read as the dx stated → spuriously CLEARED
+    # (the fabrication slipped). Dropping the "gad" abbrev form fixes it. Mirrors
+    # the #48 MDD/PHQ-9 case (which never collided — PHQ-9 ∌ "mdd").
+    tx = _tx(
+        _seg(1, "Patient reports excessive worry most days for six months."),
+        _seg(2, "GAD-7 score is 15."),
+        _seg(3, "Started sertraline 25mg."),
+    )
+    note = _note(assessment=[Claim(claim="Generalized anxiety disorder", source_spans=["S1", "S2", "S3"])])
+    flags = _flagged(note, tx)
+    assert len(flags) == 1 and flags[0].reason == INFERRED_DIAGNOSIS_REASON
+    # the STATED case STILL clears — a cited segment naming the full dx label.
+    tx_stated = _tx(_seg(1, "Assessment: generalized anxiety disorder; GAD-7 was 15."))
+    assert _flagged(
+        _note(assessment=[Claim(claim="Generalized anxiety disorder", source_spans=["S1"])]), tx_stated
+    ) == []
+
+
 def test_4_inferred_invented_label_flagged():
     tx = _tx(_seg(1, "Mood swings and started on a mood stabiliser."))
     note = _note(assessment=[Claim(claim="Bipolar disorder", source_spans=["S1"])])
@@ -201,14 +223,23 @@ def test_inferred_flag_renders_inline_and_lands_in_metadata():
 # Lexicon curation policy — ambiguous abbreviations are NOT matchable forms
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("ambiguous", ["ms", "mi", "ra", "pd", "ad"])
+@pytest.mark.parametrize("ambiguous", ["ms", "mi", "ra", "pd", "ad", "gad"])
 def test_lexicon_excludes_ambiguous_abbreviations(ambiguous):
     # None of the dangerous abbreviations is a matchable form (false-CLEAR guard).
+    # "gad" is EXCLUDED for the screening-tool-name collision (GAD ⊂ GAD-7/GAD-2).
     all_forms = {f for e in DIAGNOSIS_LEXICON for f in e.forms}
     assert ambiguous not in all_forms
     # but the FULL labels ARE present.
     assert diagnoses_named_in("patient with multiple sclerosis")
     assert diagnoses_named_in("history of myocardial infarction")
+    assert diagnoses_named_in("assessment: generalized anxiety disorder")
+
+
+def test_screening_tool_name_does_not_clear_inferred_dx():
+    # The fix, at the matcher level: a cited screening-tool NAME must not register
+    # the DIAGNOSIS. "GAD-7 score is 15" names NO lexicon diagnosis.
+    assert diagnoses_named_in("GAD-7 score is 15") == []
+    assert diagnoses_named_in("PHQ-9 score is 18") == []      # never collided (kept as a pin)
 
 
 def test_lexicon_word_boundary_not_substring():
