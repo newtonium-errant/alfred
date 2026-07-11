@@ -450,23 +450,49 @@ def test_assert_aiohttp_loopback_resolves_base_url_relative():
 
 def test_aiohttp_guard_installed_and_reversible(guard_cleanup):
     import aiohttp
-    orig = aiohttp.ClientSession._request
+    orig_request = aiohttp.ClientSession._request
+    orig_init = aiohttp.ClientSession.__init__
     assert is_aiohttp_guard_installed() is False
     install_sovereign_http_guard()
     assert is_aiohttp_guard_installed() is True
-    assert aiohttp.ClientSession._request is not orig      # wrapped
+    assert aiohttp.ClientSession._request is not orig_request    # request wrapped
+    assert aiohttp.ClientSession.__init__ is not orig_init       # __init__ wrapped (redirect seam)
     wrapped = aiohttp.ClientSession._request
-    install_sovereign_http_guard()                          # idempotent, no double-wrap
+    install_sovereign_http_guard()                              # idempotent, no double-wrap
     assert aiohttp.ClientSession._request is wrapped
     uninstall_sovereign_http_guard()
     assert is_aiohttp_guard_installed() is False
-    assert aiohttp.ClientSession._request is orig           # restored
+    assert aiohttp.ClientSession._request is orig_request        # request restored
+    assert aiohttp.ClientSession.__init__ is orig_init           # __init__ restored
 
 
-def test_aiohttp_guard_blocks_non_loopback_request(guard_cleanup):
+_LOOPBACK_DIAL = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _install_connect_tripwire(monkeypatch):
+    """Patch aiohttp.TCPConnector.connect to RECORD every dialed host and REFUSE
+    any non-loopback dial (so a silently-regressed guard can NEVER really egress,
+    even in a future CI GREEN). Returns the ``dialed`` host list (the socket
+    tripwire — N2 belt)."""
+    import aiohttp
+    dialed: list[str] = []
+    orig = aiohttp.TCPConnector.connect
+
+    async def _tw(self, req, traces, timeout):
+        dialed.append(req.url.host)
+        if req.url.host not in _LOOPBACK_DIAL:
+            raise RuntimeError(f"socket tripwire: refused cloud dial to {req.url.host}")
+        return await orig(self, req, traces, timeout)
+
+    monkeypatch.setattr(aiohttp.TCPConnector, "connect", _tw)
+    return dialed
+
+
+def test_aiohttp_guard_blocks_non_loopback_request(guard_cleanup, monkeypatch):
     # THE mutation-bind: remove the aiohttp wrap → this non-loopback aiohttp
     # request is NOT blocked (proceeds to connect) → RED.
     import aiohttp
+    dialed = _install_connect_tripwire(monkeypatch)   # N2 belt: 0-socket proof
     install_sovereign_http_guard()
 
     async def _go():
@@ -476,12 +502,14 @@ def test_aiohttp_guard_blocks_non_loopback_request(guard_cleanup):
     with pytest.raises(SovereignBoundaryError) as exc:
         asyncio.run(_go())
     assert exc.value.reason == "http_guard"
+    assert "api.deepgram.com" not in dialed           # ZERO sockets to the cloud host
 
 
-def test_aiohttp_guard_blocks_non_loopback_websocket(guard_cleanup):
+def test_aiohttp_guard_blocks_non_loopback_websocket(guard_cleanup, monkeypatch):
     # The web STT/TTS surfaces use ws_connect (deepgram/elevenlabs); the WS
     # handshake flows through _request → the guard must block it too.
     import aiohttp
+    dialed = _install_connect_tripwire(monkeypatch)   # N2 belt: 0-socket proof
     install_sovereign_http_guard()
 
     async def _go():
@@ -491,6 +519,7 @@ def test_aiohttp_guard_blocks_non_loopback_websocket(guard_cleanup):
     with pytest.raises(SovereignBoundaryError) as exc:
         asyncio.run(_go())
     assert exc.value.reason == "http_guard"
+    assert "api.deepgram.com" not in dialed           # ZERO sockets to the cloud host
 
 
 def test_aiohttp_guard_allows_loopback_request(guard_cleanup):
@@ -539,3 +568,84 @@ def test_http_guard_install_logs_coverage(guard_cleanup):
     ev = [c for c in caps if c.get("event") == "sovereign.http_guard.installed"]
     assert len(ev) == 1
     assert ev[0]["httpx"] is True and ev[0]["aiohttp"] is True
+
+
+# --- W1: redirect targets re-asserted per-hop (hermetic, socket-tripwire) ----
+
+async def _serve_redirect_and_get(status, location):
+    """Run a loopback server that returns ``status`` with ``Location: location``,
+    then GET it under the installed guard. Returns (resp_status, body) if the
+    request completes, else the guard/transport exception propagates."""
+    import aiohttp
+    from aiohttp import web
+
+    app = web.Application()
+
+    async def _redirect(request):
+        return web.Response(status=status, headers={"Location": location})
+
+    async def _final(request):
+        return web.Response(text="OK")
+
+    app.router.add_route("*", "/enc", _redirect)
+    app.router.add_route("*", "/final", _final)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = list(runner.addresses)[0][1]
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://127.0.0.1:{port}/enc") as resp:
+                return resp.status, await resp.text()
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.parametrize("status", [301, 302, 307])  # 307 preserves body = the PHI case
+def test_aiohttp_guard_blocks_redirect_to_cloud(status, guard_cleanup, monkeypatch):
+    # W1: a LOOPBACK url that 3xx-redirects to a CLOUD host must be REFUSED, with
+    # ZERO sockets to the cloud host. MUTATION-BIND: remove the redirect re-assert
+    # (the __init__ TraceConfig injection) → aiohttp follows the redirect → the
+    # tripwire records the cloud dial + raises RuntimeError (not
+    # SovereignBoundaryError) → RED.
+    dialed = _install_connect_tripwire(monkeypatch)
+    install_sovereign_http_guard()
+
+    with pytest.raises(SovereignBoundaryError) as exc:
+        asyncio.run(_serve_redirect_and_get(
+            status, "https://api.deepgram.com/leak"))
+    assert exc.value.reason == "http_guard"
+    assert "api.deepgram.com" not in dialed          # 0 sockets to the cloud host
+    assert "127.0.0.1" in dialed                      # the loopback origin WAS dialed
+
+
+def test_aiohttp_guard_follows_loopback_to_loopback_redirect(guard_cleanup, monkeypatch):
+    # Per-hop re-assert is TRANSPARENT: a loopback→loopback redirect still
+    # auto-follows (relative Location resolves to the loopback origin).
+    dialed = _install_connect_tripwire(monkeypatch)
+    install_sovereign_http_guard()
+    status, body = asyncio.run(_serve_redirect_and_get(307, "/final"))
+    assert status == 200 and body == "OK"             # followed the loopback redirect
+    assert all(h in _LOOPBACK_DIAL for h in dialed)   # every dial stayed loopback
+
+
+def test_assert_aiohttp_redirect_loopback_blocks_cloud_location():
+    # Unit test of the redirect callback: a cloud Location → SovereignBoundaryError;
+    # a loopback (relative) Location resolved against a loopback origin → no raise.
+    import asyncio as _asyncio
+    import yarl
+    from types import SimpleNamespace
+    from alfred.sovereign.http_guard import _assert_aiohttp_redirect_loopback
+
+    def _params(origin, location):
+        resp = SimpleNamespace(headers={"Location": location})
+        return SimpleNamespace(url=yarl.URL(origin), response=resp)
+
+    # cloud absolute Location → blocked
+    with pytest.raises(SovereignBoundaryError):
+        _asyncio.run(_assert_aiohttp_redirect_loopback(
+            None, None, _params("http://127.0.0.1:8000/enc", "https://api.deepgram.com/x")))
+    # relative Location off a loopback origin → resolves loopback → no raise
+    _asyncio.run(_assert_aiohttp_redirect_loopback(
+        None, None, _params("http://127.0.0.1:8000/enc", "/final")))

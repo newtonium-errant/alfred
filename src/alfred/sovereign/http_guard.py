@@ -36,13 +36,22 @@ BOTH client transports the repo uses:
   * ``httpx.Client.send`` / ``httpx.AsyncClient.send`` — the Anthropic/OpenAI
     SDKs use httpx underneath; ``telegram/transcribe.py``'s hardcoded Groq
     endpoint uses httpx.
-  * ``aiohttp.ClientSession._request`` — the web STT/TTS surfaces
-    (``web/stt_deepgram.py`` Deepgram, ``web/tts_elevenlabs.py`` ElevenLabs) use
-    ``aiohttp.ClientSession`` WebSockets. The WS handshake is an HTTP GET upgrade
-    that flows through ``_request`` (``ws_connect -> request -> _request``), so
-    wrapping ``_request`` covers regular requests AND WebSocket connects. This
-    closes task #40 — the security prerequisite for the STAY-C PWA scribe
-    channel (#49). IMPORT-GUARDED: aiohttp is a web dependency that may be absent
+  * ``aiohttp.ClientSession._request`` + ``ClientSession.__init__`` — the web
+    STT/TTS surfaces (``web/stt_deepgram.py`` Deepgram, ``web/tts_elevenlabs.py``
+    ElevenLabs) use ``aiohttp.ClientSession`` WebSockets. The WS handshake is an
+    HTTP GET upgrade that flows through ``_request`` (``ws_connect -> request ->
+    _request``), so the ``_request`` wrap covers regular requests AND WebSocket
+    connects on the INITIAL url. REDIRECT TARGETS ARE RE-ASSERTED PER-HOP (W1):
+    aiohttp follows 3xx inside ``_request``'s own loop (default
+    ``allow_redirects=True``), so the ``_request`` wrap never re-fires on the
+    target — a guard ``TraceConfig`` injected at ``__init__`` re-asserts loopback
+    on every redirect hop's target (``on_request_redirect``), and a raising
+    callback aborts the follow BEFORE the next socket (hermetically verified on
+    aiohttp 3.13.5: 0 cloud dials). So a loopback URL that 3xx-redirects to a
+    cloud host is REFUSED, not followed — parity with the httpx path (which
+    defaults follow_redirects=False). This closes task #40 — the security
+    prerequisite for the STAY-C PWA scribe channel (#49). IMPORT-GUARDED: aiohttp
+    is a web dependency that may be absent
     from a given sovereign venv, so the aiohttp wrap is applied ONLY if aiohttp
     is importable; if absent it NO-OPS gracefully (httpx-only coverage, never a
     crash). ``is_aiohttp_guard_installed()`` + the ``sovereign.http_guard.installed``
@@ -79,6 +88,7 @@ log = structlog.get_logger(__name__)
 _orig_sync_send: Callable[..., Any] | None = None
 _orig_async_send: Callable[..., Any] | None = None
 _orig_aiohttp_request: Callable[..., Any] | None = None
+_orig_aiohttp_init: Callable[..., Any] | None = None
 
 
 def _assert_host_loopback(host: str, url_for_msg: str) -> None:
@@ -120,6 +130,28 @@ def _assert_aiohttp_loopback(session: Any, str_or_url: Any) -> None:
     _assert_host_loopback(url.host or "", str(url))
 
 
+async def _assert_aiohttp_redirect_loopback(session: Any, ctx: Any, params: Any) -> None:
+    """aiohttp ``on_request_redirect`` callback — RE-ASSERT loopback on the
+    redirect TARGET, per hop (W1 fix).
+
+    aiohttp follows 3xx redirects INSIDE ``_request``'s own loop (default
+    ``allow_redirects=True``), reassigning the URL internally — so the
+    ``_request`` initial-URL wrap never re-fires on the target. Without this, a
+    loopback URL that redirects to a cloud host would be followed PAST the guard
+    (materially weaker than the httpx path, which defaults follow_redirects=False).
+
+    ``params.url`` is the redirect ORIGIN (the URL that returned the 3xx); the
+    TARGET is the ``Location`` header, resolved relative against the origin
+    EXACTLY as aiohttp resolves it (``origin.join(location)``). RAISING here
+    aborts the follow BEFORE the next connection — HERMETICALLY VERIFIED on
+    aiohttp 3.13.5 (the raising trace callback yields 0 sockets to the cloud
+    host; the redirect mutation-bound test proves it)."""
+    import yarl
+    location = params.response.headers.get("Location", "")
+    target = params.url.join(yarl.URL(location))
+    _assert_host_loopback(target.host or "", str(target))
+
+
 def _try_import_aiohttp() -> Any | None:
     """Return the ``aiohttp`` module, or ``None`` if it is not installed.
 
@@ -157,28 +189,53 @@ def _install_httpx_guard() -> None:
 
 
 def _install_aiohttp_guard() -> bool:
-    """Wrap ``aiohttp.ClientSession._request`` IF aiohttp is installed.
+    """Wrap aiohttp IF installed — the request seam AND the redirect seam.
+
+    TWO wraps (both required — redirects follow inside ``_request``'s own loop):
+      * ``ClientSession._request`` — asserts loopback on the INITIAL url.
+      * ``ClientSession.__init__`` — injects a guard ``TraceConfig`` whose
+        ``on_request_redirect`` RE-asserts loopback on every 3xx TARGET (W1),
+        without clobbering user-supplied ``trace_configs``.
 
     Idempotent (no double-wrap). Returns True iff the aiohttp wrap is live after
     this call. No-ops gracefully (returns False) when aiohttp is absent — the
     guard is httpx-only then, never a crash. A later call (after aiohttp is
     installed) DOES apply the wrap (the ``_orig_aiohttp_request is None`` sentinel
     stays None until the wrap actually lands)."""
-    global _orig_aiohttp_request
+    global _orig_aiohttp_request, _orig_aiohttp_init
     if _orig_aiohttp_request is not None:
         return True  # already wrapped
     aiohttp = _try_import_aiohttp()
     if aiohttp is None:
         return False  # not installed → httpx-only coverage (graceful no-op)
 
+    # (1) initial-URL seam.
     _orig_aiohttp_request = aiohttp.ClientSession._request
-    _aiohttp_original = _orig_aiohttp_request
+    _aiohttp_request_original = _orig_aiohttp_request
 
     async def _guarded_request(self: Any, method: str, str_or_url: Any, *args: Any, **kwargs: Any) -> Any:
         _assert_aiohttp_loopback(self, str_or_url)
-        return await _aiohttp_original(self, method, str_or_url, *args, **kwargs)
+        return await _aiohttp_request_original(self, method, str_or_url, *args, **kwargs)
 
     aiohttp.ClientSession._request = _guarded_request  # type: ignore[method-assign]
+
+    # (2) per-hop REDIRECT seam — inject a guard TraceConfig at construction. Its
+    # on_request_redirect re-asserts loopback on the 3xx target; a raising
+    # callback aborts the follow BEFORE the next socket (hermetically verified on
+    # aiohttp 3.13.5 — 0 cloud dials). User-supplied trace_configs are preserved
+    # (appended, not clobbered).
+    _orig_aiohttp_init = aiohttp.ClientSession.__init__
+    _aiohttp_init_original = _orig_aiohttp_init
+
+    def _guarded_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        trace_configs = list(kwargs.get("trace_configs") or [])
+        guard_tc = aiohttp.TraceConfig()
+        guard_tc.on_request_redirect.append(_assert_aiohttp_redirect_loopback)
+        trace_configs.append(guard_tc)
+        kwargs["trace_configs"] = trace_configs
+        _aiohttp_init_original(self, *args, **kwargs)
+
+    aiohttp.ClientSession.__init__ = _guarded_init  # type: ignore[method-assign]
     return True
 
 
@@ -200,8 +257,9 @@ def install_sovereign_http_guard() -> None:
 
 
 def uninstall_sovereign_http_guard() -> None:
-    """Restore the original httpx ``send`` + aiohttp ``_request``. No-op if unset."""
-    global _orig_sync_send, _orig_async_send, _orig_aiohttp_request
+    """Restore the original httpx ``send`` + aiohttp ``_request`` / ``__init__``.
+    No-op if unset."""
+    global _orig_sync_send, _orig_async_send, _orig_aiohttp_request, _orig_aiohttp_init
     if _orig_sync_send is not None:
         httpx.Client.send = _orig_sync_send  # type: ignore[method-assign]
         httpx.AsyncClient.send = _orig_async_send  # type: ignore[method-assign]
@@ -211,7 +269,10 @@ def uninstall_sovereign_http_guard() -> None:
         aiohttp = _try_import_aiohttp()
         if aiohttp is not None:
             aiohttp.ClientSession._request = _orig_aiohttp_request  # type: ignore[method-assign]
+            if _orig_aiohttp_init is not None:
+                aiohttp.ClientSession.__init__ = _orig_aiohttp_init  # type: ignore[method-assign]
         _orig_aiohttp_request = None
+        _orig_aiohttp_init = None
 
 
 def is_sovereign_http_guard_installed() -> bool:
