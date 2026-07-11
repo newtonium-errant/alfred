@@ -455,15 +455,18 @@ def test_aiohttp_guard_installed_and_reversible(guard_cleanup):
     assert is_aiohttp_guard_installed() is False
     install_sovereign_http_guard()
     assert is_aiohttp_guard_installed() is True
-    assert aiohttp.ClientSession._request is not orig_request    # request wrapped
-    assert aiohttp.ClientSession.__init__ is not orig_init       # __init__ wrapped (redirect seam)
+    assert aiohttp.ClientSession._request is not orig_request    # request wrapped (the SINGLE seam)
+    # SINGLE-SEAM design (D1): the redirect guard rides the retroactive _request
+    # wrap via a lazily-injected TraceConfig — __init__ is NOT patched (an
+    # __init__-only injection had a pre-install-session blind spot).
+    assert aiohttp.ClientSession.__init__ is orig_init           # __init__ untouched
     wrapped = aiohttp.ClientSession._request
     install_sovereign_http_guard()                              # idempotent, no double-wrap
     assert aiohttp.ClientSession._request is wrapped
     uninstall_sovereign_http_guard()
     assert is_aiohttp_guard_installed() is False
     assert aiohttp.ClientSession._request is orig_request        # request restored
-    assert aiohttp.ClientSession.__init__ is orig_init           # __init__ restored
+    assert aiohttp.ClientSession.__init__ is orig_init           # __init__ still untouched
 
 
 _LOOPBACK_DIAL = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -606,9 +609,9 @@ async def _serve_redirect_and_get(status, location):
 def test_aiohttp_guard_blocks_redirect_to_cloud(status, guard_cleanup, monkeypatch):
     # W1: a LOOPBACK url that 3xx-redirects to a CLOUD host must be REFUSED, with
     # ZERO sockets to the cloud host. MUTATION-BIND: remove the redirect re-assert
-    # (the __init__ TraceConfig injection) → aiohttp follows the redirect → the
-    # tripwire records the cloud dial + raises RuntimeError (not
-    # SovereignBoundaryError) → RED.
+    # (the lazy TraceConfig injection in _ensure_aiohttp_redirect_guard) → aiohttp
+    # follows the redirect → the tripwire records the cloud dial + raises
+    # RuntimeError (not SovereignBoundaryError) → RED.
     dialed = _install_connect_tripwire(monkeypatch)
     install_sovereign_http_guard()
 
@@ -628,6 +631,49 @@ def test_aiohttp_guard_follows_loopback_to_loopback_redirect(guard_cleanup, monk
     status, body = asyncio.run(_serve_redirect_and_get(307, "/final"))
     assert status == 200 and body == "OK"             # followed the loopback redirect
     assert all(h in _LOOPBACK_DIAL for h in dialed)   # every dial stayed loopback
+
+
+def test_aiohttp_guard_blocks_redirect_on_pre_install_session(guard_cleanup, monkeypatch):
+    # D1: the redirect re-assert must be RETROACTIVE. A ClientSession constructed
+    # BEFORE the guard installs (the reviewer's repro) must STILL have its redirects
+    # blocked. The old __init__-only injection missed this (the session was built
+    # before __init__ was patched, so it carried no guard trace); the lazy inject on
+    # the retroactive _request wrap covers it. MUTATION-BIND: drop the lazy inject
+    # (or gate it behind __init__) → the pre-install session follows the redirect →
+    # tripwire records the cloud dial + raises RuntimeError (not
+    # SovereignBoundaryError) → RED.
+    import aiohttp
+    from aiohttp import web
+    dialed = _install_connect_tripwire(monkeypatch)
+
+    async def _go():
+        app = web.Application()
+
+        async def _redirect(request):
+            return web.Response(status=307, headers={"Location": "https://api.deepgram.com/leak"})
+
+        app.router.add_route("*", "/enc", _redirect)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = list(runner.addresses)[0][1]
+        # THE pre-install repro: build the session while the guard is NOT installed.
+        session = aiohttp.ClientSession()
+        assert is_aiohttp_guard_installed() is False
+        install_sovereign_http_guard()          # install AFTER the session exists
+        try:
+            async with session:
+                async with session.get(f"http://127.0.0.1:{port}/enc") as resp:
+                    await resp.text()
+        finally:
+            await runner.cleanup()
+
+    with pytest.raises(SovereignBoundaryError) as exc:
+        asyncio.run(_go())
+    assert exc.value.reason == "http_guard"
+    assert "api.deepgram.com" not in dialed          # 0 sockets to the cloud host
+    assert "127.0.0.1" in dialed                      # the loopback origin WAS dialed
 
 
 def test_assert_aiohttp_redirect_loopback_blocks_cloud_location():

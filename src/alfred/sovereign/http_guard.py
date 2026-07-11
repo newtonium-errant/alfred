@@ -41,16 +41,25 @@ BOTH client transports the repo uses:
     ElevenLabs) use ``aiohttp.ClientSession`` WebSockets. The WS handshake is an
     HTTP GET upgrade that flows through ``_request`` (``ws_connect -> request ->
     _request``), so the ``_request`` wrap covers regular requests AND WebSocket
-    connects on the INITIAL url. REDIRECT TARGETS ARE RE-ASSERTED PER-HOP (W1):
-    aiohttp follows 3xx inside ``_request``'s own loop (default
-    ``allow_redirects=True``), so the ``_request`` wrap never re-fires on the
-    target — a guard ``TraceConfig`` injected at ``__init__`` re-asserts loopback
-    on every redirect hop's target (``on_request_redirect``), and a raising
-    callback aborts the follow BEFORE the next socket (hermetically verified on
-    aiohttp 3.13.5: 0 cloud dials). So a loopback URL that 3xx-redirects to a
-    cloud host is REFUSED, not followed — parity with the httpx path (which
-    defaults follow_redirects=False). This closes task #40 — the security
-    prerequisite for the STAY-C PWA scribe channel (#49). IMPORT-GUARDED: aiohttp
+    connects on the INITIAL url. REDIRECT TARGETS ARE RE-ASSERTED PER-HOP (W1),
+    RETROACTIVELY: aiohttp follows 3xx inside ``_request``'s own loop (default
+    ``allow_redirects=True``), so the initial-URL wrap never re-fires on the
+    target. A SINGLE seam closes this — the ``_request`` wrap lazily injects a
+    guard ``TraceConfig`` into the LIVE session's ``_trace_configs`` on each
+    request (``_request`` rebuilds its per-request trace list from
+    ``self._trace_configs`` EVERY call — verified against aiohttp 3.13.5 source),
+    whose ``on_request_redirect`` re-asserts loopback on every 3xx target; a
+    raising callback aborts the follow BEFORE the next socket. Because the inject
+    rides the retroactive ``_request`` wrap (the CLASS method — it fires for
+    sessions constructed BEFORE the guard installed too), the redirect re-assert
+    is exactly as retroactive as the initial-URL assert: NO pre-install-session
+    blind spot (an earlier ``__init__``-only injection had one — a session built
+    before install leaked its redirects). So a loopback URL that 3xx-redirects to
+    a cloud host is REFUSED, not followed — full parity with the httpx path (which
+    defaults follow_redirects=False), retroactive on both. Hermetically verified
+    on aiohttp 3.13.5 INCLUDING the pre-install-session case: 0 cloud dials. This
+    closes task #40 — the security prerequisite for the STAY-C PWA scribe channel
+    (#49). IMPORT-GUARDED: aiohttp
     is a web dependency that may be absent
     from a given sovereign venv, so the aiohttp wrap is applied ONLY if aiohttp
     is importable; if absent it NO-OPS gracefully (httpx-only coverage, never a
@@ -88,7 +97,6 @@ log = structlog.get_logger(__name__)
 _orig_sync_send: Callable[..., Any] | None = None
 _orig_async_send: Callable[..., Any] | None = None
 _orig_aiohttp_request: Callable[..., Any] | None = None
-_orig_aiohttp_init: Callable[..., Any] | None = None
 
 
 def _assert_host_loopback(host: str, url_for_msg: str) -> None:
@@ -145,7 +153,10 @@ async def _assert_aiohttp_redirect_loopback(session: Any, ctx: Any, params: Any)
     EXACTLY as aiohttp resolves it (``origin.join(location)``). RAISING here
     aborts the follow BEFORE the next connection — HERMETICALLY VERIFIED on
     aiohttp 3.13.5 (the raising trace callback yields 0 sockets to the cloud
-    host; the redirect mutation-bound test proves it)."""
+    host; the redirect mutation-bound test proves it). This callback is carried
+    by a guard ``TraceConfig`` that ``_ensure_aiohttp_redirect_guard`` injects
+    into the live session on its first guarded request (retroactive — see
+    ``_install_aiohttp_guard``)."""
     import yarl
     location = params.response.headers.get("Location", "")
     target = params.url.join(yarl.URL(location))
@@ -188,54 +199,73 @@ def _install_httpx_guard() -> None:
     httpx.AsyncClient.send = _guarded_async_send  # type: ignore[method-assign]
 
 
+def _ensure_aiohttp_redirect_guard(session: Any, aiohttp: Any) -> None:
+    """Lazily ensure ``session`` carries the guard redirect ``TraceConfig`` (W1).
+
+    RETROACTIVE by design: called from the ``_request`` wrap (which fires for
+    EVERY session — even ones constructed BEFORE the guard installed), so there
+    is no ``__init__``-only blind spot. aiohttp's ``_request`` rebuilds its
+    per-request trace list from ``self._trace_configs`` on every call (verified
+    against aiohttp 3.13.5 source, ``_request`` lines ~128-134), so injecting the
+    frozen guard trace here — before delegating to the real ``_request`` — makes
+    ``on_request_redirect`` fire on this request's redirect hops.
+
+    Idempotent via membership scan (no per-request re-append, no foreign sentinel
+    attribute): if a trace already carries our callback we return. The trace list
+    is REASSIGNED to a fresh list (not mutated in place) so a session whose
+    ``_trace_configs`` is a tuple is handled without an ``AttributeError``; the
+    guard trace we append is frozen by us (aiohttp freezes user configs at
+    ``__init__``; a post-construction frozen trace fires correctly — verified)."""
+    trace_configs = getattr(session, "_trace_configs", None)
+    if trace_configs is None:  # pragma: no cover — defensive for a future aiohttp
+        return
+    for tc in trace_configs:
+        if _assert_aiohttp_redirect_loopback in tc.on_request_redirect:
+            return  # already guarded — idempotent, no accumulation
+    guard_tc = aiohttp.TraceConfig()
+    guard_tc.on_request_redirect.append(_assert_aiohttp_redirect_loopback)
+    guard_tc.freeze()
+    session._trace_configs = [*trace_configs, guard_tc]
+
+
 def _install_aiohttp_guard() -> bool:
-    """Wrap aiohttp IF installed — the request seam AND the redirect seam.
+    """Wrap aiohttp IF installed — a SINGLE retroactive ``_request`` seam.
 
-    TWO wraps (both required — redirects follow inside ``_request``'s own loop):
-      * ``ClientSession._request`` — asserts loopback on the INITIAL url.
-      * ``ClientSession.__init__`` — injects a guard ``TraceConfig`` whose
-        ``on_request_redirect`` RE-asserts loopback on every 3xx TARGET (W1),
-        without clobbering user-supplied ``trace_configs``.
+    One wrap, two asserts, both retroactive (they ride the CLASS method, so they
+    fire for sessions built BEFORE the guard installed too):
+      * INITIAL url — ``_assert_aiohttp_loopback`` on the request URL.
+      * per-hop REDIRECT — ``_ensure_aiohttp_redirect_guard`` lazily injects a
+        guard ``TraceConfig`` into this session's ``_trace_configs`` so
+        ``on_request_redirect`` re-asserts loopback on every 3xx target; a raising
+        callback aborts the follow BEFORE the next socket (hermetically verified
+        on aiohttp 3.13.5 — 0 cloud dials, incl. the pre-install-session case).
 
-    Idempotent (no double-wrap). Returns True iff the aiohttp wrap is live after
-    this call. No-ops gracefully (returns False) when aiohttp is absent — the
-    guard is httpx-only then, never a crash. A later call (after aiohttp is
+    No ``__init__`` wrap — the lazy inject on the retroactive ``_request`` seam
+    fully subsumes it (an ``__init__``-only injection left a pre-install-session
+    blind spot). Idempotent (no double-wrap). Returns True iff the aiohttp wrap is
+    live after this call. No-ops gracefully (returns False) when aiohttp is absent
+    — the guard is httpx-only then, never a crash. A later call (after aiohttp is
     installed) DOES apply the wrap (the ``_orig_aiohttp_request is None`` sentinel
     stays None until the wrap actually lands)."""
-    global _orig_aiohttp_request, _orig_aiohttp_init
+    global _orig_aiohttp_request
     if _orig_aiohttp_request is not None:
         return True  # already wrapped
     aiohttp = _try_import_aiohttp()
     if aiohttp is None:
         return False  # not installed → httpx-only coverage (graceful no-op)
 
-    # (1) initial-URL seam.
     _orig_aiohttp_request = aiohttp.ClientSession._request
     _aiohttp_request_original = _orig_aiohttp_request
 
     async def _guarded_request(self: Any, method: str, str_or_url: Any, *args: Any, **kwargs: Any) -> Any:
+        # Retrofit the redirect guard onto THIS (possibly pre-install) session
+        # before delegating — _request rebuilds its trace list from
+        # self._trace_configs each call, so the inject takes effect this request.
+        _ensure_aiohttp_redirect_guard(self, aiohttp)
         _assert_aiohttp_loopback(self, str_or_url)
         return await _aiohttp_request_original(self, method, str_or_url, *args, **kwargs)
 
     aiohttp.ClientSession._request = _guarded_request  # type: ignore[method-assign]
-
-    # (2) per-hop REDIRECT seam — inject a guard TraceConfig at construction. Its
-    # on_request_redirect re-asserts loopback on the 3xx target; a raising
-    # callback aborts the follow BEFORE the next socket (hermetically verified on
-    # aiohttp 3.13.5 — 0 cloud dials). User-supplied trace_configs are preserved
-    # (appended, not clobbered).
-    _orig_aiohttp_init = aiohttp.ClientSession.__init__
-    _aiohttp_init_original = _orig_aiohttp_init
-
-    def _guarded_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        trace_configs = list(kwargs.get("trace_configs") or [])
-        guard_tc = aiohttp.TraceConfig()
-        guard_tc.on_request_redirect.append(_assert_aiohttp_redirect_loopback)
-        trace_configs.append(guard_tc)
-        kwargs["trace_configs"] = trace_configs
-        _aiohttp_init_original(self, *args, **kwargs)
-
-    aiohttp.ClientSession.__init__ = _guarded_init  # type: ignore[method-assign]
     return True
 
 
@@ -257,9 +287,14 @@ def install_sovereign_http_guard() -> None:
 
 
 def uninstall_sovereign_http_guard() -> None:
-    """Restore the original httpx ``send`` + aiohttp ``_request`` / ``__init__``.
-    No-op if unset."""
-    global _orig_sync_send, _orig_async_send, _orig_aiohttp_request, _orig_aiohttp_init
+    """Restore the original httpx ``send`` + aiohttp ``_request``. No-op if unset.
+
+    (The redirect guard rides ``_request`` via a lazily-injected ``TraceConfig``;
+    restoring ``_request`` removes the inject site. Sessions constructed while the
+    guard was live keep a harmless frozen guard trace on their ``_trace_configs``
+    for their lifetime — it only re-asserts loopback, and those sessions are
+    themselves torn down; no live ``__init__``/class patch remains.)"""
+    global _orig_sync_send, _orig_async_send, _orig_aiohttp_request
     if _orig_sync_send is not None:
         httpx.Client.send = _orig_sync_send  # type: ignore[method-assign]
         httpx.AsyncClient.send = _orig_async_send  # type: ignore[method-assign]
@@ -269,10 +304,7 @@ def uninstall_sovereign_http_guard() -> None:
         aiohttp = _try_import_aiohttp()
         if aiohttp is not None:
             aiohttp.ClientSession._request = _orig_aiohttp_request  # type: ignore[method-assign]
-            if _orig_aiohttp_init is not None:
-                aiohttp.ClientSession.__init__ = _orig_aiohttp_init  # type: ignore[method-assign]
         _orig_aiohttp_request = None
-        _orig_aiohttp_init = None
 
 
 def is_sovereign_http_guard_installed() -> bool:
