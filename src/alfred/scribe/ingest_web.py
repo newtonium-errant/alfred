@@ -56,6 +56,7 @@ from aiohttp import web
 from alfred.scribe.config import ScribeConfig
 from alfred.scribe.identity import EncounterIdentityError, compute_encounter_id
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
+from alfred.scribe.pwa_assets import APP_JS, CSP_VALUE, render_index
 
 log = structlog.get_logger(__name__)
 
@@ -88,6 +89,15 @@ _META_SUFFIX = ".meta.json"
 INGEST_CHUNK_ROUTE = "/scribe/ingest-chunk"
 CLOSE_ROUTE = "/scribe/close"
 STATUS_ROUTE = "/scribe/status"
+
+# Slice B — the loopback PWA static surface (#49). The page GET is a browser
+# NAVIGATION that cannot carry a bearer, so these two routes are Host-pinned +
+# loopback-asserted but bearer-EXEMPT (the page DELIVERS the token to its JS —
+# see pwa_assets + the auth-split rationale). The 3 API routes above stay
+# bearer-required and byte-identical.
+PAGE_ROUTE = "/"
+APP_JS_ROUTE = "/scribe/app.js"
+_BEARER_EXEMPT_PATHS: frozenset[str] = frozenset({PAGE_ROUTE, APP_JS_ROUTE})
 
 _Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
@@ -173,8 +183,18 @@ def _peername_is_loopback(request: web.Request) -> bool:
 
 
 def _build_security_middleware(config: ScribeConfig):
-    """One middleware, EVERY route (R3). Host-pin + bearer token + loopback
-    peername, and NEVER emit CORS."""
+    """One middleware, EVERY route (R3), with a SPLIT auth policy (Slice B):
+
+      * ALWAYS (every route incl. the static page) — Host-pin (the rebind guard)
+        + loopback peername + never-emit-CORS.
+      * BEARER — required on the 3 API routes; EXEMPT on the static page + app.js
+        (:data:`_BEARER_EXEMPT_PATHS`). A browser NAVIGATION GET can't carry a
+        bearer; the page is Host-pinned + loopback-only and is itself the token
+        DELIVERY surface. This is rebind-safe: a DNS-rebind request carries the
+        attacker domain as ``Host`` → refused here (421) before the page (and its
+        token) is served; a cross-origin fetch to 127.0.0.1 gets an opaque
+        response (no CORS) so attacker JS can't read the token-bearing HTML.
+    """
     web_cfg = config.ingest_web
     port = web_cfg.port
     token = web_cfg.token
@@ -190,21 +210,26 @@ def _build_security_middleware(config: ScribeConfig):
 
     @web.middleware
     async def _security(request: web.Request, handler: _Handler) -> web.StreamResponse:
-        # (R3.1) Host-pin — the rebind guard. Reject any Host that is not a pinned
-        # loopback authority (an attacker domain, a bare IP, a wrong port).
+        # (R3.1) Host-pin — the rebind guard, on EVERY route incl. the static
+        # page. Reject any Host that is not a pinned loopback authority (an
+        # attacker domain, a bare IP, a wrong port). MUST run for the page so a
+        # rebind can't fetch the token-bearing HTML.
         if (request.headers.get("Host") or "").strip() not in allowed_hosts:
             log.warning("scribe.ingest_web.rejected", route=request.path, reason="wrong_host")
             return _reject("wrong_host", 421)
-        # (R3.3) bearer token — constant-time compare, fail-closed on an empty
-        # configured or provided token.
-        provided = _bearer(request)
-        if not (token and provided and secrets.compare_digest(provided, token)):
-            log.warning("scribe.ingest_web.rejected", route=request.path, reason="bad_token")
-            return _reject("unauthorized", 401)
-        # per-request loopback peername (defense-in-depth; INSUFFICIENT alone).
+        # per-request loopback peername (defense-in-depth; INSUFFICIENT alone) —
+        # on every route.
         if not _peername_is_loopback(request):
             log.warning("scribe.ingest_web.rejected", route=request.path, reason="non_loopback_peer")
             return _reject("forbidden", 403)
+        # (R3.3) bearer token — constant-time compare, fail-closed on an empty
+        # configured or provided token. REQUIRED on the API routes; EXEMPT on the
+        # static page + app.js (a navigation GET carries no bearer).
+        if request.path not in _BEARER_EXEMPT_PATHS:
+            provided = _bearer(request)
+            if not (token and provided and secrets.compare_digest(provided, token)):
+                log.warning("scribe.ingest_web.rejected", route=request.path, reason="bad_token")
+                return _reject("unauthorized", 401)
         resp = await handler(request)
         # (R3.2) NEVER emit CORS. Defensively strip any a handler/library added.
         for h in (
@@ -369,19 +394,60 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
     )
 
 
+# --- Slice B static PWA surface (page + app.js) -----------------------------
+
+def _static_headers() -> dict[str, str]:
+    """Headers for the static PWA responses. Strict CSP (R4 — ``connect-src
+    'self'`` makes the browser itself refuse any off-box fetch), plus no-store so
+    the token-bearing page / JS is never cached (belt for R5)."""
+    return {
+        "Content-Security-Policy": CSP_VALUE,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+
+
+async def _handle_page(request: web.Request) -> web.StreamResponse:
+    """``GET /`` — the inlined loopback PWA (bearer-EXEMPT; Host-pinned + loopback
+    by the middleware). Embeds the ingest token for the same-origin JS. Strict
+    CSP + no-store. R4: zero external resources."""
+    config: ScribeConfig = request.app["scribe_config"]
+    body = render_index(config.ingest_web.token)
+    return web.Response(text=body, content_type="text/html", charset="utf-8",
+                        headers=_static_headers())
+
+
+async def _handle_app_js(request: web.Request) -> web.StreamResponse:
+    """``GET /scribe/app.js`` — the same-origin PWA logic (bearer-EXEMPT;
+    Host-pinned + loopback). No token here (the token lives in the page's data
+    attribute); this is just code. CSP-served (script-src 'self')."""
+    return web.Response(text=APP_JS, content_type="application/javascript",
+                        charset="utf-8", headers=_static_headers())
+
+
 # --- app + server lifecycle -------------------------------------------------
 
 def create_ingest_app(config: ScribeConfig) -> web.Application:
-    """Build the ingest ``web.Application`` — 3 routes, the R3 security
-    middleware, and ``client_max_size`` pinned to the per-chunk byte cap (N3)."""
+    """Build the ingest ``web.Application`` — the 3 bearer-required API routes +
+    the 2 bearer-exempt static PWA routes (Slice B), the split-policy security
+    middleware, and ``client_max_size`` pinned to the per-chunk byte cap (N3).
+
+    Only instantiated when ``ingest_web.enabled`` (the daemon starts the server
+    solely then), so the static surface is INERT by default — no server, no
+    page."""
     app = web.Application(
         client_max_size=config.ingest_web.max_chunk_bytes,
         middlewares=[_build_security_middleware(config)],
     )
     app["scribe_config"] = config
+    # 3 API routes — bearer-required, byte-identical to Slice A.
     app.router.add_post(INGEST_CHUNK_ROUTE, _handle_ingest_chunk)
     app.router.add_post(CLOSE_ROUTE, _handle_close)
     app.router.add_get(STATUS_ROUTE, _handle_status)
+    # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
+    app.router.add_get(PAGE_ROUTE, _handle_page)
+    app.router.add_get(APP_JS_ROUTE, _handle_app_js)
     return app
 
 
