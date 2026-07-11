@@ -79,10 +79,24 @@ from typing import Any
 
 import structlog
 
-from alfred.scribe.notegen import GROUNDING_UNVERIFIED, SOAP_SECTIONS, StructuredNote
+from alfred.scribe.notegen import (
+    GROUNDING_UNVERIFIED,
+    INFERRED_DIAGNOSIS,
+    SOAP_SECTIONS,
+    StructuredNote,
+)
 from alfred.scribe.transcript import Transcript
 
 log = structlog.get_logger(__name__)
+
+# H2 — reason → inline literal dispatch for GroundingResult.flag_for. A flag's
+# ``reason`` selects the inline ⚠. Grounding's mechanical reasons all map to
+# GROUNDING_UNVERIFIED (the default); the #48 ``inferred_diagnosis`` reason maps
+# to the distinct INFERRED_DIAGNOSIS literal. A reason absent from this map falls
+# back to GROUNDING_UNVERIFIED (safe default — a flag never renders unflagged).
+_REASON_INLINE_LITERAL: dict[str, str] = {
+    "inferred_diagnosis": INFERRED_DIAGNOSIS,
+}
 
 
 class GroundingIntegrityError(Exception):
@@ -166,12 +180,17 @@ class GroundingResult:
 
     def flag_for(self, section: str, index: int) -> str | None:
         """Return the inline flag literal for the claim at
-        ``(section, index)``, or ``None`` if it is clean. The single source of
-        truth ``render_soap`` reads — no hidden mutation of the claim objects,
-        and render CANNOT run without a GroundingResult."""
+        ``(section, index)``, or ``None`` if it is clean. DISPATCHES on the
+        matched flag's ``reason`` (H2): grounding's mechanical reasons →
+        GROUNDING_UNVERIFIED; ``inferred_diagnosis`` → INFERRED_DIAGNOSIS. The
+        single source of truth ``render_soap`` reads — no hidden mutation of the
+        claim objects, and render CANNOT run without a GroundingResult. (First
+        matching flag wins if a claim carries more than one — grounding flags are
+        appended before the #48 flags, so a mechanically-flagged claim shows the
+        grounding literal; its inferred flag still rides ``metadata``.)"""
         for f in self.flags:
             if f.section == section and f.claim_index == index:
-                return GROUNDING_UNVERIFIED
+                return _REASON_INLINE_LITERAL.get(f.reason, GROUNDING_UNVERIFIED)
         return None
 
 

@@ -50,6 +50,7 @@ from alfred.scribe.attestation import SCRIBE_DRAFTER_IDENTITY
 from alfred.scribe.config import ScribeConfig
 from alfred.scribe.grounding import verify as verify_grounding
 from alfred.scribe.identity import compute_encounter_id
+from alfred.scribe.inferred_dx import check_inferred_diagnoses
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
 from alfred.scribe.notegen import (
     ContextBudgetExceeded,
@@ -117,6 +118,14 @@ async def generate_verified_note(
     """
     structured = await generate_structured(transcript, config=config)
     grounding = verify_grounding(structured, transcript)      # verify THE SAME object
+    # #48 — deterministic inferred-diagnosis post-check, BETWEEN verify and render.
+    # FLAGS (never removes) a claim naming a lexicon diagnosis absent from its
+    # CITED segments; the flags EXTEND grounding.flags so they ride the existing
+    # render (flag_for → inline ⚠ INFERRED DIAGNOSIS) + grounding_flags frontmatter
+    # path. Grounding is BLIND to this (a label invented from a real segment has no
+    # number/negation token) and rule-6 can't stop it (the model disobeys) — code
+    # is the lever.
+    grounding.flags.extend(check_inferred_diagnoses(structured, transcript))
     body = render_soap(structured, title=title, grounding=grounding)  # render with THAT grounding
     return VerifiedNote(
         body=body,

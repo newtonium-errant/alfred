@@ -180,4 +180,21 @@ def attest(
         to_status=new_status,
         attester=attester,
     )
+
+    # #48 self-correcting Part-1 CAPTURE — a READ-ONLY signal (per inferred_diagnosis
+    # flag, kept-vs-removed in the attested body). SIDE-EFFECT-FREE: it runs AFTER
+    # the triad write + audit + recorded-log already succeeded, and is wrapped so
+    # any error here can NEVER alter/fail the attestation (medico-legal path). The
+    # attested body == rec["body"] (attest writes only the triad, never the body).
+    try:
+        from alfred.scribe.inferred_dx import record_inferred_dx_attest_outcome
+        record_inferred_dx_attest_outcome(
+            grounding_flags=fm.get("grounding_flags"),
+            draft_original=str(fm.get("draft_original") or ""),
+            attested_body=str(rec.get("body") or ""),
+            source_id=source_id,
+        )
+    except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
+        log.warning("scribe.inferred_dx.attest_capture_error", source_id=source_id)
+
     return result

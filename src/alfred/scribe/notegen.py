@@ -78,6 +78,11 @@ log = structlog.get_logger(__name__)
 NOT_ADDRESSED = "Not addressed"
 REASONING_NOT_STATED = "⚠ REASONING NOT STATED — clinician to complete"
 GROUNDING_UNVERIFIED = "⚠ GROUNDING UNVERIFIED — clinician to confirm"
+# #48 — the inferred-diagnosis inline flag. Distinct from GROUNDING_UNVERIFIED so
+# a clinician sees WHY (a named diagnosis absent from the cited segments — the
+# model likely INFERRED it), dispatched by GroundingResult.flag_for on the flag's
+# reason (``inferred_diagnosis``).
+INFERRED_DIAGNOSIS = "⚠ INFERRED DIAGNOSIS — not stated by clinician; confirm"
 
 # The SOAP sections + their markdown headings (order is the contract).
 SOAP_SECTIONS: tuple[str, ...] = ("subjective", "objective", "assessment", "plan")
