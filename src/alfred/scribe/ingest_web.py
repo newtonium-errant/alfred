@@ -65,6 +65,12 @@ log = structlog.get_logger(__name__)
 # pipeline.py:723) and guarantees the load-bearing per-encounter uniqueness
 # (epoch-ms + nonce). Slice B (the PWA) MINTS this shape; Slice A REJECTS anything
 # else.
+#
+# ALWAYS test with ``fullmatch`` (never ``match``) — Python's ``$`` matches BEFORE
+# a trailing ``\n``, so ``re.match`` would ACCEPT ``enc-…-…\n`` (a distinct dir
+# name that splits an encounter). ``fullmatch`` requires the WHOLE string, so a
+# trailing/embedded newline is refused (WARN-1 fix). The ``^``/``$`` anchors are
+# kept for readability but ``fullmatch`` is the operative guarantee.
 ENCOUNTER_LABEL_RE = re.compile(r"^enc-[0-9]{13}-[0-9a-f]{16}$")
 
 # MUST equal pipeline._AUDIO_EXTENSIONS (the sweep only discovers these) — pinned
@@ -229,7 +235,7 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
 
     # R6 — label token-shape (rejects PHI labels + path traversal).
     label = q.get("label", "")
-    if not ENCOUNTER_LABEL_RE.match(label):
+    if not ENCOUNTER_LABEL_RE.fullmatch(label):
         log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE, reason="invalid_label")
         return _reject("invalid_label", 400)
 
@@ -320,7 +326,7 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
     finalizes to ``ready`` (B3). Query: ``label``."""
     config: ScribeConfig = request.app["scribe_config"]
     label = request.query.get("label", "")
-    if not ENCOUNTER_LABEL_RE.match(label):
+    if not ENCOUNTER_LABEL_RE.fullmatch(label):
         return _reject("invalid_label", 400)
     try:
         encounter_id = compute_encounter_id(label, salt=config.encounter_salt)
@@ -341,7 +347,7 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
     fixed state string. NEVER a transcript / draft / segment / clinical body."""
     config: ScribeConfig = request.app["scribe_config"]
     label = request.query.get("label", "")
-    if not ENCOUNTER_LABEL_RE.match(label):
+    if not ENCOUNTER_LABEL_RE.fullmatch(label):
         return _reject("invalid_label", 400)
     try:
         encounter_id = compute_encounter_id(label, salt=config.encounter_salt)

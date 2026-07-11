@@ -276,6 +276,29 @@ def test_label_non_token_shape_rejected(tmp_path, bad):
     assert not (Path(cfg.input_dir) / bad).exists()
 
 
+@pytest.mark.parametrize("suffix", ["\n", "\r\n", "\x00"])
+def test_label_trailing_newline_rejected(tmp_path, suffix):
+    # WARN-1 (R6 strictness): Python's `$` matches BEFORE a trailing \n, so
+    # re.match would ACCEPT ``enc-…-…\n`` (a distinct dir name that splits an
+    # encounter). fullmatch requires the WHOLE string → the newline variant is
+    # refused. Build the URL by hand so the raw %0A reaches request.query intact.
+    import urllib.parse
+    cfg = _config(tmp_path)
+    label = _LABEL + suffix
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            qs = urllib.parse.urlencode({"label": label, "seq": "1", "ext": "webm", "synthetic": "true"})
+            async with s.post(f"{base}{iw.INGEST_CHUNK_ROUTE}?{qs}", data=b"x", headers=_auth()) as r:
+                return r.status, await r.json()
+
+    st, payload = asyncio.run(_go())
+    assert st == 400 and payload["error"] == "invalid_label"
+    # nothing written — no enc- dir for the newline-suffixed label.
+    inbox = Path(cfg.input_dir)
+    assert not inbox.exists() or not list(inbox.iterdir())
+
+
 def test_synthetic_gate_refuses_before_disk(tmp_path):
     cfg = _config(tmp_path)
 
@@ -576,6 +599,51 @@ def test_w2_undecodable_chunk_isolated_sweep_survives(tmp_path, monkeypatch):
     assert any(c.get("event") == "scribe.accumulator.chunk_decode_failed" for c in caps)
     assert counts["encounters"] == 2
     assert counts["chunks_folded"] == 1                  # only B folded
+    eid_b = compute_encounter_id(b, salt=_SALT)
+    assert load_ledger(ledger_path(Path(cfg.input_dir) / b, eid_b)).segments  # B processed
+
+
+def test_w2_per_subdir_isolation_accumulate_raises(tmp_path, monkeypatch):
+    # W2 per-SUBDIR isolation — its UNIQUE value (distinct from per-chunk): a raise
+    # from accumulate_encounter ITSELF (a corrupt ledger, an OSError in
+    # _discover_chunks, a checkpoint error) — NOT a per-chunk STTError, which the
+    # inner guard already catches. Force accumulate_encounter to RAISE for A → the
+    # sweep must SURVIVE, emit the fail-isolated signal, and STILL process B.
+    #   MUTATION-BIND (verified manually): remove the per-subdir try/except in
+    #   run_sweep → A's raise propagates out of run_sweep → the whole sweep dies →
+    #   B never processed → RED. Reverted clean.
+    import alfred.scribe.pipeline as pipeline_mod
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake_ollama_returning(_CANNED))
+    cfg = _config(tmp_path)
+    vault = tmp_path / "vault"
+    a = "enc-1720000000000-000000000000000a"      # sorts before b
+    b = "enc-1720000000000-000000000000000b"
+
+    async def _ingest():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            assert (await _post_chunk(s, base, label=a, seq=1, close="true"))[0] == 200
+            assert (await _post_chunk(s, base, label=b, seq=1, close="true"))[0] == 200
+
+    asyncio.run(_ingest())
+    (Path(cfg.input_dir) / b / "chunk_1.txt").write_text("Sore throat two days.\n", encoding="utf-8")
+
+    real_accum = pipeline_mod.accumulate_encounter
+
+    def _raising_accum(enc_dir, **kw):
+        if enc_dir.name == a:
+            raise RuntimeError("corrupt ledger")   # a raise from accumulate ITSELF
+        return real_accum(enc_dir, **kw)
+
+    monkeypatch.setattr(pipeline_mod, "accumulate_encounter", _raising_accum)
+
+    state = ScribeState(str(tmp_path / "state.json"))
+    with structlog.testing.capture_logs() as caps:
+        counts = asyncio.run(run_sweep(cfg, state, vault))
+
+    # A raised → isolated (fail-isolated signal), the sweep SURVIVED, B still folded.
+    assert any(c.get("event") == "scribe.pipeline.encounter_error" for c in caps)
+    assert counts["failed"] >= 1                          # A isolated as failed
+    assert counts["chunks_folded"] == 1                  # B folded despite A raising first
     eid_b = compute_encounter_id(b, salt=_SALT)
     assert load_ledger(ledger_path(Path(cfg.input_dir) / b, eid_b)).segments  # B processed
 
