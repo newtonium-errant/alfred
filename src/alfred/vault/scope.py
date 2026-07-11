@@ -1674,6 +1674,7 @@ def check_scope(
     fields: list[str] | None = None,
     body_write: bool = False,
     existing_frontmatter: dict | None = None,
+    body_op: str | None = None,
 ) -> None:
     """Check if an operation is allowed under the given scope.
 
@@ -1712,6 +1713,21 @@ def check_scope(
             it; non-event types and non-replace operations are
             unaffected. The vault_edit gate populates this from the
             parsed file before calling.
+        body_op: For an ``edit`` operation that carries a body write, the
+            CONCRETE body-mutation surface being invoked — one of
+            ``body_append`` / ``body_rewriter`` / ``body_insert_at`` /
+            ``body_replace`` (or None when no body is written). Read ONLY by
+            the ``stayc_clinical_no_attest`` live-``ai_draft`` carve-out, which
+            permits body mutation on a LIVE clinical draft ONLY via
+            ``body_replace`` (the checkpoint co-pilot's refresh path — it
+            rewrites the whole body AND refreshes ``grounding_flags`` in the
+            same edit). ``body_append`` / ``body_rewriter`` would mutate the
+            body WITHOUT refreshing ``grounding_flags`` (grounding-integrity),
+            and mid-document ``body_insert_at`` is never part of the pipeline —
+            all three are REFUSED. Fail-CLOSED on an unknown/absent op when a
+            body write is requested. Defaults to None; every other scope/gate
+            ignores it. The vault_edit gate derives it from whichever single
+            body kwarg is set (they are mutually exclusive per its own gate).
 
     Raises:
         ScopeError: If the operation is denied.
@@ -2220,10 +2236,16 @@ def check_scope(
         # Gate order (all fail-closed):
         #   1. attest triad requested → REFUSE (any status — orchestrator-only)
         #   2. status == ai_draft → permit a NARROW field refresh
-        #      (STAYC_CLINICAL_DRAFT_EDIT_FIELDS) + body mutation (the co-pilot
-        #      rewrites the body via body_replace, gated AGAIN by the
-        #      body_replace carve-out). Every other frontmatter field stays
-        #      locked even while drafting.
+        #      (STAYC_CLINICAL_DRAFT_EDIT_FIELDS) + body mutation via
+        #      body_replace ONLY (the co-pilot rewrites the body via
+        #      body_replace, gated AGAIN by the body_replace carve-out).
+        #      body_append / body_rewriter / body_insert_at are REFUSED even on
+        #      a live draft (P3-a WARN tightening: least-privilege +
+        #      grounding-integrity — append/rewriter would mutate the body
+        #      WITHOUT refreshing grounding_flags, desyncing the draft from its
+        #      grounding report; mid-doc insert_at is never part of the
+        #      pipeline). Every other frontmatter field stays locked even while
+        #      drafting.
         #   3. status attested / amended / missing / unknown → SEALED, deny all.
         _triad = {"status", "attested_by", "attested_at"}
         _requested = set(fields or [])
@@ -2252,7 +2274,30 @@ def check_scope(
                     f"Body content changes via body_replace, not raw "
                     f"frontmatter edits."
                 )
-            return  # live draft — narrow refresh + body_replace permitted
+            # P3-a WARN tightening (least-privilege + grounding-integrity): on a
+            # LIVE draft the ONLY permitted body mutation is ``body_replace``
+            # (the checkpoint co-pilot's refresh path — it rewrites the whole
+            # body AND refreshes grounding_flags in the same edit).
+            # ``body_append`` / ``body_rewriter`` are REFUSED: they mutate the
+            # body WITHOUT refreshing grounding_flags, so a live draft's body
+            # could desync from its grounding report — and neither was ever part
+            # of the pipeline. ``body_insert_at`` is refused here too (it is also
+            # denied by the second-gate universal deny; this is defense-in-depth
+            # at the edit gate). Fail-CLOSED on an unknown/absent op when a body
+            # write is requested. The anti-spoliation freeze (SEALED once
+            # attested) is intact regardless — every body op freezes on attest.
+            if body_write and body_op != "body_replace":
+                raise ScopeError(
+                    f"Scope '{scope}' may body-mutate a LIVE clinical_note "
+                    f"ai_draft ONLY via body_replace (the checkpoint co-pilot's "
+                    f"refresh path); '{body_op or '(none)'}' is refused. "
+                    f"body_append / body_rewriter would change the body WITHOUT "
+                    f"refreshing grounding_flags (grounding-integrity), and "
+                    f"mid-document body_insert_at is never part of the pipeline. "
+                    f"Least-privilege: the draft body is (re)written only via a "
+                    f"full body_replace."
+                )
+            return  # live draft — narrow refresh + body_replace-ONLY permitted
         raise ScopeError(
             f"Scope '{scope}' may not edit a clinical_note in status "
             f"'{_status or '(missing)'}' — content is SEALED once attested "

@@ -1430,6 +1430,25 @@ def vault_edit(
             body_append is not None or body_rewriter is not None
             or body_insert_at is not None or body_replace is not None
         )
+        # P3-a WARN (least-privilege + grounding-integrity): thread the
+        # CONCRETE body-mutation surface into the edit gate so the
+        # ``stayc_clinical`` live-``ai_draft`` carve-out can permit ONLY
+        # body_replace (the checkpoint co-pilot's refresh path) and REFUSE
+        # body_append / body_rewriter / body_insert_at on a live clinical
+        # draft. At most one body kwarg is set (the mutual-exclusion gate
+        # above raised otherwise), so this maps 1:1 to the active surface;
+        # None when no body write is requested. Every non-clinical edit gate
+        # ignores it.
+        if body_replace is not None:
+            body_op = "body_replace"
+        elif body_insert_at is not None:
+            body_op = "body_insert_at"
+        elif body_append is not None:
+            body_op = "body_append"
+        elif body_rewriter is not None:
+            body_op = "body_rewriter"
+        else:
+            body_op = None
         # record_type is threaded through so the type-restricted edit
         # gates (talker_routine_completion_only / talker_routine_item_
         # only / vera_forwarder_link_back_only) can enforce their type
@@ -1448,6 +1467,9 @@ def vault_edit(
             # status to decide mutable-while-ai_draft vs sealed-on-attest.
             # Every other edit gate ignores this kwarg.
             existing_frontmatter=fm,
+            # P3-a WARN: the concrete body surface (body_replace-only on a
+            # live clinical draft; see check_scope docstring).
+            body_op=body_op,
         )
         # Body-mutation tools have their own per-instance × per-type
         # gate (per the c1 matrix). Run only if the corresponding kwarg

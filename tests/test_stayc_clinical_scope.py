@@ -358,12 +358,68 @@ def test_edit_grounding_flags_on_ai_draft_ALLOWED():
 
 
 def test_edit_body_replace_plus_grounding_flags_on_ai_draft_ALLOWED():
-    # The pipeline's combined update call: body_write=True + grounding_flags
-    # refresh, on a live draft → the edit gate passes (body_replace gate does
-    # the second status check separately).
+    # The pipeline's combined update call: body_write=True + body_op=body_replace
+    # + grounding_flags refresh, on a live draft → the edit gate passes (the
+    # body_replace gate does the second status check separately). vault_edit
+    # derives ``body_op`` from the ``body_replace=`` kwarg the pipeline sends.
     check_scope(
         _SCOPE, "edit", record_type="clinical_note",
-        fields=["grounding_flags"], body_write=True,
+        fields=["grounding_flags"], body_write=True, body_op="body_replace",
+        existing_frontmatter={"status": "ai_draft"},
+    )  # no raise
+
+
+# --- P3-a WARN tightening: body surface is body_replace-ONLY on a live draft ---
+# The pipeline only ever body_replaces. body_append / body_rewriter mutate the
+# body WITHOUT refreshing grounding_flags (grounding-integrity), and mid-doc
+# body_insert_at is never part of the pipeline — all three are REFUSED at the
+# edit gate even while ai_draft. Least-privilege hardening (the anti-spoliation
+# freeze-on-attest is intact regardless).
+
+@pytest.mark.parametrize("op", ["body_append", "body_rewriter", "body_insert_at"])
+def test_edit_non_replace_body_op_on_ai_draft_DENIED(op):
+    # THE tightening pin (mutation-bind: delete the ``body_op != 'body_replace'``
+    # check in stayc_clinical_no_attest → body_append / body_rewriter become
+    # allowed on a live draft again → RED). body_append / body_rewriter were
+    # previously allowed (they ride the generic body_write bool and skip the
+    # second gate); body_insert_at was always denied (second-gate universal
+    # deny) — this now denies all three at the edit gate.
+    with pytest.raises(ScopeError) as ei:
+        check_scope(
+            _SCOPE, "edit", record_type="clinical_note",
+            fields=["grounding_flags"], body_write=True, body_op=op,
+            existing_frontmatter={"status": "ai_draft"},
+        )
+    msg = str(ei.value)
+    # The DISTINCT least-privilege / grounding wording is asserted so the deny
+    # is pinned to the tightening gate, not an incidental refusal elsewhere.
+    assert "body_replace" in msg and "grounding_flags" in msg
+
+
+def test_edit_body_op_fail_closed_on_unknown_op_on_ai_draft():
+    # Fail-CLOSED: a body write with an unrecognised / absent op is refused on a
+    # live draft (only the exact "body_replace" surface is permitted).
+    with pytest.raises(ScopeError):
+        check_scope(
+            _SCOPE, "edit", record_type="clinical_note",
+            fields=["grounding_flags"], body_write=True, body_op="body_bogus",
+            existing_frontmatter={"status": "ai_draft"},
+        )
+    with pytest.raises(ScopeError):
+        # body_write asserted but no op plumbed → fail-closed (caller bug).
+        check_scope(
+            _SCOPE, "edit", record_type="clinical_note",
+            fields=["grounding_flags"], body_write=True, body_op=None,
+            existing_frontmatter={"status": "ai_draft"},
+        )
+
+
+def test_edit_pure_frontmatter_refresh_no_body_still_allowed():
+    # A narrow frontmatter-only refresh (no body write) is unaffected by the
+    # body-op tightening: body_write=False → the body_op gate is inert.
+    check_scope(
+        _SCOPE, "edit", record_type="clinical_note",
+        fields=["grounding_flags"], body_write=False, body_op=None,
         existing_frontmatter={"status": "ai_draft"},
     )  # no raise
 
@@ -447,6 +503,52 @@ def test_e2e_body_replace_updates_draft_then_frozen_on_attest(tmp_path):
         )
     # The attested body is intact — the sneaky rewrite did not land.
     assert "SNEAKY" not in frontmatter.load(str(tmp_path / rel_path)).content
+
+
+def test_e2e_body_append_and_rewriter_on_live_draft_REFUSED(tmp_path):
+    # P3-a WARN tightening, through the REAL ops.py plumbing (vault_edit derives
+    # body_op from the kwarg and passes it to the edit gate). On a LIVE ai_draft,
+    # body_append and body_rewriter are REFUSED — only body_replace refreshes the
+    # draft. This exercises the ops-layer plumbing (a unit check_scope test alone
+    # would not catch a missing body_op pass-through in vault_edit).
+    result = vault_create(
+        tmp_path, "clinical_note", "Encounter 2026-07-11 dyspnea",
+        set_fields={"ai_draft": True, "synthetic": True, "status": "ai_draft",
+                    "grounding_flags": []},
+        body="## Subjective\nInitial checkpoint.\n",
+        scope=_SCOPE,
+    )
+    rel_path = result["path"]
+
+    # body_append on a live draft → refused (would skip grounding_flags refresh).
+    with pytest.raises((ScopeError, VaultError)):
+        vault_edit(
+            tmp_path, rel_path,
+            body_append="\nSNEAKY appended line\n",
+            scope=_SCOPE,
+        )
+    # body_rewriter on a live draft → refused.
+    with pytest.raises((ScopeError, VaultError)):
+        vault_edit(
+            tmp_path, rel_path,
+            body_rewriter=lambda b: b + "\nSNEAKY rewritten line\n",
+            scope=_SCOPE,
+        )
+    # Neither sneaky mutation landed; the draft body is unchanged.
+    body_now = frontmatter.load(str(tmp_path / rel_path)).content
+    assert "SNEAKY" not in body_now
+    assert "Initial checkpoint." in body_now
+
+    # body_replace on the SAME live draft still works (the pipeline's path).
+    vault_edit(
+        tmp_path, rel_path,
+        body_replace="## Subjective\nRevised via body_replace.\n",
+        set_fields={"grounding_flags": [{"reason": "number_mismatch"}]},
+        scope=_SCOPE,
+    )
+    post = frontmatter.load(str(tmp_path / rel_path))
+    assert "Revised via body_replace." in post.content
+    assert post["status"] == "ai_draft"
 
 
 # ---------------------------------------------------------------------------

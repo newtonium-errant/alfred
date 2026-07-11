@@ -28,10 +28,13 @@ denied deletion/relocation by the vault scope; its body is denysetted
 body_replace refresh while status==ai_draft (frozen on attest, below).
 
 The BODY below is MUTABLE while this note is a live, unattested ai_draft: the
-checkpoint co-pilot refreshes it in place under the stayc_clinical scope (whole-
-body rewrite via body_replace — the pipeline's mechanism; body_append /
-body_rewriter also ride the mutable-draft edit gate), while mid-document
-body_insert_at stays denied. grounding_flags is the ONLY draft-editable
+checkpoint co-pilot refreshes it in place under the stayc_clinical scope via a
+whole-body rewrite (body_replace — the pipeline's mechanism, and the ONLY
+permitted body mutation on a live draft). body_append / body_rewriter are DENIED
+even while ai_draft (P3-a WARN least-privilege + grounding-integrity: they would
+mutate the body WITHOUT refreshing grounding_flags, desyncing the draft from its
+grounding report), and mid-document body_insert_at stays denied. grounding_flags
+is the ONLY draft-editable
 frontmatter field (STAYC_CLINICAL_DRAFT_EDIT_FIELDS), refreshed alongside the
 body. The body is SEALED (anti-spoliation) the moment the note is attested or
 amended (status in {attested, amended}) — every body mutation is then frozen;
