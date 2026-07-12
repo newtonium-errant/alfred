@@ -68,6 +68,19 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
+# Socket-level timeout (seconds) on the googleapiclient transport. The
+# discovery ``build()`` + OAuth refresh + ``list_events`` / ``create_event``
+# calls are synchronous and blocking; the propose-create handler runs them in
+# ``asyncio.to_thread`` (per-phase deadline ``_GCAL_PHASE_DEADLINE_S = 6s`` in
+# ``transport/peer_handlers.py``). Without a socket timeout a hung Google
+# socket blocks the underlying ``httplib2`` read forever, pinning a
+# ThreadPoolExecutor worker for minutes past that soft deadline. Bounded
+# below the transport client's per-attempt read timeout
+# (``transport/client.py`` ``_REQUEST_TIMEOUT = 15s``) so the socket errors
+# out before the peer client times out and retries.
+GCAL_HTTP_TIMEOUT_S = 10.0
+
+
 # ---------------------------------------------------------------------------
 # Public exception types
 # ---------------------------------------------------------------------------
@@ -188,6 +201,26 @@ def _import_google() -> tuple[Any, Any, Any, Any]:
             "Install with: pip install -e '.[gcal]'"
         ) from exc
     return Credentials, Request, InstalledAppFlow, build
+
+
+def _import_authorized_http() -> tuple[Any, Any]:
+    """Import ``AuthorizedHttp`` + ``httplib2`` for the timeout-bounded transport.
+
+    Returned tuple: ``(AuthorizedHttp, httplib2)``. Kept separate from
+    :func:`_import_google` so only the service-build path (which needs an
+    explicit-socket-timeout http, see :data:`GCAL_HTTP_TIMEOUT_S`) requires
+    these libs; the authorize / refresh paths don't.
+    """
+    try:
+        from google_auth_httplib2 import AuthorizedHttp  # type: ignore
+        import httplib2  # type: ignore
+    except ImportError as exc:
+        raise GCalNotInstalled(
+            "Google Calendar integration requires google-auth-httplib2 and "
+            "httplib2 for a socket-timeout-bounded transport. "
+            "Install with: pip install -e '.[gcal]'"
+        ) from exc
+    return AuthorizedHttp, httplib2
 
 
 def _parse_event_window(raw: dict) -> tuple[datetime, datetime]:
@@ -415,11 +448,19 @@ class GCalClient:
         if self._service is not None:
             return self._service
         _Creds, _Req, _Flow, build = _import_google()  # noqa: N806
+        AuthorizedHttp, httplib2 = _import_authorized_http()  # noqa: N806
         creds = self._load_credentials()
+        # Wrap creds in an explicit-socket-timeout http so a hung Google
+        # socket errors out instead of blocking the transport read forever
+        # (see :data:`GCAL_HTTP_TIMEOUT_S`). NOTE: pass ``http=`` XOR
+        # ``credentials=`` — ``AuthorizedHttp`` already wraps the creds and
+        # authorizes each request; googleapiclient ``build()`` raises if both
+        # are given.
+        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=GCAL_HTTP_TIMEOUT_S))
         # cache_discovery=False suppresses the file-cache deprecation
         # warning; the discovery doc is fetched fresh per process which
         # is fine for a long-running daemon (one fetch per restart).
-        self._service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        self._service = build("calendar", "v3", http=http, cache_discovery=False)
         return self._service
 
     # -- API surface ---------------------------------------------------

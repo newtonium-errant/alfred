@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import frontmatter
 import pytest
@@ -45,6 +45,34 @@ def test_classify_gcal_error_codes():
     assert classify_gcal_error(GCalNotInstalled("x")) == "missing_dependency"
     assert classify_gcal_error(GCalAPIError("x")) == "api_error"
     assert classify_gcal_error(RuntimeError("x")) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# _atomic_write_text — the shared mechanism every writeback below funnels
+# through (FIX 2, #61)
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_text_replaces_via_tmp(tmp_path):
+    """Writes to a sibling ``.tmp`` then ``os.replace``-s over the target, and
+    leaves no ``.tmp`` behind — so a concurrent reader never sees a torn file."""
+    import alfred.integrations.gcal_sync as sync_mod
+
+    target = tmp_path / "rec.md"
+    target.write_text("old content\n", encoding="utf-8")
+
+    real_replace = sync_mod.os.replace
+    with patch.object(
+        sync_mod.os, "replace", side_effect=real_replace,
+    ) as replace_spy:
+        sync_mod._atomic_write_text(target, "new content\n")
+
+    replace_spy.assert_called_once()
+    src, dst = replace_spy.call_args.args
+    assert str(src) == str(target) + ".tmp"
+    assert str(dst) == str(target)
+    assert target.read_text(encoding="utf-8") == "new content\n"
+    assert not (tmp_path / "rec.md.tmp").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +211,49 @@ def test_sync_create_happy_path_writes_back(tmp_path):
     assert kwargs["description"] == "weekly check-in"
     # No time_zone since config.default_time_zone is empty.
     assert "time_zone" not in kwargs
+
+
+def test_sync_create_writeback_is_atomic(tmp_path):
+    """FIX 2 (#61): the create-path writeback goes through ``.tmp`` →
+    ``os.replace``, never a bare ``write_text``. #37 widened the torn-read
+    window — an orphaned ``asyncio.to_thread`` worker can land this writeback
+    POST-response, concurrent with a reader — so the swap must be atomic."""
+    import alfred.integrations.gcal_sync as sync_mod
+    from alfred.integrations.gcal_sync import sync_event_create_to_gcal
+
+    file_path = _seed_event_file(
+        tmp_path, fm={"type": "event", "name": "Coaching"},
+    )
+    client = MagicMock()
+    client.create_event.return_value = "gcal-event-id-42"
+    config = _make_config(label="alfred")
+
+    # Spy on os.replace but still perform the real rename so the content
+    # assertion below verifies the record actually landed.
+    real_replace = sync_mod.os.replace
+    with patch.object(
+        sync_mod.os, "replace", side_effect=real_replace,
+    ) as replace_spy:
+        result = sync_event_create_to_gcal(
+            client=client, config=config,
+            file_path=file_path,
+            title="Coaching", description="weekly check-in",
+            start_dt=datetime(2026, 6, 1, 14, tzinfo=timezone.utc),
+            end_dt=datetime(2026, 6, 1, 15, tzinfo=timezone.utc),
+            correlation_id="t-atomic",
+        )
+
+    assert result["event_id"] == "gcal-event-id-42"
+    # Writeback swapped atomically: os.replace(<sibling .tmp>, <final path>).
+    replace_spy.assert_called_once()
+    src, dst = replace_spy.call_args.args
+    assert str(src).endswith(".tmp")
+    assert str(dst) == str(file_path)
+    # No stray .tmp left behind after the swap.
+    assert not (file_path.parent / f"{file_path.name}.tmp").exists()
+    # And the record content actually landed.
+    fm = frontmatter.load(str(file_path))
+    assert fm["gcal_event_id"] == "gcal-event-id-42"
 
 
 def test_sync_create_propagates_time_zone(tmp_path):

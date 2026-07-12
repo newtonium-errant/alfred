@@ -285,6 +285,107 @@ def test_load_credentials_refresh_failure_message_acknowledges_transient(tmp_pat
 
 
 # ---------------------------------------------------------------------------
+# _service_obj — socket-timeout-bounded transport (FIX 1, #61)
+# ---------------------------------------------------------------------------
+
+
+# Faithful fakes for the two libs ``_import_authorized_http`` returns. Mirror
+# the REAL attribute surface (verified against google-auth-httplib2 0.31.2 +
+# httplib2: ``AuthorizedHttp(creds, http=X)`` stores ``.http = X``;
+# ``httplib2.Http(timeout=T)`` stores ``.timeout = T``). Keeping the pin
+# hermetic means it runs even in an env without the ``gcal`` extra installed
+# (the rest of this module already mocks ``_import_google`` for the same
+# reason) — no ``importorskip`` gate on a hardening regression pin.
+class _FakeHttp:
+    def __init__(self, timeout=None):
+        self.timeout = timeout
+
+
+class _FakeHttplib2:
+    Http = _FakeHttp
+
+
+class _FakeAuthorizedHttp:
+    def __init__(self, credentials, http=None):
+        self.credentials = credentials
+        self.http = http
+
+
+def test_service_obj_attaches_socket_timeout(tmp_path):
+    """The built ``service`` carries an explicit socket timeout so a hung
+    Google socket errors out instead of pinning a ThreadPoolExecutor worker
+    for minutes (the propose-create handler runs the blocking call in
+    ``asyncio.to_thread``). ``build()`` must get ``http=`` and NOT
+    ``credentials=`` (googleapiclient raises if both are given)."""
+    from alfred.integrations import gcal as gcal_mod
+
+    fake_creds = object()
+    build_mock = MagicMock()
+    with patch.object(
+        gcal_mod, "_import_google",
+        return_value=(MagicMock(), MagicMock(), MagicMock(), build_mock),
+    ), patch.object(
+        gcal_mod, "_import_authorized_http",
+        return_value=(_FakeAuthorizedHttp, _FakeHttplib2),
+    ), patch.object(
+        gcal_mod.GCalClient, "_load_credentials", return_value=fake_creds,
+    ):
+        client = gcal_mod.GCalClient(
+            credentials_path=tmp_path / "creds.json",
+            token_path=tmp_path / "token.json",
+        )
+        service = client._service_obj()
+
+    assert service is build_mock.return_value
+    build_mock.assert_called_once()
+    _args, kwargs = build_mock.call_args
+    # Mutually exclusive with http= — build() raises if both are passed.
+    assert "credentials" not in kwargs
+    authed_http = kwargs["http"]
+    assert isinstance(authed_http, _FakeAuthorizedHttp)
+    # Creds still wrapped for per-request authorization.
+    assert authed_http.credentials is fake_creds
+    # The socket timeout is attached and equals the module constant.
+    assert authed_http.http.timeout == gcal_mod.GCAL_HTTP_TIMEOUT_S
+
+
+def test_gcal_http_timeout_below_client_request_timeout():
+    """The GCal socket timeout must stay below the transport client's
+    per-attempt read timeout so a hung socket errors before the peer client
+    times out and retries into the 409 already_exists path."""
+    from alfred.integrations import gcal as gcal_mod
+    from alfred.transport.client import _REQUEST_TIMEOUT
+
+    assert 0 < gcal_mod.GCAL_HTTP_TIMEOUT_S < _REQUEST_TIMEOUT
+
+
+def test_service_obj_caches_built_service(tmp_path):
+    """Second call returns the cached service without re-importing / rebuilding
+    (one discovery fetch per process, as the docstring promises)."""
+    from alfred.integrations import gcal as gcal_mod
+
+    build_mock = MagicMock()
+    with patch.object(
+        gcal_mod, "_import_google",
+        return_value=(MagicMock(), MagicMock(), MagicMock(), build_mock),
+    ), patch.object(
+        gcal_mod, "_import_authorized_http",
+        return_value=(_FakeAuthorizedHttp, _FakeHttplib2),
+    ), patch.object(
+        gcal_mod.GCalClient, "_load_credentials", return_value=object(),
+    ):
+        client = gcal_mod.GCalClient(
+            credentials_path=tmp_path / "creds.json",
+            token_path=tmp_path / "token.json",
+        )
+        first = client._service_obj()
+        second = client._service_obj()
+
+    assert first is second
+    build_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # list_events
 # ---------------------------------------------------------------------------
 

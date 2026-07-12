@@ -47,6 +47,7 @@ diagnostic value).
 
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,24 @@ import frontmatter
 import structlog
 
 log = structlog.get_logger(__name__)
+
+
+def _atomic_write_text(file_path: Path, text: str) -> None:
+    """Write ``text`` to ``file_path`` atomically (``.tmp`` → ``os.replace``).
+
+    All the direct-frontmatter writebacks below re-serialize an event record
+    that a concurrent reader (surveyor / curator / another sync handler) can
+    read at any moment. A bare ``write_text`` truncates-then-writes in place,
+    exposing a torn-read window; #37 widened it further by moving the create
+    sync into an ``asyncio.to_thread`` worker that can land its writeback
+    POST-response. ``os.replace`` swaps the file in atomically so a reader
+    only ever sees the old or the new full record, never a half-written one.
+    Convention mirrors ``msgbus/record.py``, ``contracts/store.py``, and
+    ``instructor/state.py``.
+    """
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +418,7 @@ def sync_event_create_to_gcal(
         new_text = frontmatter.dumps(post)
         if not new_text.endswith("\n"):
             new_text += "\n"
-        file_path.write_text(new_text, encoding="utf-8")
+        _atomic_write_text(file_path, new_text)
     except Exception as exc:  # noqa: BLE001
         # Soft fail — the GCal event exists, but our dedup loses its
         # anchor. Log + keep the success path so the caller still gets
@@ -811,7 +830,7 @@ def sync_event_cancellation_to_gcal(
         new_text = frontmatter.dumps(post)
         if not new_text.endswith("\n"):
             new_text += "\n"
-        file_path.write_text(new_text, encoding="utf-8")
+        _atomic_write_text(file_path, new_text)
     except Exception as exc:  # noqa: BLE001
         # Soft fail — the GCal event is gone, but our cleanup of the
         # vault stale ID failed. Log + keep the success path so the
@@ -916,7 +935,7 @@ def _clear_gcal_ids(file_path: Path, correlation_id: str = "") -> None:
             text = frontmatter.dumps(post)
             if not text.endswith("\n"):
                 text += "\n"
-            file_path.write_text(text, encoding="utf-8")
+            _atomic_write_text(file_path, text)
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "gcal.collapse_clear_writeback_failed",
@@ -945,7 +964,7 @@ def _write_primary_id(
         text = frontmatter.dumps(post)
         if not text.endswith("\n"):
             text += "\n"
-        file_path.write_text(text, encoding="utf-8")
+        _atomic_write_text(file_path, text)
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "gcal.collapse_primary_writeback_failed",
