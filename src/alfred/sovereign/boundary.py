@@ -401,20 +401,43 @@ def _check_ingest_web_loopback(raw: dict[str, Any]) -> None:
          top-level sections.
 
     All three raise ``barrier_e`` (→ exit 79, non-restartable).
+
+    ENV-SUBSTITUTION SEAM (audit fix — the barrier and the server MUST evaluate
+    the IDENTICAL values): ``config.load_from_unified`` substitutes ``${VAR}`` in
+    the ingest_web sub-tree BEFORE coercing enabled/host/token and binding the
+    socket. This barrier historically read the RAW (un-substituted) values, so an
+    ``enabled: "${VAR}"`` (VAR=true) coerced to the LITERAL ``"${VAR}"`` → False →
+    barrier returned INERT while the server resolved it → True → BOUND (fail-OPEN,
+    to ``host`` which could be 0.0.0.0). Same seam let an UNSET
+    ``token: "${SCRIBE_INGEST_TOKEN}"`` stay a non-empty literal that passed the
+    old non-empty check yet became the live source-visible bearer. FIX: substitute
+    ONLY this sub-tree here — the same values the server binds from. It is a NEW
+    copy (``substitute_env_in_value`` never mutates its input), so ``raw`` is
+    untouched and barrier-(c)'s RAW-config ``${CLOUD_KEY}`` scan (which runs BEFORE
+    this barrier, on ``raw``) is unaffected (Gap D — do NOT substitute the whole
+    config before the boundary).
     """
+    from alfred._env import ENV_PLACEHOLDER_RE, substitute_env_in_value
     from alfred.scribe.config import INGEST_WEB_ALLOWED_KEYS, coerce_ingest_web_enabled
 
     scribe = raw.get("scribe") or {}
     if not isinstance(scribe, dict):
         return
-    ingest = scribe.get("ingest_web") or {}
+    ingest_raw = scribe.get("ingest_web") or {}
+    if not isinstance(ingest_raw, dict):
+        return
+    # Substitute ONLY the ingest_web sub-tree (a fresh copy — no raw mutation), so
+    # the barrier evaluates the SAME enabled/host/token the server binds from.
+    ingest = substitute_env_in_value(ingest_raw)
+
     # Use the SHARED enabled-coercion so "does the barrier validate the bind" ==
-    # "does the server actually bind" (a quoted ``enabled: "false"`` is inert in
-    # BOTH — no false-positive breach; and nothing can bind without arming this).
-    if not isinstance(ingest, dict) or not coerce_ingest_web_enabled(ingest.get("enabled")):
+    # "does the server actually bind" (now on the SUBSTITUTED value — a resolved
+    # ``${VAR}=true`` arms both; an unset/quoted false is inert in both).
+    if not coerce_ingest_web_enabled(ingest.get("enabled")):
         return  # INERT — no server binds, nothing to validate
 
-    # (3) allowlist-closed sub-tree — refuse any egress-shaped field.
+    # (3) allowlist-closed sub-tree — refuse any egress-shaped field. (Keys are
+    # unchanged by substitution.)
     unexpected = sorted(k for k in ingest if k not in INGEST_WEB_ALLOWED_KEYS)
     if unexpected:
         allowed = ", ".join(sorted(INGEST_WEB_ALLOWED_KEYS))
@@ -426,7 +449,9 @@ def _check_ingest_web_loopback(raw: dict[str, Any]) -> None:
             f"be an egress surface and is refused (fail-closed).",
         )
 
-    # (1) loopback host — the must-have.
+    # (1) loopback host — the must-have. (Substituted: ``${HOST}=127.0.0.1``
+    # resolves + passes; an unset ``${HOST}`` stays the literal → host_is_loopback
+    # fails → refuse, matching the socket-bind that would also fail.)
     host = str(ingest.get("host") or "").strip()
     if not host_is_loopback(host):
         raise SovereignBoundaryError(
@@ -438,7 +463,11 @@ def _check_ingest_web_loopback(raw: dict[str, Any]) -> None:
             f"at load (before any socket binds).",
         )
 
-    # (2) token present.
+    # (2) token present AND a REAL secret — reject empty OR an unresolved ``${..}``
+    # placeholder. An unset ``${SCRIBE_INGEST_TOKEN}`` stays the literal after
+    # substitution; without this the server's ``compare_digest`` would accept that
+    # predictable, source-visible literal as the live bearer (fail-loud on a
+    # missing secret, per feedback_hardcoding_and_alfred_naming).
     token = str(ingest.get("token") or "").strip()
     if not token:
         raise SovereignBoundaryError(
@@ -446,6 +475,14 @@ def _check_ingest_web_loopback(raw: dict[str, Any]) -> None:
             "scribe.ingest_web.token is unset — a sovereign PWA ingest server "
             "requires a bearer token (loopback alone is insufficient: an on-box "
             "process could POST). Set ${SCRIBE_INGEST_TOKEN}.",
+        )
+    if ENV_PLACEHOLDER_RE.search(token):
+        raise SovereignBoundaryError(
+            "barrier_e",
+            "scribe.ingest_web.token is an UNRESOLVED ${...} placeholder — its env "
+            "var is unset (or empty), so the literal placeholder would become the "
+            "live bearer secret (source-visible, predictable). Set the env var to a "
+            "real secret before enabling the ingest server; refusing at load.",
         )
 
 

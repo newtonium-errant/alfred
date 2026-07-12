@@ -407,6 +407,54 @@ def test_assert_request_loopback_refuses_cloud():
     assert exc.value.reason == "http_guard"
 
 
+# --- SovereignHttpGuard: requests coverage (audit — huggingface_hub transport) --
+
+def test_requests_guard_blocks_non_loopback(guard_cleanup):
+    # Audit FIX 2: the guard must cover requests.Session.send (huggingface_hub's
+    # transport, live in the scribe process via faster-whisper). A cloud requests
+    # call → SovereignBoundaryError BEFORE any connect. MUTATION-BIND: remove the
+    # requests wrap → this egress is NOT blocked → RED.
+    import requests
+    from alfred.sovereign import is_requests_guard_installed
+    install_sovereign_http_guard()
+    assert is_requests_guard_installed() is True
+    with pytest.raises(SovereignBoundaryError) as exc:
+        requests.get("https://api.deepgram.com/v1/listen", timeout=1.0)
+    assert exc.value.reason == "http_guard"
+
+
+def test_requests_guard_allows_loopback(guard_cleanup):
+    # A loopback requests call PASSES the guard (fails at the transport with a
+    # connection error since nothing is listening — NOT a SovereignBoundaryError).
+    import requests
+    install_sovereign_http_guard()
+    with pytest.raises(requests.exceptions.RequestException):
+        requests.get("http://127.0.0.1:1/x", timeout=1.0)
+
+
+def test_requests_guard_reversible(guard_cleanup):
+    import requests
+    from alfred.sovereign import is_requests_guard_installed
+    orig = requests.Session.send
+    assert is_requests_guard_installed() is False
+    install_sovereign_http_guard()
+    assert is_requests_guard_installed() is True and requests.Session.send is not orig
+    uninstall_sovereign_http_guard()
+    assert is_requests_guard_installed() is False and requests.Session.send is orig
+
+
+def test_requests_guard_noop_when_absent(guard_cleanup, monkeypatch):
+    # requests absent in a stripped venv → install cleanly (no crash), requests=False.
+    import alfred.sovereign.http_guard as hg
+    from alfred.sovereign import is_requests_guard_installed
+    monkeypatch.setattr(hg, "_try_import_requests", lambda: None)
+    with structlog.testing.capture_logs() as caps:
+        install_sovereign_http_guard()
+    assert is_requests_guard_installed() is False           # no-op'd, no crash
+    ev = [c for c in caps if c.get("event") == "sovereign.http_guard.installed"]
+    assert ev and ev[0]["requests"] is False
+
+
 # --- SovereignHttpGuard: aiohttp coverage (#40, PWA scribe prereq) ----------
 
 class _FakeSession:
@@ -570,7 +618,7 @@ def test_http_guard_install_logs_coverage(guard_cleanup):
         install_sovereign_http_guard()
     ev = [c for c in caps if c.get("event") == "sovereign.http_guard.installed"]
     assert len(ev) == 1
-    assert ev[0]["httpx"] is True and ev[0]["aiohttp"] is True
+    assert ev[0]["httpx"] is True and ev[0]["aiohttp"] is True and ev[0]["requests"] is True
 
 
 # --- W1: redirect targets re-asserted per-hop (hermetic, socket-tripwire) ----

@@ -2632,6 +2632,26 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     from alfred.scribe.config import load_from_unified as load_scribe_config
     from alfred.scribe.attest import attest as scribe_attest
+    from alfred.sovereign import (
+        SovereignBoundaryError,
+        install_sovereign_http_guard,
+        validate_sovereign_boundary,
+    )
+
+    # The attest CLI is a PRIVILEGED writer to PHI-bearing clinical_notes, invoked
+    # from the operator's interactive shell (which may carry cloud creds — no
+    # barrier-c) with NO daemon/orchestrator around it. Enforce the SAME sovereign
+    # boundary + arm the SAME egress guard the daemon does (daemon.py:76-79), so a
+    # sovereign instance's attest runs behind the no-egress boundary and any
+    # future/transitive egress from the attest path is guard-refused. NO-OP for a
+    # non-sovereign instance (validate_sovereign_boundary returns unless
+    # sovereign.enabled). Fail-closed: a boundary breach REFUSES the attest.
+    try:
+        validate_sovereign_boundary(raw)
+    except SovereignBoundaryError as e:
+        print(f"Attest REFUSED — sovereign boundary breach: {e}")
+        sys.exit(1)
+    install_sovereign_http_guard()
 
     cfg = load_scribe_config(raw)
     vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))

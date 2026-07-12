@@ -166,8 +166,18 @@ def _faster_whisper_transcribe(
     #
     # A bare-name ``WhisperModel(model_name)`` triggers a HF ``repo_info`` /
     # revision-check HTTP GET (Systran/faster-distil-whisper-large-v3) EVEN when
-    # the model is fully cached locally — which the armed SovereignHttpGuard
-    # (correctly) blocks → SovereignBoundaryError → every encounter fails.
+    # the model is fully cached locally.
+    #
+    # WHAT ACTUALLY PREVENTS THE EGRESS (corrected — feedback_credential_strip #3:
+    # security comments must be EXECUTED, not plausible). huggingface_hub performs
+    # that GET through a ``requests.Session`` (``get_session()``), NOT httpx/aiohttp.
+    # The SovereignHttpGuard now wraps ``requests.Session.send`` too (audit fix), so
+    # a bare-name load's GET WOULD be refused by the guard as a BACKSTOP — but the
+    # PRIMARY, always-correct mechanism is ``local_files_only=True`` below, which
+    # PREVENTS the GET from being attempted at all (a clean cache-only load, no
+    # exception on the happy path). (Before the audit the guard did NOT cover
+    # requests, so the earlier claim that "the armed guard blocks it" was FALSE —
+    # ``local_files_only`` was the SOLE protection; it now has a guard backstop.)
     #
     # The env-var path is DEAD (both verified on the box): (a) HF_HUB_OFFLINE=1
     # / TRANSFORMERS_OFFLINE=1 are UNHONORED by huggingface_hub 1.23 /
@@ -175,9 +185,9 @@ def _faster_whisper_transcribe(
     # daemonize re-exec STRIPS launch-env vars before the daemon process. So the
     # fix MUST be an in-process WhisperModel PARAMETER, not an env var.
     #
-    # ``local_files_only=True`` is the ONLY reliable mechanism: load from the
-    # local HF cache, never check the remote revision. The model MUST be
-    # pre-staged in the HF cache offline before use.
+    # ``local_files_only=True`` is the primary mechanism: load from the local HF
+    # cache, never check the remote revision. The model MUST be pre-staged in the
+    # HF cache offline before use.
     try:
         model = WhisperModel(
             model_name, device="cpu", compute_type="int8", cpu_threads=8,

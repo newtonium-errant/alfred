@@ -6,9 +6,9 @@ a new (or existing) call site that constructs an httpx client and talks to a
 hardcoded cloud URL — e.g. ``telegram/transcribe.py``'s hardcoded Groq
 endpoint, or the Anthropic SDK's httpx transport — would bypass the config
 barriers entirely. Once installed (process-global), every outbound
-``httpx.Client.send`` / ``httpx.AsyncClient.send`` AND
-``aiohttp.ClientSession._request`` asserts that the request's host is provably
-loopback BEFORE the transport connects; a non-loopback host raises
+``httpx.Client.send`` / ``httpx.AsyncClient.send``, ``aiohttp.ClientSession._request``
+AND ``requests.Session.send`` asserts that the request's host is provably loopback
+BEFORE the transport connects; a non-loopback host raises
 :class:`SovereignBoundaryError` (``reason="http_guard"``) so no bytes leave the
 box.
 
@@ -31,11 +31,20 @@ load-bearing path.
 
 SCOPE + COVERAGE (honest, walked against source — feedback_credential_strip #3:
 security docstrings must be EXECUTED/greppable, not plausible). This guard wraps
-BOTH client transports the repo uses:
+the THREE client transports live in the repo:
 
   * ``httpx.Client.send`` / ``httpx.AsyncClient.send`` — the Anthropic/OpenAI
     SDKs use httpx underneath; ``telegram/transcribe.py``'s hardcoded Groq
     endpoint uses httpx.
+  * ``requests.Session.send`` — the transport huggingface_hub uses (a transitive
+    dep of faster-whisper, live in the scribe process). One wrap of ``Session.send``
+    covers the initial request AND every redirect hop (``resolve_redirects``
+    re-enters ``send``). This closes a real blind spot: the ``scribe`` config
+    section is barrier-(d) ALLOWLISTED, so a hardcoded/transitive ``requests``
+    cloud call inside a scribe code path (e.g. a model auto-download, an HF
+    revision-check GET, a diarization/embedding fetch) is NOT denied by config —
+    the guard is the only backstop, and until the audit fix it did not cover
+    requests at all. IMPORT-GUARDED (no-op if requests absent).
   * ``aiohttp.ClientSession._request`` + ``ClientSession.__init__`` — the web
     STT/TTS surfaces (``web/stt_deepgram.py`` Deepgram, ``web/tts_elevenlabs.py``
     ElevenLabs) use ``aiohttp.ClientSession`` WebSockets. The WS handshake is an
@@ -85,6 +94,7 @@ the wiring config section at LOAD, NOT by this guard):
 from __future__ import annotations
 
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -97,6 +107,7 @@ log = structlog.get_logger(__name__)
 _orig_sync_send: Callable[..., Any] | None = None
 _orig_async_send: Callable[..., Any] | None = None
 _orig_aiohttp_request: Callable[..., Any] | None = None
+_orig_requests_send: Callable[..., Any] | None = None
 
 
 def _assert_host_loopback(host: str, url_for_msg: str) -> None:
@@ -163,6 +174,17 @@ async def _assert_aiohttp_redirect_loopback(session: Any, ctx: Any, params: Any)
     _assert_host_loopback(target.host or "", str(target))
 
 
+def _assert_requests_loopback(prepared: Any) -> None:
+    """requests adapter — raise if the PreparedRequest targets a non-loopback host.
+
+    ``requests.PreparedRequest.url`` is a fully-resolved absolute URL string;
+    wrapping ``Session.send`` covers the INITIAL request AND every redirect hop
+    (requests' ``resolve_redirects`` re-enters ``Session.send`` per hop with the
+    new absolute URL), so there is no separate redirect seam to close."""
+    url = getattr(prepared, "url", "") or ""
+    _assert_host_loopback(urlsplit(url).hostname or "", str(url))
+
+
 def _try_import_aiohttp() -> Any | None:
     """Return the ``aiohttp`` module, or ``None`` if it is not installed.
 
@@ -173,6 +195,20 @@ def _try_import_aiohttp() -> Any | None:
     except ImportError:
         return None
     return aiohttp
+
+
+def _try_import_requests() -> Any | None:
+    """Return the ``requests`` module, or ``None`` if it is not installed.
+
+    requests IS installed in the current venv (it is a transitive dep of
+    huggingface_hub, which faster-whisper pulls), but the guard import-guards it
+    anyway so a stripped sovereign venv without it NO-OPS gracefully. Factored out
+    so the import-absent path is testable (monkeypatch to return ``None``)."""
+    try:
+        import requests
+    except ImportError:
+        return None
+    return requests
 
 
 def _install_httpx_guard() -> None:
@@ -269,32 +305,68 @@ def _install_aiohttp_guard() -> bool:
     return True
 
 
+def _install_requests_guard() -> bool:
+    """Wrap ``requests.Session.send`` IF requests is installed. Idempotent.
+
+    ``Session.send`` is the choke every ``requests`` call funnels through
+    (``requests.get`` / ``.post`` → ``Session.request`` → ``Session.send``), AND
+    every redirect hop re-enters it (``resolve_redirects``), so one wrap covers
+    initial + redirects. Closes the scribe-allowlisted-section requests-egress
+    surface (barrier-d allowlists ``scribe``, so a hardcoded/transitive requests
+    cloud call inside a scribe code path — e.g. huggingface_hub's revision-check
+    GET — is NOT denied by config; this guard is the backstop). Returns True iff
+    the requests wrap is live after this call; NO-OPS (returns False) when requests
+    is absent."""
+    global _orig_requests_send
+    if _orig_requests_send is not None:
+        return True  # already wrapped
+    requests = _try_import_requests()
+    if requests is None:
+        return False  # not installed → graceful no-op
+
+    _orig_requests_send = requests.Session.send
+    _original = _orig_requests_send
+
+    def _guarded_send(self: Any, request: Any, **kwargs: Any) -> Any:
+        _assert_requests_loopback(request)
+        return _original(self, request, **kwargs)
+
+    requests.Session.send = _guarded_send  # type: ignore[method-assign]
+    return True
+
+
 def install_sovereign_http_guard() -> None:
-    """Install the process-global loopback guard on httpx AND aiohttp. Idempotent.
+    """Install the process-global loopback guard on httpx, aiohttp AND requests.
+    Idempotent.
 
     Surfaces coverage via the ``sovereign.http_guard.installed`` log (ILB —
     always emitted so which transports are guarded is greppable in the daemon's
-    sovereign attestation). ``aiohttp=False`` means aiohttp is not installed in
-    this venv (httpx-only coverage); a later install after a web mount covers it.
+    sovereign attestation). ``aiohttp=False`` / ``requests=False`` means that
+    transport is not installed in this venv; a later install after the dep lands
+    covers it.
     """
     _install_httpx_guard()
     aiohttp_installed = _install_aiohttp_guard()
+    requests_installed = _install_requests_guard()
     log.info(
         "sovereign.http_guard.installed",
         httpx=is_sovereign_http_guard_installed(),
         aiohttp=aiohttp_installed,
+        requests=requests_installed,
     )
 
 
 def uninstall_sovereign_http_guard() -> None:
-    """Restore the original httpx ``send`` + aiohttp ``_request``. No-op if unset.
+    """Restore the original httpx ``send`` + aiohttp ``_request`` + requests
+    ``Session.send``. No-op if unset.
 
-    (The redirect guard rides ``_request`` via a lazily-injected ``TraceConfig``;
-    restoring ``_request`` removes the inject site. Sessions constructed while the
-    guard was live keep a harmless frozen guard trace on their ``_trace_configs``
-    for their lifetime — it only re-asserts loopback, and those sessions are
-    themselves torn down; no live ``__init__``/class patch remains.)"""
-    global _orig_sync_send, _orig_async_send, _orig_aiohttp_request
+    (The aiohttp redirect guard rides ``_request`` via a lazily-injected
+    ``TraceConfig``; restoring ``_request`` removes the inject site. Sessions
+    constructed while the guard was live keep a harmless frozen guard trace on
+    their ``_trace_configs`` for their lifetime — it only re-asserts loopback, and
+    those sessions are themselves torn down; no live ``__init__``/class patch
+    remains.)"""
+    global _orig_sync_send, _orig_async_send, _orig_aiohttp_request, _orig_requests_send
     if _orig_sync_send is not None:
         httpx.Client.send = _orig_sync_send  # type: ignore[method-assign]
         httpx.AsyncClient.send = _orig_async_send  # type: ignore[method-assign]
@@ -305,6 +377,11 @@ def uninstall_sovereign_http_guard() -> None:
         if aiohttp is not None:
             aiohttp.ClientSession._request = _orig_aiohttp_request  # type: ignore[method-assign]
         _orig_aiohttp_request = None
+    if _orig_requests_send is not None:
+        requests = _try_import_requests()
+        if requests is not None:
+            requests.Session.send = _orig_requests_send  # type: ignore[method-assign]
+        _orig_requests_send = None
 
 
 def is_sovereign_http_guard_installed() -> bool:
@@ -318,3 +395,12 @@ def is_aiohttp_guard_installed() -> bool:
     False when aiohttp is not installed in this venv (httpx-only coverage) — part
     of the sovereign attestation surfaced on ``scribe.daemon.up``."""
     return _orig_aiohttp_request is not None
+
+
+def is_requests_guard_installed() -> bool:
+    """Return True iff the ``requests.Session.send`` guard is currently installed.
+
+    False when requests is not installed in this venv. Closes the
+    huggingface_hub/faster-whisper (requests.Session) transport blind spot inside
+    the barrier-d-allowlisted ``scribe`` section."""
+    return _orig_requests_send is not None

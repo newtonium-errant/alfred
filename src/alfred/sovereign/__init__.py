@@ -41,6 +41,7 @@ from .boundary import (
 from .http_guard import (
     install_sovereign_http_guard,
     is_aiohttp_guard_installed,
+    is_requests_guard_installed,
     is_sovereign_http_guard_installed,
     uninstall_sovereign_http_guard,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "validate_sovereign_boundary",
     "install_sovereign_http_guard",
     "is_aiohttp_guard_installed",
+    "is_requests_guard_installed",
     "is_sovereign_http_guard_installed",
     "uninstall_sovereign_http_guard",
 ]

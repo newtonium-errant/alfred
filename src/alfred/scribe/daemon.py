@@ -36,6 +36,7 @@ from alfred.sovereign import (
     SovereignBoundaryError,
     install_sovereign_http_guard,
     is_aiohttp_guard_installed,
+    is_requests_guard_installed,
     is_sovereign_http_guard_installed,
     validate_sovereign_boundary,
 )
@@ -92,6 +93,7 @@ def startup(
         sovereign_ok=True,
         http_guard_installed=is_sovereign_http_guard_installed(),
         aiohttp_guard_installed=is_aiohttp_guard_installed(),  # #40 web-transport coverage
+        requests_guard_installed=is_requests_guard_installed(),  # audit: hf_hub/requests coverage
         mode=config.mode,
         input_dir=config.input_dir,
         has_input=False,

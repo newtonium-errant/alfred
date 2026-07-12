@@ -209,6 +209,74 @@ def test_barrier_e_enabled_coercion_aligned_with_typed_load():
 
 
 # ---------------------------------------------------------------------------
+# Audit FIX 1 — barrier-e env-placeholder seam (was fail-OPEN: barrier read the
+# RAW ${VAR}, the server binds from the SUBSTITUTED value)
+# ---------------------------------------------------------------------------
+
+def test_barrier_e_enabled_env_placeholder_arms_and_validates(monkeypatch):
+    # `enabled: "${SCRIBE_WEB}"` with SCRIBE_WEB=true + host 0.0.0.0. Pre-fix the
+    # barrier coerced the LITERAL "${SCRIBE_WEB}" → False → returned inert while the
+    # typed config substituted → True → the daemon BOUND to 0.0.0.0 (fail-OPEN).
+    # Now the barrier substitutes the sub-tree → enabled resolves True → the 0.0.0.0
+    # host is refused. MUTATION-BIND: revert barrier-e to read raw → this passes
+    # (fail-open) → RED against this assertion.
+    monkeypatch.setenv("SCRIBE_WEB", "true")
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(
+            _sov_raw(enabled="${SCRIBE_WEB}", host="0.0.0.0", token="realtok"), env={})
+    assert exc.value.reason == "barrier_e"
+    # and the barrier now AGREES with the typed loader (both resolve enabled True).
+    cfg = load_from_unified({"scribe": {"encounter_salt": _SALT, "ingest_web": {
+        "enabled": "${SCRIBE_WEB}", "host": "127.0.0.1", "token": "x"}}})
+    assert cfg.ingest_web.enabled is True
+
+
+def test_barrier_e_enabled_env_placeholder_unset_is_inert(monkeypatch):
+    # Unset ${SCRIBE_WEB} → the literal stays → coerce False in BOTH the barrier and
+    # the server → inert (no bind, no validation). Consistent, not fail-open.
+    monkeypatch.delenv("SCRIBE_WEB", raising=False)
+    validate_sovereign_boundary(_sov_raw(enabled="${SCRIBE_WEB}", host="0.0.0.0"), env={})  # no raise
+    cfg = load_from_unified({"scribe": {"encounter_salt": _SALT, "ingest_web": {
+        "enabled": "${SCRIBE_WEB}", "host": "0.0.0.0"}}})
+    assert cfg.ingest_web.enabled is False
+
+
+def test_barrier_e_token_env_placeholder_unset_refused(monkeypatch):
+    # `token: "${SCRIBE_INGEST_TOKEN}"` with the var UNSET → the literal placeholder
+    # would become the live source-visible bearer. barrier-e must REFUSE (fail-loud
+    # on a missing secret). MUTATION-BIND: remove the placeholder check → the
+    # non-empty literal passes → RED.
+    monkeypatch.delenv("SCRIBE_INGEST_TOKEN", raising=False)
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(
+            _sov_raw(enabled=True, host="127.0.0.1", token="${SCRIBE_INGEST_TOKEN}"), env={})
+    assert exc.value.reason == "barrier_e"
+
+
+def test_barrier_e_resolved_env_placeholders_pass(monkeypatch):
+    # All three fields via placeholders that RESOLVE to loopback/real values → pass.
+    monkeypatch.setenv("SCRIBE_WEB", "true")
+    monkeypatch.setenv("SCRIBE_HOST", "127.0.0.1")
+    monkeypatch.setenv("SCRIBE_INGEST_TOKEN", "a-real-secret")
+    validate_sovereign_boundary(
+        _sov_raw(enabled="${SCRIBE_WEB}", host="${SCRIBE_HOST}", token="${SCRIBE_INGEST_TOKEN}"),
+        env={})  # no raise
+
+
+def test_barrier_c_cloud_key_placeholder_still_detected_gap_d(monkeypatch):
+    # Gap-D REGRESSION PIN: the barrier-e substitution must NOT disarm barrier-c's
+    # RAW-config ${CLOUD_KEY} scan. A ${ANTHROPIC_API_KEY} placeholder anywhere in
+    # the (un-substituted) config still trips barrier-c — proving barrier-e only
+    # substitutes its own sub-tree (a copy), leaving the raw config intact.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    raw = _sov_raw(enabled=True, host="127.0.0.1", token="realtok")
+    raw["logging"] = {"some_field": "${ANTHROPIC_API_KEY}"}
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(raw, env={})
+    assert exc.value.reason == "barrier_c"
+
+
+# ---------------------------------------------------------------------------
 # routes — the chunk-naming contract + atomicity (B1, contract #4/#6/#7)
 # ---------------------------------------------------------------------------
 
