@@ -2412,6 +2412,26 @@ def _scan_event_conflicts(
     return conflicts
 
 
+# Per-phase server-side deadline for the two BLOCKING Google API rounds in
+# the synchronous propose-create handler (conflict-scan, then create-sync).
+# The googleapiclient calls are synchronous + blocking (discovery ``build()``
+# + OAuth refresh on the process's first call, then ``list_events`` /
+# ``create_event``); the handler runs each off the event loop and bounds it
+# so the two phases together stay comfortably under the peer client's
+# per-attempt read timeout (``client.py`` ``_REQUEST_TIMEOUT`` = 15s). If a
+# slow-but-eventually-successful sync blocks past that deadline the client
+# read-times-out and RETRIES — and because the vault record commits
+# mid-handler, the retry lands on the 409 already_exists path while the
+# create actually succeeded, so the caller sees an error on a create that
+# landed (the 2026-07-09 Victoria-concert propose-event incident, the
+# create-succeeded-but-client-saw-error / STT-idempotency class). Two 6s
+# phases → 12s worst case, ~3s margin under 15s. Trade-off: a genuinely
+# slow-but-healthy GCal past 6s degrades to vault-only conflicts / a
+# ``sync_timeout`` report rather than breaching the client deadline — we
+# would rather say "sync unconfirmed" than lie about a committed create.
+_GCAL_PHASE_DEADLINE_S = 6.0
+
+
 def _scan_gcal_conflicts(
     request: web.Request,
     proposed_start: datetime,
@@ -2530,6 +2550,59 @@ def _scan_gcal_conflicts(
     return out
 
 
+async def _scan_gcal_conflicts_bounded(
+    request: web.Request,
+    proposed_start: datetime,
+    proposed_end: datetime,
+    correlation_id: str,
+) -> list[dict[str, Any]]:
+    """Off-loop, deadline-bounded wrapper around :func:`_scan_gcal_conflicts`.
+
+    The conflict scan issues BLOCKING Google API calls (``list_events`` on
+    up to two calendars, plus a cold discovery ``build()`` + OAuth refresh
+    on the process's first GCal call). Run inline on the event loop it
+    would (a) starve the loop for every concurrent request and (b) push the
+    handler past the peer client's per-attempt read timeout, so a
+    slow-but-eventually-successful scan makes the client read-time-out and
+    retry into the 409 path while the create succeeds (see
+    :data:`_GCAL_PHASE_DEADLINE_S`).
+
+    Bound + degrade: on deadline OR any unexpected error, fall back to the
+    vault-only conflict map (empty GCal list) — the same fail-open posture
+    ``_scan_gcal_conflicts`` already documents for a GCal outage (and this
+    also delivers the "any GCal API failure is logged + dropped" promise
+    for the non-``GCalError`` case its inner ``except`` doesn't cover). The
+    orphaned worker thread (Python threads aren't cancellable) finishes its
+    ``list_events`` in the background; its result is discarded.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _scan_gcal_conflicts,
+                request,
+                proposed_start,
+                proposed_end,
+                correlation_id,
+            ),
+            timeout=_GCAL_PHASE_DEADLINE_S,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "transport.canonical.event_propose_gcal_conflict_timeout",
+            deadline_s=_GCAL_PHASE_DEADLINE_S,
+            correlation_id=correlation_id,
+        )
+        return []
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "transport.canonical.event_propose_gcal_conflict_failed",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            correlation_id=correlation_id,
+        )
+        return []
+
+
 # Filename slug builder. Event filenames are the title plus an ISO date
 # suffix so the brief renderer (which sorts events by ``date``) and
 # Obsidian's filename-based dedup both have something stable to key on.
@@ -2581,7 +2654,13 @@ async def _handle_canonical_event_propose_create(
             "error_code": "<code>", "error": "<truncated msg>"}`` where
             ``error_code`` is one of ``calendar_id_missing`` /
             ``auth_failed`` / ``missing_dependency`` / ``api_error`` /
-            ``stale_gcal_id`` / ``unknown``. Vault record IS preserved;
+            ``stale_gcal_id`` / ``sync_timeout`` / ``unknown``.
+            ``sync_timeout`` means the blocking GCal round trip exceeded
+            the server-side per-phase deadline
+            (:data:`_GCAL_PHASE_DEADLINE_S`) and was NOT confirmed within
+            the caller's read window — the vault create is committed and
+            the projection may still land in the background (a
+            daemon/operator re-sync reconciles). Vault record IS preserved;
             the projection failed, not the canonical write. Downstream
             renderers (Hypatia / KAL-LE) switch on ``error_code`` to
             produce calibrated user-facing messages without parsing
@@ -2733,7 +2812,7 @@ async def _handle_canonical_event_propose_create(
     # to vault-only conflict-check rather than blocking every event
     # proposal. See ``_scan_gcal_conflicts`` for the trade-off note.
     vault_conflicts = _scan_event_conflicts(vault_path, start_dt, end_dt)
-    gcal_conflicts = _scan_gcal_conflicts(
+    gcal_conflicts = await _scan_gcal_conflicts_bounded(
         request, start_dt, end_dt, correlation_id,
     )
     # Dedup vault-already-synced-to-gcal-alfred records: when commit 3
@@ -2879,15 +2958,74 @@ async def _handle_canonical_event_propose_create(
         "path": rel_path,
         "correlation_id": correlation_id,
     }
-    sync_result = _sync_event_to_gcal(
-        request,
-        file_path=file_path,
-        title=title.strip(),
-        description=summary.strip(),
-        start_dt=start_dt,
-        end_dt=end_dt,
-        correlation_id=correlation_id,
-    )
+    # The vault record is committed above — the canonical source of truth.
+    # The GCal projection is a BLOCKING Google API round trip; run it off
+    # the event loop, bounded by the per-phase deadline, and contain BOTH
+    # of its post-commit failure classes so a committed create is NEVER
+    # reported to the caller as an error (the whole point of Build #37):
+    #   * The sync raises a NON-``GCalError`` after the commit (a cold
+    #     discovery ``build()`` / OAuth refresh failure —
+    #     ``sync_event_create_to_gcal`` only contains ``GCalError``, so
+    #     anything else would 500 the handler AFTER the vault write) →
+    #     surface ``gcal_sync.status=failed`` with the classified code.
+    #   * The sync is SLOW past the deadline → without a bound the client
+    #     read-times-out and retries into the 409 already_exists path while
+    #     the create actually landed (2026-07-09 incident) → answer the
+    #     committed success promptly with ``error_code="sync_timeout"``.
+    # In every path the vault record stands (sync failure does NOT roll it
+    # back); the daemon sync loop / operator re-sync reconciles the GCal
+    # projection, and an orphaned timeout thread still writes back the
+    # ``gcal_event_id`` dedup anchor if the create ultimately succeeds.
+    sync_result: dict[str, Any]
+    try:
+        sync_result = await asyncio.wait_for(
+            asyncio.to_thread(
+                _sync_event_to_gcal,
+                request,
+                file_path=file_path,
+                title=title.strip(),
+                description=summary.strip(),
+                start_dt=start_dt,
+                end_dt=end_dt,
+                correlation_id=correlation_id,
+            ),
+            timeout=_GCAL_PHASE_DEADLINE_S,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "transport.canonical.event_propose_gcal_sync_timeout",
+            peer=peer,
+            title=title[:80],
+            path=rel_path,
+            deadline_s=_GCAL_PHASE_DEADLINE_S,
+            correlation_id=correlation_id,
+        )
+        sync_result = {
+            "error": {
+                "code": "sync_timeout",
+                "detail": (
+                    f"gcal sync exceeded the {_GCAL_PHASE_DEADLINE_S:.0f}s "
+                    "server budget; vault record committed, GCal projection "
+                    "still in flight (daemon/operator will reconcile)"
+                ),
+            }
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "transport.canonical.event_propose_gcal_sync_failed",
+            peer=peer,
+            title=title[:80],
+            path=rel_path,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            correlation_id=correlation_id,
+        )
+        sync_result = {
+            "error": {
+                "code": _classify_gcal_error(exc),
+                "detail": str(exc),
+            }
+        }
     if sync_result.get("event_id"):
         response_payload["gcal_event_id"] = sync_result["event_id"]
         # Calendar-kind label is config-driven (per-instance) — Salem

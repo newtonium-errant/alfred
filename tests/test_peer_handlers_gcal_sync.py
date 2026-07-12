@@ -30,13 +30,17 @@ Coverage:
 
 from __future__ import annotations
 
+import time
+
 import frontmatter
+import structlog
 from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 from aiohttp.test_utils import TestClient
 
+import alfred.transport.peer_handlers as peer_handlers
 from alfred.transport.config import (
     AuthConfig,
     AuthTokenEntry,
@@ -474,3 +478,231 @@ async def test_frontmatter_writeback_failure_is_soft(app_factory, monkeypatch): 
     assert body["gcal_calendar"] == "alfred"
     assert body["gcal_sync"] == {"status": "ok"}
     assert "gcal_sync_error" not in body  # legacy-field regression pin
+
+
+# ---------------------------------------------------------------------------
+# Build #37 — create-succeeded-but-client-saw-error (STT-idempotency class).
+#
+# Two post-commit failure classes must NEVER surface to the caller as an
+# error on a committed create:
+#   (1) the GCal sync raises a NON-``GCalError`` after the vault commit
+#       (cold discovery build() / OAuth refresh failure) —
+#       ``sync_event_create_to_gcal`` only contains ``GCalError``, so
+#       anything else would 500 the handler AFTER the vault write.
+#   (2) the GCal sync is SLOW past the server-side per-phase deadline —
+#       without a bound the peer client read-times-out and retries into the
+#       409 already_exists path while the create actually landed (the
+#       2026-07-09 Victoria-concert incident).
+# In both cases the response is a 201 ``created`` carrying the committed
+# ``path`` plus an accurate ``gcal_sync`` status — the caller's FIRST call
+# gets the truth, no retry-into-dedup guessing.
+# ---------------------------------------------------------------------------
+
+
+async def test_gcal_sync_non_gcalerror_post_commit_returns_created(app_factory):  # type: ignore[no-untyped-def]
+    """Class (1): a raw exception from create_event (e.g. discovery build()
+    blowing up) is contained post-commit — the handler returns 201 created
+    with ``gcal_sync.status == "failed"`` instead of a 500."""
+    gcal_client = MagicMock()
+    gcal_client.list_events.return_value = []  # no conflicts
+    # NOT a GCalError — sync_event_create_to_gcal's inner except only
+    # catches GCalError, so this propagates all the way to the handler.
+    gcal_client.create_event.side_effect = RuntimeError(
+        "Failed to build Calendar service: discovery fetch failed",
+    )
+    gcal_config = _make_gcal_config()
+
+    client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
+    with structlog.testing.capture_logs() as cap:
+        resp = await client.post(
+            "/canonical/event/propose-create",
+            json={
+                "correlation_id": "non-gcalerror-post-commit",
+                "start": "2026-05-04T14:00:00-03:00",
+                "end": "2026-05-04T15:00:00-03:00",
+                "title": "Build service blows up",
+                "origin_instance": "kal-le",
+            },
+            headers={
+                "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+                "X-Alfred-Client": "kal-le",
+            },
+        )
+    # The create is committed — a post-commit sync explosion is NOT a 500.
+    assert resp.status == 201
+    body = await resp.json()
+    assert body["status"] == "created"
+    assert body["path"]  # caller gets the committed path on the first call
+    assert "gcal_event_id" not in body
+    sync = body["gcal_sync"]
+    assert sync["status"] == "failed"
+    # RuntimeError is not a GCalError subclass → classify → "unknown".
+    assert sync["error_code"] == "unknown"
+    assert "discovery" in sync["error"].lower()
+
+    # Log-emission pin (feedback_log_emission_test_pattern): the contained
+    # post-commit failure must be observable, with the exception type.
+    matches = [
+        c for c in cap
+        if c.get("event") == "transport.canonical.event_propose_gcal_sync_failed"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["error_type"] == "RuntimeError"
+
+    # Vault record preserved — the sync failure did not roll it back.
+    vault_root = client.server.app["_vault_root"]
+    fm = frontmatter.load(str(vault_root / body["path"]))
+    assert "gcal_event_id" not in fm.metadata
+
+
+async def test_gcal_sync_timeout_returns_committed_success(app_factory, monkeypatch):  # type: ignore[no-untyped-def]
+    """Class (2), THE incident: a slow-but-successful GCal sync exceeds the
+    server-side deadline → the handler still returns the committed 201 with
+    ``error_code == "sync_timeout"`` (never a client-visible timeout that
+    triggers a retry-into-409)."""
+    # Shrink the deadline so the test doesn't have to block for 6 real
+    # seconds. The handler reads the module global at call time.
+    monkeypatch.setattr(peer_handlers, "_GCAL_PHASE_DEADLINE_S", 0.2)
+
+    gcal_client = MagicMock()
+    gcal_client.list_events.return_value = []  # conflict scan is fast
+
+    def _slow_create(*args, **kwargs):
+        # Blocks the worker thread past the deadline. The orphaned thread
+        # finishes in the background (Python threads aren't cancellable).
+        time.sleep(0.8)
+        return "eventually-landed-id"
+
+    gcal_client.create_event.side_effect = _slow_create
+    gcal_config = _make_gcal_config()
+
+    client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
+    with structlog.testing.capture_logs() as cap:
+        resp = await client.post(
+            "/canonical/event/propose-create",
+            json={
+                "correlation_id": "slow-sync-timeout",
+                "start": "2026-05-04T14:00:00-03:00",
+                "end": "2026-05-04T15:00:00-03:00",
+                "title": "Slow sync but committed",
+                "origin_instance": "kal-le",
+            },
+            headers={
+                "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+                "X-Alfred-Client": "kal-le",
+            },
+        )
+    assert resp.status == 201
+    body = await resp.json()
+    assert body["status"] == "created"
+    assert body["path"]  # committed create surfaced on the FIRST call
+    assert "gcal_event_id" not in body
+    sync = body["gcal_sync"]
+    assert sync["status"] == "failed"
+    assert sync["error_code"] == "sync_timeout"
+
+    # Log-emission pin: the deadline breach is observable with the budget.
+    matches = [
+        c for c in cap
+        if c.get("event") == "transport.canonical.event_propose_gcal_sync_timeout"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["deadline_s"] == 0.2
+
+
+async def test_gcal_slow_conflict_scan_degrades_and_still_creates(app_factory, monkeypatch):  # type: ignore[no-untyped-def]
+    """Companion to the timeout fix: the conflict-scan is ALSO a blocking
+    GCal round trip (and carries the cold-start cost). A slow scan degrades
+    to vault-only conflicts and the create still proceeds within the client
+    deadline, returning a normal committed success."""
+    monkeypatch.setattr(peer_handlers, "_GCAL_PHASE_DEADLINE_S", 0.2)
+
+    gcal_client = MagicMock()
+
+    def _slow_list(*args, **kwargs):
+        time.sleep(0.8)  # blocks past the deadline
+        return []
+
+    gcal_client.list_events.side_effect = _slow_list
+    gcal_client.create_event.return_value = "created-after-degrade-id"
+    gcal_config = _make_gcal_config()
+
+    client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
+    with structlog.testing.capture_logs() as cap:
+        resp = await client.post(
+            "/canonical/event/propose-create",
+            json={
+                "correlation_id": "slow-conflict-scan",
+                "start": "2026-05-04T14:00:00-03:00",
+                "end": "2026-05-04T15:00:00-03:00",
+                "title": "Slow conflict scan",
+                "origin_instance": "kal-le",
+            },
+            headers={
+                "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+                "X-Alfred-Client": "kal-le",
+            },
+        )
+    # Conflict scan timed out → degraded to vault-only (no conflict) → the
+    # create proceeds and the sync (fast create_event) succeeds normally.
+    assert resp.status == 201
+    body = await resp.json()
+    assert body["status"] == "created"
+    assert body["gcal_sync"] == {"status": "ok"}
+    assert gcal_client.create_event.called is True
+
+    # Log-emission pin: the conflict-scan deadline breach is observable.
+    matches = [
+        c for c in cap
+        if c.get("event") == "transport.canonical.event_propose_gcal_conflict_timeout"
+    ]
+    assert len(matches) == 1
+
+
+async def test_gcal_409_already_exists_returns_before_sync(app_factory):  # type: ignore[no-untyped-def]
+    """Regression pin: a filename collision (same title + date) still short-
+    circuits to 409 already_exists BEFORE any GCal create is attempted — the
+    threading/bounding changes must not move the 409 gate past the sync."""
+    gcal_client = MagicMock()
+    gcal_client.list_events.return_value = []  # no conflicts
+    gcal_client.create_event.return_value = "first-create-id"
+    gcal_config = _make_gcal_config()
+
+    client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
+    headers = {
+        "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+        "X-Alfred-Client": "kal-le",
+    }
+    resp1 = await client.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "collide-first",
+            "start": "2026-07-01T10:00:00-03:00",
+            "end": "2026-07-01T11:00:00-03:00",
+            "title": "Recurring Standup",
+            "origin_instance": "kal-le",
+        },
+        headers=headers,
+    )
+    assert resp1.status == 201
+
+    # Same title + same date, non-overlapping later slot → conflict-check
+    # passes, filename collides → 409, and NO second create_event fires.
+    resp2 = await client.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "collide-second",
+            "start": "2026-07-01T13:00:00-03:00",
+            "end": "2026-07-01T14:00:00-03:00",
+            "title": "Recurring Standup",
+            "origin_instance": "kal-le",
+        },
+        headers=headers,
+    )
+    assert resp2.status == 409
+    body = await resp2.json()
+    assert body["status"] == "exists"
+    assert body["path"] == "event/Recurring Standup 2026-07-01.md"
+    # Sync only ran for the first (successful) create — the 409 path never
+    # reached the GCal sync.
+    assert gcal_client.create_event.call_count == 1
