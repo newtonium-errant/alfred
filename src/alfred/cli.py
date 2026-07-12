@@ -2643,15 +2643,24 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     # barrier-c) with NO daemon/orchestrator around it. Enforce the SAME sovereign
     # boundary + arm the SAME egress guard the daemon does (daemon.py:76-79), so a
     # sovereign instance's attest runs behind the no-egress boundary and any
-    # future/transitive egress from the attest path is guard-refused. NO-OP for a
-    # non-sovereign instance (validate_sovereign_boundary returns unless
-    # sovereign.enabled). Fail-closed: a boundary breach REFUSES the attest.
+    # future/transitive egress from the attest path is guard-refused. Fail-closed:
+    # a boundary breach REFUSES the attest.
+    #
+    # validate_sovereign_boundary is unconditional (it already no-ops unless
+    # sovereign.enabled). The guard install is GATED on sovereign.enabled for
+    # precision — mirror the boundary's own no-op condition so a NON-sovereign
+    # instance's attest does not monkeypatch the transport (harmless today — attest
+    # has no network surface and the guard only ever blocks — but the guard is a
+    # sovereign-scope control, so it should only arm for a sovereign instance).
+    sovereign = raw.get("sovereign") or {}
+    sovereign_enabled = isinstance(sovereign, dict) and bool(sovereign.get("enabled"))
     try:
         validate_sovereign_boundary(raw)
     except SovereignBoundaryError as e:
         print(f"Attest REFUSED — sovereign boundary breach: {e}")
         sys.exit(1)
-    install_sovereign_http_guard()
+    if sovereign_enabled:
+        install_sovereign_http_guard()
 
     cfg = load_scribe_config(raw)
     vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))

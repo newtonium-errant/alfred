@@ -264,16 +264,31 @@ def test_barrier_e_resolved_env_placeholders_pass(monkeypatch):
 
 
 def test_barrier_c_cloud_key_placeholder_still_detected_gap_d(monkeypatch):
-    # Gap-D REGRESSION PIN: the barrier-e substitution must NOT disarm barrier-c's
-    # RAW-config ${CLOUD_KEY} scan. A ${ANTHROPIC_API_KEY} placeholder anywhere in
-    # the (un-substituted) config still trips barrier-c — proving barrier-e only
-    # substitutes its own sub-tree (a copy), leaving the raw config intact.
+    # Gap-D REGRESSION PIN (end-to-end): the barrier-e substitution must NOT disarm
+    # barrier-c's RAW-config ${CLOUD_KEY} scan. A ${ANTHROPIC_API_KEY} placeholder
+    # anywhere in the (un-substituted) config still trips barrier-c.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     raw = _sov_raw(enabled=True, host="127.0.0.1", token="realtok")
     raw["logging"] = {"some_field": "${ANTHROPIC_API_KEY}"}
     with pytest.raises(SovereignBoundaryError) as exc:
         validate_sovereign_boundary(raw, env={})
     assert exc.value.reason == "barrier_c"
+
+
+def test_barrier_e_does_not_mutate_raw_config_gap_d_direct(monkeypatch):
+    # Gap-D DIRECT PIN (the non-mutation property itself, NOT barrier ordering):
+    # after a SUCCESSFUL validate_sovereign_boundary on an ingest_web with ${VAR}
+    # placeholders, the RAW config's host/token are STILL the literal placeholders —
+    # barrier-e substituted a fresh COPY (substitute_env_in_value), never `raw`. So
+    # barrier-c's RAW ${CLOUD_KEY} scan is provably unaffected regardless of barrier
+    # ordering. (env resolves them to loopback/real so the barrier PASSES + returns.)
+    monkeypatch.setenv("SCRIBE_WEB_HOST", "127.0.0.1")
+    monkeypatch.setenv("SCRIBE_WEB_TOKEN", "a-real-secret")
+    raw = _sov_raw(enabled=True, host="${SCRIBE_WEB_HOST}", token="${SCRIBE_WEB_TOKEN}")
+    validate_sovereign_boundary(raw, env={})   # PASSES (host resolves loopback, token real)
+    # RAW is UNMUTATED — still the literal placeholders (the barrier substituted a copy).
+    assert raw["scribe"]["ingest_web"]["host"] == "${SCRIBE_WEB_HOST}"
+    assert raw["scribe"]["ingest_web"]["token"] == "${SCRIBE_WEB_TOKEN}"
 
 
 # ---------------------------------------------------------------------------

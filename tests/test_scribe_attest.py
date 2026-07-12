@@ -202,9 +202,10 @@ def _scribe_args(config_path, note="clinical_note/x.md"):
                               attester="np_jamie", new_status="attested")
 
 
-def test_attest_cli_installs_guard_before_attest(tmp_path, monkeypatch):
-    # FIX 3: cmd_scribe must arm the http guard BEFORE calling scribe_attest. Patch
-    # the attest writer to assert the guard is already installed at call time.
+def test_attest_cli_installs_guard_before_attest_for_sovereign(tmp_path, monkeypatch):
+    # FIX 3 + N1: for a SOVEREIGN instance, cmd_scribe must arm the http guard
+    # BEFORE calling scribe_attest. Patch the attest writer to assert the guard is
+    # already installed at call time.
     import importlib
     from alfred import cli
     # The SUBMODULE (importlib.import_module returns sys.modules[...] — the package
@@ -220,12 +221,47 @@ def test_attest_cli_installs_guard_before_attest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(attest_mod, "attest", _fake_attest)
     cfg = _write_config(tmp_path, {
+        "sovereign": {"enabled": True},                    # sovereign → guard arms
+        "vault": {"path": str(tmp_path)}, "logging": {"dir": str(tmp_path)},
+        "scribe": {"clinicians": ["np_jamie"], "encounter_salt": "s",
+                   "stt": {"provider": "fake"},            # barrier-a OK (local)
+                   "llm": {"base_url": "http://127.0.0.1:11434"}},  # barrier-b OK (loopback)
+    })
+    try:
+        cli.cmd_scribe(_scribe_args(cfg))
+        assert seen.get("guard_installed") is True         # guard armed BEFORE attest
+    finally:
+        uninstall_sovereign_http_guard()
+
+
+def test_attest_cli_non_sovereign_does_not_install_guard(tmp_path, monkeypatch):
+    # FIX N1 (precision): a NON-sovereign instance's attest must NOT monkeypatch the
+    # transport — the guard is a sovereign-scope control. The boundary still runs
+    # (no-op for non-sovereign), attest still proceeds, but the guard stays OFF.
+    import importlib
+    from alfred import cli
+    attest_mod = importlib.import_module("alfred.scribe.attest")
+    from alfred.sovereign import (
+        is_sovereign_http_guard_installed,
+        uninstall_sovereign_http_guard,
+    )
+    assert is_sovereign_http_guard_installed() is False
+
+    seen = {}
+
+    def _fake_attest(*a, **k):
+        seen["guard_installed"] = is_sovereign_http_guard_installed()
+        return {"path": "clinical_note/x.md"}
+
+    monkeypatch.setattr(attest_mod, "attest", _fake_attest)
+    cfg = _write_config(tmp_path, {                        # NO sovereign block
         "vault": {"path": str(tmp_path)}, "logging": {"dir": str(tmp_path)},
         "scribe": {"clinicians": ["np_jamie"], "encounter_salt": "s"},
     })
     try:
         cli.cmd_scribe(_scribe_args(cfg))
-        assert seen.get("guard_installed") is True         # guard armed BEFORE attest
+        assert seen.get("guard_installed") is False        # guard NOT armed (non-sovereign)
+        assert is_sovereign_http_guard_installed() is False
     finally:
         uninstall_sovereign_http_guard()
 
