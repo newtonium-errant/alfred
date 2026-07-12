@@ -201,6 +201,11 @@ class VoiceSttWorker:
 
         self._closing = False
         self._aclose_started = False
+        # Build #30 re-entrancy guard: True while _commit_inline is mid-flight so
+        # a pump re-entry during the on_utterance await NO-OPs instead of double-
+        # firing the committing span. Session-lifetime (NOT per-utterance state —
+        # never touched by _reset_utt); managed only by _commit_inline's try/finally.
+        self._commit_in_progress = False
 
         # stats (the worker_closed summary + close diagnosis)
         self._utterances = 0
@@ -588,57 +593,91 @@ class VoiceSttWorker:
         with the committed text, fires the unchanged ``on_utterance``, then the
         shadow hook + features-only telemetry, then resets per-utterance state.
         ``decision=None`` = the bypass/disabled path (no telemetry, log fields
-        byte-identical to today)."""
-        text = " ".join(self._buffer).strip()
-        committed_n = len(self._buffer)   # segment count being committed NOW
-        # Clinical-safety (clinic-capture Piece 2b): drop caption-artifact
-        # hallucinations ("Thank you for watching!") BEFORE the LIVE turn fires —
-        # a hallucinated "send a prescription" must never drive an action. A
-        # fully-hallucinated utterance filters to "" → NO turn fires (below).
-        # Line-level exact match; real content is never substring-nuked.
-        if text:
-            filtered, dropped_noise = filter_stt_noise(text, self._stt_denylist)
-            if dropped_noise:
-                text = filtered
-                log.info("web.voice.stt.noise_filtered",
-                         voice_session_id=self._vid, dropped=len(dropped_noise))
-        utt_pcm = self._snapshot_utt_pcm()
-        self._utterances += 1
-        extra = ({"held": self._ever_held, "hold_ms": self._hold_ms_applied}
-                 if decision is not None else {})
-        log.info("web.voice.stt.utterance_end", voice_session_id=self._vid,
-                 trigger=trigger, transcript_chars=len(text), **extra)
-        if text:
-            await self._on_utterance(text)   # LIVE TURN — only real content
-            if self._shadow_capture is not None and utt_pcm:
-                duration_s = len(utt_pcm) / (self._sample_rate * 2)
-                try:
-                    self._shadow_capture(utt_pcm, text, duration_s)
-                except Exception:  # noqa: BLE001 — never break the pump
-                    log.warning("web.voice.stt.shadow_hook_raised",
-                                voice_session_id=self._vid)
-        else:
-            # Intentionally-left-blank: the whole utterance was caption noise —
-            # dropped, no turn. Distinguishable from a silent bug.
-            log.info("web.voice.stt.utterance_all_noise",
-                     voice_session_id=self._vid)
-        if decision is not None:
-            self._emit_endpoint_telemetry()
-        # LATE-FINAL CARRY-FORWARD (endpoint-hold #1). When this runs from the
-        # DETACHED _commit_held timer task, the pump is free to append a NEW final
-        # to self._buffer during the on_utterance await above (its EVENT_FINAL
-        # branch; _note_resume is a no-op there — the timer already nulled
-        # hold_task). A blanket _reset_utt would DROP that late final if its own
-        # utterance_end has not fired yet. Buffer segments only ever APPEND (never
-        # reorder), so [committed_n:] is EXACTLY the finals that arrived during the
-        # await — preserve them so the resumed speech commits on its own EOU (its
-        # teed PCM, already snapshot-cleared above, stays aligned with it). The
-        # committed span [:committed_n] is dropped, so no double-fire. In the
-        # inline pump-driven path the pump is blocked on this await, nothing
-        # appends, carried is empty → byte-identical to today.
-        carried = self._buffer[committed_n:]
-        self._reset_utt()
-        self._buffer = carried
+        byte-identical to today).
+
+        Re-entrancy guard (build #30): the ONLY await in the body is
+        ``on_utterance``. IF a future ``on_utterance`` yields control (today's
+        production ``submit_utterance`` has NO await → never yields, so this is
+        transparent insurance), the pump could re-enter this method via
+        ``_on_utterance_end`` while the outer commit is parked on that await —
+        recomputing ``committed_n`` on the buffer the pump has since mutated,
+        double-firing the committing span, and clobbering the outer commit's
+        carry-forward (the re-entrant ``_reset_utt`` would clear the buffer the
+        outer commit still expects). A ``_commit_in_progress`` bool — NOT a Lock;
+        this method is never meant to run concurrently, so a flag is the exact
+        primitive and a Lock would only imply future parallelism — makes
+        single-fire-per-commit an explicit invariant: a re-entrant call is a
+        NO-OP that returns WITHOUT firing ``on_utterance`` or resetting the
+        buffer, so the outer (first) commit's carry-forward stays intact and the
+        pump's own final still commits on its own EOU AFTER the outer commit fully
+        returns (the flag is cleared in ``finally``, so only the mid-flight
+        re-entrant call is suppressed). The non-reentrant path is byte-identical
+        to today — the guard is transparent."""
+        if self._commit_in_progress:
+            # Re-entrant commit mid-flight (see docstring): NO-OP so the outer
+            # commit's carry-forward survives + the committing span never
+            # double-fires. Loud because on_utterance yielding is unexpected today.
+            log.warning(
+                "web.voice.stt.commit_reentry_skipped",
+                voice_session_id=self._vid, trigger=trigger,
+                detail="re-entrant _commit_inline suppressed — outer commit in "
+                       "flight; carry-forward preserved, no double-fire",
+            )
+            return
+        self._commit_in_progress = True
+        try:
+            text = " ".join(self._buffer).strip()
+            committed_n = len(self._buffer)   # segment count being committed NOW
+            # Clinical-safety (clinic-capture Piece 2b): drop caption-artifact
+            # hallucinations ("Thank you for watching!") BEFORE the LIVE turn fires —
+            # a hallucinated "send a prescription" must never drive an action. A
+            # fully-hallucinated utterance filters to "" → NO turn fires (below).
+            # Line-level exact match; real content is never substring-nuked.
+            if text:
+                filtered, dropped_noise = filter_stt_noise(text, self._stt_denylist)
+                if dropped_noise:
+                    text = filtered
+                    log.info("web.voice.stt.noise_filtered",
+                             voice_session_id=self._vid, dropped=len(dropped_noise))
+            utt_pcm = self._snapshot_utt_pcm()
+            self._utterances += 1
+            extra = ({"held": self._ever_held, "hold_ms": self._hold_ms_applied}
+                     if decision is not None else {})
+            log.info("web.voice.stt.utterance_end", voice_session_id=self._vid,
+                     trigger=trigger, transcript_chars=len(text), **extra)
+            if text:
+                await self._on_utterance(text)   # LIVE TURN — only real content
+                if self._shadow_capture is not None and utt_pcm:
+                    duration_s = len(utt_pcm) / (self._sample_rate * 2)
+                    try:
+                        self._shadow_capture(utt_pcm, text, duration_s)
+                    except Exception:  # noqa: BLE001 — never break the pump
+                        log.warning("web.voice.stt.shadow_hook_raised",
+                                    voice_session_id=self._vid)
+            else:
+                # Intentionally-left-blank: the whole utterance was caption noise —
+                # dropped, no turn. Distinguishable from a silent bug.
+                log.info("web.voice.stt.utterance_all_noise",
+                         voice_session_id=self._vid)
+            if decision is not None:
+                self._emit_endpoint_telemetry()
+            # LATE-FINAL CARRY-FORWARD (endpoint-hold #1). When this runs from the
+            # DETACHED _commit_held timer task, the pump is free to append a NEW final
+            # to self._buffer during the on_utterance await above (its EVENT_FINAL
+            # branch; _note_resume is a no-op there — the timer already nulled
+            # hold_task). A blanket _reset_utt would DROP that late final if its own
+            # utterance_end has not fired yet. Buffer segments only ever APPEND (never
+            # reorder), so [committed_n:] is EXACTLY the finals that arrived during the
+            # await — preserve them so the resumed speech commits on its own EOU (its
+            # teed PCM, already snapshot-cleared above, stays aligned with it). The
+            # committed span [:committed_n] is dropped, so no double-fire. In the
+            # inline pump-driven path the pump is blocked on this await, nothing
+            # appends, carried is empty → byte-identical to today.
+            carried = self._buffer[committed_n:]
+            self._reset_utt()
+            self._buffer = carried
+        finally:
+            self._commit_in_progress = False
 
     async def _arm_or_commit_hold(self, trigger: str) -> None:
         """Arm a bounded CONCURRENT hold (a detached cancellable Task — the pump

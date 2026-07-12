@@ -373,6 +373,103 @@ async def test_late_final_carry_forward_noop_on_inline_commit() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Build #30 — commit-in-progress reentrancy guard
+# (single-fire-per-commit invariant; defensive — reachability is nil today
+#  because the production on_utterance (submit_utterance) has NO await, so it
+#  never yields control mid-commit. The guard protects against a future
+#  on_utterance gaining an await introducing the double-fire.)
+# ---------------------------------------------------------------------------
+
+
+async def test_commit_reentry_guard_no_double_fire_carry_forward_survives() -> None:
+    """Simulate the pump RE-ENTERING _commit_inline during the timer commit's
+    on_utterance await: a late EVENT_FINAL appends a new segment, then its
+    EVENT_UTTERANCE_END drives a re-entrant _commit_inline while the outer (timer)
+    commit is parked on ``await on_utterance``. The guard must NO-OP the re-entrant
+    call so on_utterance fires EXACTLY ONCE for the held span (no double-fire) and
+    the late final survives as carry-forward, committing on its OWN later EOU.
+
+    The on_utt callback models the pump at exactly the await window: it appends the
+    late final AND drives its utterance_end re-entrantly (the reentrancy the guard
+    defends). Mutation: remove the guard → the re-entrant commit fires on_utterance
+    again with the mutated buffer (double-fire) and its _reset_utt clobbers the
+    outer commit's carry-forward → both the got and buffer asserts fail."""
+    got: list[str] = []
+    reentered = {"done": False}
+
+    async def on_utt(text: str) -> None:
+        got.append(text)
+        if not reentered["done"]:
+            reentered["done"] = True
+            # A late final (its EVENT_FINAL branch) appends to the SAME buffer,
+            # then the pump processes its EVENT_UTTERANCE_END → RE-ENTRANT
+            # _commit_inline while THIS (outer) commit is still parked here.
+            w._buffer.append("wait one more thing.")
+            await w._on_utterance_end("speech_final")
+
+    w = _worker(on_utt,
+                endpoint=EndpointHoldSettings(enabled=True, base_extend_ms=20))
+    w._buffer = ["book the flight and"]
+    with structlog.testing.capture_logs() as cap:
+        await w._on_utterance_end("speech_final")          # HOLD armed
+        assert w._hold_task is not None
+        await asyncio.sleep(0.05)                           # timer → outer commit
+    # on_utterance fired EXACTLY ONCE for the held span — the re-entrant NO-OP'd.
+    assert got == ["book the flight and"]
+    assert w._utterances == 1                               # no double-count
+    # The guard fired a loud, grep-able signal (observability pin).
+    assert [c for c in cap
+            if c.get("event") == "web.voice.stt.commit_reentry_skipped"]
+    # The late final survived the re-entrant NO-OP as carry-forward.
+    assert w._buffer == ["wait one more thing."], "carry-forward clobbered by reentry"
+    # And it commits on its OWN later EOU — single fire, not lost.
+    await w._on_utterance_end("speech_final")
+    assert got == ["book the flight and", "wait one more thing."]
+
+
+async def test_commit_reentry_guard_direct_noop() -> None:
+    """Direct pin of the guard's contract (reachability is nil today, so pin the
+    NO-OP behavior directly, independent of the classify/carry-forward machinery).
+    With _commit_in_progress already True, a _commit_inline call must NO-OP: no
+    on_utterance fire, buffer + utterance counter untouched, loud skip log."""
+    got: list[str] = []
+    w = _worker(await _collect(got))
+    w._buffer = ["do not fire twice"]
+    w._commit_in_progress = True                           # an outer commit in flight
+    before = w._utterances
+    with structlog.testing.capture_logs() as cap:
+        await w._commit_inline(trigger="speech_final", decision=None)
+    assert got == []                                       # on_utterance never fired
+    assert w._buffer == ["do not fire twice"]              # buffer untouched
+    assert w._utterances == before                         # no double-count
+    matches = [c for c in cap
+               if c.get("event") == "web.voice.stt.commit_reentry_skipped"]
+    assert len(matches) == 1 and matches[0].get("trigger") == "speech_final"
+
+
+async def test_commit_in_progress_cleared_even_if_on_utterance_raises() -> None:
+    """The guard flag is cleared in a ``finally`` — an on_utterance that RAISES must
+    not leave _commit_in_progress stuck True (which would permanently NO-OP every
+    future commit → silent STT death). After the raise, a fresh commit still fires."""
+    calls = {"n": 0}
+
+    async def on_utt(text: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("turn driver blew up")
+
+    w = _worker(on_utt)
+    w._buffer = ["first one boom"]
+    with pytest.raises(RuntimeError):
+        await w._commit_inline(trigger="speech_final", decision=None)
+    assert w._commit_in_progress is False                  # cleared despite the raise
+    # A fresh commit still fires — the flag did NOT stick True.
+    w._buffer = ["second one works."]
+    await w._commit_inline(trigger="speech_final", decision=None)
+    assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Snapshot / buffer alignment (held audio stays aligned with held text)
 # ---------------------------------------------------------------------------
 
