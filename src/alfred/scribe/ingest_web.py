@@ -279,13 +279,16 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
     try:
         seq = int(q.get("seq", ""))
     except (TypeError, ValueError):
+        log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE, reason="invalid_seq")
         return _reject("invalid_seq", 400)
     if seq < 1:
+        log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE, reason="invalid_seq")
         return _reject("invalid_seq", 400)
 
     # ext — an accepted audio ext (.mp4 deliberately absent).
     ext = (q.get("ext", "") or "").lower().lstrip(".")
     if ext not in ALLOWED_AUDIO_EXTS:
+        log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE, reason="unsupported_ext")
         return _reject("unsupported_ext", 400)
 
     # opaque encounter id (fail-loud on a missing salt → opaque 500, never leak).
@@ -329,6 +332,8 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
         log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="chunk_bytes")
         return _reject("chunk_too_large", 413)
     if not body:
+        log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
+                    reason="empty_chunk", encounter_id=encounter_id)
         return _reject("empty_chunk", 400)
 
     # N3 cap — per-encounter total bytes.
@@ -363,6 +368,7 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
     config: ScribeConfig = request.app["scribe_config"]
     label = request.query.get("label", "")
     if not ENCOUNTER_LABEL_RE.fullmatch(label):
+        log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE, reason="invalid_label")
         return _reject("invalid_label", 400)
     try:
         encounter_id = compute_encounter_id(label, salt=config.encounter_salt)
@@ -384,6 +390,7 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
     config: ScribeConfig = request.app["scribe_config"]
     label = request.query.get("label", "")
     if not ENCOUNTER_LABEL_RE.fullmatch(label):
+        log.warning("scribe.ingest_web.rejected", route=STATUS_ROUTE, reason="invalid_label")
         return _reject("invalid_label", 400)
     try:
         encounter_id = compute_encounter_id(label, salt=config.encounter_salt)

@@ -403,26 +403,23 @@ def test_settle_gate_meta_marker_is_settled(tmp_path):
     enc = tmp_path / "enc"
     chunk = _write_chunk(enc, 1, ["x"], meta=True)
     meta = chunk.with_suffix(".meta.json")
-    assert is_chunk_settled(chunk, meta_path=meta, now=1e12) is True
+    assert is_chunk_settled(chunk, meta_path=meta) is True   # marker present ⇒ settled
 
 
 def test_settle_gate_holds_file_without_marker(tmp_path):
-    # No .meta.json commit marker + fresh mtime + no prior observation → HELD.
+    # Gap-B fix — the settle gate is MARKER-ONLY (the dead size+mtime-across-2-sweeps
+    # fallback was removed; accumulate never threaded prev_stat, so a markerless
+    # chunk was held forever either way). A chunk WITHOUT its .meta.json marker is
+    # NEVER settled (held), regardless of age/stability — the recorder MUST write
+    # the marker last.
     enc = tmp_path / "enc"
     chunk = _write_chunk(enc, 1, ["x"], meta=False)
     meta = chunk.with_suffix(".meta.json")
     assert not meta.is_file()
-    import os
-    st = os.stat(chunk)
-    # too-fresh (now == mtime) → unsettled regardless of prior obs.
-    assert is_chunk_settled(chunk, meta_path=meta, now=st.st_mtime) is False
-    # aged but no prior observation → still unsettled (need 2-sweep stability).
-    assert is_chunk_settled(chunk, meta_path=meta, now=st.st_mtime + 999) is False
-    # aged + stable size/mtime across sweeps → settled (the no-marker fallback).
-    assert is_chunk_settled(
-        chunk, meta_path=meta, now=st.st_mtime + 999,
-        prev_stat=(st.st_size, st.st_mtime),
-    ) is True
+    assert is_chunk_settled(chunk, meta_path=meta) is False   # no marker ⇒ NEVER settled
+    # once the marker lands, it settles.
+    meta.write_text("{}", encoding="utf-8")
+    assert is_chunk_settled(chunk, meta_path=meta) is True
 
 
 def test_accumulate_holds_unsettled_chunk(tmp_path):

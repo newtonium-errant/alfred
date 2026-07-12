@@ -5,11 +5,24 @@ Persisted so a crash/restart RESUMES: a source that already reached ``drafted``
 is never reprocessed; an intermediate/failed source is re-run from the top
 (idempotent). Load applies the schema-tolerance filter (the load() contract).
 
-State machine: ``recorded → transcribing → structuring → drafted → attested``.
+State machine: ``recorded → transcribing → structuring → drafted → [ready]``.
 Operational additions: ``refused`` (non-synthetic input rejected by the mode
 gate — terminal) and ``failed`` (an exception mid-pipeline — RETRIABLE until
-``attempts`` hits the cap, then terminal). ``attested`` is set ONLY by
-``scribe/attest.py`` (never the pipeline).
+``attempts`` hits the cap, then terminal).
+
+ATTESTATION IS OUT-OF-BAND (audit Gap-E correction). The authoritative attested
+status lives in the NOTE FRONTMATTER (``status: attested``), written by
+``scribe/attest.py`` under the privileged ``stayc_clinical_attest`` scope.
+``attest.py`` DOES NOT import or touch ``ScribeState`` — the daemon is the single
+writer of this file, and the CLI attest runs out-of-band in a SEPARATE process, so
+having attest write here would create a two-writer race. The pipeline therefore
+re-reads the note FRONTMATTER (not this state file) to detect an attested note
+(``_regen_checkpoint`` → ``post_attest_audio``). Consequence: after a real
+attestation this file still reads ``ready``/``drafted`` for the signed note — that
+is BY DESIGN (the frontmatter, not this file, is the source of truth for attested
+status). ``STATE_ATTESTED`` below is therefore RESERVED — defined + terminal (so
+status tooling that later mirrors frontmatter→state treats it as done) but NOT
+currently assigned by any code path.
 
 PHI: every field here is PHI-FREE — ``source_id`` (opaque in clinical),
 ``note_path`` (derived from source_id), ``last_error_class`` (an exception
@@ -35,7 +48,9 @@ STATE_RECORDED = "recorded"
 STATE_TRANSCRIBING = "transcribing"
 STATE_STRUCTURING = "structuring"
 STATE_DRAFTED = "drafted"
-STATE_ATTESTED = "attested"
+STATE_ATTESTED = "attested"  # RESERVED — the attested status lives in the note
+                             # frontmatter (attest.py), NOT here; never assigned by
+                             # any code path today (see the module docstring).
 STATE_REFUSED = "refused"   # non-synthetic input rejected by the mode gate
 STATE_FAILED = "failed"     # mid-pipeline exception (retriable until the cap)
 # --- P3-b2 checkpoint co-pilot states ---------------------------------------

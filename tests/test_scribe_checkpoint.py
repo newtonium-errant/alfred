@@ -101,6 +101,7 @@ def _checkpoint(enc_dir, *, config, state, vault):
         outcome = asyncio.run(checkpoint_encounter(
             enc_dir, encounter_id=r.encounter_id, config=config,
             state=state, vault_path=vault, did_fold=r.folded > 0, closed=r.closed,
+            pending_tail=r.pending_tail,   # Gap-A: block ready-finalize on an unfolded tail
         ))
     return r, outcome
 
@@ -477,6 +478,129 @@ def test_closed_sentinel_finalizes_to_ready(tmp_path, monkeypatch):
     # ledger marked closed; the draft exists and is ready for attestation.
     assert load_ledger(ledger_path(enc, r.encounter_id)).closed is True
     assert state.get(r.encounter_id).note_path
+
+
+# ---------------------------------------------------------------------------
+# Gap-A (medico-legal) — close-before-settle ready-gate
+# ---------------------------------------------------------------------------
+
+def _write_unsettled_chunk(enc_dir, seq, lines):
+    """A chunk with audio + fake-STT .txt but NO .meta.json marker → HELD."""
+    enc_dir.mkdir(parents=True, exist_ok=True)
+    name = f"chunk_{seq:03d}"
+    (enc_dir / f"{name}.wav").write_bytes(f"audio-{seq}".encode())
+    (enc_dir / f"{name}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # NO .meta.json marker → unsettled (held).
+
+
+def test_closed_with_held_tail_stays_drafted_not_ready(tmp_path, monkeypatch):
+    # Gap-A: _CLOSED present but the final chunk is HELD (its .meta.json marker
+    # hasn't landed) → the encounter STAYS DRAFTED, NOT finalized to `ready` (which
+    # would invite attestation of a note missing its tail — a signed medico-legal
+    # record silently incomplete). MUTATION-BIND: drop the pending_tail gate → this
+    # finalizes READY prematurely → RED.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-G"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])        # settled → folds + drafts
+    _write_unsettled_chunk(enc, 2, ["More history."])            # HELD (no marker)
+    (enc / "_CLOSED").write_text("", encoding="utf-8")           # close arrives before the tail settles
+    with structlog.testing.capture_logs() as caps:
+        r, outcome = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    assert r.folded == 1 and r.held == 1 and r.closed is True and r.pending_tail is True
+    assert outcome != "ready"
+    assert state.get(r.encounter_id).state == STATE_DRAFTED      # NOT ready — tail pending
+    pend = [c for c in caps if c.get("event") == "scribe.pipeline.close_pending_tail"]
+    assert len(pend) == 1 and pend[0]["encounter_id"] == r.encounter_id   # ILB signal
+
+
+def test_closed_tail_settles_then_finalizes_ready_with_tail(tmp_path, monkeypatch):
+    # The e2e (close-then-late-chunk): once the held tail SETTLES (marker lands), the
+    # NEXT sweep folds it and THEN finalizes `ready` — WITH the tail included. No
+    # attestable note is ever produced missing its tail.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-H"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config()
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    _write_unsettled_chunk(enc, 2, ["Denies fever."])
+    (enc / "_CLOSED").write_text("", encoding="utf-8")
+    r1, _ = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert state.get(r1.encounter_id).state == STATE_DRAFTED     # tail pending → drafted (not ready)
+    # the tail's marker lands (settle) → next sweep folds it + finalizes.
+    (enc / "chunk_002.meta.json").write_text(
+        json.dumps({"synthetic": True, "seq": 2}), encoding="utf-8")
+    with structlog.testing.capture_logs() as caps:
+        r2, outcome = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert r2.folded == 1 and r2.pending_tail is False
+    assert outcome == "ready" and state.get(r2.encounter_id).state == STATE_READY
+    # the tail IS in the finalized ledger (BOTH chunks folded — the note is complete).
+    ledger = load_ledger(ledger_path(enc, r2.encounter_id))
+    assert len(ledger.chunk_provenance) == 2
+    assert any(c.get("event") == "scribe.pipeline.encounter_ready" for c in caps)
+
+
+# ---------------------------------------------------------------------------
+# #3 — mid-regen seal via ScopeError (sibling of VaultError) → post_attest_audio
+# ---------------------------------------------------------------------------
+
+def test_mid_regen_scope_error_seal_is_post_attest_audio(tmp_path, monkeypatch):
+    # #3: the mid-regen seal can surface as a ScopeError (the stayc_clinical
+    # body_replace gate re-reads frontmatter INSIDE vault_edit and finds status
+    # flipped to attested) — a SIBLING of VaultError, not a subclass, never
+    # re-wrapped. The broadened seal-catch classifies it post_attest_audio (the
+    # signed note is untouched), NOT a transient FAILED. MUTATION-BIND: revert to
+    # `except VaultError` only → the ScopeError propagates → FAILED/error → RED.
+    from alfred.vault.scope import ScopeError
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-S"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config()
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    r, _ = _checkpoint(enc, config=cfg, state=state, vault=vault)   # first draft
+    assert state.get(r.encounter_id).state == STATE_DRAFTED
+    # next checkpoint: the note is sealed mid-regen → the write raises ScopeError.
+    def _raise_sealed(*a, **k):
+        raise ScopeError("clinical_note content is SEALED once attested")
+    monkeypatch.setattr(pipeline_mod, "_create_ai_draft", _raise_sealed)
+    _write_chunk(enc, 2, ["Denies shortness of breath."])
+    r2, outcome = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert outcome == "post_attest_audio"
+    assert state.get(r2.encounter_id).state == STATE_POST_ATTEST_AUDIO
+
+
+# ---------------------------------------------------------------------------
+# #4 — grounding flag-count reconcile (grounding.verified under-reports)
+# ---------------------------------------------------------------------------
+
+def test_grounding_flag_count_reconciled_after_inferred_dx(tmp_path, monkeypatch):
+    # #4: verify_grounding logs flagged=<grounding-only> BEFORE the #48 inferred-dx
+    # flags are appended. generate_verified_note now emits a reconciling
+    # scribe.grounding.flags_finalized carrying the TRUE total (grounding + inferred),
+    # so a downstream flag-counting monitor sees the real count.
+    from alfred.scribe import generate_verified_note
+    canned = json.dumps({
+        "subjective": [], "objective": [],
+        # names a lexicon dx (MDD) absent from the cited segment → 1 inferred flag,
+        # 0 grounding flags (no number/negation to catch).
+        "assessment": [{"claim": "Major depressive disorder", "source_spans": ["S1"]}],
+        "plan": [], "assessment_reasoning_stated": False,
+    })
+    _install_fake_ollama(monkeypatch, canned=canned)
+    tx = Transcript(source_id="enc-x", mode="synthetic", segments=[
+        Segment(id="S1", start_s=0.0, end_s=1.0, text="Low mood and poor sleep.", speaker=None),
+    ])
+    with structlog.testing.capture_logs() as caps:
+        vnote = asyncio.run(generate_verified_note(tx, config=_config(), title="T"))
+    gver = [c for c in caps if c.get("event") == "scribe.grounding.verified"]
+    fin = [c for c in caps if c.get("event") == "scribe.grounding.flags_finalized"]
+    assert gver and gver[0]["flagged"] == 0                     # grounding-only UNDER-reports
+    assert fin and fin[0]["total_flags"] == 1                   # reconciled TRUE total
+    assert fin[0]["inferred_diagnosis_flags"] == 1 and fin[0]["grounding_flags"] == 0
+    assert vnote.flag_count == 1                                # frontmatter/flag_count already correct
 
 
 def test_run_sweep_drives_checkpoint_end_to_end(tmp_path, monkeypatch):

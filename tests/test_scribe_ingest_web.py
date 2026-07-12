@@ -448,6 +448,37 @@ def test_unsupported_ext_rejected(tmp_path):
     assert st == 400 and payload["error"] == "unsupported_ext"
 
 
+def test_silent_rejects_now_logged_ilb(tmp_path):
+    # #10 (ILB): the previously-SILENT validation rejects now emit a PHI-safe
+    # scribe.ingest_web.rejected log (opaque reason only), matching the sibling
+    # paths — so a client erroring every request is distinguishable from no traffic.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                await _post_chunk(s, base, seq=0)                      # invalid_seq (< 1)
+                await _post_chunk(s, base, seq="abc")                  # invalid_seq (unparseable)
+                await _post_chunk(s, base, seq=1, ext="mp4")           # unsupported_ext
+                await _post_chunk(s, base, seq=1, body=b"")            # empty_chunk
+                async with s.post(base + iw.CLOSE_ROUTE,              # invalid_label (close)
+                                 params={"label": "not-a-token"}, headers=_auth()):
+                    pass
+                async with s.get(base + iw.STATUS_ROUTE,             # invalid_label (status)
+                                params={"label": "not-a-token"}, headers=_auth()):
+                    pass
+        return caps
+
+    caps = asyncio.run(_go())
+    rejects = [c for c in caps if c.get("event") == "scribe.ingest_web.rejected"]
+    reasons = {c.get("reason") for c in rejects}
+    assert {"invalid_seq", "unsupported_ext", "empty_chunk", "invalid_label"} <= reasons
+    # PHI-safe: reject logs carry ONLY opaque codes — never the raw label / audio.
+    for c in rejects:
+        assert "label" not in c                                # no raw label field
+        assert all("not-a-token" not in str(v) for v in c.values())  # bad label never echoed
+
+
 # ---------------------------------------------------------------------------
 # close (B3) + status (R2/N4) + caps (N3)
 # ---------------------------------------------------------------------------

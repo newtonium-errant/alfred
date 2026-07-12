@@ -37,7 +37,6 @@ import asyncio
 import hashlib
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,6 +71,7 @@ from alfred.scribe.state import (
 )
 from alfred.scribe.transcript import Transcript
 from alfred.vault.ops import VaultError, vault_create, vault_edit, vault_read
+from alfred.vault.scope import ScopeError
 
 log = structlog.get_logger(__name__)
 
@@ -88,11 +88,9 @@ _AUDIO_EXTENSIONS = frozenset({".wav", ".ogg", ".mp3", ".m4a", ".flac", ".webm"}
 _CHUNK_NAME_RE = re.compile(r"^chunk_(\d+)$")
 _META_SUFFIX = ".meta.json"
 _CLOSED_SENTINEL = "_CLOSED"
-# Settle floor for the no-meta fallback path (a recorder that does not drop a
-# commit-marker sidecar): a chunk whose audio mtime is younger than this is
-# never hashed/STT'd. The mandated convention's ``.meta.json`` commit marker is
-# the PRIMARY (deterministic) settle signal; this floor guards the fallback.
-_SETTLE_MIN_AGE_S = 2.0
+# Settle signal: the ``.meta.json`` commit marker (written LAST by the recorder)
+# is the REQUIRED, deterministic settle signal — see ``is_chunk_settled`` (the
+# dead markerless size+mtime fallback was removed in the Gap-B audit fix).
 
 
 @dataclass
@@ -125,7 +123,24 @@ async def generate_verified_note(
     # path. Grounding is BLIND to this (a label invented from a real segment has no
     # number/negation token) and rule-6 can't stop it (the model disobeys) — code
     # is the lever.
-    grounding.flags.extend(check_inferred_diagnoses(structured, transcript))
+    grounding_flag_count = len(grounding.flags)   # mechanical grounding flags only
+    inferred_flags = check_inferred_diagnoses(structured, transcript)
+    grounding.flags.extend(inferred_flags)
+    # #4 — RECONCILE the flag-count observability seam. verify_grounding already
+    # emitted ``scribe.grounding.verified flagged=<grounding-only>`` BEFORE this
+    # extend, so that line UNDER-reports the total (a note whose only flag is an
+    # inferred_diagnosis logs grounding flagged=0 while the note carries the inline
+    # ⚠ + a frontmatter entry). Emit the FINAL, authoritative breakdown here so a
+    # downstream flag-counting monitor sees the true total (the note body +
+    # frontmatter + flag_count below already use the extended list — this closes
+    # only the intermediate-log discrepancy).
+    log.info(
+        "scribe.grounding.flags_finalized",
+        source_id=transcript.source_id,
+        total_flags=len(grounding.flags),
+        grounding_flags=grounding_flag_count,
+        inferred_diagnosis_flags=len(inferred_flags),
+    )
     body = render_soap(structured, title=title, grounding=grounding)  # render with THAT grounding
     return VerifiedNote(
         body=body,
@@ -357,37 +372,40 @@ class AccumResult:
                                  # held this pass, isolated (the sweep + other
                                  # encounters are unaffected)
 
+    @property
+    def pending_tail(self) -> bool:
+        """True iff the fold stopped SHORT of the discovered tail this pass — a
+        held/unsettled chunk (``held``), a seq gap (``frozen``), a decode failure
+        (``decode_failed``), or a mode-gate refusal (``refused``) left an UNFOLDED
+        chunk on disk. Gap-A (medico-legal): a CLOSED encounter with
+        ``pending_tail`` must NOT finalize to ``ready`` — ``ready`` (the
+        attest-invite) must mean the FULL transcript is folded, so a signed note is
+        never silently missing its tail. Cleared once the tail settles + folds on a
+        later sweep (then ``ready`` finalizes WITH the tail)."""
+        return bool(self.held or self.refused or self.frozen or self.decode_failed)
 
-def is_chunk_settled(
-    chunk_path: Path,
-    *,
-    meta_path: Path,
-    now: float,
-    min_age_s: float = _SETTLE_MIN_AGE_S,
-    prev_stat: tuple[int, float] | None = None,
-) -> bool:
-    """True iff ``chunk_path`` is safe to hash/STT (fully written, not mid-flush).
 
-    Two settle signals (decision 6):
-      * PRIMARY — the ``.meta.json`` commit marker is present. The recorder
-        writes the sidecar LAST, so its presence ⇒ the audio is fully written.
-      * FALLBACK (no marker) — size+mtime unchanged since the previous sweep
-        observation (``prev_stat``) AND the audio older than ``min_age_s``.
+def is_chunk_settled(chunk_path: Path, *, meta_path: Path) -> bool:
+    """True iff the chunk is COMMITTED — the ``.meta.json`` marker is present.
 
-    Never hash/STT an unsettled file: a partial-write race would fold a truncated
+    The marker is the REQUIRED settle signal (single source of truth): the
+    recorder writes the chunk audio FULLY, THEN drops the ``.meta.json`` sidecar
+    LAST (the ingest_web server does exactly this — audio atomic, sidecar
+    atomic-LAST), so the sidecar's presence ⇒ the audio is fully written. Never
+    hash/STT an unsettled file: a partial-write race would fold a truncated
     transcript IMMUTABLY into the ledger.
-    """
-    if Path(meta_path).is_file():
-        return True  # commit marker ⇒ fully written
-    try:
-        st = Path(chunk_path).stat()
-    except OSError:
-        return False
-    if (now - st.st_mtime) < min_age_s:
-        return False  # too fresh — may still be flushing
-    if prev_stat is None:
-        return False  # need a prior observation to confirm 2-sweep stability
-    return (st.st_size, st.st_mtime) == prev_stat
+
+    A MARKERLESS chunk is NEVER settled — it is held indefinitely (surfaced by the
+    accumulate ``held`` count). A manually-dropped or alternate-recorder chunk
+    MUST include a ``.meta.json`` sidecar.
+
+    (Gap-B fix — the former size+mtime-across-2-sweeps markerless FALLBACK was
+    REMOVED: ``accumulate_encounter`` never threaded ``prev_stat`` across sweeps,
+    so ``prev_stat`` was structurally always None → the fallback returned False for
+    every markerless chunk anyway. It was dead code documenting a behavior that
+    never ran; marker-only is the honest contract. ``chunk_path`` is retained as
+    the settle SUBJECT for API clarity.)"""
+    return Path(meta_path).is_file()
 
 
 def _discover_chunks(encounter_dir: Path) -> list[tuple[Path, int]]:
@@ -413,7 +431,7 @@ def _chunk_content_hash(chunk_path: Path) -> str:
 
 
 def accumulate_encounter(
-    encounter_dir: Path, *, config: ScribeConfig, now: float | None = None,
+    encounter_dir: Path, *, config: ScribeConfig,
 ) -> AccumResult:
     """Fold an encounter's settled chunks into its transcript ledger, in seq
     order (scribe P3-b1 FOUNDATION — NO note-gen trigger; that is P3-b2).
@@ -439,7 +457,6 @@ def accumulate_encounter(
         collide to one id — the operator's unique-label convention is LOAD-
         BEARING for flat files (a per-encounter subdir name is naturally unique).
     """
-    now = time.time() if now is None else now
     encounter_id = compute_encounter_id(
         encounter_dir.name, salt=config.encounter_salt,
     )
@@ -468,7 +485,7 @@ def accumulate_encounter(
             )
             break
         meta_path = chunk_path.with_suffix(_META_SUFFIX)
-        if not is_chunk_settled(chunk_path, meta_path=meta_path, now=now):
+        if not is_chunk_settled(chunk_path, meta_path=meta_path):
             result.held += 1              # not committed yet — hold for a later sweep
             break                         # cannot skip the expected chunk → stop
         chunk_key = _chunk_content_hash(chunk_path)
@@ -648,7 +665,14 @@ async def _regen_checkpoint(
     # body_replace after; refuse if the draft was sealed mid-flight).
     try:
         new_path = _create_ai_draft(vault_path, title, encounter_id, config, vnote)
-    except VaultError as e:
+    except (VaultError, ScopeError) as e:
+        # #3 — the seal can surface as EITHER a VaultError (detected at
+        # _update_or_refuse_ai_draft's vault_read, pipeline path) OR a ScopeError
+        # (the stayc_clinical body_replace gate re-reads frontmatter INSIDE
+        # vault_edit and finds status flipped to attested — a SIBLING exception,
+        # not a VaultError subclass, ops.py never re-wraps it). Both mean the same
+        # thing: the note was sealed mid-regen. Catch BOTH so the race is
+        # classified post_attest_audio, not misclassified FAILED.
         if "SEALED" in str(e):
             # The note was attested BETWEEN the clobber-detect read and this write
             # (mid-flight attest race) → same post-attest-audio outcome; the
@@ -684,12 +708,21 @@ async def _regen_checkpoint(
 async def checkpoint_encounter(
     encounter_dir: Path, *, encounter_id: str, config: ScribeConfig,
     state: ScribeState, vault_path: Path, did_fold: bool, closed: bool,
+    pending_tail: bool = False,
 ) -> str:
     """The checkpoint trigger (scribe P3-b2). After P3-b1 folds a chunk, evolve
     the ai_draft in place; the ``_CLOSED`` sentinel finalizes to a ``ready``
     state (close does NOT attest — attest stays orchestrator-only). A
     ``human_edited`` encounter is SKIPPED: the ledger keeps accumulating but the
-    draft is never auto-touched until the operator opts in."""
+    draft is never auto-touched until the operator opts in.
+
+    Gap-A (medico-legal): ``pending_tail`` (this pass folded SHORT of the
+    discovered tail — a held/unsettled/gapped/refused/decode-failed chunk remains)
+    BLOCKS the ``ready`` finalize even when ``_CLOSED`` is present. ``ready`` is
+    the attest-invite, so it must mean the FULL transcript is folded — a signed
+    note must never silently miss its tail. STAYS DRAFTED (with an explicit
+    close-pending-tail signal) until the tail settles + folds on a later sweep,
+    which THEN finalizes ``ready`` with the tail included."""
     prior = state.get(encounter_id)
     if prior and prior.state == STATE_HUMAN_EDITED:
         log.info(
@@ -705,18 +738,33 @@ async def checkpoint_encounter(
             state=state, vault_path=vault_path,
         )
 
-    # _CLOSED finalize — promote ONLY a clean current draft to `ready`. A capped
-    # / frozen / refused encounter keeps its distinct state (the draft is not the
-    # full transcript, or is awaiting opt-in) — close does not paper over that.
+    # _CLOSED finalize — promote ONLY a clean, COMPLETE current draft to `ready`. A
+    # capped / frozen / refused encounter keeps its distinct state (the draft is
+    # not the full transcript, or is awaiting opt-in) — close does not paper over
+    # that. Gap-A: ALSO refuse to finalize while a tail chunk is still pending.
     if closed:
         cur = state.get(encounter_id)
         if cur and cur.state == STATE_DRAFTED:
+            if pending_tail:
+                # _CLOSED seen but the fold stopped short of the tail (a held /
+                # unsettled / gapped / refused / decode-failed chunk remains). Do
+                # NOT finalize — ready must mean COMPLETE. Stay DRAFTED; a later
+                # sweep folds the tail then finalizes. ILB: distinguish
+                # waiting-for-tail from broken.
+                log.info(
+                    "scribe.pipeline.close_pending_tail",
+                    encounter_id=encounter_id,
+                    detail="_CLOSED seen but a tail chunk is still "
+                           "held/unsettled/gapped — STAYING DRAFTED until the tail "
+                           "folds (ready must mean the full transcript is signed)",
+                )
+                return outcome
             state.set(encounter_id, state=STATE_READY)
             log.info(
                 "scribe.pipeline.encounter_ready",
                 encounter_id=encounter_id,
-                detail="_CLOSED — draft complete, ready for attestation "
-                       "(attest stays orchestrator-only)",
+                detail="_CLOSED — draft complete (tail folded), ready for "
+                       "attestation (attest stays orchestrator-only)",
             )
             outcome = "ready"
     return outcome
@@ -796,6 +844,7 @@ async def run_sweep(
                     enc_dir, encounter_id=r.encounter_id, config=config,
                     state=state, vault_path=vault_path,
                     did_fold=r.folded > 0, closed=r.closed,
+                    pending_tail=r.pending_tail,   # Gap-A: block ready finalize on an unfolded tail
                 )
                 key = _CHECKPOINT_COUNT_KEY.get(outcome)
                 if key:
