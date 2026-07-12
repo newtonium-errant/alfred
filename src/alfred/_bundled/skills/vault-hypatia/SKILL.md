@@ -3067,7 +3067,8 @@ A `propose_event` that returns `{"status": "created", ...}` MAY also carry a `gc
 Three states:
 
 - `gcal_sync: {"status": "ok"}` — sync went through. The event is on Andrew's Calendar (S.A.L.E.M.) and Jamie will see it in the next sync cycle. Confirm normally, mention the brief.
-- `gcal_sync: {"status": "failed", "error_code": "<code>", "error": "<short msg>"}` — Salem's vault landed but her GCal push did NOT. Tell Andrew the event is in Salem's vault, that calendar sync failed on her side, and name the operator action when the code suggests one. Common codes: `auth_failed` (Salem's GCal token expired — Andrew runs `alfred gcal authorize` against Salem to re-link), `api_error` (transient Google-side error — usually retries on Salem's next edit), `stale_gcal_id` (rare on a fresh create; means Salem's frontmatter already had a stale ID — a future janitor pass cleans it), `calendar_id_missing` (Salem's `alfred_calendar_id` not set in her config — Andrew updates the YAML; not resolvable via tools).
+- `gcal_sync: {"status": "failed", "error_code": "<code>", "error": "<short msg>"}` — Salem's vault landed but her GCal push did NOT. These are GENUINE failures worth surfacing. Tell Andrew the event is in Salem's vault, that calendar sync failed on her side, and name the operator action when the code suggests one. Common codes: `auth_failed` (Salem's GCal token expired — Andrew runs `alfred gcal authorize` against Salem to re-link), `api_error` (transient Google-side error — usually retries on Salem's next edit), `stale_gcal_id` (rare on a fresh create; means Salem's frontmatter already had a stale ID — a future janitor pass cleans it), `calendar_id_missing` (Salem's `alfred_calendar_id` not set in her config — Andrew updates the YAML; not resolvable via tools).
+- `gcal_sync: {"status": "failed", "error_code": "sync_timeout", "error": "<msg>"}` — **do NOT treat this as a failure, even though `status` reads `failed`.** The event WAS committed to Salem's canonical vault; the blocking GCal round-trip simply exceeded Salem's per-request deadline and is still in flight. It reconciles in the background (Salem's daemon sync loop / her next edit on the record), so the calendar entry lands shortly with no operator action. Tell Andrew the event is scheduled and committed and that the calendar entry is syncing and should appear shortly — do NOT tell him the sync failed or that he needs to re-link anything. This is distinct from the genuine-failure codes above (`auth_failed` / `api_error` / `stale_gcal_id` / `calendar_id_missing`), which DO warrant surfacing the failure.
 - `gcal_sync` key absent — Salem didn't attempt a GCal push (her GCal isn't wired, or the proposal landed without `start`/`end`). The vault record exists; don't volunteer calendar status either way.
 
 Worked example — `propose_event` succeeded on the vault side, GCal sync failed:
@@ -3079,6 +3080,16 @@ Worked example — `propose_event` succeeded on the vault side, GCal sync failed
 > Tool result: `{"status": "created", "path": "event/StrugglEbus pitch review push.md", "gcal_sync": {"status": "failed", "error_code": "auth_failed", "error": "GCal token refresh failed: invalid_grant — token revoked"}}`
 >
 > Your reply: *"I added the writing block to Salem's canonical events for Friday 10:00–12:00 ADT — but the calendar sync failed on her side (GCal auth token expired). The event is in her vault and will show on your morning brief, but it isn't on Andrew's Calendar (S.A.L.E.M.) yet. Re-link Salem's GCal with `alfred gcal authorize` from a terminal and her next edit will push it through. You'll want to put this on your calendar manually in the meantime."*
+
+Worked example — `propose_event` committed but the GCal sync didn't confirm in time (`sync_timeout`, NOT a failure):
+
+> Andrew: *"Pat, block Thursday 3–4pm for the grant call."*
+>
+> You: `propose_event(title="Grant call", start="2026-07-16T15:00:00-03:00", end="2026-07-16T16:00:00-03:00", summary="One-hour block for the grant call", origin_context="Requested 2026-07-12")`
+>
+> Tool result: `{"status": "created", "path": "event/Grant call.md", "gcal_sync": {"status": "failed", "error_code": "sync_timeout", "error": "gcal sync exceeded the 6s server budget; vault record committed, GCal projection still in flight (daemon/operator will reconcile)"}}`
+>
+> Your reply: *"Done — the grant call is scheduled and committed to Salem's vault for Thursday 15:00–16:00 ADT. The calendar sync didn't confirm within the deadline, but it's still reconciling in the background and should appear on Andrew's Calendar (S.A.L.E.M.) shortly. Nothing you need to do."* (Do NOT say the sync failed — `sync_timeout` means unconfirmed-but-committed, not a permanent failure.)
 
 The same field surfaces on the `conflict` branch in edge cases — Salem may, in rare configurations, return `gcal_sync` alongside a conflict response. Treat the field the same way wherever it appears: read `status` before narrating.
 
