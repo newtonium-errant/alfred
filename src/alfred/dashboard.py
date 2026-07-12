@@ -1044,9 +1044,23 @@ def run_live_dashboard(
     state_dir: Path,
     max_restarts: int = 5,
     missing_deps_exit: int = 78,
-) -> None:
-    """Run the Rich Live dashboard until Ctrl+C or sentinel file."""
+    sovereign_enabled: bool = False,
+) -> bool:
+    """Run the Rich Live dashboard until Ctrl+C, sentinel file, or a sovereign breach.
+
+    Returns True iff it tore down on a sovereign runtime breach (a slot exited
+    79 in a sovereign instance) — run_all feeds that into the #42 exit-79
+    propagation. ``sovereign_enabled`` is the SAME bool run_all computed at E1
+    (passed down, never re-derived — #59 predicate consistency).
+    """
     import multiprocessing  # noqa: for type hints in this scope
+
+    # #59 — one shared supervision policy across all three supervisors.
+    from alfred.orchestrator import (
+        CHILD_EXIT_ABORT_SOVEREIGN,
+        CHILD_EXIT_DROP,
+        classify_child_exit,
+    )
 
     data = DashboardData()
     data.start_time = time.time()
@@ -1072,6 +1086,10 @@ def run_live_dashboard(
     stat_reader.start()
 
     active_tools = list(tools)
+    # #59 — latched True iff a slot breaches (exit 79) in a sovereign instance;
+    # returned so run_all propagates exit 79. Bound before the try so it is
+    # always defined on every exit path.
+    sovereign_breach = False
 
     try:
         with Live(build_layout(data, active_tools), screen=True, refresh_per_second=4) as live:
@@ -1097,11 +1115,28 @@ def run_live_dashboard(
                             w.exit_code = exit_code
                             w.pid = None
 
-                            if exit_code == missing_deps_exit:
+                            decision = classify_child_exit(
+                                exit_code, sovereign_enabled=sovereign_enabled
+                            )
+
+                            if decision == CHILD_EXIT_ABORT_SOVEREIGN:
+                                # Sovereign runtime breach (exit 79): a single
+                                # slot condemns the WHOLE instance — refuse to
+                                # restart ANYTHING, latch the breach, leave both
+                                # loops so the finally stops the tail threads and
+                                # run_all propagates exit 79.
+                                w.status = "stopped"
+                                sovereign_breach = True
+                                break
+
+                            if decision == CHILD_EXIT_DROP:
+                                # 78 missing-deps, or 79 in a NON-sovereign
+                                # instance: no-restart, drop this slot, keep rest.
                                 w.status = "stopped"
                                 active_tools = [t for t in active_tools if t != tool]
                                 continue
 
+                            # decision == CHILD_EXIT_RESTART
                             w.last_death = now
                             restart_counts[tool] = restart_counts.get(tool, 0) + 1
                             w.restart_count = restart_counts[tool]
@@ -1110,6 +1145,11 @@ def run_live_dashboard(
                                 w.status = "restarting"
                             else:
                                 w.status = "stopped"
+
+                if sovereign_breach:
+                    # Leave the Live loop — the finally stops the tail threads;
+                    # run_all sees the returned flag and tears every child down.
+                    break
 
                 # Restart dead workers after cooldown (outside the lock)
                 restart_cooldown = 5.0  # seconds — matches original monitor loop
@@ -1131,3 +1171,5 @@ def run_live_dashboard(
         log_tail.stop()
         audit_tail.stop()
         stat_reader.stop()
+
+    return sovereign_breach

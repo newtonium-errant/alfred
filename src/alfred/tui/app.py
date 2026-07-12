@@ -58,6 +58,7 @@ class AlfredApp(App):
         max_restarts: int = 5,
         missing_deps_exit: int = 78,
         version: str = "0.2.0",
+        sovereign_enabled: bool = False,
     ) -> None:
         super().__init__()
         self._tools = tools
@@ -70,6 +71,11 @@ class AlfredApp(App):
         self._max_restarts = max_restarts
         self._missing_deps_exit = missing_deps_exit
         self._version = version
+        # #59 — the SAME bool run_all computed at E1 (not re-derived). Drives the
+        # shared exit-79 policy in _check_workers; _sovereign_breach latches when
+        # a slot breaches at runtime so run_textual_dashboard can propagate 79.
+        self._sovereign_enabled = sovereign_enabled
+        self._sovereign_breach = False
 
         # Data layer
         self._data = DashboardData()
@@ -289,8 +295,80 @@ class AlfredApp(App):
         self._data.stats = read_stats(self._state_dir)
         self._status_screen.update_stats(self._data.stats)
 
+    def _decide_dead_worker(self, tool: str, w, exit_code: int | None, now: float) -> str:
+        """Apply the shared #59 supervision policy to a DEAD worker and return
+        the verdict (``classify_child_exit``'s value).
+
+        Mutates the worker/app state (breach flag, ``_active_tools``,
+        ``_restart_counts``, status) and notifies the operator, but does NOT
+        touch the Textual render tail or lifecycle — the abort's ``self.exit()``
+        stays in :meth:`_check_workers`. Extracted so the decision is
+        unit-testable without a mounted app (the card-update tail needs a screen
+        stack). Returns one of ``CHILD_EXIT_{ABORT_SOVEREIGN,DROP,RESTART}``."""
+        # #59 — one shared policy across all three supervisors.
+        from alfred.orchestrator import (
+            _SOVEREIGN_BREACH_EXIT,
+            CHILD_EXIT_ABORT_SOVEREIGN,
+            CHILD_EXIT_DROP,
+            classify_child_exit,
+        )
+        decision = classify_child_exit(
+            exit_code, sovereign_enabled=self._sovereign_enabled
+        )
+
+        if decision == CHILD_EXIT_ABORT_SOVEREIGN:
+            # Sovereign runtime breach (exit 79): a single slot condemns the
+            # WHOLE instance — refuse to restart ANYTHING and latch the breach so
+            # run_textual_dashboard returns it → run_all propagates exit 79. The
+            # actual teardown (self.exit()) is the caller's job.
+            w.status = "stopped"
+            self._sovereign_breach = True
+            self.notify(
+                f"{tool.capitalize()} sovereign boundary breach (exit 79) "
+                f"— shutting down, refusing to re-enter a cloud-reachable state",
+                severity="error",
+            )
+            return decision
+
+        if decision == CHILD_EXIT_DROP:
+            # 78 missing-deps, or 79 in a NON-sovereign instance: no-restart,
+            # drop the one slot, keep the rest.
+            w.status = "stopped"
+            self._active_tools = [t for t in self._active_tools if t != tool]
+            reason = (
+                "sovereign boundary breach (exit 79)"
+                if exit_code == _SOVEREIGN_BREACH_EXIT
+                else "missing dependencies"
+            )
+            self.notify(
+                f"{tool.capitalize()} stopped: {reason}",
+                severity="error",
+            )
+            return decision
+
+        # decision == CHILD_EXIT_RESTART
+        w.last_death = now
+        self._restart_counts[tool] = self._restart_counts.get(tool, 0) + 1
+        w.restart_count = self._restart_counts[tool]
+
+        if self._restart_counts[tool] <= self._max_restarts:
+            w.status = "restarting"
+            self.notify(
+                f"{tool.capitalize()} crashed (exit {exit_code}), restarting...",
+                severity="warning",
+            )
+        else:
+            w.status = "stopped"
+            self.notify(
+                f"{tool.capitalize()} exceeded restart limit",
+                severity="error",
+            )
+        return decision
+
     def _check_workers(self) -> None:
         """Check worker process health and handle restarts."""
+        from alfred.orchestrator import CHILD_EXIT_ABORT_SOVEREIGN
+
         now = time.monotonic()
 
         for tool in list(self._active_tools):
@@ -307,31 +385,13 @@ class AlfredApp(App):
                 w.exit_code = exit_code
                 w.pid = None
 
-                if exit_code == self._missing_deps_exit:
-                    w.status = "stopped"
-                    self._active_tools = [t for t in self._active_tools if t != tool]
-                    self.notify(
-                        f"{tool.capitalize()} stopped: missing dependencies",
-                        severity="error",
-                    )
-                    continue
-
-                w.last_death = now
-                self._restart_counts[tool] = self._restart_counts.get(tool, 0) + 1
-                w.restart_count = self._restart_counts[tool]
-
-                if self._restart_counts[tool] <= self._max_restarts:
-                    w.status = "restarting"
-                    self.notify(
-                        f"{tool.capitalize()} crashed (exit {exit_code}), restarting...",
-                        severity="warning",
-                    )
-                else:
-                    w.status = "stopped"
-                    self.notify(
-                        f"{tool.capitalize()} exceeded restart limit",
-                        severity="error",
-                    )
+                decision = self._decide_dead_worker(tool, w, exit_code, now)
+                if decision == CHILD_EXIT_ABORT_SOVEREIGN:
+                    # Tear the Textual app down (App.exit() ends app.run()); the
+                    # breach flag is already latched for run_textual_dashboard.
+                    # Return before the card-update tail so teardown is prompt.
+                    self.exit()
+                    return
 
         # Restart dead workers after cooldown
         restart_cooldown = 5.0

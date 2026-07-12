@@ -148,6 +148,44 @@ def _is_no_restart_exit(exit_code: int | None) -> bool:
     return exit_code in (_MISSING_DEPS_EXIT, _SOVEREIGN_BREACH_EXIT)
 
 
+# The three supervision verdicts. Constants (not bare literals) so the three
+# supervisors — the plain run_all loop, the Textual TUI, and the Rich Live
+# dashboard — dispatch on the SAME tokens and a typo trips at import, not
+# silently at runtime.
+CHILD_EXIT_ABORT_SOVEREIGN = "abort_sovereign"
+CHILD_EXIT_DROP = "drop"
+CHILD_EXIT_RESTART = "restart"
+
+
+def classify_child_exit(exit_code: int | None, *, sovereign_enabled: bool) -> str:
+    """Return the ONE supervision policy shared by all three supervisors.
+
+    Centralizing this removes the duplication that caused the #59 divergence:
+    78 was handled everywhere, but the sovereign-79 abort was only in the plain
+    ``run_all`` loop, so the live TUI / Rich dashboards RESTARTED a runtime
+    breach up to 5× (re-entering a possibly-cloud-reachable state).
+
+      * ``"abort_sovereign"`` — a runtime sovereign breach (79) in a SOVEREIGN
+        instance: tear down ALL slots and propagate 79 to the supervisor (the
+        instance must stay down). This is the ONLY code that must never restart
+        AND must abort the whole instance.
+      * ``"drop"`` — a deliberate no-restart exit: 78 (missing optional deps) OR
+        79 in a NON-sovereign instance (79 is always no-restart, but only a
+        sovereign instance aborts-all). Drop the one slot, keep the rest.
+      * ``"restart"`` — everything else (generic crash / unexpected exit):
+        restart under the StartLimit.
+
+    Matches the #42 plain-loop semantics EXACTLY: 78 always drops; 79 in a
+    non-sovereign instance drops; 79 in a sovereign instance aborts-all. Pure +
+    pinned so all three paths stay in lockstep.
+    """
+    if exit_code == _SOVEREIGN_BREACH_EXIT and sovereign_enabled:
+        return CHILD_EXIT_ABORT_SOVEREIGN
+    if _is_no_restart_exit(exit_code):
+        return CHILD_EXIT_DROP
+    return CHILD_EXIT_RESTART
+
+
 def _enforce_sovereign_boundary_or_exit(raw: dict[str, Any]) -> None:
     """Run the sovereign no-egress boundary; abort exit-79 on breach.
 
@@ -1598,9 +1636,14 @@ def run_all(
             # (Textual via set_interval, Rich Live in its 0.25s loop).  The
             # SIGTERM handler + try/finally here ensures cleanup still runs if
             # the signal arrives while the TUI event loop is active.
+            # #59 — the live supervisors share the plain loop's exit-79 policy.
+            # Each returns True iff it detected a sovereign runtime breach; we
+            # capture it and feed the EXISTING E4 propagation (do NOT add a
+            # second exit). ``sovereign_enabled`` is the SAME bool computed at
+            # E1 — passed down, never re-derived (predicate-consistency).
             try:
                 from alfred.tui import run_textual_dashboard
-                run_textual_dashboard(
+                breached = run_textual_dashboard(
                     tools=tools,
                     processes=processes,
                     restart_counts=restart_counts,
@@ -1608,10 +1651,11 @@ def run_all(
                     sentinel_path=sentinel_path,
                     log_dir=log_dir,
                     state_dir=log_dir,
+                    sovereign_enabled=sovereign_enabled,
                 )
             except ImportError:
                 from alfred.dashboard import run_live_dashboard
-                run_live_dashboard(
+                breached = run_live_dashboard(
                     tools=tools,
                     processes=processes,
                     restart_counts=restart_counts,
@@ -1619,7 +1663,10 @@ def run_all(
                     sentinel_path=sentinel_path,
                     log_dir=log_dir,
                     state_dir=log_dir,
+                    sovereign_enabled=sovereign_enabled,
                 )
+            if breached:
+                sovereign_breach = True
         elif not shutdown_requested:
             # Plain text monitor loop
             try:
@@ -1650,33 +1697,45 @@ def run_all(
                         p = processes[tool]
                         if not p.is_alive():
                             exit_code = p.exitcode
-                            if _is_no_restart_exit(exit_code):
+                            # #59 — one shared policy for all three supervisors.
+                            decision = classify_child_exit(
+                                exit_code, sovereign_enabled=sovereign_enabled
+                            )
+                            if decision == CHILD_EXIT_ABORT_SOVEREIGN:
+                                # Sovereign instance, runtime breach: a single
+                                # slot's 79 condemns the WHOLE instance
+                                # (abort-all-siblings, R9). Latch the flag HERE —
+                                # at the 79-detection site only — and break the
+                                # roster loop; E3 then leaves the monitor loop so
+                                # the finally SIGTERM/SIGKILLs every remaining
+                                # child, and E4 re-raises 79 to systemd.
+                                print(
+                                    f"  [{tool}] sovereign boundary breach "
+                                    f"(exit 79), NOT restarting — refusing to "
+                                    f"re-enter a cloud-reachable state"
+                                )
+                                print(
+                                    f"  [{tool}] sovereign instance — "
+                                    f"tearing down all daemons and "
+                                    f"propagating exit 79 to the supervisor"
+                                )
+                                sovereign_breach = True
+                                break
+                            if decision == CHILD_EXIT_DROP:
                                 if exit_code == _SOVEREIGN_BREACH_EXIT:
+                                    # 79 in a NON-sovereign instance: no-restart,
+                                    # but no abort-all — only a sovereign instance
+                                    # tears the whole roster down.
                                     print(
                                         f"  [{tool}] sovereign boundary breach "
                                         f"(exit 79), NOT restarting — refusing to "
                                         f"re-enter a cloud-reachable state"
                                     )
-                                    if sovereign_enabled:
-                                        # Sovereign instance: a single slot's
-                                        # runtime breach condemns the WHOLE
-                                        # instance (abort-all-siblings, R9). Latch
-                                        # the flag HERE — at the 79-detection site
-                                        # only — and break the roster loop; E3
-                                        # then leaves the monitor loop so the
-                                        # finally SIGTERM/SIGKILLs every remaining
-                                        # child, and E4 re-raises 79 to systemd.
-                                        print(
-                                            f"  [{tool}] sovereign instance — "
-                                            f"tearing down all daemons and "
-                                            f"propagating exit 79 to the supervisor"
-                                        )
-                                        sovereign_breach = True
-                                        break
                                 else:
                                     print(f"  [{tool}] missing dependencies, not restarting")
                                 tools = [t for t in tools if t != tool]
                                 continue
+                            # decision == CHILD_EXIT_RESTART
                             restart_counts[tool] += 1
                             if restart_counts[tool] <= 5:
                                 print(f"  [{tool}] exited ({exit_code}), restarting ({restart_counts[tool]}/5)...")

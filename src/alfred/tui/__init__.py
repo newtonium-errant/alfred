@@ -16,8 +16,15 @@ def run_textual_dashboard(
     state_dir: Path,
     max_restarts: int = 5,
     missing_deps_exit: int = 78,
-) -> None:
-    """Entry point matching the ``run_live_dashboard`` signature from dashboard.py."""
+    sovereign_enabled: bool = False,
+) -> bool:
+    """Entry point matching the ``run_live_dashboard`` signature from dashboard.py.
+
+    Returns True iff the dashboard tore down on a sovereign runtime breach
+    (a slot exited 79 in a sovereign instance) — run_all feeds that into the
+    #42 exit-79 propagation. ``sovereign_enabled`` is the SAME bool run_all
+    computed at E1 (passed down, never re-derived — #59 predicate consistency).
+    """
     from alfred.tui.app import AlfredApp
 
     # Read version from package metadata
@@ -39,5 +46,9 @@ def run_textual_dashboard(
         max_restarts=max_restarts,
         missing_deps_exit=missing_deps_exit,
         version=version,
+        sovereign_enabled=sovereign_enabled,
     )
     app.run()
+    # After App.run() returns (App.exit() was called on breach), surface the
+    # breach flag so run_all can propagate exit 79.
+    return bool(getattr(app, "_sovereign_breach", False))

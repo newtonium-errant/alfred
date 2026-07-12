@@ -323,40 +323,34 @@ def test_multislot_sovereign_one_79_tears_down_all_and_exits_79(
 
 
 # ---------------------------------------------------------------------------
-# (2b) KNOWN-GAP pin — dashboard/TUI supervision paths still restart 79 (#59)
+# (2b→FIXED, #59) dashboard/TUI supervision paths now route 79 through the
+# shared classifier — the KNOWN-GAP pin FLIPPED to assert the fix.
 # ---------------------------------------------------------------------------
 
 
-def test_KNOWN_GAP_dashboard_paths_do_not_yet_propagate_79() -> None:
-    """PIN the CURRENT (unfixed) behavior of the live dashboard + Textual TUI
-    supervision loops: they special-case ONLY exit 78 (``missing_deps_exit``)
-    for no-restart, so a 79 (sovereign breach) FALLS THROUGH to the restart
-    path. #42 deliberately scoped its fix to the plain foreground monitor loop
-    (STAY-C runs ``--_internal-foreground`` non-live, so it is unaffected). This
-    is a documented-not-silent gap tracked by task #59; when #59 lands and adds
-    sovereign/79 handling to these paths, the ``not in`` asserts flip and force
-    this pin to be updated in lockstep.
+def test_dashboard_and_tui_paths_route_79_through_shared_policy() -> None:
+    """FLIPPED from the #42 KNOWN-GAP pin: #59 centralized the supervision
+    policy so BOTH live paths (Rich ``run_live_dashboard`` + Textual
+    ``_check_workers``) now dispatch through ``classify_child_exit`` and handle
+    the sovereign-79 abort — a runtime breach is no longer restarted up to 5×.
 
-    Source-level (not behavioral) so it needs neither rich nor textual
-    installed — reads the module files directly.
-    """
+    Source-level (needs neither rich nor textual installed) — the behavioral
+    proof lives in test_supervision_79_consistency.py (Rich) and
+    test_supervision_79_textual.py (Textual). This pin guards the WIRING so a
+    refactor that drops either path out of the shared policy trips here."""
     import alfred
     pkg_dir = Path(alfred.__file__).resolve().parent
     dash_src = (pkg_dir / "dashboard.py").read_text(encoding="utf-8")
     tui_src = (pkg_dir / "tui" / "app.py").read_text(encoding="utf-8")
 
-    # Both handle 78 (missing deps) for no-restart today...
-    assert "missing_deps_exit" in dash_src, "dashboard should special-case 78"
-    assert "missing_deps_exit" in tui_src, "TUI should special-case 78"
-
-    # ...and NEITHER yet special-cases the sovereign 79 breach → 79 is treated
-    # as restartable (the gap #59 tracks). If either grows sovereign handling,
-    # update this pin + close #59.
     for name, src in (("dashboard.py", dash_src), ("tui/app.py", tui_src)):
-        assert "_SOVEREIGN_BREACH_EXIT" not in src, (
-            f"{name} now references the sovereign breach exit — #59 may be "
-            f"fixed; update this KNOWN-GAP pin."
+        assert "classify_child_exit" in src, (
+            f"{name} must route child-exit handling through the shared "
+            f"classify_child_exit (#59) — it no longer special-cases only 78."
         )
-        assert "sovereign" not in src.lower(), (
-            f"{name} now mentions 'sovereign' — #59 may be fixed; update this pin."
+        assert "CHILD_EXIT_ABORT_SOVEREIGN" in src, (
+            f"{name} must handle the sovereign-79 abort verdict (#59)."
         )
+    # Both surface a breach flag back to run_all's exit-79 propagation.
+    assert "sovereign_breach" in dash_src, "dashboard must return a breach flag"
+    assert "_sovereign_breach" in tui_src, "TUI must latch a breach flag"
