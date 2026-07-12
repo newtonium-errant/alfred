@@ -10,9 +10,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from alfred.scripts import install_stayc_unit as installer
 from alfred.sovereign.boundary import CLOUD_KEY_ENV_VARS
+
+#: The shipped config example — deployed on-box to the STAY-C root. Its
+#: ``scribe.input_dir`` MUST land under a ReadWritePaths root (see the
+#: writability pin below).
+_CONFIG_EXAMPLE = Path(__file__).resolve().parents[1] / "config.stayc-clinical.yaml.example"
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +210,41 @@ def test_per_path_override_wins(tmp_path: Path) -> None:
     assert plan.hf_home == Path("/mnt/fastdisk/hf")
     assert "ReadWritePaths=" in plan.unit_content
     assert "/mnt/fastdisk/hf" in plan.unit_content
+
+
+# ---------------------------------------------------------------------------
+# B1 — the scribe inbox MUST be writable under the sandbox
+# ---------------------------------------------------------------------------
+
+
+def _readwrite_roots(unit_content: str) -> list[Path]:
+    rwp = [l for l in _directive_lines(unit_content) if l.startswith("ReadWritePaths=")]
+    assert len(rwp) == 1, "expected exactly one ReadWritePaths directive"
+    return [Path(p) for p in rwp[0].split("=", 1)[1].split()]
+
+
+def test_config_example_input_dir_is_under_a_readwrite_root(tmp_path: Path) -> None:
+    """B1 regression guard: the config example's ``scribe.input_dir`` MUST
+    resolve UNDER one of the unit's ReadWritePaths roots. ProtectSystem=strict
+    makes everything else read-only, so an inbox that is a SIBLING of the data
+    dir would be EROFS → save_ledger mkdir/write fails → every encounter
+    silently never folds (the daemon boots idle-fine, so `systemctl start`
+    looks healthy while nothing works). Token-presence checks miss this; the
+    directive presence + the config path must AGREE.
+
+    The default installer root (DEFAULT_STAYC_ROOT) matches the on-box path the
+    config example is deployed to, so the RWP roots and input_dir share a tree."""
+    raw = yaml.safe_load(_CONFIG_EXAMPLE.read_text(encoding="utf-8"))
+    input_dir = Path(raw["scribe"]["input_dir"])
+
+    plan = _build(tmp_path, stayc_root=installer.DEFAULT_STAYC_ROOT)
+    roots = _readwrite_roots(plan.unit_content)
+
+    assert any(input_dir == r or input_dir.is_relative_to(r) for r in roots), (
+        f"scribe.input_dir {input_dir} is NOT under any ReadWritePaths root "
+        f"{roots} — ProtectSystem=strict would make it read-only and every "
+        f"encounter would fail EROFS. Move input_dir under the data dir."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -153,6 +153,44 @@ def test_sovereign_breach_propagates_exit_79(
 
 
 # ---------------------------------------------------------------------------
+# (i-b) PIN 1b (CF1) — truthy-non-True enabled ("true"/1/"yes") still propagates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("enabled_value", ["true", 1, "yes"], ids=["str_true", "int_1", "str_yes"])
+def test_truthy_sovereign_enabled_still_propagates_exit_79(
+    orchestrator_raw_config, orch_dirs, fast_sleep, isolate_runtime_path,
+    install_fake_runners, fire_sentinel_after, capsys, enabled_value,
+) -> None:
+    """CF1 regression guard: the runtime propagation gate reads ``enabled``
+    TRUTHILY (mirroring the load gate + boundary + scribe startup), NOT strict
+    ``is True``. A config with ``enabled: "true"`` (or 1 / "yes") boots
+    sovereign at the load gate, so the runtime gate MUST agree — otherwise a
+    breach silently reverts to drop-and-continue → exit 0 (the "79 theater"
+    bug). Same fake-79 setup as PIN 1, only the enabled VALUE differs."""
+    raw = orchestrator_raw_config
+    raw["sovereign"] = {"enabled": enabled_value}
+    _wire_counter(raw, orch_dirs, "curator")
+    install_fake_runners({"curator": _fake_exit_79_curator_3arg})
+
+    fire_sentinel_after(5.0)
+
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.run_all(
+            raw, only="curator",
+            skills_dir=orch_dirs["skills"],
+            pid_path=orch_dirs["pid_path"],
+            live_mode=False,
+        )
+
+    assert exc.value.code == 79, (
+        f"truthy enabled={enabled_value!r} must still propagate 79, "
+        f"got {exc.value.code}"
+    )
+    assert "propagating exit 79" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # (ii) PIN 2 — non-sovereign 79 drops and continues (zero-regression pin)
 # ---------------------------------------------------------------------------
 

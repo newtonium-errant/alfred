@@ -45,7 +45,7 @@ def test_probe_reports_enforced_on_eperm(monkeypatch: pytest.MonkeyPatch) -> Non
     """Canary EPERM → 'enforced' + one INFO scribe.egress_firewall.enforced;
     loopback still reachable → loopback_ok."""
     def fake_connect(host: str, port: int, timeout: float) -> None:
-        if host == "1.1.1.1":
+        if host == "192.0.2.1":
             raise PermissionError(1, "Operation not permitted")
         return None  # loopback (127.0.0.1) succeeds
 
@@ -57,7 +57,7 @@ def test_probe_reports_enforced_on_eperm(monkeypatch: pytest.MonkeyPatch) -> Non
     assert verdict == "enforced"
     enforced = _one(captured, "scribe.egress_firewall.enforced")
     assert enforced["log_level"] == "info"
-    assert enforced["canary"] == "1.1.1.1:443"
+    assert enforced["canary"] == "192.0.2.1:443"
     # Deny side proven → the unverified WARNING must NOT fire.
     assert "scribe.egress_firewall.unverified" not in _events(captured)
     # Loopback reachable → loopback_ok, no severed warning.
@@ -82,7 +82,7 @@ def test_probe_reports_unverified_and_never_raises(
     the probe NEVER raises (reaching the asserts proves no raise / no sys.exit /
     no gate). Each failure mode that drives the unverified path is exercised."""
     def fake_connect(host: str, port: int, timeout: float) -> None:
-        if host == "1.1.1.1":
+        if host == "192.0.2.1":
             if canary_behavior == "connect_succeeds":
                 return None  # egress is OPEN → belt not enforced
             if canary_behavior == "timeout":
@@ -98,7 +98,7 @@ def test_probe_reports_unverified_and_never_raises(
     assert verdict == "unverified"
     unverified = _one(captured, "scribe.egress_firewall.unverified")
     assert unverified["log_level"] == "warning"
-    assert unverified["canary"] == "1.1.1.1:443"
+    assert unverified["canary"] == "192.0.2.1:443"
     # The WARNING names the SOLE verified control (Python guard + barriers).
     assert "SOLE verified egress control" in unverified["detail"]
     # 'enforced' must NOT fire on any unverified path.
@@ -176,10 +176,10 @@ def test_probe_loopback_broad_swallow_never_raises(monkeypatch: pytest.MonkeyPat
 @pytest.mark.parametrize(
     "hostport,default,expected",
     [
-        ("1.1.1.1:443", 443, ("1.1.1.1", 443)),
+        ("192.0.2.1:443", 443, ("192.0.2.1", 443)),
         ("127.0.0.1:11434", 11434, ("127.0.0.1", 11434)),
-        ("1.1.1.1", 443, ("1.1.1.1", 443)),          # no colon → default port
-        ("1.1.1.1:notaport", 443, ("1.1.1.1", 443)),  # garbage port → default
+        ("192.0.2.1", 443, ("192.0.2.1", 443)),          # no colon → default port
+        ("192.0.2.1:notaport", 443, ("192.0.2.1", 443)),  # garbage port → default
     ],
 )
 def test_split_hostport_is_tolerant(hostport, default, expected) -> None:

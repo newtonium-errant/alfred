@@ -78,7 +78,13 @@ sovereign:
 # ---------------------------------------------------------------------------
 scribe:
   mode: synthetic          # FAIL-CLOSED default; flip to `clinical` (legal gate) is the LAST switch
-  input_dir: "/data/algernon/stayc-clinical/inbox"
+  # MUST live UNDER the data dir (/data/algernon/stayc-clinical/data): the
+  # hardened systemd unit grants write to {vault, data, models/hf} only
+  # (ReadWritePaths); ProtectSystem=strict makes everything else read-only, so
+  # an inbox that is a SIBLING of data would be EROFS and every encounter would
+  # silently fail to fold. Keeping it inside data makes the ledger/chunk writes
+  # land in a writable path.
+  input_dir: "/data/algernon/stayc-clinical/data/inbox"
   # Per-instance SECRET that salts the opaque encounter_id (scribe P3-b1):
   #   encounter_id = "enc-" + hmac_sha256(encounter_salt, raw_label)[:16]
   # An UNsalted hash of a low-entropy patient label is trivially reversible, so
@@ -108,13 +114,16 @@ scribe:
   # SOLE verified control). It also connects to `loopback` (Ollama) so an
   # IPAddressAllow over-block that severed the local model fails LOUD.
   #
-  # ⚠️ When enabled:true the daemon fires ONE payload-free off-box canary SYN at
-  # boot — ONLY on the unverified path (EPERM is synchronous, so when the belt
-  # IS enforced NO packet ever leaves). Set enabled:false to suppress that SYN
-  # entirely (the daemon then logs `scribe.egress_firewall.probe_disabled`).
+  # ⚠️ When enabled:true the daemon fires ONE payload-free canary SYN at boot —
+  # ONLY on the unverified path — toward a NON-ROUTABLE TEST-NET-1 address
+  # (RFC 5737 192.0.2.1) that no host owns, so it NEVER touches a real cloud
+  # host; it only proves whether the local kernel egress hook rejects it (EPERM
+  # is synchronous, so when the belt IS enforced NO packet ever leaves). Set
+  # enabled:false to suppress that SYN entirely (the daemon then logs
+  # `scribe.egress_firewall.probe_disabled`).
   egress_probe:
     enabled: true
-    canary: "1.1.1.1:443"          # off-box routable target — SYN only, never any payload
+    canary: "192.0.2.1:443"        # TEST-NET-1 (RFC 5737) — NON-routable, never touches a real host; SYN only
     loopback: "127.0.0.1:11434"    # Ollama loopback — must stay reachable (real-need i)
 
 # ---------------------------------------------------------------------------

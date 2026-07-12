@@ -56,7 +56,7 @@ def test_startup_fires_egress_probe_when_enabled(monkeypatch):
     canary/loopback and the daemon's logger."""
     calls = []
 
-    def fake_probe(canary="1.1.1.1:443", loopback="127.0.0.1:11434", timeout=1.0, *, logger=None):
+    def fake_probe(canary="192.0.2.1:443", loopback="127.0.0.1:11434", timeout=1.0, *, logger=None):
         calls.append({"canary": canary, "loopback": loopback, "logger": logger})
         return "unverified"
 
@@ -64,7 +64,7 @@ def test_startup_fires_egress_probe_when_enabled(monkeypatch):
     startup(_raw(), env={})
 
     assert len(calls) == 1
-    assert calls[0]["canary"] == "1.1.1.1:443"
+    assert calls[0]["canary"] == "192.0.2.1:443"
     assert calls[0]["loopback"] == "127.0.0.1:11434"
     assert calls[0]["logger"] is not None, "daemon must pass its own logger to the probe"
 
@@ -73,7 +73,7 @@ def test_startup_forwards_custom_canary_and_loopback(monkeypatch):
     """Operator-configured canary/loopback are forwarded to the probe."""
     calls = []
 
-    def fake_probe(canary="1.1.1.1:443", loopback="127.0.0.1:11434", timeout=1.0, *, logger=None):
+    def fake_probe(canary="192.0.2.1:443", loopback="127.0.0.1:11434", timeout=1.0, *, logger=None):
         calls.append((canary, loopback))
         return "enforced"
 
@@ -119,3 +119,26 @@ def test_startup_swallows_probe_exception_and_still_boots(monkeypatch):
     skipped = [c for c in caps if c.get("event") == "scribe.egress_firewall.probe_skipped"]
     assert len(skipped) == 1
     assert skipped[0]["log_level"] == "warning"
+
+
+@pytest.mark.parametrize("bad_value", ["yes", 1, ["enabled"], "true"], ids=["str", "int", "list", "str_true"])
+def test_startup_tolerates_malformed_egress_probe_scalar(monkeypatch, bad_value):
+    """CF2 regression guard: a malformed (non-dict) scribe.egress_probe value is
+    coerced to {} so the ``probe_cfg.get(...)`` read can't AttributeError
+    OUTSIDE the swallow-try → boot MUST complete (scribe.daemon.up emitted). The
+    probe is observability-only; a bad config never gates boot. Coerced-to-{} →
+    enabled defaults true → the probe fires with defaults (here stubbed)."""
+    calls = []
+    monkeypatch.setattr(
+        egress_probe_mod, "probe_kernel_egress_firewall",
+        lambda *a, **k: calls.append(1),
+    )
+
+    with structlog.testing.capture_logs() as caps:
+        config = startup(_raw(egress_probe=bad_value), env={})
+
+    assert config.mode == "synthetic"
+    up = [c for c in caps if c.get("event") == "scribe.daemon.up"]
+    assert len(up) == 1, f"malformed egress_probe={bad_value!r} must not gate boot"
+    # non-dict → {} → enabled default true → probe fired once with defaults.
+    assert calls == [1]

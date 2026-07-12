@@ -1496,7 +1496,20 @@ def run_all(
     # ``shutdown_requested`` — can never false-propagate 79. Gated on
     # ``sovereign.enabled`` so every non-sovereign instance keeps today's
     # drop-and-continue behavior byte-for-byte.
-    sovereign_enabled = bool((raw.get("sovereign") or {}).get("enabled") is True)
+    #
+    # TRUTHY (not strict ``is True``) to MIRROR the sibling gates EXACTLY —
+    # the pre-spawn load gate above (``_enforce_sovereign_boundary_or_exit``,
+    # line 166), ``validate_sovereign_boundary`` in boundary.py, and
+    # ``scribe.daemon.startup`` all read ``enabled`` truthily. A strict
+    # ``is True`` here would let ``enabled: "true"`` (or 1/"yes") boot sovereign
+    # at the load gate while this RUNTIME gate read False → a runtime breach
+    # would silently revert to drop-and-continue → exit 0 → the "79 theater"
+    # bug resurrected (a fail-OPEN divergence in the safety mechanism). Keep it
+    # in lockstep with the siblings.
+    _sovereign_block = raw.get("sovereign") or {}
+    sovereign_enabled = bool(
+        isinstance(_sovereign_block, dict) and _sovereign_block.get("enabled")
+    )
     sovereign_breach = False
     # Resolve transport env vars once — orchestrator injects these
     # into every tool's child environment so any subprocess can call

@@ -13,16 +13,18 @@ This module PROBES the belt at scribe boot and LOGS what it found — it never
 trusts it, never gates serving, never brings the daemon down. Two independent
 checks, both observability-only:
 
-  1. DENY side — connect (SYN only, NO payload) to a routable canary. An
-     enforced eBPF egress hook rejects the SYN synchronously with EPERM, so
-     not one byte leaves the box → ``enforced``. If the connection SUCCEEDS
-     (egress open) or the attempt times out / errors for any other reason we
-     cannot PROVE enforcement → ``unverified``, and the WARNING names the
-     Python guard + barriers a-e as the SOLE verified egress control. We fail
-     OPEN on the verdict (``unverified`` + boot), NEVER closed — an air-gapped
-     / route-less clinic box legitimately yields a timeout and MUST still come
-     up (rejecting C's fail-closed-on-inconclusive, which would brick the
-     safest deployment).
+  1. DENY side — connect (SYN only, NO payload) to a NON-ROUTABLE TEST-NET-1
+     canary (RFC 5737 ``192.0.2.1``). An enforced eBPF egress hook rejects the
+     SYN synchronously with EPERM, so not one byte leaves the box →
+     ``enforced``. Otherwise the attempt times out / hits ICMP-unreachable /
+     errors (TEST-NET-1 is owned by no host, so it can never complete a
+     handshake to a real cloud host — that is the whole point vs a routable
+     canary) → we cannot PROVE enforcement → ``unverified``, and the WARNING
+     names the Python guard + barriers a-e as the SOLE verified egress control.
+     We fail OPEN on the verdict (``unverified`` + boot), NEVER closed — an
+     air-gapped / route-less clinic box legitimately yields a timeout and MUST
+     still come up (rejecting C's fail-closed-on-inconclusive, which would
+     brick the safest deployment).
 
   2. LOOPBACK-POSITIVE side (graft from Approach C) — separately connect to the
      Ollama loopback (``127.0.0.1:11434``). If an over-broad ``IPAddressAllow``
@@ -33,10 +35,12 @@ checks, both observability-only:
 Contract (asserted by ``tests/test_egress_probe.py``): the probe NEVER raises,
 NEVER calls ``sys.exit``, NEVER returns a gating value, NEVER prints "no egress
 possible", NEVER conflates unavailability with safety. It always closes its
-sockets. The single off-box canary SYN it fires on the unverified path is
-documented + consented via ``scribe.egress_probe.enabled`` (default true;
-set false to suppress the SYN entirely) — note EPERM is synchronous, so when
-the firewall IS enforced NO packet ever leaves.
+sockets. The single canary SYN it fires on the unverified path targets a
+NON-ROUTABLE TEST-NET-1 address (RFC 5737) — it never reaches a real cloud
+host, only proving whether the local kernel egress hook rejects it. It is still
+documented + consented via ``scribe.egress_probe.enabled`` (default true; set
+false to suppress the SYN entirely) — and EPERM is synchronous, so when the
+firewall IS enforced NO packet ever leaves at all.
 """
 
 from __future__ import annotations
@@ -89,7 +93,7 @@ def _connect_probe(host: str, port: int, timeout: float) -> None:
 
 
 def probe_kernel_egress_firewall(
-    canary: str = "1.1.1.1:443",
+    canary: str = "192.0.2.1:443",
     loopback: str = "127.0.0.1:11434",
     timeout: float = 1.0,
     *,
@@ -112,8 +116,10 @@ def probe_kernel_egress_firewall(
         host, port = _split_hostport(canary, 443)
         try:
             _connect_probe(host, port, timeout)
-            # Reached only if the connection SUCCEEDED → egress is open. The
-            # SYN did leave the box (consented via egress_probe.enabled).
+            # Reached only if the connection SUCCEEDED. With a non-routable
+            # TEST-NET-1 canary this should never happen (no host owns it); if
+            # it does, something is intercepting egress → still 'unverified'
+            # (we could not prove the kernel belt rejected it).
             verdict = "unverified"
             log.warning(
                 "scribe.egress_firewall.unverified",

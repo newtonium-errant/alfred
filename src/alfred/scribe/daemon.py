@@ -93,15 +93,20 @@ def startup(
     # enforced|unverified (+ a loopback-severed WARN if IPAddressAllow
     # over-blocked Ollama). It NEVER gates boot, so any exception is swallowed
     # (observability-only). Gated on ``scribe.egress_probe.enabled`` (default
-    # true) — when enabled it fires ONE payload-free off-box canary SYN on the
-    # unverified path; set it false to suppress that SYN. NOTE: EPERM is
-    # synchronous, so when the belt IS enforced no packet ever leaves the box.
-    probe_cfg = (raw.get("scribe") or {}).get("egress_probe") or {}
+    # true) — when enabled it fires ONE payload-free canary SYN toward a
+    # NON-ROUTABLE TEST-NET-1 address on the unverified path (never a real
+    # host); set it false to suppress that SYN. NOTE: EPERM is synchronous, so
+    # when the belt IS enforced no packet ever leaves the box.
+    # A malformed (non-dict) egress_probe scalar is coerced to {} so a bad
+    # config can never crash boot (the probe is observability-only).
+    probe_cfg = (raw.get("scribe") or {}).get("egress_probe")
+    if not isinstance(probe_cfg, dict):
+        probe_cfg = {}
     if probe_cfg.get("enabled", True):
         try:
             from alfred.sovereign.egress_probe import probe_kernel_egress_firewall
             probe_kernel_egress_firewall(
-                canary=probe_cfg.get("canary", "1.1.1.1:443"),
+                canary=probe_cfg.get("canary", "192.0.2.1:443"),
                 loopback=probe_cfg.get("loopback", "127.0.0.1:11434"),
                 logger=log,
             )
