@@ -111,6 +111,52 @@ _FOLLOWING_HEDGE_RE = re.compile(
 _NON_PREFIX_RE = re.compile(r"\bnon\s*$")
 
 
+# --- FIX 2 (audit batch 2 #7, CORRECTED): screening-INSTRUMENT blocklist -----
+# A dx abbrev is a word-boundary SUBSTRING of many clinical instrument tokens (the
+# hyphen is a word boundary): ptsd ⊂ PC-PTSD-5, adhd ⊂ ADHD-RS, ibs ⊂ IBS-SSS, osa
+# ⊂ OSA-18, bph ⊂ BPH-II, ckd ⊂ CKD-EPI, gerd ⊂ GERD-Q (and gad ⊂ GAD-7/GAD-2).
+# NAMING the instrument is NOT the clinician stating the DIAGNOSIS — so a cited
+# "PC-PTSD-5 score is 12" must NOT clear an inferred PTSD (a high-harm false-CLEAR
+# the self-correcting loop is BLIND to: a false-CLEAR emits NO flag → NO capture
+# row → the loop can never grow to fix it, so it MUST be closed here, not deferred).
+#
+# The FIX (keeps the abbrev forms → keeps recall, unlike dropping them): MASK these
+# instrument tokens out of the cited text. This MUST run on the RAW text BEFORE the
+# FIX-4 hyphen→space fold — the fold turns "pc-ptsd-5" into "pc ptsd 5" and destroys
+# the signature, so detection has to precede it. Flexible ``[-\s]?`` separators so a
+# pre-spaced transcript variant ("pc ptsd 5") is caught too. A label whose ONLY
+# cited occurrence was inside a masked instrument then has no span → not "stated" →
+# the dx FLAGS. Composes with the hedge check (an occurrence counts as stated only
+# if current-assertion AND not instrument-embedded).
+#
+# NOT via a dropped abbrev EXCEPT where the collision reaches BEYOND the instrument
+# namespace (the mask cannot reach a LAB/drug token): ``gad`` stays dropped (⊂ the
+# lab "anti-GAD / GAD antibodies", not only GAD-7); ms/mi/ra/pd/ad stay dropped
+# (drug / ambiguous). See the lexicon curation-policy docstring.
+_SCREENING_INSTRUMENT_RE = re.compile(
+    r"\b(?:"
+    r"pc[-\s]?ptsd[-\s]?5|ptsd[-\s]?8"          # PTSD screens (⊃ ptsd)
+    r"|adhd[-\s]?rs(?:[-\s]?iv)?"                # ADHD Rating Scale, +/- -IV (⊃ adhd)
+    r"|ibs[-\s]?(?:sss|qol)"                     # IBS severity / QoL (⊃ ibs)
+    r"|osa[-\s]?18"                              # OSA-18 QoL (⊃ osa)
+    r"|bph[-\s]?ii"                              # BPH Impact Index (⊃ bph)
+    r"|ckd[-\s]?epi"                             # CKD-EPI eGFR equation (⊃ ckd)
+    r"|gerd[-\s]?q"                              # GERD-Q questionnaire (⊃ gerd)
+    r"|gad[-\s]?[27]"                            # GAD-7/GAD-2 (belt: gad also dropped)
+    r"|phq[-\s]?(?:9|2|15)"                      # PHQ-* (no dx abbrev embedded; documents)
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _mask_screening_instruments(raw_cited: str) -> str:
+    """Blank out screening-instrument / scale / equation tokens on the RAW cited
+    text (pre-fold) so a dx abbrev embedded in one cannot register as a stated dx.
+    Replaced with a space to preserve the token boundary. MUST precede the
+    ``normalize_text`` hyphen→space fold (which destroys the instrument signature)."""
+    return _SCREENING_INSTRUMENT_RE.sub(" ", raw_cited)
+
+
 def _occurrence_is_hedged(norm: str, start: int, end: int) -> bool:
     """True iff the label occurrence at ``[start, end)`` in ``norm`` (a
     ``normalize_text`` string) sits inside a negation / hedge / attribution /
@@ -136,9 +182,13 @@ def _occurrence_is_hedged(norm: str, start: int, end: int) -> bool:
 
 def _stated_current(entry: DiagnosisEntry, cited: str) -> bool:
     """True iff AT LEAST ONE occurrence of any of ``entry``'s forms appears in
-    ``cited`` as a CURRENT assertion (not hedge-wrapped). If EVERY occurrence is
-    hedged, the dx is not "stated" and must not clear an inferred-dx flag."""
-    norm = normalize_text(cited)
+    ``cited`` as a CURRENT assertion — i.e. NOT hedge-wrapped AND NOT embedded in a
+    screening-instrument token. If EVERY occurrence is hedged or instrument-embedded,
+    the dx is not "stated" and must not clear an inferred-dx flag.
+
+    ORDER IS LOAD-BEARING: mask instruments on the RAW ``cited`` FIRST, then fold —
+    ``normalize_text`` turns "pc-ptsd-5" into "pc ptsd 5" and destroys the signature."""
+    norm = normalize_text(_mask_screening_instruments(cited))
     for start, end in form_spans_in(entry, norm):
         if not _occurrence_is_hedged(norm, start, end):
             return True

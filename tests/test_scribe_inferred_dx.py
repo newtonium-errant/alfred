@@ -230,29 +230,28 @@ def test_inferred_flag_renders_inline_and_lands_in_metadata():
 # Lexicon curation policy — ambiguous abbreviations are NOT matchable forms
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("ambiguous", ["ms", "mi", "ra", "pd", "ad", "gad", "ckd", "gerd"])
+@pytest.mark.parametrize("ambiguous", ["ms", "mi", "ra", "pd", "ad", "gad"])
 def test_lexicon_excludes_ambiguous_abbreviations(ambiguous):
-    # None of the dangerous abbreviations is a matchable form (false-CLEAR guard).
-    # "gad"/"ckd"/"gerd" are EXCLUDED for the screening-tool-name collision
-    # (GAD ⊂ GAD-7/GAD-2, ckd ⊂ CKD-EPI, gerd ⊂ GERD-Q — audit batch 2).
+    # These abbrevs stay DROPPED — their collision reaches BEYOND the screening-
+    # instrument namespace (ms=morphine sulfate; gad ⊂ the LAB "anti-GAD/GAD
+    # antibodies", not just GAD-7), so the pre-fold instrument blocklist can't
+    # protect them; only the full label is matchable. (ckd/gerd/ptsd/adhd/ibs/osa/
+    # bph are KEPT — instrument-only collisions closed by the blocklist, batch 2.)
     all_forms = {f for e in DIAGNOSIS_LEXICON for f in e.forms}
     assert ambiguous not in all_forms
     # but the FULL labels ARE present.
     assert diagnoses_named_in("patient with multiple sclerosis")
     assert diagnoses_named_in("history of myocardial infarction")
     assert diagnoses_named_in("assessment: generalized anxiety disorder")
-    assert diagnoses_named_in("assessment: chronic kidney disease stage 3")
-    assert diagnoses_named_in("assessment: gastroesophageal reflux disease")
 
 
-def test_screening_tool_name_does_not_clear_inferred_dx():
-    # The fix, at the matcher level: a cited screening-tool NAME must not register
-    # the DIAGNOSIS. "GAD-7 score is 15" names NO lexicon diagnosis.
+def test_gad_dropped_abbrev_names_no_dx_at_matcher_level():
+    # gad stays DROPPED (beyond-instrument lab collision), so at the pure MATCHER
+    # level a cited GAD-7 / PHQ score names NO lexicon diagnosis. (For the KEPT
+    # abbrevs ckd/gerd the matcher DOES return them — the instrument false-CLEAR is
+    # closed at the CLEAR-check level by the pre-fold mask, see the blocklist tests.)
     assert diagnoses_named_in("GAD-7 score is 15") == []
     assert diagnoses_named_in("PHQ-9 score is 18") == []      # never collided (kept as a pin)
-    # audit batch 2 — more instrument-name collisions the same class as GAD-7.
-    assert diagnoses_named_in("CKD-EPI eGFR is 55") == []     # ckd ⊂ CKD-EPI (eGFR equation)
-    assert diagnoses_named_in("GERD-Q score is 9") == []      # gerd ⊂ GERD-Q (questionnaire)
 
 
 def test_lexicon_word_boundary_not_substring():
@@ -479,3 +478,79 @@ def test_fix5_capture_only_the_flag_inferred_labels_not_whole_claim():
     assert len(ev) == 1
     assert ev[0]["diagnosis"] == "major depressive disorder"
     assert all(e["diagnosis"] != "hypertension" for e in ev)
+
+
+# ===========================================================================
+# AUDIT BATCH 2 — BLOCK-FIX: screening-INSTRUMENT blocklist (pre-fold)
+# Closes the 5 instrument false-CLEARs the reviewer confirmed, KEEPING the abbrev
+# forms (recall preserved). The instrument mask runs on RAW text before FIX-4's
+# hyphen→space fold.
+# ===========================================================================
+
+@pytest.mark.parametrize("dx_claim, instrument_cite", [
+    ("Post-traumatic stress disorder", "PC-PTSD-5 score is 12"),        # ptsd ⊂ PC-PTSD-5
+    ("Attention deficit hyperactivity disorder", "ADHD-RS score is 30"),  # adhd ⊂ ADHD-RS
+    ("Irritable bowel syndrome", "IBS-SSS is 240"),                     # ibs ⊂ IBS-SSS
+    ("Obstructive sleep apnea", "OSA-18 quality-of-life score 60"),     # osa ⊂ OSA-18
+    ("Benign prostatic hyperplasia", "BPH-II impact index is 4"),      # bph ⊂ BPH-II
+    ("Chronic kidney disease", "renal function per CKD-EPI eGFR is 55"),  # ckd ⊂ CKD-EPI
+    ("Gastroesophageal reflux disease", "GERD-Q score is 9"),          # gerd ⊂ GERD-Q
+    ("Generalized anxiety disorder", "GAD-7 score is 15"),             # gad (dropped) ⊂ GAD-7
+])
+def test_blockfix_instrument_only_cite_flags_inferred_dx(dx_claim, instrument_cite):
+    # A full-label dx claim whose ONLY cited support is the INSTRUMENT token is a
+    # fabrication → FLAGGED. Pre-fix the KEPT abbrev matched inside the folded
+    # instrument ("pc ptsd 5") and CLEARED it. (MUTATION-BIND: drop the mask from
+    # _stated_current → all 8 CLEAR again → RED. Done + reverted in the ship report.)
+    tx = _tx(_seg(1, instrument_cite))
+    note = _note(assessment=[Claim(claim=dx_claim, source_spans=["S1"])])
+    flags = _flagged(note, tx)
+    assert len(flags) == 1 and flags[0].reason == INFERRED_DIAGNOSIS_REASON
+
+
+@pytest.mark.parametrize("dx_claim, cited", [
+    ("Post-traumatic stress disorder", "assessment: PTSD, start prazosin"),
+    ("Attention deficit hyperactivity disorder", "assessment: ADHD, start methylphenidate"),
+    ("Irritable bowel syndrome", "diagnosis: IBS, dietary advice given"),
+    ("Chronic kidney disease", "assessment: CKD stage 3, monitor eGFR"),
+    ("Gastroesophageal reflux disease", "assessment: GERD, start ppi"),
+])
+def test_blockfix_bare_abbrev_stated_still_clears(dx_claim, cited):
+    # RECALL PROOF — the abbrev forms are KEPT, so a bare abbrev STATED as a current
+    # dx (no instrument wrapper) still CLEARS. This is what dropping the abbrev would
+    # have destroyed; the blocklist preserves it.
+    tx = _tx(_seg(1, cited))
+    note = _note(assessment=[Claim(claim=dx_claim, source_spans=["S1"])])
+    assert _flagged(note, tx) == []
+
+
+def test_blockfix_prefold_ordering_mask_before_fold():
+    # The mask MUST run on RAW text: the fold turns "pc-ptsd-5" → "pc ptsd 5", which
+    # exposes a standalone "ptsd". Prove the ordering directly.
+    from alfred.scribe.diagnosis_lexicon import normalize_text
+    from alfred.scribe.inferred_dx import _SCREENING_INSTRUMENT_RE, _mask_screening_instruments
+    raw = "PC-PTSD-5 score is 12"
+    # raw carries the instrument signature; the post-fold text does NOT.
+    assert _SCREENING_INSTRUMENT_RE.search(raw)
+    assert "ptsd" in normalize_text(raw)                       # fold would expose standalone ptsd
+    assert "ptsd" not in normalize_text(_mask_screening_instruments(raw))  # mask-then-fold removes it
+
+
+def test_blockfix_both_present_standalone_clears_instrument_only_flags():
+    # If the label appears BOTH standalone (current assertion) AND inside an
+    # instrument in the same span → the standalone occurrence STATES it → CLEAR.
+    tx_both = _tx(_seg(1, "assessment: post-traumatic stress disorder; PC-PTSD-5 was 12"))
+    assert _flagged(_note(assessment=[Claim(claim="Post-traumatic stress disorder", source_spans=["S1"])]),
+                    tx_both) == []
+    # only-in-instrument → FLAG (the standalone leg removed).
+    tx_only = _tx(_seg(1, "PC-PTSD-5 was 12"))
+    assert len(_flagged(_note(assessment=[Claim(claim="Post-traumatic stress disorder", source_spans=["S1"])]),
+                        tx_only)) == 1
+
+
+def test_blockfix_instrument_mask_composes_with_hedge():
+    # A standalone PTSD that is ALSO hedged (family history) still FLAGS — the mask
+    # and the hedge check compose (stated = current-assertion AND not-instrument).
+    tx = _tx(_seg(1, "family history of PTSD; PC-PTSD-5 not done"))
+    note = _note(assessment=[Claim(claim="Post-traumatic stress disorder", source_spans=["S1"])])
+    assert len(_flagged(note, tx)) == 1

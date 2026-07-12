@@ -18,25 +18,31 @@ CURATION POLICY (locked by design review):
     gap (an abbreviated inferred dx isn't flagged) — the SAFE direction under the
     precision>recall posture (attest is the backstop; the recall gap is what the
     self-correcting increment grows).
-  * SCREENING-TOOL-NAME COLLISION (the same false-CLEAR class, generalised):
-    EXCLUDE any abbreviation that is a SUBSTRING of a screening-tool / scale name,
-    not only abbrevs that collide with another DIAGNOSIS. ``\\bgad\\b`` matches
-    INSIDE the instrument name ``GAD-7`` / ``GAD-2`` (the hyphen is a word
-    boundary), so a cited "GAD-7 score is 15" segment would be read as the
-    DIAGNOSIS being stated and would spuriously CLEAR an inferred GAD fabrication
-    (a high-harm false-NEGATIVE on anxiety, the 2nd-most-common inferred dx). So
-    ``gad`` is NOT a matchable form; only the full ``generalized/generalised
-    anxiety disorder`` is. Reviewer audit (2026-07-11, CORRECTED audit batch 2):
-    GAD-7/GAD-2 is NOT the only tool-name collision — ``ckd`` ⊂ ``CKD-EPI`` (the
-    standard eGFR estimating equation, on nearly every renal note) and ``gerd`` ⊂
-    ``GERD-Q`` (a validated reflux questionnaire) collide the SAME way, so both
-    abbrev forms are now DROPPED (full labels kept). PHQ-9 ∌ ``mdd``; the OCD
-    instruments (Y-BOCS / OCI-R) embed no dx abbrev. FURTHER CANDIDATE collisions
-    flagged for clinical review before any drop (dropping them has a real recall
-    cost — these are also the primary way clinicians WRITE the dx): ``ptsd`` ⊂
-    ``PC-PTSD-5``, ``adhd`` ⊂ ``ADHD-RS``, ``ibs`` ⊂ ``IBS-SSS``. The RULE stands:
-    EXCLUDE an abbrev embedded in its own screening / scale / equation name as the
-    set grows.
+  * SCREENING-INSTRUMENT COLLISION (a whole false-CLEAR class — closed the RIGHT
+    way, by a pre-fold BLOCKLIST, NOT by dropping the abbrev). A dx abbrev is a
+    word-boundary SUBSTRING of many instrument / scale / equation tokens (the hyphen
+    is a word boundary): ``gad`` ⊂ ``GAD-7``/``GAD-2``, ``ptsd`` ⊂ ``PC-PTSD-5``,
+    ``adhd`` ⊂ ``ADHD-RS``, ``ibs`` ⊂ ``IBS-SSS``, ``osa`` ⊂ ``OSA-18``, ``bph`` ⊂
+    ``BPH-II``, ``ckd`` ⊂ ``CKD-EPI``, ``gerd`` ⊂ ``GERD-Q``. A cited "PC-PTSD-5
+    score is 12" would be read as the DIAGNOSIS being stated and spuriously CLEAR an
+    inferred PTSD — a high-harm false-NEGATIVE. A dx abbrev must therefore be checked
+    against the full clinical-INSTRUMENT namespace, not just other dx abbrevs.
+    CRITICAL: this class CANNOT be deferred to the self-correcting loop — the loop
+    grows from FLAGS, and a false-CLEAR emits NO flag → NO capture row → the loop is
+    structurally BLIND to it. FIX (``inferred_dx._SCREENING_INSTRUMENT_RE``): MASK
+    the instrument tokens out of the cited text BEFORE the normalize hyphen→space
+    fold (the fold turns ``pc-ptsd-5`` into ``pc ptsd 5`` and destroys the
+    signature); a label whose ONLY cited occurrence is inside a masked instrument is
+    not "stated" → the dx FLAGS. The abbrev FORMS stay matchable → recall preserved
+    (``PTSD``/``ADHD``/``IBS``/``CKD``/``GERD`` are almost always written abbreviated).
+    Reviewer audit (2026-07-11, CORRECTED audit batch 2): GAD-7 is NOT the only
+    collision — CKD-EPI, GERD-Q, PC-PTSD-5, ADHD-RS, IBS-SSS, OSA-18, BPH-II all
+    collide; PHQ-9 ∌ ``mdd``; OCD instruments (Y-BOCS / OCI-R) embed no dx abbrev.
+    ABBREVS STILL DROPPED (collision reaches BEYOND the screening-instrument
+    namespace, where the mask cannot reach): ``gad`` (⊂ the LAB "anti-GAD / GAD
+    antibodies", not only GAD-7) — the GAD-7/GAD-2 blocklist entries are belt-and-
+    suspenders for it; ``ms`` (= morphine sulfate), ``mi`` / ``ra`` / ``pd`` / ``ad``
+    (drug / ambiguous). For these the full label only is matchable.
   * WORD-BOUNDARY PHRASE match, NEVER substring — ``depression`` never matches
     inside ``major depression``; ``\\bMDD\\b`` never matches inside a longer token.
 
@@ -70,9 +76,10 @@ def _entry(canonical: str, *synonyms: str) -> DiagnosisEntry:
 DIAGNOSIS_LEXICON: tuple[DiagnosisEntry, ...] = (
     # --- mental health (the #48 core surface — SSRI/score-inferred) ---
     _entry("major depressive disorder", "major depression", "mdd"),
-    # "gad" abbrev EXCLUDED — it is a substring of the screening tool GAD-7/GAD-2
-    # (the hyphen is a word boundary), so a cited "GAD-7 score" would false-CLEAR
-    # an inferred GAD. Full labels only (see the SCREENING-TOOL-NAME COLLISION rule).
+    # "gad" abbrev EXCLUDED — beyond the GAD-7/GAD-2 screening tools it is a
+    # substring of the LAB "anti-GAD / GAD antibodies" (a beyond-namespace collision
+    # the instrument blocklist cannot reach), so full labels only (see the
+    # SCREENING-INSTRUMENT COLLISION rule + its EXCEPTIONS).
     _entry("generalized anxiety disorder", "generalised anxiety disorder"),
     _entry("panic disorder"),
     _entry("post-traumatic stress disorder", "posttraumatic stress disorder", "ptsd"),
@@ -101,19 +108,19 @@ DIAGNOSIS_LEXICON: tuple[DiagnosisEntry, ...] = (
     _entry("obstructive sleep apnea", "obstructive sleep apnoea", "sleep apnea", "sleep apnoea", "osa"),
     _entry("pneumonia"),
     # --- gastrointestinal ---
-    # "gerd" abbrev DROPPED — it is a substring of the screening tool GERD-Q (the
-    # hyphen is a word boundary), the SAME false-CLEAR class as GAD⊂GAD-7. Full
-    # labels only (see the SCREENING-TOOL-NAME COLLISION rule).
-    _entry("gastroesophageal reflux disease", "gastro-oesophageal reflux disease", "acid reflux"),
+    # "gerd" KEPT — its only collision is the questionnaire GERD-Q, closed by the
+    # pre-fold instrument blocklist (inferred_dx._SCREENING_INSTRUMENT_RE); abbrev
+    # recall preserved (see the SCREENING-INSTRUMENT COLLISION rule).
+    _entry("gastroesophageal reflux disease", "gastro-oesophageal reflux disease", "acid reflux", "gerd"),
     _entry("peptic ulcer disease", "pud"),
     _entry("irritable bowel syndrome", "ibs"),
     _entry("celiac disease", "coeliac disease"),
     # --- genitourinary / renal ---
     _entry("urinary tract infection", "uti"),
-    # "ckd" abbrev DROPPED — it is a substring of the eGFR equation CKD-EPI (the
-    # hyphen is a word boundary), the SAME false-CLEAR class as GAD⊂GAD-7. Full
-    # label only (see the SCREENING-TOOL-NAME COLLISION rule).
-    _entry("chronic kidney disease"),
+    # "ckd" KEPT — its only collision is the eGFR equation CKD-EPI, closed by the
+    # pre-fold instrument blocklist (inferred_dx._SCREENING_INSTRUMENT_RE); abbrev
+    # recall preserved (see the SCREENING-INSTRUMENT COLLISION rule).
+    _entry("chronic kidney disease", "ckd"),
     _entry("benign prostatic hyperplasia", "bph"),
     # --- musculoskeletal / neuro (full labels only — RA/MS/PD/AD abbrevs EXCLUDED) ---
     _entry("osteoarthritis"),
@@ -137,10 +144,11 @@ def normalize_text(text: str) -> str:
       * U+2019 / U+2018 curly apostrophe → ASCII ``'`` — STT/LLM emit curly
         apostrophes by default, which without the fold NEUTER ``parkinson's`` /
         ``alzheimer's`` (the straight-apostrophe forms never match);
-      * hyphen → space — a word boundary EITHER way (the screening-tool-name
-        collision reasoning above is unaffected: ``gad`` still matches at the
-        ``GAD 7`` boundary exactly as it did at the ``GAD-7`` boundary), so
-        ``post-traumatic`` and ``post traumatic`` both match the same form;
+      * hyphen → space — a word boundary EITHER way, so ``post-traumatic`` and
+        ``post traumatic`` both match the same form. NOTE: the fold destroys the
+        screening-INSTRUMENT signature (``pc-ptsd-5`` → ``pc ptsd 5``), which is why
+        ``inferred_dx._SCREENING_INSTRUMENT_RE`` MASKS instruments on the RAW text
+        BEFORE this fold runs (see the SCREENING-INSTRUMENT COLLISION rule);
       * whitespace collapsed so a multi-word form matches across odd spacing.
 
     Forms are run through this SAME function at match time (``_form_present`` /
