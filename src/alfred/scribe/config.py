@@ -161,6 +161,21 @@ class ScribeConfig:
     # fail-loud-on-missing-name). Set via ``${SCRIBE_ENCOUNTER_SALT}`` (env
     # substitution runs on this block), never inline in a committed config.
     encounter_salt: str = ""
+    # #57 close-manifest — STRICT "ready ⇒ complete" enforcement opt-in. When True
+    # (ALSO forced-on by clinical mode, see close_manifest.resolve_require_close_manifest),
+    # the /close route REQUIRES a final_seq (400 otherwise, nothing written) and the
+    # checkpoint gate treats a missing/ambiguous manifest as fail-closed (never
+    # READY). DEFAULT False (inert): the shipped synthetic PWA's legacy empty-close
+    # still finalizes to READY — the structural enforcement engages exactly at the
+    # clinical (medico-legal) boundary #57 gates.
+    require_close_manifest: bool = False
+    # #57 STATE_INCOMPLETE terminal grace (seconds). DEFAULT 0 = the operator-visible
+    # INCOMPLETE terminal is DISABLED; the ALWAYS-ON primary safety (a promised-but-
+    # unarrived tail stays DRAFTED forever + emits close_awaiting_promised_seq every
+    # sweep) fully satisfies the invariant. A POSITIVE value opts into marking such an
+    # encounter STATE_INCOMPLETE once the _CLOSED sentinel is older than the grace
+    # (surfaced status "incomplete — awaiting seq N"; RE-OPENABLE if the tail arrives).
+    incomplete_grace_s: int = 0
 
     @property
     def is_clinical(self) -> bool:
@@ -221,7 +236,22 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
         ingest_web=_build_ingest_web(scribe.get("ingest_web")),
         clinicians=clinicians,
         encounter_salt=str(scribe.get("encounter_salt") or ""),
+        # #57 — scalar fields on ScribeConfig (no _build nesting): string-safe coerce
+        # so a YAML ``"false"`` / ``"5"`` never slips a wrong-typed value through.
+        require_close_manifest=coerce_ingest_web_enabled(
+            scribe.get("require_close_manifest", False)),
+        incomplete_grace_s=_coerce_nonneg_int(scribe.get("incomplete_grace_s"), 0),
     )
+
+
+def _coerce_nonneg_int(value: Any, default: int) -> int:
+    """Coerce ``value`` to a non-negative int (a nonsense value keeps the default —
+    never crash the load)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if n >= 0 else default
 
 
 def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:

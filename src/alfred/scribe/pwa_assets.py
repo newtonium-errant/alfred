@@ -140,7 +140,9 @@ APP_JS = r"""'use strict';
   // the CALLER then actually stops (N1: recording must not keep hammering the
   // same seq against a cap). The encounter is closed by the dedicated
   // /scribe/close (robust even if the final chunk's 200 was lost), never a
-  // close-flag on a chunk that might itself be the lost one.
+  // close-flag on a chunk that might itself be the lost one. /scribe/close ALSO
+  // ASSERTS the final seq (#57) so the server finalizes READY only once all seqs
+  // 1..final_seq have folded.
   async function postChunk(blob, chunkSeq) {
     const params = new URLSearchParams({ label: label, seq: String(chunkSeq), ext: EXT, synthetic: 'true' });
     const url = '/scribe/ingest-chunk?' + params.toString();
@@ -242,11 +244,18 @@ APP_JS = r"""'use strict';
     try { if (recorder && recorder.state === 'recording') { recorder.stop(); } } catch (e) {}
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
     stopBtn.disabled = true;
-    // Drain every queued chunk POST, THEN an explicit /scribe/close (robust even
-    // if a final chunk's 200 was lost — the close finalizes to ready regardless).
+    // Drain every queued chunk POST, THEN an explicit /scribe/close ASSERTING the
+    // final seq (#57 "ready ⇒ complete"). This link runs AFTER every chunk link
+    // (each does `if(ok){seq=chunkSeq;}`), so `seq` here == the last accepted seq ==
+    // this client's asserted final (the read-seq-inside-the-chain discipline). The
+    // `finalSeq >= 1` guard keeps a zero-chunk start→immediate-stop on the legacy
+    // empty-close path (the server's >=1 check never 400s a legitimate empty close).
     chain = chain.then(async () => {
+      const finalSeq = seq;
+      let u = '/scribe/close?label=' + encodeURIComponent(label);
+      if (finalSeq >= 1) { u += '&final_seq=' + String(finalSeq); }
       try {
-        await fetch('/scribe/close?label=' + encodeURIComponent(label), {
+        await fetch(u, {
           method: 'POST', headers: { 'Authorization': 'Bearer ' + TOKEN }, cache: 'no-store',
         });
       } catch (e) { /* operator can re-close from status if needed */ }

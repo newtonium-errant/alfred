@@ -53,6 +53,12 @@ from typing import Any, Awaitable, Callable
 import structlog
 from aiohttp import web
 
+from alfred.scribe.close_manifest import (
+    CLOSE_SENTINEL_NAME,
+    read_close_manifest,
+    resolve_require_close_manifest,
+    write_close_manifest,
+)
 from alfred.scribe.config import ScribeConfig
 from alfred.scribe.identity import EncounterIdentityError, compute_encounter_id
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
@@ -83,7 +89,6 @@ ALLOWED_AUDIO_EXTS: frozenset[str] = frozenset({"wav", "ogg", "mp3", "m4a", "fla
 # the FILENAME; the route owns contiguity from the same source).
 _CHUNK_STEM_RE = re.compile(r"^chunk_(\d+)$")
 
-_CLOSED_SENTINEL = "_CLOSED"
 _META_SUFFIX = ".meta.json"
 
 INGEST_CHUNK_ROUTE = "/scribe/ingest-chunk"
@@ -309,6 +314,16 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
 
     enc_dir = Path(config.input_dir) / label
 
+    # #57 SEAL — once `_CLOSED` exists the encounter is sealed to NEW audio. A chunk
+    # after close is refused (409), eliminating the post-close-chunk path that could
+    # manufacture folded seqs BEYOND the promised final_seq. (Safe for the serial
+    # PWA: it never POSTs a chunk after /close — onstop is latched by `stopped` and
+    # /close is chained after the last chunk link.)
+    if (enc_dir / CLOSE_SENTINEL_NAME).exists():
+        log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
+                    reason="encounter_closed", encounter_id=encounter_id)
+        return _reject("encounter_closed", 409)
+
     # server-validated MONOTONIC / GAP-FREE seq (contract #3) — the next contiguous
     # value from the on-disk filenames (seq is authoritative from the FILENAME).
     existing = _existing_seqs(enc_dir)
@@ -352,8 +367,10 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
     )
 
     closed = _is_true(q.get("close"))
-    if closed:  # B3 — close-flag on the final chunk.
-        _atomic_write_text(enc_dir / _CLOSED_SENTINEL, "")
+    if closed:  # B3 — close-flag on the final chunk. THIS chunk IS the final, so
+        # the manifest's final_seq = this seq (trivially correct — gives the
+        # close-flag path the #57 structural completeness gate too).
+        write_close_manifest(enc_dir, seq)
 
     log.info(
         "scribe.ingest_web.chunk_written",
@@ -363,8 +380,17 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_close(request: web.Request) -> web.StreamResponse:
-    """``POST /scribe/close`` — write the ``_CLOSED`` sentinel so the encounter
-    finalizes to ``ready`` (B3). Query: ``label``."""
+    """``POST /scribe/close`` — seal the encounter (B3 + #57 close-manifest).
+
+    Query: ``label`` + (``final_seq`` — the client's asserted final seq). Writes the
+    versioned ``_CLOSED`` manifest so the checkpoint gate finalizes READY only once
+    seqs ``1..final_seq`` are ALL folded (structural "ready ⇒ complete").
+
+    STRICT (clinical / require): ``final_seq`` is REQUIRED — absent → 400, nothing
+    written (the encounter stays OPEN, can never reach READY). LEGACY (synthetic):
+    absent ``final_seq`` writes a manifest with the on-disk max (or a byte-identical
+    empty ``_CLOSED`` for a zero-chunk close). MONOTONIC write-once + consistency
+    belts guard against an adversarial 2nd close lowering the completeness bar."""
     config: ScribeConfig = request.app["scribe_config"]
     label = request.query.get("label", "")
     if not ENCOUNTER_LABEL_RE.fullmatch(label):
@@ -377,8 +403,59 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
     enc_dir = Path(config.input_dir) / label
     if not enc_dir.is_dir():
         return _reject("unknown_encounter", 404)
-    _atomic_write_text(enc_dir / _CLOSED_SENTINEL, "")
-    log.info("scribe.ingest_web.closed", encounter_id=encounter_id)
+
+    require = resolve_require_close_manifest(config)
+    raw_fs = request.query.get("final_seq")
+    sentinel = enc_dir / CLOSE_SENTINEL_NAME
+
+    if raw_fs is None or not raw_fs.strip():
+        if require:
+            # (a) STRICT + no final_seq → REFUSE, write NOTHING. The encounter stays
+            # OPEN (no sentinel) so it can never reach READY (constraint-5).
+            log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE,
+                        reason="final_seq_required", encounter_id=encounter_id)
+            return _reject("final_seq_required", 400)
+        # (b) LEGACY (not strict): manifest with the on-disk max, or empty-legacy
+        # _CLOSED for a zero-chunk close (byte-identical to the old behavior).
+        existing = _existing_seqs(enc_dir)
+        disk_max = existing[-1] if existing else 0
+        if disk_max >= 1:
+            write_close_manifest(enc_dir, disk_max)
+        else:
+            _atomic_write_text(sentinel, "")
+        log.info("scribe.ingest_web.closed", encounter_id=encounter_id,
+                 protocol=1, final_seq=disk_max)
+        return web.json_response({"encounter_id": encounter_id, "closed": True}, status=200)
+
+    # (c) final_seq PRESENT → validate + consistency + monotonic write-once.
+    try:
+        final_seq = int(raw_fs)
+    except (TypeError, ValueError):
+        log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE,
+                    reason="invalid_final_seq", encounter_id=encounter_id)
+        return _reject("invalid_final_seq", 400)
+    if final_seq < 1:
+        log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE,
+                    reason="invalid_final_seq", encounter_id=encounter_id)
+        return _reject("invalid_final_seq", 400)
+    # consistency belt: a final_seq BELOW the on-disk max contradicts gap-free-from-1
+    # (the legit tail-not-yet-landed case has final_seq > disk_max → never blocked).
+    existing = _existing_seqs(enc_dir)
+    if existing and final_seq < existing[-1]:
+        log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE,
+                    reason="final_seq_below_disk", encounter_id=encounter_id)
+        return _reject("final_seq_below_disk", 409)
+    # monotonic write-once: a 2nd /close can never LOWER the completeness bar.
+    existing_efs = None
+    if sentinel.exists():
+        existing_efs, _amb = read_close_manifest(sentinel, require=require)
+    if existing_efs is not None and final_seq < existing_efs:
+        log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE,
+                    reason="final_seq_lowered", encounter_id=encounter_id)
+        return _reject("final_seq_lowered", 409)
+    bar = max(existing_efs or 0, final_seq)
+    write_close_manifest(enc_dir, bar)
+    log.info("scribe.ingest_web.closed", encounter_id=encounter_id, protocol=2, final_seq=bar)
     return web.json_response({"encounter_id": encounter_id, "closed": True}, status=200)
 
 
@@ -398,7 +475,7 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
         return _reject("identity_unavailable", 500)
     enc_dir = Path(config.input_dir) / label
     existing = _existing_seqs(enc_dir)
-    closed = (enc_dir / _CLOSED_SENTINEL).exists()
+    closed = (enc_dir / CLOSE_SENTINEL_NAME).exists()
     state = "closed" if closed else ("recording" if existing else "pending")
     return web.json_response(
         {

@@ -57,6 +57,8 @@ STATE_FAILED = "failed"     # mid-pipeline exception (retriable until the cap)
 STATE_BUDGET_CAPPED = "budget_capped"   # regen over context budget; last-good draft kept, still folding
 STATE_HUMAN_EDITED = "human_edited"     # a human edited the draft; auto-evolution FROZEN (opt-in to resume)
 STATE_READY = "ready"                   # _CLOSED: draft complete, ready for attestation (attest stays orchestrator-only)
+# --- #57 close-manifest completeness state ----------------------------------
+STATE_INCOMPLETE = "incomplete"         # _CLOSED promised a final seq that never arrived past the grace — surfaced "incomplete — awaiting seq N". NOT ready, blocks the attest-invite like DRAFTED. RE-OPENABLE (if the missing chunk later folds → DRAFTED → re-evaluates → READY-with-tail). Deliberately OUT of _DONE_STATES.
 # --- P3-b3 attest-semantics state -------------------------------------------
 STATE_POST_ATTEST_AUDIO = "post_attest_audio"  # new audio arrived AFTER the draft was attested — REFUSED + surfaced (clinician may need to amend); the signed note is untouched
 

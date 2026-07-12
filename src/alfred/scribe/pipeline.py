@@ -37,6 +37,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,11 @@ import structlog
 from alfred.scribe import ledger as ledger_mod
 from alfred.scribe import stt as stt_mod
 from alfred.scribe.attestation import SCRIBE_DRAFTER_IDENTITY
+from alfred.scribe.close_manifest import (
+    CLOSE_SENTINEL_NAME,
+    read_close_manifest,
+    resolve_require_close_manifest,
+)
 from alfred.scribe.config import ScribeConfig
 from alfred.scribe.grounding import verify as verify_grounding
 from alfred.scribe.identity import compute_encounter_id
@@ -62,6 +68,7 @@ from alfred.scribe.state import (
     STATE_DRAFTED,
     STATE_FAILED,
     STATE_HUMAN_EDITED,
+    STATE_INCOMPLETE,
     STATE_POST_ATTEST_AUDIO,
     STATE_READY,
     STATE_REFUSED,
@@ -87,7 +94,9 @@ _AUDIO_EXTENSIONS = frozenset({".wav", ".ogg", ".mp3", ".m4a", ".flac", ".webm"}
 # ``_CLOSED`` sentinel file finalizes the encounter (no more chunks coming).
 _CHUNK_NAME_RE = re.compile(r"^chunk_(\d+)$")
 _META_SUFFIX = ".meta.json"
-_CLOSED_SENTINEL = "_CLOSED"
+# The `_CLOSED` sentinel NAME + its close-manifest contract are owned by the shared
+# ``close_manifest`` module (imported above) — the pipeline is the READER, the
+# ingest server the WRITER (no private-constant drift).
 # Settle signal: the ``.meta.json`` commit marker (written LAST by the recorder)
 # is the REQUIRED, deterministic settle signal — see ``is_chunk_settled`` (the
 # dead markerless size+mtime fallback was removed in the Gap-B audit fix).
@@ -371,6 +380,23 @@ class AccumResult:
     decode_failed: bool = False  # W2: a chunk failed to STT-decode → THIS encounter
                                  # held this pass, isolated (the sweep + other
                                  # encounters are unaffected)
+    # #57 close-manifest — the PROMISED completeness bar + the LEDGER-TRUTH folded set.
+    expected_final_seq: int | None = None  # the client's asserted final seq (from the _CLOSED manifest); None = legacy/no promise
+    close_ambiguous: bool = False          # strict mode + missing/malformed manifest → fail-closed, never READY
+    folded_seqs: frozenset[int] = frozenset()  # LEDGER-TRUTH (from chunk_provenance) — the seqs actually folded, NOT the pass-delta
+
+    @property
+    def promised_seq_pending(self) -> bool:
+        """#57: True iff the close PROMISE is not yet satisfied — the manifest was
+        ambiguous (fail-closed), OR seqs ``1..expected_final_seq`` are not ALL folded
+        (the LITERAL set-subset predicate, not a ``max>=N`` shortcut). Blocks the
+        READY finalize so a client that wrote ``_CLOSED`` before the final chunk
+        landed can never reach a premature READY."""
+        if self.close_ambiguous:
+            return True
+        if self.expected_final_seq is None:
+            return False
+        return not (self.folded_seqs >= frozenset(range(1, self.expected_final_seq + 1)))
 
     @property
     def pending_tail(self) -> bool:
@@ -541,10 +567,24 @@ def accumulate_encounter(
             result.folded += 1
         expected += 1
 
-    if (encounter_dir / _CLOSED_SENTINEL).exists():
+    sentinel = encounter_dir / CLOSE_SENTINEL_NAME
+    if sentinel.exists():
         transcript.closed = True
+        # #57 — read the close manifest's PROMISED final seq (+ strict ambiguity).
+        efs, amb = read_close_manifest(
+            sentinel, require=resolve_require_close_manifest(config),
+        )
+        result.expected_final_seq = efs
+        result.close_ambiguous = amb
     result.closed = transcript.closed
     result.segments = len(transcript.segments)
+    # #57 LEDGER-TRUTH folded set — the seqs ACTUALLY folded (from the persisted
+    # ledger), NOT the pass-delta. A release sweep that folds nothing new must still
+    # report the full folded set so a complete-but-just-closed encounter finalizes
+    # (fixes the pass-delta wedge).
+    result.folded_seqs = frozenset(
+        p.get("seq") for p in transcript.chunk_provenance if p.get("seq") is not None
+    )
 
     # Persist the authoritative ledger (atomic) BEFORE any downstream draft
     # (none in P3-b1). Intentionally-left-blank: always log the pass so an idle
@@ -573,6 +613,7 @@ _CHECKPOINT_COUNT_KEY = {
     "human_edited": "human_edited",
     "ready": "ready",
     "post_attest_audio": "post_attest_audio",
+    "incomplete": "incomplete",   # #57 — closed but the promised tail hasn't folded
 }
 
 
@@ -705,24 +746,69 @@ async def _regen_checkpoint(
     return "drafted"
 
 
+def _maybe_mark_incomplete(
+    state: ScribeState, encounter_id: str, encounter_dir: Path,
+    config: ScribeConfig, cur, *, expected_final_seq: int | None,
+    folded_seqs: frozenset[int],
+) -> bool:
+    """#57 LAYERED terminal (grace-gated, DEFAULT-OFF). Once the ``_CLOSED`` sentinel
+    is older than ``config.incomplete_grace_s``, mark the encounter STATE_INCOMPLETE
+    (operator-visible "incomplete — awaiting seq N"). DEFAULT grace 0 → DISABLED: the
+    ALWAYS-ON primary safety (stays DRAFTED + ``close_awaiting_promised_seq`` every
+    sweep) fully satisfies the invariant. Uses the sentinel mtime as the close-clock
+    (no new ScribeState field). Runs OUTSIDE the ``cur.state==STATE_DRAFTED`` guard so
+    it ALSO fires for an encounter closed before ANY chunk folded (``cur`` is None).
+    Idempotent; RE-OPENABLE (if the tail later folds → DRAFTED → re-evaluates).
+    Returns True iff it transitioned to STATE_INCOMPLETE."""
+    grace = getattr(config, "incomplete_grace_s", 0) or 0
+    if grace <= 0:
+        return False                          # terminal disabled (default)
+    if cur is not None and cur.state == STATE_INCOMPLETE:
+        return False                          # already marked (idempotent)
+    try:
+        closed_at = (encounter_dir / CLOSE_SENTINEL_NAME).stat().st_mtime
+    except OSError:
+        return False
+    if (time.time() - closed_at) <= grace:
+        return False                          # still within grace
+    state.set(encounter_id, state=STATE_INCOMPLETE)
+    log.warning(
+        "scribe.pipeline.close_incomplete",
+        encounter_id=encounter_id,
+        expected_final_seq=expected_final_seq,
+        folded_through=max(folded_seqs, default=0),
+        detail="_CLOSED promised a final seq that did not arrive within "
+               "incomplete_grace_s — marked INCOMPLETE (RE-OPENABLE if the "
+               "missing chunk folds later).",
+    )
+    return True
+
+
 async def checkpoint_encounter(
     encounter_dir: Path, *, encounter_id: str, config: ScribeConfig,
     state: ScribeState, vault_path: Path, did_fold: bool, closed: bool,
     pending_tail: bool = False,
+    expected_final_seq: int | None = None,
+    folded_seqs: frozenset[int] = frozenset(),
+    close_ambiguous: bool = False,
 ) -> str:
     """The checkpoint trigger (scribe P3-b2). After P3-b1 folds a chunk, evolve
-    the ai_draft in place; the ``_CLOSED`` sentinel finalizes to a ``ready``
-    state (close does NOT attest — attest stays orchestrator-only). A
-    ``human_edited`` encounter is SKIPPED: the ledger keeps accumulating but the
-    draft is never auto-touched until the operator opts in.
+    the ai_draft in place; ``_CLOSED`` finalizes to ``ready`` (close does NOT
+    attest — attest stays orchestrator-only). A ``human_edited`` encounter is
+    SKIPPED.
 
-    Gap-A (medico-legal): ``pending_tail`` (this pass folded SHORT of the
-    discovered tail — a held/unsettled/gapped/refused/decode-failed chunk remains)
-    BLOCKS the ``ready`` finalize even when ``_CLOSED`` is present. ``ready`` is
-    the attest-invite, so it must mean the FULL transcript is folded — a signed
-    note must never silently miss its tail. STAYS DRAFTED (with an explicit
-    close-pending-tail signal) until the tail settles + folds on a later sweep,
-    which THEN finalizes ``ready`` with the tail included."""
+    "ready ⇒ complete" (Gap-A + #57) — the finalize is BLOCKED while the encounter
+    is INCOMPLETE, i.e. ANY of:
+      * ``pending_tail`` (Gap-A) — this pass folded SHORT of the DISCOVERED tail;
+      * ``close_ambiguous`` (#57 strict) — clinical/require + a missing/malformed
+        close manifest (fail-closed);
+      * PROMISED-pending (#57 structural) — the ``_CLOSED`` manifest promised
+        ``final_seq=N`` but seqs ``1..N`` are not ALL folded (the LITERAL set-subset
+        predicate — a client that wrote ``_CLOSED`` before the final chunk landed
+        can't reach a premature READY).
+    Incomplete → STAY DRAFTED/INCOMPLETE (never READY) with a reason-specific ILB;
+    the test lives OUTSIDE the DRAFTED guard so it fires even for a never-drafted
+    encounter. RE-OPENABLE: the tail folds later → DRAFTED → finalizes READY-with-tail."""
     prior = state.get(encounter_id)
     if prior and prior.state == STATE_HUMAN_EDITED:
         log.info(
@@ -738,19 +824,18 @@ async def checkpoint_encounter(
             state=state, vault_path=vault_path,
         )
 
-    # _CLOSED finalize — promote ONLY a clean, COMPLETE current draft to `ready`. A
-    # capped / frozen / refused encounter keeps its distinct state (the draft is
-    # not the full transcript, or is awaiting opt-in) — close does not paper over
-    # that. Gap-A: ALSO refuse to finalize while a tail chunk is still pending.
     if closed:
         cur = state.get(encounter_id)
-        if cur and cur.state == STATE_DRAFTED:
+        # PROMISED-pending — the LITERAL "all seqs 1..N folded" set-subset (NOT a
+        # max>=N shortcut, so the guarantee never silently rides fold-contiguity).
+        promised_pending = expected_final_seq is not None and not (
+            folded_seqs >= frozenset(range(1, expected_final_seq + 1))
+        )
+        incomplete = pending_tail or close_ambiguous or promised_pending
+        if incomplete:
+            # reason-specific ILB (priority: pending_tail keeps the existing
+            # single-log test green; ambiguous is a fail-closed WARNING).
             if pending_tail:
-                # _CLOSED seen but the fold stopped short of the tail (a held /
-                # unsettled / gapped / refused / decode-failed chunk remains). Do
-                # NOT finalize — ready must mean COMPLETE. Stay DRAFTED; a later
-                # sweep folds the tail then finalizes. ILB: distinguish
-                # waiting-for-tail from broken.
                 log.info(
                     "scribe.pipeline.close_pending_tail",
                     encounter_id=encounter_id,
@@ -758,13 +843,37 @@ async def checkpoint_encounter(
                            "held/unsettled/gapped — STAYING DRAFTED until the tail "
                            "folds (ready must mean the full transcript is signed)",
                 )
-                return outcome
+            elif close_ambiguous:
+                log.warning(
+                    "scribe.pipeline.close_manifest_ambiguous",
+                    encounter_id=encounter_id,
+                    detail="strict mode + a missing/malformed close manifest — "
+                           "FAIL-CLOSED, never READY until a valid final_seq is "
+                           "asserted and all seqs 1..final_seq have folded",
+                )
+            else:  # promised_pending
+                log.info(
+                    "scribe.pipeline.close_awaiting_promised_seq",
+                    encounter_id=encounter_id,
+                    expected_final_seq=expected_final_seq,
+                    folded_through=max(folded_seqs, default=0),
+                    detail="_CLOSED promised final_seq but not all seqs 1..final_seq "
+                           "have folded — STAYING DRAFTED (ready must mean complete)",
+                )
+            if _maybe_mark_incomplete(
+                state, encounter_id, encounter_dir, config, cur,
+                expected_final_seq=expected_final_seq, folded_seqs=folded_seqs,
+            ):
+                return "incomplete"
+            return outcome                     # STAY DRAFTED — never READY
+        # COMPLETE — promote ONLY a clean current draft to `ready`.
+        if cur and cur.state == STATE_DRAFTED:
             state.set(encounter_id, state=STATE_READY)
             log.info(
                 "scribe.pipeline.encounter_ready",
                 encounter_id=encounter_id,
-                detail="_CLOSED — draft complete (tail folded), ready for "
-                       "attestation (attest stays orchestrator-only)",
+                detail="_CLOSED — draft complete (all promised seqs folded), ready "
+                       "for attestation (attest stays orchestrator-only)",
             )
             outcome = "ready"
     return outcome
@@ -793,6 +902,7 @@ async def run_sweep(
         # P3-b2/b3 checkpoint outcomes
         "checkpoint_drafted": 0, "budget_capped": 0, "human_edited": 0,
         "ready": 0, "post_attest_audio": 0,
+        "incomplete": 0,   # #57 — closed but the promised tail hasn't folded
     }
 
     if not input_dir.is_dir():
@@ -844,7 +954,10 @@ async def run_sweep(
                     enc_dir, encounter_id=r.encounter_id, config=config,
                     state=state, vault_path=vault_path,
                     did_fold=r.folded > 0, closed=r.closed,
-                    pending_tail=r.pending_tail,   # Gap-A: block ready finalize on an unfolded tail
+                    pending_tail=r.pending_tail,   # Gap-A: block ready finalize on an unfolded DISCOVERED tail
+                    expected_final_seq=r.expected_final_seq,   # #57 the promised bar
+                    folded_seqs=r.folded_seqs,                 # #57 ledger-truth folded set
+                    close_ambiguous=r.close_ambiguous,         # #57 strict fail-closed
                 )
                 key = _CHECKPOINT_COUNT_KEY.get(outcome)
                 if key:

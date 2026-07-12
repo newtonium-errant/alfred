@@ -25,12 +25,15 @@ import structlog
 
 import alfred.distiller.backends.ollama as ollama_mod
 import alfred.scribe.pipeline as pipeline_mod
+import time as _time
+
 from alfred.scribe import (
     ContextBudgetExceeded,
     GROUNDING_UNVERIFIED,
     STATE_BUDGET_CAPPED,
     STATE_DRAFTED,
     STATE_HUMAN_EDITED,
+    STATE_INCOMPLETE,
     STATE_POST_ATTEST_AUDIO,
     STATE_READY,
     ScribeState,
@@ -43,6 +46,7 @@ from alfred.scribe import (
     load_ledger,
     save_ledger,
 )
+from alfred.scribe.close_manifest import write_close_manifest
 from alfred.scribe.config import load_from_unified
 from alfred.scribe.notegen import NoteGenError, _NOTEGEN_OLLAMA_OPTIONS
 from alfred.vault.ops import vault_read
@@ -94,7 +98,8 @@ def _write_chunk(enc_dir, seq, lines):
 
 
 def _checkpoint(enc_dir, *, config, state, vault):
-    """Mirror run_sweep's per-encounter logic: accumulate → checkpoint."""
+    """Mirror run_sweep's per-encounter logic: accumulate → checkpoint (threads the
+    #57 close-manifest fields exactly as run_sweep does)."""
     r = accumulate_encounter(enc_dir, config=config)
     outcome = None
     if r.folded > 0 or r.closed:
@@ -102,6 +107,9 @@ def _checkpoint(enc_dir, *, config, state, vault):
             enc_dir, encounter_id=r.encounter_id, config=config,
             state=state, vault_path=vault, did_fold=r.folded > 0, closed=r.closed,
             pending_tail=r.pending_tail,   # Gap-A: block ready-finalize on an unfolded tail
+            expected_final_seq=r.expected_final_seq,   # #57 promised bar
+            folded_seqs=r.folded_seqs,                 # #57 ledger-truth
+            close_ambiguous=r.close_ambiguous,         # #57 strict fail-closed
         ))
     return r, outcome
 
@@ -686,3 +694,136 @@ def test_missing_prompt_eval_count_fails_loud(monkeypatch):
             asyncio.run(generate_structured(t, config=_config()))
     ev = [c for c in caps if c.get("event") == "scribe.notegen.missing_prompt_eval_count"]
     assert len(ev) == 1 and ev[0]["source_id"] == "enc-nopec"   # obs pin (#9)
+
+
+# ---------------------------------------------------------------------------
+# #57 — close-manifest structural "ready ⇒ complete" invariant
+# ---------------------------------------------------------------------------
+
+def test_57_structural_promised_seq_blocks_premature_ready(tmp_path, monkeypatch):
+    # THE #57 core (structural mutation-bind): chunk 1 settled + folded, the _CLOSED
+    # manifest PROMISES final_seq=3, but chunks 2 & 3 never land → the encounter STAYS
+    # DRAFTED (never premature READY) + exactly one close_awaiting_promised_seq
+    # (expected_final_seq=3, folded_through=1). MUTATION-BIND: flip `>=`→`<=`, delete
+    # the promised_pending conjunct, or use a max>=N shortcut → finalizes READY → RED.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-57a"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    write_close_manifest(enc, 3)                                  # promise 3, only 1 on disk
+    with structlog.testing.capture_logs() as caps:
+        r, outcome = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    assert r.expected_final_seq == 3 and r.folded_seqs == frozenset({1})
+    assert r.promised_seq_pending is True
+    assert outcome != "ready"
+    assert state.get(r.encounter_id).state == STATE_DRAFTED       # NOT ready — promise unmet
+    aw = [c for c in caps if c.get("event") == "scribe.pipeline.close_awaiting_promised_seq"]
+    assert len(aw) == 1 and aw[0]["expected_final_seq"] == 3 and aw[0]["folded_through"] == 1
+
+
+def test_57_strict_checkpoint_empty_manifest_is_ambiguous_never_ready(tmp_path, monkeypatch):
+    # STRICT checkpoint: clinical mode + an EMPTY legacy _CLOSED on disk → read with
+    # require=True → (None, ambiguous=True) → close_ambiguous → never READY, a
+    # close_manifest_ambiguous WARNING. MUTATION-BIND: forcing require=False →
+    # premature READY.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-57b"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    (enc / "_CLOSED").write_text("", encoding="utf-8")           # empty legacy close
+    with structlog.testing.capture_logs() as caps:
+        r, outcome = _checkpoint(enc, config=_config(mode="clinical"), state=state, vault=vault)
+    assert r.close_ambiguous is True
+    assert outcome != "ready" and state.get(r.encounter_id).state == STATE_DRAFTED
+    assert any(c.get("event") == "scribe.pipeline.close_manifest_ambiguous" for c in caps)
+    # CONTRAST: the SAME empty-_CLOSED content is legacy-tolerant under SYNTHETIC
+    # (require=False) → finalizes READY (a fresh encounter so the draft triggers).
+    enc2 = tmp_path / "inbox" / "enc-57b2"
+    state2 = ScribeState(tmp_path / "state2.json")
+    _write_chunk(enc2, 1, ["Patient reports chest pain."])
+    (enc2 / "_CLOSED").write_text("", encoding="utf-8")
+    r2, outcome2 = _checkpoint(enc2, config=_config(mode="synthetic"), state=state2, vault=vault)
+    assert outcome2 == "ready" and state2.get(r2.encounter_id).state == STATE_READY
+
+
+def test_57_reopen_e2e_promised_tail_lands_then_ready_with_tail(tmp_path, monkeypatch):
+    # RE-OPEN e2e (clinical): close promises final_seq=2 with only chunk 1 folded →
+    # DRAFTED + awaiting; chunk 2's marker lands → next sweep folds it, folded_seqs
+    # {1,2} >= {1,2} → READY, both chunks in the finalized ledger.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-57c"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config(mode="clinical")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    write_close_manifest(enc, 2)                                  # promise 2, only 1 folded
+    r1, _ = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert state.get(r1.encounter_id).state == STATE_DRAFTED      # awaiting seq 2
+    _write_chunk(enc, 2, ["Denies fever."])                       # the promised tail lands
+    r2, outcome = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert r2.folded_seqs == frozenset({1, 2}) and r2.promised_seq_pending is False
+    assert outcome == "ready" and state.get(r2.encounter_id).state == STATE_READY
+    assert len(load_ledger(ledger_path(enc, r2.encounter_id)).chunk_provenance) == 2
+
+
+def test_57_ledger_truth_release_sweep_folds_nothing_still_ready(tmp_path, monkeypatch):
+    # LEDGER-TRUTH (binds the pass-delta fix): fold the FULL tail on sweep 1 (no
+    # close), then close on sweep 2 which folds NOTHING new → still READY because
+    # folded_seqs is read from chunk_provenance, not the pass-delta. MUTATION-BIND:
+    # compute folded_seqs from the pass-delta → wedges DRAFTED forever → RED.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-57d"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config()
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    _write_chunk(enc, 2, ["Denies fever."])
+    r1, _ = _checkpoint(enc, config=cfg, state=state, vault=vault)  # folds both, NO close
+    assert r1.folded == 2 and state.get(r1.encounter_id).state == STATE_DRAFTED
+    write_close_manifest(enc, 2)                                    # close on sweep 2
+    r2, outcome = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert r2.folded == 0 and r2.folded_seqs == frozenset({1, 2})  # LEDGER-TRUTH, not pass-delta
+    assert outcome == "ready" and state.get(r2.encounter_id).state == STATE_READY
+
+
+def test_57_timeout_marks_incomplete_even_when_never_drafted(tmp_path, monkeypatch):
+    # TIMEOUT-WHEN-NEVER-DRAFTED (binds the outside-the-DRAFTED-guard fix): close
+    # promises final_seq=2 BEFORE any chunk folds (cur state is None), backdate the
+    # _CLOSED mtime beyond incomplete_grace_s → checkpoint sets STATE_INCOMPLETE and
+    # emits close_incomplete EVEN THOUGH state was None. MUTATION-BIND: move
+    # _maybe_mark_incomplete inside `if cur and cur.state==STATE_DRAFTED` → no
+    # transition, no log → RED.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-57e"
+    enc.mkdir(parents=True, exist_ok=True)
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config()
+    cfg.incomplete_grace_s = 1                                    # opt into the terminal
+    write_close_manifest(enc, 2)                                  # closed before ANY chunk
+    os.utime(enc / "_CLOSED", (_time.time() - 100, _time.time() - 100))  # backdate past the grace
+    with structlog.testing.capture_logs() as caps:
+        r, outcome = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert state.get(r.encounter_id) is not None                 # a state row was created
+    assert state.get(r.encounter_id).state == STATE_INCOMPLETE   # even though cur was None
+    assert outcome == "incomplete"
+    inc = [c for c in caps if c.get("event") == "scribe.pipeline.close_incomplete"]
+    assert len(inc) == 1 and inc[0]["expected_final_seq"] == 2 and inc[0]["folded_through"] == 0
+
+
+def test_57_malformed_manifest_fail_closed_never_ready(tmp_path, monkeypatch):
+    # MALFORMED-MANIFEST fail-closed: a non-empty unparseable _CLOSED → (None,
+    # ambiguous=True) regardless of require → never READY + close_manifest_ambiguous.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-57f"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    (enc / "_CLOSED").write_text("not-json{", encoding="utf-8")  # garbage
+    with structlog.testing.capture_logs() as caps:
+        r, outcome = _checkpoint(enc, config=_config(mode="synthetic"), state=state, vault=vault)
+    assert r.close_ambiguous is True                             # fail-closed even in synthetic
+    assert outcome != "ready" and state.get(r.encounter_id).state == STATE_DRAFTED
+    assert any(c.get("event") == "scribe.pipeline.close_manifest_ambiguous" for c in caps)

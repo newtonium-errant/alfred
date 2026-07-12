@@ -805,3 +805,97 @@ def test_real_decode_e2e_through_route(tmp_path, monkeypatch):
     enc_dir = Path(cfg.input_dir) / _LABEL
     eid = compute_encounter_id(_LABEL, salt=_SALT)
     assert load_ledger(ledger_path(enc_dir, eid)) is not None   # decode path completed, ledger written
+
+
+# ---------------------------------------------------------------------------
+# #57 — close-manifest route (strict-require, seal, monotonic/consistency belts)
+# ---------------------------------------------------------------------------
+
+def test_57_strict_route_requires_final_seq(tmp_path):
+    # STRICT (clinical): POST /scribe/close with NO final_seq → 400 final_seq_required
+    # and NOTHING written (the encounter stays OPEN → can never reach READY).
+    cfg = _config(tmp_path, mode="clinical")
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            await _post_chunk(s, base, seq=1)                      # create the enc dir
+            async with s.post(base + iw.CLOSE_ROUTE, params={"label": _LABEL},
+                             headers=_auth()) as r:
+                return r.status, await r.json()
+
+    st, payload = asyncio.run(_go())
+    assert st == 400 and payload["error"] == "final_seq_required"
+    assert not (Path(cfg.input_dir) / _LABEL / "_CLOSED").exists()   # nothing written
+
+
+def test_57_seal_rejects_chunk_after_close(tmp_path):
+    # SEAL: once _CLOSED exists a new chunk POST is refused (409 encounter_closed),
+    # so no post-close chunk can manufacture folded seqs beyond the promised final.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            await _post_chunk(s, base, seq=1)
+            async with s.post(base + iw.CLOSE_ROUTE,
+                             params={"label": _LABEL, "final_seq": "1"}, headers=_auth()):
+                pass
+            st, payload, _ = await _post_chunk(s, base, seq=2)     # after close → sealed
+            return st, payload
+
+    st, payload = asyncio.run(_go())
+    assert st == 409 and payload["error"] == "encounter_closed"
+    assert not (Path(cfg.input_dir) / _LABEL / "chunk_2.webm").exists()  # chunk not written
+
+
+def test_57_close_manifest_written_with_final_seq(tmp_path):
+    # A /close asserting final_seq writes the versioned manifest into _CLOSED.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            await _post_chunk(s, base, seq=1)
+            async with s.post(base + iw.CLOSE_ROUTE,
+                             params={"label": _LABEL, "final_seq": "3"}, headers=_auth()) as r:
+                return r.status
+
+    assert asyncio.run(_go()) == 200
+    import json as _json
+    manifest = _json.loads((Path(cfg.input_dir) / _LABEL / "_CLOSED").read_text())
+    assert manifest == {"protocol": 2, "final_seq": 3}            # promise the tail (>disk)
+
+
+def test_57_monotonic_and_consistency_belts(tmp_path):
+    # MONOTONIC / consistency belts on /close.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            await _post_chunk(s, base, seq=1)
+            await _post_chunk(s, base, seq=2)                     # disk max = 2
+            # final_seq BELOW the on-disk max → 409 final_seq_below_disk.
+            async with s.post(base + iw.CLOSE_ROUTE,
+                             params={"label": _LABEL, "final_seq": "1"}, headers=_auth()) as r:
+                out["below_disk"] = (r.status, (await r.json())["error"])
+            # legitimate tail-not-yet-landed (final_seq > disk max) → accepted.
+            async with s.post(base + iw.CLOSE_ROUTE,
+                             params={"label": _LABEL, "final_seq": "5"}, headers=_auth()) as r:
+                out["above_disk"] = r.status
+            # a 2nd close LOWERING the bar → 409 final_seq_lowered.
+            async with s.post(base + iw.CLOSE_ROUTE,
+                             params={"label": _LABEL, "final_seq": "3"}, headers=_auth()) as r:
+                out["lowered"] = (r.status, (await r.json())["error"])
+            # invalid (non-int) → 400.
+            async with s.post(base + iw.CLOSE_ROUTE,
+                             params={"label": _LABEL, "final_seq": "abc"}, headers=_auth()) as r:
+                out["invalid"] = (r.status, (await r.json())["error"])
+        return out
+
+    out = asyncio.run(_go())
+    assert out["below_disk"] == (409, "final_seq_below_disk")
+    assert out["above_disk"] == 200
+    assert out["lowered"] == (409, "final_seq_lowered")
+    assert out["invalid"] == (400, "invalid_final_seq")
+    # the bar held at 5 (the accepted value), never lowered to 3.
+    import json as _json
+    assert _json.loads((Path(cfg.input_dir) / _LABEL / "_CLOSED").read_text())["final_seq"] == 5
