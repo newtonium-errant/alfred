@@ -224,6 +224,9 @@ def test_load_credentials_refreshes_expired_token(tmp_path):
     with patch(
         "alfred.integrations.gcal._import_google",
         return_value=(Credentials, Request, MagicMock(), MagicMock()),
+    ), patch(
+        "alfred.integrations.gcal._import_httplib2_transport",
+        return_value=_FAKE_TRANSPORT,
     ):
         client = GCalClient(
             credentials_path=tmp_path / "creds.json",
@@ -268,6 +271,9 @@ def test_load_credentials_refresh_failure_message_acknowledges_transient(tmp_pat
     with patch(
         "alfred.integrations.gcal._import_google",
         return_value=(Credentials, Request, MagicMock(), MagicMock()),
+    ), patch(
+        "alfred.integrations.gcal._import_httplib2_transport",
+        return_value=_FAKE_TRANSPORT,
     ):
         client = GCalClient(
             credentials_path=tmp_path / "creds.json",
@@ -289,13 +295,15 @@ def test_load_credentials_refresh_failure_message_acknowledges_transient(tmp_pat
 # ---------------------------------------------------------------------------
 
 
-# Faithful fakes for the two libs ``_import_authorized_http`` returns. Mirror
-# the REAL attribute surface (verified against google-auth-httplib2 0.31.2 +
-# httplib2: ``AuthorizedHttp(creds, http=X)`` stores ``.http = X``;
-# ``httplib2.Http(timeout=T)`` stores ``.timeout = T``). Keeping the pin
-# hermetic means it runs even in an env without the ``gcal`` extra installed
-# (the rest of this module already mocks ``_import_google`` for the same
-# reason) — no ``importorskip`` gate on a hardening regression pin.
+# Faithful fakes for the libs ``_import_httplib2_transport`` returns
+# ``(AuthorizedHttp, Request, httplib2)``. Mirror the REAL attribute surface
+# (verified against google-auth-httplib2 0.31.2 + httplib2 + google-auth
+# 2.50.0: ``AuthorizedHttp(creds, http=X)`` stores ``.http = X``;
+# ``httplib2.Http(timeout=T)`` stores ``.timeout = T``;
+# ``google_auth_httplib2.Request(http)`` stores ``.http = http``). Keeping the
+# pins hermetic means they run even in an env without the ``gcal`` extra
+# installed (the rest of this module already mocks ``_import_google`` for the
+# same reason) — no ``importorskip`` gate on a hardening regression pin.
 class _FakeHttp:
     def __init__(self, timeout=None):
         self.timeout = timeout
@@ -309,6 +317,15 @@ class _FakeAuthorizedHttp:
     def __init__(self, credentials, http=None):
         self.credentials = credentials
         self.http = http
+
+
+class _FakeRequest:
+    """Mirror of ``google_auth_httplib2.Request(http)`` — stores ``.http``."""
+    def __init__(self, http):
+        self.http = http
+
+
+_FAKE_TRANSPORT = (_FakeAuthorizedHttp, _FakeRequest, _FakeHttplib2)
 
 
 def test_service_obj_attaches_socket_timeout(tmp_path):
@@ -325,8 +342,8 @@ def test_service_obj_attaches_socket_timeout(tmp_path):
         gcal_mod, "_import_google",
         return_value=(MagicMock(), MagicMock(), MagicMock(), build_mock),
     ), patch.object(
-        gcal_mod, "_import_authorized_http",
-        return_value=(_FakeAuthorizedHttp, _FakeHttplib2),
+        gcal_mod, "_import_httplib2_transport",
+        return_value=_FAKE_TRANSPORT,
     ), patch.object(
         gcal_mod.GCalClient, "_load_credentials", return_value=fake_creds,
     ):
@@ -369,8 +386,8 @@ def test_service_obj_caches_built_service(tmp_path):
         gcal_mod, "_import_google",
         return_value=(MagicMock(), MagicMock(), MagicMock(), build_mock),
     ), patch.object(
-        gcal_mod, "_import_authorized_http",
-        return_value=(_FakeAuthorizedHttp, _FakeHttplib2),
+        gcal_mod, "_import_httplib2_transport",
+        return_value=_FAKE_TRANSPORT,
     ), patch.object(
         gcal_mod.GCalClient, "_load_credentials", return_value=object(),
     ):
@@ -383,6 +400,51 @@ def test_service_obj_caches_built_service(tmp_path):
 
     assert first is second
     build_mock.assert_called_once()
+
+
+def test_refresh_uses_socket_timeout_transport(tmp_path):
+    """FIX A (#61): the OAuth token refresh runs over the SAME explicit
+    socket-timeout transport as the API calls — ``google_auth_httplib2.Request``
+    wrapping ``httplib2.Http(timeout=GCAL_HTTP_TIMEOUT_S)``, NOT the
+    requests-backed ``google.auth.transport.requests.Request`` whose google-auth
+    default is ~120s — so a hung token endpoint can't pin a to_thread worker on
+    the cold/expiry path past the phase deadline."""
+    from alfred.integrations import gcal as gcal_mod
+    from alfred.integrations.gcal import GCalClient
+
+    token_path = tmp_path / "token.json"
+    token_path.write_text(json.dumps({
+        "token": "old", "refresh_token": "rt",
+        "client_id": "id", "client_secret": "sec",
+    }), encoding="utf-8")
+
+    fake_creds = MagicMock()
+    fake_creds.valid = False
+    fake_creds.expired = True
+    fake_creds.refresh_token = "rt"
+    fake_creds.to_json.return_value = "{}"
+
+    Credentials = MagicMock()
+    Credentials.from_authorized_user_file.return_value = fake_creds
+
+    with patch.object(
+        gcal_mod, "_import_google",
+        return_value=(Credentials, MagicMock(), MagicMock(), MagicMock()),
+    ), patch.object(
+        gcal_mod, "_import_httplib2_transport",
+        return_value=_FAKE_TRANSPORT,
+    ):
+        client = GCalClient(
+            credentials_path=tmp_path / "creds.json",
+            token_path=token_path,
+        )
+        client._load_credentials()
+
+    fake_creds.refresh.assert_called_once()
+    refresh_request = fake_creds.refresh.call_args.args[0]
+    # It's the httplib2-backed Request (our fake), carrying the bounded socket.
+    assert isinstance(refresh_request, _FakeRequest)
+    assert refresh_request.http.timeout == gcal_mod.GCAL_HTTP_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------

@@ -555,6 +555,21 @@ async def test_gcal_sync_non_gcalerror_post_commit_returns_created(app_factory):
     assert "gcal_event_id" not in fm.metadata
 
 
+def test_gcal_phase_deadline_bounds_two_phases_under_client_timeout():
+    """PRIMARY guard for the 2026-07-09 propose_event incident (#61 FIX B):
+    the two blocking GCal phases (conflict-scan + create-sync), each bounded by
+    ``_GCAL_PHASE_DEADLINE_S``, must together stay under the peer client's
+    per-attempt read timeout ``_REQUEST_TIMEOUT``. If they don't, a
+    slow-but-committed sync breaches the client deadline and the client's retry
+    lands on the 409 already_exists path while the create actually succeeded —
+    the create-succeeded-but-client-saw-error class. This coupling lives only
+    in comments at both sites; pin it so a future bump of the 6s deadline that
+    re-opens the window fails here instead of in production."""
+    from alfred.transport.client import _REQUEST_TIMEOUT
+
+    assert 2 * peer_handlers._GCAL_PHASE_DEADLINE_S < _REQUEST_TIMEOUT
+
+
 async def test_gcal_sync_timeout_returns_committed_success(app_factory, monkeypatch):  # type: ignore[no-untyped-def]
     """Class (2), THE incident: a slow-but-successful GCal sync exceeds the
     server-side deadline → the handler still returns the committed 201 with

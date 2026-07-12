@@ -30,8 +30,9 @@ Architecture:
     that take a calendar_id are list_events (no side effects) and
     create_event (which we never call against primary in any code path).
   * **Token refresh handled by google-auth** — load saved token JSON,
-    if expired call ``Credentials.refresh(Request())``, re-write to
-    disk on success.
+    if expired call ``Credentials.refresh(request)`` over a socket-timeout-
+    bounded ``google_auth_httplib2.Request`` (see ``GCAL_HTTP_TIMEOUT_S``),
+    re-write to disk on success.
 
 SDK quirks centralized here (per ``feedback_sdk_quirk_centralization.md``):
   * ``InstalledAppFlow.run_local_server(port=0)`` for the one-time
@@ -68,14 +69,18 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
-# Socket-level timeout (seconds) on the googleapiclient transport. The
-# discovery ``build()`` + OAuth refresh + ``list_events`` / ``create_event``
-# calls are synchronous and blocking; the propose-create handler runs them in
-# ``asyncio.to_thread`` (per-phase deadline ``_GCAL_PHASE_DEADLINE_S = 6s`` in
-# ``transport/peer_handlers.py``). Without a socket timeout a hung Google
-# socket blocks the underlying ``httplib2`` read forever, pinning a
-# ThreadPoolExecutor worker for minutes past that soft deadline. Bounded
-# below the transport client's per-attempt read timeout
+# Socket-level timeout (seconds) applied to every blocking Google I/O path:
+# the discovery ``build()`` + ``list_events`` / ``create_event`` API calls
+# (via the ``AuthorizedHttp`` in ``_service_obj``) AND the OAuth token refresh
+# (via the ``google_auth_httplib2.Request`` in ``_load_credentials`` — the
+# requests-backed ``google.auth.transport.requests.Request`` would otherwise
+# fall back to google-auth's ~120s default and leave the cold/expiry path
+# unbounded). All are synchronous and blocking; the propose-create handler
+# runs them in ``asyncio.to_thread`` (per-phase deadline
+# ``_GCAL_PHASE_DEADLINE_S = 6s`` in ``transport/peer_handlers.py``). Without a
+# socket timeout a hung Google socket blocks the underlying ``httplib2`` read
+# forever, pinning a ThreadPoolExecutor worker for minutes past that soft
+# deadline. Bounded below the transport client's per-attempt read timeout
 # (``transport/client.py`` ``_REQUEST_TIMEOUT = 15s``) so the socket errors
 # out before the peer client times out and retries.
 GCAL_HTTP_TIMEOUT_S = 10.0
@@ -203,16 +208,25 @@ def _import_google() -> tuple[Any, Any, Any, Any]:
     return Credentials, Request, InstalledAppFlow, build
 
 
-def _import_authorized_http() -> tuple[Any, Any]:
-    """Import ``AuthorizedHttp`` + ``httplib2`` for the timeout-bounded transport.
+def _import_httplib2_transport() -> tuple[Any, Any, Any]:
+    """Import the httplib2-backed Google transport pieces we use for
+    socket-timeout-bounded I/O: ``(AuthorizedHttp, Request, httplib2)``.
 
-    Returned tuple: ``(AuthorizedHttp, httplib2)``. Kept separate from
-    :func:`_import_google` so only the service-build path (which needs an
-    explicit-socket-timeout http, see :data:`GCAL_HTTP_TIMEOUT_S`) requires
-    these libs; the authorize / refresh paths don't.
+    * ``AuthorizedHttp`` wraps creds for the service build (``_service_obj``).
+    * ``Request`` is the ``google_auth_httplib2`` token-refresh transport —
+      NOT ``google.auth.transport.requests.Request`` (whose google-auth
+      default socket timeout is ~120s). Using the httplib2 variant lets the
+      refresh carry the same explicit ``httplib2.Http(timeout=...)`` as the
+      API calls (``_load_credentials``).
+
+    Both let us attach an explicit ``httplib2.Http(timeout=...)`` so a hung
+    socket errors instead of blocking (see :data:`GCAL_HTTP_TIMEOUT_S`). Kept
+    separate from :func:`_import_google` so only these timeout-bounded paths
+    (service build + token refresh) require the extra libs; the one-time
+    interactive ``authorize`` flow doesn't.
     """
     try:
-        from google_auth_httplib2 import AuthorizedHttp  # type: ignore
+        from google_auth_httplib2 import AuthorizedHttp, Request  # type: ignore
         import httplib2  # type: ignore
     except ImportError as exc:
         raise GCalNotInstalled(
@@ -220,7 +234,7 @@ def _import_authorized_http() -> tuple[Any, Any]:
             "httplib2 for a socket-timeout-bounded transport. "
             "Install with: pip install -e '.[gcal]'"
         ) from exc
-    return AuthorizedHttp, httplib2
+    return AuthorizedHttp, Request, httplib2
 
 
 def _parse_event_window(raw: dict) -> tuple[datetime, datetime]:
@@ -378,7 +392,7 @@ class GCalClient:
         if self._creds is not None and self._creds.valid:
             return self._creds
 
-        Credentials, Request, _Flow, _build = _import_google()  # noqa: N806
+        Credentials, _Request, _Flow, _build = _import_google()  # noqa: N806
 
         if not self.token_path.exists():
             raise GCalNotAuthorized(
@@ -398,8 +412,18 @@ class GCalClient:
 
         if not creds.valid:
             if creds.expired and creds.refresh_token:
+                # Refresh over the same explicit-socket-timeout transport as
+                # the API calls (``google_auth_httplib2.Request`` wrapping an
+                # ``httplib2.Http(timeout=GCAL_HTTP_TIMEOUT_S)``) — NOT the
+                # requests-backed ``google.auth.transport.requests.Request``,
+                # whose google-auth default is ~120s and would leave a hung
+                # token endpoint pinning a to_thread worker on the cold/expiry
+                # path. Built outside the try so a missing-lib GCalNotInstalled
+                # propagates rather than being masked as a re-auth prompt.
+                _AuthorizedHttp, Request, httplib2 = _import_httplib2_transport()  # noqa: N806
+                refresh_request = Request(httplib2.Http(timeout=GCAL_HTTP_TIMEOUT_S))
                 try:
-                    creds.refresh(Request())
+                    creds.refresh(refresh_request)
                 except Exception as exc:  # noqa: BLE001
                     # The same generic Exception catches both terminal
                     # auth failure (refresh token revoked / expired) AND
@@ -448,7 +472,7 @@ class GCalClient:
         if self._service is not None:
             return self._service
         _Creds, _Req, _Flow, build = _import_google()  # noqa: N806
-        AuthorizedHttp, httplib2 = _import_authorized_http()  # noqa: N806
+        AuthorizedHttp, _Request, httplib2 = _import_httplib2_transport()  # noqa: N806
         creds = self._load_credentials()
         # Wrap creds in an explicit-socket-timeout http so a hung Google
         # socket errors out instead of blocking the transport read forever
