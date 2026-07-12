@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import secrets
 import socket
 import wave
 from contextlib import asynccontextmanager
@@ -52,7 +53,12 @@ from alfred.scribe.pipeline import _AUDIO_EXTENSIONS
 from alfred.sovereign.boundary import SovereignBoundaryError, validate_sovereign_boundary
 
 _SALT = "DUMMY_SCRIBE_TEST_SALT"
-_TOKEN = "secret-ingest-token-xyz"
+# Runtime-generated so NO credential-shaped literal is committed. A static
+# credential-shaped value trips GitGuardian's generic-password scanner as a FALSE
+# positive — this token authorizes nothing (the ingest face is loopback-only +
+# synthetic-mode, and this value lives only in an in-memory test config). Generating
+# it keeps the secret scanner high-signal for REAL leaks.
+_TOKEN = "tok-" + secrets.token_hex(8)
 _LABEL = "enc-1720000000000-0123456789abcdef"     # the machine-token shape (R6)
 _LABEL2 = "enc-1720000000001-fedcba9876543210"
 
@@ -223,7 +229,7 @@ def test_barrier_e_enabled_env_placeholder_arms_and_validates(monkeypatch):
     monkeypatch.setenv("SCRIBE_WEB", "true")
     with pytest.raises(SovereignBoundaryError) as exc:
         validate_sovereign_boundary(
-            _sov_raw(enabled="${SCRIBE_WEB}", host="0.0.0.0", token="realtok"), env={})
+            _sov_raw(enabled="${SCRIBE_WEB}", host="0.0.0.0", token=_TOKEN), env={})
     assert exc.value.reason == "barrier_e"
     # and the barrier now AGREES with the typed loader (both resolve enabled True).
     cfg = load_from_unified({"scribe": {"encounter_salt": _SALT, "ingest_web": {
@@ -257,7 +263,7 @@ def test_barrier_e_resolved_env_placeholders_pass(monkeypatch):
     # All three fields via placeholders that RESOLVE to loopback/real values → pass.
     monkeypatch.setenv("SCRIBE_WEB", "true")
     monkeypatch.setenv("SCRIBE_HOST", "127.0.0.1")
-    monkeypatch.setenv("SCRIBE_INGEST_TOKEN", "a-real-secret")
+    monkeypatch.setenv("SCRIBE_INGEST_TOKEN", _TOKEN)
     validate_sovereign_boundary(
         _sov_raw(enabled="${SCRIBE_WEB}", host="${SCRIBE_HOST}", token="${SCRIBE_INGEST_TOKEN}"),
         env={})  # no raise
@@ -268,7 +274,7 @@ def test_barrier_c_cloud_key_placeholder_still_detected_gap_d(monkeypatch):
     # barrier-c's RAW-config ${CLOUD_KEY} scan. A ${ANTHROPIC_API_KEY} placeholder
     # anywhere in the (un-substituted) config still trips barrier-c.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    raw = _sov_raw(enabled=True, host="127.0.0.1", token="realtok")
+    raw = _sov_raw(enabled=True, host="127.0.0.1", token=_TOKEN)
     raw["logging"] = {"some_field": "${ANTHROPIC_API_KEY}"}
     with pytest.raises(SovereignBoundaryError) as exc:
         validate_sovereign_boundary(raw, env={})
@@ -283,7 +289,7 @@ def test_barrier_e_does_not_mutate_raw_config_gap_d_direct(monkeypatch):
     # barrier-c's RAW ${CLOUD_KEY} scan is provably unaffected regardless of barrier
     # ordering. (env resolves them to loopback/real so the barrier PASSES + returns.)
     monkeypatch.setenv("SCRIBE_WEB_HOST", "127.0.0.1")
-    monkeypatch.setenv("SCRIBE_WEB_TOKEN", "a-real-secret")
+    monkeypatch.setenv("SCRIBE_WEB_TOKEN", _TOKEN)
     raw = _sov_raw(enabled=True, host="${SCRIBE_WEB_HOST}", token="${SCRIBE_WEB_TOKEN}")
     validate_sovereign_boundary(raw, env={})   # PASSES (host resolves loopback, token real)
     # RAW is UNMUTATED — still the literal placeholders (the barrier substituted a copy).

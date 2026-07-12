@@ -152,7 +152,7 @@ def test_is_unresolved_predicate() -> None:
     assert _is_unresolved("") is True
     assert _is_unresolved(None) is True
     assert _is_unresolved("${ALFRED_WEB_SESSION_SECRET}") is True
-    assert _is_unresolved("a-real-secret") is False
+    assert _is_unresolved("resolved-config-value") is False
 
 
 def test_resolve_signing_secret_returns_valid() -> None:

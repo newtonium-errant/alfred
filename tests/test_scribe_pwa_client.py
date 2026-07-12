@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import re
+import secrets
 import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -39,7 +40,11 @@ from alfred.scribe import pwa_assets
 from alfred.scribe.pwa_assets import APP_JS, CSP_VALUE, render_index
 
 _SALT = "DUMMY_SCRIBE_TEST_SALT"
-_TOKEN = "secret-ingest-token-xyz"
+# Runtime-generated so NO credential-shaped literal is committed — a static
+# credential-shaped value trips GitGuardian's generic-password scanner as a FALSE
+# positive (this token authorizes nothing: loopback-only + synthetic-mode, in-memory
+# test config). See tests/test_scribe_ingest_web.py + .gitguardian.yaml.
+_TOKEN = "tok-" + secrets.token_hex(8)
 _LABEL = "enc-1720000000000-0123456789abcdef"
 # The backend label contract (must stay in lockstep with ingest_web.ENCOUNTER_LABEL_RE).
 _LABEL_RE = re.compile(r"^enc-[0-9]{13}-[0-9a-f]{16}$")

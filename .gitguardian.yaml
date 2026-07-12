@@ -1,0 +1,24 @@
+# GitGuardian / ggshield configuration
+# https://docs.gitguardian.com/ggshield-docs/reference/config
+#
+# WHY: test fixtures legitimately contain SYNTHETIC, non-functional credential-shaped
+# strings — bearer tokens, salts, and passwords that authorize nothing (the surfaces
+# they exercise are loopback-only / synthetic-mode / in-memory test configs). Left
+# unignored, they trip the generic-password/secret detectors as FALSE positives, and
+# the resulting alert fatigue is a real risk: a genuine leak gets lost in the noise.
+# So test paths are excluded from secret scanning to keep the scanner high-signal.
+#
+# DISCIPLINE (load-bearing — the exclusion is only safe if this holds): a committed
+# test MUST NEVER contain a REAL credential. Use monkeypatch.setenv, a runtime-generated
+# value (secrets.token_hex), or an obvious DUMMY_*/example placeholder — never a live
+# key, token, password, or salt. Production secrets live in the box .env via ${VAR}
+# substitution and are never committed.
+#
+# SCOPE NOTE: this file governs `ggshield` (the CLI used in CI + pre-commit hooks).
+# GitGuardian's server-side GitHub-app monitoring is configured in the dashboard —
+# mark any residual historical fixture match there as a false-positive ("test credential").
+# The durable fix is that fixtures no longer carry credential-shaped literals at all.
+version: 2
+secret:
+  ignored-paths:
+    - 'tests/**'
