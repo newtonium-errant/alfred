@@ -491,8 +491,39 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
         await asyncio.wait_for(got_barge.wait(), timeout=30)
         barge_time = barge_at[0]
         await asyncio.wait_for(got_t2_final.wait(), timeout=15)
-        # T2's tone plays out over several seconds AFTER the barge — capture it.
-        await asyncio.sleep(3.0)
+
+        # DETERMINISTIC wait for T2's post-barge tone instead of a fixed
+        # sleep(3.0)+assert window (bl-53 flake). The old window sampled a FIXED
+        # slice [barge_time+1.0, turn_final+3.0] and asserted T2's tone filled
+        # it — but ``turn_final`` fires when T2's TEXT completes, and T2's AUDIO
+        # playout (pump → resampler → outbound track) starts asynchronously and
+        # can lag under full-suite CPU load. When it lagged past the 3 s the
+        # loud-frame count fell below 20 even though the pump was perfectly
+        # healthy: a wall-clock guess, not a state wait. Poll the REAL captured
+        # track state until BOTH (a) T2 has its own speaking_started + turn_final
+        # and (b) >=20 loud frames have actually landed past barge_time+1.0, with
+        # a generous ceiling. A genuinely dead pump (the av-resampler EOF this
+        # test pins) never reaches 20 → the ceiling expires → the SAME assertion
+        # below fails with the SAME diagnostic. Same facts pinned, waited for.
+        loud_floor = barge_time + 1.0
+
+        def _t2_spoke() -> bool:
+            starts = [e for e in events if e["type"] == "speaking_started"]
+            turns = [e for e in events if e["type"] == "turn_started"]
+            if len(starts) < 2 or len(turns) < 2:
+                return False
+            t2 = turns[1]["turn_id"]
+            return any(e["type"] == "turn_final" and e["turn_id"] == t2
+                       for e in events)
+
+        def _loud_count() -> int:
+            return sum(1 for (t, p) in frame_peaks if t > loud_floor and p > 500)
+
+        deadline = asyncio.get_event_loop().time() + 20.0
+        while asyncio.get_event_loop().time() < deadline:
+            if _t2_spoke() and _loud_count() >= 20:
+                break
+            await asyncio.sleep(0.1)
 
         # T2 attempted to speak (its own speaking_started) AND completed.
         speaking_starts = [e for e in events if e["type"] == "speaking_started"]
@@ -504,7 +535,7 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
         # THE PIN: sustained non-silent audio AFTER the barge = T2's tone made it
         # through the real resampler + playout. A pump killed by the resampler
         # EOF would leave this window silent (speaking_started fired, then dead).
-        post = [p for (t, p) in frame_peaks if t > barge_time + 1.0]
+        post = [p for (t, p) in frame_peaks if t > loud_floor]
         loud = [p for p in post if p > 500]
         assert len(loud) >= 20, (
             "T2 produced no sustained audio after the barge (av-resampler EOF "
