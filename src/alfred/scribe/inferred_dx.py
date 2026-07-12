@@ -19,6 +19,15 @@ false-POSITIVE (the dx stated in a DIFFERENT cited segment than the claim
 references) is low-harm + rare, and a co-citation (``["S1","S5"]``) clears it
 because ``_cited_text`` JOINS all cited spans.
 
+HEDGE-AWARE clear (FIX 1, audit batch 2 #5): cited-span alone closed only the
+DIFFERENT-span hole. The SAME-span hole — the label present in the cited span but
+wrapped in a hedge there ("family history of MDD", "rule out MDD", "no evidence of
+MDD", "MDD vs adjustment disorder") — was still false-CLEARED. The clear-check
+(:func:`_stated_current`) now requires a CURRENT-assertion occurrence: a label
+present ONLY inside a negation / family-history / ruled-out / differential /
+screening / resolved frame does NOT clear. A bare "history of MDD" / "PMH: HTN"
+is a current active problem (not a hedge) and still clears.
+
 ALL FOUR SECTIONS (not assessment-only): the inferred dx smuggles into the PLAN
 as an indication ("Start sertraline for major depressive disorder" citing "start
 sertraline", no dx in the cite). The lexicon match is section-agnostic; cited-span
@@ -39,12 +48,19 @@ operator-approved overrides) are a documented later increment.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import structlog
 
-from alfred.scribe.diagnosis_lexicon import diagnoses_named_in, entry_present
-from alfred.scribe.grounding import GroundingFlag, _cited_text
+from alfred.scribe.diagnosis_lexicon import (
+    DiagnosisEntry,
+    diagnoses_named_in,
+    entry_present,
+    form_spans_in,
+    normalize_text,
+)
+from alfred.scribe.grounding import _NEGATION_RE, GroundingFlag, _cited_text
 from alfred.scribe.notegen import StructuredNote
 from alfred.scribe.transcript import Transcript
 
@@ -53,6 +69,80 @@ log = structlog.get_logger(__name__)
 # The single reason literal these flags carry (dispatched to the INFERRED_DIAGNOSIS
 # inline literal by GroundingResult.flag_for).
 INFERRED_DIAGNOSIS_REASON = "inferred_diagnosis"
+
+
+# --- FIX 1 (audit batch 2 #5): SAME-SPAN hedge-aware clear-check ------------
+# A cited lexicon label clears an inferred-dx flag ONLY when it is a CURRENT
+# assertion. The original clear-check (``entry_present(e, cited)``) was blind to
+# a negation / family-history / ruled-out / differential / screening / resolved
+# frame WRAPPING the label in the SAME cited span — so a current-assessment dx
+# claim whose only support is a HEDGED mention ("family history of MDD", "rule out
+# MDD", "no evidence of MDD", "MDD vs adjustment disorder") was false-CLEARED (a
+# real false-NEGATIVE in the check's own high-harm class). We now inspect the
+# clause immediately around each label occurrence and treat a hedged-only label as
+# NOT stated. Reuses grounding's clinical negation vocabulary (``_NEGATION_RE``)
+# and adds the non-negation hedge phrases below.
+#
+# NOTE (deliberate non-hedges): a bare "history of MDD" / "PMH: hypertension" is a
+# CURRENT active problem, not a hedge — so ``history of`` is NOT a hedge marker
+# (keeps the PMH-stated fixtures clean). Only an explicit ``resolved`` / ``resolving``
+# framing past-hedges. POST-POSITIVE negation ("MDD was ruled out") is a known
+# residual gap, the same class grounding documents (grounding.py "(e)").
+
+# Non-negation hedge phrases in the clause BEFORE a matched label (operate on
+# ``normalize_text`` output — hyphens already folded to spaces, so no hyphen
+# variants needed). ``\?`` = a differential "?MDD".
+_EXTRA_PRECEDING_HEDGE_RE = re.compile(
+    r"\bfamily (?:history|hx) of\b|\bfh of\b|\bfhx\b"
+    r"|\b(?:mother|father|sibling|brother|sister|parent|maternal|paternal|son|daughter)\b"
+    r"|\brule[ds]? out\b|\bruling out\b|\br/o\b"
+    r"|\bversus\b|\bvs\b|\bdifferential\b|\bddx\b|\?"
+    r"|\bscreen(?:ing)? for\b"
+)
+# Hedge markers in the clause AFTER a matched label: differential ("MDD vs …",
+# "MDD?") + explicit past-resolved framing.
+_FOLLOWING_HEDGE_RE = re.compile(
+    r"^(?:versus|vs|resolved|resolving)\b|^\?"
+)
+# "non-diabetic" / "non diabetic" immediately before the label (after the hyphen
+# fold both end "... non "). "non" is DELIBERATELY out of grounding's global
+# _NEGATION_RE (it false-registers inside "non-productive"); here it is clause-
+# anchored immediately before a dx label, where it is a genuine negation.
+_NON_PREFIX_RE = re.compile(r"\bnon\s*$")
+
+
+def _occurrence_is_hedged(norm: str, start: int, end: int) -> bool:
+    """True iff the label occurrence at ``[start, end)`` in ``norm`` (a
+    ``normalize_text`` string) sits inside a negation / hedge / attribution /
+    differential / screening / resolved frame — so it does NOT count as a current
+    assertion. Windows are cut at clause punctuation so a hedge governing a
+    DIFFERENT clause's label does not leak (over-flag is the SAFE direction; a
+    leaked hedge would over-flag, never false-CLEAR)."""
+    # Preceding context, limited to the label's own clause.
+    before_clause = re.split(r"[.;,:()]", norm[:start])[-1]
+    if _NEGATION_RE.search(before_clause):            # reuse grounding's negation vocab
+        return True
+    if _EXTRA_PRECEDING_HEDGE_RE.search(before_clause):
+        return True
+    if _NON_PREFIX_RE.search(before_clause):
+        return True
+    # Following context: differential / resolved may TRAIL the label. Comma does
+    # NOT cut here — "MDD, resolved" / "MDD, vs …" post-modify the same label.
+    after_clause = re.split(r"[.;:()]", norm[end:])[0].lstrip(" ,")
+    if _FOLLOWING_HEDGE_RE.search(after_clause):
+        return True
+    return False
+
+
+def _stated_current(entry: DiagnosisEntry, cited: str) -> bool:
+    """True iff AT LEAST ONE occurrence of any of ``entry``'s forms appears in
+    ``cited`` as a CURRENT assertion (not hedge-wrapped). If EVERY occurrence is
+    hedged, the dx is not "stated" and must not clear an inferred-dx flag."""
+    norm = normalize_text(cited)
+    for start, end in form_spans_in(entry, norm):
+        if not _occurrence_is_hedged(norm, start, end):
+            return True
+    return False
 
 
 def check_inferred_diagnoses(
@@ -73,9 +163,13 @@ def check_inferred_diagnoses(
         if not named:
             continue  # low-FP posture: only NAMED lexicon labels, never bare symptoms
         cited = _cited_text(claim.source_spans, seg_by_id)  # grounding's JOIN of all cited spans
-        inferred = [e for e in named if not entry_present(e, cited)]
+        # HEDGE-AWARE clear (FIX 1): a named dx clears ONLY if it appears in the
+        # cited segment(s) as a CURRENT assertion — NOT if its every occurrence is
+        # wrapped in a family-history / ruled-out / differential / screening /
+        # resolved frame in the SAME span (that is a fabrication, not a stated dx).
+        inferred = [e for e in named if not _stated_current(e, cited)]
         if not inferred:
-            continue  # every named dx appears verbatim in the cited segment(s) → stated, clean
+            continue  # every named dx is stated (current) in the cited segment(s) → clean
         labels = [e.canonical for e in inferred]
         flags.append(
             GroundingFlag(
@@ -94,6 +188,23 @@ def check_inferred_diagnoses(
             )
         )
     return flags
+
+
+def _inferred_entries_from_detail(detail: str) -> list[DiagnosisEntry]:
+    """The lexicon entries a flag ACTUALLY inferred, recovered from its ``detail``.
+
+    ``check_inferred_diagnoses`` builds ``detail`` as
+    ``"inferred_diagnosis: <canonical>, <canonical> named in the claim but ..."`` —
+    the ONLY lexicon labels in that string are the inferred ones, so matching the
+    lexicon over the label portion recovers EXACTLY the flagged set (and NOT the
+    stated dxs elsewhere in a multi-dx claim). Robust to a truncated ``detail``
+    (older/hand-authored records): if the ``" named in the claim"`` marker is
+    absent it falls back to the whole post-prefix string, still matching only the
+    canonical labels present there."""
+    prefix = INFERRED_DIAGNOSIS_REASON + ":"
+    body = detail.split(prefix, 1)[1] if prefix in detail else detail
+    label_portion = body.split(" named in the claim", 1)[0]
+    return diagnoses_named_in(label_portion)
 
 
 def record_inferred_dx_attest_outcome(
@@ -122,8 +233,13 @@ def record_inferred_dx_attest_outcome(
         for flag in grounding_flags:
             if not isinstance(flag, dict) or flag.get("reason") != INFERRED_DIAGNOSIS_REASON:
                 continue
-            claim_text = str(flag.get("claim", ""))
-            for entry in diagnoses_named_in(claim_text):
+            # Capture ONLY the labels this flag ACTUALLY inferred (FIX 5, audit
+            # batch 2 #9) — NOT every dx named in the whole claim. A multi-dx claim
+            # ("MDD and stable hypertension", only MDD inferred) names STATED dxs
+            # too, which were never flagged; re-deriving over the claim would emit
+            # spurious capture rows for them and skew the self-correcting signal.
+            # The flag ``detail`` lists exactly the inferred canonical labels.
+            for entry in _inferred_entries_from_detail(str(flag.get("detail", ""))):
                 was_in_draft = entry_present(entry, draft_original)
                 kept = entry_present(entry, attested_body)
                 # Only a label the AI actually drafted is a meaningful correction

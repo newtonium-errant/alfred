@@ -5,6 +5,12 @@ mutation-bind (remove the check → the #48 case NOT flagged → RED), the H2 fl
 reason-dispatch, the inline ⚠ render + grounding_flags metadata, the lexicon
 abbreviation-exclusion policy, and the self-correcting Part-1 attest capture
 (fires kept/removed AND is side-effect-free w.r.t. attestation).
+
+AUDIT BATCH 2 additions (see the ``# audit batch 2`` section at the bottom):
+FIX 1 same-span hedge-aware clear-check (the core FN); FIX 2 CKD-EPI / GERD-Q
+tool-name collisions; FIX 3 adjectival stated-dx clears; FIX 4 unicode-apostrophe
++ hyphen↔space + reordered-diabetes normalise; FIX 5 capture restricted to the
+flag's actually-inferred labels (multi-dx conflation).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from alfred.scribe.grounding import GroundingFlag, GroundingResult, verify
 from alfred.scribe.inferred_dx import (
     INFERRED_DIAGNOSIS_REASON,
     check_inferred_diagnoses,
+    record_inferred_dx_attest_outcome,
 )
 from alfred.scribe.notegen import (
     GROUNDING_UNVERIFIED,
@@ -223,16 +230,19 @@ def test_inferred_flag_renders_inline_and_lands_in_metadata():
 # Lexicon curation policy — ambiguous abbreviations are NOT matchable forms
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("ambiguous", ["ms", "mi", "ra", "pd", "ad", "gad"])
+@pytest.mark.parametrize("ambiguous", ["ms", "mi", "ra", "pd", "ad", "gad", "ckd", "gerd"])
 def test_lexicon_excludes_ambiguous_abbreviations(ambiguous):
     # None of the dangerous abbreviations is a matchable form (false-CLEAR guard).
-    # "gad" is EXCLUDED for the screening-tool-name collision (GAD ⊂ GAD-7/GAD-2).
+    # "gad"/"ckd"/"gerd" are EXCLUDED for the screening-tool-name collision
+    # (GAD ⊂ GAD-7/GAD-2, ckd ⊂ CKD-EPI, gerd ⊂ GERD-Q — audit batch 2).
     all_forms = {f for e in DIAGNOSIS_LEXICON for f in e.forms}
     assert ambiguous not in all_forms
     # but the FULL labels ARE present.
     assert diagnoses_named_in("patient with multiple sclerosis")
     assert diagnoses_named_in("history of myocardial infarction")
     assert diagnoses_named_in("assessment: generalized anxiety disorder")
+    assert diagnoses_named_in("assessment: chronic kidney disease stage 3")
+    assert diagnoses_named_in("assessment: gastroesophageal reflux disease")
 
 
 def test_screening_tool_name_does_not_clear_inferred_dx():
@@ -240,6 +250,9 @@ def test_screening_tool_name_does_not_clear_inferred_dx():
     # the DIAGNOSIS. "GAD-7 score is 15" names NO lexicon diagnosis.
     assert diagnoses_named_in("GAD-7 score is 15") == []
     assert diagnoses_named_in("PHQ-9 score is 18") == []      # never collided (kept as a pin)
+    # audit batch 2 — more instrument-name collisions the same class as GAD-7.
+    assert diagnoses_named_in("CKD-EPI eGFR is 55") == []     # ckd ⊂ CKD-EPI (eGFR equation)
+    assert diagnoses_named_in("GERD-Q score is 9") == []      # gerd ⊂ GERD-Q (questionnaire)
 
 
 def test_lexicon_word_boundary_not_substring():
@@ -332,3 +345,137 @@ def test_attest_capture_is_side_effect_free(tmp_path):
                 clinician_ids=_CLINICIANS, audit_path=tmp_path / "attest_audit.jsonl", now=_NOW)
     assert frontmatter.load(tmp_path / bad)["status"] == "attested"   # attest unaffected
     assert r2["path"] == bad
+
+
+# ===========================================================================
+# AUDIT BATCH 2 — FP/FN correctness fixes (FIX 1-5)
+# ===========================================================================
+
+# --- FIX 1 (#5): SAME-SPAN hedge false-CLEAR — the core FN -------------------
+
+@pytest.mark.parametrize("cited_span", [
+    "family history of major depressive disorder, mother had it",  # attribution
+    "we can rule out major depressive disorder",                   # ruled-out
+    "no evidence of major depressive disorder",                    # negated
+    "major depressive disorder vs adjustment disorder",            # differential (trailing)
+    "screening for major depressive disorder",                     # screening
+    "?major depressive disorder",                                  # differential (leading ?)
+])
+def test_fix1_same_span_hedge_does_not_clear_inferred_dx(cited_span):
+    # A CURRENT-assessment MDD claim whose ONLY cited support is a HEDGED same-span
+    # mention is a fabrication → MUST be FLAGGED (pre-fix: entry_present saw the
+    # label verbatim in the cite and CLEARED it — the wide-open same-span FN).
+    tx = _tx(_seg(1, cited_span))
+    note = _note(assessment=[Claim(claim="Major depressive disorder", source_spans=["S1"])])
+    flags = _flagged(note, tx)
+    assert len(flags) == 1 and flags[0].reason == INFERRED_DIAGNOSIS_REASON
+
+
+def test_fix1_mutation_bind_family_history_flagged():
+    # MUTATION-BIND for FIX 1: the family-history same-span case is flagged ONLY
+    # because the clear-check is hedge-aware. Revert _stated_current → entry_present
+    # and this CLEARS again → RED. (Done + reverted manually in the ship report.)
+    tx = _tx(_seg(1, "family history of major depressive disorder, mother had it"))
+    note = _note(assessment=[Claim(claim="Major depressive disorder", source_spans=["S1"])])
+    assert len(_flagged(note, tx)) == 1
+
+
+@pytest.mark.parametrize("cited_span", [
+    "patient has major depressive disorder",
+    "assessment: major depressive disorder, start sertraline",
+    "diagnosis of major depressive disorder confirmed today",
+    "major depressive disorder, moderate severity",
+])
+def test_fix1_current_assertion_still_clears(cited_span):
+    # The hedge-aware check MUST NOT over-flag a genuinely STATED current dx.
+    tx = _tx(_seg(1, cited_span))
+    note = _note(assessment=[Claim(claim="Major depressive disorder", source_spans=["S1"])])
+    assert _flagged(note, tx) == []
+
+
+def test_fix1_bare_history_of_pmh_still_clears():
+    # A bare "history of MDD" / PMH dx is a CURRENT active problem, NOT a hedge —
+    # it must still clear (guards against over-tightening past-resolved detection).
+    tx = _tx(_seg(1, "past medical history: major depressive disorder, hypertension."))
+    note = _note(assessment=[Claim(claim="Major depressive disorder", source_spans=["S1"])])
+    assert _flagged(note, tx) == []
+
+
+# --- FIX 2 (#7): CKD-EPI / GERD-Q tool-name collisions ----------------------
+
+def test_fix2_ckd_epi_does_not_clear_inferred_ckd():
+    # CKD-EPI is the eGFR estimating equation — naming it is NOT stating CKD. The
+    # dropped "ckd" abbrev means an inferred CKD citing only the equation is FLAGGED.
+    tx = _tx(_seg(1, "renal function per CKD-EPI eGFR is 55."))
+    note = _note(assessment=[Claim(claim="Chronic kidney disease", source_spans=["S1"])])
+    assert len(_flagged(note, tx)) == 1
+    # the FULL label still clears.
+    tx_stated = _tx(_seg(1, "assessment: chronic kidney disease stage 3."))
+    assert _flagged(_note(assessment=[Claim(claim="Chronic kidney disease", source_spans=["S1"])]),
+                    tx_stated) == []
+
+
+def test_fix2_gerd_q_does_not_clear_inferred_gerd():
+    tx = _tx(_seg(1, "GERD-Q score is 9."))
+    note = _note(assessment=[Claim(claim="Gastroesophageal reflux disease", source_spans=["S1"])])
+    assert len(_flagged(note, tx)) == 1
+    tx_stated = _tx(_seg(1, "assessment: gastroesophageal reflux disease."))
+    assert _flagged(_note(assessment=[Claim(claim="Gastroesophageal reflux disease", source_spans=["S1"])]),
+                    tx_stated) == []
+
+
+# --- FIX 3 (#6): adjectival stated-dx must CLEAR (alarm-fatigue FP) ----------
+
+@pytest.mark.parametrize("dx_claim, cited", [
+    ("Hypertension", "patient is hypertensive"),
+    ("Type 2 diabetes", "known diabetic on metformin"),
+    ("Asthma", "asthmatic since childhood"),
+    ("Anemia", "appears anemic on exam"),
+    ("Gout", "acute gouty flare of the first toe"),
+    ("Hypothyroidism", "clinically hypothyroid, on levothyroxine"),
+    ("Obesity", "patient is obese, bmi 34"),
+])
+def test_fix3_adjectival_stated_dx_clears(dx_claim, cited):
+    # The note writes the NOUN dx; the clinician dictated it ADJECTIVALLY in the
+    # cite. Noun-only lexicon false-FLAGGED this stated dx as inferred — now CLEAN.
+    tx = _tx(_seg(1, cited))
+    note = _note(assessment=[Claim(claim=dx_claim, source_spans=["S1"])])
+    assert _flagged(note, tx) == []
+
+
+# --- FIX 4 (#8): normalize_text unicode-apostrophe + hyphen + reorder --------
+
+def test_fix4_curly_apostrophe_matches_lexicon():
+    # STT/LLM emit the U+2019 curly apostrophe by default; without the fold
+    # "Parkinson's"/"Alzheimer's" never match the straight-apostrophe forms.
+    assert diagnoses_named_in("history of Parkinson’s disease")
+    assert diagnoses_named_in("early Alzheimer’s disease")
+
+
+def test_fix4_hyphen_space_and_reorder_variants_match():
+    assert diagnoses_named_in("assessment: post traumatic stress disorder")  # space, not hyphen
+    assert diagnoses_named_in("diabetes type 2, on metformin")               # reordered
+
+
+# --- FIX 5 (#9): capture restricted to the flag's ACTUALLY-inferred labels ---
+
+def test_fix5_capture_only_the_flag_inferred_labels_not_whole_claim():
+    # A multi-dx claim NAMES a STATED dx (hypertension) alongside the one INFERRED
+    # dx (MDD) that was actually flagged. The flag detail encodes only MDD → the
+    # capture must emit ONLY the MDD outcome, NOT a spurious hypertension row.
+    # (Pre-fix: diagnoses_named_in(whole claim) emitted BOTH → conflation.)
+    flag = {
+        "section": "assessment", "claim_index": 0, "reason": "inferred_diagnosis",
+        "detail": ("inferred_diagnosis: major depressive disorder named in the claim "
+                   "but absent from the cited segment(s) — clinician to confirm or remove"),
+        "claim": "Major depressive disorder and stable hypertension", "source_spans": ["S1"],
+    }
+    draft = "## Assessment\n- Major depressive disorder and stable hypertension [S1]\n"
+    with structlog.testing.capture_logs() as caps:
+        record_inferred_dx_attest_outcome(
+            grounding_flags=[flag], draft_original=draft, attested_body=draft, source_id=_SID,
+        )
+    ev = [c for c in caps if c.get("event") == "scribe.inferred_dx.attest_outcome"]
+    assert len(ev) == 1
+    assert ev[0]["diagnosis"] == "major depressive disorder"
+    assert all(e["diagnosis"] != "hypertension" for e in ev)

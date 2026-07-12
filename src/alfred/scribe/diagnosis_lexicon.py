@@ -26,11 +26,17 @@ CURATION POLICY (locked by design review):
     DIAGNOSIS being stated and would spuriously CLEAR an inferred GAD fabrication
     (a high-harm false-NEGATIVE on anxiety, the 2nd-most-common inferred dx). So
     ``gad`` is NOT a matchable form; only the full ``generalized/generalised
-    anxiety disorder`` is. Reviewer audit (2026-07-11): GAD-7/GAD-2 is the ONLY
-    current tool-name collision — PHQ-9 ∌ ``mdd``; the ADHD/PTSD/OCD instruments
-    are ASRS / PCL / Y-BOCS (no embedded dx abbrev); the medical-dx abbrevs are
-    clean — but the RULE prevents recurrence as the set grows (e.g. a future entry
-    must not add an abbrev embedded in its own screening scale).
+    anxiety disorder`` is. Reviewer audit (2026-07-11, CORRECTED audit batch 2):
+    GAD-7/GAD-2 is NOT the only tool-name collision — ``ckd`` ⊂ ``CKD-EPI`` (the
+    standard eGFR estimating equation, on nearly every renal note) and ``gerd`` ⊂
+    ``GERD-Q`` (a validated reflux questionnaire) collide the SAME way, so both
+    abbrev forms are now DROPPED (full labels kept). PHQ-9 ∌ ``mdd``; the OCD
+    instruments (Y-BOCS / OCI-R) embed no dx abbrev. FURTHER CANDIDATE collisions
+    flagged for clinical review before any drop (dropping them has a real recall
+    cost — these are also the primary way clinicians WRITE the dx): ``ptsd`` ⊂
+    ``PC-PTSD-5``, ``adhd`` ⊂ ``ADHD-RS``, ``ibs`` ⊂ ``IBS-SSS``. The RULE stands:
+    EXCLUDE an abbrev embedded in its own screening / scale / equation name as the
+    set grows.
   * WORD-BOUNDARY PHRASE match, NEVER substring — ``depression`` never matches
     inside ``major depression``; ``\\bMDD\\b`` never matches inside a longer token.
 
@@ -74,31 +80,40 @@ DIAGNOSIS_LEXICON: tuple[DiagnosisEntry, ...] = (
     _entry("attention deficit hyperactivity disorder", "adhd"),
     _entry("obsessive-compulsive disorder", "obsessive compulsive disorder", "ocd"),
     # --- endocrine / metabolic ---
-    _entry("type 2 diabetes", "type 2 diabetes mellitus", "type ii diabetes", "t2dm"),
-    _entry("type 1 diabetes", "type 1 diabetes mellitus", "t1dm"),
-    _entry("hypothyroidism"),
-    _entry("hyperthyroidism"),
-    _entry("hypertension", "htn"),
+    # reordered "diabetes type 2" + adjectival "diabetic" (a cited "known diabetic
+    # on metformin" states the dx — noun-only lexicon false-FLAGGED the noun claim).
+    _entry("type 2 diabetes", "type 2 diabetes mellitus", "type ii diabetes", "t2dm",
+           "diabetes type 2", "diabetes mellitus type 2", "diabetic"),
+    _entry("type 1 diabetes", "type 1 diabetes mellitus", "t1dm", "diabetes type 1"),
+    _entry("hypothyroidism", "hypothyroid"),
+    _entry("hyperthyroidism", "hyperthyroid"),
+    _entry("hypertension", "htn", "hypertensive"),
     _entry("hyperlipidemia", "hyperlipidaemia", "dyslipidemia", "dyslipidaemia"),
-    _entry("gout"),
-    _entry("obesity"),
+    _entry("gout", "gouty"),
+    _entry("obesity", "obese"),
     # --- cardio / respiratory ---
     _entry("coronary artery disease", "cad"),
     _entry("congestive heart failure", "heart failure", "chf"),
     _entry("atrial fibrillation", "afib"),
     _entry("myocardial infarction"),                 # abbrev MI EXCLUDED (ambiguous)
     _entry("chronic obstructive pulmonary disease", "copd"),
-    _entry("asthma"),
+    _entry("asthma", "asthmatic"),
     _entry("obstructive sleep apnea", "obstructive sleep apnoea", "sleep apnea", "sleep apnoea", "osa"),
     _entry("pneumonia"),
     # --- gastrointestinal ---
-    _entry("gastroesophageal reflux disease", "gastro-oesophageal reflux disease", "acid reflux", "gerd"),
+    # "gerd" abbrev DROPPED — it is a substring of the screening tool GERD-Q (the
+    # hyphen is a word boundary), the SAME false-CLEAR class as GAD⊂GAD-7. Full
+    # labels only (see the SCREENING-TOOL-NAME COLLISION rule).
+    _entry("gastroesophageal reflux disease", "gastro-oesophageal reflux disease", "acid reflux"),
     _entry("peptic ulcer disease", "pud"),
     _entry("irritable bowel syndrome", "ibs"),
     _entry("celiac disease", "coeliac disease"),
     # --- genitourinary / renal ---
     _entry("urinary tract infection", "uti"),
-    _entry("chronic kidney disease", "ckd"),
+    # "ckd" abbrev DROPPED — it is a substring of the eGFR equation CKD-EPI (the
+    # hyphen is a word boundary), the SAME false-CLEAR class as GAD⊂GAD-7. Full
+    # label only (see the SCREENING-TOOL-NAME COLLISION rule).
+    _entry("chronic kidney disease"),
     _entry("benign prostatic hyperplasia", "bph"),
     # --- musculoskeletal / neuro (full labels only — RA/MS/PD/AD abbrevs EXCLUDED) ---
     _entry("osteoarthritis"),
@@ -110,26 +125,63 @@ DIAGNOSIS_LEXICON: tuple[DiagnosisEntry, ...] = (
     _entry("alzheimer's disease", "alzheimers disease", "alzheimer disease"),  # AD EXCLUDED
     # --- hematologic / other ---
     _entry("iron deficiency anemia", "iron deficiency anaemia", "iron-deficiency anemia"),
-    _entry("anemia", "anaemia"),
+    _entry("anemia", "anaemia", "anemic", "anaemic"),
 )
 
 
 def normalize_text(text: str) -> str:
-    """Lowercase + collapse whitespace so a multi-word phrase form matches across
-    varied spacing (case-insensitive by construction — forms are lowercased)."""
-    return re.sub(r"\s+", " ", (text or "").lower())
+    """Lowercase + fold the spelling variance STT/LLM output actually produces,
+    so a phrase form matches its clinical variants (case-insensitive by
+    construction — forms are lowercased):
+
+      * U+2019 / U+2018 curly apostrophe → ASCII ``'`` — STT/LLM emit curly
+        apostrophes by default, which without the fold NEUTER ``parkinson's`` /
+        ``alzheimer's`` (the straight-apostrophe forms never match);
+      * hyphen → space — a word boundary EITHER way (the screening-tool-name
+        collision reasoning above is unaffected: ``gad`` still matches at the
+        ``GAD 7`` boundary exactly as it did at the ``GAD-7`` boundary), so
+        ``post-traumatic`` and ``post traumatic`` both match the same form;
+      * whitespace collapsed so a multi-word form matches across odd spacing.
+
+    Forms are run through this SAME function at match time (``_form_present`` /
+    ``form_spans_in``), so a hyphenated lexicon form and a spaced transcript token
+    compare equal. (Word ORDER is NOT normalised — reordered variants like
+    ``diabetes type 2`` are covered by explicit reordered forms in the lexicon.)"""
+    t = (text or "").lower()
+    t = t.replace("’", "'").replace("‘", "'")  # curly → ASCII apostrophe
+    t = t.replace("-", " ")                               # hyphen → space (still a boundary)
+    return re.sub(r"\s+", " ", t)
 
 
 def _form_present(form: str, normalized_text: str) -> bool:
-    """Word-boundary PHRASE presence (NEVER substring). ``form`` is already
-    lowercased; ``normalized_text`` is ``normalize_text`` output."""
-    return re.search(r"\b" + re.escape(form) + r"\b", normalized_text) is not None
+    """Word-boundary PHRASE presence (NEVER substring). ``form`` is normalised
+    through ``normalize_text`` (matching the already-normalised ``normalized_text``)
+    so a hyphenated/curly-apostrophe form and its folded transcript token compare
+    equal."""
+    nf = normalize_text(form)
+    return re.search(r"\b" + re.escape(nf) + r"\b", normalized_text) is not None
 
 
 def entry_present(entry: DiagnosisEntry, text: str) -> bool:
     """True iff ANY surface form of ``entry`` is present (word-boundary) in ``text``."""
     norm = normalize_text(text)
     return any(_form_present(f, norm) for f in entry.forms)
+
+
+def form_spans_in(entry: DiagnosisEntry, normalized_text: str) -> list[tuple[int, int]]:
+    """All ``(start, end)`` spans in ``normalized_text`` (``normalize_text``
+    output) where ANY surface form of ``entry`` occurs (word-boundary).
+
+    Used by the inferred-dx hedge-aware clear-check to LOCATE each label
+    occurrence so it can inspect the surrounding negation / hedge / attribution
+    context (a label present ONLY inside a hedge must not clear an inferred-dx
+    flag). ``entry_present`` answers only "is it present"; this answers "where"."""
+    spans: list[tuple[int, int]] = []
+    for form in entry.forms:
+        nf = normalize_text(form)
+        for m in re.finditer(r"\b" + re.escape(nf) + r"\b", normalized_text):
+            spans.append((m.start(), m.end()))
+    return spans
 
 
 def diagnoses_named_in(text: str) -> list[DiagnosisEntry]:
