@@ -286,6 +286,9 @@ def _make_flagged_draft(tmp_path, *, body: str):
             "source_id": _SID, "drafted_by": SCRIBE_DRAFTER_IDENTITY,
             "grounding_flags": [flag],
             "draft_original": "## Assessment\n- Major depressive disorder [S1]\n",
+            # #58 — a COMPLETE encounter so attest passes the completeness gate
+            # (these tests target the inferred-dx attest capture, not completeness).
+            "encounter_completeness": {"protocol": 1, "complete": True},
         },
         body=body,
         scope="stayc_clinical",
@@ -337,6 +340,7 @@ def test_attest_capture_is_side_effect_free(tmp_path):
             "ai_draft": True, "synthetic": True, "status": "ai_draft",
             "source_id": "enc-def0123456789a", "drafted_by": SCRIBE_DRAFTER_IDENTITY,
             "grounding_flags": "not-a-list", "draft_original": "x",
+            "encounter_completeness": {"protocol": 1, "complete": True},  # #58 complete
         },
         body="## Assessment\n- Something.\n", scope="stayc_clinical",
     )["path"]

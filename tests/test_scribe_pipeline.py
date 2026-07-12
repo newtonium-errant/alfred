@@ -348,7 +348,9 @@ def test_create_ai_draft_refuses_attested_no_clobber(tmp_path):
         body="## S\nDraft.\n", grounding_flags=[], flag_count=0)
     p1 = pipeline_mod._create_ai_draft(vault, "Encounter y", "y", _config(), v1)
     scribe_attest(vault, p1, new_status="attested", attester="np_jamie",
-                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl")
+                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl",
+                  # #58 — sealing a markerless draft to set up the SEALED path; audited override.
+                  allow_incomplete=True, override_reason="test — seal setup")
 
     v2 = pipeline_mod.VerifiedNote(
         body="## S\nSNEAKY.\n", grounding_flags=[], flag_count=0)
@@ -386,7 +388,8 @@ def test_update_refused_sealed_log_emitted(tmp_path):
     v1 = pipeline_mod.VerifiedNote(body="## S\nA.\n", grounding_flags=[], flag_count=0)
     p1 = pipeline_mod._create_ai_draft(vault, "Encounter w", "w", _config(), v1)
     scribe_attest(vault, p1, new_status="attested", attester="np_jamie",
-                  clinician_ids={"np_jamie"}, audit_path=vault / "a.jsonl")
+                  clinician_ids={"np_jamie"}, audit_path=vault / "a.jsonl",
+                  allow_incomplete=True, override_reason="test — seal setup")
     v2 = pipeline_mod.VerifiedNote(body="## S\nB.\n", grounding_flags=[], flag_count=0)
     with structlog.testing.capture_logs() as cap:
         with pytest.raises(VaultError):

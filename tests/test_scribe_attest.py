@@ -47,6 +47,10 @@ def _make_ai_draft(tmp_path, *, source_id="enc-abc0123456789d", drafted_by=SCRIB
         set_fields={
             "ai_draft": True, "synthetic": True, "status": "ai_draft",
             "source_id": source_id, "drafted_by": drafted_by,
+            # #58 — these tests attest a COMPLETE encounter (they gate on
+            # lifecycle/attester); carry the completeness marker so the #58
+            # precondition passes and the tests exercise what they target.
+            "encounter_completeness": {"protocol": 1, "complete": True},
         },
         body="## Subjective\nSynthetic patient reports chest pain.\n",
         scope="stayc_clinical",

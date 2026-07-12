@@ -423,7 +423,10 @@ def test_post_attest_audio_refuses_and_surfaces(tmp_path, monkeypatch):
     eid = r.encounter_id
     note_path = state.get(eid).note_path
     scribe_attest(vault, note_path, new_status="attested", attester="np_jamie",
-                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl")
+                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl",
+                  # #58 — this test attests a DRAFTED (never-closed) note directly; use
+                  # the audited override (not about completeness — targets post-attest / draft_original).
+                  allow_incomplete=True, override_reason="test — attesting a drafted note")
     attested_body = vault_read(vault, note_path)["body"]
 
     # NEW audio arrives AFTER attestation (seq 2).
@@ -458,7 +461,8 @@ def test_post_attest_audio_counted_in_run_sweep(tmp_path, monkeypatch):
     eid = compute_encounter_id("enc-P", salt=_SALT)
     scribe_attest(vault, state.get(eid).note_path, new_status="attested",
                   attester="np_jamie", clinician_ids={"np_jamie"},
-                  audit_path=vault / "audit.jsonl")
+                  audit_path=vault / "audit.jsonl",
+                  allow_incomplete=True, override_reason="test — attesting a drafted note")
     _write_chunk(input_dir / "enc-P", 2, ["Post-attest line."])
     counts = asyncio.run(run_sweep(cfg, state, vault))
     assert counts["post_attest_audio"] == 1 and counts["checkpoint_drafted"] == 0
@@ -662,7 +666,10 @@ def test_draft_original_holds_pipeline_body_not_clinician_edit(tmp_path, monkeyp
     assert outcome == "human_edited"
 
     scribe_attest(vault, note_path, new_status="attested", attester="np_jamie",
-                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl")
+                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl",
+                  # #58 — this test attests a DRAFTED (never-closed) note directly; use
+                  # the audited override (not about completeness — targets post-attest / draft_original).
+                  allow_incomplete=True, override_reason="test — attesting a drafted note")
     sealed = frontmatter.load(str(vault / note_path))
 
     # draft_original = the AI's un-edited body; the note body = the clinician's edit.
@@ -827,3 +834,128 @@ def test_57_malformed_manifest_fail_closed_never_ready(tmp_path, monkeypatch):
     assert r.close_ambiguous is True                             # fail-closed even in synthetic
     assert outcome != "ready" and state.get(r.encounter_id).state == STATE_DRAFTED
     assert any(c.get("event") == "scribe.pipeline.close_manifest_ambiguous" for c in caps)
+
+
+# ---------------------------------------------------------------------------
+# #58 — pipeline stamps/clears/self-heals the completeness marker
+# ---------------------------------------------------------------------------
+
+def _marker(vault, note_path):
+    from alfred.vault.ops import vault_read as _vr
+    return (_vr(vault, note_path)["frontmatter"] or {}).get("encounter_completeness")
+
+
+def test_58_ready_stamps_complete_marker_note_stays_ai_draft(tmp_path, monkeypatch):
+    # PIPELINE STAMP: a checkpoint reaching READY (all promised seqs folded + closed)
+    # stamps encounter_completeness.complete=true on the note; the note stays
+    # status=='ai_draft' (attest flips it later). Synthetic empty close →
+    # expected_final_seq=None.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-58s"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    (enc / "_CLOSED").write_text("", encoding="utf-8")           # synthetic empty close
+    r, outcome = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    assert outcome == "ready" and state.get(r.encounter_id).state == STATE_READY
+    note_path = state.get(r.encounter_id).note_path
+    m = _marker(vault, note_path)
+    assert isinstance(m, dict) and m["complete"] is True and m["expected_final_seq"] is None
+    from alfred.vault.ops import vault_read as _vr
+    assert _vr(vault, note_path)["frontmatter"]["status"] == "ai_draft"   # NOT attested
+
+
+def test_58_clinical_ready_stamps_expected_final_seq(tmp_path, monkeypatch):
+    # In clinical mode a real manifest → the marker carries expected_final_seq + folded_through.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-58c"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config(mode="clinical")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    write_close_manifest(enc, 1)                                  # promise 1 (folded)
+    r, outcome = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert outcome == "ready"
+    m = _marker(vault, state.get(r.encounter_id).note_path)
+    assert m["complete"] is True and m["expected_final_seq"] == 1 and m["folded_through"] == 1
+
+
+def test_58_note_first_ordering_stamp_raise_stays_drafted_then_restamps(tmp_path, monkeypatch):
+    # NOTE-FIRST: if the stamp vault_edit raises → STATE stays DRAFTED (NOT READY);
+    # a second sweep with the stamp restored re-stamps and sets READY.
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-58n"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    (enc / "_CLOSED").write_text("", encoding="utf-8")
+    # sweep 1: stamp raises → stays DRAFTED, NOT READY.
+    monkeypatch.setattr(pipeline_mod, "stamp_complete",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stamp boom")))
+    with structlog.testing.capture_logs() as caps:
+        r1, outcome1 = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    assert outcome1 != "ready" and state.get(r1.encounter_id).state == STATE_DRAFTED
+    assert any(c.get("event") == "scribe.pipeline.completeness_stamp_failed" for c in caps)
+    assert _marker(vault, state.get(r1.encounter_id).note_path) is None   # never stamped
+    # sweep 2: stamp restored → re-stamps + READY (proves the re-stamp path).
+    monkeypatch.undo()
+    _install_fake_ollama(monkeypatch)
+    r2, outcome2 = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    assert outcome2 == "ready" and state.get(r2.encounter_id).state == STATE_READY
+    assert _marker(vault, state.get(r2.encounter_id).note_path)["complete"] is True
+
+
+def test_58_clear_on_regen_then_attest_refuses(tmp_path, monkeypatch):
+    # CLEAR-ON-REGEN: a fold-regen through _update_or_refuse_ai_draft sets
+    # encounter_completeness.complete=false ATOMICALLY with the body rewrite; a
+    # subsequent attest on that state refuses encounter_incomplete.
+    from alfred.scribe.attestation import AttestationError
+    _install_fake_ollama(monkeypatch)
+    from alfred.scribe.attest import attest as scribe_attest
+    enc = tmp_path / "inbox" / "enc-58r"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config()
+    # sweep 1: chunk 1 → _create_ai_draft (born markerless).
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    r1, _ = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    note_path = state.get(r1.encounter_id).note_path
+    # sweep 2: chunk 2 → the UPDATE path (_update_or_refuse_ai_draft body_replace)
+    # writes encounter_completeness=regressed(complete:false) ATOMICALLY.
+    _write_chunk(enc, 2, ["Denies fever."])
+    r2, outcome2 = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert outcome2 == "drafted"
+    m = _marker(vault, note_path)
+    assert isinstance(m, dict) and m["complete"] is False        # cleared on the regen
+    # attest on this (regenerated, not-yet-re-finalized) note REFUSES.
+    with pytest.raises(AttestationError) as exc:
+        scribe_attest(vault, note_path, new_status="attested", attester="np_jamie",
+                      clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl")
+    assert exc.value.reason == "encounter_incomplete"
+
+
+def test_58_self_heal_restamps_markerless_ready_note(tmp_path, monkeypatch):
+    # SELF-HEAL MIGRATION: a note at STATE_READY but MARKERLESS (pre-#58) is
+    # re-stamped on the next closed sweep via the elif branch; idempotent.
+    _install_fake_ollama(monkeypatch)
+    from alfred.vault.ops import vault_edit as _ve
+    enc = tmp_path / "inbox" / "enc-58h"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    cfg = _config()
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    (enc / "_CLOSED").write_text("", encoding="utf-8")
+    r1, _ = _checkpoint(enc, config=cfg, state=state, vault=vault)   # → READY + stamped
+    note_path = state.get(r1.encounter_id).note_path
+    # simulate a pre-#58 markerless READY note: strip the marker on disk.
+    _ve(vault, note_path, set_fields={"encounter_completeness": None}, scope="stayc_clinical")
+    assert _marker(vault, note_path) in (None,)                     # markerless now
+    # next closed sweep (state already READY) → self-heal re-stamps.
+    with structlog.testing.capture_logs() as caps:
+        r2, _ = _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert _marker(vault, note_path)["complete"] is True
+    assert any(c.get("event") == "scribe.pipeline.completeness_self_healed" for c in caps)
+    # idempotent — a SECOND sweep does not re-emit the self-heal.
+    with structlog.testing.capture_logs() as caps2:
+        _checkpoint(enc, config=cfg, state=state, vault=vault)
+    assert not any(c.get("event") == "scribe.pipeline.completeness_self_healed" for c in caps2)

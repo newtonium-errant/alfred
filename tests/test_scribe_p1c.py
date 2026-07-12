@@ -238,6 +238,7 @@ def test_authorize_attestation_refuses_empty_creator():
         authorize_attestation(
             current_status=STATUS_AI_DRAFT, new_status=STATUS_ATTESTED,
             attester="dr_synthetic", creator="", clinician_ids=_CLINICIANS,
+            encounter_complete=True,   # #58 required kwarg (this test gates on creator, not completeness)
         )
     assert exc.value.reason == "creator_missing"
 
@@ -257,7 +258,7 @@ def test_authorize_attestation_happy_path_and_log():
         authorize_attestation(
             current_status=STATUS_AI_DRAFT, new_status=STATUS_ATTESTED,
             attester="np_jamie", creator=SCRIBE_DRAFTER_IDENTITY,
-            clinician_ids=_CLINICIANS,
+            clinician_ids=_CLINICIANS, encounter_complete=True,
         )
     ev = [c for c in caps if c.get("event") == "scribe.attestation"]
     assert len(ev) == 1
@@ -273,6 +274,7 @@ def test_authorize_attestation_refuses_self_attest_and_logs():
                 current_status=STATUS_AI_DRAFT, new_status=STATUS_ATTESTED,
                 attester=SCRIBE_DRAFTER_IDENTITY, creator=SCRIBE_DRAFTER_IDENTITY,
                 clinician_ids=_CLINICIANS | {SCRIBE_DRAFTER_IDENTITY},
+                encounter_complete=True,
             )
     ev = [c for c in caps if c.get("event") == "scribe.attestation"]
     assert len(ev) == 1
@@ -285,6 +287,6 @@ def test_authorize_attestation_refuses_un_attest():
         authorize_attestation(
             current_status=STATUS_ATTESTED, new_status=STATUS_AI_DRAFT,
             attester="np_jamie", creator=SCRIBE_DRAFTER_IDENTITY,
-            clinician_ids=_CLINICIANS,
+            clinician_ids=_CLINICIANS, encounter_complete=True,
         )
     assert exc.value.reason == "illegal_status_transition"

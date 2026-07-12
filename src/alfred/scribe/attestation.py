@@ -153,6 +153,36 @@ def validate_attester(
         )
 
 
+def validate_encounter_complete(
+    *, encounter_complete: bool, forced: bool, force_reason: str | None,
+) -> None:
+    """#58 fail-closed completeness precondition. The encounter MUST be provably
+    complete (its note-frontmatter marker read ``complete: true``) unless a human
+    clinician EXPLICITLY forces the attestation with a non-empty reason.
+
+    Raises :class:`AttestationError`:
+      * ``encounter_incomplete`` — the marker is absent/false/malformed AND not
+        forced (the medico-legal core: attest never silently signs an incomplete
+        note);
+      * ``force_without_reason`` — forced but the reason is empty/whitespace (an
+        override must carry an auditable justification)."""
+    if not encounter_complete and not forced:
+        raise AttestationError(
+            "encounter_incomplete",
+            "the encounter is NOT provably complete (its note-frontmatter "
+            "completeness marker is absent/false) — refusing to attest an "
+            "incomplete clinical note. The daemon stamps the marker at the READY "
+            "finalize; a legacy/markerless note requires an explicit, audited "
+            "--force-incomplete with a reason.",
+        )
+    if forced and not (force_reason or "").strip():
+        raise AttestationError(
+            "force_without_reason",
+            "an incomplete-attest override (--force-incomplete) requires a "
+            "non-empty --reason — refusing a reasonless force.",
+        )
+
+
 def authorize_attestation(
     *,
     current_status: str,
@@ -160,16 +190,28 @@ def authorize_attestation(
     attester: str,
     creator: str,
     clinician_ids: Iterable[str],
+    encounter_complete: bool,
+    forced: bool = False,
+    force_reason: str | None = None,
 ) -> None:
     """Combined fail-closed gate for a clinical_note attest transition.
 
-    Runs BOTH controls — forward-only lifecycle AND distinct-human-clinician
-    attester — and emits a ``scribe.attestation`` observability event. Raises
+    Runs THREE controls — the #58 encounter-completeness precondition (FIRST),
+    the forward-only lifecycle, AND the distinct-human-clinician attester — and
+    emits a ``scribe.attestation`` observability event. Raises
     :class:`AttestationError` on the first violation (after logging the refusal
-    with its reason). Call this from the code path that flips a clinical_note's
-    status / sets ``attested_by``.
+    with its reason). ``encounter_complete`` is a REQUIRED keyword (no default) —
+    the fail-closed choice so this primitive can never be called without the
+    completeness verdict. An override (``forced=True`` + a non-empty
+    ``force_reason``) bypasses ONLY the completeness precondition; the lifecycle +
+    attester controls remain ABSOLUTE (a human clinician still takes explicit
+    medico-legal responsibility).
     """
     try:
+        # #58 — completeness is the FIRST refusal (before lifecycle/attester).
+        validate_encounter_complete(
+            encounter_complete=encounter_complete, forced=forced, force_reason=force_reason,
+        )
         validate_status_transition(current_status, new_status)
         validate_attester(
             attester=attester, creator=creator, clinician_ids=clinician_ids,
@@ -181,6 +223,8 @@ def authorize_attestation(
             reason=e.reason,
             from_status=current_status,
             to_status=new_status,
+            encounter_complete=encounter_complete,
+            forced=forced,
         )
         raise
     log.info(
@@ -189,4 +233,6 @@ def authorize_attestation(
         reason="authorized",
         from_status=current_status,
         to_status=new_status,
+        encounter_complete=encounter_complete,
+        forced=forced,
     )

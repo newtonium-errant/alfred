@@ -24,12 +24,14 @@ Deliberately a scribe-layer orchestrator, NOT a ``vault_attest`` op in
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
 
+from alfred.scribe import completeness_marker
 from alfred.scribe.attestation import (
     SCRIBE_DRAFTER_IDENTITY,
     AttestationError,
@@ -39,6 +41,13 @@ from alfred.scribe.identity import compute_encounter_id
 from alfred.vault.ops import vault_edit, vault_read
 
 log = structlog.get_logger(__name__)
+
+
+def _body_sha(body: str) -> str:
+    """sha256 of a note body — the CAS-bracket stability fingerprint. PHI-FREE
+    (irreversible)."""
+    return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
 
 # The privileged scope the orchestrator writes under (SCOPE_RULES). The
 # pipeline/agent scope can never select it; its edit gate allows exactly the
@@ -88,8 +97,16 @@ def attest(
     audit_path: str | Path,
     creator: str | None = None,
     now: datetime | None = None,
+    allow_incomplete: bool = False,
+    override_reason: str | None = None,
 ) -> dict:
     """Attest a clinical_note — the ONLY sanctioned triad writer. Fail-closed.
+
+    #58: refuses unless the encounter is provably complete (its note-frontmatter
+    ``encounter_completeness`` marker reads ``complete: true``), UNLESS
+    ``allow_incomplete=True`` with a non-empty ``override_reason`` (an audited
+    clinician override that bypasses ONLY the completeness precondition — the
+    lifecycle + attester controls stay absolute).
 
     Args:
         vault_path / rel_path: the clinical_note to attest.
@@ -130,15 +147,50 @@ def attest(
     current_status = fm.get("status", "ai_draft")
     effective_creator = creator or fm.get("drafted_by") or SCRIBE_DRAFTER_IDENTITY
 
-    # THE gate — forward-only lifecycle + distinct-human-clinician + non-empty
-    # creator. Raises AttestationError on any violation (self-attest included).
+    # #58 — the encounter-completeness precondition, read from the SAME frontmatter
+    # attest already vault_read (NEVER ScribeState — preserves Gap-E). Fail-closed:
+    # absent/false/malformed marker → incomplete.
+    complete = completeness_marker.is_complete(fm)
+
+    # THE gate — completeness (FIRST, #58) + forward-only lifecycle + distinct-
+    # human-clinician + non-empty creator. Raises AttestationError on the first
+    # violation. An override (allow_incomplete + reason) bypasses ONLY completeness.
     authorize_attestation(
         current_status=current_status,
         new_status=new_status,
         attester=attester,
         creator=effective_creator,
         clinician_ids=clinician_ids,
+        encounter_complete=complete,
+        forced=allow_incomplete,
+        force_reason=override_reason,
     )
+
+    # #58 CAS bracket — a double-read immediately before the triad write closes the
+    # attest-read↔triad-write TOCTOU to microseconds. Re-read the note; REFUSE
+    # note_changed_under_attest unless status is unchanged AND the body-sha is
+    # unchanged from the first read AND (the marker is STILL complete OR this is a
+    # forced override). When forced, skip the marker re-check but STILL assert
+    # status + body stable — even a forced legacy attest can't race a concurrent
+    # regen. (Best-effort, not a hard mutex — a regen between this read and the
+    # triad write is backstopped by the pipeline's post-attest seal detection.)
+    rec2 = vault_read(vault_path, rel_path)
+    fm2 = rec2["frontmatter"] or {}
+    status_stable = fm2.get("status", "ai_draft") == current_status
+    body_stable = _body_sha(rec.get("body", "")) == _body_sha(rec2.get("body", ""))
+    marker_ok = allow_incomplete or completeness_marker.is_complete(fm2)
+    if not (status_stable and body_stable and marker_ok):
+        log.warning(
+            "scribe.attest.note_changed_under_attest",
+            source_id=fm.get("source_id", ""),
+            status_stable=status_stable, body_stable=body_stable, marker_ok=marker_ok,
+        )
+        raise AttestationError(
+            "note_changed_under_attest",
+            "the clinical_note changed between attest's read and the triad write "
+            "(status / body / completeness moved under attest) — refusing to sign "
+            "a moving target. Re-run attest.",
+        )
 
     # Write the triad under the PRIVILEGED scope. vault_edit parses the record
     # type from the note; the ``stayc_clinical_attest`` scope's edit gate
@@ -161,6 +213,25 @@ def attest(
     # scribe.log line below). The file path IS captured in the standard vault
     # audit (data/vault_audit.log) when enabled — a separate, operational trail.
     source_id = fm.get("source_id", "")
+    # #58 — PHI-FREE completeness provenance in the durable trail. ``completeness``
+    # is a fixed enum ("complete" / "incomplete" / "absent") — never free text.
+    completeness = (
+        "complete" if complete
+        else ("incomplete" if isinstance(fm.get(completeness_marker.MARKER_FIELD), dict) else "absent")
+    )
+    forced_engaged = allow_incomplete and not complete
+    if forced_engaged:
+        # Loud, audited override — a clinician took explicit responsibility to sign
+        # an incomplete encounter (the bypass ENGAGED because the note was not
+        # complete). Default (no flag) is strict-refuse, handled by authorize above.
+        log.warning(
+            "scribe.attest.incomplete_override",
+            source_id=source_id,
+            completeness=completeness,
+            attester=attester,
+            detail="ATTESTED an INCOMPLETE encounter under --force-incomplete "
+                   "(audited clinician override).",
+        )
     _append_attest_audit(
         audit_path,
         {
@@ -171,6 +242,14 @@ def attest(
             "to_status": new_status,
             "attester": attester,
             "creator": effective_creator,
+            # #58 — PHI-FREE override provenance. ``forced`` = the flag was set;
+            # ``completeness`` = the enum. The free-text override_reason is
+            # DELIBERATELY NOT stored here.
+            # TODO(#58-D2): route override_reason per the operator decision (attest
+            # audit vs data/vault_audit.log) — until decided, the free-text reason
+            # is NOT written to this by-construction PHI-FREE trail.
+            "forced": bool(allow_incomplete),
+            "completeness": completeness,
         },
     )
     log.info(
@@ -179,6 +258,8 @@ def attest(
         from_status=current_status,
         to_status=new_status,
         attester=attester,
+        completeness=completeness,
+        forced=bool(allow_incomplete),
     )
 
     # #48 self-correcting Part-1 CAPTURE — a READ-ONLY signal (per inferred_diagnosis

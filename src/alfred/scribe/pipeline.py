@@ -38,6 +38,7 @@ import hashlib
 import json
 import re
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,7 @@ from alfred.scribe.close_manifest import (
     read_close_manifest,
     resolve_require_close_manifest,
 )
+from alfred.scribe.completeness_marker import maybe_restamp, regressed, stamp_complete
 from alfred.scribe.config import ScribeConfig
 from alfred.scribe.grounding import verify as verify_grounding
 from alfred.scribe.identity import compute_encounter_id
@@ -343,8 +345,13 @@ def _update_or_refuse_ai_draft(
         )
     # Live ai_draft → mutable. Rewrite body + refresh grounding_flags AND
     # draft_original (P3-b3 retain-the-diff: keep draft_original = the pipeline's
-    # LATEST generated body each checkpoint). Gated again by the stayc_clinical
-    # body_replace + edit carve-outs (draft_original is a DRAFT_EDIT_FIELD).
+    # LATEST generated body each checkpoint). #58: CLEAR the completeness marker
+    # ATOMICALLY with the body rewrite (the body changed → the encounter is no
+    # longer complete until it re-finalizes), so a just-regenerated draft can NEVER
+    # be attested as complete. This rides the SINGLE body_replace choke and only
+    # runs on a LIVE ai_draft (a sealed note raised earlier in this function), so
+    # it NEVER hits the SEALED-deny branch. Gated by the stayc_clinical DRAFT_EDIT
+    # carve-outs (all three fields are DRAFT_EDIT_FIELDS).
     vault_edit(
         vault_path,
         rel_path,
@@ -352,6 +359,9 @@ def _update_or_refuse_ai_draft(
         set_fields={
             "grounding_flags": vnote.grounding_flags,
             "draft_original": vnote.body,
+            "encounter_completeness": regressed(
+                datetime.now(timezone.utc), reason="body regenerated — awaiting re-finalize",
+            ),
         },
         scope="stayc_clinical",
     )
@@ -867,15 +877,51 @@ async def checkpoint_encounter(
                 return "incomplete"
             return outcome                     # STAY DRAFTED — never READY
         # COMPLETE — promote ONLY a clean current draft to `ready`.
-        if cur and cur.state == STATE_DRAFTED:
+        elif cur and cur.state == STATE_DRAFTED:
+            # #58 NOTE-FIRST ordering — stamp the completeness marker on the note
+            # (the artifact attest reads) FIRST, and set STATE_READY ONLY on a
+            # successful stamp. If the stamp raises, STAY DRAFTED (do NOT set READY)
+            # → the DRAFTED-guard re-fires next sweep (while _CLOSED persists) and
+            # re-stamps. This guarantees there is NEVER a state=READY / note-marker-
+            # less window (the reverse — state-DRAFTED / note-marked — self-heals).
+            folded_through = max(folded_seqs, default=0)
+            try:
+                stamp_complete(
+                    vault_path, cur.note_path, now=datetime.now(timezone.utc),
+                    expected_final_seq=expected_final_seq, folded_through=folded_through,
+                )
+            except Exception as e:  # noqa: BLE001 — stamp failed → stay DRAFTED, re-stamp next sweep
+                log.warning(
+                    "scribe.pipeline.completeness_stamp_failed",
+                    encounter_id=encounter_id,
+                    error_class=type(e).__name__,   # class only — NO PHI
+                    detail="completeness stamp failed — STAYING DRAFTED, will "
+                           "re-stamp next sweep (note-first ordering)",
+                )
+                return outcome
             state.set(encounter_id, state=STATE_READY)
             log.info(
                 "scribe.pipeline.encounter_ready",
                 encounter_id=encounter_id,
-                detail="_CLOSED — draft complete (all promised seqs folded), ready "
-                       "for attestation (attest stays orchestrator-only)",
+                detail="_CLOSED — draft complete (all promised seqs folded), marker "
+                       "stamped, ready for attestation (attest stays orchestrator-only)",
             )
             outcome = "ready"
+        # #58 SELF-HEAL — a note already at STATE_READY but MARKERLESS (pre-#58
+        # migration, or the crash window between the stamp and state.set) gets
+        # idempotently re-stamped on this closed sweep. maybe_restamp is a no-op if
+        # the marker is already present or the note is sealed.
+        elif cur and cur.state == STATE_READY:
+            if maybe_restamp(
+                vault_path, cur.note_path, now=datetime.now(timezone.utc),
+                expected_final_seq=expected_final_seq, folded_through=max(folded_seqs, default=0),
+            ):
+                log.info(
+                    "scribe.pipeline.completeness_self_healed",
+                    encounter_id=encounter_id,
+                    detail="markerless READY note re-stamped complete (migration / "
+                           "crash-window self-heal)",
+                )
     return outcome
 
 

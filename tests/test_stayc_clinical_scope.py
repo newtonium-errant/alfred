@@ -284,10 +284,16 @@ def test_draft_edit_fields_matrix_pin():
     # The narrow frontmatter-refresh allowlist for a LIVE draft. Widening is a
     # deliberate matrix change (pre-commit checklist #6). ``draft_original``
     # (P3-b3) is the retain-the-diff AI-body snapshot the pipeline refreshes each
-    # checkpoint; it is a DRAFT_EDIT_FIELD (sealed at attest), not an ATTEST_FIELD.
+    # checkpoint; ``encounter_completeness`` (#58) is the note-completeness marker
+    # the daemon stamps at READY / clears on regen / self-heals — both are
+    # DRAFT_EDIT_FIELDS (writable while ai_draft, SEALED at attest), NOT
+    # ATTEST_FIELDS (attest writes ONLY the triad, so the marker is frozen at attest).
     assert STAYC_CLINICAL_DRAFT_EDIT_FIELDS == frozenset(
-        {"grounding_flags", "draft_original"}
+        {"grounding_flags", "draft_original", "encounter_completeness"}
     )
+    # #58 — encounter_completeness is a DRAFT_EDIT field, NEVER an ATTEST field.
+    assert "encounter_completeness" in STAYC_CLINICAL_DRAFT_EDIT_FIELDS
+    assert "encounter_completeness" not in STAYC_CLINICAL_ATTEST_FIELDS
 
 
 # --- body_replace: the co-pilot's in-place update mechanism ----------------
@@ -490,6 +496,9 @@ def test_e2e_body_replace_updates_draft_then_frozen_on_attest(tmp_path):
         tmp_path, rel_path, new_status="attested", attester="np_jamie",
         clinician_ids={"np_jamie"},
         audit_path=tmp_path / "clinical_attest_audit.jsonl",
+        # #58 — this scope-freeze e2e attests a markerless draft; audited override
+        # (the test targets the attest scope gate, not the completeness precondition).
+        allow_incomplete=True, override_reason="test — scope e2e",
     )
     assert frontmatter.load(str(tmp_path / rel_path))["status"] == "attested"
 
@@ -605,6 +614,8 @@ def test_e2e_draft_then_structural_attest_then_frozen(tmp_path):
         attester="np_jamie",
         clinician_ids={"np_jamie"},
         audit_path=audit_path,
+        # #58 — markerless draft; audited override (targets the attest scope gate).
+        allow_incomplete=True, override_reason="test — scope e2e",
     )
     post = frontmatter.load(str(tmp_path / rel_path))
     assert post["status"] == "attested"

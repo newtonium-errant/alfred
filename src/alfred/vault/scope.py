@@ -1642,13 +1642,26 @@ STAYC_CLINICAL_ATTEST_FIELDS: set[str] = {"attested_by", "attested_at", "status"
 #     field (NOT the body), so writing it does not affect the clobber-detect
 #     body-sha; and it is a DRAFT_EDIT_FIELD (not an ATTEST_FIELD), so attest
 #     SEALS it with the rest of the note.
+#   * ``encounter_completeness`` (#58) — the note-frontmatter completeness marker
+#     the daemon stamps NOTE-FIRST at the READY finalize (and clears atomically
+#     with the body at the regen choke, and self-heals for markerless READY
+#     notes). attest READS it as its fail-closed "encounter is complete"
+#     precondition. It is a DRAFT_EDIT_FIELD (writable while status=='ai_draft')
+#     but DELIBERATELY NOT an ATTEST_FIELD, so it is FROZEN at attest by
+#     construction (attest writes ONLY the triad) and SEALED with the note
+#     thereafter — anti-spoliation inherited, no new seal logic. NAME-DRIFT GUARD:
+#     the vault layer must not import scribe, so this literal is a documented
+#     cross-reference to ``scribe.completeness_marker.MARKER_FIELD`` — a pin test
+#     asserts the two are equal.
 # The attest triad (status / attested_by / attested_at) is NEVER in this set — it
 # stays orchestrator-only in ANY status. Every OTHER clinical field stays locked
 # even while drafting (body content changes via ``body_replace``, not raw
 # frontmatter edits). Widening this set is a deliberate matrix change — update
 # the pin in the same commit (tests/test_stayc_clinical_scope.py, checklist #6).
 STAYC_CLINICAL_DRAFT_EDIT_FIELDS: frozenset[str] = frozenset(
-    {"grounding_flags", "draft_original"}
+    # "encounter_completeness" == scribe.completeness_marker.MARKER_FIELD (#58 —
+    # scope.py can't import scribe; drift-guarded by a pin test).
+    {"grounding_flags", "draft_original", "encounter_completeness"}
 )
 
 
