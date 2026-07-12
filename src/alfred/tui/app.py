@@ -56,7 +56,6 @@ class AlfredApp(App):
         log_dir: Path,
         state_dir: Path,
         max_restarts: int = 5,
-        missing_deps_exit: int = 78,
         version: str = "0.2.0",
         sovereign_enabled: bool = False,
     ) -> None:
@@ -69,7 +68,6 @@ class AlfredApp(App):
         self._log_dir = log_dir
         self._state_dir = state_dir
         self._max_restarts = max_restarts
-        self._missing_deps_exit = missing_deps_exit
         self._version = version
         # #59 — the SAME bool run_all computed at E1 (not re-derived). Drives the
         # shared exit-79 policy in _check_workers; _sovereign_breach latches when

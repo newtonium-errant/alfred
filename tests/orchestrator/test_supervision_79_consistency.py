@@ -156,6 +156,25 @@ def test_rich_dashboard_aborts_on_sovereign_79(tmp_path: Path, rich_headless) ->
     assert started == [], "a sovereign breach must NOT restart anything"
 
 
+def test_rich_dashboard_abort_emits_operator_visible_signal(
+    tmp_path: Path, rich_headless, capsys
+) -> None:
+    """N1 — a sovereign breach must NOT be UI-silent on the Rich path (parity
+    with the Textual notify + the plain-loop prints). After teardown the
+    dashboard prints the breach + refusing-to-re-enter-cloud-reachable lines,
+    naming the breaching slot."""
+    result = _run_rich(
+        tmp_path, procs={"curator": _FakeDead(79)}, sovereign_enabled=True,
+        sentinel_path=None,
+    )
+    assert result is True
+    out = capsys.readouterr().out
+    assert "sovereign boundary breach (exit 79)" in out
+    assert "refusing to re-enter a cloud-reachable state" in out
+    assert "propagating exit 79 to the supervisor" in out
+    assert "[curator]" in out, "the breach message must name the breaching slot"
+
+
 def test_rich_dashboard_drops_79_in_nonsovereign(tmp_path: Path, rich_headless) -> None:
     """NON-sovereign instance + a slot exits 79 → dropped (no restart), and the
     dashboard returns False (no false propagation). The sentinel ends the loop

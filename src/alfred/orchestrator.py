@@ -1641,6 +1641,9 @@ def run_all(
             # capture it and feed the EXISTING E4 propagation (do NOT add a
             # second exit). ``sovereign_enabled`` is the SAME bool computed at
             # E1 — passed down, never re-derived (predicate-consistency).
+            # Default False before the try so a future refactor of this branch
+            # can never reach ``if breached`` with the name unbound (N3).
+            breached = False
             try:
                 from alfred.tui import run_textual_dashboard
                 breached = run_textual_dashboard(

@@ -15,7 +15,6 @@ def run_textual_dashboard(
     log_dir: Path,
     state_dir: Path,
     max_restarts: int = 5,
-    missing_deps_exit: int = 78,
     sovereign_enabled: bool = False,
 ) -> bool:
     """Entry point matching the ``run_live_dashboard`` signature from dashboard.py.
@@ -44,7 +43,6 @@ def run_textual_dashboard(
         log_dir=log_dir,
         state_dir=state_dir,
         max_restarts=max_restarts,
-        missing_deps_exit=missing_deps_exit,
         version=version,
         sovereign_enabled=sovereign_enabled,
     )

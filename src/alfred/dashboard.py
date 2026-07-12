@@ -1043,7 +1043,6 @@ def run_live_dashboard(
     log_dir: Path,
     state_dir: Path,
     max_restarts: int = 5,
-    missing_deps_exit: int = 78,
     sovereign_enabled: bool = False,
 ) -> bool:
     """Run the Rich Live dashboard until Ctrl+C, sentinel file, or a sovereign breach.
@@ -1088,8 +1087,10 @@ def run_live_dashboard(
     active_tools = list(tools)
     # #59 — latched True iff a slot breaches (exit 79) in a sovereign instance;
     # returned so run_all propagates exit 79. Bound before the try so it is
-    # always defined on every exit path.
+    # always defined on every exit path. ``breach_tool`` records which slot
+    # breached so the post-teardown message can name it (N1).
     sovereign_breach = False
+    breach_tool: str | None = None
 
     try:
         with Live(build_layout(data, active_tools), screen=True, refresh_per_second=4) as live:
@@ -1124,9 +1125,13 @@ def run_live_dashboard(
                                 # slot condemns the WHOLE instance — refuse to
                                 # restart ANYTHING, latch the breach, leave both
                                 # loops so the finally stops the tail threads and
-                                # run_all propagates exit 79.
+                                # run_all propagates exit 79. The operator-visible
+                                # message prints AFTER the Live screen is torn
+                                # down (below), so it is not swallowed by the
+                                # alternate screen buffer (N1).
                                 w.status = "stopped"
                                 sovereign_breach = True
+                                breach_tool = tool
                                 break
 
                             if decision == CHILD_EXIT_DROP:
@@ -1171,5 +1176,19 @@ def run_live_dashboard(
         log_tail.stop()
         audit_tail.stop()
         stat_reader.stop()
+
+    if sovereign_breach:
+        # Operator-visible on the restored (non-alternate) screen — parity with
+        # the Textual notify + the plain-loop prints (N1). A sovereign breach is
+        # a safety event; it must NOT look like a routine stop on ANY supervisor
+        # path. Wording mirrors the plain run_all loop.
+        print(
+            f"  [{breach_tool}] sovereign boundary breach (exit 79), NOT "
+            f"restarting — refusing to re-enter a cloud-reachable state"
+        )
+        print(
+            f"  [{breach_tool}] sovereign instance — tearing down all daemons "
+            f"and propagating exit 79 to the supervisor"
+        )
 
     return sovereign_breach
