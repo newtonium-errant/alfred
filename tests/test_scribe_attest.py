@@ -18,10 +18,26 @@ import pytest
 from alfred.scribe import SCRIBE_DRAFTER_IDENTITY, source_id_for
 from alfred.scribe.attest import attest
 from alfred.scribe.attestation import AttestationError
+from alfred.sovereign.boundary import CLOUD_KEY_ENV_VARS
 from alfred.vault.ops import vault_create
 
 _CLINICIANS = {"np_jamie", "dr_synthetic"}
 _NOW = datetime(2026, 7, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_cloud_key_env(monkeypatch):
+    """TEST-HYGIENE (CLAUDE.md dispatcher/boundary env-hygiene contract): the
+    ``cmd_scribe`` attest-CLI tests call ``validate_sovereign_boundary(raw)`` with
+    NO ``env=`` → barrier-c reads LIVE ``os.environ``. A PRIOR test in the full
+    suite that leaks a cloud credential (e.g. ANTHROPIC_API_KEY) into
+    ``os.environ`` and doesn't scrub it makes barrier-c refuse the attest
+    (correct fail-closed production behavior, but env-bleed in tests). Scrub EVERY
+    ``CLOUD_KEY_ENV_VARS`` entry at setup — imported (not hardcoded) so it stays in
+    lockstep with the boundary — so every attest-CLI test runs cloud-key-free
+    regardless of prior-test bleed."""
+    for key in CLOUD_KEY_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
 
 
 def _make_ai_draft(tmp_path, *, source_id="enc-abc0123456789d", drafted_by=SCRIBE_DRAFTER_IDENTITY):
