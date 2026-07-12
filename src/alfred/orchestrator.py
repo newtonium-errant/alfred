@@ -1483,6 +1483,21 @@ def run_all(
     # here in the parent — BEFORE any child is forked below — so nothing
     # ever starts cloud-reachable. No-op for every non-sovereign instance.
     _enforce_sovereign_boundary_or_exit(raw)
+    # GROUND #7 sovereign-gated exit-79 propagation (#42). The pre-spawn gate
+    # above refuses at LOAD; this pair of locals carries the RUNTIME half. A
+    # sovereign instance whose child breaches the no-egress boundary at runtime
+    # exits ``_SOVEREIGN_BREACH_EXIT`` (79). Without the propagation wired below,
+    # the monitor loop would merely drop that slot and — once the roster empties
+    # — return exit 0, so systemd's ``RestartPreventExitStatus=79`` would never
+    # fire and the instance could be restarted straight back into a
+    # cloud-reachable state. ``sovereign_breach`` is latched ONLY at the
+    # 79-detection site (never on "the loop broke"), so a graceful
+    # ``alfred down``/SIGTERM — which breaks the loop earlier via
+    # ``shutdown_requested`` — can never false-propagate 79. Gated on
+    # ``sovereign.enabled`` so every non-sovereign instance keeps today's
+    # drop-and-continue behavior byte-for-byte.
+    sovereign_enabled = bool((raw.get("sovereign") or {}).get("enabled") is True)
+    sovereign_breach = False
     # Resolve transport env vars once — orchestrator injects these
     # into every tool's child environment so any subprocess can call
     # the outbound-push client without looking at config.yaml again.
@@ -1629,6 +1644,22 @@ def run_all(
                                         f"(exit 79), NOT restarting — refusing to "
                                         f"re-enter a cloud-reachable state"
                                     )
+                                    if sovereign_enabled:
+                                        # Sovereign instance: a single slot's
+                                        # runtime breach condemns the WHOLE
+                                        # instance (abort-all-siblings, R9). Latch
+                                        # the flag HERE — at the 79-detection site
+                                        # only — and break the roster loop; E3
+                                        # then leaves the monitor loop so the
+                                        # finally SIGTERM/SIGKILLs every remaining
+                                        # child, and E4 re-raises 79 to systemd.
+                                        print(
+                                            f"  [{tool}] sovereign instance — "
+                                            f"tearing down all daemons and "
+                                            f"propagating exit 79 to the supervisor"
+                                        )
+                                        sovereign_breach = True
+                                        break
                                 else:
                                     print(f"  [{tool}] missing dependencies, not restarting")
                                 tools = [t for t in tools if t != tool]
@@ -1640,6 +1671,15 @@ def run_all(
                             else:
                                 print(f"  [{tool}] exceeded restart limit, giving up")
                                 tools = [t for t in tools if t != tool]
+
+                    # E3 — sovereign breach latched at the 79-detection site
+                    # above: leave the ``while True:`` monitor loop so the
+                    # finally tears every remaining child down. NOT ``if not
+                    # tools`` — the breaching slot was deliberately left in the
+                    # roster (we broke before dropping it), so this is the ONLY
+                    # exit for the sovereign-abort path.
+                    if sovereign_breach:
+                        break
 
                     if not tools:
                         print("All daemons failed, exiting.")
@@ -1690,3 +1730,11 @@ def run_all(
             workers_json_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    # E4 — sovereign breach propagation. Runs AFTER the finally has
+    # SIGTERM/SIGKILLed every child (nothing is left cloud-reachable), so the
+    # supervisor sees exit 79 and systemd's ``RestartPreventExitStatus=79``
+    # keeps the instance DOWN. Non-sovereign instances never latch
+    # ``sovereign_breach`` → this is a no-op and run_all returns None as before.
+    if sovereign_breach:
+        sys.exit(_SOVEREIGN_BREACH_EXIT)

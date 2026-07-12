@@ -1,0 +1,60 @@
+[Unit]
+Description=STAY-C — sovereign ambient clinical scribe (PHI · local-only · no cloud egress)
+After=network.target
+# DELIBERATELY no PartOf= / no WantedBy=algernon.target — standalone lifecycle,
+# never joins the salem/kal-le/hypatia fan-out (GROUND #1,#6). STAY-C is NOT a
+# row in ~/.alfred/instances.yaml; it is installed by its OWN dedicated
+# installer (alfred.scripts.install_stayc_unit), never by install_systemd_units.
+
+[Service]
+Type=simple
+WorkingDirectory=<ALFRED_REPO>
+ExecStart=<ALFRED_REPO>/.venv/bin/python -m alfred --config <STAYC_CONFIG> up --_internal-foreground
+# --- barrier-(c) cloud-key scrub (DETERMINATE B): manager-enforced regardless of launch, supersedes the header's env -u wrapper ---
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL GROQ_API_KEY DEEPGRAM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY ELEVENLABS_API_KEY TOGETHER_API_KEY ZO_API_KEY RESEND_API_KEY
+# salt-only, 0600, sited OUTSIDE the config dir so barrier-(c)'s sibling-.env autoload never sees it; carries NO cloud key
+EnvironmentFile=<STAYC_SECRETS_ENV>
+# real-need iii: relocate HF STT cache off /home + force offline model load
+Environment=HF_HOME=<STAYC_HF_HOME>
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=<STAYC_VAULT> <STAYC_DATA> <STAYC_HF_HOME>
+ReadOnlyPaths=<STAYC_CONFIG>
+PrivateTmp=yes
+UMask=0077
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# best-effort egress belt — PROBED at boot, LOGGED enforced|unverified, NON-GATING (Approach B; GROUND #8). Order irrelevant (both accumulate); allow keeps 127.0.0.0/8 + ::1 reachable even when enforced.
+IPAddressAllow=localhost
+IPAddressDeny=any
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStopSec=30s
+# 78 = missing-deps sentinel; 79 = sovereign boundary breach — load-bearing ONLY
+# because of the orchestrator's sovereign-gated exit-79 propagation (GROUND #7):
+# the --_internal-foreground plain monitor loop tears every child down and
+# re-raises 79 so this directive keeps STAY-C DOWN. (The live TUI/dashboard
+# supervision paths do NOT yet honor 79 — task #59; STAY-C runs non-live so it
+# is unaffected today.)
+RestartPreventExitStatus=78 79
+# DELIBERATELY OMITTED (would break real-need iii — STT native inference):
+# MemoryDenyWriteExecute (kills ctranslate2/torch W+X JIT) and
+# SystemCallFilter=@system-service (risks silently killing native STT). Left as
+# an on-box-validated future tightening, NOT in the shipped load-bearing set.
+
+[Install]
+WantedBy=default.target

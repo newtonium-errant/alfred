@@ -34,6 +34,20 @@
 # AND there is no cloud-key sibling .env at /data/algernon/stayc-clinical/ to
 # re-introduce them. Barrier (c) refuses at load if either fails.
 #
+# ── PERSISTENCE (preferred: hardened systemd --user unit — #42) ──
+# For a box that must survive reboots + terminal exit, install the STANDALONE
+# hardened unit instead of the manual env -u launch above (the manual launch
+# stays a valid supervised-console fallback):
+#
+#   python -m alfred.scripts.install_stayc_unit    # renders + installs the unit
+#   systemctl --user start alfred-stayc-clinical.service
+#
+# The unit is STANDALONE — NOT a row in ~/.alfred/instances.yaml, NOT part of
+# algernon.target. It manager-enforces the cloud-key scrub (UnsetEnvironment),
+# an fs sandbox (ProtectSystem=strict, ReadWritePaths=vault+data+HF), and a
+# best-effort kernel egress belt (IPAddressDeny=any) that the scribe PROBES at
+# boot but never trusts. See the installer + the frozen #42 spec for rollback.
+#
 # P1-d is the STANDUP only — the daemon boots in synthetic mode, validates the
 # boundary, arms the http guard, emits `scribe.daemon.up`, and sits idle-ready.
 # The audio→note pipeline is P2. `scribe.mode: synthetic` is the fail-closed
@@ -84,6 +98,24 @@ scribe:
   # field, so no boundary barrier applies. Deploy fills the real clinician ids
   # (e.g. "np_jamie"); the AI scribe drafter ("stayc_scribe") can never attest.
   clinicians: []
+  # Kernel-egress belt PROBE (#42) — a SUBsection of scribe (barrier-d safe:
+  # not a new top-level section). Best-effort observability ONLY: the daemon
+  # never trusts or gates on it — the load-bearing egress control is the
+  # sovereign boundary + the http guard. At boot the daemon connects (SYN only,
+  # NO payload) to `canary` to probe whether the systemd IPAddressDeny belt is
+  # live, and logs `scribe.egress_firewall.enforced` (EPERM — belt live, NO
+  # packet left the box) or `.unverified` (belt unproven — Python guard is the
+  # SOLE verified control). It also connects to `loopback` (Ollama) so an
+  # IPAddressAllow over-block that severed the local model fails LOUD.
+  #
+  # ⚠️ When enabled:true the daemon fires ONE payload-free off-box canary SYN at
+  # boot — ONLY on the unverified path (EPERM is synchronous, so when the belt
+  # IS enforced NO packet ever leaves). Set enabled:false to suppress that SYN
+  # entirely (the daemon then logs `scribe.egress_firewall.probe_disabled`).
+  egress_probe:
+    enabled: true
+    canary: "1.1.1.1:443"          # off-box routable target — SYN only, never any payload
+    loopback: "127.0.0.1:11434"    # Ollama loopback — must stay reachable (real-need i)
 
 # ---------------------------------------------------------------------------
 # Vault — STAY-C's OWN PHI vault, physically separate from every other vault

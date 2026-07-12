@@ -87,6 +87,35 @@ def startup(
     from alfred.scribe.stt import ensure_backend_available
     ensure_backend_available(config)
 
+    # (c.2) Non-gating kernel-egress belt probe (#42). Best-effort only: the
+    # load-bearing egress control is the boundary gate + the http guard armed
+    # above — this just PROBES the systemd IPAddressDeny belt and LOGS
+    # enforced|unverified (+ a loopback-severed WARN if IPAddressAllow
+    # over-blocked Ollama). It NEVER gates boot, so any exception is swallowed
+    # (observability-only). Gated on ``scribe.egress_probe.enabled`` (default
+    # true) — when enabled it fires ONE payload-free off-box canary SYN on the
+    # unverified path; set it false to suppress that SYN. NOTE: EPERM is
+    # synchronous, so when the belt IS enforced no packet ever leaves the box.
+    probe_cfg = (raw.get("scribe") or {}).get("egress_probe") or {}
+    if probe_cfg.get("enabled", True):
+        try:
+            from alfred.sovereign.egress_probe import probe_kernel_egress_firewall
+            probe_kernel_egress_firewall(
+                canary=probe_cfg.get("canary", "1.1.1.1:443"),
+                loopback=probe_cfg.get("loopback", "127.0.0.1:11434"),
+                logger=log,
+            )
+        except Exception:  # noqa: BLE001 — probe is observability-only, never gates boot
+            log.warning(
+                "scribe.egress_firewall.probe_skipped",
+                detail="egress probe raised unexpectedly — swallowed (non-gating, observability-only)",
+            )
+    else:
+        log.info(
+            "scribe.egress_firewall.probe_disabled",
+            detail="scribe.egress_probe.enabled:false — kernel-belt probe skipped, NO off-box canary SYN fired",
+        )
+
     # (d) ILB up signal.
     log.info(
         "scribe.daemon.up",
