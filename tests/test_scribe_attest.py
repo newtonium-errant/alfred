@@ -216,10 +216,13 @@ def _write_config(tmp_path, body: dict) -> str:
     return str(p)
 
 
-def _scribe_args(config_path, note="clinical_note/x.md"):
+def _scribe_args(config_path, note="clinical_note/x.md", *,
+                 force_incomplete=False, reason=None, attester="np_jamie",
+                 new_status="attested"):
     import argparse
     return argparse.Namespace(config=config_path, scribe_cmd="attest", note=note,
-                              attester="np_jamie", new_status="attested")
+                              attester=attester, new_status=new_status,
+                              force_incomplete=force_incomplete, reason=reason)
 
 
 def test_attest_cli_installs_guard_before_attest_for_sovereign(tmp_path, monkeypatch):
@@ -310,3 +313,102 @@ def test_attest_cli_refuses_on_sovereign_boundary_breach(tmp_path, monkeypatch):
         assert called["attest"] is False                   # refused BEFORE the write
     finally:
         uninstall_sovereign_http_guard()
+
+
+# ---------------------------------------------------------------------------
+# #58 D1/D2 — the CLI --force-incomplete override + reason → vault audit
+# ---------------------------------------------------------------------------
+
+def _cli_config(tmp_path, *, mode="synthetic"):
+    return _write_config(tmp_path, {
+        "vault": {"path": str(tmp_path / "vault")},
+        "logging": {"dir": str(tmp_path / "data")},
+        "scribe": {"clinicians": ["np_jamie"], "encounter_salt": "s", "mode": mode,
+                   "stt": {"provider": "fake"}, "llm": {"base_url": "http://127.0.0.1:11434"}},
+    })
+
+
+def _markerless_draft(tmp_path, *, source_id="enc-abc0123456789d"):
+    from alfred.vault.ops import vault_create
+    return vault_create(
+        tmp_path / "vault", "clinical_note", f"Synthetic enc {source_id}",
+        set_fields={"ai_draft": True, "synthetic": True, "status": "ai_draft",
+                    "source_id": source_id, "drafted_by": "stayc_scribe"},
+        body="## Subjective\nReports chest pain.\n", scope="stayc_clinical",
+    )["path"]
+
+
+def test_cli_force_incomplete_e2e_reason_to_vault_audit_not_attest_audit(tmp_path):
+    from alfred import cli
+    from alfred.vault.ops import vault_read
+    cfg = _cli_config(tmp_path)
+    rel = _markerless_draft(tmp_path)
+    reason = "recorder died mid-visit"
+    cli.cmd_scribe(_scribe_args(cfg, note=rel, force_incomplete=True, reason=reason))
+
+    # attested.
+    assert vault_read(tmp_path / "vault", rel)["frontmatter"]["status"] == "attested"
+    data = tmp_path / "data"
+    attest_audit = (data / "clinical_attest_audit.jsonl").read_text()
+    vault_audit = (data / "vault_audit.log").read_text()
+    # the free-text reason is in the VAULT audit, NOT the (PHI-free) attest audit.
+    assert reason in vault_audit and reason not in attest_audit
+    aa = json.loads(attest_audit.strip())
+    assert aa["forced"] is True and aa["completeness"] == "absent"
+    assert "reason" not in aa and "override_reason" not in aa       # PHI-free pin
+
+
+def test_cli_force_incomplete_without_reason_refuses_non_zero_exit(tmp_path):
+    from alfred import cli
+    from alfred.vault.ops import vault_read
+    cfg = _cli_config(tmp_path)
+    rel = _markerless_draft(tmp_path)
+    for bad in (None, "", "   "):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_scribe(_scribe_args(cfg, note=rel, force_incomplete=True, reason=bad))
+        assert exc.value.code == 1
+    # never attested, no triad.
+    assert vault_read(tmp_path / "vault", rel)["frontmatter"]["status"] == "ai_draft"
+
+
+def test_cli_strict_refuse_without_force(tmp_path):
+    # No --force-incomplete on a markerless note → strict refuse (encounter_incomplete).
+    from alfred import cli
+    from alfred.vault.ops import vault_read
+    cfg = _cli_config(tmp_path)
+    rel = _markerless_draft(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_scribe(_scribe_args(cfg, note=rel))
+    assert exc.value.code == 1
+    assert vault_read(tmp_path / "vault", rel)["frontmatter"]["status"] == "ai_draft"
+
+
+def test_cli_force_incomplete_works_in_clinical_mode(tmp_path):
+    # Q1 — the flag is NOT mode-gated; it works in clinical mode too.
+    from alfred import cli
+    from alfred.vault.ops import vault_read
+    cfg = _cli_config(tmp_path, mode="clinical")
+    rel = _markerless_draft(tmp_path)
+    cli.cmd_scribe(_scribe_args(cfg, note=rel, force_incomplete=True, reason="clinical override"))
+    assert vault_read(tmp_path / "vault", rel)["frontmatter"]["status"] == "attested"
+    assert "clinical override" in (tmp_path / "data" / "vault_audit.log").read_text()
+
+
+@pytest.mark.parametrize("phi_reason", [
+    "patient John Doe DOB 1980-01-01 coded before signature",
+    "MRN 4432211 — device failed",
+])
+def test_cli_attest_audit_never_contains_reason_phi_free_invariant(tmp_path, phi_reason):
+    # PHI-FREE INVARIANT: whatever the --reason text, the clinical_attest_audit.jsonl
+    # NEVER carries it — it lands ONLY in the vault audit.
+    from alfred import cli
+    cfg = _cli_config(tmp_path)
+    rel = _markerless_draft(tmp_path)
+    cli.cmd_scribe(_scribe_args(cfg, note=rel, force_incomplete=True, reason=phi_reason))
+    data = tmp_path / "data"
+    assert phi_reason not in (data / "clinical_attest_audit.jsonl").read_text()   # PHI-free
+    # the reason IS in the vault audit — decode the JSONL (on-disk JSON escapes
+    # non-ASCII like the em-dash, so check the decoded ``detail`` value).
+    va_details = [json.loads(ln)["detail"]
+                  for ln in (data / "vault_audit.log").read_text().splitlines() if ln.strip()]
+    assert any(phi_reason in d for d in va_details)

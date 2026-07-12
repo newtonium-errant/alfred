@@ -38,6 +38,7 @@ from alfred.scribe.attestation import (
     authorize_attestation,
 )
 from alfred.scribe.identity import compute_encounter_id
+from alfred.vault.mutation_log import append_to_audit_log, build_audit_mutations
 from alfred.vault.ops import vault_edit, vault_read
 
 log = structlog.get_logger(__name__)
@@ -99,6 +100,7 @@ def attest(
     now: datetime | None = None,
     allow_incomplete: bool = False,
     override_reason: str | None = None,
+    vault_audit_path: str | Path | None = None,
 ) -> dict:
     """Attest a clinical_note — the ONLY sanctioned triad writer. Fail-closed.
 
@@ -122,6 +124,17 @@ def attest(
             refuses the scribe attesting its own draft even on P1-b notes that
             predate ``drafted_by``.
         now: attestation timestamp (defaults to UTC now); injectable for tests.
+        allow_incomplete: the audited --force-incomplete override — attest an
+            incomplete encounter (bypasses ONLY the completeness precondition;
+            lifecycle + attester stay absolute). Requires a non-empty
+            ``override_reason`` (else ``force_without_reason``).
+        override_reason: the free-text justification for a forced override. #58-D2:
+            routed to the VAULT AUDIT (``vault_audit_path``), NEVER the PHI-free
+            ``audit_path`` (clinical_attest_audit.jsonl).
+        vault_audit_path: the general vault mutation-provenance trail
+            (``<logging.dir>/vault_audit.log``). Where a forced override's
+            free-text ``override_reason`` is recorded (keeps the attest audit
+            PHI-free by construction). No-op if unset.
 
     Returns:
         the ``vault_edit`` result dict.
@@ -232,6 +245,24 @@ def attest(
             detail="ATTESTED an INCOMPLETE encounter under --force-incomplete "
                    "(audited clinician override).",
         )
+        # #58-D2 (operator decision) — route the FREE-TEXT override_reason to the
+        # VAULT AUDIT (``<logging.dir>/vault_audit.log`` — the general
+        # mutation-provenance trail that already carries arbitrary ``detail`` text),
+        # NOT the clinical_attest_audit.jsonl. This keeps the attest audit
+        # PHI-FREE by construction (it records only ``forced`` + the completeness
+        # enum below — never the reason). override_reason is guaranteed non-empty
+        # here (authorize raised force_without_reason otherwise). No-op if the
+        # caller didn't supply a vault-audit path.
+        if vault_audit_path is not None:
+            append_to_audit_log(
+                vault_audit_path,
+                "scribe",
+                build_audit_mutations("edit", rel_path),
+                detail=(
+                    f"force-incomplete attest override (completeness={completeness}, "
+                    f"attester={attester}): {override_reason}"
+                ),
+            )
     _append_attest_audit(
         audit_path,
         {
@@ -243,11 +274,9 @@ def attest(
             "attester": attester,
             "creator": effective_creator,
             # #58 — PHI-FREE override provenance. ``forced`` = the flag was set;
-            # ``completeness`` = the enum. The free-text override_reason is
-            # DELIBERATELY NOT stored here.
-            # TODO(#58-D2): route override_reason per the operator decision (attest
-            # audit vs data/vault_audit.log) — until decided, the free-text reason
-            # is NOT written to this by-construction PHI-FREE trail.
+            # ``completeness`` = the enum. The free-text override_reason is NEVER
+            # written to this by-construction PHI-FREE trail — it lands ONLY in the
+            # vault audit above (#58-D2 operator decision).
             "forced": bool(allow_incomplete),
             "completeness": completeness,
         },

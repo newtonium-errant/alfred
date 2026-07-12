@@ -2666,6 +2666,9 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
     log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
     audit_path = log_dir / "clinical_attest_audit.jsonl"
+    # #58-D2 — the free-text --reason for a forced override lands HERE (the general
+    # vault mutation-provenance trail), keeping clinical_attest_audit.jsonl PHI-free.
+    vault_audit_path = log_dir / "vault_audit.log"
 
     try:
         result = scribe_attest(
@@ -2675,6 +2678,12 @@ def cmd_scribe(args: argparse.Namespace) -> None:
             attester=args.attester,
             clinician_ids=set(cfg.clinicians),
             audit_path=audit_path,
+            # #58 D1 — the audited override (available in all modes). An empty
+            # --reason with --force-incomplete surfaces as a clean force_without_reason
+            # refusal below (non-zero exit, no triad written).
+            allow_incomplete=args.force_incomplete,
+            override_reason=args.reason,
+            vault_audit_path=vault_audit_path,
         )
     except Exception as e:  # noqa: BLE001 — surface any attest refusal to the operator
         print(f"Attest REFUSED: {e}")
@@ -3516,6 +3525,26 @@ def build_parser() -> argparse.ArgumentParser:
     scribe_attest.add_argument(
         "--new-status", default="attested", choices=["attested", "amended"],
         help="Target status (forward-only lifecycle; default: attested)",
+    )
+    # #58 — audited override of the completeness precondition (available in ALL
+    # modes, incl. clinical — it is opt-in; default is strict-refuse). Bypasses
+    # ONLY the completeness gate; the lifecycle + distinct-clinician attester
+    # remain absolute. Requires --reason (empty/absent → refused).
+    scribe_attest.add_argument(
+        "--force-incomplete", action="store_true",
+        help=(
+            "Attest an INCOMPLETE encounter (no/false completeness marker) — an "
+            "audited clinician override. Requires --reason. Bypasses ONLY the "
+            "completeness precondition (lifecycle + attester still enforced)."
+        ),
+    )
+    scribe_attest.add_argument(
+        "--reason", default=None,
+        help=(
+            "Justification for --force-incomplete (REQUIRED with it). Recorded in "
+            "the VAULT AUDIT (data/vault_audit.log), NOT the PHI-free attest audit "
+            "— keep it PHI-free where possible."
+        ),
     )
 
     # distiller
