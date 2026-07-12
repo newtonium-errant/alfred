@@ -6,9 +6,11 @@ import type { SessionUser } from './types';
 // the browser never sees the session token. Errors surface as `ApiError`.
 
 export const authApi = {
-  // POST /auth/login {email} → uniform { status:"sent" } (no account enumeration).
-  login: (email: string): Promise<{ status: string }> =>
-    postJson<{ status: string }>('/api/auth/login', { email }),
+  // POST /auth/login {email, next?} → uniform { status:"sent" } (no account
+  // enumeration). `next` is relayed only when present so the no-deep-link path
+  // sends the same body it always did.
+  login: (email: string, next?: string): Promise<{ status: string }> =>
+    postJson<{ status: string }>('/api/auth/login', { email, ...(next ? { next } : {}) }),
 
   // Clears the session cookie server-side.
   logout: (): Promise<{ status: string }> =>

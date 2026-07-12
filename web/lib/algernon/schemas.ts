@@ -48,6 +48,11 @@ export const sessionKeySchema = z.string().min(1).max(200);
 // a non-empty string is present so we can return the contract's email_required.
 export const loginBodySchema = z.object({
   email: z.string().trim().min(1).max(320),
+  // Optional post-auth redirect target, relayed to the backend which embeds it in
+  // the magic link (?next=…). NOT sanitised here — the backend's safe_next_path is
+  // the authority, and auth/callback re-guards it via safeNextPath before redirect.
+  // Bounded as an edge guard (an unbounded value is a DoS surface).
+  next: z.string().max(2048).optional(),
 });
 
 // The magic-link token posted to /api/auth/verify (via the callback).

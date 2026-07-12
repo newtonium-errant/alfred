@@ -33,6 +33,10 @@ function callbackErrorMessage(code: string | string[] | undefined): string | nul
 // the BFF /api/auth/login call).
 export default function LoginPage() {
   const router = useRouter();
+  // Where to land after sign-in (deep-link). Passed to the backend, which embeds
+  // it in the magic link; auth/callback re-guards it via safeNextPath. A repeated
+  // ?next= yields string[] — take the first.
+  const nextParam = Array.isArray(router.query.next) ? router.query.next[0] : router.query.next;
   const [email, setEmail] = useState('');
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState(false);
@@ -45,7 +49,7 @@ export default function LoginPage() {
     setError(null);
     setSending(true);
     try {
-      await authApi.login(email.trim());
+      await authApi.login(email.trim(), nextParam);
       setSent(true);
     } catch (err) {
       if (err instanceof ApiError && err.code === 'email_not_configured') {
