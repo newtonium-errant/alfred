@@ -53,6 +53,16 @@ THE THREE FROZEN LITERALS the renderer / grounding emit (verbatim):
 Extract-not-infer is enforced by (a) the PROMPT (prompt-tuner) and (b) the
 deterministic GROUNDING pass. The CODE here renders FAITHFULLY + flags — it
 never adds, removes, or "fixes" a claim.
+
+P4-3 (speaker-diarization) adds an INPUT-only signal, NOT an output-contract
+change: when ``transcript.diarized`` is True ``build_prompt`` tags each segment
+line with an uppercase ``[ROLE]`` ([CLINICIAN]/[PATIENT]/[OTHER]/[UNKNOWN]), and
+SYSTEM_PROMPT rule 7 teaches the model to PLACE content by those tags (patient
+content → Subjective; a patient-reported home vital → Subjective NOT Objective; a
+patient lay self-diagnosis → Subjective NOT Assessment). The output JSON shape is
+UNCHANGED — the model emits NO role / attribution field (extract-not-infer holds);
+the deterministic ``speaker_attribution`` pass re-derives attribution from the
+``[S#]`` citation graph × ``Segment.speaker``.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -67,7 +77,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from alfred.scribe.config import ScribeConfig
-from alfred.scribe.transcript import Transcript
+from alfred.scribe.transcript import Transcript, normalize_role
 
 if TYPE_CHECKING:  # annotation only — avoids a notegen↔grounding import cycle
     from alfred.scribe.grounding import GroundingResult
@@ -175,6 +185,23 @@ _NOTEGEN_OLLAMA_OPTIONS: dict = {
 #       refuse the note. This is the PROVABLY-correct safety net; the estimate
 #       above is only a hint.
 _CHARS_PER_TOKEN = 2.5          # low (over-estimating) rate — first-line hint only
+# TWO rates because the estimate covers two DIFFERENT text kinds:
+#   (a) the VARIABLE transcript is digit / timestamp / header-dense (vitals, doses,
+#       ``S## [x-y s]:`` prefixes tokenize at ~2.0-2.2 chars/tok) → 2.5 stays
+#       deliberately conservative there. But the FIXED English-prose SYSTEM_PROMPT
+#       tokenizes at ~4 chars/tok; applying 2.5 to it OVER-counts ~1.6× — and once
+#       the P4-3 rule + worked examples grew the prompt, that over-count alone
+#       exceeded num_ctx−output−margin → a NEGATIVE budget → EVERY generation
+#       false-refused ContextBudgetExceeded (even a 1-segment encounter).
+#   (b) UNDER-estimating the FIXED prompt is the SAFE direction: the pre-flight is
+#       only a cheap efficiency HINT; the AUTHORITATIVE never-accept-a-truncated-
+#       note guard is the post-call ``prompt_eval_count >= _PROMPT_TRUNCATION_CEILING``
+#       check (Ollama's real tokenizer), which this does NOT touch. Worst case a
+#       looser pre-flight lets a case through that the post-call guard then refuses
+#       (an efficiency cost, never a safety one).
+#   (c) empirical anchor: the current SYSTEM_PROMPT is ~15075 chars ≈ 3769 real
+#       tokens (chars/4.0), well within the window; chars/2.5 mis-estimated it 6030.
+_PROSE_CHARS_PER_TOKEN = 4.0    # English-prose rate — for the FIXED SYSTEM_PROMPT only
 _HEADER_TOKENS_PER_SEGMENT = 8  # fixed surcharge/seg for the dense ``S## [x-y s]:`` header
 _BUDGET_SAFETY_MARGIN = 512     # slack for tokenizer variance vs the char estimate
 # A prompt Ollama evaluated at/above this many tokens did NOT safely fit
@@ -186,12 +213,15 @@ _BUDGET_SAFETY_MARGIN = 512     # slack for tokenizer variance vs the char estim
 _PROMPT_TRUNCATION_CEILING = _NUM_CTX - _NUM_PREDICT
 
 
-def _estimate_tokens(text: str) -> int:
-    """Conservative (over-estimating) token count for ``text`` — ceil(chars/2.5).
+def _estimate_tokens(text: str, chars_per_token: float = _CHARS_PER_TOKEN) -> int:
+    """Estimate a token count for ``text`` — ``ceil(chars / chars_per_token)``.
 
-    A first-line efficiency HINT only; the authoritative guard is the post-call
+    Defaults to the conservative transcript rate (2.5); pass
+    :data:`_PROSE_CHARS_PER_TOKEN` (4.0) for the FIXED English-prose SYSTEM_PROMPT
+    so its estimate is not over-counted ~1.6× (see the rate constants above). A
+    first-line efficiency HINT only; the authoritative guard is the post-call
     ``prompt_eval_count`` check (Ollama's real tokenizer)."""
-    return math.ceil(len(text) / _CHARS_PER_TOKEN)
+    return math.ceil(len(text) / chars_per_token)
 
 # The clinical extract-not-infer system prompt (scribe P2-c). Authored to the
 # FROZEN CONTRACT above: the model emits EXACTLY the four-SOAP-section JSON object
@@ -204,8 +234,10 @@ def _estimate_tokens(text: str) -> int:
 # NOT spuriously flagged. Empty section ⇒ empty list ``[]`` (``render_soap``
 # supplies the ``NOT_ADDRESSED`` literal; a ``{claim:"Not addressed"}`` object
 # with no spans would be flagged ``ungrounded_assertion`` — do NOT emit one).
-# Every worked example below was walked against ``grounding.verify`` to render
-# ZERO flags. See the module docstring for the contract this is authored against.
+# Every worked example below was walked against the deterministic checks to render
+# ZERO flags — Examples A/B against ``grounding.verify``, and the diarized P4-3
+# Examples C/D against the full stack (``verify`` + ``check_inferred_diagnoses`` +
+# ``check_speaker_attribution``). See the module docstring for the contract.
 SYSTEM_PROMPT = """You are a clinical scribe. Your ONLY job is to EXTRACT what \
 was actually said in a recorded clinical encounter into a structured SOAP note. \
 You are NOT a diagnostician and you do NOT reason about the case for the \
@@ -213,13 +245,24 @@ clinician. The note you produce is a DRAFT the clinician will read, correct, and
 attest — a faithful extraction with honest gaps is ALWAYS better than a fluent \
 invention.
 
-You are given a transcript as numbered segments, one per line:
+You are given a transcript as numbered segments, one per line. Each segment has a
+stable id — the "S#" token at the START of the line. You will cite these ids.
+
+When the encounter has been speaker-diarized, each line ALSO carries an uppercase
+[ROLE] tag, after the [start-end s] timestamp, naming who spoke:
+
+    S1 [0.0-6.0s] [CLINICIAN]: <what the clinician said>
+    S2 [6.0-12.0s] [PATIENT]: <what the patient said>
+
+The roles are [CLINICIAN], [PATIENT], [OTHER] (someone else in the room, e.g. a
+caregiver or family member), and [UNKNOWN] (the speaker could not be identified).
+When the encounter is NOT diarized the lines have NO [ROLE] tag:
 
     S1 [0.0-6.0s]: <what was said>
     S2 [6.0-12.0s]: <what was said>
 
-Each segment has a stable id (the "S#" token at the START of the line, before the
-[start-end s] timestamp). You will cite these ids.
+The "S#" id is ALWAYS the first token of the line. Cite the BARE id in
+source_spans ("S1") — never the [ROLE] tag, never the timestamp.
 
 === OUTPUT ===
 Return ONE JSON object and NOTHING ELSE — no markdown code fences, no commentary
@@ -233,7 +276,7 @@ before or after it. It MUST be valid JSON with EXACTLY this shape:
   * assessment — the clinician's stated impression/diagnosis (ONLY if verbalized).
   * plan — stated next steps (orders, meds, follow-up, referrals).
 - "source_spans" is a list of BARE segment ids the claim came from, e.g. ["S1"]
-  or ["S2","S3"]. Write "S1" — NOT "[S1]", NOT the timestamp.
+  or ["S2","S3"]. Write "S1" — NOT "[S1]", NOT the timestamp, NOT the [ROLE] tag.
 - "assessment_reasoning_stated" is a bool (see rule 6). Default false.
 
 === THE RULES (extract, never infer) ===
@@ -291,6 +334,34 @@ before or after it. It MUST be valid JSON with EXACTLY this shape:
    no impression at all, leave "assessment" empty ([]) and set the flag false.
    Default false. NEVER fabricate a diagnosis or the reasoning behind one.
 
+7. PLACE CONTENT BY SPEAKER (only when [ROLE] tags are present) — use each cited
+   segment's [ROLE] tag to decide WHICH section its content belongs in. This rule
+   governs PLACEMENT only; it adds NOTHING to your output.
+   * [PATIENT] content — what the patient says about themselves — is the patient's
+     report: put it in "subjective", phrased with the patient's provenance
+     ("Patient reports ...", "Reports ...").
+   * [CLINICIAN] content — the clinician's own observations, exam findings, vitals
+     THEY measured, stated impression, and plan — goes in "objective" /
+     "assessment" / "plan" as usual.
+   * A vital or measurement the PATIENT reports (a home reading — "my blood
+     pressure was 150 over 90 this morning") is a PATIENT REPORT: put it in
+     "subjective" ("Patient reports a home blood pressure of 150 over 90"), NOT
+     "objective". Only a vital the clinician states they measured in the encounter
+     is an Objective finding. (A patient-reported reading placed in objective is
+     both a mis-attribution and a false in-clinic vital.)
+   * A lay self-diagnosis the PATIENT offers ("I think it's my sciatica again") is
+     the patient's reported BELIEF: put it in "subjective" as a report ("Patient
+     believes the pain is recurrent sciatica"), NOT "assessment". Assessment holds
+     ONLY the clinician's own stated impression — rule 6 still governs it (never
+     invent or infer a diagnosis).
+   CRITICAL: you must NOT emit any speaker, role, "attribution", or [ROLE] tag in
+   your JSON — no new fields, and no role text inside a claim beyond the ordinary
+   "Patient reports ..." subjective wording already used above. The [ROLE] tags are
+   INPUTS that guide placement only; a separate deterministic check re-derives
+   attribution from your citations, so your job is just to cite the right segment
+   and place it in the right section. If there are NO [ROLE] tags, place content by
+   its section meaning as usual (rules 1-6).
+
 DO NOT (each WRONG below is a real failure the safety check may or may not catch —
 so YOU must prevent it):
 - DO NOT bundle findings. Given S1 "Patient reports a cough." / S2 "Denies fever."
@@ -344,6 +415,37 @@ In Example B no objective findings and no diagnosis were stated, so those sectio
 are []; the clinician deliberately declined a diagnosis, so assessment stays empty
 and "assessment_reasoning_stated" is false. Inventing a diagnosis here would be a
 patient-safety failure.
+
+=== WORKED EXAMPLE C (speaker-diarized — a patient-reported home vital) ===
+Transcript:
+    S1 [0.0-7.0s] [PATIENT]: I checked my blood pressure at home this morning and it was 150 over 90.
+    S2 [7.0-13.0s] [CLINICIAN]: Here in clinic your blood pressure is 128 over 82.
+    S3 [13.0-19.0s] [CLINICIAN]: Continue the lisinopril and recheck in two weeks.
+Output:
+{"subjective":[{"claim":"Patient reports a home blood pressure of 150 over 90","source_spans":["S1"]}],"objective":[{"claim":"Blood pressure 128 over 82","source_spans":["S2"]}],"assessment":[],"plan":[{"claim":"Continue lisinopril","source_spans":["S3"]},{"claim":"Recheck in two weeks","source_spans":["S3"]}],"assessment_reasoning_stated":false}
+The home reading (S1, [PATIENT]) goes in subjective as the patient's report — only
+the clinician-measured 128 over 82 (S2, [CLINICIAN]) is an Objective vital. If you
+placed the S1 home reading in objective, an automated check would add the warning
+"⚠ SPEAKER MISMATCH — cites a patient/other turn in clinician-authored content;
+confirm attribution" to the note AFTER you finish — you never write that warning
+yourself; you avoid it by putting patient-reported content in subjective.
+
+=== WORKED EXAMPLE D (speaker-diarized — clinician-relayed history + a patient self-diagnosis) ===
+Transcript:
+    S1 [0.0-7.0s] [CLINICIAN]: So you've had lower back pain radiating down the left leg for about a week.
+    S2 [7.0-13.0s] [PATIENT]: Yes, and honestly I think my sciatica is flaring up again.
+    S3 [13.0-19.0s] [CLINICIAN]: On exam, straight leg raise is positive on the left.
+    S4 [19.0-26.0s] [CLINICIAN]: Start naproxen 500mg twice daily and refer to physiotherapy.
+Output:
+{"subjective":[{"claim":"Lower back pain radiating down the left leg for about a week","source_spans":["S1"]},{"claim":"Patient believes the pain is recurrent sciatica","source_spans":["S2"]}],"objective":[{"claim":"Straight leg raise positive on the left","source_spans":["S3"]}],"assessment":[],"plan":[{"claim":"Start naproxen 500mg twice daily","source_spans":["S4"]},{"claim":"Refer to physiotherapy","source_spans":["S4"]}],"assessment_reasoning_stated":false}
+Two placement points. (1) The history in S1 is spoken by the [CLINICIAN] relaying
+what the patient told them — it is still the patient's history, so it goes in
+subjective cited to S1; a clinician-relayed history in subjective is legitimate and
+draws NO warning. (2) The patient's "I think my sciatica is flaring up" (S2,
+[PATIENT]) is the patient's own BELIEF — it goes in subjective as a reported belief,
+NOT in assessment; the clinician named no diagnosis, so assessment is []. Placing
+that self-diagnosis in assessment cited to the [PATIENT] turn S2 would draw the same
+"⚠ SPEAKER MISMATCH" warning (assessment is clinician-authored content).
 
 If the transcript has no segments, or a section has nothing to extract, use [].
 Return ONLY the JSON object."""
@@ -439,10 +541,29 @@ class StructuredNote:
 
 def build_prompt(transcript: Transcript) -> str:
     """Format the segment-rich transcript for the model — numbered by stable id
-    so the model can cite ``[S#]`` in ``source_spans``."""
+    so the model can cite ``[S#]`` in ``source_spans``.
+
+    P4-3: when (and ONLY when) ``transcript.diarized`` is True, each segment line
+    also carries an uppercase ``[ROLE]`` tag derived via ``normalize_role`` (a
+    ``None`` / ``''`` / raw-cluster speaker → ``[UNKNOWN]``, fail-closed). The tag
+    sits AFTER the ``[start-end s]`` timestamp so the stable ``S#`` id stays the
+    FIRST token of every line and the ``S## [x-y s]`` header prefix is preserved;
+    ``source_spans`` still cite the BARE ``S#`` (never the role). An UN-DIARIZED
+    transcript's block is BYTE-IDENTICAL to pre-P4-3 — the tag is OMITTED entirely
+    (not rendered as ``[UNKNOWN]``). SYSTEM_PROMPT rule 7 teaches the model to
+    PLACE content by the visible tags while emitting NO role in its output (the
+    deterministic ``speaker_attribution`` pass re-derives attribution from the
+    citation graph)."""
     lines = ["Transcript segments (cite these ids in source_spans):", ""]
+    diarized = transcript.diarized
     for seg in transcript.segments:
-        lines.append(f"{seg.id} [{seg.start_s:.1f}-{seg.end_s:.1f}s]: {seg.text}")
+        if diarized:
+            role = normalize_role(seg.speaker).upper()
+            lines.append(
+                f"{seg.id} [{seg.start_s:.1f}-{seg.end_s:.1f}s] [{role}]: {seg.text}"
+            )
+        else:
+            lines.append(f"{seg.id} [{seg.start_s:.1f}-{seg.end_s:.1f}s]: {seg.text}")
     if not transcript.segments:
         lines.append("(no segments)")
     return "\n".join(lines)
@@ -559,7 +680,9 @@ async def generate_structured(
     # Over-firing here is fail-SAFE (skips this checkpoint, keeps the last-good
     # draft). The AUTHORITATIVE guard is the post-call ``prompt_eval_count`` check.
     num_ctx = int(_NOTEGEN_OLLAMA_OPTIONS.get("num_ctx", _NUM_CTX))
-    sys_tokens = _estimate_tokens(SYSTEM_PROMPT)
+    # The FIXED prose SYSTEM_PROMPT uses the prose rate (chars/4.0); the VARIABLE
+    # transcript keeps the conservative digit/header rate (chars/2.5, the default).
+    sys_tokens = _estimate_tokens(SYSTEM_PROMPT, _PROSE_CHARS_PER_TOKEN)
     prompt_tokens = (
         _estimate_tokens(prompt)
         + _HEADER_TOKENS_PER_SEGMENT * len(transcript.segments)

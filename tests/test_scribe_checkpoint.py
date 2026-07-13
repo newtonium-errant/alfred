@@ -325,7 +325,7 @@ def test_real_qwen_post_call_truncation_empirical(monkeypatch):
     # prompt_eval_count trips the post-call ceiling → ContextBudgetExceeded. This
     # confirms Ollama's actual over-context behavior + the ceiling threshold.
     import alfred.scribe.notegen as ng
-    monkeypatch.setattr(ng, "_estimate_tokens", lambda _t: 0)   # bypass the pre-flight hint
+    monkeypatch.setattr(ng, "_estimate_tokens", lambda *a, **k: 0)  # bypass the pre-flight hint (2-arg-safe)
     segs = [Segment(id=f"S{i+1}", start_s=i * 5.0, end_s=i * 5.0 + 5,
                     text=f"BP 120/80 HR 72 temp 37.{i % 10} patient reports symptom {i}")
             for i in range(4000)]   # ~10x num_ctx worth of real tokens

@@ -701,3 +701,80 @@ def test_attest_tolerates_mixed_flags_and_speaker_flags_carry_spans(tmp_path):
     # audit appended (attest fully completed)
     audit = (tmp_path / "attest_audit.jsonl").read_text().strip().splitlines()
     assert len(audit) == 1 and json.loads(audit[0])["to_status"] == "attested"
+
+
+# ---------------------------------------------------------------------------
+# P4-3 worked-example ACCURACY (feedback_worked_example_accuracy) — the two
+# SYSTEM_PROMPT worked examples (C, D) must walk CLEAN through the FULL stack
+# (verify + inferred-dx + speaker-attribution), and the mis-placements the
+# examples warn against must flag speaker_mismatch. These pin the examples to the
+# code's actual behavior so a rule/engine change that breaks them is caught.
+# ---------------------------------------------------------------------------
+
+def _full_stack_flags(note, tx, config=None):
+    c = config or _config()
+    g = verify(note, tx)
+    g.flags.extend(check_inferred_diagnoses(note, tx))
+    g.flags.extend(check_speaker_attribution(note, tx, c))
+    return g.flags
+
+
+def test_p43_example_c_home_vital_in_subjective_is_clean():
+    # WORKED EXAMPLE C output — the patient home vital placed in Subjective, the
+    # clinician-measured vital in Objective: the whole note is CLEAN.
+    tx = _tx(
+        _seg(1, "I checked my blood pressure at home this morning and it was 150 over 90.", speaker=ROLE_PATIENT),
+        _seg(2, "Here in clinic your blood pressure is 128 over 82.", speaker=ROLE_CLINICIAN),
+        _seg(3, "Continue the lisinopril and recheck in two weeks.", speaker=ROLE_CLINICIAN),
+    )
+    note = _note(
+        subjective=[Claim("Patient reports a home blood pressure of 150 over 90", ["S1"])],
+        objective=[Claim("Blood pressure 128 over 82", ["S2"])],
+        plan=[Claim("Continue lisinopril", ["S3"]), Claim("Recheck in two weeks", ["S3"])],
+    )
+    assert _full_stack_flags(note, tx) == []
+
+
+def test_p43_example_c_home_vital_in_objective_flags_mismatch():
+    # The documented counterfactual: the S1 home reading placed in OBJECTIVE
+    # (citing the patient turn) draws speaker_mismatch — what rule 7 avoids.
+    tx = _tx(
+        _seg(1, "I checked my blood pressure at home this morning and it was 150 over 90.", speaker=ROLE_PATIENT),
+        _seg(2, "Here in clinic your blood pressure is 128 over 82.", speaker=ROLE_CLINICIAN),
+    )
+    note = _note(objective=[Claim("Blood pressure 150 over 90", ["S1"])])
+    assert _reasons(_run(note, tx)) == [SPEAKER_MISMATCH_REASON]
+
+
+def test_p43_example_d_relayed_hpi_and_self_dx_in_subjective_is_clean():
+    # WORKED EXAMPLE D output — a clinician-RELAYED history in Subjective (legit,
+    # no collateral/mismatch flag) AND the patient's lay self-diagnosis in
+    # Subjective (not Assessment): the whole note is CLEAN (incl. inferred-dx, the
+    # cited patient turn names "sciatica" so the self-dx is grounded).
+    tx = _tx(
+        _seg(1, "So you've had lower back pain radiating down the left leg for about a week.", speaker=ROLE_CLINICIAN),
+        _seg(2, "Yes, and honestly I think my sciatica is flaring up again.", speaker=ROLE_PATIENT),
+        _seg(3, "On exam, straight leg raise is positive on the left.", speaker=ROLE_CLINICIAN),
+        _seg(4, "Start naproxen 500mg twice daily and refer to physiotherapy.", speaker=ROLE_CLINICIAN),
+    )
+    note = _note(
+        subjective=[
+            Claim("Lower back pain radiating down the left leg for about a week", ["S1"]),
+            Claim("Patient believes the pain is recurrent sciatica", ["S2"]),
+        ],
+        objective=[Claim("Straight leg raise positive on the left", ["S3"])],
+        plan=[Claim("Start naproxen 500mg twice daily", ["S4"]), Claim("Refer to physiotherapy", ["S4"])],
+    )
+    assert _full_stack_flags(note, tx) == []
+
+
+def test_p43_example_d_self_dx_in_assessment_flags_mismatch():
+    # The documented counterfactual: the patient's self-diagnosis placed in
+    # ASSESSMENT (citing the patient turn S2) draws speaker_mismatch (assessment is
+    # clinician-authored content).
+    tx = _tx(
+        _seg(1, "So you've had lower back pain for a week.", speaker=ROLE_CLINICIAN),
+        _seg(2, "Yes, and honestly I think my sciatica is flaring up again.", speaker=ROLE_PATIENT),
+    )
+    note = _note(assessment=[Claim("Recurrent sciatica", ["S2"])])
+    assert _reasons(_run(note, tx)) == [SPEAKER_MISMATCH_REASON]

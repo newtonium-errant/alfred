@@ -19,14 +19,22 @@ from alfred.scribe.notegen import (
     GROUNDING_UNVERIFIED,
     NOT_ADDRESSED,
     REASONING_NOT_STATED,
+    SYSTEM_PROMPT,
     ContextBudgetExceeded,
     NoteGenError,
     StructuredNote,
+    build_prompt,
     generate_structured,
     parse_structured_json,
     render_soap,
 )
-from alfred.scribe.transcript import Segment, Transcript
+from alfred.scribe.transcript import (
+    ROLE_CLINICIAN,
+    ROLE_OTHER,
+    ROLE_PATIENT,
+    Segment,
+    Transcript,
+)
 
 
 def _transcript(*texts):
@@ -538,3 +546,108 @@ def test_native_chat_prompt_eval_at_ceiling_refused(monkeypatch):
     _native_chat_transport(monkeypatch, prompt_eval_count=_PROMPT_TRUNCATION_CEILING)
     with pytest.raises(ContextBudgetExceeded):
         asyncio.run(generate_structured(_transcript("Patient reports chest pain."), config=_cfg()))
+
+
+# ---------------------------------------------------------------------------
+# P4-3 — speaker-aware note-gen prompt: [ROLE] tags, rule 7, worked examples.
+# The flag SEMANTICS of the worked examples (that they walk CLEAN and the
+# documented mis-placements flag) are pinned in test_scribe_speaker_attribution;
+# THESE pins cover the prompt ASSEMBLY surface (build_prompt + SYSTEM_PROMPT text).
+# ---------------------------------------------------------------------------
+
+def _diarized_tx(*segs, diarized=True):
+    """``segs`` are ``(text, speaker)`` tuples; ``speaker`` is a resolved role or
+    None. Segment ids/timestamps are minted the same way as ``_transcript``."""
+    segments = [
+        Segment(id=f"S{i+1}", start_s=float(i * 5), end_s=float(i * 5 + 5),
+                text=t, speaker=sp)
+        for i, (t, sp) in enumerate(segs)
+    ]
+    return Transcript(source_id="synth-d", mode="synthetic", segments=segments,
+                      diarized=diarized)
+
+
+def test_p43_diarized_prompt_carries_role_tags_with_s_id_first_token():
+    tx = _diarized_tx(
+        ("I have had a cough for three days.", ROLE_PATIENT),
+        ("Blood pressure is 120 over 80.", ROLE_CLINICIAN),
+        ("He has not been eating well.", ROLE_OTHER),
+    )
+    lines = [ln for ln in build_prompt(tx).splitlines() if ln.startswith("S")]
+    # S# stays the FIRST token of every line (the citation anchor).
+    assert lines[0].startswith("S1 ") and lines[1].startswith("S2 ") and lines[2].startswith("S3 ")
+    # the role tag sits AFTER the timestamp (S## [x-y s] [ROLE]:), uppercase.
+    assert lines[0] == "S1 [0.0-5.0s] [PATIENT]: I have had a cough for three days."
+    assert "[CLINICIAN]:" in lines[1]
+    assert "[OTHER]:" in lines[2]
+
+
+def test_p43_none_speaker_renders_unknown_tag():
+    # A None speaker on a diarized transcript folds to [UNKNOWN] (fail-closed,
+    # normalize_role) — never omitted, never a raw value.
+    line = [ln for ln in build_prompt(_diarized_tx(("Some content.", None))).splitlines()
+            if ln.startswith("S1")][0]
+    assert line == "S1 [0.0-5.0s] [UNKNOWN]: Some content."
+
+
+def test_p43_raw_cluster_speaker_renders_unknown_tag():
+    # A raw pyannote cluster id (never a canonical role) folds to [UNKNOWN].
+    line = [ln for ln in build_prompt(_diarized_tx(("Some content.", "SPEAKER_00"))).splitlines()
+            if ln.startswith("S1")][0]
+    assert "[UNKNOWN]:" in line
+
+
+def test_p43_undiarized_prompt_byte_identical_to_pre_p43():
+    # THE byte-identical pin: an un-diarized transcript's block carries NO [ROLE]
+    # tag (not even [UNKNOWN]), even if a segment carries a stale speaker — the
+    # exact pre-P4-3 "S## [x-y s]: text" line format. Reconstruct it literally.
+    segs = [
+        Segment(id="S1", start_s=0.0, end_s=5.0, text="Patient reports a cough.",
+                speaker=ROLE_PATIENT),   # speaker present but transcript un-diarized
+        Segment(id="S2", start_s=5.0, end_s=10.0, text="Amoxicillin 500mg."),
+    ]
+    tx = Transcript(source_id="synth-u", mode="synthetic", segments=segs, diarized=False)
+    expected = "\n".join([
+        "Transcript segments (cite these ids in source_spans):",
+        "",
+        "S1 [0.0-5.0s]: Patient reports a cough.",
+        "S2 [5.0-10.0s]: Amoxicillin 500mg.",
+    ])
+    assert build_prompt(tx) == expected
+    body = build_prompt(tx)
+    assert "[PATIENT]" not in body and "[UNKNOWN]" not in body and "[ROLE]" not in body
+
+
+def test_p43_empty_transcript_keeps_no_segments_marker_both_modes():
+    for diar in (True, False):
+        tx = Transcript(source_id="e", mode="synthetic", segments=[], diarized=diar)
+        assert build_prompt(tx).endswith("(no segments)")
+
+
+def test_p43_rule7_present_in_system_prompt():
+    # rule 7 attribution-placement — anchor on distinctive phrases so a silent drop
+    # of any of the four placement rules is caught.
+    assert "PLACE CONTENT BY SPEAKER" in SYSTEM_PROMPT
+    assert "home blood pressure" in SYSTEM_PROMPT           # patient home-vital → Subjective
+    assert "self-diagnosis" in SYSTEM_PROMPT                # patient lay self-dx → Subjective
+    # the extract-not-infer invariant: the model emits NO role/attribution field.
+    assert "must NOT emit any speaker, role" in SYSTEM_PROMPT
+
+
+def test_p43_worked_examples_c_and_d_present():
+    assert "WORKED EXAMPLE C" in SYSTEM_PROMPT and "WORKED EXAMPLE D" in SYSTEM_PROMPT
+    # the diarized worked-example lines use the [ROLE] format build_prompt emits.
+    assert "[PATIENT]:" in SYSTEM_PROMPT and "[CLINICIAN]:" in SYSTEM_PROMPT
+
+
+def test_p43_worked_example_line_matches_build_prompt_format():
+    # The worked-example transcript lines in SYSTEM_PROMPT must be BYTE-IDENTICAL
+    # to what build_prompt actually emits — so a format change (e.g. moving [ROLE]
+    # before the timestamp) that forgets the examples goes RED here.
+    seg = Segment(
+        id="S1", start_s=0.0, end_s=7.0, speaker=ROLE_PATIENT,
+        text="I checked my blood pressure at home this morning and it was 150 over 90.",
+    )
+    tx = Transcript(source_id="c", mode="synthetic", segments=[seg], diarized=True)
+    line = [ln for ln in build_prompt(tx).splitlines() if ln.startswith("S1")][0]
+    assert line in SYSTEM_PROMPT
