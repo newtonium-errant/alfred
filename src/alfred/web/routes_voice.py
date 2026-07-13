@@ -94,6 +94,9 @@ _KNOWN_STT_PROVIDERS = frozenset({"deepgram", "fake"})
 _KNOWN_TTS_PROVIDERS = frozenset({"elevenlabs", "fake"})
 # App-key for the mount-normalized V3 barge settings (None = disabled).
 _KEY_WEB_BARGE = "web.barge_settings"
+# App-key for the V3.1 barge-telemetry corpus dir ("" = telemetry off). Shares
+# the voice_calibration corpus with the endpoint-hold sink (event_family).
+_KEY_WEB_BARGE_TELEMETRY_DIR = "web.barge_telemetry_dir"
 
 
 def _base_mime(content_type: str) -> str:
@@ -295,8 +298,11 @@ async def _offer_assistant(
         chat_session_key=chat_session_key,
         reply_guidance=web_config.voice.reply_guidance,
     )
+    barge_settings = request.app.get(_KEY_WEB_BARGE)
     driver = VoiceTurnDriver(
-        deps, voice_session_id=vid, barge=request.app.get(_KEY_WEB_BARGE),
+        deps, voice_session_id=vid, barge=barge_settings,
+        barge_telemetry=_build_barge_telemetry(
+            request.app, identity, vid, barge_settings),
     )
     try:
         vid, answer_sdp = await manager.open_session(
@@ -468,10 +474,32 @@ def register_voice_handlers(
     # normalized settings (or None = disabled → V2 discard byte-identical, §1.12)
     # and stash for the per-request driver ctor. Mount-time ILB both ways.
     if voice.pipeline == "assistant":
-        app[_KEY_WEB_BARGE] = _build_barge(
+        barge_settings = _build_barge(
             voice, app.get(KEY_WEB_TALKER_CONFIG),
             tts_mounted=tts_worker_factory is not None,
         )
+        app[_KEY_WEB_BARGE] = barge_settings
+        # V3.1 barge telemetry (features-only) — always-on when barge is enabled
+        # + a corpus dir resolves. REUSE the endpoint-hold voice_calibration dir
+        # so both event families land in one events.jsonl (discriminated by
+        # event_family). Mount-time ILB: log which state we're in.
+        barge_tel_dir = ""
+        if barge_settings is not None:
+            barge_tel_dir = getattr(
+                getattr(voice.stt, "endpoint_hold", None), "telemetry_dir",
+                "./data/voice_calibration") or "./data/voice_calibration"
+            app[_KEY_WEB_BARGE_TELEMETRY_DIR] = barge_tel_dir
+            instance_name = getattr(
+                getattr(app.get(KEY_WEB_TALKER_CONFIG), "instance", None),
+                "name", "") or ""
+            log.info(
+                "web.voice.barge.telemetry_enabled",
+                telemetry_dir=barge_tel_dir, instance=instance_name,
+            )
+        else:
+            # Intentionally-left-blank: idle distinguishable from broken.
+            log.info(
+                "web.voice.barge.telemetry_disabled", reason="barge_not_enabled")
 
     # Reserved ICE knob observability — udp_port_range is accepted but has no
     # aiortc/aioice knob (aiortc#487), so it is NEVER a silent no-op.
@@ -925,6 +953,30 @@ def _build_barge(voice: Any, talker_config: Any, *, tts_mounted: bool):
         interrupt_phrases=len(settings.interrupt_phrases),
     )
     return settings
+
+
+def _build_barge_telemetry(app: Any, identity: Any, vid: str, barge_settings: Any):
+    """Per-session barge telemetry sink (features-only), or ``None``.
+
+    Always-on when barge is enabled AND a corpus dir resolved at mount (mirror
+    the endpoint-hold sink — collect-only, privacy-safe, low volume). ``None``
+    ⇒ every driver-side barge emit is a no-op (barge disabled / no dir).
+    ``web_user`` is the per-user calibration key (same as the endpoint sink)."""
+    if barge_settings is None:
+        return None
+    corpus_dir = app.get(_KEY_WEB_BARGE_TELEMETRY_DIR, "")
+    if not corpus_dir:
+        return None
+    from .voice_barge_telemetry import VoiceBargeTelemetry
+
+    instance_name = getattr(
+        getattr(app.get(KEY_WEB_TALKER_CONFIG), "instance", None), "name", "") or ""
+    return VoiceBargeTelemetry(
+        corpus_dir=corpus_dir,
+        web_user=getattr(identity, "user", "") or "",
+        voice_session_id=vid,
+        instance_name=instance_name,
+    )
 
 
 def _resolve_chat_binding(request: web.Request, identity: Any, body: dict):

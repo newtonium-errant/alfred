@@ -1119,3 +1119,243 @@ async def test_barge_disabled_is_v2_discard() -> None:
     assert "stt_final" in _types(ch) and "utterance_discarded" in _types(ch)
     assert not any(str(c.get("event", "")).startswith("web.voice.barge") for c in cap)
     await driver.aclose()
+
+
+# ---------------------------------------------------------------------------
+# V3.1 barge telemetry — durable features-only calibration sink (#66)
+# ---------------------------------------------------------------------------
+
+from alfred.web.barge_in import (   # noqa: E402
+    BACKCHANNEL_DEFAULTS,
+    INTERRUPT_PHRASE_DEFAULTS,
+    normalize_text,
+)
+
+
+def _barge_tel_driver(rts, clk, corpus_dir, *, web_user="andrew", **sover):
+    """A ``_barge_driver`` wired to a real VoiceBargeTelemetry sink at
+    ``corpus_dir`` (features land in ``corpus_dir/events.jsonl``)."""
+    from alfred.web.voice_barge_telemetry import VoiceBargeTelemetry
+
+    tel = VoiceBargeTelemetry(
+        corpus_dir=str(corpus_dir), web_user=web_user,
+        voice_session_id="v1", instance_name="Salem")
+    return VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=rts), "v1",
+        barge=_barge_settings(**sover), barge_telemetry=tel,
+        clock=lambda: clk[0])
+
+
+async def _drain_barge() -> None:
+    from alfred.web.voice_barge_telemetry import _BARGE_TASKS
+    for _ in range(50):
+        pending = [t for t in list(_BARGE_TASKS) if not t.done()]
+        if not pending:
+            break
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _read_barge(corpus_dir) -> list[dict]:
+    import json
+    p = corpus_dir / "events.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+
+
+async def test_barge_telemetry_confirmed_records_features(tmp_path) -> None:
+    # A real post-final confirm (mirror case 1) writes ONE features-only barge
+    # decision record (decision=barge, reason=confirmed) + an outcome record —
+    # and NEVER the transcript.
+    clk = [1000.0]
+    ch, stub = FakeChannel(), _StubTts()
+    utter = "what about the quarterly budget"
+    d = _barge_tel_driver(
+        _scripted_rts([{"type": "final", "reply": "the answer here"}]),
+        clk, tmp_path)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0                                  # past too_early
+    await d.submit_utterance(utter)
+    await _wait_for(ch, {"turn_final"})
+    await _drain_barge()
+
+    raw = (tmp_path / "events.jsonl").read_text()
+    for word in ("quarterly", "budget", "what", "about"):
+        assert word not in raw, f"raw transcript word {word!r} leaked into the sink"
+    recs = _read_barge(tmp_path)
+    decision = [r for r in recs if r.get("reason") == "confirmed" and "word_count" in r]
+    assert len(decision) == 1
+    rec = decision[0]
+    assert rec["event_family"] == "barge" and rec["decision"] == "barge"
+    assert rec["web_user"] == "andrew" and rec["instance"] == "Salem"
+    assert rec["turn_id"] == "t1" and rec["ms_into_speaking"] == 2000
+    assert rec["word_count"] == len(normalize_text(utter).split())
+    assert rec["char_count"] == len(normalize_text(utter))
+    assert rec["starts_with_backchannel"] is False
+    assert rec["is_backchannel_exact"] is False
+    assert rec["matched_interrupt_phrase"] is False
+    assert rec["cfg_too_early_ms"] == 700 and rec["cfg_echo_threshold"] == 0.8
+    assert "text" not in rec and "transcript" not in rec and "norm" not in rec
+    # The turn completed with a reply → a false-barge label of "completed",
+    # joinable to the decision record by turn_id.
+    outcome = [r for r in recs if "outcome" in r]
+    assert len(outcome) == 1
+    assert outcome[0]["outcome"] == "completed" and outcome[0]["turn_id"] == "t1"
+    assert outcome[0]["decision"] == "barge" and outcome[0]["reason"] == "confirmed"
+    await d.aclose()
+
+
+async def test_barge_telemetry_suppressed_backchannel(tmp_path) -> None:
+    # A backchannel veto (Stage B) writes ONE suppress record, reason=backchannel.
+    clk = [1000.0]
+    ch, stub = FakeChannel(), _StubTts()
+    d = _barge_tel_driver(_scripted_rts([]), clk, tmp_path)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0
+    d._barge_utt_id = None
+    d._utt_id = "u1"
+    d._stage_a("what about the quarterly budget")    # passes → Stage-A latch (skipped)
+    await d.submit_utterance("yeah")                 # backchannel → VETO
+    await asyncio.sleep(0.02)
+    await _drain_barge()
+
+    recs = _read_barge(tmp_path)
+    supp = [r for r in recs if r["decision"] == "suppress"]
+    assert len(supp) == 1                            # triggered was NOT emitted
+    rec = supp[0]
+    assert rec["reason"] == "backchannel"
+    assert rec["is_backchannel_exact"] is True
+    assert rec["starts_with_backchannel"] is True
+    assert rec["word_count"] == 1 and rec["utterance_id"] == "u1"
+    await d.aclose()
+
+
+async def test_barge_telemetry_suppressed_too_early(tmp_path) -> None:
+    # A too_early partial suppress writes reason=too_early with the elapsed ms.
+    clk = [1000.0]
+    d = _barge_tel_driver(_scripted_rts([]), clk, tmp_path)
+    d.on_speaking_started("t1")
+    clk[0] = 1000.5                                  # 500 ms < too_early (700)
+    d._utt_id = "u1"
+    d._stage_a("what about the quarterly budget")    # too_early → suppressed
+    await _drain_barge()
+
+    recs = _read_barge(tmp_path)
+    supp = [r for r in recs if r["decision"] == "suppress"]
+    assert len(supp) == 1
+    assert supp[0]["reason"] == "too_early"
+    assert supp[0]["ms_into_speaking"] == 500
+    await d.aclose()
+
+
+async def test_barge_telemetry_late_echo_suppress_reason(tmp_path) -> None:
+    # A Stage-B echo veto is recorded as reason="late_echo" (distinct from a
+    # pre-final "echo"), with the echo_score feature.
+    clk = [1000.0]
+    ch, stub = FakeChannel(), _StubTts()
+    d = _barge_tel_driver(_scripted_rts([]), clk, tmp_path)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d._spoken_text = "the quarterly report shows revenue grew twelve percent"
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0
+    d._utt_id = "u1"
+    d._barge_utt_id = "u1"                            # simulate Stage-A latch
+    await d.submit_utterance(d._spoken_text)         # echo → late veto
+    await asyncio.sleep(0.02)
+    await _drain_barge()
+
+    recs = _read_barge(tmp_path)
+    supp = [r for r in recs if r["decision"] == "suppress"]
+    assert len(supp) == 1
+    assert supp[0]["reason"] == "late_echo"
+    assert supp[0]["echo_score"] >= 0.8
+    # The spoken buffer (used to derive the echo) never reaches the sink.
+    raw = (tmp_path / "events.jsonl").read_text()
+    for word in ("quarterly", "revenue", "percent"):
+        assert word not in raw
+    await d.aclose()
+
+
+async def test_barge_telemetry_starts_with_backchannel_derivation(tmp_path) -> None:
+    # The leading-backchannel feature (the "Okay, so…" / "Yeah, well…" calibration
+    # hypothesis) is derived from norm's FIRST token, distinct from the full-norm
+    # exact-backchannel and interrupt-phrase features.
+    clk = [1000.0]
+    d = _barge_tel_driver(
+        _scripted_rts([]), clk, tmp_path,
+        backchannel_phrases=BACKCHANNEL_DEFAULTS,
+        interrupt_phrases=INTERRUPT_PHRASE_DEFAULTS)
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0
+    # (text, event, reason, starts_with, is_exact, matched_interrupt)
+    cases = [
+        ("okay so we should", "confirmed", "", True, False, False),
+        ("yeah but wait", "confirmed", "", True, False, False),
+        ("stop that", "confirmed", "", False, False, False),
+        ("the invoice is due", "confirmed", "", False, False, False),
+        ("stop", "confirmed", "", False, False, True),      # a real interrupt
+        ("yeah", "suppressed", "backchannel", True, True, False),
+    ]
+    for i, (text, ev, reason, *_rest) in enumerate(cases):
+        d._log_barge(f"web.voice.barge.{ev}", f"u{i}", reason=reason, text=text)
+    await _drain_barge()
+
+    recs = _read_barge(tmp_path)
+    by_utt = {r["utterance_id"]: r for r in recs}
+    assert len(by_utt) == len(cases)
+    for i, (text, _ev, _reason, swb, exact, mip) in enumerate(cases):
+        rec = by_utt[f"u{i}"]
+        assert rec["starts_with_backchannel"] is swb, (text, rec)
+        assert rec["is_backchannel_exact"] is exact, (text, rec)
+        assert rec["matched_interrupt_phrase"] is mip, (text, rec)
+        # No transcript word ever lands in any record.
+        for word in text.split():
+            if len(word) > 3:
+                assert word not in str(rec)
+    await d.aclose()
+
+
+async def test_barge_telemetry_outcome_labels(tmp_path) -> None:
+    # _barge_outcome writes completed / cancelled / empty; the None-barge guard
+    # emits nothing (no confirmed barge → no outcome).
+    import json as _json
+    clk = [1000.0]
+    d = _barge_tel_driver(_scripted_rts([]), clk, tmp_path)
+    d._barge_outcome("t1", "t2", "completed")
+    d._barge_outcome("t1", "t3", "cancelled")
+    d._barge_outcome("t1", "t4", "empty")
+    d._barge_outcome(None, "t5", "completed")        # guard → NO record
+    await _drain_barge()
+
+    recs = _read_barge(tmp_path)
+    assert sorted(r["outcome"] for r in recs) == ["cancelled", "completed", "empty"]
+    for r in recs:
+        assert r["decision"] == "barge" and r["reason"] == "confirmed"
+        assert r["turn_id"] == "t1"                  # join key = interrupted T1
+    assert "t5" not in _json.dumps(recs)             # None-guard record absent
+    await d.aclose()
+
+
+async def test_barge_telemetry_disabled_sink_is_noop(tmp_path) -> None:
+    # barge_telemetry=None (default) ⇒ every emit seam is a silent no-op; the
+    # decision still logs to talker.log, but no durable file is written.
+    clk = [1000.0]
+    d = _barge_driver(_scripted_rts([]), clk)        # NO barge_telemetry
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0
+    d._utt_id = "u1"
+    with structlog.testing.capture_logs() as cap:
+        d._stage_a("what about the quarterly budget")   # confirms (barge) — logs
+        d._barge_outcome("t1", "t2", "completed")       # logs, no sink
+    await _drain_barge()
+    assert not (tmp_path / "events.jsonl").exists()
+    assert any(str(c.get("event", "")).startswith("web.voice.barge") for c in cap)
+    await d.aclose()

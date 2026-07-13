@@ -112,7 +112,8 @@ class VoiceTurnDriver:
 
     def __init__(
         self, deps: TurnDeps, voice_session_id: str, *,
-        barge: Any = None, clock: Callable[[], float] = time.monotonic,
+        barge: Any = None, barge_telemetry: Any = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._deps = deps
         self._vid = voice_session_id
@@ -155,6 +156,9 @@ class VoiceTurnDriver:
         # (ctor-threaded, NOT a getattr chain); None / disabled ⇒ V2 discard
         # behaviour byte-identical at the driver/wire layer (§1.12).
         self._barge = barge
+        # Durable, features-only calibration sink (V3.1); None ⇒ barge telemetry
+        # off (barge disabled or no corpus dir) and every emit below is a no-op.
+        self._barge_telemetry = barge_telemetry
         self._barge_utt_id: str | None = None      # Stage-A latch (§1.1)
         self._spoken_text = ""                     # per-turn fed-text echo buffer (§1.5)
         self._speaking_started_at: float | None = None
@@ -406,9 +410,14 @@ class VoiceTurnDriver:
         return echo_score(text, self._spoken_text) >= self._barge.echo_threshold
 
     def _log_barge(self, event: str, utterance_id: str, *, reason: str = "",
-                   score: float = 0.0, turn_id: str = "", dedup: bool = False) -> None:
+                   score: float = 0.0, turn_id: str = "", dedup: bool = False,
+                   text: str = "") -> None:
         """Uniform, learner-ready barge telemetry (§1.9 / §1.9b): ids / ms / score
-        only, never transcript text. Suppression logs deduped per (utt_id, reason)."""
+        only, never transcript text. Suppression logs deduped per (utt_id, reason).
+
+        ``text`` is used ONLY to derive lexical-CATEGORY features for the durable
+        calibration sink (word/char counts, backchannel/interrupt booleans); it
+        is NEVER logged or written — the sink's allowlist drops any raw field."""
         if dedup:
             key = (utterance_id, reason)
             if key in self._suppress_logged:
@@ -426,6 +435,55 @@ class VoiceTurnDriver:
         if score:
             fields["score"] = round(score, 3)
         log.info(event, **fields)
+        # Durable, features-only twin (V3.1 calibration corpus). Same decision
+        # seam; NEVER the transcript — the sink allowlist enforces it structurally.
+        self._emit_barge_features(
+            event, utterance_id, fields["turn_id"], reason, score, text)
+
+    def _emit_barge_features(self, event: str, utterance_id: str, turn_id: str,
+                             reason: str, score: float, text: str) -> None:
+        """Write ONE features-only barge record to the durable calibration sink.
+
+        Maps the log ``event`` → the calibration ``decision`` / ``reason`` and
+        derives lexical-CATEGORY features from ``normalize_text(text)`` + the
+        barge settings. Stage-A ``triggered`` is the PROVISIONAL audio-only
+        partial interrupt — it is ALWAYS resolved at Stage B by a
+        ``confirmed`` / ``suppressed`` / ``late_suppressed`` event, so emitting
+        it too would double-count; it is skipped here (one durable record per
+        final decision). No-op when the sink is absent (barge telemetry off)."""
+        tel = self._barge_telemetry
+        if tel is None:
+            return
+        if "confirmed" in event:
+            decision, cal_reason = "barge", "confirmed"
+        elif "late_suppressed" in event:
+            decision, cal_reason = "suppress", "late_echo"
+        elif "suppressed" in event:
+            decision, cal_reason = "suppress", reason or ""
+        else:   # triggered (Stage-A partial) — not a durable decision; skip.
+            return
+        from .barge_in import normalize_text
+
+        norm = normalize_text(text)
+        toks = norm.split()
+        settings = self._barge
+        backchannel = getattr(settings, "backchannel_phrases", frozenset())
+        interrupt = getattr(settings, "interrupt_phrases", frozenset())
+        tel.emit({
+            "decision": decision,
+            "reason": cal_reason,
+            "ms_into_speaking": int(self._elapsed_speaking_ms()),
+            "echo_score": round(float(score), 3),
+            "word_count": len(toks),
+            "char_count": len(norm),
+            "starts_with_backchannel": bool(toks and toks[0] in backchannel),
+            "is_backchannel_exact": norm in backchannel,
+            "matched_interrupt_phrase": norm in interrupt,
+            "cfg_too_early_ms": getattr(settings, "too_early_ms", 0),
+            "cfg_echo_threshold": getattr(settings, "echo_threshold", 0.0),
+            "utterance_id": utterance_id,
+            "turn_id": turn_id,
+        })
 
     def _barge_outcome(self, barged_turn_id: str | None, new_turn_id: str,
                        outcome: str) -> None:
@@ -438,6 +496,14 @@ class VoiceTurnDriver:
             "web.voice.barge.outcome", voice_session_id=self._vid,
             barged_turn_id=barged_turn_id, new_turn_id=new_turn_id, outcome=outcome,
         )
+        # Durable false-barge label — joins to the confirmed record by turn_id
+        # (both carry the interrupted T1's id). Sink absent ⇒ no-op.
+        tel = self._barge_telemetry
+        if tel is not None:
+            tel.emit({
+                "decision": "barge", "reason": "confirmed",
+                "outcome": outcome, "turn_id": barged_turn_id,
+            })
 
     def _register_confirmed_barge(self) -> None:
         """Barge-storm circuit breaker (§1.8): 3 consecutive confirmed barges
@@ -465,10 +531,10 @@ class VoiceTurnDriver:
         if d.barge:
             self._interrupt_audio("barge_partial")   # SILENT — no wire event (§1.6)
             self._barge_utt_id = self._utt_id
-            self._log_barge("web.voice.barge.triggered", self._utt_id or "")
+            self._log_barge("web.voice.barge.triggered", self._utt_id or "", text=text)
         else:
             self._log_barge("web.voice.barge.suppressed", self._utt_id or "",
-                            reason=d.reason, score=d.score, dedup=True)
+                            reason=d.reason, score=d.score, dedup=True, text=text)
 
     def _emit_stt_final(self, utterance_id: str, text: str) -> None:
         self.emit({
@@ -484,7 +550,8 @@ class VoiceTurnDriver:
         self._register_confirmed_barge()
         self._emit_stt_final(utterance_id, text)               # honest — becomes a turn
         self.interrupt_speech("barge_confirm", wire_reason="barged_in")  # speaking_done{barged_in}
-        self._log_barge("web.voice.barge.confirmed", utterance_id, turn_id=barged_turn)
+        self._log_barge("web.voice.barge.confirmed", utterance_id,
+                        turn_id=barged_turn, text=text)
         self._barge_origin = barged_turn                       # → T2's barge.outcome
         if self._current_task is not None and not self._current_task.done():
             self._current_task.cancel()   # pre-final: CancelledError → turn_cancelled(T1)
@@ -523,14 +590,14 @@ class VoiceTurnDriver:
         # pill can't stick at 'speaking' with dead audio (ruling 2 — (c) > (e)).
         if d.reason == "echo":
             self._log_barge("web.voice.barge.late_suppressed", utterance_id,
-                            reason="echo", score=d.score, dedup=True)
+                            reason="echo", score=d.score, dedup=True, text=text)
             if stage_a_fired:
                 self.interrupt_speech("barge_veto", wire_reason="barged_in")
             return
         # backchannel / too_short / too_early veto = honest stt_final + notice.
         self._emit_stt_final(utterance_id, text)
         self._log_barge("web.voice.barge.suppressed", utterance_id,
-                        reason=d.reason, score=d.score, dedup=True)
+                        reason=d.reason, score=d.score, dedup=True, text=text)
         if stage_a_fired:
             self.interrupt_speech("barge_veto", wire_reason="barged_in")
         self.emit({
@@ -579,7 +646,7 @@ class VoiceTurnDriver:
             score = echo_score(text, self._spoken_text)
             if score >= self._barge.echo_threshold:
                 self._log_barge("web.voice.barge.late_suppressed", uid,
-                                reason="echo", score=score, dedup=True)
+                                reason="echo", score=score, dedup=True, text=text)
                 return
         self._emit_stt_final(uid, text)
         if self._pending is not None:
