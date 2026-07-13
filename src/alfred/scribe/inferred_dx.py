@@ -67,7 +67,7 @@ from alfred.scribe.transcript import Transcript
 log = structlog.get_logger(__name__)
 
 # The single reason literal these flags carry (dispatched to the INFERRED_DIAGNOSIS
-# inline literal by GroundingResult.flag_for).
+# inline literal by GroundingResult.flags_for).
 INFERRED_DIAGNOSIS_REASON = "inferred_diagnosis"
 
 
@@ -203,7 +203,7 @@ def check_inferred_diagnoses(
     from its CITED source segments — the deterministic inferred-dx post-check.
 
     FLAG, do not remove — the flags are extended onto the existing
-    ``GroundingResult.flags`` so they ride the SAME render (``flag_for`` →
+    ``GroundingResult.flags`` so they ride the SAME render (``flags_for`` →
     inline ⚠) + ``grounding_flags`` frontmatter path grounding uses. Deterministic
     string ops; no LLM, no mutation of the claim objects."""
     seg_by_id = {s.id: s for s in transcript.segments}

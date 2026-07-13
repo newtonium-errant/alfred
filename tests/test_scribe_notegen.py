@@ -121,7 +121,7 @@ def test_grounding_clean_note_zero_flags():
     r = verify_grounding(s, t)
     assert r.clean is True
     assert r.metadata == []
-    assert all(r.flag_for(sec, i) is None for sec, i, _ in s.all_claims())
+    assert all(r.flags_for(sec, i) == [] for sec, i, _ in s.all_claims())
 
 
 def test_grounding_catches_dose_flip_500mg_5mg():
@@ -131,7 +131,7 @@ def test_grounding_catches_dose_flip_500mg_5mg():
     r = verify_grounding(s, t)
     assert not r.clean
     assert r.flags[0].reason == "number_mismatch"
-    assert r.flag_for("plan", 0) == GROUNDING_UNVERIFIED
+    assert r.flags_for("plan", 0) == [GROUNDING_UNVERIFIED]
 
 
 @pytest.mark.parametrize(

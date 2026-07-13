@@ -80,9 +80,43 @@ REASONING_NOT_STATED = "⚠ REASONING NOT STATED — clinician to complete"
 GROUNDING_UNVERIFIED = "⚠ GROUNDING UNVERIFIED — clinician to confirm"
 # #48 — the inferred-diagnosis inline flag. Distinct from GROUNDING_UNVERIFIED so
 # a clinician sees WHY (a named diagnosis absent from the cited segments — the
-# model likely INFERRED it), dispatched by GroundingResult.flag_for on the flag's
+# model likely INFERRED it), dispatched by GroundingResult.flags_for on the flag's
 # reason (``inferred_diagnosis``).
 INFERRED_DIAGNOSIS = "⚠ INFERRED DIAGNOSIS — not stated by clinician; confirm"
+
+# P4-2 — the speaker-attribution inline flags (the clinical mis-attribution safety
+# net). Each is DISTINCT + self-explanatory so a clinician sees WHICH attribution
+# failure fired; all dispatched by GroundingResult.flags_for on the flag's reason
+# (see grounding._REASON_INLINE_LITERAL + speaker_attribution.py). DERIVED from the
+# [S#] citation graph × Segment.speaker — token-subset grounding proves the right
+# WORDS; these prove the right SPEAKER.
+#   * SPEAKER_MISMATCH (O/A/P, reason ``speaker_mismatch``) — a clinician-section
+#     claim (objective/assessment/plan) cites a patient/other turn (even if a
+#     clinician turn is co-cited — the co-citation-laundering close).
+SPEAKER_MISMATCH = (
+    "⚠ SPEAKER MISMATCH — cited to a patient/other turn, not the clinician; confirm attribution"
+)
+#   * SPEAKER_UNVERIFIED (all sections, reason ``speaker_unverified``) — a cited
+#     turn's speaker could not be confidently identified (unknown / None / a
+#     sub-purity demotion).
+SPEAKER_UNVERIFIED = (
+    "⚠ SPEAKER UNVERIFIED — cited turn's speaker not confidently identified; confirm attribution"
+)
+#   * COLLATERAL_ATTRIBUTION (Subjective, reason ``collateral_attribution``) — a
+#     subjective (patient-report) claim cites a caregiver/other turn, i.e.
+#     collateral history, not the patient's own words.
+COLLATERAL_ATTRIBUTION = (
+    "⚠ COLLATERAL SOURCE — subjective cited to a caregiver/other, not the patient; confirm"
+)
+#   * ATTRIBUTION_UNVERIFIED (NOTE-LEVEL banner, reason ``attribution_unverified``)
+#     — diarized but NO clinician voice appears anywhere in the encounter (the
+#     composed fail-open close: enrollment missing/failed ⇒ everything unknown/
+#     patient ⇒ per-claim flags alone could still compose into a quiet-looking
+#     note). Rendered as a visible banner line at the top of the note body.
+ATTRIBUTION_UNVERIFIED = (
+    "⚠ ATTRIBUTION UNVERIFIED — no clinician voice identified in this encounter; "
+    "speaker attribution unreliable throughout"
+)
 
 # The SOAP sections + their markdown headings (order is the contract).
 SOAP_SECTIONS: tuple[str, ...] = ("subjective", "objective", "assessment", "plan")
@@ -448,20 +482,34 @@ def render_soap(
     structured: StructuredNote, *, title: str, grounding: "GroundingResult",
 ) -> str:
     """Render the structured note to a SOAP markdown body. Emits ``[S#]`` cites,
-    the ``Not addressed`` / ``REASONING NOT STATED`` literals, and each claim's
-    ``GROUNDING_UNVERIFIED`` flag inline.
+    the ``Not addressed`` / ``REASONING NOT STATED`` literals, each claim's inline
+    flag literals, and (P4-2) the NOTE-LEVEL attribution banner at the top.
 
     ``grounding`` is REQUIRED — a note can NEVER be rendered without a
     :class:`~alfred.scribe.grounding.GroundingResult`, closing the "render
     without verify ⇒ clean-looking flagged draft" hole. The flags are read from
-    the grounding result (``flag_for``), NOT from a mutated claim field — a
+    the grounding result (``flags_for``), NOT from a mutated claim field — a
     single source of truth. (The AIRTIGHT verify-BEFORE-render — a combined
     generate→verify→render — is enforced structurally in the P2-d pipeline; this
     required param is the cheap structural nudge at this layer.)
 
+    ``flags_for`` returns ALL of a claim's distinct inline literals (P4-2 rename
+    of the single-literal ``flag_for``), so a claim carrying both a grounding
+    flag and a speaker flag renders BOTH ⚠ inline, joined by a space. The
+    NOTE-LEVEL banner (section ``"note"``, claim_index ``-1``) renders as a
+    visible line at the top of the body — its section-less identity is a P4-2
+    convention (see ``speaker_attribution``).
+
     Renders FAITHFULLY — never adds, drops, or edits a claim.
     """
     out: list[str] = [f"# {title}", ""]
+    # P4-2 NOTE-LEVEL banner(s) — the section-less ("note", -1) flags (e.g. the
+    # attribution_unverified banner). Rendered ABOVE the sections so a whole-note
+    # caveat is the first thing the clinician reads. Empty when un-diarized (the
+    # pass added no note-level flag) → byte-identical to pre-P4-2.
+    for banner in grounding.flags_for("note", -1):
+        out.append(banner)
+        out.append("")
     for sec in SOAP_SECTIONS:
         out.append(_SECTION_HEADINGS[sec])
         claims = structured.section(sec)
@@ -470,8 +518,8 @@ def render_soap(
         else:
             for i, c in enumerate(claims):
                 cites = f" [{', '.join(c.source_spans)}]" if c.source_spans else ""
-                flag_lit = grounding.flag_for(sec, i)
-                flag = f" {flag_lit}" if flag_lit else ""
+                flag_lits = grounding.flags_for(sec, i)
+                flag = f" {' '.join(flag_lits)}" if flag_lits else ""
                 out.append(f"- {c.claim}{cites}{flag}")
             if sec == "assessment" and not structured.assessment_reasoning_stated:
                 out.append(REASONING_NOT_STATED)

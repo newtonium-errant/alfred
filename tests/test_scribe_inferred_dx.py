@@ -1,7 +1,7 @@
 """Tests for the #48 deterministic inferred-diagnosis post-check.
 
 Deterministic (NO LLM judge). The 7 base + 4 added = 11 A/B fixtures, the
-mutation-bind (remove the check → the #48 case NOT flagged → RED), the H2 flag_for
+mutation-bind (remove the check → the #48 case NOT flagged → RED), the H2 flags_for
 reason-dispatch, the inline ⚠ render + grounding_flags metadata, the lexicon
 abbreviation-exclusion policy, and the self-correcting Part-1 attest capture
 (fires kept/removed AND is side-effect-free w.r.t. attestation).
@@ -202,17 +202,17 @@ def test_mutation_bind_48_case_flagged_by_the_check():
 
 
 # ---------------------------------------------------------------------------
-# H2 — flag_for reason dispatch
+# H2 — flags_for reason dispatch
 # ---------------------------------------------------------------------------
 
-def test_flag_for_dispatches_on_reason():
+def test_flags_for_dispatches_on_reason():
     g = GroundingResult(flags=[
         GroundingFlag("assessment", 0, "number_mismatch", "d", "c", ["S1"]),
         GroundingFlag("plan", 0, "inferred_diagnosis", "d", "c", ["S2"]),
     ])
-    assert g.flag_for("assessment", 0) == GROUNDING_UNVERIFIED   # grounding reason → default
-    assert g.flag_for("plan", 0) == INFERRED_DIAGNOSIS           # #48 reason → distinct literal
-    assert g.flag_for("subjective", 0) is None                  # clean → None
+    assert g.flags_for("assessment", 0) == [GROUNDING_UNVERIFIED]   # grounding reason → default
+    assert g.flags_for("plan", 0) == [INFERRED_DIAGNOSIS]           # #48 reason → distinct literal
+    assert g.flags_for("subjective", 0) == []                      # clean → []
 
 
 def test_inferred_flag_renders_inline_and_lands_in_metadata():

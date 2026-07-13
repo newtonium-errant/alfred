@@ -80,22 +80,40 @@ from typing import Any
 import structlog
 
 from alfred.scribe.notegen import (
+    ATTRIBUTION_UNVERIFIED,
+    COLLATERAL_ATTRIBUTION,
     GROUNDING_UNVERIFIED,
     INFERRED_DIAGNOSIS,
     SOAP_SECTIONS,
+    SPEAKER_MISMATCH,
+    SPEAKER_UNVERIFIED,
     StructuredNote,
 )
 from alfred.scribe.transcript import Transcript
 
 log = structlog.get_logger(__name__)
 
-# H2 — reason → inline literal dispatch for GroundingResult.flag_for. A flag's
+# H2 — reason → inline literal dispatch for GroundingResult.flags_for. A flag's
 # ``reason`` selects the inline ⚠. Grounding's mechanical reasons all map to
 # GROUNDING_UNVERIFIED (the default); the #48 ``inferred_diagnosis`` reason maps
-# to the distinct INFERRED_DIAGNOSIS literal. A reason absent from this map falls
-# back to GROUNDING_UNVERIFIED (safe default — a flag never renders unflagged).
+# to the distinct INFERRED_DIAGNOSIS literal; the P4-2 speaker-attribution reasons
+# each map to their own distinct literal (the per-claim three + the note-level
+# banner). A reason absent from this map falls back to GROUNDING_UNVERIFIED (safe
+# default — a flag never renders unflagged).
+#
+# The reason STRINGS are duplicated as constants in the modules that MINT the
+# flags (inferred_dx.INFERRED_DIAGNOSIS_REASON, speaker_attribution.*_REASON) —
+# grounding cannot import them (those modules import grounding, so importing back
+# would cycle), so the strings live here as literals and a test pins the two
+# sides in lockstep. ``attribution_unverified`` is the NOTE-LEVEL banner reason:
+# it is mapped here too so ``flags_for("note", -1)`` renders it via the SAME
+# single dispatch as every per-claim flag.
 _REASON_INLINE_LITERAL: dict[str, str] = {
     "inferred_diagnosis": INFERRED_DIAGNOSIS,
+    "speaker_mismatch": SPEAKER_MISMATCH,
+    "speaker_unverified": SPEAKER_UNVERIFIED,
+    "collateral_attribution": COLLATERAL_ATTRIBUTION,
+    "attribution_unverified": ATTRIBUTION_UNVERIFIED,
 }
 
 
@@ -178,20 +196,29 @@ class GroundingResult:
     def clean(self) -> bool:
         return not self.flags
 
-    def flag_for(self, section: str, index: int) -> str | None:
-        """Return the inline flag literal for the claim at
-        ``(section, index)``, or ``None`` if it is clean. DISPATCHES on the
-        matched flag's ``reason`` (H2): grounding's mechanical reasons →
-        GROUNDING_UNVERIFIED; ``inferred_diagnosis`` → INFERRED_DIAGNOSIS. The
+    def flags_for(self, section: str, index: int) -> list[str]:
+        """Return ALL distinct inline flag literals for the claim at
+        ``(section, index)`` — deduped, insertion-ordered — or ``[]`` if it is
+        clean. DISPATCHES each matched flag's ``reason`` (H2): grounding's
+        mechanical reasons → GROUNDING_UNVERIFIED; ``inferred_diagnosis`` →
+        INFERRED_DIAGNOSIS; the P4-2 speaker reasons → their own literals. The
         single source of truth ``render_soap`` reads — no hidden mutation of the
-        claim objects, and render CANNOT run without a GroundingResult. (First
-        matching flag wins if a claim carries more than one — grounding flags are
-        appended before the #48 flags, so a mechanically-flagged claim shows the
-        grounding literal; its inferred flag still rides ``metadata``.)"""
+        claim objects, and render CANNOT run without a GroundingResult.
+
+        P4-2 rename of the former single-literal first-match-wins ``flag_for``:
+        a claim can now carry flags from THREE independent passes (grounding +
+        #48 inferred-dx + P4-2 speaker), and ALL of them must render inline —
+        first-match-wins would silently hide the speaker ⚠ behind a co-located
+        grounding ⚠. Dedup is by LITERAL (two grounding reasons that both map to
+        GROUNDING_UNVERIFIED render one ⚠); the note-level banner is fetched with
+        ``flags_for("note", -1)`` (its section-less identity, P4-2 convention)."""
+        literals: list[str] = []
         for f in self.flags:
             if f.section == section and f.claim_index == index:
-                return _REASON_INLINE_LITERAL.get(f.reason, GROUNDING_UNVERIFIED)
-        return None
+                lit = _REASON_INLINE_LITERAL.get(f.reason, GROUNDING_UNVERIFIED)
+                if lit not in literals:
+                    literals.append(lit)
+        return literals
 
 
 def _normalize(text: str) -> str:
@@ -293,7 +320,7 @@ def _cited_text(claim_spans, seg_by_id) -> str:
 def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResult:
     """Deterministically verify grounding. Returns the auditable
     :class:`GroundingResult` (no mutation of the claim objects — ``render_soap``
-    reads flags via ``GroundingResult.flag_for``, so a note can never be
+    reads flags via ``GroundingResult.flags_for``, so a note can never be
     rendered without the grounding result)."""
     # FAIL-CLOSED integrity gate (scribe P3-b1) — refuse a transcript with
     # DUPLICATE segment ids BEFORE building the {id: segment} map. Last-wins map

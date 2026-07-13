@@ -66,6 +66,7 @@ from alfred.scribe.notegen import (
     generate_structured,
     render_soap,
 )
+from alfred.scribe.speaker_attribution import check_speaker_attribution
 from alfred.scribe.state import (
     STATE_BUDGET_CAPPED,
     STATE_DRAFTED,
@@ -131,27 +132,49 @@ async def generate_verified_note(
     # #48 — deterministic inferred-diagnosis post-check, BETWEEN verify and render.
     # FLAGS (never removes) a claim naming a lexicon diagnosis absent from its
     # CITED segments; the flags EXTEND grounding.flags so they ride the existing
-    # render (flag_for → inline ⚠ INFERRED DIAGNOSIS) + grounding_flags frontmatter
+    # render (flags_for → inline ⚠ INFERRED DIAGNOSIS) + grounding_flags frontmatter
     # path. Grounding is BLIND to this (a label invented from a real segment has no
     # number/negation token) and rule-6 can't stop it (the model disobeys) — code
     # is the lever.
     grounding_flag_count = len(grounding.flags)   # mechanical grounding flags only
     inferred_flags = check_inferred_diagnoses(structured, transcript)
     grounding.flags.extend(inferred_flags)
+    # P4-2 — deterministic SPEAKER-attribution post-check, the mis-attribution
+    # safety net. Like the #48 twin it only EXTENDS grounding.flags (verify stays
+    # byte-identical) and rides the same render (flags_for → inline ⚠ + note-level
+    # banner) + grounding_flags frontmatter path. DERIVED from the [S#] citation
+    # graph × Segment.speaker — no model-emitted field. FAIL-OPEN like the diarize
+    # pass: a crash in the safety net must NOT lose the note (un-attributed ≫
+    # lost), but log LOUDLY so morning-review sees the net degraded this note.
+    try:
+        speaker_flags = check_speaker_attribution(structured, transcript, config)
+    except Exception as e:  # noqa: BLE001 — safety-net crash must not lose the note
+        speaker_flags = []
+        log.warning(
+            "scribe.speaker_attribution.failed",
+            source_id=transcript.source_id,     # opaque encounter id only — NO PHI (NOTE-4)
+            error_class=type(e).__name__,       # class only — never the message
+            detail=(
+                "speaker-attribution safety net crashed — note drafted WITHOUT "
+                "speaker flags (un-attributed ≫ lost); surface for review"
+            ),
+        )
+    grounding.flags.extend(speaker_flags)
     # #4 — RECONCILE the flag-count observability seam. verify_grounding already
-    # emitted ``scribe.grounding.verified flagged=<grounding-only>`` BEFORE this
-    # extend, so that line UNDER-reports the total (a note whose only flag is an
-    # inferred_diagnosis logs grounding flagged=0 while the note carries the inline
-    # ⚠ + a frontmatter entry). Emit the FINAL, authoritative breakdown here so a
-    # downstream flag-counting monitor sees the true total (the note body +
-    # frontmatter + flag_count below already use the extended list — this closes
-    # only the intermediate-log discrepancy).
+    # emitted ``scribe.grounding.verified flagged=<grounding-only>`` BEFORE these
+    # extends, so that line UNDER-reports the total (a note whose only flag is an
+    # inferred_diagnosis or speaker-attribution flag logs grounding flagged=0 while
+    # the note carries the inline ⚠ + a frontmatter entry). Emit the FINAL,
+    # authoritative breakdown here so a downstream flag-counting monitor sees the
+    # true total (the note body + frontmatter + flag_count below already use the
+    # extended list — this closes only the intermediate-log discrepancy).
     log.info(
         "scribe.grounding.flags_finalized",
         source_id=transcript.source_id,
         total_flags=len(grounding.flags),
         grounding_flags=grounding_flag_count,
         inferred_diagnosis_flags=len(inferred_flags),
+        speaker_attribution_flags=len(speaker_flags),
     )
     body = render_soap(structured, title=title, grounding=grounding)  # render with THAT grounding
     return VerifiedNote(
