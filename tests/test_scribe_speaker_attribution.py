@@ -749,8 +749,14 @@ def test_p43_example_c_home_vital_in_objective_flags_mismatch():
 def test_p43_example_d_relayed_hpi_and_self_dx_in_subjective_is_clean():
     # WORKED EXAMPLE D output — a clinician-RELAYED history in Subjective (legit,
     # no collateral/mismatch flag) AND the patient's lay self-diagnosis in
-    # Subjective (not Assessment): the whole note is CLEAN (incl. inferred-dx, the
-    # cited patient turn names "sciatica" so the self-dx is grounded).
+    # Subjective (not Assessment): the whole note is CLEAN, incl. inferred-dx.
+    # inferred-dx mechanism (verified against the lexicon): diagnoses_named_in(
+    # "...recurrent sciatica") returns [] — "sciatica" is NOT in the diagnosis
+    # lexicon — so check_inferred_diagnoses SKIPS the claim at its `if not named:
+    # continue` guard and never reaches the grounding-clear path. (Were sciatica
+    # later added to the lexicon the claim would STILL clear: the term is verbatim
+    # in the cited patient turn and "I think…" is not a hedge, so _stated_current
+    # would clear it — but today it is the lexicon-skip that makes this clean.)
     tx = _tx(
         _seg(1, "So you've had lower back pain radiating down the left leg for about a week.", speaker=ROLE_CLINICIAN),
         _seg(2, "Yes, and honestly I think my sciatica is flaring up again.", speaker=ROLE_PATIENT),
