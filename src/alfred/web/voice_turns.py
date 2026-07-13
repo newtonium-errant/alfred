@@ -425,10 +425,15 @@ class VoiceTurnDriver:
             self._suppress_logged.add(key)
         if "suppress" in event:   # remember for the missed-barge cancel join (§1.9b(c))
             self._last_suppressed = (utterance_id, self._clock())
+        # ONE reading of the elapsed clock — the SAME int lands on the log line
+        # AND the durable record (a re-read would drift sub-ms between the two,
+        # so anyone joining talker.log ↔ the corpus would see a mismatch).
+        ms = int(self._elapsed_speaking_ms())
+        resolved_turn = turn_id or (self._speaking_turn_id or "")
         fields: dict[str, Any] = {
             "voice_session_id": self._vid, "utterance_id": utterance_id,
-            "turn_id": turn_id or (self._speaking_turn_id or ""),
-            "ms_into_speaking": int(self._elapsed_speaking_ms()),
+            "turn_id": resolved_turn,
+            "ms_into_speaking": ms,
         }
         if reason:
             fields["reason"] = reason
@@ -438,10 +443,10 @@ class VoiceTurnDriver:
         # Durable, features-only twin (V3.1 calibration corpus). Same decision
         # seam; NEVER the transcript — the sink allowlist enforces it structurally.
         self._emit_barge_features(
-            event, utterance_id, fields["turn_id"], reason, score, text)
+            event, utterance_id, resolved_turn, reason, ms, text)
 
     def _emit_barge_features(self, event: str, utterance_id: str, turn_id: str,
-                             reason: str, score: float, text: str) -> None:
+                             reason: str, ms_into_speaking: int, text: str) -> None:
         """Write ONE features-only barge record to the durable calibration sink.
 
         Maps the log ``event`` → the calibration ``decision`` / ``reason`` and
@@ -454,6 +459,10 @@ class VoiceTurnDriver:
         tel = self._barge_telemetry
         if tel is None:
             return
+        # ORDER IS LOAD-BEARING: "late_suppressed" MUST be tested BEFORE
+        # "suppressed" — "suppressed" is a SUBSTRING of "late_suppressed", so a
+        # reorder would silently relabel late_echo → the generic reason and
+        # corrupt the corpus.
         if "confirmed" in event:
             decision, cal_reason = "barge", "confirmed"
         elif "late_suppressed" in event:
@@ -462,18 +471,26 @@ class VoiceTurnDriver:
             decision, cal_reason = "suppress", reason or ""
         else:   # triggered (Stage-A partial) — not a durable decision; skip.
             return
-        from .barge_in import normalize_text
+        from .barge_in import echo_score, normalize_text
 
         norm = normalize_text(text)
         toks = norm.split()
         settings = self._barge
         backchannel = getattr(settings, "backchannel_phrases", frozenset())
         interrupt = getattr(settings, "interrupt_phrases", frozenset())
+        # Recompute the REAL echo score for EVERY decision (the SAME computation
+        # evaluate_barge runs internally, over the same spoken buffer). A
+        # confirmed barge PASSES the echo gate with a sub-threshold score that
+        # the pure BargeDecision discards (defaults to 0.0) — yet a confirm just
+        # under the threshold is the near-miss / likely-false-barge signal this
+        # sink exists to feed. Rounded FLOAT only; the transcript is never
+        # written. ONE source per decision (never two values for one record).
+        score = round(float(echo_score(text, self._spoken_text)), 3)
         tel.emit({
             "decision": decision,
             "reason": cal_reason,
-            "ms_into_speaking": int(self._elapsed_speaking_ms()),
-            "echo_score": round(float(score), 3),
+            "ms_into_speaking": ms_into_speaking,
+            "echo_score": score,
             "word_count": len(toks),
             "char_count": len(norm),
             "starts_with_backchannel": bool(toks and toks[0] in backchannel),

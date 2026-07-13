@@ -8,6 +8,14 @@ calibration go/no-go. The barge decisions are ALSO logged to talker.log by
 ``VoiceTurnDriver._log_barge`` / ``_barge_outcome`` (§1.9 / §1.9b, ephemeral +
 ANSI-coloured); this sink is the durable, parseable, feature-bearing twin.
 
+CORPUS SHAPE (offline learner, read this): one ``utterance_id`` can map to
+1→N records. A partial (Stage A) and its final (Stage B) may legitimately
+suppress for DIFFERENT reasons across the ``too_early`` boundary (e.g. a
+``too_early`` partial then a ``backchannel`` final), and a CONFIRMED barge also
+emits a later ``_barge_outcome`` record (same ``turn_id``, no features, carrying
+the completed/cancelled/empty label). De-dupe / join on ``(utterance_id,
+turn_id, reason)`` — do NOT assume one record per utterance.
+
 PRIVACY (load-bearing, scope §5): the sink records lexical-CATEGORY FEATURES
 ONLY (derived booleans / scalars / the decision), NEVER the raw OR normalized
 transcript text (the no-transcript-in-logs contract, ``voice_stt.py:50`` /

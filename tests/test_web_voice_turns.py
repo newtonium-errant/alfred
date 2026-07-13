@@ -1208,6 +1208,45 @@ async def test_barge_telemetry_confirmed_records_features(tmp_path) -> None:
     await d.aclose()
 
 
+async def test_barge_telemetry_confirmed_records_subthreshold_echo(tmp_path) -> None:
+    # THE echo-calibration pin: a CONFIRMED barge whose utterance is echo-LIKE
+    # but UNDER the 0.8 gate must record its real (non-zero) echo_score — the
+    # near-miss / likely-false-barge signal. Before the recompute fix the pure
+    # BargeDecision(True) carried score=0.0 and this was invisible.
+    from alfred.web.barge_in import echo_score
+    clk = [1000.0]
+    ch, stub = FakeChannel(), _StubTts()
+    spoken = "the quarterly report shows revenue grew twelve percent"
+    utter = "the report about marketing next quarter"
+    raw_score = echo_score(utter, spoken)
+    assert 0.0 < raw_score < 0.8                      # echo-like but sub-threshold
+    d = _barge_tel_driver(
+        _scripted_rts([{"type": "final", "reply": "ok"}]), clk, tmp_path)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d._spoken_text = spoken
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0                                  # past too_early
+    await d.submit_utterance(utter)                  # echo < gate → CONFIRM
+    await _wait_for(ch, {"turn_final"})
+    await _drain_barge()
+
+    recs = _read_barge(tmp_path)
+    decision = [r for r in recs if r.get("reason") == "confirmed" and "word_count" in r]
+    assert len(decision) == 1
+    rec = decision[0]
+    assert rec["decision"] == "barge"
+    # The confirmed barge's actual sub-threshold echo is now observable.
+    assert rec["echo_score"] == round(raw_score, 3)
+    assert 0.0 < rec["echo_score"] < 0.8
+    # Privacy intact: a FLOAT only — no transcript word lands on disk.
+    raw = (tmp_path / "events.jsonl").read_text()
+    for word in ("quarterly", "report", "marketing", "revenue"):
+        assert word not in raw
+    await d.aclose()
+
+
 async def test_barge_telemetry_suppressed_backchannel(tmp_path) -> None:
     # A backchannel veto (Stage B) writes ONE suppress record, reason=backchannel.
     clk = [1000.0]
