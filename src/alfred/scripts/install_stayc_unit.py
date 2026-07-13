@@ -700,6 +700,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if unit_user == "root":
+        # PHI-safety: running the sovereign clinical scribe as root defeats the
+        # whole point of the User=/Group= privilege drop. This fires on a
+        # root-DIRECT install (no sudo → $SUDO_USER unset, $USER=root → the
+        # default resolves to root), or an explicit --unit-user root.
+        print(
+            "error: refusing to render User=root — running the sovereign PHI "
+            "scribe as root defeats the systemd privilege drop. Run the "
+            "installer via sudo AS THE OPERATOR (so $SUDO_USER is the "
+            "unprivileged user), or pass --unit-user <name> explicitly.",
+            file=sys.stderr,
+        )
+        return 2
     unit_group = args.unit_group or _default_unit_group(unit_user)
 
     try:

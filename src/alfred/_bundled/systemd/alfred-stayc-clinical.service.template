@@ -25,8 +25,8 @@ WorkingDirectory=<STAYC_WORKDIR>
 ExecStart=<STAYC_PYTHON> -m alfred --config <STAYC_CONFIG> up --_internal-foreground
 # --- barrier-(c) cloud-key scrub (DETERMINATE B): manager-enforced regardless of launch, supersedes the header's env -u wrapper ---
 UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL GROQ_API_KEY DEEPGRAM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY ELEVENLABS_API_KEY TOGETHER_API_KEY ZO_API_KEY RESEND_API_KEY
-# salt-only, 0600, sited OUTSIDE the config dir so barrier-(c)'s sibling-.env autoload never sees it; carries NO cloud key.
-# Leading `-` (#67 F2): OPTIONAL — a missing file is ignored, not fatal. The salt is usually inline in config.scribe.encounter_salt, so this file is often absent; without the dash systemd REFUSES to start the unit.
+# salt-only, 0600, sited OUTSIDE the config dir so barrier-(c)'s sibling-.env autoload never sees it; carries NO cloud key. It sources SCRIBE_ENCOUNTER_SALT, which config.scribe.encounter_salt references as ${SCRIBE_ENCOUNTER_SALT} (env-sourced, NEVER inline).
+# Leading `-` (#67 F2): OPTIONAL — a MISSING env-file is non-fatal to STARTUP (without the dash systemd would REFUSE to start the unit). Fail-closed is preserved at INGEST, not startup: if the file is absent the salt stays the unresolved literal ${SCRIBE_ENCOUNTER_SALT}, and compute_encounter_id (scribe/identity.py) REJECTS an unresolved-placeholder salt — so the daemon boots idle-ready but refuses to mint a reversible encounter_id until the salt is set. Startup-tolerant + ingest-fail-closed, never a weak id.
 EnvironmentFile=-<STAYC_SECRETS_ENV>
 # real-need iii: relocate HF STT cache off /home + force offline model load
 Environment=HF_HOME=<STAYC_HF_HOME>

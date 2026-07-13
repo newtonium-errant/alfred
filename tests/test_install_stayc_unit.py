@@ -546,3 +546,80 @@ def test_main_dry_run_renders_from_real_config(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "SYSTEM unit" in out
     assert not (tmp_path / "sysd").exists(), "dry-run must not write the unit"
+
+
+# ---------------------------------------------------------------------------
+# #67 cr-67a — unit-user resolution + root/privilege-drop guards
+# ---------------------------------------------------------------------------
+
+
+def test_default_unit_user_prefers_sudo_user(monkeypatch) -> None:
+    """Under sudo, $SUDO_USER (the invoking operator) wins over $USER=root."""
+    monkeypatch.setenv("SUDO_USER", "andrew")
+    monkeypatch.setenv("USER", "root")
+    assert installer._default_unit_user() == "andrew"
+
+
+def test_default_unit_user_root_direct_resolves_root(monkeypatch) -> None:
+    """A root-DIRECT install (no sudo → $SUDO_USER unset, $USER=root) resolves to
+    'root' — which main() then rejects (see below)."""
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.setenv("USER", "root")
+    monkeypatch.delenv("LOGNAME", raising=False)
+    assert installer._default_unit_user() == "root"
+
+
+def test_default_unit_user_all_unset_is_empty(monkeypatch) -> None:
+    """All identity env unset → '' (main() then errors, telling the operator to
+    pass --unit-user)."""
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+    assert installer._default_unit_user() == ""
+
+
+def test_main_rejects_resolved_root_user(tmp_path: Path, capsys) -> None:
+    """cr-67a: refuse to render User=root (running the PHI scribe as root defeats
+    the systemd privilege drop). Explicit --unit-user root is rejected too."""
+    rc = installer.main([
+        "--config", str(_CONFIG_EXAMPLE),
+        "--unit-user", "root",
+        "--install-dir", str(tmp_path / "sysd"),
+        "--skip-model-check",
+        "--dry-run",
+    ])
+    assert rc == 2
+    assert "User=root" in capsys.readouterr().err
+
+
+def test_main_all_identity_unset_errors(tmp_path: Path, monkeypatch, capsys) -> None:
+    """No --unit-user and no identity env → main() errors (return 2) rather than
+    rendering an empty User=."""
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+    rc = installer.main([
+        "--config", str(_CONFIG_EXAMPLE),
+        "--install-dir", str(tmp_path / "sysd"),
+        "--skip-model-check",
+        "--dry-run",
+    ])
+    assert rc == 2
+    assert "cannot determine the unit user" in capsys.readouterr().err
+
+
+def test_main_root_gate_requires_euid_zero(tmp_path: Path, monkeypatch, capsys) -> None:
+    """cr-67a: writing the unit / driving systemctl needs root — a non-root euid
+    fails loud (return 2) with the sudo hint, before writing anything."""
+    monkeypatch.setattr(installer, "_geteuid", lambda: 1000)
+    sysd = tmp_path / "sysd"
+    rc = installer.main([
+        "--config", str(_CONFIG_EXAMPLE),
+        "--unit-user", "andrew",
+        "--unit-group", "andrew",
+        "--install-dir", str(sysd),  # non-system dir, but --skip-systemctl absent → needs root
+        "--skip-model-check",
+    ])
+    assert rc == 2
+    assert "requires root" in capsys.readouterr().err
+    assert not sysd.exists(), "must not write the unit when the root gate fails"
