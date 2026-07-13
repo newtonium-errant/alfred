@@ -92,9 +92,11 @@ INFERRED_DIAGNOSIS = "⚠ INFERRED DIAGNOSIS — not stated by clinician; confir
 # WORDS; these prove the right SPEAKER.
 #   * SPEAKER_MISMATCH (O/A/P, reason ``speaker_mismatch``) — a clinician-section
 #     claim (objective/assessment/plan) cites a patient/other turn (even if a
-#     clinician turn is co-cited — the co-citation-laundering close).
+#     clinician turn is co-cited — the co-citation-laundering close). Worded so it
+#     stays TRUE in the co-citation case (a co-cited clinician does NOT make ",
+#     not the clinician" false and invite dismissal of the very laundering flag).
 SPEAKER_MISMATCH = (
-    "⚠ SPEAKER MISMATCH — cited to a patient/other turn, not the clinician; confirm attribution"
+    "⚠ SPEAKER MISMATCH — cites a patient/other turn in clinician-authored content; confirm attribution"
 )
 #   * SPEAKER_UNVERIFIED (all sections, reason ``speaker_unverified``) — a cited
 #     turn's speaker could not be confidently identified (unknown / None / a
@@ -104,18 +106,22 @@ SPEAKER_UNVERIFIED = (
 )
 #   * COLLATERAL_ATTRIBUTION (Subjective, reason ``collateral_attribution``) — a
 #     subjective (patient-report) claim cites a caregiver/other turn, i.e.
-#     collateral history, not the patient's own words.
+#     collateral history. Worded to stay TRUE when the patient is also co-cited
+#     (states what the claim cites, not "not the patient").
 COLLATERAL_ATTRIBUTION = (
-    "⚠ COLLATERAL SOURCE — subjective cited to a caregiver/other, not the patient; confirm"
+    "⚠ COLLATERAL SOURCE — subjective content cites a caregiver/other turn; confirm source"
 )
 #   * ATTRIBUTION_UNVERIFIED (NOTE-LEVEL banner, reason ``attribution_unverified``)
-#     — diarized but NO clinician voice appears anywhere in the encounter (the
-#     composed fail-open close: enrollment missing/failed ⇒ everything unknown/
+#     — diarized but attribution could not be established for the encounter (the
+#     composed fail-open close: no clinician voice anywhere ⇒ everything unknown/
 #     patient ⇒ per-claim flags alone could still compose into a quiet-looking
-#     note). Rendered as a visible banner line at the top of the note body.
+#     note; ALSO reused by the pipeline when the pass CRASHES). Rendered as a
+#     visible banner line at the top of the note body. Cause-agnostic so it stays
+#     TRUE for both the no-clinician case AND the crash case (the specific cause
+#     rides the flag's ``detail``, not the inline literal).
 ATTRIBUTION_UNVERIFIED = (
-    "⚠ ATTRIBUTION UNVERIFIED — no clinician voice identified in this encounter; "
-    "speaker attribution unreliable throughout"
+    "⚠ ATTRIBUTION UNVERIFIED — speaker attribution could not be established for "
+    "this encounter; treat all attribution as unverified"
 )
 
 # The SOAP sections + their markdown headings (order is the contract).
@@ -505,8 +511,9 @@ def render_soap(
     out: list[str] = [f"# {title}", ""]
     # P4-2 NOTE-LEVEL banner(s) — the section-less ("note", -1) flags (e.g. the
     # attribution_unverified banner). Rendered ABOVE the sections so a whole-note
-    # caveat is the first thing the clinician reads. Empty when un-diarized (the
-    # pass added no note-level flag) → byte-identical to pre-P4-2.
+    # caveat is the first thing the clinician reads. Empty when the P4-2 pass
+    # contributed no note-level flag (e.g. un-diarized) — the body then differs
+    # from pre-P4-2 ONLY by the deliberate flags_for multi-literal render change.
     for banner in grounding.flags_for("note", -1):
         out.append(banner)
         out.append("")

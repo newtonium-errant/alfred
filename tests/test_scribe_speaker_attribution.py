@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 
+import frontmatter
 import pytest
 import structlog
 
@@ -29,12 +31,15 @@ import alfred.distiller.backends.ollama as ollama_mod
 import alfred.scribe.diarize as diarize_mod
 import alfred.scribe.pipeline as pipeline_mod
 from alfred.scribe import (
+    SCRIBE_DRAFTER_IDENTITY,
     accumulate_encounter,
     generate_verified_note,
     ledger_path,
     load_from_unified,
     load_ledger,
 )
+from alfred.scribe.attest import attest
+from alfred.vault.ops import vault_create
 from alfred.scribe.grounding import GroundingFlag, GroundingResult, verify
 from alfred.scribe.inferred_dx import check_inferred_diagnoses
 from alfred.scribe.notegen import (
@@ -540,9 +545,11 @@ def test_flags_finalized_log_carries_speaker_attribution_count(monkeypatch):
     assert SPEAKER_MISMATCH in vnote.body                    # rendered inline
 
 
-def test_speaker_attribution_crash_does_not_lose_note_logs_loudly(monkeypatch):
-    # Fail-open: a crash in the safety net must NOT lose the note (un-attributed ≫
-    # lost) — the note is still drafted, degraded to 0 speaker flags, with a loud log.
+def test_speaker_attribution_crash_synthesizes_banner_and_logs_loudly(monkeypatch):
+    # Fail-open but VISIBLE (F1): a crash in the safety net must NOT lose the note
+    # (un-attributed ≫ lost) AND must surface — the note is drafted WITH a
+    # synthesized note-level attribution_unverified banner (in body + frontmatter),
+    # plus a loud PHI-free log.
     canned = json.dumps({
         "subjective": [], "objective": [{"claim": "BP 120 over 80", "source_spans": ["S1"]}],
         "assessment": [], "plan": [], "assessment_reasoning_stated": True,
@@ -556,8 +563,141 @@ def test_speaker_attribution_crash_does_not_lose_note_logs_loudly(monkeypatch):
     tx = _tx(_seg(1, "BP 120 over 80.", speaker=ROLE_CLINICIAN), diarized=True)
     with structlog.testing.capture_logs() as caps:
         vnote = asyncio.run(generate_verified_note(tx, config=_config(), title="T"))
+
     assert vnote.body                                        # note STILL produced (not lost)
+    # banner synthesized: renders in the body AND rides grounding_flags frontmatter
+    assert ATTRIBUTION_UNVERIFIED in vnote.body
+    note_meta = [m for m in vnote.grounding_flags if m["section"] == "note"]
+    assert len(note_meta) == 1 and note_meta[0]["reason"] == "attribution_unverified"
+    assert note_meta[0]["claim_index"] == -1
+    # loud PHI-free log fires, carrying only the error CLASS — never the message (F5)
     warn = [c for c in caps if c.get("event") == "scribe.speaker_attribution.failed"]
     assert len(warn) == 1 and warn[0]["error_class"] == "RuntimeError"
+    assert "attribution exploded" not in json.dumps(warn[0])   # raw message never logged (NOTE-4)
+    # the finalized breakdown counts the synthesized banner
     fin = [c for c in caps if c.get("event") == "scribe.grounding.flags_finalized"]
-    assert fin[0]["speaker_attribution_flags"] == 0         # degraded, not crashed
+    assert fin[0]["speaker_attribution_flags"] == 1
+
+
+# ---------------------------------------------------------------------------
+# QA round hardenings (F3/F4/F6/F8/F9) — mutation-proof pins
+# ---------------------------------------------------------------------------
+
+def test_subjective_other_cocited_clinician_still_collateral():
+    # F3 — mirror of the O/A/P laundering pin: a Subjective claim co-citing an
+    # OTHER turn AND a clinician turn STILL flags collateral (a co-cited clinician
+    # does not launder the collateral source clean). Mutant that must fail:
+    # `ROLE_OTHER in cited_roles and ROLE_CLINICIAN not in cited_roles`.
+    tx = _tx(
+        _seg(1, "He hasn't been eating well.", speaker=ROLE_OTHER),
+        _seg(2, "How long has that been going on?", speaker=ROLE_CLINICIAN),
+    )
+    note = _note(subjective=[Claim(claim="Not eating well", source_spans=["S1", "S2"])])
+    assert _reasons(_run(note, tx)) == [COLLATERAL_ATTRIBUTION_REASON]
+
+
+def test_dangling_span_no_crash_other_claims_keep_flags():
+    # F4 — a claim citing a nonexistent span id (S99) on a diarized transcript must
+    # NOT crash; the dangling span contributes no role; OTHER claims keep their
+    # speaker flags. Mutant that must fail: dropping the `if s in seg_by_id` guard
+    # (→ KeyError on seg_by_id["S99"] → the whole pass raises).
+    tx = _tx(
+        _seg(1, "BP high.", speaker=ROLE_PATIENT),
+        _seg(2, "Noted.", speaker=ROLE_CLINICIAN),          # banner OFF
+    )
+    note = _note(objective=[
+        Claim(claim="Dangling", source_spans=["S99"]),      # nonexistent span
+        Claim(claim="BP high", source_spans=["S1"]),        # real patient span
+    ])
+    flags = _run(note, tx)                                   # must NOT crash
+    assert not any(f.section == "objective" and f.claim_index == 0 for f in flags)
+    assert any(
+        f.section == "objective" and f.claim_index == 1 and f.reason == SPEAKER_MISMATCH_REASON
+        for f in flags
+    )
+
+
+@pytest.mark.parametrize("bad_conf", [float("nan"), float("inf")])
+def test_nonfinite_conf_clinician_does_not_clear_banner(bad_conf):
+    # F6 — a non-finite conf (NaN/±inf) is NOT a trustworthy high-purity value → the
+    # clinician demotes to unknown → the banner still fires (no clinician anywhere).
+    tx = _tx(_seg(1, "BP 120 over 80.", speaker=ROLE_CLINICIAN, conf=bad_conf))
+    note = _note(objective=[Claim(claim="BP 120 over 80", source_spans=["S1"])])
+    note_flags = [f for f in _run(note, tx) if f.section == "note"]
+    assert len(note_flags) == 1 and note_flags[0].reason == ATTRIBUTION_UNVERIFIED_REASON
+
+
+@pytest.mark.parametrize("bad_conf", [float("nan"), float("inf")])
+def test_nonfinite_conf_patient_in_subjective_demotes_to_unverified(bad_conf):
+    # F6 — a non-finite conf patient in Subjective → unknown → speaker_unverified
+    # (NOT collateral, NOT clean). Mutant that must fail: the pre-fix
+    # `conf < purity_threshold` alone (NaN < x is False → would NOT demote).
+    tx = _tx(
+        _seg(1, "I feel dizzy.", speaker=ROLE_PATIENT, conf=bad_conf),
+        _seg(2, "Since when?", speaker=ROLE_CLINICIAN),      # banner OFF
+    )
+    note = _note(subjective=[Claim(claim="Feels dizzy", source_spans=["S1"])])
+    assert _reasons(_run(note, tx)) == [SPEAKER_UNVERIFIED_REASON]
+
+
+def test_oap_sections_lockstep_with_soap_sections():
+    # F9 — _OAP_SECTIONS must stay == SOAP_SECTIONS - {subjective} so a section
+    # rename/add in notegen can't silently strip the mismatch/collateral rules.
+    from alfred.scribe.notegen import SOAP_SECTIONS
+    from alfred.scribe.speaker_attribution import _OAP_SECTIONS
+    assert _OAP_SECTIONS == frozenset(SOAP_SECTIONS) - {"subjective"}
+
+
+def test_attest_tolerates_mixed_flags_and_speaker_flags_carry_spans(tmp_path):
+    # F8 — drive attest over a note whose grounding_flags carry inferred +
+    # per-claim speaker + the note-level banner TOGETHER. Attest must tolerate the
+    # shapes (the inferred-dx capture at attest is fail-silent, so a shape
+    # regression is invisible without this). ALSO assert per-claim speaker flags
+    # carry their source_spans (P4-5's correction loop re-derives cited roles from
+    # spans × the ledger transcript — confirm the payload supports it).
+    clinicians = {"np_jamie", "dr_synthetic"}
+    now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+    grounding_flags = [
+        {"section": "assessment", "claim_index": 0, "reason": "inferred_diagnosis",
+         "detail": "inferred_diagnosis: major depressive disorder named in the claim "
+                   "but absent from the cited segment(s)",
+         "claim": "Major depressive disorder", "source_spans": ["S1"]},
+        {"section": "objective", "claim_index": 0, "reason": "speaker_mismatch",
+         "detail": "speaker_mismatch: this objective claim cites a patient/other turn",
+         "claim": "BP 150 over 95", "source_spans": ["S1", "S2"]},
+        {"section": "note", "claim_index": -1, "reason": "attribution_unverified",
+         "detail": "attribution_unverified: no clinician voice identified",
+         "claim": "", "source_spans": []},
+    ]
+    rel = vault_create(
+        tmp_path, "clinical_note", "Synthetic mixed-flags encounter",
+        set_fields={
+            "ai_draft": True, "synthetic": True, "status": "ai_draft",
+            "source_id": "enc-abc0123456789d", "drafted_by": SCRIBE_DRAFTER_IDENTITY,
+            "grounding_flags": grounding_flags,
+            "draft_original": "## Assessment\n- Major depressive disorder [S1]\n",
+            "encounter_completeness": {"protocol": 1, "complete": True},  # complete → attest gate passes
+        },
+        body="## Assessment\n- Major depressive disorder [S1]\n",
+        scope="stayc_clinical",
+    )["path"]
+
+    result = attest(
+        tmp_path, rel, new_status="attested", attester="np_jamie",
+        clinician_ids=clinicians, audit_path=tmp_path / "attest_audit.jsonl", now=now,
+    )
+    assert result["path"] == rel
+
+    fm = frontmatter.load(tmp_path / rel)
+    assert fm["status"] == "attested" and fm["attested_by"] == "np_jamie"   # attest tolerated the shapes
+    # the per-claim speaker flag survives in frontmatter WITH its source_spans (P4-5 payload)
+    speaker = [f for f in fm["grounding_flags"] if f["reason"] == "speaker_mismatch"]
+    assert len(speaker) == 1 and speaker[0]["source_spans"] == ["S1", "S2"]
+    # the note-level banner also round-trips
+    assert any(
+        f["reason"] == "attribution_unverified" and f["claim_index"] == -1
+        for f in fm["grounding_flags"]
+    )
+    # audit appended (attest fully completed)
+    audit = (tmp_path / "attest_audit.jsonl").read_text().strip().splitlines()
+    assert len(audit) == 1 and json.loads(audit[0])["to_status"] == "attested"

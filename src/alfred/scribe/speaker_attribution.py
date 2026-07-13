@@ -56,13 +56,17 @@ imply every segment carries a canonical role. EVERY cited segment's ``speaker``
 is passed through :func:`~alfred.scribe.transcript.normalize_role` (None / '' /
 a raw pyannote cluster all fold to ``unknown``, fail-closed).
 
-Additionally (defense-in-depth) a segment whose ``speaker_conf`` is NOT None AND
-``< purity_threshold`` is demoted to ``unknown`` for this pass — a sub-purity
-turn is not trustworthy. The threshold is ``config.diarize.purity_threshold``
-(NOT hardcoded). The ``speaker_conf``-is-None-but-role-known case: the role
-STANDS — the engine already fail-closes weak matches to ``unknown`` at resolution
-time, so a resolved role with no recorded conf is a confident resolution, not a
-missing one; only an EXPLICIT sub-purity conf demotes.
+Additionally (defense-in-depth) a segment whose ``speaker_conf`` is present but
+not a trustworthy high-purity value is demoted to ``unknown`` for this pass:
+demote when ``speaker_conf`` is NOT None AND (non-finite — NaN / ±inf — OR
+strictly ``< config.diarize.purity_threshold``). The threshold is config-driven
+(NOT hardcoded) and the boundary is STRICT-BELOW (``conf == threshold`` stands).
+The ``speaker_conf``-is-None-but-role-known case: the role STANDS — this rests on
+a REQUIREMENT on the real P4-4/P4-5 engine, which MUST fail-close weak matches to
+``unknown`` at resolution time (so a role reaching this layer with no recorded
+conf is confident, not a weak match with conf omitted). Until that engine lands,
+``None`` simply means "no conf recorded" (the P4-1 fake seam sets none); this
+layer must not invent a demotion the engine owns.
 
 ═══════════════════════════════════════════════════════════════════════════════
 CLOSE-vs-DOCUMENT LEDGER (P4-2 residual-risk discoverability)
@@ -98,6 +102,8 @@ control, and this pass is the mechanical net beneath it.
 """
 
 from __future__ import annotations
+
+import math
 
 import structlog
 
@@ -137,19 +143,52 @@ _NOTE_SECTION = "note"
 _NOTE_CLAIM_INDEX = -1
 
 
+def _banner_flag(detail: str) -> GroundingFlag:
+    """Build the section-less NOTE-LEVEL banner flag (``section="note"``,
+    ``claim_index=-1``, empty claim/spans, reason ``attribution_unverified``).
+    Rides ``grounding_flags`` frontmatter like any flag and renders via
+    ``flags_for("note", -1)``; ``detail`` carries the specific cause (no-clinician
+    vs a safety-net crash) while the inline literal stays cause-agnostic."""
+    return GroundingFlag(
+        section=_NOTE_SECTION, claim_index=_NOTE_CLAIM_INDEX,
+        reason=ATTRIBUTION_UNVERIFIED_REASON, detail=detail, claim="", source_spans=[],
+    )
+
+
+def crashed_attribution_banner() -> GroundingFlag:
+    """The NOTE-LEVEL banner the PIPELINE synthesizes when this pass CRASHES
+    (F1) — so a crashed safety net surfaces IN the note body + frontmatter, not
+    only the log. Over-flag is the safe direction; a crash can only occur AFTER
+    the diarized gate (this pass's first statement), so an un-diarized crash is
+    near-impossible and a diarized crash means attribution is genuinely
+    unverified (the note is still never lost — the pipeline drafts on)."""
+    return _banner_flag(
+        "attribution_unverified: the speaker-attribution safety net CRASHED — "
+        "attribution could NOT be verified for this encounter; treat all "
+        "attribution as unverified (over-flagged fail-open; see the "
+        "scribe.speaker_attribution.failed log for the error class)"
+    )
+
+
 def _resolve_role(seg: Segment, purity_threshold: float) -> str:
     """The canonical role of a cited segment under the P4-2 attribution rules.
 
     normalize_role folds None / '' / a raw pyannote cluster → ``unknown``
-    (fail-closed; the cr-p41 mixed-accumulation None-speaker case lands here). An
-    EXPLICIT sub-purity conf (``speaker_conf`` is not None AND < ``purity_threshold``)
-    additionally demotes a known role to ``unknown`` (defense-in-depth). The
-    conf-is-None-but-role-known case: the role STANDS — the engine already
-    fail-closes weak matches to ``unknown`` at resolution time, so a resolved role
-    with no recorded conf is confident, not missing."""
+    (fail-closed; the cr-p41 mixed-accumulation None-speaker case lands here). A
+    conf that is present but NOT a trustworthy high-purity value demotes a known
+    role to ``unknown`` (defense-in-depth): demote when ``speaker_conf`` is not
+    None AND (non-finite — NaN / ±inf — OR strictly ``< purity_threshold``). The
+    boundary is STRICT-BELOW: ``conf == purity_threshold`` STANDS.
+
+    The conf-is-None-but-role-known case: the role STANDS. This rests on a
+    REQUIREMENT on the real engine (P4-4/P4-5): it MUST fail-close weak matches to
+    ``unknown`` at resolution time, so a role reaching this layer with NO recorded
+    conf means "confident, conf simply not recorded" — never "weak match, conf
+    omitted". Until that engine lands, ``None`` = no conf recorded (the P4-1 fake
+    seam never sets conf); this layer must not invent a demotion the engine owns."""
     role = normalize_role(seg.speaker)
     conf = seg.speaker_conf
-    if conf is not None and conf < purity_threshold:
+    if conf is not None and (not math.isfinite(conf) or conf < purity_threshold):
         return ROLE_UNKNOWN
     return role
 
@@ -161,14 +200,18 @@ def check_speaker_attribution(
 
     A deterministic post-grounding pass that only PRODUCES flags (the pipeline
     EXTENDS ``grounding.flags`` with them, exactly like the #48 twin). Returns
-    ``[]`` unchanged when the transcript is un-diarized — the whole pass no-ops so
-    an un-diarized encounter's flags / rendered note / frontmatter are
-    BYTE-IDENTICAL to pre-P4-2.
+    ``[]`` unchanged when the transcript is un-diarized — the PASS contributes
+    ZERO flags, so an un-diarized encounter's flags list + ``grounding_flags``
+    frontmatter are byte-identical to pre-P4-2, and the rendered body is identical
+    MODULO the deliberate ``flags_for`` multi-literal render change (a dual-flag
+    claim renders both literals where the old single-literal ``flag_for`` showed
+    one).
 
     See the module docstring for the asymmetric per-section rules, the cr-p41
     role-resolution contract, and the close-vs-document residual-risk ledger."""
-    # GATE — un-diarized transcripts carry no trustworthy roles; the pass no-ops
-    # so the note is byte-identical to pre-P4-2 (frozen-contract requirement).
+    # GATE — un-diarized transcripts carry no trustworthy roles; the pass
+    # contributes ZERO flags (flags list + frontmatter byte-identical to pre-P4-2;
+    # rendered body identical modulo the flags_for multi-literal render change).
     if not transcript.diarized:
         return []
 
@@ -238,19 +281,12 @@ def check_speaker_attribution(
     # clinician turn exists.
     all_roles = [_resolve_role(s, purity) for s in transcript.segments]
     if ROLE_CLINICIAN not in all_roles:
-        flags.append(GroundingFlag(
-            section=_NOTE_SECTION,
-            claim_index=_NOTE_CLAIM_INDEX,
-            reason=ATTRIBUTION_UNVERIFIED_REASON,
-            detail=(
-                "attribution_unverified: this encounter is diarized but NO "
-                "clinician voice was identified anywhere — enrollment may be "
-                "missing/failed, so speaker attribution is unreliable throughout "
-                "(the per-claim flags alone could compose into a quiet-looking "
-                "note); clinician to treat all attribution as unverified"
-            ),
-            claim="",
-            source_spans=[],
+        flags.append(_banner_flag(
+            "attribution_unverified: this encounter is diarized but NO clinician "
+            "voice was identified anywhere — enrollment may be missing/failed, so "
+            "speaker attribution is unreliable throughout (the per-claim flags "
+            "alone could compose into a quiet-looking note); clinician to treat "
+            "all attribution as unverified"
         ))
 
     return flags

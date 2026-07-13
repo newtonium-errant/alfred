@@ -66,7 +66,10 @@ from alfred.scribe.notegen import (
     generate_structured,
     render_soap,
 )
-from alfred.scribe.speaker_attribution import check_speaker_attribution
+from alfred.scribe.speaker_attribution import (
+    check_speaker_attribution,
+    crashed_attribution_banner,
+)
 from alfred.scribe.state import (
     STATE_BUDGET_CAPPED,
     STATE_DRAFTED,
@@ -149,14 +152,21 @@ async def generate_verified_note(
     try:
         speaker_flags = check_speaker_attribution(structured, transcript, config)
     except Exception as e:  # noqa: BLE001 — safety-net crash must not lose the note
-        speaker_flags = []
+        # FAIL-OPEN but VISIBLE (F1): synthesize the note-level attribution_unverified
+        # banner so a crashed net surfaces IN the note body + frontmatter, not only
+        # the log. Unconditional on crash — over-flag is the safe direction; a crash
+        # can only occur AFTER the diarized gate (check_speaker_attribution's first
+        # statement), so an un-diarized crash is near-impossible, and a diarized crash
+        # means attribution is genuinely unverified. The note is still never lost; the
+        # log stays PHI-free (opaque id + error class only, never the message).
+        speaker_flags = [crashed_attribution_banner()]
         log.warning(
             "scribe.speaker_attribution.failed",
             source_id=transcript.source_id,     # opaque encounter id only — NO PHI (NOTE-4)
             error_class=type(e).__name__,       # class only — never the message
             detail=(
-                "speaker-attribution safety net crashed — note drafted WITHOUT "
-                "speaker flags (un-attributed ≫ lost); surface for review"
+                "speaker-attribution safety net crashed — drafting with a note-level "
+                "attribution_unverified banner (un-attributed ≫ lost); surface for review"
             ),
         )
     grounding.flags.extend(speaker_flags)
