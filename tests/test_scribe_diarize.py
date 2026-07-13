@@ -64,12 +64,15 @@ from alfred.sovereign.boundary import validate_sovereign_boundary
 _SALT = "DUMMY_SCRIBE_TEST_SALT"
 
 
-def _config(provider="fake", mode="synthetic"):
+def _config(provider="fake", mode="synthetic", *, enabled=False, pipeline_config=""):
     return load_from_unified({"scribe": {
         "mode": mode,
         "encounter_salt": _SALT,
         "stt": {"provider": "fake"},
-        "diarize": {"provider": provider},
+        "diarize": {
+            "provider": provider, "enabled": enabled,
+            "pipeline_config": pipeline_config,
+        },
         "llm": {"base_url": "http://127.0.0.1:11434", "model": "m"},
     }})
 
@@ -386,12 +389,15 @@ def test_accumulate_diarize_failure_folds_unattributed(tmp_path, monkeypatch):
     assert failed[0]["encounter_id"] == eid
 
 
-def test_accumulate_pyannote_notimplemented_folds_unattributed(tmp_path):
-    # The real dispatch path (no monkeypatch): provider=pyannote raises
-    # NotImplementedError (P4-4), which the accumulator degrades — still folds.
+def test_accumulate_pyannote_disabled_folds_unattributed(tmp_path):
+    # P4-4: the real dispatch path (no monkeypatch) with provider=pyannote but
+    # enabled=false (the default) is INERT (NOTE-1 kill-switch) → the chunk folds
+    # UN-ATTRIBUTED, torch-free, no crash. (Pre-P4-4 this raised NotImplementedError
+    # which the accumulator degraded; the observable end-state — folded, speaker
+    # None, diarized False — is identical, now via the inert gate not an exception.)
     enc = tmp_path / "encP"
     _write_chunk(enc, 1, ["[PT] Chest pain."])
-    r = accumulate_encounter(enc, config=_config(provider="pyannote"))
+    r = accumulate_encounter(enc, config=_config(provider="pyannote"))  # enabled=False
     assert r.folded == 1 and r.held == 0
     eid = compute_encounter_id(enc.name, salt=_SALT)
     led = load_ledger(ledger_path(enc, eid))
@@ -431,11 +437,25 @@ def test_process_source_diarize_failure_still_drafts(tmp_path, monkeypatch):
 # 8. dispatch fail-closed — pyannote NotImplemented, unknown provider refused
 # ---------------------------------------------------------------------------
 
-def test_assign_speakers_pyannote_not_implemented(tmp_path):
+def test_assign_speakers_pyannote_disabled_is_inert(tmp_path):
+    # NOTE-1: provider=pyannote + enabled=false → INERT (returned untouched, like
+    # off). No torch, no raise.
     audio = _write_sidecar(tmp_path, "hi")
     tx = transcribe(_config(provider="fake"), audio, source_id="e")
-    with pytest.raises(NotImplementedError):
-        assign_speakers(_config(provider="pyannote"), audio, tx)
+    out = assign_speakers(_config(provider="pyannote", enabled=False), audio, tx)
+    assert out is tx
+    assert all(s.speaker is None for s in out.segments)
+    assert out.diarized is False
+
+
+def test_assign_speakers_pyannote_enabled_no_config_fails_loud(tmp_path):
+    # provider=pyannote + enabled=true but no materialized pipeline_config → the
+    # real-engine path fails LOUD (DiarizeError) rather than risk a hub GET. Reaches
+    # _run_pyannote_pipeline's config check BEFORE any pyannote import (torch-free).
+    audio = _write_sidecar(tmp_path, "hi")
+    tx = transcribe(_config(provider="fake"), audio, source_id="e")
+    with pytest.raises(DiarizeError):
+        assign_speakers(_config(provider="pyannote", enabled=True), audio, tx)
 
 
 def test_assign_speakers_unknown_provider_fails_closed(tmp_path):
@@ -456,10 +476,18 @@ def test_ensure_diarize_backend_off_fake_noop():
     ensure_diarize_backend_available(_config(provider="fake"))  # no raise
 
 
-def test_ensure_diarize_backend_pyannote_missing_raises():
-    # pyannote.audio is NOT installed in torch-free CI → must fail-loud (exit-78).
+def test_ensure_diarize_backend_pyannote_enabled_missing_raises():
+    # pyannote.audio is NOT installed in torch-free CI → an ENABLED pyannote engine
+    # must fail-loud (exit-78). NOTE-1: the dep-check gates on `enabled` too.
     with pytest.raises(MissingDiarizeDependency):
-        ensure_diarize_backend_available(_config(provider="pyannote"))
+        ensure_diarize_backend_available(_config(provider="pyannote", enabled=True))
+
+
+def test_ensure_diarize_backend_pyannote_disabled_noop():
+    # NOTE-1: provider=pyannote + enabled=false is INERT → it must boot TORCH-FREE
+    # (an operator disabling the engine is not forced to keep torch installed). No
+    # raise even though pyannote.audio is absent.
+    ensure_diarize_backend_available(_config(provider="pyannote", enabled=False))
 
 
 # ---------------------------------------------------------------------------

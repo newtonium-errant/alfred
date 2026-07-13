@@ -45,7 +45,13 @@ scribe = [
 # diarize.provider is ``pyannote``; the ``off`` (default) / ``fake`` providers
 # need no dep (CI + the unconditional fake-backend coverage).
 scribe-diarize = [
-    "pyannote.audio>=3.1",
+    # Pinned <4: P4-4 MATERIALIZES a repo-id-free pipeline config by rewriting
+    # ``pipeline.params.segmentation`` + ``pipeline.params.embedding`` in the
+    # speaker-diarization-3.1 config format (scripts.stage_diarize_models). A 4.x
+    # pipeline-config format change would break that transform — the materialize
+    # validation fail-louds, but the pin keeps the resolved wheel matched to the
+    # transform. Bump deliberately alongside a materialize-format review.
+    "pyannote.audio>=3.1,<4",
 ]
 surveyor = [
     # PINNED 2026-06-25: >=2.4 let the box's fresh install grab pymilvus 3.0 /

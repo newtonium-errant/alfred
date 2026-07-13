@@ -115,6 +115,19 @@ class ScribeDiarizeConfig:
     embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
     # Pinned revision of the embedding model (cache lookup is revision-exact).
     embedding_revision: str = ""
+    # Absolute filesystem path to the MATERIALIZED, repo-id-free pyannote pipeline
+    # config YAML (P4-4). ``scripts.stage_diarize_models`` writes it at staging
+    # time with the sub-models' ABSOLUTE LOCAL snapshot paths substituted for their
+    # HF repo ids, because pyannote's ``from_pretrained`` does NOT reliably honor
+    # ``local_files_only`` — a repo-id-bearing config still triggers a hub revision
+    # GET. Loading FROM this materialized path is what keeps the engine offline;
+    # ``HF_HUB_OFFLINE=1`` (set in the engine path) + the sovereign requests-guard
+    # are the fail-closed BACKSTOPS, not the primary control. LOCAL-BY-CONSTRUCTION:
+    # a filesystem path, NOT a network endpoint (same class as ``enrollment_path`` /
+    # ``embedding_model``) — no boundary barrier applies (SUB-FIELD LOOPBACK
+    # DISCIPLINE, module docstring). Empty ⇒ the pyannote provider fails LOUD at
+    # load-time (a real engine with no materialized offline config must not boot).
+    pipeline_config: str = ""
 
 
 # The complete, closed set of keys the ``scribe.ingest_web`` sub-tree may carry.
@@ -323,7 +336,10 @@ def _build_diarize(data: Any) -> ScribeDiarizeConfig:
     cfg = ScribeDiarizeConfig()
     if "enabled" in known:
         cfg.enabled = coerce_ingest_web_enabled(known["enabled"])
-    for str_field in ("provider", "enrollment_path", "embedding_model", "embedding_revision"):
+    for str_field in (
+        "provider", "enrollment_path", "embedding_model", "embedding_revision",
+        "pipeline_config",
+    ):
         if str_field in known:
             setattr(cfg, str_field, str(known[str_field]))
     for float_field in ("match_threshold", "separation_margin", "purity_threshold", "min_turn_s"):
