@@ -87,6 +87,14 @@ def startup(
     from alfred.scribe.stt import ensure_backend_available
     ensure_backend_available(config)
 
+    # (c.1b) Diarize backend availability (scribe P4). The ``pyannote`` engine
+    # needs the [scribe-diarize] extra; if it's missing, raise
+    # MissingDiarizeDependency → the runner exits 78 (missing deps, no-restart),
+    # mirroring the STT dep-guard. The ``off`` (default) / ``fake`` providers need
+    # no dep and pass, so the daemon boots torch-free.
+    from alfred.scribe.diarize import ensure_diarize_backend_available
+    ensure_diarize_backend_available(config)
+
     # (c.2) Non-gating kernel-egress belt probe (#42). Best-effort only: the
     # load-bearing egress control is the boundary gate + the http guard armed
     # above — this just PROBES the systemd IPAddressDeny belt and LOGS

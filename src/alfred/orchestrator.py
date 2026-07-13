@@ -467,6 +467,7 @@ def _run_scribe(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     from alfred.brief.utils import setup_logging
     setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.scribe.daemon import run as scribe_run
+    from alfred.scribe.diarize import MissingDiarizeDependency
     from alfred.scribe.stt import MissingSTTDependency
     from alfred.sovereign import SovereignBoundaryError
     try:
@@ -486,6 +487,16 @@ def _run_scribe(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
         import structlog
         structlog.get_logger(__name__).error(
             "scribe.daemon.missing_stt_dependency",
+            detail=str(e),
+            exit_code=_MISSING_DEPS_EXIT,
+        )
+        sys.exit(_MISSING_DEPS_EXIT)
+    except MissingDiarizeDependency as e:
+        # pyannote diarize provider configured but the [scribe-diarize] extra is
+        # missing. Exit 78 (missing deps, no-restart) — mirrors the STT dep-guard.
+        import structlog
+        structlog.get_logger(__name__).error(
+            "scribe.daemon.missing_diarize_dependency",
             detail=str(e),
             exit_code=_MISSING_DEPS_EXIT,
         )

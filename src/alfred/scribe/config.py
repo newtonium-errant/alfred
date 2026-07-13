@@ -22,12 +22,13 @@ pipeline hard-codes ``"clinical"`` (see ``ingest.guard_ingest``).
 
 SUB-FIELD LOOPBACK DISCIPLINE (P1-a r2 carry-forward). The sovereign boundary
 (``alfred.sovereign.boundary``) validates ``scribe.stt`` (barrier a — provider
-on the local allowlist) and ``scribe.llm`` (barrier b — base_url loopback). If
-this config ever gains a NEW network-capable sub-field (a future
-``scribe.tts`` / ``scribe.summarizer`` / ``scribe.embed``), it MUST get a
-matching barrier-a/b-style loopback/local check in boundary.py IN THE SAME
-CHANGE — do not add a network sub-field without it. The current fields below
-are local-only by construction (no api_key, no cloud endpoint).
+on the local allowlist), ``scribe.llm`` (barrier b — base_url loopback), and
+``scribe.diarize`` (barrier-a sibling — provider on the local diarize allowlist
+{off, fake, pyannote}). If this config ever gains a NEW network-capable
+sub-field (a future ``scribe.tts`` / ``scribe.summarizer`` / ``scribe.embed``),
+it MUST get a matching barrier-a/b-style loopback/local check in boundary.py IN
+THE SAME CHANGE — do not add a network sub-field without it. The current fields
+below are local-only by construction (no api_key, no cloud endpoint).
 """
 
 from __future__ import annotations
@@ -65,6 +66,55 @@ class ScribeLlmConfig:
 
     base_url: str = ""
     model: str = ""
+
+
+@dataclass
+class ScribeDiarizeConfig:
+    """Local multi-speaker diarization config (scribe P4).
+
+    ``provider`` dispatches the diarizer (``off`` = no diarization, the
+    fail-closed default; ``fake`` = the deterministic CI backend;
+    ``pyannote`` = the real on-box engine, P4-4). The sovereign boundary's
+    barrier-a sibling (``_check_diarize_local``) independently validates
+    ``provider`` is on :data:`~alfred.sovereign.SOVEREIGN_DIARIZE_ALLOWLIST`.
+
+    LOCAL-BY-CONSTRUCTION — NO ``api_key`` / ``base_url`` / cloud-endpoint field
+    (per the module docstring's SUB-FIELD LOOPBACK DISCIPLINE). pyannote loads
+    its embedding model from the local HF cache (``local_files_only``, P4-4); the
+    only network-shaped fields are the HF model id + revision, which name a
+    CACHE entry, not an endpoint. Adding a real network sub-field here would
+    require a matching boundary-layer loopback check IN THE SAME CHANGE.
+
+    Thresholds are CONSERVATIVE FAIL-CLOSED-HIGH placeholders — a turn resolves
+    to a KNOWN role only on a strong, unambiguous, high-purity match; anything
+    softer degrades to ``unknown`` (un-attributed ≫ mis-attributed). They are
+    PLACEHOLDERS pending on-box ``--calibrate`` (real DER/purity on the Ryzen +
+    the room mic); do not treat these literals as tuned.
+    """
+
+    # Dispatch: off (default, no diarization) / fake (CI) / pyannote (P4-4).
+    provider: str = "off"
+    # Convenience flag (the provider is the real gate; ``off`` is already inert).
+    enabled: bool = False
+    # Cosine similarity a cluster centroid must reach vs the enrolled clinician
+    # centroid to claim ``clinician`` — HIGH so a weak match fails to ``unknown``.
+    match_threshold: float = 0.75
+    # Required gap between the best and 2nd-best role candidate — HIGH so an
+    # ambiguous (near-tie) assignment fails-closed to ``unknown``.
+    separation_margin: float = 0.15
+    # Minimum diarization cluster purity for a turn to carry a KNOWN role — HIGH
+    # so a mixed/overlap turn degrades to ``unknown``.
+    purity_threshold: float = 0.80
+    # Turns shorter than this (seconds) are too short to embed reliably → unknown.
+    min_turn_s: float = 1.0
+    # Filesystem path to the clinician enrollment embedding (P4-5). Empty = no
+    # enrollment yet → every cluster fails the match → all ``unknown`` (fail-safe).
+    enrollment_path: str = ""
+    # Local HF cache entry for the speaker-embedding model (loaded offline in
+    # P4-4). Names a CACHE entry, NOT a network endpoint.
+    embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
+    # Pinned revision of the embedding model (cache lookup is revision-exact).
+    embedding_revision: str = ""
 
 
 # The complete, closed set of keys the ``scribe.ingest_web`` sub-tree may carry.
@@ -139,6 +189,9 @@ class ScribeConfig:
     input_dir: str = _DEFAULT_INPUT_DIR
     stt: ScribeSttConfig = field(default_factory=ScribeSttConfig)
     llm: ScribeLlmConfig = field(default_factory=ScribeLlmConfig)
+    # P4 multi-speaker diarization (OFF by default). ``diarize.provider`` is
+    # independently validated local by the sovereign boundary's barrier-a sibling.
+    diarize: ScribeDiarizeConfig = field(default_factory=ScribeDiarizeConfig)
     # The loopback PWA ingest server (#49). INERT by default; barrier (e)
     # validates its host is loopback + token present when enabled.
     ingest_web: ScribeIngestWebConfig = field(default_factory=ScribeIngestWebConfig)
@@ -233,6 +286,7 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
         input_dir=str(input_dir),
         stt=_build(ScribeSttConfig, scribe.get("stt")),
         llm=_build(ScribeLlmConfig, scribe.get("llm")),
+        diarize=_build_diarize(scribe.get("diarize")),
         ingest_web=_build_ingest_web(scribe.get("ingest_web")),
         clinicians=clinicians,
         encounter_salt=str(scribe.get("encounter_salt") or ""),
@@ -252,6 +306,33 @@ def _coerce_nonneg_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return n if n >= 0 else default
+
+
+def _build_diarize(data: Any) -> ScribeDiarizeConfig:
+    """Schema-tolerant build of :class:`ScribeDiarizeConfig` with explicit type
+    coercion (``enabled`` truthy→bool, thresholds→float) so a YAML string value
+    (``enabled: "true"``, ``purity_threshold: "0.8"``) can't slip a wrong-typed
+    field through. Unknown keys are dropped by the ``__dataclass_fields__`` filter
+    (the load-time schema-tolerance contract); the sovereign boundary SEPARATELY
+    validates ``provider`` is local (that is the security gate — this coercion is
+    convenience, not the boundary). A nonsense threshold keeps the fail-closed-HIGH
+    default (never crashes the load)."""
+    if not isinstance(data, dict):
+        return ScribeDiarizeConfig()
+    known = {k: v for k, v in data.items() if k in ScribeDiarizeConfig.__dataclass_fields__}
+    cfg = ScribeDiarizeConfig()
+    if "enabled" in known:
+        cfg.enabled = coerce_ingest_web_enabled(known["enabled"])
+    for str_field in ("provider", "enrollment_path", "embedding_model", "embedding_revision"):
+        if str_field in known:
+            setattr(cfg, str_field, str(known[str_field]))
+    for float_field in ("match_threshold", "separation_margin", "purity_threshold", "min_turn_s"):
+        if float_field in known:
+            try:
+                setattr(cfg, float_field, float(known[float_field]))
+            except (TypeError, ValueError):
+                pass  # keep the fail-closed-HIGH default; a nonsense value never crashes the load
+    return cfg
 
 
 def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:

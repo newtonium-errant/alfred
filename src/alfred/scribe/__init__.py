@@ -24,6 +24,7 @@ from .config import (
     SCRIBE_MODE_CLINICAL,
     SCRIBE_MODE_SYNTHETIC,
     ScribeConfig,
+    ScribeDiarizeConfig,
     ScribeIngestWebConfig,
     ScribeLlmConfig,
     ScribeSttConfig,
@@ -59,10 +60,22 @@ from .stt import (
     transcribe,
 )
 from .transcript import (
+    ROLE_CLINICIAN,
+    ROLE_OTHER,
+    ROLE_PATIENT,
+    ROLE_UNKNOWN,
     Segment,
     SegmentInvariantError,
     Transcript,
     make_segment_id,
+    normalize_role,
+)
+from .diarize import (
+    SCRIBE_DIARIZE_PROVIDERS,
+    DiarizeError,
+    MissingDiarizeDependency,
+    assign_speakers,
+    ensure_diarize_backend_available,
 )
 # pipeline + state imported LAST — pipeline pulls in stt/notegen/transcript, so
 # they must already be package submodules to avoid a partial-init ordering trap.
@@ -98,6 +111,7 @@ __all__ = [
     "ScribeConfig",
     "ScribeSttConfig",
     "ScribeLlmConfig",
+    "ScribeDiarizeConfig",
     "ScribeIngestWebConfig",
     "INGEST_WEB_ALLOWED_KEYS",
     "SCRIBE_MODE_SYNTHETIC",
@@ -132,6 +146,17 @@ __all__ = [
     "Segment",
     "SegmentInvariantError",
     "make_segment_id",
+    # P4 diarization (P4-1 plumbing + fake seam)
+    "ROLE_CLINICIAN",
+    "ROLE_PATIENT",
+    "ROLE_OTHER",
+    "ROLE_UNKNOWN",
+    "normalize_role",
+    "assign_speakers",
+    "ensure_diarize_backend_available",
+    "SCRIBE_DIARIZE_PROVIDERS",
+    "DiarizeError",
+    "MissingDiarizeDependency",
     # transcript ledger + checkpoint accumulator (P3-b1)
     "ledger_path",
     "load_ledger",

@@ -45,6 +45,7 @@ from typing import Any
 
 import structlog
 
+from alfred.scribe import diarize as diarize_mod
 from alfred.scribe import ledger as ledger_mod
 from alfred.scribe import stt as stt_mod
 from alfred.scribe.attestation import SCRIBE_DRAFTER_IDENTITY
@@ -218,6 +219,24 @@ async def process_source(
         transcript = await asyncio.to_thread(
             stt_mod.transcribe, config, audio_path, source_id=source_id,
         )
+
+        # P4 DIARIZE (fail-open-for-availability). Resolve per-segment speaker
+        # roles. A diarize failure degrades to speaker=None + a loud log and the
+        # note STILL generates from the un-attributed transcript — it must NOT
+        # fail the source (un-attributed ≫ mis-attributed), so it is caught HERE
+        # rather than bubbling to the outer fail-closed handler.
+        try:
+            transcript = diarize_mod.assign_speakers(config, audio_path, transcript)
+        except Exception as e:  # noqa: BLE001 — fail-open: draft un-attributed, do NOT fail
+            log.warning(
+                "scribe.diarize.failed",
+                source_id=source_id,           # opaque id only — NO PHI (NOTE-4)
+                error_class=type(e).__name__,  # class only — never the message
+                detail=(
+                    "diarization failed — drafting UN-ATTRIBUTED (speaker=None); "
+                    "un-attributed ≫ mis-attributed. Does NOT fail the source."
+                ),
+            )
 
         # transcribing → structuring (delta → note-gen → verify → render).
         state.set(source_id, state=STATE_STRUCTURING)
@@ -570,6 +589,24 @@ def accumulate_encounter(
                 ),
             )
             break                              # hold this encounter; do not fold over the hole
+        # P4 DIARIZE (fail-open-for-availability) — resolve per-segment speaker
+        # roles BEFORE folding. A diarize failure degrades to speaker=None + a
+        # loud log and STILL folds the un-attributed text (un-attributed ≫
+        # mis-attributed); unlike an STT decode failure it must NOT hold the
+        # encounter — NO break, so the fold proceeds this pass.
+        try:
+            chunk_tx = diarize_mod.assign_speakers(config, chunk_path, chunk_tx)
+        except Exception as e:  # noqa: BLE001 — fail-open: fold un-attributed, do NOT hold
+            log.warning(
+                "scribe.diarize.failed",
+                encounter_id=encounter_id,     # opaque id only — NO PHI (NOTE-4)
+                seq=seq,
+                error_class=type(e).__name__,  # class only — never the message
+                detail=(
+                    "diarization failed — folding UN-ATTRIBUTED (speaker=None); "
+                    "un-attributed ≫ mis-attributed. Does NOT hold the encounter."
+                ),
+            )
         offset = transcript.segments[-1].end_s if transcript.segments else 0.0
         if transcript.append_chunk(
             chunk_tx, audio_offset_s=offset, chunk_key=chunk_key, seq=seq,

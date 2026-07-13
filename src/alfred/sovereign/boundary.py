@@ -9,12 +9,13 @@ unresolvable input is treated as a breach, never waved through.
 prompt-time). It is a no-op unless the config declares an explicit top-level
 ``sovereign: {enabled: true}`` block — Salem / KAL-LE / Hypatia / VERA-ops
 never pay for it. When enforcement IS requested, the boundary raises
-:class:`SovereignBoundaryError` unless ALL FOUR independent barriers hold
+:class:`SovereignBoundaryError` unless ALL of these independent barriers hold
 (any one alone stops egress):
 
   (a) STT provider on the local allowlist
       {faster-whisper, local-whisper, fake}. Cloud STT (groq / deepgram /
-      elevenlabs) refused.
+      elevenlabs) refused. Its SIBLING (``barrier_a_diarize``) likewise pins the
+      diarize provider to {off, fake, pyannote} — no cloud speaker resolution.
   (b) LLM ``base_url`` host resolves to loopback {127.0.0.1, ::1, localhost}.
       A literal loopback host passes immediately; anything else must resolve
       via ``getaddrinfo`` to ALL-loopback addresses. Resolution failure =>
@@ -74,6 +75,15 @@ log = structlog.get_logger(__name__)
 SOVEREIGN_STT_ALLOWLIST: frozenset[str] = frozenset(
     {"faster-whisper", "local-whisper", "fake"}
 )
+
+# Barrier (a) SIBLING. Local diarization providers only (scribe P4).
+# ``off`` = no diarization (the fail-closed default); ``fake`` = the
+# deterministic CI backend; ``pyannote`` = the real on-box engine (P4-4, loads
+# its embedding model offline from the local HF cache). A cloud diarization
+# service is deliberately absent — the scribe never sends audio off-box to
+# resolve speakers. MUST equal the diarize dispatch set
+# (``scribe.diarize.SCRIBE_DIARIZE_PROVIDERS``) — pinned in tests.
+SOVEREIGN_DIARIZE_ALLOWLIST: frozenset[str] = frozenset({"off", "fake", "pyannote"})
 
 # Barrier (b). Loopback host literals that pass without a DNS round-trip.
 LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -214,7 +224,8 @@ class SovereignBoundaryError(Exception):
     Non-restartable. The orchestrator maps this to exit 79
     (``_SOVEREIGN_BREACH_EXIT``) and MUST NOT auto-restart — a restart would
     only re-attempt a cloud-reachable start. ``reason`` is the barrier id
-    (``barrier_a`` .. ``barrier_e`` / ``http_guard``) for greppable triage;
+    (``barrier_a`` / ``barrier_a_diarize`` / ``barrier_b`` .. ``barrier_e`` /
+    ``http_guard``) for greppable triage;
     ``detail`` is the operator-facing specifics.
     """
 
@@ -272,6 +283,29 @@ def _check_stt_local(raw: dict[str, Any]) -> None:
             f"scribe.stt.provider must be a local provider ({allowed}); "
             f"got {provider or '(unset)'!r}. Cloud STT (groq / deepgram / "
             f"elevenlabs) is refused on a sovereign instance.",
+        )
+
+
+def _check_diarize_local(raw: dict[str, Any]) -> None:
+    """Barrier (a) SIBLING — diarize provider on the local allowlist. Fail-closed.
+
+    Defense-in-depth twin of :func:`_check_stt_local`: the ``scribe`` section is
+    already an allowed top-level section (barrier d), so a ``scribe.diarize``
+    sub-tree rides in — this positively asserts its ``provider`` is local
+    ({off, fake, pyannote}) so no cloud diarization service can be configured to
+    ship audio off-box. Absent ``diarize`` block → provider defaults to ``off``
+    (unset ⇒ ``off``), which is on the allowlist (a scribe with NO diarize config
+    passes)."""
+    scribe = raw.get("scribe") or {}
+    diarize = scribe.get("diarize") or {}
+    provider = str(diarize.get("provider") or "off").strip().lower()
+    if provider not in SOVEREIGN_DIARIZE_ALLOWLIST:
+        allowed = ", ".join(sorted(SOVEREIGN_DIARIZE_ALLOWLIST))
+        raise SovereignBoundaryError(
+            "barrier_a_diarize",
+            f"scribe.diarize.provider must be a local provider ({allowed}); "
+            f"got {provider!r}. Cloud diarization is refused on a sovereign "
+            f"instance — speaker resolution stays on-box.",
         )
 
 
@@ -493,10 +527,11 @@ def validate_sovereign_boundary(
     *,
     env: Mapping[str, str] | None = None,
 ) -> None:
-    """Enforce the four-barrier no-egress boundary. Fail-closed.
+    """Enforce the layered no-egress boundary. Fail-closed.
 
     No-op unless ``raw`` declares ``sovereign: {enabled: true}``. When
-    enforcement is requested, runs barriers (a)-(d) in order and raises
+    enforcement is requested, runs the barrier checks (a / a-diarize / b / c /
+    d / e) in order and raises
     :class:`SovereignBoundaryError` on the first breach (after logging
     ``sovereign_boundary_refused reason=<barrier>``). On success emits
     ``sovereign_ok`` and returns.
@@ -525,6 +560,7 @@ def validate_sovereign_boundary(
 
     try:
         _check_stt_local(raw)
+        _check_diarize_local(raw)
         _check_llm_loopback(raw)
         _check_no_cloud_key(raw, env)
         _check_no_egress(raw)
@@ -545,5 +581,5 @@ def validate_sovereign_boundary(
         stt_provider=str(stt.get("provider") or ""),
         llm_host=urlsplit(str(llm.get("base_url") or "")).hostname or "",
         egress_clear=True,
-        detail="all four no-egress barriers held",
+        detail="all no-egress barriers held",
     )

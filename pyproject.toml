@@ -36,6 +36,17 @@ temporal = ["temporalio>=1.9.0"]
 scribe = [
     "faster-whisper>=1.0",
 ]
+# STAY-C sovereign scribe multi-speaker diarization (scribe P4). pyannote.audio
+# resolves speaker turns on-box (loads its embedding model offline from the local
+# HF cache). Pulls TORCH — so this extra is for STAY-C's OWN venv ONLY; install
+# torch from the CPU wheel index at build time. NEVER add it to [scribe] or [all]
+# (those must stay torch-free for CI + the other instances). The scribe daemon
+# exits 78 (missing deps, no-restart) if this extra isn't installed AND
+# diarize.provider is ``pyannote``; the ``off`` (default) / ``fake`` providers
+# need no dep (CI + the unconditional fake-backend coverage).
+scribe-diarize = [
+    "pyannote.audio>=3.1",
+]
 surveyor = [
     # PINNED 2026-06-25: >=2.4 let the box's fresh install grab pymilvus 3.0 /
     # milvus-lite 3.0 (directory-based), which cannot open the existing 2.5.1

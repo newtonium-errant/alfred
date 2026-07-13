@@ -5,13 +5,18 @@ designed so P3 (checkpoint-delta) and P4 (diarization) slot in WITHOUT a
 rebuild.
 
   Transcript = {
-    source_id, mode, version, processed_through_segment: null,
-    segments: [ {id: "S1", start_s, end_s, text, speaker: null} ]
+    source_id, mode, version, processed_through_segment: null, diarized: false,
+    segments: [ {id: "S1", start_s, end_s, text,
+                 speaker: null, speaker_cluster: null, speaker_conf: null} ]
   }
 
   * ``segments`` carry STABLE ids (``S1``, ``S2``, ...) — the ``[S#]`` grounding
     contract the note-gen (P2-c) + deterministic grounding-verify both cite.
-  * ``speaker`` (null in P2) — the P4 DIARIZATION slot.
+  * ``speaker`` / ``speaker_cluster`` / ``speaker_conf`` (all null in P2/P3) —
+    the P4 DIARIZATION slots: the RESOLVED role, the raw pyannote cluster (for
+    re-label without re-STT), and the diarization purity.
+  * ``diarized`` (false in P2/P3) — the P4 gate: true once a diarizer has
+    resolved the per-segment roles (the P4-2 safety net reads it).
   * ``version`` (1 in P2) — the P3 NOTE-UPDATE slot (a checkpoint dump that
     updates a note increments it).
   * ``processed_through_segment`` (null in P2) — the P3 DELTA CURSOR: the id of
@@ -78,16 +83,71 @@ def make_segment_id(index_zero_based: int) -> str:
     return f"S{index_zero_based + 1}"
 
 
+# --- P4 diarization role vocabulary (the RESOLVED-ROLE slot) ----------------
+# ``Segment.speaker`` holds a RESOLVED ROLE from this closed set — NEVER a raw
+# pyannote cluster id (that is ``speaker_cluster``). The set is closed by design:
+# attribution (P4-2) + note-gen (P4-3) branch on these exact literals, so a role
+# outside this set would silently mis-route a clinical claim.
+ROLE_CLINICIAN = "clinician"
+ROLE_PATIENT = "patient"
+ROLE_OTHER = "other"
+# The FAIL-CLOSED sentinel. A diarizer that cannot confidently resolve a turn
+# (below purity/match threshold, an un-enrolled voice, a raw cluster id like
+# ``SPEAKER_00``, or a role-assigner leak) MUST degrade to this — never a silent
+# known-role. Downstream attribution treats ``unknown`` as un-verified, so it can
+# never be laundered into a clean patient/clinician attribution.
+ROLE_UNKNOWN = "unknown"
+
+# Case-insensitive raw-label → canonical-role fold. EVERYTHING not listed —
+# including None, ``""``, a raw pyannote cluster (``SPEAKER_00``), or any garbage
+# — folds to ``unknown`` (fail-closed).
+_ROLE_ALIASES: dict[str, str] = {
+    "clinician": ROLE_CLINICIAN,
+    "doctor": ROLE_CLINICIAN,
+    "provider": ROLE_CLINICIAN,
+    "patient": ROLE_PATIENT,
+    "caregiver": ROLE_OTHER,
+    "family": ROLE_OTHER,
+    "other": ROLE_OTHER,
+}
+
+
+def normalize_role(raw: str | None) -> str:
+    """Fold a raw role label to a canonical :data:`ROLE_*` — THE single source of
+    truth shared by the diarizer-writer (P4-1) and the notegen/attribution-reader
+    (P4-2/3).
+
+    Case-insensitive. Maps clinician/doctor/provider→``clinician``,
+    patient→``patient``, caregiver/family/other→``other``. EVERYTHING ELSE —
+    ``None``, ``""``, a raw pyannote cluster (``SPEAKER_00``), or any garbage —
+    folds to ``unknown`` (FAIL-CLOSED: a role-assigner leak degrades to
+    un-attributed, never a silent known-role).
+    """
+    if not isinstance(raw, str):
+        return ROLE_UNKNOWN
+    return _ROLE_ALIASES.get(raw.strip().lower(), ROLE_UNKNOWN)
+
+
 @dataclass
 class Segment:
-    """One transcript segment. ``id`` is the stable ``[S#]`` grounding anchor;
-    ``speaker`` is the P4 diarization slot (null in P2)."""
+    """One transcript segment. ``id`` is the stable ``[S#]`` grounding anchor.
+
+    P4 diarization slots (all null in P2/P3):
+      * ``speaker`` — the RESOLVED ROLE (:data:`ROLE_*`; ``normalize_role`` is
+        the sole writer). NOT a raw cluster.
+      * ``speaker_cluster`` — the raw pyannote cluster id (e.g. ``SPEAKER_00``),
+        retained so a future re-label can re-derive roles WITHOUT re-running STT.
+      * ``speaker_conf`` — the diarization purity/confidence for this turn (the
+        signal P4-2 uses to fail-closed a low-purity turn to ``unknown``).
+    """
 
     id: str
     start_s: float
     end_s: float
     text: str
     speaker: str | None = None
+    speaker_cluster: str | None = None
+    speaker_conf: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +156,8 @@ class Segment:
             "end_s": self.end_s,
             "text": self.text,
             "speaker": self.speaker,
+            "speaker_cluster": self.speaker_cluster,
+            "speaker_conf": self.speaker_conf,
         }
 
     @classmethod
@@ -123,6 +185,14 @@ class Transcript:
     # to_dict/from_dict (schema-tolerant), so the persisted ledger resumes.
     chunk_provenance: list[dict[str, Any]] = field(default_factory=list)
     closed: bool = False
+    # P4 diarization gate (false in P2/P3). True once a diarizer has RESOLVED the
+    # per-segment ``speaker`` roles on this transcript. The safety-net reader
+    # (P4-2 ``speaker_attribution``) gates on this: only a ``diarized`` transcript
+    # carries trustworthy roles, so an un-diarized transcript is never treated as
+    # "attribution verified". Round-trips through to_dict/from_dict AND the
+    # ``delta()`` constructor (the flat process_source path derives its note from
+    # ``.delta()`` — dropping the gate there would silently un-diarize it).
+    diarized: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -133,6 +203,7 @@ class Transcript:
             "segments": [s.to_dict() for s in self.segments],
             "chunk_provenance": [dict(p) for p in self.chunk_provenance],
             "closed": self.closed,
+            "diarized": self.diarized,
         }
 
     @classmethod
@@ -192,7 +263,9 @@ class Transcript:
                 start_s=seg.start_s + audio_offset_s,  # (c) global-monotonic offset
                 end_s=seg.end_s + audio_offset_s,
                 text=seg.text,
-                speaker=seg.speaker,
+                speaker=seg.speaker,                   # P4 resolved role (carried)
+                speaker_cluster=seg.speaker_cluster,   # P4 raw cluster (carried)
+                speaker_conf=seg.speaker_conf,         # P4 purity (carried)
             )
             for i, seg in enumerate(chunk.segments)
         ]
@@ -213,6 +286,13 @@ class Transcript:
             "last_id": new_segments[-1].id if new_segments else None,
             "n_segments": len(new_segments),
         })
+        # P4: a diarized chunk latches the accumulated transcript's ``diarized``
+        # gate, so the checkpoint reader (P4-2, which loads the LEDGER) sees a
+        # truthful gate — otherwise a fully-diarized accumulation would present as
+        # un-diarized and be banner-flagged forever. Per-segment ``speaker`` still
+        # carries the (possibly ``unknown``) role for any un-attributed segment.
+        if chunk.diarized:
+            self.diarized = True
         return True
 
     def unprocessed_segments(self) -> list[Segment]:
@@ -237,11 +317,16 @@ class Transcript:
         The segments keep their ORIGINAL ids (S1, S2, ...) so the ``[S#]``
         grounding contract still resolves. For P2 (cursor ``None``) this is the
         whole transcript; the pipeline processes the delta so P3 slots in
-        without a rebuild."""
+        without a rebuild.
+
+        ⚠ ``diarized`` MUST be carried here — the flat ``process_source`` path
+        derives its note from ``.delta()``, so dropping the gate would silently
+        un-diarize a diarized transcript (a frozen-contract requirement)."""
         return Transcript(
             source_id=self.source_id,
             mode=self.mode,
             segments=self.unprocessed_segments(),
             version=self.version,
             processed_through_segment=self.processed_through_segment,
+            diarized=self.diarized,
         )

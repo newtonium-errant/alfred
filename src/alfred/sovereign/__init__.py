@@ -21,9 +21,10 @@ Public surface:
     barriers cannot see; the aiohttp wrap — task #40, the web STT/TTS transport —
     is import-guarded, so ``is_aiohttp_guard_installed`` reports whether it is
     live in this venv).
-  * Constants (:data:`SOVEREIGN_STT_ALLOWLIST`, :data:`CLOUD_KEY_ENV_VARS`,
-    :data:`EGRESS_CONFIG_SECTIONS`, :data:`LOOPBACK_HOSTS`) — the frozen
-    policy the barriers enforce; imported by tests as the contract pins.
+  * Constants (:data:`SOVEREIGN_STT_ALLOWLIST`, :data:`SOVEREIGN_DIARIZE_ALLOWLIST`,
+    :data:`CLOUD_KEY_ENV_VARS`, :data:`EGRESS_CONFIG_SECTIONS`,
+    :data:`LOOPBACK_HOSTS`) — the frozen policy the barriers enforce; imported by
+    tests as the contract pins.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from .boundary import (
     EGRESS_CONFIG_SECTIONS,
     LOOPBACK_HOSTS,
     SOVEREIGN_ALLOWED_SECTIONS,
+    SOVEREIGN_DIARIZE_ALLOWLIST,
     SOVEREIGN_STT_ALLOWLIST,
     SovereignBoundaryError,
     host_is_loopback,
@@ -51,6 +53,7 @@ __all__ = [
     "EGRESS_CONFIG_SECTIONS",
     "LOOPBACK_HOSTS",
     "SOVEREIGN_ALLOWED_SECTIONS",
+    "SOVEREIGN_DIARIZE_ALLOWLIST",
     "SOVEREIGN_STT_ALLOWLIST",
     "SovereignBoundaryError",
     "host_is_loopback",
