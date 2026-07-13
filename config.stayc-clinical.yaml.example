@@ -34,19 +34,25 @@
 # AND there is no cloud-key sibling .env at /data/algernon/stayc-clinical/ to
 # re-introduce them. Barrier (c) refuses at load if either fails.
 #
-# ── PERSISTENCE (preferred: hardened systemd --user unit — #42) ──
+# ── PERSISTENCE (preferred: hardened systemd SYSTEM unit — #42, hardened #67) ──
 # For a box that must survive reboots + terminal exit, install the STANDALONE
 # hardened unit instead of the manual env -u launch above (the manual launch
-# stays a valid supervised-console fallback):
+# stays a valid supervised-console fallback). It is a SYSTEM unit, not a --user
+# unit: only a privileged system manager can apply the hardening (a --user
+# manager dies status=218/CAPABILITIES), so install it via sudo with the STAY-C
+# venv (so the ExecStart python is that venv, where faster-whisper lives):
 #
-#   python -m alfred.scripts.install_stayc_unit    # renders + installs the unit
-#   systemctl --user start alfred-stayc-clinical.service
+#   sudo /data/algernon/stayc-clinical/.venv/bin/python \
+#       -m alfred.scripts.install_stayc_unit --stage-model   # renders + installs
+#   sudo systemctl start alfred-stayc-clinical.service
 #
 # The unit is STANDALONE — NOT a row in ~/.alfred/instances.yaml, NOT part of
 # algernon.target. It manager-enforces the cloud-key scrub (UnsetEnvironment),
-# an fs sandbox (ProtectSystem=strict, ReadWritePaths=vault+data+HF), and a
-# best-effort kernel egress belt (IPAddressDeny=any) that the scribe PROBES at
-# boot but never trusts. See the installer + the frozen #42 spec for rollback.
+# an fs sandbox (ProtectSystem=strict, ReadWritePaths=vault+data+HF+input_dir),
+# and a best-effort kernel egress belt (IPAddressDeny=any) that the scribe
+# PROBES at boot but never trusts. The installer READS scribe.input_dir +
+# scribe.stt.model from THIS config (so the sandbox + the offline STT-model
+# check match the deploy). See the installer + the frozen spec for rollback.
 #
 # P1-d is the STANDUP only — the daemon boots in synthetic mode, validates the
 # boundary, arms the http guard, emits `scribe.daemon.up`, and sits idle-ready.

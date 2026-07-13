@@ -8,12 +8,26 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=<ALFRED_REPO>
-ExecStart=<ALFRED_REPO>/.venv/bin/python -m alfred --config <STAYC_CONFIG> up --_internal-foreground
+# SYSTEM unit (#67): installed to /etc/systemd/system + enabled by root, so a
+# PRIVILEGED system manager applies the hardening below (capability drops,
+# namespaces, ProtectSystem=strict) THEN drops to this unprivileged User/Group
+# to run the scribe. A `systemctl --user` manager is UNPRIVILEGED and CANNOT
+# apply that hardening — it dies status=218/CAPABILITIES ("Failed to drop
+# capabilities", "UTS namespace setup prohibited") and crash-loops, never
+# booting. That is why STAY-C is a system unit, not a --user unit.
+User=<STAYC_USER>
+Group=<STAYC_GROUP>
+# WorkingDirectory is the STAY-C data root; the ExecStart python is the STAY-C
+# OWN venv (stayc-root/.venv) — faster-whisper lives there, NOT in the shared
+# alfred venv (#67 F1). `python -m alfred` resolves alfred from that venv's
+# installed/editable package, so WorkingDirectory need NOT be the code repo.
+WorkingDirectory=<STAYC_WORKDIR>
+ExecStart=<STAYC_PYTHON> -m alfred --config <STAYC_CONFIG> up --_internal-foreground
 # --- barrier-(c) cloud-key scrub (DETERMINATE B): manager-enforced regardless of launch, supersedes the header's env -u wrapper ---
 UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL GROQ_API_KEY DEEPGRAM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY ELEVENLABS_API_KEY TOGETHER_API_KEY ZO_API_KEY RESEND_API_KEY
-# salt-only, 0600, sited OUTSIDE the config dir so barrier-(c)'s sibling-.env autoload never sees it; carries NO cloud key
-EnvironmentFile=<STAYC_SECRETS_ENV>
+# salt-only, 0600, sited OUTSIDE the config dir so barrier-(c)'s sibling-.env autoload never sees it; carries NO cloud key.
+# Leading `-` (#67 F2): OPTIONAL — a missing file is ignored, not fatal. The salt is usually inline in config.scribe.encounter_salt, so this file is often absent; without the dash systemd REFUSES to start the unit.
+EnvironmentFile=-<STAYC_SECRETS_ENV>
 # real-need iii: relocate HF STT cache off /home + force offline model load
 Environment=HF_HOME=<STAYC_HF_HOME>
 Environment=HF_HUB_OFFLINE=1
@@ -21,7 +35,12 @@ Environment=TRANSFORMERS_OFFLINE=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=<STAYC_VAULT> <STAYC_DATA> <STAYC_HF_HOME>
+# ReadWritePaths carves the writable holes out of ProtectSystem=strict: vault +
+# data + HF cache, PLUS the scribe input_dir (#67 F4). input_dir is derived
+# from config.scribe.input_dir by the installer — on-box it is a SIBLING of the
+# data dir, NOT under it, so ProtectSystem=strict would leave it read-only and
+# every encounter would EROFS on its ledger write. Include it explicitly.
+ReadWritePaths=<STAYC_VAULT> <STAYC_DATA> <STAYC_HF_HOME> <STAYC_INPUT_DIR>
 ReadOnlyPaths=<STAYC_CONFIG>
 PrivateTmp=yes
 UMask=0077
@@ -57,4 +76,4 @@ RestartPreventExitStatus=78 79
 # an on-box-validated future tightening, NOT in the shipped load-bearing set.
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
