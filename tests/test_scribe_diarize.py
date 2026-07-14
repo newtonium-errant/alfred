@@ -360,7 +360,7 @@ def test_off_provider_note_byte_identical_to_p3(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_accumulate_diarize_failure_folds_unattributed(tmp_path, monkeypatch):
-    def _boom(config, audio_path, chunk_tx):
+    def _boom(config, audio_path, chunk_tx, *, resolved=None):  # P4-5 — mirror the real kwarg
         raise RuntimeError("diarizer exploded")
     monkeypatch.setattr(diarize_mod, "assign_speakers", _boom)
 

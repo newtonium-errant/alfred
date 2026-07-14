@@ -120,6 +120,38 @@ def record_attest_outcome(
                     source_id=source_id, detail="attest_outcome capture failed — SWALLOWED")
 
 
+def has_diarize_stats_for(
+    enrollment_dir: str | Path, preset_id: str | None, centroid_version: int | None,
+) -> bool:
+    """True iff the capture sink already holds a ``diarize_stats`` row for this
+    ``(preset_id, centroid_version)`` — the 'is this preset+version already in use?'
+    check behind the ``new_preset_first_use`` informational flag (5a) and the 5b
+    per-preset health windowing (``new`` is distinguishable from ``ok``).
+
+    A cheap linear scan (5b replaces it with a derived health index). FAIL-SILENT: a
+    read/parse error → ``False`` (treat as NEW — over-signal 'first use' rather than
+    hide it). A null ``preset_id`` is never a preset use → ``False``."""
+    if not preset_id:
+        return False
+    path = _capture_path(enrollment_dir)
+    if not path.is_file():
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (row.get("kind") == KIND_DIARIZE_STATS
+                        and row.get("preset_id") == preset_id
+                        and row.get("centroid_version") == centroid_version):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def audit(enrollment_dir: str | Path, event: str, *,
           preset_id: str | None = None, user: str | None = None,
           **fields: Any) -> None:

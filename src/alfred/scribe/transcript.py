@@ -193,6 +193,15 @@ class Transcript:
     # ``delta()`` constructor (the flat process_source path derives its note from
     # ``.delta()`` — dropping the gate there would silently un-diarize it).
     diarized: bool = False
+    # P4-5 diarization PROVENANCE (additive, optional — no shape migration). The voice
+    # preset that anchored this encounter's diarizer:
+    # ``{user, preset_id, centroid_version, engine_fingerprint}``, or ``None`` when no
+    # preset was bound / resolved (attribution ran UN-anchored, all-``unknown``
+    # fail-open). Set at resolve time by the pipeline; round-trips through
+    # to_dict/from_dict (schema-tolerant) so the ledger persists WHICH preset
+    # attributed the note — attest reads it back via the frontmatter
+    # ``diarize_provenance`` (the self-correcting loop's provenance thread).
+    diarize_preset: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -204,6 +213,7 @@ class Transcript:
             "chunk_provenance": [dict(p) for p in self.chunk_provenance],
             "closed": self.closed,
             "diarized": self.diarized,
+            "diarize_preset": self.diarize_preset,
         }
 
     @classmethod

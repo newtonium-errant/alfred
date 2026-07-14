@@ -46,6 +46,9 @@ from typing import Any
 import structlog
 
 from alfred.scribe import diarize as diarize_mod
+from alfred.scribe import embed_voice as embed_voice_mod
+from alfred.scribe import enroll_learning
+from alfred.scribe import enrollment as en_mod
 from alfred.scribe import ledger as ledger_mod
 from alfred.scribe import stt as stt_mod
 from alfred.scribe.attestation import SCRIBE_DRAFTER_IDENTITY
@@ -83,7 +86,15 @@ from alfred.scribe.state import (
     STATE_TRANSCRIBING,
     ScribeState,
 )
-from alfred.scribe.transcript import Transcript
+from alfred.scribe.transcript import (
+    ROLE_CLINICIAN,
+    ROLE_OTHER,
+    ROLE_PATIENT,
+    ROLE_UNKNOWN,
+    Segment,
+    Transcript,
+    normalize_role,
+)
 from alfred.vault.ops import VaultError, vault_create, vault_edit, vault_read
 from alfred.vault.scope import ScopeError
 
@@ -318,7 +329,7 @@ async def process_source(
 
 def _create_ai_draft(
     vault_path: Path, title: str, source_id: str, config: ScribeConfig,
-    vnote: VerifiedNote,
+    vnote: VerifiedNote, *, diarize_provenance: dict[str, Any] | None = None,
 ) -> str:
     """Create-OR-update the clinical_note ai_draft (scribe P3-a).
 
@@ -356,6 +367,15 @@ def _create_ai_draft(
         # stays = the pipeline's last body). Sealed with the note at attest.
         "draft_original": vnote.body,
     }
+    # P4-5 — additive diarize PROVENANCE on the note (create only). Which voice preset
+    # anchored this encounter's attribution: {user, preset_id, centroid_version,
+    # engine_fingerprint}, or absent when un-anchored. Written ONCE at create (the
+    # binding locks before the first chunk, so the provenance is STABLE across an
+    # encounter's checkpoints — the update path never needs to refresh it, which keeps
+    # STAYC_CLINICAL_DRAFT_EDIT_FIELDS un-widened). Attest reads it back (the
+    # self-correcting loop's provenance thread); PHI-free (ids/enums/scalars only).
+    if diarize_provenance:
+        draft_fields["diarize_provenance"] = diarize_provenance
     try:
         result = vault_create(
             vault_path,
@@ -527,6 +547,85 @@ def _chunk_content_hash(chunk_path: Path) -> str:
     return hashlib.sha256(chunk_path.read_bytes()).hexdigest()
 
 
+# --- P4-5 voice-preset resolution + diarize_stats capture -------------------
+
+def _resolve_encounter_preset(
+    encounter_dir: Path, config: ScribeConfig, engine_fingerprint: dict[str, Any],
+) -> "en_mod.ResolvedEnrollment | None":
+    """Resolve the encounter's bound voice preset — fail-OPEN to ``None`` on ANY problem.
+
+    Only attempts a resolution when enrollment is configured (``enrollment_dir`` set)
+    AND a binding sidecar EXISTS — so 'no preset selected' (the common, first-class
+    choice) stays silent (no ``scribe.enrollment.unusable`` spam), while a PRESENT
+    binding that is unusable (revoked / incompatible / digest-mismatch / corrupt) drives
+    ``resolve_for_encounter``'s reason-coded ``scribe.enrollment.unusable`` log and STILL
+    falls open to ``None`` (all-``unknown``; the P4-2 banner fires). NEVER raises,
+    NEVER blocks (fail-open-for-availability)."""
+    enroll_dir = config.diarize.enrollment_dir
+    if not enroll_dir or en_mod.read_binding(encounter_dir) is None:
+        return None
+    resolved = en_mod.resolve_for_encounter(encounter_dir, enroll_dir, engine_fingerprint)
+    return resolved if isinstance(resolved, en_mod.ResolvedEnrollment) else None
+
+
+def _role_counts(segments: list[Segment]) -> dict[str, int]:
+    """PHI-free per-role segment counts (every speaker folded through normalize_role,
+    so None / '' / a raw cluster count as ``unknown``)."""
+    roles = [normalize_role(s.speaker) for s in segments]
+    return {
+        "clinician": roles.count(ROLE_CLINICIAN),
+        "patient": roles.count(ROLE_PATIENT),
+        "other": roles.count(ROLE_OTHER),
+        "unknown": roles.count(ROLE_UNKNOWN),
+    }
+
+
+def _min_purity(segments: list[Segment]) -> float | None:
+    """Lowest recorded ``speaker_conf`` across segments (None when none carry conf —
+    the fake/off seams don't)."""
+    confs = [s.speaker_conf for s in segments if s.speaker_conf is not None]
+    return min(confs) if confs else None
+
+
+def _fail_closed_demotions(segments: list[Segment]) -> int:
+    """Count of segments the diarizer LABELED (a cluster is present) whose role
+    nonetheless fell to ``unknown`` — a fail-closed demotion (weak/ambiguous match, or
+    the no-enrollment all-unknown end-state)."""
+    return sum(1 for s in segments
+               if s.speaker_cluster is not None and normalize_role(s.speaker) == ROLE_UNKNOWN)
+
+
+def _record_diarize_stats(
+    config: ScribeConfig, *, encounter_id: str, chunk_seq: int | None,
+    chunk_tx: Transcript, resolved: "en_mod.ResolvedEnrollment | None",
+    engine_fingerprint: dict[str, Any],
+) -> None:
+    """Append the per-chunk ``diarize_stats`` capture row (PHI-free, fail-silent) when
+    enrollment is configured. A NO-PRESET chunk STILL lands a row (``preset_id`` /
+    ``user`` null — intentionally-left-blank: 'diarized without a preset' is
+    distinguishable from 'no capture'). ``best_cosine`` / ``separation`` are the on-box
+    match telemetry — ``None`` here because the per-cluster embedding extraction is the
+    on-box placeholder; ``role_counts`` / ``min_purity`` / demotions derive from the
+    transcript."""
+    if not config.diarize.enrollment_dir:
+        return
+    enroll_learning.record_diarize_stats(
+        config.diarize.enrollment_dir,
+        source_id=encounter_id,
+        chunk_seq=chunk_seq,
+        user=(resolved.user if resolved else None),
+        preset_id=(resolved.preset_id if resolved else None),
+        centroid_version=(resolved.centroid_version if resolved else None),
+        engine_fingerprint=engine_fingerprint,
+        n_segments=len(chunk_tx.segments),
+        role_counts=_role_counts(chunk_tx.segments),
+        best_cosine=None,
+        separation=None,
+        min_purity=_min_purity(chunk_tx.segments),
+        fail_closed_demotions=_fail_closed_demotions(chunk_tx.segments),
+    )
+
+
 def accumulate_encounter(
     encounter_dir: Path, *, config: ScribeConfig,
 ) -> AccumResult:
@@ -561,6 +660,37 @@ def accumulate_encounter(
     transcript = ledger_mod.load_ledger(lpath) or Transcript(
         source_id=encounter_id, mode=config.mode,
     )
+
+    # P4-5 — resolve the encounter's bound voice preset ONCE this pass (fail-open to
+    # None). The resolved preset ANCHORS the diarizer's K=2 clinician matcher + stamps
+    # provenance onto the ledger (persisted → read back at attest via the frontmatter
+    # diarize_provenance). engine_fingerprint is the RESOLVED runtime engine (an engine
+    # upgrade invalidates presets, so a stale-engine preset resolves incompatible →
+    # fail-open). No enrollment / no binding → resolved None (all-unknown; a first-class
+    # choice, silent).
+    engine_fp = embed_voice_mod.engine_fingerprint(config)
+    resolved = _resolve_encounter_preset(encounter_dir, config, engine_fp)
+    if resolved is not None:
+        transcript.diarize_preset = {
+            "user": resolved.user, "preset_id": resolved.preset_id,
+            "centroid_version": resolved.centroid_version, "engine_fingerprint": engine_fp,
+        }
+        # new_preset_first_use — the informational flag: this preset+centroid_version has
+        # no prior capture-sink evidence, so its self-correcting health window STARTS
+        # here (checked BEFORE this pass writes any diarize_stats row; a re-record bumps
+        # the version → resets the window → re-fires).
+        if not enroll_learning.has_diarize_stats_for(
+            config.diarize.enrollment_dir, resolved.preset_id, resolved.centroid_version,
+        ):
+            log.info(
+                "scribe.enrollment.new_preset_first_use",
+                encounter_id=encounter_id,
+                preset_id=resolved.preset_id,               # id-only (PHI-free)
+                centroid_version=resolved.centroid_version,
+                detail="first encounter using this preset+centroid_version — its "
+                       "self-correcting evidence base starts here (health windows on "
+                       "(preset_id, centroid_version); a re-record resets it)",
+            )
 
     folded_seqs = {p.get("seq") for p in transcript.chunk_provenance}
     expected = (max(folded_seqs) + 1) if folded_seqs else 1
@@ -637,7 +767,9 @@ def accumulate_encounter(
         # mis-attributed); unlike an STT decode failure it must NOT hold the
         # encounter — NO break, so the fold proceeds this pass.
         try:
-            chunk_tx = diarize_mod.assign_speakers(config, chunk_path, chunk_tx)
+            chunk_tx = diarize_mod.assign_speakers(
+                config, chunk_path, chunk_tx, resolved=resolved,
+            )
         except Exception as e:  # noqa: BLE001 — fail-open: fold un-attributed, do NOT hold
             log.warning(
                 "scribe.diarize.failed",
@@ -649,6 +781,14 @@ def accumulate_encounter(
                     "un-attributed ≫ mis-attributed. Does NOT hold the encounter."
                 ),
             )
+        # P4-5 — capture the per-chunk diarize_stats row (PHI-free, fail-silent). Lands
+        # for EVERY folded chunk when enrollment_dir is set, INCLUDING a no-preset chunk
+        # (preset_id null) and a fail-open diarize (all-unknown) — 'ran' is always
+        # distinguishable from 'no capture'.
+        _record_diarize_stats(
+            config, encounter_id=encounter_id, chunk_seq=seq, chunk_tx=chunk_tx,
+            resolved=resolved, engine_fingerprint=engine_fp,
+        )
         offset = transcript.segments[-1].end_s if transcript.segments else 0.0
         if transcript.append_chunk(
             chunk_tx, audio_offset_s=offset, chunk_key=chunk_key, seq=seq,
@@ -792,9 +932,14 @@ async def _regen_checkpoint(
         return "budget_capped"
 
     # UPDATE-IN-PLACE (P3-a create-or-update: create on the first checkpoint,
-    # body_replace after; refuse if the draft was sealed mid-flight).
+    # body_replace after; refuse if the draft was sealed mid-flight). P4-5 —
+    # the ledger carries the resolved-preset provenance (set at accumulate time);
+    # thread it so the FIRST create stamps the frontmatter diarize_provenance.
     try:
-        new_path = _create_ai_draft(vault_path, title, encounter_id, config, vnote)
+        new_path = _create_ai_draft(
+            vault_path, title, encounter_id, config, vnote,
+            diarize_provenance=transcript.diarize_preset,
+        )
     except (VaultError, ScopeError) as e:
         # #3 — the seal can surface as EITHER a VaultError (detected at
         # _update_or_refuse_ai_draft's vault_read, pipeline path) OR a ScopeError
