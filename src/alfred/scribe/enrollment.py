@@ -27,7 +27,7 @@ import re
 import secrets
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +225,18 @@ class Preset:
         return cls(**known)
 
 
+# The REQUIRED (no-default) Preset fields. ``Preset.from_dict`` filters unknown keys but
+# CANNOT invent a MISSING one — a preset JSON lacking any of these raises TypeError inside
+# the constructor, which (before this guard) propagated out of ``load_preset`` →
+# ``resolve_for_encounter`` → ``accumulate_encounter`` and BLOCKED the encounter forever,
+# violating the frozen fail-open contract. DERIVED from the dataclass, so it can never
+# drift from the schema (adding a required field auto-extends the check).
+_REQUIRED_PRESET_FIELDS: tuple[str, ...] = tuple(
+    name for name, f in Preset.__dataclass_fields__.items()
+    if f.default is MISSING and f.default_factory is MISSING
+)
+
+
 # --- atomic 0600 store primitives --------------------------------------------
 
 def _ensure_dir(path: Path) -> None:
@@ -276,10 +288,16 @@ def _structural_ok(data: dict[str, Any], path: Path) -> str | None:
     """Return a failure classification (``unsupported_schema`` / ``corrupt``) if the
     preset dict fails the load-contract teeth, else ``None`` (structurally valid).
 
-    Teeth: schema gate, id/path agreement, finite floats, dim consistency, unit-norm
-    within tolerance. A failure is CLASSIFIED (never crashes, never blocks)."""
+    Teeth: schema gate, REQUIRED-FIELD PRESENCE, id/path agreement, finite floats, dim
+    consistency, unit-norm within tolerance. A failure is CLASSIFIED (never crashes,
+    never blocks)."""
     if data.get("schema_version") != SCHEMA_VERSION:
         return CLASS_UNSUPPORTED_SCHEMA
+    # REQUIRED-FIELD PRESENCE — a v1 file missing any no-default field would otherwise
+    # raise TypeError inside Preset.from_dict and propagate out of the "NEVER raises"
+    # load path, permanently blocking the bound encounter. Classify it corrupt instead.
+    if any(f not in data for f in _REQUIRED_PRESET_FIELDS):
+        return CLASS_CORRUPT
     pid = data.get("preset_id")
     if not isinstance(pid, str) or not PRESET_ID_RE.fullmatch(pid) or f"{pid}.json" != path.name:
         return CLASS_CORRUPT
@@ -312,17 +330,25 @@ def load_preset(path: Path) -> tuple[Preset | None, str | None]:
     ``(Preset, None)`` on a structurally-valid record (active OR a revoked
     tombstone). ``(None, "corrupt"|"unsupported_schema")`` on a load-contract
     failure. NEVER raises — a bad file classifies, surfaces via ``list``, never a
-    crash, never a block."""
+    crash, never a block. That "never raises" is LOAD-BEARING: every caller
+    (``resolve_for_encounter`` → ``accumulate_encounter``, ``list_user_presets`` →
+    the presets CLI + ``GET /scribe/presets``, ``_find_usable_preset`` → the binding
+    route) relies on it to fail OPEN; a raise here blocks the encounter forever."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None, CLASS_CORRUPT
     if not isinstance(data, dict):
         return None, CLASS_CORRUPT
-    fail = _structural_ok(data, path)
-    if fail is not None:
-        return None, fail
-    return Preset.from_dict(data), None
+    try:
+        fail = _structural_ok(data, path)
+        if fail is not None:
+            return None, fail
+        return Preset.from_dict(data), None
+    except Exception:  # noqa: BLE001 — BELT: the load path NEVER raises. _structural_ok's
+        # teeth should catch every malformed shape, but a construction/validation failure
+        # must CLASSIFY (corrupt), never propagate and block an encounter (fail-open).
+        return None, CLASS_CORRUPT
 
 
 def engine_class(preset: Preset, engine_fingerprint: dict[str, Any]) -> str:

@@ -399,6 +399,44 @@ def _build_diarize(data: Any) -> ScribeDiarizeConfig:
     return cfg
 
 
+def _coerce_secret(value: Any, *, field: str) -> str:
+    """Coerce a SECRET config value (a bearer token) FAIL-CLOSED to ``""`` when it is
+    unset or an UNRESOLVED ``${VAR}`` placeholder — so a misconfigured key leaves the
+    surface INERT rather than ARMED with a publicly-known literal.
+
+    Two traps, both empirically confirmed to arm the biometric face:
+      * **YAML null** — ``enroll_token:`` (a bare key, the natural way to scaffold
+        "unset") is ``None``, and ``str(None)`` == ``"None"``: a TRUTHY, guessable
+        bearer. This is the SAME D4 trap ``_build_diarize`` already guards for its
+        string fields; a security key must not be the one place it is missed.
+      * **Unresolved ``${VAR}``** — env substitution leaves ``${SCRIBE_ENROLL_TOKEN}``
+        as the LITERAL placeholder when the var is absent (a service-unit env-ordering
+        slip). It is truthy AND publicly known from the example config. Mirrors
+        ``identity.compute_encounter_id``'s salt fail-closed (3d8a409) — same class of
+        defect, on a security key instead of a salt.
+
+    Empty ⇒ the enrollment face is INERT (404 + ``scribe.enroll.inert``), and barrier-e
+    independently refuses an ENABLED server whose ingest token is empty. Fail-closed in
+    both directions."""
+    if value is None:
+        return ""
+    s = str(value)
+    if s.startswith("${"):
+        log.error(
+            "scribe.config.unresolved_token_placeholder",
+            field=field,
+            detail=(
+                "an UNRESOLVED ${VAR} placeholder survived env substitution in a scribe "
+                "bearer token — the env var is NOT set, so the value is the literal, "
+                "PUBLICLY-KNOWN placeholder string. Treating it as EMPTY (fail-closed): "
+                "the surface stays INERT rather than arming with a guessable credential. "
+                "Set the environment variable (systemd EnvironmentFile / launch env)."
+            ),
+        )
+        return ""
+    return s
+
+
 def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:
     """Schema-tolerant build of :class:`ScribeIngestWebConfig` with explicit type
     coercion (``enabled`` truthy→bool, ports/caps→int) so a YAML string value
@@ -415,10 +453,31 @@ def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:
         cfg.enabled = coerce_ingest_web_enabled(known["enabled"])
     if "host" in known:
         cfg.host = str(known["host"])
+    # SECRETS — fail-closed on YAML-null / unresolved ${VAR} (see _coerce_secret). A
+    # truthy "None" / "${SCRIBE_ENROLL_TOKEN}" would ARM the face with a known bearer.
     if "token" in known:
-        cfg.token = str(known["token"])
+        cfg.token = _coerce_secret(known["token"], field="ingest_web.token")
     if "enroll_token" in known:
-        cfg.enroll_token = str(known["enroll_token"])
+        cfg.enroll_token = _coerce_secret(known["enroll_token"], field="ingest_web.enroll_token")
+    # TWO-TOKEN DISTINCTNESS — the whole custody model rests on enroll_token being a
+    # SEPARATE credential from the ingest token, because the served page EMBEDS the ingest
+    # token. If they are equal, any bearer of the page-embedded token clears every
+    # enroll-face route (enroll / re-record / revoke) and the split is void with no
+    # warning. FAIL-CLOSED: blank the enroll token so the biometric face goes INERT (404)
+    # rather than becoming reachable from page possession alone. Loud, actionable.
+    if cfg.enroll_token and cfg.enroll_token == cfg.token:
+        log.error(
+            "scribe.config.enroll_token_equals_ingest_token",
+            detail=(
+                "scribe.ingest_web.enroll_token is IDENTICAL to the ingest token. The "
+                "served page embeds the ingest token, so an equal enroll token would let "
+                "page possession alone drive biometric enrollment / re-record / revoke — "
+                "collapsing the two-token capability split. Treating enroll_token as "
+                "EMPTY (fail-closed: the enrollment face is INERT). Set a DISTINCT "
+                "SCRIBE_ENROLL_TOKEN."
+            ),
+        )
+        cfg.enroll_token = ""
     for int_field in ("port", "max_chunk_bytes", "max_chunks_per_encounter", "max_encounter_bytes"):
         if int_field in known:
             try:
