@@ -160,6 +160,9 @@ APP_JS = r"""'use strict';
   let selectedPreset = '';           // '' == "No preset — attribution off" (first-class)
   let presetsCache = [];
   let mruPresetId = null;
+  let serverState = '';              // 'empty' | 'all_incompatible' | 'ok' (the API contract)
+  let enrollSession = null;          // non-null while an enrolment session holds RAM bytes
+  let micLabel = '';                 // the device label, for the name prefill
 
   // encounter state
   let stream = null, recording = false, label = null, seq = 0, recorder = null;
@@ -169,7 +172,15 @@ APP_JS = r"""'use strict';
   const statusEl = $('status');
   function show(msg) { statusEl.textContent = msg; }            // NON-PHI text only
   function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-  function esc(s) { const d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; }
+  // ATTRIBUTE-SAFE escaping. The old version used the textContent->innerHTML trick, which
+  // escapes & < > but NOT quotes — and every use site here interpolates into an ATTRIBUTE
+  // (<option value="...">, data-id="..."). A value containing a double quote would break
+  // out of the attribute. Escape quotes explicitly.
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
 
   // R6 — machine token label: enc-<13-digit ms epoch>-<16 hex crypto nonce>.
   // NO DOM value feeds this. Must fullmatch ^enc-[0-9]{13}-[0-9a-f]{16}$.
@@ -216,15 +227,16 @@ APP_JS = r"""'use strict';
   // ══ RECORD VIEW ═══════════════════════════════════════════════════════════════
 
   async function loadPresets() {
-    presetsCache = []; mruPresetId = null;
+    presetsCache = []; mruPresetId = null; serverState = '';
     if (!user) { return; }
     try {
       const r = await api('/scribe/presets?user=' + encodeURIComponent(user));  // EITHER token
-      if (r.status === 404) { return; }                         // enrollment face inert
+      if (r.status === 404) { serverState = 'inert'; return; }  // enrollment face inert
       if (!r.ok) { return; }
       const j = await r.json();
       presetsCache = j.presets || [];
       mruPresetId = j.mru_preset_id || null;                    // SERVER-side MRU (R5)
+      serverState = j.state || '';                              // empty | all_incompatible | ok
     } catch (e) { /* offline-ish: the picker just shows the no-preset choice */ }
   }
 
@@ -249,54 +261,76 @@ APP_JS = r"""'use strict';
     renderPresetMsg();
   }
 
+  // INTENTIONALLY-LEFT-BLANK: the record view must NEVER go silent about attribution.
+  // Every registry state renders an explicit signal. The rule is simply: if NOTHING is
+  // usable, say so — whatever the cause. (The original code only caught the
+  // engine-incompatible cause, so an all-REVOKED or all-CORRUPT registry fell through
+  // BOTH branches to an empty message: the WORST state emitted LESS signal than the
+  // empty one, and Jamie would record with no indication attribution was off.)
   function renderPresetMsg() {
     const el = $('preset-msg');
     const usable = usablePresets();
-    const stale = presetsCache.filter((p) => p.classification === 'incompatible_engine' ||
-                                             p.classification === 'incompatible_model');
-    if (usable.length === 0 && stale.length > 0) {
-      // Engine-upgrade invalidation — never silent. Start STAYS enabled.
-      el.innerHTML = '<div class="banner">Your voiceprint was made with an older engine, so ' +
-        'attribution is off. <button id="go-rerecord">Re-record (~1 min)</button> ' +
-        '<button id="continue-off">Continue &mdash; attribution off</button></div>';
-      const go = $('go-rerecord');
-      if (go) { go.addEventListener('click', () => { location.hash = '#/presets'; }); }
-      const off = $('continue-off');
-      if (off) { off.addEventListener('click', () => { el.innerHTML = ''; }); }
-      return;
-    }
+    if (usable.length > 0) { el.innerHTML = ''; return; }        // a usable preset exists
+
     if (presetsCache.length === 0) {
-      // Zero presets — a NON-BLOCKING badge. Start stays enabled (no-preset is valid).
+      // ZERO presets — a NON-BLOCKING badge. Start STAYS enabled (no-preset is valid).
       el.innerHTML = '<div class="banner">No voiceprint yet &mdash; the scribe will not label who is ' +
         'speaking. <button id="go-create">Create one (~1 min)</button></div>';
       const go = $('go-create');
       if (go) { go.addEventListener('click', () => { location.hash = '#/presets'; }); }
       return;
     }
-    el.innerHTML = '';
+
+    // PRESETS EXIST BUT NONE ARE USABLE. Name the cause when we can; ALWAYS say
+    // attribution is off. The server also flags this as state:"all_incompatible" —
+    // empty vs all-unusable are DISTINCT states (docs/scribe_enroll_api.md).
+    const stale = presetsCache.some((p) => p.classification === 'incompatible_engine' ||
+                                           p.classification === 'incompatible_model');
+    const why = stale
+      ? 'Your voiceprint was made with an older engine, so attribution is off.'
+      : 'None of your voiceprints can be used right now, so attribution is off.';
+    el.innerHTML = '<div class="banner">' + why +
+      ' <button id="go-rerecord">Re-record (~1 min)</button>' +
+      ' <button id="continue-off">Continue &mdash; attribution off</button></div>';
+    const go = $('go-rerecord');
+    if (go) { go.addEventListener('click', () => { location.hash = '#/presets'; }); }
+    const off = $('continue-off');
+    if (off) { off.addEventListener('click', () => { el.innerHTML = ''; }); }
   }
+
+  const CHIP_COPY = { unarmed: 'attribution: unarmed', ok: 'attribution: on',
+                      warming: 'attribution: warming up', weak: 'attribution: weak',
+                      none: 'attribution: off' };
 
   function setChip(fit) {
     // preset_fit is a 5-value enum (unarmed|warming|weak|none|ok); 5a emits only
     // unarmed|ok. FORWARD-TOLERATE: an UNKNOWN value must not break the chip (5b adds
-    // warming/weak/none) — anything unrecognised reads as 'unarmed'.
-    const known = { unarmed: 'attribution: unarmed', ok: 'attribution: on',
-                    warming: 'attribution: warming up', weak: 'attribution: weak',
-                    none: 'attribution: off' };
-    $('chip').textContent = known[fit] || known.unarmed;
+    // warming/weak/none) — anything unrecognised reads as 'unarmed'. hasOwnProperty, not
+    // `CHIP_COPY[fit] ||`: a value like "constructor" or "toString" would otherwise
+    // resolve off the PROTOTYPE and render a function body into the chip.
+    const ok = fit && Object.prototype.hasOwnProperty.call(CHIP_COPY, fit);
+    $('chip').textContent = ok ? CHIP_COPY[fit] : CHIP_COPY.unarmed;
   }
 
   // Bind the chosen preset BEFORE the first chunk — the server LOCKS the binding at the
   // first chunk (a late bind is a 409 and would leave the note's provenance absent).
   // A binding failure must NEVER block Start: the encounter simply runs un-anchored.
+  // TIMEOUT-BOUNDED: startWindow() sits behind this await, so a HUNG bind would stall the
+  // whole encounter (audio lost). Losing attribution is survivable; losing the recording
+  // is not — so the bind races a deadline and we record regardless.
+  const BIND_TIMEOUT_MS = 4000;
   async function bindPreset() {
     if (!selectedPreset) { return; }
+    const offMsg = 'Recording. (Voice preset could not be applied — attribution off.)';
+    const q = '?label=' + encodeURIComponent(label) + '&preset=' + encodeURIComponent(selectedPreset);
     try {
-      const q = '?label=' + encodeURIComponent(label) + '&preset=' + encodeURIComponent(selectedPreset);
-      const r = await api('/scribe/encounter/preset' + q, { method: 'POST' });   // INGEST token
-      if (!r.ok) { show('Recording. (Voice preset could not be applied — attribution off.)'); }
+      const timeout = new Promise((res) => setTimeout(() => res(null), BIND_TIMEOUT_MS));
+      // INGEST token — the binding is an ENCOUNTER-class capability. Sending the ENROLL
+      // token here is a 401 wrong_token_class and attribution silently never arms.
+      const r = await Promise.race([api('/scribe/encounter/preset' + q, { method: 'POST' }), timeout]);
+      if (!r || !r.ok) { show(offMsg); }
     } catch (e) {
-      show('Recording. (Voice preset could not be applied — attribution off.)');
+      show(offMsg);
     }
   }
 
@@ -357,6 +391,14 @@ APP_JS = r"""'use strict';
   }
 
   async function start() {
+    // MUTUAL EXCLUSION (memo: enrolment and encounter recording are mutually exclusive).
+    // Two MediaRecorders on one mic, and — far worse — an enrolment buffer that captures
+    // LIVE PATIENT SPEECH on a surface whose entire consent basis is "the enrolling
+    // clinician's own voice". Refuse, loudly.
+    if (enrollSession) {
+      show('Finish or cancel the voiceprint recording first — the microphone is in use.');
+      return;
+    }
     $('start').disabled = true;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -504,9 +546,31 @@ APP_JS = r"""'use strict';
     if (act === 'rerecord') { runEnroll(id); }
   }
 
+  // TERMINAL DISCARD — drop the RAM-held voice bytes NOW rather than waiting out the
+  // server's 10-minute TTL. RAM-only custody is the security centrepiece; leaving the
+  // bytes resident is exactly what /enroll/abandon exists to prevent (and two abandoned
+  // attempts would otherwise 429 the next start against the 2-session cap).
+  async function abandonEnroll() {
+    const s = enrollSession;
+    enrollSession = null;
+    if (!s) { return; }
+    try { await api('/scribe/enroll/abandon?session=' + encodeURIComponent(s),
+                    { method: 'POST', enroll: true }); } catch (e) { /* best-effort */ }
+  }
+
   // The guided enrolment: record-first, name-last (~45-60s).
   async function runEnroll(rerecordId) {
     if (!user) { return; }
+    // MUTUAL EXCLUSION (memo) — never enrol while an encounter is recording: the
+    // enrolment buffer would capture LIVE PATIENT SPEECH, and the whole consent basis of
+    // this surface is "the enrolling clinician's own voice".
+    if (recording) {
+      $('enroll').classList.remove('hide');
+      $('enroll-title').textContent = 'Not now';
+      $('enroll-body').innerHTML = '<p>An encounter is recording. Stop it before making a ' +
+        'voiceprint &mdash; the microphone can only do one at a time.</p>';
+      return;
+    }
     if (!(await needEnrollToken())) { return; }
     const box = $('enroll');
     box.classList.remove('hide');
@@ -537,15 +601,22 @@ APP_JS = r"""'use strict';
       const r = await api('/scribe/enroll/start' + q, { method: 'POST', enroll: true });
       if (!r.ok) { st.getTracks().forEach((t) => t.stop()); return enrollFailed(r.status, rerecordId); }
       session = (await r.json()).session;
+      enrollSession = session;                 // RAM bytes are now held server-side
     } catch (e) {
       st.getTracks().forEach((t) => t.stop());
       return enrollFailed(0, rerecordId);
     }
+    // the mic's own label is the memo's name prefill ("name the place and mic").
+    try {
+      const tr = st.getAudioTracks ? st.getAudioTracks()[0] : null;
+      micLabel = (tr && tr.label) ? String(tr.label) : '';
+    } catch (e) { micLabel = ''; }
 
     $('enroll-body').innerHTML =
       '<p><b>Keep this screen open.</b></p><div class="ring" id="ring">0s</div>' +
       '<p class="note">Recording&hellip; speak normally.</p>' +
-      '<button id="en-done" class="primary">Done</button>';
+      '<button id="en-done" class="primary">Done</button>' +
+      '<button id="en-cancel">Cancel</button>';
 
     let elapsed = 0, live = true, eseq = 0;
     let echain = Promise.resolve();
@@ -578,12 +649,24 @@ APP_JS = r"""'use strict';
     }
     windowOnce();
 
-    $('en-done').addEventListener('click', async () => {
+    function halt() {
       live = false;
       clearInterval(ring);
       st.getTracks().forEach((t) => t.stop());
+    }
+    $('en-done').addEventListener('click', async () => {
+      halt();
       await echain;
       finalizeEnroll(session, rerecordId);
+    });
+    // CANCEL — an explicit discard. Drops the RAM bytes NOW (server-side) instead of
+    // leaving them resident for the 10-minute TTL.
+    $('en-cancel').addEventListener('click', async () => {
+      halt();
+      await echain;
+      await abandonEnroll();
+      $('enroll').classList.add('hide');
+      renderPresets();
     });
   }
 
@@ -591,10 +674,15 @@ APP_JS = r"""'use strict';
     $('enroll-body').innerHTML = '<p><b>Making the voiceprint&hellip;</b></p>' +
       '<p class="note">Keep this screen open.</p>';
     try {
-      await api('/scribe/enroll/finalize?session=' + encodeURIComponent(session), {
+      const r = await api('/scribe/enroll/finalize?session=' + encodeURIComponent(session), {
         method: 'POST', enroll: true, headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: 'unnamed' }),              // record-first, name-LAST
       });
+      // A finalize REFUSAL (e.g. 409 preset_bound_open_encounter) leaves the session in
+      // state="recording" server-side, so /enroll/result would answer {state:"processing"}
+      // FOREVER — the client used to poll 300x500ms and then show a generic error. Fail
+      // FAST with the copy that already exists for this status.
+      if (!r.ok) { return enrollFailed(r.status, rerecordId); }
     } catch (e) { return enrollFailed(0, rerecordId); }
     // poll /result
     for (let i = 0; i < 300; i++) {
@@ -618,21 +706,23 @@ APP_JS = r"""'use strict';
   };
 
   function enrollVerdict(j, session, rerecordId) {
+    enrollSession = null;                     // the server cleared the bytes at finalize
     if (j.verdict !== 'ok' && j.verdict !== 'ok_marginal') {
       return enrollFailed(j.verdict, rerecordId);
     }
-    // PASSED -> name it LAST. Prefill the mic label + today's date (never a patient).
+    // PASSED -> name it LAST. Prefill the MIC LABEL + today's date (never a patient).
     const marginal = j.verdict === 'ok_marginal';
     const today = new Date().toISOString().slice(0, 10);
+    const prefill = (micLabel ? micLabel : 'Room mic') + ' ' + today;
     $('enroll-body').innerHTML =
       '<p><b>Voiceprint made.</b>' + (marginal ? ' (Quality is marginal but usable.)' : '') + '</p>' +
       '<p class="note">The audio is already deleted &mdash; only the numbers were kept.</p>' +
       '<label for="nm2">Name &mdash; name the place and mic, not a patient</label>' +
       '<input id="nm2" maxlength="64" autocomplete="off">' +
       '<button id="nm2-ok" class="primary">Save</button>';
-    $('nm2').value = 'Room mic ' + today;                       // prefill (mic + date)
+    $('nm2').value = prefill;                                   // prefill (mic label + date)
     $('nm2-ok').addEventListener('click', async () => {
-      const nm = $('nm2').value || ('Room mic ' + today);
+      const nm = $('nm2').value || prefill;
       const pid = j.preset_id;
       const q = '?user=' + encodeURIComponent(user) + '&preset=' + encodeURIComponent(pid);
       try {
@@ -647,9 +737,16 @@ APP_JS = r"""'use strict';
   }
 
   function enrollFailed(reason, rerecordId) {
-    const copy = VERDICT_COPY[reason] ||
+    // DROP THE BYTES NOW on every failure path. Otherwise a failed attempt leaves its RAM
+    // buffer resident until the 10-min TTL — and two of them exhaust the 2-session cap,
+    // 429-ing the very [Record again] this screen offers.
+    abandonEnroll();
+    const known = Object.prototype.hasOwnProperty.call(VERDICT_COPY, String(reason))
+      ? VERDICT_COPY[reason] : null;
+    const copy = known ||
       (reason === 503 ? 'Voice enrolment is not configured on this machine. Ask your operator.' :
        reason === 403 ? 'This clinician is not allowed to enrol. Ask your operator.' :
+       reason === 429 ? 'Too many voiceprint attempts at once. Wait a moment and try again.' :
        reason === 409 ? 'That voiceprint is in use by a recording, or was deleted. Try again later.' :
        reason === 404 ? 'Voice enrolment is not available on this machine.' :
        'Something went wrong. Please try again.');

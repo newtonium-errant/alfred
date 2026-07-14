@@ -569,3 +569,29 @@ async def test_mru_never_offers_an_unusable_preset(tmp_path):
                              headers=_h(_ENROLL, p)) as r:
                 body = await r.json()
     assert body["mru_preset_id"] is None            # not offered as the default
+
+
+@pytest.mark.asyncio
+async def test_mru_survives_a_corrupt_binding_preset_id(tmp_path):
+    # W1 — the narrower-guard class AGAIN: `pid in usable_ids` raises TypeError on an
+    # UNHASHABLE preset_id (a hand-edited / torn binding can carry a list or dict), which
+    # escaped the OSError-only guard and 500'd the presets route — taking down the list
+    # the whole UI depends on. The MRU is a CONVENIENCE: any problem means "no default".
+    import json as _json
+    async with _serve(_config(tmp_path)) as (base, cfg):
+        p = cfg.ingest_web.port
+        async with aiohttp.ClientSession() as s:
+            a = await _enroll_full(s, base, p, name="A")
+            enc = tmp_path / "inbox" / _LABEL
+            enc.mkdir(parents=True, exist_ok=True)
+            # an UNHASHABLE preset_id (list) in an otherwise well-formed binding
+            en.binding_path(enc).write_text(_json.dumps({
+                "schema_version": 1, "user": _USER, "preset_id": ["not", "a", "string"],
+                "centroid_version": 1, "centroid_digest": "x", "bound_at": "2026-07-14T00:00:00Z",
+            }), encoding="utf-8")
+            async with s.get(base + ew.PRESETS_LIST, params={"user": _USER},
+                             headers=_h(_ENROLL, p)) as r:
+                assert r.status == 200                 # NOT a 500
+                body = await r.json()
+    assert body["mru_preset_id"] is None               # no default, list still served
+    assert len(body["presets"]) == 1 and body["presets"][0]["preset_id"] == a["preset_id"]

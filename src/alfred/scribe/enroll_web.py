@@ -606,9 +606,14 @@ def _mru_preset_id(config: ScribeConfig, user: str, usable_ids: set[str]) -> str
                 continue
             pid, bound_at = b.get("preset_id"), str(b.get("bound_at") or "")
             # ISO-8601 UTC timestamps sort lexicographically == chronologically.
-            if pid in usable_ids and bound_at > best_at:
+            # ``isinstance(pid, str)`` FIRST: a hand-edited / torn binding can carry a
+            # LIST or DICT preset_id, and `unhashable in set()` raises TypeError — which
+            # would escape the OSError-only guard below and 500 the presets route. The
+            # too-narrow-guard class again: the guard must be as wide as the threat.
+            if isinstance(pid, str) and pid in usable_ids and bound_at > best_at:
                 best_id, best_at = pid, bound_at
-    except OSError:
+    except Exception:  # noqa: BLE001 — the MRU is a CONVENIENCE. Any problem simply means
+        # "no default"; it must never take down the presets list (which the whole UI needs).
         return None
     return best_id
 

@@ -33,6 +33,7 @@ below are local-only by construction (no api_key, no cloud endpoint).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -336,7 +337,7 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
 
     input_dir = scribe.get("input_dir") or _DEFAULT_INPUT_DIR
     clinicians_raw = scribe.get("clinicians") or []
-    clinicians = [str(c) for c in clinicians_raw] if isinstance(clinicians_raw, list) else []
+    clinicians = _validate_clinicians(clinicians_raw)
     return ScribeConfig(
         mode=_normalize_mode(scribe.get("mode")),
         input_dir=str(input_dir),
@@ -397,6 +398,47 @@ def _build_diarize(data: Any) -> ScribeDiarizeConfig:
             except (TypeError, ValueError):
                 pass  # keep the fail-closed-HIGH default; a nonsense value never crashes the load
     return cfg
+
+
+# The clinician identity shape. DUAL-USE (P4-5): a ``scribe.clinicians`` entry is BOTH the
+# attest identity AND the voice-enrolment identity — it becomes a DIRECTORY NAME under
+# enrollment_dir and is matched VERBATIM by /scribe/enroll/start. It is ALSO embedded into
+# the served PWA page. Kept in lockstep with ``enrollment.USER_RE`` (pinned in tests);
+# duplicated rather than imported to keep config.py free of a scribe-module dependency.
+_CLINICIAN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _validate_clinicians(raw: Any) -> list[str]:
+    """Coerce + VALIDATE ``scribe.clinicians`` against the slug shape — FAIL-CLOSED.
+
+    An entry that is not slug-shaped ("NP Jamie", a name with spaces/quotes) is DROPPED
+    with a loud, actionable error rather than being carried into three places where it is
+    load-bearing:
+      * enrolment — the server matches the slug VERBATIM, so a bad entry fail-closes every
+        /enroll/start with 403 *after* the clinician has already been asked to record;
+      * the filesystem — the slug is a directory name under ``enrollment_dir``;
+      * the PWA page — it is embedded into a ``data-`` attribute, so a quote-bearing entry
+        is an attribute-injection surface (operator-authored, loopback-only — but the
+        cheapest place to close it is here, where the memo already requires the shape).
+    Dropping (not raising) keeps a single bad line from bricking the daemon, and it is the
+    FAIL-CLOSED direction: a dropped identity can neither attest nor enrol."""
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for c in raw:
+        s = str(c)
+        if _CLINICIAN_RE.fullmatch(s):
+            out.append(s)
+        else:
+            log.error(
+                "scribe.config.invalid_clinician",
+                detail="a scribe.clinicians entry is not slug-shaped "
+                       "(^[a-z0-9][a-z0-9._-]{0,63}$) and was DROPPED — it can neither "
+                       "attest nor enrol. The id is DUAL-USE: it is also the voice-enrolment "
+                       "identity, a directory name, and is embedded in the loopback page. "
+                       "Use e.g. 'np_jamie', not 'NP Jamie'.",
+            )
+    return out
 
 
 def _coerce_secret(value: Any, *, field: str) -> str:

@@ -388,8 +388,16 @@ def test_pwa_only_free_text_inputs_are_token_and_voiceprint_name():
     # (b) the voiceprint NAME. Pin their identity + their safety properties, so a future
     # edit cannot quietly add a third (e.g. a patient field) without failing here.
     code = _code()
-    ids = set(re.findall(r"<input id=\"([a-z0-9_-]+)\"", code))
+    # COUNT every <input, not just the id-first ones: the old regex required `<input id="`,
+    # so `<input type="text" id="patient">` would have been INVISIBLE to it.
+    assert code.count("<input") == 3, "a new <input> appeared in the client"
+    ids = set(re.findall(r"<input[^>]*\bid=\"([a-z0-9_-]+)\"", code))
     assert ids == {"tok", "nm", "nm2"}, f"unexpected free-text input(s): {ids}"
+    # no OTHER text-capturing control may be injected by the JS either (the served-HTML
+    # scan cannot see these — they are built at runtime).
+    for banned in ("<textarea", "contenteditable"):
+        assert banned not in code, f"JS-injected text control: {banned}"
+        assert banned not in render_index(_TOKEN).lower()
     # the token field is a password box, never autofilled, and never persisted.
     assert re.search(r"<input id=\"tok\" type=\"password\" autocomplete=\"off\"", code)
     # the NAME fields carry the memo's guidance + the backend's 64-char cap.
@@ -439,8 +447,11 @@ def test_pwa_preset_fit_forward_tolerates_unknown_values():
     code = _code()
     for v in ("unarmed", "ok", "warming", "weak", "none"):
         assert v in code
-    # an UNRECOGNISED value must fall back, never throw / render undefined.
-    assert re.search(r"known\[fit\] \|\| known\.unarmed", code)
+    # an UNRECOGNISED value must fall back, never throw / render undefined — and the
+    # lookup must be hasOwnProperty, not `CHIP_COPY[fit] ||` (which would resolve a
+    # PROTOTYPE key like "constructor" and render a function body into the chip).
+    assert "hasOwnProperty.call(CHIP_COPY, fit)" in code
+    assert "CHIP_COPY[fit] ||" not in code
 
 
 def test_pwa_does_not_hardcode_webm_and_maps_ios_mp4_to_m4a():
@@ -464,7 +475,11 @@ def test_pwa_presets_routes_carry_required_user_param():
     # user-keyed). Without it every call 400s — the divergence the API doc flags.
     code = _code()
     assert "'/scribe/presets?user=' + encodeURIComponent(user)" in code
-    assert code.count("'?user=' + encodeURIComponent(user) + '&preset='") >= 1
+    # EXACT count, not >=1: with `>=1` a mutant could drop ?user from ONE of the call
+    # sites and still pass on the strength of the others (mutation-proven). There are
+    # exactly three user-keyed preset routes: rename (presets view), delete, rename
+    # (post-verdict naming).
+    assert code.count("'?user=' + encodeURIComponent(user) + '&preset='") == 3
 
 
 def test_pwa_enroll_chunks_always_carry_seq():
@@ -512,13 +527,19 @@ def _urls(res, needle):
     return [c["url"] for c in res["calls"] if needle in c["url"]]
 
 
-pytestmark_node = pytest.mark.skipif(
-    _NODE is None, reason="node not installed (behavioural PWA harness); the structural "
-                          "contract pins above run unconditionally",
-)
+def test_node_is_available_for_the_behavioural_layer():
+    # UNCONDITIONAL (feedback_regression_pin_unconditional): the behavioural tests below
+    # are the ONLY thing that binds what the client actually DOES. If they were skip-gated
+    # on node, a node-less merge gate would silently drop the entire layer and the suite
+    # would still go green. Fail LOUD instead — a missing node is a broken gate, not a
+    # reason to stop checking.
+    assert _NODE is not None, (
+        "node is required for the PWA behavioural harness (tests/pwa_enroll_harness.mjs). "
+        "Install node, or the client's real behaviour is untested."
+    )
+    assert _HARNESS.is_file()
 
 
-@pytestmark_node
 def test_behaviour_binds_preset_before_the_first_chunk(tmp_path):
     # THE ordering invariant: the server LOCKS the binding at the first chunk, so a bind
     # that lands after chunk 1 is a 409 and the note's diarize_provenance is permanently
@@ -530,7 +551,6 @@ def test_behaviour_binds_preset_before_the_first_chunk(tmp_path):
     assert bind < chunk, f"bind must precede the first chunk, got {order}"
 
 
-@pytestmark_node
 def test_behaviour_no_preset_never_binds_and_still_records(tmp_path):
     # "No preset — attribution off" is a FIRST-CLASS choice: no binding call at all, and
     # the encounter still records normally.
@@ -539,7 +559,6 @@ def test_behaviour_no_preset_never_binds_and_still_records(tmp_path):
     assert _urls(res, "/scribe/ingest-chunk")          # chunks still flow
 
 
-@pytestmark_node
 def test_behaviour_bind_failure_never_blocks_the_encounter(tmp_path):
     # A 409/failed binding must NEVER block Start — the encounter simply runs un-anchored
     # (audio is never lost to a preset problem).
@@ -548,7 +567,6 @@ def test_behaviour_bind_failure_never_blocks_the_encounter(tmp_path):
     assert _urls(res, "/scribe/ingest-chunk")          # ...and recorded anyway
 
 
-@pytestmark_node
 def test_behaviour_iphone_container_maps_to_an_allowlisted_ext(tmp_path):
     # iOS supports ONLY audio/mp4 → the chunk must go out as ext=m4a (on the allowlist),
     # never ext=mp4 (which the ingest route rejects with unsupported_ext).
@@ -558,14 +576,12 @@ def test_behaviour_iphone_container_maps_to_an_allowlisted_ext(tmp_path):
     assert not any("ext=mp4" in u for u in chunks)
 
 
-@pytestmark_node
 def test_behaviour_unknown_preset_fit_does_not_break_the_chip(tmp_path):
     # 5b will emit warming/weak/none. A 5a client must render something sane, not crash.
     res = _drive("record_unknown_preset_fit_tolerated", tmp_path)
     assert res["chip"] and "undefined" not in res["chip"].lower()
 
 
-@pytestmark_node
 def test_behaviour_enroll_flow_wire_contract(tmp_path):
     # The whole enrolment wire, end to end: start → chunks(seq) → finalize → poll →
     # name-last rename. Token CLASS per route is the security half.
@@ -585,8 +601,119 @@ def test_behaviour_enroll_flow_wire_contract(tmp_path):
     # chunks are seq-numbered 1..N (idempotent retry)
     seqs = [u.split("seq=")[1] for u in _urls(res, "/scribe/enroll/chunk")]
     assert seqs == ["1", "2"], seqs
-    # the name is prefilled with the mic label + date (never a patient)
-    assert res["namePrefill"].startswith("Room mic ")
+    # the rename lands on the WIRE with ?user (the store is user-keyed; without it the
+    # server 400s and the voiceprint silently keeps its placeholder name).
+    rename = _urls(res, "/scribe/presets/rename")
+    assert rename and all("user=np_jamie" in u for u in rename), rename
+    # the name is prefilled with the MIC LABEL + date (memo: "name the place and mic"),
+    # never a patient. The harness's mic reports "Built-in Mic".
+    assert "Built-in Mic" in res["namePrefill"]
+    assert re.search(r"\d{4}-\d{2}-\d{2}", res["namePrefill"])
+
+
+# ── B1: the record view NEVER goes silent about attribution ─────────────────
+
+@pytest.mark.parametrize("scenario", ["registry_empty", "registry_all_revoked",
+                                      "registry_all_corrupt", "registry_all_stale"])
+def test_behaviour_every_unusable_registry_state_shows_a_banner(scenario, tmp_path):
+    # INTENTIONALLY-LEFT-BLANK. The original code only banner-ed the engine-INCOMPATIBLE
+    # cause, so an all-REVOKED or all-CORRUPT registry fell through to an EMPTY message:
+    # the WORST state emitted LESS signal than the empty one, and the clinician recorded
+    # with no indication attribution was off. Every unusable state must speak.
+    res = _drive(scenario, tmp_path)
+    assert "banner" in res["presetMsg"], f"{scenario} rendered NO signal: {res['presetMsg']!r}"
+    assert res["startDisabled"] is False          # ...and Start is NEVER blocked
+
+
+# ── B2: a finalize refusal fails FAST (no 150-second poll to a generic error) ─
+
+def test_behaviour_finalize_409_fails_fast_with_the_right_copy(tmp_path):
+    # The server answers 409 and leaves the session "recording", so /enroll/result would
+    # say {state:"processing"} FOREVER. The client used to poll 300x500ms and then show a
+    # generic error. It must fail immediately, with the copy that already exists for 409.
+    res = _drive("enroll_finalize_409", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/finalize" in paths
+    assert "/scribe/enroll/result" not in paths           # NO polling a doomed session
+    assert "in use by a recording" in res["enrollBody"]   # the specific 409 copy
+    assert "/scribe/enroll/abandon" in paths              # ...and the RAM bytes are dropped
+
+
+# ── picker / MRU (the layer B3's broken harness never exercised) ─────────────
+
+def test_behaviour_mru_is_preselected(tmp_path):
+    res = _drive("mru_preselected", tmp_path)
+    assert res["pickerValue"] == "pst-b"                  # the server's MRU, not the first
+    assert res["pickerHtml"].count("<option") == 3        # no-preset + 2 usable
+
+
+def test_behaviour_unusable_server_mru_is_defended(tmp_path):
+    # Even if the server wrongly offers an unusable preset as the MRU, the client must not
+    # select it — it cannot attribute, and Jamie would never know.
+    res = _drive("mru_points_at_unusable", tmp_path)
+    assert res["pickerValue"] == ""                       # falls back to "no preset"
+
+
+def test_behaviour_picker_offers_only_usable_presets(tmp_path):
+    # M5: revoked / corrupt / engine-incompatible presets must NEVER be selectable.
+    res = _drive("picker_excludes_unusable", tmp_path)
+    assert res["pickerHtml"].count("<option") == 2        # no-preset + the ONE usable
+    assert "pst-a" in res["pickerHtml"]
+    for bad in ("pst-r", "pst-c", "pst-e"):
+        assert bad not in res["pickerHtml"], f"unusable preset {bad} was offered"
+
+
+def test_behaviour_picker_is_locked_while_recording(tmp_path):
+    # M4: mid-encounter the preset (and clinician) must not change — the binding is
+    # already locked server-side, so an editable picker would only mislead.
+    res = _drive("picker_locked_while_recording", tmp_path)
+    assert res["pickerDisabled"] is True
+    assert res["whoDisabled"] is True
+
+
+def test_behaviour_prototype_preset_fit_does_not_leak_a_function(tmp_path):
+    # `CHIP_COPY[fit] ||` would resolve "constructor" off the PROTOTYPE and render a
+    # function body into the chip. hasOwnProperty closes it.
+    res = _drive("record_prototype_preset_fit_tolerated", tmp_path)
+    assert "function" not in res["chip"].lower()
+    assert res["chip"] == "attribution: unarmed"
+
+
+# ── W2: enrolment and encounter recording are MUTUALLY EXCLUSIVE ────────────
+
+def test_behaviour_cannot_enroll_while_an_encounter_is_recording(tmp_path):
+    # The enrolment buffer would capture LIVE PATIENT SPEECH — on a surface whose entire
+    # consent basis is "the enrolling clinician's own voice".
+    res = _drive("enroll_blocked_during_encounter", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" not in paths           # refused BEFORE any session
+    assert "encounter is recording" in res["enrollBody"]
+
+
+def test_behaviour_cannot_start_an_encounter_while_enrolling(tmp_path):
+    res = _drive("encounter_blocked_during_enroll", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/ingest-chunk" not in paths           # the encounter never starts
+    assert "voiceprint recording first" in res["status"]
+
+
+# ── RAM custody: /enroll/abandon is actually WIRED ──────────────────────────
+
+def test_behaviour_cancel_abandons_the_session_now(tmp_path):
+    # RAM-only custody is the security centrepiece; "drop the bytes NOW" must not be a
+    # route nobody calls (the bytes would otherwise sit until the 10-minute TTL, and two
+    # abandoned attempts would 429 the next one against the 2-session cap).
+    res = _drive("enroll_cancel_abandons", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/abandon" in paths
+
+
+def test_behaviour_bind_route_uses_the_INGEST_token(tmp_path):
+    # M8 — the security half. The binding is an ENCOUNTER-class capability. Sending the
+    # ENROLL token here is a 401 wrong_token_class and attribution SILENTLY never arms.
+    res = _drive("record_binds_before_first_chunk", tmp_path)
+    binds = [c for c in res["calls"] if c["url"].startswith("/scribe/encounter/preset")]
+    assert binds and all(c["token"] == "INGEST_TOK" for c in binds), binds
 
 
 # ---------------------------------------------------------------------------
@@ -634,3 +761,38 @@ def test_b2_real_speech_decode_nonempty_transcript(tmp_path, monkeypatch):
     assert ledger is not None and ledger.segments
     text = " ".join(seg.text for seg in ledger.segments).strip()
     assert text, "B2: real decode must yield NON-EMPTY transcript text"
+
+
+# ---------------------------------------------------------------------------
+# clinicians: DUAL-USE identity — validated at config load (fail-closed)
+# ---------------------------------------------------------------------------
+
+def test_non_slug_clinician_is_dropped_loudly():
+    # The id is the attest identity AND the enrolment identity AND a directory name AND
+    # is embedded in the served page. "NP Jamie" would attest fine but fail-close EVERY
+    # enrolment with 403 — after the clinician had already been asked to record.
+    import structlog
+
+    from alfred.scribe.config import load_from_unified
+    with structlog.testing.capture_logs() as cap:
+        cfg = load_from_unified({"scribe": {
+            "encounter_salt": _SALT, "stt": {"provider": "fake"},
+            "clinicians": ["np_jamie", "NP Jamie", 'bad"quote', "dr_x"],
+        }})
+    assert cfg.clinicians == ["np_jamie", "dr_x"]          # invalid entries DROPPED
+    errs = [c for c in cap if c.get("event") == "scribe.config.invalid_clinician"]
+    assert len(errs) == 2                                   # ...loudly, one per entry
+
+
+def test_clinician_regex_is_lockstep_with_the_enrolment_identity():
+    from alfred.scribe.config import _CLINICIAN_RE
+    from alfred.scribe.enrollment import USER_RE
+    assert _CLINICIAN_RE.pattern == USER_RE.pattern
+
+
+def test_page_cannot_be_broken_out_of_by_a_clinician_slug():
+    # Defence in depth: even if a quote-bearing entry reached render_index, the JSON is
+    # HTML-attribute escaped (quote=True), so it cannot break out of data-clinicians.
+    html = render_index(_TOKEN, ['bad"quote'])
+    assert 'bad"quote' not in html                          # the raw quote never appears
+    assert "&quot;" in html
