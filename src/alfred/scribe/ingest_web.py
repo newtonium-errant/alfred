@@ -506,7 +506,23 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
     # monotonic write-once: a 2nd /close can never LOWER the completeness bar.
     existing_efs = None
     if sentinel.exists():
-        existing_efs, _amb = read_close_manifest(sentinel, require=require)
+        # ``require=False`` DELIBERATELY (not the caller's ``require``): here we only need
+        # to know whether the EXISTING sentinel is PRESENT-but-CORRUPT. With require=False,
+        # ``ambiguous`` is True ONLY for corrupt content — an EMPTY legacy sentinel returns
+        # False, and UPGRADING an empty legacy close to a real manifest is exactly right
+        # (refusing that would wedge the encounter). ``existing_efs`` is unaffected by the
+        # flag: a valid manifest yields its final_seq under either value.
+        existing_efs, existing_corrupt = read_close_manifest(sentinel, require=False)
+        if existing_corrupt:
+            # We CANNOT read the bar the existing sentinel promised, so we cannot prove
+            # this /close does not LOWER it. Previously the ambiguity flag was DISCARDED,
+            # so a corrupt sentinel yielded existing_efs=None, the monotonic guard below
+            # was skipped, and a 2nd /close with a LOWER final_seq silently RESET the
+            # completeness bar — defeating "a 2nd /close can never LOWER the bar" on a
+            # medico-legal surface. REFUSE instead; the operator must resolve it.
+            log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE,
+                        reason="close_manifest_corrupt", encounter_id=encounter_id)
+            return _reject("close_manifest_corrupt", 409)
     if existing_efs is not None and final_seq < existing_efs:
         log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE,
                     reason="final_seq_lowered", encounter_id=encounter_id)

@@ -71,12 +71,20 @@ def read_close_manifest(path: Path, *, require: bool) -> tuple[int | None, bool]
     (``ambiguous=True``) regardless of ``require``."""
     try:
         content = Path(path).read_text(encoding="utf-8")
-    except Exception:  # noqa: BLE001 — SAME CLASS: a torn sentinel yields invalid UTF-8
-        # (UnicodeDecodeError, a ValueError, not an OSError). Unreadable => treat as empty
-        # (ambiguous under strict => fail-closed, never READY), never raise into the sweep.
-        # sentinel vanished between the exists() check and the read — treat like
-        # empty (ambiguous under strict, legacy-tolerant otherwise).
+    except OSError:
+        # ABSENT — the sentinel VANISHED between the exists() check and the read (or a bad
+        # inode). There is no promise to honour: treat like an EMPTY close (legacy-tolerant
+        # unless ``require``).
         return (None, require)
+    except Exception:  # noqa: BLE001 — PRESENT but CORRUPT. A TORN write yields invalid
+        # UTF-8 → UnicodeDecodeError (a ValueError, NOT an OSError). A torn sentinel IS a
+        # CORRUPT PROMISE, so it is FAIL-CLOSED **ALWAYS** (ambiguous=True) — exactly like
+        # the malformed-JSON branch below, and regardless of ``require``.
+        # ⚠ Conflating this with ABSENT (returning ``require``) let a torn sentinel read as
+        # a legacy empty close in non-strict mode → the encounter FINALIZED READY on a
+        # promise nobody could verify. The medico-legal invariant ("ready ⇒ complete") held
+        # only COINCIDENTALLY, because clinical mode happens to set require=True.
+        return (None, True)
     stripped = content.strip()
     if not stripped:
         return (None, require)                 # legacy empty close

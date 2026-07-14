@@ -200,6 +200,106 @@ def test_torn_chunk_meta_sidecar_does_not_block_the_encounter(tmp_path):
     assert r.refused == 1 and r.folded == 0
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# N1/N2 — ABSENT vs CORRUPT on the close-manifest (the medico-legal promise)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_torn_close_sentinel_is_corrupt_not_absent(tmp_path):
+    # N1: a TORN (invalid-UTF-8) _CLOSED is a CORRUPT PROMISE → fail-closed ALWAYS
+    # (ambiguous=True) regardless of `require`, exactly like malformed JSON. Conflating it
+    # with ABSENT let it read as a legacy empty close in non-strict mode and FINALIZE READY.
+    from alfred.scribe.close_manifest import read_close_manifest
+    sentinel = tmp_path / "_CLOSED"
+    sentinel.write_bytes(b"\xff\xfe torn sentinel \x80")
+    assert read_close_manifest(sentinel, require=False) == (None, True)   # ← was (None, False)
+    assert read_close_manifest(sentinel, require=True) == (None, True)
+
+
+def test_absent_close_sentinel_stays_legacy_tolerant(tmp_path):
+    # The ABSENT case must be UNCHANGED: a vanished sentinel has no promise to honour.
+    from alfred.scribe.close_manifest import read_close_manifest
+    gone = tmp_path / "_CLOSED"                       # never created → OSError on read
+    assert read_close_manifest(gone, require=False) == (None, False)
+    assert read_close_manifest(gone, require=True) == (None, True)
+
+
+def test_empty_legacy_sentinel_still_upgradable(tmp_path):
+    # An EMPTY sentinel is not corrupt — it must stay legacy-tolerant (and remain
+    # upgradable by a later /close), else the encounter wedges.
+    from alfred.scribe.close_manifest import read_close_manifest
+    sentinel = tmp_path / "_CLOSED"
+    sentinel.write_text("", encoding="utf-8")
+    assert read_close_manifest(sentinel, require=False) == (None, False)
+
+
+def test_torn_close_sentinel_never_finalizes_ready(tmp_path):
+    # The end-to-end invariant: a corrupt promise can NEVER reach READY, even in the
+    # non-strict (legacy) mode where the conflation used to let it through.
+    from alfred.scribe.close_manifest import CLOSE_SENTINEL_NAME
+    cfg = _cfg(tmp_path)                              # require_close_manifest defaults False
+    enc = tmp_path / "inbox" / "enc-torn"
+    enc.mkdir(parents=True, exist_ok=True)
+    (enc / "chunk_001.wav").write_bytes(b"audio-1")
+    (enc / "chunk_001.txt").write_text("[PT] Chest pain.\n", encoding="utf-8")
+    (enc / "chunk_001.meta.json").write_text(json.dumps({"synthetic": True, "seq": 1}),
+                                             encoding="utf-8")
+    (enc / CLOSE_SENTINEL_NAME).write_bytes(b"\xff\xfe torn")
+
+    r = accumulate_encounter(enc, config=cfg)
+    assert r.closed is True
+    assert r.close_ambiguous is True                  # fail-closed → the gate blocks READY
+
+
+def test_close_manifest_corrupt_cannot_lower_the_monotonic_bar(tmp_path):
+    # N2: the ambiguity flag was DISCARDED, so a corrupt existing sentinel yielded
+    # existing_efs=None, the monotonic guard was skipped, and a 2nd /close with a LOWER
+    # final_seq silently RESET the completeness bar. It must now REFUSE.
+    import asyncio as _asyncio
+    import socket as _socket
+
+    import aiohttp as _aiohttp
+
+    from alfred.scribe.close_manifest import CLOSE_SENTINEL_NAME
+    from alfred.scribe.config import (
+        ScribeIngestWebConfig, ScribeLlmConfig, ScribeSttConfig,
+    )
+    from alfred.scribe.config import ScribeConfig as _SC
+    from alfred.scribe.ingest_web import CLOSE_ROUTE, IngestWebServer
+
+    s = _socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    label = "enc-1720000000000-0123456789abcdef"
+    cfg = _SC(
+        mode="synthetic", input_dir=str(tmp_path / "inbox"),
+        stt=ScribeSttConfig(provider="fake"),
+        llm=ScribeLlmConfig(base_url="http://127.0.0.1:11434", model="m"),
+        ingest_web=ScribeIngestWebConfig(enabled=True, host="127.0.0.1", port=port,
+                                         token="DUMMY_INGEST_TOKEN_0001"),
+        encounter_salt=_SALT,
+    )
+    enc = tmp_path / "inbox" / label
+    enc.mkdir(parents=True, exist_ok=True)
+    (enc / CLOSE_SENTINEL_NAME).write_bytes(b"\xff\xfe torn promise")   # corrupt existing bar
+
+    async def _go():
+        server = IngestWebServer(cfg)
+        await server.start()
+        try:
+            base = f"http://127.0.0.1:{port}"
+            h = {"Authorization": "Bearer DUMMY_INGEST_TOKEN_0001",
+                 "Host": f"127.0.0.1:{port}"}
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.post(base + CLOSE_ROUTE,
+                                     params={"label": label, "final_seq": "1"},
+                                     headers=h) as r:
+                    return r.status
+        finally:
+            await server.stop()
+
+    assert _asyncio.run(_go()) == 409                  # close_manifest_corrupt — bar NOT reset
+    # the corrupt sentinel was NOT overwritten with a lower bar
+    assert (enc / CLOSE_SENTINEL_NAME).read_bytes() == b"\xff\xfe torn promise"
+
+
 def test_corrupt_preset_listing_does_not_raise(tmp_path):
     # list_user_presets (presets CLI + GET /scribe/presets) must classify, not 500.
     cfg = _cfg(tmp_path)
