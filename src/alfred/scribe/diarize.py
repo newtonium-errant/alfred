@@ -142,6 +142,18 @@ class DiarizeError(Exception):
     """Diarization failed — unknown provider, unreadable input, engine failure."""
 
 
+class AudioDecodeError(DiarizeError):
+    """The audio could not be DECODED to a waveform (codec/container/backend failure).
+
+    A ``DiarizeError`` subclass, so the pipeline's broad fail-open catch still degrades
+    to speaker=None (does NOT hold the encounter). It is a DISTINCT, greppable signal
+    from a model/pipeline failure — decode failures and engine failures have different
+    fixes (codec/ffmpeg vs model/config), and this is the exact ambiguity that HID the
+    original bug: pyannote's default path-loader (soundfile/libsndfile) cannot decode the
+    webm/opus + mp4/AAC that real devices produce, so every real clip fail-opened
+    indistinguishably. See :func:`_decode_audio`."""
+
+
 class MissingDiarizeDependency(Exception):
     """The ``pyannote`` engine is configured but pyannote.audio isn't installed.
 
@@ -159,6 +171,21 @@ def _pyannote_available() -> bool:
     probe returns a clean ``False`` (never propagates)."""
     try:
         return importlib.util.find_spec("pyannote.audio") is not None
+    except ImportError:
+        return False
+
+
+def _torchaudio_available() -> bool:
+    """True iff torchaudio is importable (the ``[scribe-diarize]`` extra).
+
+    torchaudio is a SEPARATE hard runtime requirement of the real engine: the decode
+    path (:func:`_decode_audio`) uses it directly to read the webm/mp4 containers
+    pyannote's default loader cannot. pyannote.audio pulls it transitively, so in a
+    correct extra install this tracks ``_pyannote_available``; the explicit probe lets
+    the boot gate fail LOUD (exit 78) on a partial install rather than fail-open on every
+    chunk."""
+    try:
+        return importlib.util.find_spec("torchaudio") is not None
     except ImportError:
         return False
 
@@ -192,6 +219,15 @@ def ensure_diarize_backend_available(config: ScribeConfig) -> None:
             f"which is not installed. Install the [scribe-diarize] extra into the "
             f"STAY-C venv (torch from the CPU wheel index). The 'off'/'fake' "
             f"providers — and a disabled pyannote (enabled:false) — need no dependency."
+        )
+    if not _torchaudio_available():
+        # torchaudio decodes the webm/mp4 the PWA + iPhone produce (pyannote's default
+        # path-loader cannot). It ships with the same extra, so a missing torchaudio is a
+        # PARTIAL install — fail LOUD at boot rather than fail-open on every real clip.
+        raise MissingDiarizeDependency(
+            f"scribe diarize provider {provider!r} (enabled) needs torchaudio to decode "
+            f"the webm/mp4 audio containers, which is not installed. Install the "
+            f"[scribe-diarize] extra into the STAY-C venv."
         )
     pipeline_config = (config.diarize.pipeline_config or "").strip()
     if not pipeline_config or not Path(pipeline_config).is_file():
@@ -766,6 +802,67 @@ def _load_pipeline_cached(cfg_path: Path):
         return pipeline
 
 
+def _to_mono(waveform: Any) -> Any:
+    """Downmix a ``(channels, time)`` waveform to MONO ``(1, time)``.
+
+    PURE tensor reshape — NO I/O, NO torchaudio import — so the channel-handling branch (a
+    STEREO device clip is the case a mono test clip would silently skip) is unit-testable
+    torch-free. pyannote's default path-loader applies ``mono='downmix'`` before the
+    segmentation model, so an in-memory waveform must be downmixed the same way; the model
+    wants mono, and downmixing an already-mono ``(1, time)`` is a no-op. ``torchaudio.load``
+    always returns 2-D ``(channels, time)`` — a non-2-D or zero-channel tensor is a decode
+    corruption and fails as :class:`AudioDecodeError` (fail-open upstream)."""
+    ndim = getattr(waveform, "ndim", None)
+    if ndim != 2:
+        raise AudioDecodeError(
+            f"decoded waveform has ndim={ndim!r}, expected 2 (channels, time)."
+        )
+    channels = waveform.shape[0]
+    if channels < 1:
+        raise AudioDecodeError("decoded waveform has zero channels.")
+    if channels > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)   # (C, T) -> (1, T)
+    return waveform
+
+
+def _decode_audio(audio_path: str | Path) -> tuple[Any, int]:
+    """Decode ``audio_path`` → ``(mono_waveform (1, time), sample_rate)`` via torchaudio's
+    ffmpeg backend — the real load path for the webm/opus + mp4/AAC that devices produce.
+
+    WHY NOT the path: ``pipeline(path)`` reads through ``pyannote.audio.Audio`` →
+    soundfile/libsndfile, which cannot decode webm/opus OR mp4/AAC — the exact formats the
+    PWA (webm) and iPhone (mp4) emit → ``LibsndfileError`` on every real clip → the pipeline
+    fail-opens (speaker=None) and attribution is silently ZERO on all production audio. The
+    WAV-only IT test never saw it. torchaudio's ffmpeg backend (av + ffmpeg on-box) decodes
+    both; pyannote resamples internally from ``sample_rate`` (passthrough), so we hand it an
+    in-memory waveform dict.
+
+    torch/torchaudio are lazy-imported HERE — inside the torch seam, never at module import
+    — so torch-free CI stays torch-free. Any decode failure raises
+    :class:`AudioDecodeError` (a ``DiarizeError`` → the pipeline's broad fail-open catch
+    degrades to speaker=None + the loud ``scribe.diarize.failed`` log; it does NOT hold the
+    encounter) — a DISTINCT signal from a model failure, the ambiguity that hid this bug.
+    NOTE-3: this changes only how the ENGINE READS audio; the STT transcript/segments and
+    the diarization annotation the pipeline emits are unchanged, so the downstream
+    alignment/purity math (``_apply_diarization``) is byte-identical."""
+    try:
+        import torchaudio
+    except ImportError as e:  # pragma: no cover — guarded by ensure_diarize_backend_available
+        raise MissingDiarizeDependency(
+            "torchaudio is not installed — install the [scribe-diarize] extra into the "
+            "STAY-C venv (it decodes the webm/mp4 containers pyannote's default loader "
+            "cannot)."
+        ) from e
+    try:
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+    except Exception as e:  # noqa: BLE001 — ANY decode failure → AudioDecodeError → fail-open
+        raise AudioDecodeError(
+            f"torchaudio could not decode the audio ({type(e).__name__}) — "
+            f"unsupported/corrupt container or a missing ffmpeg backend."
+        ) from e
+    return _to_mono(waveform), int(sample_rate)
+
+
 def _run_pyannote_pipeline(config: ScribeConfig, audio_path: str | Path) -> list[Turn]:
     """Load the OFFLINE pyannote pipeline (cached) + diarize ``audio_path`` → turns.
 
@@ -795,7 +892,13 @@ def _run_pyannote_pipeline(config: ScribeConfig, audio_path: str | Path) -> list
         )
     _validate_materialized_config_local(cfg_path)   # pre-import offline validation (A3)
     pipeline = _load_pipeline_cached(cfg_path)       # cached load (A2)
-    diarization = pipeline(str(audio_path))
+    # Decode via torchaudio (ffmpeg backend) and hand pyannote an IN-MEMORY waveform dict
+    # — NOT the path. pipeline(path) reads through pyannote.audio.Audio → soundfile /
+    # libsndfile, which CANNOT decode the webm/opus (PWA) or mp4/AAC (iPhone) that real
+    # devices produce → a libsndfile error on every real clip → the whole feature
+    # fail-opens to zero attribution, silently. See _decode_audio.
+    waveform, sample_rate = _decode_audio(audio_path)
+    diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate})
     return _turns_from_annotation(diarization)
 
 

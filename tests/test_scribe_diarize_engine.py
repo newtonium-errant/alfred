@@ -19,7 +19,10 @@ speaker_conf survive ledger reload → fold → P4-2 speaker pass composes).
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -28,6 +31,7 @@ import alfred.scribe.diarize as diarize_mod
 import alfred.scripts.stage_diarize_models as stage_mod
 from alfred.scribe.config import load_from_unified
 from alfred.scribe.diarize import (
+    AudioDecodeError,
     DiarizeError,
     MissingDiarizeDependency,
     assign_speakers,
@@ -403,6 +407,181 @@ def test_diarized_conf_survives_ledger_roundtrip_and_speaker_pass_composes(tmp_p
 
 
 # ---------------------------------------------------------------------------
+# Audio DECODE — torchaudio (ffmpeg) → mono waveform dict (P4-4 activation fix)
+#
+# THE BUG this closes: pyannote's default path-loader (soundfile/libsndfile) cannot decode
+# webm/opus (PWA) or mp4/AAC (iPhone) — the ONLY formats real devices produce — so every
+# real clip fail-opened to ZERO attribution, invisibly (the IT test fed a WAV). We now
+# decode via torchaudio and hand pyannote an in-memory waveform dict. torchaudio is
+# torch-heavy + absent from base CI, so the DECODE ITSELF is proven on-box (the updated IT
+# test + the torchaudio-gated test below); these torch-free tests pin the SHAPE / dispatch
+# / fail-open logic — the non-trivial half the WAV IT test never exercised.
+# ---------------------------------------------------------------------------
+
+class _FakeWave:
+    """Torch-free stand-in for a torchaudio waveform: ``(channels, time)`` with a
+    ``.mean(dim, keepdim)`` that returns a mono ``_FakeWave``. Records whether ``mean()``
+    ran, so a test can prove downmix happened (or didn't) without torch."""
+
+    def __init__(self, channels, samples, *, meaned=False):
+        self._shape = (channels, samples)
+        self.meaned = meaned
+
+    @property
+    def ndim(self):
+        return len(self._shape)
+
+    @property
+    def shape(self):
+        return self._shape
+
+    def mean(self, dim, keepdim):
+        assert dim == 0 and keepdim is True, (dim, keepdim)   # the EXACT downmix call
+        return _FakeWave(1, self._shape[1], meaned=True)
+
+
+def test_to_mono_passes_a_mono_waveform_through_untouched():
+    w = _FakeWave(1, 16000)
+    out = diarize_mod._to_mono(w)
+    assert out is w                          # no mean() on an already-mono signal
+    assert out.shape == (1, 16000)
+
+
+def test_to_mono_downmixes_a_stereo_waveform():
+    # THE channel-handling branch a MONO test clip would silently skip: (2, T) -> (1, T)
+    # via mean(dim=0, keepdim=True). A stereo device clip must not reach pyannote as 2ch.
+    out = diarize_mod._to_mono(_FakeWave(2, 16000))
+    assert out.shape == (1, 16000) and out.meaned is True
+
+
+def test_to_mono_rejects_zero_channels():
+    with pytest.raises(AudioDecodeError):
+        diarize_mod._to_mono(_FakeWave(0, 16000))
+
+
+def test_to_mono_rejects_non_2d():
+    class _OneD:
+        ndim = 1
+        shape = (16000,)
+    with pytest.raises(AudioDecodeError):
+        diarize_mod._to_mono(_OneD())
+
+
+def test_decode_audio_downmixes_and_passes_sample_rate_through(monkeypatch):
+    # _decode_audio with a FAKE torchaudio: a (2, T) load @ 48k -> mono (1, T), sr passed
+    # through UNCHANGED (pyannote resamples internally; we do not).
+    import types
+    fake = types.ModuleType("torchaudio")
+    fake.load = lambda path: (_FakeWave(2, 24000), 48000)
+    monkeypatch.setitem(sys.modules, "torchaudio", fake)
+    wave, sr = diarize_mod._decode_audio("/x/clip.webm")
+    assert wave.shape == (1, 24000) and wave.meaned is True
+    assert sr == 48000 and isinstance(sr, int)
+
+
+def test_decode_audio_wraps_a_decode_failure_as_audio_decode_error(monkeypatch):
+    # A torchaudio decode failure (corrupt/unsupported container) -> AudioDecodeError, which
+    # IS a DiarizeError IS an Exception, so the pipeline's broad fail-open catch still
+    # degrades to speaker=None. The original error is chained (__cause__) for triage.
+    import types
+    boom = RuntimeError("ffmpeg: could not demux")
+    fake = types.ModuleType("torchaudio")
+
+    def _raise(path):
+        raise boom
+
+    fake.load = _raise
+    monkeypatch.setitem(sys.modules, "torchaudio", fake)
+    with pytest.raises(AudioDecodeError) as ei:
+        diarize_mod._decode_audio("/x/clip.mp4")
+    assert ei.value.__cause__ is boom
+    assert isinstance(ei.value, DiarizeError)          # -> upstream fail-open catches it
+
+
+def test_decode_audio_missing_torchaudio_is_a_missing_dependency(monkeypatch):
+    # torchaudio absent -> MissingDiarizeDependency (daemon exit-78 class), never a silent
+    # fall-through. Forced deterministically (sys.modules[x]=None makes `import x` raise).
+    monkeypatch.setitem(sys.modules, "torchaudio", None)
+    with pytest.raises(MissingDiarizeDependency):
+        diarize_mod._decode_audio("/x/clip.webm")
+
+
+def test_run_pyannote_pipeline_hands_a_waveform_dict_not_the_path(monkeypatch, tmp_path):
+    # THE REGRESSION PIN for this bug. The engine must receive an IN-MEMORY waveform dict,
+    # NEVER the raw path — pipeline(path) routes through libsndfile, which cannot decode
+    # webm/mp4. A mutant reverting to `pipeline(str(audio_path))` makes captured['arg'] the
+    # path string and fails here.
+    cfg_file = tmp_path / "materialized.yaml"
+    cfg_file.write_text("pipeline: {params: {}}\n", encoding="utf-8")
+    monkeypatch.setattr(diarize_mod, "_validate_materialized_config_local", lambda p: None)
+    monkeypatch.setattr(diarize_mod, "_decode_audio", lambda p: ("WAVE", 48000))
+    captured = {}
+
+    class _FakePipeline:
+        def __call__(self, arg):
+            captured["arg"] = arg
+            return "ANNOTATION"
+
+    monkeypatch.setattr(diarize_mod, "_load_pipeline_cached", lambda p: _FakePipeline())
+    monkeypatch.setattr(diarize_mod, "_turns_from_annotation",
+                        lambda ann: [(0.0, 1.0, "S00")] if ann == "ANNOTATION" else [])
+    turns = diarize_mod._run_pyannote_pipeline(
+        _config(enabled=True, pipeline_config=str(cfg_file)), "/enc/audio.webm")
+    assert captured["arg"] == {"waveform": "WAVE", "sample_rate": 48000}
+    assert not isinstance(captured["arg"], (str, Path))     # NOT the raw path
+    assert turns == [(0.0, 1.0, "S00")]
+
+
+def test_enabled_engine_boot_gate_requires_torchaudio(monkeypatch, tmp_path):
+    # torchaudio is a hard runtime dep of the real engine now (the decode path). An enabled
+    # pyannote with pyannote.audio present but torchaudio ABSENT must fail LOUD at boot
+    # (exit 78) — NOT fail-open on every real clip.
+    cfg_file = tmp_path / "m.yaml"
+    cfg_file.write_text("pipeline: {}\n", encoding="utf-8")
+    monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    monkeypatch.setattr(diarize_mod, "_torchaudio_available", lambda: False)
+    with pytest.raises(MissingDiarizeDependency, match="torchaudio"):
+        ensure_diarize_backend_available(
+            _config(enabled=True, pipeline_config=str(cfg_file)))
+
+
+def test_enabled_engine_boot_gate_passes_when_both_deps_present(monkeypatch, tmp_path):
+    # ...and with BOTH deps present + a materialized config on disk, the gate passes.
+    cfg_file = tmp_path / "m.yaml"
+    cfg_file.write_text("pipeline: {}\n", encoding="utf-8")
+    monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    monkeypatch.setattr(diarize_mod, "_torchaudio_available", lambda: True)
+    ensure_diarize_backend_available(
+        _config(enabled=True, pipeline_config=str(cfg_file)))   # must not raise
+
+
+# --- torchaudio-gated real decode (skips in base CI; runs where the extra is installed) --
+
+_DIARIZE_FIXTURES = Path(__file__).parent / "fixtures" / "diarize"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("torchaudio") is None,
+    reason="torchaudio decode test — needs the [scribe-diarize] extra (torch-heavy, not in "
+           "base CI). Runs on-box / in any venv with the extra.",
+)
+@pytest.mark.parametrize("container", ["webm", "m4a"])
+def test_decode_audio_decodes_real_device_containers(container):
+    # THE decode proof (torchaudio-gated): a REAL webm/opus + mp4/AAC clip -> a finite mono
+    # (1, T) waveform + positive sample rate — the exact path pyannote's default loader
+    # CANNOT walk. Skips until the committed fixtures exist (a ~1s real-speech clip per
+    # container; must be recorded/transcoded where ffmpeg is present — see the ship note).
+    fixture = _DIARIZE_FIXTURES / f"short_speech.{container}"
+    if not fixture.is_file():
+        pytest.skip(f"missing decode fixture {fixture} (commit a ~1s real clip per container)")
+    wave, sr = diarize_mod._decode_audio(fixture)
+    assert wave.ndim == 2 and wave.shape[0] == 1     # mono (1, T)
+    assert wave.shape[1] > 0 and sr > 0
+    import math
+    assert math.isfinite(float(wave.abs().sum()))    # real samples, no NaN/inf
+
+
+# ---------------------------------------------------------------------------
 # real pyannote engine — skip-gated, on-box only (mirrors the qwen IT gate)
 # ---------------------------------------------------------------------------
 
@@ -410,11 +589,24 @@ def test_diarized_conf_survives_ledger_roundtrip_and_speaker_pass_composes(tmp_p
     not os.environ.get("ALFRED_SCRIBE_DIARIZE_IT"),
     reason="real pyannote engine — set ALFRED_SCRIBE_DIARIZE_IT=1 on-box with the "
            "[scribe-diarize] extra, staged models, $ALFRED_SCRIBE_DIARIZE_PIPELINE_CONFIG "
-           "(materialized) + $ALFRED_SCRIBE_DIARIZE_AUDIO (a wav)",
+           "(materialized) + a real-speech clip PER CONTAINER "
+           "($ALFRED_SCRIBE_DIARIZE_AUDIO wav, $ALFRED_SCRIBE_DIARIZE_AUDIO_WEBM, "
+           "$ALFRED_SCRIBE_DIARIZE_AUDIO_MP4)",
 )
-def test_real_pyannote_engine_smoke():
+@pytest.mark.parametrize("audio_env", [
+    "ALFRED_SCRIBE_DIARIZE_AUDIO",         # wav control (the original — always passed)
+    "ALFRED_SCRIBE_DIARIZE_AUDIO_WEBM",    # webm/opus — the PWA container (THE bug)
+    "ALFRED_SCRIBE_DIARIZE_AUDIO_MP4",     # mp4/AAC — the iPhone container (THE bug)
+])
+def test_real_pyannote_engine_smoke(audio_env):
+    # Runs the REAL engine over EACH device container. The WAV control always ran; webm +
+    # mp4 are the formats that fail-opened to ZERO attribution under the old path-loader —
+    # THIS is the on-box regression pin (infra points each env var at a real clip). A
+    # container whose env var is unset skips, so a box can add them incrementally.
+    audio = os.environ.get(audio_env)
+    if not audio:
+        pytest.skip(f"{audio_env} unset — point it at a real-speech clip in that container")
     pipeline_config = os.environ["ALFRED_SCRIBE_DIARIZE_PIPELINE_CONFIG"]
-    audio = os.environ["ALFRED_SCRIBE_DIARIZE_AUDIO"]
     tx = _tx(_seg(1, "real speech", start=0.0, end=10.0), diarized=False)
     out = assign_speakers(
         _config(enabled=True, pipeline_config=pipeline_config), audio, tx,
@@ -504,15 +696,17 @@ def test_b4_apply_clamps_nonfinite_conf_from_engine(monkeypatch):
 
 def test_a4_boot_gate_missing_config_fails_loud(monkeypatch):
     # enabled pyannote with pipeline_config unset → boot fails loud (exit 78). In
-    # torch-free CI the dep-check fires first, so pretend pyannote is present to
+    # torch-free CI the dep-checks fire first, so pretend BOTH deps are present to
     # isolate the CONFIG gate. Mutant that must fail: dropping the config branch.
     monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    monkeypatch.setattr(diarize_mod, "_torchaudio_available", lambda: True)
     with pytest.raises(MissingDiarizeDependency):
         ensure_diarize_backend_available(_config(enabled=True, pipeline_config=""))
 
 
 def test_a4_boot_gate_nonexistent_config_fails_loud(monkeypatch, tmp_path):
     monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    monkeypatch.setattr(diarize_mod, "_torchaudio_available", lambda: True)
     with pytest.raises(MissingDiarizeDependency):
         ensure_diarize_backend_available(
             _config(enabled=True, pipeline_config=str(tmp_path / "nope.yaml")))
@@ -520,6 +714,7 @@ def test_a4_boot_gate_nonexistent_config_fails_loud(monkeypatch, tmp_path):
 
 def test_a4_boot_gate_present_config_passes(monkeypatch, tmp_path):
     monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    monkeypatch.setattr(diarize_mod, "_torchaudio_available", lambda: True)
     cfg_file = tmp_path / "pipe.yaml"
     cfg_file.write_text("x", encoding="utf-8")
     ensure_diarize_backend_available(_config(enabled=True, pipeline_config=str(cfg_file)))  # no raise
