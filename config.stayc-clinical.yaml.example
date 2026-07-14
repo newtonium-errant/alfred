@@ -139,10 +139,13 @@ scribe:
   #
   # ⚠️ DUAL-USE (P4-5): these ids are ALSO the voice-enrollment identity. Each entry
   # MUST be slug-shaped — ^[a-z0-9][a-z0-9._-]{0,63}$ (lowercase; no spaces) — because
-  # it becomes a directory name under enrollment_dir and is matched VERBATIM
-  # (case-sensitive) at /scribe/enroll/start. "NP Jamie" would attest fine but
-  # fail-close EVERY enrollment with user_not_clinician — with the clinician standing
-  # there ready to record. Use "np_jamie".
+  # it becomes a directory name under enrollment_dir, is matched VERBATIM (case-sensitive)
+  # at /scribe/enroll/start, and is embedded in the served PWA page.
+  # A non-slug entry ("NP Jamie") is DROPPED at config load with a loud
+  # `scribe.config.invalid_clinician` error — so it can neither ENROLL *nor ATTEST*: the
+  # id simply does not exist. Fail-closed and loud, rather than a half-valid identity that
+  # attests fine and then fail-closes every enrollment with the clinician standing there
+  # ready to record. Use "np_jamie".
   clinicians: []
   # ── LOOPBACK PWA INGEST SERVER (#49) + the P4-5 TWO-TOKEN CAPABILITY SPLIT ─────
   # INERT by default. When enabled, barrier (e) POSITIVELY asserts `host` is loopback at

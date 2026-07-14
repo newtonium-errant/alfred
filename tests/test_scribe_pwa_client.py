@@ -690,11 +690,132 @@ def test_behaviour_cannot_enroll_while_an_encounter_is_recording(tmp_path):
     assert "encounter is recording" in res["enrollBody"]
 
 
+def test_behaviour_staged_enroll_screen_cannot_fire_during_a_live_encounter(tmp_path):
+    # THE COMPOSED PATH — a consent violation reachable by ORDINARY NAVIGATION, no race:
+    # stage the enrolment intro on #/presets (its [Start recording] listener goes live while
+    # `recording` is still false), start an encounter on #/record, come back, and tap the
+    # staged button. The guard in runEnroll() fires at the INTENT moment (screen opens); the
+    # microphone is acquired in captureEnroll(), arbitrarily later. Only a re-check AT THE
+    # ACQUISITION closes it — otherwise a second recorder opens on the live patient mic and
+    # those windows are folded into a PERMANENT biometric centroid.
+    res = _drive("enroll_staged_then_encounter_composed", tmp_path)
+    assert res["staged"] is True, "the scenario never staged the intro — it proves nothing"
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" not in paths          # no enrolment session was opened
+    assert "/scribe/enroll/chunk" not in paths          # no patient audio was uploaded
+    assert res["micOpensOnStagedClick"] == 0            # the mic was never even acquired
+    assert "encounter is recording" in res["enrollBody"]
+
+
 def test_behaviour_cannot_start_an_encounter_while_enrolling(tmp_path):
+    # The reverse direction. NOTE: routing away from a live capture now tears it down, so a
+    # user cannot NAVIGATE to Start with an enrolment running — this drives the (hidden-view)
+    # Start button directly, pinning start()'s own guard as the belt under that teardown.
     res = _drive("encounter_blocked_during_enroll", tmp_path)
     paths = [c["url"].split("?")[0] for c in res["calls"]]
     assert "/scribe/ingest-chunk" not in paths           # the encounter never starts
     assert "voiceprint recording first" in res["status"]
+    assert res["micOpens"] == 1                          # only the enrolment's own mic open
+
+
+def test_behaviour_encounter_start_loses_the_race_against_a_live_enrolment(tmp_path):
+    # `enrollSession` is set only AFTER getUserMedia + /enroll/start resolve. A Start clicked
+    # inside that window sees no session — so a guard that reads it alone is a check-then-act
+    # across a world-changing await. The mic CLAIM is taken synchronously, before the awaits.
+    res = _drive("encounter_start_races_enroll_capture", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" in paths              # the enrolment proceeded...
+    assert "/scribe/ingest-chunk" not in paths          # ...and the encounter did NOT start
+    assert "voiceprint recording first" in res["status"]
+    assert res["micOpens"] == 1                         # ONE mic open, not two
+
+
+def test_behaviour_staged_enrolment_loses_the_race_against_encounter_start(tmp_path):
+    # The mirror: `recording` is set only AFTER start()'s getUserMedia await, so a staged
+    # [Start recording] fired inside that window reads `recording === false`.
+    res = _drive("enroll_capture_races_encounter_start", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" not in paths          # no enrolment session was opened
+    assert "/scribe/ingest-chunk" in paths              # the encounter ran normally
+    assert res["micOpens"] == 1                         # ONE mic open, not two
+    assert "encounter is recording" in res["enrollBody"]
+
+
+def test_behaviour_routing_away_mid_enrolment_halts_and_abandons(tmp_path):
+    # A capture left running behind a HIDDEN view keeps recording the room and POSTing
+    # enrolment chunks, and its RAM-held bytes sit resident until the 10-minute TTL (two of
+    # them 429 the next attempt against the 2-session cap). Leaving the view ends the capture.
+    res = _drive("route_away_mid_enroll_abandons", tmp_path)
+    assert res["recorderRecordingBefore"] is True        # ...it really was capturing
+    assert res["recorderRecordingAfter"] is False        # the recorder is stopped
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/abandon" in paths             # ...and the RAM bytes are dropped
+
+
+# ── WARN-1: hash routing (the shim's no-op addEventListener hid this entirely) ─
+
+def test_behaviour_hash_routing_toggles_the_two_views(tmp_path):
+    # If the hashchange handler is dropped (or the hide-toggles inverted), the clinician can
+    # NEVER reach the presets view — the whole enrolment feature is unreachable — and every
+    # click-driven test still passes, because route() ran once at boot.
+    res = _drive("routing_toggles_views", tmp_path)
+    assert res["atBoot"] == {"record": True, "presets": False,
+                             "navRecordOn": True, "navPresetsOn": False}
+    assert res["atPresets"] == {"record": False, "presets": True,
+                                "navRecordOn": False, "navPresetsOn": True}
+    assert res["backAtRecord"] == res["atBoot"]          # ...and back again
+
+
+# ── WARN-2: the INERT box (enroll_token unset) is the DEFAULT ship posture ───
+
+def test_behaviour_inert_box_record_view_offers_no_enrolment(tmp_path):
+    # With enroll_token unset EVERY enroll-face path 404s (/scribe/presets included). The
+    # record view must not offer "Create one" — that walks the clinician through a token
+    # paste AND a mic-permission prompt only to die on a 404. Say what is true, offer nothing.
+    res = _drive("inert_record_view", tmp_path)
+    assert "banner" in res["presetMsg"]                  # still SPEAKS (attribution is off)
+    assert "not set up on this machine" in res["presetMsg"]
+    assert "Create one" not in res["presetMsg"]          # ...but invites nothing
+    assert res["startDisabled"] is False                 # recording is unaffected
+    assert res["pickerHtml"].count("<option") == 1       # just "No preset"
+
+
+def test_behaviour_inert_box_presets_view_hides_create_and_refuses_early(tmp_path):
+    res = _drive("inert_presets_view", tmp_path)
+    assert res["newPresetHidden"] is True                # the CREATE button is not offered
+    assert "not set up on this machine" in res["presetsList"]
+    # ...and even if the button is reached anyway, the refusal comes BEFORE the token paste
+    # and BEFORE the microphone prompt.
+    assert "not set up on this machine" in res["enrollBody"]
+    assert res["micOpens"] == 0
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" not in paths
+
+
+# ── N6: esc() is the attribute-context belt ─────────────────────────────────
+
+def test_behaviour_quote_bearing_preset_id_cannot_break_out_of_an_attribute(tmp_path):
+    # Every use site interpolates into an ATTRIBUTE (<option value="…">, data-id="…"). The
+    # config-load clinician gate closed the exploitable path for SLUGS, but preset ids/names
+    # come from the preset store — esc() must escape quotes, or a quote-bearing value breaks
+    # out of the attribute and injects an event handler.
+    res = _drive("quote_in_preset_id", tmp_path)
+    for html in (res["pickerHtml"], res["presetsList"]):
+        # escaped → `onfocus=&quot;steal()` (inert text). Unescaped → `onfocus="steal()`,
+        # a live handler: the raw quote closed value=" and the rest became markup.
+        assert 'onfocus="' not in html, html
+        assert "&quot;" in html                          # the quotes were escaped, not raw
+
+
+def test_pwa_esc_escapes_quotes_for_attribute_contexts():
+    # The structural belt under the behavioural pin above: the textContent->innerHTML trick
+    # (the shape this replaced) escapes & < > but NOT quotes — safe in a TEXT context, unsafe
+    # in the attribute contexts this client actually uses.
+    code = _code()
+    esc_body = code.split("function esc(s)")[1].split("}")[0]
+    for entity in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
+        assert entity in esc_body, f"esc() does not produce {entity}"
+    assert "textContent" not in esc_body                 # not the quote-blind trick
 
 
 # ── RAM custody: /enroll/abandon is actually WIRED ──────────────────────────

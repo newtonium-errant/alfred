@@ -24,9 +24,16 @@
  *     NOT quotes. A stricter shim would hide attribute-injection bugs in the app.
  *   * the element registry DROPS ids owned by an innerHTML that gets replaced, so an
  *     "element exists" assertion can never pass on a stale ghost.
+ *   * `location.hash` is a real SETTER that DISPATCHES `hashchange` to the handlers
+ *     `window.addEventListener` registered. The first version stubbed addEventListener to
+ *     a no-op, so the app's `window.addEventListener('hashchange', route)` was silently
+ *     DISCARDED: route() ran only at boot, no scenario ever changed views, and BOTH routing
+ *     mutants (inverted hide-toggles / listener removed) survived — a build where the
+ *     clinician can never reach the presets view at all would have shipped green. A stub
+ *     that swallows the thing under test is the same defect class as the boot-order bug.
  *
  * Assertions target the FETCH LOG (method + URL + bearer token) — the real server
- * contract from docs/scribe_enroll_api.md — plus picker/banner DOM state.
+ * contract from docs/scribe_enroll_api.md — plus picker/banner/view DOM state.
  */
 import { readFileSync } from 'node:fs';
 
@@ -40,6 +47,7 @@ const cfg = {
   presets: [],
   mru: null,
   serverState: 'empty',
+  presetsStatus: 200,          // 404 ⇒ the enrolment face is INERT (enroll_token unset)
   statusPresetFit: 'ok',
   bindStatus: 200,
   startStatus: 200,
@@ -97,6 +105,26 @@ switch (scenario) {
     cfg.finalizeStatus = 409; break;
   case 'enroll_start_429':
     cfg.startStatus = 429; break;
+  case 'enroll_staged_then_encounter_composed':
+  case 'route_away_mid_enroll_abandons':
+  case 'routing_toggles_views':
+  case 'encounter_start_races_enroll_capture':
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok'; break;
+  case 'enroll_capture_races_encounter_start':
+    // instantWindow: the encounter must actually COMPLETE a window, so "the encounter ran
+    // normally" is asserted on a real chunk POST rather than on the absence of a failure.
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a';
+    cfg.serverState = 'ok'; cfg.instantWindow = true; break;
+  // THE INERT BOX — the DEFAULT ship posture: enroll_token unset ⇒ EVERY enroll-face path
+  // 404s, /scribe/presets included (it is on the enroll face).
+  case 'inert_record_view':
+  case 'inert_presets_view':
+    cfg.presetsStatus = 404; break;
+  // an attribute-context injection attempt smuggled through a SERVER-supplied preset_id.
+  case 'quote_in_preset_id':
+    cfg.presets = [{ preset_id: 'pst-a" autofocus onfocus="steal()',
+                     name: 'Room "A"', classification: 'usable' }];
+    cfg.serverState = 'ok'; break;
   default: break;
 }
 
@@ -218,6 +246,9 @@ async function fetchShim(url, opts) {
     ok: (status || 200) < 400, status: status || 200, json: async () => obj,
   });
   if (url.startsWith('/scribe/presets?')) {
+    // 404 = INERT enrolment face (enroll_token unset). The route answers no body the client
+    // can trust — the whole face is ABSENT, not merely empty.
+    if (cfg.presetsStatus !== 200) { return json({}, cfg.presetsStatus); }
     return json({ user: 'np_jamie', state: cfg.serverState, presets: cfg.presets,
                   mru_preset_id: cfg.mru });
   }
@@ -235,14 +266,38 @@ async function fetchShim(url, opts) {
   return json({});
 }
 
-const location = { hash: '#/record' };
-const windowShim = { MediaRecorder, addEventListener: () => {}, confirm: () => true };
+// BROWSER-ACCURATE hash routing. `location.hash = x` DISPATCHES hashchange to the
+// listeners the app registered — the app's own `location.hash = '#/presets'` navigations
+// route exactly as they do in a browser, and so do the test's. (The previous no-op
+// addEventListener stub swallowed the app's hashchange handler entirely.)
+const winListeners = {};
+let _hash = '#/record';
+const location = {
+  get hash() { return _hash; },
+  set hash(v) {
+    const next = String(v);
+    if (next === _hash) { return; }
+    _hash = next;
+    (winListeners['hashchange'] || []).forEach((f) => f({ type: 'hashchange' }));
+  },
+};
+const windowShim = {
+  MediaRecorder,
+  addEventListener: (ev, fn) => { (winListeners[ev] = winListeners[ev] || []).push(fn); },
+  confirm: () => true,
+};
+// mic opens are COUNTED: "the enrolment path never touched the microphone" is the assertion
+// that actually binds the consent property (a refusal that still opened the mic is a fail).
+const micOpens = { n: 0 };
 const navigatorShim = {
   mediaDevices: {
-    getUserMedia: async () => ({
-      getTracks: () => [{ stop() {} }],
-      getAudioTracks: () => [{ label: cfg.micLabel, stop() {} }],
-    }),
+    getUserMedia: async () => {
+      micOpens.n += 1;
+      return {
+        getTracks: () => [{ stop() {} }],
+        getAudioTracks: () => [{ label: cfg.micLabel, stop() {} }],
+      };
+    },
   },
 };
 const cryptoShim = {
@@ -264,6 +319,10 @@ new Function('document', 'window', 'MediaRecorder', 'fetch', 'location', 'naviga
 const el = (id) => registry.get(id);
 const out = { scenario, calls: null, error: null };
 
+async function setHash(h) {          // a real navigation: dispatches hashchange -> route()
+  location.hash = h;
+  await settle(15);
+}
 async function startEncounter() {
   el('start').click();
   await settle(25);
@@ -274,7 +333,7 @@ async function oneWindow() {
   await settle(20);
 }
 async function openEnrollWithToken() {
-  location.hash = '#/presets';
+  await setHash('#/presets');
   el('new-preset').click();
   await settle(12);
   if (registry.has('tok')) {
@@ -283,6 +342,12 @@ async function openEnrollWithToken() {
     await settle(12);
   }
 }
+const views = () => ({
+  record: !el('view-record').classList.contains('hide'),
+  presets: !el('view-presets').classList.contains('hide'),
+  navRecordOn: el('nav-record').classList.contains('on'),
+  navPresetsOn: el('nav-presets').classList.contains('on'),
+});
 
 try {
   await settle();                     // let the boot's loadPresets()/renderPicker() run
@@ -304,20 +369,111 @@ try {
   } else if (scenario.startsWith('registry_')) {
     out.presetMsg = el('preset-msg').innerHTML;
     out.startDisabled = el('start').disabled;
+  } else if (scenario === 'routing_toggles_views') {
+    out.atBoot = views();
+    await setHash('#/presets');
+    out.atPresets = views();
+    await setHash('#/record');
+    out.backAtRecord = views();
+  } else if (scenario === 'inert_record_view') {
+    out.presetMsg = el('preset-msg').innerHTML;
+    out.startDisabled = el('start').disabled;
+    out.pickerHtml = el('picker').innerHTML;
+  } else if (scenario === 'inert_presets_view') {
+    await setHash('#/presets');
+    out.presetsList = el('presets-list').innerHTML;
+    out.newPresetHidden = el('new-preset').classList.contains('hide');
+    el('new-preset').click();               // ...even if the button is somehow reached
+    await settle(15);
+    out.enrollBody = el('enroll-body').innerHTML;
+    out.micOpens = micOpens.n;
+  } else if (scenario === 'quote_in_preset_id') {
+    out.pickerHtml = el('picker').innerHTML;
+    await setHash('#/presets');
+    out.presetsList = el('presets-list').innerHTML;
   } else if (scenario === 'enroll_blocked_during_encounter') {
     await startEncounter();                 // an encounter is LIVE
-    location.hash = '#/presets';
+    await setHash('#/presets');
     el('new-preset').click();               // ...now try to enrol
     await settle(15);
     out.enrollBody = el('enroll-body').innerHTML;
+  } else if (scenario === 'enroll_staged_then_encounter_composed') {
+    // THE BLOCK PATH — a consent violation composed out of ORDINARY NAVIGATION (no race,
+    // no devtools):
+    //   1. #/presets -> "Create a voiceprint": runEnroll() sees recording=false and STAGES
+    //      the intro, wiring a LIVE listener on [Start recording].
+    //   2. #/record -> Start: the encounter is now LIVE on the patient's mic.
+    //   3. back to #/presets: renderPresets() rewrites #presets-list and (pre-fix) never
+    //      touched #enroll — the staged intro was still on screen, its listener live.
+    //   4. tap the staged [Start recording] -> captureEnroll() opened a SECOND recorder on
+    //      the LIVE PATIENT MIC and pushed those windows into a PERMANENT biometric centroid.
+    // The staged button's handle is captured BEFORE the navigation, so this test still FIRES
+    // it even though the route() teardown now removes the node — i.e. it pins captureEnroll's
+    // OWN action-moment guard, independently of the teardown belt. Both must hold.
+    await setHash('#/presets');
+    el('new-preset').click();
+    await settle(12);
+    if (registry.has('tok')) {
+      el('tok').value = ENROLL_TOKEN; el('tok-ok').click(); await settle(12);
+    }
+    const staged = registry.get('en-go');          // the STAGED button (handle kept)
+    out.staged = !!staged;
+    await setHash('#/record');
+    await startEncounter();                        // the encounter is LIVE
+    await setHash('#/presets');
+    const micBefore = micOpens.n;
+    if (staged) { staged.click(); await settle(25); }
+    out.micOpensOnStagedClick = micOpens.n - micBefore;
+    out.enrollBody = el('enroll-body').innerHTML;
+  } else if (scenario === 'encounter_start_races_enroll_capture') {
+    // THE RACE the mic CLAIM exists for. `enrollSession` is only set AFTER two awaits
+    // (getUserMedia, /enroll/start), so a Start clicked in that window sees no session and
+    // — on a `enrollSession`-only guard — sails through: two recorders, one mic, patient
+    // speech in the enrolment buffer. The claim is taken SYNCHRONOUSLY, before the awaits.
+    await openEnrollWithToken();
+    el('en-go').click();                    // captureEnroll: claims, then awaits the mic
+    el('start').click();                    // ...NO settle: the session does not exist yet
+    await settle(30);
+    out.status = el('status').textContent;
+    out.micOpens = micOpens.n;
+  } else if (scenario === 'enroll_capture_races_encounter_start') {
+    // The MIRROR race: `recording` is only set AFTER start()'s getUserMedia await, so a
+    // staged [Start recording] fired inside that window sees `recording === false`.
+    await setHash('#/presets');
+    el('new-preset').click();
+    await settle(12);
+    if (registry.has('tok')) {
+      el('tok').value = ENROLL_TOKEN; el('tok-ok').click(); await settle(12);
+    }
+    const staged = registry.get('en-go');
+    await setHash('#/record');
+    el('start').click();                    // start(): claims, then awaits the mic
+    staged.click();                         // ...NO settle: `recording` is still false
+    await settle(30);
+    out.enrollBody = el('enroll-body').innerHTML;
+    out.micOpens = micOpens.n;              // 1 = the encounter's own; a 2nd = the breach
+  } else if (scenario === 'route_away_mid_enroll_abandons') {
+    await openEnrollWithToken();
+    el('en-go').click();                    // an enrolment CAPTURE is live (mic open)
+    await settle(20);
+    out.recorderRecordingBefore = recorders[recorders.length - 1].state === 'recording';
+    await setHash('#/record');              // ...navigate AWAY mid-capture
+    await settle(25);
+    // a window left running would keep recording — and POSTing enrolment chunks — behind a
+    // HIDDEN view, with the RAM bytes resident until the 10-minute TTL.
+    out.recorderRecordingAfter = recorders[recorders.length - 1].state === 'recording';
   } else if (scenario === 'encounter_blocked_during_enroll') {
     await openEnrollWithToken();
     el('en-go').click();                    // an enrolment session is LIVE
     await settle(20);
-    location.hash = '#/record';
-    el('start').click();                    // ...now try to start an encounter
+    // NO hash navigation here — routing away now TEARS THE WIZARD DOWN (halt + abandon), so
+    // a real user cannot reach [Start encounter] with a live enrolment. Clicking the
+    // (hidden-view) Start button directly pins the BELT: start()'s own mutual-exclusion
+    // guard, which must still hold if the teardown ever regresses.
+    el('start').click();
     await settle(20);
     out.status = el('status').textContent;
+    out.micOpens = micOpens.n;              // 1 = the enrolment's own; a 2nd = the breach
   } else if (scenario === 'enroll_cancel_abandons') {
     await openEnrollWithToken();
     el('en-go').click();

@@ -38,6 +38,21 @@ B2 (the client trap) — a FRESH ``MediaRecorder`` PER WINDOW: each window is
 start→stop→one complete ``ondataavailable`` blob that is INDEPENDENTLY decodable. NEVER
 ``MediaRecorder.start(timeslice)`` (blobs 2..N would be headerless clusters).
 
+MUTUAL EXCLUSION (a CONSENT property, not a mic-contention nicety) — an enrolment window
+that captures a live patient encounter is folded into a PERMANENT biometric centroid, on a
+surface whose entire consent basis is "the enrolling clinician's own voice". Two mechanisms
+enforce it, and both are needed:
+  * the MIC CLAIM (``micOwner``) is taken SYNCHRONOUSLY at each point the microphone is
+    actually ACQUIRED — ``start()`` and ``captureEnroll()`` — because ``recording`` and
+    ``enrollSession`` are only set AFTER an await, so a guard reading them alone is a
+    check-then-act across a world-changing await.
+  * ``route()`` TEARS DOWN the enrolment wizard on every view change. A wizard that is
+    merely STAGED (intro rendered, its [Start recording] listener live) otherwise survives a
+    navigation, and an encounter started in the meantime composes — by ordinary navigation,
+    no race — into exactly the violation above.
+The general rule: anything that can be STAGED and then FIRED must re-check where the
+resource is ACQUIRED, never only where the user expressed the intention.
+
 DEVICE CONTAINERS (operator ruling: the phone is an iPhone) — we do NOT hardcode webm.
 The recorder negotiates a supported type and we send what the device actually produced:
   * ENROLLMENT — the server SNIFFS the container (webm EBML / mp4 ``ftyp``); ``ext`` is
@@ -160,9 +175,21 @@ APP_JS = r"""'use strict';
   let selectedPreset = '';           // '' == "No preset — attribution off" (first-class)
   let presetsCache = [];
   let mruPresetId = null;
-  let serverState = '';              // 'empty' | 'all_incompatible' | 'ok' (the API contract)
+  let serverState = '';              // 'empty' | 'all_incompatible' | 'ok' | 'inert' (see loadPresets)
   let enrollSession = null;          // non-null while an enrolment session holds RAM bytes
+  let enrollHalt = null;             // non-null while an enrolment CAPTURE holds the mic
+  let pendingToken = null;           // resolve() of an OPEN token-paste prompt
   let micLabel = '';                 // the device label, for the name prefill
+
+  // THE MIC CLAIM — '' | 'encounter' | 'enroll'. Claimed SYNCHRONOUSLY, before the
+  // getUserMedia await, by whichever path is about to ACQUIRE the microphone.
+  //
+  // `recording` / `enrollSession` are both set AFTER an await (getUserMedia, /enroll/start),
+  // so a check on them is a check-then-act across a world-changing await: both paths could
+  // pass their own guard while the other is mid-acquisition. The claim closes that window,
+  // and — with the action-moment guards below — is what actually enforces the memo's
+  // "enrolment and encounter recording are mutually exclusive".
+  let micOwner = '';
 
   // encounter state
   let stream = null, recording = false, label = null, seq = 0, recorder = null;
@@ -231,7 +258,12 @@ APP_JS = r"""'use strict';
     if (!user) { return; }
     try {
       const r = await api('/scribe/presets?user=' + encodeURIComponent(user));  // EITHER token
-      if (r.status === 404) { serverState = 'inert'; return; }  // enrollment face inert
+      // 404 = the whole enrolment FACE is inert (enroll_token unset — the DEFAULT ship
+      // posture). 'inert' is a CLIENT-side state, not a server enum value: the server
+      // cannot answer `state` at all when the route 404s. Every surface that offers
+      // enrolment reads it (renderPresetMsg / renderPresets / runEnroll) — an un-armed box
+      // must not walk the clinician through a token paste and a mic prompt to die on a 404.
+      if (r.status === 404) { serverState = 'inert'; return; }
       if (!r.ok) { return; }
       const j = await r.json();
       presetsCache = j.presets || [];
@@ -271,6 +303,17 @@ APP_JS = r"""'use strict';
     const el = $('preset-msg');
     const usable = usablePresets();
     if (usable.length > 0) { el.innerHTML = ''; return; }        // a usable preset exists
+
+    // THE INERT BOX — the DEFAULT ship posture (enroll_token unset ⇒ the enrolment face
+    // 404s). Offering "Create one" here is an invitation that CANNOT be honoured: it walks
+    // the clinician through a token paste AND a mic-permission prompt before dying on a
+    // 404. Say what is true; offer nothing. (Attribution is off, so the banner still fires
+    // — intentionally-left-blank — but Start stays enabled: recording is unaffected.)
+    if (serverState === 'inert') {
+      el.innerHTML = '<div class="banner">Voice enrolment is not set up on this machine ' +
+        '&mdash; the scribe will not label who is speaking. Ask your operator.</div>';
+      return;
+    }
 
     if (presetsCache.length === 0) {
       // ZERO presets — a NON-BLOCKING badge. Start STAYS enabled (no-preset is valid).
@@ -395,14 +438,16 @@ APP_JS = r"""'use strict';
     // Two MediaRecorders on one mic, and — far worse — an enrolment buffer that captures
     // LIVE PATIENT SPEECH on a surface whose entire consent basis is "the enrolling
     // clinician's own voice". Refuse, loudly.
-    if (enrollSession) {
+    if (enrollSession || micOwner) {
       show('Finish or cancel the voiceprint recording first — the microphone is in use.');
       return;
     }
+    micOwner = 'encounter';               // claimed SYNCHRONOUSLY, BEFORE the await below
     $('start').disabled = true;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
+      micOwner = '';
       show('Microphone unavailable.'); $('start').disabled = false; return;
     }
     label = newLabel();
@@ -422,6 +467,7 @@ APP_JS = r"""'use strict';
     clearTimeout(windowTimer);
     try { if (recorder && recorder.state === 'recording') { recorder.stop(); } } catch (e) {}
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    if (micOwner === 'encounter') { micOwner = ''; }             // release the mic claim
     $('stop').disabled = true;
     chain = chain.then(async () => {
       const finalSeq = seq;
@@ -467,6 +513,15 @@ APP_JS = r"""'use strict';
   async function renderPresets() {
     await loadPresets();
     const el = $('presets-list');
+    // THE INERT BOX — hide the CREATE button outright. The face 404s; an un-armed box must
+    // not invite an enrolment it cannot perform (see renderPresetMsg).
+    const inert = serverState === 'inert';
+    $('new-preset').classList.toggle('hide', inert);
+    if (inert) {
+      el.innerHTML = '<div class="banner">Voice enrolment is not set up on this machine. ' +
+        'Ask your operator to arm it (an enrolment token).</div>';
+      return;
+    }
     if (!user) { el.innerHTML = '<p class="note">Select a clinician.</p>'; return; }
     if (presetsCache.length === 0) {
       el.innerHTML = '<p class="note">No voiceprints yet.</p>';   // intentionally-left-blank
@@ -505,7 +560,10 @@ APP_JS = r"""'use strict';
       '<input id="tok" type="password" autocomplete="off" spellcheck="false">' +
       '<button id="tok-ok" class="primary">Continue</button>';
     return await new Promise((res) => {
+      pendingToken = res;                                       // teardown can settle it
       $('tok-ok').addEventListener('click', () => {
+        if (!pendingToken) { return; }                          // torn down by a route away
+        pendingToken = null;
         enrollToken = $('tok').value || '';
         $('tok').value = '';                                    // drop it from the DOM
         res(!!enrollToken);
@@ -558,19 +616,31 @@ APP_JS = r"""'use strict';
                     { method: 'POST', enroll: true }); } catch (e) { /* best-effort */ }
   }
 
+  // MUTUAL EXCLUSION (memo) — never enrol while an encounter is recording: the enrolment
+  // buffer would capture LIVE PATIENT SPEECH, and the whole consent basis of this surface
+  // is "the enrolling clinician's own voice". Rendered from BOTH the intent moment
+  // (runEnroll) and the ACTION moment (captureEnroll) — see captureEnroll's guard.
+  function refuseEnrollDuringEncounter() {
+    $('enroll').classList.remove('hide');
+    $('enroll-title').textContent = 'Not now';
+    $('enroll-body').innerHTML = '<p>An encounter is recording. Stop it before making a ' +
+      'voiceprint &mdash; the microphone can only do one at a time.</p>';
+  }
+
+  function refuseEnrollInert() {
+    $('enroll').classList.remove('hide');
+    $('enroll-title').textContent = 'Not available';
+    $('enroll-body').innerHTML = '<p>Voice enrolment is not set up on this machine. ' +
+      'Ask your operator.</p>';
+  }
+
   // The guided enrolment: record-first, name-last (~45-60s).
   async function runEnroll(rerecordId) {
     if (!user) { return; }
-    // MUTUAL EXCLUSION (memo) — never enrol while an encounter is recording: the
-    // enrolment buffer would capture LIVE PATIENT SPEECH, and the whole consent basis of
-    // this surface is "the enrolling clinician's own voice".
-    if (recording) {
-      $('enroll').classList.remove('hide');
-      $('enroll-title').textContent = 'Not now';
-      $('enroll-body').innerHTML = '<p>An encounter is recording. Stop it before making a ' +
-        'voiceprint &mdash; the microphone can only do one at a time.</p>';
-      return;
-    }
+    if (recording || micOwner) { return refuseEnrollDuringEncounter(); }
+    // An INERT face 404s every enroll route. Refuse HERE — before the token paste and
+    // before the mic prompt — rather than asking for both and then failing.
+    if (serverState === 'inert') { return refuseEnrollInert(); }
     if (!(await needEnrollToken())) { return; }
     const box = $('enroll');
     box.classList.remove('hide');
@@ -584,26 +654,41 @@ APP_JS = r"""'use strict';
   }
 
   async function captureEnroll(rerecordId) {
+    // ── THE GUARD BELONGS AT THE ACTION MOMENT, NOT THE INTENT MOMENT ──────────────
+    // runEnroll()'s check fires when the enrolment SCREEN opens. The microphone opens
+    // HERE — arbitrarily later, and the staged "Start recording" listener stays live in
+    // between. Ordinary navigation composes into a consent violation with no race at all:
+    //   #/presets → "Create a voiceprint" (intro STAGED, en-go wired, `recording` false)
+    //   → #/record → Start (encounter LIVE) → back to #/presets → tap the staged button.
+    // Without a re-check here that opens a SECOND recorder on the live patient mic and
+    // pushes those windows into a PERMANENT biometric centroid. The route() teardown below
+    // destroys the staged DOM, and this guard is the belt that holds if it ever regresses.
+    // GENERAL RULE: anything that can be STAGED and then FIRED must re-check where the
+    // resource is ACQUIRED, not where the user expressed the intention.
+    if (recording || micOwner) { return refuseEnrollDuringEncounter(); }
+    micOwner = 'enroll';                  // claimed SYNCHRONOUSLY, BEFORE the await below
     let st;
     try {
       st = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
+      micOwner = '';
       $('enroll-body').innerHTML = '<p>Microphone unavailable.</p>' +
         '<button id="en-retry" class="primary">Record again</button>';
       $('en-retry').addEventListener('click', () => runEnroll(rerecordId));
       return;
     }
+    const dropMic = () => { st.getTracks().forEach((t) => t.stop()); micOwner = ''; };
     // /enroll/start — validates the clinician BEFORE any recording (never a wasted 45s).
     let q = '?user=' + encodeURIComponent(user);
     if (rerecordId) { q += '&preset=' + encodeURIComponent(rerecordId); }
     let session = null;
     try {
       const r = await api('/scribe/enroll/start' + q, { method: 'POST', enroll: true });
-      if (!r.ok) { st.getTracks().forEach((t) => t.stop()); return enrollFailed(r.status, rerecordId); }
+      if (!r.ok) { dropMic(); return enrollFailed(r.status, rerecordId); }
       session = (await r.json()).session;
       enrollSession = session;                 // RAM bytes are now held server-side
     } catch (e) {
-      st.getTracks().forEach((t) => t.stop());
+      dropMic();
       return enrollFailed(0, rerecordId);
     }
     // the mic's own label is the memo's name prefill ("name the place and mic").
@@ -618,7 +703,7 @@ APP_JS = r"""'use strict';
       '<button id="en-done" class="primary">Done</button>' +
       '<button id="en-cancel">Cancel</button>';
 
-    let elapsed = 0, live = true, eseq = 0;
+    let elapsed = 0, live = true, discarded = false, eseq = 0, curRec = null;
     let echain = Promise.resolve();
     const ring = setInterval(() => {
       elapsed += 1;
@@ -629,11 +714,12 @@ APP_JS = r"""'use strict';
     function windowOnce() {
       if (!live) { return; }
       const rec = newRecorder(st);
+      curRec = rec;
       let blob = null;
       rec.ondataavailable = (e) => { blob = e.data; };
       rec.onstop = () => {
         const captured = blob; blob = null;
-        if (captured && captured.size > 0) {
+        if (captured && captured.size > 0 && !discarded) {
           echain = echain.then(async () => {
             eseq += 1;
             // ?seq ALWAYS — a retried window must be idempotent, not a second append.
@@ -647,22 +733,36 @@ APP_JS = r"""'use strict';
       rec.start();                                              // NO timeslice (B2)
       setTimeout(() => { if (rec.state === 'recording') { rec.stop(); } }, ENROLL_WINDOW_MS);
     }
-    windowOnce();
 
-    function halt() {
+    // halt(discard) — stop the loop and release the mic.
+    //   discard=false (Done) — the in-flight window is left to its own stop timer and its
+    //     blob is dropped by `live=false`, exactly as before: `await echain` then covers
+    //     only the COMPLETED windows, so finalize can never race a late chunk POST.
+    //   discard=true (Cancel / route-away) — additionally STOP the live recorder now and
+    //     refuse its blob, so no window keeps recording (and POSTing) behind a dead screen.
+    function halt(discard) {
       live = false;
+      if (discard) {
+        discarded = true;
+        try { if (curRec && curRec.state === 'recording') { curRec.stop(); } } catch (e) {}
+      }
       clearInterval(ring);
       st.getTracks().forEach((t) => t.stop());
+      if (micOwner === 'enroll') { micOwner = ''; }
+      if (enrollHalt === halt) { enrollHalt = null; }
     }
+    enrollHalt = halt;                    // route() tears the capture down through this
+    windowOnce();
+
     $('en-done').addEventListener('click', async () => {
-      halt();
+      halt(false);
       await echain;
       finalizeEnroll(session, rerecordId);
     });
     // CANCEL — an explicit discard. Drops the RAM bytes NOW (server-side) instead of
     // leaving them resident for the 10-minute TTL.
     $('en-cancel').addEventListener('click', async () => {
-      halt();
+      halt(true);
       await echain;
       await abandonEnroll();
       $('enroll').classList.add('hide');
@@ -768,7 +868,27 @@ APP_JS = r"""'use strict';
     sel.value = user;
   }
 
+  // A wizard that is STAGED (intro rendered, its listener live) or CAPTURING must never
+  // survive the view it lives in. Routing away tears it down: the mic closes, the live
+  // window stops (it would otherwise keep recording and POSTing behind a HIDDEN view), the
+  // RAM-held bytes are dropped server-side NOW rather than at the 10-minute TTL, an open
+  // token prompt is settled, and the staged DOM — with its live listeners — is destroyed.
+  function teardownEnroll() {
+    const capturing = !!enrollHalt;
+    if (enrollHalt) { enrollHalt(true); }             // stop the mic + the window loop
+    // Abandon ONLY a session still RECORDING. A session already FINALIZED is being consumed
+    // server-side (audio destroyed, centroid being written) — abandoning it would race that
+    // write and silently lose a completed voiceprint. We just stop owning it; the preset
+    // lands in the list under its placeholder name.
+    if (capturing && enrollSession) { abandonEnroll(); }   // drop the RAM bytes NOW
+    enrollSession = null;
+    if (pendingToken) { const res = pendingToken; pendingToken = null; res(false); }
+    $('enroll').classList.add('hide');
+    $('enroll-body').innerHTML = '';                  // destroys the staged DOM + listeners
+  }
+
   function route() {
+    teardownEnroll();
     const presets = location.hash === '#/presets';
     $('view-record').classList.toggle('hide', presets);
     $('view-presets').classList.toggle('hide', !presets);

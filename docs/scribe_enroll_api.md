@@ -73,6 +73,14 @@ POST /enroll/abandon          -> {state:"abandoned"}             # TERMINAL: byt
 **`/enroll/result` states:** `processing` · `done` · `unknown_session`.
 On `unknown_session` the client offers **Record again** (the session is gone; nothing was kept).
 
+**`/enroll/abandon` is not optional client-side.** The client MUST call it on every terminal
+path that is not a finalize — Cancel, any failure, and **navigating away from the wizard**
+(which also stops the recorder: a capture left running behind a hidden view keeps recording
+the room). Otherwise the RAM-held bytes sit resident for the full 10-minute TTL, and two
+abandoned attempts exhaust the 2-session cap and **429 the next enrolment**. A session that
+has already been FINALIZED is NOT abandoned on navigation — the server is consuming it
+(audio destroyed, centroid being written), and abandoning would race that write.
+
 **Verdicts** (`done` only) — the closed set:
 
 | Verdict | Meaning | Preset written? |
@@ -135,6 +143,15 @@ client's "409 ⇒ advance" discipline is safe: no audio is ever lost to a bindin
   offered as the default — it would strand the clinician on a preset that cannot attribute.
 * `state`: `empty` · `all_incompatible` · `ok` (empty-registry and all-incompatible are
   **distinct** explicit states — render them differently).
+  * A **404** on this route is the FOURTH state the client must render, and it is the
+    DEFAULT ship posture: the enrolment face is **INERT** (`enroll_token` unset — this route
+    is on the enroll face, so it 404s with the rest of it). It is not a `state` value —
+    an inert server cannot answer one. A client that treats it as "no presets" invites an
+    enrolment it cannot perform: a token paste and a mic-permission prompt, then a 404. The
+    shipped client renders it as its own thing (`Voice enrolment is not set up on this
+    machine`), hides **Create a voiceprint**, and refuses `runEnroll` *before* the token
+    prompt. Attribution is off, so it still SAYS so — but Start stays enabled: recording is
+    unaffected by an inert enrolment face.
 * `classification`: `usable` · `incompatible_model` · `incompatible_engine` ·
   `unsupported_schema` · `revoked` · `corrupt`. Anything ≠ `usable` must show the
   **⟳ needs re-record** / **⚠ unreadable** treatment and must not be offered as a selectable preset.
