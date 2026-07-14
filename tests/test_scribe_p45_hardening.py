@@ -114,6 +114,92 @@ def test_corrupt_preset_does_not_block_the_encounter(tmp_path):
     assert unusable[0]["artifact"] == "preset"
 
 
+def _corrupt_shapes(tmp_path):
+    """The corruption shapes a TORN WRITE actually produces — the ones whose exceptions
+    are NOT OSError/JSONDecodeError and so escaped the original guard."""
+    return {
+        # invalid UTF-8 → read_text raises UnicodeDecodeError (a ValueError). THE canonical
+        # torn-write corruption; the guard named it as the threat but did not catch it.
+        "invalid_utf8": b"\xff\xfe\x00\x80not utf-8 at all\xff",
+        # deeply-nested JSON → json.loads raises RecursionError (a RuntimeError).
+        "deep_nesting": (b"[" * 20000) + (b"]" * 20000),
+        # truncated mid-write → JSONDecodeError (this one the old guard DID catch)
+        "truncated": b'{"schema_version": 1, "preset_id": "pst-',
+        # empty file (an interrupted create)
+        "empty": b"",
+    }
+
+
+@pytest.mark.parametrize("shape", list(_corrupt_shapes(None).keys()))
+def test_torn_write_shapes_classify_corrupt_never_raise(tmp_path, shape):
+    # B1: the read+parse must be INSIDE the belt. UnicodeDecodeError / RecursionError are
+    # neither OSError nor JSONDecodeError — they escaped and propagated out of the
+    # "NEVER raises" load path.
+    cfg = _cfg(tmp_path)
+    path = en.preset_path(cfg.diarize.enrollment_dir, _USER,
+                          "pst-1720000000000-0123456789abcdef")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_corrupt_shapes(tmp_path)[shape])
+
+    preset, fail = en.load_preset(path)                 # MUST NOT raise
+    assert preset is None and fail == en.CLASS_CORRUPT
+    # every downstream reader stays fail-open on the same file
+    assert en.list_user_presets(cfg.diarize.enrollment_dir, _USER,
+                                embed_voice.engine_fingerprint(cfg))[0].classification \
+        == en.CLASS_CORRUPT
+    # ...and the cap check (which now loads each file) must not break FUTURE enrollments
+    assert en.count_active_presets(cfg.diarize.enrollment_dir, _USER) == 0
+
+
+@pytest.mark.parametrize("shape", ["invalid_utf8", "deep_nesting"])
+def test_torn_preset_does_not_block_the_encounter(tmp_path, shape):
+    # The blocking failure H1 exists to prevent, through the shapes that escaped.
+    cfg = _cfg(tmp_path)
+    enc = tmp_path / "inbox" / f"enc-{shape}"
+    p = _good_preset(cfg)
+    en.write_preset(cfg.diarize.enrollment_dir, p, is_new=True)
+    enc.mkdir(parents=True, exist_ok=True)
+    en.write_binding(enc, p)
+    en.preset_path(cfg.diarize.enrollment_dir, _USER, p.preset_id).write_bytes(
+        _corrupt_shapes(tmp_path)[shape])
+
+    (enc / "chunk_001.wav").write_bytes(b"audio-1")
+    (enc / "chunk_001.txt").write_text("[PT] Chest pain.\n", encoding="utf-8")
+    (enc / "chunk_001.meta.json").write_text(json.dumps({"synthetic": True, "seq": 1}),
+                                             encoding="utf-8")
+
+    r = accumulate_encounter(enc, config=cfg)           # MUST NOT raise
+    assert r.folded == 1                                # the encounter FOLDS (fail-open)
+
+
+def test_torn_binding_does_not_block_the_encounter(tmp_path):
+    # read_binding had the identical too-narrow guard.
+    cfg = _cfg(tmp_path)
+    enc = tmp_path / "inbox" / "enc-tb"
+    enc.mkdir(parents=True, exist_ok=True)
+    en.binding_path(enc).write_bytes(b"\xff\xfe invalid utf-8 binding")
+    (enc / "chunk_001.wav").write_bytes(b"audio-1")
+    (enc / "chunk_001.txt").write_text("[PT] Chest pain.\n", encoding="utf-8")
+    (enc / "chunk_001.meta.json").write_text(json.dumps({"synthetic": True, "seq": 1}),
+                                             encoding="utf-8")
+    r = accumulate_encounter(enc, config=cfg)           # MUST NOT raise
+    assert r.folded == 1
+
+
+def test_torn_chunk_meta_sidecar_does_not_block_the_encounter(tmp_path):
+    # _read_provenance had the same shape; a torn sidecar propagated out of accumulate.
+    cfg = _cfg(tmp_path)
+    enc = tmp_path / "inbox" / "enc-tm"
+    enc.mkdir(parents=True, exist_ok=True)
+    (enc / "chunk_001.wav").write_bytes(b"audio-1")
+    (enc / "chunk_001.txt").write_text("[PT] Chest pain.\n", encoding="utf-8")
+    (enc / "chunk_001.meta.json").write_bytes(b"\xff\xfe torn sidecar")
+    r = accumulate_encounter(enc, config=cfg)           # MUST NOT raise
+    # provenance unreadable → {} → guard_ingest REFUSES in synthetic mode (fail-closed),
+    # but the SWEEP survives — that is the invariant under test.
+    assert r.refused == 1 and r.folded == 0
+
+
 def test_corrupt_preset_listing_does_not_raise(tmp_path):
     # list_user_presets (presets CLI + GET /scribe/presets) must classify, not 500.
     cfg = _cfg(tmp_path)
@@ -184,6 +270,30 @@ def test_unresolved_placeholder_enroll_token_fails_closed_and_logs(monkeypatch):
 def test_unresolved_placeholder_ingest_token_fails_closed(monkeypatch):
     web = _web({"enabled": True, "token": "${SCRIBE_INGEST_TOKEN}"}, monkeypatch)
     assert web.token == ""                        # barrier-e then refuses the enabled server
+
+
+@pytest.mark.parametrize("blank", ["   ", "\t", "\n", " \t\n "])
+def test_whitespace_only_token_is_inert_not_armed(monkeypatch, blank):
+    # B2(a): "   " is TRUTHY — it would ARM the biometric face with a blank-ish bearer.
+    web = _web({"enabled": True, "token": "t", "enroll_token": blank}, monkeypatch)
+    assert web.enroll_token == ""
+
+
+@pytest.mark.parametrize("val", ["pre-${SCRIBE_ENROLL_TOKEN}", "abc${SUFFIX}",
+                                 "x${A}y", "tok_${ENV}"])
+def test_placeholder_anywhere_in_the_value_fails_closed(monkeypatch, val):
+    # B2(b): startswith("${") was NARROWER than the threat — an unresolved placeholder is
+    # just as guessable when it is not at position 0.
+    with structlog.testing.capture_logs() as cap:
+        web = _web({"enabled": True, "token": "t", "enroll_token": val}, monkeypatch)
+    assert web.enroll_token == ""
+    assert [c for c in cap if c.get("event") == "scribe.config.unresolved_token_placeholder"]
+
+
+def test_token_is_stripped_not_rejected(monkeypatch):
+    # A real token with stray surrounding whitespace still works (stripped, not blanked).
+    web = _web({"enabled": True, "token": "  DUMMY_INGEST_0001  "}, monkeypatch)
+    assert web.token == "DUMMY_INGEST_0001"
 
 
 def test_real_token_values_survive(monkeypatch):

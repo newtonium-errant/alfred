@@ -71,7 +71,9 @@ def read_close_manifest(path: Path, *, require: bool) -> tuple[int | None, bool]
     (``ambiguous=True``) regardless of ``require``."""
     try:
         content = Path(path).read_text(encoding="utf-8")
-    except OSError:
+    except Exception:  # noqa: BLE001 — SAME CLASS: a torn sentinel yields invalid UTF-8
+        # (UnicodeDecodeError, a ValueError, not an OSError). Unreadable => treat as empty
+        # (ambiguous under strict => fail-closed, never READY), never raise into the sweep.
         # sentinel vanished between the exists() check and the read — treat like
         # empty (ambiguous under strict, legacy-tolerant otherwise).
         return (None, require)

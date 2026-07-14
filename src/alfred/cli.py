@@ -2757,16 +2757,23 @@ def _cmd_scribe_presets(args: argparse.Namespace) -> None:
                     preset, _ = en.load_preset(pf)
                     if preset is not None:
                         names[preset.preset_id] = preset.name
-        if not audit_path.is_file():
+        try:
+            audit_lines = (audit_path.read_text(encoding="utf-8").splitlines()
+                           if audit_path.is_file() else [])
+        except Exception:  # noqa: BLE001 — a TORN audit.log (invalid UTF-8) must not
+            # traceback the operator CLI; report it and continue to the orphan check.
+            print("Enroll audit is UNREADABLE (corrupt/torn) — skipping.")
+            audit_lines = []
+        if not audit_lines:
             print("No enroll audit events yet.")    # intentionally-left-blank
         else:
             print("Enroll audit:")
-            for line in audit_path.read_text(encoding="utf-8").splitlines():
+            for line in audit_lines:
                 if not line.strip():
                     continue
                 try:
                     row = json.loads(line)
-                except json.JSONDecodeError:
+                except Exception:  # noqa: BLE001 — skip a bad line, never crash
                     continue
                 pid = row.get("preset_id")
                 name = names.get(pid, "?") if pid else "-"

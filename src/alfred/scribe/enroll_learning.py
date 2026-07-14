@@ -192,13 +192,15 @@ def has_diarize_stats_for(
             for line in f:
                 try:
                     row = json.loads(line)
-                except json.JSONDecodeError:
+                except Exception:  # noqa: BLE001 — a bad LINE is skipped, not fatal
                     continue
                 if (row.get("kind") == KIND_DIARIZE_STATS
                         and row.get("preset_id") == preset_id
                         and row.get("centroid_version") == centroid_version):
                     return True
-    except OSError:
+    except Exception:  # noqa: BLE001 — the sink is APPEND-ONLY and may be torn: iterating
+        # it can raise UnicodeDecodeError (invalid UTF-8 — a ValueError, NOT an OSError).
+        # A corrupt sink must never propagate into the pipeline's fail-open path.
         return False
     return False
 

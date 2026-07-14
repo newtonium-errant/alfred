@@ -420,8 +420,15 @@ def _coerce_secret(value: Any, *, field: str) -> str:
     both directions."""
     if value is None:
         return ""
-    s = str(value)
-    if s.startswith("${"):
+    # STRIP first: a whitespace-only token ("   ") is TRUTHY and would ARM the face with a
+    # blank-ish bearer. Normalize it to "" (inert) — the same defect class as the YAML-null.
+    s = str(value).strip()
+    if not s:
+        return ""
+    # ``"${" in s`` — NOT ``startswith``. An unresolved placeholder is just as dangerous
+    # ANYWHERE in the value ("pre-${VAR}", "abc${SUFFIX}" all survive substitution as a
+    # literal, guessable string). A prefix-only check is narrower than the threat it names.
+    if "${" in s:
         log.error(
             "scribe.config.unresolved_token_placeholder",
             field=field,

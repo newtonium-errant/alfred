@@ -58,7 +58,10 @@ def load_ledger(path: Path) -> Transcript | None:
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
+    except Exception as e:  # noqa: BLE001 — SAME CLASS as the P4-5 load-contract hole: a
+        # torn ledger yields invalid UTF-8 (UnicodeDecodeError) / deep nesting yields
+        # RecursionError, neither an OSError/JSONDecodeError. Any read failure must
+        # degrade to "no ledger" (re-fold from chunks), never block the encounter.
         log.warning(
             "scribe.ledger.unreadable",
             # OPAQUE BASENAME ONLY (``enc-xxx.transcript.json``). ``str(p)`` would

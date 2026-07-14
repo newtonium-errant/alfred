@@ -216,7 +216,10 @@ def _read_provenance(audio_path: Path) -> dict[str, Any]:
     try:
         data = json.loads(meta.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, OSError):
+    except Exception:  # noqa: BLE001 — a TORN sidecar yields invalid UTF-8
+        # (UnicodeDecodeError, a ValueError — not an OSError/JSONDecodeError). It escaped
+        # the old guard and propagated out of accumulate_encounter, blocking the encounter
+        # forever. Fail-closed to {}: guard_ingest then REFUSES the chunk in synthetic mode.
         return {}
 
 

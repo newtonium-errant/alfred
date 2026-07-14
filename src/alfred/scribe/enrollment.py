@@ -340,20 +340,23 @@ def load_preset(path: Path) -> tuple[Preset | None, str | None]:
     (``resolve_for_encounter`` → ``accumulate_encounter``, ``list_user_presets`` →
     the presets CLI + ``GET /scribe/presets``, ``_find_usable_preset`` → the binding
     route) relies on it to fail OPEN; a raise here blocks the encounter forever."""
+    # ONE belt around the WHOLE load — the READ and the PARSE included. A guard whose
+    # exception set is NARROWER than the corruption it names is not a guard: a torn write
+    # produces INVALID UTF-8, and ``read_text`` raises UnicodeDecodeError (a ValueError —
+    # NOT an OSError, NOT a JSONDecodeError); deeply-nested JSON raises RecursionError (a
+    # RuntimeError). Both escaped the old ``except (OSError, json.JSONDecodeError)`` and
+    # propagated out of this "NEVER raises" path — blocking the bound encounter on every
+    # sweep FOREVER, 500-ing /scribe/presets + /scribe/status, and (since the cap check
+    # now loads each file) breaking ALL FUTURE ENROLLMENTS for that user.
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None, CLASS_CORRUPT
-    if not isinstance(data, dict):
-        return None, CLASS_CORRUPT
-    try:
+        if not isinstance(data, dict):
+            return None, CLASS_CORRUPT
         fail = _structural_ok(data, path)
         if fail is not None:
             return None, fail
         return Preset.from_dict(data), None
-    except Exception:  # noqa: BLE001 — BELT: the load path NEVER raises. _structural_ok's
-        # teeth should catch every malformed shape, but a construction/validation failure
-        # must CLASSIFY (corrupt), never propagate and block an encounter (fail-open).
+    except Exception:  # noqa: BLE001 — EVERY failure CLASSIFIES (corrupt); never raises.
         return None, CLASS_CORRUPT
 
 
@@ -520,7 +523,11 @@ def read_binding(enc_dir: str | Path) -> dict[str, Any] | None:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
-    except (OSError, json.JSONDecodeError):
+    except Exception:  # noqa: BLE001 — same class as load_preset: a torn write yields
+        # INVALID UTF-8 (UnicodeDecodeError, a ValueError) and deep nesting yields
+        # RecursionError — neither is an OSError/JSONDecodeError. An unreadable binding
+        # must resolve to None (→ classified `corrupt`/artifact=binding upstream), never
+        # raise into the caller's fail-open path.
         return None
 
 
