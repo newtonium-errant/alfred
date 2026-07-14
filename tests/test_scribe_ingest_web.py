@@ -534,7 +534,9 @@ def test_status_non_phi_only(tmp_path):
     st, body = asyncio.run(_go())
     assert st == 200
     # NON-PHI keys ONLY — no transcript/draft/segment/body field may appear (R2).
-    assert set(body) == {"encounter_id", "chunks", "max_seq", "closed", "state"}
+    # P4-5a adds preset_fit (a non-PHI enum: unarmed|ok).
+    assert set(body) == {"encounter_id", "chunks", "max_seq", "closed", "state", "preset_fit"}
+    assert body["preset_fit"] == "unarmed"    # no binding on this encounter
     assert body["chunks"] == 2 and body["max_seq"] == 2 and body["closed"] is True
     assert body["state"] == "closed"
     assert body["encounter_id"] == compute_encounter_id(_LABEL, salt=_SALT)

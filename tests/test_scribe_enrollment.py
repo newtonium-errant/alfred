@@ -261,6 +261,21 @@ def test_resolve_digest_mismatch_fails_open(tmp_path):
     assert r == en.REFUSAL_DIGEST_MISMATCH
     unusable = [c for c in caps if c.get("event") == "scribe.enrollment.unusable"]
     assert len(unusable) == 1 and unusable[0]["reason"] == en.REFUSAL_DIGEST_MISMATCH
+    assert unusable[0]["artifact"] == "binding"       # a stale binding, not a bad preset
+
+
+def test_resolve_refusal_artifact_disambiguates_preset(tmp_path):
+    # A preset-derived refusal (revoked) logs artifact="preset" — so diagnosis never
+    # conflates a corrupt binding with a corrupt/bad preset.
+    d = tmp_path / "enroll"; enc = tmp_path / "enc"
+    p = _make_preset()
+    en.write_preset(d, p, is_new=True)
+    en.write_binding(enc, p)
+    en.revoke_preset(d, "np_jamie", p.preset_id, reason="x")
+    with structlog.testing.capture_logs() as caps:
+        en.resolve_for_encounter(enc, d, _fp())
+    u = [c for c in caps if c.get("event") == "scribe.enrollment.unusable"][0]
+    assert u["reason"] == en.REFUSAL_REVOKED and u["artifact"] == "preset"
 
 
 def test_resolve_revoked(tmp_path):

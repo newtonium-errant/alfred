@@ -485,22 +485,26 @@ def resolve_for_encounter(
     never a silent re-anchor (the safety-BLOCK laundering close)."""
     binding = read_binding(enc_dir)
     if binding is None:
-        return _refuse(REFUSAL_NO_BINDING, enc_dir)
+        return _refuse(REFUSAL_NO_BINDING, enc_dir, artifact="binding")
     user = binding.get("user")
     preset_id = binding.get("preset_id")
     if not (valid_user(user) and isinstance(preset_id, str) and PRESET_ID_RE.fullmatch(preset_id)):
-        return _refuse(REFUSAL_CORRUPT, enc_dir, preset_id=preset_id)
+        # The BINDING artifact itself is malformed (distinct from a corrupt PRESET).
+        return _refuse(REFUSAL_CORRUPT, enc_dir, preset_id=preset_id, artifact="binding")
     path = preset_path(enrollment_dir, user, preset_id)
     if not path.is_file():
-        return _refuse(REFUSAL_UNKNOWN_PRESET, enc_dir, preset_id=preset_id)
+        return _refuse(REFUSAL_UNKNOWN_PRESET, enc_dir, preset_id=preset_id, artifact="preset")
     preset, fail = load_preset(path)
     cls = classify(preset, fail, engine_fingerprint)
     if cls != CLASS_USABLE:
-        # The classification IS the refusal reason (they share the same vocabulary).
-        return _refuse(cls, enc_dir, preset_id=preset_id)
+        # The classification IS the refusal reason (they share the same vocabulary);
+        # it derives from the PRESET file.
+        return _refuse(cls, enc_dir, preset_id=preset_id, artifact="preset")
     assert preset is not None
     if binding.get("centroid_digest") != preset.centroid_digest:
-        return _refuse(REFUSAL_DIGEST_MISMATCH, enc_dir, preset_id=preset_id)
+        # The BINDING's pinned digest no longer matches the preset (stale binding /
+        # mid-encounter re-record) — the artifact at fault is the binding.
+        return _refuse(REFUSAL_DIGEST_MISMATCH, enc_dir, preset_id=preset_id, artifact="binding")
     return ResolvedEnrollment(
         user=preset.user, preset_id=preset.preset_id,
         centroid_version=preset.centroid_version, centroids=preset.centroids,
@@ -508,10 +512,40 @@ def resolve_for_encounter(
     )
 
 
-def _refuse(reason: str, enc_dir: str | Path, *, preset_id: str | None = None) -> str:
+def preset_fit_for_status(
+    enc_dir: str | Path, enrollment_dir: str | Path, engine_fingerprint: dict[str, Any],
+) -> str:
+    """P4-5a ``preset_fit`` for ``GET /scribe/status``: ``"ok"`` iff a bound preset
+    resolves USABLE (present, classifies usable, digest matches), else ``"unarmed"``.
+    NON-LOGGING by design — a status poll must not spam ``scribe.enrollment.unusable``
+    (the real resolution + its one log happens in the pipeline). 5a emits only
+    ``unarmed|ok``; ``warming|weak|none`` activate with the 5b latch."""
+    if not str(enrollment_dir or ""):
+        return "unarmed"
+    binding = read_binding(enc_dir)
+    if binding is None:
+        return "unarmed"
+    user, preset_id = binding.get("user"), binding.get("preset_id")
+    if not (valid_user(user) and isinstance(preset_id, str) and PRESET_ID_RE.fullmatch(preset_id)):
+        return "unarmed"
+    path = preset_path(enrollment_dir, user, preset_id)
+    if not path.is_file():
+        return "unarmed"
+    preset, fail = load_preset(path)
+    if classify(preset, fail, engine_fingerprint) != CLASS_USABLE:
+        return "unarmed"
+    assert preset is not None
+    return "ok" if binding.get("centroid_digest") == preset.centroid_digest else "unarmed"
+
+
+def _refuse(reason: str, enc_dir: str | Path, *, preset_id: str | None = None,
+            artifact: str = "preset") -> str:
     log.warning(
         "scribe.enrollment.unusable",
         reason=reason,
+        artifact=artifact,                      # "binding" | "preset" — disambiguates a
+                                                # corrupt binding from a corrupt preset in
+                                                # diagnosis (the enum stays 8; the log widens)
         preset_id=preset_id,                    # id-only, never a name (PHI-free)
         detail="bound preset could not be resolved — encounter runs all-unknown "
                "(fail-open); the P4-2 banner fires. No block.",

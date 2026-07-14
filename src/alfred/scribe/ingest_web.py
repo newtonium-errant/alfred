@@ -104,7 +104,47 @@ PAGE_ROUTE = "/"
 APP_JS_ROUTE = "/scribe/app.js"
 _BEARER_EXEMPT_PATHS: frozenset[str] = frozenset({PAGE_ROUTE, APP_JS_ROUTE})
 
+# --- P4-5a — enrollment rides THIS server; TWO-TOKEN capability split ---------
+# The enroll routes require the ``enroll_token`` (biometric-custody capability),
+# DISTINCT from the ingest ``token`` (encounter capability): the `web`/`web_ingest`
+# peer-pin lesson applied to this standalone server, so page possession (which
+# carries the ingest token) can never grant biometric mutation. Handlers live in
+# ``enroll_web``; ``create_ingest_app`` registers them. Classification HERE is the
+# security gate. A token valid for the OTHER class → ``wrong_token_class`` 401.
+ENROLL_TOKEN_ROUTES: frozenset[str] = frozenset({
+    "/scribe/enroll/start", "/scribe/enroll/chunk", "/scribe/enroll/finalize",
+    "/scribe/enroll/result", "/scribe/enroll/abandon",
+    "/scribe/presets/rename", "/scribe/presets/delete",
+})
+PRESETS_LIST_ROUTE = "/scribe/presets"                   # auth: EITHER token (metadata only)
+ENCOUNTER_PRESET_ROUTE = "/scribe/encounter/preset"      # auth: ingest token (encounter-class)
+# Every enroll-face path (for the inert-when-tokenless 404 gate).
+_ALL_ENROLL_PATHS: frozenset[str] = ENROLL_TOKEN_ROUTES | {PRESETS_LIST_ROUTE}
+
 _Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
+
+
+def _authorize_route(
+    path: str, provided: str, *, ingest_tok: str, enroll_tok: str,
+) -> tuple[bool, str]:
+    """Two-token authorization for a non-exempt API route → ``(ok, reason)``.
+
+    A token valid for the OTHER capability class → ``wrong_token_class`` (the
+    ``*_wrong_peer`` analog — a real privilege boundary, not a typo); anything else
+    invalid → ``bad_token``. Constant-time compares; fail-closed on an empty
+    configured/provided token."""
+    def _match(tok: str) -> bool:
+        return bool(tok and provided and secrets.compare_digest(provided, tok))
+    is_ingest, is_enroll = _match(ingest_tok), _match(enroll_tok)
+    if path in ENROLL_TOKEN_ROUTES:
+        if is_enroll:
+            return True, ""
+        return False, "wrong_token_class" if is_ingest else "bad_token"
+    if path == PRESETS_LIST_ROUTE:                       # either token clears metadata
+        return (True, "") if (is_enroll or is_ingest) else (False, "bad_token")
+    if is_ingest:                                        # ingest-class (chunk/close/status/encounter-preset)
+        return True, ""
+    return False, "wrong_token_class" if is_enroll else "bad_token"
 
 
 # --- PHI-safe helpers -------------------------------------------------------
@@ -203,6 +243,7 @@ def _build_security_middleware(config: ScribeConfig):
     web_cfg = config.ingest_web
     port = web_cfg.port
     token = web_cfg.token
+    enroll_tok = web_cfg.enroll_token   # P4-5a biometric-custody capability (may be "")
     # The pinned loopback authorities — the configured host + the loopback
     # literals, at the bound port. A DNS-rebind request carries the attacker
     # DOMAIN as its Host authority → not in this set → rejected.
@@ -240,11 +281,18 @@ def _build_security_middleware(config: ScribeConfig):
                 log.warning("scribe.ingest_web.rejected", route=request.path, reason="cross_origin_fetch")
                 return _reject("cross_origin", 421)
         else:
-            # (R3.3) bearer token — constant-time compare, fail-closed on an empty
-            # configured or provided token. REQUIRED on the API routes.
+            # (R3.3) bearer token — TWO-TOKEN split (P4-5a). Each route class pins ITS
+            # token; a token valid for the OTHER class → wrong_token_class 401.
             provided = _bearer(request)
-            if not (token and provided and secrets.compare_digest(provided, token)):
-                log.warning("scribe.ingest_web.rejected", route=request.path, reason="bad_token")
+            path = request.path
+            # INERT enrollment face: enroll_token unset ⇒ the enroll-face routes are
+            # 404 (the biometric face is ABSENT, not merely unauthorized). The
+            # ingest-class routes stay bearer-required as before.
+            if path in _ALL_ENROLL_PATHS and not enroll_tok:
+                return _reject("enroll_inert", 404)
+            ok, reason = _authorize_route(path, provided, ingest_tok=token, enroll_tok=enroll_tok)
+            if not ok:
+                log.warning("scribe.ingest_web.rejected", route=path, reason=reason)
                 return _reject("unauthorized", 401)
         resp = await handler(request)
         # (R3.2) NEVER emit CORS. Defensively strip any a handler/library added.
@@ -477,6 +525,16 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
     existing = _existing_seqs(enc_dir)
     closed = (enc_dir / CLOSE_SENTINEL_NAME).exists()
     state = "closed" if closed else ("recording" if existing else "pending")
+    # P4-5a preset_fit (unarmed|ok in 5a). Non-logging status probe; fail-safe to
+    # 'unarmed' so status never breaks on an enrollment-layer hiccup.
+    preset_fit = "unarmed"
+    try:
+        from alfred.scribe import embed_voice as _ev
+        from alfred.scribe import enrollment as _en
+        preset_fit = _en.preset_fit_for_status(
+            enc_dir, config.diarize.enrollment_dir, _ev.engine_fingerprint(config))
+    except Exception:  # noqa: BLE001 — status must never 500 on the enrollment layer
+        preset_fit = "unarmed"
     return web.json_response(
         {
             "encounter_id": encounter_id,
@@ -484,6 +542,7 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
             "max_seq": existing[-1] if existing else 0,
             "closed": closed,
             "state": state,
+            "preset_fit": preset_fit,
         },
         status=200,
     )
@@ -543,6 +602,18 @@ def create_ingest_app(config: ScribeConfig) -> web.Application:
     # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
     app.router.add_get(PAGE_ROUTE, _handle_page)
     app.router.add_get(APP_JS_ROUTE, _handle_app_js)
+    # P4-5a enrollment face (biometric-custody capability). Registered ALWAYS; the
+    # middleware 404s the enroll-face paths when enroll_token is unset (INERT). Lazy
+    # import avoids an enroll_web↔ingest_web cycle.
+    if config.ingest_web.enroll_token:
+        from alfred.scribe import enroll_web
+        enroll_web.register_enroll_routes(app)
+    else:
+        log.info(
+            "scribe.enroll.inert",
+            detail="scribe.ingest_web.enroll_token is unset — the voice-enrollment "
+                   "face is INERT (enroll routes 404). Set enroll_token to arm it.",
+        )
     return app
 
 
