@@ -800,6 +800,22 @@ def test_behaviour_teardown_during_finalize_call_does_not_render_the_refusal(tmp
     assert "/scribe/enroll/finalize" in paths
 
 
+def test_behaviour_stale_bail_never_clobbers_a_newer_enrolments_mic_claim(tmp_path):
+    # THE OWNERSHIP-DISCIPLINE INVARIANT — the fix's load-bearing property, and precisely the
+    # "survives a green suite" class: every OTHER await-teardown scenario is single-capture, so
+    # a bail that wrongly clears micOwner is a no-op there. This is the multi-capture race that
+    # gives the invariant teeth. Capture A parks on getUserMedia across a teardown (the belt
+    # frees micOwner); capture B claims the freed mic and parks on /enroll/start; A resumes at
+    # GEN CHECK #1, STALE. A must stop only its OWN stream — never write micOwner, which B now
+    # owns. An unconditional clear reopens the 2-mic consent breach the whole fix closed.
+    res = _drive("ownership_stale_bail_keeps_newer_claim", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" in paths               # capture B reached the claim-holding state
+    assert "/scribe/ingest-chunk" not in paths           # the encounter was REFUSED (B owns the mic)
+    assert "voiceprint recording first" in res["status"] # ...with the mutual-exclusion copy
+    assert res["micOpens"] == 2                           # A + B only; a 3rd = the encounter's = breach
+
+
 # ── WARN-1: hash routing (the shim's no-op addEventListener hid this entirely) ─
 
 def test_behaviour_hash_routing_toggles_the_two_views(tmp_path):

@@ -140,6 +140,12 @@ switch (scenario) {
     // never reaches the poll on a !ok finalize.)
     cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
     cfg.holdEnrollFinalize = true; cfg.finalizeStatus = 409; break;
+  case 'ownership_stale_bail_keeps_newer_claim':
+    // TWO captures: A parks on getUserMedia (HELD, first call); B claims the belt-freed mic and
+    // parks on /enroll/start (HELD). A then resumes stale. instantWindow lets the mutant's
+    // wrongly-permitted encounter emit a chunk so the breach is observable.
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
+    cfg.holdFirstGetUserMedia = true; cfg.holdEnrollStart = true; cfg.instantWindow = true; break;
   // THE INERT BOX — the DEFAULT ship posture: enroll_token unset ⇒ EVERY enroll-face path
   // 404s, /scribe/presets included (it is on the enroll face).
   case 'inert_record_view':
@@ -533,6 +539,29 @@ try {
     globalThis.__releaseEnrollResult();     // /result resolves 'done' → finalize GEN CHECK bails
     await settle(40);
     out.enrollBody = el('enroll-body').innerHTML;
+  } else if (scenario === 'ownership_stale_bail_keeps_newer_claim') {
+    // OWNERSHIP DISCIPLINE — a STALE captureEnroll bail must NEVER write micOwner: by the time
+    // it resumes, a NEWER enrolment owns the claim. Capture A parks on getUserMedia across a
+    // teardown (the belt frees micOwner); capture B then claims that freed mic and parks on
+    // /enroll/start; A resumes at GEN CHECK #1, stale. If A clears micOwner it clobbers B's
+    // claim, and the encounter Start below opens a SECOND mic on the live surface — the exact
+    // 2-mic breach. Correct code leaves B's claim intact and the encounter is refused.
+    await openEnrollWithToken();
+    el('en-go').click();                 // capture A: claims mic, parks on getUserMedia (HELD)
+    await settle(15);
+    await setHash('#/record');           // teardown: bumps gen, belt frees micOwner
+    await settle(10);
+    await setHash('#/presets');          // back to stage capture B
+    el('new-preset').click();            // enroll token is cached → stages en-go immediately
+    await settle(12);
+    el('en-go').click();                 // capture B: claims the FREED mic, parks on /enroll/start (HELD)
+    await settle(15);
+    globalThis.__releaseGum();           // capture A resumes GEN CHECK #1 (stale)
+    await settle(20);
+    el('start').click();                 // encounter MUST be refused — B still owns the mic
+    await settle(25);
+    out.status = el('status').textContent;
+    out.micOpens = micOpens.n;           // 2 (A + B); a 3rd = the encounter opened a mic = breach
   } else if (scenario === 'teardown_during_finalize_call') {
     await openEnrollWithToken();
     el('en-go').click();
