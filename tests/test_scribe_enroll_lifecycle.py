@@ -350,6 +350,46 @@ async def test_session_bytes_cap_refuses_and_logs(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_same_seq_posts_append_only_once(tmp_path):
+    # The seq DEDUP CHECK must live in the post-read ATOMIC region. A check made BEFORE
+    # the `await request.read()` is passed by BOTH concurrent same-seq POSTs, which then
+    # both append — a duplicated window inflates net-speech past the 10 s HARD gate and
+    # biases the trimmed-mean centroid. (The caps themselves are already race-free: the
+    # check+append block contains no await, so the loop cannot interleave it.)
+    async with _serve(_config(tmp_path)) as (base, cfg):
+        p = cfg.ingest_web.port
+        async with aiohttp.ClientSession() as s:
+            st, b = await _start(s, base, p)
+            sid = b["session"]
+
+            async def _post():
+                # large enough that request.read() genuinely yields
+                async with s.post(base + ew.ENROLL_CHUNK,
+                                  params={"session": sid, "seq": "1"},
+                                  data=_win(512), headers=_h(_ENROLL, p)) as r:
+                    return r.status
+            await asyncio.gather(*[_post() for _ in range(6)])   # same seq, concurrent
+            assert len(ew._SESSIONS[sid].windows) == 1           # appended EXACTLY once
+
+
+@pytest.mark.asyncio
+async def test_concurrent_chunk_posts_never_exceed_the_window_cap(tmp_path):
+    async with _serve(_config(tmp_path)) as (base, cfg):
+        p = cfg.ingest_web.port
+        async with aiohttp.ClientSession() as s:
+            st, b = await _start(s, base, p)
+            sid = b["session"]
+
+            async def _post(i):
+                async with s.post(base + ew.ENROLL_CHUNK,
+                                  params={"session": sid, "seq": str(i)},
+                                  data=_win(512), headers=_h(_ENROLL, p)) as r:
+                    return r.status
+            await asyncio.gather(*[_post(i) for i in range(ew._MAX_WINDOWS * 4)])
+            assert len(ew._SESSIONS[sid].windows) <= ew._MAX_WINDOWS
+
+
+@pytest.mark.asyncio
 async def test_window_and_session_cap_hits_are_logged(tmp_path):
     async with _serve(_config(tmp_path)) as (base, cfg):
         p = cfg.ingest_web.port

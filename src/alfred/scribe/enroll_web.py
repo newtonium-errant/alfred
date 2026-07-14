@@ -260,7 +260,8 @@ async def handle_enroll_chunk(request: web.Request) -> web.StreamResponse:
         return _reject("unknown_session", 404)
     # B2 SEQ IDEMPOTENCY (the contract's ?seq). A retried window must be a NO-OP, not a
     # second append. ``seq`` is optional — a client that omits it gets the legacy
-    # append-every-POST behavior (no dedup possible).
+    # append-every-POST behavior (no dedup possible). Parsed here for a fast 400; the
+    # DEDUP CHECK ITSELF must happen below (see the atomicity note).
     seq_i: int | None = None
     raw_seq = q.get("seq")
     if raw_seq is not None:
@@ -268,14 +269,26 @@ async def handle_enroll_chunk(request: web.Request) -> web.StreamResponse:
             seq_i = int(raw_seq)
         except (TypeError, ValueError):
             return _reject("invalid_seq", 400)
-        if seq_i in session.seen_seqs:
-            # already appended — idempotent replay, NOT a second window.
-            return web.json_response(
-                {"windows": len(session.windows), "duplicate": True}, status=200)
-    body = await request.read()
+
+    body = await request.read()                   # ← the ONLY await; it YIELDS
     if len(body) > _MAX_WINDOW_BYTES:
         log.warning("scribe.enroll.cap_hit", cap="window_bytes", limit=_MAX_WINDOW_BYTES)
         return _reject("window_too_large", 429)
+
+    # ══ ATOMIC REGION — NO `await` BELOW THIS LINE (load-bearing) ═══════════════════
+    # Everything from here to the return is SYNCHRONOUS, so the event loop cannot
+    # interleave another chunk POST between the checks and the append. That is what makes
+    # the caps and the seq-dedup race-free WITHOUT a lock. Both the dedup check and the
+    # state re-check MUST live here, not before the read: a check made BEFORE the await
+    # can be passed by two concurrent same-seq POSTs, which would then both append (a
+    # duplicated window inflates net-speech past the 10 s HARD gate and biases the
+    # centroid). ⚠ If you ever add an `await` inside this region, you MUST introduce a
+    # per-session lock — the atomicity is the invariant, not an accident.
+    if session.state != "recording":              # finalize/abandon raced during the read
+        return _reject("unknown_session", 404)
+    if seq_i is not None and seq_i in session.seen_seqs:
+        return web.json_response(                 # idempotent replay — NOT a second window
+            {"windows": len(session.windows), "duplicate": True}, status=200)
     if len(session.windows) >= _MAX_WINDOWS:
         log.warning("scribe.enroll.cap_hit", cap="windows", limit=_MAX_WINDOWS)
         return _reject("too_many_windows", 429)
