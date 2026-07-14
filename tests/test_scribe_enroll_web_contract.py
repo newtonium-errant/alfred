@@ -518,3 +518,54 @@ def test_fake_bytes_per_sec_is_fake_path_only():
     src = inspect.getsource(ew._prepare_windows)
     assert src.count("_FAKE_BYTES_PER_SEC") == 1                       # fake branch only
     assert "_ONBOX_NET_SPEECH_PLACEHOLDER_BYTES_PER_SEC" in src        # real branch uses the on-box one
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SERVER-SIDE MRU (the picker's default) — R5 forbids the client remembering it
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_mru_is_the_most_recently_bound_usable_preset(tmp_path):
+    # The PWA picker pre-selects the MRU. R5 is ABSOLUTE (no localStorage), so the
+    # client CANNOT remember the last choice — the server derives it from the BINDING
+    # files (the real "last used", not merely the last edited).
+    async with _serve(_config(tmp_path)) as (base, cfg):
+        p = cfg.ingest_web.port
+        async with aiohttp.ClientSession() as s:
+            a = await _enroll_full(s, base, p, name="A")
+            b = await _enroll_full(s, base, p, name="B")
+            # with NO binding yet there is no MRU (the picker defaults to "no preset").
+            async with s.get(base + ew.PRESETS_LIST, params={"user": _USER},
+                             headers=_h(_ENROLL, p)) as r:
+                assert (await r.json())["mru_preset_id"] is None
+            # bind B to an encounter → B becomes the MRU.
+            async with s.post(base + ew.ENCOUNTER_PRESET,
+                              params={"label": _LABEL, "preset": b["preset_id"]},
+                              headers=_h(_INGEST, p)) as r:
+                assert r.status == 200
+            async with s.get(base + ew.PRESETS_LIST, params={"user": _USER},
+                             headers=_h(_ENROLL, p)) as r:
+                body = await r.json()
+    assert body["mru_preset_id"] == b["preset_id"]
+    assert body["mru_preset_id"] != a["preset_id"]
+
+
+@pytest.mark.asyncio
+async def test_mru_never_offers_an_unusable_preset(tmp_path):
+    # A revoked/incompatible preset must NOT be the default — it would strand the
+    # clinician on a preset they must re-record before it can attribute anything.
+    async with _serve(_config(tmp_path)) as (base, cfg):
+        p = cfg.ingest_web.port
+        async with aiohttp.ClientSession() as s:
+            a = await _enroll_full(s, base, p, name="A")
+            async with s.post(base + ew.ENCOUNTER_PRESET,
+                              params={"label": _LABEL, "preset": a["preset_id"]},
+                              headers=_h(_INGEST, p)) as r:
+                assert r.status == 200
+            # now DELETE it (tombstone) — the binding still names it, but it is unusable.
+            en.revoke_preset(cfg.diarize.enrollment_dir, _USER, a["preset_id"],
+                             reason="user_delete")
+            async with s.get(base + ew.PRESETS_LIST, params={"user": _USER},
+                             headers=_h(_ENROLL, p)) as r:
+                body = await r.json()
+    assert body["mru_preset_id"] is None            # not offered as the default

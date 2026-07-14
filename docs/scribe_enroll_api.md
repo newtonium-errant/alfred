@@ -121,13 +121,18 @@ client's "409 ⇒ advance" discipline is safe: no audio is ever lost to a bindin
 ## `/scribe/presets` response
 
 ```json
-{"user": "np_jamie", "state": "ok",
+{"user": "np_jamie", "state": "ok", "mru_preset_id": "pst-…",
  "presets": [{"preset_id": "pst-…", "name": "Clinic Room A", "status": "active",
               "classification": "usable", "centroid_version": 1,
               "quality": {"verdict": "ok_marginal", "advisory": {...}},
               "device_hint": {}, "created_at": "…", "updated_at": "…", "revoked": null}]}
 ```
 
+* `mru_preset_id` — the user's **most recently BOUND** preset that is still `usable`, or
+  `null`. **This is the picker's default.** It is server-derived (from the `_ENROLLMENT.json`
+  binding sidecars) *because it has to be*: R5 is absolute, so the client may not remember
+  the last choice in storage. An unusable (revoked / engine-incompatible) preset is never
+  offered as the default — it would strand the clinician on a preset that cannot attribute.
 * `state`: `empty` · `all_incompatible` · `ok` (empty-registry and all-incompatible are
   **distinct** explicit states — render them differently).
 * `classification`: `usable` · `incompatible_model` · `incompatible_engine` ·
@@ -153,6 +158,41 @@ latch. **The client MUST tolerate all five values today** (treat an unrecognised
 * An identical re-bind (same preset) is **idempotent 200**, even mid-recording (safe retry).
 * A binding failure must **never block Start** — "No preset — attribution off" is a
   first-class choice, and the encounter simply runs un-attributed.
+
+---
+
+---
+
+## The served page (what the client is given, and what it is NOT)
+
+`GET /` embeds two `data-` attributes on `<body>` for the same-origin JS (never an inline
+script — CSP forbids it):
+
+| Attribute | Contents | Why |
+|---|---|---|
+| `data-ingest-token` | the **INGEST** token | the JS needs it for chunks / close / status / **binding** |
+| `data-clinicians` | JSON array of `scribe.clinicians` slugs | the enrol view OFFERS the identity instead of making it hand-typed — the server matches it VERBATIM, so a typo would fail-close a consented recording with 403. Staff slugs, never PHI. |
+
+**The ENROLL token is NEVER embedded.** Page possession must not grant biometric mutation
+— the clinician pastes it once per page-load, memory-only (a reload asks again). There is
+no `data-enroll-*` attribute, and there never should be.
+
+## Device containers (the phone is an iPhone — operator ruling)
+
+Do **not** hardcode `webm`. The recorder negotiates a supported type and the client sends
+what the device actually produced:
+
+* **Enrolment** — the server **sniffs** the container (webm EBML / mp4 `ftyp`) and
+  **ignores `?ext`**, so iOS `audio/mp4` works as-is.
+* **Encounter** — `/scribe/ingest-chunk` validates `?ext` against a frozen allowlist
+  (`wav ogg mp3 m4a flac webm`) that has **no `mp4`**. iOS emits `audio/mp4`, which is
+  **AAC-in-MP4 — whose conventional extension is `m4a`**, and `m4a` *is* on the allowlist,
+  *is* swept, and *is* decoded (ffmpeg/whisper sniff by content, not by filename).
+  **So the client maps `audio/mp4` → `ext=m4a`.** This honours the iPhone ruling without
+  reopening the frozen #49 ext contract. `audio/webm` → `webm`; `audio/ogg` → `ogg`.
+
+⚠ On-box smoke must still confirm a **real iPhone `m4a` chunk decodes end-to-end** — the
+mapping is correct by construction but has only been exercised against a shim.
 
 ---
 

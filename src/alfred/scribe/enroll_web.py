@@ -573,7 +573,44 @@ async def handle_presets_list(request: web.Request) -> web.StreamResponse:
     # empty-registry vs all-incompatible are DISTINCT explicit states.
     state = "empty" if not presets else (
         "all_incompatible" if all(x["classification"] != en.CLASS_USABLE for x in presets) else "ok")
-    return web.json_response({"user": user, "state": state, "presets": presets}, status=200)
+    # SERVER-SIDE MRU (the memo's picker default). It MUST be server-derived: R5 is
+    # ABSOLUTE (no localStorage), so the client cannot remember the last choice itself.
+    # Derived from the BINDING files — the most recently BOUND preset for this user —
+    # which is the real "last used", not merely the last edited.
+    mru = _mru_preset_id(config, user, {p["preset_id"] for p in presets
+                                        if p["classification"] == en.CLASS_USABLE})
+    return web.json_response(
+        {"user": user, "state": state, "presets": presets, "mru_preset_id": mru}, status=200)
+
+
+def _mru_preset_id(config: ScribeConfig, user: str, usable_ids: set[str]) -> str | None:
+    """The user's most-recently-BOUND preset id that is still USABLE, else ``None``.
+
+    Scans the encounter inbox's ``_ENROLLMENT.json`` sidecars (ids + ``bound_at`` only —
+    never audio, never PHI) and returns the newest binding whose preset is still in the
+    caller's usable set. A revoked / engine-incompatible / deleted preset is NOT offered
+    as the default (it would strand the clinician on a preset they must re-record).
+    Best-effort: any read problem simply yields no MRU (the picker then defaults to
+    'No preset — attribution off', which is a first-class choice)."""
+    input_dir = Path(config.input_dir)
+    if not input_dir.is_dir() or not usable_ids:
+        return None
+    best_id: str | None = None
+    best_at = ""
+    try:
+        for enc in input_dir.iterdir():
+            if not enc.is_dir():
+                continue
+            b = en.read_binding(enc)
+            if not b or b.get("user") != user:
+                continue
+            pid, bound_at = b.get("preset_id"), str(b.get("bound_at") or "")
+            # ISO-8601 UTC timestamps sort lexicographically == chronologically.
+            if pid in usable_ids and bound_at > best_at:
+                best_id, best_at = pid, bound_at
+    except OSError:
+        return None
+    return best_id
 
 
 async def handle_presets_rename(request: web.Request) -> web.StreamResponse:

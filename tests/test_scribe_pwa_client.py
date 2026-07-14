@@ -283,16 +283,30 @@ def test_pwa_label_gen_shape_matches_backend_regex():
     assert iw.ENCOUNTER_LABEL_RE.pattern == _LABEL_RE.pattern
 
 
+def _code(js: str = APP_JS) -> str:
+    """``APP_JS`` with comments stripped, so a pin binds actual CODE, not PROSE.
+
+    This matters: the original R5 pin grepped the raw source for ``localStorage`` and so
+    was tripped by a COMMENT that merely said "no localStorage" — a banned-token scan
+    over raw source cannot tell a call from a sentence. (No string literal in APP_JS
+    contains ``//``, so stripping line comments is safe here.)"""
+    js = re.sub(r"/\*.*?\*/", "", js, flags=re.DOTALL)
+    return re.sub(r"(?m)//.*$", "", js)
+
+
 def test_pwa_one_recorder_per_window_no_timeslice():
     # B2 — a FRESH MediaRecorder per window, started with NO timeslice arg (so a
     # single complete ondataavailable blob per window). A timeslice would produce
     # headerless clusters that fail chunk-by-chunk decode.
-    assert "new MediaRecorder(stream" in APP_JS
-    assert "recorder.start();" in APP_JS                    # NO argument = one blob at stop
-    # no timeslice: recorder.start(<number/var>) must NOT appear.
-    assert not re.search(r"\.start\(\s*[0-9A-Za-z_]", APP_JS)
-    # the recorder is re-created each window (startWindow re-entered on onstop).
-    assert "if (recording) { startWindow(); }" in APP_JS
+    code = _code()
+    assert "new MediaRecorder(" in code                     # a recorder is constructed
+    # NO timeslice anywhere: `.start(<arg>)` must not appear on ANY recorder.
+    assert not re.search(r"\.start\(\s*[0-9A-Za-z_]", code)
+    assert re.search(r"\.start\(\)\s*;", code)              # started with NO argument
+    # a NEW recorder per window on BOTH capture paths (encounter + enrolment) — the
+    # recorder is re-created inside the onstop re-entry, never reused.
+    assert "if (recording) { startWindow(); }" in code      # encounter loop
+    assert "if (live) { windowOnce(); }" in code            # enrolment loop
 
 
 def test_pwa_serial_in_flight_and_409_advance():
@@ -331,32 +345,248 @@ def test_pwa_no_dead_close_flag_on_chunk():
     # N2 (FIX 4) — the dead close-on-chunk branch is removed. The client NEVER sets
     # close=true on an ingest-chunk; the encounter is finalized solely by the
     # dedicated /scribe/close (robust even if a final chunk's 200 was lost).
-    assert "close" not in APP_JS.split("/scribe/ingest-chunk")[1].split("for (let attempt")[0]
-    assert "isFinal" not in APP_JS                          # the dead parameter is gone
-    assert "postChunk(captured, chunkSeq)" in APP_JS        # call site has no isFinal arg
+    code = _code()
+    assert "close" not in code.split("/scribe/ingest-chunk")[1].split("for (let attempt")[0]
+    assert "isFinal" not in code                            # the dead parameter is gone
+    # the chunk POST carries the seq AND the ext of the ACTUAL negotiated container.
+    assert re.search(r"postChunk\(captured, chunkSeq, ext\)", code)
 
 
 def test_pwa_no_browser_storage():
-    # R5 — memory-only. NO persistence of audio/status/token in the browser.
+    # R5 — memory-only. NO persistence of audio/status/TOKEN in the browser. Scanned
+    # over CODE (comments stripped): the prose legitimately names these APIs to say it
+    # does not use them, and a raw-source grep cannot tell a call from a sentence.
+    code = _code()
     for banned in ("localStorage", "sessionStorage", "indexedDB", "IndexedDB",
-                   "serviceWorker", "navigator.serviceWorker", "caches.",
-                   "CacheStorage", ".register("):
-        assert banned not in APP_JS, f"R5 violation: {banned} present"
-    # cache:'no-store' on every fetch (belt).
-    assert "cache: 'no-store'" in APP_JS
-    # no offline-caching manifest / SW in the page either.
+                   "serviceWorker", "caches.", "CacheStorage", ".register("):
+        assert banned not in code, f"R5 violation: {banned} present in CODE"
+    assert "cache: 'no-store'" in code                      # belt on every fetch
     html = render_index(_TOKEN)
     assert "serviceWorker" not in html and "manifest" not in html
 
 
-def test_pwa_has_no_patient_identifier_field():
-    # R6 — NO patient-identifier field feeds the label; the id is a machine token.
-    # The correct check is "no form control that could capture an identifier"
-    # (an input/textarea/select/contenteditable). Reassuring COPY that mentions
-    # "patient identifiers" (to state there are none) is fine — it's not a field.
-    html = render_index(_TOKEN).lower()
-    for control in ("<input", "<textarea", "<select", "contenteditable"):
-        assert control not in html, f"R6: identifier-capable form control present: {control}"
+def test_pwa_record_view_has_no_free_text_field_and_label_is_machine_minted():
+    # R6 (EVOLVED for the enrolment UI — the old pin asserted the page had ZERO form
+    # controls, which a preset PICKER and a voiceprint NAME field necessarily break).
+    # The invariant that actually matters is narrower and stronger:
+    #   (1) NOTHING captures a patient identifier into the ENCOUNTER path, and
+    #   (2) NO DOM value feeds the encounter LABEL — it stays a machine token.
+    html = render_index(_TOKEN)
+    record = html.split('<section id="view-record">')[1].split("</section>")[0].lower()
+    # the record view has NO free-text input at all (only a <select> whose options are
+    # SERVER-provided preset names — it cannot capture typed text).
+    for control in ("<input", "<textarea", "contenteditable"):
+        assert control not in record, f"R6: free-text control in the RECORD view: {control}"
+    # the label is minted from a crypto nonce; no element value feeds it.
+    code = _code()
+    assert re.search(r"function newLabel\(\)[^}]*crypto\.getRandomValues", code, re.DOTALL)
+    assert "getElementById" not in code.split("function newLabel()")[1].split("}")[0]
+
+
+def test_pwa_only_free_text_inputs_are_token_and_voiceprint_name():
+    # The ONLY free-text inputs in the whole client are (a) the enrol-token paste and
+    # (b) the voiceprint NAME. Pin their identity + their safety properties, so a future
+    # edit cannot quietly add a third (e.g. a patient field) without failing here.
+    code = _code()
+    ids = set(re.findall(r"<input id=\"([a-z0-9_-]+)\"", code))
+    assert ids == {"tok", "nm", "nm2"}, f"unexpected free-text input(s): {ids}"
+    # the token field is a password box, never autofilled, and never persisted.
+    assert re.search(r"<input id=\"tok\" type=\"password\" autocomplete=\"off\"", code)
+    # the NAME fields carry the memo's guidance + the backend's 64-char cap.
+    assert code.count("name the place and mic, not a patient") == 2   # rename + verdict
+    assert code.count('maxlength="64"') == 2
+    # the name is enrolment metadata only — it NEVER feeds the encounter label.
+    assert "newLabel" not in code.split("nm2-ok")[1]
+
+
+def test_pwa_enroll_token_is_never_embedded_in_the_page():
+    # The two-token split's whole point: page possession must NOT grant biometric
+    # mutation. The INGEST token is embedded (the JS needs it); the ENROLL token is
+    # pasted, memory-only.
+    html = render_index("INGEST_SECRET", ["np_jamie"])
+    assert 'data-ingest-token="INGEST_SECRET"' in html
+    assert "enroll-token" not in html and "enrollToken" not in html
+    assert "data-enroll" not in html
+    # ...and the client only ever obtains it from the paste field, never the DOM dataset.
+    code = _code()
+    assert "dataset.enroll" not in code
+    assert re.search(r"enrollToken = \$\('tok'\)\.value", code)
+
+
+def test_pwa_clinicians_embedded_for_identity_picker():
+    # Staff slugs (never PHI) are embedded so the enrol view OFFERS the identity: the
+    # server matches scribe.clinicians VERBATIM, so a hand-typed typo would fail-close a
+    # consented recording with 403.
+    html = render_index(_TOKEN, ["np_jamie", "dr_x"])
+    assert "np_jamie" in html and "dr_x" in html
+    assert 'data-clinicians="' in html
+    # embedded as ESCAPED JSON in a data- attribute (never an inline script — CSP).
+    assert "&quot;np_jamie&quot;" in html
+    assert "<script>" not in html
+
+
+def test_pwa_mru_default_is_server_derived_not_client_stored():
+    # R5 is ABSOLUTE (no localStorage), so the picker's default MUST come from the
+    # server (mru_preset_id), not from client memory of the last choice.
+    code = _code()
+    assert "mru_preset_id" in code
+    assert re.search(r"mruPresetId && usable\.some", code)   # preselect only if still usable
+
+
+def test_pwa_preset_fit_forward_tolerates_unknown_values():
+    # preset_fit is a 5-value enum; 5a emits only unarmed|ok. The client MUST tolerate
+    # warming/weak/none TODAY so 5b ships without a client change.
+    code = _code()
+    for v in ("unarmed", "ok", "warming", "weak", "none"):
+        assert v in code
+    # an UNRECOGNISED value must fall back, never throw / render undefined.
+    assert re.search(r"known\[fit\] \|\| known\.unarmed", code)
+
+
+def test_pwa_does_not_hardcode_webm_and_maps_ios_mp4_to_m4a():
+    # Operator ruling: the phone is an iPhone → MediaRecorder emits audio/mp4 (AAC), not
+    # webm. The ENCOUNTER ext allowlist has no 'mp4' — but 'm4a' IS AAC-in-MP4, IS on the
+    # allowlist, IS swept, and IS decoded. So audio/mp4 → ext=m4a, honouring the iPhone
+    # ruling WITHOUT reopening the frozen #49 ext contract.
+    code = _code()
+    assert "isTypeSupported" in code                        # negotiates, doesn't assume
+    assert "'audio/mp4'" in code
+    assert re.search(r"indexOf\('mp4'\) >= 0.*return 'm4a'", code, re.DOTALL)
+    # the ext sent is derived from the ACTUAL negotiated mimeType, not a constant.
+    assert "extFor(recorder.mimeType)" in code
+    # every ext the client can emit is on the backend allowlist.
+    for ext in ("webm", "m4a", "ogg"):
+        assert ext in iw.ALLOWED_AUDIO_EXTS
+
+
+def test_pwa_presets_routes_carry_required_user_param():
+    # The as-built API REQUIRES ?user on presets list/rename/delete (the store is
+    # user-keyed). Without it every call 400s — the divergence the API doc flags.
+    code = _code()
+    assert "'/scribe/presets?user=' + encodeURIComponent(user)" in code
+    assert code.count("'?user=' + encodeURIComponent(user) + '&preset='") >= 1
+
+
+def test_pwa_enroll_chunks_always_carry_seq():
+    # ?seq makes a retried window IDEMPOTENT. Without it a lost 200 double-appends,
+    # inflating net-speech past the 10s HARD gate and biasing the centroid.
+    code = _code()
+    assert re.search(r"/scribe/enroll/chunk' \+ p", code)
+    assert re.search(r"'\?session=' \+ encodeURIComponent\(session\) \+ '&seq=' \+ String\(eseq\)", code)
+
+
+# ---------------------------------------------------------------------------
+# BEHAVIOURAL — the REAL app.js driven in node against a DOM/fetch shim.
+#
+# The structural pins above bind the security floor; THESE bind what the client actually
+# DOES — the fetch sequence, which is the server contract (docs/scribe_enroll_api.md).
+# String-pinning alone is the "passes by construction, catches nothing" failure mode.
+#
+# The shim is SELF-CONTAINED (no jsdom: the only copy here is a transitive dep of the
+# separate web/ tree, absent from this worktree). Its load-bearing safety property:
+# getElementById THROWS on an unknown id, so a shim gap is a hard error, never a false pass.
+# ---------------------------------------------------------------------------
+
+import json as _json
+import shutil
+import subprocess
+
+_HARNESS = Path(__file__).parent / "pwa_enroll_harness.mjs"
+_NODE = shutil.which("node")
+
+
+def _drive(scenario: str, tmp_path) -> dict:
+    app = tmp_path / "app.js"
+    app.write_text(APP_JS, encoding="utf-8")
+    out = subprocess.run(
+        [_NODE, str(_HARNESS), str(app), scenario],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert out.returncode == 0, f"harness failed: {out.stderr[:800]}"
+    res = _json.loads(out.stdout)
+    assert not res.get("error"), f"app threw: {res['error'][:800]}"
+    return res
+
+
+def _urls(res, needle):
+    return [c["url"] for c in res["calls"] if needle in c["url"]]
+
+
+pytestmark_node = pytest.mark.skipif(
+    _NODE is None, reason="node not installed (behavioural PWA harness); the structural "
+                          "contract pins above run unconditionally",
+)
+
+
+@pytestmark_node
+def test_behaviour_binds_preset_before_the_first_chunk(tmp_path):
+    # THE ordering invariant: the server LOCKS the binding at the first chunk, so a bind
+    # that lands after chunk 1 is a 409 and the note's diarize_provenance is permanently
+    # absent. The client MUST bind first.
+    res = _drive("record_binds_before_first_chunk", tmp_path)
+    order = [c["url"].split("?")[0] for c in res["calls"]]
+    bind = order.index("/scribe/encounter/preset")
+    chunk = order.index("/scribe/ingest-chunk")
+    assert bind < chunk, f"bind must precede the first chunk, got {order}"
+
+
+@pytestmark_node
+def test_behaviour_no_preset_never_binds_and_still_records(tmp_path):
+    # "No preset — attribution off" is a FIRST-CLASS choice: no binding call at all, and
+    # the encounter still records normally.
+    res = _drive("record_no_preset_never_binds", tmp_path)
+    assert _urls(res, "/scribe/encounter/preset") == []
+    assert _urls(res, "/scribe/ingest-chunk")          # chunks still flow
+
+
+@pytestmark_node
+def test_behaviour_bind_failure_never_blocks_the_encounter(tmp_path):
+    # A 409/failed binding must NEVER block Start — the encounter simply runs un-anchored
+    # (audio is never lost to a preset problem).
+    res = _drive("record_bind_failure_does_not_block", tmp_path)
+    assert _urls(res, "/scribe/encounter/preset")      # it tried
+    assert _urls(res, "/scribe/ingest-chunk")          # ...and recorded anyway
+
+
+@pytestmark_node
+def test_behaviour_iphone_container_maps_to_an_allowlisted_ext(tmp_path):
+    # iOS supports ONLY audio/mp4 → the chunk must go out as ext=m4a (on the allowlist),
+    # never ext=mp4 (which the ingest route rejects with unsupported_ext).
+    res = _drive("record_ios_maps_mp4_to_m4a", tmp_path)
+    chunks = _urls(res, "/scribe/ingest-chunk")
+    assert chunks and all("ext=m4a" in u for u in chunks), chunks
+    assert not any("ext=mp4" in u for u in chunks)
+
+
+@pytestmark_node
+def test_behaviour_unknown_preset_fit_does_not_break_the_chip(tmp_path):
+    # 5b will emit warming/weak/none. A 5a client must render something sane, not crash.
+    res = _drive("record_unknown_preset_fit_tolerated", tmp_path)
+    assert res["chip"] and "undefined" not in res["chip"].lower()
+
+
+@pytestmark_node
+def test_behaviour_enroll_flow_wire_contract(tmp_path):
+    # The whole enrolment wire, end to end: start → chunks(seq) → finalize → poll →
+    # name-last rename. Token CLASS per route is the security half.
+    res = _drive("enroll_flow", tmp_path)
+    calls = res["calls"]
+    paths = [c["url"].split("?")[0] for c in calls]
+    for expected in ("/scribe/enroll/start", "/scribe/enroll/chunk",
+                     "/scribe/enroll/finalize", "/scribe/enroll/result",
+                     "/scribe/presets/rename"):
+        assert expected in paths, f"{expected} missing from {paths}"
+    # record-first, NAME-LAST: the rename happens AFTER the verdict.
+    assert paths.index("/scribe/presets/rename") > paths.index("/scribe/enroll/result")
+    # every enroll-face call carries the ENROLL token (never the page's ingest token).
+    for c in calls:
+        if c["url"].startswith("/scribe/enroll/") or "/presets/rename" in c["url"]:
+            assert c["token"] == "ENROLL_TOK", f"wrong token class on {c['url']}"
+    # chunks are seq-numbered 1..N (idempotent retry)
+    seqs = [u.split("seq=")[1] for u in _urls(res, "/scribe/enroll/chunk")]
+    assert seqs == ["1", "2"], seqs
+    # the name is prefilled with the mic label + date (never a patient)
+    assert res["namePrefill"].startswith("Room mic ")
 
 
 # ---------------------------------------------------------------------------

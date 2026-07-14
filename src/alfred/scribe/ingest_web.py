@@ -593,7 +593,12 @@ async def _handle_page(request: web.Request) -> web.StreamResponse:
     by the middleware). Embeds the ingest token for the same-origin JS. Strict
     CSP + no-store. R4: zero external resources."""
     config: ScribeConfig = request.app["scribe_config"]
-    body = render_index(config.ingest_web.token)
+    # The INGEST token (encounter capability) is embedded for the JS; the ENROLL token is
+    # NEVER embedded (page possession must not grant biometric mutation). The clinician
+    # slugs are embedded so the enrolment view can OFFER the identity instead of making it
+    # hand-typed — the server matches them VERBATIM, so a typo would fail-close a
+    # consented recording with 403.
+    body = render_index(config.ingest_web.token, config.clinicians)
     return web.Response(text=body, content_type="text/html", charset="utf-8",
                         headers=_static_headers())
 
