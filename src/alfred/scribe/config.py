@@ -36,7 +36,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import structlog
+
 from alfred._env import substitute_env_in_value
+
+log = structlog.get_logger(__name__)
 
 # The two legal modes. ``synthetic`` is the fail-closed default (only
 # synthetic-tagged input flows); ``clinical`` is the LAST switch, gated on a
@@ -107,9 +111,13 @@ class ScribeDiarizeConfig:
     purity_threshold: float = 0.80
     # Turns shorter than this (seconds) are too short to embed reliably → unknown.
     min_turn_s: float = 1.0
-    # Filesystem path to the clinician enrollment embedding (P4-5). Empty = no
-    # enrollment yet → every cluster fails the match → all ``unknown`` (fail-safe).
-    enrollment_path: str = ""
+    # Directory of named voice-PRESET files (P4-5, multi-preset). Empty = feature
+    # DORMANT (inert-by-default): no enrollment, every cluster fails the match →
+    # all ``unknown`` (fail-safe). STAY-C sets ``<STAYC_DATA>/enrollment``. REPLACES
+    # the P4-4 single ``enrollment_path`` (DROPPED this commit — the multi-preset
+    # model supersedes the one-file path; see the raw-dict deprecation warning in
+    # ``load_from_unified``). A local dir, NOT a network field — no boundary barrier.
+    enrollment_dir: str = ""
     # Local HF cache entry for the speaker-embedding model (loaded offline in
     # P4-4). Names a CACHE entry, NOT a network endpoint.
     embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
@@ -141,6 +149,11 @@ class ScribeDiarizeConfig:
 INGEST_WEB_ALLOWED_KEYS: frozenset[str] = frozenset({
     "enabled", "host", "port", "token",
     "max_chunk_bytes", "max_chunks_per_encounter", "max_encounter_bytes",
+    # P4-5a — the biometric-custody capability token (voice enrollment). A SEPARATE
+    # credential from ``token`` (encounter capability): the two-token split is the
+    # `web`/`web_ingest` peer-pin lesson applied to this standalone server. Lands in
+    # lockstep with the ScribeIngestWebConfig.enroll_token field (barrier-e closed).
+    "enroll_token",
 })
 
 
@@ -182,6 +195,13 @@ class ScribeIngestWebConfig:
     # ``${SCRIBE_INGEST_TOKEN}`` (env substitution runs on this block), never
     # inline in a committed config.
     token: str = ""
+    # P4-5a — the BIOMETRIC-CUSTODY capability token (voice enrollment routes). A
+    # SEPARATE credential from ``token``: possession of the page (which carries the
+    # ingest token) must NOT grant biometric mutation. NEVER embedded in the served
+    # page — the enrolling clinician pastes it once (memory-only). Empty ⇒ the whole
+    # enrollment face is INERT (routes 404 + a ``scribe.enroll.inert`` startup log).
+    # Set via ``${SCRIBE_ENROLL_TOKEN}``, never inline in a committed config.
+    enroll_token: str = ""
     # N3 caps — an explicit, signalled ceiling (never a silent drop). aiohttp's
     # ``client_max_size`` is pinned to ``max_chunk_bytes``; the per-encounter
     # chunk-count + total-byte caps are enforced in the route with a "cap hit"
@@ -278,6 +298,26 @@ def _build(cls, data: Any):
     return cls(**known)
 
 
+def _warn_deprecated_scribe_keys(scribe: dict[str, Any]) -> None:
+    """Loud deprecation for config keys DROPPED by a newer schema — emitted on the
+    RAW dict BEFORE the schema-tolerance ``__dataclass_fields__`` filter silently
+    eats them, so an operator with a stale key learns the setting is INERT rather
+    than mysteriously ignored.
+
+    P4-5a dropped ``scribe.diarize.enrollment_path`` (the single-file P4-4 model)
+    for the multi-preset ``scribe.diarize.enrollment_dir`` (a directory)."""
+    diarize = scribe.get("diarize")
+    if isinstance(diarize, dict) and "enrollment_path" in diarize:
+        log.warning(
+            "scribe.config.enrollment_path_deprecated",
+            detail="scribe.diarize.enrollment_path was REMOVED in P4-5 (multi-preset "
+                   "voice enrollment) and is now IGNORED. Voice presets live under "
+                   "scribe.diarize.enrollment_dir (a directory), managed via the "
+                   "enrollment PWA / `alfred scribe presets`. Remove enrollment_path "
+                   "from the config to silence this warning.",
+        )
+
+
 def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
     """Build :class:`ScribeConfig` from the unified config dict.
 
@@ -292,6 +332,7 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
     if not isinstance(scribe, dict):
         scribe = {}
     scribe = substitute_env_in_value(scribe)
+    _warn_deprecated_scribe_keys(scribe)
 
     input_dir = scribe.get("input_dir") or _DEFAULT_INPUT_DIR
     clinicians_raw = scribe.get("clinicians") or []
@@ -339,7 +380,7 @@ def _build_diarize(data: Any) -> ScribeDiarizeConfig:
     if "enabled" in known:
         cfg.enabled = coerce_ingest_web_enabled(known["enabled"])
     for str_field in (
-        "provider", "enrollment_path", "embedding_model", "embedding_revision",
+        "provider", "enrollment_dir", "embedding_model", "embedding_revision",
         "pipeline_config",
     ):
         if str_field in known:
@@ -376,6 +417,8 @@ def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:
         cfg.host = str(known["host"])
     if "token" in known:
         cfg.token = str(known["token"])
+    if "enroll_token" in known:
+        cfg.enroll_token = str(known["enroll_token"])
     for int_field in ("port", "max_chunk_bytes", "max_chunks_per_encounter", "max_encounter_bytes"):
         if int_field in known:
             try:

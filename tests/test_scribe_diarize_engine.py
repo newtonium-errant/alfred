@@ -56,14 +56,14 @@ _SALT = "DUMMY_SCRIBE_TEST_SALT"
 
 
 def _config(*, provider="pyannote", enabled=True, pipeline_config="",
-            enrollment_path="", purity=0.80):
+            enrollment_dir="", purity=0.80):
     return load_from_unified({"scribe": {
         "mode": "synthetic",
         "encounter_salt": _SALT,
         "stt": {"provider": "fake"},
         "diarize": {
             "provider": provider, "enabled": enabled,
-            "pipeline_config": pipeline_config, "enrollment_path": enrollment_path,
+            "pipeline_config": pipeline_config, "enrollment_dir": enrollment_dir,
             "purity_threshold": purity,
         },
         "llm": {"base_url": "http://127.0.0.1:11434", "model": "m"},
@@ -167,11 +167,11 @@ def test_guard_conf_clamps(val, exp):
 # cluster → role — P4-4 fail-safe: no enrollment ⇒ unknown
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("enrollment", ["", "/some/enrollment.npy"])
+@pytest.mark.parametrize("enrollment", ["", "/some/enrollment"])
 def test_cluster_to_role_is_unknown_in_p44(enrollment):
     # P4-4 end-state: no P4-5 matcher exists, so EVERY cluster resolves unknown
-    # (fail-closed), whether or not an enrollment_path is set.
-    cfg = _config(enrollment_path=enrollment)
+    # (fail-closed), whether or not an enrollment_dir is set.
+    cfg = _config(enrollment_dir=enrollment)
     assert diarize_mod._cluster_to_role("SPEAKER_00", cfg) == ROLE_UNKNOWN
     assert diarize_mod._cluster_to_role(None, cfg) == ROLE_UNKNOWN
 
