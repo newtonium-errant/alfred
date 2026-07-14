@@ -55,6 +55,13 @@ const cfg = {
   clinicians: ['np_jamie'],
   instantWindow: false,
   micLabel: 'Built-in Mic',
+  // SUSPENSION GATES — hold an await open so a teardown can be interposed mid-flight. Each is
+  // a promise the interaction code resolves after it has navigated away. Used ONLY by the
+  // await-teardown scenarios (the generation-token BLOCK); the ordinary flows resolve instantly.
+  holdFirstGetUserMedia: false,
+  holdEnrollStart: false,
+  holdEnrollFinalize: false,
+  holdEnrollResult: false,
 };
 
 const USABLE = (id, name) => ({ preset_id: id, name: name, classification: 'usable' });
@@ -115,6 +122,24 @@ switch (scenario) {
     // normally" is asserted on a real chunk POST rather than on the absence of a failure.
     cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a';
     cfg.serverState = 'ok'; cfg.instantWindow = true; break;
+  // THE GENERATION-TOKEN BLOCK — a teardown interposed DURING captureEnroll's own awaits. Each
+  // holds one await open, so the interaction can navigate away before it resolves. instantWindow
+  // lets the FOLLOW-ON encounter complete a real chunk, proving the mic claim was released.
+  case 'teardown_during_getusermedia':
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
+    cfg.holdFirstGetUserMedia = true; cfg.instantWindow = true; break;
+  case 'teardown_during_enroll_start':
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
+    cfg.holdEnrollStart = true; cfg.instantWindow = true; break;
+  case 'teardown_during_finalize_poll':
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
+    cfg.holdEnrollResult = true; break;
+  case 'teardown_during_finalize_call':
+    // finalize HELD and answers 409 on release: without the PRE-poll gen check, enrollFailed
+    // renders the 409 copy into the torn-down body. (The POLL check cannot see this — the flow
+    // never reaches the poll on a !ok finalize.)
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
+    cfg.holdEnrollFinalize = true; cfg.finalizeStatus = 409; break;
   // THE INERT BOX — the DEFAULT ship posture: enroll_token unset ⇒ EVERY enroll-face path
   // 404s, /scribe/presets included (it is on the enroll face).
   case 'inert_record_view':
@@ -132,6 +157,19 @@ switch (scenario) {
 const calls = [];
 const INGEST_TOKEN = 'INGEST_TOK';
 const ENROLL_TOKEN = 'ENROLL_TOK';
+
+// SUSPENSION GATES — a deferred the interaction resolves after navigating away, so a teardown
+// lands DURING the held await. `releaseX()` (exposed on globalThis) resolves the matching gate.
+function makeGate() { let release; const p = new Promise((r) => { release = r; }); return { p, release }; }
+const gumGate = makeGate();          // first getUserMedia
+const enrollStartGate = makeGate();  // /scribe/enroll/start
+const enrollFinalizeGate = makeGate(); // /scribe/enroll/finalize
+const enrollResultGate = makeGate(); // first /scribe/enroll/result
+let gumHeld = false, resultHeld = false;
+globalThis.__releaseGum = gumGate.release;
+globalThis.__releaseEnrollStart = enrollStartGate.release;
+globalThis.__releaseEnrollFinalize = enrollFinalizeGate.release;
+globalThis.__releaseEnrollResult = enrollResultGate.release;
 
 // BROWSER semantics: textContent -> innerHTML escapes & < > but NOT quotes. A stricter
 // shim (escaping quotes too) would HIDE attribute-injection bugs in the app under test.
@@ -257,10 +295,15 @@ async function fetchShim(url, opts) {
   }
   if (url.startsWith('/scribe/encounter/preset')) { return json({}, cfg.bindStatus); }
   if (url.startsWith('/scribe/enroll/start')) {
+    if (cfg.holdEnrollStart) { await enrollStartGate.p; }   // hold so a teardown lands mid-await
     return json({ session: 'enr-1-abc' }, cfg.startStatus);
   }
-  if (url.startsWith('/scribe/enroll/finalize')) { return json({}, cfg.finalizeStatus); }
+  if (url.startsWith('/scribe/enroll/finalize')) {
+    if (cfg.holdEnrollFinalize) { await enrollFinalizeGate.p; }   // hold so a teardown lands mid-await
+    return json({}, cfg.finalizeStatus);
+  }
   if (url.startsWith('/scribe/enroll/result')) {
+    if (cfg.holdEnrollResult && !resultHeld) { resultHeld = true; await enrollResultGate.p; }
     return json({ state: 'done', verdict: 'ok', preset_id: 'pst-x', stats: {} });
   }
   return json({});
@@ -293,6 +336,7 @@ const navigatorShim = {
   mediaDevices: {
     getUserMedia: async () => {
       micOpens.n += 1;
+      if (cfg.holdFirstGetUserMedia && !gumHeld) { gumHeld = true; await gumGate.p; }  // hold the FIRST only
       return {
         getTracks: () => [{ stop() {} }],
         getAudioTracks: () => [{ label: cfg.micLabel, stop() {} }],
@@ -452,6 +496,54 @@ try {
     await settle(30);
     out.enrollBody = el('enroll-body').innerHTML;
     out.micOpens = micOpens.n;              // 1 = the encounter's own; a 2nd = the breach
+  } else if (scenario === 'teardown_during_getusermedia') {
+    // BLOCK — a route-away while getUserMedia HOLDS the await (the OS mic prompt, SECONDS on
+    // first run). captureEnroll has claimed micOwner but not yet registered enrollHalt, so the
+    // ONLY thing that can stop the resumed continuation is the generation token.
+    await openEnrollWithToken();
+    el('en-go').click();                    // captureEnroll: claims mic+gen, awaits getUserMedia (HELD)
+    await settle(15);
+    await setHash('#/record');              // teardown: bumps gen, releases the stuck micOwner
+    globalThis.__releaseGum();              // getUserMedia resolves → GEN CHECK #1 bails
+    await settle(30);
+    el('start').click();                    // the encounter must now START (mic was released)
+    await settle(30);
+  } else if (scenario === 'teardown_during_enroll_start') {
+    // BLOCK — one await later: a route-away while /enroll/start holds. The server may hold bytes
+    // for the opened session; the continuation must abandon them, release the mic, and NOT start
+    // a window. Then the encounter must start.
+    await openEnrollWithToken();
+    el('en-go').click();                    // captureEnroll: past getUserMedia, awaits /enroll/start (HELD)
+    await settle(15);
+    await setHash('#/record');              // teardown: bumps gen, releases micOwner
+    globalThis.__releaseEnrollStart();      // /enroll/start resolves → GEN CHECK #2 abandons + bails
+    await settle(30);
+    el('start').click();
+    await settle(30);
+  } else if (scenario === 'teardown_during_finalize_poll') {
+    // Residual #5 — a route-away DURING the finalize poll must not render the naming form into
+    // a torn-down body, and must NOT abandon (the worker is writing the centroid).
+    await openEnrollWithToken();
+    el('en-go').click();
+    await settle(20);
+    await oneWindow(); await oneWindow();
+    el('en-done').click();                  // halt + finalize → first /result is HELD
+    await settle(15);
+    await setHash('#/record');              // teardown during the poll: bumps gen (must be a DIFFERENT hash)
+    globalThis.__releaseEnrollResult();     // /result resolves 'done' → finalize GEN CHECK bails
+    await settle(40);
+    out.enrollBody = el('enroll-body').innerHTML;
+  } else if (scenario === 'teardown_during_finalize_call') {
+    await openEnrollWithToken();
+    el('en-go').click();
+    await settle(20);
+    await oneWindow(); await oneWindow();
+    el('en-done').click();                  // halt + finalize (HELD before the poll)
+    await settle(15);
+    await setHash('#/record');              // teardown DURING finalize: bumps gen
+    globalThis.__releaseEnrollFinalize();   // finalize resolves 409 → PRE-poll GEN CHECK bails
+    await settle(40);
+    out.enrollBody = el('enroll-body').innerHTML;
   } else if (scenario === 'route_away_mid_enroll_abandons') {
     await openEnrollWithToken();
     el('en-go').click();                    // an enrolment CAPTURE is live (mic open)

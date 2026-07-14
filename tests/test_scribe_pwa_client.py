@@ -752,6 +752,54 @@ def test_behaviour_routing_away_mid_enrolment_halts_and_abandons(tmp_path):
     assert "/scribe/enroll/abandon" in paths             # ...and the RAM bytes are dropped
 
 
+# ── BLOCK: a teardown fired DURING captureEnroll's awaits (the generation token) ─
+# captureEnroll claims micOwner synchronously but registers enrollHalt only AFTER its
+# getUserMedia + /enroll/start awaits. A route() in that window used to leave micOwner stuck
+# and (post-await) a live capture behind a hidden view — the patient-recording path DoS'd
+# ("cancel the voiceprint" with none to cancel). Each pin fires the teardown mid-await and
+# proves the flow bails cleanly AND a following encounter can still record (mic released).
+
+def test_behaviour_teardown_during_getusermedia_releases_the_mic(tmp_path):
+    res = _drive("teardown_during_getusermedia", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" not in paths           # bailed at GEN CHECK #1 (before start)
+    assert "/scribe/enroll/chunk" not in paths           # no enrolment window ever ran
+    assert "/scribe/ingest-chunk" in paths               # ...and the encounter DID start (mic freed)
+
+
+def test_behaviour_teardown_during_enroll_start_abandons_and_releases(tmp_path):
+    res = _drive("teardown_during_enroll_start", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" in paths               # the session was opened (held mid-await)
+    assert "/scribe/enroll/abandon" in paths             # ...GEN CHECK #2 drops its RAM bytes
+    assert "/scribe/enroll/chunk" not in paths           # no window ran behind the hidden view
+    assert "/scribe/ingest-chunk" in paths               # ...and the encounter started (mic freed)
+
+
+def test_behaviour_teardown_during_finalize_does_not_render_or_abandon(tmp_path):
+    # Residual #5. The naming form must NOT render into a torn-down body, and the FINALIZING
+    # session must NOT be abandoned (the worker is writing the centroid — abandon would race it
+    # and silently lose the voiceprint; it lands under its placeholder name, recoverable via Rename).
+    res = _drive("teardown_during_finalize_poll", tmp_path)
+    assert "Voiceprint made" not in res["enrollBody"]     # no verdict UI rendered post-teardown
+    assert "nm2" not in res["enrollBody"]                 # no naming form in the dead body
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/finalize" in paths             # ...finalize really was issued
+    assert "/scribe/enroll/abandon" not in paths          # the finalizing session is NOT abandoned
+
+
+def test_behaviour_teardown_during_finalize_call_does_not_render_the_refusal(tmp_path):
+    # The PRE-poll gen check (distinct from the in-poll one): a route-away DURING the finalize
+    # POST, on a !ok finalize (409), would otherwise render the 409 copy via enrollFailed into
+    # the torn-down body. The flow never reaches the poll on a !ok finalize, so only the pre-poll
+    # check can catch it.
+    res = _drive("teardown_during_finalize_call", tmp_path)
+    assert "in use by a recording" not in res["enrollBody"]   # the 409 copy never rendered
+    assert res["enrollBody"] == ""                            # body stays the torn-down empty
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/finalize" in paths
+
+
 # ── WARN-1: hash routing (the shim's no-op addEventListener hid this entirely) ─
 
 def test_behaviour_hash_routing_toggles_the_two_views(tmp_path):

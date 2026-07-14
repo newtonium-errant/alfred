@@ -40,18 +40,25 @@ start→stop→one complete ``ondataavailable`` blob that is INDEPENDENTLY decod
 
 MUTUAL EXCLUSION (a CONSENT property, not a mic-contention nicety) — an enrolment window
 that captures a live patient encounter is folded into a PERMANENT biometric centroid, on a
-surface whose entire consent basis is "the enrolling clinician's own voice". Two mechanisms
-enforce it, and both are needed:
+surface whose entire consent basis is "the enrolling clinician's own voice". Three
+mechanisms enforce it, and all are needed:
   * the MIC CLAIM (``micOwner``) is taken SYNCHRONOUSLY at each point the microphone is
     actually ACQUIRED — ``start()`` and ``captureEnroll()`` — because ``recording`` and
     ``enrollSession`` are only set AFTER an await, so a guard reading them alone is a
     check-then-act across a world-changing await.
+  * the GENERATION TOKEN (``enrollGen``) makes the claim ENFORCEABLE across ``captureEnroll``'s
+    own awaits. The claim is synchronous, but the teardown HANDLE (``enrollHalt``) is not
+    registered until after two awaits; a ``route()`` in that window would otherwise let the
+    continuation resume behind a hidden view (a live capture, bytes never abandoned, ``micOwner``
+    stuck → the encounter path DoS'd). ``teardownEnroll`` bumps the token; ``captureEnroll``
+    and ``finalizeEnroll`` bail after each await if their generation is stale.
   * ``route()`` TEARS DOWN the enrolment wizard on every view change. A wizard that is
     merely STAGED (intro rendered, its [Start recording] listener live) otherwise survives a
     navigation, and an encounter started in the meantime composes — by ordinary navigation,
     no race — into exactly the violation above.
 The general rule: anything that can be STAGED and then FIRED must re-check where the
-resource is ACQUIRED, never only where the user expressed the intention.
+resource is ACQUIRED, never only where the user expressed the intention — and a claim taken
+before an await needs its RELEASE reachable from every path that await can be interrupted by.
 
 DEVICE CONTAINERS (operator ruling: the phone is an iPhone) — we do NOT hardcode webm.
 The recorder negotiates a supported type and we send what the device actually produced:
@@ -178,6 +185,7 @@ APP_JS = r"""'use strict';
   let serverState = '';              // 'empty' | 'all_incompatible' | 'ok' | 'inert' (see loadPresets)
   let enrollSession = null;          // non-null while an enrolment session holds RAM bytes
   let enrollHalt = null;             // non-null while an enrolment CAPTURE holds the mic
+  let enrollGen = 0;                  // bumped by captureEnroll entry AND by teardownEnroll
   let pendingToken = null;           // resolve() of an OPEN token-paste prompt
   let micLabel = '';                 // the device label, for the name prefill
 
@@ -189,6 +197,12 @@ APP_JS = r"""'use strict';
   // pass their own guard while the other is mid-acquisition. The claim closes that window,
   // and — with the action-moment guards below — is what actually enforces the memo's
   // "enrolment and encounter recording are mutually exclusive".
+  //
+  // OWNERSHIP DISCIPLINE (load-bearing for the generation token below): a flow may clear
+  // micOwner ONLY while it is still the CURRENT owner. captureEnroll claims it synchronously
+  // but registers its teardown handle (enrollHalt) only after two awaits; if a teardown lands
+  // in that window it becomes the owner. So a stale captureEnroll continuation stops its OWN
+  // mic stream but must NEVER write micOwner — teardown (or a newer enrolment) owns it now.
   let micOwner = '';
 
   // encounter state
@@ -667,30 +681,57 @@ APP_JS = r"""'use strict';
     // resource is ACQUIRED, not where the user expressed the intention.
     if (recording || micOwner) { return refuseEnrollDuringEncounter(); }
     micOwner = 'enroll';                  // claimed SYNCHRONOUSLY, BEFORE the await below
+    // THE GENERATION TOKEN — the SECOND half of the action-moment discipline, and the reason
+    // the mic claim above is actually enforceable. micOwner is claimed synchronously, but the
+    // ONLY handle teardownEnroll can stop this flow through (enrollHalt) is not registered
+    // until AFTER the two awaits below. A route() firing in that window (the OS mic-permission
+    // prompt holds getUserMedia for SECONDS on first run — wide open) would otherwise let this
+    // continuation resume behind a hidden view: a second recorder on the live patient mic, the
+    // RAM bytes never abandoned, and micOwner stuck so the patient-recording path is DoS'd
+    // ("cancel the voiceprint" — but there is none to cancel). teardownEnroll bumps enrollGen;
+    // after EACH await we bail if our generation is stale.
+    const myGen = ++enrollGen;
     let st;
     try {
       st = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
+      if (myGen !== enrollGen) { return; }   // torn down mid-prompt: not ours to release or render
       micOwner = '';
       $('enroll-body').innerHTML = '<p>Microphone unavailable.</p>' +
         '<button id="en-retry" class="primary">Record again</button>';
       $('en-retry').addEventListener('click', () => runEnroll(rerecordId));
       return;
     }
+    // GEN CHECK #1 — teardown fired while getUserMedia held the await. Stop OUR stream; do NOT
+    // touch micOwner (teardown released it, or a newer enrolment owns it — OWNERSHIP DISCIPLINE).
+    if (myGen !== enrollGen) { st.getTracks().forEach((t) => t.stop()); return; }
     const dropMic = () => { st.getTracks().forEach((t) => t.stop()); micOwner = ''; };
     // /enroll/start — validates the clinician BEFORE any recording (never a wasted 45s).
     let q = '?user=' + encodeURIComponent(user);
     if (rerecordId) { q += '&preset=' + encodeURIComponent(rerecordId); }
-    let session = null;
+    let session = null, startOk = false, startStatus = 0, startThrew = false;
     try {
       const r = await api('/scribe/enroll/start' + q, { method: 'POST', enroll: true });
-      if (!r.ok) { dropMic(); return enrollFailed(r.status, rerecordId); }
-      session = (await r.json()).session;
-      enrollSession = session;                 // RAM bytes are now held server-side
+      startOk = r.ok; startStatus = r.status;
+      if (r.ok) { session = (await r.json()).session; }
     } catch (e) {
-      dropMic();
-      return enrollFailed(0, rerecordId);
+      startThrew = true;
     }
+    // GEN CHECK #2 — teardown fired during /enroll/start. The server may already hold bytes for
+    // `session`; ABANDON them (a RECORDING session is safe — the finalizing-session carve-out
+    // does not apply here) and stop our stream. Same OWNERSHIP DISCIPLINE: never touch micOwner,
+    // never render, never start a window.
+    if (myGen !== enrollGen) {
+      st.getTracks().forEach((t) => t.stop());
+      if (session) {
+        try { await api('/scribe/enroll/abandon?session=' + encodeURIComponent(session),
+                        { method: 'POST', enroll: true }); } catch (e) { /* best-effort */ }
+      }
+      return;
+    }
+    if (startThrew) { dropMic(); return enrollFailed(0, rerecordId); }
+    if (!startOk) { dropMic(); return enrollFailed(startStatus, rerecordId); }
+    enrollSession = session;                 // RAM bytes are now held server-side (still current)
     // the mic's own label is the memo's name prefill ("name the place and mic").
     try {
       const tr = st.getAudioTracks ? st.getAudioTracks()[0] : null;
@@ -757,7 +798,7 @@ APP_JS = r"""'use strict';
     $('en-done').addEventListener('click', async () => {
       halt(false);
       await echain;
-      finalizeEnroll(session, rerecordId);
+      finalizeEnroll(session, rerecordId, myGen);    // the same generation tokens the poll
     });
     // CANCEL — an explicit discard. Drops the RAM bytes NOW (server-side) instead of
     // leaving them resident for the 10-minute TTL.
@@ -770,20 +811,28 @@ APP_JS = r"""'use strict';
     });
   }
 
-  async function finalizeEnroll(session, rerecordId) {
+  async function finalizeEnroll(session, rerecordId, gen) {
     $('enroll-body').innerHTML = '<p><b>Making the voiceprint&hellip;</b></p>' +
       '<p class="note">Keep this screen open.</p>';
+    let finalizeOk = false, finalizeStatus = 0;
     try {
       const r = await api('/scribe/enroll/finalize?session=' + encodeURIComponent(session), {
         method: 'POST', enroll: true, headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: 'unnamed' }),              // record-first, name-LAST
       });
-      // A finalize REFUSAL (e.g. 409 preset_bound_open_encounter) leaves the session in
-      // state="recording" server-side, so /enroll/result would answer {state:"processing"}
-      // FOREVER — the client used to poll 300x500ms and then show a generic error. Fail
-      // FAST with the copy that already exists for this status.
-      if (!r.ok) { return enrollFailed(r.status, rerecordId); }
-    } catch (e) { return enrollFailed(0, rerecordId); }
+      finalizeOk = r.ok; finalizeStatus = r.status;
+    } catch (e) { finalizeStatus = 0; }
+    // GEN CHECK — a route-away DURING finalize/poll must not render the naming form into a
+    // torn-down body (residual #5), and must NOT abandon: the finalize is in flight, the worker
+    // is writing the centroid (its pre-write live-check would silently lose a completed
+    // voiceprint if we abandoned). Just stop. The preset lands under its placeholder name and
+    // shows in the list with a Rename.
+    if (gen !== enrollGen) { return; }
+    // A finalize REFUSAL (e.g. 409 preset_bound_open_encounter) leaves the session in
+    // state="recording" server-side, so /enroll/result would answer {state:"processing"}
+    // FOREVER — the client used to poll 300x500ms and then show a generic error. Fail
+    // FAST with the copy that already exists for this status.
+    if (!finalizeOk) { return enrollFailed(finalizeStatus, rerecordId); }
     // poll /result
     for (let i = 0; i < 300; i++) {
       let j = null;
@@ -791,6 +840,7 @@ APP_JS = r"""'use strict';
         const r = await api('/scribe/enroll/result?session=' + encodeURIComponent(session), { enroll: true });
         j = await r.json();
       } catch (e) { /* transient */ }
+      if (gen !== enrollGen) { return; }        // torn down mid-poll — no render, no abandon
       if (j && j.state === 'done') { return enrollVerdict(j, session, rerecordId); }
       if (j && j.state === 'unknown_session') { return enrollFailed('unknown_session', rerecordId); }
       await sleep(500);
@@ -874,8 +924,15 @@ APP_JS = r"""'use strict';
   // RAM-held bytes are dropped server-side NOW rather than at the 10-minute TTL, an open
   // token prompt is settled, and the staged DOM — with its live listeners — is destroyed.
   function teardownEnroll() {
+    enrollGen += 1;                   // invalidate every in-flight captureEnroll/finalize continuation
     const capturing = !!enrollHalt;
     if (enrollHalt) { enrollHalt(true); }             // stop the mic + the window loop
+    // THE LEAK-WINDOW BELT — captureEnroll claims micOwner='enroll' synchronously but registers
+    // enrollHalt only AFTER its getUserMedia + /enroll/start awaits. If teardown fires in that
+    // window, enrollHalt is still null, so nothing above released the claim — release it here.
+    // (The stale-gen bail in captureEnroll deliberately does NOT touch micOwner, so this is the
+    // ONLY release for that window.) Guarded to 'enroll' so a live ENCOUNTER's claim is untouched.
+    if (micOwner === 'enroll') { micOwner = ''; }
     // Abandon ONLY a session still RECORDING. A session already FINALIZED is being consumed
     // server-side (audio destroyed, centroid being written) — abandoning it would race that
     // write and silently lose a completed voiceprint. We just stop owning it; the preset
