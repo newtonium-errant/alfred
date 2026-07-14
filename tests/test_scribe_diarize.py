@@ -434,7 +434,8 @@ def test_process_source_diarize_failure_still_drafts(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 8. dispatch fail-closed — pyannote NotImplemented, unknown provider refused
+# 8. dispatch fail-closed — pyannote NOTE-1 enabled-gate / fail-loud, unknown
+#    provider refused (P4-4 real engine; the NotImplemented stub is gone)
 # ---------------------------------------------------------------------------
 
 def test_assign_speakers_pyannote_disabled_is_inert(tmp_path):

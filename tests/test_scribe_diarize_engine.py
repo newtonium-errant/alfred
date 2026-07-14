@@ -22,14 +22,22 @@ from __future__ import annotations
 import os
 
 import pytest
+import yaml
 
 import alfred.scribe.diarize as diarize_mod
 import alfred.scripts.stage_diarize_models as stage_mod
 from alfred.scribe.config import load_from_unified
 from alfred.scribe.diarize import (
     DiarizeError,
+    MissingDiarizeDependency,
     assign_speakers,
     ensure_diarize_backend_available,
+)
+from alfred.scripts.stage_diarize_models import (
+    DIARIZATION_REPO,
+    EMBEDDING_REPO,
+    MATERIALIZED_CONFIG_NAME,
+    SEGMENTATION_REPO,
 )
 from alfred.scribe.ledger import ledger_path, load_ledger, save_ledger
 from alfred.scribe.notegen import Claim, StructuredNote
@@ -416,3 +424,229 @@ def test_real_pyannote_engine_smoke():
     assert seg.speaker_cluster is not None            # a real cluster was assigned
     assert 0.0 <= seg.speaker_conf <= 1.0             # finite purity, never NaN
     assert seg.speaker == ROLE_UNKNOWN                # no enrollment → unknown (P4-4)
+
+
+# ===========================================================================
+# QA round hardenings (A/B/C/D) — mutation-proof where noted
+# ===========================================================================
+
+# --- B1: invalid turn bounds skipped (non-finite / end<=start) --------------
+
+@pytest.mark.parametrize("bad_turn", [
+    (float("nan"), 10.0, "BAD"),
+    (0.0, float("nan"), "BAD"),
+    (float("inf"), 10.0, "BAD"),
+    (8.0, 3.0, "BAD"),          # end <= start
+    (5.0, 5.0, "BAD"),          # zero-duration
+])
+def test_b1_invalid_turn_does_not_corrupt_real_assignment(bad_turn):
+    # A NaN/inf/inverted turn must NOT claim the segment: the real S00 turn wins,
+    # purity 1.0. Mutant that must fail: dropping the turn-bounds validation (the
+    # bad turn then steals overlap → wrong cluster / purity).
+    turns = [bad_turn, (0.0, 10.0, "S00")]
+    cl, pur = diarize_mod._dominant_cluster_over_intervals([(0.0, 10.0)], turns)
+    assert cl == "S00" and pur == 1.0
+
+
+def test_b1_apply_logs_dropped_invalid_turns(caplog):
+    import structlog
+    tx = _tx(_seg(1, start=0.0, end=10.0), diarized=False)
+    with structlog.testing.capture_logs() as caps:
+        diarize_mod._apply_diarization(_config(), tx, [(float("nan"), 1.0, "BAD"), (0.0, 10.0, "S00")])
+    dropped = [c for c in caps if c.get("event") == "scribe.diarize.invalid_turns_dropped"]
+    assert len(dropped) == 1 and dropped[0]["dropped"] == 1
+
+
+# --- B2: same-cluster duplicate/overlapping turns merged (no double-count) ---
+
+def test_b2_duplicate_same_cluster_turns_do_not_inflate_purity():
+    # Two identical S00 turns + one S01 turn over [0,10]. WITHOUT merge, S00's time
+    # double-counts → purity 0.75 (could clear an 0.7 threshold). Merged → 0.6.
+    # Mutant that must fail: dropping the per-cluster interval merge.
+    turns = [(0.0, 6.0, "S00"), (0.0, 6.0, "S00"), (6.0, 10.0, "S01")]
+    cl, pur = diarize_mod._dominant_cluster_over_intervals([(0.0, 10.0)], turns)
+    assert cl == "S00" and abs(pur - 0.6) < 1e-9
+
+
+# --- B3: coverage floor — mostly-silence segment degrades to conf 0 ----------
+
+def test_b3_low_coverage_degrades_conf():
+    # Segment [0,10] with only [0,2] labeled → coverage 0.2 < 0.3 floor → conf 0.0
+    # (fail-safe → unknown at P4-2), NOT purity 1.0. Mutant that must fail: dropping
+    # the coverage floor.
+    cl, pur = diarize_mod._dominant_cluster_over_intervals([(0.0, 10.0)], [(0.0, 2.0, "S00")])
+    assert cl == "S00" and pur == 0.0
+
+
+def test_b3_coverage_at_floor_not_degraded():
+    # coverage exactly at the floor (3s labeled / 10s) is NOT degraded (>= floor).
+    cl, pur = diarize_mod._dominant_cluster_over_intervals([(0.0, 10.0)], [(0.0, 3.0, "S00")])
+    assert cl == "S00" and pur == 1.0
+
+
+# --- B4: _guard_conf is actually WIRED through _apply_diarization ------------
+
+def test_b4_apply_clamps_nonfinite_conf_from_engine(monkeypatch):
+    # A NaN purity from the alignment must arrive CLAMPED (0.0) on the segment —
+    # pins the _guard_conf CALL inside _apply_diarization. Mutant that must fail:
+    # assigning the raw purity without _guard_conf.
+    tx = _tx(_seg(1, start=0.0, end=5.0), diarized=False)
+    monkeypatch.setattr(
+        diarize_mod, "_dominant_cluster_over_intervals",
+        lambda intervals, turns: ("S00", float("nan")),
+    )
+    diarize_mod._apply_diarization(_config(), tx, [(0.0, 5.0, "S00")])
+    assert tx.segments[0].speaker_conf == 0.0
+    assert tx.segments[0].speaker_cluster == "S00"
+
+
+# --- A4: boot gate fails loud on enabled pyannote + missing pipeline_config ---
+
+def test_a4_boot_gate_missing_config_fails_loud(monkeypatch):
+    # enabled pyannote with pipeline_config unset → boot fails loud (exit 78). In
+    # torch-free CI the dep-check fires first, so pretend pyannote is present to
+    # isolate the CONFIG gate. Mutant that must fail: dropping the config branch.
+    monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    with pytest.raises(MissingDiarizeDependency):
+        ensure_diarize_backend_available(_config(enabled=True, pipeline_config=""))
+
+
+def test_a4_boot_gate_nonexistent_config_fails_loud(monkeypatch, tmp_path):
+    monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    with pytest.raises(MissingDiarizeDependency):
+        ensure_diarize_backend_available(
+            _config(enabled=True, pipeline_config=str(tmp_path / "nope.yaml")))
+
+
+def test_a4_boot_gate_present_config_passes(monkeypatch, tmp_path):
+    monkeypatch.setattr(diarize_mod, "_pyannote_available", lambda: True)
+    cfg_file = tmp_path / "pipe.yaml"
+    cfg_file.write_text("x", encoding="utf-8")
+    ensure_diarize_backend_available(_config(enabled=True, pipeline_config=str(cfg_file)))  # no raise
+
+
+# --- A3: pre-import local-path validation of the materialized config ---------
+
+def test_a3_validate_rejects_repo_id_config(tmp_path):
+    # A config whose model refs are REPO IDS (operator mispointed at the original
+    # snapshot config.yaml) fails loud pre-pyannote-import — closes the hub-GET hole.
+    bad = tmp_path / "orig.yaml"
+    bad.write_text(yaml.safe_dump(_pcfg()), encoding="utf-8")  # repo-id refs
+    with pytest.raises(DiarizeError):
+        diarize_mod._validate_materialized_config_local(bad)
+
+
+def test_a3_validate_accepts_local_paths(tmp_path):
+    seg = tmp_path / "seg.bin"; seg.write_bytes(b"x")
+    emb = tmp_path / "emb.bin"; emb.write_bytes(b"x")
+    good = _pcfg()
+    good["pipeline"]["params"]["segmentation"] = str(seg)
+    good["pipeline"]["params"]["embedding"] = str(emb)
+    cfg = tmp_path / "materialized.yaml"
+    cfg.write_text(yaml.safe_dump(good), encoding="utf-8")
+    diarize_mod._validate_materialized_config_local(cfg)   # no raise
+
+
+# --- C1: the word-CAPABLE core is the P4-5 word-threading precondition -------
+
+def test_c1_word_level_seam_produces_per_interval_assignment():
+    # P4-5 precondition (C1): the overlap core produces a CORRECT per-cluster
+    # assignment from an interval-LIST (words), not just a single span — the seam
+    # P4-5 threads STT word timings into works before P4-5 needs it. 3 words in S00
+    # (1.5s), 1 word in S01 (1.0s) → S00 dominant, purity 1.5/2.5 = 0.6.
+    turns = [(0.0, 5.0, "S00"), (5.0, 10.0, "S01")]
+    words = [(0.5, 1.0), (2.0, 2.5), (3.0, 3.5), (7.0, 8.0)]
+    cl, pur = diarize_mod._dominant_cluster_over_intervals(words, turns)
+    assert cl == "S00" and abs(pur - 0.6) < 1e-9
+
+
+# --- D1: token single-line validation ---------------------------------------
+
+def test_d1_multiline_token_file_rejected(tmp_path):
+    f = tmp_path / "tok"
+    f.write_text("tok\nextra\n", encoding="utf-8")   # interior newline
+    with pytest.raises(RuntimeError):
+        stage_mod.resolve_token(token_file=f, env={})
+
+
+def test_d1_interior_space_token_rejected():
+    with pytest.raises(RuntimeError):
+        stage_mod.resolve_token(token_file=None, env={"HF_TOKEN": "tok with space"})
+
+
+# --- D2: stage() + main() (mocked snapshot download — the token-echo bug lived here) ---
+
+def _fake_snapshots(tmp_path):
+    seg = tmp_path / "seg"; seg.mkdir()
+    (seg / "pytorch_model.bin").write_bytes(b"x")
+    emb = tmp_path / "emb"; emb.mkdir()
+    (emb / "pytorch_model.bin").write_bytes(b"x")
+    diar = tmp_path / "diar"; diar.mkdir()
+    (diar / "config.yaml").write_text(yaml.safe_dump(_pcfg()), encoding="utf-8")
+    return {SEGMENTATION_REPO: seg, EMBEDDING_REPO: emb, DIARIZATION_REPO: diar}
+
+
+def _install_fake_download(monkeypatch, mapping):
+    def _fake(repo_id, *, hf_home, token):
+        return mapping[repo_id]
+    monkeypatch.setattr(stage_mod, "_snapshot_download", _fake)
+
+
+def test_d2_stage_writes_materialized_config_with_local_paths(tmp_path, monkeypatch):
+    snaps = _fake_snapshots(tmp_path)
+    _install_fake_download(monkeypatch, snaps)
+    out = tmp_path / "materialized.yaml"
+    written = stage_mod.stage(hf_home=tmp_path / "hf", token="DUMMY", out_path=out)
+    assert written == out
+    m = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert m["pipeline"]["params"]["segmentation"] == str(snaps[SEGMENTATION_REPO] / "pytorch_model.bin")
+    assert m["pipeline"]["params"]["embedding"] == str(snaps[EMBEDDING_REPO] / "pytorch_model.bin")
+    # the materialized config must pass the runtime local-path validation
+    diarize_mod._validate_materialized_config_local(out)
+
+
+def test_d2_stage_fails_loud_on_missing_snapshot_config(tmp_path, monkeypatch):
+    snaps = _fake_snapshots(tmp_path)
+    (snaps[DIARIZATION_REPO] / "config.yaml").unlink()   # snapshot without the config
+    _install_fake_download(monkeypatch, snaps)
+    with pytest.raises(RuntimeError):
+        stage_mod.stage(hf_home=tmp_path / "hf", token="DUMMY", out_path=tmp_path / "o.yaml")
+
+
+def test_d2_main_default_out_and_printed_path_matches_stage(tmp_path, capsys, monkeypatch):
+    _install_fake_download(monkeypatch, _fake_snapshots(tmp_path))
+    monkeypatch.setenv("HF_TOKEN", "DUMMYTOKEN")
+    hf = tmp_path / "hf"
+    rc = stage_mod.main(["--hf-home", str(hf)])
+    assert rc == 0
+    default_out = hf / MATERIALIZED_CONFIG_NAME
+    assert default_out.is_file()                         # written at the default path
+    out = capsys.readouterr().out
+    assert f"pipeline_config: {default_out}" in out      # the operator copy-paste value matches
+    # idempotent re-run
+    assert stage_mod.main(["--hf-home", str(hf)]) == 0
+
+
+def test_d2_main_returns_1_on_stage_failure_token_not_logged(tmp_path, capsys, monkeypatch):
+    def _boom(repo_id, *, hf_home, token):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(stage_mod, "_snapshot_download", _boom)
+    monkeypatch.setenv("HF_TOKEN", "SECRETTOKEN123")
+    rc = stage_mod.main(["--hf-home", str(tmp_path / "hf")])
+    assert rc == 1
+    cap = capsys.readouterr()
+    assert "SECRETTOKEN123" not in cap.out and "SECRETTOKEN123" not in cap.err
+
+
+def test_d2_main_returns_2_on_missing_token(tmp_path, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    assert stage_mod.main(["--hf-home", str(tmp_path / "hf")]) == 2
+
+
+# --- D4: YAML-null pipeline_config coerces to "" (not "None") ----------------
+
+def test_d4_yaml_null_pipeline_config_is_empty_string():
+    cfg = load_from_unified({"scribe": {"diarize": {
+        "provider": "pyannote", "enabled": True, "pipeline_config": None,
+    }}})
+    assert cfg.diarize.pipeline_config == ""

@@ -104,6 +104,23 @@ scribe:
   llm:
     base_url: "http://127.0.0.1:11434"     # loopback Ollama — barrier (b) enforced
     model: "qwen2.5:14b-instruct-q4_K_M"
+  # Multi-speaker diarization (scribe P4). Barrier (a-sibling) validates
+  # diarize.provider is local {off, fake, pyannote}. Default OFF — notes draft
+  # un-attributed until you deliberately enable the real engine.
+  diarize:
+    provider: off            # off (default) | fake (CI) | pyannote (real, on-box)
+    enabled: false           # the real-engine kill-switch: pyannote + enabled:false is INERT
+    # To enable the REAL engine (one-time, on-box):
+    #   1. accept the HF conditions on pyannote/segmentation-3.0 +
+    #      pyannote/speaker-diarization-3.1 (browser, same HF account as the token);
+    #   2. stage the models + materialize the repo-id-free pipeline config:
+    #        python -m alfred.scripts.stage_diarize_models \
+    #          --hf-home /data/algernon/stayc-clinical/models/hf \
+    #          --token-file ~/.secrets/hf_token
+    #   3. set provider: pyannote, enabled: true, and pipeline_config to the printed path.
+    # pipeline_config is the MATERIALIZED, repo-id-free config (absolute local paths);
+    # an ENABLED pyannote with it unset/missing FAILS BOOT (exit 78) by design.
+    # pipeline_config: "/data/algernon/stayc-clinical/models/hf/speaker-diarization-3.1.local.yaml"
   # Designated human-clinician identities allowed to ATTEST a clinical_note
   # (scribe P2-a, #41). FAIL-CLOSED: an empty list = NO valid attester (every
   # `alfred scribe attest` refused). A plain identity list — NOT a network

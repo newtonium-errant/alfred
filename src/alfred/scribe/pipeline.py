@@ -258,8 +258,17 @@ async def process_source(
         # note STILL generates from the un-attributed transcript — it must NOT
         # fail the source (un-attributed ≫ mis-attributed), so it is caught HERE
         # rather than bubbling to the outer fail-closed handler.
+        # W1 (P4-4) — the real pyannote engine is a torch model load + CPU inference
+        # (seconds-to-minutes), NOT the microseconds the fake/off seams were. Run it
+        # OFF the event loop (asyncio.to_thread) exactly like the whisper decode
+        # above, so a diarize pass never stalls the shared loop the ingest server
+        # rides (a blocked loop would freeze in-flight chunk POSTs). The accumulator
+        # path already runs inside asyncio.to_thread(accumulate_encounter) — not
+        # double-wrapped there.
         try:
-            transcript = diarize_mod.assign_speakers(config, audio_path, transcript)
+            transcript = await asyncio.to_thread(
+                diarize_mod.assign_speakers, config, audio_path, transcript,
+            )
         except Exception as e:  # noqa: BLE001 — fail-open: draft un-attributed, do NOT fail
             log.warning(
                 "scribe.diarize.failed",

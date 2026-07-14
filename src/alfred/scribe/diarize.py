@@ -1,11 +1,13 @@
-"""Local multi-speaker diarization for the sovereign scribe (scribe P4-1).
+"""Local multi-speaker diarization for the sovereign scribe (scribe P4, real engine
+in P4-4).
 
-The DIARIZER-WRITER half of P4: it resolves each transcript segment's
-``speaker`` to a canonical ROLE ({clinician, patient, other, unknown}) and
-latches ``Transcript.diarized``. The attribution-READER half (the mis-attribution
-safety net) is P4-2 — NO consumer reads ``speaker`` yet this phase (the plumbing
-+ the fake seam + the frozen data shapes ship first, fully CI-covered, before the
-heavy engine).
+The DIARIZER-WRITER half of P4: it resolves each transcript segment's ``speaker``
+to a canonical ROLE ({clinician, patient, other, unknown}) and latches
+``Transcript.diarized``. The attribution-READER half — the mis-attribution safety
+net ``speaker_attribution.py`` — shipped in P4-2 and DOES consume ``speaker`` /
+``speaker_conf`` now (the P4-2 flags + banner). P4-1 shipped the plumbing + the fake
+seam + the frozen shapes; P4-4 (here) replaces the pyannote stub with the real
+engine.
 
 Providers (dispatch on ``config.diarize.provider``) — ALL on the sovereign
 barrier-a-sibling allowlist, so no cloud diarization is reachable:
@@ -35,13 +37,28 @@ P4-1 NOTE-3 forbids the engine touching text OR segment boundaries, and splittin
 segment would break the ``[S#]`` id invariant (`append_chunk` monotonic ids, the
 grounding cite graph, the note-gen per-line ``S#`` contract). RECONCILIATION: we do
 NOT physically split. A segment that STRADDLES a speaker change gets a REDUCED
-purity (< 1.0); at the P4-2 attribution layer a sub-purity ``speaker_conf`` demotes
-the role to ``unknown`` (``speaker_unverified``). So "split-on-straddle" is realized
-as "straddle → low purity → unknown", which is fail-closed (un-attributed ≫
-mis-attributed) and COMPOSES with the already-shipped safety net — no new mutation
-surface, no boundary/text change. (The overlap core is word-CAPABLE — it aggregates
-over a list of intervals per segment — so P4-5 can thread STT word timings for finer
-purity without a redesign; P4-4 feeds it the single segment span.)
+purity (< 1.0).
+
+⚠ HONEST RESIDUAL (C1) — this fail-closes ONLY when the straddle drives purity
+BELOW ``purity_threshold``. A SUPRA-threshold dominant cluster (e.g. an 85%/15%
+straddle at threshold 0.80) is accepted as that speaker and ABSORBS the minority
+words — they ride the majority speaker's role with no flag. That is a genuine
+GRANULARITY LOSS vs a true per-word split: the segment is the attribution unit, so a
+minority speaker's words inside a majority segment are mis-attributed silently. The
+true fix is per-WORD attribution (P4-5 threads STT word timings into the same
+word-CAPABLE overlap core — it already aggregates over an interval-list per segment,
+so no redesign; P4-4 feeds it the single segment span). Until then this layer
+narrows, not closes, intra-segment mixing; the human ATTEST remains the primary
+control and the note is NEVER "attribution verified". Below-threshold straddles DO
+fail-closed (→ ``unknown`` / ``speaker_unverified`` at P4-2), composing with the
+shipped safety net — no new mutation surface, no boundary/text change.
+
+CROSS-CHUNK CLUSTER-LABEL INSTABILITY (C3) — pyannote mints ARBITRARY per-chunk
+labels (``SPEAKER_00``, ``SPEAKER_01``, ...): chunk 3's ``SPEAKER_00`` is NOT chunk
+1's. ``speaker_cluster`` is therefore chunk-local and MEANINGLESS across chunks.
+Harmless in P4-4 (every cluster → ``unknown`` regardless), but the P4-5 role registry
+CANNOT key on the label string — it must re-anchor each chunk by EMBEDDING match
+against the stable clinician enrollment. See the ``_cluster_to_role`` seam.
 
 CARRY-FORWARDS honored here (from the P4-1/P4-2 SHIPPED blocks):
   * NOTE-1 — ``enabled`` is now the real-engine kill-switch (dispatch + the
@@ -67,17 +84,27 @@ LOCAL-BY-CONSTRUCTION: no ``api_key`` / ``base_url``; the real engine loads OFFL
 from a MATERIALIZED, repo-id-free pipeline config (``diarize.pipeline_config``,
 written by ``scripts.stage_diarize_models``) because pyannote's ``from_pretrained``
 does not reliably honor ``local_files_only`` — a repo-id-bearing config still
-triggers a hub GET. ``HF_HUB_OFFLINE=1`` (set in the engine path) + the sovereign
-requests-guard are the fail-closed BACKSTOPS. The sovereign boundary
-(``_check_diarize_local``) independently refuses a non-local provider at load.
+triggers a hub GET. The OFFLINE layers, honestly (A3):
+  1. load from the MATERIALIZED repo-id-free config [PRIMARY];
+  2. ``_validate_materialized_config_local`` — pre-import assert every model ref is
+     an existing LOCAL path (fail-loud; closes the mispointed-config hole) [compensating];
+  3. the SovereignHttpGuard requests/httpx wrap [backstop];
+  4. the systemd unit's PRE-IMPORT ``Environment=HF_HUB_OFFLINE=1`` [the only working
+     env belt].
+⚠ A RUNTIME ``os.environ['HF_HUB_OFFLINE']='1'`` set is INERT and was DELETED:
+huggingface_hub freezes the constant at IMPORT, and STT imports hub before diarize —
+so an in-process set never takes effect (stt.py carries the on-box proof). The
+sovereign boundary (``_check_diarize_local``) independently refuses a non-local
+provider at load.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import math
-import os
+import threading
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -146,18 +173,34 @@ def ensure_diarize_backend_available(config: ScribeConfig) -> None:
     is INERT (``assign_speakers`` returns the chunk untouched), so it must ALSO boot
     torch-free (an operator disabling the engine shouldn't be forced to keep torch
     installed). The dep is required only when the real engine will actually run.
+
+    A4 BOOT GATE: an ENABLED pyannote engine ALSO requires a MATERIALIZED offline
+    ``pipeline_config`` that EXISTS. Without it every chunk would degrade to
+    un-diarized with only a per-chunk log (a silent-drift boot), so fail LOUD here
+    (``MissingDiarizeDependency`` → exit 78, no-restart — same clean give-up as a
+    missing dep; a config edit + restart is the fix). Consistent with the
+    encounter_salt fail-loud-on-missing precedent.
     """
     provider = (config.diarize.provider or "").strip().lower()
-    if (
-        provider in _REAL_ENGINE_PROVIDERS
-        and config.diarize.enabled
-        and not _pyannote_available()
-    ):
+    if provider not in _REAL_ENGINE_PROVIDERS or not config.diarize.enabled:
+        return  # off / fake / disabled pyannote → boots torch-free, no gate
+    if not _pyannote_available():
         raise MissingDiarizeDependency(
             f"scribe diarize provider {provider!r} (enabled) needs pyannote.audio, "
             f"which is not installed. Install the [scribe-diarize] extra into the "
             f"STAY-C venv (torch from the CPU wheel index). The 'off'/'fake' "
             f"providers — and a disabled pyannote (enabled:false) — need no dependency."
+        )
+    pipeline_config = (config.diarize.pipeline_config or "").strip()
+    if not pipeline_config or not Path(pipeline_config).is_file():
+        raise MissingDiarizeDependency(
+            f"scribe diarize provider 'pyannote' (enabled) requires a materialized "
+            f"pipeline_config that EXISTS on disk; got "
+            f"{pipeline_config or '(unset)'!r}. Run `python -m "
+            f"alfred.scripts.stage_diarize_models` on-box to download the models + "
+            f"materialize the repo-id-free config, then set "
+            f"scribe.diarize.pipeline_config. Refusing to boot (exit 78) rather than "
+            f"degrade every encounter to un-diarized."
         )
 
 
@@ -274,9 +317,51 @@ def _fake_diarize(chunk_tx: Transcript, audio_path: str | Path) -> Transcript:
 Turn = tuple[float, float, str]
 
 
+# B3 — labeled-coverage floor. A segment whose LABELED speech covers less than this
+# fraction of its OWN duration is mostly diarizer-silence: the "dominant" cluster
+# speaks only a sliver, so a high purity there is meaningless (the denominator
+# conflates diarizer-silence with missed speech). Below the floor we fail-SAFE — conf
+# is degraded to 0.0 (→ ``unknown`` at P4-2). CALIBRATE-tunable on-box (the same
+# --calibrate pass that tunes purity/match thresholds); ship conservative-low.
+_MIN_LABELED_COVERAGE = 0.3
+
+
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
     """Overlap (seconds) of ``[a0, a1]`` with ``[b0, b1]``, clamped at 0."""
     return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _partition_valid_turns(turns: list[Turn]) -> tuple[list[Turn], int]:
+    """Split ``turns`` into (valid, n_invalid). A turn is INVALID (B1) when a bound
+    is non-finite (NaN/±inf) or ``end <= start`` — such a turn would otherwise skew
+    the overlap math (a NaN bound can claim an entire segment). Counted so the caller
+    can log the drop (observability), never silently swallowed."""
+    valid: list[Turn] = []
+    n_invalid = 0
+    for t0, t1, cluster in turns:
+        if math.isfinite(t0) and math.isfinite(t1) and t1 > t0:
+            valid.append((t0, t1, cluster))
+        else:
+            n_invalid += 1
+    return valid, n_invalid
+
+
+def _merge_intervals(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Union a cluster's (start, end) spans into NON-OVERLAPPING intervals (B2), so
+    duplicate / overlapping turns of the SAME cluster are counted ONCE (else the same
+    speech-time double-counts and can inflate purity above threshold). Inputs are
+    pre-validated finite + ``end > start``."""
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged = [ordered[0]]
+    for s0, s1 in ordered[1:]:
+        m0, m1 = merged[-1]
+        if s0 <= m1:                      # overlap / touch → extend the run
+            merged[-1] = (m0, max(m1, s1))
+        else:
+            merged.append((s0, s1))
+    return merged
 
 
 def _dominant_cluster_over_intervals(
@@ -288,29 +373,53 @@ def _dominant_cluster_over_intervals(
     ``intervals`` is the segment's constituent spans — the single ``[start, end]``
     span in P4-4, or per-WORD spans when P4-5 threads STT word timings (the reason
     this is interval-list-shaped, not a single span: word-level slots in with no
-    redesign). Overlap is summed per cluster across all of the segment's intervals;
-    the DOMINANT cluster is the argmax (ties broken by sorted cluster label →
-    deterministic). PURITY = dominant / total-labeled-overlap ∈ [0, 1] — the
-    dominant cluster's SHARE of the segment's overlapped speech (silence / unlabeled
-    gaps are NOT in the denominator, so trailing silence does not dilute a clean
-    segment; a genuine speaker STRADDLE does). A segment overlapping NO turn (or a
-    zero/negative-duration interval) → ``(None, 0.0)`` — never a division by zero,
-    never a NaN."""
+    redesign). Per cluster, its turns are MERGED (B2 — same-cluster overlaps counted
+    once) then overlapped against the segment's spans; the DOMINANT cluster is the
+    argmax (ties → sorted cluster label, deterministic). PURITY = dominant /
+    total-LABELED-overlap ∈ [0, 1] — the dominant cluster's SHARE of the segment's
+    overlapped speech (silence / unlabeled gaps are NOT in the denominator, so
+    trailing silence does not dilute a clean segment; a genuine STRADDLE does).
+
+    Fail-SAFE guards, all → conf-degrading direction:
+      * INVALID turns (non-finite / end<=start) are dropped (B1) — defensive belt;
+        the caller pre-filters + logs the count.
+      * a zero / non-finite segment interval contributes nothing (no NaN).
+      * a segment overlapping NO valid turn → ``(None, 0.0)``.
+      * LABELED-COVERAGE below :data:`_MIN_LABELED_COVERAGE` → ``(dominant, 0.0)`` —
+        a mostly-silence segment never claims high purity (B3)."""
+    seg_ivs = [
+        (i0, i1) for i0, i1 in intervals
+        if math.isfinite(i0) and math.isfinite(i1) and i1 > i0
+    ]
+    if not seg_ivs:
+        return None, 0.0  # zero / non-finite segment → unknown, purity 0 (no NaN)
+    seg_duration = sum(i1 - i0 for i0, i1 in seg_ivs)
+
+    valid_turns, _ = _partition_valid_turns(turns)  # B1 belt (caller already filtered)
+    by_cluster_spans: dict[str, list[tuple[float, float]]] = {}
+    for t0, t1, cluster in valid_turns:
+        by_cluster_spans.setdefault(cluster, []).append((t0, t1))
+
     by_cluster: dict[str, float] = {}
-    for i0, i1 in intervals:
-        if not (math.isfinite(i0) and math.isfinite(i1)) or i1 <= i0:
-            continue  # zero/negative/non-finite interval contributes nothing (no NaN)
-        for t0, t1, cluster in turns:
-            ov = _overlap(i0, i1, t0, t1)
-            if ov > 0.0:
-                by_cluster[cluster] = by_cluster.get(cluster, 0.0) + ov
+    for cluster, spans in by_cluster_spans.items():
+        tot = 0.0
+        for m0, m1 in _merge_intervals(spans):        # B2 — merge before aggregating
+            for i0, i1 in seg_ivs:
+                tot += _overlap(i0, i1, m0, m1)
+        if tot > 0.0:
+            by_cluster[cluster] = tot
     if not by_cluster:
         return None, 0.0  # no labeled speech overlaps this segment → unknown, purity 0
-    total = sum(by_cluster.values())
-    # Deterministic argmax: iterate clusters in sorted-label order so ties resolve
-    # to the lexicographically smallest label (never dict-insertion-order-dependent).
+
+    labeled = sum(by_cluster.values())
+    # Deterministic argmax: sorted-label order so ties resolve to the lexicographically
+    # smallest label (never dict-insertion-order-dependent).
     dominant = max(sorted(by_cluster), key=by_cluster.__getitem__)
-    purity = by_cluster[dominant] / total if total > 0.0 else 0.0
+    purity = by_cluster[dominant] / labeled if labeled > 0.0 else 0.0
+
+    coverage = labeled / seg_duration if seg_duration > 0.0 else 0.0
+    if coverage < _MIN_LABELED_COVERAGE:
+        return dominant, 0.0  # B3 — mostly silence: fail-safe (→ unknown at P4-2)
     return dominant, purity
 
 
@@ -334,7 +443,14 @@ def _cluster_to_role(cluster: str | None, config: ScribeConfig) -> str:
     HARD REQUIREMENT that the engine fail-close weak/ambiguous matches to ``unknown``
     AT RESOLUTION — with no enrollment, ALL matches are "weak". The multi-preset
     cluster→role registry lands in P4-5 and extends THIS single seam; do not build
-    role matching here beyond the fail-safe."""
+    role matching here beyond the fail-safe.
+
+    ⚠ P4-5 SEAM NOTE (C3): the ``cluster`` string is a CHUNK-LOCAL pyannote label
+    (``SPEAKER_00`` in chunk 3 ≠ chunk 1's) — it is NOT stable across chunks, so P4-5
+    MUST NOT key roles on the label. It re-anchors each chunk by EMBEDDING match
+    against the stable clinician enrollment, which means P4-5 will need the per-cluster
+    EMBEDDING (or the audio to re-derive it) threaded into this seam — NOT built here
+    (this signature stays cluster+config until then)."""
     return ROLE_UNKNOWN
 
 
@@ -351,11 +467,23 @@ def _apply_diarization(
     diarized=False) and the pipeline folds it un-attributed. NOTE-3: touches ONLY
     ``speaker`` / ``speaker_cluster`` / ``speaker_conf`` — never text / id / bounds.
     Pure + torch-free (the pyannote-specific work is upstream), so CI covers it fully."""
+    # B1 — drop invalid turns (non-finite / end<=start) ONCE, loudly, before the
+    # per-segment loop (a NaN-bounds turn would otherwise skew every segment).
+    valid_turns, n_invalid = _partition_valid_turns(turns)
+    if n_invalid:
+        log.warning(
+            "scribe.diarize.invalid_turns_dropped",
+            source_id=chunk_tx.source_id,
+            dropped=n_invalid,
+            total=len(turns),
+            detail="pyannote turns with non-finite / end<=start bounds dropped "
+                   "before alignment (a bad-bounds turn can skew overlap)",
+        )
     # STAGE — compute all assignments first (this is where a raise would happen).
     staged: list[tuple[str | None, float, str]] = []
     for seg in chunk_tx.segments:
         cluster, purity = _dominant_cluster_over_intervals(
-            [(seg.start_s, seg.end_s)], turns,
+            [(seg.start_s, seg.end_s)], valid_turns,
         )
         staged.append((cluster, _guard_conf(purity), _cluster_to_role(cluster, config)))
     # COMMIT — pure assignment, cannot raise. Only speaker/cluster/conf (NOTE-3).
@@ -371,8 +499,8 @@ def _apply_diarization(
         provider="pyannote",
         source_id=chunk_tx.source_id,
         segments=len(chunk_tx.segments),
-        turns=len(turns),
-        clusters=len({t[2] for t in turns}),
+        turns=len(valid_turns),
+        clusters=len({t[2] for t in valid_turns}),
         clinician=roles.count(ROLE_CLINICIAN),
         patient=roles.count(ROLE_PATIENT),
         other=roles.count(ROLE_OTHER),
@@ -392,16 +520,104 @@ def _turns_from_annotation(diarization) -> list[Turn]:
     return turns
 
 
-def _run_pyannote_pipeline(config: ScribeConfig, audio_path: str | Path) -> list[Turn]:
-    """Load the OFFLINE pyannote pipeline + diarize ``audio_path`` → turns.
+# A2 — pipeline cache. pyannote model load is seconds; loading PER CHUNK (every ~30s
+# sweep) is wasteful. Cache a lazy singleton keyed by the resolved pipeline_config
+# path. THREAD-SAFETY (A1 moved diarize onto worker threads): a lock guards the
+# expensive first-load; subsequent hits are lock-free atomic dict reads (GIL).
+# Invalidated ONLY on path change — a materialized-config EDIT requires a process
+# restart anyway (the systemd unit's pre-import HF_HUB_OFFLINE etc. are import-frozen),
+# so process restart is the config-change boundary.
+_PIPELINE_CACHE: dict[str, Any] = {}
+_PIPELINE_CACHE_LOCK = threading.Lock()
 
-    Lazy-imports pyannote (torch heavy — never imported in CI). Loads from the
-    MATERIALIZED, repo-id-free ``diarize.pipeline_config`` (absolute local paths) —
-    the primary offline mechanism, because ``from_pretrained`` does not reliably
-    honor ``local_files_only``. ``HF_HUB_OFFLINE=1`` is set here as a BELT, and the
-    sovereign requests-guard is the fail-closed BACKSTOP. Fail-LOUD (``DiarizeError``)
-    when the materialized config is unset/missing — a real engine with no offline
-    config must never boot (and must never risk a hub GET)."""
+
+def _validate_materialized_config_local(cfg_path: Path) -> None:
+    """Compensating OFFLINE layer (A3): BEFORE importing pyannote, assert the
+    materialized pipeline config's model references are EXISTING LOCAL PATHS — never
+    repo ids. Closes the mispointed-config scenario (operator points pipeline_config
+    at the snapshot's ORIGINAL config.yaml, whose ``pyannote/...`` repo-id fields
+    would trigger a hub GET at from_pretrained). Fail-loud ``DiarizeError`` otherwise.
+
+    Offline layering, honestly (the runtime ``os.environ['HF_HUB_OFFLINE']='1'`` set
+    was DELETED — it is INERT: huggingface_hub freezes the constant at import, and STT
+    imports hub before diarize; see stt.py's on-box proof). The REAL layers: (1) load
+    from the materialized repo-id-free config [PRIMARY]; (2) THIS pre-import local-path
+    validation [compensating]; (3) the SovereignHttpGuard requests/httpx wrap
+    [backstop]; (4) the systemd unit's PRE-IMPORT ``Environment=HF_HUB_OFFLINE=1`` [the
+    only working env belt]."""
+    import yaml
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        raise DiarizeError(
+            f"materialized pipeline config {cfg_path} is unreadable / not valid YAML: "
+            f"{e}. Re-run scripts.stage_diarize_models."
+        ) from e
+    pipeline = cfg.get("pipeline")
+    params = pipeline.get("params") if isinstance(pipeline, dict) else None
+    if not isinstance(params, dict):
+        raise DiarizeError(
+            f"materialized pipeline config {cfg_path} has no 'pipeline.params' — it is "
+            f"not a materialized pyannote config. Re-run scripts.stage_diarize_models."
+        )
+    for field in ("segmentation", "embedding"):
+        val = params.get(field)
+        if not isinstance(val, str) or not Path(val).exists():
+            raise DiarizeError(
+                f"materialized pipeline config {cfg_path}: pipeline.params.{field} = "
+                f"{val!r} is not an EXISTING local path — it looks like a repo id or a "
+                f"missing file. Loading it would risk a HuggingFace hub GET "
+                f"(from_pretrained does not honor local_files_only). Point "
+                f"pipeline_config at the MATERIALIZED config (not a snapshot's original "
+                f"config.yaml) — re-run scripts.stage_diarize_models."
+            )
+
+
+def _load_pipeline_cached(cfg_path: Path):
+    """Lazy, thread-safe, per-config-path singleton pyannote Pipeline (A2).
+
+    Lazy-imports pyannote (torch heavy — never imported in CI). Double-checked
+    locking: the fast path is a lock-free atomic dict read; only the first load per
+    path takes the lock. Fail-loud on a None load (bad/incomplete materialized
+    config)."""
+    key = str(cfg_path)
+    cached = _PIPELINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with _PIPELINE_CACHE_LOCK:
+        cached = _PIPELINE_CACHE.get(key)   # re-check under the lock
+        if cached is not None:
+            return cached
+        try:
+            from pyannote.audio import Pipeline
+        except ImportError as e:  # pragma: no cover — guarded by ensure_diarize_backend_available
+            raise MissingDiarizeDependency(
+                "pyannote.audio is not installed — install the [scribe-diarize] extra "
+                "into the STAY-C venv."
+            ) from e
+        pipeline = Pipeline.from_pretrained(str(cfg_path))
+        if pipeline is None:
+            # from_pretrained returns None on a load failure instead of raising —
+            # fail-loud rather than crash later on a None call. NOT cached.
+            raise DiarizeError(
+                f"pyannote Pipeline.from_pretrained({cfg_path}) returned None — the "
+                f"materialized pipeline config is malformed or its local model paths "
+                f"are missing. Re-run scripts.stage_diarize_models."
+            )
+        _PIPELINE_CACHE[key] = pipeline
+        return pipeline
+
+
+def _run_pyannote_pipeline(config: ScribeConfig, audio_path: str | Path) -> list[Turn]:
+    """Load the OFFLINE pyannote pipeline (cached) + diarize ``audio_path`` → turns.
+
+    Loads from the MATERIALIZED, repo-id-free ``diarize.pipeline_config`` (absolute
+    local paths) — the PRIMARY offline mechanism, because ``from_pretrained`` does not
+    reliably honor ``local_files_only``. The config's local-path model refs are
+    VALIDATED pre-import (:func:`_validate_materialized_config_local`, the compensating
+    offline layer); the pipeline itself is CACHED per path (:func:`_load_pipeline_cached`).
+    Fail-LOUD (``DiarizeError``) when the config is unset/missing — a real engine with
+    no offline config must never run (and must never risk a hub GET)."""
     pipeline_config = (config.diarize.pipeline_config or "").strip()
     if not pipeline_config:
         raise DiarizeError(
@@ -419,26 +635,8 @@ def _run_pyannote_pipeline(config: ScribeConfig, audio_path: str | Path) -> list
             f"models + materialize it on-box (scripts.stage_diarize_models) before "
             f"enabling the pyannote engine."
         )
-    # BELT: force HF offline in the engine path (the materialized local-path config
-    # is the PRIMARY mechanism; this + the requests-guard are the backstops).
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    try:
-        from pyannote.audio import Pipeline
-    except ImportError as e:  # pragma: no cover — guarded by ensure_diarize_backend_available
-        raise MissingDiarizeDependency(
-            "pyannote.audio is not installed — install the [scribe-diarize] extra "
-            "into the STAY-C venv."
-        ) from e
-    pipeline = Pipeline.from_pretrained(str(cfg_path))
-    if pipeline is None:
-        # from_pretrained returns None on a load failure (e.g. a bad/incomplete
-        # materialized config) instead of raising — fail-loud rather than crash
-        # later on a None call.
-        raise DiarizeError(
-            f"pyannote Pipeline.from_pretrained({cfg_path}) returned None — the "
-            f"materialized pipeline config is malformed or its local model paths are "
-            f"missing. Re-run scripts.stage_diarize_models."
-        )
+    _validate_materialized_config_local(cfg_path)   # pre-import offline validation (A3)
+    pipeline = _load_pipeline_cached(cfg_path)       # cached load (A2)
     diarization = pipeline(str(audio_path))
     return _turns_from_annotation(diarization)
 

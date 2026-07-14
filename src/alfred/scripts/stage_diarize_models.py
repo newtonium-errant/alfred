@@ -7,9 +7,11 @@ MATERIALIZES a pipeline config YAML whose sub-model references are ABSOLUTE LOCA
 PATHS (no repo ids). This is the load mechanism the runtime engine uses because
 pyannote's ``from_pretrained`` does NOT reliably honor ``local_files_only`` — a
 repo-id-bearing config still triggers a hub revision GET even when everything is
-cached. Loading FROM the materialized local-path config is what keeps the engine
-offline; ``HF_HUB_OFFLINE=1`` + the sovereign requests-guard are the fail-closed
-BACKSTOPS (see ``scribe.diarize._run_pyannote_pipeline``).
+cached. Loading FROM the materialized local-path config is the PRIMARY offline
+control; the engine ALSO validates every model ref is an existing local path
+pre-import, and the SovereignHttpGuard + the systemd unit's PRE-IMPORT
+``Environment=HF_HUB_OFFLINE=1`` are the backstops (a RUNTIME env set is inert —
+hub freezes the constant at import). See ``scribe.diarize._run_pyannote_pipeline``.
 
 Mirrors the ``install_stayc_unit.verify_or_stage_model`` (#67 F3) precedent:
 pure path/transform helpers (unit-tested, no network) + an I/O ``main`` that does
@@ -36,6 +38,33 @@ Usage::
 
 Then set ``scribe.diarize.provider: pyannote``, ``enabled: true``, and
 ``pipeline_config: <printed materialized-config path>`` in the STAY-C config.
+
+═══════════════════════════════════════════════════════════════════════════════
+OPERATOR CHECKLIST (on-box — the code half ships CI-green; these are the manual /
+box-only verifications this script's tests CANNOT cover)
+═══════════════════════════════════════════════════════════════════════════════
+  1. GATED-REPO ACCEPTANCE FIRST — accept the HF conditions on BOTH gated repos
+     (segmentation-3.0 + speaker-diarization-3.1) in the browser BEFORE running this,
+     using the same HF account the token belongs to. Only the ungated wespeaker repo
+     is confirmed; an un-accepted gated repo 401s MID-STAGE (after other downloads).
+  2. ``_pick_local_model_path`` FILE-vs-DIR — verify pyannote actually loads the
+     materialized ``segmentation`` / ``embedding`` paths this writes (checkpoint file
+     when present, else snapshot dir). If a load errors on the path shape, adjust
+     ``_pick_local_model_path`` — the exact preference is pyannote-version-sensitive.
+  3. PERMISSIONS — the staged ``--hf-home`` tree must be READABLE by the #67 SYSTEM
+     unit's ``User=`` (the operator, not root). Stage as that user, or chown after.
+  4. TORCH/pyannote RUNTIME CACHE WRITES — under the systemd sandbox (ProtectSystem=
+     strict, ProtectHome), torch/pyannote may try to write ``~/.cache`` / XDG dirs at
+     load; ensure those are in the unit's ReadWritePaths or pre-created, else load fails.
+  5. CPU-ONLY torch — install torch from the CPU wheel index in the STAY-C venv (no
+     CUDA on the box); confirm ``torch.cuda.is_available()`` is False + load is CPU.
+  6. REAL webm DECODE — confirm torchaudio/ffmpeg decode the real PWA webm chunk format
+     (not just wav) end-to-end through ``assign_speakers``.
+  7. RTF MEASURE → CHUNK CADENCE — measure pyannote CPU RTF on the Ryzen; confirm the
+     per-chunk diarize latency fits the sweep cadence (system LAGS not fails past RTF>1).
+  8. ENROLLMENT-EMBED CONCURRENCY (P4-5) — when enrollment lands, re-verify the cached
+     pipeline + the embedding extraction are safe under the worker-thread concurrency
+     A1 introduced.
 """
 
 from __future__ import annotations
@@ -72,11 +101,6 @@ _CHECKPOINT_BASENAME = "pytorch_model.bin"
 # ---------------------------------------------------------------------------
 # Pure helpers (no network, no torch) — unit-tested
 # ---------------------------------------------------------------------------
-
-
-def hub_cache_dirname(repo_id: str) -> str:
-    """``org/name`` → the huggingface_hub cache dir name ``models--org--name``."""
-    return "models--" + repo_id.replace("/", "--")
 
 
 def materialize_pipeline_config(
@@ -128,33 +152,48 @@ def _pick_local_model_path(snapshot_dir: Path) -> str:
     return str(ckpt if ckpt.is_file() else snapshot_dir)
 
 
+def _validate_single_line_token(token: str, *, source: str) -> str:
+    """A resolved HF token must be a single opaque line (D1). ``.strip()`` clears the
+    common trailing newline, but an INTERIOR newline/whitespace (a multi-line file)
+    survives — and requests then echoes the whole value into an ``InvalidHeader``
+    exception, LEAKING the token to stderr. Reject it here with a clean, value-free
+    message instead."""
+    if not token:
+        raise RuntimeError(f"{source} is empty.")
+    if any(ch.isspace() for ch in token):
+        raise RuntimeError(
+            f"{source} contains interior whitespace / newlines — an HF token is a "
+            f"single opaque string. A multi-line token would leak to stderr via a "
+            f"requests InvalidHeader echo. Provide a single-line token."
+        )
+    return token
+
+
 def resolve_token(*, token_file: Path | None, env: dict[str, str]) -> str:
     """Resolve the HF token at RUNTIME — ``--token-file`` first, then ``$HF_TOKEN``.
 
     Read-and-drop: never persisted, never returned to any caller that logs it (the
-    only consumer is ``snapshot_download``). Fail-LOUD with a hint if neither
-    source is present — a gated download without a token 401s with a confusing
-    error, so surface the real cause + the stash-path hint here."""
+    only consumer is ``snapshot_download``). Validated single-line (D1). Fail-LOUD
+    with a hint if neither source is present — a gated download without a token 401s
+    with a confusing error, so surface the real cause + the stash-path hint here."""
     if token_file is not None:
         try:
-            token = token_file.read_text(encoding="utf-8").strip()
+            raw = token_file.read_text(encoding="utf-8").strip()
         except OSError as e:
             raise RuntimeError(
                 f"--token-file {token_file} is not readable: {e}. Point it at the "
                 f"operator token (stashed at ~/.secrets/hf_token, 0600)."
             ) from e
-        if not token:
-            raise RuntimeError(f"--token-file {token_file} is empty.")
-        return token
-    token = (env.get("HF_TOKEN") or "").strip()
-    if not token:
+        return _validate_single_line_token(raw, source=f"--token-file {token_file}")
+    raw = (env.get("HF_TOKEN") or "").strip()
+    if not raw:
         raise RuntimeError(
             "no HF token — set $HF_TOKEN or pass --token-file (the operator token "
             "is stashed at ~/.secrets/hf_token, 0600). Two of the three pyannote "
             "repos are GATED and need it to download. The token is used only for "
             "this download and is never persisted or logged."
         )
-    return token
+    return _validate_single_line_token(raw, source="$HF_TOKEN")
 
 
 # ---------------------------------------------------------------------------

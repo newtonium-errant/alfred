@@ -120,9 +120,11 @@ class ScribeDiarizeConfig:
     # time with the sub-models' ABSOLUTE LOCAL snapshot paths substituted for their
     # HF repo ids, because pyannote's ``from_pretrained`` does NOT reliably honor
     # ``local_files_only`` — a repo-id-bearing config still triggers a hub revision
-    # GET. Loading FROM this materialized path is what keeps the engine offline;
-    # ``HF_HUB_OFFLINE=1`` (set in the engine path) + the sovereign requests-guard
-    # are the fail-closed BACKSTOPS, not the primary control. LOCAL-BY-CONSTRUCTION:
+    # GET. Loading FROM this materialized path is the PRIMARY offline control; the
+    # engine ADDITIONALLY validates every model ref here is an existing local path
+    # pre-import, and the SovereignHttpGuard + the systemd unit's PRE-IMPORT
+    # ``HF_HUB_OFFLINE=1`` are the backstops (a RUNTIME env set is inert — see
+    # ``diarize._validate_materialized_config_local``). LOCAL-BY-CONSTRUCTION:
     # a filesystem path, NOT a network endpoint (same class as ``enrollment_path`` /
     # ``embedding_model``) — no boundary barrier applies (SUB-FIELD LOOPBACK
     # DISCIPLINE, module docstring). Empty ⇒ the pyannote provider fails LOUD at
@@ -341,7 +343,12 @@ def _build_diarize(data: Any) -> ScribeDiarizeConfig:
         "pipeline_config",
     ):
         if str_field in known:
-            setattr(cfg, str_field, str(known[str_field]))
+            # D4: a YAML null (``pipeline_config:`` with no value) is None, and
+            # ``str(None)`` == "None" — a non-empty string that would SLIP PAST the
+            # actionable empty-config fail-loud. Coerce None → "" so the boot gate +
+            # the runtime check see it as unset and emit the staging instruction.
+            v = known[str_field]
+            setattr(cfg, str_field, "" if v is None else str(v))
     for float_field in ("match_threshold", "separation_margin", "purity_threshold", "min_turn_s"):
         if float_field in known:
             try:
