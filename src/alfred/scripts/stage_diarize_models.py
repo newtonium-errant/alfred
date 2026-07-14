@@ -71,6 +71,36 @@ box-only verifications this script's tests CANNOT cover)
   8. ENROLLMENT-EMBED CONCURRENCY (P4-5) — when enrollment lands, re-verify the cached
      pipeline + the embedding extraction are safe under the worker-thread concurrency
      A1 introduced.
+  9. ENROLLMENT ON-BOX SMOKE (P4-5, memo-mandated — add to the #54 checklist):
+     real ~45 s of speech → real embed → preset file written → **ZERO disk residue**
+     (no raw audio anywhere under enrollment_dir; only <user>/pst-*.json + learning/ +
+     audit.log). ⚠ The audit/capture writers are FAIL-SILENT, so a "zero residue" smoke
+     can PASS while the store is actually unwritable — assert the preset file EXISTS and
+     the audit.log GREW, not merely that no audio is present.
+ 10. mp4/AAC DECODE FIXTURE (operator ruling 2 — the phone is an iPhone; iOS Safari emits
+     audio/mp4 AAC, NOT webm/opus). Record a real window from the actual phone and pin the
+     PyAV BytesIO decode for BOTH containers. The `_sniff_container` dispatch is CI-pinned;
+     the DECODE itself is on-box only.
+ 11. #42 UNIT ReadWritePaths MUST COVER enrollment_dir — under the systemd sandbox an
+     un-covered path makes every write EROFS. That surfaces as verdict `engine_error` at
+     finalize (after the clinician already spent the recording), and the fail-silent audit
+     writer hides it. Verify explicitly by enrolling once as the unit user.
+ 12. SWAP POSTURE (the RAM-custody residual) — enrollment audio lives ONLY in daemon RAM,
+     but CPython cannot zeroize bytes, so swap must be OFF or ENCRYPTED. Check
+     `swapon --show` / confirm encrypted swap before real-data enrollment.
+ 13. ACTIVATION ORDER — presets are stamped with the ENGINE FINGERPRINT and are invalidated
+     when it changes. Enrolling BEFORE the real embedder + real fingerprint accessor land
+     mass-invalidates them (incompatible_engine) the moment they do. Order: torch+models →
+     real embedder/fingerprint → NOTE-1 (`diarize.enabled`) + provider:pyannote →
+     enrollment_dir → arm enroll_token → FIRST real enrollment. Full runbook +
+     route/payload contract: `docs/scribe_enroll_api.md`.
+ 14. CALIBRATE — the four enrollment advisory gates (30 s target, SNR >= 10 dB, self-sim
+     >= 0.80, self-match headroom self_sim_p10 >= tau+0.05) ship ADVISORY. The first on-box
+     `--calibrate` ratifies the cut-lines (per-preset-condition same-/cross-speaker cosine
+     distributions) and flips them HARD via an explicit constant change.
+ 15. ⚑ BACKUP RE-RAISE (Operator Ruling 1) — enrollment_dir is currently INCLUDED in
+     backups for testing convenience. RE-RAISE the include/exclude ruling with the operator
+     BEFORE real-data testing begins; it is a pre-real-data item on the legal go-live gate.
 """
 
 from __future__ import annotations

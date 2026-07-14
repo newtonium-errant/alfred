@@ -178,3 +178,40 @@ def test_attest_no_enrollment_dir_no_capture(tmp_path):
            clinician_ids=_CLINICIANS, audit_path=tmp_path / "audit.jsonl", now=_NOW,
            enrollment_dir="")
     assert not (tmp_path / "enroll").exists()              # dormant → no sink materialized
+
+
+def test_attest_CLI_threads_enrollment_dir(tmp_path, monkeypatch):
+    # cmd_scribe is the ONLY production caller of attest(); the whole correction loop rides
+    # a single enrollment_dir kwarg (cli.py). Because the capture is fail-silent BY DESIGN,
+    # a refactor that drops that kwarg produces ZERO runtime signal — the loop just stops
+    # accumulating, forever. Drive the REAL CLI path and assert a row lands.
+    import yaml
+    from alfred.cli import build_parser, cmd_scribe
+
+    vault = tmp_path / "vault"
+    enroll = tmp_path / "enroll"
+    rel = _make_draft(
+        vault,
+        flags=[{"reason": SPEAKER_MISMATCH_REASON, "claim": "BP was 120 over 80",
+                "section": "objective"}],
+        provenance=_PROV,
+    )
+    cfg = {
+        "vault": {"path": str(vault)},
+        "logging": {"dir": str(tmp_path / "data")},
+        "scribe": {
+            "encounter_salt": "DUMMY_SCRIBE_TEST_SALT",
+            "stt": {"provider": "fake"},
+            "clinicians": ["np_jamie"],
+            "diarize": {"provider": "fake", "enrollment_dir": str(enroll)},
+        },
+    }
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    args = build_parser().parse_args(
+        ["--config", str(config), "scribe", "attest", rel, "--attester", "np_jamie"])
+    cmd_scribe(args)
+
+    rows = _attest_rows(str(enroll))
+    assert len(rows) == 1 and rows[0]["reason"] == SPEAKER_MISMATCH_REASON

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from alfred.scribe import embed_voice
 from alfred.scribe import enrollment as en
 from alfred.scribe.config import ScribeConfig, ScribeDiarizeConfig
@@ -101,6 +103,20 @@ def test_separation_below_delta_is_ambiguous_fail_closed():
 def test_separation_at_delta_matches():
     m = _match({"A": _vec(0.90), "B": _vec(0.70)})     # sep 0.20 >= delta 0.15
     assert m.matched is True and m.roles["A"] == ROLE_CLINICIAN
+
+
+def test_delta_boundary_is_inclusive():
+    # The contract says `best - second >= delta`. Pin the DIRECTION float-exactly (an
+    # implementation using strict `>` would fail-closed at exactly the calibrated margin,
+    # silently dropping clinician matches that sit on the ratified boundary).
+    # scores 1.0 and 0.0 → separation is EXACTLY 1.0; with delta=1.0 the boundary must ACCEPT.
+    c = _e1()
+    m = match_cluster_roles({"A": list(c), "B": _vec(0.0)}, [c], tau=0.75, delta=1.0)
+    assert m.separation == pytest.approx(1.0)
+    assert m.matched is True and m.roles["A"] == ROLE_CLINICIAN
+    # a hair MORE than the separation → rejected (proves the comparison is live).
+    m2 = match_cluster_roles({"A": list(c), "B": _vec(0.0)}, [c], tau=0.75, delta=1.0001)
+    assert m2.matched is False
 
 
 def test_exact_tie_is_ambiguous_all_unknown():

@@ -60,9 +60,11 @@ def test_enroll_token_in_allowlist_lockstep():
     # barrier-e: the field + the allowlist move together, else an enabled server
     # with enroll_token set would breach barrier-e as an unknown key.
     assert "enroll_token" in INGEST_WEB_ALLOWED_KEYS
-    assert "enroll_token" in ScribeDiarizeConfig.__dataclass_fields__ or True  # (on ingest_web, checked below)
     from alfred.scribe.config import ScribeIngestWebConfig
+    # enroll_token lives on ScribeIngestWebConfig (the SERVER block), NOT on the diarize
+    # block — assert BOTH directions (the old `... or True` here asserted nothing).
     assert "enroll_token" in ScribeIngestWebConfig.__dataclass_fields__
+    assert "enroll_token" not in ScribeDiarizeConfig.__dataclass_fields__
 
 
 def test_enrollment_path_dropped_from_schema():

@@ -121,12 +121,48 @@ scribe:
     # pipeline_config is the MATERIALIZED, repo-id-free config (absolute local paths);
     # an ENABLED pyannote with it unset/missing FAILS BOOT (exit 78) by design.
     # pipeline_config: "/data/algernon/stayc-clinical/models/hf/speaker-diarization-3.1.local.yaml"
+    #
+    # ── VOICE ENROLLMENT (P4-5) — named (user, mic, room) voice presets ──────────
+    # enrollment_dir is the biometric store: preset files (EMBEDDINGS ONLY — the raw
+    # audio is destroyed the moment the voiceprint is made), the enroll audit.log, and
+    # the self-correcting capture sink. Created 0700; files 0600.
+    # EMPTY (the default) = the whole enrollment feature is DORMANT: /scribe/enroll/*
+    # refuses (503 enrollment_dormant) BEFORE any recording, and nothing is ever written.
+    # NOTE: enrollment also requires provider: fake|pyannote — with provider: off the
+    # enroll routes refuse up-front rather than waste a 45 s recording.
+    # enrollment_dir: "/data/algernon/stayc-clinical/enrollment"
   # Designated human-clinician identities allowed to ATTEST a clinical_note
   # (scribe P2-a, #41). FAIL-CLOSED: an empty list = NO valid attester (every
   # `alfred scribe attest` refused). A plain identity list — NOT a network
   # field, so no boundary barrier applies. Deploy fills the real clinician ids
   # (e.g. "np_jamie"); the AI scribe drafter ("stayc_scribe") can never attest.
+  #
+  # ⚠️ DUAL-USE (P4-5): these ids are ALSO the voice-enrollment identity. Each entry
+  # MUST be slug-shaped — ^[a-z0-9][a-z0-9._-]{0,63}$ (lowercase; no spaces) — because
+  # it becomes a directory name under enrollment_dir and is matched VERBATIM
+  # (case-sensitive) at /scribe/enroll/start. "NP Jamie" would attest fine but
+  # fail-close EVERY enrollment with user_not_clinician — with the clinician standing
+  # there ready to record. Use "np_jamie".
   clinicians: []
+  # ── LOOPBACK PWA INGEST SERVER (#49) + the P4-5 TWO-TOKEN CAPABILITY SPLIT ─────
+  # INERT by default. When enabled, barrier (e) POSITIVELY asserts `host` is loopback at
+  # config-load (a 0.0.0.0 bind fails at the BARRIER → exit 79) and requires `token`.
+  # ingest_web:
+  #   enabled: true
+  #   host: 127.0.0.1          # loopback ONLY — barrier-e refuses anything else
+  #   port: 8760
+  #   # ENCOUNTER capability. The served page EMBEDS this token (its JS needs it).
+  #   token: ${SCRIBE_INGEST_TOKEN}
+  #   # BIOMETRIC-CUSTODY capability (P4-5) — a SEPARATE credential, because page
+  #   # possession must NEVER grant enrollment / re-record / revoke. It is NEVER embedded
+  #   # in the page: the enrolling clinician pastes it once (memory-only).
+  #   #   * UNSET/EMPTY  ⇒ the whole enrollment face is INERT (routes 404).
+  #   #   * IDENTICAL to `token` ⇒ REFUSED (fail-closed to inert + a loud error): an equal
+  #   #     token collapses the split, since anyone holding the page holds the ingest token.
+  #   #   * An UNRESOLVED ${SCRIBE_ENROLL_TOKEN} (env var not set at daemon start) is
+  #   #     treated as EMPTY — the face stays INERT rather than arming with the literal,
+  #   #     publicly-known placeholder string as its bearer.
+  #   enroll_token: ${SCRIBE_ENROLL_TOKEN}
   # Kernel-egress belt PROBE (#42) — a SUBsection of scribe (barrier-d safe:
   # not a new top-level section). Best-effort observability ONLY: the daemon
   # never trusts or gates on it — the load-bearing egress control is the
