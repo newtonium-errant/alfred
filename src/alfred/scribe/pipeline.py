@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -554,18 +555,53 @@ def _resolve_encounter_preset(
 ) -> "en_mod.ResolvedEnrollment | None":
     """Resolve the encounter's bound voice preset — fail-OPEN to ``None`` on ANY problem.
 
-    Only attempts a resolution when enrollment is configured (``enrollment_dir`` set)
-    AND a binding sidecar EXISTS — so 'no preset selected' (the common, first-class
-    choice) stays silent (no ``scribe.enrollment.unusable`` spam), while a PRESENT
-    binding that is unusable (revoked / incompatible / digest-mismatch / corrupt) drives
-    ``resolve_for_encounter``'s reason-coded ``scribe.enrollment.unusable`` log and STILL
-    falls open to ``None`` (all-``unknown``; the P4-2 banner fires). NEVER raises,
-    NEVER blocks (fail-open-for-availability)."""
+    THREE gates, in order:
+      1. enrollment configured (``enrollment_dir`` set) — else the store is dormant;
+      2. diarization will ACTUALLY run (:func:`diarize.will_diarize`) — a kill-switched
+         engine (``provider=off``, or ``pyannote`` + ``enabled:false``) must NOT stamp
+         ``diarize_provenance`` on the note (claiming a preset anchored attribution when
+         NOTHING was diarized) nor book preset-attributed ``diarize_stats`` rows whose
+         role_counts are 100% unknown (which would read as match_rate=0 at 5b and drive a
+         spurious re-record proposal for a preset the matcher never saw);
+      3. the binding FILE exists — gated on ``binding_path().is_file()``, NOT on
+         ``read_binding() is None``: a PRESENT-but-CORRUPT ``_ENROLLMENT.json`` (truncated
+         / disk-full / hostile write) must reach ``resolve_for_encounter`` so it classifies
+         ``corrupt`` + emits the reason-coded log. Conflating it with 'no preset selected'
+         made the one artifact whose destruction knocks attribution offline do so SILENTLY.
+
+    'No preset selected' (no binding file) stays silent — a first-class choice, not an
+    error. NEVER raises, NEVER blocks (fail-open-for-availability)."""
     enroll_dir = config.diarize.enrollment_dir
-    if not enroll_dir or en_mod.read_binding(encounter_dir) is None:
+    if not enroll_dir:
         return None
+    if not diarize_mod.will_diarize(config):
+        return None
+    if not en_mod.binding_path(encounter_dir).is_file():
+        return None                     # no preset selected — silent, first-class choice
     resolved = en_mod.resolve_for_encounter(encounter_dir, enroll_dir, engine_fingerprint)
     return resolved if isinstance(resolved, en_mod.ResolvedEnrollment) else None
+
+
+# In-process cache of (preset_id, centroid_version) pairs KNOWN to already have capture-sink
+# evidence. Bounds ``has_diarize_stats_for``'s full-file scan to at most ONE per key per
+# process — otherwise it re-read the whole (append-only, ever-growing) sink on EVERY ~30 s
+# sweep for every bound encounter.
+_PRESET_USE_SEEN: set[tuple[str, int]] = set()
+
+
+def _is_first_use(config: ScribeConfig, resolved: "en_mod.ResolvedEnrollment") -> bool:
+    """True iff this ``(preset_id, centroid_version)`` has NO prior capture-sink evidence —
+    its self-correcting health window starts now. The NEGATIVE result is cached forever
+    (once rows exist they never un-exist), so the sink scan cannot grow unbounded."""
+    key = (resolved.preset_id, resolved.centroid_version)
+    if key in _PRESET_USE_SEEN:
+        return False
+    if enroll_learning.has_diarize_stats_for(
+        config.diarize.enrollment_dir, resolved.preset_id, resolved.centroid_version,
+    ):
+        _PRESET_USE_SEEN.add(key)       # cache the negative — never scan this key again
+        return False
+    return True
 
 
 def _role_counts(segments: list[Segment]) -> dict[str, int]:
@@ -595,20 +631,38 @@ def _fail_closed_demotions(segments: list[Segment]) -> int:
                if s.speaker_cluster is not None and normalize_role(s.speaker) == ROLE_UNKNOWN)
 
 
+def _eligible_turns(segments: list[Segment], min_turn_s: float) -> int:
+    """Segments long enough to embed reliably (duration >= ``min_turn_s``) — the 5b LATCH
+    DENOMINATOR (``match_rate = 1 − unknown/eligible``). ``role_counts`` alone counts ALL
+    segments, so without this the ratified metric is UNCOMPUTABLE from the sink rows.
+    Non-finite / degenerate bounds are not eligible (fail-safe)."""
+    n = 0
+    for s in segments:
+        dur = s.end_s - s.start_s
+        if math.isfinite(dur) and dur >= min_turn_s:
+            n += 1
+    return n
+
+
 def _record_diarize_stats(
     config: ScribeConfig, *, encounter_id: str, chunk_seq: int | None,
     chunk_tx: Transcript, resolved: "en_mod.ResolvedEnrollment | None",
-    engine_fingerprint: dict[str, Any],
+    engine_fingerprint: dict[str, Any], match: dict[str, Any] | None = None,
 ) -> None:
     """Append the per-chunk ``diarize_stats`` capture row (PHI-free, fail-silent) when
     enrollment is configured. A NO-PRESET chunk STILL lands a row (``preset_id`` /
     ``user`` null — intentionally-left-blank: 'diarized without a preset' is
-    distinguishable from 'no capture'). ``best_cosine`` / ``separation`` are the on-box
-    match telemetry — ``None`` here because the per-cluster embedding extraction is the
-    on-box placeholder; ``role_counts`` / ``min_purity`` / demotions derive from the
-    transcript."""
+    distinguishable from 'no capture').
+
+    ``best_cosine`` / ``separation`` come from the K=2 matcher via ``match_sink`` (they
+    are ``None`` while the per-cluster embedding extraction is the on-box placeholder, but
+    the WIRE is now in place, so they populate automatically when it lands — previously
+    they were hardcoded ``None`` and would have stayed null forever). ``eligible_turns`` /
+    ``min_turn_s`` / ``diarized`` are the 5b health contract (see enroll_learning's
+    row-shape docstring)."""
     if not config.diarize.enrollment_dir:
         return
+    m = match or {}
     enroll_learning.record_diarize_stats(
         config.diarize.enrollment_dir,
         source_id=encounter_id,
@@ -619,10 +673,13 @@ def _record_diarize_stats(
         engine_fingerprint=engine_fingerprint,
         n_segments=len(chunk_tx.segments),
         role_counts=_role_counts(chunk_tx.segments),
-        best_cosine=None,
-        separation=None,
+        best_cosine=m.get("best_cosine"),
+        separation=m.get("separation"),
         min_purity=_min_purity(chunk_tx.segments),
         fail_closed_demotions=_fail_closed_demotions(chunk_tx.segments),
+        eligible_turns=_eligible_turns(chunk_tx.segments, config.diarize.min_turn_s),
+        min_turn_s=config.diarize.min_turn_s,
+        diarized=bool(chunk_tx.diarized),
     )
 
 
@@ -670,27 +727,17 @@ def accumulate_encounter(
     # choice, silent).
     engine_fp = embed_voice_mod.engine_fingerprint(config)
     resolved = _resolve_encounter_preset(encounter_dir, config, engine_fp)
+    first_use = False
     if resolved is not None:
         transcript.diarize_preset = {
             "user": resolved.user, "preset_id": resolved.preset_id,
             "centroid_version": resolved.centroid_version, "engine_fingerprint": engine_fp,
         }
-        # new_preset_first_use — the informational flag: this preset+centroid_version has
-        # no prior capture-sink evidence, so its self-correcting health window STARTS
-        # here (checked BEFORE this pass writes any diarize_stats row; a re-record bumps
-        # the version → resets the window → re-fires).
-        if not enroll_learning.has_diarize_stats_for(
-            config.diarize.enrollment_dir, resolved.preset_id, resolved.centroid_version,
-        ):
-            log.info(
-                "scribe.enrollment.new_preset_first_use",
-                encounter_id=encounter_id,
-                preset_id=resolved.preset_id,               # id-only (PHI-free)
-                centroid_version=resolved.centroid_version,
-                detail="first encounter using this preset+centroid_version — its "
-                       "self-correcting evidence base starts here (health windows on "
-                       "(preset_id, centroid_version); a re-record resets it)",
-            )
+        # new_preset_first_use is DEFERRED until a chunk actually folds (below): the row
+        # that latches it is only written on a fold, so firing here re-logged on every
+        # sweep over a bound-but-chunkless encounter (the bind happens at Start, ~30 s+
+        # before the first chunk settles).
+        first_use = _is_first_use(config, resolved)
 
     folded_seqs = {p.get("seq") for p in transcript.chunk_provenance}
     expected = (max(folded_seqs) + 1) if folded_seqs else 1
@@ -766,9 +813,10 @@ def accumulate_encounter(
         # loud log and STILL folds the un-attributed text (un-attributed ≫
         # mis-attributed); unlike an STT decode failure it must NOT hold the
         # encounter — NO break, so the fold proceeds this pass.
+        match_sink: dict[str, Any] = {}    # K=2 telemetry (best_cosine / separation) out
         try:
             chunk_tx = diarize_mod.assign_speakers(
-                config, chunk_path, chunk_tx, resolved=resolved,
+                config, chunk_path, chunk_tx, resolved=resolved, match_sink=match_sink,
             )
         except Exception as e:  # noqa: BLE001 — fail-open: fold un-attributed, do NOT hold
             log.warning(
@@ -787,7 +835,7 @@ def accumulate_encounter(
         # distinguishable from 'no capture'.
         _record_diarize_stats(
             config, encounter_id=encounter_id, chunk_seq=seq, chunk_tx=chunk_tx,
-            resolved=resolved, engine_fingerprint=engine_fp,
+            resolved=resolved, engine_fingerprint=engine_fp, match=match_sink,
         )
         offset = transcript.segments[-1].end_s if transcript.segments else 0.0
         if transcript.append_chunk(
@@ -795,6 +843,21 @@ def accumulate_encounter(
         ):
             result.folded += 1
         expected += 1
+
+    # new_preset_first_use — fires ONCE, and only once a chunk ACTUALLY folded (the
+    # diarize_stats row written this pass is what latches it). Firing at resolve time
+    # re-logged on every sweep over a bound-but-chunkless encounter.
+    if resolved is not None and first_use and result.folded > 0:
+        _PRESET_USE_SEEN.add((resolved.preset_id, resolved.centroid_version))
+        log.info(
+            "scribe.enrollment.new_preset_first_use",
+            encounter_id=encounter_id,
+            preset_id=resolved.preset_id,               # id-only (PHI-free)
+            centroid_version=resolved.centroid_version,
+            detail="first encounter chunk attributed by this preset+centroid_version — "
+                   "its self-correcting evidence base starts here (health windows on "
+                   "(preset_id, centroid_version); a re-record resets it)",
+        )
 
     sentinel = encounter_dir / CLOSE_SENTINEL_NAME
     if sentinel.exists():

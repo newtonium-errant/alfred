@@ -619,12 +619,28 @@ async def handle_encounter_preset(request: web.Request) -> web.StreamResponse:
     preset, _cls = resolved
     existing = en.read_binding(enc_dir)
     if existing is not None:
-        # Locked at first bind. Same (user, preset, digest) = idempotent; different = 409.
+        # Already bound. Same (preset, digest) = IDEMPOTENT (a client retry — safe even
+        # mid-recording); a DIFFERENT pair = 409 + loud log.
         same = (existing.get("preset_id") == preset.preset_id
                 and existing.get("centroid_digest") == preset.centroid_digest)
         if same:
             return web.json_response({"preset_id": preset.preset_id, "state": "bound"}, status=200)
         log.warning("scribe.enroll.rejected", route=ENCOUNTER_PRESET, reason="preset_locked")
+        return _reject("preset_locked", 409)
+    # FIRST bind — LOCKED AT FIRST CHUNK (the frozen contract). Once the encounter has
+    # started recording, a first bind is REFUSED: a late bind would anchor only the LATER
+    # chunks while the note's frontmatter diarize_provenance (stamped at note CREATE) is
+    # permanently ABSENT — attest would then record preset_id=null for an encounter a
+    # preset demonstrably attributed, silently starving that preset's 5b health window and
+    # falsifying "attest sees WHICH preset attributed the note". Selection MUST precede
+    # recording. The 409s live ONLY on this route (chunk POSTs stay preset-blind).
+    if _encounter_has_started(enc_dir):
+        log.warning(
+            "scribe.enroll.rejected", route=ENCOUNTER_PRESET, reason="preset_locked",
+            detail="encounter already recording — the binding LOCKS AT THE FIRST CHUNK; "
+                   "a preset must be selected before Start (a late bind would leave the "
+                   "note's diarize_provenance permanently absent)",
+        )
         return _reject("preset_locked", 409)
     try:
         en.write_binding(enc_dir, preset)
@@ -633,6 +649,16 @@ async def handle_encounter_preset(request: web.Request) -> web.StreamResponse:
     enroll_learning.audit(config.diarize.enrollment_dir, "preset_selected",
                           preset_id=preset.preset_id, user=preset.user)
     return web.json_response({"preset_id": preset.preset_id, "state": "bound"}, status=200)
+
+
+def _encounter_has_started(enc_dir: Path) -> bool:
+    """True iff the encounter has already begun recording — any settled chunk on disk, or
+    the ``_CLOSED`` sentinel. The binding locks here (memo: 'locked at first chunk')."""
+    if not enc_dir.is_dir():
+        return False
+    if (enc_dir / CLOSE_SENTINEL_NAME).exists():
+        return True
+    return any(p.is_file() and p.name.startswith("chunk_") for p in enc_dir.iterdir())
 
 
 def _find_usable_preset(config: ScribeConfig, preset_id: str, fp: dict[str, Any]):

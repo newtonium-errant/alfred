@@ -206,9 +206,27 @@ def ensure_diarize_backend_available(config: ScribeConfig) -> None:
         )
 
 
+def will_diarize(config: ScribeConfig) -> bool:
+    """True iff :func:`assign_speakers` will ACTUALLY diarize this config.
+
+    ``off`` is inert, and the NOTE-1 kill-switch (``provider=pyannote, enabled=false``)
+    returns every chunk untouched. The pipeline gates preset RESOLUTION on this: without
+    it, a kill-switched engine still stamped ``diarize_provenance`` on the note (claiming
+    a preset anchored attribution when NOTHING was diarized) and booked preset-attributed
+    ``diarize_stats`` rows with role_counts 100% unknown — poisoning the 5b health window
+    for a preset the matcher never saw."""
+    provider = (config.diarize.provider or "").strip().lower()
+    if provider == "fake":
+        return True
+    if provider == "pyannote":
+        return bool(config.diarize.enabled)
+    return False
+
+
 def assign_speakers(
     config: ScribeConfig, audio_path: str | Path, chunk_tx: Transcript,
     *, resolved: ResolvedEnrollment | None = None,
+    match_sink: dict[str, Any] | None = None,
 ) -> Transcript:
     """Resolve per-segment speaker roles on ``chunk_tx`` — the pipeline entry.
 
@@ -222,7 +240,14 @@ def assign_speakers(
     preset is bound / a typed refusal fell open) is the ANCHOR for the pyannote path's
     K=2 clinician matcher. ``None`` ⇒ the all-``unknown`` P4-4 end-state (fail-open).
     The ``off`` / ``fake`` seams ignore it — ``fake`` assigns roles from its sidecar
-    tags (the CI role seam), ``off`` does nothing."""
+    tags (the CI role seam), ``off`` does nothing.
+
+    ``match_sink`` (optional) receives the K=2 match TELEMETRY (``best_cosine`` /
+    ``separation`` / ``matched``) so the pipeline can record it into the ``diarize_stats``
+    capture sink. Without this out-param the telemetry existed only in a structlog line
+    and the sink's cosine fields would stay ``None`` FOREVER — including after the on-box
+    per-cluster extraction lands — silently starving the 5b health derivation of its key
+    signal."""
     provider = (config.diarize.provider or "").strip().lower()
     if provider == "off":
         return chunk_tx  # no diarization — speaker stays None, diarized stays False
@@ -244,7 +269,8 @@ def assign_speakers(
                        "INERT (chunk returned un-attributed, same as provider=off)",
             )
             return chunk_tx
-        return _pyannote_diarize(config, audio_path, chunk_tx, resolved=resolved)
+        return _pyannote_diarize(config, audio_path, chunk_tx, resolved=resolved,
+                                 match_sink=match_sink)
     # Defense in depth: the barrier-a sibling already refuses a non-local provider
     # at load; the dispatch fails closed too rather than silently no-op.
     raise DiarizeError(
@@ -551,6 +577,7 @@ def _cluster_embeddings_for(
 def _apply_diarization(
     config: ScribeConfig, chunk_tx: Transcript, turns: list[Turn],
     *, resolved: ResolvedEnrollment | None = None, audio_path: str | Path | None = None,
+    match_sink: dict[str, Any] | None = None,
 ) -> Transcript:
     """Align ``turns`` onto ``chunk_tx``'s segments and commit speaker/cluster/conf.
 
@@ -595,6 +622,13 @@ def _apply_diarization(
             tau=config.diarize.match_threshold, delta=config.diarize.separation_margin,
         )
         cluster_roles = match.roles
+        if match_sink is not None:
+            # Thread the K=2 telemetry OUT so the pipeline records it into diarize_stats.
+            match_sink.update({
+                "best_cosine": match.best_cosine,
+                "separation": match.separation,
+                "matched": match.matched,
+            })
     # STAGE — compute all assignments first (this is where a raise would happen).
     staged: list[tuple[str | None, float, str]] = []
     for seg in chunk_tx.segments:
@@ -768,6 +802,7 @@ def _run_pyannote_pipeline(config: ScribeConfig, audio_path: str | Path) -> list
 def _pyannote_diarize(
     config: ScribeConfig, audio_path: str | Path, chunk_tx: Transcript,
     *, resolved: ResolvedEnrollment | None = None,
+    match_sink: dict[str, Any] | None = None,
 ) -> Transcript:
     """The real-engine path: run pyannote (heavy, on-box) → align + commit (pure).
 
@@ -777,4 +812,5 @@ def _pyannote_diarize(
     engine raise happens here, before any segment is touched). ``resolved`` (P4-5)
     threads the encounter's bound preset into the K=2 clinician-anchor matcher."""
     turns = _run_pyannote_pipeline(config, audio_path)
-    return _apply_diarization(config, chunk_tx, turns, resolved=resolved, audio_path=audio_path)
+    return _apply_diarization(config, chunk_tx, turns, resolved=resolved,
+                              audio_path=audio_path, match_sink=match_sink)

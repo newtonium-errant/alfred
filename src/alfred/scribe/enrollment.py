@@ -45,7 +45,13 @@ SESSION_ID_RE = re.compile(r"^enr-[0-9]{13}-[0-9a-f]{16}$")
 USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 NAME_MAX = 64
+# The ACTIVE-preset cap (memo). Tombstones do NOT count against it (operator ruling) —
+# see count_active_presets.
 MAX_PRESETS_PER_USER = 32
+# The stored-ID ceiling (active + tombstones). Tombstones persist forever to block id
+# reuse, so the id space needs its OWN generous bound — hit it and the write is refused
+# LOUDLY (``tombstone_cap``) rather than growing without limit.
+MAX_PRESET_FILES_PER_USER = 256
 UNIT_NORM_TOL = 1e-3            # unit-norm load-contract tolerance
 BINDING_NAME = "_ENROLLMENT.json"
 LEARNING_DIRNAME = "learning"
@@ -400,14 +406,39 @@ def list_user_presets(enrollment_dir: str | Path, user: str,
     return entries
 
 
-def count_active_presets(enrollment_dir: str | Path, user: str) -> int:
-    """Active (non-tombstone) preset FILES for the cap check — counts by id present,
-    tombstones included (they block id reuse), so the cap is on stored ids."""
+def _preset_files(enrollment_dir: str | Path, user: str) -> list[Path]:
     d = user_dir(enrollment_dir, user)
     if not d.is_dir():
-        return 0
-    return sum(1 for p in d.iterdir()
-               if p.is_file() and p.suffix == ".json" and PRESET_ID_RE.fullmatch(p.stem))
+        return []
+    return [p for p in d.iterdir()
+            if p.is_file() and p.suffix == ".json" and PRESET_ID_RE.fullmatch(p.stem)]
+
+
+def count_active_presets(enrollment_dir: str | Path, user: str) -> int:
+    """Count the ACTIVE (non-tombstone) presets — the 32/user CAP gate.
+
+    OPERATOR RULING (panel fix-round): the cap counts ACTIVE presets ONLY. Tombstones
+    never consume a slot, which kills the dead-id exhaustion path (a delete-heavy user
+    could otherwise permanently burn the cap — `delete` could never free headroom, making
+    32 a LIFETIME create budget). Tombstones still PERSIST, so id reuse stays blocked.
+    Growth is bounded separately by :func:`count_preset_files` /
+    :data:`MAX_PRESET_FILES_PER_USER`.
+
+    (The name previously LIED — it counted tombstones too, on the very function gating
+    the cap. Now it does what it says.)"""
+    n = 0
+    for p in _preset_files(enrollment_dir, user):
+        preset, fail = load_preset(p)
+        if preset is not None and preset.status == STATUS_ACTIVE and preset.revoked is None:
+            n += 1
+    return n
+
+
+def count_preset_files(enrollment_dir: str | Path, user: str) -> int:
+    """Count ALL stored preset ids (active + tombstones) — the id-space / growth bound.
+    Tombstones persist forever (blocking id reuse), so they need their OWN generous
+    ceiling rather than consuming the active cap."""
+    return len(_preset_files(enrollment_dir, user))
 
 
 # --- write / revoke ----------------------------------------------------------
@@ -427,8 +458,13 @@ def write_preset(enrollment_dir: str | Path, preset: Preset, *, is_new: bool) ->
             raise EnrollmentError("centroid_digest does not match centroids (mis-built record)")
     path = preset_path(enrollment_dir, preset.user, preset.preset_id)
     if is_new:
+        # ACTIVE-ONLY cap (operator ruling): a tombstone never consumes a slot, so a
+        # delete-heavy user can always re-create. Tombstones persist (id reuse blocked).
         if count_active_presets(enrollment_dir, preset.user) >= MAX_PRESETS_PER_USER:
             raise EnrollmentError("preset_cap")   # explicit cap refusal (memo)
+        # ...but the stored-id space still needs a ceiling, else tombstones grow forever.
+        if count_preset_files(enrollment_dir, preset.user) >= MAX_PRESET_FILES_PER_USER:
+            raise EnrollmentError("tombstone_cap")  # loud, explicit — operator must prune
         if path.exists():
             raise EnrollmentError(f"preset_id {preset.preset_id} already exists")
     _atomic_write_json(path, preset.to_dict())
@@ -509,9 +545,17 @@ def resolve_for_encounter(
     equal ``preset.centroid_digest`` — a hostile mid-encounter re-record (new
     centroid, bumped version) lands here as ``digest_mismatch``, loud fail-open,
     never a silent re-anchor (the safety-BLOCK laundering close)."""
+    # ABSENT vs CORRUPT — a PRESENT-but-unreadable _ENROLLMENT.json is NOT "no preset
+    # selected". The memo's degradation ladder draws the line exactly here: no-binding is
+    # a first-class choice (silent); a binding artifact that EXISTS but cannot be parsed
+    # (truncation, disk-full, hostile write) is a PRESENT-but-unusable binding and MUST
+    # drive the reason-coded log — otherwise an operator greps for the signal and finds
+    # nothing, unable to tell "clinician chose no preset" from "the binding was destroyed".
+    if not binding_path(enc_dir).is_file():
+        return _refuse(REFUSAL_NO_BINDING, enc_dir, artifact="binding")
     binding = read_binding(enc_dir)
     if binding is None:
-        return _refuse(REFUSAL_NO_BINDING, enc_dir, artifact="binding")
+        return _refuse(REFUSAL_CORRUPT, enc_dir, artifact="binding")
     user = binding.get("user")
     preset_id = binding.get("preset_id")
     if not (valid_user(user) and isinstance(preset_id, str) and PRESET_ID_RE.fullmatch(preset_id)):
@@ -564,16 +608,31 @@ def preset_fit_for_status(
     return "ok" if binding.get("centroid_digest") == preset.centroid_digest else "unarmed"
 
 
+# ONCE-PER-LIFECYCLE latch for the unusable log, keyed by (encounter, reason). The
+# pipeline resolves on EVERY ~30 s sweep for EVERY encounter dir still on disk, so a
+# persistently-unusable binding (a revoked preset on a closed-but-not-swept encounter)
+# would otherwise warn ~2880×/day forever — burying rarer warnings and training the
+# operator to ignore the exact signal that also announces a hostile mid-encounter swap.
+# Same shape as the surveyor's once-per-lifecycle observability latch.
+_UNUSABLE_LOGGED: set[tuple[str, str]] = set()
+_UNUSABLE_LATCH_MAX = 4096                      # bound the set (never grows unboundedly)
+
+
 def _refuse(reason: str, enc_dir: str | Path, *, preset_id: str | None = None,
             artifact: str = "preset") -> str:
-    log.warning(
-        "scribe.enrollment.unusable",
-        reason=reason,
-        artifact=artifact,                      # "binding" | "preset" — disambiguates a
+    key = (str(enc_dir), reason)
+    if key not in _UNUSABLE_LOGGED:
+        if len(_UNUSABLE_LOGGED) < _UNUSABLE_LATCH_MAX:
+            _UNUSABLE_LOGGED.add(key)
+        log.warning(
+            "scribe.enrollment.unusable",
+            reason=reason,
+            artifact=artifact,                  # "binding" | "preset" — disambiguates a
                                                 # corrupt binding from a corrupt preset in
                                                 # diagnosis (the enum stays 8; the log widens)
-        preset_id=preset_id,                    # id-only, never a name (PHI-free)
-        detail="bound preset could not be resolved — encounter runs all-unknown "
-               "(fail-open); the P4-2 banner fires. No block.",
-    )
+            preset_id=preset_id,                # id-only, never a name (PHI-free)
+            detail="bound preset could not be resolved — encounter runs all-unknown "
+                   "(fail-open); the P4-2 banner fires. No block. (Logged ONCE per "
+                   "encounter+reason — the resolution itself repeats every sweep.)",
+        )
     return reason

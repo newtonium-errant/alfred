@@ -327,10 +327,11 @@ def test_accumulator_produces_mixed_diarized_transcript(tmp_path, monkeypatch):
     real_assign = diarize_mod.assign_speakers
     calls = {"n": 0}
 
-    def _assign(config, audio_path, chunk_tx, *, resolved=None):  # P4-5 — mirror the real kwarg
+    def _assign(config, audio_path, chunk_tx, *, resolved=None, match_sink=None):  # P4-5 kwargs
         calls["n"] += 1
         if calls["n"] == 1:
-            return real_assign(config, audio_path, chunk_tx, resolved=resolved)  # chunk1 diarizes
+            return real_assign(config, audio_path, chunk_tx, resolved=resolved,
+                               match_sink=match_sink)  # chunk1 diarizes
         raise RuntimeError("diarizer exploded on chunk2")      # chunk2 fail-opens
 
     monkeypatch.setattr(diarize_mod, "assign_speakers", _assign)

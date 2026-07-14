@@ -203,7 +203,39 @@ def test_revoke_tombstones_and_blocks_reuse(tmp_path):
     assert len(entries) == 1 and entries[0].classification == en.CLASS_REVOKED
     assert entries[0].preset.centroids == []                    # centroids dropped
     assert entries[0].preset.revoked["reason"] == "mic changed"
-    assert en.count_active_presets(d, "np_jamie") == 1          # id still blocks reuse
+    # OPERATOR RULING (panel fix-round): a tombstone consumes NO active-cap slot (so a
+    # delete-heavy user can always re-create — 32 is not a lifetime budget)...
+    assert en.count_active_presets(d, "np_jamie") == 0
+    # ...but the id PERSISTS in the stored-id space and STILL blocks reuse.
+    assert en.count_preset_files(d, "np_jamie") == 1
+    with pytest.raises(en.EnrollmentError):                     # id reuse refused
+        en.write_preset(d, p, is_new=True)
+
+
+def test_tombstones_do_not_exhaust_the_active_cap(tmp_path):
+    # The dead-id exhaustion path the ruling kills: create+delete repeatedly, then a fresh
+    # create must STILL succeed (previously every tombstone permanently burned a slot).
+    d = tmp_path / "enroll"
+    for _ in range(en.MAX_PRESETS_PER_USER + 3):
+        p = _make_preset()
+        en.write_preset(d, p, is_new=True)
+        en.revoke_preset(d, "np_jamie", p.preset_id, reason="churn")
+    assert en.count_active_presets(d, "np_jamie") == 0
+    en.write_preset(d, _make_preset(), is_new=True)             # still room — no 32-cap lockout
+    assert en.count_active_presets(d, "np_jamie") == 1
+
+
+def test_stored_id_space_has_its_own_generous_bound(tmp_path, monkeypatch):
+    # Tombstones persist forever, so the ID SPACE needs its own ceiling — a loud refusal,
+    # not unbounded growth.
+    monkeypatch.setattr(en, "MAX_PRESET_FILES_PER_USER", 3)
+    d = tmp_path / "enroll"
+    for _ in range(3):
+        p = _make_preset()
+        en.write_preset(d, p, is_new=True)
+        en.revoke_preset(d, "np_jamie", p.preset_id, reason="churn")
+    with pytest.raises(en.EnrollmentError, match="tombstone_cap"):
+        en.write_preset(d, _make_preset(), is_new=True)
 
 
 # --- binding sidecar ---------------------------------------------------------
