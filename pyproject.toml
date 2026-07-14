@@ -52,6 +52,13 @@ scribe-diarize = [
     # validation fail-louds, but the pin keeps the resolved wheel matched to the
     # transform. Bump deliberately alongside a materialize-format review.
     "pyannote.audio>=3.1,<4",
+    # Pinned <2.6: torchaudio 2.6 removed ``AudioMetaData`` from the legacy I/O
+    # backend, which pyannote.audio 3.x imports → ImportError/AttributeError at
+    # engine load. The on-box install (2026-07-13) proved latest (torch/torchaudio
+    # 2.13/2.11) breaks the engine; the box pinned 2.5.1+cpu. Keep a RANGE (not an
+    # exact pin) matched to pyannote 3.x; bump alongside the pyannote-4 review.
+    "torch>=2.2,<2.6",
+    "torchaudio>=2.2,<2.6",
 ]
 surveyor = [
     # PINNED 2026-06-25: >=2.4 let the box's fresh install grab pymilvus 3.0 /

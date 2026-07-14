@@ -101,6 +101,7 @@ def attest(
     allow_incomplete: bool = False,
     override_reason: str | None = None,
     vault_audit_path: str | Path | None = None,
+    enrollment_dir: str | Path | None = None,
 ) -> dict:
     """Attest a clinical_note — the ONLY sanctioned triad writer. Fail-closed.
 
@@ -307,4 +308,69 @@ def attest(
     except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
         log.warning("scribe.inferred_dx.attest_capture_error", source_id=source_id)
 
+    # P4-5 self-correcting Part-1 CAPTURE for SPEAKER attribution — the TWIN of the
+    # inferred-dx capture above. READ-ONLY, try-wrapped, fail-silent (a capture bug must
+    # NEVER alter/fail a medico-legal attestation). Records each speaker-attribution flag's
+    # reason + whether the flagged claim SURVIVED into the attested body (``kept`` = a
+    # normalized-substring heuristic → the correction vehicle: kept ⇒ likely a
+    # false-positive flag; removed ⇒ the check was right). No-op unless ``enrollment_dir``
+    # is set (the capture sink lives under it).
+    try:
+        if enrollment_dir:
+            _capture_speaker_attest_outcome(
+                enrollment_dir=enrollment_dir,
+                grounding_flags=fm.get("grounding_flags"),
+                diarize_provenance=fm.get("diarize_provenance"),
+                attested_body=str(rec.get("body") or ""),
+                source_id=source_id,
+            )
+    except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
+        log.warning("scribe.enroll_learning.attest_capture_error", source_id=source_id)
+
     return result
+
+
+def _capture_speaker_attest_outcome(
+    *, enrollment_dir, grounding_flags, diarize_provenance, attested_body, source_id,
+) -> None:
+    """Append an ``attest_outcome`` capture row per SPEAKER-attribution flag (P4-5).
+
+    Mirrors the inferred-dx twin: for each speaker-attribution flag in the note's
+    ``grounding_flags``, record the reason + ``kept`` (did the flagged claim's content
+    survive into the attested body — a normalized-substring heuristic, the P4-5
+    correction vehicle). The note-level ``attribution_unverified`` BANNER carries no
+    claim → recorded ``is_banner=True`` (a banner-carrying note was signed). Preset
+    provenance rides the frontmatter ``diarize_provenance`` (ids only — PHI-free)."""
+    from alfred.scribe import enroll_learning
+    from alfred.scribe.diagnosis_lexicon import normalize_text
+    from alfred.scribe.speaker_attribution import (
+        ATTRIBUTION_UNVERIFIED_REASON,
+        COLLATERAL_ATTRIBUTION_REASON,
+        SPEAKER_MISMATCH_REASON,
+        SPEAKER_UNVERIFIED_REASON,
+    )
+    speaker_reasons = {
+        SPEAKER_MISMATCH_REASON, SPEAKER_UNVERIFIED_REASON,
+        COLLATERAL_ATTRIBUTION_REASON, ATTRIBUTION_UNVERIFIED_REASON,
+    }
+    if not isinstance(grounding_flags, list):
+        return
+    prov = diarize_provenance if isinstance(diarize_provenance, dict) else {}
+    user, preset_id = prov.get("user"), prov.get("preset_id")
+    centroid_version = prov.get("centroid_version")
+    norm_body = normalize_text(attested_body)
+    for flag in grounding_flags:
+        if not isinstance(flag, dict) or flag.get("reason") not in speaker_reasons:
+            continue
+        is_banner = flag.get("reason") == ATTRIBUTION_UNVERIFIED_REASON
+        if is_banner:
+            kept = True                       # the note was signed banner-carrying (note-level)
+        else:
+            norm_claim = normalize_text(str(flag.get("claim") or ""))
+            kept = bool(norm_claim) and norm_claim in norm_body
+        enroll_learning.record_attest_outcome(
+            enrollment_dir,
+            source_id=source_id, user=user, preset_id=preset_id,
+            centroid_version=centroid_version, reason=flag.get("reason"),
+            kept=kept, is_banner=is_banner,
+        )

@@ -2625,8 +2625,11 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     attester; a self-attest / forward-only / non-clinician violation raises.
     """
     subcmd = getattr(args, "scribe_cmd", None)
+    if subcmd == "presets":
+        _cmd_scribe_presets(args)
+        return
     if subcmd != "attest":
-        print("Usage: alfred scribe attest <note> --attester <clinician> [--new-status attested|amended]")
+        print("Usage: alfred scribe {attest <note> --attester <clinician> | presets {list|audit|delete}}")
         sys.exit(1)
 
     raw = _load_unified_config(args.config)
@@ -2684,6 +2687,9 @@ def cmd_scribe(args: argparse.Namespace) -> None:
             allow_incomplete=args.force_incomplete,
             override_reason=args.reason,
             vault_audit_path=vault_audit_path,
+            # P4-5 — the voice-enrollment capture sink (self-correcting attest_outcome
+            # rows). Empty (dormant enrollment) → the attest capture is a no-op.
+            enrollment_dir=cfg.diarize.enrollment_dir,
         )
     except Exception as e:  # noqa: BLE001 — surface any attest refusal to the operator
         print(f"Attest REFUSED: {e}")
@@ -2692,6 +2698,101 @@ def cmd_scribe(args: argparse.Namespace) -> None:
         f"Attested: {result['path']} → {args.new_status} by {args.attester} "
         f"(audit: {audit_path})"
     )
+
+
+def _cmd_scribe_presets(args: argparse.Namespace) -> None:
+    """``alfred scribe presets list|audit|delete`` — operate the voice-enrollment store.
+
+    Local file ops only (no vault write, no egress) — reads/tombstones preset files +
+    the enroll audit.log under ``scribe.diarize.enrollment_dir``. ``audit`` joins names
+    from the preset files at DISPLAY time (the audit.log itself is preset_id-only,
+    PHI-free); ``list`` flags ORPHANED biometrics (a user subdir no longer in
+    ``scribe.clinicians``)."""
+    raw = _load_unified_config(args.config)
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+    from alfred.scribe import embed_voice, enroll_learning
+    from alfred.scribe import enrollment as en
+
+    cfg = load_scribe_config(raw)
+    enroll_dir = cfg.diarize.enrollment_dir
+    if not enroll_dir:
+        print("Voice enrollment is not configured (scribe.diarize.enrollment_dir is empty).")
+        sys.exit(1)
+    root = Path(enroll_dir)
+    clinicians = set(cfg.clinicians)
+    fp = embed_voice.engine_fingerprint(cfg)
+
+    def _enrolled_users() -> list[str]:
+        if not root.is_dir():
+            return []
+        return sorted(p.name for p in root.iterdir() if p.is_dir() and en.valid_user(p.name))
+
+    pcmd = getattr(args, "presets_cmd", None)
+    if pcmd == "list":
+        users = [args.user] if args.user else _enrolled_users()
+        if not users:
+            print("No enrolled users.")            # intentionally-left-blank
+            return
+        for user in users:
+            orphan = "" if user in clinicians else "  ⚠ ORPHANED (not in scribe.clinicians)"
+            print(f"User {user!r}{orphan}")
+            entries = en.list_user_presets(enroll_dir, user, fp)
+            if not entries:
+                print("  (no presets)")            # intentionally-left-blank
+                continue
+            for e in entries:
+                p = e.preset
+                name = p.name if p else "(unreadable)"
+                ver = p.centroid_version if p else "?"
+                print(f"  {e.path.stem}  [{e.classification}]  v{ver}  {name!r}")
+        return
+
+    if pcmd == "audit":
+        audit_path = root / enroll_learning.AUDIT_NAME
+        # Build preset_id → name at display time (audit.log is id-only, PHI-free).
+        names: dict[str, str] = {}
+        for user in _enrolled_users():
+            for pf in sorted((root / user).iterdir()):
+                if pf.is_file() and pf.suffix == ".json" and en.PRESET_ID_RE.fullmatch(pf.stem):
+                    preset, _ = en.load_preset(pf)
+                    if preset is not None:
+                        names[preset.preset_id] = preset.name
+        if not audit_path.is_file():
+            print("No enroll audit events yet.")    # intentionally-left-blank
+        else:
+            print("Enroll audit:")
+            for line in audit_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = row.get("preset_id")
+                name = names.get(pid, "?") if pid else "-"
+                print(f"  {row.get('ts','')}  {row.get('event',''):<18}  {pid or '-'}  {name!r}")
+        orphans = [u for u in _enrolled_users() if u not in clinicians]
+        if orphans:
+            print("\n⚠ ORPHANED biometrics (user no longer in scribe.clinicians):")
+            for o in orphans:
+                print(f"  {o}")
+        else:
+            print("\nNo orphaned biometrics (every enrolled user is a current clinician).")
+        return
+
+    if pcmd == "delete":
+        try:
+            en.revoke_preset(enroll_dir, args.user, args.preset, reason="cli_delete")
+        except en.EnrollmentError as ex:
+            print(f"Delete failed: {ex}")
+            sys.exit(1)
+        enroll_learning.audit(enroll_dir, "preset_deleted", preset_id=args.preset, user=args.user)
+        print(f"Deleted (revoked + tombstoned) preset {args.preset} for user {args.user!r}. "
+              f"Notes already written are unaffected.")
+        return
+
+    print("Usage: alfred scribe presets {list [--user U] | audit | delete --user U --preset ID}")
+    sys.exit(1)
 
 
 def cmd_mail(args: argparse.Namespace) -> None:
@@ -3546,6 +3647,26 @@ def build_parser() -> argparse.ArgumentParser:
             "— keep it PHI-free where possible."
         ),
     )
+    # P4-5 — voice-preset management (local file ops under scribe.diarize.enrollment_dir).
+    scribe_presets = scribe_sub.add_parser(
+        "presets", help="Manage voice-enrollment presets (list / audit / delete)",
+    )
+    presets_sub = scribe_presets.add_subparsers(dest="presets_cmd")
+    presets_list = presets_sub.add_parser(
+        "list", help="List voice presets + classification; flags orphaned biometrics",
+    )
+    presets_list.add_argument(
+        "--user", default=None,
+        help="Filter to one clinician (default: every enrolled user)",
+    )
+    presets_sub.add_parser(
+        "audit", help="Show the enroll audit log (names joined at display) + orphaned biometrics",
+    )
+    presets_delete = presets_sub.add_parser(
+        "delete", help="Delete (revoke + tombstone) a preset — notes already written are unaffected",
+    )
+    presets_delete.add_argument("--user", required=True, help="The preset's clinician (user subdir)")
+    presets_delete.add_argument("--preset", required=True, help="The preset id (pst-...)")
 
     # distiller
     dist = sub.add_parser("distiller", help="Vault distiller subcommands")

@@ -58,6 +58,12 @@ box-only verifications this script's tests CANNOT cover)
      load; ensure those are in the unit's ReadWritePaths or pre-created, else load fails.
   5. CPU-ONLY torch — install torch from the CPU wheel index in the STAY-C venv (no
      CUDA on the box); confirm ``torch.cuda.is_available()`` is False + load is CPU.
+     ⚠ TORCH VERSION — pin torch/torchaudio to ``>=2.2,<2.6`` (the [scribe-diarize]
+     extra enforces this). torchaudio 2.6 REMOVED ``AudioMetaData`` from the legacy I/O
+     backend, which pyannote.audio 3.x imports → ImportError at engine load. The box
+     pinned ``torch==2.5.1+cpu torchaudio==2.5.1`` (2026-07-13, proven: latest 2.13/2.11
+     broke the engine). Install e.g. ``pip install 'torch>=2.2,<2.6' 'torchaudio>=2.2,<2.6'
+     --index-url https://download.pytorch.org/whl/cpu``.
   6. REAL webm DECODE — confirm torchaudio/ffmpeg decode the real PWA webm chunk format
      (not just wav) end-to-end through ``assign_speakers``.
   7. RTF MEASURE → CHUNK CADENCE — measure pyannote CPU RTF on the Ryzen; confirm the
