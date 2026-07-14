@@ -60,6 +60,7 @@ const cfg = {
   // await-teardown scenarios (the generation-token BLOCK); the ordinary flows resolve instantly.
   holdFirstGetUserMedia: false,
   holdEnrollStart: false,
+  holdEnrollStartPerCall: false,     // hold call #1 and #2 on SEPARATE gates (two-capture race)
   holdEnrollFinalize: false,
   holdEnrollResult: false,
 };
@@ -146,6 +147,13 @@ switch (scenario) {
     // wrongly-permitted encounter emit a chunk so the breach is observable.
     cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
     cfg.holdFirstGetUserMedia = true; cfg.holdEnrollStart = true; cfg.instantWindow = true; break;
+  case 'ownership_stale_bail_2_keeps_newer_claim':
+    // The GEN CHECK #2 twin: A parks on /enroll/start #1 (per-call gate A); B claims the freed
+    // mic and parks on /enroll/start #2 (gate B); A resumes stale at GEN CHECK #2. The more
+    // consequential path — A has already opened a server session, so a clobber here races a
+    // flow that owns RAM bytes.
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a'; cfg.serverState = 'ok';
+    cfg.holdEnrollStartPerCall = true; cfg.instantWindow = true; break;
   // THE INERT BOX — the DEFAULT ship posture: enroll_token unset ⇒ EVERY enroll-face path
   // 404s, /scribe/presets included (it is on the enroll face).
   case 'inert_record_view':
@@ -169,11 +177,14 @@ const ENROLL_TOKEN = 'ENROLL_TOK';
 function makeGate() { let release; const p = new Promise((r) => { release = r; }); return { p, release }; }
 const gumGate = makeGate();          // first getUserMedia
 const enrollStartGate = makeGate();  // /scribe/enroll/start
+const enrollStartGateA = makeGate(); // per-call: /enroll/start call #1 (capture A)
+const enrollStartGateB = makeGate(); // per-call: /enroll/start call #2 (capture B)
 const enrollFinalizeGate = makeGate(); // /scribe/enroll/finalize
 const enrollResultGate = makeGate(); // first /scribe/enroll/result
-let gumHeld = false, resultHeld = false;
+let gumHeld = false, resultHeld = false, enrollStartCount = 0;
 globalThis.__releaseGum = gumGate.release;
 globalThis.__releaseEnrollStart = enrollStartGate.release;
+globalThis.__releaseEnrollStartA = enrollStartGateA.release;
 globalThis.__releaseEnrollFinalize = enrollFinalizeGate.release;
 globalThis.__releaseEnrollResult = enrollResultGate.release;
 
@@ -302,6 +313,13 @@ async function fetchShim(url, opts) {
   if (url.startsWith('/scribe/encounter/preset')) { return json({}, cfg.bindStatus); }
   if (url.startsWith('/scribe/enroll/start')) {
     if (cfg.holdEnrollStart) { await enrollStartGate.p; }   // hold so a teardown lands mid-await
+    if (cfg.holdEnrollStartPerCall) {
+      enrollStartCount += 1;
+      const n = enrollStartCount;
+      if (n === 1) { await enrollStartGateA.p; }             // capture A (released by the test)
+      else if (n === 2) { await enrollStartGateB.p; }        // capture B (left held — it owns the mic)
+      return json({ session: 'enr-' + n + '-abc' }, cfg.startStatus);   // DISTINCT ids so abandon is unambiguous
+    }
     return json({ session: 'enr-1-abc' }, cfg.startStatus);
   }
   if (url.startsWith('/scribe/enroll/finalize')) {
@@ -562,6 +580,24 @@ try {
     await settle(25);
     out.status = el('status').textContent;
     out.micOpens = micOpens.n;           // 2 (A + B); a 3rd = the encounter opened a mic = breach
+  } else if (scenario === 'ownership_stale_bail_2_keeps_newer_claim') {
+    // GEN CHECK #2 twin — A parks on /enroll/start (per-call gate A) instead of getUserMedia.
+    await openEnrollWithToken();
+    el('en-go').click();                 // capture A: mic + getUserMedia resolve, parks on /enroll/start #1 (HELD-A)
+    await settle(15);
+    await setHash('#/record');           // teardown: bumps gen, belt frees micOwner
+    await settle(10);
+    await setHash('#/presets');          // back to stage capture B
+    el('new-preset').click();            // enroll token cached → stages en-go immediately
+    await settle(12);
+    el('en-go').click();                 // capture B: claims the FREED mic, parks on /enroll/start #2 (HELD-B)
+    await settle(15);
+    globalThis.__releaseEnrollStartA();  // capture A resumes GEN CHECK #2 (stale) — session already opened
+    await settle(20);
+    el('start').click();                 // encounter MUST be refused — B still owns the mic
+    await settle(25);
+    out.status = el('status').textContent;
+    out.micOpens = micOpens.n;           // 2 (A + B); a 3rd = breach
   } else if (scenario === 'teardown_during_finalize_call') {
     await openEnrollWithToken();
     el('en-go').click();

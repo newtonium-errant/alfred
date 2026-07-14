@@ -816,6 +816,26 @@ def test_behaviour_stale_bail_never_clobbers_a_newer_enrolments_mic_claim(tmp_pa
     assert res["micOpens"] == 2                           # A + B only; a 3rd = the encounter's = breach
 
 
+def test_behaviour_stale_bail_at_gen_check_2_never_clobbers_a_newer_claim(tmp_path):
+    # THE SAME INVARIANT ONE AWAIT LATER — closing the CLASS, not just the GEN CHECK #1 instance.
+    # GEN CHECK #2's stale bail carries the identical ownership discipline, and it is the more
+    # consequential path: A has already opened a server session, so a clobber there races a flow
+    # that owns RAM bytes. A parks on /enroll/start (not getUserMedia), teardown frees micOwner,
+    # B claims it and parks on ITS /enroll/start, A resumes stale at GEN CHECK #2. A must abandon
+    # its own session and stop its stream but NEVER write micOwner (B owns it).
+    res = _drive("ownership_stale_bail_2_keeps_newer_claim", tmp_path)
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert paths.count("/scribe/enroll/start") == 2      # BOTH captures opened a session
+    assert "/scribe/enroll/abandon" in paths             # A's GEN CHECK #2 dropped its OWN bytes
+    assert "/scribe/ingest-chunk" not in paths           # the encounter was REFUSED (B owns the mic)
+    assert "voiceprint recording first" in res["status"]
+    assert res["micOpens"] == 2                           # A + B only; a 3rd = breach
+    # A abandoned ITS session (enr-1), never B's (enr-2, still live).
+    abandons = [c["url"] for c in res["calls"] if "/scribe/enroll/abandon" in c["url"]]
+    assert any("enr-1-abc" in u for u in abandons), abandons
+    assert not any("enr-2-abc" in u for u in abandons), abandons
+
+
 # ── WARN-1: hash routing (the shim's no-op addEventListener hid this entirely) ─
 
 def test_behaviour_hash_routing_toggles_the_two_views(tmp_path):
