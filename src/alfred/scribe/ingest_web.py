@@ -293,6 +293,16 @@ def _build_security_middleware(config: ScribeConfig):
             ok, reason = _authorize_route(path, provided, ingest_tok=token, enroll_tok=enroll_tok)
             if not ok:
                 log.warning("scribe.ingest_web.rejected", route=path, reason=reason)
+                if reason == "wrong_token_class":
+                    # A PRIVILEGE-BOUNDARY PROBE — the exact event the two-token split
+                    # exists to catch, and a frozen audit.log event. It must land in the
+                    # DURABLE biometric-custody trail, not only the rotating daemon
+                    # structlog (after rotation a custody audit would show zero evidence).
+                    # ids/enums only; fail-silent; no-ops when the store is dormant.
+                    from alfred.scribe import enroll_learning
+                    enroll_learning.audit(
+                        config.diarize.enrollment_dir, "wrong_token_class", route=path,
+                    )
                 return _reject("unauthorized", 401)
         resp = await handler(request)
         # (R3.2) NEVER emit CORS. Defensively strip any a handler/library added.
@@ -602,9 +612,10 @@ def create_ingest_app(config: ScribeConfig) -> web.Application:
     # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
     app.router.add_get(PAGE_ROUTE, _handle_page)
     app.router.add_get(APP_JS_ROUTE, _handle_app_js)
-    # P4-5a enrollment face (biometric-custody capability). Registered ALWAYS; the
-    # middleware 404s the enroll-face paths when enroll_token is unset (INERT). Lazy
-    # import avoids an enroll_web↔ingest_web cycle.
+    # P4-5a enrollment face (biometric-custody capability). Registered ONLY when
+    # enroll_token is set — DEFENCE IN DEPTH with the middleware's inert gate, which 404s
+    # the enroll-face paths independently (either alone suffices; keep BOTH). Lazy import
+    # avoids an enroll_web↔ingest_web cycle.
     if config.ingest_web.enroll_token:
         from alfred.scribe import enroll_web
         enroll_web.register_enroll_routes(app)
