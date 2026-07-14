@@ -103,12 +103,14 @@ from __future__ import annotations
 import importlib.util
 import math
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from alfred.scribe.config import ScribeConfig
+from alfred.scribe.enrollment import ResolvedEnrollment, cosine
 from alfred.scribe.transcript import (
     ROLE_CLINICIAN,
     ROLE_OTHER,
@@ -206,6 +208,7 @@ def ensure_diarize_backend_available(config: ScribeConfig) -> None:
 
 def assign_speakers(
     config: ScribeConfig, audio_path: str | Path, chunk_tx: Transcript,
+    *, resolved: ResolvedEnrollment | None = None,
 ) -> Transcript:
     """Resolve per-segment speaker roles on ``chunk_tx`` — the pipeline entry.
 
@@ -214,7 +217,12 @@ def assign_speakers(
     sidecar; ``pyannote`` is P4-4. On success the transcript's ``diarized`` gate
     is latched. The pipeline wraps this call so any exception degrades to
     ``speaker=None`` and STILL folds (fail-open-for-availability).
-    """
+
+    P4-5 — ``resolved`` (the encounter's bound + resolved preset, or ``None`` when no
+    preset is bound / a typed refusal fell open) is the ANCHOR for the pyannote path's
+    K=2 clinician matcher. ``None`` ⇒ the all-``unknown`` P4-4 end-state (fail-open).
+    The ``off`` / ``fake`` seams ignore it — ``fake`` assigns roles from its sidecar
+    tags (the CI role seam), ``off`` does nothing."""
     provider = (config.diarize.provider or "").strip().lower()
     if provider == "off":
         return chunk_tx  # no diarization — speaker stays None, diarized stays False
@@ -236,7 +244,7 @@ def assign_speakers(
                        "INERT (chunk returned un-attributed, same as provider=off)",
             )
             return chunk_tx
-        return _pyannote_diarize(config, audio_path, chunk_tx)
+        return _pyannote_diarize(config, audio_path, chunk_tx, resolved=resolved)
     # Defense in depth: the barrier-a sibling already refuses a non-local provider
     # at load; the dispatch fails closed too rather than silently no-op.
     raise DiarizeError(
@@ -450,12 +458,99 @@ def _cluster_to_role(cluster: str | None, config: ScribeConfig) -> str:
     MUST NOT key roles on the label. It re-anchors each chunk by EMBEDDING match
     against the stable clinician enrollment, which means P4-5 will need the per-cluster
     EMBEDDING (or the audio to re-derive it) threaded into this seam — NOT built here
-    (this signature stays cluster+config until then)."""
+    (this signature stays cluster+config until then).
+
+    P4-5 STATUS: this stays the NO-ENROLLMENT fallback (``resolved is None``) — still
+    all-``unknown``. The enrollment-anchored resolution is :func:`match_cluster_roles`
+    (the K=2 clinician-anchor matcher), wired into :func:`_apply_diarization` when a
+    preset resolved for the encounter."""
     return ROLE_UNKNOWN
+
+
+# --- P4-5 K=2 clinician-anchor matcher (embedding-anchored, fail-closed) ------
+
+@dataclass
+class ClusterMatch:
+    """Result of the K=2 clinician-anchor match over ONE chunk's clusters.
+
+    ``roles`` maps each raw pyannote cluster label → its resolved role
+    (``clinician`` for the single matched cluster, ``unknown`` for every other).
+    ``best_cosine`` / ``separation`` are the match telemetry the pipeline records into
+    the ``diarize_stats`` capture sink; ``matched`` is True iff a cluster cleared BOTH
+    gates (tau + separation) and was anchored to ``clinician``."""
+
+    roles: dict[str, str]
+    best_cosine: float
+    separation: float
+    matched: bool
+
+
+def match_cluster_roles(
+    cluster_embeddings: dict[str, list[float]],
+    centroids: list[list[float]],
+    *, tau: float, delta: float,
+) -> ClusterMatch:
+    """K=2 clinician-anchor matcher (P4-5). Resolve a chunk's raw pyannote clusters to
+    roles by EMBEDDING match against the ACTIVE preset's centroids — NEVER by the
+    per-chunk-arbitrary cluster LABEL (C3: chunk 3's ``SPEAKER_00`` ≠ chunk 1's).
+
+    Each cluster's score = MAX cosine over the preset's OWN centroid list (the clinician
+    hypothesis — anchored to that centroid ONLY, never across profiles/users). The
+    single highest-scoring cluster is resolved ``clinician`` IFF:
+      * ``best >= tau`` (a strong, unambiguous match — fail-closed-HIGH), AND
+      * ``best − second >= delta`` (SEPARATION from the next-best cluster — two clusters
+        that BOTH look like the clinician are an ambiguous near-tie → fail-closed).
+    EVERY other cluster → ``unknown``. We hold ONLY the clinician centroid, so a
+    non-clinician cluster has NOTHING to positively match against and can never be
+    asserted ``patient`` (un-attributed ≫ mis-attributed; the P4-2 layer + banner
+    render the unknowns; patient attribution is a 5b-and-beyond question, never a
+    this-isn't-the-clinician-so-it-must-be-the-patient INFERENCE).
+
+    Deterministic: clusters are scored in sorted-label order so an exact-tie argmax
+    resolves to the lexicographically smallest label (never dict-insertion-dependent).
+    ``cosine`` fails-safe to 0.0 on a dim mismatch / non-finite, so a malformed
+    embedding degrades to ``unknown`` rather than a spurious match."""
+    if not cluster_embeddings or not centroids:
+        # No clusters, or no enrolled centroid → nothing to anchor → all unknown.
+        return ClusterMatch(
+            roles={c: ROLE_UNKNOWN for c in cluster_embeddings},
+            best_cosine=0.0, separation=0.0, matched=False,
+        )
+    scores: dict[str, float] = {}
+    for label in sorted(cluster_embeddings):          # sorted → deterministic tie-break
+        emb = cluster_embeddings[label]
+        scores[label] = max((cosine(emb, c) for c in centroids), default=-1.0)
+    winner = max(scores, key=scores.__getitem__)      # first max in sorted order
+    best = scores[winner]
+    others = [s for lbl, s in scores.items() if lbl != winner]
+    second = max(others) if others else -1.0          # no competitor → unambiguous
+    separation = best - second
+    matched = best >= tau and separation >= delta
+    roles = {lbl: ROLE_UNKNOWN for lbl in scores}
+    if matched:
+        roles[winner] = ROLE_CLINICIAN
+    return ClusterMatch(roles=roles, best_cosine=best, separation=separation, matched=matched)
+
+
+def _cluster_embeddings_for(
+    config: ScribeConfig, audio_path: str | Path, turns: list[Turn],
+) -> dict[str, list[float]]:
+    """Per-cluster speaker EMBEDDING for the K=2 match — the ON-BOX PLACEHOLDER seam.
+
+    Extracting a wespeaker embedding per pyannote cluster from the chunk audio (slice
+    the cluster's turns → embed the pooled speech) is a P4-4 dependency: it needs the
+    real torch embedder + cluster→audio slicing, which land on-box, not in torch-free
+    CI. Until then this returns ``{}`` → :func:`match_cluster_roles` resolves ALL
+    clusters ``unknown`` — IDENTICAL to the P4-4 all-unknown end-state, so wiring the
+    matcher in changes NO on-box behavior yet, but the matcher + the ``resolved``
+    threading + the capture seam are all in place for the extraction to slot into.
+    The matcher itself is CI-covered against the ``embed_voice`` FAKE seam directly."""
+    return {}
 
 
 def _apply_diarization(
     config: ScribeConfig, chunk_tx: Transcript, turns: list[Turn],
+    *, resolved: ResolvedEnrollment | None = None, audio_path: str | Path | None = None,
 ) -> Transcript:
     """Align ``turns`` onto ``chunk_tx``'s segments and commit speaker/cluster/conf.
 
@@ -466,7 +561,16 @@ def _apply_diarization(
     first mutation — so a raise leaves the chunk UNTOUCHED (speaker=None,
     diarized=False) and the pipeline folds it un-attributed. NOTE-3: touches ONLY
     ``speaker`` / ``speaker_cluster`` / ``speaker_conf`` — never text / id / bounds.
-    Pure + torch-free (the pyannote-specific work is upstream), so CI covers it fully."""
+    Pure + torch-free (the pyannote-specific work is upstream), so CI covers it fully.
+
+    P4-5 ROLE RESOLUTION: with ``resolved`` (a preset bound + resolved for the
+    encounter), the K=2 clinician-anchor matcher (:func:`match_cluster_roles`) resolves
+    the chunk's clusters to roles by EMBEDDING — the matched cluster → ``clinician``,
+    every other → ``unknown``. Without ``resolved`` (no enrollment / a typed refusal
+    upstream), EVERY cluster → ``unknown`` via :func:`_cluster_to_role` (the P4-4
+    end-state). The per-cluster embedding extraction is the on-box placeholder
+    (:func:`_cluster_embeddings_for`), so on-box this is still all-``unknown`` until the
+    real extraction lands — the matcher is exercised in CI against the FAKE embed seam."""
     # B1 — drop invalid turns (non-finite / end<=start) ONCE, loudly, before the
     # per-segment loop (a NaN-bounds turn would otherwise skew every segment).
     valid_turns, n_invalid = _partition_valid_turns(turns)
@@ -479,13 +583,29 @@ def _apply_diarization(
             detail="pyannote turns with non-finite / end<=start bounds dropped "
                    "before alignment (a bad-bounds turn can skew overlap)",
         )
+    # P4-5 — resolve the chunk's clusters to roles ONCE (the matcher needs ALL clusters
+    # to compute best-vs-second separation). With enrollment → K=2 anchor; without →
+    # the all-unknown fallback (``cluster_roles=None`` routes to ``_cluster_to_role``).
+    cluster_roles: dict[str, str] | None = None
+    match: ClusterMatch | None = None
+    if resolved is not None:
+        embeddings = _cluster_embeddings_for(config, audio_path, valid_turns)
+        match = match_cluster_roles(
+            embeddings, resolved.centroids,
+            tau=config.diarize.match_threshold, delta=config.diarize.separation_margin,
+        )
+        cluster_roles = match.roles
     # STAGE — compute all assignments first (this is where a raise would happen).
     staged: list[tuple[str | None, float, str]] = []
     for seg in chunk_tx.segments:
         cluster, purity = _dominant_cluster_over_intervals(
             [(seg.start_s, seg.end_s)], valid_turns,
         )
-        staged.append((cluster, _guard_conf(purity), _cluster_to_role(cluster, config)))
+        if cluster_roles is not None:
+            role = cluster_roles.get(cluster, ROLE_UNKNOWN)   # unmatched cluster → unknown
+        else:
+            role = _cluster_to_role(cluster, config)          # no enrollment → unknown
+        staged.append((cluster, _guard_conf(purity), role))
     # COMMIT — pure assignment, cannot raise. Only speaker/cluster/conf (NOTE-3).
     roles: list[str] = []
     for seg, (cluster, conf, role) in zip(chunk_tx.segments, staged):
@@ -501,6 +621,10 @@ def _apply_diarization(
         segments=len(chunk_tx.segments),
         turns=len(valid_turns),
         clusters=len({t[2] for t in valid_turns}),
+        enrolled=resolved is not None,                        # P4-5 — was a preset anchoring this?
+        matched=(match.matched if match is not None else False),
+        best_cosine=(round(match.best_cosine, 4) if match is not None else None),
+        separation=(round(match.separation, 4) if match is not None else None),
         clinician=roles.count(ROLE_CLINICIAN),
         patient=roles.count(ROLE_PATIENT),
         other=roles.count(ROLE_OTHER),
@@ -643,12 +767,14 @@ def _run_pyannote_pipeline(config: ScribeConfig, audio_path: str | Path) -> list
 
 def _pyannote_diarize(
     config: ScribeConfig, audio_path: str | Path, chunk_tx: Transcript,
+    *, resolved: ResolvedEnrollment | None = None,
 ) -> Transcript:
     """The real-engine path: run pyannote (heavy, on-box) → align + commit (pure).
 
     Split so the ONLY torch-touching call is ``_run_pyannote_pipeline``; the
     alignment/commit (``_apply_diarization``) is pure + fully CI-covered. Turns are
     materialized BEFORE ``_apply_diarization`` (NOTE-2 atomicity — a mid-iteration
-    engine raise happens here, before any segment is touched)."""
+    engine raise happens here, before any segment is touched). ``resolved`` (P4-5)
+    threads the encounter's bound preset into the K=2 clinician-anchor matcher."""
     turns = _run_pyannote_pipeline(config, audio_path)
-    return _apply_diarization(config, chunk_tx, turns)
+    return _apply_diarization(config, chunk_tx, turns, resolved=resolved, audio_path=audio_path)
