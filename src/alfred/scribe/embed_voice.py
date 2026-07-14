@@ -15,23 +15,31 @@ engine upgrade invalidates presets, operator ruling 2):
     unit-normalized vector. No torch. The same bytes ALWAYS embed to the same
     vector, so centroid digests, load-contract validation, classification, and
     cosine matching are all reproducible in CI.
-  * ``pyannote`` — the real on-box wespeaker embedding (P4-4 dependency); lazy,
-    placeholder here (raises until the on-box engine ships).
+  * ``pyannote`` — the REAL on-box wespeaker embedding. Decodes each enrollment window
+    (a webm/mp4/wav container) IN MEMORY via torchaudio (the diarize decode-fix path,
+    reusing :func:`diarize._to_mono`), resamples to the wespeaker rate, and runs pyannote's
+    cached speaker-embedding model (the SAME model the diarizer loads) → a 256-dim
+    unit-normalized vector. Lazy torch (never imported in CI / the fake path). A per-window
+    embed failure degrades (skip + log); an all-window failure raises → ``engine_error``.
 
 ENGINE FINGERPRINT: a preset records the engine that produced its centroid so an
 engine upgrade INVALIDATES it (embeddings-only custody). :func:`engine_fingerprint`
-stamps from the RESOLVED runtime engine state — ``fake`` → a deterministic fake
-stamp (dim + a fixed fake model id); ``pyannote`` → the resolved model id / revision
-/ engine version (a P4-4 placeholder until the offline-materialized engine can be
-introspected on-box). Stamped from the RESOLVED engine, NOT raw config, so an
-unpinned revision still invalidates (parity with the diarize ``engine`` stamp).
+stamps from the RESOLVED runtime engine state — ``fake`` → a deterministic fake stamp
+(dim + a fixed fake model id); ``pyannote`` → the model id + the staged checkpoint's
+CONTENT digest (the resolved revision — not the raw, often-unset config revision, so an
+unpinned revision still invalidates) + the installed ``pyannote.audio``/``torch`` version.
+Deterministic + stable across restarts for the same staged model; changes on a
+model/revision/engine-version change. Torch-free (a file hash + a metadata read).
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import math
 import struct
+import threading
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -39,6 +47,17 @@ import structlog
 from alfred.scribe.config import ScribeConfig
 
 log = structlog.get_logger(__name__)
+
+# The wespeaker-voxceleb model runs at 16 kHz; the enrollment containers (webm/opus,
+# mp4/AAC) are typically 48 kHz, so we resample to this before embedding. Confirmed
+# on-box (the embedder does NOT resample a raw waveform the way the diarize pipeline
+# does); flagged in the ship note as an on-box-validated constant.
+_EMBED_SAMPLE_RATE = 16000
+
+# Lazy, per-checkpoint-path singleton speaker-embedding model (mirrors diarize's
+# _load_pipeline_cached): the heavy torch load happens once per staged model.
+_EMBEDDER_CACHE: dict[str, Any] = {}
+_EMBEDDER_CACHE_LOCK = threading.Lock()
 
 # The embedding dimensionality (wespeaker-voxceleb-resnet34-LM is 256; the fake
 # seam matches it so a fake-enrolled preset validates dim-consistently). The real
@@ -119,12 +138,7 @@ def embed_windows(config: ScribeConfig, windows: list[bytes]) -> list[list[float
     if provider == "fake":
         return [_fake_embed(w) for w in windows]
     if provider == "pyannote":
-        raise NotImplementedError(
-            "pyannote voice embedding is a P4-4 dependency — the real wespeaker "
-            "embedder loads from the offline-materialized engine on-box. P4-5a ships "
-            "the fake seam; enrollment against the real engine lands with on-box "
-            "verification."
-        )
+        return _pyannote_embed_windows(config, windows)
     if provider == "off":
         raise EmbedError(
             "voice embedding requested with diarize.provider='off' — enrollment is "
@@ -136,6 +150,206 @@ def embed_windows(config: ScribeConfig, windows: list[bytes]) -> list[list[float
         f"scribe embed provider {provider or '(unset)'!r} is not a local backend "
         f"({', '.join(sorted(SCRIBE_EMBED_PROVIDERS))})."
     )
+
+
+# --- the real on-box wespeaker embedder (P4-4 dependency; lazy torch) --------------
+
+
+def _resolve_embedding_model_path(config: ScribeConfig) -> Path:
+    """The staged wespeaker checkpoint path — the SAME model the diarizer loads.
+
+    Read from the materialized, repo-id-free ``diarize.pipeline_config``'s
+    ``pipeline.params.embedding`` (an absolute LOCAL path written by
+    ``scripts.stage_diarize_models``). Torch-free (a YAML read + a path check), so the
+    engine fingerprint resolves without loading torch. Fail-loud when unset/missing — a
+    real engine with no staged model must never run (and the daemon boot gate already
+    refuses this state, so a raise here can only surface a genuine misconfig)."""
+    import yaml  # pyyaml is a base dep (torch-free)
+
+    pipeline_config = (config.diarize.pipeline_config or "").strip()
+    if not pipeline_config:
+        raise EmbedError(
+            "pyannote voice embedding requires a materialized diarize.pipeline_config "
+            "(run scripts.stage_diarize_models on-box)."
+        )
+    cfg_path = Path(pipeline_config)
+    if not cfg_path.is_file():
+        raise EmbedError(f"diarize.pipeline_config {cfg_path} does not exist.")
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as e:
+        raise EmbedError(f"pipeline config {cfg_path} unreadable: {e}") from e
+    pipeline = cfg.get("pipeline")
+    params = pipeline.get("params") if isinstance(pipeline, dict) else None
+    emb = params.get("embedding") if isinstance(params, dict) else None
+    if not isinstance(emb, str) or not Path(emb).exists():
+        raise EmbedError(
+            f"pipeline config {cfg_path}: pipeline.params.embedding = {emb!r} is not an "
+            f"existing local path — re-run scripts.stage_diarize_models."
+        )
+    return Path(emb)
+
+
+def _load_embedder_cached(model_path: Path):
+    """Lazy, thread-safe, per-path singleton speaker-embedding model.
+
+    Lazy-imports pyannote (torch heavy — NEVER imported in CI). Double-checked locking:
+    the fast path is a lock-free dict read; only the first load per path takes the lock.
+    Uses ``PretrainedSpeakerEmbedding`` (pyannote's speaker-verification embedding API)
+    on the local wespeaker checkpoint — the same model the diarize pipeline loads.
+
+    ⚠ ON-BOX-VALIDATED API SEAM: the exact load path (``PretrainedSpeakerEmbedding`` vs
+    ``Model.from_pretrained`` vs ``Inference``) is confirmed on-box; flagged in the ship
+    note. If wespeaker needs a different loader, THIS is the one function to change."""
+    key = str(model_path)
+    cached = _EMBEDDER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with _EMBEDDER_CACHE_LOCK:
+        cached = _EMBEDDER_CACHE.get(key)  # re-check under the lock
+        if cached is not None:
+            return cached
+        try:
+            from pyannote.audio.pipelines.speaker_verification import (
+                PretrainedSpeakerEmbedding,
+            )
+        except ImportError as e:  # pragma: no cover — guarded by the daemon boot gate
+            raise MissingEmbedDependency(
+                "pyannote.audio is not installed — install the [scribe-diarize] extra "
+                "into the STAY-C venv."
+            ) from e
+        embedder = PretrainedSpeakerEmbedding(str(model_path))
+        _EMBEDDER_CACHE[key] = embedder
+        return embedder
+
+
+def _pyannote_embed_windows(
+    config: ScribeConfig, windows: list[bytes]
+) -> list[list[float]]:
+    """Embed each enrollment window (a webm/mp4/wav CONTAINER blob) → a 256-dim
+    unit-normalized vector, matching the fake seam's exact output contract.
+
+    Decodes IN MEMORY (RAM custody — no temp file) via torchaudio's ffmpeg backend, the
+    same decoder as the diarize decode fix, reusing :func:`diarize._to_mono` for the
+    mono downmix; resamples to the wespeaker rate; runs the cached embedder. torch /
+    torchaudio / pyannote are lazy-imported HERE so CI + the fake path stay torch-free.
+
+    DEGRADE, DON'T CRASH: a single window too short / undecodable to embed is SKIPPED
+    (logged), not fatal — only if EVERY window fails do we raise :class:`EmbedError`,
+    which the finalize worker maps to the ``engine_error`` verdict (bytes already cleared
+    in its ``finally``; no raw audio leaks)."""
+    # (1) config gate FIRST — torch-free, so a missing staged model fails as a clean
+    # EmbedError, never an ImportError, and CI never reaches the torch import here.
+    model_path = _resolve_embedding_model_path(config)
+    # (2) heavy deps, lazy (never imported in CI / the fake path).
+    try:
+        import io
+
+        import torchaudio
+
+        from alfred.scribe.diarize import _to_mono  # the decode-fix downmix (reuse)
+    except ImportError as e:  # pragma: no cover — the daemon boot gate guards this on-box
+        raise MissingEmbedDependency(
+            "torchaudio is not installed — install the [scribe-diarize] extra into the "
+            "STAY-C venv."
+        ) from e
+    embedder = _load_embedder_cached(model_path)
+    out: list[list[float]] = []
+    for i, w in enumerate(windows):
+        try:
+            waveform, sr = torchaudio.load(io.BytesIO(w))          # container -> (C, T)
+            waveform = _to_mono(waveform)                          # -> (1, T)
+            if sr != _EMBED_SAMPLE_RATE:
+                waveform = torchaudio.functional.resample(waveform, sr, _EMBED_SAMPLE_RATE)
+            # PretrainedSpeakerEmbedding wants (batch, channel, samples).
+            emb = embedder(waveform.unsqueeze(0))                  # -> (1, dim)
+            vec = [float(x) for x in _as_row(emb)]
+        except Exception as e:  # noqa: BLE001 — a bad window degrades, never crashes the batch
+            log.warning(
+                "scribe.embed.window_skipped",
+                window_index=i,
+                error_class=type(e).__name__,      # class only — NO PHI, NO raw bytes
+                detail="window too short / undecodable to embed — skipped (degrade)",
+            )
+            continue
+        out.append(_unit_normalize(vec))
+    if not out:
+        # EVERY window failed → an engine/decode problem, not a per-window blip.
+        raise EmbedError(
+            "no enrollment window could be embedded (all too short / undecodable)."
+        )
+    return out
+
+
+def _as_row(emb: Any) -> list[float]:
+    """Coerce a ``(1, dim)`` embedder output (numpy array / torch tensor) → a flat
+    ``list[float]`` of the single row. Tolerates a ``(dim,)`` result too."""
+    row = emb[0] if getattr(emb, "ndim", 1) == 2 else emb
+    return [float(x) for x in row]
+
+
+def _checkpoint_digest(model_path: Path) -> str:
+    """A stable content digest of the staged embedding checkpoint — the RESOLVED
+    revision (not the raw, often-unset config ``embedding_revision``). Same staged file
+    → same digest across restarts; a re-download of a different checkpoint → a different
+    digest → presets correctly invalidate. Torch-free. A directory (the fallback
+    materialized path) digests a sorted (name, size) manifest of its files."""
+    p = Path(model_path)
+    h = hashlib.sha256()
+    if p.is_dir():
+        for f in sorted(p.rglob("*")):
+            if f.is_file():
+                h.update(f.name.encode("utf-8"))
+                h.update(str(f.stat().st_size).encode("utf-8"))
+        return "dir:" + h.hexdigest()
+    with p.open("rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
+    return "sha256:" + h.hexdigest()
+
+
+def _engine_version() -> str:
+    """The RESOLVED engine version — the actually-installed ``pyannote.audio`` + ``torch``
+    dist versions, read from package METADATA (``importlib.metadata`` does NOT import the
+    package, so this stays torch-free). Changes on an engine upgrade → presets invalidate.
+    In torch-free CI the packages are absent → a ``?`` marker (the pyannote fingerprint is
+    only resolved on-box, where the engine is present)."""
+    parts = []
+    for pkg in ("pyannote.audio", "torch"):
+        try:
+            parts.append(f"{pkg}=={importlib.metadata.version(pkg)}")
+        except importlib.metadata.PackageNotFoundError:
+            parts.append(f"{pkg}==?")
+    return ";".join(parts)
+
+
+def _pyannote_fingerprint(config: ScribeConfig) -> dict[str, Any]:
+    """The RESOLVED runtime embedding-engine stamp (replaces the P4-4 placeholder).
+
+    Deterministic + STABLE across restarts for the same staged model + install (so a
+    restart never spuriously invalidates presets); CHANGES on a model / revision /
+    engine-version change (so an upgrade correctly invalidates). Stamped from the staged
+    engine STATE — the checkpoint content digest + the installed engine version — NOT the
+    raw config revision (which is often unset and would never invalidate).
+
+    DEGRADES (never raises) when NO model is staged: ``provider=pyannote + enabled:false``
+    boots WITHOUT a staged model (the boot gate only requires it when the engine will run),
+    yet the pipeline still stamps provenance on such (un-diarized) encounters — so this
+    accessor must not crash a read/provenance path. The degraded stamp is STABLE and
+    (correctly) differs from a resolved one, and no preset can ever carry it (enrollment
+    fail-louds without a model), so it drives no real match. ``embed_windows`` stays
+    fail-loud — you cannot EMBED without the model, but you can stamp 'engine not resolved'."""
+    model = config.diarize.embedding_model or ""
+    version = _engine_version()
+    try:
+        model_path = _resolve_embedding_model_path(config)
+    except EmbedError:
+        return {"embedding_model": model, "embedding_revision": "", "engine_version": version}
+    return {
+        "embedding_model": model,
+        "embedding_revision": _checkpoint_digest(model_path),
+        "engine_version": version,
+    }
 
 
 def engine_fingerprint(config: ScribeConfig) -> dict[str, Any]:
@@ -150,12 +364,5 @@ def engine_fingerprint(config: ScribeConfig) -> dict[str, Any]:
     fingerprint comparisons never crash on a dormant config."""
     provider = (config.diarize.provider or "").strip().lower()
     if provider == "pyannote":
-        # Placeholder until on-box: stamp from config (resolved-engine introspection
-        # is a P4-4 dependency). ``engine_version`` is a marker the real accessor
-        # replaces with the materialized engine's version.
-        return {
-            "embedding_model": config.diarize.embedding_model or "",
-            "embedding_revision": config.diarize.embedding_revision or "",
-            "engine_version": "pyannote-unresolved",  # replaced by the on-box accessor
-        }
+        return _pyannote_fingerprint(config)
     return dict(_FAKE_ENGINE)

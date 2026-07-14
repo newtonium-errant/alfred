@@ -395,16 +395,20 @@ def _prepare_windows(config: ScribeConfig, windows: list[bytes]) -> tuple[list[b
     total = sum(len(w) for w in windows)
     if provider == "fake":
         return windows, total / _FAKE_BYTES_PER_SEC
-    # Real path (on-box): each window is a container blob; decode by sniffed type.
-    decoded: list[bytes] = []
+    # Real path (on-box): each window is a container blob. Decode ONLY as a decodability
+    # GATE (a bad blob → DecodeError → the decode_failed verdict); the decoded PCM is
+    # headerless (no rate/format) and NOT embeddable, so we pass the CONTAINER bytes to
+    # embed_windows — which re-decodes them via torchaudio (webm/mp4/wav), exactly as the
+    # diarize decode fix does. embed_inputs is therefore CONTAINER bytes for BOTH providers
+    # (fake hashes them; pyannote decodes them), which keeps the seam consistent.
     for w in windows:
         container = _sniff_container(w)
         if container is None:
             raise DecodeError("unrecognized enrollment container (not webm/mp4)")
-        decoded.append(_decode_container(w, container))   # PyAV BytesIO (on-box)
+        _decode_container(w, container)   # decodability gate (PyAV BytesIO, on-box)
     # net-speech would be VAD-measured on the decoded PCM; ON-BOX PLACEHOLDER proxy here
     # (a distinct constant from the fake-path one — this feeds the real too_short gate).
-    return decoded, total / _ONBOX_NET_SPEECH_PLACEHOLDER_BYTES_PER_SEC
+    return windows, total / _ONBOX_NET_SPEECH_PLACEHOLDER_BYTES_PER_SEC
 
 
 def _sniff_container(data: bytes) -> str | None:
