@@ -482,3 +482,39 @@ async def test_preset_bound_open_encounter_refuses_rerecord(tmp_path):
                 assert r.status == 200                 # bound, encounter still OPEN (no _CLOSED)
             st, _ = await _start(s, base, p, preset=pid)
             assert st == 409                           # re-record refused while bound-open
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MEMO-LITERAL LOCKSTEP — the RAM caps + enrollment gates are module constants;
+# pin the FROZEN MEMO's LITERAL values here (NOT ew._MAX_* — a code-derived pin
+# passes even if a constant drifted from the contract). Constant-vs-memo drift → red.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_ram_custody_caps_match_memo_literals():
+    # project_p45_enrollment_design: 2 sessions / 8 windows / 8 MiB per window /
+    # 32 MiB per session / 10 min TTL.
+    assert ew._MAX_SESSIONS == 2
+    assert ew._MAX_WINDOWS == 8
+    assert ew._MAX_WINDOW_BYTES == 8 * 1024 * 1024
+    assert ew._MAX_SESSION_BYTES == 32 * 1024 * 1024
+    assert ew._SESSION_TTL_S == 600
+
+
+def test_enrollment_gates_match_memo_literals():
+    # HARD gate = <10 s net speech → too_short; advisory-until-calibrate target 30 s,
+    # SNR ≥10 dB, self-sim ≥0.80 (calibrate flips the advisory ones hard on-box).
+    assert ew._MIN_NET_SPEECH_S == 10.0
+    assert ew._TARGET_DURATION_S == 30.0
+    assert ew._ADVISORY_SNR_DB == 10.0
+    assert ew._ADVISORY_SELF_SIM == 0.80
+
+
+def test_fake_bytes_per_sec_is_fake_path_only():
+    # Audit sharpener: _FAKE_BYTES_PER_SEC is CI test math ONLY. The real (pyannote)
+    # net-speech proxy uses a SEPARATE on-box placeholder constant, so the fake constant
+    # never leaks into the real too_short contract surface. (Source-level pin: the fake
+    # constant appears exactly once in _prepare_windows — the fake branch.)
+    import inspect
+    src = inspect.getsource(ew._prepare_windows)
+    assert src.count("_FAKE_BYTES_PER_SEC") == 1                       # fake branch only
+    assert "_ONBOX_NET_SPEECH_PLACEHOLDER_BYTES_PER_SEC" in src        # real branch uses the on-box one

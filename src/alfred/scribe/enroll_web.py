@@ -56,9 +56,14 @@ _MIN_NET_SPEECH_S = 10.0                      # HARD: <10 s net speech → too_s
 _TARGET_DURATION_S = 30.0                     # advisory
 _ADVISORY_SNR_DB = 10.0                       # advisory
 _ADVISORY_SELF_SIM = 0.80                     # advisory
-# Fake-seam speech proxy (bytes→seconds). Real net-speech is VAD-measured on-box.
+# Fake-seam speech proxy (bytes→seconds) — CI TEST MATH ONLY (fake provider path).
 _FAKE_BYTES_PER_SEC = 16000
 _FAKE_SNR_DB = 20.0                           # fake fixed (passes the advisory snr)
+# ON-BOX PLACEHOLDER (P4-4 dependency): the real (pyannote) path's net_speech_s is a
+# byte-size proxy UNTIL VAD net-speech measurement on the decoded PCM lands. It DOES
+# feed the 10 s too_short HARD gate on-box, so it is a (placeholder) contract surface —
+# NOT the same as the fake-path constant above. Replace with VAD at the on-box #54 smoke.
+_ONBOX_NET_SPEECH_PLACEHOLDER_BYTES_PER_SEC = 16000
 
 
 class DecodeError(Exception):
@@ -242,8 +247,9 @@ def _prepare_windows(config: ScribeConfig, windows: list[bytes]) -> tuple[list[b
         if container is None:
             raise DecodeError("unrecognized enrollment container (not webm/mp4)")
         decoded.append(_decode_container(w, container))   # PyAV BytesIO (on-box)
-    # net-speech would be VAD-measured on the decoded PCM; placeholder proxy here.
-    return decoded, total / _FAKE_BYTES_PER_SEC
+    # net-speech would be VAD-measured on the decoded PCM; ON-BOX PLACEHOLDER proxy here
+    # (a distinct constant from the fake-path one — this feeds the real too_short gate).
+    return decoded, total / _ONBOX_NET_SPEECH_PLACEHOLDER_BYTES_PER_SEC
 
 
 def _sniff_container(data: bytes) -> str | None:
