@@ -20,6 +20,7 @@ speaker_conf survive ledger reload → fold → P4-2 speaker pass composes).
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import sys
 from pathlib import Path
@@ -49,7 +50,7 @@ from alfred.scribe.speaker_attribution import (
     SPEAKER_UNVERIFIED_REASON,
     check_speaker_attribution,
 )
-from alfred.scribe.transcript import ROLE_UNKNOWN, Segment, Transcript
+from alfred.scribe.transcript import ROLE_CLINICIAN, ROLE_UNKNOWN, Segment, Transcript
 from alfred.scripts.stage_diarize_models import (
     _pick_local_model_path,
     materialize_pipeline_config,
@@ -845,3 +846,369 @@ def test_d4_yaml_null_pipeline_config_is_empty_string():
         "provider": "pyannote", "enabled": True, "pipeline_config": None,
     }}})
     assert cfg.diarize.pipeline_config == ""
+
+
+# ===========================================================================
+# P4-5c — real per-cluster embedding EXTRACTION (fake seam + pure logic)
+#
+# The placeholder that returned {} (blocking ALL clinician attribution) is now real.
+# These pin the TORCH-FREE half — turn-grouping, merge, the net-speech floor, the
+# engine-compat dim belt, the decode-degrade path, the extractor marker, and the
+# min_turn_s COUPLING — against the fake embed seam + mocked decode/torch. The real
+# wespeaker forward pass is the on-box IT at the bottom.
+# ===========================================================================
+
+import structlog as _structlog
+
+from alfred.scribe import embed_voice
+from alfred.scribe.enrollment import ResolvedEnrollment
+
+_EMBED_DIM = embed_voice.EMBED_DIM
+
+
+def _resolved(centroids, *, dim=None):
+    return ResolvedEnrollment(
+        user="np_jamie", preset_id="pst-0000000000000-0000000000000000",
+        centroid_version=1, centroids=centroids,
+        embedding_dim=dim if dim is not None else _EMBED_DIM,
+    )
+
+
+# --- _pool_turns_by_cluster: grouping + merge + net-speech floor (pure) ------
+
+def test_pool_groups_by_cluster_and_merges_overlaps():
+    # Two S00 turns (one overlapping the other) + one S01 turn. S00's overlap is MERGED
+    # (counted once), so its net is 4.0 (0-4), not 6.0; S01 is 3.0.
+    turns = [(0.0, 3.0, "S00"), (2.0, 4.0, "S00"), (5.0, 8.0, "S01")]
+    pooled = diarize_mod._pool_turns_by_cluster(turns, min_speech_s=1.0)
+    assert pooled["S00"] == [(0.0, 4.0)]              # merged, not two spans
+    assert pooled["S01"] == [(5.0, 8.0)]
+
+
+def test_pool_floor_omits_below_keeps_at_and_above():
+    # net < floor → OMITTED; net == floor → kept; net > floor → kept.
+    turns = [(0.0, 0.8, "LOW"), (0.0, 1.0, "AT"), (0.0, 1.5, "HI")]
+    pooled = diarize_mod._pool_turns_by_cluster(turns, min_speech_s=1.0)
+    assert "LOW" not in pooled                        # 0.8 < 1.0 → dropped (noise floor)
+    assert "AT" in pooled and "HI" in pooled          # >= floor kept
+
+
+def test_pool_sums_multiple_subfloor_turns_over_the_floor():
+    # THE net-per-cluster refinement: 3 individually-sub-floor turns (0.5s each, NON-adjacent
+    # so not merged into one) SUM to 1.5s net → the cluster clears the 1.0 floor and is kept.
+    turns = [(0.0, 0.5, "C"), (2.0, 2.5, "C"), (4.0, 4.5, "C")]
+    pooled = diarize_mod._pool_turns_by_cluster(turns, min_speech_s=1.0)
+    assert "C" in pooled and len(pooled["C"]) == 3    # three separate sub-floor spans, kept
+
+
+# --- fake-seam extraction: dim, determinism, floor omission ------------------
+
+def test_fake_extraction_returns_unit_256_per_kept_cluster():
+    cfg = _config(provider="fake")
+    turns = [(0.0, 5.0, "S00"), (5.0, 10.0, "S01")]
+    emb = diarize_mod._cluster_embeddings_for(
+        cfg, None, turns, expected_dim=_EMBED_DIM, source_id="enc")
+    assert set(emb) == {"S00", "S01"}
+    for v in emb.values():
+        assert len(v) == _EMBED_DIM
+        assert abs(math.sqrt(sum(x * x for x in v)) - 1.0) < 1e-9
+
+
+def test_fake_extraction_is_deterministic():
+    cfg = _config(provider="fake")
+    turns = [(0.0, 5.0, "S00")]
+    a = diarize_mod._cluster_embeddings_for(cfg, None, turns, expected_dim=_EMBED_DIM)
+    b = diarize_mod._cluster_embeddings_for(cfg, None, turns, expected_dim=_EMBED_DIM)
+    assert a == b
+
+
+def test_fake_extraction_below_floor_cluster_omitted():
+    cfg = _config(provider="fake")
+    # S00 clears the 1.0 floor, S01 (0.5s) does not → only S00 embedded.
+    turns = [(0.0, 5.0, "S00"), (5.0, 5.5, "S01")]
+    emb = diarize_mod._cluster_embeddings_for(cfg, None, turns, expected_dim=_EMBED_DIM)
+    assert set(emb) == {"S00"}
+
+
+# --- intentionally-left-blank taxonomy: the explicit-log branches ------------
+
+def test_extraction_no_turns_logs_and_empty():
+    cfg = _config(provider="fake")
+    with _structlog.testing.capture_logs() as caps:
+        emb = diarize_mod._cluster_embeddings_for(cfg, None, [], expected_dim=_EMBED_DIM,
+                                                  source_id="enc")
+    assert emb == {}
+    ev = [c for c in caps if c.get("event") == "scribe.diarize.extraction_empty"]
+    assert len(ev) == 1 and ev[0]["reason"] == "no_turns"
+
+
+def test_extraction_all_below_floor_logs_no_cluster_above_floor():
+    cfg = _config(provider="fake")
+    turns = [(0.0, 0.4, "A"), (1.0, 1.3, "B")]         # both sub-floor
+    with _structlog.testing.capture_logs() as caps:
+        emb = diarize_mod._cluster_embeddings_for(cfg, None, turns, expected_dim=_EMBED_DIM,
+                                                  source_id="enc")
+    assert emb == {}
+    ev = [c for c in caps if c.get("event") == "scribe.diarize.extraction_empty"]
+    assert len(ev) == 1 and ev[0]["reason"] == "no_cluster_above_floor"
+    assert ev[0]["min_turn_s"] == 1.0                  # pins the field flows into the log
+
+
+def test_extraction_engine_dim_mismatch_omits_and_logs():
+    # The engine-compat BELT: the fake seam always emits 256-dim, so an expected_dim of 128
+    # (a preset from an incompatible engine) mismatches → cluster OMITTED (never handed to
+    # the matcher as a wrong-dim vector cosine would silently score 0.0) + explicit logs.
+    cfg = _config(provider="fake")
+    turns = [(0.0, 5.0, "S00")]
+    with _structlog.testing.capture_logs() as caps:
+        emb = diarize_mod._cluster_embeddings_for(cfg, None, turns, expected_dim=128,
+                                                  source_id="enc")
+    assert emb == {}                                   # nothing survives the dim guard
+    mism = [c for c in caps if c.get("event") == "scribe.diarize.extraction_engine_mismatch"]
+    assert len(mism) == 1 and mism[0]["expected_dim"] == 128 and mism[0]["clusters_omitted"] == 1
+    empty = [c for c in caps if c.get("event") == "scribe.diarize.extraction_empty"]
+    assert len(empty) == 1 and empty[0]["reason"] == "engine_mismatch"
+
+
+# --- pyannote seam: decode-degrade, no-audio-path, slicing math (mocked torch) ---
+
+def test_pyannote_extraction_decode_failure_degrades_not_raises(monkeypatch):
+    # A decode failure inside extraction DEGRADES to {} + an explicit log (chunk still folds
+    # diarized, all-unknown), never propagates — the fold is not crashed.
+    def _boom(path):
+        raise diarize_mod.AudioDecodeError("ffmpeg could not demux")
+    monkeypatch.setattr(diarize_mod, "_decode_audio", _boom)
+    # torch is imported lazily in the pyannote seam; provide a stub so CI never needs it.
+    monkeypatch.setitem(sys.modules, "torch", __import__("types").ModuleType("torch"))
+    cfg = _config(provider="pyannote", enabled=True, pipeline_config="/x.yaml")
+    turns = [(0.0, 5.0, "S00")]
+    with _structlog.testing.capture_logs() as caps:
+        emb = diarize_mod._cluster_embeddings_for(cfg, "/enc/chunk.webm", turns,
+                                                  expected_dim=_EMBED_DIM, source_id="enc")
+    assert emb == {}
+    ev = [c for c in caps if c.get("event") == "scribe.diarize.extraction_empty"]
+    assert len(ev) == 1 and ev[0]["reason"] == "decode_failed"
+
+
+def test_pyannote_extraction_no_audio_path_degrades(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", __import__("types").ModuleType("torch"))
+    cfg = _config(provider="pyannote", enabled=True, pipeline_config="/x.yaml")
+    with _structlog.testing.capture_logs() as caps:
+        emb = diarize_mod._cluster_embeddings_for(cfg, None, [(0.0, 5.0, "S00")],
+                                                  expected_dim=_EMBED_DIM, source_id="enc")
+    assert emb == {}
+    ev = [c for c in caps if c.get("event") == "scribe.diarize.extraction_empty"]
+    assert len(ev) == 1 and ev[0]["reason"] == "no_audio_path"
+
+
+class _SliceRec:
+    """Torch-free mono-waveform stand-in that RECORDS the (start, stop) sample ranges sliced
+    out of it — lets a test pin the slicing math (round(t*sr), clamp) without torch."""
+
+    def __init__(self, total):
+        self._total = total
+        self.slices: list[tuple[int, int]] = []
+
+    @property
+    def shape(self):
+        return (1, self._total)
+
+    def __getitem__(self, key):
+        _, tsl = key                       # key == (slice(None), slice(a, b))
+        self.slices.append((tsl.start, tsl.stop))
+        return ("SLICE", tsl.start, tsl.stop)
+
+
+def test_pyannote_extraction_slicing_math_and_pooling(monkeypatch):
+    # Pin the slicing math: merged intervals → sample indices round(t*sr), CLAMPED to the
+    # decoded length, one embed call per cluster, torch.cat for a multi-span pool. All mocked.
+    sr = 16000
+    wave = _SliceRec(total=sr * 10)                    # a 10s mono clip
+    monkeypatch.setattr(diarize_mod, "_decode_audio", lambda p: (wave, sr))
+    fake_torch = __import__("types").ModuleType("torch")
+    fake_torch.cat = lambda parts, dim: ("CAT", tuple(parts), dim)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    seen = []
+    monkeypatch.setattr(embed_voice, "embed_waveform",
+                        lambda cfg, w, s: seen.append((w, s)) or _unit_vec(_EMBED_DIM))
+    cfg = _config(provider="pyannote", enabled=True, pipeline_config="/x.yaml")
+    # S00 = two NON-adjacent merged spans (→ 2 slices → cat); S99 = one span clamped past end.
+    turns = [(1.0, 2.0, "S00"), (5.0, 6.0, "S00"), (9.0, 12.0, "S99")]
+    emb = diarize_mod._cluster_embeddings_for(cfg, "/enc/c.webm", turns,
+                                              expected_dim=_EMBED_DIM, source_id="enc")
+    assert set(emb) == {"S00", "S99"}
+    # slicing indices: round(t*sr), the 12.0s bound CLAMPED to total=160000.
+    assert wave.slices == [(16000, 32000), (80000, 96000), (144000, 160000)]
+    # S00 pooled via torch.cat (2 slices); the embedder was called once per cluster.
+    assert len(seen) == 2 and seen[0][1] == sr
+    assert seen[0][0][0] == "CAT"                      # S00's pooled wave is the cat marker
+
+
+# --- _apply_diarization end-to-end: match + extractor marker (fake seam) ------
+
+def _fake_centroid_for(cfg, cluster, intervals):
+    payload = diarize_mod._fake_cluster_payload(cluster, intervals)
+    return embed_voice.embed_windows(cfg, [payload])[0]
+
+
+def test_apply_diarization_real_extraction_resolves_clinician(monkeypatch):
+    # END-TO-END through _apply_diarization with a fake-provider resolved: the enrolled
+    # centroid IS the fake extraction vector for S00's pooled speech → S00 self-matches
+    # (cosine 1.0) → clinician; S01 (a different voice) → unknown. Pins that the extraction
+    # output actually drives the K=2 match, and match_sink carries the telemetry + marker.
+    cfg = _config(provider="fake")
+    turns = [(0.0, 5.0, "SPEAKER_00"), (5.0, 10.0, "SPEAKER_01")]
+    centroid = _fake_centroid_for(cfg, "SPEAKER_00", [(0.0, 5.0)])
+    tx = _tx(_seg(1, start=0.0, end=5.0), _seg(2, start=5.0, end=10.0), diarized=False)
+    sink: dict = {}
+    diarize_mod._apply_diarization(cfg, tx, turns, resolved=_resolved([centroid]),
+                                   audio_path=None, match_sink=sink)
+    assert tx.segments[0].speaker == ROLE_CLINICIAN     # S00 self-match
+    assert tx.segments[1].speaker == ROLE_UNKNOWN       # S01 other voice
+    assert sink["matched"] is True and sink["best_cosine"] > 0.75
+    assert sink["extractor"] == diarize_mod.EXTRACTOR_VERSION
+
+
+def test_apply_diarization_stamps_extractor_even_when_extraction_empty():
+    # The marker means 'extractor WIRED', not 'match succeeded': an all-below-floor chunk
+    # (extraction {} → all-unknown) STILL stamps extractor. This is the exact placeholder-era
+    # discriminator case — a real fingerprint, best_cosine 0.0, but distinguishable by marker.
+    cfg = _config(provider="fake")
+    turns = [(0.0, 0.4, "S00"), (1.0, 1.4, "S01")]      # all sub-floor → extraction empty
+    tx = _tx(_seg(1, start=0.0, end=0.4), diarized=False)
+    sink: dict = {}
+    diarize_mod._apply_diarization(cfg, tx, turns, resolved=_resolved([_unit_vec(_EMBED_DIM)]),
+                                   audio_path=None, match_sink=sink)
+    assert sink["matched"] is False and sink["best_cosine"] == 0.0
+    assert sink["extractor"] == diarize_mod.EXTRACTOR_VERSION   # wired, even with no match
+    assert all(s.speaker == ROLE_UNKNOWN for s in tx.segments)
+
+
+def test_apply_diarization_no_resolved_does_not_stamp_extractor_or_extract(monkeypatch):
+    # Without enrollment (resolved is None) the extraction NEVER runs and no marker is stamped
+    # — the 'no enrollment' branch stays byte-identical to the P4-4 all-unknown end-state.
+    called = {"n": 0}
+    monkeypatch.setattr(diarize_mod, "_cluster_embeddings_for",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {})
+    tx = _tx(_seg(1, start=0.0, end=5.0), diarized=False)
+    sink: dict = {}
+    diarize_mod._apply_diarization(_config(), tx, [(0.0, 5.0, "S00")],
+                                   resolved=None, match_sink=sink)
+    assert called["n"] == 0 and "extractor" not in sink   # extraction not invoked
+    assert tx.segments[0].speaker == ROLE_UNKNOWN
+
+
+def test_apply_diarization_extraction_raise_leaves_chunk_foldable_unattributed(monkeypatch):
+    # NOTE-2 at the P4-5c EXTRACTION site: extraction runs INSIDE the `resolved is not None`
+    # branch, BEFORE stage/commit — an UNEXPECTED (torch-OOM-class) raise from embed_waveform
+    # must PROPAGATE (fail-open), leaving the chunk UNTOUCHED (speaker None, diarized False) so
+    # the pipeline folds it un-attributed, AND must NOT stamp the sink's extractor marker (a
+    # CRASHED extraction never produced a health-eligible row — if it stamped, a poisoned
+    # all-unknown row would count toward 5b health, the exact failure the marker prevents).
+    # Distinct from the staging-raise + engine-raise pins above: those pass resolved=None and
+    # so NEVER enter the extraction branch this pins.
+    sr = 16000
+    wave = _SliceRec(total=sr * 10)
+    monkeypatch.setattr(diarize_mod, "_decode_audio", lambda p: (wave, sr))
+    monkeypatch.setitem(sys.modules, "torch", __import__("types").ModuleType("torch"))
+
+    def _oom(cfg, w, s):
+        raise RuntimeError("torch OOM mid-extraction")
+
+    monkeypatch.setattr(embed_voice, "embed_waveform", _oom)
+    cfg = _config(provider="pyannote", enabled=True, pipeline_config="/x.yaml")
+    tx = _tx(_seg(1, start=0.0, end=5.0), _seg(2, start=5.0, end=10.0), diarized=False)
+    sink: dict = {}
+    with pytest.raises(RuntimeError):
+        diarize_mod._apply_diarization(
+            cfg, tx, [(0.0, 5.0, "SPEAKER_00")],
+            resolved=_resolved([_unit_vec(_EMBED_DIM)]),
+            audio_path="/enc/c.webm", match_sink=sink,
+        )
+    assert all(
+        s.speaker is None and s.speaker_cluster is None and s.speaker_conf is None
+        for s in tx.segments
+    )
+    assert tx.diarized is False
+    assert "extractor" not in sink   # a crashed extraction never stamps a health-eligible row
+
+
+# --- the min_turn_s COUPLING pin (one knob, two consumers) -------------------
+
+def test_min_turn_s_couples_extraction_floor_and_eligible_denominator():
+    # ONE calibrate knob (config.diarize.min_turn_s) governs BOTH the per-cluster extraction
+    # floor (diarize._pool_turns_by_cluster) AND the per-segment 5b eligible denominator
+    # (pipeline._eligible_turns). Pin that both read the SAME field and MOVE TOGETHER, so a
+    # future split of the field is a conscious act, not silent drift.
+    from alfred.scribe.pipeline import _eligible_turns
+
+    turns = [(0.0, 1.5, "C")]                          # a single 1.5s cluster
+    seg = [_seg(1, start=0.0, end=1.5)]                # a single 1.5s segment
+    # default 1.0 → the 1.5s cluster is embeddable AND the 1.5s segment is eligible.
+    cfg1 = _config()
+    assert cfg1.diarize.min_turn_s == 1.0
+    assert "C" in diarize_mod._pool_turns_by_cluster(turns, min_speech_s=cfg1.diarize.min_turn_s)
+    assert _eligible_turns(seg, cfg1.diarize.min_turn_s) == 1
+    # raise the ONE field to 2.0 → the SAME 1.5s cluster falls below the extraction floor AND
+    # the SAME 1.5s segment falls out of the eligible denominator. Both move, from one knob.
+    cfg2 = _config()
+    cfg2.diarize.min_turn_s = 2.0
+    assert diarize_mod._pool_turns_by_cluster(turns, min_speech_s=cfg2.diarize.min_turn_s) == {}
+    assert _eligible_turns(seg, cfg2.diarize.min_turn_s) == 0
+
+
+# --- P4-5c real extraction → real centroid match — on-box IT (skip-gated) -----
+
+@pytest.mark.skipif(
+    not os.environ.get("ALFRED_SCRIBE_DIARIZE_IT"),
+    reason="real wespeaker extraction → match — set ALFRED_SCRIBE_DIARIZE_IT=1 on-box with "
+           "the [scribe-diarize] extra, $ALFRED_SCRIBE_DIARIZE_PIPELINE_CONFIG (materialized) "
+           "+ the committed tests/fixtures/diarize/short_speech.{webm,m4a,wav}",
+)
+@pytest.mark.parametrize("container", ["webm", "m4a", "wav"])
+def test_real_extraction_matches_enrolled_centroid_on_box(container):
+    # THE on-box proof: enroll a centroid from a real clip (the enrollment window path), then
+    # run the REAL per-cluster extraction over the SAME clip as chunk audio (one cluster
+    # spanning it) and match — SAME speaker → best_cosine > tau, matched=True. This is the
+    # pre-deploy proxy for the live acceptance (re-running Jamie's encounter on the box).
+    fixture = _DIARIZE_FIXTURES / f"short_speech.{container}"
+    if not fixture.is_file():
+        pytest.skip(f"missing extraction fixture {fixture}")
+    pipeline_config = os.environ["ALFRED_SCRIBE_DIARIZE_PIPELINE_CONFIG"]
+    cfg = _config(provider="pyannote", enabled=True, pipeline_config=pipeline_config)
+    # (1) enroll a real centroid from the clip (the same embedder the extraction reuses).
+    import soundfile as _sf  # noqa: F401 — proves the audio libs are on-box; skip if absent
+    from alfred.scribe import enrollment as _en
+    window = fixture.read_bytes()
+    centroid = _en.spherical_mean_centroid(embed_voice.embed_windows(cfg, [window]))
+    # (2) extract from the SAME clip as chunk audio — one cluster spanning the whole clip.
+    wave, sr = diarize_mod._decode_audio(fixture)
+    dur = wave.shape[1] / sr
+    turns = [(0.0, float(dur), "SPEAKER_00")]
+    emb = diarize_mod._cluster_embeddings_for(
+        cfg, fixture, turns, expected_dim=_EMBED_DIM, source_id="it")
+    assert set(emb) == {"SPEAKER_00"} and len(emb["SPEAKER_00"]) == _EMBED_DIM
+    # (3) match the extracted cluster against the enrolled centroid — SAME speaker.
+    m = diarize_mod.match_cluster_roles(
+        emb, [centroid],
+        tau=cfg.diarize.match_threshold, delta=cfg.diarize.separation_margin)
+    assert m.best_cosine > cfg.diarize.match_threshold      # a strong same-speaker match
+    assert m.matched is True and m.roles["SPEAKER_00"] == ROLE_CLINICIAN
+
+
+def _unit_vec(dim):
+    """A deterministic pseudo-random UNIT vector of length ``dim`` (fixture centroid)."""
+    import hashlib as _h
+    import struct as _st
+    out = []
+    seed = _h.sha256(b"p4-5c-unit-vec").digest()
+    i = 0
+    while len(out) < dim:
+        block = _h.sha256(seed + _st.pack(">I", i)).digest()
+        for j in range(0, len(block), 4):
+            if len(out) >= dim:
+                break
+            out.append(_st.unpack(">I", block[j:j + 4])[0] / 0xFFFFFFFF * 2.0 - 1.0)
+        i += 1
+    n = math.sqrt(sum(x * x for x in out))
+    return [x / n for x in out]

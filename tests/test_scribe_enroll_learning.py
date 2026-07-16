@@ -42,6 +42,39 @@ def test_no_preset_row_still_lands(tmp_path):
     assert len(rows) == 1 and rows[0]["preset_id"] is None and rows[0]["user"] is None
 
 
+def test_diarize_stats_row_carries_extractor_marker(tmp_path):
+    # P4-5c 5b DISCRIMINATOR: a real-extraction row stamps the extractor version marker so
+    # the health filter can tell it from a pre-P4-5c placeholder-era all-unknown row (both
+    # can carry best_cosine=0.0 / diarized=true / a real fingerprint — only the marker
+    # separates 'extractor wired' from 'placeholder era').
+    el.record_diarize_stats(
+        tmp_path, source_id="enc-jamie", chunk_seq=1, user="np_jamie", preset_id="pst-x",
+        centroid_version=1, engine_fingerprint={"embedding_model": "pyannote/wespeaker"},
+        n_segments=2, role_counts={"clinician": 1, "unknown": 1},
+        best_cosine=0.0, separation=0.0, min_purity=None, fail_closed_demotions=1,
+        extractor="p4-5c", diarized=True,
+    )
+    rows = _read(tmp_path / "learning" / "attest_capture.jsonl")
+    assert len(rows) == 1 and rows[0]["extractor"] == "p4-5c"
+    # even a real NO-MATCH (best_cosine 0.0) carries the marker — it means 'extractor ran',
+    # NOT 'match succeeded'.
+    assert rows[0]["best_cosine"] == 0.0 and rows[0]["diarized"] is True
+
+
+def test_diarize_stats_placeholder_era_row_has_null_extractor(tmp_path):
+    # A row written WITHOUT the marker (a pre-P4-5c placeholder-era row, or any caller not
+    # passing it) records extractor=None — the absent-marker POISON signal the 5b filter
+    # keys on. Pins the schema field is always present (JSONL forward-tolerance) + defaults null.
+    el.record_diarize_stats(
+        tmp_path, source_id="enc-old", chunk_seq=1, user="np_jamie", preset_id="pst-x",
+        centroid_version=1, engine_fingerprint={"embedding_model": "pyannote/wespeaker"},
+        n_segments=2, role_counts={"unknown": 2}, best_cosine=0.0, separation=0.0,
+        min_purity=None, fail_closed_demotions=2, diarized=True,
+    )
+    rows = _read(tmp_path / "learning" / "attest_capture.jsonl")
+    assert len(rows) == 1 and "extractor" in rows[0] and rows[0]["extractor"] is None
+
+
 def test_attest_outcome_appends(tmp_path):
     el.record_attest_outcome(tmp_path, source_id="enc-a", user="np_jamie",
                              preset_id="pst-y", centroid_version=2,
