@@ -64,6 +64,9 @@ from alfred.scribe.identity import EncounterIdentityError, compute_encounter_id
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
 from alfred.scribe.pwa_assets import (
     APP_JS,
+    APPLE_TOUCH_ICON_PNG,
+    APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE,
+    APPLE_TOUCH_ICON_ROUTE,
     CSP_VALUE,
     FAVICON_PNG,
     FAVICON_ROUTE,
@@ -115,15 +118,17 @@ STATUS_ROUTE = "/scribe/status"
 PAGE_ROUTE = "/"
 APP_JS_ROUTE = "/scribe/app.js"
 
-# Task #1 standalone-install surface — the manifest, its two icons, and the favicon
-# (kills the /favicon.ico 401 log spam, Task #3). All are browser-issued fetches that
-# carry no bearer AND are STATIC + SECRET-FREE (no token, unlike the page), so they join
-# the bearer-EXEMPT set. They stay under the SAME every-route middleware: Host-pin (the
-# rebind guard) + loopback peername + the Sec-Fetch-Site belt — nothing bypasses. A
-# manifest/icon/favicon fetch is same-origin (Sec-Fetch-Site: same-origin/none) → passes.
-_INSTALL_ASSET_PATHS: frozenset[str] = frozenset(
-    {MANIFEST_ROUTE, ICON_192_ROUTE, ICON_512_ROUTE, FAVICON_ROUTE}
-)
+# Task #1 standalone-install surface — the manifest, its two icons, the favicon (kills the
+# /favicon.ico 401 log spam, Task #3), and the two canonical apple-touch-icon paths (the iOS
+# home-screen tile + the same 401-spam class for the operator-ruled iPhone). All are
+# browser-issued fetches that carry no bearer AND are STATIC + SECRET-FREE (no token, unlike
+# the page), so they join the bearer-EXEMPT set. They stay under the SAME every-route
+# middleware: Host-pin (the rebind guard) + loopback peername + the Sec-Fetch-Site belt —
+# nothing bypasses. Each fetch is same-origin (Sec-Fetch-Site: same-origin/none) → passes.
+_INSTALL_ASSET_PATHS: frozenset[str] = frozenset({
+    MANIFEST_ROUTE, ICON_192_ROUTE, ICON_512_ROUTE, FAVICON_ROUTE,
+    APPLE_TOUCH_ICON_ROUTE, APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE,
+})
 _BEARER_EXEMPT_PATHS: frozenset[str] = frozenset(
     {PAGE_ROUTE, APP_JS_ROUTE} | _INSTALL_ASSET_PATHS
 )
@@ -669,13 +674,25 @@ async def _handle_favicon(request: web.Request) -> web.StreamResponse:
     return web.Response(body=FAVICON_PNG, content_type="image/png", headers=_asset_headers())
 
 
+async def _handle_apple_touch_icon(request: web.Request) -> web.StreamResponse:
+    """``GET /apple-touch-icon.png`` (and ``-precomposed.png``) — the 180px iOS home-screen
+    tile (STATIC, SECRET-FREE). Serving it 200 fixes BOTH the operator-iPhone tile (iOS uses
+    apple-touch-icon, not the manifest icons member) AND the same 401 warning-spam class the
+    favicon fix closed (WebKit auto-probes these paths). One handler for both canonical
+    paths — they serve identical bytes; the sized-variant probes are suppressed by the
+    ``<link rel="apple-touch-icon">`` in the head, so no per-size route is needed."""
+    return web.Response(body=APPLE_TOUCH_ICON_PNG, content_type="image/png",
+                        headers=_asset_headers())
+
+
 # --- app + server lifecycle -------------------------------------------------
 
 def create_ingest_app(config: ScribeConfig) -> web.Application:
     """Build the ingest ``web.Application`` — the 3 bearer-required API routes +
-    the 2 bearer-exempt static PWA routes (Slice B) + the 4 bearer-exempt
-    standalone-install assets (manifest/icons/favicon), the split-policy security
-    middleware, and ``client_max_size`` pinned to the per-chunk byte cap (N3).
+    the 2 bearer-exempt static PWA routes (Slice B) + the 6 bearer-exempt
+    standalone-install assets (manifest/icons/favicon/apple-touch-icon), the
+    split-policy security middleware, and ``client_max_size`` pinned to the
+    per-chunk byte cap (N3).
 
     Only instantiated when ``ingest_web.enabled`` (the daemon starts the server
     solely then), so the static surface is INERT by default — no server, no
@@ -692,12 +709,14 @@ def create_ingest_app(config: ScribeConfig) -> web.Application:
     # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
     app.router.add_get(PAGE_ROUTE, _handle_page)
     app.router.add_get(APP_JS_ROUTE, _handle_app_js)
-    # 4 standalone-install assets — bearer-exempt (Host-pinned + loopback), STATIC +
-    # SECRET-FREE (Task #1 manifest/icons + Task #3 favicon).
+    # 6 standalone-install assets — bearer-exempt (Host-pinned + loopback), STATIC +
+    # SECRET-FREE (Task #1 manifest/icons + Task #3 favicon + apple-touch-icon).
     app.router.add_get(MANIFEST_ROUTE, _handle_manifest)
     app.router.add_get(ICON_192_ROUTE, _handle_icon_192)
     app.router.add_get(ICON_512_ROUTE, _handle_icon_512)
     app.router.add_get(FAVICON_ROUTE, _handle_favicon)
+    app.router.add_get(APPLE_TOUCH_ICON_ROUTE, _handle_apple_touch_icon)
+    app.router.add_get(APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE, _handle_apple_touch_icon)
     # P4-5a enrollment face (biometric-custody capability). Registered ONLY when
     # enroll_token is set — DEFENCE IN DEPTH with the middleware's inert gate, which 404s
     # the enroll-face paths independently (either alone suffices; keep BOTH). Lazy import

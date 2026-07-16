@@ -111,6 +111,12 @@ CSP_VALUE = (
 _TOKEN_PLACEHOLDER = "__INGEST_TOKEN__"
 _CLINICIANS_PLACEHOLDER = "__CLINICIANS_JSON__"
 _THEME_COLOR_PLACEHOLDER = "__THEME_COLOR__"
+# The install-asset link hrefs are BAKED from the route constants (below) via render_index,
+# so a route rename propagates to the served page — the browser-facing literal can never
+# drift from the registered route (QA fix round, findings 4/9).
+_MANIFEST_ROUTE_PLACEHOLDER = "__MANIFEST_ROUTE__"
+_FAVICON_ROUTE_PLACEHOLDER = "__FAVICON_ROUTE__"
+_APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER = "__APPLE_TOUCH_ICON_ROUTE__"
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -118,8 +124,9 @@ _INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="__THEME_COLOR__">
-<link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="manifest" href="__MANIFEST_ROUTE__">
+<link rel="icon" href="__FAVICON_ROUTE__" sizes="any">
+<link rel="apple-touch-icon" href="__APPLE_TOUCH_ICON_ROUTE__">
 <title>STAY-C Scribe</title>
 <style>
   :root { color-scheme: light dark; }
@@ -593,15 +600,26 @@ APP_JS = r"""'use strict';
       'reloading this page will ask again.</p>' +
       '<label for="tok">Enrolment token</label>' +
       '<input id="tok" type="password" autocomplete="off" spellcheck="false">' +
-      '<button id="tok-ok" class="primary">Continue</button>';
+      '<button id="tok-ok" class="primary">Continue</button>' +
+      '<div id="tok-msg" class="note"></div>';
     return await new Promise((res) => {
       pendingToken = res;                                       // teardown can settle it
       $('tok-ok').addEventListener('click', () => {
         if (!pendingToken) { return; }                          // torn down by a route away
+        const val = $('tok').value || '';
+        // INTENTIONALLY-LEFT-BLANK — an EMPTY Continue must SAY so, not silently no-op.
+        // Consuming pendingToken on empty would resolve false AND leave the form on-screen;
+        // every later Continue click would then hit `!pendingToken` and do literally nothing
+        // — a permanently dead button, the exact "button does nothing" this fix round kills.
+        // So on empty: show a message, keep the prompt LIVE, and wait for a real paste.
+        if (!val) {
+          $('tok-msg').textContent = 'Enter the enrolment token to continue.';
+          return;
+        }
         pendingToken = null;
-        enrollToken = $('tok').value || '';
+        enrollToken = val;
         $('tok').value = '';                                    // drop it from the DOM
-        res(!!enrollToken);
+        res(true);
       });
     });
   }
@@ -671,16 +689,17 @@ APP_JS = r"""'use strict';
 
   // INTENTIONALLY-LEFT-BLANK — the "Create a voiceprint" button must NEVER be a silent
   // no-op. The old `if (!user) { return; }` did exactly that: with scribe.clinicians empty
-  // (the live 2026-07-16 root cause), tapping Create did literally nothing. Say what is
-  // wrong and who fixes it. The two causes are DISTINCT: no clinician SELECTED (the picker
-  // has options — realistically only the multi-clinician case, since fillWho auto-selects a
-  // sole clinician) vs no clinician CONFIGURED at all (an operator-side fix).
+  // (the live 2026-07-16 root cause), tapping Create did literally nothing. Say what is wrong
+  // and who fixes it. This guard fires ONLY in the no-clinician-configured case: fillWho
+  // auto-selects CLINICIANS[0] in EVERY non-empty case (sole AND multi-clinician), and no
+  // picker <option> carries an empty value, so `user` is truthy from page-load onward. "A
+  // clinician exists but none is selected" is therefore unreachable — there is no second
+  // message on purpose (a dead branch would only invite the comment-lies trap).
   function refuseEnrollNoClinician() {
     $('enroll').classList.remove('hide');
-    $('enroll-title').textContent = 'Select a clinician';
-    $('enroll-body').innerHTML = CLINICIANS.length === 0
-      ? '<p>No clinicians are configured on this machine &mdash; ask your operator.</p>'
-      : '<p>Select a clinician first.</p>';
+    $('enroll-title').textContent = 'No clinician configured';
+    $('enroll-body').innerHTML =
+      '<p>No clinicians are configured on this machine &mdash; ask your operator.</p>';
   }
 
   // The guided enrolment: record-first, name-last (~45-60s).
@@ -1019,6 +1038,15 @@ MANIFEST_ROUTE = "/manifest.webmanifest"
 ICON_192_ROUTE = "/scribe/icon-192.png"
 ICON_512_ROUTE = "/scribe/icon-512.png"
 FAVICON_ROUTE = "/favicon.ico"
+# iOS/WebKit uses apple-touch-icon (NOT the manifest icons member) for the home-screen tile,
+# and — with a <link rel="apple-touch-icon"> declared — fetches ONLY the declared href and
+# does NOT probe the root prefix (per Apple docs), so the sized-variant probes
+# (/apple-touch-icon-120x120.png etc.) never fire and need no route. We ALSO serve the
+# ``-precomposed.png`` sibling: some older WebKit prefers it, and a direct/no-link probe of
+# either canonical path must get a 200 (not the 401 warning-spam the favicon fix killed). The
+# operator's own device is an iPhone (module docstring), so this is the ratified target.
+APPLE_TOUCH_ICON_ROUTE = "/apple-touch-icon.png"
+APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE = "/apple-touch-icon-precomposed.png"
 
 _THEME_RGB = (0x1A, 0x7F, 0x37)   # THEME_COLOR as RGB — the solid icon fill
 
@@ -1049,6 +1077,7 @@ def _solid_png(size: int, rgb: tuple[int, int, int]) -> bytes:
 ICON_192_PNG = _solid_png(192, _THEME_RGB)
 ICON_512_PNG = _solid_png(512, _THEME_RGB)
 FAVICON_PNG = _solid_png(32, _THEME_RGB)
+APPLE_TOUCH_ICON_PNG = _solid_png(180, _THEME_RGB)   # iOS home-screen tile (180px = @3x)
 
 # The Web App Manifest — STATIC and SECRET-FREE (no token, unlike the index page). ``display:
 # standalone`` is what drops the URL bar; the maskable icons are what Chrome ≥108 needs to offer
@@ -1094,4 +1123,9 @@ def render_index(token: str, clinicians: list[str] | None = None) -> str:
         .replace(_TOKEN_PLACEHOLDER, html.escape(token, quote=True))
         .replace(_CLINICIANS_PLACEHOLDER, html.escape(payload, quote=True))
         .replace(_THEME_COLOR_PLACEHOLDER, THEME_COLOR)
+        # the install-link hrefs are baked from the route constants (single source of truth —
+        # a route rename can never leave the page linking a now-un-exempt path). QA findings 4/9.
+        .replace(_MANIFEST_ROUTE_PLACEHOLDER, MANIFEST_ROUTE)
+        .replace(_FAVICON_ROUTE_PLACEHOLDER, FAVICON_ROUTE)
+        .replace(_APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER, APPLE_TOUCH_ICON_ROUTE)
     )

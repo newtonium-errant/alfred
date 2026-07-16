@@ -169,6 +169,9 @@ switch (scenario) {
   // !user guard. It must SPEAK, not silently no-op.
   case 'enroll_no_clinician_configured':
     cfg.clinicians = []; break;
+  // QA finding 7 — the empty-paste Continue in needEnrollToken must not leave a dead button.
+  case 'enroll_empty_token_then_valid':
+    cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.serverState = 'ok'; break;
   default: break;
 }
 
@@ -654,6 +657,24 @@ try {
     out.enrollTitle = el('enroll-title').textContent;
     out.micOpens = micOpens.n;
     out.hasTokenPrompt = registry.has('tok');
+  } else if (scenario === 'enroll_empty_token_then_valid') {
+    // QA finding 7 — the token-prompt Continue must not become a permanently dead button.
+    // Click Continue with an EMPTY field: it must SAY so and keep the prompt live (NOT consume
+    // pendingToken); then a REAL paste on the SAME button must proceed.
+    await setHash('#/presets');
+    el('new-preset').click();
+    await settle(12);
+    el('tok').value = '';                              // empty paste
+    el('tok-ok').click();
+    await settle(12);
+    out.tokMsgAfterEmpty = el('tok-msg').innerHTML;
+    out.hasTokAfterEmpty = registry.has('tok');        // prompt stayed on-screen
+    out.enrollStartAfterEmpty = calls.some((c) => c.url.split('?')[0] === '/scribe/enroll/start');
+    out.micOpensAfterEmpty = micOpens.n;
+    el('tok').value = ENROLL_TOKEN;                    // now a real paste on the SAME button
+    el('tok-ok').click();
+    await settle(15);
+    out.hasEnGoAfterValid = registry.has('en-go');     // it advanced → not dead
   } else {   // enroll_flow / enroll_finalize_409 / enroll_start_429
     await openEnrollWithToken();
     if (registry.has('en-go')) {
