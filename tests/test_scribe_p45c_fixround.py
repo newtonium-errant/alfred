@@ -199,6 +199,32 @@ def test_pyannote_extraction_non_degenerate_raise_still_propagates(monkeypatch):
         diarize_mod._cluster_embeddings_for(
             cfg, "/enc/c.webm", [(0.0, 5.0, "S00")], expected_dim=_DIM, source_id="enc")
 
+def test_pyannote_extraction_plain_embed_error_propagates(monkeypatch):
+    # NOTE-2 catch NARROWNESS: the pyannote seam catches ONLY DegenerateEmbeddingError. A
+    # PLAIN EmbedError (e.g. the staged model vanished mid-sweep) must PROPAGATE — never be
+    # swallowed as a degenerate omit, which would fold the chunk all-unknown WITH the extractor
+    # stamp (a poisoned health-eligible row, the exact class the marker exists to prevent). The
+    # RuntimeError pin above does NOT bind this: a `except DegenerateEmbeddingError -> except
+    # EmbedError` broadening mutant still lets RuntimeError through (EmbedError is not a
+    # RuntimeError), so it survives that pin. This drives a plain EmbedError, which the
+    # broadening mutant WOULD swallow — so the mutant dies here.
+    sr = 16000
+    wave = _SliceRec(total=sr * 10)
+    monkeypatch.setattr(diarize_mod, "_decode_audio", lambda p: (wave, sr))
+    _stub_torch(monkeypatch)
+
+    def _embed_error(cfg, w, s):
+        raise embed_voice.EmbedError("staged model vanished mid-sweep")
+
+    monkeypatch.setattr(embed_voice, "embed_waveform", _embed_error)
+    cfg = _config(provider="pyannote", enabled=True, pipeline_config="/x.yaml")
+    with structlog.testing.capture_logs() as caps:
+        with pytest.raises(embed_voice.EmbedError):
+            diarize_mod._cluster_embeddings_for(
+                cfg, "/enc/c.webm", [(0.0, 5.0, "S00")], expected_dim=_DIM, source_id="enc")
+    # a plain EmbedError is NOT counted/logged as a degenerate omit (it propagated).
+    assert not [c for c in caps if c.get("event") == "scribe.diarize.extraction_degenerate"]
+
 
 def test_fake_extraction_omits_degenerate_cluster(monkeypatch):
     # The degeneracy belt fires on the FAKE seam too (symmetry): a DegenerateEmbeddingError
@@ -355,6 +381,11 @@ def test_eligible_denominator_reads_config_min_turn_s(tmp_path):
     assert len(rows) == 1
     assert rows[0]["eligible_turns"] == 0               # 1.5 < 2.0 config floor
     assert rows[0]["min_turn_s"] == 2.0
+    # F8 THIRD min_turn_s read: _role_counts_eligible (pipeline.py) must ALSO read the config
+    # floor, so its population equals eligible_turns. A hardcoded-1.0 mutant at that call site
+    # would count the 1.5s segment (sum 1) while eligible_turns=0 — the invariant breaks.
+    assert sum(rows[0]["role_counts_eligible"].values()) == rows[0]["eligible_turns"]  # == 0
+    assert rows[0]["role_counts_eligible"]["unknown"] == 0   # the 1.5s unknown seg is sub-floor
 
 
 # ===========================================================================
