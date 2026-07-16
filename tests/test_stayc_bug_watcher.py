@@ -55,13 +55,15 @@ def test_mode_missing_env_is_locked():
 # build_alert — PHI boundary per mode
 # ---------------------------------------------------------------------------
 
-def test_locked_alert_is_count_and_filename_only_no_body(tmp_path):
-    bid, bug_dir = _seed(tmp_path, "dead button", _PHI + " in the detail")
+def test_locked_alert_is_count_and_opaque_id_only_no_free_text(tmp_path):
+    # R1 — plant PHI in the SUMMARY (the real leak vector: the old slug embedded the summary in
+    # the id, which locked mode sends). With the OPAQUE id, the ping carries no summary text.
+    bid, bug_dir = _seed(tmp_path, _PHI + " cant save", "and in the detail too")
     reports = w.scan_new_reports(bug_dir, set())
     text = w.build_alert(w.FORWARD_MODE_LOCKED, reports)
-    assert bid in text and "1 new bug report" in text            # count + filename(id)
-    assert _PHI not in text                                       # ...NEVER the body content
-    assert "dead-button" in bid                                   # (the id carries the slug only)
+    assert bid in text and "1 new bug report" in text            # count + OPAQUE id
+    assert _PHI not in text and _PHI.lower() not in text.lower()  # NEVER the summary or its slug
+    assert "jane" not in text.lower() and "patient" not in text.lower()   # not even a fragment
 
 
 def test_full_alert_includes_the_body(tmp_path):
@@ -71,43 +73,73 @@ def test_full_alert_includes_the_body(tmp_path):
     assert bid in text and _PHI in text                          # synthetic-era full-body forward
 
 
-def test_run_once_locked_never_sends_body(tmp_path):
-    # END-TO-END fail-safe: with the DEFAULT (locked) mode, a report whose body carries PHI is
-    # surfaced by id only — the sent text never contains the body.
-    _seed(tmp_path, "problem", _PHI)
+def test_run_once_locked_never_sends_summary_or_body(tmp_path):
+    # END-TO-END fail-safe: with the DEFAULT (locked) mode, a report whose SUMMARY and body
+    # carry PHI is surfaced by opaque id only — the sent text never contains either.
+    _seed(tmp_path, _PHI + " summary", _PHI + " detail")
     bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
     sent = []
-    summary = w.run_once(bug_dir, mode=w.resolve_forward_mode({}), sender=sent.append)
+    summary = w.run_once(bug_dir, mode=w.resolve_forward_mode({}), sender=sent.append,
+                         state_path=tmp_path / "state.json")
     assert summary["forwarded"] == 1 and summary["mode"] == "locked"
-    assert sent and _PHI not in sent[0]
+    assert sent and _PHI not in sent[0] and _PHI.lower() not in sent[0].lower()
+
+
+def test_run_once_raises_and_preserves_state_on_send_failure(tmp_path):
+    # R2 — a Telegram delivery failure (sender raises, e.g. the httpx sender on HTTP >= 400)
+    # must NOT mark the reports forwarded: run_once propagates and state is NOT saved, so the
+    # reports are re-scanned + retried next run (never the silent sink where a revoked token is
+    # treated as success).
+    _seed(tmp_path, "one", "d")
+    bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
+    state = tmp_path / "state.json"
+
+    def _boom(_text):
+        raise w.TelegramSendError("Telegram HTTP 401")
+
+    with pytest.raises(w.TelegramSendError):
+        w.run_once(bug_dir, mode="locked", sender=_boom, state_path=state)
+    assert w.load_forwarded(state) == set()                      # NOT marked → retried next run
+    # a retry with a working sender then forwards it.
+    sent = []
+    w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
+    assert len(sent) == 1
 
 
 # ---------------------------------------------------------------------------
 # scan + state (no double-forward; dotfile ignored)
 # ---------------------------------------------------------------------------
 
-def test_scan_ignores_forwarded_and_state_dotfile(tmp_path):
+def test_scan_ignores_forwarded(tmp_path):
     a, bug_dir = _seed(tmp_path, "first", "d")
     b, _ = _seed(tmp_path, "second", "d")
     assert {p.stem for p in w.scan_new_reports(bug_dir, set())} == {a, b}
     assert {p.stem for p in w.scan_new_reports(bug_dir, {a})} == {b}
-    # the state dotfile is never scanned as a report.
-    w.save_forwarded(bug_dir, {a, b})
-    assert (bug_dir / w._STATE_NAME).is_file()
-    assert w.scan_new_reports(bug_dir, w.load_forwarded(bug_dir)) == []
+
+
+def test_state_lives_outside_the_bug_dir(tmp_path):
+    # R3 — the forwarded-state is WATCHER-OWNED, NOT in the (group-r-x) bug dir. save/load use an
+    # explicit state_path, and the default is under the watcher's XDG state dir, never the bug dir.
+    a, bug_dir = _seed(tmp_path, "first", "d")
+    state = tmp_path / "watcher-state" / "forwarded.json"
+    w.save_forwarded(state, {a})
+    assert state.is_file() and not (bug_dir / w._STATE_NAME).exists()   # NOT in the bug dir
+    assert w.load_forwarded(state) == {a}
+    assert w.default_state_path(bug_dir) != bug_dir / w._STATE_NAME     # default is watcher-owned
 
 
 def test_run_once_does_not_double_forward(tmp_path):
     _seed(tmp_path, "one", "d")
     bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
+    state = tmp_path / "state.json"
     sent = []
-    first = w.run_once(bug_dir, mode="locked", sender=sent.append)
-    second = w.run_once(bug_dir, mode="locked", sender=sent.append)   # .path fires again
+    first = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
+    second = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)  # .path fires again
     assert first["forwarded"] == 1 and second["forwarded"] == 0       # marked, not re-sent
     assert len(sent) == 1
     # a NEW report after that forwards just the new one.
     _seed(tmp_path, "two", "d")
-    third = w.run_once(bug_dir, mode="locked", sender=sent.append)
+    third = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
     assert third["forwarded"] == 1 and len(sent) == 2
 
 
@@ -115,15 +147,31 @@ def test_run_once_no_new_reports_is_a_signal_not_a_crash(tmp_path):
     bug_dir = tmp_path / "bugs"
     bug_dir.mkdir()
     sent = []
-    summary = w.run_once(bug_dir, mode="locked", sender=sent.append)  # ILB — ran, nothing new
+    summary = w.run_once(bug_dir, mode="locked", sender=sent.append,   # ILB — ran, nothing new
+                         state_path=tmp_path / "state.json")
     assert summary["forwarded"] == 0 and sent == []
 
 
+def test_run_once_caps_reports_per_run(tmp_path):
+    # F6 — a backlog must not fan out into hundreds of chunks (post-R2 a rate-limit 429 HARD
+    # fails the run). Forward at most MAX_REPORTS_PER_RUN per trigger; the rest drain later.
+    for i in range(w.MAX_REPORTS_PER_RUN + 3):
+        _seed(tmp_path, f"report {i}", "d")
+    bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
+    state = tmp_path / "state.json"
+    sent = []
+    summary = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
+    assert summary["forwarded"] == w.MAX_REPORTS_PER_RUN and summary["overflow"] == 3
+    assert "more this run" in sent[0]                            # overflow is signalled
+    # the remaining drain on the next run.
+    second = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
+    assert second["forwarded"] == 3
+
+
 def test_load_forwarded_tolerates_corrupt_state(tmp_path):
-    bug_dir = tmp_path / "bugs"
-    bug_dir.mkdir()
-    (bug_dir / w._STATE_NAME).write_text("{not json", encoding="utf-8")
-    assert w.load_forwarded(bug_dir) == set()                    # tolerant → re-send, never lost
+    state = tmp_path / "state.json"
+    state.write_text("{not json", encoding="utf-8")
+    assert w.load_forwarded(state) == set()                     # tolerant → re-send, never lost
 
 
 # ---------------------------------------------------------------------------
@@ -137,10 +185,14 @@ def test_watcher_templates_are_bundled_with_expected_placeholders():
     # the .path watches the bug dir and triggers the .service.
     assert "PathModified=<STAYC_BUG_DIR>" in path_tmpl
     assert "Unit=stayc-bug-watcher.service" in path_tmpl
-    # the .service runs the watcher module, as the operator, with a writable bug dir + no
-    # IPAddressDeny (it MUST egress to Telegram, unlike the clinical unit).
+    # the .service runs the watcher module as the operator, with its OWN state dir writable
+    # (NOT the bug dir — the watcher only reads that) + no IPAddressDeny (it MUST egress).
     assert "-m alfred.scripts.stayc_bug_watcher" in svc_tmpl
-    assert "ReadWritePaths=<STAYC_BUG_DIR>" in svc_tmpl
+    assert "STAYC_BUG_STATE=<STAYC_WATCHER_STATE>" in svc_tmpl        # relocated state (R3)
+    assert "ReadWritePaths=<STAYC_WATCHER_STATE_DIR>" in svc_tmpl     # writable state dir, not bug dir
+    assert not any(ln.strip() == "ReadWritePaths=<STAYC_BUG_DIR>" for ln in svc_tmpl.splitlines())
     # no IPAddressDeny DIRECTIVE (it must egress to Telegram); a comment MENTIONING it is fine.
     assert not any(ln.strip().startswith("IPAddressDeny=") for ln in svc_tmpl.splitlines())
     assert "<STAYC_WATCHER_USER>" in svc_tmpl
+    # the shared-group cross-user provisioning (R3) is documented in the template.
+    assert "groupadd" in svc_tmpl and "stayc-bugs" in svc_tmpl and "usermod -aG" in svc_tmpl

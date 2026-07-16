@@ -17,9 +17,11 @@ The mode is read from ``STAYC_BUG_FORWARD_MODE``. ANY missing / unset / unparsea
 value resolves to ``locked`` — a misconfiguration can NEVER silently escalate to full-body PHI
 egress. That fail-safe is the load-bearing property of this component.
 
-State: already-forwarded report ids live in ``<bug_dir>/.forwarded.json`` (a dotfile, so
-``scribe.bug.list_bugs`` — which only reads ``*.md`` — never treats it as a report). Re-runs
-(the .path unit fires on every change) never double-send.
+State: already-forwarded report ids live in a WATCHER-OWNED file (``$STAYC_BUG_STATE``, default
+under the watcher's XDG state dir) — NOT the bug dir, which is group-r-x for the watcher (the
+clinical daemon owns it, and it is deliberately not group-writable). Re-runs (the .path unit
+fires on every change) never double-send. On a Telegram delivery failure the state is NOT
+advanced, so the reports are retried rather than marked-and-lost.
 
 Install is operator-gated (a systemd .path + .service, run as the operator) — see the bundled
 ``stayc-bug-watcher.{path,service}.template``. This module ships the ARTIFACT; the box install
@@ -46,9 +48,23 @@ ENV_MODE = "STAYC_BUG_FORWARD_MODE"
 ENV_BUG_DIR = "STAYC_BUG_DIR"
 ENV_TOKEN = "TELEGRAM_BOT_TOKEN"           # shared operator env (aftermath-sync-alert pattern)
 ENV_CHAT_ID = "STAYC_BUG_TELEGRAM_CHAT_ID"
+# The forwarded-state file lives in a WATCHER-OWNED location (NOT the bug dir — that dir is
+# group-r-x for the watcher, not group-writable; the clinical daemon owns it). Default derives
+# under the watcher's XDG state dir so the watcher can always write it. (R3/finding 7c.)
+ENV_STATE = "STAYC_BUG_STATE"
 
 _STATE_NAME = ".forwarded.json"
 _TELEGRAM_MAX = 3800                        # under Telegram's 4096 hard cap, room for a header
+# Per-run cap — a large backlog (e.g. after Telegram was down) must not fan out into hundreds of
+# sequential chunks that trip Telegram's ~1 msg/s rate limit (which, post-R2, now HARD-FAILS the
+# run). Forward at most this many reports per trigger; the rest drain on subsequent runs. (F6.)
+MAX_REPORTS_PER_RUN = 20
+
+
+class TelegramSendError(Exception):
+    """A Telegram send FAILED (HTTP >= 400). Raised so ``run_once`` does NOT mark the reports
+    forwarded — state is preserved for retry and the oneshot unit shows FAILED, instead of the
+    silent-sink where a revoked token / wrong chat_id is treated as success. (R2/findings 4/6.)"""
 
 
 def resolve_forward_mode(env: dict[str, str] | None = None) -> str:
@@ -65,27 +81,30 @@ def resolve_forward_mode(env: dict[str, str] | None = None) -> str:
     return FORWARD_MODE_LOCKED
 
 
-def _state_path(bug_dir: Path) -> Path:
-    return bug_dir / _STATE_NAME
+def default_state_path(bug_dir: Path) -> Path:
+    """The watcher's forwarded-state file when ``$STAYC_BUG_STATE`` is unset. NOT the bug dir
+    (that is group-r-x, not group-writable) — the XDG state dir the watcher owns."""
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "stayc-bug-watcher" / _STATE_NAME
 
 
-def load_forwarded(bug_dir: Path) -> set[str]:
+def load_forwarded(state_path: Path) -> set[str]:
     """The set of already-forwarded report ids (tolerant: a missing/corrupt state file → empty,
     never a crash — worst case is a re-send, never a lost report)."""
-    p = _state_path(bug_dir)
-    if not p.is_file():
+    if not state_path.is_file():
         return set()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(state_path.read_text(encoding="utf-8"))
         return set(data) if isinstance(data, list) else set()
     except (ValueError, OSError):
         return set()
 
 
-def save_forwarded(bug_dir: Path, ids: Iterable[str]) -> None:
-    tmp = _state_path(bug_dir).with_name(_STATE_NAME + ".tmp")
+def save_forwarded(state_path: Path, ids: Iterable[str]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_path.with_name(state_path.name + ".tmp")
     tmp.write_text(json.dumps(sorted(set(ids))), encoding="utf-8")
-    os.replace(tmp, _state_path(bug_dir))
+    os.replace(tmp, state_path)
 
 
 def scan_new_reports(bug_dir: Path, forwarded: set[str]) -> list[Path]:
@@ -135,29 +154,39 @@ def _httpx_sender(token: str, chat_id: str) -> Callable[[str], None]:
         for chunk in _chunk(text):
             resp = httpx.post(url, json={"chat_id": chat_id, "text": chunk}, timeout=15.0)
             if resp.status_code >= 400:
-                log.warning("scribe.bug_watcher.telegram_error",
-                            status=resp.status_code, body_tail=resp.text[-200:])
+                # RAISE — do NOT swallow. A revoked token (401) / wrong chat_id (400) / rate
+                # limit (429) is a real DELIVERY FAILURE; swallowing it and returning would let
+                # run_once mark the reports forwarded → permanent silent sink. (R2.)
+                raise TelegramSendError(f"Telegram HTTP {resp.status_code}: {resp.text[-200:]}")
 
     return _send
 
 
-def run_once(bug_dir: Path, *, mode: str, sender: Callable[[str], None]) -> dict:
-    """Scan for NEW reports, forward via ``sender``, mark them forwarded. Returns a summary.
+def run_once(bug_dir: Path, *, mode: str, sender: Callable[[str], None],
+             state_path: Path) -> dict:
+    """Scan for NEW reports (capped at :data:`MAX_REPORTS_PER_RUN`), forward via ``sender``, and
+    ONLY THEN mark them forwarded. If ``sender`` raises (Telegram HTTP error OR a transport
+    error), the exception propagates and state is NOT saved — the reports stay unforwarded and
+    are retried, and the caller surfaces the failure (R2). Returns a summary on success.
 
     ILB — emits an explicit signal on EVERY run, including the no-new-reports case (the .path
     unit fires on any dir change; "ran, nothing new" must be distinguishable from broken)."""
-    forwarded = load_forwarded(bug_dir)
+    forwarded = load_forwarded(state_path)
     new = scan_new_reports(bug_dir, forwarded)
     if not new:
         log.info("scribe.bug_watcher.no_new_reports", mode=mode)   # ran, nothing to forward
         return {"forwarded": 0, "mode": mode}
-    text = build_alert(mode, new)
-    sender(text)
-    ids = {p.stem for p in new}
-    save_forwarded(bug_dir, forwarded | ids)
+    capped = new[:MAX_REPORTS_PER_RUN]                              # bound the per-run fan-out (F6)
+    overflow = len(new) - len(capped)
+    text = build_alert(mode, capped)
+    if overflow > 0:
+        text += f"\n(+{overflow} more this run — will send on the next trigger.)"
+    sender(text)                                                   # raises → NO save_forwarded below
+    ids = {p.stem for p in capped}
+    save_forwarded(state_path, forwarded | ids)
     # PHI-safe log — count + mode only, NEVER the report bodies.
-    log.info("scribe.bug_watcher.forwarded", count=len(new), mode=mode)
-    return {"forwarded": len(new), "mode": mode, "ids": sorted(ids)}
+    log.info("scribe.bug_watcher.forwarded", count=len(capped), mode=mode, overflow=overflow)
+    return {"forwarded": len(capped), "mode": mode, "overflow": overflow, "ids": sorted(ids)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -170,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: no bug dir (set ${ENV_BUG_DIR} or pass --bug-dir).", file=sys.stderr)
         return 2
     bug_dir = Path(args.bug_dir).expanduser()
+    state_path = (Path(os.environ[ENV_STATE]).expanduser() if os.environ.get(ENV_STATE)
+                  else default_state_path(bug_dir))
 
     mode = resolve_forward_mode(os.environ)
     token = os.environ.get(ENV_TOKEN, "")
@@ -181,7 +212,13 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    summary = run_once(bug_dir, mode=mode, sender=_httpx_sender(token, chat_id))
+    try:
+        summary = run_once(bug_dir, mode=mode, sender=_httpx_sender(token, chat_id),
+                           state_path=state_path)
+    except Exception as e:      # noqa: BLE001 — ANY failure (send, permission, transport) must
+        # fail the unit LOUDLY with state preserved, never a silent success. (R2/R3.)
+        print(f"stayc-bug-watcher: FAILED to forward — {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
     print(f"stayc-bug-watcher: forwarded {summary['forwarded']} report(s) in {mode} mode.")
     return 0
 

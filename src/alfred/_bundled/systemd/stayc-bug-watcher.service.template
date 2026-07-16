@@ -6,6 +6,18 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 # Runs as the OPERATOR (NOT the clinical User=) — this is the one component that egresses.
+#
+# CROSS-USER ACCESS (task #4 R3) — the clinical daemon (a DIFFERENT user, UMask=0077) owns the
+# bug dir + reports. It sets them EXPLICITLY to dir 2750 (setgid, group r-x) + files 0640
+# (group r) so a SHARED GROUP can iterdir + read the bodies (full mode). Provision the group at
+# install (ONE time), then add this watcher user to it:
+#     groupadd -f stayc-bugs
+#     chgrp -R stayc-bugs <STAYC_BUG_DIR>          # dir + any existing reports
+#     usermod -aG stayc-bugs <STAYC_WATCHER_USER>
+# The daemon re-applies the setgid+modes on every write, so new reports inherit the group and
+# stay group-readable. The watcher NEVER writes into the bug dir (it is not group-writable) —
+# its forwarded-state lives in STAYC_BUG_STATE below. If the group is missing the watcher fails
+# LOUDLY (read error → non-zero exit), never a silent sink.
 User=<STAYC_WATCHER_USER>
 Group=<STAYC_WATCHER_GROUP>
 # The operator env carries TELEGRAM_BOT_TOKEN + STAYC_BUG_TELEGRAM_CHAT_ID + the forwarding
@@ -14,6 +26,9 @@ Group=<STAYC_WATCHER_GROUP>
 # systemd refusing to start the unit at all.
 EnvironmentFile=-<STAYC_WATCHER_ENV>
 Environment=STAYC_BUG_DIR=<STAYC_BUG_DIR>
+# The watcher's OWN forwarded-state file (NOT in the bug dir — that is group-r-x, not writable
+# by the watcher). A watcher-owned path, e.g. /var/lib/stayc-bug-watcher/.forwarded.json.
+Environment=STAYC_BUG_STATE=<STAYC_WATCHER_STATE>
 # FAIL-SAFE (operator ruling 2026-07-16): if STAYC_BUG_FORWARD_MODE is unset / unparseable the
 # watcher resolves to `locked` (count + filename only). A misconfig can NEVER silently escalate
 # to full-body PHI egress. The go-live gate flips the env from `full` back to `locked`.
@@ -23,8 +38,10 @@ ExecStart=<STAYC_WATCHER_PYTHON> -m alfred.scripts.stayc_bug_watcher
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# The only writable hole it needs: the bug dir (to persist .forwarded.json state).
-ReadWritePaths=<STAYC_BUG_DIR>
+# The only writable hole it needs is its OWN state dir (ProtectSystem=strict still allows READ
+# of the bug dir — reading is never blocked, only writing). The bug dir is NOT here: the watcher
+# only reads it, and DAC (the shared group) is what grants that read.
+ReadWritePaths=<STAYC_WATCHER_STATE_DIR>
 PrivateTmp=yes
 UMask=0077
 ProtectKernelTunables=yes

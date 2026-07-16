@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import socket
 from contextlib import asynccontextmanager
@@ -111,7 +112,7 @@ def test_bug_dir_resolution_derives_from_input_dir(tmp_path):
 # module — write / posture / triage
 # ---------------------------------------------------------------------------
 
-def test_write_report_is_0600_and_phi_free_context(tmp_path):
+def test_write_report_explicit_modes_and_phi_free_context(tmp_path):
     cfg = _config(tmp_path)
     path, bug_id = bug_mod.write_bug_report(
         cfg, summary="Dead button", detail="clicked create, nothing",
@@ -119,13 +120,26 @@ def test_write_report_is_0600_and_phi_free_context(tmp_path):
                  "ua": "UA", "server_state": "empty", "attribution": "unarmed",
                  "secret_field": "SHOULD_BE_DROPPED"},
         events=["click new-preset", "runEnroll !user"])
-    assert oct(os.stat(path).st_mode & 0o777) == "0o600"          # vault-grade custody
+    # EXPLICIT modes (R3) — NOT umask-dependent. File 0640 (group r, so the shared-group watcher
+    # reads bodies in full mode); dir 2750 (setgid + group r-x, NOT group-writable).
+    assert oct(os.stat(path).st_mode & 0o777) == "0o640"
+    bug_dir = bug_mod.resolve_bug_dir(cfg)
+    assert oct(os.stat(bug_dir).st_mode & 0o7777) == "0o2750"     # setgid + group r-x, no group w
     text = path.read_text(encoding="utf-8")
     assert f"id: {bug_id}" in text
     assert "view: #/presets" in text and "user: np_jamie" in text
     assert "runEnroll !user" in text                             # ring buffer attached
     # a key NOT in the closed PHI-free set is DROPPED — the file can only carry the allowlist.
     assert "secret_field" not in text and "SHOULD_BE_DROPPED" not in text
+
+
+def test_report_id_is_opaque_not_derived_from_summary(tmp_path):
+    # R1 — the id must NOT embed the reporter's free-text summary (the old slug leaked it into
+    # the locked-mode Telegram ping + the daemon log). It is timestamp + random hex only.
+    cfg = _config(tmp_path)
+    _, bug_id = bug_mod.write_bug_report(cfg, summary="patient john smith cannot save", detail="d")
+    assert "john" not in bug_id.lower() and "smith" not in bug_id.lower() and "patient" not in bug_id.lower()
+    assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{8}", bug_id), bug_id   # ts + 8 hex
 
 
 def test_write_report_multiline_summary_cannot_inject_frontmatter(tmp_path):
@@ -168,6 +182,23 @@ def test_resolve_and_read_reject_unknown_and_traversal(tmp_path):
     for evil in ("../../etc/passwd", "..", "a/b", ".hidden", ""):
         assert bug_mod.read_bug(cfg, evil) is None              # traversal-guarded
         assert bug_mod.resolve_bug(cfg, evil) is False
+
+
+def test_traversal_guard_blocks_even_when_the_escape_target_exists(tmp_path):
+    # R4 — the prior test passed even with BUG_ID_RE DELETED (the escape targets didn't exist,
+    # so is_file() saved it). PLANT a real file one level above the bug dir: if the guard were
+    # removed, `_report_path`'s `bug_dir / "../escape.md"` would resolve to it. The guard must
+    # block "../escape" regardless — read returns None AND resolve returns False (the latter
+    # also stops os.replace from moving a file OUT of the bug dir).
+    cfg = _config(tmp_path)
+    bug_dir = bug_mod.resolve_bug_dir(cfg)
+    bug_dir.mkdir(parents=True, exist_ok=True)
+    escape = bug_dir.parent / "escape.md"
+    escape.write_text("secret outside the bug dir", encoding="utf-8")
+    assert (bug_dir / "../escape.md").resolve() == escape.resolve()   # the target really is reachable
+    assert bug_mod.read_bug(cfg, "../escape") is None                 # ...but the guard blocks it
+    assert bug_mod.resolve_bug(cfg, "../escape") is False
+    assert escape.is_file()                                           # never moved/read via the id
 
 
 def test_open_report_cap_raises(tmp_path):
@@ -240,21 +271,38 @@ def test_route_inert_when_disabled(tmp_path):
     assert asyncio.run(_go()) == 404                            # bug_inert — route off, not just unauth
 
 
-def test_route_body_cap_content_length_and_post_read(tmp_path):
+def test_route_body_cap_content_length_prong(tmp_path):
     cfg = _config(tmp_path, max_body_bytes=200)
 
     async def _go():
-        out = {}
         async with _serve(cfg) as base, aiohttp.ClientSession() as s:
             # honest oversized POST → refused at the Content-Length pre-check.
-            out["cl"], out["cl_body"] = await _post_bug(s, base, {"summary": "s", "detail": "z" * 500})
-        return out
+            return await _post_bug(s, base, {"summary": "s", "detail": "z" * 500})
 
-    out = asyncio.run(_go())
-    assert out["cl"] == 413 and out["cl_body"]["error"] == "bug_too_large"
+    st, body = asyncio.run(_go())
+    assert st == 413 and body["error"] == "bug_too_large"
 
 
-def test_route_empty_and_invalid_json(tmp_path):
+def test_route_body_cap_post_read_prong_chunked(tmp_path):
+    # R5 — a Transfer-Encoding: chunked POST carries NO Content-Length, so the pre-check is
+    # SKIPPED; only the post-read `len(raw) > max_body_bytes` backstop catches it. Binds that
+    # prong (deleting it lets a chunked client write up to client_max_size = 25 MiB per report).
+    cfg = _config(tmp_path, max_body_bytes=200)
+
+    async def _chunks():
+        for _ in range(10):
+            yield b"z" * 100                     # 1000 bytes total, no Content-Length → chunked
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            async with s.post(base + iw.BUG_ROUTE, data=_chunks(), headers=_auth()) as r:
+                return r.status, await r.json()
+
+    st, body = asyncio.run(_go())
+    assert st == 413 and body["error"] == "bug_too_large"
+
+
+def test_route_empty_and_invalid_json_and_nonstring(tmp_path):
     cfg = _config(tmp_path)
 
     async def _go():
@@ -263,12 +311,18 @@ def test_route_empty_and_invalid_json(tmp_path):
             out["empty"] = await _post_bug(s, base, {"summary": "   ", "detail": ""})
             out["badjson"] = await _post_bug(s, base, None, raw=b"not json at all")
             out["notdict"] = await _post_bug(s, base, None, raw=b"[1,2,3]")
+            # R6 — a truthy NON-str summary must be an opaque 400, NOT an aiohttp 500 (the old
+            # _slug(non-str) AttributeError). Same for detail.
+            out["nonstr_summary"] = await _post_bug(s, base, {"summary": ["a", "list"], "detail": "d"})
+            out["nonstr_detail"] = await _post_bug(s, base, {"summary": "s", "detail": {"x": 1}})
         return out
 
     out = asyncio.run(_go())
     assert out["empty"] == (400, {"error": "empty_report"})     # ILB — empty refused visibly
     assert out["badjson"][0] == 400 and out["badjson"][1]["error"] == "invalid_json"
     assert out["notdict"][0] == 400 and out["notdict"][1]["error"] == "invalid_json"
+    assert out["nonstr_summary"] == (400, {"error": "invalid_payload"})
+    assert out["nonstr_detail"] == (400, {"error": "invalid_payload"})
 
 
 def test_route_report_cap_429(tmp_path):
@@ -284,18 +338,25 @@ def test_route_report_cap_429(tmp_path):
     assert first == 200 and second == 429 and body["error"] == "report_cap"
 
 
-def test_route_never_logs_phi(tmp_path):
-    # The summary/detail may carry PHI despite the page caution → they must NEVER appear in a
-    # log line (the write log carries bug_id + count only).
+def test_route_never_logs_phi_including_derived_forms(tmp_path):
+    # R1/R13 — the SUMMARY may carry PHI despite the page caution. It must NEVER appear in a log
+    # line, NOR a DERIVED form of it: the old slug-in-id put a lowercased/dashed transform of the
+    # summary into the bug_id (logged), so an exact-case assertion passed falsely. Plant PHI in
+    # the SUMMARY and assert neither it NOR its lowercase/slug form is in any log (the opaque id
+    # makes this true).
     cfg = _config(tmp_path)
     phi = "Jane-Patient-DOB-1970"
+    phi_slug = "jane-patient-dob-1970"                              # the old leak form
 
     async def _go():
         with structlog.testing.capture_logs() as caps:
             async with _serve(cfg) as base, aiohttp.ClientSession() as s:
-                await _post_bug(s, base, {"summary": phi, "detail": phi + " more"})
+                await _post_bug(s, base, {"summary": phi, "detail": "more detail"})
         return caps
 
     caps = asyncio.run(_go())
     assert any(c.get("event") == "scribe.bug.written" for c in caps)   # ran, signalled
-    assert all(phi not in json.dumps(c, default=str) for c in caps)    # ...but no PHI in any log
+    for c in caps:
+        dump = json.dumps(c, default=str).lower()
+        assert phi.lower() not in dump                                # case-insensitive
+        assert phi_slug not in dump                                   # ...and the slug form

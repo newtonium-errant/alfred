@@ -661,13 +661,19 @@ async def _handle_bug(request: web.Request) -> web.StreamResponse:
     if not isinstance(payload, dict):
         return _reject("invalid_json", 400)
 
-    summary = payload.get("summary") or ""
-    detail = payload.get("detail") or ""
+    summary = payload.get("summary", "")
+    detail = payload.get("detail", "")
+    # TYPE-VALIDATE the free-text fields → opaque 400 (R6). A truthy NON-str summary (a dict /
+    # list / number) would otherwise pass the emptiness check and blow up downstream as an
+    # aiohttp 500 HTML body, breaking the "every 4xx/5xx is an opaque reason code" contract.
+    if not isinstance(summary, str) or not isinstance(detail, str):
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="invalid_payload")
+        return _reject("invalid_payload", 400)
     context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
     events = payload.get("events") if isinstance(payload.get("events"), list) else []
     # ILB — an entirely empty report is refused VISIBLY (the UI renders the 4xx), never a
     # silent 200 that writes a contentless file.
-    if not str(summary).strip() and not str(detail).strip():
+    if not summary.strip() and not detail.strip():
         log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="empty_report")
         return _reject("empty_report", 400)
 

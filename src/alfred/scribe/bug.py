@@ -1,17 +1,26 @@
 """STAY-C bug-report capture + triage (task #4).
 
 Box-local, PHI-cautious bug reports for the sovereign scribe. ``POST /scribe/bug`` (loopback,
-INGEST-token gated, NOT bearer-exempt) writes ``<ts>-<slug>.md`` files under the resolved bug
-dir; ``alfred scribe bugs {list|show|resolve}`` triages them on-box.
+INGEST-token gated, NOT bearer-exempt) writes ``<ts>-<hex>.md`` files (an OPAQUE id — the
+reporter's free-text summary is NEVER in the filename, only inside the file body) under the
+resolved bug dir; ``alfred scribe bugs {list|show|resolve}`` triages them on-box.
 
 SOVEREIGN POSTURE — the daemon NEVER egresses a report. Surfacing them off-box is the separate
 box-watcher component's job (a systemd path-unit outside the clinical unit). Reports are
-treated as **PHI-until-a-human-says-otherwise**: 0600 files, vault-grade custody. The auto-
-context the page attaches is PHI-FREE by construction (view/hash, serverState, clinician COUNT,
-clinician SLUG — a staff id, never a name, the attribution chip, UA, timestamps) plus a
-memory-only diagnostic ring buffer of UI-event traces (code-path breadcrumbs, never content).
-The free-text detail carries the page's "don't include patient details" caution — but because a
-human can still paste PHI, the file posture is PHI-grade regardless.
+treated as **PHI-until-a-human-says-otherwise**. The auto-context the page attaches is PHI-FREE
+by construction (view/hash, serverState, clinician COUNT, clinician SLUG — a staff id, never a
+name, the attribution chip, UA, timestamps) plus a memory-only diagnostic ring buffer of
+UI-event traces (code-path breadcrumbs, never content). The free-text summary/detail carry the
+page's "don't include patient details" caution — but because a human can still paste PHI, the
+file posture is PHI-grade regardless, and the OPAQUE id is what makes the locked-mode watcher
+ping + the daemon log PHI-safe (the summary lives only in the 0640 file body).
+
+CUSTODY MODES (explicit, NOT umask-dependent — the clinical unit's UMask=0077 would force
+0700/0600 and lock the different-user box watcher out): dir :data:`_BUG_DIR_MODE` (2750 — setgid
++ group r-x, so a shared-group watcher can iterdir + read but not write/delete), files
+:data:`_BUG_FILE_MODE` (0640 — owner rw, group r, so full mode can read the body). The shared
+group + chgrp is the operator's install step (see the watcher .service template); the watcher
+keeps its OWN forwarded-state OUTSIDE this dir, so the dir need not be group-writable.
 
 CAPS (a stuck/abusive client must never fill the disk, and the file must stay bounded):
   * per-POST body ≤ ``bug.max_body_bytes`` (enforced at the route, on the raw body);
@@ -25,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +47,16 @@ log = structlog.get_logger(__name__)
 # A bug id is the filename stem — a strict, traversal-proof charset (no '/', no '..', no
 # leading dot). The CLI + route resolve a report BY this id, so it gates path safety.
 BUG_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
+
+# Explicit permission modes (NOT umask-dependent — the clinical unit runs UMask=0077, which
+# would otherwise force 0700/0600 and lock the DIFFERENT-user box watcher out entirely). Set by
+# explicit chmod AFTER create. The dir is setgid + group r-x so a shared-group watcher can
+# iterdir the dir and READ bodies (0640 files) in full mode; the group is NOT given write on
+# the dir (the watcher keeps its own forwarded-state OUTSIDE the dir), so a group member can
+# neither add nor delete reports. The shared group + chgrp is the operator's install step
+# (documented in the watcher .service template). File CONTENTS stay owner-write, group-read.
+_BUG_DIR_MODE = 0o2750       # setgid + owner rwx + group r-x (NO group write)
+_BUG_FILE_MODE = 0o640       # owner rw + group r — the watcher (group) reads bodies (full mode)
 
 _RESOLVED_SUBDIR = "resolved"
 _MAX_EVENTS = 40                 # diagnostic ring truncation (the page keeps ~20; be generous)
@@ -70,19 +90,22 @@ def resolve_bug_dir(config) -> Path:
     return Path(config.input_dir).expanduser().parent / "bugs"
 
 
-def _slug(summary: str) -> str:
-    """A short, filesystem-safe slug from the summary (lowercased alnum + dashes)."""
-    s = re.sub(r"[^a-z0-9]+", "-", (summary or "").lower()).strip("-")
-    s = s[:40].strip("-")
-    return s or "report"
-
-
 def _sanitize_line(value: Any, cap: int) -> str:
     """One safe frontmatter line: coerce to str, collapse ALL whitespace (incl. newlines) to
     single spaces so a value can't break the ``k: v`` frontmatter or inject a new key, cap
     length. (The reader is a tolerant line parser, but keeping the writer clean is the belt.)"""
     s = re.sub(r"\s+", " ", str(value)).strip()
     return s[:cap]
+
+
+def _chmod_quiet(path: Path, mode: int) -> None:
+    """Best-effort explicit chmod. Never crash a write on a chmod failure (e.g. the operator
+    hasn't yet chgrp'd the dir) — the perms are a deployment concern, not a write-blocker; the
+    watcher fails LOUD on its own side if it then can't read (R2)."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
 
 
 def _count_open_reports(bug_dir: Path) -> int:
@@ -101,9 +124,11 @@ def _unique_path(bug_dir: Path, stem: str) -> tuple[Path, str]:
     return bug_dir / f"{candidate}.md", candidate
 
 
-def _write_0600(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` with 0600 from creation (vault-grade PHI custody) — never a
-    window where the file is group/other-readable. Atomic via a 0600 temp → replace."""
+def _write_report_file(path: Path, text: str) -> None:
+    """Write ``text`` atomically (0600 temp → replace) then chmod to :data:`_BUG_FILE_MODE`
+    (0640) EXPLICITLY — never a window where the file is other-readable, and the explicit chmod
+    (not the create mode) is what survives the clinical unit's UMask=0077 so the shared-group
+    watcher can read the body in full mode. Other (world) never gets any access."""
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -113,7 +138,7 @@ def _write_0600(path: Path, text: str) -> None:
         tmp.unlink(missing_ok=True)
         raise
     os.replace(tmp, path)
-    os.chmod(path, 0o600)
+    os.chmod(path, _BUG_FILE_MODE)
 
 
 def _render_report(*, bug_id: str, summary: str, detail: str,
@@ -150,16 +175,22 @@ def write_bug_report(config, *, summary: str, detail: str,
     bytes, before JSON parse); the ring truncation is applied here."""
     bug_dir = resolve_bug_dir(config)
     bug_dir.mkdir(parents=True, exist_ok=True)
+    _chmod_quiet(bug_dir, _BUG_DIR_MODE)         # explicit dir mode (setgid, group r-x) — R3
     if _count_open_reports(bug_dir) >= config.bug.max_open_reports:
         raise BugCapRefused("report_cap")
 
+    # OPAQUE id — timestamp + short random hex. The reporter's free-text summary is NOT in the
+    # id (it lives ONLY inside the 0600/0640 file body), so the id is PHI-safe to log AND to
+    # egress: the locked-mode watcher ping sends this id, and the daemon log records it. (R1 —
+    # the prior slug-in-filename leaked reporter free text off-box in locked mode + into the log.)
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    stem = f"{ts}-{_slug(summary)}"
+    stem = f"{ts}-{secrets.token_hex(4)}"
     path, bug_id = _unique_path(bug_dir, stem)
     text = _render_report(bug_id=bug_id, summary=summary, detail=detail,
                           context=context or {}, events=events or [])
-    _write_0600(path, text)
-    # PHI-safe log — id + count only, NEVER the summary/detail/context (which may carry PHI).
+    _write_report_file(path, text)
+    # PHI-safe log — the OPAQUE id + count only, NEVER the summary/detail/context (which may
+    # carry PHI). The id is a random token, NOT a transform of the summary (R1/R13).
     log.info("scribe.bug.written", bug_id=bug_id, open_reports=_count_open_reports(bug_dir))
     return path, bug_id
 
@@ -236,6 +267,7 @@ def resolve_bug(config, bug_id: str) -> bool:
         return True                                      # already resolved
     dest_dir = resolve_bug_dir(config) / _RESOLVED_SUBDIR
     dest_dir.mkdir(parents=True, exist_ok=True)
+    _chmod_quiet(dest_dir, _BUG_DIR_MODE)        # resolved/ inherits the same explicit modes
     os.replace(path, dest_dir / path.name)
     log.info("scribe.bug.resolved", bug_id=bug_id)
     return True
