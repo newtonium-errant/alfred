@@ -1,0 +1,40 @@
+[Unit]
+Description=STAY-C bug-report watcher — forward new reports to Telegram (surfacing, task #4)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the OPERATOR (NOT the clinical User=) — this is the one component that egresses.
+User=<STAYC_WATCHER_USER>
+Group=<STAYC_WATCHER_GROUP>
+# The operator env carries TELEGRAM_BOT_TOKEN + STAYC_BUG_TELEGRAM_CHAT_ID + the forwarding
+# mode (STAYC_BUG_FORWARD_MODE). Leading `-` so a MISSING env-file is non-fatal to LOAD — the
+# watcher then fails LOUD at runtime (no token -> exit 2, the unit shows failed) rather than
+# systemd refusing to start the unit at all.
+EnvironmentFile=-<STAYC_WATCHER_ENV>
+Environment=STAYC_BUG_DIR=<STAYC_BUG_DIR>
+# FAIL-SAFE (operator ruling 2026-07-16): if STAYC_BUG_FORWARD_MODE is unset / unparseable the
+# watcher resolves to `locked` (count + filename only). A misconfig can NEVER silently escalate
+# to full-body PHI egress. The go-live gate flips the env from `full` back to `locked`.
+ExecStart=<STAYC_WATCHER_PYTHON> -m alfred.scripts.stayc_bug_watcher
+# Hardening — a tiny egress helper; drop what it does not need. NOTE: unlike the clinical unit,
+# this one MUST reach the network (Telegram), so there is NO IPAddressDeny here.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The only writable hole it needs: the bug dir (to persist .forwarded.json state).
+ReadWritePaths=<STAYC_BUG_DIR>
+PrivateTmp=yes
+UMask=0077
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# No [Install] — this .service is triggered by stayc-bug-watcher.path (Type=oneshot), not
+# enabled directly. Enable the .path unit; it starts this on every bug-dir change.
