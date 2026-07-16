@@ -3437,14 +3437,15 @@ def _msg_status(args: argparse.Namespace, config, wants_json: bool) -> None:
     else:
         # Intentionally-left-blank — explicit empty-registry line.
         print("  (no projects registered)")
-    # Malformed drops with no/unknown destination can't be attributed to a receiver —
-    # surface them explicitly so they are not invisible (intentionally-left-blank).
-    unattributed = malformed.get("?", 0)
-    if unattributed:
-        print(
-            f"  (!) {unattributed} malformed message(s) with no/unknown destination "
-            f"in the bin"
-        )
+    # Malformed drops keyed to a NON-registered destination (a typo'd `to`, e.g. "alfredd")
+    # OR with no/unknown destination ("?") can't be attributed to a REGISTERED receiver — so
+    # the per-project loop above never prints them. Surface EACH explicitly so the documented
+    # backstop has no hole (the original incident was exactly an unwatched bin).
+    registered = set(registry.names())
+    orphans = sorted((k, v) for k, v in malformed.items() if k not in registered)
+    for key, m in orphans:
+        label = "no/unknown destination" if key == "?" else f"unregistered `to`: {key}"
+        print(f"  (!) {m} malformed message(s) [{label}] in the bin")
 
 
 def cmd_contract(args: argparse.Namespace) -> None:

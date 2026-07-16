@@ -170,7 +170,7 @@ def _write_bounce(
     body = (
         "Your message was BINNED as malformed by the message bus and NOT delivered.\n\n"
         f"- original id: {record.id or '(unminted)'}\n"
-        f"- original kind: {record.kind or '(missing)'}\n"
+        f"- original kind: {record.original_kind or record.kind or '(missing)'}\n"
         f"- addressed to: {record.to_project or '(missing)'}\n"
         f"- validation errors: {'; '.join(errors)}\n"
         f"- binned file: {_MALFORMED_DIR}/{binned_name}\n\n"
@@ -268,29 +268,15 @@ def scan_spool(
             _quarantine(md_file, spool_root, _MALFORMED_DIR, "parse_failed")
             continue
 
-        # TOLERANT+TAG: an unknown (present) kind is enum DRIFT between projects, not a
-        # broken message — accept it as ``fyi`` and RECORD the original kind so the receiver
-        # sees the drift, rather than malform-binning it (the 2026-07-16 incident: rrts sent
-        # kind=propose before the bus learned that contract kind). Known message kinds and
-        # contract kinds (dispatched to the solver) pass through untouched.
-        if record.kind and record.kind not in _ACCEPTED_KINDS:
-            log.warning(
-                "msgbus.route.unknown_kind_tolerated",
-                path=str(md_file), id=record.id,
-                original_kind=record.kind, to=record.to_project,
-                detail="unknown kind accepted as fyi + tagged (schema-tolerance); NOT binned",
-            )
-            record.original_kind = record.kind
-            record.kind = "fyi"
-            result.kind_tolerated += 1
-
-        # Structural validation (the id is mint-if-absent below, so a
-        # missing id is NOT malformed — every OTHER missing field / bad
-        # kind is). Accept BOTH plain message kinds AND contract kinds so a
-        # Layer-2 contract message isn't malform-quarantined.
+        # Structural validation. The id is mint-if-absent below (a missing id is NOT
+        # malformed). A present-but-UNKNOWN ``kind`` is EXCLUDED here — it is tolerable enum
+        # drift, handled AFTER this gate (below): a message that is ALSO structurally broken
+        # must be BINNED + BOUNCED reporting the REAL kind, and must NOT be double-counted as
+        # tolerated. Accept BOTH plain message kinds AND contract kinds. (An EMPTY "missing
+        # kind" STAYS structural — a message that named no kind at all IS broken.)
         structural = [
             e for e in validate_record(record, valid_kinds=_ACCEPTED_KINDS)
-            if e != "missing id"
+            if e != "missing id" and not e.startswith("invalid kind:")
         ]
         if structural:
             log.warning(
@@ -301,7 +287,9 @@ def scan_spool(
             result.malformed += 1
             binned_name = md_file.name  # _quarantine preserves the name on the happy path
             _quarantine(md_file, spool_root, _MALFORMED_DIR, "; ".join(structural))
-            # BOUNCE to the sender so the bin is not silent (intentionally-left-blank).
+            # BOUNCE to the sender so the bin is not silent (intentionally-left-blank). The
+            # record's kind is NOT rewritten (tolerance is deferred below), so the bounce
+            # reports the REAL kind the sender used.
             if _write_bounce(record, structural, binned_name, registry):
                 result.bounced += 1
             continue
@@ -325,6 +313,23 @@ def scan_spool(
             result.skipped_dup += 1
             _quarantine(md_file, spool_root, _ROUTED_DIR, "already_routed")
             continue
+
+        # TOLERANT+TAG (applied ONLY to a message that is otherwise ELIGIBLE — structurally
+        # sound + deliverable + not a dup): a present-but-UNKNOWN kind is enum DRIFT between
+        # projects, not a broken message — accept it as ``fyi`` and RECORD the original so the
+        # receiver sees the drift (the 2026-07-16 incident: rrts sent an unknown kind). Doing
+        # this AFTER the gates means a binned/undeliverable message is never tolerated-counted
+        # and its bounce reports the real kind. Known message + contract kinds pass untouched.
+        if record.kind and record.kind not in _ACCEPTED_KINDS:
+            log.warning(
+                "msgbus.route.unknown_kind_tolerated",
+                path=str(md_file), id=record.id,
+                original_kind=record.kind, to=record.to_project,
+                detail="unknown kind accepted as fyi + tagged (schema-tolerance); NOT binned",
+            )
+            record.original_kind = record.kind
+            record.kind = "fyi"
+            result.kind_tolerated += 1
 
         result.eligible.append(record)
         result.eligible_paths.append(md_file)
