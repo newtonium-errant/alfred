@@ -814,11 +814,23 @@ def test_pwa_only_free_text_inputs_are_token_and_voiceprint_name():
     assert code.count("<input") == 3, "a new <input> appeared in the client"
     ids = set(re.findall(r"<input[^>]*\bid=\"([a-z0-9_-]+)\"", code))
     assert ids == {"tok", "nm", "nm2"}, f"unexpected free-text input(s): {ids}"
-    # no OTHER text-capturing control may be injected by the JS either (the served-HTML
-    # scan cannot see these — they are built at runtime).
+    # no text-capturing control may be injected by the JS at RUNTIME (a JS-built patient field
+    # is the real injection surface — the served-HTML scan cannot see runtime-built controls).
     for banned in ("<textarea", "contenteditable"):
         assert banned not in code, f"JS-injected text control: {banned}"
-        assert banned not in render_index(_TOKEN).lower()
+    # The ONLY static-HTML free-text beyond the JS ones is the task-#4 bug-report form: exactly
+    # one <input id="bug-summary"> + one <textarea id="bug-detail">, and NOTHING else (no
+    # contenteditable, no second textarea). It is a diagnostic surface with its own PHI-caution
+    # banner and lives OUTSIDE the record view (pinned above) — never a patient/encounter field.
+    html = render_index(_TOKEN)
+    assert html.lower().count("<textarea") == 1               # ONLY the bug detail
+    assert 'id="bug-detail"' in html
+    assert "contenteditable" not in html.lower()
+    static_inputs = set(re.findall(r"<input[^>]*\bid=\"([a-z0-9_-]+)\"", html))
+    assert static_inputs == {"bug-summary"}, f"unexpected static <input>(s): {static_inputs}"
+    # the bug form carries the "no patient details" caution + is not in the record view.
+    bug_section = html.split('<section id="bug"')[1].split("</section>")[0].lower()
+    assert "patient details" in bug_section and "banner" in bug_section
     # the token field is a password box, never autofilled, and never persisted.
     assert re.search(r"<input id=\"tok\" type=\"password\" autocomplete=\"off\"", code)
     # the NAME fields carry the memo's guidance + the backend's 64-char cap.
@@ -1329,6 +1341,57 @@ def test_behaviour_empty_token_paste_is_not_a_dead_continue(tmp_path):
     assert res["enrollStartAfterEmpty"] is False         # an empty paste opened no session
     assert res["micOpensAfterEmpty"] == 0                # ...and no mic
     assert res["hasEnGoAfterValid"] is True              # the SAME Continue then advanced — not dead
+
+
+# ── Task #4: bug report — capture UI (button both views, ring buffer, visible confirm/fail) ─
+
+def test_behaviour_bug_report_carries_phi_free_context_and_ring_and_confirms(tmp_path):
+    # The incident, end to end: with NO clinician configured, tapping "Create a voiceprint"
+    # rings a breadcrumb; the bug report then POSTs that trace + PHI-FREE auto-context and
+    # confirms VISIBLY. This is exactly the diagnosability the 2026-07-16 dead-button bug lacked.
+    res = _drive("bug_report_flow", tmp_path)
+    assert res["bugOpenNotHidden"] is True                    # the form opened (visible)
+    posts = res["bugPosts"]
+    assert len(posts) == 1, posts
+    post = posts[0]
+    assert post["summary"] == "button does nothing"
+    ctx = post["context"]
+    assert ctx["view"] == "#/presets" and ctx["clinicians_len"] == 0 and ctx["user"] == ""
+    assert "HarnessUA" in ctx["ua"] and ctx["client_ts"]      # PHI-free context attached
+    # the RAM ring snapshot rode along AND carried the exact code-path breadcrumb.
+    assert isinstance(post["events"], list) and post["events"]
+    assert any("blocked: no clinician configured" in e for e in post["events"])
+    assert "Thank you" in res["bugMsg"]                       # VISIBLE confirm
+
+
+def test_behaviour_bug_report_empty_is_not_a_silent_noop(tmp_path):
+    # ILB — sending an empty report renders a message and POSTs nothing (never a silent no-op).
+    res = _drive("bug_report_empty", tmp_path)
+    assert "Please describe the problem" in res["bugMsg"]
+    assert res["bugPosts"] == []                              # nothing sent
+
+
+def test_behaviour_bug_report_server_error_shows_visible_failure(tmp_path):
+    # A non-2xx response renders a VISIBLE failure (intentionally-left-blank), never a silent
+    # swallow — the operator knows the report did not land.
+    res = _drive("bug_report_server_error", tmp_path)
+    assert len(res["bugPosts"]) == 1                          # it tried
+    assert "Could not send" in res["bugMsg"] and "500" in res["bugMsg"]
+
+
+def test_pwa_bug_affordance_on_both_views_and_ring_is_memory_only():
+    # STRUCTURAL — a "Report a problem" affordance on BOTH views, and the ring buffer is
+    # memory-only (no storage), PHI-free (status-code + breadcrumb, capped).
+    html = render_index(_TOKEN)
+    record = html.split('<section id="view-record">')[1].split("</section>")[0]
+    presets = html.split('<section id="view-presets"')[1].split("</section>")[0]
+    assert 'id="bug-open-record"' in record and 'id="bug-open-presets"' in presets
+    code = _code()
+    # ring is an in-memory array, capped, memory-only (no storage APIs — covered by the
+    # no-browser-storage test; here pin the cap + snapshot-on-submit).
+    assert "const bugRing = []" in code and "BUG_RING_MAX" in code
+    assert "bugRing.slice()" in code                          # a SNAPSHOT rides the POST
+    assert "'/scribe/bug'" in code                            # posts to the ingest-token route
 
 
 # ── N6: esc() is the attribute-context belt ─────────────────────────────────

@@ -55,6 +55,7 @@ const cfg = {
   clinicians: ['np_jamie'],
   instantWindow: false,
   micLabel: 'Built-in Mic',
+  bugStatus: 200,                    // task #4 — POST /scribe/bug response status
   // SUSPENSION GATES — hold an await open so a teardown can be interposed mid-flight. Each is
   // a promise the interaction code resolves after it has navigated away. Used ONLY by the
   // await-teardown scenarios (the generation-token BLOCK); the ordinary flows resolve instantly.
@@ -172,11 +173,17 @@ switch (scenario) {
   // QA finding 7 — the empty-paste Continue in needEnrollToken must not leave a dead button.
   case 'enroll_empty_token_then_valid':
     cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.serverState = 'ok'; break;
+  // task #4 — bug report. flow: NO clinician (the incident) so the ring carries the block.
+  case 'bug_report_flow':
+    cfg.clinicians = []; break;
+  case 'bug_report_server_error':
+    cfg.bugStatus = 500; break;
   default: break;
 }
 
 // ═══ 3. shims ═════════════════════════════════════════════════════════════════
 const calls = [];
+const bugPosts = [];               // task #4 — the parsed POST /scribe/bug bodies
 const INGEST_TOKEN = 'INGEST_TOK';
 const ENROLL_TOKEN = 'ENROLL_TOK';
 
@@ -254,7 +261,10 @@ class El {
 
 for (const id of ['status', 'start', 'stop', 'picker', 'preset-msg', 'chip', 'who', 'who2',
                   'presets-list', 'new-preset', 'enroll', 'enroll-title', 'enroll-body',
-                  'nav-record', 'nav-presets', 'view-record', 'view-presets']) {
+                  'nav-record', 'nav-presets', 'view-record', 'view-presets',
+                  // task #4 bug-report surface (static in the page; the app wires them at boot)
+                  'bug-open-record', 'bug-open-presets', 'bug', 'bug-summary', 'bug-detail',
+                  'bug-send', 'bug-cancel', 'bug-msg']) {
   registry.set(id, new El(id));
 }
 
@@ -338,6 +348,12 @@ async function fetchShim(url, opts) {
     if (cfg.holdEnrollResult && !resultHeld) { resultHeld = true; await enrollResultGate.p; }
     return json({ state: 'done', verdict: 'ok', preset_id: 'pst-x', stats: {} });
   }
+  if (url.startsWith('/scribe/bug')) {
+    // task #4 — capture the POSTed body so the test can assert the client's wire contract
+    // (PHI-free context + the ring snapshot). bugStatus drives the confirm/failure branches.
+    try { bugPosts.push(JSON.parse(o.body || '{}')); } catch (e) { bugPosts.push({ _parseError: true }); }
+    return json({ bug_id: 'bug-1' }, cfg.bugStatus);
+  }
   return json({});
 }
 
@@ -365,6 +381,7 @@ const windowShim = {
 // that actually binds the consent property (a refusal that still opened the mic is a fail).
 const micOpens = { n: 0 };
 const navigatorShim = {
+  userAgent: 'HarnessUA/1.0',
   mediaDevices: {
     getUserMedia: async () => {
       micOpens.n += 1;
@@ -675,6 +692,34 @@ try {
     el('tok-ok').click();
     await settle(15);
     out.hasEnGoAfterValid = registry.has('en-go');     // it advanced → not dead
+  } else if (scenario === 'bug_report_flow') {
+    // task #4 — the incident, end to end: with NO clinician configured, tapping "Create a
+    // voiceprint" logs a breadcrumb ('blocked: no clinician configured'); the bug report then
+    // carries that trace + PHI-free context, and confirms VISIBLY.
+    await setHash('#/presets');
+    el('new-preset').click();                 // → runEnroll → refuseEnrollNoClinician (rings it)
+    await settle(12);
+    el('bug-open-presets').click();           // open the bug form from the presets view
+    await settle(6);
+    out.bugOpenNotHidden = !el('bug').classList.contains('hide');
+    el('bug-summary').value = 'button does nothing';
+    el('bug-detail').value = 'tapped create, nothing happened';
+    el('bug-send').click();
+    await settle(12);
+    out.bugMsg = el('bug-msg').innerHTML;
+  } else if (scenario === 'bug_report_empty') {
+    el('bug-open-record').click();
+    await settle(6);
+    el('bug-send').click();                   // empty → ILB message, NO post
+    await settle(6);
+    out.bugMsg = el('bug-msg').innerHTML;
+  } else if (scenario === 'bug_report_server_error') {
+    el('bug-open-record').click();
+    await settle(6);
+    el('bug-summary').value = 'something broke';
+    el('bug-send').click();                   // bugStatus 500 → visible failure
+    await settle(12);
+    out.bugMsg = el('bug-msg').innerHTML;
   } else {   // enroll_flow / enroll_finalize_409 / enroll_start_429
     await openEnrollWithToken();
     if (registry.has('en-go')) {
@@ -693,9 +738,11 @@ try {
     out.enrollBody = el('enroll-body').innerHTML;
   }
   out.calls = calls;
+  out.bugPosts = bugPosts;
 } catch (e) {
   out.error = String((e && e.stack) || e);
   out.calls = calls;
+  out.bugPosts = bugPosts;
 }
 console.log(JSON.stringify(out));
 process.exit(0);
