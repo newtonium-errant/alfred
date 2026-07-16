@@ -1401,6 +1401,10 @@ def _build_drafter_prompt(title: str, body: str) -> str:
 # — operator-ACCEPTED residual — pairs with the preamble hardening. Scans only
 # ADDED lines (the model's contribution). Returns the matched pattern CLASSES,
 # never the matched values (so a PHI hit is never itself logged).
+# MIRROR: _DRAFTER_PREAMBLE's PRIVACY block lists these keyword classes to the
+# model so its analysis avoids tripping this scan (a hit discards the draft). If
+# you ADD/REMOVE a keyword here, update that list too, or the model's guidance
+# silently drifts out of sync with the scanner.
 _PHI_DIFF_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
     # a run of 9+ digits (allowing spaces/dashes): phone / health-card / SIN shape.
