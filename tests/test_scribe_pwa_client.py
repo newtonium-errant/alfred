@@ -565,6 +565,68 @@ def test_browser_convention_asset_paths_are_pinned_literals():
     assert iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE == "/apple-touch-icon-precomposed.png"
 
 
+def test_sized_apple_touch_probe_is_quiet_404_no_warning(tmp_path):
+    # Bundled nit — the ingest server never 404'd an unknown path: a SIZED apple-touch probe
+    # (/apple-touch-icon-120x120.png; NOT one of the two canonical exempt paths) is a no-auth
+    # browser fetch for an asset that does not exist, but it used to land in the bearer branch
+    # and log a warning-level rejected(bad_token) 401 — the favicon-spam class one probe-family
+    # later. It must now be a QUIET 404 with NO warning-level rejected log.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                async with s.get(base + "/apple-touch-icon-120x120.png") as r:   # NO bearer
+                    st = r.status
+        return st, caps
+
+    st, caps = asyncio.run(_go())
+    assert st == 404
+    rejects = [c for c in caps if c.get("event") == "scribe.ingest_web.rejected"
+               and "apple-touch-icon-120x120" in str(c.get("route", ""))]
+    assert rejects == [], f"a sized apple-touch probe must not warn: {rejects}"
+
+
+def test_sized_apple_touch_probe_with_token_is_not_masked(tmp_path):
+    # The quiet-404 is gated on no-auth + GET so it can NEVER swallow a credentialed request:
+    # a sized apple-touch path WITH a valid ingest token still reaches normal routing (404 from
+    # the router — no such route — but NOT via the silent-probe short-circuit).
+    cfg = _config(tmp_path)
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            async with s.get(base + "/apple-touch-icon-120x120.png",
+                             headers={"Authorization": f"Bearer {_TOKEN}"}) as r:
+                return r.status
+
+    assert asyncio.run(_go()) == 404     # router 404 (no route) — the request was authorized first
+
+
+def test_bearer_reason_split_no_token_vs_bad_token(tmp_path):
+    # Bundled nit — the rejected-log reason now distinguishes NO Authorization (a benign
+    # unauthenticated fetch) from a WRONG token (a credential probe). Both still 401 on an API
+    # route, but the log reads no_token vs bad_token so the two signals are separable.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                async with s.get(base + iw.STATUS_ROUTE, params={"label": _LABEL}) as r:  # no auth
+                    out["no_auth"] = r.status
+                async with s.get(base + iw.STATUS_ROUTE, params={"label": _LABEL},
+                                 headers={"Authorization": "Bearer WRONG-TOKEN"}) as r:   # wrong
+                    out["wrong"] = r.status
+        return out, caps
+
+    out, caps = asyncio.run(_go())
+    assert out["no_auth"] == 401 and out["wrong"] == 401
+    reasons = [c.get("reason") for c in caps if c.get("event") == "scribe.ingest_web.rejected"
+               and c.get("route") == iw.STATUS_ROUTE]
+    assert "no_token" in reasons     # the unauthenticated fetch
+    assert "bad_token" in reasons    # the wrong-credential probe
+
+
 def test_manifest_install_has_no_service_worker():
     # The no-residue posture is intact: the install rides the MANIFEST ALONE. No service
     # worker route exists, and no serviceWorker registration / sw.js / Cache-API appears in

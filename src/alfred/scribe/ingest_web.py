@@ -133,6 +133,17 @@ _BEARER_EXEMPT_PATHS: frozenset[str] = frozenset(
     {PAGE_ROUTE, APP_JS_ROUTE} | _INSTALL_ASSET_PATHS
 )
 
+# Conventional-asset probe prefix. WebKit fetches SIZED apple-touch variants
+# (/apple-touch-icon-120x120.png, -152x152-precomposed.png, …) — an open-ended family we do
+# NOT route (the declared <link rel="apple-touch-icon"> suppresses the probe on modern iOS,
+# but a bare/edge probe still arrives). Such a path is NOT one of the two canonical exempt
+# apple-touch paths, so it falls to the bearer branch and — no-auth — would log a
+# warning-level ``bad_token`` 401 (the favicon-spam class, one probe-family later). A
+# no-Authorization GET of this prefix is a browser fetch for an asset that does not exist:
+# answer a QUIET 404 (no warning). The two canonical paths are exempt + served 200 above, so
+# they never reach this test.
+APPLE_TOUCH_ICON_PROBE_PREFIX = "/apple-touch-icon-"
+
 # --- P4-5a — enrollment rides THIS server; TWO-TOKEN capability split ---------
 # The enroll routes require the ``enroll_token`` (biometric-custody capability),
 # DISTINCT from the ingest ``token`` (encounter capability): the `web`/`web_ingest`
@@ -159,21 +170,26 @@ def _authorize_route(
     """Two-token authorization for a non-exempt API route → ``(ok, reason)``.
 
     A token valid for the OTHER capability class → ``wrong_token_class`` (the
-    ``*_wrong_peer`` analog — a real privilege boundary, not a typo); anything else
-    invalid → ``bad_token``. Constant-time compares; fail-closed on an empty
+    ``*_wrong_peer`` analog — a real privilege boundary, not a typo); a WRONG token
+    → ``bad_token``; NO token at all → ``no_token`` (the split lets the log tell a
+    credential probe from an unauthenticated browser fetch — the two are very
+    different signals). Constant-time compares; fail-closed on an empty
     configured/provided token."""
     def _match(tok: str) -> bool:
         return bool(tok and provided and secrets.compare_digest(provided, tok))
+    # NO Authorization vs a WRONG one — a benign no-auth browser fetch should not read
+    # as the same event as someone presenting an invalid credential.
+    miss = "bad_token" if provided else "no_token"
     is_ingest, is_enroll = _match(ingest_tok), _match(enroll_tok)
     if path in ENROLL_TOKEN_ROUTES:
         if is_enroll:
             return True, ""
-        return False, "wrong_token_class" if is_ingest else "bad_token"
+        return False, "wrong_token_class" if is_ingest else miss
     if path == PRESETS_LIST_ROUTE:                       # either token clears metadata
-        return (True, "") if (is_enroll or is_ingest) else (False, "bad_token")
+        return (True, "") if (is_enroll or is_ingest) else (False, miss)
     if is_ingest:                                        # ingest-class (chunk/close/status/encounter-preset)
         return True, ""
-    return False, "wrong_token_class" if is_enroll else "bad_token"
+    return False, "wrong_token_class" if is_enroll else miss
 
 
 # --- PHI-safe helpers -------------------------------------------------------
@@ -314,6 +330,13 @@ def _build_security_middleware(config: ScribeConfig):
             # token; a token valid for the OTHER class → wrong_token_class 401.
             provided = _bearer(request)
             path = request.path
+            # QUIET the browser's conventional-asset probes: a no-Authorization GET of a
+            # sized apple-touch variant is a fetch for an asset that does not exist — a plain
+            # 404, not a warning-level bad_token 401. Gated on GET + no-auth so it can never
+            # mask a real credentialed request to any route.
+            if (request.method == "GET" and not provided
+                    and path.startswith(APPLE_TOUCH_ICON_PROBE_PREFIX)):
+                return _reject("not_found", 404)
             # INERT enrollment face: enroll_token unset ⇒ the enroll-face routes are
             # 404 (the biometric face is ABSENT, not merely unauthorized). The
             # ingest-class routes stay bearer-required as before.
