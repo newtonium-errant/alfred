@@ -239,14 +239,15 @@ def test_page_loads_zero_external_resources():
 
 
 def test_route_table_pins(tmp_path):
-    # 3 API routes (byte-identical to Slice A) + 2 static PWA routes + 6 standalone-install
-    # assets (manifest/icons/favicon/apple-touch-icon ×2).
+    # 3 API routes (byte-identical to Slice A) + POST /scribe/bug (task #4) + 2 static PWA
+    # routes + 6 standalone-install assets (manifest/icons/favicon/apple-touch-icon ×2).
     app = create_ingest_app(_config(tmp_path))
     got = {(r.method, r.get_info().get("path")) for r in app.router.routes()
            if r.method in ("GET", "POST")}
     assert ("POST", iw.INGEST_CHUNK_ROUTE) in got
     assert ("POST", iw.CLOSE_ROUTE) in got
     assert ("GET", iw.STATUS_ROUTE) in got
+    assert ("POST", iw.BUG_ROUTE) in got
     assert ("GET", iw.PAGE_ROUTE) in got
     assert ("GET", iw.APP_JS_ROUTE) in got
     assert ("GET", iw.MANIFEST_ROUTE) in got
@@ -260,7 +261,7 @@ def test_route_table_pins(tmp_path):
     for route in iw._INSTALL_ASSET_PATHS:
         assert ("GET", route) in got, route
     # no extra GET/POST routes crept in — in particular NO /sw.js (no service worker).
-    assert len(got) == 11
+    assert len(got) == 12
     assert not any("sw.js" in path or "serviceworker" in path.lower()
                    for _, path in got), got
 

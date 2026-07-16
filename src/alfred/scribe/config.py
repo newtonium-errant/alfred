@@ -228,6 +228,35 @@ class ScribeIngestWebConfig:
 
 
 @dataclass
+class ScribeBugConfig:
+    """Box-local bug-report capture (task #4).
+
+    The ``POST /scribe/bug`` route (ingest-token gated, NOT exempt) writes PHI-cautious bug
+    reports as ``<ts>-<slug>.md`` files under the resolved bug dir (0600, vault-grade —
+    treat as PHI-until-a-human-says-otherwise). NO egress from the daemon: the separate box
+    watcher component surfaces them off-box.
+
+    INERT-toggleable: ``enabled`` defaults True (the button works once the ingest server is
+    on), but an operator can set it False to 404 the route without disabling the whole server.
+
+    ``dir`` empty ⇒ derived as ``<input_dir parent>/bugs`` at resolve time (so an operator who
+    points ``input_dir`` at ``<STAYC_DATA>/inbox`` gets ``<STAYC_DATA>/bugs`` for free — a
+    per-instance-correct default, never a single-instance literal). LOCAL-BY-CONSTRUCTION: a
+    filesystem path, not a network field — no boundary barrier applies."""
+
+    enabled: bool = True
+    dir: str = ""
+    # Per-report body ceiling — a stuck/abusive client must not fill the disk with one POST.
+    max_body_bytes: int = 8 * 1024
+    # Client-side soft cap (the page enforces + shows it); echoed to the page so the number
+    # lives in ONE place. Not a server gate (the page is memory-only — no server session).
+    max_per_session: int = 10
+    # Server-side disk backstop — the count of UNRESOLVED (top-level) reports over which
+    # POST /scribe/bug returns 429. Bounds disk against a client that ignores its own cap.
+    max_open_reports: int = 200
+
+
+@dataclass
 class ScribeConfig:
     """Typed ``scribe:`` block.
 
@@ -246,6 +275,8 @@ class ScribeConfig:
     # The loopback PWA ingest server (#49). INERT by default; barrier (e)
     # validates its host is loopback + token present when enabled.
     ingest_web: ScribeIngestWebConfig = field(default_factory=ScribeIngestWebConfig)
+    # Box-local bug-report capture (task #4). Rides the ingest server; on by default.
+    bug: ScribeBugConfig = field(default_factory=ScribeBugConfig)
     # Designated human-clinician identities allowed to ATTEST a clinical_note
     # (scribe P2-a, #41). A plain identity list — NOT a network sub-field, so
     # no boundary barrier applies (barriers a/b gate only stt/llm). FAIL-CLOSED:
@@ -360,6 +391,7 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
         llm=_build(ScribeLlmConfig, scribe.get("llm")),
         diarize=_build_diarize(scribe.get("diarize")),
         ingest_web=_build_ingest_web(scribe.get("ingest_web")),
+        bug=_build_bug(scribe.get("bug")),
         clinicians=clinicians,
         encounter_salt=str(scribe.get("encounter_salt") or ""),
         # #57 — scalar fields on ScribeConfig (no _build nesting): string-safe coerce
@@ -499,6 +531,30 @@ def _coerce_secret(value: Any, *, field: str) -> str:
         )
         return ""
     return s
+
+
+def _build_bug(data: Any) -> ScribeBugConfig:
+    """Schema-tolerant build of :class:`ScribeBugConfig` with explicit type coercion
+    (``enabled`` truthy→bool, caps→int) so a YAML string can't slip a wrong-typed field
+    through. Unknown keys dropped by the ``__dataclass_fields__`` filter. A nonsense cap keeps
+    the default (never crashes the load)."""
+    if not isinstance(data, dict):
+        return ScribeBugConfig()
+    known = {k: v for k, v in data.items() if k in ScribeBugConfig.__dataclass_fields__}
+    cfg = ScribeBugConfig()
+    if "enabled" in known:
+        cfg.enabled = coerce_ingest_web_enabled(known["enabled"])
+    if "dir" in known and known["dir"] is not None:
+        cfg.dir = str(known["dir"])
+    for int_field in ("max_body_bytes", "max_per_session", "max_open_reports"):
+        if int_field in known:
+            try:
+                v = int(known[int_field])
+            except (TypeError, ValueError):
+                continue  # keep the default; a nonsense value never crashes the load
+            if v > 0:
+                setattr(cfg, int_field, v)
+    return cfg
 
 
 def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:

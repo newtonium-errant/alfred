@@ -109,6 +109,11 @@ _META_SUFFIX = ".meta.json"
 INGEST_CHUNK_ROUTE = "/scribe/ingest-chunk"
 CLOSE_ROUTE = "/scribe/close"
 STATUS_ROUTE = "/scribe/status"
+# Task #4 — box-local bug capture. INGEST-token gated (the page already holds it), NOT
+# exempt, NOT enroll-class: it falls through the middleware to the ingest-class branch, so no
+# auth wiring beyond registration. Writes PHI-cautious 0600 files via ``scribe.bug``; NO
+# egress (the box watcher surfaces them). Handler-gated on ``bug.enabled`` (404 when off).
+BUG_ROUTE = "/scribe/bug"
 
 # Slice B — the loopback PWA static surface (#49). The page GET is a browser
 # NAVIGATION that cannot carry a bearer, so these two routes are Host-pinned +
@@ -626,6 +631,56 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def _handle_bug(request: web.Request) -> web.StreamResponse:
+    """``POST /scribe/bug`` — capture a box-local bug report (task #4). INGEST-token gated by
+    the middleware (ingest-class). Body: JSON ``{summary, detail, context{}, events[]}``. The
+    per-POST byte cap is enforced HERE (Content-Length pre-check + post-read length) before the
+    open-report disk backstop in ``scribe.bug``. Returns ``{bug_id}`` (200) or an OPAQUE 4xx
+    the UI renders. NO PHI in logs (the summary/detail may carry PHI despite the page caution)."""
+    config: ScribeConfig = request.app["scribe_config"]
+    bug_cfg = config.bug
+    # INERT toggle — an operator can 404 the route without disabling the whole server.
+    if not bug_cfg.enabled:
+        return _reject("bug_inert", 404)
+    # cheap Content-Length pre-check so an honest oversized POST is refused BEFORE buffering.
+    if request.content_length is not None and request.content_length > bug_cfg.max_body_bytes:
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="bug_too_large")
+        return _reject("bug_too_large", 413)
+    try:
+        raw = await request.read()                       # globally bounded by client_max_size
+    except web.HTTPRequestEntityTooLarge:
+        return _reject("bug_too_large", 413)
+    if len(raw) > bug_cfg.max_body_bytes:                # the lying-Content-Length backstop
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="bug_too_large")
+        return _reject("bug_too_large", 413)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="invalid_json")
+        return _reject("invalid_json", 400)
+    if not isinstance(payload, dict):
+        return _reject("invalid_json", 400)
+
+    summary = payload.get("summary") or ""
+    detail = payload.get("detail") or ""
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    # ILB — an entirely empty report is refused VISIBLY (the UI renders the 4xx), never a
+    # silent 200 that writes a contentless file.
+    if not str(summary).strip() and not str(detail).strip():
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="empty_report")
+        return _reject("empty_report", 400)
+
+    from alfred.scribe import bug as bug_mod
+    try:
+        _, bug_id = bug_mod.write_bug_report(
+            config, summary=summary, detail=detail, context=context, events=events)
+    except bug_mod.BugCapRefused as e:
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason=e.reason)
+        return _reject(e.reason, 429)                    # over-cap → explicit 4xx the UI renders
+    return web.json_response({"bug_id": bug_id}, status=200)
+
+
 # --- Slice B static PWA surface (page + app.js) -----------------------------
 
 def _static_headers() -> dict[str, str]:
@@ -729,6 +784,8 @@ def create_ingest_app(config: ScribeConfig) -> web.Application:
     app.router.add_post(INGEST_CHUNK_ROUTE, _handle_ingest_chunk)
     app.router.add_post(CLOSE_ROUTE, _handle_close)
     app.router.add_get(STATUS_ROUTE, _handle_status)
+    # Task #4 — bug capture (ingest-token gated, handler-gated on bug.enabled).
+    app.router.add_post(BUG_ROUTE, _handle_bug)
     # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
     app.router.add_get(PAGE_ROUTE, _handle_page)
     app.router.add_get(APP_JS_ROUTE, _handle_app_js)
