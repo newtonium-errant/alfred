@@ -705,7 +705,8 @@ async def _handle_page(request: web.Request) -> web.StreamResponse:
     # slugs are embedded so the enrolment view can OFFER the identity instead of making it
     # hand-typed — the server matches them VERBATIM, so a typo would fail-close a
     # consented recording with 403.
-    body = render_index(config.ingest_web.token, config.clinicians)
+    body = render_index(config.ingest_web.token, config.clinicians,
+                        bug_max_per_session=config.bug.max_per_session)
     return web.Response(text=body, content_type="text/html", charset="utf-8",
                         headers=_static_headers())
 

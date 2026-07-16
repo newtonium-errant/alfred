@@ -117,6 +117,7 @@ _THEME_COLOR_PLACEHOLDER = "__THEME_COLOR__"
 _MANIFEST_ROUTE_PLACEHOLDER = "__MANIFEST_ROUTE__"
 _FAVICON_ROUTE_PLACEHOLDER = "__FAVICON_ROUTE__"
 _APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER = "__APPLE_TOUCH_ICON_ROUTE__"
+_BUG_MAX_PLACEHOLDER = "__BUG_MAX_PER_SESSION__"
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -153,7 +154,7 @@ _INDEX_HTML = """<!doctype html>
   .hide { display: none; }
 </style>
 </head>
-<body data-ingest-token="__INGEST_TOKEN__" data-clinicians="__CLINICIANS_JSON__">
+<body data-ingest-token="__INGEST_TOKEN__" data-clinicians="__CLINICIANS_JSON__" data-bug-max="__BUG_MAX_PER_SESSION__">
 <h1>STAY-C Scribe &mdash; loopback</h1>
 <nav>
   <a id="nav-record" href="#/record">Record</a>
@@ -217,6 +218,11 @@ APP_JS = r"""'use strict';
   const TOKEN = (document.body && document.body.dataset && document.body.dataset.ingestToken) || '';
   let CLINICIANS = [];
   try { CLINICIANS = JSON.parse(document.body.dataset.clinicians || '[]') || []; } catch (e) { CLINICIANS = []; }
+  // client-side per-session bug-report cap (from config, embedded in the page). A stuck client
+  // must not fill the disk; the server ALSO backstops with max_open_reports (429).
+  let BUG_MAX_PER_SESSION = 10;
+  try { BUG_MAX_PER_SESSION = parseInt(document.body.dataset.bugMax, 10) || 10; } catch (e) { BUG_MAX_PER_SESSION = 10; }
+  let bugSubmitCount = 0;            // MEMORY-ONLY (dies on reload — same no-storage posture)
 
   const WINDOW_MS = 20000;           // encounter window (~20s) — B2 boundary amortized
   const ENROLL_WINDOW_MS = 15000;    // enrollment window (~15s) — memo B2 discipline
@@ -1045,6 +1051,11 @@ APP_JS = r"""'use strict';
       $('bug-msg').textContent = 'Please describe the problem first.';
       return;
     }
+    if (bugSubmitCount >= BUG_MAX_PER_SESSION) {   // per-session cap — visible, never a silent drop
+      $('bug-msg').textContent = 'You have sent the maximum number of reports for now. ' +
+        'Please tell your operator directly.';
+      return;
+    }
     const send = $('bug-send');
     send.disabled = true;
     $('bug-msg').textContent = 'Sending…';
@@ -1054,6 +1065,7 @@ APP_JS = r"""'use strict';
       const r = await api('/scribe/bug', { method: 'POST',
         headers: { 'Content-Type': 'application/json' }, body: body });
       if (r.ok) {
+        bugSubmitCount += 1;                   // count SUCCESSES against the per-session cap
         $('bug-summary').value = ''; $('bug-detail').value = '';
         $('bug-msg').textContent = 'Thank you — your report was sent.';         // VISIBLE confirm
       } else if (r.status === 413) {
@@ -1215,7 +1227,8 @@ MANIFEST_JSON = json.dumps(
 )
 
 
-def render_index(token: str, clinicians: list[str] | None = None) -> str:
+def render_index(token: str, clinicians: list[str] | None = None,
+                 bug_max_per_session: int = 10) -> str:
     """Return the PWA index HTML with the INGEST ``token`` embedded (HTML-attribute
     escaped) for the same-origin JS, plus the ``clinicians`` identity list.
 
@@ -1242,4 +1255,7 @@ def render_index(token: str, clinicians: list[str] | None = None) -> str:
         .replace(_MANIFEST_ROUTE_PLACEHOLDER, MANIFEST_ROUTE)
         .replace(_FAVICON_ROUTE_PLACEHOLDER, FAVICON_ROUTE)
         .replace(_APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER, APPLE_TOUCH_ICON_ROUTE)
+        # the client-side per-session report cap — embedded so the number lives in ONE place
+        # (config), read by the page's bug form. Coerced to a safe int (never a stray value).
+        .replace(_BUG_MAX_PLACEHOLDER, str(max(1, int(bug_max_per_session))))
     )

@@ -56,6 +56,7 @@ const cfg = {
   instantWindow: false,
   micLabel: 'Built-in Mic',
   bugStatus: 200,                    // task #4 — POST /scribe/bug response status
+  bugMaxPerSession: 10,              // task #4 — client-side per-session cap (embedded in page)
   // SUSPENSION GATES — hold an await open so a teardown can be interposed mid-flight. Each is
   // a promise the interaction code resolves after it has navigated away. Used ONLY by the
   // await-teardown scenarios (the generation-token BLOCK); the ordinary flows resolve instantly.
@@ -178,6 +179,8 @@ switch (scenario) {
     cfg.clinicians = []; break;
   case 'bug_report_server_error':
     cfg.bugStatus = 500; break;
+  case 'bug_report_session_cap':
+    cfg.bugMaxPerSession = 2; break;   // low cap → the 3rd submit is blocked client-side
   default: break;
 }
 
@@ -269,7 +272,8 @@ for (const id of ['status', 'start', 'stop', 'picker', 'preset-msg', 'chip', 'wh
 }
 
 const body = new El('body', 'body');
-body.dataset = { ingestToken: INGEST_TOKEN, clinicians: JSON.stringify(cfg.clinicians) };
+body.dataset = { ingestToken: INGEST_TOKEN, clinicians: JSON.stringify(cfg.clinicians),
+                 bugMax: String(cfg.bugMaxPerSession) };
 
 const document = {
   body,
@@ -720,6 +724,15 @@ try {
     el('bug-send').click();                   // bugStatus 500 → visible failure
     await settle(12);
     out.bugMsg = el('bug-msg').innerHTML;
+  } else if (scenario === 'bug_report_session_cap') {
+    el('bug-open-record').click();
+    await settle(6);
+    for (let i = 1; i <= 3; i++) {            // cap is 2 → the 3rd is blocked client-side
+      el('bug-summary').value = 'report ' + i;
+      el('bug-send').click();
+      await settle(10);
+      if (i === 3) { out.bugMsg = el('bug-msg').innerHTML; }
+    }
   } else {   // enroll_flow / enroll_finalize_409 / enroll_start_429
     await openEnrollWithToken();
     if (registry.has('en-go')) {

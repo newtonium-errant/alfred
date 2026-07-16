@@ -1379,6 +1379,26 @@ def test_behaviour_bug_report_server_error_shows_visible_failure(tmp_path):
     assert "Could not send" in res["bugMsg"] and "500" in res["bugMsg"]
 
 
+def test_behaviour_bug_report_session_cap_blocks_visibly(tmp_path):
+    # Client-side per-session cap (spec: ~10/session; a stuck client must not fill the disk).
+    # With the cap at 2, the 3rd submit is blocked with a VISIBLE message and does NOT POST —
+    # only the first two land. The server's max_open_reports 429 is the independent backstop.
+    res = _drive("bug_report_session_cap", tmp_path)
+    assert len(res["bugPosts"]) == 2                         # only up to the cap were sent
+    assert "maximum number of reports" in res["bugMsg"]      # ...and the 3rd said so, visibly
+
+
+def test_bug_max_per_session_is_embedded_from_config():
+    # the cap number lives in ONE place (config) and is embedded into the page for the client
+    # to read — a config change propagates (no hardcoded client literal).
+    html = render_index(_TOKEN, ["np_jamie"], bug_max_per_session=3)
+    assert 'data-bug-max="3"' in html
+    assert pwa_assets._BUG_MAX_PLACEHOLDER not in html       # baked out
+    code = _code()
+    assert "BUG_MAX_PER_SESSION" in code and "bugSubmitCount" in code
+    assert "dataset.bugMax" in code                          # read from the page, not hardcoded
+
+
 def test_pwa_bug_affordance_on_both_views_and_ring_is_memory_only():
     # STRUCTURAL — a "Report a problem" affordance on BOTH views, and the ring buffer is
     # memory-only (no storage), PHI-free (status-code + breadcrumb, capped).

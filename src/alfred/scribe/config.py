@@ -248,8 +248,10 @@ class ScribeBugConfig:
     dir: str = ""
     # Per-report body ceiling — a stuck/abusive client must not fill the disk with one POST.
     max_body_bytes: int = 8 * 1024
-    # Client-side soft cap (the page enforces + shows it); echoed to the page so the number
-    # lives in ONE place. Not a server gate (the page is memory-only — no server session).
+    # Client-side per-session cap: embedded into the page (data-bug-max) and enforced by the
+    # bug form (a memory-only success counter blocks over-cap with a visible message). NOT a
+    # server gate — the page is memory-only, so the server can't see a session; the disk
+    # backstop below is the server-side protection. The value lives in ONE place (here).
     max_per_session: int = 10
     # Server-side disk backstop — the count of UNRESOLVED (top-level) reports over which
     # POST /scribe/bug returns 429. Bounds disk against a client that ignores its own cap.
