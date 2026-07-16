@@ -1296,23 +1296,100 @@ def _records_outside_sandbox(
     return True, ""
 
 
+# The fixed file the drafter writes its BACKEND-ADJACENT analysis into (analysis
+# mode, NOT a code fix). One throwaway per-issue branch → a fixed name is fine;
+# kept at the repo root + unmistakably named so the operator spots it in the PR
+# diff. The daemon needs NO knowledge of it — the existing status/add-all/scan/
+# commit/push/PR path (``_fresh_draft`` steps 6–11) carries whatever files the
+# model leaves in the working tree, so a lone analysis file flows through the
+# SAME pipeline unchanged. Referenced by name in ``_DRAFTER_PREAMBLE``; pinned
+# by test.
+_ANALYSIS_FILENAME = "AUTOFIX_ANALYSIS.md"
+
+
+# The drafter went 0-for-3 on backend-adjacent tickets (aftermath-rrts, 2026-07):
+# every failure was a confident CODE PR whose root cause lived where the model
+# cannot see — an n8n workflow, the live DB schema, an endpoint contract, an
+# execution log. A speculative fix there is worse than none (it masks the real
+# defect and burns review). So the drafter now CLASSIFIES first and, when the
+# cause is plausibly backend, produces a marked ANALYSIS instead of guessing
+# code. Frontend-only tickets keep the code-fix path. This is the feed-back step
+# of the drafter's self-correcting loop — the RRTS per-PR feedback is the signal.
 _DRAFTER_PREAMBLE = (
-    "You are drafting a minimal, focused fix for the bug described below, "
-    "inside a checked-out git working tree.\n"
-    "RULES:\n"
-    "- Edit only the files needed for this fix. Keep the change small.\n"
+    "You are triaging a bug report inside a checked-out git working tree and "
+    "producing ONE of two outputs: a minimal CODE FIX, or an ANALYSIS "
+    "document. Which one depends on WHERE the root cause lives — decide that "
+    "FIRST.\n\n"
+    "STEP 1 — CLASSIFY the ticket:\n"
+    "- BACKEND-ADJACENT if the root cause plausibly lives in something you "
+    "CANNOT see in this checkout: an n8n workflow, a live database "
+    "schema/constraint, a server endpoint's request/response contract, or "
+    "execution logs — OR the report describes a FAILING SAVE, a rejected or "
+    "timed-out request, or a Finance / Destinations area. When you are not "
+    "sure, classify BACKEND-ADJACENT — a wrong analysis costs far less than a "
+    "wrong code fix.\n"
+    "- FRONTEND-ONLY if the root cause is fully contained in the client-side "
+    "code present in THIS checkout (rendering, client-side validation, layout, "
+    "local state, copy/labels, a purely local computation) and you can see "
+    "BOTH the defect and its fix without assuming anything about a backend you "
+    "cannot inspect.\n\n"
+    "STEP 2 — PRODUCE THE MATCHING OUTPUT:\n\n"
+    "A) FRONTEND-ONLY → write a minimal, focused CODE FIX:\n"
+    "   - Edit only the files needed for this fix. Keep the change small.\n"
+    "   - You may run the project's tests (pytest / npm test / etc.) to verify.\n"
+    f"   - Do NOT create {_ANALYSIS_FILENAME} in this mode.\n\n"
+    "B) BACKEND-ADJACENT → DO NOT write a speculative code fix. Edit NO source "
+    "files. A backend fix you cannot verify against the real workflow / schema "
+    "/ endpoint is worse than none: it masks the true defect and wastes "
+    f"operator review. Instead write a SINGLE file, `{_ANALYSIS_FILENAME}`, at "
+    "the repo root, and change NOTHING else. That analysis IS the deliverable. "
+    "Use these real markdown sections:\n"
+    "# Auto-fix analysis — NEEDS BOX CONTEXT (not a code fix)\n"
+    "## What the report describes\n"
+    "(one neutral sentence — see PRIVACY; no reported data)\n"
+    "## Hypotheses (most to least likely)\n"
+    "1. <hypothesis> — what in the visible code points to it\n"
+    "## Contract(s) I could not verify\n"
+    "- <the exact request/response shape, workflow response timing, or DB "
+    "column/constraint that decides this bug, and WHY it is invisible from "
+    "this checkout>\n"
+    "## Box evidence that would confirm or refute each hypothesis\n"
+    "- Hypothesis 1: <which n8n node / execution log / table+column to "
+    "inspect>\n"
+    "You MAY use Read/Grep to ground the hypotheses in the frontend code (what "
+    "payload the client sends, what response it expects). You may NOT edit "
+    "source in this mode.\n\n"
+    "UNIVERSAL RULES (both modes):\n"
     "- Do NOT commit, push, open PRs, merge, or touch CI/workflows/secrets.\n"
-    "- You may run the project's tests (pytest / npm test / etc.) to verify.\n"
     "- PRIVACY (LOAD-BEARING): the issue text below may contain SENSITIVE "
     "REPORTED DATA (personal / patient information, names, dates, IDs, "
-    "screenshots-turned-text). This fix PR may land on a PUBLIC repo. NEVER "
+    "screenshots-turned-text). Your output may land on a PUBLIC repo. NEVER "
     "copy ANY reported data, quoted issue text, user-supplied values, names, "
-    "dates, or identifiers into the code you write — no test fixtures, "
-    "comments, log lines, or strings derived from the report. Describe and "
-    "fix the underlying defect GENERICALLY; invent neutral placeholder data "
-    "if a test needs a value.\n"
-    "- When done, print a one-paragraph summary of what you changed "
-    "(the summary is NOT used in the PR — it is discarded).\n\n"
+    "dates, or identifiers into what you write — not into code, test fixtures, "
+    f"comments, log lines, strings, NOR into {_ANALYSIS_FILENAME}. Describe the "
+    "defect GENERICALLY; invent neutral placeholder data if a test needs a "
+    "value. Your output is auto-scanned for obvious personal-data patterns and "
+    f"a SINGLE hit DISCARDS your work — so in {_ANALYSIS_FILENAME} write in "
+    "neutral ENGINEERING terms and DO NOT use clinical or personal-data "
+    "category words (patient, health card, OHIP, SIN, date of birth / DOB, "
+    "medical record / MRN), email addresses, or long digit strings; say 'the "
+    "record', 'the save endpoint', 'the identifier field', 'the Finance entry' "
+    "instead.\n"
+    "- When done, print a one-paragraph summary of what you changed or "
+    "concluded (the summary is NOT used in the PR — it is discarded).\n\n"
+    "EXAMPLES:\n"
+    "- Report: 'Saving a Finance entry after editing one field returns an "
+    "error and the row is not updated.' → BACKEND-ADJACENT (a failing save; "
+    "the endpoint/workflow contract is not in this checkout). Write "
+    f"{_ANALYSIS_FILENAME}: hypothesize the save endpoint requires the COMPLETE "
+    "object and rejects a partial body; state that you cannot see the "
+    "endpoint's required-field schema from the client; list the n8n save "
+    "node's request schema + a failed-save execution log as the confirming "
+    "evidence. Do NOT guess-and-send a 'fix' that posts a partial body.\n"
+    "- Report: 'The postal-code field rejects valid lowercase codes.' → "
+    "FRONTEND-ONLY (a client-side validation rule you can see and fix). Edit "
+    f"the validation and add a neutral test. Do NOT write {_ANALYSIS_FILENAME}."
+    "\n\n"
 )
 
 

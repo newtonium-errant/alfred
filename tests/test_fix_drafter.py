@@ -469,6 +469,50 @@ def test_default_allowed_tools_excludes_git_mutations():
     assert not any("git push" in t for t in _DEFAULT_ALLOWED_TOOLS)
 
 
+def test_drafter_prompt_teaches_backend_adjacent_analysis_mode():
+    """Calibration pin (task #6): the drafter prompt must teach a CLASSIFY-first
+    step with TWO output modes — a code fix for frontend-only tickets, and a
+    marked ANALYSIS file (NOT a speculative code PR) for backend-adjacent ones.
+
+    Backend-adjacent tickets went 0-for-3 (aftermath-rrts) because the drafter
+    guessed code for root causes it could not see. The output channel is
+    prompt-only: the model writes the fixed analysis file and the EXISTING
+    _fresh_draft pipeline (git add -A → commit → push → PR) carries it, so the
+    only surfaces to pin here are the prompt text + the analysis filename.
+    """
+    prompt = fix_drafter._build_drafter_prompt("t", "b")
+    # classify-first, both modes named.
+    assert "BACKEND-ADJACENT" in prompt
+    assert "FRONTEND-ONLY" in prompt
+    # the analysis file is the backend-adjacent deliverable, referenced by the
+    # single-source constant (so the daemon's add-all pipeline commits it).
+    assert fix_drafter._ANALYSIS_FILENAME == "AUTOFIX_ANALYSIS.md"
+    assert fix_drafter._ANALYSIS_FILENAME in prompt
+    # the load-bearing negative rule: no speculative backend code fix.
+    assert "speculative code fix" in prompt
+    assert "Edit NO source" in prompt
+    # ambiguity fails TOWARD analysis (a wrong analysis costs less).
+    assert "classify BACKEND-ADJACENT" in prompt
+    # the analysis structure the operator reads (needs-box-context framing).
+    assert "NEEDS BOX CONTEXT" in prompt
+    assert "Contract(s) I could not verify" in prompt
+    assert "Box evidence" in prompt
+    # PHI discipline extends to the analysis file (it may hit a PUBLIC repo and
+    # is de-PHI-scanned — a keyword hit discards the work; steer to neutral
+    # engineering vocabulary).
+    assert "personal-data category words" in prompt
+
+
+def test_drafter_prompt_preserves_privacy_and_no_push_rules():
+    """The calibration must not drop the pre-existing load-bearing guards:
+    the PRIVACY block and the no-commit/push/merge rule survive the rewrite."""
+    prompt = fix_drafter._build_drafter_prompt("t", "b")
+    assert "PRIVACY (LOAD-BEARING)" in prompt
+    assert "Do NOT commit, push, open PRs, merge" in prompt
+    # the issue title/body are still appended after the preamble.
+    assert prompt.endswith("# Issue: t\n\nb\n")
+
+
 # ---------------------------------------------------------------------------
 # Records isolation (deliverable A) — authoritative records must NOT be
 # under any sandbox-writable dir
