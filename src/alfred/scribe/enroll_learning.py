@@ -20,10 +20,21 @@ diarize_stats ROW SHAPE — the 5b health CONTRACT (frozen here, before rows acc
 The sink is APPEND-ONLY JSONL, so a late schema migration is painful — the fields the
 5b consumer needs are written from day one:
 
-  * ``eligible_turns`` + ``min_turn_s`` — the LATCH DENOMINATOR. The ONE ratified metric
-    is ``match_rate = 1 − unknown/eligible`` where eligible = turns >= ``min_turn_s``.
-    ``role_counts`` alone counts ALL segments, so without ``eligible_turns`` the metric
-    is UNCOMPUTABLE from the rows.
+  * ``eligible_turns`` + ``min_turn_s`` + ``role_counts_eligible`` — the LATCH DENOMINATOR
+    and its SAME-POPULATION numerator (F8). The ONE ratified metric is
+    ``match_rate = 1 − role_counts_eligible['unknown'] / eligible_turns`` where eligible =
+    turns >= ``min_turn_s``. ⚠ NOT ``role_counts['unknown'] / eligible_turns``: ``role_counts``
+    counts ALL segments while ``eligible_turns`` counts only those >= ``min_turn_s`` — mixing
+    the two POPULATIONS makes the ratio ill-defined (short unknown interjections inflate the
+    numerator, so it can exceed 1 and the metric go negative). ``role_counts_eligible`` draws
+    ``unknown`` from the SAME eligible population as the denominator, so ``match_rate`` ∈
+    [0, 1]. ``role_counts`` (ALL segments) is still recorded for provenance, but is NOT the
+    numerator; ``eligible_turns`` alone is insufficient — you need ``role_counts_eligible``.
+  * ``single_cluster`` (F2) — True when the chunk's match reached only ONE cluster, whose
+    separation gate is vacuously cleared (no competitor). Such a chunk is structurally blind
+    to pyannote under-clustering, so its committed conf is capped at ``best_cosine`` upstream
+    and 5b SHOULD weight its evidence down (a single-cluster all-clinician chunk is weaker
+    evidence than a multi-cluster resolved one). Absent/None on pre-F2 rows.
   * ``engine_fingerprint`` — a 5b FILTER KEY. Rows are POISONED for health purposes
     when they come from:
       (a) the FAKE embed seam (``embedding_model == "fake-embed-v1"``), or
@@ -125,6 +136,8 @@ def record_diarize_stats(
     fail_closed_demotions: int,
     extractor: str | None = None,
     eligible_turns: int = 0,
+    role_counts_eligible: dict[str, int] | None = None,
+    single_cluster: bool | None = None,
     min_turn_s: float | None = None,
     diarized: bool = False,
 ) -> None:
@@ -155,6 +168,12 @@ def record_diarize_stats(
             # 5b LATCH DENOMINATOR — match_rate = 1 − unknown/ELIGIBLE, eligible = turns
             # >= min_turn_s. Without these the metric is uncomputable from the sink.
             "eligible_turns": int(eligible_turns),
+            # F8 — SAME-population numerator for match_rate (unknown drawn from the ELIGIBLE
+            # set, so 1 − role_counts_eligible['unknown']/eligible_turns ∈ [0, 1]).
+            "role_counts_eligible": (
+                dict(role_counts_eligible) if role_counts_eligible is not None else None),
+            # F2 — chunk whose match reached only ONE cluster (vacuous separation) → weight down.
+            "single_cluster": single_cluster,
             "min_turn_s": min_turn_s,
             "diarized": bool(diarized),
             "best_cosine": best_cosine, "separation": separation,

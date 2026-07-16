@@ -121,7 +121,11 @@ class ScribeDiarizeConfig:
     # per-cluster-net — a cluster of several individually-sub-floor turns can still SUM to
     # embeddable speech and be extracted, while each of those short segments is (correctly)
     # not counted eligible. Same physical claim ("enough speech to voiceprint"), two
-    # projections. A coupling-pin test asserts both consumers read this field.
+    # projections. Coupling-pin tests drive each PRODUCTION consumer with a non-default
+    # min_turn_s (2.0) and assert the floor/denominator MOVE — pinning the config READ at
+    # BOTH call sites (``diarize._cluster_embeddings_for`` extraction floor +
+    # ``pipeline._record_diarize_stats`` eligible denominator), so a hardcoded-1.0 mutant
+    # at either site dies (see tests/test_scribe_p45c_fixround.py, F7/F9/F10).
     min_turn_s: float = 1.0
     # Directory of named voice-PRESET files (P4-5, multi-preset). Empty = feature
     # DORMANT (inert-by-default): no enrollment, every cluster fails the match →

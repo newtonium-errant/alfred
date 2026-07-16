@@ -647,6 +647,27 @@ def _eligible_turns(segments: list[Segment], min_turn_s: float) -> int:
     return n
 
 
+def _role_counts_eligible(segments: list[Segment], min_turn_s: float) -> dict[str, int]:
+    """F8 — per-role counts among ELIGIBLE segments ONLY (duration >= ``min_turn_s``), the
+    SAME population as ``eligible_turns``. The ratified 5b metric ``match_rate = 1 −
+    unknown/eligible`` drew ``unknown`` from ``role_counts`` (ALL segments) and the
+    denominator from eligible-only — DIFFERENT populations, so the ratio was ill-defined
+    (short unknown interjections inflate the numerator → the metric can go negative). This
+    cross-tab draws the numerator from the eligible population too, so
+    ``1 − role_counts_eligible['unknown'] / eligible_turns`` ∈ [0, 1]. Additive +
+    forward-tolerant (pre-fix rows lack it)."""
+    roles = [
+        normalize_role(s.speaker) for s in segments
+        if math.isfinite(s.end_s - s.start_s) and (s.end_s - s.start_s) >= min_turn_s
+    ]
+    return {
+        "clinician": roles.count(ROLE_CLINICIAN),
+        "patient": roles.count(ROLE_PATIENT),
+        "other": roles.count(ROLE_OTHER),
+        "unknown": roles.count(ROLE_UNKNOWN),
+    }
+
+
 def _record_diarize_stats(
     config: ScribeConfig, *, encounter_id: str, chunk_seq: int | None,
     chunk_tx: Transcript, resolved: "en_mod.ResolvedEnrollment | None",
@@ -663,7 +684,10 @@ def _record_diarize_stats(
     ``match_sink``) is the 5b PLACEHOLDER-ERA DISCRIMINATOR: present ⇒ the real extractor was
     wired for this row (regardless of whether a match succeeded), absent/None ⇒ a pre-P4-5c
     all-unknown row that must be filtered from health. ``eligible_turns`` / ``min_turn_s`` /
-    ``diarized`` are the 5b health contract (see enroll_learning's row-shape docstring)."""
+    ``diarized`` are the 5b health contract (see enroll_learning's row-shape docstring).
+    ``role_counts_eligible`` (F8) is the SAME-population cross-tab so ``match_rate`` is
+    well-defined; ``single_cluster`` (F2, via ``match_sink``) flags a chunk whose match
+    reached only one cluster (vacuous separation) so 5b can weight it down."""
     if not config.diarize.enrollment_dir:
         return
     m = match or {}
@@ -683,6 +707,9 @@ def _record_diarize_stats(
         min_purity=_min_purity(chunk_tx.segments),
         fail_closed_demotions=_fail_closed_demotions(chunk_tx.segments),
         eligible_turns=_eligible_turns(chunk_tx.segments, config.diarize.min_turn_s),
+        role_counts_eligible=_role_counts_eligible(
+            chunk_tx.segments, config.diarize.min_turn_s),
+        single_cluster=m.get("single_cluster"),
         min_turn_s=config.diarize.min_turn_s,
         diarized=bool(chunk_tx.diarized),
     )

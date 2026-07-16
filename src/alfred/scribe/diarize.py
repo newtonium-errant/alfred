@@ -650,15 +650,18 @@ def _fake_cluster_payload(cluster: str, intervals: list[tuple[float, float]]) ->
 
 
 def _log_extraction_result(
-    out: dict[str, list[float]], n_mismatch: int,
+    out: dict[str, list[float]], n_mismatch: int, n_degenerate: int = 0,
     *, expected_dim: int, source_id: str | None,
 ) -> None:
     """Emit the shared extraction observability lines (fake + pyannote seams).
 
     A dim mismatch is ALWAYS surfaced (the engine-compat BELT — a cluster whose embedding
     dim != the enrolled dim is OMITTED, never handed to ``cosine`` to silently score 0.0).
-    An all-empty result AFTER a mismatch is the explicit ``engine_mismatch`` taxonomy branch
-    (distinct from ``no_slices``), so an all-``unknown`` chunk stays diagnosable."""
+    A DEGENERATE embedding (zero / non-finite raw output → :class:`DegenerateEmbeddingError`)
+    is likewise OMITTED (the degeneracy BELT — never canonicalized to e1, which would collide
+    at cosine=1.0), surfaced on its own line. An all-empty result AFTER a mismatch/degeneracy
+    is the explicit ``engine_mismatch`` / ``degenerate`` taxonomy branch (distinct from
+    ``no_slices``), so an all-``unknown`` chunk stays diagnosable."""
     if n_mismatch:
         log.warning(
             "scribe.diarize.extraction_engine_mismatch",
@@ -670,11 +673,23 @@ def _log_extraction_result(
                    "OMITTED (degrade to unknown) rather than compared cross-engine. The "
                    "upstream resolve fingerprint check is the primary gate; this is the belt.",
         )
+    if n_degenerate:
+        log.warning(
+            "scribe.diarize.extraction_degenerate",
+            source_id=source_id,
+            clusters_omitted=n_degenerate,
+            embedded=len(out),
+            detail="a per-cluster embedding was DEGENERATE (zero / non-finite raw output) — "
+                   "cluster(s) OMITTED (degrade to unknown) rather than canonicalized to e1, "
+                   "which is a shared attractor that collides at cosine=1.0 (max-confidence "
+                   "mis-attribution). Fail-closed belt.",
+        )
     if not out:
         log.info(
             "scribe.diarize.extraction_empty",
             source_id=source_id,
-            reason="engine_mismatch" if n_mismatch else "no_slices",
+            reason=("engine_mismatch" if n_mismatch else
+                    "degenerate" if n_degenerate else "no_slices"),
             detail="extraction produced no usable embedding — chunk resolves all-unknown "
                    "(extraction empty, distinct from 'no enrollment').",
         )
@@ -694,14 +709,20 @@ def _fake_cluster_embeddings(
 
     out: dict[str, list[float]] = {}
     n_mismatch = 0
+    n_degenerate = 0
     for cluster in sorted(pooled):
         payload = _fake_cluster_payload(cluster, pooled[cluster])
-        vec = embed_voice.embed_windows(config, [payload])[0]
+        try:
+            vec = embed_voice.embed_windows(config, [payload])[0]
+        except embed_voice.DegenerateEmbeddingError:
+            n_degenerate += 1          # degenerate embedding — OMIT, never e1 (F1 belt)
+            continue
         if len(vec) != expected_dim:
             n_mismatch += 1
             continue
         out[cluster] = vec
-    _log_extraction_result(out, n_mismatch, expected_dim=expected_dim, source_id=source_id)
+    _log_extraction_result(
+        out, n_mismatch, n_degenerate, expected_dim=expected_dim, source_id=source_id)
     return out
 
 
@@ -745,6 +766,7 @@ def _pyannote_cluster_embeddings(
     total = int(waveform.shape[1])
     out: dict[str, list[float]] = {}
     n_mismatch = 0
+    n_degenerate = 0
     for cluster in sorted(pooled):
         slices = []
         for t0, t1 in pooled[cluster]:
@@ -755,12 +777,17 @@ def _pyannote_cluster_embeddings(
         if not slices:
             continue  # every span fell outside the decoded audio (defensive; sub-sample turn)
         pooled_wave = slices[0] if len(slices) == 1 else torch.cat(slices, dim=1)
-        vec = embed_voice.embed_waveform(config, pooled_wave, sample_rate)
+        try:
+            vec = embed_voice.embed_waveform(config, pooled_wave, sample_rate)
+        except embed_voice.DegenerateEmbeddingError:
+            n_degenerate += 1          # degenerate (zero/NaN) embedding — OMIT, never e1 (F1)
+            continue                   # OTHER raises (e.g. torch OOM) PROPAGATE → NOTE-2 fail-open
         if len(vec) != expected_dim:
             n_mismatch += 1
             continue
         out[cluster] = vec
-    _log_extraction_result(out, n_mismatch, expected_dim=expected_dim, source_id=source_id)
+    _log_extraction_result(
+        out, n_mismatch, n_degenerate, expected_dim=expected_dim, source_id=source_id)
     return out
 
 
@@ -892,7 +919,20 @@ def _apply_diarization(
                 "separation": match.separation,
                 "matched": match.matched,
                 "extractor": EXTRACTOR_VERSION,
+                # F2 — # of clusters that REACHED the matcher. A single-cluster chunk
+                # auto-clears separation (structurally blind to under-clustering), so 5b
+                # must be able to see the class and weight its confidence down.
+                "single_cluster": len(match.roles) == 1,
             })
+    # F2 — a SINGLE-cluster chunk auto-clears the separation gate (vacuous second=-1.0),
+    # so purity=1.0 is structurally BLIND to pyannote UNDER-CLUSTERING (two speakers merged
+    # into one cluster). Cap the committed conf at the MATCH QUALITY (best_cosine) for such a
+    # chunk, so a borderline match (best_cosine < purity_threshold) DEMOTES to unknown via the
+    # existing speaker_attribution conf gate — never a vacuous conf=1.0 on possibly-mixed
+    # speech. A strong match (>= purity_threshold) still stands (the frozen matcher
+    # solo-dictation contract, untouched — match_cluster_roles.matched is unchanged).
+    single_cluster_match = (
+        match is not None and match.matched and len(match.roles) == 1)
     # STAGE — compute all assignments first (this is where a raise would happen).
     staged: list[tuple[str | None, float, str]] = []
     for seg in chunk_tx.segments:
@@ -903,7 +943,10 @@ def _apply_diarization(
             role = cluster_roles.get(cluster, ROLE_UNKNOWN)   # unmatched cluster → unknown
         else:
             role = _cluster_to_role(cluster, config)          # no enrollment → unknown
-        staged.append((cluster, _guard_conf(purity), role))
+        conf = _guard_conf(purity)
+        if single_cluster_match and role == ROLE_CLINICIAN:
+            conf = min(conf, _guard_conf(match.best_cosine))  # F2 — conf reflects match quality
+        staged.append((cluster, conf, role))
     # COMMIT — pure assignment, cannot raise. Only speaker/cluster/conf (NOTE-3).
     roles: list[str] = []
     for seg, (cluster, conf, role) in zip(chunk_tx.segments, staged):

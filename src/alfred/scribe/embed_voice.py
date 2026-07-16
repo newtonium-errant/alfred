@@ -58,6 +58,14 @@ _EMBED_SAMPLE_RATE = 16000
 # _load_pipeline_cached): the heavy torch load happens once per staged model.
 _EMBEDDER_CACHE: dict[str, Any] = {}
 _EMBEDDER_CACHE_LOCK = threading.Lock()
+# Serializes concurrent FORWARD PASSES on the shared cached embedder. P4-4 carry-forward
+# checklist item 8 ("cached-pipeline concurrency is safe ONLY while the sweep serializes
+# diarize — re-verify when enrollment-embed runs concurrently") goes LIVE with P4-5c: the
+# diarize sweep now runs extraction (embed_waveform) on a worker thread while enroll finalize
+# runs embed_windows on the SAME cached model from its own thread. The cache lock covers LOAD
+# only; this covers INFERENCE. RTF impact negligible (diarize sweeps already serialize;
+# enrollment is rare) — item 8 CLOSED.
+_EMBED_INFERENCE_LOCK = threading.Lock()
 
 # The embedding dimensionality (wespeaker-voxceleb-resnet34-LM is 256; the fake
 # seam matches it so a fake-enrolled preset validates dim-consistently). The real
@@ -84,6 +92,16 @@ class EmbedError(Exception):
     """Voice embedding failed — unknown provider, unusable input, engine failure."""
 
 
+class DegenerateEmbeddingError(EmbedError):
+    """A raw model embedding is DEGENERATE — zero L2 norm or a non-finite (NaN/±inf)
+    component — so it cannot be unit-normalized without collapsing to the fixed canonical
+    e1 vector. e1 is a SHARED ATTRACTOR: two independent degenerate embeddings (a muted-mic
+    enrollment window, a near-silence extraction cluster) both coerce to e1 and score
+    cosine=1.0 — a maximum-confidence WRONG attribution. Fail-closed instead: the extraction
+    seam OMITS the cluster, the enrollment window path SKIPS the window (both + a log), and
+    NEITHER canonicalizes. Raised by :func:`_unit_normalize`, the single normalization point."""
+
+
 class MissingEmbedDependency(Exception):
     """The ``pyannote`` embedder is configured but the dependency isn't installed.
 
@@ -93,15 +111,18 @@ class MissingEmbedDependency(Exception):
 
 
 def _unit_normalize(vec: list[float]) -> list[float]:
-    """Return ``vec`` scaled to unit L2 norm. A zero / non-finite vector maps to a
-    fixed canonical unit vector (e1) rather than dividing by zero — fail-safe, and
-    the enrollment load-contract's unit-norm check still passes."""
+    """Return ``vec`` scaled to unit L2 norm. A zero / non-finite vector is DEGENERATE and
+    RAISES :class:`DegenerateEmbeddingError` rather than canonicalizing to e1 — canonicalizing
+    is a shared attractor that can collide two silent failures at cosine=1.0 (max-confidence
+    mis-attribution). The callers own the fail-closed degrade (extraction omits the cluster;
+    enrollment skips the window). The deterministic fake embedder fills 256 hash-derived
+    floats (norm ~9), so it never trips this — the fake path is unaffected."""
     norm = math.sqrt(sum(x * x for x in vec))
     if not math.isfinite(norm) or norm <= 0.0:
-        canon = [0.0] * len(vec)
-        if canon:
-            canon[0] = 1.0
-        return canon
+        raise DegenerateEmbeddingError(
+            "raw embedding has zero / non-finite L2 norm — refusing to canonicalize to e1 "
+            "(a shared attractor that collides at cosine=1.0); fail-closed."
+        )
     return [x / norm for x in vec]
 
 
@@ -240,7 +261,8 @@ def _embed_tensor(embedder: Any, waveform: Any, sample_rate: int) -> list[float]
     if sample_rate != _EMBED_SAMPLE_RATE:
         waveform = torchaudio.functional.resample(waveform, sample_rate, _EMBED_SAMPLE_RATE)
     # PretrainedSpeakerEmbedding wants (batch, channel, samples).
-    emb = embedder(waveform.unsqueeze(0))                     # -> (1, dim)
+    with _EMBED_INFERENCE_LOCK:                              # P4-4 item 8 — serialize forwards
+        emb = embedder(waveform.unsqueeze(0))                # -> (1, dim)
     return _unit_normalize([float(x) for x in _as_row(emb)])
 
 

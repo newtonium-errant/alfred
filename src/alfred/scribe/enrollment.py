@@ -124,12 +124,20 @@ def l2_norm(vec: list[float]) -> float:
 
 
 def unit_normalize(vec: list[float]) -> list[float]:
+    """Unit-normalize ``vec``. A zero / non-finite vector is DEGENERATE and RAISES
+    :class:`EnrollmentError` rather than canonicalizing to e1 — the same shared-attractor
+    fail-closed as :func:`embed_voice._unit_normalize` (a degenerate centroid must fail the
+    enrollment loud, never silently become the e1 that collides at cosine=1.0). Reached only
+    on a pathological centroid mean: the per-window embeddings feeding
+    :func:`spherical_mean_centroid` are already valid unit vectors (degenerate windows are
+    skipped upstream at the embed seam), so a zero mean requires antipodal cancellation."""
     n = l2_norm(vec)
     if not math.isfinite(n) or n <= 0.0:
-        canon = [0.0] * len(vec)
-        if canon:
-            canon[0] = 1.0
-        return canon
+        raise EnrollmentError(
+            "cannot unit-normalize a degenerate (zero / non-finite L2 norm) vector — "
+            "refusing to canonicalize to e1 (a shared attractor that collides at "
+            "cosine=1.0); enrollment fails loud instead."
+        )
     return [x / n for x in vec]
 
 
