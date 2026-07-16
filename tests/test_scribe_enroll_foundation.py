@@ -137,9 +137,15 @@ def test_embed_off_gate_and_pyannote_requires_staged_engine():
         embed_windows(_cfg(provider="pyannote"), [b"x"])
 
 
-def test_unit_normalize_zero_vector_is_canonical():
-    z = embed_voice._unit_normalize([0.0] * EMBED_DIM)
-    assert z[0] == 1.0 and abs(math.sqrt(sum(x * x for x in z)) - 1.0) < 1e-9
+def test_unit_normalize_zero_vector_raises_degenerate():
+    # F1 (2026-07-16) — a zero / non-finite raw embedding must RAISE (fail-closed), NEVER
+    # canonicalize to the e1 attractor: two independent degenerate embeddings both coerced
+    # to e1 and scored cosine=1.0, a max-confidence WRONG clinician attribution. The
+    # extraction seam omits the cluster / the enrollment window path skips the window.
+    with pytest.raises(embed_voice.DegenerateEmbeddingError):
+        embed_voice._unit_normalize([0.0] * EMBED_DIM)
+    with pytest.raises(embed_voice.DegenerateEmbeddingError):
+        embed_voice._unit_normalize([float("nan")] + [0.0] * (EMBED_DIM - 1))
 
 
 def test_engine_fingerprint_fake_deterministic():

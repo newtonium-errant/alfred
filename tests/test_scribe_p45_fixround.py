@@ -232,8 +232,9 @@ def test_row_carries_eligible_turns_and_min_turn_s(tmp_path):
 
 
 def test_match_telemetry_wire_reaches_the_row(tmp_path):
-    # best_cosine/separation are None while the per-cluster extraction is the on-box
-    # placeholder — but the WIRE must exist, else they'd stay null forever after on-box.
+    # P4-5c: per-cluster extraction is LIVE, so best_cosine/separation carry the REAL match
+    # score (a real no-match is a genuine 0.0, never None) — the placeholder-era key is the
+    # ``extractor`` MARKER, NOT best_cosine's nullness. The WIRE must exist so the sink populates.
     sink: dict = {}
     match = diarize_mod.match_cluster_roles(
         {"SPEAKER_00": [1.0] + [0.0] * (embed_voice.EMBED_DIM - 1)},
