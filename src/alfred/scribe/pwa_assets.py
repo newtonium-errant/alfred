@@ -23,6 +23,14 @@ once per page-load and lives ONLY in a closure variable; a reload asks again. Th
 also why the preset picker's default (MRU) is SERVER-derived (``mru_preset_id``) — the
 client is not allowed to remember it.
 
+STANDALONE INSTALL (Task #1) — the page ships a Web App Manifest + icons so Chrome ≥108
+installs it as a standalone app (no URL bar) from the MANIFEST ALONE. This adds NO
+service worker, NO Cache-API, NO storage of any kind: it is chrome (the install shell),
+not persistence. Offline support is DELIBERATELY absent — you cannot record to a server
+you cannot reach, and audio must never buffer on-device. The manifest + icons + favicon
+are STATIC and SECRET-FREE (unlike the index page, which embeds the ingest token); the
+no-residue posture above is preserved intact.
+
 R6 (no patient identifiers) — the encounter label is a MACHINE token minted client-side
 (``enc-<13-digit ms>-<16 hex nonce>``); NO DOM value feeds it. The record view has NO
 free-text field at all. The only free-text inputs in the page are (a) the enroll-token
@@ -75,6 +83,15 @@ from __future__ import annotations
 
 import html
 import json
+import struct
+import zlib
+
+# The theme/splash colours — the SINGLE source of truth for both the manifest and the
+# page's ``<meta name="theme-color">`` (baked into the HTML by ``render_index``), so the
+# two can never drift. ``THEME_COLOR`` is the app's primary green (matches the record-view
+# primary button); ``BACKGROUND_COLOR`` is the standalone splash background.
+THEME_COLOR = "#1a7f37"
+BACKGROUND_COLOR = "#ffffff"
 
 # The strict CSP the server sends on the page (and the JS). ``connect-src 'self'`` makes
 # the BROWSER itself refuse any off-box fetch even if the page were tampered — a second
@@ -93,12 +110,16 @@ CSP_VALUE = (
 
 _TOKEN_PLACEHOLDER = "__INGEST_TOKEN__"
 _CLINICIANS_PLACEHOLDER = "__CLINICIANS_JSON__"
+_THEME_COLOR_PLACEHOLDER = "__THEME_COLOR__"
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="__THEME_COLOR__">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/favicon.ico" sizes="any">
 <title>STAY-C Scribe</title>
 <style>
   :root { color-scheme: light dark; }
@@ -648,9 +669,23 @@ APP_JS = r"""'use strict';
       'Ask your operator.</p>';
   }
 
+  // INTENTIONALLY-LEFT-BLANK — the "Create a voiceprint" button must NEVER be a silent
+  // no-op. The old `if (!user) { return; }` did exactly that: with scribe.clinicians empty
+  // (the live 2026-07-16 root cause), tapping Create did literally nothing. Say what is
+  // wrong and who fixes it. The two causes are DISTINCT: no clinician SELECTED (the picker
+  // has options — realistically only the multi-clinician case, since fillWho auto-selects a
+  // sole clinician) vs no clinician CONFIGURED at all (an operator-side fix).
+  function refuseEnrollNoClinician() {
+    $('enroll').classList.remove('hide');
+    $('enroll-title').textContent = 'Select a clinician';
+    $('enroll-body').innerHTML = CLINICIANS.length === 0
+      ? '<p>No clinicians are configured on this machine &mdash; ask your operator.</p>'
+      : '<p>Select a clinician first.</p>';
+  }
+
   // The guided enrolment: record-first, name-last (~45-60s).
   async function runEnroll(rerecordId) {
-    if (!user) { return; }
+    if (!user) { return refuseEnrollNoClinician(); }
     if (recording || micOwner) { return refuseEnrollDuringEncounter(); }
     // An INERT face 404s every enroll route. Refuse HERE — before the token paste and
     // before the mic prompt — rather than asking for both and then failing.
@@ -975,6 +1010,68 @@ APP_JS = r"""'use strict';
 """
 
 
+# ── Standalone-install assets (Task #1): manifest + icons + favicon ───────────────────
+# The routes these are served on. They live HERE (not ingest_web) because the manifest
+# content below references the icon paths — keeping the paths beside the content is the
+# single source of truth (no path drift between the manifest and its route registration).
+# ingest_web imports these for ``app.router.add_get``.
+MANIFEST_ROUTE = "/manifest.webmanifest"
+ICON_192_ROUTE = "/scribe/icon-192.png"
+ICON_512_ROUTE = "/scribe/icon-512.png"
+FAVICON_ROUTE = "/favicon.ico"
+
+_THEME_RGB = (0x1A, 0x7F, 0x37)   # THEME_COLOR as RGB — the solid icon fill
+
+
+def _solid_png(size: int, rgb: tuple[int, int, int]) -> bytes:
+    """A minimal, valid, SECRET-FREE truecolor PNG: a solid ``rgb`` ``size``x``size`` square.
+
+    GENERATED, not embedded — the bytes are provably data-only (no token, no PHI, no
+    external reference), which is the install-icon hard constraint. A solid fill is a valid
+    ``maskable`` icon: every pixel is brand colour, so any launcher mask crop still shows the
+    brand (the safe-zone requirement is trivially met). zlib-compressed, so a 512px square is
+    a few hundred bytes on the wire."""
+    r, g, b = rgb
+    row = b"\x00" + bytes((r, g, b)) * size          # PNG filter byte 0 + `size` RGB pixels
+    raw = row * size
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)   # 8-bit truecolor RGB
+    return (b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw, 9))
+            + _chunk(b"IEND", b""))
+
+
+ICON_192_PNG = _solid_png(192, _THEME_RGB)
+ICON_512_PNG = _solid_png(512, _THEME_RGB)
+FAVICON_PNG = _solid_png(32, _THEME_RGB)
+
+# The Web App Manifest — STATIC and SECRET-FREE (no token, unlike the index page). ``display:
+# standalone`` is what drops the URL bar; the maskable icons are what Chrome ≥108 needs to offer
+# "Add to Home screen" as an installed app. NO ``serviceWorker`` / ``related_applications`` /
+# storage key — installability only (offline is deliberately absent; see the module docstring).
+MANIFEST_JSON = json.dumps(
+    {
+        "name": "STAY-C",
+        "short_name": "STAY-C",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "theme_color": THEME_COLOR,
+        "background_color": BACKGROUND_COLOR,
+        "icons": [
+            {"src": ICON_192_ROUTE, "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": ICON_512_ROUTE, "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    },
+    separators=(",", ":"),
+)
+
+
 def render_index(token: str, clinicians: list[str] | None = None) -> str:
     """Return the PWA index HTML with the INGEST ``token`` embedded (HTML-attribute
     escaped) for the same-origin JS, plus the ``clinicians`` identity list.
@@ -987,10 +1084,14 @@ def render_index(token: str, clinicians: list[str] | None = None) -> str:
     clinician hand-type it: the server matches the slug VERBATIM and fail-closes on a
     mismatch, so a typo would otherwise burn a consented recording on a 403. JSON is
     embedded in a ``data-`` attribute (HTML-attribute escaped, so ``"``/``<`` can never
-    break out) and parsed by the external JS — never an inline script (CSP)."""
+    break out) and parsed by the external JS — never an inline script (CSP).
+
+    The ``<meta name="theme-color">`` is baked from :data:`THEME_COLOR` — the same constant
+    the manifest uses — so the tab/splash colour can never drift from the manifest's."""
     payload = json.dumps(list(clinicians or []))
     return (
         _INDEX_HTML
         .replace(_TOKEN_PLACEHOLDER, html.escape(token, quote=True))
         .replace(_CLINICIANS_PLACEHOLDER, html.escape(payload, quote=True))
+        .replace(_THEME_COLOR_PLACEHOLDER, THEME_COLOR)
     )

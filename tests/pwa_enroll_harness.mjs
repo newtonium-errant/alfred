@@ -164,6 +164,11 @@ switch (scenario) {
     cfg.presets = [{ preset_id: 'pst-a" autofocus onfocus="steal()',
                      name: 'Room "A"', classification: 'usable' }];
     cfg.serverState = 'ok'; break;
+  // Task #3 — scribe.clinicians is EMPTY (the live 2026-07-16 root cause). fillWho renders
+  // "(none configured)" and leaves `user` unset, so "Create a voiceprint" hits runEnroll's
+  // !user guard. It must SPEAK, not silently no-op.
+  case 'enroll_no_clinician_configured':
+    cfg.clinicians = []; break;
   default: break;
 }
 
@@ -638,6 +643,17 @@ try {
     await oneWindow();
     el('en-cancel').click();
     await settle(25);
+  } else if (scenario === 'enroll_no_clinician_configured') {
+    // Task #3 — tapping "Create a voiceprint" with NO clinician configured must render an
+    // explicit, actionable message (never a silent no-op), and must NOT open the mic or a
+    // token prompt (the !user guard is BEFORE needEnrollToken + getUserMedia).
+    await setHash('#/presets');
+    el('new-preset').click();
+    await settle(15);
+    out.enrollBody = el('enroll-body').innerHTML;
+    out.enrollTitle = el('enroll-title').textContent;
+    out.micOpens = micOpens.n;
+    out.hasTokenPrompt = registry.has('tok');
   } else {   // enroll_flow / enroll_finalize_409 / enroll_start_429
     await openEnrollWithToken();
     if (registry.has('en-go')) {

@@ -27,6 +27,7 @@ from pathlib import Path
 
 import aiohttp
 import pytest
+import structlog
 
 from alfred.scribe.config import (
     ScribeConfig,
@@ -237,7 +238,8 @@ def test_page_loads_zero_external_resources():
 
 
 def test_route_table_pins(tmp_path):
-    # 3 API routes (byte-identical to Slice A) + 2 static PWA routes.
+    # 3 API routes (byte-identical to Slice A) + 2 static PWA routes + 4 standalone-install
+    # assets (manifest/icons/favicon).
     app = create_ingest_app(_config(tmp_path))
     got = {(r.method, r.get_info().get("path")) for r in app.router.routes()
            if r.method in ("GET", "POST")}
@@ -246,8 +248,14 @@ def test_route_table_pins(tmp_path):
     assert ("GET", iw.STATUS_ROUTE) in got
     assert ("GET", iw.PAGE_ROUTE) in got
     assert ("GET", iw.APP_JS_ROUTE) in got
-    # no extra GET/POST routes crept in.
-    assert len(got) == 5
+    assert ("GET", iw.MANIFEST_ROUTE) in got
+    assert ("GET", iw.ICON_192_ROUTE) in got
+    assert ("GET", iw.ICON_512_ROUTE) in got
+    assert ("GET", iw.FAVICON_ROUTE) in got
+    # no extra GET/POST routes crept in — in particular NO /sw.js (no service worker).
+    assert len(got) == 9
+    assert not any("sw.js" in path or "serviceworker" in path.lower()
+                   for _, path in got), got
 
 
 def test_inert_default_no_static_surface(tmp_path):
@@ -257,6 +265,178 @@ def test_inert_default_no_static_surface(tmp_path):
     cfg = _config(tmp_path, enabled=False)
     server = asyncio.run(_maybe_start_ingest_server(cfg))
     assert server is None
+
+
+# ---------------------------------------------------------------------------
+# Task #1 — standalone-install surface (manifest + icons) + Task #3 favicon
+# ---------------------------------------------------------------------------
+
+def test_exempt_paths_include_install_assets_and_still_middleware_covered():
+    # The bearer-exempt set EXPANDS to the manifest, both icons, and the favicon — but
+    # they stay under the SAME every-route middleware (Host-pin + loopback + Sec-Fetch-Site),
+    # so no bypass. Pin the additions AND that the page/app.js stay exempt too.
+    assert iw.PAGE_ROUTE in iw._BEARER_EXEMPT_PATHS
+    assert iw.APP_JS_ROUTE in iw._BEARER_EXEMPT_PATHS
+    for route in (iw.MANIFEST_ROUTE, iw.ICON_192_ROUTE, iw.ICON_512_ROUTE, iw.FAVICON_ROUTE):
+        assert route in iw._BEARER_EXEMPT_PATHS, route
+    # exactly these six — nothing else silently joined the bearer-exempt surface.
+    assert iw._BEARER_EXEMPT_PATHS == frozenset({
+        iw.PAGE_ROUTE, iw.APP_JS_ROUTE,
+        iw.MANIFEST_ROUTE, iw.ICON_192_ROUTE, iw.ICON_512_ROUTE, iw.FAVICON_ROUTE,
+    })
+
+
+def test_manifest_served_standalone_and_secret_free(tmp_path):
+    # GET /manifest.webmanifest — NO bearer needed, correct content type, and the
+    # standalone-install fields Chrome ≥108 needs. HARD INVARIANT: SECRET-FREE (neither
+    # token value appears in the served bytes).
+    import json as _json
+    cfg = _config(tmp_path, token="TOKEN_ABC")
+    cfg.ingest_web.enroll_token = "ENROLL_XYZ"      # a 2nd secret that must also never leak
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            async with s.get(base + iw.MANIFEST_ROUTE) as r:   # NO bearer
+                return r.status, r.headers.get("Content-Type"), await r.text()
+
+    st, ctype, body = asyncio.run(_go())
+    assert st == 200
+    assert "application/manifest+json" in ctype
+    m = _json.loads(body)
+    assert m["display"] == "standalone"             # what drops the URL bar
+    assert m["name"] == "STAY-C" and m["short_name"] == "STAY-C"
+    assert m["start_url"] == "/"
+    assert {i["sizes"] for i in m["icons"]} == {"192x192", "512x512"}
+    assert all("maskable" in i["purpose"] for i in m["icons"])   # maskable install icons
+    # SECRET-FREE — grep the served bytes for BOTH token values.
+    assert "TOKEN_ABC" not in body and "ENROLL_XYZ" not in body
+
+
+def test_icons_served_valid_png_and_secret_free(tmp_path):
+    # Both icon routes serve real PNG bytes (192 + 512), no bearer, and SECRET-FREE.
+    import struct
+    cfg = _config(tmp_path, token="TOKEN_ABC")
+    cfg.ingest_web.enroll_token = "ENROLL_XYZ"
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for route, size in ((iw.ICON_192_ROUTE, 192), (iw.ICON_512_ROUTE, 512)):
+                async with s.get(base + route) as r:            # NO bearer
+                    out[size] = (r.status, r.headers.get("Content-Type"), await r.read())
+        return out
+
+    out = asyncio.run(_go())
+    for size, (st, ctype, body) in out.items():
+        assert st == 200 and ctype == "image/png"
+        assert body[:8] == b"\x89PNG\r\n\x1a\n"                 # valid PNG signature
+        w, h = struct.unpack(">II", body[16:24])                # IHDR width/height
+        assert (w, h) == (size, size), (size, w, h)
+        # SECRET-FREE — the raw image bytes carry neither token.
+        assert b"TOKEN_ABC" not in body and b"ENROLL_XYZ" not in body
+
+
+def test_favicon_served_200_and_no_reject_log(tmp_path):
+    # Task #3 — Chrome auto-fetches /favicon.ico on every page load. Before, it was an
+    # un-exempt bearer-required route → 401 → a warning-level scribe.ingest_web.rejected
+    # (reason=bad_token) log per load (4+/session observed). Now it is served 200 and emits
+    # NO rejected log for /favicon.ico.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                # a browser favicon fetch carries NO Authorization header.
+                async with s.get(base + iw.FAVICON_ROUTE) as r:
+                    st, ctype, body = r.status, r.headers.get("Content-Type"), await r.read()
+        return st, ctype, body, caps
+
+    st, ctype, body, caps = asyncio.run(_go())
+    assert st == 200 and ctype == "image/png"
+    assert body[:8] == b"\x89PNG\r\n\x1a\n"
+    rejects = [c for c in caps
+               if c.get("event") == "scribe.ingest_web.rejected" and c.get("route") == iw.FAVICON_ROUTE]
+    assert rejects == [], f"favicon must not emit a rejected log: {rejects}"
+
+
+def test_install_assets_still_host_pinned_rebind_blocked(tmp_path):
+    # The expanded exempt surface stays under the Host-pin (the rebind guard): a DNS-rebind
+    # request carrying an attacker domain as Host is refused (421) on the install assets too.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for route in (iw.MANIFEST_ROUTE, iw.ICON_192_ROUTE, iw.FAVICON_ROUTE):
+                async with s.get(base + route,
+                                 headers={"Host": f"evil.example.com:{cfg.ingest_web.port}"}) as r:
+                    out[route] = r.status
+        return out
+
+    out = asyncio.run(_go())
+    assert all(st == 421 for st in out.values()), out
+
+
+def test_install_assets_still_sec_fetch_site_covered(tmp_path):
+    # ...and under the Sec-Fetch-Site belt: a cross-site fetch of an install asset is refused
+    # (421), while a same-origin fetch (the real manifest/icon fetch) is served. Fail-open on
+    # an absent header (older browsers) — must not break the real install fetch.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            async with s.get(base + iw.MANIFEST_ROUTE, headers={"Sec-Fetch-Site": "cross-site"}) as r:
+                out["cross"] = r.status
+            async with s.get(base + iw.MANIFEST_ROUTE, headers={"Sec-Fetch-Site": "same-origin"}) as r:
+                out["same_origin"] = r.status
+            async with s.get(base + iw.ICON_192_ROUTE) as r:          # absent header → fail-open
+                out["absent"] = r.status
+        return out
+
+    out = asyncio.run(_go())
+    assert out["cross"] == 421            # cross-origin refused
+    assert out["same_origin"] == 200      # the real same-origin manifest fetch served
+    assert out["absent"] == 200           # fail-open — real install fetch not broken
+
+
+def test_page_head_links_manifest_and_theme_color():
+    # The served HTML head wires the standalone install: a <link rel="manifest"> and a
+    # <meta name="theme-color">, whose colour is the SAME constant the manifest uses (single
+    # source of truth — no drift between the tab/splash colour and the manifest).
+    import json as _json
+    html = render_index(_TOKEN)
+    assert '<link rel="manifest" href="/manifest.webmanifest">' in html
+    assert f'<meta name="theme-color" content="{pwa_assets.THEME_COLOR}">' in html
+    assert pwa_assets._THEME_COLOR_PLACEHOLDER not in html   # the placeholder was baked out
+    assert _json.loads(pwa_assets.MANIFEST_JSON)["theme_color"] == pwa_assets.THEME_COLOR
+
+
+def test_manifest_install_has_no_service_worker():
+    # The no-residue posture is intact: the install rides the MANIFEST ALONE. No service
+    # worker route exists, and no serviceWorker registration / sw.js / Cache-API appears in
+    # the manifest, the served page, or the app JS.
+    import json as _json
+    m = _json.loads(pwa_assets.MANIFEST_JSON)
+    assert "serviceworker" not in _json.dumps(m).lower()     # no SW key in the manifest
+    html = render_index(_TOKEN)
+    js = pwa_assets.APP_JS
+    for hay, where in ((html, "page"), (js, "app.js")):
+        for banned in ("serviceWorker", "sw.js", ".register(", "caches.", "CacheStorage"):
+            assert banned not in hay, f"no-SW violation: {banned} in {where}"
+
+
+def test_manifest_and_icon_bytes_are_secret_free_unit():
+    # UNIT belt (no server) — the module-level asset bytes themselves carry neither token,
+    # regardless of what any live config embeds. A future edit that interpolated a secret
+    # into an asset fails here even without a served request.
+    for asset in (pwa_assets.MANIFEST_JSON, pwa_assets.ICON_192_PNG,
+                  pwa_assets.ICON_512_PNG, pwa_assets.FAVICON_PNG):
+        raw = asset.encode() if isinstance(asset, str) else asset
+        # a secret-shaped token embedded via render_index would be the leak vector; the assets
+        # are STATIC (never see the token), so no bearer-shaped substring can be present.
+        assert b"Bearer" not in raw
+        assert b"data-ingest-token" not in raw
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +472,24 @@ def _code(js: str = APP_JS) -> str:
     contains ``//``, so stripping line comments is safe here.)"""
     js = re.sub(r"/\*.*?\*/", "", js, flags=re.DOTALL)
     return re.sub(r"(?m)//.*$", "", js)
+
+
+def test_pwa_runenroll_no_clinician_guard_is_not_silent():
+    # Task #3 — the `if (!user) { return; }` silent no-op in runEnroll is gone (it was an
+    # intentionally-left-blank violation: with scribe.clinicians empty, "Create a voiceprint"
+    # did literally nothing). The guard now renders explicit feedback via
+    # refuseEnrollNoClinician, with copy keyed on CLINICIANS.length. (loadPresets keeps its
+    # OWN silent `if (!user) return` — it is the DATA layer, and renderPresets already speaks;
+    # so scope this to runEnroll's body, not a global grep.)
+    code = _code()
+    run_body = code.split("async function runEnroll(rerecordId) {")[1].split("async function captureEnroll")[0]
+    assert "if (!user) { return; }" not in run_body                # the silent no-op is gone
+    assert "return refuseEnrollNoClinician()" in run_body          # ...replaced by the speaking guard
+    # BOTH copies exist, keyed on whether any clinician is configured at all.
+    helper_body = code.split("function refuseEnrollNoClinician() {")[1].split("\n  }")[0]
+    assert "CLINICIANS.length === 0" in helper_body
+    assert "No clinicians are configured on this machine" in helper_body   # length === 0
+    assert "Select a clinician first" in helper_body                       # a clinician exists, none picked
 
 
 def test_pwa_one_recorder_per_window_no_timeslice():
@@ -362,7 +560,13 @@ def test_pwa_no_browser_storage():
         assert banned not in code, f"R5 violation: {banned} present in CODE"
     assert "cache: 'no-store'" in code                      # belt on every fetch
     html = render_index(_TOKEN)
-    assert "serviceWorker" not in html and "manifest" not in html
+    # NO service worker anywhere in the served page (the no-residue posture). The manifest
+    # link IS now deliberately present (Task #1 standalone install) but carries no storage /
+    # SW semantics — that install-without-a-service-worker invariant is pinned separately in
+    # test_pwa_manifest_install_has_no_service_worker.
+    assert "serviceWorker" not in html
+    assert "sw.js" not in html
+    assert ".register(" not in html
 
 
 def test_pwa_record_view_has_no_free_text_field_and_label_is_machine_minted():
@@ -874,6 +1078,22 @@ def test_behaviour_inert_box_presets_view_hides_create_and_refuses_early(tmp_pat
     assert res["micOpens"] == 0
     paths = [c["url"].split("?")[0] for c in res["calls"]]
     assert "/scribe/enroll/start" not in paths
+
+
+# ── Task #3: the "Create a voiceprint" button never silently no-ops ──────────
+
+def test_behaviour_no_clinician_configured_shows_explicit_feedback(tmp_path):
+    # THE live 2026-07-16 root cause: scribe.clinicians empty ⇒ `user` unset ⇒ the old
+    # `if (!user) { return; }` made "Create a voiceprint" do literally nothing. It must now
+    # render an explicit, actionable message AND never open the mic or a token prompt (the
+    # !user guard fires BEFORE needEnrollToken + getUserMedia).
+    res = _drive("enroll_no_clinician_configured", tmp_path)
+    assert res["enrollTitle"] == "Select a clinician"
+    assert "No clinicians are configured on this machine" in res["enrollBody"]   # length === 0 copy
+    assert res["micOpens"] == 0                          # the mic was never acquired
+    assert res["hasTokenPrompt"] is False               # ...nor a token paste demanded
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" not in paths          # no enrolment session was opened
 
 
 # ── N6: esc() is the attribute-context belt ─────────────────────────────────
