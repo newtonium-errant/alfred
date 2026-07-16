@@ -437,6 +437,36 @@ def test_all_install_assets_served_secret_free(tmp_path):
         assert b"TOKEN_ABC" not in body and b"ENROLL_XYZ" not in body, route
 
 
+def test_install_assets_emit_no_rejected_log_on_browser_fetch(tmp_path):
+    # QA finding 9 (finding 1's log-half) — generalise the favicon no-reject-log pin to the
+    # apple-touch paths, the batch's headline new browser-probe routes (WebKit auto-fetches them
+    # on Add-to-Home-Screen for the operator-ruled iPhone). Finding 1's concern is the
+    # warning-level scribe.ingest_web.rejected spam class, so a plain browser fetch (no bearer,
+    # no Sec-Fetch-Site) of each probe path must be served 200 AND emit NO rejected log for that
+    # route. Enumerate the probe paths BY CONSTANT (not via _INSTALL_ASSET_PATHS): a removal from
+    # the exempt set would drop the path from a set-derived loop and pass vacuously — this pin
+    # must fail if apple-touch/favicon ever falls back to the bearer branch (401 + spam). The
+    # exact-set membership pin (test_exempt_paths_…) covers set drift; this covers the behaviour.
+    cfg = _config(tmp_path)
+    probe_paths = (iw.FAVICON_ROUTE, iw.APPLE_TOUCH_ICON_ROUTE, iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE)
+
+    async def _go():
+        out = {}
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                for route in probe_paths:
+                    async with s.get(base + route) as r:          # NO bearer, no Sec-Fetch-Site
+                        out[route] = r.status
+        return out, caps
+
+    out, caps = asyncio.run(_go())
+    for route in probe_paths:
+        assert out[route] == 200, (route, out[route])
+    rejects = [(c.get("route"), c.get("reason")) for c in caps
+               if c.get("event") == "scribe.ingest_web.rejected" and c.get("route") in probe_paths]
+    assert rejects == [], f"browser-probe assets must not emit a rejected log: {rejects}"
+
+
 def test_install_assets_still_host_pinned_rebind_blocked(tmp_path):
     # The expanded exempt surface stays under the Host-pin (the rebind guard): a DNS-rebind
     # request carrying an attacker domain as Host is refused (421) on EVERY install asset.
@@ -515,6 +545,24 @@ def test_page_head_links_manifest_and_theme_color():
     # theme-color meta is the SAME constant the manifest uses (single source of truth).
     assert f'<meta name="theme-color" content="{pwa_assets.THEME_COLOR}">' in html
     assert _json.loads(pwa_assets.MANIFEST_JSON)["theme_color"] == pwa_assets.THEME_COLOR
+
+
+def test_browser_convention_asset_paths_are_pinned_literals():
+    # QA findings 1/4 completion — the finding-4 fix BAKES the <link> hrefs from the route
+    # constants, which makes a LINK-DRIVEN path (the manifest, whose only fetch is via
+    # <link rel="manifest">) rename-safe: the served page follows the constant. But favicon and
+    # apple-touch are fetched by the browser at HARDCODED conventional literals INDEPENDENT of
+    # any <link>: Chrome auto-requests /favicon.ico on every page load (the observed source of
+    # the Task #3 401 spam), and WebKit probes /apple-touch-icon.png and the no-<link>
+    # /apple-touch-icon-precomposed.png sibling on Add-to-Home-Screen. For these three, baking
+    # the <link> is NOT sufficient — the constant itself must stay the conventional literal, or a
+    # rename silently un-exempts the path the browser still hits and reintroduces the exact 401
+    # warning-spam / degraded home-screen tile this batch shipped to kill, with a green suite
+    # (finding 1's failure scenario). Pin the convention. MANIFEST_ROUTE / ICON_* are
+    # deliberately NOT pinned here — they are link/manifest-driven and rename-safe via the bake.
+    assert iw.FAVICON_ROUTE == "/favicon.ico"
+    assert iw.APPLE_TOUCH_ICON_ROUTE == "/apple-touch-icon.png"
+    assert iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE == "/apple-touch-icon-precomposed.png"
 
 
 def test_manifest_install_has_no_service_worker():
