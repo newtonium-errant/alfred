@@ -875,3 +875,44 @@ def test_msg_inbox_list_shows_kind_drift_and_bin(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "kind-drift: propose\u2192fyi" in out
     assert "in the MALFORMED BIN" in out
+
+
+async def test_route_unknown_kind_plus_structural_break_bins_with_real_kind(tmp_path):
+    # Finding A: a message with BOTH an unknown kind AND a structural break (missing subject)
+    # is BINNED + BOUNCED reporting the REAL kind — NOT tolerated (kind_tolerated stays 0), and
+    # NEVER rewritten to fyi in the bounce or on disk. Tolerance is deferred until AFTER the gates.
+    cfg = _config(tmp_path)
+    spool = Path(cfg.spool_path)
+    _drop(spool, _record(id="msg-c", kind="zorp", subject=""))
+    result = await run_route_once(cfg, {})
+    assert result["malformed"] == 1 and result["bounced"] == 1
+    assert result["kind_tolerated"] == 0 and result["routed"] == 0
+    binned = parse_message_file(list((spool / "malformed").glob("*.md"))[0])
+    assert binned.kind == "zorp"   # binned file keeps the REAL kind (not rewritten)
+    b = parse_message_file(list(cfg.registry().inbox_for("alfred").glob("*.md"))[0])
+    assert "original kind: zorp" in b.body and "original kind: fyi" not in b.body
+    assert "missing subject" in b.body
+
+
+def test_msg_status_surfaces_orphan_and_json_bin(tmp_path, capsys):
+    # Findings B+C: a malformed file addressed to an UNREGISTERED (non-empty) `to` AND one with
+    # no/unknown destination must both surface — on the JSON key AND the text '(!)' backstop.
+    import argparse
+    import json as _json
+    from alfred.cli import _msg_status
+    cfg = _config(tmp_path)
+    mdir = Path(cfg.spool_path) / "malformed"
+    mdir.mkdir()
+    write_message_file(mdir / "a1.md", _record(id="m1", to_project="alfredd", subject=""))
+    (mdir / "junk.md").write_text("no frontmatter, no destination\n")
+    # JSON surface carries both keys (finding C part 1).
+    _msg_status(argparse.Namespace(), cfg, True)
+    data = _json.loads(capsys.readouterr().out)
+    assert data["malformed_bin_by_project"]["alfredd"] == 1
+    assert data["malformed_bin_by_project"]["?"] == 1
+    # Text surface: the orphan '(!)' lines, including the unregistered `to` (finding B).
+    _msg_status(argparse.Namespace(), cfg, False)
+    tout = capsys.readouterr().out
+    assert "(!)" in tout
+    assert "alfredd" in tout                      # unregistered `to` no longer invisible (B)
+    assert "no/unknown destination" in tout       # '?' bucket text (C part 2)
