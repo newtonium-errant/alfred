@@ -52,6 +52,11 @@ class MessageRecord:
     routed_at: str = ""
     routed_by: str = ""
     read_at: str = ""
+    # TOLERANT+TAG: set by the router when the sender used a kind not in
+    # MESSAGE_KINDS|CONTRACT_KINDS — the message is accepted as ``fyi`` (enum drift
+    # between projects is schema drift, not a broken message) and the ORIGINAL kind
+    # is recorded here so the receiver SEES the drift instead of it being binned.
+    original_kind: str = ""
 
 
 def _now_iso() -> str:
@@ -75,6 +80,7 @@ def _frontmatter_dict(record: MessageRecord) -> dict[str, str]:
         ("routed_at", record.routed_at),
         ("routed_by", record.routed_by),
         ("read_at", record.read_at),
+        ("original_kind", record.original_kind),
     ):
         if value:
             fm[key] = value
@@ -106,6 +112,7 @@ def parse_message_file(path: str | Path) -> MessageRecord:
         routed_at=str(fm.get("routed_at", "") or ""),
         routed_by=str(fm.get("routed_by", "") or ""),
         read_at=str(fm.get("read_at", "") or ""),
+        original_kind=str(fm.get("original_kind", "") or ""),
     )
 
 

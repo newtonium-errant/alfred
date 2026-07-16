@@ -3314,13 +3314,25 @@ def _msg_inbox(args: argparse.Namespace, config) -> None:
 
     action = args.inbox_action
     if action == "list":
+        from alfred.msgbus.router import malformed_counts_by_project
+
         records = list_inbox(inbox)
         if not records:
             # Intentionally-left-blank — explicit empty line.
             print(f"  (inbox empty — 0 unread for {project})")
         for r in records:
-            print(f"  {r.id}  [{r.kind}] {r.from_project} → {r.subject}")
+            # TOLERANT+TAG: an unknown sender kind was accepted as fyi — surface the drift.
+            tag = f" (kind-drift: {r.original_kind}→fyi)" if r.original_kind else ""
+            print(f"  {r.id}  [{r.kind}{tag}] {r.from_project} → {r.subject}")
         print(f"unread: {count_unread(inbox)}")
+        # RECEIVER SIGNAL: a routine drain must not miss a message quarantined for this
+        # project — surface the malformed-bin count (intentionally-left-blank).
+        binned = malformed_counts_by_project(config.spool_path).get(project, 0)
+        if binned:
+            print(
+                f"  (!) {binned} message(s) addressed to {project} are in the MALFORMED "
+                f"BIN — see `alfred msg status`"
+            )
     elif action == "read":
         mid = getattr(args, "message_id", "") or ""
         if not mid:
@@ -3382,6 +3394,8 @@ def _msg_route_once(
             f"tick: scanned={result['scanned']} routed={result['routed']} "
             f"skipped_dup={result['skipped_dup']} "
             f"malformed={result['malformed']} "
+            f"bounced={result.get('bounced', 0)} "
+            f"kind_tolerated={result.get('kind_tolerated', 0)} "
             f"undeliverable={result['undeliverable']} "
             f"failed={result['failed']}"
         )
@@ -3393,6 +3407,8 @@ def _msg_status(args: argparse.Namespace, config, wants_json: bool) -> None:
     from alfred.msgbus.inbox import count_unread
     from alfred.msgbus.state import MessageBusState
 
+    from alfred.msgbus.router import malformed_counts_by_project
+
     state = MessageBusState.load(config.state_path)
     registry = config.registry()
     per_project = {
@@ -3400,11 +3416,13 @@ def _msg_status(args: argparse.Namespace, config, wants_json: bool) -> None:
         for name in registry.names()
         if registry.inbox_for(name) is not None
     }
+    malformed = malformed_counts_by_project(config.spool_path)
     summary = {
         "enabled": config.enabled,
         "spool_path": config.spool_path,
         "routed_lifetime": len(state.entries),
         "unread_by_project": per_project,
+        "malformed_bin_by_project": malformed,
     }
     if wants_json:
         print(json.dumps(summary, indent=2))
@@ -3413,10 +3431,20 @@ def _msg_status(args: argparse.Namespace, config, wants_json: bool) -> None:
     print(f"  routed (lifetime): {len(state.entries)}")
     if per_project:
         for name, n in sorted(per_project.items()):
-            print(f"  {name}: {n} unread")
+            m = malformed.get(name, 0)
+            suffix = f"  ({m} in malformed bin!)" if m else ""
+            print(f"  {name}: {n} unread{suffix}")
     else:
         # Intentionally-left-blank — explicit empty-registry line.
         print("  (no projects registered)")
+    # Malformed drops with no/unknown destination can't be attributed to a receiver —
+    # surface them explicitly so they are not invisible (intentionally-left-blank).
+    unattributed = malformed.get("?", 0)
+    if unattributed:
+        print(
+            f"  (!) {unattributed} malformed message(s) with no/unknown destination "
+            f"in the bin"
+        )
 
 
 def cmd_contract(args: argparse.Namespace) -> None:

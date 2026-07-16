@@ -101,6 +101,8 @@ class ScanResult:
     malformed: int = 0
     undeliverable: int = 0
     skipped_dup: int = 0
+    bounced: int = 0        # malformed drops that got a BOUNCE into the sender inbox
+    kind_tolerated: int = 0  # unknown-kind messages accepted as fyi + tagged (not binned)
 
     def __post_init__(self) -> None:
         if self.eligible is None:
@@ -138,6 +140,83 @@ def _quarantine(path: Path, spool_root: Path, subdir: str, reason: str) -> None:
             path=str(path),
             error_type=exc.__class__.__name__,
         )
+
+
+def _write_bounce(
+    record: MessageRecord, errors: list[str], binned_name: str,
+    registry: ProjectRegistry,
+) -> bool:
+    """Write a BOUNCE (kind=reply) into the SENDER's inbox so a malformed drop is not
+    SILENTLY binned (the 2026-07-16 intentionally-left-blank incident: a time-sensitive
+    cross-project request was quarantined with no signal, found only because the operator
+    knew to look). Returns True iff a bounce was written. Best-effort + NEVER raises — a
+    bounce failure must not crash the scan. Only fires when the sender is identifiable AND
+    registered; a message with a missing/unknown ``from`` cannot be bounced (the
+    receiver-side malformed-bin count is the backstop for those)."""
+    sender = record.from_project
+    if not sender or registry.get(sender) is None:
+        log.warning(
+            "msgbus.route.bounce_skipped_no_sender",
+            from_project=sender or "(missing)", id=record.id, errors=errors,
+            detail="malformed message binned but sender unknown/unregistered — cannot "
+                   "bounce; the receiver-side malformed-bin count is the backstop",
+        )
+        return False
+    inbox = registry.inbox_for(sender)
+    if inbox is None:
+        return False
+    created = _now_iso()
+    subject = f"BOUNCED malformed: {record.subject or '(no subject)'}"
+    body = (
+        "Your message was BINNED as malformed by the message bus and NOT delivered.\n\n"
+        f"- original id: {record.id or '(unminted)'}\n"
+        f"- original kind: {record.kind or '(missing)'}\n"
+        f"- addressed to: {record.to_project or '(missing)'}\n"
+        f"- validation errors: {'; '.join(errors)}\n"
+        f"- binned file: {_MALFORMED_DIR}/{binned_name}\n\n"
+        "Fix the flagged field(s) and re-send. (An unknown `kind` is NOT a bounce cause — "
+        "those are accepted as `fyi` with a tag; this bounce means a STRUCTURAL field was "
+        "missing.)"
+    )
+    bounce = MessageRecord(
+        from_project=ROUTED_BY, to_project=sender, kind="reply",
+        correlation_id=record.correlation_id or record.id or "bounce",
+        created=created, subject=subject, body=body,
+        reply_to=record.id, precedence="R", routed_at=created, routed_by=ROUTED_BY,
+    )
+    bounce.id = mint_message_id(
+        bounce.from_project, bounce.to_project, created, subject, body)
+    try:
+        write_message_file(inbox / message_filename(bounce), bounce)
+    except Exception as exc:  # noqa: BLE001 — a bounce write must never crash the scan
+        log.warning("msgbus.route.bounce_write_failed", id=bounce.id, error=str(exc))
+        return False
+    log.info(
+        "msgbus.route.bounced", to=sender, bounce_id=bounce.id,
+        original_id=record.id, errors=errors,
+    )
+    return True
+
+
+def malformed_counts_by_project(spool_path: str | Path) -> dict[str, int]:
+    """Count malformed-bin files grouped by the project they were ADDRESSED TO (``to``) —
+    the RECEIVER-side signal for the intentionally-left-blank fix: a routine inbox drain
+    would otherwise never learn a message meant for it was quarantined. Files that don't
+    parse / carry no ``to`` count under the ``"?"`` bucket (unattributable to a receiver).
+    Never raises (a bad file is skipped). Cheap enough for the status/inbox surfaces."""
+    counts: dict[str, int] = {}
+    mdir = Path(spool_path) / _MALFORMED_DIR
+    if not mdir.exists():
+        return counts
+    for md_file in sorted(mdir.glob("*.md")):
+        if not md_file.is_file():
+            continue
+        try:
+            key = parse_message_file(md_file).to_project or "?"
+        except Exception:  # noqa: BLE001 — an unparseable malformed file is unattributed
+            key = "?"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def _id_in_dir(directory: Path, message_id: str) -> bool:
@@ -189,6 +268,22 @@ def scan_spool(
             _quarantine(md_file, spool_root, _MALFORMED_DIR, "parse_failed")
             continue
 
+        # TOLERANT+TAG: an unknown (present) kind is enum DRIFT between projects, not a
+        # broken message — accept it as ``fyi`` and RECORD the original kind so the receiver
+        # sees the drift, rather than malform-binning it (the 2026-07-16 incident: rrts sent
+        # kind=propose before the bus learned that contract kind). Known message kinds and
+        # contract kinds (dispatched to the solver) pass through untouched.
+        if record.kind and record.kind not in _ACCEPTED_KINDS:
+            log.warning(
+                "msgbus.route.unknown_kind_tolerated",
+                path=str(md_file), id=record.id,
+                original_kind=record.kind, to=record.to_project,
+                detail="unknown kind accepted as fyi + tagged (schema-tolerance); NOT binned",
+            )
+            record.original_kind = record.kind
+            record.kind = "fyi"
+            result.kind_tolerated += 1
+
         # Structural validation (the id is mint-if-absent below, so a
         # missing id is NOT malformed — every OTHER missing field / bad
         # kind is). Accept BOTH plain message kinds AND contract kinds so a
@@ -204,7 +299,11 @@ def scan_spool(
                 errors=structural,
             )
             result.malformed += 1
+            binned_name = md_file.name  # _quarantine preserves the name on the happy path
             _quarantine(md_file, spool_root, _MALFORMED_DIR, "; ".join(structural))
+            # BOUNCE to the sender so the bin is not silent (intentionally-left-blank).
+            if _write_bounce(record, structural, binned_name, registry):
+                result.bounced += 1
             continue
 
         if registry.get(record.to_project) is None:
@@ -263,7 +362,8 @@ async def _run_route_once_locked(
         )
         empty = {
             "scanned": 0, "routed": 0, "contracts_applied": 0,
-            "skipped_dup": 0, "malformed": 0, "undeliverable": 0, "failed": 0,
+            "skipped_dup": 0, "malformed": 0, "bounced": 0, "kind_tolerated": 0,
+            "undeliverable": 0, "failed": 0,
         }
         log.info("msgbus.route.tick", scan_error=True, **empty)
         return {**empty, "scan_error": True, "results": [], "by_destination": {}}
@@ -435,6 +535,8 @@ async def _run_route_once_locked(
         "contracts_applied": contracts_applied,
         "skipped_dup": scan.skipped_dup + post_mint_skipped,
         "malformed": scan.malformed,
+        "bounced": scan.bounced,
+        "kind_tolerated": scan.kind_tolerated,
         "undeliverable": scan.undeliverable + runtime_undeliverable,
         "failed": failed,
     }
@@ -458,7 +560,8 @@ ROUTE_NOW_LOCK_WAIT_SECONDS = 3.0
 def _skipped_locked_result() -> dict[str, Any]:
     return {
         "scanned": 0, "routed": 0, "contracts_applied": 0,
-        "skipped_dup": 0, "malformed": 0, "undeliverable": 0,
+        "skipped_dup": 0, "malformed": 0, "bounced": 0, "kind_tolerated": 0,
+        "undeliverable": 0,
         "failed": 0, "skipped_locked": True, "results": [],
         "by_destination": {},
     }
