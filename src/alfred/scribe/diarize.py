@@ -129,6 +129,18 @@ SCRIBE_DIARIZE_PROVIDERS: frozenset[str] = frozenset({"off", "fake", "pyannote"}
 # Providers that need a heavy dependency (the [scribe-diarize] extra).
 _REAL_ENGINE_PROVIDERS: frozenset[str] = frozenset({"pyannote"})
 
+# The per-cluster embedding EXTRACTOR version stamp (P4-5c). Written onto every
+# ``diarize_stats`` row produced by a REAL extraction pass (threaded out via ``match_sink``
+# → ``pipeline._record_diarize_stats``) so the 5b health filter can tell a POST-extraction
+# row (``best_cosine`` reflects a real K=2 match) from a PLACEHOLDER-era row (the extractor
+# returned ``{}`` → ``best_cosine == 0.0`` on a REAL engine fingerprint — otherwise
+# INDISTINGUISHABLE by content from a genuinely-bad match). Absent/None on a row ⇒
+# placeholder era (POISON for health — the pre-P4-5c all-unknown rows, e.g. Jamie's
+# enc-3734cb79f7255f2b first-use rows). Stamped whenever the real extractor was WIRED
+# (resolved present), NOT only when a match succeeded. Bump only on a health-affecting
+# contract change.
+EXTRACTOR_VERSION: str = "p4-5c"
+
 # The fake-sidecar role-tag syntax → the role WORD ``normalize_role`` folds. An
 # unrecognized bracket token (or no tag) is treated as untagged → ``unknown``.
 _FAKE_ROLE_TAGS: dict[str, str] = {
@@ -279,10 +291,11 @@ def assign_speakers(
     tags (the CI role seam), ``off`` does nothing.
 
     ``match_sink`` (optional) receives the K=2 match TELEMETRY (``best_cosine`` /
-    ``separation`` / ``matched``) so the pipeline can record it into the ``diarize_stats``
-    capture sink. Without this out-param the telemetry existed only in a structlog line
-    and the sink's cosine fields would stay ``None`` FOREVER — including after the on-box
-    per-cluster extraction lands — silently starving the 5b health derivation of its key
+    ``separation`` / ``matched``) plus the ``extractor`` version marker (P4-5c — the 5b
+    placeholder-era discriminator) so the pipeline can record them into the ``diarize_stats``
+    capture sink. Without this out-param the telemetry existed only in a structlog line and
+    the sink's cosine fields would stay ``None`` FOREVER — including now that the on-box
+    per-cluster extraction has LANDED — silently starving the 5b health derivation of its key
     signal."""
     provider = (config.diarize.provider or "").strip().lower()
     if provider == "off":
@@ -516,11 +529,12 @@ def _cluster_to_role(cluster: str | None, config: ScribeConfig) -> str:
     role matching here beyond the fail-safe.
 
     ⚠ P4-5 SEAM NOTE (C3): the ``cluster`` string is a CHUNK-LOCAL pyannote label
-    (``SPEAKER_00`` in chunk 3 ≠ chunk 1's) — it is NOT stable across chunks, so P4-5
-    MUST NOT key roles on the label. It re-anchors each chunk by EMBEDDING match
-    against the stable clinician enrollment, which means P4-5 will need the per-cluster
-    EMBEDDING (or the audio to re-derive it) threaded into this seam — NOT built here
-    (this signature stays cluster+config until then).
+    (``SPEAKER_00`` in chunk 3 ≠ chunk 1's) — it is NOT stable across chunks, so roles are
+    NEVER keyed on the label. The embedding-anchored re-resolution IS built (P4-5c): it
+    lives in :func:`match_cluster_roles` (the K=2 matcher) fed by :func:`_cluster_embeddings_for`
+    (real per-cluster extraction), NOT in this seam — which correctly stays the
+    no-enrollment fallback (signature intentionally cluster+config, never extended to take
+    an embedding).
 
     P4-5 STATUS: this stays the NO-ENROLLMENT fallback (``resolved is None``) — still
     all-``unknown``. The enrollment-anchored resolution is :func:`match_cluster_roles`
@@ -594,19 +608,220 @@ def match_cluster_roles(
     return ClusterMatch(roles=roles, best_cosine=best, separation=separation, matched=matched)
 
 
-def _cluster_embeddings_for(
-    config: ScribeConfig, audio_path: str | Path, turns: list[Turn],
-) -> dict[str, list[float]]:
-    """Per-cluster speaker EMBEDDING for the K=2 match — the ON-BOX PLACEHOLDER seam.
+def _pool_turns_by_cluster(
+    turns: list[Turn], *, min_speech_s: float,
+) -> dict[str, list[tuple[float, float]]]:
+    """Group VALID turns by cluster label → each cluster's speech as NON-OVERLAPPING
+    merged intervals, DROPPING any cluster whose NET pooled speech is below ``min_speech_s``.
+    Pure + torch-free — the CI-testable HEART of the extraction (the pyannote seam only adds
+    audio slicing + the embedder around this).
 
-    Extracting a wespeaker embedding per pyannote cluster from the chunk audio (slice
-    the cluster's turns → embed the pooled speech) is a P4-4 dependency: it needs the
-    real torch embedder + cluster→audio slicing, which land on-box, not in torch-free
-    CI. Until then this returns ``{}`` → :func:`match_cluster_roles` resolves ALL
-    clusters ``unknown`` — IDENTICAL to the P4-4 all-unknown end-state, so wiring the
-    matcher in changes NO on-box behavior yet, but the matcher + the ``resolved``
-    threading + the capture seam are all in place for the extraction to slot into.
-    The matcher itself is CI-covered against the ``embed_voice`` FAKE seam directly."""
+    Per cluster: collect its ``(start, end)`` spans, MERGE them (B2 — same-cluster overlaps
+    counted ONCE, so a duplicated/overlapping turn never inflates the net), sum the merged
+    interval lengths = NET pooled speech. A cluster with ``< min_speech_s`` net speech is
+    OMITTED — too little to voiceprint reliably; it degrades to ``unknown`` via the matcher's
+    absence, NEVER embedded as noise. Inputs are pre-validated (finite + ``end > start``);
+    the caller (:func:`_apply_diarization`) partitions once and passes ``valid_turns``.
+
+    ``min_speech_s`` is ``config.diarize.min_turn_s`` — the SHARED calibrate knob, applied
+    here to per-cluster NET speech. This is a DIFFERENT projection than the 5b per-SEGMENT
+    eligible denominator (:func:`pipeline._eligible_turns`), which reads the SAME field: a
+    cluster of several individually-sub-floor turns can still SUM to embeddable speech, so
+    the extraction floor is net-per-cluster while the health denominator is per-segment.
+    Tuning the one field moves BOTH (deliberate coupling — see the config.py docstring)."""
+    by_cluster: dict[str, list[tuple[float, float]]] = {}
+    for t0, t1, cluster in turns:
+        by_cluster.setdefault(cluster, []).append((t0, t1))
+    pooled: dict[str, list[tuple[float, float]]] = {}
+    for cluster, spans in by_cluster.items():
+        merged = _merge_intervals(spans)
+        net = sum(b - a for a, b in merged)
+        if net >= min_speech_s:
+            pooled[cluster] = merged
+    return pooled
+
+
+def _fake_cluster_payload(cluster: str, intervals: list[tuple[float, float]]) -> bytes:
+    """Deterministic bytes for the fake embed seam from a cluster's label + merged
+    intervals — stable per ``(label, geometry)`` so the fake extraction is reproducible.
+    NOT a real voiceprint; a CI fixture that exercises the pool/floor/dim-guard path."""
+    parts = [cluster] + [f"{a:.6f}-{b:.6f}" for a, b in intervals]
+    return "|".join(parts).encode("utf-8")
+
+
+def _log_extraction_result(
+    out: dict[str, list[float]], n_mismatch: int,
+    *, expected_dim: int, source_id: str | None,
+) -> None:
+    """Emit the shared extraction observability lines (fake + pyannote seams).
+
+    A dim mismatch is ALWAYS surfaced (the engine-compat BELT — a cluster whose embedding
+    dim != the enrolled dim is OMITTED, never handed to ``cosine`` to silently score 0.0).
+    An all-empty result AFTER a mismatch is the explicit ``engine_mismatch`` taxonomy branch
+    (distinct from ``no_slices``), so an all-``unknown`` chunk stays diagnosable."""
+    if n_mismatch:
+        log.warning(
+            "scribe.diarize.extraction_engine_mismatch",
+            source_id=source_id,
+            expected_dim=expected_dim,
+            clusters_omitted=n_mismatch,
+            embedded=len(out),
+            detail="a per-cluster embedding dim != the enrolled preset dim — cluster(s) "
+                   "OMITTED (degrade to unknown) rather than compared cross-engine. The "
+                   "upstream resolve fingerprint check is the primary gate; this is the belt.",
+        )
+    if not out:
+        log.info(
+            "scribe.diarize.extraction_empty",
+            source_id=source_id,
+            reason="engine_mismatch" if n_mismatch else "no_slices",
+            detail="extraction produced no usable embedding — chunk resolves all-unknown "
+                   "(extraction empty, distinct from 'no enrollment').",
+        )
+
+
+def _fake_cluster_embeddings(
+    config: ScribeConfig, pooled: dict[str, list[tuple[float, float]]],
+    *, expected_dim: int, source_id: str | None,
+) -> dict[str, list[float]]:
+    """Torch-free CI extraction: embed a DETERMINISTIC per-cluster payload (the cluster
+    label + its merged intervals) through the ``embed_voice`` FAKE seam → a 256-dim unit
+    vector. Exercises the pool/floor/dim-guard logic end-to-end WITHOUT decoding audio. NOT
+    a real voiceprint — the same-speaker match realism is the on-box IT; here the payload is
+    a fixture so the fake extraction is reproducible. Clusters clearing ``expected_dim`` are
+    returned; a dim mismatch OMITS the cluster (the belt fires even on the fake seam)."""
+    from alfred.scribe import embed_voice
+
+    out: dict[str, list[float]] = {}
+    n_mismatch = 0
+    for cluster in sorted(pooled):
+        payload = _fake_cluster_payload(cluster, pooled[cluster])
+        vec = embed_voice.embed_windows(config, [payload])[0]
+        if len(vec) != expected_dim:
+            n_mismatch += 1
+            continue
+        out[cluster] = vec
+    _log_extraction_result(out, n_mismatch, expected_dim=expected_dim, source_id=source_id)
+    return out
+
+
+def _pyannote_cluster_embeddings(
+    config: ScribeConfig, audio_path: str | Path | None,
+    pooled: dict[str, list[tuple[float, float]]],
+    *, expected_dim: int, source_id: str | None,
+) -> dict[str, list[float]]:
+    """On-box extraction: decode the chunk audio ONCE (reusing the P4-4 :func:`_decode_audio`
+    path — NOT a second decoder), slice each cluster's merged speech spans, POOL (concatenate)
+    the slices, and embed the pooled waveform via :func:`embed_voice.embed_waveform` (the SAME
+    staged wespeaker model as enrollment). ONE embed call per cluster (no per-turn embedding).
+    torch is imported lazily HERE so CI never loads it.
+
+    DEGRADE, DON'T CRASH: a decode failure → ``{}`` + an explicit
+    ``extraction_empty(reason=decode_failed)`` log (the chunk still folds diarized, all-unknown
+    — never propagates). A per-cluster dim mismatch OMITS that cluster (+ the aggregate
+    mismatch log — the engine-compat belt). An UNEXPECTED embed raise (e.g. torch OOM)
+    PROPAGATES: the caller's stage-before-commit (NOTE-2) leaves the chunk foldable
+    un-attributed, which is the intended fail-open."""
+    from alfred.scribe import embed_voice
+
+    if audio_path is None:
+        log.info(
+            "scribe.diarize.extraction_empty", source_id=source_id, reason="no_audio_path",
+            detail="pyannote extraction needs the chunk audio path to slice; none provided "
+                   "— chunk resolves all-unknown",
+        )
+        return {}
+    import torch
+
+    try:
+        waveform, sample_rate = _decode_audio(audio_path)
+    except AudioDecodeError:
+        log.info(
+            "scribe.diarize.extraction_empty", source_id=source_id, reason="decode_failed",
+            detail="chunk audio failed to decode for embedding extraction — chunk resolves "
+                   "all-unknown (diarized, un-attributed); NOT propagated (degrade)",
+        )
+        return {}
+    total = int(waveform.shape[1])
+    out: dict[str, list[float]] = {}
+    n_mismatch = 0
+    for cluster in sorted(pooled):
+        slices = []
+        for t0, t1 in pooled[cluster]:
+            a = max(0, min(total, round(t0 * sample_rate)))
+            b = max(0, min(total, round(t1 * sample_rate)))
+            if b > a:
+                slices.append(waveform[:, a:b])
+        if not slices:
+            continue  # every span fell outside the decoded audio (defensive; sub-sample turn)
+        pooled_wave = slices[0] if len(slices) == 1 else torch.cat(slices, dim=1)
+        vec = embed_voice.embed_waveform(config, pooled_wave, sample_rate)
+        if len(vec) != expected_dim:
+            n_mismatch += 1
+            continue
+        out[cluster] = vec
+    _log_extraction_result(out, n_mismatch, expected_dim=expected_dim, source_id=source_id)
+    return out
+
+
+def _cluster_embeddings_for(
+    config: ScribeConfig, audio_path: str | Path | None, turns: list[Turn],
+    *, expected_dim: int, source_id: str | None = None,
+) -> dict[str, list[float]]:
+    """Per-cluster speaker EMBEDDING for the K=2 clinician match (P4-5c — REAL extraction).
+
+    For each pyannote cluster in the chunk: pool its (pre-validated) turns into merged speech
+    intervals, enforce the NET-speech floor (``config.diarize.min_turn_s`` — a cluster below
+    it is OMITTED, degrading to ``unknown``, never embedded as noise), slice those spans from
+    the chunk audio, POOL (concatenate) the slices, and embed the pooled speech with the SAME
+    wespeaker embedder used at enrollment (:mod:`embed_voice`). Returns
+    ``{cluster_label: 256-dim unit embedding}`` for clusters that cleared the floor AND
+    embedded at the enrolled dim; :func:`match_cluster_roles` then anchors the single best
+    to ``clinician`` (or all-``unknown`` on a weak/ambiguous/empty result).
+
+    ENGINE FAIL-CLOSE (belt + suspenders): ``resolve_for_encounter`` already REFUSED a preset
+    whose engine fingerprint mismatched the runtime, so a ``ResolvedEnrollment`` can only exist
+    under a compatible engine — and extraction embeds with that SAME config. The
+    extraction-layer BELT additionally guards the produced-embedding DIM against
+    ``expected_dim`` (the preset's ``embedding_dim``): a mismatch OMITS the cluster + logs
+    ``scribe.diarize.extraction_engine_mismatch`` rather than handing the matcher a wrong-dim
+    vector that ``cosine`` would silently score 0.0 — the "never a silent zero" requirement.
+
+    INTENTIONALLY-LEFT-BLANK: an EMPTY return is DISTINGUISHABLE per reason via an explicit
+    ``scribe.diarize.extraction_empty`` log (``no_turns`` / ``no_cluster_above_floor`` /
+    ``decode_failed`` / ``no_audio_path`` / ``no_slices`` / ``engine_mismatch``) — so an
+    all-``unknown`` chunk separates 'no enrollment' (upstream, ``resolved is None``, never
+    reaches here) from 'extraction empty' from 'engine mismatch'.
+
+    Provider dispatch mirrors :func:`embed_voice.embed_windows`: ``fake`` embeds a
+    deterministic per-cluster payload (torch-free CI); ``pyannote`` decodes + slices + embeds
+    the real waveform (on-box). Torch stays lazy in the pyannote seam so CI stays torch-free."""
+    if not turns:
+        log.info(
+            "scribe.diarize.extraction_empty", source_id=source_id, reason="no_turns",
+            detail="no diarization turns to extract from — chunk resolves all-unknown",
+        )
+        return {}
+    pooled = _pool_turns_by_cluster(turns, min_speech_s=config.diarize.min_turn_s)
+    if not pooled:
+        log.info(
+            "scribe.diarize.extraction_empty", source_id=source_id,
+            reason="no_cluster_above_floor",
+            clusters=len({t[2] for t in turns}),
+            min_turn_s=config.diarize.min_turn_s,
+            detail="no pyannote cluster had >= min_turn_s NET pooled speech — chunk resolves "
+                   "all-unknown (extraction empty, NOT 'no enrollment')",
+        )
+        return {}
+    provider = (config.diarize.provider or "").strip().lower()
+    if provider == "fake":
+        return _fake_cluster_embeddings(
+            config, pooled, expected_dim=expected_dim, source_id=source_id)
+    if provider == "pyannote":
+        return _pyannote_cluster_embeddings(
+            config, audio_path, pooled, expected_dim=expected_dim, source_id=source_id)
+    # off / unknown provider: extraction only runs under a real/fake engine (assign_speakers
+    # never routes 'off' here). Defensive all-unknown fall-through.
     return {}
 
 
@@ -624,16 +839,21 @@ def _apply_diarization(
     first mutation — so a raise leaves the chunk UNTOUCHED (speaker=None,
     diarized=False) and the pipeline folds it un-attributed. NOTE-3: touches ONLY
     ``speaker`` / ``speaker_cluster`` / ``speaker_conf`` — never text / id / bounds.
-    Pure + torch-free (the pyannote-specific work is upstream), so CI covers it fully.
+    The alignment/commit is pure; the ONLY torch-touching work is the P4-5c per-cluster
+    extraction (:func:`_cluster_embeddings_for`), and ONLY when ``resolved`` is set under
+    the real ``pyannote`` provider — so CI (no-enrollment, or the fake seam) stays torch-free.
 
     P4-5 ROLE RESOLUTION: with ``resolved`` (a preset bound + resolved for the
     encounter), the K=2 clinician-anchor matcher (:func:`match_cluster_roles`) resolves
     the chunk's clusters to roles by EMBEDDING — the matched cluster → ``clinician``,
     every other → ``unknown``. Without ``resolved`` (no enrollment / a typed refusal
     upstream), EVERY cluster → ``unknown`` via :func:`_cluster_to_role` (the P4-4
-    end-state). The per-cluster embedding extraction is the on-box placeholder
-    (:func:`_cluster_embeddings_for`), so on-box this is still all-``unknown`` until the
-    real extraction lands — the matcher is exercised in CI against the FAKE embed seam."""
+    end-state). The per-cluster embedding extraction (:func:`_cluster_embeddings_for`) is
+    REAL (P4-5c): it slices + pools each cluster's speech and embeds it with the enrollment
+    embedder, so a real enrolled clinician resolves ``clinician`` on-box. Extraction runs
+    BEFORE staging: a decode/embed failure degrades (empty → all-unknown) and an unexpected
+    raise is caught by NOTE-2's stage-before-commit (chunk foldable un-attributed). The
+    matcher + the extraction pool/floor logic are exercised in CI against the FAKE embed seam."""
     # B1 — drop invalid turns (non-finite / end<=start) ONCE, loudly, before the
     # per-segment loop (a NaN-bounds turn would otherwise skew every segment).
     valid_turns, n_invalid = _partition_valid_turns(turns)
@@ -652,7 +872,10 @@ def _apply_diarization(
     cluster_roles: dict[str, str] | None = None
     match: ClusterMatch | None = None
     if resolved is not None:
-        embeddings = _cluster_embeddings_for(config, audio_path, valid_turns)
+        embeddings = _cluster_embeddings_for(
+            config, audio_path, valid_turns,
+            expected_dim=resolved.embedding_dim, source_id=chunk_tx.source_id,
+        )
         match = match_cluster_roles(
             embeddings, resolved.centroids,
             tau=config.diarize.match_threshold, delta=config.diarize.separation_margin,
@@ -660,10 +883,15 @@ def _apply_diarization(
         cluster_roles = match.roles
         if match_sink is not None:
             # Thread the K=2 telemetry OUT so the pipeline records it into diarize_stats.
+            # ``extractor`` marks that the REAL extractor was WIRED for this row (present
+            # whether or not a match succeeded) — the 5b discriminator that separates a
+            # post-P4-5c row from a PLACEHOLDER-era all-unknown row (both can carry
+            # best_cosine=0.0 on a real fingerprint; only the marker tells them apart).
             match_sink.update({
                 "best_cosine": match.best_cosine,
                 "separation": match.separation,
                 "matched": match.matched,
+                "extractor": EXTRACTOR_VERSION,
             })
     # STAGE — compute all assignments first (this is where a raise would happen).
     staged: list[tuple[str | None, float, str]] = []

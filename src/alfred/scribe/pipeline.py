@@ -657,12 +657,13 @@ def _record_diarize_stats(
     ``user`` null — intentionally-left-blank: 'diarized without a preset' is
     distinguishable from 'no capture').
 
-    ``best_cosine`` / ``separation`` come from the K=2 matcher via ``match_sink`` (they
-    are ``None`` while the per-cluster embedding extraction is the on-box placeholder, but
-    the WIRE is now in place, so they populate automatically when it lands — previously
-    they were hardcoded ``None`` and would have stayed null forever). ``eligible_turns`` /
-    ``min_turn_s`` / ``diarized`` are the 5b health contract (see enroll_learning's
-    row-shape docstring)."""
+    ``best_cosine`` / ``separation`` come from the real K=2 matcher via ``match_sink`` (P4-5c
+    extraction is LIVE — they carry the real per-cluster match score; before extraction landed
+    they were hardcoded ``None`` and would have stayed null forever). ``extractor`` (also via
+    ``match_sink``) is the 5b PLACEHOLDER-ERA DISCRIMINATOR: present ⇒ the real extractor was
+    wired for this row (regardless of whether a match succeeded), absent/None ⇒ a pre-P4-5c
+    all-unknown row that must be filtered from health. ``eligible_turns`` / ``min_turn_s`` /
+    ``diarized`` are the 5b health contract (see enroll_learning's row-shape docstring)."""
     if not config.diarize.enrollment_dir:
         return
     m = match or {}
@@ -678,6 +679,7 @@ def _record_diarize_stats(
         role_counts=_role_counts(chunk_tx.segments),
         best_cosine=m.get("best_cosine"),
         separation=m.get("separation"),
+        extractor=m.get("extractor"),
         min_purity=_min_purity(chunk_tx.segments),
         fail_closed_demotions=_fail_closed_demotions(chunk_tx.segments),
         eligible_turns=_eligible_turns(chunk_tx.segments, config.diarize.min_turn_s),

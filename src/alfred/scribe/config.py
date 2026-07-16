@@ -110,7 +110,18 @@ class ScribeDiarizeConfig:
     # Minimum diarization cluster purity for a turn to carry a KNOWN role — HIGH
     # so a mixed/overlap turn degrades to ``unknown``.
     purity_threshold: float = 0.80
-    # Turns shorter than this (seconds) are too short to embed reliably → unknown.
+    # Minimum speech (seconds) the embedder can voiceprint reliably → below it, unknown.
+    # ONE calibrate knob, TWO consumers that read this SAME field (tuning it moves both):
+    #   1. 5b health denominator (per-SEGMENT) — ``pipeline._eligible_turns`` counts segments
+    #      with duration >= this as the ``match_rate = 1 − unknown/eligible`` denominator.
+    #   2. P4-5c extraction floor (per-CLUSTER NET) — ``diarize._pool_turns_by_cluster`` omits
+    #      a cluster whose NET pooled speech (sum of its merged turns) is below this, so it is
+    #      not embedded as noise.
+    # Deliberate asymmetry: the health denominator is per-segment; the extraction floor is
+    # per-cluster-net — a cluster of several individually-sub-floor turns can still SUM to
+    # embeddable speech and be extracted, while each of those short segments is (correctly)
+    # not counted eligible. Same physical claim ("enough speech to voiceprint"), two
+    # projections. A coupling-pin test asserts both consumers read this field.
     min_turn_s: float = 1.0
     # Directory of named voice-PRESET files (P4-5, multi-preset). Empty = feature
     # DORMANT (inert-by-default): no enrollment, every cluster fails the match →

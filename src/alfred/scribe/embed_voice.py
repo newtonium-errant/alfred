@@ -223,6 +223,48 @@ def _load_embedder_cached(model_path: Path):
         return embedder
 
 
+def _embed_tensor(embedder: Any, waveform: Any, sample_rate: int) -> list[float]:
+    """Shared tensor→vector embedding core: mono-downmix (:func:`diarize._to_mono`),
+    resample to the wespeaker rate, run the cached embedder, unit-normalize → a 256-dim
+    vector. Used by BOTH the enrollment window path (:func:`_pyannote_embed_windows`, after
+    its per-window CONTAINER decode) and the P4-5c per-cluster extraction path
+    (:func:`embed_waveform`, on an already-decoded chunk slice — so extraction never
+    re-encodes). torch/torchaudio are lazy-imported by the caller's seam; the resample import
+    stays inside it. Raises on a decode/model failure — the callers own the degrade policy
+    (per-window skip for enrollment; per-cluster omit / fail-open for extraction)."""
+    import torchaudio
+
+    from alfred.scribe.diarize import _to_mono  # the decode-fix downmix (reuse)
+
+    waveform = _to_mono(waveform)                              # (C, T) -> (1, T)
+    if sample_rate != _EMBED_SAMPLE_RATE:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, _EMBED_SAMPLE_RATE)
+    # PretrainedSpeakerEmbedding wants (batch, channel, samples).
+    emb = embedder(waveform.unsqueeze(0))                     # -> (1, dim)
+    return _unit_normalize([float(x) for x in _as_row(emb)])
+
+
+def embed_waveform(config: ScribeConfig, waveform: Any, sample_rate: int) -> list[float]:
+    """Embed an ALREADY-DECODED mono waveform slice → a 256-dim unit vector, via the SAME
+    staged wespeaker model as enrollment (the P4-5c per-cluster extraction seam).
+
+    The extraction (:func:`diarize._cluster_embeddings_for`) decodes the chunk ONCE (the P4-4
+    ``diarize._decode_audio`` path), slices + pools a cluster's speech, and hands the pooled
+    tensor here — so this does NOT re-decode; it runs the torch-free config gate FIRST (a
+    missing staged model fails as a clean :class:`EmbedError`, never an ImportError), loads
+    the cached embedder, and runs the shared :func:`_embed_tensor` core. Real engine ONLY —
+    the fake extraction path embeds byte payloads via :func:`embed_windows`, never here."""
+    provider = (config.diarize.provider or "").strip().lower()
+    if provider != "pyannote":
+        raise EmbedError(
+            f"embed_waveform is the real-engine (pyannote) extraction seam; got provider "
+            f"{provider or '(unset)'!r}. The fake path embeds byte windows via embed_windows."
+        )
+    model_path = _resolve_embedding_model_path(config)   # torch-free config gate FIRST
+    embedder = _load_embedder_cached(model_path)
+    return _embed_tensor(embedder, waveform, sample_rate)
+
+
 def _pyannote_embed_windows(
     config: ScribeConfig, windows: list[bytes]
 ) -> list[list[float]]:
@@ -241,13 +283,12 @@ def _pyannote_embed_windows(
     # (1) config gate FIRST — torch-free, so a missing staged model fails as a clean
     # EmbedError, never an ImportError, and CI never reaches the torch import here.
     model_path = _resolve_embedding_model_path(config)
-    # (2) heavy deps, lazy (never imported in CI / the fake path).
+    # (2) heavy deps, lazy (never imported in CI / the fake path). The mono downmix +
+    # resample live in the shared _embed_tensor core (which lazy-imports them too).
     try:
         import io
 
         import torchaudio
-
-        from alfred.scribe.diarize import _to_mono  # the decode-fix downmix (reuse)
     except ImportError as e:  # pragma: no cover — the daemon boot gate guards this on-box
         raise MissingEmbedDependency(
             "torchaudio is not installed — install the [scribe-diarize] extra into the "
@@ -258,12 +299,7 @@ def _pyannote_embed_windows(
     for i, w in enumerate(windows):
         try:
             waveform, sr = torchaudio.load(io.BytesIO(w))          # container -> (C, T)
-            waveform = _to_mono(waveform)                          # -> (1, T)
-            if sr != _EMBED_SAMPLE_RATE:
-                waveform = torchaudio.functional.resample(waveform, sr, _EMBED_SAMPLE_RATE)
-            # PretrainedSpeakerEmbedding wants (batch, channel, samples).
-            emb = embedder(waveform.unsqueeze(0))                  # -> (1, dim)
-            vec = [float(x) for x in _as_row(emb)]
+            vec = _embed_tensor(embedder, waveform, sr)            # -> unit-norm 256
         except Exception as e:  # noqa: BLE001 — a bad window degrades, never crashes the batch
             log.warning(
                 "scribe.embed.window_skipped",
@@ -272,7 +308,7 @@ def _pyannote_embed_windows(
                 detail="window too short / undecodable to embed — skipped (degrade)",
             )
             continue
-        out.append(_unit_normalize(vec))
+        out.append(vec)
     if not out:
         # EVERY window failed → an engine/decode problem, not a per-window blip.
         raise EmbedError(

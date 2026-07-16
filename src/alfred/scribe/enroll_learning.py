@@ -24,19 +24,32 @@ The sink is APPEND-ONLY JSONL, so a late schema migration is painful — the fie
     is ``match_rate = 1 − unknown/eligible`` where eligible = turns >= ``min_turn_s``.
     ``role_counts`` alone counts ALL segments, so without ``eligible_turns`` the metric
     is UNCOMPUTABLE from the rows.
-  * ``engine_fingerprint`` — the 5b FILTER KEY. Rows are POISONED for health purposes
+  * ``engine_fingerprint`` — a 5b FILTER KEY. Rows are POISONED for health purposes
     when they come from:
       (a) the FAKE embed seam (``embedding_model == "fake-embed-v1"``), or
-      (b) the PLACEHOLDER era — the real per-cluster embedding extractor is not wired,
-          so every cluster resolves ``unknown`` and the row books role_counts 100%
-          unknown against a real ``(preset_id, centroid_version)``, or
+      (b) the PLACEHOLDER era — pre-P4-5c, the real per-cluster embedding extractor was
+          NOT wired, so every cluster resolved ``unknown`` and the row booked role_counts
+          100% unknown against a real ``(preset_id, centroid_version)`` under a REAL engine
+          fingerprint. Such a row is INDISTINGUISHABLE by ``engine_fingerprint`` /
+          ``best_cosine`` alone from a genuinely-bad-match post-fix row (both can carry
+          ``best_cosine == 0.0``, ``diarized: true``, a real fingerprint) — so it is
+          discriminated by the ``extractor`` marker below, NOT by best_cosine, or
       (c) a KILL-SWITCHED engine (``diarized: false`` — nothing was diarized at all).
-    **5b MUST filter on ``diarized == true`` AND a REAL (non-fake) engine_fingerprint
-    before deriving health**, else the health machine reads instant degraded/stale and
-    spams re-record proposals for a preset the matcher never actually saw.
+    **5b MUST filter on ``diarized == true`` AND a REAL (non-fake) engine_fingerprint AND a
+    present ``extractor`` marker before deriving health**, else the health machine reads
+    instant degraded/stale and spams re-record proposals for a preset the matcher never
+    actually saw (e.g. Jamie's enc-3734cb79f7255f2b first-use rows — real preset, real
+    fingerprint, all-unknown, written before extraction landed).
+  * ``extractor`` — the 5b PLACEHOLDER-ERA DISCRIMINATOR (P4-5c). Present (e.g. ``"p4-5c"``)
+    ⇒ the real per-cluster extractor was WIRED for this row — the marker means "extractor
+    ran", NOT "match succeeded" (a real no-match with ``best_cosine == 0.0`` still carries
+    it). Absent/None ⇒ a pre-P4-5c placeholder row (POISON — filter it). This is what
+    replaces the stale "best_cosine is None until extraction lands" discriminator: post-fix,
+    ``best_cosine`` is a REAL score, so the marker — not its nullness — is the era key.
   * ``diarized`` — whether diarization actually RAN for this chunk (see (c) above).
-  * ``best_cosine`` / ``separation`` — the match telemetry. ``None`` until the on-box
-    per-cluster embedding extraction lands (see ``diarize._cluster_embeddings_for``).
+  * ``best_cosine`` / ``separation`` — the real K=2 match telemetry (P4-5c LIVE). Carries the
+    per-cluster match score; a real no-match is a genuine ``0.0`` (see the ``extractor``
+    discriminator above for telling that apart from a placeholder-era ``0.0``).
 """
 
 from __future__ import annotations
@@ -110,6 +123,7 @@ def record_diarize_stats(
     separation: float | None,
     min_purity: float | None,
     fail_closed_demotions: int,
+    extractor: str | None = None,
     eligible_turns: int = 0,
     min_turn_s: float | None = None,
     diarized: bool = False,
@@ -127,9 +141,16 @@ def record_diarize_stats(
             "kind": KIND_DIARIZE_STATS, "ts": _now(),
             "source_id": source_id, "chunk_seq": chunk_seq,
             "user": user, "preset_id": preset_id, "centroid_version": centroid_version,
-            # 5b FILTER KEY — see the module docstring: rows produced by the FAKE seam or
-            # the placeholder (all-unknown) extractor must be EXCLUDED from health.
+            # 5b FILTER KEY — see the module docstring: the FAKE seam (embedding_model
+            # 'fake-embed-v1') is excluded via THIS field. Pre-P4-5c placeholder-era rows
+            # carry a REAL fingerprint, so this field alone can't catch them — they are
+            # excluded via the ``extractor`` marker below.
             "engine_fingerprint": engine_fingerprint,
+            # 5b PLACEHOLDER-ERA DISCRIMINATOR (P4-5c) — the extractor version stamp. Present
+            # ⇒ the real per-cluster extractor was WIRED for this row (a genuine best_cosine,
+            # even if 0.0 from a real no-match); absent/None ⇒ a pre-P4-5c placeholder row
+            # (best_cosine==0.0 by construction) that must be filtered. See the (b) clause.
+            "extractor": extractor,
             "n_segments": int(n_segments), "role_counts": dict(role_counts),
             # 5b LATCH DENOMINATOR — match_rate = 1 − unknown/ELIGIBLE, eligible = turns
             # >= min_turn_s. Without these the metric is uncomputable from the sink.
