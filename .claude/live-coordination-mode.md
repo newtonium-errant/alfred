@@ -78,6 +78,17 @@ explicit `--from <self>` / `<self>` positional.
 Notes on the real surface (verified against master `f9fc0fb`):
 - `msg send --kind` accepts **`handover|request|fyi|reply`** only. `--reply-to` threads a reply to
   a specific message id; `--route`/`--now` are aliases for the same instant-route flag.
+- **Inbound kind tolerance + malformed bounce (task #9, 2026-07-16).** On RECEIPT the router
+  is TOLERANT of an *unknown* `kind` (enum drift between projects — the incident where rrts
+  sent `kind: propose`): it delivers the message as `fyi` and TAGS it (`kind-drift:
+  <original>→fyi`, shown in `msg inbox list`) instead of binning it. A STRUCTURALLY broken
+  message (missing `to`/`from`/`correlation_id`/`created`/`subject`) is binned to
+  `malformed/` AND a `reply`-kind **BOUNCE** lands in the sender's inbox ("BOUNCED
+  malformed: …", body = the validation errors + binned-file pointer). `msg status` and
+  `msg inbox list` surface a per-project malformed-bin count ("alfred: 0 unread (1 in
+  malformed bin!)") so a routine drain can't miss a quarantined message. Valid kinds are
+  unchanged: `handover|request|fyi|reply` + the contract kinds (`propose|counter|accept…`)
+  dispatched to the solver.
 - `msg inbox` puts the **project positional first**: pass `<self>` explicitly
   (`msg inbox <self> drain --json`). The bare `msg inbox drain --json` defaults to the config's
   `self_project` (`alfred`) — right only for the alfred agent, wrong everywhere else. Use `--json`

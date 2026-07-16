@@ -35,6 +35,7 @@ from alfred.msgbus.record import (
 )
 from alfred.msgbus.registry import ProjectEntry, ProjectRegistry, load_registry
 from alfred.msgbus.router import (
+    malformed_counts_by_project,
     mint_message_id,
     run_route_once,
     scan_spool,
@@ -287,13 +288,24 @@ async def test_route_unknown_destination_undeliverable(tmp_path):
     assert len(list((spool / "undeliverable").glob("*.md"))) == 1
 
 
-async def test_route_bad_kind_malformed(tmp_path):
+async def test_route_unknown_kind_tolerated_as_fyi(tmp_path):
+    # TOLERANT+TAG (task #9): an unknown ``kind`` is enum DRIFT between projects, not a
+    # broken message — accepted as ``fyi`` + tagged with the original kind, NOT binned.
+    # (The 2026-07-16 incident: rrts sent kind=propose and it was silently quarantined.)
     cfg = _config(tmp_path)
     spool = Path(cfg.spool_path)
     _drop(spool, _record(id="msg-x", kind="bogus"))
-    result = await run_route_once(cfg, {})
-    assert result["malformed"] == 1
-    assert len(list((spool / "malformed").glob("*.md"))) == 1
+    with structlog.testing.capture_logs() as captured:
+        result = await run_route_once(cfg, {})
+    assert result["malformed"] == 0 and result["kind_tolerated"] == 1
+    assert result["routed"] == 1
+    tol = _log_events(captured, "msgbus.route.unknown_kind_tolerated")
+    assert len(tol) == 1 and tol[0]["original_kind"] == "bogus"
+    assert len(list((spool / "malformed").glob("*.md"))) == 0
+    # delivered to the receiver inbox as fyi, with the original kind tagged.
+    placed = parse_message_file(
+        list(cfg.registry().inbox_for("aftermath-lab").glob("*.md"))[0])
+    assert placed.kind == "fyi" and placed.original_kind == "bogus"
 
 
 async def test_route_bad_parse_malformed(tmp_path):
@@ -763,3 +775,144 @@ class TestOrchestratorRegistration:
         import alfred.orchestrator as orch
         params = list(inspect.signature(orch.TOOL_RUNNERS["message_bus"]).parameters)
         assert params == ["raw", "suppress_stdout"]
+
+
+# ---------------------------------------------------------------------------
+# Task #9 — malformed BOUNCE + receiver-side bin signal
+# ---------------------------------------------------------------------------
+
+async def test_route_malformed_bounces_to_sender(tmp_path):
+    # A structurally-malformed message (here: missing subject) is binned AND a reply-kind
+    # BOUNCE lands in the SENDER's inbox — the bin is no longer silent.
+    cfg = _config(tmp_path)
+    spool = Path(cfg.spool_path)
+    _drop(spool, _record(id="msg-y", subject=""))   # missing subject -> structural malformed
+    with structlog.testing.capture_logs() as captured:
+        result = await run_route_once(cfg, {})
+    assert result["malformed"] == 1 and result["bounced"] == 1
+    bounced_ev = _log_events(captured, "msgbus.route.bounced")
+    assert len(bounced_ev) == 1 and bounced_ev[0]["to"] == "alfred"
+    bounces = list(cfg.registry().inbox_for("alfred").glob("*.md"))
+    assert len(bounces) == 1
+    b = parse_message_file(bounces[0])
+    assert b.kind == "reply"
+    assert b.subject.startswith("BOUNCED malformed:")
+    assert b.to_project == "alfred" and b.reply_to == "msg-y"
+    assert "missing subject" in b.body and "malformed/" in b.body
+
+
+async def test_route_malformed_no_sender_no_bounce(tmp_path):
+    # A malformed message with NO ``from`` cannot be bounced (no sender) — binned only.
+    cfg = _config(tmp_path)
+    spool = Path(cfg.spool_path)
+    _drop(spool, _record(id="msg-z", from_project="", subject=""))
+    result = await run_route_once(cfg, {})
+    assert result["malformed"] == 1 and result["bounced"] == 0
+    for name in cfg.registry().names():
+        assert len(list(cfg.registry().inbox_for(name).glob("*.md"))) == 0
+
+
+async def test_route_malformed_unregistered_sender_no_bounce(tmp_path):
+    # A malformed message whose ``from`` is not a registered project cannot be bounced
+    # (no inbox) — binned only, no crash.
+    cfg = _config(tmp_path)
+    spool = Path(cfg.spool_path)
+    _drop(spool, _record(id="msg-w", from_project="ghost-project", subject=""))
+    result = await run_route_once(cfg, {})
+    assert result["malformed"] == 1 and result["bounced"] == 0
+
+
+def test_malformed_counts_by_project(tmp_path):
+    cfg = _config(tmp_path)
+    spool = Path(cfg.spool_path)
+    mdir = spool / "malformed"
+    mdir.mkdir()
+    write_message_file(mdir / "a1.md", _record(id="m1", to_project="alfred", subject=""))
+    write_message_file(mdir / "a2.md", _record(id="m2", to_project="alfred", subject=""))
+    write_message_file(mdir / "b1.md", _record(id="m3", to_project="aftermath-lab"))
+    (mdir / "junk.md").write_text("no frontmatter, no destination\n")
+    counts = malformed_counts_by_project(spool)
+    assert counts.get("alfred") == 2
+    assert counts.get("aftermath-lab") == 1
+    assert counts.get("?") == 1   # unparseable / no-``to`` bucket
+
+
+def test_malformed_counts_empty_when_no_bin(tmp_path):
+    # Intentionally-left-blank: no malformed dir -> empty dict, never raises.
+    cfg = _config(tmp_path)
+    assert malformed_counts_by_project(cfg.spool_path) == {}
+
+
+def test_msg_status_surfaces_malformed_bin(tmp_path, capsys):
+    # RECEIVER SIGNAL: `msg status` must show the per-project malformed-bin count so a
+    # routine drain can't miss a quarantined message addressed to it.
+    import argparse
+    from alfred.cli import _msg_status
+    cfg = _config(tmp_path)
+    mdir = Path(cfg.spool_path) / "malformed"
+    mdir.mkdir()
+    write_message_file(mdir / "a1.md", _record(id="m1", to_project="alfred", subject=""))
+    _msg_status(argparse.Namespace(), cfg, False)
+    out = capsys.readouterr().out
+    assert "alfred:" in out and "1 in malformed bin!" in out
+
+
+def test_msg_inbox_list_shows_kind_drift_and_bin(tmp_path, capsys):
+    # `msg inbox list` shows the kind-drift tag on a tolerated message AND the malformed-bin
+    # line for messages addressed to this project.
+    import argparse
+    from alfred.cli import _msg_inbox
+    cfg = _config(tmp_path)
+    inbox = cfg.registry().inbox_for("alfred")
+    inbox.mkdir(parents=True, exist_ok=True)
+    rec = _record(id="m1", to_project="alfred", kind="fyi", original_kind="propose")
+    write_message_file(inbox / message_filename(rec), rec)
+    mdir = Path(cfg.spool_path) / "malformed"
+    mdir.mkdir()
+    write_message_file(mdir / "b1.md", _record(id="m2", to_project="alfred", subject=""))
+    args = argparse.Namespace(project="alfred", inbox_action="list", json=False)
+    _msg_inbox(args, cfg)
+    out = capsys.readouterr().out
+    assert "kind-drift: propose\u2192fyi" in out
+    assert "in the MALFORMED BIN" in out
+
+
+async def test_route_unknown_kind_plus_structural_break_bins_with_real_kind(tmp_path):
+    # Finding A: a message with BOTH an unknown kind AND a structural break (missing subject)
+    # is BINNED + BOUNCED reporting the REAL kind — NOT tolerated (kind_tolerated stays 0), and
+    # NEVER rewritten to fyi in the bounce or on disk. Tolerance is deferred until AFTER the gates.
+    cfg = _config(tmp_path)
+    spool = Path(cfg.spool_path)
+    _drop(spool, _record(id="msg-c", kind="zorp", subject=""))
+    result = await run_route_once(cfg, {})
+    assert result["malformed"] == 1 and result["bounced"] == 1
+    assert result["kind_tolerated"] == 0 and result["routed"] == 0
+    binned = parse_message_file(list((spool / "malformed").glob("*.md"))[0])
+    assert binned.kind == "zorp"   # binned file keeps the REAL kind (not rewritten)
+    b = parse_message_file(list(cfg.registry().inbox_for("alfred").glob("*.md"))[0])
+    assert "original kind: zorp" in b.body and "original kind: fyi" not in b.body
+    assert "missing subject" in b.body
+
+
+def test_msg_status_surfaces_orphan_and_json_bin(tmp_path, capsys):
+    # Findings B+C: a malformed file addressed to an UNREGISTERED (non-empty) `to` AND one with
+    # no/unknown destination must both surface — on the JSON key AND the text '(!)' backstop.
+    import argparse
+    import json as _json
+    from alfred.cli import _msg_status
+    cfg = _config(tmp_path)
+    mdir = Path(cfg.spool_path) / "malformed"
+    mdir.mkdir()
+    write_message_file(mdir / "a1.md", _record(id="m1", to_project="alfredd", subject=""))
+    (mdir / "junk.md").write_text("no frontmatter, no destination\n")
+    # JSON surface carries both keys (finding C part 1).
+    _msg_status(argparse.Namespace(), cfg, True)
+    data = _json.loads(capsys.readouterr().out)
+    assert data["malformed_bin_by_project"]["alfredd"] == 1
+    assert data["malformed_bin_by_project"]["?"] == 1
+    # Text surface: the orphan '(!)' lines, including the unregistered `to` (finding B).
+    _msg_status(argparse.Namespace(), cfg, False)
+    tout = capsys.readouterr().out
+    assert "(!)" in tout
+    assert "alfredd" in tout                      # unregistered `to` no longer invisible (B)
+    assert "no/unknown destination" in tout       # '?' bucket text (C part 2)
