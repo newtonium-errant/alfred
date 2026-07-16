@@ -22,11 +22,13 @@ import importlib.util
 import re
 import secrets
 import socket
+import struct
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiohttp
 import pytest
+import structlog
 
 from alfred.scribe.config import (
     ScribeConfig,
@@ -237,7 +239,8 @@ def test_page_loads_zero_external_resources():
 
 
 def test_route_table_pins(tmp_path):
-    # 3 API routes (byte-identical to Slice A) + 2 static PWA routes.
+    # 3 API routes (byte-identical to Slice A) + 2 static PWA routes + 6 standalone-install
+    # assets (manifest/icons/favicon/apple-touch-icon ×2).
     app = create_ingest_app(_config(tmp_path))
     got = {(r.method, r.get_info().get("path")) for r in app.router.routes()
            if r.method in ("GET", "POST")}
@@ -246,8 +249,20 @@ def test_route_table_pins(tmp_path):
     assert ("GET", iw.STATUS_ROUTE) in got
     assert ("GET", iw.PAGE_ROUTE) in got
     assert ("GET", iw.APP_JS_ROUTE) in got
-    # no extra GET/POST routes crept in.
-    assert len(got) == 5
+    assert ("GET", iw.MANIFEST_ROUTE) in got
+    assert ("GET", iw.ICON_192_ROUTE) in got
+    assert ("GET", iw.ICON_512_ROUTE) in got
+    assert ("GET", iw.FAVICON_ROUTE) in got
+    assert ("GET", iw.APPLE_TOUCH_ICON_ROUTE) in got
+    assert ("GET", iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE) in got
+    # every install asset has a registered GET route (derive from the set so a new asset
+    # can't be added to _INSTALL_ASSET_PATHS without also being routed).
+    for route in iw._INSTALL_ASSET_PATHS:
+        assert ("GET", route) in got, route
+    # no extra GET/POST routes crept in — in particular NO /sw.js (no service worker).
+    assert len(got) == 11
+    assert not any("sw.js" in path or "serviceworker" in path.lower()
+                   for _, path in got), got
 
 
 def test_inert_default_no_static_surface(tmp_path):
@@ -257,6 +272,325 @@ def test_inert_default_no_static_surface(tmp_path):
     cfg = _config(tmp_path, enabled=False)
     server = asyncio.run(_maybe_start_ingest_server(cfg))
     assert server is None
+
+
+# ---------------------------------------------------------------------------
+# Task #1 — standalone-install surface (manifest + icons) + Task #3 favicon
+# ---------------------------------------------------------------------------
+
+def test_exempt_paths_include_install_assets_and_still_middleware_covered():
+    # The bearer-exempt set EXPANDS to the manifest, both icons, and the favicon — but
+    # they stay under the SAME every-route middleware (Host-pin + loopback + Sec-Fetch-Site),
+    # so no bypass. Pin the additions AND that the page/app.js stay exempt too.
+    assert iw.PAGE_ROUTE in iw._BEARER_EXEMPT_PATHS
+    assert iw.APP_JS_ROUTE in iw._BEARER_EXEMPT_PATHS
+    for route in iw._INSTALL_ASSET_PATHS:
+        assert route in iw._BEARER_EXEMPT_PATHS, route
+    # exactly page + app.js + the install-asset set — nothing else silently joined.
+    assert iw._BEARER_EXEMPT_PATHS == frozenset({iw.PAGE_ROUTE, iw.APP_JS_ROUTE}) | iw._INSTALL_ASSET_PATHS
+    # and the install-asset set is exactly the six standalone-install assets.
+    assert iw._INSTALL_ASSET_PATHS == frozenset({
+        iw.MANIFEST_ROUTE, iw.ICON_192_ROUTE, iw.ICON_512_ROUTE, iw.FAVICON_ROUTE,
+        iw.APPLE_TOUCH_ICON_ROUTE, iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE,
+    })
+
+
+def test_manifest_served_standalone_and_secret_free(tmp_path):
+    # GET /manifest.webmanifest — NO bearer needed, correct content type, and the
+    # standalone-install fields Chrome ≥108 needs. HARD INVARIANT: SECRET-FREE (neither
+    # token value appears in the served bytes).
+    import json as _json
+    cfg = _config(tmp_path, token="TOKEN_ABC")
+    cfg.ingest_web.enroll_token = "ENROLL_XYZ"      # a 2nd secret that must also never leak
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            async with s.get(base + iw.MANIFEST_ROUTE) as r:   # NO bearer
+                return r.status, r.headers.get("Content-Type"), await r.text()
+
+    st, ctype, body = asyncio.run(_go())
+    assert st == 200
+    assert "application/manifest+json" in ctype
+    m = _json.loads(body)
+    assert m["display"] == "standalone"             # what drops the URL bar
+    assert m["name"] == "STAY-C" and m["short_name"] == "STAY-C"
+    assert m["start_url"] == "/"
+    assert {i["sizes"] for i in m["icons"]} == {"192x192", "512x512"}
+    assert all("maskable" in i["purpose"] for i in m["icons"])   # maskable install icons
+    # SECRET-FREE — grep the served bytes for BOTH token values.
+    assert "TOKEN_ABC" not in body and "ENROLL_XYZ" not in body
+
+
+def test_icons_served_valid_png_and_secret_free(tmp_path):
+    # Both icon routes serve real PNG bytes (192 + 512), no bearer, and SECRET-FREE.
+    import struct
+    cfg = _config(tmp_path, token="TOKEN_ABC")
+    cfg.ingest_web.enroll_token = "ENROLL_XYZ"
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for route, size in ((iw.ICON_192_ROUTE, 192), (iw.ICON_512_ROUTE, 512)):
+                async with s.get(base + route) as r:            # NO bearer
+                    out[size] = (r.status, r.headers.get("Content-Type"), await r.read())
+        return out
+
+    out = asyncio.run(_go())
+    for size, (st, ctype, body) in out.items():
+        assert st == 200 and ctype == "image/png"
+        assert body[:8] == b"\x89PNG\r\n\x1a\n"                 # valid PNG signature
+        w, h = struct.unpack(">II", body[16:24])                # IHDR width/height
+        assert (w, h) == (size, size), (size, w, h)
+        # SECRET-FREE — the raw image bytes carry neither token.
+        assert b"TOKEN_ABC" not in body and b"ENROLL_XYZ" not in body
+
+
+def _parse_png(b: bytes) -> list[tuple[bytes, bytes]]:
+    """Parse a PNG into a list of (chunk-tag, chunk-data), verifying every chunk CRC (computed
+    over tag+data). Raises AssertionError on a bad signature or CRC — the structural belt
+    under _solid_png that a signature+IHDR-only check misses."""
+    import binascii
+    assert b[:8] == b"\x89PNG\r\n\x1a\n", "bad PNG signature"
+    i, chunks = 8, []
+    while i < len(b):
+        ln = struct.unpack(">I", b[i:i + 4])[0]
+        tag = b[i + 4:i + 8]
+        data = b[i + 8:i + 8 + ln]
+        crc = struct.unpack(">I", b[i + 8 + ln:i + 12 + ln])[0]
+        assert crc == (binascii.crc32(tag + data) & 0xFFFFFFFF), f"bad CRC on {tag!r}"
+        chunks.append((tag, data))
+        i += 12 + ln
+    return chunks
+
+
+def test_solid_png_internals_are_structurally_valid():
+    # QA finding 6 — pin the PNG INTERNALS, not just the signature + IHDR dims. A _solid_png
+    # mutant (CRC over data-without-tag, `raw = row * (size - 1)`, wrong colour-type/stride)
+    # produces an undecodable icon → Chrome silently drops the >=144px install criterion and
+    # stops offering the install prompt, with zero log signal. Parse every chunk, verify CRCs,
+    # and confirm the decompressed pixel stream matches the declared truecolor dimensions.
+    import zlib
+    for name, png, size in (
+        ("icon-192", pwa_assets.ICON_192_PNG, 192),
+        ("icon-512", pwa_assets.ICON_512_PNG, 512),
+        ("favicon", pwa_assets.FAVICON_PNG, 32),
+        ("apple-touch", pwa_assets.APPLE_TOUCH_ICON_PNG, 180),
+    ):
+        chunks = _parse_png(png)                                 # verifies signature + all CRCs
+        assert [t for t, _ in chunks] == [b"IHDR", b"IDAT", b"IEND"], (name, chunks)
+        ihdr = dict(chunks)[b"IHDR"]
+        w, h, bit_depth, colour_type = struct.unpack(">IIBB", ihdr[:10])
+        assert (w, h) == (size, size), (name, w, h)
+        assert bit_depth == 8 and colour_type == 2, (name, bit_depth, colour_type)  # 8-bit truecolor
+        # the IDAT zlib stream decompresses to exactly `size` rows of (1 filter byte + 3*size RGB).
+        raw = zlib.decompress(dict(chunks)[b"IDAT"])
+        assert len(raw) == size * (1 + 3 * size), (name, len(raw), size)
+
+
+def test_favicon_served_200_and_no_reject_log(tmp_path):
+    # Task #3 — Chrome auto-fetches /favicon.ico on every page load. Before, it was an
+    # un-exempt bearer-required route → 401 → a warning-level scribe.ingest_web.rejected
+    # (reason=bad_token) log per load (4+/session observed). Now it is served 200 and emits
+    # NO rejected log for /favicon.ico. It is ALSO SECRET-FREE — the served bytes are grepped
+    # for BOTH real token values (QA finding 2: a serve-time interpolation mutant must die
+    # here, not just against the module-level constant).
+    cfg = _config(tmp_path, token="TOKEN_ABC")
+    cfg.ingest_web.enroll_token = "ENROLL_XYZ"
+
+    async def _go():
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                # a browser favicon fetch carries NO Authorization header.
+                async with s.get(base + iw.FAVICON_ROUTE) as r:
+                    st, ctype, body = r.status, r.headers.get("Content-Type"), await r.read()
+        return st, ctype, body, caps
+
+    st, ctype, body, caps = asyncio.run(_go())
+    assert st == 200 and ctype == "image/png"
+    assert body[:8] == b"\x89PNG\r\n\x1a\n"
+    assert b"TOKEN_ABC" not in body and b"ENROLL_XYZ" not in body   # SECRET-FREE served bytes
+    rejects = [c for c in caps
+               if c.get("event") == "scribe.ingest_web.rejected" and c.get("route") == iw.FAVICON_ROUTE]
+    assert rejects == [], f"favicon must not emit a rejected log: {rejects}"
+
+
+def test_all_install_assets_served_secret_free(tmp_path):
+    # QA findings 2/3 root — the secret-free-served-bytes invariant must hold for EVERY route
+    # in _INSTALL_ASSET_PATHS (so a new asset can't be added without inheriting the check), and
+    # it must be checked at SERVE time (a serve-time interpolation mutant can't be seen by the
+    # module-constant unit belt). Configure BOTH real tokens and grep every served body.
+    cfg = _config(tmp_path, token="TOKEN_ABC")
+    cfg.ingest_web.enroll_token = "ENROLL_XYZ"
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for route in sorted(iw._INSTALL_ASSET_PATHS):
+                async with s.get(base + route) as r:             # NO bearer
+                    out[route] = (r.status, await r.read())
+        return out
+
+    out = asyncio.run(_go())
+    assert out, "no install assets to check"
+    for route, (st, body) in out.items():
+        assert st == 200, (route, st)
+        assert b"TOKEN_ABC" not in body and b"ENROLL_XYZ" not in body, route
+
+
+def test_install_assets_emit_no_rejected_log_on_browser_fetch(tmp_path):
+    # QA finding 9 (finding 1's log-half) — generalise the favicon no-reject-log pin to the
+    # apple-touch paths, the batch's headline new browser-probe routes (WebKit auto-fetches them
+    # on Add-to-Home-Screen for the operator-ruled iPhone). Finding 1's concern is the
+    # warning-level scribe.ingest_web.rejected spam class, so a plain browser fetch (no bearer,
+    # no Sec-Fetch-Site) of each probe path must be served 200 AND emit NO rejected log for that
+    # route. Enumerate the probe paths BY CONSTANT (not via _INSTALL_ASSET_PATHS): a removal from
+    # the exempt set would drop the path from a set-derived loop and pass vacuously — this pin
+    # must fail if apple-touch/favicon ever falls back to the bearer branch (401 + spam). The
+    # exact-set membership pin (test_exempt_paths_…) covers set drift; this covers the behaviour.
+    cfg = _config(tmp_path)
+    probe_paths = (iw.FAVICON_ROUTE, iw.APPLE_TOUCH_ICON_ROUTE, iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE)
+
+    async def _go():
+        out = {}
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                for route in probe_paths:
+                    async with s.get(base + route) as r:          # NO bearer, no Sec-Fetch-Site
+                        out[route] = r.status
+        return out, caps
+
+    out, caps = asyncio.run(_go())
+    for route in probe_paths:
+        assert out[route] == 200, (route, out[route])
+    rejects = [(c.get("route"), c.get("reason")) for c in caps
+               if c.get("event") == "scribe.ingest_web.rejected" and c.get("route") in probe_paths]
+    assert rejects == [], f"browser-probe assets must not emit a rejected log: {rejects}"
+
+
+def test_install_assets_still_host_pinned_rebind_blocked(tmp_path):
+    # The expanded exempt surface stays under the Host-pin (the rebind guard): a DNS-rebind
+    # request carrying an attacker domain as Host is refused (421) on EVERY install asset.
+    # Derive the loop from _INSTALL_ASSET_PATHS (QA finding 3 — icon-512 was silently omitted;
+    # deriving from the set means no current or future asset can be forgotten).
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for route in sorted(iw._INSTALL_ASSET_PATHS):
+                async with s.get(base + route,
+                                 headers={"Host": f"evil.example.com:{cfg.ingest_web.port}"}) as r:
+                    out[route] = r.status
+        return out
+
+    out = asyncio.run(_go())
+    assert out and all(st == 421 for st in out.values()), out
+
+
+def test_bearer_exempt_routes_all_sec_fetch_site_covered(tmp_path):
+    # The Sec-Fetch-Site belt covers EVERY bearer-exempt route (page, app.js, and all six
+    # install assets) — a cross-site fetch of any of them is refused (421). Derived from
+    # _BEARER_EXEMPT_PATHS so dropping the belt from any single route (QA findings 3/8:
+    # icon-512, favicon, apple-touch, and app.js were all unpinned) cannot survive.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for route in sorted(iw._BEARER_EXEMPT_PATHS):
+                async with s.get(base + route, headers={"Sec-Fetch-Site": "cross-site"}) as r:
+                    out[route] = r.status
+        return out
+
+    out = asyncio.run(_go())
+    assert out and all(st == 421 for st in out.values()), out    # cross-origin refused everywhere
+
+
+def test_install_assets_same_origin_and_absent_header_served(tmp_path):
+    # ...and the REAL install fetch is not broken: a same-origin fetch (Sec-Fetch-Site:
+    # same-origin, how the browser actually fetches the manifest/icons) and an absent-header
+    # fetch (older browsers → fail-open) are BOTH served 200 for every install asset.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            for route in sorted(iw._INSTALL_ASSET_PATHS):
+                async with s.get(base + route, headers={"Sec-Fetch-Site": "same-origin"}) as r:
+                    same = r.status
+                async with s.get(base + route) as r:              # absent header → fail-open
+                    absent = r.status
+                out[route] = (same, absent)
+        return out
+
+    out = asyncio.run(_go())
+    assert out and all(v == (200, 200) for v in out.values()), out
+
+
+def test_page_head_links_manifest_and_theme_color():
+    # The served HTML head wires the standalone install: <link rel="manifest">, <link
+    # rel="icon">, <link rel="apple-touch-icon">, and a <meta name="theme-color">. The link
+    # hrefs are BAKED from the route constants (QA findings 4/9 — a route rename must
+    # propagate to the page, never leave it linking a now-un-exempt path); build the expected
+    # literals FROM the constants so this pin fails the moment the page hardcodes a path.
+    import json as _json
+    html = render_index(_TOKEN)
+    assert f'<link rel="manifest" href="{iw.MANIFEST_ROUTE}">' in html
+    assert f'<link rel="icon" href="{iw.FAVICON_ROUTE}" sizes="any">' in html
+    assert f'<link rel="apple-touch-icon" href="{iw.APPLE_TOUCH_ICON_ROUTE}">' in html
+    # no route/theme placeholder survives into the served page (all baked out).
+    for ph in (pwa_assets._THEME_COLOR_PLACEHOLDER, pwa_assets._MANIFEST_ROUTE_PLACEHOLDER,
+               pwa_assets._FAVICON_ROUTE_PLACEHOLDER, pwa_assets._APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER):
+        assert ph not in html, ph
+    # theme-color meta is the SAME constant the manifest uses (single source of truth).
+    assert f'<meta name="theme-color" content="{pwa_assets.THEME_COLOR}">' in html
+    assert _json.loads(pwa_assets.MANIFEST_JSON)["theme_color"] == pwa_assets.THEME_COLOR
+
+
+def test_browser_convention_asset_paths_are_pinned_literals():
+    # QA findings 1/4 completion — the finding-4 fix BAKES the <link> hrefs from the route
+    # constants, which makes a LINK-DRIVEN path (the manifest, whose only fetch is via
+    # <link rel="manifest">) rename-safe: the served page follows the constant. But favicon and
+    # apple-touch are fetched by the browser at HARDCODED conventional literals INDEPENDENT of
+    # any <link>: Chrome auto-requests /favicon.ico on every page load (the observed source of
+    # the Task #3 401 spam), and WebKit probes /apple-touch-icon.png and the no-<link>
+    # /apple-touch-icon-precomposed.png sibling on Add-to-Home-Screen. For these three, baking
+    # the <link> is NOT sufficient — the constant itself must stay the conventional literal, or a
+    # rename silently un-exempts the path the browser still hits and reintroduces the exact 401
+    # warning-spam / degraded home-screen tile this batch shipped to kill, with a green suite
+    # (finding 1's failure scenario). Pin the convention. MANIFEST_ROUTE / ICON_* are
+    # deliberately NOT pinned here — they are link/manifest-driven and rename-safe via the bake.
+    assert iw.FAVICON_ROUTE == "/favicon.ico"
+    assert iw.APPLE_TOUCH_ICON_ROUTE == "/apple-touch-icon.png"
+    assert iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE == "/apple-touch-icon-precomposed.png"
+
+
+def test_manifest_install_has_no_service_worker():
+    # The no-residue posture is intact: the install rides the MANIFEST ALONE. No service
+    # worker route exists, and no serviceWorker registration / sw.js / Cache-API appears in
+    # the manifest, the served page, or the app JS.
+    import json as _json
+    m = _json.loads(pwa_assets.MANIFEST_JSON)
+    assert "serviceworker" not in _json.dumps(m).lower()     # no SW key in the manifest
+    html = render_index(_TOKEN)
+    js = pwa_assets.APP_JS
+    for hay, where in ((html, "page"), (js, "app.js")):
+        for banned in ("serviceWorker", "sw.js", ".register(", "caches.", "CacheStorage"):
+            assert banned not in hay, f"no-SW violation: {banned} in {where}"
+
+
+def test_manifest_and_icon_bytes_are_secret_free_unit():
+    # UNIT belt (no server) — the module-level asset bytes themselves carry neither token,
+    # regardless of what any live config embeds. A future edit that interpolated a secret
+    # into an asset fails here even without a served request.
+    for asset in (pwa_assets.MANIFEST_JSON, pwa_assets.ICON_192_PNG,
+                  pwa_assets.ICON_512_PNG, pwa_assets.FAVICON_PNG,
+                  pwa_assets.APPLE_TOUCH_ICON_PNG):
+        raw = asset.encode() if isinstance(asset, str) else asset
+        # a secret-shaped token embedded via render_index would be the leak vector; the assets
+        # are STATIC (never see the token), so no bearer-shaped substring can be present.
+        assert b"Bearer" not in raw
+        assert b"data-ingest-token" not in raw
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +626,24 @@ def _code(js: str = APP_JS) -> str:
     contains ``//``, so stripping line comments is safe here.)"""
     js = re.sub(r"/\*.*?\*/", "", js, flags=re.DOTALL)
     return re.sub(r"(?m)//.*$", "", js)
+
+
+def test_pwa_runenroll_no_clinician_guard_is_not_silent():
+    # Task #3 — the `if (!user) { return; }` silent no-op in runEnroll is gone (it was an
+    # intentionally-left-blank violation: with scribe.clinicians empty, "Create a voiceprint"
+    # did literally nothing). The guard now renders explicit feedback via
+    # refuseEnrollNoClinician. (loadPresets keeps its OWN silent `if (!user) return` — it is
+    # the DATA layer, and renderPresets already speaks; so scope this to runEnroll's body.)
+    code = _code()
+    run_body = code.split("async function runEnroll(rerecordId) {")[1].split("async function captureEnroll")[0]
+    assert "if (!user) { return; }" not in run_body                # the silent no-op is gone
+    assert "return refuseEnrollNoClinician()" in run_body          # ...replaced by the speaking guard
+    helper_body = code.split("function refuseEnrollNoClinician() {")[1].split("\n  }")[0]
+    assert "No clinicians are configured on this machine" in helper_body   # the ONE reachable case
+    # QA finding 5 — the 'Select a clinician first' variant was UNREACHABLE (fillWho
+    # auto-selects CLINICIANS[0] in EVERY non-empty case, so !user fires only when the list is
+    # empty). The dead branch is removed rather than kept as a comment-lies trap.
+    assert "Select a clinician first" not in code
 
 
 def test_pwa_one_recorder_per_window_no_timeslice():
@@ -362,7 +714,13 @@ def test_pwa_no_browser_storage():
         assert banned not in code, f"R5 violation: {banned} present in CODE"
     assert "cache: 'no-store'" in code                      # belt on every fetch
     html = render_index(_TOKEN)
-    assert "serviceWorker" not in html and "manifest" not in html
+    # NO service worker anywhere in the served page (the no-residue posture). The manifest
+    # link IS now deliberately present (Task #1 standalone install) but carries no storage /
+    # SW semantics — that install-without-a-service-worker invariant is pinned separately in
+    # test_pwa_manifest_install_has_no_service_worker.
+    assert "serviceWorker" not in html
+    assert "sw.js" not in html
+    assert ".register(" not in html
 
 
 def test_pwa_record_view_has_no_free_text_field_and_label_is_machine_minted():
@@ -418,7 +776,11 @@ def test_pwa_enroll_token_is_never_embedded_in_the_page():
     # ...and the client only ever obtains it from the paste field, never the DOM dataset.
     code = _code()
     assert "dataset.enroll" not in code
-    assert re.search(r"enrollToken = \$\('tok'\)\.value", code)
+    # the token is READ from the paste field into a local, then assigned to the memory-only
+    # closure var (finding-7 refactor: empty-paste is caught before the assignment, so the
+    # source is `$('tok').value` via `val`, never the DOM dataset).
+    assert "const val = $('tok').value" in code
+    assert "enrollToken = val;" in code
 
 
 def test_pwa_clinicians_embedded_for_identity_picker():
@@ -874,6 +1236,36 @@ def test_behaviour_inert_box_presets_view_hides_create_and_refuses_early(tmp_pat
     assert res["micOpens"] == 0
     paths = [c["url"].split("?")[0] for c in res["calls"]]
     assert "/scribe/enroll/start" not in paths
+
+
+# ── Task #3: the "Create a voiceprint" button never silently no-ops ──────────
+
+def test_behaviour_no_clinician_configured_shows_explicit_feedback(tmp_path):
+    # THE live 2026-07-16 root cause: scribe.clinicians empty ⇒ `user` unset ⇒ the old
+    # `if (!user) { return; }` made "Create a voiceprint" do literally nothing. It must now
+    # render an explicit, actionable message AND never open the mic or a token prompt (the
+    # !user guard fires BEFORE needEnrollToken + getUserMedia).
+    res = _drive("enroll_no_clinician_configured", tmp_path)
+    assert res["enrollTitle"] == "No clinician configured"
+    assert "No clinicians are configured on this machine" in res["enrollBody"]   # the reachable copy
+    assert res["micOpens"] == 0                          # the mic was never acquired
+    assert res["hasTokenPrompt"] is False               # ...nor a token paste demanded
+    paths = [c["url"].split("?")[0] for c in res["calls"]]
+    assert "/scribe/enroll/start" not in paths          # no enrolment session was opened
+
+
+def test_behaviour_empty_token_paste_is_not_a_dead_continue(tmp_path):
+    # QA finding 7 — pre-existing sibling silent no-op in needEnrollToken: clicking Continue
+    # with an EMPTY token field used to resolve false AND leave the form up, so every later
+    # Continue click hit `!pendingToken` and did literally nothing (a permanently dead button —
+    # the exact 'button does nothing' this fix round exists to eliminate). Now: empty → a
+    # visible message + the prompt stays live; a REAL paste on the SAME button then proceeds.
+    res = _drive("enroll_empty_token_then_valid", tmp_path)
+    assert "Enter the enrolment token to continue" in res["tokMsgAfterEmpty"]
+    assert res["hasTokAfterEmpty"] is True               # the prompt stayed on-screen (not consumed)
+    assert res["enrollStartAfterEmpty"] is False         # an empty paste opened no session
+    assert res["micOpensAfterEmpty"] == 0                # ...and no mic
+    assert res["hasEnGoAfterValid"] is True              # the SAME Continue then advanced — not dead
 
 
 # ── N6: esc() is the attribute-context belt ─────────────────────────────────

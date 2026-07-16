@@ -23,6 +23,14 @@ once per page-load and lives ONLY in a closure variable; a reload asks again. Th
 also why the preset picker's default (MRU) is SERVER-derived (``mru_preset_id``) — the
 client is not allowed to remember it.
 
+STANDALONE INSTALL (Task #1) — the page ships a Web App Manifest + icons so Chrome ≥108
+installs it as a standalone app (no URL bar) from the MANIFEST ALONE. This adds NO
+service worker, NO Cache-API, NO storage of any kind: it is chrome (the install shell),
+not persistence. Offline support is DELIBERATELY absent — you cannot record to a server
+you cannot reach, and audio must never buffer on-device. The manifest + icons + favicon
+are STATIC and SECRET-FREE (unlike the index page, which embeds the ingest token); the
+no-residue posture above is preserved intact.
+
 R6 (no patient identifiers) — the encounter label is a MACHINE token minted client-side
 (``enc-<13-digit ms>-<16 hex nonce>``); NO DOM value feeds it. The record view has NO
 free-text field at all. The only free-text inputs in the page are (a) the enroll-token
@@ -75,6 +83,15 @@ from __future__ import annotations
 
 import html
 import json
+import struct
+import zlib
+
+# The theme/splash colours — the SINGLE source of truth for both the manifest and the
+# page's ``<meta name="theme-color">`` (baked into the HTML by ``render_index``), so the
+# two can never drift. ``THEME_COLOR`` is the app's primary green (matches the record-view
+# primary button); ``BACKGROUND_COLOR`` is the standalone splash background.
+THEME_COLOR = "#1a7f37"
+BACKGROUND_COLOR = "#ffffff"
 
 # The strict CSP the server sends on the page (and the JS). ``connect-src 'self'`` makes
 # the BROWSER itself refuse any off-box fetch even if the page were tampered — a second
@@ -93,12 +110,23 @@ CSP_VALUE = (
 
 _TOKEN_PLACEHOLDER = "__INGEST_TOKEN__"
 _CLINICIANS_PLACEHOLDER = "__CLINICIANS_JSON__"
+_THEME_COLOR_PLACEHOLDER = "__THEME_COLOR__"
+# The install-asset link hrefs are BAKED from the route constants (below) via render_index,
+# so a route rename propagates to the served page — the browser-facing literal can never
+# drift from the registered route (QA fix round, findings 4/9).
+_MANIFEST_ROUTE_PLACEHOLDER = "__MANIFEST_ROUTE__"
+_FAVICON_ROUTE_PLACEHOLDER = "__FAVICON_ROUTE__"
+_APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER = "__APPLE_TOUCH_ICON_ROUTE__"
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="__THEME_COLOR__">
+<link rel="manifest" href="__MANIFEST_ROUTE__">
+<link rel="icon" href="__FAVICON_ROUTE__" sizes="any">
+<link rel="apple-touch-icon" href="__APPLE_TOUCH_ICON_ROUTE__">
 <title>STAY-C Scribe</title>
 <style>
   :root { color-scheme: light dark; }
@@ -572,15 +600,26 @@ APP_JS = r"""'use strict';
       'reloading this page will ask again.</p>' +
       '<label for="tok">Enrolment token</label>' +
       '<input id="tok" type="password" autocomplete="off" spellcheck="false">' +
-      '<button id="tok-ok" class="primary">Continue</button>';
+      '<button id="tok-ok" class="primary">Continue</button>' +
+      '<div id="tok-msg" class="note"></div>';
     return await new Promise((res) => {
       pendingToken = res;                                       // teardown can settle it
       $('tok-ok').addEventListener('click', () => {
         if (!pendingToken) { return; }                          // torn down by a route away
+        const val = $('tok').value || '';
+        // INTENTIONALLY-LEFT-BLANK — an EMPTY Continue must SAY so, not silently no-op.
+        // Consuming pendingToken on empty would resolve false AND leave the form on-screen;
+        // every later Continue click would then hit `!pendingToken` and do literally nothing
+        // — a permanently dead button, the exact "button does nothing" this fix round kills.
+        // So on empty: show a message, keep the prompt LIVE, and wait for a real paste.
+        if (!val) {
+          $('tok-msg').textContent = 'Enter the enrolment token to continue.';
+          return;
+        }
         pendingToken = null;
-        enrollToken = $('tok').value || '';
+        enrollToken = val;
         $('tok').value = '';                                    // drop it from the DOM
-        res(!!enrollToken);
+        res(true);
       });
     });
   }
@@ -648,9 +687,24 @@ APP_JS = r"""'use strict';
       'Ask your operator.</p>';
   }
 
+  // INTENTIONALLY-LEFT-BLANK — the "Create a voiceprint" button must NEVER be a silent
+  // no-op. The old `if (!user) { return; }` did exactly that: with scribe.clinicians empty
+  // (the live 2026-07-16 root cause), tapping Create did literally nothing. Say what is wrong
+  // and who fixes it. This guard fires ONLY in the no-clinician-configured case: fillWho
+  // auto-selects CLINICIANS[0] in EVERY non-empty case (sole AND multi-clinician), and no
+  // picker <option> carries an empty value, so `user` is truthy from page-load onward. "A
+  // clinician exists but none is selected" is therefore unreachable — there is no second
+  // message on purpose (a dead branch would only invite the comment-lies trap).
+  function refuseEnrollNoClinician() {
+    $('enroll').classList.remove('hide');
+    $('enroll-title').textContent = 'No clinician configured';
+    $('enroll-body').innerHTML =
+      '<p>No clinicians are configured on this machine &mdash; ask your operator.</p>';
+  }
+
   // The guided enrolment: record-first, name-last (~45-60s).
   async function runEnroll(rerecordId) {
-    if (!user) { return; }
+    if (!user) { return refuseEnrollNoClinician(); }
     if (recording || micOwner) { return refuseEnrollDuringEncounter(); }
     // An INERT face 404s every enroll route. Refuse HERE — before the token paste and
     // before the mic prompt — rather than asking for both and then failing.
@@ -975,6 +1029,78 @@ APP_JS = r"""'use strict';
 """
 
 
+# ── Standalone-install assets (Task #1): manifest + icons + favicon ───────────────────
+# The routes these are served on. They live HERE (not ingest_web) because the manifest
+# content below references the icon paths — keeping the paths beside the content is the
+# single source of truth (no path drift between the manifest and its route registration).
+# ingest_web imports these for ``app.router.add_get``.
+MANIFEST_ROUTE = "/manifest.webmanifest"
+ICON_192_ROUTE = "/scribe/icon-192.png"
+ICON_512_ROUTE = "/scribe/icon-512.png"
+FAVICON_ROUTE = "/favicon.ico"
+# iOS/WebKit uses apple-touch-icon (NOT the manifest icons member) for the home-screen tile,
+# and — with a <link rel="apple-touch-icon"> declared — fetches ONLY the declared href and
+# does NOT probe the root prefix (per Apple docs), so the sized-variant probes
+# (/apple-touch-icon-120x120.png etc.) never fire and need no route. We ALSO serve the
+# ``-precomposed.png`` sibling: some older WebKit prefers it, and a direct/no-link probe of
+# either canonical path must get a 200 (not the 401 warning-spam the favicon fix killed). The
+# operator's own device is an iPhone (module docstring), so this is the ratified target.
+APPLE_TOUCH_ICON_ROUTE = "/apple-touch-icon.png"
+APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE = "/apple-touch-icon-precomposed.png"
+
+_THEME_RGB = (0x1A, 0x7F, 0x37)   # THEME_COLOR as RGB — the solid icon fill
+
+
+def _solid_png(size: int, rgb: tuple[int, int, int]) -> bytes:
+    """A minimal, valid, SECRET-FREE truecolor PNG: a solid ``rgb`` ``size``x``size`` square.
+
+    GENERATED, not embedded — the bytes are provably data-only (no token, no PHI, no
+    external reference), which is the install-icon hard constraint. A solid fill is a valid
+    ``maskable`` icon: every pixel is brand colour, so any launcher mask crop still shows the
+    brand (the safe-zone requirement is trivially met). zlib-compressed, so a 512px square is
+    a few hundred bytes on the wire."""
+    r, g, b = rgb
+    row = b"\x00" + bytes((r, g, b)) * size          # PNG filter byte 0 + `size` RGB pixels
+    raw = row * size
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)   # 8-bit truecolor RGB
+    return (b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw, 9))
+            + _chunk(b"IEND", b""))
+
+
+ICON_192_PNG = _solid_png(192, _THEME_RGB)
+ICON_512_PNG = _solid_png(512, _THEME_RGB)
+FAVICON_PNG = _solid_png(32, _THEME_RGB)
+APPLE_TOUCH_ICON_PNG = _solid_png(180, _THEME_RGB)   # iOS home-screen tile (180px = @3x)
+
+# The Web App Manifest — STATIC and SECRET-FREE (no token, unlike the index page). ``display:
+# standalone`` is what drops the URL bar; the maskable icons are what Chrome ≥108 needs to offer
+# "Add to Home screen" as an installed app. NO ``serviceWorker`` / ``related_applications`` /
+# storage key — installability only (offline is deliberately absent; see the module docstring).
+MANIFEST_JSON = json.dumps(
+    {
+        "name": "STAY-C",
+        "short_name": "STAY-C",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "theme_color": THEME_COLOR,
+        "background_color": BACKGROUND_COLOR,
+        "icons": [
+            {"src": ICON_192_ROUTE, "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": ICON_512_ROUTE, "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    },
+    separators=(",", ":"),
+)
+
+
 def render_index(token: str, clinicians: list[str] | None = None) -> str:
     """Return the PWA index HTML with the INGEST ``token`` embedded (HTML-attribute
     escaped) for the same-origin JS, plus the ``clinicians`` identity list.
@@ -987,10 +1113,19 @@ def render_index(token: str, clinicians: list[str] | None = None) -> str:
     clinician hand-type it: the server matches the slug VERBATIM and fail-closes on a
     mismatch, so a typo would otherwise burn a consented recording on a 403. JSON is
     embedded in a ``data-`` attribute (HTML-attribute escaped, so ``"``/``<`` can never
-    break out) and parsed by the external JS — never an inline script (CSP)."""
+    break out) and parsed by the external JS — never an inline script (CSP).
+
+    The ``<meta name="theme-color">`` is baked from :data:`THEME_COLOR` — the same constant
+    the manifest uses — so the tab/splash colour can never drift from the manifest's."""
     payload = json.dumps(list(clinicians or []))
     return (
         _INDEX_HTML
         .replace(_TOKEN_PLACEHOLDER, html.escape(token, quote=True))
         .replace(_CLINICIANS_PLACEHOLDER, html.escape(payload, quote=True))
+        .replace(_THEME_COLOR_PLACEHOLDER, THEME_COLOR)
+        # the install-link hrefs are baked from the route constants (single source of truth —
+        # a route rename can never leave the page linking a now-un-exempt path). QA findings 4/9.
+        .replace(_MANIFEST_ROUTE_PLACEHOLDER, MANIFEST_ROUTE)
+        .replace(_FAVICON_ROUTE_PLACEHOLDER, FAVICON_ROUTE)
+        .replace(_APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER, APPLE_TOUCH_ICON_ROUTE)
     )
