@@ -586,6 +586,10 @@ def build_vault_parser(subparsers: argparse._SubParsersAction) -> None:
     # read
     p = vault_sub.add_parser("read", help="Read a vault record")
     p.add_argument("path", help="Relative path to the record (e.g. person/John Smith.md)")
+    p.add_argument(
+        "--as", dest="as_clinician", default=None, metavar="CLINICIAN",
+        help="(STAY-C clinical only) attribute this read to a named clinician in the "
+             "PHIA s.63 access log. Omitted → honest 'operator' fallback (never fabricated).")
 
     # search
     p = vault_sub.add_parser("search", help="Search vault files")

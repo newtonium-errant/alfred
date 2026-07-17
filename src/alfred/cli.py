@@ -1114,7 +1114,49 @@ def cmd_vault(args: argparse.Namespace) -> None:
     )
 
     from alfred.vault.cli import handle_vault_command
-    handle_vault_command(args, vault_context=ctx)
+
+    # PHIA s.63 access log (event-store design §7.1.2c) — register the read hook when
+    # the LOADED CONFIG identifies a STAY-C clinical instance: a `scribe:` block AND
+    # load_scribe_config(raw).mode == "clinical" AND a configured vault path. Gate on
+    # CONFIG IDENTITY, NOT the env-derived ALFRED_VAULT_SCOPE (which is None for an
+    # interactive `alfred --config config.stayc-clinical.yaml vault read <note>` — the
+    # exact human PI-view s.63 targets; a scope gate would leave it unlogged). This
+    # keeps vault-never-imports-scribe (registration is at the dispatcher, not vault/cli).
+    _events = None
+    if raw and isinstance(raw.get("scribe"), dict) and (raw.get("vault") or {}).get("path"):
+        try:
+            from alfred.scribe.config import load_from_unified as _load_scribe_config
+            from alfred.scribe.config import SCRIBE_MODE_CLINICAL
+            if _load_scribe_config(raw).mode == SCRIBE_MODE_CLINICAL:
+                from alfred.scribe.events import ScribeEvents
+                from alfred.vault import ops as _vault_ops
+                log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
+                _events = ScribeEvents.from_config(
+                    raw, log_dir, legacy_audit_path=log_dir / "clinical_attest_audit.jsonl")
+                _vault_ops.register_read_hook(_events.make_read_hook())
+        except Exception:  # noqa: BLE001 — a read is observability; a store-open failure
+            # DEGRADES (unlogged read + loud warning), it never blocks a clinical read.
+            import structlog
+            structlog.get_logger("scribe.events").warning(
+                "scribe.access_log.unavailable",
+                detail="STAY-C clinical vault read: the access-log event store failed to open — "
+                       "the read PROCEEDS but is NOT logged to the s.63 trail (fix the events dir).")
+            _events = None
+
+    # Q3 (design §7.1.3) — `alfred vault read --as <clinician>` attributes the read to a
+    # named clinician (via="cli"); omitted → the honest ("operator","operator") fallback
+    # (never fabricate an identity). Applies to whatever vault_read the subcommand drives.
+    if _events is not None:
+        as_clin = getattr(args, "as_clinician", None)
+        actor, actor_kind = (as_clin, "clinician") if as_clin else ("operator", "operator")
+        try:
+            with _events.access_context(actor, actor_kind, "cli"):
+                handle_vault_command(args, vault_context=ctx)
+        finally:
+            from alfred.vault import ops as _vault_ops
+            _vault_ops.clear_read_hooks()  # one-shot CLI leaves no process-global hook
+    else:
+        handle_vault_command(args, vault_context=ctx)
 
 
 def cmd_exec(args: argparse.Namespace) -> None:
