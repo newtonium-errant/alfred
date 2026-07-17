@@ -1,9 +1,9 @@
-"""Task #4 (box half) — STAY-C bug-report watcher: forwarding modes + PHI-safety + state.
+"""Task #4 (box half) — STAY-C bug-report watcher: relay-spool surfacing + modes + PHI-safety.
 
-The watcher is the SURFACING component (a systemd .path unit outside the clinical unit).
-Its load-bearing property is the FAIL-SAFE default: any missing/unparseable mode resolves to
-``locked`` (count + filename only, PHI-safe), never ``full`` (body egress). Tests drive the
-pure functions + run_once with a fake sender (no httpx, no network)."""
+The watcher SURFACES reports by writing a Salem brief-relay SPOOL FILE (STAY-C uses NO Telegram
+— standing rule 2026-07-16). Its load-bearing property is the FAIL-SAFE default: any
+missing/unparseable mode resolves to ``locked`` (count + opaque ids), never ``full`` (bodies).
+Tests drive the pure functions + run_once with a fake writer (captures the whole-file text)."""
 
 from __future__ import annotations
 
@@ -52,147 +52,145 @@ def test_mode_missing_env_is_locked():
 
 
 # ---------------------------------------------------------------------------
-# build_alert — PHI boundary per mode
+# build_snapshot — PHI boundary per mode
 # ---------------------------------------------------------------------------
 
-def test_locked_alert_is_count_and_opaque_id_only_no_free_text(tmp_path):
-    # R1 — plant PHI in the SUMMARY (the real leak vector: the old slug embedded the summary in
-    # the id, which locked mode sends). With the OPAQUE id, the ping carries no summary text.
-    bid, bug_dir = _seed(tmp_path, _PHI + " cant save", "and in the detail too")
-    reports = w.scan_new_reports(bug_dir, set())
-    text = w.build_alert(w.FORWARD_MODE_LOCKED, reports)
-    assert bid in text and "1 new bug report" in text            # count + OPAQUE id
+def test_locked_snapshot_is_count_and_opaque_ids_only(tmp_path):
+    # R1 — plant PHI in the SUMMARY (the leak vector the old slug-in-id created). The opaque id
+    # carries no summary text, and locked mode NEVER opens the file, so the spool is PHI-safe.
+    bid, bug_dir = _seed(tmp_path, _PHI + " cant save", "and PHI in the detail too")
+    reports = w.list_unresolved_reports(bug_dir)
+    text = w.build_snapshot(w.FORWARD_MODE_LOCKED, reports, generated_at="2026-07-16T00:00:00Z", new_count=1)
+    assert bid in text and "unresolved: 1" in text and "generated_at:" in text
     assert _PHI not in text and _PHI.lower() not in text.lower()  # NEVER the summary or its slug
     assert "jane" not in text.lower() and "patient" not in text.lower()   # not even a fragment
 
 
-def test_full_alert_includes_the_body(tmp_path):
-    bid, bug_dir = _seed(tmp_path, "dead button", _PHI + " in the detail")
-    reports = w.scan_new_reports(bug_dir, set())
-    text = w.build_alert(w.FORWARD_MODE_FULL, reports)
-    assert bid in text and _PHI in text                          # synthetic-era full-body forward
+def test_full_snapshot_includes_summary_and_body(tmp_path):
+    bid, bug_dir = _seed(tmp_path, "a plain summary", _PHI + " in the detail")
+    reports = w.list_unresolved_reports(bug_dir)
+    text = w.build_snapshot(w.FORWARD_MODE_FULL, reports, generated_at="2026-07-16T00:00:00Z", new_count=1)
+    assert bid in text and "a plain summary" in text and _PHI in text   # summary line + full body
 
 
-def test_run_once_locked_never_sends_summary_or_body(tmp_path):
-    # END-TO-END fail-safe: with the DEFAULT (locked) mode, a report whose SUMMARY and body
-    # carry PHI is surfaced by opaque id only — the sent text never contains either.
+def test_empty_snapshot_is_an_explicit_signal(tmp_path):
+    # ILB — a zero-unresolved snapshot SAYS so (Salem must distinguish "0 open bugs" from a
+    # stale/missing file), and it is written every run.
+    text = w.build_snapshot(w.FORWARD_MODE_LOCKED, [], generated_at="2026-07-16T00:00:00Z", new_count=0)
+    assert "unresolved: 0" in text and "no unresolved bug reports" in text
+
+
+def test_run_once_locked_relay_never_contains_summary_or_body(tmp_path):
+    # END-TO-END fail-safe: DEFAULT (locked) mode, a report whose SUMMARY + body carry PHI is
+    # relayed by opaque id only — the spool text never contains either.
     _seed(tmp_path, _PHI + " summary", _PHI + " detail")
     bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
     sent = []
-    summary = w.run_once(bug_dir, mode=w.resolve_forward_mode({}), sender=sent.append,
+    summary = w.run_once(bug_dir, mode=w.resolve_forward_mode({}), writer=sent.append,
                          state_path=tmp_path / "state.json")
-    assert summary["forwarded"] == 1 and summary["mode"] == "locked"
+    assert summary["unresolved"] == 1 and summary["new"] == 1 and summary["mode"] == "locked"
     assert sent and _PHI not in sent[0] and _PHI.lower() not in sent[0].lower()
 
 
-def test_run_once_raises_and_preserves_state_on_send_failure(tmp_path):
-    # R2 — a Telegram delivery failure (sender raises, e.g. the httpx sender on HTTP >= 400)
-    # must NOT mark the reports forwarded: run_once propagates and state is NOT saved, so the
-    # reports are re-scanned + retried next run (never the silent sink where a revoked token is
-    # treated as success).
+# ---------------------------------------------------------------------------
+# R2 — a relay WRITE failure fails loud and preserves state
+# ---------------------------------------------------------------------------
+
+def test_run_once_raises_and_preserves_state_on_write_failure(tmp_path):
+    # R2 — a spool write failure (unwritable path / permission) must NOT advance state: run_once
+    # propagates and the ids stay unmarked, so the next run re-surfaces them (never the silent
+    # sink where an undeliverable relay is treated as success).
     _seed(tmp_path, "one", "d")
     bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
     state = tmp_path / "state.json"
 
     def _boom(_text):
-        raise w.TelegramSendError("Telegram HTTP 401")
+        raise w.RelayWriteError("cannot write relay spool")
 
-    with pytest.raises(w.TelegramSendError):
-        w.run_once(bug_dir, mode="locked", sender=_boom, state_path=state)
-    assert w.load_forwarded(state) == set()                      # NOT marked → retried next run
-    # a retry with a working sender then forwards it.
+    with pytest.raises(w.RelayWriteError):
+        w.run_once(bug_dir, mode="locked", writer=_boom, state_path=state)
+    assert w.load_forwarded(state) == set()                      # NOT advanced → re-surfaced next run
     sent = []
-    w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
-    assert len(sent) == 1
+    w.run_once(bug_dir, mode="locked", writer=sent.append, state_path=state)
+    assert sent and "unresolved: 1" in sent[0]
+
+
+def test_relay_writer_atomic_and_raises_on_unwritable(tmp_path):
+    # the real writer writes atomically (no .tmp residue) and raises RelayWriteError when the
+    # target dir cannot be created (a FILE where the parent dir should be).
+    good = tmp_path / "relay" / "spool.md"
+    w._relay_writer(good)("hello")
+    assert good.read_text() == "hello" and not list(good.parent.glob("*.tmp"))
+    blocker = tmp_path / "blocked"
+    blocker.write_text("i am a file, not a dir")
+    with pytest.raises(w.RelayWriteError):
+        w._relay_writer(blocker / "spool.md")("x")               # parent is a file → mkdir fails
 
 
 # ---------------------------------------------------------------------------
-# scan + state (no double-forward; dotfile ignored)
+# whole-file snapshot semantics + state (new-count, outside the bug dir)
 # ---------------------------------------------------------------------------
 
-def test_scan_ignores_forwarded(tmp_path):
+def test_snapshot_is_a_whole_file_rolling_view(tmp_path):
+    # The spool is REGENERATED whole each run: it always reflects ALL currently-unresolved
+    # reports (both, here), not an append of just the new one. `new` counts only the delta.
     a, bug_dir = _seed(tmp_path, "first", "d")
+    state = tmp_path / "state.json"
+    sent = []
+    first = w.run_once(bug_dir, mode="locked", writer=sent.append, state_path=state)
+    assert first["unresolved"] == 1 and first["new"] == 1
+    second = w.run_once(bug_dir, mode="locked", writer=sent.append, state_path=state)
+    assert second["unresolved"] == 1 and second["new"] == 0      # same report, no longer "new"
     b, _ = _seed(tmp_path, "second", "d")
-    assert {p.stem for p in w.scan_new_reports(bug_dir, set())} == {a, b}
-    assert {p.stem for p in w.scan_new_reports(bug_dir, {a})} == {b}
+    third = w.run_once(bug_dir, mode="locked", writer=sent.append, state_path=state)
+    assert third["unresolved"] == 2 and third["new"] == 1        # whole view = both; delta = 1
+    assert a in sent[-1] and b in sent[-1]                       # the file lists BOTH
+
+
+def test_run_once_empty_writes_an_explicit_snapshot(tmp_path):
+    bug_dir = tmp_path / "bugs"
+    bug_dir.mkdir()
+    sent = []
+    summary = w.run_once(bug_dir, mode="locked", writer=sent.append,   # ILB — always a signal
+                         state_path=tmp_path / "state.json")
+    assert summary["unresolved"] == 0 and sent and "unresolved: 0" in sent[0]
 
 
 def test_state_lives_outside_the_bug_dir(tmp_path):
-    # R3 — the forwarded-state is WATCHER-OWNED, NOT in the (group-r-x) bug dir. save/load use an
-    # explicit state_path, and the default is under the watcher's XDG state dir, never the bug dir.
+    # R3 — the state is WATCHER-OWNED, NOT in the (group-r-x) bug dir. save/load use an explicit
+    # state_path, and the default is under the watcher's XDG state dir, never the bug dir.
     a, bug_dir = _seed(tmp_path, "first", "d")
-    state = tmp_path / "watcher-state" / "forwarded.json"
+    state = tmp_path / "watcher-state" / "state.json"
     w.save_forwarded(state, {a})
     assert state.is_file() and not (bug_dir / w._STATE_NAME).exists()   # NOT in the bug dir
     assert w.load_forwarded(state) == {a}
     assert w.default_state_path(bug_dir) != bug_dir / w._STATE_NAME     # default is watcher-owned
 
 
-def test_run_once_does_not_double_forward(tmp_path):
-    _seed(tmp_path, "one", "d")
-    bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
-    state = tmp_path / "state.json"
-    sent = []
-    first = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
-    second = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)  # .path fires again
-    assert first["forwarded"] == 1 and second["forwarded"] == 0       # marked, not re-sent
-    assert len(sent) == 1
-    # a NEW report after that forwards just the new one.
-    _seed(tmp_path, "two", "d")
-    third = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
-    assert third["forwarded"] == 1 and len(sent) == 2
-
-
-def test_run_once_no_new_reports_is_a_signal_not_a_crash(tmp_path):
-    bug_dir = tmp_path / "bugs"
-    bug_dir.mkdir()
-    sent = []
-    summary = w.run_once(bug_dir, mode="locked", sender=sent.append,   # ILB — ran, nothing new
-                         state_path=tmp_path / "state.json")
-    assert summary["forwarded"] == 0 and sent == []
-
-
-def test_run_once_caps_reports_per_run(tmp_path):
-    # F6 — a backlog must not fan out into hundreds of chunks (post-R2 a rate-limit 429 HARD
-    # fails the run). Forward at most MAX_REPORTS_PER_RUN per trigger; the rest drain later.
-    for i in range(w.MAX_REPORTS_PER_RUN + 3):
-        _seed(tmp_path, f"report {i}", "d")
-    bug_dir = bug_mod.resolve_bug_dir(_cfg(tmp_path))
-    state = tmp_path / "state.json"
-    sent = []
-    summary = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
-    assert summary["forwarded"] == w.MAX_REPORTS_PER_RUN and summary["overflow"] == 3
-    assert "more this run" in sent[0]                            # overflow is signalled
-    # the remaining drain on the next run.
-    second = w.run_once(bug_dir, mode="locked", sender=sent.append, state_path=state)
-    assert second["forwarded"] == 3
-
-
 def test_load_forwarded_tolerates_corrupt_state(tmp_path):
     state = tmp_path / "state.json"
     state.write_text("{not json", encoding="utf-8")
-    assert w.load_forwarded(state) == set()                     # tolerant → re-send, never lost
+    assert w.load_forwarded(state) == set()                     # tolerant → re-counted, never lost
 
 
 # ---------------------------------------------------------------------------
 # bundled systemd artifacts
 # ---------------------------------------------------------------------------
 
-def test_watcher_templates_are_bundled_with_expected_placeholders():
+def test_watcher_templates_are_bundled_for_the_relay_spool():
     sysd = get_systemd_dir()
     path_tmpl = (sysd / "stayc-bug-watcher.path.template").read_text(encoding="utf-8")
     svc_tmpl = (sysd / "stayc-bug-watcher.service.template").read_text(encoding="utf-8")
     # the .path watches the bug dir and triggers the .service.
     assert "PathModified=<STAYC_BUG_DIR>" in path_tmpl
     assert "Unit=stayc-bug-watcher.service" in path_tmpl
-    # the .service runs the watcher module as the operator, with its OWN state dir writable
-    # (NOT the bug dir — the watcher only reads that) + no IPAddressDeny (it MUST egress).
+    # the .service runs the watcher, writes the Salem relay spool (NO Telegram, NO network).
     assert "-m alfred.scripts.stayc_bug_watcher" in svc_tmpl
-    assert "STAYC_BUG_STATE=<STAYC_WATCHER_STATE>" in svc_tmpl        # relocated state (R3)
-    assert "ReadWritePaths=<STAYC_WATCHER_STATE_DIR>" in svc_tmpl     # writable state dir, not bug dir
+    assert "STAYC_BUG_RELAY_PATH=<RELAY_PATH>" in svc_tmpl            # the relay spool env
+    assert "Telegram" not in svc_tmpl and "TELEGRAM" not in svc_tmpl  # channel swapped out
+    assert "AF_INET" not in svc_tmpl                                  # no network at all
+    # writable holes: the relay dir + the watcher's own state dir (NOT the bug dir).
+    assert "ReadWritePaths=<RELAY_DIR> <STAYC_WATCHER_STATE_DIR>" in svc_tmpl
     assert not any(ln.strip() == "ReadWritePaths=<STAYC_BUG_DIR>" for ln in svc_tmpl.splitlines())
-    # no IPAddressDeny DIRECTIVE (it must egress to Telegram); a comment MENTIONING it is fine.
-    assert not any(ln.strip().startswith("IPAddressDeny=") for ln in svc_tmpl.splitlines())
-    assert "<STAYC_WATCHER_USER>" in svc_tmpl
     # the shared-group cross-user provisioning (R3) is documented in the template.
     assert "groupadd" in svc_tmpl and "stayc-bugs" in svc_tmpl and "usermod -aG" in svc_tmpl

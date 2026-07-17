@@ -1,11 +1,11 @@
 [Unit]
-Description=STAY-C bug-report watcher — forward new reports to Telegram (surfacing, task #4)
-After=network-online.target
-Wants=network-online.target
+Description=STAY-C bug-report watcher — write the Salem relay spool (surfacing, task #4)
 
 [Service]
 Type=oneshot
-# Runs as the OPERATOR (NOT the clinical User=) — this is the one component that egresses.
+# Runs as the OPERATOR (NOT the clinical User=). STAY-C uses NO external messaging channel
+# (standing rule): this component's ONLY output is a local relay SPOOL FILE that Salem's Morning
+# Brief reads. No network at all — hence no After=network / IPAddressAllow here.
 #
 # CROSS-USER ACCESS (task #4 R3) — the clinical daemon (a DIFFERENT user, UMask=0077) owns the
 # bug dir + reports. It sets them EXPLICITLY to dir 2750 (setgid, group r-x) + files 0640
@@ -16,34 +16,37 @@ Type=oneshot
 #     usermod -aG stayc-bugs <STAYC_WATCHER_USER>
 # The daemon re-applies the setgid+modes on every write, so new reports inherit the group and
 # stay group-readable. The watcher NEVER writes into the bug dir (it is not group-writable) —
-# its forwarded-state lives in STAYC_BUG_STATE below. If the group is missing the watcher fails
-# LOUDLY (read error → non-zero exit), never a silent sink.
+# its snapshot-ids state lives in STAYC_BUG_STATE below. If the group is missing the watcher
+# fails LOUDLY (read error → non-zero exit), never a silent sink.
 User=<STAYC_WATCHER_USER>
 Group=<STAYC_WATCHER_GROUP>
-# The operator env carries TELEGRAM_BOT_TOKEN + STAYC_BUG_TELEGRAM_CHAT_ID + the forwarding
-# mode (STAYC_BUG_FORWARD_MODE). Leading `-` so a MISSING env-file is non-fatal to LOAD — the
-# watcher then fails LOUD at runtime (no token -> exit 2, the unit shows failed) rather than
-# systemd refusing to start the unit at all.
+# The operator env carries the forwarding mode (STAYC_BUG_FORWARD_MODE). Leading `-` so a
+# MISSING env-file is non-fatal to LOAD — the watcher then fails LOUD at runtime (no relay path
+# -> exit 2, the unit shows failed) rather than systemd refusing to start the unit at all.
 EnvironmentFile=-<STAYC_WATCHER_ENV>
 Environment=STAYC_BUG_DIR=<STAYC_BUG_DIR>
-# The watcher's OWN forwarded-state file (NOT in the bug dir — that is group-r-x, not writable
-# by the watcher). A watcher-owned path, e.g. /var/lib/stayc-bug-watcher/.forwarded.json.
+# The Salem-readable relay SPOOL — OUTSIDE the STAY-C trust zone. The watcher writes it and
+# Salem reads it, e.g. /data/algernon/alfred/data/stayc_bugs_relay.md. It must be
+# WATCHER-writable + SALEM-readable: place it in a dir owned/writable by <STAYC_WATCHER_USER>
+# whose group (or ACL) grants Salem's user read, or a shared group both belong to.
+Environment=STAYC_BUG_RELAY_PATH=<RELAY_PATH>
+# The watcher's OWN snapshot-ids state file (NOT in the bug dir — that is group-r-x, not
+# writable by the watcher). A watcher-owned path, e.g. /var/lib/stayc-bug-watcher/state.json.
 Environment=STAYC_BUG_STATE=<STAYC_WATCHER_STATE>
 # FAIL-SAFE (operator ruling 2026-07-16): if STAYC_BUG_FORWARD_MODE is unset / unparseable the
-# watcher resolves to `locked` (count + filename only). A misconfig can NEVER silently escalate
-# to full-body PHI egress. The go-live gate flips the env from `full` back to `locked`.
+# watcher resolves to `locked` (count + opaque ids only). A misconfig can NEVER silently
+# escalate to full-body PHI egress. The go-live gate flips the env from `full` back to `locked`.
 ExecStart=<STAYC_WATCHER_PYTHON> -m alfred.scripts.stayc_bug_watcher
-# Hardening — a tiny egress helper; drop what it does not need. NOTE: unlike the clinical unit,
-# this one MUST reach the network (Telegram), so there is NO IPAddressDeny here.
+# Hardening — a tiny local file writer; drop what it does not need. No network at all.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# The only writable hole it needs is its OWN state dir (ProtectSystem=strict still allows READ
-# of the bug dir — reading is never blocked, only writing). The bug dir is NOT here: the watcher
-# only reads it, and DAC (the shared group) is what grants that read.
-ReadWritePaths=<STAYC_WATCHER_STATE_DIR>
+# The writable holes: the relay spool dir (Salem-readable) + the watcher's own state dir.
+# ProtectSystem=strict still allows READ of the bug dir (reading is never blocked, only
+# writing); the bug dir is NOT here — DAC (the shared group) is what grants that read.
+ReadWritePaths=<RELAY_DIR> <STAYC_WATCHER_STATE_DIR>
 PrivateTmp=yes
-UMask=0077
+UMask=0027
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -51,7 +54,7 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_UNIX
 
 # No [Install] — this .service is triggered by stayc-bug-watcher.path (Type=oneshot), not
 # enabled directly. Enable the .path unit; it starts this on every bug-dir change.
