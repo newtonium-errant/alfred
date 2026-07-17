@@ -1,8 +1,8 @@
 [Unit]
 Description=STAY-C bug-report watcher path — fire on new reports (surfacing; NON-clinical)
 # DELIBERATELY SEPARATE from alfred-stayc-clinical.service. This surfacing component runs
-# OUTSIDE the clinical unit, as the OPERATOR, and is the only piece allowed to egress
-# (Telegram). The clinical daemon (sovereign, no-egress) never touches it. Task #4.
+# OUTSIDE the clinical unit, as the OPERATOR. It does NOT egress at all — its only output is a
+# local Salem-readable relay SPOOL FILE (no network). The clinical daemon never touches it. Task #4.
 
 [Path]
 # Fire whenever the bug dir changes — a new/rewritten report file lands here.

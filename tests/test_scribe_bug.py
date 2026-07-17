@@ -2,8 +2,8 @@
 
 Layers:
   * config — ScribeBugConfig defaults / coercion / dir resolution.
-  * module (scribe.bug) — 0600 write, PHI-free auto-context (closed key set), event
-    truncation, slug, list/show/resolve, traversal guard, the open-report disk cap.
+  * module (scribe.bug) — 0640/2750 write, PHI-free auto-context (closed key set), OPAQUE id
+    (ts+hex, no summary text), event truncation, list/show/resolve, traversal guard, open cap.
   * route (POST /scribe/bug) — ingest-token gate, enabled toggle (404), body cap (413,
     both Content-Length pre-check and post-read), empty/invalid (400), report_cap (429),
     and PHI-safe logging (summary/detail never logged).

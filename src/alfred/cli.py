@@ -2707,8 +2707,9 @@ def cmd_scribe(args: argparse.Namespace) -> None:
 def _cmd_scribe_bugs(args: argparse.Namespace) -> None:
     """``alfred scribe bugs list|show|resolve`` — triage box-local bug reports (task #4).
 
-    Local file ops only (no vault write, no egress): reads/moves ``<ts>-<slug>.md`` reports
-    under the resolved bug dir. Promotion to Forgejo bug-intake / VERA is a HUMAN act after
+    Local file ops only (no vault write, no egress): reads/moves ``<ts>-<hex>.md`` reports
+    (opaque id — the summary lives only in the file body) under the resolved bug dir. Promotion
+    to Forgejo bug-intake / VERA is a HUMAN act after
     on-box read + scrub — this CLI does NOT forward. ``resolve`` moves a report to
     ``resolved/`` (v1 keeps them; retention is owned by task #13)."""
     raw = _load_unified_config(args.config)

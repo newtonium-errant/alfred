@@ -187,7 +187,10 @@ def test_watcher_templates_are_bundled_for_the_relay_spool():
     # the .service runs the watcher, writes the Salem relay spool (NO Telegram, NO network).
     assert "-m alfred.scripts.stayc_bug_watcher" in svc_tmpl
     assert "STAYC_BUG_RELAY_PATH=<RELAY_PATH>" in svc_tmpl            # the relay spool env
-    assert "Telegram" not in svc_tmpl and "TELEGRAM" not in svc_tmpl  # channel swapped out
+    # channel swapped out — NO stale Telegram mention in EITHER template (the .path escaped the
+    # first sweep; bind both).
+    for name, tmpl in (("service", svc_tmpl), ("path", path_tmpl)):
+        assert "Telegram" not in tmpl and "TELEGRAM" not in tmpl, name
     assert "AF_INET" not in svc_tmpl                                  # no network at all
     # writable holes: the relay dir + the watcher's own state dir (NOT the bug dir).
     assert "ReadWritePaths=<RELAY_DIR> <STAYC_WATCHER_STATE_DIR>" in svc_tmpl
