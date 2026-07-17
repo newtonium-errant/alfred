@@ -135,3 +135,43 @@ def test_post_attest_scan_inactive_facade_noop(tmp_path):
     maint = ScribeEventMaintenance(ev)
     assert maint.post_attest_edit_scan(tmp_path / "vault", full=True) == []
     assert maint.heartbeat_if_due(now="2026-07-16T12:00:00+00:00") is None
+
+
+# --- R-A: detection survives an index rebuild (re-derive rel_path) -----------
+
+def test_post_attest_scan_detects_after_index_rebuild(tmp_path):
+    # THE mission-critical pin (AG-Rec-6): rebuild_index() wipes rel_path to "" (index-only, never
+    # chained); the scan must RE-DERIVE the note path from source_id and STILL detect a post-attest
+    # edit — not skip (a silent false all-clear on `verify --deep --rebuild-index`).
+    ev = _events(tmp_path)
+    vault, rel = _attested_note(tmp_path, ev, source_id="enc-rebuild0001")
+    _edit_body_out_of_band(vault, rel, "SNEAKY POST-ATTEST EDIT")
+    ev.rebuild_index()  # wipes rel_path across the whole index
+    assert ev.attested_digest("enc-rebuild0001")["rel_path"] == ""  # confirm the wipe
+    edits = ScribeEventMaintenance(ev).post_attest_edit_scan(vault, full=True)
+    assert len(edits) == 1 and edits[0]["subject_id"] == "enc-rebuild0001"
+    assert edits[0]["rel_path"] == rel  # MUTATION-BIND: old `continue` on empty rel_path → []
+
+
+def test_post_attest_scan_rederive_skips_truly_deleted_note(tmp_path):
+    # If the note is genuinely gone (deleted) after an index rebuild, re-derivation finds nothing →
+    # no false positive, no crash.
+    ev = _events(tmp_path)
+    vault, rel = _attested_note(tmp_path, ev, source_id="enc-gone00000001")
+    ev.rebuild_index()
+    (vault / rel).unlink()  # the note is deleted
+    assert ScribeEventMaintenance(ev).post_attest_edit_scan(vault, full=True) == []
+
+
+# --- R-E: the sweep is index-driven, not a full clinical-stream scan ---------
+
+def test_post_attest_scan_is_index_driven(tmp_path):
+    ev = _events(tmp_path)
+    vault, _ = _attested_note(tmp_path, ev, source_id="enc-idx0000001")
+    calls = {"attested_index": 0, "query": 0}
+    real_ai, real_q = ev.attested_index, ev.query
+    ev.attested_index = lambda: calls.__setitem__("attested_index", calls["attested_index"] + 1) or real_ai()
+    ev.query = lambda *a, **k: calls.__setitem__("query", calls["query"] + 1) or real_q(*a, **k)
+    ScribeEventMaintenance(ev).post_attest_edit_scan(vault, full=True)
+    assert calls["attested_index"] == 1   # ONE index read (index-driven)
+    assert calls["query"] == 0            # no full clinical-stream scan per sweep (O(N), not O(N^2))

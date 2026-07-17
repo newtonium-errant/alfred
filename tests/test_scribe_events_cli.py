@@ -201,3 +201,33 @@ def test_audit_encounter_timeline(tmp_path, capsys):
 def test_no_emit_verb(tmp_path):
     # There is DELIBERATELY no `events emit` — the facade has no emit either (§2.2).
     assert not hasattr(ScribeEvents, "emit")
+
+
+def test_verify_deep_with_rebuild_index_still_reports_edit(tmp_path, capsys):
+    # R-A regression (the false all-clear): `verify --deep --rebuild-index` runs rebuild FIRST
+    # (wiping rel_path to "") then the deep scan — which used to `continue` and report [] regardless
+    # of on-disk tampering. The scan's source_id re-derivation must keep the AG-Rec-6 query truthful.
+    cfg = _write_cfg(tmp_path)
+    ev = _seed(tmp_path)
+    vault = tmp_path / "vault"
+    rel = vault_create(
+        vault, "clinical_note", "Enc rebuild-deep",
+        set_fields={"ai_draft": True, "synthetic": True, "status": "ai_draft",
+                    "source_id": "enc-cli-rebuild01", "drafted_by": "stayc_scribe",
+                    "encounter_completeness": {"protocol": 1, "complete": True}},
+        body="## S\nchest pain\n", scope="stayc_clinical")["path"]
+    attest(vault, rel, new_status="attested", attester="np_jamie", clinician_ids=_CLINICIANS,
+           audit_path=tmp_path / "a.jsonl", now=datetime(2026, 7, 16, 12, tzinfo=timezone.utc),
+           events=ev)
+    post = frontmatter.load(str(vault / rel))
+    post.content += "\nSNEAKY EDIT AFTER SIGNATURE"
+    (vault / rel).write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    cli.cmd_scribe(_ns(cfg, "verify", deep=True, rebuild_index=True))
+    # --rebuild-index prints its own {"rebuilt_index_entries": N} blob first, then the report.
+    text = capsys.readouterr().out.strip()
+    _, idx = json.JSONDecoder().raw_decode(text)   # the rebuild blob
+    out = json.loads(text[idx:].strip())           # the verify report
+    assert out["ok"] is True
+    assert len(out["post_attest_edits"]) == 1  # NOT a false all-clear despite the rebuild
+    assert out["post_attest_edits"][0]["subject_id"] == "enc-cli-rebuild01"

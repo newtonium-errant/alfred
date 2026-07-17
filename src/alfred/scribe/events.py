@@ -443,6 +443,12 @@ class ScribeEvents:
         post-attest-edit sweep's source of truth (§5.3)."""
         return self._read_index().get(subject_id)
 
+    def attested_index(self) -> dict:
+        """The FULL attested-digest index snapshot ({subject_id: {body_sha, attested_at, seq,
+        rel_path}}). The post-attest-edit sweep iterates this ONCE (§5.3 / adjudication item 5) —
+        index-driven — instead of a full clinical-stream scan plus a per-subject index re-parse."""
+        return self._read_index()
+
     def rebuild_index(self) -> int:
         """Rebuild the attested-digest index from clinical.jsonl (``events verify --rebuild-index``).
         ``rel_path`` is index-only (never chained, §7.4) so a rebuild leaves it ``""`` — the

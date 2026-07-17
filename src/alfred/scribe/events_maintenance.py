@@ -46,6 +46,31 @@ def _parse_ts(ts: Any) -> datetime | None:
         return None
 
 
+def _build_source_id_index(vault_path: Path) -> dict[str, str]:
+    """Map ``source_id → rel_path`` by scanning the vault's ``clinical_note`` records — the
+    re-derivation for attested-index entries whose ``rel_path`` is empty (the index was rebuilt from
+    the chain, where ``rel_path`` is never carried, §7.4, or lost). Read-only, frontmatter only;
+    built lazily at most once per scan. Mirrors ``vault_list``'s internal enumeration but returns
+    the ``source_id`` the digest index keys on."""
+    import frontmatter
+
+    out: dict[str, str] = {}
+    clinical_dir = Path(vault_path) / "clinical_note"
+    if not clinical_dir.is_dir():
+        return out
+    for md in clinical_dir.rglob("*.md"):
+        try:
+            post = frontmatter.load(str(md))
+        except Exception:  # noqa: BLE001 — an unreadable/half-written note is skipped, never fatal
+            continue
+        if post.metadata.get("type") != "clinical_note":
+            continue
+        sid = str(post.metadata.get("source_id") or "")
+        if sid:
+            out[sid] = str(md.relative_to(vault_path)).replace("\\", "/")
+    return out
+
+
 class ScribeEventMaintenance:
     """Owns the daemon's event-store latches. One instance per daemon lifetime."""
 
@@ -108,24 +133,39 @@ class ScribeEventMaintenance:
         per-sweep check is HOT-WINDOW-bounded — encounters attested within ``hot_window_days`` OR
         whose note file mtime is within that window. ``emit=False`` (the ``events verify --deep``
         query surface, §8 row 15 — query verbs append ONLY ``store.verified``, never a note event)
-        REPORTS mismatches without emitting or latching. Detection ONLY — never a status mutation."""
+        REPORTS mismatches without emitting or latching. Detection ONLY — never a status mutation.
+
+        INDEX-DRIVEN (§5.3 / adjudication item 5): iterates the attested-digest index ONCE, not a
+        full clinical-stream scan + a per-subject index re-parse. When an index entry's ``rel_path``
+        is empty (the index was REBUILT from the chain — ``rel_path`` is index-only, never chained,
+        §7.4 — or lost), the note path is RE-DERIVED from ``subject_id`` by matching the vault's
+        clinical_note ``source_id`` frontmatter (lazily, one vault scan). Without this, a rebuild
+        silently blinds detection and ``verify --deep --rebuild-index`` prints a FALSE all-clear on
+        the exact AG-Rec-6 'prove any post-signature change is visible' query."""
         ev = self._ev
         if not ev.active:
             return []
         now_dt = _parse_ts(now) or datetime.now(timezone.utc)
         cutoff = now_dt - timedelta(days=self._hot_window_days)
-        # subject_id → attested ts (chain-derived; the index carries rel_path per subject).
-        subjects: dict[str, str] = {}
-        for e in ev.query("clinical", kind="attest.recorded"):
-            sid = str(e.get("subject_id") or "")
-            if sid:
-                subjects[sid] = str(e.get("ts") or "")
+        index = ev.attested_index()  # ONE read (index-driven), body_sha/attested_at/rel_path per subject
+        source_id_map: dict[str, str] | None = None  # built lazily ONLY if a rel_path is empty
         edits: list[dict] = []
-        for sid, attested_ts in subjects.items():
-            dig = ev.attested_digest(sid)
-            if not dig or not dig.get("rel_path"):
-                continue  # rebuilt index (rel_path="") can't locate the note — skip
-            rel_path = dig["rel_path"]
+        for sid, dig in index.items():
+            if not sid or not isinstance(dig, dict):
+                continue
+            body_sha = str(dig.get("body_sha") or "")
+            if not body_sha:
+                continue
+            attested_ts = str(dig.get("attested_at") or "")
+            rel_path = str(dig.get("rel_path") or "")
+            if not rel_path:
+                # RE-DERIVE (R-A): the rebuilt/lost index dropped rel_path — locate the note by its
+                # source_id, not `continue` (which is the silent false all-clear).
+                if source_id_map is None:
+                    source_id_map = _build_source_id_index(vault_path)
+                rel_path = source_id_map.get(sid, "")
+                if not rel_path:
+                    continue  # the note is genuinely gone (deleted) — nothing to compare
             if not full and not self._in_hot_window(vault_path, rel_path, attested_ts, cutoff):
                 continue
             try:
@@ -133,9 +173,9 @@ class ScribeEventMaintenance:
             except (VaultError, OSError):
                 continue
             current_sha = _body_sha(body)
-            if current_sha == dig["body_sha"]:
+            if current_sha == body_sha:
                 continue
-            record = {"subject_id": sid, "attested_body_sha": dig["body_sha"],
+            record = {"subject_id": sid, "attested_body_sha": body_sha,
                       "current_body_sha": current_sha, "rel_path": rel_path}
             if not emit:
                 edits.append(record)  # REPORT-only (verify --deep): no emit, no latch
@@ -147,13 +187,13 @@ class ScribeEventMaintenance:
             log.warning(
                 "scribe.events.post_attest_edit_detected",
                 subject_id=sid,
-                attested_body_sha=dig["body_sha"],
+                attested_body_sha=body_sha,
                 current_body_sha=current_sha,
                 detail="the signed note's body no longer matches its attested digest — a post-attest "
                        "edit visibly re-opens review (detection only; the sanctioned supersede is amend)",
             )
             ev.note_post_attest_edit_detected(
-                subject_id=sid, attested_body_sha=dig["body_sha"], current_body_sha=current_sha)
+                subject_id=sid, attested_body_sha=body_sha, current_body_sha=current_sha)
             edits.append(record)
         return edits
 
