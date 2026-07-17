@@ -243,3 +243,90 @@ def test_genesis_pins_legacy_predecessor(tmp_path):
     assert genesis["kind"] == "stream.genesis"
     assert genesis["payload"]["predecessor_file"] == "clinical_attest_audit.jsonl"
     assert len(genesis["payload"]["predecessor_sha256"]) == 64  # the legacy file's sha256 pinned
+
+
+# --- M2: rebuild_index runs under the clinical-stream flock ------------------
+
+def test_rebuild_index_blocks_while_clinical_lock_held(tmp_path):
+    # §7.4: rebuild_index does read-log → atomic-write UNDER the clinical flock, so it can't race a
+    # concurrent attest's post_append index update. Pin: while the lock is HELD, a rebuild in
+    # another thread cannot complete; once released, it does. (MUTATION-BIND: drop the `with
+    # stream_lock` and the rebuild completes immediately while the lock is held.)
+    import threading
+    ev = _events(tmp_path)
+    ev.attest_recorded(subject_id="enc-1", attester="jd", from_status="d", to_status="a",
+                       creator="c", forced=False, completeness="complete", body_sha="a1",
+                       grounding_flag_count=0, grounding_reasons=[], rel_path="p/1.md")
+    done = threading.Event()
+
+    def _rebuild():
+        ev.rebuild_index()
+        done.set()
+
+    with ev._store.stream_lock("clinical"):
+        t = threading.Thread(target=_rebuild)
+        t.start()
+        assert not done.wait(timeout=0.4)  # blocked on the held lock
+    t.join(timeout=3)
+    assert done.is_set()  # released → rebuild completes
+
+
+# --- M3: genesis predecessor is conditional, never a half-pin ---------------
+
+def test_genesis_no_legacy_pins_neither_file_nor_sha(tmp_path):
+    import structlog
+    with structlog.testing.capture_logs() as cap:
+        ev = _events(tmp_path)  # no legacy_audit_path
+    ev.note_draft_created(subject_id="e", body_sha="a")  # trigger genesis
+    g = ev.query("clinical")[0]
+    assert g["kind"] == "stream.genesis"
+    assert g["payload"]["predecessor_file"] == ""      # §3.3 — no name-present/sha-empty half-pin
+    assert g["payload"]["predecessor_sha256"] == ""
+    decided = [c for c in cap if c.get("event") == "scribe.events.genesis_predecessor_decided"]
+    assert len(decided) == 1 and decided[0]["has_sha"] is False  # pin the decision log (obs)
+
+
+def test_genesis_clinical_fails_loud_on_unreadable_legacy(tmp_path):
+    # an existing-but-unreadable legacy file (a directory → read_bytes raises IsADirectoryError) in
+    # clinical mode → fail LOUD at open rather than write a half-pinned immutable genesis (§3.3).
+    legacy = tmp_path / "clinical_attest_audit.jsonl"
+    legacy.mkdir()
+    raw = {"scribe": {"mode": "clinical", "encounter_salt": "s", "events": {"dir": str(tmp_path / "ev")}}}
+    with pytest.raises(EventStoreError):
+        ScribeEvents.from_config(raw, log_dir=str(tmp_path / "l"), legacy_audit_path=str(legacy))
+
+
+def test_genesis_nonclinical_unreadable_legacy_degrades(tmp_path):
+    legacy = tmp_path / "clinical_attest_audit.jsonl"
+    legacy.mkdir()
+    raw = {"scribe": {"mode": "synthetic", "events": {"dir": str(tmp_path / "ev")}}}
+    ev = ScribeEvents.from_config(raw, log_dir=str(tmp_path / "l"), legacy_audit_path=str(legacy))
+    ev.note_draft_created(subject_id="e", body_sha="a")
+    g = ev.query("clinical")[0]
+    assert g["payload"]["predecessor_file"] == "" and g["payload"]["predecessor_sha256"] == ""
+
+
+# --- LOW: actor_kind allowlist enforced on the access_read path -------------
+
+def test_access_read_coerces_out_of_allowlist_actor_kind(tmp_path):
+    ev = _events(tmp_path)
+    ev.access_read(subject_id="e", record_type="clinical_note", status="attested",
+                   path_digest="pd", via="cli", actor="x", actor_kind="ATTACKER_ROLE")
+    assert ev.query("access", kind="access.read")[0]["actor_kind"] == "unknown"  # §3.2 coerced
+    ev.access_read(subject_id="e2", record_type="clinical_note", status="a",
+                   path_digest="pd", via="cli", actor="drA", actor_kind="clinician")
+    assert ev.query("access", kind="access.read")[-1]["actor_kind"] == "clinician"  # valid passes
+
+
+# --- LOW: flush keeps the count on a failed emit ----------------------------
+
+def test_flush_suppressed_keeps_count_on_failed_emit(tmp_path):
+    import unittest.mock as mock
+    ev = _events(tmp_path)
+    ev._suppressed_reads = 5
+    ev._suppressed_window_start = "2026-07-16"
+    with mock.patch.object(ev, "_emit_capture", return_value=None):  # simulate a swallowed failure
+        assert ev.flush_suppressed_reads() is None
+    assert ev.suppressed_reads == 5  # count PRESERVED (not silently dropped) → carries to next flush
+    ev.flush_suppressed_reads()  # a real, successful flush
+    assert ev.suppressed_reads == 0  # resets only on success

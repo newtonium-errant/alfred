@@ -36,9 +36,18 @@ ACCESS = "access"
 # don't launder; no row import, ever).
 LEGACY_ATTEST_AUDIT = "clinical_attest_audit.jsonl"
 
-# Envelope actor_kind allowlist (§3.2) — enforced by the facade's emitters (the store keeps
-# actor_kind generic).
+# Envelope actor_kind allowlist (§3.2). The typed emitters HARDCODE their (valid) kind, so they
+# enforce it by construction; the ONE caller-supplied path is ``access_read`` (the kind rides the
+# ``access_actor`` ContextVar), which coerces an out-of-allowlist value to ``"unknown"`` via
+# :func:`_coerce_actor_kind` rather than landing a novel kind in the chained envelope. (The store
+# itself keeps ``actor_kind`` generic — the allowlist is a facade contract.)
 ACTOR_KINDS = frozenset({"clinician", "pipeline", "operator", "system", "unknown"})
+
+
+def _coerce_actor_kind(actor_kind: str) -> str:
+    """Enforce the §3.2 allowlist on the caller-supplied ``access_read`` path: an unknown kind
+    degrades to ``"unknown"`` (honest) instead of stamping a novel value into the med-legal chain."""
+    return actor_kind if actor_kind in ACTOR_KINDS else "unknown"
 
 
 @dataclass(frozen=True)
@@ -160,14 +169,32 @@ class ScribeEvents:
         for k in KINDS:
             store.register_kind(k.kind, family=k.family, fields=k.fields,
                                 stream=k.stream, durable=k.durable)
-        pred_sha = ""
+        # Genesis predecessor pin (§3.3 — pin, don't launder). BOTH fields are "" for a stream
+        # with no predecessor: the file NAME is stamped ONLY when its sha was actually computed —
+        # never a name-present + sha-empty half-pin baked into the immutable genesis row (a
+        # greenfield install must not assert a predecessor that never existed; a real cutover must
+        # not silently lose the digest). An existing-but-UNREADABLE legacy file is an open-time
+        # misconfig: clinical mode fails LOUD (same class as preflight); non-clinical logs + skips.
+        pred_file, pred_sha = "", ""
         if legacy_audit_path and Path(legacy_audit_path).exists():
             try:
                 pred_sha = sha256_hex(Path(legacy_audit_path).read_bytes())
-            except OSError:
-                pred_sha = ""
+                pred_file = LEGACY_ATTEST_AUDIT
+            except OSError as exc:
+                if clinical:
+                    raise EventStoreError(
+                        f"legacy attest-audit {legacy_audit_path!s} exists but is unreadable "
+                        f"({exc}) — refusing to write a half-pinned clinical genesis (§3.3). Fix "
+                        f"the file perms and re-open.") from exc
+                log.error(
+                    "scribe.events.legacy_pin_unreadable", path=str(legacy_audit_path),
+                    detail="legacy attest-audit unreadable — genesis pins NO predecessor (non-clinical degrade)")
         store.set_genesis_predecessor(
-            CLINICAL, predecessor_file=LEGACY_ATTEST_AUDIT, predecessor_sha256=pred_sha)
+            CLINICAL, predecessor_file=pred_file, predecessor_sha256=pred_sha)
+        log.info(
+            "scribe.events.genesis_predecessor_decided",
+            predecessor_file=pred_file or "(none)", has_sha=bool(pred_sha),
+            detail="clinical genesis predecessor pin decided (both empty ⇒ greenfield / no legacy)")
         self = cls(store, active=True, events_dir=events_dir, clock=clock)
         try:
             store.preflight()
@@ -311,7 +338,7 @@ class ScribeEvents:
     def access_read(self, *, subject_id: str, record_type: str, status: str, path_digest: str,
                     via: str, actor: str, actor_kind: str, now: str | None = None):
         return self._emit_capture(ACCESS, "access.read", subject_id=subject_id, actor=actor,
-                                  actor_kind=actor_kind, now=now,
+                                  actor_kind=_coerce_actor_kind(actor_kind), now=now,
                                   payload={"record_type": record_type, "status": status,
                                            "path_digest": path_digest, "via": via})
 
@@ -352,11 +379,15 @@ class ScribeEvents:
         from the chain, not just scribe.log. Emits even a zero count (intentionally-left-blank)."""
         count = self._suppressed_reads
         window_start = self._suppressed_window_start or self._utc_day()
-        self._suppressed_reads = 0
-        self._suppressed_window_start = None
-        return self._emit_capture(ACCESS, "access.system_reads_summary", subject_id="",
-                                  actor="stayc_scribe", actor_kind="pipeline", now=now,
-                                  payload={"count": int(count), "window_start": window_start})
+        # Emit FIRST, reset ONLY on a successful append: a swallowed best-effort failure must not
+        # silently drop the day's suppression count (it carries into the next flush instead).
+        receipt = self._emit_capture(ACCESS, "access.system_reads_summary", subject_id="",
+                                     actor="stayc_scribe", actor_kind="pipeline", now=now,
+                                     payload={"count": int(count), "window_start": window_start})
+        if receipt is not None:
+            self._suppressed_reads = 0
+            self._suppressed_window_start = None
+        return receipt
 
     @property
     def suppressed_reads(self) -> int:
@@ -415,16 +446,23 @@ class ScribeEvents:
     def rebuild_index(self) -> int:
         """Rebuild the attested-digest index from clinical.jsonl (``events verify --rebuild-index``).
         ``rel_path`` is index-only (never chained, §7.4) so a rebuild leaves it ``""`` — the
-        consumer re-derives the note path from ``subject_id``. Returns the entry count."""
+        consumer re-derives the note path from ``subject_id``. Returns the entry count.
+
+        Runs the read-log → atomic-write UNDER the clinical-stream flock (§7.4) — otherwise a
+        rebuild (daemon boot / operator ``--rebuild-index``) races a concurrent attest's
+        post_append index update and last-writer-wins drops the fresh encounter's body_sha,
+        reopening the exact silent post-attest-edit-detection gap the under-lock plumbing closes."""
         idx: dict = {}
-        for e in self._store.query(CLINICAL, kind="attest.recorded"):
-            sid = str(e.get("subject_id") or "")
-            pl = e.get("payload") or {}
-            if not sid or not isinstance(pl, dict):
-                continue
-            idx[sid] = {"body_sha": str(pl.get("body_sha") or ""), "attested_at": str(e.get("ts") or ""),
-                        "seq": int(e.get("seq") or 0), "rel_path": ""}
-        self._atomic_write_index(idx)
+        with self._store.stream_lock(CLINICAL):
+            for e in self._store.query(CLINICAL, kind="attest.recorded"):
+                sid = str(e.get("subject_id") or "")
+                pl = e.get("payload") or {}
+                if not sid or not isinstance(pl, dict):
+                    continue
+                idx[sid] = {"body_sha": str(pl.get("body_sha") or ""),
+                            "attested_at": str(e.get("ts") or ""),
+                            "seq": int(e.get("seq") or 0), "rel_path": ""}
+            self._atomic_write_index(idx)
         return len(idx)
 
     # --- pass-throughs / query --------------------------------------------
