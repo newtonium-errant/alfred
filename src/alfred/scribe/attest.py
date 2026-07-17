@@ -272,6 +272,17 @@ def attest(
             source_id=fm.get("source_id", ""),
             status_stable=status_stable, body_stable=body_stable, marker_ok=marker_ok,
         )
+        # attest.refused at the CAS-bracket refusal too (design §5.2/§8 row 3 — BOTH refusal
+        # sites emit). This is the "someone changed the note UNDER the attestation" event —
+        # the most med-legally significant refusal — so it must land in the audit trail.
+        # Best-effort, emit-then-re-raise: a store failure must never mask the refusal itself.
+        if events is not None:
+            events.attest_refused(
+                subject_id=source_id, attester=attester, reason="note_changed_under_attest",
+                from_status=current_status, to_status=new_status,
+                completeness=completeness, forced=bool(allow_incomplete),
+                now=now.isoformat(),
+            )
         raise AttestationError(
             "note_changed_under_attest",
             "the clinical_note changed between attest's read and the triad write "

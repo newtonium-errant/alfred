@@ -214,3 +214,37 @@ def test_events_none_touches_no_store(tmp_path):
     assert frontmatter.load(str(tmp_path / rel))["status"] == "attested"
     assert audit.exists()
     assert not (tmp_path / "ev").exists()  # the event store is never created
+
+
+def test_cas_bracket_refusal_emits_attest_refused(tmp_path, monkeypatch):
+    # R-D (design §5.2/§8 row 3 — BOTH refusal sites emit): the CAS-bracket refusal
+    # (note_changed_under_attest — "someone changed the note UNDER the attestation", the most
+    # med-legally significant refusal) must emit attest.refused, best-effort, then re-raise.
+    ev = _events(tmp_path)
+    rel = _make_ai_draft(tmp_path)
+    import importlib
+    attest_mod = importlib.import_module("alfred.scribe.attest")
+    real_read = attest_mod.vault_read
+    calls = {"n": 0}
+
+    def _changing_read(vp, rp):
+        calls["n"] += 1
+        rec = dict(real_read(vp, rp))
+        if calls["n"] == 2:  # the CAS re-read sees a moved body
+            rec["body"] = rec["body"] + "\nMUTATED"
+        return rec
+
+    monkeypatch.setattr(attest_mod, "vault_read", _changing_read)
+    with pytest.raises(AttestationError) as exc:
+        attest_mod.attest(tmp_path, rel, new_status="attested", attester="np_jamie",
+                          clinician_ids=_CLINICIANS, audit_path=tmp_path / "a.jsonl",
+                          now=_NOW, events=ev)
+    assert exc.value.reason == "note_changed_under_attest"
+    refused = ev.query("clinical", kind="attest.refused")
+    assert len(refused) == 1
+    assert refused[0]["payload"]["reason"] == "note_changed_under_attest"
+    assert refused[0]["payload"]["from_status"] == "ai_draft"
+    assert refused[0]["actor"] == "np_jamie"
+    # refusal never masked into a signature: no triad event.
+    assert ev.query("clinical", kind="attest.recorded") == []
+    assert frontmatter.load(str(tmp_path / rel))["status"] == "ai_draft"
