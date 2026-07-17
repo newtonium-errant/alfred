@@ -2629,8 +2629,16 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     if subcmd == "presets":
         _cmd_scribe_presets(args)
         return
+    if subcmd == "events":
+        _cmd_scribe_events(args)
+        return
+    if subcmd == "audit":
+        _cmd_scribe_audit(args)
+        return
     if subcmd != "attest":
-        print("Usage: alfred scribe {attest <note> --attester <clinician> | presets {list|audit|delete}}")
+        print("Usage: alfred scribe {attest <note> --attester <clinician> | "
+              "events {list|verify|tip|anchor} | audit encounter <enc> | "
+              "presets {list|audit|delete}}")
         sys.exit(1)
 
     raw = _load_unified_config(args.config)
@@ -2740,6 +2748,96 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     # a degraded (inactive) non-clinical store.
     if events.active:
         print(events.tip_line(CLINICAL))
+
+
+def _open_scribe_events(raw: dict):
+    """Construct the event-store facade for a read/query verb. Clinical fail-loud at open
+    (surfaced as a JSON error + exit 1); non-clinical degrades. NO sovereign guard / boundary
+    (design §8 row 15 — these verbs make no PHI-vault write and no egress; they append only the
+    local ``store.verified`` meta row on verify success)."""
+    from alfred.scribe.events import ScribeEvents
+    log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
+    audit_path = log_dir / "clinical_attest_audit.jsonl"
+    try:
+        return ScribeEvents.from_config(raw, log_dir, legacy_audit_path=audit_path)
+    except Exception as e:  # noqa: BLE001 — surface an open failure as a machine-readable error
+        print(json.dumps({"error": f"event store failed to open: {e}"}))
+        sys.exit(1)
+
+
+def _cmd_scribe_events(args: argparse.Namespace) -> None:
+    """``alfred scribe events {list|verify|tip|anchor}`` — the medico-legal event-store query
+    surface (design §10). JSON output (machine-queryable registry) with intentionally-left-blank
+    explicit empties. There is DELIBERATELY no ``emit`` verb (§2.2)."""
+    raw = _load_unified_config(args.config)
+    from alfred.evstore import sha256_hex
+    ev = _open_scribe_events(raw)
+    ecmd = getattr(args, "events_cmd", None)
+
+    if ecmd == "list":
+        rows = ev.query(
+            args.stream, family=args.family, kind=args.kind, subject_id=args.encounter,
+            actor=args.actor, since=args.since, until=args.until,
+            path_digest=(sha256_hex(args.path) if args.path else None), limit=args.limit)
+        print(json.dumps(rows, indent=2))
+        if not rows:
+            print("no events match", file=sys.stderr)  # intentionally-left-blank
+        return
+
+    if ecmd == "tip":
+        print(json.dumps(ev.tip(args.stream)))
+        return
+
+    if ecmd == "anchor":
+        print(json.dumps(ev.anchor(args.stream), indent=2))
+        return
+
+    if ecmd == "verify":
+        if args.rebuild_index:
+            print(json.dumps({"rebuilt_index_entries": ev.rebuild_index()}))
+        report = ev.verify(args.stream)
+        out = {
+            "stream": args.stream, "ok": report.ok, "entries": report.entries,
+            "head_seq": report.head_seq, "head_sha": report.head_sha,
+            "first_bad_seq": report.first_bad_seq, "torn_tail": report.torn_tail,
+            "days_since_last_anchor": report.days_since_last_anchor,
+        }
+        if report.ok and report.entries == 1:
+            out["note"] = "genesis-only"
+        if args.deep:
+            # The full attested-digest comparison (§5.3). REPORT-only (emit=False) — a
+            # query verb appends ONLY store.verified, never a note event (§8 row 15).
+            from alfred.scribe.events_maintenance import ScribeEventMaintenance
+            vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+            out["post_attest_edits"] = ScribeEventMaintenance(ev).post_attest_edit_scan(
+                vault_path, full=True, emit=False)
+        # On SUCCESS with a real chain, extend it with store.verified (§4/§6.2) — makes
+        # "when did you last verify" chain-answerable. Best-effort; the RESULT below
+        # reaches exit code regardless. Never on a broken chain, never on an empty stream.
+        if report.ok and report.entries >= 1:
+            ev.record_verified(args.stream, entries=report.entries)
+        print(json.dumps(out, indent=2))
+        if not report.ok:
+            sys.exit(1)
+        return
+
+    print("Usage: alfred scribe events {list|verify|tip|anchor}")
+    sys.exit(1)
+
+
+def _cmd_scribe_audit(args: argparse.Namespace) -> None:
+    """``alfred scribe audit encounter <enc>`` — the cross-family single-encounter timeline
+    (design §10 — the auditor one-shot / CMPA demo query). Both streams merged by ts,
+    tiebroken (stream, seq). JSON, ILB explicit empty."""
+    raw = _load_unified_config(args.config)
+    ev = _open_scribe_events(raw)
+    if getattr(args, "audit_cmd", None) != "encounter":
+        print("Usage: alfred scribe audit encounter <enc>")
+        sys.exit(1)
+    rows = ev.audit_encounter(args.encounter)
+    print(json.dumps(rows, indent=2))
+    if not rows:
+        print(f"no events for encounter {args.encounter}", file=sys.stderr)  # ILB
 
 
 def _cmd_scribe_presets(args: argparse.Namespace) -> None:
@@ -3725,6 +3823,44 @@ def build_parser() -> argparse.ArgumentParser:
             "— keep it PHI-free where possible."
         ),
     )
+    # #11 — the medico-legal event-store query surface (JSON; no `emit` verb, ever).
+    scribe_events = scribe_sub.add_parser(
+        "events", help="Query the medico-legal event store (list / verify / tip / anchor)",
+    )
+    events_sub = scribe_events.add_subparsers(dest="events_cmd")
+    ev_list = events_sub.add_parser("list", help="Tolerant filtered read (JSON, chain order)")
+    ev_list.add_argument("--stream", default="clinical", choices=["clinical", "access"])
+    ev_list.add_argument("--family", default=None, help="Filter by event family")
+    ev_list.add_argument("--kind", default=None, help="Filter by event kind")
+    ev_list.add_argument("--encounter", default=None, help="Filter by subject_id (encounter id)")
+    ev_list.add_argument("--actor", default=None, help="Filter by actor")
+    ev_list.add_argument("--since", default=None, help="ISO ts lower bound (inclusive)")
+    ev_list.add_argument("--until", default=None, help="ISO ts upper bound (inclusive)")
+    ev_list.add_argument(
+        "--path", default=None,
+        help="A vault rel-path — hashed locally + matched against path_digest "
+             "(answers 'who viewed this record' without paths in the trail)")
+    ev_list.add_argument("--limit", type=int, default=None, help="Keep the last N (most recent)")
+    ev_verify = events_sub.add_parser(
+        "verify", help="Strict chain verify (exit 1 on any tamper); morning-review cadence")
+    ev_verify.add_argument("--stream", default="clinical", choices=["clinical", "access"])
+    ev_verify.add_argument(
+        "--deep", action="store_true",
+        help="Also run the full attested-digest comparison (report post-attest edits)")
+    ev_verify.add_argument(
+        "--rebuild-index", action="store_true",
+        help="Rebuild the attested-digest index from the clinical chain")
+    ev_tip = events_sub.add_parser("tip", help="The chain tip {stream, seq, entry_sha}")
+    ev_tip.add_argument("--stream", default="clinical", choices=["clinical", "access"])
+    ev_anchor = events_sub.add_parser(
+        "anchor", help="Export the off-box anchor {stream, head_seq, head_sha, ts, ...}")
+    ev_anchor.add_argument("--stream", default="clinical", choices=["clinical", "access"])
+    # #11 — the auditor one-shot: the cross-family single-encounter timeline.
+    scribe_audit = scribe_sub.add_parser(
+        "audit", help="Cross-family single-encounter audit timeline (the CMPA demo query)")
+    audit_sub = scribe_audit.add_subparsers(dest="audit_cmd")
+    audit_enc = audit_sub.add_parser("encounter", help="Full timeline for one encounter id")
+    audit_enc.add_argument("encounter", help="The encounter id (subject_id)")
     # P4-5 — voice-preset management (local file ops under scribe.diarize.enrollment_dir).
     scribe_presets = scribe_sub.add_parser(
         "presets", help="Manage voice-enrollment presets (list / audit / delete)",

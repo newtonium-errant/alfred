@@ -98,7 +98,7 @@ class ScribeEventMaintenance:
     # --- bounded post-attest-edit scan (§5.3) ----------------------------
 
     def post_attest_edit_scan(
-        self, vault_path: Path, *, full: bool = False, now: str | None = None,
+        self, vault_path: Path, *, full: bool = False, emit: bool = True, now: str | None = None,
     ) -> list[dict]:
         """Compare each attested encounter's CURRENT note body against the pinned attested
         ``body_sha`` (the attested-digest index). On mismatch: emit ``note.post_attest_edit_detected``
@@ -106,7 +106,9 @@ class ScribeEventMaintenance:
 
         ``full=True`` (boot / ``verify --deep``) scans every attested encounter; otherwise the
         per-sweep check is HOT-WINDOW-bounded — encounters attested within ``hot_window_days`` OR
-        whose note file mtime is within that window. Detection ONLY — never a status mutation."""
+        whose note file mtime is within that window. ``emit=False`` (the ``events verify --deep``
+        query surface, §8 row 15 — query verbs append ONLY ``store.verified``, never a note event)
+        REPORTS mismatches without emitting or latching. Detection ONLY — never a status mutation."""
         ev = self._ev
         if not ev.active:
             return []
@@ -133,6 +135,11 @@ class ScribeEventMaintenance:
             current_sha = _body_sha(body)
             if current_sha == dig["body_sha"]:
                 continue
+            record = {"subject_id": sid, "attested_body_sha": dig["body_sha"],
+                      "current_body_sha": current_sha, "rel_path": rel_path}
+            if not emit:
+                edits.append(record)  # REPORT-only (verify --deep): no emit, no latch
+                continue
             key = (sid, current_sha)
             if key in self._edit_latch:
                 continue
@@ -147,8 +154,7 @@ class ScribeEventMaintenance:
             )
             ev.note_post_attest_edit_detected(
                 subject_id=sid, attested_body_sha=dig["body_sha"], current_body_sha=current_sha)
-            edits.append({"subject_id": sid, "attested_body_sha": dig["body_sha"],
-                          "current_body_sha": current_sha, "rel_path": rel_path})
+            edits.append(record)
         return edits
 
     def _in_hot_window(self, vault_path: Path, rel_path: str, attested_ts: str, cutoff: datetime) -> bool:
