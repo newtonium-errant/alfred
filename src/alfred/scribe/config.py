@@ -237,6 +237,9 @@ class ScribeEventsConfig:
     with scribe, fail-loud at open in clinical mode (design doc §2.4)."""
 
     dir: str = ""
+
+
+@dataclass
 class ScribeBugConfig:
     """Box-local bug-report capture (task #4).
 
