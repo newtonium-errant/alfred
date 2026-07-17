@@ -109,6 +109,11 @@ _META_SUFFIX = ".meta.json"
 INGEST_CHUNK_ROUTE = "/scribe/ingest-chunk"
 CLOSE_ROUTE = "/scribe/close"
 STATUS_ROUTE = "/scribe/status"
+# Task #4 — box-local bug capture. INGEST-token gated (the page already holds it), NOT
+# exempt, NOT enroll-class: it falls through the middleware to the ingest-class branch, so no
+# auth wiring beyond registration. Writes PHI-cautious 0600 files via ``scribe.bug``; NO
+# egress (the box watcher surfaces them). Handler-gated on ``bug.enabled`` (404 when off).
+BUG_ROUTE = "/scribe/bug"
 
 # Slice B — the loopback PWA static surface (#49). The page GET is a browser
 # NAVIGATION that cannot carry a bearer, so these two routes are Host-pinned +
@@ -132,6 +137,17 @@ _INSTALL_ASSET_PATHS: frozenset[str] = frozenset({
 _BEARER_EXEMPT_PATHS: frozenset[str] = frozenset(
     {PAGE_ROUTE, APP_JS_ROUTE} | _INSTALL_ASSET_PATHS
 )
+
+# Conventional-asset probe prefix. WebKit fetches SIZED apple-touch variants
+# (/apple-touch-icon-120x120.png, -152x152-precomposed.png, …) — an open-ended family we do
+# NOT route (the declared <link rel="apple-touch-icon"> suppresses the probe on modern iOS,
+# but a bare/edge probe still arrives). Such a path is NOT one of the two canonical exempt
+# apple-touch paths, so it falls to the bearer branch and — no-auth — would log a
+# warning-level ``bad_token`` 401 (the favicon-spam class, one probe-family later). A
+# no-Authorization GET of this prefix is a browser fetch for an asset that does not exist:
+# answer a QUIET 404 (no warning). The two canonical paths are exempt + served 200 above, so
+# they never reach this test.
+APPLE_TOUCH_ICON_PROBE_PREFIX = "/apple-touch-icon-"
 
 # --- P4-5a — enrollment rides THIS server; TWO-TOKEN capability split ---------
 # The enroll routes require the ``enroll_token`` (biometric-custody capability),
@@ -159,21 +175,26 @@ def _authorize_route(
     """Two-token authorization for a non-exempt API route → ``(ok, reason)``.
 
     A token valid for the OTHER capability class → ``wrong_token_class`` (the
-    ``*_wrong_peer`` analog — a real privilege boundary, not a typo); anything else
-    invalid → ``bad_token``. Constant-time compares; fail-closed on an empty
+    ``*_wrong_peer`` analog — a real privilege boundary, not a typo); a WRONG token
+    → ``bad_token``; NO token at all → ``no_token`` (the split lets the log tell a
+    credential probe from an unauthenticated browser fetch — the two are very
+    different signals). Constant-time compares; fail-closed on an empty
     configured/provided token."""
     def _match(tok: str) -> bool:
         return bool(tok and provided and secrets.compare_digest(provided, tok))
+    # NO Authorization vs a WRONG one — a benign no-auth browser fetch should not read
+    # as the same event as someone presenting an invalid credential.
+    miss = "bad_token" if provided else "no_token"
     is_ingest, is_enroll = _match(ingest_tok), _match(enroll_tok)
     if path in ENROLL_TOKEN_ROUTES:
         if is_enroll:
             return True, ""
-        return False, "wrong_token_class" if is_ingest else "bad_token"
+        return False, "wrong_token_class" if is_ingest else miss
     if path == PRESETS_LIST_ROUTE:                       # either token clears metadata
-        return (True, "") if (is_enroll or is_ingest) else (False, "bad_token")
+        return (True, "") if (is_enroll or is_ingest) else (False, miss)
     if is_ingest:                                        # ingest-class (chunk/close/status/encounter-preset)
         return True, ""
-    return False, "wrong_token_class" if is_enroll else "bad_token"
+    return False, "wrong_token_class" if is_enroll else miss
 
 
 # --- PHI-safe helpers -------------------------------------------------------
@@ -314,6 +335,13 @@ def _build_security_middleware(config: ScribeConfig):
             # token; a token valid for the OTHER class → wrong_token_class 401.
             provided = _bearer(request)
             path = request.path
+            # QUIET the browser's conventional-asset probes: a no-Authorization GET of a
+            # sized apple-touch variant is a fetch for an asset that does not exist — a plain
+            # 404, not a warning-level bad_token 401. Gated on GET + no-auth so it can never
+            # mask a real credentialed request to any route.
+            if (request.method == "GET" and not provided
+                    and path.startswith(APPLE_TOUCH_ICON_PROBE_PREFIX)):
+                return _reject("not_found", 404)
             # INERT enrollment face: enroll_token unset ⇒ the enroll-face routes are
             # 404 (the biometric face is ABSENT, not merely unauthorized). The
             # ingest-class routes stay bearer-required as before.
@@ -603,6 +631,62 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def _handle_bug(request: web.Request) -> web.StreamResponse:
+    """``POST /scribe/bug`` — capture a box-local bug report (task #4). INGEST-token gated by
+    the middleware (ingest-class). Body: JSON ``{summary, detail, context{}, events[]}``. The
+    per-POST byte cap is enforced HERE (Content-Length pre-check + post-read length) before the
+    open-report disk backstop in ``scribe.bug``. Returns ``{bug_id}`` (200) or an OPAQUE 4xx
+    the UI renders. NO PHI in logs (the summary/detail may carry PHI despite the page caution)."""
+    config: ScribeConfig = request.app["scribe_config"]
+    bug_cfg = config.bug
+    # INERT toggle — an operator can 404 the route without disabling the whole server.
+    if not bug_cfg.enabled:
+        return _reject("bug_inert", 404)
+    # cheap Content-Length pre-check so an honest oversized POST is refused BEFORE buffering.
+    if request.content_length is not None and request.content_length > bug_cfg.max_body_bytes:
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="bug_too_large")
+        return _reject("bug_too_large", 413)
+    try:
+        raw = await request.read()                       # globally bounded by client_max_size
+    except web.HTTPRequestEntityTooLarge:
+        return _reject("bug_too_large", 413)
+    if len(raw) > bug_cfg.max_body_bytes:                # the lying-Content-Length backstop
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="bug_too_large")
+        return _reject("bug_too_large", 413)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="invalid_json")
+        return _reject("invalid_json", 400)
+    if not isinstance(payload, dict):
+        return _reject("invalid_json", 400)
+
+    summary = payload.get("summary", "")
+    detail = payload.get("detail", "")
+    # TYPE-VALIDATE the free-text fields → opaque 400 (R6). A truthy NON-str summary (a dict /
+    # list / number) would otherwise pass the emptiness check and blow up downstream as an
+    # aiohttp 500 HTML body, breaking the "every 4xx/5xx is an opaque reason code" contract.
+    if not isinstance(summary, str) or not isinstance(detail, str):
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="invalid_payload")
+        return _reject("invalid_payload", 400)
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    # ILB — an entirely empty report is refused VISIBLY (the UI renders the 4xx), never a
+    # silent 200 that writes a contentless file.
+    if not summary.strip() and not detail.strip():
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason="empty_report")
+        return _reject("empty_report", 400)
+
+    from alfred.scribe import bug as bug_mod
+    try:
+        _, bug_id = bug_mod.write_bug_report(
+            config, summary=summary, detail=detail, context=context, events=events)
+    except bug_mod.BugCapRefused as e:
+        log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason=e.reason)
+        return _reject(e.reason, 429)                    # over-cap → explicit 4xx the UI renders
+    return web.json_response({"bug_id": bug_id}, status=200)
+
+
 # --- Slice B static PWA surface (page + app.js) -----------------------------
 
 def _static_headers() -> dict[str, str]:
@@ -627,7 +711,8 @@ async def _handle_page(request: web.Request) -> web.StreamResponse:
     # slugs are embedded so the enrolment view can OFFER the identity instead of making it
     # hand-typed — the server matches them VERBATIM, so a typo would fail-close a
     # consented recording with 403.
-    body = render_index(config.ingest_web.token, config.clinicians)
+    body = render_index(config.ingest_web.token, config.clinicians,
+                        bug_max_per_session=config.bug.max_per_session)
     return web.Response(text=body, content_type="text/html", charset="utf-8",
                         headers=_static_headers())
 
@@ -706,6 +791,8 @@ def create_ingest_app(config: ScribeConfig) -> web.Application:
     app.router.add_post(INGEST_CHUNK_ROUTE, _handle_ingest_chunk)
     app.router.add_post(CLOSE_ROUTE, _handle_close)
     app.router.add_get(STATUS_ROUTE, _handle_status)
+    # Task #4 — bug capture (ingest-token gated, handler-gated on bug.enabled).
+    app.router.add_post(BUG_ROUTE, _handle_bug)
     # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
     app.router.add_get(PAGE_ROUTE, _handle_page)
     app.router.add_get(APP_JS_ROUTE, _handle_app_js)

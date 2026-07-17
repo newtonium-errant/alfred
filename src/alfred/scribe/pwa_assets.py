@@ -117,6 +117,7 @@ _THEME_COLOR_PLACEHOLDER = "__THEME_COLOR__"
 _MANIFEST_ROUTE_PLACEHOLDER = "__MANIFEST_ROUTE__"
 _FAVICON_ROUTE_PLACEHOLDER = "__FAVICON_ROUTE__"
 _APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER = "__APPLE_TOUCH_ICON_ROUTE__"
+_BUG_MAX_PLACEHOLDER = "__BUG_MAX_PER_SESSION__"
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -140,8 +141,9 @@ _INDEX_HTML = """<!doctype html>
   button.primary { background: #1a7f37; color: #fff; border: 0; }
   button.danger { background: #b32424; color: #fff; border: 0; }
   button:disabled { opacity: 0.45; }
-  select, input { font-size: 1.05rem; padding: 0.6rem; border-radius: 0.5rem; border: 1px solid #8886; width: 100%; box-sizing: border-box; background: transparent; color: inherit; }
+  select, input, textarea { font-size: 1.05rem; padding: 0.6rem; border-radius: 0.5rem; border: 1px solid #8886; width: 100%; box-sizing: border-box; background: transparent; color: inherit; font-family: inherit; }
   label { display: block; margin: 0.8rem 0 0.3rem; font-size: 0.9rem; color: #888; }
+  .bug-link { background: transparent; border: 0; color: #888; text-decoration: underline; font-size: 0.85rem; padding: 0.4rem 0; margin-top: 1.2rem; }
   #status { margin-top: 1rem; padding: 0.8rem; border: 1px solid #8888; border-radius: 0.5rem; min-height: 3rem; white-space: pre-wrap; font-variant-numeric: tabular-nums; }
   .note { color: #888; font-size: 0.85rem; margin-top: 1rem; }
   .chip { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 1rem; font-size: 0.8rem; border: 1px solid #8886; }
@@ -152,7 +154,7 @@ _INDEX_HTML = """<!doctype html>
   .hide { display: none; }
 </style>
 </head>
-<body data-ingest-token="__INGEST_TOKEN__" data-clinicians="__CLINICIANS_JSON__">
+<body data-ingest-token="__INGEST_TOKEN__" data-clinicians="__CLINICIANS_JSON__" data-bug-max="__BUG_MAX_PER_SESSION__">
 <h1>STAY-C Scribe &mdash; loopback</h1>
 <nav>
   <a id="nav-record" href="#/record">Record</a>
@@ -171,6 +173,7 @@ _INDEX_HTML = """<!doctype html>
   <button id="stop" disabled>Stop &amp; finish</button>
   <div id="status" aria-live="polite">Idle. Press &ldquo;Start encounter&rdquo; to begin.</div>
   <p class="note">Audio is captured in short self-contained windows and pushed to this on-box server. Nothing is stored in the browser; nothing leaves 127.0.0.1.</p>
+  <p><button id="bug-open-record" class="bug-link">Report a problem</button></p>
 </section>
 
 <section id="view-presets" class="hide">
@@ -184,6 +187,23 @@ _INDEX_HTML = """<!doctype html>
     <div id="enroll-body"></div>
   </div>
   <p class="note">A voiceprint lets the scribe tell who is speaking. Audio is deleted the moment the voiceprint is made &mdash; only the numbers are kept, and they never leave this machine. Engine updates will ask you to re-record.</p>
+  <p><button id="bug-open-presets" class="bug-link">Report a problem</button></p>
+</section>
+
+<!-- Bug report — a SHARED panel (outside both view sections so the record view keeps NO
+     free-text field). Opened from either view's "Report a problem" affordance. R5-clean: the
+     form is memory-only; nothing is stored, and the free-text carries the PHI-caution banner. -->
+<section id="bug" class="hide">
+  <h2>Report a problem</h2>
+  <div class="banner">Please do <b>not</b> include patient details &mdash; no names, dates of birth, or health information. This goes to the technical team only.</div>
+  <label for="bug-summary">What went wrong? (short)</label>
+  <input id="bug-summary" maxlength="200" autocomplete="off">
+  <label for="bug-detail">Any more detail? (optional)</label>
+  <textarea id="bug-detail" rows="4" maxlength="4000"></textarea>
+  <p class="note">A short technical snapshot (which screen, whether a voiceprint exists, recent taps &mdash; never any recording or patient content) is attached to help debugging.</p>
+  <button id="bug-send" class="primary">Send report</button>
+  <button id="bug-cancel">Cancel</button>
+  <div id="bug-msg" aria-live="polite"></div>
 </section>
 
 <script src="/scribe/app.js"></script>
@@ -198,6 +218,11 @@ APP_JS = r"""'use strict';
   const TOKEN = (document.body && document.body.dataset && document.body.dataset.ingestToken) || '';
   let CLINICIANS = [];
   try { CLINICIANS = JSON.parse(document.body.dataset.clinicians || '[]') || []; } catch (e) { CLINICIANS = []; }
+  // client-side per-session bug-report cap (from config, embedded in the page). A stuck client
+  // must not fill the disk; the server ALSO backstops with max_open_reports (429).
+  let BUG_MAX_PER_SESSION = 10;
+  try { BUG_MAX_PER_SESSION = parseInt(document.body.dataset.bugMax, 10) || 10; } catch (e) { BUG_MAX_PER_SESSION = 10; }
+  let bugSubmitCount = 0;            // MEMORY-ONLY (dies on reload — same no-storage posture)
 
   const WINDOW_MS = 20000;           // encounter window (~20s) — B2 boundary amortized
   const ENROLL_WINDOW_MS = 15000;    // enrollment window (~15s) — memo B2 discipline
@@ -241,6 +266,25 @@ APP_JS = r"""'use strict';
   const statusEl = $('status');
   function show(msg) { statusEl.textContent = msg; }            // NON-PHI text only
   function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  // ── R5 diagnostic ring buffer — MEMORY-ONLY, last ~20 UI breadcrumbs + JS errors ──────
+  // Dies on reload (no storage — same posture as the rest of the client). PHI-FREE by
+  // construction: code-path traces + HTTP status codes, NEVER transcript/audio/patient
+  // content. Attached to a bug report so a dead-button-class bug is diagnosable from the
+  // trace ("tap create-voiceprint -> runEnroll -> blocked: no clinician") instead of free
+  // text alone (the 2026-07-16 incident). Capped so it can never grow unbounded.
+  const BUG_RING_MAX = 20;
+  const bugRing = [];
+  function logEvent(msg) {
+    try {
+      const t = new Date().toISOString().slice(11, 19);         // HH:MM:SS — no date, no PHI
+      bugRing.push(t + ' ' + String(msg).slice(0, 200));
+      while (bugRing.length > BUG_RING_MAX) { bugRing.shift(); }
+    } catch (e) { /* the ring must NEVER break the app */ }
+  }
+  window.addEventListener('error', (e) => {
+    logEvent('jserror ' + ((e && e.message) ? String(e.message).slice(0, 120) : 'unknown'));
+  });
   // ATTRIBUTE-SAFE escaping. The old version used the textContent->innerHTML trick, which
   // escapes & < > but NOT quotes — and every use site here interpolates into an ATTRIBUTE
   // (<option value="...">, data-id="..."). A value containing a double quote would break
@@ -290,7 +334,11 @@ APP_JS = r"""'use strict';
     const o = opts || {};
     const headers = o.headers || {};
     headers['Authorization'] = 'Bearer ' + (o.enroll ? enrollToken : TOKEN);
-    return fetch(path, { method: o.method || 'GET', headers: headers, body: o.body, cache: 'no-store' });
+    const resp = await fetch(path, { method: o.method || 'GET', headers: headers, body: o.body, cache: 'no-store' });
+    // Ring only the FAILURES (status >= 400) — logging every poll would flood the 20-slot ring
+    // and evict the useful breadcrumbs. The path is stripped of its query (no label/PHI).
+    if (resp.status >= 400) { logEvent('api ' + String(path).split('?')[0] + ' ' + resp.status); }
+    return resp;
   }
 
   // ══ RECORD VIEW ═══════════════════════════════════════════════════════════════
@@ -480,7 +528,9 @@ APP_JS = r"""'use strict';
     // Two MediaRecorders on one mic, and — far worse — an enrolment buffer that captures
     // LIVE PATIENT SPEECH on a surface whose entire consent basis is "the enrolling
     // clinician's own voice". Refuse, loudly.
+    logEvent('start encounter');
     if (enrollSession || micOwner) {
+      logEvent('blocked: mic in use');
       show('Finish or cancel the voiceprint recording first — the microphone is in use.');
       return;
     }
@@ -674,6 +724,7 @@ APP_JS = r"""'use strict';
   // is "the enrolling clinician's own voice". Rendered from BOTH the intent moment
   // (runEnroll) and the ACTION moment (captureEnroll) — see captureEnroll's guard.
   function refuseEnrollDuringEncounter() {
+    logEvent('blocked: encounter recording');
     $('enroll').classList.remove('hide');
     $('enroll-title').textContent = 'Not now';
     $('enroll-body').innerHTML = '<p>An encounter is recording. Stop it before making a ' +
@@ -681,6 +732,7 @@ APP_JS = r"""'use strict';
   }
 
   function refuseEnrollInert() {
+    logEvent('blocked: enrollment inert');
     $('enroll').classList.remove('hide');
     $('enroll-title').textContent = 'Not available';
     $('enroll-body').innerHTML = '<p>Voice enrolment is not set up on this machine. ' +
@@ -696,6 +748,7 @@ APP_JS = r"""'use strict';
   // clinician exists but none is selected" is therefore unreachable — there is no second
   // message on purpose (a dead branch would only invite the comment-lies trap).
   function refuseEnrollNoClinician() {
+    logEvent('blocked: no clinician configured');
     $('enroll').classList.remove('hide');
     $('enroll-title').textContent = 'No clinician configured';
     $('enroll-body').innerHTML =
@@ -704,6 +757,7 @@ APP_JS = r"""'use strict';
 
   // The guided enrolment: record-first, name-last (~45-60s).
   async function runEnroll(rerecordId) {
+    logEvent('runEnroll rerecord=' + (rerecordId ? '1' : '0'));
     if (!user) { return refuseEnrollNoClinician(); }
     if (recording || micOwner) { return refuseEnrollDuringEncounter(); }
     // An INERT face 404s every enroll route. Refuse HERE — before the token paste and
@@ -960,6 +1014,73 @@ APP_JS = r"""'use strict';
     $('en-retry').addEventListener('click', () => runEnroll(rerecordId));
   }
 
+  // ══ BUG REPORT — a shared, memory-only diagnostic surface (task #4) ════════════
+  // PHI-cautious: the free-text carries the on-screen "no patient details" banner, and the
+  // attached auto-context is a CLOSED PHI-free set (the server ALSO drops any key outside its
+  // allowlist). NO storage — the form + the ring die on reload. Confirms + failures are BOTH
+  // rendered visibly (intentionally-left-blank: a submit is never a silent no-op).
+  function currentBugContext() {
+    let chip = '';
+    try { chip = $('chip').textContent || ''; } catch (e) { chip = ''; }
+    let ua = '';
+    try { ua = (navigator && navigator.userAgent) ? String(navigator.userAgent).slice(0, 200) : ''; } catch (e) { ua = ''; }
+    return {
+      view: location.hash || '#/record',
+      server_state: serverState || '',
+      clinicians_len: CLINICIANS.length,
+      user: user || '',                       // a clinician SLUG (staff id) — never a patient
+      attribution: chip,
+      ua: ua,
+      client_ts: new Date().toISOString(),
+    };
+  }
+  function openBug() {
+    logEvent('open bug report');
+    $('bug').classList.remove('hide');
+    $('bug-msg').textContent = '';
+    try { $('bug').scrollIntoView(); } catch (e) { /* shim / non-browser: no-op */ }
+  }
+  function closeBug() {
+    $('bug').classList.add('hide');
+    $('bug-summary').value = ''; $('bug-detail').value = ''; $('bug-msg').textContent = '';
+  }
+  async function submitBug() {
+    const summary = ($('bug-summary').value || '').trim();
+    const detail = ($('bug-detail').value || '').trim();
+    if (!summary && !detail) {                 // ILB — an empty report SAYS so, never a no-op
+      $('bug-msg').textContent = 'Please describe the problem first.';
+      return;
+    }
+    if (bugSubmitCount >= BUG_MAX_PER_SESSION) {   // per-session cap — visible, never a silent drop
+      $('bug-msg').textContent = 'You have sent the maximum number of reports for now. ' +
+        'Please tell your operator directly.';
+      return;
+    }
+    const send = $('bug-send');
+    send.disabled = true;
+    $('bug-msg').textContent = 'Sending…';
+    const body = JSON.stringify({ summary: summary, detail: detail,
+      context: currentBugContext(), events: bugRing.slice() });   // SNAPSHOT the ring now
+    try {
+      const r = await api('/scribe/bug', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: body });
+      if (r.ok) {
+        bugSubmitCount += 1;                   // count SUCCESSES against the per-session cap
+        $('bug-summary').value = ''; $('bug-detail').value = '';
+        $('bug-msg').textContent = 'Thank you — your report was sent.';         // VISIBLE confirm
+      } else if (r.status === 413) {
+        $('bug-msg').textContent = 'That report is too long — please shorten it.';
+      } else if (r.status === 429) {
+        $('bug-msg').textContent = 'Too many reports right now — tell your operator directly.';
+      } else {
+        $('bug-msg').textContent = 'Could not send the report (error ' + r.status + '). Tell your operator.';
+      }
+    } catch (e) {
+      $('bug-msg').textContent = 'Could not reach the server. Tell your operator.';   // VISIBLE failure
+    }
+    send.disabled = false;
+  }
+
   // ══ shell: clinician pickers + hash routing ═══════════════════════════════════
 
   function fillWho(sel) {
@@ -1000,6 +1121,7 @@ APP_JS = r"""'use strict';
 
   function route() {
     teardownEnroll();
+    logEvent('view ' + (location.hash || '#/record'));
     const presets = location.hash === '#/presets';
     $('view-record').classList.toggle('hide', presets);
     $('view-presets').classList.toggle('hide', !presets);
@@ -1017,9 +1139,13 @@ APP_JS = r"""'use strict';
   $('who2').addEventListener('change', (e) => {
     user = e.currentTarget.value; $('who').value = user; renderPresets();
   });
-  $('new-preset').addEventListener('click', () => runEnroll(null));
+  $('new-preset').addEventListener('click', () => { logEvent('tap create-voiceprint'); runEnroll(null); });
   $('start').addEventListener('click', start);
   $('stop').addEventListener('click', stop);
+  $('bug-open-record').addEventListener('click', openBug);
+  $('bug-open-presets').addEventListener('click', openBug);
+  $('bug-send').addEventListener('click', submitBug);
+  $('bug-cancel').addEventListener('click', closeBug);
   window.addEventListener('hashchange', route);
 
   fillWho($('who'));
@@ -1101,7 +1227,8 @@ MANIFEST_JSON = json.dumps(
 )
 
 
-def render_index(token: str, clinicians: list[str] | None = None) -> str:
+def render_index(token: str, clinicians: list[str] | None = None,
+                 bug_max_per_session: int = 10) -> str:
     """Return the PWA index HTML with the INGEST ``token`` embedded (HTML-attribute
     escaped) for the same-origin JS, plus the ``clinicians`` identity list.
 
@@ -1128,4 +1255,7 @@ def render_index(token: str, clinicians: list[str] | None = None) -> str:
         .replace(_MANIFEST_ROUTE_PLACEHOLDER, MANIFEST_ROUTE)
         .replace(_FAVICON_ROUTE_PLACEHOLDER, FAVICON_ROUTE)
         .replace(_APPLE_TOUCH_ICON_ROUTE_PLACEHOLDER, APPLE_TOUCH_ICON_ROUTE)
+        # the client-side per-session report cap — embedded so the number lives in ONE place
+        # (config), read by the page's bug form. Coerced to a safe int (never a stray value).
+        .replace(_BUG_MAX_PLACEHOLDER, str(max(1, int(bug_max_per_session))))
     )
