@@ -48,9 +48,12 @@ import os
 import re
 import secrets
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
+
+if TYPE_CHECKING:  # scribe→scribe.events (design §2.3); the facade rides app["scribe_events"]
+    from alfred.scribe.events import ScribeEvents
 from aiohttp import web
 
 from alfred.scribe.close_manifest import (
@@ -359,6 +362,7 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
     """
     config: ScribeConfig = request.app["scribe_config"]
     web_cfg = config.ingest_web
+    events: "ScribeEvents | None" = request.app.get("scribe_events")
     q = request.query
 
     # R6 — label token-shape (rejects PHI labels + path traversal).
@@ -409,6 +413,8 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
     if (enc_dir / CLOSE_SENTINEL_NAME).exists():
         log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
                     reason="encounter_closed", encounter_id=encounter_id)
+        if events is not None:  # encounter.post_close_chunk_refused (design §5.4)
+            events.encounter_post_close_chunk_refused(subject_id=encounter_id, seq=seq)
         return _reject("encounter_closed", 409)
 
     # server-validated MONOTONIC / GAP-FREE seq (contract #3) — the next contiguous
@@ -425,6 +431,8 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
     # N3 cap — chunk count (explicit signal, never a silent drop).
     if len(existing) >= web_cfg.max_chunks_per_encounter:
         log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="chunks")
+        if events is not None:  # encounter.cap_hit (design §5.4)
+            events.encounter_cap_hit(subject_id=encounter_id, cap="chunks")
         return _reject("chunk_cap", 413)
 
     # read the body (bounded by client_max_size → HTTPRequestEntityTooLarge).
@@ -432,6 +440,8 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
         body = await request.read()
     except web.HTTPRequestEntityTooLarge:
         log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="chunk_bytes")
+        if events is not None:  # encounter.cap_hit (design §5.4)
+            events.encounter_cap_hit(subject_id=encounter_id, cap="chunk_bytes")
         return _reject("chunk_too_large", 413)
     if not body:
         log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
@@ -441,6 +451,8 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
     # N3 cap — per-encounter total bytes.
     if _encounter_bytes(enc_dir) + len(body) > web_cfg.max_encounter_bytes:
         log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="encounter_bytes")
+        if events is not None:  # encounter.cap_hit (design §5.4)
+            events.encounter_cap_hit(subject_id=encounter_id, cap="encounter_bytes")
         return _reject("encounter_cap", 413)
 
     # WRITE — audio atomically FIRST, sidecar atomically LAST (contract #4/#7). The
@@ -452,12 +464,22 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
         enc_dir / f"chunk_{seq}{_META_SUFFIX}",
         json.dumps({"synthetic": synthetic, "seq": seq}),
     )
+    # encounter.opened (design §5.4) — the first accepted chunk (seq==1, after the
+    # atomic chunk+meta write). seq==1 reliably means "first chunk" (the gap-free
+    # seq gate above refuses any seq != expected, and expected==1 only when empty).
+    if events is not None and seq == 1:
+        events.encounter_opened(subject_id=encounter_id)
 
     closed = _is_true(q.get("close"))
     if closed:  # B3 — close-flag on the final chunk. THIS chunk IS the final, so
         # the manifest's final_seq = this seq (trivially correct — gives the
         # close-flag path the #57 structural completeness gate too).
         write_close_manifest(enc_dir, seq)
+        # encounter.closed (design §5.4) — the close-flag seal path. A close-flag
+        # seal with no event would leave a capture-but-no-`closed` timeline (an
+        # intentionally-left-blank violation on the CMPA demo query).
+        if events is not None:
+            events.encounter_closed(subject_id=encounter_id, final_seq=seq)
 
     log.info(
         "scribe.ingest_web.chunk_written",
@@ -479,6 +501,7 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
     empty ``_CLOSED`` for a zero-chunk close). MONOTONIC write-once + consistency
     belts guard against an adversarial 2nd close lowering the completeness bar."""
     config: ScribeConfig = request.app["scribe_config"]
+    events: "ScribeEvents | None" = request.app.get("scribe_events")
     label = request.query.get("label", "")
     if not ENCOUNTER_LABEL_RE.fullmatch(label):
         log.warning("scribe.ingest_web.rejected", route=CLOSE_ROUTE, reason="invalid_label")
@@ -512,6 +535,10 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
             _atomic_write_text(sentinel, "")
         log.info("scribe.ingest_web.closed", encounter_id=encounter_id,
                  protocol=1, final_seq=disk_max)
+        # encounter.closed (design §5.4) — the /close seal path (legacy/non-strict);
+        # final_seq = the on-disk max (0 for a zero-chunk close).
+        if events is not None:
+            events.encounter_closed(subject_id=encounter_id, final_seq=disk_max)
         return web.json_response({"encounter_id": encounter_id, "closed": True}, status=200)
 
     # (c) final_seq PRESENT → validate + consistency + monotonic write-once.
@@ -559,6 +586,9 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
     bar = max(existing_efs or 0, final_seq)
     write_close_manifest(enc_dir, bar)
     log.info("scribe.ingest_web.closed", encounter_id=encounter_id, protocol=2, final_seq=bar)
+    # encounter.closed (design §5.4) — the /close seal path (final_seq present).
+    if events is not None:
+        events.encounter_closed(subject_id=encounter_id, final_seq=bar)
     return web.json_response({"encounter_id": encounter_id, "closed": True}, status=200)
 
 
@@ -687,7 +717,9 @@ async def _handle_apple_touch_icon(request: web.Request) -> web.StreamResponse:
 
 # --- app + server lifecycle -------------------------------------------------
 
-def create_ingest_app(config: ScribeConfig) -> web.Application:
+def create_ingest_app(
+    config: ScribeConfig, *, events: "ScribeEvents | None" = None,
+) -> web.Application:
     """Build the ingest ``web.Application`` — the 3 bearer-required API routes +
     the 2 bearer-exempt static PWA routes (Slice B) + the 6 bearer-exempt
     standalone-install assets (manifest/icons/favicon/apple-touch-icon), the
@@ -702,6 +734,10 @@ def create_ingest_app(config: ScribeConfig) -> web.Application:
         middlewares=[_build_security_middleware(config)],
     )
     app["scribe_config"] = config
+    # The medico-legal event-store facade (event-store design §2.2 / §5.4). The four
+    # handlers read it via request.app.get("scribe_events") and emit encounter.*
+    # best-effort. None (default / non-clinical / degraded) → the handlers no-op.
+    app["scribe_events"] = events
     # 3 API routes — bearer-required, byte-identical to Slice A.
     app.router.add_post(INGEST_CHUNK_ROUTE, _handle_ingest_chunk)
     app.router.add_post(CLOSE_ROUTE, _handle_close)
@@ -739,13 +775,16 @@ class IngestWebServer:
     Started by the scribe daemon (on the daemon's own event loop) when
     ``ingest_web.enabled``; stopped in the daemon's shutdown ``finally``."""
 
-    def __init__(self, config: ScribeConfig) -> None:
+    def __init__(
+        self, config: ScribeConfig, *, events: "ScribeEvents | None" = None,
+    ) -> None:
         self._config = config
+        self._events = events
         self._runner: web.AppRunner | None = None
 
     async def start(self) -> None:
         web_cfg = self._config.ingest_web
-        app = create_ingest_app(self._config)
+        app = create_ingest_app(self._config, events=self._events)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, web_cfg.host, web_cfg.port)
