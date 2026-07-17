@@ -228,6 +228,18 @@ class ScribeIngestWebConfig:
 
 
 @dataclass
+class ScribeEventsConfig:
+    """The append-only event store (task #11, §2.4). The WHOLE surface is ``dir`` — an
+    override for the events directory; empty (the default) derives ``<logging.dir>/events`` at
+    the facade (caller-derivation, cli.py:2670-2674). Every field is filesystem-only, so NO
+    sovereign boundary barrier applies (unlike stt/llm). There is DELIBERATELY no ``enabled``
+    knob — an evidence store that can be configured off is not evidence; activation is always-on
+    with scribe, fail-loud at open in clinical mode (design doc §2.4)."""
+
+    dir: str = ""
+
+
+@dataclass
 class ScribeConfig:
     """Typed ``scribe:`` block.
 
@@ -246,6 +258,9 @@ class ScribeConfig:
     # The loopback PWA ingest server (#49). INERT by default; barrier (e)
     # validates its host is loopback + token present when enabled.
     ingest_web: ScribeIngestWebConfig = field(default_factory=ScribeIngestWebConfig)
+    # The append-only event store (task #11). ALWAYS-ON with scribe (no enabled knob);
+    # the facade derives the events dir from ``<logging.dir>/events`` unless ``dir`` overrides.
+    events: ScribeEventsConfig = field(default_factory=ScribeEventsConfig)
     # Designated human-clinician identities allowed to ATTEST a clinical_note
     # (scribe P2-a, #41). A plain identity list — NOT a network sub-field, so
     # no boundary barrier applies (barriers a/b gate only stt/llm). FAIL-CLOSED:
@@ -360,6 +375,7 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
         llm=_build(ScribeLlmConfig, scribe.get("llm")),
         diarize=_build_diarize(scribe.get("diarize")),
         ingest_web=_build_ingest_web(scribe.get("ingest_web")),
+        events=_build_events(scribe.get("events")),
         clinicians=clinicians,
         encounter_salt=str(scribe.get("encounter_salt") or ""),
         # #57 — scalar fields on ScribeConfig (no _build nesting): string-safe coerce
@@ -378,6 +394,19 @@ def _coerce_nonneg_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return n if n >= 0 else default
+
+
+def _build_events(data: Any) -> ScribeEventsConfig:
+    """Schema-tolerant build of :class:`ScribeEventsConfig` (only the ``dir`` string override;
+    the facade derives the default from the logging dir). Unknown keys dropped by the
+    ``__dataclass_fields__`` filter (load-time schema-tolerance contract)."""
+    if not isinstance(data, dict):
+        return ScribeEventsConfig()
+    known = {k: v for k, v in data.items() if k in ScribeEventsConfig.__dataclass_fields__}
+    cfg = ScribeEventsConfig()
+    if "dir" in known:
+        cfg.dir = str(known["dir"] or "")
+    return cfg
 
 
 def _build_diarize(data: Any) -> ScribeDiarizeConfig:

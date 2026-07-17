@@ -171,10 +171,17 @@ class EventStore:
         actor_kind: str = "",
         payload: dict | None = None,
         now: str | None = None,
+        post_append: "Callable[[AppendReceipt], None] | None" = None,
     ) -> AppendReceipt:
         """Append one event to ``stream``. Fail-loud on an unregistered ``(stream, kind)`` or an
         illegal payload; durable kinds fsync. Serialized by the stream flock; auto-writes genesis
-        on the stream's first append."""
+        on the stream's first append.
+
+        ``post_append`` (optional) runs WHILE the stream lock is still held, after the line is
+        written — so a derived index (e.g. the facade's attested-digest index, §7.4) can be
+        updated inside the SAME critical section, defeating a last-writer-wins race between two
+        concurrent appenders. Its exceptions propagate (an index the caller declared critical
+        must not silently drift); a best-effort caller wraps its own callback."""
         spec = self._kinds.get((stream, kind))
         if spec is None:
             raise EventStoreError(f"unregistered event kind {kind!r} on stream {stream!r}")
@@ -186,6 +193,8 @@ class EventStore:
             receipt = self._append_locked(
                 stream, spec, subject_id, actor, actor_kind, payload, now, spec.durable
             )
+            if post_append is not None:
+                post_append(receipt)  # runs under the still-held stream lock (§7.4)
         return receipt
 
     def _validate_payload(self, kind: str, fields: frozenset, payload: dict) -> None:
