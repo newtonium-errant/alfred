@@ -2659,6 +2659,49 @@ def cmd_instance_status_all(args: argparse.Namespace) -> None:
     print(format_summary_sentinel("status", results))
 
 
+def _cmd_scribe_eval(args: argparse.Namespace) -> None:
+    """``alfred scribe eval`` — regenerate the regulator-benchmarked scorecard.
+
+    ``--mode fixture`` (default) scores committed reference notes LLM-free (CI-safe,
+    no torch/Ollama/network). ``--mode real`` scores LIVE on-box note-gen (Ollama
+    qwen2.5-14b behind the armed sovereign guard). Writes markdown to ``--out``
+    (and always to stdout)."""
+    import asyncio
+
+    from alfred.scribe.eval import FixtureNoteGenSeam, render_scorecard_md, run_suite
+
+    mode = getattr(args, "mode", "fixture")
+    if mode == "real":
+        # On-box live model: arm the sovereign boundary (the note-gen call routes
+        # through the loopback Ollama guard), then score live output.
+        raw = _load_unified_config(args.config)
+        from alfred.scribe.config import load_from_unified as load_scribe_config
+        from alfred.scribe.eval import RealNoteGenSeam
+        from alfred.sovereign import (
+            SovereignBoundaryError,
+            install_sovereign_http_guard,
+            validate_sovereign_boundary,
+        )
+        scribe_cfg = load_scribe_config(raw)
+        try:
+            validate_sovereign_boundary(raw)   # raw unified dict, per the attest path
+            install_sovereign_http_guard()
+        except SovereignBoundaryError as e:
+            print(f"scribe eval REFUSED — sovereign boundary not satisfied: {e}")
+            sys.exit(1)
+        seam = RealNoteGenSeam(config=scribe_cfg)
+        scorecard = asyncio.run(run_suite(seam, config=scribe_cfg))
+    else:
+        scorecard = asyncio.run(run_suite(FixtureNoteGenSeam()))
+
+    md = render_scorecard_md(scorecard)
+    out = getattr(args, "out", None)
+    if out:
+        Path(out).write_text(md, encoding="utf-8")
+        print(f"scorecard written to {out}")
+    print(md)
+
+
 def cmd_scribe(args: argparse.Namespace) -> None:
     """``alfred scribe attest`` — the ONLY sanctioned clinical_note attest path.
 
@@ -2676,6 +2719,9 @@ def cmd_scribe(args: argparse.Namespace) -> None:
         return
     if subcmd == "audit":
         _cmd_scribe_audit(args)
+        return
+    if subcmd == "eval":
+        _cmd_scribe_eval(args)
         return
     if subcmd != "attest":
         print("Usage: alfred scribe {attest <note> --attester <clinician> | "
@@ -3991,6 +4037,22 @@ def build_parser() -> argparse.ArgumentParser:
         "resolve", help="Mark a report resolved (move to resolved/)",
     )
     bugs_resolve.add_argument("bug_id", help="The report id (filename stem)")
+
+    # scribe eval — the regulator-benchmarked scorecard (task #16)
+    scribe_eval = scribe_sub.add_parser(
+        "eval",
+        help="Score STAY-C on the Ontario AG accuracy axes → a repeatable "
+             "STAY-C-vs-market scorecard",
+    )
+    scribe_eval.add_argument(
+        "--mode", choices=["fixture", "real"], default="fixture",
+        help="fixture = committed reference notes, LLM-free (default, CI-safe); "
+             "real = live on-box note-gen (Ollama qwen2.5-14b)",
+    )
+    scribe_eval.add_argument(
+        "--out", default=None,
+        help="Write the scorecard markdown to this path (default: stdout only)",
+    )
 
     # distiller
     dist = sub.add_parser("distiller", help="Vault distiller subcommands")

@@ -87,6 +87,7 @@ from .pipeline import (  # noqa: E402
     generate_verified_note,
     is_chunk_settled,
     process_source,
+    render_verified_note,
     run_sweep,
 )
 from .state import (  # noqa: E402
@@ -181,6 +182,7 @@ __all__ = [
     "GroundingIntegrityError",
     # pipeline + state machine (P2-d)
     "generate_verified_note",
+    "render_verified_note",
     "VerifiedNote",
     "process_source",
     "run_sweep",

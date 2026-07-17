@@ -1,0 +1,34 @@
+{
+  "subjective": [
+    {
+      "claim": "Dull headache on and off for a couple of weeks, described as mild and annoying",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "No changes in vision, no nausea",
+      "source_spans": [
+        "S4"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Examination unremarkable",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Clinician to consider next steps; will follow up",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

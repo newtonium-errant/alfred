@@ -1,0 +1,41 @@
+{
+  "subjective": [
+    {
+      "claim": "Reports taking metformin daily as prescribed",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Blood sugars not adequately controlled on metformin",
+      "source_spans": [
+        "S1"
+      ]
+    }
+  ],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Stop metformin",
+      "source_spans": [
+        "S3",
+        "S5"
+      ]
+    },
+    {
+      "claim": "Start empagliflozin 10 mg once daily",
+      "source_spans": [
+        "S3"
+      ]
+    },
+    {
+      "claim": "Advised to stay well hydrated",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

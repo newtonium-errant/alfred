@@ -130,13 +130,23 @@ def test_choke_verifies_the_same_object_it_renders(monkeypatch):
 
 def test_pipeline_render_only_inside_the_choke():
     # Structural pin: render_soap is called EXACTLY once in the pipeline module,
-    # inside generate_verified_note (right after verify_grounding). No other code
-    # path renders a note → nothing reaches vault_create unverified.
+    # inside the verify-before-render composition. No other code path renders a
+    # note → nothing reaches vault_create unverified.
+    #
+    # #16 refactor: the composition (verify → render on the SAME object) moved
+    # into the SYNC ``render_verified_note`` so a non-Ollama caller (the eval
+    # fixture seam) runs the exact same path; ``generate_verified_note`` is now
+    # ``generate_structured`` + a delegate call. The invariant is unchanged — pin
+    # it on ``render_verified_note`` (where verify+render live) AND that the async
+    # choke delegates to it.
     src = inspect.getsource(pipeline_mod)
     assert src.count("render_soap(") == 1
-    choke = inspect.getsource(pipeline_mod.generate_verified_note)
+    choke = inspect.getsource(pipeline_mod.render_verified_note)
     assert "verify_grounding(" in choke and "render_soap(" in choke
     assert choke.index("verify_grounding(") < choke.index("render_soap(")
+    # the async entry generates then delegates to the sole render path.
+    outer = inspect.getsource(pipeline_mod.generate_verified_note)
+    assert "generate_structured(" in outer and "render_verified_note(" in outer
 
 
 # ---------------------------------------------------------------------------

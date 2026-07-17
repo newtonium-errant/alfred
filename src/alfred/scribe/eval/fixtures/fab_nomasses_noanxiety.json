@@ -1,0 +1,40 @@
+{
+  "subjective": [
+    {
+      "claim": "Cramping after meals for the last few days, settles on its own",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "No fever, vomiting, or blood in the stool",
+      "source_spans": [
+        "S4"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Abdomen soft and non-tender",
+      "source_spans": [
+        "S5"
+      ]
+    },
+    {
+      "claim": "Bowel sounds normal",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Expect it to settle; return if cramping worsens or a fever develops",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

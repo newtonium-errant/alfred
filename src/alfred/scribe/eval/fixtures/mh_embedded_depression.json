@@ -1,0 +1,39 @@
+{
+  "subjective": [
+    {
+      "claim": "Morning knee aches, recurrent reflux, persistent tiredness, and intermittent foot numbness",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Reports low mood \u2014 feeling down most days for a couple of months",
+      "source_spans": [
+        "S4"
+      ]
+    },
+    {
+      "claim": "Has stopped enjoying activities she used to (anhedonia)",
+      "source_spans": [
+        "S4"
+      ]
+    },
+    {
+      "claim": "Poor sleep, waking around 4am most nights",
+      "source_spans": [
+        "S4"
+      ]
+    }
+  ],
+  "objective": [],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Will address the low mood, loss of interest, and sleep alongside the physical complaints",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}
