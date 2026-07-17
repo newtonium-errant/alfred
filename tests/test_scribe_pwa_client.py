@@ -239,14 +239,15 @@ def test_page_loads_zero_external_resources():
 
 
 def test_route_table_pins(tmp_path):
-    # 3 API routes (byte-identical to Slice A) + 2 static PWA routes + 6 standalone-install
-    # assets (manifest/icons/favicon/apple-touch-icon ×2).
+    # 3 API routes (byte-identical to Slice A) + POST /scribe/bug (task #4) + 2 static PWA
+    # routes + 6 standalone-install assets (manifest/icons/favicon/apple-touch-icon ×2).
     app = create_ingest_app(_config(tmp_path))
     got = {(r.method, r.get_info().get("path")) for r in app.router.routes()
            if r.method in ("GET", "POST")}
     assert ("POST", iw.INGEST_CHUNK_ROUTE) in got
     assert ("POST", iw.CLOSE_ROUTE) in got
     assert ("GET", iw.STATUS_ROUTE) in got
+    assert ("POST", iw.BUG_ROUTE) in got
     assert ("GET", iw.PAGE_ROUTE) in got
     assert ("GET", iw.APP_JS_ROUTE) in got
     assert ("GET", iw.MANIFEST_ROUTE) in got
@@ -260,7 +261,7 @@ def test_route_table_pins(tmp_path):
     for route in iw._INSTALL_ASSET_PATHS:
         assert ("GET", route) in got, route
     # no extra GET/POST routes crept in — in particular NO /sw.js (no service worker).
-    assert len(got) == 11
+    assert len(got) == 12
     assert not any("sw.js" in path or "serviceworker" in path.lower()
                    for _, path in got), got
 
@@ -565,6 +566,68 @@ def test_browser_convention_asset_paths_are_pinned_literals():
     assert iw.APPLE_TOUCH_ICON_PRECOMPOSED_ROUTE == "/apple-touch-icon-precomposed.png"
 
 
+def test_sized_apple_touch_probe_is_quiet_404_no_warning(tmp_path):
+    # Bundled nit — the ingest server never 404'd an unknown path: a SIZED apple-touch probe
+    # (/apple-touch-icon-120x120.png; NOT one of the two canonical exempt paths) is a no-auth
+    # browser fetch for an asset that does not exist, but it used to land in the bearer branch
+    # and log a warning-level rejected(bad_token) 401 — the favicon-spam class one probe-family
+    # later. It must now be a QUIET 404 with NO warning-level rejected log.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                async with s.get(base + "/apple-touch-icon-120x120.png") as r:   # NO bearer
+                    st = r.status
+        return st, caps
+
+    st, caps = asyncio.run(_go())
+    assert st == 404
+    rejects = [c for c in caps if c.get("event") == "scribe.ingest_web.rejected"
+               and "apple-touch-icon-120x120" in str(c.get("route", ""))]
+    assert rejects == [], f"a sized apple-touch probe must not warn: {rejects}"
+
+
+def test_sized_apple_touch_probe_with_token_is_not_masked(tmp_path):
+    # The quiet-404 is gated on no-auth + GET so it can NEVER swallow a credentialed request:
+    # a sized apple-touch path WITH a valid ingest token still reaches normal routing (404 from
+    # the router — no such route — but NOT via the silent-probe short-circuit).
+    cfg = _config(tmp_path)
+
+    async def _go():
+        async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+            async with s.get(base + "/apple-touch-icon-120x120.png",
+                             headers={"Authorization": f"Bearer {_TOKEN}"}) as r:
+                return r.status
+
+    assert asyncio.run(_go()) == 404     # router 404 (no route) — the request was authorized first
+
+
+def test_bearer_reason_split_no_token_vs_bad_token(tmp_path):
+    # Bundled nit — the rejected-log reason now distinguishes NO Authorization (a benign
+    # unauthenticated fetch) from a WRONG token (a credential probe). Both still 401 on an API
+    # route, but the log reads no_token vs bad_token so the two signals are separable.
+    cfg = _config(tmp_path)
+
+    async def _go():
+        out = {}
+        with structlog.testing.capture_logs() as caps:
+            async with _serve(cfg) as base, aiohttp.ClientSession() as s:
+                async with s.get(base + iw.STATUS_ROUTE, params={"label": _LABEL}) as r:  # no auth
+                    out["no_auth"] = r.status
+                async with s.get(base + iw.STATUS_ROUTE, params={"label": _LABEL},
+                                 headers={"Authorization": "Bearer WRONG-TOKEN"}) as r:   # wrong
+                    out["wrong"] = r.status
+        return out, caps
+
+    out, caps = asyncio.run(_go())
+    assert out["no_auth"] == 401 and out["wrong"] == 401
+    reasons = [c.get("reason") for c in caps if c.get("event") == "scribe.ingest_web.rejected"
+               and c.get("route") == iw.STATUS_ROUTE]
+    assert "no_token" in reasons     # the unauthenticated fetch
+    assert "bad_token" in reasons    # the wrong-credential probe
+
+
 def test_manifest_install_has_no_service_worker():
     # The no-residue posture is intact: the install rides the MANIFEST ALONE. No service
     # worker route exists, and no serviceWorker registration / sw.js / Cache-API appears in
@@ -751,11 +814,23 @@ def test_pwa_only_free_text_inputs_are_token_and_voiceprint_name():
     assert code.count("<input") == 3, "a new <input> appeared in the client"
     ids = set(re.findall(r"<input[^>]*\bid=\"([a-z0-9_-]+)\"", code))
     assert ids == {"tok", "nm", "nm2"}, f"unexpected free-text input(s): {ids}"
-    # no OTHER text-capturing control may be injected by the JS either (the served-HTML
-    # scan cannot see these — they are built at runtime).
+    # no text-capturing control may be injected by the JS at RUNTIME (a JS-built patient field
+    # is the real injection surface — the served-HTML scan cannot see runtime-built controls).
     for banned in ("<textarea", "contenteditable"):
         assert banned not in code, f"JS-injected text control: {banned}"
-        assert banned not in render_index(_TOKEN).lower()
+    # The ONLY static-HTML free-text beyond the JS ones is the task-#4 bug-report form: exactly
+    # one <input id="bug-summary"> + one <textarea id="bug-detail">, and NOTHING else (no
+    # contenteditable, no second textarea). It is a diagnostic surface with its own PHI-caution
+    # banner and lives OUTSIDE the record view (pinned above) — never a patient/encounter field.
+    html = render_index(_TOKEN)
+    assert html.lower().count("<textarea") == 1               # ONLY the bug detail
+    assert 'id="bug-detail"' in html
+    assert "contenteditable" not in html.lower()
+    static_inputs = set(re.findall(r"<input[^>]*\bid=\"([a-z0-9_-]+)\"", html))
+    assert static_inputs == {"bug-summary"}, f"unexpected static <input>(s): {static_inputs}"
+    # the bug form carries the "no patient details" caution + is not in the record view.
+    bug_section = html.split('<section id="bug"')[1].split("</section>")[0].lower()
+    assert "patient details" in bug_section and "banner" in bug_section
     # the token field is a password box, never autofilled, and never persisted.
     assert re.search(r"<input id=\"tok\" type=\"password\" autocomplete=\"off\"", code)
     # the NAME fields carry the memo's guidance + the backend's 64-char cap.
@@ -1266,6 +1341,77 @@ def test_behaviour_empty_token_paste_is_not_a_dead_continue(tmp_path):
     assert res["enrollStartAfterEmpty"] is False         # an empty paste opened no session
     assert res["micOpensAfterEmpty"] == 0                # ...and no mic
     assert res["hasEnGoAfterValid"] is True              # the SAME Continue then advanced — not dead
+
+
+# ── Task #4: bug report — capture UI (button both views, ring buffer, visible confirm/fail) ─
+
+def test_behaviour_bug_report_carries_phi_free_context_and_ring_and_confirms(tmp_path):
+    # The incident, end to end: with NO clinician configured, tapping "Create a voiceprint"
+    # rings a breadcrumb; the bug report then POSTs that trace + PHI-FREE auto-context and
+    # confirms VISIBLY. This is exactly the diagnosability the 2026-07-16 dead-button bug lacked.
+    res = _drive("bug_report_flow", tmp_path)
+    assert res["bugOpenNotHidden"] is True                    # the form opened (visible)
+    posts = res["bugPosts"]
+    assert len(posts) == 1, posts
+    post = posts[0]
+    assert post["summary"] == "button does nothing"
+    ctx = post["context"]
+    assert ctx["view"] == "#/presets" and ctx["clinicians_len"] == 0 and ctx["user"] == ""
+    assert "HarnessUA" in ctx["ua"] and ctx["client_ts"]      # PHI-free context attached
+    # the RAM ring snapshot rode along AND carried the exact code-path breadcrumb.
+    assert isinstance(post["events"], list) and post["events"]
+    assert any("blocked: no clinician configured" in e for e in post["events"])
+    assert "Thank you" in res["bugMsg"]                       # VISIBLE confirm
+
+
+def test_behaviour_bug_report_empty_is_not_a_silent_noop(tmp_path):
+    # ILB — sending an empty report renders a message and POSTs nothing (never a silent no-op).
+    res = _drive("bug_report_empty", tmp_path)
+    assert "Please describe the problem" in res["bugMsg"]
+    assert res["bugPosts"] == []                              # nothing sent
+
+
+def test_behaviour_bug_report_server_error_shows_visible_failure(tmp_path):
+    # A non-2xx response renders a VISIBLE failure (intentionally-left-blank), never a silent
+    # swallow — the operator knows the report did not land.
+    res = _drive("bug_report_server_error", tmp_path)
+    assert len(res["bugPosts"]) == 1                          # it tried
+    assert "Could not send" in res["bugMsg"] and "500" in res["bugMsg"]
+
+
+def test_behaviour_bug_report_session_cap_blocks_visibly(tmp_path):
+    # Client-side per-session cap (spec: ~10/session; a stuck client must not fill the disk).
+    # With the cap at 2, the 3rd submit is blocked with a VISIBLE message and does NOT POST —
+    # only the first two land. The server's max_open_reports 429 is the independent backstop.
+    res = _drive("bug_report_session_cap", tmp_path)
+    assert len(res["bugPosts"]) == 2                         # only up to the cap were sent
+    assert "maximum number of reports" in res["bugMsg"]      # ...and the 3rd said so, visibly
+
+
+def test_bug_max_per_session_is_embedded_from_config():
+    # the cap number lives in ONE place (config) and is embedded into the page for the client
+    # to read — a config change propagates (no hardcoded client literal).
+    html = render_index(_TOKEN, ["np_jamie"], bug_max_per_session=3)
+    assert 'data-bug-max="3"' in html
+    assert pwa_assets._BUG_MAX_PLACEHOLDER not in html       # baked out
+    code = _code()
+    assert "BUG_MAX_PER_SESSION" in code and "bugSubmitCount" in code
+    assert "dataset.bugMax" in code                          # read from the page, not hardcoded
+
+
+def test_pwa_bug_affordance_on_both_views_and_ring_is_memory_only():
+    # STRUCTURAL — a "Report a problem" affordance on BOTH views, and the ring buffer is
+    # memory-only (no storage), PHI-free (status-code + breadcrumb, capped).
+    html = render_index(_TOKEN)
+    record = html.split('<section id="view-record">')[1].split("</section>")[0]
+    presets = html.split('<section id="view-presets"')[1].split("</section>")[0]
+    assert 'id="bug-open-record"' in record and 'id="bug-open-presets"' in presets
+    code = _code()
+    # ring is an in-memory array, capped, memory-only (no storage APIs — covered by the
+    # no-browser-storage test; here pin the cap + snapshot-on-submit).
+    assert "const bugRing = []" in code and "BUG_RING_MAX" in code
+    assert "bugRing.slice()" in code                          # a SNAPSHOT rides the POST
+    assert "'/scribe/bug'" in code                            # posts to the ingest-token route
 
 
 # ── N6: esc() is the attribute-context belt ─────────────────────────────────

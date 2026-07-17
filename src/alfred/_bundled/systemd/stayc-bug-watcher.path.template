@@ -1,0 +1,15 @@
+[Unit]
+Description=STAY-C bug-report watcher path — fire on new reports (surfacing; NON-clinical)
+# DELIBERATELY SEPARATE from alfred-stayc-clinical.service. This surfacing component runs
+# OUTSIDE the clinical unit, as the OPERATOR. It does NOT egress at all — its only output is a
+# local Salem-readable relay SPOOL FILE (no network). The clinical daemon never touches it. Task #4.
+
+[Path]
+# Fire whenever the bug dir changes — a new/rewritten report file lands here.
+PathModified=<STAYC_BUG_DIR>
+# Also fire at start if reports already await (one that landed while the watcher was down).
+DirectoryNotEmpty=<STAYC_BUG_DIR>
+Unit=stayc-bug-watcher.service
+
+[Install]
+WantedBy=multi-user.target

@@ -2681,6 +2681,12 @@ def cmd_scribe(args: argparse.Namespace) -> None:
         print("Usage: alfred scribe {attest <note> --attester <clinician> | "
               "events {list|verify|tip|anchor} | audit encounter <enc> | "
               "presets {list|audit|delete}}")
+    if subcmd == "bugs":
+        _cmd_scribe_bugs(args)
+        return
+    if subcmd != "attest":
+        print("Usage: alfred scribe {attest <note> --attester <clinician> | "
+              "presets {list|audit|delete} | bugs {list|show|resolve}}")
         sys.exit(1)
 
     raw = _load_unified_config(args.config)
@@ -2881,6 +2887,51 @@ def _cmd_scribe_audit(args: argparse.Namespace) -> None:
     print(json.dumps(rows, indent=2))
     if not rows:
         print(f"no events for encounter {args.encounter}", file=sys.stderr)  # ILB
+
+
+def _cmd_scribe_bugs(args: argparse.Namespace) -> None:
+    """``alfred scribe bugs list|show|resolve`` — triage box-local bug reports (task #4).
+
+    Local file ops only (no vault write, no egress): reads/moves ``<ts>-<hex>.md`` reports
+    (opaque id — the summary lives only in the file body) under the resolved bug dir. Promotion
+    to Forgejo bug-intake / VERA is a HUMAN act after
+    on-box read + scrub — this CLI does NOT forward. ``resolve`` moves a report to
+    ``resolved/`` (v1 keeps them; retention is owned by task #13)."""
+    raw = _load_unified_config(args.config)
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+    from alfred.scribe import bug as bug_mod
+
+    cfg = load_scribe_config(raw)
+    bcmd = getattr(args, "bugs_cmd", None)
+
+    if bcmd == "list":
+        rows = bug_mod.list_bugs(cfg, include_resolved=getattr(args, "all", False))
+        if not rows:
+            print("No bug reports.")                 # intentionally-left-blank
+            return
+        for r in rows:
+            flag = "  [resolved]" if r["resolved"] else ""
+            print(f"{r['id']}  {r['created']}  {r['summary']!r}{flag}")
+        return
+
+    if bcmd == "show":
+        text = bug_mod.read_bug(cfg, args.bug_id)
+        if text is None:
+            print(f"No such bug report: {args.bug_id!r}")
+            sys.exit(1)
+        print(text)
+        return
+
+    if bcmd == "resolve":
+        if bug_mod.resolve_bug(cfg, args.bug_id):
+            print(f"Resolved {args.bug_id} (moved to resolved/).")
+        else:
+            print(f"No such bug report: {args.bug_id!r}")
+            sys.exit(1)
+        return
+
+    print("Usage: alfred scribe bugs {list [--all] | show <id> | resolve <id>}")
+    sys.exit(1)
 
 
 def _cmd_scribe_presets(args: argparse.Namespace) -> None:
@@ -3924,6 +3975,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     presets_delete.add_argument("--user", required=True, help="The preset's clinician (user subdir)")
     presets_delete.add_argument("--preset", required=True, help="The preset id (pst-...)")
+
+    # Task #4 — box-local bug-report triage (local file ops under the resolved bug dir).
+    scribe_bugs = scribe_sub.add_parser(
+        "bugs", help="Triage box-local STAY-C bug reports (list / show / resolve)",
+    )
+    bugs_sub = scribe_bugs.add_subparsers(dest="bugs_cmd")
+    bugs_list = bugs_sub.add_parser(
+        "list", help="List bug reports (unresolved by default; --all adds resolved)",
+    )
+    bugs_list.add_argument("--all", action="store_true", help="Include resolved reports")
+    bugs_show = bugs_sub.add_parser("show", help="Print a bug report by id")
+    bugs_show.add_argument("bug_id", help="The report id (filename stem)")
+    bugs_resolve = bugs_sub.add_parser(
+        "resolve", help="Mark a report resolved (move to resolved/)",
+    )
+    bugs_resolve.add_argument("bug_id", help="The report id (filename stem)")
 
     # distiller
     dist = sub.add_parser("distiller", help="Vault distiller subcommands")
