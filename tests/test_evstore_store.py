@@ -393,3 +393,40 @@ def test_post_append_runs_inside_the_stream_lock(tmp_path):
 
     s.append("clinical", "attest.recorded", payload={"body_sha": "x"}, post_append=_cb)
     assert observed["held"] is True  # MUTATION-BIND: post_append outside the lock → False
+
+
+# --- H1 round-2: the predicate is the FULL effective one (int seq / str prev) ----
+
+def test_non_int_seq_forgery_non_servable_and_no_crash(tmp_path):
+    # A forged row with a non-integer seq passes a PRESENCE-only check but fails verify's int(seq):
+    # the round-1 hole served it as genuine evidence while verify stayed ok=True. The shared
+    # predicate excludes it from the readers too — non-servable, counted, verify does not crash.
+    s = _store(tmp_path)
+    s.append("clinical", "attest.recorded", subject_id="enc-real", payload={"body_sha": "real1"})
+    with open(tmp_path / "events" / "clinical.jsonl", "a") as f:
+        f.write(json.dumps({"entry_sha": "f" * 64, "prev": "0" * 64, "seq": "abc",
+                            "kind": "attest.recorded", "subject_id": "enc-EVIL",
+                            "payload": {"body_sha": "EVIL"}}) + "\n")
+    s.append("clinical", "attest.recorded", payload={"body_sha": "real2"})  # seals the forgery mid-file
+    assert all(e.get("subject_id") != "enc-EVIL" for e in s.query("clinical"))  # NOT served
+    assert s.latest("clinical", subject_id="enc-EVIL") is None
+    rep = s.verify("clinical")  # no crash
+    assert rep.ok and rep.sealed_fragments == 1  # counted, not silently blessed
+
+
+def test_non_string_prev_tail_does_not_crash_tip_or_verify(tmp_path):
+    # Finding 3 (the DoS): a forged TAIL row with a NON-STRING prev makes recompute_entry_sha do
+    # `prev + "\n"` → TypeError, crashing tip resolution (the next append) AND verify. The shared
+    # predicate makes it a non-entry BEFORE recompute → no crash; the legit append chains onto the
+    # genuine tip; the forgery is never served.
+    s = _store(tmp_path)
+    s.append("clinical", "attest.recorded", payload={"body_sha": "real1"})  # genuine tip = seq 2
+    with open(tmp_path / "events" / "clinical.jsonl", "a") as f:
+        f.write(json.dumps({"entry_sha": "f" * 64, "prev": 0, "seq": 3,  # prev is INT, not str
+                            "kind": "attest.recorded", "subject_id": "enc-EVIL",
+                            "payload": {"body_sha": "EVIL"}}) + "\n")
+    s.append("clinical", "attest.recorded", payload={"body_sha": "real2"})  # MUST NOT crash on tip
+    rep = s.verify("clinical")  # MUST NOT crash
+    assert rep.ok  # legit append chained onto the genuine tip, not the forgery
+    assert all(e.get("subject_id") != "enc-EVIL" for e in s.tail("clinical", 5))  # non-servable
+    assert [e["seq"] for e in s.tail("clinical", 5)][-1] == 3  # real2 got seq 3 (genuine chain)

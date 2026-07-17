@@ -114,6 +114,28 @@ def _is_flat_scalar_list(v: Any) -> bool:
     return isinstance(v, list) and all(_is_scalar(e) for e in v)
 
 
+def _is_chain_entry(e: Any) -> bool:
+    """The ONE structural chain-entry predicate — shared by ``_iter_entries`` (the query surface:
+    query/latest/tail/audit_encounter/rebuild_index), ``_last_valid`` (tip resolution), AND
+    ``verify``, so the three can never drift again (the H1 class). A row is a chain entry iff it is
+    a dict carrying ``entry_sha`` + a ``str`` ``prev`` + a ``seq`` that parses as ``int``. This is
+    the FULL effective predicate ``verify`` needs BEFORE calling ``recompute_entry_sha`` (which does
+    ``prev + "\\n"`` — a non-str ``prev`` would raise) and taking ``int(seq)``. Anything failing it
+    is a non-entry: never served as evidence, never a tip candidate, counted as a sealed fragment by
+    verify — so a forgery cannot be query-servable yet verify-invisible, and no malformed field can
+    crash tip resolution / verify (the in-band DoS). Value validity (the sha itself) is verify's job,
+    not this structural gate."""
+    if not (isinstance(e, dict) and "entry_sha" in e and "prev" in e and "seq" in e):
+        return False
+    if not isinstance(e["prev"], str):
+        return False
+    try:
+        int(e["seq"])
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 class EventStore:
     """One events directory: two (or more) hash-chained JSONL streams + an anchors dir.
 
@@ -317,11 +339,13 @@ class EventStore:
 
     @staticmethod
     def _last_valid(text: str) -> tuple[int, str] | None:
-        """The tip (last chain-valid entry). Requires entry_sha AND prev AND seq (aligned with
-        verify / _iter_entries, H1) AND RECOMPUTES the candidate's sha before accepting it — a
-        forged tail row with a plausible ``seq`` but a garbage ``entry_sha`` must not become the
-        tip, else the next legitimate append chains onto the forgery and every future entry
-        verify-fails (an unrecoverable in-band integrity DoS the never-truncate rule forbids)."""
+        """The tip (last chain-valid entry). Gates on the shared ``_is_chain_entry`` predicate
+        (entry_sha + str prev + int-parseable seq — same as verify / _iter_entries, H1) AND
+        RECOMPUTES the candidate's sha before accepting it — a forged tail row with a plausible
+        ``seq`` but a garbage ``entry_sha`` must not become the tip, else the next legitimate append
+        chains onto the forgery and every future entry verify-fails (an unrecoverable in-band DoS the
+        never-truncate rule forbids). The predicate also makes ``recompute_entry_sha`` crash-safe
+        (a non-str ``prev`` is a non-entry, never reaches the recompute)."""
         for raw in reversed(text.split("\n")):
             s = raw.strip()
             if not s:
@@ -330,15 +354,11 @@ class EventStore:
                 e = json.loads(s)
             except ValueError:
                 continue
-            if not (isinstance(e, dict) and "entry_sha" in e and "prev" in e and "seq" in e):
-                continue
-            try:
-                seq = int(e["seq"])
-            except (TypeError, ValueError):
+            if not _is_chain_entry(e):
                 continue
             if recompute_entry_sha(e) != e["entry_sha"]:
                 continue  # tip candidate fails its own sha — skip to the last GENUINE entry
-            return (seq, str(e["entry_sha"]))
+            return (int(e["seq"]), str(e["entry_sha"]))
         return None
 
     def tip(self, stream: str) -> dict:
@@ -350,11 +370,11 @@ class EventStore:
         """Tolerant reader (enroll_learning.py:233–236 discipline): yield each parseable dict
         entry in chain order; skip blank / torn / non-entry lines.
 
-        The entry predicate (entry_sha AND prev AND seq) is ALIGNED with ``verify`` (H1) — a
-        schema-partial forged line missing ``prev``/``seq`` is chain-INVISIBLE to verify, so it must
-        be invisible to query/latest/tail/audit_encounter/rebuild_index too. Otherwise a forgery is
-        query-servable (served as evidence, pinned into the attested-digest index) yet verify stays
-        green forever. This yields structurally-valid entries only; verify recomputes the sha."""
+        Gates on the shared ``_is_chain_entry`` predicate — ALIGNED with ``verify`` (H1) so a
+        schema-partial OR type-malformed forged line (missing ``prev``/``seq``, a non-str ``prev``,
+        or a non-int-parseable ``seq``) is chain-INVISIBLE to verify AND therefore never served here
+        as evidence / pinned into the attested-digest index. Otherwise a forgery is query-servable
+        yet verify-green forever. Structurally-valid entries only; verify recomputes the sha."""
         jsonl = self._jsonl(stream)
         if not jsonl.exists():
             return
@@ -367,7 +387,7 @@ class EventStore:
                     e = json.loads(s)
                 except ValueError:
                     continue
-                if isinstance(e, dict) and "entry_sha" in e and "prev" in e and "seq" in e:
+                if _is_chain_entry(e):
                     yield e
 
     def query(
@@ -444,10 +464,12 @@ class EventStore:
         fragments are COUNTED — the FINAL one as ``torn_tail`` (a crash artifact), every non-final
         one as ``sealed_fragments`` (a sealed crash fragment OR smuggled non-entry bytes the chain
         links across). A nonzero ``sealed_fragments`` is pass-with-warning, not a pass: the evidence
-        file carries lines no chain row attests to. The predicate here (entry_sha AND prev AND seq)
-        is ALIGNED with the tolerant readers (``_iter_entries`` / ``_last_valid``) so that any
-        query-visible row is necessarily chain-covered — a forgery cannot be query-servable yet
-        verify-invisible (H1)."""
+        file carries lines no chain row attests to. The structural gate here is the shared
+        ``_is_chain_entry`` predicate — IDENTICAL to the tolerant readers (``_iter_entries`` /
+        ``_last_valid``) so that any query-visible row is necessarily chain-covered — a forgery
+        cannot be query-servable yet verify-invisible (H1). It also makes the ``recompute_entry_sha``
+        call below crash-safe: a non-str ``prev`` / non-int ``seq`` is a non-entry (a sealed
+        fragment), never reaching the recompute."""
         das = self._days_since_anchor(stream)
         jsonl = self._jsonl(stream)
         if not jsonl.exists() or jsonl.stat().st_size == 0:
@@ -466,15 +488,15 @@ class EventStore:
                 continue
             try:
                 e = json.loads(s)
-                if not (isinstance(e, dict) and "entry_sha" in e and "prev" in e and "seq" in e):
-                    raise ValueError("not an entry")
-                seq = int(e["seq"])
-            except (ValueError, TypeError):
+            except ValueError:
+                e = None
+            if not _is_chain_entry(e):
                 if i == last_nonempty:
                     torn_tail = True  # crash-mid-append fragment on the final line — benign
                 else:
                     sealed_fragments += 1  # non-final skipped line — counted, not silently blessed
                 continue  # skip; continuity check below catches a break
+            seq = int(e["seq"])  # predicate guarantees this parses
             if (
                 recompute_entry_sha(e) != e["entry_sha"]
                 or e["prev"] != prev_sha
