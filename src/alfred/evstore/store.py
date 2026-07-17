@@ -80,7 +80,10 @@ class AppendReceipt:
 class VerifyReport:
     """Result of a linear verify scan (§4). ``ok`` false ⇒ tamper/corruption at ``first_bad_seq``;
     ``torn_tail`` true ⇒ a crash-mid-append fragment on the final line (benign, pass-with-warning);
-    ``days_since_last_anchor`` None ⇒ never anchored (the zero-config ILB nag)."""
+    ``sealed_fragments`` ⇒ count of NON-final skipped fragments the chain links across — a sealed
+    crash fragment OR smuggled non-entry bytes; pass-with-warning like torn_tail, but a nonzero
+    value means the evidence file carries lines no chain row attests to (the operator must eyeball
+    the raw JSONL). ``days_since_last_anchor`` None ⇒ never anchored (the zero-config ILB nag)."""
 
     ok: bool
     entries: int
@@ -89,6 +92,7 @@ class VerifyReport:
     first_bad_seq: int | None
     torn_tail: bool
     days_since_last_anchor: int | None
+    sealed_fragments: int = 0
 
 
 @dataclass(frozen=True)
@@ -313,6 +317,11 @@ class EventStore:
 
     @staticmethod
     def _last_valid(text: str) -> tuple[int, str] | None:
+        """The tip (last chain-valid entry). Requires entry_sha AND prev AND seq (aligned with
+        verify / _iter_entries, H1) AND RECOMPUTES the candidate's sha before accepting it — a
+        forged tail row with a plausible ``seq`` but a garbage ``entry_sha`` must not become the
+        tip, else the next legitimate append chains onto the forgery and every future entry
+        verify-fails (an unrecoverable in-band integrity DoS the never-truncate rule forbids)."""
         for raw in reversed(text.split("\n")):
             s = raw.strip()
             if not s:
@@ -321,11 +330,15 @@ class EventStore:
                 e = json.loads(s)
             except ValueError:
                 continue
-            if isinstance(e, dict) and "entry_sha" in e and "seq" in e:
-                try:
-                    return (int(e["seq"]), str(e["entry_sha"]))
-                except (TypeError, ValueError):
-                    continue
+            if not (isinstance(e, dict) and "entry_sha" in e and "prev" in e and "seq" in e):
+                continue
+            try:
+                seq = int(e["seq"])
+            except (TypeError, ValueError):
+                continue
+            if recompute_entry_sha(e) != e["entry_sha"]:
+                continue  # tip candidate fails its own sha — skip to the last GENUINE entry
+            return (seq, str(e["entry_sha"]))
         return None
 
     def tip(self, stream: str) -> dict:
@@ -335,7 +348,13 @@ class EventStore:
 
     def _iter_entries(self, stream: str) -> Iterator[dict]:
         """Tolerant reader (enroll_learning.py:233–236 discipline): yield each parseable dict
-        entry in chain order; skip blank / torn / non-dict lines."""
+        entry in chain order; skip blank / torn / non-entry lines.
+
+        The entry predicate (entry_sha AND prev AND seq) is ALIGNED with ``verify`` (H1) — a
+        schema-partial forged line missing ``prev``/``seq`` is chain-INVISIBLE to verify, so it must
+        be invisible to query/latest/tail/audit_encounter/rebuild_index too. Otherwise a forgery is
+        query-servable (served as evidence, pinned into the attested-digest index) yet verify stays
+        green forever. This yields structurally-valid entries only; verify recomputes the sha."""
         jsonl = self._jsonl(stream)
         if not jsonl.exists():
             return
@@ -348,7 +367,7 @@ class EventStore:
                     e = json.loads(s)
                 except ValueError:
                     continue
-                if isinstance(e, dict) and "entry_sha" in e:
+                if isinstance(e, dict) and "entry_sha" in e and "prev" in e and "seq" in e:
                     yield e
 
     def query(
@@ -419,21 +438,27 @@ class EventStore:
     def verify(self, stream: str) -> VerifyReport:
         """Linear scan: recompute every ``entry_sha``, check ``prev`` linkage + seq continuity.
 
-        PURE — never appends (the ``store.verified`` success row is the caller's, §4/§6.2). A torn
-        FINAL fragment is ``torn_tail`` (pass-with-warning); any continuity break (bad sha, prev
-        mismatch, seq gap) is ``first_bad_seq`` + ``ok=False``. A sealed mid-file torn fragment is
-        skipped and PASSES iff the chain still links across it (the only reading consistent with
-        the never-truncate torn-tail recovery — see the receipt's doc-tension note)."""
+        PURE — never appends (the ``store.verified`` success row is the caller's, §4/§6.2).
+        Continuity semantics (design §4): a torn/sealed fragment ANYWHERE is skipped; any resulting
+        continuity break (recomputed sha / prev / seq) is ``first_bad_seq`` + ``ok=False``; skipped
+        fragments are COUNTED — the FINAL one as ``torn_tail`` (a crash artifact), every non-final
+        one as ``sealed_fragments`` (a sealed crash fragment OR smuggled non-entry bytes the chain
+        links across). A nonzero ``sealed_fragments`` is pass-with-warning, not a pass: the evidence
+        file carries lines no chain row attests to. The predicate here (entry_sha AND prev AND seq)
+        is ALIGNED with the tolerant readers (``_iter_entries`` / ``_last_valid``) so that any
+        query-visible row is necessarily chain-covered — a forgery cannot be query-servable yet
+        verify-invisible (H1)."""
         das = self._days_since_anchor(stream)
         jsonl = self._jsonl(stream)
         if not jsonl.exists() or jsonl.stat().st_size == 0:
-            return VerifyReport(True, 0, 0, GENESIS_PREV, None, False, das)
+            return VerifyReport(True, 0, 0, GENESIS_PREV, None, False, das, 0)
         physical = jsonl.read_text(encoding="utf-8", errors="replace").split("\n")
         last_nonempty = max((i for i, ln in enumerate(physical) if ln.strip()), default=-1)
         prev_sha = GENESIS_PREV
         prev_seq = 0
         entries = 0
         torn_tail = False
+        sealed_fragments = 0
         first_bad: int | None = None
         for i, ln in enumerate(physical):
             s = ln.strip()
@@ -447,7 +472,9 @@ class EventStore:
             except (ValueError, TypeError):
                 if i == last_nonempty:
                     torn_tail = True  # crash-mid-append fragment on the final line — benign
-                continue  # sealed mid-file fragment: skip; continuity check below catches a break
+                else:
+                    sealed_fragments += 1  # non-final skipped line — counted, not silently blessed
+                continue  # skip; continuity check below catches a break
             if (
                 recompute_entry_sha(e) != e["entry_sha"]
                 or e["prev"] != prev_sha
@@ -459,7 +486,8 @@ class EventStore:
             prev_seq = seq
             entries += 1
         return VerifyReport(
-            first_bad is None, entries, prev_seq, prev_sha, first_bad, torn_tail, das
+            first_bad is None, entries, prev_seq, prev_sha, first_bad, torn_tail, das,
+            sealed_fragments,
         )
 
     # --- preflight / anchor ------------------------------------------------
@@ -513,7 +541,16 @@ class EventStore:
                 latest_ts = dt
         if latest_ts is None:
             return None
-        delta = datetime.now(timezone.utc) - latest_ts
+        # Measure staleness against the SAME clock the anchor ts was stamped with (``self._now``):
+        # in production (clock=None) that is real UTC now; under an injected clock (tests / a
+        # deterministic replay) it stays consistent, so "anchored just now" reads 0 days regardless
+        # of the wall calendar. (Was ``datetime.now`` unconditionally → a fixed-clock anchor went
+        # stale by the real-world date, a date-boundary flake.)
+        try:
+            now_dt = datetime.fromisoformat(self._now().replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            now_dt = datetime.now(timezone.utc)
+        delta = now_dt - latest_ts
         return max(0, delta.days)
 
     # --- fs helpers --------------------------------------------------------
@@ -561,3 +598,10 @@ class EventStore:
     def _locked(self, stream: str) -> "EventStore._Locked":
         self._ensure_dir()
         return EventStore._Locked(self._lock(stream))
+
+    def stream_lock(self, stream: str) -> "EventStore._Locked":
+        """Public per-stream flock context (§7.4). Lets the facade wrap a multi-step read+write
+        (e.g. ``rebuild_index``: read the log → atomic-replace the index) in the SAME critical
+        section ``append`` holds — so a rebuild can't race a concurrent attest's post_append index
+        update (last-writer-wins). Usage: ``with store.stream_lock(CLINICAL): ...``."""
+        return self._locked(stream)

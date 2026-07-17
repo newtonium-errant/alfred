@@ -284,3 +284,112 @@ def test_dir_and_file_permissions(tmp_path):
     ev = tmp_path / "events"
     assert (ev.stat().st_mode & 0o777) == 0o700
     assert ((ev / "clinical.jsonl").stat().st_mode & 0o777) == 0o600
+
+
+# --- H1: tolerant-reader / verify predicate ALIGNMENT ------------------------
+
+def test_query_visible_forgery_breaks_verify(tmp_path):
+    # The H1 invariant (design §4): any row the tolerant readers SERVE is chain-covered — a forgery
+    # cannot be query-servable yet verify-invisible. A forged line carrying all three chain fields
+    # (entry_sha+prev+seq) IS served by _iter_entries → it MUST therefore break verify.
+    s = _store(tmp_path)
+    s.append("clinical", "attest.recorded", payload={"body_sha": "real1"})
+    with open(tmp_path / "events" / "clinical.jsonl", "a") as f:
+        f.write(json.dumps({
+            "entry_sha": "f" * 64, "prev": "0" * 64, "seq": 3, "kind": "attest.recorded",
+            "subject_id": "enc-EVIL", "payload": {"body_sha": "EVIL"}}) + "\n")
+    # it IS query-visible (has all three fields)...
+    assert any(e.get("subject_id") == "enc-EVIL" for e in s.tail("clinical", 5))
+    # ...so verify MUST reject it (recomputed sha mismatch). Query-visible ⇒ chain-covered.
+    assert not s.verify("clinical").ok
+
+
+def test_schema_partial_forgery_invisible_to_readers(tmp_path):
+    # A forged line MISSING prev/seq is chain-INVISIBLE to verify (skipped as a fragment); with the
+    # aligned predicate it is likewise invisible to query/latest/tail/rebuild — it can never be
+    # served as evidence or pinned into the attested-digest index.
+    s = _store(tmp_path)
+    s.append("clinical", "attest.recorded", subject_id="enc-real", payload={"body_sha": "real1"})
+    with open(tmp_path / "events" / "clinical.jsonl", "a") as f:
+        f.write(json.dumps({"entry_sha": "f" * 64, "kind": "attest.recorded",
+                            "subject_id": "enc-EVIL", "payload": {"body_sha": "EVIL"}}) + "\n")
+    assert all(e.get("subject_id") != "enc-EVIL" for e in s.query("clinical"))  # not served
+    assert s.latest("clinical", subject_id="enc-EVIL") is None
+    assert s.verify("clinical").ok  # the fragment is skipped, chain intact (but counted, see M1)
+
+
+def test_forged_fragment_does_not_poison_tip(tmp_path):
+    # H1 DoS variant: a forged row that verify SKIPS (no 'prev') but a WEAKER tip resolver would
+    # accept (it has entry_sha+seq) must NOT become the tip — else the next LEGITIMATE append chains
+    # onto the forgery's sha and verify-fails forever (unrecoverable, never-truncate). _last_valid
+    # requires prev AND recomputes the sha, so the genuine tip is used.
+    s = _store(tmp_path)
+    s.append("clinical", "attest.recorded", payload={"body_sha": "real1"})  # genuine tip = seq 2
+    with open(tmp_path / "events" / "clinical.jsonl", "a") as f:
+        f.write(json.dumps({"entry_sha": "f" * 64, "seq": 99,  # NO prev → verify skips it
+                            "kind": "attest.recorded", "payload": {"body_sha": "EVIL"}}) + "\n")
+    s.append("clinical", "attest.recorded", payload={"body_sha": "real2"})  # must chain onto seq 2
+    rep = s.verify("clinical")
+    assert rep.ok  # MUTATION-BIND: a weaker _last_valid chains real2 onto the forgery → verify fails
+    assert rep.sealed_fragments >= 1  # the forgery is a counted, un-chained fragment
+    seqs = [e["seq"] for e in s.tail("clinical", 5)]
+    assert 99 not in seqs and seqs[-1] == 3  # real2 got seq 3, chaining onto the genuine seq 2
+
+
+# --- M1: verify counts sealed (non-final skipped) fragments ------------------
+
+def test_inserted_foreign_line_counted_not_silently_blessed(tmp_path):
+    # An inserted mid-file non-entry line (simulated smuggled free text) — the chain still links
+    # across it, but verify must COUNT it (sealed_fragments), not report a fully clean bill.
+    s = _store(tmp_path)
+    for i in range(3):
+        s.append("clinical", "attest.recorded", payload={"body_sha": f"h{i}"})
+    p = tmp_path / "events" / "clinical.jsonl"
+    lines = p.read_text().splitlines()
+    lines.insert(2, json.dumps({"note": "patient John Smith DOB 1961-02-03 undeclared free text"}))
+    p.write_text("\n".join(lines) + "\n")
+    rep = s.verify("clinical")
+    assert rep.ok and rep.torn_tail is False  # chain links across it
+    assert rep.sealed_fragments == 1  # ...but the un-chained line is surfaced (ILB), not silent
+
+
+# --- M4: fsync-on-durable + post_append-under-lock are BOUND -----------------
+
+def test_durable_append_fsyncs(tmp_path, monkeypatch):
+    s = _store(tmp_path)
+    s.append("clinical", "attest.recorded", payload={"body_sha": "x"})  # writes genesis + entry
+    synced: list = []
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd))
+    s.append("clinical", "attest.recorded", payload={"body_sha": "y"})  # durable [D] entry
+    assert len(synced) >= 1  # MUTATION-BIND: dropping os.fsync in _write_line makes this empty
+
+
+def test_best_effort_append_does_not_fsync(tmp_path, monkeypatch):
+    s = _store(tmp_path)
+    s.append("access", "access.read", payload={"via": "cli"})  # genesis (fsync) + entry
+    synced: list = []
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd))
+    s.append("access", "access.read", payload={"via": "daemon"})  # best-effort entry, no genesis
+    assert synced == []  # a best-effort append must NOT fsync
+
+
+def test_post_append_runs_inside_the_stream_lock(tmp_path):
+    # §7.4: the post_append callback runs WHILE the stream flock is still held (so a derived index
+    # update joins the append's critical section). Probe it: a NON-blocking re-lock of the same
+    # lock file from inside the callback must be DENIED (append holds it).
+    import fcntl
+    s = _store(tmp_path)
+    observed: dict = {}
+
+    def _cb(receipt):
+        lockpath = tmp_path / "events" / "clinical.lock"
+        with open(lockpath, "w") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed["held"] = False  # acquired → append is NOT holding it (mutation)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except OSError:
+                observed["held"] = True   # denied → append holds the lock (correct)
+
+    s.append("clinical", "attest.recorded", payload={"body_sha": "x"}, post_append=_cb)
+    assert observed["held"] is True  # MUTATION-BIND: post_append outside the lock → False

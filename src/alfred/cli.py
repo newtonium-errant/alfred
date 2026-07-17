@@ -2842,6 +2842,7 @@ def _cmd_scribe_events(args: argparse.Namespace) -> None:
             "stream": args.stream, "ok": report.ok, "entries": report.entries,
             "head_seq": report.head_seq, "head_sha": report.head_sha,
             "first_bad_seq": report.first_bad_seq, "torn_tail": report.torn_tail,
+            "sealed_fragments": report.sealed_fragments,
             "days_since_last_anchor": report.days_since_last_anchor,
         }
         if report.ok and report.entries == 1:
