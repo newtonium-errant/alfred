@@ -15,11 +15,18 @@ primitives STRUCTURAL, not advisory:
     (3) writes the triad via ``vault_edit`` under the PRIVILEGED
         ``stayc_clinical_attest`` scope (a scope the pipeline can never
         select), and
-    (4) appends a durable, PHI-FREE medico-legal attest audit
-        (``clinical_attest_audit.jsonl``) + emits ``scribe.attest.recorded``.
+    (4) DUAL-WRITES the durable, PHI-FREE medico-legal trail — the legacy
+        ``clinical_attest_audit.jsonl`` line FIRST (an independent trail that
+        survives any event-store bug), THEN the durable ``attest.recorded``
+        event into the hash-chained store (event-store design §5.2/§8 row 2) —
+        and emits the ``scribe.attest.recorded`` structlog line.
 
 Deliberately a scribe-layer orchestrator, NOT a ``vault_attest`` op in
 ``ops.py`` — keeps the vault layer scribe-agnostic (no vault→scribe import).
+The attestation-as-event integration adds a scribe→``scribe.events`` dependency
+(the ``events`` facade is threaded in as a keyword arg by ``cmd_scribe``, never
+imported at the vault layer) — a scribe→scribe edge that does NOT touch the
+vault's scribe-agnosticism invariant (design §2.3).
 """
 
 from __future__ import annotations
@@ -28,8 +35,12 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
+
+if TYPE_CHECKING:  # scribe→scribe.events dependency (design §2.3); type-only import
+    from alfred.scribe.events import ScribeEvents
 
 from alfred.scribe import completeness_marker
 from alfred.scribe.attestation import (
@@ -102,6 +113,7 @@ def attest(
     override_reason: str | None = None,
     vault_audit_path: str | Path | None = None,
     enrollment_dir: str | Path | None = None,
+    events: "ScribeEvents | None" = None,
 ) -> dict:
     """Attest a clinical_note — the ONLY sanctioned triad writer. Fail-closed.
 
@@ -136,6 +148,15 @@ def attest(
             (``<logging.dir>/vault_audit.log``). Where a forced override's
             free-text ``override_reason`` is recorded (keeps the attest audit
             PHI-free by construction). No-op if unset.
+        events: the STAY-C event-store facade (design §5.2). When present:
+            (1) ``preflight()`` runs BEFORE the first vault_read — a store that
+            cannot open fail-closes the attest (``event_store_unavailable``), so
+            an attested note without a durable trail is near-impossible; (2) a
+            refusal emits best-effort ``attest.refused`` (never masking the
+            refusal); (3) success dual-writes ``attest.recorded`` [D] AFTER the
+            legacy audit line, in the SAME post-triad slot (the CAS window is
+            NOT widened). ``None`` (tests / non-clinical callers) → the attest
+            path is byte-identical to pre-#11.
 
     Returns:
         the ``vault_edit`` result dict.
@@ -146,6 +167,23 @@ def attest(
         VaultError / ScopeError: from the underlying vault ops.
     """
     now = now or datetime.now(timezone.utc)
+
+    # Store PREFLIGHT (design §5.2) — open + flock acquire/release + tip
+    # resolution, NO append, BEFORE the first vault_read. A store that cannot
+    # open fail-closes the attest here (never mid-operation), making an
+    # attested-note-without-trail near-impossible. This sits ENTIRELY before the
+    # CAS bracket, so it cannot affect the CAS window. Best-effort by nature: the
+    # facade is None for tests / non-clinical callers → skipped.
+    if events is not None:
+        try:
+            events.preflight()
+        except Exception as exc:  # noqa: BLE001 — any open failure fail-closes the attest
+            raise AttestationError(
+                "event_store_unavailable",
+                "the medico-legal event store failed to open (preflight) — "
+                "refusing to attest without a durable audit trail. Likely a "
+                "permissions/disk problem on the events dir; re-run once fixed.",
+            ) from exc
 
     rec = vault_read(vault_path, rel_path)
     fm = rec["frontmatter"] or {}
@@ -166,19 +204,49 @@ def attest(
     # absent/false/malformed marker → incomplete.
     complete = completeness_marker.is_complete(fm)
 
+    # PHI-FREE event provenance — HOISTED so BOTH the refusal events
+    # (attest.refused) and the success event (attest.recorded) carry the same
+    # facts, computed from the FIRST read (fm). ``completeness`` is a fixed enum
+    # (complete | incomplete | absent — never free text); ``grounding_reasons``
+    # is the ``reason`` enum of each flag ONLY (the free-text ``claim`` is PHI and
+    # never leaves frontmatter, design §5.2/§11).
+    source_id = fm.get("source_id", "")
+    completeness = (
+        "complete" if complete
+        else ("incomplete" if isinstance(fm.get(completeness_marker.MARKER_FIELD), dict) else "absent")
+    )
+    _gflags = fm.get("grounding_flags")
+    grounding_flag_count = len(_gflags) if isinstance(_gflags, list) else 0
+    grounding_reasons = (
+        [str(f.get("reason")) for f in _gflags if isinstance(f, dict) and f.get("reason")]
+        if isinstance(_gflags, list) else []
+    )
+
     # THE gate — completeness (FIRST, #58) + forward-only lifecycle + distinct-
     # human-clinician + non-empty creator. Raises AttestationError on the first
     # violation. An override (allow_incomplete + reason) bypasses ONLY completeness.
-    authorize_attestation(
-        current_status=current_status,
-        new_status=new_status,
-        attester=attester,
-        creator=effective_creator,
-        clinician_ids=clinician_ids,
-        encounter_complete=complete,
-        forced=allow_incomplete,
-        force_reason=override_reason,
-    )
+    # A refusal emits best-effort attest.refused (never masking the refusal), then
+    # re-raises — attestation.py stays pure (no store import; the store call is here).
+    try:
+        authorize_attestation(
+            current_status=current_status,
+            new_status=new_status,
+            attester=attester,
+            creator=effective_creator,
+            clinician_ids=clinician_ids,
+            encounter_complete=complete,
+            forced=allow_incomplete,
+            force_reason=override_reason,
+        )
+    except AttestationError as exc:
+        if events is not None:
+            events.attest_refused(
+                subject_id=source_id, attester=attester, reason=exc.reason,
+                from_status=current_status, to_status=new_status,
+                completeness=completeness, forced=bool(allow_incomplete),
+                now=now.isoformat(),
+            )
+        raise
 
     # #58 CAS bracket — a double-read immediately before the triad write closes the
     # attest-read↔triad-write TOCTOU to microseconds. Re-read the note; REFUSE
@@ -191,7 +259,12 @@ def attest(
     rec2 = vault_read(vault_path, rel_path)
     fm2 = rec2["frontmatter"] or {}
     status_stable = fm2.get("status", "ai_draft") == current_status
-    body_stable = _body_sha(rec.get("body", "")) == _body_sha(rec2.get("body", ""))
+    # The attested-version pin (design §5.2): the sha of the body as it stands at
+    # the CAS re-read — the exact bytes the triad is about to sign. Persisted into
+    # ``attest.recorded`` + the attested-digest index (the post-attest-edit sweep's
+    # source of truth). One field from computed-here to persisted.
+    attested_body_sha = _body_sha(rec2.get("body", ""))
+    body_stable = _body_sha(rec.get("body", "")) == attested_body_sha
     marker_ok = allow_incomplete or completeness_marker.is_complete(fm2)
     if not (status_stable and body_stable and marker_ok):
         log.warning(
@@ -226,13 +299,9 @@ def attest(
     # title can carry PHI, so it never lands in this durable trail (or in the
     # scribe.log line below). The file path IS captured in the standard vault
     # audit (data/vault_audit.log) when enabled — a separate, operational trail.
-    source_id = fm.get("source_id", "")
-    # #58 — PHI-FREE completeness provenance in the durable trail. ``completeness``
-    # is a fixed enum ("complete" / "incomplete" / "absent") — never free text.
-    completeness = (
-        "complete" if complete
-        else ("incomplete" if isinstance(fm.get(completeness_marker.MARKER_FIELD), dict) else "absent")
-    )
+    # (``source_id`` / ``completeness`` / grounding provenance were computed once
+    # at the FIRST read above — HOISTED so the refusal AND success events carry
+    # identical PHI-free facts; not recomputed here.)
     forced_engaged = allow_incomplete and not complete
     if forced_engaged:
         # Loud, audited override — a clinician took explicit responsibility to sign
@@ -282,6 +351,32 @@ def attest(
             "completeness": completeness,
         },
     )
+
+    # DUAL-WRITE, durable event SECOND (design §8 row 2 / §5.2). The legacy JSONL
+    # line above is the independent trail that survives any event-store bug; THIS is
+    # the hash-chained medico-legal record (the ``attest.recorded`` [D] event). It is
+    # DURABLE — it raises on failure, the SAME fail-loud posture as the legacy append
+    # above (both post-triad + unwrapped, so the CAS window is NOT widened; the slot
+    # is unchanged). ``attest_recorded`` also pins the attested-version digest into
+    # the attested-digest index UNDER the clinical lock (§7.4) — the post-attest-edit
+    # sweep's source of truth. ``events`` is None for tests / non-clinical callers
+    # (cmd_scribe passes None on a degraded store) → skipped, path byte-identical
+    # to pre-#11.
+    if events is not None:
+        events.attest_recorded(
+            subject_id=source_id,
+            attester=attester,
+            from_status=current_status,
+            to_status=new_status,
+            creator=effective_creator,
+            forced=bool(allow_incomplete),
+            completeness=completeness,
+            body_sha=attested_body_sha,
+            grounding_flag_count=grounding_flag_count,
+            grounding_reasons=grounding_reasons,
+            rel_path=rel_path,
+            now=now.isoformat(),
+        )
     log.info(
         "scribe.attest.recorded",
         source_id=source_id,

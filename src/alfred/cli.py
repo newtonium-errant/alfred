@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -2673,31 +2674,72 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     # vault mutation-provenance trail), keeping clinical_attest_audit.jsonl PHI-free.
     vault_audit_path = log_dir / "vault_audit.log"
 
+    # The medico-legal event store facade (event-store design §2.4/§5.2). ALWAYS-ON
+    # with scribe — there is no enabled knob. Constructed BEFORE the attest (its
+    # preflight runs before the first vault_read): clinical mode fails LOUD at open
+    # → REFUSE the attest (never attest a note without a durable trail); non-clinical
+    # degrades to inactive (the attest path stays byte-identical to pre-#11).
+    # ``legacy_audit_path`` sha-pins the legacy attest-audit into the clinical genesis
+    # (§3.3 — pin, don't launder).
+    from alfred.scribe.events import CLINICAL, ScribeEvents
+    from alfred.vault import ops as _vault_ops
+
     try:
-        result = scribe_attest(
-            vault_path,
-            args.note,
-            new_status=args.new_status,
-            attester=args.attester,
-            clinician_ids=set(cfg.clinicians),
-            audit_path=audit_path,
-            # #58 D1 — the audited override (available in all modes). An empty
-            # --reason with --force-incomplete surfaces as a clean force_without_reason
-            # refusal below (non-zero exit, no triad written).
-            allow_incomplete=args.force_incomplete,
-            override_reason=args.reason,
-            vault_audit_path=vault_audit_path,
-            # P4-5 — the voice-enrollment capture sink (self-correcting attest_outcome
-            # rows). Empty (dormant enrollment) → the attest capture is a no-op.
-            enrollment_dir=cfg.diarize.enrollment_dir,
-        )
+        events = ScribeEvents.from_config(raw, log_dir, legacy_audit_path=audit_path)
+    except Exception as e:  # noqa: BLE001 — clinical-mode open failure REFUSES the attest
+        print(f"Attest REFUSED — medico-legal event store failed to open: {e}")
+        sys.exit(1)
+    events_arg = events if events.active else None
+
+    # PHIA s.63 access log (§7.1.2b / §7.1.3): register the read hook so the attest's
+    # OWN note reads (the first read + the CAS re-read) are logged as ``access.read``
+    # attributed to the attesting clinician (via="attest"). Registration IS the scoping.
+    # Cleared in the finally so a one-shot CLI never leaks a process-global hook (and the
+    # in-process test suite stays clean — mirrors the test_vault_read_hook.py bracketing).
+    if events_arg is not None:
+        _vault_ops.register_read_hook(events.make_read_hook())
+    attest_ctx = (
+        events.access_context(args.attester, "clinician", "attest")
+        if events_arg is not None
+        else contextlib.nullcontext()
+    )
+    try:
+        with attest_ctx:
+            result = scribe_attest(
+                vault_path,
+                args.note,
+                new_status=args.new_status,
+                attester=args.attester,
+                clinician_ids=set(cfg.clinicians),
+                audit_path=audit_path,
+                # #58 D1 — the audited override (available in all modes). An empty
+                # --reason with --force-incomplete surfaces as a clean force_without_reason
+                # refusal below (non-zero exit, no triad written).
+                allow_incomplete=args.force_incomplete,
+                override_reason=args.reason,
+                vault_audit_path=vault_audit_path,
+                # P4-5 — the voice-enrollment capture sink (self-correcting attest_outcome
+                # rows). Empty (dormant enrollment) → the attest capture is a no-op.
+                enrollment_dir=cfg.diarize.enrollment_dir,
+                # #11 — the medico-legal event store (preflight + attest.recorded [D] +
+                # attest.refused + the dual-write). None on a degraded non-clinical store.
+                events=events_arg,
+            )
     except Exception as e:  # noqa: BLE001 — surface any attest refusal to the operator
         print(f"Attest REFUSED: {e}")
         sys.exit(1)
+    finally:
+        if events_arg is not None:
+            _vault_ops.clear_read_hooks()
     print(
         f"Attested: {result['path']} → {args.new_status} by {args.attester} "
         f"(audit: {audit_path})"
     )
+    # Off-box anchor (§4): print the clinical chain tip after every attestation — an
+    # offline record of a prior tip makes a full-file re-chain detectable. Skipped for
+    # a degraded (inactive) non-clinical store.
+    if events.active:
+        print(events.tip_line(CLINICAL))
 
 
 def _cmd_scribe_presets(args: argparse.Namespace) -> None:
