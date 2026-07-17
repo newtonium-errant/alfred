@@ -79,9 +79,20 @@ EventCreateHook = Callable[[Path, str, dict], None]
 EventUpdateHook = Callable[[Path, str, dict, list, dict], None]
 EventDeleteHook = Callable[[Path, str, dict], None]
 
+# The READ hook fires after every successful vault_read, receiving
+# ``(vault_path, rel_path, frontmatter)`` — the substrate for the STAY-C
+# access log (PHIA s.63, event-store design §7.1). The vault layer stays
+# scribe-agnostic: it owns only the registration point + a fail-isolated fire
+# loop; WHO registers (STAY-C entry points only) and WHAT the hook does
+# (emit ``access.read`` or suppress+count a pipeline read) live entirely in
+# the scribe facade's closure. Registration IS the scoping — a platform
+# instance never registers, so its reads are never logged.
+ReadHook = Callable[[Path, str, dict], None]
+
 _EVENT_CREATE_HOOKS: list[EventCreateHook] = []
 _EVENT_UPDATE_HOOKS: list[EventUpdateHook] = []
 _EVENT_DELETE_HOOKS: list[EventDeleteHook] = []
+_READ_HOOKS: list[ReadHook] = []
 
 
 def register_event_create_hook(func: EventCreateHook) -> None:
@@ -127,8 +138,23 @@ def register_event_delete_hook(func: EventDeleteHook) -> None:
         _EVENT_DELETE_HOOKS.append(func)
 
 
+def register_read_hook(func: ReadHook) -> None:
+    """Register a callable to fire after every successful :func:`vault_read`.
+
+    The hook receives ``(vault_path, rel_path, frontmatter)`` and decides what
+    to record (STAY-C's access-log facade emits ``access.read`` or suppresses +
+    counts a pipeline read — event-store design §7.1). ``vault_read``'s
+    signature is untouched: no identity param crosses the vault boundary (the
+    hook reads its own ContextVar), so the hardcoded-scope trap class is dodged.
+
+    Idempotent on function-identity (a re-import / daemon restart that
+    re-registers the same closure is a no-op)."""
+    if func not in _READ_HOOKS:
+        _READ_HOOKS.append(func)
+
+
 def clear_event_hooks() -> None:
-    """Test helper — wipe all three registries.
+    """Test helper — wipe all FOUR registries (create/update/delete + read).
 
     Production code never calls this; tests use it to isolate per-test
     hook state when the registries are otherwise process-global.
@@ -136,6 +162,15 @@ def clear_event_hooks() -> None:
     _EVENT_CREATE_HOOKS.clear()
     _EVENT_UPDATE_HOOKS.clear()
     _EVENT_DELETE_HOOKS.clear()
+    _READ_HOOKS.clear()
+
+
+def clear_read_hooks() -> None:
+    """Test helper — wipe only the read-hook registry (the access-log substrate).
+
+    Kept distinct from :func:`clear_event_hooks` so an access-log test can reset
+    read hooks without disturbing the GCal event hooks (and vice-versa)."""
+    _READ_HOOKS.clear()
 
 
 def _fire_create_hooks(
@@ -751,6 +786,22 @@ def _extract_base_embeds(template_body: str, name: str) -> str:
 # --- Public operations ---
 
 
+def _fire_read_hooks(vault_path: Path, rel_path: str, fm: dict) -> None:
+    """Iterate registered read hooks after a successful read; each exception is
+    logged + swallowed. A hook failure can NEVER fail a read — the access log is
+    observability, and a read is not a mutation to gate on (design §7.1)."""
+    for hook in list(_READ_HOOKS):
+        try:
+            hook(vault_path, rel_path, fm)
+        except Exception as exc:  # noqa: BLE001 — a read hook must never fail a read
+            log.warning(
+                "vault.read_hook_failed",
+                hook=getattr(hook, "__name__", repr(hook)),
+                rel_path=rel_path,
+                error=str(exc),
+            )
+
+
 def vault_read(vault_path: Path, rel_path: str) -> dict:
     """Read a vault record. Returns {path, frontmatter, body}."""
     file_path = _resolve_vault_path(vault_path, rel_path)
@@ -760,6 +811,10 @@ def vault_read(vault_path: Path, rel_path: str) -> dict:
         raise VaultError(f"Not a markdown file: {rel_path}")
 
     fm, body = _parse_record(file_path)
+    # Access-log substrate (PHIA s.63, design §7.1): fire registered read hooks
+    # post-parse, fail-isolated. No-op when nothing is registered (a platform
+    # instance never registers — registration IS the scoping, §7.2).
+    _fire_read_hooks(vault_path, rel_path, fm)
     return {"path": rel_path, "frontmatter": fm, "body": body}
 
 
