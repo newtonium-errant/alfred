@@ -42,9 +42,12 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
+
+if TYPE_CHECKING:  # scribe→scribe.events (design §2.3); type-only, the facade is threaded in
+    from alfred.scribe.events import ScribeEvents
 
 from alfred.scribe import diarize as diarize_mod
 from alfred.scribe import embed_voice as embed_voice_mod
@@ -236,6 +239,7 @@ def _source_id_for_input(audio_path: Path, config: ScribeConfig) -> str:
 
 async def process_source(
     audio_path: Path, *, config: ScribeConfig, state: ScribeState, vault_path: Path,
+    events: "ScribeEvents | None" = None,
 ) -> str:
     """Process one input to a clinical_note ai_draft. Idempotent + fail-closed.
 
@@ -304,7 +308,7 @@ async def process_source(
 
         # structuring → drafted (vault_create clinical_note ai_draft ONLY).
         note_path = _create_ai_draft(
-            vault_path, title, source_id, config, vnote,
+            vault_path, title, source_id, config, vnote, events=events,
         )
         state.set(source_id, state=STATE_DRAFTED, note_path=note_path)
         log.info(
@@ -334,6 +338,7 @@ async def process_source(
 def _create_ai_draft(
     vault_path: Path, title: str, source_id: str, config: ScribeConfig,
     vnote: VerifiedNote, *, diarize_provenance: dict[str, Any] | None = None,
+    events: "ScribeEvents | None" = None,
 ) -> str:
     """Create-OR-update the clinical_note ai_draft (scribe P3-a).
 
@@ -389,6 +394,15 @@ def _create_ai_draft(
             body=vnote.body,
             scope="stayc_clinical",
         )
+        # note.draft_created (design §5.3) — best-effort, after the initial
+        # vault_create SUCCEEDS. ``body_sha`` is the READ-BACK on-disk sha (the
+        # pipeline's canonical fingerprint), so it matches what clobber-detect /
+        # attest later compare — the round-trip strips a trailing newline.
+        if events is not None:
+            events.note_draft_created(
+                subject_id=source_id,
+                body_sha=_body_sha(vault_read(vault_path, result["path"]).get("body", "")),
+            )
         return result["path"]
     except VaultError as e:
         if "already exists" not in str(e):
@@ -398,11 +412,12 @@ def _create_ai_draft(
         # status to decide UPDATE-in-place vs REFUSE.
         tail = str(e).split("already exists:")
         rel_path = tail[-1].strip() if len(tail) > 1 else ""
-        return _update_or_refuse_ai_draft(vault_path, rel_path, source_id, vnote)
+        return _update_or_refuse_ai_draft(vault_path, rel_path, source_id, vnote, events=events)
 
 
 def _update_or_refuse_ai_draft(
     vault_path: Path, rel_path: str, source_id: str, vnote: VerifiedNote,
+    *, events: "ScribeEvents | None" = None,
 ) -> str:
     """Refresh an existing LIVE ai_draft in place, or REFUSE if sealed (P3-a).
 
@@ -455,6 +470,18 @@ def _update_or_refuse_ai_draft(
         source_id=source_id,              # opaque id only — NO PHI (NOTE-4)
         grounding_flags=vnote.flag_count,
     )
+    # note.draft_regenerated (event-store design §5.3) — best-effort, after the
+    # single atomic body_replace + clear-on-regen vault_edit SUCCEEDED (records
+    # committed reality). ``body_sha`` is the READ-BACK on-disk sha (the pipeline's
+    # canonical fingerprint — the round-trip strips a trailing newline, so it must
+    # match what clobber-detect / attest compare, not ``_body_sha(vnote.body)``).
+    # ``marker="regressed"`` reflects the completeness marker just cleared.
+    if events is not None:
+        events.note_draft_regenerated(
+            subject_id=source_id,
+            body_sha=_body_sha(vault_read(vault_path, rel_path).get("body", "")),
+            marker="regressed", grounding_flag_count=vnote.flag_count,
+        )
     return rel_path
 
 
@@ -949,7 +976,7 @@ def _body_sha(body: str) -> str:
 
 async def _regen_checkpoint(
     encounter_dir: Path, *, encounter_id: str, config: ScribeConfig,
-    state: ScribeState, vault_path: Path,
+    state: ScribeState, vault_path: Path, events: "ScribeEvents | None" = None,
 ) -> str:
     """FULL-REGEN the ai_draft from the ACCUMULATED transcript, guarded by
     clobber-detect (before) + the context-budget cap (inside generate). Returns
@@ -998,6 +1025,10 @@ async def _regen_checkpoint(
                            "surfaced; the signed note is untouched. The clinician "
                            "may need to amend.",
                 )
+                # note.post_attest_audio (design §5.3) — best-effort, on the latch
+                # into STATE_POST_ATTEST_AUDIO (new audio after the note was signed).
+                if events is not None:
+                    events.note_post_attest_audio(subject_id=encounter_id)
                 return "post_attest_audio"
             on_disk = _body_sha(rec.get("body", ""))
             if prior and prior.pipeline_body_sha and on_disk != prior.pipeline_body_sha:
@@ -1008,6 +1039,15 @@ async def _regen_checkpoint(
                     detail="on-disk body differs from the last pipeline write — "
                            "auto-evolution FROZEN, operator opt-in required to resume",
                 )
+                # note.human_edit_detected (design §5.3) — best-effort, on the state
+                # latch into STATE_HUMAN_EDITED (once, not per-sweep). OBSERVED, not
+                # intercepted: the out-of-band edit surfaced at this sweep via sha
+                # mismatch; the event records DETECTION time, not edit time.
+                if events is not None:
+                    events.note_human_edit_detected(
+                        subject_id=encounter_id,
+                        body_sha_before=prior.pipeline_body_sha, body_sha_after=on_disk,
+                    )
                 return "human_edited"
 
     # FULL-REGEN — the budget guard fires INSIDE generate_structured BEFORE the
@@ -1033,7 +1073,7 @@ async def _regen_checkpoint(
     try:
         new_path = _create_ai_draft(
             vault_path, title, encounter_id, config, vnote,
-            diarize_provenance=transcript.diarize_preset,
+            diarize_provenance=transcript.diarize_preset, events=events,
         )
     except (VaultError, ScopeError) as e:
         # #3 — the seal can surface as EITHER a VaultError (detected at
@@ -1056,6 +1096,10 @@ async def _regen_checkpoint(
                 detail="draft attested mid-regen (race) — refused + surfaced; "
                        "the signed note is untouched.",
             )
+            # note.post_attest_audio (design §5.3) — the mid-regen attest-race twin
+            # of the branch above; same terminal outcome, same best-effort emit.
+            if events is not None:
+                events.note_post_attest_audio(subject_id=encounter_id)
             return "post_attest_audio"
         raise
     # Record the sha of the ACTUAL on-disk body (post-write) so the next
@@ -1120,6 +1164,7 @@ async def checkpoint_encounter(
     expected_final_seq: int | None = None,
     folded_seqs: frozenset[int] = frozenset(),
     close_ambiguous: bool = False,
+    events: "ScribeEvents | None" = None,
 ) -> str:
     """The checkpoint trigger (scribe P3-b2). After P3-b1 folds a chunk, evolve
     the ai_draft in place; ``_CLOSED`` finalizes to ``ready`` (close does NOT
@@ -1150,7 +1195,7 @@ async def checkpoint_encounter(
     if did_fold:
         outcome = await _regen_checkpoint(
             encounter_dir, encounter_id=encounter_id, config=config,
-            state=state, vault_path=vault_path,
+            state=state, vault_path=vault_path, events=events,
         )
 
     if closed:
@@ -1225,6 +1270,17 @@ async def checkpoint_encounter(
                 detail="_CLOSED — draft complete (all promised seqs folded), marker "
                        "stamped, ready for attestation (attest stays orchestrator-only)",
             )
+            # note.ready (design §5.3) — best-effort, AFTER the marker stamp +
+            # state.set(READY) both succeeded (a stamp failure returns above → no
+            # event). ``body_sha`` = the current draft's stored read-back sha
+            # (stamping touches only frontmatter, so the body sha is unchanged).
+            if events is not None:
+                events.note_ready(
+                    subject_id=encounter_id,
+                    body_sha=(cur.pipeline_body_sha or "") if cur else "",
+                    expected_final_seq=int(expected_final_seq or 0),
+                    folded_through=int(folded_through),
+                )
             outcome = "ready"
         # #58 SELF-HEAL — a note already at STATE_READY but MARKERLESS (pre-#58
         # migration, or the crash window between the stamp and state.set) gets
@@ -1241,11 +1297,17 @@ async def checkpoint_encounter(
                     detail="markerless READY note re-stamped complete (migration / "
                            "crash-window self-heal)",
                 )
+                # note.marker_selfheal (design §5.3) — best-effort, only when
+                # maybe_restamp actually re-stamped (it is a no-op if the marker is
+                # already present or the note is sealed).
+                if events is not None:
+                    events.note_marker_selfheal(subject_id=encounter_id)
     return outcome
 
 
 async def run_sweep(
     config: ScribeConfig, state: ScribeState, vault_path: Path,
+    events: "ScribeEvents | None" = None,
 ) -> dict[str, int]:
     """Scan input_dir once. Walks BOTH legacy flat files (P2 one-shot back-comp)
     AND one level of per-encounter subdirs (P3-b1 accumulator + P3-b2 checkpoint
@@ -1292,7 +1354,7 @@ async def run_sweep(
     # source_id is now salted-opaque).
     for audio in flat_files:
         outcome = await process_source(
-            audio, config=config, state=state, vault_path=vault_path,
+            audio, config=config, state=state, vault_path=vault_path, events=events,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
 
@@ -1323,6 +1385,7 @@ async def run_sweep(
                     expected_final_seq=r.expected_final_seq,   # #57 the promised bar
                     folded_seqs=r.folded_seqs,                 # #57 ledger-truth folded set
                     close_ambiguous=r.close_ambiguous,         # #57 strict fail-closed
+                    events=events,
                 )
                 key = _CHECKPOINT_COUNT_KEY.get(outcome)
                 if key:
