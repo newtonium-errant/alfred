@@ -154,14 +154,15 @@ def _state_path(raw: dict, config) -> str:
     return str(Path(log_dir) / "scribe_state.json")
 
 
-async def _maybe_start_ingest_server(config: ScribeConfig):
+async def _maybe_start_ingest_server(config: ScribeConfig, *, events=None):
     """Start the loopback PWA ingest server IFF ``ingest_web.enabled``.
 
     Returns the started :class:`~alfred.scribe.ingest_web.IngestWebServer`, or
     ``None`` when the server is INERT (the default). Attests
     ``scribe.ingest_web.up`` either way (intentionally-left-blank: an inert
     server is distinguishable from a broken one). The bind host is already proven
-    loopback by barrier (e) at load — this trusts that gate.
+    loopback by barrier (e) at load — this trusts that gate. ``events`` (the
+    event-store facade) rides ``app["scribe_events"]`` for the encounter.* emits.
     """
     web_cfg = config.ingest_web
     if not web_cfg.enabled:
@@ -173,7 +174,7 @@ async def _maybe_start_ingest_server(config: ScribeConfig):
         return None
     from alfred.scribe.ingest_web import IngestWebServer
 
-    server = IngestWebServer(config)
+    server = IngestWebServer(config, events=events)
     await server.start()
     log.info(
         "scribe.ingest_web.up",
@@ -201,17 +202,44 @@ async def run(
 
     # Import here (not at module load) so the daemon's boundary/dep checks in
     # startup() run before the pipeline stack is imported.
+    from alfred.scribe.events import ScribeEvents
+    from alfred.scribe.events_maintenance import ScribeEventMaintenance
     from alfred.scribe.pipeline import run_sweep
     from alfred.scribe.state import ScribeState
+    from alfred.vault import ops as vault_ops
 
     state = ScribeState(_state_path(raw, config))
     state.load()
     vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+    log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
+
+    # The medico-legal event store (event-store design §2.4 / §8 row 14). ALWAYS-ON
+    # with scribe — no enabled knob. Clinical mode fails LOUD at open → REFUSE boot
+    # (ordinary RESTARTABLE exit, not 78/79 — most likely a perms/disk problem on the
+    # events dir); non-clinical degrades to inactive (dev exercises the store; the
+    # emitters no-op). ``legacy_audit_path`` sha-pins the legacy attest-audit into the
+    # clinical genesis (§3.3).
+    try:
+        events = ScribeEvents.from_config(
+            raw, log_dir, legacy_audit_path=log_dir / "clinical_attest_audit.jsonl")
+    except Exception:
+        log.error(
+            "scribe.daemon.event_store_open_failed",
+            detail="the medico-legal event store failed to open — REFUSING boot (clinical mode "
+                   "requires a durable audit trail; likely a perms/disk problem on the events dir). "
+                   "Restartable exit.")
+        raise
+    # PHIA s.63 access log (§7.1.2a / §7.1.3): register the read hook so vault reads
+    # are logged; the daemon's OWN sweep reads run under a "pipeline" access context
+    # → SUPPRESSED + counted (the daily summary makes the suppression itself auditable).
+    vault_ops.register_read_hook(events.make_read_hook())
+    maint = ScribeEventMaintenance(events)
 
     log.info(
         "scribe.daemon.pipeline_watching",
         mode=config.mode,
         input_dir=config.input_dir,
+        events_active=events.active,
         detail="sovereign scribe pipeline watching input_dir (synthetic-gated).",
     )
 
@@ -221,15 +249,32 @@ async def run(
     # a graceful terminate tears the socket down cleanly. Exit/restart semantics
     # are UNCHANGED: a bind error propagates like any sweep-stack error (generic
     # restartable exit), NOT a sovereign/dep exit (79/78).
-    server = await _maybe_start_ingest_server(config)
+    server = await _maybe_start_ingest_server(config, events=events)
     try:
-        while True:
+        # The daemon's reads are pipeline reads — bind the suppression context for the
+        # whole loop (incl. the boot scan below), so s.63 logs person-views, not the
+        # system operating.
+        with events.access_context("stayc_scribe", "pipeline", "daemon"):
+            # BOOT: the FULL post-attest-edit comparison (design §5.3 — bounded per-sweep,
+            # full at boot). Best-effort — a scan error must never wedge the daemon.
             try:
-                await run_sweep(config, state, vault_path)
-            except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop
-                log.exception("scribe.daemon.sweep_error")
-            await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+                maint.post_attest_edit_scan(vault_path, full=True)
+            except Exception:  # noqa: BLE001 — observability scan, never gates the daemon
+                log.exception("scribe.daemon.boot_post_attest_scan_error")
+            while True:
+                try:
+                    await run_sweep(config, state, vault_path, events=events)
+                    # Event-store maintenance (design §4/§5.3/§5.5): all self-latched +
+                    # best-effort. Independent of sweep work (VAULT-STATE observations run
+                    # every tick, not gated behind an idle early-return).
+                    maint.heartbeat_if_due()
+                    maint.post_attest_edit_scan(vault_path)
+                    maint.flush_suppressed_if_new_day()
+                except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop
+                    log.exception("scribe.daemon.sweep_error")
+                await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
     finally:
         if server is not None:
             await server.stop()
             log.info("scribe.ingest_web.down", detail="ingest server stopped (graceful shutdown)")
+        vault_ops.clear_read_hooks()  # a one-process daemon leaves no process-global hook

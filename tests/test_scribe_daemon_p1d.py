@@ -228,9 +228,12 @@ def test_run_wires_state_path_and_enters_loop_without_nameerror(tmp_path, monkey
     # run_sweep is ever reached, so pytest.raises(_StopLoop) fails.
     seen = {}
 
-    async def _one_shot(config, state, vault_path):
+    async def _one_shot(config, state, vault_path, **kwargs):
+        # **kwargs absorbs the #11 events= facade the daemon now threads into the
+        # sweep (keeps this a pure run()-assembly-seam probe).
         seen["state_type"] = type(state).__name__
         seen["vault_path_type"] = type(vault_path).__name__
+        seen["events_threaded"] = "events" in kwargs
         raise _StopLoop
 
     import alfred.scribe.pipeline as pl
@@ -246,5 +249,6 @@ def test_run_wires_state_path_and_enters_loop_without_nameerror(tmp_path, monkey
     # run() built ScribeState + a Path vault_path and entered the sweep loop.
     assert seen["state_type"] == "ScribeState"
     assert seen["vault_path_type"] == "PosixPath"
+    assert seen["events_threaded"] is True  # #11 — the event-store facade reaches the sweep
     # the state file path was under logging.dir (no NameError building it)
     assert (tmp_path / "scribe_state.json") == Path(_state_path(raw, None))
