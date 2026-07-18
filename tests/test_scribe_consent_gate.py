@@ -301,22 +301,25 @@ def test_withdraw_illegal_without_confirm_409(tmp_path):
     async def _run():
         async with _serve(cfg, ev) as base, aiohttp.ClientSession() as s:
             tok = await _open_session(s, base)
-            # withdraw on ∅ (no confirm) — a session is present so identity resolves, but the
-            # transition ∅→withdrawn is illegal → 409.
+            # withdraw on ∅ (no confirm). The session is IGNORED for withdrawal identity (§2.4);
+            # there is no durable confirmed event → the transition ∅→withdrawn is illegal → 409.
             status, body = await _post_consent(s, base, "withdrawn", session=tok)
             assert status == 409 and body["error"] == "illegal_transition"
     asyncio.run(_run())
 
 
-def test_withdraw_no_session_no_confirmed_401(tmp_path):
+def test_withdraw_no_confirm_is_illegal_transition_409(tmp_path):
     ev = _facade(tmp_path)
     cfg = _config(tmp_path)
 
     async def _run():
         async with _serve(cfg, ev) as base, aiohttp.ClientSession() as s:
-            # no session AND no durable confirmed event → identity cannot be resolved → 401.
+            # no session AND no durable confirmed event → you cannot withdraw a consent that was
+            # never confirmed. §2.4: withdrawal identity is the durable confirmed event (absent
+            # here), so the legality guard rejects ∅→withdrawn as an illegal transition (409),
+            # NOT a missing session (identity for withdrawal never comes from a session).
             status, body = await _post_consent(s, base, "withdrawn")
-            assert status == 401 and body["error"] == "no_session"
+            assert status == 409 and body["error"] == "illegal_transition"
     asyncio.run(_run())
 
 
@@ -336,6 +339,31 @@ def test_withdraw_identity_from_durable_confirmed_when_session_absent(tmp_path):
     asyncio.run(_run())
     wd = ev.query("clinical", kind="consent.withdrawn")
     assert len(wd) == 1 and wd[0]["actor"] == "jdoe"
+
+
+def test_withdraw_actor_is_durable_confirmed_not_rebound_session(tmp_path):
+    # §2.4 — THE falsified-attribution pin (the class this whole arc exists to prevent). jdoe
+    # obtains consent; the shared device rebinds to asmith mid-encounter (a different LIVE
+    # session); asmith taps Withdraw. The withdrawal actor MUST be jdoe — the clinician who
+    # OBTAINED consent, read from the durable confirmed event — NEVER asmith (the live session).
+    # A regression to session-preference makes consent.withdrawn.actor == asmith, chaining a
+    # verify-PASSING record with confirmed=jdoe / withdrawn=asmith: this pin fails on that.
+    ev = _facade(tmp_path)
+    cfg = _config(tmp_path)
+
+    async def _run():
+        async with _serve(cfg, ev) as base, aiohttp.ClientSession() as s:
+            jdoe = await _open_session(s, base, user="jdoe")
+            assert (await _post_consent(s, base, "confirmed", session=jdoe))[0] == 200
+            assert await _post_chunk(s, base, seq=1, session=jdoe) == 200
+            asmith = await _open_session(s, base, user="asmith")   # device rebinds mid-encounter
+            status, body = await _post_consent(s, base, "withdrawn", session=asmith)
+            assert status == 200 and body["captured_by"] == "jdoe"    # NOT asmith
+    asyncio.run(_run())
+    wd = ev.query("clinical", kind="consent.withdrawn")
+    conf = ev.query("clinical", kind="consent.confirmed")
+    # the durable chain attributes BOTH transitions to jdoe — internally consistent, not falsified.
+    assert wd[0]["actor"] == "jdoe" and conf[0]["payload"]["captured_by"] == "jdoe"
 
 
 def test_withdraw_durable_failure_no_ack_no_halt(tmp_path, monkeypatch):

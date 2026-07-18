@@ -139,8 +139,10 @@ SESSION_HEADER = "X-Scribe-Session"
 # --- #12 slice 12c — consent route + state machine wiring (design §4/§5/§6) ---
 # The single consent-transition route: confirmed/declined gate the START of capture; withdrawn
 # HALTS it (the durable append MUST land before the stop is acknowledged, §5). Ingest-class
-# (rides the ingest token); identity comes from the X-Scribe-Session session (§2.5), and for
-# withdrawal falls back to the durable confirmed event's captured_by when the session lapsed.
+# (rides the ingest token). Identity resolves by decision: confirm/decline name the ACTING
+# clinician (the live X-Scribe-Session, §2.5); withdrawal's actor is ALWAYS the durable
+# consent.confirmed captured_by — the clinician who OBTAINED consent — NEVER the live session
+# (§2.4, the governing rule: the withdrawal is attributed to whoever obtained the consent).
 CONSENT_ROUTE = "/scribe/consent"
 _CONSENT_DECISIONS: frozenset[str] = frozenset({"confirmed", "declined", "withdrawn"})
 
@@ -979,20 +981,25 @@ async def _handle_consent(request: web.Request) -> web.StreamResponse:
                          "(consent must be durably recorded before the act it gates)")
         return _reject("consent_unavailable", 503)
 
-    # Identity (§2.5): confirm/decline REQUIRE a live session (consent evidence names a real
-    # clinician, never a null identity). Withdrawal falls back to the DURABLE confirmed event's
-    # captured_by when the live session has lapsed (§2.4 — the durable event is the binding).
-    session = _resolve_session(request)
+    # Identity — the two decisions resolve it from DIFFERENT sources by design:
     if decision in ("confirmed", "declined"):
+        # confirm/decline: the ACTING clinician IS the live session (§2.5) — REQUIRED (consent
+        # evidence names a real clinician, never a null identity). No/expired session → 401.
+        session = _resolve_session(request)
         if session is None:
             log.warning("scribe.consent.no_session", route=CONSENT_ROUTE, decision=decision)
             return _reject("no_session", 401)
         captured_by = session.clinician
     else:  # withdrawn
-        captured_by = session.clinician if session is not None else events.consent_captured_by(enc_id)
-        if not captured_by:
-            log.warning("scribe.consent.no_session", route=CONSENT_ROUTE, decision=decision)
-            return _reject("no_session", 401)
+        # §2.4 GOVERNS: the withdrawal actor is ALWAYS the durable ``consent.confirmed``
+        # captured_by (the clinician who OBTAINED consent), NEVER the live session. The session
+        # is deliberately NOT read here — a shared device that rebinds to another clinician
+        # mid-encounter must not falsely attribute the withdrawal to whoever holds the session
+        # now (that would durably chain a verify-PASSING record with confirmed≠withdrawn actors —
+        # the exact falsified-attribution this arc exists to prevent). Empty ⇒ no confirmed event
+        # to withdraw; the facade's transition-legality guard rejects that as an illegal
+        # transition (409) inside the lock below (∅/declined → withdrawn is not legal).
+        captured_by = events.consent_captured_by(enc_id)
 
     from alfred.evstore import EventStoreError
     from alfred.scribe.events import ConsentTransitionError

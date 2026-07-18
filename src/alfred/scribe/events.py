@@ -415,9 +415,11 @@ class ScribeEvents:
 
     def consent_captured_by(self, subject_id: str) -> str:
         """The clinician slug pinned by this encounter's durable ``consent.confirmed`` event
-        (§2.4) — the withdrawal path reads identity back from the DURABLE event when the live PWA
-        session has already lapsed (the durable event IS the encounter→clinician binding, not a
-        still-live session). ``''`` when no confirmed event exists."""
+        (§2.4). The withdrawal path resolves its actor from this UNCONDITIONALLY — the withdrawal
+        is attributed to whoever OBTAINED the consent (the durable event IS the encounter→clinician
+        binding), NEVER the live session (a shared device may have rebound to a different clinician
+        mid-encounter; attributing the withdrawal to them would falsify the med-legal chain).
+        ``''`` when no confirmed event exists (∅/declined — nothing to withdraw)."""
         e = self.latest(CLINICAL, family="consent", kind="consent.confirmed", subject_id=subject_id)
         if not e:
             return ""
