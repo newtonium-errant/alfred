@@ -94,6 +94,10 @@ class Scorecard:
     # STAY-C-unique aggregate observability -------------------------------------
     total_grounding_flags: int = 0
     total_speaker_flags: int = 0
+    # grounding-detector reason histogram (grounding + #48 inferred-dx; the speaker
+    # reasons are counted in total_speaker_flags, not here) — lets the render split
+    # negation_mismatch FALSE POSITIVES (task #24) from genuine ungrounded catches.
+    grounding_flag_reasons: dict[str, int] = field(default_factory=dict)
     mean_word_count: float = 0.0
     mean_claim_count: float = 0.0
 
@@ -118,6 +122,15 @@ def aggregate(
     any_scored = [cs for cs in case_scores if cs.scored_axes]
     any_failures = sum(1 for cs in any_scored if cs.any_inaccuracy)
 
+    # Grounding-detector reason totals (exclude speaker reasons — counted separately).
+    from alfred.scribe.eval.scoring import _SPEAKER_REASONS
+    reason_totals: dict[str, int] = {}
+    for cs in case_scores:
+        for reason, count in cs.flag_reasons.items():
+            if reason in _SPEAKER_REASONS:
+                continue
+            reason_totals[reason] = reason_totals.get(reason, 0) + count
+
     n = len(case_scores) or 1
     return Scorecard(
         mode=mode,
@@ -130,6 +143,7 @@ def aggregate(
         any_inaccuracy_scored=len(any_scored),
         total_grounding_flags=sum(cs.grounding_flag_count for cs in case_scores),
         total_speaker_flags=sum(cs.speaker_flag_count for cs in case_scores),
+        grounding_flag_reasons=reason_totals,
         mean_word_count=sum(cs.word_count for cs in case_scores) / n,
         mean_claim_count=sum(cs.claim_count for cs in case_scores) / n,
     )
@@ -147,6 +161,38 @@ def _axis_of(cs: CaseScore, axis: str):
 
 def _pct(x: float) -> str:
     return f"{x * 100:.0f}%"
+
+
+def _grounding_flag_caveat(sc: "Scorecard") -> str:
+    """Honest read of what the grounding flags on THIS run actually are.
+
+    The flag COUNT demonstrates the review surface exists; it must not be sold as
+    N real catches. ``negation_mismatch`` is a KNOWN false-positive class (the
+    grounding negation check over-flags faithful paraphrases — pre-existing
+    grounding.py limitation, tracked as task #24), so the caveat splits it from
+    genuine ungrounded-claim catches, accurately for BOTH fixture and real runs."""
+    tot = sc.total_grounding_flags
+    if tot == 0:
+        return ("_None fired on this run — the reference notes are clean (the "
+                "detector fires on ungrounded claims; the adversarial tests exercise "
+                "it)._")
+    neg = sc.grounding_flag_reasons.get("negation_mismatch", 0)
+    real = tot - neg
+    reason_bits = ", ".join(f"{r}×{c}" for r, c in sorted(sc.grounding_flag_reasons.items()))
+    breakdown = f"By reason: {reason_bits}. "
+    if neg == tot:
+        return (breakdown + f"**Caveat: all {tot} are `negation_mismatch` FALSE "
+                "POSITIVES** — the negation check over-flags faithful paraphrases "
+                "(e.g. \"denies a plan\" vs \"I wouldn't do anything\"), a known "
+                "pre-existing grounding.py limitation tracked as task #24. The count "
+                "is shown to demonstrate the review surface EXISTS, not to claim "
+                "these are real catches.")
+    if neg > 0:
+        return (breakdown + f"**Caveat: {neg} of {tot} are `negation_mismatch` FALSE "
+                "POSITIVES** (a known over-flagging class, task #24); the remaining "
+                f"{real} are genuine ungrounded-claim catches.")
+    return (breakdown + f"All {tot} are genuine ungrounded-claim catches (no "
+            "`negation_mismatch` false positives on this run).")
 
 
 def _verdict(rollup: AxisRollup) -> str:
@@ -231,7 +277,7 @@ def render_scorecard_md(sc: Scorecard) -> str:
         f"ships this): **{sc.total_grounding_flags}** across the corpus. Every "
         "flagged claim carries an inline ⚠ + a `grounding_flags` frontmatter entry "
         "for clinician review — the IT-enforced review surface the AG's Rec 6 says "
-        "the market lacks.")
+        "the market lacks. " + _grounding_flag_caveat(sc))
     lines.append(
         f"- **Speaker-attribution flags** (P4-2 mis-attribution net): "
         f"**{sc.total_speaker_flags}** across the corpus (authored roles today; "

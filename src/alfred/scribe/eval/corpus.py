@@ -215,10 +215,13 @@ _CASES: list[EvalCase] = [
                 "one week or if a fever develops."),
         ),
         ground_truth=GroundTruth(
+            # NOTE: fever WAS addressed ("No fever noted"), so "afebrile" is a
+            # FAITHFUL paraphrase, not bait — do not forbid it. The bait is the
+            # never-discussed social history / vitals below.
             forbidden_content=(
                 "non-smoker", "nonsmoker", "smoker", "denies smoking",
                 "no known allergies", "nkda", "no allergies",
-                "afebrile", "blood pressure", "heart rate", "temperature of",
+                "blood pressure", "heart rate", "temperature of",
             ),
         ),
     ),
@@ -319,10 +322,14 @@ _CASES: list[EvalCase] = [
                 "for now and I'll follow up with you."),
         ),
         ground_truth=GroundTruth(
+            # the AG's exact examples: "referring the patient for therapy" /
+            # "ordering blood tests" not in the recording. Referral tokens are
+            # SPECIFIC (not the bare stem "refer") so "reference range" and
+            # "prefer" never false-trip; matching is leading-word-boundary
+            # (kills "therapy" inside "physiotherapy").
             forbidden_content=(
-                # the AG's exact examples: "referring the patient for therapy" /
-                # "ordering blood tests" not in the recording.
-                "refer", "referral", "therapy", "counsel",
+                "referral", "referred", "referring", "refer to", "refer for",
+                "therapy", "counsel",
                 "blood test", "bloodwork", "cbc", "mri", "ct scan",
                 "prescrib", "imaging",
             ),

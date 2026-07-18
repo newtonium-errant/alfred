@@ -62,6 +62,17 @@ def _normalize(text: str) -> str:
     return re.sub(r"(\d+(?:\.\d+)?)\s+(mg|mcg|g|ml|units?)\b", r"\1\2", t)
 
 
+def _contains(token: str, body_norm: str) -> bool:
+    """Leading-word-boundary match of ``token`` against the already-normalized
+    body. Anchors at a word START — so it kills interior false-matches
+    (``therapy`` inside ``physiotherapy``, ``refer`` inside ``prefer``) — while
+    leaving the token OPEN on the right so a STEM prefix still matches inflections
+    (``prescrib``→``prescribed``, ``depress``→``depression``). Without this the
+    substring checks would false-score a faithful paraphrase on the live-model run.
+    ``token`` is normalized the same way as the body."""
+    return re.search(r"\b" + re.escape(_normalize(token)), body_norm) is not None
+
+
 @dataclass
 class AxisScore:
     """One AG axis's verdict for one case. ``scored`` False ⇒ the case carries no
@@ -118,7 +129,7 @@ def score_fabrication(
     if not scored:
         return AxisScore(AXIS_FABRICATION, scored=False, passed=True, detail="not scored")
 
-    hits = [s for s in gt.forbidden_content if _normalize(s) in body_norm]
+    hits = [s for s in gt.forbidden_content if _contains(s, body_norm)]
     invented_assessment = gt.forbid_invented_assessment and len(structured.assessment) > 0
 
     fabricated = bool(hits) or invented_assessment
@@ -141,12 +152,12 @@ def score_wrong_drug(body_norm: str, gt: GroundTruth) -> AxisScore:
     if not scored:
         return AxisScore(AXIS_WRONG_DRUG, scored=False, passed=True, detail="not scored")
 
-    missing_names = [d.name for d in gt.correct_drugs if _normalize(d.name) not in body_norm]
+    missing_names = [d.name for d in gt.correct_drugs if not _contains(d.name, body_norm)]
     missing_doses = [
         f"{d.name} {d.dose}" for d in gt.correct_drugs
-        if d.dose and _normalize(d.dose) not in body_norm
+        if d.dose and not _contains(d.dose, body_norm)
     ]
-    wrong = [c for c in gt.confusable_drugs if _normalize(c) in body_norm]
+    wrong = [c for c in gt.confusable_drugs if _contains(c, body_norm)]
 
     if not missing_names and not missing_doses and not wrong:
         return AxisScore(AXIS_WRONG_DRUG, scored=True, passed=True,
@@ -172,7 +183,7 @@ def score_missed_mh(body_norm: str, gt: GroundTruth) -> AxisScore:
 
     captured_labels, missed_labels = [], []
     for detail in gt.required_details:
-        if any(_normalize(syn) in body_norm for syn in detail.any_of):
+        if any(_contains(syn, body_norm) for syn in detail.any_of):
             captured_labels.append(detail.label)
         else:
             missed_labels.append(detail.label)

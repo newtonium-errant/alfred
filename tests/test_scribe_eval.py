@@ -118,6 +118,31 @@ def test_fabrication_scorer_fires_on_invented_plan():
     assert "therapy" in score.fabrication.detail
 
 
+def test_forbidden_content_matching_is_word_boundary_anchored():
+    # Guards the live-model run from false-scoring a faithful paraphrase:
+    # "physiotherapy" must NOT trip the "therapy" bait; "reference"/"prefer" must
+    # NOT trip a referral bait; but a STEM prefix (prescrib→prescribed) MUST match.
+    from alfred.scribe.eval.scoring import _contains, _normalize
+    body = _normalize(
+        "Continue physiotherapy. Patient would prefer conservative care. "
+        "Lab values within the reference range."
+    )
+    assert not _contains("therapy", body)
+    assert not _contains("referral", body) and not _contains("refer to", body)
+    assert _contains("prescrib", _normalize("medication prescribed today"))
+    assert _contains("depress", _normalize("reports depression"))
+
+
+def test_afebrile_is_not_fabrication_bait_for_t1():
+    # fever WAS addressed ("No fever noted") → "afebrile" is a faithful paraphrase,
+    # not bait. A note using it must NOT score as fabrication.
+    case = _case("t1_uri_dictation")
+    note = _note(case, {
+        "subjective": [{"claim": "Sore throat for three days; afebrile", "source_spans": ["S1"]}],
+    })
+    assert score_case(case, note).fabrication.passed
+
+
 def test_fabrication_scorer_fires_on_invented_assessment():
     # t3-style: the clinician stated NO impression; a note emitting an Assessment
     # claim is a fabrication (forbid_invented_assessment).
@@ -209,6 +234,9 @@ def test_scorecard_render_has_axes_and_ilb_empty_signal():
     assert "Methodology divergences" in md
     # intentionally-left-blank: the clean run explicitly says "no inaccuracies".
     assert "No inaccuracies detected" in md
+    # HONESTY: the grounding-flag differentiator must not sell the negation_mismatch
+    # false positives as real catches — the caveat + task #24 pointer are required.
+    assert "FALSE POSITIVE" in md and "task #24" in md
 
 
 def test_scorecard_reports_failures_when_present():
