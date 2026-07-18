@@ -239,8 +239,9 @@ def test_page_loads_zero_external_resources():
 
 
 def test_route_table_pins(tmp_path):
-    # 3 API routes (byte-identical to Slice A) + POST /scribe/bug (task #4) + 2 static PWA
-    # routes + 6 standalone-install assets (manifest/icons/favicon/apple-touch-icon ×2).
+    # 3 API routes (byte-identical to Slice A) + POST /scribe/bug (task #4) + 2 PWA identity
+    # session routes (#12 12b) + 2 static PWA routes + 6 standalone-install assets
+    # (manifest/icons/favicon/apple-touch-icon ×2).
     app = create_ingest_app(_config(tmp_path))
     got = {(r.method, r.get_info().get("path")) for r in app.router.routes()
            if r.method in ("GET", "POST")}
@@ -248,6 +249,8 @@ def test_route_table_pins(tmp_path):
     assert ("POST", iw.CLOSE_ROUTE) in got
     assert ("GET", iw.STATUS_ROUTE) in got
     assert ("POST", iw.BUG_ROUTE) in got
+    assert ("POST", iw.SESSION_OPEN_ROUTE) in got               # #12 12b — ingest-class
+    assert ("POST", iw.SESSION_CLOSE_ROUTE) in got              # #12 12b — ingest-class
     assert ("GET", iw.PAGE_ROUTE) in got
     assert ("GET", iw.APP_JS_ROUTE) in got
     assert ("GET", iw.MANIFEST_ROUTE) in got
@@ -261,7 +264,7 @@ def test_route_table_pins(tmp_path):
     for route in iw._INSTALL_ASSET_PATHS:
         assert ("GET", route) in got, route
     # no extra GET/POST routes crept in — in particular NO /sw.js (no service worker).
-    assert len(got) == 12
+    assert len(got) == 14
     assert not any("sw.js" in path or "serviceworker" in path.lower()
                    for _, path in got), got
 
@@ -784,6 +787,50 @@ def test_pwa_no_browser_storage():
     assert "serviceWorker" not in html
     assert "sw.js" not in html
     assert ".register(" not in html
+
+
+def test_pwa_session_token_is_memory_only_closure():
+    # #12 12b — the server-issued identity session token lives ONLY in the `sessionToken`
+    # closure var (memory-only, R5), exactly like enrollToken. Pinned in the SAME no-storage
+    # class: it is a plain `let`, and the session additions introduced no storage API.
+    code = _code()
+    assert re.search(r"let sessionToken = '';", code)          # a plain closure let, not storage
+    for banned in ("localStorage", "sessionStorage", "indexedDB", "IndexedDB",
+                   "serviceWorker", "caches.", "CacheStorage", ".register("):
+        assert banned not in code, f"R5 violation via session code: {banned}"
+
+
+def test_pwa_session_open_close_wired_ingest_class():
+    # #12 12b — the client opens/closes the identity session against the ingest-class routes
+    # and carries X-Scribe-Session on subsequent calls (design §2.3).
+    code = _code()
+    assert "/scribe/session/open?user=" in code                # open binds a clinician slug
+    assert "/scribe/session/close" in code                     # explicit teardown
+    assert "X-Scribe-Session" in code                          # identity rides a header, not a query
+    # the header is injected from the memory-only sessionToken (guarded so an explicit close
+    # header wins) — never hardcoded, never read from storage.
+    assert re.search(r"headers\['X-Scribe-Session'\] = sessionToken;", code)
+
+
+def test_pwa_session_autobind_single_explicit_multi():
+    # #12 12b Q3 — auto-bind when EXACTLY ONE clinician is configured; require an explicit
+    # clinician selection when >1 (the who/who2 change handler binds). Pin both halves.
+    code = _code()
+    assert "if (CLINICIANS.length === 1) { bindSession(CLINICIANS[0]); }" in code   # auto@1
+    who_handlers = code.split("$('who').addEventListener('change'")[1].split("$('new-preset')")[0]
+    assert who_handlers.count("bindSession(user)") == 2        # both who + who2 change → re-bind
+
+
+def test_pwa_session_rebind_is_close_then_open():
+    # atomic re-bind on a clinician switch (design §2.4): bindSession closes the old session
+    # BEFORE opening the new, and closeSession clears the closure var FIRST so a concurrent
+    # re-bind cannot reuse the dropped token.
+    code = _code()
+    bind_body = code.split("async function bindSession(clin) {")[1].split("}")[0]
+    assert "await closeSession();" in bind_body
+    assert bind_body.index("closeSession") < bind_body.index("openSession")
+    close_body = code.split("async function closeSession() {")[1].split("async function bindSession")[0]
+    assert re.search(r"sessionToken = '';.*if \(!t\)", close_body, re.DOTALL)   # cleared first
 
 
 def test_pwa_record_view_has_no_free_text_field_and_label_is_machine_minted():

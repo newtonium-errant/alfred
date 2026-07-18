@@ -170,6 +170,10 @@ INGEST_WEB_ALLOWED_KEYS: frozenset[str] = frozenset({
     # `web`/`web_ingest` peer-pin lesson applied to this standalone server. Lands in
     # lockstep with the ScribeIngestWebConfig.enroll_token field (barrier-e closed).
     "enroll_token",
+    # #12 slice 12b — per-clinician PWA identity-session TTLs (RAM-only session table). Both
+    # are local timing knobs, not egress fields, so they are barrier-(e)-safe; kept in lockstep
+    # with the ScribeIngestWebConfig fields (the ALLOWED_KEYS == fields pin enforces the match).
+    "session_idle_ttl_s", "session_absolute_ttl_s",
 })
 
 
@@ -225,6 +229,14 @@ class ScribeIngestWebConfig:
     max_chunk_bytes: int = 25 * 1024 * 1024          # 25 MiB per POST
     max_chunks_per_encounter: int = 4096
     max_encounter_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GiB per encounter
+    # #12 slice 12b — per-clinician PWA identity-session TTLs (design §2.2). The RAM-only
+    # session table is swept on access: a session lapses after ``session_idle_ttl_s`` of no
+    # session-authenticated request (sliding), or ``session_absolute_ttl_s`` since it opened
+    # (hard cap), whichever first. The identity session holds NO PHI (only a staff slug), so
+    # the idle window is deliberately longer than the enroll table's 10 min (which guards
+    # RAM-held audio bytes). RAM-only both ends — never persisted (design §10).
+    session_idle_ttl_s: int = 1800                   # 30 min sliding idle-expiry
+    session_absolute_ttl_s: int = 43200              # 12 h absolute cap
 
 
 @dataclass
@@ -629,7 +641,8 @@ def _build_ingest_web(data: Any) -> ScribeIngestWebConfig:
             ),
         )
         cfg.enroll_token = ""
-    for int_field in ("port", "max_chunk_bytes", "max_chunks_per_encounter", "max_encounter_bytes"):
+    for int_field in ("port", "max_chunk_bytes", "max_chunks_per_encounter", "max_encounter_bytes",
+                      "session_idle_ttl_s", "session_absolute_ttl_s"):
         if int_field in known:
             try:
                 setattr(cfg, int_field, int(known[int_field]))

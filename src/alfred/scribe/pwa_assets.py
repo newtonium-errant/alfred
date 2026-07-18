@@ -232,6 +232,7 @@ APP_JS = r"""'use strict';
   // ── R5: MEMORY-ONLY. No localStorage/sessionStorage/IndexedDB/SW anywhere. ─────
   let enrollToken = '';              // pasted once per page-load; a reload asks again
   let user = '';                     // selected clinician (a scribe.clinicians slug)
+  let sessionToken = '';             // #12 12b: server-issued identity session (MEMORY-ONLY, R5)
   let selectedPreset = '';           // '' == "No preset — attribution off" (first-class)
   let presetsCache = [];
   let mruPresetId = null;
@@ -334,11 +335,45 @@ APP_JS = r"""'use strict';
     const o = opts || {};
     const headers = o.headers || {};
     headers['Authorization'] = 'Bearer ' + (o.enroll ? enrollToken : TOKEN);
+    // #12 12b: carry the identity session on every ingest-class call so the sliding TTL stays
+    // warm (design 2.2). An EXPLICIT X-Scribe-Session (session/close passes the old token) wins
+    // over the closure var, so a teardown can send the token it is dropping.
+    if (sessionToken && !headers['X-Scribe-Session']) { headers['X-Scribe-Session'] = sessionToken; }
     const resp = await fetch(path, { method: o.method || 'GET', headers: headers, body: o.body, cache: 'no-store' });
     // Ring only the FAILURES (status >= 400) — logging every poll would flood the 20-slot ring
     // and evict the useful breadcrumbs. The path is stripped of its query (no label/PHI).
     if (resp.status >= 400) { logEvent('api ' + String(path).split('?')[0] + ' ' + resp.status); }
     return resp;
+  }
+
+  // ── #12 12b: per-clinician identity session (server-issued, MEMORY-ONLY) ────────────────
+  // Binds the loopback page to a config.clinicians slug so consent capture (slice 12c) can
+  // attribute captured_by server-side. The token lives ONLY in the sessionToken closure var
+  // above  no localStorage/sessionStorage/cookie/IndexedDB (R5, identical to enrollToken):
+  // a reload drops it and the page re-opens a session.
+  async function openSession(clin) {
+    if (!clin) { sessionToken = ''; return false; }
+    try {
+      const r = await api('/scribe/session/open?user=' + encodeURIComponent(clin), { method: 'POST' });
+      if (!r.ok) { sessionToken = ''; logEvent('session open ' + r.status); return false; }
+      const j = await r.json();
+      sessionToken = (j && j.session) ? j.session : '';
+      return !!sessionToken;
+    } catch (e) { sessionToken = ''; logEvent('session open err'); return false; }
+  }
+  async function closeSession() {
+    const t = sessionToken;
+    sessionToken = '';                 // clear FIRST so a concurrent re-bind cannot reuse it
+    if (!t) { return; }
+    try { await api('/scribe/session/close', { method: 'POST', headers: { 'X-Scribe-Session': t } }); }
+    catch (e) { /* best-effort teardown  a failed close just lets the server TTL reap it */ }
+  }
+  // Re-bind identity atomically on a clinician switch: close the old session, open the new
+  // (design 2.4). Fire-and-forget from the change handlers  the session lands before an
+  // encounter starts; slice 12c's consent gate 401s + re-opens if it somehow has not.
+  async function bindSession(clin) {
+    await closeSession();
+    if (clin) { await openSession(clin); }
   }
 
   // ══ RECORD VIEW ═══════════════════════════════════════════════════════════════
@@ -1134,10 +1169,14 @@ APP_JS = r"""'use strict';
     selectedPreset = e.currentTarget.value;
   });
   $('who').addEventListener('change', (e) => {
-    user = e.currentTarget.value; $('who2').value = user; loadPresets().then(renderPicker);
+    user = e.currentTarget.value; $('who2').value = user;
+    bindSession(user);                 // #12 12b: explicit selection binds/re-binds identity
+    loadPresets().then(renderPicker);
   });
   $('who2').addEventListener('change', (e) => {
-    user = e.currentTarget.value; $('who').value = user; renderPresets();
+    user = e.currentTarget.value; $('who').value = user;
+    bindSession(user);                 // #12 12b: explicit selection binds/re-binds identity
+    renderPresets();
   });
   $('new-preset').addEventListener('click', () => { logEvent('tap create-voiceprint'); runEnroll(null); });
   $('start').addEventListener('click', start);
@@ -1150,6 +1189,11 @@ APP_JS = r"""'use strict';
 
   fillWho($('who'));
   fillWho($('who2'));
+  // #12 12b (Q3): auto-bind the identity session when EXACTLY ONE clinician is configured
+  // (frictionless, honest  fillWho has already selected it). With >1 clinicians, binding waits
+  // for an EXPLICIT clinician selection (the who/who2 change handler) so a shared device gets
+  // stronger attribution  no session is bound until the acting clinician picks themselves.
+  if (CLINICIANS.length === 1) { bindSession(CLINICIANS[0]); }
   route();
 })();
 """

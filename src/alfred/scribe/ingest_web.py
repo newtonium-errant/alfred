@@ -47,6 +47,8 @@ import json
 import os
 import re
 import secrets
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -117,6 +119,21 @@ STATUS_ROUTE = "/scribe/status"
 # auth wiring beyond registration. Writes PHI-cautious 0600 files via ``scribe.bug``; NO
 # egress (the box watcher surfaces them). Handler-gated on ``bug.enabled`` (404 when off).
 BUG_ROUTE = "/scribe/bug"
+
+# --- #12 slice 12b — per-clinician PWA session identity (design §2) -----------
+# Server-issued identity binding: the ingest token AUTHENTICATES the page; the session
+# IDENTIFIES which config.clinicians slug is acting (it supplies consent ``captured_by`` in
+# slice 12c). Both routes are INGEST-class — they ride the ingest token the page already holds
+# (design §2.3), add NO new credential, and fall through ``_authorize_route``'s default ingest
+# branch. IDENTITY ≠ AUTHENTICATION (design §2.1): on this single-trust loopback surface the
+# session answers "who," not "may they" — so the asserted-identity peer-pin escalation concern
+# (two token classes sharing a client name) does not apply: there is ONE ingest-token class and
+# the session merely records honest, server-resolved attribution, never a privilege.
+SESSION_OPEN_ROUTE = "/scribe/session/open"
+SESSION_CLOSE_ROUTE = "/scribe/session/close"
+# Identity is delivered on subsequent calls via a REQUEST HEADER (not a query param) — it keeps
+# the opaque token out of URLs and access logs, the same reasoning as the Authorization bearer.
+SESSION_HEADER = "X-Scribe-Session"
 
 # Slice B — the loopback PWA static surface (#49). The page GET is a browser
 # NAVIGATION that cannot carry a bearer, so these two routes are Host-pinned +
@@ -257,6 +274,88 @@ def _encounter_bytes(enc_dir: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+# --- #12 slice 12b — PWA identity session: RAM table, mint, sliding-TTL sweep, resolver ---
+# The RAM-only session table (design §2.2): {session_token: PwaSession}. NO persistence — a
+# server restart drops every session (the durable ``consent.confirmed`` event is the real
+# encounter→clinician binding, design §2.4; a lapsed session just re-opens on the next call).
+# Mirrors the enroll table's on-access-sweep pattern (``enroll_web._sweep_expired``): there is
+# NO reaper thread — the sweep runs at the top of every open / close / resolve.
+_MAX_PWA_SESSIONS = 64   # RAM bound — a client that opens without ever closing cannot grow the
+                         # table without limit (a self-DoS on the sovereign loopback surface,
+                         # not an attack; the idle TTL reclaims leaked sessions regardless).
+
+
+@dataclass
+class PwaSession:
+    """One server-issued identity binding: an opaque token → a ``config.clinicians`` slug.
+    RAM-only (never persisted on-device or on-disk, design §10). ``opened_at`` anchors the
+    absolute cap; ``last_seen`` (refreshed on every session-authenticated request) anchors the
+    sliding idle TTL. Holds NO PHI — only a STAFF slug, the consent ``captured_by`` / event
+    ``actor`` (design §2.5)."""
+
+    clinician: str
+    opened_at: float          # time.monotonic() at open — the absolute-cap anchor
+    last_seen: float          # time.monotonic() of the last access — the idle-TTL anchor
+
+
+_PWA_SESSIONS: dict[str, PwaSession] = {}
+
+
+def mint_pwa_session_id() -> str:
+    """A fresh opaque ``ses-<13-digit-ms>-<16hex>`` session token (crypto-random, unguessable
+    via ``secrets.token_hex``). Mirrors ``enrollment.mint_session_id``'s construction with a
+    DISTINCT ``ses-`` prefix so an identity-session token can never be confused with an
+    enroll-session id (design §2.2)."""
+    return f"ses-{int(time.time() * 1000):013d}-{secrets.token_hex(8)}"
+
+
+def _sweep_pwa_sessions(now: float, *, idle_ttl: float, abs_ttl: float) -> None:
+    """Drop every session past its sliding idle TTL (``now - last_seen > idle_ttl``) OR its
+    absolute cap (``now - opened_at > abs_ttl``), whichever first. On-access sweep — the same
+    no-reaper pattern the enroll table uses. Emits a single count line when it reclaims (ILB —
+    a silent reclaim would be indistinguishable from a table that never grows)."""
+    expired = [
+        tok for tok, s in _PWA_SESSIONS.items()
+        if (now - s.last_seen) > idle_ttl or (now - s.opened_at) > abs_ttl
+    ]
+    for tok in expired:
+        _PWA_SESSIONS.pop(tok, None)
+    if expired:
+        log.info("scribe.session.swept", count=len(expired),
+                 detail="PWA identity session(s) TTL-swept (idle or absolute cap) — RAM reclaimed")
+
+
+def _resolve_session_token(token: str, *, idle_ttl: float, abs_ttl: float,
+                           now: float | None = None) -> PwaSession | None:
+    """Pure resolver over the RAM table: SWEEP expired first (so an expired token can never
+    resolve), then look up ``token`` and refresh its ``last_seen`` (the sliding-TTL touch).
+    Returns the bound :class:`PwaSession`, or ``None`` (header absent / unknown / already
+    expired). ``now`` is injectable for deterministic TTL tests."""
+    now = time.monotonic() if now is None else now
+    _sweep_pwa_sessions(now, idle_ttl=idle_ttl, abs_ttl=abs_ttl)
+    s = _PWA_SESSIONS.get((token or "").strip())
+    if s is None:
+        return None
+    s.last_seen = now
+    return s
+
+
+def _session_ttls(config: ScribeConfig) -> tuple[float, float]:
+    """The (idle, absolute) session TTLs in seconds from config."""
+    return (float(config.ingest_web.session_idle_ttl_s),
+            float(config.ingest_web.session_absolute_ttl_s))
+
+
+def _resolve_session(request: web.Request) -> PwaSession | None:
+    """Resolve the ``X-Scribe-Session`` header → the bound session (design §2.3), refreshing
+    the sliding TTL and sweeping on access. ``None`` when absent / unknown / expired — slice
+    12c's consent route turns that into a 401 ``no_session``; slice 12b only rides it to keep
+    a live encounter's session warm."""
+    idle_ttl, abs_ttl = _session_ttls(request.app["scribe_config"])
+    return _resolve_session_token(request.headers.get(SESSION_HEADER) or "",
+                                  idle_ttl=idle_ttl, abs_ttl=abs_ttl)
 
 
 # --- R3 security middleware -------------------------------------------------
@@ -626,6 +725,12 @@ async def _handle_status(request: web.Request) -> web.StreamResponse:
     Returns the opaque encounter id, chunk count, max seq, closed bool, and a
     fixed state string. NEVER a transcript / draft / segment / clinical body."""
     config: ScribeConfig = request.app["scribe_config"]
+    # #12 slice 12b — sliding-TTL keep-warm: the ~3 s status poll refreshes an active
+    # encounter's identity session (design §2.2) so a live capture never lets its session
+    # lapse mid-encounter. NO gating here — status is non-PHI and always answers; a
+    # resolved-None simply means no session is bound (slice 12c's consent route is where
+    # a missing session 401s, not the status probe).
+    _resolve_session(request)
     label = request.query.get("label", "")
     if not ENCOUNTER_LABEL_RE.fullmatch(label):
         log.warning("scribe.ingest_web.rejected", route=STATUS_ROUTE, reason="invalid_label")
@@ -715,6 +820,53 @@ async def _handle_bug(request: web.Request) -> web.StreamResponse:
         log.warning("scribe.ingest_web.rejected", route=BUG_ROUTE, reason=e.reason)
         return _reject(e.reason, 429)                    # over-cap → explicit 4xx the UI renders
     return web.json_response({"bug_id": bug_id}, status=200)
+
+
+# --- #12 slice 12b — PWA identity session routes (ingest-class) --------------
+
+async def _handle_session_open(request: web.Request) -> web.StreamResponse:
+    """``POST /scribe/session/open?user=<slug>`` — mint a server-issued identity session bound
+    to a ``config.clinicians`` slug (design §2.3). Ingest-class (rides the ingest token the page
+    already holds). Returns ``{session, clinician}``.
+
+    FAIL-CLOSED 403 ``unknown_clinician`` on a slug that is not a ``config.clinicians`` entry
+    VERBATIM (case-sensitive, matching attest/enroll) — identity is NEVER fabricated (design
+    §2.5). An empty ``clinicians`` list ⇒ every open 403s (no identity without a configured
+    clinician)."""
+    config: ScribeConfig = request.app["scribe_config"]
+    user = request.query.get("user", "")
+    # Grammar + verbatim-allowlist gate. ``enrollment.valid_user`` is the SHARED identity-slug
+    # regex (one grammar across enroll/consent/session — no re-derived regex).
+    from alfred.scribe import enrollment as _en
+    if not _en.valid_user(user) or user not in set(config.clinicians):
+        log.warning("scribe.session.rejected", route=SESSION_OPEN_ROUTE, reason="unknown_clinician")
+        return _reject("unknown_clinician", 403)
+    idle_ttl, abs_ttl = _session_ttls(config)
+    now = time.monotonic()
+    _sweep_pwa_sessions(now, idle_ttl=idle_ttl, abs_ttl=abs_ttl)
+    if len(_PWA_SESSIONS) >= _MAX_PWA_SESSIONS:
+        # Explicit cap signal (never a silent drop) — the RAM table is full of STILL-LIVE
+        # sessions (post-sweep). On the single-trust loopback surface this is a client leak,
+        # not an attack; the operator sees the cap_hit and the idle TTL reclaims regardless.
+        log.warning("scribe.session.cap_hit", cap="sessions", live=len(_PWA_SESSIONS))
+        return _reject("session_cap", 429)
+    token = mint_pwa_session_id()
+    _PWA_SESSIONS[token] = PwaSession(clinician=user, opened_at=now, last_seen=now)
+    log.info("scribe.session.opened", clinician=user, live=len(_PWA_SESSIONS),
+             detail="PWA identity session minted (RAM-only) — supplies consent captured_by")
+    return web.json_response({"session": token, "clinician": user}, status=200)
+
+
+async def _handle_session_close(request: web.Request) -> web.StreamResponse:
+    """``POST /scribe/session/close`` (``X-Scribe-Session`` header) — drop the session from RAM
+    (explicit end-of-day / clinician-switch teardown, design §2.3). IDEMPOTENT: an absent /
+    unknown / already-expired token still returns ``{closed: true}`` — a teardown must never
+    fail-loud (the client is releasing identity; the server obliges regardless)."""
+    token = (request.headers.get(SESSION_HEADER) or "").strip()
+    existed = _PWA_SESSIONS.pop(token, None) is not None
+    log.info("scribe.session.closed", existed=existed,
+             detail="PWA identity session dropped (idempotent teardown)")
+    return web.json_response({"closed": True}, status=200)
 
 
 # --- Slice B static PWA surface (page + app.js) -----------------------------
@@ -829,6 +981,10 @@ def create_ingest_app(
     app.router.add_get(STATUS_ROUTE, _handle_status)
     # Task #4 — bug capture (ingest-token gated, handler-gated on bug.enabled).
     app.router.add_post(BUG_ROUTE, _handle_bug)
+    # #12 slice 12b — per-clinician PWA identity sessions (ingest-class; ride the ingest token,
+    # fall through _authorize_route's default ingest branch — no new credential, design §2.3).
+    app.router.add_post(SESSION_OPEN_ROUTE, _handle_session_open)
+    app.router.add_post(SESSION_CLOSE_ROUTE, _handle_session_close)
     # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
     app.router.add_get(PAGE_ROUTE, _handle_page)
     app.router.add_get(APP_JS_ROUTE, _handle_app_js)
