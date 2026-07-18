@@ -135,8 +135,21 @@ class VerifiedNote:
     structured: StructuredNote | None = None
 
 
+def _prepend_consent_line(body: str, consent: str) -> str:
+    """Insert the deterministic consent blockquote directly under the note title, alongside the
+    P4-2 note-level banner convention (design §7.2 — the first content read). Composed here in the
+    pipeline (NOT render_soap, which has no facade access). '' consent → body unchanged."""
+    if not consent:
+        return body
+    head, sep, tail = body.partition("\n\n")   # render_soap always emits "# {title}\n\n..."
+    if sep:
+        return f"{head}\n\n{consent}\n\n{tail}"
+    return f"{consent}\n\n{body}"
+
+
 async def generate_verified_note(
     transcript: Transcript, *, config: ScribeConfig, title: str,
+    events: "ScribeEvents | None" = None,
 ) -> VerifiedNote:
     """THE choke — generate → verify → render on the SAME object.
 
@@ -202,6 +215,12 @@ async def generate_verified_note(
         speaker_attribution_flags=len(speaker_flags),
     )
     body = render_soap(structured, title=title, grounding=grounding)  # render with THAT grounding
+    # #12 slice 12d — the deterministic, LLM-free consent attestation line (§7.2). Composed HERE
+    # (facade + encounter id in scope) and prepended; the LLM never sees it. Recomputed each regen
+    # from the append-only consent state, so a mid-encounter withdrawal flips the line correctly
+    # (§7.3, no stored-then-mutated drift). No-op when no facade is threaded in (events=None).
+    if events is not None:
+        body = _prepend_consent_line(body, events.consent_line(transcript.source_id))
     return VerifiedNote(
         body=body,
         grounding_flags=grounding.metadata,
@@ -303,7 +322,7 @@ async def process_source(
         state.set(source_id, state=STATE_STRUCTURING)
         title = f"Encounter {source_id}"  # source_id-based → PHI-free (NOTE-4)
         vnote = await generate_verified_note(
-            transcript.delta(), config=config, title=title,
+            transcript.delta(), config=config, title=title, events=events,
         )
 
         # structuring → drafted (vault_create clinical_note ai_draft ONLY).
@@ -1054,7 +1073,7 @@ async def _regen_checkpoint(
     # LLM call, so an over-budget checkpoint never reaches body_replace and the
     # last-good draft stays intact.
     try:
-        vnote = await generate_verified_note(transcript, config=config, title=title)
+        vnote = await generate_verified_note(transcript, config=config, title=title, events=events)
     except ContextBudgetExceeded:
         state.set(encounter_id, state=STATE_BUDGET_CAPPED)
         log.warning(

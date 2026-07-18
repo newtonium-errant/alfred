@@ -50,6 +50,17 @@ def _coerce_actor_kind(actor_kind: str) -> str:
     return actor_kind if actor_kind in ACTOR_KINDS else "unknown"
 
 
+def _consent_dt(event: dict | None) -> tuple[str, str]:
+    """Split a consent event's ISO ``ts`` into ``(YYYY-MM-DD, HH:MM)`` for the deterministic
+    consent line (§7.2). Missing/malformed ts → ``("unknown", "unknown")`` (never a crash, never
+    ``datetime.now()`` — the line states WHEN consent was actually captured)."""
+    ts = str((event or {}).get("ts") or "")
+    if "T" in ts:
+        date, _, rest = ts.partition("T")
+        return date, rest[:5]        # HH:MM
+    return "unknown", "unknown"
+
+
 # ── Consent state machine (#12 §3.1) ─────────────────────────────────────────────
 # The per-encounter consent state ∈ {"" (∅), "confirmed", "declined", "withdrawn"}. Legal
 # transitions (design §3.1): ∅→confirmed, ∅→declined, confirmed→withdrawn. declined + withdrawn
@@ -370,6 +381,37 @@ class ScribeEvents:
             if k.startswith("consent.") and k.split(".", 1)[1] in CONSENT_STATES:
                 state = k.split(".", 1)[1]
         return state
+
+    def consent_line(self, subject_id: str, *, tool: str = "STAY-C") -> str:
+        """Deterministic, LLM-free consent attestation line for the chart note (design §7.2). The
+        string is FULLY determined by the durable consent events + fixed literals — the LLM never
+        sees or generates it (un-hallucinatable); the pipeline prepends it to the note body. Reads
+        each state event's ``ts`` for the date/time (WHEN consent was captured, never
+        ``datetime.now()``). NO patient identifier — ``subject_id`` is the opaque encounter id and
+        is never rendered. Returns '' only when the store is inactive (caller prepends nothing);
+        every state — INCLUDING no-consent — renders an explicit line (ILB: silence is ambiguous)."""
+        if not self._active:
+            return ""
+        state = self.consent_state(subject_id)
+        if state == "confirmed":
+            d, t = _consent_dt(self.latest(CLINICAL, family="consent", kind="consent.confirmed",
+                                           subject_id=subject_id))
+            return f"> Consent: patient verbally consented on {d} at {t}, using {tool}."
+        if state == "declined":
+            d, t = _consent_dt(self.latest(CLINICAL, family="consent", kind="consent.declined",
+                                           subject_id=subject_id))
+            return f"> Consent: patient DECLINED AI recording on {d} at {t}. No recording captured."
+        if state == "withdrawn":
+            cd, ct = _consent_dt(self.latest(CLINICAL, family="consent", kind="consent.confirmed",
+                                             subject_id=subject_id))
+            we = self.latest(CLINICAL, family="consent", kind="consent.withdrawn",
+                             subject_id=subject_id)
+            wd, wt = _consent_dt(we)
+            at_seq = (we or {}).get("payload", {}).get("at_seq", "?")
+            return (f"> Consent: patient verbally consented on {cd} at {ct}; consent WITHDRAWN at "
+                    f"{wd} at {wt} (audio boundary seq {at_seq}). Recording stopped.")
+        # state == "" — no consent recorded (synthetic/test encounter). The explicit ILB signal.
+        return "> Consent: not recorded (synthetic/test encounter)."
 
     def consent_captured_by(self, subject_id: str) -> str:
         """The clinician slug pinned by this encounter's durable ``consent.confirmed`` event
