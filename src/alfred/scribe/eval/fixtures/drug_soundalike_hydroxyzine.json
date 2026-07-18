@@ -1,0 +1,27 @@
+{
+  "subjective": [
+    {
+      "claim": "Itching, worse at night, with intermittent hives",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "objective": [],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Start hydroxyzine 25 mg at night",
+      "source_spans": [
+        "S3"
+      ]
+    },
+    {
+      "claim": "Reassess in one week if the itch persists",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

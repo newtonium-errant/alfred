@@ -1,0 +1,40 @@
+{
+  "subjective": [
+    {
+      "claim": "Wiped out (fatigued) for about a month",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Hair seems thinner",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Weight unchanged, no neck swelling",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Thyroid normal on examination",
+      "source_spans": [
+        "S3"
+      ]
+    }
+  ],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Order bloodwork: CBC, thyroid tests, and iron studies",
+      "source_spans": [
+        "S3"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

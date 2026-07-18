@@ -1,0 +1,34 @@
+{
+  "subjective": [
+    {
+      "claim": "Reports father had similar blood-pressure problems",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Blood pressure elevated over recent visits",
+      "source_spans": [
+        "S1"
+      ]
+    }
+  ],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Start amlodipine 5 mg once daily",
+      "source_spans": [
+        "S3"
+      ]
+    },
+    {
+      "claim": "Recheck blood pressure in one month and adjust as needed",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

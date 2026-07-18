@@ -895,6 +895,25 @@ brief:
     # peer_canonical_names: # optional override for the section header
     #   kalle: "K.A.L.L.E."  # default uppercases the peer key
   #
+  # STAY-C Bug Relay — Salem-only, opt-in. STAY-C uses NO Telegram and its
+  # clinical sandbox can't egress, so a bug filed on the STAY-C PWA is a
+  # silent sink unless a box watcher OUTSIDE the clinical unit surfaces it.
+  # The stayc_bug_watcher (installed via the bundled systemd .path/.service)
+  # writes a relay spool file; the brief reads it and renders ONE PHI-free
+  # count line — "STAY-C: N unresolved bug report(s)". Bug bodies / summaries
+  # / ids NEVER cross into the brief (it transits Telegram); only the count
+  # does, even when the spool is in full mode. Absent / unreadable / stale
+  # (generated_at older than staleness_hours) → an explicit "no data / stale"
+  # line, so a dead watcher is visible rather than silently dropping the
+  # count. Disabled by default (KAL-LE / Hypatia have no STAY-C spool).
+  # stayc_bug_relay:
+  #   enabled: true
+  #   # The watcher's $STAYC_BUG_RELAY_PATH — a deployment-specific absolute
+  #   # path OUTSIDE the STAY-C trust zone (watcher-writable, Salem-readable).
+  #   # No default: set it to the same path the watcher writes.
+  #   spool_path: "/data/algernon/alfred/data/stayc_bugs_relay.md"
+  #   staleness_hours: 25    # generated_at older than this → "stale" line
+  #
   # Watch Items — config-driven upstream checks the brief runs LIVE
   # each morning (unauthenticated GitHub REST; 60 req/hr unauth is
   # plenty at one brief/day). Absent list = feature off, section never

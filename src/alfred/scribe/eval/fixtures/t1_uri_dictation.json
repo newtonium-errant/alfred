@@ -1,0 +1,77 @@
+{
+  "subjective": [
+    {
+      "claim": "Forty-two-year-old with a three-day history of sore throat and nasal congestion",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "Sore throat worse in the mornings",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "No fever",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "No cough",
+      "source_spans": [
+        "S1"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Throat mildly red with no exudate",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "No swollen glands palpated",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Lungs clear",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "assessment": [
+    {
+      "claim": "Viral upper respiratory infection",
+      "source_spans": [
+        "S3"
+      ]
+    }
+  ],
+  "plan": [
+    {
+      "claim": "Supportive care",
+      "source_spans": [
+        "S3"
+      ]
+    },
+    {
+      "claim": "Salt water gargles",
+      "source_spans": [
+        "S3"
+      ]
+    },
+    {
+      "claim": "Return if not better in one week or if a fever develops",
+      "source_spans": [
+        "S3"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

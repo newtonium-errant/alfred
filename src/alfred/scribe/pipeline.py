@@ -159,6 +159,21 @@ async def generate_verified_note(
     body in the pipeline.
     """
     structured = await generate_structured(transcript, config=config)
+    return render_verified_note(structured, transcript, config=config, title=title)
+
+
+def render_verified_note(
+    structured: StructuredNote, transcript: Transcript, *, config: ScribeConfig,
+    title: str,
+) -> VerifiedNote:
+    """The POST-generation composition of :func:`generate_verified_note` — verify
+    → #48 inferred-dx → P4-2 speaker-attribution → render, on the SAME structured
+    object. Split out (no behavior change) so a caller holding a
+    :class:`StructuredNote` from a NON-Ollama source — the #16 eval harness's
+    fixture note-gen seam — runs the EXACT production grounding + attribution +
+    render path (no drift between what the scorecard measures and what ships).
+    ``generate_verified_note`` is the only async (real-model) entry; this is the
+    deterministic remainder."""
     grounding = verify_grounding(structured, transcript)      # verify THE SAME object
     # #48 — deterministic inferred-diagnosis post-check, BETWEEN verify and render.
     # FLAGS (never removes) a claim naming a lexicon diagnosis absent from its

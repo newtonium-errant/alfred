@@ -1,0 +1,187 @@
+"""Brief integration for the STAY-C bug-report relay spool.
+
+STAY-C uses NO Telegram (standing operator rule 2026-07-16) and its clinical
+sandbox cannot egress, so a bug report filed on the STAY-C PWA is a silent
+sink unless something OUTSIDE the clinical unit surfaces it. The
+``stayc_bug_watcher`` box component (task #4) does that surfacing: on every
+bug-dir change it regenerates a **Salem-readable relay spool file** — a
+whole-file snapshot of the currently-unresolved reports. THIS module is the
+downstream half: Salem's Morning Brief reads that spool and renders one
+PHI-free status line.
+
+**The only thing that may cross into the brief is the COUNT.** The brief
+transits Telegram; the no-Telegram rule means bug bodies / summaries / ids
+must NEVER appear in it. The spool file can be in ``full`` mode (bodies
+present in the file — the all-synthetic era) or ``locked`` mode (count + ids
+only), but this reader parses ONLY the ``unresolved:`` and ``generated_at:``
+header fields and never opens the body. Even a full-mode spool yields nothing
+but the count. That is the load-bearing property of this module.
+
+Intentionally-left-blank: a dead watcher must be VISIBLE, not silent. When
+the spool file is absent, unreadable, or STALE (``generated_at`` older than
+``staleness_hours``), the section renders an explicit "no data / stale" line
+rather than omitting itself — so a watcher that stopped writing shows up in
+the brief instead of the count just quietly vanishing.
+
+The spool header format (a cross-component contract owned by
+``stayc_bug_watcher.build_snapshot`` — parse defensively, do not re-derive)::
+
+    # STAY-C bug reports — relay snapshot
+    generated_at: 2026-07-18T03:20:10Z
+    mode: locked
+    unresolved: 3
+    new_since_last: 1
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .utils import get_logger
+
+log = get_logger(__name__)
+
+SECTION_HEADER = "STAY-C Bug Relay"
+
+# The spool's generated_at timestamp format (UTC, as written by
+# ``stayc_bug_watcher._now_iso``). Parsed to compute staleness.
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _parse_spool_header(text: str) -> tuple[int | None, datetime | None]:
+    """Extract ``(unresolved_count, generated_at)`` from the spool header.
+
+    Reads ONLY the two header fields the brief needs — never the report
+    bodies / ids / summaries below the header (a full-mode spool carries
+    bodies; they must not reach the brief). Defensive line scan rather than
+    a YAML/frontmatter parse: the file is Markdown, not frontmatter, and the
+    watcher owns the exact format. Returns ``None`` for either field that is
+    absent or unparseable.
+    """
+    count: int | None = None
+    generated_at: datetime | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if count is None and stripped.startswith("unresolved:"):
+            raw = stripped[len("unresolved:"):].strip()
+            try:
+                count = int(raw)
+            except ValueError:
+                count = None
+        elif generated_at is None and stripped.startswith("generated_at:"):
+            raw = stripped[len("generated_at:"):].strip()
+            try:
+                generated_at = datetime.strptime(raw, _TS_FORMAT).replace(
+                    tzinfo=timezone.utc,
+                )
+            except ValueError:
+                generated_at = None
+        # Stop once we have both — the fields we need are in the header, and
+        # we must NOT descend into the body (full-mode bodies live below).
+        if count is not None and generated_at is not None:
+            break
+    return count, generated_at
+
+
+def render_stayc_bug_relay_section(config, now_utc: datetime) -> str:
+    """Render the STAY-C bug-relay status line, or ``""`` when disabled.
+
+    Args:
+        config: A ``StaycBugRelayConfig`` (``enabled`` / ``spool_path`` /
+            ``staleness_hours``).
+        now_utc: Current time (UTC) — passed in for deterministic staleness
+            tests, mirroring the tier section's ``now`` injection.
+
+    Returns:
+        Markdown for the section body, or ``""`` when the feature is disabled
+        (the daemon omits the section header entirely in that case — the one
+        permitted silence, matching Watch Items / Peer Digests). When
+        enabled, ALWAYS returns a non-empty line (intentionally-left-blank):
+        the count when fresh, or an explicit no-data / stale line otherwise.
+    """
+    if not config.enabled:
+        return ""
+
+    spool_path = (config.spool_path or "").strip()
+    if not spool_path:
+        # Enabled but no path configured — a config mistake the operator must
+        # SEE, not a silent omission (the spool path is deployment-specific,
+        # so there is deliberately no baked-in default).
+        log.warning("brief.stayc_relay", state="unconfigured")
+        return (
+            "**STAY-C bug relay: not configured** — set "
+            "`brief.stayc_bug_relay.spool_path` to the watcher's relay file."
+        )
+
+    path = Path(spool_path).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Watcher never wrote / wrong path — visible, not silent.
+        log.info("brief.stayc_relay", state="absent", spool_path=spool_path)
+        return (
+            "**STAY-C bug relay: no data** — spool file not found "
+            f"(`{spool_path}`). The box watcher may not be running."
+        )
+    except OSError as exc:
+        log.warning(
+            "brief.stayc_relay", state="unreadable",
+            spool_path=spool_path, error=str(exc),
+        )
+        return (
+            "**STAY-C bug relay: no data** — spool file unreadable "
+            f"(`{spool_path}`)."
+        )
+    except UnicodeDecodeError as exc:
+        # A corrupted / non-UTF-8 spool. UnicodeDecodeError subclasses
+        # ValueError (NOT OSError), so the catch above misses it — and the
+        # daemon calls this render BARE (no section-boundary guard, trusting
+        # the function to be internally total like tier/health/routine), so
+        # an escaping raise would kill the ENTIRE brief for that run. Coerce
+        # to the same visible no-data line the docstring promises. Mirrors
+        # watches.py (a3) + tier_section.py:217, which catch the same class.
+        log.warning(
+            "brief.stayc_relay", state="unreadable",
+            spool_path=spool_path, error=str(exc),
+        )
+        return (
+            "**STAY-C bug relay: no data** — spool file unreadable "
+            "(not UTF-8)."
+        )
+
+    count, generated_at = _parse_spool_header(text)
+
+    if count is None or generated_at is None:
+        # Present but the header we depend on didn't parse — treat as no data
+        # (never trust a body we can't verify a fresh header on).
+        log.warning(
+            "brief.stayc_relay", state="unreadable", spool_path=spool_path,
+            detail="header missing unresolved/generated_at",
+        )
+        return (
+            "**STAY-C bug relay: no data** — spool present but its header "
+            "could not be parsed."
+        )
+
+    age_hours = (now_utc - generated_at).total_seconds() / 3600.0
+    if age_hours > config.staleness_hours:
+        # A watcher that stopped writing must be visible — a stale count is
+        # worse than no count because it looks live.
+        log.warning(
+            "brief.stayc_relay", state="stale", count=count,
+            age_hours=round(age_hours, 1), spool_path=spool_path,
+        )
+        return (
+            f"**STAY-C bug relay: stale** — last update "
+            f"{generated_at.strftime(_TS_FORMAT)} "
+            f"({int(age_hours)}h ago, threshold {config.staleness_hours}h). "
+            "The box watcher may have stopped."
+        )
+
+    # Fresh header → render the PHI-free count (and nothing else).
+    log.info("brief.stayc_relay", state="fresh", count=count)
+    if count == 0:
+        return "STAY-C: no unresolved bug reports."
+    plural = "report" if count == 1 else "reports"
+    return f"STAY-C: {count} unresolved bug {plural}."

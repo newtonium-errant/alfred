@@ -1,0 +1,46 @@
+{
+  "subjective": [
+    {
+      "claim": "Thirty-year-old woman with fatigue for the past month",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "Hair thinning",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "Denies weight changes or neck swelling",
+      "source_spans": [
+        "S1"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Thyroid examination normal",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Order CBC, thyroid function tests, and iron studies",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Follow up when bloodwork results are available",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

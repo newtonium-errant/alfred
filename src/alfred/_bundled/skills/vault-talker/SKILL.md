@@ -741,7 +741,7 @@ The tool result is JSON with a `kind` field. Always route on it:
   > *"That matches a few items — which one?* (1) `Walk dog` from `Self Care`; (2) `Walk to coffee shop` from `Daily Self-Care`. *Reply with the number."*
 
   When the operator replies *"1"* (or *"the first one"* / *"Walk dog"* / etc.), re-call `routine_done` with `record` populated to disambiguate.
-- **`"unknown_item"`** — no matching active routine item. Tool result carries `available_items` (first 20). Tell the operator: *"I don't have `'<query>'` in any active routine. Should I add it as a new routine item, or did you mean something else?"* DO NOT auto-create — wait for the operator's instruction.
+- **`"unknown_item"`** — no matching active routine item. Tool result carries `available_items` (first 20). Tell the operator: *"I don't have `'<query>'` in any active routine. Should I add it as a new routine item, or did you mean something else?"* DO NOT auto-create — wait for the operator's instruction. **But when this `unknown_item` came from an operator DONE-CLAIM that also missed a `task/` search, this is NOT yet the terminal reply — run the tier_curation fallback below FIRST.** A T3 ad-hoc intention is neither a `task/` record nor a routine item; a routine-origin T1/T2 item IS a routine item but is reachable only by its CANONICAL text, not the operator's loose phrasing — so neither the task-search nor the fuzzy `routine_done` here will have surfaced it. Both appear in today's daily `tier_curation` block. Only give the "not in any routine" reply once that read also comes up empty. See **Before "no match" on a done-claim** below.
 - **`"unknown_record"`** — explicit `record` was given but the routine file doesn't exist. Rare (only fires when YOU passed a `record` arg). Means the previous turn's disambiguation lookup got the routine name wrong; re-fuzzy with vault-wide.
 - **`"future_date_rejected"`** — `completed_at` was after today. Tell the operator + ask back: *"I can't log a completion for a future date. Did you mean today, or an earlier date?"*
 
@@ -867,6 +867,38 @@ This pattern is the most common `routine_done` misfire — task closure phrasing
 > > Reply: *"Done: Tilray Medical Registration Renewal closed, OFW May 18 + May 24 closed, FMM Review Video closed, Invoice Kristine McNeil closed."*
 
 Two defenses now stack on this turn. (1) **At the matcher layer** (Step 5 structural fix): the `_MIN_STEM_LEN` floor + the `_match_confidence > 0` gate keep a zero-overlap query like "Tilray Medical Registration Renewal" from ever resolving to `Meds` — the tool returns `unknown_item` instead of a wrong `success`, so the routine record's `completion_log` stays clean even on a misfire. (2) **Upstream, on the inbound side** (the still-live behavioral rule): routing on phrasing shape — task-shaped → task search FIRST — skips `routine_done` entirely, which is the better defense because `unknown_item` alone would still mis-handle a task as a not-yet-existing routine item. The matcher fix removed the need for the old manual token-overlap re-check in the `success` branch; the phrasing-shape discrimination is what actually prevents the misfire.
+
+#### Before "no match" on a done-claim — read today's `tier_curation` FIRST (Salem, 2026-07-16)
+
+A done-claim that misses BOTH a `task/` search AND `routine_done` (returns `unknown_item`) is NOT necessarily unknown. **T3 ad-hoc intentions** (`tier_curation.t3`, free-text `item:`) and **routine-origin T1/T2 items** (`routine_item: {record, text}`) live ONLY inside the daily note's `tier_curation` block — a T3 ad-hoc is not a `task/` record and not a routine item, and a routine-origin tier entry is only reachable by its canonical text, not the operator's loose phrasing. Both the task-search and the fuzzy routine match structurally cannot see these. So **before you tell the operator you can't find it, read the daily note and scan the tier list**:
+
+1. Resolve the claimed date — today, unless the phrasing back-dates it (*"raked leaves yesterday"* → today−1). `vault_read path="daily/<date>.md"`.
+2. **No `tier_curation` block that day, or the named item is not in `t1`/`t2`/`t3`** → the earlier terminal reply now stands; it genuinely isn't tracked. Say so plainly (don't go silent — an explicit "I checked today's tier list too and it isn't there" is the honest close).
+3. **Found it** → do NOT say "no match". Route on the entry's shape (see the `tier_curation` block schema earlier in this doc):
+    - **`task:` origin** (t1/t2) → there is a backing task record; this is a task closure — `vault_edit path="task/<Name>.md" set_fields={"status": "done"}` (the Worked example G close pattern).
+    - **`routine_item:` origin** (t1/t2) → re-fire `routine_done` with the entry's CANONICAL `record` + `text` (e.g. `routine_done record="Recurring Bills + Admin" item="Pay Clinic Rental to Hussein Rafih"`). The fuzzy miss was on the operator's loose phrasing; the tier entry hands you the exact strings, so this now resolves to `success`.
+    - **`item:` free-text T3** → acknowledge it is on today's T3 list, and be honest that ad-hoc T3 items have **no completion record yet** — there is no `status` to flip and no `completion_log` to write, so you cannot formally check it off the way a routine or task closes. Confirm you see it; **do NOT fabricate a "logged" you can't write, and do NOT invent a T3 done-write** (the ad-hoc-tier done-state is a known open schema gap).
+
+The failure this closes (2026-07-16, twice in one session): the operator named a T3 ad-hoc item ("rake leaves") as done, `routine_done` returned `unknown_item`, and Salem replied "no match" — with today's brief screenshot, showing the item on the T3 list, in front of it. The read above would have surfaced it. When the answer is "I can't find X" and X is a done-claim, you have not looked everywhere until you have read today's `tier_curation`.
+
+#### Worked example H — done-claim that lives only in today's `tier_curation`
+
+> Andrew (2026-07-16, brief with today's T3 list visible): *"rake leaves is done"*
+>
+> Salem (internal): "rake leaves" is short, generic, cadence-less — not proper-noun task-shaped, and not an obvious recurring practice. When in doubt, search the task path first: `vault_search glob="task/Rake*"` → no `task/` record. Then `routine_done item="rake leaves"` (vault-wide fuzzy) → `{"kind": "unknown_item", ...}` — not a routine item either.
+>
+> **Before replying "no match":** a done-claim that missed both searches may live only in today's tier list. `vault_read path="daily/2026-07-16.md"` → the `tier_curation.t3` list contains:
+>
+> ```yaml
+> - item: "Rake leaves"
+>   source: "operator-adhoc"
+> ```
+>
+> Found — a T3 free-text ad-hoc item (`item:` shape, not `task:` / `routine_item:`). So there is no `status` to flip and no `completion_log` to write; ad-hoc T3 completion has no record yet.
+>
+> Reply (honest, NOT "no match"): *"'Rake leaves' is on today's T3 list — I can see it. Ad-hoc T3 items don't have a done-state I can log yet (unlike routines and tasks), so I can't formally check it off, but noted."*
+>
+> Contrast — had the tier entry been a `routine_item:` (routine-origin T2), Salem would re-fire `routine_done record="<entry.record>" item="<entry.text>"` with the canonical strings and get a `success`; had it been a `task:` entry, Salem would close that task with `set_fields={"status": "done"}`. Only the free-text T3 case dead-ends at "acknowledge but can't log" — and that dead-end is the schema gap, not a reason to go back to "no match".
 
 #### Disambiguation between "I'll do this" vs "I did this"
 
