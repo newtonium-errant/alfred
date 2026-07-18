@@ -52,7 +52,7 @@ from pathlib import Path
 import httpx
 
 from .config import WatchItemConfig
-from .utils import get_logger
+from .utils import SectionReadStatus, get_logger, safe_read_section_file
 
 log = get_logger(__name__)
 
@@ -118,14 +118,25 @@ def load_watch_state(path: Path) -> dict[str, WatchItemState]:
     """Load the per-id state map. Missing/corrupt file → fresh (warned)."""
     if not path.exists():
         return {}
+    # Defensive read via the shared helper (unifies the FileNotFoundError +
+    # OSError + UnicodeDecodeError catch — the last subclasses ValueError,
+    # not OSError; review nit a3 was a binary-corrupted state file escaping
+    # a bare OSError catch). A read failure → fresh baseline, warned.
+    read = safe_read_section_file(path)
+    if read.status is not SectionReadStatus.OK:
+        log.warning(
+            "brief.watches_state_load_failed",
+            path=str(path),
+            error=read.detail,
+            error_type=read.error_type,
+        )
+        return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError) as exc:
-        # ValueError covers BOTH json.JSONDecodeError (its subclass) AND
-        # UnicodeDecodeError from read_text on an invalid-UTF-8 file
-        # (review nit a3 — the old JSONDecodeError-only catch let a
-        # binary-corrupted state file escalate to the daemon guard
-        # instead of degrading to a fresh baseline here).
+        raw = json.loads(read.text)
+    except ValueError as exc:
+        # JSON syntax error (json.JSONDecodeError ⊂ ValueError) — the file
+        # read cleanly but isn't valid JSON. UnicodeDecodeError is already
+        # handled by the helper above, so this catch is JSON-only.
         log.warning(
             "brief.watches_state_load_failed",
             path=str(path),

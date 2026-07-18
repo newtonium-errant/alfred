@@ -105,6 +105,8 @@ from alfred.tier.daily_curation import (
     load_daily_curation,
 )
 
+from .utils import SectionReadStatus, safe_read_section_file
+
 log = structlog.get_logger(__name__)
 
 
@@ -210,12 +212,17 @@ def _validate_frontmatter_yaml(path: Path) -> str | None:
     the parse_failed log line operators rely on. See V1's history at
     commit ``91504ea`` for the underlying gotcha.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        return f"read failed: {exc}"
-    except UnicodeDecodeError as exc:
-        return f"not utf-8: {exc}"
+    # Defensive read via the shared helper — catches FileNotFoundError,
+    # other OSError, AND UnicodeDecodeError uniformly (the last subclasses
+    # ValueError, not OSError, so a bare ``except OSError`` misses it).
+    read = safe_read_section_file(path)
+    if read.status is SectionReadStatus.DECODE_ERROR:
+        return f"not utf-8: {read.detail}"
+    if read.status is not SectionReadStatus.OK:
+        # NOT_FOUND + other OSError — same "read failed" message the prior
+        # ``except OSError`` (which included FileNotFoundError) produced.
+        return f"read failed: {read.detail}"
+    text = read.text
 
     if not text.startswith("---"):
         return None
