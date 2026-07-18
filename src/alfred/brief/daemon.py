@@ -23,6 +23,8 @@ from .renderer import (
     serialize_record,
 )
 from .routine_section import render_routine_section
+from .stayc_relay import SECTION_HEADER as STAYC_RELAY_SECTION_HEADER
+from .stayc_relay import render_stayc_bug_relay_section
 from .state import BriefRun, StateManager
 from .tier_section import SECTION_HEADER as TIER_SECTION_HEADER
 from .tier_section import render_tier_section
@@ -252,6 +254,16 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # via brief config).
     routines_md = render_routine_section(Path(config.vault_path), today_local)
 
+    # STAY-C Bug Relay — reads the box watcher's relay spool and renders one
+    # PHI-free count line (never bug bodies — the brief transits Telegram and
+    # STAY-C uses none). Empty string when disabled (Salem-only, opt-in);
+    # when enabled ALWAYS returns a line (count, or an explicit no-data /
+    # stale signal so a dead watcher is visible). ``now_utc`` drives the
+    # staleness check against the spool's ``generated_at``.
+    stayc_relay_md = render_stayc_bug_relay_section(
+        config.stayc_bug_relay, datetime.now(timezone.utc),
+    )
+
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
     # second (time-sensitive but non-operational), Open Tasks by Tier
@@ -285,6 +297,13 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # one permitted silence; every CONFIGURED watch yields a line).
     if watches_md:
         sections.append(("Watch Items", watches_md))
+    # STAY-C Bug Relay sits alongside Watch Items — both are upstream
+    # operational signals (something outside Salem needs triage). Rendered
+    # ONLY when the feature is enabled (the empty string from a disabled /
+    # unconfigured-instance feature is the one permitted silence; an ENABLED
+    # relay always yields a line, including the no-data / stale signal).
+    if stayc_relay_md:
+        sections.append((STAYC_RELAY_SECTION_HEADER, stayc_relay_md))
     if upcoming_md:
         sections.append(("Upcoming Events", upcoming_md))
     if peer_digests_md:

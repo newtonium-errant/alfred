@@ -79,6 +79,37 @@ class PeerDigestsConfig:
 
 
 @dataclass
+class StaycBugRelayConfig:
+    """Config for the STAY-C Bug Relay section (task #21 — downstream of #4).
+
+    Salem's brief reads the ``stayc_bug_watcher`` relay spool and renders one
+    PHI-free count line. STAY-C uses NO Telegram, so only the count may cross
+    into the (Telegram-transiting) brief — never bug bodies.
+
+    ``enabled`` defaults OFF: only the Salem instance that lives alongside a
+    STAY-C deployment has a spool to read; KAL-LE / Hypatia have none, and a
+    section that reads a nonexistent spool would render a permanent "no data"
+    line. Opt in per-instance.
+
+    ``spool_path`` has NO baked-in default on purpose — it is a
+    deployment-specific absolute path (the box's
+    ``/data/algernon/alfred/data/stayc_bugs_relay.md`` differs from a dev
+    checkout), so a shared-code default would be wrong on every other
+    machine (per-instance-defaults rule). Enabled-but-unset renders an
+    explicit "not configured" line rather than guessing.
+
+    ``staleness_hours`` (default 25) — a ``generated_at`` older than this
+    marks the relay stale (the watcher fires on any bug-dir change plus the
+    operator's daily cadence; >25h with no write means it likely stopped).
+    25h, not 24h, tolerates a slightly-late daily tick without false-stale.
+    """
+
+    enabled: bool = False
+    spool_path: str = ""
+    staleness_hours: float = 25.0
+
+
+@dataclass
 class WatchItemConfig:
     """One ``brief.watches`` entry — a config-driven upstream check.
 
@@ -151,6 +182,9 @@ class BriefConfig:
     state: StateConfig = field(default_factory=StateConfig)
     upcoming_events: UpcomingEventsConfig = field(default_factory=UpcomingEventsConfig)
     peer_digests: PeerDigestsConfig = field(default_factory=PeerDigestsConfig)
+    # STAY-C Bug Relay — optional; disabled by default (Salem-only, opt-in).
+    # See StaycBugRelayConfig.
+    stayc_bug_relay: StaycBugRelayConfig = field(default_factory=StaycBugRelayConfig)
     # Watch Items — optional; empty list = feature off, section never
     # rendered. See WatchItemConfig.
     watches: list[WatchItemConfig] = field(default_factory=list)
@@ -266,6 +300,22 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         peer_canonical_names=peer_canonical_names,
     )
 
+    # STAY-C Bug Relay — Salem-only, opt-in. Absent block = disabled (the
+    # dataclass default), so the section never renders on instances without
+    # a STAY-C deployment. ``spool_path`` has no baked-in default (it is a
+    # deployment-specific absolute path); enabled-but-unset surfaces as an
+    # explicit "not configured" line at render time.
+    sbr_raw = section.get("stayc_bug_relay", {}) or {}
+    try:
+        staleness_hours = float(sbr_raw.get("staleness_hours", 25.0))
+    except (TypeError, ValueError):
+        staleness_hours = 25.0
+    stayc_bug_relay = StaycBugRelayConfig(
+        enabled=bool(sbr_raw.get("enabled", False)),
+        spool_path=str(sbr_raw.get("spool_path", "") or ""),
+        staleness_hours=staleness_hours,
+    )
+
     # Watch Items — optional list; absent block = feature off. Lenient
     # build (str/int coercion, non-dict entries skipped): a structurally
     # malformed ITEM still constructs and is surfaced at check time as a
@@ -367,6 +417,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         state=state,
         upcoming_events=upcoming_events,
         peer_digests=peer_digests,
+        stayc_bug_relay=stayc_bug_relay,
         watches=watches,
         log_file=f"{log_dir}/brief.log",
         primary_telegram_user_id=primary_user,
