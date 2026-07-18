@@ -239,6 +239,8 @@ APP_JS = r"""'use strict';
   let enrollToken = '';              // pasted once per page-load; a reload asks again
   let user = '';                     // selected clinician (a scribe.clinicians slug)
   let sessionToken = '';             // #12 12b: server-issued identity session (MEMORY-ONLY, R5)
+  let consentActing = false;         // #12 12c: re-entrancy latch — a double-tap on Confirmed/Declined
+                                     // must not double-POST (the 2nd's 409 would null the live label)
   let selectedPreset = '';           // '' == "No preset — attribution off" (first-class)
   let presetsCache = [];
   let mruPresetId = null;
@@ -603,6 +605,8 @@ APP_JS = r"""'use strict';
   }
 
   async function consentDecline() {
+    if (consentActing) { return; }         // re-entrancy latch (a double-tap must not double-POST)
+    consentActing = true;
     hideConsentPanel();
     try {
       const r = await api('/scribe/consent?label=' + encodeURIComponent(label) + '&decision=declined',
@@ -612,9 +616,12 @@ APP_JS = r"""'use strict';
     } catch (e) { show('Could not record the decision. Try again.'); }
     $('start').disabled = false;
     label = null;                         // a declined visit produces no audio; a fresh visit re-mints
+    consentActing = false;
   }
 
   async function consentConfirm() {
+    if (consentActing) { return; }         // re-entrancy latch (a double-tap must not double-POST)
+    consentActing = true;
     hideConsentPanel();
     let ok = false;
     try {
@@ -626,7 +633,9 @@ APP_JS = r"""'use strict';
         else { show('Could not record consent. Recording did not start.'); }
       }
     } catch (e) { show('Could not record consent. Recording did not start.'); }
-    if (!ok) { $('start').disabled = false; label = null; return; }   // FAIL-CLOSED: mic never touched
+    if (!ok) { consentActing = false; $('start').disabled = false; label = null; return; }  // FAIL-CLOSED: mic never touched
+    // SUCCESS: leave consentActing latched (the consent panel is hidden — no re-tap is possible)
+    // through the encounter; stopEncounter() + route() clear it when we return to idle.
     await beginCapture();                  // CAPTURE PHASE — the existing path, byte-for-byte
   }
 
@@ -679,6 +688,7 @@ APP_JS = r"""'use strict';
     if (micOwner === 'encounter') { micOwner = ''; }             // release the mic claim
     $('stop').disabled = true;
     $('withdraw').classList.add('hide'); $('withdraw').disabled = false;  // #12 12c — reset the control
+    consentActing = false;                                      // #12 12c — clear the consent re-entrancy latch
     chain = chain.then(async () => {
       const finalSeq = seq;
       let u = '/scribe/close?label=' + encodeURIComponent(label);
@@ -1252,6 +1262,7 @@ APP_JS = r"""'use strict';
     // so an active encounter's Withdraw control survives a presets round-trip.
     if (!presets && !recording && !micOwner) {
       hideConsentPanel(); $('withdraw').classList.add('hide'); $('start').disabled = false;
+      consentActing = false;                                   // #12 12c — clear the consent latch on idle
     }
   }
 

@@ -442,3 +442,79 @@ def test_enc_lock_same_instance_per_encounter():
     a = iw._enc_lock(locks, "enc-a")
     assert iw._enc_lock(locks, "enc-a") is a         # same encounter → same lock
     assert iw._enc_lock(locks, "enc-b") is not a     # distinct encounter → distinct lock
+
+
+# ── consent route is clinical-only (symmetric with the chunk gate) ───────────
+
+def test_consent_route_inert_in_synthetic_mode(tmp_path):
+    # a SYNTHETIC server with a healthy (active clinical) events store must NOT record consent —
+    # symmetric with the chunk gate (§7.2/§10: synthetic/test encounters have no consent flow).
+    # The route is INERT: 200 (so the PWA consent phase falls through to capture) + NO event.
+    ev = _facade(tmp_path)                            # active clinical facade …
+    cfg = _config(tmp_path, mode="synthetic")         # … behind a SYNTHETIC-mode server
+
+    async def _run():
+        async with _serve(cfg, ev) as base, aiohttp.ClientSession() as s:
+            # no session needed — the inert short-circuit is BEFORE identity resolution.
+            status, body = await _post_consent(s, base, "confirmed")
+            assert status == 200 and body.get("inert") is True
+    with structlog.testing.capture_logs() as cap:
+        asyncio.run(_run())
+    assert ev.query("clinical", family="consent") == []      # NOTHING recorded in synthetic mode
+    assert any(c.get("event") == "scribe.consent.inert" for c in cap)
+
+
+# ── RAM hygiene — terminal encounters release their lock + cache (§6.2) ──────
+
+def test_evict_encounter_is_idempotent():
+    app = {"enc_locks": {"e": object()}, "consent_cache": {"e": "confirmed"}}
+    iw._evict_encounter(app, "e")
+    assert app["enc_locks"] == {} and app["consent_cache"] == {}
+    iw._evict_encounter(app, "missing")              # idempotent — no KeyError on a gone encounter
+
+
+def test_close_evicts_lock_and_cache(tmp_path):
+    ev = _facade(tmp_path)
+    cfg = _config(tmp_path)
+    enc = _eid()
+
+    async def _run():
+        server = IngestWebServer(cfg, events=ev)
+        await server.start()
+        app = server._runner.app
+        try:
+            base = f"http://127.0.0.1:{cfg.ingest_web.port}"
+            async with aiohttp.ClientSession() as s:
+                tok = await _open_session(s, base)
+                assert (await _post_consent(s, base, "confirmed", session=tok))[0] == 200
+                assert await _post_chunk(s, base, seq=1, session=tok) == 200
+                assert enc in app["consent_cache"]           # live mid-encounter
+                async with s.post(base + iw.CLOSE_ROUTE, params={"label": _LABEL, "final_seq": "1"},
+                                  headers=_auth()) as r:
+                    assert r.status == 200
+                assert enc not in app["enc_locks"]           # sealed → lock + cache released
+                assert enc not in app["consent_cache"]
+        finally:
+            await server.stop()
+    asyncio.run(_run())
+
+
+def test_declined_evicts_lock_and_cache(tmp_path):
+    ev = _facade(tmp_path)
+    cfg = _config(tmp_path)
+    enc = _eid()
+
+    async def _run():
+        server = IngestWebServer(cfg, events=ev)
+        await server.start()
+        app = server._runner.app
+        try:
+            base = f"http://127.0.0.1:{cfg.ingest_web.port}"
+            async with aiohttp.ClientSession() as s:
+                tok = await _open_session(s, base)
+                assert (await _post_consent(s, base, "declined", session=tok))[0] == 200
+                # declined never opens the mic / never /closes → it is its own eviction point.
+                assert enc not in app["enc_locks"] and enc not in app["consent_cache"]
+        finally:
+            await server.stop()
+    asyncio.run(_run())

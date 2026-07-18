@@ -407,6 +407,18 @@ def _consent_state_cached(cache: dict, enc_id: str, events: "ScribeEvents | None
     return st
 
 
+def _evict_encounter(app: web.Application, enc_id: str) -> None:
+    """Drop a TERMINAL encounter's per-encounter lock + consent-cache entry so the RAM structures
+    don't grow unbounded over a long-running clinical daemon (dozens of encounters/day for
+    weeks/months). Called when the encounter reaches a terminal state: /scribe/close (sealed —
+    covers confirmed→closed and withdrawn→closed) and the consent route's DECLINED branch
+    (declined never opens the mic, so it never closes). Safe post-terminal — a stray later chunk
+    cache-MISSES → the durable ``consent_state`` fallback still refuses it (sealed / declined /
+    withdrawn), transiently re-creating a lock it immediately 409s under; nothing is lost."""
+    app["enc_locks"].pop(enc_id, None)
+    app["consent_cache"].pop(enc_id, None)
+
+
 # --- R3 security middleware -------------------------------------------------
 
 def _bearer(request: web.Request) -> str:
@@ -741,6 +753,7 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
         # final_seq = the on-disk max (0 for a zero-chunk close).
         if events is not None:
             events.encounter_closed(subject_id=encounter_id, final_seq=disk_max)
+        _evict_encounter(request.app, encounter_id)   # #12 12c hygiene — sealed encounter releases its lock/cache
         return web.json_response({"encounter_id": encounter_id, "closed": True}, status=200)
 
     # (c) final_seq PRESENT → validate + consistency + monotonic write-once.
@@ -791,6 +804,7 @@ async def _handle_close(request: web.Request) -> web.StreamResponse:
     # encounter.closed (design §5.4) — the /close seal path (final_seq present).
     if events is not None:
         events.encounter_closed(subject_id=encounter_id, final_seq=bar)
+    _evict_encounter(request.app, encounter_id)   # #12 12c hygiene — sealed encounter releases its lock/cache
     return web.json_response({"encounter_id": encounter_id, "closed": True}, status=200)
 
 
@@ -973,6 +987,18 @@ async def _handle_consent(request: web.Request) -> web.StreamResponse:
         log.error("scribe.ingest_web.identity_unavailable", route=CONSENT_ROUTE)
         return _reject("identity_unavailable", 500)
 
+    # Consent applies ONLY in CLINICAL mode — symmetric with the chunk gate (§6.1) and the design
+    # (§7.2/§10: a synthetic/test encounter has NO consent flow). In non-clinical mode the route
+    # is INERT: it emits NO event and returns 200 so the PWA's consent phase still falls through
+    # into capture (the chunk gate does the same — synthetic chunks pass ungated). Placed BEFORE
+    # the active-store check so a healthy-events dir on a synthetic server can't record consent.
+    if not config.is_clinical:
+        log.info("scribe.consent.inert", route=CONSENT_ROUTE, decision=decision, encounter_id=enc_id,
+                 detail="non-clinical mode — consent route inert (no event emitted; symmetric "
+                        "with the synthetic chunk-gate passthrough)")
+        return web.json_response(
+            {"encounter_id": enc_id, "decision": decision, "inert": True}, status=200)
+
     # Consent is DURABLE evidence — with no active event store we cannot record it, so we must
     # not let it appear captured. Fail-closed (§4: no consent state → the mic never opens).
     if events is None or not events.active:
@@ -1034,6 +1060,11 @@ async def _handle_consent(request: web.Request) -> web.StreamResponse:
         request.app["consent_cache"][enc_id] = decision
     log.info("scribe.consent.recorded", route=CONSENT_ROUTE, decision=decision, encounter_id=enc_id,
              detail="durable consent transition recorded + hot cache flipped")
+    if decision == "declined":
+        # DECLINED is terminal AND never reaches /scribe/close (the mic never opens), so it is its
+        # own eviction point — release the lock/cache now (the durable declined state still refuses
+        # any stray chunk via the cache-miss fallback). confirmed/withdrawn evict at /close.
+        _evict_encounter(request.app, enc_id)
     return web.json_response(
         {"encounter_id": enc_id, "decision": decision, "captured_by": captured_by}, status=200)
 

@@ -822,6 +822,17 @@ def test_pwa_session_autobind_single_explicit_multi():
     assert who_handlers.count("bindSession(user)") == 2        # both who + who2 change → re-bind
 
 
+def test_pwa_consent_buttons_have_reentrancy_latch():
+    # #12 12c — a double-tap on Confirmed/Declined must not double-POST (the 2nd POST's 409 would
+    # run `label = null` after the first already started recording, poisoning the live encounter).
+    code = _code()
+    assert "let consentActing = false;" in code
+    assert code.count("if (consentActing) { return; }") == 2   # both handlers latch at entry
+    # the latch is cleared when returning to idle so a fresh visit is never wedged.
+    stop_body = code.split("function stopEncounter")[1].split("async function stop(")[0]
+    assert "consentActing = false" in stop_body
+
+
 def test_pwa_session_rebind_is_close_then_open():
     # atomic re-bind on a clinician switch (design §2.4): bindSession closes the old session
     # BEFORE opening the new, and closeSession clears the closure var FIRST so a concurrent
