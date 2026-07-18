@@ -10,8 +10,8 @@ the "no unverified note reaches vault_create" structural pin.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
+import re
 
 import frontmatter
 import pytest
@@ -128,6 +128,21 @@ def test_choke_verifies_the_same_object_it_renders(monkeypatch):
     assert GROUNDING_UNVERIFIED in vnote.body
 
 
+def _func_body_from_src(module_text: str, name: str) -> str:
+    """Slice a top-level ``def``/``async def <name>`` body out of module SOURCE
+    TEXT by def-boundaries — no ``inspect.getsource`` of live function objects.
+
+    Deterministic under a full-suite load: reading from disk sidesteps the
+    linecache race + leaked-monkeypatch-on-the-name hazard that makes
+    ``inspect.getsource(module_object.func)`` flake intermittently across 10k
+    tests (the func object it introspects can be a stale/patched attribute)."""
+    m = re.search(rf"^(?:async +)?def {re.escape(name)}\(", module_text, re.MULTILINE)
+    assert m, f"{name} not defined at module level in pipeline source"
+    rest = module_text[m.end():]
+    nxt = re.search(r"^(?:@|async +def |def |class )", rest, re.MULTILINE)
+    return module_text[m.start(): m.end() + nxt.start()] if nxt else module_text[m.start():]
+
+
 def test_pipeline_render_only_inside_the_choke():
     # Structural pin: render_soap is called EXACTLY once in the pipeline module,
     # inside the verify-before-render composition. No other code path renders a
@@ -139,13 +154,16 @@ def test_pipeline_render_only_inside_the_choke():
     # ``generate_structured`` + a delegate call. The invariant is unchanged — pin
     # it on ``render_verified_note`` (where verify+render live) AND that the async
     # choke delegates to it.
-    src = inspect.getsource(pipeline_mod)
+    #
+    # Source is read ONCE FROM DISK (not inspect.getsource of function objects) so
+    # the scan is deterministic under the full-suite run — see _func_body_from_src.
+    src = open(pipeline_mod.__file__, encoding="utf-8").read()
     assert src.count("render_soap(") == 1
-    choke = inspect.getsource(pipeline_mod.render_verified_note)
+    choke = _func_body_from_src(src, "render_verified_note")
     assert "verify_grounding(" in choke and "render_soap(" in choke
     assert choke.index("verify_grounding(") < choke.index("render_soap(")
     # the async entry generates then delegates to the sole render path.
-    outer = inspect.getsource(pipeline_mod.generate_verified_note)
+    outer = _func_body_from_src(src, "generate_verified_note")
     assert "generate_structured(" in outer and "render_verified_note(" in outer
 
 
@@ -307,7 +325,9 @@ def test_note3_pipeline_has_no_subprocess_or_claude_p():
     # Strip the module docstring (which legitimately EXPLAINS why claude -p is
     # forbidden) and assert the CODE body has no subprocess / claude egress
     # vector — the note path must stay local-python.
-    src = inspect.getsource(pipeline_mod)
+    # Read from DISK (not inspect.getsource) — same full-suite-flake immunity as
+    # the render-choke pin above.
+    src = open(pipeline_mod.__file__, encoding="utf-8").read()
     code = src.replace(pipeline_mod.__doc__ or "", "")
     assert "import subprocess" not in code
     assert "subprocess." not in code
