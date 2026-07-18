@@ -1,0 +1,33 @@
+{
+  "subjective": [
+    {
+      "claim": "Sudden episodes of pounding heart, shortness of breath, and tingling hands",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Episodes occur at rest",
+      "source_spans": [
+        "S4"
+      ]
+    },
+    {
+      "claim": "Reports panic attacks (per her therapist) and feeling very anxious lately",
+      "source_spans": [
+        "S4"
+      ]
+    }
+  ],
+  "objective": [],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Will assess for a cardiac cause and make a plan for the anxiety",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

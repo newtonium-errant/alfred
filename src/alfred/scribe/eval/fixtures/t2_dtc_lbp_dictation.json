@@ -1,0 +1,76 @@
+{
+  "subjective": [
+    {
+      "claim": "58-year-old with a six-year history of low back pain",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "Constant aching in the lower back radiating into the right buttock, not below the knee",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "Worse with prolonged sitting and bending forward",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "Rated around six out of ten most days",
+      "source_spans": [
+        "S1"
+      ]
+    },
+    {
+      "claim": "Tried physiotherapy and over-the-counter anti-inflammatories with partial relief",
+      "source_spans": [
+        "S1"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Tenderness over the right lower lumbar paraspinals",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Forward flexion limited to about 40 degrees",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Straight leg raise negative bilaterally",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Lower limb strength and reflexes intact",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "assessment": [
+    {
+      "claim": "Chronic mechanical low back pain with right-sided referral",
+      "source_spans": [
+        "S3"
+      ]
+    },
+    {
+      "claim": "Marked restriction in activities involving prolonged sitting and bending",
+      "source_spans": [
+        "S3"
+      ]
+    }
+  ],
+  "plan": [],
+  "assessment_reasoning_stated": false
+}

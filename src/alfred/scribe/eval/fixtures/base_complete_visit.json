@@ -1,0 +1,40 @@
+{
+  "subjective": [
+    {
+      "claim": "Dysuria and increased urinary frequency since yesterday",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "No fever, no back pain",
+      "source_spans": [
+        "S2"
+      ]
+    }
+  ],
+  "objective": [
+    {
+      "claim": "Urine dip positive for infection",
+      "source_spans": [
+        "S3"
+      ]
+    }
+  ],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Start nitrofurantoin 100 mg twice daily for 5 days",
+      "source_spans": [
+        "S3"
+      ]
+    },
+    {
+      "claim": "Return if a fever or back pain develops (possible upper-tract involvement)",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}

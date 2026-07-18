@@ -1,0 +1,34 @@
+{
+  "subjective": [
+    {
+      "claim": "Back pain unchanged",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Reports feeling really low lately",
+      "source_spans": [
+        "S2"
+      ]
+    },
+    {
+      "claim": "Expresses passive suicidal ideation \u2014 wonders what the point is and at times wishes she would not wake up; denies a plan or intent to act",
+      "source_spans": [
+        "S2",
+        "S4"
+      ]
+    }
+  ],
+  "objective": [],
+  "assessment": [],
+  "plan": [
+    {
+      "claim": "Taking the disclosure seriously; will discuss supports",
+      "source_spans": [
+        "S5"
+      ]
+    }
+  ],
+  "assessment_reasoning_stated": false
+}
