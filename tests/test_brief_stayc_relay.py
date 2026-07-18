@@ -162,6 +162,23 @@ def test_unparseable_header_renders_no_data(tmp_path) -> None:
     assert "no data" in out.lower()
 
 
+def test_non_utf8_spool_renders_no_data_not_raise(tmp_path) -> None:
+    """A corrupted / non-UTF-8 spool must degrade to the no-data line, NOT
+    raise. ``read_text(encoding='utf-8')`` raises UnicodeDecodeError (a
+    ValueError subclass, NOT OSError), and the daemon calls this render bare
+    — an escaping raise would kill the ENTIRE brief for that run. Mutation:
+    drop the UnicodeDecodeError catch → this raises instead of returning."""
+    spool = tmp_path / "relay.md"
+    # A valid header line followed by a raw 0xFF byte (invalid UTF-8).
+    spool.write_bytes(
+        b"# STAY-C bug reports\ngenerated_at: " + _GEN_AT.encode()
+        + b"\nunresolved: 2\n\xff\xfe bad bytes\n",
+    )
+    out = render_stayc_bug_relay_section(_cfg(str(spool)), _NOW)
+    assert "no data" in out.lower()
+    assert "utf-8" in out.lower()
+
+
 # --- Staleness (dead watcher must be visible) ------------------------------
 
 

@@ -133,6 +133,22 @@ def render_stayc_bug_relay_section(config, now_utc: datetime) -> str:
             "**STAY-C bug relay: no data** — spool file unreadable "
             f"(`{spool_path}`)."
         )
+    except UnicodeDecodeError as exc:
+        # A corrupted / non-UTF-8 spool. UnicodeDecodeError subclasses
+        # ValueError (NOT OSError), so the catch above misses it — and the
+        # daemon calls this render BARE (no section-boundary guard, trusting
+        # the function to be internally total like tier/health/routine), so
+        # an escaping raise would kill the ENTIRE brief for that run. Coerce
+        # to the same visible no-data line the docstring promises. Mirrors
+        # watches.py (a3) + tier_section.py:217, which catch the same class.
+        log.warning(
+            "brief.stayc_relay", state="unreadable",
+            spool_path=spool_path, error=str(exc),
+        )
+        return (
+            "**STAY-C bug relay: no data** — spool file unreadable "
+            "(not UTF-8)."
+        )
 
     count, generated_at = _parse_spool_header(text)
 
