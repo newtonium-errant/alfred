@@ -43,23 +43,24 @@ depends on knowing these gaps:
   (a) PURE QUALITATIVE fabrication — a claim with no numbers/negations cited to
       a real segment (e.g. "history of MI" invented from a segment that never
       says it) passes CLEAN, by design (no token to check).
-  (b) WRONG-SYMPTOM negation — "Denies SOB" cited to "denies chest pain": the
-      token ``denies`` matches on both sides, the segment does not negate SOB,
-      so the (C) flip does not fire — the SYMPTOM is fabricated but passes.
-  (c) DROPPED negation in a BUNDLED (non-atomic) claim — a claim bundling a
+  (b) DROPPED negation in a BUNDLED (non-atomic) claim — a claim bundling a
       positive + a negative can hide a flipped positive inside a matching
       negation set. Delegated to the atomic-claim contract + human attest (the
       A/B corpus found ZERO flipped/dropped negations across 189 real claims —
       empirically safe; the 66%-FP set-equality "safety" was net-negative).
-  (d) COMPOSITE-number coincidence — "BP 120/80" whose digits happen to appear
+  (c) COMPOSITE-number coincidence — "BP 120/80" whose digits happen to appear
       as "Room 120, bed 80" in the cited segment passes CLEAN.
-  (e) (C)-FLIP mechanism limits — the targeted-flip check extracts the
+  (d) (C)-FLIP mechanism limits — the targeted-flip check extracts the
       finding-phrase that FOLLOWS a negation and requires it to be >=4 chars, so
       two flip shapes slip through (both SAFE-direction under-flags, backstopped
       by the atomic prompt + human attest):
-        * SHORT ABBREVIATIONS below the len>=4 filter — "denies SOB" → the
-          negated phrase "sob" (3 chars) is dropped → a "Reports SOB" flip is
-          MISSED.
+        * SHORT ABBREVIATIONS below the len>=4 filter — a POSITIVE "Reports SOB"
+          citing "denies SOB": the (C) negated-phrase "sob" (3 chars) is dropped
+          → the flip is MISSED. (NOTE: the NEGATION direction — "Denies SOB"
+          citing "denies chest pain", a fabricated pertinent-negative — IS now
+          caught by the (B) negated-CONCEPT check, which sees "sob" negated
+          NOWHERE in the cite. Only the positive-claim (C) flip retains this
+          short-abbrev gap.)
         * POST-POSITIVE negation — "bowel sounds absent" (the negation comes
           AFTER the finding) → no finding-phrase is extracted after the
           negation → a "Bowel sounds present" flip is MISSED. (The pre-finding
@@ -187,6 +188,32 @@ _CITE_NEGATION_RE = re.compile(
 # Leading quantifiers/articles stripped off a negated finding-phrase before the
 # targeted-flip check, so "denies any chest pain" → phrase "chest pain".
 _FLIP_STOPWORDS = frozenset({"any", "a", "an", "the", "his", "her", "their", "of"})
+
+# Function-word drop-set for negated-CONCEPT extraction (_negated_concepts). The
+# concept filter drops these by MEMBERSHIP, NOT by length — a length<3 drop
+# silently swallowed 2-char clinical abbreviations (MI/PE/CP/GI/GU/RR/BP/AS…),
+# so "No MI" extracted to an EMPTY concept and NEVER flagged (a fabricated
+# pertinent-negative slipping the safety net — grounding-precision review BLOCK-1).
+# Membership-drop keeps "mi"/"pe" as real concepts while still killing the
+# preposition/article FPs (a length>=2 floor alone would let "pain IN the back"
+# carry "in" and false-flag a faithful "no back pain" paraphrase). ONLY
+# unambiguous function words go here — DELIBERATELY EXCLUDES tokens that collide
+# with clinical abbreviations ("as" = aortic stenosis, "am"/"pm", "or" = OR) so a
+# real negated finding is never dropped. Includes the negation markers themselves
+# so a run-on "no fever no cough" doesn't carry "no" into the concept.
+_CONCEPT_STOPWORDS = frozenset({
+    # articles / determiners / quantifiers
+    "a", "an", "the", "any", "some", "this", "that", "these", "those",
+    "all", "each", "every", "both", "no",
+    # prepositions / particles
+    "of", "on", "in", "by", "to", "at", "up", "off", "out", "for", "per",
+    "from", "into", "onto", "over", "under", "with", "within", "about",
+    # coordinators
+    "and", "or", "nor", "but",
+    # negation markers (keep concepts free of the marker words)
+    "not", "never", "none", "neither", "denies", "denied", "deny",
+    "negative", "absent", "lacks", "lack", "without", "cannot",
+})
 
 
 @dataclass
@@ -328,8 +355,9 @@ def _negated_finding_phrases(text: str) -> list[str]:
 def _negated_concepts(text: str, neg_re: re.Pattern) -> list[set[str]]:
     """For each negation marker in ``text`` (matched by ``neg_re``), the SET of
     SALIENT content words in the phrase it governs — the run after the marker up
-    to the next punctuation / coordinator, with stopwords + sub-3-char tokens
-    dropped.
+    to the next punctuation / coordinator, with FUNCTION words dropped by
+    :data:`_CONCEPT_STOPWORDS` membership (NOT by length — a length<3 drop swallowed
+    2-char clinical abbreviations like "MI"/"PE", the BLOCK-1 false-negative).
 
     Powers the negated-CONCEPT grounding in :func:`verify` (the (B) precision
     path): a claim negation is grounded iff its concept word-set is a SUBSET of
@@ -338,7 +366,11 @@ def _negated_concepts(text: str, neg_re: re.Pattern) -> list[set[str]]:
     swelling"). Requiring the FULL word-set (not a single incidental word) keeps
     it conservative — a shared drug name alone does NOT ground a differently
     negated concept. Returns only NON-EMPTY concepts: a contentless negation (all
-    stopwords / <3-char) has no groundable finding, so it is not checked."""
+    function words) has no groundable finding, so it is not checked.
+
+    Callers pass ONE segment's text at a time (never the space-joined multi-span
+    cite) so a negation in one span cannot absorb the next span's words across the
+    join — see :func:`verify` (BLOCK-2)."""
     concepts: list[set[str]] = []
     low = text.lower()
     for m in neg_re.finditer(low):
@@ -347,8 +379,8 @@ def _negated_concepts(text: str, neg_re: re.Pattern) -> list[set[str]]:
         words = {
             tok
             for w in raw.split()
-            if (tok := w.strip(".,;:!?()[]'\"’")) and tok not in _FLIP_STOPWORDS
-            and len(tok) >= 3
+            if (tok := w.strip(".,;:!?()[]'\"’")) and len(tok) >= 2
+            and tok not in _CONCEPT_STOPWORDS
         }
         if words:
             concepts.append(words)
@@ -451,8 +483,22 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
         # POSITIVELY (targeted phrase check) — is UNCHANGED. The dropped-negation-
         # in-a-bundled-claim case stays delegated to the atomic-claim prompt +
         # human attest (the A/B corpus found ZERO across 189 real claims).
+        # BLOCK-2: extract cite negated concepts PER-SPAN (not from the
+        # space-joined `cited`). _cited_text joins spans with a bare " " and
+        # negation governance only breaks on punctuation/coordinators, so a span
+        # lacking trailing punctuation would RUN ON — a negation in span N would
+        # absorb span N+1's words ("No fever" + "reports chest pain" → one concept
+        # {fever, reports, chest, pain} ⊇ {chest, pain}) and SUPPRESS a genuine
+        # flip the cite states positively. Per-span keeps each negation's
+        # governance inside its own segment.
         claim_neg_concepts = _negated_concepts(claim.claim, _CITE_NEGATION_RE)
-        cite_neg_concepts = _negated_concepts(cited, _CITE_NEGATION_RE)
+        cite_neg_concepts: list[set[str]] = []
+        for span_id in claim.source_spans:
+            seg = seg_by_id.get(span_id)
+            if seg is not None:
+                cite_neg_concepts.extend(
+                    _negated_concepts(seg.text, _CITE_NEGATION_RE)
+                )
         ungrounded_negs = [
             c for c in claim_neg_concepts
             if not any(c <= span for span in cite_neg_concepts)

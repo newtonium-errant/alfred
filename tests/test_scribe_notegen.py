@@ -439,6 +439,82 @@ def test_grounding_negation_precision_emits_verified_log_flag_counted():
     assert verified[0]["flagged"] == 1
 
 
+# ---------------------------------------------------------------------------
+# NEGATION-PRECISION review FIX round (task #24, code-review BLOCK) — the
+# concept redesign must not open NEW false-negatives on the safety detector.
+# BLOCK-1: 2-char clinical abbreviations (MI/PE/CP/GI/GU…) must survive concept
+# extraction (a length<3 drop silently emptied "No MI" → never flagged).
+# BLOCK-2: a negation in one cite span must not RUN ON and absorb the next span's
+# words across the bare-space join (would suppress a genuine positive-assertion
+# flip on a punctuation-less multi-span cite).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("claim, segment", [
+    # BLOCK-1 FN: a fabricated 2-char pertinent-negative must FLAG. Mutation-bind:
+    # revert _negated_concepts to a `len >= 3` drop → "No MI" empties → these RED.
+    ("No MI", "Patient had an MI last year."),
+    ("No PE", "CT pulmonary angiogram was ordered."),
+    ("Denies CP", "Reports crushing CP radiating to the jaw."),
+])
+def test_grounding_negation_precision_two_char_abbrev_flags(claim, segment):
+    t = _transcript(segment)
+    s = _structured(subjective=[{"claim": claim, "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
+def test_grounding_negation_precision_multi_negation_each_abbrev_checked():
+    # BLOCK-1: a bundled multi-negation claim must check EACH 2-char abbreviation,
+    # not silently skip the ones a length filter would drop. Cite asserts CP, MI,
+    # PE positively → all three are ungrounded negations (SOB is genuinely
+    # negated nowhere too) → the claim flags rather than passing on the one
+    # 3-char token that survived a length drop.
+    t = _transcript("Reports CP and SOB. Had an MI. PE confirmed on CT.")
+    s = _structured(subjective=[
+        {"claim": "No CP, no SOB, no MI, no PE", "source_spans": ["S1"]},
+    ])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
+def test_grounding_negation_precision_two_char_abbrev_paraphrase_clean():
+    # The recall gain must not cost precision: a 2-char abbreviation negated in
+    # the cite (different marker) still grounds CLEAN.
+    t = _transcript("Patient denies any MI.")
+    s = _structured(subjective=[{"claim": "No MI", "source_spans": ["S1"]}])
+    assert verify_grounding(s, t).clean is True
+
+
+@pytest.mark.parametrize("claim, segment", [
+    # BLOCK-1 precision guard: keeping 2-char content tokens must NOT reopen the
+    # preposition/article FP class — "in"/"the"/"of" are dropped by STOPWORD
+    # membership, so a faithful paraphrase with filler prepositions stays CLEAN.
+    # Mutation-bind: a naive `len >= 2` drop WITHOUT the stopword set → these RED.
+    ("Denies pain in the back", "No back pain on exam."),
+    ("No swelling of the neck", "Patient denies neck swelling."),
+])
+def test_grounding_negation_precision_preposition_filler_stays_clean(claim, segment):
+    t = _transcript(segment)
+    s = _structured(subjective=[{"claim": claim, "source_spans": ["S1"]}])
+    assert verify_grounding(s, t).clean is True
+
+
+@pytest.mark.parametrize("fever_span", ["No fever", "No fever."])
+def test_grounding_negation_precision_multi_span_no_runon_absorption(fever_span):
+    # BLOCK-2 FN: "Denies chest pain" citing ["No fever", "reports chest pain"]
+    # must FLAG regardless of S1's trailing punctuation — the second span ASSERTS
+    # chest pain positively, so the negation is a flip that must not be suppressed
+    # by the first span's negation running on across the bare-space join.
+    # Mutation-bind: compute cite concepts from the space-joined `cited` instead
+    # of per-span → the parametrization WITHOUT the period ("No fever") goes RED.
+    t = _transcript(fever_span, "reports chest pain")
+    s = _structured(subjective=[
+        {"claim": "Denies chest pain", "source_spans": ["S1", "S2"]},
+    ])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
 def test_grounding_catches_ungrounded_span_S99():
     t = _transcript("Patient reports chest pain.")
     s = _structured(subjective=[{"claim": "Chest pain", "source_spans": ["S99"]}])
