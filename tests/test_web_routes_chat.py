@@ -329,6 +329,26 @@ async def test_session_persisted_under_synthetic_id(web_client) -> None:
     assert active["chat_id"] == synthetic_chat_id("andrew")
 
 
+async def test_open_stashes_timeout_close_contract(web_client) -> None:
+    """Talker web-session hygiene (fix 2 + fix 4): ``/chat/open`` stashes the
+    timeout-close contract metadata so the daemon idle-timeout sweeper can
+    close an idle web session — WITHOUT ``_vault_path_root`` the sweeper
+    skips it and the PWA session stays open for days (date-drift). Also pins
+    ``_stt_model_used`` (web-voice records previously carried ``stt_model:
+    ''``) and the ``conversation`` session type. Mutation: remove the
+    ``stash_close_contract_metadata`` call in ``_handle_chat_open`` → these
+    ``_*`` keys are absent and this fails."""
+    state_mgr = web_client.app["_t_state_mgr"]
+    talker_config = web_client.app["_t_talker_config"]
+    await web_client.post("/chat/open", json={}, headers=_session_headers())
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    assert active["_vault_path_root"] == talker_config.vault.path
+    assert active["_stt_model_used"] == "whisper-large-v3"
+    assert active["_session_type"] == "conversation"
+    assert active["_tool_set"] == talker_config.instance.tool_set
+    assert active["_user_vault_path"] == "person/Andrew Newton"
+
+
 # ---------------------------------------------------------------------------
 # Relay mode (cross-instance chat) — asserted X-Alfred-User identity
 # ---------------------------------------------------------------------------
@@ -492,6 +512,16 @@ async def test_reopen_archives_prior_session(web_client) -> None:
 
     r = await web_client.post("/chat/open", json={}, headers=headers)
     first_key = (await r.json())["session_key"]
+
+    # Send a real turn so the prior session is non-empty — an EMPTY reopen
+    # writes no record (empty-session suppression, tested separately); this
+    # test's intent is the archive path, which requires content to archive.
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": first_key, "message": "hi there"},
+        headers=headers,
+    )
+    assert r.status == 200
 
     r = await web_client.post("/chat/open", json={}, headers=headers)
     second_key = (await r.json())["session_key"]

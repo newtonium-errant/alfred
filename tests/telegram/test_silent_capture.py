@@ -246,9 +246,16 @@ async def test_inline_end_still_fires_during_capture(
     space + slash matches the boundary regex).
     """
     _seed_capture_session(state_mgr, chat_id=3)
-    # /end needs a writeable vault path.
+    # /end needs a writeable vault path. Seed a real transcript turn too so
+    # the session is non-empty — the empty-session suppression (talker
+    # web-session hygiene) writes NO record for a 0-turn close, and this
+    # test's intent is the normal capture-close path.
     active = state_mgr.get_active(3)
     active["_vault_path_root"] = talker_config.vault.path
+    active["transcript"] = [
+        {"role": "user", "content": "dictated capture content"},
+        {"role": "assistant", "content": "noted"},
+    ]
     state_mgr.set_active(3, active)
     state_mgr.save()
 

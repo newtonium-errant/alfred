@@ -219,8 +219,16 @@ async def test_inline_end_closes_session(
     """``Good. /end`` dispatches to on_end → session closes, record written."""
     _seed_active_session(state_mgr, chat_id=1)
     # on_end needs a vault_path_root that exists for the session record.
+    # Seed a real transcript turn so the session is non-empty — the
+    # empty-session suppression (talker web-session hygiene) writes NO
+    # record for a 0-turn close, and this test's intent is the record-
+    # written path.
     active = state_mgr.get_active(1)
     active["_vault_path_root"] = talker_config.vault.path
+    active["transcript"] = [
+        {"role": "user", "content": "earlier context"},
+        {"role": "assistant", "content": "noted"},
+    ]
     state_mgr.set_active(1, active)
     state_mgr.save()
 

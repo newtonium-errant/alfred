@@ -1805,6 +1805,17 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"couldn't close session: {exc}")
         return
 
+    # Empty session (opened, /end'd without any turns): ``close_session``
+    # returned "" and wrote no record. Nothing to rename, calibrate, or
+    # structure — reply plainly and return before the post-close work, all
+    # of which needs a real ``rel_path``. Keep the "session closed." prefix
+    # so the acknowledge shape stays consistent with the normal close reply.
+    if not rel_path:
+        await update.message.reply_text(
+            "session closed. it was empty — nothing to save."
+        )
+        return
+
     log.info("talker.bot.session_closed", chat_id=chat_id, record=rel_path)
 
     # --- Substance-slug rename (Phase 2 deferred-enhancement #1) --------
@@ -4544,28 +4555,26 @@ def _open_session_with_stash(
     sess = session.open_session(
         state_mgr, chat_id, model or config.anthropic.model,
     )
-    # Re-read the active dict, stamp the contract fields, save.
-    active = state_mgr.get_active(chat_id) or {}
-    active["_vault_path_root"] = config.vault.path
-    active["_user_vault_path"] = (
-        config.primary_users[0] if config.primary_users else ""
-    )
-    active["_stt_model_used"] = config.stt.model
-    active["_session_type"] = session_type
-    active["_continues_from"] = continues_from
-    if pushback_level is not None:
-        active["_pushback_level"] = pushback_level
-    # Per-instance session-save shape contract: all registered tool_sets
-    # emit ``<mode>-<date>-<slug>-<short-id>``; unknown / empty
+    # Stamp the timeout-close contract fields via the shared helper (single
+    # source of truth for both the Telegram and web openers). ``_tool_set``
+    # rides the per-instance session-save shape contract: all registered
+    # tool_sets emit ``<mode>-<date>-<slug>-<short-id>``; unknown / empty
     # ``tool_set`` falls back to the wk1 ``Voice Session — ...`` filename.
-    # Stashed at open so timeout / startup-sweep close paths can route
-    # correctly even when the config object isn't accessible from the
-    # close site.
-    active["_tool_set"] = config.instance.tool_set or ""
-    # Voice / text counts are derived from per-turn ``_kind`` at close
-    # time by ``_count_message_kinds`` — no state-dict counter needed.
-    state_mgr.set_active(chat_id, active)
-    state_mgr.save()
+    # Voice / text counts are derived from per-turn ``_kind`` at close time
+    # by ``_count_message_kinds`` — no state-dict counter needed.
+    session.stash_close_contract_metadata(
+        state_mgr,
+        chat_id,
+        vault_path_root=config.vault.path,
+        user_vault_path=(
+            config.primary_users[0] if config.primary_users else ""
+        ),
+        stt_model_used=config.stt.model,
+        session_type=session_type,
+        tool_set=config.instance.tool_set or "",
+        continues_from=continues_from,
+        pushback_level=pushback_level,
+    )
     return sess
 
 
