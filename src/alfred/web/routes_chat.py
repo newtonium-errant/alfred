@@ -477,6 +477,7 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
         close_session,
         is_capture_candidate,
         open_session,
+        stash_close_contract_metadata,
     )
 
     existing = state_mgr.get_active(identity.synthetic_chat_id)
@@ -503,7 +504,13 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
                 chat_id=identity.synthetic_chat_id,
                 reason="web_session_reopened",
                 user_vault_path=primary_users[0] if primary_users else None,
-                stt_model_used="",
+                # Stamp the configured STT model on the record (parity with
+                # Telegram, which stashes ``config.stt.model`` at open). Web
+                # voice records previously carried ``stt_model: ''`` — the
+                # divergence data existed in talker.log but never landed on
+                # the record. The daemon idle-timeout close path reads the
+                # same value off ``_stt_model_used`` (stashed at open below).
+                stt_model_used=talker_config.stt.model,
                 session_type=prior_type,
                 tool_set=talker_config.instance.tool_set,
             )
@@ -556,6 +563,26 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
         state_mgr,
         identity.synthetic_chat_id,
         model=talker_config.anthropic.model,
+    )
+    # Stash the timeout-close contract metadata (fix: web sessions never
+    # timed out). Without ``_vault_path_root`` the daemon idle-timeout
+    # sweeper SKIPS the session, so a PWA session stayed open for days until
+    # the next reopen closed it — filing the record under a ``started_at``
+    # date 1-3 days behind the actual content. With the stash, the sweeper
+    # closes an idle web session on the same ``gap_timeout_seconds`` cadence
+    # as Telegram, so the record's ``created`` date tracks the content.
+    # Web sessions are always ``session_type="conversation"`` (no web
+    # /capture, no web /note). ``_stt_model_used`` carries the configured
+    # STT model onto the eventual record (web-voice stt_model parity).
+    open_primary_users = getattr(talker_config, "primary_users", None) or []
+    stash_close_contract_metadata(
+        state_mgr,
+        identity.synthetic_chat_id,
+        vault_path_root=talker_config.vault.path,
+        user_vault_path=open_primary_users[0] if open_primary_users else "",
+        stt_model_used=talker_config.stt.model,
+        session_type="conversation",
+        tool_set=talker_config.instance.tool_set or "",
     )
     log.info(
         "web.chat.session_opened",

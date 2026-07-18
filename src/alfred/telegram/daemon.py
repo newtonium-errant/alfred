@@ -362,6 +362,10 @@ async def _close_open_sessions_on_shutdown(
                 error=str(exc),
             )
             continue
+        # Empty session: ``close_session`` wrote no record (returned "") and
+        # logged ``closed_empty`` — no path to report, no file to slug-rename.
+        if not rel_path:
+            continue
         closed_paths.append(rel_path)
         # Phase 2 deferred-enhancement #1 — same hook as the
         # in-flight sweeper. Best-effort; the session record is

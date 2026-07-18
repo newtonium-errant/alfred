@@ -1552,8 +1552,12 @@ def cmd_talker(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to close session: {exc}")
             sys.exit(1)
+        # Empty session: ``close_session`` returned "" (no record written) —
+        # surface that explicitly rather than printing a blank record path.
         if wants_json:
             print(json.dumps({"chat_id": chat_id, "record_path": rel_path}, indent=2))
+        elif not rel_path:
+            print(f"Closed session for chat_id={chat_id} (empty — no record written)")
         else:
             print(f"Closed session for chat_id={chat_id}")
             print(f"  Record: {rel_path}")

@@ -1098,6 +1098,56 @@ def open_session(
     return session
 
 
+def stash_close_contract_metadata(
+    state: StateManager,
+    chat_id: int,
+    *,
+    vault_path_root: str,
+    user_vault_path: str,
+    stt_model_used: str,
+    session_type: str,
+    tool_set: str,
+    continues_from: str | None = None,
+    pushback_level: int | None = None,
+) -> None:
+    """Stamp the timeout-close contract metadata onto an active session dict.
+
+    The timeout-driven close paths (:func:`check_timeouts_with_meta`,
+    :func:`resolve_on_startup`, the daemon shutdown sweep) read these
+    stashed ``_*`` fields off the active dict so they can close a session
+    correctly WITHOUT a live config handle. ``_vault_path_root`` in
+    particular is load-bearing: a session that lacks it is SKIPPED by every
+    sweeper (``if not vault_path_root: continue``), so it never times out.
+
+    Both the Telegram opener (``bot._open_session_with_stash``) and the web
+    opener (``web.routes_chat._handle_chat_open``) call this, so the
+    open-time contract has a single source of truth and the two channels
+    stay in sync. The web channel previously stashed NONE of these — so PWA
+    sessions never timed out and stayed open for days, drifting the eventual
+    record's ``created`` date 1-3 days behind the actual content.
+
+    ``_stt_model_used`` is stamped here at OPEN time (mirroring Telegram) so
+    the eventual record carries the configured STT model even on the web
+    voice path, where the chat session is decoupled from the ``/stt``
+    endpoint that actually transcribed the audio.
+
+    ``_continues_from`` is stamped unconditionally (may be ``None``);
+    ``_pushback_level`` only when provided — matching the pre-refactor
+    Telegram stash exactly.
+    """
+    active = state.get_active(chat_id) or {}
+    active["_vault_path_root"] = vault_path_root
+    active["_user_vault_path"] = user_vault_path
+    active["_stt_model_used"] = stt_model_used
+    active["_session_type"] = session_type
+    active["_continues_from"] = continues_from
+    if pushback_level is not None:
+        active["_pushback_level"] = pushback_level
+    active["_tool_set"] = tool_set
+    state.set_active(chat_id, active)
+    state.save()
+
+
 def append_turn(
     state: StateManager,
     session: Session,
@@ -1339,7 +1389,11 @@ def resolve_on_startup(
                 pushback_level=raw.get("_pushback_level"),
                 tool_set=raw.get("_tool_set", ""),
             )
-            closed_paths.append(path)
+            # Empty sessions close with no record (``close_session`` returns
+            # "" and logs ``closed_empty``) — nothing to report as a written
+            # path.
+            if path:
+                closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001 — log and continue sweep
             log.warning(
                 "talker.session.close_failed",
@@ -1410,6 +1464,11 @@ def check_timeouts_with_meta(
                 error=str(exc),
             )
             continue
+        # Empty session: ``close_session`` wrote no record (returned "") — no
+        # rel_path to finalize, so there's nothing for the sweeper's
+        # substance-slug / capture-structuring hook to act on. Skip the meta.
+        if not path:
+            continue
         closed_meta.append({
             "chat_id": int(chat_id_str),
             "session_id": session_id_snap,
@@ -1466,6 +1525,42 @@ def close_session(
 
     session = Session.from_dict(active_dict)
     ended_at = _now_utc()
+
+    # Empty-session suppression (talker web-session hygiene batch, 2026-07).
+    # A session that closes with NOTHING in it — no transcript turns, no
+    # vault ops, no image/document attachments — has nothing worth
+    # archiving. This is the PWA open-then-reopen churn (a session
+    # auto-opened on page load and closed by the next ``web_session_reopened``
+    # without the user ever sending a message), plus the idle-Telegram and
+    # shutdown-of-a-fresh-open cases. Writing a ``…-untitled-…`` stub
+    # (~860B) into ``session/`` — which lives in ``dont_scan_dirs`` so the
+    # janitor never reaps it — is pure noise that accumulates. Suppress the
+    # vault write and emit the intentionally-left-blank signal so "closed
+    # empty" is distinguishable from "close failed"; that log line IS the
+    # audit trail. We pop the active session but do NOT append a
+    # ``closed_sessions`` entry — an empty session produced no record, so a
+    # ``record_path: ""`` entry would only pollute the router's continuation
+    # history and ``alfred talker history``. Returns ``""`` so callers skip
+    # post-close work (substance-slug rename, capture-structuring) that would
+    # have no target record.
+    if not (
+        session.transcript
+        or session.vault_ops
+        or session.images
+        or session.documents
+    ):
+        state.pop_active(chat_id)
+        state.save()
+        log.info(
+            "talker.session.closed_empty",
+            chat_id=chat_id,
+            session_id=session.session_id,
+            reason=reason,
+            session_type=session_type,
+            detail="idle, nothing to persist — no session record written",
+        )
+        return ""
+
     # Per-instance mode resolution: registered tool_sets infer mode from
     # transcript + session_type; unknown/empty tool_set returns "" and
     # the wk1 ``Voice Session — ...`` filename is used.
