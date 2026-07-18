@@ -17,19 +17,24 @@ Checks per claim (each failure ⇒ a flag):
                                           is a legitimate summary, not flagged.
                                           Decimal-boundary-safe: 5mg never
                                           matches 0.5mg / 2.5mg / 12.5mg.)
-  4. NEGATION — INVENTED or FLIPPED  → ``negation_mismatch`` (P2-e redesign,
-     (B) the claim asserts a negation     REPLACES the P2-c bidirectional
-         NOT in the cited segment;        set-EQUALITY. Set-equality was
-     (C) the cited segment NEGATES a      empirically CATASTROPHIC — 66% flag
-         finding the claim asserts        rate — because it is incompatible with
-         POSITIVELY (targeted phrase      the atomic-claim design: an atomic
-         check, not set-diff).            claim carries a SUBSET of its
-                                          multi-finding segment's negations, so
-                                          it could NEVER equal the full set →
-                                          near-everything flagged → alarm
-                                          fatigue. The SUBSET case is now CLEAN;
-                                          (B) invented + (C) targeted-flip keep
-                                          the real safety catches.)
+  4. NEGATION — INVENTED or FLIPPED  → ``negation_mismatch`` (P2-f: (B) is
+     (B) the claim negates a CONCEPT      negated-CONCEPT grounding — a claim
+         the cited segment does NOT       negation is grounded iff the CITE
+         also negate (in ANY surface      negates the SAME concept in ANY surface
+         form / marker);                  form (contraction-aware); a concept
+     (C) the cited segment NEGATES a      negated NOWHERE in the cite flags.
+         finding the claim asserts        REPLACES the P2-e marker SET-DIFFERENCE,
+         POSITIVELY (targeted phrase      which false-flagged faithful paraphrases
+         check, not set-diff).            that realize the same pertinent-negative
+                                          with a DIFFERENT negation surface ("no
+                                          X" vs "haven't noticed any X"). The
+                                          lexically-DISJOINT-paraphrase residual
+                                          ("not adequately controlled" vs "haven't
+                                          come down as hoped") stays FLAGGED by
+                                          design → the #26 learned-suppression
+                                          loop, not a looser threshold. (C)
+                                          targeted-flip unchanged. Atomic-claim
+                                          SUBSET case stays CLEAN.)
 
 ⚠️ NOT caught here — relies on the extract-not-infer PROMPT (prompt-tuner) +
 the human ATTEST. This gate verifies mechanical grounding, NOT meaning. An
@@ -153,6 +158,29 @@ _BARE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 _NEGATION_RE = re.compile(
     r"\b(no|not|denies|denied|deny|without|negative|none|never|absent|"
     r"neither|nor|lacks?)\b",
+    re.IGNORECASE,
+)
+
+# EXTENDED negation lexicon — the base clinical set PLUS English CONTRACTED
+# negations ("haven't", "wouldn't", …). Used ONLY by the cite-side negated-CONCEPT
+# grounding in verify() (the (B) precision path), NEVER by _negation_set / the
+# (C) flip / inferred_dx. DELIBERATELY separate from the shared _NEGATION_RE:
+# inferred_dx.py reuses _NEGATION_RE for hedge detection and the _negation_set
+# membership pins assert its exact set — folding contractions into the shared
+# regex would couple this precision fix to those and risk churn. Isolation keeps
+# the blast radius to grounding. The contraction set is kept reasonably COMPLETE
+# so a stray contraction can't reopen the lexicon-gap FP class this redesign
+# closes. The ``['’]t`` is REQUIRED (never optional) — a bare "can"/"won"/"don"
+# is the modal/verb/name, NOT a negation; only the contracted form negates. The
+# apostrophe class ['’] matches straight AND curly quotes (transcripts carry
+# either).
+_CITE_NEGATION_RE = re.compile(
+    r"\b(?:"
+    r"no|not|denies|denied|deny|without|negative|none|never|absent|"
+    r"neither|nor|lacks?|cannot"
+    r"|(?:haven|hasn|hadn|wouldn|couldn|shouldn|didn|doesn|don|isn|aren"
+    r"|wasn|weren|won|can)['’]t"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -297,6 +325,36 @@ def _negated_finding_phrases(text: str) -> list[str]:
     return phrases
 
 
+def _negated_concepts(text: str, neg_re: re.Pattern) -> list[set[str]]:
+    """For each negation marker in ``text`` (matched by ``neg_re``), the SET of
+    SALIENT content words in the phrase it governs — the run after the marker up
+    to the next punctuation / coordinator, with stopwords + sub-3-char tokens
+    dropped.
+
+    Powers the negated-CONCEPT grounding in :func:`verify` (the (B) precision
+    path): a claim negation is grounded iff its concept word-set is a SUBSET of
+    some cite negated concept — matching the negated MEANING regardless of the
+    negation's surface form ("no neck swelling" ⊆ "haven't noticed any neck
+    swelling"). Requiring the FULL word-set (not a single incidental word) keeps
+    it conservative — a shared drug name alone does NOT ground a differently
+    negated concept. Returns only NON-EMPTY concepts: a contentless negation (all
+    stopwords / <3-char) has no groundable finding, so it is not checked."""
+    concepts: list[set[str]] = []
+    low = text.lower()
+    for m in neg_re.finditer(low):
+        tail = low[m.end():]
+        raw = re.split(r"[.,;:]| and | or | nor | but | with ", tail, maxsplit=1)[0]
+        words = {
+            tok
+            for w in raw.split()
+            if (tok := w.strip(".,;:!?()[]'\"’")) and tok not in _FLIP_STOPWORDS
+            and len(tok) >= 3
+        }
+        if words:
+            concepts.append(words)
+    return concepts
+
+
 def _flipped_positive_findings(claim_text: str, cited_text: str) -> list[str]:
     """Targeted FLIP check (C): findings the cited segment NEGATES that the
     claim asserts POSITIVELY. Only applies to a positive claim (one that carries
@@ -364,32 +422,48 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
                 f"number_mismatch: {missing_nums} not verbatim in cited segment(s)"
             )
 
-        # (4) NEGATION check — INVENTED + targeted FLIP (P2-e redesign).
+        # (4) NEGATION check — negated-CONCEPT grounding (B) + targeted FLIP (C).
         #
-        # REPLACES the P2-c bidirectional set-EQUALITY, which was empirically
-        # catastrophic: it is FUNDAMENTALLY incompatible with the atomic-claim
-        # design we mandated in P2-c — each atomic claim carries a SUBSET of its
-        # multi-finding segment's negations, so it could NEVER equal the full
-        # set → 66% flag rate (~all negation_mismatch), alarm fatigue, the ⚠
-        # that matters ignored. The subset case is now CLEAN.
+        # (B) is the P2-f PRECISION redesign, replacing the P2-e marker
+        # SET-DIFFERENCE (claim_negs - cited_negs). Set-difference compared
+        # negation MARKER TOKENS by lexical identity, so a faithful paraphrase
+        # realizing the SAME pertinent-negative with a DIFFERENT negation surface
+        # false-flagged as "invented": "no neck swelling" vs "haven't noticed any
+        # neck swelling", "denies a plan" vs "wouldn't do anything" ("haven't"/
+        # "wouldn't" aren't even in the base lexicon → cited_negs empty). That FP
+        # class is the medico-legal detector "crying wolf."
         #
-        # Two genuine-error catches preserve the real safety intent:
-        #   (B) INVENTED negation — the claim asserts a negation NOT present in
-        #       the cited segment (claim_negs ⊄ cited_negs).
-        #   (C) FLIPPED negation — the cited segment NEGATES a finding that the
-        #       claim asserts POSITIVELY (targeted phrase check, not set-diff).
-        # The dropped-negation-in-a-bundled-claim case is delegated to the
-        # atomic-claim prompt + human attest (the A/B corpus found ZERO
-        # flipped/dropped negations across 189 real claims — empirically safe).
-        claim_negs = _negation_set(claim.claim)
-        cited_negs = _negation_set(cited)
-        invented = claim_negs - cited_negs
+        # Now: for each CONCEPT the CLAIM negates (its salient word-set), the
+        # negation is GROUNDED iff the CITE negates the SAME concept — the claim
+        # word-set is a SUBSET of some cite negated concept — in ANY surface form
+        # (different marker OK; contraction-aware via _CITE_NEGATION_RE). A claim
+        # negation whose concept is negated NOWHERE in the cite still FLAGS
+        # (invented, or the cite asserts it positively — e.g. "Denies chest pain"
+        # vs "reports chest pain": no cite negation → flagged). CONSERVATIVE by
+        # design: requiring the FULL word-set (not a single incidental overlap —
+        # a shared drug name) keeps a lexically-DISJOINT paraphrase FLAGGED ("not
+        # adequately controlled" vs "haven't come down as hoped" — only "metformin"
+        # overlaps); that residual class's home is the #26 learned-suppression
+        # loop, NOT a looser threshold (loosening would drop genuine invented
+        # negations — the false-NEGATIVE that matters most here).
+        #
+        # (C) FLIPPED — the cited segment NEGATES a finding the claim asserts
+        # POSITIVELY (targeted phrase check) — is UNCHANGED. The dropped-negation-
+        # in-a-bundled-claim case stays delegated to the atomic-claim prompt +
+        # human attest (the A/B corpus found ZERO across 189 real claims).
+        claim_neg_concepts = _negated_concepts(claim.claim, _CITE_NEGATION_RE)
+        cite_neg_concepts = _negated_concepts(cited, _CITE_NEGATION_RE)
+        ungrounded_negs = [
+            c for c in claim_neg_concepts
+            if not any(c <= span for span in cite_neg_concepts)
+        ]
         flipped = _flipped_positive_findings(claim.claim, cited)
-        if invented or flipped:
+        if ungrounded_negs or flipped:
             detail: list[str] = []
-            if invented:
+            if ungrounded_negs:
+                pretty = [" ".join(sorted(c)) for c in ungrounded_negs]
                 detail.append(
-                    f"invented negation(s) {sorted(invented)} not in cited segment(s)"
+                    f"invented negation(s) {pretty} not negated in cited segment(s)"
                 )
             if flipped:
                 detail.append(

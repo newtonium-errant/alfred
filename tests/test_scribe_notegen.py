@@ -309,6 +309,136 @@ def test_grounding_non_free_prefixes_stay_clean_no_new_fp(claim, segment):
     assert verify_grounding(s, t).clean is True
 
 
+# ---------------------------------------------------------------------------
+# NEGATION-PRECISION redesign (P2-f, task #24) — negated-CONCEPT grounding
+# replaces the P2-e marker SET-DIFFERENCE. A faithful paraphrase realizing the
+# same pertinent-negative with a DIFFERENT negation surface form (or a
+# contraction the base lexicon misses) must NOT false-flag as invented, WHILE a
+# genuinely invented / flipped negation still flags (recall preserved).
+# These 3 PRECISION cases are the exact false positives the #16 eval corpus's
+# first run surfaced — reproduced inline (claim + cited segment verbatim) from
+# the eval fixtures so the pin is self-contained. Mutation-bind: revert (B) to
+# `_negation_set(claim) - _negation_set(cited)` → cases 1 & 3 go RED.
+# ---------------------------------------------------------------------------
+
+def test_grounding_negation_precision_no_neck_swelling_clean():
+    # #24 case 1 — fab_fatigue_nodx_ambient: "no X" grounded by "haven't noticed
+    # any X" (a contraction the base lexicon doesn't even see). Faithful → CLEAN.
+    t = _transcript(
+        "I've just been wiped out for about a month. And my hair seems a bit "
+        "thinner. But my weight's the same and I haven't noticed any neck swelling."
+    )
+    s = _structured(subjective=[
+        {"claim": "Weight unchanged, no neck swelling", "source_spans": ["S1"]},
+    ])
+    assert verify_grounding(s, t).clean is True
+
+
+def test_grounding_negation_precision_denies_plan_clean():
+    # #24 case 3 — mh_passive_si: "denies a plan" grounded by "Not like a plan",
+    # "would not wake up" grounded by "wouldn't wake up" (contraction). CLEAN.
+    t = _transcript(
+        "The back's the same. Honestly, though, I've been really low lately. Some "
+        "mornings I just lie there and wonder what the point of it all is.",
+        "Not like a plan or anything. Just... sometimes I wish I wouldn't wake up. "
+        "I wouldn't do anything.",
+    )
+    s = _structured(subjective=[{
+        "claim": (
+            "Expresses passive suicidal ideation — wonders what the point is "
+            "and at times wishes she would not wake up; denies a plan or intent to act"
+        ),
+        "source_spans": ["S1", "S2"],
+    }])
+    assert verify_grounding(s, t).clean is True
+
+
+def test_grounding_negation_precision_lexically_disjoint_paraphrase_STILL_FLAGS():
+    # #24 case 2 — drug_switch_empagliflozin: "not adequately controlled" ≈
+    # "haven't come down as hoped" is a faithful paraphrase BUT the negated
+    # concepts are lexically DISJOINT (only "metformin" overlaps). v1 keeps this
+    # FLAGGED — loosening to catch it would drop genuine invented negations (the
+    # false-NEGATIVE that matters most on a medico-legal detector). This pin
+    # FLIPS to clean when the #26 learned-suppression loop lands; until then it
+    # tracks the residual as a deliberate, documented FLAG.
+    t = _transcript("Your sugars haven't come down the way I'd hoped on the metformin.")
+    s = _structured(objective=[
+        {"claim": "Blood sugars not adequately controlled on metformin",
+         "source_spans": ["S1"]},
+    ])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
+@pytest.mark.parametrize("claim, segment", [
+    # RECALL guard (the false-NEGATIVE risk of concept-grounding): a claim
+    # negation whose concept is NOT negated in the cite must still FLAG even when
+    # the cite carries an UNRELATED negation that shares an incidental word.
+    # "chest pain" ⊄ "chest tube" — "pain" absent → the shared "chest" does NOT
+    # ground it. Mutation-bind: a single-word-overlap suppression → this goes RED.
+    ("Denies chest pain", "No chest tube placed; chest tube is absent."),
+    # A shared DRUG NAME does not ground a differently negated concept (this is
+    # exactly why case 2 above stays flagged, stated as a recall guard).
+    ("Denies taking metformin", "Sugars haven't come down on the metformin."),
+])
+def test_grounding_negation_precision_incidental_overlap_still_flags(claim, segment):
+    t = _transcript(segment)
+    s = _structured(subjective=[{"claim": claim, "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
+def test_grounding_negation_precision_wrong_symptom_now_caught():
+    # BONUS recall gain: concept-grounding CLOSES the documented "(b) wrong-
+    # symptom" gap the old marker-identity (B) missed. "Denies SOB" cited to
+    # "denies chest pain" — the marker "denies" matched on both sides so P2-e
+    # passed it CLEAN; P2-f sees SOB is negated NOWHERE in the cite → FLAG.
+    t = _transcript("Patient denies chest pain.")
+    s = _structured(subjective=[{"claim": "Denies SOB", "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
+def test_grounding_negation_precision_emits_verified_log_paraphrase_clean():
+    # LOG-EMISSION pin (standing discipline): the negated-concept-grounding path
+    # MUST drive the production `scribe.grounding.verified` emission, and a
+    # faithful paraphrase must report flagged=0 (not silently degrade). Pins the
+    # key `flagged` field so a future refactor that drops the log OR mis-counts
+    # goes red, not just green-because-untested.
+    import structlog
+
+    t = _transcript(
+        "But my weight's the same and I haven't noticed any neck swelling."
+    )
+    s = _structured(subjective=[
+        {"claim": "No neck swelling", "source_spans": ["S1"]},
+    ])
+    with structlog.testing.capture_logs() as cap:
+        r = verify_grounding(s, t)
+    assert r.clean is True
+    verified = [e for e in cap if e.get("event") == "scribe.grounding.verified"]
+    assert len(verified) == 1
+    assert verified[0]["flagged"] == 0
+    assert verified[0]["total_claims"] == 1
+
+
+def test_grounding_negation_precision_emits_verified_log_flag_counted():
+    # Partner to the clean-path log pin: a genuinely invented negation increments
+    # the emitted `flagged` count (the observability the operator greps on).
+    import structlog
+
+    t = _transcript("Patient reports headache.")
+    s = _structured(objective=[
+        {"claim": "Denies chest pain", "source_spans": ["S1"]},
+    ])
+    with structlog.testing.capture_logs() as cap:
+        r = verify_grounding(s, t)
+    assert not r.clean
+    verified = [e for e in cap if e.get("event") == "scribe.grounding.verified"]
+    assert len(verified) == 1
+    assert verified[0]["flagged"] == 1
+
+
 def test_grounding_catches_ungrounded_span_S99():
     t = _transcript("Patient reports chest pain.")
     s = _structured(subjective=[{"claim": "Chest pain", "source_spans": ["S99"]}])
