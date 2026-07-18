@@ -198,8 +198,11 @@ _FLIP_STOPWORDS = frozenset({"any", "a", "an", "the", "his", "her", "their", "of
 # preposition/article FPs (a length>=2 floor alone would let "pain IN the back"
 # carry "in" and false-flag a faithful "no back pain" paraphrase). ONLY
 # unambiguous function words go here — DELIBERATELY EXCLUDES tokens that collide
-# with clinical abbreviations ("as" = aortic stenosis, "am"/"pm", "or" = OR) so a
-# real negated finding is never dropped. Includes the negation markers themselves
+# with clinical abbreviations ("as" = aortic stenosis, "am"/"pm") so a real negated
+# finding is never dropped. NB "or" IS kept in the coordinators set below (dropped):
+# "OR" = operating-room as a negated finding is vanishingly rare AND " or " is already
+# a finding-phrase boundary, so dropping the coordinator can't lose a real concept.
+# Includes the negation markers themselves
 # so a run-on "no fever no cough" doesn't carry "no" into the concept.
 _CONCEPT_STOPWORDS = frozenset({
     # articles / determiners / quantifiers
