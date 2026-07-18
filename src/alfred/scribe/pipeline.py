@@ -159,12 +159,12 @@ async def generate_verified_note(
     body in the pipeline.
     """
     structured = await generate_structured(transcript, config=config)
-    return render_verified_note(structured, transcript, config=config, title=title)
+    return render_verified_note(structured, transcript, config=config, title=title, events=events)
 
 
 def render_verified_note(
     structured: StructuredNote, transcript: Transcript, *, config: ScribeConfig,
-    title: str,
+    title: str, events: "ScribeEvents | None" = None,
 ) -> VerifiedNote:
     """The POST-generation composition of :func:`generate_verified_note` — verify
     → #48 inferred-dx → P4-2 speaker-attribution → render, on the SAME structured

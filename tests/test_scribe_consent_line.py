@@ -162,10 +162,31 @@ def test_pipeline_no_events_no_consent_line(tmp_path, monkeypatch):
     assert "> Consent:" not in vnote.body       # no facade threaded in → no line
 
 
+def _pipeline_func_body(name: str) -> str:
+    # Read the pipeline source ONCE from disk and slice a function body by def-boundary — no
+    # inspect.getsource of live function objects (deterministic under the full-suite run; the
+    # same de-flake pattern used for the render-choke structural pin). Handles ``async def`` too.
+    import pathlib
+    import re
+    src = pathlib.Path(pipeline_mod.__file__).read_text(encoding="utf-8")
+    m = re.search(rf"^(async def|def) {re.escape(name)}\(", src, re.M)
+    start = m.start()
+    nxt = re.search(r"^(async def|def) ", src[start + 1:], re.M)
+    return src[start:(start + 1 + nxt.start()) if nxt else len(src)]
+
+
 def test_consent_line_composed_after_render_and_llm(tmp_path):
-    # structural pin: in the choke, the consent line is composed AFTER both generate_structured
-    # (the LLM call) and render_soap — it can never be part of what the model is asked to produce.
-    choke = inspect.getsource(pipeline_mod.generate_verified_note)
-    assert "consent_line(" in choke
-    assert choke.index("generate_structured(") < choke.index("consent_line(")
-    assert choke.index("render_soap(") < choke.index("consent_line(")
+    # structural pin: the consent line is composed AFTER both generate_structured (the LLM call)
+    # and render_soap — it can never be part of what the model is asked to produce. Post-#16
+    # refactor, generate_structured runs in the async ``generate_verified_note`` which delegates
+    # to the sync ``render_verified_note`` (render_soap + the consent-line prepend); the ordering
+    # holds ACROSS the two functions.
+    gen = _pipeline_func_body("generate_verified_note")
+    render = _pipeline_func_body("render_verified_note")
+    # the LLM call is in the async entry, strictly before it delegates to render:
+    assert "generate_structured(" in gen
+    assert gen.index("generate_structured(") < gen.index("render_verified_note(")
+    # the consent line composes in render, after render_soap, and NEVER in the LLM-facing entry:
+    assert "consent_line(" in render
+    assert render.index("render_soap(") < render.index("consent_line(")
+    assert "consent_line(" not in gen
