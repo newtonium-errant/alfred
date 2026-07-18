@@ -123,8 +123,11 @@ switch (scenario) {
   case 'enroll_capture_races_encounter_start':
     // instantWindow: the encounter must actually COMPLETE a window, so "the encounter ran
     // normally" is asserted on a real chunk POST rather than on the absence of a failure.
+    // #12 12c: the mic claim now lives in beginCapture() (after the consent await), so
+    // holdFirstGetUserMedia parks the ENCOUNTER's getUserMedia to reconstruct the micro-window
+    // (micOwner claimed, `recording` still false) the staged enrolment must lose against.
     cfg.presets = [USABLE('pst-a', 'Room A')]; cfg.mru = 'pst-a';
-    cfg.serverState = 'ok'; cfg.instantWindow = true; break;
+    cfg.serverState = 'ok'; cfg.instantWindow = true; cfg.holdFirstGetUserMedia = true; break;
   // THE GENERATION-TOKEN BLOCK — a teardown interposed DURING captureEnroll's own awaits. Each
   // holds one await open, so the interaction can navigate away before it resolves. instantWindow
   // lets the FOLLOW-ON encounter complete a real chunk, proving the mic claim was released.
@@ -267,7 +270,9 @@ for (const id of ['status', 'start', 'stop', 'picker', 'preset-msg', 'chip', 'wh
                   'nav-record', 'nav-presets', 'view-record', 'view-presets',
                   // task #4 bug-report surface (static in the page; the app wires them at boot)
                   'bug-open-record', 'bug-open-presets', 'bug', 'bug-summary', 'bug-detail',
-                  'bug-send', 'bug-cancel', 'bug-msg']) {
+                  'bug-send', 'bug-cancel', 'bug-msg',
+                  // #12 12c consent surface (static in the record view; the app wires them at boot)
+                  'consent-panel', 'consent-confirm', 'consent-decline', 'withdraw']) {
   registry.set(id, new El(id));
 }
 
@@ -358,6 +363,11 @@ async function fetchShim(url, opts) {
     try { bugPosts.push(JSON.parse(o.body || '{}')); } catch (e) { bugPosts.push({ _parseError: true }); }
     return json({ bug_id: 'bug-1' }, cfg.bugStatus);
   }
+  // #12 12b/12c — the identity session + consent routes. sessionStatus/consentStatus let a
+  // scenario force the failure branches; both default to 200 with a server-issued session token.
+  if (url.startsWith('/scribe/session/open')) { return json({ session: 'ses-1-abc', clinician: 'np_jamie' }, cfg.sessionStatus || 200); }
+  if (url.startsWith('/scribe/session/close')) { return json({ closed: true }); }
+  if (url.startsWith('/scribe/consent')) { return json({ decision: 'ok' }, cfg.consentStatus || 200); }
   return json({});
 }
 
@@ -423,6 +433,13 @@ async function setHash(h) {          // a real navigation: dispatches hashchange
 async function startEncounter() {
   el('start').click();
   await settle(25);
+  // #12 12c — start() now opens a consent phase (no mic) before the capture phase. If it advanced
+  // to the consent panel (i.e. was not refused by the mutual-exclusion guard), confirm to reach
+  // beginCapture() — the UNCHANGED synchronous mic claim + getUserMedia path.
+  if (el('consent-panel') && !el('consent-panel').classList.contains('hide')) {
+    el('consent-confirm').click();
+    await settle(25);
+  }
 }
 async function oneWindow() {
   const rec = recorders[recorders.length - 1];
@@ -534,8 +551,9 @@ try {
     out.status = el('status').textContent;
     out.micOpens = micOpens.n;
   } else if (scenario === 'enroll_capture_races_encounter_start') {
-    // The MIRROR race: `recording` is only set AFTER start()'s getUserMedia await, so a
-    // staged [Start recording] fired inside that window sees `recording === false`.
+    // The MIRROR race: `recording` is only set AFTER beginCapture()'s getUserMedia await (#12 12c
+    // relocated the claim there from start()), so a staged [Start recording] fired inside that
+    // window sees `recording === false` but must still lose to the synchronous micOwner claim.
     await setHash('#/presets');
     el('new-preset').click();
     await settle(12);
@@ -544,8 +562,13 @@ try {
     }
     const staged = registry.get('en-go');
     await setHash('#/record');
-    el('start').click();                    // start(): claims, then awaits the mic
-    staged.click();                         // ...NO settle: `recording` is still false
+    el('start').click();                    // consent phase — no mic yet
+    await settle(25);
+    el('consent-confirm').click();          // beginCapture: claims micOwner, parks on getUserMedia (HELD)
+    await settle(15);                       // ...micOwner is now set, `recording` still false
+    staged.click();                         // the staged enrolment fires in that window — must refuse
+    await settle(10);
+    globalThis.__releaseGum();              // the encounter's getUserMedia resolves → recording=true → chunk
     await settle(30);
     out.enrollBody = el('enroll-body').innerHTML;
     out.micOpens = micOpens.n;              // 1 = the encounter's own; a 2nd = the breach
@@ -561,6 +584,8 @@ try {
     await settle(30);
     el('start').click();                    // the encounter must now START (mic was released)
     await settle(30);
+    el('consent-confirm').click();          // #12 12c — confirm consent → the capture phase
+    await settle(30);
   } else if (scenario === 'teardown_during_enroll_start') {
     // BLOCK — one await later: a route-away while /enroll/start holds. The server may hold bytes
     // for the opened session; the continuation must abandon them, release the mic, and NOT start
@@ -572,6 +597,8 @@ try {
     globalThis.__releaseEnrollStart();      // /enroll/start resolves → GEN CHECK #2 abandons + bails
     await settle(30);
     el('start').click();
+    await settle(30);
+    el('consent-confirm').click();          // #12 12c — confirm consent → the capture phase
     await settle(30);
   } else if (scenario === 'teardown_during_finalize_poll') {
     // Residual #5 — a route-away DURING the finalize poll must not render the naming form into

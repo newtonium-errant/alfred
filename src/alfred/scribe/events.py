@@ -371,6 +371,17 @@ class ScribeEvents:
                 state = k.split(".", 1)[1]
         return state
 
+    def consent_captured_by(self, subject_id: str) -> str:
+        """The clinician slug pinned by this encounter's durable ``consent.confirmed`` event
+        (§2.4) — the withdrawal path reads identity back from the DURABLE event when the live PWA
+        session has already lapsed (the durable event IS the encounter→clinician binding, not a
+        still-live session). ``''`` when no confirmed event exists."""
+        e = self.latest(CLINICAL, family="consent", kind="consent.confirmed", subject_id=subject_id)
+        if not e:
+            return ""
+        payload = e.get("payload") or {}
+        return str(payload.get("captured_by") or "")
+
     def _assert_transition(self, subject_id: str, target: str) -> None:
         """Raise :class:`ConsentTransitionError` if ``target`` is not reachable from the encounter's
         current state (§3.1). PHI-free message — no raw subject_id (the target + current suffice)."""

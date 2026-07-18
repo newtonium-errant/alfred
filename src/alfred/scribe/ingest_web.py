@@ -42,6 +42,7 @@ authoritative (keep both).
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import os
@@ -134,6 +135,14 @@ SESSION_CLOSE_ROUTE = "/scribe/session/close"
 # Identity is delivered on subsequent calls via a REQUEST HEADER (not a query param) — it keeps
 # the opaque token out of URLs and access logs, the same reasoning as the Authorization bearer.
 SESSION_HEADER = "X-Scribe-Session"
+
+# --- #12 slice 12c — consent route + state machine wiring (design §4/§5/§6) ---
+# The single consent-transition route: confirmed/declined gate the START of capture; withdrawn
+# HALTS it (the durable append MUST land before the stop is acknowledged, §5). Ingest-class
+# (rides the ingest token); identity comes from the X-Scribe-Session session (§2.5), and for
+# withdrawal falls back to the durable confirmed event's captured_by when the session lapsed.
+CONSENT_ROUTE = "/scribe/consent"
+_CONSENT_DECISIONS: frozenset[str] = frozenset({"confirmed", "declined", "withdrawn"})
 
 # Slice B — the loopback PWA static surface (#49). The page GET is a browser
 # NAVIGATION that cannot carry a bearer, so these two routes are Host-pinned +
@@ -358,6 +367,44 @@ def _resolve_session(request: web.Request) -> PwaSession | None:
                                   idle_ttl=idle_ttl, abs_ttl=abs_ttl)
 
 
+# --- #12 slice 12c — consent hot cache + per-encounter lock (design §5.3/§6.2) ---
+# The chunk route and the consent route run in the SAME single-threaded aiohttp event loop, so a
+# per-encounter ``asyncio.Lock`` makes their critical sections mutually exclusive: the chunk's
+# (consent-check → write) and the withdrawal's (durable append → cache flip) can never interleave
+# for one encounter. Therefore no un-consented chunk can land after the durable ``withdrawn``
+# commits (§5.3 — the race is closed). Both structures live on the APP (``app["enc_locks"]`` /
+# ``app["consent_cache"]``), NOT module RAM: an ``asyncio.Lock`` is bound to the loop it was
+# created on, and per-app scoping (a) keeps every lock on its own server's loop and (b) gives the
+# exact §5.4 restart-empty semantics for free (a fresh server = a fresh, empty cache). The durable
+# event store is the source of truth; the cache is a disposable hot layer (a MISS falls back to
+# ``events.consent_state`` — the server-restart correctness backstop, §5.4).
+
+
+def _enc_lock(locks: dict, enc_id: str) -> "asyncio.Lock":
+    """The per-encounter lock from the app's ``enc_locks`` dict (created on demand — the standard
+    aiohttp per-key-lock idiom). Safe to create lazily in the single-threaded loop: no two
+    coroutines run the get-or-create concurrently (no await between the ``.get`` and the assign)."""
+    lock = locks.get(enc_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[enc_id] = lock
+    return lock
+
+
+def _consent_state_cached(cache: dict, enc_id: str, events: "ScribeEvents | None") -> str:
+    """Hot-path consent state: the app's RAM cache → fallback to the DURABLE
+    ``events.consent_state`` on a miss (repopulating the cache). The cache is a performance layer,
+    NEVER the source of truth: a server restart drops it and the miss path reads the true state
+    back from the durable store (§5.4/§6.2). ``''`` (no consent) when the store is inactive/absent."""
+    st = cache.get(enc_id)
+    if st is not None:
+        return st
+    st = events.consent_state(enc_id) if events is not None and events.active else ""
+    if st:
+        cache[enc_id] = st
+    return st
+
+
 # --- R3 security middleware -------------------------------------------------
 
 def _bearer(request: web.Request) -> str:
@@ -532,81 +579,107 @@ async def _handle_ingest_chunk(request: web.Request) -> web.StreamResponse:
 
     enc_dir = Path(config.input_dir) / label
 
-    # #57 SEAL — once `_CLOSED` exists the encounter is sealed to NEW audio. A chunk
-    # after close is refused (409), eliminating the post-close-chunk path that could
-    # manufacture folded seqs BEYOND the promised final_seq. (Safe for the serial
-    # PWA: it never POSTs a chunk after /close — onstop is latched by `stopped` and
-    # /close is chained after the last chunk link.)
-    if (enc_dir / CLOSE_SENTINEL_NAME).exists():
-        log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
-                    reason="encounter_closed", encounter_id=encounter_id)
-        if events is not None:  # encounter.post_close_chunk_refused (design §5.4)
-            events.encounter_post_close_chunk_refused(subject_id=encounter_id, seq=seq)
-        return _reject("encounter_closed", 409)
+    # #12 slice 12c — the CONSENT GATE + the chunk write run UNDER the per-encounter lock, so no
+    # chunk can interleave with a withdrawal's (durable append → cache flip). The lock spans the
+    # whole write: a chunk that passed its consent check completes BEFORE a withdrawal can flip
+    # the cache, and a chunk whose check runs after the flip is refused — so no un-consented
+    # chunk lands after the durable `withdrawn` commits (§5.3, the race is closed).
+    async with _enc_lock(request.app["enc_locks"], encounter_id):
+        # SERVER enforcement of "no consent state → the mic never opens" (§6.1): the client gate
+        # (§4) is UX; THIS is the guarantee. Even a client that skipped the panel and POSTed a
+        # chunk directly is refused at seq=1 because no `consent.confirmed` exists. It equally
+        # enforces withdrawal (§5) and declined. Cache → durable fallback. Enforced only when
+        # CLINICAL mode AND an ACTIVE event store exists: a synthetic/test encounter has no consent
+        # flow (§7.2/§10: its consent state is ""), so gating it would refuse every synthetic chunk;
+        # and consent can only be enforced against a store that can record it (clinical mode ALWAYS
+        # has an active store — it fails LOUD at open — so this never weakens the production gate).
+        if config.is_clinical and events is not None and events.active:
+            state = _consent_state_cached(request.app["consent_cache"], encounter_id, events)
+            if state != "confirmed":
+                # best-effort violation marker (a refused chunk, never a state); opaque PHI-safe 403.
+                if events is not None:
+                    events.consent_violation_refused(subject_id=encounter_id, seq=seq)
+                log.warning("scribe.consent.chunk_refused", route=INGEST_CHUNK_ROUTE,
+                            encounter_id=encounter_id, seq=seq, state=state or "none",
+                            detail="chunk refused — consent state is not 'confirmed' (mic must "
+                                   "not have opened, or a withdrawal has halted the feed)")
+                return _reject("consent_required", 403)
 
-    # server-validated MONOTONIC / GAP-FREE seq (contract #3) — the next contiguous
-    # value from the on-disk filenames (seq is authoritative from the FILENAME).
-    existing = _existing_seqs(enc_dir)
-    expected = (existing[-1] + 1) if existing else 1
-    if seq != expected:
-        log.warning(
-            "scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
-            reason="seq_out_of_order", encounter_id=encounter_id,
+        # #57 SEAL — once `_CLOSED` exists the encounter is sealed to NEW audio. A chunk
+        # after close is refused (409), eliminating the post-close-chunk path that could
+        # manufacture folded seqs BEYOND the promised final_seq. (Safe for the serial
+        # PWA: it never POSTs a chunk after /close — onstop is latched by `stopped` and
+        # /close is chained after the last chunk link.)
+        if (enc_dir / CLOSE_SENTINEL_NAME).exists():
+            log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
+                        reason="encounter_closed", encounter_id=encounter_id)
+            if events is not None:  # encounter.post_close_chunk_refused (design §5.4)
+                events.encounter_post_close_chunk_refused(subject_id=encounter_id, seq=seq)
+            return _reject("encounter_closed", 409)
+
+        # server-validated MONOTONIC / GAP-FREE seq (contract #3) — the next contiguous
+        # value from the on-disk filenames (seq is authoritative from the FILENAME).
+        existing = _existing_seqs(enc_dir)
+        expected = (existing[-1] + 1) if existing else 1
+        if seq != expected:
+            log.warning(
+                "scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
+                reason="seq_out_of_order", encounter_id=encounter_id,
+            )
+            return _reject("seq_out_of_order", 409)
+
+        # N3 cap — chunk count (explicit signal, never a silent drop).
+        if len(existing) >= web_cfg.max_chunks_per_encounter:
+            log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="chunks")
+            if events is not None:  # encounter.cap_hit (design §5.4)
+                events.encounter_cap_hit(subject_id=encounter_id, cap="chunks")
+            return _reject("chunk_cap", 413)
+
+        # read the body (bounded by client_max_size → HTTPRequestEntityTooLarge).
+        try:
+            body = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="chunk_bytes")
+            if events is not None:  # encounter.cap_hit (design §5.4)
+                events.encounter_cap_hit(subject_id=encounter_id, cap="chunk_bytes")
+            return _reject("chunk_too_large", 413)
+        if not body:
+            log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
+                        reason="empty_chunk", encounter_id=encounter_id)
+            return _reject("empty_chunk", 400)
+
+        # N3 cap — per-encounter total bytes.
+        if _encounter_bytes(enc_dir) + len(body) > web_cfg.max_encounter_bytes:
+            log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="encounter_bytes")
+            if events is not None:  # encounter.cap_hit (design §5.4)
+                events.encounter_cap_hit(subject_id=encounter_id, cap="encounter_bytes")
+            return _reject("encounter_cap", 413)
+
+        # WRITE — audio atomically FIRST, sidecar atomically LAST (contract #4/#7). The
+        # sweep acts only once the sidecar (the settle commit-marker) lands, so a
+        # partial audio is never folded.
+        enc_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_bytes(enc_dir / f"chunk_{seq}.{ext}", body)
+        _atomic_write_text(
+            enc_dir / f"chunk_{seq}{_META_SUFFIX}",
+            json.dumps({"synthetic": synthetic, "seq": seq}),
         )
-        return _reject("seq_out_of_order", 409)
+        # encounter.opened (design §5.4) — the first accepted chunk (seq==1, after the
+        # atomic chunk+meta write). seq==1 reliably means "first chunk" (the gap-free
+        # seq gate above refuses any seq != expected, and expected==1 only when empty).
+        if events is not None and seq == 1:
+            events.encounter_opened(subject_id=encounter_id)
 
-    # N3 cap — chunk count (explicit signal, never a silent drop).
-    if len(existing) >= web_cfg.max_chunks_per_encounter:
-        log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="chunks")
-        if events is not None:  # encounter.cap_hit (design §5.4)
-            events.encounter_cap_hit(subject_id=encounter_id, cap="chunks")
-        return _reject("chunk_cap", 413)
-
-    # read the body (bounded by client_max_size → HTTPRequestEntityTooLarge).
-    try:
-        body = await request.read()
-    except web.HTTPRequestEntityTooLarge:
-        log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="chunk_bytes")
-        if events is not None:  # encounter.cap_hit (design §5.4)
-            events.encounter_cap_hit(subject_id=encounter_id, cap="chunk_bytes")
-        return _reject("chunk_too_large", 413)
-    if not body:
-        log.warning("scribe.ingest_web.rejected", route=INGEST_CHUNK_ROUTE,
-                    reason="empty_chunk", encounter_id=encounter_id)
-        return _reject("empty_chunk", 400)
-
-    # N3 cap — per-encounter total bytes.
-    if _encounter_bytes(enc_dir) + len(body) > web_cfg.max_encounter_bytes:
-        log.warning("scribe.ingest_web.cap_hit", encounter_id=encounter_id, cap="encounter_bytes")
-        if events is not None:  # encounter.cap_hit (design §5.4)
-            events.encounter_cap_hit(subject_id=encounter_id, cap="encounter_bytes")
-        return _reject("encounter_cap", 413)
-
-    # WRITE — audio atomically FIRST, sidecar atomically LAST (contract #4/#7). The
-    # sweep acts only once the sidecar (the settle commit-marker) lands, so a
-    # partial audio is never folded.
-    enc_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write_bytes(enc_dir / f"chunk_{seq}.{ext}", body)
-    _atomic_write_text(
-        enc_dir / f"chunk_{seq}{_META_SUFFIX}",
-        json.dumps({"synthetic": synthetic, "seq": seq}),
-    )
-    # encounter.opened (design §5.4) — the first accepted chunk (seq==1, after the
-    # atomic chunk+meta write). seq==1 reliably means "first chunk" (the gap-free
-    # seq gate above refuses any seq != expected, and expected==1 only when empty).
-    if events is not None and seq == 1:
-        events.encounter_opened(subject_id=encounter_id)
-
-    closed = _is_true(q.get("close"))
-    if closed:  # B3 — close-flag on the final chunk. THIS chunk IS the final, so
-        # the manifest's final_seq = this seq (trivially correct — gives the
-        # close-flag path the #57 structural completeness gate too).
-        write_close_manifest(enc_dir, seq)
-        # encounter.closed (design §5.4) — the close-flag seal path. A close-flag
-        # seal with no event would leave a capture-but-no-`closed` timeline (an
-        # intentionally-left-blank violation on the CMPA demo query).
-        if events is not None:
-            events.encounter_closed(subject_id=encounter_id, final_seq=seq)
+        closed = _is_true(q.get("close"))
+        if closed:  # B3 — close-flag on the final chunk. THIS chunk IS the final, so
+            # the manifest's final_seq = this seq (trivially correct — gives the
+            # close-flag path the #57 structural completeness gate too).
+            write_close_manifest(enc_dir, seq)
+            # encounter.closed (design §5.4) — the close-flag seal path. A close-flag
+            # seal with no event would leave a capture-but-no-`closed` timeline (an
+            # intentionally-left-blank violation on the CMPA demo query).
+            if events is not None:
+                events.encounter_closed(subject_id=encounter_id, final_seq=seq)
 
     log.info(
         "scribe.ingest_web.chunk_written",
@@ -869,6 +942,95 @@ async def _handle_session_close(request: web.Request) -> web.StreamResponse:
     return web.json_response({"closed": True}, status=200)
 
 
+# --- #12 slice 12c — consent transition route -------------------------------
+
+async def _handle_consent(request: web.Request) -> web.StreamResponse:
+    """``POST /scribe/consent?label&decision={confirmed|declined|withdrawn}`` — the per-encounter
+    consent state transition (design §4/§5). Ingest-class + ``X-Scribe-Session`` for identity.
+
+    Ordering contract (§5): the DURABLE consent append MUST land before this route acknowledges.
+    On a store failure the durable emitter RAISES → 5xx, the cache is NOT flipped, and capture is
+    never told it stopped (the client keeps the encounter open and retries). The hot cache flips
+    ONLY after the durable append committed — so the chunk gate (§6.1) can never see a state the
+    store does not hold. Everything is under the per-encounter lock so no chunk write interleaves.
+    """
+    config: ScribeConfig = request.app["scribe_config"]
+    events: "ScribeEvents | None" = request.app.get("scribe_events")
+
+    label = request.query.get("label", "")
+    if not ENCOUNTER_LABEL_RE.fullmatch(label):
+        log.warning("scribe.ingest_web.rejected", route=CONSENT_ROUTE, reason="invalid_label")
+        return _reject("invalid_label", 400)
+    decision = (request.query.get("decision") or "").strip().lower()
+    if decision not in _CONSENT_DECISIONS:
+        log.warning("scribe.ingest_web.rejected", route=CONSENT_ROUTE, reason="invalid_decision")
+        return _reject("invalid_decision", 400)
+    try:
+        enc_id = compute_encounter_id(label, salt=config.encounter_salt)
+    except EncounterIdentityError:
+        log.error("scribe.ingest_web.identity_unavailable", route=CONSENT_ROUTE)
+        return _reject("identity_unavailable", 500)
+
+    # Consent is DURABLE evidence — with no active event store we cannot record it, so we must
+    # not let it appear captured. Fail-closed (§4: no consent state → the mic never opens).
+    if events is None or not events.active:
+        log.error("scribe.consent.unavailable", route=CONSENT_ROUTE, encounter_id=enc_id,
+                  detail="consent requested but the event store is inactive — REFUSING "
+                         "(consent must be durably recorded before the act it gates)")
+        return _reject("consent_unavailable", 503)
+
+    # Identity (§2.5): confirm/decline REQUIRE a live session (consent evidence names a real
+    # clinician, never a null identity). Withdrawal falls back to the DURABLE confirmed event's
+    # captured_by when the live session has lapsed (§2.4 — the durable event is the binding).
+    session = _resolve_session(request)
+    if decision in ("confirmed", "declined"):
+        if session is None:
+            log.warning("scribe.consent.no_session", route=CONSENT_ROUTE, decision=decision)
+            return _reject("no_session", 401)
+        captured_by = session.clinician
+    else:  # withdrawn
+        captured_by = session.clinician if session is not None else events.consent_captured_by(enc_id)
+        if not captured_by:
+            log.warning("scribe.consent.no_session", route=CONSENT_ROUTE, decision=decision)
+            return _reject("no_session", 401)
+
+    from alfred.evstore import EventStoreError
+    from alfred.scribe.events import ConsentTransitionError
+
+    async with _enc_lock(request.app["enc_locks"], enc_id):
+        try:
+            if decision == "confirmed":
+                events.consent_confirmed(subject_id=enc_id, captured_by=captured_by)
+            elif decision == "declined":
+                events.consent_declined(subject_id=enc_id, captured_by=captured_by)
+            else:  # withdrawn — at_seq is the on-disk max chunk seq the withdrawal saw (§5.2)
+                existing = _existing_seqs(Path(config.input_dir) / label)
+                at_seq = existing[-1] if existing else 0
+                events.consent_withdrawn(subject_id=enc_id, at_seq=at_seq, actor=captured_by)
+        except ConsentTransitionError:
+            # An illegal transition (double-confirm, withdraw-on-∅/declined, any terminal move)
+            # — refused at the facade (§3.1). ConsentTransitionError subclasses EventStoreError,
+            # so it MUST be caught first (a 409, not a 5xx — the client asked for something the
+            # state machine forbids, not a store failure).
+            log.warning("scribe.consent.illegal_transition", route=CONSENT_ROUTE, decision=decision,
+                        encounter_id=enc_id)
+            return _reject("illegal_transition", 409)
+        except EventStoreError:
+            # The DURABLE append FAILED. The withdrawal ordering contract (§5): NOT acknowledged,
+            # NO cache flip — capture is never told it stopped on an unrecorded withdrawal; the
+            # client keeps the encounter open and can retry. 5xx (fail-loud, PHI-safe code).
+            log.error("scribe.consent.write_failed", route=CONSENT_ROUTE, decision=decision,
+                      encounter_id=enc_id)
+            return _reject("consent_write_failed", 503)
+        # ONLY after the durable append committed: flip the hot gate (§6.2). Inside the lock, so
+        # a chunk's consent-check (also under the lock) sees the flip atomically w.r.t. the append.
+        request.app["consent_cache"][enc_id] = decision
+    log.info("scribe.consent.recorded", route=CONSENT_ROUTE, decision=decision, encounter_id=enc_id,
+             detail="durable consent transition recorded + hot cache flipped")
+    return web.json_response(
+        {"encounter_id": enc_id, "decision": decision, "captured_by": captured_by}, status=200)
+
+
 # --- Slice B static PWA surface (page + app.js) -----------------------------
 
 def _static_headers() -> dict[str, str]:
@@ -975,6 +1137,12 @@ def create_ingest_app(
     # handlers read it via request.app.get("scribe_events") and emit encounter.*
     # best-effort. None (default / non-clinical / degraded) → the handlers no-op.
     app["scribe_events"] = events
+    # #12 slice 12c — per-encounter consent serialization locks + the hot consent-state cache
+    # (design §5.3/§6.2). App-scoped (not module RAM): the locks bind to this server's loop, and a
+    # fresh server (restart) starts with empty caches — the durable store is the source of truth
+    # and the chunk gate falls back to it on a cache miss (§5.4).
+    app["enc_locks"] = {}
+    app["consent_cache"] = {}
     # 3 API routes — bearer-required, byte-identical to Slice A.
     app.router.add_post(INGEST_CHUNK_ROUTE, _handle_ingest_chunk)
     app.router.add_post(CLOSE_ROUTE, _handle_close)
@@ -985,6 +1153,9 @@ def create_ingest_app(
     # fall through _authorize_route's default ingest branch — no new credential, design §2.3).
     app.router.add_post(SESSION_OPEN_ROUTE, _handle_session_open)
     app.router.add_post(SESSION_CLOSE_ROUTE, _handle_session_close)
+    # #12 slice 12c — the consent transition route (ingest-class; confirmed/declined gate capture
+    # start, withdrawn halts it under the durable-before-ack ordering contract, design §4/§5).
+    app.router.add_post(CONSENT_ROUTE, _handle_consent)
     # 2 static PWA routes — bearer-exempt (Host-pinned + loopback), Slice B.
     app.router.add_get(PAGE_ROUTE, _handle_page)
     app.router.add_get(APP_JS_ROUTE, _handle_app_js)

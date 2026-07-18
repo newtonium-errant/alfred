@@ -170,7 +170,13 @@ _INDEX_HTML = """<!doctype html>
   <div id="preset-msg"></div>
   <p><span id="chip" class="chip">attribution: unarmed</span></p>
   <button id="start" class="primary">Start encounter</button>
+  <div id="consent-panel" class="hide">
+    <div class="banner">Confirm the patient has verbally consented to recording and AI dictation before capture begins.</div>
+    <button id="consent-confirm" class="primary">Confirmed &mdash; patient verbally consented</button>
+    <button id="consent-decline">Declined</button>
+  </div>
   <button id="stop" disabled>Stop &amp; finish</button>
+  <button id="withdraw" class="danger hide">Withdraw consent &amp; stop</button>
   <div id="status" aria-live="polite">Idle. Press &ldquo;Start encounter&rdquo; to begin.</div>
   <p class="note">Audio is captured in short self-contained windows and pushed to this on-box server. Nothing is stored in the browser; nothing leaves 127.0.0.1.</p>
   <p><button id="bug-open-record" class="bug-link">Report a problem</button></p>
@@ -558,34 +564,110 @@ APP_JS = r"""'use strict';
     }
   }
 
+  // ── #12 12c: CONSENT PHASE — no mic, no micOwner claim (design §4.2) ─────────────────────
+  // start() is split into a consent phase and a capture phase. The consent gate sits ENTIRELY
+  // BEFORE the micOwner claim and introduces NO second acquire path: on Confirmed→200 control
+  // falls into beginCapture(), the UNCHANGED mic path. Every non-Confirmed outcome returns
+  // before the claim, so the mic never opens.
+  function showConsentPanel() {
+    $('consent-panel').classList.remove('hide');
+    $('start').classList.add('hide');
+  }
+  function hideConsentPanel() {
+    $('consent-panel').classList.add('hide');
+    $('start').classList.remove('hide');
+  }
+
   async function start() {
     // MUTUAL EXCLUSION (memo: enrolment and encounter recording are mutually exclusive).
     // Two MediaRecorders on one mic, and — far worse — an enrolment buffer that captures
     // LIVE PATIENT SPEECH on a surface whose entire consent basis is "the enrolling
-    // clinician's own voice". Refuse, loudly.
+    // clinician's own voice". Refuse, loudly. (UNCHANGED guard — still no mic here.)
     logEvent('start encounter');
     if (enrollSession || micOwner) {
       logEvent('blocked: mic in use');
       show('Finish or cancel the voiceprint recording first — the microphone is in use.');
       return;
     }
-    micOwner = 'encounter';               // claimed SYNCHRONOUSLY, BEFORE the await below
-    $('start').disabled = true;
+    // Consent evidence must name a real clinician (§2.5): an identity session is required before
+    // consent can be captured. Auto-recover the common case (fillWho pre-selected a clinician but
+    // the session has not opened / has lapsed) by binding now; else ask for an explicit selection.
+    if (!sessionToken) {
+      if (user) { await bindSession(user); }
+      if (!sessionToken) { show('Select the acting clinician before starting.'); return; }
+    }
+    label = newLabel();                   // minted HERE, before the mic — the encounter id the
+    $('start').disabled = true;           // consent event and the chunks will both key on.
+    showConsentPanel();
+    show('Confirm the patient has verbally consented to start recording.');
+  }
+
+  async function consentDecline() {
+    hideConsentPanel();
+    try {
+      const r = await api('/scribe/consent?label=' + encodeURIComponent(label) + '&decision=declined',
+                          { method: 'POST' });
+      show(r.ok ? 'Consent declined — recording will not start.'
+                : 'Could not record the decision. Try again.');
+    } catch (e) { show('Could not record the decision. Try again.'); }
+    $('start').disabled = false;
+    label = null;                         // a declined visit produces no audio; a fresh visit re-mints
+  }
+
+  async function consentConfirm() {
+    hideConsentPanel();
+    let ok = false;
+    try {
+      const r = await api('/scribe/consent?label=' + encodeURIComponent(label) + '&decision=confirmed',
+                          { method: 'POST' });
+      ok = r.ok;
+      if (!ok) {
+        if (r.status === 401) { sessionToken = ''; show('Session expired — reselect the clinician and try again.'); }
+        else { show('Could not record consent. Recording did not start.'); }
+      }
+    } catch (e) { show('Could not record consent. Recording did not start.'); }
+    if (!ok) { $('start').disabled = false; label = null; return; }   // FAIL-CLOSED: mic never touched
+    await beginCapture();                  // CAPTURE PHASE — the existing path, byte-for-byte
+  }
+
+  async function beginCapture() {
+    // STAGED-THEN-FIRED belt: re-check mutual exclusion AFTER the consent await (the consent POST
+    // is a world-changing await during which a route()/enroll could have fired) — the same
+    // action-moment discipline as the original claim site.
+    if (enrollSession || micOwner) {
+      show('Microphone is in use — could not start.'); $('start').disabled = false; label = null; return;
+    }
+    micOwner = 'encounter';               // the SAME synchronous claim, unchanged
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
       micOwner = '';
-      show('Microphone unavailable.'); $('start').disabled = false; return;
+      show('Microphone unavailable.'); $('start').disabled = false; label = null; return;
     }
-    label = newLabel();
     seq = 0; recording = true; stopped = false; chain = Promise.resolve();
     $('picker').disabled = true;                                // LOCKED while recording
     $('who').disabled = true;
     $('stop').disabled = false;
+    $('withdraw').classList.remove('hide');                     // the mid-encounter withdraw control
     show('Recording. chunks=0 state=recording');
     await bindPreset();                                         // BEFORE the first chunk
     startWindow();
     pollStatus();
+  }
+
+  // ── #12 12c: WITHDRAW — durable-before-acknowledge (design §5) ───────────────────────────
+  // The server records the durable consent.withdrawn BEFORE it 200s. On 200 we stop (the audio
+  // boundary is server-recorded); on a non-200 (the durable append failed) we must NOT tell the
+  // clinician "stopped" on an UNRECORDED withdrawal — keep recording and allow a retry.
+  async function withdraw() {
+    $('withdraw').disabled = true;
+    try {
+      const r = await api('/scribe/consent?label=' + encodeURIComponent(label) + '&decision=withdrawn',
+                          { method: 'POST' });
+      if (r.ok) { stopEncounter('Consent withdrawn — recording stopped.'); return; }
+      show('Could not record the withdrawal — still recording. Try again.');
+    } catch (e) { show('Could not record the withdrawal — still recording. Try again.'); }
+    $('withdraw').disabled = false;
   }
 
   function stopEncounter(msg) {
@@ -596,6 +678,7 @@ APP_JS = r"""'use strict';
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
     if (micOwner === 'encounter') { micOwner = ''; }             // release the mic claim
     $('stop').disabled = true;
+    $('withdraw').classList.add('hide'); $('withdraw').disabled = false;  // #12 12c — reset the control
     chain = chain.then(async () => {
       const finalSeq = seq;
       let u = '/scribe/close?label=' + encodeURIComponent(label);
@@ -1163,6 +1246,13 @@ APP_JS = r"""'use strict';
     $('nav-record').classList.toggle('on', !presets);
     $('nav-presets').classList.toggle('on', presets);
     if (presets) { renderPresets(); } else { loadPresets().then(renderPicker); }
+    // #12 12c — entering the record view while NOT recording resets a stale consent panel (a
+    // clinician who navigated away mid-panel): hide the panel, restore Start, hide Withdraw. The
+    // discarded label re-mints on the next Start (no consent was POSTed). Skipped while recording
+    // so an active encounter's Withdraw control survives a presets round-trip.
+    if (!presets && !recording && !micOwner) {
+      hideConsentPanel(); $('withdraw').classList.add('hide'); $('start').disabled = false;
+    }
   }
 
   $('picker').addEventListener('change', (e) => {
@@ -1180,6 +1270,9 @@ APP_JS = r"""'use strict';
   });
   $('new-preset').addEventListener('click', () => { logEvent('tap create-voiceprint'); runEnroll(null); });
   $('start').addEventListener('click', start);
+  $('consent-confirm').addEventListener('click', consentConfirm);   // #12 12c — consent phase
+  $('consent-decline').addEventListener('click', consentDecline);   // #12 12c — consent phase
+  $('withdraw').addEventListener('click', withdraw);                // #12 12c — mid-encounter
   $('stop').addEventListener('click', stop);
   $('bug-open-record').addEventListener('click', openBug);
   $('bug-open-presets').addEventListener('click', openBug);

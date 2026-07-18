@@ -251,6 +251,7 @@ def test_route_table_pins(tmp_path):
     assert ("POST", iw.BUG_ROUTE) in got
     assert ("POST", iw.SESSION_OPEN_ROUTE) in got               # #12 12b — ingest-class
     assert ("POST", iw.SESSION_CLOSE_ROUTE) in got              # #12 12b — ingest-class
+    assert ("POST", iw.CONSENT_ROUTE) in got                    # #12 12c — ingest-class
     assert ("GET", iw.PAGE_ROUTE) in got
     assert ("GET", iw.APP_JS_ROUTE) in got
     assert ("GET", iw.MANIFEST_ROUTE) in got
@@ -264,7 +265,7 @@ def test_route_table_pins(tmp_path):
     for route in iw._INSTALL_ASSET_PATHS:
         assert ("GET", route) in got, route
     # no extra GET/POST routes crept in — in particular NO /sw.js (no service worker).
-    assert len(got) == 14
+    assert len(got) == 15
     assert not any("sw.js" in path or "serviceworker" in path.lower()
                    for _, path in got), got
 
