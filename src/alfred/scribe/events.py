@@ -50,6 +50,25 @@ def _coerce_actor_kind(actor_kind: str) -> str:
     return actor_kind if actor_kind in ACTOR_KINDS else "unknown"
 
 
+# ── Consent state machine (#12 §3.1) ─────────────────────────────────────────────
+# The per-encounter consent state ∈ {"" (∅), "confirmed", "declined", "withdrawn"}. Legal
+# transitions (design §3.1): ∅→confirmed, ∅→declined, confirmed→withdrawn. declined + withdrawn
+# are TERMINAL; a second confirm, or any move out of a terminal state, is refused at the facade.
+# The map is target → the set of source states it may be reached FROM (empty string == ∅).
+CONSENT_STATES: frozenset[str] = frozenset({"confirmed", "declined", "withdrawn"})
+_CONSENT_LEGAL_FROM: dict[str, frozenset[str]] = {
+    "confirmed": frozenset({""}),          # ∅ → confirmed
+    "declined": frozenset({""}),           # ∅ → declined
+    "withdrawn": frozenset({"confirmed"}),  # confirmed → withdrawn
+}
+
+
+class ConsentTransitionError(EventStoreError):
+    """An illegal consent state transition was refused at the facade (design §3.1/§5.6). Subclasses
+    ``EventStoreError`` so a caller's existing ``except EventStoreError`` covers it — a route that
+    already fails-closed on a durable-append error also fails-closed on an illegal transition."""
+
+
 @dataclass(frozen=True)
 class _Kind:
     kind: str
@@ -332,6 +351,70 @@ class ScribeEvents:
         return self._emit_capture(CLINICAL, "encounter.post_close_chunk_refused",
                                   subject_id=subject_id, actor="stayc_scribe", actor_kind="system",
                                   now=now, payload={"seq": int(seq)})
+
+    # --- CONSENT (#12) — state resolver + typed emitters ------------------
+    # The typed emitters are the ONLY constructors of consent events (no generic emit verb, #11
+    # §2.2). confirmed/declined/withdrawn are DURABLE (fsync, raise on failure — consent evidence
+    # must be recorded before the act it gates is acknowledged); violation_refused is best-effort
+    # (a marker of a refused chunk, never a state). Legality is enforced HERE at emit time via
+    # ``consent_state()`` (§3.1) — the sole consent writer is the ingest_web process, serialized
+    # per-encounter (§3.2), so the check-then-append cannot interleave with another consent write.
+
+    def consent_state(self, subject_id: str) -> str:
+        """Current per-encounter consent state ∈ {"", "confirmed", "declined", "withdrawn"} (the
+        STATE kinds only — ``violation_refused`` is NOT a state and is ignored). '' == no consent
+        set. Chain order == append order, so the last state-kind seen is the current state."""
+        state = ""
+        for e in self._store.query(CLINICAL, family="consent", subject_id=subject_id):
+            k = e.get("kind", "")
+            if k.startswith("consent.") and k.split(".", 1)[1] in CONSENT_STATES:
+                state = k.split(".", 1)[1]
+        return state
+
+    def _assert_transition(self, subject_id: str, target: str) -> None:
+        """Raise :class:`ConsentTransitionError` if ``target`` is not reachable from the encounter's
+        current state (§3.1). PHI-free message — no raw subject_id (the target + current suffice)."""
+        current = self.consent_state(subject_id)
+        if current not in _CONSENT_LEGAL_FROM[target]:
+            raise ConsentTransitionError(
+                f"illegal consent transition {current or '∅'} → {target} "
+                f"(legal from: {sorted(s or '∅' for s in _CONSENT_LEGAL_FROM[target])})")
+
+    def consent_confirmed(self, *, subject_id: str, captured_by: str,
+                          now: str | None = None) -> AppendReceipt:
+        """Durable [D]. ∅ → confirmed. ``captured_by`` is the session-resolved clinician slug
+        (§2.5) — the durable event PINS the encounter→clinician binding."""
+        self._assert_transition(subject_id, "confirmed")
+        return self._emit_durable(CLINICAL, "consent.confirmed", subject_id=subject_id,
+                                  actor=captured_by, actor_kind="clinician", now=now,
+                                  payload={"method": "verbal", "captured_by": captured_by})
+
+    def consent_declined(self, *, subject_id: str, captured_by: str,
+                         now: str | None = None) -> AppendReceipt:
+        """Durable [D]. ∅ → declined (terminal). A declined visit produces consent events but no
+        encounter dir / no audio (no chunk ever POSTs — the mic never opens)."""
+        self._assert_transition(subject_id, "declined")
+        return self._emit_durable(CLINICAL, "consent.declined", subject_id=subject_id,
+                                  actor=captured_by, actor_kind="clinician", now=now,
+                                  payload={"method": "verbal", "captured_by": captured_by})
+
+    def consent_withdrawn(self, *, subject_id: str, at_seq: int, actor: str,
+                          now: str | None = None) -> AppendReceipt:
+        """Durable [D]. confirmed → withdrawn (terminal). ``at_seq`` is the on-disk max chunk seq
+        at withdrawal — the audio boundary the withdrawal saw (§5). The durable append MUST land
+        before capture-stop is acknowledged (the ordering contract rides ``_emit_durable``'s raise)."""
+        self._assert_transition(subject_id, "withdrawn")
+        return self._emit_durable(CLINICAL, "consent.withdrawn", subject_id=subject_id,
+                                  actor=actor, actor_kind="clinician", now=now,
+                                  payload={"at_seq": int(at_seq)})
+
+    def consent_violation_refused(self, *, subject_id: str, seq: int,
+                                  now: str | None = None) -> AppendReceipt | None:
+        """Best-effort. A marker of a refused chunk (state != confirmed) — NOT a state transition,
+        so no legality assert. System actor (the gate refused it, not a clinician)."""
+        return self._emit_capture(CLINICAL, "consent.violation_refused", subject_id=subject_id,
+                                  actor="stayc_scribe", actor_kind="system", now=now,
+                                  payload={"seq": int(seq)})
 
     # --- ACCESS emitters + read hook + suppression ------------------------
 
