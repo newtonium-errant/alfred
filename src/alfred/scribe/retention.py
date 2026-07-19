@@ -13,29 +13,21 @@ CHAIN (``events.retention_sealed_row``), so the seal is idempotent across a cras
 This slice ships the unit-level :func:`seal_encounter`; the daemon sweep that drives it over READY /
 abandoned encounters is slice 13b.
 
-CRYPTO PRIMITIVE — the operator-visible decision, honestly flagged (design §3.1):
-    The design RECOMMENDS **age X25519** for the ~10-year archive because an age blob is openable
-    with the stock ``age`` binary WITHOUT this codebase (decade-scale standalone retrievability).
-    **No age library or ``age``/``rage`` CLI is vendored** in the sovereign venv, and PyNaCl is
-    absent; the only vetted asymmetric-crypto library present is **pyca/cryptography** (a transitive
-    dep, not yet declared). So the crypto backend is a genuine operator dependency decision, not a
-    silent default.
+CRYPTO PRIMITIVE — age X25519, operator-ruled (2026-07-19, design §3.1):
+    The production sealer is standard **age** X25519 recipient encryption (:class:`AgeSealer`, via the
+    ``pyrage`` library). age is the decisive choice for a ~10-year medico-legal archive: an age blob is
+    a self-describing standard format, decryptable with the stock ``age`` binary WITHOUT this codebase
+    (decade-scale standalone retrievability — the 13d offline-key retrieval guarantee). The daemon
+    holds ONLY the recipient PUBLIC key (an ``age1…`` string); the offline PRIVATE key
+    (``AGE-SECRET-KEY-…``) opens the archive, so a live-compromised daemon cannot decrypt. Recorded
+    honestly as ``cipher = "age-x25519"`` with a ``.age`` blob suffix (both true to the format).
 
-    This module ships the seal lifecycle behind a pluggable :class:`Sealer` and provides
-    :class:`CryptographySealer` — a REAL asymmetric X25519 hybrid seal (ephemeral-static ECDH →
-    HKDF-SHA256 → AES-256-GCM) built on the vendored ``cryptography`` library. It gives the SAME
-    security property age would (the daemon holds only the public key; the offline private key is
-    required to open the archive; a live-compromised daemon cannot decrypt), recorded honestly as
-    ``cipher = "x25519-hkdf-sha256-aesgcm"`` — NOT falsely ``"age-x25519"``. It is the codebase-
-    coupled retrieval FALLBACK the design flagged (same class as the PyNaCl fallback), with an
-    honest label. The ``cryptography`` import is LAZY (raises :class:`SealerUnavailable`), so this
-    module + the fail-closed-ordering pins load and run WITHOUT any crypto dep (tests inject a
-    deterministic fake sealer); only the actual-crypto round-trip is dep-gated (design §10).
-
-    The age-format standalone-openability (§3.1's decisive rationale) is a one-file swap behind the
-    :class:`Sealer` interface — add a ``pyrage``/``age`` backend, flip :data:`SEAL_CIPHER` +
-    :data:`SEAL_BLOB_SUFFIX`. That swap is the real-key-ceremony (13d) + the operator's crypto-dep
-    call; it is NOT a CI blocker and does NOT change the lifecycle, verify, or wipe logic here.
+    The ``pyrage`` import is LAZY (raises :class:`SealerUnavailable`), so this module + the
+    fail-closed-ordering pins load and run WITHOUT the crypto dep (tests inject a deterministic fake
+    sealer); only the actual-crypto round-trip is dep-gated (design §10). The seal backend lives
+    behind a pluggable :class:`Sealer` protocol — a future backend swap flips :data:`SEAL_CIPHER` +
+    :data:`SEAL_BLOB_SUFFIX` without touching the lifecycle, verify, or wipe logic. The keygen ceremony
+    + the offline-binary decrypt verification are slice 13d.
 
 Import direction (frozen): ``scribe.retention → scribe.events → evstore``; retention never imported
 back by events/evstore.
@@ -62,22 +54,20 @@ log = structlog.get_logger("scribe.retention")
 
 # --- seal blob format + cipher label (contract constants — later slices IMPORT, never re-derive) --
 
-# The honest cipher label recorded in every ``retention.sealed`` row (NOT "age-x25519" — this is
-# the pyca/cryptography X25519 hybrid, not age format). A future age backend flips this constant.
-SEAL_CIPHER = "x25519-hkdf-sha256-aesgcm"
+# The honest cipher label recorded in every ``retention.sealed`` row. The seal is the standard **age**
+# X25519 recipient format (operator ruling 2026-07-19) — a self-describing blob openable a decade from
+# now with the stock ``age`` binary WITHOUT this codebase (§3.1's decisive rationale). A mixed archive
+# stays self-identifying via this label.
+SEAL_CIPHER = "age-x25519"
 
-# The sealed-blob filename suffix (opaque-id filename, no label leak). DELIBERATELY ".sealed", NOT
-# ".age" — the blob is NOT age format, and naming it ".age" would falsely imply stock-``age``
-# decryptability. A future age backend flips this to ".age" alongside SEAL_CIPHER.
-SEAL_BLOB_SUFFIX = ".sealed"
+# The sealed-blob filename suffix (opaque-id filename, no label leak). ``.age`` — the blob IS age
+# format, decryptable by the stock ``age`` binary (the 13d offline-retrieval path).
+SEAL_BLOB_SUFFIX = ".age"
 
-# STAYC seal blob wire format: MAGIC(10) ‖ ephemeral_pubkey(32) ‖ nonce(12) ‖ AES-256-GCM(ct+tag).
-_SEAL_MAGIC = b"STAYCSEAL1"
-_EPK_LEN = 32
-_NONCE_LEN = 12
-_TAG_LEN = 16
-_HKDF_INFO = b"stayc-seal-v1"
-_X25519_KEY_LEN = 32
+# The age v1 armor/header prefix — every age ciphertext begins with the ``age-encryption.org/v1``
+# intro line. Used for the seal-time structural self-verify WITHOUT the private key (the daemon holds
+# only the recipient). The digest-stable (torn-write) half of the self-verify is in seal_encounter.
+_AGE_HEADER_PREFIX = b"age-encryption.org/"
 
 # The manifest member name inside the sealed tar (recovered on unseal to re-verify per-chunk shas).
 SEAL_MANIFEST_NAME = "manifest.json"
@@ -109,10 +99,9 @@ SEAL_STATUS_EMPTY_DISPOSED = "empty_disposed"
 
 
 class SealerUnavailable(RuntimeError):
-    """The requested crypto backend is not installed (no vendored age lib / ``cryptography``). The
-    seal lifecycle + its fail-closed-ordering pins run WITHOUT a backend (a fake sealer is
-    injected); only real sealing / the round-trip needs one, so this is raised lazily at
-    construction, never at import."""
+    """The age backend (``pyrage``) is not installed. The seal lifecycle + its fail-closed-ordering
+    pins run WITHOUT a backend (a fake sealer is injected); only real sealing / the round-trip needs
+    one, so this is raised lazily at construction, never at import."""
 
 
 class SealError(RuntimeError):
@@ -158,117 +147,96 @@ class SealOutcome:
     blob_path: str = ""
 
 
-# --- the concrete crypto backend (vendored pyca/cryptography; age is the future swap) ----------
+# --- the concrete crypto backend (age / pyrage — the OPERATOR-RULED production sealer) ----------
 
 
-class CryptographySealer:
-    """Asymmetric X25519 hybrid seal on the vendored ``cryptography`` library — ephemeral-static
-    ECDH → HKDF-SHA256 → AES-256-GCM, the recipient pubkey bound as AEAD associated data. Real
-    asymmetric property (public seals, offline private unseals); codebase-coupled retrieval (the
-    honest fallback the design flagged, §3.1). Lazy import → :class:`SealerUnavailable` if
-    ``cryptography`` is absent."""
+def _import_pyrage():
+    """Lazy-import ``pyrage`` (the age file-encryption lib), raising :class:`SealerUnavailable` when
+    absent so the module + its fail-closed-ordering pins load and run WITHOUT the crypto dep (tests
+    inject a fake sealer). Only real sealing / the round-trip needs it."""
+    try:
+        import pyrage
+        from pyrage import x25519
+    except ImportError as exc:  # pragma: no cover — exercised via the SealerUnavailable pin below
+        raise SealerUnavailable(
+            "the `pyrage` age library is not installed — cannot seal (the operator ruled age as the "
+            "seal backend, design §3.1). The seal lifecycle + its fail-closed-ordering pins run "
+            "WITHOUT it via an injected fake sealer; only real sealing / the round-trip needs it."
+        ) from exc
+    return pyrage, x25519
+
+
+class AgeSealer:
+    """The production sealer — standard **age** X25519 recipient encryption (via ``pyrage``), the
+    operator-ruled backend (2026-07-19, design §3.1). The daemon holds ONLY the recipient PUBLIC key
+    (an ``age1…`` string); the offline PRIVATE key (``AGE-SECRET-KEY-…``) opens the archive. A
+    live-compromised daemon cannot decrypt. The decisive property over a bespoke blob: an age file is
+    a self-describing standard, decryptable a decade from now with the stock ``age`` binary WITHOUT
+    this codebase (the 13d offline-retrieval guarantee). Lazy import → :class:`SealerUnavailable`.
+
+    The :class:`Sealer` protocol is bytes-in/bytes-out, so the recipient/identity are passed as the
+    UTF-8 bytes of their canonical bech32 strings (``recipient_public_key`` = ``str(recipient)``
+    encoded; ``private_key`` = ``str(identity)`` encoded). All pyrage parse/crypto errors are wrapped
+    as the module's typed :class:`SealError` (findings 18/19 — a corrupt/degenerate key never escapes
+    as an untyped ValueError the sweep would misclassify as a crash)."""
 
     cipher = SEAL_CIPHER
 
     def __init__(self) -> None:
+        self._pyrage, self._x25519 = _import_pyrage()
+
+    def _recipient(self, recipient_public_key: bytes):
         try:
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric.x25519 import (
-                X25519PrivateKey, X25519PublicKey,
-            )
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        except ImportError as exc:  # pragma: no cover — exercised via SealerUnavailable pin
-            raise SealerUnavailable(
-                "no age library or `cryptography` is available to seal — install a crypto backend "
-                "(the operator dependency decision, design §3.1). The seal lifecycle + its "
-                "fail-closed-ordering pins run without one via an injected fake sealer."
-            ) from exc
-        self._PrivateKey = X25519PrivateKey
-        self._PublicKey = X25519PublicKey
-        self._AESGCM = AESGCM
-        self._HKDF = HKDF
-        self._hashes = hashes
-        self._serialization = serialization
+            return self._x25519.Recipient.from_str(recipient_public_key.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 — UnicodeDecodeError OR pyrage RecipientError, both typed
+            # pyrage raises RecipientError on a non-canonical / malformed / degenerate recipient
+            # (bech32 validation is canonical — closes findings 18/19).
+            raise SealError(f"recipient public key is not a valid age recipient: {exc}") from exc
 
-    def _raw_public(self, key) -> bytes:
-        return key.public_bytes(
-            self._serialization.Encoding.Raw, self._serialization.PublicFormat.Raw)
-
-    def _derive_key(self, shared: bytes, epk_raw: bytes, recipient_raw: bytes) -> bytes:
-        return self._HKDF(
-            algorithm=self._hashes.SHA256(), length=32, salt=None,
-            info=_HKDF_INFO + epk_raw + recipient_raw,
-        ).derive(shared)
+    def _identity(self, private_key: bytes):
+        try:
+            return self._x25519.Identity.from_str(private_key.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 — UnicodeDecodeError OR pyrage IdentityError, both typed
+            raise SealError(f"private key is not a valid age identity: {exc}") from exc
 
     def seal(self, plaintext: bytes, recipient_public_key: bytes) -> bytes:
-        if len(recipient_public_key) != _X25519_KEY_LEN:
-            raise SealError(
-                f"recipient public key must be {_X25519_KEY_LEN} raw X25519 bytes "
-                f"(got {len(recipient_public_key)})")
-        ephemeral = self._PrivateKey.generate()
-        epk_raw = self._raw_public(ephemeral.public_key())
-        recipient = self._PublicKey.from_public_bytes(recipient_public_key)
-        shared = ephemeral.exchange(recipient)
-        key = self._derive_key(shared, epk_raw, recipient_public_key)
-        nonce = os.urandom(_NONCE_LEN)
-        ct = self._AESGCM(key).encrypt(nonce, plaintext, recipient_public_key)
-        return _SEAL_MAGIC + epk_raw + nonce + ct
+        recipient = self._recipient(recipient_public_key)
+        try:
+            return self._pyrage.encrypt(plaintext, [recipient])
+        except Exception as exc:  # noqa: BLE001 — any age encrypt failure is a typed seal failure
+            raise SealError(f"age encryption failed: {exc}") from exc
 
     def verify_wellformed(self, blob: bytes) -> bool:
-        """Structural check WITHOUT the private key (the daemon holds only the public key): the
-        magic + a minimum length that admits a header + a bare AEAD tag. This is the seal-time
-        self-verify's structural half; the digest-stable (torn-write) half is in
-        :func:`seal_encounter`."""
-        return (
-            len(blob) >= len(_SEAL_MAGIC) + _EPK_LEN + _NONCE_LEN + _TAG_LEN
-            and blob[: len(_SEAL_MAGIC)] == _SEAL_MAGIC
-        )
+        """Structural check WITHOUT the private key (the daemon holds only the recipient): every age
+        ciphertext begins with the ``age-encryption.org/v1`` intro line. The digest-stable
+        (torn-write) half of the self-verify is in :func:`seal_encounter`."""
+        return blob[: len(_AGE_HEADER_PREFIX)] == _AGE_HEADER_PREFIX
 
     def unseal(self, blob: bytes, private_key: bytes) -> bytes:
-        if not self.verify_wellformed(blob):
-            raise SealError("blob is not a well-formed STAYC seal (bad magic / too short)")
-        if len(private_key) != _X25519_KEY_LEN:
-            raise SealError(
-                f"private key must be {_X25519_KEY_LEN} raw X25519 bytes (got {len(private_key)})")
-        off = len(_SEAL_MAGIC)
-        epk_raw = blob[off:off + _EPK_LEN]
-        off += _EPK_LEN
-        nonce = blob[off:off + _NONCE_LEN]
-        off += _NONCE_LEN
-        ct = blob[off:]
-        priv = self._PrivateKey.from_private_bytes(private_key)
-        recipient_raw = self._raw_public(priv.public_key())
-        shared = priv.exchange(self._PublicKey.from_public_bytes(epk_raw))
-        key = self._derive_key(shared, epk_raw, recipient_raw)
+        identity = self._identity(private_key)
         try:
-            return self._AESGCM(key).decrypt(nonce, ct, recipient_raw)
-        except Exception as exc:  # noqa: BLE001 — any AEAD failure is an unseal failure
-            raise SealError("seal decryption/authentication failed") from exc
+            return self._pyrage.decrypt(blob, [identity])
+        except Exception as exc:  # noqa: BLE001 — wrong identity / tamper → DecryptError → SealError
+            raise SealError("age decryption/authentication failed") from exc
 
 
 def make_default_sealer() -> Sealer:
-    """The production sealer (vendored ``cryptography`` X25519 hybrid). Raises
-    :class:`SealerUnavailable` if no crypto backend is installed."""
-    return CryptographySealer()
+    """The production sealer (age / ``pyrage``). Raises :class:`SealerUnavailable` if ``pyrage`` is
+    absent."""
+    return AgeSealer()
 
 
 def generate_keypair() -> tuple[bytes, bytes]:
-    """Mint a raw X25519 ``(public, private)`` keypair (32 bytes each). The 13d keygen ceremony +
-    the round-trip test's TEST keypair. Raises :class:`SealerUnavailable` if ``cryptography`` is
-    absent."""
-    try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-    except ImportError as exc:  # pragma: no cover
-        raise SealerUnavailable("cryptography is not installed — cannot generate a keypair") from exc
-    priv = X25519PrivateKey.generate()
-    priv_raw = priv.private_bytes(
-        serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
-        serialization.NoEncryption())
-    pub_raw = priv.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    return pub_raw, priv_raw
+    """Mint an age X25519 ``(public, private)`` keypair as the UTF-8 bytes of their canonical bech32
+    strings — ``public`` = ``age1…`` recipient, ``private`` = ``AGE-SECRET-KEY-…`` identity. The 13d
+    keygen ceremony + the round-trip test's TEST keypair. Raises :class:`SealerUnavailable` if
+    ``pyrage`` is absent. ``generate_keypair`` always emits CANONICAL bytes (finding 18's corruption
+    surface only applies to a hand-edited on-box key file)."""
+    _pyrage, x25519 = _import_pyrage()
+    identity = x25519.Identity.generate()
+    pub = str(identity.to_public()).encode("utf-8")
+    priv = str(identity).encode("utf-8")
+    return pub, priv
 
 
 # --- tar / manifest helpers (deterministic; unseal recovers the manifest) ----------------------
@@ -512,8 +480,9 @@ def seal_encounter(
 
     ``recipient_public_key`` is the 32-byte raw X25519 pubkey the caller loaded from the seal-dir
     (tests pass a test pubkey). ``retained_dir`` is the RESOLVED absolute blob-store dir (the caller
-    does the empty-⇒-derive resolution; this function takes a concrete path). ``mode`` is the
-    resolved ``retained|transient`` posture (§3.5)."""
+    does the empty-⇒-derive resolution; this function takes a concrete path). ``recipient_public_key``
+    is the age recipient (an ``age1…`` string, UTF-8 bytes) the caller loaded from the seal-dir (tests
+    pass a fake pubkey). ``mode`` is the resolved ``retained|transient`` posture (§3.5)."""
     enc_dir = Path(enc_dir)
     retained_dir = Path(retained_dir)
 

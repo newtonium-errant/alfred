@@ -35,6 +35,13 @@ temporal = ["temporalio>=1.9.0"]
 # ``fake`` provider needs no dep (CI + the unconditional fake-backend coverage).
 scribe = [
     "faster-whisper>=1.0",
+    # STAY-C retention seal (#13, slice 13a/b/c). OPERATOR-RULED backend (2026-07-19, design §3.1):
+    # standard **age** X25519 recipient encryption via pyrage. age was chosen over a bespoke/pyca
+    # blob because a ~10-year medico-legal archive must be openable with the stock `age` binary
+    # WITHOUT this codebase (decade-scale standalone retrieval, the 13d offline-key path). pyrage
+    # ships a self-contained Rust wheel (manylinux x86_64 verified), torch-free, so [scribe] stays
+    # CI/torch-free. The keygen ceremony + offline-binary decrypt verification are slice 13d.
+    "pyrage>=1.1",
 ]
 # STAY-C sovereign scribe multi-speaker diarization (scribe P4). pyannote.audio
 # resolves speaker turns on-box (loads its embedding model offline from the local

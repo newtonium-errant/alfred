@@ -3,7 +3,7 @@
 Contract-first. The FAIL-CLOSED SEAL ORDERING is the highest-stakes invariant (crypto + medico-
 legal), so its pins run UNCONDITIONALLY via an injected deterministic fake sealer (no crypto dep) —
 per the regression-pin-unconditional rule. Only the ACTUAL-crypto round-trip is dep-gated behind
-``cryptography`` (design §10 last bullet). Covered here:
+``pyrage`` (the operator-ruled age backend; design §10 last bullet). Covered here:
 
   * config: retention block load, fail-SAFE mode normalization, schema-tolerance, defaults.
   * emitters: the 5 typed retention emitters — exact (stream, kind, actor) + PHI-free scalar payloads
@@ -476,57 +476,84 @@ def test_transient_is_not_the_default(tmp_path):
     assert len(_sealed_rows(ev)) == 1
 
 
-# ============================ actual-crypto round-trip (DEP-GATED) ============================
+# ============================ actual-crypto round-trip (DEP-GATED on pyrage/age) ============================
 
 
-def test_cryptography_seal_roundtrip_byte_identical(tmp_path):
-    pytest.importorskip("cryptography")   # ONLY the real-crypto round-trip is dep-gated (§10)
+def test_age_seal_roundtrip_byte_identical(tmp_path):
+    pytest.importorskip("pyrage")   # ONLY the real-crypto round-trip is dep-gated (§10)
     from alfred.scribe.retention import (
-        CryptographySealer, build_seal_tar, extract_seal_tar, generate_keypair,
+        AgeSealer, build_seal_tar, extract_seal_tar, generate_keypair,
     )
     pub, priv = generate_keypair()
-    sealer = CryptographySealer()
-    assert sealer.cipher == SEAL_CIPHER
+    sealer = AgeSealer()
+    assert sealer.cipher == SEAL_CIPHER == "age-x25519"
     gathered = [(1, "chunk_1.webm", b"audio-one"), (2, "chunk_2.webm", b"audio-two")]
     manifest = [{"seq": s, "sha256": sha256_hex(d), "bytes": len(d)} for (s, _n, d) in gathered]
     tar = build_seal_tar(gathered, manifest)
     blob = sealer.seal(tar, pub)
-    assert sealer.verify_wellformed(blob)
+    assert sealer.verify_wellformed(blob)                  # age-encryption.org header
+    assert blob.startswith(b"age-encryption.org/")
     recovered = extract_seal_tar(sealer.unseal(blob, priv))
     assert recovered["chunk_1.webm"] == b"audio-one"
     assert recovered["chunk_2.webm"] == b"audio-two"
     assert SEAL_MANIFEST_NAME in recovered
 
 
-def test_cryptography_wrong_key_and_tamper_fail(tmp_path):
-    pytest.importorskip("cryptography")
-    from alfred.scribe.retention import CryptographySealer, SealError, generate_keypair
+def test_age_wrong_key_and_tamper_fail_typed(tmp_path):
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import AgeSealer, SealError, generate_keypair
     pub, priv = generate_keypair()
     _pub2, priv2 = generate_keypair()
-    sealer = CryptographySealer()
+    sealer = AgeSealer()
     blob = sealer.seal(b"secret-audio", pub)
     with pytest.raises(SealError):
-        sealer.unseal(blob, priv2)                 # wrong private key → AEAD auth fails
+        sealer.unseal(blob, priv2)                 # wrong identity → age auth fails (typed SealError)
     tampered = bytearray(blob)
     tampered[-1] ^= 0xFF                            # flip a ciphertext byte
     with pytest.raises(SealError):
-        sealer.unseal(bytes(tampered), priv)       # even the CORRECT key fails auth on tamper
+        sealer.unseal(bytes(tampered), priv)       # even the CORRECT key fails on tamper
 
 
-def test_cryptography_end_to_end_seal_unseals_to_chunks(tmp_path):
-    pytest.importorskip("cryptography")
-    from alfred.scribe.retention import CryptographySealer, extract_seal_tar, generate_keypair
+def test_age_malformed_recipient_is_typed_sealerror(tmp_path):
+    # findings 18/19: a corrupt/degenerate recipient must raise the module's TYPED SealError (age's
+    # bech32 parse is canonical), NOT an untyped ValueError the 13b sweep would misclassify as a crash.
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import AgeSealer, SealError
+    sealer = AgeSealer()
+    with pytest.raises(SealError):
+        sealer.seal(b"audio", b"not-a-valid-age-recipient")
+    with pytest.raises(SealError):
+        sealer.seal(b"audio", b"age1thisisnotcanonicalbech32xxxxxxxxxxxxxxxxxxxxxx")
+
+
+def test_age_end_to_end_seal_unseals_to_chunks(tmp_path):
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import AgeSealer, extract_seal_tar, generate_keypair
     pub, priv = generate_keypair()
     ev = _events(tmp_path)
     enc_dir = _make_encounter(tmp_path, n_chunks=2)
     original = {f"chunk_{s}.webm": (enc_dir / f"chunk_{s}.webm").read_bytes() for s in (1, 2)}
-    out = seal_encounter(enc_dir, _ENC, events=ev, sealer=CryptographySealer(),
+    out = seal_encounter(enc_dir, _ENC, events=ev, sealer=AgeSealer(),
                          recipient_public_key=pub, retained_dir=tmp_path / "retained")
     assert out.status == SEAL_STATUS_SEALED
     blob = (tmp_path / "retained" / f"{_ENC}{SEAL_BLOB_SUFFIX}").read_bytes()
-    members = extract_seal_tar(CryptographySealer().unseal(blob, priv))
+    members = extract_seal_tar(AgeSealer().unseal(blob, priv))
     for name, data in original.items():
         assert members[name] == data          # byte-identical round-trip
+
+
+def test_sealer_unavailable_when_pyrage_absent(monkeypatch):
+    # finding 20: the stale '# pragma: no cover — exercised via SealerUnavailable pin' now has a REAL
+    # pin. Simulate pyrage being absent → AgeSealer()/generate_keypair() raise SealerUnavailable, and
+    # the module still imports (the lazy-import guarantee the ordering pins rely on).
+    import sys
+    from alfred.scribe.retention import AgeSealer, SealerUnavailable, generate_keypair
+    monkeypatch.setitem(sys.modules, "pyrage", None)          # import pyrage → ImportError
+    monkeypatch.setitem(sys.modules, "pyrage.x25519", None)
+    with pytest.raises(SealerUnavailable):
+        AgeSealer()
+    with pytest.raises(SealerUnavailable):
+        generate_keypair()
 
 
 # ============================ wipe residue observability (§3.3 findings 5/8/16) ============================
