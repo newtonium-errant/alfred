@@ -34,6 +34,8 @@ from typing import Any
 
 import yaml
 
+from .utils import SectionReadStatus, safe_read_section_file
+
 
 def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
     """Parse YAML frontmatter out of a Markdown file.
@@ -44,10 +46,14 @@ def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
     """
     if not path.exists():
         return None
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+    # Defensive read via the shared helper — the old bare ``except OSError``
+    # missed UnicodeDecodeError (a ValueError subclass), so a non-UTF-8 BIT
+    # record escaped this degrade path and crashed the whole brief (this
+    # render is called BARE by the daemon).
+    read = safe_read_section_file(path)
+    if read.status is not SectionReadStatus.OK:
         return None
+    text = read.text
     if not text.startswith("---"):
         return None
     match = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
@@ -96,9 +102,17 @@ def _read_state_latest(state_path: Path) -> dict[str, Any] | None:
     """Fall back to the BIT state file's most recent run."""
     if not state_path.exists():
         return None
+    # Defensive read via the shared helper. The old ``(OSError,
+    # json.JSONDecodeError)`` catch missed UnicodeDecodeError — a sibling of
+    # JSONDecodeError under ValueError, NOT a subclass — so a non-UTF-8 state
+    # file escaped and crashed the brief. Helper handles the read; the
+    # json.loads catch below stays for JSON-syntax errors on a clean read.
+    read = safe_read_section_file(state_path)
+    if read.status is not SectionReadStatus.OK:
+        return None
     try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(read.text)
+    except json.JSONDecodeError:
         return None
     runs = data.get("runs") or []
     if not runs:
@@ -178,7 +192,18 @@ def render_health_section(
     if record_path is not None:
         frontmatter = _parse_frontmatter(record_path)
         if frontmatter is not None:
-            body = record_path.read_text(encoding="utf-8")
+            # Guard the second (body) read too. ``_parse_frontmatter`` just
+            # read this file cleanly, but a race / transient I/O error here
+            # would otherwise crash the whole brief (bare render). On a
+            # body-read failure, render from the already-parsed frontmatter
+            # with an empty body — ``_render_from_frontmatter`` falls back to
+            # ``tool_counts`` when the body yields no per-tool lines.
+            body_read = safe_read_section_file(record_path)
+            body = (
+                body_read.text
+                if body_read.status is SectionReadStatus.OK
+                else ""
+            )
             return _render_from_frontmatter(
                 frontmatter,
                 body,

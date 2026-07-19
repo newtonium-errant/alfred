@@ -143,3 +143,74 @@ def test_tier_validate_missing_file_message(tmp_path) -> None:
     assert (_validate_frontmatter_yaml(tmp_path / "gone.md") or "").startswith(
         "read failed:"
     )
+
+
+# --- migrated 4th site: health_section (bare-called render path) -----------
+
+
+def test_health_non_utf8_bit_record_does_not_crash(tmp_path) -> None:
+    """A non-UTF-8 BIT record must NOT crash the brief. ``_parse_frontmatter``
+    used a bare ``except OSError`` that missed UnicodeDecodeError; the render
+    is called BARE by the daemon, so it escaped and killed the whole brief.
+    Now it degrades to the no-record sentinel. Mutation: revert
+    _parse_frontmatter to ``except OSError`` → this raises."""
+    from alfred.brief.health_section import render_health_section
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "Alfred BIT 2026-07-19.md").write_bytes(
+        b"---\noverall_status: ok\xff\xfe\n---\nbody\n",
+    )
+    out = render_health_section(tmp_path, state_path=None, today="2026-07-19")
+    assert "No BIT run recorded yet" in out
+
+
+def test_health_non_utf8_state_file_does_not_crash(tmp_path) -> None:
+    """A non-UTF-8 BIT STATE file must NOT crash the brief either.
+    ``_read_state_latest`` caught ``(OSError, json.JSONDecodeError)`` —
+    UnicodeDecodeError is a SIBLING of JSONDecodeError under ValueError, not a
+    subclass, so it escaped. Now it degrades. Mutation: revert the state
+    read's catch → this raises."""
+    from alfred.brief.health_section import render_health_section
+
+    state = tmp_path / "bit_state.json"
+    state.write_bytes(b"\xff\xfe not utf-8")
+    # No vault records → falls through to the state file → decode fail → sentinel.
+    out = render_health_section(tmp_path, state_path=state, today="2026-07-19")
+    assert "No BIT run recorded yet" in out
+
+
+def test_health_body_read_failure_degrades_to_frontmatter(tmp_path, monkeypatch) -> None:
+    """If the second (body) read fails after the frontmatter read succeeded
+    (a race / transient I/O error), the section still renders from the parsed
+    frontmatter instead of crashing. Forces the 2nd helper call to fail."""
+    from alfred.brief import health_section as hs
+    from alfred.brief.utils import SectionRead, SectionReadStatus
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "Alfred BIT 2026-07-19.md").write_text(
+        "---\n"
+        "overall_status: ok\n"
+        "mode: quick\n"
+        "created: 2026-07-19\n"
+        "started: 2026-07-19T05:55:00\n"
+        "name: Alfred BIT 2026-07-19\n"
+        "tool_counts:\n"
+        "  curator: 1\n"
+        "---\nbody\n",
+        encoding="utf-8",
+    )
+    real = hs.safe_read_section_file
+    state = {"n": 0}
+
+    def flaky(path):
+        state["n"] += 1
+        if state["n"] == 2:  # the body read (2nd call for this record)
+            return SectionRead(SectionReadStatus.OS_ERROR, None, "boom", "OSError")
+        return real(path)
+
+    monkeypatch.setattr(hs, "safe_read_section_file", flaky)
+    out = hs.render_health_section(tmp_path, state_path=None, today="2026-07-19")
+    assert "Overall:" in out          # rendered from frontmatter, no crash
+    assert "curator" in out           # tool_counts fallback (body was empty)
