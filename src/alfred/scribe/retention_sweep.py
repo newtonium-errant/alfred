@@ -32,6 +32,16 @@ CLINICAL-STORE GATE: encounter seal/wipe requires an ACTIVE clinical event store
 lifecycle is a clinical feature and a retained seal needs the durable ``retention.sealed`` record.
 Without an active store the sweep leaves audio UNTOUCHED (fail-safe: never wipe without the
 medico-legal store live). The telemetry prune (PHI-free) runs regardless.
+
+DESIGN BOUNDARY — closed-but-stuck INCOMPLETE encounters (A4, DEFERRED to a later slice): an
+encounter that IS ``_CLOSED`` but never reached ``STATE_READY`` because a promised tail chunk never
+arrived (``STATE_INCOMPLETE`` / a stuck ``STATE_DRAFTED`` WITH chunks) is neither the READY gate
+(§3.2) nor the abandoned gate (§3.6 keys on NO ``_CLOSED``). Such an encounter is SKIPPED here, so
+its plaintext audio is retained INDEFINITELY under LUKS — surfaced only by the pipeline's own
+``close_awaiting_promised_seq`` signal, not sealed by retention. This is a deliberate, flagged
+boundary: sealing a promised-but-incomplete encounter would seal a partial archive. The fail-loud
+manifest-mismatch recovery (§3.3, findings 2/3/7) makes a FUTURE grace-based defensive seal of these
+safe to add without risking the re-opened-encounter destruction path — deferred to the delta review.
 """
 from __future__ import annotations
 
