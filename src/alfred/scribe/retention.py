@@ -307,6 +307,16 @@ def _discover_seal_chunks(enc_dir: Path) -> list[tuple[Path, int]]:
     return found
 
 
+def encounter_has_chunks(enc_dir: str | Path) -> bool:
+    """True iff ``enc_dir`` holds at least one ``chunk_<seq>.<ext>`` audio file — the 13b sweep's
+    zero-chunk gate (a CLOSED zero-chunk encounter is DISPOSED, not sealed, §E). A missing dir → False
+    (never raise on a vanished dir)."""
+    p = Path(enc_dir)
+    if not p.is_dir():
+        return False
+    return bool(_discover_seal_chunks(p))
+
+
 # --- atomic write + plaintext wipe -------------------------------------------------------------
 
 

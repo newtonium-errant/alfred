@@ -62,11 +62,13 @@ log = structlog.get_logger("scribe.retention.sweep")
 # prune is log-rotation, not a scheduled PHI destruction, so it carries the design's fixed 180 now.
 _DIARIZE_STATS_PRUNE_DAYS = 180
 
-# The recipient public key length the current seal backend expects — a raw X25519 public key
-# (``retention.CryptographySealer``). This reader is the counterpart to the 13d ``retention keygen``
-# ceremony: BOTH swap together if the operator picks the age-format backend (design §3.1), exactly
-# like ``retention.SEAL_CIPHER`` / ``SEAL_BLOB_SUFFIX``. A wrong-length file is a MALFORMED key.
-_RECIPIENT_PUBKEY_LEN = 32
+# The recipient public key the current (age / pyrage) seal backend expects — a canonical age
+# recipient string, ``age1…`` (bech32). This reader is the counterpart to the 13d ``retention keygen``
+# ceremony (which writes ``str(recipient)``); both are the age backend's contract, like
+# ``retention.SEAL_CIPHER`` / ``SEAL_BLOB_SUFFIX``. The sweep does a LIGHTWEIGHT prefix check for the
+# once-latched malformed signal; the real (canonical bech32) parse happens in ``AgeSealer.seal`` (which
+# raises the typed SealError on a bad recipient — per-encounter isolated), keeping the sweep dep-agnostic.
+_AGE_RECIPIENT_PREFIX = "age1"
 
 
 def _parse_iso(ts: Any) -> datetime | None:
@@ -94,6 +96,9 @@ class RetentionSweepSummary:
     transient_wiped: int = 0         # §3.5 — wiped WITHOUT sealing (config-visible posture)
     no_chunks: int = 0               # an eligible dir with no audio on disk (declined/empty)
     verify_failed: int = 0           # a seal self-verify failed — plaintext left intact, retry next sweep
+    empty_disposed: int = 0          # §E — a CLOSED zero-chunk encounter disposed (PHI-named dir removed)
+    wipe_incomplete: int = 0         # a COMMITTED seal whose plaintext wipe left residue — OPERATOR ESCALATION
+    recovery_mismatch: int = 0       # already-sealed recovery FAILED CLOSED (blob/manifest) — OPERATOR ESCALATION
     skipped: int = 0                 # not eligible (still accumulating / closed-but-not-ready / in grace)
     encounter_errors: int = 0        # per-encounter failures, ISOLATED (the sweep continued)
     pruned_telemetry_rows: int = 0   # diarize_stats rows dropped (age-based, PHI-free log rotation)
@@ -103,8 +108,14 @@ class RetentionSweepSummary:
 
     def did_work(self) -> int:
         return (self.sealed_ready + self.sealed_abandoned + self.already_sealed
-                + self.transient_wiped + self.verify_failed + self.pruned_telemetry_rows
+                + self.transient_wiped + self.verify_failed + self.empty_disposed
+                + self.wipe_incomplete + self.recovery_mismatch + self.pruned_telemetry_rows
                 + self.encounter_errors + self.review_due)
+
+    def needs_operator_attention(self) -> bool:
+        """wipe_incomplete / recovery_mismatch are FAIL-CLOSED states that leave PHI on disk or a
+        chain/blob divergence — the sweep must not bury them in a routine summary."""
+        return bool(self.wipe_incomplete or self.recovery_mismatch)
 
 
 class RetentionSweep:
@@ -112,8 +123,8 @@ class RetentionSweep:
     observations, latched once so a steady-state condition never spams). One instance per daemon.
 
     ``sealer_factory`` is injectable so the trigger/contract pins run UNCONDITIONALLY with a fake
-    sealer (no crypto dep); production uses :func:`retention.make_default_sealer` (the vendored
-    ``cryptography`` X25519 backend)."""
+    sealer (no crypto dep); production uses :func:`retention.make_default_sealer` (the age / ``pyrage``
+    backend)."""
 
     def __init__(
         self,
@@ -145,8 +156,9 @@ class RetentionSweep:
         summary = RetentionSweepSummary(mode=mode)
         now_iso = now_dt.isoformat()
 
-        # CLINICAL-STORE GATE + seal-resource resolution. Encounter seal/wipe needs an active store
-        # (durable record); retained mode additionally needs the sealer + the recipient pubkey.
+        # CLINICAL-STORE GATE. ALL encounter work (seal/wipe AND the §E empty-closed disposal, which
+        # reads the chain for idempotency) needs an active store; the retained SEAL additionally needs
+        # the sealer + recipient pubkey. Disposal needs NO crypto, so it rides can_process, not can_seal.
         sealer: ret.Sealer | None = None
         pubkey = b""
         can_process = True
@@ -158,16 +170,18 @@ class RetentionSweep:
                        "retained seal needs the durable retention.sealed record; never wipe audio "
                        "without the medico-legal store live). The PHI-free telemetry prune still runs.")
             can_process = False
+        # can_seal: the READY/abandoned SEAL path is usable. Transient wipe needs no key; retained
+        # needs the sealer + pubkey. Disposal of empty-closed dirs proceeds even without a key.
+        can_seal = mode == RETENTION_MODE_TRANSIENT
         if can_process and mode == RETENTION_MODE_RETAINED:
             sealer = self._resolve_sealer()
             pubkey = self._resolve_pubkey()
-            if sealer is None or pubkey == b"":
-                can_process = False
-        summary.sealing_available = can_process
+            can_seal = sealer is not None and pubkey != b""
+        summary.sealing_available = can_process and can_seal
 
-        # (1)+(2) seal READY / defensively-seal abandoned — enumerate input_dir subdirs.
+        # (1)+(2) seal READY / defensively-seal abandoned + (§E) dispose empty-closed — enumerate subdirs.
         if can_process:
-            self._process_encounters(state, now_dt, now_iso, sealer, pubkey, summary)
+            self._process_encounters(state, now_dt, now_iso, sealer, pubkey, can_seal, summary)
 
         # (3) over-window surfacing SEAM (§4) — no schedule ⇒ latched ILB, never auto-destroy.
         self._surface_over_window(now_dt, summary)
@@ -187,22 +201,37 @@ class RetentionSweep:
             transient_wiped=summary.transient_wiped,
             no_chunks=summary.no_chunks,
             verify_failed=summary.verify_failed,
+            empty_disposed=summary.empty_disposed,
+            wipe_incomplete=summary.wipe_incomplete,
+            recovery_mismatch=summary.recovery_mismatch,
             skipped=summary.skipped,
             encounter_errors=summary.encounter_errors,
             pruned_telemetry_rows=summary.pruned_telemetry_rows,
             review_due=summary.review_due,
             sealing_available=summary.sealing_available,
             schedule_present=summary.schedule_present,
+            needs_operator_attention=summary.needs_operator_attention(),
             detail=("ran, nothing to do — no retention work this sweep" if did == 0
                     else "retention sweep completed with work"),
         )
+        if summary.needs_operator_attention():
+            # Fail-closed states (PHI residue / chain-blob divergence) must be loud, not buried in the
+            # routine summary — a distinct error the operator's grep/alert workflow keys on.
+            log.error(
+                "scribe.retention.sweep.needs_operator_attention",
+                wipe_incomplete=summary.wipe_incomplete,
+                recovery_mismatch=summary.recovery_mismatch,
+                detail="retention sweep left encounters in a FAIL-CLOSED state — either plaintext PHI "
+                       "could not be wiped after a committed seal (wipe_incomplete), or an already-sealed "
+                       "recovery refused to wipe against a missing/mismatched blob (recovery_mismatch). "
+                       "Operator reconciliation required; the next sweep retries the safe cases.")
         return summary
 
     # --- (1)+(2) encounter enumeration + gate ----------------------------
 
     def _process_encounters(
         self, state: ScribeState, now_dt: datetime, now_iso: str,
-        sealer: "ret.Sealer | None", pubkey: bytes, summary: RetentionSweepSummary,
+        sealer: "ret.Sealer | None", pubkey: bytes, can_seal: bool, summary: RetentionSweepSummary,
     ) -> None:
         cfg = self._config
         input_dir = Path(cfg.input_dir)
@@ -220,7 +249,7 @@ class RetentionSweep:
             try:
                 self._process_one(
                     enc_dir, state, now_dt, now_iso, sealer, pubkey, retained_dir,
-                    grace_days, summary)
+                    grace_days, can_seal, summary)
             except EncounterIdentityError:
                 # A missing/unresolved encounter salt makes EVERY id uncomputable — latch once (not
                 # per-encounter-per-tick spam) and skip; a sovereign scribe never seals under an
@@ -242,7 +271,7 @@ class RetentionSweep:
     def _process_one(
         self, enc_dir: Path, state: ScribeState, now_dt: datetime, now_iso: str,
         sealer: "ret.Sealer | None", pubkey: bytes, retained_dir: Path,
-        grace_days: int, summary: RetentionSweepSummary,
+        grace_days: int, can_seal: bool, summary: RetentionSweepSummary,
     ) -> None:
         cfg = self._config
         encounter_id = compute_encounter_id(enc_dir.name, salt=cfg.encounter_salt)
@@ -250,13 +279,19 @@ class RetentionSweep:
         st = state.get(encounter_id)
         is_ready = st is not None and st.state == STATE_READY
 
-        if is_ready:
+        if closed and not ret.encounter_has_chunks(enc_dir):
+            # §E — a CLOSED zero-chunk encounter (clinician opened, no audio, /close) is DISPOSED, not
+            # sealed: the PHI-named dir must not persist with 'nothing to do' logged forever. Needs no
+            # crypto (nothing to seal), so it proceeds even when can_seal is False (pre-13d keygen).
+            gate = "empty_closed"
+        elif is_ready and can_seal:
             gate = "ready"
-        elif not closed and self._is_abandoned(enc_dir, now_dt, grace_days):
+        elif not closed and can_seal and self._is_abandoned(enc_dir, now_dt, grace_days):
             gate = "abandoned"
         else:
-            # Still accumulating (fresh, un-closed), closed-but-not-yet-READY (DRAFTED/INCOMPLETE —
-            # surfaced by the pipeline's own signals), or inside the abandon grace → not eligible.
+            # Still accumulating (fresh, un-closed), closed-but-not-yet-READY WITH chunks
+            # (DRAFTED/INCOMPLETE — the pipeline's own signals cover it), inside the abandon grace, or
+            # a READY/abandoned encounter we cannot seal yet (no key) → not eligible this sweep.
             summary.skipped += 1
             return
 
@@ -277,6 +312,12 @@ class RetentionSweep:
             summary.already_sealed += 1
         elif status == ret.SEAL_STATUS_TRANSIENT_WIPED:
             summary.transient_wiped += 1
+        elif status == ret.SEAL_STATUS_EMPTY_DISPOSED:
+            summary.empty_disposed += 1
+        elif status == ret.SEAL_STATUS_WIPE_INCOMPLETE:
+            summary.wipe_incomplete += 1
+        elif status == ret.SEAL_STATUS_RECOVERY_MISMATCH:
+            summary.recovery_mismatch += 1
         elif status == ret.SEAL_STATUS_NO_CHUNKS:
             summary.no_chunks += 1
         elif status == ret.SEAL_STATUS_VERIFY_FAILED:
@@ -421,29 +462,27 @@ class RetentionSweep:
         return Path(self._config.input_dir).parent / "retained"
 
     def _resolve_sealer(self) -> "ret.Sealer | None":
-        """The production sealer (13a's ``retention.make_default_sealer`` — the ``cryptography`` X25519
-        backend behind the ``Sealer`` seam), or ``None`` — latched — if no crypto backend is installed.
-        A missing backend never crashes the daemon loop; sealing is simply skipped until the crypto dep
-        is present. NOTE: the crypto dep is DELIBERATELY UNDECLARED in pyproject pending the operator's
-        age-format-vs-cryptography ruling (design §3.1) — that declaration lands as a follow-up commit
-        once ruled, so the sweep stays dep-agnostic and this latched-skip is the honest steady state
-        until then."""
+        """The production sealer (13a's ``retention.make_default_sealer`` — the age / ``pyrage`` backend
+        behind the ``Sealer`` seam), or ``None`` — latched — if ``pyrage`` is not installed. A missing
+        backend never crashes the daemon loop; sealing is simply skipped until the (declared) dep is
+        present. The sweep stays dep-agnostic (it uses the injected sealer; tests pass a fake)."""
         try:
             return self._sealer_factory()
         except ret.SealerUnavailable:
             self._latch_log(
                 "no_sealer",
                 "scribe.retention.sweep.sealer_unavailable",
-                detail="no crypto backend is installed to seal — retention sealing is SKIPPED. The "
-                       "crypto dep is undeclared pending the operator's seal-backend ruling (design "
-                       "§3.1); it lands as a follow-up commit once ruled. Latched once.")
+                detail="the age backend (pyrage) is not installed — retention sealing is SKIPPED until "
+                       "the declared dep is present. Latched once.")
             return None
 
     def _resolve_pubkey(self) -> bytes:
-        """The recipient PUBLIC key the sweep seals to, read from ``retention.seal_public_key_path``.
-        Returns ``b""`` — latched — when the path is unset (no keygen yet — the 13d ceremony), the
-        file is absent, or it is not a well-formed raw X25519 pubkey. Re-checked every sweep, so
-        sealing begins automatically once the operator runs keygen (no restart)."""
+        """The recipient PUBLIC key the sweep seals to, read from ``retention.seal_public_key_path`` —
+        a canonical age recipient (``age1…``), returned as UTF-8 bytes for the ``Sealer`` protocol.
+        Returns ``b""`` — latched — when the path is unset (no keygen yet — the 13d ceremony), the file
+        is absent, or its content is not age-recipient-shaped. Re-checked every sweep, so sealing begins
+        automatically once the operator runs keygen (no restart). The lightweight ``age1`` prefix check
+        is only for the once-latched malformed signal; ``AgeSealer.seal`` does the canonical parse."""
         path = self._config.retention.seal_public_key_path
         if not path:
             self._latch_log(
@@ -461,21 +500,21 @@ class RetentionSweep:
                        "sealing is SKIPPED until the keygen ceremony (13d) writes it. Latched once.")
             return b""
         try:
-            raw = p.read_bytes()
+            recipient = p.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             return b""
-        if len(raw) != _RECIPIENT_PUBKEY_LEN:
+        if not recipient.startswith(_AGE_RECIPIENT_PREFIX):
             self._latch_log(
                 "pubkey_malformed",
                 "scribe.retention.sweep.seal_public_key_malformed",
-                detail=f"the seal public key is not a {_RECIPIENT_PUBKEY_LEN}-byte raw X25519 key "
-                       f"(got {len(raw)} bytes) — retention sealing is SKIPPED (a wrong key would "
-                       f"seal to an un-openable recipient). Latched once.")
+                detail=f"the seal public key is not an age recipient (expected an '{_AGE_RECIPIENT_PREFIX}"
+                       f"…' string) — retention sealing is SKIPPED (a wrong key would seal to an "
+                       f"un-openable recipient). Latched once.")
             return b""
         # A good key clears any prior absent/malformed latch so a later disappearance re-warns.
         self._latched.discard("no_pubkey")
         self._latched.discard("pubkey_malformed")
-        return raw
+        return recipient.encode("utf-8")
 
     # --- latch helper -----------------------------------------------------
 

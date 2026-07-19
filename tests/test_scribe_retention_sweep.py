@@ -37,7 +37,9 @@ from alfred.scribe.state import STATE_DRAFTED, STATE_READY, ScribeState
 
 _NOW = datetime(2026, 7, 19, 9, 0, 0, tzinfo=timezone.utc)
 _SALT = "test-salt"
-_TEST_PUBKEY = bytes(range(32))
+# An obviously-fake age recipient (age1… prefix is all the sweep's _resolve_pubkey checks; the fake
+# sealer ignores the content). NOT a real key — no round-trip runs against it.
+_TEST_AGE_RECIPIENT = "age1examplefakerecipientnotarealkeyxxxxxxxxxxxxxxxxxxxxxx"
 
 
 # --- doubles -----------------------------------------------------------------
@@ -83,9 +85,9 @@ def _events(tmp_path, *, mode="clinical"):
 
 
 def _pubkey_file(tmp_path):
-    p = tmp_path / "seal" / "seal_pub.key"
+    p = tmp_path / "seal" / "seal_pub.age"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(_TEST_PUBKEY)
+    p.write_text(_TEST_AGE_RECIPIENT + "\n", encoding="utf-8")   # trailing newline is stripped
     return p
 
 
@@ -492,3 +494,76 @@ def test_sweep_summary_reports_work(tmp_path):
     ev0 = [c for c in cap if c["event"] == "scribe.retention.sweep"][0]
     assert ev0["sealed_ready"] == 1 and ev0["encounters_scanned"] == 1
     assert "completed with work" in ev0["detail"]
+
+
+# ============================ new fail-closed / disposition status surfacing (13a fix-round) ============================
+
+
+def test_empty_closed_encounter_disposed_by_sweep(tmp_path):
+    # §E — a CLOSED zero-chunk encounter is DISPOSED by the sweep: PHI-named dir removed, counted,
+    # NO retention.* event (nothing sealed).
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "empty-closed-visit", n_chunks=0, closed=True)
+    state = ScribeState(tmp_path / "state.json")   # never reached READY
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.empty_disposed == 1 and summary.sealed_ready == 0
+    assert not enc_dir.exists()                                # PHI-named dir removed
+    assert ev.query(CLINICAL, family="retention") == []        # nothing sealed
+
+
+def test_empty_closed_disposed_even_without_pubkey(tmp_path):
+    # Disposal needs NO crypto — a CLOSED zero-chunk dir is disposed even before the 13d keygen
+    # (no pubkey), so patient-named dirs never accumulate waiting on a key.
+    cfg = _config(tmp_path, with_pubkey=False)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "empty-nokey-visit", n_chunks=0, closed=True)
+    state = ScribeState(tmp_path / "state.json")
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.empty_disposed == 1
+    assert not enc_dir.exists()
+
+
+def test_wipe_incomplete_surfaced_and_flagged(tmp_path):
+    # A committed seal whose wipe leaves residue (a nested subdir blocks the non-recursive rmdir) →
+    # wipe_incomplete count + the loud needs_operator_attention error (never buried).
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "residue-visit")
+    (enc_dir / "nested-cache").mkdir()
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.wipe_incomplete == 1 and summary.sealed_ready == 0
+    assert summary.needs_operator_attention() is True
+    assert len(_retention_rows(ev, enc_id)) == 1               # the seal DID commit
+    assert enc_dir.exists()                                    # PHI-named dir persists (residue)
+    attn = [c for c in cap if c["event"] == "scribe.retention.sweep.needs_operator_attention"]
+    assert len(attn) == 1 and attn[0]["wipe_incomplete"] == 1
+
+
+def test_recovery_mismatch_surfaced(tmp_path):
+    # A READY encounter with a retention.sealed row but NO blob → the fail-closed recovery refuses to
+    # wipe → recovery_mismatch surfaced (never silently destroys the plaintext).
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "recover-visit")
+    ev.retention_sealed(subject_id=enc_id, chunk_count=2, total_bytes=10, manifest_sha256="d" * 64,
+                        sealed_to_key_fp="fp", cipher="age-x25519")   # row present, no blob on disk
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.recovery_mismatch == 1 and summary.sealed_ready == 0
+    assert summary.needs_operator_attention() is True
+    assert (enc_dir / "chunk_1.webm").is_file()                # plaintext INTACT (never wiped)
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.needs_operator_attention"]
