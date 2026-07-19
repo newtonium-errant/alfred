@@ -7,7 +7,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from .utils import get_logger
+from .utils import SectionReadStatus, get_logger, safe_read_section_file
 
 log = get_logger(__name__)
 
@@ -77,19 +77,28 @@ def _count_audit_log(audit_path: Path, since: str) -> dict[str, dict[str, int]]:
     counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     if not audit_path.exists():
         return counts
-    try:
-        for line in audit_path.read_text(encoding="utf-8").splitlines():
-            try:
-                entry = json.loads(line)
-                ts = entry.get("ts", "")
-                if ts >= since:
-                    tool = entry.get("tool", "unknown")
-                    op = entry.get("op", "unknown")
-                    counts[tool][op] += 1
-            except json.JSONDecodeError:
-                continue
-    except OSError as e:
-        log.warning("operations.audit_read_failed", error=str(e))
+    # Defensive read via the shared helper — the old bare ``except OSError``
+    # missed UnicodeDecodeError (a ValueError subclass), so a non-UTF-8 audit
+    # log escaped and crashed the whole brief (this section is called BARE by
+    # the daemon at daemon.py). A read failure → count-0 (empty counts), warned.
+    read = safe_read_section_file(audit_path)
+    if read.status is not SectionReadStatus.OK:
+        log.warning(
+            "operations.audit_read_failed",
+            error=read.detail,
+            error_type=read.error_type,
+        )
+        return counts
+    for line in read.text.splitlines():
+        try:
+            entry = json.loads(line)
+            ts = entry.get("ts", "")
+            if ts >= since:
+                tool = entry.get("tool", "unknown")
+                op = entry.get("op", "unknown")
+                counts[tool][op] += 1
+        except json.JSONDecodeError:
+            continue
     return counts
 
 
@@ -97,9 +106,18 @@ def _read_json(path: Path) -> dict:
     """Read a JSON file, returning empty dict on failure."""
     if not path.exists():
         return {}
+    # Defensive read via the shared helper — the old ``(json.JSONDecodeError,
+    # OSError)`` catch missed UnicodeDecodeError (a SIBLING of JSONDecodeError
+    # under ValueError, not a subclass), so a non-UTF-8 state file escaped and
+    # crashed the whole brief (bare render at daemon.py). Helper handles the
+    # read; the json.loads catch below stays for JSON-syntax errors on a clean
+    # read. Mirrors health_section._read_state_latest (ea8a749).
+    read = safe_read_section_file(path)
+    if read.status is not SectionReadStatus.OK:
+        return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        return json.loads(read.text)
+    except json.JSONDecodeError:
         return {}
 
 

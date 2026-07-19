@@ -31,6 +31,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from alfred.health.aggregator import register_check
 from alfred.health.types import CheckResult, Status, ToolHealth
 
+from .utils import SectionReadStatus, safe_read_section_file
+
 
 def _check_schedule(schedule: dict) -> list[CheckResult]:
     """Validate schedule.time (HH:MM) and schedule.timezone."""
@@ -211,9 +213,16 @@ def _most_recent_successful_brief_date(state_path: Path) -> str | None:
     """
     if not state_path.is_file():
         return None
+    # Defensive read via the shared helper — the old ``(json.JSONDecodeError,
+    # OSError)`` catch missed UnicodeDecodeError (a SIBLING of JSONDecodeError
+    # under ValueError, not a subclass), so a non-UTF-8 state file escaped and
+    # crashed the BIT run. Semantics preserved: read/decode failure → None.
+    read = safe_read_section_file(state_path)
+    if read.status is not SectionReadStatus.OK:
+        return None
     try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(read.text)
+    except json.JSONDecodeError:
         return None
     runs = data.get("runs", [])
     if not isinstance(runs, list):
@@ -243,9 +252,16 @@ def _read_last_error(state_path: Path) -> dict | None:
     """
     if not state_path.is_file():
         return None
+    # Defensive read via the shared helper — same UnicodeDecodeError gap as
+    # ``_most_recent_successful_brief_date``: a non-UTF-8 state file escaped
+    # the ``(json.JSONDecodeError, OSError)`` catch. Semantics preserved:
+    # read/decode failure → None (graceful N/A, probe still runs).
+    read = safe_read_section_file(state_path)
+    if read.status is not SectionReadStatus.OK:
+        return None
     try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(read.text)
+    except json.JSONDecodeError:
         return None
     err = data.get("last_error")
     if not isinstance(err, dict):
