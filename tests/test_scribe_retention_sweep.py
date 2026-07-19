@@ -1,0 +1,494 @@
+"""Retention-sweep contract pins (task #13 slice 13b — design §3.2, §3.5, §3.6, §4, §10).
+
+Contract-first. The TRIGGER BOUNDARIES + the fail-open prune + the never-wedge isolation are the
+13b invariants, so they run UNCONDITIONALLY via an injected fake sealer (no crypto dep) — per the
+regression-pin-unconditional rule. Covered here:
+
+  * trigger boundaries (§3.2/§3.6): a STATE_READY encounter is sealed within one sweep; a still-
+    accumulating (fresh, un-closed) encounter is NOT; an abandoned (stale, un-closed, past-grace)
+    encounter IS defensively sealed-and-kept; an inside-grace one is untouched.
+  * transient mode (§3.5): wipe-without-seal + observable counted signal + NO retention.* event.
+  * prune (§0.1/§4): age-based drop on the diarize_stats sink, atomic rewrite, corrupt/undateable
+    rows preserved (fail-open), 180-day boundary, PHI-class + #11-chain isolation, no retention.* event.
+  * never-wedges: a booming encounter is isolated; the sweep continues + returns a summary.
+  * seams/gates: no-schedule ILB latch (once); inactive-store gate; no-pubkey gate; retained_dir derive.
+  * observability: the per-tick sweep-summary ILB is emitted with its fields (log-emission pin).
+"""
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import structlog
+
+from alfred.scribe.config import (
+    RETENTION_MODE_RETAINED, RETENTION_MODE_TRANSIENT, load_from_unified,
+)
+from alfred.scribe.enroll_learning import (
+    CAPTURE_NAME, KIND_ATTEST_OUTCOME, KIND_DIARIZE_STATS, LEARNING_DIRNAME,
+)
+from alfred.scribe.events import CLINICAL, ScribeEvents
+from alfred.scribe.identity import compute_encounter_id
+from alfred.scribe.retention import SEAL_BLOB_SUFFIX
+from alfred.scribe.retention_sweep import RetentionSweep
+from alfred.scribe.state import STATE_DRAFTED, STATE_READY, ScribeState
+
+_NOW = datetime(2026, 7, 19, 9, 0, 0, tzinfo=timezone.utc)
+_SALT = "test-salt"
+_TEST_PUBKEY = bytes(range(32))
+
+
+# --- doubles -----------------------------------------------------------------
+
+
+class _FakeSealer:
+    """Reversible, well-formed-blob fake (no crypto dep) — obviously-fake cipher label."""
+
+    cipher = "fake-xor-test"
+
+    def seal(self, plaintext: bytes, recipient_public_key: bytes) -> bytes:
+        return b"FAKESEAL1" + bytes([len(recipient_public_key)]) + recipient_public_key + plaintext
+
+    def verify_wellformed(self, blob: bytes) -> bool:
+        return blob.startswith(b"FAKESEAL1")
+
+    def unseal(self, blob: bytes, private_key: bytes) -> bytes:
+        assert self.verify_wellformed(blob)
+        n = blob[9]
+        return blob[10 + n:]
+
+
+class _BoomOnceSealer(_FakeSealer):
+    """Raises on the FIRST seal (a mid-encounter failure), then behaves — proves the sweep ISOLATES a
+    bad encounter and CONTINUES to the next one."""
+
+    def __init__(self) -> None:
+        self._boomed = False
+
+    def seal(self, plaintext: bytes, recipient_public_key: bytes) -> bytes:
+        if not self._boomed:
+            self._boomed = True
+            raise RuntimeError("injected seal failure")
+        return super().seal(plaintext, recipient_public_key)
+
+
+# --- fixtures / builders -----------------------------------------------------
+
+
+def _events(tmp_path, *, mode="clinical"):
+    raw = {"scribe": {"mode": mode, "encounter_salt": _SALT, "events": {"dir": str(tmp_path / "ev")}}}
+    return ScribeEvents.from_config(raw, log_dir=str(tmp_path / "logs"), clock=lambda: _NOW.isoformat())
+
+
+def _pubkey_file(tmp_path):
+    p = tmp_path / "seal" / "seal_pub.key"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(_TEST_PUBKEY)
+    return p
+
+
+def _config(tmp_path, *, mode=RETENTION_MODE_RETAINED, grace=7, with_pubkey=True,
+            enrollment=True, schedule_path=""):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(exist_ok=True)
+    retention = {"mode": mode, "abandon_grace_days": grace, "schedule_path": schedule_path}
+    if with_pubkey:
+        retention["seal_public_key_path"] = str(_pubkey_file(tmp_path))
+    scribe = {
+        "mode": "clinical", "encounter_salt": _SALT, "input_dir": str(inbox),
+        "retention": retention,
+    }
+    if enrollment:
+        scribe["diarize"] = {"enrollment_dir": str(tmp_path / "enroll")}
+    return load_from_unified({"scribe": scribe})
+
+
+def _sweep(cfg, ev, *, sealer=None):
+    factory = (lambda: sealer) if sealer is not None else (lambda: _FakeSealer())
+    return RetentionSweep(cfg, ev, sealer_factory=factory)
+
+
+def _make_encounter(cfg, label, *, n_chunks=2, closed=True, with_ledger=True):
+    """A plaintext encounter subdir under input_dir with a PHI-shaped label name."""
+    enc_dir = Path(cfg.input_dir) / label
+    enc_dir.mkdir(parents=True)
+    for seq in range(1, n_chunks + 1):
+        (enc_dir / f"chunk_{seq}.webm").write_bytes(f"audio-{label}-{seq}".encode())
+        (enc_dir / f"chunk_{seq}.meta.json").write_text(json.dumps({"seq": seq}), encoding="utf-8")
+    if closed:
+        (enc_dir / "_CLOSED").write_text(json.dumps({"protocol": 2, "final_seq": n_chunks}))
+    enc_id = compute_encounter_id(label, salt=_SALT)
+    if with_ledger:
+        (enc_dir / f"{enc_id}.transcript.json").write_text(
+            json.dumps({"encounter_id": enc_id, "segments": []}), encoding="utf-8")
+    return enc_dir, enc_id
+
+
+def _age(path, *, days):
+    """Set the mtime of ``path`` AND every immediate child to ``days`` ago (the abandoned check takes
+    the MAX mtime across the dir + its children, so both must be aged for the dir to read stale)."""
+    ts = (_NOW - timedelta(days=days)).timestamp()
+    for child in path.iterdir():
+        os.utime(child, (ts, ts))
+    os.utime(path, (ts, ts))
+
+
+def _retention_rows(ev, enc_id=None):
+    rows = ev.query(CLINICAL, family="retention", kind="retention.sealed")
+    if enc_id is not None:
+        rows = [r for r in rows if r["subject_id"] == enc_id]
+    return rows
+
+
+# ============================ trigger boundaries (§3.2/§3.6) ============================
+
+
+def test_ready_encounter_sealed_within_one_sweep(tmp_path):
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "jane-doe-2026")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.sealed_ready == 1 and summary.sealed_abandoned == 0
+    assert (Path(cfg.input_dir).parent / "retained" / f"{enc_id}{SEAL_BLOB_SUFFIX}").is_file()
+    assert not enc_dir.exists()                       # sealed → plaintext wiped (13a)
+    assert len(_retention_rows(ev, enc_id)) == 1      # durable record landed
+
+
+def test_still_accumulating_not_sealed(tmp_path):
+    # Fresh, un-closed, no READY state → still recording → NOT sealed (skipped).
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "live-visit", closed=False)
+    state = ScribeState(tmp_path / "state.json")   # no state entry at all
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.skipped == 1 and summary.sealed_ready == 0 and summary.sealed_abandoned == 0
+    assert (enc_dir / "chunk_1.webm").is_file()       # plaintext intact
+    assert _retention_rows(ev, enc_id) == []
+
+
+def test_closed_but_not_ready_is_skipped(tmp_path):
+    # _CLOSED present but the pipeline hasn't reached READY (DRAFTED / incomplete-tail) → the design
+    # boundary: neither the READY gate nor the abandoned gate (which requires NO _CLOSED) → skipped.
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "closed-drafting", closed=True)
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_DRAFTED)
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.skipped == 1 and summary.sealed_ready == 0
+    assert enc_dir.exists()
+
+
+def test_abandoned_past_grace_defensively_sealed(tmp_path):
+    # No _CLOSED, stale beyond grace → defensively sealed-and-KEPT (§3.6). A partial encounter still
+    # captured consented audio; it must be sealed, never silently dropped.
+    cfg = _config(tmp_path, grace=7)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "forgotten-visit", closed=False)
+    _age(enc_dir, days=8)
+    state = ScribeState(tmp_path / "state.json")   # never reached READY
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.sealed_abandoned == 1 and summary.sealed_ready == 0
+    assert (Path(cfg.input_dir).parent / "retained" / f"{enc_id}{SEAL_BLOB_SUFFIX}").is_file()
+    assert not enc_dir.exists()                       # seal-and-keep: sealed blob retained, plaintext wiped
+    assert len(_retention_rows(ev, enc_id)) == 1
+
+
+def test_inside_grace_untouched(tmp_path):
+    # No _CLOSED but recent activity (inside grace) → NOT abandoned → untouched (never fires on fresh).
+    cfg = _config(tmp_path, grace=7)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "paused-visit", closed=False)
+    _age(enc_dir, days=1)
+    state = ScribeState(tmp_path / "state.json")
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.skipped == 1 and summary.sealed_abandoned == 0
+    assert (enc_dir / "chunk_1.webm").is_file()
+
+
+def test_retained_dir_derives_under_input_parent(tmp_path):
+    # Empty retained_dir ⇒ <input_dir parent>/retained (STAY-C: <STAYC_DATA>/retained) — a
+    # per-instance-correct default, not a single-instance literal.
+    cfg = _config(tmp_path)
+    assert cfg.retention.retained_dir == ""
+    sweep = _sweep(cfg, _events(tmp_path))
+    assert sweep._resolved_retained_dir() == Path(cfg.input_dir).parent / "retained"
+
+
+# ============================ transient mode (§3.5) ============================
+
+
+def test_transient_wipes_without_seal_or_event(tmp_path):
+    cfg = _config(tmp_path, mode=RETENTION_MODE_TRANSIENT)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "transient-visit")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.transient_wiped == 1 and summary.sealed_ready == 0
+    assert not enc_dir.exists()                                        # audio wiped
+    assert not (Path(cfg.input_dir).parent / "retained" / f"{enc_id}{SEAL_BLOB_SUFFIX}").exists()
+    assert ev.query(CLINICAL, family="retention") == []               # NO retention.* event
+    sig = [c for c in cap if c["event"] == "scribe.retention.transient_wiped"]
+    assert len(sig) == 1 and sig[0]["chunk_count"] == 2               # observable counted signal (ILB)
+
+
+def test_retained_is_the_default_mode(tmp_path):
+    cfg = _config(tmp_path)   # no explicit mode override in the retention block
+    assert cfg.retention.mode == RETENTION_MODE_RETAINED
+
+
+# ============================ prune (§0.1/§4) ============================
+
+
+def _sink_path(cfg):
+    return Path(cfg.diarize.enrollment_dir) / LEARNING_DIRNAME / CAPTURE_NAME
+
+
+def _write_sink(cfg, lines):
+    sink = _sink_path(cfg)
+    sink.parent.mkdir(parents=True, exist_ok=True)
+    sink.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+    return sink
+
+
+def _row(kind, days_old, **extra):
+    ts = (_NOW - timedelta(days=days_old)).isoformat()
+    return json.dumps({"kind": kind, "ts": ts, **extra})
+
+
+def test_prune_drops_old_keeps_fresh_preserves_corrupt(tmp_path):
+    cfg = _config(tmp_path)
+    old_ds = _row(KIND_DIARIZE_STATS, 200, source_id="enc-old")
+    old_ao = _row(KIND_ATTEST_OUTCOME, 190, source_id="enc-old2")
+    fresh = _row(KIND_DIARIZE_STATS, 10, source_id="enc-new")
+    corrupt = '{"kind": "diarize_stats", "ts": "2026-'          # torn / unparseable
+    undateable = json.dumps({"kind": KIND_DIARIZE_STATS, "source_id": "enc-x"})  # no ts
+    sink = _write_sink(cfg, [old_ds, old_ao, fresh, corrupt, undateable])
+
+    dropped = _sweep(cfg, _events(tmp_path))._prune_diarize_stats(_NOW)
+
+    assert dropped == 2                                    # both aged rows dropped
+    remaining = sink.read_text().splitlines()
+    assert fresh in remaining                              # fresh kept
+    assert corrupt in remaining                            # torn PRESERVED (can't date → never drop)
+    assert undateable in remaining                         # undateable PRESERVED
+    assert old_ds not in remaining and old_ao not in remaining
+    assert not sink.with_name(sink.name + ".prune.tmp").exists()   # atomic: no temp left behind
+
+
+def test_prune_180_day_boundary(tmp_path):
+    cfg = _config(tmp_path)
+    just_inside = _row(KIND_DIARIZE_STATS, 179, source_id="keep")
+    just_outside = _row(KIND_DIARIZE_STATS, 181, source_id="drop")
+    sink = _write_sink(cfg, [just_inside, just_outside])
+
+    dropped = _sweep(cfg, _events(tmp_path))._prune_diarize_stats(_NOW)
+
+    remaining = sink.read_text().splitlines()
+    assert dropped == 1
+    assert just_inside in remaining and just_outside not in remaining
+
+
+def test_prune_no_rewrite_when_nothing_old(tmp_path):
+    # Nothing aged out ⇒ no rewrite (never churn the sink every tick). mtime unchanged is the proof.
+    import os
+    cfg = _config(tmp_path)
+    sink = _write_sink(cfg, [_row(KIND_DIARIZE_STATS, 5, source_id="fresh")])
+    before = os.stat(sink).st_mtime_ns
+    os.utime(sink, ns=(before - 5_000_000_000, before - 5_000_000_000))
+    stamped = os.stat(sink).st_mtime_ns
+
+    dropped = _sweep(cfg, _events(tmp_path))._prune_diarize_stats(_NOW)
+
+    assert dropped == 0
+    assert os.stat(sink).st_mtime_ns == stamped           # file not rewritten
+
+
+def test_prune_dormant_when_no_enrollment_dir(tmp_path):
+    cfg = _config(tmp_path, enrollment=False)
+    assert _sweep(cfg, _events(tmp_path))._prune_diarize_stats(_NOW) == 0
+
+
+def test_prune_does_not_touch_phi_or_chain(tmp_path):
+    # The prune's blast radius is the telemetry sink ONLY — a seal artifact + the #11 chain are
+    # untouched by a run that both seals an encounter AND prunes the sink.
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "sealed-and-pruned")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+    _write_sink(cfg, [_row(KIND_DIARIZE_STATS, 300, source_id="ancient")])
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.sealed_ready == 1 and summary.pruned_telemetry_rows == 1
+    blob = Path(cfg.input_dir).parent / "retained" / f"{enc_id}{SEAL_BLOB_SUFFIX}"
+    assert blob.is_file()                                  # seal artifact untouched by the prune
+    assert len(_retention_rows(ev, enc_id)) == 1           # #11 chain row survives
+    # the prune emitted NO retention.* event (log rotation, not a PHI destruction)
+    assert [r for r in ev.query(CLINICAL, family="retention")] == _retention_rows(ev)
+
+
+# ============================ never-wedges (exception injection) ============================
+
+
+def test_booming_encounter_is_isolated_sweep_continues(tmp_path):
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    # two READY encounters; the sealer booms on the FIRST seal, succeeds after.
+    enc_a, id_a = _make_encounter(cfg, "aaa-boom")
+    enc_b, id_b = _make_encounter(cfg, "bbb-ok")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(id_a, state=STATE_READY)
+    state.set(id_b, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev, sealer=_BoomOnceSealer())._run_sync(state, _NOW)
+
+    assert summary.encounter_errors == 1                  # the boom was ISOLATED
+    assert summary.sealed_ready == 1                      # the sweep CONTINUED and sealed the other
+    assert enc_a.exists() and not enc_b.exists()          # boomed one intact, healthy one sealed
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.encounter_error"]
+
+
+async def test_run_offloads_and_returns_summary(tmp_path):
+    # The async entry point offloads to a thread and returns the summary (no raise on a normal sweep).
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "async-visit")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    summary = await _sweep(cfg, ev).run(state, now=_NOW)
+
+    assert summary.sealed_ready == 1
+    assert not enc_dir.exists()
+
+
+# ============================ seams / gates ============================
+
+
+def test_no_schedule_ilb_latched_once(tmp_path):
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    state = ScribeState(tmp_path / "state.json")
+    sweep = _sweep(cfg, ev)
+
+    with structlog.testing.capture_logs() as cap:
+        s1 = sweep._run_sync(state, _NOW)
+        s2 = sweep._run_sync(state, _NOW)
+
+    assert s1.schedule_present is False and s2.schedule_present is False
+    latched = [c for c in cap if c["event"] == "scribe.retention.sweep.no_schedule_published"]
+    assert len(latched) == 1                               # emitted ONCE across two sweeps (latched)
+    assert s1.review_due == 0                              # NEVER auto-destroy / surface without a schedule
+
+
+def test_inactive_store_skips_seal_but_prune_runs(tmp_path):
+    # A DEGRADED store (non-clinical preflight failure ⇒ inactive) ⇒ no durable record possible ⇒
+    # leave audio UNTOUCHED (fail-safe: never wipe without the medico-legal store). The PHI-free
+    # prune still runs. (from_config leaves a healthy store active regardless of mode; the gate is
+    # exercised by forcing the degraded-inactive posture directly.)
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    ev._active = False
+    assert ev.active is False
+    enc_dir, enc_id = _make_encounter(cfg, "synthetic-visit")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+    _write_sink(cfg, [_row(KIND_DIARIZE_STATS, 300, source_id="ancient")])
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.sealing_available is False
+    assert summary.sealed_ready == 0 and enc_dir.exists()  # audio untouched
+    assert summary.pruned_telemetry_rows == 1              # prune independent of the store
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.store_inactive"]
+
+
+def test_no_pubkey_skips_seal_latched(tmp_path):
+    cfg = _config(tmp_path, with_pubkey=False)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "no-key-visit")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        sweep = _sweep(cfg, ev)
+        sweep._run_sync(state, _NOW)
+        summary = sweep._run_sync(state, _NOW)
+
+    assert summary.sealing_available is False and summary.sealed_ready == 0
+    assert enc_dir.exists()                                # not sealed (no recipient key yet — 13d keygen)
+    latched = [c for c in cap if c["event"] == "scribe.retention.sweep.no_seal_public_key"]
+    assert len(latched) == 1
+
+
+def test_malformed_pubkey_skips_seal(tmp_path):
+    cfg = _config(tmp_path)
+    # overwrite the pubkey file with a wrong-length blob
+    Path(cfg.retention.seal_public_key_path).write_bytes(b"too-short")
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "bad-key-visit")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.sealing_available is False and enc_dir.exists()
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.seal_public_key_malformed"]
+
+
+# ============================ observability (log-emission pin, builder rule #9) ============================
+
+
+def test_sweep_summary_emitted_every_tick_idle(tmp_path):
+    cfg = _config(tmp_path)          # empty inbox → nothing to do
+    ev = _events(tmp_path)
+    state = ScribeState(tmp_path / "state.json")
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.did_work() == 0
+    events = [c for c in cap if c["event"] == "scribe.retention.sweep"]
+    assert len(events) == 1
+    ev0 = events[0]
+    assert ev0["encounters_scanned"] == 0
+    assert ev0["sealed_ready"] == 0 and ev0["pruned_telemetry_rows"] == 0
+    assert "nothing to do" in ev0["detail"]               # idle is distinguishable from broken (ILB)
+
+
+def test_sweep_summary_reports_work(tmp_path):
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "worked-visit")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    ev0 = [c for c in cap if c["event"] == "scribe.retention.sweep"][0]
+    assert ev0["sealed_ready"] == 1 and ev0["encounters_scanned"] == 1
+    assert "completed with work" in ev0["detail"]

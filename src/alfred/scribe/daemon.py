@@ -205,6 +205,7 @@ async def run(
     from alfred.scribe.events import ScribeEvents
     from alfred.scribe.events_maintenance import ScribeEventMaintenance
     from alfred.scribe.pipeline import run_sweep
+    from alfred.scribe.retention_sweep import RetentionSweep
     from alfred.scribe.state import ScribeState
     from alfred.vault import ops as vault_ops
 
@@ -234,6 +235,11 @@ async def run(
     # → SUPPRESSED + counted (the daily summary makes the suppression itself auditable).
     vault_ops.register_read_hook(events.make_read_hook())
     maint = ScribeEventMaintenance(events)
+    # The retention sweep (#13 §3, slice 13b) — sibling of ScribeEventMaintenance, one per daemon
+    # lifetime. Seals READY / defensively-seals abandoned encounters + rolling-prunes the diarize_stats
+    # telemetry sink, best-effort + off-loop (tar/crypto via asyncio.to_thread). Same clinical-store
+    # gate as the emitters: a retained seal needs the durable retention.sealed record.
+    retention_sweep = RetentionSweep(config, events)
 
     log.info(
         "scribe.daemon.pipeline_watching",
@@ -270,6 +276,13 @@ async def run(
                     maint.heartbeat_if_due()
                     maint.post_attest_edit_scan(vault_path)
                     maint.flush_suppressed_if_new_day()
+                    # Retention sweep (#13 §3, slice 13b) — own try/except so a retention failure is
+                    # cleanly attributed and never masks the maintenance calls above; the sweep also
+                    # isolates per-encounter failures internally, so an exception never wedges the loop.
+                    try:
+                        await retention_sweep.run(state)
+                    except Exception:  # noqa: BLE001 — best-effort; a retention error never kills the loop
+                        log.exception("scribe.daemon.retention_sweep_error")
                 except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop
                     log.exception("scribe.daemon.sweep_error")
                 await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
