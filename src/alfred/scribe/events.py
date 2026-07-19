@@ -471,6 +471,88 @@ class ScribeEvents:
                                   actor="stayc_scribe", actor_kind="system", now=now,
                                   payload={"seq": int(seq)})
 
+    # --- RETENTION (#13) — typed emitters ---------------------------------
+    # The ONLY constructors of retention events (no generic emit verb, #11 §2.2). ALL FIVE are
+    # DURABLE (fsync, RAISE on failure) — every retention transition is a med-legal fact that must
+    # be recorded before the act it attests is acknowledged, EXACTLY the #12 withdrawal-ordering
+    # contract: the seal's durable ``retention.sealed`` MUST land before the caller wipes plaintext
+    # (retention.py §3.3), and the two-phase destroy's ``retention.destroy_intent`` MUST land before
+    # the first unlink (§5.2). Payloads are PHI-free by construction (the store refuses any field
+    # outside the frozen set + any non-scalar) — ids/enums/digests/scalars only, #11 §11. Actor is
+    # ``system`` for the daemon-driven seal, ``operator`` for the operator-initiated schedule /
+    # unseal / destroy CLI paths. NO new kinds, NO schema change — these consume the kinds #11
+    # contract-registered (the widening pin stays green).
+
+    def retention_sealed(
+        self, *, subject_id: str, chunk_count: int, total_bytes: int, manifest_sha256: str,
+        sealed_to_key_fp: str, cipher: str, now: str | None = None,
+    ) -> AppendReceipt:
+        """Durable [D]. The seal attestation — the encounter's audio was sealed to the offline-key
+        archive (retention.py §3.3). RAISES on a store-down append: the seal is NOT acknowledged
+        and the caller MUST NOT wipe plaintext (fail-closed, the ordering contract)."""
+        return self._emit_durable(
+            CLINICAL, "retention.sealed", subject_id=subject_id, actor="stayc_scribe",
+            actor_kind="system", now=now,
+            payload={"chunk_count": int(chunk_count), "total_bytes": int(total_bytes),
+                     "manifest_sha256": manifest_sha256, "sealed_to_key_fp": sealed_to_key_fp,
+                     "cipher": cipher})
+
+    def retention_schedule_published(
+        self, *, schedule_version: str, schedule_sha256: str, effective_date: str,
+        now: str | None = None,
+    ) -> AppendReceipt:
+        """Durable [D]. Pins which s.50 schedule governs this box (§4, slice 13c). Box-global, not
+        per-encounter, so ``subject_id`` is empty (like ``store.heartbeat``)."""
+        return self._emit_durable(
+            CLINICAL, "retention.schedule_published", subject_id="", actor="operator",
+            actor_kind="operator", now=now,
+            payload={"schedule_version": schedule_version, "schedule_sha256": schedule_sha256,
+                     "effective_date": effective_date})
+
+    def retention_unsealed(
+        self, *, subject_id: str, reason_code: str, ticket_ref: str, now: str | None = None,
+    ) -> AppendReceipt:
+        """Durable [D]. Records that a sealed encounter was opened for review/audit (§6, slice
+        13d). ``ticket_ref`` is the ONLY non-enum retention string (the free-text WHY routes to
+        vault_audit.log, not the store)."""
+        return self._emit_durable(
+            CLINICAL, "retention.unsealed", subject_id=subject_id, actor="operator",
+            actor_kind="operator", now=now,
+            payload={"reason_code": reason_code, "ticket_ref": ticket_ref})
+
+    def retention_destroy_intent(
+        self, *, subject_id: str, schedule_version: str, manifest_sha256: str,
+        now: str | None = None,
+    ) -> AppendReceipt:
+        """Durable [D]. Phase 1 of the two-phase s.49 destruction (§5.2, slice 13d). MUST land
+        before the first PHI unlink — a crash after intent leaves an incomplete destruction that
+        ``retention verify`` flags + a re-run completes (unlink is idempotent). RAISES on failure:
+        a store-down destroy does NOT proceed to any unlink."""
+        return self._emit_durable(
+            CLINICAL, "retention.destroy_intent", subject_id=subject_id, actor="operator",
+            actor_kind="operator", now=now,
+            payload={"schedule_version": schedule_version, "manifest_sha256": manifest_sha256})
+
+    def retention_destroyed(
+        self, *, subject_id: str, schedule_version: str, manifest_sha256: str,
+        now: str | None = None,
+    ) -> AppendReceipt:
+        """Durable [D]. Phase 2 of the two-phase s.49 destruction (§5.2, slice 13d) — emitted ONLY
+        after every PHI artifact (+ backups) is unlinked. The #11 chain SURVIVES destruction (it is
+        PHI-free — proof-of-destruction is permanent)."""
+        return self._emit_durable(
+            CLINICAL, "retention.destroyed", subject_id=subject_id, actor="operator",
+            actor_kind="operator", now=now,
+            payload={"schedule_version": schedule_version, "manifest_sha256": manifest_sha256})
+
+    def retention_sealed_row(self, subject_id: str) -> dict | None:
+        """The encounter's durable ``retention.sealed`` row, or ``None`` if it was never sealed —
+        the CHAIN is the source of truth for "already sealed" (retention.py §3.3 idempotency +
+        crash recovery). Co-located with the emitter so the (stream, family, kind) triple lives in
+        ONE place; ``retention.py`` calls this instead of re-deriving the literals."""
+        return self.latest(CLINICAL, family="retention", kind="retention.sealed",
+                           subject_id=subject_id)
+
     # --- ACCESS emitters + read hook + suppression ------------------------
 
     def access_read(self, *, subject_id: str, record_type: str, status: str, path_digest: str,

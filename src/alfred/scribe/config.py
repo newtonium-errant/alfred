@@ -49,7 +49,17 @@ log = structlog.get_logger(__name__)
 SCRIBE_MODE_SYNTHETIC = "synthetic"
 SCRIBE_MODE_CLINICAL = "clinical"
 
+# Retention posture (task #13 §3.5). ``retained`` (default) seals + keeps the encrypted audio
+# archive; ``transient`` is the disk-pressure fallback that wipes audio WITHOUT sealing. The
+# fail-SAFE default is ``retained`` (keep the evidence): an absent / None / unknown / malformed
+# mode resolves to ``retained`` — NEVER silently ``transient`` (the design's explicit rule).
+RETENTION_MODE_RETAINED = "retained"
+RETENTION_MODE_TRANSIENT = "transient"
+
 _DEFAULT_INPUT_DIR = "./data/scribe/inbox"
+# Abandoned/never-attested encounter defensive-seal grace (§3.6) — days of enc-dir inactivity
+# after which a still-un-closed encounter is defensively sealed-and-kept (never auto-deleted).
+_DEFAULT_ABANDON_GRACE_DAYS = 7
 
 
 @dataclass
@@ -252,6 +262,38 @@ class ScribeEventsConfig:
 
 
 @dataclass
+class ScribeRetentionConfig:
+    """The sealed retained-audio lifecycle (task #13 §3.7).
+
+    Every field is filesystem-only / a scalar mode, so — like :class:`ScribeEventsConfig` — NO
+    sovereign boundary barrier applies (there is no network sub-field here). ``mode`` is
+    normalized to exactly ``retained`` or ``transient`` at load (fail-SAFE to ``retained``; see
+    :func:`_normalize_retention_mode`). The three path fields default empty ⇒ the caller derives
+    them (``retained_dir`` under ``<STAYC_DATA>``; the seal pubkey + schedule under the
+    daemon-read-only ``<STAYC_SEAL_DIR>``, §3.1) — a per-instance-correct default, never a
+    single-instance literal.
+
+    Slice 13a (seal lifecycle core) consumes ``mode`` + ``retained_dir`` + ``seal_public_key_path``;
+    ``schedule_path`` (§4, slice 13c) and ``abandon_grace_days`` (§3.6, slice 13b) are carried now
+    so the whole config surface lands in one place — the sweep + schedule slices wire to fields that
+    already exist rather than re-touching the config each slice."""
+
+    # retained (default) | transient — NEVER silently transient (an unknown value ⇒ retained).
+    mode: str = RETENTION_MODE_RETAINED
+    # Empty ⇒ derived <STAYC_DATA>/retained (under ReadWritePaths); holds the sealed .sealed blobs
+    # + the relocated transcripts/ ledger copies.
+    retained_dir: str = ""
+    # Empty ⇒ derived <STAYC_SEAL_DIR>/seal_pub.age (daemon-read-only, §3.1). The recipient PUBLIC
+    # key the sweep seals to; the matching PRIVATE key lives OFFLINE (USB ×2), never on the box.
+    seal_public_key_path: str = ""
+    # Empty ⇒ derived <STAYC_SEAL_DIR>/retention_schedule.json (daemon-read-only). The s.50
+    # schedule artifact (slice 13c) — not consumed by 13a.
+    schedule_path: str = ""
+    # Stale-encounter defensive-seal grace (§3.6, slice 13b) — not consumed by 13a.
+    abandon_grace_days: int = _DEFAULT_ABANDON_GRACE_DAYS
+
+
+@dataclass
 class ScribeBugConfig:
     """Box-local bug-report capture (task #4).
 
@@ -304,6 +346,9 @@ class ScribeConfig:
     # The append-only event store (task #11). ALWAYS-ON with scribe (no enabled knob);
     # the facade derives the events dir from ``<logging.dir>/events`` unless ``dir`` overrides.
     events: ScribeEventsConfig = field(default_factory=ScribeEventsConfig)
+    # The sealed retained-audio lifecycle (task #13). Default posture is retained-encrypted;
+    # all path fields default-derive at the caller (see ScribeRetentionConfig).
+    retention: ScribeRetentionConfig = field(default_factory=ScribeRetentionConfig)
     # Box-local bug-report capture (task #4). Rides the ingest server; on by default.
     bug: ScribeBugConfig = field(default_factory=ScribeBugConfig)
     # Designated human-clinician identities allowed to ATTEST a clinical_note
@@ -421,6 +466,7 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
         diarize=_build_diarize(scribe.get("diarize")),
         ingest_web=_build_ingest_web(scribe.get("ingest_web")),
         events=_build_events(scribe.get("events")),
+        retention=_build_retention(scribe.get("retention")),
         bug=_build_bug(scribe.get("bug")),
         clinicians=clinicians,
         encounter_salt=str(scribe.get("encounter_salt") or ""),
@@ -452,6 +498,40 @@ def _build_events(data: Any) -> ScribeEventsConfig:
     cfg = ScribeEventsConfig()
     if "dir" in known:
         cfg.dir = str(known["dir"] or "")
+    return cfg
+
+
+def _normalize_retention_mode(raw_mode: Any) -> str:
+    """Fail-SAFE retention posture line (§3.5). ONLY the exact (case/space-insensitive) string
+    ``"transient"`` selects the wipe-without-seal disk-pressure fallback; absent / None / unknown /
+    malformed all resolve to ``"retained"`` — the safe default that KEEPS the encrypted evidence.
+    The opposite fail direction from :func:`_normalize_mode` (which fails to synthetic): here
+    ``retained`` is safe, so a typo can never silently drop the audio archive."""
+    if isinstance(raw_mode, str) and raw_mode.strip().lower() == RETENTION_MODE_TRANSIENT:
+        return RETENTION_MODE_TRANSIENT
+    return RETENTION_MODE_RETAINED
+
+
+def _build_retention(data: Any) -> ScribeRetentionConfig:
+    """Schema-tolerant build of :class:`ScribeRetentionConfig`. ``mode`` is normalized fail-SAFE
+    (see :func:`_normalize_retention_mode`); the three path fields coerce None → "" (the D4
+    YAML-null trap — ``str(None) == "None"`` is a non-empty path that would defeat the
+    empty-⇒-derive default); ``abandon_grace_days`` coerces to a non-negative int (nonsense keeps
+    the default, never crashes the load). Unknown keys dropped by the ``__dataclass_fields__``
+    filter (load-time schema-tolerance contract)."""
+    if not isinstance(data, dict):
+        return ScribeRetentionConfig()
+    known = {k: v for k, v in data.items() if k in ScribeRetentionConfig.__dataclass_fields__}
+    cfg = ScribeRetentionConfig()
+    if "mode" in known:
+        cfg.mode = _normalize_retention_mode(known["mode"])
+    for str_field in ("retained_dir", "seal_public_key_path", "schedule_path"):
+        if str_field in known:
+            v = known[str_field]
+            setattr(cfg, str_field, "" if v is None else str(v))
+    if "abandon_grace_days" in known:
+        cfg.abandon_grace_days = _coerce_nonneg_int(
+            known["abandon_grace_days"], _DEFAULT_ABANDON_GRACE_DAYS)
     return cfg
 
 
