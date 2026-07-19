@@ -421,17 +421,22 @@ class RetentionSweep:
         return Path(self._config.input_dir).parent / "retained"
 
     def _resolve_sealer(self) -> "ret.Sealer | None":
-        """The production sealer (vendored ``cryptography`` X25519 backend), or ``None`` — latched —
-        if no crypto backend is installed. A missing backend never crashes the daemon loop; sealing is
-        simply skipped until the operator installs the (now-declared) dep."""
+        """The production sealer (13a's ``retention.make_default_sealer`` — the ``cryptography`` X25519
+        backend behind the ``Sealer`` seam), or ``None`` — latched — if no crypto backend is installed.
+        A missing backend never crashes the daemon loop; sealing is simply skipped until the crypto dep
+        is present. NOTE: the crypto dep is DELIBERATELY UNDECLARED in pyproject pending the operator's
+        age-format-vs-cryptography ruling (design §3.1) — that declaration lands as a follow-up commit
+        once ruled, so the sweep stays dep-agnostic and this latched-skip is the honest steady state
+        until then."""
         try:
             return self._sealer_factory()
         except ret.SealerUnavailable:
             self._latch_log(
                 "no_sealer",
                 "scribe.retention.sweep.sealer_unavailable",
-                detail="no crypto backend is installed to seal — retention sealing is SKIPPED "
-                       "(install the declared `cryptography` dep). Latched once.")
+                detail="no crypto backend is installed to seal — retention sealing is SKIPPED. The "
+                       "crypto dep is undeclared pending the operator's seal-backend ruling (design "
+                       "§3.1); it lands as a follow-up commit once ruled. Latched once.")
             return None
 
     def _resolve_pubkey(self) -> bytes:

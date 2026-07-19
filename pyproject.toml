@@ -35,19 +35,6 @@ temporal = ["temporalio>=1.9.0"]
 # ``fake`` provider needs no dep (CI + the unconditional fake-backend coverage).
 scribe = [
     "faster-whisper>=1.0",
-    # STAY-C retention seal (#13, slice 13a/b): the asymmetric per-encounter seal
-    # (retention.CryptographySealer — X25519 ECDH → HKDF-SHA256 → AES-256-GCM). The
-    # box venv already carries this (49.0.0, transitive), but it was UNDECLARED —
-    # declaring it here is the 13b prerequisite the 13a commit named. Torch-free
-    # (a small Rust wheel), so [scribe] stays CI/torch-free. HONEST OPEN DECISION:
-    # the design (§3.1) RECOMMENDS the age file format for decade-scale codebase-
-    # independent decryptability; the 13a Sealer ships the cryptography X25519
-    # backend (honest cipher label, .sealed suffix) as the flagged fallback. The
-    # age-vs-cryptography swap — and thus whether this dep changes — stays OPEN
-    # until the 13d operator keygen ceremony; the seam is a one-file swap behind
-    # retention.Sealer. Floor >=42 (a modern floor; the hazmat primitives used are
-    # long-stable), no ceiling (the X25519/HKDF/AESGCM API is stable).
-    "cryptography>=42",
 ]
 # STAY-C sovereign scribe multi-speaker diarization (scribe P4). pyannote.audio
 # resolves speaker turns on-box (loads its embedding model offline from the local
