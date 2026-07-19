@@ -55,6 +55,7 @@ import structlog
 
 from alfred.evstore import sha256_hex
 from alfred.scribe import ledger
+from alfred.scribe.close_manifest import CLOSE_SENTINEL_NAME
 from alfred.scribe.config import RETENTION_MODE_RETAINED, RETENTION_MODE_TRANSIENT
 
 log = structlog.get_logger("scribe.retention")
@@ -94,6 +95,17 @@ SEAL_STATUS_ALREADY_SEALED = "already_sealed"
 SEAL_STATUS_NO_CHUNKS = "no_chunks"
 SEAL_STATUS_VERIFY_FAILED = "verify_failed"
 SEAL_STATUS_TRANSIENT_WIPED = "transient_wiped"
+# Wipe residue after a COMMITTED seal (durable row + blob durable) — some plaintext could NOT be
+# removed (a real unlink failure, an un-relocated ledger, or an unexpected nested entry). NEVER
+# reported as clean SEALED: the sweep surfaces it for operator escalation; the next sweep retries.
+SEAL_STATUS_WIPE_INCOMPLETE = "wipe_incomplete"
+# The already-sealed recovery FAILED CLOSED — the chain row exists but the blob is missing/malformed
+# in THIS retained_dir, OR the on-disk plaintext does not match the row's manifest (a re-opened
+# same-label encounter). Plaintext is left INTACT; the operator must reconcile (§3.3 findings 2/3/7).
+SEAL_STATUS_RECOVERY_MISMATCH = "recovery_mismatch"
+# A CLOSED zero-chunk encounter (clinician opened, no audio, /close) was DISPOSED — nothing to seal,
+# so no retention.* event, but the label-named dir (whose NAME is PHI) is removed (§E ruling).
+SEAL_STATUS_EMPTY_DISPOSED = "empty_disposed"
 
 
 class SealerUnavailable(RuntimeError):
@@ -330,51 +342,153 @@ def _discover_seal_chunks(enc_dir: Path) -> list[tuple[Path, int]]:
 # --- atomic write + plaintext wipe -------------------------------------------------------------
 
 
+def _fsync_dir(path: Path) -> None:
+    """fsync a DIRECTORY fd so a rename/create within it is power-loss durable — POSIX rename
+    durability requires fsyncing the CONTAINING dir, not just the file (the file fsync alone leaves
+    the dir entry in the page cache). Mirrors ``evstore._fsync_dir`` (store.py:594), the discipline
+    the repo already applies to durable event appends. Best-effort: a dir that cannot be opened for
+    fsync never crashes the seal (the fail direction is safe — a lost rename leaves plaintext, and
+    the already-sealed recovery is now blob-existence-gated)."""
+    try:
+        dfd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write EVERY byte of ``data`` — a single ``os.write`` / write(2) may transfer a SHORT count
+    without error (Linux caps one write at ~2 GiB; ENOSPC returns short; a signal can interrupt), so
+    discarding the return silently truncates a >2 GiB blob — and ``max_encounter_bytes`` defaults to
+    exactly 2 GiB. Loop until the buffer is fully drained; a zero/negative return is a hard IO error."""
+    mv = memoryview(data)
+    total = 0
+    while total < len(mv):
+        n = os.write(fd, mv[total:])
+        if n <= 0:  # pragma: no cover — defensive; a healthy write(2) never returns 0 on a nonempty buf
+            raise OSError(f"os.write returned {n} with {len(mv) - total} bytes unwritten")
+        total += n
+
+
+def _unlink_quiet(path: Path) -> bool:
+    """Unlink, tolerating ONLY a missing file (the idempotent-recovery case). Returns ``True`` on
+    success or already-gone, ``False`` on a REAL unlink failure (EACCES/EPERM/EROFS/EBUSY) so the
+    caller can COUNT it. A real failure is NEVER swallowed as success — that is exactly what let a
+    seal log 'plaintext wiped' with PHI still on disk (findings 5/8)."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomic, fsync-durable byte write (temp → ``os.replace``, 0600) — the sealed blob must be
-    durable on disk BEFORE the durable ``retention.sealed`` row references it."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    """Atomic, fsync-durable byte write: temp → FULL write → fsync(file) → ``os.replace`` →
+    fsync(dir), 0600. The DIRECTORY fsync makes the RENAME durable, so the sealed blob is truly on
+    stable storage BEFORE the durable ``retention.sealed`` row references it (§3.3 step 2, findings
+    1/10/11); the full-write loop defeats a short ``os.write`` (findings 9/13/17); the tmp is
+    unlinked on ANY write/fsync failure so a partial (possibly-plaintext) file is never left behind
+    (finding 21). Raises on a write/fsync error (the caller's fail-closed path handles it)."""
+    parent = path.parent
+    created = not parent.exists()
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if created:
+        _fsync_dir(parent)  # make the retained/ (transcripts/) dir creation itself durable
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, data)
+        _write_all(fd, data)
         os.fsync(fd)
-    finally:
+    except BaseException:
+        os.close(fd)
+        _unlink_quiet(tmp)  # never leave a partial (possibly-plaintext transcript) .tmp behind
+        raise
+    else:
         os.close(fd)
     os.replace(tmp, path)
+    _fsync_dir(parent)      # make the RENAME (the dir entry) power-loss durable (POSIX)
 
 
-def _unlink_quiet(path: Path) -> None:
-    try:
-        path.unlink()
-    except OSError:
-        pass
+@dataclass(frozen=True)
+class _WipeResult:
+    """Outcome of :func:`_relocate_and_wipe` — lets ``seal_encounter`` distinguish a CLEAN wipe from
+    one that left PHI residue (a real unlink failure, an un-relocated ledger, or an unexpected nested
+    entry that blocks the rmdir). ``residue`` True ⇒ the label-named dir persists and the outcome
+    must NOT be reported as clean SEALED (findings 5/8/16)."""
+
+    ledger_relocated: bool = False
+    unlink_failures: int = 0
+    dir_removed: bool = False
+    residue: bool = False
 
 
-def _relocate_and_wipe(enc_dir: Path, encounter_id: str, retained_dir: Path) -> None:
+def _relocate_and_wipe(enc_dir: Path, encounter_id: str, retained_dir: Path) -> _WipeResult:
     """§3.3 step 5 + §3.4 disposition — RELOCATE the transcript ledger out of the (possibly-PHI-
     label) encounter dir into ``<retained_dir>/transcripts/`` (kept plaintext under LUKS, Jamie's
     active artifact), then WIPE every remaining plaintext file (chunks, meta, ``_CLOSED``) and
     remove the label-named dir. Idempotent: a no-op if the dir is already gone (the crash-between-4-
-    and-5 recovery re-runs this)."""
+    and-5 recovery re-runs this). Never raises — IO failures fold into the returned :class:`_WipeResult`
+    so the caller surfaces residue rather than a false 'wiped' claim."""
     enc_dir = Path(enc_dir)
     if not enc_dir.exists():
-        return
+        return _WipeResult(dir_removed=True, residue=False)  # already gone — a clean idempotent no-op
+
+    ledger_relocated = False
+    ledger_residue = False
     src_ledger = ledger.ledger_path(enc_dir, encounter_id)
     if src_ledger.is_file():
         dest = ledger.ledger_path(Path(retained_dir) / "transcripts", encounter_id)
-        _atomic_write_bytes(dest, src_ledger.read_bytes())
-        _unlink_quiet(src_ledger)
+        try:
+            src_bytes = src_ledger.read_bytes()
+            _atomic_write_bytes(dest, src_bytes)
+            # DIGEST-VERIFY the relocated copy BEFORE destroying the source — never unlink the only
+            # other copy of a keep-forever clinical transcript (§3.4) against a truncated/unverified
+            # destination (finding 4). A short write already raised inside _atomic_write_bytes; this
+            # catches a torn replace / silent divergence too.
+            relocated_ok = sha256_hex(dest.read_bytes()) == sha256_hex(src_bytes)
+        except OSError:
+            relocated_ok = False
+        if relocated_ok and _unlink_quiet(src_ledger):
+            ledger_relocated = True
+        else:
+            ledger_residue = True
+            log.error(
+                "scribe.retention.ledger_relocate_verify_failed", encounter_id=encounter_id,
+                detail="the relocated transcript did not verify against the source (or the source "
+                       "could not be unlinked) — source KEPT (never destroy the only good copy of a "
+                       "keep-forever clinical transcript). Wipe flagged incomplete; retry next sweep.")
+
+    unlink_failures = 0
     for p in sorted(enc_dir.iterdir()):
         if p.is_file():
-            _unlink_quiet(p)
+            if not _unlink_quiet(p):
+                unlink_failures += 1
+    dir_removed = False
     try:
         enc_dir.rmdir()
+        dir_removed = True
     except OSError:
-        log.warning(
+        # The dir still holds an entry: an un-unlinked PHI file (unlink_failures>0), the kept ledger
+        # source (ledger_residue), OR an unexpected nested subdir/entry (the wipe is deliberately
+        # NON-recursive — never recurse blindly into unexpected content). The label-named dir NAME is
+        # itself PHI, so this is real residue — attributed HONESTLY, not as a bare 'residual subdir'.
+        log.error(
             "scribe.retention.enc_dir_not_empty", encounter_id=encounter_id,
-            detail="encounter dir not empty after wipe — a residual subdir/entry remains; left in "
-                   "place (a directory wipe must never recurse blindly into unexpected content).")
+            unlink_failures=unlink_failures, ledger_residue=ledger_residue,
+            detail="encounter dir NOT empty after wipe — plaintext residue remains (un-unlinkable PHI "
+                   "file, an un-relocated transcript, or an unexpected nested entry). The label-named "
+                   "dir (a PHI name) persists; the seal outcome is flagged wipe_incomplete.")
+    residue = bool(unlink_failures) or ledger_residue or not dir_removed
+    return _WipeResult(
+        ledger_relocated=ledger_relocated, unlink_failures=unlink_failures,
+        dir_removed=dir_removed, residue=residue)
 
 
 # --- the seal path (§3.3 strict order) ---------------------------------------------------------
@@ -408,25 +522,37 @@ def seal_encounter(
     if mode == RETENTION_MODE_TRANSIENT:
         return _transient_wipe(enc_dir, encounter_id, retained_dir)
 
-    # IDEMPOTENCY + crash recovery (§3.3): the CHAIN is the source of truth for "already sealed".
-    if events.retention_sealed_row(encounter_id) is not None:
-        # Crash between step 4 (durable event) and step 5 (wipe): the seal is COMMITTED. Complete
-        # the wipe (idempotent — a no-op if already wiped). NEVER double-emit.
-        _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
-        log.info(
-            "scribe.retention.already_sealed", encounter_id=encounter_id,
-            detail="retention.sealed already on the chain — completed the plaintext wipe "
-                   "(idempotent crash-between-event-and-wipe recovery); no re-emit.")
-        return SealOutcome(status=SEAL_STATUS_ALREADY_SEALED, encounter_id=encounter_id)
+    # IDEMPOTENCY + crash recovery (§3.3): the CHAIN says "a durable retention.sealed landed" — but
+    # NOT that the blob survived, nor that today's on-disk plaintext is the SAME audio the row
+    # attests. The recovery is FAIL-CLOSED (findings 2/3/7): it verifies the blob + the manifest
+    # BEFORE wiping, and never wipes uncovered / row-without-blob PHI.
+    sealed_row = events.retention_sealed_row(encounter_id)
+    if sealed_row is not None:
+        return _recover_already_sealed(
+            enc_dir, encounter_id, retained_dir, sealed_row, sealer)
 
     # Step 1 — gather chunks (seq order), build the per-chunk manifest + digests.
     chunks = _discover_seal_chunks(enc_dir)
     if not chunks:
-        # ILB: ran, nothing to seal (no audio on disk — a declined/empty encounter, or already
-        # wiped-without-event which is impossible after step 4's ordering).
+        # A CLOSED zero-chunk encounter (clinician opened, no audio, /close) must be DISPOSED — the
+        # label-named dir NAME is itself PHI, and nothing else ever cleans it (no seal row is ever
+        # created), so leaving it would leak a patient-named dir forever while logging 'nothing to
+        # do' (§E ruling, finding 12). An OPEN (un-closed) zero-chunk dir is genuinely mid-flight →
+        # leave it (a later chunk may still arrive).
+        if (enc_dir / CLOSE_SENTINEL_NAME).exists():
+            wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+            log.info(
+                "scribe.retention.empty_encounter_disposed", encounter_id=encounter_id,
+                residue=wipe.residue,
+                detail="a CLOSED zero-chunk encounter was disposed — nothing was sealed (NO "
+                       "retention.* event), but the label-named dir (a PHI name) is removed. Never "
+                       "leave a patient-named dir with 'nothing to do' logged forever.")
+            return SealOutcome(
+                status=(SEAL_STATUS_WIPE_INCOMPLETE if wipe.residue else SEAL_STATUS_EMPTY_DISPOSED),
+                encounter_id=encounter_id)
         log.info(
             "scribe.retention.no_chunks", encounter_id=encounter_id,
-            detail="no audio chunks present — nothing to seal (ran, nothing to do).")
+            detail="no audio chunks present + not closed — nothing to seal yet (ran, nothing to do).")
         return SealOutcome(status=SEAL_STATUS_NO_CHUNKS, encounter_id=encounter_id)
     gathered = [(seq, p.name, p.read_bytes()) for (p, seq) in chunks]
     manifest_list = [
@@ -468,8 +594,22 @@ def seal_encounter(
         subject_id=encounter_id, chunk_count=chunk_count, total_bytes=total_bytes,
         manifest_sha256=manifest_sha256, sealed_to_key_fp=fp, cipher=sealer.cipher, now=now)
 
-    # Step 5 — ONLY NOW wipe plaintext (relocate the transcript ledger first, §3.4).
-    _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    # Step 5 — ONLY NOW wipe plaintext (relocate the transcript ledger first, §3.4). A wipe that
+    # leaves residue (real unlink failure / un-relocated ledger / unexpected nested entry) must NOT
+    # be reported as clean SEALED — the seal + durable row DID commit, but plaintext PHI is still on
+    # disk, so the outcome is wipe_incomplete for operator escalation (findings 5/8/16).
+    wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    if wipe.residue:
+        log.error(
+            "scribe.retention.wipe_incomplete", encounter_id=encounter_id, chunk_count=chunk_count,
+            unlink_failures=wipe.unlink_failures,
+            detail="the durable retention.sealed row committed + the blob is sealed, but plaintext "
+                   "PHI could NOT be fully wiped — the label-named dir persists. Status=wipe_incomplete "
+                   "for operator escalation; the next sweep retries the wipe (idempotent via the chain).")
+        return SealOutcome(
+            status=SEAL_STATUS_WIPE_INCOMPLETE, encounter_id=encounter_id, chunk_count=chunk_count,
+            total_bytes=total_bytes, manifest_sha256=manifest_sha256, sealed_to_key_fp=fp,
+            cipher=sealer.cipher, blob_path=str(blob_path))
     log.info(
         "scribe.retention.sealed", encounter_id=encounter_id, chunk_count=chunk_count,
         total_bytes=total_bytes, cipher=sealer.cipher, sealed_to_key_fp=fp,
@@ -480,13 +620,92 @@ def seal_encounter(
         cipher=sealer.cipher, blob_path=str(blob_path))
 
 
+def _recover_already_sealed(
+    enc_dir: Path, encounter_id: str, retained_dir: Path, sealed_row: dict, sealer: Sealer,
+) -> SealOutcome:
+    """FAIL-CLOSED crash-between-durable-event-and-wipe recovery (§3.3, findings 2/3/7). The chain row
+    proves the durable append landed — NOT that the blob survived (finding 1's lost rename, a
+    retained_dir migration, a blob-store mishap), nor that today's on-disk plaintext is the SAME
+    audio the row attests (a re-opened same-label encounter maps to the same ``encounter_id`` and
+    accumulates NEW consented audio). Before wiping ANY plaintext this requires, in order:
+      (i)   the sealed blob EXISTS in the CALLER's ``retained_dir`` + is structurally well-formed,
+      (ii)  if plaintext chunks are present, their manifest EXACTLY matches the row's own
+            ``chunk_count`` + ``manifest_sha256`` (the manifest is plaintext-deterministic).
+    Any mismatch → loud ERROR, NO wipe, ``recovery_mismatch`` for operator escalation. NEVER wipe on
+    a row-without-blob, and NEVER destroy audio the sealed row does not cover."""
+    enc_dir = Path(enc_dir)
+    blob_path = Path(retained_dir) / f"{encounter_id}{SEAL_BLOB_SUFFIX}"
+
+    # (i) the blob must EXIST in this retained_dir and be structurally well-formed (no private key).
+    if not blob_path.is_file():
+        log.error(
+            "scribe.retention.recovery_blob_missing", encounter_id=encounter_id,
+            detail="chain says retention.sealed but the sealed blob is ABSENT in this retained_dir — "
+                   "REFUSING to wipe plaintext (a row-without-blob would destroy the only copy of PHI "
+                   "the chain falsely attests is retrievable). Operator must reconcile.")
+        return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+    try:
+        blob = blob_path.read_bytes()
+    except OSError:
+        blob = b""
+    if not blob or not sealer.verify_wellformed(blob):
+        log.error(
+            "scribe.retention.recovery_blob_malformed", encounter_id=encounter_id,
+            detail="the sealed blob is unreadable / not well-formed — REFUSING to wipe plaintext "
+                   "(the archive may be corrupt; never destroy the plaintext safety copy against it).")
+        return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+
+    # (ii) if plaintext chunks remain, they MUST match the sealed row's manifest — otherwise this is
+    # NOT the audio that was sealed (re-opened same-label encounter, finding 2) → never wipe it.
+    chunks = _discover_seal_chunks(enc_dir) if enc_dir.exists() else []
+    if chunks:
+        gathered = [(seq, p.read_bytes()) for (p, seq) in chunks]
+        manifest_list = [
+            {"seq": seq, "sha256": sha256_hex(data), "bytes": len(data)} for (seq, data) in gathered]
+        payload = sealed_row.get("payload") or {}
+        if (len(manifest_list) != payload.get("chunk_count")
+                or _manifest_digest(manifest_list) != payload.get("manifest_sha256")):
+            log.error(
+                "scribe.retention.recovery_manifest_mismatch", encounter_id=encounter_id,
+                on_disk_chunks=len(manifest_list), row_chunks=payload.get("chunk_count"),
+                detail="on-disk plaintext does NOT match the sealed row's manifest — this audio was "
+                       "NOT covered by the seal (a re-opened same-label encounter accumulated NEW "
+                       "consented audio). REFUSING to wipe; operator must reconcile (seal the new "
+                       "audio under a distinct id, or destroy explicitly). Never silently destroy it.")
+            return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+
+    # Verified: the blob covers this plaintext → complete the wipe (idempotent). NEVER re-emit.
+    wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    if wipe.residue:
+        log.error(
+            "scribe.retention.wipe_incomplete", encounter_id=encounter_id,
+            unlink_failures=wipe.unlink_failures,
+            detail="already-sealed recovery could not fully wipe plaintext — residue remains "
+                   "(wipe_incomplete); the next sweep retries.")
+        return SealOutcome(status=SEAL_STATUS_WIPE_INCOMPLETE, encounter_id=encounter_id)
+    log.info(
+        "scribe.retention.already_sealed", encounter_id=encounter_id,
+        detail="retention.sealed already on the chain, blob + manifest verified — completed the "
+               "plaintext wipe (idempotent crash-between-event-and-wipe recovery); no re-emit.")
+    return SealOutcome(status=SEAL_STATUS_ALREADY_SEALED, encounter_id=encounter_id)
+
+
 def _transient_wipe(enc_dir: Path, encounter_id: str, retained_dir: Path) -> SealOutcome:
     """§3.5 transient posture — wipe the audio WITHOUT sealing. Emits NO ``retention.*`` event
     (there is no sealed artifact to attest), but a loud, counted structlog signal so "wiped, not
     retained" is distinguishable from "nothing to do" (intentionally-left-blank). The transcript is
     still relocated + kept (only the dense audio is dropped)."""
     chunk_count = len(_discover_seal_chunks(enc_dir))
-    _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    if wipe.residue:
+        # Even transient must not claim 'wiped' with PHI still on disk (findings 5/8 apply here too).
+        log.error(
+            "scribe.retention.wipe_incomplete", encounter_id=encounter_id, chunk_count=chunk_count,
+            unlink_failures=wipe.unlink_failures,
+            detail="retention.mode=transient wipe could NOT fully remove plaintext — residue remains "
+                   "(wipe_incomplete); the label-named dir persists. The next sweep retries.")
+        return SealOutcome(status=SEAL_STATUS_WIPE_INCOMPLETE, encounter_id=encounter_id,
+                           chunk_count=chunk_count)
     log.warning(
         "scribe.retention.transient_wiped", encounter_id=encounter_id, chunk_count=chunk_count,
         detail="retention.mode=transient — audio WIPED without sealing (no retained archive, no "

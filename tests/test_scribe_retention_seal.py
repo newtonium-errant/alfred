@@ -32,9 +32,34 @@ from alfred.scribe.events import CLINICAL, KINDS, ScribeEvents
 from alfred.scribe import retention as ret_mod
 from alfred.scribe.retention import (
     SEAL_BLOB_SUFFIX, SEAL_CIPHER, SEAL_MANIFEST_NAME, SEAL_STATUS_ALREADY_SEALED,
-    SEAL_STATUS_NO_CHUNKS, SEAL_STATUS_SEALED, SEAL_STATUS_TRANSIENT_WIPED,
-    SEAL_STATUS_VERIFY_FAILED, key_fingerprint, seal_encounter,
+    SEAL_STATUS_EMPTY_DISPOSED, SEAL_STATUS_NO_CHUNKS, SEAL_STATUS_RECOVERY_MISMATCH,
+    SEAL_STATUS_SEALED, SEAL_STATUS_TRANSIENT_WIPED, SEAL_STATUS_VERIFY_FAILED,
+    SEAL_STATUS_WIPE_INCOMPLETE, key_fingerprint, seal_encounter,
 )
+
+
+def _emit_sealed_row_for(ev, enc_dir, encounter_id=None):
+    """Emit a durable retention.sealed row whose manifest EXACTLY matches ``enc_dir``'s on-disk
+    chunks (so the fail-closed recovery's manifest gate passes — a faithful crash-between-event-and-
+    wipe). Returns the real (chunk_count, total_bytes, manifest_sha256)."""
+    encounter_id = encounter_id or _ENC
+    chunks = ret_mod._discover_seal_chunks(enc_dir)
+    gathered = [(seq, p.read_bytes()) for (p, seq) in chunks]
+    manifest = [{"seq": s, "sha256": sha256_hex(d), "bytes": len(d)} for (s, d) in gathered]
+    msha = ret_mod._manifest_digest(manifest)
+    total = sum(m["bytes"] for m in manifest)
+    ev.retention_sealed(subject_id=encounter_id, chunk_count=len(manifest), total_bytes=total,
+                        manifest_sha256=msha, sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
+    return len(manifest), total, msha
+
+
+def _write_recovery_blob(tmp_path, encounter_id=None, data=b"FAKESEAL1-recovered-blob"):
+    """Place a well-formed (fake-sealer-shaped) sealed blob at the recovery path."""
+    encounter_id = encounter_id or _ENC
+    p = tmp_path / "retained" / f"{encounter_id}{SEAL_BLOB_SUFFIX}"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
 
 _CLOCK = "2026-07-19T09:00:00+00:00"
 _ENC = "enc-0123456789abcdef"                      # an opaque encounter id (PHI-free, §10)
@@ -323,13 +348,14 @@ def test_crash_between_blob_and_event_reseal(tmp_path):
 
 
 def test_crash_between_event_and_wipe_completes_wipe(tmp_path):
-    # Crash between step 4 (durable event landed) and step 5 (wipe): the row exists but plaintext is
-    # still on disk → the next call COMPLETES the wipe (idempotent) WITHOUT double-emitting.
+    # Crash between step 4 (durable event landed) and step 5 (wipe): the row exists, the blob is
+    # durable, and the on-disk plaintext MATCHES the row's manifest → the next call COMPLETES the
+    # wipe (idempotent) WITHOUT double-emitting. The fail-closed recovery gate (blob-exists +
+    # manifest-match) passes because this IS the audio that was sealed.
     ev = _events(tmp_path)
     enc_dir = _make_encounter(tmp_path)
-    # simulate: emit the durable row manually, leave plaintext in place
-    ev.retention_sealed(subject_id=_ENC, chunk_count=2, total_bytes=10, manifest_sha256="m" * 64,
-                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
+    _emit_sealed_row_for(ev, enc_dir)        # row whose manifest matches the on-disk chunks
+    _write_recovery_blob(tmp_path)           # a durable, well-formed blob at the recovery path
     assert enc_dir.is_dir()
     out = _seal(tmp_path, enc_dir, ev)
     assert out.status == SEAL_STATUS_ALREADY_SEALED
@@ -337,6 +363,36 @@ def test_crash_between_event_and_wipe_completes_wipe(tmp_path):
     assert len(_sealed_rows(ev)) == 1        # NOT double-emitted
     reloc = tmp_path / "retained" / "transcripts" / f"{_ENC}.transcript.json"
     assert reloc.is_file()                   # ledger still relocated on the recovery path
+
+
+def test_recovery_refuses_wipe_when_blob_missing(tmp_path):
+    # Finding 3 (probe-proven PHI destruction): chain row + plaintext + NO blob → the OLD code wiped
+    # the never-retrievable audio. Fail-closed: refuse, plaintext INTACT, recovery_mismatch.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    _emit_sealed_row_for(ev, enc_dir)        # row present, but no blob written anywhere
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_RECOVERY_MISMATCH
+    assert (enc_dir / "chunk_1.webm").is_file()          # plaintext NEVER wiped on a row-without-blob
+    assert [c for c in cap if c["event"] == "scribe.retention.recovery_blob_missing"]
+
+
+def test_recovery_refuses_wipe_when_plaintext_manifest_mismatches(tmp_path):
+    # Finding 2 (re-opened same-label encounter): the original sealed+wiped, then NEW consented audio
+    # arrives under the same label → same encounter_id. The blob exists, but the on-disk manifest is
+    # the NEW audio, not the row's → refuse the wipe, preserve the new audio, recovery_mismatch.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    # a sealed row for DIFFERENT (original) audio — a wrong manifest vs the current chunks
+    ev.retention_sealed(subject_id=_ENC, chunk_count=2, total_bytes=10, manifest_sha256="d" * 64,
+                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
+    _write_recovery_blob(tmp_path)           # the ORIGINAL archive blob exists
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_RECOVERY_MISMATCH
+    assert (enc_dir / "chunk_1.webm").is_file()          # the NEW consented audio is PRESERVED
+    assert [c for c in cap if c["event"] == "scribe.retention.recovery_manifest_mismatch"]
 
 
 # ============================ completeness (§3.3) ============================
@@ -471,3 +527,71 @@ def test_cryptography_end_to_end_seal_unseals_to_chunks(tmp_path):
     members = extract_seal_tar(CryptographySealer().unseal(blob, priv))
     for name, data in original.items():
         assert members[name] == data          # byte-identical round-trip
+
+
+# ============================ wipe residue observability (§3.3 findings 5/8/16) ============================
+
+
+def test_wipe_obstruction_surfaces_incomplete_and_warns(tmp_path):
+    # A residual nested subdir blocks the (deliberately non-recursive) rmdir → the seal + row DID
+    # commit, but the label-named dir persists → status wipe_incomplete + a loud, observable log.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    (enc_dir / "unexpected-cache").mkdir()
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert len(_sealed_rows(ev)) == 1                    # the seal committed (blob + durable row)
+    assert enc_dir.exists()                              # dir persists (un-recursed residue)
+    assert [c for c in cap if c["event"] == "scribe.retention.wipe_incomplete"]
+    assert [c for c in cap if c["event"] == "scribe.retention.enc_dir_not_empty"]
+    assert not [c for c in cap if c["event"] == "scribe.retention.sealed"]   # never the clean 'wiped' log
+
+
+def test_unlink_failure_flags_wipe_incomplete_not_clean_sealed(tmp_path, monkeypatch):
+    # A REAL unlink failure (EACCES/EPERM class) must NOT be swallowed as success: PHI stays on disk,
+    # so the outcome is wipe_incomplete, never SEALED-with-'plaintext wiped'.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    real = ret_mod._unlink_quiet
+
+    def _fail_on_chunks(path):
+        if path.name.startswith("chunk_") and path.name.endswith(".webm"):
+            return False                                 # simulate a real unlink failure
+        return real(path)
+
+    monkeypatch.setattr(ret_mod, "_unlink_quiet", _fail_on_chunks)
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert (enc_dir / "chunk_1.webm").is_file()          # PHI audio STILL on disk (not falsely wiped)
+    assert [c for c in cap if c["event"] == "scribe.retention.wipe_incomplete"]
+    assert not [c for c in cap if c["event"] == "scribe.retention.sealed"]
+
+
+# ============================ zero-chunk closed disposition (§E ruling, finding 12) ============================
+
+
+def test_closed_zero_chunk_encounter_is_disposed(tmp_path):
+    # A clinician opens a patient-labeled encounter, records nothing, sends /close. No audio ⇒ nothing
+    # to seal ⇒ NO retention.* event, but the label-named dir (a PHI name) MUST be removed — never
+    # left with 'nothing to do' logged forever.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=0, with_ledger=True, with_closed=True)
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_EMPTY_DISPOSED
+    assert not enc_dir.exists()                          # PHI-named dir removed
+    assert ev.query(CLINICAL, family="retention") == []  # nothing sealed ⇒ NO retention event
+    assert [c for c in cap if c["event"] == "scribe.retention.empty_encounter_disposed"]
+    # the ledger (if any) is still relocated, not destroyed
+    assert (tmp_path / "retained" / "transcripts" / f"{_ENC}.transcript.json").is_file()
+
+
+def test_open_zero_chunk_encounter_is_left_alone(tmp_path):
+    # An OPEN (un-closed) zero-chunk dir is mid-flight — a chunk may still arrive → leave it (no_chunks).
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=0, with_ledger=False, with_closed=False)
+    out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_NO_CHUNKS
+    assert enc_dir.exists()                              # not disposed (might still receive audio)
