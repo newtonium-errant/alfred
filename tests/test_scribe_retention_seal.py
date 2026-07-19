@@ -595,3 +595,65 @@ def test_open_zero_chunk_encounter_is_left_alone(tmp_path):
     out = _seal(tmp_path, enc_dir, ev)
     assert out.status == SEAL_STATUS_NO_CHUNKS
     assert enc_dir.exists()                              # not disposed (might still receive audio)
+
+
+# ============================ emitter [D] posture + facade guards (findings 6/14/15) ============================
+
+
+def test_all_five_retention_emitters_raise_when_inactive(tmp_path):
+    # The whole §3.3 wipe gate rides on retention_sealed RAISING on a down store — pin the durable
+    # posture of ALL FIVE against the REAL facade (kills the durable→capture mutant that survived the
+    # full suite). Mirrors test_durable_emitter_raises_when_inactive.
+    ev = _events(tmp_path, mode="synthetic")
+    ev._active = False  # a degraded (non-clinical, preflight-failed) store
+    with pytest.raises(EventStoreError):
+        ev.retention_sealed(subject_id=_ENC, chunk_count=1, total_bytes=1, manifest_sha256="a" * 64,
+                            sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
+    with pytest.raises(EventStoreError):
+        ev.retention_schedule_published(schedule_version="v1", schedule_sha256="a" * 64,
+                                        effective_date="2026-07-19")
+    with pytest.raises(EventStoreError):
+        ev.retention_unsealed(subject_id=_ENC, reason_code="audit", ticket_ref="TKT-1")
+    with pytest.raises(EventStoreError):
+        ev.retention_destroy_intent(subject_id=_ENC, schedule_version="v1", manifest_sha256="c" * 64)
+    with pytest.raises(EventStoreError):
+        ev.retention_destroyed(subject_id=_ENC, schedule_version="v1", manifest_sha256="c" * 64)
+
+
+def test_seal_keeps_plaintext_when_real_store_append_raises(tmp_path, monkeypatch):
+    # Integration: drive seal_encounter against a REAL ScribeEvents whose store.append raises at
+    # step 4 — the raise must propagate and plaintext must survive (never wiped-but-unsealed).
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+
+    def _boom(*a, **k):
+        raise EventStoreError("store down at append")
+
+    monkeypatch.setattr(ev.store, "append", _boom)
+    with pytest.raises(EventStoreError):
+        _seal(tmp_path, enc_dir, ev)
+    assert (enc_dir / "chunk_1.webm").is_file()          # plaintext survives a real store-append failure
+    assert (enc_dir / "chunk_2.webm").is_file()
+    assert _sealed_rows(ev) == []                          # nothing acknowledged
+
+
+def test_retention_unsealed_rejects_non_enum_reason_code(tmp_path):
+    # finding 14: reason_code is a CLOSED enum — a free-text reason is refused at the facade.
+    ev = _events(tmp_path)
+    with pytest.raises(EventStoreError):
+        ev.retention_unsealed(subject_id=_ENC, reason_code="because I felt like it", ticket_ref="T-1")
+    assert ev.query(CLINICAL, family="retention") == []
+
+
+def test_retention_unsealed_caps_ticket_ref_length(tmp_path):
+    # finding 14 (probe: a 3100-char patient name into the permanent chain): ticket_ref is
+    # facade length-capped — an oversized ref is refused, never landing PHI in the redaction-
+    # independent chain.
+    ev = _events(tmp_path)
+    with pytest.raises(EventStoreError):
+        ev.retention_unsealed(subject_id=_ENC, reason_code="dispute", ticket_ref="Jane Doe " * 400)
+    assert ev.query(CLINICAL, family="retention") == []
+    # a valid short ref under a valid reason still lands
+    ev.retention_unsealed(subject_id=_ENC, reason_code="rediarize", ticket_ref="TKT-42")
+    row = ev.latest(CLINICAL, family="retention", kind="retention.unsealed")
+    assert row["payload"] == {"reason_code": "rediarize", "ticket_ref": "TKT-42"}

@@ -36,6 +36,15 @@ ACCESS = "access"
 # don't launder; no row import, ever).
 LEGACY_ATTEST_AUDIT = "clinical_attest_audit.jsonl"
 
+# retention.unsealed facade guards (#11 §11 / retention design §6). ``reason_code`` is a CLOSED enum
+# and ``ticket_ref`` — the ONLY non-enum retention string — is facade LENGTH-CAPPED. The chain is
+# assumed PHI-free-by-construction and SURVIVES destruction (§5.3), so uncapped free text (a probe
+# landed a 3100-char patient name) becomes PERMANENT PHI residue that cannot be redacted without
+# breaking the hash chain. The free-text WHY routes to vault_audit.log, never the chain.
+RETENTION_UNSEAL_REASONS: frozenset[str] = frozenset(
+    {"dispute", "audit", "rediarize", "clinical_review"})
+RETENTION_TICKET_REF_MAX = 128  # generous for a real ticket ref / short URL; bounds a PHI injection
+
 # Envelope actor_kind allowlist (§3.2). The typed emitters HARDCODE their (valid) kind, so they
 # enforce it by construction; the ONE caller-supplied path is ``access_read`` (the kind rides the
 # ``access_actor`` ContextVar), which coerces an out-of-allowlist value to ``"unknown"`` via
@@ -512,9 +521,24 @@ class ScribeEvents:
     def retention_unsealed(
         self, *, subject_id: str, reason_code: str, ticket_ref: str, now: str | None = None,
     ) -> AppendReceipt:
-        """Durable [D]. Records that a sealed encounter was opened for review/audit (§6, slice
-        13d). ``ticket_ref`` is the ONLY non-enum retention string (the free-text WHY routes to
-        vault_audit.log, not the store)."""
+        """Durable [D]. Records that a sealed encounter was opened for review/audit (§6, slice 13d).
+
+        FACADE GUARDS (finding 14, #11 §11 / design §6): ``reason_code`` MUST be one of the CLOSED
+        enum :data:`RETENTION_UNSEAL_REASONS`, and ``ticket_ref`` — the ONLY non-enum retention
+        string — is length-capped at :data:`RETENTION_TICKET_REF_MAX`. The facade is the mandated
+        enforcement point: the chain is PHI-free-by-construction and SURVIVES destruction, so free
+        text here would be permanent, unredactable PHI residue. Fail-closed (raise) rather than
+        truncate — a truncated patient name is still PHI; the free-text WHY routes to vault_audit.log."""
+        if reason_code not in RETENTION_UNSEAL_REASONS:
+            raise EventStoreError(
+                f"retention.unsealed reason_code {reason_code!r} is not in the design enum "
+                f"{sorted(RETENTION_UNSEAL_REASONS)} — refused (the chain carries enums only, #11 §11)")
+        ticket_ref = str(ticket_ref)
+        if len(ticket_ref) > RETENTION_TICKET_REF_MAX:
+            raise EventStoreError(
+                f"retention.unsealed ticket_ref exceeds the {RETENTION_TICKET_REF_MAX}-char facade cap "
+                f"(got {len(ticket_ref)}) — the ticket_ref is a REFERENCE, not free text; route the "
+                f"justification to vault_audit.log so the PHI-free chain stays redaction-independent")
         return self._emit_durable(
             CLINICAL, "retention.unsealed", subject_id=subject_id, actor="operator",
             actor_kind="operator", now=now,
