@@ -126,11 +126,28 @@ class StateManager:
                 return self.state
             try:
                 data = json.loads(read.text)
+                if not isinstance(data, dict):
+                    # Valid JSON but not an object (``[]``, ``5``, ``"x"``):
+                    # ``State.from_dict`` would raise AttributeError on
+                    # ``data.items()`` and escape run_daemon's UNGUARDED startup
+                    # call → brief-daemon crash-loop. Route it into the shared
+                    # degrade below with a descriptive message.
+                    raise TypeError(
+                        f"state root is {type(data).__name__}, expected a JSON object"
+                    )
                 self.state = State.from_dict(data)
                 log.info("brief.state.loaded", runs=len(self.state.runs))
-            except (json.JSONDecodeError, KeyError) as e:
-                # Clean read but bad JSON / unexpected shape → same fresh-State
-                # degrade the pre-migration code produced (semantics preserved).
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+                # Clean read but malformed content → fresh-State degrade + warn
+                # (NEVER escape the unguarded startup call). Covers: bad JSON
+                # syntax (JSONDecodeError); a non-object root (the TypeError
+                # raised above); and a dict whose fields from_dict can't build —
+                # ``{"runs": 5}`` → ``for r in 5`` TypeError; ``{"runs": [5]}``
+                # → BriefRun ``r.items()`` AttributeError; a missing required
+                # key → KeyError. The TypeError/AttributeError widen is scoped
+                # to the from_dict construction (pure dict-walking) and always
+                # logs error_type, so a would-be-masked from_dict bug stays
+                # visible in the logs rather than silently swallowed.
                 log.warning(
                     "brief.state.load_failed",
                     error=str(e),

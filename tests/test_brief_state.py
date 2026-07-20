@@ -332,3 +332,79 @@ class TestStateManagerLoadDegrade:
         warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
         assert len(warns) == 1
         assert warns[0]["error_type"] == "JSONDecodeError"
+
+    # --- valid-JSON-but-malformed-shape guard (arc-completion hardening) -----
+    # These shapes parse as JSON but crash State.from_dict, escaping the
+    # UNGUARDED run_daemon startup call → brief-daemon crash-loop. The old
+    # ``(json.JSONDecodeError, KeyError)`` catch missed AttributeError (non-dict
+    # root / non-dict run element) and TypeError (non-list ``runs``). Bind-check
+    # for all four: revert load() to that catch (drop the isinstance guard +
+    # the TypeError/AttributeError widen) → each raises.
+
+    def test_list_root_degrades_to_fresh(self, tmp_path: Path) -> None:
+        """``[]`` — a JSON array root. from_dict raises AttributeError on
+        ``data.items()``; the isinstance guard routes it to a fresh State()."""
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_text("[]", encoding="utf-8")
+        mgr = StateManager(state_path)
+        with structlog.testing.capture_logs() as cap:
+            loaded = mgr.load()
+        assert loaded.runs == []
+        assert loaded.last_error is None
+        warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
+        assert len(warns) == 1
+        assert warns[0]["error_type"] == "TypeError"
+        assert "expected a JSON object" in warns[0]["error"]
+
+    def test_scalar_root_degrades_to_fresh(self, tmp_path: Path) -> None:
+        """``5`` — a JSON scalar root. Same isinstance-guard degrade."""
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_text("5", encoding="utf-8")
+        mgr = StateManager(state_path)
+        with structlog.testing.capture_logs() as cap:
+            loaded = mgr.load()
+        assert loaded.runs == []
+        warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
+        assert len(warns) == 1
+        assert warns[0]["error_type"] == "TypeError"
+
+    def test_non_list_runs_degrades_to_fresh(self, tmp_path: Path) -> None:
+        """``{"runs": 5}`` — a dict (passes isinstance) but ``runs`` is not a
+        list, so from_dict raises TypeError on ``for r in 5``. The widened
+        catch degrades it. Proves the isinstance guard ALONE is insufficient."""
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_text('{"runs": 5}', encoding="utf-8")
+        mgr = StateManager(state_path)
+        with structlog.testing.capture_logs() as cap:
+            loaded = mgr.load()
+        assert loaded.runs == []
+        warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
+        assert len(warns) == 1
+        assert warns[0]["error_type"] == "TypeError"
+
+    def test_non_dict_run_element_degrades_to_fresh(self, tmp_path: Path) -> None:
+        """``{"runs": [5]}`` — dict with a non-dict run element, so
+        ``BriefRun.from_dict(5)`` raises AttributeError on ``5.items()``.
+        Exercises the AttributeError arm of the widened catch (checklist #7:
+        one fixture per failure mode that triggers the fallback)."""
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_text('{"runs": [5]}', encoding="utf-8")
+        mgr = StateManager(state_path)
+        with structlog.testing.capture_logs() as cap:
+            loaded = mgr.load()
+        assert loaded.runs == []
+        warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
+        assert len(warns) == 1
+        assert warns[0]["error_type"] == "AttributeError"
+
+    def test_valid_dict_still_loads(self, tmp_path: Path) -> None:
+        """Happy-path regression: a well-formed dict state still loads (the
+        isinstance guard must not reject valid objects)."""
+        state_path = tmp_path / "brief_state.json"
+        mgr0 = StateManager(state_path)
+        mgr0.state.add_run(_make_run("2026-07-20", success=True))
+        mgr0.save()
+        mgr = StateManager(state_path)
+        loaded = mgr.load()
+        assert len(loaded.runs) == 1
+        assert loaded.runs[0].date == "2026-07-20"
