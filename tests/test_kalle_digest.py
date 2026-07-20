@@ -314,6 +314,39 @@ def test_bit_state_non_utf8_degrades_with_warning(tmp_path: Path) -> None:
     assert warns[0]["error_type"] == "UnicodeDecodeError"
 
 
+def test_assemble_digest_survives_all_non_utf8_inputs(tmp_path: Path) -> None:
+    """End-to-end (N-B): when EVERY reader input is corrupt (non-UTF-8), the
+    assembled digest STILL ships — a well-formed markdown body rendered from
+    the degraded (empty) data — and each reader emits its specific warning.
+    Mirrors test_operations_section_survives_non_utf8_audit_and_state (d6192b2):
+    proves the whole assembler is total over corrupt inputs, not just each
+    reader in isolation."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "bash_exec.jsonl").write_bytes(b"\xff\xfe corrupt")
+    (data_dir / "instructor_state.json").write_bytes(b"\xff\xfe corrupt")
+    bit_state = tmp_path / "bit_state.json"
+    bit_state.write_bytes(b"\xff\xfe corrupt")
+
+    with structlog.testing.capture_logs() as cap:
+        md = assemble_digest(
+            today=TODAY,
+            data_dir=data_dir,
+            repo_paths=[],
+            bit_state_path=bit_state,
+        )
+    # Digest ships: a non-empty, well-formed markdown body (degraded content).
+    assert isinstance(md, str)
+    assert "**Yesterday:**" in md
+    assert "**Today:**" in md
+    assert "**Posture:**" in md
+    # Each corrupt reader emitted its specific warning (broken != idle).
+    events = {c.get("event") for c in cap}
+    assert "kalle_digest.bash_exec_read_failed" in events
+    assert "kalle_digest.instructor_state_read_failed" in events
+    assert "kalle_digest.bit_state_read_failed" in events
+
+
 # ---------------------------------------------------------------------------
 # Renderer
 # ---------------------------------------------------------------------------

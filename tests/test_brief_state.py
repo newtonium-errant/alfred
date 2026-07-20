@@ -277,3 +277,58 @@ class TestStateManagerIntegration:
         loaded = mgr3.load()
         assert loaded.last_error is None
         assert len(loaded.runs) == 1
+
+
+class TestStateManagerLoadDegrade:
+    """load() must degrade a corrupt/unreadable state file to a fresh
+    State() + warning rather than raising — it's called UNGUARDED at
+    daemon.py inside run_daemon, so an escaping read exception crash-loops
+    the brief daemon at startup (orchestrator retries 5× then gives up).
+    The old ``(json.JSONDecodeError, KeyError)`` catch missed BOTH
+    UnicodeDecodeError and OSError. (#25 4th leg, N-A.)
+    """
+
+    def test_non_utf8_state_degrades_to_fresh(self, tmp_path: Path) -> None:
+        """A non-UTF-8 brief_state.json → fresh State() + warning, not an
+        escaping UnicodeDecodeError (subclasses ValueError, not OSError, so
+        the old catch missed it). Mutation: revert load() to the
+        ``(json.JSONDecodeError, KeyError)`` catch → this raises."""
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_bytes(b"\xff\xfe not utf-8 at all")
+        mgr = StateManager(state_path)
+        with structlog.testing.capture_logs() as cap:
+            loaded = mgr.load()
+        assert loaded.runs == []
+        assert loaded.last_error is None
+        warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
+        assert len(warns) == 1
+        assert warns[0]["error_type"] == "UnicodeDecodeError"
+
+    def test_oserror_state_degrades_to_fresh(self, tmp_path: Path) -> None:
+        """An OSError on read (here: the path is a DIRECTORY →
+        IsADirectoryError, an OSError NOT caught by the old
+        ``(json.JSONDecodeError, KeyError)``) → fresh State() + warning.
+        Mutation: revert load() to that catch → this raises."""
+        state_path = tmp_path / "brief_state.json"
+        state_path.mkdir()  # exists() is True, but read_text raises IsADirectoryError
+        mgr = StateManager(state_path)
+        with structlog.testing.capture_logs() as cap:
+            loaded = mgr.load()
+        assert loaded.runs == []
+        warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
+        assert len(warns) == 1
+        assert warns[0]["error_type"] == "IsADirectoryError"
+
+    def test_bad_json_state_degrades_to_fresh(self, tmp_path: Path) -> None:
+        """A clean-read but non-JSON state file → fresh State() + warning
+        (the JSONDecodeError branch, preserved from pre-migration behavior;
+        now also surfaces error_type)."""
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_text("{ not json", encoding="utf-8")
+        mgr = StateManager(state_path)
+        with structlog.testing.capture_logs() as cap:
+            loaded = mgr.load()
+        assert loaded.runs == []
+        warns = [c for c in cap if c.get("event") == "brief.state.load_failed"]
+        assert len(warns) == 1
+        assert warns[0]["error_type"] == "JSONDecodeError"

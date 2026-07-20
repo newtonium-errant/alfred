@@ -9,6 +9,8 @@ from pathlib import Path
 
 import structlog
 
+from .utils import SectionReadStatus, safe_read_section_file
+
 log = structlog.get_logger(__name__)
 
 MAX_HISTORY = 30
@@ -105,12 +107,35 @@ class StateManager:
 
     def load(self) -> State:
         if self.path.exists():
+            # Defensive read via the shared helper — the old
+            # ``(json.JSONDecodeError, KeyError)`` catch missed BOTH
+            # UnicodeDecodeError (a non-UTF-8 file; subclasses ValueError, not
+            # OSError) AND OSError (permission-denied / is-a-dir / I/O). load()
+            # is called UNGUARDED at daemon.py inside run_daemon, so an escaping
+            # read exception crash-loops the brief daemon at startup (the
+            # orchestrator retries 5× then gives up). Degrade to a fresh
+            # State() + warning instead. Worst blast radius of the #25 class.
+            read = safe_read_section_file(self.path)
+            if read.status is not SectionReadStatus.OK:
+                log.warning(
+                    "brief.state.load_failed",
+                    error=read.detail,
+                    error_type=read.error_type,
+                )
+                self.state = State()
+                return self.state
             try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
+                data = json.loads(read.text)
                 self.state = State.from_dict(data)
                 log.info("brief.state.loaded", runs=len(self.state.runs))
             except (json.JSONDecodeError, KeyError) as e:
-                log.warning("brief.state.load_failed", error=str(e))
+                # Clean read but bad JSON / unexpected shape → same fresh-State
+                # degrade the pre-migration code produced (semantics preserved).
+                log.warning(
+                    "brief.state.load_failed",
+                    error=str(e),
+                    error_type=e.__class__.__name__,
+                )
                 self.state = State()
         return self.state
 
