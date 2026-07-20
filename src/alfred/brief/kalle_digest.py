@@ -56,7 +56,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .utils import get_logger
+from .utils import SectionReadStatus, get_logger, safe_read_section_file
 
 log = get_logger(__name__)
 
@@ -118,31 +118,42 @@ def read_bash_exec_log(
     start_iso = start.isoformat()
     end_iso = end.isoformat()
 
-    total = 0
-    cwds: Counter[str] = Counter()
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = str(entry.get("ts") or "")
-            if ts < start_iso or ts >= end_iso:
-                continue
-            total += 1
-            cwd_raw = str(entry.get("cwd") or "")
-            cwd_name = Path(cwd_raw).name if cwd_raw else "(unknown)"
-            cwds[cwd_name] += 1
-    except OSError as exc:
+    # Defensive read via the shared helper — the old bare ``except OSError``
+    # missed UnicodeDecodeError (a ValueError subclass), so a non-UTF-8
+    # bash_exec log escaped and aborted the WHOLE KAL-LE digest (fire_once's
+    # daemon-level catch eats it as a generic fire_error). Degrade to (0, {})
+    # + a warning; the per-line json.loads below stays line-level resilient.
+    # (N2: ``read.detail`` carries only errno/position/path, never file
+    # content — safe to log; this is an alfred-written system JSONL anyway.
+    # A future renderer over PERSONAL vault content must keep payloads
+    # content-free.)
+    read = safe_read_section_file(path)
+    if read.status is not SectionReadStatus.OK:
         log.warning(
             "kalle_digest.bash_exec_read_failed",
             path=str(path),
-            error=str(exc),
+            error=read.detail,
+            error_type=read.error_type,
         )
         return 0, {}
+
+    total = 0
+    cwds: Counter[str] = Counter()
+    for line in read.text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = str(entry.get("ts") or "")
+        if ts < start_iso or ts >= end_iso:
+            continue
+        total += 1
+        cwd_raw = str(entry.get("cwd") or "")
+        cwd_name = Path(cwd_raw).name if cwd_raw else "(unknown)"
+        cwds[cwd_name] += 1
     return total, dict(cwds)
 
 
@@ -169,9 +180,34 @@ def read_instructor_state(
     """
     if not path.exists():
         return [], [], []
+    # Defensive read via the shared helper — the old ``(json.JSONDecodeError,
+    # OSError)`` catch missed UnicodeDecodeError (a SIBLING of JSONDecodeError
+    # under ValueError, not a subclass), so a non-UTF-8 state file escaped and
+    # aborted the whole KAL-LE digest. Degrade to ([], [], []); signal the
+    # failure (ILB) so a corrupt state file isn't mistaken for "no directives".
+    # (N2: payload fields carry only errno/position/path, never file content —
+    # safe for this alfred-written system JSON. Future PERSONAL-content
+    # renderers must keep log payloads content-free.)
+    read = safe_read_section_file(path)
+    if read.status is not SectionReadStatus.OK:
+        log.warning(
+            "kalle_digest.instructor_state_read_failed",
+            path=str(path),
+            stage="read",
+            error=read.detail,
+            error_type=read.error_type,
+        )
+        return [], [], []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(read.text)
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "kalle_digest.instructor_state_read_failed",
+            path=str(path),
+            stage="json",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
         return [], [], []
     if not isinstance(data, dict):
         return [], [], []
@@ -273,9 +309,30 @@ def read_bit_state(path: Path | None) -> tuple[str, str]:
     """
     if path is None or not path.exists():
         return "", ""
+    # Defensive read via the shared helper — same UnicodeDecodeError gap as
+    # the other kalle_digest readers: a non-UTF-8 BIT state file escaped the
+    # ``(json.JSONDecodeError, OSError)`` catch. Degrade to ("", "") + signal
+    # the failure (ILB). (N2: content-free payload; alfred-written BIT metadata.)
+    read = safe_read_section_file(path)
+    if read.status is not SectionReadStatus.OK:
+        log.warning(
+            "kalle_digest.bit_state_read_failed",
+            path=str(path),
+            stage="read",
+            error=read.detail,
+            error_type=read.error_type,
+        )
+        return "", ""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(read.text)
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "kalle_digest.bit_state_read_failed",
+            path=str(path),
+            stage="json",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
         return "", ""
     runs = data.get("runs") if isinstance(data, dict) else None
     if not isinstance(runs, list) or not runs:

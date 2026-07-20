@@ -303,22 +303,34 @@ def test_operations_read_json_non_utf8_degrades(tmp_path) -> None:
     """A non-UTF-8 state file → {} (empty), not a crash. The old
     ``(json.JSONDecodeError, OSError)`` catch missed UnicodeDecodeError (a
     SIBLING of JSONDecodeError under ValueError, not a subclass). Mutation:
-    revert to that two-tuple catch → this raises."""
+    revert to that two-tuple catch → this raises.
+
+    N1 (ILB): the degrade now emits a stage=read warning so a corrupt
+    curator_state.json isn't silently rendered as "No new emails processed"."""
     from alfred.brief.operations import _read_json
 
     p = tmp_path / "curator_state.json"
     p.write_bytes(b"\xff\xfe not utf-8")
-    assert _read_json(p) == {}
+    with structlog.testing.capture_logs() as cap:
+        assert _read_json(p) == {}
+    warns = [c for c in cap if c.get("event") == "operations.state_read_failed"]
+    assert len(warns) == 1
+    assert warns[0]["stage"] == "read"
+    assert warns[0]["error_type"] == "UnicodeDecodeError"
 
 
 def test_operations_read_json_bad_json_degrades(tmp_path) -> None:
-    """A clean-read but non-JSON file → {} (the json.loads catch preserved
-    exactly from the pre-migration behavior)."""
+    """A clean-read but non-JSON file → {} (the json.loads catch preserved).
+    N1 (ILB): now also emits a stage=json warning."""
     from alfred.brief.operations import _read_json
 
     p = tmp_path / "curator_state.json"
     p.write_text("{ not json", encoding="utf-8")
-    assert _read_json(p) == {}
+    with structlog.testing.capture_logs() as cap:
+        assert _read_json(p) == {}
+    warns = [c for c in cap if c.get("event") == "operations.state_read_failed"]
+    assert len(warns) == 1
+    assert warns[0]["stage"] == "json"
 
 
 def test_operations_section_survives_non_utf8_audit_and_state(tmp_path) -> None:

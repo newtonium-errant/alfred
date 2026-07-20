@@ -78,6 +78,10 @@ def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
         # Frontmatter present but not valid YAML → same no-record path,
         # same broken-vs-idle signal (stage distinguishes it from a read
         # failure above).
+        # N2: str(yaml.YAMLError) CAN echo a fragment of the offending YAML.
+        # Safe here — BIT records are alfred-written system metadata, not
+        # personal content. A future renderer parsing PERSONAL vault
+        # frontmatter must NOT log str(exc) verbatim (content leak into logs).
         log.warning(
             "brief.health_record_load_failed",
             path=str(path),
