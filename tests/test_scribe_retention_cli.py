@@ -280,6 +280,29 @@ def test_keygen_writes_public_only_streams_private_to_stderr(tmp_path, capsys, m
     assert not any("AGE-SECRET-KEY" in repr(rec) for rec in captured)
 
 
+def test_keygen_writes_secret_free_custody_audit_line(tmp_path, capsys, monkeypatch):
+    """#13d-1 follow-up: a first mint leaves a secret-free custody breadcrumb in
+    vault_audit.log — op=create, path=pubkey, detail carries public_fp + rotated=False
+    — and the private key appears in NO audit entry. append_to_audit_log is FILE-based
+    (writes JSONL, not structlog), so the pin reads the audit file, not capture_logs."""
+    from alfred.scribe import retention as ret_mod
+    _patch_keypair(monkeypatch)
+    cfg, pub_path = _keygen_cfg(tmp_path)
+    cli._cmd_scribe_retention(_keygen_ns(cfg))
+    audit = tmp_path / "data" / "vault_audit.log"
+    rows = [json.loads(l) for l in audit.read_text(encoding="utf-8").splitlines() if l.strip()]
+    custody = [r for r in rows if "retention seal keygen" in r.get("detail", "")]
+    assert len(custody) == 1, rows
+    row = custody[0]
+    assert row["tool"] == "scribe"
+    assert row["op"] == "create"                        # first mint CREATES the pubkey file
+    assert row["path"] == str(pub_path)
+    assert f"public_fp={ret_mod.key_fingerprint(_FAKE_PUB)}" in row["detail"]
+    assert "rotated=False" in row["detail"]
+    # The private key is NEVER in the audit trail (the whole point of the two-trail split).
+    assert "AGE-SECRET-KEY" not in audit.read_text(encoding="utf-8")
+
+
 def test_keygen_unset_path_errors(tmp_path, capsys, monkeypatch):
     """seal_public_key_path unset ⇒ fail-closed error, exit 1, no keypair minted."""
     _patch_keypair(monkeypatch)  # would succeed if reached — proves we fail BEFORE it
@@ -312,6 +335,13 @@ def test_keygen_force_rotates_new_key(tmp_path, capsys, monkeypatch):
     out = _stdout_json(capsys)
     assert out["rotated"] is True
     assert pub_path.read_text(encoding="utf-8").strip() == "age1rotatednewkeyxxxxxxxxxxxxx"
+    # Rotation MODIFIES the existing pubkey file → the custody-audit line records op=modify + rotated=True.
+    audit = tmp_path / "data" / "vault_audit.log"
+    custody = [json.loads(l) for l in audit.read_text(encoding="utf-8").splitlines()
+               if l.strip() and "retention seal keygen" in l]
+    assert len(custody) == 1
+    assert custody[0]["op"] == "modify" and "rotated=True" in custody[0]["detail"]
+    assert "AGE-SECRET-KEY" not in audit.read_text(encoding="utf-8")
 
 
 def test_keygen_sealer_unavailable_fails_closed(tmp_path, capsys, monkeypatch):

@@ -2956,6 +2956,7 @@ def _retention_keygen(args: argparse.Namespace) -> None:
     the terminal."""
     from alfred.scribe import retention as ret_mod
     from alfred.scribe.config import load_from_unified as load_scribe_config
+    from alfred.vault.mutation_log import append_to_audit_log, build_audit_mutations
 
     raw = _load_unified_config(args.config)
     pub_path = load_scribe_config(raw).retention.seal_public_key_path
@@ -2990,6 +2991,18 @@ def _retention_keygen(args: argparse.Namespace) -> None:
         print(json.dumps({"error": f"failed to write the seal public key to {str(pub_path)!r}: {exc}"}))
         sys.exit(1)
     fp = ret_mod.key_fingerprint(pub)
+    # SECRET-FREE custody-audit breadcrumb (#13d-1 follow-up) — a PHIA key-custody ceremony must
+    # leave a "when was the seal key minted/rotated" trail. Route it to vault_audit.log via the same
+    # two-trail convention the attest override uses (attest.py:337-346), NOT a re-derived writer. The
+    # detail carries the PUBLIC fingerprint + the rotated flag ONLY — NEVER the private identity (which
+    # lives only on the terminal below). A rotation MODIFIES the pubkey file (op "edit"); a first mint
+    # CREATES it (op "create").
+    log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
+    append_to_audit_log(
+        str(log_dir / "vault_audit.log"), "scribe",
+        build_audit_mutations("edit" if rotating else "create", str(pub_path)),
+        detail=f"retention seal keygen (public_fp={fp}, rotated={rotating}) — private identity "
+               f"streamed to terminal only, never persisted")
     # ONE-TIME custody block on STDERR (human ceremony). The private identity reaches the operator's
     # terminal ONLY — never a file, the chain, or a log. Bare sys.stderr.write (NOT structlog / NOT
     # print-to-stdout) so no log sink and no stdout-redirect capture the secret.
