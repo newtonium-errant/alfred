@@ -214,3 +214,129 @@ def test_unset_schedule_path_errors(tmp_path, capsys):
     with pytest.raises(SystemExit):
         cli._cmd_scribe_retention(_ns(str(p), "show"))
     assert "unset" in json.dumps(_stdout_json(capsys))
+
+
+# ============================ keygen (13d-1) ============================
+#
+# The offline-key custody ceremony (design §3.1). CONTRACT: write ONLY the public
+# recipient on-box; stream the PRIVATE identity to STDERR once (never a file, never
+# the chain, never a log); JSON summary carries the PUBLIC fingerprint only. The
+# structural pins (public-only-written, private-stays-off-stdout-and-off-logs,
+# fail-closed guards) run UNCONDITIONALLY with a fake keypair; one dep-gated test
+# asserts the real age recipient validity.
+
+
+_FAKE_PUB = b"age1qfakepublicrecipientdonotusexxxxxxxxxxxxxxxxxxxxxxxxxxx"
+_FAKE_PRIV = "AGE-SECRET-KEY-1FAKEIDENTITYDONOTUSEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+
+def _keygen_cfg(tmp_path, *, mode="clinical", set_pub_path=True):
+    pub_path = tmp_path / "seal" / "seal_pub.age"
+    retention = {"seal_public_key_path": str(pub_path)} if set_pub_path else {}
+    body = {
+        "vault": {"path": str(tmp_path / "vault")},
+        "logging": {"dir": str(tmp_path / "data")},
+        "scribe": {
+            "clinicians": ["np_jamie"], "encounter_salt": "s", "mode": mode,
+            "retention": retention,
+        },
+    }
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(body), encoding="utf-8")
+    return str(p), pub_path
+
+
+def _keygen_ns(config, *, force=False):
+    return argparse.Namespace(
+        config=config, scribe_cmd="retention", retention_cmd="keygen", force=force)
+
+
+def _patch_keypair(monkeypatch, pub=_FAKE_PUB, priv=_FAKE_PRIV):
+    from alfred.scribe import retention as ret_mod
+    monkeypatch.setattr(ret_mod, "generate_keypair", lambda: (pub, priv.encode("utf-8")))
+
+
+def test_keygen_writes_public_only_streams_private_to_stderr(tmp_path, capsys, monkeypatch):
+    """Public key written on-box; private identity ONLY on stderr — never stdout,
+    never the pubkey file, never a captured log event."""
+    from alfred.scribe import retention as ret_mod
+    _patch_keypair(monkeypatch)
+    cfg, pub_path = _keygen_cfg(tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        cli._cmd_scribe_retention(_keygen_ns(cfg))
+    cap = capsys.readouterr()
+    # Public key file holds EXACTLY the recipient (a trailing newline is fine).
+    assert pub_path.read_text(encoding="utf-8").strip() == _FAKE_PUB.decode()
+    # JSON summary (stdout) carries the PUBLIC fingerprint + rotated flag — no private key.
+    out = json.loads(cap.out)
+    assert out == {
+        "keygen": True, "seal_public_key_path": str(pub_path),
+        "sealed_to_key_fp": ret_mod.key_fingerprint(_FAKE_PUB), "rotated": False,
+    }
+    assert "AGE-SECRET-KEY" not in cap.out
+    # The private identity IS delivered on stderr (the one-time custody block).
+    assert _FAKE_PRIV in cap.err
+    # And it appears in NO log event (no structlog line ever carries the secret).
+    assert not any("AGE-SECRET-KEY" in repr(rec) for rec in captured)
+
+
+def test_keygen_unset_path_errors(tmp_path, capsys, monkeypatch):
+    """seal_public_key_path unset ⇒ fail-closed error, exit 1, no keypair minted."""
+    _patch_keypair(monkeypatch)  # would succeed if reached — proves we fail BEFORE it
+    cfg, _ = _keygen_cfg(tmp_path, set_pub_path=False)
+    with pytest.raises(SystemExit):
+        cli._cmd_scribe_retention(_keygen_ns(cfg))
+    assert "unset" in json.dumps(_stdout_json(capsys))
+
+
+def test_keygen_refuses_overwrite_without_force(tmp_path, capsys, monkeypatch):
+    """An existing pubkey is NOT overwritten without --force; the file is untouched."""
+    _patch_keypair(monkeypatch)
+    cfg, pub_path = _keygen_cfg(tmp_path)
+    pub_path.parent.mkdir(parents=True, exist_ok=True)
+    pub_path.write_text("age1existingkeyxxxxxxxxxxxxxx\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cli._cmd_scribe_retention(_keygen_ns(cfg, force=False))
+    assert "--force" in json.dumps(_stdout_json(capsys))
+    # UNCHANGED — never clobbered a live key without an explicit rotation.
+    assert pub_path.read_text(encoding="utf-8") == "age1existingkeyxxxxxxxxxxxxxx\n"
+
+
+def test_keygen_force_rotates_new_key(tmp_path, capsys, monkeypatch):
+    """--force rotates: a NEW key is written + rotated:true (additive rotation)."""
+    cfg, pub_path = _keygen_cfg(tmp_path)
+    pub_path.parent.mkdir(parents=True, exist_ok=True)
+    pub_path.write_text("age1oldkeyxxxxxxxxxxxxxxxxxxxx\n", encoding="utf-8")
+    _patch_keypair(monkeypatch, pub=b"age1rotatednewkeyxxxxxxxxxxxxx")
+    cli._cmd_scribe_retention(_keygen_ns(cfg, force=True))
+    out = _stdout_json(capsys)
+    assert out["rotated"] is True
+    assert pub_path.read_text(encoding="utf-8").strip() == "age1rotatednewkeyxxxxxxxxxxxxx"
+
+
+def test_keygen_sealer_unavailable_fails_closed(tmp_path, capsys, monkeypatch):
+    """pyrage absent ⇒ SealerUnavailable ⇒ fail-closed error, exit 1, no pubkey written."""
+    from alfred.scribe import retention as ret_mod
+
+    def _boom():
+        raise ret_mod.SealerUnavailable("no pyrage")
+
+    monkeypatch.setattr(ret_mod, "generate_keypair", _boom)
+    cfg, pub_path = _keygen_cfg(tmp_path)
+    with pytest.raises(SystemExit):
+        cli._cmd_scribe_retention(_keygen_ns(cfg))
+    assert "pyrage" in json.dumps(_stdout_json(capsys))
+    assert not pub_path.exists()
+
+
+def test_keygen_real_crypto_writes_valid_recipient(tmp_path, capsys):
+    """Dep-gated: with pyrage present, keygen writes a CANONICAL age recipient (the
+    sweep's is_valid_age_recipient accepts it) and the fp matches key_fingerprint."""
+    from alfred.scribe import retention as ret_mod
+    pytest.importorskip("pyrage")
+    cfg, pub_path = _keygen_cfg(tmp_path)
+    cli._cmd_scribe_retention(_keygen_ns(cfg))
+    out = _stdout_json(capsys)
+    written = pub_path.read_text(encoding="utf-8").strip()
+    assert ret_mod.is_valid_age_recipient(written)
+    assert out["sealed_to_key_fp"] == ret_mod.key_fingerprint(written.encode("utf-8"))

@@ -108,6 +108,8 @@ _STAYC_PLACEHOLDERS: frozenset[str] = frozenset({
     "<STAYC_VAULT>",
     "<STAYC_DATA>",
     "<STAYC_INPUT_DIR>",
+    # #13d Q4 — the daemon-READ-ONLY seal dir (seal pubkey + s.50 schedule).
+    "<STAYC_SEAL_DIR>",
 })
 
 #: Generic residual-placeholder sweep — catches an UNKNOWN ``<UPPER_CASE>``
@@ -140,6 +142,10 @@ class StaycInstallPlan:
     data: Path
     #: Read from config.scribe.input_dir (#67 F4) — a ReadWritePaths root.
     input_dir: Path
+    #: #13d Q4 — the daemon-READ-ONLY seal dir (seal pubkey + s.50 schedule). Added
+    #: to the unit's ReadOnlyPaths so a compromised daemon can seal TO the key but
+    #: not swap it. Operator-published (keygen / schedule publish), never daemon-written.
+    seal_dir: Path
     #: Read from config.scribe.stt.model (#67 F3) — drives the HF-cache check.
     stt_model: str
     unit_filename: str
@@ -219,6 +225,7 @@ def render_stayc_unit(
     vault: Path,
     data: Path,
     input_dir: Path,
+    seal_dir: Path,
 ) -> str:
     """Substitute the STAY-C placeholders into the unit template.
 
@@ -238,6 +245,7 @@ def render_stayc_unit(
         .replace("<STAYC_VAULT>", str(vault))
         .replace("<STAYC_DATA>", str(data))
         .replace("<STAYC_INPUT_DIR>", str(input_dir))
+        .replace("<STAYC_SEAL_DIR>", str(seal_dir))
     )
     leftovers = sorted(ph for ph in _STAYC_PLACEHOLDERS if ph in rendered)
     residual = sorted(set(_RESIDUAL_PLACEHOLDER_RE.findall(rendered)))
@@ -263,6 +271,7 @@ def build_plan(
     vault: Path | None = None,
     data: Path | None = None,
     input_dir: Path | None = None,
+    seal_dir: Path | None = None,
     stt_model: str | None = None,
 ) -> StaycInstallPlan:
     """Derive deploy paths from ``stayc_root``, read the config, render the unit.
@@ -271,15 +280,20 @@ def build_plan(
     ``stayc_root`` but is independently overridable (e.g. an HF cache on a
     different volume). ``input_dir`` + ``stt_model`` default to the DEPLOYED
     config's ``scribe.input_dir`` / ``scribe.stt.model`` (#67 F3/F4) — read once
-    unless both are supplied explicitly. Reads the bundled template + the
-    deployed config only — no ``instances.yaml``, no ``algernon.target``. NO FS
-    mutation, NO subprocess.
+    unless both are supplied explicitly. ``seal_dir`` defaults to
+    ``<stayc_root>/seal`` (#13d Q4 — the daemon-read-only seal pubkey + schedule
+    home, added to ReadOnlyPaths). Reads the bundled template + the deployed config
+    only — no ``instances.yaml``, no ``algernon.target``. NO FS mutation, NO subprocess.
     """
     config_path = config_path or (stayc_root / "config.stayc-clinical.yaml")
     secrets_env = secrets_env or (stayc_root / "secrets" / "scribe.env")
     hf_home = hf_home or (stayc_root / "models" / "hf")
     vault = vault or (stayc_root / "vault")
     data = data or (stayc_root / "data")
+    # #13d Q4 — the daemon-READ-ONLY seal dir, OUTSIDE <STAYC_DATA> (which is
+    # ReadWritePaths). Default <stayc_root>/seal; the config's seal_public_key_path
+    # + schedule_path should point INSIDE it so ReadOnlyPaths protects them.
+    seal_dir = seal_dir or (stayc_root / "seal")
     # #67 F1: the ExecStart python is the STAY-C OWN venv (faster-whisper lives
     # there), decoupled from wherever this installer module happens to live.
     python = python or (stayc_root / ".venv" / "bin" / "python")
@@ -311,6 +325,7 @@ def build_plan(
         vault=vault,
         data=data,
         input_dir=input_dir,
+        seal_dir=seal_dir,
     )
 
     return StaycInstallPlan(
@@ -326,6 +341,7 @@ def build_plan(
         vault=vault,
         data=data,
         input_dir=input_dir,
+        seal_dir=seal_dir,
         stt_model=stt_model,
         unit_filename=STAYC_UNIT_FILENAME,
         unit_content=unit_content,
@@ -555,6 +571,7 @@ def print_plan(plan: StaycInstallPlan) -> None:
     print(f"    vault:     {plan.vault}")
     print(f"    data:      {plan.data}")
     print(f"    input_dir: {plan.input_dir}  (from config; a ReadWritePaths root)")
+    print(f"    seal dir:  {plan.seal_dir}  (#13d — a ReadOnlyPaths root: seal pubkey + schedule)")
     print(f"    STT model: {plan.stt_model}")
     print()
 
@@ -653,6 +670,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--vault", type=Path, default=None, help="Override the PHI vault path (default: <stayc-root>/vault).")
     parser.add_argument("--data", type=Path, default=None, help="Override the data dir — logs/audit/encounters/pid (default: <stayc-root>/data).")
     parser.add_argument("--input-dir", type=Path, default=None, help="Override scribe.input_dir (default: read from the config). Added to ReadWritePaths (#67 F4).")
+    parser.add_argument("--seal-dir", type=Path, default=None, help="Override the daemon-read-only seal dir — seal pubkey + s.50 schedule (default: <stayc-root>/seal). Added to ReadOnlyPaths (#13d Q4).")
     parser.add_argument("--stt-model", default=None, help="Override scribe.stt.model (default: read from the config). Drives the offline HF-cache check (#67 F3).")
     parser.add_argument(
         "--stage-model",
@@ -728,6 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             vault=args.vault,
             data=args.data,
             input_dir=args.input_dir,
+            seal_dir=args.seal_dir,
             stt_model=args.stt_model,
         )
     except (FileNotFoundError, ValueError) as exc:

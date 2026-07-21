@@ -41,7 +41,14 @@ ProtectHome=read-only
 # data dir, NOT under it, so ProtectSystem=strict would leave it read-only and
 # every encounter would EROFS on its ledger write. Include it explicitly.
 ReadWritePaths=<STAYC_VAULT> <STAYC_DATA> <STAYC_HF_HOME> <STAYC_INPUT_DIR>
-ReadOnlyPaths=<STAYC_CONFIG>
+# <STAYC_SEAL_DIR> holds the seal PUBLIC key + the s.50 retention schedule — both
+# OPERATOR-published (via `alfred scribe retention keygen` / `schedule publish`,
+# run in the operator's shell, NOT under this sandbox) and daemon-READ-ONLY (#13d
+# Q4). Siting them read-only means a live-compromised daemon can seal TO the key
+# but cannot SWAP it (seal future encounters to an attacker key) or rewrite the
+# schedule. The sealed-blob STORE stays under <STAYC_DATA> (ReadWritePaths) — the
+# daemon writes blobs there; only the pubkey + schedule are read-only.
+ReadOnlyPaths=<STAYC_CONFIG> <STAYC_SEAL_DIR>
 PrivateTmp=yes
 UMask=0077
 ProtectKernelTunables=yes

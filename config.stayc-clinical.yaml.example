@@ -187,6 +187,54 @@ scribe:
     enabled: true
     canary: "192.0.2.1:443"        # TEST-NET-1 (RFC 5737) — NON-routable, never touches a real host; SYN only
     loopback: "127.0.0.1:11434"    # Ollama loopback — must stay reachable (real-need i)
+  # ── RETENTION LIFECYCLE (task #13) — sealed retained-audio + s.50 schedule ─────
+  # The default is RETAIN, sealed at rest: each encounter's audio is age-sealed to
+  # a PUBLIC key on-box; the PRIVATE key lives OFFLINE (USB x2). A live-compromised
+  # daemon cannot decrypt the archive. Destruction is the explicit, audited operator
+  # EXCEPTION (`alfred scribe retention destroy`), never automatic.
+  retention:
+    mode: retained            # retained (default) | transient — NEVER silently transient.
+    #                           transient wipes audio WITHOUT sealing (disk-pressure fallback);
+    #                           it emits a loud counted signal, never the silent default.
+    # retained_dir EMPTY ⇒ CODE-DERIVED <input_dir parent>/retained (on-box:
+    # /data/algernon/stayc-clinical/data/retained — under ReadWritePaths, the daemon
+    # writes sealed .age blobs + relocated transcripts there). Set only to override.
+    retained_dir: ""
+    # seal_public_key_path — the age recipient (age1…) the daemon seals to. Site it
+    # under the daemon-READ-ONLY seal dir (systemd ReadOnlyPaths, #13d Q4) so a
+    # compromised daemon can seal TO it but not SWAP it. EMPTY ⇒ sealing is SKIPPED
+    # (latched no_seal_public_key) until you run the custody ceremony:
+    #     alfred --config config.stayc-clinical.yaml scribe retention keygen
+    # keygen writes ONLY the public key here; the private identity is shown ONCE on
+    # the terminal for you to move to two offline USB sticks (Andrew + Jamie). The
+    # private key is NEVER written to the box, the chain, or a log.
+    seal_public_key_path: "/data/algernon/stayc-clinical/seal/seal_pub.age"
+    # schedule_path — the s.50 retention schedule (versioned JSON, sha-pinned into the
+    # clinical chain). Also under the daemon-read-only seal dir. EMPTY ⇒ over-window
+    # surfacing is OFF (latched no_schedule_published). Publish with:
+    #     alfred … scribe retention schedule publish examples/retention_schedule.v1.json
+    schedule_path: "/data/algernon/stayc-clinical/seal/retention_schedule.json"
+    # review_spool_path — PHI-FREE morning-review relay snapshot (Salem's Morning
+    # Brief reads it: the over-window review_due count + the oldest over-window
+    # opaque encounter id). No PHI, no bodies. EMPTY ⇒ the spool is not written.
+    review_spool_path: "/data/algernon/stayc-clinical/data/retention_review.spool"
+    abandon_grace_days: 7     # a stale un-closed encounter (no activity for N days) is
+    #                           defensively SEALED-and-KEPT (never auto-deleted). Floored at 1.
+  # ── KEY CUSTODY + BACKUP POSTURE (task #13 — real-data gate, not a build blocker) ─
+  # OFFLINE PRIVATE KEY: `retention keygen` prints it ONCE. Move it to TWO offline USB
+  #   sticks (Andrew + Jamie), verify each opens a test seal, then clear the terminal.
+  #   It opens EVERY sealed encounter for the whole 10-yr window — treat it as a
+  #   controlled item. Rotation is additive: a new `keygen --force` mints a new
+  #   fingerprint; already-sealed blobs keep opening with the old key.
+  # RETRIEVAL: `alfred … scribe retention unseal <enc> --key <usb> --out <dir> --reason
+  #   <dispute|audit|rediarize|clinical_review> --ticket <ref>` (stop the daemon first);
+  #   or open the .age blob off-box with the stock `age` binary + `unseal … --record-only`.
+  # BACKUP (operator-gated, real-data step): STAY-C is backed up by a DEDICATED restic
+  #   job (its OWN repo + 10-yr keep policy), separate from the general algernon nightly.
+  #   The off-box transcript + note are age-sealed to the SAME offline key BEFORE upload
+  #   (seal-before-backup), so the whole off-box archive is uniformly crypto-shredded.
+  #   The biometric enrollment dir is STRUCTURALLY EXCLUDED. Destruction purges the
+  #   backup copies (restic rewrite --exclude --forget + prune) and asserts they are gone.
 
 # ---------------------------------------------------------------------------
 # Vault — STAY-C's OWN PHI vault, physically separate from every other vault

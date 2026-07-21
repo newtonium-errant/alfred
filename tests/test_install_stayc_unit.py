@@ -97,6 +97,7 @@ def test_render_sentinel_rejects_unsubstituted_placeholder() -> None:
             vault=Path("/vault"),
             data=Path("/data"),
             input_dir=Path("/inbox"),
+            seal_dir=Path("/seal"),
         )
 
 
@@ -199,7 +200,6 @@ def test_rendered_unit_sandbox_directives(tmp_path: Path) -> None:
         "IPAddressAllow=localhost",
         "IPAddressDeny=any",
         "RestartPreventExitStatus=78 79",
-        "ReadOnlyPaths=/data/algernon/stayc-clinical/config.stayc-clinical.yaml",
     ):
         assert expected in directives, f"missing directive: {expected!r}"
 
@@ -214,6 +214,17 @@ def test_rendered_unit_sandbox_directives(tmp_path: Path) -> None:
     ):
         assert needed in rwp[0], f"ReadWritePaths missing {needed}"
 
+    # #13d Q4: ReadOnlyPaths covers the config AND the daemon-read-only seal dir
+    # (seal pubkey + s.50 schedule), in a single directive — a compromised daemon
+    # can seal TO the key but not SWAP it.
+    rop = [l for l in directives if l.startswith("ReadOnlyPaths=")]
+    assert len(rop) == 1
+    for needed in (
+        "/data/algernon/stayc-clinical/config.stayc-clinical.yaml",
+        "/data/algernon/stayc-clinical/seal",
+    ):
+        assert needed in rop[0], f"ReadOnlyPaths missing {needed}"
+
     # Offline HF env belt.
     assert "Environment=HF_HOME=/data/algernon/stayc-clinical/models/hf" in directives
     assert "Environment=HF_HUB_OFFLINE=1" in directives
@@ -226,6 +237,46 @@ def test_rendered_unit_sandbox_directives(tmp_path: Path) -> None:
     assert not any(l.startswith("SystemCallFilter") for l in directives), (
         "SystemCallFilter must NOT be an active directive (risks killing native STT)"
     )
+
+
+# ---------------------------------------------------------------------------
+# #13d Q4 — the daemon-READ-ONLY seal dir (<STAYC_SEAL_DIR>)
+# ---------------------------------------------------------------------------
+
+
+def test_seal_dir_placeholder_in_known_set() -> None:
+    """Contract-pin lockstep (checklist #6): the template carries <STAYC_SEAL_DIR>,
+    so it MUST be in _STAYC_PLACEHOLDERS or the residual-sweep sentinel would reject
+    every render. Adding the placeholder without registering it here is the exact
+    drift this pins against."""
+    assert "<STAYC_SEAL_DIR>" in installer._STAYC_PLACEHOLDERS
+
+
+def test_seal_dir_defaults_under_stayc_root_and_is_read_only(tmp_path: Path) -> None:
+    """build_plan defaults seal_dir to <stayc_root>/seal, it lands in ReadOnlyPaths,
+    and it is OUTSIDE every ReadWritePaths root — the security property: a compromised
+    daemon can read (seal TO) the pubkey but never write (SWAP) it."""
+    plan = _build(tmp_path)
+    assert plan.seal_dir == Path("/data/algernon/stayc-clinical/seal")
+    directives = _directive_lines(plan.unit_content)
+    rop = [l for l in directives if l.startswith("ReadOnlyPaths=")]
+    assert len(rop) == 1
+    assert "/data/algernon/stayc-clinical/seal" in rop[0]
+    # The seal dir must NOT be reachable from any writable root (else the read-only
+    # guarantee is void). It is a SIBLING of data, never under it.
+    for rw_root in _readwrite_roots(plan.unit_content):
+        assert rw_root not in plan.seal_dir.parents and rw_root != plan.seal_dir, (
+            f"seal dir {plan.seal_dir} must not sit under writable root {rw_root}"
+        )
+
+
+def test_seal_dir_override_wins(tmp_path: Path) -> None:
+    """A --seal-dir (build_plan seal_dir=) override replaces the <stayc_root>/seal
+    default and renders into ReadOnlyPaths."""
+    plan = _build(tmp_path, seal_dir=Path("/mnt/ro/stayc-seal"))
+    assert plan.seal_dir == Path("/mnt/ro/stayc-seal")
+    rop = [l for l in _directive_lines(plan.unit_content) if l.startswith("ReadOnlyPaths=")]
+    assert "/mnt/ro/stayc-seal" in rop[0]
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +465,41 @@ def test_config_example_input_dir_is_under_a_readwrite_root(tmp_path: Path) -> N
         f"{roots} — ProtectSystem=strict would make it read-only and every "
         f"encounter would fail EROFS."
     )
+
+
+def test_config_example_seal_paths_are_under_the_readonly_seal_dir(tmp_path: Path) -> None:
+    """#13d Q4 mirror-image of the input_dir guard: the config example's retention
+    ``seal_public_key_path`` + ``schedule_path`` MUST resolve UNDER the ReadOnlyPaths
+    seal dir. If they drifted into a ReadWritePaths root (or anywhere writable), a
+    live-compromised daemon could SWAP the seal key (seal future encounters to an
+    attacker key) or rewrite the schedule — defeating the whole asymmetric-seal
+    posture. Built FROM the real config example (exercises the read)."""
+    raw = yaml.safe_load(_CONFIG_EXAMPLE.read_text(encoding="utf-8"))
+    retention = raw["scribe"]["retention"]
+    pub_path = Path(retention["seal_public_key_path"])
+    sched_path = Path(retention["schedule_path"])
+
+    plan = installer.build_plan(
+        stayc_root=installer.DEFAULT_STAYC_ROOT,
+        install_dir=tmp_path / "systemd",
+        unit_user="andrew",
+        unit_group="andrew",
+        config_path=_CONFIG_EXAMPLE,
+    )
+    directives = _directive_lines(plan.unit_content)
+    rop = [l for l in directives if l.startswith("ReadOnlyPaths=")]
+    assert len(rop) == 1
+    ro_roots = [Path(p) for p in rop[0].split("=", 1)[1].split()]
+    for p in (pub_path, sched_path):
+        assert any(p == r or p.is_relative_to(r) for r in ro_roots), (
+            f"retention path {p} is NOT under any ReadOnlyPaths root {ro_roots} — a "
+            f"compromised daemon could swap the seal key / rewrite the schedule."
+        )
+    # And it must NOT be writable — belt on the above (a path can't be under both).
+    for p in (pub_path, sched_path):
+        assert not any(p == r or p.is_relative_to(r) for r in _readwrite_roots(plan.unit_content)), (
+            f"retention path {p} sits under a WRITABLE root — the daemon must not be able to swap it."
+        )
 
 
 # ---------------------------------------------------------------------------

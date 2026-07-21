@@ -2942,13 +2942,97 @@ def _cmd_scribe_audit(args: argparse.Namespace) -> None:
         print(f"no events for encounter {args.encounter}", file=sys.stderr)  # ILB
 
 
+def _retention_keygen(args: argparse.Namespace) -> None:
+    """``alfred scribe retention keygen [--force]`` — the offline-key CUSTODY CEREMONY (design §3.1,
+    slice 13d). Mints an age X25519 keypair and writes ONLY the recipient PUBLIC key (an ``age1…``
+    string) to ``retention.seal_public_key_path`` (daemon-readable, and per Q4 daemon-READ-ONLY). The
+    PRIVATE identity (``AGE-SECRET-KEY-…``) is streamed to STDERR as a one-time custody block for the
+    operator to move to two offline USB copies — it is NEVER written to any daemon-readable path, NEVER
+    to the chain, and NEVER logged (no structlog line carries it; the write is a bare ``sys.stderr``
+    print so no log sink observes the identity). Rotation is ADDITIVE: ``--force`` mints a new
+    fingerprint; already-sealed blobs keep their ``sealed_to_key_fp`` and open with the matching offline
+    key (no re-seal). The JSON summary on stdout carries the PUBLIC fingerprint only — NEVER the private
+    key — so a ``keygen > out.json`` redirect captures the secret-free summary while the secret stays on
+    the terminal."""
+    from alfred.scribe import retention as ret_mod
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    raw = _load_unified_config(args.config)
+    pub_path = load_scribe_config(raw).retention.seal_public_key_path
+    if not pub_path:
+        print(json.dumps({"error": "retention.seal_public_key_path is unset — configure the "
+                                    "daemon-read-only seal public-key path before keygen "
+                                    "(design §3.1/§3.7)"}))
+        sys.exit(1)
+    pub_path = Path(pub_path)
+    rotating = pub_path.exists()
+    if rotating and not args.force:
+        print(json.dumps({
+            "error": f"a seal public key already exists at {str(pub_path)!r} — refusing to overwrite "
+                     f"without --force. Key rotation is DELIBERATE + additive: --force mints a NEW "
+                     f"fingerprint; already-sealed encounters keep their sealed_to_key_fp and still "
+                     f"open with the matching OFFLINE private key (no re-seal). Re-run with --force to "
+                     f"rotate."}))
+        sys.exit(1)
+    try:
+        pub, priv = ret_mod.generate_keypair()
+    except ret_mod.SealerUnavailable as exc:
+        print(json.dumps({"error": f"cannot generate a seal keypair — the age backend (pyrage) is not "
+                                    f"installed: {exc}"}))
+        sys.exit(1)
+    # Write ONLY the public recipient (atomic, fsync-durable, 0600). keygen runs in the operator's
+    # interactive shell — NOT under the systemd sandbox — so it writes the daemon-read-only seal dir
+    # freely (ReadOnlyPaths constrains the DAEMON process only). Trailing newline is stripped by the
+    # sweep's _resolve_pubkey / is_valid_age_recipient, so the file stays a clean single-line recipient.
+    try:
+        ret_mod._atomic_write_bytes(pub_path, pub + b"\n")
+    except OSError as exc:
+        print(json.dumps({"error": f"failed to write the seal public key to {str(pub_path)!r}: {exc}"}))
+        sys.exit(1)
+    fp = ret_mod.key_fingerprint(pub)
+    # ONE-TIME custody block on STDERR (human ceremony). The private identity reaches the operator's
+    # terminal ONLY — never a file, the chain, or a log. Bare sys.stderr.write (NOT structlog / NOT
+    # print-to-stdout) so no log sink and no stdout-redirect capture the secret.
+    priv_str = priv.decode("utf-8")
+    sys.stderr.write(
+        "\n"
+        "============================================================\n"
+        "  STAY-C SEAL KEY — OFFLINE PRIVATE IDENTITY (shown ONCE)\n"
+        "============================================================\n"
+        f"  {priv_str}\n"
+        "------------------------------------------------------------\n"
+        f"  This private key opens EVERY encounter sealed to fingerprint\n"
+        f"  {fp}. It is shown ONCE and is stored NOWHERE on this box.\n"
+        "  NOW, before anything else:\n"
+        "   1. Copy it to TWO offline USB sticks (Andrew + Jamie).\n"
+        "   2. Verify each stick opens a test seal.\n"
+        "   3. Clear this terminal's scrollback.\n"
+        "  Do NOT save this output to a file or paste it anywhere the box\n"
+        "  (or a backup) can read it. Losing it = the sealed archive is\n"
+        "  unrecoverable; leaking it = the sealed archive is exposed.\n"
+        "============================================================\n\n"
+    )
+    print(json.dumps({
+        "keygen": True,
+        "seal_public_key_path": str(pub_path),
+        "sealed_to_key_fp": fp,
+        "rotated": rotating,
+    }, indent=2))
+
+
 def _cmd_scribe_retention(args: argparse.Namespace) -> None:
-    """``alfred scribe retention schedule {publish <file>|show}`` — the s.50 retention SCHEDULE
-    surface (design §4, slice 13c). ``publish`` validates a schedule JSON, DURABLY pins its sha via
-    ``retention.schedule_published`` [D] BEFORE writing the daemon-read-only artifact (fail-closed —
-    a store-down publish writes NOTHING), then atomic-writes the exact pinned bytes. ``show`` prints
-    the published schedule + whether its on-disk bytes still match the chain-pinned sha (drift). JSON
-    output, ILB explicit empties. The sweep SURFACES over-window classes; it NEVER auto-destroys (§5)."""
+    """``alfred scribe retention {keygen | schedule {publish <file>|show}}`` — the retention operator
+    surface. ``keygen`` (slice 13d, design §3.1) is the offline-key custody ceremony (see
+    :func:`_retention_keygen`). ``schedule`` (slice 13c, design §4): ``publish`` validates a schedule
+    JSON, DURABLY pins its sha via ``retention.schedule_published`` [D] BEFORE writing the
+    daemon-read-only artifact (fail-closed — a store-down publish writes NOTHING), then atomic-writes the
+    exact pinned bytes; ``show`` prints the published schedule + whether its on-disk bytes still match the
+    chain-pinned sha (drift). JSON output, ILB explicit empties. The sweep SURFACES over-window classes;
+    it NEVER auto-destroys (§5)."""
+    if getattr(args, "retention_cmd", None) == "keygen":
+        _retention_keygen(args)
+        return
+
     from alfred.evstore import sha256_hex
     from alfred.scribe import retention as ret_mod
     from alfred.scribe import schedule as sched_mod
@@ -2957,7 +3041,7 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
 
     scmd = getattr(args, "schedule_cmd", None)
     if getattr(args, "retention_cmd", None) != "schedule" or scmd not in ("publish", "show"):
-        print("Usage: alfred scribe retention schedule {publish <file> | show}")
+        print("Usage: alfred scribe retention {keygen [--force] | schedule {publish <file> | show}}")
         sys.exit(1)
 
     raw = _load_unified_config(args.config)
@@ -4110,6 +4194,16 @@ def build_parser() -> argparse.ArgumentParser:
         "retention", help="s.50 retention schedule (publish / show); the sweep surfaces over-window, "
                           "never auto-destroys")
     retention_sub = scribe_retention.add_subparsers(dest="retention_cmd")
+    # #13d — the offline-key custody ceremony (design §3.1). Writes ONLY the public key on-box; the
+    # private identity is streamed once to the operator's terminal for offline USB custody.
+    ret_keygen = retention_sub.add_parser(
+        "keygen", help="Mint the offline seal keypair (custody ceremony): write ONLY the public key to "
+                       "the daemon-read-only seal dir; the private key is shown ONCE for offline USB "
+                       "custody (never persisted, never logged)")
+    ret_keygen.add_argument(
+        "--force", action="store_true",
+        help="Rotate: overwrite an existing public key with a NEW keypair (additive — already-sealed "
+             "blobs keep their fingerprint and still open with the matching offline key)")
     ret_sched = retention_sub.add_parser(
         "schedule", help="Publish / show the s.50 retention schedule (versioned, sha-pinned [D])")
     ret_sched_sub = ret_sched.add_subparsers(dest="schedule_cmd")
