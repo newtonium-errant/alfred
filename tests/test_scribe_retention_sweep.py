@@ -376,6 +376,32 @@ def test_booming_encounter_is_isolated_sweep_continues(tmp_path):
     assert [c for c in cap if c["event"] == "scribe.retention.sweep.encounter_error"]
 
 
+def test_abandoned_gate_late_chunk_survives_row_undercounts(tmp_path):
+    # D1 (HIGH-3 end-to-end, sweep abandoned gate): a chunk that arrives DURING seal() survives the
+    # manifest-scoped wipe, the durable row attests the GATHERED count, and the sweep escalates
+    # wipe_incomplete + needs_operator_attention. Kills mutant M5 through the sweep path.
+    cfg = _config(tmp_path, grace=7)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "forgotten-race", n_chunks=2, closed=False)
+    _age(enc_dir, days=8)
+
+    class _LateSealer(_FakeSealer):
+        def seal(self, plaintext, recipient_public_key):
+            (enc_dir / "chunk_3.webm").write_bytes(b"late-consented-audio")   # arrives mid-seal
+            return super().seal(plaintext, recipient_public_key)
+
+    state = ScribeState(tmp_path / "state.json")
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev, sealer=_LateSealer())._run_sync(state, _NOW)
+
+    assert summary.wipe_incomplete == 1 and summary.sealed_abandoned == 0
+    assert summary.needs_operator_attention() is True
+    rows = _retention_rows(ev, enc_id)
+    assert len(rows) == 1 and rows[0]["payload"]["chunk_count"] == 2   # row attests the gathered set
+    assert (enc_dir / "chunk_3.webm").is_file()                        # late chunk NOT wiped unsealed
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.needs_operator_attention"]
+
+
 async def test_run_offloads_and_returns_summary(tmp_path):
     # The async entry point offloads to a thread and returns the summary (no raise on a normal sweep).
     cfg = _config(tmp_path)

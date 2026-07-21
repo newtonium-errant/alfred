@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 import structlog
@@ -117,6 +118,20 @@ class _BadVerifySealer(_FakeSealer):
 
     def verify_wellformed(self, blob: bytes) -> bool:
         return False
+
+
+class _LateChunkSealer(_FakeSealer):
+    """Writes a NEW chunk into ``enc_dir`` DURING ``seal()`` — simulates a PWA flushing a queued chunk
+    in the tar/crypto window (the confirmed HIGH-3 abandoned-gate race). The manifest-scoped wipe must
+    remove only the GATHERED set, so the late chunk SURVIVES (never wiped unsealed)."""
+
+    def __init__(self, enc_dir, late_name="chunk_3.webm"):
+        self._enc_dir = Path(enc_dir)
+        self._late_name = late_name
+
+    def seal(self, plaintext: bytes, recipient_public_key: bytes) -> bytes:
+        (self._enc_dir / self._late_name).write_bytes(b"late-arriving-consented-audio")
+        return super().seal(plaintext, recipient_public_key)
 
 
 class _StubEvents:
@@ -1056,6 +1071,75 @@ def test_recovery_disposes_empty_dir_when_sealer_none(tmp_path):
     assert out.status == SEAL_STATUS_ALREADY_SEALED      # disposed via the zero-chunk no-crypto path
     assert not enc_dir.exists()                          # PHI-named dir removed, not AttributeError-stuck
     assert len(_sealed_rows(ev)) == 1                    # no re-emit
+
+
+# ====== D1/D8/D9 — end-to-end late-chunk race + the two missing recovery pins ======
+
+
+def test_late_chunk_during_seal_survives_and_row_undercounts(tmp_path):
+    # D1 (HIGH-3 end-to-end): a chunk that arrives DURING seal() (after the gather) is NOT in the
+    # manifest-scoped wipe set → it SURVIVES; the durable row attests the GATHERED count (2, not 3), so
+    # the outcome is wipe_incomplete + the next call escalates recovery_mismatch keeping the chunk.
+    # Kills mutant M5 (re-deriving the step-5 wipe set via _discover_seal_chunks).
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=2)
+    out = _seal(tmp_path, enc_dir, ev, sealer=_LateChunkSealer(enc_dir))
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert out.chunk_count == 2                            # sealed the GATHERED set, not the late arrival
+    rows = _sealed_rows(ev)
+    assert len(rows) == 1 and rows[0]["payload"]["chunk_count"] == 2   # row UNDER-attests, never wipes it
+    assert (enc_dir / "chunk_3.webm").is_file()           # the late chunk SURVIVES (never wiped unsealed)
+    assert not (enc_dir / "chunk_1.webm").exists()        # the gathered+sealed chunks WERE wiped
+    # next sweep: recovery sees an EXTRA on-disk chunk (seq 3) not in the sidecar → recovery_mismatch
+    out2 = _seal(tmp_path, enc_dir, ev)
+    assert out2.status == SEAL_STATUS_RECOVERY_MISMATCH
+    assert (enc_dir / "chunk_3.webm").is_file()           # still kept — never destroyed on the recovery path
+
+
+def test_zero_chunk_recovery_residue_surfaces_incomplete(tmp_path):
+    # D8: the zero-chunk arm of _recover_already_sealed has a residue leg — a residue-leaving zero-chunk
+    # recovery must report wipe_incomplete, NOT a false 'already_sealed / completed the dir cleanup'.
+    # Kills the mutant that drops that branch. Reproduce: a re-opened empty+closed dir with a prior row
+    # whose archive dest already holds a DIVERGENT transcript → ledger relocation refuses → residue.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=0, with_ledger=True, with_closed=True)
+    ev.retention_sealed(subject_id=_ENC, chunk_count=2, total_bytes=10, manifest_sha256="d" * 64,
+                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
+    dest = tmp_path / "retained" / "transcripts" / f"{_ENC}.transcript.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text('{"encounter_id": "' + _ENC + '", "segments": ["PRIOR SESSION"]}', encoding="utf-8")
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE      # NOT already_sealed
+    assert enc_dir.exists()
+    assert dest.read_text().find("PRIOR SESSION") != -1   # the prior archive is preserved
+    assert [c for c in cap if c["event"] == "scribe.retention.wipe_incomplete"]
+
+
+def test_recovery_refuses_sidecar_not_matching_row(tmp_path):
+    # D9: the sidecar must AUTHENTICATE against the durable row (its manifest digest == the row's
+    # manifest_sha256). A sidecar whose manifest does NOT match the row (a stale/restored sidecar) is
+    # refused — recovery never subset-verifies + wipes against an unauthenticated reference. Kills the
+    # mutant reducing the gate to `if sidecar is None:`.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=2)
+    # a row whose manifest_sha256 is NOT the digest of the sidecar we write (different sealed audio)
+    ev.retention_sealed(subject_id=_ENC, chunk_count=2, total_bytes=10, manifest_sha256="e" * 64,
+                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
+    # a sidecar matching the ON-DISK chunks (so the subset check WOULD pass if auth were skipped) + blob
+    chunks = ret_mod._discover_seal_chunks(enc_dir)
+    manifest = [{"seq": s, "sha256": sha256_hex(p.read_bytes()), "bytes": len(p.read_bytes())}
+                for (p, s) in chunks]
+    blob = b"FAKESEAL1-mismatched-sidecar"
+    retained = tmp_path / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    (retained / f"{_ENC}{SEAL_BLOB_SUFFIX}").write_bytes(blob)
+    ret_mod._write_manifest_sidecar(retained, _ENC, manifest, sha256_hex(blob))
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_RECOVERY_MISMATCH
+    assert (enc_dir / "chunk_1.webm").is_file()           # NEVER wiped against an unauthenticated sidecar
+    assert [c for c in cap if c["event"] == "scribe.retention.recovery_sidecar_mismatch"]
 
 
 def test_age_verify_wellformed_rejects_truncated_blob(tmp_path):
