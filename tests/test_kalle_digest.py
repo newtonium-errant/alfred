@@ -95,6 +95,23 @@ def test_bash_exec_log_skips_malformed_lines(tmp_path: Path) -> None:
     assert count == 2
 
 
+def test_bash_exec_log_non_utf8_degrades_with_warning(tmp_path: Path) -> None:
+    """A non-UTF-8 bash_exec log → (0, {}) + a warning, not an escaping
+    UnicodeDecodeError. The old bare ``except OSError`` missed it (subclasses
+    ValueError, not OSError), aborting the whole KAL-LE digest via fire_once's
+    daemon-level catch. Mutation: revert to ``read_text`` inside ``except
+    OSError`` → this raises."""
+    log_path = tmp_path / "bash_exec.jsonl"
+    log_path.write_bytes(b"\xff\xfe not utf-8 at all\n")
+    with structlog.testing.capture_logs() as cap:
+        count, cwds = read_bash_exec_log(log_path, TODAY)
+    assert count == 0
+    assert cwds == {}
+    warns = [c for c in cap if c.get("event") == "kalle_digest.bash_exec_read_failed"]
+    assert len(warns) == 1
+    assert warns[0]["error_type"] == "UnicodeDecodeError"
+
+
 # ---------------------------------------------------------------------------
 # instructor state reader
 # ---------------------------------------------------------------------------
@@ -127,10 +144,35 @@ def test_instructor_state_extracts_retrying(tmp_path: Path) -> None:
 def test_instructor_state_invalid_json_returns_empty(tmp_path: Path) -> None:
     state_path = tmp_path / "instructor_state.json"
     state_path.write_text("{ not valid json", encoding="utf-8")
-    executed, pending, retrying = read_instructor_state(state_path, TODAY)
+    with structlog.testing.capture_logs() as cap:
+        executed, pending, retrying = read_instructor_state(state_path, TODAY)
     assert executed == []
     assert pending == []
     assert retrying == []
+    # ILB: a corrupt state file must not masquerade as "no directives".
+    warns = [
+        c for c in cap if c.get("event") == "kalle_digest.instructor_state_read_failed"
+    ]
+    assert len(warns) == 1
+    assert warns[0]["stage"] == "json"
+
+
+def test_instructor_state_non_utf8_degrades_with_warning(tmp_path: Path) -> None:
+    """A non-UTF-8 state file → ([], [], []) + a warning, not an escaping
+    UnicodeDecodeError (a SIBLING of JSONDecodeError under ValueError). The old
+    ``(json.JSONDecodeError, OSError)`` catch missed it. Mutation: revert to
+    that two-tuple catch → this raises."""
+    state_path = tmp_path / "instructor_state.json"
+    state_path.write_bytes(b"\xff\xfe not utf-8")
+    with structlog.testing.capture_logs() as cap:
+        executed, pending, retrying = read_instructor_state(state_path, TODAY)
+    assert (executed, pending, retrying) == ([], [], [])
+    warns = [
+        c for c in cap if c.get("event") == "kalle_digest.instructor_state_read_failed"
+    ]
+    assert len(warns) == 1
+    assert warns[0]["stage"] == "read"
+    assert warns[0]["error_type"] == "UnicodeDecodeError"
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +284,67 @@ def test_bit_state_warn(tmp_path: Path) -> None:
     }), encoding="utf-8")
     status, _ = read_bit_state(bit_path)
     assert status == "warn"
+
+
+def test_bit_state_invalid_json_degrades_with_warning(tmp_path: Path) -> None:
+    """A clean-read but non-JSON BIT state → ("", "") + a stage=json warning
+    (the json.loads catch, now signalled per ILB)."""
+    bit_path = tmp_path / "bit_state.json"
+    bit_path.write_text("{ not json", encoding="utf-8")
+    with structlog.testing.capture_logs() as cap:
+        status, summary = read_bit_state(bit_path)
+    assert (status, summary) == ("", "")
+    warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_read_failed"]
+    assert len(warns) == 1
+    assert warns[0]["stage"] == "json"
+
+
+def test_bit_state_non_utf8_degrades_with_warning(tmp_path: Path) -> None:
+    """A non-UTF-8 BIT state file → ("", "") + a stage=read warning, not an
+    escaping UnicodeDecodeError. The old ``(json.JSONDecodeError, OSError)``
+    catch missed it. Mutation: revert to that two-tuple catch → this raises."""
+    bit_path = tmp_path / "bit_state.json"
+    bit_path.write_bytes(b"\xff\xfe not utf-8")
+    with structlog.testing.capture_logs() as cap:
+        status, summary = read_bit_state(bit_path)
+    assert (status, summary) == ("", "")
+    warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_read_failed"]
+    assert len(warns) == 1
+    assert warns[0]["stage"] == "read"
+    assert warns[0]["error_type"] == "UnicodeDecodeError"
+
+
+def test_assemble_digest_survives_all_non_utf8_inputs(tmp_path: Path) -> None:
+    """End-to-end (N-B): when EVERY reader input is corrupt (non-UTF-8), the
+    assembled digest STILL ships — a well-formed markdown body rendered from
+    the degraded (empty) data — and each reader emits its specific warning.
+    Mirrors test_operations_section_survives_non_utf8_audit_and_state (d6192b2):
+    proves the whole assembler is total over corrupt inputs, not just each
+    reader in isolation."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "bash_exec.jsonl").write_bytes(b"\xff\xfe corrupt")
+    (data_dir / "instructor_state.json").write_bytes(b"\xff\xfe corrupt")
+    bit_state = tmp_path / "bit_state.json"
+    bit_state.write_bytes(b"\xff\xfe corrupt")
+
+    with structlog.testing.capture_logs() as cap:
+        md = assemble_digest(
+            today=TODAY,
+            data_dir=data_dir,
+            repo_paths=[],
+            bit_state_path=bit_state,
+        )
+    # Digest ships: a non-empty, well-formed markdown body (degraded content).
+    assert isinstance(md, str)
+    assert "**Yesterday:**" in md
+    assert "**Today:**" in md
+    assert "**Posture:**" in md
+    # Each corrupt reader emitted its specific warning (broken != idle).
+    events = {c.get("event") for c in cap}
+    assert "kalle_digest.bash_exec_read_failed" in events
+    assert "kalle_digest.instructor_state_read_failed" in events
+    assert "kalle_digest.bit_state_read_failed" in events
 
 
 # ---------------------------------------------------------------------------

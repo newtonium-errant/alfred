@@ -10,9 +10,11 @@ import setup_logging`` before touching the kwargs.
 
 from __future__ import annotations
 
+import enum
 import logging
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import structlog
 
@@ -87,3 +89,70 @@ def setup_logging(
 
 def get_logger(name: str = __name__) -> structlog.stdlib.BoundLogger:
     return structlog.get_logger(name)
+
+
+class SectionReadStatus(enum.Enum):
+    """Outcome of :func:`safe_read_section_file`."""
+
+    OK = "ok"
+    NOT_FOUND = "not_found"
+    OS_ERROR = "os_error"
+    DECODE_ERROR = "decode_error"
+
+
+class SectionRead(NamedTuple):
+    """Result of a defensive section-file read.
+
+    ``text`` is the file content when ``status is OK``, else ``None``.
+    ``detail`` / ``error_type`` carry ``str(exc)`` and the exception class
+    name on failure (both ``""`` on success) so callers can preserve their
+    own log fields and degrade messages.
+    """
+
+    status: SectionReadStatus
+    text: str | None
+    detail: str
+    error_type: str
+
+
+def safe_read_section_file(path: Path) -> SectionRead:
+    """Read a brief section file, catching every read failure uniformly.
+
+    Brief section renderers are called BARE by the daemon — there is no
+    per-section boundary guard, because each renderer is trusted to be
+    internally total (it returns its own degrade line rather than raising).
+    So an unhandled read exception escapes the renderer and kills the ENTIRE
+    brief for that run.
+
+    ``Path.read_text(encoding="utf-8")`` can raise three disjoint things:
+
+    * ``FileNotFoundError`` — the file is missing (a subclass of ``OSError``);
+    * other ``OSError`` — permission denied, is-a-directory, an I/O error;
+    * ``UnicodeDecodeError`` — a corrupted / non-UTF-8 file. This one
+      subclasses ``ValueError`` (via ``UnicodeError``), **not** ``OSError`` —
+      so an ``except OSError`` misses it and it escapes. That exact gap
+      recurred three times in this package (``watches``, ``tier_section``,
+      ``stayc_relay``) before this helper centralized the catch.
+
+    Returns a :class:`SectionRead` discriminating the outcome so each caller
+    keeps its own degrade rendering (a not-found spool and a corrupted spool
+    warrant different operator messages). A fourth section reader inherits
+    the complete catch for free by calling this instead of ``read_text``.
+    """
+    try:
+        return SectionRead(
+            SectionReadStatus.OK, path.read_text(encoding="utf-8"), "", "",
+        )
+    except FileNotFoundError as exc:
+        return SectionRead(
+            SectionReadStatus.NOT_FOUND, None, str(exc), exc.__class__.__name__,
+        )
+    except OSError as exc:
+        return SectionRead(
+            SectionReadStatus.OS_ERROR, None, str(exc), exc.__class__.__name__,
+        )
+    except UnicodeDecodeError as exc:
+        return SectionRead(
+            SectionReadStatus.DECODE_ERROR, None, str(exc),
+            exc.__class__.__name__,
+        )

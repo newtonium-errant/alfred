@@ -38,7 +38,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .utils import get_logger
+from .utils import SectionReadStatus, get_logger, safe_read_section_file
 
 log = get_logger(__name__)
 
@@ -115,42 +115,40 @@ def render_stayc_bug_relay_section(config, now_utc: datetime) -> str:
         )
 
     path = Path(spool_path).expanduser()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    # Defensive read via the shared helper — it catches FileNotFoundError,
+    # other OSError, AND UnicodeDecodeError (which subclasses ValueError, not
+    # OSError; an escaping decode error on a corrupted spool would kill the
+    # whole brief, since the daemon calls this render bare). Each outcome maps
+    # to its own operator-facing no-data line.
+    read = safe_read_section_file(path)
+    if read.status is SectionReadStatus.NOT_FOUND:
         # Watcher never wrote / wrong path — visible, not silent.
         log.info("brief.stayc_relay", state="absent", spool_path=spool_path)
         return (
             "**STAY-C bug relay: no data** — spool file not found "
             f"(`{spool_path}`). The box watcher may not be running."
         )
-    except OSError as exc:
+    if read.status is SectionReadStatus.OS_ERROR:
         log.warning(
             "brief.stayc_relay", state="unreadable",
-            spool_path=spool_path, error=str(exc),
+            spool_path=spool_path, error=read.detail,
         )
         return (
             "**STAY-C bug relay: no data** — spool file unreadable "
             f"(`{spool_path}`)."
         )
-    except UnicodeDecodeError as exc:
-        # A corrupted / non-UTF-8 spool. UnicodeDecodeError subclasses
-        # ValueError (NOT OSError), so the catch above misses it — and the
-        # daemon calls this render BARE (no section-boundary guard, trusting
-        # the function to be internally total like tier/health/routine), so
-        # an escaping raise would kill the ENTIRE brief for that run. Coerce
-        # to the same visible no-data line the docstring promises. Mirrors
-        # watches.py (a3) + tier_section.py:217, which catch the same class.
+    if read.status is SectionReadStatus.DECODE_ERROR:
+        # A corrupted / non-UTF-8 spool.
         log.warning(
             "brief.stayc_relay", state="unreadable",
-            spool_path=spool_path, error=str(exc),
+            spool_path=spool_path, error=read.detail,
         )
         return (
             "**STAY-C bug relay: no data** — spool file unreadable "
             "(not UTF-8)."
         )
 
-    count, generated_at = _parse_spool_header(text)
+    count, generated_at = _parse_spool_header(read.text)
 
     if count is None or generated_at is None:
         # Present but the header we depend on didn't parse — treat as no data
@@ -240,25 +238,26 @@ def render_stayc_retention_relay_section(config, now_utc: datetime) -> str:
         )
 
     path = Path(spool_path).expanduser()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    # E6 merge-fold: defensive read via the shared helper (arrived from master's #25 arc) — it catches
+    # FileNotFoundError, other OSError, AND UnicodeDecodeError (which subclasses ValueError, not
+    # OSError; an escaping decode error on a corrupted spool would kill the whole brief since the
+    # daemon calls this render bare). Each outcome maps to its own operator-facing no-data line.
+    read = safe_read_section_file(path)
+    if read.status is SectionReadStatus.NOT_FOUND:
         log.info("brief.stayc_retention_relay", state="absent", spool_path=spool_path)
         return (
             "**STAY-C retention relay: no data** — review spool not found "
             f"(`{spool_path}`). The box sweep may not be running / synced."
         )
-    except OSError as exc:
+    if read.status is SectionReadStatus.OS_ERROR:
         log.warning("brief.stayc_retention_relay", state="unreadable",
-                    spool_path=spool_path, error=str(exc))
+                    spool_path=spool_path, error=read.detail)
         return f"**STAY-C retention relay: no data** — review spool unreadable (`{spool_path}`)."
-    except UnicodeDecodeError:
-        # UnicodeDecodeError subclasses ValueError (NOT OSError) — the daemon calls this render bare,
-        # so an escaping raise would kill the whole brief; coerce to the visible no-data line.
+    if read.status is SectionReadStatus.DECODE_ERROR:
         log.warning("brief.stayc_retention_relay", state="unreadable", spool_path=spool_path)
         return "**STAY-C retention relay: no data** — review spool unreadable (not UTF-8)."
 
-    review_due, oldest, generated_at, surfaced = _parse_retention_spool_header(text)
+    review_due, oldest, generated_at, surfaced = _parse_retention_spool_header(read.text)
     if review_due is None or generated_at is None:
         log.warning("brief.stayc_retention_relay", state="unreadable", spool_path=spool_path,
                     detail="header missing review_due/generated_at")

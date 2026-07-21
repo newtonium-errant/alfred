@@ -34,6 +34,10 @@ from typing import Any
 
 import yaml
 
+from .utils import SectionReadStatus, get_logger, safe_read_section_file
+
+log = get_logger(__name__)
+
 
 def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
     """Parse YAML frontmatter out of a Markdown file.
@@ -44,10 +48,25 @@ def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
     """
     if not path.exists():
         return None
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+    # Defensive read via the shared helper — the old bare ``except OSError``
+    # missed UnicodeDecodeError (a ValueError subclass), so a non-UTF-8 BIT
+    # record escaped this degrade path and crashed the whole brief (this
+    # render is called BARE by the daemon).
+    read = safe_read_section_file(path)
+    if read.status is not SectionReadStatus.OK:
+        # Load failure (non-UTF-8 / I/O error) → no-record path. Emit a
+        # signal so a corrupt BIT record is distinguishable from "BIT hasn't
+        # run yet" (ILB: broken must not masquerade as idle). Mirrors the
+        # sibling brief.watches_state_load_failed convention.
+        log.warning(
+            "brief.health_record_load_failed",
+            path=str(path),
+            stage="read",
+            error=read.detail,
+            error_type=read.error_type,
+        )
         return None
+    text = read.text
     if not text.startswith("---"):
         return None
     match = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
@@ -55,7 +74,21 @@ def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
         return None
     try:
         data = yaml.safe_load(match.group(1))
-    except yaml.YAMLError:
+    except yaml.YAMLError as exc:
+        # Frontmatter present but not valid YAML → same no-record path,
+        # same broken-vs-idle signal (stage distinguishes it from a read
+        # failure above).
+        # N2: str(yaml.YAMLError) CAN echo a fragment of the offending YAML.
+        # Safe here — BIT records are alfred-written system metadata, not
+        # personal content. A future renderer parsing PERSONAL vault
+        # frontmatter must NOT log str(exc) verbatim (content leak into logs).
+        log.warning(
+            "brief.health_record_load_failed",
+            path=str(path),
+            stage="yaml",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
         return None
     if not isinstance(data, dict):
         return None
@@ -96,9 +129,35 @@ def _read_state_latest(state_path: Path) -> dict[str, Any] | None:
     """Fall back to the BIT state file's most recent run."""
     if not state_path.exists():
         return None
+    # Defensive read via the shared helper. The old ``(OSError,
+    # json.JSONDecodeError)`` catch missed UnicodeDecodeError — a sibling of
+    # JSONDecodeError under ValueError, NOT a subclass — so a non-UTF-8 state
+    # file escaped and crashed the brief. Helper handles the read; the
+    # json.loads catch below stays for JSON-syntax errors on a clean read.
+    read = safe_read_section_file(state_path)
+    if read.status is not SectionReadStatus.OK:
+        # Load failure of the fallback state file → no-record path. Signal
+        # it (ILB) — the state file existing-but-unreadable is broken, not
+        # idle. Mirrors the sibling brief.watches_state_load_failed.
+        log.warning(
+            "brief.health_state_load_failed",
+            path=str(state_path),
+            stage="read",
+            error=read.detail,
+            error_type=read.error_type,
+        )
+        return None
     try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(read.text)
+    except json.JSONDecodeError as exc:
+        # Read cleanly but not valid JSON → same no-record path, same signal.
+        log.warning(
+            "brief.health_state_load_failed",
+            path=str(state_path),
+            stage="json",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
         return None
     runs = data.get("runs") or []
     if not runs:
@@ -178,7 +237,27 @@ def render_health_section(
     if record_path is not None:
         frontmatter = _parse_frontmatter(record_path)
         if frontmatter is not None:
-            body = record_path.read_text(encoding="utf-8")
+            # Guard the second (body) read too. ``_parse_frontmatter`` just
+            # read this file cleanly, but a race / transient I/O error here
+            # would otherwise crash the whole brief (bare render). On a
+            # body-read failure, render from the already-parsed frontmatter
+            # with an empty body — ``_render_from_frontmatter`` falls back to
+            # ``tool_counts`` when the body yields no per-tool lines.
+            body_read = safe_read_section_file(record_path)
+            if body_read.status is SectionReadStatus.OK:
+                body = body_read.text
+            else:
+                # Frontmatter read cleanly but the body read failed (race /
+                # transient I/O). We still render from the parsed frontmatter,
+                # but the per-tool breakdown is lost — signal the partial
+                # degrade rather than silently dropping to tool_counts.
+                log.warning(
+                    "brief.health_body_read_failed",
+                    path=str(record_path),
+                    error=body_read.detail,
+                    error_type=body_read.error_type,
+                )
+                body = ""
             return _render_from_frontmatter(
                 frontmatter,
                 body,

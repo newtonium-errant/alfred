@@ -190,6 +190,16 @@ class TestMostRecentSuccessfulDate:
         state_path.write_text("not valid json {{{", encoding="utf-8")
         assert _most_recent_successful_brief_date(state_path) is None
 
+    def test_non_utf8_state_returns_none(self, tmp_path: Path) -> None:
+        # UnicodeDecodeError is a SIBLING of JSONDecodeError under ValueError
+        # (NOT a subclass), so it escaped the old ``(json.JSONDecodeError,
+        # OSError)`` catch and crashed the BIT run on a non-UTF-8 state file.
+        # Now it degrades to None like corrupt JSON. Mutation: revert to the
+        # two-tuple catch → this raises.
+        state_path = tmp_path / "s.json"
+        state_path.write_bytes(b"\xff\xfe not utf-8")
+        assert _most_recent_successful_brief_date(state_path) is None
+
     def test_runs_not_a_list_returns_none(self, tmp_path: Path) -> None:
         # Defensive against a future schema migration that breaks
         # the ``runs`` key shape.
@@ -441,6 +451,15 @@ class TestReadLastError:
     def test_corrupt_json_returns_none(self, tmp_path: Path) -> None:
         state_path = tmp_path / "brief_state.json"
         state_path.write_text("{ not json", encoding="utf-8")
+        assert _read_last_error(state_path) is None
+
+    def test_non_utf8_state_returns_none(self, tmp_path: Path) -> None:
+        # Same UnicodeDecodeError gap as _most_recent_successful_brief_date:
+        # a non-UTF-8 state file escaped the ``(json.JSONDecodeError,
+        # OSError)`` catch. Now degrades to None. Mutation: revert to the
+        # two-tuple catch → this raises.
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_bytes(b"\xff\xfe not utf-8")
         assert _read_last_error(state_path) is None
 
 
