@@ -474,11 +474,23 @@ class RetentionSweep:
             return
         # E2: build the {encounter_id: sealed ts} map in ONE chain query, then dict-lookup per blob —
         # C5's per-blob retention_sealed_row was a full-chain scan PER blob (O(blobs × rows), wedges as
-        # the deployment ages). Best-effort: an observability query failure → empty map → mtime basis.
+        # the deployment ages).
         try:
             ts_by_id = self._ev.retention_sealed_ts_by_id()
-        except Exception:  # noqa: BLE001 — never crash the sweep over an observability query
-            ts_by_id = {}
+        except Exception:  # noqa: BLE001 — the whole-chain query failed (an existing-but-unreadable
+            # chain: EACCES/EIO/EISDIR, or a corrupt parse). R5: this is the AGE BASIS for EVERY blob —
+            # swallowing it to an empty map would fall every blob to the mtime fallback, and on a
+            # restore day (fresh mtimes + a briefly-unreadable chain) an over-window encounter reports
+            # UNDER-window → a FALSE all-clear on the s.49 destruction-review obligation (the E3 class,
+            # reintroduced via E2's own path). Mirror the glob-failure sibling: latch a distinct signal,
+            # leave review_surfaced=False (the brief renders 'not evaluated / UNKNOWN'), write NO
+            # all-clear this tick. A SINGLE blob's legitimately-absent row is NOT this path — it is a
+            # dict miss handled inside _over_window_basis_ts (the documented mtime fallback stays).
+            self._latch_log(
+                "review_basis_unavailable", "scribe.retention.sweep.review_basis_unavailable",
+                detail="the clinical chain could not be read to date the sealed blobs (the over-window "
+                       "AGE BASIS) — review_due is UNKNOWN this sweep (NOT an all-clear). Latched.")
+            return
         for blob in blobs:
             basis = self._over_window_basis_ts(blob, ts_by_id)  # C5: durable row ts, fallback mtime
             if basis is not None and basis.timestamp() < cutoff:

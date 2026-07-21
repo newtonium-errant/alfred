@@ -616,6 +616,37 @@ def test_review_glob_failure_marks_not_surfaced_and_latches(tmp_path, monkeypatc
     assert [c for c in cap if c["event"] == "scribe.retention.sweep.review_enumeration_failed"]
 
 
+def test_chain_basis_query_failure_marks_not_surfaced_no_false_all_clear(tmp_path, monkeypatch):
+    # R5: if the WHOLE-chain age-basis query raises (an existing-but-unreadable clinical chain —
+    # EACCES/EIO/EISDIR), surfacing must NOT swallow it to an empty map and report a false all-clear
+    # (which E2's own path reintroduced — on a restore day with fresh mtimes, an over-window encounter
+    # would fall to the mtime fallback → UNDER-window → surfaced:true/review_due:0). It marks
+    # surfaced:false (brief → 'not evaluated / UNKNOWN'), latches review_basis_unavailable, and writes
+    # NO affirmative all-clear. Bind-check: reverting to the swallow-to-empty + unconditional surfaced
+    # → FAIL.
+    from alfred.scribe.events import ScribeEvents
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    spool = tmp_path / "spool" / "retention_review.spool"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    cfg.retention.review_spool_path = str(spool)
+    _publish_sched(cfg, encounter_audio_sealed=1)
+    ev = _events(tmp_path)
+    # an over-window blob whose FRESH mtime would (wrongly) read UNDER-window if the chain basis is lost
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    (retained / f"enc-old{SEAL_BLOB_SUFFIX}").write_bytes(b"FAKESEAL1")   # mtime ~now (fresh)
+    monkeypatch.setattr(ScribeEvents, "retention_sealed_ts_by_id",
+                        lambda self: (_ for _ in ()).throw(OSError("EACCES on clinical.jsonl")))
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, ev)._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.review_surfaced is False                  # NOT a false all-clear
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.review_basis_unavailable"]
+    raw = spool.read_text()
+    assert "surfaced: false" in raw and "surfaced: true" not in raw   # NO affirmative all-clear written
+
+
 def test_review_spool_bytes_are_only_count_and_opaque_id(tmp_path):
     # E4: the review-spool bytes carry ONLY generated_at/surfaced/review_due/oldest_encounter_id (the
     # oldest an OPAQUE salted-HMAC id) — no label, no patient content — EVEN when the over-window
