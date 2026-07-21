@@ -106,10 +106,19 @@ def capture_sink_lock(enrollment_dir: str | Path) -> Iterator[None]:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
-    except OSError:
+    except OSError as exc:
         if fd is not None:
             os.close(fd)
             fd = None
+        # D15: proceeding UNLOCKED silently degrades the finding-19 serialization invisibly (e.g. a
+        # root-owned lock file → the unprivileged daemon gets EACCES). Emit a loud signal so 'proceeded
+        # unlocked' is distinguishable from 'locked' (intentionally-left-blank) — the guarded loss is a
+        # single PHI-free telemetry row, so this stays best-effort (never fail a valid attest).
+        log.warning(
+            "scribe.enroll_learning.capture_sink_lock_skipped", error_class=type(exc).__name__,
+            detail="the attest_capture sink lock could NOT be acquired — proceeding WITHOUT "
+                   "serialization; a concurrent prune/append race could drop one PHI-free telemetry "
+                   "row. Check the lock-file ownership/perms.")
     try:
         yield
     finally:

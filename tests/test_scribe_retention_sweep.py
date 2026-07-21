@@ -1057,3 +1057,18 @@ def test_capture_sink_lock_is_exclusive(tmp_path):
         fcntl.flock(fd2, fcntl.LOCK_UN)
     finally:
         os.close(fd2)
+
+
+def test_capture_sink_lock_skip_logs_when_flock_fails(tmp_path, monkeypatch):
+    # D15: when the flock can't be acquired (e.g. a root-owned lock file → EACCES), capture_sink_lock
+    # proceeds UNLOCKED but LOUDLY (a warning so 'proceeded unlocked' is distinguishable from 'locked'),
+    # never silently — else the finding-19 serialization reopens invisibly.
+    import fcntl
+
+    from alfred.scribe.enroll_learning import capture_sink_lock
+    monkeypatch.setattr(fcntl, "flock",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("EACCES on the lock file")))
+    with structlog.testing.capture_logs() as cap:
+        with capture_sink_lock(tmp_path / "enroll"):
+            pass                                                 # the CM still yields (best-effort)
+    assert [c for c in cap if c["event"] == "scribe.enroll_learning.capture_sink_lock_skipped"]
