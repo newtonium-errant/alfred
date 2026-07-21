@@ -110,6 +110,26 @@ class StaycBugRelayConfig:
 
 
 @dataclass
+class StaycRetentionRelayConfig:
+    """Config for the STAY-C Retention Review Relay section (task #13 §4 / C3).
+
+    Salem's brief reads the retention sweep's PHI-free review spool and renders one line: the
+    ``review_due`` count + the oldest over-window (OPAQUE) encounter_id. Same discipline as the bug
+    relay — STAY-C uses NO Telegram, so only the PHI-free count/id may cross into the
+    (Telegram-transiting) brief, never encounter labels/bodies.
+
+    ``enabled`` defaults OFF (Salem-only, opt-in — only the Salem instance beside a STAY-C deployment
+    has a spool). ``spool_path`` has NO baked-in default (a deployment-specific absolute path;
+    enabled-but-unset renders 'not configured'). ``staleness_hours`` (default 25) — the sweep writes
+    every ~30s on the box, but the box→Salem sync is the cadence bottleneck, so 25h tolerates a daily
+    sync without false-stale (mirrors the bug relay)."""
+
+    enabled: bool = False
+    spool_path: str = ""
+    staleness_hours: float = 25.0
+
+
+@dataclass
 class WatchItemConfig:
     """One ``brief.watches`` entry — a config-driven upstream check.
 
@@ -185,6 +205,10 @@ class BriefConfig:
     # STAY-C Bug Relay — optional; disabled by default (Salem-only, opt-in).
     # See StaycBugRelayConfig.
     stayc_bug_relay: StaycBugRelayConfig = field(default_factory=StaycBugRelayConfig)
+    # STAY-C Retention Review Relay — optional; disabled by default (Salem-only, opt-in).
+    # See StaycRetentionRelayConfig (§4 morning-review surface, C3).
+    stayc_retention_relay: StaycRetentionRelayConfig = field(
+        default_factory=StaycRetentionRelayConfig)
     # Watch Items — optional; empty list = feature off, section never
     # rendered. See WatchItemConfig.
     watches: list[WatchItemConfig] = field(default_factory=list)
@@ -315,6 +339,17 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         spool_path=str(sbr_raw.get("spool_path", "") or ""),
         staleness_hours=staleness_hours,
     )
+    # STAY-C Retention Review Relay (§4 / C3) — same shape/discipline as the bug relay.
+    srr_raw = section.get("stayc_retention_relay", {}) or {}
+    try:
+        srr_staleness = float(srr_raw.get("staleness_hours", 25.0))
+    except (TypeError, ValueError):
+        srr_staleness = 25.0
+    stayc_retention_relay = StaycRetentionRelayConfig(
+        enabled=bool(srr_raw.get("enabled", False)),
+        spool_path=str(srr_raw.get("spool_path", "") or ""),
+        staleness_hours=srr_staleness,
+    )
 
     # Watch Items — optional list; absent block = feature off. Lenient
     # build (str/int coercion, non-dict entries skipped): a structurally
@@ -418,6 +453,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         upcoming_events=upcoming_events,
         peer_digests=peer_digests,
         stayc_bug_relay=stayc_bug_relay,
+        stayc_retention_relay=stayc_retention_relay,
         watches=watches,
         log_file=f"{log_dir}/brief.log",
         primary_telegram_user_id=primary_user,

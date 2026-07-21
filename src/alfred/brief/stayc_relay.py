@@ -185,3 +185,102 @@ def render_stayc_bug_relay_section(config, now_utc: datetime) -> str:
         return "STAY-C: no unresolved bug reports."
     plural = "report" if count == 1 else "reports"
     return f"STAY-C: {count} unresolved bug {plural}."
+
+
+# --- STAY-C Retention Review Relay (task #13 §4 / C3) --------------------------
+
+RETENTION_SECTION_HEADER = "STAY-C Retention Review"
+
+
+def _parse_retention_spool_header(text: str) -> tuple[int | None, str, datetime | None]:
+    """``(review_due, oldest_encounter_id, generated_at)`` from the retention review spool header —
+    the PHI-free fields the sweep's ``_write_review_spool`` writes. ``review_due`` / ``generated_at``
+    are ``None`` when absent/unparseable; ``oldest_encounter_id`` is an OPAQUE salted-HMAC id (safe to
+    render). Defensive line scan (the sweep owns the exact format), never a body descent."""
+    review_due: int | None = None
+    oldest = ""
+    generated_at: datetime | None = None
+    for line in text.splitlines():
+        s = line.strip()
+        if review_due is None and s.startswith("review_due:"):
+            try:
+                review_due = int(s[len("review_due:"):].strip())
+            except ValueError:
+                review_due = None
+        elif not oldest and s.startswith("oldest_encounter_id:"):
+            oldest = s[len("oldest_encounter_id:"):].strip()
+        elif generated_at is None and s.startswith("generated_at:"):
+            raw = s[len("generated_at:"):].strip()
+            try:
+                generated_at = datetime.strptime(raw, _TS_FORMAT).replace(tzinfo=timezone.utc)
+            except ValueError:
+                generated_at = None
+        if review_due is not None and generated_at is not None and oldest:
+            break
+    return review_due, oldest, generated_at
+
+
+def render_stayc_retention_relay_section(config, now_utc: datetime) -> str:
+    """Render the STAY-C retention-review status line (§4 morning-review surface, C3), or ``""`` when
+    disabled. PHI-free: ONLY the ``review_due`` count + the OPAQUE oldest encounter_id cross into the
+    (Telegram-transiting) brief — never encounter labels/bodies. ILB: enabled ALWAYS returns a line
+    (the count, or an explicit no-data / stale signal so a dead box sweep is visible)."""
+    if not config.enabled:
+        return ""
+
+    spool_path = (config.spool_path or "").strip()
+    if not spool_path:
+        log.warning("brief.stayc_retention_relay", state="unconfigured")
+        return (
+            "**STAY-C retention relay: not configured** — set "
+            "`brief.stayc_retention_relay.spool_path` to the sweep's review spool."
+        )
+
+    path = Path(spool_path).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        log.info("brief.stayc_retention_relay", state="absent", spool_path=spool_path)
+        return (
+            "**STAY-C retention relay: no data** — review spool not found "
+            f"(`{spool_path}`). The box sweep may not be running / synced."
+        )
+    except OSError as exc:
+        log.warning("brief.stayc_retention_relay", state="unreadable",
+                    spool_path=spool_path, error=str(exc))
+        return f"**STAY-C retention relay: no data** — review spool unreadable (`{spool_path}`)."
+    except UnicodeDecodeError:
+        # UnicodeDecodeError subclasses ValueError (NOT OSError) — the daemon calls this render bare,
+        # so an escaping raise would kill the whole brief; coerce to the visible no-data line.
+        log.warning("brief.stayc_retention_relay", state="unreadable", spool_path=spool_path)
+        return "**STAY-C retention relay: no data** — review spool unreadable (not UTF-8)."
+
+    review_due, oldest, generated_at = _parse_retention_spool_header(text)
+    if review_due is None or generated_at is None:
+        log.warning("brief.stayc_retention_relay", state="unreadable", spool_path=spool_path,
+                    detail="header missing review_due/generated_at")
+        return (
+            "**STAY-C retention relay: no data** — review spool present but its header "
+            "could not be parsed."
+        )
+
+    age_hours = (now_utc - generated_at).total_seconds() / 3600.0
+    if age_hours > config.staleness_hours:
+        log.warning("brief.stayc_retention_relay", state="stale", review_due=review_due,
+                    age_hours=round(age_hours, 1), spool_path=spool_path)
+        return (
+            f"**STAY-C retention relay: stale** — last update "
+            f"{generated_at.strftime(_TS_FORMAT)} "
+            f"({int(age_hours)}h ago, threshold {config.staleness_hours}h). "
+            "The box sweep may have stopped."
+        )
+
+    log.info("brief.stayc_retention_relay", state="fresh", review_due=review_due)
+    if review_due == 0:
+        return "STAY-C retention: no encounters over the s.50 review window."
+    plural = "encounter" if review_due == 1 else "encounters"
+    tail = f" (oldest: {oldest})" if oldest else ""
+    return (
+        f"STAY-C retention: {review_due} {plural} over the s.50 review window{tail} — "
+        "review + run the destroy playbook (§5) as warranted."
+    )

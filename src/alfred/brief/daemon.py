@@ -23,8 +23,9 @@ from .renderer import (
     serialize_record,
 )
 from .routine_section import render_routine_section
+from .stayc_relay import RETENTION_SECTION_HEADER as STAYC_RETENTION_SECTION_HEADER
 from .stayc_relay import SECTION_HEADER as STAYC_RELAY_SECTION_HEADER
-from .stayc_relay import render_stayc_bug_relay_section
+from .stayc_relay import render_stayc_bug_relay_section, render_stayc_retention_relay_section
 from .state import BriefRun, StateManager
 from .tier_section import SECTION_HEADER as TIER_SECTION_HEADER
 from .tier_section import render_tier_section
@@ -263,6 +264,12 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     stayc_relay_md = render_stayc_bug_relay_section(
         config.stayc_bug_relay, datetime.now(timezone.utc),
     )
+    # STAY-C Retention Review Relay (§4 / C3) — the same PHI-free, ILB discipline: the review_due
+    # count + the oldest OPAQUE encounter_id, or an explicit no-data / stale signal. Empty when
+    # disabled (Salem-only, opt-in).
+    stayc_retention_md = render_stayc_retention_relay_section(
+        config.stayc_retention_relay, datetime.now(timezone.utc),
+    )
 
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
@@ -304,6 +311,12 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # relay always yields a line, including the no-data / stale signal).
     if stayc_relay_md:
         sections.append((STAYC_RELAY_SECTION_HEADER, stayc_relay_md))
+    # STAY-C Retention Review sits beside the Bug Relay — both are upstream operational signals from
+    # the STAY-C box (something outside Salem needs triage). Rendered ONLY when enabled (the empty
+    # string from a disabled instance is the one permitted silence; an ENABLED relay always yields a
+    # line, incl. the no-data / stale signal).
+    if stayc_retention_md:
+        sections.append((STAYC_RETENTION_SECTION_HEADER, stayc_retention_md))
     if upcoming_md:
         sections.append(("Upcoming Events", upcoming_md))
     if peer_digests_md:
