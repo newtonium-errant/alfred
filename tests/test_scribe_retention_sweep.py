@@ -550,6 +550,70 @@ def test_diarize_window_comes_from_schedule(tmp_path):
     assert summary.pruned_telemetry_rows == 1              # dropped by the 30d schedule window
 
 
+def test_review_due_latch_rearms_after_resolution(tmp_path):
+    # C4: the review_due latch is a RESOLVABLE alert — it must re-arm when due→0 so a LATER cohort
+    # re-emits the signal (not once-per-daemon-lifetime like a steady-state condition).
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    _publish_sched(cfg, encounter_audio_sealed=1)
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    ts_old = (_NOW - timedelta(days=5)).timestamp()
+    blob = retained / f"enc-a{SEAL_BLOB_SUFFIX}"
+    blob.write_bytes(b"FAKESEAL1")
+    os.utime(blob, (ts_old, ts_old))
+    sweep = _sweep(cfg, _events(tmp_path))
+    state = ScribeState(tmp_path / "state.json")
+    with structlog.testing.capture_logs() as cap:
+        s1 = sweep._run_sync(state, _NOW)                # due=1 → latch fires
+        blob.unlink()                                    # operator resolved it → due=0 → latch re-arms
+        s2 = sweep._run_sync(state, _NOW)
+        blob2 = retained / f"enc-b{SEAL_BLOB_SUFFIX}"    # a NEW cohort crosses the window
+        blob2.write_bytes(b"FAKESEAL1")
+        os.utime(blob2, (ts_old, ts_old))
+        s3 = sweep._run_sync(state, _NOW)                # due=1 → signal RE-FIRES
+    assert (s1.review_due, s2.review_due, s3.review_due) == (1, 0, 1)
+    fired = [c for c in cap if c["event"] == "scribe.retention.sweep.retention_review_due"]
+    assert len(fired) == 2                               # fired for BOTH cohorts (re-armed)
+
+
+def test_over_window_basis_is_chain_ts_not_mtime(tmp_path):
+    # C5: the over-window age basis is the durable retention.sealed row's ts (backup-restore-proof,
+    # chain-answerable), NOT the blob mtime. A blob with a FRESH mtime but an OLD row ts (a restore
+    # that dropped mtimes) still surfaces — the mtime basis would have silently reset the 10-yr clock.
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    _publish_sched(cfg, encounter_audio_sealed=1)        # 1-day window
+    ev = _events(tmp_path)
+    enc_id = "enc-restored"
+    ev.retention_sealed(subject_id=enc_id, chunk_count=1, total_bytes=1, manifest_sha256="a" * 64,
+                        sealed_to_key_fp="fp", cipher="age-x25519",
+                        now=(_NOW - timedelta(days=400)).isoformat())   # OLD durable row ts
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    (retained / f"{enc_id}{SEAL_BLOB_SUFFIX}").write_bytes(b"FAKESEAL1")   # FRESH mtime (just written)
+
+    summary = _sweep(cfg, ev)._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.review_due == 1                        # over-window by the CHAIN ts despite fresh mtime
+
+
+def test_corrupted_schedule_latches_load_failed_not_absent(tmp_path):
+    # C7: a schedule file present but unloadable (corrupt) latches a DISTINCT schedule_load_failed
+    # signal, never the misleading 'no schedule published yet' — governance stopped, and that's visible.
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    sched_path.parent.mkdir(parents=True, exist_ok=True)
+    sched_path.write_text("{ not valid json", encoding="utf-8")   # published-then-corrupted
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.schedule_present is False
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.schedule_load_failed"]
+    assert not [c for c in cap if c["event"] == "scribe.retention.sweep.no_schedule_published"]
+
+
 def test_diarize_never_pruned_skips_prune_latched(tmp_path):
     # A schedule declaring diarize_stats never-pruned SKIPS the prune (an ancient row is kept) + latches
     # a deliberate-no-prune observation (distinguishable from a broken prune).

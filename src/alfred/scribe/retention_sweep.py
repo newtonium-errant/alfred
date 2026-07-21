@@ -424,16 +424,31 @@ class RetentionSweep:
         an IO error surfaces nothing (fail-open, non-destructive)."""
         summary.schedule_present = schedule is not None
         if schedule is None:
-            self._latch_log(
-                "no_schedule",
-                "scribe.retention.sweep.no_schedule_published",
-                detail="no s.50 retention schedule is published yet — over-window surfacing is SKIPPED; "
-                       "the sweep NEVER auto-destroys. Publish one via `alfred scribe retention schedule "
-                       "publish`. Latched once.")
+            # C7: distinguish a PUBLISHED-then-corrupted schedule (a file exists at the path but load
+            # returned None — malformed/unreadable) from NEVER-published — a distinct latched signal,
+            # not the misleading 'no schedule published yet' text.
+            if self._schedule_file_present():
+                self._latch_log(
+                    "schedule_load_failed", "scribe.retention.sweep.schedule_load_failed",
+                    detail="a schedule file EXISTS at retention.schedule_path but could NOT be loaded "
+                           "(malformed / corrupt / unreadable) — over-window surfacing is SKIPPED and "
+                           "the diarize prune reverted to the 180d fallback. Fix or re-publish the "
+                           "schedule (`alfred scribe retention schedule publish`). Latched.")
+            else:
+                self._latch_log(
+                    "no_schedule", "scribe.retention.sweep.no_schedule_published",
+                    detail="no s.50 retention schedule is published yet — over-window surfacing is "
+                           "SKIPPED; the sweep NEVER auto-destroys. Publish one via `alfred scribe "
+                           "retention schedule publish`. Latched once.")
             return
+        # a valid schedule clears any prior absent/corrupt latch so a later regression re-warns.
+        self._latched.discard("no_schedule")
+        self._latched.discard("schedule_load_failed")
         window_days = sched_mod.class_window_days(schedule, sched_mod.SURFACED_PHI_CLASS)
         if window_days is None:
-            return  # the surfaced PHI class is declared never-pruned → nothing is ever over-window
+            summary.review_due = 0
+            self._latched.discard("review_due")  # never-pruned now → clear any prior due latch
+            return
         retained_dir = self._resolved_retained_dir()
         cutoff = now_dt.timestamp() - window_days * 86400
         due = 0
@@ -442,11 +457,9 @@ class RetentionSweep:
         except OSError:
             return  # can't enumerate the blob store → surface nothing this sweep (best-effort)
         for blob in blobs:
-            try:
-                if blob.stat().st_mtime < cutoff:
-                    due += 1
-            except OSError:
-                continue
+            basis = self._over_window_basis_ts(blob)  # C5: the durable row ts, fallback blob mtime
+            if basis is not None and basis.timestamp() < cutoff:
+                due += 1
         summary.review_due = due
         if due > 0:
             self._latch_log(
@@ -457,7 +470,39 @@ class RetentionSweep:
                        f"{schedule.get('schedule_version')!r}) — SURFACED for the operator's "
                        f"morning-review playbook (the review_due count rides the per-tick sweep "
                        f"summary). The sweep NEVER auto-destroys; run the explicit destroy playbook "
-                       f"(§5). Latched once.")
+                       f"(§5). Latched until the due set resolves to zero.")
+        else:
+            # C4: re-arm — the latch is for a RESOLVABLE, actionable alert (the operator destroys the
+            # due blobs via the §5 playbook). Discard it when due==0 so a LATER cohort re-emits the
+            # signal (mirrors the pubkey-latch discipline), not once-per-daemon-lifetime.
+            self._latched.discard("review_due")
+
+    def _schedule_file_present(self) -> bool:
+        """True iff a file EXISTS at ``retention.schedule_path`` (used to distinguish a corrupt
+        published schedule from a never-published one — C7). An unsearchable parent (is_file EACCES)
+        counts as present-but-unloadable."""
+        path = self._config.retention.schedule_path
+        if not path:
+            return False
+        try:
+            return Path(path).is_file()
+        except OSError:
+            return True
+
+    def _over_window_basis_ts(self, blob: Path) -> datetime | None:
+        """The age basis for the over-window check (C5): the DURABLE ``retention.sealed`` row's ts for
+        this blob's encounter_id (``<encounter_id>.age`` → stem) — backup-restore-proof + chain-
+        answerable, the design's '10 yr from last encounter activity' basis. Falls back to the blob
+        mtime (a DEGRADED basis — a restore that drops mtimes resets it; documented for the 13e restore
+        runbook) only when no row is found; ``None`` when neither is dateable."""
+        row = self._ev.retention_sealed_row(blob.stem)
+        ts = _parse_iso((row or {}).get("ts"))
+        if ts is not None:
+            return ts
+        try:
+            return datetime.fromtimestamp(blob.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            return None
 
     def _load_schedule(self) -> dict | None:
         """The published s.50 schedule dict, or ``None`` when the path is unset / absent / malformed —
