@@ -207,6 +207,66 @@ def _import_pyrage():
     return pyrage, x25519
 
 
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+# Curve25519 degenerate / low-order u-coordinates (the libsodium ``has_small_order`` blocklist,
+# little-endian). A recipient encoding one of these produces an ALL-ZERO ECDH shared secret, so
+# ``pyrage``/age PANICS ("Generated the all-zero esk; OS RNG is likely failing!") — a
+# ``pyo3_runtime.PanicException`` whose MRO is NOT ``Exception`` (finding 13), which escapes the
+# sweep's + daemon's ``except Exception`` and crash-loops the scribe. We reject them BEFORE pyrage;
+# the ``except BaseException`` belt-catch in :meth:`AgeSealer.seal` is the comprehensive net for any
+# point not enumerated here (an imperfect blocklist is never a safety regression — the belt backstops).
+_LOW_ORDER_X25519: frozenset[bytes] = frozenset({
+    bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000000"),
+    bytes.fromhex("0100000000000000000000000000000000000000000000000000000000000000"),
+    bytes.fromhex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+    bytes.fromhex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+    bytes.fromhex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+    bytes.fromhex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+    bytes.fromhex("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+})
+
+
+def _bech32_convertbits(data: list[int], frombits: int, tobits: int) -> list[int] | None:
+    """Base-conversion for bech32 (no padding — the age recipient payload is a whole 32 bytes)."""
+    acc = 0
+    bits = 0
+    ret: list[int] = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None  # leftover bits ⇒ not a whole-byte payload
+    return ret
+
+
+def _decode_age_recipient_point(recipient: str) -> bytes | None:
+    """Decode an ``age1…`` recipient's 5-bit data (minus the 6-char checksum) to its 32-byte X25519
+    u-coordinate, or ``None`` if it is not shaped like a bech32 ``age`` recipient. This is a SCREEN for
+    the low-order pre-check only — the authoritative bech32 checksum parse is ``Recipient.from_str``
+    (both a malformed recipient and a low-order one end in a typed :class:`SealError`)."""
+    s = recipient.strip()
+    if s.lower() != s and s.upper() != s:
+        return None  # mixed case is invalid bech32
+    s = s.lower()
+    if not s.startswith("age1"):
+        return None
+    data_part = s[len("age1"):]
+    if len(data_part) < 6 or any(c not in _BECH32_CHARSET for c in data_part):
+        return None
+    values = [_BECH32_CHARSET.index(c) for c in data_part]
+    decoded = _bech32_convertbits(values[:-6], 5, 8)  # drop the 6-symbol checksum
+    if decoded is None:
+        return None
+    return bytes(decoded)
+
+
 class AgeSealer:
     """The production sealer — standard **age** X25519 recipient encryption (via ``pyrage``), the
     operator-ruled backend (2026-07-19, design §3.1). The daemon holds ONLY the recipient PUBLIC key
@@ -219,7 +279,10 @@ class AgeSealer:
     UTF-8 bytes of their canonical bech32 strings (``recipient_public_key`` = ``str(recipient)``
     encoded; ``private_key`` = ``str(identity)`` encoded). All pyrage parse/crypto errors are wrapped
     as the module's typed :class:`SealError` (findings 18/19 — a corrupt/degenerate key never escapes
-    as an untyped ValueError the sweep would misclassify as a crash)."""
+    as an untyped ValueError the sweep would misclassify as a crash). A degenerate/low-order recipient
+    is pre-validated + rejected before pyrage, and the encrypt is belt-caught against a pyo3
+    ``PanicException`` (which is NOT an ``Exception``) so it cannot crash-loop the daemon (finding 13);
+    ``KeyboardInterrupt`` / ``SystemExit`` still propagate."""
 
     cipher = SEAL_CIPHER
 
@@ -228,10 +291,23 @@ class AgeSealer:
 
     def _recipient(self, recipient_public_key: bytes):
         try:
-            return self._x25519.Recipient.from_str(recipient_public_key.decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001 — UnicodeDecodeError OR pyrage RecipientError, both typed
-            # pyrage raises RecipientError on a non-canonical / malformed / degenerate recipient
-            # (bech32 validation is canonical — closes findings 18/19).
+            raw = recipient_public_key.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SealError(f"recipient public key is not valid UTF-8: {exc}") from exc
+        # PRE-VALIDATE (finding 13, R10): reject a bech32-valid recipient that encodes a degenerate /
+        # low-order X25519 point BEFORE pyrage — such a point does NOT raise in Recipient.from_str, it
+        # PANICS inside pyrage.encrypt (a pyo3 PanicException that is NOT an Exception). Screen it here
+        # as a typed SealError; the belt-catch in seal() nets any point this blocklist misses.
+        point = _decode_age_recipient_point(raw)
+        if point is not None and (len(point) != 32 or point in _LOW_ORDER_X25519):
+            raise SealError(
+                "recipient public key is a degenerate / low-order X25519 point — refused (it would "
+                "panic the age encrypt with an all-zero shared secret; finding 13)")
+        try:
+            return self._x25519.Recipient.from_str(raw)
+        except Exception as exc:  # noqa: BLE001 — pyrage RecipientError on a non-canonical recipient, typed
+            # pyrage raises RecipientError on a non-canonical / malformed recipient (bech32 validation
+            # is canonical — closes findings 18/19).
             raise SealError(f"recipient public key is not a valid age recipient: {exc}") from exc
 
     def _identity(self, private_key: bytes):
@@ -244,8 +320,12 @@ class AgeSealer:
         recipient = self._recipient(recipient_public_key)
         try:
             return self._pyrage.encrypt(plaintext, [recipient])
-        except Exception as exc:  # noqa: BLE001 — any age encrypt failure is a typed seal failure
-            raise SealError(f"age encryption failed: {exc}") from exc
+        except (KeyboardInterrupt, SystemExit):
+            raise  # never swallow a shutdown signal as a seal failure
+        except BaseException as exc:  # noqa: BLE001 — incl. pyo3 PanicException (NOT an Exception; finding
+            # 13). Converting it to a typed SealError keeps a degenerate key per-encounter-isolated
+            # instead of escaping the sweep + daemon except-Exception guards → scribe crash-loop.
+            raise SealError(f"age encryption failed: {type(exc).__name__}") from exc
 
     def verify_wellformed(self, blob: bytes) -> bool:
         """STRUCTURAL check WITHOUT the private key (the daemon holds only the recipient). Not a prefix

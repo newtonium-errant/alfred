@@ -1144,3 +1144,98 @@ def test_seal_aborts_before_durable_row_on_dir_fsync_failure(tmp_path, monkeypat
         _seal(tmp_path, enc_dir, ev)
     assert (enc_dir / "chunk_1.webm").is_file()              # plaintext intact — never wiped
     assert _sealed_rows(ev) == []                            # no durable row (aborted before step 4)
+
+
+# ====== degenerate age recipient (R10 — finding 13) ======
+
+
+def _bech32_encode_age(payload32: bytes) -> str:
+    """A minimal bech32 (BIP-173, HRP 'age') encoder — builds a checksum-VALID age recipient from raw
+    32 bytes so a degenerate/low-order point can be encoded exactly as a real keygen tool would."""
+    charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+    def convertbits(data, frombits, tobits):
+        acc = bits = 0
+        ret = []
+        maxv = (1 << tobits) - 1
+        for value in data:
+            acc = (acc << frombits) | value
+            bits += frombits
+            while bits >= tobits:
+                bits -= tobits
+                ret.append((acc >> bits) & maxv)
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+        return ret
+
+    def polymod(values):
+        gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+        chk = 1
+        for v in values:
+            top = chk >> 25
+            chk = ((chk & 0x1ffffff) << 5) ^ v
+            for i in range(5):
+                chk ^= gen[i] if ((top >> i) & 1) else 0
+        return chk
+
+    hrp = "age"
+    hrp_exp = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    data5 = convertbits(list(payload32), 8, 5)
+    pm = polymod(hrp_exp + data5 + [0] * 6) ^ 1
+    checksum = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(charset[d] for d in data5 + checksum)
+
+
+def test_bech32_encoder_decoder_round_trip():
+    # sanity: the test encoder round-trips through the production point decoder (so the degenerate
+    # recipients below really carry the raw bytes we intend to reject).
+    for raw in (bytes(32), b"\x01" + bytes(31), bytes(range(32))):
+        assert ret_mod._decode_age_recipient_point(_bech32_encode_age(raw)) == raw
+
+
+def test_age_prevalidation_rejects_degenerate_recipient_typed(tmp_path):
+    # finding 13 (R10): a bech32-VALID recipient encoding a degenerate/low-order X25519 point (all-zero
+    # or point-1) is rejected as a TYPED SealError BEFORE pyrage — never a pyo3 PanicException that
+    # escapes the sweep + daemon except-Exception into a scribe crash-loop.
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import AgeSealer, SealError, generate_keypair
+    sealer = AgeSealer()
+    for degenerate in (bytes(32), b"\x01" + bytes(31)):
+        recipient = _bech32_encode_age(degenerate).encode("utf-8")
+        with pytest.raises(SealError):
+            sealer.seal(b"audio", recipient)
+    # a REAL keygen recipient is NOT falsely rejected (round-trips through seal)
+    pub, _priv = generate_keypair()
+    assert sealer.seal(b"audio", pub).startswith(b"age-encryption.org/")
+
+
+def test_age_seal_belt_catches_panic_into_typed_sealerror(tmp_path, monkeypatch):
+    # finding 13 (R10): even a degenerate point the blocklist misses must not crash the daemon — the
+    # belt-catch converts a pyo3 PanicException (which is NOT an Exception) into a typed SealError.
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import AgeSealer, SealError, generate_keypair
+    pub, _priv = generate_keypair()
+    sealer = AgeSealer()
+
+    class _FakePanic(BaseException):     # mimics pyo3_runtime.PanicException — NOT an Exception
+        pass
+
+    assert not isinstance(_FakePanic(), Exception)   # the escape vector the belt-catch must net
+
+    monkeypatch.setattr(sealer._pyrage, "encrypt",
+                        lambda *_a, **_k: (_ for _ in ()).throw(_FakePanic("all-zero esk")))
+    with pytest.raises(SealError):
+        sealer.seal(b"audio", pub)
+
+
+def test_age_seal_belt_reraises_shutdown_signals(tmp_path, monkeypatch):
+    # the belt-catch must NEVER swallow a shutdown signal (KeyboardInterrupt / SystemExit) as a
+    # SealError — those propagate for a clean daemon shutdown.
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import AgeSealer, generate_keypair
+    pub, _priv = generate_keypair()
+    sealer = AgeSealer()
+    monkeypatch.setattr(sealer._pyrage, "encrypt",
+                        lambda *_a, **_k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        sealer.seal(b"audio", pub)
