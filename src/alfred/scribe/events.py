@@ -635,6 +635,20 @@ class ScribeEvents:
         return self.latest(CLINICAL, family="retention", kind="retention.sealed",
                            subject_id=subject_id)
 
+    def retention_sealed_ts_by_id(self) -> dict[str, str]:
+        """``{encounter_id: latest retention.sealed ts}`` in ONE chain query — the sweep's over-window
+        age basis for EVERY sealed blob without a per-blob full-chain scan (C5's per-blob
+        ``retention_sealed_row`` was O(blobs × rows), which wedges the sweep as a deployment ages —
+        E2). Chain order == append order, so the LAST sealed row per ``subject_id`` wins (latest-wins
+        on a re-seal, matching :meth:`retention_sealed_row`). Co-located so the (stream, family, kind)
+        triple stays in ONE place."""
+        out: dict[str, str] = {}
+        for r in self.query(CLINICAL, family="retention", kind="retention.sealed"):
+            sid = r.get("subject_id")
+            if sid:
+                out[sid] = r.get("ts", "")  # last write wins (chain order == append order)
+        return out
+
     # --- ACCESS emitters + read hook + suppression ------------------------
 
     def access_read(self, *, subject_id: str, record_type: str, status: str, path_digest: str,

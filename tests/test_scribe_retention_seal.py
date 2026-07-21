@@ -767,6 +767,24 @@ def test_retention_sibling_emitters_length_cap_free_strings(tmp_path):
     assert ev.query(CLINICAL, family="retention") == []      # NOTHING PHI-bearing landed in the chain
 
 
+def test_retention_sealed_ts_by_id_latest_wins(tmp_path):
+    # E2: retention_sealed_ts_by_id builds {encounter_id: LATEST sealed ts} in ONE query (replacing the
+    # per-blob full-chain scan). A re-seal (a second retention.sealed row for the same id) must WIN —
+    # latest-wins, chain order == append order, matching retention_sealed_row/latest().
+    ev = _events(tmp_path)
+    ev.retention_sealed(subject_id="enc-a", chunk_count=1, total_bytes=1, manifest_sha256="a" * 64,
+                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER, now="2026-01-01T00:00:00+00:00")
+    ev.retention_sealed(subject_id="enc-a", chunk_count=2, total_bytes=2, manifest_sha256="b" * 64,
+                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER, now="2026-06-01T00:00:00+00:00")
+    ev.retention_sealed(subject_id="enc-b", chunk_count=1, total_bytes=1, manifest_sha256="c" * 64,
+                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER, now="2026-03-01T00:00:00+00:00")
+    m = ev.retention_sealed_ts_by_id()
+    assert set(m) == {"enc-a", "enc-b"}
+    assert m["enc-a"] == ev.retention_sealed_row("enc-a")["ts"]   # == latest() (the re-seal)
+    assert m["enc-b"] == ev.retention_sealed_row("enc-b")["ts"]
+    assert "2026-06" in m["enc-a"]                                # the LATER seal won, not the first
+
+
 def test_retention_envelope_fields_length_capped(tmp_path):
     # D6: the ENVELOPE fields (subject_id + now) are facade-capped too — R9 capped only PAYLOAD fields,
     # so a 4800-char PHI probe landed in the permanent chain via subject_id / now. Every retention

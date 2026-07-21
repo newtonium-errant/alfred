@@ -462,8 +462,15 @@ class RetentionSweep:
             blobs = list(retained_dir.glob(f"*{ret.SEAL_BLOB_SUFFIX}"))
         except OSError:
             return  # can't enumerate the blob store → surface nothing this sweep (best-effort)
+        # E2: build the {encounter_id: sealed ts} map in ONE chain query, then dict-lookup per blob —
+        # C5's per-blob retention_sealed_row was a full-chain scan PER blob (O(blobs × rows), wedges as
+        # the deployment ages). Best-effort: an observability query failure → empty map → mtime basis.
+        try:
+            ts_by_id = self._ev.retention_sealed_ts_by_id()
+        except Exception:  # noqa: BLE001 — never crash the sweep over an observability query
+            ts_by_id = {}
         for blob in blobs:
-            basis = self._over_window_basis_ts(blob)  # C5: the durable row ts, fallback blob mtime
+            basis = self._over_window_basis_ts(blob, ts_by_id)  # C5: durable row ts, fallback mtime
             if basis is not None and basis.timestamp() < cutoff:
                 due += 1
                 if oldest_ts is None or basis < oldest_ts:  # track the OLDEST over-window encounter (C3)
@@ -499,14 +506,14 @@ class RetentionSweep:
         except OSError:
             return True
 
-    def _over_window_basis_ts(self, blob: Path) -> datetime | None:
+    def _over_window_basis_ts(self, blob: Path, ts_by_id: dict[str, str]) -> datetime | None:
         """The age basis for the over-window check (C5): the DURABLE ``retention.sealed`` row's ts for
-        this blob's encounter_id (``<encounter_id>.age`` → stem) — backup-restore-proof + chain-
-        answerable, the design's '10 yr from last encounter activity' basis. Falls back to the blob
-        mtime (a DEGRADED basis — a restore that drops mtimes resets it; documented for the 13e restore
-        runbook) only when no row is found; ``None`` when neither is dateable."""
-        row = self._ev.retention_sealed_row(blob.stem)
-        ts = _parse_iso((row or {}).get("ts"))
+        this blob's encounter_id (``<encounter_id>.age`` → stem), looked up in the ONE-query-per-tick
+        ``ts_by_id`` map (E2) — backup-restore-proof + chain-answerable, the design's '10 yr from last
+        encounter activity' basis. Falls back to the blob mtime (a DEGRADED basis — a restore that
+        drops mtimes resets it; documented for the 13e restore runbook) only when no row is found;
+        ``None`` when neither is dateable."""
+        ts = _parse_iso(ts_by_id.get(blob.stem))
         if ts is not None:
             return ts
         try:
