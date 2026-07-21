@@ -32,6 +32,7 @@ from alfred.scribe.enroll_learning import (
 )
 from alfred.evstore import sha256_hex
 from alfred.scribe import retention as ret_mod
+from alfred.scribe import schedule as sched_mod
 from alfred.scribe.events import CLINICAL, ScribeEvents
 from alfred.scribe.identity import compute_encounter_id
 from alfred.scribe.retention import SEAL_BLOB_SUFFIX
@@ -406,6 +407,115 @@ def test_no_schedule_ilb_latched_once(tmp_path):
     latched = [c for c in cap if c["event"] == "scribe.retention.sweep.no_schedule_published"]
     assert len(latched) == 1                               # emitted ONCE across two sweeps (latched)
     assert s1.review_due == 0                              # NEVER auto-destroy / surface without a schedule
+
+
+# ============================ s.50 schedule surfacing (13c — §4) ============================
+
+
+def _publish_sched(cfg, **window_overrides):
+    """Publish a v1-shaped schedule to cfg.retention.schedule_path with per-class window_days
+    overrides (e.g. encounter_audio_sealed=1, diarize_stats=None)."""
+    data = sched_mod.default_schedule_v1()
+    for cls, win in window_overrides.items():
+        data["classes"][cls]["window_days"] = win
+    sched_mod.publish_schedule(cfg.retention.schedule_path, data)
+
+
+def test_over_window_sealed_blob_surfaced_and_latched(tmp_path):
+    # §4: with a schedule, the sweep counts sealed .age blobs older than the encounter_audio_sealed
+    # window into summary.review_due + latches a retention_review_due signal — SURFACE ONLY.
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    _publish_sched(cfg, encounter_audio_sealed=1)          # a 1-day window
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    old_blob = retained / f"enc-old{SEAL_BLOB_SUFFIX}"
+    old_blob.write_bytes(b"FAKESEAL1-old")
+    fresh_blob = retained / f"enc-fresh{SEAL_BLOB_SUFFIX}"
+    fresh_blob.write_bytes(b"FAKESEAL1-fresh")
+    ts_old = (_NOW - timedelta(days=5)).timestamp()
+    os.utime(old_blob, (ts_old, ts_old))                   # aged past the window; fresh keeps ~now mtime
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.schedule_present is True
+    assert summary.review_due == 1                         # only the aged blob is over-window
+    assert old_blob.is_file() and fresh_blob.is_file()     # SURFACE-ONLY — neither blob destroyed
+    latched = [c for c in cap if c["event"] == "scribe.retention.sweep.retention_review_due"]
+    assert len(latched) == 1
+
+
+def test_surfacing_never_destroys_across_sweeps(tmp_path):
+    # The review_due count rides EVERY sweep summary (ILB), while the latch fires once; and the blob is
+    # NEVER touched no matter how many sweeps run (destruction stays the explicit operator playbook).
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    _publish_sched(cfg, encounter_audio_sealed=1)
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    blob = retained / f"enc-x{SEAL_BLOB_SUFFIX}"
+    blob.write_bytes(b"FAKESEAL1")
+    ts = (_NOW - timedelta(days=400)).timestamp()
+    os.utime(blob, (ts, ts))
+    sweep = _sweep(cfg, _events(tmp_path))
+    state = ScribeState(tmp_path / "state.json")
+
+    with structlog.testing.capture_logs() as cap:
+        s1 = sweep._run_sync(state, _NOW)
+        s2 = sweep._run_sync(state, _NOW)
+
+    assert s1.review_due == 1 and s2.review_due == 1        # counted EVERY tick (ILB)
+    assert len([c for c in cap if c["event"] == "scribe.retention.sweep.retention_review_due"]) == 1
+    assert blob.is_file()                                   # NEVER auto-destroyed
+
+
+def test_never_pruned_class_surfaces_nothing(tmp_path):
+    # A schedule that declares encounter_audio_sealed never-pruned (window null) surfaces NOTHING even
+    # for an ancient blob.
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    _publish_sched(cfg, encounter_audio_sealed=None)
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    ancient = retained / f"enc-ancient{SEAL_BLOB_SUFFIX}"
+    ancient.write_bytes(b"FAKESEAL1")
+    ts = (_NOW - timedelta(days=9999)).timestamp()
+    os.utime(ancient, (ts, ts))
+
+    summary = _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.schedule_present is True and summary.review_due == 0
+    assert ancient.is_file()
+
+
+def test_diarize_window_comes_from_schedule(tmp_path):
+    # §4: a published schedule's diarize_stats window governs the prune — a 40-day row drops under a
+    # 30-day schedule window (it would be KEPT under the 180d fallback).
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    _publish_sched(cfg, diarize_stats=30)
+    _write_sink(cfg, [_row(KIND_DIARIZE_STATS, 40, source_id="mid")])
+
+    summary = _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.pruned_telemetry_rows == 1              # dropped by the 30d schedule window
+
+
+def test_diarize_never_pruned_skips_prune_latched(tmp_path):
+    # A schedule declaring diarize_stats never-pruned SKIPS the prune (an ancient row is kept) + latches
+    # a deliberate-no-prune observation (distinguishable from a broken prune).
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    _publish_sched(cfg, diarize_stats=None)
+    sink = _write_sink(cfg, [_row(KIND_DIARIZE_STATS, 9999, source_id="ancient")])
+
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.pruned_telemetry_rows == 0
+    assert len(sink.read_text().splitlines()) == 1         # the ancient row KEPT (never-pruned)
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.diarize_stats_never_pruned"]
 
 
 def test_inactive_store_skips_seal_but_prune_runs(tmp_path):

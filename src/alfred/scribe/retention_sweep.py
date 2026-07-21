@@ -57,6 +57,7 @@ from typing import Any, Callable
 import structlog
 
 from alfred.scribe import retention as ret
+from alfred.scribe import schedule as sched_mod
 from alfred.scribe.close_manifest import CLOSE_SENTINEL_NAME
 from alfred.scribe.config import (
     RETENTION_MODE_RETAINED, RETENTION_MODE_TRANSIENT, ScribeConfig,
@@ -201,11 +202,17 @@ class RetentionSweep:
         if can_process:
             self._process_encounters(state, now_dt, now_iso, sealer, pubkey, can_seal, summary)
 
-        # (3) over-window surfacing SEAM (§4) — no schedule ⇒ latched ILB, never auto-destroy.
-        self._surface_over_window(now_dt, summary)
+        # Load the s.50 schedule ONCE (fail-closed None) and thread it into both surfacing + the prune
+        # (avoids a double read; both are PHI-free observability, independent of the store gate).
+        schedule = self._load_schedule()
 
-        # (4) diarize_stats rolling prune (§0.1/§4) — PHI-free log rotation, no retention.* event.
-        summary.pruned_telemetry_rows = self._prune_diarize_stats(now_dt)
+        # (3) over-window surfacing (§4) — no schedule ⇒ latched ILB; a schedule ⇒ count over-window
+        # sealed encounters (surface-only, NEVER auto-destroy).
+        self._surface_over_window(now_dt, summary, schedule)
+
+        # (4) diarize_stats rolling prune (§0.1/§4) — PHI-free log rotation, no retention.* event; the
+        # window now comes from the schedule's diarize_stats class (fallback 180d when unpublished).
+        summary.pruned_telemetry_rows = self._prune_diarize_stats(now_dt, schedule)
 
         # Sweep summary — ALWAYS emitted (intentionally-left-blank: idle is distinguishable from broken).
         did = summary.did_work()
@@ -377,48 +384,65 @@ class RetentionSweep:
 
     # --- (3) over-window surfacing seam (§4) -----------------------------
 
-    def _surface_over_window(self, now_dt: datetime, summary: RetentionSweepSummary) -> None:
-        """The s.50 schedule artifact ships in 13c. This is the SEAM: resolve the schedule; with none
-        present, emit a latched intentionally-left-blank observation and skip surfacing WITHOUT
-        failing. 13c plugs the per-class window comparison in below (enumerate sealed encounters →
-        compare age vs class window → set ``summary.review_due``). This path NEVER auto-destroys —
-        surfacing is surface-only (§4); destruction stays the explicit operator playbook (§5)."""
-        schedule = self._load_schedule()
+    def _surface_over_window(
+        self, now_dt: datetime, summary: RetentionSweepSummary, schedule: dict | None,
+    ) -> None:
+        """§4 over-window SURFACING. With no schedule published, emit a latched intentionally-left-blank
+        observation and skip WITHOUT failing. With a schedule, compare each sealed ``.age`` blob's age
+        (now − mtime) against the ``encounter_audio_sealed`` class window → set ``summary.review_due``
+        + latch a ``retention_review_due`` signal (once). SURFACE-ONLY (§4): this path NEVER touches a
+        blob — destruction stays the explicit operator playbook (§5). A never-pruned window (null) or
+        an IO error surfaces nothing (fail-open, non-destructive)."""
         summary.schedule_present = schedule is not None
         if schedule is None:
             self._latch_log(
                 "no_schedule",
                 "scribe.retention.sweep.no_schedule_published",
-                detail="no s.50 retention schedule is published yet (the schedule artifact ships in "
-                       "slice 13c) — over-window surfacing is SKIPPED; the sweep NEVER auto-destroys. "
-                       "Latched once.")
+                detail="no s.50 retention schedule is published yet — over-window surfacing is SKIPPED; "
+                       "the sweep NEVER auto-destroys. Publish one via `alfred scribe retention schedule "
+                       "publish`. Latched once.")
             return
-        # 13c SEAM — compare each sealed encounter's age against its class window and set
-        # summary.review_due (a due count surfaced to the morning review; NEVER an auto-destroy).
-        # Unreachable in 13b (the schedule loader always returns None until 13c ships the reader).
+        window_days = sched_mod.class_window_days(schedule, sched_mod.SURFACED_PHI_CLASS)
+        if window_days is None:
+            return  # the surfaced PHI class is declared never-pruned → nothing is ever over-window
+        retained_dir = self._resolved_retained_dir()
+        cutoff = now_dt.timestamp() - window_days * 86400
+        due = 0
+        try:
+            blobs = list(retained_dir.glob(f"*{ret.SEAL_BLOB_SUFFIX}"))
+        except OSError:
+            return  # can't enumerate the blob store → surface nothing this sweep (best-effort)
+        for blob in blobs:
+            try:
+                if blob.stat().st_mtime < cutoff:
+                    due += 1
+            except OSError:
+                continue
+        summary.review_due = due
+        if due > 0:
+            self._latch_log(
+                "review_due",
+                "scribe.retention.sweep.retention_review_due",
+                detail=f"{due} sealed encounter(s) are OVER the s.50 retention window for "
+                       f"'{sched_mod.SURFACED_PHI_CLASS}' (schedule "
+                       f"{schedule.get('schedule_version')!r}) — SURFACED for the operator's "
+                       f"morning-review playbook (the review_due count rides the per-tick sweep "
+                       f"summary). The sweep NEVER auto-destroys; run the explicit destroy playbook "
+                       f"(§5). Latched once.")
 
     def _load_schedule(self) -> dict | None:
-        """13b stub: there is no schedule reader/writer until 13c, so a schedule is present only if
-        the operator's ``schedule_path`` file already exists (it does not in 13b). Returns the parsed
-        schedule dict, or ``None`` when absent/unset — the seam 13c fills in with real parsing +
-        fail-closed-on-malformed."""
+        """The published s.50 schedule dict, or ``None`` when the path is unset / absent / malformed —
+        FAIL-CLOSED (a malformed schedule is treated as no-usable-schedule → skip surfacing, keep the
+        180d telemetry fallback; never crash the sweep). Delegates to :func:`schedule.load_schedule`
+        (validation-gated) so the CLI publish + the sweep read share one parser."""
         path = self._config.retention.schedule_path
         if not path:
             return None
-        p = Path(path)
-        if not p.is_file():
-            return None
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # 13c owns fail-closed-on-malformed surfacing; in 13b a malformed file is treated as
-            # "no usable schedule" (skip surfacing, never crash the sweep).
-            return None
-        return data if isinstance(data, dict) else None
+        return sched_mod.load_schedule(path)
 
     # --- (4) diarize_stats rolling prune (§0.1/§4) -----------------------
 
-    def _prune_diarize_stats(self, now_dt: datetime) -> int:
+    def _prune_diarize_stats(self, now_dt: datetime, schedule: dict | None = None) -> int:
         """Age-based rolling prune of the PHI-FREE ``diarize_stats``/``attest_outcome`` telemetry sink
         (``<enrollment_dir>/learning/attest_capture.jsonl``) — absorbs the queued P4-5b unowned
         180-day prune. Drops rows whose ``ts`` is older than the window; PRESERVES every row it cannot
@@ -427,6 +451,11 @@ class RetentionSweep:
         mirrors the enroll-sink skip-not-fatal discipline). Atomic temp→replace rewrite (never a torn
         sink); emits NO ``retention.*`` event (log rotation, not a PHI destruction). Returns the row
         count dropped (folded into the sweep summary — intentionally-left-blank).
+
+        Window sourcing (§4, 13c): a published ``schedule``'s ``diarize_stats`` window governs; with
+        NO schedule the fixed 180d default applies (the P4-5b absorption). A schedule that declares
+        ``diarize_stats`` NEVER-pruned (``window_days: null``) SKIPS the prune (a latched observation —
+        deliberate no-prune is distinguishable from a broken prune).
 
         Concurrency (finding 19): the sink has a CROSS-PROCESS appender the original note missed — the
         ``alfred scribe attest`` CLI's ``record_attest_outcome`` appends from a separate process,
@@ -439,7 +468,20 @@ class RetentionSweep:
         sink = Path(enrollment_dir) / LEARNING_DIRNAME / CAPTURE_NAME
         if not sink.is_file():
             return 0
-        cutoff = now_dt - timedelta(days=_DIARIZE_STATS_PRUNE_DAYS)
+        prune_days = _DIARIZE_STATS_PRUNE_DAYS
+        if schedule is not None:
+            window = sched_mod.class_window_days(schedule, sched_mod.TELEMETRY_CLASS)
+            if window is None:
+                # the published schedule declares diarize_stats NEVER-pruned → skip the rolling prune.
+                self._latch_log(
+                    "diarize_never_pruned",
+                    "scribe.retention.sweep.diarize_stats_never_pruned",
+                    detail="the published s.50 schedule declares diarize_stats never-pruned "
+                           "(window_days null) — the telemetry rolling prune is SKIPPED (deliberate, "
+                           "not broken). Latched once.")
+                return 0
+            prune_days = window
+        cutoff = now_dt - timedelta(days=prune_days)
         # Hold the sink lock across READ + REWRITE (finding 19) so a concurrent attest-CLI append is
         # serialized, not clobbered by the read-then-replace snapshot.
         with capture_sink_lock(enrollment_dir):
