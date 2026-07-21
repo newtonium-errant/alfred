@@ -2727,6 +2727,9 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     if subcmd == "eval":
         _cmd_scribe_eval(args)
         return
+    if subcmd == "retention":
+        _cmd_scribe_retention(args)
+        return
     if subcmd != "attest":
         print("Usage: alfred scribe {attest <note> --attester <clinician> | "
               "events {list|verify|tip|anchor} | audit encounter <enc> | "
@@ -2937,6 +2940,82 @@ def _cmd_scribe_audit(args: argparse.Namespace) -> None:
     print(json.dumps(rows, indent=2))
     if not rows:
         print(f"no events for encounter {args.encounter}", file=sys.stderr)  # ILB
+
+
+def _cmd_scribe_retention(args: argparse.Namespace) -> None:
+    """``alfred scribe retention schedule {publish <file>|show}`` — the s.50 retention SCHEDULE
+    surface (design §4, slice 13c). ``publish`` validates a schedule JSON, DURABLY pins its sha via
+    ``retention.schedule_published`` [D] BEFORE writing the daemon-read-only artifact (fail-closed —
+    a store-down publish writes NOTHING), then atomic-writes the exact pinned bytes. ``show`` prints
+    the published schedule + whether its on-disk bytes still match the chain-pinned sha (drift). JSON
+    output, ILB explicit empties. The sweep SURFACES over-window classes; it NEVER auto-destroys (§5)."""
+    from alfred.evstore import sha256_hex
+    from alfred.scribe import retention as ret_mod
+    from alfred.scribe import schedule as sched_mod
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+    from alfred.scribe.events import CLINICAL
+
+    scmd = getattr(args, "schedule_cmd", None)
+    if getattr(args, "retention_cmd", None) != "schedule" or scmd not in ("publish", "show"):
+        print("Usage: alfred scribe retention schedule {publish <file> | show}")
+        sys.exit(1)
+
+    raw = _load_unified_config(args.config)
+    sched_path = load_scribe_config(raw).retention.schedule_path
+    if not sched_path:
+        print(json.dumps({"error": "retention.schedule_path is unset — configure the daemon-read-only "
+                                    "schedule path before publishing (design §3.1/§3.7)"}))
+        sys.exit(1)
+
+    if scmd == "publish":
+        try:
+            data = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"error": f"cannot read schedule file {args.file!r}: {exc}"}))
+            sys.exit(1)
+        try:
+            sched_mod.validate_schedule(data)
+        except sched_mod.ScheduleError as exc:
+            print(json.dumps({"error": f"invalid schedule (REFUSED, nothing published): {exc}"}))
+            sys.exit(1)
+        canonical = sched_mod.canonical_schedule_bytes(data)
+        sha = sha256_hex(canonical)
+        ev = _open_scribe_events(raw)
+        # DURABLE pin FIRST (fail-closed): a store-down / inactive publish RAISES and writes NO
+        # unpinned schedule to disk. Facade-capped free-string fields (finding 12) apply here.
+        try:
+            ev.retention_schedule_published(
+                schedule_version=data["schedule_version"], schedule_sha256=sha,
+                effective_date=data["effective_date"])
+        except Exception as exc:  # noqa: BLE001 — surface a store-down publish as a machine-readable error
+            print(json.dumps({"error": f"durable retention.schedule_published pin FAILED — nothing "
+                                        f"written (fail-closed): {exc}"}))
+            sys.exit(1)
+        # THEN write the EXACT pinned bytes atomically (the R7-hardened write).
+        ret_mod._atomic_write_bytes(Path(sched_path), canonical)
+        print(json.dumps({
+            "published": True, "path": str(sched_path),
+            "schedule_version": data["schedule_version"], "schedule_sha256": sha,
+            "effective_date": data["effective_date"]}, indent=2))
+        return
+
+    # show
+    ev = _open_scribe_events(raw)
+    sched = sched_mod.load_schedule(sched_path)
+    latest = ev.latest(CLINICAL, family="retention", kind="retention.schedule_published")
+    chain_sha = (latest or {}).get("payload", {}).get("schedule_sha256")
+    if sched is None:
+        print(json.dumps({"schedule_present": False, "path": str(sched_path),
+                          "chain_pinned_sha256": chain_sha}, indent=2))
+        print("no valid schedule published at retention.schedule_path", file=sys.stderr)  # ILB
+        return
+    on_disk_sha = sha256_hex(Path(sched_path).read_bytes())
+    print(json.dumps({
+        "schedule_present": True, "path": str(sched_path),
+        "schedule_version": sched["schedule_version"], "effective_date": sched["effective_date"],
+        "on_disk_sha256": on_disk_sha, "chain_pinned_sha256": chain_sha,
+        "pin_matches": bool(chain_sha) and on_disk_sha == chain_sha,
+        "classes": sched["classes"], "minor_rule": sched["minor_rule"]}, indent=2))
 
 
 def _cmd_scribe_bugs(args: argparse.Namespace) -> None:
@@ -4005,6 +4084,22 @@ def build_parser() -> argparse.ArgumentParser:
     audit_sub = scribe_audit.add_subparsers(dest="audit_cmd")
     audit_enc = audit_sub.add_parser("encounter", help="Full timeline for one encounter id")
     audit_enc.add_argument("encounter", help="The encounter id (subject_id)")
+    # #13c — the s.50 retention SCHEDULE surface (publish / show).
+    scribe_retention = scribe_sub.add_parser(
+        "retention", help="s.50 retention schedule (publish / show); the sweep surfaces over-window, "
+                          "never auto-destroys")
+    retention_sub = scribe_retention.add_subparsers(dest="retention_cmd")
+    ret_sched = retention_sub.add_parser(
+        "schedule", help="Publish / show the s.50 retention schedule (versioned, sha-pinned [D])")
+    ret_sched_sub = ret_sched.add_subparsers(dest="schedule_cmd")
+    rs_pub = ret_sched_sub.add_parser(
+        "publish", help="Validate + publish a schedule JSON to the daemon-read-only path, pinning its "
+                        "sha via retention.schedule_published [D] (see the bundled "
+                        "examples/retention_schedule.v1.json)")
+    rs_pub.add_argument("file", help="Path to the schedule JSON to publish")
+    ret_sched_sub.add_parser(
+        "show", help="Show the published schedule + whether its on-disk bytes still match the "
+                     "chain-pinned sha (drift)")
     # P4-5 — voice-preset management (local file ops under scribe.diarize.enrollment_dir).
     scribe_presets = scribe_sub.add_parser(
         "presets", help="Manage voice-enrollment presets (list / audit / delete)",
