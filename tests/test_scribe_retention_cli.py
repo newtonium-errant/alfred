@@ -120,6 +120,37 @@ def test_publish_fail_closed_when_pin_raises(tmp_path, capsys, monkeypatch):
     assert not sched_path.exists()                          # pin raised BEFORE the write → nothing published
 
 
+def test_publish_write_failure_after_pin_reports_dangling(tmp_path, capsys, monkeypatch):
+    # C2: the durable-first ordering makes a post-pin write failure (read-only seal dir / disk-full)
+    # possible — it must surface a JSON error naming the dangling-pin state + the re-publish remedy,
+    # NOT a raw traceback. The [D] pin DID land (that's the dangling state).
+    from alfred.scribe import retention as ret_mod
+    cfg, sched_path = _write_cfg(tmp_path)
+    src = _write_schedule_file(tmp_path)
+    monkeypatch.setattr(ret_mod, "_atomic_write_bytes",
+                        lambda path, data: (_ for _ in ()).throw(OSError("read-only seal dir")))
+    with pytest.raises(SystemExit):
+        cli._cmd_scribe_retention(_ns(cfg, "publish", file=src))
+    out = _stdout_json(capsys)
+    assert out.get("dangling_pin") is True and "re-run" in out["error"].lower()
+    assert not sched_path.exists()                           # the artifact write failed
+    row = _events(tmp_path).latest(CLINICAL, family="retention", kind="retention.schedule_published")
+    assert row is not None                                    # ...but the [D] pin landed (the dangling state)
+
+
+def test_show_toctou_file_vanishes_between_load_and_reread(tmp_path, capsys, monkeypatch):
+    # C9: a TOCTOU — the file vanishes (operator rm / re-publish rename) between load_schedule and the
+    # drift re-read must fall to the fail-closed empty branch, never a raw FileNotFoundError traceback.
+    from alfred.scribe import schedule as sched_mod
+    cfg, sched_path = _write_cfg(tmp_path)
+    monkeypatch.setattr(sched_mod, "load_schedule", lambda p: sched_mod.default_schedule_v1())
+    assert not sched_path.exists()                           # load 'succeeds' but the file is absent
+    cli._cmd_scribe_retention(_ns(cfg, "show"))              # must NOT raise
+    out = capsys.readouterr()
+    assert json.loads(out.out)["schedule_present"] is False
+    assert "vanished" in out.err                             # ILB
+
+
 def test_publish_refuses_unreadable_source(tmp_path, capsys):
     cfg, sched_path = _write_cfg(tmp_path)
     with pytest.raises(SystemExit):

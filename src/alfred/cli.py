@@ -2991,8 +2991,20 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
             print(json.dumps({"error": f"durable retention.schedule_published pin FAILED — nothing "
                                         f"written (fail-closed): {exc}"}))
             sys.exit(1)
-        # THEN write the EXACT pinned bytes atomically (the R7-hardened write).
-        ret_mod._atomic_write_bytes(Path(sched_path), canonical)
+        # THEN write the EXACT pinned bytes atomically (the R7-hardened write). C2: the durable-first
+        # ordering makes THIS the one failure the pin already landed — a write failure (read-only seal
+        # dir / disk-full) leaves a DANGLING pin. Surface it as a machine-readable error naming the
+        # state + the re-publish remedy (the pin's 'latest wins' heals on re-run), never a raw traceback.
+        try:
+            ret_mod._atomic_write_bytes(Path(sched_path), canonical)
+        except OSError as exc:
+            print(json.dumps({
+                "error": f"the retention.schedule_published [D] pin LANDED but writing the schedule "
+                         f"artifact to {sched_path!r} FAILED ({exc}) — the chain now holds a DANGLING "
+                         f"pin (no on-disk schedule). Fix the seal-dir perms/space and RE-RUN publish "
+                         f"(the durable pin is 'latest wins', so a successful re-publish heals it).",
+                "dangling_pin": True, "schedule_sha256": sha}))
+            sys.exit(1)
         print(json.dumps({
             "published": True, "path": str(sched_path),
             "schedule_version": data["schedule_version"], "schedule_sha256": sha,
@@ -3009,7 +3021,16 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
                           "chain_pinned_sha256": chain_sha}, indent=2))
         print("no valid schedule published at retention.schedule_path", file=sys.stderr)  # ILB
         return
-    on_disk_sha = sha256_hex(Path(sched_path).read_bytes())
+    try:
+        on_disk_sha = sha256_hex(Path(sched_path).read_bytes())
+    except OSError:
+        # C9: TOCTOU — the file vanished (operator rm / re-publish rename) between load_schedule and
+        # this drift re-read. Fall to the fail-closed empty branch, never a raw FileNotFoundError.
+        print(json.dumps({"schedule_present": False, "path": str(sched_path),
+                          "chain_pinned_sha256": chain_sha}, indent=2))
+        print("schedule vanished between load and drift-check (concurrent rm / re-publish)",
+              file=sys.stderr)  # ILB
+        return
     print(json.dumps({
         "schedule_present": True, "path": str(sched_path),
         "schedule_version": sched["schedule_version"], "effective_date": sched["effective_date"],
