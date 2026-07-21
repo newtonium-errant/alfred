@@ -268,10 +268,13 @@ class ScribeRetentionConfig:
     Every field is filesystem-only / a scalar mode, so — like :class:`ScribeEventsConfig` — NO
     sovereign boundary barrier applies (there is no network sub-field here). ``mode`` is
     normalized to exactly ``retained`` or ``transient`` at load (fail-SAFE to ``retained``; see
-    :func:`_normalize_retention_mode`). The three path fields default empty ⇒ the caller derives
-    them (``retained_dir`` under ``<STAYC_DATA>``; the seal pubkey + schedule under the
-    daemon-read-only ``<STAYC_SEAL_DIR>``, §3.1) — a per-instance-correct default, never a
-    single-instance literal.
+    :func:`_normalize_retention_mode`). Empty-path semantics DIFFER by field (C8 — the comments below
+    match actual behavior): ``retained_dir`` empty ⇒ CODE-DERIVED ``<input_dir parent>/retained`` (the
+    sweep's :meth:`RetentionSweep._resolved_retained_dir`, a per-instance-correct default); but
+    ``seal_public_key_path`` empty ⇒ sealing SKIPPED (latched ``no_seal_public_key``) and
+    ``schedule_path`` empty ⇒ over-window surfacing OFF (latched ``no_schedule_published``) — NEITHER
+    is code-derived. Their ``<STAYC_SEAL_DIR>/…`` daemon-read-only siting (§3.1) is a config-TEMPLATE
+    value the operator's config / installer fills, NOT a code default.
 
     Slice 13a (seal lifecycle core) consumes ``mode`` + ``retained_dir`` + ``seal_public_key_path``;
     ``schedule_path`` (§4, slice 13c) and ``abandon_grace_days`` (§3.6, slice 13b) are carried now
@@ -280,14 +283,16 @@ class ScribeRetentionConfig:
 
     # retained (default) | transient — NEVER silently transient (an unknown value ⇒ retained).
     mode: str = RETENTION_MODE_RETAINED
-    # Empty ⇒ derived <STAYC_DATA>/retained (under ReadWritePaths); holds the sealed .sealed blobs
-    # + the relocated transcripts/ ledger copies.
+    # Empty ⇒ CODE-DERIVED <input_dir parent>/retained (the sweep's _resolved_retained_dir; STAY-C:
+    # <STAYC_DATA>/retained, under ReadWritePaths); holds the sealed .age blobs + relocated transcripts.
     retained_dir: str = ""
-    # Empty ⇒ derived <STAYC_SEAL_DIR>/seal_pub.age (daemon-read-only, §3.1). The recipient PUBLIC
-    # key the sweep seals to; the matching PRIVATE key lives OFFLINE (USB ×2), never on the box.
+    # Empty ⇒ sealing SKIPPED (latched no_seal_public_key) — NOT code-derived. The operator's config /
+    # installer sites it at the daemon-read-only <STAYC_SEAL_DIR>/seal_pub.age (§3.1). The recipient
+    # PUBLIC key the sweep seals to; the matching PRIVATE key lives OFFLINE (USB ×2), never on the box.
     seal_public_key_path: str = ""
-    # Empty ⇒ derived <STAYC_SEAL_DIR>/retention_schedule.json (daemon-read-only). The s.50
-    # schedule artifact (slice 13c) — not consumed by 13a.
+    # Empty ⇒ over-window surfacing OFF (latched no_schedule_published) — NOT code-derived. The
+    # operator's config / installer sites it at <STAYC_SEAL_DIR>/retention_schedule.json (§3.1). The
+    # s.50 schedule artifact (slice 13c).
     schedule_path: str = ""
     # Stale-encounter defensive-seal grace (§3.6, slice 13b) — not consumed by 13a.
     abandon_grace_days: int = _DEFAULT_ABANDON_GRACE_DAYS
@@ -488,6 +493,26 @@ def _coerce_nonneg_int(value: Any, default: int) -> int:
     return n if n >= 0 else default
 
 
+def _coerce_grace_days(value: Any, default: int) -> int:
+    """``abandon_grace_days`` floored at 1 (D2). A configured 0 (or negative) makes ``_is_abandoned``
+    fire on freshly-written encounters — §3.6's normative 'never fires inside the grace / never on an
+    encounter still accumulating' invariant collapses (with 0 there IS no grace), sealing an
+    ACTIVELY-recording visit mid-stream. A sub-1 value is REFUSED → the default, with a LOUD config
+    warning (never silently seal active encounters). A non-int nonsense value keeps the default
+    silently, like every other config field."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if n < 1:
+        log.warning(
+            "scribe.retention.abandon_grace_days_floored", configured=n, minimum=1, applied=default,
+            detail="retention.abandon_grace_days must be >= 1 — a 0/negative grace would seal "
+                   "actively-recording encounters mid-stream (§3.6). REFUSED; using the default.")
+        return default
+    return n
+
+
 def _build_events(data: Any) -> ScribeEventsConfig:
     """Schema-tolerant build of :class:`ScribeEventsConfig` (only the ``dir`` string override;
     the facade derives the default from the logging dir). Unknown keys dropped by the
@@ -530,7 +555,7 @@ def _build_retention(data: Any) -> ScribeRetentionConfig:
             v = known[str_field]
             setattr(cfg, str_field, "" if v is None else str(v))
     if "abandon_grace_days" in known:
-        cfg.abandon_grace_days = _coerce_nonneg_int(
+        cfg.abandon_grace_days = _coerce_grace_days(
             known["abandon_grace_days"], _DEFAULT_ABANDON_GRACE_DAYS)
     return cfg
 

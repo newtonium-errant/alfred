@@ -231,6 +231,23 @@ def test_retention_bad_grace_keeps_default():
     assert cfg.retention.abandon_grace_days == 7
 
 
+@pytest.mark.parametrize("bad_grace", [0, -1, -30])
+def test_retention_grace_floored_to_default_with_warning(bad_grace):
+    # D2: a sub-1 abandon_grace_days would seal actively-recording encounters mid-stream (§3.6 has no
+    # grace at 0). It is REFUSED → the default (7) with a LOUD config warning (never silently seal).
+    with structlog.testing.capture_logs() as cap:
+        cfg = load_from_unified({"scribe": {"retention": {"abandon_grace_days": bad_grace}}})
+    assert cfg.retention.abandon_grace_days == 7
+    warns = [c for c in cap if c["event"] == "scribe.retention.abandon_grace_days_floored"]
+    assert len(warns) == 1 and warns[0]["configured"] == bad_grace
+
+
+def test_retention_grace_one_is_the_accepted_floor():
+    # 1 is the inclusive floor — a deliberate 1-day grace is honored (not bumped to the default).
+    cfg = load_from_unified({"scribe": {"retention": {"abandon_grace_days": 1}}})
+    assert cfg.retention.abandon_grace_days == 1
+
+
 # ============================ emitter pins ============================
 
 
