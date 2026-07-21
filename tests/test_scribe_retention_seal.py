@@ -866,7 +866,8 @@ def test_relocate_refuses_to_overwrite_divergent_archived_transcript(tmp_path):
     assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
     assert dest.read_text() == prior                          # prior session's transcript PRESERVED
     assert (enc_dir / f"{_ENC}.transcript.json").is_file()    # source KEPT (both copies survive)
-    assert [c for c in cap if c["event"] == "scribe.retention.ledger_relocate_dest_divergent"]
+    div = [c for c in cap if c["event"] == "scribe.retention.ledger_relocate_dest_divergent"]
+    assert div and "torn" in div[0]["detail"].lower()         # D10: names BOTH causes, not only re-open
 
 
 def test_relocate_idempotent_when_dest_already_identical(tmp_path):
@@ -951,6 +952,27 @@ def test_disposal_residue_keeps_closed_sentinel_for_retry(tmp_path):
     assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
     assert (enc_dir / "_CLOSED").is_file()                   # sentinel KEPT — still disposal-eligible
     assert enc_dir.exists()
+
+
+def test_wipe_dir_vanishes_mid_wipe_is_clean_noop(tmp_path, monkeypatch):
+    # D14: if the dir VANISHES mid-wipe (a concurrent dispose / an operator following the escalation
+    # playbook rmdir's it) AFTER the entry stat, the iterdir FileNotFoundError is a clean idempotent
+    # no-op (objective achieved — dir gone, zero plaintext), NOT a false residue/wipe_incomplete.
+    enc_dir = tmp_path / "inbox" / "vanishing"
+    enc_dir.mkdir(parents=True)
+    (enc_dir / "chunk_1.webm").write_bytes(b"a")
+
+    def _rm_and_noreloc(ed, eid, rd):
+        for f in list(ed.iterdir()):
+            f.unlink()
+        ed.rmdir()                                            # the dir vanishes mid-wipe
+        return False, False
+
+    monkeypatch.setattr(ret_mod, "_relocate_ledger", _rm_and_noreloc)
+    res = ret_mod._relocate_and_wipe(enc_dir, _ENC, tmp_path / "retained",
+                                     chunk_paths=[enc_dir / "chunk_1.webm"])
+    assert res.residue is False and res.dir_removed is True   # clean, not a false wipe_incomplete
+    assert not enc_dir.exists()
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses the 0o000 unsearchable-dir perms")

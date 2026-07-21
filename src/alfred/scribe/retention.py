@@ -692,8 +692,12 @@ def _relocate_ledger(enc_dir: Path, encounter_id: str, retained_dir: Path) -> tu
                 log.error(
                     "scribe.retention.ledger_relocate_dest_divergent", encounter_id=encounter_id,
                     detail="a DIVERGENT transcript already exists at the archive dest for this "
-                           "encounter_id (a same-label re-open) — refusing to overwrite a prior "
-                           "session's archived transcript. Source KEPT; wipe flagged incomplete.")
+                           "encounter_id — refusing to overwrite it. Cause is EITHER a same-label "
+                           "re-open (a prior session's archived transcript) OR a PREVIOUSLY-TORN "
+                           "relocation of THIS session (a first attempt that os.replace'd but failed "
+                           "digest-verify) — D10: the message no longer asserts only the re-open. The "
+                           "in-dir SOURCE is the verified-good copy; reconcile against it, never trust "
+                           "the archived (possibly-torn) dest. Source KEPT; wipe flagged incomplete.")
                 return False, True
         else:
             _atomic_write_bytes(dest, src_bytes)
@@ -755,6 +759,12 @@ def _relocate_and_wipe(
     # meta is SPARED because its chunk file is still present (manifest-scoping preserved).
     try:
         entries = list(enc_dir.iterdir())
+    except FileNotFoundError:
+        # D14: the dir VANISHED mid-wipe (a concurrent dispose / an operator following the escalation
+        # playbook rmdir'd it) — the objective (dir gone, zero plaintext) is achieved → a clean
+        # idempotent no-op, NOT a false residue/wipe_incomplete.
+        return _WipeResult(ledger_relocated=ledger_relocated, unlink_failures=unlink_failures,
+                           dir_removed=True, residue=False)
     except OSError:
         _log_enc_dir_residue(encounter_id, unlink_failures=unlink_failures,
                              ledger_residue=ledger_residue,
@@ -773,6 +783,10 @@ def _relocate_and_wipe(
     # un-relocated ledger. ``iterdir`` on an unsearchable dir folds into residue (R12, findings 11/41).
     try:
         leftovers = [p for p in enc_dir.iterdir() if p.name != CLOSE_SENTINEL_NAME]
+    except FileNotFoundError:
+        # D14: dir vanished mid-wipe → clean idempotent no-op (the objective is achieved), not residue.
+        return _WipeResult(ledger_relocated=ledger_relocated, unlink_failures=unlink_failures,
+                           dir_removed=True, residue=False)
     except OSError:
         _log_enc_dir_residue(encounter_id, unlink_failures=unlink_failures,
                              ledger_residue=ledger_residue,

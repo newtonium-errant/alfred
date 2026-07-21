@@ -861,6 +861,50 @@ def test_recover_gate_routes_lost_state_sealed_encounter(tmp_path):
     assert not enc_dir.exists()                                    # wipe completed (plaintext gone)
 
 
+def test_spared_late_chunk_re_escalates_next_sweep(tmp_path):
+    # D11: after the race spares a late chunk on a NON-closed encounter, its FRESH mtime de-qualifies
+    # the abandoned gate — but the broadened chain-keyed recover gate (no mtime/closed req) re-catches
+    # it every sweep → persistent recovery_mismatch + needs_operator_attention, never signal-quiet.
+    cfg = _config(tmp_path, grace=7)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "late-race", n_chunks=2, closed=False)
+    _age(enc_dir, days=8)
+
+    class _LateSealer(_FakeSealer):
+        def seal(self, plaintext, recipient_public_key):
+            (enc_dir / "chunk_3.webm").write_bytes(b"late")
+            return super().seal(plaintext, recipient_public_key)
+
+    sweep = _sweep(cfg, ev, sealer=_LateSealer())
+    state = ScribeState(tmp_path / "state.json")
+    s1 = sweep._run_sync(state, _NOW)
+    assert s1.wipe_incomplete == 1 and s1.needs_operator_attention() is True
+    # sweep 2: NO re-aging — the spared chunk's mtime is fresh; the recover gate re-catches it.
+    with structlog.testing.capture_logs() as cap:
+        s2 = sweep._run_sync(state, _NOW)
+    assert s2.recovery_mismatch == 1 and s2.skipped == 0      # NOT signal-quiet
+    assert s2.needs_operator_attention() is True
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.needs_operator_attention"]
+    assert (enc_dir / "chunk_3.webm").is_file()               # the spared chunk stays kept
+
+
+def test_abandoned_sealed_recovers_even_without_pubkey(tmp_path):
+    # D13: an un-closed abandoned-gate-sealed encounter that crashed between row and wipe must re-reach
+    # recovery even when the pubkey is later lost (can_seal False) — recovery needs the sealer, not the
+    # pubkey. The chain-keyed recover gate (no can_seal / no _CLOSED requirement) routes it.
+    cfg = _config(tmp_path, with_pubkey=False)               # can_seal False
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "abandoned-sealed", n_chunks=2, closed=False)
+    _write_sweep_recovery_artifacts(cfg, tmp_path, enc_dir, enc_id, ev)   # row + blob + matching sidecar
+    state = ScribeState(tmp_path / "state.json")
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.skipped == 0                               # NOT skipped despite can_seal False
+    assert summary.already_sealed == 1                       # recovery COMPLETED the wipe (chunks match)
+    assert not enc_dir.exists()
+
+
 def test_closed_with_chunks_no_row_still_skipped(tmp_path):
     # The recover gate is CHAIN-keyed: a closed-with-chunks encounter WITHOUT a sealed row (a genuine
     # DRAFTED/INCOMPLETE encounter, the A4 boundary) is still SKIPPED — the gate does not over-fire.

@@ -347,13 +347,16 @@ class RetentionSweep:
             gate = "ready"
         elif not closed and can_seal and self._is_abandoned(enc_dir, now_dt, grace_days):
             gate = "abandoned"
-        elif closed and has_chunks and self._ev.retention_sealed_row(encounter_id) is not None:
-            # finding 30 — recovery reachability keys on the CHAIN, not the DELETABLE pipeline state
-            # file. A crash-between-event-and-wipe encounter is closed WITH chunks; if its ScribeState
-            # entry is lost (a documented 'state is just bookkeeping' reset), it hit neither the ready
-            # gate (needs STATE_READY) nor the abandoned gate (needs NO _CLOSED) and was SKIPPED forever
-            # with plaintext on disk. A durable retention.sealed row is authoritative → route it into
-            # seal_encounter's fail-closed recovery (completes the wipe, or escalates recovery_mismatch).
+        elif has_chunks and self._ev.retention_sealed_row(encounter_id) is not None:
+            # recovery reachability keys on the CHAIN, not deletable/mtime state (finding 30 + D11/D13).
+            # ANY dir with chunks on disk AND a durable retention.sealed row is a crash-between-event-
+            # and-wipe (or a spared late-chunk / abandoned-sealed) encounter — the row is authoritative.
+            # NO ``closed`` requirement (D13: an abandoned-gate seal has no _CLOSED, and its recovery
+            # needs only the sealer, not the pubkey) and NO mtime/grace requirement (D11: a late chunk
+            # spared by the race fix has a FRESH mtime that de-qualifies the abandoned gate — it must
+            # still re-enter recovery and persistently escalate, not go signal-quiet for the grace
+            # window). Route to seal_encounter's fail-closed recovery (completes the wipe, or escalates
+            # recovery_mismatch). A dir with chunks but NO row (fresh/DRAFTED) falls through to skip.
             gate = "recover"
         else:
             # Still accumulating (fresh, un-closed), closed-but-not-yet-READY WITH chunks and no seal
