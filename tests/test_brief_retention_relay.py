@@ -23,11 +23,13 @@ def _cfg(spool_path: str, *, enabled: bool = True, staleness_hours: float = 25.0
         enabled=enabled, spool_path=spool_path, staleness_hours=staleness_hours)
 
 
-def _spool(tmp_path, *, review_due, oldest="enc-0123456789abcdef", generated_at=_GEN_AT):
+def _spool(tmp_path, *, review_due, oldest="enc-0123456789abcdef", generated_at=_GEN_AT,
+           surfaced=True):
     p = tmp_path / "retention_review.spool"
     p.write_text(
         "# STAY-C retention review — relay snapshot\n"
         f"generated_at: {generated_at}\n"
+        f"surfaced: {'true' if surfaced else 'false'}\n"
         f"review_due: {review_due}\n"
         f"oldest_encounter_id: {oldest}\n",
         encoding="utf-8")
@@ -68,6 +70,26 @@ def test_render_never_leaks_phi(tmp_path):
     spool.write_text(spool.read_text() + "\nnote: Jane Doe DOB 1990 chest pain\n", encoding="utf-8")
     out = render_stayc_retention_relay_section(_cfg(str(spool)), _NOW)
     assert "jane" not in out.lower() and "doe" not in out.lower()
+
+
+def test_not_surfaced_is_not_a_false_all_clear(tmp_path):
+    # E3: a FRESH spool whose surfacing did NOT run (surfaced:false — no schedule / unenumerable store)
+    # must NOT render the all-clear; review_due is UNKNOWN.
+    out = render_stayc_retention_relay_section(
+        _cfg(str(_spool(tmp_path, review_due=0, oldest="", surfaced=False))), _NOW)
+    assert "review not evaluated" in out and "UNKNOWN" in out
+    assert "no encounters over" not in out                   # never the false all-clear
+
+
+def test_absent_surfaced_field_fails_safe_to_not_evaluated(tmp_path):
+    # An older spool lacking the surfaced field defaults to did-not-evaluate (fail-safe: never a false
+    # all-clear from a spool written before the field existed).
+    p = tmp_path / "retention_review.spool"
+    p.write_text(
+        "# STAY-C retention review — relay snapshot\n"
+        f"generated_at: {_GEN_AT}\nreview_due: 0\noldest_encounter_id: \n", encoding="utf-8")
+    out = render_stayc_retention_relay_section(_cfg(str(p)), _NOW)
+    assert "review not evaluated" in out
 
 
 def test_absent_spool_renders_no_data(tmp_path):

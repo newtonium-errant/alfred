@@ -569,22 +569,51 @@ def test_review_spool_written_phi_free(tmp_path):
 
     text = spool.read_text()
     assert "review_due: 1" in text
+    assert "surfaced: true" in text                         # E3 — surfacing actually EVALUATED
     assert "oldest_encounter_id: enc-oldest" in text        # opaque id only (PHI-free)
     assert "generated_at:" in text
     assert "jane" not in text.lower() and "doe" not in text.lower()   # no PHI / labels / bodies
 
 
 def test_review_spool_written_even_when_idle_ilb(tmp_path):
-    # C3 ILB: the spool is written EVERY sweep (review_due 0 when nothing due) — a fresh snapshot proves
-    # the sweep is alive; a stale spool surfaces a dead sweep in the brief.
+    # C3 ILB: the spool is written EVERY sweep — a fresh snapshot proves the sweep is alive; a stale
+    # spool surfaces a dead sweep in the brief. E3: with NO schedule, surfacing did NOT run, so the
+    # spool marks surfaced:false (NOT a false all-clear).
     spool = tmp_path / "spool" / "retention_review.spool"
-    cfg = _config(tmp_path)                                  # no schedule → review_due 0
+    cfg = _config(tmp_path)                                  # no schedule → surfacing skipped
     cfg.retention.review_spool_path = str(spool)
 
     _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
 
     text = spool.read_text()
     assert "review_due: 0" in text and "oldest_encounter_id:" in text
+    assert "surfaced: false" in text                        # E3 — did NOT evaluate (no schedule)
+
+
+def test_review_glob_failure_marks_not_surfaced_and_latches(tmp_path, monkeypatch):
+    # E3: an unenumerable blob store (glob raises OSError) ABORTS surfacing — the spool marks
+    # surfaced:false (never a false all-clear) and a distinct enumeration-failed signal latches (it was
+    # silently swallowed). (Deterministic via a scoped Path.glob raise — 3.12 glob swallows perms, so a
+    # chmod can't reproduce it.)
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    spool = tmp_path / "spool" / "retention_review.spool"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    cfg.retention.review_spool_path = str(spool)
+    _publish_sched(cfg, encounter_audio_sealed=1)
+    real_glob = Path.glob
+
+    def _boom_glob(self, pattern):
+        if self.name == "retained":
+            raise OSError("EIO enumerating the blob store")
+        return real_glob(self, pattern)
+
+    monkeypatch.setattr(Path, "glob", _boom_glob)
+    with structlog.testing.capture_logs() as cap:
+        summary = _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.review_surfaced is False
+    assert "surfaced: false" in spool.read_text()
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.review_enumeration_failed"]
 
 
 def test_review_due_latch_rearms_after_resolution(tmp_path):

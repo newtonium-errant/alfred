@@ -192,14 +192,17 @@ def render_stayc_bug_relay_section(config, now_utc: datetime) -> str:
 RETENTION_SECTION_HEADER = "STAY-C Retention Review"
 
 
-def _parse_retention_spool_header(text: str) -> tuple[int | None, str, datetime | None]:
-    """``(review_due, oldest_encounter_id, generated_at)`` from the retention review spool header —
-    the PHI-free fields the sweep's ``_write_review_spool`` writes. ``review_due`` / ``generated_at``
-    are ``None`` when absent/unparseable; ``oldest_encounter_id`` is an OPAQUE salted-HMAC id (safe to
-    render). Defensive line scan (the sweep owns the exact format), never a body descent."""
+def _parse_retention_spool_header(text: str) -> tuple[int | None, str, datetime | None, bool]:
+    """``(review_due, oldest_encounter_id, generated_at, surfaced)`` from the retention review spool
+    header — the PHI-free fields the sweep's ``_write_review_spool`` writes. ``review_due`` /
+    ``generated_at`` are ``None`` when absent/unparseable; ``oldest_encounter_id`` is an OPAQUE
+    salted-HMAC id (safe to render); ``surfaced`` (default False when absent — fail-safe: an older
+    spool without the field is treated as did-not-evaluate, never a false all-clear). Defensive line
+    scan (the sweep owns the exact format), never a body descent."""
     review_due: int | None = None
     oldest = ""
     generated_at: datetime | None = None
+    surfaced = False
     for line in text.splitlines():
         s = line.strip()
         if review_due is None and s.startswith("review_due:"):
@@ -207,6 +210,8 @@ def _parse_retention_spool_header(text: str) -> tuple[int | None, str, datetime 
                 review_due = int(s[len("review_due:"):].strip())
             except ValueError:
                 review_due = None
+        elif s.startswith("surfaced:"):
+            surfaced = s[len("surfaced:"):].strip().lower() == "true"
         elif not oldest and s.startswith("oldest_encounter_id:"):
             oldest = s[len("oldest_encounter_id:"):].strip()
         elif generated_at is None and s.startswith("generated_at:"):
@@ -215,9 +220,7 @@ def _parse_retention_spool_header(text: str) -> tuple[int | None, str, datetime 
                 generated_at = datetime.strptime(raw, _TS_FORMAT).replace(tzinfo=timezone.utc)
             except ValueError:
                 generated_at = None
-        if review_due is not None and generated_at is not None and oldest:
-            break
-    return review_due, oldest, generated_at
+    return review_due, oldest, generated_at, surfaced
 
 
 def render_stayc_retention_relay_section(config, now_utc: datetime) -> str:
@@ -255,7 +258,7 @@ def render_stayc_retention_relay_section(config, now_utc: datetime) -> str:
         log.warning("brief.stayc_retention_relay", state="unreadable", spool_path=spool_path)
         return "**STAY-C retention relay: no data** — review spool unreadable (not UTF-8)."
 
-    review_due, oldest, generated_at = _parse_retention_spool_header(text)
+    review_due, oldest, generated_at, surfaced = _parse_retention_spool_header(text)
     if review_due is None or generated_at is None:
         log.warning("brief.stayc_retention_relay", state="unreadable", spool_path=spool_path,
                     detail="header missing review_due/generated_at")
@@ -273,6 +276,16 @@ def render_stayc_retention_relay_section(config, now_utc: datetime) -> str:
             f"{generated_at.strftime(_TS_FORMAT)} "
             f"({int(age_hours)}h ago, threshold {config.staleness_hours}h). "
             "The box sweep may have stopped."
+        )
+
+    # E3: a FRESH spool whose surfacing did NOT run this sweep (no schedule published / corrupt / the
+    # blob store was unenumerable) must NOT read as an all-clear — review_due is UNKNOWN, not zero.
+    if not surfaced:
+        log.info("brief.stayc_retention_relay", state="not_surfaced")
+        return (
+            "**STAY-C retention: review not evaluated** — the box sweep is alive but over-window "
+            "surfacing did not run (no s.50 schedule published, or the blob store was unreadable). "
+            "review_due is UNKNOWN — publish/repair the schedule."
         )
 
     log.info("brief.stayc_retention_relay", state="fresh", review_due=review_due)

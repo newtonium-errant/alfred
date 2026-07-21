@@ -122,6 +122,8 @@ class RetentionSweepSummary:
     encounter_errors: int = 0        # per-encounter failures, ISOLATED (the sweep continued)
     pruned_telemetry_rows: int = 0   # diarize_stats rows dropped (age-based, PHI-free log rotation)
     review_due: int = 0              # §4 over-window PHI classes surfaced (0 until 13c's schedule)
+    review_surfaced: bool = False    # §4/E3 — did surfacing actually EVALUATE this tick? (False when
+    #                                  skipped/aborted — distinguishes 'ran, 0 due' from 'did not run')
     oldest_review_encounter_id: str = ""  # §4/C3 — the oldest over-window encounter (opaque id, for the spool)
     sealing_available: bool = True   # was the seal path usable (active store + sealer + pubkey)
     schedule_present: bool = False   # was an s.50 schedule found (False until 13c)
@@ -451,6 +453,7 @@ class RetentionSweep:
         window_days = sched_mod.class_window_days(schedule, sched_mod.SURFACED_PHI_CLASS)
         if window_days is None:
             summary.review_due = 0
+            summary.review_surfaced = True  # EVALUATED: the class is never-pruned → definitively 0 due
             self._latched.discard("review_due")  # never-pruned now → clear any prior due latch
             return
         retained_dir = self._resolved_retained_dir()
@@ -461,7 +464,14 @@ class RetentionSweep:
         try:
             blobs = list(retained_dir.glob(f"*{ret.SEAL_BLOB_SUFFIX}"))
         except OSError:
-            return  # can't enumerate the blob store → surface nothing this sweep (best-effort)
+            # E3: the enumeration ABORTED (unenumerable blob store) — surfacing did NOT run, so
+            # review_surfaced stays False (the spool must NOT publish a false all-clear). Emit a
+            # latched signal (was silently swallowed) so the operator sees the enumeration failure.
+            self._latch_log(
+                "review_glob_failed", "scribe.retention.sweep.review_enumeration_failed",
+                detail="the sealed-blob store could not be enumerated for over-window surfacing — "
+                       "review_due is UNKNOWN this sweep (NOT an all-clear). Latched.")
+            return
         # E2: build the {encounter_id: sealed ts} map in ONE chain query, then dict-lookup per blob —
         # C5's per-blob retention_sealed_row was a full-chain scan PER blob (O(blobs × rows), wedges as
         # the deployment ages). Best-effort: an observability query failure → empty map → mtime basis.
@@ -478,6 +488,7 @@ class RetentionSweep:
                     oldest_id = blob.stem                    # <encounter_id>.age → opaque id, PHI-free
         summary.review_due = due
         summary.oldest_review_encounter_id = oldest_id
+        summary.review_surfaced = True  # EVALUATED: the blob store was enumerated against a real window
         if due > 0:
             self._latch_log(
                 "review_due",
@@ -539,6 +550,10 @@ class RetentionSweep:
         lines = [
             "# STAY-C retention review — relay snapshot",
             f"generated_at: {now_dt.strftime(self._REVIEW_SPOOL_TS)}",
+            # E3: 'surfaced' distinguishes an EVALUATED all-clear (surfaced true, review_due 0) from a
+            # SKIPPED/ABORTED run (surfaced false — no schedule / corrupt / unenumerable store). The
+            # brief must NOT render a false 'nothing due' when surfacing did not actually run.
+            f"surfaced: {'true' if summary.review_surfaced else 'false'}",
             f"review_due: {summary.review_due}",
             f"oldest_encounter_id: {summary.oldest_review_encounter_id}",
         ]
