@@ -101,6 +101,12 @@ _CHUNK_NAME_RE = re.compile(r"^chunk_(\d+)$")
 # destroyed the verify-failed KEPT ledger + any late-arriving/unexpected file).
 _META_SUFFIX = ".meta.json"
 
+# ``chunk_<seq>.meta.json`` — group(1) is the CHUNK stem (``chunk_<seq>``). Used by the wipe's
+# orphan-meta cleanup (D4): a meta whose chunk file is GONE is a crash-orphan of a sealed chunk (a
+# meta carries no audio; the pipeline creates a meta ONLY alongside a chunk), so it is safe to wipe —
+# and leaving it turned a crash-mid-wipe into a PERMANENT wipe_incomplete loop.
+_META_NAME_RE = re.compile(r"^(chunk_\d+)\.meta\.json$")
+
 # --- SealOutcome status vocabulary (slice 13b's sweep summary consumes these) -----------------
 SEAL_STATUS_SEALED = "sealed"
 SEAL_STATUS_ALREADY_SEALED = "already_sealed"
@@ -722,9 +728,29 @@ def _relocate_and_wipe(
     for chunk_path in chunk_paths:
         if not _unlink_quiet(chunk_path):
             unlink_failures += 1
-        sidecar = enc_dir / (chunk_path.stem + _META_SUFFIX)
-        if not _unlink_quiet(sidecar):
+        meta = enc_dir / (chunk_path.stem + _META_SUFFIX)
+        if not _unlink_quiet(meta):
             unlink_failures += 1
+
+    # ORPHAN-META CLEANUP (D4): after the chunk wipe, a ``chunk_<seq>.meta.json`` whose chunk file is
+    # GONE is a crash-orphan of a sealed chunk (chunk unlinked pre-crash, meta survived) — safe to wipe
+    # (a meta carries no audio) and REQUIRED to wipe, else a crash-mid-wipe becomes a permanent
+    # wipe_incomplete loop (the 'completable subset' closure must hold for metas too). A LATE chunk's
+    # meta is SPARED because its chunk file is still present (manifest-scoping preserved).
+    try:
+        entries = list(enc_dir.iterdir())
+    except OSError:
+        _log_enc_dir_residue(encounter_id, unlink_failures=unlink_failures,
+                             ledger_residue=ledger_residue,
+                             reason="the encounter dir is unsearchable after the wipe — residue")
+        return _WipeResult(
+            ledger_relocated=ledger_relocated, unlink_failures=unlink_failures, residue=True)
+    present_chunk_stems = {p.stem for p in entries if _CHUNK_NAME_RE.match(p.stem)}
+    for p in entries:
+        m = _META_NAME_RE.match(p.name)
+        if m and m.group(1) not in present_chunk_stems:  # orphan meta (its chunk is gone)
+            if not _unlink_quiet(p):
+                unlink_failures += 1
 
     # Determine residue: anything left in the dir OTHER than ``_CLOSED`` (a late chunk not in the
     # manifest, the kept ledger, an unexpected nested entry) is residue; so is any unlink failure or
@@ -850,7 +876,17 @@ def seal_encounter(
             "scribe.retention.no_chunks", encounter_id=encounter_id,
             detail="no audio chunks present + not closed — nothing to seal yet (ran, nothing to do).")
         return SealOutcome(status=SEAL_STATUS_NO_CHUNKS, encounter_id=encounter_id)
-    gathered = [(seq, p.name, p.read_bytes()) for (p, seq) in chunks]
+    try:
+        gathered = [(seq, p.name, p.read_bytes()) for (p, seq) in chunks]
+    except OSError:
+        # D3 (fresh-seal leg — less severe, no durable row yet): an unreadable chunk during the gather
+        # must NOT escape as an untyped PermissionError — abort the seal, plaintext INTACT, retry next
+        # sweep (a typed verify_failed the sweep tallies, never a wipe on an incomplete gather).
+        log.error(
+            "scribe.retention.seal_gather_unreadable", encounter_id=encounter_id,
+            detail="a chunk could NOT be read while gathering for the seal (perms / IO error) — "
+                   "ABORTED before any durable row or wipe; plaintext left intact, retry next sweep.")
+        return SealOutcome(status=SEAL_STATUS_VERIFY_FAILED, encounter_id=encounter_id)
     manifest_list = [
         {"seq": seq, "sha256": sha256_hex(data), "bytes": len(data)}
         for (seq, _name, data) in gathered
@@ -1036,7 +1072,20 @@ def _recover_already_sealed(
     sidecar_by_seq = {int(m["seq"]): m["sha256"] for m in sidecar["manifest"]
                       if isinstance(m, dict) and "seq" in m and "sha256" in m}
     for (p, seq) in chunks:
-        if seq not in sidecar_by_seq or sha256_hex(p.read_bytes()) != sidecar_by_seq[seq]:
+        try:
+            on_disk_sha = sha256_hex(p.read_bytes())
+        except OSError:
+            # D3: an UNREADABLE chunk (EACCES/EIO) must NOT escape as an untyped PermissionError the
+            # sweep miscounts as a generic encounter_error — it is a fail-closed recovery refusal (a
+            # row-present encounter whose plaintext we cannot verify), so escalate recovery_mismatch,
+            # NO wipe, needs_operator_attention fires.
+            log.error(
+                "scribe.retention.recovery_chunk_unreadable", encounter_id=encounter_id,
+                detail="an on-disk chunk could NOT be read (perms / IO error) during recovery subset "
+                       "verification — REFUSING to wipe (never destroy plaintext we cannot verify is "
+                       "covered by the seal). Operator must reconcile the file perms. recovery_mismatch.")
+            return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+        if seq not in sidecar_by_seq or on_disk_sha != sidecar_by_seq[seq]:
             log.error(
                 "scribe.retention.recovery_manifest_mismatch", encounter_id=encounter_id,
                 on_disk_chunks=len(chunks), row_chunks=payload.get("chunk_count"),

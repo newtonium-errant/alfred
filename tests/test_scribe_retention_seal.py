@@ -1142,6 +1142,78 @@ def test_recovery_refuses_sidecar_not_matching_row(tmp_path):
     assert [c for c in cap if c["event"] == "scribe.retention.recovery_sidecar_mismatch"]
 
 
+# ====== D3/D4 — unreadable-chunk escalation + orphan-meta cleanup ======
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses 0o000 read-denial")
+def test_recovery_unreadable_chunk_escalates_not_raises(tmp_path):
+    # D3: an UNREADABLE chunk (EACCES/EIO) during the recovery subset check must escalate a typed
+    # recovery_mismatch (NO wipe), never an untyped PermissionError the sweep miscounts as a generic
+    # encounter_error while the fail-closed escalation channel stays silent.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=1)
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)         # row + blob + matching sidecar
+    os.chmod(enc_dir / "chunk_1.webm", 0o000)                # unreadable AFTER the sidecar was built
+    try:
+        with structlog.testing.capture_logs() as cap:
+            out = _seal(tmp_path, enc_dir, ev)
+    finally:
+        os.chmod(enc_dir / "chunk_1.webm", 0o600)
+    assert out.status == SEAL_STATUS_RECOVERY_MISMATCH       # typed escalation, not a raise
+    assert (enc_dir / "chunk_1.webm").is_file()              # NEVER wiped
+    assert [c for c in cap if c["event"] == "scribe.retention.recovery_chunk_unreadable"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses 0o000 read-denial")
+def test_fresh_seal_unreadable_chunk_verify_failed_not_raises(tmp_path):
+    # D3 (fresh-seal leg): an unreadable chunk during the gather aborts as a TYPED verify_failed
+    # (plaintext intact, no durable row), never an untyped PermissionError.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=1)
+    os.chmod(enc_dir / "chunk_1.webm", 0o000)
+    try:
+        with structlog.testing.capture_logs() as cap:
+            out = _seal(tmp_path, enc_dir, ev)
+    finally:
+        os.chmod(enc_dir / "chunk_1.webm", 0o600)
+    assert out.status == SEAL_STATUS_VERIFY_FAILED
+    assert (enc_dir / "chunk_1.webm").is_file()
+    assert _sealed_rows(ev) == []                            # no durable row (aborted before step 4)
+    assert [c for c in cap if c["event"] == "scribe.retention.seal_gather_unreadable"]
+
+
+def test_orphan_meta_crash_mid_wipe_recovery_completes(tmp_path):
+    # D4: crash mid-wipe leaves a chunk GONE but its chunk_<seq>.meta.json orphaned. Recovery
+    # subset-verifies the surviving chunks, wipes them, AND wipes the orphan meta → the dir is removed
+    # and recovery COMPLETES (already_sealed) — never a permanent wipe_incomplete loop.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=3)
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)         # row + blob + sidecar for all 3
+    (enc_dir / "chunk_1.webm").unlink()                      # crash: chunk_1 gone, its meta survives
+    assert (enc_dir / "chunk_1.meta.json").is_file()         # the orphan meta
+    out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_ALREADY_SEALED          # completes, no permanent loop
+    assert not enc_dir.exists()                              # dir removed (orphan meta wiped)
+
+
+def test_late_chunk_and_its_meta_both_spared(tmp_path):
+    # D4 protection: a LATE chunk WITH a meta (both arrive mid-seal) is spared in FULL — the orphan
+    # cleanup only wipes a meta whose chunk file is GONE, so a present late chunk's meta stays.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=2)
+
+    class _LateWithMeta(_FakeSealer):
+        def seal(self, plaintext, recipient_public_key):
+            (enc_dir / "chunk_3.webm").write_bytes(b"late-audio")
+            (enc_dir / "chunk_3.meta.json").write_text("{}", encoding="utf-8")
+            return super().seal(plaintext, recipient_public_key)
+
+    out = _seal(tmp_path, enc_dir, ev, sealer=_LateWithMeta())
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert (enc_dir / "chunk_3.webm").is_file()              # late chunk spared
+    assert (enc_dir / "chunk_3.meta.json").is_file()         # AND its meta spared (chunk present)
+
+
 def test_age_verify_wellformed_rejects_truncated_blob(tmp_path):
     # R4 (findings 8/21/23): the structural age-v1 check rejects a blob truncated before its MAC line
     # or with an empty payload — cases the old 19-byte prefix check accepted.

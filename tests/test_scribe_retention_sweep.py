@@ -376,6 +376,28 @@ def test_booming_encounter_is_isolated_sweep_continues(tmp_path):
     assert [c for c in cap if c["event"] == "scribe.retention.sweep.encounter_error"]
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses 0o000 read-denial")
+def test_sweep_unreadable_chunk_recovery_escalates_operator_attention(tmp_path):
+    # D3 (sweep-level): an unreadable chunk in a row-present recovery surfaces as recovery_mismatch +
+    # needs_operator_attention, NOT a silent generic encounter_error — the fail-closed PHI-residue
+    # escalation channel must fire.
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "unreadable-recover", closed=True)
+    _write_sweep_recovery_artifacts(cfg, tmp_path, enc_dir, enc_id, ev)   # row + blob + matching sidecar
+    os.chmod(enc_dir / "chunk_1.webm", 0o000)
+    state = ScribeState(tmp_path / "state.json")             # no state entry → chain-keyed recover gate
+    try:
+        with structlog.testing.capture_logs() as cap:
+            summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+    finally:
+        os.chmod(enc_dir / "chunk_1.webm", 0o600)
+    assert summary.recovery_mismatch == 1 and summary.encounter_errors == 0
+    assert summary.needs_operator_attention() is True
+    assert (enc_dir / "chunk_1.webm").is_file()              # never wiped
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.needs_operator_attention"]
+
+
 def test_abandoned_gate_late_chunk_survives_row_undercounts(tmp_path):
     # D1 (HIGH-3 end-to-end, sweep abandoned gate): a chunk that arrives DURING seal() survives the
     # manifest-scoped wipe, the durable row attests the GATHERED count, and the sweep escalates
