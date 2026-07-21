@@ -252,3 +252,36 @@ def test_run_wires_state_path_and_enters_loop_without_nameerror(tmp_path, monkey
     assert seen["events_threaded"] is True  # #11 — the event-store facade reaches the sweep
     # the state file path was under logging.dir (no NameError building it)
     assert (tmp_path / "scribe_state.json") == Path(_state_path(raw, None))
+
+
+def test_retention_sweep_runs_even_when_run_sweep_raises(tmp_path, monkeypatch):
+    # finding 18: the retention sweep is a SIBLING of run_sweep + the maintenance calls in the daemon
+    # tick, not nested in one try where an upstream raise skips everything downstream. Make run_sweep
+    # raise a persistent error (an unreadable inbox class) and assert the retention sweep STILL runs —
+    # its own graceful degradation (ILB summary, telemetry prune, store gate) is designed to survive
+    # exactly that. Before the fix (shared try), the raise skipped retention forever.
+    #
+    # MUTATION-BIND: re-nest retention_sweep.run() inside run_sweep's try in daemon.py and this test
+    # hangs/fails — run_sweep's raise is caught by the shared except and retention.run is never reached,
+    # so _StopLoop never propagates.
+    import alfred.scribe.pipeline as pl
+    import alfred.scribe.retention_sweep as rs
+    seen = {"retention_ran": False}
+
+    async def _boom_sweep(config, state, vault_path, **kwargs):
+        raise RuntimeError("inbox unreadable — a persistent per-tick raise upstream of retention")
+
+    async def _record_retention(self, state, **kwargs):
+        seen["retention_ran"] = True
+        raise _StopLoop            # break the loop once we've PROVEN retention was reached
+
+    monkeypatch.setattr(pl, "run_sweep", _boom_sweep)
+    monkeypatch.setattr(rs.RetentionSweep, "run", _record_retention)
+
+    raw = _sovereign_raw(
+        logging={"dir": str(tmp_path)},
+        vault={"path": str(tmp_path / "vault")},
+    )
+    with pytest.raises(_StopLoop):
+        asyncio.run(scribe_run(raw, env={}))
+    assert seen["retention_ran"] is True   # retention ran despite run_sweep raising every tick

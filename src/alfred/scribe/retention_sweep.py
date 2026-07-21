@@ -46,6 +46,7 @@ safe to add without risking the re-opened-encounter destruction path — deferre
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from dataclasses import dataclass
@@ -60,7 +61,7 @@ from alfred.scribe.close_manifest import CLOSE_SENTINEL_NAME
 from alfred.scribe.config import (
     RETENTION_MODE_RETAINED, RETENTION_MODE_TRANSIENT, ScribeConfig,
 )
-from alfred.scribe.enroll_learning import CAPTURE_NAME, LEARNING_DIRNAME
+from alfred.scribe.enroll_learning import CAPTURE_NAME, LEARNING_DIRNAME, capture_sink_lock
 from alfred.scribe.identity import EncounterIdentityError, compute_encounter_id
 from alfred.scribe.state import STATE_READY, ScribeState
 
@@ -82,14 +83,21 @@ _AGE_RECIPIENT_PREFIX = "age1"
 
 
 def _parse_iso(ts: Any) -> datetime | None:
-    """Parse an ISO-8601 ``ts`` (the enroll-sink row + event timestamp shape). ``None`` on anything
-    unparseable — the caller treats an undateable row as NOT-positively-old (preserve, never drop)."""
+    """Parse an ISO-8601 ``ts`` (the enroll-sink row + event timestamp shape) to a TIMEZONE-AWARE
+    datetime. ``None`` on anything unparseable OR on a tz-NAIVE timestamp — the caller compares against
+    an aware cutoff, so a naive value would raise ``TypeError`` and crash the whole prune every tick
+    (finding 16). A naive ts cannot be positively dated in a definite zone, so it is treated as
+    undateable → the caller PRESERVES it (never drop a row we cannot positively date; the enroll sink's
+    own writer always emits aware UTC, so a naive row is foreign / hand-edited / older-version)."""
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+    if dt.tzinfo is None:
+        return None  # tz-naive → undateable → PRESERVE (never crash the aware-cutoff comparison)
+    return dt
 
 
 @dataclass
@@ -288,27 +296,43 @@ class RetentionSweep:
         closed = (enc_dir / CLOSE_SENTINEL_NAME).exists()
         st = state.get(encounter_id)
         is_ready = st is not None and st.state == STATE_READY
+        has_chunks = ret.encounter_has_chunks(enc_dir)
+        dispose_empty = False
 
-        if closed and not ret.encounter_has_chunks(enc_dir):
+        if closed and not has_chunks:
             # §E — a CLOSED zero-chunk encounter (clinician opened, no audio, /close) is DISPOSED, not
             # sealed: the PHI-named dir must not persist with 'nothing to do' logged forever. Needs no
             # crypto (nothing to seal), so it proceeds even when can_seal is False (pre-13d keygen).
             gate = "empty_closed"
+        elif not closed and not has_chunks and self._is_abandoned(enc_dir, now_dt, grace_days):
+            # E-EXTENSION — a stale-ABANDONED zero-chunk dir (no _CLOSED, no audio, past the abandon
+            # grace) is likewise DISPOSED (else it leaks a patient-named dir forever while logging
+            # no_chunks). Needs no crypto; the seal path disposes it via dispose_empty.
+            gate = "empty_abandoned"
+            dispose_empty = True
         elif is_ready and can_seal:
             gate = "ready"
         elif not closed and can_seal and self._is_abandoned(enc_dir, now_dt, grace_days):
             gate = "abandoned"
+        elif closed and has_chunks and self._ev.retention_sealed_row(encounter_id) is not None:
+            # finding 30 — recovery reachability keys on the CHAIN, not the DELETABLE pipeline state
+            # file. A crash-between-event-and-wipe encounter is closed WITH chunks; if its ScribeState
+            # entry is lost (a documented 'state is just bookkeeping' reset), it hit neither the ready
+            # gate (needs STATE_READY) nor the abandoned gate (needs NO _CLOSED) and was SKIPPED forever
+            # with plaintext on disk. A durable retention.sealed row is authoritative → route it into
+            # seal_encounter's fail-closed recovery (completes the wipe, or escalates recovery_mismatch).
+            gate = "recover"
         else:
-            # Still accumulating (fresh, un-closed), closed-but-not-yet-READY WITH chunks
-            # (DRAFTED/INCOMPLETE — the pipeline's own signals cover it), inside the abandon grace, or
-            # a READY/abandoned encounter we cannot seal yet (no key) → not eligible this sweep.
+            # Still accumulating (fresh, un-closed), closed-but-not-yet-READY WITH chunks and no seal
+            # row (DRAFTED/INCOMPLETE — the pipeline's own signals cover it), inside the abandon grace,
+            # or a READY/abandoned encounter we cannot seal yet (no key) → not eligible this sweep.
             summary.skipped += 1
             return
 
         outcome = ret.seal_encounter(
             enc_dir, encounter_id, events=self._ev, sealer=sealer,
             recipient_public_key=pubkey, retained_dir=retained_dir,
-            mode=cfg.retention.mode, now=now_iso)
+            mode=cfg.retention.mode, now=now_iso, dispose_empty=dispose_empty)
         self._tally(outcome.status, gate, summary)
 
     @staticmethod
@@ -404,10 +428,11 @@ class RetentionSweep:
         sink); emits NO ``retention.*`` event (log rotation, not a PHI destruction). Returns the row
         count dropped (folded into the sweep summary — intentionally-left-blank).
 
-        Concurrency note: the sink's only writer is the pipeline (``record_diarize_stats`` during
-        ``run_sweep``), which runs strictly BEFORE this sweep within the daemon tick; the ingest
-        server (the only other loop task) never writes the telemetry sink — so this read-then-rewrite
-        has no concurrent appender."""
+        Concurrency (finding 19): the sink has a CROSS-PROCESS appender the original note missed — the
+        ``alfred scribe attest`` CLI's ``record_attest_outcome`` appends from a separate process,
+        uncorrelated with daemon ticks. So the read-then-rewrite IS raced. Both the appender and this
+        prune hold the STABLE capture-sink lock (:func:`capture_sink_lock`) across their critical
+        section, so an append can't land between this read and the ``os.replace`` and be clobbered."""
         enrollment_dir = self._config.diarize.enrollment_dir
         if not enrollment_dir:
             return 0  # the voice-enrollment feature is dormant — no sink to prune (summary shows 0)
@@ -415,6 +440,13 @@ class RetentionSweep:
         if not sink.is_file():
             return 0
         cutoff = now_dt - timedelta(days=_DIARIZE_STATS_PRUNE_DAYS)
+        # Hold the sink lock across READ + REWRITE (finding 19) so a concurrent attest-CLI append is
+        # serialized, not clobbered by the read-then-replace snapshot.
+        with capture_sink_lock(enrollment_dir):
+            return self._prune_sink_locked(sink, cutoff)
+
+    def _prune_sink_locked(self, sink: Path, cutoff: datetime) -> int:
+        """The read → age-filter → atomic-rewrite body, run UNDER the capture-sink lock."""
         kept: list[str] = []
         dropped = 0
         try:
@@ -431,7 +463,7 @@ class RetentionSweep:
                         continue
                     dt = _parse_iso(row.get("ts")) if isinstance(row, dict) else None
                     if dt is None:
-                        kept.append(line)   # undateable row → PRESERVE
+                        kept.append(line)   # undateable / tz-naive row → PRESERVE (finding 16)
                         continue
                     if dt < cutoff:
                         dropped += 1        # positively over-window → DROP (counted)
@@ -441,7 +473,14 @@ class RetentionSweep:
             return 0  # a read error must never crash the sweep — the prune is best-effort
         if dropped == 0:
             return 0  # nothing aged out → no rewrite (never churn the sink every tick)
-        self._atomic_rewrite_lines(sink, kept)
+        try:
+            self._atomic_rewrite_lines(sink, kept)
+        except OSError:
+            log.warning(
+                "scribe.retention.sweep.prune_rewrite_failed",
+                detail="the diarize_stats prune rewrite failed (disk/perms) — rows NOT dropped this "
+                       "tick; the stale .prune.tmp is cleaned up, retry next tick. Best-effort.")
+            return 0
         return dropped
 
     @staticmethod
@@ -455,9 +494,19 @@ class RetentionSweep:
         try:
             os.write(fd, data.encode("utf-8"))
             os.fsync(fd)
-        finally:
+        except BaseException:
             os.close(fd)
-        os.replace(tmp, path)
+            with contextlib.suppress(OSError):
+                tmp.unlink()  # never leave a stale .prune.tmp on a write/fsync failure (finding 16 sibling)
+            raise
+        else:
+            os.close(fd)
+        try:
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()  # replace failed — clean the tmp so it does not accrete each tick
+            raise
 
     # --- resource resolution ---------------------------------------------
 
@@ -512,18 +561,31 @@ class RetentionSweep:
         try:
             recipient = p.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
+            # finding 37: an unreadable key file (perms 0000 / EIO) previously returned b"" SILENTLY —
+            # the ONLY unlatched branch. Latch an observation so the operator greps a key signal, not
+            # just a bare sealing_available=False in the summary.
+            self._latch_log(
+                "pubkey_unreadable",
+                "scribe.retention.sweep.seal_public_key_unreadable",
+                detail="the configured retention.seal_public_key_path exists but could NOT be read "
+                       "(perms / IO error) — retention sealing is SKIPPED until it is readable. "
+                       "Latched once.")
             return b""
-        if not recipient.startswith(_AGE_RECIPIENT_PREFIX):
+        # finding 17: a full bech32 canonical check (not a bare 'age1' prefix) — a truncated/typo'd
+        # recipient that still starts with 'age1' would otherwise clear the check, leave
+        # sealing_available=True, and fail EVERY seal with an anonymous per-encounter SealError loop.
+        if not ret.is_valid_age_recipient(recipient):
             self._latch_log(
                 "pubkey_malformed",
                 "scribe.retention.sweep.seal_public_key_malformed",
-                detail=f"the seal public key is not an age recipient (expected an '{_AGE_RECIPIENT_PREFIX}"
-                       f"…' string) — retention sealing is SKIPPED (a wrong key would seal to an "
-                       f"un-openable recipient). Latched once.")
+                detail=f"the seal public key is not a canonical age recipient (an '{_AGE_RECIPIENT_PREFIX}"
+                       f"…' bech32 string with a valid checksum + a non-degenerate point) — retention "
+                       f"sealing is SKIPPED (a malformed key would fail every seal). Latched once.")
             return b""
-        # A good key clears any prior absent/malformed latch so a later disappearance re-warns.
+        # A good key clears any prior absent/malformed/unreadable latch so a later regression re-warns.
         self._latched.discard("no_pubkey")
         self._latched.discard("pubkey_malformed")
+        self._latched.discard("pubkey_unreadable")
         return recipient.encode("utf-8")
 
     # --- latch helper -----------------------------------------------------

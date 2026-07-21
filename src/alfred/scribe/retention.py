@@ -246,6 +246,45 @@ def _bech32_convertbits(data: list[int], frombits: int, tobits: int) -> list[int
     return ret
 
 
+def _bech32_polymod(values: list[int]) -> int:
+    """The BIP-173 bech32 checksum polymod."""
+    gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5):
+            chk ^= gen[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def is_valid_age_recipient(recipient: str) -> bool:
+    """True iff ``recipient`` is a CANONICAL ``age1…`` bech32 recipient — valid checksum, a whole
+    32-byte payload, NOT a degenerate/low-order point. The sweep's ``_resolve_pubkey`` uses this
+    instead of a bare ``startswith('age1')`` prefix test so a bech32-INVALID but age1-prefixed key (a
+    truncated / typo'd paste — finding 17) is caught + latched as ``seal_public_key_malformed`` BEFORE
+    any seal attempt, rather than surfacing as an anonymous per-encounter ``SealError`` loop under a
+    summary that falsely claims sealing is available. Pure-Python (no pyrage) so the sweep stays
+    dep-agnostic; ``AgeSealer._recipient`` still does the authoritative parse at seal time."""
+    s = recipient.strip()
+    if s.lower() != s and s.upper() != s:
+        return False  # mixed case is invalid bech32
+    s = s.lower()
+    if not s.startswith("age1"):
+        return False
+    data_part = s[len("age1"):]
+    if len(data_part) < 6 or any(c not in _BECH32_CHARSET for c in data_part):
+        return False
+    data = [_BECH32_CHARSET.index(c) for c in data_part]
+    hrp_expand = [ord(c) >> 5 for c in "age"] + [0] + [ord(c) & 31 for c in "age"]
+    if _bech32_polymod(hrp_expand + data) != 1:
+        return False  # bad checksum
+    point = _bech32_convertbits(data[:-6], 5, 8)
+    if point is None or len(point) != 32 or bytes(point) in _LOW_ORDER_X25519:
+        return False
+    return True
+
+
 def _decode_age_recipient_point(recipient: str) -> bytes | None:
     """Decode an ``age1…`` recipient's 5-bit data (minus the 6-char checksum) to its 32-byte X25519
     u-coordinate, or ``None`` if it is not shaped like a bech32 ``age`` recipient. This is a SCREEN for

@@ -65,11 +65,13 @@ The sink is APPEND-ONLY JSONL, so a late schema migration is painful — the fie
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import structlog
 
@@ -77,6 +79,7 @@ log = structlog.get_logger(__name__)
 
 LEARNING_DIRNAME = "learning"
 CAPTURE_NAME = "attest_capture.jsonl"
+CAPTURE_LOCK_NAME = ".attest_capture.lock"
 AUDIT_NAME = "audit.log"
 
 KIND_DIARIZE_STATS = "diarize_stats"
@@ -87,29 +90,66 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _append_jsonl(path: Path, row: dict[str, Any], *, enrollment_dir: str | Path) -> None:
+@contextlib.contextmanager
+def capture_sink_lock(enrollment_dir: str | Path) -> Iterator[None]:
+    """Serialize every writer of the ``attest_capture`` sink — the daemon pipeline's
+    ``record_diarize_stats``, the attest CLI's ``record_attest_outcome`` (a SEPARATE process), and the
+    retention sweep's rolling prune — via an exclusive ``flock`` on a STABLE lock file. The sink itself
+    is rotated by ``os.replace`` (the prune), so flocking the sink fd is unreliable — the pre-replace
+    inode gets orphaned and a blocked appender would write to the dead inode, silently losing the row
+    (finding 19). The lock file's inode never moves, so serializing on it is correct. Best-effort: if
+    the lock cannot be opened/acquired, proceed WITHOUT it (the guarded loss is a single PHI-free
+    telemetry row — never fail a valid attest or wedge the sweep over a lock)."""
+    lock_path = Path(enrollment_dir) / LEARNING_DIRNAME / CAPTURE_LOCK_NAME
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _append_jsonl(path: Path, row: dict[str, Any], *, enrollment_dir: str | Path,
+                  lock_sink: bool = False) -> None:
     """Append one JSON line, creating the dir tree 0700 and the file 0600.
 
     ``mkdir(parents=True)`` creates ancestors at the UMASK default (typically 0755), so
     the enrollment ROOT and ``learning/`` would be world-listable whenever the first write
     under the store is an audit/capture row (a rejected /enroll/start, or a no-preset
     encounter's diarize_stats) rather than a preset. The frozen DATA MODEL fixes the whole
-    store at 0700 — chmod the root AND the target dir. Caller wraps fail-silent."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    for d in (Path(enrollment_dir), path.parent):
-        try:
-            os.chmod(d, 0o700)
-        except OSError:
-            pass
-    # Newly-created file → 0600; an existing file keeps its mode.
-    existed = path.exists()
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row) + "\n")
-    if not existed:
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+    store at 0700 — chmod the root AND the target dir. Caller wraps fail-silent.
+
+    ``lock_sink`` serializes the append against the retention prune's read-then-replace rewrite via
+    the stable capture-sink lock (finding 19) — set ONLY for the capture sink the prune rotates, not
+    the append-only audit log."""
+    ctx = capture_sink_lock(enrollment_dir) if lock_sink else contextlib.nullcontext()
+    with ctx:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for d in (Path(enrollment_dir), path.parent):
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+        # Newly-created file → 0600; an existing file keeps its mode.
+        existed = path.exists()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        if not existed:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
 
 
 def _capture_path(enrollment_dir: str | Path) -> Path:
@@ -178,7 +218,7 @@ def record_diarize_stats(
             "diarized": bool(diarized),
             "best_cosine": best_cosine, "separation": separation,
             "min_purity": min_purity, "fail_closed_demotions": int(fail_closed_demotions),
-        }, enrollment_dir=enrollment_dir)
+        }, enrollment_dir=enrollment_dir, lock_sink=True)   # serialize vs the prune rewrite (finding 19)
     except Exception:  # noqa: BLE001 — capture must NEVER affect the pipeline
         log.warning("scribe.enroll_learning.capture_error", kind=KIND_DIARIZE_STATS,
                     source_id=source_id, detail="diarize_stats capture failed — SWALLOWED")
@@ -205,7 +245,7 @@ def record_attest_outcome(
             "source_id": source_id, "user": user, "preset_id": preset_id,
             "centroid_version": centroid_version, "reason": reason,
             "kept": bool(kept), "is_banner": bool(is_banner),
-        }, enrollment_dir=enrollment_dir)
+        }, enrollment_dir=enrollment_dir, lock_sink=True)   # serialize vs the prune rewrite (finding 19)
     except Exception:  # noqa: BLE001 — capture must NEVER fail a valid attest
         log.warning("scribe.enroll_learning.capture_error", kind=KIND_ATTEST_OUTCOME,
                     source_id=source_id, detail="attest_outcome capture failed — SWALLOWED")

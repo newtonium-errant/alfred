@@ -21,6 +21,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 import structlog
 
 from alfred.scribe.config import (
@@ -29,6 +30,8 @@ from alfred.scribe.config import (
 from alfred.scribe.enroll_learning import (
     CAPTURE_NAME, KIND_ATTEST_OUTCOME, KIND_DIARIZE_STATS, LEARNING_DIRNAME,
 )
+from alfred.evstore import sha256_hex
+from alfred.scribe import retention as ret_mod
 from alfred.scribe.events import CLINICAL, ScribeEvents
 from alfred.scribe.identity import compute_encounter_id
 from alfred.scribe.retention import SEAL_BLOB_SUFFIX
@@ -37,9 +40,10 @@ from alfred.scribe.state import STATE_DRAFTED, STATE_READY, ScribeState
 
 _NOW = datetime(2026, 7, 19, 9, 0, 0, tzinfo=timezone.utc)
 _SALT = "test-salt"
-# An obviously-fake age recipient (age1… prefix is all the sweep's _resolve_pubkey checks; the fake
-# sealer ignores the content). NOT a real key — no round-trip runs against it.
-_TEST_AGE_RECIPIENT = "age1examplefakerecipientnotarealkeyxxxxxxxxxxxxxxxxxxxxxx"
+# A CANONICAL age recipient (valid bech32 checksum, non-degenerate point — payload = bytes 1..32).
+# The sweep's _resolve_pubkey now does a full bech32 verify (finding 17), so the old malformed
+# placeholder would be (correctly) rejected. The fake sealer still ignores the content — no round-trip.
+_TEST_AGE_RECIPIENT = "age1qypqxpq9qcrsszg2pvxq6rs0zqg3yyc5z5tpwxqergd3c8g7rusqmwn7f2"
 
 
 # --- doubles -----------------------------------------------------------------
@@ -567,3 +571,176 @@ def test_recovery_mismatch_surfaced(tmp_path):
     assert summary.needs_operator_attention() is True
     assert (enc_dir / "chunk_1.webm").is_file()                # plaintext INTACT (never wiped)
     assert [c for c in cap if c["event"] == "scribe.retention.sweep.needs_operator_attention"]
+
+
+# ============================ sweep robustness (R8 — findings 16/17/18/19/37) ============================
+
+
+def test_prune_preserves_tz_naive_row_never_crashes(tmp_path):
+    # finding 16: a tz-NAIVE ts row must not crash the prune (an aware cutoff vs a naive dt raises
+    # TypeError, killing the whole prune + the ILB summary + the needs_operator_attention emission
+    # every tick). A naive row is undateable → PRESERVED; genuinely-old aware rows still drop.
+    cfg = _config(tmp_path)
+    naive = json.dumps({"kind": KIND_DIARIZE_STATS, "ts": "2026-07-19T12:00:00", "source_id": "naive"})
+    old = _row(KIND_DIARIZE_STATS, 200, source_id="old-aware")
+    fresh = _row(KIND_DIARIZE_STATS, 5, source_id="fresh")
+    sink = _write_sink(cfg, [naive, old, fresh])
+
+    dropped = _sweep(cfg, _events(tmp_path))._prune_diarize_stats(_NOW)   # must not raise
+
+    remaining = sink.read_text().splitlines()
+    assert dropped == 1                                        # only the old AWARE row dropped
+    assert naive in remaining                                  # the tz-naive row PRESERVED (undateable)
+    assert fresh in remaining
+    assert old not in remaining
+
+
+def test_malformed_bech32_pubkey_skips_seal_latched(tmp_path):
+    # finding 17: an age1-prefixed but bech32-INVALID recipient (a truncated paste) previously cleared
+    # the bare prefix check → sealing_available=True while EVERY seal failed with an anonymous
+    # per-encounter SealError. Now the full bech32 verify catches it → sealing_available=False + a
+    # LATCHED seal_public_key_malformed key signal (not an encounter-attributed loop).
+    cfg = _config(tmp_path)
+    Path(cfg.retention.seal_public_key_path).write_text(_TEST_AGE_RECIPIENT[:-1], encoding="utf-8")
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "bad-checksum-visit")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+
+    with structlog.testing.capture_logs() as cap:
+        sweep = _sweep(cfg, ev)
+        sweep._run_sync(state, _NOW)
+        summary = sweep._run_sync(state, _NOW)
+
+    assert summary.sealing_available is False and summary.sealed_ready == 0
+    assert enc_dir.exists()                                    # not sealed (nothing attempted)
+    assert summary.encounter_errors == 0                       # NOT an anonymous per-encounter loop
+    latched = [c for c in cap if c["event"] == "scribe.retention.sweep.seal_public_key_malformed"]
+    assert len(latched) == 1                                   # latched ONCE across two sweeps
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses 0o000 unreadable-file perms")
+def test_unreadable_pubkey_latched(tmp_path):
+    # finding 37: an unreadable key file (perms 0000 / EIO) previously returned b"" SILENTLY — the ONLY
+    # unlatched _resolve_pubkey branch. Now it latches a key-unreadable observation so the operator
+    # greps a key signal, not just a bare sealing_available=False.
+    cfg = _config(tmp_path)
+    keyfile = Path(cfg.retention.seal_public_key_path)
+    os.chmod(keyfile, 0o000)
+    ev = _events(tmp_path)
+    state = ScribeState(tmp_path / "state.json")
+    try:
+        with structlog.testing.capture_logs() as cap:
+            summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+    finally:
+        os.chmod(keyfile, 0o600)
+    assert summary.sealing_available is False
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.seal_public_key_unreadable"]
+
+
+def test_empty_abandoned_zero_chunk_disposed(tmp_path):
+    # E-EXTENSION: a stale-ABANDONED zero-chunk dir (no _CLOSED, no audio, past grace) is DISPOSED —
+    # the PHI-named dir must not leak forever while logging no_chunks. Needs no crypto.
+    cfg = _config(tmp_path, grace=7)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "abandoned-empty-visit", n_chunks=0, closed=False)
+    _age(enc_dir, days=8)
+    state = ScribeState(tmp_path / "state.json")
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.empty_disposed == 1 and summary.sealed_abandoned == 0
+    assert not enc_dir.exists()                                # PHI-named dir removed
+    assert ev.query(CLINICAL, family="retention") == []        # nothing sealed ⇒ NO retention event
+
+
+def test_empty_abandoned_inside_grace_left_alone(tmp_path):
+    # A zero-chunk un-closed dir INSIDE the grace is NOT disposed (a chunk may still arrive) — the
+    # E-extension only fires past the abandon grace.
+    cfg = _config(tmp_path, grace=7)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "empty-fresh-visit", n_chunks=0, closed=False)
+    _age(enc_dir, days=1)
+    state = ScribeState(tmp_path / "state.json")
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.empty_disposed == 0 and summary.skipped == 1
+    assert enc_dir.exists()
+
+
+def _write_sweep_recovery_artifacts(cfg, tmp_path, enc_dir, enc_id, ev):
+    """Emit a sealed row + blob + matching sidecar for enc_dir's on-disk chunks under the sweep's
+    derived retained_dir (a faithful crash-between-event-and-wipe)."""
+    chunks = ret_mod._discover_seal_chunks(enc_dir)
+    manifest = [{"seq": s, "sha256": sha256_hex(p.read_bytes()), "bytes": len(p.read_bytes())}
+                for (p, s) in chunks]
+    ev.retention_sealed(subject_id=enc_id, chunk_count=len(manifest),
+                        total_bytes=sum(m["bytes"] for m in manifest),
+                        manifest_sha256=ret_mod._manifest_digest(manifest), sealed_to_key_fp="fp",
+                        cipher="age-x25519")
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    blob = b"FAKESEAL1-recovered"
+    (retained / f"{enc_id}{SEAL_BLOB_SUFFIX}").write_bytes(blob)
+    ret_mod._write_manifest_sidecar(retained, enc_id, manifest, sha256_hex(blob))
+
+
+def test_recover_gate_routes_lost_state_sealed_encounter(tmp_path):
+    # finding 30: a closed-WITH-chunks encounter whose ScribeState entry is LOST (a 'state is just
+    # bookkeeping' reset) but which has a durable retention.sealed row was SKIPPED forever with
+    # plaintext on disk (it hit neither the ready gate nor the abandoned gate). The recover gate keys on
+    # the CHAIN and routes it into fail-closed recovery → completes the wipe.
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "lost-state-visit", closed=True)
+    _write_sweep_recovery_artifacts(cfg, tmp_path, enc_dir, enc_id, ev)
+    state = ScribeState(tmp_path / "state.json")   # NO entry for enc_id (state lost)
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.already_sealed == 1 and summary.skipped == 0   # routed to recovery, NOT skipped
+    assert not enc_dir.exists()                                    # wipe completed (plaintext gone)
+
+
+def test_closed_with_chunks_no_row_still_skipped(tmp_path):
+    # The recover gate is CHAIN-keyed: a closed-with-chunks encounter WITHOUT a sealed row (a genuine
+    # DRAFTED/INCOMPLETE encounter, the A4 boundary) is still SKIPPED — the gate does not over-fire.
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "drafting-visit", closed=True)
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_DRAFTED)
+
+    summary = _sweep(cfg, ev)._run_sync(state, _NOW)
+
+    assert summary.skipped == 1 and summary.already_sealed == 0
+    assert enc_dir.exists()
+
+
+def test_capture_sink_lock_is_exclusive(tmp_path):
+    # finding 19: capture_sink_lock is a REAL exclusive flock on a STABLE lock file — while held, a
+    # second (different-fd) non-blocking acquisition of the same lock file FAILS. This is the mutual
+    # exclusion that serializes the attest-CLI append against the prune's read-then-replace rewrite so
+    # a concurrent append is never clobbered (the sink itself is rotated, so flocking IT is unreliable).
+    import fcntl
+
+    from alfred.scribe.enroll_learning import (
+        CAPTURE_LOCK_NAME, LEARNING_DIRNAME, capture_sink_lock,
+    )
+    enroll = tmp_path / "enroll"
+    lock_file = enroll / LEARNING_DIRNAME / CAPTURE_LOCK_NAME
+    with capture_sink_lock(enroll):
+        fd = os.open(lock_file, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # held by the CM → cannot acquire
+        finally:
+            os.close(fd)
+    # after release the lock is acquirable again
+    fd2 = os.open(lock_file, os.O_RDWR)
+    try:
+        fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)          # now succeeds
+        fcntl.flock(fd2, fcntl.LOCK_UN)
+    finally:
+        os.close(fd2)

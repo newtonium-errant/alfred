@@ -268,23 +268,34 @@ async def run(
             except Exception:  # noqa: BLE001 — observability scan, never gates the daemon
                 log.exception("scribe.daemon.boot_post_attest_scan_error")
             while True:
+                # Each tick step is INDEPENDENTLY wrapped (finding 18): a persistent raise in an
+                # EARLIER step (e.g. an unreadable inbox in run_sweep, or a maintenance scan) must NOT
+                # starve the LATER steps — in particular the retention sweep, whose own graceful
+                # degradation (per-encounter isolation, the ILB summary, the telemetry prune, the
+                # store gate) is designed to survive exactly that class of failure. They are SIBLINGS,
+                # not nested in one try where an upstream error skips everything downstream.
                 try:
                     await run_sweep(config, state, vault_path, events=events)
-                    # Event-store maintenance (design §4/§5.3/§5.5): all self-latched +
-                    # best-effort. Independent of sweep work (VAULT-STATE observations run
-                    # every tick, not gated behind an idle early-return).
-                    maint.heartbeat_if_due()
-                    maint.post_attest_edit_scan(vault_path)
-                    maint.flush_suppressed_if_new_day()
-                    # Retention sweep (#13 §3, slice 13b) — own try/except so a retention failure is
-                    # cleanly attributed and never masks the maintenance calls above; the sweep also
-                    # isolates per-encounter failures internally, so an exception never wedges the loop.
-                    try:
-                        await retention_sweep.run(state)
-                    except Exception:  # noqa: BLE001 — best-effort; a retention error never kills the loop
-                        log.exception("scribe.daemon.retention_sweep_error")
-                except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop
+                except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop OR starve retention
                     log.exception("scribe.daemon.sweep_error")
+                # Event-store maintenance (design §4/§5.3/§5.5): all self-latched + best-effort.
+                # Independent of sweep work (VAULT-STATE observations run every tick, not gated behind
+                # an idle early-return). Each wrapped so one failure never starves the next.
+                for _step, _call in (
+                    ("heartbeat", maint.heartbeat_if_due),
+                    ("post_attest_edit_scan", lambda: maint.post_attest_edit_scan(vault_path)),
+                    ("flush_suppressed", maint.flush_suppressed_if_new_day),
+                ):
+                    try:
+                        _call()
+                    except Exception:  # noqa: BLE001 — best-effort maintenance, never wedges the loop
+                        log.exception("scribe.daemon.maintenance_error", step=_step)
+                # Retention sweep (#13 §3) — a SIBLING of the above, reached regardless of any earlier
+                # step's failure; the sweep isolates per-encounter failures internally too.
+                try:
+                    await retention_sweep.run(state)
+                except Exception:  # noqa: BLE001 — best-effort; a retention error never kills the loop
+                    log.exception("scribe.daemon.retention_sweep_error")
                 await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
     finally:
         if server is not None:
