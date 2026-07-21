@@ -948,6 +948,26 @@ def test_dispose_empty_disposes_unclosed_zero_chunk_dir(tmp_path):
     assert [c for c in cap if c["event"] == "scribe.retention.empty_encounter_disposed"]
 
 
+def test_seal_on_vanished_dir_returns_typed_status_not_raise(tmp_path):
+    # findings 35/R6: seal_encounter (retained, no chain row) on a VANISHED dir must return a typed
+    # status (no_chunks), never a bare FileNotFoundError from an unguarded discovery iterdir — a
+    # TOCTOU between the sweep's enumeration and _process_one (an operator/concurrent dispose).
+    ev = _events(tmp_path)
+    out = seal_encounter(tmp_path / "inbox" / "gone", _ENC, events=ev, sealer=_FakeSealer(),
+                         recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained")
+    assert out.status == SEAL_STATUS_NO_CHUNKS
+
+
+def test_transient_wipe_on_vanished_dir_is_typed_noop(tmp_path):
+    # findings 32/R6: transient-mode seal_encounter on a VANISHED dir is a typed idempotent no-op
+    # (transient_wiped, chunk_count 0), never a FileNotFoundError.
+    ev = _events(tmp_path)
+    out = seal_encounter(tmp_path / "inbox" / "gone", _ENC, events=ev, sealer=_FakeSealer(),
+                         recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained",
+                         mode=RETENTION_MODE_TRANSIENT)
+    assert out.status == SEAL_STATUS_TRANSIENT_WIPED and out.chunk_count == 0
+
+
 def test_unclosed_zero_chunk_without_dispose_flag_left_alone(tmp_path):
     # Without dispose_empty (default) an OPEN zero-chunk dir is still left alone (no_chunks) — the
     # E-extension only disposes when the sweep positively determines stale-abandonment.
