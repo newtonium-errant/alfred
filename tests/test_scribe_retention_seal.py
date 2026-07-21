@@ -1037,3 +1037,110 @@ def test_transient_wipe_obstruction_surfaces_incomplete(tmp_path, monkeypatch):
     assert (enc_dir / "chunk_1.webm").is_file()
     assert [c for c in cap if c["event"] == "scribe.retention.wipe_incomplete"]
     assert not [c for c in cap if c["event"] == "scribe.retention.transient_wiped"]
+
+
+# ====== atomic-write durability (R7 / R11 — findings 7/22/25/27/28/39) ======
+
+
+def test_write_all_drains_short_writes(tmp_path, monkeypatch):
+    # finding 27 (R11): _write_all writes EVERY byte even when os.write returns a SHORT count (a single
+    # os.write can transfer < len — the >2 GiB cap / ENOSPC / a signal). Cap os.write at 7 bytes/call
+    # and assert the full payload lands; the single-`os.write` mutant would truncate at 7 bytes.
+    real_write = os.write
+    calls = []
+
+    def _short_write(fd, data):
+        n = real_write(fd, bytes(data[:7]))                  # transfer at most 7 bytes per call
+        calls.append(n)
+        return n
+
+    payload = b"x" * 100
+    target = tmp_path / "blob.bin"
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        monkeypatch.setattr(os, "write", _short_write)
+        ret_mod._write_all(fd, payload)
+    finally:
+        os.close(fd)
+    assert target.read_bytes() == payload                    # every byte written despite short writes
+    assert len(calls) >= 2 and max(calls) <= 7               # the loop actually iterated (not one write)
+
+
+def test_atomic_write_unlinks_tmp_on_replace_failure(tmp_path, monkeypatch):
+    # finding 28: an os.replace failure (EROFS/EACCES between fsync and rename) must NOT leave the
+    # full-payload .tmp behind — after fsync the tmp holds the COMPLETE (possibly plaintext transcript)
+    # payload, which the 13d destroy path would miss by canonical name.
+    target = tmp_path / "retained" / "x.transcript.json"
+
+    def _boom_replace(src, dst):
+        raise OSError("EROFS: read-only fs after an IO error")
+
+    monkeypatch.setattr(os, "replace", _boom_replace)
+    with pytest.raises(OSError):
+        ret_mod._atomic_write_bytes(target, b"full-plaintext-transcript-payload")
+    assert not target.with_name(target.name + ".tmp").exists()   # tmp cleaned up on the replace failure
+    assert not target.exists()
+
+
+def test_blob_rename_dir_fsync_fires_after_replace(tmp_path, monkeypatch):
+    # finding 25 (R11): _atomic_write_bytes must fsync the parent dir AFTER os.replace so the RENAME
+    # (the dirent) is power-loss durable BEFORE the caller's durable retention.sealed row. Spy-pin the
+    # call ORDER — the mutant dropping the post-replace _fsync_dir ('remove redundant fsyncs') must
+    # FAIL this. Durability has no functional end-state assert; a call/order spy is the in-style pin.
+    calls = []
+    real_replace = os.replace
+    real_fsync_dir = ret_mod._fsync_dir
+
+    def _spy_replace(src, dst):
+        calls.append(("replace", str(dst)))
+        return real_replace(src, dst)
+
+    def _spy_fsync_dir(path):
+        calls.append(("fsync_dir", str(path)))
+        return real_fsync_dir(path)
+
+    monkeypatch.setattr(os, "replace", _spy_replace)
+    monkeypatch.setattr(ret_mod, "_fsync_dir", _spy_fsync_dir)
+    target = tmp_path / "retained" / "blob.age"
+    ret_mod._atomic_write_bytes(target, b"age-blob-bytes")
+    assert ("replace", str(target)) in calls
+    ri = max(i for i, c in enumerate(calls) if c == ("replace", str(target)))
+    assert any(c == ("fsync_dir", str(target.parent)) for c in calls[ri + 1:]), \
+        "the parent-dir fsync must fire AFTER os.replace (rename durability)"
+
+
+def test_mkdir_durable_fsyncs_parent_of_each_created_level(tmp_path, monkeypatch):
+    # findings 7/39: creating retained/ + retained/transcripts/ must fsync the PARENT of each new
+    # level (POSIX: a new dir's dirent lives in its PARENT). The pre-fix code fsynced the newly created
+    # dir ITSELF, leaving the dirents that NAME the subtree non-durable → assert the PARENTS are synced.
+    fsynced = []
+    real_fsync_dir = ret_mod._fsync_dir
+
+    def _spy(path):
+        fsynced.append(str(path))
+        return real_fsync_dir(path)
+
+    monkeypatch.setattr(ret_mod, "_fsync_dir", _spy)
+    base = tmp_path / "data"
+    base.mkdir()
+    target = base / "retained" / "transcripts" / "x.json"
+    ret_mod._atomic_write_bytes(target, b"payload")
+    assert str(base) in fsynced                              # records the 'retained' dirent
+    assert str(base / "retained") in fsynced                # records the 'transcripts' dirent
+
+
+def test_seal_aborts_before_durable_row_on_dir_fsync_failure(tmp_path, monkeypatch):
+    # finding 22: a dir-fsync EIO (the kernel's ONLY signal a rename dirent may be lost) must NOT be
+    # swallowed — the seal ABORTS before the durable retention.sealed row + the plaintext wipe.
+    # Fail-closed: plaintext intact, no row.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+
+    def _boom_fsync_dir(path):
+        raise OSError("EIO on the retained dir fsync")
+
+    monkeypatch.setattr(ret_mod, "_fsync_dir", _boom_fsync_dir)
+    with pytest.raises(OSError):
+        _seal(tmp_path, enc_dir, ev)
+    assert (enc_dir / "chunk_1.webm").is_file()              # plaintext intact — never wiped
+    assert _sealed_rows(ev) == []                            # no durable row (aborted before step 4)

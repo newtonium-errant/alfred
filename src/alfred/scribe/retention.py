@@ -406,19 +406,35 @@ def _fsync_dir(path: Path) -> None:
     """fsync a DIRECTORY fd so a rename/create within it is power-loss durable — POSIX rename
     durability requires fsyncing the CONTAINING dir, not just the file (the file fsync alone leaves
     the dir entry in the page cache). Mirrors ``evstore._fsync_dir`` (store.py:594), the discipline
-    the repo already applies to durable event appends. Best-effort: a dir that cannot be opened for
-    fsync never crashes the seal (the fail direction is safe — a lost rename leaves plaintext, and
-    the already-sealed recovery is now blob-existence-gated)."""
-    try:
-        dfd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    the repo already applies to durable event appends. RAISES on failure (finding 22): a dir-fsync
+    EIO is the kernel's ONLY signal that the rename/create dirent may be lost — swallowing it let the
+    seal proceed to the durable ``retention.sealed`` row + the plaintext wipe with the durability
+    guarantee VOID. The caller (blob/sidecar write, BEFORE the durable row) aborts on the raise →
+    fail-closed, plaintext intact, retry next sweep."""
+    dfd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(dfd)
-    except OSError:
-        pass
     finally:
         os.close(dfd)
+
+
+def _mkdir_durable(leaf: Path) -> None:
+    """``mkdir(parents=True)`` then fsync the PARENT of EVERY level that was newly created — a new
+    directory's own dirent lives in its PARENT, not in itself, so fsyncing the created dir (the
+    pre-fix bug, findings 7/39) never made the dirent that NAMES it durable. Creating
+    ``retained/`` + ``retained/transcripts/`` fsyncs the data dir (records ``retained``) AND
+    ``retained/`` (records ``transcripts``). A dir-fsync failure RAISES (finding 22, via
+    :func:`_fsync_dir`)."""
+    missing: list[Path] = []
+    p = leaf
+    while not p.exists():
+        missing.append(p)
+        if p.parent == p:  # filesystem root — stop
+            break
+        p = p.parent
+    leaf.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for created_dir in missing:
+        _fsync_dir(created_dir.parent)  # the parent now holds the new dir's dirent — make it durable
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -450,17 +466,18 @@ def _unlink_quiet(path: Path) -> bool:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomic, fsync-durable byte write: temp → FULL write → fsync(file) → ``os.replace`` →
-    fsync(dir), 0600. The DIRECTORY fsync makes the RENAME durable, so the sealed blob is truly on
-    stable storage BEFORE the durable ``retention.sealed`` row references it (§3.3 step 2, findings
-    1/10/11); the full-write loop defeats a short ``os.write`` (findings 9/13/17); the tmp is
-    unlinked on ANY write/fsync failure so a partial (possibly-plaintext) file is never left behind
-    (finding 21). Raises on a write/fsync error (the caller's fail-closed path handles it)."""
+    """Atomic, fsync-durable byte write: mkdir-durable → temp → FULL write → fsync(file) →
+    ``os.replace`` → fsync(dir), 0600. The DIRECTORY fsync makes the RENAME durable, so the sealed
+    blob is truly on stable storage BEFORE the durable ``retention.sealed`` row references it (§3.3
+    step 2); the full-write loop defeats a short ``os.write`` (findings 9/13/17); the tmp is unlinked
+    on ANY write/fsync failure AND on an ``os.replace`` failure (findings 21/28 — after fsync the tmp
+    holds the FULL payload) so a partial-or-full plaintext file is never left behind; each newly
+    created dir level fsyncs its PARENT (findings 7/39); every dir fsync RAISES on failure so a lost
+    dirent aborts the caller BEFORE its durable row (finding 22). Raises on any write/fsync/replace
+    error (the caller's fail-closed path handles it)."""
     parent = path.parent
-    created = not parent.exists()
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if created:
-        _fsync_dir(parent)  # make the retained/ (transcripts/) dir creation itself durable
+    _mkdir_durable(parent)  # create + fsync-durable each NEW level's parent (findings 7/39; raises on
+                            # a dir-fsync failure — the caller aborts BEFORE the durable row, finding 22)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -472,8 +489,13 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
     else:
         os.close(fd)
-    os.replace(tmp, path)
-    _fsync_dir(parent)      # make the RENAME (the dir entry) power-loss durable (POSIX)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        _unlink_quiet(tmp)  # finding 28: the .tmp now holds the FULL payload — never leave it behind
+        raise
+    _fsync_dir(parent)      # make the RENAME (the dir entry) power-loss durable (POSIX); a dir-fsync
+                            # EIO here RAISES and aborts the caller before its durable row (finding 22)
 
 
 @dataclass(frozen=True)
