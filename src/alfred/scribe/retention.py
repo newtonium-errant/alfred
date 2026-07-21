@@ -79,6 +79,12 @@ SEAL_MANIFEST_NAME = "manifest.json"
 # retention must seal EVERY audio chunk, so a new/unknown container is never silently left unsealed.
 _CHUNK_NAME_RE = re.compile(r"^chunk_(\d+)$")
 
+# The per-chunk meta sidecar suffix (``chunk_<seq>.meta.json``). The manifest-scoped wipe (§3.3 step 5)
+# removes EXACTLY the manifest chunk files + their meta sidecar — derived from the chunk STEM so the
+# wipe set is deterministic, never a blanket iterdir loop (findings 1/2/3/4/5 — a blanket loop
+# destroyed the verify-failed KEPT ledger + any late-arriving/unexpected file).
+_META_SUFFIX = ".meta.json"
+
 # --- SealOutcome status vocabulary (slice 13b's sweep summary consumes these) -----------------
 SEAL_STATUS_SEALED = "sealed"
 SEAL_STATUS_ALREADY_SEALED = "already_sealed"
@@ -297,7 +303,11 @@ def _discover_seal_chunks(enc_dir: Path) -> list[tuple[Path, int]]:
     (so ``chunk_10`` follows ``chunk_2``). Excludes ``.meta.json`` sidecars, ``_CLOSED``, and the
     transcript ledger by stem-matching (see ``_CHUNK_NAME_RE``)."""
     found: list[tuple[Path, int]] = []
-    for p in Path(enc_dir).iterdir():
+    try:
+        entries = list(Path(enc_dir).iterdir())
+    except FileNotFoundError:
+        return []  # a vanished dir → no chunks (idempotent no-op, findings 32/35 — never raise here)
+    for p in entries:
         if not p.is_file():
             continue
         m = _CHUNK_NAME_RE.match(p.stem)
@@ -407,66 +417,156 @@ class _WipeResult:
     residue: bool = False
 
 
-def _relocate_and_wipe(enc_dir: Path, encounter_id: str, retained_dir: Path) -> _WipeResult:
-    """§3.3 step 5 + §3.4 disposition — RELOCATE the transcript ledger out of the (possibly-PHI-
-    label) encounter dir into ``<retained_dir>/transcripts/`` (kept plaintext under LUKS, Jamie's
-    active artifact), then WIPE every remaining plaintext file (chunks, meta, ``_CLOSED``) and
-    remove the label-named dir. Idempotent: a no-op if the dir is already gone (the crash-between-4-
-    and-5 recovery re-runs this). Never raises — IO failures fold into the returned :class:`_WipeResult`
-    so the caller surfaces residue rather than a false 'wiped' claim."""
-    enc_dir = Path(enc_dir)
-    if not enc_dir.exists():
-        return _WipeResult(dir_removed=True, residue=False)  # already gone — a clean idempotent no-op
+def _relocate_ledger(enc_dir: Path, encounter_id: str, retained_dir: Path) -> tuple[bool, bool]:
+    """RELOCATE the transcript ledger (§3.4) out of the (possibly-PHI-label) encounter dir into
+    ``<retained_dir>/transcripts/`` — the keep-forever clinical transcript. Returns
+    ``(relocated, residue)``:
 
-    ledger_relocated = False
-    ledger_residue = False
+      * ``relocated`` — the source was safely unlinked (a verified copy exists at the dest).
+      * ``residue``  — the source was KEPT (relocation could not be verified, or the dest already
+                       holds a DIVERGENT transcript for this encounter_id). The source is NEVER
+                       destroyed against an unverified/divergent dest (findings 1/2/3/4/5).
+
+    NEVER raises — IO failures fold into ``residue=True`` (R12). The source ledger is only ever
+    removed on a verified relocation; the manifest-scoped wipe loop below NEVER touches it."""
     src_ledger = ledger.ledger_path(enc_dir, encounter_id)
-    if src_ledger.is_file():
-        dest = ledger.ledger_path(Path(retained_dir) / "transcripts", encounter_id)
-        try:
-            src_bytes = src_ledger.read_bytes()
-            _atomic_write_bytes(dest, src_bytes)
-            # DIGEST-VERIFY the relocated copy BEFORE destroying the source — never unlink the only
-            # other copy of a keep-forever clinical transcript (§3.4) against a truncated/unverified
-            # destination (finding 4). A short write already raised inside _atomic_write_bytes; this
-            # catches a torn replace / silent divergence too.
-            relocated_ok = sha256_hex(dest.read_bytes()) == sha256_hex(src_bytes)
-        except OSError:
-            relocated_ok = False
-        if relocated_ok and _unlink_quiet(src_ledger):
-            ledger_relocated = True
+    try:
+        if not src_ledger.is_file():
+            return False, False  # no ledger to move (a ledger-less encounter is clean here)
+        src_bytes = src_ledger.read_bytes()
+    except OSError:
+        # cannot even read the source ledger — KEEP it, flag residue (never a false 'relocated').
+        log.error(
+            "scribe.retention.ledger_relocate_verify_failed", encounter_id=encounter_id,
+            detail="the transcript ledger could not be read for relocation — source KEPT; wipe "
+                   "flagged incomplete, retry next sweep.")
+        return False, True
+    dest = ledger.ledger_path(Path(retained_dir) / "transcripts", encounter_id)
+    try:
+        # DEST-COLLISION (R2, finding 3): an encounter_id is deterministic from (label, salt), so a
+        # same-label re-open resolves the SAME dest. If the dest already holds this encounter's
+        # transcript, NEVER blindly overwrite it (that would destroy a prior session's archived copy):
+        #   byte-identical  ⇒ already-relocated (idempotent crash recovery) → unlink the source.
+        #   DIVERGENT       ⇒ a different session's archived transcript → KEEP both, escalate.
+        if dest.exists():
+            dest_bytes = dest.read_bytes()
+            if dest_bytes == src_bytes:
+                relocated_ok = True  # already archived (identical) — safe to drop the source
+            else:
+                log.error(
+                    "scribe.retention.ledger_relocate_dest_divergent", encounter_id=encounter_id,
+                    detail="a DIVERGENT transcript already exists at the archive dest for this "
+                           "encounter_id (a same-label re-open) — refusing to overwrite a prior "
+                           "session's archived transcript. Source KEPT; wipe flagged incomplete.")
+                return False, True
         else:
-            ledger_residue = True
-            log.error(
-                "scribe.retention.ledger_relocate_verify_failed", encounter_id=encounter_id,
-                detail="the relocated transcript did not verify against the source (or the source "
-                       "could not be unlinked) — source KEPT (never destroy the only good copy of a "
-                       "keep-forever clinical transcript). Wipe flagged incomplete; retry next sweep.")
+            _atomic_write_bytes(dest, src_bytes)
+            # DIGEST-VERIFY the relocated copy BEFORE destroying the source (finding 4/6) — never
+            # unlink the only other copy of a keep-forever clinical transcript against a
+            # truncated/torn/diverged destination. A short write already raised inside
+            # _atomic_write_bytes; this catches a torn replace / silent divergence too.
+            relocated_ok = sha256_hex(dest.read_bytes()) == sha256_hex(src_bytes)
+    except OSError:
+        relocated_ok = False
+    if relocated_ok and _unlink_quiet(src_ledger):
+        return True, False
+    log.error(
+        "scribe.retention.ledger_relocate_verify_failed", encounter_id=encounter_id,
+        detail="the relocated transcript did not verify against the source (or the source could not "
+               "be unlinked) — source KEPT (never destroy the only good copy of a keep-forever "
+               "clinical transcript). Wipe flagged incomplete; retry next sweep.")
+    return False, True
 
+
+def _relocate_and_wipe(
+    enc_dir: Path, encounter_id: str, retained_dir: Path, *, chunk_paths: list[Path],
+) -> _WipeResult:
+    """§3.3 step 5 + §3.4 disposition — RELOCATE the transcript ledger, then WIPE EXACTLY the
+    manifest-listed chunk files (``chunk_paths``) + their ``.meta.json`` sidecars, then remove
+    ``_CLOSED`` LAST and rmdir the label-named dir. MANIFEST-SCOPED (R1): the wipe set is derived
+    from ``chunk_paths`` — NEVER a blanket ``iterdir`` unlink — so a late-arriving chunk, the
+    verify-failed KEPT ledger, or any unexpected file SURVIVES and is surfaced as residue (findings
+    1/2/3/4/5). Ordering (R6): the ledger is relocated first; ``_CLOSED`` is removed only after every
+    manifest file is gone AND the ledger is relocated AND no unexpected entry remains — so a failed
+    step never loses the eligibility sentinel (findings 15/40). Idempotent: a gone dir is a clean
+    no-op (R6). NEVER raises — every IO failure (incl. an unsearchable dir, findings 11/41) folds
+    into ``residue`` (R12); the caller surfaces residue rather than a false 'wiped' claim."""
+    enc_dir = Path(enc_dir)
+    try:
+        if not enc_dir.exists():
+            return _WipeResult(dir_removed=True, residue=False)  # already gone — clean idempotent no-op
+    except OSError:
+        # cannot even stat the dir (unsearchable ancestor) — treat as residue, never raise (R12).
+        _log_enc_dir_residue(encounter_id, unlink_failures=0, ledger_residue=False,
+                             reason="the encounter dir could not be stat'd (unsearchable) — residue")
+        return _WipeResult(residue=True)
+
+    ledger_relocated, ledger_residue = _relocate_ledger(enc_dir, encounter_id, retained_dir)
+
+    # WIPE the manifest chunk set ONLY: each chunk file + its derived ``.meta.json`` sidecar.
     unlink_failures = 0
-    for p in sorted(enc_dir.iterdir()):
-        if p.is_file():
-            if not _unlink_quiet(p):
-                unlink_failures += 1
+    for chunk_path in chunk_paths:
+        if not _unlink_quiet(chunk_path):
+            unlink_failures += 1
+        sidecar = enc_dir / (chunk_path.stem + _META_SUFFIX)
+        if not _unlink_quiet(sidecar):
+            unlink_failures += 1
+
+    # Determine residue: anything left in the dir OTHER than ``_CLOSED`` (a late chunk not in the
+    # manifest, the kept ledger, an unexpected nested entry) is residue; so is any unlink failure or
+    # un-relocated ledger. ``iterdir`` on an unsearchable dir folds into residue (R12, findings 11/41).
+    try:
+        leftovers = [p for p in enc_dir.iterdir() if p.name != CLOSE_SENTINEL_NAME]
+    except OSError:
+        _log_enc_dir_residue(encounter_id, unlink_failures=unlink_failures,
+                             ledger_residue=ledger_residue,
+                             reason="the encounter dir is unsearchable after the wipe — residue")
+        return _WipeResult(
+            ledger_relocated=ledger_relocated, unlink_failures=unlink_failures, residue=True)
+
+    if unlink_failures or ledger_residue or leftovers:
+        _log_enc_dir_residue(encounter_id, unlink_failures=unlink_failures,
+                             ledger_residue=ledger_residue,
+                             reason="plaintext residue remains after the manifest-scoped wipe (an "
+                                    "un-unlinkable PHI file, an un-relocated transcript, a "
+                                    "late-arriving unsealed chunk, or an unexpected nested entry)")
+        return _WipeResult(
+            ledger_relocated=ledger_relocated, unlink_failures=unlink_failures,
+            dir_removed=False, residue=True)
+
+    # CLEAN: the dir holds at most ``_CLOSED`` now. Remove it LAST (R6 — the eligibility sentinel
+    # must outlive every other step, findings 15/40), then rmdir.
+    closed = enc_dir / CLOSE_SENTINEL_NAME
+    if not _unlink_quiet(closed):
+        unlink_failures += 1
+        _log_enc_dir_residue(encounter_id, unlink_failures=unlink_failures,
+                             ledger_residue=ledger_residue,
+                             reason="the _CLOSED sentinel could not be removed — residue")
+        return _WipeResult(
+            ledger_relocated=ledger_relocated, unlink_failures=unlink_failures, residue=True)
     dir_removed = False
     try:
         enc_dir.rmdir()
         dir_removed = True
     except OSError:
-        # The dir still holds an entry: an un-unlinked PHI file (unlink_failures>0), the kept ledger
-        # source (ledger_residue), OR an unexpected nested subdir/entry (the wipe is deliberately
-        # NON-recursive — never recurse blindly into unexpected content). The label-named dir NAME is
-        # itself PHI, so this is real residue — attributed HONESTLY, not as a bare 'residual subdir'.
-        log.error(
-            "scribe.retention.enc_dir_not_empty", encounter_id=encounter_id,
-            unlink_failures=unlink_failures, ledger_residue=ledger_residue,
-            detail="encounter dir NOT empty after wipe — plaintext residue remains (un-unlinkable PHI "
-                   "file, an un-relocated transcript, or an unexpected nested entry). The label-named "
-                   "dir (a PHI name) persists; the seal outcome is flagged wipe_incomplete.")
-    residue = bool(unlink_failures) or ledger_residue or not dir_removed
+        _log_enc_dir_residue(encounter_id, unlink_failures=unlink_failures,
+                             ledger_residue=ledger_residue,
+                             reason="the label-named dir could not be removed after a clean wipe (a "
+                                    "concurrent create raced the rmdir)")
     return _WipeResult(
         ledger_relocated=ledger_relocated, unlink_failures=unlink_failures,
-        dir_removed=dir_removed, residue=residue)
+        dir_removed=dir_removed, residue=not dir_removed)
+
+
+def _log_enc_dir_residue(encounter_id: str, *, unlink_failures: int, ledger_residue: bool,
+                         reason: str) -> None:
+    """The HONEST residue attribution (never a bare 'residual subdir'). The label-named dir NAME is
+    itself PHI, so any residue is real; the seal outcome is flagged wipe_incomplete for escalation."""
+    log.error(
+        "scribe.retention.enc_dir_not_empty", encounter_id=encounter_id,
+        unlink_failures=unlink_failures, ledger_residue=ledger_residue,
+        detail=f"{reason}. The label-named dir (a PHI name) persists; the seal outcome is flagged "
+               f"wipe_incomplete (retry next sweep).")
 
 
 # --- the seal path (§3.3 strict order) ---------------------------------------------------------
@@ -482,6 +582,7 @@ def seal_encounter(
     retained_dir: str | Path,
     mode: str = RETENTION_MODE_RETAINED,
     now: str | None = None,
+    dispose_empty: bool = False,
 ) -> SealOutcome:
     """Seal ONE encounter's audio (unit-level; the sweep in 13b drives this over READY / abandoned
     encounters). Fail-closed strict order (§3.3): tar → seal → self-verify → durable
@@ -513,19 +614,21 @@ def seal_encounter(
     # Step 1 — gather chunks (seq order), build the per-chunk manifest + digests.
     chunks = _discover_seal_chunks(enc_dir)
     if not chunks:
-        # A CLOSED zero-chunk encounter (clinician opened, no audio, /close) must be DISPOSED — the
-        # label-named dir NAME is itself PHI, and nothing else ever cleans it (no seal row is ever
-        # created), so leaving it would leak a patient-named dir forever while logging 'nothing to
-        # do' (§E ruling, finding 12). An OPEN (un-closed) zero-chunk dir is genuinely mid-flight →
-        # leave it (a later chunk may still arrive).
-        if (enc_dir / CLOSE_SENTINEL_NAME).exists():
-            wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+        # A zero-chunk encounter must be DISPOSED — the label-named dir NAME is itself PHI, and
+        # nothing else ever cleans it (no seal row is ever created), so leaving it would leak a
+        # patient-named dir forever while logging 'nothing to do' (§E ruling, finding 12). Two
+        # trigger cases: a CLOSED one (clinician opened, no audio, /close), and a stale-ABANDONED one
+        # (no _CLOSED, past the abandon grace — the sweep passes ``dispose_empty=True``, the
+        # E-extension). An OPEN, in-grace zero-chunk dir is genuinely mid-flight → leave it (a later
+        # chunk may still arrive). Disposal needs NO crypto (nothing to seal).
+        if (enc_dir / CLOSE_SENTINEL_NAME).exists() or dispose_empty:
+            wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir, chunk_paths=[])
             log.info(
                 "scribe.retention.empty_encounter_disposed", encounter_id=encounter_id,
                 residue=wipe.residue,
-                detail="a CLOSED zero-chunk encounter was disposed — nothing was sealed (NO "
-                       "retention.* event), but the label-named dir (a PHI name) is removed. Never "
-                       "leave a patient-named dir with 'nothing to do' logged forever.")
+                detail="a zero-chunk encounter was disposed — nothing was sealed (NO retention.* "
+                       "event), but the label-named dir (a PHI name) is removed. Never leave a "
+                       "patient-named dir with 'nothing to do' logged forever.")
             return SealOutcome(
                 status=(SEAL_STATUS_WIPE_INCOMPLETE if wipe.residue else SEAL_STATUS_EMPTY_DISPOSED),
                 encounter_id=encounter_id)
@@ -573,11 +676,14 @@ def seal_encounter(
         subject_id=encounter_id, chunk_count=chunk_count, total_bytes=total_bytes,
         manifest_sha256=manifest_sha256, sealed_to_key_fp=fp, cipher=sealer.cipher, now=now)
 
-    # Step 5 — ONLY NOW wipe plaintext (relocate the transcript ledger first, §3.4). A wipe that
-    # leaves residue (real unlink failure / un-relocated ledger / unexpected nested entry) must NOT
-    # be reported as clean SEALED — the seal + durable row DID commit, but plaintext PHI is still on
-    # disk, so the outcome is wipe_incomplete for operator escalation (findings 5/8/16).
-    wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    # Step 5 — ONLY NOW wipe plaintext (relocate the transcript ledger first, §3.4). The wipe is
+    # MANIFEST-SCOPED: only the chunk files this seal covered (+ their meta sidecars + _CLOSED) are
+    # removed — a chunk that arrived AFTER the gather (finding 4's abandoned-gate race) is NOT in the
+    # set, so it SURVIVES and surfaces as residue rather than being wiped unsealed. A wipe that leaves
+    # residue must NOT be reported as clean SEALED — the seal + durable row DID commit, but plaintext
+    # PHI is still on disk, so the outcome is wipe_incomplete for operator escalation (findings 5/8/16).
+    wipe = _relocate_and_wipe(
+        enc_dir, encounter_id, retained_dir, chunk_paths=[p for (p, _seq) in chunks])
     if wipe.residue:
         log.error(
             "scribe.retention.wipe_incomplete", encounter_id=encounter_id, chunk_count=chunk_count,
@@ -654,7 +760,8 @@ def _recover_already_sealed(
             return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
 
     # Verified: the blob covers this plaintext → complete the wipe (idempotent). NEVER re-emit.
-    wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    wipe = _relocate_and_wipe(
+        enc_dir, encounter_id, retained_dir, chunk_paths=[p for (p, _seq) in chunks])
     if wipe.residue:
         log.error(
             "scribe.retention.wipe_incomplete", encounter_id=encounter_id,
@@ -674,8 +781,10 @@ def _transient_wipe(enc_dir: Path, encounter_id: str, retained_dir: Path) -> Sea
     (there is no sealed artifact to attest), but a loud, counted structlog signal so "wiped, not
     retained" is distinguishable from "nothing to do" (intentionally-left-blank). The transcript is
     still relocated + kept (only the dense audio is dropped)."""
-    chunk_count = len(_discover_seal_chunks(enc_dir))
-    wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir)
+    chunks = _discover_seal_chunks(enc_dir)
+    chunk_count = len(chunks)
+    wipe = _relocate_and_wipe(
+        enc_dir, encounter_id, retained_dir, chunk_paths=[p for (p, _seq) in chunks])
     if wipe.residue:
         # Even transient must not claim 'wiped' with PHI still on disk (findings 5/8 apply here too).
         log.error(

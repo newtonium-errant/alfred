@@ -20,6 +20,7 @@ per the regression-pin-unconditional rule. Only the ACTUAL-crypto round-trip is 
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 import structlog
@@ -684,3 +685,195 @@ def test_retention_unsealed_caps_ticket_ref_length(tmp_path):
     ev.retention_unsealed(subject_id=_ENC, reason_code="rediarize", ticket_ref="TKT-42")
     row = ev.latest(CLINICAL, family="retention", kind="retention.unsealed")
     assert row["payload"] == {"reason_code": "rediarize", "ticket_ref": "TKT-42"}
+
+
+# ====== manifest-scoped wipe (R1/R2/R6/R12 — findings 1/2/3/4/5/6/11/15/26/31/40/41) ======
+
+
+def test_relocate_failure_keeps_ledger_source_and_enc_dir(tmp_path, monkeypatch):
+    # HIGH findings 1/2/5: a FAILED transcript relocation (retained volume fills) must NEVER destroy
+    # the only source copy of a keep-forever clinical transcript, and MUST leave the enc dir so the
+    # 'retry next sweep' promise is true. The manifest-scoped wipe removes ONLY the sealed chunk set —
+    # never the ledger via a blanket iterdir loop (the pre-fix wipe destroyed the just-'KEPT' source).
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    real_write = ret_mod._atomic_write_bytes
+
+    def _fail_transcript_write(path, data):
+        if str(path).endswith(".transcript.json"):
+            raise OSError("ENOSPC on the retained transcript volume")
+        real_write(path, data)
+
+    monkeypatch.setattr(ret_mod, "_atomic_write_bytes", _fail_transcript_write)
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE          # NEVER a clean SEALED
+    assert (enc_dir / f"{_ENC}.transcript.json").is_file()    # SOURCE ledger SURVIVES (the only copy)
+    assert enc_dir.exists()                                   # dir persists — 'retry next sweep' is true
+    assert len(_sealed_rows(ev)) == 1                         # the seal DID commit (blob + durable row)
+    assert [c for c in cap if c["event"] == "scribe.retention.ledger_relocate_verify_failed"]
+    assert not [c for c in cap if c["event"] == "scribe.retention.sealed"]   # never the clean 'wiped'
+
+
+def test_relocate_refuses_to_overwrite_divergent_archived_transcript(tmp_path):
+    # HIGH finding 3: encounter_id is deterministic from (label, salt), so a same-label re-open
+    # resolves the SAME archive dest. A DIVERGENT transcript already there (a prior session's archived
+    # copy) must NEVER be overwritten — refuse, keep both, wipe_incomplete.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    dest = tmp_path / "retained" / "transcripts" / f"{_ENC}.transcript.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    prior = json.dumps({"encounter_id": _ENC, "segments": ["PRIOR SESSION FULL TRANSCRIPT"]})
+    dest.write_text(prior, encoding="utf-8")
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert dest.read_text() == prior                          # prior session's transcript PRESERVED
+    assert (enc_dir / f"{_ENC}.transcript.json").is_file()    # source KEPT (both copies survive)
+    assert [c for c in cap if c["event"] == "scribe.retention.ledger_relocate_dest_divergent"]
+
+
+def test_relocate_idempotent_when_dest_already_identical(tmp_path):
+    # A crash-recovery re-run where the transcript was ALREADY archived (byte-identical dest): the
+    # relocation is idempotent — the source is safely dropped, NO divergent-dest escalation.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    src_bytes = (enc_dir / f"{_ENC}.transcript.json").read_bytes()
+    dest = tmp_path / "retained" / "transcripts" / f"{_ENC}.transcript.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(src_bytes)                               # identical archived copy already present
+    out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_SEALED                   # clean — dest matched, source dropped
+    assert not enc_dir.exists()
+    assert dest.read_bytes() == src_bytes
+
+
+def test_torn_transcript_relocation_keeps_source_never_wipes(tmp_path, monkeypatch):
+    # HIGH finding 6 (the previously-unpinned digest-verify): a torn/diverged relocated transcript
+    # (dest bytes != source) must NOT unlink the source. Pins the `relocated_ok = sha256(dest) ==
+    # sha256(src)` gate — the mutant `relocated_ok = True` re-lands the source-destroying bug and
+    # must FAIL this test (mutation-verified in the build report).
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    real_write = ret_mod._atomic_write_bytes
+
+    def _corrupt_transcript(path, data):
+        if str(path).endswith(".transcript.json"):
+            real_write(path, data + b"TORN")                 # on-disk dest != the source bytes
+        else:
+            real_write(path, data)
+
+    monkeypatch.setattr(ret_mod, "_atomic_write_bytes", _corrupt_transcript)
+    out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert (enc_dir / f"{_ENC}.transcript.json").is_file()   # source KEPT against the torn dest
+
+
+def test_relocate_and_wipe_is_manifest_scoped_late_chunk_survives(tmp_path):
+    # R1 core (finding 4's abandoned-gate race): _relocate_and_wipe removes EXACTLY the manifest chunk
+    # set — a chunk on disk but NOT in chunk_paths (it arrived AFTER the gather) SURVIVES + surfaces as
+    # residue, never wiped unsealed. Also pins the derived meta-sidecar removal.
+    enc_dir = tmp_path / "inbox" / "jane-doe-2026-07-19"
+    enc_dir.mkdir(parents=True)
+    for seq in (1, 2, 3):
+        (enc_dir / f"chunk_{seq}.webm").write_bytes(f"audio-{seq}".encode())
+        (enc_dir / f"chunk_{seq}.meta.json").write_text("{}", encoding="utf-8")
+    (enc_dir / "_CLOSED").write_text("{}", encoding="utf-8")
+    manifest = [enc_dir / "chunk_1.webm", enc_dir / "chunk_2.webm"]      # chunk_3 arrived LATE
+    res = ret_mod._relocate_and_wipe(enc_dir, _ENC, tmp_path / "retained", chunk_paths=manifest)
+    assert res.residue is True and res.dir_removed is False
+    assert enc_dir.exists()
+    assert (enc_dir / "chunk_3.webm").is_file()              # the late chunk SURVIVES (not in manifest)
+    assert (enc_dir / "_CLOSED").is_file()                   # sentinel kept — dir stays eligible (R6)
+    assert not (enc_dir / "chunk_1.webm").exists()           # manifest chunks wiped
+    assert not (enc_dir / "chunk_1.meta.json").exists()      # + their derived meta sidecars
+    assert not (enc_dir / "chunk_2.webm").exists()
+
+
+def test_relocate_and_wipe_removes_closed_last_then_rmdir_on_clean(tmp_path):
+    # R6: on a CLEAN wipe (all manifest files gone, ledger relocated) _CLOSED is removed LAST and the
+    # dir is rmdir'd — no residue, no leaked PHI-named dir.
+    enc_dir = tmp_path / "inbox" / "clean-visit"
+    enc_dir.mkdir(parents=True)
+    (enc_dir / "chunk_1.webm").write_bytes(b"a")
+    (enc_dir / "chunk_1.meta.json").write_text("{}", encoding="utf-8")
+    (enc_dir / "_CLOSED").write_text("{}", encoding="utf-8")
+    res = ret_mod._relocate_and_wipe(enc_dir, _ENC, tmp_path / "retained",
+                                     chunk_paths=[enc_dir / "chunk_1.webm"])
+    assert res.residue is False and res.dir_removed is True
+    assert not enc_dir.exists()
+
+
+def test_disposal_residue_keeps_closed_sentinel_for_retry(tmp_path):
+    # findings 15/40: a disposal that leaves residue (an unexpected nested subdir blocks the
+    # non-recursive rmdir) must NOT destroy _CLOSED — the eligibility sentinel survives so the
+    # encounter re-qualifies for disposal next sweep (never one-shot-escalate then forever-leak).
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=0, with_ledger=False, with_closed=True)
+    (enc_dir / "editor-cache").mkdir()
+    out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert (enc_dir / "_CLOSED").is_file()                   # sentinel KEPT — still disposal-eligible
+    assert enc_dir.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses the 0o000 unsearchable-dir perms")
+def test_relocate_and_wipe_never_raises_on_unsearchable_dir(tmp_path):
+    # findings 11/41: the 'Never raises' contract must be TRUE — an unsearchable (0o000) enc dir folds
+    # into residue, never a PermissionError that reroutes PHI-residue from wipe_incomplete to a
+    # generic encounter_error.
+    enc_dir = tmp_path / "inbox" / "locked-visit"
+    enc_dir.mkdir(parents=True)
+    (enc_dir / "chunk_1.webm").write_bytes(b"a")
+    os.chmod(enc_dir, 0o000)
+    try:
+        res = ret_mod._relocate_and_wipe(enc_dir, _ENC, tmp_path / "retained",
+                                         chunk_paths=[enc_dir / "chunk_1.webm"])
+    finally:
+        os.chmod(enc_dir, 0o700)                             # restore so tmp cleanup can descend
+    assert res.residue is True                               # folded into residue — no raise
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses 0o500 unlink-denial perms")
+def test_unlink_quiet_returns_false_on_real_eacces_true_on_missing(tmp_path):
+    # findings 26/31: _unlink_quiet swallows ONLY a missing file (→True); a REAL EACCES/EPERM must
+    # return False so the caller COUNTS it. Pins the helper DIRECTLY (not via a monkeypatched stub) —
+    # the swallow-all revert (`except OSError: return True`) must FAIL this (mutation-verified).
+    d = tmp_path / "locked"
+    d.mkdir()
+    victim = d / "chunk_1.webm"
+    victim.write_bytes(b"phi")
+    os.chmod(d, 0o500)                                       # r-x: can stat but not unlink (EACCES)
+    try:
+        assert ret_mod._unlink_quiet(victim) is False       # real failure NEVER swallowed as success
+    finally:
+        os.chmod(d, 0o700)
+    assert ret_mod._unlink_quiet(d / "does-not-exist") is True  # missing → True (idempotent)
+
+
+def test_dispose_empty_disposes_unclosed_zero_chunk_dir(tmp_path):
+    # E-extension (seal-half): a zero-chunk NOT-closed dir with dispose_empty=True (the sweep's
+    # stale-abandoned gate) is DISPOSED — PHI-named dir removed, ledger relocated, NO retention event,
+    # no crypto needed. Inherits the manifest-scoped (chunk_paths=[]) + _CLOSED-last semantics.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=0, with_ledger=True, with_closed=False)
+    with structlog.testing.capture_logs() as cap:
+        out = seal_encounter(enc_dir, _ENC, events=ev, sealer=_FakeSealer(),
+                             recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained",
+                             dispose_empty=True)
+    assert out.status == SEAL_STATUS_EMPTY_DISPOSED
+    assert not enc_dir.exists()                              # PHI-named dir removed
+    assert ev.query(CLINICAL, family="retention") == []      # nothing sealed ⇒ NO retention event
+    assert (tmp_path / "retained" / "transcripts" / f"{_ENC}.transcript.json").is_file()  # ledger kept
+    assert [c for c in cap if c["event"] == "scribe.retention.empty_encounter_disposed"]
+
+
+def test_unclosed_zero_chunk_without_dispose_flag_left_alone(tmp_path):
+    # Without dispose_empty (default) an OPEN zero-chunk dir is still left alone (no_chunks) — the
+    # E-extension only disposes when the sweep positively determines stale-abandonment.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=0, with_ledger=False, with_closed=False)
+    out = seal_encounter(enc_dir, _ENC, events=ev, sealer=_FakeSealer(),
+                         recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained")
+    assert out.status == SEAL_STATUS_NO_CHUNKS
+    assert enc_dir.exists()
