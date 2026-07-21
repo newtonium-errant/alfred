@@ -767,6 +767,30 @@ def test_retention_sibling_emitters_length_cap_free_strings(tmp_path):
     assert ev.query(CLINICAL, family="retention") == []      # NOTHING PHI-bearing landed in the chain
 
 
+def test_retention_envelope_fields_length_capped(tmp_path):
+    # D6: the ENVELOPE fields (subject_id + now) are facade-capped too — R9 capped only PAYLOAD fields,
+    # so a 4800-char PHI probe landed in the permanent chain via subject_id / now. Every retention
+    # emitter now caps them; the only shipped caller (the sweep) passes a salted-HMAC id, so this is a
+    # facade-contract close for the 13d unseal/destroy CLI (operator-typed subject_id).
+    ev = _events(tmp_path)
+    phi = "Jane Doe DOB 1990-01-01 " * 200                   # 4800 chars of patient identifiers
+    for call in (
+        lambda: ev.retention_sealed(subject_id=phi, chunk_count=1, total_bytes=1,
+                                    manifest_sha256="a" * 64, sealed_to_key_fp="fp", cipher=SEAL_CIPHER),
+        lambda: ev.retention_sealed(subject_id=_ENC, chunk_count=1, total_bytes=1, now=phi,
+                                    manifest_sha256="a" * 64, sealed_to_key_fp="fp", cipher=SEAL_CIPHER),
+        lambda: ev.retention_unsealed(subject_id=phi, reason_code="audit", ticket_ref="T-1"),
+        lambda: ev.retention_destroy_intent(subject_id=phi, schedule_version="v1",
+                                            manifest_sha256="c" * 64),
+        lambda: ev.retention_destroyed(subject_id=phi, schedule_version="v1", manifest_sha256="c" * 64),
+        lambda: ev.retention_schedule_published(schedule_version="v1", schedule_sha256="a" * 64,
+                                                effective_date="2026-07-19", now=phi),
+    ):
+        with pytest.raises(EventStoreError):
+            call()
+    assert ev.query(CLINICAL, family="retention") == []      # NOTHING PHI-bearing landed in the chain
+
+
 def test_retention_ticket_ref_cap_boundary_pinned(tmp_path):
     # finding 33: the ticket_ref cap is pinned at its exact BOUNDARY (128 accepted / 129 rejected) so a
     # future 'ticket URLs got longer' tweak that weakens it (e.g. 3500) trips a test — it must not

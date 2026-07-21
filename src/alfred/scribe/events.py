@@ -68,6 +68,13 @@ def _cap_retention_str(kind: str, field: str, value: Any, max_len: int) -> str:
             f"vault_audit.log so the PHI-free chain stays redaction-independent")
     return s
 
+
+def _cap_retention_now(kind: str, now: str | None) -> str | None:
+    """Facade length-cap on the ENVELOPE ``now`` (an ISO ts) of a retention emitter (D6 — R9 capped
+    only PAYLOAD fields, so ``now`` + ``subject_id`` flowed uncapped into the chained envelope; a
+    4800-char PHI probe landed via them). ``None`` stays ``None`` — the 'use the store clock' sentinel."""
+    return None if now is None else _cap_retention_str(kind, "now", now, RETENTION_STR_FIELD_MAX)
+
 # Envelope actor_kind allowlist (§3.2). The typed emitters HARDCODE their (valid) kind, so they
 # enforce it by construction; the ONE caller-supplied path is ``access_read`` (the kind rides the
 # ``access_actor`` ContextVar), which coerces an out-of-allowlist value to ``"unknown"`` via
@@ -524,8 +531,9 @@ class ScribeEvents:
         and the caller MUST NOT wipe plaintext (fail-closed, the ordering contract). Every string
         field is facade length-capped (finding 12) even though the daemon supplies real digests."""
         return self._emit_durable(
-            CLINICAL, "retention.sealed", subject_id=subject_id, actor="stayc_scribe",
-            actor_kind="system", now=now,
+            CLINICAL, "retention.sealed",
+            subject_id=_cap_retention_str("sealed", "subject_id", subject_id, RETENTION_STR_FIELD_MAX),
+            actor="stayc_scribe", actor_kind="system", now=_cap_retention_now("sealed", now),
             payload={"chunk_count": int(chunk_count), "total_bytes": int(total_bytes),
                      "manifest_sha256": _cap_retention_str(
                          "sealed", "manifest_sha256", manifest_sha256, RETENTION_STR_FIELD_MAX),
@@ -543,7 +551,7 @@ class ScribeEvents:
         facade length-capped (finding 12 — the 13c CLI passes operator-typed version/date strings)."""
         return self._emit_durable(
             CLINICAL, "retention.schedule_published", subject_id="", actor="operator",
-            actor_kind="operator", now=now,
+            actor_kind="operator", now=_cap_retention_now("schedule_published", now),
             payload={"schedule_version": _cap_retention_str(
                          "schedule_published", "schedule_version", schedule_version,
                          RETENTION_STR_FIELD_MAX),
@@ -576,8 +584,9 @@ class ScribeEvents:
                 f"(got {len(ticket_ref)}) — the ticket_ref is a REFERENCE, not free text; route the "
                 f"justification to vault_audit.log so the PHI-free chain stays redaction-independent")
         return self._emit_durable(
-            CLINICAL, "retention.unsealed", subject_id=subject_id, actor="operator",
-            actor_kind="operator", now=now,
+            CLINICAL, "retention.unsealed",
+            subject_id=_cap_retention_str("unsealed", "subject_id", subject_id, RETENTION_STR_FIELD_MAX),
+            actor="operator", actor_kind="operator", now=_cap_retention_now("unsealed", now),
             payload={"reason_code": reason_code, "ticket_ref": ticket_ref})
 
     def retention_destroy_intent(
@@ -590,8 +599,10 @@ class ScribeEvents:
         a store-down destroy does NOT proceed to any unlink. Every string field is facade
         length-capped (finding 12 — the 13d CLI passes an operator-typed schedule_version)."""
         return self._emit_durable(
-            CLINICAL, "retention.destroy_intent", subject_id=subject_id, actor="operator",
-            actor_kind="operator", now=now,
+            CLINICAL, "retention.destroy_intent",
+            subject_id=_cap_retention_str(
+                "destroy_intent", "subject_id", subject_id, RETENTION_STR_FIELD_MAX),
+            actor="operator", actor_kind="operator", now=_cap_retention_now("destroy_intent", now),
             payload={"schedule_version": _cap_retention_str(
                          "destroy_intent", "schedule_version", schedule_version,
                          RETENTION_STR_FIELD_MAX),
@@ -608,8 +619,9 @@ class ScribeEvents:
         PHI-free — proof-of-destruction is permanent). Every string field is facade length-capped
         (finding 12)."""
         return self._emit_durable(
-            CLINICAL, "retention.destroyed", subject_id=subject_id, actor="operator",
-            actor_kind="operator", now=now,
+            CLINICAL, "retention.destroyed",
+            subject_id=_cap_retention_str("destroyed", "subject_id", subject_id, RETENTION_STR_FIELD_MAX),
+            actor="operator", actor_kind="operator", now=_cap_retention_now("destroyed", now),
             payload={"schedule_version": _cap_retention_str(
                          "destroyed", "schedule_version", schedule_version, RETENTION_STR_FIELD_MAX),
                      "manifest_sha256": _cap_retention_str(
