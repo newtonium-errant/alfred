@@ -269,7 +269,7 @@ def test_seal_happy_path_full_order(tmp_path):
     ev = _events(tmp_path)
     enc_dir = _make_encounter(tmp_path)
     out = _seal(tmp_path, enc_dir, ev)
-    # blob present + at the opaque-id path (.sealed, no label leak)
+    # blob present + at the opaque-id path (.age suffix, no label leak)
     blob_path = tmp_path / "retained" / f"{_ENC}{SEAL_BLOB_SUFFIX}"
     assert out.status == SEAL_STATUS_SEALED
     assert blob_path.is_file()

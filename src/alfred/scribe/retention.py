@@ -127,8 +127,9 @@ class SealerUnavailable(RuntimeError):
 
 
 class SealError(RuntimeError):
-    """A seal / unseal operation failed structurally (bad key length, malformed blob, or an AEAD
-    authentication failure on decrypt)."""
+    """A seal / unseal operation failed structurally — a malformed / degenerate age recipient or
+    identity (a bech32 parse / low-order-point rejection, NOT a raw-key length check — the age swap),
+    a malformed blob, or an AEAD authentication failure on decrypt."""
 
 
 class Sealer(Protocol):
@@ -802,11 +803,11 @@ def seal_encounter(
     ``retention.sealed`` [D] → ONLY THEN wipe plaintext. Idempotent via the chain
     (``events.retention_sealed_row``): a crash at any step is recovered by the next call.
 
-    ``recipient_public_key`` is the 32-byte raw X25519 pubkey the caller loaded from the seal-dir
-    (tests pass a test pubkey). ``retained_dir`` is the RESOLVED absolute blob-store dir (the caller
-    does the empty-⇒-derive resolution; this function takes a concrete path). ``recipient_public_key``
-    is the age recipient (an ``age1…`` string, UTF-8 bytes) the caller loaded from the seal-dir (tests
-    pass a fake pubkey). ``mode`` is the resolved ``retained|transient`` posture (§3.5)."""
+    ``recipient_public_key`` is the age recipient (an ``age1…`` bech32 string, UTF-8 bytes) the caller
+    loaded from the seal-dir — NOT raw key bytes (the age swap; findings 36/42). ``retained_dir`` is
+    the RESOLVED absolute blob-store dir (the caller does the empty-⇒-derive resolution; this function
+    takes a concrete path). ``mode`` is the resolved ``retained|transient`` posture (§3.5).
+    ``dispose_empty`` disposes a zero-chunk NOT-closed dir (the sweep's stale-abandoned E-extension)."""
     enc_dir = Path(enc_dir)
     retained_dir = Path(retained_dir)
 
