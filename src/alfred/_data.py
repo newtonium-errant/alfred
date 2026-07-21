@@ -34,6 +34,14 @@ def get_tui_js_path() -> Path:
     return get_bundled_dir() / "tui_js" / "index.js"
 
 
+def get_retention_schedule_example() -> Path:
+    """The bundled s.50 retention-schedule v1 example (task #13 §4, slice 13c). The operator copies
+    this to the daemon-read-only seal dir + publishes it via ``alfred scribe retention schedule
+    publish``. Its bytes are the canonical form of ``scribe.schedule.default_schedule_v1`` (a drift
+    pin asserts the match)."""
+    return get_bundled_dir() / "examples" / "retention_schedule.v1.json"
+
+
 def get_systemd_dir() -> Path:
     """Return the bundled systemd-templates directory.
 

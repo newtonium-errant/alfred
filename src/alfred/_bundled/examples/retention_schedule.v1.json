@@ -1,0 +1,47 @@
+{
+  "classes": {
+    "audit_access_log": {
+      "basis": "never auto-pruned (floor 1 yr) \u2014 PHIA s.63 + NS Reg s.11(3)",
+      "floor_days": 365,
+      "window_days": null
+    },
+    "bug_reports": {
+      "basis": "1 yr or until resolved",
+      "window_days": 365
+    },
+    "clinical_note": {
+      "basis": "10 yr \u2014 the clinical record (PHIA s.50 core)",
+      "window_days": 3650
+    },
+    "consent_events": {
+      "basis": "never auto-pruned \u2014 consent evidence must outlive the record it gates",
+      "window_days": null
+    },
+    "diarize_stats": {
+      "basis": "180 d rolling \u2014 PHI-FREE ML telemetry, not a clinical record",
+      "window_days": 180
+    },
+    "encounter_audio_sealed": {
+      "basis": "10 yr from last activity \u2014 clinical-record norm / CMPA / dispute protection",
+      "window_days": 3650
+    },
+    "retention_events": {
+      "basis": "never auto-pruned \u2014 proof-of-destruction must be permanent (s.50)",
+      "window_days": null
+    },
+    "transcript_ledger": {
+      "basis": "10 yr (= audio) \u2014 derived clinical record",
+      "window_days": 3650
+    },
+    "voice_presets": {
+      "basis": "until superseded / re-enroll \u2014 biometric embedding, not per-encounter PHI",
+      "window_days": null
+    }
+  },
+  "effective_date": "2026-07-19",
+  "minor_rule": {
+    "majority_age": 19,
+    "post_majority_years": 10
+  },
+  "schedule_version": "v1"
+}
