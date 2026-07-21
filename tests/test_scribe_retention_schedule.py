@@ -62,6 +62,17 @@ def test_validate_accepts_null_window_never_pruned():
     assert validate_schedule(data) is not None
 
 
+def test_validate_rejects_absent_window_days_key():
+    # C1: an ABSENT window_days key (a typo like 'window_day') is an incomplete spec, NOT the
+    # never-pruned sentinel — it must fail validation (only explicit null means never-pruned), else a
+    # fat-fingered publish silently disables 10-yr PHI surfacing.
+    data = _valid()
+    del data["classes"]["encounter_audio_sealed"]["window_days"]
+    data["classes"]["encounter_audio_sealed"]["window_day"] = 3650   # typo'd key
+    with pytest.raises(ScheduleError):
+        validate_schedule(data)
+
+
 @pytest.mark.parametrize("bad_version", ["", "  ", None, 5])
 def test_validate_rejects_bad_version(bad_version):
     data = _valid()

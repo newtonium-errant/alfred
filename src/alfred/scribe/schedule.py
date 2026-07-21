@@ -54,7 +54,13 @@ SURFACED_PHI_CLASS = "encounter_audio_sealed"
 # no schedule is published). PHI-FREE — a rolling prune, not an audited PHI destruction (§4).
 TELEMETRY_CLASS = "diarize_stats"
 
-_DAYS_PER_YEAR = 365  # coarse — the windows drive a SOFT 'review due' surface signal, never a destroy
+# C6 — a year is encoded as 365 days, so a 10-yr window is 3650 days vs ~3653 CALENDAR days for the
+# decade. This surfaces review_due ~3 days EARLY (never LATE), which is the SAFE direction for the s.50
+# review obligation: an over-window encounter is flagged for the operator's morning review at-or-before
+# the true window, never over-retained past it. Surfacing is SURFACE-ONLY (§4) — the 13d destroy
+# playbook MUST re-check the exact calendar date before any destruction, so 'surfaced early' NEVER
+# means 'destroyed before the 10-calendar-year clinical-record minimum'. Deliberate + documented.
+_DAYS_PER_YEAR = 365
 
 
 class ScheduleError(ValueError):
@@ -127,7 +133,14 @@ def validate_schedule(data: Any) -> dict:
     for name, spec in classes.items():
         if not isinstance(spec, dict):
             raise ScheduleError(f"class {name!r} must be a JSON object")
-        window = spec.get("window_days")
+        # C1: the load-bearing ``window_days`` key MUST be PRESENT (explicit ``null`` = the deliberate
+        # never-pruned sentinel; an ABSENT key is an incomplete/typo'd spec that would silently read as
+        # never-pruned and disable 10-yr PHI surfacing). Fail closed like a missing class.
+        if "window_days" not in spec:
+            raise ScheduleError(
+                f"class {name!r} is missing the required 'window_days' key (use explicit null for "
+                f"never-pruned) — an absent key would silently disable surfacing for this class")
+        window = spec["window_days"]
         if window is not None and (not isinstance(window, int) or isinstance(window, bool) or window < 0):
             raise ScheduleError(
                 f"class {name!r} window_days must be a non-negative integer or null (got {window!r})")
