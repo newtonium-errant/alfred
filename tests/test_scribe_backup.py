@@ -141,6 +141,26 @@ def test_seal_file_for_backup_malformed_blob_raises(tmp_path):
     assert not (tmp_path / "out.age").exists()                 # never write an unverifiable copy
 
 
+def test_seal_file_for_backup_real_crypto_round_trip(tmp_path):
+    """Dep-gated (ruling A guarantee): the seal-before-backup copy is a REAL age blob that opens
+    ONLY with the OFFLINE private key — the whole-off-box-archive crypto-shred. Seals a plaintext
+    transcript to a real recipient, confirms it round-trips byte-identical with the matching identity,
+    and is crypto-shredded (SealError) to any OTHER key."""
+    pytest.importorskip("pyrage")
+    pub, priv = ret.generate_keypair()
+    sealer = ret.make_default_sealer()
+    src = tmp_path / "t.json"
+    src.write_bytes(b'{"transcript":"real phi content"}')
+    dest = tmp_path / "sealed" / f"{_ENC}.transcript.age"
+    assert backup.seal_file_for_backup(src, dest, sealer=sealer, recipient_public_key=pub) is True
+    blob = dest.read_bytes()
+    assert ret._age_blob_wellformed(blob)                       # a genuine age v1 envelope
+    assert sealer.unseal(blob, priv) == src.read_bytes()        # off-box-openable with the offline key
+    _other_pub, other_priv = ret.generate_keypair()
+    with pytest.raises(ret.SealError):
+        sealer.unseal(blob, other_priv)                        # crypto-shredded to any other key
+
+
 # ============================ encounter_backup_globs ============================
 
 
