@@ -62,6 +62,27 @@ def _write_recovery_blob(tmp_path, encounter_id=None, data=b"FAKESEAL1-recovered
     p.write_bytes(data)
     return p
 
+
+def _write_recovery_artifacts(tmp_path, enc_dir, ev, *, encounter_id=None,
+                              blob=b"FAKESEAL1-recovered-blob", manifest=None):
+    """Emit the sealed row + write the blob + the matching PHI-free manifest sidecar so the fail-closed
+    recovery's (blob-exists + structurally-well-formed + sidecar-authenticates + blob-sha-matches +
+    per-chunk-subset) gates pass for a faithful crash-between-event-and-wipe. ``manifest`` defaults to
+    the sidecar/row attesting ``enc_dir``'s current on-disk chunks (the completable case)."""
+    encounter_id = encounter_id or _ENC
+    if manifest is None:
+        chunks = ret_mod._discover_seal_chunks(enc_dir)
+        manifest = [{"seq": s, "sha256": sha256_hex(p.read_bytes()), "bytes": len(p.read_bytes())}
+                    for (p, s) in chunks]
+    msha = ret_mod._manifest_digest(manifest)
+    total = sum(m["bytes"] for m in manifest)
+    ev.retention_sealed(subject_id=encounter_id, chunk_count=len(manifest), total_bytes=total,
+                        manifest_sha256=msha, sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
+    retained = tmp_path / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    (retained / f"{encounter_id}{SEAL_BLOB_SUFFIX}").write_bytes(blob)
+    ret_mod._write_manifest_sidecar(retained, encounter_id, manifest, sha256_hex(blob))
+
 _CLOCK = "2026-07-19T09:00:00+00:00"
 _ENC = "enc-0123456789abcdef"                      # an opaque encounter id (PHI-free, §10)
 _TEST_PUBKEY = bytes(range(32))                    # a fixed 32-byte "pubkey" for the fake sealer
@@ -355,8 +376,7 @@ def test_crash_between_event_and_wipe_completes_wipe(tmp_path):
     # manifest-match) passes because this IS the audio that was sealed.
     ev = _events(tmp_path)
     enc_dir = _make_encounter(tmp_path)
-    _emit_sealed_row_for(ev, enc_dir)        # row whose manifest matches the on-disk chunks
-    _write_recovery_blob(tmp_path)           # a durable, well-formed blob at the recovery path
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)  # row + blob + sidecar matching on-disk chunks
     assert enc_dir.is_dir()
     out = _seal(tmp_path, enc_dir, ev)
     assert out.status == SEAL_STATUS_ALREADY_SEALED
@@ -381,15 +401,15 @@ def test_recovery_refuses_wipe_when_blob_missing(tmp_path):
 
 def test_recovery_refuses_wipe_when_plaintext_manifest_mismatches(tmp_path):
     # Finding 2 (re-opened same-label encounter): the original sealed+wiped, then NEW consented audio
-    # arrives under the same label → same encounter_id. The blob exists, but the on-disk manifest is
-    # the NEW audio, not the row's → refuse the wipe, preserve the new audio, recovery_mismatch.
+    # arrives under the same label → same encounter_id. The blob + sidecar attest the ORIGINAL audio
+    # (same seqs, DIFFERENT shas); the on-disk chunks are the NEW audio → the subset check refuses the
+    # wipe, preserves the new audio, recovery_mismatch.
     ev = _events(tmp_path)
-    enc_dir = _make_encounter(tmp_path)
-    # a sealed row for DIFFERENT (original) audio — a wrong manifest vs the current chunks
-    ev.retention_sealed(subject_id=_ENC, chunk_count=2, total_bytes=10, manifest_sha256="d" * 64,
-                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER)
-    _write_recovery_blob(tmp_path)           # the ORIGINAL archive blob exists
+    enc_dir = _make_encounter(tmp_path)                  # on-disk NEW audio
+    original = [{"seq": s, "sha256": sha256_hex(f"ORIGINAL-audio-{s}".encode()), "bytes": 20}
+                for s in (1, 2)]                          # a DIFFERENT-sha manifest (the sealed audio)
     with structlog.testing.capture_logs() as cap:
+        _write_recovery_artifacts(tmp_path, enc_dir, ev, manifest=original)
         out = _seal(tmp_path, enc_dir, ev)
     assert out.status == SEAL_STATUS_RECOVERY_MISMATCH
     assert (enc_dir / "chunk_1.webm").is_file()          # the NEW consented audio is PRESERVED
@@ -877,3 +897,143 @@ def test_unclosed_zero_chunk_without_dispose_flag_left_alone(tmp_path):
                          recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained")
     assert out.status == SEAL_STATUS_NO_CHUNKS
     assert enc_dir.exists()
+
+
+# ====== manifest-sidecar recovery: subset / truncated-blob / sealer-None (R3/R4/R5) ======
+
+
+def test_recovery_completes_crash_mid_wipe_subset(tmp_path):
+    # R3 (findings 20/29): a crash DURING the step-5 wipe leaves a strict SUBSET of the sealed chunks.
+    # Recovery recognizes each present chunk matches its sidecar entry (seq→sha) and COMPLETES the
+    # wipe — never a permanent recovery_mismatch escalation, never the misdiagnosing 'NEW audio' text.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=3)
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)     # sidecar/row attest all 3 chunks
+    (enc_dir / "chunk_1.webm").unlink()                  # crashed after chunk_1 was already wiped
+    (enc_dir / "chunk_1.meta.json").unlink()
+    out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_ALREADY_SEALED      # the subset {2,3} completes, no escalation
+    assert not enc_dir.exists()
+    assert len(_sealed_rows(ev)) == 1
+
+
+def test_recovery_refuses_truncated_blob_via_sidecar_digest(tmp_path):
+    # R4 / findings 8/21/23: a blob that passes the structural check but is TRUNCATED/CORRUPT (its sha
+    # no longer matches the sidecar's blob_sha256) must NOT be wiped against — recovery_mismatch,
+    # plaintext INTACT. The pre-fix prefix-only gate wiped the never-retrievable audio here.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)     # sidecar records the FULL blob's sha
+    blob_path = tmp_path / "retained" / f"{_ENC}{SEAL_BLOB_SUFFIX}"
+    blob_path.write_bytes(b"FAKESEAL1-TRUNCATED")        # well-formed prefix, DIFFERENT sha
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_RECOVERY_MISMATCH
+    assert (enc_dir / "chunk_1.webm").is_file()          # plaintext NEVER wiped against a corrupt blob
+    assert [c for c in cap if c["event"] == "scribe.retention.recovery_blob_corrupt"]
+
+
+def test_recovery_refuses_missing_sidecar(tmp_path):
+    # The sidecar is the recovery reference — without it (deleted/corrupt) recovery cannot subset-verify
+    # and MUST fail closed, plaintext intact.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    _emit_sealed_row_for(ev, enc_dir)                    # row present
+    _write_recovery_blob(tmp_path)                       # blob present, but NO sidecar
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_RECOVERY_MISMATCH
+    assert (enc_dir / "chunk_1.webm").is_file()
+    assert [c for c in cap if c["event"] == "scribe.retention.recovery_sidecar_mismatch"]
+
+
+def test_recovery_refuses_wipe_when_sealer_none_and_plaintext_present(tmp_path):
+    # R5 (findings 9/14/24/38, blob-present variant): a chain row + on-disk plaintext + blob but NO
+    # sealer (pyrage lost from the venv) must NOT AttributeError on None.verify_wellformed — it
+    # fail-closes to recovery_mismatch with plaintext intact.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)
+    with structlog.testing.capture_logs() as cap:
+        out = seal_encounter(enc_dir, _ENC, events=ev, sealer=None,
+                             recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained")
+    assert out.status == SEAL_STATUS_RECOVERY_MISMATCH
+    assert (enc_dir / "chunk_1.webm").is_file()          # plaintext intact — no crash, no wipe
+    assert [c for c in cap if c["event"] == "scribe.retention.recovery_sealer_unavailable"]
+
+
+def test_recovery_disposes_empty_dir_when_sealer_none(tmp_path):
+    # R5 (findings 9/14/24/38, the core): a CLOSED zero-chunk dir with a PRIOR sealed row + blob but
+    # NO sealer must DISPOSE (needs no crypto) — never an AttributeError-loop that leaks the PHI-named
+    # dir forever. The dir is removed; no re-emit.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=0, with_ledger=False, with_closed=True)
+    ev.retention_sealed(subject_id=_ENC, chunk_count=2, total_bytes=10, manifest_sha256="d" * 64,
+                        sealed_to_key_fp="fp", cipher=SEAL_CIPHER)   # prior seal, dir re-created empty
+    _write_recovery_blob(tmp_path)
+    out = seal_encounter(enc_dir, _ENC, events=ev, sealer=None,
+                         recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained")
+    assert out.status == SEAL_STATUS_ALREADY_SEALED      # disposed via the zero-chunk no-crypto path
+    assert not enc_dir.exists()                          # PHI-named dir removed, not AttributeError-stuck
+    assert len(_sealed_rows(ev)) == 1                    # no re-emit
+
+
+def test_age_verify_wellformed_rejects_truncated_blob(tmp_path):
+    # R4 (findings 8/21/23): the structural age-v1 check rejects a blob truncated before its MAC line
+    # or with an empty payload — cases the old 19-byte prefix check accepted.
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import AgeSealer, generate_keypair
+    pub, _priv = generate_keypair()
+    sealer = AgeSealer()
+    blob = sealer.seal(b"some-audio-bytes-for-the-tar", pub)
+    assert sealer.verify_wellformed(blob) is True              # a full, well-formed age blob passes
+    assert sealer.verify_wellformed(blob[:20]) is False        # truncated to the intro (no MAC line)
+    assert sealer.verify_wellformed(b"age-encryption.org/") is False   # the OLD prefix no longer passes
+    mac = blob.find(b"\n--- ")
+    payload_start = blob.find(b"\n", mac + 5) + 1
+    assert sealer.verify_wellformed(blob[:payload_start]) is False      # header intact, EMPTY payload
+
+
+def test_recovery_wipe_obstruction_surfaces_incomplete(tmp_path, monkeypatch):
+    # finding 10 (recovery leg unpinned): an already-sealed recovery whose wipe leaves PHI residue (a
+    # real unlink failure) must report wipe_incomplete + NOT the clean 'already_sealed' line — the
+    # mutant that drops the recovery-leg `if wipe.residue:` branch must FAIL this.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)
+    real = ret_mod._unlink_quiet
+
+    def _fail_on_chunks(path):
+        if path.name.startswith("chunk_") and path.name.endswith(".webm"):
+            return False
+        return real(path)
+
+    monkeypatch.setattr(ret_mod, "_unlink_quiet", _fail_on_chunks)
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert (enc_dir / "chunk_1.webm").is_file()          # PHI still on disk (not falsely 'wiped')
+    assert [c for c in cap if c["event"] == "scribe.retention.wipe_incomplete"]
+    assert not [c for c in cap if c["event"] == "scribe.retention.already_sealed"]
+
+
+def test_transient_wipe_obstruction_surfaces_incomplete(tmp_path, monkeypatch):
+    # finding 10 (transient leg unpinned): a transient wipe that leaves PHI residue must report
+    # wipe_incomplete + NOT the clean 'transient_wiped' line — the mutant dropping the transient-leg
+    # `if wipe.residue:` branch must FAIL this.
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path)
+    real = ret_mod._unlink_quiet
+
+    def _fail_on_chunks(path):
+        if path.name.startswith("chunk_") and path.name.endswith(".webm"):
+            return False
+        return real(path)
+
+    monkeypatch.setattr(ret_mod, "_unlink_quiet", _fail_on_chunks)
+    with structlog.testing.capture_logs() as cap:
+        out = _seal(tmp_path, enc_dir, ev, mode=RETENTION_MODE_TRANSIENT)
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert (enc_dir / "chunk_1.webm").is_file()
+    assert [c for c in cap if c["event"] == "scribe.retention.wipe_incomplete"]
+    assert not [c for c in cap if c["event"] == "scribe.retention.transient_wiped"]

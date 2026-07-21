@@ -64,13 +64,29 @@ SEAL_CIPHER = "age-x25519"
 # format, decryptable by the stock ``age`` binary (the 13d offline-retrieval path).
 SEAL_BLOB_SUFFIX = ".age"
 
-# The age v1 armor/header prefix — every age ciphertext begins with the ``age-encryption.org/v1``
-# intro line. Used for the seal-time structural self-verify WITHOUT the private key (the daemon holds
-# only the recipient). The digest-stable (torn-write) half of the self-verify is in seal_encounter.
-_AGE_HEADER_PREFIX = b"age-encryption.org/"
+# The age v1 intro line + header MAC delimiter. Every age ciphertext is
+# ``age-encryption.org/v1\n`` + one-or-more ``-> `` recipient stanzas + a ``--- <b64 mac>\n`` header
+# terminator + the binary STREAM payload. ``verify_wellformed`` parses this STRUCTURE (not just a
+# prefix) so a truncated blob — header cut short, or an empty payload after the MAC line — is caught
+# WITHOUT the private key (findings 8/21/23: a prefix check passed a truncated, undecryptable blob and
+# recovery wiped plaintext against it). The digest-stable (torn-write) half of the self-verify is in
+# seal_encounter; the exact blob-integrity check on recovery is the manifest-sidecar ``blob_sha256``.
+_AGE_V1_INTRO = b"age-encryption.org/v1\n"
+_AGE_HEADER_MAC = b"\n--- "
 
 # The manifest member name inside the sealed tar (recovered on unseal to re-verify per-chunk shas).
 SEAL_MANIFEST_NAME = "manifest.json"
+
+# The PHI-FREE manifest SIDECAR written beside the blob at seal time (``<encounter_id>.manifest.json``
+# in ``retained_dir``). Holds the sorted per-chunk ``[{seq, sha256, bytes}]`` + the sealed ``blob_sha256``
+# — ids/digests/scalars only, no PHI. It lets the crash-between-event-and-wipe recovery (a) authenticate
+# itself against the durable row (its manifest digest == the row's ``manifest_sha256``), (b) detect a
+# truncated/corrupt blob EXACTLY (``sha256(blob) == blob_sha256`` — closes findings 8/21/23), and
+# (c) subset-verify each PRESENT on-disk chunk (seq→sha), so a crash-mid-wipe residue is a COMPLETABLE
+# subset rather than a permanent mismatch (findings 20/29). The private-key-only tar manifest cannot be
+# read on-box (the daemon holds only the recipient), so this PHI-free sidecar is the recovery reference.
+# 13d's destroy path unlinks it beside the blob (a destroy contract, flagged in the delta report).
+SEAL_MANIFEST_SIDECAR_SUFFIX = ".manifest.json"
 
 # Chunk filename shape (parse seq from the STEM). Matches the pipeline's ``_CHUNK_NAME_RE`` so seal
 # discovery agrees with the accumulator on "what is a chunk": ``chunk_<seq>.<ext>`` → stem
@@ -129,6 +145,25 @@ class Sealer(Protocol):
     def verify_wellformed(self, blob: bytes) -> bool: ...
 
     def unseal(self, blob: bytes, private_key: bytes) -> bytes: ...
+
+
+def _age_blob_wellformed(blob: bytes) -> bool:
+    """True iff ``blob`` is a STRUCTURALLY well-formed age v1 envelope — the ``age-encryption.org/v1``
+    intro, at least one ``-> `` recipient stanza, the ``--- <mac>`` header terminator, AND a non-empty
+    binary payload after it (findings 8/21/23: a prefix-only check passed a truncated blob). Base64
+    body lines cannot contain ``-`` so the first ``\\n--- `` is unambiguously the header terminator.
+    Module-level so recovery can structurally gate a blob WITHOUT constructing a sealer (R4/R5)."""
+    if not blob.startswith(_AGE_V1_INTRO):
+        return False
+    mac_idx = blob.find(_AGE_HEADER_MAC)              # the "\n--- " terminating the header
+    if mac_idx == -1:
+        return False
+    if b"\n-> " not in blob[: mac_idx + 1]:           # ≥ 1 recipient stanza inside the header
+        return False
+    payload_nl = blob.find(b"\n", mac_idx + len(_AGE_HEADER_MAC))  # end of the "--- <mac>" line
+    if payload_nl == -1:
+        return False
+    return len(blob) > payload_nl + 1                 # a NON-EMPTY binary payload follows the header
 
 
 def key_fingerprint(public_key: bytes) -> str:
@@ -213,10 +248,14 @@ class AgeSealer:
             raise SealError(f"age encryption failed: {exc}") from exc
 
     def verify_wellformed(self, blob: bytes) -> bool:
-        """Structural check WITHOUT the private key (the daemon holds only the recipient): every age
-        ciphertext begins with the ``age-encryption.org/v1`` intro line. The digest-stable
-        (torn-write) half of the self-verify is in :func:`seal_encounter`."""
-        return blob[: len(_AGE_HEADER_PREFIX)] == _AGE_HEADER_PREFIX
+        """STRUCTURAL check WITHOUT the private key (the daemon holds only the recipient). Not a prefix
+        test (findings 8/21/23 — a prefix pass let a truncated, undecryptable blob wipe plaintext):
+        the FULL bytes must be a well-formed age v1 envelope — the ``age-encryption.org/v1`` intro, at
+        least one ``-> `` recipient stanza, the ``--- <mac>`` header terminator, AND a NON-EMPTY binary
+        payload after it. A blob cut short of its MAC line or its payload fails. The digest-stable
+        (torn-write) half is in :func:`seal_encounter`; the exact blob-integrity check on recovery is
+        the manifest-sidecar ``blob_sha256`` (a header parse cannot detect a payload-body truncation)."""
+        return _age_blob_wellformed(blob)
 
     def unseal(self, blob: bytes, private_key: bytes) -> bytes:
         identity = self._identity(private_key)
@@ -253,6 +292,39 @@ def _manifest_digest(manifest_list: list[dict]) -> str:
     (§3.3). Canonical = sorted keys + tight separators, so the digest is stable across runs."""
     canonical = json.dumps(manifest_list, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return sha256_hex(canonical)
+
+
+def _write_manifest_sidecar(
+    retained_dir: Path, encounter_id: str, manifest_list: list[dict], blob_sha: str,
+) -> None:
+    """Write the PHI-free manifest sidecar (``<encounter_id>.manifest.json``) beside the blob —
+    atomic + fsync-durable. Records the sorted per-chunk manifest + the sealed ``blob_sha256`` so the
+    crash-between-event-and-wipe recovery can subset-verify each present chunk (findings 20/29) AND
+    detect a truncated/corrupt blob exactly (findings 8/21/23) — WITHOUT the private key. Written
+    BEFORE the durable row (the recovery reference must exist whenever a row does); a crash before it
+    leaves no row → the next sweep re-seals, regenerating both."""
+    path = Path(retained_dir) / f"{encounter_id}{SEAL_MANIFEST_SIDECAR_SUFFIX}"
+    data = json.dumps(
+        {"manifest": manifest_list, "blob_sha256": blob_sha},
+        sort_keys=True, separators=(",", ":")).encode("utf-8")
+    _atomic_write_bytes(path, data)
+
+
+def _load_manifest_sidecar(retained_dir: Path, encounter_id: str) -> dict | None:
+    """Load the manifest sidecar, or ``None`` if absent / unreadable / malformed (recovery then fails
+    CLOSED — never wipes plaintext without a verified reference)."""
+    path = Path(retained_dir) / f"{encounter_id}{SEAL_MANIFEST_SIDECAR_SUFFIX}"
+    try:
+        data = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    manifest = data.get("manifest")
+    blob_sha = data.get("blob_sha256")
+    if not isinstance(manifest, list) or not isinstance(blob_sha, str):
+        return None
+    return {"manifest": manifest, "blob_sha256": blob_sha}
 
 
 def _add_tar_member(tar: tarfile.TarFile, name: str, data: bytes) -> None:
@@ -667,6 +739,12 @@ def seal_encounter(
             status=SEAL_STATUS_VERIFY_FAILED, encounter_id=encounter_id,
             chunk_count=chunk_count, total_bytes=total_bytes, manifest_sha256=manifest_sha256)
 
+    # Step 3.5 — write the PHI-free manifest SIDECAR beside the blob (BEFORE the durable row, so the
+    # crash-between-event-and-wipe recovery always finds its subset-verify + blob-integrity reference;
+    # a crash before it leaves NO row → the next sweep re-seals and regenerates both). See
+    # SEAL_MANIFEST_SIDECAR_SUFFIX. Raises on a write/fsync error (fail-closed — no row, no wipe).
+    _write_manifest_sidecar(retained_dir, encounter_id, manifest_list, blob_sha)
+
     # Step 4 — DURABLE retention.sealed [D]; RAISES on a store-down append (fail-closed). The seal
     # is NOT acknowledged and plaintext is NOT wiped until this commits — exactly the #12
     # withdrawal durable-before-ack ordering. A raise PROPAGATES: the blob-without-event state is
@@ -706,22 +784,69 @@ def seal_encounter(
 
 
 def _recover_already_sealed(
-    enc_dir: Path, encounter_id: str, retained_dir: Path, sealed_row: dict, sealer: Sealer,
+    enc_dir: Path, encounter_id: str, retained_dir: Path, sealed_row: dict,
+    sealer: "Sealer | None",
 ) -> SealOutcome:
     """FAIL-CLOSED crash-between-durable-event-and-wipe recovery (§3.3, findings 2/3/7). The chain row
-    proves the durable append landed — NOT that the blob survived (finding 1's lost rename, a
-    retained_dir migration, a blob-store mishap), nor that today's on-disk plaintext is the SAME
-    audio the row attests (a re-opened same-label encounter maps to the same ``encounter_id`` and
-    accumulates NEW consented audio). Before wiping ANY plaintext this requires, in order:
-      (i)   the sealed blob EXISTS in the CALLER's ``retained_dir`` + is structurally well-formed,
-      (ii)  if plaintext chunks are present, their manifest EXACTLY matches the row's own
-            ``chunk_count`` + ``manifest_sha256`` (the manifest is plaintext-deterministic).
-    Any mismatch → loud ERROR, NO wipe, ``recovery_mismatch`` for operator escalation. NEVER wipe on
-    a row-without-blob, and NEVER destroy audio the sealed row does not cover."""
-    enc_dir = Path(enc_dir)
-    blob_path = Path(retained_dir) / f"{encounter_id}{SEAL_BLOB_SUFFIX}"
+    proves the durable append landed — NOT that the blob survived, nor that today's on-disk plaintext
+    is the SAME audio the row attests. The order:
 
-    # (i) the blob must EXIST in this retained_dir and be structurally well-formed (no private key).
+      * ZERO plaintext on disk → nothing to destroy → complete the dir cleanup (disposal). Needs NO
+        crypto and NO sealer (R5, findings 9/14/24/38: an empty re-opened+closed dir with a prior row
+        must DISPOSE, never AttributeError on a ``None`` sealer).
+      * plaintext present but ``sealer is None`` → cannot verify the blob → LATCHED fail-closed skip
+        (recovery_mismatch), never a crash (R5).
+      * plaintext present → (i) the blob EXISTS + is structurally well-formed (R4) + its digest matches
+        the PHI-free manifest sidecar's ``blob_sha256`` (findings 8/21/23 — a truncated blob no longer
+        passes); (ii) the sidecar authenticates against the row (its manifest digest == the row's
+        ``manifest_sha256``); (iii) every PRESENT on-disk chunk matches its sidecar entry seq→sha —
+        a strict SUBSET is a COMPLETABLE crash-mid-wipe residue (R3, findings 20/29), an EXTRA or
+        MISMATCHED chunk is a re-opened/corrupt encounter → escalate. Only then complete the wipe.
+    Any mismatch → loud ERROR, NO wipe, ``recovery_mismatch``. NEVER destroy audio the row does not cover."""
+    enc_dir = Path(enc_dir)
+    retained_dir = Path(retained_dir)
+
+    # On-disk plaintext to protect? A vanished dir → none; an unsearchable dir → cannot enumerate
+    # (treat as residue below). NEVER raise here (R6/R12).
+    try:
+        chunks = _discover_seal_chunks(enc_dir) if enc_dir.exists() else []
+    except OSError:
+        chunks = None
+
+    # ZERO plaintext → nothing to destroy; complete the dir cleanup. Needs NO sealer (R5).
+    if chunks is not None and not chunks:
+        wipe = _relocate_and_wipe(enc_dir, encounter_id, retained_dir, chunk_paths=[])
+        if wipe.residue:
+            log.error(
+                "scribe.retention.wipe_incomplete", encounter_id=encounter_id,
+                unlink_failures=wipe.unlink_failures,
+                detail="already-sealed recovery (zero on-disk chunks) could not fully clean the dir — "
+                       "residue remains (wipe_incomplete); the next sweep retries.")
+            return SealOutcome(status=SEAL_STATUS_WIPE_INCOMPLETE, encounter_id=encounter_id)
+        log.info(
+            "scribe.retention.already_sealed", encounter_id=encounter_id,
+            detail="retention.sealed on the chain + no plaintext on disk — completed the dir cleanup "
+                   "(idempotent recovery / disposal of a re-opened+closed empty dir); no re-emit.")
+        return SealOutcome(status=SEAL_STATUS_ALREADY_SEALED, encounter_id=encounter_id)
+
+    # There IS plaintext (or the dir is unsearchable). Wiping it REQUIRES verifying the blob covers it
+    # — which needs a sealer. A None sealer here (pyrage lost from the venv) → fail-closed skip, NEVER
+    # AttributeError (R5, findings 9/14/24/38).
+    if sealer is None:
+        log.error(
+            "scribe.retention.recovery_sealer_unavailable", encounter_id=encounter_id,
+            detail="chain says retention.sealed and plaintext is on disk, but NO sealer is available "
+                   "(pyrage absent) to verify the blob — REFUSING to wipe (never destroy plaintext we "
+                   "cannot verify is covered). Retention sealing is latched-skipped; operator reconciles.")
+        return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+    if chunks is None:
+        _log_enc_dir_residue(encounter_id, unlink_failures=0, ledger_residue=False,
+                             reason="the encounter dir is unsearchable — cannot enumerate plaintext "
+                                    "to verify against the seal; REFUSING to wipe")
+        return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+
+    # (i) the blob must EXIST + be structurally well-formed (R4).
+    blob_path = retained_dir / f"{encounter_id}{SEAL_BLOB_SUFFIX}"
     if not blob_path.is_file():
         log.error(
             "scribe.retention.recovery_blob_missing", encounter_id=encounter_id,
@@ -736,30 +861,51 @@ def _recover_already_sealed(
     if not blob or not sealer.verify_wellformed(blob):
         log.error(
             "scribe.retention.recovery_blob_malformed", encounter_id=encounter_id,
-            detail="the sealed blob is unreadable / not well-formed — REFUSING to wipe plaintext "
-                   "(the archive may be corrupt; never destroy the plaintext safety copy against it).")
+            detail="the sealed blob is unreadable / not a well-formed age envelope — REFUSING to wipe "
+                   "plaintext (the archive may be truncated/corrupt; never destroy the plaintext "
+                   "safety copy against it).")
         return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
 
-    # (ii) if plaintext chunks remain, they MUST match the sealed row's manifest — otherwise this is
-    # NOT the audio that was sealed (re-opened same-label encounter, finding 2) → never wipe it.
-    chunks = _discover_seal_chunks(enc_dir) if enc_dir.exists() else []
-    if chunks:
-        gathered = [(seq, p.read_bytes()) for (p, seq) in chunks]
-        manifest_list = [
-            {"seq": seq, "sha256": sha256_hex(data), "bytes": len(data)} for (seq, data) in gathered]
-        payload = sealed_row.get("payload") or {}
-        if (len(manifest_list) != payload.get("chunk_count")
-                or _manifest_digest(manifest_list) != payload.get("manifest_sha256")):
+    # (ii) the PHI-free manifest sidecar authenticates against the durable row (its manifest digest ==
+    # the row's manifest_sha256), and the blob's digest EXACTLY matches the sidecar's blob_sha256 (a
+    # truncated but header-well-formed blob is caught here — findings 8/21/23). No sidecar → fail-closed.
+    payload = sealed_row.get("payload") or {}
+    sidecar = _load_manifest_sidecar(retained_dir, encounter_id)
+    if sidecar is None or _manifest_digest(sidecar["manifest"]) != payload.get("manifest_sha256"):
+        log.error(
+            "scribe.retention.recovery_sidecar_mismatch", encounter_id=encounter_id,
+            has_sidecar=sidecar is not None,
+            detail="the PHI-free manifest sidecar is missing or does NOT authenticate against the "
+                   "sealed row's manifest_sha256 — REFUSING to wipe (recovery cannot verify which "
+                   "audio the blob covers without a trusted per-chunk reference). Operator reconciles.")
+        return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+    if sha256_hex(blob) != sidecar.get("blob_sha256"):
+        log.error(
+            "scribe.retention.recovery_blob_corrupt", encounter_id=encounter_id,
+            detail="the sealed blob's digest does NOT match the manifest sidecar's blob_sha256 — the "
+                   "archive is TRUNCATED/CORRUPT (undecryptable) — REFUSING to wipe the plaintext "
+                   "safety copy against it (findings 8/21/23). Operator must reconcile / re-seal.")
+        return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
+
+    # (iii) SUBSET validation (R3, findings 20/29): every PRESENT on-disk chunk must match its sidecar
+    # entry seq→sha. A strict SUBSET (crash-mid-wipe left fewer chunks) is COMPLETABLE — the blob
+    # covers them. An EXTRA seq (not in the manifest) or a MISMATCHED sha means this is NOT the sealed
+    # audio (a re-opened same-label encounter, finding 2) OR on-disk corruption → escalate, never wipe.
+    sidecar_by_seq = {int(m["seq"]): m["sha256"] for m in sidecar["manifest"]
+                      if isinstance(m, dict) and "seq" in m and "sha256" in m}
+    for (p, seq) in chunks:
+        if seq not in sidecar_by_seq or sha256_hex(p.read_bytes()) != sidecar_by_seq[seq]:
             log.error(
                 "scribe.retention.recovery_manifest_mismatch", encounter_id=encounter_id,
-                on_disk_chunks=len(manifest_list), row_chunks=payload.get("chunk_count"),
-                detail="on-disk plaintext does NOT match the sealed row's manifest — this audio was "
-                       "NOT covered by the seal (a re-opened same-label encounter accumulated NEW "
-                       "consented audio). REFUSING to wipe; operator must reconcile (seal the new "
-                       "audio under a distinct id, or destroy explicitly). Never silently destroy it.")
+                on_disk_chunks=len(chunks), row_chunks=payload.get("chunk_count"),
+                detail="an on-disk chunk does NOT match the sealed manifest (an EXTRA seq or a changed "
+                       "sha) — EITHER a re-opened same-label encounter accumulated NEW consented "
+                       "audio, OR an on-disk chunk is corrupt. REFUSING to wipe; operator must "
+                       "reconcile (seal genuinely-new audio under a distinct id, or destroy "
+                       "explicitly). A crash-mid-wipe SUBSET, by contrast, completes automatically.")
             return SealOutcome(status=SEAL_STATUS_RECOVERY_MISMATCH, encounter_id=encounter_id)
 
-    # Verified: the blob covers this plaintext → complete the wipe (idempotent). NEVER re-emit.
+    # Verified: every present chunk is a covered subset → complete the wipe (idempotent). NEVER re-emit.
     wipe = _relocate_and_wipe(
         enc_dir, encounter_id, retained_dir, chunk_paths=[p for (p, _seq) in chunks])
     if wipe.residue:
@@ -771,8 +917,9 @@ def _recover_already_sealed(
         return SealOutcome(status=SEAL_STATUS_WIPE_INCOMPLETE, encounter_id=encounter_id)
     log.info(
         "scribe.retention.already_sealed", encounter_id=encounter_id,
-        detail="retention.sealed already on the chain, blob + manifest verified — completed the "
-               "plaintext wipe (idempotent crash-between-event-and-wipe recovery); no re-emit.")
+        detail="retention.sealed already on the chain, blob + sidecar + per-chunk subset verified — "
+               "completed the plaintext wipe (idempotent crash-between-event-and-wipe recovery); no "
+               "re-emit.")
     return SealOutcome(status=SEAL_STATUS_ALREADY_SEALED, encounter_id=encounter_id)
 
 
