@@ -1159,6 +1159,31 @@ def test_late_chunk_during_seal_survives_and_row_undercounts(tmp_path):
     assert (enc_dir / "chunk_3.webm").is_file()           # still kept — never destroyed on the recovery path
 
 
+def test_late_chunk_during_recovery_survives_and_no_false_clean(tmp_path):
+    # E1 (the D1 recovery-path sibling): a chunk arriving DURING recovery's verify window (between the
+    # chunk discovery and the step-5 wipe) is NOT in the manifest-scoped wipe set → it SURVIVES; the
+    # outcome is wipe_incomplete, NEVER a false already_sealed / 'completed the plaintext wipe'. Kills
+    # mutant M5b (re-deriving the RECOVERY wipe set via _discover_seal_chunks at the wipe call).
+    ev = _events(tmp_path)
+    enc_dir = _make_encounter(tmp_path, n_chunks=2)
+    _write_recovery_artifacts(tmp_path, enc_dir, ev)         # row + blob + sidecar for {1,2}
+
+    class _LateDuringRecovery(_FakeSealer):
+        # the PWA flushes a queued chunk during the recovery verify window (blob read + per-chunk hash).
+        def verify_wellformed(self, blob):
+            (enc_dir / "chunk_3.webm").write_bytes(b"late-arriving-consented-audio")
+            return super().verify_wellformed(blob)
+
+    with structlog.testing.capture_logs() as cap:
+        out = seal_encounter(enc_dir, _ENC, events=ev, sealer=_LateDuringRecovery(),
+                             recipient_public_key=_TEST_PUBKEY, retained_dir=tmp_path / "retained")
+    assert out.status == SEAL_STATUS_WIPE_INCOMPLETE
+    assert (enc_dir / "chunk_3.webm").is_file()             # the late chunk SURVIVES (never wiped unsealed)
+    assert not (enc_dir / "chunk_1.webm").exists()          # the covered chunks WERE wiped
+    assert [c for c in cap if c["event"] == "scribe.retention.wipe_incomplete"]
+    assert not [c for c in cap if c["event"] == "scribe.retention.already_sealed"]   # NO false clean
+
+
 def test_zero_chunk_recovery_residue_surfaces_incomplete(tmp_path):
     # D8: the zero-chunk arm of _recover_already_sealed has a residue leg — a residue-leaving zero-chunk
     # recovery must report wipe_incomplete, NOT a false 'already_sealed / completed the dir cleanup'.
