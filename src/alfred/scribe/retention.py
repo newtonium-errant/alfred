@@ -159,7 +159,11 @@ def _age_blob_wellformed(blob: bytes) -> bool:
     intro, at least one ``-> `` recipient stanza, the ``--- <mac>`` header terminator, AND a non-empty
     binary payload after it (findings 8/21/23: a prefix-only check passed a truncated blob). Base64
     body lines cannot contain ``-`` so the first ``\\n--- `` is unambiguously the header terminator.
-    Module-level so recovery can structurally gate a blob WITHOUT constructing a sealer (R4/R5)."""
+    Module-level (the structural parse needs no key/state), so it is reusable; the ONLY caller is
+    :meth:`AgeSealer.verify_wellformed`. Recovery does NOT call this sealer-free — it uses
+    ``sealer.verify_wellformed`` and fail-closed-refuses when ``sealer is None`` (R5), so the blob is
+    never structurally gated without a sealer (D17 — the prior 'recovery can gate without a sealer'
+    wording was false)."""
     if not blob.startswith(_AGE_V1_INTRO):
         return False
     mac_idx = blob.find(_AGE_HEADER_MAC)              # the "\n--- " terminating the header
@@ -234,6 +238,18 @@ _LOW_ORDER_X25519: frozenset[bytes] = frozenset({
 })
 
 
+def _is_low_order_x25519(point: bytes) -> bool:
+    """True iff ``point`` (a 32-byte X25519 u-coordinate, little-endian) is degenerate/low-order.
+    X25519 IGNORES bit 255 of u, so each blocked point has a HIGH-BIT TWIN (byte 31 | 0x80) that is
+    equally degenerate (libsodium's ``has_small_order`` compares ``s[31] & 0x7f``). Mask bit 255 before
+    the exact-match lookup so the twins are caught too (D7 — a twin previously cleared the check and
+    panicked pyrage.encrypt under a summary claiming sealing was available)."""
+    if len(point) != 32:
+        return False
+    masked = point[:31] + bytes([point[31] & 0x7f])
+    return masked in _LOW_ORDER_X25519
+
+
 def _bech32_convertbits(data: list[int], frombits: int, tobits: int) -> list[int] | None:
     """Base-conversion for bech32 (no padding — the age recipient payload is a whole 32 bytes)."""
     acc = 0
@@ -287,7 +303,7 @@ def is_valid_age_recipient(recipient: str) -> bool:
     if _bech32_polymod(hrp_expand + data) != 1:
         return False  # bad checksum
     point = _bech32_convertbits(data[:-6], 5, 8)
-    if point is None or len(point) != 32 or bytes(point) in _LOW_ORDER_X25519:
+    if point is None or len(point) != 32 or _is_low_order_x25519(bytes(point)):
         return False
     return True
 
@@ -345,7 +361,7 @@ class AgeSealer:
         # PANICS inside pyrage.encrypt (a pyo3 PanicException that is NOT an Exception). Screen it here
         # as a typed SealError; the belt-catch in seal() nets any point this blocklist misses.
         point = _decode_age_recipient_point(raw)
-        if point is not None and (len(point) != 32 or point in _LOW_ORDER_X25519):
+        if point is not None and (len(point) != 32 or _is_low_order_x25519(point)):
             raise SealError(
                 "recipient public key is a degenerate / low-order X25519 point — refused (it would "
                 "panic the age encrypt with an all-zero shared secret; finding 13)")

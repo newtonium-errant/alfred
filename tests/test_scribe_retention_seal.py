@@ -1445,6 +1445,29 @@ def test_age_prevalidation_rejects_degenerate_recipient_typed(tmp_path):
     assert sealer.seal(b"audio", pub).startswith(b"age-encryption.org/")
 
 
+def test_low_order_high_bit_twins_rejected(tmp_path):
+    # D7: X25519 ignores bit 255 of the u-coordinate, so each blocked low-order point has a HIGH-BIT
+    # TWIN (byte 31 | 0x80) that is equally degenerate. Without the s[31]&0x7f mask the twin cleared
+    # is_valid_age_recipient and panicked pyrage.encrypt. Every twin must now be rejected.
+    from alfred.scribe.retention import _LOW_ORDER_X25519, is_valid_age_recipient
+    for base in _LOW_ORDER_X25519:
+        twin = base[:31] + bytes([base[31] | 0x80])
+        assert twin not in _LOW_ORDER_X25519                 # the twin is NOT an exact blocklist member
+        assert is_valid_age_recipient(_bech32_encode_age(twin)) is False   # ...but the mask catches it
+
+
+def test_age_prevalidation_rejects_high_bit_twin(tmp_path):
+    # D7 (crypto level): sealing to a high-bit twin raises a TYPED SealError before pyrage (never a
+    # panic-escape under a summary claiming sealing is available).
+    pytest.importorskip("pyrage")
+    from alfred.scribe.retention import _LOW_ORDER_X25519, AgeSealer, SealError
+    sealer = AgeSealer()
+    base = next(iter(_LOW_ORDER_X25519))
+    twin = base[:31] + bytes([base[31] | 0x80])
+    with pytest.raises(SealError):
+        sealer.seal(b"audio", _bech32_encode_age(twin).encode("utf-8"))
+
+
 def test_age_seal_belt_catches_panic_into_typed_sealerror(tmp_path, monkeypatch):
     # finding 13 (R10): even a degenerate point the blocklist misses must not crash the daemon — the
     # belt-catch converts a pyo3 PanicException (which is NOT an Exception) into a typed SealError.
@@ -1464,14 +1487,16 @@ def test_age_seal_belt_catches_panic_into_typed_sealerror(tmp_path, monkeypatch)
         sealer.seal(b"audio", pub)
 
 
-def test_age_seal_belt_reraises_shutdown_signals(tmp_path, monkeypatch):
+@pytest.mark.parametrize("signal_exc", [KeyboardInterrupt, SystemExit])
+def test_age_seal_belt_reraises_shutdown_signals(tmp_path, monkeypatch, signal_exc):
     # the belt-catch must NEVER swallow a shutdown signal (KeyboardInterrupt / SystemExit) as a
-    # SealError — those propagate for a clean daemon shutdown.
+    # SealError — those propagate for a clean daemon shutdown. D16: SystemExit is now pinned too (the
+    # prior test threw only KeyboardInterrupt, so dropping SystemExit from the re-raise tuple survived).
     pytest.importorskip("pyrage")
     from alfred.scribe.retention import AgeSealer, generate_keypair
     pub, _priv = generate_keypair()
     sealer = AgeSealer()
     monkeypatch.setattr(sealer._pyrage, "encrypt",
-                        lambda *_a, **_k: (_ for _ in ()).throw(KeyboardInterrupt()))
-    with pytest.raises(KeyboardInterrupt):
+                        lambda *_a, **_k: (_ for _ in ()).throw(signal_exc()))
+    with pytest.raises(signal_exc):
         sealer.seal(b"audio", pub)
