@@ -29,7 +29,10 @@ from alfred.evstore import EventStoreError, sha256_hex
 from alfred.scribe.config import (
     RETENTION_MODE_RETAINED, RETENTION_MODE_TRANSIENT, load_from_unified,
 )
-from alfred.scribe.events import CLINICAL, KINDS, ScribeEvents
+from alfred.scribe.events import (
+    CLINICAL, KINDS, RETENTION_STR_FIELD_MAX, RETENTION_TICKET_REF_MAX,
+    RETENTION_UNSEAL_REASONS, ScribeEvents,
+)
 from alfred.scribe import retention as ret_mod
 from alfred.scribe.retention import (
     SEAL_BLOB_SUFFIX, SEAL_CIPHER, SEAL_MANIFEST_NAME, SEAL_STATUS_ALREADY_SEALED,
@@ -705,6 +708,63 @@ def test_retention_unsealed_caps_ticket_ref_length(tmp_path):
     ev.retention_unsealed(subject_id=_ENC, reason_code="rediarize", ticket_ref="TKT-42")
     row = ev.latest(CLINICAL, family="retention", kind="retention.unsealed")
     assert row["payload"] == {"reason_code": "rediarize", "ticket_ref": "TKT-42"}
+
+
+# ====== facade completeness: every free-string retention field is capped (R9 — findings 12/33/34) ======
+
+
+def test_retention_sibling_emitters_length_cap_free_strings(tmp_path):
+    # finding 12: a 4080-char PHI probe landed via a SIBLING emitter (schedule_published /
+    # destroy_intent / destroyed), whose free-string fields were uncapped, into the permanent,
+    # redaction-independent chain. EVERY retention emitter now facade-caps EVERY string field.
+    ev = _events(tmp_path)
+    phi = "Jane Doe DOB 1990-01-01 " * 200                   # 4800 chars of patient identifiers
+    for call in (
+        lambda: ev.retention_schedule_published(schedule_version=phi, schedule_sha256="a" * 64,
+                                                effective_date="2026-07-19"),
+        lambda: ev.retention_schedule_published(schedule_version="v1", schedule_sha256="a" * 64,
+                                                effective_date=phi),
+        lambda: ev.retention_destroy_intent(subject_id=_ENC, schedule_version=phi,
+                                            manifest_sha256="c" * 64),
+        lambda: ev.retention_destroyed(subject_id=_ENC, schedule_version=phi, manifest_sha256="c" * 64),
+        lambda: ev.retention_sealed(subject_id=_ENC, chunk_count=1, total_bytes=1,
+                                    manifest_sha256=phi, sealed_to_key_fp="fp", cipher=SEAL_CIPHER),
+    ):
+        with pytest.raises(EventStoreError):
+            call()
+    assert ev.query(CLINICAL, family="retention") == []      # NOTHING PHI-bearing landed in the chain
+
+
+def test_retention_ticket_ref_cap_boundary_pinned(tmp_path):
+    # finding 33: the ticket_ref cap is pinned at its exact BOUNDARY (128 accepted / 129 rejected) so a
+    # future 'ticket URLs got longer' tweak that weakens it (e.g. 3500) trips a test — it must not
+    # silently readmit the original 3100-char PHI probe.
+    assert RETENTION_TICKET_REF_MAX == 128
+    ev = _events(tmp_path)
+    ev.retention_unsealed(subject_id=_ENC, reason_code="audit", ticket_ref="x" * 128)   # exactly 128 OK
+    assert ev.latest(CLINICAL, family="retention", kind="retention.unsealed")["payload"]["ticket_ref"] \
+        == "x" * 128
+    with pytest.raises(EventStoreError):
+        ev.retention_unsealed(subject_id=_ENC, reason_code="audit", ticket_ref="x" * 129)  # 129 rejected
+
+
+def test_retention_str_field_cap_boundary_pinned(tmp_path):
+    # the sibling-field cap boundary (128 accepted / 129 rejected) is pinned too, so weakening
+    # RETENTION_STR_FIELD_MAX trips a test.
+    assert RETENTION_STR_FIELD_MAX == 128
+    ev = _events(tmp_path)
+    ev.retention_schedule_published(schedule_version="v" * 128, schedule_sha256="a" * 64,
+                                    effective_date="2026-07-19")                       # 128 OK
+    with pytest.raises(EventStoreError):
+        ev.retention_schedule_published(schedule_version="v" * 129, schedule_sha256="a" * 64,
+                                        effective_date="2026-07-19")                   # 129 rejected
+
+
+def test_retention_unseal_reasons_exact_membership_pinned():
+    # finding 34: the closed reason enum's EXACT membership is pinned so an enum-widening mutant (a
+    # catch-all 'other') trips a test — the chain-auditability of 'why was this sealed audio opened'
+    # (CMPA/dispute reconstruction) depends on the enum staying closed.
+    assert RETENTION_UNSEAL_REASONS == frozenset({"dispute", "audit", "rediarize", "clinical_review"})
 
 
 # ====== manifest-scoped wipe (R1/R2/R6/R12 — findings 1/2/3/4/5/6/11/15/26/31/40/41) ======

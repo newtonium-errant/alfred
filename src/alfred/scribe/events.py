@@ -45,6 +45,29 @@ RETENTION_UNSEAL_REASONS: frozenset[str] = frozenset(
     {"dispute", "audit", "rediarize", "clinical_review"})
 RETENTION_TICKET_REF_MAX = 128  # generous for a real ticket ref / short URL; bounds a PHI injection
 
+# Facade length cap on EVERY other free-string retention payload field (schedule_version,
+# effective_date, the digest strings, cipher). finding 12 landed a 4080-char patient name through a
+# SIBLING emitter (retention_schedule_published's schedule_version/effective_date were uncapped) into
+# the permanent, redaction-independent chain. The design's premise "ticket_ref is the ONLY non-enum
+# retention string" (§6) is only TRUE if the facade caps the rest — so every retention emitter now
+# length-caps each string field it forwards (versions/dates/digests are all << this bound; a PHI probe
+# is not). Fail-closed (raise), never truncate — a truncated patient name is still PHI.
+RETENTION_STR_FIELD_MAX = 128
+
+
+def _cap_retention_str(kind: str, field: str, value: Any, max_len: int) -> str:
+    """Coerce a retention payload string field to ``str`` and RAISE past ``max_len`` (finding 12 /
+    design §6/§8 — the chain carries ids/enums/digests/scalars only and SURVIVES destruction, so an
+    over-long free string is PERMANENT, unredactable PHI residue). Applied at the facade, the design's
+    mandated enforcement point, to EVERY string field of EVERY retention emitter."""
+    s = str(value)
+    if len(s) > max_len:
+        raise EventStoreError(
+            f"retention {kind} field {field!r} exceeds the {max_len}-char facade cap (got {len(s)}) — "
+            f"retention payloads carry ids/enums/digests/scalars only; route free text to "
+            f"vault_audit.log so the PHI-free chain stays redaction-independent")
+    return s
+
 # Envelope actor_kind allowlist (§3.2). The typed emitters HARDCODE their (valid) kind, so they
 # enforce it by construction; the ONE caller-supplied path is ``access_read`` (the kind rides the
 # ``access_actor`` ContextVar), which coerces an out-of-allowlist value to ``"unknown"`` via
@@ -498,25 +521,38 @@ class ScribeEvents:
     ) -> AppendReceipt:
         """Durable [D]. The seal attestation — the encounter's audio was sealed to the offline-key
         archive (retention.py §3.3). RAISES on a store-down append: the seal is NOT acknowledged
-        and the caller MUST NOT wipe plaintext (fail-closed, the ordering contract)."""
+        and the caller MUST NOT wipe plaintext (fail-closed, the ordering contract). Every string
+        field is facade length-capped (finding 12) even though the daemon supplies real digests."""
         return self._emit_durable(
             CLINICAL, "retention.sealed", subject_id=subject_id, actor="stayc_scribe",
             actor_kind="system", now=now,
             payload={"chunk_count": int(chunk_count), "total_bytes": int(total_bytes),
-                     "manifest_sha256": manifest_sha256, "sealed_to_key_fp": sealed_to_key_fp,
-                     "cipher": cipher})
+                     "manifest_sha256": _cap_retention_str(
+                         "sealed", "manifest_sha256", manifest_sha256, RETENTION_STR_FIELD_MAX),
+                     "sealed_to_key_fp": _cap_retention_str(
+                         "sealed", "sealed_to_key_fp", sealed_to_key_fp, RETENTION_STR_FIELD_MAX),
+                     "cipher": _cap_retention_str(
+                         "sealed", "cipher", cipher, RETENTION_STR_FIELD_MAX)})
 
     def retention_schedule_published(
         self, *, schedule_version: str, schedule_sha256: str, effective_date: str,
         now: str | None = None,
     ) -> AppendReceipt:
         """Durable [D]. Pins which s.50 schedule governs this box (§4, slice 13c). Box-global, not
-        per-encounter, so ``subject_id`` is empty (like ``store.heartbeat``)."""
+        per-encounter, so ``subject_id`` is empty (like ``store.heartbeat``). Every string field is
+        facade length-capped (finding 12 — the 13c CLI passes operator-typed version/date strings)."""
         return self._emit_durable(
             CLINICAL, "retention.schedule_published", subject_id="", actor="operator",
             actor_kind="operator", now=now,
-            payload={"schedule_version": schedule_version, "schedule_sha256": schedule_sha256,
-                     "effective_date": effective_date})
+            payload={"schedule_version": _cap_retention_str(
+                         "schedule_published", "schedule_version", schedule_version,
+                         RETENTION_STR_FIELD_MAX),
+                     "schedule_sha256": _cap_retention_str(
+                         "schedule_published", "schedule_sha256", schedule_sha256,
+                         RETENTION_STR_FIELD_MAX),
+                     "effective_date": _cap_retention_str(
+                         "schedule_published", "effective_date", effective_date,
+                         RETENTION_STR_FIELD_MAX)})
 
     def retention_unsealed(
         self, *, subject_id: str, reason_code: str, ticket_ref: str, now: str | None = None,
@@ -551,11 +587,17 @@ class ScribeEvents:
         """Durable [D]. Phase 1 of the two-phase s.49 destruction (§5.2, slice 13d). MUST land
         before the first PHI unlink — a crash after intent leaves an incomplete destruction that
         ``retention verify`` flags + a re-run completes (unlink is idempotent). RAISES on failure:
-        a store-down destroy does NOT proceed to any unlink."""
+        a store-down destroy does NOT proceed to any unlink. Every string field is facade
+        length-capped (finding 12 — the 13d CLI passes an operator-typed schedule_version)."""
         return self._emit_durable(
             CLINICAL, "retention.destroy_intent", subject_id=subject_id, actor="operator",
             actor_kind="operator", now=now,
-            payload={"schedule_version": schedule_version, "manifest_sha256": manifest_sha256})
+            payload={"schedule_version": _cap_retention_str(
+                         "destroy_intent", "schedule_version", schedule_version,
+                         RETENTION_STR_FIELD_MAX),
+                     "manifest_sha256": _cap_retention_str(
+                         "destroy_intent", "manifest_sha256", manifest_sha256,
+                         RETENTION_STR_FIELD_MAX)})
 
     def retention_destroyed(
         self, *, subject_id: str, schedule_version: str, manifest_sha256: str,
@@ -563,11 +605,15 @@ class ScribeEvents:
     ) -> AppendReceipt:
         """Durable [D]. Phase 2 of the two-phase s.49 destruction (§5.2, slice 13d) — emitted ONLY
         after every PHI artifact (+ backups) is unlinked. The #11 chain SURVIVES destruction (it is
-        PHI-free — proof-of-destruction is permanent)."""
+        PHI-free — proof-of-destruction is permanent). Every string field is facade length-capped
+        (finding 12)."""
         return self._emit_durable(
             CLINICAL, "retention.destroyed", subject_id=subject_id, actor="operator",
             actor_kind="operator", now=now,
-            payload={"schedule_version": schedule_version, "manifest_sha256": manifest_sha256})
+            payload={"schedule_version": _cap_retention_str(
+                         "destroyed", "schedule_version", schedule_version, RETENTION_STR_FIELD_MAX),
+                     "manifest_sha256": _cap_retention_str(
+                         "destroyed", "manifest_sha256", manifest_sha256, RETENTION_STR_FIELD_MAX)})
 
     def retention_sealed_row(self, subject_id: str) -> dict | None:
         """The encounter's durable ``retention.sealed`` row, or ``None`` if it was never sealed —
