@@ -616,6 +616,57 @@ def test_review_glob_failure_marks_not_surfaced_and_latches(tmp_path, monkeypatc
     assert [c for c in cap if c["event"] == "scribe.retention.sweep.review_enumeration_failed"]
 
 
+def test_review_spool_bytes_are_only_count_and_opaque_id(tmp_path):
+    # E4: the review-spool bytes carry ONLY generated_at/surfaced/review_due/oldest_encounter_id (the
+    # oldest an OPAQUE salted-HMAC id) — no label, no patient content — EVEN when the over-window
+    # encounter's LABEL is PHI. Assert against the actual written bytes.
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    spool = tmp_path / "spool" / "retention_review.spool"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    cfg.retention.review_spool_path = str(spool)
+    _publish_sched(cfg, encounter_audio_sealed=1)
+    ev = _events(tmp_path)
+    label = "jane-doe-1990-chest-pain"                       # a PHI label
+    enc_id = compute_encounter_id(label, salt=_SALT)         # the OPAQUE id (salted HMAC)
+    ev.retention_sealed(subject_id=enc_id, chunk_count=1, total_bytes=1, manifest_sha256="a" * 64,
+                        sealed_to_key_fp="fp", cipher="age-x25519",
+                        now=(_NOW - timedelta(days=400)).isoformat())   # OLD row ts → over-window
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    (retained / f"{enc_id}{SEAL_BLOB_SUFFIX}").write_bytes(b"FAKESEAL1")
+
+    _sweep(cfg, ev)._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    raw = spool.read_bytes().decode("utf-8")
+    assert "jane" not in raw.lower() and "doe" not in raw.lower() and "chest" not in raw.lower()
+    assert f"oldest_encounter_id: {enc_id}" in raw          # the opaque id, == the blob stem
+    value_keys = {ln.split(":", 1)[0] for ln in raw.splitlines() if ":" in ln and not ln.startswith("#")}
+    assert value_keys == {"generated_at", "surfaced", "review_due", "oldest_encounter_id"}
+
+
+def test_review_spool_write_failure_latched(tmp_path, monkeypatch):
+    # E5: a persistently-unwritable spool path is a STEADY-STATE condition — latch (once), not a bare
+    # warning every 30s tick (the module's latch discipline).
+    spool = tmp_path / "spool" / "retention_review.spool"
+    cfg = _config(tmp_path)
+    cfg.retention.review_spool_path = str(spool)
+    real = ret_mod._atomic_write_bytes
+
+    def _boom(path, data):
+        if str(path).endswith("retention_review.spool"):
+            raise OSError("read-only spool path")
+        return real(path, data)
+
+    monkeypatch.setattr(ret_mod, "_atomic_write_bytes", _boom)
+    sweep = _sweep(cfg, _events(tmp_path))
+    state = ScribeState(tmp_path / "state.json")
+    with structlog.testing.capture_logs() as cap:
+        sweep._run_sync(state, _NOW)
+        sweep._run_sync(state, _NOW)
+    fails = [c for c in cap if c["event"] == "scribe.retention.sweep.review_spool_write_failed"]
+    assert len(fails) == 1                                   # latched — once across two sweeps
+
+
 def test_review_due_latch_rearms_after_resolution(tmp_path):
     # C4: the review_due latch is a RESOLVABLE alert — it must re-arm when due→0 so a LATER cohort
     # re-emits the signal (not once-per-daemon-lifetime like a steady-state condition).

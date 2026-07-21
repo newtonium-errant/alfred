@@ -561,10 +561,15 @@ class RetentionSweep:
         try:
             ret._atomic_write_bytes(Path(path), data)
         except OSError:
-            log.warning(
-                "scribe.retention.sweep.review_spool_write_failed",
+            # E5: a persistently-unwritable spool path is a STEADY-STATE condition — latch (once), not
+            # a bare warning every 30s tick (the module's latch discipline). A successful write clears
+            # the latch so a later regression re-warns.
+            self._latch_log(
+                "review_spool_write_failed", "scribe.retention.sweep.review_spool_write_failed",
                 detail="could not write the §4 review relay spool — the morning-review line will read "
-                       "stale/no-data until the next successful write. Best-effort.")
+                       "stale/no-data until the next successful write. Check the path perms. Latched.")
+            return
+        self._latched.discard("review_spool_write_failed")  # a good write re-arms the warning
 
     def _load_schedule(self) -> dict | None:
         """The published s.50 schedule dict, or ``None`` when the path is unset / absent / malformed —
