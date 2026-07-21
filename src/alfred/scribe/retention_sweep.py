@@ -198,9 +198,20 @@ class RetentionSweep:
             can_seal = sealer is not None and pubkey != b""
         summary.sealing_available = can_process and can_seal
 
+        # Each leg below is a SIBLING, wrapped so a stat-EACCES (pathlib re-raises EACCES on
+        # is_file/is_dir when a parent dir is unsearchable) folds into a latched escalation instead of
+        # escaping _run_sync and killing this tick's ILB summary + the needs_operator_attention
+        # emission (D5). The specific stat sites are also individually guarded; this is the backstop.
+
         # (1)+(2) seal READY / defensively-seal abandoned + (§E) dispose empty-closed — enumerate subdirs.
         if can_process:
-            self._process_encounters(state, now_dt, now_iso, sealer, pubkey, can_seal, summary)
+            try:
+                self._process_encounters(state, now_dt, now_iso, sealer, pubkey, can_seal, summary)
+            except OSError:
+                summary.encounter_errors += 1
+                self._latch_log("process_eacces", "scribe.retention.sweep.process_leg_eacces",
+                                detail="the encounter-processing leg hit an unsearchable dir (EACCES) — "
+                                       "isolated so the sweep summary + escalation still emit. Latched.")
 
         # Load the s.50 schedule ONCE (fail-closed None) and thread it into both surfacing + the prune
         # (avoids a double read; both are PHI-free observability, independent of the store gate).
@@ -208,11 +219,21 @@ class RetentionSweep:
 
         # (3) over-window surfacing (§4) — no schedule ⇒ latched ILB; a schedule ⇒ count over-window
         # sealed encounters (surface-only, NEVER auto-destroy).
-        self._surface_over_window(now_dt, summary, schedule)
+        try:
+            self._surface_over_window(now_dt, summary, schedule)
+        except OSError:
+            self._latch_log("surface_eacces", "scribe.retention.sweep.surface_leg_eacces",
+                            detail="the over-window surfacing leg hit an unsearchable dir (EACCES) — "
+                                   "isolated so the sweep summary + escalation still emit. Latched.")
 
         # (4) diarize_stats rolling prune (§0.1/§4) — PHI-free log rotation, no retention.* event; the
         # window now comes from the schedule's diarize_stats class (fallback 180d when unpublished).
-        summary.pruned_telemetry_rows = self._prune_diarize_stats(now_dt, schedule)
+        try:
+            summary.pruned_telemetry_rows = self._prune_diarize_stats(now_dt, schedule)
+        except OSError:
+            self._latch_log("prune_eacces", "scribe.retention.sweep.prune_leg_eacces",
+                            detail="the telemetry-prune leg hit an unsearchable dir (EACCES) — isolated "
+                                   "so the sweep summary + escalation still emit. Latched.")
 
         # Sweep summary — ALWAYS emitted (intentionally-left-blank: idle is distinguishable from broken).
         did = summary.did_work()
@@ -260,7 +281,12 @@ class RetentionSweep:
     ) -> None:
         cfg = self._config
         input_dir = Path(cfg.input_dir)
-        if not input_dir.is_dir():
+        try:
+            input_present = input_dir.is_dir()
+        except OSError:
+            return  # D5: a stat-EACCES on the inbox parent must not escape — skip this leg (the sweep
+            #         summary + operator-attention emission survive; the pipeline's own error covers it)
+        if not input_present:
             return  # nothing to seal — the pipeline's own idle signal covers the missing-inbox case
         retained_dir = self._resolved_retained_dir()
         grace_days = cfg.retention.abandon_grace_days
@@ -466,7 +492,12 @@ class RetentionSweep:
         if not enrollment_dir:
             return 0  # the voice-enrollment feature is dormant — no sink to prune (summary shows 0)
         sink = Path(enrollment_dir) / LEARNING_DIRNAME / CAPTURE_NAME
-        if not sink.is_file():
+        try:
+            sink_present = sink.is_file()
+        except OSError:
+            return 0  # D5: a stat-EACCES on the learning dir must not escape after encounters were
+            #           processed — swallow it so the tick's summary + operator-attention still emit
+        if not sink_present:
             return 0
         prune_days = _DIARIZE_STATS_PRUNE_DAYS
         if schedule is not None:
@@ -593,7 +624,20 @@ class RetentionSweep:
                        "keygen ceremony is slice 13d). Retention sealing is SKIPPED. Latched once.")
             return b""
         p = Path(path)
-        if not p.is_file():
+        try:
+            key_present = p.is_file()
+        except OSError:
+            # D5: a stat-EACCES (an unsearchable PARENT dir — pathlib re-raises EACCES on is_file, only
+            # ENOENT/ENOTDIR/EBADF/ELOOP are swallowed) is the same operator-facing condition as an
+            # unreadable key. Latch the unreadable signal + return b"" — NEVER let it escape _run_sync
+            # and kill the tick's ILB summary + the needs_operator_attention emission.
+            self._latch_log(
+                "pubkey_unreadable",
+                "scribe.retention.sweep.seal_public_key_unreadable",
+                detail="the retention.seal_public_key_path could not be stat'd (unsearchable parent "
+                       "dir / perms) — retention sealing is SKIPPED until it is reachable. Latched once.")
+            return b""
+        if not key_present:
             self._latch_log(
                 "no_pubkey",
                 "scribe.retention.sweep.no_seal_public_key",

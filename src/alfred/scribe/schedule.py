@@ -175,11 +175,13 @@ def load_schedule(path: str | Path) -> dict | None:
     FAIL-CLOSED for the sweep (a malformed schedule is treated as no usable schedule → skip surfacing,
     never crash the sweep). Use :func:`validate_schedule` directly when a raise is wanted (the CLI)."""
     p = Path(path)
-    if not p.is_file():
-        return None
     try:
+        if not p.is_file():
+            return None
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        # absent / unreadable / unsearchable-parent (is_file re-raises EACCES) / malformed → fail-closed
+        # None (the sweep skips surfacing; D5 — a stat-EACCES must not escape and kill the sweep tick).
         return None
     try:
         return validate_schedule(data)

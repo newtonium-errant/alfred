@@ -876,6 +876,53 @@ def test_closed_with_chunks_no_row_still_skipped(tmp_path):
     assert enc_dir.exists()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses 0o000 unsearchable-dir perms")
+def test_sweep_unsearchable_keydir_survives_and_latches(tmp_path):
+    # D5(a): a stat-EACCES on the seal-key's PARENT dir (pathlib re-raises EACCES on is_file) must NOT
+    # escape _run_sync — it latches seal_public_key_unreadable + sealing_available=False, and the
+    # per-tick ILB summary still emits.
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "keydir-locked")
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+    keydir = Path(cfg.retention.seal_public_key_path).parent
+    os.chmod(keydir, 0o000)
+    try:
+        with structlog.testing.capture_logs() as cap:
+            summary = _sweep(cfg, ev)._run_sync(state, _NOW)          # must NOT raise
+    finally:
+        os.chmod(keydir, 0o700)
+    assert summary.sealing_available is False
+    assert enc_dir.exists()                                            # not sealed (no reachable key)
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.seal_public_key_unreadable"]
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep"]  # the ILB summary survived
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses 0o000 unsearchable-dir perms")
+def test_sweep_prune_leg_eacces_preserves_operator_attention(tmp_path):
+    # D5(b): a wipe_incomplete escalation found THIS tick must NOT be swallowed by a later prune-leg
+    # stat-EACCES — the summary + the needs_operator_attention error still emit.
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    enc_dir, enc_id = _make_encounter(cfg, "residue-and-locked-sink")
+    (enc_dir / "nested-cache").mkdir()                                 # blocks rmdir → wipe_incomplete
+    state = ScribeState(tmp_path / "state.json")
+    state.set(enc_id, state=STATE_READY)
+    learning = Path(cfg.diarize.enrollment_dir) / "learning"
+    learning.mkdir(parents=True, exist_ok=True)
+    (learning / "attest_capture.jsonl").write_text("", encoding="utf-8")   # the sink exists
+    os.chmod(learning, 0o000)                                         # its stat now EACCES
+    try:
+        with structlog.testing.capture_logs() as cap:
+            summary = _sweep(cfg, ev)._run_sync(state, _NOW)          # must NOT raise
+    finally:
+        os.chmod(learning, 0o700)
+    assert summary.wipe_incomplete == 1
+    assert summary.needs_operator_attention() is True
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.needs_operator_attention"]
+
+
 def test_capture_sink_lock_is_exclusive(tmp_path):
     # finding 19: capture_sink_lock is a REAL exclusive flock on a STABLE lock file — while held, a
     # second (different-fd) non-blocking acquisition of the same lock file FAILS. This is the mutual
