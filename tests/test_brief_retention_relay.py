@@ -110,6 +110,30 @@ def test_unparseable_header_renders_no_data(tmp_path):
     assert "no data" in out
 
 
+def test_spool_is_a_directory_renders_no_data(tmp_path):
+    # E6 bind-check: the OSError read branch — a spool path that is a DIRECTORY raises IsADirectoryError
+    # (an OSError subclass) on read; the reader degrades to an explicit 'no data' line + a load-failed
+    # warning, never an escaping raise that would kill the bare daemon render. (The reader is locally
+    # defensive — FileNotFoundError / OSError / UnicodeDecodeError — pending the #25 helper at merge.)
+    import structlog
+
+    d = tmp_path / "spool_is_a_dir"
+    d.mkdir()
+    with structlog.testing.capture_logs() as cap:
+        out = render_stayc_retention_relay_section(_cfg(str(d)), _NOW)
+    assert "no data" in out and "unreadable" in out
+    assert [c for c in cap if c["event"] == "brief.stayc_retention_relay" and c.get("state") == "unreadable"]
+
+
+def test_non_utf8_spool_renders_no_data(tmp_path):
+    # E6 bind-check: the UnicodeDecodeError read branch (subclasses ValueError, NOT OSError) — a
+    # non-UTF-8 spool degrades to 'no data', never an escaping raise.
+    p = tmp_path / "retention_review.spool"
+    p.write_bytes(b"\xff\xfe not utf-8 \x00 bytes")
+    out = render_stayc_retention_relay_section(_cfg(str(p)), _NOW)
+    assert "no data" in out
+
+
 def test_config_loader_parses_retention_relay():
     cfg = load_from_unified({"brief": {"stayc_retention_relay": {
         "enabled": True, "spool_path": "/data/retention_review.spool", "staleness_hours": 30}}})
