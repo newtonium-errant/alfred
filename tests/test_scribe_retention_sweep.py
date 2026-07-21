@@ -550,6 +550,43 @@ def test_diarize_window_comes_from_schedule(tmp_path):
     assert summary.pruned_telemetry_rows == 1              # dropped by the 30d schedule window
 
 
+def test_review_spool_written_phi_free(tmp_path):
+    # C3 producer: the sweep writes a PHI-FREE whole-file review spool (generated_at + review_due +
+    # oldest OPAQUE encounter_id) when review_spool_path is set — the §4 morning-review surface.
+    sched_path = tmp_path / "seal" / "retention_schedule.json"
+    spool = tmp_path / "spool" / "retention_review.spool"
+    cfg = _config(tmp_path, schedule_path=str(sched_path))
+    cfg.retention.review_spool_path = str(spool)
+    _publish_sched(cfg, encounter_audio_sealed=1)
+    retained = Path(cfg.input_dir).parent / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    old = retained / f"enc-oldest{SEAL_BLOB_SUFFIX}"
+    old.write_bytes(b"FAKESEAL1")
+    ts = (_NOW - timedelta(days=10)).timestamp()
+    os.utime(old, (ts, ts))
+
+    _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    text = spool.read_text()
+    assert "review_due: 1" in text
+    assert "oldest_encounter_id: enc-oldest" in text        # opaque id only (PHI-free)
+    assert "generated_at:" in text
+    assert "jane" not in text.lower() and "doe" not in text.lower()   # no PHI / labels / bodies
+
+
+def test_review_spool_written_even_when_idle_ilb(tmp_path):
+    # C3 ILB: the spool is written EVERY sweep (review_due 0 when nothing due) — a fresh snapshot proves
+    # the sweep is alive; a stale spool surfaces a dead sweep in the brief.
+    spool = tmp_path / "spool" / "retention_review.spool"
+    cfg = _config(tmp_path)                                  # no schedule → review_due 0
+    cfg.retention.review_spool_path = str(spool)
+
+    _sweep(cfg, _events(tmp_path))._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    text = spool.read_text()
+    assert "review_due: 0" in text and "oldest_encounter_id:" in text
+
+
 def test_review_due_latch_rearms_after_resolution(tmp_path):
     # C4: the review_due latch is a RESOLVABLE alert — it must re-arm when due→0 so a LATER cohort
     # re-emits the signal (not once-per-daemon-lifetime like a steady-state condition).

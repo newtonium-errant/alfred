@@ -294,6 +294,11 @@ class ScribeRetentionConfig:
     # operator's config / installer sites it at <STAYC_SEAL_DIR>/retention_schedule.json (§3.1). The
     # s.50 schedule artifact (slice 13c).
     schedule_path: str = ""
+    # Empty ⇒ the §4 morning-review relay spool is NOT written (surfacing rides the daemon log only).
+    # When set, the sweep writes a PHI-FREE whole-file snapshot (generated_at + review_due count +
+    # oldest over-window encounter_id — an opaque salted-HMAC id, no PHI) that Salem's Morning Brief
+    # reads (stayc_relay), so the s.50 review obligation reaches the morning-review cadence (§4, C3).
+    review_spool_path: str = ""
     # Stale-encounter defensive-seal grace (§3.6, slice 13b) — not consumed by 13a.
     abandon_grace_days: int = _DEFAULT_ABANDON_GRACE_DAYS
 
@@ -550,7 +555,7 @@ def _build_retention(data: Any) -> ScribeRetentionConfig:
     cfg = ScribeRetentionConfig()
     if "mode" in known:
         cfg.mode = _normalize_retention_mode(known["mode"])
-    for str_field in ("retained_dir", "seal_public_key_path", "schedule_path"):
+    for str_field in ("retained_dir", "seal_public_key_path", "schedule_path", "review_spool_path"):
         if str_field in known:
             v = known[str_field]
             setattr(cfg, str_field, "" if v is None else str(v))

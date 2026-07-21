@@ -122,6 +122,7 @@ class RetentionSweepSummary:
     encounter_errors: int = 0        # per-encounter failures, ISOLATED (the sweep continued)
     pruned_telemetry_rows: int = 0   # diarize_stats rows dropped (age-based, PHI-free log rotation)
     review_due: int = 0              # §4 over-window PHI classes surfaced (0 until 13c's schedule)
+    oldest_review_encounter_id: str = ""  # §4/C3 — the oldest over-window encounter (opaque id, for the spool)
     sealing_available: bool = True   # was the seal path usable (active store + sealer + pubkey)
     schedule_present: bool = False   # was an s.50 schedule found (False until 13c)
 
@@ -234,6 +235,9 @@ class RetentionSweep:
             self._latch_log("prune_eacces", "scribe.retention.sweep.prune_leg_eacces",
                             detail="the telemetry-prune leg hit an unsearchable dir (EACCES) — isolated "
                                    "so the sweep summary + escalation still emit. Latched.")
+
+        # (5) §4 morning-review relay spool (C3) — PHI-free whole-file snapshot Salem's brief reads.
+        self._write_review_spool(now_dt, summary)
 
         # Sweep summary — ALWAYS emitted (intentionally-left-blank: idle is distinguishable from broken).
         did = summary.did_work()
@@ -452,6 +456,8 @@ class RetentionSweep:
         retained_dir = self._resolved_retained_dir()
         cutoff = now_dt.timestamp() - window_days * 86400
         due = 0
+        oldest_id = ""
+        oldest_ts = None
         try:
             blobs = list(retained_dir.glob(f"*{ret.SEAL_BLOB_SUFFIX}"))
         except OSError:
@@ -460,7 +466,11 @@ class RetentionSweep:
             basis = self._over_window_basis_ts(blob)  # C5: the durable row ts, fallback blob mtime
             if basis is not None and basis.timestamp() < cutoff:
                 due += 1
+                if oldest_ts is None or basis < oldest_ts:  # track the OLDEST over-window encounter (C3)
+                    oldest_ts = basis
+                    oldest_id = blob.stem                    # <encounter_id>.age → opaque id, PHI-free
         summary.review_due = due
+        summary.oldest_review_encounter_id = oldest_id
         if due > 0:
             self._latch_log(
                 "review_due",
@@ -503,6 +513,36 @@ class RetentionSweep:
             return datetime.fromtimestamp(blob.stat().st_mtime, tz=timezone.utc)
         except OSError:
             return None
+
+    # The §4 morning-review relay spool header ts format (UTC, Z-suffixed) — MUST match
+    # ``brief.stayc_relay._TS_FORMAT`` (the cross-component contract the brief reader parses).
+    _REVIEW_SPOOL_TS = "%Y-%m-%dT%H:%M:%SZ"
+
+    def _write_review_spool(self, now_dt: datetime, summary: RetentionSweepSummary) -> None:
+        """Write the PHI-FREE §4 morning-review relay spool (C3) — a whole-file snapshot Salem's
+        Morning Brief reads (``brief.stayc_relay``) so the s.50 review obligation reaches the
+        morning-review cadence, not just the daemon log. Written EVERY sweep when
+        ``review_spool_path`` is configured (ILB: a fresh snapshot proves the sweep is alive; a stale
+        one surfaces a dead sweep in the brief). Carries ONLY generated_at + the ``review_due`` count
+        + the oldest over-window ``encounter_id`` (an opaque salted-HMAC id) — no PHI, no bodies.
+        Atomic write; best-effort (a write failure never crashes the sweep)."""
+        path = (self._config.retention.review_spool_path or "").strip()
+        if not path:
+            return
+        lines = [
+            "# STAY-C retention review — relay snapshot",
+            f"generated_at: {now_dt.strftime(self._REVIEW_SPOOL_TS)}",
+            f"review_due: {summary.review_due}",
+            f"oldest_encounter_id: {summary.oldest_review_encounter_id}",
+        ]
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+        try:
+            ret._atomic_write_bytes(Path(path), data)
+        except OSError:
+            log.warning(
+                "scribe.retention.sweep.review_spool_write_failed",
+                detail="could not write the §4 review relay spool — the morning-review line will read "
+                       "stale/no-data until the next successful write. Best-effort.")
 
     def _load_schedule(self) -> dict | None:
         """The published s.50 schedule dict, or ``None`` when the path is unset / absent / malformed —
