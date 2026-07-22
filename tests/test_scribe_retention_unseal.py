@@ -239,16 +239,77 @@ def test_unseal_cli_manifest_mismatch_fails_closed_no_event(tmp_path, capsys, mo
 
 def test_unseal_record_only_emits_without_decrypt(tmp_path, capsys):
     cfg_path, ev = _cfg_and_ev(tmp_path)
+    # The encounter WAS sealed on-box (chain row exists); the operator opened it off-box → record-only.
+    _r, enc, _m = _sealed(tmp_path, ev, _FakeSealer(), retained=tmp_path / "retained")
     cli._cmd_scribe_retention(_unseal_ns(
-        cfg_path, "enc-offbox-open", reason="audit", ticket="TCK-2", record_only=True,
+        cfg_path, enc, reason="audit", ticket="TCK-2", record_only=True,
         justification="opened off-box on trusted-laptop-07"))
     summary = json.loads(capsys.readouterr().out)
-    assert summary == {"unsealed": True, "record_only": True, "encounter_id": "enc-offbox-open",
+    assert summary == {"unsealed": True, "record_only": True, "encounter_id": enc,
                        "reason_code": "audit"}
-    rows = ev.query(CLINICAL, family="retention", kind="retention.unsealed", subject_id="enc-offbox-open")
+    rows = ev.query(CLINICAL, family="retention", kind="retention.unsealed", subject_id=enc)
     assert len(rows) == 1 and rows[0]["payload"] == {"reason_code": "audit", "ticket_ref": "TCK-2"}
     audit = (tmp_path / "data" / "vault_audit.log").read_text(encoding="utf-8")
     assert "off-box on trusted-laptop-07" in audit and "RECORD-ONLY" in audit
+
+
+def test_unseal_refuses_blob_without_chain_row(tmp_path, capsys, monkeypatch):
+    """WARN-1: a blob + sidecar exist on disk but NO retention.sealed chain row → fail-closed, NO
+    decrypt, NO event. Serving PHI the chain does not attest violates chain-is-source-of-truth (#11)."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    retained = tmp_path / "retained"
+    retained.mkdir(parents=True, exist_ok=True)
+    enc = "enc-planted-no-row"
+    (retained / f"{enc}.age").write_bytes(b"FAKESEAL1planted")          # a blob with NO chain row
+    (retained / f"{enc}.manifest.json").write_text(
+        json.dumps({"manifest": [], "blob_sha256": "x"}), encoding="utf-8")
+    monkeypatch.setattr(ret, "make_default_sealer", lambda: _FakeSealer())
+    keyfile = tmp_path / "id.txt"
+    keyfile.write_text("AGE-SECRET-KEY-X", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    with pytest.raises(SystemExit):
+        cli._cmd_scribe_retention(_unseal_ns(cfg_path, enc, key=str(keyfile), out=str(out_dir)))
+    err = json.loads(capsys.readouterr().out)
+    assert "no retention.sealed row" in err["error"]
+    assert ev.query(CLINICAL, family="retention", kind="retention.unsealed", subject_id=enc) == []
+    assert not out_dir.exists()                                         # NO decrypt happened
+
+
+def test_record_only_refuses_enc_without_chain_row(tmp_path, capsys):
+    """WARN-1 (record-only leg): attesting an unseal of a never-sealed enc is equally wrong."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    with pytest.raises(SystemExit):
+        cli._cmd_scribe_retention(_unseal_ns(
+            cfg_path, "enc-never-sealed", reason="audit", ticket="T", record_only=True))
+    err = json.loads(capsys.readouterr().out)
+    assert "no retention.sealed row" in err["error"]
+    assert ev.query(CLINICAL, family="retention", kind="retention.unsealed",
+                    subject_id="enc-never-sealed") == []
+
+
+def test_unseal_failed_decrypt_preserves_pre_existing_operator_chunk(tmp_path, capsys, monkeypatch):
+    """WARN-2: a reused --out with an operator's own chunk_9.webm is NOT collateral-wiped when the
+    unseal fails (verify-then-write wrote nothing, so only the pre-existing file is present — the wipe
+    must protect it)."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    sealer = _FakeSealer()
+    _r, enc, _m = _sealed(tmp_path, ev, sealer, retained=tmp_path / "retained")
+    # Corrupt the sidecar so unseal_to_dir fails AFTER out_dir is (pre)populated by the operator.
+    sidecar = tmp_path / "retained" / f"{enc}.manifest.json"
+    d = json.loads(sidecar.read_text())
+    d["blob_sha256"] = "0" * 64
+    sidecar.write_text(json.dumps(d), encoding="utf-8")
+    out_dir = tmp_path / "reused_out"
+    out_dir.mkdir()
+    operator_file = out_dir / "chunk_9.webm"
+    operator_file.write_bytes(b"operator-own-audio")               # pre-existing, NOT from this unseal
+    monkeypatch.setattr(ret, "make_default_sealer", lambda: _FakeSealer())
+    keyfile = tmp_path / "id.txt"
+    keyfile.write_text("AGE-SECRET-KEY-X", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cli._cmd_scribe_retention(_unseal_ns(cfg_path, enc, key=str(keyfile), out=str(out_dir)))
+    assert operator_file.exists()                                  # NEVER collateral-wiped
+    assert operator_file.read_bytes() == b"operator-own-audio"
 
 
 def test_unseal_record_only_forbids_key_and_out(tmp_path, capsys):

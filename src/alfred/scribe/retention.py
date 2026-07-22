@@ -1273,17 +1273,22 @@ def unseal_to_dir(
     return UnsealResult(chunk_count=len(written), written_paths=tuple(written))
 
 
-def wipe_plaintext_dir(out_dir: str | Path, written_paths=None, *, created: bool = False) -> None:
+def wipe_plaintext_dir(out_dir: str | Path, written_paths=None, *, created: bool = False,
+                       protect=None) -> None:
     """Best-effort wipe of decrypted plaintext in ``out_dir`` (§6 step 5) — overwrite-before-unlink
     each written chunk (a mitigation, NOT a guarantee on SSD, per the runbook §7), then rmdir ``out_dir``
     if we created it. NEVER raises (it runs in the caller's ``finally``, even on error / Ctrl-C — a wipe
     failure must not mask the original exception). ``written_paths`` None ⇒ wipe any ``chunk_*`` files
-    present (a failure BEFORE the write list was returned)."""
+    present (a failure BEFORE the write list was returned), EXCLUDING ``protect`` (WARN-2: the caller
+    snapshots the PRE-EXISTING ``chunk_*`` set of a reused ``--out`` before decrypt, so a failed unseal
+    never collateral-wipes an operator's own ``chunk_9.webm`` — only the plaintext THIS unseal produced)."""
     out_dir = Path(out_dir)
+    protected = {Path(p).resolve() for p in protect} if protect else set()
     targets = [Path(p) for p in written_paths] if written_paths else []
     if not targets:
         try:
-            targets = [p for p in out_dir.iterdir() if p.is_file() and _CHUNK_NAME_RE.match(p.stem)]
+            targets = [p for p in out_dir.iterdir()
+                       if p.is_file() and _CHUNK_NAME_RE.match(p.stem) and p.resolve() not in protected]
         except OSError:
             targets = []
     for p in targets:

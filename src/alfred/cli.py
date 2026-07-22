@@ -3082,6 +3082,18 @@ def _retention_unseal(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     cfg = load_scribe_config(raw)
     enc = args.encounter
+
+    # ARG validation FIRST (clear errors before touching the store): --record-only forbids --key/--out;
+    # the decrypt path requires both.
+    if args.record_only and (args.key or args.out):
+        print(json.dumps({"error": "--record-only forbids --key/--out — it emits the unseal "
+                                    "attestation WITHOUT a local decrypt (the off-box-open path)"}))
+        sys.exit(1)
+    if not args.record_only and (not args.key or not args.out):
+        print(json.dumps({"error": "unseal requires --key <identity file> and --out <dir> "
+                                    "(or --record-only for the off-box-open attestation)"}))
+        sys.exit(1)
+
     ev = _open_scribe_events(raw)
     if not ev.active:
         print(json.dumps({"error": "clinical event store inactive — unseal requires an active "
@@ -3092,15 +3104,29 @@ def _retention_unseal(args: argparse.Namespace) -> None:
     retained_dir = ret_mod.resolved_retained_dir(cfg)
     blob_path = retained_dir / f"{enc}{ret_mod.SEAL_BLOB_SUFFIX}"
 
+    # WARN-1 — CHAIN-AUTHORITY GUARD (fail-closed on a row-less blob). A legitimately-sealed encounter
+    # ALWAYS has a durable retention.sealed row (seal emits it BEFORE the plaintext wipe), so a blob
+    # with NO chain row is a crash-transient (re-seals) OR a planted artifact — serving / attesting PHI
+    # the chain does not attest violates chain-is-source-of-truth (#11). Both paths (decrypt AND
+    # --record-only) require the row; mirrors _recover_already_sealed, which only trusts a blob when its
+    # sealed row is present. expected_manifest_sha256 below is therefore ALWAYS a real chain sha, never
+    # None (which would have SKIPPED unseal_to_dir's step-1 chain authentication).
+    sealed_row = ev.retention_sealed_row(enc)
+    if sealed_row is None:
+        print(json.dumps({"error": f"no retention.sealed row for {enc} — refusing to unseal an "
+                                    f"unattested blob (the chain is the source of truth, #11). A "
+                                    f"legitimately sealed encounter ALWAYS has a durable chain row; a "
+                                    f"row-less blob is a crash-transient (re-seals next sweep) or a "
+                                    f"planted artifact. Investigate why a blob exists with no chain "
+                                    f"attestation before opening it."}))
+        sys.exit(1)
+
     # --record-only: emit the attestation WITHOUT a local decrypt (the off-box-open path). Honest
     # posture (design §6 / 13e runbook): the box cannot cryptographically WITNESS an off-box decrypt,
     # so this is an OPERATOR ATTESTATION that an off-box open occurred — the off-box machine is named
-    # in the vault_audit justification, and the chain records that an unseal was attested.
+    # in the vault_audit justification, and the chain records that an unseal was attested (of an
+    # encounter that WAS sealed — the WARN-1 guard above already refused a never-sealed enc).
     if args.record_only:
-        if args.key or args.out:
-            print(json.dumps({"error": "--record-only forbids --key/--out — it emits the unseal "
-                                        "attestation WITHOUT a local decrypt (the off-box-open path)"}))
-            sys.exit(1)
         try:
             ev.retention_unsealed(subject_id=enc, reason_code=args.reason, ticket_ref=args.ticket)
         except Exception as exc:  # noqa: BLE001 — surface a store-down / bad-enum emit as a JSON error
@@ -3111,11 +3137,7 @@ def _retention_unseal(args: argparse.Namespace) -> None:
                           "reason_code": args.reason}, indent=2))
         return
 
-    # on-box decrypt path — requires --key (offline identity) + --out (temp dir).
-    if not args.key or not args.out:
-        print(json.dumps({"error": "unseal requires --key <identity file> and --out <dir> "
-                                    "(or --record-only for the off-box-open attestation)"}))
-        sys.exit(1)
+    # on-box decrypt path.
     try:
         identity = Path(args.key).read_text(encoding="utf-8").strip().encode("utf-8")
     except OSError as exc:
@@ -3126,10 +3148,18 @@ def _retention_unseal(args: argparse.Namespace) -> None:
     except ret_mod.SealerUnavailable as exc:
         print(json.dumps({"error": f"the age backend (pyrage) is not installed — cannot decrypt: {exc}"}))
         sys.exit(1)
-    sealed_row = ev.retention_sealed_row(enc)
-    expected = (sealed_row or {}).get("payload", {}).get("manifest_sha256")
+    expected = (sealed_row.get("payload") or {}).get("manifest_sha256")
     out_dir = Path(args.out)
     created = not out_dir.exists()
+    # WARN-2 — snapshot the PRE-EXISTING chunk_* files of a reused --out so the wipe never collateral-
+    # wipes an operator's own chunk_9.webm on a failed unseal (only the plaintext THIS unseal wrote).
+    pre_existing: set = set()
+    try:
+        if out_dir.exists():
+            pre_existing = {p for p in out_dir.iterdir()
+                            if p.is_file() and ret_mod._CHUNK_NAME_RE.match(p.stem)}
+    except OSError:
+        pre_existing = set()
     result = None
     try:
         try:
@@ -3154,8 +3184,10 @@ def _retention_unseal(args: argparse.Namespace) -> None:
         _hold_for_review(out_dir)
     finally:
         # ALWAYS wipe the decrypted plaintext (even on error / Ctrl-C) — never leave PHI in --out.
+        # protect the pre-existing operator files from the None-fallback glob (WARN-2).
         ret_mod.wipe_plaintext_dir(
-            out_dir, result.written_paths if result is not None else None, created=created)
+            out_dir, result.written_paths if result is not None else None, created=created,
+            protect=pre_existing)
 
 
 def _retention_verify(args: argparse.Namespace) -> None:
