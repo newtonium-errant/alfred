@@ -133,6 +133,29 @@ def _includes(restic_args):
     return out
 
 
+def test_backup_run_seals_strictly_before_restic_ORDER(tmp_path, monkeypatch):
+    """NOTE-1: bind the seal-BEFORE-restic ORDER, not just 'both ran'. The restic stub records the
+    staging-blob existence AT CALL TIME — a future reorder (restic before the seal loop) would capture
+    them ABSENT here and fail, where the post-hoc 'both exist' assertion would still pass."""
+    _seal_encounter(tmp_path)
+    _make_note(tmp_path, _ENC)
+    cfg = _cfg(tmp_path)
+    t_dest, n_dest = backup_mod.sealed_backup_paths(cfg, _ENC)
+    seen = {}
+
+    def _stub(args, env):
+        seen["transcript"] = t_dest.exists()      # FS state at the MOMENT restic is invoked
+        seen["note"] = n_dest.exists()
+        return subprocess.CompletedProcess(args=["restic"], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(backup_mod, "_run_restic", _stub)
+    monkeypatch.setattr(backup_mod.shutil, "which", lambda name: "/usr/bin/restic")
+    monkeypatch.setenv(backup_mod.ENV_RESTIC_REPO, "sftp:host:/stayc")
+    monkeypatch.setenv(backup_mod.ENV_RESTIC_PASSWORD, "pw")
+    backup_mod.backup_run(cfg, tmp_path / "vault", sealer=_FakeSealer(), recipient_public_key=_FAKE_PUB)
+    assert seen == {"transcript": True, "note": True}   # the staging blobs existed BEFORE restic ran
+
+
 def test_backup_run_malformed_note_skip_loud_and_count(tmp_path, monkeypatch):
     _seal_encounter(tmp_path)
     _make_note(tmp_path, _ENC)
@@ -206,10 +229,9 @@ def test_backup_run_no_encounters_is_ilb(tmp_path, monkeypatch):
 # ============================ CLI entry (retention backup-run) ============================
 
 
-def test_backup_run_cli_real_crypto(tmp_path, capsys, monkeypatch):
-    pytest.importorskip("pyrage")
-    _seal_encounter(tmp_path)
-    _make_note(tmp_path, _ENC)
+def _cli_cfg_real_pubkey(tmp_path):
+    """A CLI config with a REAL age recipient at seal_public_key_path (the CLI validates it via
+    is_valid_age_recipient before sealing). Returns the config path."""
     pub, _priv = ret.generate_keypair()
     seal_pub = tmp_path / "seal" / "seal_pub.age"
     seal_pub.parent.mkdir(parents=True, exist_ok=True)
@@ -224,12 +246,51 @@ def test_backup_run_cli_real_crypto(tmp_path, capsys, monkeypatch):
     }
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump(body), encoding="utf-8")
+    return str(cfg_path)
+
+
+def _backup_run_ns(cfg_path, *, dry_run=False):
+    return argparse.Namespace(config=cfg_path, scribe_cmd="retention", retention_cmd="backup-run",
+                              dry_run=dry_run)
+
+
+def test_backup_run_cli_real_crypto(tmp_path, capsys, monkeypatch):
+    pytest.importorskip("pyrage")
+    _seal_encounter(tmp_path)
+    _make_note(tmp_path, _ENC)
+    cfg_path = _cli_cfg_real_pubkey(tmp_path)
     _record_restic(monkeypatch)
-    ns = argparse.Namespace(config=str(cfg_path), scribe_cmd="retention",
-                            retention_cmd="backup-run", dry_run=False)
-    cli._cmd_scribe_retention(ns)
+    cli._cmd_scribe_retention(_backup_run_ns(cfg_path))
     out = json.loads(capsys.readouterr().out)
     assert out["backup_run"] is True and out["notes_sealed"] == 1 and out["restic_ran"] is True
+
+
+def test_backup_run_cli_restic_failure_exits_1_WARN1(tmp_path, capsys, monkeypatch):
+    """WARN-1: a restic-backup non-zero → the CLI exits 1 (the whole reason the timer's OnFailure
+    surfaces). Unpinned before this — a regression that swallowed the failure would go green."""
+    pytest.importorskip("pyrage")
+    _seal_encounter(tmp_path)
+    _make_note(tmp_path, _ENC)
+    cfg_path = _cli_cfg_real_pubkey(tmp_path)
+    _record_restic(monkeypatch, returncode=1)               # restic backup FAILS
+    with pytest.raises(SystemExit) as exc:
+        cli._cmd_scribe_retention(_backup_run_ns(cfg_path))
+    assert exc.value.code == 1
+    assert json.loads(capsys.readouterr().out)["restic_ran"] is False
+
+
+def test_backup_run_cli_restic_unavailable_exits_1_WARN1(tmp_path, capsys, monkeypatch):
+    """WARN-1 sibling: restic binary missing (repo un-runnable) → sealed the staging copies but the CLI
+    still exits 1 (the backup did not complete — the timer must surface it)."""
+    pytest.importorskip("pyrage")
+    _seal_encounter(tmp_path)
+    _make_note(tmp_path, _ENC)
+    cfg_path = _cli_cfg_real_pubkey(tmp_path)
+    monkeypatch.setattr(backup_mod.shutil, "which", lambda name: None)   # no restic binary
+    with pytest.raises(SystemExit) as exc:
+        cli._cmd_scribe_retention(_backup_run_ns(cfg_path))
+    assert exc.value.code == 1
+    assert json.loads(capsys.readouterr().out)["restic_ran"] is False
 
 
 def test_backup_run_cli_errors_without_pubkey(tmp_path, capsys):
