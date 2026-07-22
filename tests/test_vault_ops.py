@@ -257,7 +257,7 @@ def test_completion_log_not_in_list_fields_registry() -> None:
 
 import pytest  # noqa: E402
 from alfred.vault import ops as _ops  # noqa: E402
-from alfred.vault.ops import secure_unlink, vault_delete  # noqa: E402
+from alfred.vault.ops import VaultError, secure_unlink, vault_delete  # noqa: E402
 
 
 def test_secure_unlink_overwrites_bytes_BEFORE_unlink(tmp_path, monkeypatch):
@@ -332,3 +332,22 @@ def test_vault_delete_non_secure_still_uses_obsidian_when_available(tmp_path, mo
     monkeypatch.setattr(_ops.obsidian, "delete_file", lambda name: calls.append(name) or True)
     vault_delete(vault, "task/T.md")                        # no secure, no scope
     assert calls == ["task/T"]                              # routed to Obsidian (trash-respecting) as before
+
+
+def test_vault_delete_secure_RAISES_on_unlink_failure(tmp_path, monkeypatch):
+    """BLOCK fix: vault_delete(secure=True) must PROPAGATE a secure_unlink failure (raise VaultError),
+    NOT swallow it + report deleted:True — else a note-unlink failure is masked and the destroy could
+    emit retention.destroyed while the clinical_note survives (false proof-of-destruction). Restores the
+    pre-secure raise-on-failure semantics (the non-secure fallback's unlink() raised too)."""
+    vault = tmp_path / "vault"
+    (vault / "clinical_note").mkdir(parents=True)
+    note = vault / "clinical_note" / "R.md"
+    note.write_text("---\ntype: clinical_note\n---\nPHI\n", encoding="utf-8")
+
+    def boom(self, *a, **k):
+        raise OSError("EROFS")                              # a real unlink failure → secure_unlink→False
+
+    monkeypatch.setattr(_ops.Path, "unlink", boom)
+    with pytest.raises(VaultError, match="secure unlink failed"):
+        vault_delete(vault, "clinical_note/R.md", scope="stayc_clinical_destroy", secure=True)
+    assert note.exists()                                    # NOT removed — the failure surfaced, not masked

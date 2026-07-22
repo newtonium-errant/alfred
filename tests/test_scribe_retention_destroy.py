@@ -449,3 +449,29 @@ def test_destroy_secure_overwrites_residual_audio_chunks(tmp_path, capsys, monke
     assert set(at["chunk_1.webm"]) == {0}                  # raw AUDIO overwritten before unlink
     assert set(at[f"{enc}.transcript.json"]) == {0}        # the in-label ledger too
     assert not label_dir.exists()                          # dir removed
+
+
+def test_destroy_blocks_destroyed_on_note_unlink_failure_BLOCK(tmp_path, capsys, monkeypatch):
+    """BLOCK end-to-end: a NOTE-unlink failure (via vault_delete(secure=True)) must land in `failures`
+    and BLOCK retention.destroyed — the note survives, so emitting destroyed would be a false
+    proof-of-destruction. Previously masked (the secure branch swallowed secure_unlink's False)."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    _seal(tmp_path, ev)
+    note = _make_note(tmp_path, _ENC)
+    _mock_purge(monkeypatch, complete=True)
+    from alfred.vault import ops as _ops
+    real = _ops.secure_unlink
+
+    def selective(path):
+        # simulate an unlink failure for the clinical note ONLY (a read-only file), succeed elsewhere.
+        if str(path).endswith(".md"):
+            return False
+        return real(path)
+
+    monkeypatch.setattr(_ops, "secure_unlink", selective)
+    out, exited = _run(cfg_path, _ENC, capsys)
+    assert exited == 1 and "INCOMPLETE" in out["error"]
+    # retention.destroyed NOT emitted — the note-unlink failure blocked it (intent stays; re-run completes).
+    assert ev.retention_destroyed_row(_ENC) is None
+    assert ev.retention_destroy_intent_row(_ENC) is not None
+    assert note.exists()                                    # the note SURVIVES — no false proof-of-destruction

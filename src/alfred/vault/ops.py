@@ -1963,8 +1963,14 @@ def vault_delete(
     # SECURE destruction (s.49) — bypass the Obsidian trash routing ENTIRELY (ALWAYS permanent, never
     # trashed, regardless of Obsidian availability) + best-effort overwrite-before-unlink the plaintext.
     # Placed BEFORE the Obsidian branch so a running Obsidian can never route a secure destroy to trash.
+    # RAISE on an unlink FAILURE (secure_unlink returns False) — restore the pre-secure raise-on-failure
+    # semantics (the non-secure fallback's file_path.unlink() raises too) so the destroy handler's
+    # except→failures gate catches it and BLOCKS retention.destroyed. Swallowing it would be a false
+    # proof-of-destruction (the clinical_note survives on disk while the chain says destroyed).
     if secure:
-        secure_unlink(file_path)
+        if not secure_unlink(file_path):
+            raise VaultError(f"secure unlink failed for {rel_path} — record NOT removed (a read-only "
+                             f"file/dir or IO error); the destruction is INCOMPLETE")
         return _build_delete_result()
 
     # Try Obsidian CLI — respects user's trash settings
