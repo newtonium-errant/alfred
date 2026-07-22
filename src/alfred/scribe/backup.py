@@ -339,3 +339,111 @@ def purge_encounter(
         complete=False, encounter_id=encounter_id, excluded_paths=excluded,
         reason="restic find STILL returns the encounter after rewrite+prune — the backup purge did "
                "NOT complete (a destruction that leaves a backup copy is INCOMPLETE, Q3); fail loud")
+
+
+# --- (4) backup_run — seal-before-backup orchestration (13d-4b, INERT) ---------------------------
+
+
+@dataclass(frozen=True)
+class BackupRunResult:
+    """One dedicated-backup run's outcome (13d-4b). ``restic_ran`` is True only when the restic backup
+    exited 0; ``malformed_notes`` counts clinical_notes that could NOT be parsed (skip-loud-and-count —
+    a backup is NON-destructive, so an un-backed-up malformed note is a loud signal, never fatal, unlike
+    the destroy WARN-1 refuse); ``multi_note_encounters`` counts amended encounters whose extra notes
+    are NOT captured under the single ``<enc>.note.age`` name (a documented limitation)."""
+
+    encounters: int = 0
+    transcripts_sealed: int = 0
+    notes_sealed: int = 0
+    malformed_notes: int = 0
+    multi_note_encounters: int = 0
+    restic_ran: bool = False
+    dry_run: bool = False
+    reason: str = ""
+
+
+def backup_run(
+    config: ScribeConfig, vault_path, *, sealer: ret.Sealer, recipient_public_key: bytes,
+    dry_run: bool = False,
+) -> BackupRunResult:
+    """The dedicated STAY-C backup orchestration (13d-4b) — SEAL-BEFORE-BACKUP then restic. INERT: only
+    ever invoked by the operator-gated ``retention backup-run`` CLI (the timer's ExecStart), never on
+    import. For each sealed encounter (a ``<enc>.age`` blob in the retained dir): age-seal its transcript
+    ledger + its vault clinical_note into the enc-id-named sealed-staging copies (ruling A — the off-box
+    archive is uniformly crypto-shredded), seal-IF-ABSENT (age is non-deterministic, so re-sealing would
+    churn restic dedup; an AMENDED note needs its staging blob cleared to re-seal — documented). THEN
+    ``restic backup`` the :func:`build_backup_set` (retained tree + sealed staging; plaintext transcripts
+    + ``**/enrollment`` structurally excluded) tagged :data:`RESTIC_TAG` on the DEDICATED repo.
+
+    MALFORMED NOTE posture (skip-loud-and-count, distinct from the destroy's fail-loud refuse): a backup
+    is NON-destructive, so a clinical_note that can't be parsed is simply not sealed — counted +
+    surfaced (never silently dropped, never fatal). Returns a :class:`BackupRunResult`; ``dry_run`` seals
+    NOTHING + runs NO restic (a plan preview). NEVER raises on a per-encounter seal error (isolated)."""
+    retained = ret.resolved_retained_dir(config)
+    try:
+        blobs = sorted(retained.glob(f"*{ret.SEAL_BLOB_SUFFIX}"))
+    except OSError:
+        blobs = []
+
+    transcripts_sealed = notes_sealed = multi = 0
+    malformed_set: set = set()
+    for blob in blobs:
+        enc = blob.name[:-len(ret.SEAL_BLOB_SUFFIX)]
+        t_dest, n_dest = sealed_backup_paths(config, enc)
+        matches, malformed = ret.resolve_note_paths(vault_path, enc)
+        malformed_set.update(str(p) for p in malformed)
+        if len(matches) > 1:
+            multi += 1
+            log.warning(
+                "scribe.backup.multi_note_encounter", encounter_id=enc, count=len(matches),
+                detail="an encounter resolved to MULTIPLE clinical_notes (amended) — only the first is "
+                       "sealed under <enc>.note.age; the others are NOT in the off-box backup (documented "
+                       "13d-4b limitation; the on-box notes remain the source of truth).")
+        if dry_run:
+            continue
+        try:
+            if not t_dest.exists() and seal_file_for_backup(
+                    transcript_source_path(config, enc), t_dest,
+                    sealer=sealer, recipient_public_key=recipient_public_key):
+                transcripts_sealed += 1
+            if matches and not n_dest.exists() and seal_file_for_backup(
+                    matches[0], n_dest, sealer=sealer, recipient_public_key=recipient_public_key):
+                notes_sealed += 1
+        except ret.SealError:
+            log.warning(
+                "scribe.backup.seal_before_backup_failed", encounter_id=enc,
+                detail="seal-before-backup failed for an encounter (bad recipient / malformed blob) — "
+                       "ISOLATED; the run continues. This encounter's off-box copy is missing until fixed.")
+
+    result_kwargs = dict(
+        encounters=len(blobs), transcripts_sealed=transcripts_sealed, notes_sealed=notes_sealed,
+        malformed_notes=len(malformed_set), multi_note_encounters=multi)
+
+    if dry_run:
+        return BackupRunResult(**result_kwargs, restic_ran=False, dry_run=True,
+                               reason="dry-run — sealed nothing, ran no restic (plan preview)")
+
+    if shutil.which("restic") is None:
+        return BackupRunResult(**result_kwargs, restic_ran=False,
+                               reason="restic binary not found on PATH — sealed the staging copies but "
+                                      "did NOT run the backup")
+    env = _restic_env()
+    if env is None:
+        return BackupRunResult(**result_kwargs, restic_ran=False,
+                               reason=f"the dedicated STAY-C restic repo is not configured "
+                                      f"({ENV_RESTIC_REPO} / a password source unset) — sealed the "
+                                      f"staging copies but did NOT run the backup (never the general repo)")
+    bs = build_backup_set(config)
+    args = ["backup", *[str(p) for p in bs.includes], "--tag", RESTIC_TAG]
+    for ex in bs.excludes:
+        args += ["--exclude", ex]
+    proc = _run_restic(args, env)
+    ran = proc.returncode == 0
+    log.info(
+        "scribe.backup.run", encounters=len(blobs), transcripts_sealed=transcripts_sealed,
+        notes_sealed=notes_sealed, malformed_notes=len(malformed_set), restic_ran=ran,
+        detail=("dedicated backup complete" if ran else "seal done, restic backup FAILED")
+        + (" — nothing to seal (no sealed encounters yet)" if not blobs else ""))
+    return BackupRunResult(
+        **result_kwargs, restic_ran=ran,
+        reason="" if ran else f"restic backup exited {proc.returncode}")

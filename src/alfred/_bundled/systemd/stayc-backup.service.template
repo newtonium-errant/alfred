@@ -1,0 +1,20 @@
+[Unit]
+Description=STAY-C dedicated backup — seal-before-backup + restic to the DEDICATED repo (10yr keep)
+# Separate from the general algernon nightly (algernon-backup) — its own repo, tag, and keep policy
+# so the 10-yr sealed-audio archive is never pruned by the nightly's 2-yr cap (recon 2026-07-21 §4).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=<STAYC_BACKUP_USER>
+Group=<STAYC_BACKUP_GROUP>
+Nice=10
+IOSchedulingClass=idle
+# Dedicated STAY-C restic repo credentials — STAYC_RESTIC_REPO + STAYC_RESTIC_PASSWORD_FILE. NEVER the
+# general algernon repo (scribe.backup._restic_env fails closed rather than fall back). NO leading dash:
+# a missing creds file must FAIL the backup loudly, not run against an unconfigured repo.
+EnvironmentFile=<STAYC_BACKUP_ENV>
+# backup-run seals each encounter's transcript+note to the offline recipient (ruling A), then restic-
+# backs up the retained tree + sealed staging (data/enrollment structurally excluded), tagged 'stayc'.
+ExecStart=<STAYC_BACKUP_PYTHON> -m alfred --config <STAYC_BACKUP_CONFIG> scribe retention backup-run

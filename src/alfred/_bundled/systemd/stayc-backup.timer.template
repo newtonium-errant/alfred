@@ -1,0 +1,10 @@
+[Unit]
+Description=STAY-C dedicated backup timer (seal-before-backup + restic to the dedicated repo)
+
+[Timer]
+OnCalendar=<STAYC_BACKUP_ONCALENDAR>
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

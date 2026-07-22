@@ -3537,6 +3537,61 @@ def _retention_destroy(args: argparse.Namespace) -> None:
     }, indent=2))
 
 
+def _retention_backup_run(args: argparse.Namespace) -> None:
+    """``alfred scribe retention backup-run [--dry-run]`` — the dedicated STAY-C backup entry point
+    (13d-4b; the operator-gated timer's ExecStart). Seal-before-backup then restic (see
+    ``scribe.backup.backup_run``): age-seal each encounter's transcript + note into the sealed-staging
+    dir, then restic-backup the retained tree + staging (enrollment structurally excluded) to the
+    DEDICATED repo. JSON output; ILB explicit 'nothing to seal'. Requires the seal recipient pubkey
+    (same as the daemon sweep) — the off-box copies are sealed to the offline key."""
+    from alfred.scribe import backup as backup_mod
+    from alfred.scribe import retention as ret_mod
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+    vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+
+    pub_path = cfg.retention.seal_public_key_path
+    if not pub_path:
+        print(json.dumps({"error": "retention.seal_public_key_path is unset — seal-before-backup needs "
+                                    "the offline recipient key (run `retention keygen` first)"}))
+        sys.exit(1)
+    try:
+        recipient = Path(pub_path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        print(json.dumps({"error": f"cannot read the seal public key at {pub_path!r}: {exc}"}))
+        sys.exit(1)
+    if not ret_mod.is_valid_age_recipient(recipient):
+        print(json.dumps({"error": f"the seal public key at {pub_path!r} is not a canonical age "
+                                    f"recipient — cannot seal the off-box copies"}))
+        sys.exit(1)
+    try:
+        sealer = ret_mod.make_default_sealer()
+    except ret_mod.SealerUnavailable as exc:
+        print(json.dumps({"error": f"the age backend (pyrage) is not installed — cannot seal: {exc}"}))
+        sys.exit(1)
+
+    result = backup_mod.backup_run(
+        cfg, vault_path, sealer=sealer, recipient_public_key=recipient.encode("utf-8"),
+        dry_run=args.dry_run)
+    out = {
+        "backup_run": True, "dry_run": result.dry_run, "encounters": result.encounters,
+        "transcripts_sealed": result.transcripts_sealed, "notes_sealed": result.notes_sealed,
+        "malformed_notes": result.malformed_notes, "multi_note_encounters": result.multi_note_encounters,
+        "restic_ran": result.restic_ran, "reason": result.reason,
+    }
+    print(json.dumps(out, indent=2))
+    if result.encounters == 0:
+        print("retention backup-run: nothing to seal — no sealed encounters yet", file=sys.stderr)  # ILB
+    if result.malformed_notes:
+        print(f"retention backup-run: {result.malformed_notes} clinical_note(s) could not be parsed and "
+              f"were NOT backed up — fix them (backup is non-destructive, so this is a warning)",
+              file=sys.stderr)
+    if not result.dry_run and not result.restic_ran:
+        sys.exit(1)   # sealing done but the restic backup did not run/complete — fail-loud for the timer
+
+
 def _verify_dangling_pin(ev, cfg, sched_mod, sha256_hex, clinical) -> dict | None:
     """A chain-pinned ``retention.schedule_published`` whose on-disk schedule is absent / sha-mismatched
     (drift) — or a pin with no configured ``schedule_path``. ``None`` when there is no pin or the pin
@@ -3582,6 +3637,9 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
     if rcmd == "destroy":
         _retention_destroy(args)
         return
+    if rcmd == "backup-run":
+        _retention_backup_run(args)
+        return
 
     from alfred.evstore import sha256_hex
     from alfred.scribe import retention as ret_mod
@@ -3591,8 +3649,8 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
 
     scmd = getattr(args, "schedule_cmd", None)
     if getattr(args, "retention_cmd", None) != "schedule" or scmd not in ("publish", "show"):
-        print("Usage: alfred scribe retention {keygen [--force] | unseal <enc> ... | verify | "
-              "schedule {publish <file> | show}}")
+        print("Usage: alfred scribe retention {keygen [--force] | unseal <enc> ... | destroy <enc> ... "
+              "| verify | backup-run | schedule {publish <file> | show}}")
         sys.exit(1)
 
     raw = _load_unified_config(args.config)
@@ -4800,6 +4858,13 @@ def build_parser() -> argparse.ArgumentParser:
     ret_destroy.add_argument("--yes", action="store_true",
                              help="Skip the interactive type-the-encounter-id confirmation "
                                   "(scripted / non-interactive use)")
+    # #13d-4b — the dedicated backup entry point (the operator-gated timer's ExecStart). Seal-before-
+    # backup then restic; INERT (never runs on its own).
+    ret_backup = retention_sub.add_parser(
+        "backup-run", help="Seal each encounter's transcript+note off-box then restic-backup the "
+                           "dedicated STAY-C repo (the operator-gated timer target)")
+    ret_backup.add_argument("--dry-run", action="store_true", dest="dry_run",
+                            help="Plan preview — seal nothing, run no restic")
     ret_sched = retention_sub.add_parser(
         "schedule", help="Publish / show the s.50 retention schedule (versioned, sha-pinned [D])")
     ret_sched_sub = ret_sched.add_subparsers(dest="schedule_cmd")
