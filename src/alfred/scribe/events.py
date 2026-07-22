@@ -649,6 +649,33 @@ class ScribeEvents:
                 out[sid] = r.get("ts", "")  # last write wins (chain order == append order)
         return out
 
+    def retention_destroy_intent_row(self, subject_id: str) -> dict | None:
+        """The encounter's durable ``retention.destroy_intent`` row, or ``None`` — the two-phase
+        destroy's crash-recovery idempotency key (13d-3): an intent WITHOUT a matching
+        ``retention.destroyed`` is an incomplete destruction that a re-run completes. Co-located so
+        the (stream, family, kind) triple stays in ONE place (read-only; no new kind, widening pin green)."""
+        return self.latest(CLINICAL, family="retention", kind="retention.destroy_intent",
+                           subject_id=subject_id)
+
+    def retention_destroyed_row(self, subject_id: str) -> dict | None:
+        """The encounter's durable ``retention.destroyed`` row, or ``None`` if the destruction never
+        completed — the 13d-3 destroy short-circuits an already-destroyed encounter on it."""
+        return self.latest(CLINICAL, family="retention", kind="retention.destroyed",
+                           subject_id=subject_id)
+
+    def incomplete_destructions(self) -> list[str]:
+        """The subject_ids with a ``retention.destroy_intent`` but NO matching ``retention.destroyed``
+        — a crash between the two-phase destroy's phase 1 (intent [D]) and phase 2 (destroyed [D]),
+        i.e. an INCOMPLETE destruction the operator must complete (re-run the destroy; unlink is
+        idempotent). ``retention verify`` (13d-2) surfaces this. Sorted for a deterministic report."""
+        intents = {r.get("subject_id") for r in
+                   self.query(CLINICAL, family="retention", kind="retention.destroy_intent")
+                   if r.get("subject_id")}
+        done = {r.get("subject_id") for r in
+                self.query(CLINICAL, family="retention", kind="retention.destroyed")
+                if r.get("subject_id")}
+        return sorted(intents - done)
+
     # --- ACCESS emitters + read hook + suppression ------------------------
 
     def access_read(self, *, subject_id: str, record_type: str, status: str, path_digest: str,

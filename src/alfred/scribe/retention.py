@@ -1184,3 +1184,120 @@ def _transient_wipe(enc_dir: Path, encounter_id: str, retained_dir: Path) -> Sea
                "posture (§3.5), never the silent default.")
     return SealOutcome(
         status=SEAL_STATUS_TRANSIENT_WIPED, encounter_id=encounter_id, chunk_count=chunk_count)
+
+
+# --- the unseal path (§6 single-encounter retrieval — slice 13d-2) ------------------------------
+
+
+@dataclass(frozen=True)
+class UnsealResult:
+    """Result of :func:`unseal_to_dir` — the chunk count + the plaintext paths written (the caller's
+    ``finally`` wipes them on exit, §6 step 5)."""
+
+    chunk_count: int
+    written_paths: tuple = ()
+
+
+def unseal_to_dir(
+    retained_dir: str | Path,
+    encounter_id: str,
+    *,
+    identity: bytes,
+    sealer: Sealer,
+    out_dir: str | Path,
+    expected_manifest_sha256: str | None = None,
+) -> UnsealResult:
+    """Decrypt + VERIFY + write ONE sealed encounter's audio to ``out_dir`` (§6 retrieval). FAIL-CLOSED:
+    ANY integrity failure raises :class:`SealError` and writes NOTHING (verify-then-write) — the caller
+    emits NO ``retention.unsealed`` event and wipes ``out_dir``. Verification, defense-in-depth beyond
+    the tar-internal manifest:
+
+      1. the manifest SIDECAR authenticates against the chain's ``manifest_sha256``
+         (``expected_manifest_sha256``, if given) — a stale/tampered sidecar is refused;
+      2. the on-disk blob's sha == the sidecar's ``blob_sha256`` (a truncated blob caught pre-decrypt);
+      3. the decrypted tar's manifest digest == the sidecar's (content matches the recovery reference);
+      4. each extracted chunk's sha == its manifest entry (per-chunk integrity).
+
+    ``identity`` is the OFFLINE age private key (``AGE-SECRET-KEY-…`` UTF-8 bytes) the operator loaded
+    from the offline USB. ``sealer.unseal`` raises :class:`SealError` on a wrong identity / AEAD tamper."""
+    retained_dir = Path(retained_dir)
+    out_dir = Path(out_dir)
+    blob_path = retained_dir / f"{encounter_id}{SEAL_BLOB_SUFFIX}"
+    if not blob_path.is_file():
+        raise SealError(f"sealed blob not found for {encounter_id}: {blob_path}")
+    sidecar = _load_manifest_sidecar(retained_dir, encounter_id)
+    if sidecar is None:
+        raise SealError("manifest sidecar missing / malformed — cannot verify the decrypt (fail-closed)")
+    sidecar_digest = _manifest_digest(sidecar["manifest"])
+    if expected_manifest_sha256 is not None and sidecar_digest != expected_manifest_sha256:
+        raise SealError(
+            "the manifest sidecar does not authenticate against the chain's manifest_sha256 — refused")
+    blob = blob_path.read_bytes()
+    if sha256_hex(blob) != sidecar.get("blob_sha256"):
+        raise SealError("sealed blob digest != sidecar blob_sha256 — the archive is truncated / corrupt")
+    tar_bytes = sealer.unseal(blob, identity)          # SealError on a wrong identity / AEAD tamper
+    members = extract_seal_tar(tar_bytes)               # path-traversal-guarded
+    tar_manifest_raw = members.get(SEAL_MANIFEST_NAME)
+    if tar_manifest_raw is None:
+        raise SealError("the decrypted tar is missing its manifest.json")
+    try:
+        tar_manifest = json.loads(tar_manifest_raw)
+    except ValueError as exc:
+        raise SealError(f"the decrypted manifest.json is malformed: {exc}") from exc
+    if _manifest_digest(tar_manifest) != sidecar_digest:
+        raise SealError("the decrypted manifest does not match the sidecar (content mismatch)")
+    by_seq = {int(e["seq"]): e for e in sidecar["manifest"]
+              if isinstance(e, dict) and "seq" in e and "sha256" in e}
+    # VERIFY every chunk member BEFORE writing any — no partial plaintext lands on a mismatch.
+    verified: list[tuple[str, bytes]] = []
+    for name, data in members.items():
+        if name == SEAL_MANIFEST_NAME:
+            continue
+        m = _CHUNK_NAME_RE.match(Path(name).stem)
+        if m is None:
+            raise SealError(f"unexpected member in the sealed tar: {name!r}")
+        entry = by_seq.get(int(m.group(1)))
+        if entry is None or sha256_hex(data) != entry.get("sha256"):
+            raise SealError(f"chunk {name!r} does not match its manifest sha (corrupt / tampered)")
+        verified.append((name, data))
+    out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    written: list[Path] = []
+    for name, data in verified:
+        dest = out_dir / name
+        dest.write_bytes(data)
+        try:
+            dest.chmod(0o600)
+        except OSError:
+            pass
+        written.append(dest)
+    return UnsealResult(chunk_count=len(written), written_paths=tuple(written))
+
+
+def wipe_plaintext_dir(out_dir: str | Path, written_paths=None, *, created: bool = False) -> None:
+    """Best-effort wipe of decrypted plaintext in ``out_dir`` (§6 step 5) — overwrite-before-unlink
+    each written chunk (a mitigation, NOT a guarantee on SSD, per the runbook §7), then rmdir ``out_dir``
+    if we created it. NEVER raises (it runs in the caller's ``finally``, even on error / Ctrl-C — a wipe
+    failure must not mask the original exception). ``written_paths`` None ⇒ wipe any ``chunk_*`` files
+    present (a failure BEFORE the write list was returned)."""
+    out_dir = Path(out_dir)
+    targets = [Path(p) for p in written_paths] if written_paths else []
+    if not targets:
+        try:
+            targets = [p for p in out_dir.iterdir() if p.is_file() and _CHUNK_NAME_RE.match(p.stem)]
+        except OSError:
+            targets = []
+    for p in targets:
+        try:
+            size = p.stat().st_size
+            with open(p, "r+b") as f:
+                f.write(b"\x00" * size)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            pass  # best-effort overwrite — proceed to unlink regardless
+        _unlink_quiet(p)
+    if created:
+        try:
+            out_dir.rmdir()
+        except OSError:
+            pass  # non-empty (operator dropped files) or already gone — leave it

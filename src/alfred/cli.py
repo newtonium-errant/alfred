@@ -3033,6 +3033,267 @@ def _retention_keygen(args: argparse.Namespace) -> None:
     }, indent=2))
 
 
+def _route_unseal_justification(audit_path, blob_path, encounter_id, args, *, record_only):
+    """Route the free-text unseal justification (+ reason/ticket provenance) to vault_audit.log — the
+    two-trail split (#58-D2 / design §6): the CHAIN carries only the enum reason_code + ticket_ref
+    (PHI-free, permanent, survives destruction), so any free text lands HERE. NEVER the private key,
+    NEVER patient content."""
+    from alfred.vault.mutation_log import append_to_audit_log, build_audit_mutations
+    tag = ", RECORD-ONLY off-box open" if record_only else ""
+    detail = (f"retention unseal (reason={args.reason}, ticket={args.ticket}, "
+              f"encounter={encounter_id}{tag})")
+    justification = getattr(args, "justification", None)
+    if justification:
+        detail += f": {justification}"
+    append_to_audit_log(str(audit_path), "scribe",
+                        build_audit_mutations("edit", str(blob_path)), detail=detail)
+
+
+def _hold_for_review(out_dir: Path) -> None:
+    """Interactive hold: keep the decrypted plaintext in ``out_dir`` for the operator's review, then
+    the caller's ``finally`` wipes it on exit (§6 step 4-5). Skipped when stdin is not a TTY
+    (scripted / test) — the ``finally`` STILL wipes, so a non-interactive unseal decrypts, records the
+    event, and immediately wipes (a scripted unseal is not a review session; the contract is
+    'wiped on exit')."""
+    try:
+        if not sys.stdin.isatty():
+            return
+    except (ValueError, OSError):
+        return
+    try:
+        input(f"\nDecrypted to {out_dir}. Review the audio now, then press Enter to WIPE the "
+              f"plaintext and exit (Ctrl-C also wipes): ")
+    except (EOFError, KeyboardInterrupt):
+        pass  # any exit path wipes via the caller's finally
+
+
+def _retention_unseal(args: argparse.Namespace) -> None:
+    """``alfred scribe retention unseal <enc> --key <identity> --out <dir> --reason <...> --ticket
+    <ref> [--justification] | --record-only`` — the §6 single-encounter retrieval (slice 13d-2).
+
+    On-box: decrypt the ``.age`` blob with the OFFLINE identity, VERIFY manifest_sha256 + per-chunk
+    digests (mismatch → fail-closed, NO output, NO event), emit ``retention.unsealed`` [D]
+    {reason_code, ticket_ref}, route the free-text justification → vault_audit.log (NEVER the chain),
+    and WIPE the temp plaintext on exit (finally — even on error / Ctrl-C). ``--record-only`` (the
+    off-box-open ATTESTATION path) emits the row WITHOUT any local decrypt."""
+    from alfred.scribe import retention as ret_mod
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+    enc = args.encounter
+    ev = _open_scribe_events(raw)
+    if not ev.active:
+        print(json.dumps({"error": "clinical event store inactive — unseal requires an active "
+                                    "medico-legal store (scribe.mode: clinical)"}))
+        sys.exit(1)
+    log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
+    audit_path = log_dir / "vault_audit.log"
+    retained_dir = ret_mod.resolved_retained_dir(cfg)
+    blob_path = retained_dir / f"{enc}{ret_mod.SEAL_BLOB_SUFFIX}"
+
+    # --record-only: emit the attestation WITHOUT a local decrypt (the off-box-open path). Honest
+    # posture (design §6 / 13e runbook): the box cannot cryptographically WITNESS an off-box decrypt,
+    # so this is an OPERATOR ATTESTATION that an off-box open occurred — the off-box machine is named
+    # in the vault_audit justification, and the chain records that an unseal was attested.
+    if args.record_only:
+        if args.key or args.out:
+            print(json.dumps({"error": "--record-only forbids --key/--out — it emits the unseal "
+                                        "attestation WITHOUT a local decrypt (the off-box-open path)"}))
+            sys.exit(1)
+        try:
+            ev.retention_unsealed(subject_id=enc, reason_code=args.reason, ticket_ref=args.ticket)
+        except Exception as exc:  # noqa: BLE001 — surface a store-down / bad-enum emit as a JSON error
+            print(json.dumps({"error": f"durable retention.unsealed failed (fail-closed): {exc}"}))
+            sys.exit(1)
+        _route_unseal_justification(audit_path, blob_path, enc, args, record_only=True)
+        print(json.dumps({"unsealed": True, "record_only": True, "encounter_id": enc,
+                          "reason_code": args.reason}, indent=2))
+        return
+
+    # on-box decrypt path — requires --key (offline identity) + --out (temp dir).
+    if not args.key or not args.out:
+        print(json.dumps({"error": "unseal requires --key <identity file> and --out <dir> "
+                                    "(or --record-only for the off-box-open attestation)"}))
+        sys.exit(1)
+    try:
+        identity = Path(args.key).read_text(encoding="utf-8").strip().encode("utf-8")
+    except OSError as exc:
+        print(json.dumps({"error": f"cannot read the --key identity file {args.key!r}: {exc}"}))
+        sys.exit(1)
+    try:
+        sealer = ret_mod.make_default_sealer()
+    except ret_mod.SealerUnavailable as exc:
+        print(json.dumps({"error": f"the age backend (pyrage) is not installed — cannot decrypt: {exc}"}))
+        sys.exit(1)
+    sealed_row = ev.retention_sealed_row(enc)
+    expected = (sealed_row or {}).get("payload", {}).get("manifest_sha256")
+    out_dir = Path(args.out)
+    created = not out_dir.exists()
+    result = None
+    try:
+        try:
+            result = ret_mod.unseal_to_dir(
+                retained_dir, enc, identity=identity, sealer=sealer, out_dir=out_dir,
+                expected_manifest_sha256=expected)
+        except ret_mod.SealError as exc:
+            # FAIL-CLOSED: no plaintext output survives (finally wipes), NO event emitted.
+            print(json.dumps({"error": f"unseal FAILED (fail-closed — no output, no event): {exc}"}))
+            sys.exit(1)
+        # Emit AFTER a verified decrypt+write, BEFORE the review hold. A store-down emit RAISES →
+        # fail-closed (finally wipes the plaintext; the unseal was NOT recorded, so it did not happen).
+        try:
+            ev.retention_unsealed(subject_id=enc, reason_code=args.reason, ticket_ref=args.ticket)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"error": f"durable retention.unsealed failed (fail-closed — plaintext "
+                                        f"wiped, no review): {exc}"}))
+            sys.exit(1)
+        _route_unseal_justification(audit_path, blob_path, enc, args, record_only=False)
+        print(json.dumps({"unsealed": True, "encounter_id": enc, "reason_code": args.reason,
+                          "chunk_count": result.chunk_count, "out": str(out_dir)}, indent=2))
+        _hold_for_review(out_dir)
+    finally:
+        # ALWAYS wipe the decrypted plaintext (even on error / Ctrl-C) — never leave PHI in --out.
+        ret_mod.wipe_plaintext_dir(
+            out_dir, result.written_paths if result is not None else None, created=created)
+
+
+def _retention_verify(args: argparse.Namespace) -> None:
+    """``alfred scribe retention verify`` — the §12 integrity report (slice 13d-2). Reports, fail-closed
+    on the inconsistency classes: incomplete destructions (a ``retention.destroy_intent`` with no
+    matching ``retention.destroyed`` — a crash between the two-phase destroy's phases), over-window
+    due (sealed blobs past the s.50 window — informational), blob-without-sidecar / sidecar-without-blob
+    (orphaned retained artifacts), and a dangling schedule pin (a chain-pinned schedule whose on-disk
+    bytes are absent / sha-mismatched). JSON output; ILB explicit 'nothing to report'; exit non-zero on
+    any inconsistency class (over-window alone does NOT fail — it is a normal review signal)."""
+    from alfred.evstore import sha256_hex
+    from alfred.scribe import retention as ret_mod
+    from alfred.scribe import schedule as sched_mod
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+    from alfred.scribe.events import CLINICAL
+
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+    ev = _open_scribe_events(raw)
+    retained_dir = ret_mod.resolved_retained_dir(cfg)
+
+    # 1. incomplete destructions (intent-without-destroyed).
+    incomplete = ev.incomplete_destructions()
+
+    # 2. blob/sidecar pairing — orphaned retained artifacts (fail-closed: a missing sidecar makes a
+    #    blob's crash-recovery impossible; a missing blob makes the sidecar's row un-openable).
+    blobs: set[str] = set()
+    sidecars: set[str] = set()
+    scan_ok = True
+    try:
+        for p in retained_dir.glob(f"*{ret_mod.SEAL_BLOB_SUFFIX}"):
+            blobs.add(p.name[:-len(ret_mod.SEAL_BLOB_SUFFIX)])
+        for p in retained_dir.glob(f"*{ret_mod.SEAL_MANIFEST_SIDECAR_SUFFIX}"):
+            sidecars.add(p.name[:-len(ret_mod.SEAL_MANIFEST_SIDECAR_SUFFIX)])
+    except OSError:
+        scan_ok = False  # unreadable retained dir — reported below, never a crash
+    blob_without_sidecar = sorted(blobs - sidecars)
+    sidecar_without_blob = sorted(sidecars - blobs)
+
+    # 3. over-window due (informational) — reuse the sweep's chain-ts age basis.
+    over = _verify_over_window(ev, retained_dir, cfg, ret_mod, sched_mod)
+
+    # 4. dangling schedule pin.
+    dangling = _verify_dangling_pin(ev, cfg, sched_mod, sha256_hex, CLINICAL)
+
+    inconsistent = bool(incomplete or blob_without_sidecar or sidecar_without_blob or dangling
+                        or not scan_ok)
+    out = {
+        "incomplete_destructions": incomplete,
+        "blob_without_sidecar": blob_without_sidecar,
+        "sidecar_without_blob": sidecar_without_blob,
+        "dangling_schedule_pin": dangling,
+        "over_window_due": over["count"],
+        "oldest_over_window": over["oldest"],
+        "over_window_evaluated": over["surfaced"],
+        "retained_dir_scan_ok": scan_ok,
+        "inconsistent": inconsistent,
+    }
+    print(json.dumps(out, indent=2))
+    if not inconsistent and over["count"] == 0:
+        print("retention verify: nothing to report — no incomplete destructions, no orphaned "
+              "artifacts, no over-window encounters, schedule pin clean", file=sys.stderr)  # ILB
+    if inconsistent:
+        sys.exit(1)
+
+
+def _verify_over_window(ev, retained_dir, cfg, ret_mod, sched_mod) -> dict:
+    """Count sealed ``.age`` blobs past the ``encounter_audio_sealed`` s.50 window (read-only report,
+    a point-in-time sibling of the sweep's latched surfacing). Chain-ts age basis (backup-restore-proof)
+    with an mtime fallback. Returns ``{count, oldest, surfaced}``; ``surfaced=False`` when it could NOT
+    evaluate (no schedule / never-pruned class / unreadable chain / unenumerable store) — NOT an
+    all-clear."""
+    import datetime as _dt
+    path = cfg.retention.schedule_path
+    schedule = sched_mod.load_schedule(path) if path else None
+    if schedule is None:
+        return {"count": 0, "oldest": "", "surfaced": False}
+    window_days = sched_mod.class_window_days(schedule, sched_mod.SURFACED_PHI_CLASS)
+    if window_days is None:
+        return {"count": 0, "oldest": "", "surfaced": True}  # never-pruned class → definitively 0 due
+    try:
+        ts_by_id = ev.retention_sealed_ts_by_id()
+    except Exception:  # noqa: BLE001 — an unreadable chain is NOT an all-clear
+        return {"count": 0, "oldest": "", "surfaced": False}
+    try:
+        blobs = list(retained_dir.glob(f"*{ret_mod.SEAL_BLOB_SUFFIX}"))
+    except OSError:
+        return {"count": 0, "oldest": "", "surfaced": False}
+    cutoff = _dt.datetime.now(_dt.timezone.utc).timestamp() - window_days * 86400
+    due = 0
+    oldest_id = ""
+    oldest_ts = None
+    for blob in blobs:
+        enc_id = blob.name[:-len(ret_mod.SEAL_BLOB_SUFFIX)]
+        raw_ts = ts_by_id.get(enc_id)
+        basis = None
+        if raw_ts:
+            try:
+                basis = _dt.datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if basis.tzinfo is None:
+                    basis = None
+            except (ValueError, TypeError):
+                basis = None
+        if basis is None:
+            try:
+                basis = _dt.datetime.fromtimestamp(blob.stat().st_mtime, tz=_dt.timezone.utc)
+            except OSError:
+                continue
+        if basis.timestamp() < cutoff:
+            due += 1
+            if oldest_ts is None or basis < oldest_ts:
+                oldest_ts, oldest_id = basis, enc_id
+    return {"count": due, "oldest": oldest_id, "surfaced": True}
+
+
+def _verify_dangling_pin(ev, cfg, sched_mod, sha256_hex, clinical) -> dict | None:
+    """A chain-pinned ``retention.schedule_published`` whose on-disk schedule is absent / sha-mismatched
+    (drift) — or a pin with no configured ``schedule_path``. ``None`` when there is no pin or the pin
+    matches on disk."""
+    latest = ev.latest(clinical, family="retention", kind="retention.schedule_published")
+    if latest is None:
+        return None  # no schedule ever published → nothing to dangle
+    pinned = (latest.get("payload") or {}).get("schedule_sha256")
+    path = cfg.retention.schedule_path
+    if not path:
+        return {"reason": "a schedule is chain-pinned but retention.schedule_path is unset",
+                "pinned_sha256": pinned}
+    try:
+        on_disk = sha256_hex(Path(path).read_bytes())
+    except OSError:
+        return {"reason": "the chain-pinned schedule is absent / unreadable on disk",
+                "pinned_sha256": pinned}
+    if on_disk != pinned:
+        return {"reason": "the on-disk schedule sha does not match the chain-pinned sha (drift)",
+                "pinned_sha256": pinned, "on_disk_sha256": on_disk}
+    return None
+
+
 def _cmd_scribe_retention(args: argparse.Namespace) -> None:
     """``alfred scribe retention {keygen | schedule {publish <file>|show}}`` — the retention operator
     surface. ``keygen`` (slice 13d, design §3.1) is the offline-key custody ceremony (see
@@ -3042,8 +3303,15 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
     exact pinned bytes; ``show`` prints the published schedule + whether its on-disk bytes still match the
     chain-pinned sha (drift). JSON output, ILB explicit empties. The sweep SURFACES over-window classes;
     it NEVER auto-destroys (§5)."""
-    if getattr(args, "retention_cmd", None) == "keygen":
+    rcmd = getattr(args, "retention_cmd", None)
+    if rcmd == "keygen":
         _retention_keygen(args)
+        return
+    if rcmd == "unseal":
+        _retention_unseal(args)
+        return
+    if rcmd == "verify":
+        _retention_verify(args)
         return
 
     from alfred.evstore import sha256_hex
@@ -3054,7 +3322,8 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
 
     scmd = getattr(args, "schedule_cmd", None)
     if getattr(args, "retention_cmd", None) != "schedule" or scmd not in ("publish", "show"):
-        print("Usage: alfred scribe retention {keygen [--force] | schedule {publish <file> | show}}")
+        print("Usage: alfred scribe retention {keygen [--force] | unseal <enc> ... | verify | "
+              "schedule {publish <file> | show}}")
         sys.exit(1)
 
     raw = _load_unified_config(args.config)
@@ -4217,6 +4486,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="Rotate: overwrite an existing public key with a NEW keypair (additive — already-sealed "
              "blobs keep their fingerprint and still open with the matching offline key)")
+    # #13d-2 — single-encounter retrieval (design §6). Decrypt+verify+wipe-on-exit, or --record-only
+    # (the off-box-open operator attestation).
+    ret_unseal = retention_sub.add_parser(
+        "unseal", help="Decrypt one sealed encounter for review (dispute/audit/rediarize/clinical "
+                       "review); emits retention.unsealed [D], wipes the plaintext on exit")
+    ret_unseal.add_argument("encounter", help="The opaque encounter id (subject_id)")
+    ret_unseal.add_argument("--key", default=None,
+                            help="Path to the OFFLINE age identity file (AGE-SECRET-KEY-…). Required "
+                                 "unless --record-only.")
+    ret_unseal.add_argument("--out", default=None,
+                            help="Temp dir for the decrypted plaintext (wiped on exit). Required "
+                                 "unless --record-only.")
+    ret_unseal.add_argument("--reason", required=True,
+                            choices=["dispute", "audit", "rediarize", "clinical_review"],
+                            help="Why the audio was opened (a CLOSED enum recorded on the chain)")
+    ret_unseal.add_argument("--ticket", required=True,
+                            help="Ticket / incident reference (recorded on the chain, length-capped)")
+    ret_unseal.add_argument("--justification", default=None,
+                            help="Free-text why → vault_audit.log ONLY (NEVER the chain)")
+    ret_unseal.add_argument("--record-only", action="store_true", dest="record_only",
+                            help="Emit the unseal attestation WITHOUT a local decrypt — the off-box-open "
+                                 "path (the blob was opened off-box with the stock `age` binary). "
+                                 "Forbids --key/--out.")
+    # #13d-2 — the integrity report (incomplete destructions / orphaned artifacts / over-window / pin).
+    retention_sub.add_parser(
+        "verify", help="Report incomplete destructions, blob/sidecar orphans, over-window encounters, "
+                       "and schedule-pin drift; fail-closed on inconsistencies")
     ret_sched = retention_sub.add_parser(
         "schedule", help="Publish / show the s.50 retention schedule (versioned, sha-pinned [D])")
     ret_sched_sub = ret_sched.add_subparsers(dest="schedule_cmd")
