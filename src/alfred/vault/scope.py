@@ -124,14 +124,15 @@ _DELETE_DENIED_TYPES: frozenset[str] = frozenset({
     # authorised path for removing a preference from active effect;
     # the record itself stays for audit.
     "preference",
-    # Clinical note (scribe P1-b) — ANTI-SPOLIATION. A clinical record must
-    # never be deletable by any AGENT scope. Destroying a medico-legal record
-    # is spoliation; there is no agent-path recovery. The ``stayc_clinical``
-    # scope itself also sets delete=False; this denyset is the defense-in-depth
-    # that survives a future scope mistake. The ONE exemption (task #13, 13d-3):
-    # the PRIVILEGED, CLI-only ``stayc_clinical_destroy`` scope, carved out at
-    # the delete gate for the operator-initiated, two-phase-audited s.49 secure
-    # destruction — never reachable from an agent path. Operator also retains
+    # Clinical note (scribe P1-b) — ANTI-SPOLIATION. A clinical record must never
+    # be deletable by any AGENT scope. NOTE (13d-3 BLOCK-1): this record_type-based
+    # entry is NOT the load-bearing enforcement for clinical_note — ``vault_delete``
+    # scope-checks with ``record_type=""`` (it parses the type after), so this entry
+    # is DEAD via ``vault_delete`` for clinical_note. The REAL enforcement is the
+    # PATH-KEYED deny in ``check_scope`` (a ``clinical_note/`` delete is refused for
+    # every scope except the privileged CLI-only ``stayc_clinical_destroy``). This
+    # entry stays as a belt for the DIRECT-call path (record_type populated) + as an
+    # explicit marker; ``stayc_clinical`` also sets delete=False. Operator retains
     # filesystem-level delete.
     "clinical_note",
 })
@@ -1079,10 +1080,13 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
     # orchestrator / transport / talker / curator / janitor path, so no agent route can select it (the
     # escalation-surface guard, pinned in tests/test_stayc_clinical_scope.py). The delete is the
     # deliberate, operator-initiated, two-phase-audited destruction (retention.destroy_intent →
-    # unlink → retention.destroyed); it is the ONE exemption to ``clinical_note``'s universal
-    # ``_DELETE_DENIED_TYPES`` deny (carved out at the delete gate). create / edit / move / search /
-    # context are ALL denied — even if the scope were somehow reached, the blast radius is exactly
-    # "delete one clinical_note", which still requires the durable two-phase chain around it.
+    # unlink → retention.destroyed); it is the ONE scope exempted from the clinical_note PATH-KEYED
+    # anti-spoliation deny in check_scope (which refuses a clinical_note delete for every OTHER scope,
+    # keyed on the ``clinical_note/`` path so it fires even when vault_delete passes record_type=""). Its
+    # own ``clinical_note_destroy_only`` delete gate then bounds it to clinical_note (never any other
+    # type). create / edit / move / search / context are ALL denied — even if the scope were somehow
+    # reached, the blast radius is exactly "delete one clinical_note", still under the durable two-phase
+    # chain around it.
     "stayc_clinical_destroy": {
         "read": True,       # locate / confirm the note before destroying it
         "search": False,
@@ -1829,12 +1833,34 @@ def check_scope(
     # driven, but the watcher path runs without human-in-the-loop on
     # each directive — too risky for canonical records). Operator
     # retains filesystem-level delete.
+    # clinical_note PATH-KEYED anti-spoliation deny (task #13, 13d-3 BLOCK-1). ``vault_delete``
+    # scope-checks with ``record_type=""`` (it parses the frontmatter type only AFTER the scope
+    # check), so the ``record_type``-based ``_DELETE_DENIED_TYPES`` deny below is DEAD via
+    # ``vault_delete`` for clinical_note — a ``delete: True`` scope (the janitor) was probed deleting a
+    # ``clinical_note/`` path with ``record_type=""`` → ALLOWED. Mirror the destroy scope's ``delete``
+    # gate's PATH-keying so the deny fires regardless of whether ``record_type`` is populated: a delete
+    # of a clinical_note (by TYPE or by ``clinical_note/`` PATH) is DENIED for EVERY scope EXCEPT the
+    # privileged, CLI-only ``stayc_clinical_destroy``. This makes the allow/deny pair SYMMETRIC — "only
+    # the destroy scope deletes a clinical_note" is a REAL enforcement guarantee, not one resting on
+    # which instances happen to run the janitor. (The broader ``record_type=""`` gap for the REST of
+    # ``_DELETE_DENIED_TYPES`` — e.g. ``preference`` on Salem, which DOES run the janitor — is boarded
+    # separately as its own cross-cutting fix; this close is clinical_note-only.)
+    if operation == "delete" and scope != "stayc_clinical_destroy":
+        norm_del = rel_path.replace("\\", "/")
+        if record_type == "clinical_note" or norm_del.startswith("clinical_note/"):
+            raise ScopeError(
+                "Delete of a clinical_note is denied — only the privileged, CLI-only "
+                "'stayc_clinical_destroy' scope may destroy a clinical record (PHIA anti-spoliation: "
+                "a medico-legal record must not be deletable by any agent scope). The two-phase "
+                "'alfred scribe retention destroy' CLI is the sole authorised path."
+            )
+
     if operation == "delete" and record_type in _DELETE_DENIED_TYPES:
-        # The ONE exemption (task #13, 13d-3, OQ1=A): the PRIVILEGED ``stayc_clinical_destroy`` scope
-        # may delete a ``clinical_note`` — the operator-initiated s.49 secure destruction. It is CLI-
-        # only (never an agent route — see the scope's SCOPE_RULES note + the escalation pin), audited
-        # by the two-phase retention.destroy_intent/destroyed chain, and its ``clinical_note_destroy_only``
-        # gate below still refuses every OTHER type. Every other (scope, type) stays universally denied.
+        # The clinical_note exemption for the destroy scope is handled by the PATH-KEYED deny above
+        # (which skips ``stayc_clinical_destroy``); this record_type-based deny remains the belt for the
+        # OTHER denied types (``preference``) when their ``record_type`` IS populated. The destroy scope
+        # is still exempted here so a direct ``check_scope(record_type="clinical_note")`` call reaches
+        # its ``clinical_note_destroy_only`` gate rather than being denied.
         if not (scope == "stayc_clinical_destroy" and record_type == "clinical_note"):
             raise ScopeError(
                 f"Delete of record type '{record_type}' is universally "

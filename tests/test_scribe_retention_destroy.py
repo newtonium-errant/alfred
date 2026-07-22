@@ -122,20 +122,21 @@ def _run(cfg_path, ns_kwargs_enc, capsys, **kw):
 def test_resolve_note_paths_matches_by_source_id(tmp_path):
     _make_note(tmp_path, _ENC)                                        # matches
     _make_note(tmp_path, "enc-other", source_id="enc-other")          # different source_id
-    got = ret.resolve_note_paths(tmp_path / "vault", _ENC)
-    assert [p.name for p in got] == [f"note-{_ENC}.md"]
+    matches, malformed = ret.resolve_note_paths(tmp_path / "vault", _ENC)
+    assert [p.name for p in matches] == [f"note-{_ENC}.md"] and malformed == []
 
 
-def test_resolve_note_paths_skips_malformed_note(tmp_path):
+def test_resolve_note_paths_collects_malformed_note(tmp_path):
     _make_note(tmp_path, _ENC)
-    (tmp_path / "vault" / "clinical_note" / "broken.md").write_text(
-        "---\nnot: [valid: yaml\n---\nbody", encoding="utf-8")
-    got = ret.resolve_note_paths(tmp_path / "vault", _ENC)            # skips the broken one, no raise
-    assert [p.name for p in got] == [f"note-{_ENC}.md"]
+    broken = tmp_path / "vault" / "clinical_note" / "broken.md"
+    broken.write_text("---\nnot: [valid: yaml\n---\nbody", encoding="utf-8")
+    matches, malformed = ret.resolve_note_paths(tmp_path / "vault", _ENC)   # collects, no raise
+    assert [p.name for p in matches] == [f"note-{_ENC}.md"]
+    assert [p.name for p in malformed] == ["broken.md"]
 
 
 def test_resolve_note_paths_empty_when_no_dir(tmp_path):
-    assert ret.resolve_note_paths(tmp_path / "vault", _ENC) == []
+    assert ret.resolve_note_paths(tmp_path / "vault", _ENC) == ([], [])
 
 
 # ============================ two-phase order + happy path ============================
@@ -223,6 +224,49 @@ def test_crash_between_phases_flagged_by_verify_then_re_run_completes(tmp_path, 
     out, exited2 = _run(cfg_path, _ENC, capsys)
     assert out["destroyed"] is True and exited2 is None
     assert ev.retention_destroyed_row(_ENC) is not None
+
+
+def test_malformed_clinical_note_refuses_destroy_WARN1(tmp_path, capsys, monkeypatch):
+    """WARN-1: an unparseable clinical_note (unknowable source_id — could BE the target) → the destroy
+    REFUSES to emit retention.destroyed (never a false proof-of-destruction); nothing is destroyed."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    retained = _seal(tmp_path, ev)
+    _make_note(tmp_path, _ENC)
+    (tmp_path / "vault" / "clinical_note" / "corrupt.md").write_text(
+        "---\nbad: [unclosed\n---\nSOAP body", encoding="utf-8")     # unparseable note in the dir
+    _mock_purge(monkeypatch, complete=True)
+    out, exited = _run(cfg_path, _ENC, capsys)
+    assert exited == 1 and "REFUSING to destroy" in out["error"]
+    assert out["unparseable_clinical_notes"] == 1
+    # NOTHING destroyed — no intent, artifacts intact.
+    assert (retained / f"{_ENC}.age").exists()
+    assert ev.retention_destroy_intent_row(_ENC) is None
+    assert ev.retention_destroyed_row(_ENC) is None
+
+
+def test_dry_run_surfaces_unparseable_notes_WARN1(tmp_path, capsys, monkeypatch):
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    _seal(tmp_path, ev)
+    _make_note(tmp_path, _ENC)
+    (tmp_path / "vault" / "clinical_note" / "corrupt.md").write_text("---\nbad: [x\n---\nb", encoding="utf-8")
+    _mock_purge(monkeypatch, complete=True)
+    out, _exited = _run(cfg_path, _ENC, capsys, dry_run=True)
+    assert out["unparseable_clinical_notes"] == 1 and out["blocked_by_unparseable_notes"] is True
+
+
+def test_reason_write_failure_blocks_destroyed_NOTE1(tmp_path, capsys, monkeypatch):
+    """NOTE-1: the compliance --reason is routed to vault_audit BEFORE retention.destroyed. A reason
+    write failure fail-louds WITHOUT emitting destroyed (the reason must be durable first), so the
+    destruction never "stands" with the reason lost — a re-run re-routes + completes."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    _seal(tmp_path, ev)
+    _make_note(tmp_path, _ENC)
+    _mock_purge(monkeypatch, complete=True)
+    monkeypatch.setattr(cli, "_route_destroy_reason",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("audit log unwritable")))
+    out, exited = _run(cfg_path, _ENC, capsys)
+    assert exited == 1 and "compliance --reason" in out["error"]
+    assert ev.retention_destroyed_row(_ENC) is None              # destroyed NOT emitted
 
 
 def test_already_destroyed_is_noop(tmp_path, capsys, monkeypatch):

@@ -198,37 +198,43 @@ def resolved_retained_dir(config) -> Path:
     return Path(config.input_dir).parent / "retained"
 
 
-def resolve_note_paths(vault_path, encounter_id: str) -> list[Path]:
+def resolve_note_paths(vault_path, encounter_id: str) -> tuple[list[Path], list[Path]]:
     """Locate the ``clinical_note`` record(s) for an encounter — the read-only vault scan SHARED by the
     s.49 destroy (13d-3) AND the seal-before-backup (13d-4b backup_run). Scans
     ``<vault>/clinical_note/*.md`` for a frontmatter ``source_id`` == ``encounter_id`` (the opaque
-    encounter id the pipeline stamps on the note, notegen NOTE-4). Returns the matching paths (usually
-    one; an amended encounter may have a superseding clinical_note with the SAME source_id, so >1 is
-    possible). NEVER raises — an unreadable / malformed note is SKIPPED with a loud warning (a destroy
-    must not wedge on one bad file), so the destroy CLI surfaces the matched COUNT for the operator's
-    post-destroy check (a 0 where a note was expected, or a skipped-malformed warning, is the signal to
-    reconcile). Returns ``[]`` when the dir is absent or nothing matches."""
+    encounter id the pipeline stamps on the note, notegen NOTE-4).
+
+    Returns ``(matches, malformed)``: ``matches`` are the paths whose ``source_id`` == encounter_id
+    (usually one; an amended encounter may have a superseding note with the SAME source_id, so >1 is
+    possible); ``malformed`` are the clinical_note paths that could NOT be parsed. A malformed note's
+    ``source_id`` is UNKNOWABLE, so ANY of them could be the destroy target — WARN-1: the destroy
+    REFUSES to emit ``retention.destroyed`` while ``malformed`` is non-empty (a corrupt target would
+    otherwise SURVIVE destruction → a FALSE proof-of-destruction). NEVER raises (a bad file is collected
+    into ``malformed`` + logged, not raised). ``([], [])`` when the dir is absent."""
     import frontmatter
     note_dir = Path(vault_path) / "clinical_note"
     try:
         entries = sorted(note_dir.glob("*.md"))
     except OSError:
-        return []
+        return [], []
     matches: list[Path] = []
+    malformed: list[Path] = []
     for p in entries:
         try:
             post = frontmatter.load(str(p))
             source_id = post.metadata.get("source_id")
-        except Exception:  # noqa: BLE001 — a malformed note can't be source_id-matched; skip it LOUD
+        except Exception:  # noqa: BLE001 — a malformed note can't be source_id-matched; COLLECT it LOUD
             log.warning(
                 "scribe.retention.note_scan_unreadable", path_name=p.name,
-                detail="a clinical_note could not be parsed while resolving notes by source_id — "
-                       "SKIPPED. If it should have matched the destroy target, it will SURVIVE "
-                       "destruction; reconcile via the operator's post-destroy note check.")
+                detail="a clinical_note could not be parsed while resolving notes by source_id — its "
+                       "source_id is UNKNOWABLE, so it may BE the destroy target. The destroy refuses "
+                       "to emit retention.destroyed while any unparseable note exists (never a false "
+                       "proof-of-destruction). Fix / remove it, then re-run.")
+            malformed.append(p)
             continue
         if source_id == encounter_id:
             matches.append(p)
-    return matches
+    return matches, malformed
 
 
 @dataclass(frozen=True)

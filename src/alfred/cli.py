@@ -3397,7 +3397,7 @@ def _retention_destroy(args: argparse.Namespace) -> None:
 
     onbox = _destroy_onbox_targets(cfg, enc, ret_mod, backup_mod)
     label_dirs = _destroy_residual_label_dirs(cfg, enc, ret_mod)
-    note_paths = ret_mod.resolve_note_paths(vault_path, enc)
+    note_paths, malformed_notes = ret_mod.resolve_note_paths(vault_path, enc)
 
     # --dry-run — enumerate what WOULD be destroyed; emit NOTHING, unlink NOTHING, run NO restic mutation.
     if args.dry_run:
@@ -3408,6 +3408,10 @@ def _retention_destroy(args: argparse.Namespace) -> None:
         print(json.dumps({
             "dry_run": True, "encounter_id": enc, "would_unlink": would,
             "residual_label_dirs": len(label_dirs), "clinical_notes": len(note_paths),
+            # WARN-1: an unparseable clinical_note has an UNKNOWABLE source_id (could be the target) —
+            # a real run would REFUSE while any exist; surface it here so the preview never hides it.
+            "unparseable_clinical_notes": len(malformed_notes),
+            "blocked_by_unparseable_notes": bool(malformed_notes),
             "backup_purge": {"complete": purge_preview.complete, "reason": purge_preview.reason,
                              "excluded_paths": purge_preview.excluded_paths},
         }, indent=2))
@@ -3417,6 +3421,20 @@ def _retention_destroy(args: argparse.Namespace) -> None:
     if ev.retention_destroyed_row(enc) is not None:
         print(json.dumps({"already_destroyed": True, "encounter_id": enc}, indent=2))
         return
+
+    # WARN-1 PRE-FLIGHT (fail-loud, before intent): refuse if ANY clinical_note in clinical_note/ is
+    # unparseable. Its source_id is unknowable, so it could BE the destroy target — emitting
+    # retention.destroyed while it survives would be a FALSE proof-of-destruction. The operator must
+    # fix / remove it first.
+    if malformed_notes:
+        print(json.dumps({
+            "error": f"REFUSING to destroy — {len(malformed_notes)} clinical_note(s) under "
+                     f"clinical_note/ could NOT be parsed. An unparseable note's source_id is "
+                     f"unknowable, so it may BE the destroy target — destroying now would leave PHI "
+                     f"behind while retention.destroyed claims completion (false proof-of-destruction). "
+                     f"Fix or remove the unparseable note(s), then re-run.",
+            "encounter_id": enc, "unparseable_clinical_notes": len(malformed_notes)}))
+        sys.exit(1)
 
     # CONFIRMATION — type the opaque encounter id back (proves the operator has the right record in
     # front of them, not a fat-fingered neighbour). --yes bypasses for scripted / non-interactive use.
@@ -3488,16 +3506,31 @@ def _retention_destroy(args: argparse.Namespace) -> None:
         }, indent=2))
         sys.exit(1)
 
-    # PHASE 2 — durable destroyed [D] (only after every unlink + the backup purge succeeded).
+    # NOTE-1 — route the compliance --reason to vault_audit.log BEFORE the destroyed emit, so a
+    # vault_audit write failure can NEVER lose the reason while the destruction "stands". If this write
+    # fails, we fail-loud WITHOUT emitting destroyed; the re-run (idempotent unlinks + purge) re-routes
+    # the reason (a duplicate audit line is harmless append-only provenance) + then emits destroyed. So
+    # the reason is durably recorded before — and re-attempted on any incomplete run before —
+    # retention.destroyed ever lands.
+    try:
+        _route_destroy_reason(audit_path, enc, args)
+    except OSError as exc:
+        print(json.dumps({"error": f"artifacts destroyed + backup purged, but writing the compliance "
+                                    f"--reason to vault_audit.log FAILED ({exc}) — retention.destroyed "
+                                    f"NOT emitted (the reason must be durable first). Fix the audit-log "
+                                    f"path/perms and re-run to complete (unlink idempotent).",
+                          "encounter_id": enc}))
+        sys.exit(1)
+
+    # PHASE 2 — durable destroyed [D] (only after every unlink + the backup purge + the durable reason).
     try:
         ev.retention_destroyed(subject_id=enc, schedule_version=schedule_version,
                                manifest_sha256=manifest_sha)
     except Exception as exc:  # noqa: BLE001
-        print(json.dumps({"error": f"artifacts destroyed + backup purged, but the durable "
-                                    f"retention.destroyed append FAILED: {exc}. Re-run to emit it "
-                                    f"(unlink idempotent); retention verify flags the incomplete state."}))
+        print(json.dumps({"error": f"artifacts destroyed + backup purged + reason recorded, but the "
+                                    f"durable retention.destroyed append FAILED: {exc}. Re-run to emit "
+                                    f"it (unlink idempotent); retention verify flags the incomplete state."}))
         sys.exit(1)
-    _route_destroy_reason(audit_path, enc, args)
     print(json.dumps({
         "destroyed": True, "encounter_id": enc, "unlinked": unlinked,
         "clinical_notes_deleted": notes_deleted, "backup_purged": purge.complete,

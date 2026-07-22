@@ -251,6 +251,33 @@ def test_destroy_scope_is_the_sole_clinical_note_deleter(scope):
         check_scope(scope, "delete", rel_path="clinical_note/x.md", record_type="clinical_note")
 
 
+@pytest.mark.parametrize("scope", ["janitor", "curator", "distiller", "instructor",
+                                   "stayc_clinical", "stayc_clinical_attest", "talker"])
+def test_clinical_note_delete_denied_with_EMPTY_record_type_BLOCK1(scope):
+    """BLOCK-1 probe: vault_delete scope-checks with record_type="" (parses the type after), so the
+    deny MUST be PATH-keyed. The reviewer probed janitor (delete:True) deleting a clinical_note/ path
+    with record_type="" → previously ALLOWED. Now DENIED for EVERY non-destroy scope, keyed on the
+    clinical_note/ path alone. This makes the allow/deny pair symmetric — the enforcement is REAL."""
+    with pytest.raises(ScopeError):
+        check_scope(scope, "delete", rel_path="clinical_note/note-x.md", record_type="")
+
+
+def test_clinical_note_delete_denied_via_real_vault_delete_BLOCK1(tmp_path):
+    """BLOCK-1 end-to-end: a real vault_delete (which passes record_type="") of a clinical_note under
+    the janitor scope is REFUSED — the exact escalation path the reviewer probed, now closed."""
+    from alfred.vault.ops import vault_delete
+    vault = tmp_path / "vault"
+    (vault / "clinical_note").mkdir(parents=True)
+    note = vault / "clinical_note" / "note-x.md"
+    note.write_text("---\ntitle: N\ntype: clinical_note\nsource_id: enc-x\n---\nbody\n", encoding="utf-8")
+    with pytest.raises(ScopeError):
+        vault_delete(vault, "clinical_note/note-x.md", scope="janitor")
+    assert note.exists()                                       # NOT deleted — the belt held
+    # The privileged destroy scope CAN (the sole authorised path).
+    vault_delete(vault, "clinical_note/note-x.md", scope=_DESTROY_SCOPE)
+    assert not note.exists()
+
+
 def test_destroy_scope_gate1_admits_clinical_note():
     # gate 1 (_validate_type) auto-derives clinical_note under the destroy scope's list:True — do NOT
     # edit a KNOWN_TYPES_BY_SCOPE literal (the auto-population must stay live, per CLAUDE.md).
@@ -265,9 +292,11 @@ def test_destroy_scope_is_agent_unreachable_ESCALATION_PIN():
     agent-reachable module — a future wiring that injected it into an agent path would flip this RED."""
     import pathlib
     src = pathlib.Path(schema.__file__).resolve().parents[1]   # src/alfred
+    # WARN-2: temporal/activities._build_env injects profile.scope→ALFRED_VAULT_SCOPE→spawn_agent, and
+    # exec --scope + orchestrator spawn are agent-reachable scope-injection routes — include them.
     agent_reachable = [
         "backends", "curator", "janitor", "distiller", "talker.py", "talker",
-        "transport", "web", "surveyor", "mail", "brief",
+        "transport", "web", "surveyor", "mail", "brief", "temporal", "orchestrator.py",
     ]
     offenders = []
     for path in src.rglob("*.py"):
