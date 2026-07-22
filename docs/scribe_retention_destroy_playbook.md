@@ -96,7 +96,7 @@ You should see the encounter's life story ending (for a retained encounter) in a
 alfred --config config.stayc-clinical.yaml scribe events list --encounter <encounter_id>
 ```
 
-**On disk**, a sealed encounter's artifacts live at (concrete on-box paths):
+**On disk** (for the configured STAY-C layout), a sealed encounter's artifacts live at:
 
 - Sealed audio: `/data/algernon/stayc-clinical/data/retained/<encounter_id>.age`
 - Manifest sidecar: `/data/algernon/stayc-clinical/data/retained/<encounter_id>.manifest.json`
@@ -313,14 +313,13 @@ required verbatim-in-spirit; do not soften it:
   construction**.
 
 - **The transcript and note are the honest-limitation case.** These are kept as LUKS-encrypted
-  plaintext so the clinician can use them. When we unlink them, residual blocks are protected
-  only by the **whole-disk encryption** (LUKS) — which defends the *powered-off, stolen-disk*
-  threat, but is **not** a per-file cryptographic erase. A stronger per-file guarantee would
-  require re-encrypting the whole volume, which is out of scope for on-demand single-encounter
-  destruction. As a mitigation, the tooling makes a **best-effort overwrite before unlink** for
-  the transcript and note — documented honestly as **best-effort on SSD storage, not a
-  guarantee** (wear-levelling and journaling mean no single-file overwrite is guaranteed on
-  modern SSDs).
+  plaintext so the clinician can use them. When they are destroyed they are **permanently
+  unlinked** — there is **no** per-file secure-erase or overwrite step. After the unlink,
+  residual blocks on the drive are protected **only** by the **whole-disk encryption** (LUKS),
+  which defends the *powered-off, stolen-disk* threat but is **not** a per-file cryptographic
+  erase. A stronger per-file guarantee would require re-encrypting the whole volume, which is out
+  of scope for on-demand single-encounter destruction. Do not describe this as a secure wipe; it
+  is a permanent deletion whose residual-block protection is the whole-disk encryption.
 
 - **Every electronic medical record has this same limitation.** The correct posture is to
   **state it plainly and never overclaim** perfect erasure. This is why seal-before-backup

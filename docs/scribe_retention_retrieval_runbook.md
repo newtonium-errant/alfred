@@ -90,8 +90,9 @@ alfred --config config.stayc-clinical.yaml scribe retention unseal <encounter_id
 ```
 
 What this does, in plain language (verified against the shipped code):
-- decrypts `/data/algernon/stayc-clinical/data/retained/<encounter_id>.age` into the `--out`
-  directory (the audio chunks come back out as they went in);
+- decrypts the sealed blob (for the configured STAY-C layout,
+  `/data/algernon/stayc-clinical/data/retained/<encounter_id>.age`) into the `--out` directory
+  (the audio chunks come back out as they went in);
 - **verifies** the decrypted contents against the recorded fingerprints (`manifest_sha256`, and
   the per-chunk digests) so you know the archive was not corrupted. If verification fails it
   **fails closed** — no plaintext is left behind and **no event is written** (the open did not
