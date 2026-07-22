@@ -732,3 +732,102 @@ def test_talker_tier_curation_constants_pinned():
     )
     assert TALKER_TIER_CURATION_TYPES == {"daily"}
     assert TALKER_TIER_CURATION_FIELDS == {"tier_curation"}
+
+
+# ---------------------------------------------------------------------------
+# Generalized anti-spoliation delete deny (13d-3 follow-up) — the PATH-KEYED
+# deny now covers the FULL _DELETE_DENIED_TYPES set, closing the
+# record_type=""-via-vault_delete gap for EVERY denied type (not just
+# clinical_note). Parametrized over the live set so a future denied type is
+# auto-covered.
+# ---------------------------------------------------------------------------
+
+from alfred.vault.scope import (  # noqa: E402
+    _DELETE_DENIED_DIRS,
+    _DELETE_DENIED_TYPES,
+    _DELETE_DENIED_TYPES_WITHOUT_DIR,
+)
+
+_DENIED = sorted(_DELETE_DENIED_TYPES)
+
+
+def _dir(denied_type: str) -> str:
+    return _DELETE_DENIED_DIRS[denied_type]
+
+
+def test_every_denied_type_is_path_keyable_LOCKSTEP():
+    # A denied type with no 1:1 vault directory can't be path-keyed → it would silently lose the
+    # vault_delete (record_type="") close. This pin fails if a future denied type lacks a directory.
+    assert _DELETE_DENIED_TYPES_WITHOUT_DIR == frozenset(), (
+        f"denied types without a directory (not path-keyable): {set(_DELETE_DENIED_TYPES_WITHOUT_DIR)}")
+
+
+@pytest.mark.parametrize("denied_type", _DENIED)
+@pytest.mark.parametrize("shape", ["{d}/X.md", "./{d}/X.md", "dummy/../{d}/X.md",
+                                   "/abs/{d}/X.md", "../{d}/X.md"])
+def test_denied_delete_path_keyed_all_vectors(denied_type, shape):
+    # vault_delete scope-checks with record_type="" — the deny MUST fire on the normalized path for
+    # EVERY denied type, incl. the ./ + dummy/../ resolve-into-dir bypasses and absolute/escaping.
+    rel = shape.format(d=_dir(denied_type))
+    with pytest.raises(ScopeError):
+        check_scope("janitor", "delete", rel_path=rel, record_type="")
+
+
+@pytest.mark.parametrize("denied_type", _DENIED)
+def test_denied_delete_corrupt_frontmatter_still_denied(denied_type):
+    # A denied-type file whose frontmatter won't parse → vault_delete passes record_type="" → the
+    # path-keying still denies it (the type-based deny would have gone dead here).
+    with pytest.raises(ScopeError):
+        check_scope("janitor", "delete", rel_path=f"{_dir(denied_type)}/corrupt.md", record_type="")
+
+
+@pytest.mark.parametrize("denied_type", _DENIED)
+def test_denied_delete_direct_call_record_type_populated(denied_type):
+    # The direct-call path (record_type populated) is still denied — the belt is symmetric.
+    with pytest.raises(ScopeError):
+        check_scope("janitor", "delete", rel_path="", record_type=denied_type)
+
+
+@pytest.mark.parametrize("scope", ["janitor", "curator", "distiller", "talker", "stayc_clinical"])
+@pytest.mark.parametrize("denied_type", _DENIED)
+def test_denied_delete_for_every_non_destroy_scope(scope, denied_type):
+    with pytest.raises(ScopeError):
+        check_scope(scope, "delete", rel_path=f"{_dir(denied_type)}/X.md", record_type="")
+
+
+def test_legit_non_denied_delete_not_regressed():
+    # The janitor (the sole delete:True scope) must STILL delete a non-denied type — no over-deny.
+    for rel, rt in (("task/X.md", "task"), ("person/Y.md", "person"), ("session/Z.md", "session")):
+        check_scope("janitor", "delete", rel_path=rel, record_type=rt)          # must NOT raise
+
+
+def test_destroy_scope_carveout_unchanged():
+    # The destroy scope still deletes clinical_note (incl ./-prefixed), and is refused on preference.
+    check_scope("stayc_clinical_destroy", "delete", rel_path="clinical_note/X.md", record_type="")
+    check_scope("stayc_clinical_destroy", "delete", rel_path="./clinical_note/X.md", record_type="")
+    with pytest.raises(ScopeError):
+        check_scope("stayc_clinical_destroy", "delete", rel_path="preference/X.md", record_type="")
+
+
+def test_denied_delete_end_to_end_vault_delete(tmp_path):
+    # End-to-end through the real vault_delete (which passes record_type="") for BOTH denied types:
+    # the janitor delete is refused and the file survives; the destroy scope can delete a clinical_note.
+    from alfred.vault.ops import vault_delete
+    vault = tmp_path / "vault"
+    files = {}
+    for t in ("preference", "clinical_note"):
+        (vault / t).mkdir(parents=True)
+        p = vault / t / "R.md"
+        p.write_text(f"---\ntitle: R\ntype: {t}\n---\nbody\n", encoding="utf-8")
+        files[t] = p
+    for t in ("preference", "clinical_note"):
+        with pytest.raises(ScopeError):
+            vault_delete(vault, f"{t}/R.md", scope="janitor")
+        assert files[t].exists()                                                # not deleted
+        # disguised path is refused too (resolves into the denied dir).
+        with pytest.raises(ScopeError):
+            vault_delete(vault, f"./{t}/R.md", scope="janitor")
+        assert files[t].exists()
+    # the destroy scope is the sole authorised clinical_note deleter.
+    vault_delete(vault, "clinical_note/R.md", scope="stayc_clinical_destroy")
+    assert not files["clinical_note"].exists()

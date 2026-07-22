@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from .schema import KNOWN_TYPES_KALLE, LEARN_TYPES
+from .schema import KNOWN_TYPES_KALLE, LEARN_TYPES, TYPE_DIRECTORY
 
 
 class ScopeError(Exception):
@@ -140,26 +140,43 @@ _DELETE_DENIED_TYPES: frozenset[str] = frozenset({
 })
 
 
-def _delete_target_class(rel_path: str) -> tuple[bool, bool]:
-    """Classify a delete ``rel_path`` for the clinical_note anti-spoliation gate (13d-3 BLOCK-2).
-    Returns ``(is_clinical_note, is_unsafe)``.
+# Each _DELETE_DENIED_TYPES member's vault DIRECTORY (1:1 from the registry) — the PATH-KEYED deny below
+# matches a normalized delete rel_path against these prefixes so the deny fires even via ``vault_delete``
+# (which scope-checks with ``record_type=""``, so the record_type-based deny is dead for it). A denied
+# type with NO 1:1 directory can't be path-keyed — ``_DELETE_DENIED_TYPES_WITHOUT_DIR`` surfaces it for a
+# lockstep pin (a future denied type without a directory would silently lose the vault_delete close).
+_DELETE_DENIED_DIRS: dict[str, str] = {
+    t: TYPE_DIRECTORY[t] for t in _DELETE_DENIED_TYPES if TYPE_DIRECTORY.get(t)
+}
+_DELETE_DENIED_TYPES_WITHOUT_DIR: frozenset[str] = frozenset(
+    _DELETE_DENIED_TYPES - set(_DELETE_DENIED_DIRS))
+
+
+def _delete_target_class(rel_path: str) -> tuple[str | None, bool]:
+    """Classify a delete ``rel_path`` for the anti-spoliation deny (13d-3 BLOCK-2, generalized to the
+    FULL ``_DELETE_DENIED_TYPES`` set). Returns ``(matched_denied_type_or_None, is_unsafe)``.
 
     The gate must NORMALIZE the path before matching, because ``vault_delete`` scope-checks the RAW
     ``rel_path`` but ``_resolve_vault_path`` collapses ``./`` and ``..`` AFTER the check — so a disguised
-    path (``./clinical_note/X.md``, ``dummy/../clinical_note/X.md``) string-fails the deny yet RESOLVES
-    into ``clinical_note/`` and deletes the PHI. ``os.path.normpath`` collapses those to
-    ``clinical_note/…`` so the deny catches them.
+    path (``./preference/X.md``, ``dummy/../clinical_note/X.md``) string-fails a raw prefix check yet
+    RESOLVES into a denied directory and deletes the record. ``os.path.normpath`` collapses those, then
+    the normalized path is matched against EACH denied type's directory prefix (``_DELETE_DENIED_DIRS``)
+    so the deny catches every member of the set, not just clinical_note.
 
     ``is_unsafe`` is True when the normalized path is ABSOLUTE or ESCAPES the vault (leading ``..``) — a
-    delete must target a clean in-vault relative path; this closes ``/abs/…/clinical_note/X.md`` and
-    ``../clinical_note/X.md``, which ``normpath`` alone won't string-match into the ``clinical_note/``
-    prefix. RESIDUAL (deliberately NOT closed here — needs ``.resolve()``/realpath + a filesystem plant
-    beyond the vault-CLI threat model; it IS the boarded resolve-against-vault arc): a SYMLINK inside the
-    vault (``innocent/`` → ``clinical_note/``) still bypasses ``normpath``."""
+    delete must target a clean in-vault relative path; this closes ``/abs/…/preference/X.md`` and
+    ``../clinical_note/X.md``, which ``normpath`` alone won't string-match into a denied-dir prefix.
+    RESIDUAL (deliberately NOT closed here — needs ``.resolve()``/realpath + a filesystem plant beyond
+    the vault-CLI threat model; it IS the boarded resolve-against-vault arc): a SYMLINK inside the vault
+    (``innocent/`` → ``preference/``) still bypasses ``normpath``."""
     norm = os.path.normpath(rel_path.replace("\\", "/"))
     is_unsafe = os.path.isabs(norm) or norm == ".." or norm.startswith("../")
-    is_clinical_note = norm == "clinical_note" or norm.startswith("clinical_note/")
-    return is_clinical_note, is_unsafe
+    matched: str | None = None
+    for denied_type, directory in _DELETE_DENIED_DIRS.items():
+        if norm == directory or norm.startswith(directory + "/"):
+            matched = denied_type
+            break
+    return matched, is_unsafe
 
 
 def _check_body_mutation_allowed(
@@ -1870,30 +1887,43 @@ def check_scope(
     # ``_DELETE_DENIED_TYPES`` — e.g. ``preference`` on Salem, which DOES run the janitor — is boarded
     # separately as its own cross-cutting fix; this close is clinical_note-only.)
     if operation == "delete" and scope != "stayc_clinical_destroy":
-        # BLOCK-2: NORMALIZE before matching (see _delete_target_class) so ./clinical_note/… and
-        # dummy/../clinical_note/… — which resolve INTO clinical_note/ but string-fail a raw prefix
-        # check — are caught; and an absolute / vault-escaping delete path is refused outright.
-        del_is_cn, del_is_unsafe = _delete_target_class(rel_path)
-        if record_type == "clinical_note" or del_is_cn:
+        # BLOCK-2 (generalized to the FULL _DELETE_DENIED_TYPES set): NORMALIZE before matching (see
+        # _delete_target_class) so ./preference/…, dummy/../clinical_note/… — which resolve INTO a
+        # denied dir but string-fail a raw prefix check — are caught for EVERY denied type; and an
+        # absolute / vault-escaping delete path is refused. This closes the record_type=""-via-
+        # vault_delete gap for the whole set (not just clinical_note, per the 13d-3 follow-up).
+        matched_type, del_is_unsafe = _delete_target_class(rel_path)
+        # honor BOTH the path match (record_type="" via vault_delete) AND a populated record_type
+        # naming a denied type (a direct check_scope call) — the belt is symmetric across both entry paths.
+        denied = matched_type or (record_type if record_type in _DELETE_DENIED_TYPES else None)
+        if denied == "clinical_note":
             raise ScopeError(
                 "Delete of a clinical_note is denied — only the privileged, CLI-only "
                 "'stayc_clinical_destroy' scope may destroy a clinical record (PHIA anti-spoliation: "
                 "a medico-legal record must not be deletable by any agent scope). The two-phase "
                 "'alfred scribe retention destroy' CLI is the sole authorised path."
             )
+        if denied is not None:
+            raise ScopeError(
+                f"Delete of a '{denied}' record is universally denied for agent scopes "
+                f"(operator-canonical — recovery cost too high to gate via per-scope toggle). The "
+                f"authorised path for removing it from active effect is ``status: revoked`` on the "
+                f"existing record; the record itself stays for audit. Operator may delete via direct "
+                f"filesystem access if truly needed."
+            )
         if del_is_unsafe:
             raise ScopeError(
                 f"Delete refused for scope '{scope}' — '{rel_path}' is not a clean in-vault relative "
-                f"path (it is absolute or escapes the vault). A clinical_note could hide behind such a "
-                f"path; deletes must use a normalized in-vault relative path."
+                f"path (it is absolute or escapes the vault). An anti-spoliation record could hide "
+                f"behind such a path; deletes must use a normalized in-vault relative path."
             )
 
     if operation == "delete" and record_type in _DELETE_DENIED_TYPES:
-        # The clinical_note exemption for the destroy scope is handled by the PATH-KEYED deny above
-        # (which skips ``stayc_clinical_destroy``); this record_type-based deny remains the belt for the
-        # OTHER denied types (``preference``) when their ``record_type`` IS populated. The destroy scope
-        # is still exempted here so a direct ``check_scope(record_type="clinical_note")`` call reaches
-        # its ``clinical_note_destroy_only`` gate rather than being denied.
+        # BELT for the DESTROY-scope direct-call path (the PATH-KEYED deny above skips
+        # ``stayc_clinical_destroy``): a destroy-scope delete with a populated ``record_type`` naming a
+        # NON-clinical_note denied type (e.g. ``preference``) is refused here; ``clinical_note`` is
+        # exempted so it reaches the ``clinical_note_destroy_only`` gate. For every OTHER scope the
+        # generalized path-keyed deny above already fired, so this is a redundant-but-harmless belt.
         if not (scope == "stayc_clinical_destroy" and record_type == "clinical_note"):
             raise ScopeError(
                 f"Delete of record type '{record_type}' is universally "
@@ -1924,13 +1954,13 @@ def check_scope(
         # BLOCK-2: normalize SYMMETRICALLY with the deny side — the destroy scope still succeeds on a
         # ./-prefixed clinical_note path, and an absolute / vault-escaping destroy target is refused (so
         # the normalization defect isn't left on the allow side either).
-        dest_is_cn, dest_is_unsafe = _delete_target_class(rel_path)
+        dest_matched, dest_is_unsafe = _delete_target_class(rel_path)
         if dest_is_unsafe:
             raise ScopeError(
                 f"Scope '{scope}' refuses delete of '{rel_path}' — the destroy target must be a clean "
                 f"in-vault relative path (not absolute, not vault-escaping)."
             )
-        if record_type != "clinical_note" and not dest_is_cn:
+        if record_type != "clinical_note" and dest_matched != "clinical_note":
             raise ScopeError(
                 f"Scope '{scope}' may only delete a 'clinical_note' record (the s.49 "
                 f"secure-destruction scope) — got type '{record_type or '(unset)'}' / path "
