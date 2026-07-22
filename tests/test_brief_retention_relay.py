@@ -81,6 +81,34 @@ def test_not_surfaced_is_not_a_false_all_clear(tmp_path):
     assert "no encounters over" not in out                   # never the false all-clear
 
 
+def test_not_surfaced_names_all_three_causes_and_remediations(tmp_path):
+    # The spool carries only surfaced=false — NOT which of the sweep's three not-surfaced causes fired
+    # (no/corrupt schedule → no_schedule_published/schedule_load_failed; an unenumerable sealed-blob
+    # store → review_enumeration_failed; an unreadable clinical chain → review_basis_unavailable). So the
+    # render MUST name all three + their DISTINCT remediations: a single "publish the schedule" line
+    # mis-points the operator when the real cause is (2) an unenumerable blob store or (3) an unreadable
+    # clinical chain. Regression pin for follow-up #3 (was: 2 causes + one wrong remediation).
+    import structlog
+
+    with structlog.testing.capture_logs() as cap:
+        out = render_stayc_retention_relay_section(
+            _cfg(str(_spool(tmp_path, review_due=0, oldest="", surfaced=False))), _NOW)
+    low = out.lower()
+    # cause 1 — no/corrupt schedule: publish/repair the schedule
+    assert "corrupt" in low and "alfred scribe retention schedule publish" in out
+    # cause 2 — unenumerable sealed-blob store: check the retained/blob dir readability + permissions
+    assert "enumerated" in low and "blob" in low and "permission" in low
+    # cause 3 — unreadable clinical chain (the R5 age-basis path): check the clinical event store
+    assert "clinical" in low and "chain" in low
+    # the operator is pointed at the daemon-log latch family that DOES name the exact cause
+    assert "scribe.retention.sweep" in out
+    # log-emission pin: the not_surfaced state must stay observable across refactors (the operator's
+    # grep workflow depends on it) — assert the exact event + state, not just that a line rendered.
+    matches = [c for c in cap if c["event"] == "brief.stayc_retention_relay"
+               and c.get("state") == "not_surfaced"]
+    assert len(matches) == 1
+
+
 def test_absent_surfaced_field_fails_safe_to_not_evaluated(tmp_path):
     # An older spool lacking the surfaced field defaults to did-not-evaluate (fail-safe: never a false
     # all-clear from a spool written before the field existed).
