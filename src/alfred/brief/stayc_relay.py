@@ -277,14 +277,25 @@ def render_stayc_retention_relay_section(config, now_utc: datetime) -> str:
             "The box sweep may have stopped."
         )
 
-    # E3: a FRESH spool whose surfacing did NOT run this sweep (no schedule published / corrupt / the
-    # blob store was unenumerable) must NOT read as an all-clear — review_due is UNKNOWN, not zero.
+    # E3/R5: a FRESH spool whose surfacing did NOT run this sweep must NOT read as an all-clear —
+    # review_due is UNKNOWN, not zero. The spool carries only surfaced=false; it does NOT record WHICH
+    # of the sweep's THREE not-surfaced causes fired (no/corrupt schedule → no_schedule_published /
+    # schedule_load_failed; an unenumerable sealed-blob store → review_enumeration_failed; an unreadable
+    # clinical chain, the over-window AGE BASIS → review_basis_unavailable). So the render names ALL
+    # THREE + their DISTINCT remediations — "publish the schedule" is correct for ONLY the first and
+    # would mis-point the operator for the other two — and points at the daemon-log latch that DOES name
+    # the exact one. (If the spool is ever extended to thread the specific cause, collapse this to the
+    # named cause + its single remediation.)
     if not surfaced:
         log.info("brief.stayc_retention_relay", state="not_surfaced")
         return (
             "**STAY-C retention: review not evaluated** — the box sweep is alive but over-window "
-            "surfacing did not run (no s.50 schedule published, or the blob store was unreadable). "
-            "review_due is UNKNOWN — publish/repair the schedule."
+            "surfacing did not run, so review_due is UNKNOWN (NOT an all-clear). One of three causes: "
+            "(1) no s.50 schedule is published, or the published one is corrupt — publish/repair it via "
+            "`alfred scribe retention schedule publish`; (2) the sealed-blob store could not be "
+            "enumerated — check the retained/blob dir's readability + permissions; (3) the clinical "
+            "chain could not be read to date the blobs — check the clinical event store's health + "
+            "permissions. The daemon log's latched `scribe.retention.sweep.*` signal names which one."
         )
 
     log.info("brief.stayc_retention_relay", state="fresh", review_due=review_due)
