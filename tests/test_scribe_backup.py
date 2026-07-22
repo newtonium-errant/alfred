@@ -74,9 +74,11 @@ def test_backup_set_includes_sealed_tree_excludes_plaintext_and_enrollment(tmp_p
     cfg = _cfg(tmp_path)
     bs = backup.build_backup_set(cfg)
     retained = Path(cfg.input_dir).parent / "retained"
-    # Includes: the retained tree (sealed audio + PHI-free sidecars) + the sealed-backup staging dir.
-    assert retained in bs.includes
-    assert backup.resolved_sealed_backup_dir(cfg) in bs.includes
+    # ONE include root: the retained tree (sealed audio + PHI-free sidecars). The sealed-staging dir
+    # rides UNDER it (a separate include would be redundant) — assert it is COVERED by the include.
+    assert bs.includes == [retained]
+    sealed = backup.resolved_sealed_backup_dir(cfg)
+    assert sealed.is_relative_to(retained), "sealed staging must ride under the retained include"
     # EXCLUDES: the plaintext transcript ledger (LUKS on-box only) + the biometric enrollment store.
     assert str(retained / "transcripts") in bs.excludes
     assert "**/enrollment" in bs.excludes
@@ -213,6 +215,20 @@ def test_restic_env_none_when_no_password_source(tmp_path, monkeypatch):
     assert backup._restic_env() is None                        # a repo with no password can't open
 
 
+def test_restic_env_drops_conflicting_repo_file_and_password_command(tmp_path, monkeypatch):
+    """Defense-in-depth for a destruction command: a stale inherited RESTIC_REPOSITORY_FILE (conflicts
+    with the RESTIC_REPOSITORY we set) or RESTIC_PASSWORD_COMMAND (shadows the intended password) could
+    redirect the purge at a different repo / open with a different key — both are dropped."""
+    monkeypatch.setenv(backup.ENV_RESTIC_REPO, "sftp:host:/stayc")
+    monkeypatch.setenv(backup.ENV_RESTIC_PASSWORD, "pw")
+    monkeypatch.setenv("RESTIC_REPOSITORY_FILE", "/some/other/repo")
+    monkeypatch.setenv("RESTIC_PASSWORD_COMMAND", "cat /some/other/pw")
+    env = backup._restic_env()
+    assert env["RESTIC_REPOSITORY"] == "sftp:host:/stayc"
+    assert "RESTIC_REPOSITORY_FILE" not in env
+    assert "RESTIC_PASSWORD_COMMAND" not in env
+
+
 # ============================ purge_encounter (mocked restic) ============================
 
 
@@ -267,7 +283,10 @@ def test_purge_happy_path_complete_when_find_empty(tmp_path, monkeypatch):
     assert rewrite[0] == "rewrite" and "--forget" in rewrite
     assert rewrite.count("--exclude") == 4
     assert calls[1][0] == "prune"
+    # The assert-empty find MUST be at least as broad as the repo-wide rewrite — it is DELIBERATELY
+    # un-tagged, else a non-stayc-tagged snapshot holding the encounter would slip a false all-clear.
     assert calls[2][0] == "find" and _ENC in calls[2]
+    assert "--tag" not in calls[2] and backup.RESTIC_TAG not in calls[2]
     assert any(c.get("event") == "scribe.backup.purge_complete" for c in captured)
 
 

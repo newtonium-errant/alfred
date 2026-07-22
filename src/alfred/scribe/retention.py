@@ -183,6 +183,21 @@ def key_fingerprint(public_key: bytes) -> str:
     return sha256_hex(public_key)[:16]
 
 
+def resolved_retained_dir(config) -> Path:
+    """The sealed-blob store + relocated-transcript dir — the SINGLE source of truth for WHERE the
+    seal path writes, so the daemon sweep (13b), the backup, and the destroy-purge (13d) can NEVER
+    silently target a different tree than the seal writes to (a real fail-open drift risk for the
+    destruction backstop). Configured ``retention.retained_dir`` or the derived
+    ``<input_dir parent>/retained`` (a per-instance-correct default, never a single-instance literal).
+    Duck-typed on ``config`` (a ``ScribeConfig``) to keep this module's import surface minimal — it
+    reads only ``config.retention.retained_dir`` + ``config.input_dir``. The sweep's
+    ``RetentionSweep._resolved_retained_dir`` + ``scribe.backup`` both delegate here."""
+    configured = config.retention.retained_dir
+    if configured:
+        return Path(configured)
+    return Path(config.input_dir).parent / "retained"
+
+
 @dataclass(frozen=True)
 class SealOutcome:
     """The result of a :func:`seal_encounter` call — the sweep (13b) consumes ``status`` for its

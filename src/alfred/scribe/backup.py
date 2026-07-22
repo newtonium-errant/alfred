@@ -100,23 +100,14 @@ class PurgeResult:
 # --- retained-dir + sealed-staging-dir resolution (mirror the sweep's derive) -------------------
 
 
-def resolved_retained_dir(config: ScribeConfig) -> Path:
-    """The sealed-blob store + relocated transcripts dir — the SAME resolution the retention sweep
-    uses (``RetentionSweep._resolved_retained_dir``): configured ``retention.retained_dir`` or the
-    derived ``<input_dir parent>/retained`` (a per-instance-correct default, never a single-instance
-    literal)."""
-    configured = config.retention.retained_dir
-    if configured:
-        return Path(configured)
-    return Path(config.input_dir).parent / "retained"
-
-
 def resolved_sealed_backup_dir(config: ScribeConfig) -> Path:
     """The staging dir for the enc-id-named SEALED backup copies of the transcript + note (ruling A).
-    Derived ``<retained_dir>/backup_sealed`` — under the retained tree (already ReadWritePaths) so
-    the daemon/backup job can write the sealed copies, and enc-id-named so purge is uniform. Kept
-    OUT of the transcripts/ subdir (which holds the plaintext ledger, structurally excluded)."""
-    return resolved_retained_dir(config) / "backup_sealed"
+    Derived ``<retained_dir>/backup_sealed`` — UNDER the retained tree (already ReadWritePaths) so
+    the backup job can write the sealed copies, and so backing up the retained root captures them with
+    NO separate include. Kept OUT of the transcripts/ subdir (the plaintext ledger, structurally
+    excluded). Delegates to the shared :func:`retention.resolved_retained_dir` (single source of truth
+    — purge/backup can never target a different tree than the seal writes to)."""
+    return ret.resolved_retained_dir(config) / "backup_sealed"
 
 
 # --- (1) the backup set (include/exclude) -------------------------------------------------------
@@ -138,8 +129,7 @@ def build_backup_set(config: ScribeConfig) -> BackupSet:
 
     Deliberately does NOT back up ``data/`` wholesale nor the raw vault tree — the note's durable
     off-box copy is its SEALED staging blob, so no plaintext clinical record ever leaves the box."""
-    retained = resolved_retained_dir(config)
-    sealed_backup = resolved_sealed_backup_dir(config)
+    retained = ret.resolved_retained_dir(config)
     excludes = [
         # the plaintext transcript ledger — LUKS on-box only, sealed copy goes off-box instead.
         str(retained / "transcripts"),
@@ -150,7 +140,10 @@ def build_backup_set(config: ScribeConfig) -> BackupSet:
     enrollment_dir = config.diarize.enrollment_dir
     if enrollment_dir:
         excludes.append(str(enrollment_dir))
-    return BackupSet(includes=[retained, sealed_backup], excludes=excludes)
+    # ONE include root: the retained tree. The sealed-staging dir (<retained>/backup_sealed) rides
+    # UNDER it, so a separate include would be REDUNDANT; the ``.age`` audio + PHI-free sidecars are
+    # direct children. Only the plaintext transcripts/ subdir is carved back out via the exclude.
+    return BackupSet(includes=[retained], excludes=excludes)
 
 
 # --- (2) seal-before-backup (ruling A) ----------------------------------------------------------
@@ -195,7 +188,7 @@ def transcript_source_path(config: ScribeConfig, encounter_id: str) -> Path:
     """The on-box relocated transcript ledger for an encounter — the plaintext source
     seal-before-backup seals. Lives at ``<retained_dir>/transcripts/<enc>.transcript.json`` (where
     ``retention._relocate_ledger`` puts it)."""
-    return ledger.ledger_path(resolved_retained_dir(config) / "transcripts", encounter_id)
+    return ledger.ledger_path(ret.resolved_retained_dir(config) / "transcripts", encounter_id)
 
 
 # --- (3) per-encounter destroy purge (destroy step 3f) ------------------------------------------
@@ -206,7 +199,7 @@ def encounter_backup_globs(config: ScribeConfig, encounter_id: str) -> list[str]
     (the invariant): the sealed audio blob, the PHI-free sidecar, and the sealed transcript + note
     backup copies. restic ``--exclude`` matches these absolute paths in every snapshot. Explicit
     per-artifact (NOT a ``<enc>.*`` glob) so a purge can NEVER over-match a differently-named file."""
-    retained = resolved_retained_dir(config)
+    retained = ret.resolved_retained_dir(config)
     sealed_backup = resolved_sealed_backup_dir(config)
     return [
         str(retained / f"{encounter_id}{ret.SEAL_BLOB_SUFFIX}"),                 # sealed audio
@@ -227,6 +220,12 @@ def _restic_env() -> dict[str, str] | None:
         return None
     env = dict(os.environ)
     env["RESTIC_REPOSITORY"] = repo
+    # Defense-in-depth for a DESTRUCTION command: a stale inherited RESTIC_REPOSITORY_FILE conflicts
+    # with the RESTIC_REPOSITORY we set (restic errors on both), and a RESTIC_PASSWORD_COMMAND would
+    # SHADOW our intended password source — either could silently redirect the purge at a different
+    # repo / open with a different key. Drop both so the STAY-C dedicated creds are the ONLY ones in play.
+    env.pop("RESTIC_REPOSITORY_FILE", None)
+    env.pop("RESTIC_PASSWORD_COMMAND", None)
     pw_file = os.environ.get(ENV_RESTIC_PASSWORD_FILE)
     pw = os.environ.get(ENV_RESTIC_PASSWORD)
     if pw_file:
@@ -324,8 +323,12 @@ def purge_encounter(
             reason=f"restic prune exited {prune.returncode} — the excised blocks may NOT be freed; "
                    f"the backup purge did NOT complete")
 
-    # ASSERT the encounter is gone from every snapshot (the load-bearing check).
-    found = _run_restic(["find", "--tag", RESTIC_TAG, encounter_id], env)
+    # ASSERT the encounter is gone from every snapshot (the load-bearing check). DELIBERATELY
+    # UN-tagged: `rewrite --forget --exclude` above runs REPO-WIDE, so the verify MUST be at least
+    # as broad — a `--tag stayc` find would MISS a non-stayc-tagged snapshot the rewrite failed to
+    # strip and falsely report complete=True (a backup surviving a "complete" destruction). A
+    # destruction backstop verifies at least as broadly as it mutates (over-report → fail closed).
+    found = _run_restic(["find", encounter_id], env)
     if _find_is_empty(found, encounter_id):
         log.info(
             "scribe.backup.purge_complete", encounter_id=encounter_id, excluded=len(excluded),

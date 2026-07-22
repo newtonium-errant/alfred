@@ -711,14 +711,12 @@ class RetentionSweep:
     # --- resource resolution ---------------------------------------------
 
     def _resolved_retained_dir(self) -> Path:
-        """The sealed-blob store + relocated transcripts dir. Empty config ⇒ derive
-        ``<input_dir parent>/retained`` (STAY-C's ``input_dir`` is ``<STAYC_DATA>/inbox``, so this is
-        ``<STAYC_DATA>/retained`` — under ReadWritePaths, per §3.7) — a per-instance-correct default,
-        never a single-instance literal (mirrors ``ScribeBugConfig.dir``)."""
-        configured = self._config.retention.retained_dir
-        if configured:
-            return Path(configured)
-        return Path(self._config.input_dir).parent / "retained"
+        """The sealed-blob store + relocated transcripts dir. Delegates to the SHARED
+        :func:`retention.resolved_retained_dir` (the single source of truth) so the sweep, the backup,
+        and the destroy-purge can NEVER silently target a different tree than the seal writes to.
+        Empty config ⇒ ``<input_dir parent>/retained`` (STAY-C's ``input_dir`` is ``<STAYC_DATA>/inbox``,
+        so ``<STAYC_DATA>/retained`` — under ReadWritePaths, per §3.7)."""
+        return ret.resolved_retained_dir(self._config)
 
     def _resolve_sealer(self) -> "ret.Sealer | None":
         """The production sealer (13a's ``retention.make_default_sealer`` — the age / ``pyrage`` backend
