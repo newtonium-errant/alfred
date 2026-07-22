@@ -125,12 +125,14 @@ _DELETE_DENIED_TYPES: frozenset[str] = frozenset({
     # the record itself stays for audit.
     "preference",
     # Clinical note (scribe P1-b) — ANTI-SPOLIATION. A clinical record must
-    # never be deletable by ANY agent scope, even one carrying
-    # ``delete: True`` (none does today, but this universal-deny is the
-    # belt). Destroying a medico-legal record is spoliation; there is no
-    # agent-path recovery. The ``stayc_clinical`` scope itself also sets
-    # delete=False; this denyset is the defense-in-depth that survives a
-    # future scope mistake. Operator retains filesystem-level delete.
+    # never be deletable by any AGENT scope. Destroying a medico-legal record
+    # is spoliation; there is no agent-path recovery. The ``stayc_clinical``
+    # scope itself also sets delete=False; this denyset is the defense-in-depth
+    # that survives a future scope mistake. The ONE exemption (task #13, 13d-3):
+    # the PRIVILEGED, CLI-only ``stayc_clinical_destroy`` scope, carved out at
+    # the delete gate for the operator-initiated, two-phase-audited s.49 secure
+    # destruction — never reachable from an agent path. Operator also retains
+    # filesystem-level delete.
     "clinical_note",
 })
 
@@ -1069,6 +1071,31 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
+    # ``stayc_clinical_destroy`` — the PRIVILEGED s.49 SECURE-DESTRUCTION scope (task #13, 13d-3,
+    # OQ1=A). The SOLE scope permitted to delete a ``clinical_note`` — and ONLY a ``clinical_note``
+    # (the ``clinical_note_destroy_only`` gate refuses every other type). Reachable ONLY from the
+    # ``alfred scribe retention destroy`` CLI, which passes ``scope="stayc_clinical_destroy"`` DIRECTLY
+    # to ``vault_delete`` in-process — NEVER injected as ``ALFRED_VAULT_SCOPE`` by any agent / backend /
+    # orchestrator / transport / talker / curator / janitor path, so no agent route can select it (the
+    # escalation-surface guard, pinned in tests/test_stayc_clinical_scope.py). The delete is the
+    # deliberate, operator-initiated, two-phase-audited destruction (retention.destroy_intent →
+    # unlink → retention.destroyed); it is the ONE exemption to ``clinical_note``'s universal
+    # ``_DELETE_DENIED_TYPES`` deny (carved out at the delete gate). create / edit / move / search /
+    # context are ALL denied — even if the scope were somehow reached, the blast radius is exactly
+    # "delete one clinical_note", which still requires the durable two-phase chain around it.
+    "stayc_clinical_destroy": {
+        "read": True,       # locate / confirm the note before destroying it
+        "search": False,
+        "list": True,       # gate 1 (_validate_type) admits clinical_note under this scope (VERA-P1 list lesson)
+        "context": False,
+        "create": False,
+        "edit": False,
+        "move": False,
+        "delete": "clinical_note_destroy_only",   # clinical_note ONLY (the s.49 destruction capability)
+        "allow_body_writes": False,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
 }
 
 
@@ -1803,15 +1830,21 @@ def check_scope(
     # each directive — too risky for canonical records). Operator
     # retains filesystem-level delete.
     if operation == "delete" and record_type in _DELETE_DENIED_TYPES:
-        raise ScopeError(
-            f"Delete of record type '{record_type}' is universally "
-            f"denied for agent scopes (operator-canonical — recovery "
-            f"cost too high to gate via per-scope toggle). The "
-            f"authorised path for removing a preference from active "
-            f"effect is ``status: revoked`` on the existing record; "
-            f"the record itself stays for audit. Operator may delete "
-            f"via direct filesystem access if truly needed."
-        )
+        # The ONE exemption (task #13, 13d-3, OQ1=A): the PRIVILEGED ``stayc_clinical_destroy`` scope
+        # may delete a ``clinical_note`` — the operator-initiated s.49 secure destruction. It is CLI-
+        # only (never an agent route — see the scope's SCOPE_RULES note + the escalation pin), audited
+        # by the two-phase retention.destroy_intent/destroyed chain, and its ``clinical_note_destroy_only``
+        # gate below still refuses every OTHER type. Every other (scope, type) stays universally denied.
+        if not (scope == "stayc_clinical_destroy" and record_type == "clinical_note"):
+            raise ScopeError(
+                f"Delete of record type '{record_type}' is universally "
+                f"denied for agent scopes (operator-canonical — recovery "
+                f"cost too high to gate via per-scope toggle). The "
+                f"authorised path for removing a preference from active "
+                f"effect is ``status: revoked`` on the existing record; "
+                f"the record itself stays for audit. Operator may delete "
+                f"via direct filesystem access if truly needed."
+            )
 
     if permission is True:
         return
@@ -1822,6 +1855,23 @@ def check_scope(
         )
 
     # Special rules
+    if permission == "clinical_note_destroy_only":
+        # The s.49 destruction gate (13d-3, OQ1=A): the ``stayc_clinical_destroy`` scope's ``delete``
+        # capability is bounded to ``clinical_note`` and NOTHING else — the scope structurally cannot
+        # delete a person/project/task/etc. Keyed on the PATH (``clinical_note/…``) because
+        # ``vault_delete`` passes ``rel_path`` but NOT the parsed ``record_type`` on a delete (it parses
+        # the frontmatter AFTER the scope check), so ``record_type`` is empty on the real call; an
+        # explicit ``record_type == "clinical_note"`` (a direct check_scope call) is also accepted.
+        norm = rel_path.replace("\\", "/")
+        if record_type != "clinical_note" and not norm.startswith("clinical_note/"):
+            raise ScopeError(
+                f"Scope '{scope}' may only delete a 'clinical_note' record (the s.49 "
+                f"secure-destruction scope) — got type '{record_type or '(unset)'}' / path "
+                f"'{rel_path}'. This scope's sole capability is destroying a clinical record under "
+                f"the two-phase retention.destroy_intent/destroyed audit."
+            )
+        return
+
     if permission == "inbox_only":
         norm = rel_path.replace("\\", "/")
         if not norm.startswith("inbox/"):

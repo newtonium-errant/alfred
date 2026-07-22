@@ -3303,6 +3303,207 @@ def _verify_over_window(ev, retained_dir, cfg, ret_mod, sched_mod) -> dict:
     return {"count": due, "oldest": oldest_id, "surfaced": True}
 
 
+def _destroy_onbox_targets(cfg, enc, ret_mod, backup_mod):
+    """The enc-id-named ON-BOX artifact paths a destroy unlinks (idempotent — each may be absent):
+    the sealed audio blob, the PHI-free manifest sidecar, the relocated transcript ledger, and the
+    seal-before-backup staging copies (transcript + note, 13d-4b). The residual plaintext label dir
+    (abandoned-before-seal / transient) + the vault clinical_note are handled separately (they are not
+    enc-id-named on disk)."""
+    retained = ret_mod.resolved_retained_dir(cfg)
+    sealed_backup = backup_mod.resolved_sealed_backup_dir(cfg)
+    return [
+        retained / f"{enc}{ret_mod.SEAL_BLOB_SUFFIX}",                       # sealed audio
+        retained / f"{enc}{ret_mod.SEAL_MANIFEST_SIDECAR_SUFFIX}",           # PHI-free sidecar
+        retained / "transcripts" / f"{enc}.transcript.json",                # relocated ledger
+        sealed_backup / f"{enc}{backup_mod.SEAL_TRANSCRIPT_SUFFIX}",         # sealed backup transcript
+        sealed_backup / f"{enc}{backup_mod.SEAL_NOTE_SUFFIX}",               # sealed backup note
+    ]
+
+
+def _destroy_residual_label_dirs(cfg, enc, ret_mod):
+    """The input_dir label dir(s) whose computed encounter_id == ``enc`` — an abandoned-before-seal /
+    transient encounter's residual PLAINTEXT (chunks + meta + ledger + _CLOSED + the PHI-named dir).
+    Enc-id is a salted hash of the label, so it can't be reversed — we scan + match. A sealed encounter
+    has none (wiped at seal). NEVER raises (a bad salt / unreadable inbox → [])."""
+    from alfred.scribe.identity import EncounterIdentityError, compute_encounter_id
+    input_dir = Path(cfg.input_dir)
+    out = []
+    try:
+        entries = list(input_dir.iterdir())
+    except OSError:
+        return []
+    for d in entries:
+        try:
+            if d.is_dir() and not d.name.startswith(".") and \
+                    compute_encounter_id(d.name, salt=cfg.encounter_salt) == enc:
+                out.append(d)
+        except (OSError, EncounterIdentityError):
+            continue
+    return out
+
+
+def _route_destroy_reason(audit_path, enc, args):
+    """Route the destroy ``--reason`` (+ ticket + free-text justification) to vault_audit.log — the
+    two-trail split (§5.2): the frozen retention.destroy_intent/destroyed payloads carry NO reason field
+    (only {schedule_version, manifest_sha256}), so WHY a record was destroyed lands HERE, never the
+    chain. NEVER patient content."""
+    from alfred.vault.mutation_log import append_to_audit_log, build_audit_mutations
+    detail = f"retention DESTROY (reason={args.reason}, ticket={args.ticket}, encounter={enc})"
+    justification = getattr(args, "justification", None)
+    if justification:
+        detail += f": {justification}"
+    append_to_audit_log(str(audit_path), "scribe",
+                        build_audit_mutations("delete", f"retention/destroy/{enc}"), detail=detail)
+
+
+def _retention_destroy(args: argparse.Namespace) -> None:
+    """``alfred scribe retention destroy <enc> --reason <patient_request|legal_order|schedule_expiry>
+    --ticket <ref> [--justification] [--dry-run] [--yes]`` — the §5.2 two-phase s.49 SECURE DESTRUCTION
+    (slice 13d-3). IRREVERSIBLE — permanently deletes a patient's record.
+
+    Order (crash-safe): retention.destroy_intent [D] BEFORE any unlink → unlink [sealed .age + manifest
+    sidecar + residual plaintext + transcript ledger + sealed-backup staging + vault clinical_note (via
+    the privileged stayc_clinical_destroy scope) + backup.purge_encounter] → GATE on completeness →
+    retention.destroyed [D]. A crash between intent and destroyed leaves an incomplete destruction that
+    `retention verify` flags + a re-run completes (unlink idempotent). An incomplete backup purge or an
+    on-box unlink failure BLOCKS retention.destroyed (a destruction leaving a copy is NOT "destroyed").
+    The --reason routes to vault_audit.log (the frozen payload has no reason field). WITHDRAWAL never
+    triggers this — the operator supplies an explicit encounter id (the consent.withdrawn marker is
+    destroy-ADDRESSABILITY only). Safeguards: --dry-run enumerates + mutates nothing; an interactive
+    type-the-encounter-id-back confirmation unless --yes."""
+    from alfred.scribe import backup as backup_mod
+    from alfred.scribe import retention as ret_mod
+    from alfred.scribe import schedule as sched_mod
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+    enc = args.encounter
+    vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+    ev = _open_scribe_events(raw)
+    if not ev.active:
+        print(json.dumps({"error": "clinical event store inactive — destroy requires an active "
+                                    "medico-legal store (scribe.mode: clinical)"}))
+        sys.exit(1)
+    log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
+    audit_path = log_dir / "vault_audit.log"
+
+    # Resolve the frozen destroy-payload fields (§5.2): manifest_sha256 from the sealed row (or "" for a
+    # never-sealed abandoned/transient encounter); schedule_version from the published schedule (or "").
+    sealed_row = ev.retention_sealed_row(enc)
+    manifest_sha = (sealed_row.get("payload") or {}).get("manifest_sha256", "") if sealed_row else ""
+    sched = sched_mod.load_schedule(cfg.retention.schedule_path) if cfg.retention.schedule_path else None
+    schedule_version = sched["schedule_version"] if sched else ""
+
+    onbox = _destroy_onbox_targets(cfg, enc, ret_mod, backup_mod)
+    label_dirs = _destroy_residual_label_dirs(cfg, enc, ret_mod)
+    note_paths = ret_mod.resolve_note_paths(vault_path, enc)
+
+    # --dry-run — enumerate what WOULD be destroyed; emit NOTHING, unlink NOTHING, run NO restic mutation.
+    if args.dry_run:
+        would = [str(p) for p in onbox if p.exists()]
+        would += [str(d) for d in label_dirs]
+        would += [str(p) for p in note_paths]
+        purge_preview = backup_mod.purge_encounter(cfg, enc, dry_run=True)
+        print(json.dumps({
+            "dry_run": True, "encounter_id": enc, "would_unlink": would,
+            "residual_label_dirs": len(label_dirs), "clinical_notes": len(note_paths),
+            "backup_purge": {"complete": purge_preview.complete, "reason": purge_preview.reason,
+                             "excluded_paths": purge_preview.excluded_paths},
+        }, indent=2))
+        return
+
+    # IDEMPOTENCY — already destroyed? (a completed prior run). No-op, exit 0.
+    if ev.retention_destroyed_row(enc) is not None:
+        print(json.dumps({"already_destroyed": True, "encounter_id": enc}, indent=2))
+        return
+
+    # CONFIRMATION — type the opaque encounter id back (proves the operator has the right record in
+    # front of them, not a fat-fingered neighbour). --yes bypasses for scripted / non-interactive use.
+    if not args.yes:
+        try:
+            typed = input(f"IRREVERSIBLE destruction of encounter {enc}.\n"
+                          f"Type the encounter id to confirm: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            typed = ""
+        if typed != enc:
+            print(json.dumps({"error": "confirmation did not match the encounter id — ABORTED "
+                                        "(nothing destroyed). Re-run and type the exact id, or use --yes."}))
+            sys.exit(1)
+
+    # PHASE 1 — durable intent BEFORE any unlink (crash-safety). Skip the re-emit on a crash-recovery
+    # re-run where the intent already landed (unlink is idempotent; we complete phase 2).
+    if ev.retention_destroy_intent_row(enc) is None:
+        try:
+            ev.retention_destroy_intent(subject_id=enc, schedule_version=schedule_version,
+                                        manifest_sha256=manifest_sha)
+        except Exception as exc:  # noqa: BLE001 — a store-down intent does NOT proceed to any unlink
+            print(json.dumps({"error": f"durable retention.destroy_intent FAILED — nothing unlinked "
+                                        f"(fail-closed): {exc}"}))
+            sys.exit(1)
+
+    # UNLINK (idempotent). Count real failures (a missing file is fine — recovery / re-run).
+    failures = []
+    unlinked = []
+    import shutil as _shutil
+    for p in onbox:
+        try:
+            if p.exists():
+                p.unlink()
+                unlinked.append(str(p))
+        except OSError as exc:
+            failures.append(f"{p}: {exc}")
+    for d in label_dirs:
+        try:
+            _shutil.rmtree(d)
+            unlinked.append(str(d))
+        except OSError as exc:
+            failures.append(f"{d}: {exc}")
+    notes_deleted = 0
+    for note in note_paths:
+        try:
+            rel = str(note.relative_to(vault_path))
+        except ValueError:
+            rel = note.name
+        try:
+            from alfred.vault import ops as _vault_ops
+            _vault_ops.vault_delete(vault_path, rel, scope="stayc_clinical_destroy")
+            notes_deleted += 1
+            unlinked.append(str(note))
+        except Exception as exc:  # noqa: BLE001 — a scope/vault error blocks destroyed (fail-loud below)
+            failures.append(f"{note}: {exc}")
+
+    # BACKUP PURGE (§5.4 / Q3) — rewrite --exclude --forget + prune on the DEDICATED repo, assert-empty.
+    purge = backup_mod.purge_encounter(cfg, enc)
+
+    # GATE retention.destroyed on COMPLETENESS — an on-box unlink failure OR an incomplete backup purge
+    # is an INCOMPLETE destruction: fail-loud, do NOT emit destroyed. The intent-without-destroyed state
+    # persists (retention verify flags it); a re-run completes (unlink idempotent, purge re-runs).
+    if failures or not purge.complete:
+        print(json.dumps({
+            "error": "destruction INCOMPLETE — retention.destroyed NOT emitted (fail-loud). Re-run to "
+                     "complete (unlink is idempotent, the backup purge re-runs).",
+            "encounter_id": enc, "onbox_unlink_failures": failures,
+            "backup_purge_complete": purge.complete, "backup_purge_reason": purge.reason,
+        }, indent=2))
+        sys.exit(1)
+
+    # PHASE 2 — durable destroyed [D] (only after every unlink + the backup purge succeeded).
+    try:
+        ev.retention_destroyed(subject_id=enc, schedule_version=schedule_version,
+                               manifest_sha256=manifest_sha)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": f"artifacts destroyed + backup purged, but the durable "
+                                    f"retention.destroyed append FAILED: {exc}. Re-run to emit it "
+                                    f"(unlink idempotent); retention verify flags the incomplete state."}))
+        sys.exit(1)
+    _route_destroy_reason(audit_path, enc, args)
+    print(json.dumps({
+        "destroyed": True, "encounter_id": enc, "unlinked": unlinked,
+        "clinical_notes_deleted": notes_deleted, "backup_purged": purge.complete,
+    }, indent=2))
+
+
 def _verify_dangling_pin(ev, cfg, sched_mod, sha256_hex, clinical) -> dict | None:
     """A chain-pinned ``retention.schedule_published`` whose on-disk schedule is absent / sha-mismatched
     (drift) — or a pin with no configured ``schedule_path``. ``None`` when there is no pin or the pin
@@ -3344,6 +3545,9 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
         return
     if rcmd == "verify":
         _retention_verify(args)
+        return
+    if rcmd == "destroy":
+        _retention_destroy(args)
         return
 
     from alfred.evstore import sha256_hex
@@ -4545,6 +4749,24 @@ def build_parser() -> argparse.ArgumentParser:
     retention_sub.add_parser(
         "verify", help="Report incomplete destructions, blob/sidecar orphans, over-window encounters, "
                        "and schedule-pin drift; fail-closed on inconsistencies")
+    # #13d-3 — the two-phase s.49 secure destruction (IRREVERSIBLE — permanently deletes a record).
+    ret_destroy = retention_sub.add_parser(
+        "destroy", help="Two-phase secure destruction of one encounter's PHI (sealed audio + transcript "
+                        "+ note + backups). IRREVERSIBLE; audited via retention.destroy_intent/destroyed")
+    ret_destroy.add_argument("encounter", help="The opaque encounter id (subject_id)")
+    ret_destroy.add_argument("--reason", required=True,
+                             choices=["patient_request", "legal_order", "schedule_expiry"],
+                             help="Why the record is destroyed (routed to vault_audit.log, NOT the chain)")
+    ret_destroy.add_argument("--ticket", required=True,
+                             help="Ticket / incident reference authorizing the destruction")
+    ret_destroy.add_argument("--justification", default=None,
+                             help="Free-text detail → vault_audit.log ONLY (NEVER the chain)")
+    ret_destroy.add_argument("--dry-run", action="store_true", dest="dry_run",
+                             help="Enumerate what WOULD be destroyed (paths + backup snapshots); "
+                                  "emit nothing, unlink nothing, run no restic mutation")
+    ret_destroy.add_argument("--yes", action="store_true",
+                             help="Skip the interactive type-the-encounter-id confirmation "
+                                  "(scripted / non-interactive use)")
     ret_sched = retention_sub.add_parser(
         "schedule", help="Publish / show the s.50 retention schedule (versioned, sha-pinned [D])")
     ret_sched_sub = ret_sched.add_subparsers(dest="schedule_cmd")

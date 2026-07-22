@@ -96,8 +96,10 @@ def test_clinical_note_typedefinition_shape():
     assert d.name_field == "title"
     assert d.required_fields == ("title",)
     assert d.statuses == frozenset({"ai_draft", "attested", "amended"})
-    # P2-a (#41) tagged the privileged attest scope for gate-1 list-safety.
-    assert d.available_in_scopes == frozenset({"stayc_clinical", "stayc_clinical_attest"})
+    # P2-a (#41) tagged the privileged attest scope; 13d-3 tagged the privileged
+    # stayc_clinical_destroy scope — both for gate-1 list-safety.
+    assert d.available_in_scopes == frozenset(
+        {"stayc_clinical", "stayc_clinical_attest", "stayc_clinical_destroy"})
     assert d.is_leaf is True
     assert d.is_learn_type is False
 
@@ -210,6 +212,78 @@ def test_gate1_admits_clinical_note_under_attest_scope():
     # The attest scope has list:True; gate 1 (_validate_type) must admit
     # clinical_note under it (VERA-P1 lesson). Auto-derived, no literal edit.
     assert "clinical_note" in schema.TYPE_REGISTRY.known_types("stayc_clinical_attest")
+
+
+# ---------------------------------------------------------------------------
+# #13 13d-3 (OQ1=A) — the privileged stayc_clinical_destroy scope
+# ---------------------------------------------------------------------------
+
+_DESTROY_SCOPE = "stayc_clinical_destroy"
+
+
+def test_destroy_scope_deletes_clinical_note():
+    # THE capability: the s.49 destruction scope may delete a clinical_note.
+    check_scope(_DESTROY_SCOPE, "delete", rel_path="clinical_note/x.md", record_type="clinical_note")
+
+
+@pytest.mark.parametrize("rtype", ["person", "project", "task", "preference", "event", "session"])
+def test_destroy_scope_deletes_ONLY_clinical_note(rtype):
+    # The clinical_note_destroy_only gate refuses every OTHER type — the scope's sole capability is
+    # destroying a clinical_note (no other type, so no blast radius beyond the one record class).
+    with pytest.raises(ScopeError):
+        check_scope(_DESTROY_SCOPE, "delete", rel_path=f"{rtype}/x.md", record_type=rtype)
+
+
+@pytest.mark.parametrize("op", ["create", "edit", "move"])
+def test_destroy_scope_denies_all_ops_but_delete(op):
+    # no other op — create / edit / move are all denied on clinical_note (and everything else).
+    with pytest.raises(ScopeError):
+        check_scope(_DESTROY_SCOPE, op, rel_path="clinical_note/x.md", record_type="clinical_note")
+
+
+@pytest.mark.parametrize("scope", ["janitor", "curator", "distiller", "stayc_clinical",
+                                   "stayc_clinical_attest", "talker"])
+def test_destroy_scope_is_the_sole_clinical_note_deleter(scope):
+    # The universal clinical_note delete-deny stays intact for EVERY other scope — only
+    # stayc_clinical_destroy is carved out. This is the anti-spoliation belt (a future scope mistake
+    # can't accidentally delete a clinical record).
+    with pytest.raises(ScopeError):
+        check_scope(scope, "delete", rel_path="clinical_note/x.md", record_type="clinical_note")
+
+
+def test_destroy_scope_gate1_admits_clinical_note():
+    # gate 1 (_validate_type) auto-derives clinical_note under the destroy scope's list:True — do NOT
+    # edit a KNOWN_TYPES_BY_SCOPE literal (the auto-population must stay live, per CLAUDE.md).
+    assert "clinical_note" in schema.TYPE_REGISTRY.known_types(_DESTROY_SCOPE)
+
+
+def test_destroy_scope_is_agent_unreachable_ESCALATION_PIN():
+    """ESCALATION-SURFACE GUARD (13d-3): the privileged delete scope must be reachable ONLY from the
+    destroy CLI, NEVER any agent / backend / transport / talker / curator / janitor / distiller route.
+    Scope is selected via ALFRED_VAULT_SCOPE (set per-tool by the orchestrator) or passed in-process;
+    the destroy CLI passes it directly to vault_delete. Pin: the scope string appears in NO
+    agent-reachable module — a future wiring that injected it into an agent path would flip this RED."""
+    import pathlib
+    src = pathlib.Path(schema.__file__).resolve().parents[1]   # src/alfred
+    agent_reachable = [
+        "backends", "curator", "janitor", "distiller", "talker.py", "talker",
+        "transport", "web", "surveyor", "mail", "brief",
+    ]
+    offenders = []
+    for path in src.rglob("*.py"):
+        rel = path.relative_to(src).as_posix()
+        if not any(rel == m or rel.startswith(m + "/") or rel == m for m in agent_reachable):
+            continue
+        try:
+            if _DESTROY_SCOPE in path.read_text(encoding="utf-8"):
+                offenders.append(rel)
+        except OSError:
+            continue
+    assert offenders == [], (
+        f"{_DESTROY_SCOPE} is referenced by agent-reachable module(s) {offenders} — the privileged "
+        f"s.49 delete scope must be CLI-only. If an agent path can select it, it can delete clinical "
+        f"records (the exact escalation this pin guards)."
+    )
 
 
 # ---------------------------------------------------------------------------

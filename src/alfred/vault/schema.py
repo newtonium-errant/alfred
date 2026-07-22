@@ -618,13 +618,15 @@ _DEFINITIONS: list[TypeDefinition] = [
         name_field="title",
         # ``stayc_clinical`` — the pipeline/agent scope (create ai_draft).
         # ``stayc_clinical_attest`` (scribe P2-a, #41) — the PRIVILEGED attest
-        # scope used ONLY by the scribe.attest orchestrator. Tagged here so
-        # gate 1 (_validate_type) admits clinical_note under the attest scope's
-        # ``list: True`` (the VERA-P1 lesson: gate 1 fires on list). The edit
-        # path (vault_edit) does NOT fire gate 1, but tagging keeps list-safe +
-        # matches the vera_forwarder / vera_ticket_outcome precedent.
+        # scope used ONLY by the scribe.attest orchestrator. ``stayc_clinical_destroy``
+        # (task #13, 13d-3, OQ1=A) — the PRIVILEGED, CLI-only s.49 secure-destruction
+        # scope (the SOLE scope that may delete a clinical_note). All three are tagged
+        # here so gate 1 (_validate_type) admits clinical_note under their ``list: True``
+        # (the VERA-P1 lesson: gate 1 fires on list). The edit/delete paths do NOT fire
+        # gate 1, but tagging keeps list-safe + matches the vera_forwarder precedent.
         # KNOWN_TYPES_BY_SCOPE auto-derives — do NOT edit a literal.
-        available_in_scopes=frozenset({"stayc_clinical", "stayc_clinical_attest"}),
+        available_in_scopes=frozenset(
+            {"stayc_clinical", "stayc_clinical_attest", "stayc_clinical_destroy"}),
         is_leaf=True,
     ),
 
