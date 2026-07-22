@@ -262,6 +262,36 @@ def test_clinical_note_delete_denied_with_EMPTY_record_type_BLOCK1(scope):
         check_scope(scope, "delete", rel_path="clinical_note/note-x.md", record_type="")
 
 
+@pytest.mark.parametrize("vector", [
+    "./clinical_note/X.md",              # ./ collapses INTO clinical_note (a live PHI-delete bypass)
+    "dummy/../clinical_note/X.md",       # .. collapses INTO clinical_note (a live PHI-delete bypass)
+    "/abs/clinical_note/X.md",           # absolute — refused as not a clean in-vault relative path
+    "../clinical_note/X.md",             # vault-escaping — refused
+])
+def test_clinical_note_delete_path_normalization_bypasses_denied_BLOCK2(vector):
+    """BLOCK-2: the deny keyed on the RAW rel_path, but _resolve_vault_path collapses ./ and .. AFTER
+    the check — so a disguised path slipped the deny and deleted the PHI. Normalizing before the match
+    (+ refusing absolute/escaping paths) closes all four vectors for every non-destroy scope."""
+    with pytest.raises(ScopeError):
+        check_scope("janitor", "delete", rel_path=vector, record_type="")
+
+
+@pytest.mark.parametrize("vector", ["clinical_note/X.md", "./clinical_note/X.md",
+                                    "dummy/../clinical_note/X.md"])
+def test_destroy_scope_still_allows_normalized_clinical_note_BLOCK2(vector):
+    # The SYMMETRIC allow side must ALSO normalize — the destroy scope still succeeds on a ./-prefixed
+    # or ..-collapsing clinical_note path (normalization must not break the legit destroy).
+    check_scope(_DESTROY_SCOPE, "delete", rel_path=vector, record_type="")
+
+
+@pytest.mark.parametrize("vector", ["/abs/clinical_note/X.md", "../clinical_note/X.md"])
+def test_destroy_scope_refuses_absolute_or_escaping_target_BLOCK2(vector):
+    # The allow side refuses an absolute / vault-escaping destroy target (the defect isn't left on the
+    # allow side) — a destroy must target a clean in-vault relative path.
+    with pytest.raises(ScopeError):
+        check_scope(_DESTROY_SCOPE, "delete", rel_path=vector, record_type="")
+
+
 def test_clinical_note_delete_denied_via_real_vault_delete_BLOCK1(tmp_path):
     """BLOCK-1 end-to-end: a real vault_delete (which passes record_type="") of a clinical_note under
     the janitor scope is REFUSED — the exact escalation path the reviewer probed, now closed."""
@@ -273,6 +303,12 @@ def test_clinical_note_delete_denied_via_real_vault_delete_BLOCK1(tmp_path):
     with pytest.raises(ScopeError):
         vault_delete(vault, "clinical_note/note-x.md", scope="janitor")
     assert note.exists()                                       # NOT deleted — the belt held
+    # BLOCK-2 end-to-end: the reviewer's exact disguised-path probes are now refused too (they resolve
+    # INTO clinical_note/ but the normalized deny catches them BEFORE _resolve_vault_path deletes).
+    for disguised in ("./clinical_note/note-x.md", "dummy/../clinical_note/note-x.md"):
+        with pytest.raises(ScopeError):
+            vault_delete(vault, disguised, scope="janitor")
+        assert note.exists()                                   # still there — PHI-delete bypass closed
     # The privileged destroy scope CAN (the sole authorised path).
     vault_delete(vault, "clinical_note/note-x.md", scope=_DESTROY_SCOPE)
     assert not note.exists()
