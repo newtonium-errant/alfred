@@ -3487,6 +3487,15 @@ def _retention_destroy(args: argparse.Namespace) -> None:
             unlinked.append(str(p))
     for d in label_dirs:
         try:
+            # SECURE overwrite (§7) of the residual PLAINTEXT in a PHI-named label dir (an abandoned-
+            # before-seal / transient encounter) BEFORE removing it: the raw audio chunks (chunk_*.<ext>)
+            # are the DENSEST plaintext PHI, and a ledger (<enc>.transcript.json) may sit here too. Every
+            # file is secure_unlink'd uniformly (the audio + transcript are PHI; the chunk_*.meta.json
+            # sidecars are low-PHI seq/size and _CLOSED is non-PHI, but overwriting them is cheap +
+            # keeps the whole PHI-named dir consistent) — THEN rmtree the now-emptied dir.
+            for fp in list(Path(d).rglob("*")):
+                if fp.is_file() and not _vault_ops.secure_unlink(fp):
+                    failures.append(f"{fp}: secure unlink failed")
             _shutil.rmtree(d)
             unlinked.append(str(d))
         except OSError as exc:

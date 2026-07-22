@@ -403,3 +403,49 @@ def test_destroy_note_permanent_even_when_obsidian_available(tmp_path, capsys, m
     assert out["destroyed"] is True and exited is None
     assert trash == []                                      # Obsidian trash NEVER invoked
     assert not note.exists()                                # permanently gone from disk
+
+
+def test_destroy_secure_overwrites_residual_audio_chunks(tmp_path, capsys, monkeypatch):
+    """§7 (residual class): an abandoned-before-seal encounter's raw plaintext AUDIO chunks in the
+    input_dir label dir are OVERWRITTEN (zeroed) before the dir is rmtree'd — the densest plaintext PHI
+    must not be plain-removed while the transcript+note are overwritten."""
+    from alfred.scribe.identity import compute_encounter_id
+    inbox = tmp_path / "data" / "inbox"
+    body = {
+        "vault": {"path": str(tmp_path / "vault")},
+        "logging": {"dir": str(tmp_path / "data")},
+        "scribe": {"clinicians": ["np_jamie"], "encounter_salt": "s", "mode": "clinical",
+                   "input_dir": str(inbox), "events": {"dir": str(tmp_path / "ev")},
+                   "retention": {"retained_dir": str(tmp_path / "retained")}},
+    }
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump(body), encoding="utf-8")
+    raw = {"scribe": {"mode": "clinical", "encounter_salt": "s", "events": {"dir": str(tmp_path / "ev")}}}
+    ev = ScribeEvents.from_config(raw, log_dir=str(tmp_path / "data"))
+    # abandoned-before-seal: a PHI-named label dir with raw audio + a ledger, NEVER sealed.
+    label = "john-smith-2026-07-22"
+    enc = compute_encounter_id(label, salt="s")
+    label_dir = inbox / label
+    label_dir.mkdir(parents=True)
+    (label_dir / "chunk_1.webm").write_bytes(b"RAW AUDIO PHI BYTES 111")
+    (label_dir / "chunk_1.meta.json").write_text("{}", encoding="utf-8")
+    (label_dir / f"{enc}.transcript.json").write_bytes(b'{"transcript":"dialogue PHI"}')
+    _mock_purge(monkeypatch, complete=True)
+    from alfred.vault import ops as _ops
+    at = {}
+    orig = _ops.Path.unlink
+
+    def spy(self, *a, **k):
+        if self.name.startswith("chunk_1.") or self.name.endswith(".transcript.json"):
+            try:
+                at[self.name] = self.read_bytes()
+            except OSError:
+                at[self.name] = None
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(_ops.Path, "unlink", spy)
+    out, exited = _run(cfg_path, enc, capsys)
+    assert out["destroyed"] is True and exited is None
+    assert set(at["chunk_1.webm"]) == {0}                  # raw AUDIO overwritten before unlink
+    assert set(at[f"{enc}.transcript.json"]) == {0}        # the in-label ledger too
+    assert not label_dir.exists()                          # dir removed

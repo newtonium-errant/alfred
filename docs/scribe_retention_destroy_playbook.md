@@ -312,9 +312,11 @@ required verbatim-in-spirit; do not soften it:
   therefore strong even against low-level residual-block recovery: it is **crypto-shredded by
   construction**.
 
-- **The transcript and note are the honest-limitation case.** These are kept as LUKS-encrypted
+- **The transcript, the note, and any residual raw audio are the honest-limitation case.** These
+  LUKS-plaintext artifacts — the transcript ledger, the vault clinical_note, and (for an
+  abandoned-before-seal encounter) the residual raw audio chunks in the inbox — are kept as
   plaintext so the clinician can use them. When they are destroyed the tooling makes a
-  **best-effort overwrite of the file's bytes with zeros (then fsync) before unlinking it**, and
+  **best-effort overwrite of each file's bytes with zeros (then fsync) before unlinking it**, and
   the note is **always permanently removed — never sent to a trash/recycle folder** (the destroy
   bypasses any Obsidian trash routing, so the destruction never depends on whether Obsidian
   happens to be running). The overwrite is **a mitigation, NOT a guarantee**: on SSD storage,
