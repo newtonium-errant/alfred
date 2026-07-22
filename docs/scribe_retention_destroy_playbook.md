@@ -313,13 +313,18 @@ required verbatim-in-spirit; do not soften it:
   construction**.
 
 - **The transcript and note are the honest-limitation case.** These are kept as LUKS-encrypted
-  plaintext so the clinician can use them. When they are destroyed they are **permanently
-  unlinked** — there is **no** per-file secure-erase or overwrite step. After the unlink,
-  residual blocks on the drive are protected **only** by the **whole-disk encryption** (LUKS),
-  which defends the *powered-off, stolen-disk* threat but is **not** a per-file cryptographic
-  erase. A stronger per-file guarantee would require re-encrypting the whole volume, which is out
-  of scope for on-demand single-encounter destruction. Do not describe this as a secure wipe; it
-  is a permanent deletion whose residual-block protection is the whole-disk encryption.
+  plaintext so the clinician can use them. When they are destroyed the tooling makes a
+  **best-effort overwrite of the file's bytes with zeros (then fsync) before unlinking it**, and
+  the note is **always permanently removed — never sent to a trash/recycle folder** (the destroy
+  bypasses any Obsidian trash routing, so the destruction never depends on whether Obsidian
+  happens to be running). The overwrite is **a mitigation, NOT a guarantee**: on SSD storage,
+  wear-levelling, journaling, and copy-on-write mean the zero-write may not land on the original
+  physical blocks, so residual plaintext blocks can persist. After the unlink, whatever residual
+  blocks remain are protected **only** by the **whole-disk encryption** (LUKS), which defends the
+  *powered-off, stolen-disk* threat but is **not** a per-file cryptographic erase. A stronger
+  per-file guarantee would require re-encrypting the whole volume, which is out of scope for
+  on-demand single-encounter destruction. So: best-effort overwrite + forced permanent unlink,
+  with the residual-block limit stated plainly — never described as a guaranteed secure wipe.
 
 - **Every electronic medical record has this same limitation.** The correct posture is to
   **state it plainly and never overclaim** perfect erasure. This is why seal-before-backup

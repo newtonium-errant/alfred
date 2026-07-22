@@ -7,6 +7,7 @@ Falls back to filesystem operations when Obsidian is unavailable.
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import date
 from pathlib import Path
@@ -28,6 +29,32 @@ from .schema import (
     TYPE_DIRECTORY,
 )
 from .scope import check_scope
+
+
+def secure_unlink(path: str | Path) -> bool:
+    """Best-effort OVERWRITE-BEFORE-UNLINK of a plaintext file (zero-fill → fsync → unlink) — the shared
+    secure-delete discipline for plaintext PHI (the s.49 destroy path + the unseal temp-wipe). A
+    MITIGATION, NOT a guarantee: on SSDs (wear-levelling, journaling, copy-on-write) the overwrite may
+    not land on the original physical blocks. Returns ``True`` on unlink success OR already-gone,
+    ``False`` on a REAL unlink failure (EACCES/EPERM/EROFS/EBUSY) so the caller can count it. The
+    overwrite is best-effort (an unreadable/short file is still unlinked); the sole home for the
+    discipline so callers reuse it rather than re-deriving the open-r+b/zero/fsync loop."""
+    p = Path(path)
+    try:
+        size = p.stat().st_size
+        with open(p, "r+b") as f:
+            f.write(b"\x00" * size)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass  # best-effort overwrite — proceed to unlink regardless
+    try:
+        p.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
 
 log = structlog.get_logger(__name__)
 
@@ -1876,11 +1903,20 @@ def vault_delete(
     rel_path: str,
     *,
     scope: str | None = None,
+    secure: bool = False,
 ) -> dict:
     """Delete a vault record. Returns {path, deleted}.
 
     When Obsidian is running, uses the Obsidian CLI which respects the
     configured deletion behavior (system trash, Obsidian trash, or permanent).
+
+    ``secure=True`` (the s.49 destruction path): bypass the Obsidian trash
+    routing ENTIRELY and best-effort overwrite-before-unlink the plaintext bytes
+    (:func:`secure_unlink`). A secure destruction must ALWAYS permanently remove
+    the record — never trash it — regardless of Obsidian availability / config
+    (don't rest on "Obsidian isn't running"); and it overwrites the plaintext
+    first (a mitigation, not an SSD guarantee). Only the retention destroy path
+    passes it, after scope-checking under ``stayc_clinical_destroy``.
 
     Optional ``scope`` runs ``check_scope`` before the delete.
     """
@@ -1923,6 +1959,13 @@ def vault_delete(
             if gcal_sync is not None:
                 result["gcal_sync"] = gcal_sync
         return result
+
+    # SECURE destruction (s.49) — bypass the Obsidian trash routing ENTIRELY (ALWAYS permanent, never
+    # trashed, regardless of Obsidian availability) + best-effort overwrite-before-unlink the plaintext.
+    # Placed BEFORE the Obsidian branch so a running Obsidian can never route a secure destroy to trash.
+    if secure:
+        secure_unlink(file_path)
+        return _build_delete_result()
 
     # Try Obsidian CLI — respects user's trash settings
     if obsidian.is_available():

@@ -248,3 +248,87 @@ def test_completion_log_not_in_list_fields_registry() -> None:
     # Sanity: ``items`` is still in LIST_FIELDS (the relaxation was
     # surgical — only completion_log was affected).
     assert "items" in LIST_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Secure delete (s.49 destruction hardening) — overwrite-before-unlink +
+# force-permanent (bypass Obsidian trash). See scribe.retention destroy path.
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+from alfred.vault import ops as _ops  # noqa: E402
+from alfred.vault.ops import secure_unlink, vault_delete  # noqa: E402
+
+
+def test_secure_unlink_overwrites_bytes_BEFORE_unlink(tmp_path, monkeypatch):
+    p = tmp_path / "phi.txt"
+    secret = b"PATIENT SECRET SOAP NOTE - PHI"
+    p.write_bytes(secret)
+    seen = {}
+    orig = _ops.Path.unlink
+
+    def spy_unlink(self, *a, **k):
+        # capture what's ON DISK at the moment unlink is called → proves overwrite happened FIRST
+        if self == p:
+            seen["at_unlink"] = self.read_bytes()
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(_ops.Path, "unlink", spy_unlink)
+    assert secure_unlink(p) is True
+    assert seen["at_unlink"] == b"\x00" * len(secret)      # OVERWRITTEN before the unlink (not the PHI)
+    assert not p.exists()
+
+
+def test_secure_unlink_missing_file_returns_true(tmp_path):
+    assert secure_unlink(tmp_path / "gone.txt") is True     # idempotent (already-gone is success)
+
+
+def test_secure_unlink_real_unlink_failure_returns_false(tmp_path, monkeypatch):
+    p = tmp_path / "phi.txt"
+    p.write_bytes(b"data")
+
+    def boom(self, *a, **k):
+        raise OSError("EPERM")
+
+    monkeypatch.setattr(_ops.Path, "unlink", boom)
+    assert secure_unlink(p) is False                        # a REAL failure is counted, not swallowed
+
+
+def test_vault_delete_secure_bypasses_obsidian_and_overwrites(tmp_path, monkeypatch):
+    """secure=True: ALWAYS permanent (never Obsidian-trashed) even when Obsidian IS available, and the
+    plaintext is overwritten before the unlink."""
+    vault = tmp_path / "vault"
+    (vault / "clinical_note").mkdir(parents=True)
+    note = vault / "clinical_note" / "R.md"
+    secret = b"---\ntype: clinical_note\n---\nPHI SOAP body\n"
+    note.write_bytes(secret)
+    # Obsidian IS available — a non-secure delete would route to its trash. A spy proves secure skips it.
+    trash_calls = []
+    monkeypatch.setattr(_ops.obsidian, "is_available", lambda: True)
+    monkeypatch.setattr(_ops.obsidian, "delete_file", lambda name: trash_calls.append(name) or True)
+    seen = {}
+    orig = _ops.Path.unlink
+
+    def spy_unlink(self, *a, **k):
+        if self == note:
+            seen["at_unlink"] = self.read_bytes()
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(_ops.Path, "unlink", spy_unlink)
+    vault_delete(vault, "clinical_note/R.md", scope="stayc_clinical_destroy", secure=True)
+    assert trash_calls == []                                # Obsidian trash NEVER invoked (forced permanent)
+    assert not note.exists()                                # gone from disk, not trashed
+    assert seen["at_unlink"] == b"\x00" * len(secret)       # overwritten before the unlink
+
+
+def test_vault_delete_non_secure_still_uses_obsidian_when_available(tmp_path, monkeypatch):
+    """Regression: the DEFAULT (secure=False) delete still respects the Obsidian trash routing when
+    Obsidian is available — the secure path is opt-in, not a global behavior change."""
+    vault = tmp_path / "vault"
+    (vault / "task").mkdir(parents=True)
+    (vault / "task" / "T.md").write_text("---\ntype: task\n---\nb\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(_ops.obsidian, "is_available", lambda: True)
+    monkeypatch.setattr(_ops.obsidian, "delete_file", lambda name: calls.append(name) or True)
+    vault_delete(vault, "task/T.md")                        # no secure, no scope
+    assert calls == ["task/T"]                              # routed to Obsidian (trash-respecting) as before

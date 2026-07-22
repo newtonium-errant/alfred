@@ -341,3 +341,65 @@ def test_withdrawal_alone_never_destroys(tmp_path, capsys, monkeypatch):
     assert ev.retention_destroyed_row(_ENC) is None
     withdrawn = ev.query(CLINICAL, family="consent", kind="consent.withdrawn", subject_id=_ENC)
     assert len(withdrawn) == 1                                        # addressable, not destroyed
+
+
+# ============================ secure-delete hardening (§7) ============================
+
+
+def _content_at_unlink(at_unlink, basename):
+    for k, v in at_unlink.items():
+        if k.endswith(basename):
+            return v
+    return "MISSING"
+
+
+def test_destroy_overwrites_plaintext_but_not_crypto_shredded(tmp_path, capsys, monkeypatch):
+    """§7: the LUKS-plaintext transcript + note are OVERWRITTEN (zeroed) before unlink; the
+    crypto-shredded sealed blob + PHI-free sidecar are plain-unlinked (NOT overwritten — residual is
+    undecryptable ciphertext / a digest). Spies Path.unlink to capture on-disk content at unlink-time."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    retained = _seal(tmp_path, ev)
+    note = _make_note(tmp_path, _ENC)
+    _mock_purge(monkeypatch, complete=True)
+    transcript = retained / "transcripts" / f"{_ENC}.transcript.json"
+    assert transcript.exists()
+    from alfred.vault import ops as _ops
+    at_unlink = {}
+    orig = _ops.Path.unlink
+
+    def spy(self, *a, **k):
+        try:
+            at_unlink[str(self)] = self.read_bytes()
+        except OSError:
+            at_unlink[str(self)] = None
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(_ops.Path, "unlink", spy)
+    out, exited = _run(cfg_path, _ENC, capsys)
+    assert out["destroyed"] is True and exited is None
+    # PLAINTEXT transcript + note → all-zero bytes at unlink (overwritten first).
+    assert set(_content_at_unlink(at_unlink, f"{_ENC}.transcript.json")) == {0}
+    assert set(_content_at_unlink(at_unlink, note.name)) == {0}
+    # CRYPTO-SHREDDED sealed blob + sidecar → their REAL bytes at unlink (NOT overwritten).
+    blob_bytes = _content_at_unlink(at_unlink, f"{_ENC}.age")
+    sidecar_bytes = _content_at_unlink(at_unlink, f"{_ENC}.manifest.json")
+    assert blob_bytes not in ("MISSING", None) and set(blob_bytes) != {0}
+    assert sidecar_bytes not in ("MISSING", None) and set(sidecar_bytes) != {0}
+    assert not transcript.exists() and not note.exists()
+
+
+def test_destroy_note_permanent_even_when_obsidian_available(tmp_path, capsys, monkeypatch):
+    """§7 invariant: the note is ALWAYS permanently destroyed, NEVER Obsidian-trashed — even when
+    Obsidian IS available. A secure destruction must not rest on 'Obsidian isn't running'."""
+    cfg_path, ev = _cfg_and_ev(tmp_path)
+    _seal(tmp_path, ev)
+    note = _make_note(tmp_path, _ENC)
+    _mock_purge(monkeypatch, complete=True)
+    from alfred.vault import ops as _ops
+    trash = []
+    monkeypatch.setattr(_ops.obsidian, "is_available", lambda: True)
+    monkeypatch.setattr(_ops.obsidian, "delete_file", lambda name: trash.append(name) or True)
+    out, exited = _run(cfg_path, _ENC, capsys)
+    assert out["destroyed"] is True and exited is None
+    assert trash == []                                      # Obsidian trash NEVER invoked
+    assert not note.exists()                                # permanently gone from disk

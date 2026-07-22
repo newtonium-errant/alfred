@@ -49,6 +49,7 @@ from alfred.evstore import sha256_hex
 from alfred.scribe import ledger
 from alfred.scribe.close_manifest import CLOSE_SENTINEL_NAME
 from alfred.scribe.config import RETENTION_MODE_RETAINED, RETENTION_MODE_TRANSIENT
+from alfred.vault.ops import secure_unlink  # shared overwrite-before-unlink discipline (scribe → vault)
 
 log = structlog.get_logger("scribe.retention")
 
@@ -1331,15 +1332,7 @@ def wipe_plaintext_dir(out_dir: str | Path, written_paths=None, *, created: bool
         except OSError:
             targets = []
     for p in targets:
-        try:
-            size = p.stat().st_size
-            with open(p, "r+b") as f:
-                f.write(b"\x00" * size)
-                f.flush()
-                os.fsync(f.fileno())
-        except OSError:
-            pass  # best-effort overwrite — proceed to unlink regardless
-        _unlink_quiet(p)
+        secure_unlink(p)  # shared overwrite-before-unlink discipline (vault.ops.secure_unlink)
     if created:
         try:
             out_dir.rmdir()

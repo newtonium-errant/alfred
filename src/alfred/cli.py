@@ -3304,20 +3304,24 @@ def _verify_over_window(ev, retained_dir, cfg, ret_mod, sched_mod) -> dict:
 
 
 def _destroy_onbox_targets(cfg, enc, ret_mod, backup_mod):
-    """The enc-id-named ON-BOX artifact paths a destroy unlinks (idempotent — each may be absent):
-    the sealed audio blob, the PHI-free manifest sidecar, the relocated transcript ledger, and the
-    seal-before-backup staging copies (transcript + note, 13d-4b). The residual plaintext label dir
-    (abandoned-before-seal / transient) + the vault clinical_note are handled separately (they are not
-    enc-id-named on disk)."""
+    """The enc-id-named ON-BOX artifact paths a destroy removes, split by secure-delete class:
+    ``(crypto_shredded, plaintext)``. CRYPTO-SHREDDED (plain unlink — no overwrite needed, residual is
+    undecryptable age-ciphertext / a PHI-free digest sidecar): the sealed audio blob, the manifest
+    sidecar, and the seal-before-backup staging copies (transcript + note .age, 13d-4b). PLAINTEXT
+    (overwrite-before-unlink, §7): the relocated LUKS-plaintext transcript ledger. The residual plaintext
+    label dir + the vault clinical_note are handled separately (not enc-id-named on disk)."""
     retained = ret_mod.resolved_retained_dir(cfg)
     sealed_backup = backup_mod.resolved_sealed_backup_dir(cfg)
-    return [
-        retained / f"{enc}{ret_mod.SEAL_BLOB_SUFFIX}",                       # sealed audio
-        retained / f"{enc}{ret_mod.SEAL_MANIFEST_SIDECAR_SUFFIX}",           # PHI-free sidecar
-        retained / "transcripts" / f"{enc}.transcript.json",                # relocated ledger
-        sealed_backup / f"{enc}{backup_mod.SEAL_TRANSCRIPT_SUFFIX}",         # sealed backup transcript
-        sealed_backup / f"{enc}{backup_mod.SEAL_NOTE_SUFFIX}",               # sealed backup note
+    crypto_shredded = [
+        retained / f"{enc}{ret_mod.SEAL_BLOB_SUFFIX}",                       # sealed audio (crypto-shredded)
+        retained / f"{enc}{ret_mod.SEAL_MANIFEST_SIDECAR_SUFFIX}",           # PHI-free digest sidecar
+        sealed_backup / f"{enc}{backup_mod.SEAL_TRANSCRIPT_SUFFIX}",         # sealed backup transcript (.age)
+        sealed_backup / f"{enc}{backup_mod.SEAL_NOTE_SUFFIX}",               # sealed backup note (.age)
     ]
+    plaintext = [
+        retained / "transcripts" / f"{enc}.transcript.json",                # LUKS-plaintext ledger
+    ]
+    return crypto_shredded, plaintext
 
 
 def _destroy_residual_label_dirs(cfg, enc, ret_mod):
@@ -3395,13 +3399,13 @@ def _retention_destroy(args: argparse.Namespace) -> None:
     sched = sched_mod.load_schedule(cfg.retention.schedule_path) if cfg.retention.schedule_path else None
     schedule_version = sched["schedule_version"] if sched else ""
 
-    onbox = _destroy_onbox_targets(cfg, enc, ret_mod, backup_mod)
+    crypto_targets, plaintext_targets = _destroy_onbox_targets(cfg, enc, ret_mod, backup_mod)
     label_dirs = _destroy_residual_label_dirs(cfg, enc, ret_mod)
     note_paths, malformed_notes = ret_mod.resolve_note_paths(vault_path, enc)
 
     # --dry-run — enumerate what WOULD be destroyed; emit NOTHING, unlink NOTHING, run NO restic mutation.
     if args.dry_run:
-        would = [str(p) for p in onbox if p.exists()]
+        would = [str(p) for p in (*crypto_targets, *plaintext_targets) if p.exists()]
         would += [str(d) for d in label_dirs]
         would += [str(p) for p in note_paths]
         purge_preview = backup_mod.purge_encounter(cfg, enc, dry_run=True)
@@ -3464,13 +3468,23 @@ def _retention_destroy(args: argparse.Namespace) -> None:
     failures = []
     unlinked = []
     import shutil as _shutil
-    for p in onbox:
+    from alfred.vault import ops as _vault_ops
+    # CRYPTO-SHREDDED artifacts (sealed .age + PHI-free sidecar) — plain unlink (residual is
+    # undecryptable ciphertext / a digest; overwrite adds nothing).
+    for p in crypto_targets:
         try:
             if p.exists():
                 p.unlink()
                 unlinked.append(str(p))
         except OSError as exc:
             failures.append(f"{p}: {exc}")
+    # LUKS-PLAINTEXT artifacts (the transcript ledger) — SECURE overwrite-before-unlink (§7,
+    # best-effort, not an SSD guarantee). secure_unlink returns False on a REAL unlink failure → counted.
+    for p in plaintext_targets:
+        if p.exists() and not _vault_ops.secure_unlink(p):
+            failures.append(f"{p}: secure unlink failed")
+        else:
+            unlinked.append(str(p))
     for d in label_dirs:
         try:
             _shutil.rmtree(d)
@@ -3484,8 +3498,9 @@ def _retention_destroy(args: argparse.Namespace) -> None:
         except ValueError:
             rel = note.name
         try:
-            from alfred.vault import ops as _vault_ops
-            _vault_ops.vault_delete(vault_path, rel, scope="stayc_clinical_destroy")
+            # SECURE destruction: overwrite-before-unlink + ALWAYS permanent (never Obsidian-trashed),
+            # regardless of Obsidian availability (§7 / don't-rest-on-a-config-accident).
+            _vault_ops.vault_delete(vault_path, rel, scope="stayc_clinical_destroy", secure=True)
             notes_deleted += 1
             unlinked.append(str(note))
         except Exception as exc:  # noqa: BLE001 — a scope/vault error blocks destroyed (fail-loud below)
