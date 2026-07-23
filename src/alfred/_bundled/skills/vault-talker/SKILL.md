@@ -901,6 +901,8 @@ The result is JSON with a `kind` discriminator you MUST route on. The string val
 - **`"not_marked"`** — that item wasn't checked off in the first place; tell the operator gently (*"that wasn't checked off, nothing to undo"*) — this is NOT an error.
 - **`"ambiguous_item"`** / **`"unknown_item"`** — same shape as `tier_done` (ask back with `candidates` / honest not-found).
 
+**Either tool** can also return **`"internal_error"`** on an unexpected internal failure (the payload carries an `error` string). Route it as a generic *"I couldn't complete that — something went wrong on my end"* and do NOT claim the item was checked / unchecked. Rare: the dispatch wraps its in-process `mark_t3_done` / `mark_t3_undone` call and surfaces this kind on an unexpected exception.
+
 Besides `kind`, the payload carries `item` (the MATCHED canonical T3 text on success/noop; the operator's raw query on unknown/ambiguous), `date` (the daily file acted on), `candidates` (as above), and — on `tier_done` only — `done_at` (the stamped ISO date on `success`/`idempotent_noop`, else `null`). A `tier_done` `success` feeds the balanced-day goal: `_entry_done` counts a free-text T3 done when `done_at == today`, `/today` drops it, and the morning brief ✓-strikes it.
 
 `tier_done` is the ONLY authorised path to a free-text T3 done-state — do NOT try to write a `done` / `done_at` field via `vault_edit set_fields` (a sibling top-level `done` write is scope-denied; `done_at` is reachable only through this tool because it lives NESTED inside a `t3` entry).
