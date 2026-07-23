@@ -495,7 +495,20 @@ def _render_t3_entry(entry: T3Entry) -> str:
     """Render one T3 line — bare free-text item (no confirm affordance).
 
     Note T3 entries carry ``item:`` (free-text) not ``task:`` (wikilink).
+
+    Arc #20: a checked-off ad-hoc item (``done_at`` set) renders ✓-struck
+    (``- ~~item~~ ✓``). The morning brief is a day snapshot, so a done T3
+    stays VISIBLE as progress toward the balanced-day goal — contrast
+    ``/today`` (:func:`render_curated_tier_section_for_today`), which
+    DROPS done T3 to keep the committed "what's on my plate" view clean.
+    A daily file only ever carries a same-day ``done_at`` (T3 never rolls
+    over, and ``tier_done`` back-dates into the completion date's OWN
+    file), so "``done_at`` present" == "done for the rendered day". An
+    unmarked item (``done_at`` None — the common case) is byte-identical
+    to the pre-Arc-#20 ``- {item}`` render.
     """
+    if getattr(entry, "done_at", None):
+        return f"- ~~{entry.item}~~ ✓"
     return f"- {entry.item}"
 
 
@@ -1321,6 +1334,7 @@ def _curated_entry_is_closed(
 def render_curated_tier_section_for_today(
     daily_curation: DailyCuration | None,
     vault_path: Path | None = None,
+    today: date | None = None,
 ) -> str:
     """Render the ``/today`` curated-only tier section body.
 
@@ -1343,6 +1357,17 @@ def render_curated_tier_section_for_today(
     render, or any caller that doesn't thread the path) NO filtering
     happens and the render is byte-identical to the pre-2026-06-15
     behaviour, so existing callers are unaffected.
+
+    **Done-T3 drop** (Arc #20, 2026-07-22). When ``today`` is provided,
+    free-text T3 items the operator has checked off today (``done_at ==
+    today``, via the ``tier_done`` tool) are DROPPED — the mirror of the
+    completed-task filter above, keeping the operator-committed view
+    ("what's still on my plate") clean. Contrast the morning brief, which
+    ✓-STRIKES done T3 (a day snapshot showing progress —
+    :func:`_render_t3_entry`). When ``today`` is ``None`` (the default —
+    callers that don't thread it) NO T3 done-filtering happens and the
+    render is byte-identical, so existing callers are unaffected. The
+    ``/today`` composer always threads ``today``.
 
     Contrast with :func:`render_tier_section` (the full materials view
     the morning brief uses): that function consumes the same
@@ -1396,6 +1421,26 @@ def render_curated_tier_section_for_today(
         ]
         filtered_closed = before - (len(curated_t1) + len(curated_t2))
 
+    # Arc #20 (2026-07-22): DROP free-text T3 items the operator has
+    # checked off TODAY (``done_at == today``) — mirrors the task-origin
+    # closed-filter above, keeping the operator-committed ``/today`` view
+    # clean ("what's still on my plate"). Contrast the morning brief,
+    # which ✓-STRIKES done T3 (a day snapshot; :func:`_render_t3_entry`).
+    # Only fires when ``today`` is threaded (the /today composer always
+    # threads it); ``today=None`` keeps the render byte-identical for
+    # callers that don't (existing tests / the brief's full-materials
+    # render). A same-day ``done_at`` is the only value a daily file
+    # carries (T3 never rolls over; back-dates land in their own file).
+    t3_done_filtered = 0
+    if today is not None:
+        _today_iso = today.isoformat()
+        before_t3 = len(curated_t3)
+        curated_t3 = [
+            e for e in curated_t3
+            if getattr(e, "done_at", None) != _today_iso
+        ]
+        t3_done_filtered = before_t3 - len(curated_t3)
+
     def _bucket(header_label: str, entries: list, render_entry) -> list[str]:
         """Compose one bucket's lines.
 
@@ -1438,6 +1483,12 @@ def render_curated_tier_section_for_today(
         # (filtering off — e.g. the brief's full-materials render).
         status_filter_applied=vault_path is not None,
         status_filtered=filtered_closed,
+        # Arc #20 ILB: surface the done-T3 drop so an operator can grep
+        # "why did my T3 item disappear from /today" — distinguishes "I
+        # checked it off" (t3_done_filtered>0) from a render bug.
+        # t3_done_filter_applied is False when no ``today`` was threaded.
+        t3_done_filter_applied=today is not None,
+        t3_done_filtered=t3_done_filtered,
     )
     return body
 

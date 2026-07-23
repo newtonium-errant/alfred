@@ -734,6 +734,40 @@ def test_talker_tier_curation_constants_pinned():
     assert TALKER_TIER_CURATION_FIELDS == {"tier_curation"}
 
 
+def test_talker_scope_still_rejects_top_level_done_on_daily():
+    """Arc #20 (2026-07-22) tight-allowlist regression pin — the crux of
+    the arc's scope discipline (2026-07-16 incident).
+
+    The free-text T3 done-state (``done_at``) lives NESTED inside the
+    ``tier_curation`` block — a CHILD of the already-allowed top-level
+    field — and is written ONLY by the deterministic ``tier_done``
+    mutator (``mark_t3_done``), NEVER as a sibling top-level ``done`` /
+    ``done_at`` key. So Arc #20 added a done-state with ZERO widening of
+    this allowlist. This pins that a top-level ``done`` write via the LLM
+    vault_create / vault_edit path STAYS ``scope_denied`` (the 07-16
+    denial was correct), and that the allowlist did NOT gain ``done`` or
+    ``done_at``. If a future change widens the allowlist to admit a
+    top-level done field, THIS test fails loud."""
+    from alfred.vault.scope import (
+        TALKER_TIER_CURATION_FIELDS,
+        check_talker_tier_curation_fields,
+    )
+    # The allowlist did NOT gain a top-level done field.
+    assert "done" not in TALKER_TIER_CURATION_FIELDS
+    assert "done_at" not in TALKER_TIER_CURATION_FIELDS
+    assert TALKER_TIER_CURATION_FIELDS == {"tier_curation"}
+    # A top-level ``done`` write is rejected (the 07-16 correct-deny).
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_talker_tier_curation_fields("daily", ["done"])
+    # A top-level ``done_at`` write is likewise rejected — the done-state
+    # rides NESTED, never as a top-level key.
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_talker_tier_curation_fields("daily", ["done_at"])
+    # Mixed tier_curation + done → still rejected (subset check).
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_talker_tier_curation_fields("daily", ["tier_curation", "done"])
+
+
 # ---------------------------------------------------------------------------
 # Generalized anti-spoliation delete deny (13d-3 follow-up) — the PATH-KEYED
 # deny now covers the FULL _DELETE_DENIED_TYPES set, closing the

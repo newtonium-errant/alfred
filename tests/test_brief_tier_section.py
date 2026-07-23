@@ -2224,3 +2224,114 @@ def test_render_tier_section_calls_view_once(tmp_path: Path) -> None:
         f"compute_today_view called {calls['n']}x — must be exactly once "
         "(no double-compute)."
     )
+
+
+# ===========================================================================
+# Arc #20 (2026-07-22) — free-text T3 ad-hoc done-state render
+# ===========================================================================
+#
+# Split (operator-ratified Q2): the morning brief ✓-STRIKES a done T3
+# (a day snapshot of progress toward the balanced-day goal); ``/today``
+# DROPS it (the operator-committed "what's still on my plate" view).
+
+
+def test_render_t3_entry_open_is_byte_stable() -> None:
+    """An unmarked T3 item (``done_at`` None) renders byte-identically to
+    the pre-Arc-#20 ``- {item}`` — no churn for the common case."""
+    from alfred.brief.tier_section import _render_t3_entry
+    e = T3Entry(item="Read for an hour", source="operator-adhoc")
+    assert _render_t3_entry(e) == "- Read for an hour"
+
+
+def test_render_t3_entry_done_is_struck() -> None:
+    """A checked-off T3 item (``done_at`` set) renders ✓-struck in the
+    morning brief — visible as progress."""
+    from alfred.brief.tier_section import _render_t3_entry
+    e = T3Entry(item="Rake leaves", source="operator-adhoc", done_at="2026-07-22")
+    assert _render_t3_entry(e) == "- ~~Rake leaves~~ ✓"
+
+
+def test_curated_for_today_drops_done_t3_when_today_threaded() -> None:
+    """``/today`` DROPS a T3 item checked off today (``done_at == today``)
+    while keeping the open one — the operator-committed view stays clean."""
+    from datetime import date
+    curation = DailyCuration(t3=[
+        T3Entry(item="Rake leaves", source="operator-adhoc", done_at="2026-07-22"),
+        T3Entry(item="Read for an hour", source="aspirational"),
+    ])
+    body = render_curated_tier_section_for_today(
+        curation, today=date(2026, 7, 22),
+    )
+    assert "Rake leaves" not in body       # dropped (done today)
+    assert "- Read for an hour" in body    # kept (open)
+    # The dropped item is NOT struck — it's gone, not shown-with-strike.
+    assert "~~" not in body
+
+
+def test_curated_for_today_keeps_t3_done_on_a_different_day() -> None:
+    """A ``done_at`` from a PAST day does not drop the item from today's
+    /today view — only ``done_at == today`` drops (defensive; T3 files
+    only ever carry same-day done_at, but the compare is exact)."""
+    from datetime import date
+    curation = DailyCuration(t3=[
+        T3Entry(item="Rake leaves", source="operator-adhoc", done_at="2026-07-20"),
+    ])
+    body = render_curated_tier_section_for_today(
+        curation, today=date(2026, 7, 22),
+    )
+    # Not dropped (done_at != today) → still rendered, and struck (done).
+    assert "Rake leaves" in body
+
+
+def test_curated_for_today_byte_stable_without_today() -> None:
+    """``today=None`` (callers that don't thread it) → NO T3 done-filter,
+    render byte-identical to a caller that never had the param."""
+    curation = DailyCuration(t3=[
+        T3Entry(item="Rake leaves", source="operator-adhoc", done_at="2026-07-22"),
+        T3Entry(item="Read for an hour", source="aspirational"),
+    ])
+    body_default = render_curated_tier_section_for_today(curation)
+    body_none = render_curated_tier_section_for_today(curation, today=None)
+    assert body_default == body_none
+    # Without the filter both items render (done one struck via the shared
+    # per-entry helper).
+    assert "~~Rake leaves~~ ✓" in body_default
+    assert "- Read for an hour" in body_default
+
+
+def test_curated_for_today_done_drop_emits_ilb_log() -> None:
+    """Per ``feedback_log_emission_test_pattern`` — the done-T3 drop is
+    surfaced in the render log so an operator can grep 'why did my T3 item
+    disappear from /today' (t3_done_filtered>0) vs a render bug."""
+    from datetime import date
+    curation = DailyCuration(t3=[
+        T3Entry(item="Rake leaves", source="operator-adhoc", done_at="2026-07-22"),
+        T3Entry(item="Read for an hour", source="aspirational"),
+    ])
+    with structlog.testing.capture_logs() as captured:
+        render_curated_tier_section_for_today(curation, today=date(2026, 7, 22))
+    matches = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.rendered_curated_for_today"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["t3_done_filter_applied"] is True
+    assert matches[0]["t3_done_filtered"] == 1
+    assert matches[0]["curated_t3"] == 1  # count AFTER the drop
+
+
+def test_curated_for_today_done_filter_not_applied_without_today() -> None:
+    """``today=None`` → the ILB log reports the filter was NOT applied
+    (distinguishes 'no done items' from 'filter off')."""
+    curation = DailyCuration(t3=[
+        T3Entry(item="Read for an hour", source="aspirational"),
+    ])
+    with structlog.testing.capture_logs() as captured:
+        render_curated_tier_section_for_today(curation)
+    matches = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.rendered_curated_for_today"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["t3_done_filter_applied"] is False
+    assert matches[0]["t3_done_filtered"] == 0

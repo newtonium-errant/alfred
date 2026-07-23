@@ -1379,6 +1379,14 @@ class TierEntry:
     target_cadence_days: int | None = None
     days_since_last_completed: int | None = None
     overdue_ratio: float | None = None
+    # Arc #20 (2026-07-22) — free-text T3 ad-hoc done-state. Carried
+    # ONLY for curated free-text T3 entries (``_curated_t3_to_tier_entry``);
+    # ``None`` for every task-origin / routine-origin entry (those resolve
+    # done-ness through their backing task status / completion_log). ISO
+    # ``YYYY-MM-DD`` when the operator checked the item off via
+    # ``tier_done``. Lets ``_entry_done`` count it toward the daily goal
+    # and the render layer strike / drop it.
+    done_at: str | None = None
 
 
 @dataclass
@@ -1788,7 +1796,11 @@ def _curated_to_tier_entry(entry: Any, *, tier: int) -> TierEntry | None:
 
 def _curated_t3_to_tier_entry(entry: Any) -> TierEntry | None:
     """Convert a ``daily_curation`` T3 entry (free-text ``item:``) to a
-    TierEntry."""
+    TierEntry.
+
+    Arc #20: carries the entry's ``done_at`` (the free-text T3 done-state)
+    onto the TierEntry so ``_entry_done`` can count it toward the daily
+    goal. ``None`` for an unmarked item (the common case)."""
     text = getattr(entry, "item", None)
     if not text:
         return None
@@ -1797,6 +1809,7 @@ def _curated_t3_to_tier_entry(entry: Any) -> TierEntry | None:
         path="routine/",
         source=getattr(entry, "source", "operator") or "operator",
         item_text=str(text),
+        done_at=getattr(entry, "done_at", None),
     )
 
 
@@ -1939,10 +1952,20 @@ def _compute_daily_goal(
             dates = _parse_item_completion_dates(cl.get(text_key, []))
             return today in dates
         # Free-text T3 entry (curated ``item:`` with no record anchor —
-        # "Meditate", "Read for an hour"). Scan ALL routine completion
-        # logs for a same-text completion today. This is the honest
-        # "did the operator complete this intention today" signal when
-        # the free-text maps to a routine item somewhere.
+        # "Meditate", "Read for an hour", "Rake leaves").
+        #
+        # Arc #20: the item's OWN ad-hoc done-state comes first — an
+        # operator ``tier_done`` stamps ``done_at`` on the entry, and a
+        # free-text ad-hoc intention ("rake leaves") has no routine to
+        # map to, so this is the ONLY signal that will fire for it. Count
+        # it done when ``done_at`` is today (a back-dated ``done_at`` from
+        # a prior day does NOT count toward today's balanced-day goal).
+        if entry.done_at is not None and entry.done_at == today.isoformat():
+            return True
+        # Fallback for a free-text item that DOES map to a routine item
+        # somewhere: scan ALL routine completion logs for a same-text
+        # completion today (the honest "did the operator complete this
+        # intention today" signal, pre-Arc-#20 behaviour, preserved).
         for cl in completion_by_record.values():
             dates = _parse_item_completion_dates(cl.get(text_key, []))
             if today in dates:

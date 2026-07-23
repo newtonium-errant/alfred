@@ -592,7 +592,7 @@ def test_compose_today_reply_uses_curated_render_not_full_materials(
     # verify it's invoked.
     captured_args: list = []
 
-    def _spy_curated(curation, vault_path=None):
+    def _spy_curated(curation, vault_path=None, today=None):
         captured_args.append(curation)
         return "### T1 — (no items yet)\n\n### T2 — (no items yet)\n\n### T3 — (no items yet)\n"
 
@@ -639,7 +639,7 @@ def test_compose_today_reply_curated_render_receives_loaded_curation(
 
     captured_curation = []
 
-    def _spy(curation, vault_path=None):
+    def _spy(curation, vault_path=None, today=None):
         captured_curation.append(curation)
         return "stub"
 

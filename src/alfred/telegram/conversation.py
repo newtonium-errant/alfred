@@ -510,6 +510,141 @@ _ROUTINE_UNDONE_TOOL_SCHEMA = {
 }
 
 
+# Arc #20 (2026-07-22) — ``tier_done`` / ``tier_undone`` schemas.
+#
+# Salem-only tools that check off (or un-check) a FREE-TEXT T3 ad-hoc
+# item on today's (or a back-dated) tier shortlist — the intentions
+# ("rake leaves", "read for an hour") that have no backing ``task/``
+# record or routine ``completion_log`` and so had NO done-state before
+# this arc. Pairs with #19: when a done-claim misses task-search AND
+# ``routine_done`` (unknown_item), the talker reads the daily
+# ``tier_curation`` block and, if the item is a free-text T3, calls
+# ``tier_done`` — closing the honest dead-end #19 left for this case.
+#
+# Dispatch is IN-PROCESS (``_dispatch_tier_done`` calls
+# ``tier.daily_curation.mark_t3_done`` directly — the tier module is
+# already a clean fcntl-locked atomic writer, so there's no
+# CLI-source-of-truth reason to subprocess like ``routine_done`` does).
+# The mutator is a deterministic single-field flip of ``done_at`` nested
+# INSIDE the ``tier_curation`` block: code is the allowlist (it can
+# touch nothing but a matched T3 entry's ``done_at``), and the on-disk
+# write is the top-level ``tier_curation`` key — so this rides the
+# existing ``TALKER_TIER_CURATION_FIELDS`` allowlist with ZERO widening
+# (a sibling top-level ``done`` write stays correctly ``scope_denied``).
+#
+# Cross-agent contract: the vault-talker SKILL's #19 Worked Example H
+# T3 branch calls these; the ``kind`` discriminator shapes the reply.
+_TIER_DONE_TOOL_SCHEMA = {
+    "name": "tier_done",
+    "description": (
+        "Check off a FREE-TEXT T3 ad-hoc item on the daily tier "
+        "shortlist. Salem-only. Use this when the operator says they "
+        "did a self-care / ad-hoc intention that is on today's T3 list "
+        "but is NOT a tracked task or routine (e.g. 'rake leaves is "
+        "done', 'I read for an hour', 'finished raking the leaves') — "
+        "the free-text intentions with no task record and no routine "
+        "completion_log. Routing order (per #19): try task closure and "
+        "``routine_done`` FIRST; only when BOTH miss and you have read "
+        "the daily ``tier_curation`` block and found the item as a "
+        "free-text ``t3`` entry, call this. Fuzzy-matches ``item`` "
+        "against the day's T3 items (same matcher as ``routine_done`` — "
+        "phrasing needn't be exact). Returns a structured ``kind`` "
+        "discriminator you MUST route on:\n"
+        "  * 'success' — checked off; confirm it ('Checked ‘Rake "
+        "leaves’ off today’s T3 list.')\n"
+        "  * 'idempotent_noop' — already checked off for that date; "
+        "tell the operator gently\n"
+        "  * 'ambiguous_item' — multiple T3 items match; ASK BACK with "
+        "the numbered candidate list (do NOT guess)\n"
+        "  * 'unknown_item' — no T3 item matches; give the honest #19 "
+        "close ('I checked today’s tier list too and it isn’t "
+        "there') — do NOT invent a done-state\n"
+        "  * 'future_date_rejected' — ``completed_at`` is in the "
+        "future; ask the operator to clarify\n"
+        "Back-dating supported via ``completed_at`` (YYYY-MM-DD). "
+        "Default is today. Resolve 'yesterday' → today−1, "
+        "'last Tuesday' → most-recent-past-Tuesday yourself before "
+        "calling. This is the ONLY authorised path to a T3 done-state — "
+        "do NOT try to write a ``done`` field via vault_edit (the daily "
+        "record's scope gate rejects it)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "item": {
+                "type": "string",
+                "description": (
+                    "The T3 item text the operator named. Fuzzy match "
+                    "(substring + stem-tolerant) — phrasing needn't be "
+                    "exact."
+                ),
+            },
+            "completed_at": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: YYYY-MM-DD date the item was completed. "
+                    "Omit for today. Resolve relative dates ('yesterday', "
+                    "'last Tuesday') to YYYY-MM-DD yourself before "
+                    "calling. Future dates are rejected."
+                ),
+            },
+        },
+        "required": ["item"],
+    },
+}
+
+
+# ``tier_undone`` — the surgical inverse of ``tier_done``: clears the
+# ``done_at`` on a matched free-text T3 item. Salem-only; same in-process
+# locked-writer path. Ships with ``tier_done`` so a mis-check is trivially
+# reversible.
+_TIER_UNDONE_TOOL_SCHEMA = {
+    "name": "tier_undone",
+    "description": (
+        "Un-check a FREE-TEXT T3 ad-hoc item — the inverse of "
+        "``tier_done``. Salem-only. Use this when the operator says they "
+        "did NOT actually do a T3 intention they'd checked off, or "
+        "checked it by mistake (e.g. 'I didn’t actually rake the "
+        "leaves', 'un-check read for an hour'). Fuzzy-matches ``item`` "
+        "against the day's T3 items. Returns a structured ``kind`` "
+        "discriminator you MUST route on:\n"
+        "  * 'unmarked' — the check was cleared; confirm it\n"
+        "  * 'not_marked' — that item wasn't checked off in the first "
+        "place; tell the operator gently ('that wasn’t checked "
+        "off, nothing to undo') — this is NOT an error\n"
+        "  * 'ambiguous_item' — multiple T3 items match; ASK BACK with "
+        "the numbered candidate list (do NOT guess)\n"
+        "  * 'unknown_item' — no T3 item matches; tell the operator + "
+        "list the day's T3 items if helpful\n"
+        "Date handling: omit ``completed_at`` for today, or pass "
+        "YYYY-MM-DD to un-check a back-dated completion. Resolve relative "
+        "dates yourself before calling."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "item": {
+                "type": "string",
+                "description": (
+                    "The T3 item text the operator named. Fuzzy match "
+                    "(substring + stem-tolerant) — phrasing needn't be "
+                    "exact."
+                ),
+            },
+            "completed_at": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: YYYY-MM-DD date whose check to clear. "
+                    "Omit for today. Resolve relative dates yourself "
+                    "before calling."
+                ),
+            },
+        },
+        "required": ["item"],
+    },
+}
+
+
 # Phase 2B B3 (2026-05-30) — ``routine_item`` schema.
 #
 # Salem-only tool for item-level CRUD on existing routine records.
@@ -1124,6 +1259,9 @@ SALEM_VAULT_TOOLS: list[dict[str, Any]] = [
     _ROUTINE_UNDONE_TOOL_SCHEMA,
     # Phase 2B B3 (2026-05-30) — item-level CRUD on existing routines.
     _ROUTINE_ITEM_TOOL_SCHEMA,
+    # Arc #20 (2026-07-22) — free-text T3 ad-hoc done-state (+ undo).
+    _TIER_DONE_TOOL_SCHEMA,
+    _TIER_UNDONE_TOOL_SCHEMA,
 ]
 
 
@@ -2463,6 +2601,183 @@ async def _dispatch_routine_undone(
     return _dumps(parsed)
 
 
+# --- tier_done / tier_undone dispatch (Arc #20, 2026-07-22) --------------
+#
+# Free-text T3 ad-hoc done-state. UNLIKE routine_done (which subprocesses
+# ``alfred routine done`` because the CLI is the source of truth for the
+# completion_log mutation), tier_done calls
+# ``tier.daily_curation.mark_t3_done`` IN-PROCESS: the tier module is
+# already a clean fcntl-locked atomic writer, so there is no
+# CLI-source-of-truth reason to fork a subprocess. The mutator is a
+# deterministic single-field flip (``done_at`` on a matched T3 entry) —
+# code is the allowlist, and the on-disk write touches only the top-level
+# ``tier_curation`` key, so it rides the existing
+# ``TALKER_TIER_CURATION_FIELDS`` allowlist with ZERO widening.
+
+
+def _resolve_tier_timezone(config: TalkerConfig | None) -> str:
+    """The IANA tz used to resolve 'today' for the tier done-state.
+
+    Prefers the tier surface's own ``today_command.timezone`` (the same
+    tz ``/today`` + the tier compute use, so tier_done's date boundary
+    matches what the operator sees rendered). Falls back to
+    :data:`_DEFAULT_INSTANCE_TIMEZONE` (``America/Halifax``, Salem's tz)
+    when the ``today_command`` block is absent.
+    """
+    if (
+        config is not None
+        and config.today_command is not None
+        and config.today_command.timezone
+    ):
+        return config.today_command.timezone
+    return _DEFAULT_INSTANCE_TIMEZONE
+
+
+async def _dispatch_tier_done(
+    *,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+    undo: bool = False,
+) -> str:
+    """Dispatch one ``tier_done`` (or ``tier_undone`` when ``undo``) block.
+
+    Salem-only. IN-PROCESS call to ``mark_t3_done`` / ``mark_t3_undone``
+    (blocking file I/O + ``fcntl`` lock → ``asyncio.to_thread`` so the
+    event loop stays unblocked). Returns a JSON object carrying the
+    ``kind`` discriminator the SKILL routes on, plus the matched item,
+    date, and (for done) the stamped ``done_at`` / (for ambiguous /
+    unknown) the candidate list.
+    """
+    import asyncio
+
+    from alfred.tier.daily_curation import (
+        TIER_DONE_KIND_FUTURE_DATE_REJECTED,
+        mark_t3_done,
+        mark_t3_undone,
+    )
+
+    tool_label = "tier_undone" if undo else "tier_done"
+
+    # --- Tool-set gating (Salem-only) -----------------------------------
+    tool_set = ""
+    if config is not None:
+        tool_set = (config.instance.tool_set or "").lower()
+    if tool_set in {"kalle", "hypatia"}:
+        log.warning(
+            f"talker.{tool_label}.wrong_tool_set",
+            tool_set=tool_set,
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": (
+                f"{tool_label} is Salem-only — the tier system is "
+                f"Salem-only"
+            ),
+            "tool_set": tool_set,
+        })
+
+    # --- Argument parsing -----------------------------------------------
+    if not isinstance(tool_input, dict):
+        return _dumps({"error": f"{tool_label} requires a dict tool_input"})
+    item = tool_input.get("item", "")
+    completed_at_raw = tool_input.get("completed_at", "") or ""
+    if not isinstance(item, str) or not item.strip():
+        return _dumps({"error": f"{tool_label} requires a non-empty 'item'"})
+    if config is None or not config.vault or not config.vault.path:
+        # Fail-loud: the tier writer needs a vault path. This should not
+        # happen in production (Salem always plumbs config), but a test
+        # or misconfig that omits it must not silently no-op.
+        return _dumps({
+            "error": f"{tool_label} requires talker config with a vault path",
+        })
+
+    vault_path = Path(config.vault.path)
+
+    # Resolve today in the tier timezone (matches /today's date boundary).
+    tz_name = _resolve_tier_timezone(config)
+    try:
+        today = _dt.datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:  # noqa: BLE001 - bad tz string → OS-local fallback
+        log.warning(f"talker.{tool_label}.bad_timezone", tz=tz_name)
+        today = _dt.date.today()
+
+    # Resolve the target date (default today). A malformed ``completed_at``
+    # is a fail-loud arg error, not a silent today-fallback.
+    if isinstance(completed_at_raw, str) and completed_at_raw.strip():
+        try:
+            target_date = _dt.date.fromisoformat(completed_at_raw.strip())
+        except ValueError:
+            return _dumps({
+                "error": (
+                    f"{tool_label}: 'completed_at' must be YYYY-MM-DD; "
+                    f"got {completed_at_raw!r}"
+                ),
+            })
+    else:
+        target_date = today
+
+    log.info(
+        f"talker.{tool_label}.invoke",
+        session_id=session.session_id,
+        item=item[:200],
+        completed_at=target_date.isoformat(),
+        default_today=(not (completed_at_raw or "").strip()),
+    )
+
+    # --- In-process mutation (blocking → thread) ------------------------
+    try:
+        if undo:
+            result = await asyncio.to_thread(
+                mark_t3_undone, vault_path, item.strip(), on_date=target_date,
+            )
+        else:
+            result = await asyncio.to_thread(
+                mark_t3_done,
+                vault_path,
+                item.strip(),
+                completed_at=target_date,
+                today=today,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            f"talker.{tool_label}.crashed",
+            session_id=session.session_id,
+            error=str(exc),
+        )
+        return _dumps({
+            "error": f"{tool_label} crashed: {exc}",
+            "kind": "subprocess_error",
+        })
+
+    log.info(
+        f"talker.{tool_label}.result",
+        session_id=session.session_id,
+        kind=result.kind,
+        item=(result.item or "")[:200],
+        date=result.date or "",
+        done_at=result.done_at or "",
+    )
+
+    payload: dict[str, Any] = {
+        "kind": result.kind,
+        "item": result.item,
+        "date": result.date,
+        "candidates": result.candidates,
+    }
+    if not undo:
+        payload["done_at"] = result.done_at
+        # Surface the future-date rejection reason inline (mirrors the
+        # routine_done contract's structured error) so the SKILL can
+        # voice it without inferring from ``kind`` alone.
+        if result.kind == TIER_DONE_KIND_FUTURE_DATE_REJECTED:
+            payload["error"] = (
+                f"'{result.date}' is in the future; ask the operator to "
+                f"clarify the date."
+            )
+    return _dumps(payload)
+
+
 # --- routine_item dispatch (Phase 2B B3, 2026-05-30) ---------------------
 #
 # Conversational item-CRUD path. Subprocess-invokes ``python -m alfred
@@ -3667,6 +3982,26 @@ async def _execute_tool(
             tool_input=tool_input,
             session=session,
             config=config,
+        )
+
+    # ``tier_done`` / ``tier_undone`` (Salem, Arc #20 2026-07-22) —
+    # free-text T3 ad-hoc done-state. IN-PROCESS (calls
+    # ``tier.daily_curation.mark_t3_done`` / ``mark_t3_undone`` directly —
+    # the tier module is a clean fcntl-locked atomic writer). The
+    # deterministic single-field ``done_at`` flip rides the existing
+    # ``tier_curation`` top-level allowlist with ZERO scope widening.
+    if tool_name == "tier_done":
+        return await _dispatch_tier_done(
+            tool_input=tool_input,
+            session=session,
+            config=config,
+        )
+    if tool_name == "tier_undone":
+        return await _dispatch_tier_done(
+            tool_input=tool_input,
+            session=session,
+            config=config,
+            undo=True,
         )
 
     # Inter-instance Phase A peer tools (KAL-LE, Hypatia → Salem). Each

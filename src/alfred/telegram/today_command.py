@@ -155,8 +155,12 @@ def compose_today_reply(
         # operator has since CLOSED (2026-06-15) — /today shows only
         # live commitments. Without the path the render skips filtering;
         # the composer always has the path, so /today always filters.
+        # Pass today (Arc #20) so the render also DROPS free-text T3 items
+        # the operator has checked off today via ``tier_done`` — /today
+        # shows only what's still on the plate. The composer always has
+        # today_local, so /today always filters done T3.
         tier_body = render_curated_tier_section_for_today(
-            curation, vault_path=vault_path,
+            curation, vault_path=vault_path, today=today_local,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

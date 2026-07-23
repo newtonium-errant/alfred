@@ -328,19 +328,56 @@ class T3Entry:
     ``item`` is the operator-facing string (e.g. ``"Walk Fergus"``).
     ``source`` is one of :data:`T3_SOURCES`. No ``confirmed`` field
     (T3 is operator-curated; the add IS the confirmation).
+
+    ``done_at`` (Arc #20, 2026-07-22) is the ISO ``YYYY-MM-DD`` date the
+    operator checked this item off, or ``None`` when still open. A DATE
+    (not a bare bool) so the daily goal can ask "done *today*?" and
+    back-dating ("raked leaves yesterday") works. This is the ONLY
+    done-state home for a free-text T3 item: unlike task-origin /
+    routine-origin T1/T2 entries (which resolve done-ness through their
+    backing ``task/`` status or ``completion_log``), a free-text T3 item
+    has no backing record. It rides the existing ``tier_curation``
+    top-level field allowlist because it is NESTED inside the entry (a
+    CHILD of the already-allowed ``tier_curation`` field) — NOT a
+    sibling top-level ``done`` key, which the talker scope gate
+    (``check_talker_tier_curation_fields``) correctly rejects. Written
+    only by the deterministic :func:`mark_t3_done` mutator, never by an
+    LLM whole-block ``tier_curation`` rewrite.
     """
 
     item: str
     source: str
+    done_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"item": self.item, "source": self.source}
+        """Serialize to the YAML-shaped dict.
+
+        ``done_at`` is emitted ONLY when set (mirrors the optional-drop
+        pattern on :meth:`DailyCuration.to_dict`'s ``curated_at`` /
+        ``rollover_from``): an open item stays a clean two-key
+        ``{item, source}`` so byte-stability is preserved for every
+        never-marked-done item.
+        """
+        out: dict[str, Any] = {"item": self.item, "source": self.source}
+        if self.done_at is not None:
+            out["done_at"] = self.done_at
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> T3Entry:
+        """Build from a YAML-loaded dict.
+
+        ``done_at`` is read schema-tolerantly: any present non-null value
+        is coerced to ``str``; absent / null ⟹ ``None`` (open). The
+        ``item`` + ``source`` requirement enforced by
+        :meth:`DailyCuration._parse_t3_list` is unchanged — ``done_at``
+        is a purely additive field.
+        """
+        done_at_raw = data.get("done_at")
         return cls(
             item=str(data.get("item", "")),
             source=str(data.get("source", "")),
+            done_at=str(done_at_raw) if done_at_raw is not None else None,
         )
 
 
@@ -545,6 +582,86 @@ def load_daily_curation(
     return curation
 
 
+def _write_curation_into_daily_file(
+    daily_file: Path, today: _date, curation: DailyCuration,
+) -> None:
+    """Read-preserve-write the ``tier_curation`` block into ``daily_file``.
+
+    The atomic ``.curation.tmp`` → ``os.replace`` write body, factored out
+    of :func:`save_tier_curation` so :func:`mark_t3_done` /
+    :func:`mark_t3_undone` can share it WITHIN a single lock hold.
+
+    **PRECONDITION: the caller MUST already hold** ``daily_file_lock`` for
+    ``daily_file``. This function does NOT take the lock — it is the
+    lock-free inner write shared by every locked caller. The load →
+    match → mutate → write of a done-state flip has to be one locked
+    critical section (otherwise two ``tier_done`` calls race: A reads,
+    B reads, A writes, B writes-preserving-A's-stale-view → A's flip is
+    lost — the exact Step-5 lost-update shape). ``mark_t3_done`` can't
+    just call :func:`save_tier_curation` after its own read, because that
+    would re-enter :func:`daily_file_lock` on a SECOND fd for the same
+    file and self-deadlock (``flock(LOCK_EX)`` on a distinct open file
+    description blocks even within the same process). Hence the shared
+    lock-free inner write.
+
+    Behaviour is byte-identical to the pre-refactor
+    :func:`save_tier_curation` inner block: preserve other frontmatter
+    keys + body verbatim, seed a minimal ``type: daily`` file when
+    absent, atomic ``.curation.tmp`` write with orphan-tmp cleanup.
+    """
+    if daily_file.exists():
+        try:
+            post = frontmatter.load(str(daily_file))
+        except Exception as exc:  # noqa: BLE001
+            # Defensive: a corrupt file forces caller to delete +
+            # retry. Don't overwrite blindly — operator may have
+            # hand-edits we'd lose.
+            log.warning(
+                "tier.daily_curation.save_aborted_corrupt_file",
+                path=str(daily_file),
+                date=today.isoformat(),
+                error=str(exc),
+            )
+            raise
+        existing_meta = dict(post.metadata or {})
+        body = post.content or ""
+    else:
+        # Fresh file — seed minimum frontmatter so a downstream
+        # reader (brief, janitor) sees a well-formed ``type: daily``
+        # record.
+        existing_meta = {"type": "daily", "date": today.isoformat()}
+        body = ""
+        log.info(
+            "tier.daily_curation.created_fresh_daily_file",
+            path=str(daily_file),
+            date=today.isoformat(),
+            detail=(
+                "daily file did not exist; seeded minimum frontmatter "
+                "(``type: daily``, ``date: <iso>``) + empty body. The "
+                "routine aggregator's next fire will "
+                "read-preserve-write this curation."
+            ),
+        )
+
+    # Replace / add the tier_curation block.
+    existing_meta["tier_curation"] = curation.to_dict()
+
+    new_post = frontmatter.Post(body, **existing_meta)
+    tmp_path = daily_file.with_suffix(".curation.tmp")
+    # orphan-tmp cleanup (reviewer NOTE, 2026-06-27): a failed
+    # os.replace would otherwise leave a stale .curation.tmp orphan
+    # (self-heals next run, but invisible to scanners). try/finally
+    # removes it on any failure path; on success os.replace has
+    # already moved it, so unlink(missing_ok=True) is a no-op.
+    try:
+        tmp_path.write_text(
+            frontmatter.dumps(new_post) + "\n", encoding="utf-8",
+        )
+        os.replace(tmp_path, daily_file)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def save_tier_curation(
     vault_path: Path, today: _date, curation: DailyCuration,
 ) -> None:
@@ -595,57 +712,7 @@ def save_tier_curation(
     # daily file (Step 5 lost-update fix). The read below must stay valid
     # through the write; the lock guarantees no other writer interleaves.
     with daily_file_lock(daily_file):
-        if daily_file.exists():
-            try:
-                post = frontmatter.load(str(daily_file))
-            except Exception as exc:  # noqa: BLE001
-                # Defensive: a corrupt file forces caller to delete +
-                # retry. Don't overwrite blindly — operator may have
-                # hand-edits we'd lose.
-                log.warning(
-                    "tier.daily_curation.save_aborted_corrupt_file",
-                    path=str(daily_file),
-                    date=today.isoformat(),
-                    error=str(exc),
-                )
-                raise
-            existing_meta = dict(post.metadata or {})
-            body = post.content or ""
-        else:
-            # Fresh file — seed minimum frontmatter so a downstream
-            # reader (brief, janitor) sees a well-formed ``type: daily``
-            # record.
-            existing_meta = {"type": "daily", "date": today.isoformat()}
-            body = ""
-            log.info(
-                "tier.daily_curation.created_fresh_daily_file",
-                path=str(daily_file),
-                date=today.isoformat(),
-                detail=(
-                    "daily file did not exist; seeded minimum frontmatter "
-                    "(``type: daily``, ``date: <iso>``) + empty body. The "
-                    "routine aggregator's next fire will "
-                    "read-preserve-write this curation."
-                ),
-            )
-
-        # Replace / add the tier_curation block.
-        existing_meta["tier_curation"] = curation.to_dict()
-
-        new_post = frontmatter.Post(body, **existing_meta)
-        tmp_path = daily_file.with_suffix(".curation.tmp")
-        # orphan-tmp cleanup (reviewer NOTE, 2026-06-27): a failed
-        # os.replace would otherwise leave a stale .curation.tmp orphan
-        # (self-heals next run, but invisible to scanners). try/finally
-        # removes it on any failure path; on success os.replace has
-        # already moved it, so unlink(missing_ok=True) is a no-op.
-        try:
-            tmp_path.write_text(
-                frontmatter.dumps(new_post) + "\n", encoding="utf-8",
-            )
-            os.replace(tmp_path, daily_file)
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        _write_curation_into_daily_file(daily_file, today, curation)
 
     log.info(
         "tier.daily_curation.saved",
@@ -658,13 +725,326 @@ def save_tier_curation(
     )
 
 
+# ---------------------------------------------------------------------------
+# Arc #20 (2026-07-22) — free-text T3 done-state mutators
+# ---------------------------------------------------------------------------
+#
+# The ONLY authorised writers of ``T3Entry.done_at``. Deterministic
+# single-field mutators — CODE, not the LLM, is the allowlist: they can
+# flip ``done_at`` on a matched T3 entry and nothing else (never
+# ``type``/``date``/other entries/body). They write through the same
+# ``daily_file_lock`` + atomic ``.curation.tmp`` path as
+# ``save_tier_curation`` (via the shared lock-free
+# ``_write_curation_into_daily_file``), touching only the top-level
+# ``tier_curation`` key — so the write honours the existing
+# ``TALKER_TIER_CURATION_FIELDS`` allowlist with ZERO widening.
+#
+# ``kind`` discriminator — cross-agent contract the talker's
+# ``_dispatch_tier_done`` / ``_dispatch_tier_undone`` route on (and the
+# vault-talker SKILL quotes verbatim). Mirrors the ``routine_done`` B1
+# ``DONE_KIND_*`` string values so operator phrasing routes consistently
+# across both surfaces. Rename any of these = update the talker
+# dispatcher + SKILL in lockstep.
+TIER_DONE_KIND_SUCCESS = "success"
+TIER_DONE_KIND_IDEMPOTENT_NOOP = "idempotent_noop"
+TIER_DONE_KIND_AMBIGUOUS_ITEM = "ambiguous_item"
+TIER_DONE_KIND_UNKNOWN_ITEM = "unknown_item"
+TIER_DONE_KIND_FUTURE_DATE_REJECTED = "future_date_rejected"
+# Undo-specific kinds — the inverse of ``mark_t3_done``. ``unmarked`` = a
+# ``done_at`` was cleared; ``not_marked`` = the item was already open
+# (idempotent no-op, NOT an error — distinct from ``idempotent_noop`` so
+# the talker can voice "that wasn't checked off, nothing to undo" vs
+# "already done"). Per intentionally-left-blank the no-op is explicit.
+# ``ambiguous_item`` / ``unknown_item`` are shared with the done path.
+TIER_UNDONE_KIND_UNMARKED = "unmarked"
+TIER_UNDONE_KIND_NOT_MARKED = "not_marked"
+
+
+@dataclass
+class TierDoneResult:
+    """Result of a :func:`mark_t3_done` / :func:`mark_t3_undone` call.
+
+    ``kind`` is the discriminator (one of the ``TIER_DONE_KIND_*`` /
+    ``TIER_UNDONE_KIND_*`` constants) the talker routes on. The other
+    fields carry what the talker needs to voice the reply:
+
+      * ``item`` — the MATCHED T3 item text (canonical form from the
+        curation, not the operator's fuzzy query) on success / noop /
+        idempotent paths; the operator's raw query on unknown/ambiguous.
+      * ``date`` — ISO date of the daily file acted on.
+      * ``done_at`` — the stamped ISO date on ``success`` /
+        ``idempotent_noop``; ``None`` otherwise.
+      * ``candidates`` — for ``ambiguous_item`` the matched item texts to
+        ask back on; for ``unknown_item`` the day's full T3 item list
+        (so the talker can say "here's what IS on today's T3 list").
+    """
+
+    kind: str
+    item: str | None = None
+    date: str | None = None
+    done_at: str | None = None
+    candidates: list[str] = field(default_factory=list)
+
+
+def _match_t3_entries(query: str, entries: list[T3Entry]) -> list[T3Entry]:
+    """Fuzzy-match ``query`` against each T3 entry's ``item`` text.
+
+    Reuses the routine matcher (:func:`alfred.routine.cli._matches_item`)
+    so ``tier_done`` and ``routine_done`` resolve the SAME operator
+    phrasing identically (the design's consistency requirement) and the
+    same learned glossary substrate can serve both when P5 wires it in.
+    Lazy function-level import: ``routine.cli`` imports nothing from
+    ``tier`` (no module-load cycle), and this mirrors ``tier/compute.py``'s
+    existing lazy-import-of-routine pattern. ``glossary=None`` here ⟹ the
+    plain fuzzy ladder (the P5 self-correcting glossary read wires in as
+    its own slice).
+    """
+    from alfred.routine.cli import _matches_item
+
+    return [e for e in entries if _matches_item(query, e.item)]
+
+
+def mark_t3_done(
+    vault_path: Path,
+    item: str,
+    *,
+    completed_at: _date,
+    today: _date,
+) -> TierDoneResult:
+    """Mark a free-text T3 item done on ``completed_at``'s daily file.
+
+    Loads the daily file for ``completed_at`` (so a back-date resolves
+    the item on the day it was curated), fuzzy-matches ``item`` against
+    that day's ``t3[].item`` strings, and stamps ``done_at =
+    completed_at`` on the single match. ``today`` gates future dates.
+
+    The WHOLE read → match → mutate → write runs inside ``daily_file_lock``
+    (one critical section) so two concurrent ``tier_done`` calls can't
+    lost-update each other's flips — see
+    :func:`_write_curation_into_daily_file`'s precondition note for why
+    calling :func:`save_tier_curation` here would self-deadlock instead.
+
+    Returns a :class:`TierDoneResult`; every branch emits a named log
+    event (per intentionally-left-blank) so an operator can grep the
+    outcome without re-reading the file. Only mutates on a single match
+    — the honest "isn't on the list" dead-end (``unknown_item``, #19) is
+    preserved for the truly-untracked item.
+    """
+    if not item or not item.strip():
+        log.info("tier.mark_t3_done.empty_query", date=completed_at.isoformat())
+        return TierDoneResult(
+            kind=TIER_DONE_KIND_UNKNOWN_ITEM,
+            item=item,
+            date=completed_at.isoformat(),
+        )
+
+    if completed_at > today:
+        log.info(
+            "tier.mark_t3_done.future_date_rejected",
+            date=completed_at.isoformat(),
+            today=today.isoformat(),
+            item=item,
+        )
+        return TierDoneResult(
+            kind=TIER_DONE_KIND_FUTURE_DATE_REJECTED,
+            item=item,
+            date=completed_at.isoformat(),
+        )
+
+    daily_file = _daily_file_path(vault_path, completed_at)
+    with daily_file_lock(daily_file):
+        curation = load_daily_curation(vault_path, completed_at)
+        if curation is None:
+            log.info(
+                "tier.mark_t3_done.no_curation",
+                date=completed_at.isoformat(),
+                item=item,
+                detail=(
+                    "no daily file / tier_curation block for the target "
+                    "date — the item is untracked, honest #19 dead-end."
+                ),
+            )
+            return TierDoneResult(
+                kind=TIER_DONE_KIND_UNKNOWN_ITEM,
+                item=item,
+                date=completed_at.isoformat(),
+            )
+
+        matches = _match_t3_entries(item, curation.t3)
+        if not matches:
+            log.info(
+                "tier.mark_t3_done.unknown_item",
+                date=completed_at.isoformat(),
+                item=item,
+                t3_count=len(curation.t3),
+            )
+            return TierDoneResult(
+                kind=TIER_DONE_KIND_UNKNOWN_ITEM,
+                item=item,
+                date=completed_at.isoformat(),
+                candidates=[e.item for e in curation.t3],
+            )
+        if len(matches) > 1:
+            log.info(
+                "tier.mark_t3_done.ambiguous_item",
+                date=completed_at.isoformat(),
+                item=item,
+                match_count=len(matches),
+            )
+            return TierDoneResult(
+                kind=TIER_DONE_KIND_AMBIGUOUS_ITEM,
+                item=item,
+                date=completed_at.isoformat(),
+                candidates=[e.item for e in matches],
+            )
+
+        matched = matches[0]
+        target_iso = completed_at.isoformat()
+        if matched.done_at == target_iso:
+            log.info(
+                "tier.mark_t3_done.idempotent_noop",
+                date=target_iso,
+                item=matched.item,
+            )
+            return TierDoneResult(
+                kind=TIER_DONE_KIND_IDEMPOTENT_NOOP,
+                item=matched.item,
+                date=target_iso,
+                done_at=target_iso,
+            )
+
+        matched.done_at = target_iso
+        _write_curation_into_daily_file(daily_file, completed_at, curation)
+
+    log.info(
+        "tier.mark_t3_done.success",
+        date=target_iso,
+        item=matched.item,
+    )
+    return TierDoneResult(
+        kind=TIER_DONE_KIND_SUCCESS,
+        item=matched.item,
+        date=target_iso,
+        done_at=target_iso,
+    )
+
+
+def mark_t3_undone(
+    vault_path: Path,
+    item: str,
+    *,
+    on_date: _date,
+) -> TierDoneResult:
+    """Clear ``done_at`` on a free-text T3 item — the inverse of
+    :func:`mark_t3_done`.
+
+    Loads ``on_date``'s daily file, fuzzy-matches ``item``, and clears
+    ``done_at`` on the single match. Same locked-RMW discipline as
+    :func:`mark_t3_done`. No future-date gate — undoing any date is
+    harmless (you can only clear a ``done_at`` that exists).
+
+    Returns ``unmarked`` when a ``done_at`` was cleared, ``not_marked``
+    when the item was already open (idempotent, NOT an error), or the
+    shared ``ambiguous_item`` / ``unknown_item`` kinds.
+    """
+    if not item or not item.strip():
+        log.info("tier.mark_t3_undone.empty_query", date=on_date.isoformat())
+        return TierDoneResult(
+            kind=TIER_DONE_KIND_UNKNOWN_ITEM,
+            item=item,
+            date=on_date.isoformat(),
+        )
+
+    daily_file = _daily_file_path(vault_path, on_date)
+    with daily_file_lock(daily_file):
+        curation = load_daily_curation(vault_path, on_date)
+        if curation is None:
+            log.info(
+                "tier.mark_t3_undone.no_curation",
+                date=on_date.isoformat(),
+                item=item,
+            )
+            return TierDoneResult(
+                kind=TIER_DONE_KIND_UNKNOWN_ITEM,
+                item=item,
+                date=on_date.isoformat(),
+            )
+
+        matches = _match_t3_entries(item, curation.t3)
+        if not matches:
+            log.info(
+                "tier.mark_t3_undone.unknown_item",
+                date=on_date.isoformat(),
+                item=item,
+                t3_count=len(curation.t3),
+            )
+            return TierDoneResult(
+                kind=TIER_DONE_KIND_UNKNOWN_ITEM,
+                item=item,
+                date=on_date.isoformat(),
+                candidates=[e.item for e in curation.t3],
+            )
+        if len(matches) > 1:
+            log.info(
+                "tier.mark_t3_undone.ambiguous_item",
+                date=on_date.isoformat(),
+                item=item,
+                match_count=len(matches),
+            )
+            return TierDoneResult(
+                kind=TIER_DONE_KIND_AMBIGUOUS_ITEM,
+                item=item,
+                date=on_date.isoformat(),
+                candidates=[e.item for e in matches],
+            )
+
+        matched = matches[0]
+        if matched.done_at is None:
+            log.info(
+                "tier.mark_t3_undone.not_marked",
+                date=on_date.isoformat(),
+                item=matched.item,
+            )
+            return TierDoneResult(
+                kind=TIER_UNDONE_KIND_NOT_MARKED,
+                item=matched.item,
+                date=on_date.isoformat(),
+            )
+
+        previous = matched.done_at
+        matched.done_at = None
+        _write_curation_into_daily_file(daily_file, on_date, curation)
+
+    log.info(
+        "tier.mark_t3_undone.unmarked",
+        date=on_date.isoformat(),
+        item=matched.item,
+        was_done_at=previous,
+    )
+    return TierDoneResult(
+        kind=TIER_UNDONE_KIND_UNMARKED,
+        item=matched.item,
+        date=on_date.isoformat(),
+    )
+
+
 __all__ = [
     "DailyCuration",
     "T1T2Entry",
     "T1_T2_SOURCES",
     "T3Entry",
     "T3_SOURCES",
+    "TIER_DONE_KIND_AMBIGUOUS_ITEM",
+    "TIER_DONE_KIND_FUTURE_DATE_REJECTED",
+    "TIER_DONE_KIND_IDEMPOTENT_NOOP",
+    "TIER_DONE_KIND_SUCCESS",
+    "TIER_DONE_KIND_UNKNOWN_ITEM",
+    "TIER_UNDONE_KIND_NOT_MARKED",
+    "TIER_UNDONE_KIND_UNMARKED",
+    "TierDoneResult",
     "daily_file_lock",
     "load_daily_curation",
+    "mark_t3_done",
+    "mark_t3_undone",
     "save_tier_curation",
 ]

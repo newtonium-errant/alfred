@@ -656,3 +656,76 @@ def test_view_preserves_optout_against_tier_defaults(tmp_path: Path) -> None:
         "(Walk-Fergus opt-out preserved end-to-end)"
     )
     assert any(r.text == "Walk Fergus" for r in view.routine_today)
+
+
+# --- Arc #20: free-text T3 ad-hoc done-state in the daily goal ------------
+#
+# A free-text T3 intention ("Rake leaves") has NO backing task record and
+# NO routine completion_log — its ``done_at`` (set by the ``tier_done``
+# tool) is the ONLY signal that can move the T3 lane's done count. Before
+# Arc #20 "rake leaves is done" never moved the balanced-day marker.
+
+
+def test_daily_goal_counts_free_text_t3_done_at_today(tmp_path: Path) -> None:
+    """A curated free-text T3 with ``done_at == today`` counts toward the
+    daily goal's T3 lane, with NO backing routine (the Arc #20 close)."""
+    vault = _vault(tmp_path)
+    _write_daily_curation(
+        vault, "2026-05-28",
+        "type: daily\ndate: '2026-05-28'\n"
+        "tier_curation:\n"
+        "  t3:\n"
+        "  - item: Rake leaves\n    source: operator-adhoc\n"
+        "    done_at: '2026-05-28'\n"
+        "  - item: Read for an hour\n    source: aspirational\n",
+    )
+    view = compute_today_view(vault, NOW)
+    assert view.daily_goal.t3_available == 2
+    assert view.daily_goal.t3_done == 1  # only the done_at==today one
+
+
+def test_daily_goal_ignores_free_text_t3_done_at_past_day(tmp_path: Path) -> None:
+    """A ``done_at`` on a PAST day does NOT count toward TODAY's goal —
+    a back-dated completion doesn't inflate today's balanced-day marker."""
+    vault = _vault(tmp_path)
+    _write_daily_curation(
+        vault, "2026-05-28",
+        "type: daily\ndate: '2026-05-28'\n"
+        "tier_curation:\n"
+        "  t3:\n"
+        "  - item: Rake leaves\n    source: operator-adhoc\n"
+        "    done_at: '2026-05-27'\n",
+    )
+    view = compute_today_view(vault, NOW)
+    assert view.daily_goal.t3_available == 1
+    assert view.daily_goal.t3_done == 0
+
+
+def test_daily_goal_free_text_t3_done_flips_balanced_day(tmp_path: Path) -> None:
+    """The friction close, end-to-end: a free-text T3 ``done_at==today``
+    completes the T3 lane so the balanced-day marker flips once T1 + T2
+    are also done."""
+    vault = _vault(tmp_path)
+    _write_task(
+        vault, "T1 Done",
+        "type: task\nstatus: done\nname: T1 Done\ncompleted: 2026-05-28\n",
+    )
+    _write_task(
+        vault, "T2 Done",
+        "type: task\nstatus: done\nname: T2 Done\ncompleted: 2026-05-28\n",
+    )
+    _write_daily_curation(
+        vault, "2026-05-28",
+        "type: daily\ndate: '2026-05-28'\n"
+        "tier_curation:\n"
+        "  t1:\n  - task: '[[task/T1 Done]]'\n    source: operator\n"
+        "    confirmed: true\n"
+        "  t2:\n  - task: '[[task/T2 Done]]'\n    source: operator\n"
+        "  t3:\n  - item: Rake leaves\n    source: operator-adhoc\n"
+        "    done_at: '2026-05-28'\n",
+    )
+    view = compute_today_view(vault, NOW)
+    assert view.daily_goal.t1_done >= 1
+    assert view.daily_goal.t2_done >= 1
+    assert view.daily_goal.t3_done >= 1
+    assert view.daily_goal.balanced_day is True
