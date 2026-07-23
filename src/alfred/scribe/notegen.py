@@ -208,8 +208,8 @@ _CHARS_PER_TOKEN = 2.5          # low (over-estimating) rate — first-line hint
 #       check (Ollama's real tokenizer), which this does NOT touch. Worst case a
 #       looser pre-flight lets a case through that the post-call guard then refuses
 #       (an efficiency cost, never a safety one).
-#   (c) empirical anchor: the current SYSTEM_PROMPT is ~15075 chars ≈ 3769 real
-#       tokens (chars/4.0), well within the window; chars/2.5 mis-estimated it 6030.
+#   (c) empirical anchor: the current SYSTEM_PROMPT is ~16687 chars ≈ 4172 real
+#       tokens (chars/4.0), well within the window; chars/2.5 mis-estimated it 6675.
 _PROSE_CHARS_PER_TOKEN = 4.0    # English-prose rate — for the FIXED SYSTEM_PROMPT only
 _HEADER_TOKENS_PER_SEGMENT = 8  # fixed surcharge/seg for the dense ``S## [x-y s]:`` header
 _BUDGET_SAFETY_MARGIN = 512     # slack for tokenizer variance vs the char estimate
@@ -370,6 +370,30 @@ before or after it. It MUST be valid JSON with EXACTLY this shape:
    attribution from your citations, so your job is just to cite the right segment
    and place it in the right section. If there are NO [ROLE] tags, place content by
    its section meaning as usual (rules 1-6).
+
+8. BE CONCISE — WORDING, NOT CONTENT. Once a claim is atomic (rule 1) and cited,
+   say it in as few words as the finding needs. A verbose claim is still a defect
+   even when everything in it is true, correctly cited, and correctly atomic.
+   * ONE CLAUSE per claim. State the finding directly; do not wrap it in an extra
+     descriptive clause. "Patient reports a cough that has been present and
+     worsening for approximately the past three days" -> "Reports a cough,
+     worsening over approximately three days" (same finding, same citation,
+     same stated modifier, fewer words).
+   * DO NOT restate the section name or category inside the claim text — the
+     clinician already sees the "## Subjective" / "## Objective" heading. Write
+     "Reports a cough", not "Subjective: patient reports a cough" or "Reported
+     symptom: cough".
+   * DO NOT add hedging or narration wrapper words that nobody in the encounter
+     said ("it was noted that", "it appears that", "the patient was found to
+     have", "the assessment suggests"). If the SPEAKER hedged ("I think it might
+     be my sciatica"), extract-not-infer still applies: keep THEIR hedge — this
+     rule bans wrapper phrasing you add, never a hedge someone actually said.
+   * DO NOT add filler connectives ("in terms of", "with regard to", "it should
+     be noted that").
+   Concision NEVER outranks rules 1-7: never merge two findings to save words,
+   never drop a number/unit/negation/modifier, and never shorten or drop a
+   source_spans citation to make a claim look tidier. A faithful, fully-cited
+   claim that reads a little long beats a short claim that lost content.
 
 DO NOT (each WRONG below is a real failure the safety check may or may not catch —
 so YOU must prevent it):
