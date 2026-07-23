@@ -2739,6 +2739,9 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     if subcmd == "notegen-profile":
         _cmd_scribe_notegen_profile(args)
         return
+    if subcmd == "notegen-feedback":
+        _cmd_scribe_notegen_feedback(args)
+        return
     if subcmd != "attest":
         print("Usage: alfred scribe {attest <note> --attester <clinician> | "
               "events {list|verify|tip|anchor} | audit encounter <enc> | "
@@ -3946,6 +3949,76 @@ def _cmd_scribe_negation_glossary(args: argparse.Namespace) -> None:
         "approved": cid, "operator": operator, "glossary_revision": revision,
         "dropped_count": dropped_count, "claim_concept": sorted(claim_final),
         "cite_concept": sorted(cite_final)}, indent=2))
+
+
+def _cmd_scribe_notegen_feedback(args: argparse.Namespace) -> None:
+    """``alfred scribe notegen-feedback {status [--json] | diff <source_id>}`` — the #14e read surfaces.
+
+    ``status`` (Part A) — a READ-ONLY PHI-FREE aggregate over the ``notegen_edit`` capture sink:
+    per-section add/remove/modify totals, the median net word delta, the grounding-reason FP ranking
+    (kept-rate → tune-down candidates), and the ``high_modification`` encounter list by OPAQUE
+    source_id. ILB: an explicit "no correction signal yet" when the sink is empty. Proposes; the
+    operator approves (no auto-mutation).
+
+    ``diff <source_id>`` (Part B) — ⚠ THE ONE PHI-BEARING SURFACE. Recomputes the raw draft→attested
+    diff ON-BOX from vault records and prints it to STDOUT ONLY — never persisted, logged, audited, or
+    egressed (ephemeral, local-only, authorized-PHI-on-box). For the operator to generalize a
+    terminology preference at morning review."""
+    from alfred.scribe import notegen_feedback as _nf
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    fcmd = getattr(args, "notegen_feedback_cmd", None)
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+
+    if fcmd == "status":
+        rows = _nf.read_notegen_edit_rows(cfg.diarize.enrollment_dir)
+        agg = _nf.aggregate_feedback(rows)
+        if getattr(args, "json", False):
+            print(json.dumps(agg, indent=2))
+            return
+        if agg["attests"] == 0:                              # ILB — idle distinguishable from broken
+            print("Note-gen feedback: 0 attests captured — no correction signal yet.")
+            return
+        print(f"Note-gen feedback — {agg['attests']} attest(s) captured "
+              f"(median net word delta {agg['median_net_word_delta']}):")
+        if agg["fp_ranking"]:
+            print("  Grounding-reason FP ranking (high kept-rate = tune-down candidate):")
+            for r in agg["fp_ranking"]:
+                print(f"    {r['reason']}: kept {r['kept']}/{r['kept'] + r['removed']} "
+                      f"({r['kept_rate']:.0%})")
+        else:
+            print("  Grounding-reason FP ranking: none (no flagged claims surveyed yet).")  # ILB
+        print("  Per-section edits (added / removed / modified / kept):")
+        for sec in ("subjective", "objective", "assessment", "plan"):
+            s = agg["sections"][sec]
+            print(f"    {sec}: +{s['claims_added']} / -{s['claims_removed']} / "
+                  f"~{s['claims_modified']} / ={s['claims_kept_verbatim']}")
+        hm = agg["high_modification_source_ids"]
+        print(f"  High-modification encounters ({len(hm)}) — inspect on-box via "
+              f"`notegen-feedback diff <source_id>`:")
+        for sid in hm:
+            print(f"    {sid}")
+        if not hm:
+            print("    none")                                # ILB
+        return
+
+    if fcmd == "diff":
+        vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+        diff = _nf.recompute_raw_diff(vault_path, args.source_id)
+        if diff is None:
+            print(f"No clinical_note found for source_id {args.source_id!r}.")   # ILB
+            return
+        if not diff:
+            print(f"source_id {args.source_id}: draft == attested (no clinician edits).")  # ILB
+            return
+        # ⚠ PHI SURFACE — the raw diff goes to STDOUT ONLY. It is NEVER written to a log / audit /
+        # mutation trail / file (the arc's one authorized-PHI on-box surface; ephemeral).
+        print(diff)
+        return
+
+    print("Usage: alfred scribe notegen-feedback {status [--json] | diff <source_id>}")
+    sys.exit(1)
 
 
 def _cmd_scribe_notegen_profile(args: argparse.Namespace) -> None:
@@ -5184,6 +5257,20 @@ def build_parser() -> argparse.ArgumentParser:
     ngp_sub.add_parser(
         "show", help="Show the active profile (highest valid version, else the built-in default) + its "
                      "sha256 display fingerprint + an on-disk-canonical self-check")
+    # #14e — the note-gen feedback read surfaces (status readout + on-box raw-diff).
+    scribe_ngf = scribe_sub.add_parser(
+        "notegen-feedback",
+        help="#14 note-gen edit-diff feedback: `status` (PHI-free readout) / `diff <source_id>` (⚠ "
+             "PHI-BEARING raw draft→attested diff, on-box + stdout-only)")
+    ngf_sub = scribe_ngf.add_subparsers(dest="notegen_feedback_cmd")
+    ngf_status = ngf_sub.add_parser(
+        "status", help="PHI-FREE aggregate: per-section edit rates, median net word delta, grounding-"
+                       "reason FP ranking, high-modification encounters by opaque source_id")
+    ngf_status.add_argument("--json", action="store_true", help="JSON output")
+    ngf_diff = ngf_sub.add_parser(
+        "diff", help="⚠ PHI SURFACE — recompute the raw draft→attested diff ON-BOX for one encounter "
+                     "(stdout-only, ephemeral, never persisted/egressed)")
+    ngf_diff.add_argument("source_id", help="The opaque encounter source_id (from `status`)")
     # P4-5 — voice-preset management (local file ops under scribe.diarize.enrollment_dir).
     scribe_presets = scribe_sub.add_parser(
         "presets", help="Manage voice-enrollment presets (list / audit / delete)",

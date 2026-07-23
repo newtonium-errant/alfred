@@ -31,7 +31,9 @@ the retention-prune coverage with it) in a later slice.
 from __future__ import annotations
 
 import difflib
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -321,3 +323,101 @@ def record_notegen_edit_outcome(
         log.warning(
             "scribe.notegen_feedback.capture_error", source_id=source_id,
             detail="notegen_edit capture failed — SWALLOWED (attestation unaffected)")
+
+
+# ===========================================================================
+# #14e-i — the read surfaces (Part A status readout + Part B on-box raw diff)
+# ===========================================================================
+
+def read_notegen_edit_rows(enrollment_dir: Any) -> list[dict]:
+    """Read all ``notegen_edit`` rows from the shared capture sink. PHI-FREE (the rows are the closed
+    frozenset of counts/enums). Tolerant: unset/absent/torn → the rows read so far (a corrupt sink never
+    raises into the read-only readout)."""
+    if not str(enrollment_dir or ""):
+        return []
+    from alfred.scribe.enroll_learning import _capture_path
+    path = _capture_path(enrollment_dir)
+    rows: list[dict] = []
+    try:
+        if not path.is_file():
+            return []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    row = json.loads(s)
+                except Exception:  # noqa: BLE001 — a torn line is skipped, not fatal
+                    continue
+                if isinstance(row, dict) and row.get("kind") == KIND_NOTEGEN_EDIT:
+                    rows.append(row)
+    except Exception:  # noqa: BLE001 — a corrupt/unreadable sink must never crash the readout
+        return rows
+    return rows
+
+
+def aggregate_feedback(rows: list[dict]) -> dict:
+    """Aggregate ``notegen_edit`` rows into the PHI-FREE Part-A readout: per-section add/remove/modify/
+    keep totals, the median ``net_word_delta``, the grounding-reason FP RANKING (per reason kept vs
+    removed → a high kept-rate = "the clinician kept the flagged claim → the flag is a tune-down
+    candidate"), and the ``high_modification`` encounter list BY OPAQUE ``source_id``. Counts / enums /
+    opaque ids ONLY — no claim text ever leaves the sink."""
+    import statistics
+    n = len(rows)
+    sections = {sec: {k: 0 for k in _SECTION_COUNT_FIELDS} for sec in SOAP_SECTIONS}
+    net_word_deltas: list[int] = []
+    survival: dict[str, dict[str, int]] = {}
+    high_mod: list[str] = []
+    for row in rows:
+        for sec in SOAP_SECTIONS:
+            sc = (row.get("sections") or {}).get(sec) or {}
+            for k in _SECTION_COUNT_FIELDS:
+                sections[sec][k] += int(sc.get(k, 0) or 0)
+        totals = row.get("totals") or {}
+        if isinstance(totals.get("net_word_delta"), int):
+            net_word_deltas.append(totals["net_word_delta"])
+        for reason, sub in (row.get("flag_survival") or {}).items():
+            b = survival.setdefault(str(reason), {"removed": 0, "kept": 0})
+            b["removed"] += int((sub or {}).get("removed", 0) or 0)
+            b["kept"] += int((sub or {}).get("kept", 0) or 0)
+        if row.get("high_modification") and row.get("source_id"):
+            high_mod.append(str(row["source_id"]))
+    fp_ranking = []
+    for reason, b in survival.items():
+        total = b["removed"] + b["kept"]
+        fp_ranking.append({
+            "reason": reason, "kept": b["kept"], "removed": b["removed"],
+            "kept_rate": (b["kept"] / total if total else 0.0)})
+    # highest kept-rate first (the strongest FP / tune-down candidate), then by volume.
+    fp_ranking.sort(key=lambda r: (-r["kept_rate"], -(r["kept"] + r["removed"])))
+    return {
+        "attests": n,
+        "sections": sections,
+        "median_net_word_delta": statistics.median(net_word_deltas) if net_word_deltas else 0,
+        "flag_survival": survival,
+        "fp_ranking": fp_ranking,
+        "high_modification_source_ids": sorted(set(high_mod)),
+    }
+
+
+def recompute_raw_diff(vault_path: Any, source_id: str) -> str | None:
+    """Part B — recompute the raw draft→attested unified diff ON-BOX from vault records (the note's
+    ``draft_original`` frontmatter vs its attested body). Returns the diff text (``""`` when draft ==
+    attested), or ``None`` when no clinical_note matches ``source_id``.
+
+    ⚠ PHI-BEARING — the diff carries the clinician's raw edits (full PHI). The CALLER displays it to
+    STDOUT ONLY: it is NEVER persisted, logged, audited, or egressed (the arc's one authorized-PHI
+    on-box surface, ephemeral). This function itself only READS vault files + returns the string; it
+    writes nothing."""
+    from alfred.scribe.retention import resolve_note_paths
+    import frontmatter
+    matches, _malformed = resolve_note_paths(Path(vault_path), source_id)
+    if not matches:
+        return None
+    post = frontmatter.load(str(sorted(matches)[-1]))   # latest (an amended supersede shares source_id)
+    draft = str(post.metadata.get("draft_original") or "")
+    attested = post.content or ""
+    return "\n".join(difflib.unified_diff(
+        draft.splitlines(), attested.splitlines(),
+        fromfile="draft_original", tofile="attested_body", lineterm=""))
