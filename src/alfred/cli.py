@@ -2745,6 +2745,7 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     from alfred.scribe.config import load_from_unified as load_scribe_config
     from alfred.scribe.attest import attest as scribe_attest
+    from alfred.scribe.negation_suppression import resolve_candidates_dir
     from alfred.sovereign import (
         SovereignBoundaryError,
         install_sovereign_http_guard,
@@ -2830,6 +2831,11 @@ def cmd_scribe(args: argparse.Namespace) -> None:
                 # P4-5 — the voice-enrollment capture sink (self-correcting attest_outcome
                 # rows). Empty (dormant enrollment) → the attest capture is a no-op.
                 enrollment_dir=cfg.diarize.enrollment_dir,
+                # #26 — the negation-paraphrase self-correcting spool dir (<STAYC_DATA>/scribe/).
+                # The attest twin records the PHI-FREE kept boolean; the whole loop rides this
+                # single kwarg (a dropped kwarg → the loop silently stops accumulating, so a test
+                # drives the real CLI path to pin it). Derived per-instance from input_dir.
+                negation_candidates_dir=resolve_candidates_dir(cfg),
                 # #11 — the medico-legal event store (preflight + attest.recorded [D] +
                 # attest.refused + the dual-write). None on a degraded non-clinical store.
                 events=events_arg,

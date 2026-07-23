@@ -113,6 +113,7 @@ def attest(
     override_reason: str | None = None,
     vault_audit_path: str | Path | None = None,
     enrollment_dir: str | Path | None = None,
+    negation_candidates_dir: str | Path | None = None,
     events: "ScribeEvents | None" = None,
 ) -> dict:
     """Attest a clinical_note — the ONLY sanctioned triad writer. Fail-closed.
@@ -432,6 +433,26 @@ def attest(
             )
     except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
         log.warning("scribe.enroll_learning.attest_capture_error", source_id=source_id)
+
+    # #26 self-correcting Part-1 CAPTURE for NEGATION paraphrases — the THIRD twin beside
+    # the inferred-dx (:406) and speaker (:424) captures. READ-ONLY, try-wrapped, fail-silent
+    # (a capture bug must NEVER alter/fail a medico-legal attestation). Records the PHI-FREE
+    # dismissal signal per negation_mismatch flag: kept = the flagged claim SURVIVED unchanged
+    # into the attested body (an implicit 'faithful paraphrase' verdict — the #26 correction
+    # vehicle; no attest UX change). The concept-PAIR half is captured at RENDER (the transcript
+    # side attest never loads); this side is PHI-free (ids + a boolean). No-op unless the spool
+    # dir is set. The attested body == rec["body"] (attest writes only the triad, never the body).
+    try:
+        if negation_candidates_dir:
+            from alfred.scribe.negation_suppression import record_negation_attest_outcome
+            record_negation_attest_outcome(
+                negation_candidates_dir,
+                grounding_flags=fm.get("grounding_flags"),
+                attested_body=str(rec.get("body") or ""),
+                source_id=source_id,
+            )
+    except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
+        log.warning("scribe.negation_suppression.attest_capture_error", source_id=source_id)
 
     return result
 

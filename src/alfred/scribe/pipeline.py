@@ -67,6 +67,10 @@ from alfred.scribe.grounding import verify as verify_grounding
 from alfred.scribe.identity import compute_encounter_id
 from alfred.scribe.inferred_dx import check_inferred_diagnoses
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
+from alfred.scribe.negation_suppression import (
+    capture_render_candidates,
+    resolve_candidates_dir,
+)
 from alfred.scribe.notegen import (
     ContextBudgetExceeded,
     StructuredNote,
@@ -228,6 +232,19 @@ def render_verified_note(
         grounding_flags=grounding_flag_count,
         inferred_diagnosis_flags=len(inferred_flags),
         speaker_attribution_flags=len(speaker_flags),
+    )
+    # #26 self-correcting Part-1 CAPTURE (1a) — the RENDER-time, PHI-BEARING half of the
+    # negation-paraphrase loop. Spools the (claim-negated-concept, cite-negated-concept)
+    # PAIR for each lexically-disjoint paraphrase candidate (a negation_mismatch flag whose
+    # cite ALSO negates) so morning-review can later approve a learned suppression (#26).
+    # Concept-SETS only, never raw text; RE-DERIVES grounding's (B) path from its own helpers
+    # so grounding.py stays byte-identical. Here at RENDER (not attest) because the cite
+    # concepts need the transcript, which is only in scope on this side of the split.
+    # SIDE-EFFECT-FREE + fail-silent by construction (mirrors the inferred-dx / speaker attest
+    # twins) — it writes to a separate spool and never touches the rendered note.
+    capture_render_candidates(
+        structured, transcript,
+        candidates_dir=resolve_candidates_dir(config), source_id=transcript.source_id,
     )
     body = render_soap(structured, title=title, grounding=grounding)  # render with THAT grounding
     # #12 slice 12d — the deterministic, LLM-free consent attestation line (§7.2). Composed HERE
