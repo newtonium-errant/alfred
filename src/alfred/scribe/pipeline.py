@@ -73,6 +73,7 @@ from alfred.scribe.negation_suppression import (
     resolve_candidates_dir,
 )
 from alfred.scribe.notegen_profile import resolve_active_profile
+from alfred.scribe.notegen_quality import QUALITY_REASON_PREFIX, check_note_quality
 from alfred.scribe.notegen import (
     ContextBudgetExceeded,
     StructuredNote,
@@ -137,6 +138,9 @@ class VerifiedNote:
 
     body: str
     grounding_flags: list[dict[str, Any]] = field(default_factory=list)
+    # #14c — the ADVISORY quality-pass flags, a SEPARATE list from grounding_flags (medico-legal ≠
+    # advisory; §4.1). Split by the ``quality_`` reason prefix in render_verified_note.
+    quality_flags: list[dict[str, Any]] = field(default_factory=list)
     flag_count: int = 0
     structured: StructuredNote | None = None
 
@@ -224,6 +228,20 @@ def render_verified_note(
             ),
         )
     grounding.flags.extend(speaker_flags)
+    # #14c — the deterministic post-note QUALITY pass (ADVISORY completeness/style vs the note_profile).
+    # Runs post-grounding, pre-render; NEVER mutates claims (flags only, mirrors grounding). Emits
+    # NOTE-LEVEL quality_* flags extended onto the result FOR RENDER (the single flags_for dispatch →
+    # the top-banner path, no render_soap change); SPLIT into the SEPARATE advisory quality_flags
+    # frontmatter list at the return (medico-legal grounding_flags ≠ advisory quality, §4.1). Profile
+    # via the TOTAL resolver (DEFAULT when absent/corrupt) → never crashes. ILB: the verdict is ALWAYS
+    # logged (flagged=0 ⇒ "quality pass: clean" — idle distinguishable from broken).
+    quality_flags = check_note_quality(structured, resolve_active_profile(config))
+    grounding.flags.extend(quality_flags)
+    log.info(
+        "scribe.notegen_quality.verdict",
+        source_id=transcript.source_id, flagged=len(quality_flags),
+        detail="quality pass: clean" if not quality_flags else "quality pass: advisory flag(s) raised",
+    )
     # #4 — RECONCILE the flag-count observability seam. verify_grounding already
     # emitted ``scribe.grounding.verified flagged=<grounding-only>`` BEFORE these
     # extends, so that line UNDER-reports the total (a note whose only flag is an
@@ -239,6 +257,7 @@ def render_verified_note(
         grounding_flags=grounding_flag_count,
         inferred_diagnosis_flags=len(inferred_flags),
         speaker_attribution_flags=len(speaker_flags),
+        quality_flags=len(quality_flags),
     )
     # #26 self-correcting Part-1 CAPTURE (1a) — the RENDER-time, PHI-BEARING half of the
     # negation-paraphrase loop. Spools the (claim-negated-concept, cite-negated-concept)
@@ -260,9 +279,14 @@ def render_verified_note(
     # (§7.3, no stored-then-mutated drift). No-op when no facade is threaded in (events=None).
     if events is not None:
         body = _prepend_consent_line(body, events.consent_line(transcript.source_id))
+    # SPLIT the unified flag list into the two frontmatter lists by the quality_ reason prefix
+    # (§4.1 — advisory quality_flags stay OUT of the medico-legal grounding_flags; a disjointness pin
+    # guarantees no grounding reason ever starts with quality_, so the partition is exact).
+    all_flags = grounding.metadata
     return VerifiedNote(
         body=body,
-        grounding_flags=grounding.metadata,
+        grounding_flags=[f for f in all_flags if not f["reason"].startswith(QUALITY_REASON_PREFIX)],
+        quality_flags=[f for f in all_flags if f["reason"].startswith(QUALITY_REASON_PREFIX)],
         flag_count=len(grounding.flags),
         structured=structured,
     )
@@ -429,6 +453,9 @@ def _create_ai_draft(
         "source_id": source_id,
         "drafted_by": SCRIBE_DRAFTER_IDENTITY,
         "grounding_flags": vnote.grounding_flags,
+        # #14c — the ADVISORY quality-pass flags, refreshed each regen exactly like grounding_flags
+        # (a DRAFT_EDIT_FIELD — writable while ai_draft, sealed at attest). SEPARATE from grounding_flags.
+        "quality_flags": vnote.quality_flags,
         # P3-b3 retain-the-diff: the AI's generated body, written INTO the note
         # (frontmatter — NOT the body, so it doesn't affect the clobber-detect
         # body-sha). At create, body == draft_original; they diverge only when a
@@ -522,13 +549,15 @@ def _update_or_refuse_ai_draft(
     # be attested as complete. This rides the SINGLE body_replace choke and only
     # runs on a LIVE ai_draft (a sealed note raised earlier in this function), so
     # it NEVER hits the SEALED-deny branch. Gated by the stayc_clinical DRAFT_EDIT
-    # carve-outs (all three fields are DRAFT_EDIT_FIELDS).
+    # carve-outs (all FOUR fields are DRAFT_EDIT_FIELDS — #14c added quality_flags,
+    # refreshed each regen like grounding_flags).
     vault_edit(
         vault_path,
         rel_path,
         body_replace=vnote.body,
         set_fields={
             "grounding_flags": vnote.grounding_flags,
+            "quality_flags": vnote.quality_flags,   # #14c — advisory, refreshed each regen
             "draft_original": vnote.body,
             "encounter_completeness": regressed(
                 datetime.now(timezone.utc), reason="body regenerated — awaiting re-finalize",

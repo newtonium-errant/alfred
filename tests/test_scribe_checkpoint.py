@@ -610,9 +610,12 @@ def test_grounding_flag_count_reconciled_after_inferred_dx(tmp_path, monkeypatch
     gver = [c for c in caps if c.get("event") == "scribe.grounding.verified"]
     fin = [c for c in caps if c.get("event") == "scribe.grounding.flags_finalized"]
     assert gver and gver[0]["flagged"] == 0                     # grounding-only UNDER-reports
-    assert fin and fin[0]["total_flags"] == 1                   # reconciled TRUE total
+    # #14c — empty required S+P sections (2 required-empty) + assessment-with-findings-no-plan (1) raise
+    # 3 note-level quality flags; the reconciled total now includes them. total = 1 inferred + 3 quality.
+    assert fin and fin[0]["total_flags"] == 4                   # reconciled TRUE total (grounding+inferred+quality)
     assert fin[0]["inferred_diagnosis_flags"] == 1 and fin[0]["grounding_flags"] == 0
-    assert vnote.flag_count == 1                                # frontmatter/flag_count already correct
+    assert fin[0]["quality_flags"] == 3
+    assert vnote.flag_count == 4
 
 
 def test_run_sweep_drives_checkpoint_end_to_end(tmp_path, monkeypatch):

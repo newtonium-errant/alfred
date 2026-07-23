@@ -90,6 +90,9 @@ from alfred.scribe.notegen import (
     COLLATERAL_ATTRIBUTION,
     GROUNDING_UNVERIFIED,
     INFERRED_DIAGNOSIS,
+    QUALITY_ASSESSMENT_NO_PLAN,
+    QUALITY_REQUIRED_SECTION_EMPTY,
+    QUALITY_VERBOSE,
     SOAP_SECTIONS,
     SPEAKER_MISMATCH,
     SPEAKER_UNVERIFIED,
@@ -132,12 +135,20 @@ class NegationSuppressionStore(Protocol):
 # sides in lockstep. ``attribution_unverified`` is the NOTE-LEVEL banner reason:
 # it is mapped here too so ``flags_for("note", -1)`` renders it via the SAME
 # single dispatch as every per-claim flag.
+#
+# #14c — the ``quality_*`` NOTE-LEVEL advisory reasons are registered here too (PURELY ADDITIVE to the
+# render-dispatch dict — grounding's DETECTION logic (verify / the #24/#26 negation checks) is
+# byte-UNCHANGED; this dict only maps a reason → its inline ⚠ for render). They render at the top
+# banner via the SAME ``flags_for("note", -1)`` path.
 _REASON_INLINE_LITERAL: dict[str, str] = {
     "inferred_diagnosis": INFERRED_DIAGNOSIS,
     "speaker_mismatch": SPEAKER_MISMATCH,
     "speaker_unverified": SPEAKER_UNVERIFIED,
     "collateral_attribution": COLLATERAL_ATTRIBUTION,
     "attribution_unverified": ATTRIBUTION_UNVERIFIED,
+    "quality_required_section_empty": QUALITY_REQUIRED_SECTION_EMPTY,
+    "quality_verbose": QUALITY_VERBOSE,
+    "quality_assessment_no_plan": QUALITY_ASSESSMENT_NO_PLAN,
 }
 
 

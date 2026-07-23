@@ -1733,7 +1733,10 @@ STAYC_CLINICAL_ATTEST_FIELDS: set[str] = {"attested_by", "attested_at", "status"
 STAYC_CLINICAL_DRAFT_EDIT_FIELDS: frozenset[str] = frozenset(
     # "encounter_completeness" == scribe.completeness_marker.MARKER_FIELD (#58 —
     # scope.py can't import scribe; drift-guarded by a pin test).
-    {"grounding_flags", "draft_original", "encounter_completeness"}
+    # "quality_flags" (#14c) — the ADVISORY post-note quality-pass flags, refreshed each regen
+    # exactly like grounding_flags; writable while ai_draft, SEALED at attest (the anti-spoliation
+    # invariant is untouched — draft_original + the attested body are unaffected).
+    {"grounding_flags", "quality_flags", "draft_original", "encounter_completeness"}
 )
 
 

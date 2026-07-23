@@ -427,8 +427,10 @@ def test_draft_edit_fields_matrix_pin():
     # the daemon stamps at READY / clears on regen / self-heals — both are
     # DRAFT_EDIT_FIELDS (writable while ai_draft, SEALED at attest), NOT
     # ATTEST_FIELDS (attest writes ONLY the triad, so the marker is frozen at attest).
+    # #14c widened this by ONE — quality_flags (advisory, refreshed each regen like grounding_flags).
+    # The pin stays EXACT (not "any field") so any OTHER field sneaking in still reddens.
     assert STAYC_CLINICAL_DRAFT_EDIT_FIELDS == frozenset(
-        {"grounding_flags", "draft_original", "encounter_completeness"}
+        {"grounding_flags", "quality_flags", "draft_original", "encounter_completeness"}
     )
     # #58 — encounter_completeness is a DRAFT_EDIT field, NEVER an ATTEST field.
     assert "encounter_completeness" in STAYC_CLINICAL_DRAFT_EDIT_FIELDS

@@ -134,6 +134,15 @@ ATTRIBUTION_UNVERIFIED = (
     "this encounter; treat all attribution as unverified"
 )
 
+# #14c — the post-note QUALITY-pass inline flags (ADVISORY completeness/style vs the note_profile —
+# distinct from the medico-legal grounding/attribution flags above). Each is a NOTE-LEVEL banner
+# (section "note", claim_index -1), dispatched by GroundingResult.flags_for on the ``quality_*`` reason
+# (see grounding._REASON_INLINE_LITERAL + notegen_quality.py). NEVER gates note-gen; the clinician
+# decides. Worded advisory ("consider" / "confirm"), never as a faithfulness assertion.
+QUALITY_REQUIRED_SECTION_EMPTY = "⚠ QUALITY — a profile-required section is empty; complete or confirm"
+QUALITY_VERBOSE = "⚠ QUALITY — note is over the succinctness target; consider tightening (advisory)"
+QUALITY_ASSESSMENT_NO_PLAN = "⚠ QUALITY — assessment has findings but no plan; add a plan or confirm"
+
 # The SOAP sections + their markdown headings (order is the contract).
 SOAP_SECTIONS: tuple[str, ...] = ("subjective", "objective", "assessment", "plan")
 _SECTION_HEADINGS = {

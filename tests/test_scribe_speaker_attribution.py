@@ -541,8 +541,11 @@ def test_flags_finalized_log_carries_speaker_attribution_count(monkeypatch):
     assert len(fin) == 1
     assert fin[0]["speaker_attribution_flags"] == 1
     assert fin[0]["grounding_flags"] == 0 and fin[0]["inferred_diagnosis_flags"] == 0
-    assert fin[0]["total_flags"] == 1
-    assert vnote.flag_count == 1
+    # #14c — the empty required S/A/P sections raise 3 note-level quality flags; the flags_finalized
+    # seam now carries them too. total = 1 speaker + 3 quality.
+    assert fin[0]["quality_flags"] == 3
+    assert fin[0]["total_flags"] == 4
+    assert vnote.flag_count == 4
     assert SPEAKER_MISMATCH in vnote.body                    # rendered inline
 
 

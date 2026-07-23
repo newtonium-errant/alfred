@@ -123,8 +123,10 @@ def test_choke_verifies_the_same_object_it_renders(monkeypatch):
     # verify + render ran on the SAME structured object, verify BEFORE render.
     assert seen["verified"] == seen["rendered"]
     assert seen["grounding_present"] is True
-    # the dose flip was flagged → grounding actually ran on this note.
-    assert vnote.flag_count == 1
+    # the dose flip was flagged → grounding actually ran on this note. (#14c: the note-level quality
+    # pass may add its own flags for empty required sections — assert the GROUNDING list specifically,
+    # which stays exactly the one dose flag; quality flags live in the separate quality_flags list.)
+    assert len(vnote.grounding_flags) == 1
     assert GROUNDING_UNVERIFIED in vnote.body
 
 
