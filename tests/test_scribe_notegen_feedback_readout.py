@@ -95,7 +95,8 @@ def test_aggregate_is_phi_free():
     agg = nf.aggregate_feedback([_row("enc-a", high_modification=True,
                                       flag_survival={"negation_mismatch": {"removed": 1, "kept": 0}})])
     assert set(agg) == {"attests", "sections", "median_net_word_delta", "flag_survival",
-                        "fp_ranking", "high_modification_source_ids"}
+                        "fp_ranking", "quality_survival", "quality_ranking",
+                        "high_modification_source_ids"}   # #14e-ii added the quality-survival keys
     assert agg["high_modification_source_ids"] == ["enc-a"]         # opaque encounter id only
     assert all(r["reason"] == "negation_mismatch" for r in agg["fp_ranking"])   # reason ENUM only
     assert set(agg["flag_survival"]) == {"negation_mismatch"}       # keys are reason enums

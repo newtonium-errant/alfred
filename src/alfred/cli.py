@@ -2789,6 +2789,10 @@ def cmd_scribe(args: argparse.Namespace) -> None:
         install_sovereign_http_guard()
 
     cfg = load_scribe_config(raw)
+    # #14e-ii — the active note_profile (TOTAL resolver: DEFAULT when absent/corrupt, never raises) —
+    # its target + required sections drive the quality-flag survival re-check at attest.
+    from alfred.scribe.notegen_profile import resolve_active_profile
+    _active_profile = resolve_active_profile(cfg)
     vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
     log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
     audit_path = log_dir / "clinical_attest_audit.jsonl"
@@ -2848,6 +2852,14 @@ def cmd_scribe(args: argparse.Namespace) -> None:
                 # single kwarg (a dropped kwarg → the loop silently stops accumulating, so a test
                 # drives the real CLI path to pin it). Derived per-instance from input_dir.
                 negation_candidates_dir=resolve_candidates_dir(cfg),
+                # #14e-ii — the active profile's succinctness target + required sections drive the
+                # quality-flag SURVIVAL re-check at attest (acted vs ignored). Resolved via the TOTAL
+                # resolver (DEFAULT when absent/corrupt) → never fails. Current-target-with-drift is
+                # fine for MVP (the signal is advisory; signal-I's draft-time version is the boarded
+                # precision path).
+                quality_succinctness_target=_active_profile.succinctness_target_words_per_claim,
+                quality_required_sections=frozenset(
+                    s.key for s in _active_profile.sections if s.required),
                 # #11 — the medico-legal event store (preflight + attest.recorded [D] +
                 # attest.refused + the dual-write). None on a degraded non-clinical store.
                 events=events_arg,
@@ -3989,6 +4001,14 @@ def _cmd_scribe_notegen_feedback(args: argparse.Namespace) -> None:
                       f"({r['kept_rate']:.0%})")
         else:
             print("  Grounding-reason FP ranking: none (no flagged claims surveyed yet).")  # ILB
+        # #14e-ii — the quality-check tune-down ranking (ignored = clinician left the advisory flag).
+        if agg.get("quality_ranking"):
+            print("  Quality-check ranking (high ignored-rate = tune-down candidate):")
+            for r in agg["quality_ranking"]:
+                print(f"    {r['reason']}: ignored {r['ignored']}/{r['acted'] + r['ignored']} "
+                      f"({r['ignored_rate']:.0%})")
+        else:
+            print("  Quality-check ranking: none (no quality flags surveyed yet).")  # ILB
         print("  Per-section edits (added / removed / modified / kept):")
         for sec in ("subjective", "objective", "assessment", "plan"):
             s = agg["sections"][sec]

@@ -114,6 +114,8 @@ def attest(
     vault_audit_path: str | Path | None = None,
     enrollment_dir: str | Path | None = None,
     negation_candidates_dir: str | Path | None = None,
+    quality_succinctness_target: float | None = None,
+    quality_required_sections=None,
     events: "ScribeEvents | None" = None,
 ) -> dict:
     """Attest a clinical_note — the ONLY sanctioned triad writer. Fail-closed.
@@ -460,6 +462,9 @@ def attest(
     # claim text). Called UNCONDITIONALLY (NOT gated on enrollment_dir here) so a DORMANT sink emits an
     # observable one-time signal rather than silently capturing nothing (the intentionally-left-blank
     # trap). Reads draft_original + body + grounding_flags (as the twins do) + the profile id/version.
+    # #14e-ii — ALSO drives quality_survival: the draft-time quality_flags + the active profile's
+    # target + required-sections (threaded by cmd_scribe from resolve_active_profile) re-check whether
+    # each advisory quality flag was ACTED-on or IGNORED in the attested body. Same SWALLOWED belt.
     try:
         from alfred.scribe.notegen_feedback import record_notegen_edit_outcome
         record_notegen_edit_outcome(
@@ -470,6 +475,9 @@ def attest(
             template_id=fm.get("note_profile_id"),
             template_version=fm.get("note_profile_version"),
             source_id=source_id,
+            quality_flags=fm.get("quality_flags"),
+            succinctness_target=quality_succinctness_target,
+            required_sections=quality_required_sections,
         )
     except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
         log.warning("scribe.notegen_feedback.attest_capture_error", source_id=source_id)

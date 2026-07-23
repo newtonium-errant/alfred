@@ -41,6 +41,12 @@ import structlog
 from alfred.scribe.enroll_learning import KIND_NOTEGEN_EDIT
 from alfred.scribe.grounding import _normalize
 from alfred.scribe.notegen import SOAP_SECTIONS, _SECTION_HEADINGS
+from alfred.scribe.notegen_quality import (
+    QUALITY_ASSESSMENT_NO_PLAN_REASON,
+    QUALITY_REASON_PREFIX,
+    QUALITY_REQUIRED_SECTION_EMPTY_REASON,
+    QUALITY_VERBOSE_REASON,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -70,10 +76,14 @@ _SECTION_COUNT_FIELDS = frozenset({
 _TOTAL_FIELDS = _SECTION_COUNT_FIELDS | {"net_word_delta"}
 # flag_survival inner (H): per grounding reason enum → {removed, kept} int counts.
 _SURVIVAL_FIELDS = frozenset({"removed", "kept"})
+# #14e-ii quality_survival inner: per quality reason enum → {acted, ignored} int counts (did the
+# clinician ACT on the advisory quality flag — the check STOPPED firing on the attested body — or
+# IGNORE it — it STILL fires ⇒ a tune-down candidate). PHI-free (reason enums + counts).
+_QUALITY_SURVIVAL_FIELDS = frozenset({"acted", "ignored"})
 # The whole row.
 _ROW_FIELDS = frozenset({
     "kind", "ts", "source_id", "template_id", "template_version",
-    "sections", "totals", "flag_survival", "high_modification",
+    "sections", "totals", "flag_survival", "quality_survival", "high_modification",
 })
 # The ONLY string-valued top-level fields — the widening allowlist. Any OTHER string leaf anywhere in
 # the row is a claim-text leak and MUST fail the pin. (flag_survival reason KEYS are enum strings —
@@ -201,13 +211,62 @@ def _coerce_version(value: Any) -> int:
         return DEFAULT_TEMPLATE_VERSION
 
 
+def _recheck_quality_reasons(
+    attested_body: str, succinctness_target: Any, required_sections: Any,
+) -> set[str]:
+    """#14e-ii — re-run the 3 quality checks against the ATTESTED body's parsed sections → the set of
+    ``quality_*`` reasons that STILL fire. Mirrors ``notegen_quality.check_note_quality`` but over the
+    parsed body (attest never holds the StructuredNote). required-section-empty + assessment-no-plan are
+    profile-INDEPENDENT (only the required-set names which sections to check); ONLY verbose needs the
+    target. Deterministic, no LLM."""
+    secs = _parse_sections(str(attested_body or ""))
+    required = set(required_sections or ())
+    reasons: set[str] = set()
+    for sec in required:
+        if sec in SOAP_SECTIONS and not secs.get(sec):
+            reasons.add(QUALITY_REQUIRED_SECTION_EMPTY_REASON)
+    if secs.get("assessment") and not secs.get("plan"):
+        reasons.add(QUALITY_ASSESSMENT_NO_PLAN_REASON)
+    total_claims = sum(len(secs.get(s, [])) for s in SOAP_SECTIONS)
+    if total_claims and isinstance(succinctness_target, (int, float)) and succinctness_target:
+        total_words = sum(len(c.split()) for s in SOAP_SECTIONS for c in secs.get(s, []))
+        if total_words / total_claims > succinctness_target:
+            reasons.add(QUALITY_VERBOSE_REASON)
+    return reasons
+
+
+def _quality_survival(
+    quality_flags: Any, attested_body: str, succinctness_target: Any, required_sections: Any,
+) -> dict[str, dict[str, int]]:
+    """Per DRAFT-time ``quality_*`` reason → ``{acted, ignored}`` (§4.3). For each distinct quality
+    reason the DRAFT carried, re-check whether it STILL fires on the attested body: STILL fires ⇒
+    ``ignored`` (the clinician left it → a tune-down candidate); STOPPED ⇒ ``acted`` (they filled the
+    section / cut / added a plan → the check was useful). PHI-FREE (reason enums + a per-attest 0/1)."""
+    if not isinstance(quality_flags, list):
+        return {}
+    draft_reasons = {
+        str(f.get("reason")) for f in quality_flags
+        if isinstance(f, dict) and str(f.get("reason", "")).startswith(QUALITY_REASON_PREFIX)}
+    if not draft_reasons:
+        return {}
+    still = _recheck_quality_reasons(attested_body, succinctness_target, required_sections)
+    return {
+        reason: {"acted": 0 if reason in still else 1, "ignored": 1 if reason in still else 0}
+        for reason in draft_reasons}
+
+
 def compute_notegen_edit_row(
     *, draft_original: str, attested_body: str, grounding_flags: Any,
     template_id: Any, template_version: Any, source_id: str,
+    quality_flags: Any = None, succinctness_target: Any = None, required_sections: Any = None,
 ) -> dict[str, Any]:
     """Build the ONE PHI-FREE ``notegen_edit`` row from the draft→attested diff. PURE + deterministic
     (no I/O, no ``ts`` — the writer stamps that). Every value is a count / delta / enum / bool; no
-    claim text ever. Guaranteed to satisfy :func:`phi_free_violations` (a test pins compute output)."""
+    claim text ever. Guaranteed to satisfy :func:`phi_free_violations` (a test pins compute output).
+
+    #14e-ii: ``quality_flags`` (the note's draft-time advisory quality flags) + ``succinctness_target``
+    + ``required_sections`` (from the active profile at attest) drive ``quality_survival`` — the
+    quality-check self-correcting signal (acted vs ignored per reason)."""
     draft_secs = _parse_sections(str(draft_original or ""))
     att_secs = _parse_sections(str(attested_body or ""))
     sections: dict[str, dict[str, int]] = {}
@@ -228,6 +287,8 @@ def compute_notegen_edit_row(
         "sections": sections,
         "totals": totals,
         "flag_survival": _flag_survival(grounding_flags, attested_body),
+        "quality_survival": _quality_survival(
+            quality_flags, attested_body, succinctness_target, required_sections),
         "high_modification": bool(high_mod),
     }
 
@@ -258,18 +319,25 @@ def phi_free_violations(row: dict[str, Any]) -> list[str]:
                 v.append(f"unknown section {sec!r}")
             v += _count_violations(counts, _SECTION_COUNT_FIELDS, f"sections.{sec}")
     v += _count_violations(row.get("totals"), _TOTAL_FIELDS, "totals")
-    fs = row.get("flag_survival")
-    if not isinstance(fs, dict):
-        v.append("flag_survival must be a dict")
-    else:
-        for reason, sub in fs.items():
-            if not isinstance(reason, str):
-                v.append("flag_survival reason key must be a str enum")
-            if not isinstance(sub, dict) or set(sub) != set(_SURVIVAL_FIELDS):
-                v.append(f"flag_survival[{reason!r}] must be exactly {{removed, kept}}")
-            elif not all(_is_int(x) for x in sub.values()):
-                v.append(f"flag_survival[{reason!r}] values must be int")
+    v += _survival_violations(row.get("flag_survival"), _SURVIVAL_FIELDS, "flag_survival")
+    v += _survival_violations(row.get("quality_survival"), _QUALITY_SURVIVAL_FIELDS, "quality_survival")
     return v
+
+
+def _survival_violations(block: Any, inner: frozenset, label: str) -> list[str]:
+    """A survival sub-map ``{reason_enum: {<inner fields>: int}}`` — reason KEYS are enum strings; the
+    values are exactly the inner int-dict. A claim-text string as a key OR value ⇒ a violation."""
+    if not isinstance(block, dict):
+        return [f"{label} must be a dict"]
+    out: list[str] = []
+    for reason, sub in block.items():
+        if not isinstance(reason, str):
+            out.append(f"{label} reason key must be a str enum")
+        if not isinstance(sub, dict) or set(sub) != set(inner):
+            out.append(f"{label}[{reason!r}] must be exactly {set(inner)}")
+        elif not all(_is_int(x) for x in sub.values()):
+            out.append(f"{label}[{reason!r}] values must be int")
+    return out
 
 
 def _is_int(x: Any) -> bool:
@@ -291,6 +359,7 @@ def _count_violations(block: Any, allowed: frozenset, label: str) -> list[str]:
 def record_notegen_edit_outcome(
     *, enrollment_dir: Any, grounding_flags: Any, draft_original: str, attested_body: str,
     template_id: Any = None, template_version: Any = None, source_id: str,
+    quality_flags: Any = None, succinctness_target: Any = None, required_sections: Any = None,
 ) -> None:
     """#14 self-correcting Part-1 CAPTURE at attest — the FOURTH read-only, fail-silent sibling.
 
@@ -316,7 +385,9 @@ def record_notegen_edit_outcome(
         row = compute_notegen_edit_row(
             draft_original=draft_original, attested_body=attested_body,
             grounding_flags=grounding_flags, template_id=template_id,
-            template_version=template_version, source_id=source_id)
+            template_version=template_version, source_id=source_id,
+            quality_flags=quality_flags, succinctness_target=succinctness_target,
+            required_sections=required_sections)
         from alfred.scribe import enroll_learning
         enroll_learning.record_notegen_edit(enrollment_dir, row=row)
     except Exception:  # noqa: BLE001 — capture must NEVER affect a valid attest
@@ -368,6 +439,7 @@ def aggregate_feedback(rows: list[dict]) -> dict:
     sections = {sec: {k: 0 for k in _SECTION_COUNT_FIELDS} for sec in SOAP_SECTIONS}
     net_word_deltas: list[int] = []
     survival: dict[str, dict[str, int]] = {}
+    quality: dict[str, dict[str, int]] = {}   # #14e-ii — {reason: {acted, ignored}}
     high_mod: list[str] = []
     for row in rows:
         for sec in SOAP_SECTIONS:
@@ -381,6 +453,10 @@ def aggregate_feedback(rows: list[dict]) -> dict:
             b = survival.setdefault(str(reason), {"removed": 0, "kept": 0})
             b["removed"] += int((sub or {}).get("removed", 0) or 0)
             b["kept"] += int((sub or {}).get("kept", 0) or 0)
+        for reason, sub in (row.get("quality_survival") or {}).items():
+            b = quality.setdefault(str(reason), {"acted": 0, "ignored": 0})
+            b["acted"] += int((sub or {}).get("acted", 0) or 0)
+            b["ignored"] += int((sub or {}).get("ignored", 0) or 0)
         if row.get("high_modification") and row.get("source_id"):
             high_mod.append(str(row["source_id"]))
     fp_ranking = []
@@ -391,12 +467,23 @@ def aggregate_feedback(rows: list[dict]) -> dict:
             "kept_rate": (b["kept"] / total if total else 0.0)})
     # highest kept-rate first (the strongest FP / tune-down candidate), then by volume.
     fp_ranking.sort(key=lambda r: (-r["kept_rate"], -(r["kept"] + r["removed"])))
+    # #14e-ii — the quality-check tune-down ranking: highest IGNORED-rate first (a quality check the
+    # clinician consistently leaves in place = a candidate to tune down / drop), then by volume.
+    quality_ranking = []
+    for reason, b in quality.items():
+        total = b["acted"] + b["ignored"]
+        quality_ranking.append({
+            "reason": reason, "acted": b["acted"], "ignored": b["ignored"],
+            "ignored_rate": (b["ignored"] / total if total else 0.0)})
+    quality_ranking.sort(key=lambda r: (-r["ignored_rate"], -(r["acted"] + r["ignored"])))
     return {
         "attests": n,
         "sections": sections,
         "median_net_word_delta": statistics.median(net_word_deltas) if net_word_deltas else 0,
         "flag_survival": survival,
         "fp_ranking": fp_ranking,
+        "quality_survival": quality,
+        "quality_ranking": quality_ranking,
         "high_modification_source_ids": sorted(set(high_mod)),
     }
 
