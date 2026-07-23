@@ -262,6 +262,29 @@ async def test_tier_done_future_date_rejected(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tier_done_crash_returns_internal_error(tmp_path, monkeypatch):
+    """A crash in the in-process mutator surfaces as the documented,
+    pinned ``internal_error`` kind (NOT the misnamed 'subprocess_error' —
+    there is no subprocess) + a human-readable ``error``."""
+    config = _salem_config(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("disk on fire")
+
+    # The dispatcher lazy-imports mark_t3_done from the tier module at
+    # call time, so patching the source binds through to the dispatch.
+    monkeypatch.setattr("alfred.tier.daily_curation.mark_t3_done", _boom)
+
+    out = await _call(
+        config, _session(), tool_name="tier_done",
+        tool_input={"item": "rake leaves"},
+    )
+    parsed = json.loads(out)
+    assert parsed["kind"] == "internal_error"
+    assert "crashed" in parsed.get("error", "")
+
+
+@pytest.mark.asyncio
 async def test_tier_undone_reverses(tmp_path):
     config = _salem_config(tmp_path)
     vault = Path(config.vault.path)

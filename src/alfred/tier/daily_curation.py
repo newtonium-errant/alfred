@@ -758,6 +758,15 @@ TIER_DONE_KIND_FUTURE_DATE_REJECTED = "future_date_rejected"
 # ``ambiguous_item`` / ``unknown_item`` are shared with the done path.
 TIER_UNDONE_KIND_UNMARKED = "unmarked"
 TIER_UNDONE_KIND_NOT_MARKED = "not_marked"
+# Dispatcher-only kind — the generic-failure signal. The mutators
+# themselves NEVER emit this (they return a typed :class:`TierDoneResult`
+# or raise); it is emitted by the talker's ``_dispatch_tier_done`` except
+# handler when the in-process call itself crashes (unexpected exception).
+# Mirrors ``routine.cli``'s dispatcher-only ``DONE_KIND_SUBPROCESS_ERROR``,
+# but named for the IN-PROCESS reality (there is no subprocess). The
+# payload keeps a human-readable ``error`` alongside the kind. Documented
+# + pinned so the vault-talker SKILL quotes the full kind set.
+TIER_DONE_KIND_INTERNAL_ERROR = "internal_error"
 
 
 @dataclass
@@ -1037,6 +1046,7 @@ __all__ = [
     "TIER_DONE_KIND_AMBIGUOUS_ITEM",
     "TIER_DONE_KIND_FUTURE_DATE_REJECTED",
     "TIER_DONE_KIND_IDEMPOTENT_NOOP",
+    "TIER_DONE_KIND_INTERNAL_ERROR",
     "TIER_DONE_KIND_SUCCESS",
     "TIER_DONE_KIND_UNKNOWN_ITEM",
     "TIER_UNDONE_KIND_NOT_MARKED",

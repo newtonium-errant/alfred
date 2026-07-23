@@ -2653,6 +2653,7 @@ async def _dispatch_tier_done(
 
     from alfred.tier.daily_curation import (
         TIER_DONE_KIND_FUTURE_DATE_REJECTED,
+        TIER_DONE_KIND_INTERNAL_ERROR,
         mark_t3_done,
         mark_t3_undone,
     )
@@ -2740,6 +2741,11 @@ async def _dispatch_tier_done(
                 today=today,
             )
     except Exception as exc:  # noqa: BLE001
+        # Generic-crash signal for the IN-PROCESS call (no subprocess) —
+        # the mutator raised unexpectedly. ``internal_error`` is the
+        # documented/pinned dispatcher-only kind (imported so a rename
+        # fails loud here rather than silently drifting the canary the
+        # SKILL routes on); the payload keeps a human-readable ``error``.
         log.warning(
             f"talker.{tool_label}.crashed",
             session_id=session.session_id,
@@ -2747,7 +2753,7 @@ async def _dispatch_tier_done(
         )
         return _dumps({
             "error": f"{tool_label} crashed: {exc}",
-            "kind": "subprocess_error",
+            "kind": TIER_DONE_KIND_INTERNAL_ERROR,
         })
 
     log.info(

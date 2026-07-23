@@ -40,6 +40,7 @@ from alfred.tier.daily_curation import (
     TIER_DONE_KIND_AMBIGUOUS_ITEM,
     TIER_DONE_KIND_FUTURE_DATE_REJECTED,
     TIER_DONE_KIND_IDEMPOTENT_NOOP,
+    TIER_DONE_KIND_INTERNAL_ERROR,
     TIER_DONE_KIND_SUCCESS,
     TIER_DONE_KIND_UNKNOWN_ITEM,
     TIER_UNDONE_KIND_NOT_MARKED,
@@ -79,6 +80,10 @@ def test_tier_done_kind_constants_pinned() -> None:
     assert TIER_DONE_KIND_FUTURE_DATE_REJECTED == "future_date_rejected"
     assert TIER_UNDONE_KIND_UNMARKED == "unmarked"
     assert TIER_UNDONE_KIND_NOT_MARKED == "not_marked"
+    # Dispatcher-only generic-crash kind (NOT emitted by the mutators;
+    # the talker's _dispatch_tier_done except handler emits it). Named for
+    # the in-process reality — there is no subprocess.
+    assert TIER_DONE_KIND_INTERNAL_ERROR == "internal_error"
 
 
 # ---------------------------------------------------------------------------
