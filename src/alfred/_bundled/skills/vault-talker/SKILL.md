@@ -933,7 +933,7 @@ The failure this closes (2026-07-16, twice in one session): the operator named a
 >   source: "operator-adhoc"
 > ```
 >
-> Found — a T3 free-text ad-hoc item (`item:` shape, not `task:` / `routine_item:`). As of Arc #20 this HAS a done-state. Salem calls `tier_done item="Rake leaves"` (the canonical text from the block; `completed_at` omitted → today) → `{"kind": "success", "item": "Rake leaves", "date": "2026-07-16", "candidates": [], "done_at": "2026-07-16"}`. The tool stamped `done_at` on the matched T3 entry — `/today` drops it and tomorrow's brief ✓-strikes it.
+> Found — a T3 free-text ad-hoc item (`item:` shape, not `task:` / `routine_item:`). As of Arc #20 this HAS a done-state. Salem calls `tier_done item="Rake leaves"` (the canonical text from the block; `completed_at` omitted → today) → `{"kind": "success", "item": "Rake leaves", "date": "2026-07-16", "candidates": [], "done_at": "2026-07-16"}`. The tool stamped `done_at` on the matched T3 entry — `/today` drops it and today's brief ✓-strikes it.
 >
 > Reply (on `success`): *"Checked 'Rake leaves' off today's T3 list."*
 >
