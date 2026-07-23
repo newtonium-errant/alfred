@@ -2736,6 +2736,9 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     if subcmd == "negation-glossary":
         _cmd_scribe_negation_glossary(args)
         return
+    if subcmd == "notegen-profile":
+        _cmd_scribe_notegen_profile(args)
+        return
     if subcmd != "attest":
         print("Usage: alfred scribe {attest <note> --attester <clinician> | "
               "events {list|verify|tip|anchor} | audit encounter <enc> | "
@@ -3945,6 +3948,60 @@ def _cmd_scribe_negation_glossary(args: argparse.Namespace) -> None:
         "cite_concept": sorted(cite_final)}, indent=2))
 
 
+def _cmd_scribe_notegen_profile(args: argparse.Namespace) -> None:
+    """``alfred scribe notegen-profile {init [--force] | show}`` — the #14 note_profile operator
+    surface (item 12 MVP: a single seed profile, NO builder).
+
+    ``init`` scaffolds ``note_profile_v1.json`` from the built-in default (the current implicit SOAP
+    structure made an explicit, versionable artifact) — atomic 0600 write; refuses to clobber an
+    existing v1 without ``--force`` (rollback-unsafe). ``show`` prints the ACTIVE profile (highest
+    valid version, else the built-in default) + its sha256 DISPLAY fingerprint + an on-disk-canonical
+    self-check. The durable chain-pinned sha (a ``note.template_published`` event) is LATER — 14b
+    touches no evstore kind."""
+    from alfred.scribe import notegen_profile as _np
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    ncmd = getattr(args, "notegen_profile_cmd", None)
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+    profiles_dir = _np.resolve_profiles_dir(cfg)
+
+    if ncmd == "init":
+        dest = _np.profile_path(profiles_dir, 1)
+        if dest.exists() and not args.force:
+            print(json.dumps({
+                "error": f"{dest} already exists — refusing to clobber (rollback-unsafe). Use --force "
+                         f"to overwrite, or hand-author a higher version for a tuning change.",
+                "path": str(dest)}))
+            sys.exit(1)
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        meta = _np.write_profile(dest, _np.seed_profile_dict(1))
+        print(json.dumps({"initialized": str(dest), **meta}, indent=2))
+        return
+
+    if ncmd == "show":
+        active = _np.resolve_active_profile(cfg)
+        d = active.to_dict()
+        path = _np.profile_path(profiles_dir, active.profile_version)
+        on_disk_canonical = None
+        if active.profile_version > 0 and path.is_file():
+            try:
+                on_disk_canonical = path.read_bytes() == _np.canonical_profile_bytes(d)
+            except OSError:
+                on_disk_canonical = None
+        print(json.dumps({
+            "active": d,
+            "profile_sha256": _np.profile_sha256(d),
+            "source": "built-in default" if active.profile_version == 0 else str(path),
+            "on_disk_canonical": on_disk_canonical,
+            "note": "sha256 is a DISPLAY fingerprint (no durable chain pin in 14b)",
+        }, indent=2))
+        return
+
+    print("Usage: alfred scribe notegen-profile {init [--force] | show}")
+    sys.exit(1)
+
+
 def _cmd_scribe_bugs(args: argparse.Namespace) -> None:
     """``alfred scribe bugs list|show|resolve`` — triage box-local bug reports (task #4).
 
@@ -5114,6 +5171,19 @@ def build_parser() -> argparse.ArgumentParser:
         "reject", help="Reject a candidate (the flag stands) + audit")
     neg_reject.add_argument("candidate_id", help="The npc-... candidate id")
     neg_reject.add_argument("--operator", required=True, help="The rejecting operator identity (audited)")
+    # #14 item-12 — the note_profile artifact (seed init / show active). Single SOAP profile, NO builder.
+    scribe_ngp = scribe_sub.add_parser(
+        "notegen-profile",
+        help="Manage the #14 note_profile artifact (init the v1 seed / show the active profile)")
+    ngp_sub = scribe_ngp.add_subparsers(dest="notegen_profile_cmd")
+    ngp_init = ngp_sub.add_parser(
+        "init", help="Scaffold note_profile_v1.json from the built-in default (the current implicit SOAP "
+                     "structure, made an explicit versionable artifact)")
+    ngp_init.add_argument("--force", action="store_true",
+                          help="Overwrite an existing note_profile_v1.json (rollback-unsafe)")
+    ngp_sub.add_parser(
+        "show", help="Show the active profile (highest valid version, else the built-in default) + its "
+                     "sha256 display fingerprint + an on-disk-canonical self-check")
     # P4-5 — voice-preset management (local file ops under scribe.diarize.enrollment_dir).
     scribe_presets = scribe_sub.add_parser(
         "presets", help="Manage voice-enrollment presets (list / audit / delete)",

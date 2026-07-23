@@ -72,6 +72,7 @@ from alfred.scribe.negation_suppression import (
     capture_render_candidates,
     resolve_candidates_dir,
 )
+from alfred.scribe.notegen_profile import resolve_active_profile
 from alfred.scribe.notegen import (
     ContextBudgetExceeded,
     StructuredNote,
@@ -435,6 +436,17 @@ def _create_ai_draft(
         # stays = the pipeline's last body). Sealed with the note at attest.
         "draft_original": vnote.body,
     }
+    # #14b — note-gen PROFILE attribution (create only). Which note_profile version produced this
+    # draft: {note_profile_id = note_type (STABLE 'soap'), note_profile_version = the ledger version}.
+    # PHI-FREE. Written ONCE at create (like diarize_provenance below), so 14a's edit-diff capture
+    # (signal I) attributes every correction signal to the version that generated the draft. Fail-safe:
+    # resolve_active_profile degrades to the built-in DEFAULT (soap/0) when no profile is configured or
+    # all are corrupt, so note-gen NEVER depends on a profile file AND the attribution matches 14a's
+    # soap/0 reader default. STAYC_CLINICAL_DRAFT_EDIT_FIELDS stays un-widened — the update path never
+    # refreshes these (the active version locks at create, like the provenance below).
+    _profile = resolve_active_profile(config)
+    draft_fields["note_profile_id"] = _profile.note_type
+    draft_fields["note_profile_version"] = _profile.profile_version
     # P4-5 — additive diarize PROVENANCE on the note (create only). Which voice preset
     # anchored this encounter's attribution: {user, preset_id, centroid_version,
     # engine_fingerprint}, or absent when un-anchored. Written ONCE at create (the
