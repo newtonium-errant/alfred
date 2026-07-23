@@ -204,6 +204,7 @@ async def run(
     # startup() run before the pipeline stack is imported.
     from alfred.scribe.events import ScribeEvents
     from alfred.scribe.events_maintenance import ScribeEventMaintenance
+    from alfred.scribe.negation_suppression import load_suppression, resolve_glossary_path
     from alfred.scribe.pipeline import run_sweep
     from alfred.scribe.retention_sweep import RetentionSweep
     from alfred.scribe.state import ScribeState
@@ -241,6 +242,20 @@ async def run(
     # gate as the emitters: a retained seal needs the durable retention.sealed record.
     retention_sweep = RetentionSweep(config, events)
 
+    # #26 Phase-2 FEED-BACK — load the operator-approved negation-suppression store ONCE at boot
+    # (config-like; mirrors how ``events`` is constructed here, not per-sweep) and thread it into
+    # run_sweep → verify. Empty/absent (the Phase-2 default — no approved pairs yet) ⇒ suppression
+    # is INERT and grounding is byte-identical. Morning-review approvals apply on the next daemon
+    # start (Phase-3 may add a live reload). Emit the pair count so 'inert' is distinguishable from
+    # 'active' (intentionally-left-blank).
+    suppression = load_suppression(resolve_glossary_path(config))
+    log.info(
+        "scribe.daemon.negation_suppression_loaded",
+        pairs=len(suppression.pairs),
+        detail="#26 learned negation-suppression store loaded (pairs=0 ⇒ INERT: no approved "
+               "paraphrase pairs yet, grounding byte-identical)",
+    )
+
     log.info(
         "scribe.daemon.pipeline_watching",
         mode=config.mode,
@@ -275,7 +290,7 @@ async def run(
                 # store gate) is designed to survive exactly that class of failure. They are SIBLINGS,
                 # not nested in one try where an upstream error skips everything downstream.
                 try:
-                    await run_sweep(config, state, vault_path, events=events)
+                    await run_sweep(config, state, vault_path, events=events, suppression=suppression)
                 except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop OR starve retention
                     log.exception("scribe.daemon.sweep_error")
                 # Event-store maintenance (design §4/§5.3/§5.5): all self-latched + best-effort.

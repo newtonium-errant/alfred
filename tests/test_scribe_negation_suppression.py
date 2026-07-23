@@ -26,16 +26,21 @@ import structlog
 from alfred.scribe import SCRIBE_DRAFTER_IDENTITY, load_from_unified
 from alfred.scribe import negation_suppression as ns
 from alfred.scribe.attest import attest
+from alfred.scribe.grounding import _CITE_NEGATION_RE, _negated_concepts
 from alfred.scribe.grounding import verify as verify_grounding
 from alfred.scribe.negation_suppression import (
     KIND_ATTEST_OUTCOME,
     KIND_CANDIDATE,
+    NEGATION_GLOSSARY_NAME,
     NEGATION_MISMATCH_REASON,
+    NegationSuppression,
     _attest_outcomes_file,
     _candidates_file,
     capture_render_candidates,
+    load_suppression,
     record_negation_attest_outcome,
     resolve_candidates_dir,
+    resolve_glossary_path,
 )
 from alfred.scribe.notegen import StructuredNote
 from alfred.scribe.transcript import Segment, Transcript
@@ -488,3 +493,238 @@ def test_attest_CLI_threads_negation_candidates_dir(tmp_path):
 
     rows = _outcome_rows(tmp_path / "scribe")
     assert len(rows) == 1 and rows[0]["reason"] == NEGATION_MISMATCH_REASON
+
+
+# ===========================================================================
+# PHASE 2 — FEED-BACK: the Tier-2 approved store + grounding's (B)-path consult
+# ===========================================================================
+
+def _store(*pairs) -> NegationSuppression:
+    """Build an approved store from (claim_set, cite_set) pairs (frozen at construction)."""
+    return NegationSuppression(pairs=tuple((frozenset(a), frozenset(b)) for a, b in pairs))
+
+
+def _empagliflozin_pair():
+    """The empagliflozin approved pair DERIVED from grounding's OWN extraction — so the
+    seed is EXACTLY what verify() extracts (drift-proof against any _negated_concepts change)."""
+    claim = _negated_concepts(_EMPAGLIFLOZIN_CLAIM, _CITE_NEGATION_RE)[0]
+    cite = _negated_concepts(_EMPAGLIFLOZIN_CITE, _CITE_NEGATION_RE)[0]
+    return claim, cite
+
+
+# --- NegationSuppression.suppresses — exact-match predicate --------------------
+
+def test_empty_store_suppresses_nothing():
+    s = NegationSuppression()
+    assert s.is_empty is True
+    assert s.suppresses({"adequately", "controlled", "metformin"}, [{"come", "down"}]) is False
+
+
+def test_suppresses_exact_pair_match():
+    claim, cite = _empagliflozin_pair()
+    s = _store((claim, cite))
+    assert s.suppresses(claim, [cite]) is True
+
+
+def test_suppresses_requires_exact_claim_not_subset():
+    # A claim concept that is a STRICT SUBSET of the approved A_claim must NOT match
+    # (exact-set-equality). MUTATION-BIND: loosening to subset → this returns True → a
+    # recall guard falsely suppresses. Exact keeps it False.
+    claim, cite = _empagliflozin_pair()
+    s = _store((claim, cite))
+    subset_claim = {"controlled", "metformin"}          # ⊂ {adequately, controlled, metformin}
+    assert subset_claim < claim                          # sanity: strict subset
+    assert s.suppresses(subset_claim, [cite]) is False
+
+
+def test_suppresses_requires_exact_cite_not_subset():
+    claim, cite = _empagliflozin_pair()
+    s = _store((claim, cite))
+    subset_cite = {"come", "down", "metformin"}          # ⊂ the approved cite set
+    assert subset_cite < cite                            # sanity: strict subset
+    assert s.suppresses(claim, [subset_cite]) is False
+
+
+def test_suppresses_requires_present_cite_concept():
+    claim, cite = _empagliflozin_pair()
+    s = _store((claim, cite))
+    assert s.suppresses(claim, []) is False              # no cite negation → never suppressible
+
+
+def test_suppresses_unrelated_concept_false():
+    claim, cite = _empagliflozin_pair()
+    s = _store((claim, cite))
+    assert s.suppresses({"chest", "pain"}, [{"chest", "tube", "placed"}]) is False
+
+
+# --- load_suppression — the JSON loader (fail-safe toward flagging) ------------
+
+def test_load_suppression_unset_is_empty():
+    assert load_suppression("").is_empty is True
+    assert load_suppression(None).is_empty is True
+
+
+def test_load_suppression_absent_file_is_empty(tmp_path):
+    assert load_suppression(tmp_path / "nope.json").is_empty is True
+
+
+def test_load_suppression_malformed_is_empty(tmp_path):
+    p = tmp_path / NEGATION_GLOSSARY_NAME
+    p.write_text("{ not json", encoding="utf-8")
+    with structlog.testing.capture_logs() as cap:
+        s = load_suppression(p)
+    assert s.is_empty is True
+    assert [e for e in cap if e.get("event") == "scribe.negation_suppression.glossary_load_error"]
+
+
+def test_load_suppression_parses_and_lowercases_pairs(tmp_path):
+    p = tmp_path / NEGATION_GLOSSARY_NAME
+    p.write_text(json.dumps({
+        "version": 1,
+        "pairs": [{
+            "id": "np-0001",
+            "claim_concept": ["Adequately", "Controlled", "metformin"],   # mixed case
+            "cite_concept": ["come", "down", "way", "i'd", "hoped", "metformin"],
+            "approved_by": "andrew",
+        }],
+    }), encoding="utf-8")
+    s = load_suppression(p)
+    assert len(s.pairs) == 1
+    a, b = s.pairs[0]
+    assert a == frozenset({"adequately", "controlled", "metformin"})       # lowercased
+    assert b == frozenset({"come", "down", "way", "i'd", "hoped", "metformin"})
+
+
+def test_load_suppression_skips_incomplete_entries(tmp_path):
+    p = tmp_path / NEGATION_GLOSSARY_NAME
+    p.write_text(json.dumps({"pairs": [
+        {"claim_concept": ["a", "b"]},                       # missing cite_concept → skip
+        {"cite_concept": ["c", "d"]},                        # missing claim_concept → skip
+        {"claim_concept": ["a"], "cite_concept": ["c"]},     # valid
+    ]}), encoding="utf-8")
+    assert len(load_suppression(p).pairs) == 1
+
+
+def test_resolve_glossary_path(tmp_path):
+    cfg = load_from_unified({"scribe": {"input_dir": str(tmp_path / "inbox")}})
+    assert resolve_glossary_path(cfg) == tmp_path / "scribe" / NEGATION_GLOSSARY_NAME
+
+
+# --- verify() consult — the acceptance-test SPLIT (§8) -------------------------
+
+def test_verify_empty_store_empagliflozin_STILL_FLAGS():
+    # (1) EMPTY-STORE GUARD — proves the loop adds NO blanket loosening. Companion to the
+    # canonical pin tests/test_scribe_notegen.py:356. suppression=None AND an empty store
+    # BOTH stay byte-identical → the lexically-disjoint paraphrase STILL flags.
+    t = _transcript(_EMPAGLIFLOZIN_CITE)
+    s = _structured(objective=[{"claim": _EMPAGLIFLOZIN_CLAIM, "source_spans": ["S1"]}])
+    for supp in (None, NegationSuppression()):
+        r = verify_grounding(s, t, suppression=supp)
+        assert not r.clean and r.flags[0].reason == NEGATION_MISMATCH_REASON
+
+
+def test_verify_seeded_store_flips_empagliflozin_clean():
+    # (2) SEEDED-STORE ACCEPTANCE — THE FLIP the brief wants. Seed the exact empagliflozin
+    # concept-pair; verify returns CLEAN. Mechanism proof (deterministic, no operator needed).
+    t = _transcript(_EMPAGLIFLOZIN_CITE)
+    s = _structured(objective=[{"claim": _EMPAGLIFLOZIN_CLAIM, "source_spans": ["S1"]}])
+    r = verify_grounding(s, t, suppression=_store(_empagliflozin_pair()))
+    assert r.clean is True
+
+
+def test_verify_seeded_store_emits_suppressed_count(tmp_path):
+    # Log-emission pin (discipline #9): a suppression firing MUST surface on the
+    # scribe.grounding.verified line so an operator can grep that the learned feed-back fired.
+    t = _transcript(_EMPAGLIFLOZIN_CITE)
+    s = _structured(objective=[{"claim": _EMPAGLIFLOZIN_CLAIM, "source_spans": ["S1"]}])
+    with structlog.testing.capture_logs() as cap:
+        verify_grounding(s, t, suppression=_store(_empagliflozin_pair()))
+    v = [e for e in cap if e.get("event") == "scribe.grounding.verified"]
+    assert len(v) == 1 and v[0]["suppressed"] == 1 and v[0]["flagged"] == 0
+
+
+def test_verify_empty_store_suppressed_count_zero():
+    t = _transcript(_EMPAGLIFLOZIN_CITE)
+    s = _structured(objective=[{"claim": _EMPAGLIFLOZIN_CLAIM, "source_spans": ["S1"]}])
+    with structlog.testing.capture_logs() as cap:
+        verify_grounding(s, t, suppression=NegationSuppression())
+    v = [e for e in cap if e.get("event") == "scribe.grounding.verified"]
+    assert len(v) == 1 and v[0]["suppressed"] == 0 and v[0]["flagged"] == 1
+
+
+# --- recall guards MUST stay RED with a POPULATED store ------------------------
+
+@pytest.mark.parametrize("claim, segment", [
+    # incidental single-word overlap — "chest pain" ⊄ "chest tube"; the shared "chest"
+    # does NOT ground it, and the empagliflozin pair does NOT match it → STILL flags.
+    ("Denies chest pain", "No chest tube placed; chest tube is absent."),
+    # a shared DRUG NAME does not ground a differently negated concept.
+    ("Denies taking metformin", "Sugars haven't come down on the metformin."),
+])
+def test_verify_populated_store_incidental_overlap_still_flags(claim, segment):
+    t = _transcript(segment)
+    s = _structured(subjective=[{"claim": claim, "source_spans": ["S1"]}])
+    r = verify_grounding(s, t, suppression=_store(_empagliflozin_pair()))
+    assert not r.clean and r.flags[0].reason == NEGATION_MISMATCH_REASON
+
+
+def test_verify_populated_store_wrong_symptom_still_flags():
+    # "Denies SOB" cited to "denies chest pain" — SOB negated NOWHERE in the cite. A
+    # populated (unrelated) store must NOT suppress it.
+    t = _transcript("Patient denies chest pain.")
+    s = _structured(subjective=[{"claim": "Denies SOB", "source_spans": ["S1"]}])
+    r = verify_grounding(s, t, suppression=_store(_empagliflozin_pair()))
+    assert not r.clean and r.flags[0].reason == NEGATION_MISMATCH_REASON
+
+
+def test_verify_mutation_bind_subset_claim_still_flags():
+    # MUTATION-BIND (claim side): seed the empagliflozin pair; a claim whose negated concept
+    # is a STRICT SUBSET of the approved A_claim ({controlled, metformin}) against the EXACT
+    # approved cite STILL flags. Exact-match required — loosening to subset would wrongly
+    # suppress this different (real) negation → this pin would go green (fail).
+    t = _transcript(_EMPAGLIFLOZIN_CITE)
+    s = _structured(objective=[{"claim": "Not controlled on metformin", "source_spans": ["S1"]}])
+    r = verify_grounding(s, t, suppression=_store(_empagliflozin_pair()))
+    assert not r.clean and r.flags[0].reason == NEGATION_MISMATCH_REASON
+
+
+def test_verify_mutation_bind_subset_cite_still_flags():
+    # MUTATION-BIND (cite side): the EXACT approved claim concept, but the LIVE cite negates a
+    # STRICT SUBSET of the approved B_cite ({come, down, metformin}) → no exact cite match →
+    # STILL flags. Loosening the cite match to subset would wrongly suppress.
+    t = _transcript("Sugars haven't come down on the metformin.")
+    s = _structured(objective=[{"claim": _EMPAGLIFLOZIN_CLAIM, "source_spans": ["S1"]}])
+    r = verify_grounding(s, t, suppression=_store(_empagliflozin_pair()))
+    assert not r.clean and r.flags[0].reason == NEGATION_MISMATCH_REASON
+
+
+def test_verify_suppression_never_touches_C_flip():
+    # (C) POSITIVE/NEGATIVE FLIP is a real contradiction — NEVER suppressible. A positive claim
+    # citing a segment that NEGATES the finding STILL flags even with a store present (the store
+    # only filters the (B) path). Seed a pair whose cite concept equals the flip finding to prove
+    # the (C) path is untouched.
+    t = _transcript("Abdomen lacks bowel sounds.")
+    s = _structured(objective=[{"claim": "Bowel sounds present", "source_spans": ["S1"]}])
+    store = _store(({"bowel", "sounds", "present"}, {"bowel", "sounds"}))
+    r = verify_grounding(s, t, suppression=store)
+    assert not r.clean and r.flags[0].reason == NEGATION_MISMATCH_REASON
+
+
+# --- pipeline threading — the store reaches verify end-to-end ------------------
+
+def test_pipeline_threads_suppression_into_verify(tmp_path):
+    # The whole feed-back rides render_verified_note → verify(suppression=). Drive the REAL
+    # production render path: default None flags the paraphrase; the seeded store flips the SAME
+    # note clean in its grounding_flags frontmatter. Proves the thread reaches verify (a dropped
+    # kwarg on any hop → the seeded case would still flag → this pin fails).
+    from alfred.scribe.pipeline import render_verified_note
+
+    cfg = load_from_unified({"scribe": {"input_dir": str(tmp_path / "inbox")}})
+    t = _transcript(_EMPAGLIFLOZIN_CITE)
+    s = _structured(objective=[{"claim": _EMPAGLIFLOZIN_CLAIM, "source_spans": ["S1"]}])
+
+    vnote0 = render_verified_note(s, t, config=cfg, title="E", suppression=None)
+    assert any(f["reason"] == NEGATION_MISMATCH_REASON for f in vnote0.grounding_flags)
+
+    vnote1 = render_verified_note(s, t, config=cfg, title="E", suppression=_store(_empagliflozin_pair()))
+    assert not any(f["reason"] == NEGATION_MISMATCH_REASON for f in vnote1.grounding_flags)

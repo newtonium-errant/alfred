@@ -64,6 +64,7 @@ import contextlib
 import fcntl
 import json
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -97,6 +98,8 @@ NEGATION_MISMATCH_REASON = "negation_mismatch"
 _SCRIBE_SUBDIR = "scribe"
 NEGATION_CANDIDATES_NAME = "negation_candidates.jsonl"          # render pairs (PHI-bearing)
 NEGATION_ATTEST_OUTCOMES_NAME = "negation_attest_outcomes.jsonl"  # attest kept (PHI-free)
+NEGATION_GLOSSARY_NAME = "negation_glossary.json"              # Tier-2 approved store (generic vocab)
+GLOSSARY_VERSION = 1                                          # #26 v1 = exact-match concept-set PAIRS
 
 KIND_CANDIDATE = "candidate"
 KIND_ATTEST_OUTCOME = "attest_outcome"
@@ -118,6 +121,14 @@ def resolve_candidates_dir(config: "ScribeConfig") -> Path:
     (Phase 1 needs the writers to have a home without touching config.py; a Phase-2
     override lands with the Tier-2 approved-store path)."""
     return Path(config.input_dir).expanduser().parent / _SCRIBE_SUBDIR
+
+
+def resolve_glossary_path(config: "ScribeConfig") -> Path:
+    """The Tier-2 APPROVED store path — ``<STAYC_DATA>/scribe/negation_glossary.json``,
+    a sibling of the candidate spool. Data-layer (operator-grown, mutable), NOT bundled
+    code — de-identified generic clinical vocab that survives s.49 destruction (the whole
+    point of the generalize-at-approval step), so it is NOT retention-swept."""
+    return resolve_candidates_dir(config) / NEGATION_GLOSSARY_NAME
 
 
 def _candidates_file(candidates_dir: str | Path) -> Path:
@@ -310,3 +321,92 @@ def record_negation_attest_outcome(
         log.warning(
             "scribe.negation_suppression.attest_capture_error", source_id=source_id,
             detail="negation attest-outcome capture failed — SWALLOWED (attestation unaffected)")
+
+
+# ===========================================================================
+# Phase 2 — FEED-BACK: the Tier-2 APPROVED suppression store (pairs-v1)
+# ===========================================================================
+
+@dataclass(frozen=True)
+class NegationSuppression:
+    """The Tier-2 APPROVED suppression store — operator-de-identified concept-set PAIRS.
+
+    v1 = EXACT-set-match pairs (the ratified default; NOT the higher-reuse glossary). Each
+    pair ``(claim_concept, cite_concept)`` records ONE operator decision: "this claim
+    negated-concept-set, when the cite negates THIS concept-set, is a faithful paraphrase —
+    suppress the (B) flag." Encounter-independent, generic clinical vocab (lexicon-class,
+    like ``DIAGNOSIS_LEXICON``): survives s.49 destruction, never relayed as pairs.
+
+    Consumed by ``grounding.verify`` via the duck-typed ``NegationSuppressionStore``
+    protocol (grounding never imports this class — that would cycle). Empty ⇒ ``suppresses``
+    is always ``False`` ⇒ grounding is byte-identical to pre-#26."""
+
+    # Each pair is (claim_concept, cite_concept) as frozensets — order-independent,
+    # hashable, exact-comparable. Lowercased/stripped at load to match _negated_concepts.
+    pairs: tuple[tuple[frozenset[str], frozenset[str]], ...] = field(default_factory=tuple)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.pairs
+
+    def suppresses(
+        self, claim_concept: set[str], cite_neg_concepts: list[set[str]],
+    ) -> bool:
+        """True IFF an approved pair ``(A_claim, B_cite)`` EXACT-set-matches BOTH the claim
+        concept AND some present cite negated concept: ``claim_concept == A_claim`` AND
+        ``any(cite == B_cite)``.
+
+        EXACT set-equality for v1 — fires ONLY on the exact concept-sets the operator
+        approved; ANY phrasing drift (a sub/superset, a differently-tokenized cite) → no
+        match → the negation STILL FLAGS. That is the SAFE direction on a medico-legal
+        detector: a learned suppression can never over-reach to a concept the operator did
+        not explicitly approve. Requiring a PRESENT cite concept (never the empty case) means
+        an invented negation whose cite negates nothing is never suppressible here either."""
+        if not self.pairs:
+            return False
+        cc = frozenset(claim_concept)
+        cite_frozen = [frozenset(span) for span in cite_neg_concepts]
+        for a_claim, b_cite in self.pairs:
+            if cc == a_claim and any(span == b_cite for span in cite_frozen):
+                return True
+        return False
+
+
+def load_suppression(glossary_path: str | Path | None) -> NegationSuppression:
+    """Load the Tier-2 approved store from JSON. FAIL-SAFE toward FLAGGING: an unset /
+    absent / malformed / wrong-shape file → an EMPTY store (no suppression, grounding
+    byte-identical) — a learned override must never activate from a corrupt file, and a
+    missing store is the common Phase-2 state (no pairs approved yet).
+
+    Reads the design's Tier-2 schema (``{"version", "pairs": [{"claim_concept": [...],
+    "cite_concept": [...], ...}]}``). Concepts are lowercased + whitespace-stripped to
+    match ``_negated_concepts``'s output form; entries missing either side are skipped.
+    The ``version`` field is READ-tolerant (any int) — forward-compatible, never a
+    hard-fail (the load-time schema-tolerance contract)."""
+    if not str(glossary_path or ""):
+        return NegationSuppression()
+    p = Path(glossary_path)
+    if not p.is_file():
+        return NegationSuppression()          # no store yet → inert (byte-identical)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — a torn/invalid file must never activate suppression
+        log.warning(
+            "scribe.negation_suppression.glossary_load_error", path=str(p),
+            detail="approved suppression store is malformed — loading EMPTY (no suppression, "
+                   "fail-safe toward flagging). Fix the JSON to re-activate the learned pairs.")
+        return NegationSuppression()
+    if not isinstance(data, dict) or not isinstance(data.get("pairs"), list):
+        return NegationSuppression()
+    pairs: list[tuple[frozenset[str], frozenset[str]]] = []
+    for entry in data["pairs"]:
+        if not isinstance(entry, dict):
+            continue
+        a, b = entry.get("claim_concept"), entry.get("cite_concept")
+        if not (isinstance(a, list) and isinstance(b, list) and a and b):
+            continue
+        a_fs = frozenset(t for x in a if (t := str(x).strip().lower()))
+        b_fs = frozenset(t for x in b if (t := str(x).strip().lower()))
+        if a_fs and b_fs:
+            pairs.append((a_fs, b_fs))
+    return NegationSuppression(pairs=tuple(pairs))

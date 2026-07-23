@@ -103,9 +103,9 @@ def test_choke_verifies_the_same_object_it_renders(monkeypatch):
     orig_verify = pl.verify_grounding
     orig_render = pl.render_soap
 
-    def _verify_spy(structured, transcript):
+    def _verify_spy(structured, transcript, *, suppression=None):
         seen["verified"] = id(structured)
-        return orig_verify(structured, transcript)
+        return orig_verify(structured, transcript, suppression=suppression)
 
     def _render_spy(structured, *, title, grounding):
         seen["rendered"] = id(structured)

@@ -68,6 +68,7 @@ from alfred.scribe.identity import compute_encounter_id
 from alfred.scribe.inferred_dx import check_inferred_diagnoses
 from alfred.scribe.ingest import ScribeIngestRefused, guard_ingest
 from alfred.scribe.negation_suppression import (
+    NegationSuppression,
     capture_render_candidates,
     resolve_candidates_dir,
 )
@@ -154,6 +155,7 @@ def _prepend_consent_line(body: str, consent: str) -> str:
 async def generate_verified_note(
     transcript: Transcript, *, config: ScribeConfig, title: str,
     events: "ScribeEvents | None" = None,
+    suppression: "NegationSuppression | None" = None,
 ) -> VerifiedNote:
     """THE choke — generate → verify → render on the SAME object.
 
@@ -163,12 +165,16 @@ async def generate_verified_note(
     body in the pipeline.
     """
     structured = await generate_structured(transcript, config=config)
-    return render_verified_note(structured, transcript, config=config, title=title, events=events)
+    return render_verified_note(
+        structured, transcript, config=config, title=title, events=events,
+        suppression=suppression,
+    )
 
 
 def render_verified_note(
     structured: StructuredNote, transcript: Transcript, *, config: ScribeConfig,
     title: str, events: "ScribeEvents | None" = None,
+    suppression: "NegationSuppression | None" = None,
 ) -> VerifiedNote:
     """The POST-generation composition of :func:`generate_verified_note` — verify
     → #48 inferred-dx → P4-2 speaker-attribution → render, on the SAME structured
@@ -178,7 +184,7 @@ def render_verified_note(
     render path (no drift between what the scorecard measures and what ships).
     ``generate_verified_note`` is the only async (real-model) entry; this is the
     deterministic remainder."""
-    grounding = verify_grounding(structured, transcript)      # verify THE SAME object
+    grounding = verify_grounding(structured, transcript, suppression=suppression)  # verify THE SAME object (+ #26 feed-back)
     # #48 — deterministic inferred-diagnosis post-check, BETWEEN verify and render.
     # FLAGS (never removes) a claim naming a lexicon diagnosis absent from its
     # CITED segments; the flags EXTEND grounding.flags so they ride the existing
@@ -291,6 +297,7 @@ def _source_id_for_input(audio_path: Path, config: ScribeConfig) -> str:
 async def process_source(
     audio_path: Path, *, config: ScribeConfig, state: ScribeState, vault_path: Path,
     events: "ScribeEvents | None" = None,
+    suppression: "NegationSuppression | None" = None,
 ) -> str:
     """Process one input to a clinical_note ai_draft. Idempotent + fail-closed.
 
@@ -355,6 +362,7 @@ async def process_source(
         title = f"Encounter {source_id}"  # source_id-based → PHI-free (NOTE-4)
         vnote = await generate_verified_note(
             transcript.delta(), config=config, title=title, events=events,
+            suppression=suppression,
         )
 
         # structuring → drafted (vault_create clinical_note ai_draft ONLY).
@@ -1028,6 +1036,7 @@ def _body_sha(body: str) -> str:
 async def _regen_checkpoint(
     encounter_dir: Path, *, encounter_id: str, config: ScribeConfig,
     state: ScribeState, vault_path: Path, events: "ScribeEvents | None" = None,
+    suppression: "NegationSuppression | None" = None,
 ) -> str:
     """FULL-REGEN the ai_draft from the ACCUMULATED transcript, guarded by
     clobber-detect (before) + the context-budget cap (inside generate). Returns
@@ -1105,7 +1114,8 @@ async def _regen_checkpoint(
     # LLM call, so an over-budget checkpoint never reaches body_replace and the
     # last-good draft stays intact.
     try:
-        vnote = await generate_verified_note(transcript, config=config, title=title, events=events)
+        vnote = await generate_verified_note(
+            transcript, config=config, title=title, events=events, suppression=suppression)
     except ContextBudgetExceeded:
         state.set(encounter_id, state=STATE_BUDGET_CAPPED)
         log.warning(
@@ -1216,6 +1226,7 @@ async def checkpoint_encounter(
     folded_seqs: frozenset[int] = frozenset(),
     close_ambiguous: bool = False,
     events: "ScribeEvents | None" = None,
+    suppression: "NegationSuppression | None" = None,
 ) -> str:
     """The checkpoint trigger (scribe P3-b2). After P3-b1 folds a chunk, evolve
     the ai_draft in place; ``_CLOSED`` finalizes to ``ready`` (close does NOT
@@ -1246,7 +1257,7 @@ async def checkpoint_encounter(
     if did_fold:
         outcome = await _regen_checkpoint(
             encounter_dir, encounter_id=encounter_id, config=config,
-            state=state, vault_path=vault_path, events=events,
+            state=state, vault_path=vault_path, events=events, suppression=suppression,
         )
 
     if closed:
@@ -1359,6 +1370,7 @@ async def checkpoint_encounter(
 async def run_sweep(
     config: ScribeConfig, state: ScribeState, vault_path: Path,
     events: "ScribeEvents | None" = None,
+    suppression: "NegationSuppression | None" = None,
 ) -> dict[str, int]:
     """Scan input_dir once. Walks BOTH legacy flat files (P2 one-shot back-comp)
     AND one level of per-encounter subdirs (P3-b1 accumulator + P3-b2 checkpoint
@@ -1406,6 +1418,7 @@ async def run_sweep(
     for audio in flat_files:
         outcome = await process_source(
             audio, config=config, state=state, vault_path=vault_path, events=events,
+            suppression=suppression,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
 
@@ -1437,6 +1450,7 @@ async def run_sweep(
                     folded_seqs=r.folded_seqs,                 # #57 ledger-truth folded set
                     close_ambiguous=r.close_ambiguous,         # #57 strict fail-closed
                     events=events,
+                    suppression=suppression,                   # #26 Phase-2 learned feed-back
                 )
                 key = _CHECKPOINT_COUNT_KEY.get(outcome)
                 if key:

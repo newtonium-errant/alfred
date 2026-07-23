@@ -81,7 +81,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import structlog
 
@@ -98,6 +98,24 @@ from alfred.scribe.notegen import (
 from alfred.scribe.transcript import Transcript
 
 log = structlog.get_logger(__name__)
+
+
+class NegationSuppressionStore(Protocol):
+    """Duck-typed #26 Phase-2 approved-suppression store, passed into :func:`verify`
+    by the PIPELINE (the concrete impl is ``negation_suppression.NegationSuppression``).
+
+    ``verify`` consults it as an ADDITIONAL suppression source on the (B) negated-CONCEPT
+    path ONLY — never (C) (a positive/negative flip is a real contradiction, never
+    suppressible). grounding NEVER imports the concrete class: that module imports
+    grounding's own (B)-path helpers (``_negated_concepts`` / ``_CITE_NEGATION_RE``), so
+    the reverse import would cycle — so grounding stays PURE (no I/O, no config import)
+    and just calls ``.suppresses()`` duck-typed. ``None`` (the default, every non-daemon
+    caller) ⇒ byte-identical to pre-#26 output."""
+
+    def suppresses(
+        self, claim_concept: set[str], cite_neg_concepts: list[set[str]],
+    ) -> bool: ...
+
 
 # H2 — reason → inline literal dispatch for GroundingResult.flags_for. A flag's
 # ``reason`` selects the inline ⚠. Grounding's mechanical reasons all map to
@@ -410,11 +428,22 @@ def _cited_text(claim_spans, seg_by_id) -> str:
     return " ".join(seg_by_id[s].text for s in claim_spans if s in seg_by_id)
 
 
-def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResult:
+def verify(
+    structured: StructuredNote, transcript: Transcript, *,
+    suppression: "NegationSuppressionStore | None" = None,
+) -> GroundingResult:
     """Deterministically verify grounding. Returns the auditable
     :class:`GroundingResult` (no mutation of the claim objects — ``render_soap``
     reads flags via ``GroundingResult.flags_for``, so a note can never be
-    rendered without the grounding result)."""
+    rendered without the grounding result).
+
+    ``suppression`` (#26 Phase-2 FEED-BACK, keyword-only, default ``None``) is the
+    operator-approved learned-suppression store, loaded + threaded by the PIPELINE.
+    ``None`` or an empty store ⇒ output byte-identical to pre-#26: no negation flag is
+    ever ADDED or removed. A populated store can ONLY turn a residual (B) invented-
+    negation flag into CLEAN (never touches (C) flips, never adds a flag) — the
+    conservative, medico-legal-safe direction. grounding stays PURE — it consults the
+    store via the duck-typed :class:`NegationSuppressionStore` protocol, doing no I/O."""
     # FAIL-CLOSED integrity gate (scribe P3-b1) — refuse a transcript with
     # DUPLICATE segment ids BEFORE building the {id: segment} map. Last-wins map
     # overwrite would ground a claim against the wrong same-id segment and pass
@@ -429,6 +458,7 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
         )
     seg_by_id = {s.id: s for s in transcript.segments}
     result = GroundingResult()
+    suppressed_count = 0   # #26 — residual (B) negations turned CLEAN by an approved pair
 
     for section, idx, claim in structured.all_claims():
         reasons: list[str] = []
@@ -506,6 +536,22 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
             c for c in claim_neg_concepts
             if not any(c <= span for span in cite_neg_concepts)
         ]
+        # #26 Phase-2 FEED-BACK — consult the operator-approved suppression store as an
+        # ADDITIONAL suppression source on the (B) residual ONLY (NEVER the (C) flip below —
+        # a positive/negative flip is a real contradiction, never suppressible). A residual
+        # ungrounded negation is dropped IFF an approved pair EXACT-set-matches BOTH its claim
+        # concept AND a present cite negated concept. suppression is None (default — every
+        # non-daemon caller) OR an empty store ⇒ this block is a no-op, ungrounded_negs is
+        # unchanged, suppressed_count stays 0 (byte-identical). PURE: only a duck-typed call,
+        # no I/O. Placed AFTER the (B) subset check so an already-grounded negation never
+        # reaches the store (a suppression can only clear a would-be FLAG, never add one).
+        if suppression is not None and ungrounded_negs:
+            kept = [
+                c for c in ungrounded_negs
+                if not suppression.suppresses(c, cite_neg_concepts)
+            ]
+            suppressed_count += len(ungrounded_negs) - len(kept)
+            ungrounded_negs = kept
         flipped = _flipped_positive_findings(claim.claim, cited)
         if ungrounded_negs or flipped:
             detail: list[str] = []
@@ -539,5 +585,9 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
         mode=transcript.mode,
         total_claims=sum(len(structured.section(s)) for s in SOAP_SECTIONS),
         flagged=len(result.flags),
+        # #26 — count of residual (B) negations an approved pair turned CLEAN this note.
+        # 0 = inert (None/empty store, the Phase-2 default) — every note logs it so an
+        # operator can grep whether the learned feed-back fired (intentionally-left-blank).
+        suppressed=suppressed_count,
     )
     return result
