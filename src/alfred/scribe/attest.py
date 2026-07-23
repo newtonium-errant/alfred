@@ -454,6 +454,26 @@ def attest(
     except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
         log.warning("scribe.negation_suppression.attest_capture_error", source_id=source_id)
 
+    # #14 self-correcting Part-1 CAPTURE for NOTE-GEN EDIT-DIFF — the FOURTH sibling (the STRUCTURAL
+    # GENERALIZATION of the three above, to the whole draft→attested diff). READ-ONLY, try-wrapped,
+    # fail-silent. Emits PHI-FREE per-section correction signals (counts/deltas/enums only — never
+    # claim text). Called UNCONDITIONALLY (NOT gated on enrollment_dir here) so a DORMANT sink emits an
+    # observable one-time signal rather than silently capturing nothing (the intentionally-left-blank
+    # trap). Reads draft_original + body + grounding_flags (as the twins do) + the profile id/version.
+    try:
+        from alfred.scribe.notegen_feedback import record_notegen_edit_outcome
+        record_notegen_edit_outcome(
+            enrollment_dir=enrollment_dir,
+            grounding_flags=fm.get("grounding_flags"),
+            draft_original=str(fm.get("draft_original") or ""),
+            attested_body=str(rec.get("body") or ""),
+            template_id=fm.get("note_profile_id"),
+            template_version=fm.get("note_profile_version"),
+            source_id=source_id,
+        )
+    except Exception:  # noqa: BLE001 — belt: capture must never affect a valid attest
+        log.warning("scribe.notegen_feedback.attest_capture_error", source_id=source_id)
+
     return result
 
 
