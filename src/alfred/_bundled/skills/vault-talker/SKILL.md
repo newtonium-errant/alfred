@@ -264,6 +264,7 @@ tier_curation:
   t3:
     - item: "Walk Fergus"
       source: "operator-adhoc"
+      done_at: "2026-05-29"                # optional (Arc #20) — ISO YYYY-MM-DD the operator checked it off; ABSENT while open. Written ONLY by tier_done, never by a whole-block rewrite.
   curated_at: "2026-05-29T07:14:00-03:00"
   rollover_from: "2026-05-28"             # optional — present when pre-populated from yesterday
 ```
@@ -283,7 +284,7 @@ Field-shape rules (verify against the dataclass before drafting examples):
     - `operator` — explicit operator add via talker
     - `rollover` — pre-populated from yesterday's incomplete (T1/T2 only)
 - **Routine-origin entries do NOT roll over.** Per Ship B, when yesterday's routine-origin T1/T2 entry is incomplete, the rollover section silently skips it — the routine's compute surface (`compute_auto_routine_candidates` / `compute_auto_routine_t2_candidates`) re-fires the next morning if the item is still due. Task-origin entries DO roll over as before.
-- **T3 entries carry `item:` (a free-text string), NOT `task:` or `routine_item:`.** Source enum values: `aspirational`, `operator`, `operator-adhoc` (the canonical T3 set in `T3_SOURCES`). **T3 has no `rollover` source** — T3 is fresh-each-day per the spec.
+- **T3 entries carry `item:` (a free-text string), NOT `task:` or `routine_item:`.** Source enum values: `aspirational`, `operator`, `operator-adhoc` (the canonical T3 set in `T3_SOURCES`). **T3 has no `rollover` source** — T3 is fresh-each-day per the spec. **A T3 entry MAY carry an optional `done_at:` (ISO `YYYY-MM-DD`, Arc #20)** — the free-text T3 done-state, ABSENT while open, present once checked off. It is the ONLY done-state home for a free-text T3 item (which has no backing `task/` status or `completion_log`), and is written ONLY by the `tier_done` tool (see **Marking a free-text T3 ad-hoc item done — `tier_done` / `tier_undone`** below) — NEVER by a whole-block `tier_curation` rewrite. `done_at` is allowed only because it is NESTED inside a `t3` entry (a child of the already-allowed `tier_curation` field); a sibling top-level `done` key stays correctly scope-denied.
 - **`confirmed: true` is T1-only and optional.** T2/T3 entries have no confirmed field — the operator-add IS the confirmation.
 - **`curated_at` records the ACTUAL wall-clock time of the edit you are making right now** (timezone-aware ISO 8601, Andrew's local offset). It is an audit field — backdating it makes the vault lie about when curation actually happened. NEVER set it to the daily block's nominal time (e.g. a morning-ish `09:00` because curation "belongs to the morning"), NEVER copy a timestamp from the existing block or from an earlier edit in the same session — every write stamps its own now. DO NOT repeat the 2026-06-10 mistakes: a session running at 13:19 ADT wrote `curated_at: '2026-06-10T09:00:00-03:00'`, and an edit made at 12:36 wrote `11:15` (origin unknown — invented or copied, either way backdated). Both made the audit trail lie. (Schema anchor: `curated_at: str | None` — "ISO-8601 wall-clock timestamp" — in `alfred/tier/daily_curation.py`; the code never auto-stamps it, so the honesty of this field is entirely on you.)
 - Source enum values + field names are stable contract surface pinned by tests. If they drift in `daily_curation.py`, this SKILL needs a follow-up sweep.
@@ -868,6 +869,42 @@ This pattern is the most common `routine_done` misfire — task closure phrasing
 
 Two defenses now stack on this turn. (1) **At the matcher layer** (Step 5 structural fix): the `_MIN_STEM_LEN` floor + the `_match_confidence > 0` gate keep a zero-overlap query like "Tilray Medical Registration Renewal" from ever resolving to `Meds` — the tool returns `unknown_item` instead of a wrong `success`, so the routine record's `completion_log` stays clean even on a misfire. (2) **Upstream, on the inbound side** (the still-live behavioral rule): routing on phrasing shape — task-shaped → task search FIRST — skips `routine_done` entirely, which is the better defense because `unknown_item` alone would still mis-handle a task as a not-yet-existing routine item. The matcher fix removed the need for the old manual token-overlap re-check in the `success` branch; the phrasing-shape discrimination is what actually prevents the misfire.
 
+#### Marking a free-text T3 ad-hoc item done — `tier_done` / `tier_undone` (Salem, Arc #20, shipped 2026-07-22)
+
+Free-text T3 ad-hoc intentions ("rake leaves", "read for an hour") have no backing `task/` record and no routine `completion_log`, so before Arc #20 they had **no done-state at all** — a done-claim about one structurally dead-ended (that's the #19 gap). **`tier_done`** closes it: it stamps a `done_at` date on a matched free-text T3 entry in today's (or a back-dated) `tier_curation.t3` block. **`tier_undone`** is the inverse (clears `done_at`). Both are **Salem-only** (the tier system is Salem-only) and dispatch IN-PROCESS to `tier.daily_curation.mark_t3_done` / `mark_t3_undone` — a deterministic single-field flip of `done_at` that rides the existing `tier_curation` allowlist with ZERO scope widening (do NOT try to reach the same state with `vault_edit`).
+
+**When to use `tier_done`:** an operator done-claim about a **free-text daily T3 ad-hoc item** — one that is NOT a tracked `task/` record and NOT a routine item. Per the #19 routing order this is the LAST resort: try `task/` closure and `routine_done` FIRST; only when BOTH miss (`routine_done` → `unknown_item`) AND you have read today's `tier_curation` and found the item as a free-text `t3` entry, call `tier_done`. (`task:` and `routine_item:` tier entries route to task-closure / `routine_done` instead — see the fallback below.)
+
+**When to use `tier_undone`:** the operator says they did NOT actually do a T3 item they'd checked off, or checked one by mistake (*"I didn't actually rake the leaves"*, *"un-check read for an hour"*).
+
+**The tool input shape** (both tools take exactly these two args — `item` required, `completed_at` optional):
+
+```yaml
+tier_done:                    # or: tier_undone
+  item: "Rake leaves"         # required — fuzzy-matched (substring + stem-tolerant), phrasing needn't be exact. Pass the canonical T3 text you read from the block to guarantee the hit.
+  completed_at: "2026-07-16"  # OPTIONAL — YYYY-MM-DD; omit for today. Resolve "yesterday" / "last Tuesday" to a date yourself. Future dates are rejected (tier_done).
+```
+
+The result is JSON with a `kind` discriminator you MUST route on. The string values mirror `routine_done`'s `DONE_KIND_*` so operator phrasing routes consistently across both surfaces.
+
+`tier_done` kinds:
+
+- **`"success"`** — checked off; `done_at` stamped. Confirm it: *"Checked 'Rake leaves' off today's T3 list."* (For a back-date, name the date.)
+- **`"idempotent_noop"`** — already checked off for that date; note gently, no double-write. (Distinct from the undo path's `not_marked`.)
+- **`"ambiguous_item"`** — multiple T3 items match; result carries `candidates` (the matched item texts). **ASK BACK with a numbered list, do NOT guess.**
+- **`"unknown_item"`** — no T3 item matches on that date; result carries `candidates` (the day's full T3 item list). This is the honest #19 close — do NOT invent a done-state. Should NOT occur when you reached `tier_done` via the fallback below (you already read the entry); if it does, the item genuinely isn't there.
+- **`"future_date_rejected"`** — `completed_at` is after today; result carries an `error` string. Ask the operator to clarify the date.
+
+`tier_undone` kinds:
+
+- **`"unmarked"`** — the check was cleared; confirm it.
+- **`"not_marked"`** — that item wasn't checked off in the first place; tell the operator gently (*"that wasn't checked off, nothing to undo"*) — this is NOT an error.
+- **`"ambiguous_item"`** / **`"unknown_item"`** — same shape as `tier_done` (ask back with `candidates` / honest not-found).
+
+Besides `kind`, the payload carries `item` (the MATCHED canonical T3 text on success/noop; the operator's raw query on unknown/ambiguous), `date` (the daily file acted on), `candidates` (as above), and — on `tier_done` only — `done_at` (the stamped ISO date on `success`/`idempotent_noop`, else `null`). A `tier_done` `success` feeds the balanced-day goal: `_entry_done` counts a free-text T3 done when `done_at == today`, `/today` drops it, and the morning brief ✓-strikes it.
+
+`tier_done` is the ONLY authorised path to a free-text T3 done-state — do NOT try to write a `done` / `done_at` field via `vault_edit set_fields` (a sibling top-level `done` write is scope-denied; `done_at` is reachable only through this tool because it lives NESTED inside a `t3` entry).
+
 #### Before "no match" on a done-claim — read today's `tier_curation` FIRST (Salem, 2026-07-16)
 
 A done-claim that misses BOTH a `task/` search AND `routine_done` (returns `unknown_item`) is NOT necessarily unknown. **T3 ad-hoc intentions** (`tier_curation.t3`, free-text `item:`) and **routine-origin T1/T2 items** (`routine_item: {record, text}`) live ONLY inside the daily note's `tier_curation` block — a T3 ad-hoc is not a `task/` record and not a routine item, and a routine-origin tier entry is only reachable by its canonical text, not the operator's loose phrasing. Both the task-search and the fuzzy routine match structurally cannot see these. So **before you tell the operator you can't find it, read the daily note and scan the tier list**:
@@ -877,7 +914,7 @@ A done-claim that misses BOTH a `task/` search AND `routine_done` (returns `unkn
 3. **Found it** → do NOT say "no match". Route on the entry's shape (see the `tier_curation` block schema earlier in this doc):
     - **`task:` origin** (t1/t2) → there is a backing task record; this is a task closure — `vault_edit path="task/<Name>.md" set_fields={"status": "done"}` (the Worked example G close pattern).
     - **`routine_item:` origin** (t1/t2) → re-fire `routine_done` with the entry's CANONICAL `record` + `text` (e.g. `routine_done record="Recurring Bills + Admin" item="Pay Clinic Rental to Hussein Rafih"`). The fuzzy miss was on the operator's loose phrasing; the tier entry hands you the exact strings, so this now resolves to `success`.
-    - **`item:` free-text T3** → acknowledge it is on today's T3 list, and be honest that ad-hoc T3 items have **no completion record yet** — there is no `status` to flip and no `completion_log` to write, so you cannot formally check it off the way a routine or task closes. Confirm you see it; **do NOT fabricate a "logged" you can't write, and do NOT invent a T3 done-write** (the ad-hoc-tier done-state is a known open schema gap).
+    - **`item:` free-text T3** → as of Arc #20 this HAS a done-state. Call **`tier_done`** to check it off — pass the entry's canonical `item:` text you just read from the block (like the `routine_item:` branch hands you canonical strings, passing the exact text guarantees the fuzzy matcher hits), and `completed_at` only if the claim was back-dated. Route on the returned `kind`: `success` → confirm it (*"Checked 'Rake leaves' off today's T3 list"*); `idempotent_noop` → already checked for that date, note gently; `ambiguous_item` → ask back with the numbered `candidates`; `future_date_rejected` → clarify the date; `unknown_item` → genuinely no matching T3 entry (shouldn't occur here — you just read it — but if it does, fall back to the step-2 honest close; **do NOT claim a done you didn't write**). Full contract: **Marking a free-text T3 ad-hoc item done — `tier_done` / `tier_undone`** above.
 
 The failure this closes (2026-07-16, twice in one session): the operator named a T3 ad-hoc item ("rake leaves") as done, `routine_done` returned `unknown_item`, and Salem replied "no match" — with today's brief screenshot, showing the item on the T3 list, in front of it. The read above would have surfaced it. When the answer is "I can't find X" and X is a done-claim, you have not looked everywhere until you have read today's `tier_curation`.
 
@@ -894,11 +931,13 @@ The failure this closes (2026-07-16, twice in one session): the operator named a
 >   source: "operator-adhoc"
 > ```
 >
-> Found — a T3 free-text ad-hoc item (`item:` shape, not `task:` / `routine_item:`). So there is no `status` to flip and no `completion_log` to write; ad-hoc T3 completion has no record yet.
+> Found — a T3 free-text ad-hoc item (`item:` shape, not `task:` / `routine_item:`). As of Arc #20 this HAS a done-state. Salem calls `tier_done item="Rake leaves"` (the canonical text from the block; `completed_at` omitted → today) → `{"kind": "success", "item": "Rake leaves", "date": "2026-07-16", "candidates": [], "done_at": "2026-07-16"}`. The tool stamped `done_at` on the matched T3 entry — `/today` drops it and tomorrow's brief ✓-strikes it.
 >
-> Reply (honest, NOT "no match"): *"'Rake leaves' is on today's T3 list — I can see it. Ad-hoc T3 items don't have a done-state I can log yet (unlike routines and tasks), so I can't formally check it off, but noted."*
+> Reply (on `success`): *"Checked 'Rake leaves' off today's T3 list."*
 >
-> Contrast — had the tier entry been a `routine_item:` (routine-origin T2), Salem would re-fire `routine_done record="<entry.record>" item="<entry.text>"` with the canonical strings and get a `success`; had it been a `task:` entry, Salem would close that task with `set_fields={"status": "done"}`. Only the free-text T3 case dead-ends at "acknowledge but can't log" — and that dead-end is the schema gap, not a reason to go back to "no match".
+> Other `kind`s off the same call: `idempotent_noop` → *"'Rake leaves' was already checked off today."* (no double-write); `ambiguous_item` → ask back with the numbered `candidates`; `unknown_item` → the honest step-2 close (genuinely not on the list — do NOT claim a done you didn't write).
+>
+> Contrast — each of the three tier shapes now has a done path: a `task:` entry closes via `set_fields={"status": "done"}`; a `routine_item:` (routine-origin) re-fires `routine_done record="<entry.record>" item="<entry.text>"` with the canonical strings → `success`; a free-text `item:` T3 checks off via `tier_done`. The 2026-07-16 dead-end (free-text T3 had no done-state at all) is closed.
 
 #### Disambiguation between "I'll do this" vs "I did this"
 
