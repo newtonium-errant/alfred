@@ -105,6 +105,13 @@ class CaseScore:
     claim_count: int = 0
 
     @property
+    def words_per_claim(self) -> float:
+        """#14d — the DENSITY metric (words / atomic claim). 0.0 for a degenerate zero-claim note
+        (empty / parse-failed) — such cases are EXCLUDED from the corpus distribution aggregates so
+        their 0.0 can't understate verbosity (they surface as an explicit excluded-count instead)."""
+        return self.word_count / self.claim_count if self.claim_count else 0.0
+
+    @property
     def scored_axes(self) -> list[AxisScore]:
         return [a for a in (self.fabrication, self.wrong_drug, self.missed_mh) if a.scored]
 

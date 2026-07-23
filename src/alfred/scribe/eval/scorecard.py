@@ -100,6 +100,21 @@ class Scorecard:
     grounding_flag_reasons: dict[str, int] = field(default_factory=dict)
     mean_word_count: float = 0.0
     mean_claim_count: float = 0.0
+    # #14d-i — the words-per-claim density DISTRIBUTION (RECORDED-ONLY; Q2 defers the pass/fail bar).
+    # Computed over cases WITH claims only (zero-claim cases excluded so their 0.0 can't understate the
+    # metric); the excluded count is surfaced explicitly (ILB). mean/median/p90 give the operator the
+    # SHAPE (incl. the tail) to set a real-data target later.
+    mean_words_per_claim: float = 0.0
+    median_words_per_claim: float = 0.0
+    p90_words_per_claim: float = 0.0
+    words_per_claim_cases: int = 0        # N cases WITH claims (the distribution denominator)
+    zero_claim_cases: int = 0             # M degenerate cases EXCLUDED from the distribution
+    # DORMANT pass/fail plumbing (consumer-fields-from-day-one). ``succinctness_target`` is None in
+    # 14d-i → recorded-only, NO verdict. When a REAL-DATA target is later passed to ``aggregate`` it
+    # activates: ``verbose_rate`` = fraction of with-claim cases over the target. The target is NEVER
+    # auto-pulled from the profile's guessed 25 (that stays the advisory quality_verbose flag's).
+    succinctness_target: float | None = None
+    verbose_rate: float | None = None
 
     @property
     def any_inaccuracy_rate(self) -> float:
@@ -107,10 +122,26 @@ class Scorecard:
                 if self.any_inaccuracy_scored else 0.0)
 
 
+def _percentile(sorted_vals: list[float], q: float) -> float:
+    """Nearest-rank percentile (deterministic, stdlib-only) over an ASCENDING-sorted list. ``q`` in
+    [0,1]. Empty → 0.0. Used for the p90 verbosity tail."""
+    if not sorted_vals:
+        return 0.0
+    import math
+    rank = max(1, math.ceil(q * len(sorted_vals)))     # 1-based nearest rank
+    return sorted_vals[min(rank, len(sorted_vals)) - 1]
+
+
 def aggregate(
     case_scores: list[CaseScore], *, mode: str, model: str,
+    succinctness_target: float | None = None,
 ) -> Scorecard:
-    """Roll per-case scores up into a :class:`Scorecard`."""
+    """Roll per-case scores up into a :class:`Scorecard`.
+
+    ``succinctness_target`` (#14d-i) is None by default → the words/claim axis is RECORDED-ONLY (no
+    pass/fail verdict, Q2). Passing a REAL-DATA target (LATER) activates the dormant ``verbose_rate``.
+    It is NEVER defaulted to the profile's guessed 25."""
+    import statistics
     rollups: dict[str, AxisRollup] = {}
     for axis, ag in AG_BASELINES.items():
         scored = [cs for cs in case_scores if _axis_of(cs, axis).scored]
@@ -131,6 +162,19 @@ def aggregate(
                 continue
             reason_totals[reason] = reason_totals.get(reason, 0) + count
 
+    # #14d-i — words/claim DISTRIBUTION over cases WITH claims only (zero-claim cases would inject a
+    # misleading 0.0). The excluded count is surfaced explicitly (ILB).
+    wpc_values = sorted(cs.words_per_claim for cs in case_scores if cs.claim_count > 0)
+    zero_claim_cases = sum(1 for cs in case_scores if cs.claim_count == 0)
+    mean_wpc = sum(wpc_values) / len(wpc_values) if wpc_values else 0.0
+    median_wpc = statistics.median(wpc_values) if wpc_values else 0.0
+    p90_wpc = _percentile(wpc_values, 0.90)
+    # DORMANT pass/fail — activates ONLY on an explicit real-data target (None in 14d-i → recorded-only).
+    verbose_rate = (
+        sum(1 for v in wpc_values if v > succinctness_target) / len(wpc_values)
+        if succinctness_target is not None and wpc_values else
+        (0.0 if succinctness_target is not None else None))
+
     n = len(case_scores) or 1
     return Scorecard(
         mode=mode,
@@ -146,6 +190,13 @@ def aggregate(
         grounding_flag_reasons=reason_totals,
         mean_word_count=sum(cs.word_count for cs in case_scores) / n,
         mean_claim_count=sum(cs.claim_count for cs in case_scores) / n,
+        mean_words_per_claim=mean_wpc,
+        median_words_per_claim=median_wpc,
+        p90_words_per_claim=p90_wpc,
+        words_per_claim_cases=len(wpc_values),
+        zero_claim_cases=zero_claim_cases,
+        succinctness_target=succinctness_target,
+        verbose_rate=verbose_rate,
     )
 
 
@@ -286,19 +337,36 @@ def render_scorecard_md(sc: Scorecard) -> str:
         f"- **Verbosity (Suki succinctness gap):** mean "
         f"**{sc.mean_word_count:.0f}** words / **{sc.mean_claim_count:.1f}** atomic "
         "claims per note — the baseline #14's note-quality loop tunes against.")
+    # #14d-i — the words/claim DENSITY distribution, rendered ALONGSIDE the completeness axes above so
+    # a succinctness "win" that drops a required claim shows as a missed_mh regression in the SAME
+    # scorecard. RECORDED-ONLY (Q2): no pass/fail target/verdict unless one is explicitly configured.
+    lines.append(
+        f"- **Words / atomic claim (#14 density — RECORDED-ONLY, no pass/fail target set (Q2)):** "
+        f"mean **{sc.mean_words_per_claim:.1f}**, median **{sc.median_words_per_claim:.1f}**, "
+        f"p90 **{sc.p90_words_per_claim:.1f}** over {sc.words_per_claim_cases} case(s) with claims"
+        + (f"; **{sc.zero_claim_cases}** zero-claim case(s) EXCLUDED from the distribution"
+           if sc.zero_claim_cases else "")
+        + ". Read WITH the completeness axes (missed_mh) above — set a corpus target from this "
+          "real-data distribution before enabling any bar.")
+    if sc.succinctness_target is not None:
+        lines.append(
+            f"  - configured target **{sc.succinctness_target:.0f}** w/claim → "
+            f"**{sc.verbose_rate:.0%}** of {sc.words_per_claim_cases} with-claim case(s) over target.")
     lines.append("")
 
     # --- per-case detail ---
     lines.append("## Per-case detail")
     lines.append("")
     lines.append("| Case | Primary axis | Fabrication | Wrong-drug | Missed-MH | "
-                 "Ground.flags | Speaker.flags | Words |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+                 "Ground.flags | Speaker.flags | Words | W/claim |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for cs in sc.case_scores:
+        # #14d-i — a zero-claim (degenerate) case shows "—" (excluded from the aggregate; visible here).
+        wpc_cell = f"{cs.words_per_claim:.1f}" if cs.claim_count > 0 else "—"
         lines.append(
             f"| `{cs.case_id}` | {cs.primary_axis} | {_cell(cs.fabrication)} | "
             f"{_cell(cs.wrong_drug)} | {_cell(cs.missed_mh)} | "
-            f"{cs.grounding_flag_count} | {cs.speaker_flag_count} | {cs.word_count} |")
+            f"{cs.grounding_flag_count} | {cs.speaker_flag_count} | {cs.word_count} | {wpc_cell} |")
     lines.append("")
 
     # --- failing-case explanations (intentionally-left-blank: say so if none) ---
