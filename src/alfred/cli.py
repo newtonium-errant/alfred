@@ -2730,6 +2730,12 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     if subcmd == "retention":
         _cmd_scribe_retention(args)
         return
+    if subcmd == "negation-candidates":
+        _cmd_scribe_negation_candidates(args)
+        return
+    if subcmd == "negation-glossary":
+        _cmd_scribe_negation_glossary(args)
+        return
     if subcmd != "attest":
         print("Usage: alfred scribe {attest <note> --attester <clinician> | "
               "events {list|verify|tip|anchor} | audit encounter <enc> | "
@@ -3382,6 +3388,7 @@ def _retention_destroy(args: argparse.Namespace) -> None:
     destroy-ADDRESSABILITY only). Safeguards: --dry-run enumerates + mutates nothing; an interactive
     type-the-encounter-id-back confirmation unless --yes."""
     from alfred.scribe import backup as backup_mod
+    from alfred.scribe import negation_suppression as _ns
     from alfred.scribe import retention as ret_mod
     from alfred.scribe import schedule as sched_mod
     from alfred.scribe.config import load_from_unified as load_scribe_config
@@ -3417,6 +3424,8 @@ def _retention_destroy(args: argparse.Namespace) -> None:
         purge_preview = backup_mod.purge_encounter(cfg, enc, dry_run=True)
         print(json.dumps({
             "dry_run": True, "encounter_id": enc, "would_unlink": would,
+            # #26 — derived-PHI candidate/attest rows that WOULD be row-pruned for this source_id.
+            "negation_candidate_rows": _ns.count_rows_for_source(_ns.resolve_candidates_dir(cfg), enc),
             "residual_label_dirs": len(label_dirs), "clinical_notes": len(note_paths),
             # WARN-1: an unparseable clinical_note has an UNKNOWABLE source_id (could be the target) —
             # a real run would REFUSE while any exist; surface it here so the preview never hides it.
@@ -3520,6 +3529,22 @@ def _retention_destroy(args: argparse.Namespace) -> None:
             unlinked.append(str(note))
         except Exception as exc:  # noqa: BLE001 — a scope/vault error blocks destroyed (fail-loud below)
             failures.append(f"{note}: {exc}")
+
+    # #26 DESTROY-WITH-ENCOUNTER — prune the derived-PHI negation candidate + attest-outcome rows
+    # for this source_id from BOTH shared JSONL spools (a row-prune keyed by source_id, NOT a file
+    # unlink — the spools hold rows for many encounters). The de-identified Tier-2 glossary is NEVER
+    # touched (it survives s.49 by design). A prune error OR any residual row is folded into the SAME
+    # completeness gate below: a surviving derived-PHI row = INCOMPLETE destruction (the false-proof
+    # class), so retention.destroyed is BLOCKED until it's gone.
+    _cand_dir = _ns.resolve_candidates_dir(cfg)
+    try:
+        _ns.prune_candidates_for_source(_cand_dir, enc)
+    except Exception as exc:  # noqa: BLE001 — a prune failure BLOCKS destroyed (fail-loud gate)
+        failures.append(f"negation candidate spool ({enc}): {exc}")
+    _residual_cand = _ns.count_rows_for_source(_cand_dir, enc)
+    if _residual_cand:
+        failures.append(
+            f"negation candidate spool: {_residual_cand} derived-PHI row(s) for {enc} survived the prune")
 
     # BACKUP PURGE (§5.4 / Q3) — rewrite --exclude --forget + prune on the DEDICATED repo, assert-empty.
     purge = backup_mod.purge_encounter(cfg, enc)
@@ -3760,6 +3785,164 @@ def _cmd_scribe_retention(args: argparse.Namespace) -> None:
         "on_disk_sha256": on_disk_sha, "chain_pinned_sha256": chain_sha,
         "pin_matches": bool(chain_sha) and on_disk_sha == chain_sha,
         "classes": sched["classes"], "minor_rule": sched["minor_rule"]}, indent=2))
+
+
+def _cmd_scribe_negation_candidates(args: argparse.Namespace) -> None:
+    """``alfred scribe negation-candidates [--json]`` — LIST review-ready #26 paraphrase-
+    suppression candidates (the 1a⋈1b join: a paraphrase the detector FLAGGED that the clinician
+    then ATTESTED unchanged = an implicit 'faithful' verdict), minus those already decided.
+
+    LOCAL-ONLY, NEVER RELAYED. PHI-BEARING: it renders the CONCEPT-SETS (claim + cite word-sets)
+    tied to the opaque source_id — NOT raw sentences (Phase 1 deliberately never stored those). To
+    see raw context the operator pulls the transcript by source_id on-box while it still exists. ILB:
+    an empty list prints an explicit line, never silence (idle ≠ broken)."""
+    from alfred.scribe import negation_suppression as _ns
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+    cand_dir = _ns.resolve_candidates_dir(cfg)
+    ev = _open_scribe_events(raw)
+    decided = ev.negation_decided_ids() if ev.active else set()
+    candidates = _ns.join_review_ready(cand_dir, decided)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "pending": len(candidates),
+            "candidates": [{
+                "candidate_id": c.candidate_id, "source_id": c.source_id,
+                "section": c.section, "claim_index": c.claim_index,
+                "claim_concepts": [list(s) for s in c.claim_concepts],
+                "cite_concepts": [list(s) for s in c.cite_concepts],
+            } for c in candidates]}, indent=2))
+        return
+    if not candidates:
+        print("No negation-paraphrase candidates awaiting review.")   # ILB — idle ≠ broken
+        return
+    print(f"{len(candidates)} negation-paraphrase candidate(s) awaiting review "
+          f"(LOCAL-ONLY, PHI-bearing concept-sets):\n")
+    for c in candidates:
+        print(f"  {c.candidate_id}  [{c.section}#{c.claim_index}]  source={c.source_id}")
+        for cs in c.claim_concepts:
+            print(f"      claim negates: {{{', '.join(cs)}}}")
+        for cs in c.cite_concepts:
+            print(f"      cite  negates: {{{', '.join(cs)}}}")
+    print("\nApprove: alfred scribe negation-glossary approve <candidate_id> --operator <name> "
+          "[--drop tok,tok] [--pair c:i]\n"
+          "Reject:  alfred scribe negation-glossary reject <candidate_id> --operator <name>")
+
+
+def _cmd_scribe_negation_glossary(args: argparse.Namespace) -> None:
+    """``alfred scribe negation-glossary {approve <id> [--drop t,t][--pair c:i] | reject <id>}
+    --operator <name>`` — the audited operator decision that closes the #26 loop.
+
+    APPROVE: pick the concept pair (single = unambiguous; MULTI requires ``--pair <claim_idx>:<cite_idx>``,
+    NEVER a silent cross-product — that would over-suppress a whole class) → de-identify (default =
+    AS-CAPTURED; ``--drop`` removes named PHI-residue tokens) → append the pair to the Tier-2 glossary
+    (which the detector reads) → emit the PHI-FREE durable ``negation.approved`` [D].
+    REJECT: emit ``negation.rejected`` [D] (the flag stands; the candidate leaves the review list).
+
+    Both are hash-chained governance facts (the approval chain is the tamper-evident proof of every
+    detector change). ORDER = glossary-write THEN audit: a crash between leaves a pair-without-event
+    that a re-run self-heals (append is idempotent; cid is not-yet-decided so the re-run completes the
+    audit) — never an event-without-pair dead-end. The audit carries the candidate_id HASH + the count
+    of dropped tokens ONLY — never a concept-set or a dropped-token string."""
+    from datetime import datetime, timezone
+
+    from alfred.scribe import negation_suppression as _ns
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+
+    gcmd = getattr(args, "glossary_cmd", None)
+    if gcmd not in ("approve", "reject"):
+        print("Usage: alfred scribe negation-glossary {approve <candidate_id> [--drop t,t] "
+              "[--pair c:i] | reject <candidate_id>} --operator <name>")
+        sys.exit(1)
+    raw = _load_unified_config(args.config)
+    cfg = load_scribe_config(raw)
+    cand_dir = _ns.resolve_candidates_dir(cfg)
+    ev = _open_scribe_events(raw)
+    if not ev.active:
+        print(json.dumps({"error": "clinical event store inactive — an audited negation decision "
+                                    "requires an active medico-legal store (scribe.mode: clinical)"}))
+        sys.exit(1)
+    operator = getattr(args, "operator", "") or ""
+    if not operator:
+        print(json.dumps({"error": "--operator <name> is required (the audited approver identity)"}))
+        sys.exit(1)
+    cid = args.candidate_id
+    decided = ev.negation_decided_ids()
+    if cid in decided:
+        print(json.dumps({"error": f"candidate {cid} was already decided (approved/rejected) — no-op",
+                          "candidate_id": cid}))
+        sys.exit(1)
+
+    if gcmd == "reject":
+        ev.negation_rejected(candidate_id=cid, operator=operator)
+        print(json.dumps({"rejected": cid, "operator": operator}, indent=2))
+        return
+
+    # APPROVE — the candidate must be in the CURRENT review-ready join (present + faithful-attested).
+    candidates = {c.candidate_id: c for c in _ns.join_review_ready(cand_dir, decided)}
+    cand = candidates.get(cid)
+    if cand is None:
+        print(json.dumps({"error": f"candidate {cid} is not review-ready (not in the join — no "
+                                    f"faithful-attest outcome, or already decided/pruned)",
+                          "candidate_id": cid}))
+        sys.exit(1)
+    n_claim, n_cite = len(cand.claim_concepts), len(cand.cite_concepts)
+    claim_i, cite_i = 0, 0
+    pair_arg = getattr(args, "pair", None)
+    if n_claim != 1 or n_cite != 1:
+        if not pair_arg:
+            print(json.dumps({
+                "error": "multi-concept candidate — specify --pair <claim_idx>:<cite_idx> (never a "
+                         "silent cross-product). Options enumerated below.",
+                "candidate_id": cid,
+                "claim_concepts": [list(s) for s in cand.claim_concepts],
+                "cite_concepts": [list(s) for s in cand.cite_concepts]}, indent=2))
+            sys.exit(1)
+        try:
+            claim_i, cite_i = (int(x) for x in str(pair_arg).split(":", 1))
+        except (ValueError, TypeError):
+            print(json.dumps({"error": f"--pair must be <claim_idx>:<cite_idx> (got {pair_arg!r})"}))
+            sys.exit(1)
+    if not (0 <= claim_i < n_claim and 0 <= cite_i < n_cite):
+        print(json.dumps({"error": f"--pair index out of range (claim 0..{n_claim - 1}, "
+                                    f"cite 0..{n_cite - 1})"}))
+        sys.exit(1)
+    claim_sel = list(cand.claim_concepts[claim_i])
+    cite_sel = list(cand.cite_concepts[cite_i])
+    # de-ID — --drop removes named PHI-residue tokens (default = as-captured). The dropped STRINGS
+    # never leave this process; only dropped_count crosses to the audit + glossary provenance.
+    drop_set = {t.strip().lower() for t in (getattr(args, "drop", "") or "").split(",") if t.strip()}
+    claim_final = [t for t in claim_sel if t not in drop_set]
+    cite_final = [t for t in cite_sel if t not in drop_set]
+    dropped_count = (len(claim_sel) + len(cite_sel)) - (len(claim_final) + len(cite_final))
+    if not claim_final or not cite_final:
+        print(json.dumps({"error": "--drop would empty a concept-set — refusing (a pair needs both "
+                                    "sides). Drop fewer tokens.", "candidate_id": cid}))
+        sys.exit(1)
+
+    glossary_path = _ns.resolve_glossary_path(cfg)
+    revision = _ns.append_approved_pair(
+        glossary_path, candidate_id=cid, claim_concept=claim_final, cite_concept=cite_final,
+        approved_by=operator, approved_at=datetime.now(timezone.utc).isoformat(),
+        dropped_count=dropped_count)
+    # Audit AFTER the atomic glossary write (see the ordering note in the docstring). Fail-loud on an
+    # emit failure so the operator re-runs (idempotent append → the re-run only completes the audit).
+    try:
+        ev.negation_approved(candidate_id=cid, operator=operator, glossary_version=revision,
+                             dropped_count=dropped_count)
+    except Exception as exc:  # noqa: BLE001 — glossary is written; the audit must be completed by re-run
+        print(json.dumps({
+            "error": f"pair written to the glossary (revision {revision}) but the durable "
+                     f"negation.approved audit FAILED: {exc}. RE-RUN approve to complete the audit "
+                     f"(the glossary append is idempotent — no duplicate).", "candidate_id": cid}))
+        sys.exit(1)
+    print(json.dumps({
+        "approved": cid, "operator": operator, "glossary_revision": revision,
+        "dropped_count": dropped_count, "claim_concept": sorted(claim_final),
+        "cite_concept": sorted(cite_final)}, indent=2))
 
 
 def _cmd_scribe_bugs(args: argparse.Namespace) -> None:
@@ -4906,6 +5089,31 @@ def build_parser() -> argparse.ArgumentParser:
     ret_sched_sub.add_parser(
         "show", help="Show the published schedule + whether its on-disk bytes still match the "
                      "chain-pinned sha (drift)")
+    # #26 — negation-paraphrase self-correcting loop: review + audited approve/reject.
+    scribe_neg_cand = scribe_sub.add_parser(
+        "negation-candidates",
+        help="List review-ready #26 negation-paraphrase suppression candidates (LOCAL-ONLY, "
+             "PHI-bearing concept-sets)")
+    scribe_neg_cand.add_argument("--json", action="store_true", help="JSON output")
+    scribe_neg_gloss = scribe_sub.add_parser(
+        "negation-glossary",
+        help="Audited approve/reject of a #26 paraphrase-suppression candidate (writes the Tier-2 "
+             "glossary + a PHI-free hash-chained decision)")
+    neg_gloss_sub = scribe_neg_gloss.add_subparsers(dest="glossary_cmd")
+    neg_approve = neg_gloss_sub.add_parser(
+        "approve", help="Approve a candidate → append the de-identified pair to the glossary + audit")
+    neg_approve.add_argument("candidate_id", help="The npc-... id from `negation-candidates`")
+    neg_approve.add_argument("--operator", required=True, help="The approver identity (audited)")
+    neg_approve.add_argument(
+        "--drop", default="",
+        help="Comma-separated PHI-residue tokens to drop before storing (default: as-captured)")
+    neg_approve.add_argument(
+        "--pair", default=None,
+        help="For a MULTI-concept candidate: <claim_idx>:<cite_idx> (required — never cross-products)")
+    neg_reject = neg_gloss_sub.add_parser(
+        "reject", help="Reject a candidate (the flag stands) + audit")
+    neg_reject.add_argument("candidate_id", help="The npc-... candidate id")
+    neg_reject.add_argument("--operator", required=True, help="The rejecting operator identity (audited)")
     # P4-5 — voice-preset management (local file ops under scribe.diarize.enrollment_dir).
     scribe_presets = scribe_sub.add_parser(
         "presets", help="Manage voice-enrollment presets (list / audit / delete)",

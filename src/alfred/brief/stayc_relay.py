@@ -307,3 +307,95 @@ def render_stayc_retention_relay_section(config, now_utc: datetime) -> str:
         f"STAY-C retention: {review_due} {plural} over the s.50 review window{tail} — "
         "review + run the destroy playbook (§5) as warranted."
     )
+
+
+# --- STAY-C Negation-Paraphrase Review Relay (#26 Phase 3) --------------------
+
+NEGATION_SECTION_HEADER = "STAY-C Negation Review"
+
+
+def _parse_negation_spool_header(text: str) -> tuple[int | None, datetime | None]:
+    """``(pending, generated_at)`` from the #26 negation-review spool header — the PHI-free fields the
+    sweep's ``_write_negation_review_spool`` writes (a bare COUNT + generated_at, NEVER a concept-set).
+    ``None`` for either field absent/unparseable. Defensive line scan (the sweep owns the format)."""
+    pending: int | None = None
+    generated_at: datetime | None = None
+    for line in text.splitlines():
+        s = line.strip()
+        if pending is None and s.startswith("pending:"):
+            try:
+                pending = int(s[len("pending:"):].strip())
+            except ValueError:
+                pending = None
+        elif generated_at is None and s.startswith("generated_at:"):
+            raw = s[len("generated_at:"):].strip()
+            try:
+                generated_at = datetime.strptime(raw, _TS_FORMAT).replace(tzinfo=timezone.utc)
+            except ValueError:
+                generated_at = None
+        if pending is not None and generated_at is not None:
+            break
+    return pending, generated_at
+
+
+def render_stayc_negation_relay_section(config, now_utc: datetime) -> str:
+    """Render the STAY-C negation-paraphrase review status line (#26 Phase-3 morning-review surface),
+    or ``""`` when disabled. PHI-FREE: ONLY the pending COUNT crosses into the (Telegram-transiting)
+    brief — never a concept-set (the PHI pairs stay on-box in ``alfred scribe negation-candidates``).
+    ILB: enabled ALWAYS returns a line (the count — INCLUDING an explicit '0 awaiting review' — or a
+    no-data / stale signal so a dead box sweep is visible; idle ≠ broken)."""
+    if not config.enabled:
+        return ""
+
+    spool_path = (config.spool_path or "").strip()
+    if not spool_path:
+        log.warning("brief.stayc_negation_relay", state="unconfigured")
+        return (
+            "**STAY-C negation relay: not configured** — set "
+            "`brief.stayc_negation_relay.spool_path` to the sweep's negation-review spool."
+        )
+
+    path = Path(spool_path).expanduser()
+    read = safe_read_section_file(path)
+    if read.status is SectionReadStatus.NOT_FOUND:
+        log.info("brief.stayc_negation_relay", state="absent", spool_path=spool_path)
+        return (
+            "**STAY-C negation relay: no data** — negation-review spool not found "
+            f"(`{spool_path}`). The box sweep may not be running / synced."
+        )
+    if read.status is SectionReadStatus.OS_ERROR:
+        log.warning("brief.stayc_negation_relay", state="unreadable",
+                    spool_path=spool_path, error=read.detail)
+        return f"**STAY-C negation relay: no data** — negation-review spool unreadable (`{spool_path}`)."
+    if read.status is SectionReadStatus.DECODE_ERROR:
+        log.warning("brief.stayc_negation_relay", state="unreadable", spool_path=spool_path)
+        return "**STAY-C negation relay: no data** — negation-review spool unreadable (not UTF-8)."
+
+    pending, generated_at = _parse_negation_spool_header(read.text)
+    if pending is None or generated_at is None:
+        log.warning("brief.stayc_negation_relay", state="unreadable", spool_path=spool_path,
+                    detail="header missing pending/generated_at")
+        return (
+            "**STAY-C negation relay: no data** — negation-review spool present but its header "
+            "could not be parsed."
+        )
+
+    age_hours = (now_utc - generated_at).total_seconds() / 3600.0
+    if age_hours > config.staleness_hours:
+        log.warning("brief.stayc_negation_relay", state="stale", pending=pending,
+                    age_hours=round(age_hours, 1), spool_path=spool_path)
+        return (
+            f"**STAY-C negation relay: stale** — last update "
+            f"{generated_at.strftime(_TS_FORMAT)} "
+            f"({int(age_hours)}h ago, threshold {config.staleness_hours}h). "
+            "The box sweep may have stopped."
+        )
+
+    log.info("brief.stayc_negation_relay", state="fresh", pending=pending)
+    if pending == 0:
+        return "STAY-C negation: 0 paraphrase candidates awaiting review."   # ILB — idle ≠ broken
+    plural = "candidate" if pending == 1 else "candidates"
+    return (
+        f"STAY-C negation: {pending} paraphrase {plural} awaiting review — "
+        "run `alfred scribe negation-candidates` on the box to approve/reject."
+    )

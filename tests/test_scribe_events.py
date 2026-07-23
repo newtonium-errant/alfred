@@ -34,6 +34,9 @@ EXPECTED_KINDS = {
     ("clinical", "encounter.closed"): (["final_seq"], False),
     ("clinical", "encounter.opened"): ([], False),
     ("clinical", "encounter.post_close_chunk_refused"): (["seq"], False),
+    # #26 learning family — negation-paraphrase suppression governance (PHI-free)
+    ("clinical", "negation.approved"): (["dropped_count", "glossary_version"], True),
+    ("clinical", "negation.rejected"): ([], True),
     ("clinical", "note.draft_created"): (["body_sha"], False),
     ("clinical", "note.draft_regenerated"): (["body_sha", "grounding_flag_count", "marker"], False),
     ("clinical", "note.human_edit_detected"): (["body_sha_after", "body_sha_before"], False),

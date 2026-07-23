@@ -62,12 +62,13 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 
@@ -99,12 +100,21 @@ _SCRIBE_SUBDIR = "scribe"
 NEGATION_CANDIDATES_NAME = "negation_candidates.jsonl"          # render pairs (PHI-bearing)
 NEGATION_ATTEST_OUTCOMES_NAME = "negation_attest_outcomes.jsonl"  # attest kept (PHI-free)
 NEGATION_GLOSSARY_NAME = "negation_glossary.json"              # Tier-2 approved store (generic vocab)
+NEGATION_REVIEW_SPOOL_NAME = "negation_review.spool"          # PHI-FREE pending-COUNT relay snapshot
 GLOSSARY_VERSION = 1                                          # #26 v1 = exact-match concept-set PAIRS
 
 KIND_CANDIDATE = "candidate"
 KIND_ATTEST_OUTCOME = "attest_outcome"
 
 DISPOSITION_PENDING = "pending"
+
+# The unreviewed-candidate age cap (Phase-3 retention). A derived-PHI candidate that no operator
+# reviews within this window is pruned by the retention sweep — an un-actioned PHI row must not
+# linger indefinitely. 90d ≈ 3 morning-review cycles (team-lead ruling). A fixed named constant:
+# schedule-tunability (like the diarize telemetry window) would require widening the FROZEN
+# SCHEDULE_CLASSES contract (which every published schedule must match) — deferred as a separate
+# cross-cutting change; changing this literal is the interim tuning knob.
+NEGATION_CANDIDATE_AGE_CAP_DAYS = 90
 
 
 def _now() -> str:
@@ -410,3 +420,256 @@ def load_suppression(glossary_path: str | Path | None) -> NegationSuppression:
         if a_fs and b_fs:
             pairs.append((a_fs, b_fs))
     return NegationSuppression(pairs=tuple(pairs))
+
+
+def glossary_mtime(glossary_path: str | Path | None) -> float | None:
+    """The glossary file's mtime, or ``None`` if absent/unstattable — the mtime-reload key
+    (file-absent is a valid steady state, not an error)."""
+    try:
+        p = Path(glossary_path or "")
+        return p.stat().st_mtime if p.is_file() else None
+    except OSError:
+        return None
+
+
+def maybe_reload_suppression(
+    current: NegationSuppression, glossary_path: str | Path | None, last_mtime: float | None,
+) -> tuple[NegationSuppression, float | None]:
+    """#26 Phase-3 TIMELY RELOAD — mtime-gated re-read of the Tier-2 store for the running
+    daemon. Re-reads ONLY when the glossary mtime changed since ``last_mtime`` (an operator
+    approve rewrites the glossary → bumps mtime → the running daemon applies it on the NEXT
+    sweep, no restart), at zero cost when unchanged. REUSES the fail-safe :func:`load_suppression`
+    (corrupt/missing → empty store → still flags, never crashes the sweep). File-absent is a
+    valid steady state. Returns ``(store, mtime)`` for the caller to carry forward."""
+    mtime = glossary_mtime(glossary_path)
+    if mtime == last_mtime:
+        return current, last_mtime            # unchanged → keep the in-memory store
+    store = load_suppression(glossary_path)
+    log.info(
+        "scribe.negation_suppression.reloaded", pairs=len(store.pairs),
+        detail="#26 approved-suppression store reloaded (glossary changed — operator approval "
+               "applies this sweep, no daemon restart)")
+    return store, mtime
+
+
+# ===========================================================================
+# Phase 3 — PROPOSE + APPROVE: join / review backing / glossary write / retention
+# ===========================================================================
+
+def candidate_id(source_id: Any, section: Any, claim_index: Any) -> str:
+    """The deterministic, PHI-FREE handle for a paraphrase candidate — a truncated sha256 of
+    the join key ``(source_id, section, claim_index)``. Stable across runs (DERIVED, not stored),
+    so the render row (1a) and attest row (1b) for the same claim map to the SAME id. Serves as:
+    the ``negation-candidates`` list handle, the approve/reject argument, the evstore audit
+    subject (candidate_hash), AND the glossary pair's provenance id. Carries NO PHI — source_id
+    is already a salted-opaque encounter id, and a hash of it + positions is non-reversible."""
+    raw = f"{source_id}|{section}|{claim_index}"
+    return "npc-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+@dataclass(frozen=True)
+class ReviewCandidate:
+    """One review-ready paraphrase candidate (the 1a⋈1b join result). PHI-BEARING (concept-sets
+    tied to an opaque source_id) — on-box operator review ONLY, NEVER relayed."""
+
+    candidate_id: str
+    source_id: str
+    section: str
+    claim_index: Any
+    claim_concepts: tuple[tuple[str, ...], ...]
+    cite_concepts: tuple[tuple[str, ...], ...]
+
+
+def _read_rows(path: Path) -> list[dict]:
+    """Read a JSONL sink → list of dict rows. Tolerant: absent → []; a torn/partial line
+    (an append-only sink can tear on a crash) is SKIPPED; a corrupt file never raises. So a
+    prune over the result also self-heals torn lines."""
+    if not path.is_file():
+        return []
+    rows: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    row = json.loads(s)
+                except Exception:  # noqa: BLE001 — skip a torn line, never fail the read
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except Exception:  # noqa: BLE001 — a corrupt sink must never crash the join/prune
+        return rows
+    return rows
+
+
+def _row_key(row: dict) -> tuple:
+    return (row.get("source_id"), row.get("section"), row.get("claim_index"))
+
+
+def join_review_ready(
+    candidates_dir: str | Path, decided_ids: set[str] | None = None,
+) -> list[ReviewCandidate]:
+    """The 1a⋈1b JOIN — pair render candidate rows (1a) with attest-outcome rows (1b) on
+    ``(source_id, section, claim_index)``. A key is REVIEW-READY iff it has ≥1 candidate row
+    AND ≥1 attest_outcome with ``kept=True`` (the clinician signed the flagged paraphrase
+    UNCHANGED = an implicit 'faithful' verdict) AND its ``candidate_id`` is NOT already decided
+    (approved/rejected). Multi-checkpoint duplicate candidate rows dedupe to the LATEST by ts.
+
+    Returns PHI-bearing :class:`ReviewCandidate`s for on-box operator review ONLY (never relayed)."""
+    decided = decided_ids or set()
+    cand_by_key: dict[tuple, dict] = {}
+    for row in _read_rows(_candidates_file(candidates_dir)):
+        if row.get("kind") != KIND_CANDIDATE:
+            continue
+        k = _row_key(row)
+        prev = cand_by_key.get(k)
+        if prev is None or str(row.get("ts", "")) >= str(prev.get("ts", "")):
+            cand_by_key[k] = row              # latest-by-ts wins (dedupe checkpoint regens)
+    kept_keys = {
+        _row_key(row) for row in _read_rows(_attest_outcomes_file(candidates_dir))
+        if row.get("kind") == KIND_ATTEST_OUTCOME and row.get("kept") is True
+    }
+    out: list[ReviewCandidate] = []
+    for k, row in cand_by_key.items():
+        if k not in kept_keys:
+            continue                          # not attested-faithful → not review-ready
+        cid = candidate_id(row.get("source_id"), row.get("section"), row.get("claim_index"))
+        if cid in decided:
+            continue                          # already approved/rejected
+        out.append(ReviewCandidate(
+            candidate_id=cid,
+            source_id=str(row.get("source_id", "")),
+            section=str(row.get("section", "")),
+            claim_index=row.get("claim_index"),
+            claim_concepts=tuple(tuple(str(t) for t in c) for c in (row.get("claim_concepts") or [])),
+            cite_concepts=tuple(tuple(str(t) for t in c) for c in (row.get("cite_concepts") or [])),
+        ))
+    out.sort(key=lambda c: c.candidate_id)    # deterministic order
+    return out
+
+
+def count_pending(candidates_dir: str | Path, decided_ids: set[str] | None = None) -> int:
+    """PHI-FREE count of review-ready candidates — the ONLY negation-loop number that may
+    cross the relay boundary (NEVER the concept-sets). Just the join length."""
+    return len(join_review_ready(candidates_dir, decided_ids))
+
+
+def _prune_sink(sink_path: Path, drop: Callable[[dict], bool]) -> int:
+    """Read → keep rows where NOT ``drop(row)`` → atomic rewrite (tmp→rename), UNDER the sink
+    lock. Returns the count REMOVED. Absent file → 0. The SAME lock + helper backs BOTH the
+    destroy-by-source prune AND the age-cap prune, so they can NEVER race on the same sink
+    (team-lead ruling). A torn line is already dropped by :func:`_read_rows`, so a prune also
+    self-heals a partially-written sink."""
+    if not sink_path.is_file():
+        return 0
+    with _sink_lock(sink_path):
+        rows = _read_rows(sink_path)
+        keep = [r for r in rows if not drop(r)]
+        removed = len(rows) - len(keep)
+        if removed == 0:
+            return 0
+        tmp = sink_path.with_suffix(sink_path.suffix + ".prune.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                for r in keep:
+                    f.write(json.dumps(r) + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, sink_path)        # atomic swap — never a partial sink
+        except Exception:
+            with contextlib.suppress(OSError):
+                tmp.unlink()                  # never leave a stale .prune.tmp
+            raise
+    return removed
+
+
+def prune_candidates_for_source(candidates_dir: str | Path, source_id: str) -> int:
+    """DESTROY-WITH-ENCOUNTER — remove every candidate + attest-outcome row for ``source_id``
+    from BOTH PHI-bearing sinks (an s.49 destruction wipes the encounter's derived-PHI candidates
+    too). Returns total rows removed. The de-identified Tier-2 glossary is NOT touched (it survives
+    destruction). Pair with :func:`count_rows_for_source` to GATE the destroyed event."""
+    n = _prune_sink(_candidates_file(candidates_dir), lambda r: r.get("source_id") == source_id)
+    n += _prune_sink(_attest_outcomes_file(candidates_dir), lambda r: r.get("source_id") == source_id)
+    return n
+
+
+def count_rows_for_source(candidates_dir: str | Path, source_id: str) -> int:
+    """The destroy COMPLETENESS verifier — rows still bearing ``source_id`` across BOTH sinks.
+    The destroy path GATES ``retention.destroyed`` on this being 0 AFTER the prune: a residual
+    derived-PHI row = destruction INCOMPLETE = fail-loud (same posture as a note-unlink failure)."""
+    n = sum(1 for r in _read_rows(_candidates_file(candidates_dir)) if r.get("source_id") == source_id)
+    n += sum(1 for r in _read_rows(_attest_outcomes_file(candidates_dir)) if r.get("source_id") == source_id)
+    return n
+
+
+def prune_candidates_by_age(candidates_dir: str | Path, cutoff_iso: str) -> int:
+    """AGE-CAP prune — remove rows whose ``ts`` is older than ``cutoff_iso`` (an un-reviewed
+    candidate must not linger as derived PHI past the cap). ``ts`` is a ``datetime.isoformat()``
+    UTC string, so a lexicographic compare is chronological (same format on both sides). A row
+    with a MISSING/malformed ts is DROPPED — fail-safe: an unage-able PHI row should not persist.
+    Same lock/helper as the destroy prune."""
+    def _too_old(r: dict) -> bool:
+        ts = r.get("ts")
+        return not (isinstance(ts, str) and ts >= cutoff_iso)
+    n = _prune_sink(_candidates_file(candidates_dir), _too_old)
+    n += _prune_sink(_attest_outcomes_file(candidates_dir), _too_old)
+    return n
+
+
+def append_approved_pair(
+    glossary_path: str | Path, *, candidate_id: str,
+    claim_concept: list[str], cite_concept: list[str],
+    approved_by: str, approved_at: str, dropped_count: int = 0,
+) -> int:
+    """Append ONE operator-approved pair to the Tier-2 glossary (atomic tmp→rename, 0600) and
+    return the new ``revision`` (a monotonic edit counter — the audit's ``glossary_version``).
+
+    The stored pair is de-identified generic vocab: concept-SETS (already post-``--drop``) + the
+    PHI-FREE provenance ``id`` = ``candidate_id`` (NOT the raw source_id — a self-contained hash
+    that survives s.49 destruction without a dangling encounter reference, team-lead's Contract-A
+    refinement). The dropped token STRINGS are NEVER stored (they were the PHI residue removed);
+    only ``dropped_count`` is kept. IDEMPOTENT: a pair whose ``id`` already exists is a no-op
+    (returns the current revision) — a double-approve can't duplicate a pair."""
+    p = Path(glossary_path)
+    data: dict[str, Any] = {}
+    if p.is_file():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:  # noqa: BLE001 — a corrupt glossary is rebuilt from a clean base
+            log.warning(
+                "scribe.negation_suppression.glossary_rewrite_over_corrupt", path=str(p),
+                detail="approved-store JSON was unreadable at approve — rebuilding from a clean base "
+                       "(prior pairs unrecoverable; the evstore approve chain remains authoritative)")
+    pairs = data.get("pairs")
+    if not isinstance(pairs, list):
+        pairs = []
+    if any(isinstance(e, dict) and e.get("id") == candidate_id for e in pairs):
+        return int(data.get("revision", len(pairs)))     # already approved → no-op
+    revision = int(data.get("revision", 0)) + 1
+    pairs.append({
+        "id": candidate_id,
+        "claim_concept": sorted(claim_concept),
+        "cite_concept": sorted(cite_concept),
+        "approved_by": approved_by,
+        "approved_at": approved_at,
+        "dropped_count": int(dropped_count),
+    })
+    out = {"version": GLOSSARY_VERSION, "revision": revision, "pairs": pairs}
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(p.parent, 0o700)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return revision

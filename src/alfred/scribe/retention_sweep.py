@@ -64,6 +64,13 @@ from alfred.scribe.config import (
 )
 from alfred.scribe.enroll_learning import CAPTURE_NAME, LEARNING_DIRNAME, capture_sink_lock
 from alfred.scribe.identity import EncounterIdentityError, compute_encounter_id
+from alfred.scribe.negation_suppression import (
+    NEGATION_CANDIDATE_AGE_CAP_DAYS,
+    NEGATION_REVIEW_SPOOL_NAME,
+    count_pending,
+    prune_candidates_by_age,
+    resolve_candidates_dir,
+)
 from alfred.scribe.state import STATE_READY, ScribeState
 
 log = structlog.get_logger("scribe.retention.sweep")
@@ -121,6 +128,8 @@ class RetentionSweepSummary:
     skipped: int = 0                 # not eligible (still accumulating / closed-but-not-ready / in grace)
     encounter_errors: int = 0        # per-encounter failures, ISOLATED (the sweep continued)
     pruned_telemetry_rows: int = 0   # diarize_stats rows dropped (age-based, PHI-free log rotation)
+    pruned_negation_candidate_rows: int = 0  # #26 derived-PHI candidate/attest rows dropped (age-cap)
+    pending_negation_candidates: int = 0     # #26 review-ready count for the PHI-free relay spool
     review_due: int = 0              # §4 over-window PHI classes surfaced (0 until 13c's schedule)
     review_surfaced: bool = False    # §4/E3 — did surfacing actually EVALUATE this tick? (False when
     #                                  skipped/aborted — distinguishes 'ran, 0 due' from 'did not run')
@@ -238,8 +247,24 @@ class RetentionSweep:
                             detail="the telemetry-prune leg hit an unsearchable dir (EACCES) — isolated "
                                    "so the sweep summary + escalation still emit. Latched.")
 
+        # (4b) #26 negation-candidate AGE-CAP prune — drop un-reviewed DERIVED-PHI candidate/attest
+        # rows older than the cap so an un-actioned PHI row can't linger. Unlike the PHI-FREE diarize
+        # sink (which PRESERVES undateable rows), this PHI-bearing sink DROPS an undateable row
+        # (fail-safe toward not-retaining-PHI). Its own lock (shared with the destroy-prune) — cannot
+        # race the destroy path. Best-effort: a prune error is isolated, never wedges the sweep.
+        try:
+            summary.pruned_negation_candidate_rows = self._prune_negation_candidates(now_dt)
+        except OSError:
+            self._latch_log("negation_prune_eacces", "scribe.retention.sweep.negation_prune_leg_eacces",
+                            detail="the #26 negation-candidate age-cap prune hit an unsearchable dir "
+                                   "(EACCES) — isolated so the sweep summary still emits. Latched.")
+
         # (5) §4 morning-review relay spool (C3) — PHI-free whole-file snapshot Salem's brief reads.
         self._write_review_spool(now_dt, summary)
+
+        # (5b) #26 negation-paraphrase pending-COUNT relay spool — PHI-FREE (a bare count + generated_at,
+        # NEVER the concept-sets), a sibling of the review spool, gated on the same review_spool_path.
+        self._write_negation_review_spool(now_dt, summary)
 
         # Sweep summary — ALWAYS emitted (intentionally-left-blank: idle is distinguishable from broken).
         did = summary.did_work()
@@ -582,6 +607,50 @@ class RetentionSweep:
                        "stale/no-data until the next successful write. Check the path perms. Latched.")
             return
         self._latched.discard("review_spool_write_failed")  # a good write re-arms the warning
+
+    def _prune_negation_candidates(self, now_dt: datetime) -> int:
+        """#26 AGE-CAP prune of the DERIVED-PHI negation candidate + attest-outcome spools — drop rows
+        older than :data:`NEGATION_CANDIDATE_AGE_CAP_DAYS` so an un-reviewed candidate can't linger as
+        PHI. Row-prune under the negation sink lock (SHARED with the s.49 destroy-prune, so they never
+        race). PHI-BEARING posture: an undateable row is DROPPED (fail-safe toward not-retaining-PHI —
+        the OPPOSITE of the PHI-free diarize sink, which preserves undateable rows). Returns rows
+        dropped (folded into the sweep summary — ILB). No ``retention.*`` event (a rolling prune, not a
+        keyed s.49 destruction)."""
+        cand_dir = resolve_candidates_dir(self._config)
+        cutoff_iso = (now_dt - timedelta(days=NEGATION_CANDIDATE_AGE_CAP_DAYS)).isoformat()
+        return prune_candidates_by_age(cand_dir, cutoff_iso)
+
+    def _write_negation_review_spool(self, now_dt: datetime, summary: RetentionSweepSummary) -> None:
+        """Write the PHI-FREE #26 pending-COUNT relay snapshot — a sibling of the §4 review spool,
+        gated on the SAME ``review_spool_path`` (so the operator opts into all morning-review relays at
+        once, no extra config field). Carries ONLY ``generated_at`` + the review-ready pending COUNT —
+        NEVER a concept-set (count-only crosses the relay boundary; the PHI pairs stay on-box in
+        ``negation-candidates``). The join's 'decided' exclusion comes from the durable event chain (an
+        inactive store ⇒ decided = ∅, still a valid count). Atomic write, best-effort + latched-on-fail
+        (mirrors the review spool). Every sweep when configured (ILB: a fresh snapshot = sweep alive)."""
+        base = (self._config.retention.review_spool_path or "").strip()
+        if not base:
+            return
+        decided = self._ev.negation_decided_ids() if getattr(self._ev, "active", False) else set()
+        cand_dir = resolve_candidates_dir(self._config)
+        pending = count_pending(cand_dir, decided)
+        summary.pending_negation_candidates = pending
+        path = Path(base).with_name(NEGATION_REVIEW_SPOOL_NAME)
+        lines = [
+            "# STAY-C negation-paraphrase review — relay snapshot (PHI-free: count only)",
+            f"generated_at: {now_dt.strftime(self._REVIEW_SPOOL_TS)}",
+            f"pending: {pending}",
+        ]
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+        try:
+            ret._atomic_write_bytes(path, data)
+        except OSError:
+            self._latch_log(
+                "negation_spool_write_failed", "scribe.retention.sweep.negation_spool_write_failed",
+                detail="could not write the #26 negation-review relay spool — the morning-review line "
+                       "will read stale/no-data until the next successful write. Check path perms. Latched.")
+            return
+        self._latched.discard("negation_spool_write_failed")
 
     def _load_schedule(self) -> dict | None:
         """The published s.50 schedule dict, or ``None`` when the path is unset / absent / malformed —

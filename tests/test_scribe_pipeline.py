@@ -198,6 +198,53 @@ def test_process_source_drafts_ai_draft_with_grounding_flags(tmp_path, monkeypat
     assert GROUNDING_UNVERIFIED in note.content
 
 
+def test_process_source_threads_suppression_to_verify(tmp_path, monkeypatch):
+    # NOTE-1 (#26 Phase-2 heavy-gate carry-forward): the suppression store must reach verify through
+    # the REAL pipeline path (process_source → generate_verified_note → render_verified_note → verify),
+    # not merely render_verified_note (Phase 2's e2e pin). A verify-spy records the store identity it
+    # received; process_source must pass the EXACT object it was handed — a dropped kwarg on any hop →
+    # the spy sees None → this fails.
+    import alfred.scribe.pipeline as pl
+    from alfred.scribe.negation_suppression import NegationSuppression
+    seen = {}
+    orig = pl.verify_grounding
+
+    def _spy(structured, transcript, *, suppression=None):
+        seen["suppression"] = suppression
+        return orig(structured, transcript, suppression=suppression)
+    monkeypatch.setattr(pl, "verify_grounding", _spy)
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake_ollama_returning(_CANNED_CLEAN))
+    audio = _drop_input(tmp_path / "inbox")
+    state = ScribeState(tmp_path / "state.json")
+    store = NegationSuppression(pairs=((frozenset({"a"}), frozenset({"b"})),))
+    asyncio.run(process_source(audio, config=_config(), state=state,
+                               vault_path=tmp_path / "vault", suppression=store))
+    assert seen.get("suppression") is store        # the exact store threaded process_source → verify
+
+
+def test_run_sweep_threads_suppression_to_verify(tmp_path, monkeypatch):
+    # NOTE-1 — the run_sweep → process_source hop (the sweep entry the daemon actually calls).
+    import alfred.scribe.pipeline as pl
+    from alfred.scribe.negation_suppression import NegationSuppression
+    seen = {}
+    orig = pl.verify_grounding
+
+    def _spy(structured, transcript, *, suppression=None):
+        seen["suppression"] = suppression
+        return orig(structured, transcript, suppression=suppression)
+    monkeypatch.setattr(pl, "verify_grounding", _spy)
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake_ollama_returning(_CANNED_CLEAN))
+    input_dir = tmp_path / "inbox"
+    _drop_input(input_dir)
+    cfg = load_from_unified({"scribe": {
+        "mode": "synthetic", "encounter_salt": _SALT, "stt": {"provider": "fake"},
+        "llm": {"base_url": "http://127.0.0.1:11434", "model": "m"}, "input_dir": str(input_dir)}})
+    state = ScribeState(tmp_path / "state.json")
+    store = NegationSuppression(pairs=((frozenset({"a"}), frozenset({"b"})),))
+    asyncio.run(run_sweep(cfg, state, tmp_path / "vault", suppression=store))
+    assert seen.get("suppression") is store        # threaded run_sweep → process_source → verify
+
+
 # ---------------------------------------------------------------------------
 # Idempotency + resume
 # ---------------------------------------------------------------------------

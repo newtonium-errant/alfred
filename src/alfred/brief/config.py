@@ -130,6 +130,25 @@ class StaycRetentionRelayConfig:
 
 
 @dataclass
+class StaycNegationRelayConfig:
+    """Config for the STAY-C Negation-Paraphrase Review Relay section (#26 Phase 3).
+
+    Salem's brief reads the box sweep's PHI-FREE negation-review spool and renders one line: the
+    COUNT of review-ready paraphrase-suppression candidates awaiting the operator's morning-review
+    approve/reject. Same discipline as the retention relay — only the PHI-free COUNT crosses into the
+    (Telegram-transiting) brief, NEVER a concept-set (the PHI pairs stay on-box in
+    ``alfred scribe negation-candidates``).
+
+    ``enabled`` defaults OFF (Salem-only opt-in). ``spool_path`` has NO baked-in default (a
+    deployment-specific absolute path — the ``negation_review.spool`` sibling of the retention review
+    spool). ``staleness_hours`` (default 25) tolerates a daily box→Salem sync, mirroring the siblings."""
+
+    enabled: bool = False
+    spool_path: str = ""
+    staleness_hours: float = 25.0
+
+
+@dataclass
 class WatchItemConfig:
     """One ``brief.watches`` entry — a config-driven upstream check.
 
@@ -209,6 +228,9 @@ class BriefConfig:
     # See StaycRetentionRelayConfig (§4 morning-review surface, C3).
     stayc_retention_relay: StaycRetentionRelayConfig = field(
         default_factory=StaycRetentionRelayConfig)
+    # See StaycNegationRelayConfig (#26 Phase-3 morning-review surface).
+    stayc_negation_relay: StaycNegationRelayConfig = field(
+        default_factory=StaycNegationRelayConfig)
     # Watch Items — optional; empty list = feature off, section never
     # rendered. See WatchItemConfig.
     watches: list[WatchItemConfig] = field(default_factory=list)
@@ -351,6 +373,17 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         staleness_hours=srr_staleness,
     )
 
+    snr_raw = section.get("stayc_negation_relay", {}) or {}
+    try:
+        snr_staleness = float(snr_raw.get("staleness_hours", 25.0))
+    except (TypeError, ValueError):
+        snr_staleness = 25.0
+    stayc_negation_relay = StaycNegationRelayConfig(
+        enabled=bool(snr_raw.get("enabled", False)),
+        spool_path=str(snr_raw.get("spool_path", "") or ""),
+        staleness_hours=snr_staleness,
+    )
+
     # Watch Items — optional list; absent block = feature off. Lenient
     # build (str/int coercion, non-dict entries skipped): a structurally
     # malformed ITEM still constructs and is surfaced at check time as a
@@ -454,6 +487,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         peer_digests=peer_digests,
         stayc_bug_relay=stayc_bug_relay,
         stayc_retention_relay=stayc_retention_relay,
+        stayc_negation_relay=stayc_negation_relay,
         watches=watches,
         log_file=f"{log_dir}/brief.log",
         primary_telegram_user_id=primary_user,

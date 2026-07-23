@@ -204,7 +204,12 @@ async def run(
     # startup() run before the pipeline stack is imported.
     from alfred.scribe.events import ScribeEvents
     from alfred.scribe.events_maintenance import ScribeEventMaintenance
-    from alfred.scribe.negation_suppression import load_suppression, resolve_glossary_path
+    from alfred.scribe.negation_suppression import (
+        glossary_mtime,
+        load_suppression,
+        maybe_reload_suppression,
+        resolve_glossary_path,
+    )
     from alfred.scribe.pipeline import run_sweep
     from alfred.scribe.retention_sweep import RetentionSweep
     from alfred.scribe.state import ScribeState
@@ -242,13 +247,15 @@ async def run(
     # gate as the emitters: a retained seal needs the durable retention.sealed record.
     retention_sweep = RetentionSweep(config, events)
 
-    # #26 Phase-2 FEED-BACK — load the operator-approved negation-suppression store ONCE at boot
-    # (config-like; mirrors how ``events`` is constructed here, not per-sweep) and thread it into
-    # run_sweep → verify. Empty/absent (the Phase-2 default — no approved pairs yet) ⇒ suppression
-    # is INERT and grounding is byte-identical. Morning-review approvals apply on the next daemon
-    # start (Phase-3 may add a live reload). Emit the pair count so 'inert' is distinguishable from
-    # 'active' (intentionally-left-blank).
-    suppression = load_suppression(resolve_glossary_path(config))
+    # #26 FEED-BACK — load the operator-approved negation-suppression store at boot + capture its
+    # mtime. Phase 3 makes approvals apply TIMELY: the per-sweep mtime-gated reload below re-reads the
+    # glossary only when it changed (an operator approve rewrites it → the running daemon picks the pair
+    # up on the NEXT sweep, no restart), at zero cost when unchanged. Empty/absent (no approved pairs
+    # yet) ⇒ suppression is INERT + grounding byte-identical. Emit the pair count so 'inert' is
+    # distinguishable from 'active' (intentionally-left-blank).
+    _glossary_path = resolve_glossary_path(config)
+    suppression = load_suppression(_glossary_path)
+    suppression_mtime = glossary_mtime(_glossary_path)
     log.info(
         "scribe.daemon.negation_suppression_loaded",
         pairs=len(suppression.pairs),
@@ -283,6 +290,11 @@ async def run(
             except Exception:  # noqa: BLE001 — observability scan, never gates the daemon
                 log.exception("scribe.daemon.boot_post_attest_scan_error")
             while True:
+                # #26 TIMELY RELOAD — mtime-gated re-read of the approved store BEFORE the sweep, so an
+                # operator morning-review approval applies THIS sweep (no restart) at zero cost when the
+                # glossary is unchanged. Fail-safe (corrupt/missing → empty store → still flags).
+                suppression, suppression_mtime = maybe_reload_suppression(
+                    suppression, _glossary_path, suppression_mtime)
                 # Each tick step is INDEPENDENTLY wrapped (finding 18): a persistent raise in an
                 # EARLIER step (e.g. an unreadable inbox in run_sweep, or a maintenance scan) must NOT
                 # starve the LATER steps — in particular the retention sweep, whose own graceful

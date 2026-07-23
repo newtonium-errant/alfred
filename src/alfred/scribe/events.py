@@ -186,6 +186,14 @@ KINDS: tuple[_Kind, ...] = (
           frozenset({"schedule_version", "manifest_sha256"}), CLINICAL, True),
     _Kind("retention.destroyed", "retention",
           frozenset({"schedule_version", "manifest_sha256"}), CLINICAL, True),
+    # LEARNING (#26 — negation-paraphrase self-correcting loop). The operator's approve/reject
+    # of a paraphrase-suppression pair is a PHI-FREE governance fact that CHANGES the detector, so
+    # it is durable + hash-chained (the in-order chain is tamper-evident proof of every learned
+    # suppression). PHI-FREE by construction: subject_id = the candidate_id HASH, payload carries
+    # only the glossary revision + de-ID dropped-token COUNT — NEVER a concept-set or token string.
+    _Kind("negation.approved", "learning",
+          frozenset({"glossary_version", "dropped_count"}), CLINICAL, True),
+    _Kind("negation.rejected", "learning", frozenset(), CLINICAL, True),
 )
 
 
@@ -662,6 +670,53 @@ class ScribeEvents:
         completed — the 13d-3 destroy short-circuits an already-destroyed encounter on it."""
         return self.latest(CLINICAL, family="retention", kind="retention.destroyed",
                            subject_id=subject_id)
+
+    # --- LEARNING emitters (#26 negation-paraphrase self-correcting loop) --
+    def negation_approved(
+        self, *, candidate_id: str, operator: str, glossary_version: int,
+        dropped_count: int = 0, now: str | None = None,
+    ) -> AppendReceipt:
+        """Durable [D]. The operator APPROVED a paraphrase-suppression pair into the Tier-2
+        glossary — a governance action that CHANGES the detector, so it is hash-chained (the
+        strongest answer to 'prove no suppression was slipped in to hide a missed contraindication'
+        is the tamper-evident in-order chain of every approval). PHI-FREE ONLY: ``subject_id`` =
+        the candidate_id HASH, payload = the glossary ``revision`` + the count of de-ID-dropped
+        tokens — NEVER a concept-set or a raw/dropped token string. Fields are facade
+        length-capped (finding 12)."""
+        return self._emit_durable(
+            CLINICAL, "negation.approved",
+            subject_id=_cap_retention_str("negation.approved", "candidate_id", candidate_id,
+                                          RETENTION_STR_FIELD_MAX),
+            actor=_cap_retention_str("negation.approved", "operator", operator, RETENTION_STR_FIELD_MAX),
+            actor_kind="operator", now=_cap_retention_now("negation.approved", now),
+            payload={"glossary_version": int(glossary_version), "dropped_count": int(dropped_count)})
+
+    def negation_rejected(
+        self, *, candidate_id: str, operator: str, now: str | None = None,
+    ) -> AppendReceipt:
+        """Durable [D]. The operator REVIEWED a candidate and DECLINED it (the flag was right, or
+        the pair should not be a standing suppression). Recorded so a rejected candidate is PROVABLY
+        reviewed (not merely dropped). PHI-FREE: candidate_id hash (subject) + operator + ts, no
+        payload."""
+        return self._emit_durable(
+            CLINICAL, "negation.rejected",
+            subject_id=_cap_retention_str("negation.rejected", "candidate_id", candidate_id,
+                                          RETENTION_STR_FIELD_MAX),
+            actor=_cap_retention_str("negation.rejected", "operator", operator, RETENTION_STR_FIELD_MAX),
+            actor_kind="operator", now=_cap_retention_now("negation.rejected", now), payload={})
+
+    def negation_decided_ids(self) -> set[str]:
+        """The set of candidate_ids with a durable ``negation.approved`` OR ``negation.rejected``
+        — the join's 'already decided' exclusion set (a decided candidate never re-surfaces for
+        review). The chain is the source of truth for what's decided (the glossary carries only
+        approvals; rejections live ONLY here)."""
+        ids: set[str] = set()
+        for kind in ("negation.approved", "negation.rejected"):
+            for r in self.query(CLINICAL, family="learning", kind=kind):
+                sid = r.get("subject_id")
+                if sid:
+                    ids.add(sid)
+        return ids
 
     def incomplete_destructions(self) -> list[str]:
         """The subject_ids with a ``retention.destroy_intent`` but NO matching ``retention.destroyed``

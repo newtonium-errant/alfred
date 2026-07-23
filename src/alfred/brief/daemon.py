@@ -23,9 +23,14 @@ from .renderer import (
     serialize_record,
 )
 from .routine_section import render_routine_section
+from .stayc_relay import NEGATION_SECTION_HEADER as STAYC_NEGATION_SECTION_HEADER
 from .stayc_relay import RETENTION_SECTION_HEADER as STAYC_RETENTION_SECTION_HEADER
 from .stayc_relay import SECTION_HEADER as STAYC_RELAY_SECTION_HEADER
-from .stayc_relay import render_stayc_bug_relay_section, render_stayc_retention_relay_section
+from .stayc_relay import (
+    render_stayc_bug_relay_section,
+    render_stayc_negation_relay_section,
+    render_stayc_retention_relay_section,
+)
 from .state import BriefRun, StateManager
 from .tier_section import SECTION_HEADER as TIER_SECTION_HEADER
 from .tier_section import render_tier_section
@@ -270,6 +275,12 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     stayc_retention_md = render_stayc_retention_relay_section(
         config.stayc_retention_relay, datetime.now(timezone.utc),
     )
+    # STAY-C Negation Review Relay (#26 Phase 3) — same PHI-free, ILB discipline: the pending
+    # candidate COUNT only (never a concept-set), or an explicit no-data / stale signal. Empty when
+    # disabled (Salem-only, opt-in).
+    stayc_negation_md = render_stayc_negation_relay_section(
+        config.stayc_negation_relay, datetime.now(timezone.utc),
+    )
 
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
@@ -317,6 +328,10 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # line, incl. the no-data / stale signal).
     if stayc_retention_md:
         sections.append((STAYC_RETENTION_SECTION_HEADER, stayc_retention_md))
+    # STAY-C Negation Review sits beside the other STAY-C relays — an upstream operational signal (the
+    # operator has paraphrase candidates to approve/reject on the box). Rendered ONLY when enabled.
+    if stayc_negation_md:
+        sections.append((STAYC_NEGATION_SECTION_HEADER, stayc_negation_md))
     if upcoming_md:
         sections.append(("Upcoming Events", upcoming_md))
     if peer_digests_md:
