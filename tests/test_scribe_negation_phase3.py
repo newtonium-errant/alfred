@@ -355,6 +355,41 @@ def test_cli_approve_drop_removes_tokens_and_counts(tmp_path):
     assert "metformin" not in json.dumps(row)                   # no token string anywhere in the event
 
 
+def test_approve_crash_between_glossary_write_and_audit_self_heals(tmp_path, monkeypatch):
+    # LOAD-BEARING (heavy-gate probe): approve order is glossary-write THEN audit. The self-heal
+    # claim holds ONLY because `decided` is derived from the AUDIT EVENT CHAIN, never from the glossary
+    # pairs. Simulate a crash AFTER the glossary write but BEFORE the audit → the pair is in the
+    # glossary but there is NO negation.approved event → the candidate must STILL surface (NOT a
+    # permanent, unrecorded detector mutation) → a re-run completes the audit idempotently. If `decided`
+    # were glossary-derived, the candidate would be marked decided with no chain record — a med-legal BLOCK.
+    _write_config(tmp_path)
+    cid = _seed(tmp_path, source_id="enc-empa")
+    calls = {"n": 0}
+    real = ScribeEvents.negation_approved
+
+    def _flaky(self, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated crash after glossary write, before audit")
+        return real(self, **kw)
+    monkeypatch.setattr(ScribeEvents, "negation_approved", _flaky)
+
+    gp = _cand_dir(tmp_path) / ns.NEGATION_GLOSSARY_NAME
+    # 1st approve: glossary written, audit crashes → fail-loud, exit 1
+    code1, out1 = _approve(tmp_path, cid)
+    assert code1 == 1 and "audit FAILED" in out1
+    assert len(json.loads(gp.read_text())["pairs"]) == 1              # the pair IS on disk
+    decided = _events(tmp_path).negation_decided_ids()
+    assert cid not in decided                                         # but NOT decided (event-derived)
+    # → it STILL surfaces for review (no silent unrecorded mutation)
+    assert cid in {c.candidate_id for c in ns.join_review_ready(_cand_dir(tmp_path), decided)}
+    # 2nd approve (re-run): audit succeeds, glossary append is idempotent → now decided, no dup pair
+    code2, out2 = _approve(tmp_path, cid)
+    assert code2 == 0
+    assert len(json.loads(gp.read_text())["pairs"]) == 1             # STILL exactly one pair
+    assert cid in _events(tmp_path).negation_decided_ids()            # NOW recorded in the chain
+
+
 def test_cli_reject_audits_and_removes_from_list(tmp_path):
     _write_config(tmp_path)
     cid = _seed(tmp_path, source_id="enc-empa")
