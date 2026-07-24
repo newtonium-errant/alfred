@@ -25,6 +25,11 @@ from alfred.email_filing import EmailFilingConfig, classify_filing_for_inbox
 # A matching (rule) sender/subject and a non-matching one.
 _RULE_INBOX = "# Your receipt\n\n**From:** billing@digitalocean.com\n**To:** me@x.com\n\n---\n\nReceipt body."
 _NOMATCH_INBOX = "# Lunch?\n\n**From:** friend@gmail.com\n**To:** me@x.com\n\n---\n\nWant lunch tomorrow?"
+# #7 7c-ii — a matching record carrying a Message-ID (the Gmail-filing join key).
+_RULE_INBOX_WITH_MID = (
+    "# Your receipt\n\n**From:** billing@digitalocean.com\n**To:** me@x.com\n"
+    "**Message-ID:** <abc@mail.gmail.com>\n\n---\n\nReceipt body."
+)
 
 
 @dataclass
@@ -171,6 +176,28 @@ def test_filing_write_does_not_perturb_priority_fields(tmp_path):
     assert fm["priority"] == "high"
     assert fm["action_hint"] == "calendar"
     assert fm["priority_reasoning"] == "was urgent"
+
+
+def test_rule_match_writes_email_message_id_when_present(tmp_path):
+    # #7 7c-ii — the join key is captured from the record and written next to email_category.
+    vault = _vault(tmp_path)
+    rel = _seed_note(vault, "mid1", priority="high", action_hint="calendar")
+    classify_filing_for_inbox(vault, _RULE_INBOX_WITH_MID, [rel], _cfg())
+    fm = _read_fm(vault, rel)
+    assert fm["email_category"] == "Business/Receipts"
+    assert fm["email_message_id"] == "<abc@mail.gmail.com>"
+    # Orthogonality holds with the second field too — priority axis untouched.
+    assert fm["priority"] == "high" and fm["action_hint"] == "calendar"
+
+
+def test_no_message_id_omits_the_field(tmp_path):
+    # A record without a Message-ID line writes email_category but NOT an empty email_message_id.
+    vault = _vault(tmp_path)
+    rel = _seed_note(vault, "mid2")
+    classify_filing_for_inbox(vault, _RULE_INBOX, [rel], _cfg())  # _RULE_INBOX has no Message-ID
+    fm = _read_fm(vault, rel)
+    assert fm["email_category"] == "Business/Receipts"
+    assert "email_message_id" not in fm
 
 
 def test_filing_fault_is_isolated_never_raises(tmp_path, monkeypatch):

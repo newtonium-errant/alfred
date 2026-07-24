@@ -548,6 +548,12 @@ def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> Non
     # ``mail.fetch.enabled`` is True (the operator-gated flip). When off, NO fetch thread starts and NO
     # IMAP connection is ever opened — production is byte-for-byte unchanged.
     _maybe_start_mail_fetch_loop(config, vault_path)
+    # #7 7c-ii — the Gmail-side label-apply loop, alongside the fetch loop. The confidence-state path is
+    # SINGLE-SOURCED from the daily_sync config (the ONE file ``/calibration_ok filing`` writes) so the
+    # live-mailbox-mutation gate can never drift from the operator's actual approval.
+    from alfred.daily_sync.config import load_from_unified as _load_ds
+    confidence_state_path = _load_ds(raw).state.path
+    _maybe_start_gmail_filing_loop(config, vault_path, confidence_state_path)
     # Idle-tick heartbeat — defaulted-on; emits ``mail.idle_tick`` so
     # the operator can distinguish "no traffic" from "daemon dead".
     run_webhook(
@@ -609,6 +615,57 @@ def _maybe_start_mail_fetch_loop(config, vault_path: Path) -> None:
         accounts=[a.name for a in fetch_accounts], poll_interval=interval,
         detail="native IMAP fetch loop started ALONGSIDE the webhook (#7 rehome — the webhook is not "
                "evicted; live.ca still arrives via n8n).")
+
+
+def _gmail_filing_tick(config, vault_path: Path, confidence_state_path: str) -> None:
+    """#7 7c-ii — one Gmail-filing reconciliation tick, fault-isolated. The dynamic ``confidence.filing``
+    gate is re-read INSIDE ``file_inbox_messages`` (fail-closed, before any IMAP connect), so a live write
+    requires the operator's current approval every tick. A fault is caught here so the loop (and the
+    webhook sharing this process) never die on a transient IMAP fault."""
+    import structlog
+    log = structlog.get_logger(__name__)
+    from alfred.mail.gmail_filing import file_inbox_messages
+    try:
+        file_inbox_messages(config, vault_path, confidence_state_path)
+    except Exception:  # noqa: BLE001 — a transient fault must not kill the loop or webhook
+        log.exception("gmail_filing.loop_error")
+
+
+def _maybe_start_gmail_filing_loop(config, vault_path: Path, confidence_state_path: str) -> None:
+    """#7 7c-ii — start the Gmail-side label-apply loop as a daemon THREAD alongside the webhook, IF AND
+    ONLY IF ``mail.gmail_filing.enabled`` (the STATIC per-instance gate). INERT default returns immediately
+    (no thread). Note the thread starting is NOT a live-mailbox write: each tick STILL re-reads the DYNAMIC
+    ``confidence.filing`` gate before any IMAP connect, so with the operator gate closed the started thread
+    opens no connection and mutates nothing — it just polls the gate. Both gates (static enabled + dynamic
+    confidence.filing) must be true for a single Gmail write."""
+    import structlog
+    log = structlog.get_logger(__name__)
+    gf_cfg = getattr(config, "gmail_filing", None)
+    if gf_cfg is None or not gf_cfg.enabled:
+        return   # STATIC INERT — this instance does not run the Gmail-filing loop.
+    fetch_accounts = config.fetch_accounts()
+    if not fetch_accounts:
+        log.info(
+            "gmail_filing.loop_no_accounts",
+            detail="mail.gmail_filing.enabled is True but no account has fetch: true — the Gmail-filing "
+                   "loop has no account to file against.")
+        return
+    import threading
+    import time
+    interval = config.gmail_filing_poll_interval()
+
+    def _loop() -> None:
+        while True:
+            _gmail_filing_tick(config, vault_path, confidence_state_path)
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, name="gmail-filing", daemon=True).start()
+    log.info(
+        "gmail_filing.loop_started",
+        accounts=[a.name for a in fetch_accounts], poll_interval=interval,
+        confidence_state_path=confidence_state_path,
+        detail="Gmail-filing loop started; DORMANT until confidence.filing is flipped True via "
+               "/calibration_ok filing (each tick re-reads the gate before any IMAP connect).")
 
 
 def _run_talker(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = False) -> None:

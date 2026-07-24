@@ -1263,6 +1263,14 @@ mail:
   fetch:
     enabled: false            # DEFAULT off — the loop does not run and opens no IMAP connection
     # poll_interval: 300      # optional per-loop cadence override (else uses poll_interval above)
+  # #7 7c-ii — the Gmail-side label-apply loop (replaces the n8n filing). TWO gates: this static
+  # ``enabled`` (below) starts the loop thread; the DYNAMIC ``confidence.filing`` flag (flipped by
+  # ``/calibration_ok filing`` after the on-box archive-semantics verification — see the flip runbook)
+  # is re-read per tick and is what actually authorizes a live-mailbox write. Both must be true. The
+  # confidence path is single-sourced from ``daily_sync.state.path`` (never duplicated here).
+  gmail_filing:
+    enabled: false            # DEFAULT off — no thread; even when true the loop is DORMANT until confidence.filing
+    # poll_interval: 300      # optional per-loop cadence override (else uses poll_interval above)
   accounts:
     # live.ca — arrives via the Outlook n8n webhook, so fetch: false (never native-fetched here).
     - name: live

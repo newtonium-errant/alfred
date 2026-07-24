@@ -134,10 +134,44 @@ Exit codes:
    runs inside the mail-webhook process; its logs land in `mail_webhook.log`, not `mail.log`).
 4. **Confirm intake** — after the next poll interval, new Gmail arrives as `email-gmail-*.md` in
    `vault/inbox/` and is picked up by the curator + `email_classifier` + the 7c topical filer.
-5. **Confirm filing continuity** — the 7c-ii Gmail-side labeler re-applies the `Business/*` /
-   `Finance/*` labels (hard-gated on the ratified `confidence.filing` flag; see the 7c docs). The
-   live archive-semantics verification (does removing INBOX archive as expected) is done here, on a
-   **throwaway/test message first**, never a blind write to real mail.
+5. **Enable the Gmail-filing loop (STATIC gate) — starts DORMANT.** In `config.yaml`, set
+   `mail.gmail_filing.enabled: true`. Restart the mail daemon. The loop thread starts but is DORMANT:
+   `confidence.filing` is still False, so every tick returns before any IMAP connect — no label, no
+   archive. Confirm: `grep gmail_filing.loop_started data/mail_webhook.log`.
+6. **Run the on-box archive-semantics verification (section 4a) BEFORE going live.** Required — do not
+   skip.
+7. **Flip the operator gate (DYNAMIC) to go live** — only after 4a passes: `/calibration_ok filing` (in
+   Telegram) flips `confidence.filing` True. The next tick labels + archives the categorized INBOX
+   backlog. Confirm: `grep gmail_filing.filed data/mail_webhook.log`. To pause at any time,
+   `/calibration_ok filing off` — the next tick goes dormant again (no restart needed).
+
+### 4a. On-box archive-semantics verification (REQUIRED before `/calibration_ok filing`)
+
+The Gmail-filing loop applies a label via `+X-GM-LABELS ("<category>")` and archives via
+`-X-GM-LABELS (\Inbox)`. The exact `\Inbox` token + archive behavior can only be confirmed against the
+real mailbox. Verify on a **throwaway/test message** first — NEVER a blind write to real mail:
+
+```bash
+python3 - <<'PY'
+import imaplib, os, ssl
+pw = os.environ["GMAIL_ANDREWNEWTON965_APP_PASSWORD"]
+c = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=ssl.create_default_context())
+c.login("andrewnewton965@gmail.com", pw)
+c.select("INBOX", readonly=False)
+# Find a THROWAWAY test message you sent yourself (subject "ALGERNON FILING TEST"):
+typ, data = c.uid("SEARCH", None, 'HEADER', 'Subject', 'ALGERNON FILING TEST')
+uid = data[0].split()[0]
+# Apply a test label, then archive:
+print("label:",   c.uid("STORE", uid, "+X-GM-LABELS", '("Business/Receipts")'))
+print("archive:", c.uid("STORE", uid, "-X-GM-LABELS", "(\\Inbox)"))
+c.logout()
+PY
+```
+
+Confirm in the Gmail UI: the test message now carries the `Business/Receipts` nested label AND has left
+the Inbox (archived). If the `\Inbox` token differs on this account, adjust `gmail_filing._apply_label_and_archive`
+and re-verify before flipping the gate. Only once this behaves as expected do you run
+`/calibration_ok filing`.
 
 ## 5. Behavior change to expect at the flip (name it, don't be surprised by it)
 

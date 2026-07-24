@@ -46,6 +46,15 @@ log = structlog.get_logger(__name__)
 _EMAIL_FROM_RE = re.compile(r"^\s*\*?\*?From:\*?\*?\s*\S+@\S+", re.MULTILINE)
 _EMAIL_SUBJECT_RE = re.compile(r"^\s*\*?\*?Subject:\*?\*?\s*\S+", re.MULTILINE)
 _EMAIL_ACCOUNT_RE = re.compile(r"^\s*\*?\*?Account:\*?\*?\s*\S+", re.MULTILINE)
+# #7 7c-ii — the Message-ID is the join key the Gmail-filing loop re-resolves the message by. Captured
+# here (the classifier has the raw inbox_content) and written onto the note next to email_category.
+_MESSAGE_ID_RE = re.compile(r"^\s*\*?\*?Message-ID:\*?\*?\s*(\S+)", re.MULTILINE)
+
+
+def _extract_message_id(inbox_content: str) -> str:
+    """Return the ``**Message-ID:**`` value from the inbox record, or ""."""
+    m = _MESSAGE_ID_RE.search(inbox_content or "")
+    return m.group(1).strip() if m else ""
 
 
 def is_email_inbox(content: str) -> bool:
@@ -267,12 +276,19 @@ def classify_filing_for_inbox(
         return FilingResult(category=None, source="none", written=[])
 
     category = f"{matched[0]}/{matched[1]}"
+    # #7 7c-ii — the Message-ID join key for the Gmail-filing loop, captured here (constant across the
+    # notes from this one email). Written next to email_category; omitted if the record carries none.
+    message_id = _extract_message_id(inbox_content)
+    set_fields: dict[str, str] = {"email_category": category}
+    if message_id:
+        set_fields["email_message_id"] = message_id
     written: list[str] = []
     for note_path in note_only:
         try:
-            # Additive, isolated write: ONLY email_category. Never touches priority/action_hint —
-            # the orthogonality guarantee is that this set_fields carries exactly one key.
-            vault_edit(vault_path, note_path, set_fields={"email_category": category})
+            # Additive, isolated write: ONLY the two email_* filing fields. Never touches
+            # priority/action_hint — the orthogonality guarantee is that this set_fields carries only
+            # the filing axis's own keys.
+            vault_edit(vault_path, note_path, set_fields=dict(set_fields))
             log_mutation(session_path, "edit", note_path, scope="email_filing")
             written.append(note_path)
         except VaultError as exc:
