@@ -64,6 +64,11 @@ class MailFetchConfig:
 
     enabled: bool = False
     poll_interval: int | None = None   # None ⇒ use MailConfig.poll_interval
+    # #7 7b — the parity-proof shadow fetch (``alfred mail fetch --shadow``) writes READ-ONLY captured
+    # records here, DELIBERATELY OUTSIDE the vault inbox so the curator never ingests them. Gitignored.
+    # Not the daemon loop's concern (the loop always writes to the real inbox); this only scopes the
+    # box-run parity harness. Default is under ``data/`` alongside the other non-vault runtime artifacts.
+    shadow_dir: str = "./data/mail_shadow"
 
 
 @dataclass
@@ -109,6 +114,7 @@ def load_from_unified(raw: dict) -> MailConfig:
     fetch_cfg = MailFetchConfig(
         enabled=bool(fetch_raw.get("enabled", False)),
         poll_interval=fetch_raw.get("poll_interval"),
+        shadow_dir=fetch_raw.get("shadow_dir", "./data/mail_shadow"),
     )
     # Idle-tick — defaulted-on; partial dict merges over dataclass default.
     idle_raw = section.get("idle_tick") or {}

@@ -550,6 +550,23 @@ def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> Non
     )
 
 
+def _fetch_tick(config, vault_path: Path) -> None:
+    """#7 7b — one iteration of the native fetch loop's work, isolated for fault-tolerance.
+
+    Extracted from ``_maybe_start_mail_fetch_loop._loop`` (behavior-preserving) so the fault-isolation
+    guarantee is independently testable: a transient IMAP fault raised by ``fetch_all`` is caught HERE and
+    logged as ``mail.fetch.loop_error``, so the loop (and the webhook sharing this process) never die on a
+    transient fault. ``fetch_all`` is imported at call time so the loop picks up config/monkeypatch state
+    live (and the mail dependency isn't dragged in unless the loop actually runs)."""
+    import structlog
+    log = structlog.get_logger(__name__)
+    from alfred.mail.fetcher import fetch_all
+    try:
+        fetch_all(config, vault_path, only_flagged=True)
+    except Exception:  # noqa: BLE001 — a transient IMAP fault must not kill the loop or webhook
+        log.exception("mail.fetch.loop_error")
+
+
 def _maybe_start_mail_fetch_loop(config, vault_path: Path) -> None:
     """#7 7a — start the native IMAP fetch loop as a daemon THREAD alongside the webhook, IF and ONLY
     IF ``mail.fetch.enabled``. INERT default returns immediately (no thread, no IMAP connect). ILB: an
@@ -570,16 +587,12 @@ def _maybe_start_mail_fetch_loop(config, vault_path: Path) -> None:
         return
     import threading
     import time
-    from alfred.mail.fetcher import fetch_all
 
     interval = config.fetch_poll_interval()
 
     def _loop() -> None:
         while True:
-            try:
-                fetch_all(config, vault_path, only_flagged=True)
-            except Exception:  # noqa: BLE001 — a transient IMAP fault must not kill the loop or webhook
-                log.exception("mail.fetch.loop_error")
+            _fetch_tick(config, vault_path)
             time.sleep(interval)
 
     threading.Thread(target=_loop, name="mail-fetch", daemon=True).start()

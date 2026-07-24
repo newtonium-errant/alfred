@@ -4255,6 +4255,32 @@ def cmd_mail(args: argparse.Namespace) -> None:
 
     subcmd = getattr(args, "mail_cmd", None)
     if subcmd == "fetch":
+        # #7 7b — READ-ONLY shadow parity capture. One-shot (no polling): fetch the fetch: true accounts
+        # from a date window via EXAMINE + BODY.PEEK into the gitignored shadow dir, touching NO
+        # production state. Box-gated (needs the Gmail app password); see docs/mail_rehome_flip_runbook.md.
+        if getattr(args, "shadow", False):
+            from alfred.mail.fetcher import _imap_since_date, shadow_fetch_all
+            fetch_accts = config.fetch_accounts()
+            if not fetch_accts:
+                print("No 'fetch: true' accounts configured — nothing to shadow-fetch.")
+                print("Add 'fetch: true' to the account you're rehoming (e.g. gmail).")
+                sys.exit(1)
+            try:
+                since = _imap_since_date(lookback_days=args.lookback_days, since=args.since)
+            except ValueError as e:
+                print(f"Invalid --since (expected YYYY-MM-DD): {e}")
+                sys.exit(1)
+            folder = args.folder or "[Gmail]/All Mail"
+            total = shadow_fetch_all(config, since=since, folder=args.folder)
+            print(
+                f"[shadow] Read-only captured {total} record(s) since {since} "
+                f"into {config.fetch.shadow_dir} (folder: {folder})."
+            )
+            print(
+                "No production state was touched: EXAMINE (read-only SELECT) + BODY.PEEK "
+                "(no \\Seen) + no STORE + shadow dir only."
+            )
+            return
         if not config.accounts:
             print("No mail accounts configured. Add a 'mail' section to config.yaml.")
             print("See config.yaml.example for the format.")
@@ -4284,8 +4310,37 @@ def cmd_mail(args: argparse.Namespace) -> None:
             print(f"  {name}: {len(ids)} emails fetched")
         if not sm.state.seen_ids:
             print("  No emails fetched yet.")
+    elif subcmd == "parity-compare":
+        # #7 7b — prove native-fetcher ↔ n8n-webhook record parity modulo the three ACCEPTED divergences
+        # (From/To bare-address, References fetcher-only). Exit 0 = parity proven; 1 = a real (4th)
+        # divergence; 2 = inconclusive (nothing matched to compare). See the flip runbook.
+        from alfred.mail.fetcher import compare_records
+        shadow_dir = Path(args.shadow_dir or config.fetch.shadow_dir)
+        production_dir = Path(args.production_dir)
+        report = compare_records(shadow_dir, production_dir)
+        print(f"Parity compare — shadow: {shadow_dir}  production: {production_dir}")
+        # ILB: print every count explicitly (including zeros) so 'nothing matched'
+        # is distinguishable from 'all passed'.
+        print(f"  matched pairs:   {len(report.matched)}")
+        print(f"  parity PASS:     {report.passed}")
+        print(f"  parity FAIL:     {report.failed}")
+        print(f"  shadow-only:     {len(report.shadow_only)}  (captured by shadow, absent in production)")
+        print(f"  production-only: {len(report.production_only)}  (in production, not captured by shadow)")
+        for pair in report.matched:
+            if not pair.parity:
+                print(f"\n  FAIL {pair.message_id}  (shadow: {pair.shadow_file} | production: {pair.production_file})")
+                for line in pair.diff.splitlines():
+                    print(f"    {line}")
+        if report.failed:
+            print("\nRESULT: PARITY FAILED — a divergence beyond the three accepted ones exists (see diffs above).")
+            sys.exit(1)
+        if not report.matched:
+            print("\nRESULT: INCONCLUSIVE — no Message-ID matched between the two dirs (nothing to compare).")
+            print("Check the date window, the shadow folder, and that production records were captured.")
+            sys.exit(2)
+        print(f"\nRESULT: PARITY PROVEN — all {report.passed} matched pair(s) equivalent modulo the three accepted divergences.")
     else:
-        print("Usage: alfred mail {fetch|webhook|status}")
+        print("Usage: alfred mail {fetch|webhook|status|parity-compare}")
         sys.exit(1)
 
 
@@ -6266,7 +6321,22 @@ def build_parser() -> argparse.ArgumentParser:
     mail_sub = mail_p.add_subparsers(dest="mail_cmd")
     mail_fetch = mail_sub.add_parser("fetch", help="Fetch new emails from configured accounts")
     mail_fetch.add_argument("--once", action="store_true", default=False, help="Fetch once and exit (no polling)")
+    # #7 7b — read-only shadow parity capture (box-gated; touches no production state).
+    mail_fetch.add_argument("--shadow", action="store_true", default=False,
+                            help="READ-ONLY parity capture: fetch fetch:true accounts (EXAMINE + BODY.PEEK) into the gitignored shadow dir; no production state touched")
+    mail_fetch.add_argument("--lookback-days", type=int, default=7,
+                            help="Shadow: days back to fetch for the parity window (default: 7)")
+    mail_fetch.add_argument("--since", default=None,
+                            help="Shadow: explicit start date YYYY-MM-DD (overrides --lookback-days)")
+    mail_fetch.add_argument("--folder", default=None,
+                            help="Shadow: IMAP folder to read (default: '[Gmail]/All Mail'; locale-dependent — see runbook)")
     mail_sub.add_parser("status", help="Show mail fetcher state")
+    # #7 7b — prove native-fetcher ↔ n8n-webhook record parity (modulo the three accepted divergences).
+    mail_parity = mail_sub.add_parser("parity-compare", help="Compare shadow vs production email records (7b parity proof)")
+    mail_parity.add_argument("--production-dir", required=True,
+                             help="Dir of n8n-delivered production email-*.md records to compare against")
+    mail_parity.add_argument("--shadow-dir", default=None,
+                             help="Dir of shadow-captured records (default: mail.fetch.shadow_dir)")
     mail_webhook = mail_sub.add_parser("webhook", help="Start webhook receiver for incoming email")
     mail_webhook.add_argument("--port", type=int, default=5005, help="Port to listen on (default: 5005)")
     mail_webhook.add_argument(

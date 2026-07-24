@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import difflib
 import email
 import email.policy
+import hashlib
 import imaplib
 import re
 import ssl
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
@@ -424,3 +427,415 @@ def fetch_all(config: MailConfig, vault_path: Path, *, only_flagged: bool = Fals
     state_mgr.save()
     log.info("mail.fetch_complete", total=total)
     return total
+
+
+# ===========================================================================
+# #7 7b — shadow parity harness (READ-ONLY) + the normalized parity compare
+#
+# Purpose: PROVE, on real mail, that the native fetcher produces records
+# equivalent to the n8n webhook BEFORE the operator flips off n8n. The live
+# run is box-gated (needs the Gmail app password); this module is the tooling,
+# fully unit-testable with fixtures.
+#
+# FOUR ACCEPTED DIVERGENCES (all "fetcher is the richer superset"; ratified
+# 2026-07-23) — the compare normalizes exactly these and demands byte-equality
+# on everything else, so a FIFTH divergence still fails (fail-loud at the box run):
+#   1. From    — fetcher emits the full raw header (display name + address);
+#                n8n reduces to the bare address via ``parseAddr``.
+#   2. To      — fetcher emits the full raw header (all recipients);
+#                n8n reduces to the first bare address.
+#   3. References — fetcher emits a ``**References:**`` line for threaded mail;
+#                n8n's POST omits it entirely.
+#   4. Subject — fetcher parses with ``policy.default`` which DECODES RFC2047
+#                encoded-words (``=?UTF-8?...?=`` → Unicode); a raw header read
+#                keeps them encoded. The compare RFC2047-decodes BOTH heading
+#                lines (idempotent — a no-op on an already-decoded/ASCII subject)
+#                so it's robust whether Gmail returns the Subject encoded or
+#                pre-decoded, while still demanding subject-equality-modulo-
+#                encoding (a genuinely different subject fails).
+# ===========================================================================
+
+
+_ANGLE_ADDR_RE = re.compile(r"<([^>]+)>")
+_FROM_LINE_RE = re.compile(r"^\*\*From:\*\*\s*(.*)$")
+_TO_LINE_RE = re.compile(r"^\*\*To:\*\*\s*(.*)$")
+_REFS_LINE_RE = re.compile(r"^\*\*References:\*\*")
+_MID_LINE_RE = re.compile(r"^\*\*Message-ID:\*\*\s*(.*)$")
+# The subject appears ONLY as the H1 heading (``# <subject>``); there is no
+# ``**Subject:**`` line. The parity compare RFC2047-decodes this line on both sides.
+_HEADING_RE = re.compile(r"^#\s(.*)$")
+
+
+def _decode_rfc2047(value: str) -> str:
+    """Decode any RFC2047 encoded-words in a header value to Unicode.
+
+    IDEMPOTENT: an already-decoded (or plain-ASCII) value is returned unchanged,
+    so applying it to both sides of the compare is safe whether Gmail returns the
+    Subject raw-encoded or pre-decoded. FAIL-SAFE: returns the input verbatim on
+    any decode error (a malformed encoded-word must not crash the compare).
+    """
+    from email.header import decode_header, make_header
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:  # noqa: BLE001 — malformed encoded-word must not crash the compare
+        return value
+
+
+def _normalize_addr(raw: str) -> str:
+    """Reduce a From/To header value to the same bare address the n8n webhook produced.
+
+    Mirrors the n8n 'Build Request Body' node's ``parseAddr`` EXACTLY: the first
+    angle-bracketed ``<addr>`` if present, else the first comma-separated part,
+    trimmed. Used ONLY by the parity compare to normalize away the ACCEPTED
+    From/To divergence (fetcher = full raw header; n8n = bare address) while
+    STILL demanding address-EQUALITY — a genuinely wrong From address (different
+    address, not just a stripped display name) still fails the compare.
+    """
+    if not raw:
+        return ""
+    m = _ANGLE_ADDR_RE.search(raw)
+    if m:
+        return m.group(1).strip()
+    return raw.split(",")[0].strip()
+
+
+def _imap_since_date(
+    *,
+    lookback_days: int | None = None,
+    since: str | None = None,
+    today: date | None = None,
+) -> str:
+    """Compute the IMAP ``SEARCH SINCE`` date string (``DD-Mon-YYYY``).
+
+    Prefers an explicit ``since`` (``YYYY-MM-DD``); else ``lookback_days`` back
+    from ``today``; else a 7-day default. ``today`` is injectable for tests.
+    Raises ``ValueError`` on an unparseable ``since`` (fail-loud — a silently
+    wrong window would silently narrow the parity proof).
+    """
+    if today is None:
+        today = date.today()
+    if since:
+        d = date.fromisoformat(since)
+    elif lookback_days is not None:
+        d = today - timedelta(days=lookback_days)
+    else:
+        d = today - timedelta(days=7)
+    return d.strftime("%d-%b-%Y")
+
+
+def fetch_account_shadow(
+    account: MailAccount,
+    shadow_path: Path,
+    *,
+    since: str,
+    folder: str | None = None,
+    seen_ids: set[str] | None = None,
+) -> int:
+    """READ-ONLY shadow fetch of one account for the #7 7b parity proof.
+
+    NON-DISRUPTIVE BY CONSTRUCTION — four independent belts guarantee it cannot
+    alter Gmail state or the production inbox:
+
+      1. **EXAMINE** — ``select(folder, readonly=True)``; imaplib maps this to
+         the IMAP ``EXAMINE`` command → server-side read-only, no flag write is
+         even possible.
+      2. **BODY.PEEK[]** — the fetch uses ``BODY.PEEK[]``, NEVER ``RFC822``, so
+         ``\\Seen`` is not set even on a writable mailbox.
+      3. **No STORE** — the shadow path issues NO ``conn.store(...)`` at all; the
+         production path's ``+FLAGS \\Seen`` store is absent here.
+      4. **Shadow dir only** — records are written under ``shadow_path`` (never
+         the vault inbox), so the curator never ingests them.
+
+    Fetches messages ``SINCE`` the given IMAP date REGARDLESS of ``\\Seen`` (n8n
+    has already read/archived them), dedups by Message-ID within the run,
+    renders each via the shared :func:`_build_markdown` (byte-identical to the
+    production fetcher path), and writes ``email-<account>-<midtag>-<slug>.md``.
+    The shadow filename uses a stable Message-ID hash (not a timestamp) so a
+    re-run overwrites the same message's file rather than piling up duplicates,
+    and a bulk fetch of many same-second messages can't collide. The compare
+    joins on the ``**Message-ID:**`` body line, never the filename. Returns the
+    count written.
+    """
+    password = account.resolved_password()
+    if not password:
+        log.error("mail.shadow.no_password", account=account.name)
+        return 0
+
+    if seen_ids is None:
+        seen_ids = set()
+    target_folder = folder or "[Gmail]/All Mail"
+    ctx = ssl.create_default_context()
+    count = 0
+    shadow_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with imaplib.IMAP4_SSL(account.imap_host, account.imap_port, ssl_context=ctx) as conn:
+            conn.login(account.email, password)
+            log.info("mail.shadow.connected", account=account.name, folder=target_folder)
+
+            # Belt 1: EXAMINE (read-only SELECT). imaplib readonly=True → EXAMINE.
+            status, _ = conn.select(target_folder, readonly=True)
+            if status != "OK":
+                log.warning(
+                    "mail.shadow.folder_failed",
+                    account=account.name,
+                    folder=target_folder,
+                )
+                return 0
+
+            # Date-windowed search — SINCE returns messages regardless of \Seen.
+            status, data = conn.search(None, "SINCE", since)
+            if status != "OK" or not data or not data[0]:
+                log.info(
+                    "mail.shadow.no_messages",
+                    account=account.name,
+                    folder=target_folder,
+                    since=since,
+                )
+                return 0
+
+            msg_nums = data[0].split()
+            log.info(
+                "mail.shadow.found",
+                account=account.name,
+                folder=target_folder,
+                since=since,
+                count=len(msg_nums),
+            )
+
+            for num in msg_nums:
+                # Belt 2: BODY.PEEK[] — never RFC822 → never sets \Seen.
+                status, msg_data = conn.fetch(num, "(BODY.PEEK[])")
+                if status != "OK" or not msg_data or not msg_data[0]:
+                    continue
+                raw = msg_data[0][1]
+                if not raw:
+                    continue
+                msg = email.message_from_bytes(raw, policy=email.policy.default)
+                message_id = msg.get("Message-ID", "")
+                if message_id and message_id in seen_ids:
+                    continue
+
+                md = _build_markdown(msg, account.name)
+                subject = msg.get("Subject", "no-subject")
+                slug = _sanitize_filename(subject)
+                if message_id:
+                    mid_tag = hashlib.sha1(message_id.encode("utf-8")).hexdigest()[:10]
+                else:
+                    mid_tag = f"nomid-{count}"
+                filename = f"email-{account.name}-{mid_tag}-{slug}.md"
+                # Belt 4: write ONLY under the shadow dir — never the vault inbox.
+                out = shadow_path / filename
+                out.write_text(md, encoding="utf-8")
+                log.info("mail.shadow.saved", file=filename)
+                if message_id:
+                    seen_ids.add(message_id)
+                count += 1
+                # Belt 3: NO conn.store(...) anywhere — \Seen is never touched.
+
+    except imaplib.IMAP4.error as e:
+        log.error("mail.shadow.imap_error", account=account.name, error=str(e))
+    except Exception as e:  # noqa: BLE001 — a shadow fault must never propagate
+        log.error("mail.shadow.error", account=account.name, error=str(e))
+
+    return count
+
+
+def shadow_fetch_all(
+    config: MailConfig,
+    *,
+    since: str,
+    folder: str | None = None,
+) -> int:
+    """READ-ONLY shadow fetch of the ``fetch: true`` accounts for the 7b parity proof.
+
+    Writes captured records under ``config.fetch.shadow_dir`` (deliberately
+    OUTSIDE the vault inbox — the curator never sees them), NEVER the vault
+    inbox. Returns the total records written. Per
+    ``feedback_intentionally_left_blank.md``, a no-``fetch: true``-accounts
+    config logs an explicit ``mail.shadow.no_accounts`` signal. See
+    :func:`fetch_account_shadow` for the four non-disruptive belts.
+    """
+    shadow_dir = Path(config.fetch.shadow_dir)
+    shadow_dir.mkdir(parents=True, exist_ok=True)
+    accounts = config.fetch_accounts()
+    log.info(
+        "mail.shadow.starting",
+        accounts=len(accounts),
+        account_names=[a.name for a in accounts],
+        since=since,
+        folder=folder or "[Gmail]/All Mail",
+        shadow_dir=str(shadow_dir),
+    )
+    if not accounts:
+        log.info(
+            "mail.shadow.no_accounts",
+            detail="no account has fetch: true — nothing to shadow-fetch.",
+        )
+        return 0
+
+    seen_ids: set[str] = set()
+    total = 0
+    for account in accounts:
+        total += fetch_account_shadow(
+            account, shadow_dir, since=since, folder=folder, seen_ids=seen_ids,
+        )
+    log.info("mail.shadow.complete", total=total)
+    return total
+
+
+# --- The normalized parity compare -----------------------------------------
+
+
+@dataclass
+class ParityPair:
+    """One matched (shadow, production) record pair, joined by Message-ID.
+
+    ``parity`` is True when the two records are byte-identical AFTER normalizing
+    the four accepted divergences (From/To to bare address, References dropped,
+    Subject RFC2047-decoded). ``diff`` is a unified diff of the NORMALIZED
+    records (so it shows only genuine, non-accepted divergences) when ``parity``
+    is False.
+    """
+
+    message_id: str
+    shadow_file: str
+    production_file: str
+    parity: bool
+    diff: str = ""
+
+
+@dataclass
+class ParityReport:
+    """Result of :func:`compare_records`.
+
+    ``matched`` — pairs present in BOTH dirs (the real compare). ``shadow_only``
+    / ``production_only`` — Message-IDs present in only one side (window/folder
+    mismatch, not a parity failure per se, but surfaced for the operator).
+    """
+
+    matched: list[ParityPair] = field(default_factory=list)
+    shadow_only: list[str] = field(default_factory=list)
+    production_only: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for p in self.matched if p.parity)
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for p in self.matched if not p.parity)
+
+    @property
+    def is_parity(self) -> bool:
+        """Parity PROVEN only when there is at least one matched pair AND every
+        matched pair passes. Zero matched pairs is INCONCLUSIVE, not proven —
+        the caller must distinguish 'nothing to compare' from 'all passed'."""
+        return bool(self.matched) and self.failed == 0
+
+
+def _record_message_id(text: str) -> str:
+    """Extract the ``**Message-ID:**`` value from a rendered record, or ""."""
+    for line in text.splitlines():
+        m = _MID_LINE_RE.match(line)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _normalize_record_for_parity(text: str) -> list[str]:
+    """Return the record's lines with the four ACCEPTED divergences normalized.
+
+    Drops any ``**References:**`` line entirely; rewrites ``**From:**`` /
+    ``**To:**`` to their bare normalized address (see :func:`_normalize_addr`);
+    RFC2047-decodes the ``# <subject>`` heading (see :func:`_decode_rfc2047`,
+    idempotent). Every other line is kept verbatim, so any FIFTH divergence
+    survives into the byte-compare and fails parity — that's the safety property.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        if _REFS_LINE_RE.match(line):
+            continue
+        m = _FROM_LINE_RE.match(line)
+        if m:
+            out.append(f"**From:** {_normalize_addr(m.group(1))}")
+            continue
+        m = _TO_LINE_RE.match(line)
+        if m:
+            out.append(f"**To:** {_normalize_addr(m.group(1))}")
+            continue
+        m = _HEADING_RE.match(line)
+        if m:
+            out.append(f"# {_decode_rfc2047(m.group(1))}")
+            continue
+        out.append(line)
+    return out
+
+
+def _index_records_by_mid(directory: Path) -> dict[str, tuple[str, str]]:
+    """Map Message-ID → (filename, text) for every ``email-*.md`` in ``directory``.
+
+    Records without a parseable Message-ID can't be joined; they're skipped with
+    an ILB ``mail.parity.records_without_message_id`` count so the operator can
+    see how many were unjoinable rather than silently dropped.
+    """
+    result: dict[str, tuple[str, str]] = {}
+    if not directory.is_dir():
+        log.warning("mail.parity.no_dir", path=str(directory))
+        return result
+    no_mid = 0
+    for f in sorted(directory.glob("email-*.md")):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        mid = _record_message_id(text)
+        if not mid:
+            no_mid += 1
+            continue
+        result[mid] = (f.name, text)
+    if no_mid:
+        log.info(
+            "mail.parity.records_without_message_id",
+            path=str(directory),
+            count=no_mid,
+        )
+    return result
+
+
+def compare_records(shadow_dir: Path, production_dir: Path) -> ParityReport:
+    """Join shadow ↔ production ``email-*.md`` records by Message-ID and prove
+    parity modulo the four ACCEPTED divergences.
+
+    A matched pair PASSES when its records are identical after
+    :func:`_normalize_record_for_parity` (From/To → bare address, References
+    dropped, Subject RFC2047-decoded). Any other difference (Date, Account,
+    Message-ID, In-Reply-To, body, structure — a fifth divergence) fails the
+    pair and is captured as a unified diff of the normalized records. Returns a
+    :class:`ParityReport`; the caller renders it and decides pass/fail.
+    """
+    shadow_by_mid = _index_records_by_mid(shadow_dir)
+    prod_by_mid = _index_records_by_mid(production_dir)
+
+    report = ParityReport()
+    for mid in sorted(set(shadow_by_mid) & set(prod_by_mid)):
+        sf, stext = shadow_by_mid[mid]
+        pf, ptext = prod_by_mid[mid]
+        snorm = _normalize_record_for_parity(stext)
+        pnorm = _normalize_record_for_parity(ptext)
+        if snorm == pnorm:
+            report.matched.append(ParityPair(mid, sf, pf, True))
+        else:
+            diff = "\n".join(
+                difflib.unified_diff(
+                    pnorm, snorm,
+                    fromfile=f"production/{pf}",
+                    tofile=f"shadow/{sf}",
+                    lineterm="",
+                )
+            )
+            report.matched.append(ParityPair(mid, sf, pf, False, diff))
+
+    report.shadow_only = sorted(set(shadow_by_mid) - set(prod_by_mid))
+    report.production_only = sorted(set(prod_by_mid) - set(shadow_by_mid))
+    return report
