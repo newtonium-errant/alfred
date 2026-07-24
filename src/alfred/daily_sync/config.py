@@ -16,6 +16,7 @@ daily_sync:
     medium: false
     low: false
     spam: false
+    filing: false          # #7 7c-i — topical-filing-axis gate (consumer: 7c-ii Gmail label write)
   state:
     path: "./data/daily_sync_state.json"
 ```
@@ -74,19 +75,25 @@ class CorpusConfig:
 
 @dataclass
 class ConfidenceConfig:
-    """Per-tier confidence flags.
+    """Confidence flags — priority tiers + the filing-axis gate.
 
-    Flipped via the ``/calibration_ok <tier>`` Telegram command and
+    Flipped via the ``/calibration_ok <flag>`` Telegram command and
     persisted to a small state file (NOT this dataclass — the dataclass
     only holds the seed values from config). The flags are read by
     surfacing consumers (c3/c4/c5) to gate per-tier surfacing on
     Andrew's explicit approval.
+
+    ``filing`` (#7 7c-i) is NOT a priority tier — it's the topical-filing
+    axis gate. Additive + defaults False; built-before-consumer (the
+    consumer is the 7c-ii Gmail-side label write, hard-gated on this
+    flag). Nothing auto-flips it; only ``/calibration_ok filing`` does.
     """
 
     high: bool = False
     medium: bool = False
     low: bool = False
     spam: bool = False
+    filing: bool = False
 
 
 @dataclass

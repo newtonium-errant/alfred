@@ -58,10 +58,24 @@ class CorpusEntry:
     # 05-15). Future few-shot rotation can detect duplicate-marking
     # patterns via this field.
     via: str = ""
+    # #7 7c-i — the TOPICAL FILING axis (orthogonal to the priority axis above).
+    # Additive: default "" so every existing corpus row + priority-only writer is
+    # unaffected. A category correction sets ``andrew_category`` (the operator's
+    # filing call); ``classifier_category`` is the filer's pre-correction verdict
+    # ("" when the filer produced no category — the n8n "skip" long tail).
+    classifier_category: str = ""
+    andrew_category: str = ""
 
     def is_correction(self) -> bool:
-        """Return True when Andrew's call differed from the classifier's."""
+        """Return True when Andrew's call differed from the classifier's (PRIORITY axis)."""
         return self.andrew_priority != self.classifier_priority
+
+    def is_category_correction(self) -> bool:
+        """Return True when Andrew set a FILING category that differs from the filer's verdict.
+
+        Requires a non-empty ``andrew_category`` (a confirmation with no category carries no learning
+        signal) that differs from ``classifier_category``. Orthogonal to :meth:`is_correction`."""
+        return bool(self.andrew_category) and self.andrew_category != self.classifier_category
 
 
 def append_correction(corpus_path: str | Path, entry: CorpusEntry) -> None:
@@ -122,6 +136,8 @@ def _entry_from_dict(data: dict) -> CorpusEntry:
         subject=data.get("subject", ""),
         snippet=data.get("snippet", ""),
         via=data.get("via", ""),
+        classifier_category=data.get("classifier_category", ""),
+        andrew_category=data.get("andrew_category", ""),
     )
 
 
@@ -218,3 +234,24 @@ def recent_corrections(
 
     # Return oldest-first so the few-shot block reads chronologically.
     return list(reversed(chosen))
+
+
+def recent_category_corrections(
+    corpus_path: str | Path,
+    *,
+    limit: int = 10,
+) -> list[CorpusEntry]:
+    """Return the most recent N FILING category corrections, oldest-first (#7 7c-i).
+
+    Filters to actual category corrections (:meth:`CorpusEntry.is_category_correction`) — confirmations
+    carry no learning signal for the few-shot. The orthogonal sibling of :func:`recent_corrections` (which
+    is the PRIORITY axis); walks the same corpus file but keys on the category fields. Deterministic for a
+    given corpus. Category diversification is intentionally omitted (the four seed categories are few and
+    the correction volume is low); revisit if one category ever dominates the window."""
+    if limit <= 0:
+        return []
+    corrections = [e for e in iter_corrections(corpus_path) if e.is_category_correction()]
+    if not corrections:
+        return []
+    # Most recent N, returned oldest-first for a chronological few-shot block.
+    return corrections[-limit:]

@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     from alfred.email_classifier.config import EmailClassifierConfig
+    from alfred.email_filing.config import EmailFilingConfig
 
 from alfred.common.heartbeat import Heartbeat
 from alfred.preferences.loader import load_active_preferences
@@ -332,6 +333,7 @@ async def _process_file(
     config: CuratorConfig,
     state_mgr: StateManager,
     email_classifier_config: "EmailClassifierConfig | None" = None,
+    email_filing_config: "EmailFilingConfig | None" = None,
 ) -> None:
     """Process a single inbox file through the full pipeline.
 
@@ -341,6 +343,13 @@ async def _process_file(
     each newly-created ``note/*.md`` record's frontmatter. Disabled
     or non-email files are skipped silently — the post-processor never
     raises into the curator pipeline.
+
+    When ``email_filing_config.enabled`` is True, the orthogonal TOPICAL
+    FILING pass (#7 7c-i) runs as a SEPARATE post-pass after the priority
+    pass and writes an additive ``email_category`` frontmatter field. The
+    two passes are fault-isolated (each in its own swallowed try/except)
+    and write disjoint fields, so a filing fault can never corrupt the
+    priority classification.
     """
     filename = inbox_file.name
     log.info("daemon.processing", file=filename)
@@ -518,6 +527,29 @@ async def _process_file(
         except Exception:  # noqa: BLE001 — must never crash the daemon
             log.exception("daemon.email_classifier_error", file=filename)
 
+    # Topical filing post-pass (#7 7c-i) — orthogonal sibling of the priority
+    # classifier above. SEPARATE swallowed try/except + a SEPARATE to_thread so a
+    # filing fault is fully isolated from the priority classification (which has
+    # already completed and persisted). Writes an additive ``email_category``
+    # field only. INERT re: Gmail — vault frontmatter only.
+    if (
+        email_filing_config is not None
+        and email_filing_config.enabled
+        and files_created
+    ):
+        try:
+            from alfred.email_filing import classify_filing_for_inbox
+
+            await asyncio.to_thread(
+                classify_filing_for_inbox,
+                config.vault.vault_path,
+                inbox_content,
+                files_created,
+                email_filing_config,
+            )
+        except Exception:  # noqa: BLE001 — must never crash the daemon or the priority pass
+            log.exception("daemon.email_filing_error", file=filename)
+
     log.info(
         "daemon.completed",
         file=filename,
@@ -535,6 +567,7 @@ async def run(
     config: CuratorConfig,
     skills_dir: Path,
     email_classifier_config: "EmailClassifierConfig | None" = None,
+    email_filing_config: "EmailFilingConfig | None" = None,
 ) -> None:
     """Main daemon entry point.
 
@@ -543,6 +576,10 @@ async def run(
     (``email_classifier:`` section). When ``None`` or
     ``enabled=False``, the classifier post-processor is a no-op and
     curator behaves exactly as before this hook landed.
+
+    ``email_filing_config`` (#7 7c-i) is the analogous opt-in block for the
+    orthogonal topical-filing pass (``email_filing:`` section). ``None`` /
+    ``enabled=False`` → the filing pass is a no-op.
     """
     log.info(
         "daemon.starting",
@@ -598,6 +635,7 @@ async def run(
                         config,
                         state_mgr,
                         email_classifier_config=email_classifier_config,
+                        email_filing_config=email_filing_config,
                     )
                 except Exception:
                     log.exception("daemon.process_error", file=inbox_file.name)
@@ -701,6 +739,7 @@ async def run(
                                 config,
                                 state_mgr,
                                 email_classifier_config=email_classifier_config,
+                                email_filing_config=email_filing_config,
                             )
                         except Exception:
                             log.exception("daemon.process_error", file=inbox_file.name)

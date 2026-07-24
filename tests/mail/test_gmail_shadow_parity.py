@@ -11,11 +11,11 @@ Pins (all UNCONDITIONAL):
     header heuristics (`is_email_inbox` still True, `_extract_sender` still parses From, not References).
   * The display-name-From alias-fix: the fetcher restores the display name n8n's bare-address stripping
     dropped, so `_extract_sender` recovers it (the flip-time classifier behavior change, pinned).
-  * The normalized compare on the three ACCEPTED divergences (From/To bare-address, References-only), and
-    that a FOURTH divergence FAILS.
+  * The normalized compare on the FOUR ACCEPTED divergences (From/To bare-address, References-only,
+    Subject RFC2047-decoded), and that a FIFTH divergence FAILS.
 
-Subject-RFC2047-encoding is a candidate 4th divergence surfaced by the adversarial probe; its pin lands
-once the accept/eliminate ruling is in.
+Subject-RFC2047 decoding is the fourth accepted divergence (ratified 2026-07-23) — the compare
+decode-normalizes both headings idempotently; covered by the encoded-subject scenario A/B pins below.
 """
 
 from __future__ import annotations

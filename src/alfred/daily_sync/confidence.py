@@ -43,7 +43,11 @@ from .config import ConfidenceConfig
 
 log = structlog.get_logger(__name__)
 
-_VALID_TIERS = ("high", "medium", "low", "spam")
+# The valid confidence-flag keys. The four priority TIERS plus, since #7 7c-i,
+# the ``filing`` axis gate (NOT a priority tier — the topical-filing gate whose
+# consumer is the 7c-ii Gmail label write). Additive; the four tiers are
+# unperturbed. ``/calibration_ok filing`` flips it via ``set_confidence``.
+_VALID_TIERS = ("high", "medium", "low", "spam", "filing")
 
 
 def load_state(state_path: str | Path) -> dict[str, Any]:
@@ -106,6 +110,8 @@ def list_confidence(
         "medium": bool(persisted.get("medium", seed.medium)),
         "low": bool(persisted.get("low", seed.low)),
         "spam": bool(persisted.get("spam", seed.spam)),
+        # #7 7c-i — the topical-filing-axis gate (built-before-consumer; 7c-ii reads it).
+        "filing": bool(persisted.get("filing", seed.filing)),
     }
 
 

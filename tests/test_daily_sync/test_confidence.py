@@ -33,7 +33,9 @@ def _seed() -> ConfidenceConfig:
 def test_list_confidence_no_state_uses_seed(tmp_path: Path):
     state_path = tmp_path / "state.json"
     flags = list_confidence(state_path, _seed())
-    assert flags == {"high": False, "medium": False, "low": False, "spam": False}
+    # #7 7c-i lockstep: the four priority tiers are unperturbed; ``filing`` (the topical-filing axis gate)
+    # is the additive fifth key, defaulting False.
+    assert flags == {"high": False, "medium": False, "low": False, "spam": False, "filing": False}
 
 
 def test_set_confidence_persists_and_returns(tmp_path: Path):
@@ -52,7 +54,7 @@ def test_set_confidence_multiple_tiers(tmp_path: Path):
     set_confidence(state_path, "spam", True, seed=_seed())
     flags = list_confidence(state_path, _seed())
     assert flags == {
-        "high": True, "medium": False, "low": False, "spam": True,
+        "high": True, "medium": False, "low": False, "spam": True, "filing": False,
     }
 
 
@@ -92,3 +94,31 @@ def test_format_confidence_report_contains_all_tiers():
     assert "✅" in high_line
     medium_line = next(line for line in lines if "medium" in line)
     assert "⏳" in medium_line
+
+
+# ---------------------------------------------------------------------------
+# #7 7c-i — the ``filing`` axis gate: additive, defaults False, flippable, tiers unperturbed
+# ---------------------------------------------------------------------------
+
+
+def test_filing_flag_defaults_false_and_tiers_unperturbed(tmp_path: Path):
+    # Exact-set lockstep pin: the confidence flag set is EXACTLY the four priority tiers + filing.
+    flags = list_confidence(tmp_path / "state.json", ConfidenceConfig())
+    assert set(flags) == {"high", "medium", "low", "spam", "filing"}
+    assert flags == {"high": False, "medium": False, "low": False, "spam": False, "filing": False}
+
+
+def test_filing_flag_flippable_via_set_confidence(tmp_path: Path):
+    # ``/calibration_ok filing`` routes here; the gate must be flippable + persist, independent of tiers.
+    state_path = tmp_path / "state.json"
+    flags = set_confidence(state_path, "filing", True, seed=ConfidenceConfig())
+    assert flags["filing"] is True
+    # Persists across reload; the four priority tiers are untouched.
+    reloaded = list_confidence(state_path, ConfidenceConfig())
+    assert reloaded["filing"] is True
+    assert reloaded["high"] is False and reloaded["spam"] is False
+
+
+def test_filing_flag_in_report():
+    out = format_confidence_report({"high": False, "medium": False, "low": False, "spam": False, "filing": True})
+    assert "filing" in out

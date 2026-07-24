@@ -205,6 +205,30 @@ email_classifier:
   calibration_corpus_path: "./data/email_calibration.salem.jsonl"
   calibration_few_shot_count: 10
 
+# Email TOPICAL FILING (#7 7c-i) — the orthogonal sibling of email_classifier
+# above. The priority axis tiers an email (high/medium/low/spam); this axis
+# FILES it into a topical category (Business/Receipts, Business/Invoices,
+# Finance/Tax, Finance/Personal), ported verbatim from the retired n8n Gmail
+# workflow. A rule match wins first; the LLM fallback (Sonnet) handles the long
+# tail on no-rule-match. Writes an additive ``email_category`` frontmatter field
+# ONLY — never the priority fields. INERT re: Gmail (7c-i is vault-side only; the
+# Gmail-side label re-application is 7c-ii, gated on ``confidence.filing``).
+email_filing:
+  enabled: true
+  fallback_enabled: true        # LLM fallback fires ONLY on no-rule-match
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-6"  # same model class as email_classifier (personal-email, not clinical)
+    max_tokens: 256
+  # SHARE the corpus with email_classifier — one file carries both the priority
+  # and the category correction axes (the self-correcting few-shot for each).
+  calibration_corpus_path: "./data/email_calibration.salem.jsonl"
+  calibration_few_shot_count: 10
+  # Operator-approved rule additions. Read here (seeds + additions); the WRITE
+  # side (the approval CLI + proposal generation) is 7c-i-b. Absent/empty ⇒
+  # seeds only (the n8n parity set).
+  rules_additions_path: "./data/email_filing_rules.json"
+
 janitor:
   sweep:
     interval_seconds: 3600
