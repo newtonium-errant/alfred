@@ -70,6 +70,12 @@ log = structlog.get_logger(__name__)
 # inline literal by GroundingResult.flags_for).
 INFERRED_DIAGNOSIS_REASON = "inferred_diagnosis"
 
+# LIVE registry of the grounding-reason codes this module MINTS — the namespace-disjointness
+# pin (test_scribe_notegen_quality) unions this into the derived grounding-reason set so a new
+# reason here auto-enters the guard (no hand-maintained test copy). Same discipline as
+# ``grounding.MECHANICAL_GROUNDING_REASONS`` / ``speaker_attribution.GROUNDING_REASONS``.
+GROUNDING_REASONS: frozenset[str] = frozenset({INFERRED_DIAGNOSIS_REASON})
+
 
 # --- FIX 1 (audit batch 2 #5): SAME-SPAN hedge-aware clear-check ------------
 # A cited lexicon label clears an inferred-dx flag ONLY when it is a CURRENT

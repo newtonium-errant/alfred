@@ -132,6 +132,18 @@ SPEAKER_UNVERIFIED_REASON = "speaker_unverified"
 COLLATERAL_ATTRIBUTION_REASON = "collateral_attribution"
 ATTRIBUTION_UNVERIFIED_REASON = "attribution_unverified"
 
+# LIVE registry of the grounding-reason codes this module MINTS (the per-claim three + the
+# note-level banner) — the namespace-disjointness pin (test_scribe_notegen_quality) unions this
+# into the derived grounding-reason set so a new reason here auto-enters the guard (no
+# hand-maintained test copy). Same discipline as ``grounding.MECHANICAL_GROUNDING_REASONS`` /
+# ``inferred_dx.GROUNDING_REASONS``.
+GROUNDING_REASONS: frozenset[str] = frozenset({
+    SPEAKER_MISMATCH_REASON,
+    SPEAKER_UNVERIFIED_REASON,
+    COLLATERAL_ATTRIBUTION_REASON,
+    ATTRIBUTION_UNVERIFIED_REASON,
+})
+
 # The clinician-authored SOAP sections (Objective / Assessment / Plan). A cited
 # patient/other turn here is a mismatch; Subjective (the patient's report) has its
 # own asymmetric rule (collateral) below.

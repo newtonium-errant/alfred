@@ -14,8 +14,12 @@ import tempfile
 import pytest
 
 from alfred.scribe.config import load_from_unified
-from alfred.scribe.grounding import _REASON_INLINE_LITERAL, verify
-from alfred.scribe.inferred_dx import INFERRED_DIAGNOSIS_REASON
+from alfred.scribe.grounding import (
+    MECHANICAL_GROUNDING_REASONS,
+    _REASON_INLINE_LITERAL,
+    verify,
+)
+from alfred.scribe.inferred_dx import GROUNDING_REASONS as _INFERRED_DX_REASONS
 from alfred.scribe.notegen import (
     QUALITY_ASSESSMENT_NO_PLAN,
     QUALITY_REQUIRED_SECTION_EMPTY,
@@ -24,12 +28,7 @@ from alfred.scribe.notegen import (
 from alfred.scribe import notegen_quality as nq
 from alfred.scribe.notegen_profile import DEFAULT_PROFILE, profile_from_dict
 from alfred.scribe.pipeline import render_verified_note
-from alfred.scribe.speaker_attribution import (
-    ATTRIBUTION_UNVERIFIED_REASON,
-    COLLATERAL_ATTRIBUTION_REASON,
-    SPEAKER_MISMATCH_REASON,
-    SPEAKER_UNVERIFIED_REASON,
-)
+from alfred.scribe.speaker_attribution import GROUNDING_REASONS as _SPEAKER_REASONS
 from alfred.scribe.transcript import Segment, Transcript
 from alfred.vault.scope import STAYC_CLINICAL_DRAFT_EDIT_FIELDS
 
@@ -206,19 +205,25 @@ def test_grounding_detector_unchanged_on_a_clean_note():
 # Namespace disjointness + DRAFT_EDIT_FIELDS widen (the 3 ratified conditions)
 # ===========================================================================
 
-_KNOWN_GROUNDING_REASONS = frozenset({
-    "ungrounded_assertion", "ungrounded_span", "number_mismatch", "negation_mismatch",
-    INFERRED_DIAGNOSIS_REASON, SPEAKER_MISMATCH_REASON, SPEAKER_UNVERIFIED_REASON,
-    COLLATERAL_ATTRIBUTION_REASON, ATTRIBUTION_UNVERIFIED_REASON,
-})
+# SELF-MAINTAINING grounding-reason set — DERIVED from the three LIVE per-module registries, NOT a
+# hand-maintained copy. A grounding reason added to any minting module's ``GROUNDING_REASONS`` /
+# ``MECHANICAL_GROUNDING_REASONS`` frozenset auto-enters the disjointness guard below, so a future
+# grounding reason cannot silently escape it (the #14c hand-list drift the go-live hardening closed).
+# CEILING (be honest for the next reader): the guard covers reasons that are REGISTERED in these
+# frozensets. A brand-new INLINE reason literal minted in code WITHOUT being added to its module's
+# registry is not auto-detected (that needs AST/corpus analysis) — but each module's registry sits
+# co-located with its reason constants + mint sites, so registering is the local, obvious step.
+_LIVE_GROUNDING_REASONS = MECHANICAL_GROUNDING_REASONS | _INFERRED_DX_REASONS | _SPEAKER_REASONS
 
 
 def test_quality_namespace_disjoint_from_grounding():
     # the split keys on the quality_ prefix — a grounding reason must NEVER start with it (else it'd
     # leak into the advisory list, diluting the medico-legal signal), and every quality reason MUST.
+    # Run over the DERIVED live set so the guard follows the registries, not a stale hand-copy.
+    assert _LIVE_GROUNDING_REASONS, "live grounding-reason registries must be non-empty"
     assert all(r.startswith(nq.QUALITY_REASON_PREFIX) for r in nq.QUALITY_REASONS)
-    assert not any(r.startswith(nq.QUALITY_REASON_PREFIX) for r in _KNOWN_GROUNDING_REASONS)
-    assert nq.QUALITY_REASONS.isdisjoint(_KNOWN_GROUNDING_REASONS)
+    assert not any(r.startswith(nq.QUALITY_REASON_PREFIX) for r in _LIVE_GROUNDING_REASONS)
+    assert nq.QUALITY_REASONS.isdisjoint(_LIVE_GROUNDING_REASONS)
 
 
 def test_quality_flags_is_a_draft_edit_field():

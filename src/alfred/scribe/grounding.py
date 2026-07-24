@@ -103,6 +103,33 @@ from alfred.scribe.transcript import Transcript
 log = structlog.get_logger(__name__)
 
 
+# ── Mechanical grounding-reason codes (the 4 verify()-minted reasons) ────────────
+# The reason CODE minted for each mechanical failure — the token BEFORE the ":" in the
+# flag string (``reasons[0].split(":", 1)[0]``). Extracted to named constants so
+# :data:`MECHANICAL_GROUNDING_REASONS` is a LIVE registry the namespace-disjointness pin
+# derives from (test_scribe_notegen_quality) instead of a hand-maintained copy. The VALUES
+# are byte-identical to the former inline literals — grounding DETECTION is unchanged
+# (pinned by ``test_grounding_detector_unchanged_on_a_clean_note``; mutate a value so it
+# differs from its mint site and that pin reds).
+UNGROUNDED_ASSERTION_REASON = "ungrounded_assertion"
+UNGROUNDED_SPAN_REASON = "ungrounded_span"
+NUMBER_MISMATCH_REASON = "number_mismatch"
+NEGATION_MISMATCH_REASON = "negation_mismatch"
+
+# The LIVE registry of grounding's OWN (mechanical) reason codes — the disjointness pin
+# unions this with ``inferred_dx.GROUNDING_REASONS`` + ``speaker_attribution.GROUNDING_REASONS``
+# (which grounding cannot import — those modules import grounding, so a reverse import cycles).
+# A NEW mechanical reason MUST be registered here alongside its mint site (both co-located in
+# this file) so it auto-enters the guard. Practical ceiling: a brand-new INLINE literal that is
+# NOT added here is not auto-detected — the guard covers REGISTERED reasons (see the pin docstring).
+MECHANICAL_GROUNDING_REASONS: frozenset[str] = frozenset({
+    UNGROUNDED_ASSERTION_REASON,
+    UNGROUNDED_SPAN_REASON,
+    NUMBER_MISMATCH_REASON,
+    NEGATION_MISMATCH_REASON,
+})
+
+
 class NegationSuppressionStore(Protocol):
     """Duck-typed #26 Phase-2 approved-suppression store, passed into :func:`verify`
     by the PIPELINE (the concrete impl is ``negation_suppression.NegationSuppression``).
@@ -476,13 +503,13 @@ def verify(
 
         # (1) ungrounded assertion — no citation at all.
         if not claim.source_spans:
-            reasons.append("ungrounded_assertion: claim cites no source segment")
+            reasons.append(f"{UNGROUNDED_ASSERTION_REASON}: claim cites no source segment")
         else:
             # (2) every cited span must be a real segment id.
             bad = [s for s in claim.source_spans if s not in seg_by_id]
             if bad:
                 reasons.append(
-                    f"ungrounded_span: cited segment(s) {bad} not in transcript"
+                    f"{UNGROUNDED_SPAN_REASON}: cited segment(s) {bad} not in transcript"
                 )
 
         cited = _cited_text(claim.source_spans, seg_by_id)
@@ -495,7 +522,7 @@ def verify(
         ]
         if missing_nums:
             reasons.append(
-                f"number_mismatch: {missing_nums} not verbatim in cited segment(s)"
+                f"{NUMBER_MISMATCH_REASON}: {missing_nums} not verbatim in cited segment(s)"
             )
 
         # (4) NEGATION check — negated-CONCEPT grounding (B) + targeted FLIP (C).
@@ -576,7 +603,7 @@ def verify(
                     f"claim asserts positively a finding the cited segment "
                     f"negates: {flipped}"
                 )
-            reasons.append("negation_mismatch: " + "; ".join(detail))
+            reasons.append(f"{NEGATION_MISMATCH_REASON}: " + "; ".join(detail))
 
         if reasons:
             result.flags.append(
