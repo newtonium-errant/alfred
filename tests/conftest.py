@@ -7,6 +7,7 @@ without touching the real vault or the user's checked-in config.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -52,6 +53,34 @@ import yaml
 # from the current ``_CONFIG.default_processors``, restoring coherence
 # with ``capture_logs``.
 #
+# SECOND orphaning vector (diagnosed 2026-07-24) — stale monkeypatched
+# log methods. A ``BoundLoggerLazyProxy`` resolves ``log.warning`` /
+# ``log.info`` / etc. dynamically via ``__getattr__`` (they are NOT real
+# instance attributes). Several suite tests spy on a daemon logger with
+# ``monkeypatch.setattr(mod.log, "warning", _spy)`` (e.g.
+# ``test_brief_dispatch.py``'s push-failure tests). Because ``hasattr(log,
+# "warning")`` is True (via ``__getattr__``), monkeypatch snapshots the
+# RESOLVED bound method as the "original" and, on teardown, RESTORES it by
+# *setting* ``log.__dict__["warning"] = <that bound method>`` — leaving a
+# REAL instance attribute that shadows ``__getattr__`` for the rest of the
+# process. That bound method has its ``_processors`` frozen to the list
+# that was current when the spy test ran; it never re-resolves, so
+# ``capture_logs``'s in-place swap of the CURRENT config list can't reach
+# it → the event renders through the frozen chain (caplog shows it) and
+# ``capture_logs`` returns ``[]`` — identical failure signature to the
+# cache-orphan case above.
+#
+# This was latent on master (the global processors list was stable across
+# tests, so ``capture_logs`` mutated the very list the frozen method held).
+# The ``_pin_structlog_off_stdout`` fixture below hands each test a FRESH
+# processors list literal, which orphans the spy test's frozen list and
+# surfaces the bug (``test_brief_watches`` / ``_weather`` / ``_process_hub``
+# crash-guard asserts). So this fixture strips not just ``bind`` but every
+# non-dunder public attribute a monkeypatch/cache could have left on the
+# proxy (all of the proxy's own state is underscore-prefixed — see
+# ``BoundLoggerLazyProxy.__init__`` — so a non-underscore key in
+# ``__dict__`` is always an artifact: ``bind`` or a shadowed log method).
+#
 # Long-term fix (deferred — separate arc): the eight ``setup_logging``
 # helpers in ``src/alfred/*/utils.py`` should maintain a module-level
 # processor list and mutate it in place rather than passing a new list
@@ -61,8 +90,16 @@ import yaml
 
 @pytest.fixture(autouse=True)
 def _bust_structlog_lazy_proxy_cache():
-    """Autouse: bust cached ``bind`` on every ``alfred.*`` module-level
-    structlog logger BEFORE each test runs.
+    """Autouse: reset every ``alfred.*`` module-level structlog proxy to a
+    clean lazy state BEFORE each test runs.
+
+    Strips the cached ``bind`` override (``cache_logger_on_first_use`` case)
+    AND any stale monkeypatched log-method attribute (``warning`` / ``info``
+    / etc.) that a prior test's ``monkeypatch.setattr(log, <method>, ...)``
+    restored onto the proxy instance. Both shadow the proxy's dynamic
+    ``__getattr__`` resolution and pin ``_processors`` to an orphaned list,
+    breaking ``capture_logs``. Deleting them forces re-resolution against
+    the CURRENT ``_CONFIG.default_processors`` on next use.
 
     Cheap — typical run sees ~50 modules under ``alfred.*`` with module-
     level loggers, attribute deletion is O(1). Test setup time impact
@@ -75,14 +112,84 @@ def _bust_structlog_lazy_proxy_cache():
         for attr in _attr_names:
             candidate = getattr(mod, attr, None)
             if isinstance(candidate, structlog._config.BoundLoggerLazyProxy):
-                # ``bind`` override is set on the instance when
-                # ``cache_logger_on_first_use=True`` was active at the
-                # logger's first usage. Deletion forces re-resolution
-                # against the CURRENT ``_CONFIG.default_processors``
-                # on the next ``log.info(...)`` call. Safe even if no
-                # instance override exists — guard with ``in __dict__``.
-                if "bind" in candidate.__dict__:
-                    del candidate.bind
+                # Every attribute the proxy legitimately owns is
+                # underscore-prefixed (``_logger``, ``_processors``, …).
+                # Any non-underscore key in ``__dict__`` is an artifact:
+                # the ``bind`` cache override (from
+                # ``cache_logger_on_first_use=True``) or a stale
+                # monkeypatched log method (``warning``/``info``/…) that a
+                # prior spy test left behind. Delete them so the proxy
+                # re-resolves against the CURRENT config on next use.
+                _artifacts = [k for k in candidate.__dict__ if not k.startswith("_")]
+                for _key in _artifacts:
+                    delattr(candidate, _key)
+    yield
+
+
+# ---------------------------------------------------------------------------
+# structlog OFF-stdout baseline — closes the capsys-pollution flake class
+# (see feedback_structlog_assertion_patterns.md)
+# ---------------------------------------------------------------------------
+#
+# Root cause (diagnosed 2026-07-24): ``setup_logging`` (the eight
+# ``*/utils.py`` helpers, default ``suppress_stdout=False``) does
+# ``logging.basicConfig(handlers=[StreamHandler(sys.stdout)], force=True)`` +
+# ``structlog.configure(logger_factory=stdlib.LoggerFactory())``. That leaves
+# a root-logger ``StreamHandler`` bound to ``sys.stdout`` AND flips structlog
+# off its unconfigured ``PrintLoggerFactory`` default — and NOTHING contains or
+# restores that global state across tests. Two failure modes result, wanting
+# OPPOSITE structlog states, so no single containment baseline serves both:
+#
+#   * POLLUTION (Class B — the ``json.loads(capsys.readouterr().out)`` tests,
+#     e.g. ``routine/test_cli_items``): when structlog is in its PrintLogger
+#     default (writes to the CURRENT ``sys.stdout`` each call), a stray
+#     structlog event — including one from a background daemon thread spawned
+#     by an orchestrator/mail/curator test that outlives its test — interleaves
+#     a rendered log line into the JSON on stdout and breaks the parse.
+#   * ABSENCE (Class A — tests asserting a structlog EVENT on ``capsys.out``,
+#     e.g. ``test_backfill``): once a prior ``setup_logging`` moved structlog to
+#     LoggerFactory, its events go to the logging module (caplog), not stdout,
+#     so the ``capsys.out`` assertion sees nothing.
+#
+# This fixture pins a DETERMINISTIC OFF-stdout baseline before every test:
+# structlog routes through stdlib logging (so ``caplog`` and
+# ``structlog.testing.capture_logs`` both keep working), and no structlog line
+# can ever reach ``capsys.out``. Class A must therefore assert via
+# ``capture_logs`` (the ``test_backfill`` migration lands with this fixture).
+#
+# It does NOT touch pytest's own capture handler: only ``StreamHandler``s whose
+# ``.stream`` IS the real stdout/stderr are stripped (pytest's LogCaptureHandler
+# streams a StringIO; FileHandlers stream a file — both are left intact). A test
+# that itself calls ``setup_logging`` mid-body still overrides this baseline for
+# its own duration (this only sets the pre-test starting state).
+
+
+@pytest.fixture(autouse=True)
+def _pin_structlog_off_stdout():
+    """Autouse: deterministic OFF-stdout structlog baseline before each test."""
+    root = logging.getLogger()
+    _live_stdio = (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__)
+    for handler in list(root.handlers):
+        # Strip ONLY handlers bound to the real stdout/stderr (a leaked
+        # setup_logging StreamHandler). pytest's capture handler (StringIO
+        # stream) and FileHandlers (file stream) are left untouched.
+        if isinstance(handler, logging.StreamHandler) and getattr(handler, "stream", None) in _live_stdio:
+            root.removeHandler(handler)
+    # Pin structlog to stdlib LoggerFactory (NOT the PrintLogger→stdout default)
+    # so events route through logging → pytest capture, never direct-to-stdout.
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.dev.ConsoleRenderer(colors=False),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
     yield
 
 

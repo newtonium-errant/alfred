@@ -23,6 +23,7 @@ from typing import Any
 
 import frontmatter
 import pytest
+import structlog
 
 from alfred.email_classifier import (
     BackfillSummary,
@@ -457,13 +458,15 @@ def test_backfill_missing_note_dir_returns_empty_summary(
 def test_backfill_progress_log_fires_at_interval(
     vault: Path,
     enabled_config: EmailClassifierConfig,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Progress log fires every N records. Use small interval for the test.
 
-    structlog renders to stdout via the default ConsoleRenderer; capture
-    via ``capsys`` rather than ``caplog`` since the project uses
-    structlog's processor chain (see curator/utils.py setup_logging).
+    Asserted via ``structlog.testing.capture_logs`` (the robust pattern per
+    ``feedback_structlog_assertion_patterns.md``). The prior ``capsys``-on-stdout
+    form was order-fragile: it required structlog in its unconfigured
+    PrintLogger→stdout default, which any earlier test's ``setup_logging``
+    clobbers (moving events to the logging module) — so it flaked in the full
+    suite. ``capture_logs`` reads the event stream directly, sink-independent.
     """
     # Seed enough records that progress fires at least once
     for i in range(6):
@@ -472,19 +475,17 @@ def test_backfill_progress_log_fires_at_interval(
         )
     fake = _FakeLLM(response="unused")
 
-    run_backfill(
-        vault_path=vault,
-        config=enabled_config,
-        llm_caller=fake,
-        progress_every=3,
-    )
+    with structlog.testing.capture_logs() as cap:
+        run_backfill(
+            vault_path=vault,
+            config=enabled_config,
+            llm_caller=fake,
+            progress_every=3,
+        )
 
-    captured = capsys.readouterr()
     # 6 records, every 3 → progress fires at idx=3 and idx=6
-    progress_count = captured.out.count("email_classifier.backfill.progress")
-    assert progress_count >= 2, (
-        f"expected ≥2 progress logs, got {progress_count}\n--- stdout ---\n{captured.out}"
-    )
+    progress = [e for e in cap if e.get("event") == "email_classifier.backfill.progress"]
+    assert len(progress) >= 2, f"expected ≥2 progress logs, got {len(progress)}: {cap}"
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +660,6 @@ def test_backfill_reclassify_false_default_preserves_existing_behavior(
 def test_backfill_reclassify_logs_verdict_change(
     vault: Path,
     enabled_config: EmailClassifierConfig,
-    capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
 ) -> None:
     """When a reclassify re-evaluation produces a DIFFERENT priority
@@ -668,12 +668,11 @@ def test_backfill_reclassify_logs_verdict_change(
     priorities pinned so operator log review can grep verdict changes
     apart from no-op re-confirms.
 
-    Mirrors the capsys-stdout pattern of
-    ``test_backfill_progress_log_fires_at_interval`` (the project
-    routes structlog through ConsoleRenderer; capsys captures
-    rendered events from stdout). Isolated from c6 quarantine —
-    classifier returns spam, which would otherwise trigger the move
-    + pollute capsys output with the quarantine_spam log line.
+    Asserted via ``structlog.testing.capture_logs`` (robust, sink-independent)
+    per ``feedback_structlog_assertion_patterns.md`` — the prior capsys-on-stdout
+    form flaked in the full suite (see the progress-log test's docstring). This
+    also pins the fields as STRUCTURED VALUES (``old_priority``/``new_priority``),
+    stronger than the old ``"old_priority=medium" in out`` string match.
     """
     _isolate_quarantine_state(tmp_path, enabled_config, spam_flag=False)
     _seed_note(
@@ -685,26 +684,21 @@ def test_backfill_reclassify_logs_verdict_change(
         reasoning="retroactive spam under corrected few-shot",
     ))
 
-    run_backfill(
-        vault_path=vault,
-        config=enabled_config,
-        llm_caller=fake,
-        reclassify=True,
-        # Disable the progress log so its events don't pollute the
-        # capsys output we're grepping.
-        progress_every=0,
-    )
+    with structlog.testing.capture_logs() as cap:
+        run_backfill(
+            vault_path=vault,
+            config=enabled_config,
+            llm_caller=fake,
+            reclassify=True,
+            progress_every=0,
+        )
 
-    captured = capsys.readouterr()
-    # Event name present in rendered output.
-    assert "email_classifier.backfill.reclassified" in captured.out, (
-        f"reclassified log event missing from capsys output:\n--- stdout ---\n{captured.out}"
-    )
-    # Both old + new priorities surfaced as structured fields. Pin
-    # both values so a future refactor that drops either field fails
-    # this test (per feedback_log_emission_test_pattern.md).
-    assert "old_priority=medium" in captured.out or "old_priority='medium'" in captured.out
-    assert "new_priority=spam" in captured.out or "new_priority='spam'" in captured.out
+    reclassified = [e for e in cap if e.get("event") == "email_classifier.backfill.reclassified"]
+    assert len(reclassified) == 1, f"expected 1 reclassified event, got: {cap}"
+    # Both old + new priorities pinned as structured fields, so a future refactor
+    # that drops or renames either fails this test (feedback_log_emission_test_pattern.md).
+    assert reclassified[0]["old_priority"] == "medium"
+    assert reclassified[0]["new_priority"] == "spam"
 
 
 def test_backfill_reclassify_dry_run_does_not_write(
