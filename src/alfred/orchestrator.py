@@ -535,6 +535,11 @@ def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> Non
     inbox_path = vault_path / config.inbox_dir
     token = os.environ.get("MAIL_WEBHOOK_TOKEN", "")
     from alfred.mail.webhook import run_webhook
+    # #7 7a — the native IMAP fetch loop runs ALONGSIDE the webhook (the webhook stays the live inbound
+    # path for live.ca via n8n; it is NEVER evicted). INERT by default: only started when
+    # ``mail.fetch.enabled`` is True (the operator-gated flip). When off, NO fetch thread starts and NO
+    # IMAP connection is ever opened — production is byte-for-byte unchanged.
+    _maybe_start_mail_fetch_loop(config, vault_path)
     # Idle-tick heartbeat — defaulted-on; emits ``mail.idle_tick`` so
     # the operator can distinguish "no traffic" from "daemon dead".
     run_webhook(
@@ -543,6 +548,46 @@ def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> Non
         idle_tick_enabled=config.idle_tick.enabled,
         idle_tick_interval_seconds=config.idle_tick.interval_seconds,
     )
+
+
+def _maybe_start_mail_fetch_loop(config, vault_path: Path) -> None:
+    """#7 7a — start the native IMAP fetch loop as a daemon THREAD alongside the webhook, IF and ONLY
+    IF ``mail.fetch.enabled``. INERT default returns immediately (no thread, no IMAP connect). ILB: an
+    enabled-but-no-``fetch: true``-accounts config logs an explicit signal so 'gate on, nothing to
+    pull' is distinguishable from 'gate off'. The thread is a daemon (dies with the process); a fetch
+    error is caught + logged per-tick so the loop (and the webhook) never die on a transient IMAP fault."""
+    import structlog
+    log = structlog.get_logger(__name__)
+    fetch_cfg = getattr(config, "fetch", None)
+    if fetch_cfg is None or not fetch_cfg.enabled:
+        return   # INERT (or a config without a fetch block) — the mail slot is the webhook receiver only.
+    fetch_accounts = config.fetch_accounts()
+    if not fetch_accounts:
+        log.info(
+            "mail.fetch.loop_no_accounts",
+            detail="mail.fetch.enabled is True but no account has fetch: true — the native fetch loop "
+                   "has nothing to pull (add fetch: true to the account to rehome).")
+        return
+    import threading
+    import time
+    from alfred.mail.fetcher import fetch_all
+
+    interval = config.fetch_poll_interval()
+
+    def _loop() -> None:
+        while True:
+            try:
+                fetch_all(config, vault_path, only_flagged=True)
+            except Exception:  # noqa: BLE001 — a transient IMAP fault must not kill the loop or webhook
+                log.exception("mail.fetch.loop_error")
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, name="mail-fetch", daemon=True).start()
+    log.info(
+        "mail.fetch.loop_started",
+        accounts=[a.name for a in fetch_accounts], poll_interval=interval,
+        detail="native IMAP fetch loop started ALONGSIDE the webhook (#7 rehome — the webhook is not "
+               "evicted; live.ca still arrives via n8n).")
 
 
 def _run_talker(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = False) -> None:

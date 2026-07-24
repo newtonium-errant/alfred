@@ -1220,6 +1220,46 @@ surveyor:
 # out of all auto-sync via an explicit empty list. The ``no_candidates``
 # empty-state signal fires downstream so idle is distinguishable from
 # broken.
+# Mail intake. TWO paths (see the runtime-location legend at the top of this file):
+#   * WEBHOOK receiver (the ``mail`` daemon slot) — the LIVE inbound path: an n8n workflow
+#     (Outlook / Gmail) POSTs to <tunnel>/ingest → the receiver writes email-<account>-*.md into the
+#     vault inbox → curator processes. This is what runs in production today.
+#   * NATIVE IMAP fetch loop (#7 rehome) — pulls IMAP directly, no n8n. INERT by default
+#     (``fetch.enabled: false``): the daemon runs ONLY the webhook. Turning it on (the operator-gated
+#     flip) starts a fetch thread ALONGSIDE the webhook that pulls the ``fetch: true`` accounts.
+#
+# Secrets (passwords) are ${VAR} refs resolved from .env — NEVER inline a password here. See
+# .env.example for MAIL_WEBHOOK_TOKEN, MAIL_LIVE_PASSWORD, GMAIL_ANDREWNEWTON965_APP_PASSWORD.
+mail:
+  poll_interval: 300          # webhook path ignores this; the fetch loop uses it (or fetch.poll_interval)
+  inbox_dir: inbox
+  state:
+    path: ./data/mail_state.json
+  # #7 — the native IMAP fetch loop. INERT until the operator flips (disable the n8n workflow + enable).
+  fetch:
+    enabled: false            # DEFAULT off — the loop does not run and opens no IMAP connection
+    # poll_interval: 300      # optional per-loop cadence override (else uses poll_interval above)
+  accounts:
+    # live.ca — arrives via the Outlook n8n webhook, so fetch: false (never native-fetched here).
+    - name: live
+      email: andrew.newton@live.ca
+      imap_host: imap-mail.outlook.com
+      imap_port: 993
+      password: "${MAIL_LIVE_PASSWORD}"
+      folders: [INBOX]
+      mark_read: true
+      fetch: false
+    # Gmail — the #7 rehome target. name: gmail keeps email-gmail-*.md filenames byte-identical to the
+    # current n8n webhook output. Ships INERT (fetch.enabled: false above); flipped on at cutover.
+    - name: gmail
+      email: andrewnewton965@gmail.com
+      imap_host: imap.gmail.com
+      imap_port: 993
+      password: "${GMAIL_ANDREWNEWTON965_APP_PASSWORD}"
+      folders: [INBOX]
+      mark_read: true
+      fetch: true
+
 scaffold:
   include:
     - "_templates"

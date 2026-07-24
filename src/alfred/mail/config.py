@@ -15,6 +15,12 @@ class MailAccount:
     password: str = ""
     folders: list[str] = field(default_factory=lambda: ["INBOX"])
     mark_read: bool = True
+    # #7 7a — this account is pulled by the NATIVE IMAP fetch loop (the daemon path), vs delivered by
+    # the n8n webhook. Default False: an existing account (e.g. live.ca, which arrives via the Outlook
+    # webhook) is NOT double-fetched. The Gmail rehome account sets ``fetch: true``. Gated ABOVE by the
+    # global ``mail.fetch.enabled`` INERT switch — this flag only SELECTS which accounts the loop pulls
+    # once the loop is turned on.
+    fetch: bool = False
 
     def resolved_password(self) -> str:
         """Resolve ${VAR} references in password."""
@@ -47,11 +53,36 @@ class IdleTickConfig:
 
 
 @dataclass
+class MailFetchConfig:
+    """#7 7a — the native IMAP fetch LOOP gate (the rehome's run path).
+
+    INERT by default (``enabled: False``): the mail daemon runs ONLY the webhook receiver, exactly as
+    today — the fetch loop does not run and NEVER opens an IMAP connection. Setting ``enabled: true``
+    (the operator-gated flip, 7b) starts a background fetch thread ALONGSIDE the webhook that
+    periodically pulls the ``fetch: true`` accounts (Gmail) into the same inbox. The webhook is never
+    evicted. ``poll_interval`` (seconds) governs the loop; falls back to ``MailConfig.poll_interval``."""
+
+    enabled: bool = False
+    poll_interval: int | None = None   # None ⇒ use MailConfig.poll_interval
+
+
+@dataclass
 class MailConfig:
     accounts: list[MailAccount] = field(default_factory=list)
     poll_interval: int = 300  # seconds
     state_path: str = "./data/mail_state.json"
     inbox_dir: str = "inbox"
+    # #7 7a — the native IMAP fetch-loop gate (INERT by default).
+    fetch: MailFetchConfig = field(default_factory=MailFetchConfig)
+
+    def fetch_poll_interval(self) -> int:
+        """The fetch loop's cadence — its own override, else the top-level poll_interval."""
+        return self.fetch.poll_interval if self.fetch.poll_interval else self.poll_interval
+
+    def fetch_accounts(self) -> list[MailAccount]:
+        """The accounts the native fetch loop pulls (``fetch: true``) — the webhook-delivered accounts
+        (fetch: false) are excluded so they are never double-fetched."""
+        return [a for a in self.accounts if a.fetch]
     # Idle-tick heartbeat — see :class:`IdleTickConfig`. Defaulted-on
     # via the dataclass default_factory; absent block in YAML keeps
     # ``enabled=True`` / ``interval_seconds=60``.
@@ -71,7 +102,14 @@ def load_from_unified(raw: dict) -> MailConfig:
             password=acc.get("password", ""),
             folders=acc.get("folders", ["INBOX"]),
             mark_read=acc.get("mark_read", True),
+            fetch=bool(acc.get("fetch", False)),
         ))
+    # #7 7a — the native fetch-loop gate (INERT by default: absent block ⇒ enabled=False).
+    fetch_raw = section.get("fetch") or {}
+    fetch_cfg = MailFetchConfig(
+        enabled=bool(fetch_raw.get("enabled", False)),
+        poll_interval=fetch_raw.get("poll_interval"),
+    )
     # Idle-tick — defaulted-on; partial dict merges over dataclass default.
     idle_raw = section.get("idle_tick") or {}
     idle_tick = IdleTickConfig(
@@ -84,4 +122,5 @@ def load_from_unified(raw: dict) -> MailConfig:
         state_path=section.get("state", {}).get("path", "./data/mail_state.json"),
         inbox_dir=section.get("inbox_dir", "inbox"),
         idle_tick=idle_tick,
+        fetch=fetch_cfg,
     )

@@ -387,17 +387,21 @@ def fetch_account(
     return count
 
 
-def fetch_all(config: MailConfig, vault_path: Path) -> int:
-    """Fetch from all configured accounts. Returns total new emails.
+def fetch_all(config: MailConfig, vault_path: Path, *, only_flagged: bool = False) -> int:
+    """Fetch new emails and drop them into the vault inbox. Returns total new emails.
 
-    Manual-CLI fallback path (``alfred mail fetch``) — the live inbound
-    flow is the webhook (n8n → tunnel → ``mail.webhook``); this fetcher
-    is kept at feature parity deliberately (2026-06-07 empty-body-synth
-    parity commits) but is never scheduled. Its logs route to
-    ``mail.log`` via ``cmd_mail``'s setup_logging.
+    ``only_flagged=False`` (the manual ``alfred mail fetch`` CLI): pull EVERY configured account — the
+    deliberate, parity-maintained fallback path, unchanged since 2026-06-07.
+    ``only_flagged=True`` (the #7 7a native daemon loop): pull ONLY the ``fetch: true`` accounts (Gmail)
+    so the webhook-delivered accounts (live.ca) are never double-fetched.
+
+    The live inbound flow remains the webhook (n8n → tunnel → ``mail.webhook``); with the fetch loop
+    turned on it runs ALONGSIDE the webhook, never replacing it. Logs route to ``mail.log`` (CLI) or
+    ``mail_webhook.log`` (the daemon thread shares the webhook runner's logging).
     """
     inbox_path = vault_path / config.inbox_dir
     inbox_path.mkdir(parents=True, exist_ok=True)
+    accounts = config.fetch_accounts() if only_flagged else config.accounts
 
     # R1 (2026-06-11): log the CONFIGURED-account truth here, at the one
     # place accounts are actually consumed. The (since renamed)
@@ -405,15 +409,16 @@ def fetch_all(config: MailConfig, vault_path: Path) -> int:
     # misled a diagnosis into "the IMAP account config isn't loading."
     log.info(
         "mail.fetch.starting",
-        accounts=len(config.accounts),
-        account_names=[a.name for a in config.accounts],
+        accounts=len(accounts),
+        account_names=[a.name for a in accounts],
+        only_flagged=only_flagged,
     )
 
     state_mgr = StateManager(config.state_path)
     state_mgr.load()
 
     total = 0
-    for account in config.accounts:
+    for account in accounts:
         total += fetch_account(account, inbox_path, state_mgr)
 
     state_mgr.save()
