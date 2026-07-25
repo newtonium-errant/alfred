@@ -1271,6 +1271,16 @@ mail:
   gmail_filing:
     enabled: false            # DEFAULT off — no thread; even when true the loop is DORMANT until confidence.filing
     # poll_interval: 300      # optional per-loop cadence override (else uses poll_interval above)
+  # #31 — account-delivery liveness (Monitor A). The BIT health sweep flags, per account, how long
+  # since an email last ARRIVED (from the raw email-<account>-* file in inbox/ + inbox/processed/) —
+  # independent of whether the curator structured it. Would have caught the Gmail intake going
+  # silently dead for ~2 months. Generous defaults so a legitimately-quiet account doesn't cry wolf.
+  liveness:
+    enabled: true             # DEFAULT on — set false to silence the delivery monitor
+    warn_days: 3              # WARN if an account had prior delivery but none in this many days
+    fail_days: 7              # FAIL threshold
+    # accounts:               # optional per-account overrides (a low-volume account can run looser)
+    #   gmail: {warn_days: 2, fail_days: 5}
   accounts:
     # live.ca — arrives via the Outlook n8n webhook, so fetch: false (never native-fetched here).
     - name: live
