@@ -313,6 +313,25 @@ def _build_markdown(msg: email.message.EmailMessage, account: str) -> str:
     return "\n".join(lines)
 
 
+def _imap_mailbox(name: str) -> str:
+    """Return an IMAP-safe mailbox token for SELECT/EXAMINE.
+
+    imaplib does NOT quote mailbox names, so a name with a space (e.g.
+    ``[Gmail]/All Mail``) is sent as two tokens and the server answers
+    ``BAD Could not parse command``. Wrap such names in a double-quoted IMAP
+    string. Already-quoted names and plain atoms (``INBOX``) pass through
+    unchanged. Only whitespace triggers quoting — ``[`` / ``]`` / ``/`` are
+    valid IMAP atom chars, so the space in ``[Gmail]/All Mail`` is the sole
+    trigger for the Gmail folder set; escaping embedded quotes/backslashes is a
+    deliberate non-goal (no such mailbox exists here).
+    """
+    if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+        return name
+    if any(c.isspace() for c in name):
+        return '"' + name + '"'
+    return name
+
+
 def fetch_account(
     account: MailAccount,
     inbox_path: Path,
@@ -371,7 +390,7 @@ def fetch_account(
                         "mail.cap_reached", account=account.name, max_per_run=max_per_run
                     )
                     break
-                status, _ = conn.select(folder, readonly=not account.mark_read)
+                status, _ = conn.select(_imap_mailbox(folder), readonly=not account.mark_read)
                 if status != "OK":
                     log.warning("mail.folder_failed", account=account.name, folder=folder)
                     continue
@@ -629,7 +648,7 @@ def fetch_account_shadow(
             log.info("mail.shadow.connected", account=account.name, folder=target_folder)
 
             # Belt 1: EXAMINE (read-only SELECT). imaplib readonly=True → EXAMINE.
-            status, _ = conn.select(target_folder, readonly=True)
+            status, _ = conn.select(_imap_mailbox(target_folder), readonly=True)
             if status != "OK":
                 log.warning(
                     "mail.shadow.folder_failed",

@@ -219,8 +219,9 @@ def test_shadow_fetch_readonly_four_belts(tmp_path, monkeypatch):
     fetch_account_shadow(_gmail_account(), shadow, since="16-Jul-2026", folder="[Gmail]/All Mail")
     conn = created[0]
 
-    # Belt 1: EXAMINE — the ONLY select is read-only.
-    assert conn.select_calls == [("[Gmail]/All Mail", True)]
+    # Belt 1: EXAMINE — the ONLY select is read-only. The spaced mailbox is
+    # auto-quoted for IMAP (unquoted → BAD Could not parse command).
+    assert conn.select_calls == [('"[Gmail]/All Mail"', True)]
     # Belt 2: BODY.PEEK[] — every fetch peeks; RFC822 never appears.
     assert conn.fetch_calls, "expected at least one fetch"
     assert all(spec == "(BODY.PEEK[])" for _num, spec in conn.fetch_calls)
@@ -236,7 +237,8 @@ def test_shadow_fetch_readonly_four_belts(tmp_path, monkeypatch):
 def test_shadow_default_folder_is_all_mail(tmp_path, monkeypatch):
     created = _install_fake_imap(monkeypatch, [_COMMON_RAW])
     fetch_account_shadow(_gmail_account(), tmp_path / "shadow", since="16-Jul-2026")  # no folder → default
-    assert created[0].select_calls == [("[Gmail]/All Mail", True)]
+    # Default All-Mail folder has a space → auto-quoted for the IMAP EXAMINE.
+    assert created[0].select_calls == [('"[Gmail]/All Mail"', True)]
 
 
 def test_shadow_dedups_by_message_id(tmp_path, monkeypatch):

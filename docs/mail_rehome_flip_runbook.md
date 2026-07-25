@@ -54,6 +54,12 @@ PY
 Look for the entry carrying the `\All` attribute — that is the folder name to pass as `--folder`.
 (This LIST probe is read-only; it changes nothing.)
 
+Pass that name to `--folder` **plainly**, shell-quoted only for the space — e.g.
+`--folder '[Gmail]/All Mail'`. The fetcher auto-quotes spaced mailbox names for the IMAP
+`SELECT`/`EXAMINE`, so do **not** embed IMAP double-quotes: `--folder '"[Gmail]/All Mail"'` would
+double-quote the name and fail. (Before the auto-quote fix, the plain form returned
+`BAD Could not parse command`; it is now the correct form.)
+
 ## 3. The read-only shadow parity proof
 
 The shadow fetch is **non-disruptive by construction** — four independent belts guarantee it cannot
@@ -86,6 +92,7 @@ a snapshot of the raw inbox records during a window. Either:
 
 ```bash
 # Read-only capture of the last 7 days from All Mail into data/mail_shadow/
+# Pass the folder name plainly (shell-quoted for the space); the fetcher quotes it for IMAP.
 alfred mail fetch --shadow --lookback-days 7 --folder '<All-Mail-name-from-section-2>'
 
 # Compare shadow vs the production snapshot, joined by Message-ID
