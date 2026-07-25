@@ -44,6 +44,7 @@ from . import (
     friction_section,
     pending_items_section,
     radar_section,
+    recurrence_section,
     routine_match_section,
     triage_section,
 )
@@ -289,6 +290,13 @@ async def fire_once(
     # instances stay unaffected. The pending path is read from config inside
     # the provider (no set_* holder needed).
     routine_match_section.register()
+
+    # #20 P5 B1 — ad-hoc-T3 recurrence→promote proposals (PROPOSE-ONLY). Needs the vault path (scans
+    # vault/daily/*.md); registered unconditionally — the provider returns None when
+    # ``tier_recurrence.enabled`` is False (Salem opts in via config). The provider materializes the
+    # pending queue on render (idempotent); B2 wires the approve/reject reply routing.
+    recurrence_section.set_vault_path(vault_path)
+    recurrence_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()

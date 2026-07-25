@@ -214,6 +214,26 @@ class RoutineMatchConfig:
 
 
 @dataclass
+class TierRecurrenceConfig:
+    """#20 P5 — ad-hoc-T3 recurrence→promote proposals, Daily Sync surface (B1).
+
+    ``enabled`` defaults OFF — a new judgment-making surface, opt-in per instance via
+    ``daily_sync.tier_recurrence.enabled: true`` (Salem-personal, like routine_match). Detection scans
+    the ``vault/daily/*.md`` ``done_at`` history (the #20 producer) and PROPOSES promoting a recurring
+    ad-hoc chore to a routine record; the operator approves/rejects (B2). The pending + decided stores
+    are SELF-OWNED (written AND read by this subsystem — no cross-tool single-source contract, unlike
+    ``routine_match``'s pending_path). A chore checked off on ≥ ``threshold_done_days`` DISTINCT days
+    within ``window_days`` triggers a proposal.
+    """
+
+    enabled: bool = False
+    pending_path: str = "./data/tier_recurrence_pending.salem.jsonl"
+    decided_path: str = "./data/tier_recurrence_decided.salem.jsonl"
+    threshold_done_days: int = 3
+    window_days: int = 30
+
+
+@dataclass
 class DailySyncConfig:
     """Top-level Daily Sync config.
 
@@ -241,6 +261,11 @@ class DailySyncConfig:
     routine_match: RoutineMatchConfig = field(
         default_factory=RoutineMatchConfig,
     )
+    # #20 P5 — ad-hoc-T3 recurrence→promote proposal surface (B1). Defaulted-OFF;
+    # Salem opts in via ``daily_sync.tier_recurrence.enabled: true``.
+    tier_recurrence: TierRecurrenceConfig = field(
+        default_factory=TierRecurrenceConfig,
+    )
     # Path to the config file this DailySyncConfig was loaded from.
     # Carried so lazy/late loaders (the canonical-proposals queue-path
     # helpers in ``canonical_proposals_section`` and ``reply_dispatch``)
@@ -267,6 +292,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "friction_analyzer": FrictionAnalyzerConfig,
     "thresholds": FrictionThresholdsConfig,
     "routine_match": RoutineMatchConfig,
+    "tier_recurrence": TierRecurrenceConfig,
 }
 
 
