@@ -27,6 +27,7 @@ from typing import Any
 
 from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth, resolve_api_key
+from alfred.health.claude_cli_auth import check_claude_cli_auth, resolve_claude_command
 from alfred.health.types import CheckResult, Status, ToolHealth
 
 
@@ -336,6 +337,11 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     if backend == "claude":
         api_key = resolve_api_key(raw)
         results.append(await check_anthropic_auth(api_key))
+        # #32 — probe the claude -p LOGIN surface too. Distinct from the SDK
+        # api-key probe above: with ANTHROPIC_API_KEY set, that probe stays
+        # green while `claude -p` is "not logged in" (the silent structuring-
+        # down class). Zero tokens via `claude auth status`.
+        results.append(await check_claude_cli_auth(command=resolve_claude_command(raw)))
 
     results.append(_check_last_successful_process(raw))
 
