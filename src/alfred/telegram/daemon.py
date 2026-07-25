@@ -1384,7 +1384,7 @@ async def run(
         try:
             nl_broker_cfg = transport_config.canonical.nl_broker
             if nl_broker_cfg.enabled:
-                from alfred.telegram._anthropic_compat import (
+                from alfred._anthropic_compat import (
                     messages_create_kwargs as _nl_create_kwargs,
                 )
 

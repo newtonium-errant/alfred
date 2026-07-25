@@ -32,7 +32,7 @@ import frontmatter
 from alfred.vault import ops
 
 from . import capture_batch
-from ._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 from .state import StateManager
 from .utils import get_logger
 

@@ -2,10 +2,10 @@
 
 This is the PACKAGE-ROOT home for Anthropic-SDK glue, owned by no single tool (per
 ``feedback_sdk_quirk_centralization.md``: "promote the helper to ``src/alfred/_anthropic_compat.py``
-… Don't import across packages from telegram/"). It was promoted here from
-``alfred.telegram._anthropic_compat`` (which now re-exports for compat) when the second non-telegram
-consumer — the ``email_filing`` LLM fallback — joined ``email_classifier`` in duplicating the same
-construct-client-and-call block.
+… Don't import across packages from telegram/"). It was promoted here from the telegram package
+(its original home) when the second non-telegram consumer — the ``email_filing`` LLM fallback —
+joined ``email_classifier`` in duplicating the same construct-client-and-call block. The original
+telegram re-export shim has since been retired and every importer migrated to this module.
 
 Two surfaces:
 

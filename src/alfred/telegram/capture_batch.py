@@ -36,7 +36,7 @@ from typing import Any, Final
 from alfred.common.stt_noise import filter_stt_noise
 from alfred.vault import ops
 
-from ._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 from .utils import get_logger
 
 log = get_logger(__name__)

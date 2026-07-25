@@ -7,7 +7,7 @@ These unit tests pin the rule; the per-call-site tests in
 """
 from __future__ import annotations
 
-from alfred.telegram._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 
 
 def test_opus_4_7_drops_temperature() -> None:

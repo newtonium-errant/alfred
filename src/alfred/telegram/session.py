@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from alfred.common.stt_noise import filter_stt_noise
-from ._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 from .state import StateManager
 from .utils import get_logger
 

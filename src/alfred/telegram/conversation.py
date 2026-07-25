@@ -29,7 +29,7 @@ import anthropic
 
 from alfred.audit import agent_slug_for
 
-from ._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 from .config import TalkerConfig
 from .session import Session, append_turn, append_vault_op
 from .state import StateManager

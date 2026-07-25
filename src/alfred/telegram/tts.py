@@ -26,7 +26,7 @@ from typing import Any, Final
 
 import httpx
 
-from ._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 from .config import TtsConfig
 from .utils import get_logger
 

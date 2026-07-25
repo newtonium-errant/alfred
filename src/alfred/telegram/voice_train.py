@@ -103,7 +103,7 @@ import structlog
 
 from alfred.vault import ops
 
-from ._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 from .utils import get_logger
 
 log = get_logger(__name__)

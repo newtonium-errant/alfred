@@ -9,9 +9,9 @@ created (any divergence between the two normalisations would break the
 ``(instance, user)`` key match across the dispatch path) is exactly the
 sort of drift the canonical-helper pattern exists to prevent.
 
-Distinct from :mod:`alfred.telegram._anthropic_compat`, which targets
-SDK-level model-family quirks. This module is for *internal* shared
-helpers; the SDK shim stays where it is.
+Distinct from the root Anthropic-SDK helper
+(:mod:`alfred._anthropic_compat`), which targets SDK-level model-family
+quirks. This module is for *internal* shared helpers.
 """
 
 from __future__ import annotations

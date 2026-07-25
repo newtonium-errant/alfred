@@ -35,7 +35,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from ._anthropic_compat import messages_create_kwargs
+from alfred._anthropic_compat import messages_create_kwargs
 from .session_types import (
     ROUTER_MODEL,
     SessionTypeDefaults,
