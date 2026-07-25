@@ -59,6 +59,7 @@ class RecurrenceProposalDisplayItem:
     sample_text: str
     done_days: int
     window_days: int
+    suggested_cadence_days: int = 7   # the inferred soft-cadence suggestion (display; operator confirms)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +68,7 @@ class RecurrenceProposalDisplayItem:
             "sample_text": self.sample_text,
             "done_days": self.done_days,
             "window_days": self.window_days,
+            "suggested_cadence_days": self.suggested_cadence_days,
         }
 
     @classmethod
@@ -95,7 +97,7 @@ def _format_item(item: RecurrenceProposalDisplayItem) -> str:
     return (
         f"{item.item_number}. “{item.sample_text}” — done {item.done_days} "
         f"day{'s' if item.done_days != 1 else ''} in the last {item.window_days} "
-        f"→ promote to a routine?"
+        f"→ promote to a routine (suggest every ~{item.suggested_cadence_days}d)?  [{item.proposal_id}]"
     )
 
 
@@ -134,6 +136,7 @@ def recurrence_review_section(
             sample_text=p.sample_text,
             done_days=p.done_days,
             window_days=p.window_days,
+            suggested_cadence_days=promote.infer_cadence_days(p),
         )
         for i, p in enumerate(proposals)
     ]
@@ -152,7 +155,13 @@ def recurrence_review_section(
     for item in items:
         lines.append(_format_item(item))
     lines.append("")
-    lines.append("Reply with `N approve` / `N reject`.")
+    # Decisions run on the box via the CLI (the routine-write is a deliberate, placed action). No-junk-
+    # default: placement is operator-chosen (--routine, or the configured promote_routine) — never a
+    # blind default. (The Daily Sync reply-approve/reject flow is the boarded B2b follow-up.)
+    default_hint = (f" (default routine: “{tr.promote_routine}”)" if tr.promote_routine else "")
+    lines.append(
+        "Approve on the box: `alfred tier-recurrence approve <id> --operator <you> --routine <record>"
+        f"`{default_hint}. Reject: `alfred tier-recurrence reject <id> --operator <you>`.")
     return "\n".join(lines).rstrip()
 
 

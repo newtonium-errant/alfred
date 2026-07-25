@@ -5004,6 +5004,73 @@ def cmd_msg(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _cmd_tier_recurrence(args: argparse.Namespace) -> None:
+    """``alfred tier-recurrence {list [--json] | approve <proposal_id> --operator <name>
+    [--routine <record>] [--cadence <days>] | reject <proposal_id> --operator <name>}`` — the operator
+    decision that closes the #20 P5 recurrence→promote loop.
+
+    APPROVE promotes the recurring ad-hoc chore to a soft-cadence ``routine/`` item + records the
+    decision; REJECT records the decision only (the proposal leaves the review list, never re-surfaces).
+    The routine record is written ONLY here (+ the Daily Sync reply path) — never by detection."""
+    from dataclasses import asdict
+    from datetime import date as _date
+
+    from alfred.daily_sync.config import load_from_unified as load_ds_config
+    from alfred.tier import promote
+
+    raw = _load_unified_config(args.config)
+    tr = load_ds_config(raw).tier_recurrence
+    vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+    cmd = getattr(args, "tier_recurrence_cmd", None)
+
+    if cmd == "list":
+        proposals = promote.materialize_proposals(vault_path, tr, _date.today())
+        if getattr(args, "json", False):
+            print(json.dumps([{**asdict(p), "suggested_cadence_days": promote.infer_cadence_days(p)}
+                              for p in proposals], indent=2))
+            return
+        if not proposals:
+            print("No recurring ad-hoc items to propose.")   # ILB
+            return
+        for p in proposals:
+            print(f"{p.proposal_id}  “{p.sample_text}” — done {p.done_days}d in the last "
+                  f"{p.window_days}d → suggest every ~{promote.infer_cadence_days(p)}d")
+        print("\nApprove: alfred tier-recurrence approve <proposal_id> --operator <name> "
+              "--routine <record> [--cadence <days>]")
+        print("Reject:  alfred tier-recurrence reject <proposal_id> --operator <name>")
+        return
+
+    operator = getattr(args, "operator", "") or ""
+    if not operator:
+        print(json.dumps({"error": "--operator <name> is required (the approver identity)"}))
+        sys.exit(1)
+    pid = getattr(args, "proposal_id", "")
+
+    if cmd == "reject":
+        res = promote.reject_proposal(tr, pid, operator=operator)
+        print(json.dumps(res, indent=2))
+        sys.exit(1 if "error" in res else 0)
+
+    if cmd == "approve":
+        # Placement is operator-chosen: --routine, else the CONFIGURED promote_routine. No junk default:
+        # if neither is set, refuse (never a blind placement into an auto-created generic record).
+        routine = (getattr(args, "routine", "") or tr.promote_routine or "").strip()
+        if not routine:
+            print(json.dumps({"error": "no routine target — pass --routine <record>, or configure "
+                                       "daily_sync.tier_recurrence.promote_routine (there is NO default "
+                                       "record; placement is always operator-chosen)"}))
+            sys.exit(1)
+        cadence = getattr(args, "cadence", None)
+        res = promote.approve_proposal(vault_path, tr, pid, routine_record=routine, operator=operator,
+                                       cadence_days=(int(cadence) if cadence is not None else None))
+        print(json.dumps(res, indent=2))
+        sys.exit(1 if "error" in res else 0)
+
+    print("Usage: alfred tier-recurrence {list [--json] | approve <proposal_id> --operator <name> "
+          "[--routine <record>] [--cadence <days>] | reject <proposal_id> --operator <name>}")
+    sys.exit(1)
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6535,6 +6602,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # #20 P5 — ad-hoc-T3 recurrence→promote review + decision.
+    trec_p = sub.add_parser(
+        "tier-recurrence",
+        help="Review + approve/reject recurring-ad-hoc-chore promotion proposals (#20 P5)",
+    )
+    trec_sub = trec_p.add_subparsers(dest="tier_recurrence_cmd")
+    trec_list = trec_sub.add_parser("list", help="List pending promotion proposals")
+    trec_list.add_argument("--json", action="store_true", help="Machine-readable output")
+    trec_approve = trec_sub.add_parser("approve", help="Promote a proposal's chore to a routine")
+    trec_approve.add_argument("proposal_id")
+    trec_approve.add_argument("--operator", required=True, help="Approver identity (recorded)")
+    trec_approve.add_argument(
+        "--routine",
+        help="Routine record to add the item to (else daily_sync.tier_recurrence.promote_routine; "
+             "no default — placement is operator-chosen)")
+    trec_approve.add_argument("--cadence", type=int, help="Override the suggested target_cadence_days")
+    trec_reject = trec_sub.add_parser("reject", help="Reject a proposal (never re-surfaces)")
+    trec_reject.add_argument("proposal_id")
+    trec_reject.add_argument("--operator", required=True, help="Rejecter identity (recorded)")
+
     return parser
 
 
@@ -6583,6 +6670,7 @@ def main() -> None:
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
         "routine": cmd_routine,
+        "tier-recurrence": _cmd_tier_recurrence,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,
         "contract": cmd_contract,

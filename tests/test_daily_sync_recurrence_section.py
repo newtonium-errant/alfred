@@ -81,13 +81,15 @@ def test_enabled_with_proposal_renders_numbered_list(tmp_path: Path) -> None:
         out = rs.recurrence_review_section(_cfg(tmp_path), _TODAY, start_index=5)
     assert out is not None
     assert out.startswith("## Recurring task review (1 item)")
-    assert "5. “Rake leaves” — done 3 days in the last 30 → promote to a routine?" in out
-    assert "Reply with `N approve` / `N reject`." in out
+    pid = promote.proposal_id(promote.query_key("Rake leaves"))
+    # seed span 05-10..05-20 / 2 gaps = avg 5 → snaps to nearest common cadence (3).
+    assert f"5. “Rake leaves” — done 3 days in the last 30 → promote to a routine (suggest every ~3d)?  [{pid}]" in out
+    assert "alfred tier-recurrence approve <id>" in out   # decisions run on the box via the CLI (B2)
     assert [c for c in cap if c.get("event") == "tier_recurrence.surfaced"]
-    # global numbering starts at start_index; batch captured for reply routing (B2)
+    # global numbering starts at start_index; batch captured for the boarded B2b reply routing
     batch = rs.consume_last_batch()
     assert len(batch) == 1 and batch[0].item_number == 5
-    assert batch[0].proposal_id == promote.proposal_id(promote.query_key("Rake leaves"))
+    assert batch[0].proposal_id == pid and batch[0].suggested_cadence_days == 3
 
 
 def test_section_materialize_never_writes_a_routine_record(tmp_path: Path) -> None:

@@ -231,6 +231,13 @@ class TierRecurrenceConfig:
     decided_path: str = "./data/tier_recurrence_decided.salem.jsonl"
     threshold_done_days: int = 3
     window_days: int = 30
+    # B2 — the routine record a REPLY-approve places a promoted chore into. NO junk default: when unset
+    # (""), reply-approve is DISABLED and the Daily Sync surface directs to the CLI
+    # (``alfred tier-recurrence approve <id> --routine <name>``) — never a blind placement into an
+    # auto-created generic record. The operator either configures a deliberate named home here (then
+    # reply-approve is informed — the surface shows the target + cadence) or names the record per-approve
+    # via the CLI ``--routine``. (D1/D6 no-junk-default guard.)
+    promote_routine: str = ""
 
 
 @dataclass

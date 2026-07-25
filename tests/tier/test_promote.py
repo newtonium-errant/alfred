@@ -218,3 +218,168 @@ def test_materialize_excludes_decided(tmp_path: Path) -> None:
     props = promote.materialize_proposals(v, cfg, _TODAY)
     assert props == []                                        # decided → not surfaced, not re-proposed
     assert promote.load_pending(cfg.pending_path) == []       # and not appended to pending
+
+
+# --- B2: approval + routine-record promotion write (the mutation) ----------
+
+import frontmatter  # noqa: E402
+
+
+def _routine_items(vault: Path, record: str) -> list:
+    post = frontmatter.load(str(vault / "routine" / f"{record}.md"))
+    return post.metadata.get("items") or []
+
+
+def _seed_pending(cfg, *, first="2026-05-01", last="2026-05-22", done_days=4,
+                  text="Rake leaves") -> str:  # span 21 / 3 gaps = 7 → snaps to weekly
+    pid = promote.proposal_id(promote.query_key(text))
+    promote.append_pending(cfg.pending_path, promote.RecurrenceProposal(
+        proposal_id=pid, query_key=promote.query_key(text), sample_text=text,
+        done_days=done_days, window_days=30, first_seen=first, last_seen=last))
+    return pid
+
+
+def test_infer_cadence_snaps_to_common() -> None:
+    def _p(first, last, n):
+        return promote.RecurrenceProposal(proposal_id="x", query_key="k", sample_text="t",
+                                          done_days=n, window_days=30, first_seen=first, last_seen=last)
+    assert promote.infer_cadence_days(_p("2026-05-01", "2026-05-08", 2)) == 7     # 7/1 → 7
+    assert promote.infer_cadence_days(_p("2026-05-01", "2026-05-29", 5)) == 7     # 28/4=7 → 7
+    assert promote.infer_cadence_days(_p("2026-05-01", "2026-05-03", 3)) == 1     # 2/2=1 → 1
+    assert promote.infer_cadence_days(_p("bad", "x", 3)) == 7                     # fallback
+
+
+def test_append_promoted_item_creates_soft_cadence_item(tmp_path: Path) -> None:
+    v = tmp_path / "vault"
+    result = promote.append_promoted_item(v, "Recurring Chores", text="Rake leaves", cadence_days=7)
+    assert result == "appended"
+    items = _routine_items(v, "Recurring Chores")
+    assert len(items) == 1
+    it = items[0]
+    assert it["text"] == "Rake leaves" and it["priority"] == "aspirational"
+    assert it["target_cadence_days"] == 7 and "due_pattern" not in it   # soft-cadence, no deadline
+    # the record is a proper routine record
+    post = frontmatter.load(str(v / "routine" / "Recurring Chores.md"))
+    assert post.metadata["type"] == "routine"
+
+
+def test_append_promoted_item_idempotent_by_text(tmp_path: Path) -> None:
+    v = tmp_path / "vault"
+    promote.append_promoted_item(v, "Recurring Chores", text="Rake leaves", cadence_days=7)
+    # a differently-phrased same chore (same query_key) → duplicate, no second item
+    second = promote.append_promoted_item(v, "Recurring Chores", text="rake the leaves", cadence_days=3)
+    assert second == "duplicate"
+    assert len(_routine_items(v, "Recurring Chores")) == 1
+    assert not list((v / "routine").glob("*.promote.tmp"))   # atomic: no temp left behind
+
+
+def test_append_promoted_item_preserves_existing(tmp_path: Path) -> None:
+    v = tmp_path / "vault"
+    (v / "routine").mkdir(parents=True)
+    (v / "routine" / "Home.md").write_text(
+        "---\ntype: routine\nname: Home\nitems:\n  - text: Water plants\n    priority: tracked\n---\n\nbody\n",
+        encoding="utf-8")
+    promote.append_promoted_item(v, "Home", text="Rake leaves", cadence_days=7)
+    items = _routine_items(v, "Home")
+    assert len(items) == 2
+    assert {i["text"] for i in items} == {"Water plants", "Rake leaves"}   # existing item preserved
+
+
+def test_approve_writes_routine_and_records_decision(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    pid = _seed_pending(cfg)
+    v = tmp_path / "vault"
+    res = promote.approve_proposal(v, cfg, pid, routine_record="Recurring Chores", operator="andrew")
+    assert res["approved"] == pid and res["write"] == "appended" and res["cadence_days"] == 7
+    assert len(_routine_items(v, "Recurring Chores")) == 1
+    assert promote.decided_ids(cfg.decided_path) == {pid}          # decided-row written
+    decisions = promote.load_decisions(cfg.decided_path)
+    assert decisions[0].decision == "approve" and decisions[0].operator == "andrew"
+
+
+def test_approve_honors_explicit_cadence(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    pid = _seed_pending(cfg)
+    v = tmp_path / "vault"
+    promote.approve_proposal(v, cfg, pid, routine_record="Chores", operator="a", cadence_days=14)
+    assert _routine_items(v, "Chores")[0]["target_cadence_days"] == 14
+
+
+def test_approve_core_no_junk_default_guard(tmp_path: Path) -> None:
+    """#20 P5 B2 hardening: the no-junk-default refusal lives IN approve_proposal (fail-closed), NOT
+    only at the CLI boundary — so a caller bypassing the CLI (e.g. B2b's reply path) inherits it. A
+    blank/whitespace routine_record refuses BEFORE any write: no routine record, no decided-row."""
+    cfg = _cfg(tmp_path)
+    pid = _seed_pending(cfg)
+    v = tmp_path / "vault"
+    for rr in ("", "   "):
+        res = promote.approve_proposal(v, cfg, pid, routine_record=rr, operator="a")
+        assert "error" in res and "no routine target" in res["error"]
+    assert not (v / "routine").exists()                        # NO routine record written
+    assert promote.decided_ids(cfg.decided_path) == set()      # NO decided-row (proposal stays pending)
+
+
+def test_approve_refuses_already_decided_and_non_pending(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    v = tmp_path / "vault"
+    # non-pending id
+    assert "error" in promote.approve_proposal(v, cfg, "trp-nope", routine_record="X", operator="a")
+    assert not (v / "routine").exists()                            # no write on refusal
+    # already-decided
+    pid = _seed_pending(cfg)
+    promote.approve_proposal(v, cfg, pid, routine_record="Chores", operator="a")
+    res2 = promote.approve_proposal(v, cfg, pid, routine_record="Chores", operator="a")  # re-approve
+    assert "error" in res2 and "already decided" in res2["error"]
+    assert len(_routine_items(v, "Chores")) == 1                   # idempotent — no duplicate item
+
+
+def test_reject_writes_only_decided_no_routine(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    pid = _seed_pending(cfg)
+    v = tmp_path / "vault"
+    res = promote.reject_proposal(cfg, pid, operator="andrew")
+    assert res["rejected"] == pid
+    assert promote.decided_ids(cfg.decided_path) == {pid}
+    assert not (v / "routine").exists()                            # NO routine touch on reject
+
+
+def test_rejected_proposal_never_resurfaces(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    v = tmp_path / "vault"
+    for d in ("2026-05-10", "2026-05-15", "2026-05-20"):
+        _write_daily(v, d, _t3("Rake leaves", "operator-adhoc", d))
+    first = promote.materialize_proposals(v, cfg, _TODAY)
+    pid = first[0].proposal_id
+    promote.reject_proposal(cfg, pid, operator="a")
+    assert promote.materialize_proposals(v, cfg, _TODAY) == []      # decided → never re-surfaces
+
+
+def test_aspirational_eligible_and_approve_does_not_touch_the_source(tmp_path: Path) -> None:
+    """#20 P5 B2 NOTE-2: an ``aspirational`` chore IS promotion-eligible (the prime use-case), and
+    approve ADDS the committed item to the TARGET routine ONLY — it never removes/mutates the source
+    aspirational entry (the daily t3 rows it came from). Exactly one routine-side write, source untouched."""
+    cfg = _cfg(tmp_path)
+    v = tmp_path / "vault"
+    dailies: dict[str, str] = {}
+    for d in ("2026-05-10", "2026-05-15", "2026-05-20"):
+        _write_daily(v, d, _t3("Rake leaves", "aspirational", d))   # aspirational source, no routine match
+        dailies[d] = (v / "daily" / f"{d}.md").read_text()
+    props = promote.materialize_proposals(v, cfg, _TODAY)
+    assert len(props) == 1                                          # aspirational is eligible
+    promote.approve_proposal(v, cfg, props[0].proposal_id, routine_record="Chores", operator="a")
+    assert {p.name for p in (v / "routine").glob("*.md")} == {"Chores.md"}   # ONLY the target written
+    for d, before in dailies.items():
+        assert (v / "daily" / f"{d}.md").read_text() == before      # source aspirational entry UNTOUCHED
+
+
+def test_approve_is_the_only_routine_writer(tmp_path: Path) -> None:
+    """THE B2 gate pin: detection/materialize NEVER writes a routine record — only approve does."""
+    cfg = _cfg(tmp_path)
+    v = tmp_path / "vault"
+    for d in ("2026-05-10", "2026-05-15", "2026-05-20"):
+        _write_daily(v, d, _t3("Rake leaves", "operator-adhoc", d))
+    promote.materialize_proposals(v, cfg, _TODAY)   # detection + surface projection
+    assert not (v / "routine").exists()             # detection wrote NO routine record
+    pid = promote.load_pending(cfg.pending_path)[0].proposal_id
+    promote.approve_proposal(v, cfg, pid, routine_record="Chores", operator="a")
+    assert len(_routine_items(v, "Chores")) == 1     # ONLY approve wrote the routine record
