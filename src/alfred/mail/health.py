@@ -9,16 +9,29 @@ rate limits):
   * per-account required fields present (name, email, imap_host)
   * inbox dir exists under vault
 
-Account-delivery liveness (#31 — Monitor A): per configured account, how
-long since the last email ARRIVED. Sourced from the arrival artifact — the
+Account-delivery liveness (#31 — Monitor A): per configured account, roughly
+how long since the last email arrived. Sourced from the arrival artifact — the
 raw ``email-{account}-*.md`` file the fetcher/webhook write to the inbox and
-the curator moves (filename + mtime retained) to ``inbox/processed/``. This
-is deliberately INDEPENDENT of whether the curator managed to STRUCTURE the
-record (that is Monitor B's job): a raw email sitting unstructured in
-``processed/`` still counts as "delivered." Would have caught the Gmail
-intake going silently dead for ~2 months (newest record May 22, discovered
-only during the cutover). Per ``feedback_intentionally_left_blank.md``:
-account silence must be distinguishable from a healthy quiet account.
+the curator moves (filename retained) to ``inbox/processed/``. This is
+deliberately INDEPENDENT of whether the curator managed to STRUCTURE the record
+(that is Monitor B's job): a raw email sitting unstructured in ``processed/``
+still counts as "delivered." Would have caught the Gmail intake going silently
+dead for ~2 months (newest record May 22, discovered only during the cutover).
+Per ``feedback_intentionally_left_blank.md``: account silence must be
+distinguishable from a healthy quiet account.
+
+**Age is measured by file mtime, and the provenance differs by directory:** a
+file still in ``inbox/`` carries its ARRIVAL mtime, but a file in
+``processed/`` carries its PROCESSING-time mtime — ``curator.writer.mark_processed``
+rewrites ``status`` / ``processed_at`` frontmatter via an atomic write (which
+resets mtime) BEFORE the ``shutil.move`` (text records; binary files skip the
+rewrite, but email records are text). Monitor A takes the newest mtime across
+both dirs. So staleness is measured from processing time and UNDER-reports by
+the curator's processing lag — normally minutes, and a processed file is not
+touched again afterward. Benign for the target case: a dead account's newest
+processed record stops advancing, so its age keeps growing and FAIL still fires
+(gmail-dead: processing ≈ arrival ~2mo ago). A maintainer must NOT re-reason
+this as arrival-time precision.
 """
 
 from __future__ import annotations
@@ -115,9 +128,12 @@ def _newest_arrival_mtime(
 
     Uses a manual prefix/suffix filter rather than ``glob`` so an account
     name containing a glob-special char (``[``, ``*``, ``?``) can't corrupt
-    the match. mtime (not filename-timestamp parsing) is the age key — it is
-    set at write time, preserved by ``shutil.move`` into ``processed/``, and
-    is format-agnostic across the fetcher + webhook filename shapes.
+    the match. mtime (not filename-timestamp parsing) is the age key —
+    format-agnostic across the fetcher + webhook filename shapes. Note the
+    mtime provenance differs by dir: ``inbox/`` files carry arrival mtime,
+    ``processed/`` files carry processing-time mtime (``mark_processed``
+    atomically rewrites frontmatter, resetting mtime, before the move on text
+    records). See the module docstring for why that under-reports benignly.
     """
     prefix = f"email-{account_name}-"
     newest: float | None = None
@@ -151,10 +167,14 @@ def _check_account_liveness(
 ) -> CheckResult:
     """One account's delivery-liveness CheckResult.
 
-    SKIP when the account has never delivered (fresh account / nothing
-    arrived yet — distinct from "went dark"). Otherwise OK/WARN/FAIL on the
-    age of the newest arrival, WARN-before-FAIL. Per ILB: a quiet-but-fresh
-    account is not a failure; a previously-live account gone silent is.
+    Never delivered (no arrival records anywhere) → **OK** with a "no records
+    yet" detail — NOT SKIP. ``Status.worst`` ranks SKIP above OK, so a SKIP
+    would ratchet the whole mail tool down to SKIP on every fresh/quiet
+    install; OK-with-detail stays observable (ILB) without the false downgrade.
+    Otherwise OK/WARN/FAIL on the age of the newest arrival, WARN-before-FAIL.
+    Per ILB: a quiet-but-fresh account is not a failure; a previously-live
+    account gone silent is — and escalation requires a PRIOR arrival, which is
+    exactly the gmail-went-silent case.
     """
     newest = _newest_arrival_mtime(vault, inbox_dir, processed_dir, name)
     if newest is None:

@@ -1,13 +1,16 @@
 """Tests for the BIT mail probes — the #31 account-delivery liveness monitor
 (Monitor A).
 
-Monitor A answers "how long since this account last DELIVERED an email,"
-sourced from the ARRIVAL artifact (the raw ``email-{account}-*.md`` file the
-fetcher/webhook write to the inbox and the curator moves — filename + mtime
-retained — to ``inbox/processed/``). It is deliberately INDEPENDENT of
-whether the curator STRUCTURED the record (Monitor B's job): a raw email
-sitting unstructured in ``processed/`` still counts as delivered. Would have
-caught the Gmail intake going silently dead for ~2 months.
+Monitor A answers "roughly how long since this account last delivered an
+email," sourced from the ARRIVAL artifact (the raw ``email-{account}-*.md``
+file the fetcher/webhook write to the inbox and the curator moves — filename
+retained — to ``inbox/processed/``). Age is by file mtime: ``inbox/`` files
+carry arrival mtime, ``processed/`` files carry processing-time mtime (the
+curator rewrites frontmatter before the move) — see the module docstring of
+``alfred.mail.health`` for why that under-reports benignly. It is deliberately
+INDEPENDENT of whether the curator STRUCTURED the record (Monitor B's job): a
+raw email sitting unstructured in ``processed/`` still counts as delivered.
+Would have caught the Gmail intake going silently dead for ~2 months.
 
 Per ``feedback_intentionally_left_blank.md``: an account gone silent must be
 distinguishable from a healthy-but-quiet account. Tests run unconditionally.
