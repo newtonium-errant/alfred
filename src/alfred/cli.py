@@ -4033,8 +4033,18 @@ def _cmd_scribe_notegen_feedback(args: argparse.Namespace) -> None:
         vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
         diff = _nf.recompute_raw_diff(vault_path, args.source_id)
         if diff is None:
-            print(f"No clinical_note found for source_id {args.source_id!r}.")   # ILB
+            print(f"No clinical_note found for source_id {args.source_id!r}.")   # ILB (no note read)
             return
+        # A note resolved ⇒ its PHI (draft_original + attested body) WAS read on-box. Record the PHIA
+        # s.63 access (PHI-FREE: source_id + actor + ts + via, NEVER the diff content) BEFORE displaying
+        # the raw PHI. Clinical mode requires a live store to open (fail-loud in _open_scribe_events);
+        # non-clinical degrades to inactive → no PHI to audit, so ILB the absence (never a silent gap).
+        ev = _open_scribe_events(raw)
+        if ev.active:
+            ev.raw_diff_viewed(subject_id=args.source_id)   # best-effort access record
+        else:
+            print("(raw-diff view NOT audited — the clinical event store is inactive in this mode.)",
+                  file=sys.stderr)                            # ILB — the absence is observable
         if not diff:
             print(f"source_id {args.source_id}: draft == attested (no clinician edits).")  # ILB
             return

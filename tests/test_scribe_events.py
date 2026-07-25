@@ -19,6 +19,7 @@ _CLOCK = "2026-07-16T12:00:00+00:00"
 # or field is a DELIBERATE reviewed schema change: update this literal in the same commit.
 EXPECTED_KINDS = {
     ("access", "access.read"): (["path_digest", "record_type", "status", "via"], False),
+    ("access", "access.raw_diff_viewed"): (["via"], False),
     ("access", "access.system_reads_summary"): (["count", "window_start"], False),
     ("access", "store.verified"): (["entries", "ok"], False),
     ("clinical", "attest.recorded"): (
@@ -99,14 +100,26 @@ def test_each_emitter_writes_exact_stream_and_kind(tmp_path):
     ev.encounter_cap_hit(subject_id="e", cap="chunks")
     ev.access_read(subject_id="e", record_type="clinical_note", status="attested",
                    path_digest="pd", via="cli", actor="op", actor_kind="operator")
+    ev.raw_diff_viewed(subject_id="e")
     clinical_kinds = {r["kind"] for r in ev.query("clinical")}
     access_kinds = {r["kind"] for r in ev.query("access")}
     assert {"note.draft_created", "note.ready", "encounter.opened", "encounter.closed",
             "encounter.cap_hit"} <= clinical_kinds
-    assert "access.read" in access_kinds
+    assert {"access.read", "access.raw_diff_viewed"} <= access_kinds
     # a clinical kind must never land on the access stream and vice-versa (kind→stream binding).
     assert "access.read" not in clinical_kinds
+    assert "access.raw_diff_viewed" not in clinical_kinds
     assert "note.ready" not in access_kinds
+
+
+def test_raw_diff_viewed_authority(tmp_path):
+    ev = _events(tmp_path)
+    ev.raw_diff_viewed(subject_id="enc-1")
+    rows = ev.query("access", kind="access.raw_diff_viewed")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["subject_id"] == "enc-1" and r["actor"] == "operator" and r["actor_kind"] == "operator"
+    assert r["payload"] == {"via": "cli"}                  # PHI-FREE — opaque id + via only, NO diff text
 
 
 # --- postures ---------------------------------------------------------------

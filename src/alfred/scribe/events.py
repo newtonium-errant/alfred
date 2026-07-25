@@ -169,6 +169,10 @@ KINDS: tuple[_Kind, ...] = (
           frozenset({"record_type", "status", "path_digest", "via"}), ACCESS, False),
     _Kind("access.system_reads_summary", "access",
           frozenset({"count", "window_start"}), ACCESS, False),
+    # #14/#26 go-live — the operator VIEWED the raw draft→attested diff on-box (the arc's one
+    # authorized-PHI on-box surface). PHI-FREE: subject_id = opaque source_id, payload = ``via`` only —
+    # NEVER the diff content (the diff reaches stdout ONLY, never the chain). Best-effort access record.
+    _Kind("access.raw_diff_viewed", "access", frozenset({"via"}), ACCESS, False),
     # CONSENT (#12 — contract-registered now, emitters at #12)
     _Kind("consent.confirmed", "consent", frozenset({"method", "captured_by"}), CLINICAL, True),
     _Kind("consent.declined", "consent", frozenset({"method", "captured_by"}), CLINICAL, True),
@@ -739,6 +743,19 @@ class ScribeEvents:
                                   actor_kind=_coerce_actor_kind(actor_kind), now=now,
                                   payload={"record_type": record_type, "status": status,
                                            "path_digest": path_digest, "via": via})
+
+    def raw_diff_viewed(self, *, subject_id: str, actor: str = "operator",
+                        actor_kind: str = "operator", via: str = "cli",
+                        now: str | None = None) -> AppendReceipt | None:
+        """Best-effort ACCESS-stream record that the operator VIEWED the raw draft→attested diff on-box
+        (``alfred scribe notegen-feedback diff <source_id>`` — the arc's one authorized-PHI on-box
+        surface). PHIA s.63 accountability. PHI-FREE by construction: only the OPAQUE ``subject_id``
+        (source_id) + actor + ts + ``via`` cross the chain — NEVER the diff content (the diff reaches
+        STDOUT ONLY, never the chain / a log / an audit). Best-effort (a store failure must never mask
+        the operator's ability to view); the caller checks ``active`` to ILB an inactive store."""
+        return self._emit_capture(ACCESS, "access.raw_diff_viewed", subject_id=subject_id, actor=actor,
+                                  actor_kind=_coerce_actor_kind(actor_kind), now=now,
+                                  payload={"via": via})
 
     def make_read_hook(self):
         """Return the closure registered into ``ops.register_read_hook``. Reads the

@@ -199,3 +199,28 @@ def test_diff_phi_reaches_stdout_only_never_a_log(tmp_path):
     leaked = [p.name for p in data_dir.rglob("*") if p.is_file() and phi in p.read_text(errors="ignore")] \
         if data_dir.exists() else []
     assert leaked == [], f"PHI diff content leaked into {leaked}"
+
+
+def test_diff_emits_phi_free_access_audit(tmp_path):
+    # #14/#26 go-live — viewing the raw diff records a PHIA s.63 access event (access.raw_diff_viewed)
+    # that is PHI-FREE: opaque source_id + actor + via ONLY, NEVER the diff content. A no-match view
+    # (no note read → no PHI access) records NOTHING (emit only when a note resolved).
+    from alfred.cli import _load_unified_config
+    from alfred.scribe.events import ScribeEvents
+
+    config = _cfg(tmp_path)
+    phi = "Chest pain for two days"
+    _make_note(tmp_path / "vault", "enc-x", f"## S\n- {phi}\n", "## S\n- Chest pain 2 days\n")
+
+    _run(config, "notegen-feedback", "diff", "enc-x")        # the audited PHI view
+    _run(config, "notegen-feedback", "diff", "enc-none")     # no note → no access → no event
+
+    raw = _load_unified_config(str(config))
+    log_dir = tmp_path / "data"
+    ev = ScribeEvents.from_config(raw, str(log_dir),
+                                  legacy_audit_path=log_dir / "clinical_attest_audit.jsonl")
+    rows = ev.query("access", kind="access.raw_diff_viewed")
+    assert len(rows) == 1                                    # ONLY the resolved-note view recorded
+    assert rows[0]["subject_id"] == "enc-x" and rows[0]["payload"] == {"via": "cli"}
+    assert rows[0]["actor_kind"] == "operator"
+    assert phi not in json.dumps(rows)                       # PHI-FREE — no diff text in the event
