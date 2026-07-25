@@ -49,9 +49,10 @@ def test_fetch_all_logs_configured_account_truth(tmp_path, monkeypatch) -> None:
         state_path=str(tmp_path / "mail_state.json"),
     )
 
-    # No network: stub the per-account fetch.
+    # No network: stub the per-account fetch. ``**kwargs`` absorbs the
+    # ``max_per_run`` keyword ``fetch_all`` now threads through.
     monkeypatch.setattr(
-        fetcher_mod, "fetch_account", lambda account, inbox, mgr: 0,
+        fetcher_mod, "fetch_account", lambda account, inbox, mgr, **kwargs: 0,
     )
 
     with structlog.testing.capture_logs() as captured:

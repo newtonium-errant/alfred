@@ -64,6 +64,12 @@ class MailFetchConfig:
 
     enabled: bool = False
     poll_interval: int | None = None   # None ⇒ use MailConfig.poll_interval
+    # Bounded-batch cap — max messages PULLED per fetch RUN (per fetch:true account, across its
+    # folders). ``None`` ⇒ unlimited = current behavior, byte-unchanged. The operator sets this at the
+    # Gmail-cutover flip so a ~2-month backlog drains N-at-a-time instead of flooding the curator in one
+    # tick; the account's ``\Seen`` mark IS the cursor (each run searches ``UNSEEN`` + marks processed
+    # messages seen), so capped ticks drain the backlog with NO extra state. Relies on ``mark_read: true``.
+    max_per_run: int | None = None
     # #7 7b — the parity-proof shadow fetch (``alfred mail fetch --shadow``) writes READ-ONLY captured
     # records here, DELIBERATELY OUTSIDE the vault inbox so the curator never ingests them. Gitignored.
     # Not the daemon loop's concern (the loop always writes to the real inbox); this only scopes the
@@ -141,6 +147,7 @@ def load_from_unified(raw: dict) -> MailConfig:
     fetch_cfg = MailFetchConfig(
         enabled=bool(fetch_raw.get("enabled", False)),
         poll_interval=fetch_raw.get("poll_interval"),
+        max_per_run=fetch_raw.get("max_per_run"),
         shadow_dir=fetch_raw.get("shadow_dir", "./data/mail_shadow"),
     )
     # Idle-tick — defaulted-on; partial dict merges over dataclass default.

@@ -317,8 +317,18 @@ def fetch_account(
     account: MailAccount,
     inbox_path: Path,
     state_mgr: StateManager,
+    *,
+    max_per_run: int | None = None,
 ) -> int:
-    """Fetch new emails from one account. Returns count of new emails saved."""
+    """Fetch new emails from one account. Returns count of new emails saved.
+
+    ``max_per_run`` is the bounded-batch cap: at most that many messages are
+    PULLED per run across the account's folders (a per-run budget carried across
+    the folder loop). ``None`` ⇒ unlimited = pre-cap behavior. The ``\\Seen``
+    mark is the cursor — each processed message is marked seen and the next
+    run's ``UNSEEN`` search skips it — so a capped run drains a backlog
+    N-at-a-time with no extra state (requires ``mark_read: true``).
+    """
     password = account.resolved_password()
     if not password:
         log.error("mail.no_password", account=account.name)
@@ -332,7 +342,35 @@ def fetch_account(
             conn.login(account.email, password)
             log.info("mail.connected", account=account.name)
 
+            # Per-run budget carried across the folders loop (None ⇒ unlimited).
+            # The cap bounds messages PULLED per run, not per folder, so it's a
+            # true per-run cap even for a multi-folder account.
+            remaining = max_per_run
+            if max_per_run is not None and not account.mark_read:
+                # Fail loud on the incompatible combo: the bounded drain uses the
+                # ``\Seen`` mark as its cursor, so without ``mark_read`` the store
+                # never fires, ``UNSEEN`` never shrinks, and every capped run
+                # re-pulls the same first-N forever (state-dedup blocks re-save, so
+                # the backlog never advances) — a SILENT stall. WARN (don't
+                # hard-fail — keep the daemon running) so a first-time cap config
+                # with mark_read=false surfaces instead of quietly not-working.
+                log.warning(
+                    "mail.cap_without_mark_read",
+                    account=account.name,
+                    max_per_run=max_per_run,
+                    detail=(
+                        "max_per_run set with mark_read=false → the bounded drain will "
+                        "stall; \\Seen is the drain cursor (UNSEEN never shrinks, so every "
+                        "capped run re-pulls the same first-N). Set mark_read: true."
+                    ),
+                )
             for folder in account.folders:
+                if remaining is not None and remaining <= 0:
+                    # Cap already spent by earlier folders — stop pulling this run.
+                    log.info(
+                        "mail.cap_reached", account=account.name, max_per_run=max_per_run
+                    )
+                    break
                 status, _ = conn.select(folder, readonly=not account.mark_read)
                 if status != "OK":
                     log.warning("mail.folder_failed", account=account.name, folder=folder)
@@ -345,7 +383,22 @@ def fetch_account(
                     continue
 
                 msg_nums = data[0].split()
-                log.info("mail.found", account=account.name, folder=folder, count=len(msg_nums))
+                found = len(msg_nums)
+                # Apply the per-run budget: pull at most ``remaining`` this folder.
+                capped = False
+                if remaining is not None:
+                    msg_nums = msg_nums[:remaining]
+                    remaining -= len(msg_nums)
+                    capped = len(msg_nums) < found
+                log.info(
+                    "mail.found",
+                    account=account.name,
+                    folder=folder,
+                    count=len(msg_nums),
+                    found=found,
+                    capped=capped,
+                    max_per_run=max_per_run,
+                )
 
                 for num in msg_nums:
                     status, msg_data = conn.fetch(num, "(RFC822)")
@@ -422,7 +475,9 @@ def fetch_all(config: MailConfig, vault_path: Path, *, only_flagged: bool = Fals
 
     total = 0
     for account in accounts:
-        total += fetch_account(account, inbox_path, state_mgr)
+        total += fetch_account(
+            account, inbox_path, state_mgr, max_per_run=config.fetch.max_per_run
+        )
 
     state_mgr.save()
     log.info("mail.fetch_complete", total=total)
