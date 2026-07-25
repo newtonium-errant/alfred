@@ -36,7 +36,7 @@ from .pipeline import _apply_inbox_preference_filter
 from .state import StateManager
 from .utils import get_logger
 from .watcher import InboxWatcher
-from .writer import mark_filtered, mark_processed
+from .writer import mark_filtered, mark_processed, quarantine
 
 # Email classifier (per-instance, opt-in) — post-processor that adds
 # ``priority`` + ``action_hint`` frontmatter fields to email-derived
@@ -326,6 +326,84 @@ def _release_file(inbox_file: Path) -> None:
         pass
 
 
+def _handle_processing_failure(
+    inbox_file: Path,
+    state_mgr: StateManager,
+    config: CuratorConfig,
+    reason: str,
+) -> None:
+    """#34 — route one processing failure through retry-in-place-then-quarantine.
+
+    Called from BOTH the soft-fail branch (``result.success is False``) and the
+    exception handlers (a crash inside ``_process_file``). Classifies by
+    PERSISTENCE, not failure type: a transient blip (rate-limit, brief
+    ``claude -p`` outage) self-heals within ``max_retries`` — the file is left
+    in ``inbox/`` (unmarked), so the watch loop's periodic ``full_scan`` re-picks
+    and reprocesses it next tick. A SUSTAINED failure (login outage OR a
+    genuinely malformed email) exceeds the cap → the file is QUARANTINED to
+    ``failed/`` (terminal: out of inbox so it can't loop, intact so it isn't
+    silently lost, recoverable via ``alfred curator retry-failed``).
+
+    EXCEPTION-SAFE by construction: this runs INSIDE the callers' ``except``
+    blocks, so every step is guarded — it must never itself raise (that would
+    re-introduce a loss path). Worst case it logs and leaves the file in inbox
+    (the safe default — retried, never lost).
+    """
+    filename = inbox_file.name
+    try:
+        # Legacy escape hatch — the pre-#34 silent-loss behavior (marks the
+        # failed email processed + moves to processed/). Parity/rollback only.
+        if config.on_failure.action == "processed":
+            if inbox_file.exists():
+                mark_processed(inbox_file, config.vault.processed_path)
+            state_mgr.state.mark_processed(
+                filename=filename,
+                inbox_path=str(inbox_file),
+                files_created=[],
+                files_modified=[],
+                backend_used="failed_legacy_processed",
+            )
+            state_mgr.save()
+            log.warning(
+                "daemon.failure_marked_processed_legacy",
+                file=filename,
+                reason=reason[:200],
+            )
+            return
+
+        attempts = state_mgr.state.bump_failed(filename)
+        max_retries = config.on_failure.max_retries
+        if attempts >= max_retries:
+            # Terminal — quarantine and clear the counter.
+            if inbox_file.exists():
+                quarantine(inbox_file, config.failed_path)
+            state_mgr.state.clear_failed(filename)
+            state_mgr.save()
+            log.error(
+                "daemon.quarantined",
+                file=filename,
+                attempts=attempts,
+                max_retries=max_retries,
+                reason=reason[:200],
+            )
+        else:
+            # Leave the file in inbox (UNMARKED) so the periodic full_scan
+            # retries it next tick — a transient failure self-heals here.
+            state_mgr.save()
+            log.warning(
+                "daemon.retry_pending",
+                file=filename,
+                attempt=attempts,
+                max_retries=max_retries,
+                reason=reason[:200],
+            )
+    except Exception:
+        # Must not re-raise into the caller's except block. The file stays in
+        # inbox (safe: retried, never lost); the counter may be un-persisted,
+        # costing at most a few extra retries — benign.
+        log.exception("daemon.handle_failure_error", file=filename)
+
+
 async def _process_file(
     inbox_file: Path,
     backend: BaseBackend,
@@ -486,16 +564,27 @@ async def _process_file(
     append_to_audit_log(audit_path, "curator", mutations, detail=filename)
 
     if not result.success:
+        # #34 — do NOT mark_processed on a backend failure (that was the
+        # silent-loss bug: the raw email moved to processed/ + marked done,
+        # never retried). Route through retry-in-place-then-quarantine instead.
         log.error("daemon.agent_failed", file=filename, summary=result.summary[:500])
+        _handle_processing_failure(
+            inbox_file, state_mgr, config,
+            reason=f"agent_failed: {result.summary[:200]}",
+        )
+        return
 
     if not files_created and not files_modified:
+        # Success but nothing extracted — legit "nothing to record" (e.g. spam
+        # the agent declined). Kept as-is per #34 D6; a no-mutation RATE spike
+        # is a Phase-2 self-correcting signal, not a per-email failure.
         log.warning("daemon.no_changes", file=filename)
 
-    # Mark processed and move (skip if agent already moved the file)
+    # Success — mark processed + move (skip if agent already moved the file).
     if inbox_file.exists():
         mark_processed(inbox_file, config.vault.processed_path)
 
-    # Update state
+    # Update state (mark_processed also clears any accumulated failed_attempts).
     state_mgr.state.mark_processed(
         filename=filename,
         inbox_path=str(inbox_file),
@@ -637,15 +726,17 @@ async def run(
                         email_classifier_config=email_classifier_config,
                         email_filing_config=email_filing_config,
                     )
-                except Exception:
+                except Exception as exc:
                     log.exception("daemon.process_error", file=inbox_file.name)
-                    # Always move to processed — even on failure — to prevent
-                    # infinite reprocessing loops. The error is logged above.
-                    if inbox_file.exists():
-                        try:
-                            mark_processed(inbox_file, config.vault.processed_path)
-                        except Exception:
-                            log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
+                    # #34 — route the crash through retry-in-place-then-quarantine
+                    # (a deterministic crash exceeds max_retries → quarantine → no
+                    # infinite loop, honoring the old anti-loop concern; a
+                    # transient crash self-heals). Replaces the old unconditional
+                    # mark_processed (silent loss). Helper is exception-safe.
+                    _handle_processing_failure(
+                        inbox_file, state_mgr, config,
+                        reason=f"process_error: {exc.__class__.__name__}",
+                    )
                 finally:
                     _release_file(inbox_file)
 
@@ -741,15 +832,15 @@ async def run(
                                 email_classifier_config=email_classifier_config,
                                 email_filing_config=email_filing_config,
                             )
-                        except Exception:
+                        except Exception as exc:
                             log.exception("daemon.process_error", file=inbox_file.name)
-                            # Always move to processed — even on failure — to
-                            # prevent infinite reprocessing loops.
-                            if inbox_file.exists():
-                                try:
-                                    mark_processed(inbox_file, config.vault.processed_path)
-                                except Exception:
-                                    log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
+                            # #34 — route through retry-in-place-then-quarantine
+                            # (exception-safe helper). Replaces the old
+                            # unconditional mark_processed (silent loss).
+                            _handle_processing_failure(
+                                inbox_file, state_mgr, config,
+                                reason=f"process_error: {exc.__class__.__name__}",
+                            )
                         finally:
                             _processing.discard(str(inbox_file))
                             _release_file(inbox_file)

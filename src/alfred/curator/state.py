@@ -40,6 +40,12 @@ class State:
     version: int = 2
     last_run: str = ""
     processed: dict[str, ProcessedEntry] = field(default_factory=dict)
+    # #34 — per-file failed-attempt counter for the retry-in-place-then-quarantine
+    # path. Keyed by inbox filename; bumped on each processing failure, cleared on
+    # success (or quarantine). Lives in STATE, never in the arrival file's
+    # frontmatter — a frontmatter write would bump the file's mtime and mask
+    # Monitor A's delivery-staleness signal (#31).
+    failed_attempts: dict[str, int] = field(default_factory=dict)
 
     def is_processed(self, filename: str) -> bool:
         return filename in self.processed
@@ -60,12 +66,27 @@ class State:
             backend_used=backend_used,
         )
         self.last_run = datetime.now(timezone.utc).isoformat()
+        # Success clears any accumulated failure count (a transient failure that
+        # later self-heals must not carry stale attempts toward the cap).
+        self.failed_attempts.pop(filename, None)
+
+    def failed_count(self, filename: str) -> int:
+        return self.failed_attempts.get(filename, 0)
+
+    def bump_failed(self, filename: str) -> int:
+        """Increment and return the file's failure count."""
+        self.failed_attempts[filename] = self.failed_attempts.get(filename, 0) + 1
+        return self.failed_attempts[filename]
+
+    def clear_failed(self, filename: str) -> None:
+        self.failed_attempts.pop(filename, None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
             "last_run": self.last_run,
             "processed": {k: v.to_dict() for k, v in self.processed.items()},
+            "failed_attempts": dict(self.failed_attempts),
         }
 
     @classmethod
@@ -73,10 +94,16 @@ class State:
         processed = {}
         for k, v in data.get("processed", {}).items():
             processed[k] = ProcessedEntry.from_dict(v)
+        # Schema-tolerant: state files written before #34 have no
+        # ``failed_attempts`` key → default to empty.
+        failed_attempts = data.get("failed_attempts", {})
+        if not isinstance(failed_attempts, dict):
+            failed_attempts = {}
         return cls(
             version=data.get("version", 2),
             last_run=data.get("last_run", ""),
             processed=processed,
+            failed_attempts={k: int(v) for k, v in failed_attempts.items()},
         )
 
 

@@ -144,6 +144,29 @@ class IdleTickConfig:
 
 
 @dataclass
+class OnFailureConfig:
+    """Curator behavior when processing an inbox file fails (#34 — the
+    on-failure data-loss hardening).
+
+    ``action``:
+      * ``"retry"`` (default) — leave the file in ``inbox/`` and bump a
+        per-file counter; the periodic ``full_scan`` re-picks it, so a
+        transient failure (rate-limit blip, brief ``claude -p`` outage)
+        self-heals on the next tick. After ``max_retries`` SUSTAINED failures
+        the file is QUARANTINED to ``failed_dir`` (terminal — out of inbox, so
+        no infinite reprocess loop; visible + recoverable via
+        ``alfred curator retry-failed``).
+      * ``"processed"`` — **LEGACY: marks failed emails processed and moves
+        them to ``inbox/processed/`` = the silent-loss behavior this fix
+        replaces.** Only for parity/rollback; do not enable unaware.
+    """
+
+    action: str = "retry"
+    max_retries: int = 3
+    failed_dir: str = "inbox/failed"
+
+
+@dataclass
 class CuratorConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
@@ -159,6 +182,14 @@ class CuratorConfig:
     # via the dataclass default_factory; absent block in YAML keeps
     # ``enabled=True`` / ``interval_seconds=60``.
     idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
+    # #34 — on-failure behavior (retry-in-place then quarantine, vs the legacy
+    # move-to-processed silent loss). See :class:`OnFailureConfig`.
+    on_failure: OnFailureConfig = field(default_factory=OnFailureConfig)
+
+    @property
+    def failed_path(self) -> Path:
+        """Absolute quarantine dir — vault-relative ``on_failure.failed_dir``."""
+        return self.vault.vault_path / self.on_failure.failed_dir
 
 
 # --- Recursive builder ---
@@ -171,6 +202,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "state": StateConfig,
     "logging": LoggingConfig,
     "idle_tick": IdleTickConfig,
+    "on_failure": OnFailureConfig,
 }
 
 
@@ -255,4 +287,8 @@ def load_from_unified(raw: dict[str, Any]) -> CuratorConfig:
     idle_raw = tool.get("idle_tick")
     if isinstance(idle_raw, dict):
         top_level["idle_tick"] = idle_raw
+    # #34 — on-failure block; absent → the default OnFailureConfig (retry).
+    on_failure_raw = tool.get("on_failure")
+    if isinstance(on_failure_raw, dict):
+        top_level["on_failure"] = on_failure_raw
     return _build(CuratorConfig, top_level)

@@ -118,6 +118,44 @@ def mark_processed(
     return dest
 
 
+def quarantine(inbox_file: Path, failed_dir: Path) -> Path:
+    """Move a persistently-failing inbox file to ``failed_dir`` (#34).
+
+    The TERMINAL state of the retry-in-place-then-quarantine path: after
+    ``max_retries`` sustained failures the file leaves ``inbox/`` (so the
+    periodic ``full_scan`` can't re-pick it → no infinite reprocess loop) but
+    lands in ``failed_dir`` INTACT — visible + recoverable via
+    ``alfred curator retry-failed`` — instead of ``processed/`` (which would
+    falsely mark it done: the silent-loss behavior this replaces).
+
+    Sets ``status: failed`` + ``failed_at`` frontmatter for grep-ability on
+    text files; binary files just move. Returns the new path. Mirrors
+    :func:`mark_processed`'s collision handling.
+    """
+    if not _is_binary(inbox_file):
+        try:
+            post = frontmatter.load(str(inbox_file))
+            post.metadata["status"] = "failed"
+            post.metadata["failed_at"] = datetime.now(timezone.utc).isoformat()
+            _atomic_write(inbox_file, frontmatter.dumps(post))
+        except Exception:
+            log.warning("writer.frontmatter_failed", file=str(inbox_file))
+
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    dest = failed_dir / inbox_file.name
+    if dest.exists():
+        stem = dest.stem
+        suffix = dest.suffix
+        counter = 1
+        while dest.exists():
+            dest = failed_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+
+    shutil.move(str(inbox_file), str(dest))
+    log.info("writer.quarantined", src=str(inbox_file), dest=str(dest))
+    return dest
+
+
 def mark_filtered(
     inbox_file: Path,
     processed_dir: Path,
