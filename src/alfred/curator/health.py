@@ -302,6 +302,59 @@ def _check_last_successful_process(raw: dict[str, Any]) -> CheckResult:
     )
 
 
+def _check_quarantine(raw: dict[str, Any]) -> CheckResult:
+    """Count files in the curator's #34 quarantine dir (``inbox/failed``).
+
+    A quarantine mechanism that silently accumulated files would recreate the
+    very silent-state anti-pattern #31/#32 exist to kill — a loss-prevention
+    feature must not itself pile up unseen. So surface it: WARN when anything is
+    quarantined (structuring failed on N emails — run ``alfred curator
+    retry-failed`` once the backend is healthy), OK with an explicit "0
+    quarantined" otherwise. Per ``feedback_intentionally_left_blank.md``.
+    """
+    vault_path_str = (raw.get("vault", {}) or {}).get("path", "") or ""
+    if not vault_path_str:
+        return CheckResult(
+            name="quarantine", status=Status.SKIP, detail="vault.path not set"
+        )
+    failed_dir = ((raw.get("curator", {}) or {}).get("on_failure", {}) or {}).get(
+        "failed_dir", "inbox/failed"
+    )
+    failed_path = Path(vault_path_str) / failed_dir
+    if not failed_path.is_dir():
+        return CheckResult(
+            name="quarantine",
+            status=Status.OK,
+            detail="0 quarantined",
+            data={"count": 0, "failed_dir": failed_dir},
+        )
+    try:
+        count = sum(
+            1
+            for f in failed_path.iterdir()
+            if f.is_file() and not f.name.startswith(".")
+        )
+    except OSError:
+        return CheckResult(
+            name="quarantine",
+            status=Status.SKIP,
+            detail=f"could not read {failed_path}",
+        )
+    if count > 0:
+        return CheckResult(
+            name="quarantine",
+            status=Status.WARN,
+            detail=f"{count} item(s) quarantined in {failed_dir} — run `alfred curator retry-failed`",
+            data={"count": count, "failed_dir": failed_dir},
+        )
+    return CheckResult(
+        name="quarantine",
+        status=Status.OK,
+        detail="0 quarantined",
+        data={"count": 0, "failed_dir": failed_dir},
+    )
+
+
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     """Run curator health checks.
 
@@ -344,6 +397,7 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
         results.append(await check_claude_cli_auth(command=resolve_claude_command(raw)))
 
     results.append(_check_last_successful_process(raw))
+    results.append(_check_quarantine(raw))
 
     status = Status.worst([r.status for r in results])
     return ToolHealth(tool="curator", status=status, results=results)

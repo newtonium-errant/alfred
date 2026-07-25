@@ -121,6 +121,18 @@ logging:
 curator:
   inbox_dir: "inbox"
   processed_dir: "inbox/processed"
+  # #34 — what happens when processing a file FAILS (e.g. `claude -p` down).
+  # ``retry`` (default): leave it in inbox and retry on the next scan — a
+  # transient blip self-heals — then QUARANTINE to ``failed_dir`` after
+  # ``max_retries`` sustained failures (out of inbox so no reprocess loop, but
+  # intact + recoverable via ``alfred curator retry-failed``). The BIT surfaces
+  # a "N quarantined" health line. ``processed`` is the LEGACY behavior — marks
+  # failed emails processed + moves them to processed/ = SILENT DATA LOSS (the
+  # bug this replaces); only for parity/rollback, do not enable unaware.
+  on_failure:
+    action: retry             # retry | processed(legacy-lossy)
+    max_retries: 3
+    failed_dir: "inbox/failed"
   watcher:
     poll_interval: 5
     debounce_seconds: 10

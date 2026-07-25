@@ -525,6 +525,9 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def cmd_curator(args: argparse.Namespace) -> None:
+    if getattr(args, "curator_cmd", None) == "retry-failed":
+        _cmd_curator_retry_failed(args)
+        return
     import asyncio
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="curator")
@@ -538,6 +541,62 @@ def cmd_curator(args: argparse.Namespace) -> None:
         asyncio.run(run(config, get_skills_dir(), email_classifier_config=classifier_config))
     except KeyboardInterrupt:
         print("\nStopped.")
+
+
+def _cmd_curator_retry_failed(args: argparse.Namespace) -> None:
+    """``alfred curator retry-failed`` — re-queue #34-quarantined files.
+
+    Moves every file from the quarantine dir (``inbox/failed``) back into the
+    inbox and clears its failure counter, so the curator reprocesses it with a
+    fresh ``max_retries`` budget. Run this after the backend recovers (e.g. the
+    BIT ``claude-cli-auth`` probe / Monitor B goes green). Files that fail again
+    simply re-quarantine — no infinite loop. Per intentionally-left-blank, an
+    empty quarantine prints an explicit "nothing to retry".
+    """
+    import shutil
+
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="curator")
+    from alfred.curator.config import load_from_unified
+    from alfred.curator.state import StateManager
+
+    config = load_from_unified(raw)
+    failed_path = config.failed_path
+    inbox_path = config.vault.inbox_path
+
+    if not failed_path.is_dir():
+        print(f"No quarantine dir ({failed_path}) — nothing to retry.")
+        return
+
+    candidates = [
+        f for f in sorted(failed_path.iterdir())
+        if f.is_file() and not f.name.startswith(".")
+    ]
+    if not candidates:
+        print(f"Quarantine dir {failed_path} is empty — nothing to retry.")
+        return
+
+    state_mgr = StateManager(config.state.path)
+    state_mgr.load()
+    inbox_path.mkdir(parents=True, exist_ok=True)
+
+    moved = 0
+    for f in candidates:
+        dest = inbox_path / f.name
+        if dest.exists():
+            stem, suffix, counter = dest.stem, dest.suffix, 1
+            while dest.exists():
+                dest = inbox_path / f"{stem}_{counter}{suffix}"
+                counter += 1
+        shutil.move(str(f), str(dest))
+        state_mgr.state.clear_failed(f.name)
+        moved += 1
+
+    state_mgr.save()
+    print(
+        f"Re-queued {moved} quarantined file(s) from {failed_path} back into "
+        f"{inbox_path}. The curator will reprocess them on its next scan."
+    )
 
 
 def cmd_email_classifier(args: argparse.Namespace) -> None:
@@ -5177,8 +5236,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # curator
-    sub.add_parser("curator", help="Start curator daemon")
+    # curator — bare invocation starts the daemon; sub-subcommands add ops.
+    curator_p = sub.add_parser("curator", help="Curator daemon + operations")
+    curator_sub = curator_p.add_subparsers(dest="curator_cmd")
+    curator_sub.add_parser(
+        "retry-failed",
+        help="Re-queue #34-quarantined inbox files (inbox/failed) back into inbox for reprocessing",
+    )
 
     # email-classifier (backfill + future operational subcommands)
     ec = sub.add_parser(

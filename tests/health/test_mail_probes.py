@@ -221,3 +221,36 @@ async def test_health_check_dead_account_rolls_up_to_fail(tmp_path: Path) -> Non
     delivery = [r for r in th.results if r.name == "delivery:gmail"][0]
     assert delivery.status is Status.FAIL
     assert th.status is Status.FAIL  # worst-of rollup
+
+
+# ---------------------------------------------------------------------------
+# #34 orthogonality — a quarantined delivered email still counts as delivered
+# ---------------------------------------------------------------------------
+
+
+def test_quarantined_email_in_failed_dir_counts_as_delivered(tmp_path: Path) -> None:
+    """A delivered email that FAILED structuring and was quarantined to failed/
+    (#34) is still a delivered arrival — Monitor A must stay orthogonal to
+    structuring health (Monitor B). Otherwise a structuring outage would read as
+    a delivery outage."""
+    _make_email(tmp_path / "inbox" / "failed", "gmail", days_ago=1)
+    r = _check_account_liveness(
+        tmp_path, "inbox", "inbox/processed", "gmail", 3, 7, failed_dir="inbox/failed"
+    )
+    assert r.status is Status.OK  # delivered, despite the failed structuring
+
+
+def test_liveness_scans_default_failed_dir(tmp_path: Path) -> None:
+    # Only a quarantined record exists → still counted (default failed_dir).
+    _make_email(tmp_path / "inbox" / "failed", "gmail", days_ago=1)
+    raw = _raw(tmp_path)  # no curator config → default failed_dir "inbox/failed"
+    out = _check_liveness(raw, raw["mail"])
+    assert out[0].status is Status.OK
+
+
+def test_liveness_reads_custom_failed_dir_from_config(tmp_path: Path) -> None:
+    _make_email(tmp_path / "inbox" / "quarantine", "gmail", days_ago=1)
+    raw = _raw(tmp_path)
+    raw["curator"] = {"on_failure": {"failed_dir": "inbox/quarantine"}}
+    out = _check_liveness(raw, raw["mail"])
+    assert out[0].status is Status.OK

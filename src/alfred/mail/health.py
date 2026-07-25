@@ -55,6 +55,9 @@ _MAIL_LIVENESS_FAIL_DAYS = 7
 # Where the curator moves processed arrival files (its config default). Read
 # from ``curator.processed_dir`` at runtime; this is the fallback.
 _DEFAULT_PROCESSED_DIR = "inbox/processed"
+# Where the curator quarantines failed arrival files (#34). Read from
+# ``curator.on_failure.failed_dir`` at runtime; this is the fallback.
+_DEFAULT_FAILED_DIR = "inbox/failed"
 
 
 def _check_accounts(accounts: list) -> list[CheckResult]:
@@ -120,24 +123,33 @@ def _check_inbox(raw: dict[str, Any], mail: dict) -> CheckResult:
 
 
 def _newest_arrival_mtime(
-    vault: Path, inbox_dir: str, processed_dir: str, account_name: str
+    vault: Path,
+    inbox_dir: str,
+    processed_dir: str,
+    account_name: str,
+    failed_dir: str = _DEFAULT_FAILED_DIR,
 ) -> float | None:
     """Newest mtime of an ``email-{account}-*.md`` arrival file across the
-    inbox and the curator's processed dir. ``None`` if the account has no
-    arrival records anywhere.
+    inbox, the curator's processed dir, AND the #34 quarantine dir. ``None`` if
+    the account has no arrival records anywhere.
+
+    Scanning the quarantine dir keeps Monitor A ORTHOGONAL to structuring
+    (Monitor B): a delivered email that FAILED structuring and was quarantined
+    (#34) is still a delivered arrival, so it must still count as "delivered" —
+    otherwise a structuring outage would look like a delivery outage.
 
     Uses a manual prefix/suffix filter rather than ``glob`` so an account
     name containing a glob-special char (``[``, ``*``, ``?``) can't corrupt
     the match. mtime (not filename-timestamp parsing) is the age key —
     format-agnostic across the fetcher + webhook filename shapes. Note the
     mtime provenance differs by dir: ``inbox/`` files carry arrival mtime,
-    ``processed/`` files carry processing-time mtime (``mark_processed``
-    atomically rewrites frontmatter, resetting mtime, before the move on text
-    records). See the module docstring for why that under-reports benignly.
+    ``processed/`` (and quarantined) files carry a later processing/quarantine
+    mtime (a frontmatter rewrite resets mtime before the move on text records).
+    See the module docstring for why that under-reports benignly.
     """
     prefix = f"email-{account_name}-"
     newest: float | None = None
-    for rel in (inbox_dir, processed_dir):
+    for rel in (inbox_dir, processed_dir, failed_dir):
         d = vault / rel
         if not d.is_dir():
             continue
@@ -164,6 +176,7 @@ def _check_account_liveness(
     name: str,
     warn_days: int,
     fail_days: int,
+    failed_dir: str = _DEFAULT_FAILED_DIR,
 ) -> CheckResult:
     """One account's delivery-liveness CheckResult.
 
@@ -176,7 +189,7 @@ def _check_account_liveness(
     account gone silent is — and escalation requires a PRIOR arrival, which is
     exactly the gmail-went-silent case.
     """
-    newest = _newest_arrival_mtime(vault, inbox_dir, processed_dir, name)
+    newest = _newest_arrival_mtime(vault, inbox_dir, processed_dir, name, failed_dir=failed_dir)
     if newest is None:
         # No baseline to measure staleness against. A configured account with
         # no delivered records yet is healthy-quiet, not a failure — return OK
@@ -262,8 +275,12 @@ def _check_liveness(raw: dict[str, Any], mail: dict) -> list[CheckResult]:
     global_fail = int(liveness.get("fail_days", _MAIL_LIVENESS_FAIL_DAYS))
     per_account = liveness.get("accounts", {}) or {}
     inbox_dir = mail.get("inbox_dir", "inbox")
-    processed_dir = (raw.get("curator", {}) or {}).get(
-        "processed_dir", _DEFAULT_PROCESSED_DIR
+    curator_cfg = raw.get("curator", {}) or {}
+    processed_dir = curator_cfg.get("processed_dir", _DEFAULT_PROCESSED_DIR)
+    # #34 — a quarantined delivered email still counts as delivered, so scan the
+    # curator's on-failure quarantine dir too (keeps Monitor A ⊥ Monitor B).
+    failed_dir = (curator_cfg.get("on_failure", {}) or {}).get(
+        "failed_dir", _DEFAULT_FAILED_DIR
     )
     vault = Path(vault_path_str)
 
@@ -278,7 +295,7 @@ def _check_liveness(raw: dict[str, Any], mail: dict) -> list[CheckResult]:
         fail_days = int(override.get("fail_days", global_fail))
         out.append(
             _check_account_liveness(
-                vault, inbox_dir, processed_dir, name, warn_days, fail_days
+                vault, inbox_dir, processed_dir, name, warn_days, fail_days, failed_dir=failed_dir
             )
         )
     return out
