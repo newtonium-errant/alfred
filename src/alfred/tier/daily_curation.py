@@ -105,85 +105,18 @@ touch the file body.
 
 from __future__ import annotations
 
-import contextlib
 import os
 from dataclasses import dataclass, field
 from datetime import date as _date
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import frontmatter  # type: ignore[import-untyped]
 import structlog
 
-# fcntl is POSIX-only. The fleet runs on Linux (prod box + WSL dev), so
-# it's always available there; the guarded import keeps the module
-# importable on a hypothetical non-POSIX box (the lock then degrades to a
-# no-op — see daily_file_lock).
-try:
-    import fcntl as _fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback
-    _fcntl = None  # type: ignore[assignment]
+from alfred.common.file_lock import file_rmw_lock
 
 log = structlog.get_logger(__name__)
-
-
-@contextlib.contextmanager
-def daily_file_lock(daily_file_path: Path) -> Iterator[None]:
-    """Exclusive cross-process lock around a daily-file read-modify-write.
-
-    Step 5 lost-update fix (2026-06-27): ``daily/<date>.md`` has TWO
-    read-preserve-write writers in SEPARATE processes — the routine
-    aggregator daemon (05:59 fire) and ``save_tier_curation`` (talker /
-    operator, any time). The atomic ``.tmp`` → ``os.replace`` write
-    (2026-06-26) closed torn READS but NOT the lost-update race: writer A
-    reads → writer B reads the same state → A writes → B writes
-    (preserving A's now-STALE view) → A's keys are clobbered. The
-    operator-facing symptom is a just-made tier-curation confirmation
-    silently lost when the aggregate pass fires mid-edit.
-
-    This wraps each writer's WHOLE RMW (read existing → merge → atomic
-    write) in an ``fcntl.flock(LOCK_EX)`` on a sidecar lock file, so the
-    two RMWs serialize: the second writer blocks until the first's write
-    lands, then reads the fresh state.
-
-    ``daily_file_path`` is the RESOLVED daily-file path the caller is
-    about to write (``<...>/<date>.md``); the lock is that path with a
-    ``.lock`` suffix. Deriving the lock from the actual file path (not a
-    re-hardcoded ``daily/``) means both writers lock the SAME sidecar as
-    long as they write the SAME file — the lock is structurally
-    consistent with whatever path each writer resolved, even if the
-    aggregator's configurable output dir ever diverges from the curation
-    layer's path (that would be a pre-existing file-path bug, not a lock
-    bug). The lock file is created on demand, never deleted (a stable
-    0-byte sidecar; deleting it would reopen a create-race on the lock).
-
-    Degrades to a no-op (with a warn) if ``fcntl`` is unavailable —
-    preserves the prior atomic-only behaviour on non-POSIX rather than
-    crashing. The fleet is Linux, so this path is defensive-only.
-    """
-    if _fcntl is None:  # pragma: no cover - non-POSIX fallback
-        log.warning(
-            "tier.daily_curation.flock_unavailable",
-            detail=(
-                "fcntl not available (non-POSIX); daily-file writes fall "
-                "back to atomic-only (torn-reads closed, lost-update "
-                "window OPEN). The fleet is Linux; this path is defensive."
-            ),
-        )
-        yield
-        return
-
-    lock_path = daily_file_path.with_suffix(".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    # Open (create if absent) the sidecar lock file. ``a`` so concurrent
-    # creators don't truncate each other; we never write to it — the
-    # flock on the fd is the whole mechanism.
-    with open(lock_path, "a", encoding="utf-8") as lock_fd:
-        _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_UN)
 
 
 # Canonical ``source`` enum values — Ships 2 + 4 reference these as
@@ -591,7 +524,7 @@ def _write_curation_into_daily_file(
     of :func:`save_tier_curation` so :func:`mark_t3_done` /
     :func:`mark_t3_undone` can share it WITHIN a single lock hold.
 
-    **PRECONDITION: the caller MUST already hold** ``daily_file_lock`` for
+    **PRECONDITION: the caller MUST already hold** ``file_rmw_lock`` for
     ``daily_file``. This function does NOT take the lock — it is the
     lock-free inner write shared by every locked caller. The load →
     match → mutate → write of a done-state flip has to be one locked
@@ -599,7 +532,7 @@ def _write_curation_into_daily_file(
     B reads, A writes, B writes-preserving-A's-stale-view → A's flip is
     lost — the exact Step-5 lost-update shape). ``mark_t3_done`` can't
     just call :func:`save_tier_curation` after its own read, because that
-    would re-enter :func:`daily_file_lock` on a SECOND fd for the same
+    would re-enter :func:`file_rmw_lock` on a SECOND fd for the same
     file and self-deadlock (``flock(LOCK_EX)`` on a distinct open file
     description blocks even within the same process). Hence the shared
     lock-free inner write.
@@ -696,7 +629,7 @@ def save_tier_curation(
     (transport/instructor/curator state.py).
 
     Lost-update lock (Step 5, 2026-06-27): the WHOLE read-merge-write is
-    wrapped in :func:`daily_file_lock` (exclusive ``fcntl.flock`` on the
+    wrapped in :func:`file_rmw_lock` (exclusive ``fcntl.flock`` on the
     ``.lock`` sidecar) so a concurrent aggregator RMW can't read stale,
     write, and clobber this curation — the two writers serialize. Atomic
     write alone closed torn-reads; the lock closes lost-update.
@@ -711,7 +644,7 @@ def save_tier_curation(
     # Serialize the whole RMW against the aggregator's RMW on the same
     # daily file (Step 5 lost-update fix). The read below must stay valid
     # through the write; the lock guarantees no other writer interleaves.
-    with daily_file_lock(daily_file):
+    with file_rmw_lock(daily_file):
         _write_curation_into_daily_file(daily_file, today, curation)
 
     log.info(
@@ -733,7 +666,7 @@ def save_tier_curation(
 # single-field mutators — CODE, not the LLM, is the allowlist: they can
 # flip ``done_at`` on a matched T3 entry and nothing else (never
 # ``type``/``date``/other entries/body). They write through the same
-# ``daily_file_lock`` + atomic ``.curation.tmp`` path as
+# ``file_rmw_lock`` + atomic ``.curation.tmp`` path as
 # ``save_tier_curation`` (via the shared lock-free
 # ``_write_curation_into_daily_file``), touching only the top-level
 # ``tier_curation`` key — so the write honours the existing
@@ -827,7 +760,7 @@ def mark_t3_done(
     that day's ``t3[].item`` strings, and stamps ``done_at =
     completed_at`` on the single match. ``today`` gates future dates.
 
-    The WHOLE read → match → mutate → write runs inside ``daily_file_lock``
+    The WHOLE read → match → mutate → write runs inside ``file_rmw_lock``
     (one critical section) so two concurrent ``tier_done`` calls can't
     lost-update each other's flips — see
     :func:`_write_curation_into_daily_file`'s precondition note for why
@@ -861,7 +794,7 @@ def mark_t3_done(
         )
 
     daily_file = _daily_file_path(vault_path, completed_at)
-    with daily_file_lock(daily_file):
+    with file_rmw_lock(daily_file):
         curation = load_daily_curation(vault_path, completed_at)
         if curation is None:
             log.info(
@@ -965,7 +898,7 @@ def mark_t3_undone(
         )
 
     daily_file = _daily_file_path(vault_path, on_date)
-    with daily_file_lock(daily_file):
+    with file_rmw_lock(daily_file):
         curation = load_daily_curation(vault_path, on_date)
         if curation is None:
             log.info(
@@ -1052,7 +985,6 @@ __all__ = [
     "TIER_UNDONE_KIND_NOT_MARKED",
     "TIER_UNDONE_KIND_UNMARKED",
     "TierDoneResult",
-    "daily_file_lock",
     "load_daily_curation",
     "mark_t3_done",
     "mark_t3_undone",

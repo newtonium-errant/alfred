@@ -877,9 +877,9 @@ def run_aggregator_once(
     # (below) closed torn-reads; this closes lost-update. The lock is
     # keyed on the resolved ``file_path`` so it matches the curation
     # writer's lock on the same file.
-    from alfred.tier.daily_curation import daily_file_lock
+    from alfred.common.file_lock import file_rmw_lock
 
-    with daily_file_lock(file_path):
+    with file_rmw_lock(file_path):
         # Preserve any pre-existing tier_curation block. Talker may have
         # pre-edited the daily file before the 05:59 aggregator fire; or
         # the operator may have run ``alfred routine`` manually mid-day

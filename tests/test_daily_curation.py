@@ -32,10 +32,10 @@ from alfred.tier.daily_curation import (
     T1_T2_SOURCES,
     T3Entry,
     T3_SOURCES,
-    daily_file_lock,
     load_daily_curation,
     save_tier_curation,
 )
+from alfred.common.file_lock import file_rmw_lock
 
 
 TODAY = date(2026, 5, 29)
@@ -740,7 +740,7 @@ def test_aggregator_and_curation_tmp_suffixes_distinct() -> None:
 # The atomic .tmp→os.replace write closed torn-reads but NOT the
 # lost-update race (two RMW writers in separate processes: A reads, B
 # reads, A writes, B writes-preserving-A's-stale-view → A's keys lost).
-# daily_file_lock serializes each writer's whole RMW via fcntl.flock on a
+# file_rmw_lock serializes each writer's whole RMW via fcntl.flock on a
 # sidecar .lock. These tests are deterministic (no sleeps/timing) — on
 # Linux flock on two separate open() fds of the same file blocks even
 # within one process, so mutual exclusion is testable in-process.
@@ -748,7 +748,7 @@ def test_aggregator_and_curation_tmp_suffixes_distinct() -> None:
 import fcntl as _fcntl_test
 
 
-def test_daily_file_lock_is_mutually_exclusive(tmp_path: Path) -> None:
+def test_file_rmw_lock_is_mutually_exclusive(tmp_path: Path) -> None:
     """While the lock is held, a second exclusive acquire on the same
     sidecar fails (non-blocking) — proves the lock is actually held, so
     a concurrent writer's RMW would block rather than interleave."""
@@ -756,7 +756,7 @@ def test_daily_file_lock_is_mutually_exclusive(tmp_path: Path) -> None:
     daily_file = vault / "daily" / "2026-05-29.md"
     lock_path = daily_file.with_suffix(".lock")
 
-    with daily_file_lock(daily_file):
+    with file_rmw_lock(daily_file):
         # Lock sidecar created + held. A fresh fd's non-blocking
         # exclusive acquire must fail (someone holds it).
         with open(lock_path, "a", encoding="utf-8") as probe:
@@ -773,19 +773,19 @@ def test_daily_file_lock_is_mutually_exclusive(tmp_path: Path) -> None:
                 if not raised:
                     _fcntl_test.flock(probe.fileno(), _fcntl_test.LOCK_UN)
     assert raised, (
-        "daily_file_lock did not hold the lock exclusively — a "
+        "file_rmw_lock did not hold the lock exclusively — a "
         "concurrent RMW could interleave (lost-update window open)."
     )
 
 
-def test_daily_file_lock_releases_on_exit(tmp_path: Path) -> None:
+def test_file_rmw_lock_releases_on_exit(tmp_path: Path) -> None:
     """After the context exits, the lock is released — a fresh acquire
     succeeds (no leaked lock that would deadlock the next writer)."""
     vault = _make_vault(tmp_path)
     daily_file = vault / "daily" / "2026-05-29.md"
     lock_path = daily_file.with_suffix(".lock")
 
-    with daily_file_lock(daily_file):
+    with file_rmw_lock(daily_file):
         pass
     # Now acquirable again.
     with open(lock_path, "a", encoding="utf-8") as probe:
@@ -846,7 +846,7 @@ def test_lost_update_curation_survives_interleaved_aggregator(
     # Main thread holds the lock (simulating the aggregator's RMW
     # in-flight), starts the bg curation save (which must block), then
     # writes the aggregator's view + releases.
-    with daily_file_lock(daily_file):
+    with file_rmw_lock(daily_file):
         t.start()
         save_started.wait(timeout=5)
         # The bg save is now blocked on the lock. Confirm it has NOT

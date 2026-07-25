@@ -18,7 +18,7 @@ NEVER by detection/render.
 Mirrors the ``routine.match_calibration`` pending/glossary pattern (schema-tolerant JSONL twins,
 degrade-not-crash) and the ``scribe negation-glossary`` approve/reject order (routine-write THEN
 decided-row → a crash between self-heals: the append is idempotent-by-text and the id is not-yet-decided,
-so a re-run completes). The routine-record write uses the generic ``daily_file_lock`` (an
+so a re-run completes). The routine-record write uses the generic ``file_rmw_lock`` (an
 ``fcntl``-flock sidecar on any path) for a ``mark_t3_done``-parity atomic locked-RMW.
 """
 from __future__ import annotations
@@ -37,7 +37,8 @@ import structlog
 import yaml
 
 from alfred.routine.match_calibration import query_key
-from alfred.tier.daily_curation import daily_file_lock, load_daily_curation
+from alfred.common.file_lock import file_rmw_lock
+from alfred.tier.daily_curation import load_daily_curation
 
 log = structlog.get_logger(__name__)
 
@@ -342,12 +343,12 @@ def append_promoted_item(
 ) -> str:
     """Append a soft-cadence ``Item`` (``text`` + ``priority`` + ``target_cadence_days`` — NO deadline,
     never escalates) to ``routine/<routine_record>.md``'s ``items:`` list. Creates the record (``type:
-    routine`` + ``name``) if absent. ATOMIC locked-RMW under :func:`daily_file_lock` (``mark_t3_done``
+    routine`` + ``name``) if absent. ATOMIC locked-RMW under :func:`file_rmw_lock` (``mark_t3_done``
     parity). IDEMPOTENT: returns ``"duplicate"`` (no write) when an item whose ``query_key(text)``
     already matches is present — a re-approve never adds a second copy. Returns ``"appended"`` on write."""
     path = Path(vault_path) / "routine" / f"{routine_record}.md"
     target_key = query_key(text)
-    with daily_file_lock(path):
+    with file_rmw_lock(path):
         if path.exists():
             post = frontmatter.load(str(path))
             fm = dict(post.metadata or {})
