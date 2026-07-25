@@ -362,6 +362,85 @@ async def test_execute_non_destructive_runs_tool_loop(
     assert post.metadata.get("tags") == ["done"]
 
 
+async def test_execute_routes_create_kwargs_through_the_quirk_helper(
+    config: InstructorConfig,
+    state: InstructorState,
+    skills_dir: Path,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The instructor's ``messages.create`` routes through
+    ``messages_create_kwargs`` so the Opus-``temperature`` quirk applies by
+    construction — the instructor passes no temperature today, but binding the
+    routing means a future temperature addition can't 400 on an Opus model.
+    A revert to a direct ``create`` call drops the spy and fails this pin.
+    """
+    _write_record(
+        vault,
+        "note/Target.md",
+        dedent(
+            """\
+            ---
+            type: note
+            name: Target
+            created: '2026-04-20'
+            ---
+
+            Body.
+            """
+        ),
+    )
+    # Opus is the family the quirk gate strips ``temperature`` for.
+    monkeypatch.setattr(config.anthropic, "model", "claude-opus-4-7")
+
+    real_helper = exec_mod.messages_create_kwargs
+    spy_calls: list[dict[str, Any]] = []
+
+    def _spy(**kwargs: Any) -> dict[str, Any]:
+        spy_calls.append(kwargs)
+        return real_helper(**kwargs)
+
+    monkeypatch.setattr(exec_mod, "messages_create_kwargs", _spy)
+
+    responses = [
+        FakeResponse(
+            content=[
+                FakeBlock(
+                    type="text",
+                    text='{"status": "done", "summary": "noop"}',
+                )
+            ],
+            stop_reason="end_turn",
+        )
+    ]
+    client = FakeClient(responses=responses)
+
+    result = await execute(
+        client=client,
+        directive="review this record",
+        record_path="note/Target.md",
+        config=config,
+        state=state,
+        skills_dir=skills_dir,
+    )
+    assert result.status == "done"
+
+    # The create call routed through the helper exactly once...
+    assert len(spy_calls) == 1
+    assert spy_calls[0]["model"] == "claude-opus-4-7"
+
+    # ...and the kwargs that actually reached ``messages.create`` carry NO
+    # temperature on an Opus model (quirk-safe by construction), with every
+    # original argument preserved.
+    assert len(client.messages.calls) == 1
+    sent = client.messages.calls[0]
+    assert "temperature" not in sent
+    assert sent["model"] == "claude-opus-4-7"
+    assert sent["max_tokens"] == config.anthropic.max_tokens
+    assert sent["tools"] is exec_mod.VAULT_TOOLS
+    assert "system" in sent and "messages" in sent
+
+
 async def test_execute_destructive_keyword_triggers_dry_run(
     config: InstructorConfig,
     state: InstructorState,

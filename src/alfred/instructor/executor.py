@@ -42,6 +42,7 @@ from typing import Any
 import anthropic
 import frontmatter
 
+from alfred._anthropic_compat import messages_create_kwargs
 from alfred.vault import ops, scope
 from alfred.vault.mutation_log import log_mutation
 
@@ -774,12 +775,19 @@ async def execute(
     for iteration in range(MAX_TOOL_ITERATIONS):
         tool_iterations = iteration + 1
         try:
+            # Route create-kwargs through the shared quirk gate so every
+            # ``messages.create`` call site stays quirk-safe by construction.
+            # The instructor passes no ``temperature`` today (so this is a
+            # no-op on the current dict), but folding it here means a future
+            # temperature addition can't 400 on an Opus-family model.
             response = await client.messages.create(
-                model=config.anthropic.model,
-                max_tokens=config.anthropic.max_tokens,
-                system=system_prompt,
-                messages=messages,
-                tools=VAULT_TOOLS,
+                **messages_create_kwargs(
+                    model=config.anthropic.model,
+                    max_tokens=config.anthropic.max_tokens,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=VAULT_TOOLS,
+                )
             )
         except anthropic.APIError as exc:
             log.warning(
