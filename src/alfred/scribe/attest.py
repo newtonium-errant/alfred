@@ -114,6 +114,7 @@ def attest(
     vault_audit_path: str | Path | None = None,
     enrollment_dir: str | Path | None = None,
     negation_candidates_dir: str | Path | None = None,
+    notegen_feedback_dir: str | Path | None = None,
     quality_succinctness_target: float | None = None,
     quality_required_sections=None,
     events: "ScribeEvents | None" = None,
@@ -459,16 +460,19 @@ def attest(
     # #14 self-correcting Part-1 CAPTURE for NOTE-GEN EDIT-DIFF — the FOURTH sibling (the STRUCTURAL
     # GENERALIZATION of the three above, to the whole draft→attested diff). READ-ONLY, try-wrapped,
     # fail-silent. Emits PHI-FREE per-section correction signals (counts/deltas/enums only — never
-    # claim text). Called UNCONDITIONALLY (NOT gated on enrollment_dir here) so a DORMANT sink emits an
+    # claim text). Called UNCONDITIONALLY (NOT gated on capture_dir here) so a DORMANT sink emits an
     # observable one-time signal rather than silently capturing nothing (the intentionally-left-blank
     # trap). Reads draft_original + body + grounding_flags (as the twins do) + the profile id/version.
+    # #14/#26 go-live — the notegen sink is DECOUPLED from the voice enrollment_dir onto a dedicated
+    # scribe-level capture_dir (``notegen_feedback_dir``, resolved per-instance by cmd_scribe): note-gen
+    # edit feedback captures regardless of whether voice enrollment is configured.
     # #14e-ii — ALSO drives quality_survival: the draft-time quality_flags + the active profile's
     # target + required-sections (threaded by cmd_scribe from resolve_active_profile) re-check whether
     # each advisory quality flag was ACTED-on or IGNORED in the attested body. Same SWALLOWED belt.
     try:
         from alfred.scribe.notegen_feedback import record_notegen_edit_outcome
         record_notegen_edit_outcome(
-            enrollment_dir=enrollment_dir,
+            capture_dir=notegen_feedback_dir,
             grounding_flags=fm.get("grounding_flags"),
             draft_original=str(fm.get("draft_original") or ""),
             attested_body=str(rec.get("body") or ""),

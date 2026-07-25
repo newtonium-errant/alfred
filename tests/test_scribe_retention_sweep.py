@@ -30,6 +30,9 @@ from alfred.scribe.config import (
 from alfred.scribe.enroll_learning import (
     CAPTURE_NAME, KIND_ATTEST_OUTCOME, KIND_DIARIZE_STATS, LEARNING_DIRNAME,
 )
+from alfred.scribe.notegen_feedback import (
+    KIND_NOTEGEN_EDIT, NOTEGEN_CAPTURE_NAME, resolve_notegen_feedback_dir,
+)
 from alfred.evstore import sha256_hex
 from alfred.scribe import retention as ret_mod
 from alfred.scribe import schedule as sched_mod
@@ -352,6 +355,100 @@ def test_prune_does_not_touch_phi_or_chain(tmp_path):
     assert len(_retention_rows(ev, enc_id)) == 1           # #11 chain row survives
     # the prune emitted NO retention.* event (log rotation, not a PHI destruction)
     assert [r for r in ev.query(CLINICAL, family="retention")] == _retention_rows(ev)
+
+
+# ================= notegen_edit prune (#14/#26 dedicated-sink decouple) =================
+# The relocated notegen_edit sink (<input_dir parent>/scribe/notegen_edit.jsonl) is PHI-free but
+# SOURCE-LINKED, so its retention prune MOVED in lockstep with the decouple — an un-pruned sink is a
+# retention gap. Same posture as the diarize prune: age-filter by ts, PRESERVE undateable, no
+# retention.* event, own lock, folded into the sweep summary via pruned_notegen_edit_rows.
+
+
+def _notegen_sink_path(cfg):
+    return resolve_notegen_feedback_dir(cfg) / NOTEGEN_CAPTURE_NAME
+
+
+def _write_notegen_sink(cfg, lines):
+    sink = _notegen_sink_path(cfg)
+    sink.parent.mkdir(parents=True, exist_ok=True)
+    sink.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+    return sink
+
+
+def test_notegen_prune_drops_old_keeps_fresh_preserves_undateable(tmp_path):
+    cfg = _config(tmp_path)
+    old = _row(KIND_NOTEGEN_EDIT, 200, source_id="enc-old")
+    fresh = _row(KIND_NOTEGEN_EDIT, 10, source_id="enc-new")
+    corrupt = '{"kind": "notegen_edit", "ts": "2026-'                 # torn / unparseable
+    undateable = json.dumps({"kind": KIND_NOTEGEN_EDIT, "source_id": "enc-x"})  # no ts
+    sink = _write_notegen_sink(cfg, [old, fresh, corrupt, undateable])
+
+    dropped = _sweep(cfg, _events(tmp_path))._prune_notegen_edit(_NOW)
+
+    assert dropped == 1                                    # only the aged row dropped
+    remaining = sink.read_text().splitlines()
+    assert fresh in remaining                              # fresh kept
+    assert corrupt in remaining                            # torn PRESERVED (can't date → never drop)
+    assert undateable in remaining                         # undateable PRESERVED (PHI-free posture)
+    assert old not in remaining
+    assert not sink.with_name(sink.name + ".prune.tmp").exists()   # atomic: no temp left behind
+
+
+def test_notegen_prune_180_day_boundary(tmp_path):
+    cfg = _config(tmp_path)
+    just_inside = _row(KIND_NOTEGEN_EDIT, 179, source_id="keep")
+    just_outside = _row(KIND_NOTEGEN_EDIT, 181, source_id="drop")
+    sink = _write_notegen_sink(cfg, [just_inside, just_outside])
+
+    dropped = _sweep(cfg, _events(tmp_path))._prune_notegen_edit(_NOW)
+
+    remaining = sink.read_text().splitlines()
+    assert dropped == 1
+    assert just_inside in remaining and just_outside not in remaining
+
+
+def test_notegen_prune_absent_sink_is_zero(tmp_path):
+    # No attests yet ⇒ no notegen sink on disk ⇒ prune is a clean 0 (never crashes; ILB summary shows 0).
+    cfg = _config(tmp_path)
+    assert _sweep(cfg, _events(tmp_path))._prune_notegen_edit(_NOW) == 0
+
+
+def test_notegen_prune_captures_without_voice_enrollment(tmp_path):
+    # THE decouple: the notegen prune resolves its sink from input_dir, NOT diarize.enrollment_dir —
+    # so it prunes even when voice enrollment is absent (the old shared sink would have been dormant).
+    cfg = _config(tmp_path, enrollment=False)
+    sink = _write_notegen_sink(cfg, [_row(KIND_NOTEGEN_EDIT, 300, source_id="ancient")])
+    dropped = _sweep(cfg, _events(tmp_path))._prune_notegen_edit(_NOW)
+    assert dropped == 1 and sink.read_text().strip() == ""   # pruned despite no enrollment_dir
+
+
+def test_notegen_prune_folds_into_summary_and_emits_no_retention_event(tmp_path):
+    # ILB: the row count rides the sweep summary (pruned_notegen_edit_rows), distinct from the diarize
+    # counter; and the prune emits NO retention.* event (log rotation, not a PHI destruction).
+    cfg = _config(tmp_path)
+    ev = _events(tmp_path)
+    _write_notegen_sink(cfg, [_row(KIND_NOTEGEN_EDIT, 300, source_id="ancient"),
+                              _row(KIND_NOTEGEN_EDIT, 5, source_id="fresh")])
+    _write_sink(cfg, [_row(KIND_DIARIZE_STATS, 300, source_id="diar-old")])   # both sinks present
+
+    summary = _sweep(cfg, ev)._run_sync(ScribeState(tmp_path / "state.json"), _NOW)
+
+    assert summary.pruned_notegen_edit_rows == 1           # the aged notegen row
+    assert summary.pruned_telemetry_rows == 1              # the diarize prune is UNCHANGED + independent
+    assert [r for r in ev.query(CLINICAL, family="retention")] == _retention_rows(ev)   # no retention.*
+
+
+def test_notegen_prune_never_pruned_schedule_skips_with_own_latch(tmp_path):
+    # A schedule declaring the telemetry class never-pruned SKIPS the notegen prune (deliberate) and
+    # latches its OWN signal — independent of the diarize never-pruned latch (shared window, separate keys).
+    schedule = {"schedule_version": "v1", "classes": {sched_mod.TELEMETRY_CLASS: {"window_days": None}}}
+    cfg = _config(tmp_path)
+    sink = _write_notegen_sink(cfg, [_row(KIND_NOTEGEN_EDIT, 300, source_id="ancient")])
+    with structlog.testing.capture_logs() as cap:
+        dropped = _sweep(cfg, _events(tmp_path))._prune_notegen_edit(_NOW, schedule)
+    assert dropped == 0
+    assert len(sink.read_text().splitlines()) == 1         # the ancient row KEPT (never-pruned)
+    assert [c for c in cap if c["event"] == "scribe.retention.sweep.notegen_edit_never_pruned"]
 
 
 # ============================ never-wedges (exception injection) ============================

@@ -17,28 +17,33 @@ The PHI-free schema is a CLOSED FROZENSET (:data:`_ROW_FIELDS` etc.), pinned by 
 :func:`phi_free_violations` — the same discipline as the event-store field allowlist. Capture is
 fail-silent + side-effect-free BY CONSTRUCTION: a bug here can NEVER alter/fail a medico-legal attest.
 
-ROADMAP (NOT 14a — a real latent gap, boarded): the capture sink currently rides
-``<enrollment_dir>/learning/attest_capture.jsonl`` (SHARED with the voice-diarization captures — one
-lock, one retention prune, one dormancy gate, design §2.3), which mis-couples note-gen edit feedback
-to VOICE-enrollment config: an instance that attests notes without ``scribe.diarize.enrollment_dir``
-set captures ZERO notegen_edit rows. On the production box enrollment IS configured, so 14a keeps the
-shared sink (moving it would drag the #13-13b retention-prune rewiring into scope). But the dormancy
-is made OBSERVABLE (a one-time signal, :func:`record_notegen_edit_outcome`) so absent rows are
-diagnosable, never silent. Decouple the PHI-free capture sink onto a scribe-level data path (+ move
-the retention-prune coverage with it) in a later slice.
+SINK (decoupled at go-live hardening, #14/#26): the capture rides a DEDICATED, scribe-level sink
+``<input_dir parent>/scribe/notegen_edit.jsonl`` (:func:`resolve_notegen_feedback_dir` — per-instance
+from ``input_dir``, the #26 ``resolve_candidates_dir`` mirror), with its OWN flock + its OWN retention
+prune. It is INDEPENDENT of the voice-diarization sink under ``scribe.diarize.enrollment_dir``. This
+closes the former mis-coupling: an instance that attested notes WITHOUT voice enrollment configured
+captured ZERO notegen_edit rows (note-gen edit feedback has nothing to do with voice enrollment).
+Dormancy stays OBSERVABLE (the one-time signal in :func:`record_notegen_edit_outcome`), now gated on
+the scribe-level ``capture_dir`` resolvability — with the input_dir-derived default it is near-always
+resolvable, so dormancy effectively never fires (the mis-coupling WAS the bug); the guard remains for
+the explicit-empty edge. The retention-prune coverage MOVED in lockstep
+(``RetentionSweep._prune_notegen_edit`` — an un-pruned source-linked sink is a retention gap).
 """
 
 from __future__ import annotations
 
+import contextlib
 import difflib
+import fcntl
 import json
+import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from alfred.scribe.enroll_learning import KIND_NOTEGEN_EDIT
 from alfred.scribe.grounding import _normalize
 from alfred.scribe.notegen import SOAP_SECTIONS, _SECTION_HEADINGS
 from alfred.scribe.notegen_quality import (
@@ -48,7 +53,110 @@ from alfred.scribe.notegen_quality import (
     QUALITY_VERBOSE_REASON,
 )
 
+if TYPE_CHECKING:
+    from alfred.scribe.config import ScribeConfig
+
 log = structlog.get_logger(__name__)
+
+
+# ── The DEDICATED, scribe-level notegen-edit capture sink (#14/#26 go-live decouple) ─────────────
+# ``notegen_edit`` is the row kind (was in enroll_learning while the sink was SHARED with the voice
+# captures — moved here on decouple; it is a notegen concern). The sink is a DEDICATED file under the
+# per-instance scribe data dir, with its OWN flock + retention prune, independent of the voice sink.
+KIND_NOTEGEN_EDIT = "notegen_edit"
+_NOTEGEN_SINK_SUBDIR = "scribe"          # MUST match negation_suppression._SCRIBE_SUBDIR (pinned in tests)
+NOTEGEN_CAPTURE_NAME = "notegen_edit.jsonl"
+NOTEGEN_CAPTURE_LOCK_NAME = ".notegen_edit.lock"
+
+
+def resolve_notegen_feedback_dir(config: "ScribeConfig") -> Path:
+    """The DEDICATED notegen-edit capture DIR — ``<input_dir parent>/scribe`` (the SAME per-instance
+    scribe data dir as #26 ``negation_suppression.resolve_candidates_dir`` + the retention sweep's
+    ``_resolved_retained_dir``; the notegen sink is a DISTINCT FILE within it). Derived purely from
+    ``config.input_dir`` — per-instance-correct, NEVER a single-instance literal, and NEVER gated on the
+    voice ``scribe.diarize.enrollment_dir`` (that coupling was the go-live bug). No config override field
+    (Phase-1 mirror of #26). A test pins ``== resolve_candidates_dir`` so the two can never diverge."""
+    return Path(config.input_dir).expanduser().parent / _NOTEGEN_SINK_SUBDIR
+
+
+def _notegen_sink_path(capture_dir: str | Path) -> Path:
+    return Path(capture_dir) / NOTEGEN_CAPTURE_NAME
+
+
+@contextlib.contextmanager
+def notegen_capture_lock(capture_dir: str | Path):
+    """Serialize the notegen-edit sink's writers (the attest-CLI capture) against the retention sweep's
+    rolling prune via an exclusive ``flock`` on a STABLE lock file. The sink is rotated by ``os.replace``
+    (the prune), so flocking the sink fd is unreliable — the pre-replace inode is orphaned and a blocked
+    appender would write the dead inode, silently losing the row (enroll_learning finding 19, same
+    rationale, dedicated lock). Best-effort: if the lock can't be opened/acquired, proceed WITHOUT it +
+    a loud signal (the guarded loss is a single PHI-free telemetry row — never fail a valid attest or
+    wedge the sweep over a lock)."""
+    lock_path = Path(capture_dir) / NOTEGEN_CAPTURE_LOCK_NAME
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+        log.warning(
+            "scribe.notegen_feedback.capture_lock_skipped", error_class=type(exc).__name__,
+            detail="the notegen_edit capture-sink lock could NOT be acquired — proceeding WITHOUT "
+                   "serialization; a concurrent prune/append race could drop one PHI-free telemetry "
+                   "row. Check the lock-file ownership/perms.")
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _append_notegen_row(capture_dir: str | Path, row: dict[str, Any]) -> None:
+    """Append one JSON line to the dedicated notegen sink, creating the scribe dir 0700 and the sink
+    file 0600, UNDER the capture lock (serialized vs the prune's read-then-replace rewrite). Mirrors
+    ``enroll_learning._append_jsonl`` (dedicated so the notegen sink is fully self-owned). Caller wraps
+    fail-silent."""
+    path = _notegen_sink_path(capture_dir)
+    with notegen_capture_lock(capture_dir):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+        existed = path.exists()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        if not existed:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+
+def record_notegen_edit(capture_dir: str | Path, *, row: dict[str, Any]) -> None:
+    """Append a PHI-FREE ``notegen_edit`` row to the dedicated scribe-level sink. The ``row`` is the
+    closed-frozenset payload built by :func:`compute_notegen_edit_row` (kind + per-section
+    counts/deltas/enums ONLY, widening-pinned there); this writer just stamps ``ts`` and appends.
+    FAIL-SILENT + PHI-FREE. Moved out of ``enroll_learning`` on the #14/#26 decouple (was the shared
+    voice sink)."""
+    if not str(capture_dir or ""):
+        return                      # store DORMANT (the OBSERVABLE one-time signal is emitted upstream
+        #                             in record_notegen_edit_outcome, not here)
+    try:
+        _append_notegen_row(capture_dir, {"ts": _now(), **row})
+    except Exception:  # noqa: BLE001 — capture must NEVER fail a valid attest / the pipeline
+        log.warning("scribe.notegen_feedback.capture_error", kind=KIND_NOTEGEN_EDIT,
+                    source_id=row.get("source_id"), detail="notegen_edit capture failed — SWALLOWED")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 # The single ratified SOAP profile (Q4) — the default attribution until 14b's real profile writes
 # ``note_profile_id`` / ``note_profile_version`` into frontmatter (consumer-fields-from-day-one).
@@ -357,30 +465,32 @@ def _count_violations(block: Any, allowed: frozenset, label: str) -> list[str]:
 
 
 def record_notegen_edit_outcome(
-    *, enrollment_dir: Any, grounding_flags: Any, draft_original: str, attested_body: str,
+    *, capture_dir: Any, grounding_flags: Any, draft_original: str, attested_body: str,
     template_id: Any = None, template_version: Any = None, source_id: str,
     quality_flags: Any = None, succinctness_target: Any = None, required_sections: Any = None,
 ) -> None:
     """#14 self-correcting Part-1 CAPTURE at attest — the FOURTH read-only, fail-silent sibling.
 
-    Computes the PHI-FREE ``notegen_edit`` row (draft→attested diff) and appends it to the shared
-    capture sink. SIDE-EFFECT-FREE + fail-silent BY CONSTRUCTION: any error is swallowed so a capture
-    bug can NEVER fail a medico-legal attest.
+    Computes the PHI-FREE ``notegen_edit`` row (draft→attested diff) and appends it to the DEDICATED
+    scribe-level capture sink (``capture_dir`` = :func:`resolve_notegen_feedback_dir`, decoupled from the
+    voice ``enrollment_dir`` at the #14/#26 go-live hardening). SIDE-EFFECT-FREE + fail-silent BY
+    CONSTRUCTION: any error is swallowed so a capture bug can NEVER fail a medico-legal attest.
 
-    DORMANCY IS OBSERVABLE (not silent — the intentionally-left-blank trap): when the sink is dormant
-    (``enrollment_dir`` unset ⇒ no resolvable capture sink), emit a ONE-TIME signal so absent rows are
-    diagnosable rather than mistaken for 'no edits'. (Roadmap: decouple this sink from the voice
-    ``enrollment_dir`` — see the module docstring.)"""
+    DORMANCY IS OBSERVABLE (not silent — the intentionally-left-blank trap): when ``capture_dir`` is
+    unset ⇒ no resolvable capture sink, emit a ONE-TIME signal so absent rows are diagnosable rather than
+    mistaken for 'no edits'. With the input_dir-derived default ``capture_dir`` is near-always resolvable,
+    so this effectively never fires (the former voice-enrollment coupling WAS the bug); the guard remains
+    for the explicit-empty edge."""
     try:
-        if not str(enrollment_dir or ""):
+        if not str(capture_dir or ""):
             if not _DORMANT["warned"]:
                 _DORMANT["warned"] = True
                 log.warning(
                     "scribe.notegen_feedback.capture_dormant", source_id=source_id,
-                    detail="notegen_edit capture DORMANT — no capture sink configured "
-                           "(scribe.diarize.enrollment_dir unset). Note-gen edit-diff feedback is NOT "
-                           "being recorded; absent rows are EXPECTED until a sink is configured. "
-                           "One-time signal (further dormant attests stay quiet).")
+                    detail="notegen_edit capture DORMANT — no capture sink resolved (scribe capture_dir "
+                           "empty). Note-gen edit-diff feedback is NOT being recorded; absent rows are "
+                           "EXPECTED until a scribe input_dir is configured. One-time signal (further "
+                           "dormant attests stay quiet).")
             return
         row = compute_notegen_edit_row(
             draft_original=draft_original, attested_body=attested_body,
@@ -388,8 +498,7 @@ def record_notegen_edit_outcome(
             template_version=template_version, source_id=source_id,
             quality_flags=quality_flags, succinctness_target=succinctness_target,
             required_sections=required_sections)
-        from alfred.scribe import enroll_learning
-        enroll_learning.record_notegen_edit(enrollment_dir, row=row)
+        record_notegen_edit(capture_dir, row=row)
     except Exception:  # noqa: BLE001 — capture must NEVER affect a valid attest
         log.warning(
             "scribe.notegen_feedback.capture_error", source_id=source_id,
@@ -400,14 +509,14 @@ def record_notegen_edit_outcome(
 # #14e-i — the read surfaces (Part A status readout + Part B on-box raw diff)
 # ===========================================================================
 
-def read_notegen_edit_rows(enrollment_dir: Any) -> list[dict]:
-    """Read all ``notegen_edit`` rows from the shared capture sink. PHI-FREE (the rows are the closed
-    frozenset of counts/enums). Tolerant: unset/absent/torn → the rows read so far (a corrupt sink never
-    raises into the read-only readout)."""
-    if not str(enrollment_dir or ""):
+def read_notegen_edit_rows(capture_dir: Any) -> list[dict]:
+    """Read all ``notegen_edit`` rows from the DEDICATED scribe-level capture sink (``capture_dir`` =
+    :func:`resolve_notegen_feedback_dir`). PHI-FREE (the rows are the closed frozenset of counts/enums).
+    Tolerant: unset/absent/torn → the rows read so far (a corrupt sink never raises into the read-only
+    readout)."""
+    if not str(capture_dir or ""):
         return []
-    from alfred.scribe.enroll_learning import _capture_path
-    path = _capture_path(enrollment_dir)
+    path = _notegen_sink_path(capture_dir)
     rows: list[dict] = []
     try:
         if not path.is_file():

@@ -18,7 +18,6 @@ import structlog
 import yaml
 
 from alfred.cli import build_parser, cmd_scribe
-from alfred.scribe import enroll_learning as el
 from alfred.scribe import notegen_feedback as nf
 from alfred.sovereign.boundary import CLOUD_KEY_ENV_VARS
 from alfred.vault.ops import vault_create
@@ -40,9 +39,9 @@ def _row(source_id, **over):
     return r
 
 
-def _seed(enroll, *rows):
+def _seed(capture_dir, *rows):
     for r in rows:
-        el.record_notegen_edit(str(enroll), row=r)
+        nf.record_notegen_edit(str(capture_dir), row=r)
 
 
 # ===========================================================================
@@ -50,13 +49,14 @@ def _seed(enroll, *rows):
 # ===========================================================================
 
 def test_read_rows_filters_kind_and_tolerates_absent(tmp_path):
-    enroll = tmp_path / "enroll"
-    assert nf.read_notegen_edit_rows(enroll) == []          # absent sink → []
-    assert nf.read_notegen_edit_rows("") == []              # dormant → []
-    el.record_notegen_edit(str(enroll), row=_row("enc-a"))
-    el.record_attest_outcome(str(enroll), source_id="enc-a", user=None, preset_id=None,
-                             centroid_version=None, reason="negation_mismatch", kept=True)  # other kind
-    rows = nf.read_notegen_edit_rows(enroll)
+    capture = tmp_path / "scribe"
+    assert nf.read_notegen_edit_rows(capture) == []          # absent sink → []
+    assert nf.read_notegen_edit_rows("") == []               # dormant → []
+    nf.record_notegen_edit(str(capture), row=_row("enc-a"))
+    # a FOREIGN-kind line in the DEDICATED sink is filtered out by read_notegen_edit_rows.
+    with open(nf._notegen_sink_path(capture), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"kind": "some_other_kind", "ts": "2026-01-01T00:00:00+00:00"}) + "\n")
+    rows = nf.read_notegen_edit_rows(capture)
     assert len(rows) == 1 and rows[0]["kind"] == "notegen_edit"   # only notegen_edit rows
 
 
@@ -165,7 +165,9 @@ def test_cli_status_ilb_empty(tmp_path):
 
 def test_cli_status_populated_and_json(tmp_path):
     config = _cfg(tmp_path)
-    _seed(tmp_path / "enroll", _row("enc-a", high_modification=True,
+    # the status CLI reads the DEDICATED scribe-level sink (resolve_notegen_feedback_dir = <input_dir
+    # parent>/scribe); _cfg sets input_dir=<tmp>/inbox, so seed <tmp>/scribe.
+    _seed(tmp_path / "scribe", _row("enc-a", high_modification=True,
                                     flag_survival={"negation_mismatch": {"removed": 0, "kept": 2}}))
     out = _run(config, "notegen-feedback", "status")[1]
     assert "1 attest(s)" in out and "negation_mismatch" in out and "enc-a" in out

@@ -16,7 +16,6 @@ import frontmatter
 import pytest
 
 from alfred.scribe import SCRIBE_DRAFTER_IDENTITY
-from alfred.scribe import enroll_learning
 from alfred.scribe import notegen_feedback as nf
 from alfred.scribe.attest import attest
 from alfred.scribe.grounding import GroundingResult, verify
@@ -229,37 +228,50 @@ def test_widening_pin_rejects_a_claim_string_leak():
 # Writer + side-effect-free + observable dormancy
 # ===========================================================================
 
-def _rows(enroll):
-    p = enroll_learning._capture_path(enroll)
+def _rows(capture_dir):
+    p = nf._notegen_sink_path(capture_dir)
     if not p.is_file():
         return []
     return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()
             and json.loads(x).get("kind") == "notegen_edit"]
 
 
-def test_writer_appends_to_shared_sink_with_ts(tmp_path):
-    enroll = str(tmp_path / "enroll")
+def test_resolve_notegen_feedback_dir_matches_candidates_dir(tmp_path):
+    # DIVERGENCE PIN — the notegen sink lives in the SAME per-instance scribe data dir as the #26
+    # negation candidates (<input_dir parent>/scribe). Pin equality so the two resolvers can never
+    # drift to different trees (which would strand the sink outside the retention prune's reach).
+    from alfred.scribe.config import load_from_unified
+    from alfred.scribe.negation_suppression import resolve_candidates_dir
+    cfg = load_from_unified({"scribe": {"encounter_salt": "s", "input_dir": str(tmp_path / "inbox")}})
+    assert nf.resolve_notegen_feedback_dir(cfg) == resolve_candidates_dir(cfg)
+    assert nf.resolve_notegen_feedback_dir(cfg) == tmp_path / "scribe"   # per-instance from input_dir
+
+
+def test_writer_appends_to_dedicated_sink_with_ts(tmp_path):
+    capture = str(tmp_path / "scribe")
     body = _render(subjective=[{"claim": "Chest pain for two days", "source_spans": ["S1"]}])
-    nf.record_notegen_edit_outcome(enrollment_dir=enroll, grounding_flags=None,
+    nf.record_notegen_edit_outcome(capture_dir=capture, grounding_flags=None,
                                    draft_original=body, attested_body=body, source_id="enc-1")
-    rows = _rows(enroll)
+    rows = _rows(capture)
     assert len(rows) == 1
     assert rows[0]["kind"] == "notegen_edit" and rows[0]["ts"]
     assert rows[0]["template_id"] == "soap" and rows[0]["template_version"] == 0
     assert nf.phi_free_violations(rows[0]) == []             # the written row is PHI-free
+    # the DEDICATED sink is NOT the voice sink — nothing under a learning/ subdir
+    assert not (tmp_path / "scribe" / "learning").exists()
 
 
 def test_dormant_is_observable_one_time(tmp_path):
     import structlog
     nf._DORMANT["warned"] = False                            # reset the module latch for the test
     with structlog.testing.capture_logs() as cap:
-        nf.record_notegen_edit_outcome(enrollment_dir="", grounding_flags=None,
+        nf.record_notegen_edit_outcome(capture_dir="", grounding_flags=None,
                                        draft_original="x", attested_body="x", source_id="enc-1")
-        nf.record_notegen_edit_outcome(enrollment_dir="", grounding_flags=None,
+        nf.record_notegen_edit_outcome(capture_dir="", grounding_flags=None,
                                        draft_original="x", attested_body="x", source_id="enc-2")
     dormant = [e for e in cap if e.get("event") == "scribe.notegen_feedback.capture_dormant"]
     assert len(dormant) == 1                                 # ONE-TIME (latched), not per-attest spam
-    assert not (tmp_path / "enroll").exists()                # dormant → no sink materialized
+    assert not (tmp_path / "scribe").exists()                # dormant → no sink materialized
 
 
 def test_capture_error_is_swallowed(tmp_path, monkeypatch):
@@ -268,7 +280,7 @@ def test_capture_error_is_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(nf, "compute_notegen_edit_row", _boom)
     import structlog
     with structlog.testing.capture_logs() as cap:
-        nf.record_notegen_edit_outcome(enrollment_dir=str(tmp_path / "enroll"), grounding_flags=None,
+        nf.record_notegen_edit_outcome(capture_dir=str(tmp_path / "scribe"), grounding_flags=None,
                                        draft_original="x", attested_body="x", source_id="enc-1")  # no raise
     assert [e for e in cap if e.get("event") == "scribe.notegen_feedback.capture_error"]
 
@@ -290,12 +302,29 @@ def _make_draft(vault, *, draft_original, body):
 
 
 def test_attest_wires_the_capture(tmp_path):
-    enroll = str(tmp_path / "enroll")
+    # The notegen capture rides the DEDICATED notegen_feedback_dir (decoupled from the voice
+    # enrollment_dir at #14/#26 go-live) — the row lands in that sink, NOT the enrollment sink.
+    capture = str(tmp_path / "scribe")
     body = _render(subjective=[{"claim": "Chest pain for two days", "source_spans": ["S1"]}])
     rel = _make_draft(tmp_path, draft_original=body, body=body)
     attest(tmp_path, rel, new_status="attested", attester="np_jamie", clinician_ids=_CLINICIANS,
-           audit_path=tmp_path / "audit.jsonl", now=_NOW, enrollment_dir=enroll)
-    assert len(_rows(enroll)) == 1                            # a notegen_edit row landed
+           audit_path=tmp_path / "audit.jsonl", now=_NOW, enrollment_dir=str(tmp_path / "enroll"),
+           notegen_feedback_dir=capture)
+    assert len(_rows(capture)) == 1                           # a notegen_edit row landed in the scribe sink
+    assert not _rows(tmp_path / "enroll")                     # NOT in the voice enrollment sink
+
+
+def test_attest_captures_without_voice_enrollment(tmp_path):
+    # THE go-live decouple, contract-first: an instance that attests WITHOUT voice enrollment
+    # (enrollment_dir unset) STILL captures notegen_edit feedback — the former mis-coupling captured
+    # ZERO rows in this case. Only the dedicated notegen_feedback_dir need be set.
+    capture = str(tmp_path / "scribe")
+    body = _render(subjective=[{"claim": "Chest pain for two days", "source_spans": ["S1"]}])
+    rel = _make_draft(tmp_path, draft_original=body, body=body)
+    attest(tmp_path, rel, new_status="attested", attester="np_jamie", clinician_ids=_CLINICIANS,
+           audit_path=tmp_path / "audit.jsonl", now=_NOW, enrollment_dir="",
+           notegen_feedback_dir=capture)
+    assert len(_rows(capture)) == 1                           # captured despite no voice enrollment
 
 
 def test_attest_capture_error_never_fails_the_attest(tmp_path, monkeypatch):
@@ -306,5 +335,36 @@ def test_attest_capture_error_never_fails_the_attest(tmp_path, monkeypatch):
     rel = _make_draft(tmp_path, draft_original=body, body=body)
     result = attest(tmp_path, rel, new_status="attested", attester="np_jamie",
                     clinician_ids=_CLINICIANS, audit_path=tmp_path / "audit.jsonl", now=_NOW,
-                    enrollment_dir=str(tmp_path / "enroll"))
+                    enrollment_dir=str(tmp_path / "enroll"), notegen_feedback_dir=str(tmp_path / "scribe"))
     assert result and frontmatter.load(str(tmp_path / rel))["status"] == "attested"
+
+
+def test_attest_CLI_threads_notegen_feedback_dir(tmp_path):
+    # cmd_scribe is the ONLY production caller of attest(); the notegen loop rides a single
+    # notegen_feedback_dir kwarg (cli.py resolves it per-instance from input_dir). Because the capture
+    # is fail-silent BY DESIGN, a dropped kwarg produces ZERO runtime signal — the loop just stops
+    # accumulating. Drive the REAL CLI path and assert a row lands in <input_dir parent>/scribe.
+    import yaml
+    from alfred.cli import build_parser, cmd_scribe
+
+    body = _render(subjective=[{"claim": "Chest pain for two days", "source_spans": ["S1"]}])
+    rel = _make_draft(tmp_path, draft_original=body, body=body)
+    cfg = {
+        "vault": {"path": str(tmp_path)},
+        "logging": {"dir": str(tmp_path / "data")},
+        "scribe": {
+            "input_dir": str(tmp_path / "inbox"),        # → notegen sink dir = <tmp>/scribe/
+            "encounter_salt": "DUMMY_SCRIBE_TEST_SALT",
+            "stt": {"provider": "fake"},
+            "clinicians": ["np_jamie"],
+            "diarize": {"provider": "fake"},              # no enrollment_dir — voice enrollment absent
+        },
+    }
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    args = build_parser().parse_args(
+        ["--config", str(config), "scribe", "attest", rel, "--attester", "np_jamie"])
+    cmd_scribe(args)
+
+    assert len(_rows(tmp_path / "scribe")) == 1              # the CLI threaded the dir; a row landed

@@ -16,7 +16,6 @@ import frontmatter
 import pytest
 
 from alfred.scribe import SCRIBE_DRAFTER_IDENTITY
-from alfred.scribe import enroll_learning as el
 from alfred.scribe import notegen_feedback as nf
 from alfred.scribe.attest import attest
 from alfred.sovereign.boundary import CLOUD_KEY_ENV_VARS
@@ -114,8 +113,10 @@ def test_widening_pin_rejects_claim_string_in_quality_survival():
 # Side-effect-free through the real attest() + wiring
 # ===========================================================================
 
-def _rows(enroll):
-    p = el._capture_path(enroll)
+def _rows(capture_dir):
+    # #14/#26 go-live — the notegen_edit rows live in the DEDICATED scribe-level sink now, NOT the
+    # voice enrollment sink (decoupled from enrollment_dir).
+    p = nf._notegen_sink_path(capture_dir)
     return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()
             if x.strip() and json.loads(x).get("kind") == "notegen_edit"] if p.is_file() else []
 
@@ -130,14 +131,17 @@ def _make_draft(vault, *, quality_flags, body):
 
 
 def test_attest_captures_quality_survival(tmp_path):
-    enroll = str(tmp_path / "enroll")
+    # #14/#26 go-live — the notegen capture rides the DEDICATED notegen_feedback_dir (decoupled from
+    # the voice enrollment_dir); the row lands in that sink, so pass + read it.
+    capture = str(tmp_path / "scribe")
     # draft flagged assessment_no_plan; the clinician ADDED a plan in the attested body → ACTED.
     rel = _make_draft(tmp_path, quality_flags=[_qflag("quality_assessment_no_plan")],
                       body="## Assessment\n- b [S1]\n\n## Plan\n- ibuprofen [S1]\n")
     attest(tmp_path, rel, new_status="attested", attester="np_jamie", clinician_ids=_CLINICIANS,
-           audit_path=tmp_path / "audit.jsonl", now=_NOW, enrollment_dir=enroll,
+           audit_path=tmp_path / "audit.jsonl", now=_NOW, enrollment_dir=str(tmp_path / "enroll"),
+           notegen_feedback_dir=capture,
            quality_succinctness_target=25, quality_required_sections=_REQUIRED)
-    rows = _rows(enroll)
+    rows = _rows(capture)
     assert len(rows) == 1
     assert rows[0]["quality_survival"]["quality_assessment_no_plan"]["acted"] == 1   # clinician acted
 
@@ -148,8 +152,12 @@ def test_attest_quality_survival_capture_never_fails_attest(tmp_path, monkeypatc
     monkeypatch.setattr(nf, "_quality_survival", _boom)
     rel = _make_draft(tmp_path, quality_flags=[_qflag("quality_assessment_no_plan")],
                       body="## Assessment\n- b [S1]\n\n## Plan\n- c [S1]\n")
+    # notegen_feedback_dir MUST be set so the capture actually RUNS and hits the monkeypatched boom —
+    # otherwise the capture goes dormant before _quality_survival and the swallow path is never exercised
+    # (green-but-vacuous). This drives the real error → SWALLOWED → attest unaffected assertion.
     result = attest(tmp_path, rel, new_status="attested", attester="np_jamie", clinician_ids=_CLINICIANS,
                     audit_path=tmp_path / "audit.jsonl", now=_NOW, enrollment_dir=str(tmp_path / "enroll"),
+                    notegen_feedback_dir=str(tmp_path / "scribe"),
                     quality_succinctness_target=25, quality_required_sections=_REQUIRED)
     assert result and frontmatter.load(str(tmp_path / rel))["status"] == "attested"   # attest UNAFFECTED
 

@@ -2758,6 +2758,7 @@ def cmd_scribe(args: argparse.Namespace) -> None:
     from alfred.scribe.config import load_from_unified as load_scribe_config
     from alfred.scribe.attest import attest as scribe_attest
     from alfred.scribe.negation_suppression import resolve_candidates_dir
+    from alfred.scribe.notegen_feedback import resolve_notegen_feedback_dir
     from alfred.sovereign import (
         SovereignBoundaryError,
         install_sovereign_http_guard,
@@ -2852,6 +2853,11 @@ def cmd_scribe(args: argparse.Namespace) -> None:
                 # single kwarg (a dropped kwarg → the loop silently stops accumulating, so a test
                 # drives the real CLI path to pin it). Derived per-instance from input_dir.
                 negation_candidates_dir=resolve_candidates_dir(cfg),
+                # #14/#26 go-live — the DEDICATED scribe-level notegen-edit capture sink
+                # (<input_dir parent>/scribe/notegen_edit.jsonl), DECOUPLED from the voice enrollment_dir
+                # so note-gen edit feedback captures regardless of voice enrollment. Per-instance from
+                # input_dir (mirror of resolve_candidates_dir); a dropped kwarg → the loop silently stops.
+                notegen_feedback_dir=resolve_notegen_feedback_dir(cfg),
                 # #14e-ii — the active profile's succinctness target + required sections drive the
                 # quality-flag SURVIVAL re-check at attest (acted vs ignored). Resolved via the TOTAL
                 # resolver (DEFAULT when absent/corrupt) → never fails. Current-target-with-drift is
@@ -3984,7 +3990,7 @@ def _cmd_scribe_notegen_feedback(args: argparse.Namespace) -> None:
     cfg = load_scribe_config(raw)
 
     if fcmd == "status":
-        rows = _nf.read_notegen_edit_rows(cfg.diarize.enrollment_dir)
+        rows = _nf.read_notegen_edit_rows(_nf.resolve_notegen_feedback_dir(cfg))
         agg = _nf.aggregate_feedback(rows)
         if getattr(args, "json", False):
             print(json.dumps(agg, indent=2))

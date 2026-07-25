@@ -21,7 +21,10 @@ best-effort, none silently deleting:
   4. **diarize_stats rolling prune** (§0.1 / §4 — absorbs the queued P4-5b unowned 180-day prune):
      an age-based row drop on the PHI-FREE telemetry sink, atomic temp→replace rewrite, corrupt/torn
      rows preserved-not-fatal. Emits NO ``retention.*`` event (it is log rotation, not a PHI
-     destruction) — counted in the sweep summary.
+     destruction) — counted in the sweep summary. Its SIBLING, the **notegen_edit rolling prune**
+     (#14/#26), applies the SAME posture to the DEDICATED scribe-level notegen sink (decoupled from the
+     voice sink at go-live) — moved in lockstep with the decouple so the relocated source-linked rows
+     are not left un-pruned (counted separately as ``pruned_notegen_edit_rows``).
 
 INTENTIONALLY-LEFT-BLANK: every tick emits a ``scribe.retention.sweep`` summary so "ran, nothing to
 do" is distinguishable from "the sweep is broken." Per-encounter failures are ISOLATED (one bad
@@ -64,6 +67,11 @@ from alfred.scribe.config import (
 )
 from alfred.scribe.enroll_learning import CAPTURE_NAME, LEARNING_DIRNAME, capture_sink_lock
 from alfred.scribe.identity import EncounterIdentityError, compute_encounter_id
+from alfred.scribe.notegen_feedback import (
+    NOTEGEN_CAPTURE_NAME,
+    notegen_capture_lock,
+    resolve_notegen_feedback_dir,
+)
 from alfred.scribe.negation_suppression import (
     NEGATION_CANDIDATE_AGE_CAP_DAYS,
     NEGATION_REVIEW_SPOOL_NAME,
@@ -128,6 +136,7 @@ class RetentionSweepSummary:
     skipped: int = 0                 # not eligible (still accumulating / closed-but-not-ready / in grace)
     encounter_errors: int = 0        # per-encounter failures, ISOLATED (the sweep continued)
     pruned_telemetry_rows: int = 0   # diarize_stats rows dropped (age-based, PHI-free log rotation)
+    pruned_notegen_edit_rows: int = 0  # #14/#26 notegen_edit rows dropped (age-based, PHI-free log rotation)
     pruned_negation_candidate_rows: int = 0  # #26 derived-PHI candidate/attest rows dropped (age-cap)
     pending_negation_candidates: int = 0     # #26 review-ready count for the PHI-free relay spool
     review_due: int = 0              # §4 over-window PHI classes surfaced (0 until 13c's schedule)
@@ -141,7 +150,7 @@ class RetentionSweepSummary:
         return (self.sealed_ready + self.sealed_abandoned + self.already_sealed
                 + self.transient_wiped + self.verify_failed + self.empty_disposed
                 + self.wipe_incomplete + self.recovery_mismatch + self.pruned_telemetry_rows
-                + self.encounter_errors + self.review_due)
+                + self.pruned_notegen_edit_rows + self.encounter_errors + self.review_due)
 
     def needs_operator_attention(self) -> bool:
         """wipe_incomplete / recovery_mismatch are FAIL-CLOSED states that leave PHI on disk or a
@@ -247,6 +256,17 @@ class RetentionSweep:
                             detail="the telemetry-prune leg hit an unsearchable dir (EACCES) — isolated "
                                    "so the sweep summary + escalation still emit. Latched.")
 
+        # (4c) #14/#26 notegen-edit rolling prune — the DEDICATED scribe-level PHI-free telemetry sink
+        # (decoupled from the voice sink at go-live); SAME posture as the diarize prune (log rotation, no
+        # retention.* event, preserve-undateable). MOVED in lockstep with the sink decouple — an
+        # un-pruned source-linked sink is a retention gap.
+        try:
+            summary.pruned_notegen_edit_rows = self._prune_notegen_edit(now_dt, schedule)
+        except OSError:
+            self._latch_log("notegen_prune_eacces", "scribe.retention.sweep.notegen_prune_leg_eacces",
+                            detail="the #14/#26 notegen-edit telemetry prune hit an unsearchable dir "
+                                   "(EACCES) — isolated so the sweep summary still emits. Latched.")
+
         # (4b) #26 negation-candidate AGE-CAP prune — drop un-reviewed DERIVED-PHI candidate/attest
         # rows older than the cap so an un-actioned PHI row can't linger. Unlike the PHI-FREE diarize
         # sink (which PRESERVES undateable rows), this PHI-bearing sink DROPS an undateable row
@@ -284,6 +304,7 @@ class RetentionSweep:
             skipped=summary.skipped,
             encounter_errors=summary.encounter_errors,
             pruned_telemetry_rows=summary.pruned_telemetry_rows,
+            pruned_notegen_edit_rows=summary.pruned_notegen_edit_rows,
             review_due=summary.review_due,
             sealing_available=summary.sealing_available,
             schedule_present=summary.schedule_present,
@@ -695,23 +716,74 @@ class RetentionSweep:
             #           processed — swallow it so the tick's summary + operator-attention still emit
         if not sink_present:
             return 0
-        prune_days = _DIARIZE_STATS_PRUNE_DAYS
-        if schedule is not None:
-            window = sched_mod.class_window_days(schedule, sched_mod.TELEMETRY_CLASS)
-            if window is None:
-                # the published schedule declares diarize_stats NEVER-pruned → skip the rolling prune.
-                self._latch_log(
-                    "diarize_never_pruned",
-                    "scribe.retention.sweep.diarize_stats_never_pruned",
-                    detail="the published s.50 schedule declares diarize_stats never-pruned "
-                           "(window_days null) — the telemetry rolling prune is SKIPPED (deliberate, "
-                           "not broken). Latched once.")
-                return 0
-            prune_days = window
+        prune_days = self._telemetry_prune_window(
+            schedule,
+            latch_key="diarize_never_pruned",
+            latch_event="scribe.retention.sweep.diarize_stats_never_pruned",
+            detail="the published s.50 schedule declares diarize_stats never-pruned (window_days null) — "
+                   "the telemetry rolling prune is SKIPPED (deliberate, not broken). Latched once.")
+        if prune_days is None:
+            return 0
         cutoff = now_dt - timedelta(days=prune_days)
         # Hold the sink lock across READ + REWRITE (finding 19) so a concurrent attest-CLI append is
         # serialized, not clobbered by the read-then-replace snapshot.
         with capture_sink_lock(enrollment_dir):
+            return self._prune_sink_locked(sink, cutoff)
+
+    def _telemetry_prune_window(self, schedule: dict | None, *, latch_key: str, latch_event: str,
+                                detail: str) -> int | None:
+        """The rolling-prune window (days) for a PHI-FREE telemetry sink: the published schedule's
+        ``TELEMETRY_CLASS`` (diarize_stats) window, or the fixed 180d fallback with NO schedule. Returns
+        ``None`` (SKIP the prune, latched) when the schedule declares that class never-pruned
+        (``window_days: null``) — a deliberate no-prune distinguishable from a broken one. SHARED by the
+        diarize + notegen telemetry prunes so both honor the SAME schedule class consistently; each caller
+        passes its OWN latch key so the two never-pruned signals stay independent."""
+        if schedule is None:
+            return _DIARIZE_STATS_PRUNE_DAYS
+        window = sched_mod.class_window_days(schedule, sched_mod.TELEMETRY_CLASS)
+        if window is None:
+            self._latch_log(latch_key, latch_event, detail=detail)
+            return None
+        return window
+
+    def _prune_notegen_edit(self, now_dt: datetime, schedule: dict | None = None) -> int:
+        """Age-based rolling prune of the DEDICATED PHI-FREE ``notegen_edit`` telemetry sink
+        (``<input_dir parent>/scribe/notegen_edit.jsonl`` — decoupled from the voice sink at the #14/#26
+        go-live hardening). SAME posture as :meth:`_prune_diarize_stats`: PRESERVES every undateable/torn
+        row (age-based, fail-open), atomic temp→replace rewrite (never a torn sink), emits NO
+        ``retention.*`` event (log rotation, not a PHI destruction), and the SAME telemetry window
+        (schedule ``TELEMETRY_CLASS`` / 180d fallback / never-pruned skip). Its OWN capture lock
+        (:func:`notegen_capture_lock`) serializes vs the attest-CLI append (finding-19 sibling on the
+        dedicated sink). Returns the row count dropped (folded into the sweep summary — ILB).
+
+        This MOVED in lockstep with the sink decouple: the relocated ``notegen_edit`` rows are PHI-free
+        but SOURCE-LINKED (carry an opaque ``source_id``), so leaving them un-pruned would be a retention
+        gap. The diarize prune is UNCHANGED (diarize_stats/attest_outcome stay in the voice sink).
+
+        GO-LIVE CHECK (#14/#26 decouple, no data migration — STAY-C ships inert pre-go-live): at
+        go-live, confirm the OLD shared voice sink ``<enrollment_dir>/learning/attest_capture.jsonl``
+        has NO stranded ``notegen_edit`` rows (there won't be — the decouple predates any real capture —
+        but it is cheap to verify; those rows would otherwise never be pruned from the voice sink, whose
+        prune only drops diarize_stats/attest_outcome)."""
+        capture_dir = resolve_notegen_feedback_dir(self._config)
+        sink = Path(capture_dir) / NOTEGEN_CAPTURE_NAME
+        try:
+            sink_present = sink.is_file()
+        except OSError:
+            return 0  # D5: a stat-EACCES on the scribe dir must not escape — swallow so the tick's
+            #           summary + operator-attention still emit (mirrors the diarize prune)
+        if not sink_present:
+            return 0  # no notegen sink yet (no attests / dormant) — nothing to prune (summary shows 0)
+        prune_days = self._telemetry_prune_window(
+            schedule,
+            latch_key="notegen_never_pruned",
+            latch_event="scribe.retention.sweep.notegen_edit_never_pruned",
+            detail="the published s.50 schedule declares the telemetry class never-pruned (window_days "
+                   "null) — the notegen_edit rolling prune is SKIPPED (deliberate, not broken). Latched once.")
+        if prune_days is None:
+            return 0
+        cutoff = now_dt - timedelta(days=prune_days)
+        with notegen_capture_lock(capture_dir):
             return self._prune_sink_locked(sink, cutoff)
 
     def _prune_sink_locked(self, sink: Path, cutoff: datetime) -> int:

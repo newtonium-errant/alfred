@@ -3,12 +3,14 @@
 The CAPTURE half (part 1) of the P4-5 self-correcting loop, and the enroll audit
 trail. Two append-only JSONL sinks under ``<enrollment_dir>/``:
 
-  * ``learning/attest_capture.jsonl`` — the THREE self-correcting capture event kinds
-    (``diarize_stats`` per chunk/rollup, ``attest_outcome`` at attest, and ``notegen_edit``
-    at attest — the #14 note-gen edit-diff row). All share one flock, one retention prune,
-    and one dormancy gate: FAIL-SILENT (a capture bug never touches the pipeline / the
-    medico-legal attest path) and PHI-FREE BY CONSTRUCTION — ids, enums, booleans, scalars,
-    counts ONLY (never a name/label/transcript/note text).
+  * ``learning/attest_capture.jsonl`` — the TWO VOICE self-correcting capture event kinds
+    (``diarize_stats`` per chunk/rollup, ``attest_outcome`` at attest). They share one flock,
+    one retention prune, and one dormancy gate: FAIL-SILENT (a capture bug never touches the
+    pipeline / the medico-legal attest path) and PHI-FREE BY CONSTRUCTION — ids, enums,
+    booleans, scalars, counts ONLY (never a name/label/transcript/note text). NOTE: the #14
+    ``notegen_edit`` row was DECOUPLED (#14/#26 go-live) onto its OWN scribe-level sink with its
+    OWN flock + prune — see ``notegen_feedback`` — because note-gen edit feedback has nothing to
+    do with VOICE enrollment (the old shared-sink coupling captured ZERO rows without voice enrollment).
   * ``audit.log`` — enroll lifecycle events, ``preset_id``-ONLY (never a name; the
     ``presets audit`` CLI joins names at display time).
 
@@ -85,7 +87,8 @@ AUDIT_NAME = "audit.log"
 
 KIND_DIARIZE_STATS = "diarize_stats"
 KIND_ATTEST_OUTCOME = "attest_outcome"
-KIND_NOTEGEN_EDIT = "notegen_edit"   # #14 item-11 — note-gen edit-diff capture (PHI-free, shared sink)
+# NOTE: the #14 ``notegen_edit`` row kind + its writer were DECOUPLED to a dedicated scribe-level sink
+# (#14/#26 go-live) — see ``notegen_feedback.KIND_NOTEGEN_EDIT`` / ``record_notegen_edit``.
 
 
 def _now() -> str:
@@ -260,23 +263,6 @@ def record_attest_outcome(
     except Exception:  # noqa: BLE001 — capture must NEVER fail a valid attest
         log.warning("scribe.enroll_learning.capture_error", kind=KIND_ATTEST_OUTCOME,
                     source_id=source_id, detail="attest_outcome capture failed — SWALLOWED")
-
-
-def record_notegen_edit(enrollment_dir: str | Path, *, row: dict[str, Any]) -> None:
-    """Append a #14 ``notegen_edit`` row to the SHARED ``attest_capture.jsonl`` sink — one flock, one
-    retention prune, one dormancy gate with the diarize/attest_outcome captures (design §2.3: do NOT
-    open a second sink surface). The ``row`` is the PHI-FREE closed-frozenset payload built by
-    ``notegen_feedback.compute_notegen_edit_row`` (kind + per-section counts/deltas/enums ONLY,
-    widening-pinned there); this writer just stamps ``ts`` and appends. FAIL-SILENT + PHI-FREE."""
-    if not str(enrollment_dir or ""):
-        return                      # store DORMANT (the OBSERVABLE one-time signal is emitted upstream
-        #                             in notegen_feedback.record_notegen_edit_outcome, not here)
-    try:
-        _append_jsonl(_capture_path(enrollment_dir), {"ts": _now(), **row},
-                      enrollment_dir=enrollment_dir, lock_sink=True)   # serialize vs the prune (finding 19)
-    except Exception:  # noqa: BLE001 — capture must NEVER fail a valid attest / the pipeline
-        log.warning("scribe.enroll_learning.capture_error", kind=KIND_NOTEGEN_EDIT,
-                    source_id=row.get("source_id"), detail="notegen_edit capture failed — SWALLOWED")
 
 
 def has_diarize_stats_for(
