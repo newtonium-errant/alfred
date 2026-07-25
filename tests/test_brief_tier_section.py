@@ -2251,6 +2251,50 @@ def test_render_t3_entry_done_is_struck() -> None:
     assert _render_t3_entry(e) == "- ~~Rake leaves~~ ✓"
 
 
+def test_render_t3_entry_stale_done_at_renders_plain_when_date_threaded() -> None:
+    """#20 P5 NOTE-2 (same-render-date guard): with the render date threaded,
+    a ``done_at`` from a DIFFERENT day renders PLAIN — a stale / mis-dated
+    ``done_at`` can never falsely read 'done today'. Same-day → still struck."""
+    from alfred.brief.tier_section import _render_t3_entry
+    e = T3Entry(item="Rake leaves", source="operator-adhoc", done_at="2026-05-27")
+    assert _render_t3_entry(e, "2026-05-28") == "- Rake leaves"          # stale → plain
+    assert _render_t3_entry(e, "2026-05-27") == "- ~~Rake leaves~~ ✓"    # same day → struck
+
+
+def test_render_t3_entry_none_date_falls_back_to_presence() -> None:
+    """A date-less caller (``today_iso=None``, incl. the default arg) keeps the
+    prior presence-based ✓-strike — byte-stable for shape-preview callers."""
+    from alfred.brief.tier_section import _render_t3_entry
+    e = T3Entry(item="Rake leaves", source="operator-adhoc", done_at="2026-05-27")
+    assert _render_t3_entry(e, None) == "- ~~Rake leaves~~ ✓"
+    assert _render_t3_entry(e) == "- ~~Rake leaves~~ ✓"
+
+
+def test_morning_brief_strikes_done_t3_only_on_render_date(tmp_path: Path) -> None:
+    """#20 P5 NOTE-2, INTEGRATION: the morning brief threads the render date
+    (``render_tier_section`` → ``_render_curated_shortlists`` → ``_render_t3_entry``),
+    so a same-day ``done_at`` is ✓-struck but a stale ``done_at`` (a rollover /
+    mis-dated-write anomaly) renders PLAIN — defense-in-depth on the back-dating
+    invariant. NOW.date() == 2026-05-28."""
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t3:\n"
+            "  - item: Rake leaves\n"
+            "    source: operator-adhoc\n"
+            "    done_at: '2026-05-28'\n"      # == render date → struck
+            "  - item: Wash car\n"
+            "    source: operator-adhoc\n"
+            "    done_at: '2026-05-27'\n"      # stale (yesterday) → the guard target
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    assert "- ~~Rake leaves~~ ✓" in body        # same-day done → struck (progress snapshot)
+    assert "- Wash car" in body                 # stale done → PLAIN
+    assert "~~Wash car~~" not in body            # NOT falsely struck as done-today
+
+
 def test_curated_for_today_drops_done_t3_when_today_threaded() -> None:
     """``/today`` DROPS a T3 item checked off today (``done_at == today``)
     while keeping the open one — the operator-committed view stays clean."""

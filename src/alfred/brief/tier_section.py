@@ -491,7 +491,7 @@ def _render_auto_t2_routine_entry(candidate: Any) -> str:
     )
 
 
-def _render_t3_entry(entry: T3Entry) -> str:
+def _render_t3_entry(entry: T3Entry, today_iso: str | None = None) -> str:
     """Render one T3 line — bare free-text item (no confirm affordance).
 
     Note T3 entries carry ``item:`` (free-text) not ``task:`` (wikilink).
@@ -501,13 +501,21 @@ def _render_t3_entry(entry: T3Entry) -> str:
     stays VISIBLE as progress toward the balanced-day goal — contrast
     ``/today`` (:func:`render_curated_tier_section_for_today`), which
     DROPS done T3 to keep the committed "what's on my plate" view clean.
-    A daily file only ever carries a same-day ``done_at`` (T3 never rolls
-    over, and ``tier_done`` back-dates into the completion date's OWN
-    file), so "``done_at`` present" == "done for the rendered day". An
+
+    #20 P5 NOTE-2 (same-render-date guard): a daily file SHOULD only ever
+    carry a same-day ``done_at`` (T3 never rolls over, and ``tier_done``
+    back-dates into the completion date's OWN file). This render no longer
+    TRUSTS that invariant — when the caller threads the render date
+    (``today_iso``), an entry is ✓-struck ONLY when ``done_at ==
+    today_iso`` (mirroring the ``/today`` drop-filter's date-equality),
+    so a stale / mis-dated ``done_at`` renders PLAIN rather than falsely
+    reading "done today". ``today_iso is None`` (a date-less caller — e.g.
+    a shape preview) falls back to the prior presence-based ✓-strike. An
     unmarked item (``done_at`` None — the common case) is byte-identical
-    to the pre-Arc-#20 ``- {item}`` render.
+    to the pre-Arc-#20 ``- {item}`` render under both modes.
     """
-    if getattr(entry, "done_at", None):
+    done_at = getattr(entry, "done_at", None)
+    if done_at and (today_iso is None or done_at == today_iso):
         return f"- ~~{entry.item}~~ ✓"
     return f"- {entry.item}"
 
@@ -664,6 +672,7 @@ def _render_curated_shortlists(
     auto_t1_routine_candidates: list[Any],
     auto_t2_routine_candidates: list[Any],
     auto_t3_routine_candidates: list[Any] | None = None,
+    today_iso: str | None = None,
 ) -> str:
     """Compose the three ``### T1 / T2 / T3`` subsections.
 
@@ -794,7 +803,7 @@ def _render_curated_shortlists(
     has_auto_t3 = bool(auto_t3_routine_candidates)
     if has_curated_t3:
         for entry in curated_t3:
-            t3_lines.append(_render_t3_entry(entry))
+            t3_lines.append(_render_t3_entry(entry, today_iso))
         t3_lines.append("")
     if has_auto_t3:
         t3_lines.append(T3_AUTO_SECTION_HEADER)
@@ -1236,6 +1245,7 @@ def render_tier_section(
         auto_t1_routine_candidates,
         auto_t2_routine_candidates,
         auto_t3_routine_candidates,
+        today_iso=today.isoformat(),  # #20 P5 NOTE-2: ✓-strike done T3 only on the rendered day
     )
     pool = _render_t2_selection_pool(
         records,
