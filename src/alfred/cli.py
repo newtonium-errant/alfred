@@ -4301,7 +4301,12 @@ def cmd_mail(args: argparse.Namespace) -> None:
             print("No mail accounts configured. Add a 'mail' section to config.yaml.")
             print("See config.yaml.example for the format.")
             sys.exit(1)
-        total = fetch_all(config, vault_path)
+        # --flagged scopes to 'fetch: true' accounts (gmail today) — the daemon
+        # loop already runs only_flagged; this gives the manual CLI the same
+        # scope so a scoped/overnight drain doesn't also IMAP-fetch the dead
+        # live.ca/Outlook account. Absent → all accounts (byte-unchanged).
+        only_flagged = getattr(args, "flagged", False)
+        total = fetch_all(config, vault_path, only_flagged=only_flagged)
         print(f"Fetched {total} new email(s).")
         if not args.once:
             import time
@@ -4309,7 +4314,7 @@ def cmd_mail(args: argparse.Namespace) -> None:
             try:
                 while True:
                     time.sleep(config.poll_interval)
-                    total = fetch_all(config, vault_path)
+                    total = fetch_all(config, vault_path, only_flagged=only_flagged)
                     if total:
                         print(f"Fetched {total} new email(s).")
             except KeyboardInterrupt:
@@ -6404,6 +6409,8 @@ def build_parser() -> argparse.ArgumentParser:
     mail_sub = mail_p.add_subparsers(dest="mail_cmd")
     mail_fetch = mail_sub.add_parser("fetch", help="Fetch new emails from configured accounts")
     mail_fetch.add_argument("--once", action="store_true", default=False, help="Fetch once and exit (no polling)")
+    mail_fetch.add_argument("--flagged", action="store_true", default=False,
+                            help="Fetch only 'fetch: true' accounts (e.g. gmail), skipping webhook-delivered accounts — the daemon loop's scope, for a scoped/overnight drain")
     # #7 7b — read-only shadow parity capture (box-gated; touches no production state).
     mail_fetch.add_argument("--shadow", action="store_true", default=False,
                             help="READ-ONLY parity capture: fetch fetch:true accounts (EXAMINE + BODY.PEEK) into the gitignored shadow dir; no production state touched")
