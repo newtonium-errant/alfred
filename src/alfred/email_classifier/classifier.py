@@ -188,46 +188,26 @@ def _default_llm_caller(
     user: str,
     config: EmailClassifierConfig,
 ) -> str:
-    """Default LLM caller — Anthropic SDK in-process.
+    """Default LLM caller — Anthropic SDK in-process (via the shared root helper).
 
-    Returns the raw assistant text concatenating all ``text`` blocks from
-    the response. On SDK error returns an empty string so the caller's
-    sentinel-fallback path fires. We log the failure so it lands in the
-    curator's structured log alongside other ``email_classifier.*`` events.
+    Returns the raw assistant text concatenating all ``text`` blocks from the response. On SDK error
+    (or a missing SDK / missing key) returns an empty string so the caller's sentinel-fallback path
+    fires; the failure logs land under ``email_classifier.*`` in the curator's structured log. The
+    construct-client-and-call block is centralized in
+    :func:`alfred._anthropic_compat.call_anthropic_text` (shared with ``email_filing`` without either
+    importing the other; the Opus-``temperature`` quirk applies by construction there).
     """
-    try:
-        import anthropic
-    except ImportError:
-        log.warning("email_classifier.anthropic_not_installed")
-        return ""
+    from alfred._anthropic_compat import call_anthropic_text
 
-    api_key = config.anthropic.api_key
-    if not api_key or api_key.startswith("${"):
-        log.warning("email_classifier.no_api_key")
-        return ""
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=config.anthropic.model,
-            max_tokens=config.anthropic.max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-    except Exception as exc:  # noqa: BLE001 — must not crash post-processor
-        log.warning(
-            "email_classifier.llm_call_failed",
-            error=str(exc),
-            model=config.anthropic.model,
-        )
-        return ""
-
-    parts: list[str] = []
-    for block in getattr(response, "content", []) or []:
-        block_text = getattr(block, "text", None)
-        if isinstance(block_text, str):
-            parts.append(block_text)
-    return "".join(parts)
+    return call_anthropic_text(
+        api_key=config.anthropic.api_key,
+        model=config.anthropic.model,
+        max_tokens=config.anthropic.max_tokens,
+        system=system,
+        user=user,
+        log=log,
+        log_prefix="email_classifier",
+    )
 
 
 # --- Email detection --------------------------------------------------------

@@ -94,34 +94,22 @@ LLMCaller = Callable[[str, str, EmailFilingConfig], str]
 
 
 def _default_llm_caller(system: str, user: str, config: EmailFilingConfig) -> str:
-    """Default LLM caller — Anthropic SDK in-process. Returns raw assistant text, or "" on any error
-    (the caller treats "" as 'no category'). Mirrors email_classifier's caller; kept local (orthogonality)."""
-    try:
-        import anthropic
-    except ImportError:
-        log.warning("email_filing.anthropic_not_installed")
-        return ""
-    api_key = config.anthropic.api_key
-    if not api_key or api_key.startswith("${"):
-        log.warning("email_filing.no_api_key")
-        return ""
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=config.anthropic.model,
-            max_tokens=config.anthropic.max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-    except Exception as exc:  # noqa: BLE001 — must not crash the post-pass
-        log.warning("email_filing.llm_call_failed", error=str(exc), model=config.anthropic.model)
-        return ""
-    parts: list[str] = []
-    for block in getattr(response, "content", []) or []:
-        block_text = getattr(block, "text", None)
-        if isinstance(block_text, str):
-            parts.append(block_text)
-    return "".join(parts)
+    """Default LLM caller — Anthropic SDK in-process, via the shared root helper. Returns raw assistant
+    text, or "" on any error (the caller treats "" as 'no category'). The construct-client-and-call
+    block is centralized in :func:`alfred._anthropic_compat.call_anthropic_text` (shared with
+    ``email_classifier`` WITHOUT either importing the other — the root helper is the orthogonality
+    seam; failures log under ``email_filing.*``)."""
+    from alfred._anthropic_compat import call_anthropic_text
+
+    return call_anthropic_text(
+        api_key=config.anthropic.api_key,
+        model=config.anthropic.model,
+        max_tokens=config.anthropic.max_tokens,
+        system=system,
+        user=user,
+        log=log,
+        log_prefix="email_filing",
+    )
 
 
 def _build_fallback_system(config: EmailFilingConfig) -> str:
