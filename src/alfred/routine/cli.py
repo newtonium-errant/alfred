@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ import frontmatter  # type: ignore[import-untyped]
 import structlog
 import yaml
 
+from alfred.common.file_lock import file_rmw_lock
 from alfred.vault.scope import ScopeError
 
 from .aggregator import run_aggregator_once
@@ -1043,187 +1045,192 @@ def cmd_done(
     assert resolved_path is not None  # narrowing
     path = resolved_path
 
-    # ---- Load record + completion_log --------------------------------
-    post = frontmatter.load(str(path))
-    fm = dict(post.metadata or {})
+    with file_rmw_lock(path):
+        # ---- Load record + completion_log --------------------------------
+        post = frontmatter.load(str(path))
+        fm = dict(post.metadata or {})
 
-    completion_log_raw = fm.get("completion_log") or {}
-    if not isinstance(completion_log_raw, dict):
-        # Operator hand-edit dropped the dict — restore.
-        log.warning(
-            "routine.cli.completion_log_not_dict",
-            path=str(path),
-            type=type(completion_log_raw).__name__,
-        )
-        completion_log_raw = {}
-    completion_log: dict[str, list[str]] = {}
-    for key, val in completion_log_raw.items():
-        # Normalise: each value should be a list of ISO date strings.
-        # Tolerate scalar-as-single-list and YAML-native date objects.
-        if isinstance(val, list):
-            normalised: list[str] = []
-            for v in val:
-                if isinstance(v, date_type):
-                    normalised.append(v.isoformat())
-                elif isinstance(v, str):
-                    normalised.append(v)
-                else:
-                    log.debug(
-                        "routine.cli.skipping_bad_log_entry",
-                        key=str(key), value=repr(v),
-                    )
-            completion_log[str(key)] = normalised
-        elif isinstance(val, (str, date_type)):
-            completion_log[str(key)] = [
-                val.isoformat() if isinstance(val, date_type) else val
+        completion_log_raw = fm.get("completion_log") or {}
+        if not isinstance(completion_log_raw, dict):
+            # Operator hand-edit dropped the dict — restore.
+            log.warning(
+                "routine.cli.completion_log_not_dict",
+                path=str(path),
+                type=type(completion_log_raw).__name__,
+            )
+            completion_log_raw = {}
+        completion_log: dict[str, list[str]] = {}
+        for key, val in completion_log_raw.items():
+            # Normalise: each value should be a list of ISO date strings.
+            # Tolerate scalar-as-single-list and YAML-native date objects.
+            if isinstance(val, list):
+                normalised: list[str] = []
+                for v in val:
+                    if isinstance(v, date_type):
+                        normalised.append(v.isoformat())
+                    elif isinstance(v, str):
+                        normalised.append(v)
+                    else:
+                        log.debug(
+                            "routine.cli.skipping_bad_log_entry",
+                            key=str(key), value=repr(v),
+                        )
+                completion_log[str(key)] = normalised
+            elif isinstance(val, (str, date_type)):
+                completion_log[str(key)] = [
+                    val.isoformat() if isinstance(val, date_type) else val
+                ]
+            else:
+                completion_log[str(key)] = []
+
+        # ---- Verify item exists on this specific record ------------------
+        # When record_name was supplied explicitly, the strict + fuzzy
+        # cascade applies: strict text-equality first, then fuzzy on the
+        # record's items. When record_name was empty (vault-wide fuzzy
+        # already canonicalised item_text above), this is just a sanity
+        # pass — item_text WILL be in known_texts by construction.
+        raw_items = fm.get("items") or []
+        if not isinstance(raw_items, list):
+            raw_items = []
+        known_items: list[_ItemCandidate] = []
+        for it in raw_items:
+            if not isinstance(it, dict):
+                continue
+            t = str((it or {}).get("text") or "").strip()
+            if t:
+                known_items.append(_ItemCandidate(
+                    record_name=resolved_record,
+                    item_text=t,
+                    path=path,
+                ))
+        known_texts = {c.item_text for c in known_items}
+        if item_text not in known_texts:
+            # Fall through to fuzzy match on THIS record's items.
+            on_record_matches = [
+                c for c in known_items if _matches_item(item_text, c.item_text)
             ]
+            if not on_record_matches:
+                return _emit_canary(
+                    wants_json=wants_json,
+                    kind=DONE_KIND_UNKNOWN_ITEM,
+                    exit_code=1,
+                    message=(
+                        f"Item {item_text!r} not found on routine "
+                        f"{resolved_record!r}. Known items: "
+                        f"{sorted(known_texts) if known_texts else '(none)'}"
+                    ),
+                    payload={
+                        "item_text_input": item_text,
+                        "record": resolved_record,
+                        "known_items": sorted(known_texts),
+                    },
+                )
+            if len(on_record_matches) > 1:
+                return _emit_canary(
+                    wants_json=wants_json,
+                    kind=DONE_KIND_AMBIGUOUS_ITEM,
+                    exit_code=1,
+                    message=(
+                        f"{item_text!r} matches {len(on_record_matches)} "
+                        f"items on {resolved_record!r}. Ask back."
+                    ),
+                    payload={
+                        "item_text_input": item_text,
+                        "record": resolved_record,
+                        "candidates": [
+                            {"record": c.record_name, "item": c.item_text}
+                            for c in on_record_matches
+                        ],
+                    },
+                )
+            # Exactly one fuzzy match on this record — canonicalise.
+            item_text = on_record_matches[0].item_text
+
+        # ---- Idempotent append -------------------------------------------
+        existing = completion_log.get(item_text, [])
+        if iso in existing:
+            new_list = existing
+            appended = False
         else:
-            completion_log[str(key)] = []
+            new_list = existing + [iso]
+            appended = True
 
-    # ---- Verify item exists on this specific record ------------------
-    # When record_name was supplied explicitly, the strict + fuzzy
-    # cascade applies: strict text-equality first, then fuzzy on the
-    # record's items. When record_name was empty (vault-wide fuzzy
-    # already canonicalised item_text above), this is just a sanity
-    # pass — item_text WILL be in known_texts by construction.
-    raw_items = fm.get("items") or []
-    if not isinstance(raw_items, list):
-        raw_items = []
-    known_items: list[_ItemCandidate] = []
-    for it in raw_items:
-        if not isinstance(it, dict):
-            continue
-        t = str((it or {}).get("text") or "").strip()
-        if t:
-            known_items.append(_ItemCandidate(
-                record_name=resolved_record,
-                item_text=t,
-                path=path,
-            ))
-    known_texts = {c.item_text for c in known_items}
-    if item_text not in known_texts:
-        # Fall through to fuzzy match on THIS record's items.
-        on_record_matches = [
-            c for c in known_items if _matches_item(item_text, c.item_text)
-        ]
-        if not on_record_matches:
+        if not appended:
+            # Idempotent no-op: skip the write entirely (no point
+            # round-tripping the same content). Fire BOTH log events
+            # ONLY in plain-text mode:
+            #   * ``routine.cli.done`` with ``appended=False`` — the
+            #     pre-B1 contract, pinned by regression test
+            #     ``test_done_emits_log_event``. Preserved verbatim for
+            #     plain-text invocations so the observability surface
+            #     stays backwards-compatible.
+            #   * ``routine.cli.done.idempotent_noop`` — the B1 addition,
+            #     finer-grained signal that the canary path took the
+            #     idempotent branch.
+            #
+            # **Why suppress on ``wants_json``**: structlog's default sink
+            # writes log events to stdout in CLI process context, which
+            # interleaves the rendered log line with the JSON canary
+            # output. The talker subprocess wrapper expects single-line
+            # parseable JSON on stdout (per the reversed-LINE-scan
+            # pattern in :func:`alfred.telegram.conversation.
+            # _dispatch_routine_done`); the structlog line breaks that
+            # contract. The canary JSON IS the structured event for
+            # JSON-mode invocations — the ``kind`` field carries the same
+            # ``success`` / ``idempotent_noop`` signal the log events
+            # convey. Tests that need to pin the structlog emission use
+            # ``wants_json=False`` paths.
+            if not wants_json:
+                log.info(
+                    "routine.cli.done",
+                    record=resolved_record,
+                    item=item_text,
+                    date=iso,
+                    appended=False,
+                    path=str(path.relative_to(vault_path)),
+                )
+                log.info(
+                    "routine.cli.done.idempotent_noop",
+                    record=resolved_record,
+                    item=item_text,
+                    date=iso,
+                    path=str(path.relative_to(vault_path)),
+                )
             return _emit_canary(
                 wants_json=wants_json,
-                kind=DONE_KIND_UNKNOWN_ITEM,
-                exit_code=1,
+                kind=DONE_KIND_IDEMPOTENT_NOOP,
+                exit_code=0,
                 message=(
-                    f"Item {item_text!r} not found on routine "
-                    f"{resolved_record!r}. Known items: "
-                    f"{sorted(known_texts) if known_texts else '(none)'}"
+                    f"Already logged: {resolved_record} / {item_text} @ {iso}"
                 ),
                 payload={
-                    "item_text_input": item_text,
                     "record": resolved_record,
-                    "known_items": sorted(known_texts),
+                    "item": item_text,
+                    "date": iso,
+                    "path": str(path.relative_to(vault_path)),
+                    "appended": False,
                 },
             )
-        if len(on_record_matches) > 1:
-            return _emit_canary(
-                wants_json=wants_json,
-                kind=DONE_KIND_AMBIGUOUS_ITEM,
-                exit_code=1,
-                message=(
-                    f"{item_text!r} matches {len(on_record_matches)} "
-                    f"items on {resolved_record!r}. Ask back."
-                ),
-                payload={
-                    "item_text_input": item_text,
-                    "record": resolved_record,
-                    "candidates": [
-                        {"record": c.record_name, "item": c.item_text}
-                        for c in on_record_matches
-                    ],
-                },
-            )
-        # Exactly one fuzzy match on this record — canonicalise.
-        item_text = on_record_matches[0].item_text
 
-    # ---- Idempotent append -------------------------------------------
-    existing = completion_log.get(item_text, [])
-    if iso in existing:
-        new_list = existing
-        appended = False
-    else:
-        new_list = existing + [iso]
-        appended = True
+        completion_log[item_text] = new_list
+        fm["completion_log"] = completion_log
 
-    if not appended:
-        # Idempotent no-op: skip the write entirely (no point
-        # round-tripping the same content). Fire BOTH log events
-        # ONLY in plain-text mode:
-        #   * ``routine.cli.done`` with ``appended=False`` — the
-        #     pre-B1 contract, pinned by regression test
-        #     ``test_done_emits_log_event``. Preserved verbatim for
-        #     plain-text invocations so the observability surface
-        #     stays backwards-compatible.
-        #   * ``routine.cli.done.idempotent_noop`` — the B1 addition,
-        #     finer-grained signal that the canary path took the
-        #     idempotent branch.
-        #
-        # **Why suppress on ``wants_json``**: structlog's default sink
-        # writes log events to stdout in CLI process context, which
-        # interleaves the rendered log line with the JSON canary
-        # output. The talker subprocess wrapper expects single-line
-        # parseable JSON on stdout (per the reversed-LINE-scan
-        # pattern in :func:`alfred.telegram.conversation.
-        # _dispatch_routine_done`); the structlog line breaks that
-        # contract. The canary JSON IS the structured event for
-        # JSON-mode invocations — the ``kind`` field carries the same
-        # ``success`` / ``idempotent_noop`` signal the log events
-        # convey. Tests that need to pin the structlog emission use
-        # ``wants_json=False`` paths.
-        if not wants_json:
-            log.info(
-                "routine.cli.done",
-                record=resolved_record,
-                item=item_text,
-                date=iso,
-                appended=False,
-                path=str(path.relative_to(vault_path)),
-            )
-            log.info(
-                "routine.cli.done.idempotent_noop",
-                record=resolved_record,
-                item=item_text,
-                date=iso,
-                path=str(path.relative_to(vault_path)),
-            )
-        return _emit_canary(
-            wants_json=wants_json,
-            kind=DONE_KIND_IDEMPOTENT_NOOP,
-            exit_code=0,
-            message=(
-                f"Already logged: {resolved_record} / {item_text} @ {iso}"
-            ),
-            payload={
-                "record": resolved_record,
-                "item": item_text,
-                "date": iso,
-                "path": str(path.relative_to(vault_path)),
-                "appended": False,
-            },
-        )
-
-    completion_log[item_text] = new_list
-    fm["completion_log"] = completion_log
-
-    # Round-trip: frontmatter.dumps re-emits the file with the mutated
-    # metadata. We bypass ``vault_edit`` here because routine completion
-    # logging is a structured frontmatter mutation that doesn't fit the
-    # set_fields shape (per-key value-list append) and the Salem-only
-    # guard above is the operative gate.
-    new_post = frontmatter.Post(post.content, **fm)
-    # frontmatter.dumps uses ``yaml.safe_dump`` internally, which sorts
-    # keys by default. We want to preserve the operator's original key
-    # order — emit the frontmatter ourselves with sort_keys=False.
-    fm_yaml = yaml.dump(fm, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    out = f"---\n{fm_yaml}---\n\n{new_post.content}\n"
-    path.write_text(out, encoding="utf-8")
+        # Round-trip: frontmatter.dumps re-emits the file with the mutated
+        # metadata. We bypass ``vault_edit`` here because routine completion
+        # logging is a structured frontmatter mutation that doesn't fit the
+        # set_fields shape (per-key value-list append) and the Salem-only
+        # guard above is the operative gate.
+        new_post = frontmatter.Post(post.content, **fm)
+        # frontmatter.dumps uses ``yaml.safe_dump`` internally, which sorts
+        # keys by default. We want to preserve the operator's original key
+        # order — emit the frontmatter ourselves with sort_keys=False.
+        fm_yaml = yaml.dump(fm, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        out = f"---\n{fm_yaml}---\n\n{new_post.content}\n"
+        # Atomic write (torn-read fix); the enclosing file_rmw_lock is the
+        # lost-update fix -- both needed (see alfred.common.file_lock).
+        _tmp = path.with_name(path.name + ".tmp")
+        _tmp.write_text(out, encoding="utf-8")
+        os.replace(_tmp, path)
 
     # Suppress the legacy ``routine.cli.done`` structlog event in
     # JSON mode — structlog's stdout sink would interleave with the

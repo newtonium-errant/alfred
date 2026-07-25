@@ -76,6 +76,7 @@ at entry. Routine subsystem refuses non-Salem instances.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -83,6 +84,8 @@ from typing import Any, Callable
 import frontmatter  # type: ignore[import-untyped]
 import structlog
 import yaml
+
+from alfred.common.file_lock import file_rmw_lock
 
 from .cli import (
     ITEM_KIND_ADDED,
@@ -355,7 +358,11 @@ def _write_record_state(
         fm, default_flow_style=False, allow_unicode=True, sort_keys=False,
     )
     out = f"---\n{fm_yaml}---\n\n{post.content}\n"
-    record_path.write_text(out, encoding="utf-8")
+    # Atomic write (torn-read fix) — pairs with the file_rmw_lock in
+    # _atomic_item_mutate (lost-update fix). See alfred.common.file_lock.
+    tmp_path = record_path.with_name(record_path.name + ".tmp")
+    tmp_path.write_text(out, encoding="utf-8")
+    os.replace(tmp_path, record_path)
 
 
 def _atomic_item_mutate(
@@ -385,12 +392,18 @@ def _atomic_item_mutate(
     (duplicate-item check, cadence-conflict check, TOCTOU-disappeared
     check).
     """
-    fm, items, completion_log, post = _load_record_state(record_path)
-    result = mutator_fn(items, completion_log)
-    if not result.aborted:
-        _write_record_state(
-            record_path, fm, result.items, result.completion_log, post,
-        )
+    # Hold the cross-process RMW lock across the WHOLE read → mutate → write,
+    # on the SAME record-path sidecar that ``tier.promote`` locks — so
+    # concurrent routine writers (cmd_undone/add/remove/edit) + promote
+    # serialize instead of clobbering. The flock fixes lost updates;
+    # _write_record_state's atomic replace fixes torn reads.
+    with file_rmw_lock(record_path):
+        fm, items, completion_log, post = _load_record_state(record_path)
+        result = mutator_fn(items, completion_log)
+        if not result.aborted:
+            _write_record_state(
+                record_path, fm, result.items, result.completion_log, post,
+            )
     return result
 
 
