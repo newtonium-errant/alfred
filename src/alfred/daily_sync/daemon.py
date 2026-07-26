@@ -324,6 +324,27 @@ async def fire_once(
         dedupe_key=dedupe_key,
     )
 
+    # #30 PWA READ-ON-OPEN — best-effort spool of the assembled body for
+    # the web outbound read route (GET /web/outbound/daily_sync/latest).
+    # Symmetric with the brief daemon's spool: a spool failure must NEVER
+    # break the fire — the Telegram push + state save below are the
+    # primary path. Lazy import so daily_sync doesn't depend on the web
+    # package at module load.
+    try:
+        from alfred.web.outbound_store import write_latest
+
+        write_latest(
+            Path(config.state.path).parent, "daily_sync", today_iso, body,
+        )
+        log.info("daily_sync.web_outbound_written", date=today_iso)
+    except Exception as exc:  # noqa: BLE001 — spool never kills the fire
+        log.warning(
+            "daily_sync.web_outbound_write_failed",
+            date=today_iso,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+
     message_ids = await _push_via_transport(
         body, user_id, today_iso, dedupe_key=dedupe_key,
     )

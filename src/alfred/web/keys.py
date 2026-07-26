@@ -25,3 +25,9 @@ KEY_WEB_INFLIGHT = "web.inflight_session_keys"
 # (NOT module-global) for the same reason as KEY_WEB_INFLIGHT — concurrent
 # test apps in one process must not share the RTCPeerConnection registry.
 KEY_WEB_VOICE_MANAGER = "web.voice_manager"
+# The daemon's data dir (the ./data the brief/transport state lives under),
+# or ``None`` when the mount site didn't thread it. The outbound-read route
+# (routes_brief.py, #30) serves the brief/daily-sync spool from
+# ``<data_dir>/web_outbound/``; an unset dir reads as "nothing spooled"
+# (the intentionally-left-blank empty 200), never a crash.
+KEY_WEB_DATA_DIR = "web.data_dir"

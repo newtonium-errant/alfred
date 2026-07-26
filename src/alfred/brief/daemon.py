@@ -356,6 +356,25 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
 
     log.info("brief.written", path=rel_path)
 
+    # #30 PWA READ-ON-OPEN — best-effort spool of the rendered brief for
+    # the web outbound read route (GET /web/outbound/brief/latest).
+    # Mirrors the Telegram-push swallow below: the vault write above is
+    # the primary artifact, and a spool failure must NEVER break the run
+    # (nor the state update / Telegram push that follow). Lazy import so
+    # the brief daemon doesn't depend on the web package at module load.
+    try:
+        from alfred.web.outbound_store import write_latest
+
+        write_latest(data_dir, "brief", today, content)
+        log.info("brief.web_outbound_written", date=today)
+    except Exception as exc:  # noqa: BLE001 — spool never kills the run
+        log.warning(
+            "brief.web_outbound_write_failed",
+            date=today,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+
     # Update state
     state_mgr.state.add_run(BriefRun(
         date=today,

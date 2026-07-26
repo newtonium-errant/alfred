@@ -1710,6 +1710,18 @@ async def run(
                     system_prompt_provider=system_prompt_provider,
                     vault_context_str=vault_context_str,
                     allowed_user_ids=allowed_user_ids,
+                    # #30 outbound READ-ON-OPEN: the daemon's data dir (the
+                    # same parent the transport state file lives under) —
+                    # the /web/outbound read route serves the brief /
+                    # daily-sync spool from <data_dir>/web_outbound/.
+                    # transport_config is always set here (transport_app
+                    # is not None implies its assignment succeeded); the
+                    # None guard is belt-and-suspenders.
+                    data_dir=(
+                        str(Path(transport_config.state.path).parent)
+                        if transport_config is not None
+                        else None
+                    ),
                 )
         else:
             # Intentionally-left-blank: a disabled / unmountable web

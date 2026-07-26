@@ -58,6 +58,7 @@ from .keys import (
     KEY_WEB_ANTHROPIC,
     KEY_WEB_AUTH_STATE,
     KEY_WEB_CONFIG,
+    KEY_WEB_DATA_DIR,
     KEY_WEB_INFLIGHT,
     KEY_WEB_STATE_MGR,
     KEY_WEB_SYSTEM_PROVIDER,
@@ -1129,6 +1130,7 @@ def register_web_routes(
     system_prompt_provider: Callable[[], str],
     vault_context_str: str,
     allowed_user_ids: "list[int] | None" = None,
+    data_dir: "str | None" = None,
 ) -> bool:
     """Mount the web chat + auth routes onto ``app`` — IFF web is enabled.
 
@@ -1191,6 +1193,10 @@ def register_web_routes(
     app[KEY_WEB_TALKER_CONFIG] = talker_config
     app[KEY_WEB_SYSTEM_PROVIDER] = system_prompt_provider
     app[KEY_WEB_VAULT_CTX] = vault_context_str
+    # The daemon's data dir for the outbound-read spool (#30). Optional —
+    # ``None`` (a call site that doesn't thread it) makes the outbound route
+    # serve its intentionally-left-blank empty payload rather than crash.
+    app[KEY_WEB_DATA_DIR] = data_dir
     # Per-app concurrent-turn guard set (NOT module-global — concurrent test
     # apps in one process must not share in-flight state).
     app[KEY_WEB_INFLIGHT] = set()
@@ -1233,6 +1239,15 @@ def register_web_routes(
 
     register_stt_handlers(app)
     mounted_routes.append("/stt/transcribe")
+
+    # Outbound-read route (/web/outbound/{kind}/latest) — #30 brief +
+    # daily-sync READ-ON-OPEN. Same lazy-import anti-cycle pattern as STT.
+    # Mounted in both modes; the handler peer-pins WEB_CHAT_PEER itself
+    # (see routes_brief.py), so an ingest-token read is fail-closed 401.
+    from .routes_brief import register_brief_routes
+
+    register_brief_routes(app)
+    mounted_routes.append("/web/outbound/{kind}/latest")
 
     # Voice routes (/voice/*) — V0 WebRTC echo, default-OFF behind
     # web.voice.enabled. register_voice_handlers is self-gating (returns
