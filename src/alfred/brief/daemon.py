@@ -397,6 +397,32 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     return rel_path
 
 
+def _spool_brief_web_outbound(config: BriefConfig, today: str, content: str) -> None:
+    """Best-effort spool of the rendered brief for the #30 web outbound read
+    route (``GET /web/outbound/brief/latest``).
+
+    The vault write is the primary artifact; a spool failure must NEVER break
+    the caller — so this swallows + logs, mirroring ``generate_brief``'s spool.
+    Called from ``update_weather`` so a MANUAL ``alfred brief weather`` refresh
+    re-spools too, instead of leaving a stale web copy. ``data_dir`` resolves the
+    same way ``generate_brief`` derives it (``config.state.path`` parent). Lazy
+    import so the brief daemon doesn't depend on the web package at module load.
+    """
+    data_dir = str(Path(config.state.path).parent)
+    try:
+        from alfred.web.outbound_store import write_latest
+
+        write_latest(data_dir, "brief", today, content)
+        log.info("brief.web_outbound_written", date=today)
+    except Exception as exc:  # noqa: BLE001 — spool never kills the run
+        log.warning(
+            "brief.web_outbound_write_failed",
+            date=today,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+
+
 async def update_weather(config: BriefConfig) -> str:
     """Update the weather section in today's brief. Creates the brief if it doesn't exist."""
     today = date.today().isoformat()
@@ -421,6 +447,7 @@ async def update_weather(config: BriefConfig) -> str:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
         log.info("brief.weather_created", path=rel_path)
+        _spool_brief_web_outbound(config, today, content)
         return rel_path
 
     # Brief exists — replace the weather section in-place
@@ -439,6 +466,7 @@ async def update_weather(config: BriefConfig) -> str:
         updated = existing[:match.start()] + replacement_body + suffix + existing[match.end():]
         file_path.write_text(updated, encoding="utf-8")
         log.info("brief.weather_updated", path=rel_path)
+        _spool_brief_web_outbound(config, today, updated)
     else:
         log.warning("brief.weather_section_not_found", path=rel_path)
 

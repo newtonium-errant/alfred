@@ -12,6 +12,7 @@ suite deliberately.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import structlog
@@ -20,6 +21,7 @@ from alfred.brief import daemon as daemon_mod
 from alfred.brief import weather as weather_mod
 from alfred.brief.config import BriefConfig, OutputConfig, StateConfig
 from alfred.brief.daemon import ensure_process_hub
+from alfred.web.outbound_store import read_latest
 from alfred.brief.renderer import (
     process_hub_name,
     render_brief,
@@ -208,3 +210,40 @@ class TestGenerateBriefCreatesHub:
         assert rel_path is not None
         assert (vault / rel_path).exists()
         assert (vault / "process" / "Morning Brief.md").exists()
+
+    async def test_update_weather_respools_web_outbound(self, tmp_path, monkeypatch) -> None:
+        """#30: a MANUAL ``alfred brief weather`` must re-spool the web copy so
+        ``GET /web/outbound/brief/latest`` isn't stale after a manual refresh.
+        Covers the create branch AND the exists→update branch (both re-spool via
+        the shared helper)."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        async def _no_metars(config):  # type: ignore[no-untyped-def]
+            return []
+
+        async def _no_tafs(config):  # type: ignore[no-untyped-def]
+            return []
+
+        monkeypatch.setattr(weather_mod, "fetch_metars", _no_metars)
+        monkeypatch.setattr(weather_mod, "fetch_tafs", _no_tafs)
+
+        config = BriefConfig(
+            vault_path=str(vault),
+            state=StateConfig(path=str(data_dir / "brief_state.json")),
+        )
+
+        # Create branch (no brief yet) → generate + spool.
+        await daemon_mod.update_weather(config)
+        spooled = read_latest(str(data_dir), "brief")
+        assert spooled is not None
+        assert spooled["date"] == date.today().isoformat()
+        assert "Weather" in spooled["markdown"]
+
+        # Exists→update branch (re-run) → re-spools the updated content.
+        await daemon_mod.update_weather(config)
+        spooled2 = read_latest(str(data_dir), "brief")
+        assert spooled2 is not None
+        assert spooled2["date"] == date.today().isoformat()

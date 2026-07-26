@@ -82,7 +82,12 @@ def read_latest(data_dir: str | Path | None, kind: str) -> dict[str, Any] | None
     md_path, sidecar_path = _kind_paths(data_dir, kind)
     try:
         markdown = md_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError on a non-UTF-8 / corrupted
+        # payload — without it a tampered <kind>.md raises through the
+        # "never raises" contract and 500s the route. The #25 read-class:
+        # OSError alone is too narrow for a text read. (The sidecar read
+        # below already degrades via its broad ``except Exception``.)
         return None
     try:
         raw = json.loads(sidecar_path.read_text(encoding="utf-8"))

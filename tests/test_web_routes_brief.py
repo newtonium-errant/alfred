@@ -224,6 +224,14 @@ class TestOutboundStore:
         sidecar.write_text("{not json", encoding="utf-8")
         assert read_latest(tmp_path, "brief") is None
 
+    def test_corrupt_markdown_non_utf8_treated_absent(self, tmp_path: Path) -> None:
+        # #25 read-class: a tampered / non-UTF-8 <kind>.md must degrade to
+        # None. ``except OSError`` alone missed UnicodeDecodeError (a
+        # ValueError) → the "never raises" contract leaked → route 500.
+        write_latest(tmp_path, "brief", "2026-07-19", "content")
+        (tmp_path / "web_outbound" / "brief.md").write_bytes(b"\xff\xfe\x00\x01 not utf-8")
+        assert read_latest(tmp_path, "brief") is None
+
     def test_missing_sidecar_treated_absent(self, tmp_path: Path) -> None:
         write_latest(tmp_path, "brief", "2026-07-19", "content")
         (tmp_path / "web_outbound" / "brief.json").unlink()
@@ -331,6 +339,20 @@ async def test_outbound_empty_returns_ilb_200(outbound_client) -> None:
         assert any(
             c.get("event") == "web.outbound.empty" for c in captured
         )
+
+
+async def test_outbound_corrupt_markdown_returns_ilb_200(outbound_client) -> None:
+    """#25 read-class at the route: a tampered / non-UTF-8 spooled ``<kind>.md``
+    must NOT 500 — ``read_latest`` degrades to None and the route serves the ILB
+    empty payload. Without the ``(OSError, ValueError)`` widen this 500s."""
+    data_dir = outbound_client.app["_t_data_dir"]
+    write_latest(data_dir, "brief", "2026-07-19", "# real\n")
+    (Path(data_dir) / "web_outbound" / "brief.md").write_bytes(b"\xff\xfe\x00\x01 not utf-8")
+    resp = await outbound_client.get(
+        "/web/outbound/brief/latest", headers=_session_headers(),
+    )
+    assert resp.status == 200
+    assert await resp.json() == {"kind": "brief", "date": None, "markdown": None}
 
 
 async def test_outbound_no_data_dir_returns_ilb_200(
