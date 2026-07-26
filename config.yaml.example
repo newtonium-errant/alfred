@@ -613,6 +613,14 @@ transport:
 #     provider: resend
 #     api_key: "${RESEND_API_KEY}"
 #     from_address: "${ALFRED_WEB_FROM_ADDRESS}"
+#   # --- Notification tray (parity #22, POLL slice) ---
+#   # Peer notices tagged ``web_notify`` (KAL-LE's ticket-created notify
+#   # today) fan out into a bounded per-user store the PWA polls back via
+#   # GET /chat/notifications, BESIDE the unchanged Telegram relay.
+#   # Default-ON (the store only fills when a peer sends); set false to
+#   # skip the sink + route mount entirely.
+#   # notifications:
+#   #   enabled: true
 #   # --- WebRTC voice (PWA voice arc) ---
 #   # Browser mic → WebRTC → this server. DISABLED by default — an absent or
 #   # ``enabled: false`` block mounts NO /voice/* routes (route table
@@ -1400,6 +1408,12 @@ scaffold:
 #   enabled: true
 #   state:
 #     path: "./data/ticket_intake_state.json"
+#   # Parity #22: the principal peer that gets the best-effort
+#   # ticket-created notify (kind=notice + web_notify → the principal's
+#   # Telegram relay AND its PWA notification tray). Must also exist in
+#   # THIS instance's transport.peers to route; unset it to "" to opt
+#   # out (logged skip either way — never an error, never blocks the ack).
+#   notify_peer: "salem"
 
 # Ticket forwarder — VERA-ONLY sender half of the same pipeline.
 # Deterministic 15-minute scanner over <vault>/ticket/: every ticket
