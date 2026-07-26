@@ -154,10 +154,62 @@ def _flatten_transcript_for_web(
     return out
 
 
-async def _read_json_body(request: web.Request) -> dict[str, Any]:
-    """Best-effort JSON body read; returns ``{}`` on empty / invalid body."""
+# ---------------------------------------------------------------------------
+# Turn-body streamed read — route-scoped 32 MiB cap (image-carry, #29)
+# ---------------------------------------------------------------------------
+#
+# /chat/turn + /chat/stream may now carry base64 image blocks (up to
+# MAX_IMAGES_PER_TURN × MAX_IMAGE_BYTES ≈ 4 × 5 MiB decoded, plus base64's
+# ~33% inflation + the JSON envelope). That is FAR above the shared transport
+# app's DEFAULT 1 MiB ``client_max_size`` (``build_app`` passes no override),
+# and ``request.json()`` / ``request.read()`` enforce that global cap — they
+# would 413 every screenshot turn. So this helper STREAMS ``request.content``
+# with its OWN byte cap (:data:`MAX_TURN_BODY_BYTES`), EXACTLY as
+# ``routes_stt.py`` streams audio, leaving the 1 MiB guard on every OTHER
+# peer/auth/ingest route UNTOUCHED. Do NOT "fix" this by raising
+# ``client_max_size`` on the shared app — that weakens DoS protection on every
+# peer route (see the ``routes_stt.py`` module docstring). This cap MUST move
+# in LOCKSTEP with the two BFF caps (``web/pages/api/chat/turn.ts`` sizeLimit
+# and ``stream.ts`` MAX_BODY_BYTES) — a lower tier 413s a real screenshot
+# below another and the end-to-end path fails.
+_TURN_BODY_CHUNK_BYTES: int = 64 * 1024
+MAX_TURN_BODY_BYTES: int = 32 * 1024 * 1024  # 32 MiB
+
+
+async def _read_json_body(request: web.Request) -> dict[str, Any] | web.Response:
+    """Best-effort JSON body read with a route-scoped 32 MiB cap.
+
+    Returns the parsed dict, ``{}`` on an empty / invalid body (the current
+    LENIENT contract — a malformed / empty body is treated as ``{}``, NOT a
+    400; downstream ``message_required`` validation surfaces the real error),
+    or a ``413`` :class:`aiohttp.web.Response` when the streamed body exceeds
+    :data:`MAX_TURN_BODY_BYTES`. Callers MUST return a ``web.Response`` result
+    VERBATIM (it is the body-too-large error) before touching it as a dict.
+
+    Streams ``request.content`` rather than ``request.json()`` so the body cap
+    is OURS (:data:`MAX_TURN_BODY_BYTES`), not the transport app's 1 MiB
+    ``client_max_size`` — image turns can be ~28 MiB (4 × 5 MiB base64) and
+    ``request.json()`` would 413 them under the global guard. EXACT copy of
+    the ``routes_stt.py`` streamed read; do NOT raise ``client_max_size``
+    app-wide instead (see that module's docstring).
+    """
+    buf = bytearray()
+    async for chunk in request.content.iter_chunked(_TURN_BODY_CHUNK_BYTES):
+        buf.extend(chunk)
+        if len(buf) > MAX_TURN_BODY_BYTES:
+            log.warning(
+                "web.chat.body_too_large",
+                bytes_seen=len(buf),
+                max_bytes=MAX_TURN_BODY_BYTES,
+            )
+            return web.json_response(
+                {"error": "body_too_large", "max_bytes": MAX_TURN_BODY_BYTES},
+                status=413,
+            )
+    if not buf:
+        return {}
     try:
-        body = await request.json()
+        body = json.loads(buf)
     except Exception:  # noqa: BLE001 — malformed body → treat as empty
         return {}
     return body if isinstance(body, dict) else {}
@@ -616,6 +668,8 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": "invalid_session"}, status=401)
 
     body = await _read_json_body(request)
+    if isinstance(body, web.Response):
+        return body  # 413 — body exceeded MAX_TURN_BODY_BYTES (image-carry)
     session_key = body.get("session_key")
     message = body.get("message")
     if not isinstance(message, str) or not message.strip():
@@ -793,6 +847,8 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": "invalid_session"}, status=401)
 
     body = await _read_json_body(request)
+    if isinstance(body, web.Response):
+        return body  # 413 — body exceeded MAX_TURN_BODY_BYTES (image-carry)
     session_key = body.get("session_key")
     message = body.get("message")
     if not isinstance(message, str) or not message.strip():

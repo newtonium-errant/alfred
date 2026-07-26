@@ -11,6 +11,7 @@ aiohttp's ``aiohttp_client`` fixture to spin up the real transport
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 
@@ -1916,6 +1917,86 @@ async def test_chat_stream_rejects_bad_image_before_stream(web_client) -> None:
     assert r.status == 400
     assert r.content_type == "application/json"
     assert (await r.json())["error"] == "image_invalid"
+
+
+# --- load-bearing: > 1 MiB image body must NOT 413 under client_max_size ---
+#
+# The transport app is built with aiohttp's DEFAULT 1 MiB ``client_max_size``
+# (``build_app`` passes no override). ``_read_json_body`` must STREAM the body
+# with its OWN 32 MiB cap (:data:`MAX_TURN_BODY_BYTES`), NOT call
+# ``request.json()`` (which enforces the shared 1 MiB guard and would 413 every
+# real screenshot). These two pins prove that. Mutation-checked: reverting the
+# streamed read back to ``await request.json()`` turns both RED.
+
+
+def _big_image_b64(decoded_bytes: int = 2 * 1024 * 1024) -> str:
+    """A base64 payload decoding to ``decoded_bytes`` (default 2 MiB) — ABOVE
+    the 1 MiB ``client_max_size`` but BELOW MAX_IMAGE_BYTES (5 MiB).
+
+    Arbitrary filler bytes: ``_parse_image_blocks`` validates base64 + decoded
+    size only, and ``build_image_block`` / ``save_image_to_inbox`` never decode
+    the pixels — so a filler blob exercises the exact body-size path a real
+    screenshot would, without shipping a megabyte fixture.
+    """
+    raw = b"\x89PNG\r\n\x1a\n" + b"\x00" * (decoded_bytes - 8)
+    return base64.standard_b64encode(raw).decode("ascii")
+
+
+async def test_chat_turn_large_image_body_not_413(web_client) -> None:
+    """A chat turn carrying a > 1 MiB image body is ACCEPTED (200, not 413),
+    reaches vision as an image content-block, and lands in the inbox."""
+    data = _big_image_b64()
+    assert len(base64.b64decode(data)) > 1024 * 1024  # body is over the 1 MiB cap
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk,
+            "message": "what's broken here?",
+            "images": [{"media_type": "image/png", "data": data}],
+        },
+        headers=headers,
+    )
+    assert r.status == 200  # NOT 413 — streamed cap governs, not client_max_size
+
+    state_mgr = web_client.app["_t_state_mgr"]
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    content = active["transcript"][0]["content"]
+    assert isinstance(content, list)
+    assert any(b.get("type") == "image" for b in content)
+
+    inbox = Path(web_client.app["_t_talker_config"].vault.path) / "inbox"
+    assert list(inbox.glob("screenshot-*")), "screenshot not persisted to inbox"
+
+
+async def test_chat_stream_large_image_body_not_413(web_client) -> None:
+    """Mirror pin for /chat/stream: a > 1 MiB image body opens the SSE stream
+    (200 + terminal ``done`` frame) instead of 413'ing under client_max_size,
+    and the user turn is recorded as an image content-block list."""
+    data = _big_image_b64()
+    assert len(base64.b64decode(data)) > 1024 * 1024
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    resp = await web_client.post(
+        "/chat/stream",
+        json={
+            "session_key": sk,
+            "message": "what's broken here?",
+            "images": [{"media_type": "image/png", "data": data}],
+        },
+        headers=headers,
+    )
+    assert resp.status == 200  # NOT 413
+    assert resp.headers["Content-Type"] == "text/event-stream"
+    events = await _read_sse(resp)
+    assert any(e == "done" for (e, _d) in events), "no terminal done frame"
+
+    state_mgr = web_client.app["_t_state_mgr"]
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    content = active["transcript"][0]["content"]
+    assert isinstance(content, list)
+    assert any(b.get("type") == "image" for b in content)
 
 
 # --- per-turn channel marker (in-conversation PHI signal) ------------------
