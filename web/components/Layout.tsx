@@ -26,6 +26,7 @@ type LayoutProps = {
 // structure so a new surface adds a link without re-architecting the header.
 const NAV_LINKS = [
   { href: '/', label: 'Chat' },
+  { href: '/brief', label: 'Brief' },
   { href: '/ingest', label: 'Ingest' },
 ] as const;
 
