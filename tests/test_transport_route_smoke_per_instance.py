@@ -652,7 +652,18 @@ async def test_every_register_helper_has_wire_transport_app_kwarg():
     register_helpers = sorted(
         name for name in dir(peer_handlers)
         if name.startswith("register_")
-        and name not in {"register_peer_routes", "register_canonical_routes"}
+        # register_web_notify_sink (parity #22) is EXCLUDED by design: it
+        # is called by the WEB mount (alfred.web.routes_chat.
+        # register_web_routes, which builds the notify store + closure),
+        # NOT by the daemon via wire_transport_app — wiring it there would
+        # force the daemon to import web modules. The absent-sink path is
+        # a logged debug skip, not a 500, so the Flavor-3 silent-wiring-gap
+        # failure mode this test guards against does not apply.
+        and name not in {
+            "register_peer_routes",
+            "register_canonical_routes",
+            "register_web_notify_sink",
+        }
         and callable(getattr(peer_handlers, name))
     )
     # Sanity baseline — if the discovery returns nothing, the test

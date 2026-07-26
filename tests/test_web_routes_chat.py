@@ -1400,6 +1400,9 @@ def test_register_web_routes_enabled_mounts_chat_and_auth(tmp_path) -> None:
         "/chat/turn",
         "/chat/stream",
         "/chat/history/{session_key}",
+        # Parity #22 — notifications default ON (web.notifications.enabled).
+        "/chat/notifications",
+        "/chat/notifications/ack",
         "/auth/login",
         "/auth/verify",
     }

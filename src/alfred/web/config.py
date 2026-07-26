@@ -312,6 +312,21 @@ class WebVoiceConfig:
 
 
 @dataclass
+class WebNotificationsConfig:
+    """Web notification-center config (``web.notifications``, parity #22).
+
+    ``enabled`` defaults **True** (unlike the surface-level opt-ins): the
+    store only fills when a peer actually sends a ``web_notify``-tagged
+    notice (KAL-LE's ticket intake today), so a default-on tray is inert
+    on every instance nothing notifies. Setting ``enabled: false`` skips
+    the sink registration AND the ``/chat/notifications*`` route mount
+    (opt-out inertness, logged).
+    """
+
+    enabled: bool = True
+
+
+@dataclass
 class WebConfig:
     """Typed config for the ``web:`` section.
 
@@ -325,6 +340,8 @@ class WebConfig:
     auth: WebAuthConfig = field(default_factory=WebAuthConfig)
     email: WebEmailConfig = field(default_factory=WebEmailConfig)
     voice: WebVoiceConfig = field(default_factory=WebVoiceConfig)
+    notifications: WebNotificationsConfig = field(
+        default_factory=WebNotificationsConfig)
     # Tool-scoped state path for the single-use magic-link nonce store
     # (per the load() schema-tolerance contract's "default state paths must
     # be tool-scoped" rule). Overridable per-instance.
@@ -629,6 +646,22 @@ def _build_voice(raw: Any) -> WebVoiceConfig:
     )
 
 
+def _build_notifications(raw: Any) -> WebNotificationsConfig:
+    """Hand-roll ``WebNotificationsConfig`` with a schema-tolerance filter.
+
+    Mirrors ``_build_auth`` — dict guard + ``__dataclass_fields__`` filter.
+    Absent / malformed block → the default-ON config (see the dataclass
+    docstring for why notifications default on)."""
+    defaults = WebNotificationsConfig()
+    if not isinstance(raw, dict):
+        return defaults
+    known = WebNotificationsConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    return WebNotificationsConfig(
+        enabled=bool(filtered.get("enabled", defaults.enabled)),
+    )
+
+
 def _int(value: Any, default: int) -> int:
     """Coerce to int, falling back to ``default`` on None / bad input."""
     try:
@@ -662,6 +695,7 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
         auth=_build_auth(section.get("auth")),
         email=_build_email(section.get("email")),
         voice=_build_voice(section.get("voice")),
+        notifications=_build_notifications(section.get("notifications")),
         state_path=str(
             section.get("state_path", "./data/web_auth_state.json")
             or "./data/web_auth_state.json"

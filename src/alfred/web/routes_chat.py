@@ -45,6 +45,7 @@ import base64
 import binascii
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Callable
 
 from aiohttp import web
@@ -60,6 +61,7 @@ from .keys import (
     KEY_WEB_CONFIG,
     KEY_WEB_DATA_DIR,
     KEY_WEB_INFLIGHT,
+    KEY_WEB_NOTIFY_STORE,
     KEY_WEB_STATE_MGR,
     KEY_WEB_SYSTEM_PROVIDER,
     KEY_WEB_TALKER_CONFIG,
@@ -1248,6 +1250,54 @@ def register_web_routes(
 
     register_brief_routes(app)
     mounted_routes.append("/web/outbound/{kind}/latest")
+
+    # Notification routes (/chat/notifications*) — parity #22 KAL-LE ticket
+    # → PWA notify, POLL slice. Default-ON (web.notifications.enabled; the
+    # store only fills when a peer sends a web_notify-tagged notice). The
+    # bounded store lives under data_dir; the fan-out sink is registered on
+    # the TRANSPORT app (peer_handlers.register_web_notify_sink) so the
+    # /peer/send message|notice branch reaches it WITHOUT telegram/daemon.py
+    # importing web modules. Same lazy-import anti-cycle pattern as STT.
+    if web_config.notifications.enabled:
+        from alfred.transport.peer_handlers import register_web_notify_sink
+
+        from .notify_state import WebNotifyStore, build_web_notify_sink
+        from .routes_notify import register_notify_routes
+
+        notify_store = None
+        if data_dir:
+            notify_store = WebNotifyStore.create(
+                Path(data_dir) / "web_notify_state.json"
+            )
+            notify_store.load()
+            register_web_notify_sink(
+                app, build_web_notify_sink(notify_store, web_config)
+            )
+            log.info(
+                "web.routes.notify_sink_registered",
+                state_path=str(notify_store.state_path),
+            )
+        else:
+            # Intentionally-left-blank: no data_dir → nothing to persist
+            # into. The routes still mount (serving the explicit empty
+            # payload); the peer fan-out logs its own sink-absent skip.
+            log.info(
+                "web.routes.notify_store_skipped",
+                reason="no data_dir threaded — routes serve the empty "
+                       "payload; sink not registered",
+            )
+        app[KEY_WEB_NOTIFY_STORE] = notify_store
+        register_notify_routes(app)
+        mounted_routes += ["/chat/notifications", "/chat/notifications/ack"]
+    else:
+        # Intentionally-left-blank: an explicit opt-out is a deliberate
+        # state, logged so "no notification routes" is distinguishable
+        # from a silent wiring skip.
+        app[KEY_WEB_NOTIFY_STORE] = None
+        log.info(
+            "web.routes.notifications_disabled",
+            reason="web.notifications.enabled=false",
+        )
 
     # Voice routes (/voice/*) — V0 WebRTC echo, default-OFF behind
     # web.voice.enabled. register_voice_handlers is self-gating (returns

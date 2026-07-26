@@ -31,3 +31,10 @@ KEY_WEB_VOICE_MANAGER = "web.voice_manager"
 # ``<data_dir>/web_outbound/``; an unset dir reads as "nothing spooled"
 # (the intentionally-left-blank empty 200), never a crash.
 KEY_WEB_DATA_DIR = "web.data_dir"
+# The bounded per-user WebNotifyStore (parity #22 KAL-LE ticket → PWA
+# notify, poll slice), or ``None`` when notifications are enabled but no
+# data_dir was threaded (the read routes then serve the intentionally-
+# left-blank empty payload). Filled by the transport-level sink
+# (peer_handlers.register_web_notify_sink) on web_notify-tagged notices;
+# read by routes_notify keyed to the resolving identity's synthetic id.
+KEY_WEB_NOTIFY_STORE = "web.notify_store"

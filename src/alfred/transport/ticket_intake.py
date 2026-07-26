@@ -101,6 +101,14 @@ class TicketIntakeConfig:
     # on-box drafter routes the fix PR to the mapped app repo. Empty map →
     # no marker → single-repo drafter behavior (Phase 0).
     project_by_client: dict = field(default_factory=dict)
+    # Parity #22: the principal peer that receives the best-effort
+    # ticket-created notify (kind=notice, web_notify=True → the PWA
+    # notification store beside the Telegram relay). Config-layer (NOT a
+    # call-site literal, per the three-layers discipline) with the
+    # deployment default. The peer must ALSO exist in ``transport.peers``
+    # for the send to route; unset/unknown → logged skip
+    # (``transport.ticket.web_notify_skipped``), never an error.
+    notify_peer: str = "salem"
 
 
 def load_ticket_intake_config(raw: dict[str, Any]) -> TicketIntakeConfig:
@@ -131,6 +139,9 @@ def load_ticket_intake_config(raw: dict[str, Any]) -> TicketIntakeConfig:
         enabled=bool(section.get("enabled", False)),
         state_path=state_path or DEFAULT_TICKET_INTAKE_STATE_PATH,
         project_by_client=project_by_client,
+        # An explicit empty string is a deliberate opt-out (skip+log at
+        # the notify site); only an ABSENT key gets the default.
+        notify_peer=str(section.get("notify_peer", "salem") or ""),
     )
 
 

@@ -140,6 +140,16 @@ _KEY_GCAL_INTENDED_ON = "transport.gcal_intended_on"
 _KEY_TICKET_INTAKE_CONFIG = "transport.ticket_intake_config"
 _KEY_TICKET_INTAKE_GITHUB = "transport.ticket_intake_github"
 
+# Application-storage key for the web-PWA notification sink (parity #22,
+# poll slice). Registered by the WEB mount
+# (:func:`alfred.web.routes_chat.register_web_routes`) via
+# :func:`register_web_notify_sink` — NOT by the telegram daemon — so the
+# ``message|notice`` fan-out below reaches the web notification store
+# without telegram/daemon.py (or this module) importing web code. Absent →
+# the fan-out logs a debug skip (this instance has no web notification
+# surface); the Telegram relay is unaffected either way.
+_KEY_WEB_NOTIFY_SINK = "transport.web_notify_sink"
+
 
 # ---------------------------------------------------------------------------
 # Conflict-source enum (Phase A+)
@@ -592,6 +602,39 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
             auth_peer=auth_peer,
             correlation_id=correlation_id,
         )
+
+    # --- Web-PWA notify fan-out (parity #22) — message|notice only -------
+    # A payload tagged ``web_notify`` ALSO lands in the web notification
+    # store (poll/read-on-request slice), BESIDE the unchanged Telegram
+    # relay below — additive fan-out, never a replacement. Best-effort in
+    # both directions: sink absent → logged skip (this instance has no
+    # web notification surface mounted); sink raising → logged, the relay
+    # + ack proceed untouched.
+    if kind in ("message", "notice") and payload.get("web_notify"):
+        web_notify_sink = request.app.get(_KEY_WEB_NOTIFY_SINK)
+        if web_notify_sink is None:
+            log.debug(
+                "transport.peer.web_notify_sink_absent",
+                kind=kind, from_peer=auth_peer,
+                correlation_id=correlation_id,
+                reason="no web notify sink registered (web surface not "
+                       "mounted or notifications disabled) — Telegram "
+                       "relay unaffected",
+            )
+        else:
+            try:
+                web_notify_sink(
+                    payload=payload,
+                    from_peer=auth_peer,
+                    correlation_id=correlation_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — fan-out must never block the relay
+                log.warning(
+                    "transport.peer.web_notify_sink_failed",
+                    kind=kind, from_peer=auth_peer,
+                    error=str(exc), error_type=exc.__class__.__name__,
+                    correlation_id=correlation_id,
+                )
 
     inbox: PeerInboxCallable | None = request.app.get(_KEY_PEER_INBOX)
     if inbox is None:
@@ -3775,6 +3818,19 @@ async def _handle_ticket_intake(
         from_peer=auth_peer,
         correlation_id=correlation_id,
     )
+    # Web-PWA notify (parity #22) — fires on status ``created`` ONLY.
+    # Best-effort: any failure inside is swallowed + logged, never
+    # blocking this ack.
+    await _notify_ticket_created_web(
+        request,
+        intake_config=intake_config,
+        ticket_uid=ticket_uid,
+        title=fm_title,
+        ticket_type=fm_ticket_type,
+        issue_number=entry.issue_number,
+        issue_url=entry.issue_url,
+        correlation_id=correlation_id,
+    )
     # (The github client already audited outcome="created".)
     return web.json_response({
         "status": "created",
@@ -3783,6 +3839,90 @@ async def _handle_ticket_intake(
         "kalle_relpath": entry.kalle_relpath,
         "correlation_id": correlation_id,
     })
+
+
+async def _notify_ticket_created_web(
+    request: web.Request,
+    *,
+    intake_config: Any,
+    ticket_uid: str,
+    title: str,
+    ticket_type: str,
+    issue_number: Any,
+    issue_url: str,
+    correlation_id: str,
+) -> None:
+    """Best-effort ticket-created notify to the principal (parity #22).
+
+    Fires on ack status ``created`` ONLY — NEVER ``exists`` / ``adopted``
+    (a VERA re-push must not re-notify) and never
+    ``recorded_issue_pending`` (the eventual successful re-push lands
+    here exactly once, when the issue actually gets created). Sends a
+    ``kind=notice`` peer message tagged ``web_notify: True`` to the
+    configured principal peer (``ticket_intake.notify_peer``, default
+    ``salem``): the principal's Telegram relay carries it as a normal
+    precedence-R notice AND its web mount fans it into the PWA
+    notification store (poll slice).
+
+    Best-effort BOTH ways, mirroring ``_link_back_kalle_record``'s
+    failure isolation: peer unconfigured → logged skip
+    (intentionally-left-blank, ``transport.ticket.web_notify_skipped``);
+    the send raising → swallowed + logged
+    (``transport.ticket.web_notify_failed``). A notify failure must
+    NEVER turn a created ticket into a failed ack.
+    """
+    config = _get_config(request)
+    peer_name = str(getattr(intake_config, "notify_peer", "") or "")
+    if not peer_name or peer_name not in config.peers:
+        log.info(
+            "transport.ticket.web_notify_skipped",
+            reason="notify peer not configured",
+            notify_peer=peer_name or "(unset)",
+            ticket_uid=ticket_uid,
+            correlation_id=correlation_id,
+        )
+        return
+    self_name = _get_instance_self_name(request)
+    text = (
+        f"New ticket [{ticket_type}] {title} — filed as issue "
+        f"#{issue_number}: {issue_url}"
+    )
+    try:
+        # Late import at call time (module style) — also what lets tests
+        # monkeypatch ``alfred.transport.client.peer_send``.
+        from .client import peer_send
+
+        await peer_send(
+            peer_name,
+            "notice",
+            {
+                "text": text,
+                "precedence": "R",
+                "source": self_name or "kal-le",
+                "web_notify": True,
+                "ticket_uid": ticket_uid,
+                "issue_url": issue_url,
+            },
+            config=config,
+            self_name=self_name,
+            correlation_id=correlation_id,
+        )
+        log.info(
+            "transport.ticket.web_notify_sent",
+            to_peer=peer_name,
+            ticket_uid=ticket_uid,
+            issue_number=issue_number,
+            correlation_id=correlation_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — notify must never block the ack
+        log.warning(
+            "transport.ticket.web_notify_failed",
+            to_peer=peer_name,
+            ticket_uid=ticket_uid,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            correlation_id=correlation_id,
+        )
 
 
 def _ticket_issue_pending_response(
@@ -3929,6 +4069,24 @@ def register_peer_inbox(
     ``(kind, payload, from_peer, correlation_id) -> awaitable[dict]``.
     """
     app[_KEY_PEER_INBOX] = callable_
+
+
+def register_web_notify_sink(
+    app: web.Application,
+    sink: Callable[..., None],
+) -> None:
+    """Wire the web-PWA notification sink onto an already-built app.
+
+    Mirrors :func:`register_peer_inbox` / ``register_send_callable``, but
+    is called by the WEB mount (``alfred.web.routes_chat.
+    register_web_routes``) rather than the telegram daemon — the daemon
+    stays free of web imports. The callable is SYNC with shape
+    ``(*, payload: dict, from_peer: str, correlation_id: str) -> None``;
+    it enqueues into the bounded web notification store. Absent → the
+    ``/peer/send`` ``message|notice`` fan-out logs a debug skip and the
+    Telegram relay proceeds unchanged.
+    """
+    app[_KEY_WEB_NOTIFY_SINK] = sink
 
 
 def register_vault_path(app: web.Application, vault_path: Path) -> None:
