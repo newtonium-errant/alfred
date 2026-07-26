@@ -1,15 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_DC_TEXT_CHARS,
+  MAX_IMAGE_BYTES,
   MAX_MESSAGE_CHARS,
   MAX_SDP_CHARS,
+  base64DecodedBytes,
   chatTurnBodySchema,
+  imageAttachmentSchema,
   voiceCancelFrame,
   voiceCloseBodySchema,
   voiceDcEventSchema,
   voiceHelloFrame,
   voiceOfferBodySchema,
 } from '../lib/algernon/schemas';
+
+// base64 of "hello" — a small valid attachment payload for the happy path.
+const SMALL_B64 = 'aGVsbG8=';
+// A base64 string whose DECODED size exceeds MAX_IMAGE_BYTES (5 MiB). All-'A'
+// (valid alphabet, length % 4 === 0). 7 MiB chars → ~5.25 MiB decoded.
+const OVERSIZED_B64 = 'A'.repeat(7 * 1024 * 1024);
 
 describe('chatTurnBodySchema', () => {
   it('accepts a valid text turn', () => {
@@ -51,6 +60,79 @@ describe('chatTurnBodySchema', () => {
       kind: 'shout',
     });
     expect(r.success).toBe(false);
+  });
+
+  // --- image-carry (parity #29) ---
+  it('accepts a valid images array', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'what is broken here?',
+      images: [{ media_type: 'image/png', data: SMALL_B64 }],
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects a bad image media_type', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'hi',
+      images: [{ media_type: 'image/tiff', data: SMALL_B64 }],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects more than 4 images', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'hi',
+      images: Array.from({ length: 5 }, () => ({ media_type: 'image/png', data: SMALL_B64 })),
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects an oversized image (> 5 MiB decoded)', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'hi',
+      images: [{ media_type: 'image/png', data: OVERSIZED_B64 }],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects image data carrying the data: URI prefix (must be bare base64)', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'hi',
+      images: [{ media_type: 'image/png', data: `data:image/png;base64,${SMALL_B64}` }],
+    });
+    expect(r.success).toBe(false);
+  });
+});
+
+describe('imageAttachmentSchema + base64DecodedBytes', () => {
+  it('base64DecodedBytes matches the true decoded length (padding-aware)', () => {
+    expect(base64DecodedBytes(SMALL_B64)).toBe(5); // "hello"
+    expect(base64DecodedBytes('')).toBe(0);
+    expect(base64DecodedBytes('QQ==')).toBe(1); // "A"
+    expect(base64DecodedBytes('QUI=')).toBe(2); // "AB"
+    expect(base64DecodedBytes('QUJD')).toBe(3); // "ABC"
+  });
+
+  it('accepts a payload just under the 5 MiB decoded cap', () => {
+    // 5242878 = 3 × 1747626 (multiple of 3 ⇒ unpadded base64 of length ×4/3).
+    const underCap = 'A'.repeat((5242878 / 3) * 4);
+    expect(base64DecodedBytes(underCap)).toBeLessThanOrEqual(MAX_IMAGE_BYTES);
+    expect(imageAttachmentSchema.safeParse({ media_type: 'image/png', data: underCap }).success).toBe(true);
+  });
+
+  it('accepts each allowed media_type', () => {
+    for (const mt of ['image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+      expect(imageAttachmentSchema.safeParse({ media_type: mt, data: SMALL_B64 }).success).toBe(true);
+    }
+  });
+
+  it('rejects empty data', () => {
+    expect(imageAttachmentSchema.safeParse({ media_type: 'image/png', data: '' }).success).toBe(false);
   });
 });
 

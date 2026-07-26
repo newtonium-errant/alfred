@@ -3,6 +3,7 @@ import { chatApi } from './client';
 import { ApiError } from './http';
 import { HOME_INSTANCE_NAME } from './instance';
 import { createSseParser } from './sse';
+import type { ImageAttachment } from './schemas';
 import type {
   ChatKind,
   ChatMessage,
@@ -119,6 +120,9 @@ interface PendingTurn {
   kind: ChatKind;
   priorLen: number;
   idk: string;
+  // Carried screenshots (parity #29) — resent verbatim on retry so a retried
+  // image turn dedups to the same result (the SAME idempotency key rides along).
+  images?: ImageAttachment[];
 }
 
 // A live, human label for a stream `status` frame (tool activity on a long turn).
@@ -164,8 +168,12 @@ export interface UseChat {
   unauthenticated: boolean;
   /** True when the last turn failed recoverably and retry() will resend it. */
   retryable: boolean;
-  /** `kind` tags the backend turn counter ('voice' for transcript-originated sends). */
-  send: (text: string, kind?: ChatKind) => Promise<void>;
+  /**
+   * `kind` tags the backend turn counter ('voice' for transcript-originated
+   * sends). `images` carries optional screenshots (parity #29) — an image-only
+   * turn passes a placeholder caption as `text` (the composer supplies it).
+   */
+  send: (text: string, kind?: ChatKind, images?: ImageAttachment[]) => Promise<void>;
   /** Resend the last failed turn with the SAME idempotency key (no double-act). */
   retry: () => Promise<void>;
   /** Start a fresh chat (archives the prior session). */
@@ -348,7 +356,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   // SAME idempotency key (the backend dedups if it already ran).
   const runTurn = useCallback(
     async (ctx: PendingTurn) => {
-      const { key, userId, text, kind, priorLen, idk } = ctx;
+      const { key, userId, text, kind, priorLen, idk, images } = ctx;
       setError(null);
       setWorking(null);
       setStatus('sending');
@@ -373,7 +381,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
 
       let res: Response;
       try {
-        res = await chatApi.stream(key, text, { kind, instance, idempotencyKey: idk, signal: ac.signal });
+        res = await chatApi.stream(key, text, { kind, instance, idempotencyKey: idk, images, signal: ac.signal });
       } catch (e) {
         // Aborted by unmount / instance switch → the turn is being abandoned; do
         // not reconcile or touch state (the component is gone or re-bootstrapping).
@@ -401,7 +409,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
         // 200 but no readable body (old runtime) → the non-stream fallback. The
         // shared idempotency key makes this safe even after the stream attempt.
         try {
-          const d = await chatApi.turn(key, text, { kind, instance, idempotencyKey: idk });
+          const d = await chatApi.turn(key, text, { kind, instance, idempotencyKey: idk, images });
           finalizeReply(userId, d);
           onSuccess();
         } catch (e) {
@@ -484,9 +492,12 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   }, [openFresh, fail]);
 
   const send = useCallback(
-    async (raw: string, kind: ChatKind = 'text') => {
+    async (raw: string, kind: ChatKind = 'text', images?: ImageAttachment[]) => {
       const text = raw.trim();
       const key = sessionKeyRef.current;
+      // The composer guarantees a non-empty caption even for an image-only turn
+      // (a placeholder), so `!text` still gates a truly-empty send. `key` gates
+      // a not-yet-booted session.
       if (!text || !key) return;
       // Intercept a bare "/end" control BEFORE it reaches the model (S7).
       if (isEndCommand(text)) {
@@ -506,7 +517,15 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       // backend returns the real user-turn stamp (keeps live == resume).
       const userId = nextId();
       setMessages((prev) => [...prev, { id: userId, role: 'user', text, ts: '' }]);
-      const ctx: PendingTurn = { key, userId, text, kind, priorLen, idk };
+      const ctx: PendingTurn = {
+        key,
+        userId,
+        text,
+        kind,
+        priorLen,
+        idk,
+        ...(images && images.length ? { images } : {}),
+      };
       pendingRef.current = ctx;
       await runTurn(ctx);
     },

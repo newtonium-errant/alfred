@@ -205,7 +205,7 @@ export default function ChatPage() {
             onTurnFinal={refreshFromHistory}
           />
 
-          <Composer onSend={(t, kind) => void send(t, kind)} disabled={booting || sending} />
+          <Composer onSend={(t, kind, images) => void send(t, kind, images)} disabled={booting || sending} />
         </div>
       </Layout>
     </>

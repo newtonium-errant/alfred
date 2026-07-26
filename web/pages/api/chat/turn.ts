@@ -11,7 +11,16 @@ import { sendTransportError } from '../../../lib/algernon/bffError';
 // Cross-instance selector: gate session (401) → owner-only (403) → known target
 // (400), then relay over that target's peer token + the asserted X-Alfred-User.
 // The `instance` field is BFF-only (stripped before relay); `idempotency_key`
-// relays verbatim for backend retry-safety dedup.
+// and `images` relay verbatim (retry-safety dedup + carried screenshots #29).
+
+// Image-carry (#29): the default Next bodyParser cap is 1 MiB — far below a
+// real screenshot turn (up to 4 × 5 MiB decoded ≈ 28 MiB of base64 + envelope).
+// Raise it to 32 MiB IN LOCKSTEP with the backend MAX_TURN_BODY_BYTES and the
+// /api/chat/stream MAX_BODY_BYTES — if any tier is lower a real screenshot 413s
+// below another and the end-to-end path fails. This cap is route-scoped (only
+// this handler), NOT app-wide.
+export const config = { api: { bodyParser: { sizeLimit: '32mb' } } };
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
@@ -39,6 +48,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     message: parsed.data.message,
     kind: parsed.data.kind === 'voice' ? 'voice' : 'text',
     ...(parsed.data.idempotency_key ? { idempotency_key: parsed.data.idempotency_key } : {}),
+    ...(parsed.data.images && parsed.data.images.length ? { images: parsed.data.images } : {}),
   };
 
   if (isHomeInstance(parsed.data.instance)) {

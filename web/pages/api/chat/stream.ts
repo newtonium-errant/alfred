@@ -16,9 +16,11 @@ import { sendTransportError } from '../../../lib/algernon/bffError';
 // res.json() once streaming has started.
 export const config = { api: { bodyParser: false, externalResolver: true } };
 
-// Generous cap for a chat turn body (message ≤ 8000 chars + session_key +
-// idempotency_key). Far under any DoS concern; rejects a runaway upload.
-const MAX_BODY_BYTES = 128 * 1024;
+// Cap for a chat turn body. Sized for image-carry (#29): up to 4 × 5 MiB decoded
+// screenshots ≈ 28 MiB of base64 + the JSON envelope. Held at 32 MiB IN LOCKSTEP
+// with the backend MAX_TURN_BODY_BYTES and the /api/chat/turn bodyParser
+// sizeLimit — a lower tier here would 413 a real screenshot the others accept.
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 async function readJsonBody(req: NextApiRequest): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -69,6 +71,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     message: parsed.data.message,
     kind: parsed.data.kind === 'voice' ? 'voice' : 'text',
     ...(parsed.data.idempotency_key ? { idempotency_key: parsed.data.idempotency_key } : {}),
+    ...(parsed.data.images && parsed.data.images.length ? { images: parsed.data.images } : {}),
   };
 
   const home = isHomeInstance(parsed.data.instance);

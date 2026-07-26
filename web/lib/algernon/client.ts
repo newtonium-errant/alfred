@@ -8,7 +8,7 @@ import type {
   IngestSubmitResponse,
   IngestTargetsResponse,
 } from './types';
-import type { IngestBody } from './schemas';
+import type { ImageAttachment, IngestBody } from './schemas';
 
 // BROWSER-side chat client. Talks ONLY to the same-origin BFF (`/api/chat/*`),
 // never the transport directly — the BFF holds the peer token + relays the
@@ -24,6 +24,9 @@ export interface ChatTurnOptions {
   kind?: ChatKind;
   instance?: string;
   idempotencyKey?: string;
+  // Carried screenshots (parity #29). Sent as `images` on the turn/stream body;
+  // absent / empty ⇒ a text-only turn (byte-identical to the pre-feature path).
+  images?: ImageAttachment[];
 }
 
 export const chatApi = {
@@ -44,6 +47,7 @@ export const chatApi = {
       kind: opts.kind ?? 'text',
       ...(opts.instance ? { instance: opts.instance } : {}),
       ...(opts.idempotencyKey ? { idempotency_key: opts.idempotencyKey } : {}),
+      ...(opts.images && opts.images.length ? { images: opts.images } : {}),
     }),
   history: (sessionKey: string, instance?: string): Promise<ChatHistoryResponse> =>
     getJson<ChatHistoryResponse>(
@@ -70,6 +74,7 @@ export const chatApi = {
         kind: opts.kind ?? 'text',
         ...(opts.instance ? { instance: opts.instance } : {}),
         ...(opts.idempotencyKey ? { idempotency_key: opts.idempotencyKey } : {}),
+        ...(opts.images && opts.images.length ? { images: opts.images } : {}),
       }),
       signal: opts.signal,
     }),

@@ -207,6 +207,27 @@ describe('POST /api/chat/stream', () => {
     expect(mockCallChatStream).not.toHaveBeenCalled();
   });
 
+  it('accepts a ~6 MiB image body (32 MiB LOCKSTEP cap) and forwards images', async () => {
+    // One ~4.5 MiB-decoded image (≤ 5 MiB) ⇒ ~6 MiB base64 ⇒ ~6 MiB body: FAR
+    // over the old 128 KiB cap (and over the backend's 1 MiB client_max_size),
+    // under the new 32 MiB cap. Must parse, validate, and forward — not 400.
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransportStream.mockResolvedValue(sseUpstream([DONE_FRAME]));
+    const { res, status, writes } = mockRes();
+    const data = 'A'.repeat(6 * 1024 * 1024); // decoded ~4.5 MiB, valid base64
+    await handler(
+      streamReq({ session_key: 'k', message: 'look', images: [{ media_type: 'image/png', data }] }),
+      res,
+    );
+    // Not rejected as too-large / invalid.
+    expect(status).not.toHaveBeenCalledWith(400);
+    expect(mockCallTransportStream).toHaveBeenCalledTimes(1);
+    const opts = mockCallTransportStream.mock.calls[0][2];
+    expect(opts.body.images).toHaveLength(1);
+    expect(opts.body.images[0].media_type).toBe('image/png');
+    expect(Buffer.concat(writes).toString()).toContain('event: done');
+  });
+
   it('CROSS owner + known target → relay stream with asserted user', async () => {
     mockResolveSessionToken.mockReturnValue('tok');
     mockReadDisplayIdentity.mockReturnValue({ name: 'andrew', role: 'owner' });

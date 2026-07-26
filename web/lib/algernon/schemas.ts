@@ -19,6 +19,51 @@ export const chatInstanceSchema = z.string().trim().min(1).max(64);
 // guard (CONTRACT S6); absent ⇒ no dedup.
 export const idempotencyKeySchema = z.string().min(1).max(200);
 
+// --- Image-carry (parity #29) — MIRRORS the backend authority ----------------
+// The backend (src/alfred/web/routes_chat.py) is the FAIL-LOUD authority on
+// these caps (ALLOWED_IMAGE_MEDIA_TYPES / MAX_IMAGE_BYTES / MAX_IMAGES_PER_TURN);
+// these FE mirrors are UX-only — they reject early with inline copy so a user
+// isn't surprised by a 400 after the round-trip. Keep them IDENTICAL to the
+// backend constants; a drift means the FE accepts what the backend rejects (or
+// vice-versa). The wire shape is `{ media_type, data }` where `data` is base64
+// WITHOUT the `data:<mime>;base64,` prefix — the caller strips it.
+export const ALLOWED_IMAGE_MEDIA_TYPES = [
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+] as const;
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MiB decoded, per image
+export const MAX_IMAGES_PER_TURN = 4;
+
+// The decoded byte length of a standard base64 string (no data: prefix), derived
+// from length + '=' padding WITHOUT allocating the decoded buffer (a 5 MiB image
+// is ~6.7 MiB of base64 — decoding just to measure it would be wasteful).
+export function base64DecodedBytes(b64: string): number {
+  const len = b64.length;
+  if (len === 0) return 0;
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  return Math.floor((len * 3) / 4) - padding;
+}
+
+// One carried image. `data` is bare standard base64 (the `data:` URI prefix
+// stripped by the composer): non-empty, base64-alphabet only (mirrors the
+// backend's `b64decode(validate=True)`), decoding to ≤ MAX_IMAGE_BYTES.
+export const imageAttachmentSchema = z.object({
+  media_type: z.enum(ALLOWED_IMAGE_MEDIA_TYPES),
+  data: z
+    .string()
+    .min(1)
+    .regex(/^[A-Za-z0-9+/]+={0,2}$/, {
+      message: 'image data must be bare base64 (strip the data: prefix)',
+    })
+    .refine((s) => base64DecodedBytes(s) <= MAX_IMAGE_BYTES, {
+      message: `each image must be ≤ ${MAX_IMAGE_BYTES} bytes (5 MiB) decoded`,
+    }),
+});
+
+export type ImageAttachment = z.infer<typeof imageAttachmentSchema>;
+
 // POST /api/chat/turn body.
 export const chatTurnBodySchema = z.object({
   session_key: z.string().min(1),
@@ -31,6 +76,9 @@ export const chatTurnBodySchema = z.object({
   instance: chatInstanceSchema.optional(),
   // Retry-safety (CONTRACT S6). Relayed verbatim to the transport.
   idempotency_key: idempotencyKeySchema.optional(),
+  // Optional carried screenshots (parity #29) — relayed VERBATIM to the backend
+  // (which re-validates as the authority). Bounded to MAX_IMAGES_PER_TURN.
+  images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_TURN).optional(),
 });
 
 export type ChatTurnBody = z.infer<typeof chatTurnBodySchema>;
