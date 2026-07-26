@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Head from 'next/head';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
+import { NotificationList } from '../components/NotificationList';
 import { ChatThread } from '../components/chat/ChatThread';
 import { ChatTargetPicker } from '../components/chat/ChatTargetPicker';
 import { Composer } from '../components/chat/Composer';
@@ -10,6 +11,7 @@ import { Button } from '../components/ui/button';
 import { authApi } from '../lib/algernon/authClient';
 import { chatApi } from '../lib/algernon/client';
 import { useChat } from '../lib/algernon/useChat';
+import { useNotifications } from '../lib/algernon/useNotifications';
 import { useSession } from '../lib/algernon/useSession';
 import { HOME_INSTANCE_NAME } from '../lib/algernon/instance';
 import { display, subtle } from '../lib/typography';
@@ -52,6 +54,23 @@ export default function ChatPage() {
     instance,
   });
   const booting = status === 'booting';
+
+  // Notification tray (parity #22, POLL slice). The hook fetches on bootstrap
+  // + a focused-only ~60s poll; the effect below adds the after-each-turn
+  // refresh (a completed turn may have triggered a peer notice).
+  const {
+    notifications,
+    unread,
+    ack: ackNotifications,
+    refresh: refreshNotifications,
+  } = useNotifications({ enabled: authed });
+  const wasSending = useRef(false);
+  useEffect(() => {
+    // Refresh on the sending true→false transition only (turn completed) —
+    // the hook's own bootstrap fetch covers mount.
+    if (wasSending.current && !sending) void refreshNotifications();
+    wasSending.current = sending;
+  }, [sending, refreshNotifications]);
 
   // Load the instance switcher's options once signed in (metadata only; the
   // picker hides itself when only the home instance is configured).
@@ -112,7 +131,7 @@ export default function ChatPage() {
       <Head>
         <title>Chat · {INSTANCE_NAME}</title>
       </Head>
-      <Layout onSignOut={() => void handleSignOut()}>
+      <Layout onSignOut={() => void handleSignOut()} unreadCount={unread}>
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h1 className={display}>Chat</h1>
@@ -172,6 +191,20 @@ export default function ChatPage() {
               {notice}
             </p>
           )}
+
+          {/* Notification tray (parity #22, POLL slice — Telegram remains the
+              closed-app channel). Always rendered with an explicit "No
+              notifications" empty state (ILB) so a blank tray is observably
+              deliberate, not a broken section. */}
+          <section data-testid="notifications-section" aria-label="Notifications">
+            <h2 className={`mb-2 ${subtle}`}>
+              Notifications{unread > 0 ? ` · ${unread} unread` : ''}
+            </h2>
+            <NotificationList
+              notifications={notifications}
+              onAck={(ids) => void ackNotifications(ids)}
+            />
+          </section>
 
           {error && (
             <div

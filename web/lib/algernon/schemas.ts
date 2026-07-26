@@ -91,6 +91,41 @@ export const chatOpenBodySchema = z.object({
 // A session_key path/param must be a non-empty string (the backend issues uuids).
 export const sessionKeySchema = z.string().min(1).max(200);
 
+// --- Notifications (parity #22, poll slice) ----------------------------------
+// Typed mirror of the backend notification entry
+// (src/alfred/web/notify_state.py — the backend is the authority). Used to
+// parse-validate the polled list on the client; `ticket_uid` / `issue_url`
+// are '' when the notice wasn't ticket-shaped, and tolerated as absent for
+// forward-compat.
+export const notificationSchema = z.object({
+  id: z.string().min(1),
+  text: z.string(),
+  precedence: z.string(),
+  source: z.string(),
+  ticket_uid: z.string().optional(),
+  issue_url: z.string().optional(),
+  ts: z.string(),
+  read: z.boolean(),
+});
+
+export type Notification = z.infer<typeof notificationSchema>;
+
+// GET /chat/notifications → { notifications: [...], unread }.
+export const notificationsResponseSchema = z.object({
+  notifications: z.array(notificationSchema),
+  unread: z.number(),
+});
+
+// POST /api/chat/notifications/ack body — the BFF trust-boundary guard.
+// Bounded (mirrors the backend MAX_ACK_IDS=200); non-empty string ids only.
+export const MAX_NOTIFICATION_ACK_IDS = 200;
+
+export const notificationsAckBodySchema = z.object({
+  ids: z.array(z.string().min(1).max(64)).min(1).max(MAX_NOTIFICATION_ACK_IDS),
+});
+
+export type NotificationsAckBody = z.infer<typeof notificationsAckBodySchema>;
+
 // POST /api/auth/login body. Light edge guard; the backend is the authority on
 // the uniform { status:"sent" } response (no account enumeration). We only ensure
 // a non-empty string is present so we can return the contract's email_required.

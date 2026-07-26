@@ -17,6 +17,11 @@ type LayoutProps = {
    * Supabase-free (honeydew's Layout called `supabase.auth.signOut()` inline).
    */
   onSignOut?: () => void;
+  /**
+   * Unread-notification count for the nav badge (parity #22). 0 / omitted
+   * renders no badge — the badge is a signal, not a permanent zero counter.
+   */
+  unreadCount?: number;
   /** Max content width; defaults to a comfortable reading column. */
   maxWidthClassName?: string;
 };
@@ -39,6 +44,7 @@ export function Layout({
   children,
   showNav = true,
   onSignOut,
+  unreadCount = 0,
   maxWidthClassName = 'max-w-2xl',
 }: LayoutProps) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -55,6 +61,18 @@ export function Layout({
           >
             <span aria-hidden="true">✦</span>
             {INSTANCE_NAME}
+            {unreadCount > 0 && (
+              // Unread-notification badge (parity #22). Calm honeydew pill —
+              // never danger-red (reserved for true system errors). Hidden at
+              // zero so idle isn't a permanent "0" counter.
+              <span
+                data-testid="nav-unread-badge"
+                aria-label={`${unreadCount} unread notifications`}
+                className="rounded-full bg-honeydew-600 px-2 py-0.5 text-xs font-bold text-white"
+              >
+                {unreadCount}
+              </span>
+            )}
           </Link>
 
           {showNav && (

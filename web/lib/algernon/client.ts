@@ -7,6 +7,8 @@ import type {
   ChatTurnResponse,
   IngestSubmitResponse,
   IngestTargetsResponse,
+  NotificationsAckResponse,
+  NotificationsResponse,
 } from './types';
 import type { ImageAttachment, IngestBody } from './schemas';
 
@@ -54,6 +56,12 @@ export const chatApi = {
       `/api/chat/history/${encodeURIComponent(sessionKey)}` +
         (instance ? `?instance=${encodeURIComponent(instance)}` : ''),
     ),
+  // Notification tray (parity #22, POLL slice — home instance only). The empty
+  // tray is the backend's ILB { notifications: [], unread: 0 }, never an error.
+  notifications: (): Promise<NotificationsResponse> =>
+    getJson<NotificationsResponse>('/api/chat/notifications'),
+  ackNotifications: (ids: string[]): Promise<NotificationsAckResponse> =>
+    postJson<NotificationsAckResponse>('/api/chat/notifications/ack', { ids }),
   // Opens the SSE turn stream and returns the RAW Response so useChat can read
   // res.body.getReader() (the success signal is the terminal `done` frame, not a
   // JSON body). Validation errors come back as JSON BEFORE the stream begins —

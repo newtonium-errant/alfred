@@ -72,6 +72,36 @@ export interface ChatTargetsResponse {
   targets: ChatTarget[];
 }
 
+// --- Notifications (parity #22, poll slice) ----------------------------------
+// Typed mirror of the backend notification tray
+// (src/alfred/web/routes_notify.py — the backend owns the contract). One
+// entry per KAL-LE ticket-created notice (web_notify-tagged peer notices in
+// general); `ticket_uid`/`issue_url` are '' for non-ticket notices.
+export interface NotificationItem {
+  id: string;
+  text: string;
+  precedence: string;
+  source: string;
+  ticket_uid?: string;
+  issue_url?: string;
+  ts: string;
+  read: boolean;
+}
+
+// GET /api/chat/notifications → the caller's own tray, newest-first. An empty
+// tray is the backend's ILB 200 { notifications: [], unread: 0 } — never a 404.
+export interface NotificationsResponse {
+  notifications: NotificationItem[];
+  unread: number;
+}
+
+// POST /api/chat/notifications/ack { ids } → { acked, unread }. Idempotent —
+// re-acking acks 0 and never errors.
+export interface NotificationsAckResponse {
+  acked: number;
+  unread: number;
+}
+
 // The backend error envelope: { error: <code>, detail?: <string> }.
 export interface ApiErrorBody {
   error: string;
