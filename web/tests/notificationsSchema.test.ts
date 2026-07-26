@@ -39,6 +39,25 @@ describe('notificationSchema', () => {
       notificationSchema.safeParse({ ...VALID_ITEM, read: 'no' }).success,
     ).toBe(false);
   });
+
+  it('sanitizes a non-http(s) issue_url to undefined (#22 XSS defense-in-depth)', () => {
+    // The notification survives, but a javascript:/data: url is dropped so it
+    // can never reach the <a href> in the operator's session. (Backend
+    // _safe_http_url is the authority; this mirrors it.)
+    const js = notificationSchema.safeParse({
+      ...VALID_ITEM,
+      issue_url: 'javascript:alert(document.cookie)',
+    });
+    expect(js.success).toBe(true);
+    expect(js.success && js.data.issue_url).toBeUndefined();
+
+    const data = notificationSchema.safeParse({ ...VALID_ITEM, issue_url: 'data:text/html,x' });
+    expect(data.success && data.data.issue_url).toBeUndefined();
+
+    // A valid http(s) url is preserved unchanged.
+    const ok = notificationSchema.safeParse({ ...VALID_ITEM });
+    expect(ok.success && ok.data.issue_url).toBe(VALID_ITEM.issue_url);
+  });
 });
 
 describe('notificationsResponseSchema', () => {

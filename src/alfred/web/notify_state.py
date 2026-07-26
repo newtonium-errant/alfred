@@ -42,6 +42,23 @@ log = get_logger(__name__)
 NOTIFY_CAP = 200
 
 
+def _safe_http_url(value: Any) -> str:
+    """Return ``value`` only if it is an ``http(s)`` URL, else ``""`` (#22 XSS guard).
+
+    A peer-supplied ``issue_url`` is rendered into an ``<a href>`` in the
+    OPERATOR's PWA session, so a ``javascript:`` / ``data:`` scheme would be a
+    stored-XSS sink (React only *warns* on a javascript: href — it does not
+    block it). The backend is the authority: drop any value whose scheme isn't
+    http(s), keeping the field SHAPE (empty string) rather than the dangerous
+    value. Case-insensitive; surrounding whitespace stripped. The FE zod schema
+    mirrors this as defense-in-depth.
+    """
+    s = str(value or "").strip()
+    if s.lower().startswith(("http://", "https://")):
+        return s
+    return ""
+
+
 @dataclass
 class WebNotifyStore:
     """In-memory mirror of the web-notification state file.
@@ -135,6 +152,12 @@ class WebNotifyStore:
 
         Evicts oldest entries beyond :data:`NOTIFY_CAP`. Returns the
         minted entry (id + ts stamped here).
+
+        NOTE (Nit B, accepted-as-documented): there is no ``ticket_uid`` dedup
+        here — a repeated enqueue of the same ticket appends a duplicate entry.
+        Safe while the producer is single-shot best-effort (the KAL-LE ticket
+        poll fires once per ticket); add a ``ticket_uid`` dedup guard if a
+        RETRYING producer is ever introduced.
         """
         entry = {
             "id": uuid.uuid4().hex[:16],
@@ -142,7 +165,9 @@ class WebNotifyStore:
             "precedence": str(precedence or "R"),
             "source": str(source or ""),
             "ticket_uid": str(ticket_uid or ""),
-            "issue_url": str(issue_url or ""),
+            # #22 XSS guard — a peer-supplied issue_url renders into an <a href>
+            # in the operator's session; store it only if it's an http(s) URL.
+            "issue_url": _safe_http_url(issue_url),
             "ts": datetime.now(timezone.utc).isoformat(),
             "read": False,
         }

@@ -168,6 +168,33 @@ class TestWebNotifyStore:
         # Per-user isolation: another key sees nothing.
         assert reloaded.list_for(99) == []
 
+    def test_safe_http_url_scheme_allowlist(self) -> None:
+        # #22 XSS guard: only http(s) survives; everything else → "".
+        from alfred.web.notify_state import _safe_http_url
+
+        assert _safe_http_url("https://github.com/a/b/issues/1") == "https://github.com/a/b/issues/1"
+        assert _safe_http_url("HTTP://x") == "HTTP://x"  # case-insensitive scheme
+        assert _safe_http_url("  https://x  ") == "https://x"  # surrounding ws stripped
+        assert _safe_http_url("javascript:alert(1)") == ""
+        assert _safe_http_url("data:text/html,<script>1</script>") == ""
+        assert _safe_http_url("https:evil") == ""  # requires ://
+        assert _safe_http_url("") == ""
+        assert _safe_http_url(None) == ""
+
+    def test_enqueue_drops_javascript_scheme_issue_url(self, tmp_path: Path) -> None:
+        # A peer-supplied javascript: issue_url must be STORED EMPTY (never the
+        # dangerous value that would render into the operator's <a href>).
+        store = WebNotifyStore.create(tmp_path / "notify.json")
+        entry = store.enqueue(1, text="x", issue_url="javascript:alert(document.cookie)")
+        assert entry["issue_url"] == ""
+        # persists empty across reload...
+        reloaded = WebNotifyStore.create(tmp_path / "notify.json")
+        reloaded.load()
+        assert reloaded.list_for(1)[0]["issue_url"] == ""
+        # ...while a valid http(s) url is preserved.
+        e2 = store.enqueue(1, text="y", issue_url="https://github.com/a/b/issues/2")
+        assert e2["issue_url"] == "https://github.com/a/b/issues/2"
+
     def test_cap_evicts_oldest(self, tmp_path: Path) -> None:
         store = WebNotifyStore.create(tmp_path / "notify.json")
         ids = [

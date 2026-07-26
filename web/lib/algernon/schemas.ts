@@ -103,7 +103,15 @@ export const notificationSchema = z.object({
   precedence: z.string(),
   source: z.string(),
   ticket_uid: z.string().optional(),
-  issue_url: z.string().optional(),
+  // #22 XSS defense-in-depth: a peer-supplied issue_url renders into an
+  // <a href>; sanitize any non-http(s) scheme (javascript:/data:) to undefined
+  // so it never reaches the href. Backend (_safe_http_url) is the authority;
+  // this mirrors it. Transform (not refine) so one bad item can't fail the
+  // whole notifications array and nuke the tray.
+  issue_url: z
+    .string()
+    .optional()
+    .transform((u) => (u && /^https?:\/\//i.test(u.trim()) ? u : undefined)),
   ts: z.string(),
   read: z.boolean(),
 });
