@@ -1405,6 +1405,10 @@ def test_register_web_routes_enabled_mounts_chat_and_auth(tmp_path) -> None:
         "/chat/notifications/ack",
         "/auth/login",
         "/auth/verify",
+        # OTP re-auth (#23): mounted in session mode alongside login/verify,
+        # gated PER-REQUEST by web.auth.otp_enabled (default OFF -> 404).
+        "/auth/otp/request",
+        "/auth/otp/verify",
     }
 
 
