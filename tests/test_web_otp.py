@@ -118,6 +118,7 @@ def _web_config(
     otp_max_attempts: int = 5,
     otp_ttl_minutes: int = 10,
     email_configured: bool = True,
+    users: list | None = None,
 ) -> WebConfig:
     email = (
         WebEmailConfig(
@@ -130,7 +131,11 @@ def _web_config(
     )
     return WebConfig(
         enabled=True,
-        users=[WebUser(name="andrew", role="owner", email="andrew@example.com")],
+        users=(
+            users
+            if users is not None
+            else [WebUser(name="andrew", role="owner", email="andrew@example.com")]
+        ),
         auth=WebAuthConfig(
             session_secret=DUMMY_WEB_SIGNING_SECRET,
             magic_link_ttl_minutes=15,
@@ -404,6 +409,60 @@ async def test_otp_verify_roundtrip_and_token_parity(
     headers = {**_PEER_HEADERS, SESSION_HEADER: body["session_token"]}
     r = await client.post("/chat/open", json={}, headers=headers)
     assert r.status == 200
+
+
+async def test_otp_mint_role_is_live_resolved_not_hardcoded(
+    aiohttp_client, tmp_path, captured_codes
+) -> None:
+    """G1: the minted session token's role is LIVE-resolved from the user's
+    config entry (identity.role), NOT hardcoded to owner. A NON-owner user must
+    get a NON-owner token — the parity test above can't catch a hardcoded-owner
+    mint because its fixture only has an owner. Guards the ``agent=salem``
+    hardcoding-drift class on this token-minting surface (a role-escalation gap).
+    """
+    cfg = _web_config(
+        users=[WebUser(name="member1", role="member", email="member@example.com")]
+    )
+    client, _, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+    await _request_code(client, email="member@example.com")
+    r = await _verify(client, email="member@example.com", code=captured_codes[0])
+    assert r.status == 200
+    body = await r.json()
+    assert body["role"] == "member"  # response role reflects the live entry
+
+    # LOAD-BEARING: the TOKEN's embedded role (``r``) is the credential — a
+    # hardcoded mint role would encode owner-scope for this limited user.
+    payload = verify_session_token(
+        body["session_token"], secret=DUMMY_WEB_SIGNING_SECRET
+    )
+    assert payload is not None
+    assert payload["r"] == "member"
+    assert payload["u"] == "member1"
+
+
+async def test_otp_token_exp_matches_session_ttl(
+    aiohttp_client, tmp_path, captured_codes
+) -> None:
+    """G2: the OTP session token's ``exp`` ≈ now + ``session_ttl_hours`` (parity
+    with the magic-link mint), not a hardcoded/short TTL. The parity test only
+    asserts ``exp > 0``, which a mutated ``ttl_hours=1`` would still pass."""
+    import time
+
+    cfg = _web_config()  # session_ttl_hours=168
+    client, _, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+    await _request_code(client)
+    before = int(time.time())
+    r = await _verify(client, code=captured_codes[0])
+    after = int(time.time())
+    assert r.status == 200
+    payload = verify_session_token(
+        (await r.json())["session_token"], secret=DUMMY_WEB_SIGNING_SECRET
+    )
+    assert payload is not None
+    ttl_seconds = 168 * 3600
+    exp = int(payload["exp"])
+    # exp == mint_time + ttl, and mint_time ∈ [before, after]. Tight tolerance.
+    assert before + ttl_seconds - 2 <= exp <= after + ttl_seconds + 2
 
 
 # ---------------------------------------------------------------------------

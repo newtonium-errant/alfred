@@ -426,9 +426,13 @@ _OTP_CODE_RE = re.compile(r"^[0-9]{6}$")
 def _otp_disabled_response() -> web.StreamResponse:
     """404 for /auth/otp/* while ``web.auth.otp_enabled`` is off.
 
-    The feature is DEFAULT-OFF and must be inert until the operator flips
-    the flag — a 404 (not a 401/503) so the disabled routes are
-    indistinguishable from routes that don't exist."""
+    The feature is DEFAULT-OFF and must be inert until the operator flips the
+    flag. The STATUS is a 404 (not a 401/503) so a probe can't tell a disabled
+    feature from an unconfigured deployment — but the BODY deliberately carries
+    ``{"error": "otp_disabled"}`` so the BFF (``otp/verify.ts``) can
+    graceful-degrade the feature-off case instead of treating it as a generic
+    404. So it is NOT byte-indistinguishable from a nonexistent route: the
+    status is, the body is not, by design."""
     return web.json_response({"error": "otp_disabled"}, status=404)
 
 
