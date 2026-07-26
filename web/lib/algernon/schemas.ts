@@ -149,6 +149,23 @@ export const loginBodySchema = z.object({
 // The magic-link token posted to /api/auth/verify (via the callback).
 export const authTokenSchema = z.string().min(1).max(4096);
 
+// --- OTP re-auth (parity #23 — iOS PWA cookie-jar fix) -----------------------
+// POST /api/auth/otp/request body. Same edge-guard role as loginBodySchema; the
+// backend is the authority on the uniform { status:"sent" } (no enumeration).
+export const otpRequestBodySchema = z.object({
+  email: z.string().trim().min(1).max(320),
+});
+
+// The exact passcode wire shape — mirrors the backend's ^[0-9]{6}$ authority.
+export const OTP_CODE_REGEX = /^[0-9]{6}$/;
+
+// POST /api/auth/otp/verify body. A malformed shape is rejected at the edge
+// with the SAME uniform invalid_or_expired the backend returns (no oracle).
+export const otpVerifyBodySchema = z.object({
+  email: z.string().trim().min(1).max(320),
+  code: z.string().regex(OTP_CODE_REGEX),
+});
+
 // --- Cross-instance ingest (BUILD_DECISIONS §3 / §5) ------------------------
 // An ingested artifact's body is written VERBATIM and can be a whole document,
 // so the cap is far larger than the chat cap — but still bounded (the chat path's
