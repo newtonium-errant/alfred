@@ -93,6 +93,16 @@ class WebAuthConfig:
     (which then fails loud at the signing-secret guard if no secret is set,
     so a typo'd-relay instance fails closed rather than serving an
     unverified surface).
+
+    OTP re-auth (parity #23 — iOS PWA cookie-jar fix): ``otp_enabled``
+    DEFAULTS OFF — the ``/auth/otp/*`` routes answer 404 until the operator
+    flips ``web.auth.otp_enabled: true``. The emailed one-time passcode is
+    typed INTO the already-open PWA so the session cookie lands in the
+    PWA's own cookie jar (a magic link tapped from iOS Mail opens in
+    Safari's separate jar and the PWA stays logged out). Keep-both: the
+    magic-link path is unchanged. ``otp_max_attempts`` is the per-code
+    attempt cap (the cap-th failure burns the code); ``otp_ttl_minutes``
+    is the code's lifetime.
     """
 
     session_secret: str = ""
@@ -100,6 +110,9 @@ class WebAuthConfig:
     magic_link_ttl_minutes: int = 15
     base_url: str = ""
     mode: str = "session"
+    otp_enabled: bool = False
+    otp_max_attempts: int = 5
+    otp_ttl_minutes: int = 10
 
 
 @dataclass
@@ -411,6 +424,15 @@ def _build_auth(raw: Any) -> WebAuthConfig:
         ),
         base_url=str(filtered.get("base_url", "") or ""),
         mode=mode,
+        # OTP re-auth (parity #23). ``otp_enabled`` DEFAULT-OFF — an absent
+        # key keeps the feature inert (the /auth/otp/* routes 404).
+        otp_enabled=bool(filtered.get("otp_enabled", False)),
+        otp_max_attempts=_int(
+            filtered.get("otp_max_attempts"), defaults.otp_max_attempts
+        ),
+        otp_ttl_minutes=_int(
+            filtered.get("otp_ttl_minutes"), defaults.otp_ttl_minutes
+        ),
     )
 
 

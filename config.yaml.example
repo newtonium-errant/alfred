@@ -609,6 +609,14 @@ transport:
 #     session_ttl_hours: 168          # 7-day session token lifetime
 #     magic_link_ttl_minutes: 15      # short-lived, single-use login link
 #     base_url: "${ALFRED_WEB_BASE_URL}"   # public origin (cloudflared subdomain)
+#     # --- OTP re-auth (parity #23, the iOS PWA cookie-jar fix) ---
+#     # An emailed 6-digit code typed INTO the already-open PWA, so the
+#     # session cookie lands in the PWA's own jar (a magic link tapped from
+#     # iOS Mail opens in Safari's separate jar). DEFAULT OFF — /auth/otp/*
+#     # answers 404 until this is flipped. Magic-link stays for desktop.
+#     otp_enabled: false
+#     otp_max_attempts: 5             # per-code tries; the 5th failure burns it
+#     otp_ttl_minutes: 10             # code lifetime; single-use on success
 #   email:
 #     provider: resend
 #     api_key: "${RESEND_API_KEY}"

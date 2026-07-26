@@ -7,8 +7,8 @@ it NEVER crashes, so the rest of the web surface (chat) proceeds without
 email wired. ``httpx`` is already a project dependency (transcribe / tts /
 transport client) — no new dependency.
 
-Never logs the magic link or token (both secret). Logs recipient presence
-as a bool, not the address.
+Never logs the magic link, token, or OTP code (all secret). Logs
+recipient presence as a bool, not the address.
 """
 
 from __future__ import annotations
@@ -63,6 +63,80 @@ async def send_magic_link(
         f'<p><a href="{link}">Sign in</a></p>'
         "<p>This link expires shortly and can be used only once. "
         "If you didn't request it, you can ignore this email.</p>"
+    )
+    payload = {
+        "from": cfg.from_address,
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                _RESEND_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {cfg.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except Exception as exc:  # noqa: BLE001 — transport error → soft-fail
+        log.warning(
+            "web.email.send_error",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return False
+
+    if resp.status_code // 100 != 2:
+        body_tail = (resp.text or "")[:200]
+        log.warning(
+            "web.email.send_failed",
+            status=resp.status_code,
+            body_tail=body_tail,
+        )
+        return False
+
+    log.info(
+        "web.email.sent",
+        status=resp.status_code,
+        recipient_present=bool(to_email),
+    )
+    return True
+
+
+async def send_otp_code(
+    cfg: WebEmailConfig,
+    to_email: str,
+    code: str,
+    *,
+    instance_name: str = "",
+) -> bool:
+    """Send a one-time sign-in passcode via Resend. Returns success.
+
+    Mirrors :func:`send_magic_link`'s soft-fail contract: ``False`` (never
+    raises) on missing/unresolved creds, transport error, or non-2xx —
+    the caller maps that to a 503. The CODE is secret and is NEVER logged
+    (only send status / recipient presence).
+    """
+    if not email_configured(cfg):
+        log.warning(
+            "web.email.not_configured",
+            detail=(
+                "Resend api_key / from_address unset or unresolved "
+                "(${...} placeholder) — OTP code NOT sent"
+            ),
+            recipient_present=bool(to_email),
+        )
+        return False
+
+    subject = f"Your {instance_name or 'Algernon'} sign-in code"
+    html = (
+        "<p>Your sign-in code is:</p>"
+        f'<p style="font-size:28px;font-weight:bold;letter-spacing:4px">{code}</p>'
+        "<p>Enter it in the app you requested it from. It expires shortly "
+        "and can be used only once. If you didn't request it, you can "
+        "ignore this email.</p>"
     )
     payload = {
         "from": cfg.from_address,

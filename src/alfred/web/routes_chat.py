@@ -1223,7 +1223,14 @@ def register_web_routes(
         from .routes_auth import register_auth_handlers
 
         register_auth_handlers(app)
-        mounted_routes += ["/auth/login", "/auth/verify"]
+        # /auth/otp/* (#23) are mounted but answer 404 until the operator
+        # flips web.auth.otp_enabled (default OFF — per-request gate).
+        mounted_routes += [
+            "/auth/login",
+            "/auth/verify",
+            "/auth/otp/request",
+            "/auth/otp/verify",
+        ]
     else:
         # Intentionally-left-blank: relay mode deliberately omits the login
         # surface, logged so "no /auth routes" is a deliberate state, not a

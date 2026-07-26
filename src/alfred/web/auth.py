@@ -162,6 +162,30 @@ def _verify_typed(
 
 
 # ---------------------------------------------------------------------------
+# OTP code hashing (parity #23 — iOS PWA re-auth)
+# ---------------------------------------------------------------------------
+
+# Domain-separation prefix so an OTP-code HMAC can never be confused with a
+# token signature (which HMACs a base64url payload under the same secret).
+_OTP_HASH_DOMAIN = "otp-code-v1"
+
+
+def hash_otp_code(email: str, code: str, *, secret: str) -> str:
+    """HMAC-SHA256 hex of a one-time passcode, bound to its email.
+
+    HASH-ONLY storage invariant: the server persists ONLY this digest —
+    the raw 6-digit code is emailed and never written to state or logs.
+    Binding the (normalised) email into the message means a digest for one
+    address can never validate a guess against another. Verification
+    compares digests with ``hmac.compare_digest`` (timing-safe).
+    """
+    message = f"{_OTP_HASH_DOMAIN}:{email.strip().lower()}:{code}"
+    return hmac.new(
+        secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Mint
 # ---------------------------------------------------------------------------
 
