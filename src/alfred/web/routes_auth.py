@@ -33,9 +33,12 @@ routes answer 404 until flipped), HASH-ONLY storage (HMAC of the code —
 the raw 6 digits are emailed and never persisted or logged), TTL burn
 (``otp_ttl_minutes``), per-code attempt cap (``otp_max_attempts``; the
 cap-th failure burns the code), single-use burn on success, timing-safe
-compare, per-email issuance rate limit, and a single uniform 401
+compare, per-email issuance rate limit, an IP-INDEPENDENT per-email
+failed-verify lockout (#38 — closes the IP-rotation bypass of the per-code
+cap: an attacker rotating client_ip is still bounded by an email-keyed
+guess ceiling, ``otp_email_lockout_*``), and a single uniform 401
 ``invalid_or_expired`` for EVERY rejection (bad code / expired / unknown
-email / exhausted — no oracle).
+email / exhausted / LOCKED — no oracle).
 """
 
 from __future__ import annotations
@@ -53,6 +56,7 @@ from aiohttp import web
 
 from .auth import (
     hash_otp_code,
+    hash_otp_email,
     make_magic_token,
     make_session_token,
     verify_magic_token,
@@ -65,6 +69,19 @@ from .keys import KEY_WEB_AUTH_STATE, KEY_WEB_CONFIG
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+
+def _client_ip(request: web.Request) -> str:
+    """The caller's IP (``request.remote``), or ``""`` when unavailable.
+
+    Single source for the client IP so the ``(client_ip, email)`` issuance
+    limiter reads it one way. Deliberately NOT consulted by the #38 per-email
+    lockout counter — that counter is IP-INDEPENDENT (keyed on the email hash
+    ONLY) so IP rotation cannot widen the guess budget. Kept as a seam so the
+    IP-rotation-bypass-closed test can vary the IP per call and a mutation
+    that (wrongly) folds the IP into the lockout key is caught.
+    """
+    return getattr(request, "remote", None) or ""
 
 
 # --- Login rate limiting (bit b) -------------------------------------------
@@ -279,7 +296,7 @@ async def _handle_auth_login(request: web.Request) -> web.StreamResponse:
     # GLOBAL counter is NOT incremented here — only on an actual send below
     # (record_send), so a junk-email flood can't lock out real logins.
     email_norm = email.strip().lower()
-    client_ip = getattr(request, "remote", None) or ""
+    client_ip = _client_ip(request)
     if not _LOGIN_RATE_LIMITER.allow_attempt((client_ip, email_norm)):
         log.warning(
             "web.auth.login_rate_limited",
@@ -471,7 +488,7 @@ async def _handle_otp_request(request: web.Request) -> web.StreamResponse:
     # Issuance rate limit — checked BEFORE the user lookup so known and
     # unknown emails are limited identically (no enumeration via a 429).
     email_norm = email.strip().lower()
-    client_ip = getattr(request, "remote", None) or ""
+    client_ip = _client_ip(request)
     if not _OTP_RATE_LIMITER.allow_attempt((client_ip, email_norm)):
         log.warning(
             "web.auth.otp_rate_limited",
@@ -562,6 +579,27 @@ async def _handle_otp_verify(request: web.Request) -> web.StreamResponse:
     secret = resolve_signing_secret(web_config.auth)
     provided_hmac = hash_otp_code(email_norm, code, secret=secret)
 
+    # IP-INDEPENDENT per-email failed-verify lockout (#38) — the guess ceiling
+    # that closes the IP-rotation bypass. Keyed on the email HASH ONLY (never
+    # client_ip), so an attacker rotating client_ip cannot widen the budget
+    # (the (client_ip, email) issuance limiter's per-email cap is bypassable
+    # by rotation; this ceiling is not). Layered ON TOP of the #23 per-code
+    # cap / issuance limiter — not replacing them.
+    email_hash = hash_otp_email(email_norm, secret=secret)
+    lockout_threshold = web_config.auth.otp_email_lockout_max_failures
+    lockout_window_s = web_config.auth.otp_email_lockout_window_minutes * 60
+    lockout_cooldown_s = web_config.auth.otp_email_lockout_cooldown_minutes * 60
+    if web_auth_state.otp_email_locked(email_hash):
+        # Rejected on the SHARED uniform 401 — byte-identical to an ordinary
+        # wrong code (no locked-vs-not oracle) — and BEFORE peeking any live
+        # code, so even a CORRECT code is rejected while locked. Burn
+        # comparable time to the real compare (no cheap timing tell).
+        hmac.compare_digest(
+            provided_hmac, hash_otp_code(email_norm, "000000", secret=secret)
+        )
+        log.info("web.auth.otp_verify_rejected", reason="email_locked")
+        return _otp_uniform_401()
+
     # TTL is enforced inside peek (an expired entry is burned on sight);
     # persist the possible burn even on this reject path.
     entry = web_auth_state.peek_otp(email_norm)
@@ -571,6 +609,14 @@ async def _handle_otp_verify(request: web.Request) -> web.StreamResponse:
         # then reject uniformly.
         hmac.compare_digest(
             provided_hmac, hash_otp_code(email_norm, "000000", secret=secret)
+        )
+        # #38 — count this failed guess against the IP-independent per-email
+        # ceiling (a no-live-code miss is still an attempt).
+        web_auth_state.record_otp_email_failure(
+            email_hash,
+            threshold=lockout_threshold,
+            window_s=lockout_window_s,
+            cooldown_s=lockout_cooldown_s,
         )
         try:
             web_auth_state.save()
@@ -584,6 +630,13 @@ async def _handle_otp_verify(request: web.Request) -> web.StreamResponse:
     max_attempts = web_config.auth.otp_max_attempts
     if int(entry.get("attempts", 0)) >= max_attempts:
         web_auth_state.consume_otp(email_norm)
+        # #38 — an over-cap attempt is still a failed guess.
+        web_auth_state.record_otp_email_failure(
+            email_hash,
+            threshold=lockout_threshold,
+            window_s=lockout_window_s,
+            cooldown_s=lockout_cooldown_s,
+        )
         try:
             web_auth_state.save()
         except OSError:
@@ -597,6 +650,14 @@ async def _handle_otp_verify(request: web.Request) -> web.StreamResponse:
         provided_hmac.encode("ascii"),
     ):
         attempts = web_auth_state.record_otp_failure(email_norm, max_attempts)
+        # #38 — the wrong guess also counts against the IP-independent
+        # per-email ceiling (this is the counter IP rotation cannot escape).
+        email_entry = web_auth_state.record_otp_email_failure(
+            email_hash,
+            threshold=lockout_threshold,
+            window_s=lockout_window_s,
+            cooldown_s=lockout_cooldown_s,
+        )
         try:
             web_auth_state.save()
         except OSError:
@@ -606,12 +667,17 @@ async def _handle_otp_verify(request: web.Request) -> web.StreamResponse:
             reason="bad_code",
             attempts=attempts,
             burned=attempts >= max_attempts,
+            email_failures=int(email_entry.get("count", 0)),
+            email_locked=float(email_entry.get("locked_until", 0)) > 0,
         )
         return _otp_uniform_401()
 
-    # Match — SINGLE-USE BURN first, saved immediately so the consumption
-    # is durable even if a later step fails (a verified code must never be
+    # Match — clear the IP-independent per-email failure counter (#38): a
+    # correct code proves the requester holds it, so their guess budget
+    # resets. Then SINGLE-USE BURN, saved immediately so the consumption is
+    # durable even if a later step fails (a verified code must never be
     # replayable). Mirrors the nonce-consume ordering in /auth/verify.
+    web_auth_state.clear_otp_email_failures(email_hash)
     web_auth_state.consume_otp(email_norm)
     try:
         web_auth_state.save()

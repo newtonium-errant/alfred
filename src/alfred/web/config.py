@@ -103,6 +103,20 @@ class WebAuthConfig:
     magic-link path is unchanged. ``otp_max_attempts`` is the per-code
     attempt cap (the cap-th failure burns the code); ``otp_ttl_minutes``
     is the code's lifetime.
+
+    Per-email failed-verify lockout (#38 — IP-independent guess ceiling):
+    the #23 per-code cap + ``(client_ip, email)`` issuance limiter leave one
+    low-sev gap — an attacker ROTATING client_ip bypasses the per-email
+    issuance cap and is bounded only by the shared global send ceiling
+    (~100 guesses/15min vs a 1e6 space). These three knobs add an
+    IP-INDEPENDENT per-email failed-verify counter so IP rotation cannot
+    widen the budget. ``otp_email_lockout_max_failures`` failed verifies for
+    one email within ``otp_email_lockout_window_minutes`` LOCK further
+    verifies for ``otp_email_lockout_cooldown_minutes`` (a locked email
+    returns the SAME uniform 401 — no oracle). All three matter only when
+    ``otp_enabled``; the default threshold (20) sits far above a real user's
+    fumble (bounded by the per-code cap of 5) and far below the IP-rotation
+    ceiling (~100/15min).
     """
 
     session_secret: str = ""
@@ -113,6 +127,9 @@ class WebAuthConfig:
     otp_enabled: bool = False
     otp_max_attempts: int = 5
     otp_ttl_minutes: int = 10
+    otp_email_lockout_max_failures: int = 20
+    otp_email_lockout_window_minutes: int = 15
+    otp_email_lockout_cooldown_minutes: int = 15
 
 
 @dataclass
@@ -432,6 +449,20 @@ def _build_auth(raw: Any) -> WebAuthConfig:
         ),
         otp_ttl_minutes=_int(
             filtered.get("otp_ttl_minutes"), defaults.otp_ttl_minutes
+        ),
+        # Per-email failed-verify lockout (#38). Conservative defaults; only
+        # matter when otp_enabled.
+        otp_email_lockout_max_failures=_int(
+            filtered.get("otp_email_lockout_max_failures"),
+            defaults.otp_email_lockout_max_failures,
+        ),
+        otp_email_lockout_window_minutes=_int(
+            filtered.get("otp_email_lockout_window_minutes"),
+            defaults.otp_email_lockout_window_minutes,
+        ),
+        otp_email_lockout_cooldown_minutes=_int(
+            filtered.get("otp_email_lockout_cooldown_minutes"),
+            defaults.otp_email_lockout_cooldown_minutes,
         ),
     )
 

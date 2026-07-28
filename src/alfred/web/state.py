@@ -13,10 +13,21 @@ code exists only in the email and in the request that verifies it. Same
 single-use discipline as the nonce (pop on success), plus a per-code
 ``attempts`` counter (the cap-th failure burns the code) and a TTL burn.
 
+Per-email failed-verify lockout (#38) — ``otp_email_failures`` maps an
+email HASH (``hash_otp_email``, IP-INDEPENDENT) → ``{count, window_start,
+locked_until}``. It bounds total failed /auth/otp/verify guesses per email
+across ALL client IPs and ALL issued codes, closing the IP-rotation bypass
+of the per-code cap + the ``(client_ip, email)`` issuance limiter. Keyed on
+the email ONLY — never the IP — so IP rotation cannot widen the guess
+budget. Windowed + self-healing: the count decays after the window and the
+lock clears after the cooldown.
+
 Schema-tolerance: a corrupt / partial file is logged and tolerated (the
 in-memory default heals on next save), and only the known top-level keys
-are read — an older/newer file with extra keys loads without crashing
-(an older daemon reading a newer file simply ignores ``otp_codes``).
+are read — an older/newer file with extra keys loads without crashing (an
+older daemon reading a newer file simply ignores ``otp_codes`` /
+``otp_email_failures``; a pre-#38 file with no ``otp_email_failures`` key
+loads to an empty dict).
 """
 
 from __future__ import annotations
@@ -32,6 +43,16 @@ import structlog
 
 log = structlog.get_logger()
 
+# Bound the persisted ``otp_email_failures`` dict. A caller with the BFF peer
+# token can drive /auth/otp/verify for arbitrarily many DISTINCT emails (each
+# a fresh no-live-code failure → a new entry), so this store — unlike the
+# per-code map, which only holds emails that were actually issued a code —
+# is attacker-growable. When over the cap the entry with the OLDEST activity
+# (``max(window_start, locked_until)``) is evicted; a currently-locked entry
+# has ``locked_until`` in the future → freshest activity → survives eviction,
+# so a flood of junk emails can never evict a real victim's live lockout.
+_MAX_EMAIL_FAILURE_KEYS = 4096
+
 
 @dataclass
 class WebAuthState:
@@ -44,12 +65,19 @@ class WebAuthState:
     int, "attempts": int}`` — one outstanding OTP per (lowercased) email;
     a new request REPLACES the old entry. HASH-ONLY: ``code_hmac`` is the
     HMAC of the code, never the raw 6 digits.
+
+    ``otp_email_failures`` (#38) maps an email HASH (``hash_otp_email``,
+    IP-independent) -> ``{"count": int, "window_start": float,
+    "locked_until": float}`` — the rolling per-email failed-verify counter
+    that locks further verifies once ``count`` reaches the threshold within
+    the window, closing the IP-rotation brute-force bypass.
     """
 
     state_path: Path
     version: int = 1
     nonces: dict[str, dict[str, Any]] = field(default_factory=dict)
     otp_codes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    otp_email_failures: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # --- load/save ---------------------------------------------------------
 
@@ -86,10 +114,19 @@ class WebAuthState:
             for k, v in otp_raw.items()
             if isinstance(v, dict)
         }
+        # #38 — schema-tolerant: a pre-#38 file has no ``otp_email_failures``
+        # key, so this coalesces to ``{}`` (no lockout state carried forward).
+        ef_raw = raw.get("otp_email_failures", {}) or {}
+        self.otp_email_failures = {
+            str(k): dict(v)
+            for k, v in ef_raw.items()
+            if isinstance(v, dict)
+        }
         log.info(
             "web.auth_state.loaded",
             nonces=len(self.nonces),
             otp_codes=len(self.otp_codes),
+            otp_email_failures=len(self.otp_email_failures),
         )
 
     def save(self) -> None:
@@ -98,6 +135,7 @@ class WebAuthState:
             "version": self.version,
             "nonces": self.nonces,
             "otp_codes": self.otp_codes,
+            "otp_email_failures": self.otp_email_failures,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -209,3 +247,91 @@ class WebAuthState:
         a later step of the request fails — a verified code can never be
         replayed."""
         return self.otp_codes.pop(email, None)
+
+    # --- Per-email failed-verify lockout (#38) -----------------------------
+    # An IP-INDEPENDENT guess ceiling. ``email_hash`` is ``hash_otp_email``
+    # (keyed on the normalized email ONLY, never client_ip) so an attacker
+    # rotating client_ip cannot widen the budget. Layered ON TOP of the #23
+    # per-code cap / issuance limiter, not replacing them.
+
+    def otp_email_locked(self, email_hash: str, now: float | None = None) -> bool:
+        """True while ``email_hash`` is inside its lockout cooldown.
+
+        A locked email must have its /auth/otp/verify rejected with the SAME
+        uniform 401 as an ordinary wrong code (no locked-vs-not oracle) — the
+        caller gates on this BEFORE peeking any live code, so even a correct
+        code is rejected while locked. Self-healing: once ``now`` passes
+        ``locked_until`` this returns ``False`` and the counter is reset on the
+        next failure (see :meth:`record_otp_email_failure`)."""
+        entry = self.otp_email_failures.get(email_hash)
+        if entry is None:
+            return False
+        current = time.time() if now is None else now
+        return current < float(entry.get("locked_until", 0))
+
+    def record_otp_email_failure(
+        self,
+        email_hash: str,
+        *,
+        threshold: int,
+        window_s: float,
+        cooldown_s: float,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Count ONE failed verify against ``email_hash`` (any non-success:
+        wrong code / expired / no-live-code). Returns the updated entry.
+
+        Windowed + self-healing. The count accumulates within a rolling
+        ``window_s``; the counter RESETS to a fresh window when (a) there is
+        no entry, (b) the window has elapsed since ``window_start`` (a legit
+        user's occasional fumble decays and never accumulates to a lockout),
+        or (c) a prior lock has expired (``now >= locked_until`` — the
+        post-cooldown fresh budget, so a single post-cooldown failure can't
+        instantly re-lock). When ``count`` reaches ``threshold`` a
+        ``locked_until = now + cooldown_s`` is armed. Caller saves.
+
+        Keyed on ``email_hash`` ONLY — never client_ip — so IP rotation does
+        not widen the budget (that is the whole point of #38). Bounded: the
+        store is capped at :data:`_MAX_EMAIL_FAILURE_KEYS` (attacker-growable
+        via distinct-email flooding), evicting the oldest-activity entry."""
+        current = time.time() if now is None else now
+        entry = self.otp_email_failures.get(email_hash)
+        window_start = float(entry.get("window_start", 0)) if entry else 0.0
+        locked_until = float(entry.get("locked_until", 0)) if entry else 0.0
+        reset = (
+            entry is None
+            or (current - window_start >= window_s)
+            or (locked_until > 0 and current >= locked_until)
+        )
+        # When ``reset`` is False, ``entry`` is guaranteed non-None (the first
+        # ``reset`` clause is ``entry is None``), so the accumulate path below
+        # is safe.
+        if reset:
+            entry = {"count": 0, "window_start": current, "locked_until": 0}
+        assert entry is not None  # narrows for the type-checker; see above
+        entry["count"] = int(entry.get("count", 0)) + 1
+        if entry["count"] >= threshold:
+            entry["locked_until"] = current + cooldown_s
+        self.otp_email_failures[email_hash] = entry
+        self._bound_email_failures()
+        return entry
+
+    def clear_otp_email_failures(self, email_hash: str) -> None:
+        """Drop ``email_hash``'s failure counter — called on a SUCCESSFUL
+        verify (a correct code proves the requester holds it, so their guess
+        budget resets). Caller saves."""
+        self.otp_email_failures.pop(email_hash, None)
+
+    def _bound_email_failures(self) -> None:
+        """Evict the oldest-activity entry when over the cap. Activity is
+        ``max(window_start, locked_until)`` so a live lock (``locked_until`` in
+        the future) is the freshest and survives a junk-email flood."""
+        while len(self.otp_email_failures) > _MAX_EMAIL_FAILURE_KEYS:
+            oldest = min(
+                self.otp_email_failures,
+                key=lambda k: max(
+                    float(self.otp_email_failures[k].get("window_start", 0)),
+                    float(self.otp_email_failures[k].get("locked_until", 0)),
+                ),
+            )
+            self.otp_email_failures.pop(oldest, None)

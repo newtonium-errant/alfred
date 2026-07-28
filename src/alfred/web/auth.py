@@ -169,6 +169,11 @@ def _verify_typed(
 # token signature (which HMACs a base64url payload under the same secret).
 _OTP_HASH_DOMAIN = "otp-code-v1"
 
+# Distinct domain for the per-email failed-verify lockout key (#38) — so an
+# email-only digest can never collide with a code digest (which additionally
+# binds the 6-digit code) or a token signature under the same secret.
+_OTP_EMAIL_HASH_DOMAIN = "otp-email-v1"
+
 
 def hash_otp_code(email: str, code: str, *, secret: str) -> str:
     """HMAC-SHA256 hex of a one-time passcode, bound to its email.
@@ -180,6 +185,25 @@ def hash_otp_code(email: str, code: str, *, secret: str) -> str:
     compares digests with ``hmac.compare_digest`` (timing-safe).
     """
     message = f"{_OTP_HASH_DOMAIN}:{email.strip().lower()}:{code}"
+    return hmac.new(
+        secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def hash_otp_email(email: str, *, secret: str) -> str:
+    """HMAC-SHA256 hex of a NORMALIZED email — the lockout counter key (#38).
+
+    Keyed on the (normalised) email ONLY, NEVER the client IP: the #38
+    hardening adds an IP-INDEPENDENT per-email failed-verify ceiling so an
+    attacker rotating ``client_ip`` cannot widen the 6-digit guess budget
+    (the issuance rate-limiter's ``(client_ip, email)`` per-email cap is
+    bypassable by IP rotation; this ceiling is not). HMAC with the instance
+    secret (not a bare hash) so the small email space is not precomputable,
+    and domain-separated (:data:`_OTP_EMAIL_HASH_DOMAIN`) so this digest can
+    never collide with a code digest or a token signature. Hash-only, like
+    the code store — the raw address is not the lookup key.
+    """
+    message = f"{_OTP_EMAIL_HASH_DOMAIN}:{email.strip().lower()}"
     return hmac.new(
         secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
     ).hexdigest()

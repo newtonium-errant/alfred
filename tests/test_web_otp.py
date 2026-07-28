@@ -54,7 +54,7 @@ from alfred.transport.config import (
 from alfred.transport.server import build_app
 from alfred.transport.state import TransportState
 from alfred.web import routes_auth as auth_routes_mod
-from alfred.web.auth import SESSION_HEADER, verify_session_token
+from alfred.web.auth import SESSION_HEADER, hash_otp_email, verify_session_token
 from alfred.web.config import (
     WebAuthConfig,
     WebConfig,
@@ -117,6 +117,9 @@ def _web_config(
     otp_enabled: bool = True,
     otp_max_attempts: int = 5,
     otp_ttl_minutes: int = 10,
+    otp_email_lockout_max_failures: int = 20,
+    otp_email_lockout_window_minutes: int = 15,
+    otp_email_lockout_cooldown_minutes: int = 15,
     email_configured: bool = True,
     users: list | None = None,
 ) -> WebConfig:
@@ -144,6 +147,9 @@ def _web_config(
             otp_enabled=otp_enabled,
             otp_max_attempts=otp_max_attempts,
             otp_ttl_minutes=otp_ttl_minutes,
+            otp_email_lockout_max_failures=otp_email_lockout_max_failures,
+            otp_email_lockout_window_minutes=otp_email_lockout_window_minutes,
+            otp_email_lockout_cooldown_minutes=otp_email_lockout_cooldown_minutes,
         ),
         email=email,
     )
@@ -674,3 +680,208 @@ def test_web_auth_state_load_tolerates_missing_otp_key(tmp_path) -> None:
     st = WebAuthState.create(p)
     st.load()
     assert st.otp_codes == {}
+
+
+# ===========================================================================
+# #38 — IP-INDEPENDENT per-email failed-verify lockout (brute-force ceiling)
+#
+# Closes the ONE low-sev gap #23 flagged: the per-code 5-attempt cap +
+# (client_ip, email) issuance limiter are bypassable by IP rotation (rotate
+# client_ip → dodge the per-email issuance cap → ~100 guesses/15min vs 1e6).
+# The lockout counter is keyed on the NORMALIZED EMAIL ONLY (never client_ip)
+# so IP rotation cannot widen the guess budget. It is layered ON TOP of the
+# #23 controls (which stay green above) — never replacing them.
+# ===========================================================================
+
+_EMAIL_HASH = hash_otp_email("andrew@example.com", secret=DUMMY_WEB_SIGNING_SECRET)
+
+
+def test_otp_email_lockout_defaults_dataclass() -> None:
+    # MUTATION PIN: the conservative defaults. 20 sits far above a real user's
+    # fumble (bounded by the per-code cap of 5) and far below the ~100/15min
+    # IP-rotation ceiling. Windows default to 15 minutes.
+    c = WebAuthConfig()
+    assert c.otp_email_lockout_max_failures == 20
+    assert c.otp_email_lockout_window_minutes == 15
+    assert c.otp_email_lockout_cooldown_minutes == 15
+
+
+def test_otp_email_lockout_config_from_unified() -> None:
+    # An operator YAML that never mentions the knobs loads the defaults; and
+    # the knobs parse when present.
+    default = load_from_unified({"web": {"auth": {"session_secret": "s"}}})
+    assert default.auth.otp_email_lockout_max_failures == 20
+    cfg = load_from_unified(
+        {
+            "web": {
+                "auth": {
+                    "otp_email_lockout_max_failures": 7,
+                    "otp_email_lockout_window_minutes": 3,
+                    "otp_email_lockout_cooldown_minutes": 9,
+                }
+            }
+        }
+    )
+    assert cfg.auth.otp_email_lockout_max_failures == 7
+    assert cfg.auth.otp_email_lockout_window_minutes == 3
+    assert cfg.auth.otp_email_lockout_cooldown_minutes == 9
+
+
+async def test_otp_email_lockout_closes_ip_rotation_bypass(
+    aiohttp_client, tmp_path, captured_codes, monkeypatch
+) -> None:
+    """THE #38 point — the failed-verify ceiling is IP-INDEPENDENT.
+
+    We vary the client IP on EVERY call through the ``_client_ip`` seam; the
+    correct per-email counter (keyed on the email hash only) still locks after
+    the threshold, and the email is then rejected even with the CORRECT code
+    from a fresh IP.
+
+    MUTATION PIN: fold ``client_ip`` into ``record_otp_email_failure``'s key
+    and this goes RED — the failures below are spread one-per-IP, so a
+    per-(ip,email) counter never reaches the threshold, the email never locks,
+    and the correct code at the end would (wrongly) succeed (200 != 401).
+    """
+    import itertools
+
+    ip_seq = itertools.count()
+    monkeypatch.setattr(
+        auth_routes_mod, "_client_ip", lambda request: f"10.0.0.{next(ip_seq)}"
+    )
+    cfg = _web_config(otp_email_lockout_max_failures=8)
+    client, _, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+
+    # 8 failed verifies for ONE email, each from a DIFFERENT client_ip.
+    for _ in range(8):
+        assert (await _verify(client, code="000000")).status == 401
+
+    # Locked regardless of IP: issue a fresh, LIVE code and present the CORRECT
+    # value from yet another IP — still the uniform 401.
+    await _request_code(client)
+    correct = captured_codes[0]
+    r = await _verify(client, code=correct)
+    assert r.status == 401
+    assert await r.json() == UNIFORM_401_BODY
+
+
+async def test_otp_locked_email_verify_indistinguishable_from_wrong_code(
+    aiohttp_client, tmp_path, captured_codes
+) -> None:
+    # NO ENUMERATION ORACLE: a locked-out email's verify response is
+    # byte-identical to an ordinary wrong-code 401, and issuance stays uniform.
+    cfg = _web_config(otp_email_lockout_max_failures=5)
+    client, _, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+
+    # Reference shape: an ordinary wrong-code 401 against a live code (this is
+    # also email failure #1).
+    await _request_code(client)
+    code = captured_codes[0]
+    ref = await _verify(client, code=_wrong_code(code))
+    ref_pair = (ref.status, await ref.json())
+    assert ref_pair == (401, UNIFORM_401_BODY)
+
+    # Drive to the threshold (4 more → count 5 → locked).
+    for _ in range(4):
+        assert (await _verify(client, code=_wrong_code(code))).status == 401
+
+    # A verify against the now-locked email is byte-identical to the wrong-code
+    # reference (status AND body) — no locked-vs-not oracle. Correct code too.
+    locked = await _verify(client, code=code)
+    assert (locked.status, await locked.json()) == ref_pair
+
+    # Issuance for a locked email stays the uniform {status: sent}.
+    req = await _request_code(client)
+    assert req.status == 200
+    assert (await req.json())["status"] == "sent"
+
+
+async def test_otp_no_false_lockout_for_legit_fumble(
+    aiohttp_client, tmp_path, captured_codes
+) -> None:
+    # NO FALSE LOCKOUT: a real user who fumbles 1-2 codes then types the right
+    # one succeeds and is NOT locked (well under the default-20 threshold).
+    client, auth_state, _ = await _make_client(
+        aiohttp_client, tmp_path, _web_config()
+    )
+    await _request_code(client)
+    code = captured_codes[0]
+    assert (await _verify(client, code=_wrong_code(code))).status == 401
+    assert (await _verify(client, code=_wrong_code(code))).status == 401
+    assert (await _verify(client, code=code)).status == 200
+    assert not auth_state.otp_email_locked(_EMAIL_HASH)
+    assert _EMAIL_HASH not in auth_state.otp_email_failures  # cleared on success
+
+
+async def test_otp_lockout_self_heals_after_cooldown(
+    aiohttp_client, tmp_path, captured_codes
+) -> None:
+    # SELF-HEAL: after the window/cooldown elapses the email can verify again.
+    cfg = _web_config(otp_email_lockout_max_failures=5)
+    client, auth_state, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+
+    for _ in range(5):
+        assert (await _verify(client, code="000000")).status == 401
+    assert auth_state.otp_email_locked(_EMAIL_HASH)
+
+    # A live, correct code is still rejected while locked (lock gate is BEFORE
+    # peek, so the code is never touched/burned).
+    await _request_code(client)
+    code = captured_codes[0]
+    assert (await _verify(client, code=code)).status == 401
+
+    # Simulate the cooldown + window elapsing (server-side clock authority).
+    entry = auth_state.otp_email_failures[_EMAIL_HASH]
+    entry["locked_until"] = 1  # in the past
+    entry["window_start"] = 1  # window elapsed → fresh budget
+    assert not auth_state.otp_email_locked(_EMAIL_HASH)
+
+    # The SAME live code now verifies — the lockout self-healed.
+    r = await _verify(client, code=code)
+    assert r.status == 200
+
+
+async def test_otp_success_resets_email_failure_counter(
+    aiohttp_client, tmp_path, captured_codes
+) -> None:
+    # RESET-ON-SUCCESS: a successful verify clears the email's failure counter.
+    cfg = _web_config(otp_email_lockout_max_failures=5)
+    client, auth_state, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+
+    await _request_code(client)
+    code = captured_codes[0]
+    # Three wrong guesses (per-code cap is 5, so the code stays live).
+    for _ in range(3):
+        assert (await _verify(client, code=_wrong_code(code))).status == 401
+    assert int(auth_state.otp_email_failures[_EMAIL_HASH]["count"]) == 3
+
+    # A correct code clears the counter entirely (fresh budget).
+    assert (await _verify(client, code=code)).status == 200
+    assert _EMAIL_HASH not in auth_state.otp_email_failures
+
+
+async def test_otp_email_lockout_durable_across_reload(
+    aiohttp_client, tmp_path, captured_codes
+) -> None:
+    # The lock is PERSISTED — a daemon restart must not grant a fresh guess
+    # budget (an attacker can't reset the lock by triggering a restart).
+    cfg = _web_config(otp_email_lockout_max_failures=5)
+    client, _, state_file = await _make_client(aiohttp_client, tmp_path, cfg)
+    for _ in range(5):
+        assert (await _verify(client, code="000000")).status == 401
+    reloaded = WebAuthState.create(state_file)
+    reloaded.load()
+    assert reloaded.otp_email_locked(_EMAIL_HASH)
+
+
+def test_web_auth_state_load_tolerates_missing_otp_email_failures_key(
+    tmp_path,
+) -> None:
+    # A pre-#38 state file (no otp_email_failures key) loads clean → empty.
+    p = tmp_path / "s.json"
+    p.write_text(
+        json.dumps({"version": 1, "nonces": {}, "otp_codes": {}}),
+        encoding="utf-8",
+    )
+    st = WebAuthState.create(p)
+    st.load()
+    assert st.otp_email_failures == {}
