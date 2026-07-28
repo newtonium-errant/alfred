@@ -732,15 +732,24 @@ async def test_otp_email_lockout_closes_ip_rotation_bypass(
 ) -> None:
     """THE #38 point — the failed-verify ceiling is IP-INDEPENDENT.
 
-    We vary the client IP on EVERY call through the ``_client_ip`` seam; the
-    correct per-email counter (keyed on the email hash only) still locks after
-    the threshold, and the email is then rejected even with the CORRECT code
-    from a fresh IP.
+    Faithful to the REAL attack (#38 fix — count-only-live-code-failures): the
+    attacker submits WRONG codes against a LIVE outstanding code for ONE target,
+    each guess from a DIFFERENT client_ip (rotating IP to dodge the
+    ``(client_ip, email)`` issuance limiter, which is the bypass #38 closes).
+    The per-code cap (5) burns a code, so the attacker re-requests — every
+    wrong-guess-against-a-live-code counts against the IP-INDEPENDENT email
+    ceiling regardless of IP. After the threshold the email locks, and a fresh
+    CORRECT code from yet another IP is still rejected.
+
+    (Pre-fix this test drove no-live-code guesses; post-fix those correctly
+    record nothing — see the flood-eviction pin — so it must drive live-code
+    failures to be a faithful attack.)
 
     MUTATION PIN: fold ``client_ip`` into ``record_otp_email_failure``'s key
     and this goes RED — the failures below are spread one-per-IP, so a
-    per-(ip,email) counter never reaches the threshold, the email never locks,
-    and the correct code at the end would (wrongly) succeed (200 != 401).
+    per-(ip,email) counter never reaches the threshold (``otp_email_locked``
+    on the pure-email hash stays False), and the correct code at the end would
+    (wrongly) succeed (200 != 401).
     """
     import itertools
 
@@ -748,17 +757,27 @@ async def test_otp_email_lockout_closes_ip_rotation_bypass(
     monkeypatch.setattr(
         auth_routes_mod, "_client_ip", lambda request: f"10.0.0.{next(ip_seq)}"
     )
-    cfg = _web_config(otp_email_lockout_max_failures=8)
-    client, _, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+    cfg = _web_config(otp_email_lockout_max_failures=8)  # per-code cap stays 5
+    client, auth_state, _ = await _make_client(aiohttp_client, tmp_path, cfg)
 
-    # 8 failed verifies for ONE email, each from a DIFFERENT client_ip.
+    # 8 wrong-code-against-a-LIVE-code failures for ONE email, each from a
+    # DIFFERENT client_ip. Keep a live code in front of every guess: the
+    # per-code cap of 5 burns a code, so re-request when it's gone (IP rotation
+    # dodges the issuance limiter — exactly the bypass being closed).
+    live = ""
     for _ in range(8):
-        assert (await _verify(client, code="000000")).status == 401
+        if auth_state.peek_otp("andrew@example.com") is None:
+            await _request_code(client)
+            live = captured_codes[-1]
+        assert (await _verify(client, code=_wrong_code(live))).status == 401
+    # The IP-independent per-email counter reached the threshold and locked,
+    # even though every failure came from a distinct IP.
+    assert auth_state.otp_email_locked(_EMAIL_HASH)
 
     # Locked regardless of IP: issue a fresh, LIVE code and present the CORRECT
     # value from yet another IP — still the uniform 401.
     await _request_code(client)
-    correct = captured_codes[0]
+    correct = captured_codes[-1]
     r = await _verify(client, code=correct)
     assert r.status == 401
     assert await r.json() == UNIFORM_401_BODY
@@ -819,14 +838,19 @@ async def test_otp_lockout_self_heals_after_cooldown(
     cfg = _web_config(otp_email_lockout_max_failures=5)
     client, auth_state, _ = await _make_client(aiohttp_client, tmp_path, cfg)
 
+    # Drive to lockout with WRONG guesses against a LIVE code (post-fix, only
+    # live-code failures count). The per-code cap is 5, so 5 wrong guesses both
+    # burn the code AND reach the email threshold.
+    await _request_code(client)
+    wrong = _wrong_code(captured_codes[0])
     for _ in range(5):
-        assert (await _verify(client, code="000000")).status == 401
+        assert (await _verify(client, code=wrong)).status == 401
     assert auth_state.otp_email_locked(_EMAIL_HASH)
 
     # A live, correct code is still rejected while locked (lock gate is BEFORE
     # peek, so the code is never touched/burned).
     await _request_code(client)
-    code = captured_codes[0]
+    code = captured_codes[-1]
     assert (await _verify(client, code=code)).status == 401
 
     # Simulate the cooldown + window elapsing (server-side clock authority).
@@ -866,11 +890,91 @@ async def test_otp_email_lockout_durable_across_reload(
     # budget (an attacker can't reset the lock by triggering a restart).
     cfg = _web_config(otp_email_lockout_max_failures=5)
     client, _, state_file = await _make_client(aiohttp_client, tmp_path, cfg)
+    # Drive to lockout with WRONG guesses against a LIVE code (post-fix, only
+    # live-code failures count); 5 wrong == per-code cap == email threshold.
+    await _request_code(client)
+    wrong = _wrong_code(captured_codes[0])
     for _ in range(5):
-        assert (await _verify(client, code="000000")).status == 401
+        assert (await _verify(client, code=wrong)).status == 401
     reloaded = WebAuthState.create(state_file)
     reloaded.load()
     assert reloaded.otp_email_locked(_EMAIL_HASH)
+
+
+async def test_otp_flood_of_no_live_code_emails_cannot_evict_real_target_lockout(
+    aiohttp_client, tmp_path, captured_codes, monkeypatch
+) -> None:
+    """FLOOD-EVICTION REGRESSION PIN — the load-bearing #38-fix guard.
+
+    THE DEFECT (pre-fix): ``otp_email_failures`` was recorded on the no-live-code
+    verify path, so a caller with the BFF peer token could drive
+    /auth/otp/verify for arbitrarily many DISTINCT junk emails (each a fresh
+    no-live-code failure → a new entry). Flooding > the bounded store's cap
+    evicted the entry with the oldest activity — and a real ACCUMULATING target
+    (``window_start`` in the past, ``locked_until`` == 0) is precisely the
+    "oldest" shape, so it was the eviction victim on every insert → its counter
+    reset before reaching the threshold → it NEVER locked → the IP-rotation
+    bypass re-opened via email-flooding. (/auth/otp/verify has no other verify-
+    side rate limiter, so this per-email lockout is the SOLE ceiling.)
+
+    THE FIX: record a per-email failure ONLY when a LIVE code was present, so a
+    no-live-code guess creates ZERO entries and the store holds only emails that
+    were actually issued a code (⊆ allowlisted operators) — structurally
+    un-floodable.
+
+    This pin reproduces the exact attack shape and asserts the fix:
+      (1) the target is driven partway to lockout with genuine live-code
+          failures (the accumulating "oldest" victim shape);
+      (2) a flood of distinct junk no-live-code emails (>> a shrunk store cap)
+          creates ZERO new entries — the store still holds ONLY the target;
+      (3) one more genuine live-code failure tips the target over the threshold
+          → it LOCKS despite the flood.
+
+    MUTATION-VERIFY (performed out-of-band, then reverted): restore
+    ``record_otp_email_failure`` on the no-live-code path in routes_auth (~:615)
+    and this goes RED — the flood fills the shrunk store (assertion 2 fails: the
+    key set is no longer just the target) AND evicts the accumulating target
+    (whose ``window_start`` is oldest), so the final failure resets it to
+    count=1 and it never locks (assertion 3 fails).
+    """
+    import alfred.web.state as state_mod
+
+    # Shrink the bounded store so a small, fast flood exceeds it — the eviction
+    # dynamic that the mutation would exploit is then reproducible in-test.
+    monkeypatch.setattr(state_mod, "_MAX_EMAIL_FAILURE_KEYS", 8)
+
+    cfg = _web_config(otp_email_lockout_max_failures=5, otp_max_attempts=5)
+    client, auth_state, _ = await _make_client(aiohttp_client, tmp_path, cfg)
+
+    # (1) Drive the REAL target most of the way to lockout with genuine
+    # wrong-code-against-a-LIVE-code failures. Its counter is now the
+    # "accumulating" eviction-victim shape: window_start in the past,
+    # locked_until == 0, count just under threshold. The code stays live
+    # (4 < per-code cap of 5).
+    await _request_code(client)  # target andrew@example.com (allowlisted)
+    wrong = _wrong_code(captured_codes[0])
+    for _ in range(4):
+        assert (await _verify(client, code=wrong)).status == 401
+    assert int(auth_state.otp_email_failures[_EMAIL_HASH]["count"]) == 4
+    assert not auth_state.otp_email_locked(_EMAIL_HASH)
+
+    # (2) FLOOD: 40 distinct junk emails (>> the shrunk store cap of 8), each
+    # with NO outstanding code → each hits the no-live-code path. Post-fix each
+    # records NOTHING, so the store never grows and the target is never at risk
+    # of eviction. Every response is the same uniform 401 (no oracle).
+    for i in range(40):
+        r = await _verify(client, email=f"junk{i}@nope.com", code="000000")
+        assert r.status == 401
+        assert await r.json() == UNIFORM_401_BODY
+    # The store holds ONLY the real target — the flood created zero entries.
+    assert set(auth_state.otp_email_failures) == {_EMAIL_HASH}
+    assert int(auth_state.otp_email_failures[_EMAIL_HASH]["count"]) == 4
+
+    # (3) One more genuine live-code failure tips the target over the threshold
+    # → it LOCKS. Pre-fix the flood would have evicted this counter (resetting
+    # it to count=1), so it would NEVER reach the threshold.
+    assert (await _verify(client, code=wrong)).status == 401
+    assert auth_state.otp_email_locked(_EMAIL_HASH)
 
 
 def test_web_auth_state_load_tolerates_missing_otp_email_failures_key(

@@ -610,14 +610,24 @@ async def _handle_otp_verify(request: web.Request) -> web.StreamResponse:
         hmac.compare_digest(
             provided_hmac, hash_otp_code(email_norm, "000000", secret=secret)
         )
-        # #38 — count this failed guess against the IP-independent per-email
-        # ceiling (a no-live-code miss is still an attempt).
-        web_auth_state.record_otp_email_failure(
-            email_hash,
-            threshold=lockout_threshold,
-            window_s=lockout_window_s,
-            cooldown_s=lockout_cooldown_s,
-        )
+        # #38 fix (un-floodable store) — deliberately DO NOT record a per-email
+        # failure on the no-live-code path. A guess against an email with no
+        # live outstanding code achieves nothing (peek is None → the SAME
+        # uniform 401 regardless of the code), so not counting it loses ZERO
+        # protection. But recording it WOULD create an ``otp_email_failures``
+        # entry for ANY email the caller names — letting an attacker flood
+        # ~4096 distinct junk emails to fill / evict from the bounded store and
+        # knock a real ACCUMULATING target's counter out (it looks "oldest"),
+        # so the target never reaches the threshold and never locks — re-opening
+        # the very IP-rotation bypass #38 closed, via email-flooding. Recording
+        # ONLY when a live code was present (the wrong-code / exhausted-attempts
+        # paths below) means entries exist solely for emails that were issued a
+        # code — and a code is only ever issued to an ALLOWLISTED user
+        # (``/auth/otp/request`` → ``web.users``) — so the store is structurally
+        # bounded to ~(operators) and the 4096 cap is never approached: the
+        # flood-eviction attack becomes impossible. The lock GATE above still
+        # rejects a locked email here uniformly; only the RECORDING stops. The
+        # peek above may still have burned an expired entry (TTL); persist that.
         try:
             web_auth_state.save()
         except OSError:

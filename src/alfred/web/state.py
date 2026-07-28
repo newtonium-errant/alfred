@@ -43,14 +43,20 @@ import structlog
 
 log = structlog.get_logger()
 
-# Bound the persisted ``otp_email_failures`` dict. A caller with the BFF peer
-# token can drive /auth/otp/verify for arbitrarily many DISTINCT emails (each
-# a fresh no-live-code failure → a new entry), so this store — unlike the
-# per-code map, which only holds emails that were actually issued a code —
-# is attacker-growable. When over the cap the entry with the OLDEST activity
+# Bound the persisted ``otp_email_failures`` dict — DEFENSE-IN-DEPTH belt, no
+# longer the primary control. The routes_auth caller records a per-email
+# failure ONLY when a LIVE code was present (the wrong-code / exhausted paths),
+# NEVER on the no-live-code path, and a live code only ever exists for an
+# ALLOWLISTED email (``/auth/otp/request`` → ``web.users``). So this store is
+# structurally bounded to ~(number of operators) and this cap is never
+# approached in practice — the earlier flood-eviction attack (fill the store
+# with distinct junk no-live-code emails to evict a real accumulating target)
+# is impossible because junk emails never create an entry at all. The cap +
+# eviction stays purely as a bounded-memory belt (a corrupt/enormous restored
+# file, or a future caller that records more broadly, still can't grow memory
+# without bound). When over the cap the entry with the OLDEST activity
 # (``max(window_start, locked_until)``) is evicted; a currently-locked entry
-# has ``locked_until`` in the future → freshest activity → survives eviction,
-# so a flood of junk emails can never evict a real victim's live lockout.
+# has ``locked_until`` in the future → freshest activity → survives eviction.
 _MAX_EMAIL_FAILURE_KEYS = 4096
 
 
@@ -278,8 +284,16 @@ class WebAuthState:
         cooldown_s: float,
         now: float | None = None,
     ) -> dict[str, Any]:
-        """Count ONE failed verify against ``email_hash`` (any non-success:
-        wrong code / expired / no-live-code). Returns the updated entry.
+        """Count ONE failed verify against ``email_hash``. Returns the updated
+        entry.
+
+        #38 fix — the caller (``_handle_otp_verify``) invokes this ONLY when a
+        LIVE outstanding code was present (the wrong-code / exhausted-attempts
+        paths), NEVER on the no-live-code path. A live code only ever exists for
+        an ALLOWLISTED email, so entries here are bounded to ~(operators) and
+        the store is un-floodable — see :data:`_MAX_EMAIL_FAILURE_KEYS`. (The
+        method itself is generic; the un-floodable invariant lives at the call
+        site, so do not re-add a no-live-code caller without re-opening it.)
 
         Windowed + self-healing. The count accumulates within a rolling
         ``window_s``; the counter RESETS to a fresh window when (a) there is
@@ -292,8 +306,9 @@ class WebAuthState:
 
         Keyed on ``email_hash`` ONLY — never client_ip — so IP rotation does
         not widen the budget (that is the whole point of #38). Bounded: the
-        store is capped at :data:`_MAX_EMAIL_FAILURE_KEYS` (attacker-growable
-        via distinct-email flooding), evicting the oldest-activity entry."""
+        store is capped at :data:`_MAX_EMAIL_FAILURE_KEYS` (a defense-in-depth
+        memory belt — the store is un-floodable at the call site), evicting the
+        oldest-activity entry."""
         current = time.time() if now is None else now
         entry = self.otp_email_failures.get(email_hash)
         window_start = float(entry.get("window_start", 0)) if entry else 0.0
