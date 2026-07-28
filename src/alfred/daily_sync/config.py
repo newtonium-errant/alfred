@@ -241,6 +241,42 @@ class TierRecurrenceConfig:
 
 
 @dataclass
+class TicketNotifyConfig:
+    """#22b — KAL-LE ticket → PWA-notify observability surface (Daily Sync).
+
+    ``enabled`` defaults OFF — a per-instance opt-in (Salem is the first and,
+    today, the only instance that HOSTS the web notify store the KAL-LE
+    ticket→PWA-notify pipeline fans into). When ``true`` the Daily Sync grows
+    a READ-ONLY "Ticket notifications" section that surfaces the ticket
+    notices Salem received since the last sync, FAIL-LOUD: it renders an
+    explicit ⚠️ when the pipeline can't be trusted (web surface off,
+    notifications disabled, no operator to key to, or the store read failed)
+    rather than a silent empty section — so the operator can confirm the
+    #22 pipeline is live in production.
+
+    Operator directive (2026-07): *"to start i want it included in the daily
+    sync so I can see if it's happening. fail loud."* Read-only by design —
+    the PWA notification tray still OWNS read/ack; this section never mutates
+    the store. Instances that don't opt in (KAL-LE / Hypatia) leave this
+    absent → the provider returns None and the section is omitted, so their
+    Daily Sync is byte-unchanged (no false ⚠️).
+
+    The store path is DERIVED (not configured): ``<state.path>.parent /
+    web_notify_state.json`` — the same ``data_dir`` convention the #30 web
+    outbound spool uses (``write_latest(Path(config.state.path).parent, …)``),
+    which is the cross-process contract with the talker daemon that WRITES
+    the store. Add an explicit ``store_path`` override here only if a deploy
+    ever splits the daily_sync state dir from the talker data_dir.
+    """
+
+    enabled: bool = False
+    # Optional explicit override of the derived store path. Empty string =
+    # derive from ``<state.path>.parent / web_notify_state.json`` (the
+    # production case). Present only for split-dir deploys / tests.
+    store_path: str = ""
+
+
+@dataclass
 class DailySyncConfig:
     """Top-level Daily Sync config.
 
@@ -273,6 +309,12 @@ class DailySyncConfig:
     tier_recurrence: TierRecurrenceConfig = field(
         default_factory=TierRecurrenceConfig,
     )
+    # #22b — KAL-LE ticket → PWA-notify observability surface. Defaulted-OFF;
+    # Salem opts in via ``daily_sync.ticket_notify.enabled: true`` (it hosts
+    # the web notify store the pipeline fans into). Read-only fail-loud.
+    ticket_notify: TicketNotifyConfig = field(
+        default_factory=TicketNotifyConfig,
+    )
     # Path to the config file this DailySyncConfig was loaded from.
     # Carried so lazy/late loaders (the canonical-proposals queue-path
     # helpers in ``canonical_proposals_section`` and ``reply_dispatch``)
@@ -300,6 +342,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "thresholds": FrictionThresholdsConfig,
     "routine_match": RoutineMatchConfig,
     "tier_recurrence": TierRecurrenceConfig,
+    "ticket_notify": TicketNotifyConfig,
 }
 
 

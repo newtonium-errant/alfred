@@ -46,6 +46,7 @@ from . import (
     radar_section,
     recurrence_section,
     routine_match_section,
+    ticket_notify_section,
     triage_section,
 )
 from .assembler import assemble_message
@@ -297,6 +298,19 @@ async def fire_once(
     # pending queue on render (idempotent); B2 wires the approve/reject reply routing.
     recurrence_section.set_vault_path(vault_path)
     recurrence_section.register()
+
+    # #22b — KAL-LE ticket → PWA-notify observability surface (READ-ONLY,
+    # FAIL-LOUD). Registered unconditionally — the provider returns None
+    # (section omitted) unless ``daily_sync.ticket_notify.enabled`` is true
+    # (Salem opts in; it hosts the web notify store the pipeline fans into).
+    # It reads the ``web:`` block (web.enabled / notifications / users) from
+    # the stashed raw config to run its state-3 pipeline checks + resolve the
+    # operator key, so hand it the pre-loaded raw config when we have it
+    # (skips the per-fire config-file round-trip). Never mutates the store —
+    # the PWA tray owns read/ack.
+    if raw_config is not None:
+        ticket_notify_section.set_raw_config(raw_config)
+    ticket_notify_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
