@@ -136,6 +136,33 @@ async def _push_brief_to_telegram(
         )
 
 
+def _spool_brief_web_outbound(config: BriefConfig, today: str, content: str) -> None:
+    """Best-effort spool of the rendered brief for the #30 web outbound read
+    route (``GET /web/outbound/brief/latest``).
+
+    The vault write is the primary artifact; a spool failure must NEVER break
+    the caller — so this swallows + logs, mirroring the brief's Telegram-push
+    swallow. Shared by ``generate_brief`` (the scheduled / catch-up run) and
+    ``update_weather`` (a MANUAL ``alfred brief weather`` refresh, so the web
+    copy isn't left stale). ``data_dir`` resolves the same way ``generate_brief``
+    derives it (``config.state.path`` parent). Lazy import so the brief daemon
+    doesn't depend on the web package at module load.
+    """
+    data_dir = str(Path(config.state.path).parent)
+    try:
+        from alfred.web.outbound_store import write_latest
+
+        write_latest(data_dir, "brief", today, content)
+        log.info("brief.web_outbound_written", date=today)
+    except Exception as exc:  # noqa: BLE001 — spool never kills the run
+        log.warning(
+            "brief.web_outbound_write_failed",
+            date=today,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+
+
 async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: bool = False) -> str | None:
     """Generate a morning brief. Returns the vault-relative path, or None if skipped."""
     today = date.today().isoformat()
@@ -360,20 +387,9 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # the web outbound read route (GET /web/outbound/brief/latest).
     # Mirrors the Telegram-push swallow below: the vault write above is
     # the primary artifact, and a spool failure must NEVER break the run
-    # (nor the state update / Telegram push that follow). Lazy import so
-    # the brief daemon doesn't depend on the web package at module load.
-    try:
-        from alfred.web.outbound_store import write_latest
-
-        write_latest(data_dir, "brief", today, content)
-        log.info("brief.web_outbound_written", date=today)
-    except Exception as exc:  # noqa: BLE001 — spool never kills the run
-        log.warning(
-            "brief.web_outbound_write_failed",
-            date=today,
-            error=str(exc),
-            error_type=exc.__class__.__name__,
-        )
+    # (nor the state update / Telegram push that follow). Shared with
+    # update_weather's manual-refresh re-spool via the helper below.
+    _spool_brief_web_outbound(config, today, content)
 
     # Update state
     state_mgr.state.add_run(BriefRun(
@@ -395,32 +411,6 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         )
 
     return rel_path
-
-
-def _spool_brief_web_outbound(config: BriefConfig, today: str, content: str) -> None:
-    """Best-effort spool of the rendered brief for the #30 web outbound read
-    route (``GET /web/outbound/brief/latest``).
-
-    The vault write is the primary artifact; a spool failure must NEVER break
-    the caller — so this swallows + logs, mirroring ``generate_brief``'s spool.
-    Called from ``update_weather`` so a MANUAL ``alfred brief weather`` refresh
-    re-spools too, instead of leaving a stale web copy. ``data_dir`` resolves the
-    same way ``generate_brief`` derives it (``config.state.path`` parent). Lazy
-    import so the brief daemon doesn't depend on the web package at module load.
-    """
-    data_dir = str(Path(config.state.path).parent)
-    try:
-        from alfred.web.outbound_store import write_latest
-
-        write_latest(data_dir, "brief", today, content)
-        log.info("brief.web_outbound_written", date=today)
-    except Exception as exc:  # noqa: BLE001 — spool never kills the run
-        log.warning(
-            "brief.web_outbound_write_failed",
-            date=today,
-            error=str(exc),
-            error_type=exc.__class__.__name__,
-        )
 
 
 async def update_weather(config: BriefConfig) -> str:
