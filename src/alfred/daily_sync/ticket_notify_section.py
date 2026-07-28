@@ -88,6 +88,7 @@ quote it; a rename here = update the SKILL in lockstep.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -271,6 +272,40 @@ def _resolve_store_path(config: DailySyncConfig) -> Path:
     return Path(config.state.path).parent / "web_notify_state.json"
 
 
+def _probe_store_readable(store_path: Path) -> str | None:
+    """Breakage-probe — distinguish PRESENT-BUT-UNREADABLE from ABSENT.
+
+    :meth:`~alfred.web.notify_state.WebNotifyStore.load` is self-healing by
+    contract: it swallows ``(OSError, ValueError)`` and returns an EMPTY
+    store for BOTH a genuinely-absent file (healthy — the pipeline never
+    fired) AND a present-but-broken one (permission-denied / corrupt-JSON).
+    For a FAIL-LOUD observability surface those two must NOT render
+    identically — a present-but-unreadable store silently showing
+    ``(0) none`` is exactly the self-defeating case #22b exists to prevent.
+
+    This is a DETECTION-ONLY probe. When the file EXISTS we re-read it raw
+    (``read_text`` + ``json.loads``) purely to SURFACE an unreadable /
+    corrupt condition as a reason string → the caller renders STATE-3 loud.
+    The parsed value is DISCARDED; the actual data still flows through the
+    store's own ``load()`` / ``list_for()`` (no schema duplication here). A
+    ``PermissionError`` / ``OSError`` (unreadable) or ``JSONDecodeError`` /
+    ``UnicodeDecodeError`` (both ``ValueError`` subclasses — corrupt) yields
+    a reason string. A genuinely ABSENT file returns ``None`` → the caller
+    proceeds to the normal read → STATE-2 healthy (a pipeline that never
+    fired must not scream ⚠️).
+    """
+    if not store_path.exists():
+        return None
+    try:
+        json.loads(store_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # noqa: BLE001 — detection-only probe
+        return (
+            f"ticket-notify store present but unreadable — "
+            f"{exc.__class__.__name__}: {exc}"
+        )
+    return None
+
+
 def _read_notices(config: DailySyncConfig, operator: str) -> list[dict[str, Any]]:
     """Read the operator's notices via the notify store's list API.
 
@@ -391,6 +426,23 @@ def ticket_notify_section(
 
     # (a) — store read, best-effort. A failure becomes STATE 3, never a crash.
     try:
+        # Breakage-probe FIRST. WebNotifyStore.load() self-heals a
+        # present-but-unreadable store to EMPTY (its platform-wide swallow
+        # contract) — which would render a SILENT STATE-2 "(0) none" for a
+        # permission-denied or corrupt-JSON file. For a fail-loud surface
+        # that is self-defeating, so distinguish present-but-broken (→ loud
+        # STATE-3) from genuinely-absent (→ STATE-2 healthy) BEFORE
+        # delegating to the swallowing read.
+        store_path = _resolve_store_path(config)
+        unreadable = _probe_store_readable(store_path)
+        if unreadable is not None:
+            log.warning(
+                "daily_sync.ticket_notify.state3_store_unreadable",
+                date=today.isoformat(),
+                path=str(store_path),
+                reason=unreadable,
+            )
+            return _state3(unreadable)
         notices = _read_notices(config, operator)
     except Exception as exc:  # noqa: BLE001 — read failure → loud, never blocks the fire
         log.warning(

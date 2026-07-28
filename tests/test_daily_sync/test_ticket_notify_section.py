@@ -270,6 +270,87 @@ def test_state3_store_read_raises(
     assert "OSError" in rendered
 
 
+def test_state3_store_present_but_permission_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRESENT-BUT-UNREADABLE (permission-denied) must FAIL LOUD, not
+    render a silent STATE-2 "(0) none".
+
+    ``WebNotifyStore.load()`` self-heals a read failure to EMPTY (its
+    platform-wide swallow contract of ``(OSError, ValueError)``), so
+    without the section's own breakage-probe a permission-denied store
+    file would render as healthy "none" — self-defeating for a fail-loud
+    observability surface. The probe distinguishes present-but-broken
+    from genuinely-absent. Plausible on the box given its andrew/ubuntu
+    ownership history.
+    """
+    cfg = _config(tmp_path)
+    set_raw_config(_web_raw())
+    # A present, well-formed store file that we then make unreadable.
+    _enqueue(cfg, text="ticket we cannot read")
+    store_file = _store_path(cfg)
+    assert store_file.exists()
+
+    real_read_text = Path.read_text
+
+    def _denied(self: Path, *a: Any, **k: Any) -> str:
+        if self.name == store_file.name:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", _denied)
+    rendered = ticket_notify_section(cfg, TODAY)  # MUST NOT raise
+    assert rendered is not None
+    assert rendered.startswith(f"{SECTION_HEADER_BASE} ⚠️")
+    assert "⚠️" in rendered
+    assert "present but unreadable" in rendered
+    assert "PermissionError" in rendered
+    # NOT the silent healthy state.
+    assert "### Ticket notifications (0)" not in rendered
+    assert "No ticket notifications since" not in rendered
+
+
+def test_state3_store_present_but_corrupt_json(tmp_path: Path) -> None:
+    """PRESENT-BUT-CORRUPT (non-JSON / truncated content) must FAIL LOUD.
+
+    The swallowing ``load()`` tolerates a corrupt file to EMPTY (its
+    ``ValueError`` branch — ``json.JSONDecodeError`` is a ``ValueError``)
+    → a silent STATE-2. The breakage-probe surfaces it as a loud STATE-3
+    instead.
+    """
+    cfg = _config(tmp_path)
+    set_raw_config(_web_raw())
+    store_file = _store_path(cfg)
+    store_file.parent.mkdir(parents=True, exist_ok=True)
+    store_file.write_text("{ this is NOT valid json ::: [", encoding="utf-8")
+    rendered = ticket_notify_section(cfg, TODAY)  # MUST NOT raise
+    assert rendered is not None
+    assert rendered.startswith(f"{SECTION_HEADER_BASE} ⚠️")
+    assert "⚠️" in rendered
+    assert "present but unreadable" in rendered
+    # NOT the silent healthy state.
+    assert "### Ticket notifications (0)" not in rendered
+    assert "No ticket notifications since" not in rendered
+
+
+def test_state2_store_genuinely_absent_is_not_loud(tmp_path: Path) -> None:
+    """CONTRAST pin to the two breakage pins above.
+
+    A GENUINELY-ABSENT store file (the pipeline never fired) must render
+    STATE-2 healthy — the explicit ILB line, NEVER a ⚠️. This is the
+    other half of the breakage-probe contract: reverting the probe leaves
+    THIS pin green while turning the two present-but-broken pins red.
+    """
+    cfg = _config(tmp_path)
+    set_raw_config(_web_raw())
+    assert not _store_path(cfg).exists()  # genuinely absent
+    rendered = ticket_notify_section(cfg, TODAY)
+    assert rendered is not None
+    assert "### Ticket notifications (0)" in rendered
+    assert "No ticket notifications since" in rendered
+    assert "⚠️" not in rendered
+
+
 def test_state3_web_config_unresolved(tmp_path: Path) -> None:
     """No raw config stashed AND no config_path → the pipeline can't be
     verified → loud ⚠️ (fail-closed), not a silent empty section."""
