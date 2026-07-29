@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from alfred.health.agent_failure import build_failure_summary, classify_agent_failure
 from alfred.subprocess_env import claude_subprocess_env
 
 from ..config import ClaudeBackendConfig
@@ -70,27 +71,35 @@ class ClaudeBackend(BaseBackend):
             )
         except asyncio.TimeoutError:
             log.error("claude.timeout", timeout=self.config.timeout)
-            return BackendResult(success=False, summary="ERROR: timeout")
+            return BackendResult(success=False, summary="ERROR: timeout", kind="other")
         except FileNotFoundError:
             log.error("claude.command_not_found", command=self.config.command)
             return BackendResult(
                 success=False,
                 summary=f"ERROR: command not found: {self.config.command}",
+                kind="other",
             )
 
         raw = stdout.decode("utf-8", errors="replace")
         err = stderr.decode("utf-8", errors="replace")
 
         if proc.returncode != 0:
+            # Shared classify + summary (see 2026-07-29 weekly-limit incident):
+            # quota / auth banners land on stdout, not stderr.
+            kind = classify_agent_failure(raw, err)
+            summary = build_failure_summary(proc.returncode, raw, err)
             log.warning(
                 "claude.nonzero_exit",
                 code=proc.returncode,
+                kind=kind,
                 stderr=err[:500],
-                stdout_tail=raw[-2000:],
+                stdout_tail=raw[-2000:] if raw else "",
+                summary=summary,
             )
             return BackendResult(
                 success=False,
-                summary=f"Exit code {proc.returncode}: {err[:500]}",
+                summary=summary,
+                kind=kind,
             )
 
         log.info("claude.completed", summary_length=len(raw))

@@ -342,6 +342,7 @@ async def run_sweep(
                         log.error(
                             "sweep.agent_failed",
                             sweep_id=sweep_id,
+                            kind=agent_result.kind,
                             summary=agent_result.summary[:500],
                         )
 

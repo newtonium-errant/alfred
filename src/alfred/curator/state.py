@@ -46,6 +46,14 @@ class State:
     # frontmatter — a frontmatter write would bump the file's mtime and mask
     # Monitor A's delivery-staleness signal (#31).
     failed_attempts: dict[str, int] = field(default_factory=dict)
+    # 2026-07-29 — the most recent AGENT (``claude -p``) failure, so the curator
+    # BIT can surface quota/auth outages that ``last_run`` alone can't (a stale
+    # ``last_run`` can't distinguish "no work" from "every call failing"). Shape:
+    # {"ts": ISO-UTC, "kind": <closed set>, "summary_tail": <bounded CLI message>}.
+    # ``None`` until the first agent failure. Compared against ``last_run`` by
+    # the ``agent-failure-kind`` probe: a failure NEWER than the last success is
+    # an active outage; older means the pipeline recovered.
+    last_agent_failure: dict[str, Any] | None = None
 
     def is_processed(self, filename: str) -> bool:
         return filename in self.processed
@@ -70,6 +78,21 @@ class State:
         # later self-heals must not carry stale attempts toward the cap).
         self.failed_attempts.pop(filename, None)
 
+    def record_agent_failure(self, kind: str, summary: str) -> None:
+        """Stamp the most recent agent (``claude -p``) failure.
+
+        Called from the daemon's ``result.success is False`` branch. Does
+        NOT touch ``last_run`` — that stays the last SUCCESSFUL process, so
+        the BIT probe can compare the two to tell an active outage from a
+        recovered one. ``summary`` is already bounded by
+        ``build_failure_summary`` (<=300 chars); we store its tail defensively.
+        """
+        self.last_agent_failure = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": kind or "other",
+            "summary_tail": (summary or "")[-300:],
+        }
+
     def failed_count(self, filename: str) -> int:
         return self.failed_attempts.get(filename, 0)
 
@@ -87,6 +110,7 @@ class State:
             "last_run": self.last_run,
             "processed": {k: v.to_dict() for k, v in self.processed.items()},
             "failed_attempts": dict(self.failed_attempts),
+            "last_agent_failure": self.last_agent_failure,
         }
 
     @classmethod
@@ -99,11 +123,18 @@ class State:
         failed_attempts = data.get("failed_attempts", {})
         if not isinstance(failed_attempts, dict):
             failed_attempts = {}
+        # Schema-tolerant: state files written before 2026-07-29 have no
+        # ``last_agent_failure`` key → default None. A malformed value
+        # (non-dict) degrades to None rather than crashing the loader.
+        last_agent_failure = data.get("last_agent_failure")
+        if not isinstance(last_agent_failure, dict):
+            last_agent_failure = None
         return cls(
             version=data.get("version", 2),
             last_run=data.get("last_run", ""),
             processed=processed,
             failed_attempts={k: int(v) for k, v in failed_attempts.items()},
+            last_agent_failure=last_agent_failure,
         )
 
 

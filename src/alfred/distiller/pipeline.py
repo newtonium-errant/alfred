@@ -291,24 +291,18 @@ async def _call_llm(
     result = await backend.process(prompt=prompt, vault_path=vault_path)
 
     if not result.success:
-        # Enrich the failure log with stdout diagnostics. The backend's
-        # summary alone reads "Exit code 1: " when both stdout and stderr
-        # are empty — we surface the first 200 chars of stdout (rate-limit
-        # messages and similar errors front-load) plus a tail for grep.
+        # The backend now builds ``result.summary`` from tails of BOTH
+        # streams via ``alfred.health.agent_failure.build_failure_summary``
+        # (never the content-free "Exit code 1: " that stderr-only summaries
+        # produced during the 2026-07-29 weekly-limit outage) and tags a
+        # closed-set ``kind``. Surface both, plus the raw tails for grep.
         raw_stdout = result.stdout or ""
         raw_stderr = result.stderr or ""
-        if raw_stdout:
-            detail = raw_stdout[:200]
-        elif raw_stderr:
-            detail = raw_stderr[:200]
-        else:
-            detail = "(no output)"
-        enriched_summary = f"Exit code 1: {detail}"
         log.warning(
             "pipeline.llm_failed",
             stage=stage_label,
-            summary=enriched_summary[:500],
-            backend_summary=result.summary[:500],
+            summary=result.summary[:500],
+            kind=result.kind,
             stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
             stderr=raw_stderr[:500],
         )

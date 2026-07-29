@@ -19,6 +19,10 @@ class BackendResult:
     stdout: str = ""  # Raw subprocess stdout — used by pipeline.py to surface
                       # diagnostic output (e.g. rate-limit messages) on failure.
     stderr: str = ""  # Raw subprocess stderr — same purpose.
+    # Closed-set failure classification from ``alfred.health.agent_failure``
+    # (quota_limited / auth / other). Empty on success. See the 2026-07-29
+    # weekly-limit incident.
+    kind: str = ""
 
 
 VAULT_CLI_REFERENCE = """

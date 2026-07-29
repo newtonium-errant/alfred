@@ -567,7 +567,19 @@ async def _process_file(
         # #34 — do NOT mark_processed on a backend failure (that was the
         # silent-loss bug: the raw email moved to processed/ + marked done,
         # never retried). Route through retry-in-place-then-quarantine instead.
-        log.error("daemon.agent_failed", file=filename, summary=result.summary[:500])
+        log.error(
+            "daemon.agent_failed",
+            file=filename,
+            kind=result.kind,
+            summary=result.summary[:500],
+        )
+        # 2026-07-29 — stamp the failure into state (kind + bounded CLI message)
+        # so the curator BIT ``agent-failure-kind`` probe can surface a quota /
+        # auth outage that a stale ``last_run`` alone can't distinguish from an
+        # idle inbox. Set BEFORE ``_handle_processing_failure`` so its
+        # ``state_mgr.save()`` persists it on every sub-path (retry / quarantine
+        # / legacy). ``last_run`` is deliberately left untouched.
+        state_mgr.state.record_agent_failure(kind=result.kind, summary=result.summary)
         _handle_processing_failure(
             inbox_file, state_mgr, config,
             reason=f"agent_failed: {result.summary[:200]}",

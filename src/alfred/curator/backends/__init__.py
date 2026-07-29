@@ -20,6 +20,11 @@ class BackendResult:
     success: bool = False
     summary: str = ""
     files_changed: list[str] = field(default_factory=list)
+    # Closed-set failure classification from ``alfred.health.agent_failure``
+    # (quota_limited / auth / other). Empty on success; set by the backend on
+    # any failure return so the daemon can persist + surface it. See the
+    # 2026-07-29 weekly-limit incident.
+    kind: str = ""
 
 
 VAULT_CLI_REFERENCE = """

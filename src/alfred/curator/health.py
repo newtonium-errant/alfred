@@ -302,6 +302,133 @@ def _check_last_successful_process(raw: dict[str, Any]) -> CheckResult:
     )
 
 
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp to an aware UTC datetime, or None if unparseable.
+
+    Tolerates the trailing-``Z`` form alongside the explicit-offset form and
+    treats a naive timestamp as UTC (curator writes UTC everywhere).
+    """
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _read_curator_last_agent_failure(state_path: Path) -> dict[str, Any] | None:
+    """Read curator state's top-level ``last_agent_failure`` dict.
+
+    Returns None if the file / key is missing or malformed. Inlined dict-walk
+    (not ``StateManager``) so a corrupt state file degrades gracefully rather
+    than crashing the BIT run — mirrors ``_read_curator_last_run``.
+    """
+    if not state_path.is_file():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    failure = data.get("last_agent_failure")
+    if isinstance(failure, dict):
+        return failure
+    return None
+
+
+def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
+    """Surface the most recent ``claude -p`` agent failure, if it's still active.
+
+    Closes the 2026-07-29 blind spot: the ``claude-cli-auth`` probe reads
+    ``claude auth status`` (login only, zero tokens) and stayed GREEN through
+    a three-day WEEKLY-QUOTA outage — logged in the whole time, just out of
+    budget — while every structuring call failed and 234 emails quarantined.
+    This probe derives its signal from REAL failing traffic that curator
+    already recorded into state (no extra ``claude -p`` call — the zero-token
+    BIT invariant stands).
+
+    Logic:
+      * no ``last_agent_failure`` recorded            → OK  ("no recent agent failures")
+      * failure OLDER-or-equal to the last success    → OK  (pipeline recovered)
+      * active failure, ``kind == auth``              → FAIL (pipeline is DOWN — mirrors
+                                                        the claude-cli-auth severity)
+      * active failure, ``kind == quota_limited``     → WARN (intake failing + quarantining)
+      * active failure, ``kind == other`` / unknown   → WARN (surface the CLI tail)
+
+    Per ``feedback_intentionally_left_blank.md`` the no-failure case emits an
+    explicit OK line so "healthy" is never silent absence.
+    """
+    state_path = _resolve_curator_state_path(raw)
+    failure = _read_curator_last_agent_failure(state_path)
+
+    if failure is None:
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.OK,
+            detail="no recent agent failures",
+            data={"state_path": str(state_path)},
+        )
+
+    fail_ts = _parse_iso_utc(failure.get("ts"))
+    last_run_dt = _parse_iso_utc(_read_curator_last_run(state_path))
+    kind = failure.get("kind", "other") or "other"
+    tail = failure.get("summary_tail", "") or ""
+    ts_display = failure.get("ts", "unknown")
+
+    # A success AT-OR-AFTER the recorded failure means the pipeline recovered —
+    # the stale failure is history, not an active outage. (If the failure ts is
+    # unparseable we can't prove recovery, so we treat it as active and surface
+    # it rather than swallow it.)
+    if fail_ts is not None and last_run_dt is not None and last_run_dt >= fail_ts:
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.OK,
+            detail=f"no recent agent failures (last failure {ts_display} predates last success)",
+            data={
+                "state_path": str(state_path),
+                "last_agent_failure": failure,
+                "last_run": _read_curator_last_run(state_path),
+            },
+        )
+
+    payload: dict[str, Any] = {
+        "state_path": str(state_path),
+        "kind": kind,
+        "ts": ts_display,
+        "summary_tail": tail,
+    }
+
+    if kind == "auth":
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.FAIL,
+            detail=(
+                f"claude -p auth failure since {ts_display} — structuring pipeline is DOWN; "
+                f"last CLI message: {tail}"
+            ),
+            data=payload,
+        )
+    if kind == "quota_limited":
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.WARN,
+            detail=(
+                f"claude -p quota-limited since {ts_display} — intake failing + quarantining; "
+                f"last CLI message: {tail}"
+            ),
+            data=payload,
+        )
+    return CheckResult(
+        name="agent-failure-kind",
+        status=Status.WARN,
+        detail=f"claude -p failing ({kind}) since {ts_display}; last CLI message: {tail}",
+        data=payload,
+    )
+
+
 def _check_quarantine(raw: dict[str, Any]) -> CheckResult:
     """Count files in the curator's #34 quarantine dir (``inbox/failed``).
 
@@ -397,6 +524,7 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
         results.append(await check_claude_cli_auth(command=resolve_claude_command(raw)))
 
     results.append(_check_last_successful_process(raw))
+    results.append(_check_agent_failure_kind(raw))
     results.append(_check_quarantine(raw))
 
     status = Status.worst([r.status for r in results])
