@@ -198,6 +198,34 @@ export const ingestBodySchema = z.object({
 
 export type IngestBody = z.infer<typeof ingestBodySchema>;
 
+// --- iOS Shortcuts device-token ingest (bearer-only /api/ingest/shortcut) -----
+// A deliberately NARROWER subset of the ingest surface for the Shortcuts tendril
+// (Action Button → Dictate → POST). `text` is the record BODY; note-only for v1;
+// title optional (the route derives one when absent); target optional (the route
+// defaults it). No free-form record_type, no client-supplied `source` — the route
+// stamps provenance itself. The 8000-char cap mirrors the chat edge cap (a voice
+// capture is short; a whole-document paste belongs on ingest/submit).
+export const SHORTCUT_MAX_TEXT_CHARS = 8000;
+export const SHORTCUT_MAX_TITLE_CHARS = 300;
+
+// v1 accepts ONLY 'note'. z.enum leaves the door open for a widened set later; a
+// value outside it is a 400 at the edge (mirrors the backend type gate).
+export const SHORTCUT_RECORD_TYPES = ['note'] as const;
+
+export const shortcutIngestBodySchema = z.object({
+  // Written VERBATIM as the record body; validate non-empty-after-trim while
+  // relaying the ORIGINAL value (mirrors ingestBodySchema.body).
+  text: z
+    .string()
+    .max(SHORTCUT_MAX_TEXT_CHARS)
+    .refine((s) => s.trim().length > 0, { message: 'A text capture is required.' }),
+  title: z.string().trim().min(1).max(SHORTCUT_MAX_TITLE_CHARS).optional(),
+  record_type: z.enum(SHORTCUT_RECORD_TYPES).optional(),
+  target: z.string().trim().min(1).max(64).optional(),
+});
+
+export type ShortcutIngestBody = z.infer<typeof shortcutIngestBodySchema>;
+
 // --- Web STT trust-boundary constants (BUILD_DECISIONS §4 / §5) -------------
 // Co-located with the other edge constants even though the binary STT body is
 // NOT zod-parsed (it's a raw audio Buffer) — the BFF route uses these for the
