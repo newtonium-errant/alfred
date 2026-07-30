@@ -178,6 +178,26 @@ def test_dotted_bullet_nonverb_falls_through(tmp_path: Path) -> None:
     assert is_latest_batch_replied(cfg) is False
 
 
+def test_long_prose_with_leading_near_miss_verb_falls_through(tmp_path: Path) -> None:
+    """ISOLATING PIN for gate 3 (the 1-2 word remainder gate).
+
+    "2 dwon the road ahead" has an in-batch leading digit (2) AND a first
+    remainder word ("dwon") that IS a near-miss of the email verb "down" —
+    so gate 4 (near-miss) PASSES. Only gate 3 (remainder is 4 words, not
+    1-2) stops it from being read as a mistyped calibration. Without gate 3
+    this ordinary prose would hijack chat. This pin reddens iff gate 3 is
+    removed/neutered — the reviewer's mutation-proven blind spot.
+    """
+    cfg = _config(tmp_path)
+    _seed_email_batch(cfg, count=3, message_ids=[100])  # item 2 exists
+
+    for prose in ("2 dwon the road ahead", "2 dwon the whole road trip"):
+        # Detector-level assertion (gate 3 lives here) + end-to-end.
+        assert _detect_mistyped_calibration(prose, cfg) is False, prose
+        assert maybe_smart_route_reply(cfg, prose) is None, prose
+        assert is_latest_batch_replied(cfg) is False
+
+
 # --- Discriminator unit tests --------------------------------------------
 
 
