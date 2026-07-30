@@ -226,6 +226,26 @@ export const shortcutIngestBodySchema = z.object({
 
 export type ShortcutIngestBody = z.infer<typeof shortcutIngestBodySchema>;
 
+// --- Feed surface (Feed Phase B) --------------------------------------------
+// POST /api/feed/act body → relayed VERBATIM to the transport POST /feed/act.
+// `id` is the feed item id (`<kind>:<stable_key>` — carries a colon and often a
+// record path, hence the generous bound); `action_id` is the deck/feed verb
+// (confirm/reject/high/…/ack). The transport's (kind, action) map is the
+// capability ceiling — the BFF only relays. `z.object` STRIPS unknown keys (no
+// `.strict()`), so a client can't smuggle extra fields into the transport body
+// (the transport contract defines only {id, action_id}).
+export const feedActBodySchema = z.object({
+  id: z.string().trim().min(1).max(512),
+  action_id: z.string().trim().min(1).max(64),
+});
+
+export type FeedActBody = z.infer<typeof feedActBodySchema>;
+
+// GET /api/feed/list allowlisted query filters, passed through to the transport
+// GET /feed/items. Optional + AND-combined server-side; any other query key is
+// DROPPED (allowlist — a client can't forward arbitrary query to the transport).
+export const FEED_LIST_FILTER_KEYS = ['state', 'mode', 'kind'] as const;
+
 // --- Web STT trust-boundary constants (BUILD_DECISIONS §4 / §5) -------------
 // Co-located with the other edge constants even though the binary STT body is
 // NOT zod-parsed (it's a raw audio Buffer) — the BFF route uses these for the
