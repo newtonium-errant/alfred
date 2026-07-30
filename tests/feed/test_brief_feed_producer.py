@@ -40,8 +40,21 @@ def test_health_emits_only_non_ok_tools(tmp_path: Path) -> None:
     assert by_id["health:janitor"].evidence["status"] == "fail"
 
 
-def test_health_all_ok_or_absent_is_empty(tmp_path: Path) -> None:
-    # No BIT record → [] so reconcile marks any stale warns acted.
+def test_health_no_record_is_none_not_empty(tmp_path: Path) -> None:
+    # No BIT data at all → None (failure sentinel) so the caller does NOT
+    # reconcile — a missing record must never mass-``acted`` health.
+    assert health_feed_items(tmp_path, instance="salem") is None
+
+
+def test_health_all_ok_is_empty_list(tmp_path: Path) -> None:
+    # Record present, every tool ok → [] (genuine empty) so reconcile marks any
+    # stale warns acted.
+    run = tmp_path / "run"
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "Alfred BIT 2026-07-30.md").write_text(
+        "---\ntype: run\n---\n\n## Summary\n[OK] curator  (1 ms)\n[OK] janitor  (1 ms)\n## Detail\n",
+        encoding="utf-8",
+    )
     assert health_feed_items(tmp_path, instance="salem") == []
 
 

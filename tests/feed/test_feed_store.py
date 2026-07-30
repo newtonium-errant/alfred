@@ -130,6 +130,49 @@ def test_reconcile_only_touches_its_own_kind(tmp_path: Path) -> None:
     assert folded["pending:u1"].state == STATE_OPEN
 
 
+def test_reconcile_preserves_created_at_while_open(tmp_path: Path) -> None:
+    """created_at is the CONTINUOUSLY-OPEN episode's first-seen — a re-upsert
+    across fires with a DISTINCT item object (fresh timestamp) must not drift it.
+    (The old idempotency test reused the same object, so it was blind to this.)"""
+    s = _store(tmp_path)
+    first = FeedItem.create(kind="proposal", stable_key="c1", instance="salem", title="v1",
+                            created_at="2026-07-30T00:00:00+00:00")
+    s.reconcile("proposal", [first])
+    # Fire 2: a genuinely new object for the SAME key, with a later created_at.
+    second = FeedItem.create(kind="proposal", stable_key="c1", instance="salem", title="v2",
+                             created_at="2026-07-31T09:00:00+00:00")
+    s.reconcile("proposal", [second])
+    folded = s.load()
+    assert folded["proposal:c1"].title == "v2"  # evidence/title DID refresh
+    assert folded["proposal:c1"].created_at == "2026-07-30T00:00:00+00:00"  # first-seen preserved
+
+
+def test_acted_then_reappears_is_new_episode_with_fresh_created_at(tmp_path: Path) -> None:
+    """A key that went acted and reappears in the open set is a NEW episode:
+    revived to open, with the fresh created_at (not the old episode's)."""
+    s = _store(tmp_path)
+    s.reconcile("proposal", [FeedItem.create(kind="proposal", stable_key="c1", instance="salem",
+                                             title="v1", created_at="2026-07-30T00:00:00+00:00")])
+    s.reconcile("proposal", [])  # c1 → acted
+    assert s.load()["proposal:c1"].state == STATE_ACTED
+    # Reappears — the authority re-opened it → new episode, fresh created_at.
+    s.reconcile("proposal", [FeedItem.create(kind="proposal", stable_key="c1", instance="salem",
+                                             title="v2", created_at="2026-08-01T00:00:00+00:00")])
+    folded = s.load()
+    assert folded["proposal:c1"].state == STATE_OPEN  # revived
+    assert folded["proposal:c1"].created_at == "2026-08-01T00:00:00+00:00"  # new episode's first-seen
+    assert folded["proposal:c1"].acted_at is None  # prior episode's acted_at cleared
+
+
+def test_upsert_also_preserves_created_at_while_open(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.upsert(FeedItem.create(kind="radar", stable_key="r1", instance="salem", title="a",
+                             created_at="2026-07-30T00:00:00+00:00"))
+    s.upsert(FeedItem.create(kind="radar", stable_key="r1", instance="salem", title="b",
+                             created_at="2026-08-05T00:00:00+00:00"))
+    assert s.load()["radar:r1"].created_at == "2026-07-30T00:00:00+00:00"
+
+
 def test_reconcile_idempotent_rerun(tmp_path: Path) -> None:
     s = _store(tmp_path)
     open_set = [_item("routine_match", "q1|r1"), _item("routine_match", "q2|r2")]

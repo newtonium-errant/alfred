@@ -204,8 +204,25 @@ def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_l
             build = extractors.get(section.feed_kind or "")
             if build is None:
                 continue
-            section.feed_items = build()
-            try_feed_reconcile(store, section.feed_kind, section.feed_items)
+            # Failure ≠ emptiness: an extractor that RAISES or returns None means
+            # "couldn't read the source" → DON'T reconcile (leave this kind's feed
+            # state untouched), else a blip would spuriously mass-``acted`` it. A
+            # LIST (incl. []) is a genuine read → reconcile normally.
+            try:
+                items = build()
+            except Exception as exc:  # noqa: BLE001 — extractor blip must not touch feed state
+                log.warning(
+                    "brief.feed_extractor_failed",
+                    kind=section.feed_kind,
+                    error=str(exc),
+                    error_type=exc.__class__.__name__,
+                )
+                continue
+            if items is None:
+                log.warning("brief.feed_extractor_failed", kind=section.feed_kind, reason="no_read")
+                continue
+            section.feed_items = items
+            try_feed_reconcile(store, section.feed_kind, items)
     except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the brief
         log.warning(
             "brief.feed_emit_failed",

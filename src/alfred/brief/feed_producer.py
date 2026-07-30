@@ -5,11 +5,17 @@ consume (reusing each section module's gather helpers) into FeedItems — the
 renderers' markdown is untouched, so the brief render stays byte-identical.
 
 Phase A converts the item-bearing sections with clean structured sources:
-health, event, peer_digest here; slot_suggestion (the TodayView projection) is
-deferred to its own slice. Evidence is a minimal projection of the section's own
-record (not the whole markdown). All extractors are best-effort: any failure
-returns ``[]`` — the belt at the call site also swallows, so a feed extractor
-can never break the brief.
+health, slot_suggestion, event, peer_digest. Evidence is a minimal projection of
+the section's own record (not the whole markdown).
+
+**Failure ≠ emptiness.** Each extractor returns ``list[FeedItem] | None``:
+  * a LIST (possibly ``[]``) is a genuine read — ``[]`` means "the section has
+    nothing open right now", and the caller reconciles it (so cleared items go
+    ``acted``);
+  * ``None`` is a FAILURE (the source raised / couldn't be read) — the caller
+    must NOT reconcile, or an extractor blip would spuriously mass-``acted`` a
+    whole kind. The belt logs the failure either way; on ``None`` the kind's feed
+    state is left untouched this run.
 """
 
 from __future__ import annotations
@@ -26,19 +32,21 @@ def health_feed_items(
     vault_path: str | Path,
     *,
     instance: str,
-) -> list[FeedItem]:
-    """One ``health`` item per NON-OK tool in the latest BIT record (stable key
-    = tool name). All-ok / no record → ``[]`` so reconcile marks stale warns acted."""
+) -> list[FeedItem] | None:
+    """One ``health`` item per NON-OK tool in the latest BIT record (stable key =
+    tool name). All-ok (record present, every tool ok) → ``[]`` so reconcile marks
+    stale warns acted. NO record / read error → ``None`` (can't confirm health;
+    don't mass-``acted`` on missing data)."""
     from .health_section import _find_latest_bit_record, _per_tool_lines
 
     vault = Path(vault_path)
     try:
         record = _find_latest_bit_record(vault)
         if record is None:
-            return []
+            return None  # no BIT data at all → don't reconcile (would mass-act)
         body = record.read_text(encoding="utf-8")
     except OSError:
-        return []
+        return None
     out: list[FeedItem] = []
     for tool, status, detail in _per_tool_lines(body):
         if status == "ok":
@@ -61,18 +69,26 @@ def event_feed_items(
     today_local,
     *,
     instance: str,
-) -> list[FeedItem]:
+) -> list[FeedItem] | None:
     """One ``event`` item per upcoming event/task in the window (stable key =
-    date_iso + name). Phase A does NOT apply the operator inbox-preference filter
-    to the feed projection — that is a render-time concern and the (unrendered)
-    feed being a superset is harmless."""
+    date_iso + name). Applies the SAME operator action-preference filter the
+    render applies (``load_active_preferences`` → ``_collect_items``), so the feed
+    projection matches what the operator sees — no superset. Read failure →
+    ``None`` (don't reconcile)."""
+    from alfred.preferences.loader import load_active_preferences
+
     from .upcoming_events import _collect_items
 
     max_days = int(getattr(upcoming_config, "max_days_ahead", 30) or 30)
+    vault = Path(vault_path)
     try:
-        items, _filtered = _collect_items(Path(vault_path), today_local, max_days)
-    except Exception:  # noqa: BLE001 — extractor is best-effort; belt also swallows
-        return []
+        try:
+            prefs = load_active_preferences(vault, shape="action")
+        except Exception:  # noqa: BLE001 — mirror render: pref-load failure → no filter
+            prefs = []
+        items, _filtered = _collect_items(vault, today_local, max_days, prefs)
+    except Exception:  # noqa: BLE001 — source failure → don't reconcile (belt also logs)
+        return None
     out: list[FeedItem] = []
     for ev in items:
         out.append(FeedItem.create(
@@ -110,18 +126,18 @@ def slot_suggestion_feed_items(
     tier_defaults: Any,
     *,
     instance: str,
-) -> list[FeedItem]:
+) -> list[FeedItem] | None:
     """One ``slot_suggestion`` item per T1/T2/T3 tier-lane entry in the TodayView
     projection (auto-T1 task + routine candidates, T2 auto-surfaced, T3
     suggestions). The feed reads the SAME ``compute_today_view`` projection the
     brief's tier section renders, so it never diverges from what the operator
-    sees. Empty day → ``[]``."""
+    sees. Empty day → ``[]``; projection failure → ``None`` (don't reconcile)."""
     from alfred.tier.compute import compute_today_view
 
     try:
         view = compute_today_view(Path(vault_path), now, tier_defaults)
-    except Exception:  # noqa: BLE001 — best-effort; belt also swallows
-        return []
+    except Exception:  # noqa: BLE001 — source failure → don't reconcile (belt also logs)
+        return None
     out: list[FeedItem] = []
     for entry in (*view.t1, *view.t2, *view.t3):
         key = _slot_stable_key(entry)
@@ -155,15 +171,15 @@ def peer_digest_feed_items(
     today_iso: str,
     *,
     instance: str,
-) -> list[FeedItem]:
+) -> list[FeedItem] | None:
     """One ``peer_digest`` item per peer digest record today (stable key = peer +
-    date; fyi)."""
+    date; fyi). Scan failure → ``None`` (don't reconcile)."""
     from .peer_digests import _scan_peer_digests
 
     try:
         records = _scan_peer_digests(Path(vault_path), today_iso)
-    except Exception:  # noqa: BLE001 — best-effort; belt also swallows
-        return []
+    except Exception:  # noqa: BLE001 — source failure → don't reconcile (belt also logs)
+        return None
     out: list[FeedItem] = []
     for rec in records:
         peer = (getattr(rec, "peer", "") or "").strip()

@@ -138,11 +138,37 @@ class FeedStore:
             os.fsync(fh.fileno())
         os.replace(tmp, self.path)
 
+    # --- created_at episode semantics ----------------------------------------
+
+    @staticmethod
+    def _episode_merged_payload(item: FeedItem, current: dict[str, FeedItem]) -> dict[str, Any]:
+        """Build an upsert payload with EPISODE-correct ``created_at``.
+
+        The feed tracks an item across a continuously-open EPISODE; ``created_at``
+        is that episode's first-seen. So MERGE, don't wholesale-replace:
+
+          * stored item exists AND is still ``open`` → preserve its stored
+            ``created_at`` (the episode continues; producers pass a fresh
+            timestamp each fire, which must NOT drift the first-seen);
+          * stored item was ``acted`` / ``acked`` / ``expired`` and the same key
+            reappears in the open set → a NEW episode: keep the incoming fresh
+            ``created_at``, and the upsert (state=open) legitimately REVIVES it —
+            the authoritative store re-opened it, so it IS open again;
+          * no stored item → first sighting, keep the incoming ``created_at``.
+        """
+        payload = item.to_dict()
+        stored = current.get(item.id)
+        if stored is not None and stored.state == STATE_OPEN:
+            payload["created_at"] = stored.created_at
+        return payload
+
     # --- public write API (each acquires the lock once — never nested) -------
 
     def upsert(self, item: FeedItem) -> None:
         with file_rmw_lock(self.path):
-            self._append_lines_locked([{"ev": "upsert", "ts": _now_iso(), "item": item.to_dict()}])
+            current = self._fold_from_disk()
+            payload = self._episode_merged_payload(item, current)
+            self._append_lines_locked([{"ev": "upsert", "ts": _now_iso(), "item": payload}])
             self._maybe_compact_locked()
 
     def set_state(self, item_id: str, state: str) -> None:
@@ -179,11 +205,11 @@ class FeedStore:
             }
             absent = previously_open - incoming_ids
 
+            ts = _now_iso()
             events: list[dict[str, Any]] = [
-                {"ev": "upsert", "ts": _now_iso(), "item": item.to_dict()}
+                {"ev": "upsert", "ts": ts, "item": self._episode_merged_payload(item, current)}
                 for item in open_items
             ]
-            ts = _now_iso()
             events.extend(
                 {"ev": "state", "ts": ts, "id": item_id, "state": STATE_ACTED}
                 for item_id in sorted(absent)

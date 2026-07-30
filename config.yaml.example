@@ -1622,3 +1622,19 @@ scaffold:
 #   store_path: "/home/andrew/.alfred/kalle/data/contracts"   # <id>.md per contract
 #   audit_log_path: ""        # defaults to <store_path>/contract_audit.jsonl
 #   operator_id: "andrew"     # stamps ratified_by; the ratify/reject authority
+
+# ---------------------------------------------------------------------------
+# Feed (Phase A — foundation, invisible)
+# ---------------------------------------------------------------------------
+# The attention-tiered store both the daily-sync and the brief project into
+# (append-only event JSONL, fold-on-load). Phase A accumulates truth only —
+# no operator-visible change; brief + sync render byte-identically whether
+# this is on or off (the producers are belt-guarded side-writes). Phase B/C
+# render it (Awareness feed, Decide deck, briefing player).
+#
+# ``enabled`` defaults TRUE — it's a local write, never outward, and the belt
+# makes it safe, so it starts accumulating history with no operator flip.
+# feed:
+#   enabled: true                              # local JSONL write; belt-guarded
+#   store_path: "./data/feed_items.jsonl"      # tool-scoped default
+#   compact_threshold_bytes: 5242880           # 5 MiB → rewrite folded state
