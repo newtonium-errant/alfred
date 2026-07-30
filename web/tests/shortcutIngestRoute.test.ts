@@ -20,7 +20,11 @@ vi.mock('../lib/algernon/transport', () => ({
   TransportTimeoutError: class TransportTimeoutError extends Error {},
 }));
 
-import handler, { __resetShortcutRateLimitForTest } from '../pages/api/ingest/shortcut';
+import handler, {
+  __resetShortcutRateLimitForTest,
+  __shortcutRateLimitBucketCountForTest,
+  __shortcutRateLimitMaxForTest,
+} from '../pages/api/ingest/shortcut';
 
 const TOKEN = 'DUMMY_SHORTCUT_TOKEN_1234';
 
@@ -286,5 +290,30 @@ describe('POST /api/ingest/shortcut — rate limit', () => {
     const { res, status } = mockRes();
     await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'hi' } }), res);
     expect(status).toHaveBeenCalledWith(201);
+  });
+
+  it('distinct wrong tokens never populate the limiter Map (anti-flood, #38 invariant)', async () => {
+    // The real flood vector: DISTINCT wrong tokens (distinct hashes). If the
+    // limiter ran BEFORE auth, each would create its own bucket and grow the
+    // Map. Because auth precedes the limiter, every one is 401'd first and the
+    // Map stays empty. Reddens iff limiter-before-auth is (re)introduced.
+    for (let i = 0; i < 25; i++) {
+      const { res, status } = mockRes();
+      await handler(req({ authorization: `Bearer DUMMY_WRONG_TOKEN_${i}`, body: { text: 'hi' } }), res);
+      expect(status).toHaveBeenCalledWith(401);
+    }
+    expect(__shortcutRateLimitBucketCountForTest()).toBe(0);
+  });
+
+  it('garbage SHORTCUT_INGEST_RATE_MAX falls back to the default 30 (never 0/NaN/negative)', async () => {
+    for (const garbage of ['0', 'abc', '-5']) {
+      process.env.SHORTCUT_INGEST_RATE_MAX = garbage;
+      expect(__shortcutRateLimitMaxForTest()).toBe(30);
+    }
+    // Controls: a valid positive value is honoured; absent → default.
+    process.env.SHORTCUT_INGEST_RATE_MAX = '5';
+    expect(__shortcutRateLimitMaxForTest()).toBe(5);
+    delete process.env.SHORTCUT_INGEST_RATE_MAX;
+    expect(__shortcutRateLimitMaxForTest()).toBe(30);
   });
 });

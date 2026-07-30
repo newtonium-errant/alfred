@@ -83,6 +83,26 @@ export function __resetShortcutRateLimitForTest(): void {
   rateBuckets.clear();
 }
 
+/**
+ * Test-only: number of live rate-limit buckets. Pins the anti-flood invariant —
+ * distinct WRONG tokens must never populate the Map (they're 401'd before the
+ * limiter runs), so a flood of them leaves this at 0. Reddens if the limiter is
+ * ever ordered before the auth gate (the #38 flood vector).
+ */
+export function __shortcutRateLimitBucketCountForTest(): number {
+  return rateBuckets.size;
+}
+
+/**
+ * Test-only: the effective per-window ceiling the limiter uses. Pins the
+ * garbage-env fallback — a non-positive / non-numeric SHORTCUT_INGEST_RATE_MAX
+ * must degrade to the default 30, never to 0 / NaN / a negative (which would
+ * make the limiter trip immediately or never).
+ */
+export function __shortcutRateLimitMaxForTest(): number {
+  return rateLimitMax();
+}
+
 // --- constant-time bearer check ---------------------------------------------
 function extractBearer(req: NextApiRequest): string | null {
   const h = req.headers['authorization'];
