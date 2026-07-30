@@ -21,6 +21,7 @@ Heavy-gate pins for Feed Phase B slice B1:
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -695,6 +696,88 @@ def test_router_uses_last_batch_not_feed_evidence(tmp_path: Path) -> None:
     assert result.ok and result.status == STATUS_ACTED
     rows = list(iter_corrections(cfg.corpus.path))
     assert len(rows) == 1 and rows[0].record_path == "note/Email1.md"
+
+
+# ---------------------------------------------------------------------------
+# kind consistency guard (defense-in-depth: item.kind, not the id string)
+# ---------------------------------------------------------------------------
+
+
+def test_kind_id_prefix_mismatch_is_error(tmp_path: Path) -> None:
+    """A stored item whose kind disagrees with its id prefix is corruption —
+    the router fails loud rather than trusting either side silently."""
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    # id says email_tier; stored kind says attribution — impossible via the
+    # producer, so a hand-crafted / corrupt entry. Upsert it directly.
+    store.upsert(FeedItem(id="email_tier:ghost", kind="attribution"))
+
+    result = _call(store, cfg, "email_tier:ghost", "confirm")
+
+    assert result.ok is False and result.status == "error"
+    assert "kind does not match" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# concurrency — TOCTOU close (per-item serialization)
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_acts_serialize_to_exactly_one_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two threads act the SAME open item; the per-item lock lets exactly ONE
+    reach the resolver (corpus rows == 1) and the other gets already_acted.
+
+    Deterministic via the ``_dispatch_barrier`` seam: the lock holder parks
+    inside the critical section (having passed the folded-state gate) while the
+    second thread is PROVEN not to have entered — it's blocked on the per-item
+    lock, so it never reaches the seam, so ``arrivals`` is released exactly once.
+
+    MUTATION-VERIFY: change ``act`` to call ``_act_locked`` WITHOUT the
+    ``with _per_item_lock(...)`` wrap and BOTH assertions redden deterministically
+    — the second thread passes the still-``open`` gate, reaches the seam
+    (``second_reached`` becomes True), and both append (rows == 2).
+    """
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    arrivals = threading.Semaphore(0)
+    gate = threading.Event()
+
+    def _seam(feed_item_id: str) -> None:
+        arrivals.release()          # "a thread reached the critical section"
+        assert gate.wait(timeout=5)  # park until the test releases
+
+    monkeypatch.setattr(arouter, "_dispatch_barrier", _seam)
+
+    results: dict[str, Any] = {}
+
+    def _worker(name: str) -> None:
+        results[name] = _call(store, cfg, fid, "confirm")
+
+    t1 = threading.Thread(target=_worker, args=("t1",), name="t1")
+    t2 = threading.Thread(target=_worker, args=("t2",), name="t2")
+    t1.start()
+    t2.start()
+
+    # Exactly one thread holds the lock and reaches the seam.
+    assert arrivals.acquire(timeout=5) is True
+    # The other is blocked on the per-item lock — it can NOT reach the seam
+    # while the first holds it (without the lock, it would, and this succeeds).
+    second_reached = arrivals.acquire(timeout=0.5)
+    gate.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert second_reached is False, (
+        "per-item lock failed — both acts entered the critical section"
+    )
+    assert len(list(iter_corrections(cfg.corpus.path))) == 1
+    assert sorted(r.status for r in results.values()) == [STATUS_ACTED, STATUS_ALREADY_ACTED]
 
 
 # ---------------------------------------------------------------------------

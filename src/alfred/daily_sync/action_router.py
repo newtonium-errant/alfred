@@ -31,6 +31,9 @@ ordinal, NEVER from the feed item's display ``evidence``. Aged out of last_batch
 
 from __future__ import annotations
 
+import contextlib
+import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -103,6 +106,57 @@ _BATCH_LOADERS: dict[str, str] = {
     "pending": "_last_batch_pending_items",
     "routine_match": "_last_batch_routine_match_items",
 }
+
+
+# --- per-item serialization (TOCTOU close) -----------------------------------
+# The act path is load → folded-state check → resolver dispatch → set_state, and
+# the transport runs it in a thread executor. Without serialization, two
+# near-simultaneous acts on the SAME open item (a deck double-tap) both pass the
+# ``open`` check and both dispatch the resolver — and the email resolver's
+# ``append_correction`` is an UNCONDITIONAL append, so a duplicate corpus row
+# lands. We serialize per feed_item_id with an IN-PROCESS keyed mutex held across
+# the WHOLE critical section.
+#
+# NOT the store's ``file_rmw_lock``: a slow pending peer-dispatch act would then
+# block producers' reconciles for seconds. In-process is sufficient under the
+# SINGLE-ISSUER assumption — only THIS process's transport serves ``/feed/act``.
+# If a second act-issuer (another process) is ever added, this MUST move to a
+# cross-process lock on the store; the store internals already use file_rmw_lock.
+#
+# Reference-counted so the registry stays bounded to ids with an in-flight act:
+# the refcount is bumped under the registry lock BEFORE the (blocking) acquire,
+# so a concurrent releaser can't delete an entry another waiter still needs.
+_registry_lock = threading.Lock()
+_item_locks: dict[str, list] = {}  # feed_item_id -> [threading.Lock, refcount]
+
+
+@contextlib.contextmanager
+def _per_item_lock(feed_item_id: str) -> Iterator[None]:
+    with _registry_lock:
+        entry = _item_locks.get(feed_item_id)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _item_locks[feed_item_id] = entry
+        entry[1] += 1
+        lock = entry[0]
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _registry_lock:
+            entry = _item_locks.get(feed_item_id)
+            if entry is not None:
+                entry[1] -= 1
+                if entry[1] <= 0:
+                    del _item_locks[feed_item_id]
+
+
+def _dispatch_barrier(feed_item_id: str) -> None:
+    """Test seam — a no-op in production. Exists ONLY so the concurrency pin can
+    force two acts to overlap inside the critical section (proving the per-item
+    lock serializes them). Never do work here."""
+    return None
 
 
 @dataclass
@@ -266,13 +320,20 @@ def act(
       1. Load the feed item from the store; not present → ``stale_item``.
       2. Not ``open`` → ``already_acted`` (ok-noop; resolvers are idempotent,
          but we don't re-run them — the store already reflects a decision).
-      3. Universal ``ack`` for FYI items → set ``acked`` directly, no resolver.
-      4. ``(kind, action_id)`` not in :data:`FEED_ACTIONS` → ``invalid_action``.
-      5. Load the authoritative last_batch item by stable-key re-derivation;
+      3. Kind comes from ``item.kind`` (defense-in-depth), with an id-prefix
+         consistency guard — a mismatch is data corruption → ``error``.
+      4. Universal ``ack`` for FYI items → set ``acked`` directly, no resolver.
+      5. ``(kind, action_id)`` not in :data:`FEED_ACTIONS` → ``invalid_action``.
+      6. Load the authoritative last_batch item by stable-key re-derivation;
          absent → ``stale_item``.
-      6. Synthesize the ReplyCorrection + dispatch to the resolver; resolver
+      7. Synthesize the ReplyCorrection + dispatch to the resolver; resolver
          error → ``error`` carrying the resolver's own message.
-      7. Success → set ``acted`` → ``acted`` ok.
+      8. Success → set ``acted`` → ``acted`` ok.
+
+    The whole load→check→dispatch→set_state span runs under the per-item mutex
+    (:func:`_per_item_lock`) so two concurrent acts on the same open item can't
+    both pass the folded-state gate and double-dispatch. See that helper for the
+    single-issuer assumption.
     """
     feed_item_id = (feed_item_id or "").strip()
     action_id = (action_id or "").strip()
@@ -282,6 +343,27 @@ def act(
             feed_item_id, action_id,
         )
 
+    with _per_item_lock(feed_item_id):
+        return _act_locked(
+            feed_item_id, action_id,
+            feed_store=feed_store, config=config, vault_path=vault_path,
+            instance_name=instance_name, instance_scope=instance_scope,
+            raw_config=raw_config,
+        )
+
+
+def _act_locked(
+    feed_item_id: str,
+    action_id: str,
+    *,
+    feed_store: Any,
+    config: Any,
+    vault_path: Path | None,
+    instance_name: str,
+    instance_scope: str,
+    raw_config: dict[str, Any] | None,
+) -> ActResult:
+    """The critical section — runs holding this item's mutex. See :func:`act`."""
     item = feed_store.load().get(feed_item_id)
     if item is None:
         log.info(
@@ -307,7 +389,22 @@ def act(
             feed_item_id, action_id,
         )
 
-    kind = feed_item_id.partition(":")[0]
+    # Kind is the STORED item's kind (authoritative), not the client-supplied id
+    # string — defense-in-depth. The id is ``<kind>:<stable_key>`` by
+    # construction, so a prefix mismatch means a corrupt / hand-crafted store
+    # entry: fail loud, never silently trust one side.
+    kind = item.kind
+    id_prefix = feed_item_id.partition(":")[0]
+    if kind != id_prefix:
+        log.warning(
+            "feed.act.kind_mismatch", id=feed_item_id, action=action_id,
+            item_kind=kind, id_prefix=id_prefix,
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "feed item kind does not match its id — refusing",
+            feed_item_id, action_id,
+        )
 
     # Universal ack — FYI items only, no resolver, no last_batch, no vault op.
     if action_id == ACK_ACTION:
@@ -353,6 +450,7 @@ def act(
     correction = ReplyCorrection(
         item_number=_SYNTHETIC_ITEM_NUMBER, **kind_actions[action_id],
     )
+    _dispatch_barrier(feed_item_id)  # no-op in prod; concurrency-pin seam
     err, detail = _dispatch(
         kind, correction, batch_item,
         config=config, vault_path=vault_path,
