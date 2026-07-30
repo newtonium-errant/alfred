@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from alfred.common.schedule import ScheduleConfig
+from alfred.feed import FeedConfig, load_from_unified as _load_feed_config
 
 from .utils import get_logger
 
@@ -266,6 +267,13 @@ class BriefConfig:
     # precedent of ``quarantine_dir_name`` (from email_classifier).
     tier_defaults: Any = None
 
+    # Feed Phase A — the feed store block (feed.enabled / store_path /
+    # compact_threshold_bytes). Loaded from the unified ``feed:`` block so the
+    # brief's producer #2 writes the SAME store the daily-sync producer does.
+    feed: FeedConfig = field(default_factory=FeedConfig)
+    # Instance slug stamped into feed items (from telegram.instance.name, lowercased).
+    instance_name: str = ""
+
 
 def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     """Build BriefConfig from the unified config dict."""
@@ -493,4 +501,8 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         primary_telegram_user_id=primary_user,
         quarantine_dir_name=quarantine_dir_name,
         tier_defaults=tier_defaults,
+        feed=_load_feed_config(raw),
+        instance_name=(
+            ((raw.get("telegram") or {}).get("instance") or {}).get("name", "") or ""
+        ).strip().lower(),
     )

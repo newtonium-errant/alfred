@@ -16,6 +16,7 @@ from alfred.common.schedule import (
 from .config import BriefConfig
 from .health_section import render_health_section
 from .peer_digests import render_peer_digests_section
+from .section_result import SectionResult
 from .renderer import (
     process_hub_name,
     render_brief,
@@ -158,6 +159,52 @@ def _spool_brief_web_outbound(config: BriefConfig, today: str, content: str) -> 
         log.warning(
             "brief.web_outbound_write_failed",
             date=today,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+
+
+def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_local) -> None:
+    """Reconcile the converted sections' feed items into the feed store.
+
+    Belt-in-depth: an outer guard around store/extractor construction, and each
+    per-section reconcile is itself belt-swallowed — a feed extractor failure can
+    never break the brief. Gated on ``feed.enabled``.
+    """
+    if not config.feed.enabled:
+        return
+    try:
+        from alfred.feed import FeedStore, try_feed_reconcile
+
+        from .feed_producer import (
+            event_feed_items,
+            health_feed_items,
+            peer_digest_feed_items,
+        )
+
+        instance = config.instance_name
+        extractors = {
+            "health": lambda: health_feed_items(config.vault_path, instance=instance),
+            "event": lambda: event_feed_items(
+                config.upcoming_events, config.vault_path, today_local, instance=instance,
+            ),
+            "peer_digest": lambda: peer_digest_feed_items(
+                config.vault_path, today_local.isoformat(), instance=instance,
+            ),
+        }
+        store = FeedStore(
+            config.feed.store_path,
+            compact_threshold_bytes=config.feed.compact_threshold_bytes,
+        )
+        for section in sections:
+            build = extractors.get(section.feed_kind or "")
+            if build is None:
+                continue
+            section.feed_items = build()
+            try_feed_reconcile(store, section.feed_kind, section.feed_items)
+    except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the brief
+        log.warning(
+            "brief.feed_emit_failed",
             error=str(exc),
             error_type=exc.__class__.__name__,
         )
@@ -327,11 +374,14 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # Events so the principal's own forward calendar is the immediately-
     # actionable surface and peer chatter follows.
     sections = [
-        ("Health", health_md),
-        ("Weather", weather_md),
-        (TIER_SECTION_HEADER, tier_md),
-        ("Today's Routines", routines_md),
-        ("Operations", ops_md),
+        SectionResult("Health", health_md, feed_kind="health"),
+        SectionResult("Weather", weather_md),
+        # slot_suggestion feed for the tier/slots section is deferred to its own
+        # slice (A3b) — the TodayView projection extractor is heavier than the
+        # other three. Markdown-only here, byte-identical.
+        SectionResult(TIER_SECTION_HEADER, tier_md),
+        SectionResult("Today's Routines", routines_md),
+        SectionResult("Operations", ops_md),
     ]
     # Watch Items sits after Operations, before Upcoming Events:
     # upstream watches are forward-looking operational signals — more
@@ -341,32 +391,39 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # configured (the empty string from an unconfigured feature is the
     # one permitted silence; every CONFIGURED watch yields a line).
     if watches_md:
-        sections.append(("Watch Items", watches_md))
+        sections.append(SectionResult("Watch Items", watches_md))
     # STAY-C Bug Relay sits alongside Watch Items — both are upstream
     # operational signals (something outside Salem needs triage). Rendered
     # ONLY when the feature is enabled (the empty string from a disabled /
     # unconfigured-instance feature is the one permitted silence; an ENABLED
     # relay always yields a line, including the no-data / stale signal).
     if stayc_relay_md:
-        sections.append((STAYC_RELAY_SECTION_HEADER, stayc_relay_md))
+        sections.append(SectionResult(STAYC_RELAY_SECTION_HEADER, stayc_relay_md))
     # STAY-C Retention Review sits beside the Bug Relay — both are upstream operational signals from
     # the STAY-C box (something outside Salem needs triage). Rendered ONLY when enabled (the empty
     # string from a disabled instance is the one permitted silence; an ENABLED relay always yields a
     # line, incl. the no-data / stale signal).
     if stayc_retention_md:
-        sections.append((STAYC_RETENTION_SECTION_HEADER, stayc_retention_md))
+        sections.append(SectionResult(STAYC_RETENTION_SECTION_HEADER, stayc_retention_md))
     # STAY-C Negation Review sits beside the other STAY-C relays — an upstream operational signal (the
     # operator has paraphrase candidates to approve/reject on the box). Rendered ONLY when enabled.
     if stayc_negation_md:
-        sections.append((STAYC_NEGATION_SECTION_HEADER, stayc_negation_md))
+        sections.append(SectionResult(STAYC_NEGATION_SECTION_HEADER, stayc_negation_md))
     if upcoming_md:
-        sections.append(("Upcoming Events", upcoming_md))
+        sections.append(SectionResult("Upcoming Events", upcoming_md, feed_kind="event"))
     if peer_digests_md:
-        sections.append(("Peer Digests", peer_digests_md))
+        sections.append(SectionResult("Peer Digests", peer_digests_md, feed_kind="peer_digest"))
 
-    # Render
-    frontmatter, body = render_brief(today, sections, config)
+    # Render — consumes ONLY ``.markdown`` (mechanical unwrap of the SectionResult
+    # seam back to the (name, markdown) tuples the renderer always took), so the
+    # brief output is byte-identical to the pre-seam brief.
+    frontmatter, body = render_brief(today, [(s.name, s.markdown) for s in sections], config)
     content = serialize_record(frontmatter, body)
+
+    # Feed Phase A (producer #2) — project the converted sections into the feed
+    # store. Runs AFTER the render above off the SAME section objects, so it can
+    # never perturb the markdown. Belt-in-depth: outer guard + per-section belt.
+    _emit_brief_feed(config, sections, today_local)
 
     # Write to vault
     vault_path = Path(config.vault_path)
