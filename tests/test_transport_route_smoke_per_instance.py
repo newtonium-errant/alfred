@@ -787,6 +787,12 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         # ``transport.ingest.disabled`` info log; this debug event is the
         # wire-level skip signal.
         "transport.wire_transport_app.ingest_skipped",
+        # Feed surface (Feed Phase B, 2026-07-30) — instances wired with
+        # feed_enabled=False (this smoke test omits the feed kwargs)
+        # skip-log here. register_feed_routes ALSO emits its own
+        # ``transport.feed.disabled`` info log; this debug event is the
+        # wire-level skip signal.
+        "transport.wire_transport_app.feed_skipped",
     }
     actual_skips = set(skip_events)
     missing = expected_skips - actual_skips

@@ -1578,6 +1578,39 @@ async def run(
             log.exception("talker.daemon.ticket_outcome_setup_failed")
             ticket_outcome_resolver_fn = None
 
+        # ---- Feed surface (Feed Phase B) -----------------------------
+        # Build the FeedStore + DailySyncConfig the feed routes need, off
+        # the SAME raw config the rest of the daemon uses. Belt-guarded: a
+        # feed-config failure must not break transport setup (the feed can
+        # never break a host). instance_name is config.instance.name — the
+        # pending resolver lowercases self_instance internally, so this is
+        # identical to agent_slug_for(config) for routing.
+        feed_enabled = False
+        feed_store = None
+        feed_daily_sync_config = None
+        feed_instance_scope = ""
+        try:
+            from alfred.daily_sync.config import (
+                load_from_unified as load_daily_sync_config,
+            )
+            from alfred.feed import (
+                FeedStore,
+                load_from_unified as load_feed_config,
+            )
+
+            _feed_cfg = load_feed_config(raw)
+            if _feed_cfg.enabled:
+                feed_enabled = True
+                feed_store = FeedStore(
+                    _feed_cfg.store_path,
+                    compact_threshold_bytes=_feed_cfg.compact_threshold_bytes,
+                )
+                feed_daily_sync_config = load_daily_sync_config(raw)
+                feed_instance_scope = config.instance.tool_set or "talker"
+        except Exception:  # noqa: BLE001 — feed must never break transport setup
+            log.exception("talker.daemon.feed_setup_failed")
+            feed_enabled = False
+
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper
         # conditionally based on what we pass in. This is the single
@@ -1620,6 +1653,13 @@ async def run(
             # transport.ingest.enabled (default False → route not mounted).
             ingest_enabled=transport_config.ingest.enabled,
             ingest_config=transport_config.ingest,
+            # Feed surface (Feed Phase B). Mounted when feed.enabled (default
+            # true); dark until the operator adds the web_feed peer token.
+            feed_enabled=feed_enabled,
+            feed_store=feed_store,
+            feed_daily_sync_config=feed_daily_sync_config,
+            feed_instance_scope=feed_instance_scope,
+            feed_raw_config=raw,
         )
         log.info(
             "talker.daemon.transport_configured",

@@ -699,6 +699,11 @@ def wire_transport_app(
     ticket_outcome_resolve_callable: _TicketOutcomeResolveCallable | None = None,
     ingest_enabled: bool = False,
     ingest_config: Any | None = None,
+    feed_enabled: bool = False,
+    feed_store: Any | None = None,
+    feed_daily_sync_config: Any | None = None,
+    feed_instance_scope: str = "",
+    feed_raw_config: "dict[str, Any] | None" = None,
 ) -> None:
     """Wire all transport-app dependencies in one place.
 
@@ -784,6 +789,25 @@ def wire_transport_app(
             :class:`alfred.transport.config.IngestConfig` carrying
             ``max_body_chars`` + the optional per-instance ``types``
             narrowing list. Read only when ``ingest_enabled`` is True.
+        feed_enabled: Mount the feed surface (``GET /feed/items`` +
+            ``POST /feed/act``, Feed Phase B). Default ``False`` here; the
+            daemon passes ``feed.enabled`` (default true). The routes are
+            gated by the dedicated ``web_feed`` peer pin — dark until the
+            operator adds that token. Wired via
+            :func:`routes_feed.register_feed_routes`.
+        feed_store: The constructed :class:`alfred.feed.FeedStore` the feed
+            routes read + mutate. Read only when ``feed_enabled`` is True.
+        feed_daily_sync_config: The instance's
+            :class:`alfred.daily_sync.config.DailySyncConfig`, used by the
+            action router to load ``last_batch`` and resolve corpus/queue
+            paths. Read only when ``feed_enabled`` is True.
+        feed_instance_scope: The running instance's scope name
+            (``config.instance.tool_set``: ``"talker"`` / ``"kalle"`` /
+            ``"hypatia"``) — forwarded to the proposal resolver on a
+            proposal-confirm act. Read only when ``feed_enabled`` is True.
+        feed_raw_config: The pre-loaded unified config dict — forwarded to
+            the pending-item resolver so it skips per-call config.yaml reads.
+            Read only when ``feed_enabled`` is True.
 
     Logging: emits one info event per registered resource so a
     misconfigured instance has a single grep target
@@ -804,6 +828,7 @@ def wire_transport_app(
         register_ticket_outcome_resolver_callable,
         register_vault_path,
     )
+    from .routes_feed import register_feed_routes
     from .routes_ingest import register_ingest_routes
 
     # Identity is unconditional — every instance has a name.
@@ -1032,6 +1057,35 @@ def wire_transport_app(
             "transport.wire_transport_app.ingest_skipped",
             reason="transport.ingest.enabled is false / absent (instance "
                    "did not opt into the cross-instance ingest route)",
+        )
+
+    # Feed surface (Feed Phase B) — GET /feed/items + POST /feed/act, gated by
+    # the dedicated ``web_feed`` peer pin. Mounted when the feed is enabled
+    # (default true); dark until the operator adds the ``web_feed`` token
+    # (fail-closed 401 until then). register_feed_routes emits its own explicit
+    # disabled-skip log (intentionally-left-blank) when off.
+    if feed_enabled:
+        register_feed_routes(
+            app,
+            enabled=True,
+            feed_store=feed_store,
+            daily_sync_config=feed_daily_sync_config,
+            instance_name=instance_name,
+            instance_scope=feed_instance_scope,
+            raw_config=feed_raw_config,
+        )
+        log.info(
+            "transport.wire_transport_app.feed_registered",
+            scope=feed_instance_scope,
+        )
+    else:
+        # Still call the registrar so its own disabled-skip log fires —
+        # keeps the "ran, did not mount" signal greppable + symmetric.
+        register_feed_routes(app, enabled=False)
+        log.debug(
+            "transport.wire_transport_app.feed_skipped",
+            reason="feed.enabled is false / absent (instance did not opt "
+                   "into the feed surface)",
         )
 
 
