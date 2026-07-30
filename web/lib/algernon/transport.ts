@@ -112,6 +112,78 @@ async function parseJsonOrNull(res: Response): Promise<unknown> {
   }
 }
 
+// --- Feed surface (Feed Phase B) --------------------------------------------
+// The Decide deck / Awareness feed read + act on the HOME instance's own feed —
+// the SAME transport as chat (`ALFRED_WEB_TRANSPORT_URL`), but a DISTINCT peer
+// token: `web_feed` (decide-cards-only; the transport's (kind, action) map is
+// the capability ceiling), NOT the full-chat `web` token. So this mirrors the
+// home path (callTransport/peerToken) with a sibling token env — it is NOT a
+// per-target family (the feed is single-home-instance, unlike ingest/chat
+// targets). Matches the Phase B deploy checklist: "add web_feed token to salem
+// config + BFF env" (one BFF env addition).
+
+function feedToken(): string {
+  const token = process.env.ALFRED_WEB_FEED_TOKEN;
+  if (!token || !token.trim()) {
+    throw new TransportConfigError('ALFRED_WEB_FEED_TOKEN is not set');
+  }
+  return token;
+}
+
+/**
+ * True when the feed transport env is fully configured — the home transport URL
+ * AND the `web_feed` peer token are both present. The BFF checks this at the top
+ * of each feed route and returns 503 `not_configured` (deploy-inert) when false,
+ * the same fail-closed posture as ingest/shortcut. A SET-but-WRONG token is NOT
+ * caught here (it looks configured) — the transport then 401s `feed_wrong_peer`,
+ * which the BFF relays as an error (never a silent success).
+ */
+export function isFeedConfigured(): boolean {
+  const url = process.env.ALFRED_WEB_TRANSPORT_URL;
+  const token = process.env.ALFRED_WEB_FEED_TOKEN;
+  return Boolean(url && url.trim() && token && token.trim());
+}
+
+export interface FeedCallOptions {
+  /** JSON request body (POST /feed/act). Omit for GET. */
+  body?: unknown;
+  /** Allowlisted query filters (GET /feed/items): state/mode/kind. */
+  query?: Record<string, string>;
+}
+
+/**
+ * Relay a JSON call to the HOME transport's feed routes using the server-side
+ * `web_feed` peer token. GET /feed/items (with optional state/mode/kind query)
+ * and POST /feed/act. Buffered + timeout-bounded (a wedged transport → a clean
+ * TransportTimeoutError → the BFF's 504); the browser never sees the token.
+ */
+export async function callTransportFeed(
+  method: 'GET' | 'POST',
+  path: string,
+  opts: FeedCallOptions = {},
+): Promise<TransportResult> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${feedToken()}`,
+    'X-Alfred-Client': PEER_CLIENT,
+    Accept: 'application/json',
+  };
+  if (opts.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+  const qs =
+    opts.query && Object.keys(opts.query).length
+      ? `?${new URLSearchParams(opts.query).toString()}`
+      : '';
+
+  const res = await fetchJsonWithTimeout(`${baseUrl()}${path}${qs}`, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+
+  return { status: res.status, body: await parseJsonOrNull(res) };
+}
+
 // --- Web STT binary relay (BUILD_DECISIONS §4) ------------------------------
 // Relays a raw audio Buffer to the transport's POST /stt/transcribe. Same Layer-1
 // peer auth + X-Alfred-Client + relayed session token as callTransport, but the
