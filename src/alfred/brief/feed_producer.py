@@ -91,6 +91,65 @@ def event_feed_items(
     return out
 
 
+def _slot_stable_key(entry: Any) -> str:
+    """Durable identity for a tier-lane entry, per the step-2 identity table:
+    task → path (wikilink target); routine item → (record, text); free-text
+    T3 → item text. Origin-prefixed so the three spaces can't collide."""
+    origin = getattr(entry, "origin", "")
+    if origin == "routine_item" and entry.routine_record and entry.item_text:
+        return f"routine:{entry.routine_record}::{entry.item_text}"
+    if origin == "task" and entry.path:
+        return f"task:{entry.path}"
+    name = getattr(entry, "name", "") or ""
+    return f"text:{name}" if name else ""
+
+
+def slot_suggestion_feed_items(
+    vault_path: str | Path,
+    now,
+    tier_defaults: Any,
+    *,
+    instance: str,
+) -> list[FeedItem]:
+    """One ``slot_suggestion`` item per T1/T2/T3 tier-lane entry in the TodayView
+    projection (auto-T1 task + routine candidates, T2 auto-surfaced, T3
+    suggestions). The feed reads the SAME ``compute_today_view`` projection the
+    brief's tier section renders, so it never diverges from what the operator
+    sees. Empty day → ``[]``."""
+    from alfred.tier.compute import compute_today_view
+
+    try:
+        view = compute_today_view(Path(vault_path), now, tier_defaults)
+    except Exception:  # noqa: BLE001 — best-effort; belt also swallows
+        return []
+    out: list[FeedItem] = []
+    for entry in (*view.t1, *view.t2, *view.t3):
+        key = _slot_stable_key(entry)
+        if not key:
+            continue
+        reason = getattr(entry, "surface_reason", None) or getattr(entry, "source", "") or ""
+        title = f"T{entry.tier}: {entry.name}" + (f" — {reason}" if reason else "")
+        out.append(FeedItem.create(
+            kind="slot_suggestion",
+            stable_key=key,
+            instance=instance,
+            title=title,
+            evidence={
+                "tier": entry.tier,
+                "origin": getattr(entry, "origin", ""),
+                "name": entry.name,
+                "path": getattr(entry, "path", ""),
+                "due_iso": getattr(entry, "due_iso", None),
+                "surface_reason": getattr(entry, "surface_reason", None),
+                "source": getattr(entry, "source", ""),
+                "routine_record": getattr(entry, "routine_record", None),
+                "item_text": getattr(entry, "item_text", None),
+            },
+            source_ref=dict(_SOURCE_REF),
+        ))
+    return out
+
+
 def peer_digest_feed_items(
     vault_path: str | Path,
     today_iso: str,

@@ -164,7 +164,7 @@ def _spool_brief_web_outbound(config: BriefConfig, today: str, content: str) -> 
         )
 
 
-def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_local) -> None:
+def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_local, now_local) -> None:
     """Reconcile the converted sections' feed items into the feed store.
 
     Belt-in-depth: an outer guard around store/extractor construction, and each
@@ -180,11 +180,15 @@ def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_l
             event_feed_items,
             health_feed_items,
             peer_digest_feed_items,
+            slot_suggestion_feed_items,
         )
 
         instance = config.instance_name
         extractors = {
             "health": lambda: health_feed_items(config.vault_path, instance=instance),
+            "slot_suggestion": lambda: slot_suggestion_feed_items(
+                config.vault_path, now_local, config.tier_defaults, instance=instance,
+            ),
             "event": lambda: event_feed_items(
                 config.upcoming_events, config.vault_path, today_local, instance=instance,
             ),
@@ -376,10 +380,9 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     sections = [
         SectionResult("Health", health_md, feed_kind="health"),
         SectionResult("Weather", weather_md),
-        # slot_suggestion feed for the tier/slots section is deferred to its own
-        # slice (A3b) — the TodayView projection extractor is heavier than the
-        # other three. Markdown-only here, byte-identical.
-        SectionResult(TIER_SECTION_HEADER, tier_md),
+        # tier/slots → slot_suggestion feed (A3b): one item per TodayView tier-
+        # lane entry. Markdown byte-identical — the feed reads the same projection.
+        SectionResult(TIER_SECTION_HEADER, tier_md, feed_kind="slot_suggestion"),
         SectionResult("Today's Routines", routines_md),
         SectionResult("Operations", ops_md),
     ]
@@ -423,7 +426,7 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # Feed Phase A (producer #2) — project the converted sections into the feed
     # store. Runs AFTER the render above off the SAME section objects, so it can
     # never perturb the markdown. Belt-in-depth: outer guard + per-section belt.
-    _emit_brief_feed(config, sections, today_local)
+    _emit_brief_feed(config, sections, today_local, now_local)
 
     # Write to vault
     vault_path = Path(config.vault_path)

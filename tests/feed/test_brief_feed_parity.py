@@ -9,6 +9,7 @@ Tests run unconditionally per ``feedback_regression_pin_unconditional.md``.
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import frontmatter  # type: ignore[import-untyped]
@@ -28,10 +29,20 @@ def _write_bit(vault: Path) -> None:
     )
 
 
+def _write_task_due_today(vault: Path) -> None:
+    (vault / "task").mkdir(parents=True, exist_ok=True)
+    today = date.today().isoformat()
+    (vault / "task" / "Pay Steph.md").write_text(
+        f"---\ntype: task\nstatus: todo\nname: Pay Steph\ndue: {today}\n---\n\n# Pay Steph\n",
+        encoding="utf-8",
+    )
+
+
 def _config(tmp_path: Path, *, feed_enabled: bool) -> BriefConfig:
     vault = tmp_path / "vault"
     vault.mkdir(parents=True, exist_ok=True)
     _write_bit(vault)
+    _write_task_due_today(vault)  # → a T1 slot_suggestion item when the feed is on
     cfg = BriefConfig(vault_path=str(vault), instance_name="salem")
     cfg.state.path = str(tmp_path / "data" / "brief_state.json")
     cfg.primary_telegram_user_id = None  # no push
@@ -82,3 +93,6 @@ async def test_brief_output_byte_identical_feed_on_vs_off(
     assert len(health) == 1
     assert health[0].id == "health:surveyor"
     assert health[0].state == "open"
+    # All four converted sections fed the store — slot_suggestion present too.
+    slots = [it for it in folded.values() if it.kind == "slot_suggestion"]
+    assert any(it.id == "slot_suggestion:task:task/Pay Steph.md" for it in slots)
