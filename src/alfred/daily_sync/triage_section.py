@@ -3,13 +3,22 @@
 Reads ``vault/task/*.md``, filters records flagged ``alfred_triage:
 True`` with open status, and renders the Daily Sync's Triage Queue
 section as a numbered list. The queue surfaces the janitor's
-proposed-merge dedup candidates so the operator can resolve them in
-their morning sweep.
+proposed-merge dedup candidates so the operator sees them in their
+morning sweep.
 
 Priority: 24 — between friction (23) and attribution (25). Triage
-items are signal-rich AND actionable (the operator confirms/declines
-each dedup proposal), so they sit alongside friction and above the
-long-tail attribution audit.
+items are signal-rich and SURFACED-FOR-REVIEW, so they sit alongside
+friction and above the long-tail attribution audit.
+
+**Per-item confirm/decline is NOT wired** (as of 2026-07-30). There is
+no triage branch in :mod:`alfred.daily_sync.reply_dispatch` — a reply
+like "N confirm" is not routed to a triage record; it falls through the
+dispatcher's normal item lookup and is echoed back as unparsed. The
+persisted ``last_batch.triage_items`` rows exist so a FUTURE dispatcher
+can resolve "item N" → task record (see :class:`TriageItemSummary`);
+the interface reimagining arc will wire resolution as a Decide card.
+Until then the operator acts on a triage item out-of-band (open the
+task record and edit it). Do not describe this section as interactive.
 
 ## Read path
 
@@ -18,8 +27,7 @@ The daemon calls :func:`set_vault_path` once at startup (mirroring
 ``vault/task/*.md``, filters records where ``alfred_triage`` is
 ``True`` AND status is in ``{todo, active}``, and renders a numbered
 list ordered by the record's ``name`` (or file stem when ``name``
-missing). Numbered list is 1-indexed per the dispatch's worked
-example.
+missing). The numbered list is 1-indexed (matches the rendered batch).
 
 ## Why ``{todo, active}`` not full ``OPEN_STATUSES``
 

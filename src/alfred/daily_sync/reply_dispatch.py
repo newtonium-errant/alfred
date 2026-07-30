@@ -143,6 +143,66 @@ def _last_batch_routine_match_items(config: DailySyncConfig) -> list[dict[str, A
     return [i for i in items if isinstance(i, dict)]
 
 
+def _batch_item_numbers(config: DailySyncConfig) -> set[int]:
+    """Union of ``item_number`` across every item list in the latest batch.
+
+    Used by the smart-route mistyped-calibration detector (G1) to confirm
+    a leading digit refers to a REAL item before nudging — an incidental
+    leading digit in ordinary prose (``"2 things I wanted to say"``) whose
+    number happens to be in range is NOT enough on its own.
+    """
+    numbers: set[int] = set()
+    for getter in (
+        _last_batch_items,
+        _last_batch_attribution_items,
+        _last_batch_proposal_items,
+        _last_batch_pending_items,
+        _last_batch_routine_match_items,
+    ):
+        for item in getter(config):
+            raw = item.get("item_number")
+            if isinstance(raw, bool):
+                continue  # bool is an int subclass — never a valid item number
+            if isinstance(raw, int):
+                numbers.add(raw)
+            elif isinstance(raw, str) and raw.isdigit():
+                numbers.add(int(raw))
+    return numbers
+
+
+def _batch_type_flags(config: DailySyncConfig) -> dict[str, bool]:
+    """Which item types the latest batch carried — drives the calibration hint.
+
+    Mirrors the ``has_*`` arguments :func:`_compose_calibration_hint` takes,
+    so the G1 nudge advertises exactly the verbs that apply to THIS batch.
+    """
+    return {
+        "has_email": bool(_last_batch_items(config)),
+        "has_attribution": bool(_last_batch_attribution_items(config)),
+        "has_proposal": bool(_last_batch_proposal_items(config)),
+        "has_pending": bool(_last_batch_pending_items(config)),
+        "has_routine_match": bool(_last_batch_routine_match_items(config)),
+    }
+
+
+def _applicable_calibration_verbs(flags: dict[str, bool]) -> set[str]:
+    """Advertised calibration verbs for the batch's item types.
+
+    Kept in step with what :func:`_compose_calibration_hint` suggests — the
+    G1 near-miss detector only nudges when an unrecognized token is a typo
+    of a verb the operator was actually told to use for THIS batch, so a
+    typo of an inapplicable verb won't false-fire.
+    """
+    verbs: set[str] = set()
+    if flags["has_attribution"] or flags["has_proposal"] or flags["has_routine_match"]:
+        verbs.update({"confirm", "reject"})
+    if flags["has_pending"]:
+        verbs.update({"noted", "show"})
+    if flags["has_email"]:
+        verbs.update({"same", "ditto", "high", "medium", "low", "spam", "up", "down", "keep"})
+    return verbs
+
+
 def reply_targets_daily_sync(
     config: DailySyncConfig,
     parent_message_id: int,
@@ -373,6 +433,120 @@ def _revert_batch_replied(config: DailySyncConfig) -> None:
         )
 
 
+# G1 (2026-07-30) — mistyped-calibration detector helpers.
+#
+# A free-standing message routed as a calibration reply but yielding zero
+# corrections is EITHER a mistyped calibration verb ("3 confrim") OR ordinary
+# prose with an incidental leading digit ("2 things I wanted to say"). The
+# first deserves a nudge (ILB — silence is the friction the operator flagged);
+# the second must fall through to normal conversation untouched. These helpers
+# separate the two with high confidence.
+
+# A leading item number followed by a short remainder. The remainder is
+# captured so the detector can size + near-miss it. "item N: <err>" formatted
+# unparsed entries (from chain/dup resolution) start with "item" and don't
+# match — exactly the entries we want to skip.
+_LEADING_ITEM_RE = re.compile(r"^\s*(\d+)\s+(.+)$")
+
+
+def _osa_distance(a: str, b: str) -> int:
+    """Optimal string alignment (restricted Damerau-Levenshtein) distance.
+
+    Insert / delete / substitute AND adjacent transposition each cost 1.
+    Transposition matters: the most common calibration typos are letter
+    swaps (``"confrim"`` for ``"confirm"``), which plain Levenshtein scores
+    as 2 but a human reads as one slip.
+    """
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev2: list[int] = []
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(
+                cur[j - 1] + 1,      # insertion
+                prev[j] + 1,         # deletion
+                prev[j - 1] + cost,  # substitution
+            )
+            if (
+                i > 1
+                and j > 1
+                and a[i - 1] == b[j - 2]
+                and a[i - 2] == b[j - 1]
+            ):
+                cur[j] = min(cur[j], prev2[j - 2] + 1)  # adjacent transposition
+        prev2, prev = prev, cur
+    return prev[lb]
+
+
+def _is_calibration_verb_typo(word: str, verbs: set[str]) -> bool:
+    """True when ``word`` is a near-miss (likely typo) of an applicable verb.
+
+    Length-aware threshold — 1 edit for short verbs (<=4 chars), 2 for
+    longer. Tight enough that an ordinary short word (``"dogs"``) is NOT a
+    typo of ``"down"`` (distance 2 > threshold 1), loose enough that a
+    swapped-letter verb (``"confrim"``) matches ``"confirm"`` (distance 1).
+    Words under 3 chars are never matched — at that length everything is
+    "close" to something, which would hijack chat.
+    """
+    w = word.lower().strip(".,!?:;\"'")
+    if len(w) < 3:
+        return False
+    for verb in verbs:
+        if abs(len(w) - len(verb)) > 2:
+            continue
+        threshold = 1 if len(verb) <= 4 else 2
+        if _osa_distance(w, verb) <= threshold:
+            return True
+    return False
+
+
+def _detect_mistyped_calibration(reply_text: str, config: DailySyncConfig) -> bool:
+    """Distinguish a mistyped calibration reply from ordinary prose.
+
+    Returns True only for the HIGH-CONFIDENCE case (all conditions required):
+      * the reply parses to ZERO corrections and is not all-ok (nothing the
+        parser recognized), AND
+      * some unparsed fragment is ``<n> <token...>`` where ``n`` is a REAL
+        item in the latest batch, AND
+      * that fragment's remainder is 1-2 words (a verb-shaped token, not
+        prose), AND
+      * at least one of those words is a near-miss of a verb advertised for
+        THIS batch's item types.
+
+    Everything weaker returns False → the caller falls through to normal
+    conversation. Never hijacks real chat: long prose fails the 1-2 word
+    gate, an out-of-range digit fails the membership gate, and a short
+    non-verb ("2 dogs") fails the near-miss gate.
+    """
+    parsed = parse_reply(reply_text)
+    if parsed.all_ok or parsed.corrections:
+        return False
+    item_numbers = _batch_item_numbers(config)
+    if not item_numbers:
+        return False
+    verbs = _applicable_calibration_verbs(_batch_type_flags(config))
+    if not verbs:
+        return False
+    for fragment in parsed.unparsed:
+        m = _LEADING_ITEM_RE.match(fragment)
+        if not m:
+            continue
+        if int(m.group(1)) not in item_numbers:
+            continue
+        rest_words = m.group(2).split()
+        if not 1 <= len(rest_words) <= 2:
+            continue
+        if any(_is_calibration_verb_typo(w, verbs) for w in rest_words):
+            return True
+    return False
+
+
 def maybe_smart_route_reply(
     config: DailySyncConfig,
     reply_text: str,
@@ -452,9 +626,29 @@ def maybe_smart_route_reply(
     # False-positive guard: zero confirmed AND not all_ok means the
     # parser couldn't extract a calibration action from this message.
     # Revert the flag so the next legitimate calibration reply still
-    # lands.
+    # lands (the calibration window stays OPEN either way below).
     if not result.get("all_ok") and not result.get("confirmed_count"):
         _revert_batch_replied(config)
+
+        # G1 (2026-07-30, ILB) — a free-standing *mistyped* calibration
+        # reply ("3 confrim") used to fall through to SILENCE here. When
+        # this is a high-confidence mistyped calibration (a real item
+        # number + a near-miss of a verb advertised for THIS batch),
+        # nudge with the item-type-aware hint instead of going dark. The
+        # dispatcher's own body already echoes the raw fragment but omits
+        # the hint on this path, so we append it. Weaker shapes (ordinary
+        # prose with an incidental leading digit) still fall through
+        # untouched — never hijack real chat.
+        if _detect_mistyped_calibration(reply_text, config):
+            hint = _compose_calibration_hint(**_batch_type_flags(config))
+            base_message = result.get("message") or "Calibration: couldn't parse that."
+            result["message"] = f"{base_message}{hint}" if hint else base_message
+            log.info(
+                "daily_sync.smart_route.mistyped_calibration_nudge",
+                unparsed=len(result.get("unparsed", [])),
+            )
+            return result
+
         log.info(
             "daily_sync.smart_route.false_positive_revert",
             unparsed=len(result.get("unparsed", [])),
