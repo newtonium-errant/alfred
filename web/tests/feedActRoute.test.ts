@@ -200,14 +200,24 @@ describe('POST /api/feed/act — relay per status class', () => {
     expect(json.mock.calls[0][0].detail).toBe('record no longer exists');
   });
 
-  it('relays a wrong-token transport 401 feed_wrong_peer (NOT a silent success)', async () => {
+  it('maps a wrong-token upstream 401 to 502 feed_upstream_unavailable + warns (NOT a bare 401)', async () => {
+    // A SET-but-WRONG web_feed token → transport 401 feed_wrong_peer. Post-auth
+    // this is server-side misconfig, not a client session failure — mapped to
+    // 502 so it can't trip the PWA bare-401 → login redirect, with the operator's
+    // greppable upstream_auth_misconfig warn. Never a 200, never a relayed 401.
     asOwner();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     mockCallTransportFeed.mockResolvedValue({ status: 401, body: { error: 'feed_wrong_peer' } });
     const { res, status, json } = mockRes();
     await handler(postReq(validBody), res);
-    expect(status).toHaveBeenCalledWith(401);
-    expect(json).toHaveBeenCalledWith({ error: 'feed_wrong_peer' });
+    expect(status).toHaveBeenCalledWith(502);
+    expect(json).toHaveBeenCalledWith({ error: 'feed_upstream_unavailable' });
     expect(status).not.toHaveBeenCalledWith(200);
+    expect(status).not.toHaveBeenCalledWith(401);
+    expect(warnSpy).toHaveBeenCalledWith('[bff:feed/act] upstream_auth_misconfig');
+    // A misconfig-rejected act never happened → it is NOT logged as an act.
+    expect(logSpy).not.toHaveBeenCalled();
   });
 });
 

@@ -66,6 +66,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const { status, body } = await callTransportFeed('POST', '/feed/act', {
       body: { id, action_id },
     });
+    // A post-auth upstream 401 can ONLY mean the BFF's own `web_feed` token is
+    // wrong / missing at the transport (the browser never supplies it) — NOT a
+    // client session failure. Map to 502 (never relay the bare 401, which the
+    // PWA's login-redirect paths would misread as an expired session) and emit
+    // the operator's greppable signal. Precedes the provenance log: a
+    // misconfig-rejected act never happened, so it is NOT logged as an act.
+    if (status === 401) {
+      console.warn('[bff:feed/act] upstream_auth_misconfig');
+      return res.status(502).json({ error: 'feed_upstream_unavailable' });
+    }
     // BFF-owned provenance — id/action/outcome/user, no evidence content. `via`
     // captures the deck provenance the transport body deliberately doesn't carry.
     const outcome =

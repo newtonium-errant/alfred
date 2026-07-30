@@ -155,16 +155,22 @@ describe('GET /api/feed/list — relay', () => {
     expect(json.mock.calls[0][0].items[0].id).toBe('email_tier:note/A.md');
   });
 
-  it('relays a wrong-token transport 401 feed_wrong_peer (NOT a silent success)', async () => {
+  it('maps a wrong-token upstream 401 to 502 feed_upstream_unavailable + warns (NOT a bare 401)', async () => {
     // A SET-but-WRONG web_feed token clears isFeedConfigured() but the transport
-    // rejects it — the BFF must surface the error, never a 200.
+    // rejects it (feed_wrong_peer). Post-auth this is server-side misconfig, not
+    // a client session failure — the BFF maps it to 502 so it can never trip the
+    // PWA's bare-401 → login-redirect paths, and emits the operator's greppable
+    // upstream_auth_misconfig signal. It must NEVER be a 200 or a relayed 401.
     asOwner();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     mockCallTransportFeed.mockResolvedValue({ status: 401, body: { error: 'feed_wrong_peer' } });
     const { res, status, json } = mockRes();
     await handler(getReq(), res);
-    expect(status).toHaveBeenCalledWith(401);
-    expect(json).toHaveBeenCalledWith({ error: 'feed_wrong_peer' });
+    expect(status).toHaveBeenCalledWith(502);
+    expect(json).toHaveBeenCalledWith({ error: 'feed_upstream_unavailable' });
     expect(status).not.toHaveBeenCalledWith(200);
+    expect(status).not.toHaveBeenCalledWith(401);
+    expect(warnSpy).toHaveBeenCalledWith('[bff:feed/list] upstream_auth_misconfig');
   });
 
   it('maps a transport timeout to 504 WITHOUT retrying', async () => {

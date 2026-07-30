@@ -52,6 +52,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   try {
     const { status, body } = await callTransportFeed('GET', '/feed/items', { query });
+    // A post-auth upstream 401 can ONLY mean the BFF's own `web_feed` token is
+    // wrong / missing from the transport auth.tokens — the browser never
+    // supplies it — so it is server-side misconfig, NOT a client session
+    // failure. Map to 502 (never relay the bare 401, which the PWA's
+    // login-redirect paths would misread as an expired session) and emit the
+    // operator's greppable signal.
+    if (status === 401) {
+      console.warn('[bff:feed/list] upstream_auth_misconfig');
+      return res.status(502).json({ error: 'feed_upstream_unavailable' });
+    }
     return res.status(status).json(body ?? {});
   } catch (e) {
     return sendTransportError(res, 'feed/list', e);
