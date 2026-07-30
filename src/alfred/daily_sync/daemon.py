@@ -395,6 +395,41 @@ async def fire_once(
     clear_last_error_on_state(state)
     save_state(config.state.path, state)
 
+    # Feed Phase A (producer #1) — project this fire's batch families into the
+    # feed store. Runs AFTER save_state so it CANNOT affect the body or the
+    # persisted last_batch (byte-parity by construction). Belt-in-depth: an outer
+    # guard around config/store construction, and each per-family reconcile is
+    # itself belt-swallowed — a feed failure can never break the fire.
+    if raw_config is not None:
+        try:
+            from alfred.audit import agent_slug_for
+            from alfred.feed import FeedStore, load_from_unified as _load_feed_config
+
+            feed_cfg = _load_feed_config(raw_config)
+            if feed_cfg.enabled:
+                from .feed_producer import emit_sync_feed
+
+                emit_sync_feed(
+                    FeedStore(
+                        feed_cfg.store_path,
+                        compact_threshold_bytes=feed_cfg.compact_threshold_bytes,
+                    ),
+                    agent_slug_for(config),
+                    email_items=items,
+                    attribution_items=attribution_items,
+                    proposal_items=proposal_items,
+                    pending_items=pending_items,
+                    routine_match_items=routine_match_items,
+                    radar_items=radar_items,
+                    friction_items=friction_items,
+                )
+        except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the fire
+            log.warning(
+                "daily_sync.feed_emit_failed",
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+
     return {
         "ok": True,
         "items_count": len(items),
