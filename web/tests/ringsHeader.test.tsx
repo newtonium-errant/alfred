@@ -83,6 +83,9 @@ describe('RingsHeader (controlled render)', () => {
     expect(screen.queryByTestId('ring-panel-item')).not.toBeNull();
     const complete = screen.getByTestId('ring-complete') as HTMLButtonElement;
     expect(complete.disabled).toBe(true);
+    // Visually-honest disabled: the muted class is pinned WITH the disabled attr,
+    // so un-disabling this (making it live) forces a conscious restyle too.
+    expect(complete.className).toContain('opacity-50');
     // Evidence hidden until the row is tapped.
     expect(screen.queryByTestId('ring-item-evidence')).toBeNull();
     fireEvent.click(screen.getByTestId('ring-item-row'));

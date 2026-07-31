@@ -10,6 +10,7 @@ import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { composeMode, halifaxHour, type ComposeMode } from '../lib/algernon/composer';
 import { useComposerLog } from '../lib/algernon/composerLog';
+import { deckVerbsFor } from '../lib/algernon/feedConstants';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
@@ -71,7 +72,12 @@ export default function HomePage() {
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
   const board = useFeedBoard({ items: items ?? [], onAuthExpired });
-  const deckCount = board.needsYou.length;
+  // How many things need you (the FEED truth) vs how many the DECK can actually
+  // deal. The deck only handles kinds with a wired verb — slot_suggestion et al.
+  // aren't swipeable yet (Phase C) — so the deck PROMISE counts deck-able only
+  // (mirrors feed.tsx, b1). The needs-you line stays the feed total.
+  const needsYouCount = board.needsYou.length;
+  const deckableCount = board.needsYou.filter((it) => deckVerbsFor(it.kind) !== null).length;
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -106,6 +112,8 @@ export default function HomePage() {
     );
   }
 
+  // The deck entry — only rendered when there's something DECK-ABLE (call sites
+  // gate on deckableCount > 0), so the count always matches what the deck deals.
   const deckPill = (
     <Link
       href="/deck"
@@ -113,7 +121,7 @@ export default function HomePage() {
       className="mt-3 flex items-center justify-between rounded-xl border border-honeydew-300 bg-honeydew-50 px-4 py-3 text-sm font-semibold text-honeydew-700"
     >
       <span>
-        {deckCount > 0 ? `${deckCount} decision${deckCount > 1 ? 's' : ''} waiting` : 'Nothing to decide right now'}
+        {deckableCount} decision{deckableCount > 1 ? 's' : ''} waiting
       </span>
       <span aria-hidden>Open the deck →</span>
     </Link>
@@ -141,7 +149,7 @@ export default function HomePage() {
               <h2 className={titleClass}>Your morning brief is ready</h2>
               <p className={`mt-1 ${subtle}`}>The brief and Daily Sync {INSTANCE_NAME} prepared — open to read →</p>
             </Link>
-            {deckPill}
+            {deckableCount > 0 && deckPill}
           </section>
         )}
 
@@ -151,12 +159,15 @@ export default function HomePage() {
             <div className="mt-3">
               <RingsHeader items={items ?? []} onAuthExpired={onAuthExpired} />
             </div>
+            {/* The feed total (true) — distinct from the deck pill below, which is
+                the deck-able subset. In check-in the non-deck-able needs-you items
+                (slot_suggestion) are the rings above, so total = deck + rings. */}
             <p data-testid="composer-needs-you" className={`mt-3 ${subtle}`}>
-              {deckCount > 0
-                ? `${deckCount} thing${deckCount > 1 ? 's' : ''} need${deckCount > 1 ? '' : 's'} you.`
+              {needsYouCount > 0
+                ? `${needsYouCount} thing${needsYouCount > 1 ? 's' : ''} need${needsYouCount > 1 ? '' : 's'} you.`
                 : 'Nothing needs you right now.'}
             </p>
-            {deckPill}
+            {deckableCount > 0 && deckPill}
           </section>
         )}
 
@@ -179,7 +190,7 @@ export default function HomePage() {
               </p>
             ) : (
               <>
-                {board.needsYou.length > 0 && deckPill}
+                {deckableCount > 0 && deckPill}
                 {board.fyi.length > 0 && (
                   <ul className="mt-4 flex flex-col gap-2">
                     {board.fyi.map((it) => (
