@@ -190,6 +190,25 @@ def slot_suggestion_feed_items(
     return out
 
 
+# The peer-digest card renders ``evidence.body`` as readable prose, so the
+# extractor must EMIT the digest body (the record already holds it — this is
+# emission, not new gathering). Bounded because the feed store is append-only
+# JSONL folded on every load: an unbounded multi-KB digest would bloat every
+# fold. Verbatim under the cap; over it, hard-truncate + an honest marker + a
+# machine-readable ``truncated`` flag so the card can say "there's more."
+_PEER_DIGEST_BODY_MAX = 4000
+_PEER_DIGEST_TRUNCATION_MARKER = "\n\n…[truncated]"
+
+
+def _bounded_digest_body(body: str) -> tuple[str, bool]:
+    """Return ``(emitted_body, truncated)`` — the body verbatim when within
+    :data:`_PEER_DIGEST_BODY_MAX`, else its first ``_PEER_DIGEST_BODY_MAX``
+    chars plus :data:`_PEER_DIGEST_TRUNCATION_MARKER`."""
+    if len(body) <= _PEER_DIGEST_BODY_MAX:
+        return body, False
+    return body[:_PEER_DIGEST_BODY_MAX] + _PEER_DIGEST_TRUNCATION_MARKER, True
+
+
 def peer_digest_feed_items(
     vault_path: str | Path,
     today_iso: str,
@@ -197,7 +216,11 @@ def peer_digest_feed_items(
     instance: str,
 ) -> list[FeedItem] | None:
     """One ``peer_digest`` item per peer digest record today (stable key = peer +
-    date; fyi). Scan failure → ``None`` (don't reconcile)."""
+    date; fyi). Evidence carries the digest ``body`` (bounded — see
+    :func:`_bounded_digest_body`) plus a ``truncated`` flag, so the card renders
+    readable content instead of asking for an ack on {peer, date} alone. Scan
+    failure → ``None`` (don't reconcile). The stable key is UNCHANGED (peer +
+    date) — adding body must never shift an id, so an ack'd digest stays acked."""
     from .peer_digests import _scan_peer_digests
 
     try:
@@ -209,12 +232,18 @@ def peer_digest_feed_items(
         peer = (getattr(rec, "peer", "") or "").strip()
         if not peer:
             continue
+        body, truncated = _bounded_digest_body(getattr(rec, "body", "") or "")
         out.append(FeedItem.create(
             kind="peer_digest",
             stable_key=f"{peer}|{today_iso}",
             instance=instance,
             title=f"Peer digest: {peer}",
-            evidence={"peer": peer, "date": today_iso},
+            evidence={
+                "peer": peer,
+                "date": today_iso,
+                "body": body,
+                "truncated": truncated,
+            },
             source_ref=dict(_SOURCE_REF),
         ))
     return out

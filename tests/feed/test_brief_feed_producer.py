@@ -84,11 +84,11 @@ def test_event_feed_items_translation(tmp_path: Path, monkeypatch) -> None:
 # --- peer_digest: stable key = peer + date ----------------------------------
 
 
-def _write_peer_digest(vault: Path, peer: str, today_iso: str) -> None:
+def _write_peer_digest(vault: Path, peer: str, today_iso: str, body: str = "body") -> None:
     run = vault / "run"
     run.mkdir(parents=True, exist_ok=True)
     (run / f"Peer Digest {peer}.md").write_text(
-        f"---\ntype: run\nsource: peer\npeer: {peer}\ncreated: {today_iso}\nreceived_at: {today_iso}T09:00:00+00:00\n---\n\nbody\n",
+        f"---\ntype: run\nsource: peer\npeer: {peer}\ncreated: {today_iso}\nreceived_at: {today_iso}T09:00:00+00:00\n---\n\n{body}\n",
         encoding="utf-8",
     )
 
@@ -104,3 +104,38 @@ def test_peer_digest_feed_items(tmp_path: Path) -> None:
 def test_peer_digest_none_today_is_empty(tmp_path: Path) -> None:
     _write_peer_digest(tmp_path, "kalle", "2026-07-29")  # yesterday
     assert peer_digest_feed_items(tmp_path, "2026-07-30", instance="salem") == []
+
+
+def test_peer_digest_body_verbatim_when_small(tmp_path: Path) -> None:
+    """A short digest carries its body verbatim in evidence, truncated=False —
+    the card renders readable content instead of {peer, date} alone."""
+    _write_peer_digest(tmp_path, "kalle", "2026-07-30", body="Shipped X.\nBlocked on Y.")
+    items = peer_digest_feed_items(tmp_path, "2026-07-30", instance="salem")
+    assert len(items) == 1
+    ev = items[0].evidence
+    assert ev["body"] == "Shipped X.\nBlocked on Y."
+    assert ev["truncated"] is False
+
+
+def test_peer_digest_body_bounded_and_marked_when_oversized(tmp_path: Path) -> None:
+    """An oversized digest is hard-truncated at the cap, carries the honest
+    marker, and sets truncated=True (bounded so the append-only feed store fold
+    stays cheap)."""
+    big = "z" * 5000
+    _write_peer_digest(tmp_path, "kalle", "2026-07-30", body=big)
+    items = peer_digest_feed_items(tmp_path, "2026-07-30", instance="salem")
+    assert len(items) == 1
+    ev = items[0].evidence
+    assert ev["truncated"] is True
+    assert ev["body"].startswith("z" * 4000)
+    assert ev["body"].endswith("…[truncated]")
+    # Bounded: cap chars + the fixed marker, nothing more.
+    assert len(ev["body"]) == 4000 + len("\n\n…[truncated]")
+
+
+def test_peer_digest_stable_key_unchanged_with_body(tmp_path: Path) -> None:
+    """Adding body to evidence must NOT shift the id — an already-ack'd digest
+    (keyed peer+date) has to stay ack'd across the change."""
+    _write_peer_digest(tmp_path, "kalle", "2026-07-30", body="x" * 9000)
+    items = peer_digest_feed_items(tmp_path, "2026-07-30", instance="salem")
+    assert items[0].id == "peer_digest:kalle|2026-07-30"  # id is peer+date only
