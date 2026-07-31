@@ -44,9 +44,35 @@ def agent_slug_for(config: Any) -> str:
     return name or "talker"
 
 
+def instance_name_from_raw(raw: Any) -> str:
+    """The instance's DISPLAY name from the unified config dict —
+    ``telegram.instance.name`` (e.g. "Salem", "KAL-LE"), the canonical identity
+    the rest of the instance uses.
+
+    For feed producers that hold the unified ``raw`` config but not a ``*Config``
+    exposing ``.instance.name``: the daily_sync feed producer's ``DailySyncConfig``
+    has NO ``instance`` field, so ``agent_slug_for`` there always fell back to
+    "talker" and mislabelled every sync feed chip (2026-07-31). This mirrors
+    ``BriefConfig.instance_name`` so the two feed producers stamp the SAME store
+    with the SAME instance value. Returns "" when unset — honest (an empty chip),
+    never a wrong default; distinct from :func:`agent_slug_for`, which lowercases
+    for the marker_id slug contract.
+    """
+    if isinstance(raw, dict):
+        telegram = raw.get("telegram")
+        if isinstance(telegram, dict):
+            instance = telegram.get("instance")
+            if isinstance(instance, dict):
+                name = instance.get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+    return ""
+
+
 __all__ = [
     "InferMarkerCandidate",
     "InferMarkerResult",
     "sweep_paths",
     "agent_slug_for",
+    "instance_name_from_raw",
 ]

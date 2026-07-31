@@ -402,7 +402,7 @@ async def fire_once(
     # itself belt-swallowed — a feed failure can never break the fire.
     if raw_config is not None:
         try:
-            from alfred.audit import agent_slug_for
+            from alfred.audit import instance_name_from_raw
             from alfred.feed import FeedStore, load_from_unified as _load_feed_config
 
             feed_cfg = _load_feed_config(raw_config)
@@ -414,7 +414,10 @@ async def fire_once(
                         feed_cfg.store_path,
                         compact_threshold_bytes=feed_cfg.compact_threshold_bytes,
                     ),
-                    agent_slug_for(config),
+                    # DailySyncConfig has no `.instance`, so agent_slug_for(config)
+                    # always fell back to "talker" and mislabelled the chip; use
+                    # the canonical display name (matches the brief producer).
+                    instance_name_from_raw(raw_config),
                     email_items=items,
                     attribution_items=attribution_items,
                     proposal_items=proposal_items,

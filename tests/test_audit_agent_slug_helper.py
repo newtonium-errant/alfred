@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from alfred.audit import agent_slug_for
+from alfred.audit import agent_slug_for, instance_name_from_raw
 
 
 @dataclass
@@ -75,3 +75,28 @@ def test_agent_slug_for_object_without_instance_attr():
         pass
 
     assert agent_slug_for(_Empty()) == "talker"
+
+
+# --- instance_name_from_raw (the feed-producer display name) ------------------
+# The daily_sync feed producer holds the unified raw config, not a *Config with
+# `.instance` — so agent_slug_for(DailySyncConfig) always fell back to "talker"
+# and mislabelled every sync feed chip (2026-07-31). instance_name_from_raw reads
+# the canonical telegram.instance.name instead.
+
+
+def test_instance_name_from_raw_reads_telegram_instance_name():
+    assert instance_name_from_raw({"telegram": {"instance": {"name": "Salem"}}}) == "Salem"
+    assert instance_name_from_raw({"telegram": {"instance": {"name": "KAL-LE"}}}) == "KAL-LE"
+
+
+def test_instance_name_from_raw_strips_but_preserves_display_casing():
+    # Display name (matches BriefConfig.instance_name), NOT the lowercased slug.
+    assert instance_name_from_raw({"telegram": {"instance": {"name": "  Hypatia "}}}) == "Hypatia"
+
+
+def test_instance_name_from_raw_empty_never_talker():
+    # A missing / blank name yields "" (honest empty chip), never the wrong
+    # "talker" the old agent_slug_for(DailySyncConfig) path produced.
+    for raw in ({}, {"telegram": {}}, {"telegram": {"instance": {}}}, {"telegram": {"instance": {"name": ""}}}):
+        assert instance_name_from_raw(raw) == ""
+    assert instance_name_from_raw(None) == ""
