@@ -46,7 +46,7 @@ export const RING_ACTION_UNDO = 'undo_done';
 // (no origin, no routine_record, tier < 3). Shared by every completion surface
 // (rings panel + feed row) so the copy can't drift. Task / routine / free-text T3
 // are all board-completable now, so none of them surface this note.
-export const COMPLETION_UNAVAILABLE_HINT = 'Completion arrives later';
+export const COMPLETION_UNAVAILABLE_HINT = "Completion isn't available for this item";
 
 /**
  * Whether a ring item is complete — the single choke-point for green/strikethrough.

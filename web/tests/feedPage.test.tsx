@@ -3,9 +3,9 @@ import { render, screen, waitFor } from '@testing-library/react';
 
 // Surface parity: the feed's slot rows carry the SAME per-lane completion control
 // as the rings panel — completable lanes (task / routine / free-text T3) get a live
-// ✓, an unknown-origin slot gets the honest "Completion arrives later" note (the
-// stale "acts arrive with the board" line is gone). Deck-able decisions still feed
-// the deck-link count.
+// ✓, an unknown-origin slot gets the honest "Completion isn't available for this
+// item" note (the stale "acts arrive with the board" line is gone). Deck-able
+// decisions still feed the deck-link count.
 
 const { mockList, mockAct } = vi.hoisted(() => ({ mockList: vi.fn(), mockAct: vi.fn() }));
 vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: mockAct } }));
@@ -62,7 +62,7 @@ describe('FeedPage — slot rows get the live per-lane completion control', () =
     expect(screen.getByTestId('feed-deck-link').textContent).toContain('1 decision');
 
     const pending = screen.getByTestId('feed-pending');
-    expect(pending.textContent).toContain('Completion arrives later'); // honest note
+    expect(pending.textContent).toContain("Completion isn't available for this item"); // honest note
     expect(pending.textContent).not.toContain('arrive with the board'); // stale line GONE
     expect(screen.queryByTestId('feed-row-unavailable')).not.toBeNull();
     expect(screen.queryByTestId('feed-row-hint')).toBeNull(); // hint prop removed

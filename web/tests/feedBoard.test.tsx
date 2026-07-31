@@ -200,7 +200,7 @@ describe('FeedRow — per-lane completion (shared hook)', () => {
         completion={fakeCompletion()}
       />,
     );
-    expect(screen.getByTestId('feed-row-unavailable').textContent).toContain('Completion arrives later');
+    expect(screen.getByTestId('feed-row-unavailable').textContent).toContain("Completion isn't available for this item");
     expect(screen.queryByTestId('feed-row-complete')).toBeNull();
   });
 
