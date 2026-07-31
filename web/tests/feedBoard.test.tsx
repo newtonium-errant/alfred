@@ -115,4 +115,37 @@ describe('FeedRow — defensive render', () => {
     expect(document.querySelector('script')).toBeNull();
     expect(screen.getByTestId('feed-row-ack').getAttribute('aria-label')).toContain('Heads up');
   });
+
+  it('renders a peer_digest body as prose + a truncated notice (the digest content)', () => {
+    render(
+      <FeedRow
+        item={item({
+          kind: 'peer_digest',
+          title: 'Peer digest: kalle',
+          evidence: { peer: 'kalle', date: '2026-07-31', body: 'First line.\nSecond line.', truncated: true },
+        })}
+        expanded
+        onToggleEvidence={() => {}}
+        onAck={() => {}}
+      />,
+    );
+    const body = screen.getByTestId('evidence-body');
+    expect(body.textContent).toContain('First line.');
+    expect(body.textContent).toContain('Second line.');
+    expect(screen.queryByTestId('evidence-truncated')).not.toBeNull();
+    // body/truncated are prose/flag — never key:value rows.
+    expect(screen.queryByTestId('feed-row-evidence')?.textContent ?? '').not.toContain('First line.');
+  });
+
+  it('a body makes the row expandable even with no key:value rows', () => {
+    render(
+      <FeedRow
+        item={item({ kind: 'peer_digest', title: 'Peer digest: kalle', evidence: { body: 'only a body' } })}
+        expanded={false}
+        onToggleEvidence={() => {}}
+        onAck={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId('feed-row-details')).not.toBeNull();
+  });
 });

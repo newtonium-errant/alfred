@@ -9,12 +9,99 @@ import {
   HEAVY_KINDS,
   PARK_Y_THRESHOLD,
   SWIPE_X_THRESHOLD,
+  affirmLabelFor,
   deckVerbsFor,
+  emailPriority,
   kindLabel,
   stampOpacity,
   verdictForDrag,
 } from '../lib/algernon/feedConstants';
-import { coerceEvidenceValue, evidenceLabel, evidenceRows } from '../lib/algernon/feedEvidence';
+import { coerceEvidenceValue, evidenceBody, evidenceLabel, evidenceRows } from '../lib/algernon/feedEvidence';
+import type { FeedItem } from '../lib/algernon/feed';
+
+function feedItem(kind: string, evidence: Record<string, unknown>): FeedItem {
+  return {
+    id: `${kind}:x`,
+    kind,
+    instance: 'salem',
+    title: 't',
+    mode: 'decide',
+    attention: 'needs_you',
+    evidence,
+    actions: [],
+    state: 'open',
+    created_at: '2026-07-31T00:00:00Z',
+    acted_at: null,
+    expires_at: null,
+    source_ref: {},
+  };
+}
+
+describe('emailPriority — the on-face tier', () => {
+  it('reads classifier_priority (the real key), case/space-insensitive', () => {
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: 'HIGH' }))).toBe('high');
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: ' low ' }))).toBe('low');
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: 'medium' }))).toBe('medium');
+  });
+  it('surfaces spam too (face honesty — operator ruling)', () => {
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: 'spam' }))).toBe('spam');
+  });
+  it('is null for empty / missing / wrong-key / non-email (no badge, plain verb)', () => {
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: '' }))).toBeNull();
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: 'garbage' }))).toBeNull();
+    expect(emailPriority(feedItem('email_tier', {}))).toBeNull();
+    expect(emailPriority(feedItem('email_tier', { priority: 'high' }))).toBeNull(); // wrong key ignored
+    expect(emailPriority(feedItem('attribution', { classifier_priority: 'high' }))).toBeNull();
+  });
+});
+
+describe('evidenceBody — prose body extraction', () => {
+  it('extracts a non-empty body + the truncated flag', () => {
+    expect(evidenceBody({ body: 'line one\nline two', truncated: false })).toEqual({
+      text: 'line one\nline two',
+      truncated: false,
+    });
+    expect(evidenceBody({ body: 'digest…[truncated]', truncated: true })?.truncated).toBe(true);
+  });
+  it('is null for absent / empty / non-string / non-object', () => {
+    expect(evidenceBody({})).toBeNull();
+    expect(evidenceBody({ body: '   ' })).toBeNull();
+    expect(evidenceBody({ body: 42 })).toBeNull();
+    expect(evidenceBody(null)).toBeNull();
+    expect(evidenceBody('x')).toBeNull();
+  });
+  it('caps a pathologically long body', () => {
+    expect(evidenceBody({ body: 'x'.repeat(9000) })?.text.length).toBe(4000);
+  });
+});
+
+describe('evidenceRows — body/truncated are prose, never key:value rows', () => {
+  it('drops body and truncated from the rows', () => {
+    const rows = evidenceRows({ peer: 'kalle', body: 'the digest', truncated: true });
+    const keys = rows.map((r) => r.key);
+    expect(keys).toContain('peer');
+    expect(keys).not.toContain('body');
+    expect(keys).not.toContain('truncated');
+  });
+});
+
+describe('affirmLabelFor — dynamic affirm verb', () => {
+  it('appends the tier for an email with a priority', () => {
+    expect(affirmLabelFor(feedItem('email_tier', { classifier_priority: 'high' }))).toBe('Confirm HIGH');
+  });
+  it('appends SPAM too (face honesty — the spam tier is confirmable)', () => {
+    expect(affirmLabelFor(feedItem('email_tier', { classifier_priority: 'spam' }))).toBe('Confirm SPAM');
+  });
+  it('stays the plain static label for email without a recognised priority', () => {
+    expect(affirmLabelFor(feedItem('email_tier', {}))).toBe('Confirm');
+    expect(affirmLabelFor(feedItem('email_tier', { classifier_priority: 'garbage' }))).toBe('Confirm');
+  });
+  it('leaves other kinds unchanged, and is null when there is no affirm action', () => {
+    expect(affirmLabelFor(feedItem('routine_match', {}))).toBe("That's it");
+    expect(affirmLabelFor(feedItem('attribution', { classifier_priority: 'high' }))).toBe('Confirm');
+    expect(affirmLabelFor(feedItem('weather', {}))).toBeNull(); // unmapped kind
+  });
+});
 
 describe('verdictForDrag — swipe thresholds', () => {
   it('affirms past the right x-threshold', () => {

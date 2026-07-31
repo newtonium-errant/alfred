@@ -11,8 +11,34 @@ export interface EvidenceRow {
   value: string;
 }
 
-// Keys that are noise on a card (internal plumbing) — hidden from the expand.
-const HIDDEN_KEYS: ReadonlySet<string> = new Set(['item_number']);
+// Keys hidden from the key:value rows: internal plumbing, plus `body`/`truncated`
+// which render as PROSE (evidenceBody / <EvidenceBody>), not a one-line row.
+const HIDDEN_KEYS: ReadonlySet<string> = new Set(['item_number', 'body', 'truncated']);
+
+// Digest/long-form body is capped at 4000 chars by the producer; mirror that as a
+// defensive display cap (the body scrolls within its container either way).
+const MAX_BODY_CHARS = 4000;
+
+export interface EvidenceBodyContent {
+  text: string;
+  truncated: boolean;
+}
+
+/**
+ * The multiline prose body of an item's evidence (peer_digest et al.), or null
+ * when absent/empty. `truncated` mirrors the producer flag — the body may also
+ * end with a literal `…[truncated]` marker; both are honoured (the marker renders
+ * inline, the flag drives the "full text in the Brief" affordance). Generic: ANY
+ * kind's `evidence.body` surfaces this way. Untrusted display text — the caller
+ * renders it as escaped React children, never markup.
+ */
+export function evidenceBody(evidence: unknown): EvidenceBodyContent | null {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return null;
+  const ev = evidence as Record<string, unknown>;
+  const raw = ev.body;
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null;
+  return { text: raw.slice(0, MAX_BODY_CHARS), truncated: ev.truncated === true };
+}
 
 // A compact, human-ish label for an evidence key (snake_case → Title words).
 export function evidenceLabel(key: string): string {

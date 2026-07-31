@@ -221,4 +221,59 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     );
     expect(screen.getByText(/writes a record/i)).toBeTruthy();
   });
+
+  function renderCard(overrides: Partial<Parameters<typeof item>[0]> = {}, expanded = false) {
+    return render(
+      <DeckCard
+        item={item(overrides)}
+        depth={0}
+        expanded={expanded}
+        confirming={false}
+        onToggleEvidence={() => {}}
+        onConfirmHeavy={() => {}}
+        onCancelHeavy={() => {}}
+      />,
+    );
+  }
+
+  it('an email card shows the assigned TIER badge + a dynamic affirm label on the face', () => {
+    renderCard({ evidence: { classifier_priority: 'high', sender: 'a@b.com' } });
+    const badge = screen.getByTestId('deck-tier-badge');
+    expect(badge.textContent?.toLowerCase()).toContain('high');
+    expect(badge.className).toContain('text-danger'); // high → danger colour
+    // Footer affirm verb is dynamic (no blind confirm).
+    expect(screen.getByTestId('deck-card').textContent).toContain('Confirm HIGH');
+  });
+
+  it('an email card with NO recognised priority shows no badge and the plain Confirm verb', () => {
+    renderCard({ evidence: { sender: 'a@b.com' } });
+    expect(screen.queryByTestId('deck-tier-badge')).toBeNull();
+    expect(screen.getByTestId('deck-card').textContent).toContain('Confirm →');
+  });
+
+  it('a SPAM-classified email shows the badge + "Confirm SPAM" (face honesty, operator ruling)', () => {
+    renderCard({ evidence: { classifier_priority: 'spam', sender: 'a@b.com' } });
+    expect(screen.getByTestId('deck-tier-badge').textContent?.toLowerCase()).toContain('spam');
+    expect(screen.getByTestId('deck-card').textContent).toContain('Confirm SPAM');
+  });
+
+  it('renders an evidence.body as escaped prose (generic mechanism, deck too)', () => {
+    const evil = '<img src=x onerror=alert(1)>';
+    renderCard({ evidence: { body: `digest text\n${evil}`, truncated: true } }, true);
+    const body = screen.getByTestId('evidence-body');
+    expect(body.textContent).toContain('digest text');
+    expect(body.textContent).toContain(evil); // present as TEXT
+    expect(document.querySelector('img')).toBeNull(); // never as markup
+    expect(screen.queryByTestId('evidence-truncated')).not.toBeNull();
+  });
+
+  it('evidence scrolls WITHIN the card — container carries overflow, verbs stay outside it', () => {
+    renderCard({ evidence: { classifier_priority: 'low', sender: 'a@b.com', snippet: 'x'.repeat(600) } }, true);
+    const evidence = screen.getByTestId('deck-evidence');
+    expect(evidence.className).toContain('overflow-y-auto');
+    expect(evidence.className).toContain('min-h-0');
+    // The verb footer is a sibling OUTSIDE the scroll region (DOM-order containment).
+    expect(evidence.textContent).not.toContain('Confirm');
+    expect(screen.getByTestId('deck-card').textContent).toContain('Confirm');
+  });
 });

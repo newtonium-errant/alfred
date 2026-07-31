@@ -1,3 +1,5 @@
+import type { FeedItem } from './feed';
+
 // Feed / deck constants + pure helpers. Kept OUT of the components so the
 // gesture math, the per-kind verb map, and the display labels are unit-testable
 // without a DOM, and so per-user vocabulary (rings labels, kind names) lives in
@@ -68,6 +70,39 @@ export const DECK_VERBS: Record<string, DeckVerbs> = {
 /** Deck verbs for a kind, or null when the kind has no deck action mapping. */
 export function deckVerbsFor(kind: string): DeckVerbs | null {
   return Object.prototype.hasOwnProperty.call(DECK_VERBS, kind) ? DECK_VERBS[kind] : null;
+}
+
+// --- email-tier priority (on-face tier badge + dynamic affirm label) ----------
+// The email-tier feed producer stamps the classifier's assigned tier as
+// `evidence.classifier_priority` (VERIFIED against daily_sync/email_section.py —
+// NOT `priority`; the value is lowercase high/medium/low/spam). ALL FOUR real
+// tiers — spam included — surface as a badge + a "Confirm HIGH"-style verb, so a
+// spam-classified email shows what it was tagged rather than asking for a blind
+// confirm (operator ruling 2026-07-31: face honesty especially for spam; that
+// both verbs then write spam is a legible quirk, not a UI lie). Empty / anything
+// unrecognised → no badge, plain verb.
+export const EMAIL_PRIORITY_TIERS = ['low', 'medium', 'high', 'spam'] as const;
+export type EmailPriority = (typeof EMAIL_PRIORITY_TIERS)[number];
+
+/** The assigned priority tier of an email_tier item, or null (no badge, plain verb). */
+export function emailPriority(item: FeedItem): EmailPriority | null {
+  if (item.kind !== 'email_tier') return null;
+  const raw = (item.evidence as Record<string, unknown> | null | undefined)?.classifier_priority;
+  const v = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return (EMAIL_PRIORITY_TIERS as readonly string[]).includes(v) ? (v as EmailPriority) : null;
+}
+
+/**
+ * The affirm verb label for an item, WITH per-item context — a kind-generic hook
+ * over the static DECK_VERBS label. email_tier appends its assigned tier
+ * ("Confirm HIGH"); every other kind returns its static label unchanged. Null
+ * when the kind has no affirm action.
+ */
+export function affirmLabelFor(item: FeedItem): string | null {
+  const verbs = deckVerbsFor(item.kind);
+  if (!verbs || verbs.affirm === null) return null;
+  const p = emailPriority(item);
+  return p ? `${verbs.affirmLabel} ${p.toUpperCase()}` : verbs.affirmLabel;
 }
 
 // --- display labels ----------------------------------------------------------
