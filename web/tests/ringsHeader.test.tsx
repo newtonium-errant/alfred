@@ -1,17 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 // Pins the RingsHeader render: three tier rings (segments vs empty red circle),
 // the tap-to-expand bucket panel, the disabled ✓ placeholder (no mutation path),
 // row-tap evidence, the all-empty ILB caption, and the fetch/401 seam.
 // Plain DOM assertions only (the suite runs without jest-dom — see vitest.setup).
 
-const { mockList } = vi.hoisted(() => ({ mockList: vi.fn() }));
-vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: vi.fn() } }));
+const { mockList, mockAct } = vi.hoisted(() => ({ mockList: vi.fn(), mockAct: vi.fn() }));
+vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: mockAct } }));
 
 import { RingsHeader } from '../components/feed/RingsHeader';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
+
+// A completable (routine-item) lane item — enables the ✓.
+function routineSlot(overrides: Partial<FeedItem> = {}): FeedItem {
+  return slot({
+    id: 'slot_suggestion:routine/Bills.md::Pay',
+    title: 'T1: Pay Eastlink',
+    attention: 'needs_you',
+    evidence: { tier: 1, origin: 'routine_item', routine_record: 'routine/Bills.md', item_text: 'Pay Eastlink' },
+    ...overrides,
+  });
+}
+
+const flushAct = () => act(async () => { await Promise.resolve(); await Promise.resolve(); });
 
 function slot(overrides: Partial<FeedItem> = {}): FeedItem {
   return {
@@ -35,6 +48,8 @@ function slot(overrides: Partial<FeedItem> = {}): FeedItem {
 beforeEach(() => {
   mockList.mockReset();
   mockList.mockResolvedValue({ items: [], count: 0 });
+  mockAct.mockReset();
+  mockAct.mockResolvedValue({ ok: true, status: 'acted' });
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -77,20 +92,84 @@ describe('RingsHeader (controlled render)', () => {
     expect(screen.queryByTestId('ring-panel-1')).toBeNull();
   });
 
-  it('the panel lists items with a DISABLED ✓ (no mutation path), and a row-tap shows evidence', () => {
+  it('a NON-completable lane (tier-1, no writer) keeps the honest-disabled ✓, and a row-tap shows evidence', () => {
     render(<RingsHeader items={[slot({ id: 'a', evidence: { tier: 1, surface_reason: 'due today' } })]} />);
     fireEvent.click(screen.getByTestId('ring-1'));
     expect(screen.queryByTestId('ring-panel-item')).not.toBeNull();
     const complete = screen.getByTestId('ring-complete') as HTMLButtonElement;
     expect(complete.disabled).toBe(true);
-    // Visually-honest disabled: the muted class is pinned WITH the disabled attr,
-    // so un-disabling this (making it live) forces a conscious restyle too.
-    expect(complete.className).toContain('opacity-50');
+    // Visually-honest disabled: the STANDALONE opacity-50 muted class is pinned
+    // WITH the disabled attr (split-includes, so a live button's `disabled:opacity-50`
+    // variant doesn't count) — un-disabling this forces a conscious restyle too.
+    expect(complete.className.split(' ')).toContain('opacity-50');
     // Evidence hidden until the row is tapped.
     expect(screen.queryByTestId('ring-item-evidence')).toBeNull();
     fireEvent.click(screen.getByTestId('ring-item-row'));
     expect(screen.queryByTestId('ring-item-evidence')).not.toBeNull();
     expect(screen.getByTestId('ring-item-evidence').textContent).toContain('due today');
+  });
+
+  it('per-lane enablement: a task lane stays disabled, a routine lane is LIVE (mutation-verify)', () => {
+    // Task-backed → no board writer → disabled + the honesty pin.
+    const { unmount } = render(
+      <RingsHeader items={[slot({ id: 't', evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })]} />,
+    );
+    fireEvent.click(screen.getByTestId('ring-1'));
+    const taskBtn = screen.getByTestId('ring-complete') as HTMLButtonElement;
+    expect(taskBtn.disabled).toBe(true); // ← reddens if completable(task) ever returns true
+    expect(taskBtn.className.split(' ')).toContain('opacity-50');
+    unmount();
+
+    // Routine-item → wired writer → an ENABLED live control (no standalone opacity-50).
+    render(<RingsHeader items={[routineSlot({ id: 'r' })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    const routineBtn = screen.getByTestId('ring-complete') as HTMLButtonElement;
+    expect(routineBtn.disabled).toBe(false);
+    expect(routineBtn.className.split(' ')).not.toContain('opacity-50');
+  });
+
+  it('completing a routine item goes green + strikethrough and reveals undo', async () => {
+    render(<RingsHeader items={[routineSlot({ id: 'r' })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ring-complete'));
+    });
+    await flushAct();
+    // The ✓ is gone (replaced by the done marker + undo), the item marked done.
+    expect(screen.queryByTestId('ring-complete')).toBeNull();
+    expect(screen.queryByTestId('ring-item-done')).not.toBeNull();
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-done')).toBe('true');
+    expect(screen.queryByTestId('ring-undo')).not.toBeNull();
+    expect(mockAct).toHaveBeenCalledWith('r', 'done');
+  });
+
+  it('undo on a done row returns it to an actionable ✓', async () => {
+    // Start already done (server truth) so undo is available immediately.
+    render(<RingsHeader items={[routineSlot({ id: 'r', state: 'acted' })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    expect(screen.queryByTestId('ring-undo')).not.toBeNull();
+    mockAct.mockResolvedValue({ ok: true, status: 'undone' });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ring-undo'));
+    });
+    await flushAct();
+    expect(mockAct).toHaveBeenLastCalledWith('r', 'undo_done');
+    // Back to an actionable ✓.
+    expect(screen.queryByTestId('ring-complete')).not.toBeNull();
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-done')).toBe('false');
+  });
+
+  it('a failed completion reverts and shows a per-item error', async () => {
+    mockAct.mockRejectedValue(new ApiError(409, 'request_failed'));
+    render(<RingsHeader items={[routineSlot({ id: 'r' })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ring-complete'));
+    });
+    await flushAct();
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-done')).toBe('false');
+    expect(screen.queryByTestId('ring-item-error')).not.toBeNull();
+    expect(screen.queryByTestId('ring-complete')).not.toBeNull(); // still actionable
   });
 
   it('an empty bucket panel shows its own ILB line', () => {

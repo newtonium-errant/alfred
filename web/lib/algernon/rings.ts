@@ -37,13 +37,41 @@ export function ringTierOf(item: FeedItem): number | null {
   return Number.isInteger(n) && n >= 1 && n <= 3 ? n : null;
 }
 
+// The completion action verbs the board sends for a slot item (Phase C).
+export const RING_ACTION_DONE = 'done';
+export const RING_ACTION_UNDO = 'undo_done';
+
 /**
- * Whether a ring item is complete. Phase-B evidence carries NO completion signal,
- * so this is the single choke-point that returns false today; Phase C lights the
- * green segment by reading the real flag once the producer emits one.
+ * Whether a ring item is complete — the single choke-point for green/strikethrough.
+ * TWO signals, per the board-completion contract: an item completed VIA the board
+ * persists as `state === "acted"` (the router's set_state); an item completed in
+ * the vault (and still emitted) carries `evidence.done === true`. Compute both —
+ * a board-completed item that compute then suppresses won't re-emit `done`, so
+ * `done` alone would lose it.
  */
 export function ringItemDone(item: FeedItem): boolean {
+  if (item.state === 'acted') return true;
   return (item.evidence as Record<string, unknown> | null | undefined)?.done === true;
+}
+
+/**
+ * Whether a slot item's lane can be completed FROM THE BOARD (enables the ✓), per
+ * the completion-semantics matrix — computed client-side from the producer's own
+ * stamped evidence fields:
+ *   - origin === "task"  → false (v1 UNSUPPORTED — no talker task-completion writer)
+ *   - routine_record set → true  (routine-item lane → routine_done writer)
+ *   - tier === 3         → true  (free-text T3 lane → tier_done writer)
+ *   - otherwise          → false (unknown origin → never a guessed write)
+ * A false lane keeps the ✓ honestly disabled with its "not completable here yet"
+ * microcopy; the router is the ground truth and returns `unsupported_item` if the
+ * client and backend ever disagree.
+ */
+export function ringItemCompletable(item: FeedItem): boolean {
+  const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
+  if (ev.origin === 'task') return false;
+  if (ev.routine_record) return true;
+  if (ev.tier === 3 || ev.tier === '3') return true;
+  return false;
 }
 
 /**

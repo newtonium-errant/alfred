@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ringItemDone, ringTierOf, tierRingBuckets } from '../lib/algernon/rings';
+import { ringItemCompletable, ringItemDone, ringTierOf, tierRingBuckets } from '../lib/algernon/rings';
 import type { FeedItem } from '../lib/algernon/feed';
 
 // Ring DATA binding — grouping open slot_suggestion feed items into the three
@@ -42,11 +42,34 @@ describe('ringTierOf', () => {
 });
 
 describe('ringItemDone', () => {
-  it('is false with no completion signal (the Phase-B reality)', () => {
+  it('is false for an open item with no completion signal', () => {
     expect(ringItemDone(slot())).toBe(false);
   });
-  it('reads an explicit done flag (forward-compat for Phase C)', () => {
+  it('is true when evidence.done is set (vault-completed, still emitted)', () => {
     expect(ringItemDone(slot({ evidence: { tier: 1, done: true } }))).toBe(true);
+  });
+  it('is true when state is "acted" (board-completed — never re-emits done)', () => {
+    expect(ringItemDone(slot({ state: 'acted', evidence: { tier: 1 } }))).toBe(true);
+  });
+});
+
+describe('ringItemCompletable', () => {
+  it('is false for a task-backed lane (v1 has no board task writer)', () => {
+    expect(ringItemCompletable(slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } }))).toBe(false);
+  });
+  it('is true for a routine-item lane', () => {
+    expect(ringItemCompletable(slot({ evidence: { tier: 1, origin: 'routine_item', routine_record: 'routine/Bills.md', item_text: 'Pay' } }))).toBe(true);
+  });
+  it('is true for a free-text T3 lane (numeric or string tier)', () => {
+    expect(ringItemCompletable(slot({ evidence: { tier: 3 } }))).toBe(true);
+    expect(ringItemCompletable(slot({ evidence: { tier: '3' } }))).toBe(true);
+  });
+  it('is false for an unknown origin with no routine record and tier < 3', () => {
+    expect(ringItemCompletable(slot({ evidence: { tier: 1 } }))).toBe(false);
+    expect(ringItemCompletable(slot({ evidence: {} }))).toBe(false);
+  });
+  it('task origin wins even at tier 3 (never a guessed write)', () => {
+    expect(ringItemCompletable(slot({ evidence: { tier: 3, origin: 'task' } }))).toBe(false);
   });
 });
 

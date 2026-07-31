@@ -12,6 +12,7 @@ import { composeMode, halifaxHour, type ComposeMode } from '../lib/algernon/comp
 import { useComposerLog } from '../lib/algernon/composerLog';
 import { deckVerbsFor } from '../lib/algernon/feedConstants';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
+import { ringItemDone } from '../lib/algernon/rings';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
@@ -74,9 +75,12 @@ export default function HomePage() {
   const board = useFeedBoard({ items: items ?? [], onAuthExpired });
   // How many things need you (the FEED truth) vs how many the DECK can actually
   // deal. The deck only handles kinds with a wired verb — slot_suggestion et al.
-  // aren't swipeable yet (Phase C) — so the deck PROMISE counts deck-able only
-  // (mirrors feed.tsx, b1). The needs-you line stays the feed total.
-  const needsYouCount = board.needsYou.length;
+  // aren't swipeable — so the deck PROMISE counts deck-able only (mirrors feed.tsx,
+  // b1). A DONE slot item (board-completed) no longer needs you, so it's excluded
+  // from the needs-you total (Phase C).
+  const needsYouCount = board.needsYou.filter(
+    (it) => !(it.kind === 'slot_suggestion' && ringItemDone(it)),
+  ).length;
   const deckableCount = board.needsYou.filter((it) => deckVerbsFor(it.kind) !== null).length;
 
   const toggleExpanded = useCallback((id: string) => {

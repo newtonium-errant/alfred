@@ -79,4 +79,16 @@ describe('HomePage composer — the deck pill counts only deck-able kinds', () =
     expect(screen.queryByTestId('composer-deck-pill')).toBeNull();
     expect(screen.getByTestId('composer-needs-you').textContent).toContain('1 thing needs you');
   });
+
+  it('a DONE slot item is excluded from the needs-you count (Phase C)', async () => {
+    const doneSlot: FeedItem = { ...item('slot_suggestion', 's1', 'needs_you', 'decide'), state: 'acted' };
+    mockList.mockResolvedValue({
+      items: [item('email_tier', 'e1', 'needs_you', 'decide'), doneSlot],
+      count: 2,
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('composer-needs-you')).not.toBeNull());
+    // Two needs-you items, but the done slot no longer needs you → count is 1.
+    expect(screen.getByTestId('composer-needs-you').textContent).toContain('1 thing needs you');
+  });
 });

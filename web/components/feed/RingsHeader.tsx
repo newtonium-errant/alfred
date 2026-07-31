@@ -12,13 +12,14 @@ import {
   ringSegments,
   segmentStroke,
 } from '../../lib/algernon/ringGeometry';
-import { ringItemDone, tierRingBuckets, type RingBucket } from '../../lib/algernon/rings';
+import { ringItemCompletable, tierRingBuckets, type RingBucket } from '../../lib/algernon/rings';
+import { useRingCompletion } from './useRingCompletion';
 
-// The segmented "balanced day" rings header (B3-4). DISPLAY ONLY in Phase B:
-// three tier rings (T1/T2/T3) rendered from open `slot_suggestion` feed items
-// (see lib/algernon/rings.ts for why tier, not duty/rhythm/fuel). Tap a ring to
-// expand its bucket; tap a row for its evidence. Completion is Phase C — the ✓
-// button is a disabled, honest placeholder, with NO mutation path at all.
+// The segmented "balanced day" rings header. Three tier rings (T1/T2/T3) from
+// open `slot_suggestion` items (see lib/algernon/rings.ts for why tier). Tap a
+// ring to expand its bucket; tap a row for its evidence. Phase C: the panel's ✓
+// completes an item per-lane (routine + free-text T3 wired; task/unknown stay
+// honestly disabled) — optimistic green on success, single-step undo on done rows.
 
 export interface RingsHeaderProps {
   /** 401 handler (bubbles a session expiry to the host page, like the deck/feed). */
@@ -36,6 +37,7 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
   const [error, setError] = useState<string | null>(null);
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [openItemId, setOpenItemId] = useState<string | null>(null);
+  const completion = useRingCompletion({ onAuthExpired });
 
   useEffect(() => {
     if (controlled) return;
@@ -91,7 +93,9 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
             Loading your rings…
           </p>
         ) : (
-          buckets.map((b) => <Ring key={b.key} bucket={b} active={openKey === b.key} onTap={() => toggleRing(b.key)} />)
+          buckets.map((b) => (
+            <Ring key={b.key} bucket={b} active={openKey === b.key} isDone={completion.effectiveDone} onTap={() => toggleRing(b.key)} />
+          ))
         )}
       </div>
 
@@ -105,7 +109,7 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
       {activeBucket && (
         <div data-testid={`ring-panel-${activeBucket.key}`} className="mt-2 rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
           <h3 className="text-xs font-bold uppercase tracking-wider text-honeydew-700">
-            {activeBucket.label} · {activeBucket.items.filter(ringItemDone).length}/{activeBucket.items.length} done
+            {activeBucket.label} · {activeBucket.items.filter(completion.effectiveDone).length}/{activeBucket.items.length} done
           </h3>
 
           {activeBucket.items.length === 0 ? (
@@ -116,11 +120,14 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
           ) : (
             <ul className="mt-2 flex flex-col gap-2">
               {activeBucket.items.map((it) => {
-                const done = ringItemDone(it);
+                const done = completion.effectiveDone(it);
+                const completable = ringItemCompletable(it);
+                const busy = completion.busy(it.id);
+                const itemError = completion.errorFor(it.id);
                 const rows = evidenceRows(it.evidence);
                 const expanded = openItemId === it.id;
                 return (
-                  <li key={it.id} data-testid="ring-panel-item" className="border-t border-dashed border-honeydew-200 pt-2 first:border-0 first:pt-0">
+                  <li key={it.id} data-testid="ring-panel-item" data-done={done} className="border-t border-dashed border-honeydew-200 pt-2 first:border-0 first:pt-0">
                     <div className="flex items-start justify-between gap-2">
                       <button
                         type="button"
@@ -133,25 +140,64 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
                           aria-hidden
                           className={`mt-1 h-2 w-2 shrink-0 rounded-full ${done ? 'bg-status-done-fg' : 'bg-status-progress-fg'}`}
                         />
-                        <span className="min-w-0 break-words text-sm font-semibold text-honeydew-700">{it.title || it.id}</span>
+                        <span className={`min-w-0 break-words text-sm font-semibold text-honeydew-700 ${done ? 'line-through opacity-70' : ''}`}>
+                          {it.title || it.id}
+                        </span>
                       </button>
-                      {/* Completion is Phase C — an honest DISABLED placeholder, no
-                          mutation path. Styled visibly inert (muted + reduced
-                          opacity, default cursor) so it never reads as a live
-                          control. The `disabled` attr AND the `opacity-50` muted
-                          class are pinned together — un-disabling this forces a
-                          conscious restyle too. */}
-                      <button
-                        type="button"
-                        data-testid="ring-complete"
-                        disabled
-                        aria-disabled="true"
-                        title="arrives with the board"
-                        className="shrink-0 cursor-default rounded-lg border border-honeydew-200 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-400 opacity-50"
-                      >
-                        ✓ Done
-                      </button>
+
+                      {done ? (
+                        // Completed — a green marker, plus a single-step undo where
+                        // the lane is board-completable (never on a vault-done item).
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <span data-testid="ring-item-done" className="text-[10px] font-bold uppercase tracking-wider text-status-done-fg">
+                            ✓ Done
+                          </span>
+                          {completable && (
+                            <button
+                              type="button"
+                              data-testid="ring-undo"
+                              disabled={busy}
+                              onClick={() => completion.undo(it)}
+                              className="rounded-lg border border-honeydew-300 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-600 disabled:opacity-50"
+                            >
+                              {busy ? '…' : 'Undo'}
+                            </button>
+                          )}
+                        </div>
+                      ) : completable ? (
+                        // A LIVE control — this lane has a wired writer.
+                        <button
+                          type="button"
+                          data-testid="ring-complete"
+                          disabled={busy}
+                          onClick={() => completion.complete(it)}
+                          className="shrink-0 rounded-lg border border-honeydew-400 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+                        >
+                          {busy ? '…' : '✓ Done'}
+                        </button>
+                      ) : (
+                        // Non-completable lane (task / unknown origin) — honestly
+                        // DISABLED. The `disabled` attr AND `opacity-50` are pinned
+                        // together so un-disabling forces a conscious restyle.
+                        <button
+                          type="button"
+                          data-testid="ring-complete"
+                          disabled
+                          aria-disabled="true"
+                          title="not completable here yet"
+                          className="shrink-0 cursor-default rounded-lg border border-honeydew-200 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-400 opacity-50"
+                        >
+                          ✓ Done
+                        </button>
+                      )}
                     </div>
+
+                    {itemError && (
+                      <p data-testid="ring-item-error" role="alert" className="mt-1 pl-4 text-[11px] text-danger">
+                        {itemError}
+                      </p>
+                    )}
+
                     {expanded && rows.length > 0 && (
                       <dl data-testid="ring-item-evidence" className="mt-1.5 space-y-1 pl-4 text-xs text-honeydew-600">
                         {rows.map((r) => (
@@ -167,8 +213,6 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
               })}
             </ul>
           )}
-
-          <p className="mt-2 text-[11px] text-honeydew-600">Completing arrives with the board.</p>
         </div>
       )}
     </section>
@@ -176,8 +220,19 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
 }
 
 // One ring: n segments (amber = planned, green = done) or, for an empty bucket,
-// a faint red circle. A tap toggles the bucket panel.
-function Ring({ bucket, active, onTap }: { bucket: RingBucket; active: boolean; onTap: () => void }) {
+// a faint red circle. A tap toggles the bucket panel. `isDone` is threaded from
+// the completion state so a just-completed segment goes green optimistically.
+function Ring({
+  bucket,
+  active,
+  isDone,
+  onTap,
+}: {
+  bucket: RingBucket;
+  active: boolean;
+  isDone: (item: FeedItem) => boolean;
+  onTap: () => void;
+}) {
   const n = bucket.items.length;
   const segs = ringSegments(n);
   return (
@@ -211,7 +266,7 @@ function Ring({ bucket, active, onTap }: { bucket: RingBucket; active: boolean; 
               stroke="currentColor"
               strokeWidth={RING_STROKE_WIDTH}
               strokeLinecap="round"
-              className={segmentStroke(ringItemDone(bucket.items[i]))}
+              className={segmentStroke(isDone(bucket.items[i]))}
             />
           ))
         )}
