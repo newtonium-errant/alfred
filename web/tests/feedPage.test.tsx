@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 
 // Surface parity: the feed's slot rows carry the SAME per-lane completion control
-// as the rings panel — completable lanes get a live ✓, task/unknown lanes get the
-// honest "Completion arrives later" note (the stale "acts arrive with the board"
-// line is gone). Deck-able decisions still feed the deck-link count.
+// as the rings panel — completable lanes (task / routine / free-text T3) get a live
+// ✓, an unknown-origin slot gets the honest "Completion arrives later" note (the
+// stale "acts arrive with the board" line is gone). Deck-able decisions still feed
+// the deck-link count.
 
 const { mockList, mockAct } = vi.hoisted(() => ({ mockList: vi.fn(), mockAct: vi.fn() }));
 vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: mockAct } }));

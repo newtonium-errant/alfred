@@ -117,16 +117,27 @@ describe('RingsHeader (controlled render)', () => {
     expect(screen.getByTestId('ring-item-evidence').textContent).toContain('due today');
   });
 
-  it('per-lane enablement: a task lane stays disabled, a routine lane is LIVE (mutation-verify)', () => {
-    // Task-backed → no board writer → disabled + the honesty pin.
+  it('per-lane enablement: a task lane is now LIVE (C1b), an unknown-origin lane stays disabled (mutation-verify)', () => {
+    // Task-backed → C1b writer wired → an ENABLED live control (no standalone opacity-50).
     const { unmount } = render(
       <RingsHeader items={[slot({ id: 't', evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })]} />,
     );
     fireEvent.click(screen.getByTestId('ring-1'));
     const taskBtn = screen.getByTestId('ring-complete') as HTMLButtonElement;
-    expect(taskBtn.disabled).toBe(true); // ← reddens if completable(task) ever returns true
-    expect(taskBtn.className.split(' ')).toContain('opacity-50');
+    expect(taskBtn.disabled).toBe(false); // ← reddens if completable(task) regresses to false
+    expect(taskBtn.className.split(' ')).not.toContain('opacity-50');
     unmount();
+
+    // Unknown / unstamped origin (no origin, no routine_record, tier < 3) → no writer
+    // → honestly disabled + the visual-honesty pin.
+    const { unmount: unmount2 } = render(
+      <RingsHeader items={[slot({ id: 'u', evidence: { tier: 1, surface_reason: 'due today' } })]} />,
+    );
+    fireEvent.click(screen.getByTestId('ring-1'));
+    const unknownBtn = screen.getByTestId('ring-complete') as HTMLButtonElement;
+    expect(unknownBtn.disabled).toBe(true); // ← reddens if completable(unknown) ever returns true
+    expect(unknownBtn.className.split(' ')).toContain('opacity-50');
+    unmount2();
 
     // Routine-item → wired writer → an ENABLED live control (no standalone opacity-50).
     render(<RingsHeader items={[routineSlot({ id: 'r' })]} />);
@@ -251,5 +262,38 @@ describe('RingsHeader — completion is a STAGE, not a disappearance', () => {
     expect(screen.getByTestId('ring-panel-worklist').querySelectorAll('[data-testid="ring-panel-item"]')).toHaveLength(1);
     expect(screen.getByTestId('ring-show-done').textContent).toContain('Show done (1)');
     expect(screen.queryByTestId('ring-panel-all-done')).toBeNull(); // not all done
+  });
+});
+
+describe('RingsHeader — task lane (C1b: completable, done-only)', () => {
+  it('an OPEN task row is a LIVE ✓ (task lane is board-completable now)', () => {
+    render(<RingsHeader items={[slot({ id: 't', evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    const btn = screen.getByTestId('ring-complete') as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-done')).toBe('false');
+  });
+
+  it('a DONE task row shows ✓ Done but NO undo control (done-only: undo is via chat)', () => {
+    // Task done today → stays on the ring (green), all-done WIN; the done row shows the
+    // ✓ Done marker but no Undo — a task is completable, NOT board-undoable (undo_done
+    // → 422). Reveal the done row via Show-done to inspect it.
+    render(
+      <RingsHeader
+        items={[slot({ id: 't', state: 'acted', acted_at: TODAY_ISO, evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })]}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('ring-1'));
+    expect(screen.queryByTestId('ring-panel-all-done')).not.toBeNull();
+    fireEvent.click(screen.getByTestId('ring-show-done'));
+    expect(screen.queryByTestId('ring-item-done')).not.toBeNull(); // ✓ Done marker present
+    expect(screen.queryByTestId('ring-undo')).toBeNull(); // ← reddens if the undo gate uses `completable` not `undoable`
+  });
+
+  it('by contrast a DONE routine row DOES show Undo (routine is board-undoable)', () => {
+    render(<RingsHeader items={[doneTodaySlot({ id: 'r' })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    fireEvent.click(screen.getByTestId('ring-show-done'));
+    expect(screen.queryByTestId('ring-undo')).not.toBeNull();
   });
 });

@@ -1,7 +1,7 @@
 import type { FeedItem } from '../../lib/algernon/feed';
 import { kindLabel } from '../../lib/algernon/feedConstants';
 import { evidenceBody, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
-import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable } from '../../lib/algernon/rings';
+import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, ringItemUndoable } from '../../lib/algernon/rings';
 import type { UseRingCompletionResult } from './useRingCompletion';
 import { EvidenceBody } from './EvidenceBody';
 
@@ -33,6 +33,7 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion }:
   const done = completion ? completion.effectiveDone(item) : false;
   const busy = completion ? completion.busy(item.id) : false;
   const completable = completion ? ringItemCompletable(item) : false;
+  const undoable = completion ? ringItemUndoable(item) : false;
   const completionError = completion ? completion.errorFor(item.id) : null;
   return (
     <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
@@ -71,7 +72,7 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion }:
               <span data-testid="feed-row-done" className="text-[10px] font-bold uppercase tracking-wider text-status-done-fg">
                 ✓ Done
               </span>
-              {completable && (
+              {undoable && (
                 <button
                   type="button"
                   data-testid="feed-row-undo"
@@ -94,7 +95,8 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion }:
               {busy ? '…' : '✓ Done'}
             </button>
           ) : (
-            // Task / unknown lane — honest note, NO button (never the false board line).
+            // Unknown / unstamped-origin lane — honest note, NO button (task is
+            // completable now; only a slot with no writer-able origin lands here).
             <span data-testid="feed-row-unavailable" className="shrink-0 self-center text-[11px] italic text-honeydew-600/80">
               {COMPLETION_UNAVAILABLE_HINT}
             </span>
