@@ -263,6 +263,28 @@ export const composerLogBodySchema = z.object({
 
 export type ComposerLogBody = z.infer<typeof composerLogBodySchema>;
 
+// POST /api/push/subscribe body (B4) — a browser PushSubscription, stored server-
+// side so the poller can send to it. All fields bounded; `z.object` STRIPS unknown
+// keys. `endpoint` MUST be a URL (the push service origin) — validated but never
+// used as a filesystem path. The keys are the base64url ECDH/auth secrets web-push
+// needs; bounded generously (p256dh ~88 / auth ~24 chars in practice).
+export const PUSH_ENDPOINT_MAX_CHARS = 2048;
+export const pushSubscriptionSchema = z.object({
+  endpoint: z.string().url().max(PUSH_ENDPOINT_MAX_CHARS),
+  expirationTime: z.number().nullable().optional(),
+  keys: z.object({
+    p256dh: z.string().min(1).max(512),
+    auth: z.string().min(1).max(512),
+  }),
+});
+export type PushSubscriptionBody = z.infer<typeof pushSubscriptionSchema>;
+
+// DELETE /api/push/subscribe body — remove the subscription with this endpoint.
+export const pushUnsubscribeBodySchema = z.object({
+  endpoint: z.string().url().max(PUSH_ENDPOINT_MAX_CHARS),
+});
+export type PushUnsubscribeBody = z.infer<typeof pushUnsubscribeBodySchema>;
+
 // --- Web STT trust-boundary constants (BUILD_DECISIONS §4 / §5) -------------
 // Co-located with the other edge constants even though the binary STT body is
 // NOT zod-parsed (it's a raw audio Buffer) — the BFF route uses these for the
