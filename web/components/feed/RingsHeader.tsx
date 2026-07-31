@@ -135,14 +135,19 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
                         />
                         <span className="min-w-0 break-words text-sm font-semibold text-honeydew-700">{it.title || it.id}</span>
                       </button>
-                      {/* Completion is Phase C — an honest DISABLED placeholder, no mutation path. */}
+                      {/* Completion is Phase C — an honest DISABLED placeholder, no
+                          mutation path. Styled visibly inert (muted + reduced
+                          opacity, default cursor) so it never reads as a live
+                          control. The `disabled` attr AND the `opacity-50` muted
+                          class are pinned together — un-disabling this forces a
+                          conscious restyle too. */}
                       <button
                         type="button"
                         data-testid="ring-complete"
                         disabled
                         aria-disabled="true"
                         title="arrives with the board"
-                        className="shrink-0 cursor-not-allowed rounded-lg border border-honeydew-300 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-400"
+                        className="shrink-0 cursor-default rounded-lg border border-honeydew-200 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-400 opacity-50"
                       >
                         ✓ Done
                       </button>
