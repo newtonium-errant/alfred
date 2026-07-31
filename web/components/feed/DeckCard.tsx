@@ -1,6 +1,6 @@
 import { forwardRef } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { deckVerbsFor, kindLabel, HEAVY_KINDS } from '../../lib/algernon/feedConstants';
+import { affirmLabelFor, deckVerbsFor, emailPriority, kindLabel, HEAVY_KINDS, type EmailPriority } from '../../lib/algernon/feedConstants';
 import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 
 // Presentational deck card. All content is rendered as React text children
@@ -8,6 +8,14 @@ import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 // dangerouslySetInnerHTML or renders an href from item data (#22 XSS precedent).
 // The drag transform + stamp opacities are driven IMPERATIVELY by Deck via the
 // forwarded ref (query `[data-stamp]`) so a pointermove never re-renders React.
+
+// Tier badge colour by assigned priority — bordered-chip idiom (matches the
+// card's other chips, not the rounded Badge pill). Reuses existing status tokens.
+const PRIORITY_CHIP_CLASS: Record<EmailPriority, string> = {
+  high: 'border-danger text-danger',
+  medium: 'border-status-progress-fg text-status-progress-fg',
+  low: 'border-honeydew-500 text-honeydew-600',
+};
 
 export interface DeckCardProps {
   item: FeedItem;
@@ -26,6 +34,11 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
   const verbs = deckVerbsFor(item.kind);
   const heavy = HEAVY_KINDS.has(item.kind);
   const rows = evidenceRows(item.evidence);
+  // Email-tier decisions carry their assigned tier on the FACE (no blind confirm):
+  // a colour-coded badge + a dynamic affirm label ("Confirm HIGH"). Absent/spam →
+  // no badge + the plain verb.
+  const priority = emailPriority(item);
+  const affirmLabel = affirmLabelFor(item);
 
   return (
     <div
@@ -41,10 +54,20 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         transition: 'transform .22s ease, opacity .22s ease',
       }}
     >
-      <div className="mb-2 flex flex-wrap gap-1.5">
+      <div className="mb-2 flex shrink-0 flex-wrap gap-1.5">
         <span className="rounded border border-honeydew-300 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
           {kindLabel(item.kind)}
         </span>
+        {priority && (
+          // The assigned tier, on the face — the decision content the operator
+          // was otherwise blind-confirming.
+          <span
+            data-testid="deck-tier-badge"
+            className={`rounded border px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${PRIORITY_CHIP_CLASS[priority]}`}
+          >
+            {priority}
+          </span>
+        )}
         {item.instance && (
           <span className="rounded border border-honeydew-400 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
             {item.instance}
@@ -57,7 +80,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         )}
       </div>
 
-      <h2 className="mb-1.5 text-lg font-extrabold leading-snug text-honeydew-700">{item.title || item.id}</h2>
+      <h2 className="mb-1.5 shrink-0 text-lg font-extrabold leading-snug text-honeydew-700">{item.title || item.id}</h2>
 
       {rows.length > 0 && (
         <button
@@ -65,13 +88,19 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
           data-testid="deck-evidence-toggle"
           onClick={onToggleEvidence}
           aria-expanded={expanded}
-          className="self-start text-xs text-honeydew-600 underline underline-offset-2"
+          className="shrink-0 self-start text-xs text-honeydew-600 underline underline-offset-2"
         >
           {expanded ? 'Hide details' : 'Show details'}
         </button>
       )}
       {expanded && (
-        <dl data-testid="deck-evidence" className="mt-2 space-y-1 border-t border-dashed border-honeydew-300 pt-2 text-xs text-honeydew-600">
+        // Evidence SCROLLS within the card — flex-1 + min-h-0 lets it take the
+        // space between the title and the pinned verb footer, overflow-y-auto keeps
+        // long snippets from spilling past the card onto the buttons below.
+        <dl
+          data-testid="deck-evidence"
+          className="mt-2 min-h-0 flex-1 space-y-1 overflow-y-auto border-t border-dashed border-honeydew-300 pt-2 text-xs text-honeydew-600"
+        >
           {rows.map((r) => (
             <div key={r.key} className="flex gap-2">
               <dt className="shrink-0 font-semibold text-honeydew-700">{evidenceLabel(r.key)}:</dt>
@@ -81,19 +110,19 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         </dl>
       )}
 
-      <div className="mt-auto flex items-center justify-between pt-3 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
+      <div className="mt-auto flex shrink-0 items-center justify-between pt-3 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
         <span className={verbs?.reject ? 'text-danger' : 'text-honeydew-400'}>
           {verbs?.reject ? `← ${verbs.rejectLabel}` : '—'}
         </span>
         <span className="text-status-progress-fg">↑ Park</span>
         <span className={verbs?.affirm ? 'text-honeydew-600' : 'text-honeydew-400'}>
-          {verbs?.affirm ? `${verbs.affirmLabel} →` : '—'}
+          {verbs?.affirm ? `${affirmLabel} →` : '—'}
         </span>
       </div>
 
       {/* Verdict stamps — Deck sets their opacity imperatively during a drag. */}
       <span data-stamp="affirm" className="pointer-events-none absolute right-4 top-4 rotate-[-8deg] rounded border-2 border-honeydew-600 px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-honeydew-600 opacity-0">
-        {heavy ? 'Review' : 'Yes'}
+        {priority ? affirmLabel : heavy ? 'Review' : 'Yes'}
       </span>
       <span data-stamp="reject" className="pointer-events-none absolute left-4 top-4 rotate-[8deg] rounded border-2 border-danger px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-danger opacity-0">
         No
