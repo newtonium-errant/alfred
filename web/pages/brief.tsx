@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import Head from 'next/head';
+import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
 import { BriefView } from '../components/brief/BriefView';
@@ -30,6 +31,10 @@ export default function BriefPage() {
   const [dailySync, setDailySync] = useState<OutboundLatest | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [unauthenticated, setUnauthenticated] = useState(false);
+  // Signpost banner (client-side page element ONLY — never touches the brief
+  // record/markdown; Phase-A byte-parity is sacred). Starts hidden to avoid an
+  // SSR flash, then reveals on mount unless previously dismissed (localStorage).
+  const [showSignpost, setShowSignpost] = useState(false);
 
   // Redirect signed-out visitors to login — either /api/auth/me said "no
   // session" or a /api/brief call returned 401 invalid_session.
@@ -63,6 +68,23 @@ export default function BriefPage() {
       cancelled = true;
     };
   }, [authed]);
+
+  const SIGNPOST_KEY = 'algernon_brief_signpost';
+  useEffect(() => {
+    try {
+      if (window.localStorage.getItem(SIGNPOST_KEY) !== 'dismissed') setShowSignpost(true);
+    } catch {
+      setShowSignpost(true); // storage blocked → still surface the informational note
+    }
+  }, []);
+  const dismissSignpost = useCallback(() => {
+    setShowSignpost(false);
+    try {
+      window.localStorage.setItem(SIGNPOST_KEY, 'dismissed');
+    } catch {
+      /* best-effort — the banner just reappears next load */
+    }
+  }, []);
 
   const handleSignOut = useCallback(async () => {
     try {
@@ -102,6 +124,35 @@ export default function BriefPage() {
         <p className={`mt-1 ${subtle}`}>
           Today&apos;s morning brief and Daily Sync from {INSTANCE_NAME}.
         </p>
+
+        {showSignpost && (
+          <div
+            data-testid="brief-signpost"
+            className="mt-4 flex items-start justify-between gap-3 rounded-xl border border-honeydew-300 bg-honeydew-50 px-3 py-2 text-sm text-honeydew-700"
+          >
+            <span>
+              Reply verbs in the text (&ldquo;T1 confirm&rdquo;, …) work in Telegram. On the web,
+              decisions live in the{' '}
+              <Link href="/deck" className="underline underline-offset-2">
+                Deck
+              </Link>{' '}
+              and{' '}
+              <Link href="/feed" className="underline underline-offset-2">
+                Feed
+              </Link>
+              .
+            </span>
+            <button
+              type="button"
+              data-testid="brief-signpost-dismiss"
+              aria-label="Dismiss"
+              onClick={dismissSignpost}
+              className="shrink-0 text-honeydew-600 underline underline-offset-2"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {error && (
           <div

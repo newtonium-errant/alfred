@@ -9,10 +9,15 @@ export interface FeedRowProps {
   item: FeedItem;
   expanded: boolean;
   onToggleEvidence: () => void;
-  onAck: () => void;
+  /** Present → an Ack button. Omit for a decide-mode row whose acts aren't wired. */
+  onAck?: () => void;
+  /** Muted affordance note shown IN PLACE of the Ack button when there is no
+   *  action yet (e.g. slot_suggestion — its acts arrive with the board). An
+   *  honest placeholder, never a dead control that pretends to work. */
+  hint?: string;
 }
 
-export function FeedRow({ item, expanded, onToggleEvidence, onAck }: FeedRowProps) {
+export function FeedRow({ item, expanded, onToggleEvidence, onAck, hint }: FeedRowProps) {
   const rows = evidenceRows(item.evidence);
   return (
     <li data-testid="feed-row" data-kind={item.kind} className="rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
@@ -41,15 +46,21 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck }: FeedRowProp
             </button>
           )}
         </div>
-        <button
-          type="button"
-          data-testid="feed-row-ack"
-          aria-label={`Acknowledge: ${item.title || item.id}`}
-          onClick={onAck}
-          className="shrink-0 rounded-lg border border-honeydew-400 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-600"
-        >
-          Ack
-        </button>
+        {onAck ? (
+          <button
+            type="button"
+            data-testid="feed-row-ack"
+            aria-label={`Acknowledge: ${item.title || item.id}`}
+            onClick={onAck}
+            className="shrink-0 rounded-lg border border-honeydew-400 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-600"
+          >
+            Ack
+          </button>
+        ) : hint ? (
+          <span data-testid="feed-row-hint" className="shrink-0 self-center text-[11px] italic text-honeydew-600/80">
+            {hint}
+          </span>
+        ) : null}
       </div>
       {expanded && rows.length > 0 && (
         <dl data-testid="feed-row-evidence" className="mt-2 space-y-1 border-t border-dashed border-honeydew-200 pt-2 text-xs text-honeydew-600">

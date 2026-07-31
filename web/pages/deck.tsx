@@ -4,7 +4,9 @@ import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
 import { Deck } from '../components/feed/Deck';
 import { authApi } from '../lib/algernon/authClient';
+import Link from 'next/link';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
+import { deckVerbsFor } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle } from '../lib/typography';
@@ -97,7 +99,15 @@ export default function DeckPage() {
     router.replace('/login');
   }, [router]);
 
-  const empty = useMemo(() => items != null && items.length === 0, [items]);
+  // The deck only deals kinds with a WIRED verb (DECK_VERBS). A decide-mode kind
+  // whose acts aren't built yet (slot_suggestion → the board, Phase C) has no
+  // verbs, so it must never enter the stack as a card that's dead to every
+  // gesture. Filter client-side; the API contract is untouched.
+  const actionable = useMemo(
+    () => (items ?? []).filter((it) => deckVerbsFor(it.kind) !== null),
+    [items],
+  );
+  const unactionableCount = (items?.length ?? 0) - actionable.length;
 
   if (!authed) {
     return (
@@ -135,17 +145,31 @@ export default function DeckPage() {
           </p>
         )}
 
-        {empty && (
-          // Intentionally-left-blank: an explicit "nothing to decide" state.
+        {items != null && !error && actionable.length === 0 && unactionableCount === 0 && (
+          // ILB: empty because there is genuinely nothing open to decide.
           <p data-testid="deck-empty" className={`mt-6 ${subtle}`}>
             Nothing to decide right now — new decisions arrive with each sync.
           </p>
         )}
 
-        {items != null && items.length > 0 && (
+        {items != null && !error && actionable.length === 0 && unactionableCount > 0 && (
+          // ILB: empty because the open decisions are NOT-YET-actionable here —
+          // distinct from "done". Their surfaces (e.g. the board) are still being
+          // built, so they live on the Feed for now, not as dead deck cards.
+          <p data-testid="deck-unactionable" className={`mt-6 ${subtle}`}>
+            {unactionableCount} item{unactionableCount > 1 ? 's are' : ' is'} waiting on surfaces
+            still being built — see the{' '}
+            <Link href="/feed" className="underline underline-offset-2">
+              Feed
+            </Link>
+            .
+          </p>
+        )}
+
+        {actionable.length > 0 && (
           <div className="mt-6 flex min-h-[440px] flex-col">
             <Deck
-              items={items}
+              items={actionable}
               onAuthExpired={onAuthExpired}
               onParkPersist={onParkPersist}
               onUnparkPersist={onUnparkPersist}

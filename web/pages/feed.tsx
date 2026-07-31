@@ -7,6 +7,7 @@ import { FeedRow } from '../components/feed/FeedRow';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
+import { deckVerbsFor } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
@@ -55,6 +56,11 @@ export default function FeedPage() {
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
   const board = useFeedBoard({ items: items ?? [], onAuthExpired });
+  // A needs-you item is deck-able only if the deck has a wired verb for its kind;
+  // the rest (slot_suggestion, whose acts arrive with the board) get an honest
+  // row + note rather than a phantom deck-link count.
+  const deckable = board.needsYou.filter((it) => deckVerbsFor(it.kind) !== null);
+  const pendingRows = board.needsYou.filter((it) => deckVerbsFor(it.kind) === null);
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -128,16 +134,36 @@ export default function FeedPage() {
         {loaded && board.needsYou.length > 0 && (
           <section data-testid="feed-needs-you" className="mt-6">
             <h2 className={titleClass}>Needs you</h2>
-            <Link
-              href="/deck"
-              data-testid="feed-deck-link"
-              className="mt-2 flex items-center justify-between rounded-xl border border-honeydew-300 bg-honeydew-50 px-4 py-3 text-sm font-semibold text-honeydew-700"
-            >
-              <span>
-                {board.needsYou.length} decision{board.needsYou.length > 1 ? 's' : ''} waiting
-              </span>
-              <span aria-hidden>Open the deck →</span>
-            </Link>
+            {/* Deck-able decisions (a wired verb) route to the swipe deck; the
+                count matches what the deck actually deals (see deck.tsx). */}
+            {deckable.length > 0 && (
+              <Link
+                href="/deck"
+                data-testid="feed-deck-link"
+                className="mt-2 flex items-center justify-between rounded-xl border border-honeydew-300 bg-honeydew-50 px-4 py-3 text-sm font-semibold text-honeydew-700"
+              >
+                <span>
+                  {deckable.length} decision{deckable.length > 1 ? 's' : ''} waiting
+                </span>
+                <span aria-hidden>Open the deck →</span>
+              </Link>
+            )}
+            {/* Decide-mode items whose acts aren't wired yet (slot_suggestion →
+                the board, Phase C). Shown honestly with a muted note, NOT a
+                pressable control that would do nothing. */}
+            {pendingRows.length > 0 && (
+              <ul data-testid="feed-pending" className="mt-2 flex flex-col gap-2">
+                {pendingRows.map((it) => (
+                  <FeedRow
+                    key={it.id}
+                    item={it}
+                    expanded={expanded.has(it.id)}
+                    onToggleEvidence={() => toggleExpanded(it.id)}
+                    hint="acts arrive with the board"
+                  />
+                ))}
+              </ul>
+            )}
           </section>
         )}
 
