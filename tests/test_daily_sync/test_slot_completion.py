@@ -278,18 +278,115 @@ def test_tier_lane_undo_clears_done_at(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_task_origin_is_unsupported_and_leaves_vault_untouched(tmp_path: Path) -> None:
+def test_task_lane_done_writes_status_and_acts(tmp_path: Path) -> None:
+    """C1b: task origin is now COMPLETABLE — done flips status→done + stamps a
+    completion date (exactly what _task_is_done_today reads) and acts the item."""
     vault = _vault(tmp_path)
     _task_due_today(vault, name="Interview")
     store, cfg = _store(tmp_path), _ds_config(tmp_path)
     item = _publish(store, vault, origin="task")
-    task_before = (vault / "task" / "Interview.md").read_text(encoding="utf-8")
 
     res = _act(store, cfg, vault, item.id, "done")
 
-    assert not res.ok and res.status == STATUS_UNSUPPORTED_ITEM
-    assert (vault / "task" / "Interview.md").read_text(encoding="utf-8") == task_before
-    assert store.load()[item.id].state == STATE_OPEN  # never acted
+    assert res.ok and res.status == STATUS_ACTED
+    fm = frontmatter.load(str(vault / "task" / "Interview.md")).metadata
+    assert fm["status"] == "done"  # REAL write
+    assert str(fm["completed"]) == TODAY_ISO
+    assert store.load()[item.id].state == STATE_ACTED  # optimistic green
+
+
+def test_task_lane_idempotent_redone(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    _task_due_today(vault, name="Interview")
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _publish(store, vault, origin="task")
+
+    first = _act(store, cfg, vault, item.id, "done")
+    second = _act(store, cfg, vault, item.id, "done")
+
+    assert first.ok and second.ok
+    assert second.status == STATUS_ALREADY_ACTED  # folded-state ok-noop
+    fm = frontmatter.load(str(vault / "task" / "Interview.md")).metadata
+    assert fm["status"] == "done"
+
+
+def test_task_lane_undo_is_unsupported_v1(tmp_path: Path) -> None:
+    """v1 task lane is done-only — undo_done is an honest unsupported dead-end
+    (prior open status isn't cleanly restorable; the FE says 'undo via chat')."""
+    vault = _vault(tmp_path)
+    _task_due_today(vault, name="Interview")
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _publish(store, vault, origin="task")
+    _act(store, cfg, vault, item.id, "done")
+
+    undo = _act(store, cfg, vault, item.id, "undo_done")
+
+    assert not undo.ok and undo.status == STATUS_UNSUPPORTED_ITEM
+    # The completion is NOT reversed — status stays done, item stays acted.
+    fm = frontmatter.load(str(vault / "task" / "Interview.md")).metadata
+    assert fm["status"] == "done"
+    assert store.load()[item.id].state == STATE_ACTED
+
+
+def test_task_writer_invalid_status_fails_loud(tmp_path: Path) -> None:
+    """A task whose status is outside the schema vocab → the writer refuses
+    (never guesses a lifecycle); the record is left UNTOUCHED."""
+    from alfred.tier.task_completion import (
+        TASK_DONE_KIND_INVALID_STATUS,
+        mark_task_done,
+    )
+
+    vault = _vault(tmp_path)
+    (vault / "task" / "Weird.md").write_text(
+        "---\ntype: task\nstatus: frobnicated\nname: Weird\n---\n\n# Weird\n",
+        encoding="utf-8",
+    )
+    before = (vault / "task" / "Weird.md").read_text(encoding="utf-8")
+
+    result = mark_task_done(vault, "task/Weird.md", TODAY_ISO)
+
+    assert result.kind == TASK_DONE_KIND_INVALID_STATUS
+    assert not result.ok
+    assert (vault / "task" / "Weird.md").read_text(encoding="utf-8") == before  # untouched
+
+
+def test_task_writer_unknown_record(tmp_path: Path) -> None:
+    """Missing file OR a non-task record at the path → unknown_record (never a
+    guessed write)."""
+    from alfred.tier.task_completion import (
+        TASK_DONE_KIND_UNKNOWN_RECORD,
+        mark_task_done,
+    )
+
+    vault = _vault(tmp_path)
+    assert mark_task_done(vault, "task/Nope.md", TODAY_ISO).kind == TASK_DONE_KIND_UNKNOWN_RECORD
+
+    (vault / "note").mkdir(exist_ok=True)
+    (vault / "note" / "AThing.md").write_text(
+        "---\ntype: note\nname: AThing\n---\n\n# AThing\n", encoding="utf-8",
+    )
+    assert mark_task_done(vault, "note/AThing.md", TODAY_ISO).kind == TASK_DONE_KIND_UNKNOWN_RECORD
+
+
+def test_task_writer_predicate_satisfaction_output_bound(tmp_path: Path) -> None:
+    """Single-source-of-doneness: after the writer runs, the tier overlay's OWN
+    predicate (entry_is_done → _task_is_done_today) sees the task as done. Binds
+    the writer's OUTPUT to what the producer reads — a writer that wrote the
+    wrong field would leave the predicate False."""
+    import alfred.tier.compute as compute
+    from alfred.tier.compute import TierEntry
+    from alfred.tier.task_completion import mark_task_done
+
+    vault = _vault(tmp_path)
+    _task_due_today(vault, name="Interview")
+    entry = TierEntry(tier=1, origin="task", name="Interview", path="task/Interview.md")
+    task_fm, comp = compute.build_done_caches(vault)
+    assert compute.entry_is_done(entry, task_fm_by_name=task_fm, completion_by_record=comp, today=TODAY) is False
+
+    mark_task_done(vault, "task/Interview.md", TODAY_ISO)
+
+    task_fm2, comp2 = compute.build_done_caches(vault)
+    assert compute.entry_is_done(entry, task_fm_by_name=task_fm2, completion_by_record=comp2, today=TODAY) is True
 
 
 def test_unknown_origin_is_unsupported(tmp_path: Path) -> None:
@@ -526,18 +623,42 @@ def test_done_emits_named_log(tmp_path: Path) -> None:
     assert done[0]["item"] == "Meditate"
 
 
-def test_unsupported_emits_named_log(tmp_path: Path) -> None:
+def test_task_done_emits_named_log(tmp_path: Path) -> None:
     vault = _vault(tmp_path)
-    _task_due_today(vault)
+    _task_due_today(vault, name="Interview")
     store, cfg = _store(tmp_path), _ds_config(tmp_path)
     item = _publish(store, vault, origin="task")
 
     with structlog.testing.capture_logs() as cap:
         _act(store, cfg, vault, item.id, "done")
 
+    done = [c for c in cap if c.get("event") == "feed.act.slot.done"]
+    assert len(done) == 1
+    assert done[0]["lane"] == "task"
+    assert done[0]["item"] == "Interview"
+
+
+def test_unsupported_emits_named_log(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    # Unknown origin (no routine_record, tier != 3, origin not task) → the
+    # honest unsupported dead-end, still logged.
+    crafted = FeedItem.create(
+        kind="slot_suggestion",
+        stable_key="text:Mystery",
+        instance="salem",
+        title="T1: Mystery",
+        evidence={"tier": 1, "origin": "", "name": "Mystery", "item_text": "Mystery"},
+        source_ref={"producer": "brief"},
+    )
+    store.upsert(crafted)
+
+    with structlog.testing.capture_logs() as cap:
+        _act(store, cfg, vault, crafted.id, "done")
+
     unsupported = [c for c in cap if c.get("event") == "feed.act.slot.unsupported_item"]
     assert len(unsupported) == 1
-    assert unsupported[0]["origin"] == "task"
+    assert unsupported[0]["origin"] == ""
 
 
 # ---------------------------------------------------------------------------

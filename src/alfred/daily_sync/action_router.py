@@ -344,10 +344,12 @@ def _today_for(config: Any) -> _date:
 
 def _slot_lane(evidence: dict[str, Any]) -> str:
     """Classify a slot item's completion LANE from its stamped evidence (the
-    Phase C matrix). Returns ``"routine"`` / ``"tier"`` / ``"unsupported"``.
+    Phase C matrix). Returns ``"routine"`` / ``"tier"`` / ``"task"`` /
+    ``"unsupported"``.
 
-      * ``origin == "task"``                → unsupported (v1: no talker
-        task-completion writer exists — the ✓ stays honestly disabled).
+      * ``origin == "task"``                → task lane (status → done + a
+        completion date, via ``tier.task_completion.mark_task_done``). C1b
+        wired the writer; done-only (undo → unsupported, see :func:`_slot_undo`).
       * ``routine_record`` present          → routine lane (completion_log
         writer, shared with ``routine_done``).
       * ``tier == 3`` (free-text, no record) → tier lane (``done_at`` writer,
@@ -359,7 +361,7 @@ def _slot_lane(evidence: dict[str, Any]) -> str:
     """
     origin = str(evidence.get("origin") or "")
     if origin == "task":
-        return "unsupported"
+        return "task"
     if str(evidence.get("routine_record") or "").strip():
         return "routine"
     if evidence.get("tier") == 3:
@@ -489,6 +491,37 @@ def _slot_done(
             feed_item_id, action_id,
         )
 
+    if lane == "task":
+        from alfred.tier.task_completion import (
+            TASK_DONE_KIND_IDEMPOTENT_NOOP,
+            TASK_DONE_KIND_SUCCESS,
+            mark_task_done,
+        )
+
+        rel = str(evidence.get("path") or "").strip()
+        if not rel:
+            return ActResult(
+                False, STATUS_STALE_ITEM,
+                "task is missing its record path — it'll resurface at the next sync",
+                feed_item_id, action_id,
+            )
+        result = mark_task_done(Path(vault_path), rel, today.isoformat())
+        if result.kind in (TASK_DONE_KIND_SUCCESS, TASK_DONE_KIND_IDEMPOTENT_NOOP):
+            feed_store.set_state(feed_item_id, STATE_ACTED)
+            log.info(
+                "feed.act.slot.done", id=feed_item_id, lane=lane,
+                kind=result.kind, item=result.name or item_text,
+            )
+            return ActResult(True, STATUS_ACTED, f"marked done: {result.name or item_text}", feed_item_id, action_id)
+        log.info(
+            "feed.act.slot.writer_error", id=feed_item_id, lane=lane,
+            kind=result.kind, item=result.name or item_text,
+        )
+        return ActResult(
+            False, STATUS_ERROR, _task_writer_detail(result.kind, result.name or item_text),
+            feed_item_id, action_id,
+        )
+
     # tier lane — free-text T3.
     from alfred.tier.daily_curation import (
         TIER_DONE_KIND_IDEMPOTENT_NOOP,
@@ -527,6 +560,18 @@ def _slot_undo(
 ) -> ActResult:
     """Route a slot ``undo_done`` to the lane's inverse writer; on the non-error
     end-state set the feed item back to ``open`` (the completion is reversed)."""
+    if lane == "task":
+        # v1 task lane is DONE-ONLY — the prior open status isn't cleanly
+        # restorable (a done task could have been todo/active/blocked; restoring
+        # a fixed one would guess a lifecycle), so undo isn't wired. Honest
+        # dead-end; the FE surfaces "undo via chat for now".
+        log.info("feed.act.slot.undo_unsupported", id=feed_item_id, lane=lane)
+        return ActResult(
+            False, STATUS_UNSUPPORTED_ITEM,
+            "undo isn't available for tasks from the board yet — undo via chat",
+            feed_item_id, action_id,
+        )
+
     if lane == "routine":
         from alfred.routine import completion as _completion
 
@@ -588,6 +633,15 @@ def _routine_writer_detail(kind: str, item_text: str) -> str:
     if kind == "unknown_record":
         return "the routine record could not be read"
     return f"could not record completion for '{item_text}'"
+
+
+def _task_writer_detail(kind: str, name: str) -> str:
+    """Human detail for a task completion writer refusal."""
+    if kind == "unknown_record":
+        return f"'{name}' is no longer a task at that path"
+    if kind == "invalid_status":
+        return f"'{name}' has an unrecognized status — refusing to guess the lifecycle"
+    return f"could not complete '{name}'"
 
 
 def _tier_writer_detail(kind: str, item_text: str) -> str:
