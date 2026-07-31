@@ -93,6 +93,15 @@ describe('push/subscribe POST', () => {
     expect(mockAddSubscription).not.toHaveBeenCalled();
   });
 
+  it('400 on a non-https endpoint (http:// or javascript:)', async () => {
+    for (const bad of ['http://push.example.com/x', 'javascript:alert(1)']) {
+      const { res, status } = mockRes();
+      await handler(req('POST', { ...validSub, endpoint: bad }), res);
+      expect(status).toHaveBeenCalledWith(400);
+    }
+    expect(mockAddSubscription).not.toHaveBeenCalled();
+  });
+
   it('201 stores the subscription (owner-stamped) and kicks the poller', async () => {
     const { res, status, json } = mockRes();
     await handler(req('POST', validSub), res);
@@ -136,10 +145,12 @@ describe('push/subscribe DELETE', () => {
     expect(mockRemoveSubscription).toHaveBeenCalledWith('https://push.example.com/abc');
   });
 
-  it('400 on a malformed endpoint', async () => {
-    const { res, status } = mockRes();
-    await handler(req('DELETE', { endpoint: 'nope' }), res);
-    expect(status).toHaveBeenCalledWith(400);
+  it('400 on a malformed or non-https endpoint', async () => {
+    for (const bad of ['nope', 'http://push.example.com/x', 'javascript:alert(1)']) {
+      const { res, status } = mockRes();
+      await handler(req('DELETE', { endpoint: bad }), res);
+      expect(status).toHaveBeenCalledWith(400);
+    }
     expect(mockRemoveSubscription).not.toHaveBeenCalled();
   });
 });

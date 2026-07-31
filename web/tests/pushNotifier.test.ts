@@ -155,16 +155,20 @@ describe('ensurePushPoller (inert gate)', () => {
     expect(__isPushPollerRunningForTest()).toBe(false);
   });
 
-  it('constructs exactly one interval when enabled + configured, idempotently', () => {
+  it('creates exactly ONE interval across concurrent kicks (setInterval call-count)', () => {
     process.env.ALGERNON_VAPID_PUBLIC = 'pub';
     process.env.ALGERNON_VAPID_PRIVATE = 'priv';
     process.env.ALGERNON_VAPID_SUBJECT = 'mailto:a@b.com';
     process.env.PUSH_ENABLED = 'true';
+    // Count the actual setInterval calls — this reddens if the singleton guard
+    // leaks and a second kick constructs a second interval (which the prior
+    // running-state assertion could NOT detect). Verified by removing the
+    // `pollerTimer != null` guard: two kicks → 2 calls → this fails.
+    const spy = vi.spyOn(global, 'setInterval');
     ensurePushPoller();
-    expect(__isPushPollerRunningForTest()).toBe(true);
-    ensurePushPoller(); // idempotent — still just one
+    ensurePushPoller(); // second kick must NOT construct a second interval
+    expect(spy).toHaveBeenCalledTimes(1);
     expect(__isPushPollerRunningForTest()).toBe(true);
     __stopPushPollerForTest();
-    expect(__isPushPollerRunningForTest()).toBe(false);
   });
 });

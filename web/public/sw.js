@@ -83,11 +83,22 @@ self.addEventListener('message', (event) => {
 });
 
 // --- Web Push (B4) ----------------------------------------------------------
+// Same-origin deep-link guard — mirrors safeNextPath: only an ABSOLUTE path, and
+// NOT the protocol-relative (`//host`) / backslash (`/\host`) forms a browser
+// resolves OFF-origin (a bare startsWith('/') lets those through). DUPLICATED
+// from lib/algernon/pushLink.ts (a service worker is a static file and cannot
+// import a module); pushLink.test.ts extracts + runs THIS copy for parity.
+function sanitizeDeepLink(url) {
+  return typeof url === 'string' && url.startsWith('/') && url[1] !== '/' && url[1] !== '\\'
+    ? url
+    : '/feed';
+}
+
 // Show a notification for a server push. The payload is {title, kind, url} ONLY
 // (lock-screen privacy — never evidence content; the server guarantees this).
 // Defensive: a malformed/empty push still shows a minimal notification rather
-// than throwing, and `url` is only honoured when it's a same-origin relative
-// path (a push can never open an off-origin URL on click).
+// than throwing, and `url` is sanitised to a same-origin absolute path (an
+// off-origin or protocol-relative value can never be opened on click).
 self.addEventListener('push', (event) => {
   let data = {};
   try {
@@ -97,7 +108,7 @@ self.addEventListener('push', (event) => {
   }
   const title = (data && typeof data.title === 'string' && data.title) || 'Algernon';
   const kind = (data && typeof data.kind === 'string' && data.kind) || '';
-  const url = data && typeof data.url === 'string' && data.url.startsWith('/') ? data.url : '/feed';
+  const url = sanitizeDeepLink(data && data.url);
   event.waitUntil(
     self.registration.showNotification(title, {
       body: kind ? `${kind} · needs you` : 'needs you',
@@ -114,7 +125,7 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const data = event.notification.data || {};
-  const target = typeof data.url === 'string' && data.url.startsWith('/') ? data.url : '/feed';
+  const target = sanitizeDeepLink(data.url);
   event.waitUntil(
     (async () => {
       const clientsArr = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });

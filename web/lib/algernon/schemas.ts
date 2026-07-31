@@ -269,8 +269,17 @@ export type ComposerLogBody = z.infer<typeof composerLogBodySchema>;
 // used as a filesystem path. The keys are the base64url ECDH/auth secrets web-push
 // needs; bounded generously (p256dh ~88 / auth ~24 chars in practice).
 export const PUSH_ENDPOINT_MAX_CHARS = 2048;
+// A push endpoint MUST be an https URL. `.url()` alone would accept `http://` and
+// even `javascript:` (both parse as URLs), so pin the scheme — a non-https
+// endpoint is never a real push service and is rejected 400 at the edge.
+export const pushEndpointSchema = z
+  .string()
+  .url()
+  .max(PUSH_ENDPOINT_MAX_CHARS)
+  .refine((u) => u.startsWith('https://'), { message: 'endpoint must be an https URL' });
+
 export const pushSubscriptionSchema = z.object({
-  endpoint: z.string().url().max(PUSH_ENDPOINT_MAX_CHARS),
+  endpoint: pushEndpointSchema,
   expirationTime: z.number().nullable().optional(),
   keys: z.object({
     p256dh: z.string().min(1).max(512),
@@ -281,7 +290,7 @@ export type PushSubscriptionBody = z.infer<typeof pushSubscriptionSchema>;
 
 // DELETE /api/push/subscribe body — remove the subscription with this endpoint.
 export const pushUnsubscribeBodySchema = z.object({
-  endpoint: z.string().url().max(PUSH_ENDPOINT_MAX_CHARS),
+  endpoint: pushEndpointSchema,
 });
 export type PushUnsubscribeBody = z.infer<typeof pushUnsubscribeBodySchema>;
 
