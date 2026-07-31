@@ -16,7 +16,7 @@ import {
   stampOpacity,
   verdictForDrag,
 } from '../lib/algernon/feedConstants';
-import { coerceEvidenceValue, evidenceLabel, evidenceRows } from '../lib/algernon/feedEvidence';
+import { coerceEvidenceValue, evidenceBody, evidenceLabel, evidenceRows } from '../lib/algernon/feedEvidence';
 import type { FeedItem } from '../lib/algernon/feed';
 
 function feedItem(kind: string, evidence: Record<string, unknown>): FeedItem {
@@ -49,6 +49,36 @@ describe('emailPriority — the on-face tier', () => {
     expect(emailPriority(feedItem('email_tier', {}))).toBeNull();
     expect(emailPriority(feedItem('email_tier', { priority: 'high' }))).toBeNull(); // wrong key ignored
     expect(emailPriority(feedItem('attribution', { classifier_priority: 'high' }))).toBeNull();
+  });
+});
+
+describe('evidenceBody — prose body extraction', () => {
+  it('extracts a non-empty body + the truncated flag', () => {
+    expect(evidenceBody({ body: 'line one\nline two', truncated: false })).toEqual({
+      text: 'line one\nline two',
+      truncated: false,
+    });
+    expect(evidenceBody({ body: 'digest…[truncated]', truncated: true })?.truncated).toBe(true);
+  });
+  it('is null for absent / empty / non-string / non-object', () => {
+    expect(evidenceBody({})).toBeNull();
+    expect(evidenceBody({ body: '   ' })).toBeNull();
+    expect(evidenceBody({ body: 42 })).toBeNull();
+    expect(evidenceBody(null)).toBeNull();
+    expect(evidenceBody('x')).toBeNull();
+  });
+  it('caps a pathologically long body', () => {
+    expect(evidenceBody({ body: 'x'.repeat(9000) })?.text.length).toBe(4000);
+  });
+});
+
+describe('evidenceRows — body/truncated are prose, never key:value rows', () => {
+  it('drops body and truncated from the rows', () => {
+    const rows = evidenceRows({ peer: 'kalle', body: 'the digest', truncated: true });
+    const keys = rows.map((r) => r.key);
+    expect(keys).toContain('peer');
+    expect(keys).not.toContain('body');
+    expect(keys).not.toContain('truncated');
   });
 });
 

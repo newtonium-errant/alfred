@@ -1,6 +1,7 @@
 import type { FeedItem } from '../../lib/algernon/feed';
 import { kindLabel } from '../../lib/algernon/feedConstants';
-import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
+import { evidenceBody, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
+import { EvidenceBody } from './EvidenceBody';
 
 // One FYI feed row: a glance item with an Ack. Content is escaped React text
 // only (evidence is untrusted display data — no innerHTML, no href).
@@ -19,6 +20,10 @@ export interface FeedRowProps {
 
 export function FeedRow({ item, expanded, onToggleEvidence, onAck, hint }: FeedRowProps) {
   const rows = evidenceRows(item.evidence);
+  // A digest/prose body (peer_digest et al.) also makes the row expandable, even
+  // when it has no key:value rows of its own.
+  const hasBody = evidenceBody(item.evidence) !== null;
+  const hasDetails = rows.length > 0 || hasBody;
   return (
     <li data-testid="feed-row" data-kind={item.kind} className="rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
       <div className="flex items-start justify-between gap-3">
@@ -34,7 +39,7 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, hint }: FeedR
             )}
           </div>
           <p className="break-words text-sm font-semibold text-honeydew-700">{item.title || item.id}</p>
-          {rows.length > 0 && (
+          {hasDetails && (
             <button
               type="button"
               data-testid="feed-row-details"
@@ -62,15 +67,21 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, hint }: FeedR
           </span>
         ) : null}
       </div>
-      {expanded && rows.length > 0 && (
-        <dl data-testid="feed-row-evidence" className="mt-2 space-y-1 border-t border-dashed border-honeydew-200 pt-2 text-xs text-honeydew-600">
-          {rows.map((r) => (
-            <div key={r.key} className="flex gap-2">
-              <dt className="shrink-0 font-semibold text-honeydew-700">{evidenceLabel(r.key)}:</dt>
-              <dd className="min-w-0 break-words">{r.value}</dd>
-            </div>
-          ))}
-        </dl>
+      {expanded && hasDetails && (
+        <div className="border-t border-dashed border-honeydew-200 pt-2">
+          {/* Prose body first (the digest content), then any key:value rows. */}
+          <EvidenceBody evidence={item.evidence} />
+          {rows.length > 0 && (
+            <dl data-testid="feed-row-evidence" className="mt-2 space-y-1 text-xs text-honeydew-600">
+              {rows.map((r) => (
+                <div key={r.key} className="flex gap-2">
+                  <dt className="shrink-0 font-semibold text-honeydew-700">{evidenceLabel(r.key)}:</dt>
+                  <dd className="min-w-0 break-words">{r.value}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+        </div>
       )}
     </li>
   );

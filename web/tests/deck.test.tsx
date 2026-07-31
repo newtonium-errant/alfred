@@ -253,6 +253,16 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     expect(footer).not.toContain('Confirm SPAM');
   });
 
+  it('renders an evidence.body as escaped prose (generic mechanism, deck too)', () => {
+    const evil = '<img src=x onerror=alert(1)>';
+    renderCard({ evidence: { body: `digest text\n${evil}`, truncated: true } }, true);
+    const body = screen.getByTestId('evidence-body');
+    expect(body.textContent).toContain('digest text');
+    expect(body.textContent).toContain(evil); // present as TEXT
+    expect(document.querySelector('img')).toBeNull(); // never as markup
+    expect(screen.queryByTestId('evidence-truncated')).not.toBeNull();
+  });
+
   it('evidence scrolls WITHIN the card — container carries overflow, verbs stay outside it', () => {
     renderCard({ evidence: { classifier_priority: 'low', sender: 'a@b.com', snippet: 'x'.repeat(600) } }, true);
     const evidence = screen.getByTestId('deck-evidence');

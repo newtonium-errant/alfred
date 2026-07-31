@@ -1,7 +1,8 @@
 import { forwardRef } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
 import { affirmLabelFor, deckVerbsFor, emailPriority, kindLabel, HEAVY_KINDS, type EmailPriority } from '../../lib/algernon/feedConstants';
-import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
+import { evidenceBody, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
+import { EvidenceBody } from './EvidenceBody';
 
 // Presentational deck card. All content is rendered as React text children
 // (auto-escaped) — evidence is untrusted display data, so NOTHING here uses
@@ -39,6 +40,8 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
   // no badge + the plain verb.
   const priority = emailPriority(item);
   const affirmLabel = affirmLabelFor(item);
+  // Prose body (generic — any kind's evidence.body) also makes the card expandable.
+  const hasDetails = rows.length > 0 || evidenceBody(item.evidence) !== null;
 
   return (
     <div
@@ -82,7 +85,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
 
       <h2 className="mb-1.5 shrink-0 text-lg font-extrabold leading-snug text-honeydew-700">{item.title || item.id}</h2>
 
-      {rows.length > 0 && (
+      {hasDetails && (
         <button
           type="button"
           data-testid="deck-evidence-toggle"
@@ -96,18 +99,24 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
       {expanded && (
         // Evidence SCROLLS within the card — flex-1 + min-h-0 lets it take the
         // space between the title and the pinned verb footer, overflow-y-auto keeps
-        // long snippets from spilling past the card onto the buttons below.
-        <dl
+        // long snippets / a long digest body from spilling past the card onto the
+        // buttons below.
+        <div
           data-testid="deck-evidence"
           className="mt-2 min-h-0 flex-1 space-y-1 overflow-y-auto border-t border-dashed border-honeydew-300 pt-2 text-xs text-honeydew-600"
         >
-          {rows.map((r) => (
-            <div key={r.key} className="flex gap-2">
-              <dt className="shrink-0 font-semibold text-honeydew-700">{evidenceLabel(r.key)}:</dt>
-              <dd className="min-w-0 break-words">{r.value}</dd>
-            </div>
-          ))}
-        </dl>
+          <EvidenceBody evidence={item.evidence} />
+          {rows.length > 0 && (
+            <dl className="space-y-1">
+              {rows.map((r) => (
+                <div key={r.key} className="flex gap-2">
+                  <dt className="shrink-0 font-semibold text-honeydew-700">{evidenceLabel(r.key)}:</dt>
+                  <dd className="min-w-0 break-words">{r.value}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+        </div>
       )}
 
       <div className="mt-auto flex shrink-0 items-center justify-between pt-3 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
