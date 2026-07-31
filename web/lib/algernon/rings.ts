@@ -81,17 +81,60 @@ export function ringItemCompletable(item: FeedItem): boolean {
   return false;
 }
 
+// The instance's local timezone for day-scoping (same America/Halifax the composer
+// uses for compose-mode). One deploy = one instance; flagged, not per-instance-
+// configurable in the web yet.
+const RING_TZ = 'America/Halifax';
+
+function instanceDayKey(d: Date): string {
+  // YYYY-MM-DD in the instance tz — the calendar-day identity for date-scoping.
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: RING_TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+/** Whether a UTC ISO timestamp falls on TODAY in the instance timezone. */
+export function isTodayInstanceTz(iso: string | null | undefined, now: Date = new Date()): boolean {
+  if (!iso) return false;
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return false;
+  return instanceDayKey(t) === instanceDayKey(now);
+}
+
 /**
- * Group open `slot_suggestion` feed items into the three tier rings, in
- * TIER_RING_ORDER. Non-slot_suggestion items and items with a missing / invalid
- * tier are dropped (defensive). Always returns exactly three buckets so an empty
- * tier renders its own (red) empty ring rather than vanishing.
+ * Whether a slot item belongs on TODAY's rings. Completion changes an item's
+ * STAGE (colour), not its EXISTENCE — so a board-done item (state=acted) STAYS on
+ * the ring all day (green) instead of vanishing and leaving a false red-empty
+ * ring. `open` items (planned, or open-with-evidence.done) always show; `acted`
+ * items show ONLY if completed TODAY (acted_at in the instance tz) — stable keys
+ * persist across days, so yesterday's acted items must not count. Anything else
+ * (acked / expired / acted-not-today) has left the day.
  */
-export function tierRingBuckets(items: FeedItem[]): RingBucket[] {
+export function ringItemVisibleToday(item: FeedItem, now: Date = new Date()): boolean {
+  if (item.state === 'open') return true;
+  if (item.state === 'acted') return isTodayInstanceTz(item.acted_at, now);
+  return false;
+}
+
+/**
+ * Group `slot_suggestion` feed items into the three tier rings, in
+ * TIER_RING_ORDER. Includes today's DONE items (state=acted, acted_at today) as
+ * well as open ones, per `ringItemVisibleToday` — so the rings show
+ * planned + done all day, never dropping a completion. Non-slot / invalid-tier /
+ * not-today items are dropped (defensive). Always returns exactly three buckets
+ * so an empty tier renders its own (red) empty ring rather than vanishing.
+ */
+export function tierRingBuckets(items: FeedItem[], now: Date = new Date()): RingBucket[] {
   const byTier = new Map<number, FeedItem[]>();
   for (const t of TIER_RING_ORDER) byTier.set(t, []);
   for (const it of items) {
     if (it.kind !== 'slot_suggestion') continue;
+    if (!ringItemVisibleToday(it, now)) continue;
     const tier = ringTierOf(it);
     if (tier == null) continue;
     byTier.get(tier)?.push(it);

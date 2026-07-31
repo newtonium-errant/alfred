@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import Head from 'next/head';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
@@ -55,7 +55,10 @@ export default function HomePage() {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await feedApi.list({ state: 'open' });
+        // No state filter: the rings need today's DONE (state=acted) slot items
+        // too (completion is a STAGE, not a disappearance). The needs-you / deck /
+        // board surfaces below split back to open-only. One fetch, client-split.
+        const res = await feedApi.list({});
         if (!cancelled) setItems(res.items);
       } catch (e) {
         if (cancelled) return;
@@ -72,7 +75,10 @@ export default function HomePage() {
   }, [authed]);
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
-  const board = useFeedBoard({ items: items ?? [], onAuthExpired });
+  // OPEN-only for the remaining-work surfaces (board / needs-you / deck) — the
+  // rings (below) get the full set incl. today's done. One fetch, split here.
+  const openItems = useMemo(() => (items ?? []).filter((it) => it.state === 'open'), [items]);
+  const board = useFeedBoard({ items: openItems, onAuthExpired });
   // How many things need you (the FEED truth) vs how many the DECK can actually
   // deal. The deck only handles kinds with a wired verb — slot_suggestion et al.
   // aren't swipeable — so the deck PROMISE counts deck-able only (mirrors feed.tsx,

@@ -45,6 +45,14 @@ function slot(overrides: Partial<FeedItem> = {}): FeedItem {
   };
 }
 
+// Completion is a STAGE, not a disappearance: an acted item stays on the ring for
+// TODAY (green) but a prior-day acted item is gone. 26h back is safely a prior
+// calendar day in the instance tz regardless of the DST offset.
+const TODAY_ISO = new Date().toISOString();
+const YESTERDAY_ISO = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString();
+const doneTodaySlot = (over: Partial<FeedItem> = {}) =>
+  routineSlot({ id: 'done-today', state: 'acted', acted_at: TODAY_ISO, ...over });
+
 beforeEach(() => {
   mockList.mockReset();
   mockList.mockResolvedValue({ items: [], count: 0 });
@@ -128,25 +136,31 @@ describe('RingsHeader (controlled render)', () => {
     expect(routineBtn.className.split(' ')).not.toContain('opacity-50');
   });
 
-  it('completing a routine item goes green + strikethrough and reveals undo', async () => {
+  it('completing a routine item leaves the worklist for a WIN + Show-done reveals undo', async () => {
     render(<RingsHeader items={[routineSlot({ id: 'r' })]} />);
     fireEvent.click(screen.getByTestId('ring-1'));
     await act(async () => {
       fireEvent.click(screen.getByTestId('ring-complete'));
     });
     await flushAct();
-    // The ✓ is gone (replaced by the done marker + undo), the item marked done.
+    // Done → out of the worklist → the WIN state, and the ✓ is gone.
     expect(screen.queryByTestId('ring-complete')).toBeNull();
-    expect(screen.queryByTestId('ring-item-done')).not.toBeNull();
-    expect(screen.getByTestId('ring-panel-item').getAttribute('data-done')).toBe('true');
-    expect(screen.queryByTestId('ring-undo')).not.toBeNull();
+    expect(screen.queryByTestId('ring-panel-all-done')).not.toBeNull();
     expect(mockAct).toHaveBeenCalledWith('r', 'done');
+    // Completed rows live behind "Show done (1)" — reveal shows the marker + undo.
+    fireEvent.click(screen.getByTestId('ring-show-done'));
+    expect(screen.queryByTestId('ring-item-done')).not.toBeNull();
+    expect(screen.queryByTestId('ring-undo')).not.toBeNull();
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-done')).toBe('true');
   });
 
-  it('undo on a done row returns it to an actionable ✓', async () => {
-    // Start already done (server truth) so undo is available immediately.
-    render(<RingsHeader items={[routineSlot({ id: 'r', state: 'acted' })]} />);
+  it('undo (from the Show-done drill-down) returns the item to the worklist', async () => {
+    // A board-done-today item (state=acted, acted_at today) — stays on the ring.
+    render(<RingsHeader items={[doneTodaySlot({ id: 'r' })]} />);
     fireEvent.click(screen.getByTestId('ring-1'));
+    expect(screen.queryByTestId('ring-panel-all-done')).not.toBeNull();
+    expect(screen.queryByTestId('ring-complete')).toBeNull(); // done → not in the worklist
+    fireEvent.click(screen.getByTestId('ring-show-done')); // reveal the done row
     expect(screen.queryByTestId('ring-undo')).not.toBeNull();
     mockAct.mockResolvedValue({ ok: true, status: 'undone' });
     await act(async () => {
@@ -154,7 +168,7 @@ describe('RingsHeader (controlled render)', () => {
     });
     await flushAct();
     expect(mockAct).toHaveBeenLastCalledWith('r', 'undo_done');
-    // Back to an actionable ✓.
+    // Back in the worklist with a live ✓.
     expect(screen.queryByTestId('ring-complete')).not.toBeNull();
     expect(screen.getByTestId('ring-panel-item').getAttribute('data-done')).toBe('false');
   });
@@ -180,11 +194,11 @@ describe('RingsHeader (controlled render)', () => {
 });
 
 describe('RingsHeader (fetch seam)', () => {
-  it('fetches open slot_suggestion items on mount', async () => {
+  it('fetches slot_suggestion items on mount (no state filter — needs today\'s done)', async () => {
     mockList.mockResolvedValue({ items: [slot({ id: 'a', evidence: { tier: 1 } })], count: 1 });
     const { container } = render(<RingsHeader />);
     await waitFor(() => expect(container.querySelectorAll('[data-testid="ring-1"] path')).toHaveLength(1));
-    expect(mockList).toHaveBeenCalledWith({ kind: 'slot_suggestion', state: 'open' });
+    expect(mockList).toHaveBeenCalledWith({ kind: 'slot_suggestion' });
   });
 
   it('bubbles a 401 to onAuthExpired instead of showing an error', async () => {
@@ -204,5 +218,38 @@ describe('RingsHeader (fetch seam)', () => {
   it('skips the fetch entirely when items are supplied (controlled)', () => {
     render(<RingsHeader items={[]} />);
     expect(mockList).not.toHaveBeenCalled();
+  });
+});
+
+describe('RingsHeader — completion is a STAGE, not a disappearance', () => {
+  it("the operator's case: a done-today item is a GREEN ring segment + 'All N done', never red-empty", () => {
+    const { container } = render(<RingsHeader items={[doneTodaySlot()]} />);
+    // The done item is STILL on the ring — one green segment, not the red-empty circle.
+    expect(container.querySelectorAll('[data-testid="ring-1"] path')).toHaveLength(1);
+    expect(screen.queryByTestId('ring-empty-1')).toBeNull();
+    expect(container.querySelector('[data-testid="ring-1"] path')?.getAttribute('class')).toContain('text-status-done-fg');
+    fireEvent.click(screen.getByTestId('ring-1'));
+    expect(screen.getByTestId('ring-panel-1').textContent).toContain('1/1'); // honest ratio
+    expect(screen.getByTestId('ring-panel-all-done').textContent).toContain('All 1 done');
+    expect(screen.queryByTestId('ring-panel-empty')).toBeNull(); // NOT the red-empty language
+  });
+
+  it("yesterday's acted item is EXCLUDED — only TODAY's done counts (stable keys persist)", () => {
+    const { container } = render(<RingsHeader items={[routineSlot({ id: 'y', state: 'acted', acted_at: YESTERDAY_ISO })]} />);
+    expect(screen.queryByTestId('ring-empty-1')).not.toBeNull(); // nothing today → red-empty
+    expect(container.querySelectorAll('[data-testid="ring-1"] path')).toHaveLength(0);
+  });
+
+  it('mixed planned + done-today: 2 segments, "1/2" ratio, worklist shows only the planned one', () => {
+    const { container } = render(
+      <RingsHeader items={[routineSlot({ id: 'plan' }), doneTodaySlot({ id: 'done' })]} />,
+    );
+    expect(container.querySelectorAll('[data-testid="ring-1"] path')).toHaveLength(2);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    expect(screen.getByTestId('ring-panel-1').textContent).toContain('1/2');
+    // Worklist default = the not-done planned item; the done one hides behind Show done.
+    expect(screen.getByTestId('ring-panel-worklist').querySelectorAll('[data-testid="ring-panel-item"]')).toHaveLength(1);
+    expect(screen.getByTestId('ring-show-done').textContent).toContain('Show done (1)');
+    expect(screen.queryByTestId('ring-panel-all-done')).toBeNull(); // not all done
   });
 });

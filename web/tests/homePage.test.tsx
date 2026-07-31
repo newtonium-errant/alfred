@@ -118,9 +118,9 @@ describe('HomePage composer — the rings are PERSISTENT across every mode', () 
     mockList.mockResolvedValue({ items: [], count: 0 });
     render(<HomePage />);
     await waitFor(() => expect(screen.queryByTestId('compose-feed')).not.toBeNull());
-    // The composer's single list({state:'open'}) — RingsHeader is controlled, so no
-    // extra list({kind:'slot_suggestion'}) fetch.
+    // The composer's SINGLE unfiltered list({}) (open + today's done for the
+    // rings) — RingsHeader is controlled, so no extra slot_suggestion fetch.
     expect(mockList).toHaveBeenCalledTimes(1);
-    expect(mockList).toHaveBeenCalledWith({ state: 'open' });
+    expect(mockList).toHaveBeenCalledWith({});
   });
 });

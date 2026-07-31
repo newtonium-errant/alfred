@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { ringItemCompletable, ringItemDone, ringTierOf, tierRingBuckets } from '../lib/algernon/rings';
+import {
+  isTodayInstanceTz,
+  ringItemCompletable,
+  ringItemDone,
+  ringItemVisibleToday,
+  ringTierOf,
+  tierRingBuckets,
+} from '../lib/algernon/rings';
 import type { FeedItem } from '../lib/algernon/feed';
 
 // Ring DATA binding — grouping open slot_suggestion feed items into the three
@@ -100,5 +107,54 @@ describe('tierRingBuckets', () => {
     ]);
     const all = buckets.flatMap((b) => b.items.map((i) => i.id));
     expect(all).toEqual(['ok']);
+  });
+
+  it("includes today's DONE (acted) items and drops prior-day acted ones", () => {
+    const now = new Date('2026-07-31T15:00:00Z'); // Halifax 12:00 2026-07-31 (ADT, UTC-3)
+    const buckets = tierRingBuckets(
+      [
+        slot({ id: 'open', evidence: { tier: 1 } }),
+        slot({ id: 'done-today', state: 'acted', acted_at: '2026-07-31T16:00:00Z', evidence: { tier: 1 } }),
+        slot({ id: 'done-yst', state: 'acted', acted_at: '2026-07-30T18:00:00Z', evidence: { tier: 1 } }),
+      ],
+      now,
+    );
+    expect(buckets[0].items.map((i) => i.id).sort()).toEqual(['done-today', 'open']);
+  });
+});
+
+describe('isTodayInstanceTz (America/Halifax day-scope)', () => {
+  const now = new Date('2026-07-31T15:00:00Z'); // Halifax 12:00 2026-07-31 (ADT, UTC-3)
+  it('true for a UTC instant on the same Halifax day', () => {
+    expect(isTodayInstanceTz('2026-07-31T16:30:00Z', now)).toBe(true);
+  });
+  it('false for a prior Halifax day', () => {
+    expect(isTodayInstanceTz('2026-07-30T20:00:00Z', now)).toBe(false);
+  });
+  it('respects the tz boundary — an early-UTC instant maps to the previous Halifax day', () => {
+    // 02:00Z − 3h = 23:00 on 2026-07-30 in Halifax → NOT today.
+    expect(isTodayInstanceTz('2026-07-31T02:00:00Z', now)).toBe(false);
+  });
+  it('false for null / unparseable', () => {
+    expect(isTodayInstanceTz(null, now)).toBe(false);
+    expect(isTodayInstanceTz('not-a-date', now)).toBe(false);
+  });
+});
+
+describe('ringItemVisibleToday — completion is a STAGE, not a disappearance', () => {
+  const now = new Date('2026-07-31T15:00:00Z');
+  it('open items always show (planned, or open-with-evidence.done)', () => {
+    expect(ringItemVisibleToday(slot({ state: 'open' }), now)).toBe(true);
+  });
+  it('an acted-today item STAYS on the ring (green, not gone)', () => {
+    expect(ringItemVisibleToday(slot({ state: 'acted', acted_at: '2026-07-31T16:00:00Z' }), now)).toBe(true);
+  });
+  it('an acted-yesterday item is gone — only TODAY counts', () => {
+    expect(ringItemVisibleToday(slot({ state: 'acted', acted_at: '2026-07-30T18:00:00Z' }), now)).toBe(false);
+  });
+  it('acted with no acted_at, or acked / expired, are gone (defensive)', () => {
+    expect(ringItemVisibleToday(slot({ state: 'acted', acted_at: null }), now)).toBe(false);
+    expect(ringItemVisibleToday(slot({ state: 'acked' }), now)).toBe(false);
+    expect(ringItemVisibleToday(slot({ state: 'expired' }), now)).toBe(false);
   });
 });
