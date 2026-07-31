@@ -12,7 +12,7 @@ import {
   ringSegments,
   segmentStroke,
 } from '../../lib/algernon/ringGeometry';
-import { ringItemCompletable, tierRingBuckets, type RingBucket } from '../../lib/algernon/rings';
+import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, tierRingBuckets, type RingBucket } from '../../lib/algernon/rings';
 import { useRingCompletion } from './useRingCompletion';
 
 // The segmented "balanced day" rings header. Three tier rings (T1/T2/T3) from
@@ -184,7 +184,7 @@ export function RingsHeader({ onAuthExpired, items: itemsProp }: RingsHeaderProp
                           data-testid="ring-complete"
                           disabled
                           aria-disabled="true"
-                          title="not completable here yet"
+                          title={COMPLETION_UNAVAILABLE_HINT}
                           className="shrink-0 cursor-default rounded-lg border border-honeydew-200 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-400 opacity-50"
                         >
                           ✓ Done

@@ -6,8 +6,10 @@ import { Layout } from '../components/Layout';
 import { FeedRow } from '../components/feed/FeedRow';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
+import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { deckVerbsFor } from '../lib/algernon/feedConstants';
+import { ringItemDone } from '../lib/algernon/rings';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
@@ -56,11 +58,18 @@ export default function FeedPage() {
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
   const board = useFeedBoard({ items: items ?? [], onAuthExpired });
+  // ONE completion implementation, shared with the rings panel (never a second).
+  const completion = useRingCompletion({ onAuthExpired });
+  // A DONE slot item no longer needs you (isDone counting — mirrors the composer):
+  // it drops out of the needs-you groups once its completion reconciles.
+  const activeNeedsYou = board.needsYou.filter(
+    (it) => !(it.kind === 'slot_suggestion' && ringItemDone(it)),
+  );
   // A needs-you item is deck-able only if the deck has a wired verb for its kind;
-  // the rest (slot_suggestion, whose acts arrive with the board) get an honest
-  // row + note rather than a phantom deck-link count.
-  const deckable = board.needsYou.filter((it) => deckVerbsFor(it.kind) !== null);
-  const pendingRows = board.needsYou.filter((it) => deckVerbsFor(it.kind) === null);
+  // the rest (slot_suggestion) get the SAME per-lane completion control the rings
+  // panel uses — completion is LIVE now, not "arriving with the board".
+  const deckable = activeNeedsYou.filter((it) => deckVerbsFor(it.kind) !== null);
+  const pendingRows = activeNeedsYou.filter((it) => deckVerbsFor(it.kind) === null);
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -96,7 +105,7 @@ export default function FeedPage() {
   }
 
   const loaded = items != null && !error;
-  const empty = loaded && board.needsYou.length === 0 && board.fyi.length === 0;
+  const empty = loaded && activeNeedsYou.length === 0 && board.fyi.length === 0;
 
   return (
     <>
@@ -131,7 +140,7 @@ export default function FeedPage() {
           </p>
         )}
 
-        {loaded && board.needsYou.length > 0 && (
+        {loaded && activeNeedsYou.length > 0 && (
           <section data-testid="feed-needs-you" className="mt-6">
             <h2 className={titleClass}>Needs you</h2>
             {/* Deck-able decisions (a wired verb) route to the swipe deck; the
@@ -148,9 +157,9 @@ export default function FeedPage() {
                 <span aria-hidden>Open the deck →</span>
               </Link>
             )}
-            {/* Decide-mode items whose acts aren't wired yet (slot_suggestion →
-                the board, Phase C). Shown honestly with a muted note, NOT a
-                pressable control that would do nothing. */}
+            {/* Slot rows (non-deck-able needs-you) carry the SAME live per-lane
+                completion control as the rings panel — completable lanes get a
+                real ✓; task/unknown lanes get an honest note (no dead control). */}
             {pendingRows.length > 0 && (
               <ul data-testid="feed-pending" className="mt-2 flex flex-col gap-2">
                 {pendingRows.map((it) => (
@@ -159,7 +168,7 @@ export default function FeedPage() {
                     item={it}
                     expanded={expanded.has(it.id)}
                     onToggleEvidence={() => toggleExpanded(it.id)}
-                    hint="acts arrive with the board"
+                    completion={completion}
                   />
                 ))}
               </ul>

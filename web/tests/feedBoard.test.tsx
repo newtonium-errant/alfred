@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, renderHook, screen } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen } from '@testing-library/react';
 
 // Pins the Awareness feed board: the needs-you / FYI split + the Ack flow
 // (optimistic remove, error restore, server-config banner, auth-expired).
@@ -147,5 +147,86 @@ describe('FeedRow — defensive render', () => {
       />,
     );
     expect(screen.queryByTestId('feed-row-details')).not.toBeNull();
+  });
+});
+
+// FeedRow drives the SHARED useRingCompletion (never a second implementation).
+// A fake completion object pins FeedRow's per-lane RENDER + wiring against that
+// interface; the hook's own act/undo/error logic is pinned in useRingCompletion.test.
+import type { UseRingCompletionResult } from '../components/feed/useRingCompletion';
+
+function fakeCompletion(over: Partial<UseRingCompletionResult> = {}): UseRingCompletionResult {
+  return {
+    effectiveDone: () => false,
+    busy: () => false,
+    errorFor: () => null,
+    complete: vi.fn(),
+    undo: vi.fn(),
+    ...over,
+  };
+}
+function slot(over: Partial<FeedItem> = {}): FeedItem {
+  return item({
+    id: 'slot_suggestion:routine/Bills.md::Pay',
+    kind: 'slot_suggestion',
+    title: 'T1: Pay Eastlink',
+    attention: 'needs_you',
+    mode: 'decide',
+    evidence: { tier: 1, routine_record: 'routine/Bills.md', item_text: 'Pay' },
+    ...over,
+  });
+}
+
+describe('FeedRow — per-lane completion (shared hook)', () => {
+  it('a completable lane shows a LIVE ✓ that calls complete()', () => {
+    const complete = vi.fn();
+    render(
+      <FeedRow item={slot()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion({ complete })} />,
+    );
+    const btn = screen.getByTestId('feed-row-complete');
+    fireEvent.click(btn);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('feed-row-ack')).toBeNull();
+  });
+
+  it('a task/unknown lane shows the honest note + NO button', () => {
+    render(
+      <FeedRow
+        item={slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })}
+        expanded={false}
+        onToggleEvidence={() => {}}
+        completion={fakeCompletion()}
+      />,
+    );
+    expect(screen.getByTestId('feed-row-unavailable').textContent).toContain('Completion arrives later');
+    expect(screen.queryByTestId('feed-row-complete')).toBeNull();
+  });
+
+  it('a done row shows ✓ Done + Undo, strikes the title, and calls undo()', () => {
+    const undo = vi.fn();
+    render(
+      <FeedRow
+        item={slot()}
+        expanded={false}
+        onToggleEvidence={() => {}}
+        completion={fakeCompletion({ effectiveDone: () => true, undo })}
+      />,
+    );
+    expect(screen.queryByTestId('feed-row-done')).not.toBeNull();
+    expect(screen.getByTestId('feed-row').getAttribute('data-done')).toBe('true');
+    fireEvent.click(screen.getByTestId('feed-row-undo'));
+    expect(undo).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a completion error', () => {
+    render(
+      <FeedRow
+        item={slot()}
+        expanded={false}
+        onToggleEvidence={() => {}}
+        completion={fakeCompletion({ errorFor: () => 'That could not be completed.' })}
+      />,
+    );
+    expect(screen.getByTestId('feed-row-completion-error').textContent).toContain('could not be completed');
   });
 });

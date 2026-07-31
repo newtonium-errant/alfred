@@ -41,6 +41,12 @@ export function ringTierOf(item: FeedItem): number | null {
 export const RING_ACTION_DONE = 'done';
 export const RING_ACTION_UNDO = 'undo_done';
 
+// The honest per-lane truth for a NON-board-completable lane (task / unknown),
+// shared by every completion surface (rings panel + feed row) so the copy can't
+// drift. Replaces the now-false board-arrival hint — completion IS live for the
+// routine + free-text lanes; only these lanes wait on a later writer.
+export const COMPLETION_UNAVAILABLE_HINT = 'Completion arrives later';
+
 /**
  * Whether a ring item is complete — the single choke-point for green/strikethrough.
  * TWO signals, per the board-completion contract: an item completed VIA the board
@@ -62,8 +68,9 @@ export function ringItemDone(item: FeedItem): boolean {
  *   - routine_record set → true  (routine-item lane → routine_done writer)
  *   - tier === 3         → true  (free-text T3 lane → tier_done writer)
  *   - otherwise          → false (unknown origin → never a guessed write)
- * A false lane keeps the ✓ honestly disabled with its "not completable here yet"
- * microcopy; the router is the ground truth and returns `unsupported_item` if the
+ * A false lane surfaces the honest COMPLETION_UNAVAILABLE_HINT (disabled ✓ in the
+ * rings panel, a plain note in the feed) — never a dead control that pretends to
+ * work; the router is the ground truth and returns `unsupported_item` if the
  * client and backend ever disagree.
  */
 export function ringItemCompletable(item: FeedItem): boolean {
