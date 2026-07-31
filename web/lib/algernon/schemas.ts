@@ -246,6 +246,23 @@ export type FeedActBody = z.infer<typeof feedActBodySchema>;
 // DROPPED (allowlist — a client can't forward arbitrary query to the transport).
 export const FEED_LIST_FILTER_KEYS = ['state', 'mode', 'kind'] as const;
 
+// POST /api/feed/composer-log body (B3-3). CAPTURE-ONLY home-composer telemetry
+// appended to a server-side JSONL — never relayed to the transport, never carries
+// evidence content. All fields bounded (a log write is a DoS surface too):
+// `rule`/`event` are closed enums; `path` is the client route string (≤200,
+// stored as DATA only — it NEVER influences the append path, which is server-
+// fixed); `dwell_ms` a non-negative int with a 24h sanity ceiling. `z.object`
+// STRIPS unknown keys so a client can't smuggle extra fields into the log line.
+export const COMPOSER_LOG_MAX_PATH_CHARS = 200;
+export const composerLogBodySchema = z.object({
+  rule: z.enum(['brief', 'checkin', 'feed']),
+  event: z.enum(['composed', 'navigated_away']),
+  dwell_ms: z.number().int().min(0).max(24 * 60 * 60 * 1000).optional(),
+  path: z.string().max(COMPOSER_LOG_MAX_PATH_CHARS).optional(),
+});
+
+export type ComposerLogBody = z.infer<typeof composerLogBodySchema>;
+
 // --- Web STT trust-boundary constants (BUILD_DECISIONS §4 / §5) -------------
 // Co-located with the other edge constants even though the binary STT body is
 // NOT zod-parsed (it's a raw audio Buffer) — the BFF route uses these for the
