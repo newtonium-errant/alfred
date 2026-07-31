@@ -3,6 +3,7 @@ import Head from 'next/head';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
+import { PushToggle } from '../components/PushToggle';
 import { FeedRow } from '../components/feed/FeedRow';
 import { RingsHeader } from '../components/feed/RingsHeader';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
@@ -196,6 +197,9 @@ export default function HomePage() {
             )}
           </section>
         )}
+
+        {/* Push opt-in — renders nothing unless push is supported + configured. */}
+        <PushToggle />
 
         {board.toast && (
           <div data-testid="composer-toast" role="status" className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3 rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card">

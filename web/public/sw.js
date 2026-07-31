@@ -82,6 +82,69 @@ self.addEventListener('message', (event) => {
   if (event.data === 'SKIP_WAITING') self.skipWaiting();
 });
 
+// --- Web Push (B4) ----------------------------------------------------------
+// Same-origin deep-link guard — mirrors safeNextPath: only an ABSOLUTE path, and
+// NOT the protocol-relative (`//host`) / backslash (`/\host`) forms a browser
+// resolves OFF-origin (a bare startsWith('/') lets those through). DUPLICATED
+// from lib/algernon/pushLink.ts (a service worker is a static file and cannot
+// import a module); pushLink.test.ts extracts + runs THIS copy for parity.
+function sanitizeDeepLink(url) {
+  return typeof url === 'string' && url.startsWith('/') && url[1] !== '/' && url[1] !== '\\'
+    ? url
+    : '/feed';
+}
+
+// Show a notification for a server push. The payload is {title, kind, url} ONLY
+// (lock-screen privacy — never evidence content; the server guarantees this).
+// Defensive: a malformed/empty push still shows a minimal notification rather
+// than throwing, and `url` is sanitised to a same-origin absolute path (an
+// off-origin or protocol-relative value can never be opened on click).
+self.addEventListener('push', (event) => {
+  let data = {};
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch (_e) {
+    data = {};
+  }
+  const title = (data && typeof data.title === 'string' && data.title) || 'Algernon';
+  const kind = (data && typeof data.kind === 'string' && data.kind) || '';
+  const url = sanitizeDeepLink(data && data.url);
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: kind ? `${kind} · needs you` : 'needs you',
+      tag: url, // collapse repeats to the same surface
+      data: { url },
+      icon: '/icon-192.png',
+      badge: '/icon-192.png',
+    }),
+  );
+});
+
+// Click → focus an existing same-origin tab (routing it to the deep link) or open
+// a new one. Only ever navigates to the relative path stored on the notification.
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const data = event.notification.data || {};
+  const target = sanitizeDeepLink(data.url);
+  event.waitUntil(
+    (async () => {
+      const clientsArr = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      for (const client of clientsArr) {
+        if ('focus' in client) {
+          try {
+            await client.focus();
+            if ('navigate' in client) await client.navigate(target);
+            return;
+          } catch (_e) {
+            /* fall through to opening a fresh window */
+          }
+        }
+      }
+      if (self.clients.openWindow) await self.clients.openWindow(target);
+    })(),
+  );
+});
+
 async function cacheFirst(request) {
   const cache = await caches.open(CACHE_NAME);
   const cached = await cache.match(request);

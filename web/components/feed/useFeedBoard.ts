@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from 'react';
 import { feedApi, type FeedItem } from '../../lib/algernon/feed';
+import { isNeedsYouItem } from '../../lib/algernon/feedNeedsYou';
 import { ApiError } from '../../lib/algernon/http';
 
 // The Awareness feed's board state: split the open items into a needs-you group
@@ -27,11 +28,8 @@ export interface UseFeedBoardResult {
   dismissToast: () => void;
 }
 
-function isNeedsYou(it: FeedItem): boolean {
-  // Decisions belong on the deck; everything else is glance/FYI. Prefer the
-  // attention tier, falling back to mode for older items.
-  return it.attention === 'needs_you' || it.mode === 'decide';
-}
+// isNeedsYou moved to lib/algernon/feedNeedsYou.ts (shared with the push
+// notifier — one source of truth for "what needs a decision").
 
 export function useFeedBoard(opts: UseFeedBoardOptions): UseFeedBoardResult {
   const { items, onAuthExpired } = opts;
@@ -41,8 +39,8 @@ export function useFeedBoard(opts: UseFeedBoardOptions): UseFeedBoardResult {
   const [banner, setBanner] = useState<string | null>(null);
 
   const visible = useMemo(() => items.filter((it) => !ackedIds.has(it.id)), [items, ackedIds]);
-  const needsYou = useMemo(() => visible.filter(isNeedsYou), [visible]);
-  const fyi = useMemo(() => visible.filter((it) => !isNeedsYou(it)), [visible]);
+  const needsYou = useMemo(() => visible.filter(isNeedsYouItem), [visible]);
+  const fyi = useMemo(() => visible.filter((it) => !isNeedsYouItem(it)), [visible]);
 
   const restore = useCallback((id: string) => {
     setAckedIds((prev) => {
