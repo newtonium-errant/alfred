@@ -3,6 +3,7 @@ import {
   isTodayInstanceTz,
   ringItemCompletable,
   ringItemDone,
+  ringItemUndoable,
   ringItemVisibleToday,
   ringTierOf,
   tierRingBuckets,
@@ -61,8 +62,8 @@ describe('ringItemDone', () => {
 });
 
 describe('ringItemCompletable', () => {
-  it('is false for a task-backed lane (v1 has no board task writer)', () => {
-    expect(ringItemCompletable(slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } }))).toBe(false);
+  it('is true for a task-backed lane (C1b: the board task-completion writer is wired)', () => {
+    expect(ringItemCompletable(slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } }))).toBe(true);
   });
   it('is true for a routine-item lane', () => {
     expect(ringItemCompletable(slot({ evidence: { tier: 1, origin: 'routine_item', routine_record: 'routine/Bills.md', item_text: 'Pay' } }))).toBe(true);
@@ -75,8 +76,28 @@ describe('ringItemCompletable', () => {
     expect(ringItemCompletable(slot({ evidence: { tier: 1 } }))).toBe(false);
     expect(ringItemCompletable(slot({ evidence: {} }))).toBe(false);
   });
-  it('task origin wins even at tier 3 (never a guessed write)', () => {
-    expect(ringItemCompletable(slot({ evidence: { tier: 3, origin: 'task' } }))).toBe(false);
+  it('a task lane is completable regardless of tier (origin wins, C1b)', () => {
+    expect(ringItemCompletable(slot({ evidence: { tier: 3, origin: 'task' } }))).toBe(true);
+    expect(ringItemCompletable(slot({ evidence: { tier: 2, origin: 'task' } }))).toBe(true);
+  });
+});
+
+describe('ringItemUndoable — task is completable but NOT board-undoable (v1)', () => {
+  it('is false for a task lane (undo_done → 422 "undo via chat"; the board hides the control)', () => {
+    expect(ringItemUndoable(slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } }))).toBe(false);
+    // even at tier 3 — origin task always excludes board undo.
+    expect(ringItemUndoable(slot({ evidence: { tier: 3, origin: 'task' } }))).toBe(false);
+  });
+  it('is true for a routine-item lane (routine_undone wired)', () => {
+    expect(ringItemUndoable(slot({ evidence: { tier: 1, origin: 'routine_item', routine_record: 'routine/Bills.md', item_text: 'Pay' } }))).toBe(true);
+  });
+  it('is true for a free-text T3 lane (tier_undone wired)', () => {
+    expect(ringItemUndoable(slot({ evidence: { tier: 3 } }))).toBe(true);
+    expect(ringItemUndoable(slot({ evidence: { tier: '3' } }))).toBe(true);
+  });
+  it('is false for an unknown origin (not completable → not undoable — the conjunct)', () => {
+    expect(ringItemUndoable(slot({ evidence: { tier: 1 } }))).toBe(false);
+    expect(ringItemUndoable(slot({ evidence: {} }))).toBe(false);
   });
 });
 

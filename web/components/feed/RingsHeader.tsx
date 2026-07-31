@@ -12,14 +12,15 @@ import {
   ringSegments,
   segmentStroke,
 } from '../../lib/algernon/ringGeometry';
-import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, tierRingBuckets, type RingBucket } from '../../lib/algernon/rings';
+import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, ringItemUndoable, tierRingBuckets, type RingBucket } from '../../lib/algernon/rings';
 import { useRingCompletion } from './useRingCompletion';
 
 // The segmented "balanced day" rings header. Three tier rings (T1/T2/T3) from
 // open `slot_suggestion` items (see lib/algernon/rings.ts for why tier). Tap a
 // ring to expand its bucket; tap a row for its evidence. Phase C: the panel's ✓
-// completes an item per-lane (routine + free-text T3 wired; task/unknown stay
-// honestly disabled) — optimistic green on success, single-step undo on done rows.
+// completes an item per-lane (task + routine + free-text T3 wired; unknown/
+// unstamped-origin stays honestly disabled) — optimistic green on success, single-
+// step undo on done rows (task is done-only: no board undo, see rings.ts).
 
 export interface RingsHeaderProps {
   /** 401 handler (bubbles a session expiry to the host page, like the deck/feed). */
@@ -87,6 +88,7 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
   const renderItem = (it: FeedItem) => {
     const done = completion.effectiveDone(it);
     const completable = ringItemCompletable(it);
+    const undoable = ringItemUndoable(it);
     const busy = completion.busy(it.id);
     const itemError = completion.errorFor(it.id);
     const rows = evidenceRows(it.evidence);
@@ -112,12 +114,13 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
 
           {done ? (
             // Completed — a green marker, plus a single-step undo where the lane is
-            // board-completable (never on a vault-done item).
+            // board-UNDOABLE (routine + T3; a task is completable but not board-
+            // undoable, and a vault-done item has no board writer).
             <div className="flex shrink-0 items-center gap-1.5">
               <span data-testid="ring-item-done" className="text-[10px] font-bold uppercase tracking-wider text-status-done-fg">
                 ✓ Done
               </span>
-              {completable && (
+              {undoable && (
                 <button
                   type="button"
                   data-testid="ring-undo"
@@ -141,9 +144,10 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
               {busy ? '…' : '✓ Done'}
             </button>
           ) : (
-            // Non-completable lane (task / unknown origin) — honestly DISABLED. The
-            // `disabled` attr AND `opacity-50` are pinned together so un-disabling
-            // forces a conscious restyle.
+            // Non-completable lane (unknown / unstamped origin — task is completable
+            // now, see rings.ts) — honestly DISABLED. The `disabled` attr AND
+            // `opacity-50` are pinned together so un-disabling forces a conscious
+            // restyle.
             <button
               type="button"
               data-testid="ring-complete"

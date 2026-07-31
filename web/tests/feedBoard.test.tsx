@@ -189,17 +189,48 @@ describe('FeedRow — per-lane completion (shared hook)', () => {
     expect(screen.queryByTestId('feed-row-ack')).toBeNull();
   });
 
-  it('a task/unknown lane shows the honest note + NO button', () => {
+  it('an unknown-origin lane shows the honest note + NO button', () => {
+    // No origin, no routine_record, tier < 3 → no writer → the honest note. (Task is
+    // completable now — see the task-lane tests below.)
     render(
       <FeedRow
-        item={slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })}
+        item={slot({ evidence: { tier: 1, surface_reason: 'due today' } })}
         expanded={false}
         onToggleEvidence={() => {}}
         completion={fakeCompletion()}
       />,
     );
-    expect(screen.getByTestId('feed-row-unavailable').textContent).toContain('Completion arrives later');
+    expect(screen.getByTestId('feed-row-unavailable').textContent).toContain("Completion isn't available for this item");
     expect(screen.queryByTestId('feed-row-complete')).toBeNull();
+  });
+
+  it('a task lane shows a LIVE ✓ (C1b), not the honest note', () => {
+    const complete = vi.fn();
+    render(
+      <FeedRow
+        item={slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })}
+        expanded={false}
+        onToggleEvidence={() => {}}
+        completion={fakeCompletion({ complete })}
+      />,
+    );
+    expect(screen.queryByTestId('feed-row-unavailable')).toBeNull();
+    fireEvent.click(screen.getByTestId('feed-row-complete'));
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('a DONE task row shows ✓ Done but NO undo (done-only; undo is via chat)', () => {
+    // ← reddens if the undo gate uses `completable` instead of `undoable`.
+    render(
+      <FeedRow
+        item={slot({ evidence: { tier: 1, origin: 'task', path: 'task/A.md' } })}
+        expanded={false}
+        onToggleEvidence={() => {}}
+        completion={fakeCompletion({ effectiveDone: () => true })}
+      />,
+    );
+    expect(screen.queryByTestId('feed-row-done')).not.toBeNull();
+    expect(screen.queryByTestId('feed-row-undo')).toBeNull();
   });
 
   it('a done row shows ✓ Done + Undo, strikes the title, and calls undo()', () => {

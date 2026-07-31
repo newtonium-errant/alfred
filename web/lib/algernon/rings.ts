@@ -41,11 +41,12 @@ export function ringTierOf(item: FeedItem): number | null {
 export const RING_ACTION_DONE = 'done';
 export const RING_ACTION_UNDO = 'undo_done';
 
-// The honest per-lane truth for a NON-board-completable lane (task / unknown),
-// shared by every completion surface (rings panel + feed row) so the copy can't
-// drift. Replaces the now-false board-arrival hint — completion IS live for the
-// routine + free-text lanes; only these lanes wait on a later writer.
-export const COMPLETION_UNAVAILABLE_HINT = 'Completion arrives later';
+// The honest per-lane truth for a NON-board-completable lane — after C1b wired the
+// task-completion writer, that's now ONLY a slot with an unknown / unstamped origin
+// (no origin, no routine_record, tier < 3). Shared by every completion surface
+// (rings panel + feed row) so the copy can't drift. Task / routine / free-text T3
+// are all board-completable now, so none of them surface this note.
+export const COMPLETION_UNAVAILABLE_HINT = "Completion isn't available for this item";
 
 /**
  * Whether a ring item is complete — the single choke-point for green/strikethrough.
@@ -64,7 +65,8 @@ export function ringItemDone(item: FeedItem): boolean {
  * Whether a slot item's lane can be completed FROM THE BOARD (enables the ✓), per
  * the completion-semantics matrix — computed client-side from the producer's own
  * stamped evidence fields:
- *   - origin === "task"  → false (v1 UNSUPPORTED — no talker task-completion writer)
+ *   - origin === "task"  → true  (C1b: task-completion writer wired — DONE-only;
+ *                                  see ringItemUndoable for the no-board-undo carve)
  *   - routine_record set → true  (routine-item lane → routine_done writer)
  *   - tier === 3         → true  (free-text T3 lane → tier_done writer)
  *   - otherwise          → false (unknown origin → never a guessed write)
@@ -75,10 +77,25 @@ export function ringItemDone(item: FeedItem): boolean {
  */
 export function ringItemCompletable(item: FeedItem): boolean {
   const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
-  if (ev.origin === 'task') return false;
+  if (ev.origin === 'task') return true;
   if (ev.routine_record) return true;
   if (ev.tier === 3 || ev.tier === '3') return true;
   return false;
+}
+
+/**
+ * Whether a DONE slot item's lane can be UN-done from the board (gates the Undo
+ * control on a done row). Task-backed items are completable but NOT board-undoable
+ * in v1: `undo_done` on a task returns `unsupported_item` (422, "undo isn't
+ * available for tasks from the board yet — undo via chat"), so the board never
+ * surfaces the control — nothing dead to click, the 422 stays a belt for a stale
+ * client. Routine + free-text T3 lanes are both completable AND undoable. The
+ * `ringItemCompletable` conjunct is load-bearing: it keeps unknown / missing-origin
+ * lanes (not completable) also non-undoable.
+ */
+export function ringItemUndoable(item: FeedItem): boolean {
+  const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
+  return ringItemCompletable(item) && ev.origin !== 'task';
 }
 
 // The instance's local timezone for day-scoping (same America/Halifax the composer
