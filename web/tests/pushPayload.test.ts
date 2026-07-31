@@ -32,12 +32,23 @@ describe('pushPayloadFor', () => {
 
   it('NEVER leaks evidence content (lock-screen privacy)', () => {
     const p = pushPayloadFor(
-      item({ evidence: { sender: 'secret@person.com', body_preview: 'CONFIDENTIAL_TEXT', name: 'Jane Doe' } }),
+      item({
+        evidence: {
+          sender: 'secret@person.com',
+          body_preview: 'CONFIDENTIAL_TEXT',
+          name: 'Jane Doe',
+          // `body` is the prose digest field the peer_digest round introduced —
+          // name it explicitly so this pin guards it (structural guarantee already
+          // covers it; belt-and-suspenders).
+          body: 'SECRET_DIGEST',
+        },
+      }),
     );
     const serialized = JSON.stringify(p);
     expect(serialized).not.toContain('CONFIDENTIAL_TEXT');
     expect(serialized).not.toContain('secret@person.com');
     expect(serialized).not.toContain('Jane Doe');
+    expect(serialized).not.toContain('SECRET_DIGEST');
   });
 
   it('deep-links decisions to /deck and glance items to /feed', () => {

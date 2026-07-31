@@ -245,12 +245,16 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     expect(screen.getByTestId('deck-card').textContent).toContain('Confirm HIGH');
   });
 
-  it('an email card with no/spam priority shows NO badge and the plain Confirm verb', () => {
-    renderCard({ evidence: { classifier_priority: 'spam', sender: 'a@b.com' } });
+  it('an email card with NO recognised priority shows no badge and the plain Confirm verb', () => {
+    renderCard({ evidence: { sender: 'a@b.com' } });
     expect(screen.queryByTestId('deck-tier-badge')).toBeNull();
-    const footer = screen.getByTestId('deck-card').textContent ?? '';
-    expect(footer).toContain('Confirm →');
-    expect(footer).not.toContain('Confirm SPAM');
+    expect(screen.getByTestId('deck-card').textContent).toContain('Confirm →');
+  });
+
+  it('a SPAM-classified email shows the badge + "Confirm SPAM" (face honesty, operator ruling)', () => {
+    renderCard({ evidence: { classifier_priority: 'spam', sender: 'a@b.com' } });
+    expect(screen.getByTestId('deck-tier-badge').textContent?.toLowerCase()).toContain('spam');
+    expect(screen.getByTestId('deck-card').textContent).toContain('Confirm SPAM');
   });
 
   it('renders an evidence.body as escaped prose (generic mechanism, deck too)', () => {

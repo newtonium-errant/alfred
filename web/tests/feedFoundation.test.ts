@@ -43,9 +43,12 @@ describe('emailPriority — the on-face tier', () => {
     expect(emailPriority(feedItem('email_tier', { classifier_priority: ' low ' }))).toBe('low');
     expect(emailPriority(feedItem('email_tier', { classifier_priority: 'medium' }))).toBe('medium');
   });
-  it('is null for spam / empty / missing / non-email (no badge, plain verb)', () => {
-    expect(emailPriority(feedItem('email_tier', { classifier_priority: 'spam' }))).toBeNull();
+  it('surfaces spam too (face honesty — operator ruling)', () => {
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: 'spam' }))).toBe('spam');
+  });
+  it('is null for empty / missing / wrong-key / non-email (no badge, plain verb)', () => {
     expect(emailPriority(feedItem('email_tier', { classifier_priority: '' }))).toBeNull();
+    expect(emailPriority(feedItem('email_tier', { classifier_priority: 'garbage' }))).toBeNull();
     expect(emailPriority(feedItem('email_tier', {}))).toBeNull();
     expect(emailPriority(feedItem('email_tier', { priority: 'high' }))).toBeNull(); // wrong key ignored
     expect(emailPriority(feedItem('attribution', { classifier_priority: 'high' }))).toBeNull();
@@ -86,9 +89,12 @@ describe('affirmLabelFor — dynamic affirm verb', () => {
   it('appends the tier for an email with a priority', () => {
     expect(affirmLabelFor(feedItem('email_tier', { classifier_priority: 'high' }))).toBe('Confirm HIGH');
   });
-  it('stays the plain static label for email without a priority', () => {
+  it('appends SPAM too (face honesty — the spam tier is confirmable)', () => {
+    expect(affirmLabelFor(feedItem('email_tier', { classifier_priority: 'spam' }))).toBe('Confirm SPAM');
+  });
+  it('stays the plain static label for email without a recognised priority', () => {
     expect(affirmLabelFor(feedItem('email_tier', {}))).toBe('Confirm');
-    expect(affirmLabelFor(feedItem('email_tier', { classifier_priority: 'spam' }))).toBe('Confirm');
+    expect(affirmLabelFor(feedItem('email_tier', { classifier_priority: 'garbage' }))).toBe('Confirm');
   });
   it('leaves other kinds unchanged, and is null when there is no affirm action', () => {
     expect(affirmLabelFor(feedItem('routine_match', {}))).toBe("That's it");

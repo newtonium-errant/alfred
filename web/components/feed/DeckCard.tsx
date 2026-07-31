@@ -16,6 +16,9 @@ const PRIORITY_CHIP_CLASS: Record<EmailPriority, string> = {
   high: 'border-danger text-danger',
   medium: 'border-status-progress-fg text-status-progress-fg',
   low: 'border-honeydew-500 text-honeydew-600',
+  // Distinct neutral so SPAM isn't visually equated with HIGH-urgency (it's junk,
+  // not important) — still legible on the face.
+  spam: 'border-status-todo-fg text-status-todo-fg',
 };
 
 export interface DeckCardProps {

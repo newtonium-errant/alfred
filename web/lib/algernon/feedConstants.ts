@@ -75,11 +75,13 @@ export function deckVerbsFor(kind: string): DeckVerbs | null {
 // --- email-tier priority (on-face tier badge + dynamic affirm label) ----------
 // The email-tier feed producer stamps the classifier's assigned tier as
 // `evidence.classifier_priority` (VERIFIED against daily_sync/email_section.py —
-// NOT `priority`; the value is lowercase high/medium/low/spam). Only the three
-// PRIORITY tiers surface as a badge + a "Confirm HIGH"-style verb; `spam`, empty,
-// or anything unrecognised → no badge, plain verb (spam is already the reject
-// verb, so it isn't a confirmable priority level).
-export const EMAIL_PRIORITY_TIERS = ['low', 'medium', 'high'] as const;
+// NOT `priority`; the value is lowercase high/medium/low/spam). ALL FOUR real
+// tiers — spam included — surface as a badge + a "Confirm HIGH"-style verb, so a
+// spam-classified email shows what it was tagged rather than asking for a blind
+// confirm (operator ruling 2026-07-31: face honesty especially for spam; that
+// both verbs then write spam is a legible quirk, not a UI lie). Empty / anything
+// unrecognised → no badge, plain verb.
+export const EMAIL_PRIORITY_TIERS = ['low', 'medium', 'high', 'spam'] as const;
 export type EmailPriority = (typeof EMAIL_PRIORITY_TIERS)[number];
 
 /** The assigned priority tier of an email_tier item, or null (no badge, plain verb). */
