@@ -26,12 +26,15 @@ type LayoutProps = {
   maxWidthClassName?: string;
 };
 
-// The app's surfaces. Chat + the cross-instance Ingest surface; Routines lands in
-// M3 (the no-shame display). Keeping this an array preserves honeydew's nav
-// structure so a new surface adds a link without re-architecting the header.
+// The app's surfaces. The logo (✦) links to `/`, the home COMPOSER (B3-3); Chat
+// moved to /chat when the composer took the landing. Keeping this an array
+// preserves honeydew's nav structure so a new surface adds a link without
+// re-architecting the header.
 const NAV_LINKS = [
-  { href: '/', label: 'Chat' },
+  { href: '/chat', label: 'Chat' },
   { href: '/brief', label: 'Brief' },
+  { href: '/deck', label: 'Deck' },
+  { href: '/feed', label: 'Feed' },
   { href: '/ingest', label: 'Ingest' },
 ] as const;
 
