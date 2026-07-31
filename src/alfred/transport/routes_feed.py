@@ -50,12 +50,17 @@ _KEY_FEED_RAW_CONFIG = "transport.feed_raw_config"
 
 # ActResult.status → HTTP status. Applied paths + the idempotent noop are 200;
 # a moved-on item is 409; a bad action is 400; a resolver/domain failure is 422.
+# Phase C slice 1 (board DONE path): ``undone`` is an applied path (200);
+# ``unsupported_item`` is a lane with no completion writer (422 — understood but
+# unprocessable, distinct from a bad action).
 _HTTP_STATUS_BY_STATUS: dict[str, int] = {
     "acted": 200,
     "acked": 200,
     "already_acted": 200,
+    "undone": 200,
     "stale_item": 409,
     "invalid_action": 400,
+    "unsupported_item": 422,
     "error": 422,
 }
 

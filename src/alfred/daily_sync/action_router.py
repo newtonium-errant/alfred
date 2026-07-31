@@ -35,8 +35,11 @@ import contextlib
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import date as _date
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import structlog
 
@@ -63,6 +66,15 @@ STATUS_ALREADY_ACTED = "already_acted"
 STATUS_STALE_ITEM = "stale_item"
 STATUS_INVALID_ACTION = "invalid_action"
 STATUS_ERROR = "error"
+# Phase C slice 1 (board DONE path) — the slot-completion vocabulary.
+STATUS_UNDONE = "undone"  # undo_done succeeded → item back to open
+STATUS_UNSUPPORTED_ITEM = "unsupported_item"  # lane has no completion writer (task/unknown)
+
+# slot_suggestion completion actions (handled by the dedicated dispatcher, NOT
+# the ReplyCorrection/last_batch path — the writers are called directly).
+DONE_ACTION = "done"
+UNDO_DONE_ACTION = "undo_done"
+SLOT_KIND = "slot_suggestion"
 
 # (kind, action_id) → the kwargs that synthesize the owning resolver's
 # ``ReplyCorrection``. THIS MAP IS THE CAPABILITY CEILING — a pair absent here
@@ -93,6 +105,16 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     "pending": {
         "noted": {"ok": True, "consumed_token": "noted"},
         "show": {"ok": True, "consumed_token": "show"},
+    },
+    # slot_suggestion (board DONE path) — the capability-ceiling declaration.
+    # Unlike the five families above, the kwargs here are UNUSED: a slot
+    # completion does NOT synthesize a ReplyCorrection or read last_batch. It is
+    # intercepted by :func:`_dispatch_slot_completion` (right after this ceiling
+    # check) which calls the per-lane completion writer directly against the
+    # feed item's OWN stamped evidence (origin/routine_record/tier/item_text).
+    "slot_suggestion": {
+        "done": {},
+        "undo_done": {},
     },
 }
 
@@ -303,6 +325,282 @@ def _dispatch(
     return f"no resolver for kind '{kind}'", ""
 
 
+# --- slot_suggestion completion (board DONE path) ----------------------------
+
+
+def _today_for(config: Any) -> _date:
+    """Today's date in the instance's configured timezone (the SAME tz the brief
+    / tier compute uses) so a board completion stamps the day the producer
+    surfaced the item under. UTC fallback only when the config carries no
+    timezone (production always populates ``schedule.timezone``)."""
+    tz = getattr(getattr(config, "schedule", None), "timezone", "") or ""
+    if tz:
+        try:
+            return datetime.now(ZoneInfo(tz)).date()
+        except Exception:  # noqa: BLE001 — bad tz string → UTC fallback
+            log.warning("feed.act.slot.bad_timezone", tz=tz)
+    return datetime.now(timezone.utc).date()
+
+
+def _slot_lane(evidence: dict[str, Any]) -> str:
+    """Classify a slot item's completion LANE from its stamped evidence (the
+    Phase C matrix). Returns ``"routine"`` / ``"tier"`` / ``"unsupported"``.
+
+      * ``origin == "task"``                → unsupported (v1: no talker
+        task-completion writer exists — the ✓ stays honestly disabled).
+      * ``routine_record`` present          → routine lane (completion_log
+        writer, shared with ``routine_done``).
+      * ``tier == 3`` (free-text, no record) → tier lane (``done_at`` writer,
+        shared with ``tier_done``).
+      * anything else                       → unsupported (unknown origin).
+
+    NO fuzzy, NO guessing — the discriminator is the producer's own stamped
+    fields (trusted, same class as ``last_batch``).
+    """
+    origin = str(evidence.get("origin") or "")
+    if origin == "task":
+        return "unsupported"
+    if str(evidence.get("routine_record") or "").strip():
+        return "routine"
+    if evidence.get("tier") == 3:
+        return "tier"
+    return "unsupported"
+
+
+def _dispatch_slot_completion(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    config: Any,
+    vault_path: Path | None,
+) -> ActResult:
+    """Apply a slot_suggestion ``done`` / ``undo_done`` via the per-lane
+    completion writer — the SAME functions the talker uses (single writer per
+    lane). Acts on the feed item's OWN stamped ``evidence`` (never last_batch,
+    never a re-derived key). Runs inside the caller's per-item mutex.
+    """
+    evidence = dict(getattr(item, "evidence", None) or {})
+    lane = _slot_lane(evidence)
+
+    if lane == "unsupported":
+        log.info(
+            "feed.act.slot.unsupported_item", id=feed_item_id, action=action_id,
+            origin=evidence.get("origin", ""), tier=evidence.get("tier"),
+        )
+        return ActResult(
+            False, STATUS_UNSUPPORTED_ITEM,
+            "this item can't be completed from the board yet",
+            feed_item_id, action_id,
+        )
+
+    if vault_path is None:
+        return ActResult(
+            False, STATUS_ERROR,
+            "vault not configured — can't record completion",
+            feed_item_id, action_id,
+        )
+
+    item_text = str(evidence.get("item_text") or evidence.get("name") or "").strip()
+    if not item_text:
+        log.info(
+            "feed.act.slot.stale_item", id=feed_item_id, action=action_id,
+            reason="no_item_text",
+        )
+        return ActResult(
+            False, STATUS_STALE_ITEM,
+            "this item is missing its completion key — it'll resurface at the next sync",
+            feed_item_id, action_id,
+        )
+
+    today = _today_for(config)
+
+    if action_id == UNDO_DONE_ACTION:
+        # Undo only when the item is CURRENTLY done — freshly board-acted
+        # (state=acted) OR still-open-but-done-in-vault (evidence.done: completed
+        # via the talker, or a reconcile revived a board-acted item back to open
+        # with done=true). Nothing to undo otherwise.
+        is_done = item.state == STATE_ACTED or bool(evidence.get("done"))
+        if not is_done:
+            log.info(
+                "feed.act.slot.not_done", id=feed_item_id, action=action_id,
+                state=item.state,
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                "this item isn't marked done — nothing to undo",
+                feed_item_id, action_id,
+            )
+        return _slot_undo(
+            feed_item_id, action_id, lane=lane, evidence=evidence,
+            feed_store=feed_store, vault_path=vault_path,
+            item_text=item_text, today=today,
+        )
+
+    # action_id == DONE_ACTION (the ceiling admits only done/undo_done).
+    return _slot_done(
+        feed_item_id, action_id, lane=lane, evidence=evidence,
+        feed_store=feed_store, vault_path=vault_path,
+        item_text=item_text, today=today,
+    )
+
+
+def _slot_done(
+    feed_item_id: str,
+    action_id: str,
+    *,
+    lane: str,
+    evidence: dict[str, Any],
+    feed_store: Any,
+    vault_path: Path,
+    item_text: str,
+    today: _date,
+) -> ActResult:
+    """Route a slot ``done`` to the lane's completion writer; on the non-error
+    end-state set the feed item ``acted`` (optimistic-green). Idempotent: a
+    re-done maps to the same ``acted`` (the writer's own idempotent_noop)."""
+    if lane == "routine":
+        from alfred.routine import completion as _completion
+
+        rel = str(evidence.get("path") or "").strip()
+        if not rel:
+            return ActResult(
+                False, STATUS_STALE_ITEM,
+                "routine item is missing its record path — it'll resurface at the next sync",
+                feed_item_id, action_id,
+            )
+        result = _completion.mark_routine_item_done(
+            Path(vault_path) / rel, item_text, today.isoformat(),
+        )
+        if result.ok:
+            feed_store.set_state(feed_item_id, STATE_ACTED)
+            log.info(
+                "feed.act.slot.done", id=feed_item_id, lane=lane,
+                kind=result.kind, item=item_text,
+            )
+            return ActResult(True, STATUS_ACTED, f"marked done: {item_text}", feed_item_id, action_id)
+        log.info(
+            "feed.act.slot.writer_error", id=feed_item_id, lane=lane,
+            kind=result.kind, item=item_text,
+        )
+        return ActResult(
+            False, STATUS_ERROR, _routine_writer_detail(result.kind, item_text),
+            feed_item_id, action_id,
+        )
+
+    # tier lane — free-text T3.
+    from alfred.tier.daily_curation import (
+        TIER_DONE_KIND_IDEMPOTENT_NOOP,
+        TIER_DONE_KIND_SUCCESS,
+        mark_t3_done,
+    )
+
+    result = mark_t3_done(Path(vault_path), item_text, completed_at=today, today=today)
+    if result.kind in (TIER_DONE_KIND_SUCCESS, TIER_DONE_KIND_IDEMPOTENT_NOOP):
+        feed_store.set_state(feed_item_id, STATE_ACTED)
+        log.info(
+            "feed.act.slot.done", id=feed_item_id, lane=lane,
+            kind=result.kind, item=item_text,
+        )
+        return ActResult(True, STATUS_ACTED, f"marked done: {result.item or item_text}", feed_item_id, action_id)
+    log.info(
+        "feed.act.slot.writer_error", id=feed_item_id, lane=lane,
+        kind=result.kind, item=item_text,
+    )
+    return ActResult(
+        False, STATUS_ERROR, _tier_writer_detail(result.kind, item_text),
+        feed_item_id, action_id,
+    )
+
+
+def _slot_undo(
+    feed_item_id: str,
+    action_id: str,
+    *,
+    lane: str,
+    evidence: dict[str, Any],
+    feed_store: Any,
+    vault_path: Path,
+    item_text: str,
+    today: _date,
+) -> ActResult:
+    """Route a slot ``undo_done`` to the lane's inverse writer; on the non-error
+    end-state set the feed item back to ``open`` (the completion is reversed)."""
+    if lane == "routine":
+        from alfred.routine import completion as _completion
+
+        rel = str(evidence.get("path") or "").strip()
+        if not rel:
+            return ActResult(
+                False, STATUS_STALE_ITEM,
+                "routine item is missing its record path — it'll resurface at the next sync",
+                feed_item_id, action_id,
+            )
+        result = _completion.mark_routine_item_undone(
+            Path(vault_path) / rel, item_text, today.isoformat(),
+        )
+        if result.ok:
+            feed_store.set_state(feed_item_id, STATE_OPEN)
+            log.info(
+                "feed.act.slot.undone", id=feed_item_id, lane=lane,
+                kind=result.kind, item=item_text,
+            )
+            return ActResult(True, STATUS_UNDONE, f"undone: {item_text}", feed_item_id, action_id)
+        log.info(
+            "feed.act.slot.writer_error", id=feed_item_id, lane=lane,
+            kind=result.kind, item=item_text,
+        )
+        return ActResult(
+            False, STATUS_ERROR, _routine_writer_detail(result.kind, item_text),
+            feed_item_id, action_id,
+        )
+
+    # tier lane — free-text T3.
+    from alfred.tier.daily_curation import (
+        TIER_UNDONE_KIND_NOT_MARKED,
+        TIER_UNDONE_KIND_UNMARKED,
+        mark_t3_undone,
+    )
+
+    result = mark_t3_undone(Path(vault_path), item_text, on_date=today)
+    if result.kind in (TIER_UNDONE_KIND_UNMARKED, TIER_UNDONE_KIND_NOT_MARKED):
+        feed_store.set_state(feed_item_id, STATE_OPEN)
+        log.info(
+            "feed.act.slot.undone", id=feed_item_id, lane=lane,
+            kind=result.kind, item=item_text,
+        )
+        return ActResult(True, STATUS_UNDONE, f"undone: {result.item or item_text}", feed_item_id, action_id)
+    log.info(
+        "feed.act.slot.writer_error", id=feed_item_id, lane=lane,
+        kind=result.kind, item=item_text,
+    )
+    return ActResult(
+        False, STATUS_ERROR, _tier_writer_detail(result.kind, item_text),
+        feed_item_id, action_id,
+    )
+
+
+def _routine_writer_detail(kind: str, item_text: str) -> str:
+    """Human detail for a routine completion writer refusal."""
+    if kind == "unknown_item":
+        return f"'{item_text}' is no longer on that routine record"
+    if kind == "unknown_record":
+        return "the routine record could not be read"
+    return f"could not record completion for '{item_text}'"
+
+
+def _tier_writer_detail(kind: str, item_text: str) -> str:
+    """Human detail for a tier (free-text T3) writer refusal."""
+    if kind == "unknown_item":
+        return f"'{item_text}' isn't on today's T3 list"
+    if kind == "ambiguous_item":
+        return f"'{item_text}' matches more than one T3 item — be more specific"
+    if kind == "future_date_rejected":
+        return "can't complete a future-dated item"
+    return f"could not record completion for '{item_text}'"
+
+
 def act(
     feed_item_id: str,
     action_id: str,
@@ -379,7 +677,15 @@ def _act_locked(
     # Folded-state check FIRST — only OPEN items are actionable. An acted/acked/
     # expired item is an idempotent ok-noop (the deck may double-tap or race a
     # reconcile); we never re-drive a resolver for it.
-    if item.state != STATE_OPEN:
+    #
+    # THE ONE EXCEPTION: ``undo_done`` on a slot_suggestion acts on an item that
+    # is DONE — i.e. already ``acted`` (the board's done set it). It must reach
+    # the slot dispatcher below to reverse the completion, so it is exempt from
+    # the acted-is-final gate. (An undo on an OPEN item — done via a non-board
+    # path, still emitted open with evidence.done=true — passes this gate
+    # naturally.) Every other (kind, action) on a non-open item is the noop.
+    _is_slot_undo = item.kind == SLOT_KIND and action_id == UNDO_DONE_ACTION
+    if item.state != STATE_OPEN and not _is_slot_undo:
         log.info(
             "feed.act.already_acted", id=feed_item_id, action=action_id,
             state=item.state,
@@ -432,6 +738,18 @@ def _act_locked(
             False, STATUS_INVALID_ACTION,
             f"'{action_id}' is not a valid action for a {kind} item",
             feed_item_id, action_id,
+        )
+
+    # slot_suggestion (board DONE path) — a DEDICATED dispatcher, NOT the
+    # ReplyCorrection/last_batch path. It acts on the feed item's OWN stamped
+    # evidence (the producer's trusted origin/routine_record/tier/item_text,
+    # same trust class as last_batch) and calls the per-lane completion writer
+    # — the SAME functions the talker uses (single writer per lane). Intercepts
+    # BEFORE _load_batch_item because slot items have no last_batch entry.
+    if kind == SLOT_KIND:
+        return _dispatch_slot_completion(
+            feed_item_id, action_id, item,
+            feed_store=feed_store, config=config, vault_path=vault_path,
         )
 
     # Authoritative item from last_batch — re-derived, never ordinal/evidence.

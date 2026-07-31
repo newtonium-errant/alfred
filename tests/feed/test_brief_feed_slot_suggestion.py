@@ -119,6 +119,43 @@ def test_t3_only(tmp_path: Path) -> None:
     assert items[0].evidence["tier"] == 3
 
 
+# --- done evidence (Phase C slice 1 — the board's ring greenness) -----------
+
+
+def test_every_slot_item_carries_done_flag(tmp_path: Path) -> None:
+    """Each emitted slot item carries ``evidence.done`` (the ring's green
+    signal, from the tier layer's own predicate). Open items → done=False."""
+    vault = _vault(tmp_path)
+    _task(vault, "Pay Steph", "type: task\nstatus: todo\nname: Pay Steph\ndue: 2026-05-28\n")
+    items = _items(vault)
+    assert items
+    for it in items:
+        assert it.evidence["done"] is False
+
+
+def test_done_true_for_completed_free_text_t3(tmp_path: Path) -> None:
+    """A curated free-text T3 stamped ``done_at`` today re-emits with
+    done=True (it does NOT vanish — planned/done/remaining)."""
+    from datetime import date
+
+    from alfred.tier.daily_curation import (
+        DailyCuration,
+        T3Entry,
+        save_tier_curation,
+    )
+
+    vault = _vault(tmp_path)
+    (vault / "daily").mkdir(parents=True, exist_ok=True)
+    day = NOW.date()
+    save_tier_curation(
+        vault, day,
+        DailyCuration(t3=[T3Entry(item="Meditate", source="operator-adhoc", done_at=day.isoformat())]),
+    )
+    items = [it for it in _items(vault) if it.evidence.get("tier") == 3]
+    assert len(items) == 1
+    assert items[0].evidence["done"] is True
+
+
 # --- free-text T3 stable-key fallback (unit) --------------------------------
 
 

@@ -1878,33 +1878,18 @@ def _collect_routine_today(
     return out
 
 
-def _compute_daily_goal(
-    vault_path: Path,
-    today: date,
-    t1: list[TierEntry],
-    t2: list[TierEntry],
-    t3: list[TierEntry],
-) -> DailyGoalState:
-    """Compute the one-of-each-tier daily goal over the assembled lanes.
+def build_done_caches(vault_path: Path) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Load the substrate the done-predicate reads: task frontmatter by name +
+    routine completion logs by record.
 
-    Counts available + done per lane. "Done" =
-      * task-origin entry → the task record's status is closed
-        (``_task_is_done_today``),
-      * routine-origin entry → the item is completed in its current
-        cycle (or today, for soft-cadence) per its routine record's
-        ``completion_log``.
-
-    Note: items that classified into a tier are by definition NOT
-    completed-this-cycle (the classifier suppresses completed items via
-    ``completion_satisfies_current_cycle``). So tier-lane ``*_done``
-    counts come from CURATED entries the operator placed AND later
-    completed (a curated T1 task the operator finished), plus any
-    auto-task entry whose status flipped to done after surfacing. This
-    is the honest "did you finish something in this lane today" signal.
+    Extracted from ``_compute_daily_goal`` so the SAME caches feed BOTH the
+    daily-goal done-count AND the feed producer's per-item ``done`` flag — the
+    producer must never re-derive doneness (ring/brief doneness disagreement is
+    the gaslighting class Phase C slice 1 kills). Returns
+    ``(task_fm_by_name, completion_by_record)``.
     """
     import frontmatter  # type: ignore[import-untyped]
 
-    # Cache task frontmatter by name + routine completion logs by record.
     task_fm_by_name: dict[str, dict] = {}
     task_dir = vault_path / "task"
     if task_dir.is_dir():
@@ -1934,43 +1919,106 @@ def _compute_daily_goal(
             cl = fm.get("completion_log") or {}
             completion_by_record[rec] = cl if isinstance(cl, dict) else {}
 
-    def _entry_done(entry: TierEntry) -> bool:
-        if entry.origin == "task":
-            fm = task_fm_by_name.get(entry.name)
-            if fm is None:
-                return False
-            return _task_is_done_today(fm, today)
-        # routine_item: completed today (a date in completion_log[text]
-        # equal to today). The classifier already excludes
-        # completed-this-cycle items from the lanes, so this catches the
-        # operator completing a curated routine item during the day.
-        text_key = entry.item_text or entry.name
-        if entry.routine_record:
-            # Record-anchored entry (auto-surfaced or curated routine_item
-            # with a record): look up that record's completion log.
-            cl = completion_by_record.get(entry.routine_record, {})
-            dates = _parse_item_completion_dates(cl.get(text_key, []))
-            return today in dates
-        # Free-text T3 entry (curated ``item:`` with no record anchor —
-        # "Meditate", "Read for an hour", "Rake leaves").
-        #
-        # Arc #20: the item's OWN ad-hoc done-state comes first — an
-        # operator ``tier_done`` stamps ``done_at`` on the entry, and a
-        # free-text ad-hoc intention ("rake leaves") has no routine to
-        # map to, so this is the ONLY signal that will fire for it. Count
-        # it done when ``done_at`` is today (a back-dated ``done_at`` from
-        # a prior day does NOT count toward today's balanced-day goal).
-        if entry.done_at is not None and entry.done_at == today.isoformat():
+    return task_fm_by_name, completion_by_record
+
+
+def entry_is_done(
+    entry: TierEntry,
+    *,
+    task_fm_by_name: dict[str, dict],
+    completion_by_record: dict[str, dict],
+    today: date,
+) -> bool:
+    """THE done-predicate for a tier-lane entry — the SINGLE source of truth
+    for "is this item completed today", reused by the daily-goal count AND the
+    feed producer's ``done`` flag (identity-pinned: fork this → both reds).
+
+    "Done" =
+      * task-origin entry → the task record's status is closed today
+        (``_task_is_done_today``),
+      * routine-origin entry with a record → the item is completed today in
+        that record's ``completion_log``,
+      * free-text T3 entry → its ad-hoc ``done_at`` is today (Arc #20), else a
+        same-text completion today in ANY routine record (the pre-Arc-#20
+        fallback).
+
+    ``task_fm_by_name`` / ``completion_by_record`` come from
+    :func:`build_done_caches`.
+    """
+    if entry.origin == "task":
+        fm = task_fm_by_name.get(entry.name)
+        if fm is None:
+            return False
+        return _task_is_done_today(fm, today)
+    # routine_item: completed today (a date in completion_log[text] equal to
+    # today). The classifier already excludes completed-this-cycle items from
+    # the lanes, so this catches the operator completing a curated routine item
+    # during the day.
+    text_key = entry.item_text or entry.name
+    if entry.routine_record:
+        # Record-anchored entry (auto-surfaced or curated routine_item with a
+        # record): look up that record's completion log.
+        cl = completion_by_record.get(entry.routine_record, {})
+        dates = _parse_item_completion_dates(cl.get(text_key, []))
+        return today in dates
+    # Free-text T3 entry (curated ``item:`` with no record anchor —
+    # "Meditate", "Read for an hour", "Rake leaves").
+    #
+    # Arc #20: the item's OWN ad-hoc done-state comes first — an operator
+    # ``tier_done`` stamps ``done_at`` on the entry, and a free-text ad-hoc
+    # intention ("rake leaves") has no routine to map to, so this is the ONLY
+    # signal that will fire for it. Count it done when ``done_at`` is today (a
+    # back-dated ``done_at`` from a prior day does NOT count toward today).
+    if entry.done_at is not None and entry.done_at == today.isoformat():
+        return True
+    # Fallback for a free-text item that DOES map to a routine item somewhere:
+    # scan ALL routine completion logs for a same-text completion today (the
+    # honest "did the operator complete this intention today" signal,
+    # pre-Arc-#20 behaviour, preserved).
+    for cl in completion_by_record.values():
+        dates = _parse_item_completion_dates(cl.get(text_key, []))
+        if today in dates:
             return True
-        # Fallback for a free-text item that DOES map to a routine item
-        # somewhere: scan ALL routine completion logs for a same-text
-        # completion today (the honest "did the operator complete this
-        # intention today" signal, pre-Arc-#20 behaviour, preserved).
-        for cl in completion_by_record.values():
-            dates = _parse_item_completion_dates(cl.get(text_key, []))
-            if today in dates:
-                return True
-        return False
+    return False
+
+
+def _compute_daily_goal(
+    vault_path: Path,
+    today: date,
+    t1: list[TierEntry],
+    t2: list[TierEntry],
+    t3: list[TierEntry],
+) -> DailyGoalState:
+    """Compute the one-of-each-tier daily goal over the assembled lanes.
+
+    Counts available + done per lane. "Done" =
+      * task-origin entry → the task record's status is closed
+        (``_task_is_done_today``),
+      * routine-origin entry → the item is completed in its current
+        cycle (or today, for soft-cadence) per its routine record's
+        ``completion_log``.
+
+    Note: items that classified into a tier are by definition NOT
+    completed-this-cycle (the classifier suppresses completed items via
+    ``completion_satisfies_current_cycle``). So tier-lane ``*_done``
+    counts come from CURATED entries the operator placed AND later
+    completed (a curated T1 task the operator finished), plus any
+    auto-task entry whose status flipped to done after surfacing. This
+    is the honest "did you finish something in this lane today" signal.
+    """
+    # Per-entry doneness delegates to the module-level ``entry_is_done`` (the
+    # SAME predicate the feed producer's ``done`` flag uses, over caches from
+    # ``build_done_caches``) so the daily-goal count and the ring green-dots can
+    # never disagree on "done".
+    task_fm_by_name, completion_by_record = build_done_caches(vault_path)
+
+    def _entry_done(entry: TierEntry) -> bool:
+        return entry_is_done(
+            entry,
+            task_fm_by_name=task_fm_by_name,
+            completion_by_record=completion_by_record,
+            today=today,
+        )
 
     t1_done = sum(1 for e in t1 if _entry_done(e))
     t2_done = sum(1 for e in t2 if _entry_done(e))
@@ -2001,6 +2049,7 @@ __all__ = [
     "RoutineLine",
     "TierEntry",
     "TodayView",
+    "build_done_caches",
     "classify_routine_item",
     "coerce_due_date",
     "compute_auto_routine_candidates",
@@ -2010,4 +2059,5 @@ __all__ = [
     "compute_self_care_candidates",
     "compute_self_care_task_candidates",
     "compute_today_view",
+    "entry_is_done",
 ]

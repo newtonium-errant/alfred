@@ -131,13 +131,30 @@ def slot_suggestion_feed_items(
     projection (auto-T1 task + routine candidates, T2 auto-surfaced, T3
     suggestions). The feed reads the SAME ``compute_today_view`` projection the
     brief's tier section renders, so it never diverges from what the operator
-    sees. Empty day → ``[]``; projection failure → ``None`` (don't reconcile)."""
-    from alfred.tier.compute import compute_today_view
+    sees. Empty day → ``[]``; projection failure → ``None`` (don't reconcile).
+
+    Each item carries ``evidence.done`` — the completion state the ring reads to
+    show a green/struck segment. It is computed by the tier layer's OWN
+    ``entry_is_done`` predicate over ``build_done_caches`` (identity-shared with
+    the daily-goal count), NEVER a re-derived doneness — a done/undone
+    disagreement between the ring and the brief is the exact gaslighting Phase C
+    slice 1 closes. ``compute_today_view`` still SKIPS auto-surfaced routine
+    items once completed-this-cycle; those don't vanish from the board because
+    the feed store retains them as ``acted`` after a board completion — so the
+    ring's greenness is ``state == acted OR evidence.done`` (see the board
+    action router)."""
+    from alfred.tier.compute import (
+        build_done_caches,
+        compute_today_view,
+        entry_is_done,
+    )
 
     try:
         view = compute_today_view(Path(vault_path), now, tier_defaults)
+        task_fm_by_name, completion_by_record = build_done_caches(Path(vault_path))
     except Exception:  # noqa: BLE001 — source failure → don't reconcile (belt also logs)
         return None
+    today = now.date()
     out: list[FeedItem] = []
     for entry in (*view.t1, *view.t2, *view.t3):
         key = _slot_stable_key(entry)
@@ -145,6 +162,12 @@ def slot_suggestion_feed_items(
             continue
         reason = getattr(entry, "surface_reason", None) or getattr(entry, "source", "") or ""
         title = f"T{entry.tier}: {entry.name}" + (f" — {reason}" if reason else "")
+        done = entry_is_done(
+            entry,
+            task_fm_by_name=task_fm_by_name,
+            completion_by_record=completion_by_record,
+            today=today,
+        )
         out.append(FeedItem.create(
             kind="slot_suggestion",
             stable_key=key,
@@ -160,6 +183,7 @@ def slot_suggestion_feed_items(
                 "source": getattr(entry, "source", ""),
                 "routine_record": getattr(entry, "routine_record", None),
                 "item_text": getattr(entry, "item_text", None),
+                "done": done,
             },
             source_ref=dict(_SOURCE_REF),
         ))
