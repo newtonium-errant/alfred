@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import os
 import re
 import sys
 from dataclasses import dataclass
@@ -58,7 +57,6 @@ from zoneinfo import ZoneInfo
 
 import frontmatter  # type: ignore[import-untyped]
 import structlog
-import yaml
 
 from alfred.vault.scope import ScopeError
 

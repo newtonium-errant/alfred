@@ -409,6 +409,41 @@ def test_routine_writer_identity_pin_cli_and_board(tmp_path: Path, monkeypatch) 
     assert seen == ["Meditate", "Meditate"], "board must route through the SAME writer"
 
 
+def test_routine_undo_writer_identity_pin_cli_and_board(tmp_path: Path, monkeypatch) -> None:
+    """Symmetric to the done-writer pin: cmd_undone (talker) AND the board's
+    undo_done call the SAME ``completion.mark_routine_item_undone`` object. Fork
+    either un-log write inline → the spy misses → this pin reddens."""
+    from alfred.routine import completion as _completion
+    from alfred.routine.cli import cmd_undone  # via cli (re-export) → loads cli first
+    from alfred.routine.config import RoutineConfig
+
+    real = _completion.mark_routine_item_undone
+    seen: list[str] = []
+
+    def _spy(record_path, item_text, date_):
+        seen.append(item_text)
+        return real(record_path, item_text, date_)
+
+    monkeypatch.setattr(_completion, "mark_routine_item_undone", _spy)
+
+    vault = _vault(tmp_path)
+    _routine_selfcare(vault)
+
+    # (a) talker path — cmd_undone (resolves, then calls the shared un-log writer;
+    # nothing logged yet → not_logged, but the writer IS invoked).
+    rcfg = RoutineConfig(vault_path=str(vault), instance_name="salem")
+    rcfg.state.path = str(tmp_path / "routine_state.json")
+    cmd_undone(rcfg, "Self Care", "Meditate", date=TODAY_ISO)
+    assert seen == ["Meditate"], "cmd_undone must route through the shared writer"
+
+    # (b) board path — mark done first (so undo clears the is_done gate), then undo.
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _publish(store, vault, origin="routine")
+    _act(store, cfg, vault, item.id, "done")
+    _act(store, cfg, vault, item.id, "undo_done")
+    assert seen == ["Meditate", "Meditate"], "board undo must route through the SAME writer"
+
+
 def test_tier_writer_identity_pin_board(tmp_path: Path, monkeypatch) -> None:
     """The board's tier lane calls ``daily_curation.mark_t3_done`` — the SAME
     function ``tier_done`` uses. Monkeypatch the module attr → the board's lazy
@@ -433,31 +468,42 @@ def test_tier_writer_identity_pin_board(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_done_predicate_identity_pin_daily_goal_and_producer(tmp_path: Path, monkeypatch) -> None:
-    """The daily-goal count AND the feed producer's ``done`` flag call the SAME
-    ``compute.entry_is_done``. Monkeypatch it once → BOTH surfaces reflect it.
-    Fork either into a re-derived doneness → the spy misses that caller → red."""
+    """The daily-goal count AND the feed producer's ``done`` flag bind to the
+    RETURN of ``compute.entry_is_done`` — not merely call it. Force the predicate
+    to a SENTINEL that cannot arise from the real (open, never-completed) item,
+    then assert BOTH surfaces reflect the sentinel. A fork of EITHER caller to a
+    re-derived doneness makes that surface show the real value (False) → this pin
+    reddens.
+
+    (An earlier call-count form was VACUOUS: ``compute_today_view``'s own
+    transitive ``entry_is_done`` call satisfied the count even when the producer
+    forked. Binding output→return is the non-vacuous shape — reviewer-flagged
+    2026-07-31, mutation-proved.)"""
     import alfred.tier.compute as compute
 
-    real = compute.entry_is_done
-    calls = {"n": 0}
-
-    def _spy(entry, **kw):
-        calls["n"] += 1
-        return real(entry, **kw)
-
-    monkeypatch.setattr(compute, "entry_is_done", _spy)
+    # Sentinel: force done=True on an item whose REAL done is False (self-care
+    # Meditate, never completed). True can therefore ONLY come from the shared
+    # predicate's return — never from a re-derivation off the entry.
+    monkeypatch.setattr(compute, "entry_is_done", lambda entry, **kw: True)
 
     vault = _vault(tmp_path)
-    _routine_selfcare(vault)
+    _routine_selfcare(vault)  # one open, never-completed T3 item → real done=False
 
-    # (a) daily-goal count (via compute_today_view → _compute_daily_goal).
-    compute.compute_today_view(vault, NOW, None)
-    after_goal = calls["n"]
-    assert after_goal >= 1, "daily-goal count must use the shared predicate"
+    # (a) daily-goal count binds to the predicate's return.
+    view = compute.compute_today_view(vault, NOW, None)
+    assert len(view.t3) >= 1
+    assert view.daily_goal.t3_done == len(view.t3), (
+        "daily-goal must count off the shared predicate's RETURN (sentinel-True), "
+        "not a re-derived doneness"
+    )
 
-    # (b) the feed producer's done flag.
-    _slot_items(vault)
-    assert calls["n"] > after_goal, "the producer must use the SAME predicate"
+    # (b) the producer's emitted evidence.done binds to the predicate's return.
+    items = _slot_items(vault)
+    assert items
+    assert all(it.evidence["done"] is True for it in items), (
+        "the producer's evidence.done must reflect the shared predicate's RETURN "
+        "(sentinel-True), not a re-derived doneness"
+    )
 
 
 # ---------------------------------------------------------------------------
