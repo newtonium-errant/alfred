@@ -1,11 +1,16 @@
 """Load-bearing pins for the #34-sibling routine-record RMW lock.
 
-The routine CLI writers (cmd_done + the cmd_undone/add/remove/edit handlers via
-``_atomic_item_mutate``) RMW ``routine/<Name>.md`` records that ``tier.promote``
+The routine CLI writers RMW ``routine/<Name>.md`` records that ``tier.promote``
 already flocks — but pre-fix they bypassed the lock, so a promote-append racing
 a cmd_done (or two cmd_done) could clobber each other's field (lost update). The
 fix: every writer holds ``file_rmw_lock`` (same sidecar as promote) across its
 whole read→mutate→write, and writes atomically (``.tmp`` → ``os.replace``).
+
+Phase C slice 1 relocated the cmd_done / cmd_undone completion_log WRITE into
+the shared ``alfred.routine.completion`` leaf (single writer per lane, shared
+with the board's ``/feed/act`` path) — so those two acquire the lock in
+``completion.py``; cmd_item_add/remove/edit still lock via
+``cli_items._atomic_item_mutate``. Both paths lock the SAME record sidecar.
 
 These pin: (1) each writer ACQUIRES the lock on the correct record path (the
 deterministic regression guard — fails if a writer's lock is dropped);
@@ -71,7 +76,8 @@ def test_cmd_done_acquires_lock_on_the_record_path(tmp_path: Path, monkeypatch) 
         calls.append(path)
         yield
 
-    monkeypatch.setattr("alfred.routine.cli.file_rmw_lock", _spy)
+    # The completion_log write now locks inside the shared completion writer.
+    monkeypatch.setattr("alfred.routine.completion.file_rmw_lock", _spy)
     cmd_done(_config(vault, tmp_path), "Chores", "A", today_override="2026-07-25")
     assert calls == [record]  # locked the record's own sidecar (== promote's)
 

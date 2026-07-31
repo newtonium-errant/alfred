@@ -87,6 +87,7 @@ import yaml
 
 from alfred.common.file_lock import file_rmw_lock
 
+from . import completion as _completion
 from .cli import (
     ITEM_KIND_ADDED,
     ITEM_KIND_AMBIGUOUS_ITEM,
@@ -1328,43 +1329,52 @@ def cmd_undone(
         return code
     assert resolved_path is not None
 
-    def _mutator(
-        items: list[dict],
-        completion_log: dict[str, list[str]],
-    ) -> _MutationResult:
-        dates = completion_log.get(canonical_item, [])
-        if iso not in dates:
-            # ILB no-op: the desired end-state (not logged on this date)
-            # already holds → leave the file untouched (aborted gate).
-            return _MutationResult(
-                items=items,
-                completion_log=completion_log,
-                payload_extras={},
-                aborted=True,
-            )
-        new_dates = [d for d in dates if d != iso]
-        new_completion_log = dict(completion_log)
-        # Keep ``[]`` when the list empties (mirror cmd_done; don't drop key).
-        new_completion_log[canonical_item] = new_dates
-        return _MutationResult(
-            items=items,
-            completion_log=new_completion_log,
-            payload_extras={
-                "removed": True,
-                "remaining_dates": new_dates,
+    # ---- Shared completion_log removal (identity-pinned with the board) ---
+    # The un-log WRITE is delegated to the SAME
+    # ``alfred.routine.completion.mark_routine_item_undone`` the board's
+    # ``/feed/act`` undo_done dispatcher calls — single writer per lane. The
+    # resolver above (``_resolve_record_for_item_op``) still owns the
+    # record/item resolution + its unknown_record / unknown_item / ambiguous
+    # canaries; the writer re-checks existence under its own file_rmw_lock and
+    # leaves the file UNTOUCHED on the not-logged no-op (its ``aborted`` gate).
+    # Called via the module attribute so the identity pin can monkeypatch one
+    # symbol and see both callers route through it.
+    rel_path = str(resolved_path.relative_to(vault_path))
+    result = _completion.mark_routine_item_undone(resolved_path, canonical_item, iso)
+
+    if result.kind == _completion.DONE_KIND_UNKNOWN_ITEM:
+        # TOCTOU: the item vanished between resolution and the writer's lock.
+        return _emit_canary(
+            wants_json=wants_json,
+            kind=ITEM_KIND_UNKNOWN_ITEM,
+            exit_code=1,
+            message=(
+                f"Item {canonical_item!r} not found on {resolved_record!r}."
+            ),
+            payload={
+                "item_text_input": canonical_item,
+                "record": resolved_record,
             },
         )
+    if result.kind == _completion.DONE_KIND_UNKNOWN_RECORD:
+        return _emit_canary(
+            wants_json=wants_json,
+            kind=ITEM_KIND_UNKNOWN_RECORD,
+            exit_code=1,
+            message=(
+                f"Routine record {resolved_record!r} could not be read."
+            ),
+            payload={"record_name_input": resolved_record},
+        )
 
-    result = _atomic_item_mutate(resolved_path, _mutator)
-
-    if result.aborted:
+    if result.kind == _completion.UNDONE_KIND_NOT_LOGGED:
         if not wants_json:
             log.info(
                 "routine.cli.item.not_logged",
                 record=resolved_record,
                 item=canonical_item,
                 date=iso,
-                path=str(resolved_path.relative_to(vault_path)),
+                path=rel_path,
             )
         return _emit_canary(
             wants_json=wants_json,
@@ -1378,7 +1388,7 @@ def cmd_undone(
                 "record": resolved_record,
                 "item": canonical_item,
                 "date": iso,
-                "path": str(resolved_path.relative_to(vault_path)),
+                "path": rel_path,
                 "removed": False,
             },
         )
@@ -1389,8 +1399,8 @@ def cmd_undone(
             record=resolved_record,
             item=canonical_item,
             date=iso,
-            path=str(resolved_path.relative_to(vault_path)),
-            remaining=len(result.payload_extras.get("remaining_dates", [])),
+            path=rel_path,
+            remaining=len(result.remaining_dates),
         )
     return _emit_canary(
         wants_json=wants_json,
@@ -1401,8 +1411,9 @@ def cmd_undone(
             "record": resolved_record,
             "item": canonical_item,
             "date": iso,
-            "path": str(resolved_path.relative_to(vault_path)),
-            **result.payload_extras,
+            "path": rel_path,
+            "removed": True,
+            "remaining_dates": result.remaining_dates,
         },
     )
 
