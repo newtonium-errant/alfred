@@ -4,6 +4,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { SHORTCUT_MAX_TITLE_CHARS, shortcutIngestBodySchema } from '../../../lib/algernon/schemas';
 import { callTransportTo, listIngestTargets } from '../../../lib/algernon/transport';
 import { sendTransportError } from '../../../lib/algernon/bffError';
+import { loadDirectiveAliases, matchLeadingDirective } from '../../../lib/algernon/shortcutDirective';
 
 // POST /api/ingest/shortcut — a BEARER-ONLY capture door for the iOS Shortcuts
 // tendril (Action Button → Dictate → POST). Sibling of ingest/submit.ts, but for
@@ -30,6 +31,14 @@ import { sendTransportError } from '../../../lib/algernon/bffError';
 //   6. target is configured (400 unknown_target) — checked BEFORE any env lookup
 //      so a bogus target can't probe server env
 // Transport/config failures map via sendTransportError (no topology leak).
+//
+// VOICE-DIRECTIVE ROUTING (deterministic, no LLM): a capture that OPENS with a
+// directive ("message for Hypatia, …", "for Hypatia: …", "Hypatia: …") to a
+// KNOWN + CONFIGURED instance is re-homed to that target and the prefix stripped;
+// see `lib/algernon/shortcutDirective.ts`. Fail-safe by construction — an unknown
+// name (or a recognised-but-unconfigured one) keeps the words fully INTACT in the
+// default inbox, so a misheard name never loses content. Aliases (STT mangling)
+// are config-layer via SHORTCUT_DIRECTIVE_ALIASES.
 //
 // OPERATOR SETUP: set SHORTCUT_INGEST_TOKEN (a long random secret) in the web
 // server env; the Shortcut sends `Authorization: Bearer <token>` and a JSON body
@@ -188,10 +197,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   // value is unambiguous whether or not the client sent the field.
   const record_type = 'note';
 
-  // Resolve the target case-insensitively against the CONFIGURED set (the Shortcut
-  // sends a human-typed name or relies on the default). Checked BEFORE any env
-  // lookup so a bogus target can't probe server env.
-  const requested = (target || DEFAULT_TARGET).trim();
+  // Leading voice-directive routing (deterministic, no LLM). If the capture
+  // OPENS with a directive to a KNOWN + CONFIGURED instance, re-home it there and
+  // strip the prefix. A recognised-but-unconfigured name keeps the text INTACT in
+  // the default inbox + logs the intent (for the re-homing loop). An unknown name
+  // is not a directive → intact. Fail-safe: a misheard name never loses words.
+  const directive = matchLeadingDirective(text, loadDirectiveAliases());
+  let requested = (target || DEFAULT_TARGET).trim();
+  let bodyText = text;
+  let source = 'iOS Shortcut';
+  let routedViaDirective = false;
+  if (directive) {
+    const directiveTarget = listIngestTargets().find(
+      (t) => t.name.toLowerCase() === directive.canonical.toLowerCase(),
+    );
+    if (directiveTarget) {
+      requested = directiveTarget.name;
+      bodyText = directive.rest;
+      source = `iOS Shortcut (spoken: "${directive.spokenForm}")`;
+      routedViaDirective = true;
+    } else {
+      console.warn(
+        `[bff:ingest/shortcut] directive_target_unconfigured target=${directive.canonical}`,
+      );
+    }
+  }
+
+  // Resolve the (possibly directive-overridden) target case-insensitively against
+  // the CONFIGURED set. Checked BEFORE any env lookup so a bogus target can't
+  // probe server env.
   const match = listIngestTargets().find((t) => t.name.toLowerCase() === requested.toLowerCase());
   if (!match) {
     console.warn('[bff:ingest/shortcut] reject reason=unknown_target');
@@ -199,25 +233,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   const now = new Date();
-  const finalTitle = title ?? deriveTitle(text, now);
+  const finalTitle = title ?? deriveTitle(bodyText, now);
 
   try {
     const { status, body: respBody } = await callTransportTo(match.name, 'POST', '/vault/ingest', {
       body: {
         record_type,
         title: finalTitle,
-        body: text,
-        source: 'iOS Shortcut',
+        body: bodyText,
+        source,
         ingested_by: INGESTED_BY,
         ingested_at: now.toISOString(),
         correlation_id: randomUUID(),
-        set_fields: { ingested_via: 'shortcut', origin_instance: ORIGIN_INSTANCE },
+        set_fields: {
+          ingested_via: 'shortcut',
+          origin_instance: ORIGIN_INSTANCE,
+          ...(routedViaDirective ? { routed_via: 'directive' } : {}),
+        },
       },
       headers: { 'X-Alfred-Ingest-User': INGESTED_BY },
     });
     console.log(
       `[bff:ingest/shortcut] accept target=${match.name} record_type=note ` +
-        `text_chars=${text.length} title_chars=${finalTitle.length} upstream=${status}`,
+        `text_chars=${bodyText.length} title_chars=${finalTitle.length} ` +
+        `directive=${routedViaDirective} upstream=${status}`,
     );
     return res.status(status).json(respBody ?? {});
   } catch (e) {
