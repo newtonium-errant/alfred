@@ -6,7 +6,10 @@ import { render, screen, waitFor } from '@testing-library/react';
 // check-in "N things need you" line stays the feed total (true, and distinct
 // from the deck subset).
 
-const { mockList } = vi.hoisted(() => ({ mockList: vi.fn() }));
+const { mockList, modeState } = vi.hoisted(() => ({
+  mockList: vi.fn(),
+  modeState: { current: 'checkin' as 'brief' | 'checkin' | 'feed' },
+}));
 vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: vi.fn() } }));
 vi.mock('../lib/algernon/useSession', () => ({
   useSession: () => ({ user: { name: 'andrew', role: 'owner' }, loading: false }),
@@ -15,11 +18,11 @@ vi.mock('next/router', () => ({
   useRouter: () => ({ replace: vi.fn(), push: vi.fn(), query: {}, events: { on: vi.fn(), off: vi.fn() } }),
 }));
 vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
-// Force the CHECK-IN composition so the rings + needs-you line + deck pill render.
+// Composition mode is controllable per test (default check-in).
 vi.mock('../lib/algernon/composer', () => ({
-  composeMode: () => 'checkin',
+  composeMode: () => modeState.current,
   halifaxHour: () => 12,
-  composeModeForDate: () => 'checkin',
+  composeModeForDate: () => modeState.current,
 }));
 // No-op the telemetry hook (avoids a real fetch on mount).
 vi.mock('../lib/algernon/composerLog', () => ({ useComposerLog: () => {} }));
@@ -45,7 +48,10 @@ function item(kind: string, id: string, attention: string, mode: string): FeedIt
   };
 }
 
-beforeEach(() => mockList.mockReset());
+beforeEach(() => {
+  mockList.mockReset();
+  modeState.current = 'checkin';
+});
 afterEach(() => vi.restoreAllMocks());
 
 describe('HomePage composer — the deck pill counts only deck-able kinds', () => {
@@ -90,5 +96,31 @@ describe('HomePage composer — the deck pill counts only deck-able kinds', () =
     await waitFor(() => expect(screen.queryByTestId('composer-needs-you')).not.toBeNull());
     // Two needs-you items, but the done slot no longer needs you → count is 1.
     expect(screen.getByTestId('composer-needs-you').textContent).toContain('1 thing needs you');
+  });
+});
+
+describe('HomePage composer — the rings are PERSISTENT across every mode', () => {
+  for (const mode of ['brief', 'checkin', 'feed'] as const) {
+    it(`renders the rings header in ${mode} mode (completion surface always exists)`, async () => {
+      modeState.current = mode;
+      mockList.mockResolvedValue({
+        items: [item('slot_suggestion', 's1', 'needs_you', 'decide')],
+        count: 1,
+      });
+      render(<HomePage />);
+      await waitFor(() => expect(screen.queryByTestId(`compose-${mode}`)).not.toBeNull());
+      expect(screen.queryByTestId('rings-header')).not.toBeNull();
+    });
+  }
+
+  it('does NOT double-fetch — RingsHeader shares the composer feed load (controlled)', async () => {
+    modeState.current = 'feed';
+    mockList.mockResolvedValue({ items: [], count: 0 });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('compose-feed')).not.toBeNull());
+    // The composer's single list({state:'open'}) — RingsHeader is controlled, so no
+    // extra list({kind:'slot_suggestion'}) fetch.
+    expect(mockList).toHaveBeenCalledTimes(1);
+    expect(mockList).toHaveBeenCalledWith({ state: 'open' });
   });
 });

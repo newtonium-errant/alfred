@@ -131,6 +131,16 @@ export default function HomePage() {
     </Link>
   );
 
+  // The rings are PERSISTENT across every composer mode — the completion surface
+  // must exist all day, not only during the 11:00–14:00 check-in window. The mode
+  // rules govern what LEADS (brief card / rings / feed board), not whether rings
+  // exist. Controlled `items` seam → no second feed fetch.
+  const ringsHeader = (
+    <div className="mt-3">
+      <RingsHeader items={items ?? []} onAuthExpired={onAuthExpired} />
+    </div>
+  );
+
   return (
     <>
       <Head>
@@ -142,6 +152,11 @@ export default function HomePage() {
         <p data-testid="composed-line" className={`mt-1 font-mono text-xs uppercase tracking-widest ${subtle}`}>
           COMPOSED · {mode}
         </p>
+
+        {/* The rings are a PERSISTENT glance strip (the ratified sketch) — present
+            in every mode so the completion surface exists all day, not only during
+            the check-in window. The mode's lead content follows below. */}
+        {ringsHeader}
 
         {mode === 'brief' && (
           <section data-testid="compose-brief" className="mt-6">
@@ -160,9 +175,6 @@ export default function HomePage() {
         {mode === 'checkin' && (
           <section data-testid="compose-checkin" className="mt-6">
             <h2 className={titleClass}>Midday check-in</h2>
-            <div className="mt-3">
-              <RingsHeader items={items ?? []} onAuthExpired={onAuthExpired} />
-            </div>
             {/* The feed total (true) — distinct from the deck pill below, which is
                 the deck-able subset. In check-in the non-deck-able needs-you items
                 (slot_suggestion) are the rings above, so total = deck + rings. */}
