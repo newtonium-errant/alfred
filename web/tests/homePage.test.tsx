@@ -74,6 +74,23 @@ describe('HomePage composer — the deck pill counts only deck-able kinds', () =
     expect(screen.getByTestId('composer-needs-you').textContent).toContain('2 things need you');
   });
 
+  it('an ACTED email_tier is NOT counted in the deck pill (the open-split is the guard)', async () => {
+    // Since the composer now fetches with no state filter, `openItems` (state==='open')
+    // is the SOLE guard keeping acted items off the deck-pill count — deckableCount
+    // has no state awareness, and isNeedsYouItem(acted email_tier) is true. Break the
+    // split → an acted email would count as a "decision waiting".
+    const actedEmail: FeedItem = { ...item('email_tier', 'e-acted', 'needs_you', 'decide'), state: 'acted' };
+    mockList.mockResolvedValue({
+      items: [item('email_tier', 'e-open', 'needs_you', 'decide'), actedEmail],
+      count: 2,
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('composer-deck-pill')).not.toBeNull());
+    const pill = screen.getByTestId('composer-deck-pill').textContent ?? '';
+    expect(pill).toContain('1 decision'); // ONLY the open one
+    expect(pill).not.toContain('2 decision');
+  });
+
   it('all needs-you non-deck-able → NO deck pill (empty deck never promised)', async () => {
     mockList.mockResolvedValue({
       items: [item('slot_suggestion', 's1', 'needs_you', 'decide')],
