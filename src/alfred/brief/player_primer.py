@@ -55,7 +55,13 @@ class PlayerContextPrimer:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PlayerContextPrimer":
-        d = data or {}
+        # Schema-tolerant + fail-soft: a non-dict (a bare string / list / int
+        # that slipped past an upstream bound-only edge guard) yields an EMPTY
+        # (invalid) primer, never an AttributeError — so a malformed primer
+        # answers un-grounded, never 500s the chat turn (the consumer injects
+        # this BEFORE its try/except; defense-in-depth, not trusting the BFF's
+        # shape guard alone).
+        d = data if isinstance(data, dict) else {}
         return cls(
             brief_date=str(d.get("brief_date", "") or ""),
             section_id=str(d.get("section_id", "") or ""),

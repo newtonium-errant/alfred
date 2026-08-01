@@ -2147,3 +2147,19 @@ async def test_invalid_primer_bad_date_falls_back_ungrounded(web_client) -> None
     )
     assert r.status == 200
     assert await _turn_user_text(web_client, headers, sk) == "hello"  # no injection
+
+
+async def test_non_dict_primer_fails_soft_no_500(web_client) -> None:
+    """Defense-in-depth: a NON-DICT primer (bypassing the BFF's bound-only
+    object guard) must fail-soft to an un-grounded turn — never a 500. The
+    consumer parses the primer BEFORE its run_turn try/except, so a bare-string
+    primer would AttributeError-500 without the from_dict isinstance guard."""
+    headers = _session_headers()
+    sk = await _open(web_client, headers)
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": sk, "message": "hello", "primer": "not-an-object"},
+        headers=headers,
+    )
+    assert r.status == 200  # NOT 500
+    assert await _turn_user_text(web_client, headers, sk) == "hello"  # un-grounded

@@ -52,3 +52,15 @@ def test_from_dict_tolerates_missing_keys() -> None:
     p = PlayerContextPrimer.from_dict(None)
     assert not p.valid  # empty → invalid, no crash
     assert PlayerContextPrimer.from_dict({"brief_date": "2026-08-01"}).section_id == ""
+
+
+def test_from_dict_tolerates_non_dict() -> None:
+    """A non-dict primer (a bare string / list / int slipping past an upstream
+    bound-only guard) → EMPTY invalid primer, NEVER an AttributeError — so the
+    consumer answers un-grounded instead of 500-ing the turn (defense-in-depth,
+    not trusting the BFF shape guard alone)."""
+    for bad in ("garbage", ["day_plan"], 42, 3.14, True):
+        p = PlayerContextPrimer.from_dict(bad)  # type: ignore[arg-type]
+        assert not p.valid
+        assert p.brief_date == "" and p.section_id == ""
+        assert p.context_line() == ""
