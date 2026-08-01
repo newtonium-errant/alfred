@@ -66,20 +66,33 @@ export function arcPath(cx: number, cy: number, r: number, a0: number, a1: numbe
 // Segment / ring colouring, mapped to the PWA's EXISTING status token idiom (the
 // deck already uses text-status-progress-fg / text-danger). Applied as each
 // element's text colour with stroke="currentColor" so a path can carry its own
-// colour (forward-compatible with mixed done/planned in Phase C). These literals
-// live in lib/, which the tailwind content glob now scans, so they are generated.
-//   done    → green  (a completed item — Phase C+; never live in Phase B)
-//   planned → amber  (a planned/open item — the only live segment colour in B)
-//   empty   → red    (an empty ring: nothing in the bucket)
-export type SegmentStatus = 'done' | 'planned';
+// colour. These literals live in lib/, which the tailwind content glob scans.
+//   done      → green  (a completed item)
+//   planned   → amber  (a committed, not-yet-done item — on today's plan)
+//   suggested → muted  (C2: an auto-surfaced candidate, not yet committed — a
+//               third visual class, tentative; rendered as a segment for legibility
+//               but excluded from the done/total COUNT. Colour-only for v1; a dashed
+//               stroke is a possible enhancement, operator eyes on first cut.)
+//   empty     → red    (an empty ring: nothing in the bucket)
+export type SegmentStatus = 'done' | 'planned' | 'suggested';
 
 export const RING_STROKE_CLASS = {
   done: 'text-status-done-fg',
   planned: 'text-status-progress-fg',
+  suggested: 'text-honeydew-400',
   empty: 'text-danger',
 } as const;
 
-/** The colour class for one segment given its completion (done → green, else amber). */
+/** The colour class for one segment given its C2 stage (done → green, planned → amber, suggested → muted). */
+export function segmentStageClass(stage: SegmentStatus): string {
+  return RING_STROKE_CLASS[stage];
+}
+
+/**
+ * The colour class for one segment given its completion (done → green, else amber).
+ * Delegates to `segmentStageClass` — the 2-way completion helper kept for callers
+ * that only know done/not-done; C2 stage-aware callers use `segmentStageClass`.
+ */
 export function segmentStroke(done: boolean): string {
-  return done ? RING_STROKE_CLASS.done : RING_STROKE_CLASS.planned;
+  return segmentStageClass(done ? 'done' : 'planned');
 }

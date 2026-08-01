@@ -1,4 +1,5 @@
 import type { FeedItem } from './feed';
+import { ringItemSuggested, ringTierOf } from './rings';
 
 // Feed / deck constants + pure helpers. Kept OUT of the components so the
 // gesture math, the per-kind verb map, and the display labels are unit-testable
@@ -51,6 +52,13 @@ export interface DeckVerbs {
   affirmLabel: string;
   rejectLabel: string;
   heavy: boolean;
+  /**
+   * C2 skip=park: the LEFT (reject) gesture is a CLIENT-side park (no POST), not a
+   * decline — there's no backend decline path for slots v1, so a skipped candidate
+   * may resurface. `reject` stays null (no action_id); useDeck routes the gesture to
+   * park() when this is set. Copy must never promise "won't show again."
+   */
+  rejectParks?: boolean;
 }
 
 // Heavy kinds create/mutate a durable record → a right-swipe does NOT commit;
@@ -65,11 +73,28 @@ export const DECK_VERBS: Record<string, DeckVerbs> = {
   proposal: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject', heavy: true },
   recurrence: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Promote', rejectLabel: 'Reject', heavy: true },
   pending: { affirm: 'noted', reject: null, affirmLabel: 'Noted', rejectLabel: '', heavy: false },
+  // C2 slot candidate: Accept (right, POST "accept") / Skip (left, client-park, no
+  // POST — rejectParks) / Park (up). Only SUGGESTED slots are dealt (see isDeckDealt).
+  slot_suggestion: { affirm: 'accept', reject: null, affirmLabel: 'Take it', rejectLabel: 'Skip', heavy: false, rejectParks: true },
 };
 
 /** Deck verbs for a kind, or null when the kind has no deck action mapping. */
 export function deckVerbsFor(kind: string): DeckVerbs | null {
   return Object.prototype.hasOwnProperty.call(DECK_VERBS, kind) ? DECK_VERBS[kind] : null;
+}
+
+/**
+ * Whether a feed item is DEALT to the swipe deck — the ONE predicate the deck's
+ * dealing AND the deck link/pill count both use, so "the link counts exactly what
+ * the deck deals" holds (never hand-roll a divergent count). A classic decision kind
+ * is dealt when it has a wired verb; a slot_suggestion is dealt ONLY when SUGGESTED
+ * (planned/done slots are worklist/glance items, never deck cards). A suggested slot
+ * is legitimately BOTH deck-dealt (the gesture surface) AND inline-actionable (the
+ * feed row / rings panel worklist) — same item, two surfaces.
+ */
+export function isDeckDealt(item: FeedItem): boolean {
+  if (item.kind === 'slot_suggestion') return ringItemSuggested(item);
+  return deckVerbsFor(item.kind) !== null;
 }
 
 // --- email-tier priority (on-face tier badge + dynamic affirm label) ----------
@@ -101,6 +126,11 @@ export function emailPriority(item: FeedItem): EmailPriority | null {
 export function affirmLabelFor(item: FeedItem): string | null {
   const verbs = deckVerbsFor(item.kind);
   if (!verbs || verbs.affirm === null) return null;
+  // A slot candidate's Accept carries its tier on the face — "Take it — T2".
+  if (item.kind === 'slot_suggestion') {
+    const t = ringTierOf(item);
+    return t ? `${verbs.affirmLabel} — T${t}` : verbs.affirmLabel;
+  }
   const p = emailPriority(item);
   return p ? `${verbs.affirmLabel} ${p.toUpperCase()}` : verbs.affirmLabel;
 }

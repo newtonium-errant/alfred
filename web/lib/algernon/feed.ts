@@ -23,6 +23,11 @@ export interface FeedItem {
   evidence: Record<string, unknown>;
   actions: Array<Record<string, unknown>>;
   state: string;
+  // The VERB stamped on the last state event (C2): "accept" | "done" | undefined
+  // (legacy / pre-C2 store items). Discriminates the state=acted overload — a C2
+  // accept and a C1b completion both set state=acted, so the verb (not the stale
+  // evidence.candidate flag) decides the stage. Absent → legacy DONE.
+  acted_action?: string | null;
   created_at: string;
   acted_at: string | null;
   expires_at: string | null;
@@ -37,12 +42,25 @@ export interface FeedListResponse {
 // POST /api/feed/act result (the B1 ActResult.to_dict shape). `status` is the
 // machine code (acted | acked | already_acted | stale_item | invalid_action |
 // error); `detail` is the human line (the resolver's own message where it has one).
+//
+// `render` is the C2 slot-ACCEPT committed payload — present ONLY on an accept
+// success (the router sets it in _dispatch_slot_confirm and to_dict emits it only
+// when non-None; ABSENT on already_acted / invalid_action / error / every other
+// action). The FE gates its optimistic candidate→planned flip on render being
+// PRESENT (never on status alone) — absent render → refetch/reconcile, never a lie.
+export interface FeedActRender {
+  tier: number;
+  name: string;
+  committed: boolean;
+}
+
 export interface FeedActResult {
   ok: boolean;
   status: string;
   detail: string;
   id: string;
   action_id: string;
+  render?: FeedActRender;
 }
 
 export interface FeedListParams {

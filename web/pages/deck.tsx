@@ -6,7 +6,7 @@ import { Deck } from '../components/feed/Deck';
 import { authApi } from '../lib/algernon/authClient';
 import Link from 'next/link';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { deckVerbsFor } from '../lib/algernon/feedConstants';
+import { isDeckDealt } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle } from '../lib/typography';
@@ -99,12 +99,12 @@ export default function DeckPage() {
     router.replace('/login');
   }, [router]);
 
-  // The deck only deals kinds with a WIRED verb (DECK_VERBS). A decide-mode kind
-  // whose acts aren't built yet (slot_suggestion → the board, Phase C) has no
-  // verbs, so it must never enter the stack as a card that's dead to every
-  // gesture. Filter client-side; the API contract is untouched.
+  // The deck deals only isDeckDealt items — classic decisions + SUGGESTED slots (C2).
+  // A non-deck-dealt decide item (a PLANNED slot — committed, awaiting its ✓) is a
+  // worklist item, not a deck card; it lives on the Feed / rings. Filter client-side;
+  // the API contract is untouched.
   const actionable = useMemo(
-    () => (items ?? []).filter((it) => deckVerbsFor(it.kind) !== null),
+    () => (items ?? []).filter(isDeckDealt),
     [items],
   );
   const unactionableCount = (items?.length ?? 0) - actionable.length;
@@ -153,12 +153,12 @@ export default function DeckPage() {
         )}
 
         {items != null && !error && actionable.length === 0 && unactionableCount > 0 && (
-          // ILB: empty because the open decisions are NOT-YET-actionable here —
-          // distinct from "done". Their surfaces (e.g. the board) are still being
-          // built, so they live on the Feed for now, not as dead deck cards.
+          // ILB: nothing to SWIPE, but there are non-deck-dealt open items — PLANNED
+          // slots (committed, awaiting their ✓). Those are worklist items, actionable
+          // inline on the Feed / rings, not deck cards.
           <p data-testid="deck-unactionable" className={`mt-6 ${subtle}`}>
-            {unactionableCount} item{unactionableCount > 1 ? 's are' : ' is'} waiting on surfaces
-            still being built — see the{' '}
+            {unactionableCount} item{unactionableCount > 1 ? 's are' : ' is'} on your worklist —
+            complete {unactionableCount > 1 ? 'them' : 'it'} on the{' '}
             <Link href="/feed" className="underline underline-offset-2">
               Feed
             </Link>

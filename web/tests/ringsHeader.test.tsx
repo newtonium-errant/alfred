@@ -297,3 +297,58 @@ describe('RingsHeader — task lane (C1b: completable, done-only)', () => {
     expect(screen.queryByTestId('ring-undo')).not.toBeNull();
   });
 });
+
+describe('RingsHeader — C2 SUGGESTED stage (candidate cards)', () => {
+  // A completable routine candidate (so an accept→planned flip shows the live ✓).
+  const suggested = (over: Partial<FeedItem> = {}) =>
+    slot({
+      id: 'sug',
+      attention: 'needs_you',
+      evidence: { tier: 1, origin: 'routine_item', routine_record: 'routine/SelfCare.md', item_text: 'Meditate', name: 'Meditate', candidate: true },
+      ...over,
+    });
+
+  it('a SUGGESTED item shows Accept (no ✓), a MUTED segment, and "N suggested" — excluded from the count', () => {
+    const { container } = render(<RingsHeader items={[suggested()]} />);
+    // Muted (suggested) ring segment, not amber/green.
+    expect(container.querySelector('[data-testid="ring-1"] path')?.getAttribute('class')).toContain('text-honeydew-400');
+    fireEvent.click(screen.getByTestId('ring-1'));
+    expect(screen.queryByTestId('ring-accept')).not.toBeNull();
+    expect(screen.queryByTestId('ring-complete')).toBeNull(); // candidates aren't completable
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-stage')).toBe('suggested');
+    expect(screen.getByTestId('ring-panel-1').textContent).toContain('1 suggested'); // committed count is 0
+  });
+
+  it('mixed suggested + planned: 2 segments, count "0/1 done" (candidate excluded from the denominator)', () => {
+    const { container } = render(<RingsHeader items={[suggested({ id: 'sug' }), routineSlot({ id: 'plan' })]} />);
+    expect(container.querySelectorAll('[data-testid="ring-1"] path')).toHaveLength(2);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    expect(screen.getByTestId('ring-panel-1').textContent).toContain('0/1'); // committed=1 (the planned one)
+    expect(screen.queryByTestId('ring-accept')).not.toBeNull();
+    expect(screen.queryByTestId('ring-complete')).not.toBeNull();
+  });
+
+  it('accepting a suggested item POSTs "accept" and optimistically flips it to PLANNED (render-present)', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'sug', action_id: 'accept', render: { tier: 1, name: 'Meditate', committed: true } });
+    render(<RingsHeader items={[suggested({ id: 'sug' })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    await act(async () => { fireEvent.click(screen.getByTestId('ring-accept')); });
+    await flushAct();
+    expect(mockAct).toHaveBeenCalledWith('sug', 'accept');
+    // Flipped to planned: Accept gone, a live ✓ (routine lane) shown.
+    expect(screen.queryByTestId('ring-accept')).toBeNull();
+    expect(screen.queryByTestId('ring-complete')).not.toBeNull();
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-stage')).toBe('planned');
+  });
+
+  it('an accept that returns NO render does not flip (reconciles) — the item stays suggested', async () => {
+    // ← the render-present gate at the surface: already_acted / render-absent → no flip.
+    mockAct.mockResolvedValue({ ok: true, status: 'already_acted', id: 'sug', action_id: 'accept' });
+    render(<RingsHeader items={[suggested({ id: 'sug' })]} />);
+    fireEvent.click(screen.getByTestId('ring-1'));
+    await act(async () => { fireEvent.click(screen.getByTestId('ring-accept')); });
+    await flushAct();
+    expect(screen.getByTestId('ring-panel-item').getAttribute('data-stage')).toBe('suggested');
+    expect(screen.queryByTestId('ring-accept')).not.toBeNull();
+  });
+});

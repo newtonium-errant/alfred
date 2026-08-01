@@ -158,10 +158,10 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
         <button
           type="button"
           data-testid="deck-btn-reject"
-          aria-label="Reject"
-          disabled={!current || confirming || !verbs?.reject}
+          aria-label={verbs?.rejectLabel || 'Reject'}
+          disabled={!current || confirming || !(verbs?.reject || verbs?.rejectParks)}
           onClick={deck.reject}
-          className="flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] border-danger p-3 text-danger disabled:opacity-30"
+          className={`flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] p-3 disabled:opacity-30 ${verbs?.rejectParks ? 'border-status-progress-fg text-status-progress-fg' : 'border-danger text-danger'}`}
         >
           ✕
         </button>

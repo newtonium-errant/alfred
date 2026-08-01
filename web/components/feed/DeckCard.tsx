@@ -1,6 +1,7 @@
 import { forwardRef } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
 import { affirmLabelFor, deckVerbsFor, emailPriority, kindLabel, HEAVY_KINDS, type EmailPriority } from '../../lib/algernon/feedConstants';
+import { ringTierOf } from '../../lib/algernon/rings';
 import { evidenceBody, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import { EvidenceBody } from './EvidenceBody';
 
@@ -43,6 +44,11 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
   // no badge + the plain verb.
   const priority = emailPriority(item);
   const affirmLabel = affirmLabelFor(item);
+  // C2 slot candidate face: the tier on a badge + the WHY (surface_reason) on the
+  // face, so the card carries its own claim (no blind swipe).
+  const slotTier = item.kind === 'slot_suggestion' ? ringTierOf(item) : null;
+  const rawWhy = item.kind === 'slot_suggestion' ? (item.evidence as Record<string, unknown> | null | undefined)?.surface_reason : null;
+  const whyText = typeof rawWhy === 'string' && rawWhy.trim() ? rawWhy : null;
   // Prose body (generic — any kind's evidence.body) also makes the card expandable.
   const hasDetails = rows.length > 0 || evidenceBody(item.evidence) !== null;
 
@@ -74,6 +80,15 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
             {priority}
           </span>
         )}
+        {slotTier && (
+          // The candidate's tier, on the face — the decision content, not a blind swipe.
+          <span
+            data-testid="deck-slot-tier"
+            className="rounded border border-status-progress-fg px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-status-progress-fg"
+          >
+            T{slotTier}
+          </span>
+        )}
         {item.instance && (
           <span className="rounded border border-honeydew-400 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
             {item.instance}
@@ -87,6 +102,13 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
       </div>
 
       <h2 className="mb-1.5 shrink-0 text-lg font-extrabold leading-snug text-honeydew-700">{item.title || item.id}</h2>
+
+      {whyText && (
+        // The WHY, on the face (surface_reason) — the card's own claim for being here.
+        <p data-testid="deck-slot-why" className="mb-1.5 shrink-0 text-xs italic text-honeydew-600">
+          {whyText}
+        </p>
+      )}
 
       {hasDetails && (
         <button
@@ -123,8 +145,8 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
       )}
 
       <div className="mt-auto flex shrink-0 items-center justify-between pt-3 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
-        <span className={verbs?.reject ? 'text-danger' : 'text-honeydew-400'}>
-          {verbs?.reject ? `← ${verbs.rejectLabel}` : '—'}
+        <span className={verbs?.reject ? 'text-danger' : verbs?.rejectParks ? 'text-status-progress-fg' : 'text-honeydew-400'}>
+          {verbs?.reject || verbs?.rejectParks ? `← ${verbs.rejectLabel}` : '—'}
         </span>
         <span className="text-status-progress-fg">↑ Park</span>
         <span className={verbs?.affirm ? 'text-honeydew-600' : 'text-honeydew-400'}>
@@ -134,10 +156,10 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
 
       {/* Verdict stamps — Deck sets their opacity imperatively during a drag. */}
       <span data-stamp="affirm" className="pointer-events-none absolute right-4 top-4 rotate-[-8deg] rounded border-2 border-honeydew-600 px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-honeydew-600 opacity-0">
-        {priority ? affirmLabel : heavy ? 'Review' : 'Yes'}
+        {priority ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : heavy ? 'Review' : 'Yes'}
       </span>
       <span data-stamp="reject" className="pointer-events-none absolute left-4 top-4 rotate-[8deg] rounded border-2 border-danger px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-danger opacity-0">
-        No
+        {verbs?.rejectParks ? 'Skip' : 'No'}
       </span>
       <span data-stamp="park" className="pointer-events-none absolute left-1/2 top-4 -ml-10 rounded border-2 border-status-progress-fg px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-status-progress-fg opacity-0">
         Park

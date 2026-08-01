@@ -4,6 +4,7 @@ import {
   RING_GAP_DEG,
   RING_STROKE_CLASS,
   ringSegments,
+  segmentStageClass,
   segmentStroke,
 } from '../lib/algernon/ringGeometry';
 
@@ -74,5 +75,20 @@ describe('segment colouring', () => {
     expect(RING_STROKE_CLASS.empty).toBe('text-danger');
     const all = new Set([RING_STROKE_CLASS.done, RING_STROKE_CLASS.planned, RING_STROKE_CLASS.empty]);
     expect(all.size).toBe(3);
+  });
+
+  it('C2 segmentStageClass maps all three stages to distinct colours (suggested = muted)', () => {
+    expect(segmentStageClass('done')).toBe(RING_STROKE_CLASS.done);
+    expect(segmentStageClass('planned')).toBe(RING_STROKE_CLASS.planned);
+    expect(segmentStageClass('suggested')).toBe(RING_STROKE_CLASS.suggested);
+    expect(RING_STROKE_CLASS.suggested).toBe('text-honeydew-400');
+    // Four distinct classes across the full stage + empty set (no colour collision).
+    const all = new Set([RING_STROKE_CLASS.done, RING_STROKE_CLASS.planned, RING_STROKE_CLASS.suggested, RING_STROKE_CLASS.empty]);
+    expect(all.size).toBe(4);
+  });
+
+  it('segmentStroke(done) delegates to the stage class (2-way completion helper)', () => {
+    expect(segmentStroke(true)).toBe(segmentStageClass('done'));
+    expect(segmentStroke(false)).toBe(segmentStageClass('planned'));
   });
 });

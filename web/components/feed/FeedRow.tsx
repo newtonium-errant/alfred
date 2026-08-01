@@ -1,14 +1,16 @@
 import type { FeedItem } from '../../lib/algernon/feed';
 import { kindLabel } from '../../lib/algernon/feedConstants';
 import { evidenceBody, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
-import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, ringItemUndoable } from '../../lib/algernon/rings';
+import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, ringItemStage, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
 import type { UseRingCompletionResult } from './useRingCompletion';
+import type { UseSlotAcceptResult } from './useSlotAccept';
 import { EvidenceBody } from './EvidenceBody';
 
 // One feed row. Content is escaped React text only (evidence is untrusted display
 // data — no innerHTML, no href). The right-hand affordance is one of: an Ack
-// (FYI rows), the SAME per-lane completion control the rings panel uses (slot rows
-// — via the shared useRingCompletion, never a second implementation), or nothing.
+// (FYI rows), or the SAME per-STAGE slot affordance the rings panel uses (slot rows
+// — SUGGESTED→Accept / PLANNED→✓ / DONE→marker+undo, via the shared hooks, never a
+// second implementation), or nothing.
 
 export interface FeedRowProps {
   item: FeedItem;
@@ -17,24 +19,43 @@ export interface FeedRowProps {
   /** Present → an Ack button (FYI rows). */
   onAck?: () => void;
   /**
-   * Present → this is a completable slot row: render the live ✓ / done+undo /
-   * honest-note affordance driven by the SHARED completion hook (the identical
-   * per-lane logic the rings panel uses). Takes precedence over onAck.
+   * Present → this is a slot row: render the per-STAGE affordance (SUGGESTED→Accept /
+   * PLANNED→✓ / DONE→marker+undo) driven by the SHARED hooks (the identical per-lane
+   * logic the rings panel uses). Takes precedence over onAck.
    */
   completion?: UseRingCompletionResult;
+  /**
+   * Present alongside `completion` → the C2 accept hook, driving the SUGGESTED
+   * candidate's [Accept] control + its optimistic candidate→planned flip.
+   */
+  accept?: UseSlotAcceptResult;
 }
 
-export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion }: FeedRowProps) {
+export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, accept }: FeedRowProps) {
   const rows = evidenceRows(item.evidence);
   // A digest/prose body (peer_digest et al.) also makes the row expandable, even
   // when it has no key:value rows of its own.
   const hasBody = evidenceBody(item.evidence) !== null;
   const hasDetails = rows.length > 0 || hasBody;
-  const done = completion ? completion.effectiveDone(item) : false;
+  // C2 stage seam (mirrors RingsHeader.effectiveStage): completion-done > accept-
+  // committed(planned) > base stage; an optimistic UNDO (raw done, override not-done)
+  // returns the row to PLANNED.
+  const stage: RingItemStage | null = completion
+    ? completion.effectiveDone(item)
+      ? 'done'
+      : accept?.accepted(item.id)
+        ? 'planned'
+        : ringItemStage(item) === 'done'
+          ? 'planned'
+          : ringItemStage(item)
+    : null;
+  const done = stage === 'done';
+  const suggested = stage === 'suggested';
   const busy = completion ? completion.busy(item.id) : false;
+  const acceptBusy = accept ? accept.busy(item.id) : false;
   const completable = completion ? ringItemCompletable(item) : false;
   const undoable = completion ? ringItemUndoable(item) : false;
-  const completionError = completion ? completion.errorFor(item.id) : null;
+  const completionError = (completion ? completion.errorFor(item.id) : null) ?? (accept ? accept.errorFor(item.id) : null);
   return (
     <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
       <div className="flex items-start justify-between gap-3">
@@ -66,7 +87,7 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion }:
         </div>
 
         {completion ? (
-          // Slot completion — the SAME per-lane affordance as the rings panel.
+          // Slot — the SAME per-STAGE affordance as the rings panel.
           done ? (
             <div className="flex shrink-0 items-center gap-1.5">
               <span data-testid="feed-row-done" className="text-[10px] font-bold uppercase tracking-wider text-status-done-fg">
@@ -84,6 +105,19 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion }:
                 </button>
               )}
             </div>
+          ) : suggested ? (
+            // SUGGESTED — an auto-surfaced candidate not yet on the plan. The one
+            // affordance is Accept (commit it); NO ✓. Optimistic candidate→planned on
+            // a render-bearing 200 (useSlotAccept's render-present gate).
+            <button
+              type="button"
+              data-testid="feed-row-accept"
+              disabled={acceptBusy || !accept}
+              onClick={() => accept?.accept(item)}
+              className="shrink-0 rounded-lg border border-honeydew-500 bg-honeydew-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+            >
+              {acceptBusy ? '…' : 'Accept'}
+            </button>
           ) : completable ? (
             <button
               type="button"
