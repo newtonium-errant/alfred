@@ -11,6 +11,7 @@ import type {
   NotificationsResponse,
 } from './types';
 import type { ImageAttachment, IngestBody } from './schemas';
+import type { PlayerPrimer } from './player';
 
 // BROWSER-side chat client. Talks ONLY to the same-origin BFF (`/api/chat/*`),
 // never the transport directly — the BFF holds the peer token + relays the
@@ -29,6 +30,11 @@ export interface ChatTurnOptions {
   // Carried screenshots (parity #29). Sent as `images` on the turn/stream body;
   // absent / empty ⇒ a text-only turn (byte-identical to the pre-feature path).
   images?: ImageAttachment[];
+  // Player-ask on-screen context (C3c). Sent as `primer` on the turn body — the BFF
+  // relays it verbatim; the backend validity-gates it (PlayerContextPrimer) and grounds
+  // the answer on the slide, or answers un-grounded if invalid. Only the /player ask
+  // sends it; a normal /chat turn omits it (byte-identical to the pre-feature path).
+  primer?: PlayerPrimer;
 }
 
 export const chatApi = {
@@ -50,6 +56,8 @@ export const chatApi = {
       ...(opts.instance ? { instance: opts.instance } : {}),
       ...(opts.idempotencyKey ? { idempotency_key: opts.idempotencyKey } : {}),
       ...(opts.images && opts.images.length ? { images: opts.images } : {}),
+      // Player-ask primer (C3c) — non-streamed turn only (the answer is one text card).
+      ...(opts.primer ? { primer: opts.primer } : {}),
     }),
   history: (sessionKey: string, instance?: string): Promise<ChatHistoryResponse> =>
     getJson<ChatHistoryResponse>(

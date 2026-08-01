@@ -7,18 +7,22 @@ import { authApi } from '../lib/algernon/authClient';
 import { fetchAudio, fetchNarration, type NarrationResult, type PlayerAudioState } from '../lib/algernon/briefPlayer';
 import { narrationSlides, slideAtFraction, slideDeepLink } from '../lib/algernon/player';
 import { usePlayer } from '../components/player/usePlayer';
+import { usePlayerAsk } from '../components/player/usePlayerAsk';
 import { useMediaSession } from '../components/player/useMediaSession';
+import { VoiceCapture } from '../components/chat/VoiceCapture';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
-// The interruptible briefing player (C3b). Renders the narration as slides, plays the
-// cached audio when available, and degrades to TEXT-ALONG when it isn't — never a broken
-// play button. play / pause / ask / resume-at-position ride the usePlayer state machine
-// (interruption is first-class); Media Session mirrors the controls to lock-screen/car.
-// The ask surface is a clearly-scoped STUB here (C3c wires STT + the chat primer).
+// The interruptible briefing player (C3b + C3c). Renders the narration as slides, plays
+// the cached audio when available, and degrades to TEXT-ALONG when it isn't — never a
+// broken play button. play / pause / ask / resume-at-position ride the usePlayer state
+// machine (interruption is first-class); Media Session mirrors the controls to
+// lock-screen/car. The ask surface (C3c) wires a real chat turn: mic (STT) or keyboard →
+// a turn carrying the on-screen primer (brief_date + the PAUSED slide's section) → the
+// assistant's answer as a text card → resume at the held instant.
 
 export default function PlayerPage() {
   const router = useRouter();
@@ -29,6 +33,8 @@ export default function PlayerPage() {
   const [audio, setAudio] = useState<PlayerAudioState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [unauthenticated, setUnauthenticated] = useState(false);
+  // The ask surface's keyboard input (C3c) — always live; the STT "Use" prefills it.
+  const [question, setQuestion] = useState('');
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const objectUrlRef = useRef<string | null>(null);
 
@@ -79,9 +85,37 @@ export default function PlayerPage() {
     () => (narration && 'narration' in narration ? narrationSlides(narration.narration) : []),
     [narration],
   );
+  // The brief being played (for the ask primer) — present whenever slides are.
+  const briefDate = useMemo(
+    () => (narration && 'narration' in narration ? narration.narration.brief_date : null),
+    [narration],
+  );
   const player = usePlayer(slides);
+  const playerAsk = usePlayerAsk({ onAuthExpired });
   const hasAudio = audio?.kind === 'audio';
   const { state, position, currentSlide, slideCount } = player;
+
+  // A fresh ask surface each time it closes: clear the input once an answer lands.
+  useEffect(() => {
+    if (playerAsk.status === 'answered') setQuestion('');
+  }, [playerAsk.status]);
+
+  // Ask carries the on-screen primer — brief_date + the CURRENT (paused) slide's section,
+  // not slide 0 (position is held across the asking state). Invalid primer ⟹ the backend
+  // answers un-grounded (fail-soft), so an absent slide/date still sends a real question.
+  const submitAsk = useCallback(async () => {
+    const q = question.trim();
+    if (!q || playerAsk.sending) return;
+    await playerAsk.ask(q, { brief_date: briefDate ?? '', section_id: currentSlide?.sectionId ?? '' });
+  }, [question, playerAsk, briefDate, currentSlide]);
+
+  // Resume from the ask surface: clear the ask (superseding any in-flight turn) + the
+  // input, then return the machine to the held instant.
+  const onResume = useCallback(() => {
+    playerAsk.reset();
+    setQuestion('');
+    player.resume();
+  }, [playerAsk, player]);
 
   // Mirror the state machine onto the <audio> element (the machine is the source of
   // truth; asking/paused both pause the audio, so resume continues from the held instant).
@@ -253,19 +287,69 @@ export default function PlayerPage() {
               </div>
             )}
 
-            {/* The ask surface — FIRST-CLASS interruption. C3c wires STT + the chat primer;
-                v1 shows the surface + the honest stub so the state is real, not a stop. */}
+            {/* The ask surface — FIRST-CLASS interruption (C3c): mic (STT) or keyboard →
+                a real chat turn carrying the on-screen primer → the assistant's answer as
+                a text card → resume at the held instant. The keyboard stays live even when
+                STT fails (VoiceCapture shows its own honest "type it instead"). */}
             {state === 'asking' && (
               <div data-testid="player-ask" className="mt-3 rounded-xl border border-honeydew-300 bg-honeydew-50 p-4">
-                <p className="text-sm font-semibold text-honeydew-700">Paused — ask about this slide.</p>
-                <p data-testid="player-ask-stub" className={`mt-1 text-xs ${subtle}`}>
-                  Voice &amp; chat answers arrive with the next update. Resume when you&rsquo;re ready.
+                <p className="text-sm font-semibold text-honeydew-700">
+                  Paused{currentSlide ? ` — ask about ${currentSlide.title}` : ' — ask a question'}.
                 </p>
+
+                {/* Keyboard — ALWAYS live (the primary type path AND the STT-fail fallback). */}
+                <textarea
+                  data-testid="player-ask-input"
+                  aria-label="Ask about this slide"
+                  rows={2}
+                  value={question}
+                  disabled={playerAsk.sending}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  className="mt-2 w-full rounded-lg border border-honeydew-300 bg-white px-3 py-2 text-sm text-honeydew-700 disabled:opacity-60"
+                />
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="player-ask-send"
+                    disabled={playerAsk.sending || question.trim().length === 0}
+                    onClick={() => void submitAsk()}
+                    className="rounded-lg border border-honeydew-600 bg-honeydew-600 px-4 py-2 text-xs font-bold uppercase tracking-wider text-cream disabled:opacity-40"
+                  >
+                    Ask
+                  </button>
+                  {playerAsk.sending && (
+                    // Intentionally-left-blank: an explicit working signal, not a dead UI.
+                    <span data-testid="player-ask-sending" className={`text-xs ${subtle}`}>
+                      Asking…
+                    </span>
+                  )}
+                </div>
+
+                {/* Mic — reuses VoiceCapture (record → STT → editable review); Use prefills
+                    the input above so the operator confirms the transcript before it sends. */}
+                <div className="mt-3">
+                  <VoiceCapture idPrefix="player-ask-voice" onTranscript={(t) => setQuestion(t)} disabled={playerAsk.sending} />
+                </div>
+
+                {/* Error — the keyboard above stays live to retry (honest, no dead mic). */}
+                {playerAsk.error && (
+                  <p role="alert" data-testid="player-ask-error" className="mt-2 text-sm text-danger">
+                    {playerAsk.error}
+                  </p>
+                )}
+
+                {/* The answer — a TEXT card in-player (answer-TTS is boarded, not built). */}
+                {playerAsk.answer != null && (
+                  <div data-testid="player-ask-answer" className="mt-3 rounded-lg border border-honeydew-200 bg-cream p-3 text-sm text-honeydew-700">
+                    {playerAsk.answer}
+                  </div>
+                )}
+
                 <button
                   type="button"
                   data-testid="player-resume"
-                  onClick={player.resume}
-                  className="mt-3 rounded-lg border border-honeydew-600 bg-honeydew-600 px-4 py-2 text-xs font-bold uppercase tracking-wider text-cream"
+                  onClick={onResume}
+                  className="mt-3 rounded-lg border border-honeydew-400 px-4 py-2 text-xs font-bold uppercase tracking-wider text-honeydew-700"
                 >
                   Resume
                 </button>
