@@ -10,17 +10,34 @@ import {
   RING_STROKE_WIDTH,
   RING_VIEWBOX,
   ringSegments,
-  segmentStroke,
+  segmentStageClass,
 } from '../../lib/algernon/ringGeometry';
-import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, ringItemUndoable, tierRingBuckets, type RingBucket } from '../../lib/algernon/rings';
+import {
+  COMPLETION_UNAVAILABLE_HINT,
+  ringItemCompletable,
+  ringItemStage,
+  ringItemUndoable,
+  tierRingBuckets,
+  type RingBucket,
+  type RingItemStage,
+} from '../../lib/algernon/rings';
 import { useRingCompletion } from './useRingCompletion';
+import { useSlotAccept } from './useSlotAccept';
 
 // The segmented "balanced day" rings header. Three tier rings (T1/T2/T3) from
-// open `slot_suggestion` items (see lib/algernon/rings.ts for why tier). Tap a
-// ring to expand its bucket; tap a row for its evidence. Phase C: the panel's ✓
-// completes an item per-lane (task + routine + free-text T3 wired; unknown/
-// unstamped-origin stays honestly disabled) — optimistic green on success, single-
-// step undo on done rows (task is done-only: no board undo, see rings.ts).
+// `slot_suggestion` items (see lib/algernon/rings.ts for why tier). Tap a ring to
+// expand its bucket; tap a row for its evidence.
+//
+// Phase C2 — three STAGES per the scope-first matrix, one seam (`effectiveStage`):
+//   SUGGESTED (candidate, not on the plan) → an [Accept] control (useSlotAccept),
+//     rendered as a MUTED ring segment, EXCLUDED from the done/total count.
+//   PLANNED (committed, open) → the C1b ✓ (task/routine/T3 wired; unknown disabled),
+//     an AMBER segment, counted in the denominator.
+//   DONE → a green marker + single-step undo where board-undoable, a GREEN segment,
+//     the numerator.
+// Optimistic overlays: a completed item flips green (useRingCompletion), an accepted
+// candidate flips candidate→PLANNED (useSlotAccept, render-present gated) — both honest
+// degrades that reconcile at the next fetch.
 
 export interface RingsHeaderProps {
   /** 401 handler (bubbles a session expiry to the host page, like the deck/feed). */
@@ -29,7 +46,7 @@ export interface RingsHeaderProps {
    * Composition / test seam: when provided, these items are rendered directly
    * and the internal fetch is skipped (the composer can share one feed load).
    * The set may include today's DONE (state=acted) slot items — the rings show
-   * planned + done all day (`tierRingBuckets` date-scopes the acted ones).
+   * suggested + planned + done all day (`tierRingBuckets` date-scopes + dedups).
    */
   items?: FeedItem[];
   /** Test seam: "now" for the today date-scope (defaults to the real clock). */
@@ -44,6 +61,7 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
   const [openItemId, setOpenItemId] = useState<string | null>(null);
   const [showDone, setShowDone] = useState(false);
   const completion = useRingCompletion({ onAuthExpired });
+  const accept = useSlotAccept({ onAuthExpired });
   const now = useMemo(() => nowProp ?? new Date(), [nowProp]);
 
   useEffect(() => {
@@ -74,6 +92,20 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
   const totalItems = useMemo(() => buckets.reduce((n, b) => n + b.items.length, 0), [buckets]);
   const activeBucket = useMemo(() => buckets.find((b) => b.key === openKey) ?? null, [buckets, openKey]);
 
+  // The single stage seam for rendering: a completion optimistic-done wins, then an
+  // accept optimistic-committed (candidate→planned) overlays, else the base stage.
+  // An optimistic UNDO (completion says not-done while the raw stage is still done —
+  // the item hasn't reconciled yet) returns the item to PLANNED, not its raw done.
+  const effectiveStage = useCallback(
+    (it: FeedItem): RingItemStage => {
+      if (completion.effectiveDone(it)) return 'done';
+      if (accept.accepted(it.id)) return 'planned';
+      const base = ringItemStage(it);
+      return base === 'done' ? 'planned' : base;
+    },
+    [completion, accept],
+  );
+
   const toggleRing = useCallback((key: string) => {
     setOpenItemId(null);
     setShowDone(false);
@@ -83,18 +115,23 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
     setOpenItemId((cur) => (cur === id ? null : id));
   }, []);
 
-  // One worklist row — used for both the remaining (not-done) list and the
-  // revealed done list. Its ✓ / done+undo / disabled affordance is per-lane.
+  // One worklist row — used for the remaining (suggested + planned) list and the
+  // revealed done list. Affordance is per STAGE: Accept (suggested) / ✓ (planned) /
+  // done+undo (done).
   const renderItem = (it: FeedItem) => {
-    const done = completion.effectiveDone(it);
+    const stage = effectiveStage(it);
+    const done = stage === 'done';
+    const suggested = stage === 'suggested';
     const completable = ringItemCompletable(it);
     const undoable = ringItemUndoable(it);
-    const busy = completion.busy(it.id);
-    const itemError = completion.errorFor(it.id);
+    const compBusy = completion.busy(it.id);
+    const acceptBusy = accept.busy(it.id);
+    const itemError = completion.errorFor(it.id) ?? accept.errorFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
+    const dotClass = done ? 'bg-status-done-fg' : suggested ? 'bg-honeydew-400' : 'bg-status-progress-fg';
     return (
-      <li key={it.id} data-testid="ring-panel-item" data-done={done} className="border-t border-dashed border-honeydew-200 pt-2 first:border-0 first:pt-0">
+      <li key={it.id} data-testid="ring-panel-item" data-done={done} data-stage={stage} className="border-t border-dashed border-honeydew-200 pt-2 first:border-0 first:pt-0">
         <div className="flex items-start justify-between gap-2">
           <button
             type="button"
@@ -103,10 +140,7 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
             aria-expanded={expanded}
             className="flex min-w-0 flex-1 items-start gap-2 text-left"
           >
-            <span
-              aria-hidden
-              className={`mt-1 h-2 w-2 shrink-0 rounded-full ${done ? 'bg-status-done-fg' : 'bg-status-progress-fg'}`}
-            />
+            <span aria-hidden className={`mt-1 h-2 w-2 shrink-0 rounded-full ${dotClass}`} />
             <span className={`min-w-0 break-words text-sm font-semibold text-honeydew-700 ${done ? 'line-through opacity-70' : ''}`}>
               {it.title || it.id}
             </span>
@@ -124,30 +158,42 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
                 <button
                   type="button"
                   data-testid="ring-undo"
-                  disabled={busy}
+                  disabled={compBusy}
                   onClick={() => completion.undo(it)}
                   className="rounded-lg border border-honeydew-300 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-600 disabled:opacity-50"
                 >
-                  {busy ? '…' : 'Undo'}
+                  {compBusy ? '…' : 'Undo'}
                 </button>
               )}
             </div>
+          ) : suggested ? (
+            // SUGGESTED — an auto-surfaced candidate NOT yet on the plan. The one
+            // affordance is Accept (commit it); NO ✓ (candidates aren't completable
+            // until committed). Optimistic candidate→planned on a render-bearing 200.
+            <button
+              type="button"
+              data-testid="ring-accept"
+              disabled={acceptBusy}
+              onClick={() => accept.accept(it)}
+              className="shrink-0 rounded-lg border border-honeydew-500 bg-honeydew-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+            >
+              {acceptBusy ? '…' : 'Accept'}
+            </button>
           ) : completable ? (
-            // A LIVE control — this lane has a wired writer.
+            // PLANNED + a wired writer — a LIVE ✓.
             <button
               type="button"
               data-testid="ring-complete"
-              disabled={busy}
+              disabled={compBusy}
               onClick={() => completion.complete(it)}
               className="shrink-0 rounded-lg border border-honeydew-400 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
             >
-              {busy ? '…' : '✓ Done'}
+              {compBusy ? '…' : '✓ Done'}
             </button>
           ) : (
-            // Non-completable lane (unknown / unstamped origin — task is completable
-            // now, see rings.ts) — honestly DISABLED. The `disabled` attr AND
-            // `opacity-50` are pinned together so un-disabling forces a conscious
-            // restyle.
+            // PLANNED, non-completable lane (unknown / unstamped origin) — honestly
+            // DISABLED. The `disabled` attr AND `opacity-50` are pinned together so
+            // un-disabling forces a conscious restyle.
             <button
               type="button"
               data-testid="ring-complete"
@@ -201,7 +247,7 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
           </p>
         ) : (
           buckets.map((b) => (
-            <Ring key={b.key} bucket={b} active={openKey === b.key} isDone={completion.effectiveDone} onTap={() => toggleRing(b.key)} />
+            <Ring key={b.key} bucket={b} active={openKey === b.key} stageOf={effectiveStage} onTap={() => toggleRing(b.key)} />
           ))
         )}
       </div>
@@ -216,32 +262,34 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
       {activeBucket &&
         (() => {
           const bucketItems = activeBucket.items;
-          const doneItems = bucketItems.filter(completion.effectiveDone);
-          const notDone = bucketItems.filter((it) => !completion.effectiveDone(it));
+          const doneItems = bucketItems.filter((it) => effectiveStage(it) === 'done');
+          const notDone = bucketItems.filter((it) => effectiveStage(it) !== 'done');
+          // COMMITTED = planned + done (the count denominator); SUGGESTED excluded.
+          const committedCount = bucketItems.filter((it) => effectiveStage(it) !== 'suggested').length;
           return (
             <div data-testid={`ring-panel-${activeBucket.key}`} className="mt-2 rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
-              {/* Honest ratio over the full (planned + done-today) set: "T2 · 1/1 DONE". */}
+              {/* Honest header: the committed ratio ("T2 · 1/2 done"), or — when nothing
+                  is committed yet, only candidates — the suggested count. */}
               <h3 className="text-xs font-bold uppercase tracking-wider text-honeydew-700">
-                {activeBucket.label} · {doneItems.length}/{bucketItems.length} done
+                {activeBucket.label} · {committedCount > 0 ? `${doneItems.length}/${committedCount} done` : `${bucketItems.length} suggested`}
               </h3>
 
               {bucketItems.length === 0 ? (
-                // Genuinely nothing planned in this tier (the red-empty ring).
+                // Genuinely nothing in this tier (the red-empty ring).
                 <p data-testid="ring-panel-empty" className="mt-2 text-xs text-honeydew-600">
                   Empty — nothing in this tier yet. Suggestions arrive with each sync.
                 </p>
               ) : (
                 <>
                   {notDone.length > 0 ? (
-                    // The WORKLIST — remaining items only, by default.
+                    // The WORKLIST — remaining (suggested + planned) items, by default.
                     <ul data-testid="ring-panel-worklist" className="mt-2 flex flex-col gap-2">
                       {notDone.map(renderItem)}
                     </ul>
                   ) : (
-                    // A WIN — everything planned is done. Distinct from the red-empty
-                    // "nothing planned" language the operator's screenshot showed.
+                    // A WIN — everything committed is done (no suggested, no planned left).
                     <p data-testid="ring-panel-all-done" className="mt-2 text-xs font-semibold text-status-done-fg">
-                      All {bucketItems.length} done ✓
+                      All {committedCount} done ✓
                     </p>
                   )}
 
@@ -273,18 +321,19 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
   );
 }
 
-// One ring: n segments (amber = planned, green = done) or, for an empty bucket,
-// a faint red circle. A tap toggles the bucket panel. `isDone` is threaded from
-// the completion state so a just-completed segment goes green optimistically.
+// One ring: n segments (muted = suggested, amber = planned, green = done) or, for an
+// empty bucket, a faint red circle. A tap toggles the bucket panel. `stageOf` is
+// threaded from the render seam so a just-accepted/-completed segment recolours
+// optimistically.
 function Ring({
   bucket,
   active,
-  isDone,
+  stageOf,
   onTap,
 }: {
   bucket: RingBucket;
   active: boolean;
-  isDone: (item: FeedItem) => boolean;
+  stageOf: (item: FeedItem) => RingItemStage;
   onTap: () => void;
 }) {
   const n = bucket.items.length;
@@ -320,7 +369,7 @@ function Ring({
               stroke="currentColor"
               strokeWidth={RING_STROKE_WIDTH}
               strokeLinecap="round"
-              className={segmentStroke(isDone(bucket.items[i]))}
+              className={segmentStageClass(stageOf(bucket.items[i]))}
             />
           ))
         )}
