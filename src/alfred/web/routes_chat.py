@@ -1267,6 +1267,7 @@ def register_web_routes(
 
     register_brief_audio_routes(app)
     mounted_routes.append("/web/brief/audio")
+    mounted_routes.append("/web/brief/narration")
 
     # Notification routes (/chat/notifications*) — parity #22 KAL-LE ticket
     # → PWA notify, POLL slice. Default-ON (web.notifications.enabled; the

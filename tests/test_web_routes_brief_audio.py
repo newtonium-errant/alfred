@@ -251,3 +251,33 @@ async def test_speed_out_of_range_clamped(client_with_tts, tmp_path, monkeypatch
     resp = await client_with_tts.get("/web/brief/audio?speed=9.9", headers=_session_headers())
     assert resp.status == 200
     assert spy.calls[0]["speed"] == 1.2  # clamped to max
+
+
+# --- narration JSON route (slides source) -----------------------------------
+
+
+async def test_narration_json_served(client_with_tts, tmp_path) -> None:
+    """The slides route returns the sectioned narration dict (no synth)."""
+    _spool_narration(tmp_path / "data", text="You have three things on today's plan.")
+    resp = await client_with_tts.get("/web/brief/narration", headers=_session_headers())
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["brief_date"] == DATE
+    assert body["segments"][0]["section_id"] == "day_state"
+    assert body["segments"][0]["text"] == "You have three things on today's plan."
+    assert body["empty"] is False
+
+
+async def test_narration_json_no_brief_ilb(client_with_tts) -> None:
+    resp = await client_with_tts.get("/web/brief/narration", headers=_session_headers())
+    assert resp.status == 200
+    assert (await resp.json()) == {"state": "no_brief"}
+
+
+async def test_narration_json_wrong_peer_rejected(aiohttp_client, tmp_path) -> None:
+    data_dir = tmp_path / "data"; data_dir.mkdir()
+    _spool_narration(data_dir)
+    client = await aiohttp_client(_build(tmp_path, str(data_dir), with_tts=True))
+    resp = await client.get("/web/brief/narration", headers=_ingest_session_headers())
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "wrong_peer"

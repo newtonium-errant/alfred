@@ -68,23 +68,35 @@ def _resolve_speed(raw: str | None) -> float | None:
     return max(_SPEED_MIN, min(_SPEED_MAX, speed))
 
 
-def _load_spooled_narration(data_dir, ) -> tuple[str, str] | None:
-    """Return ``(brief_date, full_text)`` from the spooled narration, or None
-    when nothing is spooled / the payload is corrupt / the narration is empty.
-    ``full_text`` joins the segment texts (the single-shot synth input)."""
+def _read_spooled_narration_dict(data_dir) -> dict | None:
+    """Return the parsed narration payload dict from the spool, or None when
+    nothing is spooled / the payload is corrupt. The dict is the
+    ``BriefNarration.to_dict`` shape ({brief_date, segments, total_words,
+    empty})."""
     latest = read_latest(data_dir, NARRATION_KIND)
     if latest is None:
         return None
     try:
         payload = json.loads(latest.get("markdown") or "")
-        segments = payload.get("segments") or []
-        full_text = "\n\n".join(
-            str(s.get("text") or "") for s in segments if s.get("text")
-        ).strip()
-        brief_date = str(payload.get("brief_date") or latest.get("date") or "")
     except (ValueError, TypeError, AttributeError):
         log.warning("web.brief_audio.corrupt_narration")
         return None
+    if not isinstance(payload, dict):
+        return None
+    # Backfill brief_date from the spool sidecar if the payload omitted it.
+    if not payload.get("brief_date"):
+        payload["brief_date"] = str(latest.get("date") or "")
+    return payload
+
+
+def _spooled_full_text(payload: dict) -> tuple[str, str] | None:
+    """From a narration payload dict, return ``(brief_date, full_text)`` (the
+    single-shot synth input) or None when empty / dateless."""
+    segments = payload.get("segments") or []
+    full_text = "\n\n".join(
+        str(s.get("text") or "") for s in segments if isinstance(s, dict) and s.get("text")
+    ).strip()
+    brief_date = str(payload.get("brief_date") or "")
     if not full_text or not brief_date:
         return None
     return brief_date, full_text
@@ -113,7 +125,8 @@ async def _handle_brief_audio(request: web.Request) -> web.StreamResponse:
 
     # (3) Read the spooled narration.
     data_dir = request.app.get(KEY_WEB_DATA_DIR)
-    loaded = _load_spooled_narration(data_dir)
+    payload = _read_spooled_narration_dict(data_dir)
+    loaded = _spooled_full_text(payload) if payload is not None else None
     if loaded is None:
         log.info("web.brief_audio.no_brief", user=identity.user)
         return web.json_response({"state": "no_brief"})  # ILB 200
@@ -161,10 +174,39 @@ async def _handle_brief_audio(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def _handle_brief_narration(request: web.Request) -> web.StreamResponse:
+    """GET /web/brief/narration — the sectioned narration JSON the player renders
+    slides from (no synth, no cache — a cheap read of the daemon-spooled model).
+
+    Same peer-pin + identity as the audio route. Returns the ``BriefNarration``
+    dict ({brief_date, segments, total_words, empty}); an absent / corrupt spool
+    is the intentionally-left-blank ``200 {state:"no_brief"}`` (never a 404)."""
+    peer = request.get("transport_peer", "")
+    if peer != WEB_CHAT_PEER:
+        log.warning(
+            "web.brief_narration.wrong_peer", reason="wrong_peer",
+            peer=peer or "(none)", expected=WEB_CHAT_PEER,
+        )
+        return web.json_response({"error": "wrong_peer"}, status=401)
+
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    identity = resolve_web_identity(request, web_config)
+    if identity is None:
+        return web.json_response({"error": "invalid_session"}, status=401)
+
+    data_dir = request.app.get(KEY_WEB_DATA_DIR)
+    payload = _read_spooled_narration_dict(data_dir)
+    if payload is None:
+        log.info("web.brief_narration.no_brief", user=identity.user)
+        return web.json_response({"state": "no_brief"})  # ILB 200
+    return web.json_response(payload)
+
+
 def register_brief_audio_routes(app: web.Application) -> None:
-    """Mount ``GET /web/brief/audio`` (called by ``register_web_routes``; the web
-    config, talker config, and data_dir are already stashed on the app)."""
+    """Mount ``GET /web/brief/audio`` + ``GET /web/brief/narration`` (called by
+    ``register_web_routes``; web/talker config + data_dir already stashed)."""
     app.router.add_get("/web/brief/audio", _handle_brief_audio)
+    app.router.add_get("/web/brief/narration", _handle_brief_narration)
 
 
 __all__ = ["NARRATION_KIND", "register_brief_audio_routes"]
