@@ -1258,6 +1258,16 @@ def register_web_routes(
     register_brief_routes(app)
     mounted_routes.append("/web/outbound/{kind}/latest")
 
+    # Brief-audio route (/web/brief/audio) — C3a interruptible player. Same
+    # lazy-import anti-cycle pattern; the handler peer-pins WEB_CHAT_PEER itself
+    # (routes_brief_audio.py), reads the daemon-spooled narration, synthesizes on
+    # demand via the shared telegram.tts primitive, and caches per
+    # (brief_date, content-hash, speed) — replay costs zero credits.
+    from .routes_brief_audio import register_brief_audio_routes
+
+    register_brief_audio_routes(app)
+    mounted_routes.append("/web/brief/audio")
+
     # Notification routes (/chat/notifications*) — parity #22 KAL-LE ticket
     # → PWA notify, POLL slice. Default-ON (web.notifications.enabled; the
     # store only fills when a peer sends a web_notify-tagged notice). The

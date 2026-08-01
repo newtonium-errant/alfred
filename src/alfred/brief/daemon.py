@@ -164,6 +164,45 @@ def _spool_brief_web_outbound(config: BriefConfig, today: str, content: str) -> 
         )
 
 
+async def _spool_brief_narration(config: BriefConfig, today: str, now_local) -> None:
+    """Best-effort spool of the day's SPEAKABLE narration (C3a) for the player's
+    on-demand audio route.
+
+    STRUCTURED build only — NO synthesis here (ElevenLabs credits are spent only
+    when the operator opens the player; the audio route renders + caches on
+    demand). The payload is the narration JSON carried in the outbound_store
+    markdown slot (kind ``brief_narration``); the audio route reads it,
+    synthesizes, and caches per (brief_date, content-hash, speed). Swallow + log
+    exactly like the #30 brief spool — a narration failure must NEVER break the
+    brief run (mirrors ``_spool_brief_web_outbound``)."""
+    data_dir = str(Path(config.state.path).parent)
+    try:
+        import json as _json
+
+        from alfred.web.outbound_store import write_latest
+
+        from .narration import build_narration
+
+        narration = await build_narration(config, now_local, brief_date=today)
+        write_latest(
+            data_dir, "brief_narration", today, _json.dumps(narration.to_dict()),
+        )
+        log.info(
+            "brief.narration_spooled",
+            date=today,
+            segments=len(narration.segments),
+            total_words=narration.total_words,
+            empty=narration.empty,
+        )
+    except Exception as exc:  # noqa: BLE001 — spool never kills the run
+        log.warning(
+            "brief.narration_spool_failed",
+            date=today,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+
+
 def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_local, now_local) -> None:
     """Reconcile the converted sections' feed items into the feed store.
 
@@ -467,6 +506,9 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # (nor the state update / Telegram push that follow). Shared with
     # update_weather's manual-refresh re-spool via the helper below.
     _spool_brief_web_outbound(config, today, content)
+    # C3a: spool the day's speakable narration alongside the brief (no synth) so
+    # the interruptible player's audio route can render + cache on demand.
+    await _spool_brief_narration(config, today, now_local)
 
     # Update state
     state_mgr.state.add_run(BriefRun(
