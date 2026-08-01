@@ -15,6 +15,7 @@ Coverage (mandatory regression pins, run unconditionally):
 from __future__ import annotations
 
 import pytest
+import structlog
 
 from alfred.transport.config import (
     DEFAULT_RECALL_MAX_MATCHES,
@@ -26,6 +27,7 @@ from alfred.transport.config import (
     is_stayc_peer_name,
     load_from_unified,
 )
+from alfred.vault.schema import TYPE_REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +161,88 @@ def test_recall_tolerates_unknown_peer_rule_keys() -> None:
 def test_recall_non_dict_block_yields_default() -> None:
     assert _build_recall("not-a-dict") == RecallConfig()
     assert _build_recall(None) == RecallConfig()
+
+
+# ---------------------------------------------------------------------------
+# Allowlist type validation — DROP-unknown-with-WARN (the traversal wall)
+# ---------------------------------------------------------------------------
+
+
+def test_recall_drops_unknown_type_with_warn() -> None:
+    with structlog.testing.capture_logs() as captured:
+        r = _build_recall({
+            "enabled": True,
+            "peers": {"kal-le": {"types": ["person", "notarealtype"]}},
+        })
+    # Unknown type dropped; the real one survives (fail-SAFE narrowing).
+    assert r.peers["kal-le"].types == ["person"]
+    drops = [c for c in captured if c.get("event") == "transport.recall.unknown_type_dropped"]
+    assert len(drops) == 1
+    assert drops[0]["type"] == "notarealtype"
+    assert drops[0]["peer"] == "kal-le"
+
+
+def test_recall_drops_path_traversal_type_at_load() -> None:
+    # THE traversal wall: a "../"-style type is not a known record type, so
+    # it is dropped at load and can never compose into the vault_search glob.
+    with structlog.testing.capture_logs() as captured:
+        r = _build_recall({
+            "enabled": True,
+            "peers": {"kal-le": {"types": ["person", "../", "../../etc"]}},
+        })
+    assert r.peers["kal-le"].types == ["person"]
+    dropped_types = {
+        c["type"] for c in captured
+        if c.get("event") == "transport.recall.unknown_type_dropped"
+    }
+    assert dropped_types == {"../", "../../etc"}
+
+
+def test_recall_surviving_types_are_all_known() -> None:
+    r = _build_recall({
+        "enabled": True,
+        "peers": {"kal-le": {"types": ["person", "project", "task", "bogus"]}},
+    })
+    valid = TYPE_REGISTRY.known_types(None)
+    assert set(r.peers["kal-le"].types) <= valid
+    assert r.peers["kal-le"].types == ["person", "project", "task"]
+
+
+def test_recall_scope_gates_per_instance_types() -> None:
+    # ``article`` is a hypatia-scope type — NOT canonical. It must survive
+    # when the instance scope is hypatia, and drop under the canonical set.
+    r_hyp = _build_recall(
+        {"enabled": True, "peers": {"kal-le": {"types": ["note", "article"]}}},
+        instance_scope="hypatia",
+    )
+    assert r_hyp.peers["kal-le"].types == ["note", "article"]
+
+    r_canon = _build_recall(
+        {"enabled": True, "peers": {"kal-le": {"types": ["note", "article"]}}},
+    )
+    assert r_canon.peers["kal-le"].types == ["note"]
+
+
+def test_recall_scope_never_admits_clinical_note() -> None:
+    # clinical_note is STAY-C-scope ONLY — it must never validate into any
+    # non-STAY-C instance's recall allowlist (PHI containment).
+    for scope in ("", "talker", "hypatia", "kalle"):
+        r = _build_recall(
+            {"enabled": True, "peers": {"kal-le": {"types": ["clinical_note"]}}},
+            instance_scope=scope,
+        )
+        assert r.peers["kal-le"].types == []
+
+
+def test_recall_tool_set_threaded_from_load_from_unified() -> None:
+    # hypatia's tool_set selects the hypatia valid-type set at load.
+    cfg = load_from_unified({
+        "telegram": {"instance": {"name": "Hypatia", "tool_set": "hypatia"}},
+        "transport": {
+            "recall": {"enabled": True, "peers": {"kal-le": {"types": ["article"]}}}
+        },
+    })
+    assert cfg.recall.peers["kal-le"].types == ["article"]
 
 
 # ---------------------------------------------------------------------------

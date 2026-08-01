@@ -190,6 +190,22 @@ def search_recall(
     for rt in search_types:
         if len(matches) >= max_matches:
             break
+        # Glob-site path-traversal backstop (defense-in-depth). The recall
+        # allowlist is already type-validated at config load (`_build_recall`
+        # drops any non-KNOWN type incl. "../"), and `resolve_search_types`
+        # only ever emits types drawn from that validated allowlist — so this
+        # is belt-and-braces. But this is THE function where a config/request-
+        # derived string composes into a filesystem glob, so it refuses any
+        # type carrying a path separator or parent-ref rather than trusting
+        # the upstream wall (the #18 "every glob-reaching path" pattern).
+        if "/" in rt or "\\" in rt or ".." in rt:
+            log.warning(
+                "transport.recall.unsafe_type_skipped",
+                record_type=rt,
+                detail="type contains a path separator / parent-ref — "
+                       "refusing to glob (traversal backstop)",
+            )
+            continue
         try:
             hits = vault_search(
                 vault_path,

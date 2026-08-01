@@ -900,7 +900,9 @@ def _build_ingest(data: dict[str, Any]) -> IngestConfig:
     )
 
 
-def _build_recall(data: Any, *, instance_name: str = "") -> RecallConfig:
+def _build_recall(
+    data: Any, *, instance_name: str = "", instance_scope: str = "",
+) -> RecallConfig:
     """Build the optional ``recall`` block (defaults = disabled, empty).
 
     Enforces the STAY-C fence FAIL-LOUD at load (both directions):
@@ -911,6 +913,21 @@ def _build_recall(data: Any, *, instance_name: str = "") -> RecallConfig:
          dormant in a config waiting to be flipped on.
       2. If participation is enabled AND this is a STAY-C instance →
          :class:`RecallConfigError`. STAY-C may never answer.
+
+    Validates every allowlist type against the record-type registry for
+    this instance's scope (``TYPE_REGISTRY.known_types(instance_scope)`` —
+    canonical + the instance's own scope types, the SAME set the vault's
+    ``_validate_type`` gate uses). An unrecognized type is DROPPED with a
+    loud WARN — NOT fail-loud (mirrors the FilterDimRule/FILTER_OPERATORS
+    load-validation precedent above). Rationale: dropping narrows
+    disclosure (fail-SAFE — a typo makes recall answer LESS, never more),
+    whereas fail-loud would take the whole talker daemon down over a recall
+    typo; a type typo is the lesser class, so it drops while the STAY-C
+    fence (identity/safety class) stays fail-loud. This is ALSO the
+    path-traversal wall: an operator typo like ``types: ["../"]`` is not a
+    known record type, so it is dropped at load and never composes into the
+    ``vault_search`` glob (which would otherwise traverse outside the
+    vault). ``instance_scope=""`` falls back to the canonical set.
 
     ``max_matches`` is int-coerced (fallback = default) then clamped to
     :data:`RECALL_MAX_MATCHES_CEILING` and floored at 1;
@@ -930,6 +947,12 @@ def _build_recall(data: Any, *, instance_name: str = "") -> RecallConfig:
             "from its config (STAY-C answers nothing, in either direction)"
         )
 
+    # Lazy import — vault.schema is core-but-heavier; only pulled when a
+    # recall section is actually present (keeps config.py import-light).
+    from alfred.vault.schema import TYPE_REGISTRY
+
+    valid_types = TYPE_REGISTRY.known_types(instance_scope or None)
+
     peers_raw = data.get("peers", {}) or {}
     peers: dict[str, RecallPeerRules] = {}
     if isinstance(peers_raw, dict):
@@ -944,7 +967,28 @@ def _build_recall(data: Any, *, instance_name: str = "") -> RecallConfig:
             if not isinstance(rules_raw, dict):
                 continue
             types_raw = rules_raw.get("types", []) or []
-            types = [str(t) for t in types_raw if isinstance(t, str) and t.strip()]
+            types: list[str] = []
+            for t in types_raw:
+                if not isinstance(t, str) or not t.strip():
+                    continue
+                t = t.strip()
+                if t not in valid_types:
+                    # DROP-unknown-with-loud-WARN (fail-SAFE): a typo / bogus
+                    # type (incl. a path-traversal string like "../") is
+                    # never searched, never globbed. Logged so an operator
+                    # sees the drop rather than silently answering less.
+                    log.warning(
+                        "transport.recall.unknown_type_dropped",
+                        peer=str(peer_name),
+                        type=t,
+                        instance=instance_name,
+                        scope=instance_scope or "(canonical)",
+                        detail="not a known record type for this instance's "
+                               "scope — dropped from the recall allowlist "
+                               "(never searched or globbed)",
+                    )
+                    continue
+                types.append(t)
             peers[str(peer_name)] = RecallPeerRules(types=types)
 
     try:
@@ -982,7 +1026,10 @@ def _build_peers(data: dict[str, Any]) -> dict[str, PeerEntry]:
     return out
 
 
-def _build(cls: type, data: dict[str, Any], *, instance_name: str = "") -> Any:
+def _build(
+    cls: type, data: dict[str, Any], *,
+    instance_name: str = "", instance_scope: str = "",
+) -> Any:
     """Recursively construct a dataclass from a dict.
 
     The ``auth`` section has a non-trivial nested structure so we
@@ -990,9 +1037,12 @@ def _build(cls: type, data: dict[str, Any], *, instance_name: str = "") -> Any:
     dataclasses.
 
     ``instance_name`` (the persona name from ``telegram.instance.name``)
-    is threaded through only for the STAY-C recall fence — a STAY-C
-    instance that enables ``recall`` must fail loud at load
-    (:func:`_build_recall`).
+    and ``instance_scope`` (the tool-set from ``telegram.instance.tool_set``)
+    are threaded through only for the recall block: ``instance_name`` for
+    the STAY-C fence (a STAY-C instance enabling ``recall`` fails loud), and
+    ``instance_scope`` for the allowlist type-validation set (the recall
+    types are validated against ``known_types(instance_scope)`` — the same
+    per-scope set the vault's ``_validate_type`` gate uses).
     """
     if cls is TransportConfig:
         kwargs: dict[str, Any] = {}
@@ -1025,7 +1075,9 @@ def _build(cls: type, data: dict[str, Any], *, instance_name: str = "") -> Any:
         # the section is present (default RecallConfig() otherwise).
         if "recall" in data and isinstance(data["recall"], dict):
             kwargs["recall"] = _build_recall(
-                data["recall"], instance_name=instance_name,
+                data["recall"],
+                instance_name=instance_name,
+                instance_scope=instance_scope,
             )
         if "peers" in data and isinstance(data["peers"], dict):
             kwargs["peers"] = _build_peers(data["peers"])
@@ -1060,9 +1112,18 @@ def load_from_unified(raw: dict[str, Any]) -> TransportConfig:
     # instance answering recall (fence part 1, the named-peer rule, still
     # fires regardless of instance name).
     instance_name = ""
+    instance_scope = ""
     telegram = raw.get("telegram", {}) or {}
     if isinstance(telegram, dict):
         inst = telegram.get("instance", {}) or {}
         if isinstance(inst, dict):
             instance_name = str(inst.get("name", "") or "")
-    return _build(TransportConfig, tool, instance_name=instance_name)
+            # ``tool_set`` is the instance's vault scope (talker / kalle /
+            # hypatia); it selects the per-scope valid record-type set the
+            # recall allowlist is validated against.
+            instance_scope = str(inst.get("tool_set", "") or "")
+    return _build(
+        TransportConfig, tool,
+        instance_name=instance_name,
+        instance_scope=instance_scope,
+    )

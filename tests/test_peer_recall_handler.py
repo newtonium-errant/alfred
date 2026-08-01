@@ -275,6 +275,48 @@ async def test_recall_snippet_capped_and_flagged(aiohttp_client, tmp_path) -> No
 
 
 # ---------------------------------------------------------------------------
+# Path-traversal wall — glob-site backstop (defense-in-depth)
+# ---------------------------------------------------------------------------
+
+
+async def test_recall_glob_backstop_skips_traversal_type(aiohttp_client, tmp_path) -> None:
+    # Belt-and-braces: even if an unsafe type bypassed load-validation (here
+    # constructed directly), the glob-site backstop refuses to glob it — no
+    # file outside the vault is ever reached.
+    audit_path = str(tmp_path / "audit.jsonl")
+    tstate = TransportState.create(tmp_path / "state.json")
+    app = build_app(
+        _transport_config(
+            audit_path=audit_path,
+            peers={"kal-le": RecallPeerRules(types=["../", "person"])},
+        ),
+        tstate,
+    )
+    vault = _make_vault(tmp_path)
+    # A record OUTSIDE the vault a "../" glob could otherwise reach.
+    (tmp_path / "leak.md").write_text(
+        "---\ntype: person\nname: Leak\n---\nAndrew leaked\n", encoding="utf-8",
+    )
+    register_vault_path(app, vault)
+    register_instance_identity(app, name="Salem")
+    register_recall_routes(app, enabled=True, instance_name="Salem")
+    client = await aiohttp_client(app)
+
+    with structlog.testing.capture_logs() as captured:
+        resp = await client.post(
+            "/peer/recall", headers=_KALLE_HEADERS, json={"query": "Andrew"},
+        )
+    data = await resp.json()
+    paths = [m["record_pointer"]["path"] for m in data["matches"]]
+    # "person" still searched; "../" never globbed → no outside leak.
+    assert all(not p.startswith("..") for p in paths)
+    assert not any("leak" in p.lower() for p in paths)
+    assert any(p.startswith("person/") for p in paths)
+    skipped = [c for c in captured if c.get("event") == "transport.recall.unsafe_type_skipped"]
+    assert any(s.get("record_type") == "../" for s in skipped)
+
+
+# ---------------------------------------------------------------------------
 # Audit — every answer
 # ---------------------------------------------------------------------------
 
