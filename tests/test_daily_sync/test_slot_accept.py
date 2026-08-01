@@ -807,6 +807,33 @@ def test_undo_on_accepted_is_refused_no_vault_change(tmp_path: Path) -> None:
     assert store.load()[item.id].acted_action == "accept"  # unchanged
 
 
+def test_undo_on_accepted_routine_lane_binds_the_guard(tmp_path: Path) -> None:
+    """SECURITY PIN — binds the undo guard's UNIQUE lane. On the TASK lane undo
+    is already unsupported_item from C1b (done-only), so the task-lane test above
+    stays green even with the guard removed. The ROUTINE lane is the real
+    exposure: guard off, ``mark_routine_item_undone`` on a never-completed
+    (accepted, not done) item returns ``not_logged`` with ``.ok=True`` →
+    ``_slot_undo`` flips the item acted→open, CLEARS acted_action, and reports
+    "undone" — the misleading un-accept flip. This fixture reddens if the guard
+    is neutered: it asserts the refusal AND that the item stays acted+accept."""
+    vault = _vault(tmp_path)
+    record = _routine_selfcare(vault)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = [it for it in _slot_items(vault) if it.evidence.get("routine_record")][0]
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "accept")  # acted_action=accept, NOT completed
+
+    undo = _act(store, cfg, vault, item.id, "undo_done")
+
+    assert not undo.ok and undo.status == STATUS_UNSUPPORTED_ITEM  # refused
+    folded = store.load()[item.id]
+    assert folded.state == STATE_ACTED       # NOT flipped to open (guard off → open)
+    assert folded.acted_action == "accept"   # NOT cleared (guard off → None)
+    # No completion_log write either (never logged; belt-and-suspenders).
+    cl = dict(frontmatter.load(str(record)).metadata.get("completion_log") or {})
+    assert cl.get("Meditate") in (None, [])
+
+
 def test_undo_on_done_acted_reverses_completion(tmp_path: Path) -> None:
     """GATE MATRIX: undo on a DONE-acted item (accept → done → undo) reverses the
     completion normally — the accept-refusal guard does not fire (verb is
