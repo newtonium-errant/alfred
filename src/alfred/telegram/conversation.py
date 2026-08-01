@@ -1272,6 +1272,70 @@ _PEER_INTER_INSTANCE_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+# Cross-instance recall — the ASK side (#20 S2). Surfaced ONLY on instances
+# with a ``transport.recall.ask`` edge list (see ``tools_for_set``'s
+# ``recall_ask_enabled`` gate) — a non-configured instance's model never
+# sees this tool (fail-closed at the surface layer, same posture as the
+# GCal tool). Instance-agnostic wording per CLAUDE.md "Three Layers": the
+# tool description is CODE shipped to every asking instance; per-instance
+# "who can I ask + when to reach" specifics belong in the PROMPT layer
+# (SKILL.md) — the prompt-tuner pass adds the when-to-reach + attribution
+# copy after this ships (the capability-audit same-cycle rule).
+_RECALL_PEERS_TOOL = {
+    "name": "recall_peers",
+    "description": (
+        "Ask your configured peer instances to recall what THEY know about "
+        "something, when your OWN vault has come up empty. Use this after a "
+        "local vault_search / vault_read found nothing and the answer might "
+        "live on another instance (e.g. the user asks about a person, "
+        "project, or decision you have no record of), OR when the user "
+        "explicitly says 'ask <peer> about X'. Each peer searches its own "
+        "vault under its own disclosure policy and returns BOUNDED snippets "
+        "plus a source pointer — never whole records. You MUST attribute "
+        "every fact you surface from a peer to the instance it came from "
+        "(each match carries its source instance). Returns ``{status, "
+        "results: [{instance, count, matches: [{type, name, snippet, "
+        "truncated, path}]}], reached, unreachable, misconfigured, "
+        "total_matches}``. When ``total_matches`` is 0, say so honestly — "
+        "name the peers you checked. When a peer is in ``unreachable``, "
+        "tell the user you couldn't reach it (your own answer still stands); "
+        "do NOT silently omit it. This is READ-ONLY — it never writes to any "
+        "vault."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "The free-text thing to recall (a name, topic, or "
+                    "question). Plain prose; each peer substring-matches it "
+                    "against its own vault."
+                ),
+            },
+            "peer": {
+                "type": "string",
+                "description": (
+                    "Optional. Target a SINGLE configured peer by name (for "
+                    "'ask <peer> about X'). Omit to ask ALL your configured "
+                    "recall peers."
+                ),
+            },
+            "types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional record-type narrowing (e.g. ['person', "
+                    "'project']). Narrows within your configured interest set "
+                    "for the peer — you cannot broaden beyond it."
+                ),
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
 # GCal read tool. Surfaced ONLY when the active config carries
 # ``gcal.enabled: true`` — see ``tools_for_set`` for the runtime gating
 # (the schema is dropped from the tool list entirely on instances
@@ -1401,6 +1465,7 @@ def tools_for_set(
     set_name: str,
     *,
     gcal_enabled: bool = False,
+    recall_ask_enabled: bool = False,
 ) -> list[dict[str, Any]]:
     """Return the tool schema list for ``set_name`` (default ``talker``).
 
@@ -1414,17 +1479,27 @@ def tools_for_set(
     calendar read access at all'" because she literally had no
     tool for it).
 
-    Caller (``run_turn``) reads ``gcal.enabled`` off the loaded
-    GCalConfig; the schema is appended only when the operator opted
-    in. The dispatch branch in ``_execute_tool`` lazy-loads the
-    GCal client on each invocation (mirrors peer-tool pattern).
+    ``recall_ask_enabled`` (#20 S2): when True, appends ``recall_peers``
+    so the model can ask configured peers on a local miss. Default False
+    so an instance with NO ``transport.recall.ask`` edge list never
+    surfaces the tool (fail-closed at the SURFACE layer — the model can't
+    reach out from an unconfigured instance, not just a dispatch-level
+    refusal). Caller (``run_turn`` via ``_prepare_turn``) resolves it from
+    the loaded transport config; the dispatch branch lazy-loads the
+    transport config per invocation (mirrors the GCal + peer-tool pattern).
+
+    Both flags append (never mutate the registry) so subsequent calls
+    without a flag see the unaugmented list.
     """
     base = VAULT_TOOLS_BY_SET.get(set_name) or TALKER_VAULT_TOOLS
-    if not gcal_enabled:
+    extra: list[dict[str, Any]] = []
+    if gcal_enabled:
+        extra.append(_GCAL_LIST_EVENTS_TOOL)
+    if recall_ask_enabled:
+        extra.append(_RECALL_PEERS_TOOL)
+    if not extra:
         return base
-    # Append (don't mutate the registry) so subsequent calls without
-    # the flag see the unaugmented list.
-    return [*base, _GCAL_LIST_EVENTS_TOOL]
+    return [*base, *extra]
 
 
 # tool_name -> vault scope operation name
@@ -3489,6 +3564,240 @@ async def _dispatch_peer_inter_instance_tool(
         return _dumps({"error": f"unexpected error: {exc}"})
 
 
+# Cross-instance recall — the ASK side dispatch (#20 S2).
+# ---------------------------------------------------------------------------
+# ``recall_peers`` is surfaced only on instances with a
+# ``transport.recall.ask`` edge list (``tools_for_set`` gate). On a local
+# miss the model calls it; this handler fans the query out to the
+# configured peers over the S1 ``/peer/recall`` route (via the outbound
+# client), returning a STRUCTURED, per-instance-attributed, bounded result
+# the model renders. READ-ONLY by construction — it never touches a vault
+# write path (the no-write-on-recall ruling; ephemeral by default, stubs
+# are S3). Graceful degradation is explicit and DISTINCT per failure mode:
+# a peer that refuses this asker (401 wrong_peer) is a MISCONFIG (logged as
+# such), a peer that can't be reached is TRANSIENT ("offline"), and both
+# keep the asker's own answer standing — never a hang, never a silent omit.
+
+
+async def _dispatch_recall_peers_tool(
+    *,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch ``recall_peers`` → ask configured peers via /peer/recall.
+
+    Deterministic multi-peer fan-out (sorted peer order → merged, per-
+    instance-attributed result). Type-narrowing: the sent types are the
+    intersection of the model's request with THIS instance's configured
+    interest set for the peer — the asker can never widen beyond its
+    interest set. Every transport failure is caught and mapped to a
+    distinct, honest bucket; the turn never crashes on a dead peer.
+    """
+    from alfred.transport.exceptions import (
+        TransportError,
+        TransportRejected,
+        TransportServerDown,
+        TransportUnavailable,
+    )
+
+    # --- input validation ------------------------------------------------
+    if not isinstance(tool_input, dict):
+        return _dumps({"error": "recall_peers requires an object input"})
+    query = tool_input.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return _dumps({"error": "recall_peers requires a non-empty 'query'"})
+    query = query.strip()
+
+    target_peer = tool_input.get("peer")
+    target_peer = (
+        target_peer.strip()
+        if isinstance(target_peer, str) and target_peer.strip()
+        else None
+    )
+
+    model_types = tool_input.get("types")
+    if model_types is not None and not isinstance(model_types, list):
+        return _dumps({"error": "'types' must be a list of strings"})
+    model_types_clean: list[str] | None = (
+        [t for t in model_types if isinstance(t, str) and t.strip()]
+        if isinstance(model_types, list)
+        else None
+    )
+
+    # --- self identity (canonical peer name = lowercased instance name;
+    # matches the answerer's auth.tokens + recall.peers keys) -------------
+    self_name = ""
+    if config is not None and config.instance is not None:
+        self_name = (config.instance.name or "").lower()
+    if not self_name:
+        return _dumps(
+            {"error": "recall_peers: this instance has no name configured"}
+        )
+
+    # --- transport config load (daemon's OWN config path) ----------------
+    try:
+        from alfred.transport.config import load_config as load_transport_config
+        transport_config_path = (
+            config.config_path
+            if config is not None and config.config_path
+            else "config.yaml"
+        )
+        transport_config = load_transport_config(transport_config_path)
+    except FileNotFoundError as exc:
+        return _dumps(
+            {"error": "transport config unavailable for recall", "detail": str(exc)}
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as a tool error, not a crash
+        return _dumps({"error": f"transport config load failed: {exc}"})
+
+    ask_cfg = transport_config.recall.ask
+    if not ask_cfg.peers:
+        # Belt-and-braces: the tool shouldn't be surfaced without ask
+        # config, but never fan out from an unconfigured instance.
+        log.warning(
+            "talker.recall_peers.no_ask_config",
+            self_name=self_name,
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": "recall_peers not configured on this instance "
+                     "(no transport.recall.ask edges)",
+        })
+
+    # --- target selection (deterministic order) --------------------------
+    if target_peer is not None:
+        if target_peer not in ask_cfg.peers:
+            return _dumps({
+                "error": f"peer '{target_peer}' is not a configured recall peer",
+                "configured_peers": sorted(ask_cfg.peers),
+            })
+        targets = [target_peer]
+    else:
+        targets = sorted(ask_cfg.peers)
+
+    # --- fan out (NO vault writes on this path) --------------------------
+    from alfred.transport.client import peer_recall
+
+    results: list[dict[str, Any]] = []
+    reached: list[str] = []
+    unreachable: list[dict[str, str]] = []
+    misconfigured: list[dict[str, str]] = []
+    total_matches = 0
+
+    for peer in targets:
+        interest = ask_cfg.peers[peer].types
+        # Asker never widens: narrow the model's request to the interest
+        # set (when declared). Empty interest = no asker-side filter (the
+        # answerer still gates). If the model asked ONLY for types outside
+        # a declared interest set, don't ask this peer (skipping avoids the
+        # empty-list-omitted-→-widen-to-full trap).
+        if model_types_clean is not None:
+            sent_types: list[str] | None = [
+                t for t in model_types_clean if not interest or t in interest
+            ]
+            if interest and not sent_types:
+                results.append({
+                    "instance": peer, "count": 0, "matches": [],
+                    "note": "no_type_overlap",
+                })
+                continue
+        else:
+            sent_types = list(interest) if interest else None
+
+        try:
+            resp = await peer_recall(
+                peer,
+                query,
+                types=sent_types,
+                config=transport_config,
+                self_name=self_name,
+            )
+        except TransportRejected as exc:
+            # 4xx. A 401 means THIS asker is not in the peer's
+            # recall.peers allowlist (wrong_peer) — a CONFIG problem, not a
+            # transient outage. Surface it as misconfig in the logs.
+            status_code = getattr(exc, "status_code", None)
+            reason = "wrong_peer" if status_code == 401 else f"rejected_{status_code}"
+            log.warning(
+                "talker.recall_peers.misconfigured",
+                peer=peer,
+                self_name=self_name,
+                status_code=status_code,
+                reason=reason,
+                session_id=session.session_id,
+                detail="answerer refused this asker — check the peer's "
+                       "transport.recall.peers allowlist + our peer token",
+            )
+            misconfigured.append({"instance": peer, "reason": reason})
+            continue
+        except TransportServerDown as exc:
+            log.warning(
+                "talker.recall_peers.peer_down",
+                peer=peer, error=str(exc), session_id=session.session_id,
+            )
+            unreachable.append({"instance": peer, "reason": "offline"})
+            continue
+        except (TransportUnavailable, TransportError) as exc:
+            log.warning(
+                "talker.recall_peers.unavailable",
+                peer=peer, error=str(exc), session_id=session.session_id,
+            )
+            unreachable.append({"instance": peer, "reason": "unavailable"})
+            continue
+
+        reached.append(peer)
+        raw_matches = resp.get("matches") if isinstance(resp, dict) else None
+        raw_matches = raw_matches if isinstance(raw_matches, list) else []
+        rendered: list[dict[str, Any]] = []
+        for m in raw_matches:
+            if not isinstance(m, dict):
+                continue
+            ptr = m.get("record_pointer")
+            ptr = ptr if isinstance(ptr, dict) else {}
+            rendered.append({
+                "type": m.get("type", ""),
+                "name": m.get("name", ""),
+                "snippet": m.get("snippet", ""),
+                "truncated": bool(m.get("truncated", False)),
+                "path": ptr.get("path", ""),
+            })
+        # Attribution is structural: label by the answerer's self-reported
+        # instance name (falling back to the peer key we asked under).
+        source = (
+            resp.get("instance")
+            if isinstance(resp, dict) and resp.get("instance")
+            else peer
+        )
+        total_matches += len(rendered)
+        results.append({
+            "instance": source, "count": len(rendered), "matches": rendered,
+        })
+
+    # Intentionally-left-blank: reached-but-empty (total_matches == 0 with a
+    # non-empty ``reached``) and all-unreachable are DISTINCT states, both
+    # explicit in the payload so the model renders the honest copy for each.
+    log.info(
+        "talker.recall_peers.answered",
+        self_name=self_name,
+        peers_asked=targets,
+        reached=reached,
+        unreachable=[u["instance"] for u in unreachable],
+        misconfigured=[m["instance"] for m in misconfigured],
+        total_matches=total_matches,
+        session_id=session.session_id,
+    )
+    return _dumps({
+        "status": "ok",
+        "query": query,
+        "results": results,
+        "reached": reached,
+        "unreachable": unreachable,
+        "misconfigured": misconfigured,
+        "total_matches": total_matches,
+    })
+
+
 # Field-truncation cap for the GCal description payload. Calendar
 # event descriptions can carry meeting agendas, Zoom join blurbs,
 # multi-paragraph context. The model only needs enough to answer
@@ -3537,6 +3846,38 @@ def _resolve_gcal_enabled_for_run_turn(config: TalkerConfig) -> bool:
         return False
     except Exception as exc:  # noqa: BLE001
         log.debug("talker.gcal_resolve_enabled_failed", error=str(exc))
+        return False
+
+
+def _resolve_recall_ask_enabled_for_run_turn(config: TalkerConfig) -> bool:
+    """Lazy-resolve whether this instance has a ``recall.ask`` edge list.
+
+    Used by ``_prepare_turn`` to decide whether to surface the
+    ``recall_peers`` tool (#20 S2). Lazy-loads the transport config from
+    the daemon's own config path (NOT the default ``config.yaml`` — a
+    Hypatia daemon started with ``--config config.hypatia.yaml`` must read
+    ITS edge list, the same P0 fix as the peer-tool dispatcher).
+
+    Returns True iff ``transport.recall.ask.peers`` is non-empty — fail-
+    closed: any load failure (missing file, parse error, STAY-C fence
+    raising) returns False so the tool is NOT surfaced (an instance that
+    can't prove it has recall-ask edges never reaches out). A STAY-C
+    config would raise :class:`RecallConfigError` from the loader here;
+    swallowing it to False is correct — STAY-C surfaces no recall tool.
+    """
+    config_path = (
+        config.config_path
+        if config is not None and config.config_path
+        else "config.yaml"
+    )
+    try:
+        from alfred.transport.config import load_config as load_transport_config
+        transport_config = load_transport_config(config_path)
+        return bool(transport_config.recall.ask.peers)
+    except FileNotFoundError:
+        return False
+    except Exception as exc:  # noqa: BLE001 — fail-closed: no tool surfaced
+        log.debug("talker.recall_ask_resolve_enabled_failed", error=str(exc))
         return False
 
 
@@ -4312,6 +4653,17 @@ async def _execute_tool(
     }:
         return await _dispatch_peer_inter_instance_tool(
             tool_name=tool_name,
+            tool_input=tool_input,
+            session=session,
+            config=config,
+        )
+
+    # Cross-instance recall ask-side (#20 S2). Surfaced only when this
+    # instance has a transport.recall.ask edge list; the dispatcher
+    # re-checks (belt-and-braces) and returns {"error": ...} shapes that
+    # match the rest of the dispatcher. READ-ONLY (no vault write path).
+    if tool_name == "recall_peers":
+        return await _dispatch_recall_peers_tool(
             tool_input=tool_input,
             session=session,
             config=config,
@@ -5142,8 +5494,14 @@ def _prepare_turn(
     # without calendar reads), matching the pre-feature behaviour
     # for any instance that doesn't carry a gcal block.
     gcal_enabled = _resolve_gcal_enabled_for_run_turn(config)
+    # Recall ask-side (#20 S2): surface ``recall_peers`` only when this
+    # instance has a ``transport.recall.ask`` edge list (fail-closed —
+    # unconfigured instances never see the tool).
+    recall_ask_enabled = _resolve_recall_ask_enabled_for_run_turn(config)
     instance_tools = tools_for_set(
-        config.instance.tool_set, gcal_enabled=gcal_enabled,
+        config.instance.tool_set,
+        gcal_enabled=gcal_enabled,
+        recall_ask_enabled=recall_ask_enabled,
     )
     return _TurnPrep(
         capture=False,

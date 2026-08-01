@@ -472,6 +472,22 @@ transport:
   #       types: [person, project, task, decision, note, org, routine, session]
   #     hypatia:
   #       types: [note, session]
+  #   # ASK side (#20 S2) — who THIS instance may ASK on a local miss. The
+  #   # talker surfaces a `recall_peers` tool ONLY when this block is
+  #   # present + non-empty (fail-closed: no `ask` = never asks, tool never
+  #   # shown to the model). Each peer name must be a key under
+  #   # `transport.peers` (base_url + token). `types` is this instance's
+  #   # interest set for that peer — a courtesy narrowing applied before the
+  #   # request leaves; the asker can never widen beyond it, and the
+  #   # answerer's own `recall.peers` allowlist is the hard gate regardless.
+  #   # STAY-C may neither be listed here nor set `ask` on its own config
+  #   # (fails loud at load, both directions).
+  #   ask:
+  #     peers:
+  #       kal-le:
+  #         types: [person, project, task, decision, note]
+  #       hypatia:
+  #         types: [note]
 
   # Salem-only: per-peer canonical record permissions (Phase A inter-
   # instance comms). Each peer gets a per-record-type field allowlist.
