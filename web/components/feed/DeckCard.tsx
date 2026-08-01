@@ -2,7 +2,7 @@ import { forwardRef } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
 import { affirmLabelFor, deckVerbsFor, emailPriority, kindLabel, HEAVY_KINDS, type EmailPriority } from '../../lib/algernon/feedConstants';
 import { ringTierOf } from '../../lib/algernon/rings';
-import { evidenceBody, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
+import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import { EvidenceBody } from './EvidenceBody';
 
 // Presentational deck card. All content is rendered as React text children
@@ -49,8 +49,10 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
   const slotTier = item.kind === 'slot_suggestion' ? ringTierOf(item) : null;
   const rawWhy = item.kind === 'slot_suggestion' ? (item.evidence as Record<string, unknown> | null | undefined)?.surface_reason : null;
   const whyText = typeof rawWhy === 'string' && rawWhy.trim() ? rawWhy : null;
-  // Prose body (generic — any kind's evidence.body) also makes the card expandable.
-  const hasDetails = rows.length > 0 || evidenceBody(item.evidence) !== null;
+  // Prose body (generic — any kind's evidence.body) OR a safe external link (the
+  // email "Open in Gmail" deep-link, #26) also makes the card expandable.
+  const hasDetails =
+    rows.length > 0 || evidenceBody(item.evidence) !== null || evidenceExternalLink(item.evidence) !== null;
 
   return (
     <div

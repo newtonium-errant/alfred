@@ -12,8 +12,18 @@ export interface EvidenceRow {
 }
 
 // Keys hidden from the key:value rows: internal plumbing, plus `body`/`truncated`
-// which render as PROSE (evidenceBody / <EvidenceBody>), not a one-line row.
-const HIDDEN_KEYS: ReadonlySet<string> = new Set(['item_number', 'body', 'truncated']);
+// which render as PROSE (evidenceBody / <EvidenceBody>), not a one-line row. The
+// email-tier fields (#26) are hidden too: `body`/`body_truncated` drive the prose +
+// "more" cue, `gmail_url` renders as the "Open in Gmail" anchor, and `message_id` is
+// internal plumbing (the raw id, not display) — none belong as a raw key:value row.
+const HIDDEN_KEYS: ReadonlySet<string> = new Set([
+  'item_number',
+  'body',
+  'truncated',
+  'body_truncated',
+  'message_id',
+  'gmail_url',
+]);
 
 // Digest/long-form body is capped at 4000 chars by the producer; mirror that as a
 // defensive display cap (the body scrolls within its container either way).
@@ -25,11 +35,11 @@ export interface EvidenceBodyContent {
 }
 
 /**
- * The multiline prose body of an item's evidence (peer_digest et al.), or null
- * when absent/empty. `truncated` mirrors the producer flag — the body may also
- * end with a literal `…[truncated]` marker; both are honoured (the marker renders
- * inline, the flag drives the "full text in the Brief" affordance). Generic: ANY
- * kind's `evidence.body` surfaces this way. Untrusted display text — the caller
+ * The multiline prose body of an item's evidence (peer_digest, email_tier, et al.),
+ * or null when absent/empty. Truncation is flagged by EITHER `truncated` (peer_digest)
+ * OR `body_truncated` (email_tier, #26) — both mean "the body prose was clipped"; the
+ * body may also end with a literal `…[truncated]` marker (honoured inline). Generic:
+ * ANY kind's `evidence.body` surfaces this way. Untrusted display text — the caller
  * renders it as escaped React children, never markup.
  */
 export function evidenceBody(evidence: unknown): EvidenceBodyContent | null {
@@ -37,7 +47,35 @@ export function evidenceBody(evidence: unknown): EvidenceBodyContent | null {
   const ev = evidence as Record<string, unknown>;
   const raw = ev.body;
   if (typeof raw !== 'string' || raw.trim().length === 0) return null;
-  return { text: raw.slice(0, MAX_BODY_CHARS), truncated: ev.truncated === true };
+  const truncated = ev.truncated === true || ev.body_truncated === true;
+  return { text: raw.slice(0, MAX_BODY_CHARS), truncated };
+}
+
+// The one host a feed-evidence external link may point at: the server-built Gmail
+// deep-link (#26). Kept as a strict prefix allowlist — see evidenceExternalLink.
+const GMAIL_URL_PREFIX = 'https://mail.google.com/';
+
+export interface EvidenceExternalLink {
+  href: string;
+  label: string;
+}
+
+/**
+ * A safe external link for the evidence surface, or null. The ONLY current source is
+ * the email-tier `gmail_url` (#26) — a SERVER-built deep-link the card renders as an
+ * "Open in Gmail" anchor.
+ *
+ * SECURITY (the deliberate, scoped exception to the #22 no-href-from-item-data rule,
+ * blessed by team-lead): the href is rendered VERBATIM — never reconstructed client-side
+ * — and is gated by a strict `https://mail.google.com/` prefix allowlist. Anything else
+ * (a javascript:/data: scheme, another host, a non-string) → null → NO anchor rendered.
+ * So a hostile or malformed value can never become a clickable href.
+ */
+export function evidenceExternalLink(evidence: unknown): EvidenceExternalLink | null {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return null;
+  const raw = (evidence as Record<string, unknown>).gmail_url;
+  if (typeof raw !== 'string' || !raw.startsWith(GMAIL_URL_PREFIX)) return null;
+  return { href: raw, label: 'Open in Gmail' };
 }
 
 // A compact, human-ish label for an evidence key (snake_case → Title words).
