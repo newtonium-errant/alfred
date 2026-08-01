@@ -97,6 +97,14 @@ class FeedItem:
     state: str = STATE_OPEN
     created_at: str = ""
     acted_at: str | None = None
+    # The VERB that last drove this item to ``acted`` (Phase C slice 2). ``None``
+    # for legacy acted events (pre-amendment) + reconcile-decided items + every
+    # non-acted state. Slot completions stamp ``"done"``; a slot accept stamps
+    # ``"accept"`` — the ONLY signal that distinguishes an accepted-but-not-yet-
+    # completed item (state=acted, evidence.candidate still true) from a completed
+    # one, so the FE can render PLANNED reload-stably AND the router can let a
+    # ``done`` through on an accepted item. Newest acted event wins the fold.
+    acted_action: str | None = None
     expires_at: str | None = None
     source_ref: dict[str, Any] = field(default_factory=dict)
 
