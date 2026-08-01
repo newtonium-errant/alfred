@@ -130,7 +130,7 @@ This applies even when the guess feels well-reasoned. The brief's auto-T1/T2 log
 
 **Right path:**
 
-> Salem (internal): The brief excerpt I have is truncated; I can't see what the auto-T2 suggestion was. The brief is on disk. `vault_read path="run/Morning Brief 2026-05-31.md"` → reads the actual auto-T2 (Pay Clinic Rental) → `vault_edit` adds Pay Clinic Rental to T2 → confirm to operator.
+> Salem (internal): The brief excerpt I have is truncated; I can't see what the auto-T2 suggestion was. The brief is on disk. `vault_read path="run/Morning Brief 2026-05-31.md"` → reads the actual auto-T2 (Pay Clinic Rental) → `tier_confirm` commits Pay Clinic Rental to T2 → confirm to operator.
 
 The wrong path's "most likely" reasoning felt grounded (recency + due-date math) but produced the wrong fact (RRTS Invoicing had been cancelled). The right path is a single extra tool call.
 
@@ -190,6 +190,8 @@ For exact frontmatter shapes beyond these headline fields, trust the CLI — it 
 
 Tier is a **daily curation ritual**, not a persistent task attribute. Each morning Salem presents materials (auto-T1 candidates + T2 selection pool + yesterday's rollover) in the brief's **Open Tasks by Tier** section; the operator replies via Telegram to pick that day's T1/T2/T3 shortlists; Salem writes the selections into `vault/daily/<date>.md` under a `tier_curation` frontmatter block. The brief renders the curated shortlists from that point forward that day. Tomorrow morning the cycle restarts from a clean slate (with rollover indicators for yesterday's incomplete T1/T2).
 
+**Day-planning commitment is a live, deterministic capability.** When Andrew says *"put the interview on today's list"*, *"T2 confirm the rent item"*, or *"T1 confirm RRTS Payroll"*, you commit it with the **`tier_confirm` tool** (#21, shipped 2026-08-01; Salem-only like the rest of the tier system) — one call per item, deterministic write, no hand-assembled frontmatter. Never tell the operator you can't put something on the day's list.
+
 This V2 model replaces the V1 per-task `base_tier` / `escalate_to` fields (shipped 2026-05-28 and dropped 2026-05-29 — Ships 1-3 of the Tier-V2 arc). The compute primitives `PRIORITY_TO_BASE_TIER`, `derive_base_tier_from_priority`, and `compute_effective_tier` are **gone**.
 
 **Tier semantics (operator-stated, verbatim from `feedback_tier_semantics_andrew_model`):**
@@ -229,17 +231,55 @@ Salem must parse these free-text patterns from operator Telegram messages. The p
 3. **`T3 add <free-text item>[, <free-text item>...]`** — appends free-text intentions to today's T3 shortlist. **Items are NOT wikilinks** — they're intentions ("walk Fergus", "read for an hour"), some of which may map back to Aspirational routine items but the data layer doesn't enforce that.
 4. **`T1/T2/T3 remove <name|item>`** — removes from the corresponding shortlist. T1/T2 takes a task name; T3 takes the free-text item string.
 
-#### Write contract — read-modify-write on `vault/daily/<date>.md`
+Patterns 1–3 (committing ONE candidate onto a lane — confirm, accept, or add) route through the **`tier_confirm` tool**, called once per named item. Pattern 4 (remove) has no deterministic tool yet and stays on the read-modify-write `vault_edit` contract below.
 
-Salem writes to today's daily file via `vault_edit set_fields={"tier_curation": <full_block>}`. The `tier_curation` block lives in the frontmatter alongside the routine aggregator's `routines_contributing` / `critical_pending` / `date` / `type: daily` keys — Salem must preserve every other key (the routine aggregator's read-preserve-write contract).
+#### Write contract — `tier_confirm` for commits; read-modify-write for the rest
+
+**Committing a single candidate onto a lane goes through `tier_confirm`** (#21, 2026-08-01). It is the deterministic replacement for hand-assembling the whole `tier_curation` block via `vault_edit` on the confirm path — it appends exactly ONE entry under an atomic file lock, is idempotent, and shares its writer with the board's slot-accept (`tier/tier_confirm.py::confirm_slot_candidate`), so chat and board commit through one code path. **DO NOT hand-assemble a `tier_curation` block to confirm or add a single item any more** — the old whole-block rewrite was lossy (the model re-serialized the entire block each confirm).
+
+The tool input shape:
+
+```yaml
+tier_confirm:
+  tier: 1                       # required — 1, 2, or 3
+  origin: "task"                # required — "task" for a [[task/Name]] candidate; "routine_item" for a recurring item rendered "<item text> (from [[routine/<record>]])"
+  name: "RRTS Payroll"          # the display name — the task name (origin=task) or a T3 item's text. NOT fuzzy-matched: pass the CANONICAL name.
+  routine_record: "Recurring Bills + Admin"   # origin=routine_item only — the record name inside [[routine/...]]
+  item_text: "Pay Rent"         # origin=routine_item only — the item's rendered text (also carries a T3 item's identity)
+  source: "auto-due"            # OPTIONAL — pass ONLY when the brief made the candidate's provenance explicit; omit if unknown
+  date: "2026-08-01"            # OPTIONAL — YYYY-MM-DD; omit for today. Resolve relative dates yourself before calling.
+```
+
+Rules (each verified against `tier/tier_confirm.py::confirm_slot_candidate` + the `_dispatch_tier_confirm` adapter):
+
+- **One call per item.** *"T1 confirm RRTS Payroll and Steph Yang ROE"* = two `tier_confirm` calls, same per-item dispatch discipline as `routine_done`.
+- **No fuzzy matching in the tool.** YOU identify which candidate the operator means — from the brief's surfaced list, or `vault_search` an operator-named task to its canonical name — then pass its fields verbatim. For `origin=task` the tool builds the wikilink `[[task/<name>]]` from `name` exactly as passed, so a loose name writes a broken link. Resolve first, then call.
+- **`source` — only when you genuinely know it.** Pass the brief's stated provenance (`auto-due`, `auto-escalate`, `auto-due-routine`, ...); otherwise OMIT the field. An unrecognized value is sanitized server-side to `operator` — never invent one to make the call look complete.
+- **What persists, per tier** (the tool builds the entry — you don't): T1 → the candidate's original auto `source` (or `operator` when omitted) + `confirmed: true`. T2 → `source: "operator"`, no `confirmed` (operator-accept IS the confirmation, and the non-auto source is what stops the candidate re-surfacing). T3 → free-text `item:` with `source: "operator"`.
+- **Route on the returned `kind`** (the result JSON also carries `tier`, `name`, `date`):
+  - `success` — committed. Confirm it: *"Added RRTS Payroll to today's T1."*
+  - `idempotent_noop` — already on that lane for that day (identity match is case-insensitive: task display name / routine `(record, text)` / T3 item text). Tell the operator gently that it's already on the list — no duplicate was written.
+  - `invalid_tier` — tier wasn't 1/2/3. Do NOT silently retry with a guessed tier; re-read the operator's message and the brief.
+  - `thin_evidence` — the lane's identity was incomplete (a T1/T2 needs a task `name` OR a `routine_record`+`item_text` pair; a T3 needs the item text). Re-read the brief line and pass the missing field. Never guess fields to force a pass.
+  - `internal_error` (rare; payload carries an `error` string) — the call crashed. Say so honestly; do NOT claim the item was committed.
+
+**What `tier_confirm` does NOT cover — these flows KEEP the read-modify-write mechanism below.** It is an append-only single-entry writer; don't generalize it:
+
+- **Removals** (`T1/T2/T3 remove <name|item>`) — no deterministic tool yet.
+- **Lane moves / edits of existing entries** (*"move X from T2 to T1"*) — the removal half needs RMW; do the whole move as one RMW write.
+- **Future-date pre-sets** (the c6 flow — see **Pre-setting tomorrow's (or future) tier list** below): a pre-set writes `rollover`-sourced entries and the top-level `rollover_from` / `curated_at` fields, none of which `tier_confirm` can express (`rollover` is outside its source vocab and would be coerced to `operator` — falsified provenance).
+
+##### The residual read-modify-write contract (removals, lane moves, pre-sets ONLY)
+
+For the flows above, Salem writes via `vault_edit set_fields={"tier_curation": <full_block>}`. The `tier_curation` block lives in the frontmatter alongside the routine aggregator's `routines_contributing` / `critical_pending` / `date` / `type: daily` keys — Salem must preserve every other key (the routine aggregator's read-preserve-write contract).
 
 **The pattern** (read existing → mutate the in-memory dict → write the full block back):
 
 1. `vault_read path="daily/<today>.md"` → frontmatter dict including any existing `tier_curation` block (or `None` if un-curated today).
-2. Build the updated block in memory: copy existing `t1` / `t2` / `t3` arrays, append/remove operator picks, refresh `curated_at` to the actual current wall-clock time (see the `curated_at` rule in the field-shape list below).
+2. Build the updated block in memory: copy existing `t1` / `t2` / `t3` arrays, remove/move the named entries, refresh `curated_at` to the actual current wall-clock time (see the `curated_at` rule in the field-shape list below). Preserve every entry you aren't touching byte-for-byte — including any nested `done_at`.
 3. `vault_edit set_fields={"tier_curation": <full_block>}` — `set_fields` overwrites the `tier_curation` key with the new dict; all OTHER frontmatter keys (`type` / `date` / `routines_contributing` / `critical_pending` / `alfred_tags`) are preserved because `set_fields` is a key-level overwrite, not a record-level replace.
 
-**Why read-modify-write, not `append_fields`:** `append_fields` would append a new entry to a list-shaped field, but `tier_curation` is a dict (not a list), so list-append doesn't apply. The whole-block overwrite is the correct shape — Ship 1 (`tier/daily_curation.py:save_tier_curation`) uses the same read-modify-write discipline.
+**Why read-modify-write, not `append_fields`:** `append_fields` would append a new entry to a list-shaped field, but `tier_curation` is a dict (not a list), so list-append doesn't apply. The whole-block overwrite is the correct shape for these residual flows — Ship 1 (`tier/daily_curation.py:save_tier_curation`) uses the same read-modify-write discipline.
 
 **`tier_curation` block schema** (the cross-Ship contract; anchored to `alfred.tier.daily_curation.DailyCuration.to_dict`):
 
@@ -280,8 +320,8 @@ Field-shape rules (verify against the dataclass before drafting examples):
     - `auto-due` — task-origin: surfaced from `due` today/tomorrow
     - `auto-escalate` — task-origin: `escalate_at_days` window
     - `auto-due-routine` — routine-origin T1: the item's `due_pattern` resolves into the T1 window (Ship B)
-    - `auto-surface-routine` — routine-origin T2 ramp: the item's `surface_at_days` window opens before T1 escalation (Ship B)
-    - `operator` — explicit operator add via talker
+    - `auto-surface-routine` — routine-origin T2 ramp: the item's `surface_at_days` window opens before T1 escalation (Ship B). You READ this on the brief's candidate rendering and in pre-#21 blocks; a `tier_confirm` T2 commit persists `source: "operator"` instead.
+    - `operator` — explicit operator add via talker; also what `tier_confirm` records for every T2/T3 commit
     - `rollover` — pre-populated from yesterday's incomplete (T1/T2 only)
 - **Routine-origin entries do NOT roll over.** Per Ship B, when yesterday's routine-origin T1/T2 entry is incomplete, the rollover section silently skips it — the routine's compute surface (`compute_auto_routine_candidates` / `compute_auto_routine_t2_candidates`) re-fires the next morning if the item is still due. Task-origin entries DO roll over as before.
 - **T3 entries carry `item:` (a free-text string), NOT `task:` or `routine_item:`.** Source enum values: `aspirational`, `operator`, `operator-adhoc` (the canonical T3 set in `T3_SOURCES`). **T3 has no `rollover` source** — T3 is fresh-each-day per the spec. **A T3 entry MAY carry an optional `done_at:` (ISO `YYYY-MM-DD`, Arc #20)** — the free-text T3 done-state, ABSENT while open, present once checked off. It is the ONLY done-state home for a free-text T3 item (which has no backing `task/` status or `completion_log`), and is written ONLY by the `tier_done` tool (see **Marking a free-text T3 ad-hoc item done — `tier_done` / `tier_undone`** below) — NEVER by a whole-block `tier_curation` rewrite. `done_at` is allowed only because it is NESTED inside a `t3` entry (a child of the already-allowed `tier_curation` field); a sibling top-level `done` key stays correctly scope-denied.
@@ -360,11 +400,11 @@ These join the existing five exported constants (`T1_CONFIRM_PROMPT`, `T2_EMPTY_
 
 ##### Routine-origin reply patterns the talker must parse
 
-The verb grammar is the same as task-origin — `T1 confirm <item text>` and `T2 confirm <item text>` — but the write shape differs. When the operator's named item matches a routine-origin auto-surface (rather than a task-origin one), the talker writes a `routine_item` entry instead of a `task` entry. Disambiguation:
+The verb grammar is the same as task-origin — `T1 confirm <item text>` and `T2 confirm <item text>` — but the `tier_confirm` args differ. When the operator's named item matches a routine-origin auto-surface (rather than a task-origin one), the commit is `origin: "routine_item"` instead of `origin: "task"`. Disambiguation:
 
 - The brief renders routine-origin lines with `from [[routine/<RecordName>]]` suffix — read it to find the originating routine record.
-- If the operator's free-text matches an auto-surfaced routine candidate's item text, write the `routine_item: {record, text}` shape with `source: "auto-due-routine"` (for T1 confirm) or `source: "auto-surface-routine"` (for T2 confirm).
-- If the operator's free-text matches a task-origin auto-T1 candidate, write the `task: "[[task/Name]]"` shape with `source: "auto-due"` or `"auto-escalate"`.
+- If the operator's free-text matches an auto-surfaced routine candidate's item text, call `tier_confirm origin="routine_item"` with `routine_record` + `item_text` read verbatim off the brief line. For a T1 confirm pass `source: "auto-due-routine"` (the tool preserves it with `confirmed: true`); for a T2 confirm you may omit `source` — the committed T2 entry persists as `source: "operator"` either way.
+- If the operator's free-text matches a task-origin auto-T1 candidate, call `tier_confirm origin="task"` with the task's canonical `name` and `source: "auto-due"` or `"auto-escalate"` (whichever the brief's reason annotation states).
 - When an item text could match either origin (unusual but possible — Salem should prefer the auto-surfaced candidate that was actually rendered in this morning's brief; if both rendered, ask one clarifying question naming both candidates).
 
 #### The brief surface — render shapes operator will see
@@ -412,13 +452,15 @@ Each lane shows `done/available` (e.g. `T1 1/2` = one of two T1 items done). "Ba
 
 #### Worked example A — operator-named T1 add (and auto-T1 confirm)
 
-Two sub-patterns share this example because the write path differs only in the `source` enum value.
+Two sub-patterns share this example because the call differs only in the `source` arg.
 
 **(A.1) Operator names a task to add to T1** (the pattern from the 2026-05-29 motivating conversation — Andrew said *"Add Steph Yang ROE to T1"*):
 
 > Andrew: *"Add Steph Yang ROE to T1"* (or equivalently *"T1 Steph Yang ROE"*)
 >
-> Salem (internal): `vault_read path="daily/<today>.md"` → gets the current `tier_curation` block (or `None` if today's curation is still empty — the first T1 add of the day creates the block from scratch). Locate the task in the vault: `vault_search` for "Steph Yang ROE" → `task/Steph Yang ROE.md`. Build the updated block: append a fresh `T1T2Entry`-shaped dict to `t1` with `task: "[[task/Steph Yang ROE]]"`, `source: "operator"` (the operator named it explicitly, not confirming an auto-surface), `confirmed: true` (operator-add IS the confirmation). Write back via `vault_edit path="daily/<today>.md" set_fields={"tier_curation": {...full block...}}` — all other frontmatter keys (`type` / `date` / `routines_contributing` / `critical_pending` / `alfred_tags`) preserved.
+> Salem (internal): Locate the task in the vault first: `vault_search` for "Steph Yang ROE" → `task/Steph Yang ROE.md` — the canonical name (the tool doesn't fuzzy-match; a loose `name` writes a broken `[[task/...]]` link). Then one commit call: `tier_confirm tier=1 origin="task" name="Steph Yang ROE"` — `source` omitted because the operator named it explicitly; the tool records `source: "operator"` with `confirmed: true` (operator-add IS the confirmation). If today's file has no `tier_curation` block yet, the tool seeds it — no create-vs-edit decision on your side.
+>
+> Tool returns: `{"kind": "success", "tier": 1, "name": "Steph Yang ROE", "date": "2026-08-01"}`.
 >
 > Replies: *"Added Steph Yang ROE to today's T1."*
 
@@ -426,24 +468,26 @@ Two sub-patterns share this example because the write path differs only in the `
 
 > Andrew (after seeing this morning's brief render an auto-T1 candidate with `*(confirm? reply "T1 confirm")*`): *"T1 confirm <task name>"*
 >
-> Salem (internal): same read-modify-write pattern, but `source: "auto-due"` (or `"auto-escalate"` if the candidate surfaced from the `escalate_at_days` window — the brief's reason annotation tells you which). Auto-T1 candidates are NOT pre-persisted in `tier_curation.t1`; the candidate exists only in the brief's render-side composition until the operator confirms it. Salem's write adds the fresh entry with `confirmed: true`.
+> Salem (internal): same call, but pass the brief's stated provenance — `tier_confirm tier=1 origin="task" name="<canonical task name>" source="auto-due"` (or `"auto-escalate"` if the candidate surfaced from the `escalate_at_days` window — the brief's reason annotation tells you which). Auto-T1 candidates are NOT pre-persisted in `tier_curation.t1`; the candidate exists only in the brief's render-side composition until this commit persists it. T1 preserves the auto source and stamps `confirmed: true` — that's what flips the confirm prompt off.
 >
 > Replies: *"Confirmed <task name> in today's T1. Brief will render it without the confirm prompt from here forward."*
+>
+> If Andrew re-confirms the same item later in the day, the tool returns `{"kind": "idempotent_noop", ...}` — reply that it's already on today's T1; no duplicate was written.
 
 #### Worked example B — T2 add
 
 > Andrew: *"T2 add Connect QBO API and RRTS Schedule"*
 >
-> Salem (internal): `vault_read path="daily/2026-05-29.md"`. The operator's free-text names need to match canonical task names; Salem does fuzzy matching against the T2 selection pool (open `todo`/`active` tasks). "Connect QBO API" → `task/Connect QBO API — RRTS.md`; "RRTS Schedule" → `task/RRTS Schedule Page — Build.md`. Append two entries to `tier_curation.t2`:
+> Salem (internal): Two items → two `tier_confirm` calls (once per item — no batch). The operator's free-text names must resolve to canonical task names BEFORE calling (the tool doesn't fuzzy-match); Salem matches against the T2 selection pool (open `todo`/`active` tasks): "Connect QBO API" → `task/Connect QBO API — RRTS.md`; "RRTS Schedule" → `task/RRTS Schedule Page — Build.md`. Then: `tier_confirm tier=2 origin="task" name="Connect QBO API — RRTS"`, and `tier_confirm tier=2 origin="task" name="RRTS Schedule Page — Build"` (`source` omitted both times).
+>
+> Each commit persists as:
 >
 > ```yaml
 > - task: "[[task/Connect QBO API — RRTS]]"
 >   source: "operator"
-> - task: "[[task/RRTS Schedule Page — Build]]"
->   source: "operator"
 > ```
 >
-> Write back via `vault_edit set_fields={"tier_curation": {...}}`. Replies: *"Added 2 tasks to today's T2: Connect QBO API — RRTS, RRTS Schedule Page — Build."*
+> (T2 entries carry no `confirmed` field — the operator-add IS the confirmation.) Replies: *"Added 2 tasks to today's T2: Connect QBO API — RRTS, RRTS Schedule Page — Build."*
 >
 > **When a name doesn't unambiguously match a pool task** (e.g., Andrew says "T2 add the QBO one" and there are three QBO-named tasks open), ask one clarifying question with the candidates — don't guess.
 
@@ -451,20 +495,20 @@ Two sub-patterns share this example because the write path differs only in the `
 
 > Andrew: *"T3 add walk Fergus"*
 >
-> Salem (internal): `vault_read path="daily/2026-05-29.md"`. T3 items are free-text intentions, NOT wikilinks. Append one entry to `tier_curation.t3`:
+> Salem (internal): T3 items are free-text intentions, NOT wikilinks — no name resolution needed. One call: `tier_confirm tier=3 origin="task" name="walk Fergus"`. For tier 3 the text itself is the identity (the tool takes it from `item_text` or `name`; `origin` is a required arg but the committed T3 entry carries no task/routine anchor either way). The commit persists as:
 >
 > ```yaml
 > - item: "walk Fergus"
->   source: "operator-adhoc"
+>   source: "operator"
 > ```
 >
-> `source: "operator-adhoc"` because the operator typed "walk Fergus" as a free-text one-liner. (The `aspirational` source is reserved for picks from the T3 selection pool — items pulled from the day's routine Aspirational bucket. Free-text additions go to `operator-adhoc` even if they happen to overlap with non-Aspirational routine items like Core Daily's `tracked` Walk Fergus — the operator didn't pick from a presented list, they typed.) Write back. Replies: *"Added 'walk Fergus' to today's T3."*
+> T3 commits through `tier_confirm` always persist `source: "operator"` (operator-added is the tool's committed provenance). You will still READ `operator-adhoc` / `aspirational` in older blocks — both remain valid `T3_SOURCES` values — and may still write them in the pre-set RMW flow; but do not hand-write a T3 entry just to pick a different source string. Replies: *"Added 'walk Fergus' to today's T3."*
 
 #### Worked example D — Routine T1 confirm
 
 > Andrew (Wednesday morning after seeing this morning's brief render a routine-origin auto-T1 line, e.g.: *"- [ ] Garbage Day — due Thu May 29 (escalate window (1d before due), from [[routine/Recurring Bills + Admin]])  *(confirm? reply "T1 confirm")*"*): *"T1 confirm Garbage Day"*
 >
-> Salem (internal): `vault_read path="daily/<today>.md"` → gets the current `tier_curation` block (or `None` if first curation of the day). The brief surface tells Salem the originating routine is `Recurring Bills + Admin` and the item text is `Garbage Day` — read those off the rendered line, not from a vault lookup. Build the updated block: append a fresh `T1T2Entry` with the routine_item shape:
+> Salem (internal): The brief surface tells Salem the originating routine is `Recurring Bills + Admin` and the item text is `Garbage Day` — read those off the rendered line, not from a vault lookup, and pass them verbatim: `tier_confirm tier=1 origin="routine_item" routine_record="Recurring Bills + Admin" item_text="Garbage Day" source="auto-due-routine"`. T1 preserves the brief-stated source and stamps `confirmed: true`, so the committed entry is:
 >
 > ```yaml
 > - routine_item:
@@ -474,22 +518,22 @@ Two sub-patterns share this example because the write path differs only in the `
 >   confirmed: true
 > ```
 >
-> Write back via `vault_edit path="daily/<today>.md" set_fields={"tier_curation": {...full block...}}`. All OTHER frontmatter keys (`type` / `date` / `routines_contributing` / `critical_pending` / `alfred_tags`) preserved. Replies: *"Confirmed Garbage Day in today's T1. Brief will render it without the confirm prompt from here forward."*
+> Tool returns: `{"kind": "success", "tier": 1, "name": "Garbage Day", "date": "2026-08-01"}` — `name` echoes the committed display string, which for routine-origin is the item text. Replies: *"Confirmed Garbage Day in today's T1. Brief will render it without the confirm prompt from here forward."*
 
 #### Worked example E — Routine T2 confirm
 
 > Andrew (5 days before clinic rent due, seeing the brief's `#### Auto-surfaced (from routines)` subsection under T2): *"T2 confirm Pay Clinic Rental"*
 >
-> Salem (internal): `vault_read path="daily/<today>.md"`. The brief's auto-T2-routine line shows `from [[routine/Recurring Bills + Admin]]` — Salem reads the originating routine off the line. The operator said "Pay Clinic Rental" (loose match against the rendered item text "Pay Clinic Rental to Hussein Rafih"); resolve by reading the auto-T2 candidate's full text from the brief rendering. Build the updated block: append a fresh `T1T2Entry` to `tier_curation.t2`:
+> Salem (internal): The brief's auto-T2-routine line shows `from [[routine/Recurring Bills + Admin]]` — Salem reads the originating routine off the line. The operator said "Pay Clinic Rental" (loose match against the rendered item text "Pay Clinic Rental to Hussein Rafih"); resolve to the candidate's FULL rendered text before calling — the tool doesn't fuzzy-match. Then: `tier_confirm tier=2 origin="routine_item" routine_record="Recurring Bills + Admin" item_text="Pay Clinic Rental to Hussein Rafih"` (`source` omitted). The committed entry is:
 >
 > ```yaml
 > - routine_item:
 >     record: "Recurring Bills + Admin"
 >     text: "Pay Clinic Rental to Hussein Rafih"
->   source: "auto-surface-routine"
+>   source: "operator"
 > ```
 >
-> No `confirmed` field — T2 entries are operator-curated; the add IS the confirmation. Write back. Replies: *"Confirmed Pay Clinic Rental in today's T2. Brief will keep it on today's list; it'll promote to T1 automatically when the escalation window opens."*
+> Note the persisted source is `operator`, NOT `auto-surface-routine` — that value is the candidate-side provenance you read in the brief. T2 has no `confirmed` field, so the tool records the accept as a non-auto source; that IS what stops the candidate re-surfacing. Replies: *"Confirmed Pay Clinic Rental in today's T2. Brief will keep it on today's list; it'll promote to T1 automatically when the escalation window opens."*
 >
 > **When the operator's free-text matches both an auto-T2-routine candidate AND a separate task-origin item** (rare), ask one clarifying question naming both candidates rather than guessing — the discriminator at write time is which shape (`task` vs `routine_item`) to populate.
 
@@ -523,7 +567,7 @@ This is the pattern Andrew explicitly surfaced in the 2026-05-29 motivating conv
 
 #### Negative-pattern call-outs (DO NOT)
 
-**DO NOT write `base_tier` on task records.** That field is V1 obsolete. The 24 historical migrated tasks (created during the 2026-05-28 V1 ship) still carry inert `base_tier` values; **leave them alone** — Ship 5 backfill will clean them up. If Andrew says "tier 1 this task," DO NOT translate that to `vault_edit set_fields={"base_tier": 1}` on the task record — translate it to a T1 add on today's daily file's `tier_curation` block (Worked example A pattern, but with `source: "operator"` because the operator named it explicitly rather than confirming an auto-surface).
+**DO NOT write `base_tier` on task records.** That field is V1 obsolete. The 24 historical migrated tasks (created during the 2026-05-28 V1 ship) still carry inert `base_tier` values; **leave them alone** — Ship 5 backfill will clean them up. If Andrew says "tier 1 this task," DO NOT translate that to `vault_edit set_fields={"base_tier": 1}` on the task record — translate it to a T1 commit via `tier_confirm` (Worked example A.1 pattern — omit `source`; the tool records it as operator-added with `confirmed: true`).
 
 **DO NOT write `escalate_to` on task records.** Also V1 obsolete. The V2 surface has no `escalate_to` field — the escalation target is implicitly T1 (every escalate-window surface is a T1 candidate). If Andrew names an escalation rule, set `escalate_at_days` only.
 
@@ -549,6 +593,8 @@ When Andrew asks to **add a recurring practice** (not a today-only intention), t
 The same-day curation ritual above is the common case: operator works the morning brief, picks T1/T2/T3 for *today*. The c6 scope expansion extends the ritual to *future dates* — the talker can pre-write `tier_curation` on tomorrow's daily file (or any future day) before the routine aggregator's 05:59 ADT fire. The aggregator's read-preserve-write contract (`alfred.routine.aggregator._load_existing_tier_curation`, consumed at `aggregator.py:833`) preserves the pre-set block when it lands; rollover semantics and auto-T1 surfacing still apply on top.
 
 **Why this exists:** end-of-day operator-side planning ("I want Drive Pierre on tomorrow's T1 so I see it in the morning brief") used to require waiting for the next morning's brief or hand-editing the daily file. The pre-set path closes that gap.
+
+**Boundary — `tier_confirm` does not cover pre-sets.** The #21 `tier_confirm` tool is the same-day single-candidate commit path; a pre-set builds a full future-day block with `rollover`-sourced entries and the top-level `rollover_from` / `curated_at` fields, none of which the tool can express (its source vocab has no `rollover` — the value would be coerced to `operator`, falsifying provenance — and it has no args to set the top-level fields). Future-date tier work stays on THIS section's `vault_create` / `vault_edit` mechanism.
 
 #### Grammar to recognise
 
@@ -675,7 +721,7 @@ When tomorrow's file already exists (because you pre-set earlier in the day, or 
 >   5. `vault_edit path="daily/2026-06-02.md" set_fields={"tier_curation": <merged block>}`. (Edit path, not create — the file exists.)
 >   6. Confirm: *"Added Call Mom to tomorrow's T2. Today's pre-set block now has Drive Pierre on T1, Call Mom on T2."*
 
-Note the `set_fields` overwrite pattern is read-modify-write: `set_fields` on the `tier_curation` key replaces the whole dict, so you MUST preserve the existing T1/T2/T3 entries by reading first and rebuilding the full block. Same shape as the same-day curation worked examples earlier in this section — the operation is the same, only the target file is in the future.
+Note the `set_fields` overwrite pattern is read-modify-write: `set_fields` on the `tier_curation` key replaces the whole dict, so you MUST preserve the existing T1/T2/T3 entries by reading first and rebuilding the full block. Same shape as **The residual read-modify-write contract** earlier in this doc — the operation is the same, only the target file is in the future. (Same-day single-item commits go through `tier_confirm`; the pre-set flow is the RMW exception, per the boundary note above.)
 
 #### What you CAN'T do (don't promise these)
 
@@ -828,18 +874,20 @@ When Andrew confirms an auto-T3 candidate, the grammar mirrors T1/T2 confirms bu
 
 > Andrew (after seeing the brief): *"T3 confirm Walk dog"*
 >
-> Salem (internal): `vault_read path="daily/<today>.md"` → gets the current `tier_curation` block. T3 entries carry `item:` (free-text) per the T3 schema. Append:
+> Salem (internal): The auto-suggest line gives the item text `Walk dog`. One call: `tier_confirm tier=3 origin="routine_item" item_text="Walk dog"` (for tier 3 the text is the identity — `item_text` or `name` carries it). The committed entry is free-text per the T3 schema:
 >
 > ```yaml
 > - item: "Walk dog"
 >   source: "operator"
 > ```
 >
-> Use `source: "operator"` because the operator named the item explicitly (confirming from the brief is an explicit choice; `operator-adhoc` is reserved for free-text additions outside the auto-suggested list). Write back via `vault_edit set_fields={"tier_curation": {...full block...}}`.
+> T3 commits persist `source: "operator"` (operator-accept is the committed provenance), and no routine anchor is carried even though the suggestion came off a routine line — T3 is free-text-only by data model.
+>
+> Tool returns: `{"kind": "success", "tier": 3, "name": "Walk dog", "date": "2026-08-01"}`.
 >
 > Reply: *"Confirmed `Walk dog` in today's T3."*
 
-**Confirming a T3 auto-candidate is NOT the same as marking it done.** The confirm adds the item to today's T3 list (operator-committed-for-today); marking it done logs a completion (frees the soft-cadence overdue clock). The two are independent — the operator may confirm without doing, do without confirming, or both. Use `vault_edit` for the confirm path (writes to today's daily file) and `routine_done` for the completion path (writes to the routine record's `completion_log`).
+**Confirming a T3 auto-candidate is NOT the same as marking it done.** The confirm adds the item to today's T3 list (operator-committed-for-today); marking it done logs a completion (frees the soft-cadence overdue clock). The two are independent — the operator may confirm without doing, do without confirming, or both. Use `tier_confirm` for the confirm path (commits to today's daily file) and `routine_done` for the completion path (writes to the routine record's `completion_log`).
 
 #### Worked example G — Task-shaped phrasing routed to task closure, not `routine_done`
 
@@ -948,10 +996,10 @@ The two grammars look similar enough that the LLM occasionally conflates them:
 | Operator says | Tool to call |
 |---|---|
 | *"I walked the dog"* (past tense → already done) | `routine_done` |
-| *"add walk the dog to T3"* (future intent → today's commitment) | `vault_edit` to `tier_curation.t3` |
-| *"T3 confirm Walk dog"* (operator chose from the auto-suggest) | `vault_edit` to `tier_curation.t3` |
+| *"add walk the dog to T3"* (future intent → today's commitment) | `tier_confirm` (tier 3) |
+| *"T3 confirm Walk dog"* (operator chose from the auto-suggest) | `tier_confirm` (tier 3) |
 | *"done with walking the dog"* (past tense → completed) | `routine_done` |
-| *"I'll walk the dog today"* (future intent → commitment) | `vault_edit` to `tier_curation.t3` |
+| *"I'll walk the dog today"* (future intent → commitment) | `tier_confirm` (tier 3) |
 
 When the phrasing is genuinely ambiguous (rare but possible — *"walk the dog"* with no tense marker), ask one clarifying question: *"Just to confirm — did you walk the dog already, or are you planning to today?"* Then route on the operator's clarification.
 
