@@ -82,7 +82,7 @@ class BatchItem:
     # #26 — card body preview + Gmail deep-link (feed evidence only; the Telegram
     # ``render_batch`` does NOT read these, so the sync stays byte-identical).
     body: str = ""
-    body_truncated: bool = False
+    truncated: bool = False
     message_id: str = ""
     gmail_url: str = ""
 
@@ -99,7 +99,7 @@ class BatchItem:
             "cluster_record_paths": list(self.cluster_record_paths),
             "cluster_most_recent_label": self.cluster_most_recent_label,
             "body": self.body,
-            "body_truncated": self.body_truncated,
+            "truncated": self.truncated,
             "message_id": self.message_id,
             "gmail_url": self.gmail_url,
         }
@@ -116,11 +116,14 @@ class _CandidateRecord:
     snippet: str
     mtime: float
     # #26 — card body preview (bounded) + the Gmail deep-link. ``body`` is the
-    # 600-char readable preview; ``body_truncated`` drives the FE "more" cue;
-    # ``message_id`` is the raw RFC822 id (future-proof); ``gmail_url`` is the
-    # pre-built deep-link the FE renders as a plain external anchor.
+    # 600-char readable preview; ``truncated`` drives the FE "more" cue — this is
+    # the shared bounded-body schema key (peer_digest evidence reads the same
+    # ``truncated``), NOT a per-kind name, so the FE's generic evidenceBody() path
+    # detects it; the kind-specific "more" COPY (email → open in Gmail) is the
+    # FE's call. ``message_id`` is the raw RFC822 id (future-proof); ``gmail_url``
+    # is the pre-built deep-link the FE renders as a plain external anchor.
     body: str = ""
-    body_truncated: bool = False
+    truncated: bool = False
     message_id: str = ""
     gmail_url: str = ""
 
@@ -190,7 +193,7 @@ def _read_candidate(
     # Lazy import so daily_sync's module graph doesn't pull the mail package.
     from alfred.mail.gmail_filing import gmail_rfc822_search_url
 
-    body, body_truncated = _bounded_email_body(post.content or "")
+    body, truncated = _bounded_email_body(post.content or "")
     message_id = str(fm.get("email_message_id") or "").strip()
     gmail_url = gmail_rfc822_search_url(message_id) if message_id else ""
 
@@ -204,7 +207,7 @@ def _read_candidate(
         snippet=snippet,
         mtime=mtime,
         body=body,
-        body_truncated=body_truncated,
+        truncated=truncated,
         message_id=message_id,
         gmail_url=gmail_url,
     )
@@ -671,7 +674,7 @@ def build_batch(
                 cluster_record_paths=cluster_paths,
                 cluster_most_recent_label=most_recent_label,
                 body=primary.body,
-                body_truncated=primary.body_truncated,
+                truncated=primary.truncated,
                 message_id=primary.message_id,
                 gmail_url=primary.gmail_url,
             )

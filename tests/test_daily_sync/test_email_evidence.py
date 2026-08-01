@@ -108,7 +108,7 @@ def test_read_candidate_populates_evidence(tmp_path: Path) -> None:
     rec = _read_candidate(vault, rel)
     assert rec is not None
     assert rec.body == "Real email body content here."
-    assert rec.body_truncated is False
+    assert rec.truncated is False
     assert rec.message_id == "<msg-1@example.com>"
     assert rec.gmail_url == gmail_rfc822_search_url("<msg-1@example.com>")
     assert "rfc822msgid:" in rec.gmail_url
@@ -126,11 +126,11 @@ def test_batch_item_to_dict_carries_evidence_fields() -> None:
     item = BatchItem(
         item_number=1, record_path="note/A.md", classifier_priority="high",
         classifier_action_hint=None, classifier_reason="r", sender="a@b.com",
-        subject="s", snippet="snip", body="the body", body_truncated=True,
+        subject="s", snippet="snip", body="the body", truncated=True,
         message_id="<m@x>", gmail_url="https://mail.google.com/x",
     )
     d = item.to_dict()
-    assert d["body"] == "the body" and d["body_truncated"] is True
+    assert d["body"] == "the body" and d["truncated"] is True
     assert d["message_id"] == "<m@x>" and d["gmail_url"] == "https://mail.google.com/x"
 
 
@@ -145,7 +145,7 @@ def test_render_batch_byte_identical_with_and_without_new_fields() -> None:
     )
     plain = BatchItem(**base)
     enriched = BatchItem(
-        **base, body="a much longer body preview " * 20, body_truncated=True,
+        **base, body="a much longer body preview " * 20, truncated=True,
         message_id="<m@x>", gmail_url="https://mail.google.com/mail/u/0/#search/rfc822msgid:m",
     )
     assert render_batch([plain]) == render_batch([enriched])  # byte-identical
@@ -164,7 +164,7 @@ def test_feed_item_id_stable_when_enriched() -> None:
     )
     plain = BatchItem(**base)
     enriched = BatchItem(
-        **base, body="body preview", body_truncated=False,
+        **base, body="body preview", truncated=False,
         message_id="<m@x>", gmail_url="https://mail.google.com/x",
     )
     id_plain = build_feed_items("email_tier", [plain.to_dict()], "salem")[0].id
