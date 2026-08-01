@@ -30,10 +30,12 @@ export interface DeckCardProps {
   onToggleEvidence: () => void;
   onConfirmHeavy: () => void;
   onCancelHeavy: () => void;
+  /** Open the re-tier picker (#28) — email_tier top card only; absent elsewhere. */
+  onReTierOpen?: () => void;
 }
 
 export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckCard(
-  { item, depth, expanded, confirming, onToggleEvidence, onConfirmHeavy, onCancelHeavy },
+  { item, depth, expanded, confirming, onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen },
   ref,
 ) {
   const verbs = deckVerbsFor(item.kind);
@@ -121,6 +123,21 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
           className="shrink-0 self-start text-xs text-honeydew-600 underline underline-offset-2"
         >
           {expanded ? 'Hide details' : 'Show details'}
+        </button>
+      )}
+
+      {/* Re-tier affordance (#28) — a DELIBERATE tap (not a swipe) to correct the
+          classifier's tier. Email top card only; the "…" control is taken (details),
+          so this is an on-face button. Swipes stay judge-the-claim; this is the heavier
+          multi-choice door. */}
+      {item.kind === 'email_tier' && depth === 0 && onReTierOpen && (
+        <button
+          type="button"
+          data-testid="deck-retier-open"
+          onClick={onReTierOpen}
+          className="mt-1 shrink-0 self-start text-xs font-semibold text-status-progress-fg underline underline-offset-2"
+        >
+          Adjust tier…
         </button>
       )}
       {expanded && (

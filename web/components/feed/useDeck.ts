@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { feedApi, type FeedItem } from '../../lib/algernon/feed';
+import { feedApi, type FeedActResult, type FeedItem } from '../../lib/algernon/feed';
 import { UNDO_MS, deckVerbsFor, HEAVY_KINDS, type Verdict } from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
 
@@ -51,6 +51,10 @@ export interface UseDeckResult {
   undo: () => void;
   /** Deal a parked card back into the deck queue (un-park + re-enter immediately). */
   dealNow: (item: FeedItem) => void;
+  /** The re-tier action_id in flight for the current email card (#28), or null. */
+  reTiering: string | null;
+  /** Re-tier the current email card: await the act, flip only on `acted`. Awaitable. */
+  reTier: (tierId: string) => Promise<void>;
   dismissToast: () => void;
 }
 
@@ -75,6 +79,10 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   // Cards dealt back from the parked view — re-appended to the tail of the deck queue
   // so an un-parked card re-enters the deck immediately without disturbing the index.
   const [readded, setReadded] = useState<FeedItem[]>([]);
+  // The re-tier action_id in flight for the current email card (#28), or null. Unlike a
+  // swipe (optimistic advance + deferred POST), a re-tier AWAITS the act and only flips
+  // on `acted` — a calibration CORRECTION must be honestly confirmed, not optimistic.
+  const [reTiering, setReTiering] = useState<string | null>(null);
 
   const pendingRef = useRef<Pending | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -243,6 +251,45 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     [onUnparkPersist],
   );
 
+  // Re-tier the current email card (#28): POST the chosen tier action_id, AWAIT it, and
+  // flip the card off the deck ONLY on `acted` — no optimistic advance, nothing "greens"
+  // before the backend confirms the correction. A pending swipe act flushes first
+  // (ordering). `acted` → advance + honest no-undo toast; already-moved-on → advance
+  // (stale); ApiError → routeError; any other status → keep the card + honest detail.
+  // Awaitable so the caller can close the picker once the act resolves.
+  const reTier = useCallback(
+    async (tierId: string) => {
+      const item = current;
+      if (!item || reTiering) return;
+      flushPending(); // fire any deferred swipe act BEFORE the re-tier (in order)
+      setReTiering(tierId);
+      let res: FeedActResult;
+      try {
+        res = await feedApi.act(item.id, tierId);
+      } catch (e) {
+        setReTiering(null);
+        routeError(e);
+        return;
+      }
+      setReTiering(null);
+      if (res.ok && res.status === 'acted') {
+        setIndex((i) => i + 1); // flip-on-acted: leaves the deck like any other act
+        setToast({ message: `Re-tiered to ${tierId.toUpperCase()}.`, canUndo: false });
+        clearTimer();
+        timerRef.current = setTimeout(() => setToast(null), UNDO_MS);
+      } else if (res.status === 'already_acted' || res.status === 'stale_item') {
+        setIndex((i) => i + 1); // already moved on server-side → remove the stale card
+        setToast({ message: "That one had already moved on — it'll resurface at the next sync.", canUndo: false });
+        clearTimer();
+        timerRef.current = setTimeout(() => setToast(null), UNDO_MS);
+      } else {
+        // invalid_action / error / unknown → keep the card, honest toast (retry possible).
+        setToast({ message: res.detail || `Couldn't re-tier (${res.status}).`, canUndo: false });
+      }
+    },
+    [current, reTiering, flushPending, routeError],
+  );
+
   const dismissToast = useCallback(() => setToast(null), []);
 
   const remaining = Math.max(0, queue.length - index);
@@ -266,6 +313,8 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     cancelHeavy,
     undo,
     dealNow,
+    reTiering,
+    reTier,
     dismissToast,
   };
 }
