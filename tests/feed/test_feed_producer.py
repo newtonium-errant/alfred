@@ -6,7 +6,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from alfred.daily_sync.feed_producer import build_feed_items, emit_sync_feed
+from alfred.daily_sync.email_section import SENDER_PLACEHOLDER
+from alfred.daily_sync.feed_producer import _SENDER_ABSENT, build_feed_items, emit_sync_feed
 from alfred.feed import STATE_ACTED, STATE_OPEN, FeedStore
 
 
@@ -73,6 +74,15 @@ def test_email_title_named_sender_no_subject() -> None:
     it = _Item(record_path="note/A.md", sender="jamie@example.com", subject="")
     [feed_item] = build_feed_items("email_tier", [it], "salem")
     assert feed_item.title == "Email tier: jamie@example.com — (no subject)"
+
+
+def test_title_sentinel_covers_email_section_placeholder() -> None:
+    # Cross-module drift pin (#28): feed_producer keeps its own local
+    # absent-sender sentinel set (no prod import, to avoid coupling), but it MUST
+    # cover the placeholder email_section actually injects. If email_section ever
+    # changes SENDER_PLACEHOLDER, this reddens here instead of the card title
+    # silently regressing to "Email tier: <new-placeholder> — subject".
+    assert SENDER_PLACEHOLDER.lower() in _SENDER_ABSENT
 
 
 def test_stable_keys_per_family() -> None:

@@ -128,6 +128,14 @@ class _CandidateRecord:
     gmail_url: str = ""
 
 
+# The placeholder written into an email-tier item's ``sender`` when no real
+# sender resolves. Exported so the feed title builder's absent-sender sentinel
+# (``feed_producer._SENDER_ABSENT``) can be DRIFT-PINNED against it — if this
+# string ever changes, that pin reddens rather than the card title silently
+# regressing to "Email tier: <new-placeholder> — subject" (#28).
+SENDER_PLACEHOLDER = "(unknown)"
+
+
 def _read_candidate(
     vault_path: Path, rel_path: str,
 ) -> _CandidateRecord | None:
@@ -178,12 +186,12 @@ def _read_candidate(
     # Treat the literal sentinel ``(unknown)`` as absence — a prior
     # version of the curator wrote this placeholder into frontmatter and
     # we don't want to propagate it through the fallback chain.
-    if fm_sender.lower() in {"(unknown)", "unknown"}:
+    if fm_sender.lower() in {SENDER_PLACEHOLDER, "unknown"}:
         fm_sender = ""
     display_sender = _display_sender_from_raw(fm_sender) if fm_sender else ""
     if not display_sender:
         display_sender = _display_sender_from_raw(raw_sender)
-    sender = display_sender or "(unknown)"
+    sender = display_sender or SENDER_PLACEHOLDER
 
     snippet = _extract_snippet(post.content or "", limit=120)
 

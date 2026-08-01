@@ -263,6 +263,55 @@ def test_email_down_modifier_lowers_tier(tmp_path: Path) -> None:
     assert rows[0].andrew_priority == "low"  # medium → down → low
 
 
+# The exact re-tier action-id vocabulary the #28 deck picker sends to /feed/act.
+# Pinned per-id (alongside the ``high`` pin above) so a future resolver/ceiling
+# rename can't silently orphan the FE picker — the id set is a load-bearing FE
+# contract. Each is one explicit-tier ReplyCorrection → corpus row.
+def test_email_medium_sets_explicit_tier(tmp_path: Path) -> None:
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="low")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    result = _call(store, cfg, fid, "medium")
+
+    assert result.ok and result.status == STATUS_ACTED
+    rows = list(iter_corrections(cfg.corpus.path))
+    assert rows[0].andrew_priority == "medium"
+    assert "medium" in result.detail
+
+
+def test_email_low_sets_explicit_tier(tmp_path: Path) -> None:
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="high")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    result = _call(store, cfg, fid, "low")
+
+    assert result.ok and result.status == STATUS_ACTED
+    rows = list(iter_corrections(cfg.corpus.path))
+    assert rows[0].andrew_priority == "low"
+    assert "low" in result.detail
+
+
+def test_email_spam_sets_explicit_tier(tmp_path: Path) -> None:
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    result = _call(store, cfg, fid, "spam")
+
+    assert result.ok and result.status == STATUS_ACTED
+    rows = list(iter_corrections(cfg.corpus.path))
+    assert rows[0].andrew_priority == "spam"
+    assert "spam" in result.detail
+
+
 # ---------------------------------------------------------------------------
 # attribution — real vault marker flip + corpus row
 # ---------------------------------------------------------------------------
