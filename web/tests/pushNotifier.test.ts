@@ -47,7 +47,11 @@ function makeDeps(overrides: Partial<PollDeps> = {}): PollDeps {
   };
 }
 
-const VAPID = ['ALGERNON_VAPID_PUBLIC', 'ALGERNON_VAPID_PRIVATE', 'ALGERNON_VAPID_SUBJECT', 'PUSH_ENABLED'];
+// PUSH_POLICY joins the env-cleanup list (#27 slice 3): the default policy is
+// now the strictest gate (email_urgent + override), so the mechanics tests below
+// that push generic email_tier items opt into PUSH_POLICY=needs_you to exercise
+// the poll diff/prune/seen machinery independent of the eligibility policy.
+const VAPID = ['ALGERNON_VAPID_PUBLIC', 'ALGERNON_VAPID_PRIVATE', 'ALGERNON_VAPID_SUBJECT', 'PUSH_ENABLED', 'PUSH_POLICY'];
 beforeEach(() => {
   for (const k of VAPID) delete process.env[k];
   vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -80,6 +84,7 @@ describe('runPollOnce', () => {
   });
 
   it('pushes each fresh item to every subscription and persists the seen id', async () => {
+    process.env.PUSH_POLICY = 'needs_you'; // mechanics test: all needs-you eligible
     const writeSeenIds = vi.fn().mockResolvedValue(undefined);
     const sendPush = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
@@ -101,6 +106,7 @@ describe('runPollOnce', () => {
   });
 
   it('never re-pushes an already-seen item, only the fresh one', async () => {
+    process.env.PUSH_POLICY = 'needs_you'; // mechanics test: all needs-you eligible
     const sendPush = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
       readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
@@ -115,6 +121,7 @@ describe('runPollOnce', () => {
   });
 
   it('prunes a subscription the push service reports Gone (410)', async () => {
+    process.env.PUSH_POLICY = 'needs_you'; // mechanics test: all needs-you eligible
     const removeSubscription = vi.fn().mockResolvedValue(true);
     const deps = makeDeps({
       readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/dead')]),
@@ -126,6 +133,77 @@ describe('runPollOnce', () => {
     expect(r.pruned).toBe(1);
     expect(r.sent).toBe(0);
     expect(removeSubscription).toHaveBeenCalledWith('https://p/dead');
+  });
+
+  // --- #27 slice 3: push-eligibility policy (default = strictest) ------------
+
+  const urgentOverride = (id: string) =>
+    item(id, { kind: 'email_urgent', evidence: { high_source: 'override' } });
+  const urgentLlm = (id: string) =>
+    item(id, { kind: 'email_urgent', evidence: { high_source: 'llm' } });
+  const tierMedium = (id: string) => item(id, { kind: 'email_tier' }); // needs-you, non-urgent
+
+  it('default policy rings ONLY for the override-high email_urgent (not llm-high, not email_tier)', async () => {
+    // No PUSH_POLICY set → email_urgent_override (operator ruling C).
+    const sendPush = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
+      fetchNeedsYouItems: vi.fn().mockResolvedValue([
+        urgentOverride('u-ovr'),
+        urgentLlm('u-llm'),
+        tierMedium('t-med'),
+      ]),
+      sendPush,
+    });
+    const r = await runPollOnce(deps);
+    expect(r.sent).toBe(1);
+    const pushedTitles = sendPush.mock.calls.map((c) => JSON.parse(c[1] as string).title);
+    expect(pushedTitles).toEqual(['Item u-ovr']);
+  });
+
+  it('does NOT ring at all when the only fresh items are ineligible under the default policy', async () => {
+    const sendPush = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
+      fetchNeedsYouItems: vi.fn().mockResolvedValue([urgentLlm('u-llm'), tierMedium('t-med')]),
+      sendPush,
+    });
+    const r = await runPollOnce(deps);
+    expect(r.reason).toBe('no_new_items');
+    expect(sendPush).not.toHaveBeenCalled();
+  });
+
+  it('PUSH_POLICY=email_urgent_all widens to BOTH highs (still not email_tier)', async () => {
+    process.env.PUSH_POLICY = 'email_urgent_all';
+    const sendPush = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
+      fetchNeedsYouItems: vi.fn().mockResolvedValue([
+        urgentOverride('u-ovr'),
+        urgentLlm('u-llm'),
+        tierMedium('t-med'),
+      ]),
+      sendPush,
+    });
+    const r = await runPollOnce(deps);
+    expect(r.sent).toBe(2);
+    const pushedTitles = sendPush.mock.calls.map((c) => JSON.parse(c[1] as string).title).sort();
+    expect(pushedTitles).toEqual(['Item u-llm', 'Item u-ovr']);
+  });
+
+  it('only the ELIGIBLE open ids are pinned in the persisted seen-set', async () => {
+    // Default policy: the override-urgent is pushed+seen; the ineligible items are
+    // never added to seen (never pushed). Pins that boundSeen gets eligible ids.
+    const writeSeenIds = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
+      fetchNeedsYouItems: vi.fn().mockResolvedValue([urgentOverride('u-ovr'), tierMedium('t-med')]),
+      writeSeenIds,
+    });
+    await runPollOnce(deps);
+    const persisted = writeSeenIds.mock.calls[0][0] as string[];
+    expect(persisted).toContain('u-ovr');
+    expect(persisted).not.toContain('t-med');
   });
 });
 

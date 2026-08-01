@@ -3,6 +3,7 @@ import type { FeedItem } from './feed';
 import { isNeedsYouItem } from './feedNeedsYou';
 import { isPushEnabled, readVapidConfig } from './pushConfig';
 import { pushPayloadFor } from './pushPayload';
+import { isPushEligible, readPushPolicy } from './pushPolicy';
 import {
   readSeenIds,
   readSubscriptions,
@@ -97,11 +98,21 @@ export async function runPollOnce(deps: PollDeps): Promise<PollResult> {
   }
 
   const items = await deps.fetchNeedsYouItems();
+  // #27 slice 3 — push-eligibility gate. Ring ONLY for items the operator's
+  // policy permits (default: email_urgent + high_source==="override"). Widening
+  // is a PUSH_POLICY env flip, not a code change (see pushPolicy.ts). Applied
+  // HERE (not inside fetchNeedsYouItems) so the gate is exercised regardless of
+  // the injected fetch dep.
+  const policy = readPushPolicy();
+  const eligible = items.filter((it) => isPushEligible(it, policy));
   const seen = await deps.readSeenIds();
-  const fresh = items.filter((it) => !seen.has(it.id));
+  const fresh = eligible.filter((it) => !seen.has(it.id));
   if (fresh.length === 0) {
-    // ILB: ran, nothing new to ring for.
-    console.log(`[push:poll] ran subs=${subs.length} needs_you=${items.length} fresh=0 (nothing new)`);
+    // ILB: ran, nothing new to ring for (needs_you vs eligible distinguishes
+    // "nothing waiting" from "policy filtered everything out").
+    console.log(
+      `[push:poll] ran subs=${subs.length} needs_you=${items.length} policy=${policy} eligible=${eligible.length} fresh=0 (nothing new)`,
+    );
     return { reason: 'no_new_items', fresh: 0, sent: 0, pruned: 0 };
   }
 
@@ -128,10 +139,13 @@ export async function runPollOnce(deps: PollDeps): Promise<PollResult> {
   }
 
   // Persist the bounded seen-set (open ids pinned so a still-open item never
-  // re-rings after the cap rolls over).
-  const openIds = new Set(items.map((i) => i.id));
+  // re-rings after the cap rolls over). Pin the ELIGIBLE open ids — those are
+  // the only ones that were pushed and added to the seen-set.
+  const openIds = new Set(eligible.map((i) => i.id));
   await deps.writeSeenIds(boundSeen(seen, openIds, SEEN_MAX));
-  console.log(`[push:poll] ran subs=${subs.length} fresh=${fresh.length} sent=${sent} pruned=${pruned}`);
+  console.log(
+    `[push:poll] ran subs=${subs.length} needs_you=${items.length} policy=${policy} eligible=${eligible.length} fresh=${fresh.length} sent=${sent} pruned=${pruned}`,
+  );
   return { reason: 'sent', fresh: fresh.length, sent, pruned };
 }
 

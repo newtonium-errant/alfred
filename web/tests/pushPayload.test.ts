@@ -51,6 +51,35 @@ describe('pushPayloadFor', () => {
     expect(serialized).not.toContain('SECRET_DIGEST');
   });
 
+  it('NEVER leaks an email_urgent card evidence — the #27 kind (title+kind+url only)', () => {
+    // Slice 3's push rings for email_urgent; the field-named privacy pin extends
+    // to its evidence shape. The producer-built TITLE legitimately carries
+    // sender/subject (the design permits "title + sender/subject only, never the
+    // body"), so this pins the EVIDENCE-only fields — the bounded body, the Gmail
+    // deep-link, and the high_source discriminator — never reach the lock screen.
+    const p = pushPayloadFor(
+      item({
+        id: 'email_urgent:note/Server outage.md',
+        kind: 'email_urgent',
+        title: 'Urgent email: ops@statuspage.io — Server outage',
+        evidence: {
+          sender: 'ops@statuspage.io',
+          subject: 'Server outage',
+          body: 'PRODUCTION_INCIDENT_DETAIL',
+          gmail_url: 'https://mail.google.com/mail/u/0/#search/rfc822msgid:SECRET',
+          high_source: 'override',
+        },
+      }),
+    );
+    expect(Object.keys(p).sort()).toEqual(['kind', 'title', 'url']);
+    expect(p.kind).toBe('email_urgent');
+    expect(p.url).toBe('/deck'); // needs-you → deck
+    const serialized = JSON.stringify(p);
+    expect(serialized).not.toContain('PRODUCTION_INCIDENT_DETAIL'); // bounded body
+    expect(serialized).not.toContain('rfc822msgid'); // gmail deep-link
+    expect(serialized).not.toContain('high_source'); // the slice-3 discriminator
+  });
+
   it('deep-links decisions to /deck and glance items to /feed', () => {
     expect(pushDeepLink(item({ mode: 'decide', attention: 'needs_you' }))).toBe('/deck');
     expect(pushDeepLink(item({ mode: 'fyi', attention: 'fyi' }))).toBe('/feed');
