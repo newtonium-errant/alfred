@@ -110,6 +110,15 @@ def _task_due_today(vault: Path, *, name: str = "Interview") -> None:
     )
 
 
+def _task_due_today_named(vault: Path, *, filename: str, name: str) -> None:
+    """A task whose frontmatter ``name`` differs from its file stem — the ~5%
+    sanitized/truncated-filename shape (real Salem examples: ``$100`` → ``00``)."""
+    (vault / "task" / f"{filename}.md").write_text(
+        f"---\ntype: task\nstatus: todo\nname: {name}\ndue: {TODAY_ISO}\n---\n\n# {name}\n",
+        encoding="utf-8",
+    )
+
+
 def _daily_path(vault: Path) -> Path:
     return vault / "daily" / f"{TODAY_ISO}.md"
 
@@ -434,6 +443,50 @@ def test_accept_reconcile_revives_same_episode_committed(tmp_path: Path) -> None
     assert revived.evidence["confirmed"] is True
     slots = [i for i in store.load().values() if i.kind == "slot_suggestion"]
     assert len(slots) == 1  # no duplicate episode
+
+
+def test_accept_name_differs_from_stem_no_double_surface(tmp_path: Path) -> None:
+    """The ~5% name≠stem path (§3 flag, pinned per heavy-gate NIT). The feed
+    stable key is path-based (``task/<stem>.md``) but ``compute_today_view``
+    dedups AND the curated wikilink round-trips on the ``name`` field — so after
+    accept the committed re-emit lands under a DIFFERENT id (``task/<name>.md``).
+
+    Case-B pin: (a) exactly ONE open committed slot after the next emit +
+    reconcile — compute's name-keyed dedup suppresses the auto candidate, so
+    NO double-surface; (b) the old ``task:<stem-path>`` id is folded ``acted``
+    (the accept set it) and never revived (it was acted, so it never enters
+    ``previously_open`` — the new name-derived id opens a fresh episode)."""
+    vault = _vault(tmp_path)
+    _task_due_today_named(vault, filename="pay-bill", name="Pay Bill")
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+
+    # Auto candidate — its feed id is path/stem-based.
+    item = _slot_items(vault)[0]
+    old_id = item.id
+    assert old_id == "slot_suggestion:task:task/pay-bill.md"
+    assert item.evidence["candidate"] is True
+    store.upsert(item)
+
+    _act(store, cfg, vault, old_id, "accept")
+    assert store.load()[old_id].state == STATE_ACTED
+
+    # Next fire re-emits the committed entry under a NAME-derived id → reconcile.
+    try_feed_reconcile(store, "slot_suggestion", _slot_items(vault))
+
+    folded = store.load()
+    open_slots = [
+        i for i in folded.values()
+        if i.kind == "slot_suggestion" and i.state == STATE_OPEN
+    ]
+    # (a) exactly ONE open committed slot — no double-surface.
+    assert len(open_slots) == 1
+    committed = open_slots[0]
+    assert committed.id == "slot_suggestion:task:task/Pay Bill.md"  # name-derived
+    assert committed.id != old_id
+    assert committed.evidence["candidate"] is False
+    assert committed.evidence["confirmed"] is True
+    # (b) the old auto id is folded acted, never revived.
+    assert folded[old_id].state == STATE_ACTED
 
 
 # ---------------------------------------------------------------------------
