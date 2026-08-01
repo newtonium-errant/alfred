@@ -435,6 +435,22 @@ def _dispatch_slot_completion(
     today = _today_for(config)
 
     if action_id == UNDO_DONE_ACTION:
+        # An item acted-by-ACCEPT (planned, not completed) has NO completion to
+        # reverse and there is no un-accept writer in v1 — refuse honestly rather
+        # than routing to the completion-undo writer (which would find nothing
+        # logged and misleadingly flip the item back to open). "un-accept via
+        # chat" is the honest fallback (task #21).
+        if getattr(item, "acted_action", None) == ACCEPT_ACTION:
+            log.info(
+                "feed.act.slot.undo_on_accepted", id=feed_item_id, lane=lane,
+                action=action_id,
+            )
+            return ActResult(
+                False, STATUS_UNSUPPORTED_ITEM,
+                "this was added to today's plan, not completed — there's nothing "
+                "to undo (un-accept via chat)",
+                feed_item_id, action_id,
+            )
         # Undo only when the item is CURRENTLY done — freshly board-acted
         # (state=acted) OR still-open-but-done-in-vault (evidence.done: completed
         # via the talker, or a reconcile revived a board-acted item back to open
@@ -492,7 +508,7 @@ def _slot_done(
             Path(vault_path) / rel, item_text, today.isoformat(),
         )
         if result.ok:
-            feed_store.set_state(feed_item_id, STATE_ACTED)
+            feed_store.set_state(feed_item_id, STATE_ACTED, action=DONE_ACTION)
             log.info(
                 "feed.act.slot.done", id=feed_item_id, lane=lane,
                 kind=result.kind, item=item_text,
@@ -523,7 +539,7 @@ def _slot_done(
             )
         result = mark_task_done(Path(vault_path), rel, today.isoformat())
         if result.kind in (TASK_DONE_KIND_SUCCESS, TASK_DONE_KIND_IDEMPOTENT_NOOP):
-            feed_store.set_state(feed_item_id, STATE_ACTED)
+            feed_store.set_state(feed_item_id, STATE_ACTED, action=DONE_ACTION)
             log.info(
                 "feed.act.slot.done", id=feed_item_id, lane=lane,
                 kind=result.kind, item=result.name or item_text,
@@ -547,7 +563,7 @@ def _slot_done(
 
     result = mark_t3_done(Path(vault_path), item_text, completed_at=today, today=today)
     if result.kind in (TIER_DONE_KIND_SUCCESS, TIER_DONE_KIND_IDEMPOTENT_NOOP):
-        feed_store.set_state(feed_item_id, STATE_ACTED)
+        feed_store.set_state(feed_item_id, STATE_ACTED, action=DONE_ACTION)
         log.info(
             "feed.act.slot.done", id=feed_item_id, lane=lane,
             kind=result.kind, item=item_text,
@@ -736,7 +752,10 @@ def _dispatch_slot_confirm(
         date=today,
     )
     if result.ok:
-        feed_store.set_state(feed_item_id, STATE_ACTED)
+        # Stamp the acting verb so the fold distinguishes accept-acted (PLANNED,
+        # still completable) from done-acted (DONE). See _act_locked's verb-aware
+        # gate + the FeedItem.acted_action docstring.
+        feed_store.set_state(feed_item_id, STATE_ACTED, action=ACCEPT_ACTION)
         log.info(
             "feed.act.slot.accepted", id=feed_item_id, tier=result.tier,
             kind=result.kind, item=result.name,
@@ -842,14 +861,29 @@ def _act_locked(
     # expired item is an idempotent ok-noop (the deck may double-tap or race a
     # reconcile); we never re-drive a resolver for it.
     #
-    # THE ONE EXCEPTION: ``undo_done`` on a slot_suggestion acts on an item that
-    # is DONE — i.e. already ``acted`` (the board's done set it). It must reach
-    # the slot dispatcher below to reverse the completion, so it is exempt from
-    # the acted-is-final gate. (An undo on an OPEN item — done via a non-board
-    # path, still emitted open with evidence.done=true — passes this gate
-    # naturally.) Every other (kind, action) on a non-open item is the noop.
+    # EXCEPTION 1: ``undo_done`` on a slot_suggestion acts on an item that is
+    # DONE — i.e. already ``acted`` (the board's done set it). It must reach the
+    # slot dispatcher below to reverse the completion, so it is exempt from the
+    # acted-is-final gate. (An undo on an OPEN item — done via a non-board path,
+    # still emitted open with evidence.done=true — passes this gate naturally.)
+    #
+    # EXCEPTION 2 (Phase C slice 2): ``done`` on a slot item acted-by-ACCEPT.
+    # An accepted item is ``state=acted`` with ``acted_action="accept"`` — it's
+    # PLANNED, not completed. Completing it must NOT be swallowed as
+    # already_acted (that re-opened the operator's #1 friction: he couldn't ✓ an
+    # item he accepted this morning until the next producer emit revived it,
+    # hours away). So a done on an accept-acted slot item is exempt — it reaches
+    # the completion writer, which re-stamps ``acted_action="done"``. A done on a
+    # done-acted item stays the idempotent already_acted noop.
+    #
+    # Every other (kind, action) on a non-open item is the noop.
     _is_slot_undo = item.kind == SLOT_KIND and action_id == UNDO_DONE_ACTION
-    if item.state != STATE_OPEN and not _is_slot_undo:
+    _is_slot_done_on_accepted = (
+        item.kind == SLOT_KIND
+        and action_id == DONE_ACTION
+        and getattr(item, "acted_action", None) == ACCEPT_ACTION
+    )
+    if item.state != STATE_OPEN and not (_is_slot_undo or _is_slot_done_on_accepted):
         log.info(
             "feed.act.already_acted", id=feed_item_id, action=action_id,
             state=item.state,

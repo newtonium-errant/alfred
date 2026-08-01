@@ -101,8 +101,17 @@ class FeedStore:
             if existing is None:
                 return  # state for an id we've never upserted — nothing to fold onto
             existing.state = new_state
-            if new_state == STATE_ACTED and not existing.acted_at:
-                existing.acted_at = event.get("ts") or _now_iso()
+            if new_state == STATE_ACTED:
+                # ``acted_action`` tracks the VERB of the LATEST acted event
+                # (newest wins: an accept then a later done ends "done"). A
+                # legacy / verbless acted event (e.g. reconcile-decided) → None.
+                existing.acted_action = event.get("action")
+                if not existing.acted_at:
+                    existing.acted_at = event.get("ts") or _now_iso()
+            else:
+                # Non-acted transition (open via undo/revival, acked, expired) —
+                # the item is no longer acted, so clear the verb.
+                existing.acted_action = None
         # Unknown ev → deliberately skipped (forward-compat).
 
     # --- write primitives (assume the lock is HELD by the caller) ------------
@@ -171,9 +180,16 @@ class FeedStore:
             self._append_lines_locked([{"ev": "upsert", "ts": _now_iso(), "item": payload}])
             self._maybe_compact_locked()
 
-    def set_state(self, item_id: str, state: str) -> None:
+    def set_state(self, item_id: str, state: str, *, action: str | None = None) -> None:
+        """Append a state transition. ``action`` (optional) records the acting
+        VERB on an ``acted`` transition (e.g. ``"accept"`` / ``"done"``) so the
+        fold can distinguish accept-acted from done-acted; omitted → legacy None
+        (backward-compatible with every existing caller)."""
+        event: dict[str, Any] = {"ev": "state", "ts": _now_iso(), "id": item_id, "state": state}
+        if action is not None:
+            event["action"] = action
         with file_rmw_lock(self.path):
-            self._append_lines_locked([{"ev": "state", "ts": _now_iso(), "id": item_id, "state": state}])
+            self._append_lines_locked([event])
             self._maybe_compact_locked()
 
     def compact(self) -> None:

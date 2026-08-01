@@ -57,6 +57,60 @@ def test_state_for_unknown_id_is_ignored(tmp_path: Path) -> None:
     assert s.load() == {}
 
 
+# --- acted_action (Phase C slice 2 — the acted verb) -------------------------
+
+
+def test_set_state_stamps_acted_action(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.upsert(_item("slot_suggestion", "task:task/X.md"))
+    s.set_state("slot_suggestion:task:task/X.md", STATE_ACTED, action="accept")
+    folded = s.load()["slot_suggestion:task:task/X.md"]
+    assert folded.state == STATE_ACTED
+    assert folded.acted_action == "accept"
+
+
+def test_acted_action_newest_event_wins(tmp_path: Path) -> None:
+    """accept then a later done → the fold ends "done" (newest acted wins)."""
+    s = _store(tmp_path)
+    s.upsert(_item("slot_suggestion", "task:task/X.md"))
+    s.set_state("slot_suggestion:task:task/X.md", STATE_ACTED, action="accept")
+    s.set_state("slot_suggestion:task:task/X.md", STATE_ACTED, action="done")
+    assert s.load()["slot_suggestion:task:task/X.md"].acted_action == "done"
+
+
+def test_acted_action_legacy_verbless_event_is_none(tmp_path: Path) -> None:
+    """A legacy acted event (no ``action`` — pre-amendment / reconcile-decided)
+    folds to ``acted_action=None`` (C1 compat)."""
+    s = _store(tmp_path)
+    s.upsert(_item("slot_suggestion", "task:task/X.md"))
+    s.set_state("slot_suggestion:task:task/X.md", STATE_ACTED)  # no action
+    folded = s.load()["slot_suggestion:task:task/X.md"]
+    assert folded.state == STATE_ACTED
+    assert folded.acted_action is None
+
+
+def test_acted_action_cleared_on_return_to_open(tmp_path: Path) -> None:
+    """A non-acted transition (undo → open) clears the verb — an open item never
+    carries a stale acted_action."""
+    s = _store(tmp_path)
+    s.upsert(_item("slot_suggestion", "task:task/X.md"))
+    s.set_state("slot_suggestion:task:task/X.md", STATE_ACTED, action="accept")
+    s.set_state("slot_suggestion:task:task/X.md", STATE_OPEN)
+    folded = s.load()["slot_suggestion:task:task/X.md"]
+    assert folded.state == STATE_OPEN
+    assert folded.acted_action is None
+
+
+def test_acted_action_in_list_payload(tmp_path: Path) -> None:
+    """acted_action rides the list payload (to_dict) so GET /feed/items exposes
+    it to the FE."""
+    s = _store(tmp_path)
+    s.upsert(_item("slot_suggestion", "task:task/X.md"))
+    s.set_state("slot_suggestion:task:task/X.md", STATE_ACTED, action="accept")
+    payload = s.load()["slot_suggestion:task:task/X.md"].to_dict()
+    assert payload["acted_action"] == "accept"
+
+
 def test_empty_store_loads_empty(tmp_path: Path) -> None:
     assert _store(tmp_path).load() == {}
 

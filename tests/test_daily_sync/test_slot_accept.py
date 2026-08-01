@@ -37,6 +37,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import frontmatter
 import pytest
 import structlog
 
@@ -46,6 +47,8 @@ from alfred.daily_sync.action_router import (
     STATUS_ACTED,
     STATUS_ALREADY_ACTED,
     STATUS_INVALID_ACTION,
+    STATUS_UNDONE,
+    STATUS_UNSUPPORTED_ITEM,
     act,
 )
 from alfred.daily_sync.config import DailySyncConfig
@@ -117,6 +120,18 @@ def _task_due_today_named(vault: Path, *, filename: str, name: str) -> None:
         f"---\ntype: task\nstatus: todo\nname: {name}\ndue: {TODAY_ISO}\n---\n\n# {name}\n",
         encoding="utf-8",
     )
+
+
+def _routine_selfcare(vault: Path, *, item: str = "Meditate") -> Path:
+    """A self-care routine item — surfaces T3 every day until completed."""
+    p = vault / "routine" / "Self Care.md"
+    p.write_text(
+        "---\ntype: routine\nstatus: active\nname: Self Care\ncadence:\n  type: daily\n"
+        f"items:\n- text: {item}\n  priority: aspirational\n  self_care: true\n"
+        "---\n\n# Self Care\n",
+        encoding="utf-8",
+    )
+    return p
 
 
 def _daily_path(vault: Path) -> Path:
@@ -688,3 +703,153 @@ def test_two_accept_taps_serialize_to_one_entry(tmp_path: Path) -> None:
     assert len(load_daily_curation(vault, TODAY).t1) == 1  # exactly one entry
     assert all(r.ok for r in results)
     assert sorted(r.status for r in results) == [STATUS_ACTED, STATUS_ALREADY_ACTED]
+
+
+# ---------------------------------------------------------------------------
+# acted_action verb amendment — complete an accepted item BEFORE the re-emit
+# ---------------------------------------------------------------------------
+# The seam b3cd found: after accept, the item is state=acted with NO verb — so
+# a same-window `done` was swallowed as already_acted (operator couldn't ✓ an
+# item he accepted until the next producer emit, hours away — his #1 friction
+# re-opened). The verb-stamped state event + verb-aware gate closes it.
+
+
+def test_accept_stamps_acted_action_accept(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _candidate_item(
+        tier=1, origin="task", name="Interview", path="task/Interview.md",
+        source="auto-due", confirmed=False, stable_key="task:task/Interview.md",
+    )
+    store.upsert(item)
+
+    _act(store, cfg, vault, item.id, "accept")
+    assert store.load()[item.id].acted_action == "accept"
+
+
+def test_accept_then_done_same_window_both_writes_land(tmp_path: Path) -> None:
+    """OPERATOR SCENARIO: accept a T1 task, then ✓ it the SAME morning (before
+    any re-emit). The done is NOT swallowed as already_acted — it reaches the
+    completion writer. Both writes land (curation confirmed entry + task status
+    done), and the folded acted_action ends "done"."""
+    vault = _vault(tmp_path)
+    _task_due_today(vault, name="Interview")
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _slot_items(vault)[0]
+    store.upsert(item)
+
+    acc = _act(store, cfg, vault, item.id, "accept")
+    assert acc.ok and acc.status == STATUS_ACTED
+    assert len(load_daily_curation(vault, TODAY).t1) == 1  # ACCEPT write
+    assert store.load()[item.id].acted_action == "accept"
+
+    done = _act(store, cfg, vault, item.id, "done")  # same window
+    assert done.ok and done.status == STATUS_ACTED  # NOT already_acted
+    fm = frontmatter.load(str(vault / "task" / "Interview.md")).metadata
+    assert fm["status"] == "done"  # DONE write landed
+    assert str(fm["completed"]) == TODAY_ISO
+    assert len(load_daily_curation(vault, TODAY).t1) == 1  # accept write survived
+    assert store.load()[item.id].acted_action == "done"  # re-stamped
+
+
+def test_accepted_item_reload_stable_planned_signal(tmp_path: Path) -> None:
+    """RELOAD-STABILITY: an accepted item folds to state=acted +
+    acted_action=accept + evidence.candidate=true on a FRESH store instance —
+    the FE reads PLANNED reload-stably, no regression to amber."""
+    vault = _vault(tmp_path)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _candidate_item(
+        tier=1, origin="task", name="Interview", path="task/Interview.md",
+        source="auto-due", confirmed=False, stable_key="task:task/Interview.md",
+    )
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "accept")
+
+    reloaded = FeedStore(str(tmp_path / "feed.jsonl")).load()[item.id]
+    assert reloaded.state == STATE_ACTED
+    assert reloaded.acted_action == "accept"
+    assert reloaded.evidence["candidate"] is True  # FE: acted+accept → PLANNED
+
+
+def test_done_on_done_acted_is_idempotent_already_acted(tmp_path: Path) -> None:
+    """GATE MATRIX: done on a DONE-acted item stays the idempotent already_acted
+    noop (only accept-acted is exempt from the gate)."""
+    vault = _vault(tmp_path)
+    _task_due_today(vault, name="Interview")
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _slot_items(vault)[0]
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "accept")
+    _act(store, cfg, vault, item.id, "done")  # now done-acted
+
+    third = _act(store, cfg, vault, item.id, "done")
+    assert third.ok and third.status == STATUS_ALREADY_ACTED
+
+
+def test_undo_on_accepted_is_refused_no_vault_change(tmp_path: Path) -> None:
+    """GATE MATRIX: undo on an accept-acted item is refused honestly (no
+    un-accept writer v1) — the daily file is byte-unchanged, verb unchanged."""
+    vault = _vault(tmp_path)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _candidate_item(
+        tier=1, origin="task", name="Interview", path="task/Interview.md",
+        source="auto-due", confirmed=False, stable_key="task:task/Interview.md",
+    )
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "accept")
+
+    before = _daily_path(vault).read_text(encoding="utf-8")
+    undo = _act(store, cfg, vault, item.id, "undo_done")
+    after = _daily_path(vault).read_text(encoding="utf-8")
+
+    assert not undo.ok and undo.status == STATUS_UNSUPPORTED_ITEM
+    assert after == before  # no un-accept write
+    assert store.load()[item.id].acted_action == "accept"  # unchanged
+
+
+def test_undo_on_done_acted_reverses_completion(tmp_path: Path) -> None:
+    """GATE MATRIX: undo on a DONE-acted item (accept → done → undo) reverses the
+    completion normally — the accept-refusal guard does not fire (verb is
+    "done", not "accept")."""
+    vault = _vault(tmp_path)
+    _routine_selfcare(vault)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = [it for it in _slot_items(vault) if it.evidence.get("routine_record")][0]
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "accept")
+    _act(store, cfg, vault, item.id, "done")  # completes → acted_action=done
+
+    undo = _act(store, cfg, vault, item.id, "undo_done")
+    assert undo.ok and undo.status == STATUS_UNDONE
+    cl = dict(frontmatter.load(str(vault / "routine" / "Self Care.md")).metadata.get("completion_log") or {})
+    assert cl.get("Meditate") == []  # completion date removed
+
+
+def test_undo_on_accepted_emits_named_log(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = _candidate_item(
+        tier=1, origin="task", name="Interview", path="task/Interview.md",
+        source="auto-due", confirmed=False, stable_key="task:task/Interview.md",
+    )
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "accept")
+
+    with structlog.testing.capture_logs() as cap:
+        _act(store, cfg, vault, item.id, "undo_done")
+
+    events = [c for c in cap if c.get("event") == "feed.act.slot.undo_on_accepted"]
+    assert len(events) == 1
+
+
+def test_done_stamps_acted_action_done(tmp_path: Path) -> None:
+    """The done dispatches stamp acted_action="done" (all slot lanes) — pinned
+    on the routine lane."""
+    vault = _vault(tmp_path)
+    _routine_selfcare(vault)
+    store, cfg = _store(tmp_path), _ds_config(tmp_path)
+    item = [it for it in _slot_items(vault) if it.evidence.get("routine_record")][0]
+    store.upsert(item)
+
+    _act(store, cfg, vault, item.id, "done")  # direct done (not via accept)
+    assert store.load()[item.id].acted_action == "done"
