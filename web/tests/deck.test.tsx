@@ -533,4 +533,24 @@ describe('Deck — re-tier picker (task #28 render)', () => {
     expect(screen.getAllByTestId('deck-card')[0].textContent).toContain('Email A');
     expect(mockAct).not.toHaveBeenCalled(); // no act fired from the gated arrow
   });
+
+  // The iOS dead-tap fix: the tap DID fire (picker opened), but the overlay opened at
+  // z-20 BEHIND the z-100 top card → invisible → read as unresponsive. Pin the fix in the
+  // closest jsdom-testable form: the picker's z-index sits ABOVE the top card's.
+  it('the picker opens ABOVE the top card, not hidden behind it (#28 tap fix)', () => {
+    render(<Deck items={[emailItem({ id: 'a', title: 'Email A' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-retier-open')));
+    const picker = screen.getByTestId('deck-retier-picker');
+    const topCard = screen.getAllByTestId('deck-card')[0];
+    expect(Number(picker.style.zIndex)).toBeGreaterThan(Number(topCard.style.zIndex));
+  });
+
+  it('the parked panel also opens ABOVE the top card mid-deck (same latent z bug, closed)', () => {
+    render(<Deck items={[emailItem({ id: 'a', title: 'Email A' }), item({ id: 'b', title: 'Bee' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b, panel available
+    act(() => fireEvent.click(screen.getByTestId('deck-parked'))); // open the panel WITH a card present
+    const panel = screen.getByTestId('deck-parked-panel');
+    const topCard = screen.getAllByTestId('deck-card')[0];
+    expect(Number(panel.style.zIndex)).toBeGreaterThan(Number(topCard.style.zIndex));
+  });
 });

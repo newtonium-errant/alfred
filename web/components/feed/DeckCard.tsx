@@ -5,6 +5,13 @@ import { ringTierOf } from '../../lib/algernon/rings';
 import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import { EvidenceBody } from './EvidenceBody';
 
+// The top card's z-index base — each card sits at `DECK_CARD_BASE_Z - depth` (the top at
+// the base). Any overlay meant to sit ABOVE the card stack (the parked drill, the re-tier
+// picker) MUST exceed this, or it opens BEHIND the top card and reads as a dead tap on the
+// real device (the #28 re-tier bug: z-20 overlay < z-100 card → invisible, jsdom can't see
+// stacking). Exported so those overlays derive their z from it and can't drift below.
+export const DECK_CARD_BASE_Z = 100;
+
 // Presentational deck card. All content is rendered as React text children
 // (auto-escaped) — evidence is untrusted display data, so NOTHING here uses
 // dangerouslySetInnerHTML or renders an href from item data (#22 XSS precedent).
@@ -63,7 +70,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
       data-kind={item.kind}
       className="absolute inset-0 m-auto flex max-h-[360px] touch-none select-none flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
       style={{
-        zIndex: 100 - depth,
+        zIndex: DECK_CARD_BASE_Z - depth,
         transform: `translateY(${depth * 10}px) scale(${1 - depth * 0.035})`,
         opacity: depth > 2 ? 0 : 1,
         pointerEvents: depth === 0 ? 'auto' : 'none',

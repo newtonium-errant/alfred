@@ -10,7 +10,13 @@ import {
   verdictForDrag,
 } from '../../lib/algernon/feedConstants';
 import { useDeck } from './useDeck';
-import { DeckCard } from './DeckCard';
+import { DeckCard, DECK_CARD_BASE_Z } from './DeckCard';
+
+// Overlays (the parked drill, the re-tier picker) must sit ABOVE the whole card stack —
+// the top card is at DECK_CARD_BASE_Z, so an overlay below it opens invisibly behind the
+// card and reads as a dead tap (the #28 re-tier bug). Derived from the card base so it
+// can't drift below. Inline (not a Tailwind z-class) so the ordering is jsdom-testable.
+const OVERLAY_Z_INDEX = DECK_CARD_BASE_Z + 10;
 
 export interface DeckProps {
   items: FeedItem[];
@@ -214,7 +220,8 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
             data-testid="deck-parked-panel"
             role="dialog"
             aria-label="Parked cards"
-            className="absolute inset-0 z-20 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+            style={{ zIndex: OVERLAY_Z_INDEX }}
+            className="absolute inset-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
           >
             <div className="mb-2 flex items-center justify-between">
               <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
@@ -271,7 +278,8 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
             data-testid="deck-retier-picker"
             role="dialog"
             aria-label="Adjust email tier"
-            className="absolute inset-0 z-20 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+            style={{ zIndex: OVERLAY_Z_INDEX }}
+            className="absolute inset-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
           >
             <div className="mb-2 flex items-center justify-between">
               <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">Adjust tier</p>
