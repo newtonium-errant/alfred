@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
 import { callTransport } from '../../../lib/algernon/transport';
-import { sendTransportError } from '../../../lib/algernon/bffError';
+import { mapUpstreamWrongPeer, sendTransportError } from '../../../lib/algernon/bffError';
 
 // GET /api/brief/narration → the day's speakable narration JSON (c2's C3a
 // GET /web/brief/narration): {brief_date, segments[], total_words, empty}, or the
@@ -23,6 +23,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   try {
     const { status, body } = await callTransport('GET', '/web/brief/narration', { sessionToken });
+    // A post-auth wrong_peer 401 (BFF peer misconfig) → 502, never a fake logout; a real
+    // invalid_session 401 relays for the re-login path.
+    if (mapUpstreamWrongPeer(res, 'brief/narration', status, body)) return;
     return res.status(status).json(body ?? {});
   } catch (e) {
     return sendTransportError(res, 'brief/narration', e);

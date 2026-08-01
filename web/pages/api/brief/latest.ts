@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
 import { callTransport } from '../../../lib/algernon/transport';
-import { sendTransportError } from '../../../lib/algernon/bffError';
+import { mapUpstreamWrongPeer, sendTransportError } from '../../../lib/algernon/bffError';
 
 // GET /api/brief/latest?kind=brief|daily_sync → the latest daemon-spooled
 // outbound artifact ({kind, date, markdown}) from the home instance's
@@ -38,6 +38,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const { status, body } = await callTransport('GET', `/web/outbound/${kind}/latest`, {
       sessionToken,
     });
+    // A post-auth wrong_peer 401 (BFF peer misconfig) → 502, never a fake logout; a real
+    // invalid_session 401 relays for re-login. Fence-widened here alongside brief/audio +
+    // brief/narration (deliberate — this #30-era route had the same relay gap; consistency
+    // over per-lane bolt-ons, flagged to the reviewer).
+    if (mapUpstreamWrongPeer(res, 'brief/latest', status, body)) return;
     return res.status(status).json(body ?? {});
   } catch (e) {
     return sendTransportError(res, 'brief/latest', e);

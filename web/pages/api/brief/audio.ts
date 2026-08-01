@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
 import { callTransportRaw } from '../../../lib/algernon/transport';
-import { sendTransportError } from '../../../lib/algernon/bffError';
+import { mapUpstreamWrongPeer, sendTransportError } from '../../../lib/algernon/bffError';
 
 // GET /api/brief/audio[?speed=0.7-1.2] → the day's briefing mp3 (c2's C3a
 // GET /web/brief/audio). Forwards the transport response by content-type: audio/mpeg
@@ -48,6 +48,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     } catch {
       body = null;
     }
+    // A post-auth wrong_peer 401 (BFF peer misconfig) → 502, never a fake logout; a real
+    // invalid_session 401 relays for the re-login path. (The raw proxy must map this
+    // itself — callTransportRaw returns the status verbatim; see its docstring.)
+    if (mapUpstreamWrongPeer(res, 'brief/audio', upstream.status, body)) return;
     return res.status(upstream.status).json(body ?? {});
   } catch (e) {
     return sendTransportError(res, 'brief/audio', e);

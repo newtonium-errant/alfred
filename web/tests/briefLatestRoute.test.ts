@@ -109,12 +109,25 @@ describe('GET /api/brief/latest (#30)', () => {
     expect(json).toHaveBeenCalledWith(empty);
   });
 
-  it('maps a backend 401 through to the client (401→401)', async () => {
+  // The ambiguous upstream 401, BOTH directions (fence-widened fix — this #30-era route
+  // shared the relay gap with the new brief/audio + brief/narration routes):
+  it('RELAYS an invalid_session upstream 401 to the client (real expiry → re-login, not mapped)', async () => {
     mockResolveSessionToken.mockReturnValue('tok');
     mockCallTransport.mockResolvedValue({ status: 401, body: { error: 'invalid_session' } });
     const { res, status, json } = mockRes();
     await handler(briefReq('brief'), res);
-    expect(status).toHaveBeenCalledWith(401);
+    expect(status).toHaveBeenCalledWith(401); // ← reddens if a blanket map breaks re-login
     expect(json).toHaveBeenCalledWith({ error: 'invalid_session' });
+  });
+
+  it('maps a wrong_peer upstream 401 → 502 (peer misconfig, never a bare 401 = never a fake logout)', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransport.mockResolvedValue({ status: 401, body: { error: 'wrong_peer' } });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { res, status, json } = mockRes();
+    await handler(briefReq('brief'), res);
+    expect(status).toHaveBeenCalledWith(502);
+    expect(json).toHaveBeenCalledWith({ error: 'brief_upstream_unavailable' });
+    expect(warn).toHaveBeenCalledWith('[bff:brief/latest] upstream_auth_misconfig');
   });
 });

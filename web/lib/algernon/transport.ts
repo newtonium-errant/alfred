@@ -110,6 +110,10 @@ export async function callTransport(
  * token + relayed session token (same auth as callTransport); Accept covers both.
  * Timeout-bounded like the buffered path. DO NOT parseJsonOrNull here (it would
  * consume the audio body).
+ *
+ * Returns the upstream STATUS verbatim — a raw caller MUST map a `wrong_peer` 401 → 502
+ * itself (the B2 fake-logout guard, via bffError.mapUpstreamWrongPeer); this helper does
+ * NOT do it (it can't discriminate the body without consuming the stream).
  */
 export async function callTransportRaw(method: 'GET', path: string, opts: CallOptions = {}): Promise<Response> {
   const headers: Record<string, string> = {
