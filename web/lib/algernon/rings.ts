@@ -181,13 +181,22 @@ export function ringItemVisibleToday(item: FeedItem, now: Date = new Date()): bo
 
 /**
  * The Case-B dedup key: two slot items are the SAME logical commitment when they
- * share (tier, origin, evidence.name). A T3 / 5%-task accept re-emits the committed
- * item under a NEW id (text:-keyed) while the spent acted-by-accept OLD id persists
- * in the raw store list forever — same (tier, origin, name), different id.
+ * share (tier, evidence.name). A T3 / 5%-task accept re-emits the committed item
+ * under a NEW id (text:-keyed) while the spent acted-by-accept OLD id persists in the
+ * raw store list forever.
+ *
+ * ORIGIN DROPS OUT (verified against c2's T3 before/after at 94a6dcfd): a T3 TASK
+ * candidate's committed re-emit FLIPS origin (task → routine_item — the free-text
+ * T3Entry is re-read as routine_item regardless of the candidate's origin), so
+ * keying on origin would MISS the task-lane phantom (the routine lane keeps origin,
+ * the task lane doesn't). `name` is stable across the flip in both lanes. Accepted
+ * false-positive: a routine item + a same-name task in one tier (one accepted, one
+ * open) — worst case a transient chip hides behind an identically-named open item
+ * for a few hours (an existence-vs-stage non-event, not a lost commitment).
  */
 function slotDedupKey(item: FeedItem): string {
   const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
-  return `${ringTierOf(item) ?? ''}|${String(ev.origin ?? '')}|${String(ev.name ?? '')}`;
+  return `${ringTierOf(item) ?? ''}|${String(ev.name ?? '')}`;
 }
 
 /**
@@ -197,11 +206,12 @@ function slotDedupKey(item: FeedItem): string {
  * dropping a completion.
  *
  * CASE-B DEDUP: an accepted item's committed re-emit (an OPEN sibling on the same
- * tier+origin+name) supersedes the spent acted-by-accept phantom — the new-id
- * T3 / 5%-task path leaves BOTH in the raw list (the FE list route returns all
- * states; compute-dedup doesn't cover it). Drop the acted-by-accept phantom so the
- * committed denominator isn't double-counted; a TRANSIENT accepted item with no
- * open sibling yet is kept (it shows as PLANNED during the accept→re-emit window).
+ * (tier, name) — see slotDedupKey for why origin drops out) supersedes the spent
+ * acted-by-accept phantom — the new-id T3 / 5%-task path leaves BOTH in the raw list
+ * (the FE list route returns all states; compute-dedup doesn't cover it). Drop the
+ * acted-by-accept phantom so the committed denominator isn't double-counted; a
+ * TRANSIENT accepted item with no open sibling yet is kept (it shows as PLANNED
+ * during the accept→re-emit window).
  *
  * Non-slot / invalid-tier / not-today items are dropped (defensive). Always returns
  * exactly three buckets so an empty tier renders its own (red) empty ring.

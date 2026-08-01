@@ -189,29 +189,29 @@ describe('tierRingBuckets', () => {
     expect(buckets[0].items.map((i) => i.id).sort()).toEqual(['done-today', 'open']);
   });
 
-  it('Case-B dedup: an OPEN committed re-emit suppresses the spent acted-by-accept phantom (same tier+origin+name, new id)', () => {
+  it('Case-B dedup: an OPEN committed re-emit suppresses the spent acted-by-accept phantom, keyed on (tier, name) — origin DROPS OUT', () => {
     const now = new Date('2026-07-31T15:00:00Z');
+    // Two T3 phantom pairs, verbatim from c2's before/after at 94a6dcfd:
     const buckets = tierRingBuckets(
       [
-        // The spent T3 accept phantom — old routine-keyed id, acted-by-accept, persists forever.
-        slot({
-          id: 'slot_suggestion:routine:Self Care::Meditate',
-          state: 'acted',
-          acted_at: '2026-07-31T16:00:00Z',
-          acted_action: 'accept',
-          evidence: { tier: 3, origin: 'routine_item', name: 'Meditate', candidate: true },
-        }),
-        // The committed re-emit — new text-keyed id, OPEN, same tier+origin+name.
-        slot({
-          id: 'slot_suggestion:text:Meditate',
-          state: 'open',
-          evidence: { tier: 3, origin: 'routine_item', name: 'Meditate', candidate: false },
-        }),
+        // (a) self-care ROUTINE — origin MATCHES (routine_item both). Collapses under
+        //     either key; the baseline.
+        slot({ id: 'slot_suggestion:routine:Self Care::Meditate', state: 'acted', acted_at: '2026-07-31T16:00:00Z', acted_action: 'accept', evidence: { tier: 3, origin: 'routine_item', name: 'Meditate', candidate: true } }),
+        slot({ id: 'slot_suggestion:text:Meditate', state: 'open', evidence: { tier: 3, origin: 'routine_item', name: 'Meditate', candidate: false } }),
+        // (b) self-care TASK — origin FLIPS on commit (task → routine_item, the free-text
+        //     T3Entry re-read). ← the GAP-CATCHER: (tier,origin,name) would MISS this and
+        //     leave the phantom; only (tier,name) collapses it. This pin reddens if origin
+        //     is ever re-added to the key.
+        slot({ id: 'slot_suggestion:task:task/Book a massage.md', state: 'acted', acted_at: '2026-07-31T16:00:00Z', acted_action: 'accept', evidence: { tier: 3, origin: 'task', name: 'Book a massage', candidate: true } }),
+        slot({ id: 'slot_suggestion:text:Book a massage', state: 'open', evidence: { tier: 3, origin: 'routine_item', name: 'Book a massage', candidate: false } }),
       ],
       now,
     );
-    // Exactly ONE T3 item — the phantom is deduped (the committed denominator isn't doubled).
-    expect(buckets[2].items.map((i) => i.id)).toEqual(['slot_suggestion:text:Meditate']);
+    // Both phantoms deduped → only the two committed (open) re-emits survive in T3.
+    expect(buckets[2].items.map((i) => i.id).sort()).toEqual([
+      'slot_suggestion:text:Book a massage',
+      'slot_suggestion:text:Meditate',
+    ]);
   });
 
   it('Case-B: an acted-by-accept with NO open sibling is KEPT (the transient accepted item shows)', () => {
