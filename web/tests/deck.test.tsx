@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, renderHook, screen } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen } from '@testing-library/react';
 
 // Pins the deck state machine (useDeck) + the card's defensive render. The
 // intricate parts — DELAYED ACT (fire on timeout / flush-on-next / cancel-on-undo,
@@ -11,6 +11,7 @@ const { mockAct } = vi.hoisted(() => ({ mockAct: vi.fn() }));
 vi.mock('../lib/algernon/feed', () => ({ feedApi: { act: mockAct, list: vi.fn() } }));
 
 import { useDeck } from '../components/feed/useDeck';
+import { Deck } from '../components/feed/Deck';
 import { DeckCard } from '../components/feed/DeckCard';
 import { UNDO_MS } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
@@ -106,6 +107,70 @@ describe('useDeck — park (client-side defer, no POST)', () => {
     act(() => result.current.undo()); // un-park b
     expect(result.current.parkedCount).toBe(1);
     expect(unparkPersist).toHaveBeenCalledWith('b');
+  });
+});
+
+describe('useDeck — parked retention + deal-now (task #26)', () => {
+  it('park RETAINS the item (title + kind) for the drill-down; parkedCount = parked.length', () => {
+    const items = [item({ id: 'a', title: 'Alpha' }), item({ id: 'b' })];
+    const { result } = renderHook(() => useDeck({ items }));
+    act(() => result.current.park());
+    expect(result.current.parkedCount).toBe(1);
+    expect(result.current.parked.map((p) => p.id)).toEqual(['a']);
+    expect(result.current.parked[0].title).toBe('Alpha');
+  });
+
+  it('dealNow un-parks (persist) and re-enters the card into the queue immediately', () => {
+    const unpark = vi.fn();
+    const items = [item({ id: 'a' }), item({ id: 'b' })];
+    const { result } = renderHook(() => useDeck({ items, onUnparkPersist: unpark }));
+    act(() => result.current.park());   // park a → current b
+    act(() => result.current.affirm()); // commit b → deck clears, a parked
+    expect(result.current.cleared).toBe(true);
+    expect(result.current.parkedCount).toBe(1);
+
+    act(() => result.current.dealNow(result.current.parked[0])); // deal a back
+    expect(unpark).toHaveBeenCalledWith('a');
+    expect(result.current.parkedCount).toBe(0);
+    expect(result.current.cleared).toBe(false);
+    expect(result.current.current?.id).toBe('a'); // re-dealt, dealable now
+  });
+
+  it('dealNow appends at the TAIL mid-swipe — the cursor is undisturbed', () => {
+    const items = [item({ id: 'a' }), item({ id: 'b' }), item({ id: 'c' })];
+    const { result } = renderHook(() => useDeck({ items }));
+    act(() => result.current.park()); // park a → current b
+    expect(result.current.current?.id).toBe('b');
+    act(() => result.current.dealNow(result.current.parked[0]));
+    expect(result.current.current?.id).toBe('b'); // cursor NOT reset
+    expect(result.current.parkedCount).toBe(0);
+    // a re-entered at the tail: b → c → a
+    act(() => result.current.affirm()); // b
+    act(() => result.current.affirm()); // c (flushes b in order)
+    expect(result.current.current?.id).toBe('a');
+  });
+
+  it('deal → re-park → deal-again works (a re-dealt card can be parked + dealt again)', () => {
+    const items = [item({ id: 'a' })];
+    const { result } = renderHook(() => useDeck({ items }));
+    act(() => result.current.park());                            // park a (cleared)
+    act(() => result.current.dealNow(result.current.parked[0])); // deal a back → current a
+    expect(result.current.current?.id).toBe('a');
+    act(() => result.current.park());                            // re-park a
+    expect(result.current.parkedCount).toBe(1);
+    act(() => result.current.dealNow(result.current.parked[0])); // deal a AGAIN
+    expect(result.current.parkedCount).toBe(0);
+    expect(result.current.current?.id).toBe('a'); // reachable again, no stuck state
+  });
+
+  it('undo after a park removes it from the parked LIST (not just the count)', () => {
+    const items = [item({ id: 'a' }), item({ id: 'b' })];
+    const { result } = renderHook(() => useDeck({ items }));
+    act(() => result.current.park());
+    expect(result.current.parked.map((p) => p.id)).toEqual(['a']);
+    act(() => result.current.undo());
+    expect(result.current.parked).toEqual([]);
+    expect(result.current.current?.id).toBe('a'); // restored to the deck
   });
 });
 
@@ -312,5 +377,65 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     const face = screen.getByTestId('deck-card').textContent ?? '';
     expect(face).toContain('Take it — T3'); // tier-bearing affirm, not a blind swipe
     expect(face).toContain('Skip'); // LEFT is Skip (park), never a hard reject
+  });
+});
+
+describe('Deck — parked drill-down (task #26 render)', () => {
+  it('the Parked label is a BUTTON that opens the panel listing parked cards', () => {
+    render(<Deck items={[item({ id: 'a', title: 'Alpha' }), item({ id: 'b', title: 'Bravo' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b
+    const label = screen.getByTestId('deck-parked');
+    expect(label.tagName).toBe('BUTTON'); // never a number you can't tap
+    expect(label.textContent).toContain('view'); // advertises its own verb
+    act(() => fireEvent.click(label));
+    expect(screen.getByTestId('deck-parked-panel')).toBeTruthy();
+    const rows = screen.getAllByTestId('deck-parked-row');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain('Alpha');
+  });
+
+  it('deck-clear "View parked" opens the panel; Deal now re-deals + shows the empty ILB', () => {
+    render(<Deck items={[item({ id: 'a', title: 'Alpha' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → deck clears
+    expect(screen.getByTestId('deck-cleared')).toBeTruthy();
+    act(() => fireEvent.click(screen.getByTestId('deck-cleared-view')));
+    expect(screen.getByTestId('deck-parked-panel')).toBeTruthy();
+
+    act(() => fireEvent.click(screen.getByTestId('deck-parked-deal'))); // deal a back
+    expect(screen.getByTestId('deck-parked-empty')).toBeTruthy(); // ILB, not a blank panel
+    expect(screen.queryByTestId('deck-cleared')).toBeNull(); // deck un-cleared
+
+    act(() => fireEvent.click(screen.getByTestId('deck-parked-close')));
+    expect(screen.queryByTestId('deck-parked-panel')).toBeNull();
+    expect(screen.getByTestId('deck-card')).toBeTruthy(); // a is dealt again
+  });
+
+  it('Deal now removes just that card from the list; the others stay parked', () => {
+    render(
+      <Deck
+        items={[item({ id: 'a', title: 'Alpha' }), item({ id: 'b', title: 'Bravo' }), item({ id: 'c', title: 'Charlie' })]}
+      />,
+    );
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park b → current c
+    act(() => fireEvent.click(screen.getByTestId('deck-parked'))); // open the panel
+    expect(screen.getAllByTestId('deck-parked-row')).toHaveLength(2);
+
+    act(() => fireEvent.click(screen.getAllByTestId('deck-parked-deal')[0])); // deal a
+    const rows = screen.getAllByTestId('deck-parked-row');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain('Bravo'); // b stays parked
+  });
+
+  it('panel open → an arrow key does NOT act on the underlying card', () => {
+    render(<Deck items={[item({ id: 'a', title: 'Alpha' }), item({ id: 'b', title: 'Bravo' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b
+    act(() => fireEvent.click(screen.getByTestId('deck-parked'))); // open the panel
+    // An arrow key while the panel overlays the deck must be inert (the card is hidden).
+    act(() => fireEvent.keyDown(screen.getByTestId('deck'), { key: 'ArrowRight' }));
+    act(() => fireEvent.click(screen.getByTestId('deck-parked-close')));
+    // b was NOT affirmed/advanced — still the current card, deck not cleared.
+    expect(screen.queryByTestId('deck-cleared')).toBeNull();
+    expect(screen.getByTestId('deck-card').textContent).toContain('Bravo');
   });
 });
