@@ -21,6 +21,7 @@ from alfred.transport.config import (
     DEFAULT_RECALL_MAX_MATCHES,
     DEFAULT_RECALL_SNIPPET_MAX_CHARS,
     RECALL_MAX_MATCHES_CEILING,
+    RecallAskConfig,
     RecallConfig,
     RecallConfigError,
     _build_recall,
@@ -302,3 +303,114 @@ def test_fence_allows_normal_instance_enabling_recall() -> None:
     })
     assert cfg.recall.enabled is True
     assert cfg.recall.peers["kal-le"].types == ["person"]
+
+
+# ---------------------------------------------------------------------------
+# Asker side (#20 S2) — recall.ask edge list
+# ---------------------------------------------------------------------------
+
+
+def test_ask_absent_defaults_empty_fail_closed() -> None:
+    cfg = load_from_unified({"transport": {"recall": {"enabled": True}}})
+    assert cfg.recall.ask == RecallAskConfig()
+    assert cfg.recall.ask.peers == {}
+
+
+def test_ask_parses_peers_and_interest_types() -> None:
+    r = _build_recall({
+        "ask": {
+            "peers": {
+                "kal-le": {"types": ["person", "project"]},
+                "hypatia": {"types": ["note"]},
+            }
+        }
+    })
+    assert set(r.ask.peers) == {"kal-le", "hypatia"}
+    assert r.ask.peers["kal-le"].types == ["person", "project"]
+    assert r.ask.peers["hypatia"].types == ["note"]
+
+
+def test_ask_is_independent_of_answerer_enabled() -> None:
+    # An instance can ASK without ANSWERING (enabled=False, ask populated).
+    r = _build_recall({
+        "enabled": False,
+        "ask": {"peers": {"kal-le": {"types": ["person"]}}},
+    })
+    assert r.enabled is False
+    assert r.ask.peers["kal-le"].types == ["person"]
+
+
+def test_ask_empty_interest_types_allowed() -> None:
+    # Empty interest = no asker-side filter (answerer still gates).
+    r = _build_recall({"ask": {"peers": {"kal-le": {}}}})
+    assert r.ask.peers["kal-le"].types == []
+
+
+def test_ask_drops_unknown_interest_type_with_warn() -> None:
+    with structlog.testing.capture_logs() as captured:
+        r = _build_recall({
+            "ask": {"peers": {"kal-le": {"types": ["person", "bogus", "../"]}}}
+        })
+    assert r.ask.peers["kal-le"].types == ["person"]
+    dropped = {
+        c["type"] for c in captured
+        if c.get("event") == "transport.recall.unknown_type_dropped"
+        and c.get("side") == "ask"
+    }
+    assert dropped == {"bogus", "../"}
+
+
+def test_ask_scope_gates_interest_types() -> None:
+    # article is hypatia-scope — survives under hypatia scope, drops canonical.
+    r_hyp = _build_recall(
+        {"ask": {"peers": {"kal-le": {"types": ["note", "article"]}}}},
+        instance_scope="hypatia",
+    )
+    assert r_hyp.ask.peers["kal-le"].types == ["note", "article"]
+    r_canon = _build_recall(
+        {"ask": {"peers": {"kal-le": {"types": ["note", "article"]}}}},
+    )
+    assert r_canon.ask.peers["kal-le"].types == ["note"]
+
+
+def test_ask_tolerates_unknown_keys() -> None:
+    r = _build_recall({
+        "ask": {
+            "peers": {"kal-le": {"types": ["person"], "future": 1}},
+            "future_field": True,
+        }
+    })
+    assert r.ask.peers["kal-le"].types == ["person"]
+
+
+# --- STAY-C fence, ask side, both directions -------------------------------
+
+
+@pytest.mark.parametrize("peer_key", ["stay-c", "stayc", "STAY-C", "stay_c"])
+def test_ask_fence_rejects_stayc_as_asked_peer(peer_key: str) -> None:
+    with pytest.raises(RecallConfigError, match="STAY-C"):
+        _build_recall({"ask": {"peers": {peer_key: {"types": ["note"]}}}})
+
+
+def test_ask_fence_rejects_ask_edges_on_stayc_instance() -> None:
+    with pytest.raises(RecallConfigError, match="STAY-C"):
+        _build_recall(
+            {"ask": {"peers": {"kal-le": {"types": ["note"]}}}},
+            instance_name="STAY-C",
+        )
+
+
+def test_ask_fence_via_load_from_unified() -> None:
+    with pytest.raises(RecallConfigError, match="STAY-C"):
+        load_from_unified({
+            "telegram": {"instance": {"name": "STAY-C"}},
+            "transport": {"recall": {"ask": {"peers": {"kal-le": {"types": ["note"]}}}}},
+        })
+
+
+def test_ask_allows_normal_instance_with_ask_edges() -> None:
+    cfg = load_from_unified({
+        "telegram": {"instance": {"name": "Salem", "tool_set": "talker"}},
+        "transport": {"recall": {"ask": {"peers": {"kal-le": {"types": ["person"]}}}}},
+    })
+    assert cfg.recall.ask.peers["kal-le"].types == ["person"]

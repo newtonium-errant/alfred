@@ -326,6 +326,108 @@ async def test_peer_query_passes_fields(kalle_stub):  # type: ignore[no-untyped-
 
 
 # ---------------------------------------------------------------------------
+# peer_recall — cross-instance recall ask-side client (#20 S2)
+# ---------------------------------------------------------------------------
+
+
+async def _recall_stub(aiohttp_server):  # type: ignore[no-untyped-def]
+    """Stub answerer exposing /peer/recall; records each received request."""
+    from aiohttp import web
+
+    received: list[dict[str, Any]] = []
+
+    async def _recall(request: web.Request) -> web.Response:
+        body = await request.json()
+        received.append({"body": body, "headers": dict(request.headers)})
+        return web.json_response({
+            "status": "ok",
+            "instance": "KAL-LE-stub",
+            "count": 1,
+            "matches": [{
+                "type": "person",
+                "name": "Andrew Newton",
+                "snippet": "Owner of RRTS.",
+                "truncated": False,
+                "record_pointer": {"instance": "KAL-LE-stub", "path": "person/Andrew Newton.md"},
+            }],
+            "correlation_id": body.get("correlation_id"),
+        })
+
+    app = web.Application()
+    app.router.add_post("/peer/recall", _recall)
+    server = await aiohttp_server(app)
+    return f"http://{server.host}:{server.port}", received
+
+
+def _config_for(base_url: str) -> TransportConfig:
+    return TransportConfig(
+        server=ServerConfig(),
+        scheduler=SchedulerConfig(),
+        auth=AuthConfig(tokens={}),
+        state=StateConfig(),
+        peers={"kal-le": PeerEntry(base_url=base_url, token=DUMMY_KALLE_PEER_TOKEN)},
+    )
+
+
+async def test_peer_recall_dispatches_query_and_types(aiohttp_server):  # type: ignore[no-untyped-def]
+    from alfred.transport.client import peer_recall
+
+    base_url, received = await _recall_stub(aiohttp_server)
+    resp = await peer_recall(
+        "kal-le",
+        "when did Andrew join",
+        types=["person", "project"],
+        config=_config_for(base_url),
+        self_name="salem",
+        correlation_id="cid-recall-1",
+    )
+    assert resp["status"] == "ok"
+    assert resp["instance"] == "KAL-LE-stub"
+    assert resp["matches"][0]["record_pointer"]["instance"] == "KAL-LE-stub"
+
+    entry = received[-1]
+    assert entry["body"]["query"] == "when did Andrew join"
+    assert entry["body"]["types"] == ["person", "project"]
+    assert entry["headers"]["Authorization"] == f"Bearer {DUMMY_KALLE_PEER_TOKEN}"
+    assert entry["headers"]["X-Alfred-Client"] == "salem"
+    assert entry["headers"]["X-Correlation-Id"] == "cid-recall-1"
+
+
+async def test_peer_recall_omits_types_when_absent(aiohttp_server):  # type: ignore[no-untyped-def]
+    from alfred.transport.client import peer_recall
+
+    base_url, received = await _recall_stub(aiohttp_server)
+    await peer_recall(
+        "kal-le", "anything", config=_config_for(base_url), self_name="salem",
+    )
+    # No types key on the wire when the asker didn't narrow.
+    assert "types" not in received[-1]["body"]
+
+
+async def test_peer_recall_4xx_raises_rejected_with_status(aiohttp_server):  # type: ignore[no-untyped-def]
+    # wrong_peer / misconfig discrimination: a 401 surfaces as
+    # TransportRejected carrying status_code (the caller logs it as config).
+    from aiohttp import web
+
+    from alfred.transport.client import peer_recall
+    from alfred.transport.exceptions import TransportRejected
+
+    async def _recall(request: web.Request) -> web.Response:
+        return web.json_response({"reason": "wrong_peer"}, status=401)
+
+    app = web.Application()
+    app.router.add_post("/peer/recall", _recall)
+    server = await aiohttp_server(app)
+    base_url = f"http://{server.host}:{server.port}"
+
+    with pytest.raises(TransportRejected) as exc_info:
+        await peer_recall(
+            "kal-le", "q", config=_config_for(base_url), self_name="salem",
+        )
+    assert exc_info.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # Retry behaviour — 5xx triggers one retry
 # ---------------------------------------------------------------------------
 

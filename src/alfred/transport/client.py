@@ -582,6 +582,69 @@ async def peer_search(
     )
 
 
+async def peer_recall(
+    peer_name: str,
+    query: str,
+    *,
+    types: list[str] | None = None,
+    config: "TransportConfig | None" = None,
+    self_name: str,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/recall on the named peer — cross-instance recall (#20 S2).
+
+    The asker-side client for the recall lane (#20). Sends a free-text
+    ``query`` (+ an optional ``types`` narrowing list) to a configured
+    peer; the answerer searches ITS OWN vault against ITS allowlist and
+    returns bounded matches (a capped snippet + a record pointer) or an
+    honest empty match set.
+
+    Args:
+        peer_name: Outbound peer key (``"salem"`` / ``"kal-le"`` — the
+            key under ``transport.peers``, resolved to base_url + token).
+        query: The free-text recall query.
+        types: Optional record-type narrowing. The answerer intersects
+            this against ITS per-asker allowlist — it can only NARROW,
+            never widen, what the answerer discloses (the asker-side caller
+            should ALSO pre-narrow to its own configured interest set so a
+            type the asker doesn't care about is never even sent).
+        self_name / config / correlation_id: as for :func:`peer_search`.
+
+    Returns the answerer's response dict on success — ``{status: "ok",
+    instance, count, matches[], correlation_id}`` where each match is
+    ``{type, name, snippet, truncated, record_pointer{instance, path}}``.
+
+    Raises the standard transport taxonomy on failure (the caller
+    discriminates for graceful degradation): :class:`TransportRejected`
+    (4xx — e.g. 401 ``wrong_peer`` = this asker is not a configured recall
+    peer on the answerer → a MISCONFIG, ``status_code`` carried), 404
+    (recall not mounted / disabled on the answerer),
+    :class:`TransportServerDown` (peer unreachable → transient),
+    :class:`TransportUnavailable` (5xx after retries).
+    """
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or _new_correlation_id()
+
+    body: dict[str, Any] = {"query": query}
+    if types:
+        body["types"] = list(types)
+
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/recall",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )
+
+
 async def peer_async_query(
     peer_name: str,
     record_type: str,

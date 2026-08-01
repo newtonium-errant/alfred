@@ -623,6 +623,38 @@ class RecallPeerRules:
 
 
 @dataclass
+class RecallAskPeerRules:
+    """One peer this instance may ASK, plus the asker's interest types (#20 S2).
+
+    ``types`` is the asker's OWN interest set for this peer — the record
+    types this instance cares to pull FROM that peer. It is a NARROWING
+    filter applied asker-side before the request leaves: the asker never
+    sends (and so never widens to) a type outside this set. Empty = no
+    asker-side type filter (the answerer's own allowlist still gates every
+    request — the asker widening is impossible either way because the
+    answerer enforces `recall.peers`).
+    """
+
+    types: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RecallAskConfig:
+    """Asker-side recall edge list (#20 S2) — who THIS instance may ask.
+
+    The sibling of the answerer-side :class:`RecallConfig.peers` allowlist:
+    ``peers`` maps a peer NAME (a key under ``transport.peers``, resolved to
+    base_url + token) → the asker's :class:`RecallAskPeerRules`. Fail-closed
+    by construction: default-empty ``peers`` means this instance asks NO
+    peer — the ``recall_peers`` tool is not even surfaced to the model (a
+    non-configured instance can't reach out). Flipping an edge is an
+    operator config change, never code.
+    """
+
+    peers: dict[str, RecallAskPeerRules] = field(default_factory=dict)
+
+
+@dataclass
 class RecallConfig:
     """Answerer-side cross-instance recall policy (#20 S1).
 
@@ -655,6 +687,9 @@ class RecallConfig:
     max_matches: int = DEFAULT_RECALL_MAX_MATCHES
     snippet_max_chars: int = DEFAULT_RECALL_SNIPPET_MAX_CHARS
     peers: dict[str, RecallPeerRules] = field(default_factory=dict)
+    # Asker side (#20 S2). Independent of ``enabled`` (the answerer switch):
+    # an instance can ask peers without itself answering, and vice versa.
+    ask: RecallAskConfig = field(default_factory=RecallAskConfig)
 
 
 @dataclass
@@ -953,6 +988,36 @@ def _build_recall(
 
     valid_types = TYPE_REGISTRY.known_types(instance_scope or None)
 
+    def _clean_types(types_raw: Any, peer_name: str, *, side: str) -> list[str]:
+        """Coerce + validate a recall type list, DROP-unknown-with-loud-WARN.
+
+        Shared by the answerer allowlist (``recall.peers``) and the asker
+        interest set (``recall.ask.peers``). Fail-SAFE: a typo / bogus type
+        (incl. a path-traversal string like ``"../"``) is dropped, never
+        searched, never sent, never globbed — logged so the operator sees
+        the drop. ``side`` distinguishes the two surfaces in the log.
+        """
+        out: list[str] = []
+        for t in types_raw or []:
+            if not isinstance(t, str) or not t.strip():
+                continue
+            t = t.strip()
+            if t not in valid_types:
+                log.warning(
+                    "transport.recall.unknown_type_dropped",
+                    peer=peer_name,
+                    type=t,
+                    side=side,
+                    instance=instance_name,
+                    scope=instance_scope or "(canonical)",
+                    detail="not a known record type for this instance's "
+                           "scope — dropped from the recall type set "
+                           "(never searched, sent, or globbed)",
+                )
+                continue
+            out.append(t)
+        return out
+
     peers_raw = data.get("peers", {}) or {}
     peers: dict[str, RecallPeerRules] = {}
     if isinstance(peers_raw, dict):
@@ -966,30 +1031,49 @@ def _build_recall(
                 )
             if not isinstance(rules_raw, dict):
                 continue
-            types_raw = rules_raw.get("types", []) or []
-            types: list[str] = []
-            for t in types_raw:
-                if not isinstance(t, str) or not t.strip():
-                    continue
-                t = t.strip()
-                if t not in valid_types:
-                    # DROP-unknown-with-loud-WARN (fail-SAFE): a typo / bogus
-                    # type (incl. a path-traversal string like "../") is
-                    # never searched, never globbed. Logged so an operator
-                    # sees the drop rather than silently answering less.
-                    log.warning(
-                        "transport.recall.unknown_type_dropped",
-                        peer=str(peer_name),
-                        type=t,
-                        instance=instance_name,
-                        scope=instance_scope or "(canonical)",
-                        detail="not a known record type for this instance's "
-                               "scope — dropped from the recall allowlist "
-                               "(never searched or globbed)",
+            peers[str(peer_name)] = RecallPeerRules(
+                types=_clean_types(
+                    rules_raw.get("types", []), str(peer_name), side="answer",
+                ),
+            )
+
+    # --- Asker side (#20 S2): recall.ask edge list ----------------------
+    # Independent of ``enabled`` (the answerer switch). Fail-closed:
+    # absent / empty ``ask.peers`` → this instance asks nobody.
+    ask_raw = data.get("ask", {}) or {}
+    ask_peers: dict[str, RecallAskPeerRules] = {}
+    if isinstance(ask_raw, dict):
+        # Fence: STAY-C may never ASK either. Part 2 (this instance IS
+        # STAY-C and has ask edges) is checked FIRST so a STAY-C config
+        # fails loud regardless of which peers it lists.
+        ask_peers_raw = ask_raw.get("peers", {}) or {}
+        if (
+            isinstance(ask_peers_raw, dict)
+            and ask_peers_raw
+            and is_stayc_peer_name(instance_name)
+        ):
+            raise RecallConfigError(
+                f"instance '{instance_name}' is STAY-C, which is categorically "
+                "excluded from cross-instance recall — remove `recall.ask` "
+                "from its config (STAY-C asks nothing, in either direction)"
+            )
+        if isinstance(ask_peers_raw, dict):
+            for peer_name, rules_raw in ask_peers_raw.items():
+                # Fence part 1 (ask side): STAY-C may never be asked.
+                if is_stayc_peer_name(str(peer_name)):
+                    raise RecallConfigError(
+                        f"peer '{peer_name}' names STAY-C, which is "
+                        "categorically excluded from cross-instance recall — "
+                        "remove it from `recall.ask.peers` (STAY-C is never "
+                        "asked)"
                     )
+                if not isinstance(rules_raw, dict):
                     continue
-                types.append(t)
-            peers[str(peer_name)] = RecallPeerRules(types=types)
+                ask_peers[str(peer_name)] = RecallAskPeerRules(
+                    types=_clean_types(
+                        rules_raw.get("types", []), str(peer_name), side="ask",
+                    ),
+                )
 
     try:
         max_matches = int(data.get("max_matches", DEFAULT_RECALL_MAX_MATCHES))
@@ -1010,6 +1094,7 @@ def _build_recall(
         max_matches=max_matches,
         snippet_max_chars=snippet_max_chars,
         peers=peers,
+        ask=RecallAskConfig(peers=ask_peers),
     )
 
 
