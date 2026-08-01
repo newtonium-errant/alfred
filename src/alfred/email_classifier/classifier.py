@@ -21,7 +21,10 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from alfred.feed import FeedEmitHandle
 
 import frontmatter
 import structlog
@@ -992,6 +995,103 @@ async def _push_high_priority_email(
     return True
 
 
+# --- #27 slice 1: classify-time email_urgent feed emit ---------------------
+
+# The no-sender sentinels — mirrors ``daily_sync.feed_producer._SENDER_ABSENT``
+# (the #28 rule): when the sender is absent, drop the sender segment from the
+# card title rather than render "Urgent email: (unknown) — subject". Kept local
+# (not imported) so the emit path carries no import of the sync producer; the
+# classifier's own sender derivation (:func:`_extract_sender`) never MINTS the
+# "(unknown)" placeholder — it returns "" — so ``not sender`` is the operative
+# check, and the placeholder set is honored for defense-in-depth against a
+# frontmatter-sourced value.
+_URGENT_SENDER_ABSENT = frozenset({"(unknown)", "unknown"})
+
+
+def _urgent_title(sender: str, subject: str) -> str:
+    """Build the ``email_urgent`` card title, dropping the sender segment when the
+    sender is absent (the #28 no-sender rule, reused for the interrupt card)."""
+    subject_display = subject or "(no subject)"
+    if not sender or sender.strip().lower() in _URGENT_SENDER_ABSENT:
+        return f"Urgent email: {subject_display}"
+    return f"Urgent email: {sender} — {subject_display}"
+
+
+def _emit_email_urgent_feed(
+    handle: "FeedEmitHandle",
+    *,
+    note_rel_path: str,
+    result: "ClassificationResult",
+    fm: dict[str, Any],
+    body: str,
+    inbox_content: str,
+    subject: str,
+) -> None:
+    """Upsert ONE ``email_urgent`` feed item for a high-priority record (#27).
+
+    PER-ITEM UPSERT, **NO RECONCILE**: the sync (daily_sync) producer owns the
+    ``email_tier`` open set and reconciles it every fire; a reconcile HERE would
+    mass-act the OTHER emitter's items. The distinct kind + upsert-only is exactly
+    what keeps the two emitters from fighting (see the design doc's reconcile
+    crux). An urgent item persists until the operator acks it.
+
+    Evidence mirrors the sync-time ``email_tier`` card's shape so the deck can
+    render both from one code path: sender/subject/bounded-body/gmail deep-link,
+    plus the classify-time provenance (``classifier_priority``/``classifier_reason``)
+    and — LOAD-BEARING for slice 3 — ``high_source``: ``"override"`` when the
+    high verdict came from the sender-override list, ``"llm"`` when the model
+    picked high on its own (``result.override_applied`` is the signal; it is True
+    ONLY when the override fired, per the classifier's own audit contract).
+
+    Raises nothing of its own beyond what the store/build can raise — the caller
+    belt-wraps this so a feed fault never blocks classification.
+    """
+    # Lazy imports: keep module-load light + defer the alfred.feed edge to emit
+    # time (mirrors the c5 push's lazy transport import).
+    from alfred.daily_sync.email_section import bounded_email_body
+    from alfred.feed import FeedItem, FeedStore, make_id
+    from alfred.mail.gmail_filing import gmail_rfc822_search_url
+
+    sender_email, sender_display = _extract_sender(inbox_content)
+    sender = sender_display or sender_email  # display preferred, else bare address
+
+    preview, truncated = bounded_email_body(body or "")
+    message_id = str(fm.get("email_message_id") or "").strip()
+    gmail_url = gmail_rfc822_search_url(message_id) if message_id else ""
+
+    evidence: dict[str, Any] = {
+        "sender": sender,
+        "subject": subject,
+        "body": preview,
+        "truncated": truncated,
+        "message_id": message_id,
+        "gmail_url": gmail_url,
+        "record_path": note_rel_path,
+        "classifier_priority": result.priority,
+        "classifier_reason": result.reasoning,
+        # slice-3 gate: push fires ONLY for override-highs. "override" iff the
+        # sender-override forced the high; "llm" iff the model picked it.
+        "high_source": "override" if result.override_applied else "llm",
+    }
+
+    item = FeedItem.create(
+        kind="email_urgent",
+        stable_key=note_rel_path,
+        instance=handle.instance,
+        title=_urgent_title(sender, subject),
+        evidence=evidence,
+        source_ref={"producer": "email_classifier"},
+    )
+    FeedStore(handle.store_path).upsert(item)
+    log.info(
+        "email_classifier.urgent_emitted",
+        path=note_rel_path,
+        feed_id=make_id("email_urgent", note_rel_path),
+        high_source=evidence["high_source"],
+        instance=handle.instance,
+    )
+
+
 # --- Classification entry points -------------------------------------------
 
 
@@ -1003,6 +1103,7 @@ def classify_record(
     *,
     llm_caller: LLMCaller | None = None,
     session_path: str | None = None,
+    feed_handle: "FeedEmitHandle | None" = None,
 ) -> ClassificationResult:
     """Classify a single note record and write the result to its frontmatter.
 
@@ -1246,6 +1347,43 @@ def classify_record(
         if pushed:
             result.pushed_to_telegram = True
 
+    # #27 slice 1 — classify-time email_urgent feed emit. Fires on EVERY high
+    # (LLM verdict OR sender-override), independent of the c5 Telegram push gate
+    # above: the in-app interrupt surfaces the moment a high lands, whereas the
+    # push is separately gated (and slice 3 will gate the push on override-highs).
+    # PER-ITEM UPSERT, no reconcile (the sync producer owns email_tier's open
+    # set). Belt-wrapped: the emit can NEVER block classification/structuring —
+    # the record's priority frontmatter is already persisted. Per
+    # feedback_intentionally_left_blank.md: emit ``urgent_emitted`` on success
+    # (inside the helper), ``urgent_emit_failed`` on fault, and an explicit
+    # skip line when the feed is disabled — idle stays distinguishable from
+    # broken. ``feed_handle is None`` is the fail-safe default (unwired caller,
+    # e.g. the backfill CLI) — no emit, silently.
+    if result.priority == "high" and feed_handle is not None:
+        if not feed_handle.enabled:
+            log.info(
+                "email_classifier.urgent_emit_skipped_disabled",
+                path=note_rel_path,
+            )
+        else:
+            try:
+                _emit_email_urgent_feed(
+                    feed_handle,
+                    note_rel_path=note_rel_path,
+                    result=result,
+                    fm=fm,
+                    body=body,
+                    inbox_content=inbox_content,
+                    subject=subject,
+                )
+            except Exception as exc:  # noqa: BLE001 — emit must NEVER block classify
+                log.warning(
+                    "email_classifier.urgent_emit_failed",
+                    path=note_rel_path,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+
     return result
 
 
@@ -1257,6 +1395,7 @@ def classify_records_for_inbox(
     *,
     llm_caller: LLMCaller | None = None,
     session_path: str | None = None,
+    feed_handle: "FeedEmitHandle | None" = None,
 ) -> list[ClassificationResult]:
     """Post-processor entry point — called from the curator daemon.
 
@@ -1267,6 +1406,12 @@ def classify_records_for_inbox(
     3. Filter ``note_paths`` to ``note/*.md`` records (curator may also
        create person/org/task records — those are NOT classified).
     4. For each remaining note, call :func:`classify_record`.
+
+    ``feed_handle`` (#27 slice 1) is the OPTIONAL classify-time feed-emit
+    context threaded from the orchestrator via the curator daemon. When it is
+    ``None`` (the fail-safe default — unwired caller, e.g. the backfill CLI or a
+    minimal test config), no ``email_urgent`` item is emitted. When present + a
+    record lands high, ONE ``email_urgent`` item is upserted per record.
 
     Returns the per-record results (empty list when short-circuited).
     Never raises — the curator daemon treats this as fire-and-forget.
@@ -1302,6 +1447,7 @@ def classify_records_for_inbox(
                 config=config,
                 llm_caller=llm_caller,
                 session_path=session_path,
+                feed_handle=feed_handle,
             )
             results.append(result)
         except VaultError as exc:

@@ -720,6 +720,90 @@ def test_ack_fyi_item_sets_acked(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# email_urgent (#27 slice 1) — decide-kind ack → acted; ack-only ceiling
+# ---------------------------------------------------------------------------
+
+
+def _publish_urgent(
+    store: FeedStore, record_path: str = "note/Urgent.md", instance: str = "salem",
+) -> str:
+    """Upsert an email_urgent item as the classify-time emitter would (direct
+    FeedItem.create — it is NOT a sync family, so build_feed_items has no entry
+    for it), and return its id."""
+    item = FeedItem.create(
+        kind="email_urgent", stable_key=record_path, instance=instance,
+        title="Urgent email: sender@example.com — subject",
+        evidence={"record_path": record_path, "high_source": "llm"},
+        source_ref={"producer": "email_classifier"},
+    )
+    store.upsert(item)
+    return item.id
+
+
+def test_email_urgent_ack_sets_acted(tmp_path: Path) -> None:
+    """Acking an email_urgent item (MODE_DECIDE) → acted (NOT acked): the
+    operator has DECIDED the interrupt. No resolver, no last_batch, no vault op —
+    the item just flips to acted, stamping the ``ack`` verb."""
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    fid = _publish_urgent(store)
+    assert store.load()[fid].mode == "decide"
+
+    result = _call(store, cfg, fid, "ack")
+
+    assert result.ok is True and result.status == STATUS_ACTED
+    stored = store.load()[fid]
+    assert stored.state == STATE_ACTED
+    assert stored.acted_action == "ack"
+
+
+def test_email_urgent_ceiling_only_ack(tmp_path: Path) -> None:
+    """email_urgent's capability ceiling is ack-only — any other action is
+    invalid and never mutates the store (the item stays open)."""
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    fid = _publish_urgent(store)
+
+    for bad in ("confirm", "high", "reject", "done", "accept"):
+        result = _call(store, cfg, fid, bad)
+        assert result.ok is False and result.status == STATUS_INVALID_ACTION, bad
+        assert store.load()[fid].state == STATE_OPEN, bad
+
+
+def test_email_urgent_ack_is_acted_while_fyi_ack_stays_acked(tmp_path: Path) -> None:
+    """The decide/awareness split pinned in one place: an email_urgent ack →
+    ACTED; a radar (FYI) ack → ACKED. The universal FYI-ack gate is byte-
+    unchanged — the email_urgent intercept (gated on kind) neither widens nor
+    reorders it."""
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    urgent_id = _publish_urgent(store, record_path="note/U.md")
+    radar_id = _publish(
+        store, "radar",
+        {"record_path": "radar/x.md", "record_type": "note", "event_id": "r1"},
+    )
+
+    assert _call(store, cfg, urgent_id, "ack").status == STATUS_ACTED
+    assert _call(store, cfg, radar_id, "ack").status == STATUS_ACKED
+
+    folded = store.load()
+    assert folded[urgent_id].state == STATE_ACTED
+    assert folded[radar_id].state == STATE_ACKED
+
+
+def test_email_urgent_double_ack_is_idempotent_noop(tmp_path: Path) -> None:
+    """A second ack on an already-acted urgent item is the idempotent ok-noop
+    (the folded-state gate fires first — the intercept never re-drives)."""
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    fid = _publish_urgent(store)
+
+    assert _call(store, cfg, fid, "ack").status == STATUS_ACTED
+    second = _call(store, cfg, fid, "ack")
+    assert second.ok is True and second.status == STATUS_ALREADY_ACTED
+
+
+# ---------------------------------------------------------------------------
 # item source — last_batch, NOT feed evidence
 # ---------------------------------------------------------------------------
 

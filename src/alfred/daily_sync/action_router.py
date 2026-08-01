@@ -81,6 +81,14 @@ UNDO_DONE_ACTION = "undo_done"
 ACCEPT_ACTION = "accept"
 SLOT_KIND = "slot_suggestion"
 
+# email_urgent (#27 slice 1) — the classify-time high-priority interrupt kind
+# (curator emits it per-item; distinct from the sync-time email_tier card). It is
+# MODE_DECIDE (deals into the deck + rings/needs-you) but its ONLY action is
+# ``ack`` → acted. Unlike a FYI ack (which sets ``acked``), acking an urgent item
+# = deciding it (the operator has seen the interrupt); there is no resolver and no
+# last_batch (it was never part of a sync batch).
+URGENT_KIND = "email_urgent"
+
 # (kind, action_id) → the kwargs that synthesize the owning resolver's
 # ``ReplyCorrection``. THIS MAP IS THE CAPABILITY CEILING — a pair absent here
 # can never reach a resolver. A fresh ReplyCorrection is built per call (never a
@@ -122,6 +130,14 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "done": {},
         "undo_done": {},
         "accept": {},
+    },
+    # email_urgent (#27 slice 1) — ack-only capability ceiling. Like slot's, the
+    # kwargs are UNUSED: an ``email_urgent`` ack does NOT synthesize a
+    # ReplyCorrection or read last_batch. It is intercepted by :func:`_act_locked`
+    # (see the URGENT_KIND block) which sets the item ``acted`` directly. Any
+    # action other than ``ack`` is invalid — the ceiling stays closed.
+    "email_urgent": {
+        "ack": {},
     },
 }
 
@@ -909,6 +925,31 @@ def _act_locked(
             "feed item kind does not match its id — refusing",
             feed_item_id, action_id,
         )
+
+    # email_urgent (#27 slice 1) — DEDICATED ack intercept, placed BEFORE the
+    # universal FYI-ack gate below ON PURPOSE. email_urgent is MODE_DECIDE, and
+    # that gate rejects ``ack`` on any non-FYI item (``ack_on_non_fyi``); so
+    # without this intercept an urgent ack would be refused. Acking an urgent
+    # item = deciding it → ``acted`` (NOT ``acked``, which is the FYI-awareness
+    # state). No resolver, no last_batch — the curator emits it per-item, so
+    # there is no sync batch to re-derive from. FEED_ACTIONS[email_urgent] is the
+    # capability ceiling: any action other than ``ack`` is invalid. This block
+    # touches ONLY email_urgent — the universal FYI-ack gate is byte-unchanged,
+    # so every other decide kind's ack still returns invalid_action there.
+    if kind == URGENT_KIND:
+        if action_id not in FEED_ACTIONS.get(URGENT_KIND, {}):
+            log.info(
+                "feed.act.invalid_action", id=feed_item_id, kind=kind,
+                action=action_id, reason="urgent_non_ack",
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                f"'{action_id}' is not a valid action for a {kind} item",
+                feed_item_id, action_id,
+            )
+        feed_store.set_state(feed_item_id, STATE_ACTED, action=ACK_ACTION)
+        log.info("feed.act.acted", id=feed_item_id, kind=kind, action=action_id)
+        return ActResult(True, STATUS_ACTED, "acknowledged", feed_item_id, action_id)
 
     # Universal ack — FYI items only, no resolver, no last_batch, no vault op.
     if action_id == ACK_ACTION:

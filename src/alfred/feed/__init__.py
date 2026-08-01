@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .belt import try_feed_reconcile
 from .config import FeedConfig, load_from_unified
+from .emit import FeedEmitHandle
 from .model import (
     ATTENTION_FYI,
     ATTENTION_NEEDS_YOU,
@@ -30,6 +31,7 @@ __all__ = [
     "ATTENTION_NEEDS_YOU",
     "DEFAULT_COMPACT_THRESHOLD_BYTES",
     "FeedConfig",
+    "FeedEmitHandle",
     "FeedItem",
     "FeedStore",
     "KINDS",

@@ -201,7 +201,7 @@ def _read_candidate(
     # Lazy import so daily_sync's module graph doesn't pull the mail package.
     from alfred.mail.gmail_filing import gmail_rfc822_search_url
 
-    body, truncated = _bounded_email_body(post.content or "")
+    body, truncated = bounded_email_body(post.content or "")
     message_id = str(fm.get("email_message_id") or "").strip()
     gmail_url = gmail_rfc822_search_url(message_id) if message_id else ""
 
@@ -372,7 +372,7 @@ def _extract_snippet(body: str, *, limit: int = 120) -> str:
 _EMAIL_BODY_CAP = 600
 
 
-def _bounded_email_body(content: str, *, cap: int = _EMAIL_BODY_CAP) -> tuple[str, bool]:
+def bounded_email_body(content: str, *, cap: int = _EMAIL_BODY_CAP) -> tuple[str, bool]:
     """Return ``(body, truncated)`` — the readable email prose bounded to ``cap``.
 
     Reuses :func:`_extract_snippet` at an effectively-unbounded limit to get the
@@ -380,11 +380,24 @@ def _bounded_email_body(content: str, *, cap: int = _EMAIL_BODY_CAP) -> tuple[st
     from (so the two never diverge on cleaning), then caps at ``cap`` with a
     ``truncated`` flag (the FE's "there's more — open in Gmail" signal). Mirrors
     the peer-digest ``_bounded_digest_body`` (bounded evidence + truncated flag).
+
+    Promoted to a public symbol for #27: the classify-time ``email_urgent`` feed
+    emitter (``email_classifier.classifier``) reuses this to build the interrupt
+    card's bounded preview from the SAME cleaner the sync-time ``email_tier`` card
+    uses — two consumers, so it graduates from private per the second-consumer
+    precedent. The ``_bounded_email_body`` alias below preserves the pre-#27
+    private name for existing callers/tests.
     """
     full = _extract_snippet(content or "", limit=10**9)  # full cleaned prose, no cut
     if len(full) <= cap:
         return full, False
     return full[:cap].rstrip() + "…", True
+
+
+# Backward-compat alias — the pre-#27 private name. Existing internal callers and
+# tests reference ``_bounded_email_body``; keep it pointed at the public function
+# so a rename doesn't ripple through them.
+_bounded_email_body = bounded_email_body
 
 
 def _already_calibrated(corpus_path: str | Path) -> set[str]:
