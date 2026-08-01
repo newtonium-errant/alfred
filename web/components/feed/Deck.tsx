@@ -3,6 +3,7 @@ import type { FeedItem } from '../../lib/algernon/feed';
 import {
   DRAG_Y_CLAMP,
   deckVerbsFor,
+  kindLabel,
   stampOpacity,
   verdictForDrag,
 } from '../../lib/algernon/feedConstants';
@@ -18,8 +19,11 @@ export interface DeckProps {
 
 export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: DeckProps) {
   const deck = useDeck({ items, onAuthExpired, onParkPersist, onUnparkPersist });
-  const { current, upcoming, confirmingId, toast, banner } = deck;
+  const { current, upcoming, confirmingId, toast, banner, parked } = deck;
   const [expanded, setExpanded] = useState(false);
+  // The parked drill-down (task #26): parked cards stay hidden by default, viewable
+  // behind this drill so the operator can deal one back without waiting for the sync.
+  const [parkedOpen, setParkedOpen] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
 
   // Collapse the evidence expand whenever the top card changes.
@@ -120,13 +124,24 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
         <span data-testid="deck-count">
           {deck.remaining > 0 ? `${deck.remaining} card${deck.remaining > 1 ? 's' : ''}` : 'Clear'}
         </span>
-        {deck.parkedCount > 0 && <span data-testid="deck-parked">Parked: {deck.parkedCount}</span>}
+        {deck.parkedCount > 0 && (
+          // Never a number you can't tap — the label advertises its own verb.
+          <button
+            type="button"
+            data-testid="deck-parked"
+            aria-haspopup="dialog"
+            onClick={() => setParkedOpen(true)}
+            className="font-semibold uppercase tracking-wider text-status-progress-fg underline underline-offset-2"
+          >
+            Parked: {deck.parkedCount} — view
+          </button>
+        )}
       </div>
 
       <div className="relative min-h-[340px] flex-1">
         {stack.map(({ item, depth }) => (
           <DeckCard
-            key={item.id}
+            key={(item as { __deckKey?: string }).__deckKey ?? item.id}
             ref={depth === 0 ? topRef : undefined}
             item={item}
             depth={depth}
@@ -144,11 +159,80 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
             className="absolute inset-0 m-auto flex max-h-[360px] flex-col items-center justify-center gap-2 rounded-2xl border border-honeydew-300 bg-cream p-5 text-center shadow-card"
           >
             <p className="text-2xl font-extrabold text-honeydew-700">Deck clear.</p>
-            <p className="text-sm text-honeydew-600">
-              {deck.parkedCount > 0
-                ? `${deck.parkedCount} parked — the next sync will re-offer them.`
-                : 'Nothing left to decide right now.'}
-            </p>
+            {deck.parkedCount > 0 ? (
+              <>
+                <p className="text-sm text-honeydew-600">
+                  {deck.parkedCount} parked — the next sync will re-offer them.
+                </p>
+                <button
+                  type="button"
+                  data-testid="deck-cleared-view"
+                  aria-haspopup="dialog"
+                  onClick={() => setParkedOpen(true)}
+                  className="mt-1 text-sm font-semibold text-status-progress-fg underline underline-offset-2"
+                >
+                  View parked
+                </button>
+              </>
+            ) : (
+              <p className="text-sm text-honeydew-600">Nothing left to decide right now.</p>
+            )}
+          </div>
+        )}
+
+        {/* The parked drill-down (task #26): the worklist behind the "view" — list the
+            parked cards (title + kind), each with Deal now (un-park + re-enter the queue
+            immediately). Overlays the card area; z-above the cleared state. */}
+        {parkedOpen && (
+          <div
+            data-testid="deck-parked-panel"
+            role="dialog"
+            aria-label="Parked cards"
+            className="absolute inset-0 z-20 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+          >
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
+                Parked ({parked.length})
+              </p>
+              <button
+                type="button"
+                data-testid="deck-parked-close"
+                onClick={() => setParkedOpen(false)}
+                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2"
+              >
+                Close
+              </button>
+            </div>
+
+            {parked.length === 0 ? (
+              // ILB: the drill is open but everything's been dealt back — say so, don't blank.
+              <p data-testid="deck-parked-empty" className="mt-2 text-sm text-honeydew-600">
+                No parked cards — you&rsquo;ve dealt them all back in.
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-2 overflow-y-auto">
+                {parked.map((p) => (
+                  <li
+                    key={p.id}
+                    data-testid="deck-parked-row"
+                    className="flex items-center gap-2 rounded-xl border border-honeydew-200 bg-white p-2.5"
+                  >
+                    <span className="shrink-0 rounded-md border border-honeydew-300 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-honeydew-600">
+                      {kindLabel(p.kind)}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm text-honeydew-700">{p.title}</span>
+                    <button
+                      type="button"
+                      data-testid="deck-parked-deal"
+                      onClick={() => deck.dealNow(p)}
+                      className="shrink-0 rounded-lg border border-honeydew-600 px-3 py-1 text-xs font-bold uppercase tracking-wider text-honeydew-700"
+                    >
+                      Deal now
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         )}
       </div>

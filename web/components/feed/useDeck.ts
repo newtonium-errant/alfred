@@ -36,6 +36,8 @@ export interface UseDeckResult {
   current: FeedItem | null;
   upcoming: FeedItem[];
   remaining: number;
+  /** The this-session parked cards, retained for the parked drill-down. */
+  parked: FeedItem[];
   parkedCount: number;
   confirmingId: string | null;
   toast: DeckToast | null;
@@ -47,6 +49,8 @@ export interface UseDeckResult {
   confirmHeavy: () => void;
   cancelHeavy: () => void;
   undo: () => void;
+  /** Deal a parked card back into the deck queue (un-park + re-enter immediately). */
+  dealNow: (item: FeedItem) => void;
   dismissToast: () => void;
 }
 
@@ -65,10 +69,16 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [toast, setToast] = useState<DeckToast | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
-  const [parkedCount, setParkedCount] = useState(0);
+  // The this-session parked cards, RETAINED (not just counted) so the parked
+  // drill-down can list them (title + kind) + deal them back. undo un-parks the last.
+  const [parked, setParked] = useState<FeedItem[]>([]);
+  // Cards dealt back from the parked view — re-appended to the tail of the deck queue
+  // so an un-parked card re-enters the deck immediately without disturbing the index.
+  const [readded, setReadded] = useState<FeedItem[]>([]);
 
   const pendingRef = useRef<Pending | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const readdSeqRef = useRef(0);
 
   const clearTimer = () => {
     if (timerRef.current !== null) {
@@ -134,7 +144,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
       let restorePark = false;
       if (verdict === 'park') {
         restorePark = true;
-        setParkedCount((c) => c + 1);
+        setParked((prev) => [...prev, item]);
         onParkPersist?.(item.id);
       }
       setConfirmingId(null);
@@ -158,7 +168,11 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     [flushPending, index, onParkPersist],
   );
 
-  const current = index < items.length ? items[index] : null;
+  // The effective deck queue: the base items plus any cards dealt back from the parked
+  // view (appended at the tail). The index walks this combined queue, so a re-dealt card
+  // becomes reachable without shifting the cards already behind the cursor.
+  const queue = readded.length > 0 ? items.concat(readded) : items;
+  const current = index < queue.length ? queue[index] : null;
 
   const affirm = useCallback(() => {
     if (!current) return;
@@ -207,7 +221,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     clearTimer();
     pendingRef.current = null; // cancel the deferred POST — never an un-act
     if (p.restorePark) {
-      setParkedCount((c) => Math.max(0, c - 1));
+      setParked((prev) => prev.filter((it) => it.id !== p.item.id));
       onUnparkPersist?.(p.item.id);
     }
     setIndex(p.restoreIndex);
@@ -215,17 +229,32 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     setToast(null);
   }, [onUnparkPersist]);
 
+  // Deal a parked card back into the deck: drop it from the park set (client + persist)
+  // and re-append it to the queue tail so it's dealable immediately. The clone carries a
+  // fresh render-key (__deckKey) so a re-dealt id can never collide in the visible stack
+  // (deal → re-park → deal-again is legal); id is preserved so POST/persist stay correct.
+  const dealNow = useCallback(
+    (target: FeedItem) => {
+      setParked((prev) => prev.filter((it) => it.id !== target.id));
+      onUnparkPersist?.(target.id);
+      const seq = readdSeqRef.current++;
+      setReadded((prev) => [...prev, { ...target, __deckKey: `readd-${seq}` } as FeedItem]);
+    },
+    [onUnparkPersist],
+  );
+
   const dismissToast = useCallback(() => setToast(null), []);
 
-  const remaining = Math.max(0, items.length - index);
-  const upcoming = items.slice(index + 1, index + 3);
-  const cleared = index >= items.length;
+  const remaining = Math.max(0, queue.length - index);
+  const upcoming = queue.slice(index + 1, index + 3);
+  const cleared = index >= queue.length;
 
   return {
     current,
     upcoming,
     remaining,
-    parkedCount,
+    parked,
+    parkedCount: parked.length,
     confirmingId,
     toast,
     banner,
@@ -236,6 +265,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     confirmHeavy,
     cancelHeavy,
     undo,
+    dealNow,
     dismissToast,
   };
 }
