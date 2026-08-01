@@ -89,6 +89,20 @@ def _read_spooled_narration_dict(data_dir) -> dict | None:
     return payload
 
 
+def _absent_narration_state(data_dir) -> str:
+    """Distinguish the two ILB absences (house rule: idle vs broken must not
+    collapse):
+      * ``no_brief`` — no brief spooled today (the #30 ``brief`` spool is absent
+        too) → FE offers the deck.
+      * ``narration_unavailable`` — the brief EXISTS but its narration spool is
+        missing / failed / empty (spool crashed, or narration had nothing
+        speakable) → FE says "brief exists, audio unavailable" + offers the
+        brief page. Checked against the #30 brief spool's presence.
+    """
+    brief_present = read_latest(data_dir, "brief") is not None
+    return "narration_unavailable" if brief_present else "no_brief"
+
+
 def _spooled_full_text(payload: dict) -> tuple[str, str] | None:
     """From a narration payload dict, return ``(brief_date, full_text)`` (the
     single-shot synth input) or None when empty / dateless."""
@@ -128,8 +142,9 @@ async def _handle_brief_audio(request: web.Request) -> web.StreamResponse:
     payload = _read_spooled_narration_dict(data_dir)
     loaded = _spooled_full_text(payload) if payload is not None else None
     if loaded is None:
-        log.info("web.brief_audio.no_brief", user=identity.user)
-        return web.json_response({"state": "no_brief"})  # ILB 200
+        state = _absent_narration_state(data_dir)  # no_brief vs narration_unavailable
+        log.info("web.brief_audio.absent", user=identity.user, state=state)
+        return web.json_response({"state": state})  # ILB 200
     brief_date, full_text = loaded
 
     speed = _resolve_speed(request.query.get("speed"))
@@ -197,8 +212,9 @@ async def _handle_brief_narration(request: web.Request) -> web.StreamResponse:
     data_dir = request.app.get(KEY_WEB_DATA_DIR)
     payload = _read_spooled_narration_dict(data_dir)
     if payload is None:
-        log.info("web.brief_narration.no_brief", user=identity.user)
-        return web.json_response({"state": "no_brief"})  # ILB 200
+        state = _absent_narration_state(data_dir)  # no_brief vs narration_unavailable
+        log.info("web.brief_narration.absent", user=identity.user, state=state)
+        return web.json_response({"state": state})  # ILB 200
     return web.json_response(payload)
 
 

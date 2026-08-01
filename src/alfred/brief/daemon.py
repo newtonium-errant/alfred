@@ -137,28 +137,34 @@ async def _push_brief_to_telegram(
         )
 
 
-def _spool_brief_web_outbound(config: BriefConfig, today: str, content: str) -> None:
-    """Best-effort spool of the rendered brief for the #30 web outbound read
-    route (``GET /web/outbound/brief/latest``).
+def _spool_brief_web_outbound(
+    config: BriefConfig, today: str, content: str, *, kind: str = "brief",
+) -> None:
+    """Best-effort spool of a rendered outbound artifact for the web read routes.
 
-    The vault write is the primary artifact; a spool failure must NEVER break
-    the caller — so this swallows + logs, mirroring the brief's Telegram-push
-    swallow. Shared by ``generate_brief`` (the scheduled / catch-up run) and
-    ``update_weather`` (a MANUAL ``alfred brief weather`` refresh, so the web
-    copy isn't left stale). ``data_dir`` resolves the same way ``generate_brief``
-    derives it (``config.state.path`` parent). Lazy import so the brief daemon
-    doesn't depend on the web package at module load.
+    The single best-effort web-outbound WRITE leaf. The vault write is the
+    primary artifact; a spool failure must NEVER break the caller — so this
+    swallows + logs, mirroring the brief's Telegram-push swallow. Shared by:
+      * ``generate_brief`` (kind ``brief``, the #30 read-on-open, scheduled /
+        catch-up) + ``update_weather`` (a MANUAL ``alfred brief weather``
+        refresh, so the web copy isn't left stale);
+      * ``_spool_brief_narration`` (kind ``brief_narration``, C3a) — so the
+        narration write rides the SAME swallow+log belt as the brief spool.
+    ``data_dir`` resolves the same way ``generate_brief`` derives it
+    (``config.state.path`` parent). Lazy import so the brief daemon doesn't
+    depend on the web package at module load.
     """
     data_dir = str(Path(config.state.path).parent)
     try:
         from alfred.web.outbound_store import write_latest
 
-        write_latest(data_dir, "brief", today, content)
-        log.info("brief.web_outbound_written", date=today)
+        write_latest(data_dir, kind, today, content)
+        log.info("brief.web_outbound_written", date=today, kind=kind)
     except Exception as exc:  # noqa: BLE001 — spool never kills the run
         log.warning(
             "brief.web_outbound_write_failed",
             date=today,
+            kind=kind,
             error=str(exc),
             error_type=exc.__class__.__name__,
         )
@@ -175,32 +181,32 @@ async def _spool_brief_narration(config: BriefConfig, today: str, now_local) -> 
     synthesizes, and caches per (brief_date, content-hash, speed). Swallow + log
     exactly like the #30 brief spool — a narration failure must NEVER break the
     brief run (mirrors ``_spool_brief_web_outbound``)."""
-    data_dir = str(Path(config.state.path).parent)
     try:
         import json as _json
-
-        from alfred.web.outbound_store import write_latest
 
         from .narration import build_narration
 
         narration = await build_narration(config, now_local, brief_date=today)
-        write_latest(
-            data_dir, "brief_narration", today, _json.dumps(narration.to_dict()),
-        )
-        log.info(
-            "brief.narration_spooled",
-            date=today,
-            segments=len(narration.segments),
-            total_words=narration.total_words,
-            empty=narration.empty,
-        )
-    except Exception as exc:  # noqa: BLE001 — spool never kills the run
+    except Exception as exc:  # noqa: BLE001 — narration build never kills the run
         log.warning(
-            "brief.narration_spool_failed",
+            "brief.narration_build_failed",
             date=today,
             error=str(exc),
             error_type=exc.__class__.__name__,
         )
+        return
+    # Ride the SHARED best-effort web-outbound write helper (same swallow+log
+    # belt as the #30 brief spool) — a write failure logs loud + is harmless.
+    _spool_brief_web_outbound(
+        config, today, _json.dumps(narration.to_dict()), kind="brief_narration",
+    )
+    log.info(
+        "brief.narration_spooled",
+        date=today,
+        segments=len(narration.segments),
+        total_words=narration.total_words,
+        empty=narration.empty,
+    )
 
 
 def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_local, now_local) -> None:

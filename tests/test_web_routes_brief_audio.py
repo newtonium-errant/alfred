@@ -182,10 +182,22 @@ async def test_no_session_rejected(aiohttp_client, tmp_path) -> None:
 
 
 async def test_no_brief_ilb(client_with_tts) -> None:
-    """No spooled narration → 200 {state:no_brief} (never 404)."""
+    """No brief AND no narration spooled → 200 {state:no_brief} (never 404)."""
     resp = await client_with_tts.get("/web/brief/audio", headers=_session_headers())
     assert resp.status == 200
     assert (await resp.json()) == {"state": "no_brief"}
+
+
+async def test_audio_narration_unavailable_when_brief_present(aiohttp_client, tmp_path) -> None:
+    """ILB distinguishability: the brief spooled but its narration did NOT
+    (spool failed) → narration_unavailable, NOT no_brief — the FE says "brief
+    exists, audio unavailable" rather than offering the deck."""
+    data_dir = tmp_path / "data"; data_dir.mkdir()
+    write_latest(str(data_dir), "brief", DATE, "# Brief\n\nbody")  # brief present, no narration
+    client = await aiohttp_client(_build(tmp_path, str(data_dir), with_tts=True))
+    resp = await client.get("/web/brief/audio", headers=_session_headers())
+    assert resp.status == 200
+    assert (await resp.json()) == {"state": "narration_unavailable"}
 
 
 async def test_tts_not_configured_ilb(aiohttp_client, tmp_path) -> None:
@@ -274,6 +286,17 @@ async def test_narration_json_no_brief_ilb(client_with_tts) -> None:
     assert (await resp.json()) == {"state": "no_brief"}
 
 
+async def test_narration_json_unavailable_when_brief_present(aiohttp_client, tmp_path) -> None:
+    """Brief present, narration spool absent → narration_unavailable (distinct
+    from no_brief) so the FE can render "brief exists, audio unavailable"."""
+    data_dir = tmp_path / "data"; data_dir.mkdir()
+    write_latest(str(data_dir), "brief", DATE, "# Brief\n\nbody")
+    client = await aiohttp_client(_build(tmp_path, str(data_dir), with_tts=True))
+    resp = await client.get("/web/brief/narration", headers=_session_headers())
+    assert resp.status == 200
+    assert (await resp.json()) == {"state": "narration_unavailable"}
+
+
 async def test_narration_json_wrong_peer_rejected(aiohttp_client, tmp_path) -> None:
     data_dir = tmp_path / "data"; data_dir.mkdir()
     _spool_narration(data_dir)
@@ -281,3 +304,41 @@ async def test_narration_json_wrong_peer_rejected(aiohttp_client, tmp_path) -> N
     resp = await client.get("/web/brief/narration", headers=_ingest_session_headers())
     assert resp.status == 401
     assert (await resp.json())["error"] == "wrong_peer"
+
+
+# --- daemon spool rides the shared best-effort helper (belt discipline) ------
+
+
+async def test_narration_spool_rides_shared_helper(tmp_path, monkeypatch) -> None:
+    """The narration WRITE routes through the SHARED best-effort web-outbound
+    helper (kind ``brief_narration``) — same swallow+log belt as the #30 brief
+    spool (DRY'd at 19043770), not a hand-rolled write."""
+    from datetime import datetime
+
+    import alfred.brief.daemon as bd
+    from alfred.brief.config import BriefConfig
+    from alfred.brief.narration import BriefNarration, NarrationSegment
+
+    async def _fake_build(config, now, *, brief_date, narration_config=None):
+        return BriefNarration(
+            brief_date=brief_date,
+            segments=[NarrationSegment("day_state", "State", "hi there")],
+        )
+
+    monkeypatch.setattr("alfred.brief.narration.build_narration", _fake_build)
+
+    seen: list[tuple[str, str]] = []
+
+    def _spy(config, today, content, *, kind="brief"):
+        seen.append((kind, content))
+
+    monkeypatch.setattr(bd, "_spool_brief_web_outbound", _spy)
+
+    cfg = BriefConfig(vault_path=str(tmp_path / "vault"), instance_name="Salem")
+    cfg.state.path = str(tmp_path / "brief_state.json")
+    await bd._spool_brief_narration(cfg, "2026-08-01", datetime(2026, 8, 1, 6, 0, 0))
+
+    assert len(seen) == 1
+    kind, content = seen[0]
+    assert kind == "brief_narration"  # rides the shared helper with the C3a kind
+    assert "2026-08-01" in content and "day_state" in content  # narration JSON

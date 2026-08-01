@@ -528,10 +528,14 @@ async def test_brief_spool_failure_swallowed_vault_and_push_succeed(
     # The Telegram push still fired.
     assert len(pushed) == 1
     assert pushed[0]["user_id"] == 42
-    # The swallow is LOGGED (never silent).
+    # The swallow is LOGGED (never silent). Two best-effort spools now ride the
+    # shared helper (the #30 brief spool + the C3a narration spool); both fail on
+    # the planted broken dir and both swallow. This test targets the BRIEF spool
+    # — filter to kind="brief" (the narration spool has its own C3a coverage).
     fails = [
         c for c in captured
         if c.get("event") == "brief.web_outbound_write_failed"
+        and c.get("kind") == "brief"
     ]
     assert len(fails) == 1
     # And the success line did NOT fire.
