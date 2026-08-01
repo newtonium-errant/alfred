@@ -645,6 +645,129 @@ _TIER_UNDONE_TOOL_SCHEMA = {
 }
 
 
+# #21 (2026-08-01) — ``tier_confirm`` schema.
+#
+# Salem-only tool that COMMITS an auto-surfaced tier candidate onto today's
+# T1/T2/T3 shortlist — the deterministic replacement for the LLM whole-block
+# ``vault_edit set_fields={"tier_curation": ...}`` rewrite the SKILL used to
+# instruct (lossy: the model re-serialized the entire block each confirm). This
+# tool routes through ``tier.tier_confirm.confirm_slot_candidate`` — the SAME
+# writer the board's slot-accept (C2) calls, so chat + board are ONE writer per
+# verb. Dispatch is IN-PROCESS (the tier module is a clean fcntl-locked atomic
+# writer, like ``tier_done``); the write is a surgical single-entry APPEND to
+# the ``tier_curation`` block (rides the ``TALKER_TIER_CURATION_FIELDS``
+# allowlist with ZERO widening — bypasses check_scope exactly as tier_done does).
+#
+# NO fuzzy matching in the tool: the model identifies WHICH candidate from the
+# brief's own "Open Tasks by Tier" surfaced list and passes its fields; the tool
+# validates + writes or fails loud (invalid_tier / thin_evidence). The
+# LLM-supplied ``source`` is sanitized against the known vocab before the write
+# (an invented enum coerces to "operator" — never fake provenance).
+#
+# Cross-agent contract: the vault-talker SKILL's tier-curation grammar section
+# calls this instead of vault_edit; the ``kind`` discriminator shapes the reply.
+_TIER_CONFIRM_TOOL_SCHEMA = {
+    "name": "tier_confirm",
+    "description": (
+        "Commit an auto-surfaced tier candidate onto today's T1/T2/T3 "
+        "shortlist. Salem-only. Use this when the operator confirms/accepts "
+        "a candidate the morning brief surfaced in its 'Open Tasks by Tier' "
+        "section (e.g. 'T1 confirm RRTS Payroll', 'yes add Pay Rent to T2', "
+        "'put walk Fergus on today's T3'). Identify WHICH candidate the "
+        "operator means from the brief's surfaced list, then pass ITS fields "
+        "verbatim — this tool does NOT fuzzy-match; it validates and writes "
+        "deterministically. This REPLACES the old vault_edit whole-block "
+        "rewrite for tier confirmation — do NOT hand-assemble a "
+        "``tier_curation`` block via vault_edit anymore; call this per "
+        "candidate (once per item). Returns a ``kind`` discriminator you MUST "
+        "route on:\n"
+        "  * 'success' — committed; confirm it ('Added RRTS Payroll to "
+        "today’s T1.')\n"
+        "  * 'idempotent_noop' — that item is already on today's list for "
+        "that tier; tell the operator gently (no duplicate written)\n"
+        "  * 'invalid_tier' — tier wasn't 1/2/3; do NOT retry blindly, "
+        "re-read the brief\n"
+        "  * 'thin_evidence' — the candidate's identity was incomplete "
+        "(a T1/T2 needs a task name OR a routine record+item; a T3 needs "
+        "the item text); re-read the brief line and pass the missing field\n"
+        "Per-tier semantics are handled for you: T1 records the confirmation "
+        "as confirmed; T2/T3 record it as operator-added. Back-date via "
+        "``date`` (YYYY-MM-DD); omit for today."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tier": {
+                "type": "integer",
+                "enum": [1, 2, 3],
+                "description": "The tier lane to commit into: 1, 2, or 3.",
+            },
+            "origin": {
+                "type": "string",
+                "enum": ["task", "routine_item"],
+                "description": (
+                    "'task' when the candidate is a ``task/`` record "
+                    "([[task/Name]] in the brief); 'routine_item' when it's a "
+                    "recurring item inside a ``routine/`` record (rendered "
+                    "'<item text> (from [[routine/<record>]])')."
+                ),
+            },
+            "name": {
+                "type": "string",
+                "description": (
+                    "The candidate's display name — the task name (for "
+                    "origin=task) or the item text (for a routine/free-text "
+                    "T3). Required unless a routine record+item_text fully "
+                    "identifies the entry."
+                ),
+            },
+            "path": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: the record's vault-relative path "
+                    "(task/<file>.md or routine/<file>.md) if known. Accepted "
+                    "for symmetry; the task entry is keyed by name."
+                ),
+            },
+            "routine_record": {
+                "type": "string",
+                "description": (
+                    "For origin=routine_item: the routine record name (e.g. "
+                    "'Recurring Bills + Admin') — the part inside "
+                    "[[routine/...]]."
+                ),
+            },
+            "item_text": {
+                "type": "string",
+                "description": (
+                    "For origin=routine_item: the item's text (e.g. 'Pay "
+                    "Rent'). For a routine/cadence T3 candidate this is the "
+                    "item identity."
+                ),
+            },
+            "source": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: the candidate's provenance if the brief made "
+                    "it explicit (e.g. 'auto-due', 'self-care'). Best-effort "
+                    "— omit if unknown; an unrecognized value is ignored "
+                    "(recorded as operator-added). Never affects whether the "
+                    "commit succeeds."
+                ),
+            },
+            "date": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: YYYY-MM-DD day to commit onto. Omit for today. "
+                    "Resolve relative dates yourself before calling."
+                ),
+            },
+        },
+        "required": ["tier", "origin"],
+    },
+}
+
+
 # Phase 2B B3 (2026-05-30) — ``routine_item`` schema.
 #
 # Salem-only tool for item-level CRUD on existing routine records.
@@ -1262,6 +1385,8 @@ SALEM_VAULT_TOOLS: list[dict[str, Any]] = [
     # Arc #20 (2026-07-22) — free-text T3 ad-hoc done-state (+ undo).
     _TIER_DONE_TOOL_SCHEMA,
     _TIER_UNDONE_TOOL_SCHEMA,
+    # #21 (2026-08-01) — deterministic tier-candidate confirm (chat side of C2).
+    _TIER_CONFIRM_TOOL_SCHEMA,
 ]
 
 
@@ -2784,6 +2909,153 @@ async def _dispatch_tier_done(
     return _dumps(payload)
 
 
+# --- tier_confirm dispatch (#21, 2026-08-01) -----------------------------
+#
+# The chat side of C2 slot-accept. Commits an auto-surfaced tier candidate onto
+# today's shortlist through ``tier.tier_confirm.confirm_slot_candidate`` — the
+# SAME writer the board's ``/feed/act`` accept calls, so chat + board are ONE
+# writer per verb. IN-PROCESS (the tier module is a clean fcntl-locked atomic
+# writer, like tier_done). Replaces the LLM whole-block ``vault_edit`` rewrite
+# the SKILL used to instruct — deterministic single-entry append, no fuzzy.
+
+
+async def _dispatch_tier_confirm(
+    *,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch one ``tier_confirm`` block — commit an auto-surfaced candidate.
+
+    Salem-only. IN-PROCESS call to ``confirm_slot_candidate`` (blocking file I/O
+    + ``fcntl`` lock → ``asyncio.to_thread``). NO fuzzy matching: the model
+    passes the candidate's fields from the brief's surfaced list; the tool
+    sanitizes the untrusted ``source``, resolves the date, and writes or fails
+    loud. Returns a JSON object carrying the ``kind`` discriminator the SKILL
+    routes on (success / idempotent_noop / invalid_tier / thin_evidence), plus
+    the committed tier + name + date.
+    """
+    import asyncio
+
+    from alfred.tier.tier_confirm import confirm_slot_candidate, sanitize_source
+
+    tool_label = "tier_confirm"
+
+    # --- Tool-set gating (Salem-only) -----------------------------------
+    tool_set = ""
+    if config is not None:
+        tool_set = (config.instance.tool_set or "").lower()
+    if tool_set in {"kalle", "hypatia"}:
+        log.warning(
+            f"talker.{tool_label}.wrong_tool_set",
+            tool_set=tool_set,
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": (
+                f"{tool_label} is Salem-only — the tier system is Salem-only"
+            ),
+            "tool_set": tool_set,
+        })
+
+    # --- Argument parsing -----------------------------------------------
+    if not isinstance(tool_input, dict):
+        return _dumps({"error": f"{tool_label} requires a dict tool_input"})
+    if config is None or not config.vault or not config.vault.path:
+        # Fail-loud: the writer needs a vault path (mirrors tier_done).
+        return _dumps({
+            "error": f"{tool_label} requires talker config with a vault path",
+        })
+
+    tier = tool_input.get("tier")
+    origin = str(tool_input.get("origin") or "")
+    name = str(tool_input.get("name") or "")
+    path = str(tool_input.get("path") or "")
+    routine_record = tool_input.get("routine_record")
+    item_text = tool_input.get("item_text")
+    # Sanitize the UNTRUSTED (LLM-supplied) source BEFORE it can reach the
+    # writer / persist into the daily file — an invented enum coerces to
+    # "operator" (#21 ruling). Never fake provenance.
+    source = sanitize_source(tool_input.get("source"))
+    date_raw = tool_input.get("date", "") or ""
+
+    vault_path = Path(config.vault.path)
+
+    # Resolve today in the tier timezone (matches /today's date boundary).
+    tz_name = _resolve_tier_timezone(config)
+    try:
+        today = _dt.datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:  # noqa: BLE001 - bad tz string → OS-local fallback
+        log.warning(f"talker.{tool_label}.bad_timezone", tz=tz_name)
+        today = _dt.date.today()
+
+    # Resolve the target date (default today). A malformed ``date`` is a
+    # fail-loud arg error, not a silent today-fallback (mirrors tier_done).
+    if isinstance(date_raw, str) and date_raw.strip():
+        try:
+            target_date = _dt.date.fromisoformat(date_raw.strip())
+        except ValueError:
+            return _dumps({
+                "error": (
+                    f"{tool_label}: 'date' must be YYYY-MM-DD; got {date_raw!r}"
+                ),
+            })
+    else:
+        target_date = today
+
+    log.info(
+        f"talker.{tool_label}.invoke",
+        session_id=session.session_id,
+        tier=tier,
+        origin=origin,
+        name=name[:200],
+        date=target_date.isoformat(),
+        default_today=(not (date_raw or "").strip()),
+    )
+
+    # --- In-process mutation (blocking → thread) ------------------------
+    try:
+        result = await asyncio.to_thread(
+            confirm_slot_candidate,
+            vault_path,
+            tier=tier,
+            origin=origin,
+            name=name,
+            path=path,
+            routine_record=routine_record,
+            item_text=item_text,
+            source=source,
+            date=target_date,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Dispatcher-only crash signal (the in-process call raised) — mirrors
+        # tier_done's ``internal_error``; the writer itself never emits it.
+        log.warning(
+            f"talker.{tool_label}.crashed",
+            session_id=session.session_id,
+            error=str(exc),
+        )
+        return _dumps({
+            "error": f"{tool_label} crashed: {exc}",
+            "kind": "internal_error",
+        })
+
+    log.info(
+        f"talker.{tool_label}.result",
+        session_id=session.session_id,
+        kind=result.kind,
+        tier=result.tier,
+        name=(result.name or "")[:200],
+        date=result.date or "",
+    )
+    return _dumps({
+        "kind": result.kind,
+        "tier": result.tier,
+        "name": result.name,
+        "date": result.date,
+    })
+
+
 # --- routine_item dispatch (Phase 2B B3, 2026-05-30) ---------------------
 #
 # Conversational item-CRUD path. Subprocess-invokes ``python -m alfred
@@ -4008,6 +4280,18 @@ async def _execute_tool(
             session=session,
             config=config,
             undo=True,
+        )
+
+    # ``tier_confirm`` (Salem, #21 2026-08-01) — commit an auto-surfaced tier
+    # candidate onto today's shortlist. IN-PROCESS via the SAME
+    # ``confirm_slot_candidate`` writer the board's slot-accept uses (one writer
+    # per verb). Deterministic single-entry append; replaces the LLM whole-block
+    # vault_edit rewrite.
+    if tool_name == "tier_confirm":
+        return await _dispatch_tier_confirm(
+            tool_input=tool_input,
+            session=session,
+            config=config,
         )
 
     # Inter-instance Phase A peer tools (KAL-LE, Hypatia → Salem). Each

@@ -99,6 +99,37 @@ CONFIRM_KIND_THIN_EVIDENCE = "thin_evidence"
 # IS the confirmation.
 _COMMITTED_SOURCE = "operator"
 
+# The known ``source`` vocabulary a confirm may persist — the auto/self-care
+# candidate sources ``compute_today_view`` stamps on an auto-surfaced entry
+# plus the committed ``operator``. Used by :func:`sanitize_source` to coerce an
+# UNTRUSTED (LLM-supplied) source at the talker-tool boundary; the board path
+# passes machine-surfaced sources (always in-vocab) and does not sanitize.
+KNOWN_CONFIRM_SOURCES: frozenset[str] = frozenset({
+    "auto-due",
+    "auto-escalate",
+    "auto-due-routine",
+    "auto-surface-routine",
+    "auto-cadence-routine",
+    "self-care",
+    _COMMITTED_SOURCE,  # "operator"
+})
+
+
+def sanitize_source(source: str | None) -> str:
+    """Coerce an untrusted ``source`` to a known-vocab value (#21 ruling).
+
+    Returns ``source`` (stripped) iff it is in :data:`KNOWN_CONFIRM_SOURCES`,
+    else ``"operator"`` — so an LLM-invented enum string never persists into the
+    daily file as fake provenance. The talker tool calls this on its LLM-supplied
+    ``source`` arg BEFORE invoking :func:`confirm_slot_candidate`; the board path
+    does not (its sources are machine-surfaced and always in-vocab). Note this
+    only affects the PERSISTED provenance on a T1 confirm (T2/T3 override to
+    ``operator`` inside the writer regardless), but it is applied uniformly at
+    the boundary so no untrusted string ever reaches the writer.
+    """
+    s = (source or "").strip()
+    return s if s in KNOWN_CONFIRM_SOURCES else _COMMITTED_SOURCE
+
 
 @dataclass
 class ConfirmResult:
@@ -347,6 +378,8 @@ __all__ = [
     "CONFIRM_KIND_INVALID_TIER",
     "CONFIRM_KIND_SUCCESS",
     "CONFIRM_KIND_THIN_EVIDENCE",
+    "KNOWN_CONFIRM_SOURCES",
     "ConfirmResult",
     "confirm_slot_candidate",
+    "sanitize_source",
 ]
