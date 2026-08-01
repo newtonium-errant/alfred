@@ -109,6 +109,30 @@ describe('useDeck — park (client-side defer, no POST)', () => {
   });
 });
 
+describe('useDeck — C2 slot: Accept POSTs, Skip = client park (rejectParks, no POST)', () => {
+  const slotCandidate = (id: string) =>
+    item({ id, kind: 'slot_suggestion', evidence: { tier: 1, origin: 'routine_item', routine_record: 'r/S.md', name: 'X', candidate: true } });
+
+  it('affirm on a slot candidate DEFERS a POST of "accept"', () => {
+    const { result } = renderHook(() => useDeck({ items: [slotCandidate('s')] }));
+    act(() => result.current.affirm());
+    expect(mockAct).not.toHaveBeenCalled(); // deferred
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).toHaveBeenCalledWith('s', 'accept');
+  });
+
+  it('reject (LEFT = Skip) PARKS the candidate — no POST, counts + persists', () => {
+    const parkPersist = vi.fn();
+    const { result } = renderHook(() => useDeck({ items: [slotCandidate('s'), item({ id: 'b' })], onParkPersist: parkPersist }));
+    act(() => result.current.reject()); // Skip
+    expect(result.current.current?.id).toBe('b'); // advanced
+    expect(result.current.parkedCount).toBe(1);
+    expect(parkPersist).toHaveBeenCalledWith('s');
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).not.toHaveBeenCalled(); // ← reddens if skip POSTs instead of parking
+  });
+});
+
 describe('useDeck — heavy two-step confirm', () => {
   it('heavy affirm reveals a confirm stage (no advance, no POST) until confirm-tap', () => {
     const items = [item({ id: 'p1', kind: 'proposal', title: 'New person' })];
@@ -275,5 +299,18 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     // The verb footer is a sibling OUTSIDE the scroll region (DOM-order containment).
     expect(evidence.textContent).not.toContain('Confirm');
     expect(screen.getByTestId('deck-card').textContent).toContain('Confirm');
+  });
+
+  it('a SUGGESTED slot card shows the tier badge + the WHY + a "Take it — T{n}" affirm + Skip', () => {
+    renderCard({
+      kind: 'slot_suggestion',
+      title: 'Meditate',
+      evidence: { tier: 3, origin: 'routine_item', routine_record: 'r/S.md', name: 'Meditate', surface_reason: 'self-care', candidate: true },
+    });
+    expect(screen.getByTestId('deck-slot-tier').textContent).toContain('T3');
+    expect(screen.getByTestId('deck-slot-why').textContent).toContain('self-care');
+    const face = screen.getByTestId('deck-card').textContent ?? '';
+    expect(face).toContain('Take it — T3'); // tier-bearing affirm, not a blind swipe
+    expect(face).toContain('Skip'); // LEFT is Skip (park), never a hard reject
   });
 });

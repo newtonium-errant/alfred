@@ -10,7 +10,7 @@ import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { composeMode, halifaxHour, type ComposeMode } from '../lib/algernon/composer';
 import { useComposerLog } from '../lib/algernon/composerLog';
-import { deckVerbsFor } from '../lib/algernon/feedConstants';
+import { isDeckDealt } from '../lib/algernon/feedConstants';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { ringItemDone } from '../lib/algernon/rings';
 import { ApiError } from '../lib/algernon/http';
@@ -87,7 +87,7 @@ export default function HomePage() {
   const needsYouCount = board.needsYou.filter(
     (it) => !(it.kind === 'slot_suggestion' && ringItemDone(it)),
   ).length;
-  const deckableCount = board.needsYou.filter((it) => deckVerbsFor(it.kind) !== null).length;
+  const deckableCount = board.needsYou.filter(isDeckDealt).length;
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {

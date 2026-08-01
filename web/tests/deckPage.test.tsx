@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 
-// First-contact fix: the deck deals ONLY kinds with a wired verb (DECK_VERBS).
-// A decide-mode kind whose acts aren't built yet (slot_suggestion) must never
-// enter the stack as a card dead to every gesture; and the empty-state must
-// distinguish "nothing to decide" from "open decisions are not-yet-actionable".
+// The deck deals ONLY isDeckDealt items — classic decisions + C2 SUGGESTED slots.
+// A PLANNED slot (committed, non-candidate) is a worklist item, not a deck card, so
+// it must never enter the stack; and the empty-state distinguishes "nothing to
+// decide" from "open items are on the worklist, not the deck".
 
 const { mockList } = vi.hoisted(() => ({ mockList: vi.fn() }));
 vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: vi.fn() } }));
@@ -34,6 +34,9 @@ function item(kind: string, id: string): FeedItem {
     source_ref: {},
   };
 }
+function slotItem(id: string, evidence: Record<string, unknown>): FeedItem {
+  return { ...item('slot_suggestion', id), evidence };
+}
 
 beforeEach(() => {
   mockList.mockReset();
@@ -61,15 +64,31 @@ describe('DeckPage — deals only actionable kinds', () => {
     expect(screen.queryByTestId('deck-unactionable')).toBeNull();
   });
 
-  it('all-unactionable → the NOT-YET-actionable empty state (distinct from done), no deck', async () => {
+  it('deals a SUGGESTED slot candidate as a card (C2) — enabled Accept + tier badge on the face', async () => {
     mockList.mockResolvedValue({
-      items: [item('slot_suggestion', 's1'), item('slot_suggestion', 's2')],
+      items: [slotItem('s1', { tier: 1, origin: 'routine_item', routine_record: 'r/S.md', item_text: 'Meditate', name: 'Meditate', candidate: true })],
+      count: 1,
+    });
+    render(<DeckPage />);
+    await waitFor(() => expect(screen.queryByTestId('deck-card')).not.toBeNull());
+    expect(screen.getByTestId('deck-card').getAttribute('data-kind')).toBe('slot_suggestion');
+    expect(screen.getByTestId('deck-count').textContent).toBe('1 card');
+    expect((screen.getByTestId('deck-btn-affirm') as HTMLButtonElement).disabled).toBe(false); // accept wired
+    expect(screen.queryByTestId('deck-slot-tier')?.textContent).toContain('T1');
+    expect(screen.queryByTestId('deck-unactionable')).toBeNull();
+  });
+
+  it('all-PLANNED (committed, non-dealt) → the worklist empty state, no deck', async () => {
+    // Planned slots (evidence {} → no candidate) aren't deck cards; they're worklist
+    // items on the Feed. Distinct from "done" and from "nothing to decide".
+    mockList.mockResolvedValue({
+      items: [slotItem('s1', { tier: 1 }), slotItem('s2', { tier: 2 })],
       count: 2,
     });
     render(<DeckPage />);
     await waitFor(() => expect(screen.queryByTestId('deck-unactionable')).not.toBeNull());
     expect(screen.getByTestId('deck-unactionable').textContent).toContain('2 items');
-    expect(screen.getByTestId('deck-unactionable').textContent).toContain('still being built');
+    expect(screen.getByTestId('deck-unactionable').textContent).toContain('worklist');
     expect(screen.queryByTestId('deck-card')).toBeNull();
     expect(screen.queryByTestId('deck-empty')).toBeNull();
   });

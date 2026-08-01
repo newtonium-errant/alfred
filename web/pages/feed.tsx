@@ -9,7 +9,7 @@ import { authApi } from '../lib/algernon/authClient';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { deckVerbsFor } from '../lib/algernon/feedConstants';
+import { isDeckDealt } from '../lib/algernon/feedConstants';
 import { ringItemDone } from '../lib/algernon/rings';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
@@ -68,11 +68,12 @@ export default function FeedPage() {
   const activeNeedsYou = board.needsYou.filter(
     (it) => !(it.kind === 'slot_suggestion' && ringItemDone(it)),
   );
-  // A needs-you item is deck-able only if the deck has a wired verb for its kind;
-  // the rest (slot_suggestion) get the SAME per-lane completion control the rings
-  // panel uses — completion is LIVE now, not "arriving with the board".
-  const deckable = activeNeedsYou.filter((it) => deckVerbsFor(it.kind) !== null);
-  const pendingRows = activeNeedsYou.filter((it) => deckVerbsFor(it.kind) === null);
+  // Deck-dealt = classic decisions + SUGGESTED slots (isDeckDealt — the one predicate
+  // that also drives the deck-link count, so it matches what /deck deals). Slot rows
+  // (suggested → Accept, planned → ✓) ALSO render inline as the worklist — a suggested
+  // slot is legitimately on both the deck link and the inline list (team-lead ruling).
+  const deckable = activeNeedsYou.filter(isDeckDealt);
+  const pendingRows = activeNeedsYou.filter((it) => it.kind === 'slot_suggestion');
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {

@@ -184,7 +184,15 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   const reject = useCallback(() => {
     if (!current) return;
     const verbs = deckVerbsFor(current.kind);
-    if (!verbs || verbs.reject === null) return; // no reject action (e.g. pending)
+    if (!verbs) return;
+    // C2 skip=park: a rejectParks lane (slot candidate) routes the LEFT gesture to a
+    // client-side PARK (no POST) — a skip, not a decline; it may resurface at the
+    // next sync (there's no backend decline path for slots v1).
+    if (verbs.rejectParks) {
+      commit('park', null, current);
+      return;
+    }
+    if (verbs.reject === null) return; // no reject action (e.g. pending)
     commit('reject', verbs.reject, current);
   }, [current, commit]);
 
