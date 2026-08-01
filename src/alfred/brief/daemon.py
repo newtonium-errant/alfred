@@ -315,6 +315,14 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         config.vault_path,
         since=today,
         quarantine_dir_name=config.quarantine_dir_name,
+        # #27 slice 2 — the "medium emails waiting" line reads the feed store.
+        # Threaded UNCONDITIONALLY (not gated on feed.enabled): both the feed-
+        # enabled and feed-disabled briefs then read the SAME store at this
+        # point (before _emit_brief_feed's writes, and the brief never writes
+        # email_tier), keeping the feed-parity golden gate byte-identical.
+        # FeedStore.load is safe on a missing/empty file, so an off/absent feed
+        # renders the honest zero-state.
+        feed_store_path=config.feed.store_path,
     )
 
     # Health section — reads the latest BIT record from vault/run/

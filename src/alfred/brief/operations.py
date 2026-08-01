@@ -69,6 +69,55 @@ def _quarantine_summary(
     return f"Spam quarantine: {week_count} this week ({month_count} this month)"
 
 
+def _medium_waiting_summary(feed_store_path: str) -> str:
+    """Count OPEN medium-tier ``email_tier`` items in the feed store → one line.
+
+    #27 slice 2 — "medium waits, but never SILENTLY." Medium emails surface as
+    ``email_tier`` calibration cards; while the operator hasn't confirmed / re-
+    tiered them they sit OPEN in the feed store. This is the brief's honest count
+    of that held set (tap-through on the FE = the feed filtered to waiting emails
+    — no new brief machinery; the feed already holds them).
+
+    "Waiting-medium" = feed item ``kind == "email_tier"`` AND ``state == "open"``
+    AND the classifier's verdict (``evidence.classifier_priority``) was
+    ``"medium"``. A confirmed / re-tiered card is ``acted`` (excluded); the
+    classifier verdict is the tier axis (a re-tier acts the item, so open items
+    still carry the original verdict).
+
+    Returns (always a line — ILB: a held-count of 0 is a real, tested state, not
+    silence):
+      - ``"📥 No medium emails waiting"`` — explicit zero-state
+      - ``"📥 N medium email(s) waiting"`` — N > 0
+      - ``"📥 Medium-email count unavailable"`` — read/fold error (warned; never
+        crashes the bare-called Operations render)
+
+    Read via ``FeedStore.load`` (brief → feed is a leaf import; ``load`` is itself
+    lock-free + torn-line-tolerant). Belt-wrapped so a feed fault can never break
+    the Operations section (the daemon calls it bare).
+    """
+    try:
+        from alfred.feed import FeedStore
+
+        items = FeedStore(feed_store_path).load()
+        n = sum(
+            1
+            for it in items.values()
+            if it.kind == "email_tier"
+            and it.state == "open"
+            and (it.evidence or {}).get("classifier_priority") == "medium"
+        )
+    except Exception as exc:  # noqa: BLE001 — Operations is called bare; never crash
+        log.warning(
+            "operations.medium_waiting_failed",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return "📥 Medium-email count unavailable"
+    if n == 0:
+        return "📥 No medium emails waiting"
+    return f"📥 {n} medium email{'s' if n != 1 else ''} waiting"
+
+
 def _count_audit_log(audit_path: Path, since: str) -> dict[str, dict[str, int]]:
     """Count audit log mutations by tool and operation since a given ISO date prefix.
 
@@ -207,6 +256,7 @@ def format_operations_section(
     vault_path: str,
     since: str | None = None,
     quarantine_dir_name: str = "quarantine",
+    feed_store_path: str | None = None,
 ) -> str:
     """Render the Operations section as markdown.
 
@@ -219,6 +269,15 @@ def format_operations_section(
             matches ``EmailClassifierConfig.quarantine_dir_name``).
             Threaded through to ``_quarantine_summary`` so per-instance
             overrides surface in the operator brief.
+        feed_store_path: Path to the feed store (#27 slice 2). When provided,
+            the "medium emails waiting" line is appended (an OPEN-medium
+            ``email_tier`` count). ``None`` (the default for non-daemon callers /
+            existing tests) omits the line, keeping their output byte-identical.
+            The daemon threads it UNCONDITIONALLY (not gated on ``feed.enabled``)
+            so the feed-enabled and feed-disabled briefs stay byte-identical —
+            the feed-parity golden gate — since both read the same store at
+            Operations-render time (before any brief feed-write, and the brief
+            never writes ``email_tier``).
     """
     if since is None:
         since = date.today().isoformat()
@@ -272,6 +331,14 @@ def format_operations_section(
     lines.append(
         f"**{_quarantine_summary(vault, quarantine_dir_name=quarantine_dir_name)}**"
     )
+
+    # #27 slice 2 — medium emails waiting. Sits beside the quarantine line
+    # (both are email-classifier operator-review surfaces). Rendered ONLY when
+    # the caller threads a feed store path (existing callers pass None → byte-
+    # identical output). Always a line when threaded, incl. the explicit
+    # zero-state per ILB — held medium email must never be SILENTLY held.
+    if feed_store_path is not None:
+        lines.append(f"**{_medium_waiting_summary(feed_store_path)}**")
 
     # Audit breakdown if there's activity
     if audit_counts:
