@@ -439,3 +439,98 @@ describe('Deck — parked drill-down (task #26 render)', () => {
     expect(screen.getByTestId('deck-card').textContent).toContain('Bravo');
   });
 });
+
+describe('useDeck — re-tier the current email card (#28)', () => {
+  const emailItem = (over: Partial<FeedItem> = {}) =>
+    item({ kind: 'email_tier', evidence: { classifier_priority: 'low', sender: 'a@b.com', subject: 'x' }, ...over });
+
+  it('reTier posts the EXACT tier action_id and flips the card on acted', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'a', action_id: 'high', detail: '' });
+    const { result } = renderHook(() => useDeck({ items: [emailItem({ id: 'a' }), item({ id: 'b' })] }));
+    await act(async () => { await result.current.reTier('high'); });
+    expect(mockAct).toHaveBeenCalledWith('a', 'high'); // the id VOCAB is the contract
+    expect(result.current.current?.id).toBe('b'); // flip-on-acted: leaves the deck
+  });
+
+  it('does NOT advance until acted returns (no optimistic lie)', async () => {
+    let resolveAct: (v: unknown) => void = () => undefined;
+    mockAct.mockImplementation(() => new Promise((r) => { resolveAct = r; }));
+    const { result } = renderHook(() => useDeck({ items: [emailItem({ id: 'a' }), item({ id: 'b' })] }));
+    let pending: Promise<void> = Promise.resolve();
+    await act(async () => {
+      pending = result.current.reTier('high');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // In flight: pending signal set, card NOT advanced (nothing greens yet).
+    expect(result.current.reTiering).toBe('high');
+    expect(result.current.current?.id).toBe('a');
+    await act(async () => {
+      resolveAct({ ok: true, status: 'acted', id: 'a', action_id: 'high', detail: '' });
+      await pending;
+    });
+    expect(result.current.reTiering).toBeNull();
+    expect(result.current.current?.id).toBe('b'); // only NOW flipped
+  });
+
+  it('a non-acted status keeps the card (honest, retry possible)', async () => {
+    mockAct.mockResolvedValue({ ok: false, status: 'invalid_action', id: 'a', action_id: 'high', detail: 'nope' });
+    const { result } = renderHook(() => useDeck({ items: [emailItem({ id: 'a' }), item({ id: 'b' })] }));
+    await act(async () => { await result.current.reTier('high'); });
+    expect(result.current.current?.id).toBe('a'); // NOT advanced
+    expect(result.current.toast?.message).toContain('nope');
+  });
+
+  it('an ApiError routes to the error handler and keeps the card', async () => {
+    mockAct.mockRejectedValue(new ApiError(502, 'feed_upstream_unavailable'));
+    const { result } = renderHook(() => useDeck({ items: [emailItem({ id: 'a' })] }));
+    await act(async () => { await result.current.reTier('high'); });
+    expect(result.current.current?.id).toBe('a'); // stays
+    expect(result.current.banner).toContain('server-side');
+  });
+});
+
+describe('Deck — re-tier picker (task #28 render)', () => {
+  const emailItem = (over: Partial<FeedItem> = {}) =>
+    item({ kind: 'email_tier', evidence: { classifier_priority: 'low', sender: 'a@b.com', subject: 'x' }, ...over });
+
+  it('"Adjust tier…" opens the picker with the tiers OTHER than the assigned one', () => {
+    render(<Deck items={[emailItem({ id: 'a', title: 'Email A' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-retier-open')));
+    expect(screen.getByTestId('deck-retier-picker')).toBeTruthy();
+    // Assigned LOW → offers high / medium / spam, NOT low (spam included: two honest doors).
+    expect(screen.queryByTestId('deck-retier-choice-high')).not.toBeNull();
+    expect(screen.queryByTestId('deck-retier-choice-medium')).not.toBeNull();
+    expect(screen.queryByTestId('deck-retier-choice-spam')).not.toBeNull();
+    expect(screen.queryByTestId('deck-retier-choice-low')).toBeNull(); // assigned excluded
+  });
+
+  it('picking a tier posts its exact action_id, closes the picker + shows an honest toast', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'a', action_id: 'high', detail: '' });
+    render(<Deck items={[emailItem({ id: 'a', title: 'Email A' }), item({ id: 'b', title: 'Bee' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-retier-open')));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('deck-retier-choice-high'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mockAct).toHaveBeenCalledWith('a', 'high');
+    expect(screen.queryByTestId('deck-retier-picker')).toBeNull(); // closed once the act resolved
+    expect(screen.getByTestId('deck-toast').textContent).toContain('Re-tiered to HIGH');
+  });
+
+  it('the "Adjust tier…" affordance is email_tier only (absent on other kinds)', () => {
+    render(<Deck items={[item({ id: 'p', kind: 'proposal', title: 'New person' })]} />);
+    expect(screen.queryByTestId('deck-retier-open')).toBeNull();
+  });
+
+  it('picker open → an arrow key does NOT act on the hidden card (input gated)', () => {
+    render(<Deck items={[emailItem({ id: 'a', title: 'Email A' }), item({ id: 'b', title: 'Bee' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-retier-open')));
+    act(() => fireEvent.keyDown(screen.getByTestId('deck'), { key: 'ArrowRight' }));
+    act(() => fireEvent.click(screen.getByTestId('deck-retier-cancel')));
+    // a was NOT affirmed/advanced — still the top card.
+    expect(screen.getAllByTestId('deck-card')[0].textContent).toContain('Email A');
+    expect(mockAct).not.toHaveBeenCalled(); // no act fired from the gated arrow
+  });
+});

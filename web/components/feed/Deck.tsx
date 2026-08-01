@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
 import {
   DRAG_Y_CLAMP,
+  EMAIL_PRIORITY_TIERS,
   deckVerbsFor,
+  emailPriority,
   kindLabel,
   stampOpacity,
   verdictForDrag,
@@ -24,18 +26,26 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
   // The parked drill-down (task #26): parked cards stay hidden by default, viewable
   // behind this drill so the operator can deal one back without waiting for the sync.
   const [parkedOpen, setParkedOpen] = useState(false);
+  // The re-tier picker (task #28) — a deliberate multi-choice correction on the email card.
+  const [reTierOpen, setReTierOpen] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
 
-  // Collapse the evidence expand whenever the top card changes.
-  useEffect(() => setExpanded(false), [current?.id]);
+  // Collapse the evidence expand + close the re-tier picker whenever the top card changes.
+  useEffect(() => {
+    setExpanded(false);
+    setReTierOpen(false);
+  }, [current?.id]);
 
   const confirming = current != null && confirmingId === current.id;
+  // Any open overlay (parked drill OR re-tier picker) blocks deck swipe + keyboard input,
+  // so a gesture can't act on the card hidden underneath (the parked-panel guard lesson).
+  const inputBlocked = parkedOpen || reTierOpen;
 
   // Imperative pointer drag on the top card — no React re-render per move. The
   // DISCRETE outcome (verdictForDrag → deck handler) is what the unit tests pin.
   useEffect(() => {
     const el = topRef.current;
-    if (!el || !current || confirming) return;
+    if (!el || !current || confirming || inputBlocked) return;
     let sx = 0;
     let sy = 0;
     let dx = 0;
@@ -93,24 +103,36 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
       el.removeEventListener('pointerup', onUp);
       el.removeEventListener('pointercancel', onUp);
     };
-  }, [current, confirming, deck]);
+  }, [current, confirming, inputBlocked, deck]);
 
   // Keyboard alternates (accessibility): ← reject · → affirm · ↑ park · ↓ details.
-  // While the parked drill-down is open its overlay blocks pointer input on the hidden
-  // card, so the keyboard MUST be gated too — otherwise an arrow key acts on the card
-  // underneath the panel (a first-contact-shaped edge).
+  // While an overlay (parked drill OR re-tier picker) is open it blocks pointer input on
+  // the hidden card, so the keyboard MUST be gated too — otherwise an arrow key acts on
+  // the card underneath the overlay (a first-contact-shaped edge).
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (!current || confirming || parkedOpen) return;
+      if (!current || confirming || inputBlocked) return;
       if (e.key === 'ArrowRight') deck.affirm();
       else if (e.key === 'ArrowLeft') deck.reject();
       else if (e.key === 'ArrowUp') deck.park();
       else if (e.key === 'ArrowDown') setExpanded((v) => !v);
     },
-    [current, confirming, parkedOpen, deck],
+    [current, confirming, inputBlocked, deck],
+  );
+
+  // Re-tier the current email card to a chosen tier, then close the picker once the act
+  // resolves (on success the card has flipped away; on error the toast shows + card stays).
+  const onPickTier = useCallback(
+    async (tier: string) => {
+      await deck.reTier(tier);
+      setReTierOpen(false);
+    },
+    [deck],
   );
 
   const verbs = current ? deckVerbsFor(current.kind) : null;
+  // The current email card's assigned tier (#28) — the picker offers the OTHERS.
+  const assignedTier = current ? emailPriority(current) : null;
   const stack: Array<{ item: FeedItem; depth: number }> = [];
   if (current) stack.push({ item: current, depth: 0 });
   upcoming.forEach((item, i) => stack.push({ item, depth: i + 1 }));
@@ -153,6 +175,7 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
             onToggleEvidence={() => setExpanded((v) => !v)}
             onConfirmHeavy={deck.confirmHeavy}
             onCancelHeavy={deck.cancelHeavy}
+            onReTierOpen={depth === 0 ? () => setReTierOpen(true) : undefined}
           />
         ))}
 
@@ -235,6 +258,55 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
                   </li>
                 ))}
               </ul>
+            )}
+          </div>
+        )}
+
+        {/* The re-tier picker (task #28): a deliberate correction of the classifier's
+            tier — the tiers OTHER than the assigned one (spam included, two honest doors).
+            Each choice AWAITS its act; nothing greens until acted returns (deck.reTiering
+            drives the pending signal). Overlays the card; deck input is gated while open. */}
+        {reTierOpen && current && (
+          <div
+            data-testid="deck-retier-picker"
+            role="dialog"
+            aria-label="Adjust email tier"
+            className="absolute inset-0 z-20 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+          >
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">Adjust tier</p>
+              <button
+                type="button"
+                data-testid="deck-retier-cancel"
+                disabled={deck.reTiering !== null}
+                onClick={() => setReTierOpen(false)}
+                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2 disabled:opacity-40"
+              >
+                Cancel
+              </button>
+            </div>
+            <p className="mb-2 text-xs text-honeydew-600">
+              {assignedTier ? `Now: ${assignedTier.toUpperCase()}. Move it to:` : 'Set the tier:'}
+            </p>
+            <div className="flex flex-col gap-2">
+              {EMAIL_PRIORITY_TIERS.filter((tier) => tier !== assignedTier).map((tier) => (
+                <button
+                  key={tier}
+                  type="button"
+                  data-testid={`deck-retier-choice-${tier}`}
+                  disabled={deck.reTiering !== null}
+                  onClick={() => void onPickTier(tier)}
+                  className="rounded-xl border border-honeydew-400 px-3 py-2 text-left text-sm font-semibold uppercase tracking-wider text-honeydew-700 disabled:opacity-40"
+                >
+                  {tier}
+                </button>
+              ))}
+            </div>
+            {deck.reTiering && (
+              // Intentionally-left-blank: an explicit working signal — nothing greens until acted.
+              <p data-testid="deck-retier-pending" className="mt-3 text-xs text-honeydew-600">
+                Adjusting to {deck.reTiering.toUpperCase()}…
+              </p>
             )}
           </div>
         )}
