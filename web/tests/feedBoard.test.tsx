@@ -154,6 +154,7 @@ describe('FeedRow — defensive render', () => {
 // A fake completion object pins FeedRow's per-lane RENDER + wiring against that
 // interface; the hook's own act/undo/error logic is pinned in useRingCompletion.test.
 import type { UseRingCompletionResult } from '../components/feed/useRingCompletion';
+import type { UseSlotAcceptResult } from '../components/feed/useSlotAccept';
 
 function fakeCompletion(over: Partial<UseRingCompletionResult> = {}): UseRingCompletionResult {
   return {
@@ -162,6 +163,15 @@ function fakeCompletion(over: Partial<UseRingCompletionResult> = {}): UseRingCom
     errorFor: () => null,
     complete: vi.fn(),
     undo: vi.fn(),
+    ...over,
+  };
+}
+function fakeAccept(over: Partial<UseSlotAcceptResult> = {}): UseSlotAcceptResult {
+  return {
+    accepted: () => false,
+    busy: () => false,
+    errorFor: () => null,
+    accept: vi.fn(),
     ...over,
   };
 }
@@ -259,5 +269,39 @@ describe('FeedRow — per-lane completion (shared hook)', () => {
       />,
     );
     expect(screen.getByTestId('feed-row-completion-error').textContent).toContain('could not be completed');
+  });
+});
+
+describe('FeedRow — C2 SUGGESTED stage (accept)', () => {
+  const suggested = (over: Partial<FeedItem> = {}) =>
+    slot({
+      id: 'sug',
+      evidence: { tier: 1, origin: 'routine_item', routine_record: 'routine/SelfCare.md', item_text: 'Meditate', name: 'Meditate', candidate: true },
+      ...over,
+    });
+
+  it('a SUGGESTED slot shows Accept (no ✓) and calls accept()', () => {
+    const acc = vi.fn();
+    render(
+      <FeedRow item={suggested()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion()} accept={fakeAccept({ accept: acc })} />,
+    );
+    expect(screen.queryByTestId('feed-row-complete')).toBeNull(); // candidates aren't completable
+    fireEvent.click(screen.getByTestId('feed-row-accept'));
+    expect(acc).toHaveBeenCalledTimes(1);
+  });
+
+  it('an accepted (optimistic-committed) slot flips to PLANNED — the live ✓, not Accept', () => {
+    render(
+      <FeedRow item={suggested()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion()} accept={fakeAccept({ accepted: () => true })} />,
+    );
+    expect(screen.queryByTestId('feed-row-accept')).toBeNull();
+    expect(screen.queryByTestId('feed-row-complete')).not.toBeNull(); // routine lane → live ✓
+  });
+
+  it('surfaces an accept error (merged into the row error line)', () => {
+    render(
+      <FeedRow item={suggested()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion()} accept={fakeAccept({ errorFor: () => "That's already on today's plan." })} />,
+    );
+    expect(screen.getByTestId('feed-row-completion-error').textContent).toContain('already on');
   });
 });

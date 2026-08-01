@@ -7,6 +7,7 @@ import { FeedRow } from '../components/feed/FeedRow';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
+import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { deckVerbsFor } from '../lib/algernon/feedConstants';
 import { ringItemDone } from '../lib/algernon/rings';
@@ -60,6 +61,8 @@ export default function FeedPage() {
   const board = useFeedBoard({ items: items ?? [], onAuthExpired });
   // ONE completion implementation, shared with the rings panel (never a second).
   const completion = useRingCompletion({ onAuthExpired });
+  // The C2 accept hook — drives a SUGGESTED slot row's [Accept] + optimistic flip.
+  const slotAccept = useSlotAccept({ onAuthExpired });
   // A DONE slot item no longer needs you (isDone counting — mirrors the composer):
   // it drops out of the needs-you groups once its completion reconciles.
   const activeNeedsYou = board.needsYou.filter(
@@ -169,6 +172,7 @@ export default function FeedPage() {
                     expanded={expanded.has(it.id)}
                     onToggleEvidence={() => toggleExpanded(it.id)}
                     completion={completion}
+                    accept={slotAccept}
                   />
                 ))}
               </ul>
