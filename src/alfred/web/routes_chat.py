@@ -749,12 +749,35 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 user=identity.user, session_key=session_key,
             )
 
+        # C3c player context primer — when the pause→ask turn carries a valid
+        # {brief_date, section_id}, prepend the SERVER-composed grounding note so
+        # deictic references ("why is that yellow?") resolve against the
+        # on-screen slide. The client sends ONLY the structured fields; the note
+        # is composed here (never client-authored → no prompt-injection surface).
+        # Invalid/absent primer → un-grounded, byte-identical to a normal turn.
+        # Injected AFTER the dedup check so the idempotency key stays the raw
+        # operator message. ``/chat/turn`` only (v1); the stream handler is
+        # untouched.
+        from alfred.brief.player_primer import PlayerContextPrimer
+
+        primer = PlayerContextPrimer.from_dict(body.get("primer"))
+        turn_message = message
+        if primer.valid:
+            turn_message = f"{primer.context_line()}\n\n{message}"
+            log.info(
+                "web.chat.primer_grounded",
+                user=identity.user,
+                session_key=session_key,
+                brief_date=primer.brief_date,
+                section_id=primer.section_id,
+            )
+
         try:
             reply = await run_turn(
                 client=client,
                 state=state_mgr,
                 session=session_obj,
-                user_message=message,
+                user_message=turn_message,
                 config=talker_config,
                 vault_context_str=vault_context_str,
                 system_prompt=system_prompt_provider(),

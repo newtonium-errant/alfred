@@ -2052,3 +2052,98 @@ async def test_rrts_turn_surfaces_web_channel_in_system(rrts_web_client) -> None
         )
     )
     assert "channel: web" in rendered
+
+
+# ---------------------------------------------------------------------------
+# C3c player context primer (/chat/turn) — structured, server-composed grounding
+# ---------------------------------------------------------------------------
+# The pause→ask turn carries an optional structured {brief_date, section_id};
+# the BACKEND composes the grounding note (client never authors prompt text).
+# The persisted user turn (via /chat/history) is the injected message — the
+# direct pin. Gates: valid → grounded; absent → byte-parity; invalid → NEVER
+# inject (un-grounded, byte-identical).
+
+
+async def _open(web_client, headers) -> str:
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    assert r.status == 200
+    return (await r.json())["session_key"]
+
+
+async def _turn_user_text(web_client, headers, sk: str) -> str:
+    """The persisted USER turn text after a turn — the injected message."""
+    r = await web_client.get(f"/chat/history/{sk}", headers=headers)
+    assert r.status == 200
+    turns = (await r.json())["turns"]
+    return next(t["text"] for t in turns if t["role"] == "user")
+
+
+async def test_primer_grounds_user_turn(web_client) -> None:
+    """Valid primer → the SERVER-composed grounding note is prepended to the
+    turn (committed contract)."""
+    headers = _session_headers()
+    sk = await _open(web_client, headers)
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk,
+            "message": "why is that yellow?",
+            "primer": {"brief_date": "2026-08-01", "section_id": "day_plan"},
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+    text = await _turn_user_text(web_client, headers, sk)
+    assert text.startswith("[Player context:")          # server-composed note
+    assert "day_plan" in text and "2026-08-01" in text  # grounded on the slide
+    assert text.rstrip().endswith("why is that yellow?")  # raw message preserved
+
+
+async def test_absent_primer_byte_parity(web_client) -> None:
+    """No primer → the turn is byte-identical to a normal turn (images-style
+    optionality)."""
+    headers = _session_headers()
+    sk = await _open(web_client, headers)
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": sk, "message": "plain message"},
+        headers=headers,
+    )
+    assert r.status == 200
+    assert await _turn_user_text(web_client, headers, sk) == "plain message"
+
+
+async def test_invalid_primer_section_falls_back_ungrounded(web_client) -> None:
+    """A garbage section_id fails the .valid gate → NEVER inject; the turn is
+    un-grounded (byte-identical). The client can't ground a turn on a bogus
+    slide."""
+    headers = _session_headers()
+    sk = await _open(web_client, headers)
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk,
+            "message": "hello",
+            "primer": {"brief_date": "2026-08-01", "section_id": "not_a_real_slide"},
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+    assert await _turn_user_text(web_client, headers, sk) == "hello"  # no injection
+
+
+async def test_invalid_primer_bad_date_falls_back_ungrounded(web_client) -> None:
+    """A non-ISO brief_date fails the .valid gate → un-grounded byte-parity."""
+    headers = _session_headers()
+    sk = await _open(web_client, headers)
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk,
+            "message": "hello",
+            "primer": {"brief_date": "today", "section_id": "day_plan"},
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+    assert await _turn_user_text(web_client, headers, sk) == "hello"  # no injection
