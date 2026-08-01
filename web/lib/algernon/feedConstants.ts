@@ -68,6 +68,11 @@ export const HEAVY_KINDS: ReadonlySet<string> = new Set(['proposal', 'recurrence
 
 export const DECK_VERBS: Record<string, DeckVerbs> = {
   email_tier: { affirm: 'confirm', reject: 'spam', affirmLabel: 'Confirm', rejectLabel: 'Spam', heavy: false },
+  // #27 email_urgent — the INTERRUPT card. ACK-only: right/✓ acknowledges (POST "ack" →
+  // acted → flip); no reject/left (re-tier lives on the calibration card — two cards, two
+  // claims); park works as ever (kind-generic). Having this entry is what makes
+  // isDeckDealt(email_urgent) true → the C2-era generic deck/needs-you paths deal + count it.
+  email_urgent: { affirm: 'ack', reject: null, affirmLabel: 'Got it', rejectLabel: '', heavy: false },
   attribution: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject', heavy: false },
   routine_match: { affirm: 'confirm', reject: 'reject', affirmLabel: "That's it", rejectLabel: 'No', heavy: false },
   proposal: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject', heavy: true },
@@ -140,6 +145,7 @@ export function affirmLabelFor(item: FeedItem): string | null {
 // (upper-cased) so a new backend kind still renders a sensible chip.
 export const KIND_LABELS: Record<string, string> = {
   email_tier: 'Email tier',
+  email_urgent: 'Urgent',
   attribution: 'Attribution',
   proposal: 'Proposal',
   recurrence: 'Recurrence',

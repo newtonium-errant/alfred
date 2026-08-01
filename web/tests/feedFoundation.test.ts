@@ -12,6 +12,7 @@ import {
   affirmLabelFor,
   deckVerbsFor,
   emailPriority,
+  isDeckDealt,
   kindLabel,
   stampOpacity,
   verdictForDrag,
@@ -206,6 +207,33 @@ describe('deck verbs', () => {
   it('returns null for an unmapped kind (park-only)', () => {
     expect(deckVerbsFor('weather')).toBeNull();
     expect(deckVerbsFor('email_tier')).not.toBeNull();
+  });
+});
+
+describe('email_urgent — the interrupt kind deals + acks (#27)', () => {
+  const urgent = (over: Record<string, unknown> = {}) =>
+    feedItem('email_urgent', { sender: 'a@b.com', subject: 'Re: prod down', classifier_priority: 'high', high_source: 'override', ...over });
+
+  it('deals into the deck (isDeckDealt true — the C2-era generic path carries it)', () => {
+    expect(isDeckDealt(urgent())).toBe(true);
+  });
+  it('is ACK-only: affirm "ack", no reject (re-tier stays on the calibration card)', () => {
+    const v = deckVerbsFor('email_urgent');
+    expect(v?.affirm).toBe('ack');
+    expect(v?.reject).toBeNull();
+    expect(v?.heavy).toBe(false);
+  });
+  it('affirmLabelFor is the static "Got it" (no tier append — not a calibration card)', () => {
+    expect(affirmLabelFor(urgent())).toBe('Got it');
+    expect(emailPriority(urgent())).toBeNull(); // the priority badge is email_tier-only
+  });
+  it('reuses the email honest-copy path: isEmailEvidence fires (sender+subject+classifier_priority)', () => {
+    expect(isEmailEvidence(urgent().evidence)).toBe(true);
+  });
+  it('hides high_source from the raw rows (it renders as the on-face provenance chip)', () => {
+    const keys = evidenceRows(urgent().evidence).map((r) => r.key);
+    expect(keys).not.toContain('high_source');
+    expect(keys).toContain('sender'); // ordinary evidence still shows
   });
 });
 

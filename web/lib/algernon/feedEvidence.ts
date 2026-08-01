@@ -23,6 +23,9 @@ const HIDDEN_KEYS: ReadonlySet<string> = new Set([
   'body_truncated',
   'message_id',
   'gmail_url',
+  // #27 email_urgent: `high_source` renders as the on-face provenance chip
+  // ("Priority sender" / "Classifier: high"), never as a raw key:value row.
+  'high_source',
 ]);
 
 // Digest/long-form body is capped at 4000 chars by the producer; mirror that as a

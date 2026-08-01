@@ -554,3 +554,69 @@ describe('Deck — re-tier picker (task #28 render)', () => {
     expect(Number(panel.style.zIndex)).toBeGreaterThan(Number(topCard.style.zIndex));
   });
 });
+
+describe('useDeck — email_urgent ack wiring (#27)', () => {
+  const urgent = (over: Partial<FeedItem> = {}) =>
+    item({ id: 'u', kind: 'email_urgent', evidence: { sender: 'a@b.com', subject: 's', classifier_priority: 'high', high_source: 'llm' }, ...over });
+
+  it('affirm on an urgent card DEFERS a POST of "ack" (deals + acks via the generic flow)', () => {
+    const { result } = renderHook(() => useDeck({ items: [urgent()] }));
+    act(() => result.current.affirm());
+    expect(result.current.current).toBeNull(); // advanced off the deck (optimistic)
+    expect(mockAct).not.toHaveBeenCalled(); // deferred
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).toHaveBeenCalledWith('u', 'ack'); // flip-on-acted rides the standard deck flow
+  });
+
+  it('reject is a no-op on urgent (ACK-only — re-tier lives on the calibration card)', () => {
+    const { result } = renderHook(() => useDeck({ items: [urgent(), item({ id: 'b' })] }));
+    act(() => result.current.reject());
+    expect(result.current.current?.id).toBe('u'); // not advanced — no reject door
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).not.toHaveBeenCalled();
+  });
+});
+
+describe('Deck — email_urgent interrupt card (#27 render)', () => {
+  const urgentEvidence = (high_source: string) => ({ sender: 'a@b.com', subject: 'prod down', classifier_priority: 'high', high_source });
+  const urgent = (over: Partial<FeedItem> = {}) =>
+    item({ kind: 'email_urgent', title: 'a@b.com — prod down', evidence: urgentEvidence('override'), ...over });
+
+  it('shows the interrupt "Needs you" badge, NOT the calibration tier badge or the re-tier verb', () => {
+    render(<Deck items={[urgent()]} />);
+    expect(screen.getByTestId('deck-urgent-badge')).toBeTruthy();
+    expect(screen.queryByTestId('deck-tier-badge')).toBeNull(); // priority badge is email_tier-only
+    expect(screen.queryByTestId('deck-retier-open')).toBeNull(); // no re-tier on urgent (two cards, two jobs)
+  });
+
+  it('the high_source chip is honest provenance — override → "Priority sender"', () => {
+    render(<Deck items={[urgent({ evidence: urgentEvidence('override') })]} />);
+    expect(screen.getByTestId('deck-urgent-why').textContent).toContain('Priority sender');
+  });
+
+  it('the high_source chip — llm → "Classifier: high"', () => {
+    render(<Deck items={[urgent({ evidence: urgentEvidence('llm') })]} />);
+    expect(screen.getByTestId('deck-urgent-why').textContent).toContain('Classifier: high');
+  });
+
+  it('ACK-only verbs: the ✓ (ack) is enabled, the left/reject door is disabled', () => {
+    render(<Deck items={[urgent()]} />);
+    expect((screen.getByTestId('deck-btn-affirm') as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByTestId('deck-btn-reject') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId('deck-card').textContent).toContain('Got it');
+  });
+
+  it('reuses the evidence path — an expanded urgent card renders the "Open in Gmail" anchor', () => {
+    render(
+      <Deck
+        items={[
+          urgent({
+            evidence: { ...urgentEvidence('llm'), body: 'the email body', truncated: false, gmail_url: 'https://mail.google.com/mail/u/0/#search/rfc822msgid:x' },
+          }),
+        ]}
+      />,
+    );
+    act(() => fireEvent.click(screen.getByTestId('deck-evidence-toggle')));
+    expect(screen.getByTestId('evidence-external-link').getAttribute('href')).toContain('mail.google.com');
+  });
+});

@@ -58,6 +58,12 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
   const slotTier = item.kind === 'slot_suggestion' ? ringTierOf(item) : null;
   const rawWhy = item.kind === 'slot_suggestion' ? (item.evidence as Record<string, unknown> | null | undefined)?.surface_reason : null;
   const whyText = typeof rawWhy === 'string' && rawWhy.trim() ? rawWhy : null;
+  // #27 email_urgent — the INTERRUPT card. Distinct from the calibration card: it's not
+  // "judge my classification", it's "this email needs you". The high_source chip is HONEST
+  // provenance — a sender-override forced the high vs the LLM's own call.
+  const urgent = item.kind === 'email_urgent';
+  const urgentSource = urgent ? (item.evidence as Record<string, unknown> | null | undefined)?.high_source : null;
+  const urgentWhy = urgentSource === 'override' ? 'Priority sender' : urgentSource === 'llm' ? 'Classifier: high' : null;
   // Prose body (generic — any kind's evidence.body) OR a safe external link (the
   // email "Open in Gmail" deep-link, #26) also makes the card expandable.
   const hasDetails =
@@ -81,6 +87,16 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         <span className="rounded border border-honeydew-300 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
           {kindLabel(item.kind)}
         </span>
+        {urgent && (
+          // The interrupt signal, on the face — danger-toned so it reads distinct from the
+          // calibration card at a glance ("needs you NOW", not "confirm a classification").
+          <span
+            data-testid="deck-urgent-badge"
+            className="rounded border border-danger bg-danger-bg px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-danger"
+          >
+            Needs you
+          </span>
+        )}
         {priority && (
           // The assigned tier, on the face — the decision content the operator
           // was otherwise blind-confirming.
@@ -118,6 +134,13 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         // The WHY, on the face (surface_reason) — the card's own claim for being here.
         <p data-testid="deck-slot-why" className="mb-1.5 shrink-0 text-xs italic text-honeydew-600">
           {whyText}
+        </p>
+      )}
+
+      {urgentWhy && (
+        // The urgent card's honest provenance, on the face — why THIS email interrupted.
+        <p data-testid="deck-urgent-why" className="mb-1.5 shrink-0 text-xs italic text-honeydew-600">
+          {urgentWhy}
         </p>
       )}
 
@@ -182,7 +205,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
 
       {/* Verdict stamps — Deck sets their opacity imperatively during a drag. */}
       <span data-stamp="affirm" className="pointer-events-none absolute right-4 top-4 rotate-[-8deg] rounded border-2 border-honeydew-600 px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-honeydew-600 opacity-0">
-        {priority ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : heavy ? 'Review' : 'Yes'}
+        {priority || urgent ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : heavy ? 'Review' : 'Yes'}
       </span>
       <span data-stamp="reject" className="pointer-events-none absolute left-4 top-4 rotate-[8deg] rounded border-2 border-danger px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-danger opacity-0">
         {verbs?.rejectParks ? 'Skip' : 'No'}
