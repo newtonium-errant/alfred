@@ -48,17 +48,53 @@ export const RING_ACTION_UNDO = 'undo_done';
 // are all board-completable now, so none of them surface this note.
 export const COMPLETION_UNAVAILABLE_HINT = "Completion isn't available for this item";
 
+// --- C2 slot lifecycle stage (suggested → planned → done) --------------------
+export type RingItemStage = 'suggested' | 'planned' | 'done';
+
 /**
- * Whether a ring item is complete — the single choke-point for green/strikethrough.
- * TWO signals, per the board-completion contract: an item completed VIA the board
- * persists as `state === "acted"` (the router's set_state); an item completed in
- * the vault (and still emitted) carries `evidence.done === true`. Compute both —
- * a board-completed item that compute then suppresses won't re-emit `done`, so
- * `done` alone would lose it.
+ * The C2 lifecycle stage of a slot_suggestion — the single choke-point (one seam)
+ * that drives which verbs each surface shows. Precedence DONE > SUGGESTED > PLANNED.
+ *
+ * The `state==='acted'` OVERLOAD (a C1b completion AND a C2 accept both set acted) is
+ * resolved by the VERB stamped on the state event — `item.acted_action`
+ * ("accept" | "done" | absent-legacy), added in the C2 backend round:
+ *   1. evidence.done === true                 → DONE  (vault-completed, still emitted)
+ *   2. acted && acted_action === 'accept'     → PLANNED (accepted/committed — ✓ ENABLED
+ *        so the operator can complete what he accepted this morning; NO undo rendered)
+ *   3. acted otherwise (done / absent-legacy) → DONE  (a completion; C1b unchanged)
+ *   4. open + candidate === true              → SUGGESTED; open otherwise → PLANNED
+ * `candidate` does NOT discriminate acted items: the backend gate allows ✓ done on an
+ * acted-by-accept item, and the dispatcher never mutates evidence, so a genuinely
+ * done-after-accept item keeps `candidate=true` — keying on it would misread it as
+ * PLANNED (the exact flow the verb stamp exists for). ABSENT acted_action degrades to
+ * legacy DONE (same never-a-guess discipline as the render-present accept gating).
+ */
+export function ringItemStage(item: FeedItem): RingItemStage {
+  const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
+  if (ev.done === true) return 'done';
+  if (item.state === 'acted') return item.acted_action === 'accept' ? 'planned' : 'done';
+  return ev.candidate === true ? 'suggested' : 'planned';
+}
+
+/**
+ * Whether a ring item is complete — the single choke-point for green/strikethrough,
+ * now STAGE-derived so it can never disagree with `ringItemStage`. (Pre-C2 this was
+ * `state==='acted' || evidence.done`; the ONLY behaviour change is that an
+ * acted-but-still-candidate item — a just-accepted, not-yet-reconciled slot — reads
+ * as NOT done, since accept means committed/planned, not completed.)
  */
 export function ringItemDone(item: FeedItem): boolean {
-  if (item.state === 'acted') return true;
-  return (item.evidence as Record<string, unknown> | null | undefined)?.done === true;
+  return ringItemStage(item) === 'done';
+}
+
+/** A SUGGESTED slot — an auto-surfaced candidate not yet on today's plan (deck-dealt; shows Accept). */
+export function ringItemSuggested(item: FeedItem): boolean {
+  return ringItemStage(item) === 'suggested';
+}
+
+/** A COMMITTED slot — on today's plan (planned or done). The ring COUNT tallies these; candidates are excluded. */
+export function ringItemCommitted(item: FeedItem): boolean {
+  return ringItemStage(item) !== 'suggested';
 }
 
 /**
@@ -124,13 +160,18 @@ export function isTodayInstanceTz(iso: string | null | undefined, now: Date = ne
 }
 
 /**
- * Whether a slot item belongs on TODAY's rings. Completion changes an item's
- * STAGE (colour), not its EXISTENCE — so a board-done item (state=acted) STAYS on
- * the ring all day (green) instead of vanishing and leaving a false red-empty
- * ring. `open` items (planned, or open-with-evidence.done) always show; `acted`
- * items show ONLY if completed TODAY (acted_at in the instance tz) — stable keys
+ * Whether a slot item belongs on TODAY's rings. Completion changes an item's STAGE
+ * (colour), not its EXISTENCE — a board item (state=acted) STAYS on the ring all day
+ * instead of vanishing and leaving a false red-empty ring. `open` items always show;
+ * `acted` items show ONLY if acted TODAY (acted_at in the instance tz) — stable keys
  * persist across days, so yesterday's acted items must not count. Anything else
  * (acked / expired / acted-not-today) has left the day.
+ *
+ * NOTE: the accept-acted PHANTOM (a T3/5%-task accept's spent old id, which persists
+ * as acted-by-accept in the raw list forever) is suppressed by the Case-B dedup in
+ * `tierRingBuckets` — an OPEN committed sibling supersedes it — NOT here, because a
+ * TRANSIENT accepted item with no open sibling yet must still show (as PLANNED)
+ * during the accept→re-emit window.
  */
 export function ringItemVisibleToday(item: FeedItem, now: Date = new Date()): boolean {
   if (item.state === 'open') return true;
@@ -139,22 +180,45 @@ export function ringItemVisibleToday(item: FeedItem, now: Date = new Date()): bo
 }
 
 /**
- * Group `slot_suggestion` feed items into the three tier rings, in
- * TIER_RING_ORDER. Includes today's DONE items (state=acted, acted_at today) as
- * well as open ones, per `ringItemVisibleToday` — so the rings show
- * planned + done all day, never dropping a completion. Non-slot / invalid-tier /
- * not-today items are dropped (defensive). Always returns exactly three buckets
- * so an empty tier renders its own (red) empty ring rather than vanishing.
+ * The Case-B dedup key: two slot items are the SAME logical commitment when they
+ * share (tier, origin, evidence.name). A T3 / 5%-task accept re-emits the committed
+ * item under a NEW id (text:-keyed) while the spent acted-by-accept OLD id persists
+ * in the raw store list forever — same (tier, origin, name), different id.
+ */
+function slotDedupKey(item: FeedItem): string {
+  const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
+  return `${ringTierOf(item) ?? ''}|${String(ev.origin ?? '')}|${String(ev.name ?? '')}`;
+}
+
+/**
+ * Group `slot_suggestion` feed items into the three tier rings, in TIER_RING_ORDER.
+ * Includes today's suggested (open+candidate) / planned / done items per
+ * `ringItemVisibleToday` — so the rings show all three stages all day, never
+ * dropping a completion.
+ *
+ * CASE-B DEDUP: an accepted item's committed re-emit (an OPEN sibling on the same
+ * tier+origin+name) supersedes the spent acted-by-accept phantom — the new-id
+ * T3 / 5%-task path leaves BOTH in the raw list (the FE list route returns all
+ * states; compute-dedup doesn't cover it). Drop the acted-by-accept phantom so the
+ * committed denominator isn't double-counted; a TRANSIENT accepted item with no
+ * open sibling yet is kept (it shows as PLANNED during the accept→re-emit window).
+ *
+ * Non-slot / invalid-tier / not-today items are dropped (defensive). Always returns
+ * exactly three buckets so an empty tier renders its own (red) empty ring.
  */
 export function tierRingBuckets(items: FeedItem[], now: Date = new Date()): RingBucket[] {
+  const visible = items.filter(
+    (it) => it.kind === 'slot_suggestion' && ringItemVisibleToday(it, now) && ringTierOf(it) != null,
+  );
+  const openKeys = new Set(visible.filter((it) => it.state === 'open').map(slotDedupKey));
+  const deduped = visible.filter(
+    (it) => !(it.state === 'acted' && it.acted_action === 'accept' && openKeys.has(slotDedupKey(it))),
+  );
   const byTier = new Map<number, FeedItem[]>();
   for (const t of TIER_RING_ORDER) byTier.set(t, []);
-  for (const it of items) {
-    if (it.kind !== 'slot_suggestion') continue;
-    if (!ringItemVisibleToday(it, now)) continue;
+  for (const it of deduped) {
     const tier = ringTierOf(it);
-    if (tier == null) continue;
-    byTier.get(tier)?.push(it);
+    if (tier != null) byTier.get(tier)?.push(it);
   }
   return TIER_RING_ORDER.map((t) => ({
     key: String(t),

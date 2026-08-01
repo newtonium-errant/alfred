@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   isTodayInstanceTz,
+  ringItemCommitted,
   ringItemCompletable,
   ringItemDone,
+  ringItemStage,
+  ringItemSuggested,
   ringItemUndoable,
   ringItemVisibleToday,
   ringTierOf,
@@ -58,6 +61,49 @@ describe('ringItemDone', () => {
   });
   it('is true when state is "acted" (board-completed — never re-emits done)', () => {
     expect(ringItemDone(slot({ state: 'acted', evidence: { tier: 1 } }))).toBe(true);
+  });
+  it('is FALSE for an acted-by-ACCEPT item (committed, not completed — the verb decides, not candidate)', () => {
+    // ← the state=acted overload: acted_action==='accept' is a just-accepted slot
+    // (→ planned), never a completion. Stage-derived, so it can't disagree.
+    expect(ringItemDone(slot({ state: 'acted', acted_action: 'accept', evidence: { tier: 1, candidate: true } }))).toBe(false);
+  });
+  it('is TRUE for a done-AFTER-accept item (acted_action==="done", candidate still stale-true)', () => {
+    // The exact flow the verb stamp exists for — a candidate-keyed rule would LIE here.
+    expect(ringItemDone(slot({ state: 'acted', acted_action: 'done', evidence: { tier: 1, candidate: true } }))).toBe(true);
+  });
+});
+
+describe('ringItemStage — C2 lifecycle (suggested → planned → done), VERB-stamped', () => {
+  it('OPEN + candidate → suggested', () => {
+    expect(ringItemStage(slot({ state: 'open', evidence: { tier: 1, candidate: true } }))).toBe('suggested');
+  });
+  it('OPEN + no candidate → planned (absence of the field never sprouts Accept — pre-C2 items)', () => {
+    expect(ringItemStage(slot({ state: 'open', evidence: { tier: 1 } }))).toBe('planned');
+    expect(ringItemStage(slot({ state: 'open', evidence: { tier: 1, candidate: false } }))).toBe('planned');
+  });
+  it('evidence.done → done (precedence: done beats a lingering candidate)', () => {
+    expect(ringItemStage(slot({ state: 'open', evidence: { tier: 1, done: true, candidate: true } }))).toBe('done');
+  });
+  it('ACTED + acted_action="accept" → planned (accepted/committed — ✓ enabled, no undo)', () => {
+    // candidate stays stale-true — the VERB, not candidate, decides.
+    expect(ringItemStage(slot({ state: 'acted', acted_action: 'accept', evidence: { tier: 1, candidate: true } }))).toBe('planned');
+  });
+  it('ACTED + acted_action="done" → done (a completion, incl. done-AFTER-accept with candidate stale-true)', () => {
+    expect(ringItemStage(slot({ state: 'acted', acted_action: 'done', evidence: { tier: 1, candidate: true } }))).toBe('done');
+  });
+  it('ACTED + absent acted_action → done (legacy degrade — C1b unchanged)', () => {
+    expect(ringItemStage(slot({ state: 'acted', evidence: { tier: 1 } }))).toBe('done');
+  });
+  it('ringItemSuggested / ringItemCommitted track the stage (a candidate is NOT committed → excluded from the count)', () => {
+    const cand = slot({ state: 'open', evidence: { tier: 1, candidate: true } });
+    const planned = slot({ state: 'open', evidence: { tier: 1 } });
+    const accepted = slot({ state: 'acted', acted_action: 'accept', evidence: { tier: 1, candidate: true } });
+    const done = slot({ state: 'acted', acted_action: 'done', evidence: { tier: 1 } });
+    expect(ringItemSuggested(cand)).toBe(true);
+    expect(ringItemSuggested(planned)).toBe(false);
+    expect(ringItemCommitted(cand)).toBe(false);
+    expect(ringItemCommitted(accepted)).toBe(true); // accepted = planned = committed
+    expect(ringItemCommitted(done)).toBe(true);
   });
 });
 
@@ -142,6 +188,48 @@ describe('tierRingBuckets', () => {
     );
     expect(buckets[0].items.map((i) => i.id).sort()).toEqual(['done-today', 'open']);
   });
+
+  it('Case-B dedup: an OPEN committed re-emit suppresses the spent acted-by-accept phantom (same tier+origin+name, new id)', () => {
+    const now = new Date('2026-07-31T15:00:00Z');
+    const buckets = tierRingBuckets(
+      [
+        // The spent T3 accept phantom — old routine-keyed id, acted-by-accept, persists forever.
+        slot({
+          id: 'slot_suggestion:routine:Self Care::Meditate',
+          state: 'acted',
+          acted_at: '2026-07-31T16:00:00Z',
+          acted_action: 'accept',
+          evidence: { tier: 3, origin: 'routine_item', name: 'Meditate', candidate: true },
+        }),
+        // The committed re-emit — new text-keyed id, OPEN, same tier+origin+name.
+        slot({
+          id: 'slot_suggestion:text:Meditate',
+          state: 'open',
+          evidence: { tier: 3, origin: 'routine_item', name: 'Meditate', candidate: false },
+        }),
+      ],
+      now,
+    );
+    // Exactly ONE T3 item — the phantom is deduped (the committed denominator isn't doubled).
+    expect(buckets[2].items.map((i) => i.id)).toEqual(['slot_suggestion:text:Meditate']);
+  });
+
+  it('Case-B: an acted-by-accept with NO open sibling is KEPT (the transient accepted item shows)', () => {
+    const now = new Date('2026-07-31T15:00:00Z');
+    const buckets = tierRingBuckets(
+      [
+        slot({
+          id: 'a',
+          state: 'acted',
+          acted_at: '2026-07-31T16:00:00Z',
+          acted_action: 'accept',
+          evidence: { tier: 1, origin: 'task', name: 'X', candidate: true },
+        }),
+      ],
+      now,
+    );
+    expect(buckets[0].items.map((i) => i.id)).toEqual(['a']);
+  });
 });
 
 describe('isTodayInstanceTz (America/Halifax day-scope)', () => {
@@ -177,5 +265,16 @@ describe('ringItemVisibleToday — completion is a STAGE, not a disappearance', 
     expect(ringItemVisibleToday(slot({ state: 'acted', acted_at: null }), now)).toBe(false);
     expect(ringItemVisibleToday(slot({ state: 'acked' }), now)).toBe(false);
     expect(ringItemVisibleToday(slot({ state: 'expired' }), now)).toBe(false);
+  });
+  it('an acted-by-accept item still SHOWS here — the T3 phantom double is Case-B dedup, not visibility', () => {
+    // A transient accepted item (no open sibling yet) must show as PLANNED during the
+    // accept→re-emit window; suppression of the SPENT phantom lives in tierRingBuckets.
+    expect(
+      ringItemVisibleToday(slot({ state: 'acted', acted_at: '2026-07-31T16:00:00Z', acted_action: 'accept', evidence: { tier: 1, candidate: true } }), now),
+    ).toBe(true);
+    // A board-completed acted-today item also shows (C1b).
+    expect(
+      ringItemVisibleToday(slot({ state: 'acted', acted_at: '2026-07-31T16:00:00Z', acted_action: 'done', evidence: { tier: 1 } }), now),
+    ).toBe(true);
   });
 });
