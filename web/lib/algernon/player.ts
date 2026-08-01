@@ -61,3 +61,34 @@ export function narrationSlides(n: BriefNarration | null | undefined): PlayerSli
     wordCount: s.word_count,
   }));
 }
+
+// Where a slide's deep-link (tap the slide element) lands — the REAL surface for that
+// section, per the design. day_state (goal rings) → the feed; day_plan (slots) → the
+// deck (accept/complete); everything else (health/events/weather/sign_off) → the brief
+// page. Unknown sections default to the brief page (never a dead link).
+const SECTION_DEEP_LINK: Record<string, string> = {
+  day_state: '/feed',
+  day_plan: '/deck',
+};
+export function slideDeepLink(sectionId: string): string {
+  return SECTION_DEEP_LINK[sectionId] ?? '/brief';
+}
+
+/**
+ * The slide index a playback FRACTION (0..1 of the whole briefing) falls in — the v1
+ * audio→slide sync (one mp3; segment N spans its word_count share of total_words).
+ * Pure so the boundary math is unit-pinned without an <audio> element. Clamps: ≤0 → 0,
+ * ≥1 → last; zero-total (no words) → 0. A later refinement is precise per-segment audio.
+ */
+export function slideAtFraction(slides: PlayerSlide[], fraction: number): number {
+  if (slides.length === 0) return 0;
+  const total = slides.reduce((n, s) => n + Math.max(0, s.wordCount), 0);
+  if (total <= 0 || fraction <= 0) return 0;
+  if (fraction >= 1) return slides.length - 1;
+  let acc = 0;
+  for (let i = 0; i < slides.length; i++) {
+    acc += Math.max(0, slides[i].wordCount) / total;
+    if (fraction < acc) return i;
+  }
+  return slides.length - 1;
+}

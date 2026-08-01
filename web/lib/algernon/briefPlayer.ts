@@ -6,32 +6,39 @@ import type { BriefNarration } from './player';
 // feedApi / the brief-page fetch shape.
 
 // --- narration (slides source) ----------------------------------------------
-// The narration fetch: the dict, or the backend's ILB no-brief marker (absent/corrupt
-// spool → 200 {state:"no_brief"}). The page branches: noBrief → "no brief; here's the
-// deck"; a dict → narrationSlides() (which itself returns [] for an empty:true dict —
-// the distinct "brief exists, nothing speakable" ILB).
-export type NarrationResult = { narration: BriefNarration } | { noBrief: true };
+// The narration fetch: the dict, or an ILB state marker. The page branches:
+// no_brief → "no brief; here's the deck"; narration_unavailable → "brief exists, audio
+// unavailable" + brief-page link (c2 inc-3); a dict → narrationSlides() (which returns
+// [] for an empty:true dict — the distinct "brief exists, nothing speakable" ILB).
+export type NarrationState = 'no_brief' | 'narration_unavailable';
+export type NarrationResult = { narration: BriefNarration } | { state: NarrationState };
 
 export async function fetchNarration(): Promise<NarrationResult> {
   const body = await getJson<BriefNarration | { state?: string }>('/api/brief/narration');
-  if (body && typeof body === 'object' && (body as { state?: string }).state === 'no_brief') {
-    return { noBrief: true };
-  }
+  const state = body && typeof body === 'object' ? (body as { state?: string }).state : undefined;
+  if (state === 'no_brief') return { state: 'no_brief' };
+  if (state === 'narration_unavailable') return { state: 'narration_unavailable' };
   return { narration: body as BriefNarration };
 }
 
 // --- audio (or its ILB / degradation state) ---------------------------------
 // The audio route's outcome mapped to a player audio-state.
 //
-// FORWARD-COMPAT DEGRADATION (team-lead pin): any UNKNOWN / unrecognized JSON state
-// string — OR a 502 / non-audio / network failure — degrades to `unavailable` (a
-// generic honest "audio unavailable" + text-along mode), NEVER a crash or a broken play
-// button. So the backend's pending third state renders safely under whatever name it
-// ships as; naming it is a copy improvement, not a blocker. Same never-a-guess degrade
-// family as the C2 render-present + acted_action-absent pins.
+// The known ILB states get honest specific copy; FORWARD-COMPAT DEGRADATION (team-lead
+// pin) still catches everything else: any UNKNOWN / future JSON state string — OR a
+// 502 / non-audio / network failure — degrades to `unavailable` (generic honest "audio
+// unavailable" + text-along), NEVER a crash or a broken play button. Same never-a-guess
+// degrade family as the C2 render-present + acted_action-absent pins.
+//   no_brief             — no brief spooled today → offer the DECK.
+//   narration_unavailable — brief EXISTS but its narration spool is missing/failed →
+//                           "brief exists, audio unavailable" → offer the BRIEF PAGE
+//                           (distinguishes a spool crash from an empty morning; c2 inc-3).
+//   tts_not_configured   — narration exists, no TTS key → text-along.
+//   unavailable          — the catch-all (502 / unknown-future-state / network).
 export type PlayerAudioState =
   | { kind: 'audio'; url: string }
   | { kind: 'no_brief' }
+  | { kind: 'narration_unavailable' }
   | { kind: 'tts_not_configured' }
   | { kind: 'unavailable' };
 
@@ -51,8 +58,9 @@ export function playerAudioState(p: AudioProbe): PlayerAudioState {
   if (p.ok && ct.includes('audio/mpeg') && p.blobUrl) return { kind: 'audio', url: p.blobUrl };
   if (p.ok && ct.includes('application/json')) {
     if (p.state === 'no_brief') return { kind: 'no_brief' };
+    if (p.state === 'narration_unavailable') return { kind: 'narration_unavailable' };
     if (p.state === 'tts_not_configured') return { kind: 'tts_not_configured' };
-    return { kind: 'unavailable' }; // unknown / new state (incl. the pending third) → safe degrade
+    return { kind: 'unavailable' }; // truly-unknown / future state → safe degrade (forward-compat)
   }
   return { kind: 'unavailable' }; // 502 synth-fail / 401 / network / non-audio → text-along
 }

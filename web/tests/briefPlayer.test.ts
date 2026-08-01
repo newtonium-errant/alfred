@@ -24,7 +24,13 @@ describe('playerAudioState — the forward-compat degradation seam', () => {
     });
   });
 
-  it('an UNKNOWN state string → unavailable (FORWARD-COMPAT: the pending third state renders safely under any name)', () => {
+  it('200 JSON {state:narration_unavailable} → narration_unavailable (brief exists → offer the brief page, c2 inc-3)', () => {
+    expect(playerAudioState({ ok: true, status: 200, contentType: 'application/json', state: 'narration_unavailable' })).toEqual({
+      kind: 'narration_unavailable',
+    });
+  });
+
+  it('a genuinely UNKNOWN/future state string → unavailable (FORWARD-COMPAT still catches beyond the named states)', () => {
     // ← reddens if an unrecognized state ever crashes or falls through to a broken play button.
     expect(playerAudioState({ ok: true, status: 200, contentType: 'application/json', state: 'brief_exists_narration_missing' })).toEqual({
       kind: 'unavailable',
@@ -59,9 +65,14 @@ describe('fetchNarration', () => {
     await expect(fetchNarration()).resolves.toEqual({ narration: dict });
   });
 
-  it('200 {state:no_brief} → {noBrief:true}', async () => {
+  it('200 {state:no_brief} → {state:no_brief}', async () => {
     mockGetJson.mockResolvedValue({ state: 'no_brief' });
-    await expect(fetchNarration()).resolves.toEqual({ noBrief: true });
+    await expect(fetchNarration()).resolves.toEqual({ state: 'no_brief' });
+  });
+
+  it('200 {state:narration_unavailable} → {state:narration_unavailable} (brief exists, no narration)', async () => {
+    mockGetJson.mockResolvedValue({ state: 'narration_unavailable' });
+    await expect(fetchNarration()).resolves.toEqual({ state: 'narration_unavailable' });
   });
 
   it('an empty:true dict is a dict (not no_brief) — narrationSlides renders the "nothing to play" ILB', async () => {
