@@ -565,6 +565,98 @@ class IngestConfig:
     types: list[str] = field(default_factory=list)
 
 
+# --- Cross-instance recall (#20 S1, 2026-08-01) -----------------------------
+
+# Hard ceiling on how many bounded matches one recall answer may return,
+# regardless of a per-instance ``max_matches``. Defense against a
+# misconfigured policy disclosing an unbounded record set — the twin of
+# :data:`FILTER_LIMIT_CEILING` for the recall lane.
+RECALL_MAX_MATCHES_CEILING: int = 50
+
+# Defaults for the recall answer's bounded projection.
+DEFAULT_RECALL_MAX_MATCHES: int = 10
+DEFAULT_RECALL_SNIPPET_MAX_CHARS: int = 500
+
+# The longest inbound recall query we accept (defensive token-cost /
+# injection-surface gate, checked at handler entry). Mirrors
+# ``NLBrokerConfig.question_max_chars``.
+RECALL_QUERY_MAX_CHARS: int = 2000
+
+
+class RecallConfigError(ValueError):
+    """A recall config that violates a categorical rule (STAY-C fence).
+
+    Raised at config-load (``load_from_unified``) so an offending config
+    FAILS LOUD — the daemon never starts with STAY-C wired into the
+    recall lane, in either direction. See :func:`is_stayc_peer_name` and
+    :func:`_build_recall`.
+    """
+
+
+def is_stayc_peer_name(name: str) -> bool:
+    """True iff ``name`` denotes the STAY-C instance, in any spelling.
+
+    STAY-C is CATEGORICALLY excluded from the cross-instance recall lane,
+    both directions (§1/§3 of the recall federation design). This is the
+    single source of truth for "is this the fenced instance," normalizing
+    over the spellings that appear in configs / peer keys (``stay-c`` is
+    the canonical peer key per ``telegram.router._VALID_PEER_TARGETS``,
+    but ``stayc`` / ``stay_c`` / casing variants are all fenced too).
+    """
+    normalized = (name or "").strip().casefold().replace("-", "").replace("_", "")
+    return normalized == "stayc"
+
+
+@dataclass
+class RecallPeerRules:
+    """One asking-peer's recall entitlement — the per-peer type allowlist.
+
+    ``types`` is the allowlist of record types THIS answerer will search +
+    disclose when this peer asks. A type absent from the list is NEVER
+    searched and NEVER returned (filtered BEFORE the search, answerer-side
+    — the asker's request can only NARROW this set, never widen it). An
+    empty list means the peer is a configured recall asker but entitled to
+    nothing (every query returns an honest empty match set).
+    """
+
+    types: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RecallConfig:
+    """Answerer-side cross-instance recall policy (#20 S1).
+
+    The matrix-as-config: participation on/off + the per-asking-peer type
+    allowlist. Every edge is config, never code — flipping an edge is an
+    operator config change. Fail-closed by construction:
+
+      * ``enabled`` defaults ``False`` — an instance with no ``recall:``
+        section (or ``enabled: false``) NEVER mounts the ``/peer/recall``
+        route and answers nothing.
+      * ``peers`` default-empty — an authenticated peer that is not a KEY
+        here is not a configured recall asker; the handler refuses it
+        (401 ``wrong_peer``), never trusting the asker's claim.
+
+    Bounded projection is enforced answerer-side (the asker cannot request
+    "full"): ``max_matches`` caps the record count (clamped further by
+    :data:`RECALL_MAX_MATCHES_CEILING`) and ``snippet_max_chars`` caps each
+    returned snippet (oversize → truncated + a ``truncated`` flag).
+
+    STAY-C fence: a config that names STAY-C as a recall peer, or that
+    enables participation on a STAY-C instance, is rejected at load with
+    :class:`RecallConfigError` (see :func:`_build_recall`). The recall
+    audit reuses the answerer's existing ``canonical.audit_log_path`` with
+    a dedicated ``kind: "recall_read"`` op — one cross-instance-read trail,
+    op-differentiated, exactly as ``/peer/search`` reuses it with
+    ``kind: "search"``.
+    """
+
+    enabled: bool = False
+    max_matches: int = DEFAULT_RECALL_MAX_MATCHES
+    snippet_max_chars: int = DEFAULT_RECALL_SNIPPET_MAX_CHARS
+    peers: dict[str, RecallPeerRules] = field(default_factory=dict)
+
+
 @dataclass
 class TransportConfig:
     """Typed config for the transport module."""
@@ -575,6 +667,7 @@ class TransportConfig:
     state: StateConfig = field(default_factory=StateConfig)
     canonical: CanonicalConfig = field(default_factory=CanonicalConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    recall: RecallConfig = field(default_factory=RecallConfig)
     peers: dict[str, PeerEntry] = field(default_factory=dict)
 
 
@@ -807,6 +900,75 @@ def _build_ingest(data: dict[str, Any]) -> IngestConfig:
     )
 
 
+def _build_recall(data: Any, *, instance_name: str = "") -> RecallConfig:
+    """Build the optional ``recall`` block (defaults = disabled, empty).
+
+    Enforces the STAY-C fence FAIL-LOUD at load (both directions):
+      1. If any peer key names STAY-C → :class:`RecallConfigError`. STAY-C
+         may never be a recall asker, so its mere presence in the peer set
+         is a categorical violation — fired UNCONDITIONALLY (even when
+         ``enabled`` is false), because a latent STAY-C edge must never sit
+         dormant in a config waiting to be flipped on.
+      2. If participation is enabled AND this is a STAY-C instance →
+         :class:`RecallConfigError`. STAY-C may never answer.
+
+    ``max_matches`` is int-coerced (fallback = default) then clamped to
+    :data:`RECALL_MAX_MATCHES_CEILING` and floored at 1;
+    ``snippet_max_chars`` is int-coerced and floored at 1 so a
+    zero/negative config value can't wedge the projection.
+    """
+    if not isinstance(data, dict):
+        return RecallConfig()
+
+    enabled = bool(data.get("enabled", False))
+
+    # Fence part 2: participation on a STAY-C instance is forbidden.
+    if enabled and is_stayc_peer_name(instance_name):
+        raise RecallConfigError(
+            f"instance '{instance_name}' is STAY-C, which is categorically "
+            "excluded from cross-instance recall — remove `recall.enabled` "
+            "from its config (STAY-C answers nothing, in either direction)"
+        )
+
+    peers_raw = data.get("peers", {}) or {}
+    peers: dict[str, RecallPeerRules] = {}
+    if isinstance(peers_raw, dict):
+        for peer_name, rules_raw in peers_raw.items():
+            # Fence part 1: STAY-C may never be a recall peer.
+            if is_stayc_peer_name(str(peer_name)):
+                raise RecallConfigError(
+                    f"peer '{peer_name}' names STAY-C, which is categorically "
+                    "excluded from cross-instance recall — remove it from "
+                    "`recall.peers` (STAY-C is neither asker nor answerer)"
+                )
+            if not isinstance(rules_raw, dict):
+                continue
+            types_raw = rules_raw.get("types", []) or []
+            types = [str(t) for t in types_raw if isinstance(t, str) and t.strip()]
+            peers[str(peer_name)] = RecallPeerRules(types=types)
+
+    try:
+        max_matches = int(data.get("max_matches", DEFAULT_RECALL_MAX_MATCHES))
+    except (TypeError, ValueError):
+        max_matches = DEFAULT_RECALL_MAX_MATCHES
+    max_matches = max(1, min(max_matches, RECALL_MAX_MATCHES_CEILING))
+
+    try:
+        snippet_max_chars = int(
+            data.get("snippet_max_chars", DEFAULT_RECALL_SNIPPET_MAX_CHARS)
+        )
+    except (TypeError, ValueError):
+        snippet_max_chars = DEFAULT_RECALL_SNIPPET_MAX_CHARS
+    snippet_max_chars = max(1, snippet_max_chars)
+
+    return RecallConfig(
+        enabled=enabled,
+        max_matches=max_matches,
+        snippet_max_chars=snippet_max_chars,
+        peers=peers,
+    )
+
+
 def _build_peers(data: dict[str, Any]) -> dict[str, PeerEntry]:
     """Build the ``peers`` dict: peer_name → :class:`PeerEntry`."""
     out: dict[str, PeerEntry] = {}
@@ -820,12 +982,17 @@ def _build_peers(data: dict[str, Any]) -> dict[str, PeerEntry]:
     return out
 
 
-def _build(cls: type, data: dict[str, Any]) -> Any:
+def _build(cls: type, data: dict[str, Any], *, instance_name: str = "") -> Any:
     """Recursively construct a dataclass from a dict.
 
     The ``auth`` section has a non-trivial nested structure so we
     handle it explicitly; the others map cleanly onto simple nested
     dataclasses.
+
+    ``instance_name`` (the persona name from ``telegram.instance.name``)
+    is threaded through only for the STAY-C recall fence — a STAY-C
+    instance that enables ``recall`` must fail loud at load
+    (:func:`_build_recall`).
     """
     if cls is TransportConfig:
         kwargs: dict[str, Any] = {}
@@ -850,6 +1017,16 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
             kwargs["canonical"] = _build_canonical(data["canonical"])
         if "ingest" in data and isinstance(data["ingest"], dict):
             kwargs["ingest"] = _build_ingest(data["ingest"])
+        # ``recall`` fence must fire even when the section is absent-but-
+        # the-instance-is-STAY-C? No — a STAY-C instance with NO recall
+        # section legitimately answers nothing; the fence only fires on
+        # ATTEMPTED participation (enabled) or a named STAY-C peer, both of
+        # which live inside a present ``recall`` block. So build only when
+        # the section is present (default RecallConfig() otherwise).
+        if "recall" in data and isinstance(data["recall"], dict):
+            kwargs["recall"] = _build_recall(
+                data["recall"], instance_name=instance_name,
+            )
         if "peers" in data and isinstance(data["peers"], dict):
             kwargs["peers"] = _build_peers(data["peers"])
         return TransportConfig(**kwargs)
@@ -876,4 +1053,16 @@ def load_from_unified(raw: dict[str, Any]) -> TransportConfig:
     """
     raw = _substitute_env(raw)
     tool = raw.get("transport", {}) or {}
-    return _build(TransportConfig, tool)
+    # The persona name lives in the telegram section (``instance.name``); it
+    # is threaded to the transport builder ONLY for the STAY-C recall fence
+    # so a STAY-C config that enables recall fails loud at load. Best-effort
+    # — a config without the telegram block simply can't be a STAY-C
+    # instance answering recall (fence part 1, the named-peer rule, still
+    # fires regardless of instance name).
+    instance_name = ""
+    telegram = raw.get("telegram", {}) or {}
+    if isinstance(telegram, dict):
+        inst = telegram.get("instance", {}) or {}
+        if isinstance(inst, dict):
+            instance_name = str(inst.get("name", "") or "")
+    return _build(TransportConfig, tool, instance_name=instance_name)

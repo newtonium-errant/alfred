@@ -444,6 +444,35 @@ transport:
   #   #   of the universal {document, note, source} set; can only narrow,
   #   #   never widen (the web_ingest scope gate is the hard ceiling).
 
+  # Cross-instance recall — the ANSWER side (#20 S1). This instance answers
+  # a free-text recall query from an allowed peer by searching ITS OWN vault
+  # and returning bounded matches (a capped snippet + a record pointer), or
+  # an honest empty match set. The route is ``POST /peer/recall``; identity
+  # is the authenticated transport peer (the ``auth.tokens`` key), never the
+  # asker's claim. Default ``enabled: false`` — an un-opted-in instance never
+  # mounts the route (/peer/recall → 404) and answers nothing (fail-closed).
+  #
+  # THE MATRIX IS THIS CONFIG: ``peers`` maps each ALLOWED asking peer → the
+  # record types this answerer will search + disclose FOR THAT PEER. A type
+  # absent from a peer's list is never searched or returned; a peer absent
+  # from ``peers`` is refused (401 wrong_peer). The asker's ``types`` request
+  # can only NARROW a peer's allowlist, never widen it. Every answer appends
+  # a ``kind: "recall_read"`` line to ``canonical.audit_log_path`` (who
+  # asked, types requested/searched/denied, records returned, ts).
+  #
+  # STAY-C FENCE: STAY-C is categorically excluded, both directions. Naming
+  # ``stay-c`` (any spelling) as a recall peer, or setting ``enabled: true``
+  # on a STAY-C instance, FAILS LOUD at config load — do neither.
+  # recall:
+  #   enabled: true
+  #   max_matches: 10            # bounded projection — records per answer (≤50)
+  #   snippet_max_chars: 500     # per-snippet cap; oversize → truncated flag
+  #   peers:
+  #     kal-le:
+  #       types: [person, project, task, decision, note, org, routine, session]
+  #     hypatia:
+  #       types: [note, session]
+
   # Salem-only: per-peer canonical record permissions (Phase A inter-
   # instance comms). Each peer gets a per-record-type field allowlist.
   # Empty / missing peer = denied. Empty / missing fields within a

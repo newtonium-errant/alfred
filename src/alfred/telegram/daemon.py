@@ -1653,6 +1653,9 @@ async def run(
             # transport.ingest.enabled (default False → route not mounted).
             ingest_enabled=transport_config.ingest.enabled,
             ingest_config=transport_config.ingest,
+            # Cross-instance recall answer route (#20 S1). Opt-in via
+            # transport.recall.enabled (default False → route not mounted).
+            recall_enabled=transport_config.recall.enabled,
             # Feed surface (Feed Phase B). Mounted when feed.enabled (default
             # true); dark until the operator adds the web_feed peer token.
             feed_enabled=feed_enabled,

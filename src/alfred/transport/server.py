@@ -699,6 +699,7 @@ def wire_transport_app(
     ticket_outcome_resolve_callable: _TicketOutcomeResolveCallable | None = None,
     ingest_enabled: bool = False,
     ingest_config: Any | None = None,
+    recall_enabled: bool = False,
     feed_enabled: bool = False,
     feed_store: Any | None = None,
     feed_daily_sync_config: Any | None = None,
@@ -789,6 +790,14 @@ def wire_transport_app(
             :class:`alfred.transport.config.IngestConfig` carrying
             ``max_body_chars`` + the optional per-instance ``types``
             narrowing list. Read only when ``ingest_enabled`` is True.
+        recall_enabled: Mount the cross-instance recall answer route
+            (``POST /peer/recall``, #20 S1). Default ``False`` — an
+            un-opted-in instance never mounts the route (opt-in inertness;
+            ``/peer/recall`` → 404). Wired via
+            :func:`routes_recall.register_recall_routes`, which also carries
+            the STAY-C fence (never mounts on STAY-C; raises if enabled on
+            one). The allowlist / peer-pin / bounded-projection policy is
+            read by the handler from ``transport.recall`` at request time.
         feed_enabled: Mount the feed surface (``GET /feed/items`` +
             ``POST /feed/act``, Feed Phase B). Default ``False`` here; the
             daemon passes ``feed.enabled`` (default true). The routes are
@@ -830,6 +839,7 @@ def wire_transport_app(
     )
     from .routes_feed import register_feed_routes
     from .routes_ingest import register_ingest_routes
+    from .routes_recall import register_recall_routes
 
     # Identity is unconditional — every instance has a name.
     register_instance_identity(app, name=instance_name, alias=instance_alias)
@@ -1057,6 +1067,30 @@ def wire_transport_app(
             "transport.wire_transport_app.ingest_skipped",
             reason="transport.ingest.enabled is false / absent (instance "
                    "did not opt into the cross-instance ingest route)",
+        )
+
+    # Cross-instance recall answer route (#20 S1). Opt-in via
+    # ``transport.recall.enabled``; register_recall_routes emits its own
+    # explicit disabled-skip log (intentionally-left-blank) when off, and
+    # carries the STAY-C fence (never mounts on STAY-C).
+    if recall_enabled:
+        register_recall_routes(
+            app, enabled=True, instance_name=instance_name,
+        )
+        log.info(
+            "transport.wire_transport_app.recall_registered",
+            instance=instance_name,
+        )
+    else:
+        # Still call the registrar so its own disabled-skip log fires —
+        # keeps the "ran, did not mount" signal greppable + symmetric.
+        register_recall_routes(
+            app, enabled=False, instance_name=instance_name,
+        )
+        log.debug(
+            "transport.wire_transport_app.recall_skipped",
+            reason="transport.recall.enabled is false / absent (instance "
+                   "did not opt into the cross-instance recall route)",
         )
 
     # Feed surface (Feed Phase B) — GET /feed/items + POST /feed/act, gated by
