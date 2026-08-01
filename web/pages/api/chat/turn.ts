@@ -49,6 +49,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     kind: parsed.data.kind === 'voice' ? 'voice' : 'text',
     ...(parsed.data.idempotency_key ? { idempotency_key: parsed.data.idempotency_key } : {}),
     ...(parsed.data.images && parsed.data.images.length ? { images: parsed.data.images } : {}),
+    // Player-ask primer (C3c) — relayed VERBATIM; the backend validity-gates it
+    // (PlayerContextPrimer) and grounds the answer on the slide, or answers un-grounded.
+    ...(parsed.data.primer ? { primer: parsed.data.primer } : {}),
   };
 
   if (isHomeInstance(parsed.data.instance)) {

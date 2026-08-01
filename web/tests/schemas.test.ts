@@ -7,6 +7,7 @@ import {
   base64DecodedBytes,
   chatTurnBodySchema,
   imageAttachmentSchema,
+  playerPrimerSchema,
   voiceCancelFrame,
   voiceCloseBodySchema,
   voiceDcEventSchema,
@@ -106,6 +107,42 @@ describe('chatTurnBodySchema', () => {
       images: [{ media_type: 'image/png', data: `data:image/png;base64,${SMALL_B64}` }],
     });
     expect(r.success).toBe(false);
+  });
+
+  it('accepts a turn carrying a player primer (C3c)', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'why is that yellow?',
+      primer: { brief_date: '2026-08-01', section_id: 'health' },
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('a turn with no primer is valid (byte-identical to the pre-feature path)', () => {
+    const r = chatTurnBodySchema.safeParse({ session_key: 'k', message: 'hi' });
+    expect(r.success).toBe(true);
+  });
+});
+
+describe('playerPrimerSchema (C3c) — bound-only edge guard, backend is the validity authority', () => {
+  it('accepts a well-formed primer', () => {
+    const r = playerPrimerSchema.safeParse({ brief_date: '2026-08-01', section_id: 'day_state' });
+    expect(r.success).toBe(true);
+  });
+
+  // The load-bearing fail-soft pin: the BFF must NOT reject an ISO-bad date or an unknown
+  // section_id — the backend answers UN-GROUNDED for those (PlayerContextPrimer.valid). A
+  // 400 here would turn the "answer un-grounded" contract into a hard failure.
+  it('accepts an ISO-bad date and an unknown section_id (backend gates, not the BFF)', () => {
+    const badDate = playerPrimerSchema.safeParse({ brief_date: 'not-a-date', section_id: 'health' });
+    expect(badDate.success).toBe(true);
+    const unknownSection = playerPrimerSchema.safeParse({ brief_date: '2026-08-01', section_id: 'made_up' });
+    expect(unknownSection.success).toBe(true);
+  });
+
+  it('bounds the strings (DoS guard) — an over-long section_id / brief_date is rejected', () => {
+    expect(playerPrimerSchema.safeParse({ brief_date: '2026-08-01', section_id: 'x'.repeat(65) }).success).toBe(false);
+    expect(playerPrimerSchema.safeParse({ brief_date: 'x'.repeat(33), section_id: 'health' }).success).toBe(false);
   });
 });
 

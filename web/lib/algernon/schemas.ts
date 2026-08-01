@@ -64,6 +64,21 @@ export const imageAttachmentSchema = z.object({
 
 export type ImageAttachment = z.infer<typeof imageAttachmentSchema>;
 
+// Player-ask on-screen primer (C3c) — the two-key context the /player ask carries so the
+// answer resolves against the PAUSED slide. Relayed VERBATIM to the backend, which is the
+// validity authority (src/alfred/brief/player_primer.py PlayerContextPrimer.valid): an
+// ISO-bad date or an unknown section_id ⟹ the backend answers UN-GROUNDED, never rejects
+// the turn. So this edge guard only BOUNDS the strings (DoS) — it deliberately does NOT
+// enforce the ISO format / the known-section set, which would turn the backend's fail-soft
+// into a 400 and break the "answer un-grounded" contract. Same relay-verbatim discipline
+// as `images` (the backend re-validates as the authority).
+export const playerPrimerSchema = z.object({
+  brief_date: z.string().max(32),
+  section_id: z.string().max(64),
+});
+
+export type PlayerPrimerBody = z.infer<typeof playerPrimerSchema>;
+
 // POST /api/chat/turn body.
 export const chatTurnBodySchema = z.object({
   session_key: z.string().min(1),
@@ -79,6 +94,9 @@ export const chatTurnBodySchema = z.object({
   // Optional carried screenshots (parity #29) — relayed VERBATIM to the backend
   // (which re-validates as the authority). Bounded to MAX_IMAGES_PER_TURN.
   images: z.array(imageAttachmentSchema).max(MAX_IMAGES_PER_TURN).optional(),
+  // Player-ask on-screen context (C3c) — relayed VERBATIM; the backend validity-gates
+  // (invalid ⟹ answer un-grounded, never a 400). Only the /player ask sends it.
+  primer: playerPrimerSchema.optional(),
 });
 
 export type ChatTurnBody = z.infer<typeof chatTurnBodySchema>;

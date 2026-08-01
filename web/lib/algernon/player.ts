@@ -38,6 +38,19 @@ export interface PlayerSlide {
   wordCount: number;
 }
 
+// The C3c player-ask context primer — the on-screen grounding the ask carries to the
+// chat turn. Mirrors the backend carry-shape (src/alfred/brief/player_primer.py
+// PlayerContextPrimer.to_dict): two stable keys, so Salem resolves deictic references
+// ("that", "it", "this") against the slide the operator PAUSED on, grounded in that
+// day's brief (not a re-derived "today"). The backend validity-gates it (bad date /
+// unknown section_id ⟹ answer un-grounded, never fabricate a slide context).
+export interface PlayerPrimer {
+  /** The brief being played (ISO YYYY-MM-DD). */
+  brief_date: string;
+  /** The current slide's narration section id (a SEGMENT_ORDER value). */
+  section_id: string;
+}
+
 function orderRank(id: string): number {
   const i = (SEGMENT_ORDER as readonly string[]).indexOf(id);
   // Unknown section_ids sort LAST (defensive — never silently dropped; the producer
