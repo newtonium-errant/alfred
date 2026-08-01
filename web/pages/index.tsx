@@ -174,6 +174,16 @@ export default function HomePage() {
               <h2 className={titleClass}>Your morning brief is ready</h2>
               <p className={`mt-1 ${subtle}`}>The brief and Daily Sync {INSTANCE_NAME} prepared — open to read →</p>
             </Link>
+            {/* Offer the interruptible player (C3b) — the /player page degrades gracefully
+                if there's no brief / no audio, so this is safe to offer in the brief window. */}
+            <Link
+              href="/player"
+              data-testid="composer-player-link"
+              className="mt-3 flex items-center justify-between rounded-xl border border-honeydew-300 bg-honeydew-50 px-4 py-3 text-sm font-semibold text-honeydew-700"
+            >
+              <span>Play your briefing</span>
+              <span aria-hidden>▶</span>
+            </Link>
             {deckableCount > 0 && deckPill}
           </section>
         )}

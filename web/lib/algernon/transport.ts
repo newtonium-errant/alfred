@@ -102,6 +102,31 @@ export async function callTransport(
   return { status: res.status, body: await parseJsonOrNull(res) };
 }
 
+/**
+ * RAW home/session transport GET — returns the fetch Response UNPARSED so the caller
+ * can forward a non-JSON body. The C3b audio route (GET /web/brief/audio) returns
+ * `audio/mpeg` bytes on a cache hit/render OR a JSON ILB state (no_brief /
+ * tts_not_configured / …); the BFF proxy branches on content-type. Home `web` peer
+ * token + relayed session token (same auth as callTransport); Accept covers both.
+ * Timeout-bounded like the buffered path. DO NOT parseJsonOrNull here (it would
+ * consume the audio body).
+ *
+ * Returns the upstream STATUS verbatim — a raw caller MUST map a `wrong_peer` 401 → 502
+ * itself (the B2 fake-logout guard, via bffError.mapUpstreamWrongPeer); this helper does
+ * NOT do it (it can't discriminate the body without consuming the stream).
+ */
+export async function callTransportRaw(method: 'GET', path: string, opts: CallOptions = {}): Promise<Response> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${peerToken()}`,
+    'X-Alfred-Client': PEER_CLIENT,
+    Accept: 'audio/mpeg, application/json',
+  };
+  if (opts.sessionToken) {
+    headers['X-Alfred-Session'] = opts.sessionToken;
+  }
+  return fetchJsonWithTimeout(`${baseUrl()}${path}`, { method, headers });
+}
+
 // A non-JSON body (e.g. an upstream 502 HTML page) → null; the BFF maps the
 // status. Don't throw: a bad-shaped error response must not mask the status.
 async function parseJsonOrNull(res: Response): Promise<unknown> {

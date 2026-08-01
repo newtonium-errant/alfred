@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NextApiResponse } from 'next';
-import { sendTransportError } from '../lib/algernon/bffError';
+import { mapUpstreamWrongPeer, sendTransportError } from '../lib/algernon/bffError';
 import { TransportConfigError, TransportTimeoutError } from '../lib/algernon/transport';
 
 // Regression-pin the FE-2 reviewer security note: the BFF must NEVER return the
@@ -56,5 +56,37 @@ describe('sendTransportError', () => {
     expect(status).toHaveBeenCalledWith(504);
     expect(json).toHaveBeenCalledWith({ error: 'gateway_timeout' });
     expect(json.mock.calls[0][0]).not.toHaveProperty('detail');
+  });
+});
+
+describe('mapUpstreamWrongPeer — the brief-family ambiguous-401 discriminator', () => {
+  it('a wrong_peer 401 → 502 brief_upstream_unavailable + a greppable warn, returns true (caller stops)', () => {
+    const { res, status, json } = mockRes();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const handled = mapUpstreamWrongPeer(res, 'brief/audio', 401, { error: 'wrong_peer' });
+    expect(handled).toBe(true);
+    expect(status).toHaveBeenCalledWith(502);
+    expect(json).toHaveBeenCalledWith({ error: 'brief_upstream_unavailable' });
+    expect(warn).toHaveBeenCalledWith('[bff:brief/audio] upstream_auth_misconfig');
+  });
+
+  it('an invalid_session 401 → returns FALSE (caller RELAYS for re-login), sends nothing', () => {
+    const { res, status } = mockRes();
+    // ← reddens if a blanket map ever swallows a real expiry (breaks re-login recovery)
+    expect(mapUpstreamWrongPeer(res, 'brief/narration', 401, { error: 'invalid_session' })).toBe(false);
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('a non-401 status → false (no-op — 200 dict / 502 synth-fail pass through)', () => {
+    const { res, status } = mockRes();
+    expect(mapUpstreamWrongPeer(res, 'brief/latest', 200, { brief_date: 'x' })).toBe(false);
+    expect(mapUpstreamWrongPeer(res, 'brief/audio', 502, { error: 'tts_synthesis_failed' })).toBe(false);
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('a 401 with a missing / other error → false (only wrong_peer maps; everything else relays)', () => {
+    const { res } = mockRes();
+    expect(mapUpstreamWrongPeer(res, 'brief/latest', 401, {})).toBe(false);
+    expect(mapUpstreamWrongPeer(res, 'brief/latest', 401, null)).toBe(false);
   });
 });
