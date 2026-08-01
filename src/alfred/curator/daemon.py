@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 if TYPE_CHECKING:
     from alfred.email_classifier.config import EmailClassifierConfig
     from alfred.email_filing.config import EmailFilingConfig
+    from alfred.feed import FeedEmitHandle
 
 from alfred.common.heartbeat import Heartbeat
 from alfred.preferences.loader import load_active_preferences
@@ -412,6 +413,7 @@ async def _process_file(
     state_mgr: StateManager,
     email_classifier_config: "EmailClassifierConfig | None" = None,
     email_filing_config: "EmailFilingConfig | None" = None,
+    feed_handle: "FeedEmitHandle | None" = None,
 ) -> None:
     """Process a single inbox file through the full pipeline.
 
@@ -624,6 +626,7 @@ async def _process_file(
                 inbox_content,
                 files_created,
                 email_classifier_config,
+                feed_handle=feed_handle,
             )
         except Exception:  # noqa: BLE001 — must never crash the daemon
             log.exception("daemon.email_classifier_error", file=filename)
@@ -669,6 +672,7 @@ async def run(
     skills_dir: Path,
     email_classifier_config: "EmailClassifierConfig | None" = None,
     email_filing_config: "EmailFilingConfig | None" = None,
+    feed_handle: "FeedEmitHandle | None" = None,
 ) -> None:
     """Main daemon entry point.
 
@@ -681,6 +685,11 @@ async def run(
     ``email_filing_config`` (#7 7c-i) is the analogous opt-in block for the
     orthogonal topical-filing pass (``email_filing:`` section). ``None`` /
     ``enabled=False`` → the filing pass is a no-op.
+
+    ``feed_handle`` (#27 slice 1) is the optional classify-time feed-emit
+    context resolved by the orchestrator's ``_run_curator`` (store path +
+    instance + enabled). ``None`` → no ``email_urgent`` items are emitted
+    (fail-safe); curator behaves exactly as before this hook landed.
     """
     log.info(
         "daemon.starting",
@@ -737,6 +746,7 @@ async def run(
                         state_mgr,
                         email_classifier_config=email_classifier_config,
                         email_filing_config=email_filing_config,
+                        feed_handle=feed_handle,
                     )
                 except Exception as exc:
                     log.exception("daemon.process_error", file=inbox_file.name)
@@ -843,6 +853,7 @@ async def run(
                                 state_mgr,
                                 email_classifier_config=email_classifier_config,
                                 email_filing_config=email_filing_config,
+                                feed_handle=feed_handle,
                             )
                         except Exception as exc:
                             log.exception("daemon.process_error", file=inbox_file.name)

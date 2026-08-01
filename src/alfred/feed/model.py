@@ -34,7 +34,7 @@ STATE_EXPIRED = "expired"
 # Every kind the feed can carry (step-2 contract + brief peer_digest). Kept as a
 # frozenset so producers/tests can assert membership without importing the dict.
 KINDS: frozenset[str] = frozenset({
-    "email_tier", "attribution", "proposal", "pending", "routine_match",
+    "email_tier", "email_urgent", "attribution", "proposal", "pending", "routine_match",
     "recurrence", "contract", "slot_suggestion", "routing", "health", "weather",
     "event", "ops_notable", "ticket_notice", "radar", "friction",
     "notegen_readout", "peer_digest",
@@ -47,6 +47,11 @@ KINDS: frozenset[str] = frozenset({
 KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     # Decision kinds — the operator must judge these.
     "email_tier": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
+    # #27 — a classify-time high-priority email interrupt (curator emits at
+    # classify time, distinct from the sync-time email_tier calibration card).
+    # decide/needs_you: deals into the deck + counts in rings/needs-you. Single
+    # verb is ``ack`` → acted (see FEED_ACTIONS in daily_sync/action_router).
+    "email_urgent": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "attribution": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "proposal": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "pending": (MODE_DECIDE, ATTENTION_NEEDS_YOU),

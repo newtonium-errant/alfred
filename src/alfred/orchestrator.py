@@ -64,11 +64,36 @@ def _run_curator(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = F
     # (absent / ``enabled: false`` ⇒ disabled config ⇒ the filing pass no-ops).
     filing_config = load_filing(raw)
     setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
+    # #27 slice 1 — resolve the classify-time email_urgent feed-emit handle HERE
+    # (the one place the unified ``raw`` dict lives). Store path is instance-
+    # resolved via the SAME resolver the daily_sync feed producer uses, and the
+    # instance display name via the canonical ``instance_name_from_raw`` (the
+    # classifier has no other source for it). Belt-wrapped: any resolution
+    # failure degrades to ``None`` (NO EMIT — fail-safe), never a crashed
+    # curator start. The emit itself is separately belt-wrapped in the
+    # classifier, so a runtime feed fault can't break classification either.
+    feed_handle = None
+    try:
+        from alfred.audit import instance_name_from_raw
+        from alfred.feed import FeedEmitHandle, load_from_unified as load_feed
+        feed_cfg = load_feed(raw)
+        feed_handle = FeedEmitHandle(
+            store_path=feed_cfg.store_path,
+            instance=instance_name_from_raw(raw),
+            enabled=feed_cfg.enabled,
+        )
+    except Exception:  # noqa: BLE001 — feed resolution must never break curator start
+        import structlog
+        structlog.get_logger(__name__).warning(
+            "curator.feed_handle_resolve_failed", exc_info=True,
+        )
+        feed_handle = None
     from alfred.curator.daemon import run
     asyncio.run(run(
         config, Path(skills_dir),
         email_classifier_config=classifier_config,
         email_filing_config=filing_config,
+        feed_handle=feed_handle,
     ))
 
 

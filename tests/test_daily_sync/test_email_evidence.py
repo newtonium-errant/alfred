@@ -29,6 +29,7 @@ from alfred.daily_sync.email_section import (
     BatchItem,
     _bounded_email_body,
     _read_candidate,
+    bounded_email_body,
     render_batch,
 )
 from alfred.daily_sync.feed_producer import build_feed_items
@@ -36,6 +37,14 @@ from alfred.mail.gmail_filing import gmail_rfc822_search_url
 
 
 # --- bounded body -----------------------------------------------------------
+
+
+def test_bounded_email_body_public_name_and_alias() -> None:
+    """#27 promoted ``_bounded_email_body`` → public ``bounded_email_body`` (the
+    classify-time email_urgent emitter is the second consumer). The private
+    alias stays pointed at the public function so existing callers/tests hold."""
+    assert bounded_email_body is _bounded_email_body
+    assert bounded_email_body("short") == ("short", False)
 
 
 def test_bounded_body_short_not_truncated() -> None:
