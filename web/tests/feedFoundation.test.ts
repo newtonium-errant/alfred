@@ -16,7 +16,7 @@ import {
   stampOpacity,
   verdictForDrag,
 } from '../lib/algernon/feedConstants';
-import { coerceEvidenceValue, evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../lib/algernon/feedEvidence';
+import { coerceEvidenceValue, evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows, isEmailEvidence } from '../lib/algernon/feedEvidence';
 import type { FeedItem } from '../lib/algernon/feed';
 
 function feedItem(kind: string, evidence: Record<string, unknown>): FeedItem {
@@ -120,6 +120,25 @@ describe('evidenceExternalLink — the scheme-gated "Open in Gmail" link (#26)',
     expect(evidenceExternalLink({ gmail_url: 42 })).toBeNull();
     expect(evidenceExternalLink(null)).toBeNull();
     expect(evidenceExternalLink('x')).toBeNull();
+  });
+});
+
+describe('isEmailEvidence — email_tier discriminator for honest truncation copy (#26)', () => {
+  it('is true when the email signature (sender + subject + classifier_priority) is present', () => {
+    // Present even with empty values / a blank gmail_url — key-presence, not value.
+    expect(isEmailEvidence({ sender: 'a@b.com', subject: '', classifier_priority: 'high', gmail_url: '' })).toBe(true);
+  });
+  it('is false for peer_digest (prose body, none of the email keys)', () => {
+    expect(isEmailEvidence({ body: 'the digest', truncated: true })).toBe(false);
+  });
+  it('is false when the signature is incomplete (missing any of the three)', () => {
+    expect(isEmailEvidence({ sender: 'a@b.com', subject: 'hi' })).toBe(false); // no classifier_priority
+    expect(isEmailEvidence({ sender: 'a@b.com', classifier_priority: 'low' })).toBe(false); // no subject
+  });
+  it('is false for non-object', () => {
+    expect(isEmailEvidence(null)).toBe(false);
+    expect(isEmailEvidence('x')).toBe(false);
+    expect(isEmailEvidence([1, 2])).toBe(false);
   });
 });
 

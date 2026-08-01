@@ -78,6 +78,21 @@ export function evidenceExternalLink(evidence: unknown): EvidenceExternalLink | 
   return { href: raw, label: 'Open in Gmail' };
 }
 
+/**
+ * Does this evidence come from an email_tier card (#26)? Email always carries
+ * sender + subject + classifier_priority (email_section.to_dict emits them
+ * unconditionally); peer_digest / other kinds never do. Used to keep the truncation
+ * copy HONEST when there's no Gmail deep-link: a truncated email with no message_id
+ * (⟹ blank gmail_url ⟹ no link) has no linkable full text and is NOT "in the Brief"
+ * (the Brief never renders email bodies) — so it must not fall to the generic Brief
+ * copy. Key-presence, not value (an email may have an empty subject/classifier).
+ */
+export function isEmailEvidence(evidence: unknown): boolean {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return false;
+  const ev = evidence as Record<string, unknown>;
+  return 'sender' in ev && 'subject' in ev && 'classifier_priority' in ev;
+}
+
 // A compact, human-ish label for an evidence key (snake_case → Title words).
 export function evidenceLabel(key: string): string {
   return key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());

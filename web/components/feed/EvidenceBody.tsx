@@ -1,4 +1,4 @@
-import { evidenceBody, evidenceExternalLink } from '../../lib/algernon/feedEvidence';
+import { evidenceBody, evidenceExternalLink, isEmailEvidence } from '../../lib/algernon/feedEvidence';
 
 // Renders an item's evidence `body` as readable multiline PROSE (paragraph flow,
 // not a key:value row) — the digest text a peer_digest card was otherwise missing,
@@ -29,7 +29,11 @@ export function EvidenceBody({ evidence }: { evidence: unknown }) {
       )}
       {body?.truncated && (
         <p data-testid="evidence-truncated" className="mt-1 text-[11px] italic text-honeydew-600/80">
-          {link ? 'There’s more — open in Gmail.' : 'Truncated — full text in the Brief.'}
+          {link
+            ? 'There’s more — open in Gmail.'
+            : isEmailEvidence(evidence)
+              ? 'Preview only — full text isn’t linkable here.'
+              : 'Truncated — full text in the Brief.'}
         </p>
       )}
       {link && (

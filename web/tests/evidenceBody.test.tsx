@@ -44,6 +44,20 @@ describe('EvidenceBody — body + external link render', () => {
     expect(screen.getByTestId('evidence-truncated').textContent).toContain('the Brief');
   });
 
+  it('a truncated email with NO gmail_url says "Preview only" — NOT the false Brief promise (#26)', () => {
+    // Long body + missing message_id ⟹ blank gmail_url ⟹ no link. The Brief never renders
+    // email bodies, so "full text in the Brief" would be a meaning-drift lie.
+    render(
+      <EvidenceBody
+        evidence={{ body: 'clipped email', truncated: true, sender: 'a@b.com', subject: 'Re: hi', classifier_priority: 'high', gmail_url: '' }}
+      />,
+    );
+    const copy = screen.getByTestId('evidence-truncated').textContent ?? '';
+    expect(copy).toContain('Preview only');
+    expect(copy).not.toContain('Brief'); // never the false promise
+    expect(screen.queryByTestId('evidence-external-link')).toBeNull(); // no link, as set up
+  });
+
   it('renders nothing when there is neither a body nor a valid link', () => {
     const { container } = render(<EvidenceBody evidence={{ sender: 'a@b.com' }} />);
     expect(container.firstChild).toBeNull();
