@@ -16,7 +16,7 @@ import {
   stampOpacity,
   verdictForDrag,
 } from '../lib/algernon/feedConstants';
-import { coerceEvidenceValue, evidenceBody, evidenceLabel, evidenceRows } from '../lib/algernon/feedEvidence';
+import { coerceEvidenceValue, evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../lib/algernon/feedEvidence';
 import type { FeedItem } from '../lib/algernon/feed';
 
 function feedItem(kind: string, evidence: Record<string, unknown>): FeedItem {
@@ -63,6 +63,10 @@ describe('evidenceBody — prose body extraction', () => {
     });
     expect(evidenceBody({ body: 'digest…[truncated]', truncated: true })?.truncated).toBe(true);
   });
+  it('honours the email_tier body_truncated flag as truncation too (#26)', () => {
+    expect(evidenceBody({ body: 'bounded email preview', body_truncated: true })?.truncated).toBe(true);
+    expect(evidenceBody({ body: 'short email', body_truncated: false })?.truncated).toBe(false);
+  });
   it('is null for absent / empty / non-string / non-object', () => {
     expect(evidenceBody({})).toBeNull();
     expect(evidenceBody({ body: '   ' })).toBeNull();
@@ -82,6 +86,40 @@ describe('evidenceRows — body/truncated are prose, never key:value rows', () =
     expect(keys).toContain('peer');
     expect(keys).not.toContain('body');
     expect(keys).not.toContain('truncated');
+  });
+  it('hides the email_tier plumbing keys (#26) from the rows', () => {
+    const rows = evidenceRows({
+      sender: 'a@b.com',
+      body: 'preview',
+      body_truncated: true,
+      message_id: '<abc@mail>',
+      gmail_url: 'https://mail.google.com/mail/u/0/#search/rfc822msgid:abc',
+    });
+    const keys = rows.map((r) => r.key);
+    expect(keys).toContain('sender'); // the one real row
+    expect(keys).not.toContain('body_truncated');
+    expect(keys).not.toContain('message_id');
+    expect(keys).not.toContain('gmail_url'); // never a raw URL row — it's the anchor
+  });
+});
+
+describe('evidenceExternalLink — the scheme-gated "Open in Gmail" link (#26)', () => {
+  it('accepts a server-built https://mail.google.com URL and returns it VERBATIM', () => {
+    const url = 'https://mail.google.com/mail/u/0/#search/rfc822msgid:a%40b';
+    expect(evidenceExternalLink({ gmail_url: url })).toEqual({ href: url, label: 'Open in Gmail' });
+  });
+  it('is null for a non-Gmail host / non-https scheme / hostile URL (never a clickable href)', () => {
+    expect(evidenceExternalLink({ gmail_url: 'javascript:alert(1)' })).toBeNull();
+    expect(evidenceExternalLink({ gmail_url: 'https://evil.example.com/mail.google.com' })).toBeNull();
+    expect(evidenceExternalLink({ gmail_url: 'http://mail.google.com/x' })).toBeNull(); // not https
+    expect(evidenceExternalLink({ gmail_url: 'data:text/html,x' })).toBeNull();
+  });
+  it('is null for absent / empty / non-string / non-object', () => {
+    expect(evidenceExternalLink({})).toBeNull();
+    expect(evidenceExternalLink({ gmail_url: '' })).toBeNull();
+    expect(evidenceExternalLink({ gmail_url: 42 })).toBeNull();
+    expect(evidenceExternalLink(null)).toBeNull();
+    expect(evidenceExternalLink('x')).toBeNull();
   });
 });
 

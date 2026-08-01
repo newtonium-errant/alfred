@@ -1,6 +1,6 @@
 import type { FeedItem } from '../../lib/algernon/feed';
 import { kindLabel } from '../../lib/algernon/feedConstants';
-import { evidenceBody, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
+import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, ringItemStage, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
 import type { UseRingCompletionResult } from './useRingCompletion';
 import type { UseSlotAcceptResult } from './useSlotAccept';
@@ -33,10 +33,11 @@ export interface FeedRowProps {
 
 export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, accept }: FeedRowProps) {
   const rows = evidenceRows(item.evidence);
-  // A digest/prose body (peer_digest et al.) also makes the row expandable, even
-  // when it has no key:value rows of its own.
+  // A digest/prose body (peer_digest et al.) OR a safe external link (the email
+  // "Open in Gmail" deep-link, #26) also makes the row expandable, even when it has
+  // no key:value rows of its own.
   const hasBody = evidenceBody(item.evidence) !== null;
-  const hasDetails = rows.length > 0 || hasBody;
+  const hasDetails = rows.length > 0 || hasBody || evidenceExternalLink(item.evidence) !== null;
   // C2 stage seam (mirrors RingsHeader.effectiveStage): completion-done > accept-
   // committed(planned) > base stage; an optimistic UNDO (raw done, override not-done)
   // returns the row to PLANNED.
