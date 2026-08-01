@@ -27,6 +27,33 @@ from alfred.feed import FeedItem
 
 _SOURCE_REF = {"producer": "brief"}
 
+# The ``source`` enum values a TierEntry carries when it is AUTO-surfaced (not
+# operator-committed) — mirrors the auto/self-care sources assigned in
+# ``tier.compute.compute_today_view``. A slot item is an accept CANDIDATE (Phase
+# C slice 2) iff its source is one of these AND it is not yet confirmed: a
+# confirmed T1 preserves its original auto source but flips ``confirmed=True``,
+# and an operator-committed T2/T3 carries a non-auto source ("operator"). Pinned
+# by ``tests/feed/test_brief_feed_slot_suggestion.py`` against the compute
+# assignments — if compute adds/renames an auto source, update BOTH in lockstep.
+_AUTO_CANDIDATE_SOURCES = frozenset({
+    "auto-due",
+    "auto-escalate",
+    "auto-due-routine",
+    "auto-surface-routine",
+    "auto-cadence-routine",
+    "self-care",
+})
+
+
+def _slot_is_candidate(source: str, confirmed: Any) -> bool:
+    """Whether a slot item is an accept CANDIDATE (auto-surfaced, not yet
+    committed to today's plan). Candidate = the entry's ``source`` is an
+    auto/self-care source AND it is not confirmed (``confirmed is not True`` —
+    covers T1's explicit ``False`` and T2/T3's ``None``). A committed item
+    (operator-added, or a confirmed auto-T1) is NOT a candidate → the router
+    refuses ``accept`` on it (the provenance guard)."""
+    return source in _AUTO_CANDIDATE_SOURCES and confirmed is not True
+
 
 def health_feed_items(
     vault_path: str | Path,
@@ -168,6 +195,8 @@ def slot_suggestion_feed_items(
             completion_by_record=completion_by_record,
             today=today,
         )
+        source = getattr(entry, "source", "") or ""
+        confirmed = getattr(entry, "confirmed", None)
         out.append(FeedItem.create(
             kind="slot_suggestion",
             stable_key=key,
@@ -180,7 +209,14 @@ def slot_suggestion_feed_items(
                 "path": getattr(entry, "path", ""),
                 "due_iso": getattr(entry, "due_iso", None),
                 "surface_reason": getattr(entry, "surface_reason", None),
-                "source": getattr(entry, "source", ""),
+                "source": source,
+                # Phase C slice 2 (board ACCEPT path): ``confirmed`` verbatim
+                # (T1-only; None for T2/T3) + the derived ``candidate`` flag the
+                # router's accept provenance-guard reads. Evidence-only — the
+                # brief render never reads evidence, so byte-parity holds (the
+                # C1 ``done`` precedent).
+                "confirmed": confirmed,
+                "candidate": _slot_is_candidate(source, confirmed),
                 "routine_record": getattr(entry, "routine_record", None),
                 "item_text": getattr(entry, "item_text", None),
                 "done": done,

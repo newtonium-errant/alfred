@@ -74,6 +74,11 @@ STATUS_UNSUPPORTED_ITEM = "unsupported_item"  # lane has no completion writer (t
 # the ReplyCorrection/last_batch path — the writers are called directly).
 DONE_ACTION = "done"
 UNDO_DONE_ACTION = "undo_done"
+# slot_suggestion ACCEPT action (Phase C slice 2 — board day-planning). Commits
+# an auto-surfaced candidate onto today's tier list via the tier_confirm writer.
+# Gated: accept ONLY when ``evidence.candidate is True`` (a committed item →
+# invalid_action, the provenance guard).
+ACCEPT_ACTION = "accept"
 SLOT_KIND = "slot_suggestion"
 
 # (kind, action_id) → the kwargs that synthesize the owning resolver's
@@ -106,15 +111,17 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "noted": {"ok": True, "consumed_token": "noted"},
         "show": {"ok": True, "consumed_token": "show"},
     },
-    # slot_suggestion (board DONE path) — the capability-ceiling declaration.
-    # Unlike the five families above, the kwargs here are UNUSED: a slot
-    # completion does NOT synthesize a ReplyCorrection or read last_batch. It is
-    # intercepted by :func:`_dispatch_slot_completion` (right after this ceiling
-    # check) which calls the per-lane completion writer directly against the
+    # slot_suggestion (board DONE + ACCEPT paths) — the capability-ceiling
+    # declaration. Unlike the five families above, the kwargs here are UNUSED: a
+    # slot completion/accept does NOT synthesize a ReplyCorrection or read
+    # last_batch. It is intercepted by :func:`_dispatch_slot_completion`
+    # (done/undo_done) or :func:`_dispatch_slot_confirm` (accept) right after
+    # this ceiling check, which call the per-lane writer directly against the
     # feed item's OWN stamped evidence (origin/routine_record/tier/item_text).
     "slot_suggestion": {
         "done": {},
         "undo_done": {},
+        "accept": {},
     },
 }
 
@@ -196,15 +203,24 @@ class ActResult:
     detail: str = ""
     feed_item_id: str = ""
     action_id: str = ""
+    # Optional committed-render payload for the FE's optimistic flip (Phase C
+    # slice 2 accept — the C1 optimistic-green pattern). Carries the fields the
+    # deck needs to render the candidate card transitioning to committed
+    # (tier / name / committed) without a re-fetch. ``None`` for every other
+    # action (additive, backward-compatible: absent from ``to_dict`` when None).
+    render: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "ok": self.ok,
             "status": self.status,
             "detail": self.detail,
             "id": self.feed_item_id,
             "action_id": self.action_id,
         }
+        if self.render is not None:
+            out["render"] = self.render
+        return out
 
 
 def _load_batch_item(kind: str, feed_item_id: str, config: Any) -> dict[str, Any] | None:
@@ -655,6 +671,100 @@ def _tier_writer_detail(kind: str, item_text: str) -> str:
     return f"could not record completion for '{item_text}'"
 
 
+# --- slot_suggestion accept (board day-planning path) ------------------------
+
+
+def _dispatch_slot_confirm(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    config: Any,
+    vault_path: Path | None,
+) -> ActResult:
+    """Apply a slot_suggestion ``accept`` — commit an auto-surfaced candidate
+    onto today's tier list via ``tier.tier_confirm.confirm_slot_candidate`` (the
+    deterministic writer; task #21 routes the talker's confirm grammar through
+    the same one). Acts on the feed item's OWN stamped ``evidence`` (never
+    last_batch). Runs inside the caller's per-item mutex.
+
+    PROVENANCE GUARD (output-bound): accept is valid ONLY on a genuine candidate
+    (``evidence.candidate is True``). A committed item — an operator-added or
+    already-confirmed slot — is NOT accept-able → ``invalid_action``, and NO
+    write happens (the guard is proven by asserting the vault is UNCHANGED, not
+    by a call-count — per ``feedback_identity_pin_output_binding``).
+
+    On the non-error end-state (success / idempotent_noop) the feed item is set
+    ``acted`` (the candidate episode is decided) and the ActResult carries the
+    committed-render payload for the FE's optimistic flip. The NEXT producer emit
+    re-emits the item as committed (``candidate=False``) — a new open episode per
+    the C1 reconcile semantics (verified against feed/store.py)."""
+    evidence = dict(getattr(item, "evidence", None) or {})
+
+    # Provenance guard — accept ONLY genuine candidates.
+    if evidence.get("candidate") is not True:
+        log.info(
+            "feed.act.slot.not_a_candidate", id=feed_item_id, action=action_id,
+            candidate=evidence.get("candidate"), source=evidence.get("source", ""),
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            "this item is already on today's plan — nothing to accept",
+            feed_item_id, action_id,
+        )
+
+    if vault_path is None:
+        return ActResult(
+            False, STATUS_ERROR,
+            "vault not configured — can't accept this suggestion",
+            feed_item_id, action_id,
+        )
+
+    from alfred.tier.tier_confirm import confirm_slot_candidate
+
+    today = _today_for(config)
+    result = confirm_slot_candidate(
+        Path(vault_path),
+        tier=evidence.get("tier"),
+        origin=str(evidence.get("origin") or ""),
+        name=str(evidence.get("name") or ""),
+        path=str(evidence.get("path") or ""),
+        routine_record=evidence.get("routine_record"),
+        item_text=evidence.get("item_text"),
+        source=str(evidence.get("source") or ""),
+        date=today,
+    )
+    if result.ok:
+        feed_store.set_state(feed_item_id, STATE_ACTED)
+        log.info(
+            "feed.act.slot.accepted", id=feed_item_id, tier=result.tier,
+            kind=result.kind, item=result.name,
+        )
+        return ActResult(
+            True, STATUS_ACTED, f"added to today's T{result.tier}: {result.name}",
+            feed_item_id, action_id,
+            render={"tier": result.tier, "name": result.name, "committed": True},
+        )
+    log.info(
+        "feed.act.slot.confirm_error", id=feed_item_id, tier=evidence.get("tier"),
+        kind=result.kind,
+    )
+    return ActResult(
+        False, STATUS_ERROR, _confirm_writer_detail(result.kind),
+        feed_item_id, action_id,
+    )
+
+
+def _confirm_writer_detail(kind: str) -> str:
+    """Human detail for a slot-accept writer refusal."""
+    if kind == "invalid_tier":
+        return "this suggestion has an unrecognized tier — refusing to guess"
+    if kind == "thin_evidence":
+        return "this suggestion is missing what's needed to add it — it'll resurface at the next sync"
+    return "could not add this suggestion to today's plan"
+
+
 def act(
     feed_item_id: str,
     action_id: str,
@@ -794,13 +904,24 @@ def _act_locked(
             feed_item_id, action_id,
         )
 
-    # slot_suggestion (board DONE path) — a DEDICATED dispatcher, NOT the
-    # ReplyCorrection/last_batch path. It acts on the feed item's OWN stamped
-    # evidence (the producer's trusted origin/routine_record/tier/item_text,
-    # same trust class as last_batch) and calls the per-lane completion writer
-    # — the SAME functions the talker uses (single writer per lane). Intercepts
-    # BEFORE _load_batch_item because slot items have no last_batch entry.
+    # slot_suggestion (board DONE + ACCEPT paths) — DEDICATED dispatchers, NOT
+    # the ReplyCorrection/last_batch path. They act on the feed item's OWN
+    # stamped evidence (the producer's trusted origin/routine_record/tier/
+    # item_text, same trust class as last_batch): done/undo_done → the per-lane
+    # completion writer, accept → the tier_confirm writer — the SAME functions
+    # the talker uses (single writer per lane). Intercepts BEFORE
+    # _load_batch_item because slot items have no last_batch entry.
     if kind == SLOT_KIND:
+        if action_id == ACCEPT_ACTION:
+            # Board day-planning: commit an auto-surfaced candidate onto today's
+            # tier list. A separate dispatcher (not the completion writers) —
+            # it calls the tier_confirm writer and enforces the candidate
+            # provenance guard. An already-acted candidate never reaches here
+            # (folded-state gate above returns already_acted).
+            return _dispatch_slot_confirm(
+                feed_item_id, action_id, item,
+                feed_store=feed_store, config=config, vault_path=vault_path,
+            )
         return _dispatch_slot_completion(
             feed_item_id, action_id, item,
             feed_store=feed_store, config=config, vault_path=vault_path,

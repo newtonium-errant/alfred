@@ -168,3 +168,75 @@ def test_slot_stable_key_free_text_fallback() -> None:
         item_text = None
 
     assert _slot_stable_key(_Entry()) == "text:Meditate 10 min"
+
+
+# --- accept candidate provenance (Phase C slice 2) --------------------------
+# ``evidence.candidate`` is the flag the router's accept provenance-guard reads;
+# ``evidence.confirmed`` is the verbatim T1 confirm flag. Pinned against the real
+# producer output so the derivation can't silently drift.
+
+
+def test_auto_t1_task_is_candidate_confirmed_false(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    _task(vault, "Pay Steph", "type: task\nstatus: todo\nname: Pay Steph\ndue: 2026-05-28\n")
+    it = _items(vault)[0]
+    assert it.evidence["source"] == "auto-due"
+    assert it.evidence["candidate"] is True  # auto-surfaced, not committed
+    assert it.evidence["confirmed"] is False
+
+
+def test_confirmed_curated_t1_is_not_candidate(tmp_path: Path) -> None:
+    """A confirmed auto-T1 (operator already accepted it) preserves its auto
+    ``source`` but ``confirmed=True`` flips ``candidate`` off."""
+    from alfred.tier.daily_curation import (
+        DailyCuration,
+        T1T2Entry,
+        save_tier_curation,
+    )
+
+    vault = _vault(tmp_path)
+    (vault / "daily").mkdir(parents=True, exist_ok=True)
+    _task(vault, "Pay Steph", "type: task\nstatus: todo\nname: Pay Steph\ndue: 2026-05-28\n")
+    save_tier_curation(
+        vault, NOW.date(),
+        DailyCuration(t1=[T1T2Entry(task="[[task/Pay Steph]]", source="auto-due", confirmed=True)]),
+    )
+    t1 = [it for it in _items(vault) if it.evidence.get("tier") == 1]
+    assert len(t1) == 1
+    assert t1[0].evidence["confirmed"] is True
+    assert t1[0].evidence["candidate"] is False  # committed → not accept-able
+
+
+def test_t2_auto_surface_is_candidate(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    _routine(
+        vault, "Bills",
+        "type: routine\nstatus: active\nname: Bills\ncadence:\n  type: daily\n"
+        "items:\n- text: Pay Rent\n  priority: tracked\n"
+        "  due_pattern:\n    type: monthly\n    day: 1\n  escalate_at_days: 0\n  surface_at_days: 5\n",
+    )
+    it = _items(vault)[0]
+    assert it.evidence["tier"] == 2
+    assert it.evidence["source"] == "auto-surface-routine"
+    assert it.evidence["candidate"] is True
+    assert it.evidence["confirmed"] is None  # T2 has no confirmed field
+
+
+def test_operator_curated_t3_is_not_candidate(tmp_path: Path) -> None:
+    """An operator-added free-text T3 (source ``operator-adhoc``) is committed —
+    not an auto candidate."""
+    from alfred.tier.daily_curation import (
+        DailyCuration,
+        T3Entry,
+        save_tier_curation,
+    )
+
+    vault = _vault(tmp_path)
+    (vault / "daily").mkdir(parents=True, exist_ok=True)
+    save_tier_curation(
+        vault, NOW.date(),
+        DailyCuration(t3=[T3Entry(item="Rake leaves", source="operator-adhoc")]),
+    )
+    t3 = [it for it in _items(vault) if it.evidence.get("tier") == 3]
+    assert len(t3) == 1
+    assert t3[0].evidence["candidate"] is False
