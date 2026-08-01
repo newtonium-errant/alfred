@@ -42,8 +42,23 @@ def _email_key(d: dict[str, Any]) -> str:
     return _s(d, "record_path")
 
 
+# email_section injects the literal "(unknown)"/"unknown" placeholder when an
+# email has no resolvable sender (see email_section.py:181, its own no-sender
+# sentinel set); an empty evidence sender is the same signal. Kept local rather
+# than imported so the title builder carries no cross-module dependency — the
+# sentinel is a stable, human-facing placeholder.
+_SENDER_ABSENT = frozenset({"(unknown)", "unknown"})
+
+
 def _email_title(d: dict[str, Any]) -> str:
-    return f"Email tier: {_s(d, 'sender') or 'unknown'} — {_s(d, 'subject') or '(no subject)'}"
+    # Drop the sender segment entirely when the sender is absent — otherwise the
+    # card title read "Email tier: (unknown) — subject" (#28). Subject-only when
+    # there's no real sender to name.
+    subject = _s(d, "subject") or "(no subject)"
+    sender = _s(d, "sender")
+    if not sender or sender.lower() in _SENDER_ABSENT:
+        return f"Email tier: {subject}"
+    return f"Email tier: {sender} — {subject}"
 
 
 def _attr_key(d: dict[str, Any]) -> str:

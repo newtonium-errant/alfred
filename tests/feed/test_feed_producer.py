@@ -33,6 +33,48 @@ def test_email_stable_key_falls_back_to_record_path() -> None:
     assert feed_item.id == "email_tier:note/A.md"
 
 
+# --- title: sender segment present when named, dropped when absent (#28) ------
+
+
+def test_email_title_names_a_real_sender() -> None:
+    it = _Item(record_path="note/A.md", sender="jamie@example.com", subject="Friday meeting")
+    [feed_item] = build_feed_items("email_tier", [it], "salem")
+    assert feed_item.title == "Email tier: jamie@example.com — Friday meeting"
+
+
+def test_email_title_drops_unknown_sender_segment() -> None:
+    # email_section injects the literal "(unknown)" placeholder for a senderless
+    # email — the title must not read "Email tier: (unknown) — ..." (#28).
+    it = _Item(record_path="note/A.md", sender="(unknown)", subject="Your hold is ready")
+    [feed_item] = build_feed_items("email_tier", [it], "salem")
+    assert feed_item.title == "Email tier: Your hold is ready"
+
+
+def test_email_title_drops_empty_sender_segment() -> None:
+    it = _Item(record_path="note/A.md", sender="", subject="Your hold is ready")
+    [feed_item] = build_feed_items("email_tier", [it], "salem")
+    assert feed_item.title == "Email tier: Your hold is ready"
+
+
+def test_email_title_drops_bare_unknown_sender_segment() -> None:
+    # The other sentinel in email_section's no-sender set (case-insensitive).
+    it = _Item(record_path="note/A.md", sender="Unknown", subject="Your hold is ready")
+    [feed_item] = build_feed_items("email_tier", [it], "salem")
+    assert feed_item.title == "Email tier: Your hold is ready"
+
+
+def test_email_title_absent_sender_and_subject() -> None:
+    it = _Item(record_path="note/A.md", sender="(unknown)", subject="")
+    [feed_item] = build_feed_items("email_tier", [it], "salem")
+    assert feed_item.title == "Email tier: (no subject)"
+
+
+def test_email_title_named_sender_no_subject() -> None:
+    it = _Item(record_path="note/A.md", sender="jamie@example.com", subject="")
+    [feed_item] = build_feed_items("email_tier", [it], "salem")
+    assert feed_item.title == "Email tier: jamie@example.com — (no subject)"
+
+
 def test_stable_keys_per_family() -> None:
     cases = {
         "attribution": (_Item(record_path="p/x.md", marker_id="inf-1"), "attribution:p/x.md|inf-1"),
