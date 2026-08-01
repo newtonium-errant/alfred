@@ -96,15 +96,18 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
   }, [current, confirming, deck]);
 
   // Keyboard alternates (accessibility): ← reject · → affirm · ↑ park · ↓ details.
+  // While the parked drill-down is open its overlay blocks pointer input on the hidden
+  // card, so the keyboard MUST be gated too — otherwise an arrow key acts on the card
+  // underneath the panel (a first-contact-shaped edge).
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (!current || confirming) return;
+      if (!current || confirming || parkedOpen) return;
       if (e.key === 'ArrowRight') deck.affirm();
       else if (e.key === 'ArrowLeft') deck.reject();
       else if (e.key === 'ArrowUp') deck.park();
       else if (e.key === 'ArrowDown') setExpanded((v) => !v);
     },
-    [current, confirming, deck],
+    [current, confirming, parkedOpen, deck],
   );
 
   const verbs = current ? deckVerbsFor(current.kind) : null;

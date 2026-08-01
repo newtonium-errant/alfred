@@ -426,4 +426,16 @@ describe('Deck — parked drill-down (task #26 render)', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].textContent).toContain('Bravo'); // b stays parked
   });
+
+  it('panel open → an arrow key does NOT act on the underlying card', () => {
+    render(<Deck items={[item({ id: 'a', title: 'Alpha' }), item({ id: 'b', title: 'Bravo' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b
+    act(() => fireEvent.click(screen.getByTestId('deck-parked'))); // open the panel
+    // An arrow key while the panel overlays the deck must be inert (the card is hidden).
+    act(() => fireEvent.keyDown(screen.getByTestId('deck'), { key: 'ArrowRight' }));
+    act(() => fireEvent.click(screen.getByTestId('deck-parked-close')));
+    // b was NOT affirmed/advanced — still the current card, deck not cleared.
+    expect(screen.queryByTestId('deck-cleared')).toBeNull();
+    expect(screen.getByTestId('deck-card').textContent).toContain('Bravo');
+  });
 });
