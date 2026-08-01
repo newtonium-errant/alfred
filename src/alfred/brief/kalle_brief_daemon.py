@@ -147,6 +147,60 @@ def load_brief_digest_push_config(raw: dict[str, Any]) -> BriefDigestPushConfig:
 
 
 # ---------------------------------------------------------------------------
+# BIT posture — state-path resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_bit_state_path(
+    config: BriefDigestPushConfig,
+    raw: dict[str, Any] | None,
+) -> Path | None:
+    """Resolve the BIT state file the posture line should read, or ``None``.
+
+    Precedence:
+      1. ``brief_digest_push.bit_state_path`` — explicit override wins.
+      2. The BIT config's own ``state.path`` — SINGLE SOURCE OF TRUTH when
+         this instance runs BIT (``bit:`` section present). Sourcing from
+         ``alfred.bit.config`` (rather than re-deriving
+         ``data_dir/bit_state.json``) means a customized ``bit.state.path``
+         is honored instead of silently missed — the failure mode behind
+         a "no BIT data" posture on an instance that DOES run BIT. For
+         KAL-LE's default config both resolve to the same file.
+      3. ``data_dir/bit_state.json`` — legacy fallback for instances with
+         no ``bit:`` section (posture correctly reads "no BIT data").
+
+    ILB: when ``bit:`` is configured but its state file is absent, log the
+    resolved path so a "no BIT data" posture on a BIT-running instance is
+    grep-able (self-diagnosing) instead of indistinguishable from an
+    instance that simply runs no BIT.
+    """
+    if config.bit_state_path:
+        return Path(config.bit_state_path)
+
+    if isinstance(raw, dict) and isinstance(raw.get("bit"), dict):
+        from alfred.bit.config import load_from_unified as load_bit_config
+
+        configured = Path(load_bit_config(raw).state.path)
+        if configured.exists():
+            return configured
+        log.info(
+            "kalle.brief_digest.bit_state_missing",
+            configured_path=str(configured),
+            self_name=config.self_name,
+            detail=(
+                "bit: section present but its state file was not found — "
+                "posture renders 'no BIT data' this digest"
+            ),
+        )
+        return None
+
+    candidate = Path(config.data_dir) / "bit_state.json"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Assembler selection (VERA P2)
 # ---------------------------------------------------------------------------
 
@@ -197,13 +251,7 @@ def _assemble_for_source(
             detail="falling back to git_activity assembler",
         )
 
-    bit_path: Path | None = None
-    if config.bit_state_path:
-        bit_path = Path(config.bit_state_path)
-    else:
-        candidate = Path(config.data_dir) / "bit_state.json"
-        if candidate.exists():
-            bit_path = candidate
+    bit_path = _resolve_bit_state_path(config, raw)
 
     return assemble_digest(
         today=today,
@@ -211,6 +259,26 @@ def _assemble_for_source(
         repo_paths=[Path(p) for p in config.repo_paths],
         bit_state_path=bit_path,
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket-pipeline section gating
+# ---------------------------------------------------------------------------
+
+
+def _ticket_pipeline_configured(raw: dict[str, Any] | None) -> bool:
+    """True when this instance runs the VERA→KAL-LE→GitHub ticket pipeline.
+
+    The signal is a ``ticket_intake:`` section in the unified config: the
+    digest's Ticket pipeline section reads EXCLUSIVELY from ticket-intake
+    state (plus ``github:`` for the PR outcome check), so an instance
+    without ``ticket_intake`` has no pipeline to report on. Config-driven
+    gate — NOT a hardcoded instance-name check: KAL-LE has
+    ``ticket_intake:``, Hypatia does not. Matches
+    ``load_ticket_intake_config``'s own "absent / malformed → disabled"
+    tolerance (a present-but-non-dict section counts as absent).
+    """
+    return isinstance(raw, dict) and isinstance(raw.get("ticket_intake"), dict)
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +301,11 @@ async def fire_once(
 
     ``raw`` is the unified config dict (threaded from the orchestrator
     runner) — the c5 ticket-pipeline section and the VERA forward-status
-    tails read their state paths + github config from it. ``None`` (old
-    callers/tests) degrades gracefully: the pipeline section still
-    renders from defaults per ILB, just without GitHub credentials.
+    tails read their state paths + github config from it. The c5 section
+    is only appended when ``raw`` carries a ``ticket_intake:`` section
+    (this instance runs the ticket pipeline); ``None`` or a config with
+    no ``ticket_intake`` (old callers/tests, Hypatia) omits the section
+    and logs the skip per ILB.
 
     Failure is non-fatal at the daemon level — the loop logs and
     continues so the next day's fire still runs.
@@ -245,16 +315,29 @@ async def fire_once(
 
     digest_md = _assemble_for_source(config, today, raw)
 
-    if config.source != "tickets":
-        # Ticket-pipeline section (pipeline c5) — KAL-LE-digest-family
-        # only (the "tickets" source is VERA's snapshot, which carries
-        # per-line forward-status tails instead). Awaited HERE because
-        # the github_ops client is async and fire_once is the assembler
-        # call's nearest async context. Internally §-contained: a
-        # section failure degrades to its "section unavailable" line,
-        # never a missing digest. Rendered EVERY digest (ILB).
+    if config.source != "tickets" and _ticket_pipeline_configured(raw):
+        # Ticket-pipeline section (pipeline c5) — KAL-LE-digest-family AND
+        # ticket-pipeline-configured only. The "tickets" source is VERA's
+        # snapshot (per-line forward-status tails instead); an instance
+        # with no ``ticket_intake:`` (e.g. Hypatia) has no pipeline to
+        # report, so the section is omitted entirely rather than rendering
+        # a misleading "no tickets received yet" line for a pipeline it
+        # doesn't run. Awaited HERE because the github_ops client is async
+        # and fire_once is the assembler call's nearest async context.
+        # Internally §-contained: a section failure degrades to its
+        # "section unavailable" line, never a missing digest. Rendered on
+        # EVERY digest of a ticket-pipeline instance (ILB).
         section = await assemble_ticket_pipeline_section(raw)
         digest_md = f"{digest_md}\n\n{section}"
+    elif config.source != "tickets":
+        # ILB: this instance runs no ticket pipeline (no ``ticket_intake:``
+        # config) — omit the section, but log so "omitted because
+        # unconfigured" is distinguishable from a broken/dropped section.
+        log.info(
+            "kalle.brief_digest.ticket_pipeline_section_skipped",
+            reason="no_ticket_intake_config",
+            self_name=config.self_name,
+        )
 
     log.info(
         "kalle.brief_digest.assembled",

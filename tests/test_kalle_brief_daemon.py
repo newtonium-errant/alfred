@@ -15,9 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 
 from alfred.brief.kalle_brief_daemon import (
     BriefDigestPushConfig,
+    _assemble_for_source,
+    _resolve_bit_state_path,
+    _ticket_pipeline_configured,
     fire_once,
     load_brief_digest_push_config,
 )
@@ -370,6 +374,172 @@ async def test_fire_once_tickets_source_gets_tails_not_pipeline_section(
     # raw threading proof: the forwarder-state-aware tail rendered
     # (absent state file → pending).
     assert "· forward pending" in md
+
+
+# ---------------------------------------------------------------------------
+# Ticket-pipeline section gated on ticket_intake config presence
+# (a git_activity instance with no ticket pipeline — e.g. Hypatia — must NOT
+# get the "no tickets received yet" line for a pipeline it doesn't run)
+# ---------------------------------------------------------------------------
+
+
+def test_ticket_pipeline_configured_gate() -> None:
+    """The gate keys on a ``ticket_intake:`` dict section — nothing else."""
+    assert _ticket_pipeline_configured({"ticket_intake": {"state": {}}}) is True
+    assert _ticket_pipeline_configured({"ticket_intake": {}}) is True
+    assert _ticket_pipeline_configured({}) is False
+    assert _ticket_pipeline_configured(None) is False
+    # Present-but-malformed (non-dict) counts as absent, matching
+    # load_ticket_intake_config's own tolerance.
+    assert _ticket_pipeline_configured({"ticket_intake": "oops"}) is False
+
+
+@pytest.mark.asyncio
+async def test_fire_once_omits_ticket_pipeline_without_ticket_intake(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A git_activity instance with NO ticket_intake config (Hypatia-shape)
+    omits the Ticket pipeline section entirely and logs the skip (ILB).
+    Mutation-verify: the section assembler is not even invoked."""
+    captured_pushes: list[dict[str, Any]] = []
+
+    async def _fake_send(
+        peer_name: str, *, digest_markdown: str, digest_date: str,
+        self_name: str, config: TransportConfig | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        captured_pushes.append({"digest_markdown": digest_markdown})
+        return {"status": "accepted", "path": "x", "correlation_id": "c"}
+
+    import alfred.brief.kalle_brief_daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "peer_send_brief_digest", _fake_send)
+
+    # The gate must short-circuit BEFORE the section is assembled.
+    async def _must_not_run(*_a: Any, **_kw: Any) -> str:
+        raise AssertionError("ticket pipeline section must not be assembled")
+
+    monkeypatch.setattr(daemon_mod, "assemble_ticket_pipeline_section", _must_not_run)
+
+    data_dir = _make_data_dir(tmp_path)
+    config = BriefDigestPushConfig(
+        enabled=True, self_name="hypatia", target_peer="salem",
+        repo_paths=[], data_dir=str(data_dir),
+    )
+    # Hypatia-shape raw: brief_digest_push present, NO ticket_intake section.
+    raw: dict[str, Any] = {"vault": {"path": str(tmp_path)}}
+
+    with structlog.testing.capture_logs() as logs:
+        result = await fire_once(
+            config,
+            TransportConfig(peers={"salem": PeerEntry(base_url="http://x", token="t")}),
+            today=date(2026, 4, 23),
+            raw=raw,
+        )
+    assert result["ok"] is True
+    md = captured_pushes[0]["digest_markdown"]
+    assert "Ticket pipeline" not in md
+    # The rest of the digest still renders.
+    assert "**Yesterday:**" in md
+    assert "**Posture:**" in md
+    # ILB skip log emitted with the contract fields.
+    skips = [
+        c for c in logs
+        if c.get("event") == "kalle.brief_digest.ticket_pipeline_section_skipped"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["reason"] == "no_ticket_intake_config"
+    assert skips[0]["self_name"] == "hypatia"
+
+
+# ---------------------------------------------------------------------------
+# BIT posture reads the BIT config's own state path (single source of truth),
+# not a re-derived data_dir/bit_state.json
+# ---------------------------------------------------------------------------
+
+
+def _write_bit_state(path: Path, status: str = "warn") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "version": 1,
+            "runs": [{"overall_status": status, "tool_counts": {"ok": 4, "warn": 1}}],
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_resolve_bit_state_path_explicit_override_wins(tmp_path: Path) -> None:
+    override = tmp_path / "explicit_bit.json"
+    override.write_text("{}", encoding="utf-8")
+    config = BriefDigestPushConfig(
+        bit_state_path=str(override), data_dir=str(tmp_path),
+    )
+    # Explicit override returned even when a bit: section names another path.
+    assert _resolve_bit_state_path(
+        config, {"bit": {"state": {"path": "/somewhere/else.json"}}},
+    ) == override
+
+
+def test_resolve_bit_state_path_sources_from_bit_config(tmp_path: Path) -> None:
+    """bit: present → read bit.state.path, NOT data_dir/bit_state.json. A
+    custom path (≠ data_dir) proves the single-source-of-truth wiring; a
+    decoy at data_dir/bit_state.json must be ignored."""
+    custom = tmp_path / "custom" / "bit_state.json"
+    _write_bit_state(custom, status="warn")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    _write_bit_state(data_dir / "bit_state.json", status="ok")  # decoy
+    config = BriefDigestPushConfig(data_dir=str(data_dir))
+    raw = {"logging": {"dir": str(tmp_path)}, "bit": {"state": {"path": str(custom)}}}
+    assert _resolve_bit_state_path(config, raw) == custom
+
+
+def test_resolve_bit_state_path_bit_configured_but_missing_logs(
+    tmp_path: Path,
+) -> None:
+    """bit: present but state file absent → None + ILB bit_state_missing log."""
+    missing = tmp_path / "gone" / "bit_state.json"
+    config = BriefDigestPushConfig(self_name="kal-le", data_dir=str(tmp_path))
+    raw = {"logging": {"dir": str(tmp_path)}, "bit": {"state": {"path": str(missing)}}}
+    with structlog.testing.capture_logs() as logs:
+        result = _resolve_bit_state_path(config, raw)
+    assert result is None
+    miss = [
+        c for c in logs
+        if c.get("event") == "kalle.brief_digest.bit_state_missing"
+    ]
+    assert len(miss) == 1
+    assert miss[0]["configured_path"] == str(missing)
+    assert miss[0]["self_name"] == "kal-le"
+
+
+def test_resolve_bit_state_path_no_bit_section_uses_data_dir(
+    tmp_path: Path,
+) -> None:
+    """No bit: section → legacy data_dir/bit_state.json fallback (Hypatia)."""
+    data_dir = tmp_path / "data"
+    _write_bit_state(data_dir / "bit_state.json")
+    config = BriefDigestPushConfig(data_dir=str(data_dir))
+    assert _resolve_bit_state_path(
+        config, {"vault": {"path": "x"}},
+    ) == data_dir / "bit_state.json"
+    # Truly absent file → None (and raw=None old-caller path).
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert _resolve_bit_state_path(BriefDigestPushConfig(data_dir=str(empty)), None) is None
+
+
+def test_assemble_for_source_bit_posture_from_bit_config(tmp_path: Path) -> None:
+    """End-to-end: a bit: section with a custom state path drives the posture
+    line (yellow) even though data_dir holds no bit_state.json."""
+    custom = tmp_path / "bitdir" / "bit_state.json"
+    _write_bit_state(custom, status="warn")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config = BriefDigestPushConfig(repo_paths=[], data_dir=str(data_dir))
+    raw = {"logging": {"dir": str(tmp_path)}, "bit": {"state": {"path": str(custom)}}}
+    md = _assemble_for_source(config, date(2026, 4, 23), raw)
+    assert "**Posture:** yellow" in md
 
 
 # ---------------------------------------------------------------------------
