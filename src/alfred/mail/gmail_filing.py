@@ -115,6 +115,25 @@ def _parse_message_id(header_bytes: bytes) -> str:
     return m.group(1).decode("utf-8", errors="replace").strip() if m else ""
 
 
+def gmail_rfc822_search_url(message_id: str) -> str:
+    """A Gmail deep-link that opens a message by its RFC822 ``Message-ID`` — the
+    "open in Gmail" affordance for the email-tier cards (#26).
+
+    Uses Gmail's ``rfc822msgid:`` search operator, which resolves a message by
+    its immutable Message-ID (the same join key ``gmail_filing`` labels by), so
+    the link survives across folders/labels. ``u/0`` is the single-account
+    assumption (v1). Returns ``""`` for an empty id (the FE then renders no
+    link). The id is stripped of RFC822 angle brackets and URL-encoded (message
+    ids carry ``@`` and can carry ``/``, ``+``, etc.).
+    """
+    from urllib.parse import quote
+
+    mid = (message_id or "").strip().strip("<>").strip()
+    if not mid:
+        return ""
+    return f"https://mail.google.com/mail/u/0/#search/rfc822msgid:{quote(mid, safe='')}"
+
+
 # --- The write: label-first, archive-last ----------------------------------
 
 

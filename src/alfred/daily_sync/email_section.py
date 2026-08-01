@@ -79,6 +79,12 @@ class BatchItem:
     # 2026-04-11)"``).
     cluster_record_paths: list[str] = field(default_factory=list)
     cluster_most_recent_label: str = ""
+    # #26 — card body preview + Gmail deep-link (feed evidence only; the Telegram
+    # ``render_batch`` does NOT read these, so the sync stays byte-identical).
+    body: str = ""
+    body_truncated: bool = False
+    message_id: str = ""
+    gmail_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +98,10 @@ class BatchItem:
             "snippet": self.snippet,
             "cluster_record_paths": list(self.cluster_record_paths),
             "cluster_most_recent_label": self.cluster_most_recent_label,
+            "body": self.body,
+            "body_truncated": self.body_truncated,
+            "message_id": self.message_id,
+            "gmail_url": self.gmail_url,
         }
 
 
@@ -105,6 +115,14 @@ class _CandidateRecord:
     subject: str
     snippet: str
     mtime: float
+    # #26 — card body preview (bounded) + the Gmail deep-link. ``body`` is the
+    # 600-char readable preview; ``body_truncated`` drives the FE "more" cue;
+    # ``message_id`` is the raw RFC822 id (future-proof); ``gmail_url`` is the
+    # pre-built deep-link the FE renders as a plain external anchor.
+    body: str = ""
+    body_truncated: bool = False
+    message_id: str = ""
+    gmail_url: str = ""
 
 
 def _read_candidate(
@@ -166,6 +184,16 @@ def _read_candidate(
 
     snippet = _extract_snippet(post.content or "", limit=120)
 
+    # #26 — bounded card body + Gmail deep-link (from the record's own content +
+    # frontmatter; no new fetch). ``email_message_id`` is the join key 7c-i wrote
+    # (same id gmail_filing labels by); the deep-link is composed server-side.
+    # Lazy import so daily_sync's module graph doesn't pull the mail package.
+    from alfred.mail.gmail_filing import gmail_rfc822_search_url
+
+    body, body_truncated = _bounded_email_body(post.content or "")
+    message_id = str(fm.get("email_message_id") or "").strip()
+    gmail_url = gmail_rfc822_search_url(message_id) if message_id else ""
+
     return _CandidateRecord(
         rel_path=rel_path,
         priority=priority,
@@ -175,6 +203,10 @@ def _read_candidate(
         subject=subject,
         snippet=snippet,
         mtime=mtime,
+        body=body,
+        body_truncated=body_truncated,
+        message_id=message_id,
+        gmail_url=gmail_url,
     )
 
 
@@ -319,6 +351,29 @@ def _extract_snippet(body: str, *, limit: int = 120) -> str:
     if len(text) > limit:
         text = text[: limit - 3].rstrip() + "..."
     return text
+
+
+# The card body preview cap (#26). Larger than the 120-char ``snippet`` (which
+# stays for the Telegram sync render) so the tier card carries enough to JUDGE
+# the classification — but capped well under the 4000 digest cap because emails
+# are noisier (signatures, quoted replies, disclaimers); the Gmail deep-link is
+# the full-reading surface. Bounds the last_batch payload too.
+_EMAIL_BODY_CAP = 600
+
+
+def _bounded_email_body(content: str, *, cap: int = _EMAIL_BODY_CAP) -> tuple[str, bool]:
+    """Return ``(body, truncated)`` — the readable email prose bounded to ``cap``.
+
+    Reuses :func:`_extract_snippet` at an effectively-unbounded limit to get the
+    SAME header-skipped, whitespace-collapsed prose the 120-char snippet is cut
+    from (so the two never diverge on cleaning), then caps at ``cap`` with a
+    ``truncated`` flag (the FE's "there's more — open in Gmail" signal). Mirrors
+    the peer-digest ``_bounded_digest_body`` (bounded evidence + truncated flag).
+    """
+    full = _extract_snippet(content or "", limit=10**9)  # full cleaned prose, no cut
+    if len(full) <= cap:
+        return full, False
+    return full[:cap].rstrip() + "…", True
 
 
 def _already_calibrated(corpus_path: str | Path) -> set[str]:
@@ -615,6 +670,10 @@ def build_batch(
                 snippet=primary.snippet,
                 cluster_record_paths=cluster_paths,
                 cluster_most_recent_label=most_recent_label,
+                body=primary.body,
+                body_truncated=primary.body_truncated,
+                message_id=primary.message_id,
+                gmail_url=primary.gmail_url,
             )
         )
     return items
