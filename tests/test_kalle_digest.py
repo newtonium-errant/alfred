@@ -258,9 +258,32 @@ def test_git_commits_empty_yesterday_returns_no_entry(tmp_path: Path) -> None:
 
 
 def test_bit_state_missing_returns_empty() -> None:
-    status, summary = read_bit_state(None)
-    assert status == ""
-    assert summary == ""
+    posture = read_bit_state(None)
+    assert posture.status == ""
+    assert posture.summary == ""
+    # No path at all is the genuinely-absent case — the only shape allowed
+    # to render "no BIT data on this instance".
+    assert posture.present is False
+
+
+def test_bit_state_path_none_is_silent() -> None:
+    """An instance with no BIT configured is quiet, not noisy: the rendered
+    posture line is the signal, so the reader logs nothing."""
+    with structlog.testing.capture_logs() as cap:
+        read_bit_state(None)
+    assert [c for c in cap if str(c.get("event", "")).startswith("kalle_digest.")] == []
+
+
+def test_bit_state_resolved_path_absent_logs(tmp_path: Path) -> None:
+    """A resolved path that doesn't exist → empty posture + ILB log, so a
+    "no BIT data" line on a BIT-running instance is grep-able."""
+    missing = tmp_path / "nope" / "bit_state.json"
+    with structlog.testing.capture_logs() as cap:
+        posture = read_bit_state(missing)
+    assert posture.present is False
+    warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_absent"]
+    assert len(warns) == 1
+    assert warns[0]["path"] == str(missing)
 
 
 def test_bit_state_ok_with_counts(tmp_path: Path) -> None:
@@ -270,9 +293,10 @@ def test_bit_state_ok_with_counts(tmp_path: Path) -> None:
             {"overall_status": "ok", "tool_counts": {"ok": 6, "warn": 0}},
         ],
     }), encoding="utf-8")
-    status, summary = read_bit_state(bit_path)
-    assert status == "ok"
-    assert "6 ok" in summary
+    posture = read_bit_state(bit_path)
+    assert posture.status == "ok"
+    assert "6 ok" in posture.summary
+    assert posture.present is True
 
 
 def test_bit_state_warn(tmp_path: Path) -> None:
@@ -282,8 +306,80 @@ def test_bit_state_warn(tmp_path: Path) -> None:
             {"overall_status": "warn", "tool_counts": {"ok": 5, "warn": 1}},
         ],
     }), encoding="utf-8")
-    status, _ = read_bit_state(bit_path)
-    assert status == "warn"
+    posture = read_bit_state(bit_path)
+    assert posture.status == "warn"
+
+
+def test_bit_state_skip_carries_counts_and_mode(tmp_path: Path) -> None:
+    """KAL-LE's real steady-state shape (box ground truth 2026-08-03): the
+    reader must surface status/counts/mode so the renderer can be honest
+    about it instead of falling through to the no-data copy."""
+    bit_path = tmp_path / "bit_state.json"
+    bit_path.write_text(json.dumps({
+        "version": 1,
+        "last_run": "2026-08-03T08:50:00+00:00",
+        "runs": [{
+            "date": "2026-08-03",
+            "overall_status": "skip",
+            "mode": "quick",
+            "tool_counts": {"ok": 5, "warn": 0, "fail": 0, "skip": 7},
+        }],
+    }), encoding="utf-8")
+    posture = read_bit_state(bit_path)
+    assert posture.status == "skip"
+    assert posture.mode == "quick"
+    assert posture.tool_counts == {"ok": 5, "warn": 0, "fail": 0, "skip": 7}
+    assert posture.present is True
+    # Zero buckets dropped; "skip" reads as "skipped".
+    assert posture.summary == "5 ok, 7 skipped"
+
+
+def test_bit_state_no_runs_logs(tmp_path: Path) -> None:
+    """A state file with an empty run list → empty posture + ILB log."""
+    bit_path = tmp_path / "bit_state.json"
+    bit_path.write_text(json.dumps({"version": 1, "runs": []}), encoding="utf-8")
+    with structlog.testing.capture_logs() as cap:
+        posture = read_bit_state(bit_path)
+    assert posture.present is False
+    warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_no_runs"]
+    assert len(warns) == 1
+    assert warns[0]["reason"] == "empty"
+
+
+def test_bit_state_runs_not_a_list_logs(tmp_path: Path) -> None:
+    bit_path = tmp_path / "bit_state.json"
+    bit_path.write_text(json.dumps({"runs": "nope"}), encoding="utf-8")
+    with structlog.testing.capture_logs() as cap:
+        posture = read_bit_state(bit_path)
+    assert posture.present is False
+    warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_no_runs"]
+    assert len(warns) == 1
+    assert warns[0]["reason"] == "not_a_list"
+    assert warns[0]["runs_type"] == "str"
+
+
+def test_bit_state_malformed_latest_run_logs(tmp_path: Path) -> None:
+    bit_path = tmp_path / "bit_state.json"
+    bit_path.write_text(json.dumps({"runs": ["not-an-object"]}), encoding="utf-8")
+    with structlog.testing.capture_logs() as cap:
+        posture = read_bit_state(bit_path)
+    assert posture.present is False
+    warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_malformed_run"]
+    assert len(warns) == 1
+    assert warns[0]["latest_type"] == "str"
+
+
+def test_bit_state_non_dict_tool_counts_degrades(tmp_path: Path) -> None:
+    """Malformed tool_counts must not crash the reader — the status still
+    lands, the summary is simply empty."""
+    bit_path = tmp_path / "bit_state.json"
+    bit_path.write_text(json.dumps({
+        "runs": [{"overall_status": "ok", "tool_counts": "5 ok"}],
+    }), encoding="utf-8")
+    posture = read_bit_state(bit_path)
+    assert posture.status == "ok"
+    assert posture.tool_counts == {}
+    assert posture.summary == ""
 
 
 def test_bit_state_invalid_json_degrades_with_warning(tmp_path: Path) -> None:
@@ -292,8 +388,8 @@ def test_bit_state_invalid_json_degrades_with_warning(tmp_path: Path) -> None:
     bit_path = tmp_path / "bit_state.json"
     bit_path.write_text("{ not json", encoding="utf-8")
     with structlog.testing.capture_logs() as cap:
-        status, summary = read_bit_state(bit_path)
-    assert (status, summary) == ("", "")
+        posture = read_bit_state(bit_path)
+    assert (posture.status, posture.summary, posture.present) == ("", "", False)
     warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_read_failed"]
     assert len(warns) == 1
     assert warns[0]["stage"] == "json"
@@ -306,8 +402,8 @@ def test_bit_state_non_utf8_degrades_with_warning(tmp_path: Path) -> None:
     bit_path = tmp_path / "bit_state.json"
     bit_path.write_bytes(b"\xff\xfe not utf-8")
     with structlog.testing.capture_logs() as cap:
-        status, summary = read_bit_state(bit_path)
-    assert (status, summary) == ("", "")
+        posture = read_bit_state(bit_path)
+    assert (posture.status, posture.summary, posture.present) == ("", "", False)
     warns = [c for c in cap if c.get("event") == "kalle_digest.bit_state_read_failed"]
     assert len(warns) == 1
     assert warns[0]["stage"] == "read"
@@ -434,6 +530,123 @@ def test_render_posture_green_on_ok() -> None:
     assert "6 ok" in md
 
 
+def test_render_posture_skip_is_honest_not_no_data() -> None:
+    """REGRESSION (2026-08-03): KAL-LE's digest rendered "green — no BIT data
+    on this instance" every morning while its BIT daemon wrote a fresh state
+    file daily. ``_render_posture_line`` mapped only {fail, warn, ok}, so the
+    steady-state ``skip`` fell through to the no-data copy.
+
+    Mutation: delete the ``status == "skip"`` branch → this fails."""
+    data = DigestData(
+        bit_overall_status="skip",
+        bit_summary_line="5 ok, 7 skipped",
+        bit_tool_counts={"ok": 5, "warn": 0, "fail": 0, "skip": 7},
+        bit_mode="quick",
+        bit_present=True,
+    )
+    md = render_digest_markdown(data)
+    assert "**Posture:** green — 5 ok, 7 skipped (quick mode)." in md
+    assert "no BIT data" not in md
+
+
+def test_render_posture_skip_with_fails_is_red() -> None:
+    """Fail-honest: the aggregate says skip but the counts carry fails, so
+    the line must not paint green."""
+    data = DigestData(
+        bit_overall_status="skip",
+        bit_summary_line="2 fail, 3 ok, 7 skipped",
+        bit_tool_counts={"ok": 3, "warn": 0, "fail": 2, "skip": 7},
+        bit_mode="quick",
+        bit_present=True,
+    )
+    md = render_digest_markdown(data)
+    assert "**Posture:** red" in md
+    assert "2 fail, 3 ok, 7 skipped (quick mode)" in md
+
+
+def test_render_posture_skip_with_warns_is_yellow() -> None:
+    data = DigestData(
+        bit_overall_status="skip",
+        bit_summary_line="4 ok, 7 skipped, 1 warn",
+        bit_tool_counts={"ok": 4, "warn": 1, "fail": 0, "skip": 7},
+        bit_present=True,
+    )
+    md = render_digest_markdown(data)
+    assert "**Posture:** yellow" in md
+    # No mode recorded → no "(… mode)" suffix, no empty parens.
+    assert "mode)" not in md
+
+
+def test_render_posture_skip_with_no_oks_says_no_probes_ran() -> None:
+    """Every probe skipped: green (nothing failed) but the copy must not
+    imply checks passed."""
+    data = DigestData(
+        bit_overall_status="skip",
+        bit_summary_line="12 skipped",
+        bit_tool_counts={"ok": 0, "warn": 0, "fail": 0, "skip": 12},
+        bit_mode="quick",
+        bit_present=True,
+    )
+    md = render_digest_markdown(data)
+    assert "**Posture:** green — no probes ran; 12 skipped (quick mode)." in md
+    assert "no BIT data" not in md
+
+
+def test_render_posture_skip_with_no_counts_at_all() -> None:
+    data = DigestData(
+        bit_overall_status="skip", bit_mode="full", bit_present=True,
+    )
+    md = render_digest_markdown(data)
+    assert "**Posture:** green — BIT ran but recorded no tool results (full mode)." in md
+    assert "no BIT data" not in md
+
+
+def test_render_posture_unknown_status_is_distinct_and_logged() -> None:
+    """An unrecognised status must never borrow the "no BIT data" copy —
+    that copy is reserved for genuinely absent data."""
+    data = DigestData(
+        bit_overall_status="degraded",
+        bit_summary_line="5 ok",
+        bit_tool_counts={"ok": 5},
+        bit_present=True,
+    )
+    with structlog.testing.capture_logs() as cap:
+        md = render_digest_markdown(data)
+    assert "**Posture:** yellow — unknown BIT status 'degraded' (5 ok)." in md
+    assert "no BIT data" not in md
+    warns = [c for c in cap if c.get("event") == "kalle_digest.posture_unknown_bit_status"]
+    assert len(warns) == 1
+    assert warns[0]["status"] == "degraded"
+    assert warns[0]["tool_counts"] == {"ok": 5}
+
+
+def test_render_posture_present_but_no_status_is_distinct_and_logged() -> None:
+    """A run record with no overall_status is broken input, not absent data."""
+    data = DigestData(
+        bit_overall_status="",
+        bit_summary_line="5 ok, 7 skipped",
+        bit_tool_counts={"ok": 5, "skip": 7},
+        bit_present=True,
+    )
+    with structlog.testing.capture_logs() as cap:
+        md = render_digest_markdown(data)
+    assert "**Posture:** yellow — BIT ran but recorded no status (5 ok, 7 skipped)." in md
+    assert "no BIT data" not in md
+    warns = [c for c in cap if c.get("event") == "kalle_digest.posture_missing_bit_status"]
+    assert len(warns) == 1
+    assert warns[0]["tool_counts"] == {"ok": 5, "skip": 7}
+
+
+def test_render_posture_absent_data_keeps_no_data_copy() -> None:
+    """The reserved copy still fires for the one case it describes: no BIT
+    state read at all."""
+    with structlog.testing.capture_logs() as cap:
+        md = render_digest_markdown(DigestData())
+    assert "**Posture:** green — no BIT data on this instance." in md
+    # Genuinely-absent is a quiet state, not a warning.
+    assert [c for c in cap if str(c.get("event", "")).startswith("kalle_digest.posture_")] == []
+
+
 def test_render_word_count_within_target() -> None:
     """A realistic digest stays under the ~400 word soft cap."""
     data = DigestData(
@@ -499,6 +712,38 @@ def test_assemble_digest_full_pipeline(tmp_path: Path) -> None:
     assert "1 bash_exec runs" in md or "bash_exec runs" in md
     assert "queued for retry" in md
     assert "**Posture:** green" in md
+
+
+def test_assemble_digest_with_live_bit_state_reports_honestly(tmp_path: Path) -> None:
+    """END-TO-END regression pin for the 2026-08-03 bug: reader + renderer
+    together, against KAL-LE's actual on-box bit_state.json shape. The unit
+    pins cover each half; this one proves the seam — the original bug was
+    invisible per-layer (the reader returned "skip" correctly, the renderer
+    just didn't know the word)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    bit_state = data_dir / "bit_state.json"
+    bit_state.write_text(json.dumps({
+        "version": 1,
+        "last_run": "2026-08-03T08:50:12+00:00",
+        "runs": [{
+            "date": "2026-08-03",
+            "generated_at": "2026-08-03T08:50:12+00:00",
+            "vault_path": "/home/andrew/aftermath-lab",
+            "overall_status": "skip",
+            "mode": "quick",
+            "tool_counts": {"ok": 5, "warn": 0, "fail": 0, "skip": 7},
+        }],
+    }), encoding="utf-8")
+
+    md = assemble_digest(
+        today=TODAY,
+        data_dir=data_dir,
+        repo_paths=[],
+        bit_state_path=bit_state,
+    )
+    assert "**Posture:** green — 5 ok, 7 skipped (quick mode)." in md
+    assert "no BIT data" not in md
 
 
 def test_gather_digest_data_aggregates(tmp_path: Path) -> None:

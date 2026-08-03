@@ -31,11 +31,18 @@ Sections
     behind a config flag once the v1 shape is dogfooded.
 
 **Posture** (deterministic):
-    - green: no BIT data OR all BIT checks passed yesterday
-    - yellow: any BIT WARN
+    - green: all BIT checks passed, or checks were skipped with no
+      warn/fail in the counts, or no BIT data at all
+    - yellow: any BIT WARN, or a status we can't interpret
     - red: any BIT FAIL
-    KAL-LE doesn't run BIT in v1 (per the rollout ledger), so the
-    typical posture line is "green — no BIT data on this instance".
+    KAL-LE now runs BIT daily and its steady state is
+    ``overall_status: skip`` — ``Status.worst`` ranks SKIP above OK, so
+    an instance with unconfigured tools rolls up to ``skip`` even when
+    every probe that ran passed. The typical KAL-LE line is therefore
+    "green — 5 ok, 7 skipped (quick mode)". The "no BIT data on this
+    instance" copy is reserved for the cases where no readable BIT run
+    record was recovered — no state file, or a state file that couldn't
+    be parsed into one (see :func:`read_bit_state`, which logs which).
 
 **Ticket pipeline** (deterministic, pipeline c5):
     The VERA→KAL-LE→GitHub ticket pipeline's morning surface +
@@ -80,8 +87,35 @@ class DigestData:
     instructor_pending: list[str] = field(default_factory=list)
     instructor_retrying: list[str] = field(default_factory=list)
     git_commits_by_repo: dict[str, list[str]] = field(default_factory=dict)
-    bit_overall_status: str = ""  # "ok" | "warn" | "fail" | "" (unknown)
+    # "ok" | "warn" | "fail" | "skip" | "" (no status recorded / no data).
+    # ``skip`` is a first-class steady state, not an absence — see
+    # :func:`_render_posture_line`.
+    bit_overall_status: str = ""
     bit_summary_line: str = ""
+    bit_tool_counts: dict[str, int] = field(default_factory=dict)
+    bit_mode: str = ""  # "quick" | "full" | "" (unrecorded)
+    # True when a BIT run record was actually read. Distinguishes
+    # "BIT ran and told us nothing useful" from "no BIT on this instance";
+    # only the latter may render the "no BIT data" copy.
+    bit_present: bool = False
+
+
+@dataclass
+class BITPosture:
+    """What :func:`read_bit_state` recovered from the BIT state file.
+
+    ``present`` is the load-bearing field: it is True only when a BIT run
+    record was actually read off disk. The posture renderer reserves the
+    "no BIT data on this instance" copy for ``present=False`` — every
+    other shape (a run with an odd status, a run with no status at all)
+    gets its own honest copy plus a log line.
+    """
+
+    status: str = ""
+    summary: str = ""
+    tool_counts: dict[str, int] = field(default_factory=dict)
+    mode: str = ""
+    present: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -300,15 +334,57 @@ def read_git_commits(
     return out
 
 
-def read_bit_state(path: Path | None) -> tuple[str, str]:
+# Count keys rendered with friendlier English in the posture phrase.
+# ``skip`` is the only one that reads wrong as a bare noun ("7 skip").
+_COUNT_LABELS = {"skip": "skipped"}
+
+
+def _summarise_counts(counts: dict[str, Any]) -> str:
+    """``{"ok": 5, "skip": 7, "fail": 0}`` -> ``"5 ok, 7 skipped"``.
+
+    Zero-valued buckets are dropped so the phrase carries only what
+    actually happened. Alphabetical key order keeps fail/ok/skip/warn
+    stable across runs.
+    """
+    return ", ".join(
+        f"{v} {_COUNT_LABELS.get(k, k)}"
+        for k, v in sorted(counts.items())
+        if v
+    )
+
+
+def _count(counts: dict[str, Any], key: str) -> int:
+    """One count bucket as an int; 0 for missing or non-numeric values."""
+    try:
+        return int(counts.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_bit_state(path: Path | None) -> BITPosture:
     """Read BIT state file for posture computation.
 
-    Returns (overall_status, summary_line). overall_status is one of
-    ``"ok"``, ``"warn"``, ``"fail"``, or ``""`` when no data is
-    available (e.g. KAL-LE doesn't run BIT in v1).
+    Returns a :class:`BITPosture`. Every degraded path returns the empty
+    posture (``present=False``) AND logs why — a "no BIT data" posture on
+    an instance that demonstrably runs BIT must be grep-able rather than
+    silent (ILB, per ``feedback_intentionally_left_blank.md``). That gap
+    is exactly how KAL-LE's daily digest claimed "no BIT data" for weeks
+    while its BIT daemon wrote a fresh state file every morning.
     """
-    if path is None or not path.exists():
-        return "", ""
+    if path is None:
+        # No BIT configured for this instance — genuinely absent, and the
+        # rendered posture line says so. Nothing to signal.
+        return BITPosture()
+    if not path.exists():
+        # A path was resolved but the file isn't there. The daemon's
+        # resolver logs the configured-but-missing case; this catches the
+        # explicit-override and deleted-between-resolve-and-read cases.
+        log.warning(
+            "kalle_digest.bit_state_absent",
+            path=str(path),
+            detail="resolved BIT state path does not exist — posture renders 'no BIT data'",
+        )
+        return BITPosture()
     # Defensive read via the shared helper — same UnicodeDecodeError gap as
     # the other kalle_digest readers: a non-UTF-8 BIT state file escaped the
     # ``(json.JSONDecodeError, OSError)`` catch. Degrade to ("", "") + signal
@@ -322,7 +398,7 @@ def read_bit_state(path: Path | None) -> tuple[str, str]:
             error=read.detail,
             error_type=read.error_type,
         )
-        return "", ""
+        return BITPosture()
     try:
         data = json.loads(read.text)
     except json.JSONDecodeError as exc:
@@ -333,21 +409,36 @@ def read_bit_state(path: Path | None) -> tuple[str, str]:
             error=str(exc),
             error_type=exc.__class__.__name__,
         )
-        return "", ""
+        return BITPosture()
     runs = data.get("runs") if isinstance(data, dict) else None
     if not isinstance(runs, list) or not runs:
-        return "", ""
+        log.warning(
+            "kalle_digest.bit_state_no_runs",
+            path=str(path),
+            reason="not_a_list" if not isinstance(runs, list) else "empty",
+            runs_type=type(runs).__name__,
+            detail="BIT state file has no usable run history — posture renders 'no BIT data'",
+        )
+        return BITPosture()
     latest = runs[-1]
     if not isinstance(latest, dict):
-        return "", ""
-    status = str(latest.get("overall_status", "")).lower()
-    counts = latest.get("tool_counts") or {}
-    summary = ""
-    if isinstance(counts, dict) and counts:
-        summary = ", ".join(
-            f"{v} {k}" for k, v in sorted(counts.items()) if v
+        log.warning(
+            "kalle_digest.bit_state_malformed_run",
+            path=str(path),
+            latest_type=type(latest).__name__,
+            detail="latest BIT run is not an object — posture renders 'no BIT data'",
         )
-    return status, summary
+        return BITPosture()
+    status = str(latest.get("overall_status", "")).strip().lower()
+    raw_counts = latest.get("tool_counts")
+    counts = dict(raw_counts) if isinstance(raw_counts, dict) else {}
+    return BITPosture(
+        status=status,
+        summary=_summarise_counts(counts),
+        tool_counts=counts,
+        mode=str(latest.get("mode", "") or "").strip(),
+        present=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +458,7 @@ def gather_digest_data(
     bash_count, bash_cwds = read_bash_exec_log(bash_exec_log, today)
     executed, pending, retrying = read_instructor_state(instructor_state, today)
     commits = read_git_commits(repo_paths, today)
-    bit_status, bit_summary = read_bit_state(bit_state)
+    bit = read_bit_state(bit_state)
     return DigestData(
         bash_exec_count=bash_count,
         bash_exec_cwd_counts=bash_cwds,
@@ -375,8 +466,11 @@ def gather_digest_data(
         instructor_pending=pending,
         instructor_retrying=retrying,
         git_commits_by_repo=commits,
-        bit_overall_status=bit_status,
-        bit_summary_line=bit_summary,
+        bit_overall_status=bit.status,
+        bit_summary_line=bit.summary,
+        bit_tool_counts=bit.tool_counts,
+        bit_mode=bit.mode,
+        bit_present=bit.present,
     )
 
 
@@ -444,8 +538,47 @@ def _render_today_section(data: DigestData) -> str:
     return "\n".join(bullets)
 
 
+def _render_skip_posture(data: DigestData) -> str:
+    """Posture for an ``overall_status: skip`` BIT run.
+
+    ``skip`` is not an absence of data — it is KAL-LE's steady state.
+    ``Status.worst`` (alfred/health/types.py) ranks SKIP above OK, so an
+    instance where some tools have no config section rolls up to ``skip``
+    on every run even when every probe that DID run passed. Render what
+    actually happened.
+
+    Fail-honest: the aggregate says ``skip`` but the counts are the
+    ground truth, so a run carrying fails or warns never paints green.
+    """
+    counts = data.bit_tool_counts or {}
+    fails = _count(counts, "fail")
+    warns = _count(counts, "warn")
+    oks = _count(counts, "ok")
+    suffix = f" ({data.bit_mode} mode)" if data.bit_mode else ""
+
+    if fails:
+        phrase = data.bit_summary_line or "BIT FAIL recorded"
+        return f"**Posture:** red — {phrase}{suffix}."
+    if warns:
+        phrase = data.bit_summary_line or "BIT WARN recorded"
+        return f"**Posture:** yellow — {phrase}{suffix}."
+    if not oks:
+        # Nothing failed, but nothing passed either — say so rather than
+        # claiming checks passed on the strength of zero evidence.
+        if data.bit_summary_line:
+            return f"**Posture:** green — no probes ran; {data.bit_summary_line}{suffix}."
+        return f"**Posture:** green — BIT ran but recorded no tool results{suffix}."
+    return f"**Posture:** green — {data.bit_summary_line}{suffix}."
+
+
 def _render_posture_line(data: DigestData) -> str:
-    """One line — ``green / yellow / red`` + a short phrase."""
+    """One line — ``green / yellow / red`` + a short phrase.
+
+    The "no BIT data on this instance" copy is reserved for genuinely
+    absent data (``bit_present=False``). Any status we read but don't
+    recognise gets its own copy plus a warning, so a future BIT status
+    value can't silently regress the line into claiming no data.
+    """
     status = data.bit_overall_status
     if status == "fail":
         phrase = data.bit_summary_line or "BIT FAIL recorded"
@@ -456,10 +589,36 @@ def _render_posture_line(data: DigestData) -> str:
     if status == "ok":
         phrase = data.bit_summary_line or "all BIT checks passed"
         return f"**Posture:** green — {phrase}."
-    # No BIT data — typical for instances that don't run BIT (KAL-LE
-    # in v1 per the rollout ledger). Default to green so the absence
-    # of a BIT signal isn't misread as a problem.
-    return "**Posture:** green — no BIT data on this instance."
+    if status == "skip":
+        return _render_skip_posture(data)
+
+    detail = f" ({data.bit_summary_line})" if data.bit_summary_line else ""
+    if not status:
+        if data.bit_present:
+            # A run record exists but carries no overall_status — the BIT
+            # writer changed shape or the file was hand-edited.
+            log.warning(
+                "kalle_digest.posture_missing_bit_status",
+                summary=data.bit_summary_line,
+                tool_counts=dict(data.bit_tool_counts or {}),
+                detail="BIT run record carries no overall_status",
+            )
+            return f"**Posture:** yellow — BIT ran but recorded no status{detail}."
+        # No readable BIT run record — usually an instance that doesn't
+        # run BIT, but a degraded read lands here too (read_bit_state logs
+        # which). Green so the absence of a BIT signal isn't misread as a
+        # problem. Splitting a degraded-read copy off from the no-BIT copy
+        # is boarded separately.
+        return "**Posture:** green — no BIT data on this instance."
+
+    log.warning(
+        "kalle_digest.posture_unknown_bit_status",
+        status=status,
+        summary=data.bit_summary_line,
+        tool_counts=dict(data.bit_tool_counts or {}),
+        detail="BIT overall_status not in {ok, warn, fail, skip}",
+    )
+    return f"**Posture:** yellow — unknown BIT status {status!r}{detail}."
 
 
 def render_digest_markdown(data: DigestData) -> str:
@@ -503,9 +662,9 @@ def assemble_digest(
             kalle/data/`` in production). Holds bash_exec.jsonl and
             instructor_state.json.
         repo_paths: List of repos to scan for yesterday's commits.
-        bit_state_path: Optional BIT state file. When ``None`` (KAL-LE
-            v1 default), posture defaults to green with the "no BIT
-            data" note.
+        bit_state_path: Optional BIT state file. When ``None`` (an
+            instance that doesn't run BIT), posture defaults to green
+            with the "no BIT data" note.
 
     Returns:
         The one-slide markdown body. Caller wraps it in a
