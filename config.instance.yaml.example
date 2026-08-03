@@ -31,6 +31,11 @@
 #   ALFRED_KALLE_TRANSPORT_TOKEN   — shared secret for KAL-LE's inbound transport
 #   ALFRED_KALLE_PEER_TOKEN        — token Salem uses when reaching KAL-LE
 #   ALFRED_SALEM_PEER_TOKEN        — token KAL-LE uses when reaching Salem
+#   ALFRED_KALLE_HYPATIA_PEER_TOKEN — token Hypatia uses when reaching KAL-LE
+#   ALFRED_HYPATIA_PEER_TOKEN      — token KAL-LE uses when reaching Hypatia
+#     (the last two are the #30 recall edge. Every peer PAIR gets its own
+#      dedicated secret — never reuse one peer's token for another, since
+#      the authenticated peer key IS the asker's identity on /peer/recall.)
 #   ANTHROPIC_API_KEY              — same as Salem's; can split later
 #   GROQ_API_KEY                   — same as Salem's (STT)
 # Generate each token with: python -c 'import secrets; print(secrets.token_hex(32))'
@@ -88,11 +93,30 @@ transport:
       salem:
         token: "${ALFRED_KALLE_PEER_TOKEN}"
         allowed_clients: [salem]
+      # Hypatia's peer entry (#30 recall edge). Its OWN dedicated secret —
+      # never reuse `local`'s or Salem's token. Per-peer token uniqueness
+      # is what lets the answerer trust the authenticated peer key as the
+      # asker's identity rather than an asserted header.
+      hypatia:
+        token: "${ALFRED_KALLE_HYPATIA_PEER_TOKEN}"
+        allowed_clients: [hypatia]
   # Outbound peers — where KAL-LE can reach.
+  #
+  # PEER KEYS ARE THE WIRE NAMESPACE and are spelled canonically:
+  # `salem`, `kal-le`, `hypatia`, `vera`, `stay-c`. They are NOT vault
+  # scopes — Salem's peer key is `salem` but her scope is `talker`, and
+  # KAL-LE's peer key is `kal-le` while its scope is `kalle`. Do not
+  # "unify" the two. Keep the hyphenated canonical form here: a
+  # sender-local alias that diverges from it (e.g. writing `kalle`) still
+  # resolves since #30, but it defeats grep across instances and is a
+  # deploy-day cleanup when found.
   peers:
     salem:
       base_url: "http://127.0.0.1:8891"
       token: "${ALFRED_SALEM_PEER_TOKEN}"
+    hypatia:
+      base_url: "http://127.0.0.1:8896"
+      token: "${ALFRED_HYPATIA_PEER_TOKEN}"
   # Canonical — KAL-LE is NOT the owner (Salem holds canonical records).
   canonical:
     owner: false
@@ -101,6 +125,41 @@ transport:
   state:
     path: "/home/andrew/.alfred/kalle/data/transport_state.json"
     dead_letter_max_age_days: 30
+
+  # Cross-instance recall (#20 S1 answer side / S2 ask side; edges wired
+  # in #30). Two INDEPENDENT switches:
+  #   * `enabled` + `peers`  — whether this instance ANSWERS, and what it
+  #     will disclose to each asking peer. Absent = route not mounted
+  #     (/peer/recall → 404), answers nothing.
+  #   * `ask.peers`          — who this instance may ASK on a local miss.
+  #     Absent/empty = never asks, and the talker never even surfaces the
+  #     `recall_peers` tool to the model (fail-closed).
+  # Identity is the AUTHENTICATED transport peer (the `auth.tokens` key),
+  # never the asker's claim. A peer absent from `peers` is refused; the
+  # asker's `types` can only NARROW an allowlist, never widen it.
+  #
+  # STAY-C FENCE: naming `stay-c` (any spelling) here, or enabling recall
+  # on a STAY-C instance, FAILS LOUD at config load — both directions.
+  recall:
+    enabled: true
+    max_matches: 10
+    snippet_max_chars: 500
+    # ANSWER side — what KAL-LE discloses, per asking peer.
+    peers:
+      salem:
+        types: [decision, pattern, principle, note, session]
+      # KAL-LE↔Hypatia (#30). Hypatia reaches here for dev/architecture
+      # context its own library doesn't hold.
+      hypatia:
+        types: [decision, pattern, principle, note]
+    # ASK side — who KAL-LE asks on a local miss. Each name must also be
+    # a key under `transport.peers` above.
+    ask:
+      peers:
+        salem:
+          types: [person, project, task, decision, note]
+        hypatia:
+          types: [note, session]
 
 # ---------------------------------------------------------------------------
 # Instructor — enables natural-language self-improvement directives

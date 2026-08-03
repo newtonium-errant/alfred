@@ -109,6 +109,58 @@ def _base_raw_config(tool_set: str = "talker", instance_name: str = "Salem") -> 
     }
 
 
+# --- _resolve_recall_ask_enabled: direct pins ---------------------------------
+#
+# The audit's raw-dict resolver had NO direct coverage — only its consumer
+# (``_registered_tool_names``, pinned below) was tested, so the fail-closed
+# contract rested on an untested ``except Exception`` swallow. That matters
+# beyond tidiness: this is the resolver the STAY-C fence flows through on
+# the capability-audit path, so a silent True would report ``recall_peers``
+# as advertised on a categorically-fenced instance. Mirrors the three pins
+# its twin ``conversation._resolve_recall_ask_enabled_for_run_turn`` already
+# carries (tests/telegram/test_recall_peers_tool.py).
+
+
+def test_resolve_recall_ask_enabled_true_when_ask_peers_configured() -> None:
+    """A populated ``transport.recall.ask.peers`` surfaces the tool."""
+    raw = _base_raw_config()
+    raw["transport"] = {
+        "recall": {"ask": {"peers": {"kal-le": {"types": ["note"]}}}},
+    }
+    assert skill_audit._resolve_recall_ask_enabled(raw) is True
+
+
+def test_resolve_recall_ask_enabled_false_when_ask_peers_empty() -> None:
+    """Fail-closed: no ask edges means the tool is never advertised."""
+    raw = _base_raw_config()
+    raw["transport"] = {"recall": {"ask": {"peers": {}}}}
+    assert skill_audit._resolve_recall_ask_enabled(raw) is False
+
+    no_block = _base_raw_config()
+    assert skill_audit._resolve_recall_ask_enabled(no_block) is False
+
+
+def test_resolve_recall_ask_enabled_false_on_stayc_fence_raise() -> None:
+    """The STAY-C fence raises at load; the resolver must swallow to False.
+
+    A fenced instance surfaces NO recall tool, so the audit must not
+    report ``recall_peers`` as advertised for it. Pins the fail-closed
+    swallow that the ``except Exception`` branch implements.
+    """
+    raw = _base_raw_config()
+    raw["transport"] = {
+        "recall": {"ask": {"peers": {"stay-c": {"types": ["note"]}}}},
+    }
+    # Sanity: this config really does raise in the transport loader.
+    from alfred.transport.config import (
+        RecallConfigError, load_from_unified as load_transport,
+    )
+    with pytest.raises(RecallConfigError):
+        load_transport(raw)
+
+    assert skill_audit._resolve_recall_ask_enabled(raw) is False
+
+
 def test_registered_tool_names_threads_recall_ask_enabled() -> None:
     """#16 item 15: recall_ask_enabled must reach tools_for_set, or recall_peers is
     INVISIBLE to the capability audit (can't confirm it's advertised). Uses the REAL

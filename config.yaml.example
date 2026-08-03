@@ -488,6 +488,18 @@ transport:
   #         types: [person, project, task, decision, note]
   #       hypatia:
   #         types: [note]
+  #       # Salem→VERA (#30). VERA holds the RRTS ops/route/ticket record,
+  #       # which Salem's SKILL already advertises as a reach-on-miss. The
+  #       # `ticket` type is legitimate here: it carries
+  #       # `available_in_scopes={vera, vera_ops, kalle, vera_forwarder}` in
+  #       # vault/schema.py, and the answerer validates its allowlist via
+  #       # TYPE_REGISTRY.known_types(<its own scope>) — so a VERA answerer
+  #       # running under scope `vera` can disclose it without widening any
+  #       # allowlist. Requires VERA to grow its OWN `recall` block plus a
+  #       # dedicated inbound Salem peer token (per-peer token uniqueness —
+  #       # never reuse another peer's secret).
+  #       vera:
+  #         types: [ticket, task, note]
 
   # Salem-only: per-peer canonical record permissions (Phase A inter-
   # instance comms). Each peer gets a per-record-type field allowlist.
