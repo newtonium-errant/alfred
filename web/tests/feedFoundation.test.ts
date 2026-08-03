@@ -15,6 +15,7 @@ import {
   isDeckDealt,
   kindLabel,
   stampOpacity,
+  swipeActsFor,
   verdictForDrag,
 } from '../lib/algernon/feedConstants';
 import { coerceEvidenceValue, evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows, isEmailEvidence } from '../lib/algernon/feedEvidence';
@@ -207,6 +208,23 @@ describe('deck verbs', () => {
   it('returns null for an unmapped kind (park-only)', () => {
     expect(deckVerbsFor('weather')).toBeNull();
     expect(deckVerbsFor('email_tier')).not.toBeNull();
+  });
+});
+
+describe('swipeActsFor — no-op swipe springs back (#16 item 12)', () => {
+  it('an ACK-only kind reject is a NO-OP (email_urgent/pending → spring back)', () => {
+    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'reject')).toBe(false);
+    expect(swipeActsFor(deckVerbsFor('pending'), 'reject')).toBe(false);
+  });
+  it('a real reject acts (email_tier spam, slot rejectParks)', () => {
+    expect(swipeActsFor(deckVerbsFor('email_tier'), 'reject')).toBe(true);
+    expect(swipeActsFor(deckVerbsFor('slot_suggestion'), 'reject')).toBe(true); // rejectParks routes to park
+  });
+  it('affirm acts when the kind has an affirm; park always acts; null verdict never', () => {
+    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'affirm')).toBe(true); // ack
+    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'park')).toBe(true);
+    expect(swipeActsFor(null, 'affirm')).toBe(false);
+    expect(swipeActsFor(deckVerbsFor('email_tier'), null)).toBe(false);
   });
 });
 

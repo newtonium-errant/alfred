@@ -7,6 +7,7 @@ import {
   emailPriority,
   kindLabel,
   stampOpacity,
+  swipeActsFor,
   verdictForDrag,
 } from '../../lib/algernon/feedConstants';
 import { useDeck } from './useDeck';
@@ -52,6 +53,10 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
   useEffect(() => {
     const el = topRef.current;
     if (!el || !current || confirming || inputBlocked) return;
+    // The current card's verbs — so a swipe toward a NO-OP verdict (an ACK-only kind's
+    // left/reject, e.g. email_urgent) springs the card back instead of leaving it stuck
+    // half-dragged (there was no advance to unmount the stale transform).
+    const verbs = deckVerbsFor(current.kind);
     let sx = 0;
     let sy = 0;
     let dx = 0;
@@ -93,10 +98,15 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
       const verdict = verdictForDrag(dx, dy);
       dx = 0;
       dy = 0;
-      if (verdict === 'affirm') deck.affirm();
-      else if (verdict === 'reject') deck.reject();
-      else if (verdict === 'park') deck.park();
-      else resetVisual();
+      // Only fire a verb that actually acts; a no-op verdict (an ACK-only kind's reject,
+      // an affirm-less kind) springs back so the card isn't left stuck half-swiped.
+      if (verdict && swipeActsFor(verbs, verdict)) {
+        if (verdict === 'affirm') deck.affirm();
+        else if (verdict === 'reject') deck.reject();
+        else deck.park();
+      } else {
+        resetVisual();
+      }
     };
 
     el.addEventListener('pointerdown', onDown);

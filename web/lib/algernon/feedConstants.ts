@@ -33,6 +33,18 @@ export function verdictForDrag(dx: number, dy: number): Verdict {
   return null;
 }
 
+/**
+ * Whether a drag VERDICT actually maps to an action for these verbs — so the deck can
+ * SPRING BACK (resetVisual) on a no-op swipe instead of leaving the card stuck half-
+ * dragged. An ACK-only kind (reject: null, e.g. email_urgent) reject → false; an
+ * affirm-less kind affirm → false; park is always available. (#16 item 12.)
+ */
+export function swipeActsFor(verbs: DeckVerbs | null, verdict: Verdict): boolean {
+  if (verdict === 'affirm') return !!verbs?.affirm;
+  if (verdict === 'reject') return !!(verbs?.reject || verbs?.rejectParks);
+  return verdict === 'park';
+}
+
 /** Verdict-stamp opacity during a drag (0..1), mirroring the sketch's fade. */
 export function stampOpacity(distance: number): number {
   if (distance <= STAMP_FADE_START) return 0;
