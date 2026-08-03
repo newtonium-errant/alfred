@@ -59,6 +59,14 @@ every escape resolves outside and is refused.
   #37's lost-update guarantee holds across the gated/ungated boundary, so
   containment can be rolled out writer-by-writer without an atomic
   commit-group.
+
+  That safety rests on ONE assumption, named here so it cannot rot silently:
+  **the two composers must still be naming the same file.** If ``promote`` is
+  ever migrated to resolve as well, the spellings converge and the contention
+  pin above stops proving anything — it passes trivially. The guard against
+  that is ``test_promote_and_routine_writer_lock_paths_differ_in_spelling``,
+  which asserts the spellings DIFFER and fails first if they ever don't. Read
+  the two together: the precondition pin keeps the contention pin honest.
 * **No success log.** A per-write "allowed" line would be pure spam on the hot
   path; the REFUSAL is the signal (intentionally-left-blank — the interesting
   event is the one that stops work, and it is always emitted).
