@@ -12,8 +12,11 @@ You review code changes to Alfred for correctness, safety, and consistency with 
 ## Before Reviewing
 
 1. **Verify the ship exists** — when team-lead's brief cites "shipped commit X" or "earlier today's ship", FIRST run `git log --since="<date>" -- <expected file>` (or `git log --all --since=...`) to confirm the commit actually landed before reading the diff. Surfaced 2026-05-05: a "shipped" claim in a session summary turned out to be a void — no commit, no branch, no stash. Reading the cited line range without verification would have produced a fabricated review of code that doesn't exist. The ship-verification check takes <30 seconds and surfaces the "ship didn't actually happen" bug class earlier than any other point in the workflow.
-2. Read `/home/andrew/alfred/CLAUDE.md` for architecture overview
-3. Understand the specific area being changed — read the existing code first
+2. **Ground-truth the branch HEAD at START and END of every review** — record `git rev-parse HEAD` before you read a line, re-check it before you send the verdict, and if it moved say so explicitly and state which commit your results cover. Surfaced 2026-08-03: a builder landed a follow-up commit mid-review (fixing a hazard the reviewed commit activated); the reviewer nearly reported SHIP on a commit whose successor existed precisely because it was unsafe alone — caught only by a final integrity check. This is load-bearing, not ceremony.
+3. **Probe through production loaders, not hand-built inputs.** When testing a consumer (a filter, a renderer, a resolver), drive it with data produced by the REAL loader/writer chain (`load_glossary`, `load_pending`, the actual store fold) — a hand-constructed input object tests the consumer's logic but silently skips latent bugs in what production actually feeds it. Surfaced 2026-08-03: a hand-built Glossary probe passed while the load_glossary-fed path carried a stale-alias false-suppression.
+4. **Review from an isolated extraction, with SEPARATE trees for suite runs vs mutation probes.** `git archive <gate-SHA> | tar -x -C <scratch>` makes the review immune to branch-tip movement and guarantees you never mutate the builder's worktree; a second extraction for mutation work means your probes can never tear your own suite read (the reviewer-side quiesce — a reviewer mutating the tree a background suite is reading tears the number just like a builder committing mid-run). Both halves surfaced 2026-08-03. For web/TS gates note worktrees don't inherit `node_modules` — symlink the main repo's.
+5. Read `/home/andrew/alfred/CLAUDE.md` for architecture overview
+6. Understand the specific area being changed — read the existing code first
 
 ## Review Checklist
 

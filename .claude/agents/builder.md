@@ -17,6 +17,10 @@ Since the 2026-07-12 SovServ migration, all daemons, live vaults, and runtime st
 
 Related: the full-suite has a **hard node dependency** — prepend `/home/andrew/.local/share/fnm/node-versions/v24.14.1/installation/bin` to PATH before pytest, or `tests/test_scribe_pwa_client.py` throws ~41 false failures.
 
+**Announce commits to branches under active review.** If you push a follow-up commit onto a branch the reviewer is currently gating, say so immediately (one line to team-lead: new SHA + what it adds). Surfaced 2026-08-03: a branch moved mid-review with no announcement; the reviewer nearly issued a verdict on a superseded commit and caught it only in a final integrity check.
+
+**Quiesce during suite gates.** Never edit a worktree — commits OR uncommitted edits — while a reviewer's full-suite run is executing in it, and don't run a parallel suite of your own there. A torn read (files rewritten mid-run) produces phantom failures in exactly the rewritten files and voids the whole number. Same day, same branch: a commit landing 5½ minutes into a 6:47 run cost a full re-run. One runner, one fixed SHA, then resume.
+
 ## Before Writing Code
 
 1. Read the project CLAUDE.md at `/home/andrew/alfred/CLAUDE.md` — it has the architecture overview
@@ -131,7 +135,7 @@ After completing work, report using this format:
 
 If you completed work but couldn't commit (bash sandbox denial, etc.), say so explicitly — "WORK STAGED, commit blocked by <reason>; team-lead must commit from outside the worktree". Don't report "shipped" when commit didn't happen.
 
-**Test count audits.** When citing test counts in your report or commit message, recount via `pytest --collect-only -q <test_file>` (with the venv python + node on PATH) before claiming the number — NOT a grep. Grep patterns undercount two shapes: `async def test_` functions and top-level `def test_` in classless files (2026-08-03: `grep -c "^def test_"` reported 40→56 for a file that was actually 67→83 — the 27 async tests were invisible, and the correct delta masked the wrong baseline). Multiple instances of "claimed N, actual M" drift — minor in isolation but real if test counts track ship-quality across time.
+**Test count audits.** When citing test counts in your report or commit message, recount via `pytest --collect-only -q <test_file>` (with the venv python + node on PATH) before claiming the number — NOT a grep. Grep patterns undercount two shapes: `async def test_` functions and top-level `def test_` in classless files (2026-08-03: `grep -c "^def test_"` reported 40→56 for a file that was actually 67→83 — the 27 async tests were invisible, and the correct delta masked the wrong baseline). Multiple instances of "claimed N, actual M" drift — minor in isolation but real if test counts track ship-quality across time. **Always state the literal invocation alongside the figure** (`pytest tests/routine tests/test_daily_sync -q` etc.) — three counts in one session failed to reproduce until the selection was known; a number without its invocation isn't checkable. **The same rule covers mutation figures: state the substituted body alongside the red-count** ("replacing the sanitizer with `return String(value)` fails 8") — a reviewer's slightly-different mutation body legitimately produces a different count, and without the body the figures can't be reconciled (4th unreproducible count of 2026-08-03; direction was safe every time, but only the body proves that).
 
 ## Pattern Discovery
 
