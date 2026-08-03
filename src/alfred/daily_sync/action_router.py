@@ -81,6 +81,18 @@ UNDO_DONE_ACTION = "undo_done"
 ACCEPT_ACTION = "accept"
 SLOT_KIND = "slot_suggestion"
 
+# R3 board snooze. Imported from the tier layer so the duration ladder has ONE
+# definition — the ceiling above, this dispatch, and the store all read it.
+from alfred.tier.snooze import (  # noqa: E402
+    SNOOZE_DURATIONS as SNOOZE_ACTIONS,
+)
+from alfred.tier.snooze import (  # noqa: E402
+    UNSNOOZE_ACTION,
+)
+
+SNOOZE_ACTED_VERB = "snooze"
+STATUS_ALREADY_DONE = "already_done"
+
 # email_urgent (#27 slice 1) — the classify-time high-priority interrupt kind
 # (curator emits it per-item; distinct from the sync-time email_tier card). It is
 # MODE_DECIDE (deals into the deck + rings/needs-you) but its ONLY action is
@@ -126,10 +138,19 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # (done/undo_done) or :func:`_dispatch_slot_confirm` (accept) right after
     # this ceiling check, which call the per-lane writer directly against the
     # feed item's OWN stamped evidence (origin/routine_record/tier/item_text).
+    # snooze_* / unsnooze (R3): kwargs UNUSED, same as done/accept. Intercepted
+    # by :func:`_dispatch_slot_snooze`, which is a SEPARATE dispatcher from
+    # `_dispatch_slot_completion` on purpose — no completion writer is
+    # reachable from a snooze under any input, so "snooze never fakes a
+    # completion" is enforced structurally rather than by convention.
     "slot_suggestion": {
         "done": {},
         "undo_done": {},
         "accept": {},
+        "snooze_1d": {},
+        "snooze_3d": {},
+        "snooze_7d": {},
+        "unsnooze": {},
     },
     # email_urgent (#27 slice 1) — ack-only capability ceiling. Like slot's, the
     # kwargs are UNUSED: an ``email_urgent`` ack does NOT synthesize a
@@ -408,6 +429,124 @@ def _slot_lane(evidence: dict[str, Any]) -> str:
     if evidence.get("tier") == 3:
         return "tier"
     return "unsupported"
+
+
+def _snooze_store_path(config: Any) -> str | None:
+    """Resolve the board snooze store from the unified config, or ``None``.
+
+    Reads ``tier.snooze.path`` out of the instance's OWN config file, threaded
+    via ``config.config_path`` — the same single-source discipline as
+    :func:`reply_dispatch._routine_match_corpus_path`. The writer here and the
+    reader in ``compute_today_view`` MUST resolve to the same file; deriving
+    both from one config key is what stops them drifting.
+
+    ``None`` = not wired on this instance, and every snooze verb then refuses
+    honestly rather than accepting a tap it would silently drop.
+    """
+    config_path = getattr(config, "config_path", None) or "config.yaml"
+    try:
+        import yaml as _yaml
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f) or {}
+    except Exception as exc:  # noqa: BLE001
+        log.info("board.snooze.config_unavailable", error=str(exc))
+        return None
+    tier_section = raw.get("tier") if isinstance(raw, dict) else None
+    if not isinstance(tier_section, dict):
+        return None
+    snooze_section = tier_section.get("snooze")
+    if not isinstance(snooze_section, dict):
+        return None
+    return str(snooze_section.get("path") or "") or None
+
+
+def _dispatch_slot_snooze(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    config: Any,
+) -> ActResult:
+    """Apply a board ``snooze_*`` / ``unsnooze``.
+
+    DELIBERATELY SEPARATE from :func:`_dispatch_slot_completion`: this function
+    imports no completion writer and calls none, so a snooze cannot fake a
+    completion no matter what evidence arrives. It writes ONLY the sidecar
+    store — no vault mutation of any kind.
+    """
+    from alfred.tier.snooze import add_snooze, remove_snooze, slot_stable_key
+
+    evidence = dict(getattr(item, "evidence", None) or {})
+    store_path = _snooze_store_path(config)
+    if store_path is None:
+        log.info(
+            "board.snooze.not_configured", id=feed_item_id, action=action_id,
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "board snooze isn't configured on this instance",
+            feed_item_id, action_id,
+        )
+
+    # The feed id IS "<kind>:<stable_key>" by construction, so the key is the
+    # id's tail — no re-derivation from evidence, which could disagree.
+    key = feed_item_id.partition(":")[2]
+    if not key:
+        return ActResult(
+            False, STATUS_STALE_ITEM,
+            "this item is missing its identity — it'll resurface at the next sync",
+            feed_item_id, action_id,
+        )
+
+    if action_id == UNSNOOZE_ACTION:
+        removed = remove_snooze(store_path, key)
+        log.info(
+            "board.unsnooze", id=feed_item_id, key=key, removed=removed,
+        )
+        if not removed:
+            return ActResult(
+                True, STATUS_ALREADY_ACTED, "wasn't snoozed (no change)",
+                feed_item_id, action_id,
+            )
+        feed_store.set_state(feed_item_id, STATE_OPEN)
+        return ActResult(True, STATUS_ACTED, "un-snoozed", feed_item_id, action_id)
+
+    # Refuse a snooze on something already done — parking a finished item is
+    # meaningless, and accepting the tap silently would be the exact
+    # gesture-accepted-then-ignored failure this design rules out.
+    if bool(evidence.get("done")) or getattr(item, "acted_action", None) == DONE_ACTION:
+        log.info(
+            "board.snooze.refused_already_done", id=feed_item_id, action=action_id,
+        )
+        return ActResult(
+            False, STATUS_ALREADY_DONE,
+            "this item is already done — nothing to snooze",
+            feed_item_id, action_id,
+        )
+
+    days = SNOOZE_ACTIONS[action_id]
+    lane = _slot_lane(evidence)
+    entry = add_snooze(
+        store_path, key,
+        days=days,
+        today=_today_for(config),
+        lane=lane,
+        due_iso=str(evidence.get("due_iso") or ""),
+        duration_label=action_id.removeprefix("snooze_"),
+    )
+    # Verb-stamped so "what did I snooze?" is answerable and the FE has a place
+    # to hang an undo affordance (UI deferred).
+    feed_store.set_state(feed_item_id, STATE_ACTED, action=SNOOZE_ACTED_VERB)
+    log.info(
+        "board.snooze", id=feed_item_id, key=key, lane=lane, days=days,
+        until=entry.snoozed_until, overdue_at_snooze=entry.overdue_at_snooze,
+    )
+    return ActResult(
+        True, STATUS_ACTED, f"snoozed until {entry.snoozed_until}",
+        feed_item_id, action_id,
+    )
 
 
 def _dispatch_slot_completion(
@@ -996,6 +1135,14 @@ def _act_locked(
     # the talker uses (single writer per lane). Intercepts BEFORE
     # _load_batch_item because slot items have no last_batch entry.
     if kind == SLOT_KIND:
+        if action_id in SNOOZE_ACTIONS or action_id == UNSNOOZE_ACTION:
+            # Intercepted BEFORE the completion dispatcher. A snooze can never
+            # reach a completion writer — that is the structural guarantee, not
+            # a convention (see FEED_ACTIONS' slot_suggestion note).
+            return _dispatch_slot_snooze(
+                feed_item_id, action_id, item,
+                feed_store=feed_store, config=config,
+            )
         if action_id == ACCEPT_ACTION:
             # Board day-planning: commit an auto-surfaced candidate onto today's
             # tier list. A separate dispatcher (not the completion writers) —

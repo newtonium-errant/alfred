@@ -137,14 +137,17 @@ def event_feed_items(
 def _slot_stable_key(entry: Any) -> str:
     """Durable identity for a tier-lane entry, per the step-2 identity table:
     task → path (wikilink target); routine item → (record, text); free-text
-    T3 → item text. Origin-prefixed so the three spaces can't collide."""
-    origin = getattr(entry, "origin", "")
-    if origin == "routine_item" and entry.routine_record and entry.item_text:
-        return f"routine:{entry.routine_record}::{entry.item_text}"
-    if origin == "task" and entry.path:
-        return f"task:{entry.path}"
-    name = getattr(entry, "name", "") or ""
-    return f"text:{name}" if name else ""
+    T3 → item text. Origin-prefixed so the three spaces can't collide.
+
+    DELEGATES to ``alfred.tier.snooze.slot_stable_key``, the canonical
+    implementation. The board card's feed id and the snooze store's key MUST be
+    the same string — two copies of this logic would drift, and a drifted key
+    silently snoozes nothing (or the wrong row). Pinned by a test that drives
+    both names over the same entries.
+    """
+    from alfred.tier.snooze import slot_stable_key
+
+    return slot_stable_key(entry)
 
 
 def slot_suggestion_feed_items(
