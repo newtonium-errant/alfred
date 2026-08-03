@@ -48,6 +48,7 @@ from alfred.daily_sync.assembler import ReplyCorrection
 from alfred.daily_sync.corpus import append_correction
 from alfred.daily_sync.feed_producer import _FAMILIES, _as_dict
 from alfred.feed.model import MODE_FYI, STATE_ACKED, STATE_ACTED, STATE_OPEN, make_id
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 log = structlog.get_logger(__name__)
 
@@ -644,6 +645,50 @@ def _dispatch_slot_completion(
     )
 
 
+def _contained_record_path(
+    vault_path: Path,
+    rel: str,
+    *,
+    feed_item_id: str,
+    action_id: str,
+    lane: str,
+    writer: str,
+) -> "tuple[Path | None, ActResult | None]":
+    """Resolve an evidence-stamped ``rel`` inside the vault, or build the refusal.
+
+    Arc #18. ``evidence["path"]`` is producer-stamped, which the board writers
+    have historically treated as trusted. It is NOT safe to compose blind: for a
+    CURATED slot the producer builds that field by interpolating a string read
+    back out of the daily file (``tier.compute._curated_to_tier_entry`` does
+    ``path=f"routine/{record}.md"``), and that string is persisted from an
+    unsanitised LLM tool argument by ``tier.tier_confirm.confirm_slot_candidate``.
+    So a hostile ``routine_record`` reaches this composition through the vault,
+    without ever crossing the HTTP boundary (``/feed/act`` takes only
+    ``{id, action_id}``).
+
+    Returns ``(resolved_path, None)`` on success and ``(None, refusal)`` on an
+    escape — the caller returns the refusal verbatim. Fail-closed: NO write, the
+    feed item stays ``open``, and one named log fires so the refusal is grep-able
+    (the containment helper logs the path detail; this adds the board context).
+
+    Note the TASK lane does not use this: it hands ``(vault_path, rel)`` to
+    ``tier.task_completion.mark_task_done``, which composes internally and
+    therefore gates internally. One gate per composition site, never two.
+    """
+    try:
+        return resolve_in_vault(vault_path, rel, writer=writer), None
+    except VaultContainmentError:
+        log.warning(
+            "feed.act.slot.path_escape_denied",
+            id=feed_item_id, action=action_id, lane=lane, rel_path=rel,
+        )
+        return None, ActResult(
+            False, STATUS_ERROR,
+            "this item's record path is not inside the vault — refusing to write",
+            feed_item_id, action_id,
+        )
+
+
 def _slot_done(
     feed_item_id: str,
     action_id: str,
@@ -668,8 +713,14 @@ def _slot_done(
                 "routine item is missing its record path — it'll resurface at the next sync",
                 feed_item_id, action_id,
             )
+        record_path, refusal = _contained_record_path(
+            Path(vault_path), rel, feed_item_id=feed_item_id,
+            action_id=action_id, lane=lane, writer="feed.act.slot.done.routine",
+        )
+        if refusal is not None:
+            return refusal
         result = _completion.mark_routine_item_done(
-            Path(vault_path) / rel, item_text, today.isoformat(),
+            record_path, item_text, today.isoformat(),
         )
         if result.ok:
             feed_store.set_state(feed_item_id, STATE_ACTED, action=DONE_ACTION)
@@ -778,8 +829,14 @@ def _slot_undo(
                 "routine item is missing its record path — it'll resurface at the next sync",
                 feed_item_id, action_id,
             )
+        record_path, refusal = _contained_record_path(
+            Path(vault_path), rel, feed_item_id=feed_item_id,
+            action_id=action_id, lane=lane, writer="feed.act.slot.undone.routine",
+        )
+        if refusal is not None:
+            return refusal
         result = _completion.mark_routine_item_undone(
-            Path(vault_path) / rel, item_text, today.isoformat(),
+            record_path, item_text, today.isoformat(),
         )
         if result.ok:
             feed_store.set_state(feed_item_id, STATE_OPEN)
