@@ -18,13 +18,23 @@ from alfred.daily_sync.config import DailySyncConfig, RoutineMatchConfig
 from alfred.routine import match_calibration as mc
 
 
-def _cfg(pending_path: Path, *, enabled: bool = True) -> DailySyncConfig:
-    return DailySyncConfig(
-        enabled=True,
-        routine_match=RoutineMatchConfig(
-            enabled=enabled, pending_path=str(pending_path),
-        ),
+def _cfg(
+    pending_path: Path,
+    *,
+    enabled: bool = True,
+    corpus_path: Path | None = None,
+    max_age_days: int = mc.DEFAULT_PENDING_MAX_AGE_DAYS,
+    max_items: int = mc.DEFAULT_PENDING_MAX_ITEMS,
+) -> DailySyncConfig:
+    rm = RoutineMatchConfig(
+        enabled=enabled,
+        pending_path=str(pending_path),
+        pending_max_age_days=max_age_days,
+        pending_max_items=max_items,
     )
+    if corpus_path is not None:
+        rm.corpus_path = str(corpus_path)
+    return DailySyncConfig(enabled=True, routine_match=rm)
 
 
 def _seed_pending(p: Path, *entries: mc.PendingMatch) -> None:
@@ -197,14 +207,22 @@ def test_pending_path_derive_failure_logs_debug(monkeypatch) -> None:
             "daily_sync": {"enabled": True, "routine_match": {"enabled": True}},
         })
 
-    # Fell back to the dataclass default (the shared constant) — no crash.
+    # Fell back to the dataclass defaults (the shared constants) — no crash.
     assert cfg.routine_match.pending_path == mc.DEFAULT_PENDING_PATH
+    assert cfg.routine_match.corpus_path == mc.DEFAULT_CORPUS_PATH
+    assert cfg.routine_match.pending_max_age_days == mc.DEFAULT_PENDING_MAX_AGE_DAYS
+    assert cfg.routine_match.pending_max_items == mc.DEFAULT_PENDING_MAX_ITEMS
     matches = [
         c for c in cap
-        if c.get("event") == "daily_sync.routine_match.pending_path_derive_failed"
+        if c.get("event") == "daily_sync.routine_match.config_derive_failed"
     ]
     assert len(matches) == 1
     assert "boom" in matches[0]["error"]
+    # The event now covers the whole derived set, not just pending_path — the
+    # field list is part of the signal (renamed from pending_path_derive_failed).
+    assert set(matches[0]["fields"]) == {
+        "pending_path", "corpus_path", "pending_max_age_days", "pending_max_items",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +305,149 @@ def test_disabled_clears_holder(tmp_path: Path) -> None:
     # …then a disabled fire must clear it.
     rms.routine_match_section(_cfg(p, enabled=False), date(2026, 6, 28))
     assert rms.peek_last_batch_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Reject-suppression (screenshot round 2026-08-03) — the section must not
+# re-surface rows the operator already ruled on.
+# ---------------------------------------------------------------------------
+
+
+def _reject(query: str, item_text: str) -> mc.MatchCorpusEntry:
+    return mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT,
+        query_key=mc.query_key(query),
+        item_text=item_text,
+    )
+
+
+def test_rejected_row_is_not_re_surfaced(tmp_path: Path) -> None:
+    """THE SCREENSHOT BUG, end-to-end through the section.
+
+    "Clean hammer → Fully Clean House" was re-dealt every morning despite a
+    daily NO swipe: the reject wrote its corpus verdict (the matcher honoured
+    it) but the review surface read the append-only pending sink and never
+    consulted the corpus, so the card came back and the deck's
+    revival-after-acted resurrected it.
+
+    Mutation: revert the section to render ``pending`` instead of the filtered
+    list → this fails."""
+    p, corpus = tmp_path / "pending.jsonl", tmp_path / "corpus.jsonl"
+    _seed_pending(p, mc.PendingMatch(
+        query="Clean hammer", matched_to="Sundays",
+        record="Fully Clean House", confidence=0.33,
+        captured_at="2026-08-02T12:00:00+00:00", kind=mc.KIND_NO_MATCH,
+    ))
+    mc.append_corpus(corpus, _reject("Clean hammer", "Sundays"))
+
+    out = rms.routine_match_section(
+        _cfg(p, corpus_path=corpus), date(2026, 8, 3),
+    )
+    assert out is not None
+    assert "Clean hammer" not in out
+    # Falls through to the ILB sentinel — nothing to review is stated, not
+    # silently omitted.
+    assert "No low-confidence routine matches to review" in out
+
+
+def test_suppressed_rows_do_not_reach_the_deck(tmp_path: Path) -> None:
+    """The daemon feeds the deck from ``consume_last_batch``, so filtering in
+    the section has to empty the FEED batch too — otherwise the card keeps
+    being dealt even though the Daily Sync message stopped showing it."""
+    p, corpus = tmp_path / "pending.jsonl", tmp_path / "corpus.jsonl"
+    _seed_pending(p, mc.PendingMatch(
+        query="Clean hammer", matched_to="Sundays",
+        record="Fully Clean House", confidence=0.33,
+        captured_at="2026-08-02T12:00:00+00:00", kind=mc.KIND_NO_MATCH,
+    ))
+    mc.append_corpus(corpus, _reject("Clean hammer", "Sundays"))
+
+    rms.routine_match_section(_cfg(p, corpus_path=corpus), date(2026, 8, 3))
+    assert rms.consume_last_batch() == []
+
+
+def test_unresolved_row_still_surfaces_alongside_a_rejected_one(
+    tmp_path: Path,
+) -> None:
+    """The filter is surgical: only the ruled-on row drops out."""
+    p, corpus = tmp_path / "pending.jsonl", tmp_path / "corpus.jsonl"
+    _seed_pending(
+        p,
+        mc.PendingMatch(query="Clean hammer", matched_to="Sundays",
+                        record="Fully Clean House", confidence=0.33,
+                        captured_at="2026-08-02T12:00:00+00:00"),
+        mc.PendingMatch(query="walk doggo", matched_to="Walk dog",
+                        record="Daily", confidence=0.40,
+                        captured_at="2026-08-02T12:00:00+00:00"),
+    )
+    mc.append_corpus(corpus, _reject("Clean hammer", "Sundays"))
+
+    out = rms.routine_match_section(
+        _cfg(p, corpus_path=corpus), date(2026, 8, 3), start_index=1,
+    )
+    assert out is not None
+    assert out.startswith("## Routine match review (1 item)")
+    assert "walk doggo" in out
+    assert "Clean hammer" not in out
+
+
+def test_suppression_is_logged_with_its_reasons(tmp_path: Path) -> None:
+    """ILB (feedback_log_emission_test_pattern): a shrinking review list must be
+    explicable — "already ruled on" vs "the section broke" must be greppable.
+
+    Mutation: drop the ``pending_suppressed`` log → this fails."""
+    p, corpus = tmp_path / "pending.jsonl", tmp_path / "corpus.jsonl"
+    _seed_pending(
+        p,
+        mc.PendingMatch(query="Clean hammer", matched_to="Sundays",
+                        record="Fully Clean House", confidence=0.33,
+                        captured_at="2026-08-02T12:00:00+00:00"),
+        mc.PendingMatch(query="ancient", matched_to="Old thing",
+                        record="Daily", confidence=0.2,
+                        captured_at="2026-01-01T12:00:00+00:00"),
+    )
+    mc.append_corpus(corpus, _reject("Clean hammer", "Sundays"))
+
+    with structlog.testing.capture_logs() as cap:
+        rms.routine_match_section(
+            _cfg(p, corpus_path=corpus), date(2026, 8, 3),
+        )
+    matches = [c for c in cap if c.get("event") == "routine_match.pending_suppressed"]
+    assert len(matches) == 1
+    ev = matches[0]
+    assert ev["captured"] == 2
+    assert ev["surfaced"] == 0
+    assert ev["resolved"] == 1
+    assert ev["aged_out"] == 1
+    assert ev["corpus_path"] == str(corpus)
+
+
+def test_no_suppression_emits_no_suppression_log(tmp_path: Path) -> None:
+    """The quiet path stays quiet — the log fires on actual suppression, so it
+    stays a signal rather than daily noise."""
+    p = tmp_path / "pending.jsonl"
+    _seed_pending(p, mc.PendingMatch(
+        query="walk doggo", matched_to="Walk dog", record="Daily",
+        confidence=0.40, captured_at="2026-08-02T12:00:00+00:00",
+    ))
+    with structlog.testing.capture_logs() as cap:
+        rms.routine_match_section(
+            _cfg(p, corpus_path=tmp_path / "absent.jsonl"), date(2026, 8, 3),
+        )
+    assert [c for c in cap if c.get("event") == "routine_match.pending_suppressed"] == []
+
+
+def test_missing_corpus_file_surfaces_everything(tmp_path: Path) -> None:
+    """No corpus yet (fresh instance) → empty glossary → nothing suppressed.
+    The filter must never swallow the review list just because the operator
+    hasn't ruled on anything yet."""
+    p = tmp_path / "pending.jsonl"
+    _seed_pending(p, mc.PendingMatch(
+        query="walk doggo", matched_to="Walk dog", record="Daily",
+        confidence=0.40, captured_at="2026-08-02T12:00:00+00:00",
+    ))
+    out = rms.routine_match_section(
+        _cfg(p, corpus_path=tmp_path / "nope.jsonl"), date(2026, 8, 3),
+    )
+    assert out is not None
+    assert "walk doggo" in out

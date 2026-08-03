@@ -9,6 +9,7 @@ match path writes ONLY to the pending sink).
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -389,3 +390,183 @@ def test_no_match_capture_emits_captured_log(tmp_path: Path) -> None:
     assert len(captured) == 1
     assert captured[0]["candidate"] == "Feed the cat"
     assert captured[0]["query"] == "feed the birds"
+
+
+# ---------------------------------------------------------------------------
+# Review filter — the reject-suppression gap (screenshot round 2026-08-03)
+# ---------------------------------------------------------------------------
+#
+# The pending sink is append-only with no prune API, and the surfacing path
+# never consulted the corpus. So an operator reject wrote a verdict the MATCHER
+# honoured while the REVIEW CARD came back every morning forever (the deck's
+# revival-after-acted resurrected it each day). These pin the filter that
+# closes the read side.
+
+
+TODAY = date(2026, 8, 3)
+
+
+def _pending(
+    query: str = "Clean hammer",
+    matched_to: str = "Sundays",
+    *,
+    record: str = "Fully Clean House",
+    captured_at: str = "2026-08-02T12:00:00+00:00",
+    kind: str = mc.KIND_NO_MATCH,
+    confidence: float = 0.33,
+) -> mc.PendingMatch:
+    return mc.PendingMatch(
+        query=query, matched_to=matched_to, record=record,
+        confidence=confidence, captured_at=captured_at, kind=kind,
+    )
+
+
+def _glossary(*entries: mc.MatchCorpusEntry) -> mc.Glossary:
+    g = mc.Glossary(confirmed=set(), rejected=set(), aliases={})
+    for e in entries:
+        pair = (e.query_key, e.item_text)
+        if e.type == mc.CORPUS_REJECT:
+            g.rejected.add(pair)
+        elif e.type == mc.CORPUS_ALIAS:
+            g.aliases[e.query_key] = e.item_text
+            g.confirmed.add(pair)
+        else:
+            g.confirmed.add(pair)
+    return g
+
+
+def test_filter_keeps_unresolved_fresh_row() -> None:
+    kept, stats = mc.filter_pending_for_review(
+        [_pending()], _glossary(), today=TODAY,
+    )
+    assert len(kept) == 1
+    assert (stats.captured, stats.surfaced, stats.suppressed()) == (1, 1, 0)
+
+
+def test_filter_drops_row_the_operator_rejected() -> None:
+    """REGRESSION (2026-08-03): "Clean hammer → Fully Clean House" was re-dealt
+    daily despite a daily NO swipe. The reject reached the corpus; the surfacing
+    path just never read it.
+
+    Mutation: drop the ``glossary.verdict`` check → this fails."""
+    entry = _pending()
+    g = _glossary(mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT,
+        query_key=mc.query_key(entry.query),
+        item_text=entry.matched_to,
+    ))
+    kept, stats = mc.filter_pending_for_review([entry], g, today=TODAY)
+    assert kept == []
+    assert (stats.resolved, stats.surfaced) == (1, 0)
+
+
+def test_filter_drops_row_the_operator_confirmed() -> None:
+    entry = _pending(kind=mc.KIND_LOW_CONF)
+    g = _glossary(mc.MatchCorpusEntry(
+        type=mc.CORPUS_CONFIRM,
+        query_key=mc.query_key(entry.query),
+        item_text=entry.matched_to,
+    ))
+    kept, stats = mc.filter_pending_for_review([entry], g, today=TODAY)
+    assert kept == []
+    assert stats.resolved == 1
+
+
+def test_filter_drops_row_whose_query_was_aliased_elsewhere() -> None:
+    """An alias resolves the PHRASE, not just the pair. Once the operator has
+    said "Clean hammer means Tidy Shed", re-asking "did you mean Sundays?" for
+    the same phrase is the same groundhog — the pair never matched, so a
+    pair-only check would miss it.
+
+    Mutation: drop the ``alias_for`` check → this fails."""
+    entry = _pending(matched_to="Sundays")
+    g = _glossary(mc.MatchCorpusEntry(
+        type=mc.CORPUS_ALIAS,
+        query_key=mc.query_key("Clean hammer"),
+        item_text="Tidy Shed",
+    ))
+    kept, stats = mc.filter_pending_for_review([entry], g, today=TODAY)
+    assert kept == []
+    assert stats.resolved == 1
+
+
+def test_filter_retires_rows_older_than_max_age() -> None:
+    """The screenshot's row was a 3-week-old no_match at 0.33 confidence still
+    being asked about daily."""
+    old = _pending(captured_at="2026-07-06T12:00:00+00:00")  # 28 days back
+    kept, stats = mc.filter_pending_for_review(
+        [old], _glossary(), today=TODAY, max_age_days=21,
+    )
+    assert kept == []
+    assert (stats.aged_out, stats.surfaced) == (1, 0)
+
+
+def test_filter_age_boundary_is_inclusive_of_the_limit_day() -> None:
+    """Exactly max_age_days old still surfaces; one day older does not."""
+    at_limit = _pending(captured_at="2026-07-13T12:00:00+00:00")  # 21 days
+    past = _pending(captured_at="2026-07-12T12:00:00+00:00")      # 22 days
+    kept_at, _ = mc.filter_pending_for_review(
+        [at_limit], _glossary(), today=TODAY, max_age_days=21,
+    )
+    kept_past, _ = mc.filter_pending_for_review(
+        [past], _glossary(), today=TODAY, max_age_days=21,
+    )
+    assert len(kept_at) == 1
+    assert kept_past == []
+
+
+def test_filter_falls_back_to_completion_date_when_captured_at_absent() -> None:
+    entry = mc.PendingMatch(
+        query="q", matched_to="m", record="r", confidence=0.4,
+        completion_date="2026-07-01", captured_at="",
+    )
+    kept, stats = mc.filter_pending_for_review(
+        [entry], _glossary(), today=TODAY, max_age_days=21,
+    )
+    assert kept == []
+    assert stats.aged_out == 1
+
+
+def test_filter_fails_open_on_an_undateable_row() -> None:
+    """A row we can't date is KEPT — never silently retire something whose age
+    is unknown. Mutation: default the parse failure to "old" → this fails."""
+    entry = mc.PendingMatch(
+        query="q", matched_to="m", record="r", confidence=0.4,
+        completion_date="not-a-date", captured_at="garbage",
+    )
+    kept, stats = mc.filter_pending_for_review(
+        [entry], _glossary(), today=TODAY, max_age_days=1,
+    )
+    assert len(kept) == 1
+    assert stats.aged_out == 0
+
+
+def test_filter_caps_the_days_list_keeping_most_recent() -> None:
+    rows = [
+        _pending(query=f"q{i}", captured_at=f"2026-08-0{i}T12:00:00+00:00")
+        for i in range(1, 4)
+    ]
+    kept, stats = mc.filter_pending_for_review(
+        rows, _glossary(), today=TODAY, max_items=2,
+    )
+    assert [k.query for k in kept] == ["q2", "q3"]
+    assert (stats.capped, stats.surfaced) == (1, 2)
+
+
+def test_filter_stats_account_for_every_captured_row() -> None:
+    """surfaced + suppressed == captured, always — the ILB line has to add up."""
+    resolved = _pending(query="resolved")
+    aged = _pending(query="aged", captured_at="2026-01-01T12:00:00+00:00")
+    fresh_a, fresh_b = _pending(query="a"), _pending(query="b")
+    g = _glossary(mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT,
+        query_key=mc.query_key("resolved"),
+        item_text="Sundays",
+    ))
+    _, stats = mc.filter_pending_for_review(
+        [resolved, aged, fresh_a, fresh_b], g, today=TODAY, max_items=1,
+    )
+    assert stats.captured == 4
+    assert (stats.resolved, stats.aged_out, stats.capped) == (1, 1, 1)
+    assert stats.surfaced == 1
+    assert stats.surfaced + stats.suppressed() == stats.captured

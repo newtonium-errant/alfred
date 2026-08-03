@@ -40,6 +40,9 @@ import yaml
 
 from alfred.common.schedule import ScheduleConfig
 from alfred.routine.match_calibration import (
+    DEFAULT_CORPUS_PATH as _ROUTINE_MATCH_CORPUS_DEFAULT,
+    DEFAULT_PENDING_MAX_AGE_DAYS as _ROUTINE_MATCH_MAX_AGE_DEFAULT,
+    DEFAULT_PENDING_MAX_ITEMS as _ROUTINE_MATCH_MAX_ITEMS_DEFAULT,
     DEFAULT_PENDING_PATH as _ROUTINE_MATCH_PENDING_DEFAULT,
 )
 
@@ -211,6 +214,15 @@ class RoutineMatchConfig:
 
     enabled: bool = False
     pending_path: str = _ROUTINE_MATCH_PENDING_DEFAULT
+    # Same single-source contract as pending_path, for the three values the
+    # review filter needs (``match_calibration.filter_pending_for_review``).
+    # The corpus is what reply_dispatch WRITES operator verdicts to and what
+    # this section must READ to stop re-surfacing already-ruled-on rows — a
+    # drift between the two is exactly the bug the filter closes, so it is
+    # derived from the routine config rather than independently defaulted.
+    corpus_path: str = _ROUTINE_MATCH_CORPUS_DEFAULT
+    pending_max_age_days: int = _ROUTINE_MATCH_MAX_AGE_DEFAULT
+    pending_max_items: int = _ROUTINE_MATCH_MAX_ITEMS_DEFAULT
 
 
 @dataclass
@@ -387,14 +399,21 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
     # See ``RoutineMatchConfig`` for the full contract; mirrors the Phase-2b
     # corpus_path single-source (reply_dispatch reads the routine config).
     rm_section = section.get("routine_match") if isinstance(section, dict) else None
-    rm_explicit = isinstance(rm_section, dict) and "pending_path" in rm_section
-    if not rm_explicit:
+
+    def _rm_explicit(field_name: str) -> bool:
+        return isinstance(rm_section, dict) and field_name in rm_section
+
+    # Every field below follows the same single-source contract; an explicit
+    # ``daily_sync.routine_match.<field>`` still wins (intentional split).
+    _derived = ("pending_path", "corpus_path", "pending_max_age_days", "pending_max_items")
+    if not all(_rm_explicit(f) for f in _derived):
         try:
             from alfred.routine.config import load_from_unified as _load_routine
 
-            cfg.routine_match.pending_path = (
-                _load_routine(raw).match_calibration.pending_path
-            )
+            _mc = _load_routine(raw).match_calibration
+            for _field in _derived:
+                if not _rm_explicit(_field):
+                    setattr(cfg.routine_match, _field, getattr(_mc, _field))
         except Exception as exc:  # noqa: BLE001
             # Never let routine-config resolution break daily_sync load — keep
             # the dataclass default (the shared constant, which is also what the
@@ -403,7 +422,8 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
             # routine-config breakage would silently re-introduce the read/write
             # drift via the constant fallback — this makes that diagnosable.
             log.debug(
-                "daily_sync.routine_match.pending_path_derive_failed",
+                "daily_sync.routine_match.config_derive_failed",
+                fields=list(_derived),
                 error=str(exc),
             )
     # Synthetic ``_config_path`` key — set by the CLI in

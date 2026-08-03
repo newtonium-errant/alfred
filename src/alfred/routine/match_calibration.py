@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 import structlog
@@ -50,6 +51,14 @@ DEFAULT_NO_MATCH_FLOOR = 0.3
 # the matcher consults. Mutated ONLY by an operator reply through the Daily Sync
 # reply_dispatch; never by a match. Per-instance, mirrors the pending sink.
 DEFAULT_CORPUS_PATH = "./data/routine_match_corpus.salem.jsonl"
+# Review-surface bounds (see :func:`filter_pending_for_review`). The pending
+# sink is append-only and never pruned, so without these a captured row is
+# re-surfaced every single morning forever. ``MAX_AGE_DAYS`` retires a row the
+# operator has demonstrably chosen not to act on; ``MAX_ITEMS`` caps one day's
+# review list so a capture burst can't wall the feed. Both tunable per-instance
+# via the ``routine.match_calibration`` config block.
+DEFAULT_PENDING_MAX_AGE_DAYS = 21
+DEFAULT_PENDING_MAX_ITEMS = 10
 
 
 @dataclass
@@ -281,11 +290,117 @@ def load_glossary(path: str | Path) -> Glossary:
     return Glossary(confirmed=confirmed, rejected=rejected, aliases=aliases)
 
 
+@dataclass
+class PendingReviewStats:
+    """Why :func:`filter_pending_for_review` dropped what it dropped.
+
+    Carried out to the caller so the review surface can log an explicit
+    "captured N, surfaced M, suppressed K because …" line. Silent
+    suppression would make "the card finally stopped coming back" and
+    "the section broke" look identical (ILB).
+    """
+
+    captured: int = 0   # rows in the sink
+    resolved: int = 0   # already carry an operator verdict in the corpus
+    aged_out: int = 0   # older than max_age_days
+    capped: int = 0     # trimmed by max_items
+    surfaced: int = 0   # what the operator actually sees
+
+    def suppressed(self) -> int:
+        return self.resolved + self.aged_out + self.capped
+
+
+def _captured_date(entry: PendingMatch) -> date | None:
+    """Best-effort capture date for the age filter.
+
+    Prefers ``captured_at`` (ISO timestamp, possibly ``Z``-suffixed), falls
+    back to ``completion_date`` (plain ``YYYY-MM-DD``). Returns ``None`` when
+    neither parses — the caller then FAILS OPEN and keeps the row rather than
+    silently retiring something it couldn't date.
+    """
+    raw = (entry.captured_at or "").strip()
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+    raw = (entry.completion_date or "").strip()
+    if raw:
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            pass
+    return None
+
+
+def filter_pending_for_review(
+    pending: list[PendingMatch],
+    glossary: Glossary,
+    *,
+    today: date | None = None,
+    max_age_days: int = DEFAULT_PENDING_MAX_AGE_DAYS,
+    max_items: int = DEFAULT_PENDING_MAX_ITEMS,
+) -> tuple[list[PendingMatch], PendingReviewStats]:
+    """Narrow the append-only pending sink to what's worth reviewing today.
+
+    THE BUG THIS CLOSES: the sink is append-only and has no prune/resolve API,
+    and the surfacing path never consulted the corpus. So an operator reject
+    wrote its verdict (which the MATCHER honours — the false positive stops
+    recurring as a match) while the REVIEW CARD came back every morning
+    forever, and the feed's revival-after-acted resurrected it each time. The
+    operator read "reject = suppress" and was right about the matcher and
+    wrong about the card. Three drops, in order:
+
+    1. **Resolved** — the corpus already holds a verdict for this row. Either
+       a direct ``(query_key, matched_to)`` confirm/reject, OR an alias on the
+       query_key alone: once the operator has said "that phrase means X",
+       re-asking "did you mean Y?" for the same phrase is the groundhog even
+       though the pair never matched.
+    2. **Aged out** — captured more than ``max_age_days`` ago. A row that has
+       sat unreviewed that long is one the operator has decided not to answer;
+       asking again daily is nagging, not calibration. Undateable rows fail
+       OPEN (kept) — never silently retire what we couldn't date.
+    3. **Capped** — at most ``max_items``, most recent first, so a capture
+       burst can't wall the review surface.
+
+    Non-destructive by design: the sink is the capture record and stays
+    intact; the corpus stays the single source of truth for verdicts. That
+    also means this retroactively releases rows already stuck in the loop —
+    no migration, no rewrite of operator history.
+    """
+    today = today or date.today()
+    stats = PendingReviewStats(captured=len(pending))
+    kept: list[PendingMatch] = []
+
+    for entry in pending:
+        qkey = query_key(entry.query)
+        if glossary.verdict(qkey, entry.matched_to) is not None:
+            stats.resolved += 1
+            continue
+        if glossary.alias_for(qkey) is not None:
+            stats.resolved += 1
+            continue
+        captured = _captured_date(entry)
+        if captured is not None and (today - captured).days > max_age_days:
+            stats.aged_out += 1
+            continue
+        kept.append(entry)
+
+    if max_items >= 0 and len(kept) > max_items:
+        stats.capped = len(kept) - max_items
+        kept = kept[-max_items:] if max_items else []
+
+    stats.surfaced = len(kept)
+    return kept, stats
+
+
 __all__ = [
     "DEFAULT_PENDING_PATH",
     "DEFAULT_CONFIDENCE_THRESHOLD",
     "DEFAULT_NO_MATCH_FLOOR",
     "DEFAULT_CORPUS_PATH",
+    "DEFAULT_PENDING_MAX_AGE_DAYS",
+    "DEFAULT_PENDING_MAX_ITEMS",
     "KIND_LOW_CONF",
     "KIND_NO_MATCH",
     "CORPUS_CONFIRM",
@@ -294,8 +409,10 @@ __all__ = [
     "Glossary",
     "MatchCorpusEntry",
     "PendingMatch",
+    "PendingReviewStats",
     "append_corpus",
     "append_pending",
+    "filter_pending_for_review",
     "load_glossary",
     "load_pending",
     "query_key",

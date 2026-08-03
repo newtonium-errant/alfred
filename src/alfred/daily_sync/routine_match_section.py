@@ -26,7 +26,11 @@ from typing import Any
 
 import structlog
 
-from alfred.routine.match_calibration import load_pending
+from alfred.routine.match_calibration import (
+    filter_pending_for_review,
+    load_glossary,
+    load_pending,
+)
 
 from . import assembler
 from .config import DailySyncConfig
@@ -149,7 +153,34 @@ def routine_match_section(
         _LAST_BATCH_HOLDER["items"] = []
         return None
 
+    # Narrow the append-only sink to what's actually worth reviewing today:
+    # drop rows the operator already ruled on (the corpus is the verdict
+    # record), retire rows too old to be worth re-asking, cap the day's list.
+    # Without this the sink only ever grows, so a rejected suggestion came
+    # back every morning forever — the matcher honoured the reject while the
+    # review card ignored it. Filtering HERE fixes both surfaces at once: the
+    # daemon feeds the deck from this same batch (``consume_last_batch``).
     pending = load_pending(rm.pending_path)
+    glossary = load_glossary(rm.corpus_path)
+    surfaced, stats = filter_pending_for_review(
+        pending,
+        glossary,
+        today=today,
+        max_age_days=rm.pending_max_age_days,
+        max_items=rm.pending_max_items,
+    )
+    if stats.suppressed():
+        # ILB: a shrinking review list must be explicable — "ruled on already"
+        # has to be distinguishable from "the section broke".
+        log.info(
+            "routine_match.pending_suppressed",
+            captured=stats.captured,
+            surfaced=stats.surfaced,
+            resolved=stats.resolved,
+            aged_out=stats.aged_out,
+            capped=stats.capped,
+            corpus_path=rm.corpus_path,
+        )
     # Number the items GLOBALLY from the assembler's start_index so the reply
     # dispatcher can route "item N confirm" against the persisted batch.
     items = [
@@ -163,7 +194,7 @@ def routine_match_section(
             captured_at=p.captured_at,
             kind=p.kind,
         )
-        for i, p in enumerate(pending)
+        for i, p in enumerate(surfaced)
     ]
     _LAST_BATCH_HOLDER["items"] = items
 

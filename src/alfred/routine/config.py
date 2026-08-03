@@ -415,6 +415,13 @@ class MatchCalibrationConfig:
     # "did you mean…" suggestion when a completion matches nothing. Below it the
     # closest candidate is too unrelated to suggest (ILB "nothing close").
     no_match_floor: float = match_calibration.DEFAULT_NO_MATCH_FLOOR
+    # Review-surface bounds. The pending sink is append-only with no prune
+    # API, so the surfacing path filters against the corpus (already-ruled-on
+    # rows drop out) and retires rows older than ``pending_max_age_days``.
+    # ``pending_max_items`` caps one morning's list. See
+    # ``match_calibration.filter_pending_for_review``.
+    pending_max_age_days: int = match_calibration.DEFAULT_PENDING_MAX_AGE_DAYS
+    pending_max_items: int = match_calibration.DEFAULT_PENDING_MAX_ITEMS
 
 
 @dataclass
@@ -497,6 +504,18 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
         ),
         no_match_floor=float(
             mc_raw.get("no_match_floor", match_calibration.DEFAULT_NO_MATCH_FLOOR)
+        ),
+        pending_max_age_days=int(
+            mc_raw.get(
+                "pending_max_age_days",
+                match_calibration.DEFAULT_PENDING_MAX_AGE_DAYS,
+            )
+        ),
+        pending_max_items=int(
+            mc_raw.get(
+                "pending_max_items",
+                match_calibration.DEFAULT_PENDING_MAX_ITEMS,
+            )
         ),
     )
 
