@@ -193,3 +193,143 @@ def test_no_lost_update_concurrent_writers(tmp_path: Path) -> None:
     cl = frontmatter.load(str(record)).metadata["completion_log"]
     assert cl.get("A") == [date], "main's write (A) must survive"
     assert date in cl.get("B", []), "cmd_done(B) must preserve A — no lost update"
+
+
+# ---------------------------------------------------------------------------
+# #37 x #18 convergence — the lock survives MIXED PATH SPELLINGS
+# ---------------------------------------------------------------------------
+#
+# Arc #18 made the routine writers compose their target through
+# ``vault.paths.resolve_in_vault``, which returns a RESOLVED path.
+# ``tier.promote.append_promoted_item`` still composes the CONFIGURED spelling
+# (``Path(vault_path) / "routine" / f"{record}.md"``, promote.py:349). On the
+# box those strings DIFFER — /home/andrew/alfred is a symlink to
+# /data/algernon/alfred and the vault is configured via the symlink.
+#
+# The open question that gated this arc's merge: does that spelling split
+# de-serialize the sidecar and reopen the #37 lost-update race?
+#
+# It does not, and the reason is mechanical rather than incidental: ``flock``
+# locks the INODE (via the open file description), not the path string. Two
+# spellings that name the same file through a symlinked parent open the same
+# inode, so they contend correctly. These pins prove it through the REAL
+# ``file_rmw_lock`` rather than by argument, so the guarantee is checkable and
+# a future change that breaks it fails here.
+
+
+def _symlinked_vault(tmp_path: Path) -> tuple[Path, Path]:
+    """Return ``(configured, real)`` — a vault reached via a symlink, the
+    production topology. ``configured`` is what config.yaml would carry."""
+    real = tmp_path / "data" / "algernon" / "alfred" / "vault"
+    (real / "routine").mkdir(parents=True)
+    configured = tmp_path / "home_alfred_vault"
+    configured.symlink_to(real, target_is_directory=True)
+    return configured, real
+
+
+def test_promote_and_routine_writer_lock_paths_differ_in_spelling(tmp_path: Path) -> None:
+    """Precondition for the pin below. If these two ever converge, the
+    contention test stops proving anything and silently becomes a tautology."""
+    from alfred.vault.paths import resolve_in_vault
+
+    configured, _real = _symlinked_vault(tmp_path)
+    promote_target = Path(configured) / "routine" / "Chores.md"   # promote.py:349 verbatim
+    writer_target = resolve_in_vault(configured, "routine/Chores.md", writer="test")
+
+    assert str(promote_target) != str(writer_target), (
+        "the two composers must produce DIFFERENT strings for this pin to mean anything"
+    )
+    assert promote_target.with_suffix(".lock") != writer_target.with_suffix(".lock")
+
+
+def test_mixed_spellings_take_the_SAME_lock_no_37_regression(tmp_path: Path) -> None:
+    """The gating question, answered by measurement.
+
+    Holding ``file_rmw_lock`` via promote's CONFIGURED spelling must block a
+    contender using the #18 writers' RESOLVED spelling. If it did not, a
+    promote-append racing a routine write on the box would lost-update exactly
+    as it did before #37.
+    """
+    import fcntl
+
+    from alfred.vault.paths import resolve_in_vault
+
+    configured, _real = _symlinked_vault(tmp_path)
+    promote_target = Path(configured) / "routine" / "Chores.md"
+    writer_target = resolve_in_vault(configured, "routine/Chores.md", writer="test")
+
+    with file_rmw_lock(promote_target):
+        # Same sidecar name the migrated writers' file_rmw_lock would open.
+        contender_lock = writer_target.with_suffix(".lock")
+        held_lock = promote_target.with_suffix(".lock")
+        assert contender_lock.stat().st_ino == held_lock.stat().st_ino, (
+            "different inodes would mean genuinely different locks"
+        )
+
+        fd = open(contender_lock, "a", encoding="utf-8")
+        try:
+            with contextlib.suppress(BlockingIOError):
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                raise AssertionError(
+                    "resolved spelling acquired the lock while the configured "
+                    "spelling held it — the sidecars de-serialized and #37's "
+                    "lost-update race is reopen"
+                )
+        finally:
+            fd.close()
+
+
+def test_no_lost_update_across_mixed_spellings(tmp_path: Path) -> None:
+    """The gold-standard form of the same guarantee: two writers, two
+    spellings, one record — both changes must survive.
+
+    Mirrors the two-writer test above it, but the worker locks via the RESOLVED
+    spelling while main holds the CONFIGURED one.
+    """
+    configured, real = _symlinked_vault(tmp_path)
+    record = real / "routine" / "Chores.md"
+    record.write_text(
+        "---\ntype: routine\nname: Chores\n"
+        "items:\n- text: A\n  priority: tracked\ncompletion_log: {}\n---\n\n# Chores\n",
+        encoding="utf-8",
+    )
+
+    from alfred.vault.paths import resolve_in_vault
+
+    resolved = resolve_in_vault(configured, "routine/Chores.md", writer="test")
+    done: list[str] = []
+
+    def _worker() -> None:
+        # Locks via the RESOLVED spelling (what the #18 writers now compose).
+        with file_rmw_lock(resolved):
+            post = frontmatter.load(str(record))
+            fm = dict(post.metadata or {})
+            cl = dict(fm.get("completion_log") or {})
+            cl["B"] = ["2026-07-25"]
+            fm["completion_log"] = cl
+            fm_yaml = yaml.dump(fm, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            record.write_text(f"---\n{fm_yaml}---\n\n{post.content}\n", encoding="utf-8")
+            done.append("B")
+
+    # Main holds via the CONFIGURED spelling (what promote composes).
+    with file_rmw_lock(Path(configured) / "routine" / "Chores.md"):
+        post = frontmatter.load(str(record))
+        fm = dict(post.metadata or {})
+        stale = dict(fm.get("completion_log") or {})
+        stale["A"] = ["2026-07-25"]
+
+        t = threading.Thread(target=_worker)
+        t.start()
+        time.sleep(0.3)  # an unlocked worker would write B here and get clobbered
+
+        fm["completion_log"] = stale
+        fm_yaml = yaml.dump(fm, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        record.write_text(f"---\n{fm_yaml}---\n\n{post.content}\n", encoding="utf-8")
+
+    t.join(timeout=5)
+    assert not t.is_alive(), "worker did not complete"
+    assert done == ["B"]
+
+    cl = frontmatter.load(str(record)).metadata["completion_log"]
+    assert cl.get("A") == ["2026-07-25"], "main's write (A) must survive"
+    assert "B" in cl, "worker's write (B) must preserve A — no lost update across spellings"
