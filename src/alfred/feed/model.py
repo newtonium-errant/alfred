@@ -31,6 +31,55 @@ STATE_ACTED = "acted"
 STATE_ACKED = "acked"
 STATE_EXPIRED = "expired"
 
+# --- snapshot kinds: per-kind revival policy ---------------------------------
+#
+# Most kinds are EPISODE-shaped: the producer emits an item when a condition
+# starts and stops emitting it when the condition ends, so the same key
+# reappearing genuinely means "this happened again" and reviving a decided item
+# is correct (a tool that goes ok → warn → ok → warn should re-surface).
+#
+# SNAPSHOT kinds are different: the producer re-emits the same open set every
+# fire because it is describing a standing state, not an event. ``event`` is
+# the case that bit us — an appointment on the 10th keeps the id
+# ``event:2026-08-10|Dentist`` every single morning until it passes, so the
+# reconcile upsert revived it the day after each ack and the operator was asked
+# to acknowledge the same appointment daily. Operator ruling (2026-08-03):
+# events surface when FIRST ADDED and when their CONTENT CHANGES (a moved
+# time); an ack sticks otherwise.
+#
+# The fingerprint is the content the operator would want re-surfaced. Fields
+# already inside the stable key are included so the fingerprint stands alone if
+# a key function ever changes. Adding a kind here is a DELIBERATE semantic
+# change — it makes acks stick across re-emission — so it does not happen by
+# default; see the module docstring note on peer_digest.
+SNAPSHOT_FINGERPRINT_FIELDS: dict[str, tuple[str, ...]] = {
+    "event": ("date_iso", "name", "rec_type", "time_display"),
+}
+
+
+def snapshot_fingerprint(kind: str, evidence: dict[str, Any] | None) -> str | None:
+    """Content fingerprint for a snapshot kind, or ``None``.
+
+    ``None`` means "no opinion — use episode semantics", and is returned for
+    every non-snapshot kind AND for a snapshot item whose evidence carries none
+    of the fingerprint fields. That second case is the read-belt for items
+    written before this policy existed (and for malformed evidence): an item we
+    cannot fingerprint falls back to the PRE-EXISTING behaviour (revive) rather
+    than being silently suppressed forever on the strength of a guess.
+    """
+    fields = SNAPSHOT_FINGERPRINT_FIELDS.get(kind)
+    if fields is None:
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    parts = [str(evidence.get(f, "") or "") for f in fields]
+    if not any(parts):
+        return None
+    # Unit separator — cannot appear in the field values, so ("a", "b|c") and
+    # ("a|b", "c") can't collide into the same fingerprint.
+    return "\x1f".join(parts)
+
+
 # Every kind the feed can carry (step-2 contract + brief peer_digest). Kept as a
 # frozenset so producers/tests can assert membership without importing the dict.
 KINDS: frozenset[str] = frozenset({

@@ -26,11 +26,54 @@ import structlog
 
 from alfred.common.file_lock import file_rmw_lock
 
-from .model import STATE_ACTED, STATE_OPEN, FeedItem, _now_iso
+from .model import (
+    STATE_ACKED,
+    STATE_ACTED,
+    STATE_OPEN,
+    FeedItem,
+    _now_iso,
+    snapshot_fingerprint,
+)
 
 log = structlog.get_logger(__name__)
 
 DEFAULT_COMPACT_THRESHOLD_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+
+def _revival_suppressed(
+    kind: str, incoming: FeedItem, stored: FeedItem | None,
+) -> bool:
+    """Should this reconcile upsert be SKIPPED to keep a decision sticky?
+
+    Reconcile normally upserts every incoming item at ``state=open``, which
+    REVIVES a stored item the operator already decided. For episode-shaped
+    kinds that is correct and deliberate: a health check that goes ok → warn
+    again is genuinely new news. For SNAPSHOT kinds it is the groundhog bug —
+    the producer re-emits the same standing item every fire, so an acked
+    appointment came back the next morning, and the next, forever.
+
+    Suppress only when ALL of:
+      * the item is stored and already decided (``acted`` / ``acked``) —
+        an open item is not being revived, and ``expired`` keeps its existing
+        behaviour rather than acquiring a new one here;
+      * the kind is a snapshot kind (see ``SNAPSHOT_FINGERPRINT_FIELDS``);
+      * both fingerprints are computable AND equal — content is unchanged, so
+        there is nothing new to tell the operator.
+
+    Any other shape returns False and the pre-existing revive happens. That is
+    the read-belt: an item written before this policy (or with evidence we
+    can't fingerprint) behaves exactly as it does today rather than being
+    silently suppressed forever on the strength of a guess.
+    """
+    if stored is None or stored.state not in (STATE_ACTED, STATE_ACKED):
+        return False
+    fp_incoming = snapshot_fingerprint(kind, incoming.evidence)
+    if fp_incoming is None:
+        return False
+    fp_stored = snapshot_fingerprint(kind, stored.evidence)
+    if fp_stored is None:
+        return False
+    return fp_incoming == fp_stored
 
 
 class FeedStore:
@@ -222,10 +265,16 @@ class FeedStore:
             absent = previously_open - incoming_ids
 
             ts = _now_iso()
-            events: list[dict[str, Any]] = [
-                {"ev": "upsert", "ts": ts, "item": self._episode_merged_payload(item, current)}
-                for item in open_items
-            ]
+            events: list[dict[str, Any]] = []
+            suppressed = 0
+            for item in open_items:
+                if _revival_suppressed(kind, item, current.get(item.id)):
+                    suppressed += 1
+                    continue
+                events.append(
+                    {"ev": "upsert", "ts": ts,
+                     "item": self._episode_merged_payload(item, current)}
+                )
             events.extend(
                 {"ev": "state", "ts": ts, "id": item_id, "state": STATE_ACTED}
                 for item_id in sorted(absent)
@@ -233,4 +282,8 @@ class FeedStore:
             self._append_lines_locked(events)
             self._maybe_compact_locked()
 
-        return {"open": len(open_items), "acted": len(absent)}
+        return {
+            "open": len(open_items),
+            "acted": len(absent),
+            "suppressed": suppressed,
+        }

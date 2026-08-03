@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from alfred.common.file_lock import file_rmw_lock
-from alfred.feed.model import STATE_ACTED, STATE_OPEN, FeedItem
+from alfred.feed.model import STATE_ACKED, STATE_ACTED, STATE_OPEN, FeedItem
 from alfred.feed.store import FeedStore
 
 
@@ -162,12 +162,12 @@ def test_reconcile_upserts_and_marks_absent_acted(tmp_path: Path) -> None:
     s = _store(tmp_path)
     # Fire 1: two proposals open.
     counts1 = s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
-    assert counts1 == {"open": 2, "acted": 0}
+    assert counts1 == {"open": 2, "acted": 0, "suppressed": 0}
     assert {i for i, it in s.load().items() if it.state == STATE_OPEN} == {"proposal:c1", "proposal:c2"}
 
     # Fire 2: c1 still open, c2 gone (decided elsewhere) → c2 becomes acted.
     counts2 = s.reconcile("proposal", [_item("proposal", "c1")])
-    assert counts2 == {"open": 1, "acted": 1}
+    assert counts2 == {"open": 1, "acted": 1, "suppressed": 0}
     folded = s.load()
     assert folded["proposal:c1"].state == STATE_OPEN
     assert folded["proposal:c2"].state == STATE_ACTED
@@ -233,7 +233,7 @@ def test_reconcile_idempotent_rerun(tmp_path: Path) -> None:
     s.reconcile("routine_match", open_set)
     first = {i: it.state for i, it in s.load().items()}
     counts = s.reconcile("routine_match", open_set)  # same set again
-    assert counts == {"open": 2, "acted": 0}
+    assert counts == {"open": 2, "acted": 0, "suppressed": 0}
     assert {i: it.state for i, it in s.load().items()} == first  # folded state unchanged
 
 
@@ -301,3 +301,124 @@ def test_no_lost_update_append_racing_compaction(tmp_path: Path) -> None:
     folded = s.load()
     assert "proposal:A" in folded, "A (main's compaction) must survive"
     assert "proposal:B" in folded, "B (concurrent upsert) must survive — no lost update"
+
+
+# --- per-kind revival policy: the event ack groundhog -------------------------
+#
+# Operator screenshot 2026-08-03: the awareness feed re-demanded ACK on the same
+# appointment cards every morning. ``event`` ids are stable across days by
+# design (``event:<event date>|<name>``), so the daily producer re-emitted the
+# same open set and reconcile's upsert revived every acked card. Operator
+# ruling: events surface when FIRST ADDED and when their CONTENT CHANGES; an
+# ack sticks otherwise.
+
+
+def _event(key: str, *, time_display: str = "09:00", name: str = "Dentist") -> FeedItem:
+    return FeedItem.create(
+        kind="event", stable_key=key, instance="salem",
+        title=f"2026-08-10: {name}",
+        evidence={
+            "date_iso": "2026-08-10", "name": name,
+            "rec_type": "event", "time_display": time_display,
+        },
+    )
+
+
+def test_acked_event_is_not_revived_by_the_next_snapshot(tmp_path: Path) -> None:
+    """THE GROUNDHOG PIN. Mutation: drop the ``_revival_suppressed`` check in
+    reconcile → this fails."""
+    s = _store(tmp_path)
+    key = "2026-08-10|Dentist"
+    s.reconcile("event", [_event(key)])
+    s.set_state(f"event:{key}", STATE_ACKED)
+
+    counts = s.reconcile("event", [_event(key)])  # tomorrow's identical snapshot
+
+    assert s.load()[f"event:{key}"].state == STATE_ACKED  # ack STUCK
+    assert counts["suppressed"] == 1
+    assert counts["open"] == 1  # the producer still emitted it
+
+
+def test_acked_event_revives_when_its_time_moves(tmp_path: Path) -> None:
+    """Content change IS news — a moved appointment must come back."""
+    s = _store(tmp_path)
+    key = "2026-08-10|Dentist"
+    s.reconcile("event", [_event(key, time_display="09:00")])
+    s.set_state(f"event:{key}", STATE_ACKED)
+
+    counts = s.reconcile("event", [_event(key, time_display="14:30")])
+
+    assert s.load()[f"event:{key}"].state == STATE_OPEN  # revived
+    assert counts["suppressed"] == 0
+
+
+def test_acted_event_is_also_kept_sticky(tmp_path: Path) -> None:
+    """``acted`` and ``acked`` are both decisions — neither should be undone by
+    an unchanged re-emission."""
+    s = _store(tmp_path)
+    key = "2026-08-10|Dentist"
+    s.reconcile("event", [_event(key)])
+    s.set_state(f"event:{key}", STATE_ACTED)
+    s.reconcile("event", [_event(key)])
+    assert s.load()[f"event:{key}"].state == STATE_ACTED
+
+
+def test_open_event_still_refreshes_normally(tmp_path: Path) -> None:
+    """The policy only guards DECIDED items — an open item still gets its
+    evidence/title refreshed every fire."""
+    s = _store(tmp_path)
+    key = "2026-08-10|Dentist"
+    s.reconcile("event", [_event(key, time_display="09:00")])
+    counts = s.reconcile("event", [_event(key, time_display="14:30")])
+    assert counts["suppressed"] == 0
+    assert s.load()[f"event:{key}"].evidence["time_display"] == "14:30"
+
+
+def test_health_keeps_episode_revival(tmp_path: Path) -> None:
+    """REGRESSION GUARD: health is episode-shaped — a warn that returns after
+    being acted IS new news and must still revive. Mutation: add "health" to
+    SNAPSHOT_FINGERPRINT_FIELDS → this fails."""
+    s = _store(tmp_path)
+    item = FeedItem.create(
+        kind="health", stable_key="surveyor", instance="salem",
+        title="Health: surveyor WARN",
+        evidence={"tool": "surveyor", "status": "warn", "detail": "ollama 404"},
+    )
+    s.reconcile("health", [item])
+    s.set_state("health:surveyor", STATE_ACTED)
+
+    counts = s.reconcile("health", [item])  # same warn recurs
+
+    assert s.load()["health:surveyor"].state == STATE_OPEN  # revived, as before
+    assert counts["suppressed"] == 0
+
+
+def test_absent_event_still_goes_acted(tmp_path: Path) -> None:
+    """absent→acted reconcile is UNCHANGED by the policy: an appointment that
+    drops out of the window still closes."""
+    s = _store(tmp_path)
+    s.reconcile("event", [_event("2026-08-10|Dentist"), _event("2026-08-11|Vet")])
+    counts = s.reconcile("event", [_event("2026-08-10|Dentist")])
+    assert counts["acted"] == 1
+    assert s.load()["event:2026-08-11|Vet"].state == STATE_ACTED
+
+
+def test_prechange_event_without_evidence_still_revives(tmp_path: Path) -> None:
+    """READ-BELT: an item stored before this policy (or with evidence we can't
+    fingerprint) keeps TODAY'S behaviour — revive — rather than being silently
+    suppressed forever on a guess.
+
+    Mutation: treat an unfingerprintable stored item as "matching" → this
+    fails."""
+    s = _store(tmp_path)
+    key = "2026-08-10|Dentist"
+    # Stored with no evidence at all — the pre-policy shape.
+    s.reconcile("event", [FeedItem.create(
+        kind="event", stable_key=key, instance="salem", title="old", evidence={},
+    )])
+    s.set_state(f"event:{key}", STATE_ACKED)
+
+    counts = s.reconcile("event", [_event(key)])
+
+    assert s.load()[f"event:{key}"].state == STATE_OPEN
+    assert counts["suppressed"] == 0
