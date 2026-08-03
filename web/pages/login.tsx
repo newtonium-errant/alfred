@@ -80,6 +80,9 @@ export default function LoginPage() {
   const [code, setCode] = useState('');
   const [otpBusy, setOtpBusy] = useState(false);
   const [otpError, setOtpError] = useState<string | null>(null);
+  // Set only when the sign-in COMMITTED but the post-login navigation failed —
+  // the state that must never be rendered as a verify error (see handleOtpVerify).
+  const [otpSignedIn, setOtpSignedIn] = useState(false);
 
   const callbackError = callbackErrorMessage(router.query.error);
 
@@ -124,12 +127,26 @@ export default function LoginPage() {
     setOtpBusy(true);
     try {
       await authApi.otpVerify(email.trim(), code.trim());
-      // Cookie was set server-side on the response we just received — the
-      // session lives in THIS context's jar. Client-guard the deep-link
-      // (mirrors auth/callback's safeNextPath re-guard) and go.
-      await router.replace(safeNextPath(nextParam));
     } catch (err) {
       setOtpError(otpErrorMessage(err, 'verify'));
+      setOtpBusy(false);
+      return;
+    }
+    // PAST THIS POINT THE SIGN-IN HAS COMMITTED: the one-time code is burned
+    // server-side and the cookie was set on the response we just received — the
+    // session lives in THIS context's jar. So the navigation must sit OUTSIDE
+    // the verify try. It used to be inside, which meant any failure here was
+    // reported as "that code is incorrect or has expired" about a login that had
+    // already SUCCEEDED — and because the code was spent, every retry drew the
+    // uniform 401, leaving the operator no move but to request a fresh code.
+    // Client-guard the deep-link (mirrors auth/callback's safeNextPath re-guard).
+    try {
+      await router.replace(safeNextPath(nextParam));
+    } catch {
+      // Signed in, but we couldn't route. Say the true thing and offer a plain
+      // anchor — a real navigation that needs neither the router nor another
+      // code (intentionally-left-blank: never fail silently on a success).
+      setOtpSignedIn(true);
       setOtpBusy(false);
     }
   }
@@ -246,6 +263,22 @@ export default function LoginPage() {
                     </Button>
                   </form>
                 </>
+              ) : otpSignedIn ? (
+                // The sign-in worked; only the routing didn't. A plain anchor is
+                // the escape hatch — no router, no fresh code, no re-verify of a
+                // code that has already been spent.
+                <div data-testid="otp-signed-in">
+                  <p className="mt-3 text-honeydew-600">
+                    You’re signed in. Continue to the app.
+                  </p>
+                  <a
+                    href={safeNextPath(nextParam)}
+                    data-testid="otp-continue"
+                    className="mt-4 inline-block text-sm font-semibold text-honeydew-700 underline"
+                  >
+                    Continue →
+                  </a>
+                </div>
               ) : (
                 <div data-testid="otp-code-stage">
                   <p className="mt-3 text-honeydew-600">
@@ -296,6 +329,9 @@ export default function LoginPage() {
                 </p>
               )}
 
+              {/* Hidden once signed in — offering another sign-in method to
+                  someone who already has a session is a false affordance. */}
+              {!otpSignedIn && (
               <button
                 type="button"
                 data-testid="link-toggle"
@@ -308,6 +344,7 @@ export default function LoginPage() {
               >
                 Use an emailed sign-in link instead
               </button>
+              )}
             </>
           )}
         </Card>

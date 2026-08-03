@@ -229,3 +229,169 @@ describe('POST /api/auth/otp/verify', () => {
     expect(mockSendTransportError).toHaveBeenCalledWith(res, 'auth/otp/verify', boom);
   });
 });
+
+// --- BFF OTP observability -------------------------------------------------
+// The 2026-07-27 / 2026-08-03 first-attempt sign-in failures left ZERO BFF
+// evidence: the transport logged `web.auth.otp_verify_ok` both times while these
+// two routes said nothing on ANY path, so there was no way to tell a BFF that
+// returned {ok:true} (browser lost the response) from a BFF that collapsed the
+// upstream 200 into its uniform 401. These pins keep every path — the happy one
+// included — greppable, and keep the redaction contract intact. Per the
+// log-emission discipline: the test drives the production code path, not the
+// logger in isolation (authLog.test.ts covers the logger itself).
+
+describe('OTP route observability', () => {
+  function captureLogs() {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    return {
+      lines: () =>
+        [...log.mock.calls, ...warn.mock.calls].map((c) => String(c[0])),
+      warnLines: () => warn.mock.calls.map((c) => String(c[0])),
+    };
+  }
+
+  const okBackend = {
+    status: 200,
+    body: { session_token: 'TOK.SIG', name: 'andrew', role: 'owner', exp: 4102444800 },
+  };
+
+  it('logs the SUCCESS path — the line whose absence made the incident undiagnosable', async () => {
+    mockCallTransport.mockResolvedValue(okBackend);
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), res);
+
+    const hits = cap.lines().filter((l) => l.includes('[bff:auth/otp/verify]'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain('outcome=ok');
+    expect(hits[0]).toContain('upstream=200');
+    expect(hits[0]).toContain('status_class=2xx');
+    expect(hits[0]).toContain('cookie_set=true');
+  });
+
+  it('logs a genuine upstream rejection with its status class', async () => {
+    mockCallTransport.mockResolvedValue({ status: 401, body: { error: 'invalid_or_expired' } });
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), res);
+
+    const hits = cap.lines().filter((l) => l.includes('[bff:auth/otp/verify]'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain('outcome=rejected');
+    expect(hits[0]).toContain('upstream=401');
+    expect(hits[0]).toContain('cookie_set=false');
+  });
+
+  it('WARNS on the 200-without-token collapse — and still answers the uniform 401', async () => {
+    // The evidence-destroying branch: upstream ACCEPTED the code (so it is burned)
+    // but sent no usable token. It must be distinguishable in the JOURNAL while
+    // staying byte-identical to an ordinary rejection ON THE WIRE — a distinct
+    // status would tell a caller their code was correct (no-oracle).
+    mockCallTransport.mockResolvedValue({ status: 200, body: { name: 'andrew' } });
+    const cap = captureLogs();
+    const { res, status, json, setHeader } = mockRes();
+    await verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), res);
+
+    const warns = cap.warnLines().filter((l) => l.includes('[bff:auth/otp/verify]'));
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain('outcome=upstream_ok_no_token');
+    expect(warns[0]).toContain('upstream=200');
+
+    // The wire shape is UNCHANGED — same status, same body, no cookie.
+    expect(status).toHaveBeenCalledWith(401);
+    expect(json).toHaveBeenCalledWith({ ok: false, error: 'invalid_or_expired' });
+    expect(setHeader).not.toHaveBeenCalled();
+  });
+
+  it('logs a relay failure as transport_error (commit state unknowable from here)', async () => {
+    mockCallTransport.mockRejectedValue(new TypeError('fetch failed'));
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), res);
+
+    const warns = cap.warnLines().filter((l) => l.includes('[bff:auth/otp/verify]'));
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain('outcome=transport_error');
+    expect(warns[0]).toContain('error_name=TypeError');
+  });
+
+  it('logs an edge rejection that never reached the transport', async () => {
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await verifyHandler(postReq({ email: 'andrew@example.com', code: 'abcdef' }), res);
+
+    const hits = cap.lines().filter((l) => l.includes('[bff:auth/otp/verify]'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain('outcome=bad_request');
+    expect(hits[0]).toContain('upstream=none');
+    expect(mockCallTransport).not.toHaveBeenCalled();
+  });
+
+  it('logs the issuance half so a verify always has a matching request', async () => {
+    mockCallTransport.mockResolvedValue({ status: 200, body: { status: 'sent' } });
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await requestHandler(postReq({ email: 'andrew@example.com' }), res);
+
+    const hits = cap.lines().filter((l) => l.includes('[bff:auth/otp/request]'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain('outcome=sent');
+    expect(hits[0]).toContain('upstream=200');
+  });
+
+  it('logs a rejected issuance with the relayed error code', async () => {
+    mockCallTransport.mockResolvedValue({ status: 429, body: { error: 'rate_limited' } });
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await requestHandler(postReq({ email: 'andrew@example.com' }), res);
+
+    const hits = cap.lines().filter((l) => l.includes('[bff:auth/otp/request]'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain('outcome=rejected');
+    expect(hits[0]).toContain('upstream=429');
+    expect(hits[0]).toContain('error=rate_limited');
+  });
+
+  // THE REDACTION PIN. Drives every logging path on both routes and asserts the
+  // three forbidden secrets never appear. Security-load-bearing: adding a field
+  // to a log line must not be able to leak the passcode, the session token, or
+  // an operator's address into the journal.
+  it('never logs the passcode, the session token, or a full email — any path', async () => {
+    const cap = captureLogs();
+    const cases: Array<() => Promise<unknown>> = [
+      async () => {
+        mockCallTransport.mockResolvedValue(okBackend);
+        return verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), mockRes().res);
+      },
+      async () => {
+        mockCallTransport.mockResolvedValue({ status: 401, body: { error: 'invalid_or_expired' } });
+        return verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), mockRes().res);
+      },
+      async () => {
+        mockCallTransport.mockResolvedValue({ status: 200, body: { name: 'andrew' } });
+        return verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), mockRes().res);
+      },
+      async () => {
+        mockCallTransport.mockResolvedValue({ status: 404, body: { error: 'otp_disabled' } });
+        return verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), mockRes().res);
+      },
+      async () => {
+        mockCallTransport.mockRejectedValue(new Error('boom'));
+        return verifyHandler(postReq({ email: 'andrew@example.com', code: '123456' }), mockRes().res);
+      },
+      async () => {
+        mockCallTransport.mockResolvedValue({ status: 200, body: { status: 'sent' } });
+        return requestHandler(postReq({ email: 'andrew@example.com' }), mockRes().res);
+      },
+    ];
+    for (const run of cases) await run();
+
+    const all = cap.lines().join('\n');
+    expect(all).not.toContain('123456'); // the passcode
+    expect(all).not.toContain('TOK.SIG'); // the session token
+    expect(all).not.toContain('andrew@example.com'); // the full address
+    // The domain IS emitted — the correlation handle the redaction deliberately keeps.
+    expect(all).toContain('email_domain=example.com');
+  });
+});

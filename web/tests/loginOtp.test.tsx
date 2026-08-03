@@ -129,6 +129,86 @@ describe('LoginPage — sign in with a code (OTP)', () => {
     expect(screen.queryByTestId('otp-code-input')).toBeNull();
   });
 
+  // MUTATION PIN — the first-attempt-failure defect. `router.replace` used to sit
+  // INSIDE the verify try, so a navigation failure was rendered as "that code is
+  // incorrect or has expired" about a sign-in that had ALREADY COMMITTED: the
+  // one-time code was burned server-side (transport logged otp_verify_ok), so
+  // every retry drew the uniform 401 and the operator's only move was to request
+  // a fresh code — the exact reported symptom. Moving the navigation back inside
+  // the try re-fails this test.
+  it('does NOT report a bad code when the sign-in succeeded and only the redirect failed', async () => {
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockResolvedValue({ ok: true });
+    replaceMock.mockRejectedValue(new Error('Route Cancelled'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    // The signed-in state, NOT an error. A burned code must never be described
+    // to the operator as an invalid one.
+    await screen.findByTestId('otp-signed-in');
+    expect(screen.queryByTestId('otp-error')).toBeNull();
+    // And no affordance that would send them back for another code.
+    expect(screen.queryByTestId('otp-code-input')).toBeNull();
+    expect(screen.queryByTestId('otp-resend')).toBeNull();
+    expect(screen.queryByTestId('link-toggle')).toBeNull();
+  });
+
+  it('offers a plain anchor to the guarded deep-link when the redirect failed', async () => {
+    routerQuery.current = { next: '/chat?instance=hypatia' };
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockResolvedValue({ ok: true });
+    replaceMock.mockRejectedValue(new Error('Route Cancelled'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    const cont = await screen.findByTestId('otp-continue');
+    // A real navigation that needs neither the router nor a fresh code.
+    expect(cont.getAttribute('href')).toBe('/chat?instance=hypatia');
+  });
+
+  it('guards the fallback anchor through safeNextPath too (no open redirect)', async () => {
+    routerQuery.current = { next: 'https://evil.com' };
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockResolvedValue({ ok: true });
+    replaceMock.mockRejectedValue(new Error('Route Cancelled'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    const cont = await screen.findByTestId('otp-continue');
+    expect(cont.getAttribute('href')).toBe('/');
+  });
+
+  it('a REAL verify rejection still shows the error and never the signed-in state', async () => {
+    // The other side of the pin: the fix must not swallow genuine failures.
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(401, 'invalid_or_expired'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    const err = await screen.findByTestId('otp-error');
+    expect(err.textContent).toContain('incorrect or has expired');
+    expect(screen.queryByTestId('otp-signed-in')).toBeNull();
+    expect(replaceMock).not.toHaveBeenCalled();
+    // Still able to retry / request another code.
+    expect(screen.getByTestId('otp-resend')).not.toBeNull();
+  });
+
   it('can switch back to the magic-link form', async () => {
     const user = userEvent.setup();
     render(<LoginPage />);
