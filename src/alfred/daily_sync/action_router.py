@@ -338,6 +338,15 @@ def _dispatch(
         if err is not None:
             return err, ""
         verb = "confirmed" if correction.ok else "rejected"
+        # Report the WRITE, not the intent — same shape as attribution and
+        # proposal above. The resolver has no idempotent no-op path today (it
+        # returns did_write=True on every successful append), so this reads
+        # identically in production right now; wiring it means a future no-op
+        # branch can't silently show the operator a cheerful "rejected" over a
+        # write that never landed. That failure mode is invisible from the
+        # deck, which is exactly how a broken suppression loop survives weeks.
+        if not did_write:
+            return None, f"routine match already {verb} (no change)"
         return None, f"routine match {verb}"
 
     if kind == "pending":

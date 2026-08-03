@@ -215,10 +215,19 @@ def append_corpus(path: str | Path, entry: MatchCorpusEntry) -> None:
 class Glossary:
     """The matcher-facing view of the corpus — consulted in ``_matches_item``.
 
-    Built by :func:`load_glossary`. Last-write-wins per ``(query_key,
-    item_text)`` pair, so a later operator action overrides an earlier one
-    (e.g. confirm after a mistaken reject). ``aliases`` maps a query_key to the
-    item it was confirmed to alias (Phase 3) — also last-write-wins.
+    Built by :func:`load_glossary`.
+
+    **Conflict rule: LATER-VERDICT-WINS, per ``(query_key, item_text)`` pair.**
+    Replaying the append-only log in order, a later operator action overrides
+    an earlier one for that pair — confirm after a mistaken reject, or reject
+    after a mistaken confirm/alias. :meth:`verdict` additionally checks
+    ``rejected`` first, so an explicit exclusion wins even if a load bug ever
+    left a pair in both sets (belt-and-braces, not the primary mechanism).
+
+    A reject ALSO retracts an alias pointing at the rejected item — see
+    :func:`load_glossary`. An alias is a claim about the phrase ("clean hammer
+    means Fully Clean House"); rejecting that exact pair withdraws the claim.
+    A reject of a DIFFERENT item leaves the alias standing.
     """
 
     confirmed: set[tuple[str, str]]   # (query_key, item_text) → fast-path True
@@ -281,6 +290,17 @@ def load_glossary(path: str | Path) -> Glossary:
         elif entry.type == CORPUS_REJECT:
             confirmed.discard(pair)
             rejected.add(pair)
+            # Retract an alias pointing at the item just rejected. An alias is
+            # a claim about the PHRASE ("clean hammer means Fully Clean
+            # House"); rejecting that exact pair withdraws it. Without this,
+            # the alias outlives the reject: Salem's real corpus holds a
+            # 2026-07-31 alias followed by three rejects of the same pair, and
+            # ``alias_for`` still returned the aliased item. ``verdict`` was
+            # already correct (reject), so the MATCHER never mis-fired — but a
+            # stale alias silently resolves OTHER captures of the same phrase.
+            # A reject of a DIFFERENT item leaves the alias standing.
+            if aliases.get(entry.query_key) == entry.item_text:
+                del aliases[entry.query_key]
         elif entry.type == CORPUS_ALIAS:
             # An alias is also a promotion (the phrasing should now match the
             # aliased item) — record both the alias map and the confirmed pair.

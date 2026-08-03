@@ -510,6 +510,70 @@ def test_routine_match_reject_writes_reject_row(tmp_path: Path, monkeypatch: pyt
     assert rows[0]["type"] == mc.CORPUS_REJECT
 
 
+def test_routine_match_verdict_log_carries_the_resolved_corpus_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ILB: the verdict log must name the file it wrote to.
+
+    Without it, "the reject didn't write" and "the reject wrote to a file I
+    wasn't looking at" are indistinguishable from the log — a distinction that
+    cost a full diagnosis cycle on 2026-08-03. query_key is logged too because
+    append_corpus normalises the query (lowercase), so a case-sensitive grep
+    for the raw phrase misses the row.
+
+    Mutation: drop corpus_path= from the event → this fails."""
+    from alfred.routine import match_calibration as mc
+
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    corpus = tmp_path / "routine_match_corpus.jsonl"
+    monkeypatch.setattr(rd, "_routine_match_corpus_path", lambda *a, **kw: str(corpus))
+
+    item = _routine_match_item(1, query="Clean hammer", matched_to="Fully Clean House")
+    fid = _publish(store, "routine_match", item)
+    _seed_batch(cfg, routine_match_items=[item])
+
+    with structlog.testing.capture_logs() as cap:
+        _call(store, cfg, fid, "reject")
+
+    events = [c for c in cap if c.get("event") == "daily_sync.routine_match.verdict_recorded"]
+    assert len(events) == 1
+    assert events[0]["corpus_path"] == str(corpus)
+    assert events[0]["verdict"] == "reject"
+    assert events[0]["query_key"] == mc.query_key("Clean hammer")
+
+
+def test_routine_match_no_op_write_is_reported_as_no_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The router must report the WRITE, not the intent.
+
+    The resolver has no idempotent no-op branch today, so this is a latent
+    defect rather than a live one — but a cheerful "routine match rejected"
+    over a write that never landed is invisible from the deck, which is
+    exactly how a broken suppression loop survives for weeks. Mirrors the
+    attribution/proposal "already X (no change)" shape.
+
+    Mutation: return the unconditional success string → this fails."""
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    monkeypatch.setattr(
+        rd, "_routine_match_corpus_path", lambda *a, **kw: str(tmp_path / "c.jsonl"),
+    )
+    monkeypatch.setattr(
+        rd, "_resolve_routine_match_correction", lambda *a, **kw: (None, False),
+    )
+
+    item = _routine_match_item(1, query="walk doggo", matched_to="Walk dog")
+    fid = _publish(store, "routine_match", item)
+    _seed_batch(cfg, routine_match_items=[item])
+
+    result = _call(store, cfg, fid, "reject")
+
+    assert result.ok and result.status == STATUS_ACTED
+    assert result.detail == "routine match already rejected (no change)"
+
+
 # ---------------------------------------------------------------------------
 # pending — real local queue resolution
 # ---------------------------------------------------------------------------

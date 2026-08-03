@@ -408,9 +408,9 @@ TODAY = date(2026, 8, 3)
 
 def _pending(
     query: str = "Clean hammer",
-    matched_to: str = "Sundays",
+    matched_to: str = "Fully Clean House",
     *,
-    record: str = "Fully Clean House",
+    record: str = "Sundays",
     captured_at: str = "2026-08-02T12:00:00+00:00",
     kind: str = mc.KIND_NO_MATCH,
     confidence: float = 0.33,
@@ -474,12 +474,12 @@ def test_filter_drops_row_the_operator_confirmed() -> None:
 
 def test_filter_drops_row_whose_query_was_aliased_elsewhere() -> None:
     """An alias resolves the PHRASE, not just the pair. Once the operator has
-    said "Clean hammer means Tidy Shed", re-asking "did you mean Sundays?" for
-    the same phrase is the same groundhog — the pair never matched, so a
-    pair-only check would miss it.
+    said "Clean hammer means Tidy Shed", re-asking "did you mean Fully Clean
+    House?" for the same phrase is the same groundhog — the pair never
+    matched, so a pair-only check would miss it.
 
     Mutation: drop the ``alias_for`` check → this fails."""
-    entry = _pending(matched_to="Sundays")
+    entry = _pending(matched_to="Fully Clean House")
     g = _glossary(mc.MatchCorpusEntry(
         type=mc.CORPUS_ALIAS,
         query_key=mc.query_key("Clean hammer"),
@@ -561,7 +561,7 @@ def test_filter_stats_account_for_every_captured_row() -> None:
     g = _glossary(mc.MatchCorpusEntry(
         type=mc.CORPUS_REJECT,
         query_key=mc.query_key("resolved"),
-        item_text="Sundays",
+        item_text="Fully Clean House",
     ))
     _, stats = mc.filter_pending_for_review(
         [resolved, aged, fresh_a, fresh_b], g, today=TODAY, max_items=1,
@@ -570,3 +570,114 @@ def test_filter_stats_account_for_every_captured_row() -> None:
     assert (stats.resolved, stats.aged_out, stats.capped) == (1, 1, 1)
     assert stats.surfaced == 1
     assert stats.surfaced + stats.suppressed() == stats.captured
+
+
+# ---------------------------------------------------------------------------
+# Conflict rule — alias then rejects on the SAME pair (Salem's real corpus)
+# ---------------------------------------------------------------------------
+#
+# Salem's live corpus for "clean hammer" holds, in order: a 2026-07-31
+# match_alias {query_key "clean hammer", item_text "Fully Clean House",
+# record "Sundays"} — a first-contact-day right-swipe recorded before verb
+# stamping existed, contrary to the operator's stated intent — then
+# match_reject rows on 08-01/02/03 for the SAME pair. These pin what that
+# sequence resolves to.
+
+REAL_QKEY = "clean hammer"
+REAL_ITEM = "Fully Clean House"
+
+
+def _alias_then_rejects(path: Path) -> None:
+    """Salem's real row order: one alias, then three rejects of the same pair."""
+    mc.append_corpus(path, mc.MatchCorpusEntry(
+        type=mc.CORPUS_ALIAS, query_key=REAL_QKEY, item_text=REAL_ITEM,
+        record="Sundays", action_at="2026-07-31T15:00:00+00:00",
+    ))
+    for day in ("01", "02", "03"):
+        mc.append_corpus(path, mc.MatchCorpusEntry(
+            type=mc.CORPUS_REJECT, query_key=REAL_QKEY, item_text=REAL_ITEM,
+            record="Sundays", action_at=f"2026-08-{day}T15:00:00+00:00",
+        ))
+
+
+def test_later_reject_beats_earlier_alias(tmp_path: Path) -> None:
+    """CONFLICT RULE: later-verdict-wins per (query_key, item_text).
+
+    The operator's alias was a mis-swipe; the three rejects that followed are
+    the real intent. If the alias could win, the matcher would auto-match a
+    future "clean hammer" to "Fully Clean House" — a false-positive WRITE
+    against a routine record."""
+    corpus = tmp_path / "corpus.jsonl"
+    _alias_then_rejects(corpus)
+    g = mc.load_glossary(corpus)
+    assert g.verdict(REAL_QKEY, REAL_ITEM) == "reject"
+    assert (REAL_QKEY, REAL_ITEM) not in g.confirmed
+    assert (REAL_QKEY, REAL_ITEM) in g.rejected
+
+
+def test_reject_retracts_the_alias_it_contradicts(tmp_path: Path) -> None:
+    """A reject withdraws an alias pointing at the rejected item.
+
+    ``verdict`` was always correct here, so the MATCHER never mis-fired. But
+    the alias map outlived the reject, and ``alias_for`` is consulted by the
+    review filter — a stale alias would silently resolve OTHER captures of the
+    same phrase the operator never ruled on.
+
+    Mutation: drop the ``del aliases[...]`` line → this fails."""
+    corpus = tmp_path / "corpus.jsonl"
+    _alias_then_rejects(corpus)
+    g = mc.load_glossary(corpus)
+    assert g.alias_for(REAL_QKEY) is None
+
+
+def test_reject_of_another_item_leaves_the_alias_standing(tmp_path: Path) -> None:
+    """The retraction is surgical: rejecting a DIFFERENT pair for the same
+    phrase does not withdraw an alias to some other item."""
+    corpus = tmp_path / "corpus.jsonl"
+    mc.append_corpus(corpus, mc.MatchCorpusEntry(
+        type=mc.CORPUS_ALIAS, query_key=REAL_QKEY, item_text="Tidy Shed",
+    ))
+    mc.append_corpus(corpus, mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT, query_key=REAL_QKEY, item_text=REAL_ITEM,
+    ))
+    g = mc.load_glossary(corpus)
+    assert g.alias_for(REAL_QKEY) == "Tidy Shed"
+    assert g.verdict(REAL_QKEY, REAL_ITEM) == "reject"
+
+
+def test_later_alias_beats_earlier_reject(tmp_path: Path) -> None:
+    """Later-verdict-wins runs both directions — a re-alias after a reject
+    restores the pair (the operator changed their mind back)."""
+    corpus = tmp_path / "corpus.jsonl"
+    mc.append_corpus(corpus, mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT, query_key=REAL_QKEY, item_text=REAL_ITEM,
+    ))
+    mc.append_corpus(corpus, mc.MatchCorpusEntry(
+        type=mc.CORPUS_ALIAS, query_key=REAL_QKEY, item_text=REAL_ITEM,
+    ))
+    g = mc.load_glossary(corpus)
+    assert g.verdict(REAL_QKEY, REAL_ITEM) == "confirm"
+    assert g.alias_for(REAL_QKEY) == REAL_ITEM
+
+
+def test_filter_suppresses_on_the_real_alias_then_rejects_shape(
+    tmp_path: Path,
+) -> None:
+    """END-TO-END on Salem's actual row shape: the pending row for
+    "Clean hammer" must drop out of the review list given the real corpus
+    (alias 07-31, rejects 08-01/02/03), with the REAL field orientation
+    (matched_to "Fully Clean House", record "Sundays")."""
+    corpus = tmp_path / "corpus.jsonl"
+    _alias_then_rejects(corpus)
+    entry = mc.PendingMatch(
+        query="Clean hammer", matched_to="Fully Clean House", record="Sundays",
+        confidence=0.33, captured_at="2026-07-16T12:00:00+00:00",
+        kind=mc.KIND_NO_MATCH,
+    )
+    kept, stats = mc.filter_pending_for_review(
+        [entry], mc.load_glossary(corpus), today=date(2026, 8, 4),
+        max_age_days=90,  # isolate the resolved path from the age path
+    )
+    assert kept == []
+    assert stats.resolved == 1
+    assert stats.aged_out == 0

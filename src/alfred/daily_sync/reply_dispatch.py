@@ -850,6 +850,12 @@ def _resolve_routine_match_correction(
         kind=kind,
         query=query,
         matched_to=matched_to,
+        # The RESOLVED path, not the configured one. Without it, "the reject
+        # didn't write" and "the reject wrote somewhere I wasn't looking" are
+        # indistinguishable from the log — a distinction that cost a full
+        # diagnosis cycle on 2026-08-03.
+        corpus_path=str(corpus_path),
+        query_key=query_key(query),
     )
     return (None, True)
 
