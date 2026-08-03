@@ -400,6 +400,15 @@ async def test_generate_brief_roundtrip_byte_identical(
 
     monkeypatch.setattr(brief_daemon_mod, "fetch_and_format", _fake_weather)
 
+    # The NARRATION path reaches weather by a function-local import of
+    # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
+    # cover — without this, generate_brief makes a live aviationweather.gov
+    # call. Rationale: tests/feed/test_brief_feed_parity.py::_patch_weather.
+    async def _no_metars(_wc):  # type: ignore[no-untyped-def]
+        return []
+
+    monkeypatch.setattr("alfred.brief.weather.fetch_metars", _no_metars)
+
     # The brief's data dir IS the app fixture's spool dir (state file
     # lives under it → generate_brief derives data_dir from its parent).
     config = _brief_config(tmp_path)
@@ -495,6 +504,15 @@ async def test_brief_spool_failure_swallowed_vault_and_push_succeed(
         return "Sunny, 21C."
 
     monkeypatch.setattr(brief_daemon_mod, "fetch_and_format", _fake_weather)
+
+    # The NARRATION path reaches weather by a function-local import of
+    # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
+    # cover — without this, generate_brief makes a live aviationweather.gov
+    # call. Rationale: tests/feed/test_brief_feed_parity.py::_patch_weather.
+    async def _no_metars(_wc):  # type: ignore[no-untyped-def]
+        return []
+
+    monkeypatch.setattr("alfred.brief.weather.fetch_metars", _no_metars)
 
     pushed: list[dict[str, Any]] = []
 

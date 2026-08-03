@@ -763,6 +763,15 @@ class TestGenerateBriefWeatherGuard:
 
         monkeypatch.setattr(daemon_mod, "fetch_and_format", _structural_bug)
 
+        # The NARRATION path reaches weather by a function-local import of
+        # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
+        # cover — without this, generate_brief makes a live aviationweather.gov
+        # call. Rationale: tests/feed/test_brief_feed_parity.py::_patch_weather.
+        async def _no_metars(_wc):  # type: ignore[no-untyped-def]
+            return []
+
+        monkeypatch.setattr("alfred.brief.weather.fetch_metars", _no_metars)
+
         config = BriefConfig(
             vault_path=str(vault),
             state=StateConfig(path=str(data_dir / "brief_state.json")),

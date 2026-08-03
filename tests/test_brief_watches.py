@@ -373,6 +373,15 @@ async def test_daemon_level_watches_crash_never_kills_brief(tmp_path, monkeypatc
 
     monkeypatch.setattr(daemon_mod, "fetch_and_format", _no_weather)
 
+    # The NARRATION path reaches weather by a function-local import of
+    # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
+    # cover — without this, generate_brief makes a live aviationweather.gov
+    # call. Rationale: tests/feed/test_brief_feed_parity.py::_patch_weather.
+    async def _no_metars(_wc):  # type: ignore[no-untyped-def]
+        return []
+
+    monkeypatch.setattr("alfred.brief.weather.fetch_metars", _no_metars)
+
     config = BriefConfig(
         vault_path=str(vault),
         state=StateConfig(path=str(data_dir / "brief_state.json")),
@@ -409,6 +418,15 @@ async def test_daemon_omits_section_when_unconfigured(tmp_path, monkeypatch) -> 
         return "*Weather data unavailable.*"
 
     monkeypatch.setattr(daemon_mod, "fetch_and_format", _no_weather)
+
+    # The NARRATION path reaches weather by a function-local import of
+    # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
+    # cover — without this, generate_brief makes a live aviationweather.gov
+    # call. Rationale: tests/feed/test_brief_feed_parity.py::_patch_weather.
+    async def _no_metars(_wc):  # type: ignore[no-untyped-def]
+        return []
+
+    monkeypatch.setattr("alfred.brief.weather.fetch_metars", _no_metars)
 
     called: list = []
 
