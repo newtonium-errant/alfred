@@ -8,22 +8,27 @@ import userEvent from '@testing-library/user-event';
 // server-side by the BFF (covered in authOtpRoutes.test.ts) — this file locks
 // the UI wiring and the graceful degradation when OTP is disabled.
 
-const { loginMock, otpRequestMock, otpVerifyMock, replaceMock, routerQuery } = vi.hoisted(
-  () => ({
+const { loginMock, otpRequestMock, otpVerifyMock, meMock, replaceMock, routerQuery } =
+  vi.hoisted(() => ({
     loginMock: vi.fn(),
     otpRequestMock: vi.fn(),
     otpVerifyMock: vi.fn(),
+    meMock: vi.fn(),
     replaceMock: vi.fn(),
     routerQuery: { current: {} as Record<string, string | string[] | undefined> },
-  }),
-);
+  }));
 
 vi.mock('next/router', () => ({
   useRouter: () => ({ query: routerQuery.current, replace: replaceMock, push: vi.fn() }),
 }));
 
 vi.mock('../lib/algernon/authClient', () => ({
-  authApi: { login: loginMock, otpRequest: otpRequestMock, otpVerify: otpVerifyMock },
+  authApi: {
+    login: loginMock,
+    otpRequest: otpRequestMock,
+    otpVerify: otpVerifyMock,
+    me: meMock,
+  },
 }));
 
 import LoginPage from '../pages/login';
@@ -33,6 +38,7 @@ afterEach(() => {
   loginMock.mockReset();
   otpRequestMock.mockReset();
   otpVerifyMock.mockReset();
+  meMock.mockReset();
   replaceMock.mockReset();
   routerQuery.current = {};
 });
@@ -207,6 +213,133 @@ describe('LoginPage — sign in with a code (OTP)', () => {
     expect(replaceMock).not.toHaveBeenCalled();
     // Still able to retry / request another code.
     expect(screen.getByTestId('otp-resend')).not.toBeNull();
+  });
+
+  // --- Post-verify session probe (recovery option A) ------------------------
+  // The verify is NON-IDEMPOTENT: an upstream 200 burns the code. So a failure
+  // whose class leaves "the server committed anyway" open must not be taken at
+  // face value — retrying the same six digits can only draw the uniform 401, and
+  // the operator's only escape becomes a fresh code (the reported symptom).
+
+  it('rescues a lost verify response — network error but the session actually landed', async () => {
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(0, 'network_error'));
+    meMock.mockResolvedValue({ name: 'andrew', role: 'owner' });
+    replaceMock.mockResolvedValue(true);
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    expect(meMock).toHaveBeenCalledTimes(1);
+    expect(replaceMock).toHaveBeenCalledWith('/');
+    expect(screen.queryByTestId('otp-error')).toBeNull();
+  });
+
+  it('rescues a BFF 5xx the same way (the transport answer never got back to us)', async () => {
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(502, 'transport_unreachable'));
+    meMock.mockResolvedValue({ name: 'andrew', role: 'owner' });
+    replaceMock.mockResolvedValue(true);
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    expect(meMock).toHaveBeenCalledTimes(1);
+    expect(replaceMock).toHaveBeenCalledWith('/');
+  });
+
+  it('bounds the probe well under the 70s default — it runs while "Signing in…" shows', async () => {
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(0, 'timeout'));
+    meMock.mockResolvedValue({ name: 'andrew', role: 'owner' });
+    replaceMock.mockResolvedValue(true);
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    expect(meMock).toHaveBeenCalledWith({ timeoutMs: 8000 });
+  });
+
+  it('does NOT probe a definitive 401 — a mistyped digit must not cost an extra request', async () => {
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(401, 'invalid_or_expired'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    const err = await screen.findByTestId('otp-error');
+    expect(err.textContent).toContain('incorrect or has expired');
+    expect(meMock).not.toHaveBeenCalled();
+  });
+
+  it('tells the truth when the probe says no — never "incorrect", and warns the code is spent', async () => {
+    // The honest-copy requirement: a transport-class failure is not a verdict on
+    // the digits, and "try again" with the same code is the one move that cannot
+    // work if the server consumed it.
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(0, 'network_error'));
+    meMock.mockRejectedValue(new ApiError(401, 'not_authenticated'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    const err = await screen.findByTestId('otp-error');
+    expect(err.textContent).toContain('Couldn’t reach the server');
+    expect(err.textContent).toContain('may already be spent');
+    expect(err.textContent).not.toContain('incorrect');
+    expect(replaceMock).not.toHaveBeenCalled();
+    // Recoverable: the resend affordance is still there.
+    expect(screen.getByTestId('otp-resend')).not.toBeNull();
+  });
+
+  it('a probe that itself fails is treated as not-signed-in, not as a crash', async () => {
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(0, 'network_error'));
+    meMock.mockRejectedValue(new ApiError(0, 'network_error'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    const err = await screen.findByTestId('otp-error');
+    expect(err.textContent).toContain('may already be spent');
+    expect(screen.queryByTestId('otp-signed-in')).toBeNull();
+  });
+
+  it('probe rescue + a failed redirect still lands on the signed-in anchor', async () => {
+    // Composition of the two fixes: the probe proves the session, the navigation
+    // fails, and the operator gets a real link instead of a bogus code error.
+    otpRequestMock.mockResolvedValue({ ok: true });
+    otpVerifyMock.mockRejectedValue(new ApiError(0, 'network_error'));
+    meMock.mockResolvedValue({ name: 'andrew', role: 'owner' });
+    replaceMock.mockRejectedValue(new Error('Route Cancelled'));
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await driveToCodeStage(user);
+    await user.type(screen.getByTestId('otp-code-input'), '123456');
+    await user.click(screen.getByTestId('otp-verify-submit'));
+
+    await screen.findByTestId('otp-signed-in');
+    expect(screen.getByTestId('otp-continue').getAttribute('href')).toBe('/');
+    expect(screen.queryByTestId('otp-error')).toBeNull();
   });
 
   it('can switch back to the magic-link form', async () => {

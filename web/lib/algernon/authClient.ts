@@ -31,5 +31,9 @@ export const authApi = {
     postJson<{ status: string }>('/api/auth/logout', {}),
 
   // The current signed-in user (display only), or throws ApiError(401) if none.
-  me: (): Promise<SessionUser> => getJson<SessionUser>('/api/auth/me'),
+  // `opts.timeoutMs` exists for the login page's post-verify session probe, which
+  // runs while the operator is staring at "Signing in…" and so must not inherit
+  // the 70s default. Callers that omit it (useSession) are unchanged.
+  me: (opts: { timeoutMs?: number } = {}): Promise<SessionUser> =>
+    getJson<SessionUser>('/api/auth/me', opts),
 };

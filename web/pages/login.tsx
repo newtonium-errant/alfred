@@ -28,6 +28,43 @@ function callbackErrorMessage(code: string | string[] | undefined): string | nul
   }
 }
 
+// How long the post-verify session probe may take. It runs while the operator is
+// looking at "Signing in…", so it must NOT inherit http.ts's 70s default — a
+// probe that strands them for over a minute is worse than the honest error.
+const SESSION_PROBE_TIMEOUT_MS = 8000;
+
+/**
+ * True when a verify failure leaves open that the server COMMITTED anyway: a
+ * browser-side network error or timeout (`ApiError.status === 0`), or a BFF 5xx.
+ * A 401/404/400 is the backend's own verdict on the code and is never in doubt —
+ * probing those would add a request to every mistyped digit and tell us nothing.
+ */
+function isIndeterminateVerifyFailure(err: unknown): boolean {
+  return err instanceof ApiError && (err.status === 0 || err.status >= 500);
+}
+
+/**
+ * Did the sign-in actually land despite the error? Asks the BFF who we are.
+ *
+ * HONEST LIMIT — worth knowing before trusting this too far: the session cookie
+ * rides the very response that failed, so when the response is lost ENTIRELY the
+ * cookie is lost with it and this correctly reports "no". What it DOES rescue is
+ * the partial shape — headers (and therefore Set-Cookie) arrived, then the body
+ * read failed — plus any client-side throw after a clean success. Closing the
+ * full response-loss case needs an idempotency key on the verify itself, which
+ * touches one-time-use semantics and is a separate, security-gated arc.
+ */
+async function probeSignedIn(err: unknown): Promise<boolean> {
+  if (!isIndeterminateVerifyFailure(err)) return false;
+  try {
+    await authApi.me({ timeoutMs: SESSION_PROBE_TIMEOUT_MS });
+    return true;
+  } catch {
+    // 401 (no session) or a second transport failure — either way, not signed in.
+    return false;
+  }
+}
+
 // Maps an OTP request/verify ApiError to a friendly line.
 function otpErrorMessage(err: unknown, phase: 'request' | 'verify'): string {
   if (err instanceof ApiError) {
@@ -42,6 +79,14 @@ function otpErrorMessage(err: unknown, phase: 'request' | 'verify'): string {
         return 'Please enter your email address.';
       case 'rate_limited':
         return 'Too many code requests — wait a few minutes and try again.';
+    }
+    // Not a verdict on the code — the request never got a clean answer. On verify
+    // that distinction is load-bearing: the server may have consumed the code
+    // before we lost the response, which makes "try again" (with the same code)
+    // the ONE thing that cannot work. Say what actually happened and point at the
+    // move that does work, instead of implying the digits were wrong.
+    if (phase === 'verify' && isIndeterminateVerifyFailure(err)) {
+      return 'Couldn’t reach the server to finish signing in. That code may already be spent — request a new one.';
     }
   }
   return phase === 'request'
@@ -128,9 +173,17 @@ export default function LoginPage() {
     try {
       await authApi.otpVerify(email.trim(), code.trim());
     } catch (err) {
-      setOtpError(otpErrorMessage(err, 'verify'));
-      setOtpBusy(false);
-      return;
+      // The verify is NON-IDEMPOTENT: an upstream 200 burns the code, so if the
+      // server committed and we merely lost the answer, retrying these same six
+      // digits can only ever draw the uniform 401 and the operator's sole escape
+      // is a fresh code — the reported symptom. Before calling it a failure, ASK
+      // whether we are in fact signed in. Only on an indeterminate failure class;
+      // a 401 is the backend's verdict and gets no probe.
+      if (!(await probeSignedIn(err))) {
+        setOtpError(otpErrorMessage(err, 'verify'));
+        setOtpBusy(false);
+        return;
+      }
     }
     // PAST THIS POINT THE SIGN-IN HAS COMMITTED: the one-time code is burned
     // server-side and the cookie was set on the response we just received — the
