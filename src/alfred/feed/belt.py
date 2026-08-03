@@ -42,7 +42,15 @@ def try_feed_reconcile(
         "feed.reconcile",
         ok=True,
         kind=kind,
+        # The size of the INCOMING open set — what the producer emitted this
+        # fire, INCLUDING any items suppressed below. It is not the count of
+        # items written, and not the store's resulting open count.
         open=counts["open"],
         acted=counts["acted"],
+        # Snapshot items whose decision was kept sticky because their content
+        # is unchanged (per-kind revival policy). Always emitted, including 0:
+        # a card that stops re-appearing must be explicable as "we chose not to
+        # revive it" rather than looking like the producer went quiet.
+        suppressed=counts["suppressed"],
     )
     return counts

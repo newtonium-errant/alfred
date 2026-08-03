@@ -1482,6 +1482,7 @@ def _task_is_done_today(fm: dict, today: date) -> bool:
 def compute_today_view(
     vault_path: Path, now: datetime,
     tier_defaults: Any = None,
+    snooze_path: str | Path | None = None,
 ) -> TodayView:
     """Build the unified today view over the substrate.
 
@@ -1713,6 +1714,39 @@ def compute_today_view(
         ))
         t3_keys.add(key)
 
+    # --- board snooze ---------------------------------------------
+    # Drop rows the operator parked, BEFORE the daily goal is computed — a
+    # hidden row must not count toward the day's target. ``snooze_path=None``
+    # (the default) leaves the feature entirely inert: no store, no filter,
+    # byte-identical view. Applied HERE, in the one projection the board and
+    # the brief's tier section both read, so the two can never disagree.
+    # The path normally arrives on ``tier_defaults`` (stamped once at brief
+    # config load), which is why no production caller passes it explicitly —
+    # an explicit argument is the test/override path. Reading it from the
+    # already-threaded bundle is what makes the read side reachable from all
+    # three callers without a 4th parameter any of them could forget.
+    if snooze_path is None:
+        snooze_path = getattr(tier_defaults, "snooze_path", "") or None
+    snooze_suppressed = 0
+    if snooze_path is not None:
+        from alfred.tier.snooze import filter_snoozed_entries, load_snoozes
+
+        _snoozes = load_snoozes(snooze_path)
+        if _snoozes:
+            for _lane_name, _lane in (("t1", t1), ("t2", t2), ("t3", t3)):
+                _kept, _stats = filter_snoozed_entries(
+                    _lane, _snoozes, today=today,
+                )
+                _lane[:] = _kept
+                snooze_suppressed += _stats.suppressed
+                for _key, _reason in _stats.broke_through:
+                    # A card returning EARLY must be explicable, never
+                    # mysterious — name which delta fired.
+                    log.info(
+                        "board.snooze_breakthrough",
+                        lane=_lane_name, key=_key, reason=_reason,
+                    )
+
     # --- routine_today: the complement (fired today, no handoff) ---
     routine_today = _collect_routine_today(vault_path, today, tier_defaults)
 
@@ -1731,6 +1765,10 @@ def compute_today_view(
         t2_done=daily_goal.t2_done,
         t3_done=daily_goal.t3_done,
         curation_loaded=curation is not None,
+        # ILB: a shorter board must be explicable as "you parked these" rather
+        # than looking like the projection lost them. Always emitted, including
+        # 0 and including when the feature is inert.
+        snooze_suppressed=snooze_suppressed,
     )
 
     return TodayView(

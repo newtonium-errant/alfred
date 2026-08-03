@@ -289,6 +289,14 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     tier_defaults = TierDefaultsConfig.from_raw(
         (raw.get("routine") or {}).get("tier_defaults"),
     )
+    # Board snooze store (R3) — THE read-side resolution point, exactly once.
+    # ``tier_defaults`` is already threaded to every production caller of
+    # ``compute_today_view`` (narration, tier_section, feed_producer), so
+    # stamping the path here wires all three at once and leaves no call site
+    # that could be forgotten. Same helper the writer uses, so the two halves
+    # cannot resolve to different files.
+    from alfred.tier.snooze import resolve_snooze_path
+    tier_defaults.snooze_path = resolve_snooze_path(raw) or ""
     log_dir = raw.get("logging", {}).get("dir", "./data")
 
     # Parse stations

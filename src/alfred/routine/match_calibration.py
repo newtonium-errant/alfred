@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 import structlog
@@ -50,6 +51,14 @@ DEFAULT_NO_MATCH_FLOOR = 0.3
 # the matcher consults. Mutated ONLY by an operator reply through the Daily Sync
 # reply_dispatch; never by a match. Per-instance, mirrors the pending sink.
 DEFAULT_CORPUS_PATH = "./data/routine_match_corpus.salem.jsonl"
+# Review-surface bounds (see :func:`filter_pending_for_review`). The pending
+# sink is append-only and never pruned, so without these a captured row is
+# re-surfaced every single morning forever. ``MAX_AGE_DAYS`` retires a row the
+# operator has demonstrably chosen not to act on; ``MAX_ITEMS`` caps one day's
+# review list so a capture burst can't wall the feed. Both tunable per-instance
+# via the ``routine.match_calibration`` config block.
+DEFAULT_PENDING_MAX_AGE_DAYS = 21
+DEFAULT_PENDING_MAX_ITEMS = 10
 
 
 @dataclass
@@ -206,10 +215,19 @@ def append_corpus(path: str | Path, entry: MatchCorpusEntry) -> None:
 class Glossary:
     """The matcher-facing view of the corpus — consulted in ``_matches_item``.
 
-    Built by :func:`load_glossary`. Last-write-wins per ``(query_key,
-    item_text)`` pair, so a later operator action overrides an earlier one
-    (e.g. confirm after a mistaken reject). ``aliases`` maps a query_key to the
-    item it was confirmed to alias (Phase 3) — also last-write-wins.
+    Built by :func:`load_glossary`.
+
+    **Conflict rule: LATER-VERDICT-WINS, per ``(query_key, item_text)`` pair.**
+    Replaying the append-only log in order, a later operator action overrides
+    an earlier one for that pair — confirm after a mistaken reject, or reject
+    after a mistaken confirm/alias. :meth:`verdict` additionally checks
+    ``rejected`` first, so an explicit exclusion wins even if a load bug ever
+    left a pair in both sets (belt-and-braces, not the primary mechanism).
+
+    A reject ALSO retracts an alias pointing at the rejected item — see
+    :func:`load_glossary`. An alias is a claim about the phrase ("clean hammer
+    means Fully Clean House"); rejecting that exact pair withdraws the claim.
+    A reject of a DIFFERENT item leaves the alias standing.
     """
 
     confirmed: set[tuple[str, str]]   # (query_key, item_text) → fast-path True
@@ -272,6 +290,17 @@ def load_glossary(path: str | Path) -> Glossary:
         elif entry.type == CORPUS_REJECT:
             confirmed.discard(pair)
             rejected.add(pair)
+            # Retract an alias pointing at the item just rejected. An alias is
+            # a claim about the PHRASE ("clean hammer means Fully Clean
+            # House"); rejecting that exact pair withdraws it. Without this,
+            # the alias outlives the reject: Salem's real corpus holds a
+            # 2026-07-31 alias followed by three rejects of the same pair, and
+            # ``alias_for`` still returned the aliased item. ``verdict`` was
+            # already correct (reject), so the MATCHER never mis-fired — but a
+            # stale alias silently resolves OTHER captures of the same phrase.
+            # A reject of a DIFFERENT item leaves the alias standing.
+            if aliases.get(entry.query_key) == entry.item_text:
+                del aliases[entry.query_key]
         elif entry.type == CORPUS_ALIAS:
             # An alias is also a promotion (the phrasing should now match the
             # aliased item) — record both the alias map and the confirmed pair.
@@ -281,11 +310,136 @@ def load_glossary(path: str | Path) -> Glossary:
     return Glossary(confirmed=confirmed, rejected=rejected, aliases=aliases)
 
 
+@dataclass
+class PendingReviewStats:
+    """Why :func:`filter_pending_for_review` dropped what it dropped.
+
+    Carried out to the caller so the review surface can log an explicit
+    "captured N, surfaced M, suppressed K because …" line. Silent
+    suppression would make "the card finally stopped coming back" and
+    "the section broke" look identical (ILB).
+    """
+
+    captured: int = 0   # rows in the sink
+    resolved: int = 0   # already carry an operator verdict in the corpus
+    aged_out: int = 0   # older than max_age_days
+    capped: int = 0     # trimmed by max_items
+    surfaced: int = 0   # what the operator actually sees
+
+    def suppressed(self) -> int:
+        return self.resolved + self.aged_out + self.capped
+
+
+def _captured_date(entry: PendingMatch) -> date | None:
+    """Best-effort capture date for the age filter.
+
+    Prefers ``captured_at`` (ISO timestamp, possibly ``Z``-suffixed), falls
+    back to ``completion_date`` (plain ``YYYY-MM-DD``). Returns ``None`` when
+    neither parses — the caller then FAILS OPEN and keeps the row rather than
+    silently retiring something it couldn't date.
+    """
+    raw = (entry.captured_at or "").strip()
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+    raw = (entry.completion_date or "").strip()
+    if raw:
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            pass
+    return None
+
+
+def filter_pending_for_review(
+    pending: list[PendingMatch],
+    glossary: Glossary,
+    *,
+    today: date | None = None,
+    max_age_days: int = DEFAULT_PENDING_MAX_AGE_DAYS,
+    max_items: int = DEFAULT_PENDING_MAX_ITEMS,
+) -> tuple[list[PendingMatch], PendingReviewStats]:
+    """Narrow the append-only pending sink to what's worth reviewing today.
+
+    THE BUG THIS CLOSES: the sink is append-only and has no prune/resolve API,
+    and the surfacing path never consulted the corpus. So an operator reject
+    wrote its verdict (which the MATCHER honours — the false positive stops
+    recurring as a match) while the REVIEW CARD came back every morning
+    forever, and the feed's revival-after-acted resurrected it each time. The
+    operator read "reject = suppress" and was right about the matcher and
+    wrong about the card. Three drops, in order:
+
+    1. **Resolved** — the corpus already holds a verdict for this row. Either
+       a direct ``(query_key, matched_to)`` confirm/reject, OR an alias on the
+       query_key alone: once the operator has said "that phrase means X",
+       re-asking "did you mean Y?" for the same phrase is the groundhog even
+       though the pair never matched.
+    2. **Aged out** — captured more than ``max_age_days`` ago. USUALLY that
+       means the operator saw it and chose not to answer, and asking again
+       daily is nagging rather than calibration. It does NOT mean that in
+       every case: a row that sat below the ``max_items`` cut every day never
+       surfaced at all and still ages out, unseen. The counts distinguish the
+       two only in aggregate (``aged_out`` vs ``capped``), not per row — see
+       the caller's ILB log, and the starvation note on the cap below.
+       Undateable rows fail OPEN (kept) — never silently retire what we
+       couldn't date.
+    3. **Capped** — at most ``max_items`` rows, **FIFO: the OLDEST unresolved
+       rows win** (a selection rule, not a render order — the kept rows keep
+       their original file order). A capture burst can't wall the review
+       surface, and nothing is starved out of existence.
+
+       FIFO is the point, not an implementation detail. Selecting the NEWEST
+       (the original v1 behaviour) starves the oldest rows, and a
+       perpetually-starved row eventually ages out **having never been shown
+       once** — the system silently deciding on the operator's behalf, which
+       fails the CAPTURE half of the self-correcting standard before feedback
+       or approval ever enter it. FIFO instead guarantees every row is offered
+       at least once before it can expire; its cost is bounded LATENCY (fresh
+       captures queue behind a backlog), never loss. Ruled 2026-08-03 after a
+       reviewer drove 15 rows at ``max_items=10`` and five aged out unseen.
+
+    Non-destructive by design: the sink is the capture record and stays
+    intact; the corpus stays the single source of truth for verdicts. That
+    also means this retroactively releases rows already stuck in the loop —
+    no migration, no rewrite of operator history.
+    """
+    today = today or date.today()
+    stats = PendingReviewStats(captured=len(pending))
+    kept: list[PendingMatch] = []
+
+    for entry in pending:
+        qkey = query_key(entry.query)
+        if glossary.verdict(qkey, entry.matched_to) is not None:
+            stats.resolved += 1
+            continue
+        if glossary.alias_for(qkey) is not None:
+            stats.resolved += 1
+            continue
+        captured = _captured_date(entry)
+        if captured is not None and (today - captured).days > max_age_days:
+            stats.aged_out += 1
+            continue
+        kept.append(entry)
+
+    if max_items >= 0 and len(kept) > max_items:
+        stats.capped = len(kept) - max_items
+        # FIFO — keep the OLDEST unresolved rows. ``pending`` is in file order,
+        # which is capture order, so a plain head-slice is the queue.
+        kept = kept[:max_items]
+
+    stats.surfaced = len(kept)
+    return kept, stats
+
+
 __all__ = [
     "DEFAULT_PENDING_PATH",
     "DEFAULT_CONFIDENCE_THRESHOLD",
     "DEFAULT_NO_MATCH_FLOOR",
     "DEFAULT_CORPUS_PATH",
+    "DEFAULT_PENDING_MAX_AGE_DAYS",
+    "DEFAULT_PENDING_MAX_ITEMS",
     "KIND_LOW_CONF",
     "KIND_NO_MATCH",
     "CORPUS_CONFIRM",
@@ -294,8 +448,10 @@ __all__ = [
     "Glossary",
     "MatchCorpusEntry",
     "PendingMatch",
+    "PendingReviewStats",
     "append_corpus",
     "append_pending",
+    "filter_pending_for_review",
     "load_glossary",
     "load_pending",
     "query_key",
