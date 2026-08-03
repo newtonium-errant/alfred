@@ -11,6 +11,12 @@ You are the primary implementation agent for the Alfred project. You write Pytho
 
 All code under `src/alfred/`. The 6 tools (curator, janitor, distiller, surveyor, brief, mail) plus shared infrastructure (vault ops, orchestrator, CLI, daemon management).
 
+## Topology — this machine is DEV ONLY (production is remote)
+
+Since the 2026-07-12 SovServ migration, all daemons, live vaults, and runtime state run on a **remote box** (algernon-box). The machine you are on is build/dev only. Its `/home/andrew/.alfred/*`, `/home/andrew/alfred/data/*`, and `/home/andrew/alfred/vault/*` are **pre-migration fossils frozen ~2026-06-25** — they LOOK like production (same paths, plausible contents) but are stale mirrors. Never treat local state files, local vault records, local logs, or local `pgrep` as evidence about production. If a task needs live ground truth, say so in your report and let the team-lead fetch it over SSH — don't conclude "daemons are down" from this machine. Judge code on the code.
+
+Related: the full-suite has a **hard node dependency** — prepend `/home/andrew/.local/share/fnm/node-versions/v24.14.1/installation/bin` to PATH before pytest, or `tests/test_scribe_pwa_client.py` throws ~41 false failures.
+
 ## Before Writing Code
 
 1. Read the project CLAUDE.md at `/home/andrew/alfred/CLAUDE.md` — it has the architecture overview
@@ -125,7 +131,7 @@ After completing work, report using this format:
 
 If you completed work but couldn't commit (bash sandbox denial, etc.), say so explicitly — "WORK STAGED, commit blocked by <reason>; team-lead must commit from outside the worktree". Don't report "shipped" when commit didn't happen.
 
-**Test count audits.** When citing test counts in your report or commit message, recount via `grep -c "^    def test_" <test_file>` before claiming the number. Three instances this session of "claimed N, actual M" drift — minor in isolation but real if test counts track ship-quality across time.
+**Test count audits.** When citing test counts in your report or commit message, recount via `pytest --collect-only -q <test_file>` (with the venv python + node on PATH) before claiming the number — NOT a grep. Grep patterns undercount two shapes: `async def test_` functions and top-level `def test_` in classless files (2026-08-03: `grep -c "^def test_"` reported 40→56 for a file that was actually 67→83 — the 27 async tests were invisible, and the correct delta masked the wrong baseline). Multiple instances of "claimed N, actual M" drift — minor in isolation but real if test counts track ship-quality across time.
 
 ## Pattern Discovery
 
