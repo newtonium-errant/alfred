@@ -86,7 +86,11 @@ import structlog
 import yaml
 
 from alfred.common.file_lock import file_rmw_lock
-from alfred.vault.paths import VaultContainmentError, resolve_in_vault
+from alfred.vault.paths import (
+    VaultContainmentError,
+    resolve_in_vault,
+    vault_relative,
+)
 
 from . import completion as _completion
 from .cli import (
@@ -926,7 +930,7 @@ def cmd_item_add(
             "routine.cli.item.added",
             record=resolved_record,
             item=item_text,
-            path=str(resolved_path.relative_to(vault_path)),
+            path=vault_relative(vault_path, resolved_path),
         )
     return _emit_canary(
         wants_json=wants_json,
@@ -936,7 +940,7 @@ def cmd_item_add(
         payload={
             "record": resolved_record,
             "item": item_text,
-            "path": str(resolved_path.relative_to(vault_path)),
+            "path": vault_relative(vault_path, resolved_path),
             **result.payload_extras,
         },
     )
@@ -1012,7 +1016,7 @@ def cmd_item_remove(
             "routine.cli.item.removed",
             record=resolved_record,
             item=canonical_item,
-            path=str(resolved_path.relative_to(vault_path)),
+            path=vault_relative(vault_path, resolved_path),
             completion_entries_dropped=len(
                 removed_completion_dates["value"]
             ),
@@ -1033,7 +1037,7 @@ def cmd_item_remove(
         payload={
             "record": resolved_record,
             "item": canonical_item,
-            "path": str(resolved_path.relative_to(vault_path)),
+            "path": vault_relative(vault_path, resolved_path),
             **result.payload_extras,
         },
     )
@@ -1234,7 +1238,7 @@ def cmd_item_edit(
             item=canonical_item,
             renamed_to=result.payload_extras.get("renamed_to"),
             fields_changed=result.payload_extras.get("fields_changed", []),
-            path=str(resolved_path.relative_to(vault_path)),
+            path=vault_relative(vault_path, resolved_path),
         )
     return _emit_canary(
         wants_json=wants_json,
@@ -1251,7 +1255,7 @@ def cmd_item_edit(
         payload={
             "record": resolved_record,
             "item": canonical_item,
-            "path": str(resolved_path.relative_to(vault_path)),
+            "path": vault_relative(vault_path, resolved_path),
             **result.payload_extras,
         },
     )
@@ -1359,7 +1363,7 @@ def cmd_undone(
     # leaves the file UNTOUCHED on the not-logged no-op (its ``aborted`` gate).
     # Called via the module attribute so the identity pin can monkeypatch one
     # symbol and see both callers route through it.
-    rel_path = str(resolved_path.relative_to(vault_path))
+    rel_path = vault_relative(vault_path, resolved_path)
     result = _completion.mark_routine_item_undone(
         resolved_path, canonical_item, iso, vault_path=vault_path,
     )

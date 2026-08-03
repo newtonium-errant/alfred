@@ -312,6 +312,99 @@ def test_e2e_done_cannot_escape(vault: Path, canary: Path, tmp_path: Path) -> No
     assert len(_denials(cap, "routine.cli.path_escape_denied")) == 1
 
 
+# ---------------------------------------------------------------------------
+# SYMLINKED VAULT — the shape production actually runs in
+# ---------------------------------------------------------------------------
+#
+# /home/andrew/alfred is a symlink to /data/algernon/alfred (since 2026-06-25)
+# and config.yaml points at the SYMLINK spelling. Every other fixture in this
+# repo builds its vault directly under tmp_path, where .resolve() is a no-op —
+# so the resolved and configured spellings coincide and an entire class of bug
+# is invisible.
+#
+# It bit immediately: arc #18 made the writers return RESOLVED paths while the
+# callers still computed ``path.relative_to(vault_path)`` against the CONFIGURED
+# spelling. ``relative_to`` is LEXICAL, so it raised ValueError and took down
+# EVERY routine verb — with 11877 tests green. These fixtures exist so the next
+# resolution-shaped change fails here instead of on the box.
+
+
+@pytest.fixture()
+def symlinked_vault(tmp_path: Path) -> Path:
+    """A vault reached through a symlink, mirroring production's topology.
+
+    Returns the SYMLINK spelling — what config.yaml would carry. The real
+    directory lives elsewhere, so ``.resolve()`` genuinely changes the string.
+    """
+    real = tmp_path / "data" / "algernon" / "alfred" / "vault"
+    (real / "routine").mkdir(parents=True)
+    link = tmp_path / "home_alfred_vault"
+    link.symlink_to(real, target_is_directory=True)
+    assert Path(link).resolve() != Path(link)  # precondition: really a symlink
+    return link
+
+
+def test_symlinked_vault_precondition_holds(symlinked_vault: Path) -> None:
+    """Guard the guard: if this ever stops being a real symlink, every pin
+    below silently degrades into a duplicate of the plain-vault tests."""
+    assert symlinked_vault.is_symlink()
+    assert symlinked_vault.resolve() != symlinked_vault
+
+
+@pytest.mark.parametrize(
+    ("verb", "call"),
+    [
+        ("done", lambda cfg: cmd_done(cfg, "Chores", "A", today_override=TODAY_ISO)),
+        ("item_add", lambda cfg: cmd_item_add(cfg, record_name="Chores", item_text="New")),
+        ("item_remove", lambda cfg: cmd_item_remove(cfg, record_name="Chores", item_text="A")),
+        ("item_edit", lambda cfg: cmd_item_edit(
+            cfg, record_name="Chores", item_text="A", new_text="B")),
+    ],
+)
+def test_every_routine_verb_works_on_a_symlinked_vault(
+    symlinked_vault: Path, tmp_path: Path, verb: str, call,
+) -> None:
+    """The regression pin. Each verb must succeed when the vault is configured
+    via a symlink — the exact production shape."""
+    _write_routine(symlinked_vault, "Chores", {
+        "type": "routine", "name": "Chores",
+        "items": [{"text": "A", "priority": "tracked"}],
+    })
+    config = _config(symlinked_vault, tmp_path)
+    assert call(config) == 0, f"{verb} failed on a symlinked vault"
+
+
+def test_symlinked_vault_still_refuses_escapes(
+    symlinked_vault: Path, canary: Path, tmp_path: Path,
+) -> None:
+    """Containment must hold through the symlink too — resolving both sides
+    must not accidentally widen what counts as 'inside'."""
+    config = _config(symlinked_vault, tmp_path)
+    with structlog.testing.capture_logs() as cap:
+        code = cmd_item_add(
+            config, record_name=f"../../../../{canary.stem}", item_text="Z",
+        )
+    assert code != 0
+    assert canary.read_text(encoding="utf-8") == CANARY_BODY
+    assert len(_denials(cap, "routine.cli.path_escape_denied")) == 1
+
+
+def test_symlinked_vault_reports_a_relative_path_not_an_absolute_one(
+    symlinked_vault: Path, tmp_path: Path,
+) -> None:
+    """``vault_relative`` must yield the vault-relative string even when the
+    two spellings differ — the canary payload/logs carry ``routine/Chores.md``,
+    not a leaked absolute realpath."""
+    from alfred.vault.paths import vault_relative
+
+    _write_routine(symlinked_vault, "Chores", {
+        "type": "routine", "name": "Chores",
+        "items": [{"text": "A", "priority": "tracked"}],
+    })
+    resolved = symlinked_vault.resolve() / "routine" / "Chores.md"
+    assert vault_relative(symlinked_vault, resolved) == "routine/Chores.md"
+
+
 def test_e2e_item_add_still_works_for_a_real_record(vault: Path, tmp_path: Path) -> None:
     """The e2e happy path, so the escape pins above can't pass by breaking the
     verb outright."""

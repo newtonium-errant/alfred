@@ -24,7 +24,11 @@ from pathlib import Path
 import pytest
 import structlog
 
-from alfred.vault.paths import VaultContainmentError, resolve_in_vault
+from alfred.vault.paths import (
+    VaultContainmentError,
+    resolve_in_vault,
+    vault_relative,
+)
 
 WRITER = "test.writer"
 
@@ -279,6 +283,64 @@ def test_deeply_nested_new_path_is_accepted(vault: Path) -> None:
         vault, "quarantine/spam/2027-01/New Thing.md", writer=WRITER,
     )
     assert out.is_relative_to(vault.resolve())
+
+
+# ---------------------------------------------------------------------------
+# vault_relative — the symlink-tolerant companion
+# ---------------------------------------------------------------------------
+
+
+def test_vault_relative_basic(vault: Path) -> None:
+    assert vault_relative(vault, vault / "routine" / "Chores.md") == "routine/Chores.md"
+
+
+def test_vault_relative_survives_a_symlinked_vault(tmp_path: Path) -> None:
+    """THE regression pin for the arc's own worst bug.
+
+    ``Path.relative_to`` is LEXICAL. Once the writers resolve, a vault
+    CONFIGURED via a symlink no longer shares a prefix with the resolved record
+    path, and the bare call raises — which is what took down every routine verb
+    at bb5962bb while 11877 tests stayed green (no fixture was symlinked).
+    """
+    real = tmp_path / "data" / "vault"
+    (real / "routine").mkdir(parents=True)
+    configured = tmp_path / "home_vault"
+    configured.symlink_to(real, target_is_directory=True)
+
+    resolved_record = (configured / "routine" / "Chores.md").resolve()
+    assert resolved_record.is_relative_to(real)          # lives under the REAL dir
+    with pytest.raises(ValueError):                       # the bare call still raises
+        resolved_record.relative_to(configured)
+
+    assert vault_relative(configured, resolved_record) == "routine/Chores.md"
+
+
+def test_vault_relative_accepts_either_spelling(tmp_path: Path) -> None:
+    """Both spellings of the SAME record yield the same relative string —
+    callers must not care which side of the symlink they hold."""
+    real = tmp_path / "data" / "vault"
+    (real / "routine").mkdir(parents=True)
+    configured = tmp_path / "home_vault"
+    configured.symlink_to(real, target_is_directory=True)
+
+    via_link = configured / "routine" / "Chores.md"
+    via_real = real / "routine" / "Chores.md"
+    assert vault_relative(configured, via_link) == vault_relative(configured, via_real)
+    assert vault_relative(real, via_link) == vault_relative(configured, via_real)
+
+
+def test_vault_relative_does_not_raise_on_an_outside_path(vault: Path, tmp_path: Path) -> None:
+    """Display helper, not a gate — an outside path degrades to its absolute
+    string rather than crashing a log line. Containment already ran."""
+    outside = tmp_path / "outside.md"
+    outside.write_text("x", encoding="utf-8")
+    assert vault_relative(vault, outside) == str(outside.resolve())
+
+
+def test_vault_relative_normalises_internal_dotdot(vault: Path) -> None:
+    assert vault_relative(
+        vault, vault / "routine" / ".." / "routine" / "Chores.md",
+    ) == "routine/Chores.md"
 
 
 def test_error_carries_structured_detail(vault: Path) -> None:

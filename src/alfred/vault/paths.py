@@ -143,6 +143,43 @@ def resolve_in_vault(
     return candidate
 
 
+def vault_relative(vault_path: Path | str, abs_path: Path | str) -> str:
+    """The vault-relative POSIX string for ``abs_path`` — symlink-tolerant.
+
+    The companion to :func:`resolve_in_vault`, and NOT optional once that gate
+    is in place. ``Path.relative_to`` is purely LEXICAL: it compares path
+    components without resolving anything. So the moment a writer holds a
+    RESOLVED path (what ``resolve_in_vault`` returns) while ``vault_path`` is
+    still the CONFIGURED spelling, ``relative_to`` raises — the two no longer
+    share a prefix even though they name the same directory:
+
+        configured : /home/andrew/alfred/vault          (a symlink)
+        resolved   : /data/algernon/alfred/vault
+        ValueError : '/data/.../routine/Chores.md' is not in the subpath of
+                     '/home/andrew/alfred/vault'
+
+    That is production's exact shape (``/home/andrew/alfred`` has been a symlink
+    to ``/data/algernon/alfred`` since 2026-06-25, and the vault is configured
+    via the symlink spelling), and it took down every routine verb when arc #18
+    made the writers resolve. It was invisible to the whole test suite because
+    ``tmp_path`` fixtures are never symlinked, so ``.resolve()`` is a no-op and
+    the two spellings coincide.
+
+    Resolving BOTH sides makes the comparison mean what callers assume it means.
+    Falls back to the absolute string when the path genuinely lies outside the
+    vault — this helper is for DISPLAY/logging, so it must not raise; containment
+    is :func:`resolve_in_vault`'s job and has already run by the time we get here.
+    """
+    root = Path(vault_path).resolve()
+    target = Path(abs_path).resolve()
+    try:
+        return target.relative_to(root).as_posix()
+    except ValueError:
+        # Outside the vault: report the absolute path rather than crashing a
+        # log line or a canary payload.
+        return target.as_posix()
+
+
 def _deny(
     *, rel_path: str, resolved: str, vault_root: str, writer: str, reason: str,
 ) -> None:
@@ -164,4 +201,5 @@ def _deny(
 __all__ = [
     "VaultContainmentError",
     "resolve_in_vault",
+    "vault_relative",
 ]

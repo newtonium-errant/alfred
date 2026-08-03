@@ -58,7 +58,11 @@ from zoneinfo import ZoneInfo
 import frontmatter  # type: ignore[import-untyped]
 import structlog
 
-from alfred.vault.paths import VaultContainmentError, resolve_in_vault
+from alfred.vault.paths import (
+    VaultContainmentError,
+    resolve_in_vault,
+    vault_relative,
+)
 from alfred.vault.scope import ScopeError
 
 from . import completion as _completion
@@ -1152,7 +1156,7 @@ def cmd_done(
         item_text = on_record_matches[0].item_text
 
     # ---- Shared completion_log write (identity-pinned with the board) ----
-    rel_path = str(path.relative_to(vault_path))
+    rel_path = vault_relative(vault_path, path)
     result = _completion.mark_routine_item_done(
         path, item_text, iso, vault_path=vault_path,
     )
