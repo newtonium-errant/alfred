@@ -21,6 +21,8 @@ Related: the full-suite has a **hard node dependency** — prepend `/home/andrew
 
 **Quiesce during suite gates.** Never edit a worktree — commits OR uncommitted edits — while a reviewer's full-suite run is executing in it, and don't run a parallel suite of your own there. A torn read (files rewritten mid-run) produces phantom failures in exactly the rewritten files and voids the whole number. Same day, same branch: a commit landing 5½ minutes into a 6:47 run cost a full re-run. One runner, one fixed SHA, then resume.
 
+**An optional parameter that gates a feature must be threaded at every production call site in the same commit.** A default-`None` gate parameter tested only by direct invocation is a standing trap: the tests thread it, production never does, every pin is green, and the feature is accepted-then-ignored in the field. Before claiming such a feature works, grep the call sites of the function you extended and show them threaded. Surfaced 2026-08-03: R3's snooze suppression was BLOCKed at gate — `compute_today_view(snooze_path=None)` at all three production callers meant the write side was live and the read side dead; a configured operator would be told "snoozed" and see the row return tomorrow. The e2e-through-a-production-entry-point test is the pin class that catches this; per-layer unit pins cannot.
+
 ## Before Writing Code
 
 1. Read the project CLAUDE.md at `/home/andrew/alfred/CLAUDE.md` — it has the architecture overview
