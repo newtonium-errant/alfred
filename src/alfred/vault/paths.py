@@ -39,10 +39,26 @@ every escape resolves outside and is refused.
 * **Fail-closed.** Any doubt (empty path, embedded NUL, unresolvable) is a
   refusal, never a pass-through.
 * **Returns the RESOLVED path**, so callers write exactly what was verified —
-  no gap between the path that was checked and the path that is used. This also
-  normalises ``file_rmw_lock`` sidecar identity: two writers spelling the same
-  record differently (``routine/F.md`` vs ``routine/../routine/F.md``) now take
-  the SAME lock, which they previously did not.
+  no gap between the path that was checked and the path that is used. It also
+  normalises the path STRING, which is what logs, canary payloads and equality
+  comparisons see.
+
+  It does NOT change lock identity, and an earlier draft of this docstring
+  claimed otherwise ("two writers spelling the same record differently now take
+  the SAME lock, which they previously did not"). That was wrong. ``flock``
+  keys on the INODE via the open file description, not on the path string, so
+  two spellings that name one file — ``routine/F.md`` vs
+  ``routine/../routine/F.md``, or a symlinked vault root vs its realpath —
+  ALWAYS contended, before this module existed and after. Measured
+  cross-process; pinned in ``tests/routine/test_routine_record_lock.py``
+  (``test_mixed_spellings_take_the_SAME_lock_no_37_regression``).
+
+  The practical consequence, and the reason this paragraph is worth its length:
+  ``tier.promote.append_promoted_item`` still composes the CONFIGURED spelling
+  while the gated writers compose the resolved one, and that split is SAFE.
+  #37's lost-update guarantee holds across the gated/ungated boundary, so
+  containment can be rolled out writer-by-writer without an atomic
+  commit-group.
 * **No success log.** A per-write "allowed" line would be pure spam on the hot
   path; the REFUSAL is the signal (intentionally-left-blank — the interesting
   event is the one that stops work, and it is always emitted).

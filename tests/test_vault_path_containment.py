@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 import structlog
 
+from tests._required_kwarg import MISSING_KWARG_RE, assert_required_keyword_only
 from alfred.vault.paths import (
     VaultContainmentError,
     resolve_in_vault,
@@ -180,11 +181,17 @@ def test_embedded_nul_is_refused(vault: Path) -> None:
 
 
 def test_writer_is_required_keyword(vault: Path) -> None:
-    """``writer`` must be a REQUIRED keyword — per builder.md's optional-gate
-    rule, a defaulted gate parameter is a standing trap (tests thread it,
-    production doesn't, every pin stays green). Pinned so nobody 'helpfully'
-    gives it a default."""
-    with pytest.raises(TypeError):
+    """``writer`` must be a REQUIRED keyword — the optional-gate rule.
+
+    This one happens to bind even as a bare ``raises(TypeError)``, because a
+    defaulted ``writer`` yields a WORKING call with no incidental raise
+    available. That asymmetry against the completion-writer pins (where
+    ``Path(None)`` supplies a bogus TypeError) is exactly why the structural
+    assertion is the template — whether a bare pin binds depends on what the
+    parameter is later USED for, which is not something you can eyeball.
+    """
+    assert_required_keyword_only(resolve_in_vault, "writer")
+    with pytest.raises(TypeError, match=MISSING_KWARG_RE):
         resolve_in_vault(vault, "routine/Foo.md")  # type: ignore[call-arg]
 
 

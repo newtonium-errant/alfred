@@ -43,6 +43,7 @@ from alfred.routine.cli_items import (
     cmd_item_remove,
 )
 from alfred.routine.config import RoutineConfig
+from tests._required_kwarg import MISSING_KWARG_RE, assert_required_keyword_only
 
 TODAY_ISO = "2026-07-25"
 
@@ -206,10 +207,17 @@ def test_mark_undone_refuses_escaping_record_path(vault: Path, canary: Path) -> 
     "fn", [_completion.mark_routine_item_done, _completion.mark_routine_item_undone],
 )
 def test_completion_writers_require_vault_path(vault: Path, fn) -> None:
-    """``vault_path`` must be REQUIRED, never defaulted. A ``vault_path=None``
-    default is the standing trap builder.md names: threaded in tests, absent in
-    production, every pin green, containment silently dead in the field."""
-    with pytest.raises(TypeError):
+    """``vault_path`` must be REQUIRED, never defaulted — the optional-gate trap.
+
+    Both halves are load-bearing, and the FIRST is the real guarantee. A bare
+    ``pytest.raises(TypeError)`` here is HOLLOW: under the minimal regression
+    (just add ``= None`` to the signature) the call proceeds and ``Path(None)``
+    inside ``resolve_in_vault`` raises TypeError *incidentally*, which a bare
+    pin cannot distinguish from Python refusing the call. Measured: 31/31 green
+    against exactly the build this test forbids. See ``tests/_required_kwarg``.
+    """
+    assert_required_keyword_only(fn, "vault_path")
+    with pytest.raises(TypeError, match=MISSING_KWARG_RE):
         fn(vault / "routine" / "X.md", "A", TODAY_ISO)  # type: ignore[call-arg]
 
 
@@ -252,6 +260,8 @@ def test_atomic_item_mutate_refuses_escape_before_taking_the_lock(
 
 
 def test_atomic_item_mutate_requires_vault_path(vault: Path) -> None:
+    """Same optional-gate pin, same binding form — this writer has the same
+    incidental-``Path(None)`` escape hatch as the completion pair."""
     rec = _write_routine(vault, "Chores", {"type": "routine", "items": []})
 
     def _mut(items, completion_log):
@@ -259,7 +269,8 @@ def test_atomic_item_mutate_requires_vault_path(vault: Path) -> None:
             items=items, completion_log=completion_log, payload_extras={},
         )
 
-    with pytest.raises(TypeError):
+    assert_required_keyword_only(_atomic_item_mutate, "vault_path")
+    with pytest.raises(TypeError, match=MISSING_KWARG_RE):
         _atomic_item_mutate(rec, _mut)  # type: ignore[call-arg]
 
 
