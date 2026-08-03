@@ -98,7 +98,7 @@ def test_atomic_item_mutate_acquires_lock_on_the_record_path(tmp_path: Path, mon
     def _mut(items, completion_log):
         return _MutationResult(items=items, completion_log=completion_log, payload_extras={}, aborted=True)
 
-    _atomic_item_mutate(record, _mut)
+    _atomic_item_mutate(record, _mut, vault_path=vault)
     assert calls == [record]
 
 
@@ -137,7 +137,7 @@ def test_atomic_item_mutate_writes_atomically_via_os_replace(tmp_path: Path, mon
         completion_log["A"] = ["2026-07-25"]
         return _MutationResult(items=items, completion_log=completion_log, payload_extras={}, aborted=False)
 
-    _atomic_item_mutate(record, _mut)
+    _atomic_item_mutate(record, _mut, vault_path=vault)
     assert any(dst.endswith("Chores.md") for _src, dst in replaced)
 
 

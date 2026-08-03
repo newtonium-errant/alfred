@@ -86,6 +86,7 @@ import structlog
 import yaml
 
 from alfred.common.file_lock import file_rmw_lock
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 from . import completion as _completion
 from .cli import (
@@ -372,6 +373,8 @@ def _atomic_item_mutate(
         [list[dict], dict[str, list[str]]],
         _MutationResult,
     ],
+    *,
+    vault_path: Path,
 ) -> _MutationResult:
     """Load the record, run ``mutator_fn``, write atomically (UNLESS
     the mutator signalled ``aborted=True``).
@@ -393,6 +396,23 @@ def _atomic_item_mutate(
     (duplicate-item check, cadence-conflict check, TOCTOU-disappeared
     check).
     """
+    # Arc #18 containment (defence in depth — ``_routine_path`` already gates
+    # the composition its callers use). MUST run before ``file_rmw_lock``, not
+    # merely before the write: the lock does ``lock_path.parent.mkdir(
+    # parents=True)``, so a late check still creates directories + a ``.lock``
+    # sidecar at an out-of-vault target. ``vault_path`` is a REQUIRED keyword
+    # for the reason in ``completion._contained`` — a defaulted one would make
+    # this silently skippable in production while every test stays green.
+    try:
+        record_path = resolve_in_vault(
+            vault_path, record_path, writer="routine.cli_items.item_mutate",
+        )
+    except VaultContainmentError:
+        log.warning(
+            "routine.cli_items.path_escape_denied", path=str(record_path),
+        )
+        raise
+
     # Hold the cross-process RMW lock across the WHOLE read → mutate → write,
     # on the SAME record-path sidecar that ``tier.promote`` locks — so
     # concurrent routine writers (cmd_undone/add/remove/edit) + promote
@@ -885,7 +905,7 @@ def cmd_item_add(
             payload_extras={"new_item": new_item},
         )
 
-    result = _atomic_item_mutate(resolved_path, _mutator)
+    result = _atomic_item_mutate(resolved_path, _mutator, vault_path=vault_path)
 
     if duplicate_seen["hit"]:
         return _emit_canary(
@@ -985,7 +1005,7 @@ def cmd_item_remove(
             },
         )
 
-    result = _atomic_item_mutate(resolved_path, _mutator)
+    result = _atomic_item_mutate(resolved_path, _mutator, vault_path=vault_path)
 
     if not wants_json:
         log.info(
@@ -1195,7 +1215,7 @@ def cmd_item_edit(
             },
         )
 
-    result = _atomic_item_mutate(resolved_path, _mutator)
+    result = _atomic_item_mutate(resolved_path, _mutator, vault_path=vault_path)
 
     if cadence_conflict["err"] is not None:
         return _emit_canary(
@@ -1340,7 +1360,9 @@ def cmd_undone(
     # Called via the module attribute so the identity pin can monkeypatch one
     # symbol and see both callers route through it.
     rel_path = str(resolved_path.relative_to(vault_path))
-    result = _completion.mark_routine_item_undone(resolved_path, canonical_item, iso)
+    result = _completion.mark_routine_item_undone(
+        resolved_path, canonical_item, iso, vault_path=vault_path,
+    )
 
     if result.kind == _completion.DONE_KIND_UNKNOWN_ITEM:
         # TOCTOU: the item vanished between resolution and the writer's lock.

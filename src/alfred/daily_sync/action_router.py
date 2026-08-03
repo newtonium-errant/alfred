@@ -720,7 +720,7 @@ def _slot_done(
         if refusal is not None:
             return refusal
         result = _completion.mark_routine_item_done(
-            record_path, item_text, today.isoformat(),
+            record_path, item_text, today.isoformat(), vault_path=Path(vault_path),
         )
         if result.ok:
             feed_store.set_state(feed_item_id, STATE_ACTED, action=DONE_ACTION)
@@ -836,7 +836,7 @@ def _slot_undo(
         if refusal is not None:
             return refusal
         result = _completion.mark_routine_item_undone(
-            record_path, item_text, today.isoformat(),
+            record_path, item_text, today.isoformat(), vault_path=Path(vault_path),
         )
         if result.ok:
             feed_store.set_state(feed_item_id, STATE_OPEN)
