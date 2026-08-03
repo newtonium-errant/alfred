@@ -119,7 +119,11 @@ _CLUSTER_OPT_OUT_SENTINEL = "general"
 # ``alfred`` → ``salem`` mapping). Re-exported here under the original
 # name so existing call sites and tests continue to work unchanged.
 
-from ._compat import _normalize_instance_name  # noqa: E402, F401
+from ._compat import (  # noqa: E402, F401
+    _normalize_instance_name,
+    collapse_peer_name,
+    resolve_peer_key,
+)
 
 
 # --- Application-level inbound pre-pass ----------------------------------
@@ -4698,15 +4702,19 @@ async def _dispatch_peer_route(
     # reach…" error. Returning False makes the caller fall through to
     # Salem's normal handling, same as the TransportServerDown branch.
     #
-    # ``name`` (not ``canonical``) is the peer-key source: ``KAL-LE``
-    # normalizes to ``kal-le`` (matches the peer key), whereas
-    # ``K.A.L.L.E.`` normalizes to ``kalle`` (no dashes — wouldn't
-    # match). This mirrors ``transport.health._infer_self_name``.
+    # ``name`` (not ``canonical``) is the peer-key source; it stays the
+    # wire form handed to ``peer_send`` below. #30: the SELF-TARGET
+    # COMPARISON, though, is an identity question, so it collapses both
+    # sides via ``collapse_peer_name`` — that way ``K.A.L.L.E.`` and
+    # ``KAL-LE`` compare equal instead of yielding ``kalle`` vs
+    # ``kal-le`` and letting a self-route slip past this guard.
     self_name = _normalize_instance_name(
         config.instance.name or config.instance.canonical or "",
     )
-    target_normalized = _normalize_instance_name(target)
-    if target_normalized == self_name:
+    self_identity = collapse_peer_name(
+        config.instance.name or config.instance.canonical or "",
+    )
+    if collapse_peer_name(target) == self_identity:
         log.info(
             "talker.bot.peer_route_self_target",
             chat_id=chat_id,
@@ -4744,6 +4752,26 @@ async def _dispatch_peer_route(
             chat_id=chat_id, error=str(exc),
         )
         return False
+
+    # #30: resolve the classifier's target spelling to a CONFIGURED peer
+    # key before it reaches ``peer_send`` (which looks ``target`` up in
+    # ``transport_config.peers`` verbatim). Sender-local aliases diverge
+    # across instances — VERA names KAL-LE ``kalle`` while every other
+    # instance writes ``kal-le`` — so a canonical emission would miss a
+    # box whose alias is spelled differently. Fail-closed: an unresolvable
+    # name falls through to local handling rather than routing nowhere.
+    resolved_target = resolve_peer_key(target, transport_config.peers.keys())
+    if resolved_target is None:
+        log.warning(
+            "talker.peer_key_unresolved",
+            chat_id=chat_id,
+            target=target,
+            configured_peers=sorted(transport_config.peers.keys()),
+            reason="no configured transport.peers key matches this name "
+                   "(identity-collapsed); refusing to route",
+        )
+        return False
+    target = resolved_target
 
     correlation_id = peers_module._prune_orphans or None  # sanity import
     from alfred.transport.peers import _prune_orphans  # noqa: F401

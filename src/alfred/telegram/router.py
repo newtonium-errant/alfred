@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from alfred._anthropic_compat import messages_create_kwargs
+from ._compat import collapse_peer_name, resolve_peer_key
 from .session_types import (
     ROUTER_MODEL,
     SessionTypeDefaults,
@@ -448,13 +449,25 @@ def _decision_from_parsed(
     peer_route_hint: str = ""
     if session_type == "peer_route":
         raw_target = parsed.get("target")
-        if isinstance(raw_target, str) and raw_target.lower() in accepted_targets:
-            candidate = raw_target.lower()
+        # #30: resolve the classifier's spelling to a CONFIGURED key
+        # rather than testing raw membership. Sender-local aliases
+        # diverge across instances (VERA names KAL-LE ``kalle``; everyone
+        # else writes ``kal-le``), so a canonical emission would fail a
+        # literal ``in`` against a box whose alias is spelled otherwise.
+        # ``candidate`` is therefore always a real key from
+        # ``accepted_targets``, which is what the dispatcher needs.
+        candidate = (
+            resolve_peer_key(raw_target, accepted_targets)
+            if isinstance(raw_target, str) else None
+        )
+        if candidate is not None:
             # c3 parse-time guard: even with the "never self-target"
             # instruction in the prompt, the classifier can still emit
             # target=<self>. Drop to note with a warning so we can
             # track how often the instruction is ignored.
-            if self_name and candidate == self_name:
+            if self_name and (
+                collapse_peer_name(candidate) == collapse_peer_name(self_name)
+            ):
                 log.warning(
                     "talker.router.peer_route_self_target_coerced",
                     self_name=self_name,
@@ -470,7 +483,7 @@ def _decision_from_parsed(
         elif (
             valid_peer_targets is not None
             and isinstance(raw_target, str)
-            and raw_target.lower() in _VALID_PEER_TARGETS
+            and resolve_peer_key(raw_target, _VALID_PEER_TARGETS) is not None
         ):
             # NEW (#62): the target is a globally-known peer name but not
             # configured on THIS instance. Distinct log so the failure
