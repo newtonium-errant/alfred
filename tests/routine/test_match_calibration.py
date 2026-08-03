@@ -681,3 +681,33 @@ def test_filter_suppresses_on_the_real_alias_then_rejects_shape(
     assert kept == []
     assert stats.resolved == 1
     assert stats.aged_out == 0
+
+
+def test_alias_on_one_query_does_not_suppress_a_different_query(
+    tmp_path: Path,
+) -> None:
+    """The alias check is keyed on the ROW's own query, not on "any alias
+    exists". An alias for "clean hammer" must not resolve a pending row for an
+    unrelated phrase the operator has never ruled on.
+
+    Driven through ``load_glossary`` (the production loader) rather than a
+    hand-built Glossary, so the pin covers the real load path — a loader change
+    that leaked aliases across keys would slip past a hand-built fixture.
+
+    Mutation: key the alias check on anything other than the row's own
+    query_key → this fails."""
+    corpus = tmp_path / "corpus.jsonl"
+    mc.append_corpus(corpus, mc.MatchCorpusEntry(
+        type=mc.CORPUS_ALIAS,
+        query_key=mc.query_key("Clean hammer"),
+        item_text="Fully Clean House",
+    ))
+    unrelated = mc.PendingMatch(
+        query="walk doggo", matched_to="Walk dog", record="Daily",
+        confidence=0.40, captured_at="2026-08-02T12:00:00+00:00",
+    )
+    kept, stats = mc.filter_pending_for_review(
+        [unrelated], mc.load_glossary(corpus), today=TODAY,
+    )
+    assert [k.query for k in kept] == ["walk doggo"]
+    assert (stats.resolved, stats.surfaced) == (0, 1)

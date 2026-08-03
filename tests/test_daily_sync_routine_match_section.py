@@ -70,9 +70,9 @@ def test_enabled_with_pending_renders_numbered_list(tmp_path: Path) -> None:
     _seed_pending(
         p,
         mc.PendingMatch(query="walk doggo", matched_to="Walk dog",
-                        record="Daily", confidence=0.40),
+                        record="Daily", confidence=0.40, captured_at="2026-06-27T12:00:00+00:00"),
         mc.PendingMatch(query="meds", matched_to="Take meds",
-                        record="Health", confidence=0.33),
+                        record="Health", confidence=0.33, captured_at="2026-06-27T12:00:00+00:00"),
     )
     with structlog.testing.capture_logs() as cap:
         out = rms.routine_match_section(_cfg(p), date(2026, 6, 28), start_index=1)
@@ -91,7 +91,8 @@ def test_start_index_offsets_numbering(tmp_path: Path) -> None:
     continuous after earlier sections."""
     p = tmp_path / "pending.jsonl"
     _seed_pending(p, mc.PendingMatch(
-        query="q", matched_to="m", record="R", confidence=0.2))
+        query="q", matched_to="m", record="R", confidence=0.2,
+        captured_at="2026-06-27T12:00:00+00:00"))
     out = rms.routine_match_section(_cfg(p), date(2026, 6, 28), start_index=7)
     assert out is not None
     assert "7." in out
@@ -241,7 +242,7 @@ def test_consume_last_batch_returns_numbered_routine_match_items(tmp_path: Path)
                         record="Daily", confidence=0.40,
                         completion_date="2026-06-28", captured_at="t1"),
         mc.PendingMatch(query="meds", matched_to="Take meds",
-                        record="Health", confidence=0.33),
+                        record="Health", confidence=0.33, captured_at="2026-06-27T12:00:00+00:00"),
     )
     rms.routine_match_section(_cfg(p), date(2026, 6, 28), start_index=5)
     batch = rms.consume_last_batch()
@@ -276,10 +277,11 @@ def test_no_match_item_renders_did_you_mean(tmp_path: Path) -> None:
     _seed_pending(
         p,
         mc.PendingMatch(query="walk doggo", matched_to="Walk dog",
-                        record="Daily", confidence=0.40),  # low_conf (default)
+                        record="Daily", confidence=0.40,  # low_conf (default)
+                        captured_at="2026-06-27T12:00:00+00:00"),
         mc.PendingMatch(query="feed the birds", matched_to="Feed the cat",
                         record="Daily", confidence=0.50,
-                        kind=mc.KIND_NO_MATCH),
+                        kind=mc.KIND_NO_MATCH, captured_at="2026-06-27T12:00:00+00:00"),
     )
     out = rms.routine_match_section(_cfg(p), date(2026, 6, 28), start_index=1)
     assert out is not None
@@ -298,7 +300,8 @@ def test_disabled_clears_holder(tmp_path: Path) -> None:
     leak into a later fire's persist)."""
     p = tmp_path / "pending.jsonl"
     _seed_pending(p, mc.PendingMatch(
-        query="q", matched_to="m", record="R", confidence=0.2))
+        query="q", matched_to="m", record="R", confidence=0.2,
+        captured_at="2026-06-27T12:00:00+00:00"))
     # First an enabled fire populates the holder…
     rms.routine_match_section(_cfg(p), date(2026, 6, 28))
     assert rms.peek_last_batch_count() == 1

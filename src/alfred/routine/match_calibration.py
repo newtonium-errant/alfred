@@ -376,12 +376,27 @@ def filter_pending_for_review(
        query_key alone: once the operator has said "that phrase means X",
        re-asking "did you mean Y?" for the same phrase is the groundhog even
        though the pair never matched.
-    2. **Aged out** — captured more than ``max_age_days`` ago. A row that has
-       sat unreviewed that long is one the operator has decided not to answer;
-       asking again daily is nagging, not calibration. Undateable rows fail
-       OPEN (kept) — never silently retire what we couldn't date.
-    3. **Capped** — at most ``max_items``, most recent first, so a capture
-       burst can't wall the review surface.
+    2. **Aged out** — captured more than ``max_age_days`` ago. USUALLY that
+       means the operator saw it and chose not to answer, and asking again
+       daily is nagging rather than calibration. It does NOT mean that in
+       every case: a row that sat below the ``max_items`` cut every day never
+       surfaced at all and still ages out, unseen. The counts distinguish the
+       two only in aggregate (``aged_out`` vs ``capped``), not per row — see
+       the caller's ILB log, and the starvation note on the cap below.
+       Undateable rows fail OPEN (kept) — never silently retire what we
+       couldn't date.
+    3. **Capped** — at most ``max_items`` rows, SELECTING the most recently
+       captured (this is a selection rule, not a render order — the kept rows
+       keep their original file order). A capture burst therefore can't wall
+       the review surface.
+
+       Known interaction: selecting the newest starves the oldest, and a
+       perpetually-starved row eventually ages out having never been shown.
+       Harmless while captures are rare (the cap only binds above
+       ``max_items`` in a single window), but it is a real trade — FIFO would
+       guarantee every row is seen once before it can expire, at the cost of
+       burying fresh captures behind a backlog. Left as-is deliberately;
+       flagged rather than silently chosen.
 
     Non-destructive by design: the sink is the capture record and stays
     intact; the corpus stays the single source of truth for verdicts. That
