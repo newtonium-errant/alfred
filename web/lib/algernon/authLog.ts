@@ -42,6 +42,36 @@ export function emailDomain(email: unknown): string {
   return email.slice(at + 1).trim().toLowerCase() || '(none)';
 }
 
+/** Longest any single field may render. A pathological upstream body must not flood the journal. */
+const MAX_FIELD_CHARS = 120;
+
+/**
+ * Make a value safe to interpolate into a ONE-LINE log record.
+ *
+ * The `error` field carries a string relayed straight from the upstream body and
+ * is otherwise unvalidated, so it is an injection vector into the journal. The
+ * guarantee here is that a VALUE can never be mistaken for STRUCTURE:
+ *  - control characters (a newline above all) would forge a whole extra line —
+ *    `error=x\n[bff:auth/otp/verify] outcome=ok` greps as a genuine success;
+ *  - `=` and `[` `]` would forge FIELDS or a record prefix INSIDE one line, which
+ *    a newline guard alone does not stop: neutralising only the newline still
+ *    leaves `error=rate_limited?[bff:auth/otp/verify]_outcome=ok` matching a
+ *    naive `grep outcome=ok`. Both classes go.
+ *  - spaces collapse to `_`, so a multi-word value cannot split into two fields.
+ *
+ * Sanitising rather than allowlisting the known codes is deliberate: an
+ * allowlist would silently render any NEW backend error code as `unknown`,
+ * blinding exactly the incident that introduced it. Legitimate codes are
+ * snake_case identifiers, so none of the replaced characters costs real signal.
+ */
+export function sanitizeLogValue(value: string | number | boolean): string {
+  return String(value)
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f=[\]]/g, '?')
+    .replace(/\s/g, '_')
+    .slice(0, MAX_FIELD_CHARS);
+}
+
 export interface AuthOutcome {
   /** Terse, greppable verb for what the route did (`ok`, `rejected`, `sent`, …). */
   outcome: string;
@@ -61,14 +91,21 @@ export interface AuthOutcome {
  * `upstream=none` when the route answered without relaying.
  */
 export function logAuthOutcome(route: string, o: AuthOutcome): void {
+  // EVERY interpolated field goes through the sanitiser, not just `extra.error`.
+  // `email_domain` is caller-supplied upstream of emailDomain() and so can carry
+  // control bytes too ("a@b\nc"), which makes it a second forging vector; `route`
+  // and `outcome` are call-site literals today, and sanitising them costs nothing
+  // and removes the question for whoever adds the next call site.
   const parts = [
-    `outcome=${o.outcome}`,
+    `outcome=${sanitizeLogValue(o.outcome)}`,
     `upstream=${typeof o.upstream === 'number' ? o.upstream : 'none'}`,
     `status_class=${statusClass(o.upstream)}`,
-    `email_domain=${emailDomain(o.email)}`,
+    `email_domain=${sanitizeLogValue(emailDomain(o.email))}`,
   ];
-  for (const [k, v] of Object.entries(o.extra ?? {})) parts.push(`${k}=${v}`);
-  const line = `[bff:${route}] ${parts.join(' ')}`;
+  for (const [k, v] of Object.entries(o.extra ?? {})) {
+    parts.push(`${sanitizeLogValue(k)}=${sanitizeLogValue(v)}`);
+  }
+  const line = `[bff:${sanitizeLogValue(route)}] ${parts.join(' ')}`;
   if (o.level === 'warn') console.warn(line);
   else console.log(line);
 }

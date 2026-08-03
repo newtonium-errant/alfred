@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { emailDomain, logAuthOutcome, statusClass } from '../lib/algernon/authLog';
+import {
+  emailDomain,
+  logAuthOutcome,
+  sanitizeLogValue,
+  statusClass,
+} from '../lib/algernon/authLog';
 
 // The BFF auth-outcome logger. Its redaction contract is security-load-bearing:
 // no passcode, no session token, no full email address may ever reach a log line.
@@ -69,6 +74,48 @@ describe('emailDomain', () => {
     ['an object', { email: 'andrew@example.com' }],
   ])('returns (none) for a non-string input — %s', (_label, raw) => {
     expect(emailDomain(raw)).toBe('(none)');
+  });
+});
+
+describe('sanitizeLogValue — log-forging guard', () => {
+  it('neutralises a newline so an upstream error string cannot forge a line', () => {
+    const forged = 'rate_limited\n[bff:auth/otp/verify] outcome=ok upstream=200';
+    const safe = sanitizeLogValue(forged);
+    expect(safe).not.toContain('\n');
+    expect(safe.split('\n')).toHaveLength(1);
+  });
+
+  it.each([
+    ['carriage return', 'a\rb'],
+    ['NUL', 'a\u0000b'],
+    ['escape', 'a\u001bb'],
+    ['DEL', 'a\u007fb'],
+    ['C1 control', 'a\u0085b'],
+  ])('replaces a %s', (_label, raw) => {
+    const safe = sanitizeLogValue(raw);
+    expect(safe).toBe('a?b');
+  });
+
+  it('collapses spaces so a multi-word value cannot fake extra key=value fields', () => {
+    expect(sanitizeLogValue('some upstream words')).toBe('some_upstream_words');
+  });
+
+  it.each([
+    ['field separator', 'outcome=ok', 'outcome?ok'],
+    ['record prefix', '[bff:x]', '?bff:x?'],
+  ])('neutralises the %s so a value cannot forge structure INSIDE one line', (_l, raw, want) => {
+    // A newline guard alone is not enough: with only control characters replaced,
+    // a forged payload still greps as `outcome=ok` from the middle of a line.
+    expect(sanitizeLogValue(raw)).toBe(want);
+  });
+
+  it('bounds the length so a pathological upstream body cannot flood the journal', () => {
+    expect(sanitizeLogValue('x'.repeat(5000))).toHaveLength(120);
+  });
+
+  it('leaves an ordinary backend error code untouched', () => {
+    // Sanitising beats allowlisting precisely because a NEW code still renders.
+    expect(sanitizeLogValue('some_brand_new_backend_code')).toBe('some_brand_new_backend_code');
   });
 });
 

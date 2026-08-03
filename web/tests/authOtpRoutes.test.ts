@@ -353,6 +353,39 @@ describe('OTP route observability', () => {
     expect(hits[0]).toContain('error=rate_limited');
   });
 
+  // LOG-FORGING PIN, driven through the PRODUCTION relay path rather than the
+  // sanitiser in isolation: request.ts passes the upstream `error` string
+  // straight into the log line, and it is unvalidated. A newline in it would
+  // otherwise emit a second journal line that greps as a genuine success —
+  // the log equivalent of an injection.
+  it('cannot be made to forge a log line via the relayed upstream error string', async () => {
+    mockCallTransport.mockResolvedValue({
+      status: 429,
+      body: { error: 'rate_limited\n[bff:auth/otp/verify] outcome=ok upstream=200 status_class=2xx' },
+    });
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await requestHandler(postReq({ email: 'andrew@example.com' }), res);
+
+    const lines = cap.lines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('\n');
+    // The forged text is neutralised, not merely relocated: no second record can
+    // be read out of this line, and the real outcome is still legible.
+    expect(lines[0]).toContain('outcome=rejected');
+    expect(lines[0]).not.toContain('outcome=ok');
+  });
+
+  it('cannot be made to forge a line via a control character in the email either', async () => {
+    // emailDomain() echoes the domain, so the address is a second injection vector.
+    mockCallTransport.mockResolvedValue({ status: 200, body: { status: 'sent' } });
+    const cap = captureLogs();
+    const { res } = mockRes();
+    await requestHandler(postReq({ email: 'andrew@exa\nmple.com' }), res);
+
+    for (const line of cap.lines()) expect(line).not.toContain('\n');
+  });
+
   // THE REDACTION PIN. Drives every logging path on both routes and asserts the
   // three forbidden secrets never appear. Security-load-bearing: adding a field
   // to a log line must not be able to leak the passcode, the session token, or

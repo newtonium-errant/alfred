@@ -46,13 +46,24 @@ function isIndeterminateVerifyFailure(err: unknown): boolean {
 /**
  * Did the sign-in actually land despite the error? Asks the BFF who we are.
  *
- * HONEST LIMIT — worth knowing before trusting this too far: the session cookie
- * rides the very response that failed, so when the response is lost ENTIRELY the
- * cookie is lost with it and this correctly reports "no". What it DOES rescue is
- * the partial shape — headers (and therefore Set-Cookie) arrived, then the body
- * read failed — plus any client-side throw after a clean success. Closing the
- * full response-loss case needs an idempotency key on the verify itself, which
- * touches one-time-use semantics and is a separate, security-gated arc.
+ * WHAT THIS ACTUALLY RESCUES — one case, narrower than it looks: a fetch()
+ * REJECTION (surfaced as ApiError.status === 0) on a response whose headers the
+ * platform had already applied, so Set-Cookie reached the jar while the promise
+ * still rejected. That is the plausible iOS-PWA-resume shape, and the only one
+ * where the session exists but the client believes it failed.
+ *
+ * WHAT IT DOES NOT — read this before scoping the idempotency-key work:
+ *  - A response lost ENTIRELY takes the Set-Cookie with it. Nothing to find.
+ *  - The 5xx branch earns its place through the HONEST COPY, not through rescue:
+ *    every BFF error path answers without setting cookies, so that probe always
+ *    says no. Do not cite it as coverage.
+ *  - A 200 whose BODY fails to parse never arrives here at all — http.ts's
+ *    parseOrThrow swallows the read error on an ok response and returns null, so
+ *    the verify RESOLVES and the ordinary redirect runs.
+ *
+ * (An earlier draft of this comment claimed the last two as rescued cases; both
+ * were unreachable. Measured, not assumed — the distinction scopes what an
+ * idempotency key still has to cover.)
  */
 async function probeSignedIn(err: unknown): Promise<boolean> {
   if (!isIndeterminateVerifyFailure(err)) return false;
