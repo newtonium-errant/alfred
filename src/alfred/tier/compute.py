@@ -1720,6 +1720,13 @@ def compute_today_view(
     # (the default) leaves the feature entirely inert: no store, no filter,
     # byte-identical view. Applied HERE, in the one projection the board and
     # the brief's tier section both read, so the two can never disagree.
+    # The path normally arrives on ``tier_defaults`` (stamped once at brief
+    # config load), which is why no production caller passes it explicitly —
+    # an explicit argument is the test/override path. Reading it from the
+    # already-threaded bundle is what makes the read side reachable from all
+    # three callers without a 4th parameter any of them could forget.
+    if snooze_path is None:
+        snooze_path = getattr(tier_defaults, "snooze_path", "") or None
     snooze_suppressed = 0
     if snooze_path is not None:
         from alfred.tier.snooze import filter_snoozed_entries, load_snoozes

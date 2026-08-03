@@ -109,6 +109,26 @@ class SnoozeEntry:
         return cls(**known)
 
 
+def resolve_snooze_path(raw: Any) -> str | None:
+    """``tier.snooze.path`` out of a unified config dict, or ``None``.
+
+    THE single parse of this key. The writer (the board action dispatcher) and
+    the reader (the projection, via ``tier_defaults.snooze_path``) both come
+    through here, so they cannot resolve to different files — a drift between
+    them would mean snoozes written where nothing reads them, which is the
+    same read/write split that BLOCKed this feature at gate.
+    """
+    if not isinstance(raw, dict):
+        return None
+    tier_section = raw.get("tier")
+    if not isinstance(tier_section, dict):
+        return None
+    snooze_section = tier_section.get("snooze")
+    if not isinstance(snooze_section, dict):
+        return None
+    return str(snooze_section.get("path") or "") or None
+
+
 def slot_stable_key(entry: Any) -> str:
     """Durable identity for a tier-lane entry.
 
@@ -319,6 +339,7 @@ __all__ = [
     "is_snoozed",
     "load_snoozes",
     "remove_snooze",
+    "resolve_snooze_path",
     "save_snoozes",
     "slot_stable_key",
 ]

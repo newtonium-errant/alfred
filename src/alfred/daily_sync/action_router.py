@@ -443,6 +443,8 @@ def _snooze_store_path(config: Any) -> str | None:
     ``None`` = not wired on this instance, and every snooze verb then refuses
     honestly rather than accepting a tap it would silently drop.
     """
+    from alfred.tier.snooze import resolve_snooze_path
+
     config_path = getattr(config, "config_path", None) or "config.yaml"
     try:
         import yaml as _yaml
@@ -452,13 +454,8 @@ def _snooze_store_path(config: Any) -> str | None:
     except Exception as exc:  # noqa: BLE001
         log.info("board.snooze.config_unavailable", error=str(exc))
         return None
-    tier_section = raw.get("tier") if isinstance(raw, dict) else None
-    if not isinstance(tier_section, dict):
-        return None
-    snooze_section = tier_section.get("snooze")
-    if not isinstance(snooze_section, dict):
-        return None
-    return str(snooze_section.get("path") or "") or None
+    # Shared parse — the reader resolves the SAME key through the SAME helper.
+    return resolve_snooze_path(raw)
 
 
 def _dispatch_slot_snooze(
@@ -476,7 +473,10 @@ def _dispatch_slot_snooze(
     completion no matter what evidence arrives. It writes ONLY the sidecar
     store — no vault mutation of any kind.
     """
-    from alfred.tier.snooze import add_snooze, remove_snooze, slot_stable_key
+    # Only these two. This function's imports are structurally pinned (the
+    # no-completion-writer test reads its bytecode names), so an unused name
+    # here reads as load-bearing to the next person — keep it exact.
+    from alfred.tier.snooze import add_snooze, remove_snooze
 
     evidence = dict(getattr(item, "evidence", None) or {})
     store_path = _snooze_store_path(config)

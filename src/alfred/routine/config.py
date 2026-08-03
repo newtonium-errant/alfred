@@ -365,6 +365,17 @@ class TierDefaultsConfig:
 
     escalate_at_days: int | None = None
     surface_at_days: int | None = None
+    # Board snooze store (R3). NOT parsed by from_raw — it lives under
+    # ``tier.snooze.path``, not ``routine.tier_defaults`` — it is stamped on by
+    # whoever loads the unified config (see brief/config.py).
+    #
+    # It rides HERE rather than as a new compute_today_view argument because
+    # this object is ALREADY threaded to every production caller of the
+    # projection. A 4th parameter would have to be added at three call sites
+    # and kept there forever; forgetting it at one is exactly what left the
+    # read side dead and BLOCKed this feature at gate. Carrying it on the
+    # existing bundle makes "forgot to thread it" unrepresentable.
+    snooze_path: str = ""
 
     @classmethod
     def from_raw(cls, raw: Any) -> "TierDefaultsConfig":

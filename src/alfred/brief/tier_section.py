@@ -840,6 +840,7 @@ def _render_t2_selection_pool(
     auto_t1_record_names: set[str],
     curated_t1_record_names: set[str],
     curated_t2_record_names: set[str],
+    snoozed_names: set[str] | None = None,
 ) -> str:
     """Compose the ``### T2 selection pool`` subsection (materials).
 
@@ -850,9 +851,12 @@ def _render_t2_selection_pool(
       3. NOT in today's auto-T1 set (already in T1 shortlist)
       4. NOT already in curated T1 (operator confirmed) or T2 (operator
          picked)
+      5. NOT board-snoozed (R3) — offering back a row the operator just
+         parked is the same broken promise as leaving it on the board
 
     Empty-pool path emits a sentinel line per intentionally-left-blank.
     """
+    snoozed_names = snoozed_names or set()
     pool: list[tuple[str, Path]] = []  # (display_name, path) for sort
     alfred_triage_skipped = 0
     for path, fm, name in records:
@@ -876,6 +880,8 @@ def _render_t2_selection_pool(
         if name in curated_t1_record_names:
             continue
         if name in curated_t2_record_names:
+            continue
+        if name in snoozed_names:
             continue
         pool.append((name, path))
 
@@ -1247,11 +1253,38 @@ def render_tier_section(
         auto_t3_routine_candidates,
         today_iso=today.isoformat(),  # #20 P5 NOTE-2: ✓-strike done T3 only on the rendered day
     )
+    # Snoozed rows must not reappear in the pool. The pool is a RENDER-ONLY
+    # material computed here, not sliced from today_view, so the projection's
+    # suppression does not reach it — a snoozed task dropped out of T1 and
+    # showed up two sections lower under "tasks you might want to add",
+    # i.e. the system offering back the thing just parked. The ratified matrix
+    # is "hide-from-board AND suppress re-suggestion"; a pick-list IS the
+    # re-suggestion surface. Found by the end-to-end pin, not by unit pins.
+    from alfred.tier.snooze import load_snoozes, is_snoozed
+
+    _snooze_path = getattr(tier_defaults, "snooze_path", "") or None
+    _snoozed_task_names: set[str] = set()
+    if _snooze_path is not None:
+        _snoozes = load_snoozes(_snooze_path)
+        for _path, _fm, _name in records:
+            _stored = _snoozes.get(f"task:task/{_path.name}")
+            if _stored is None:
+                continue
+            # Same predicate as the projection — a due-date delta that would
+            # break the row through onto the board must also return it here.
+            _suppressed, _ = is_snoozed(
+                _stored, today=today,
+                current_due_iso=str(_fm.get("due") or ""),
+            )
+            if _suppressed:
+                _snoozed_task_names.add(_name)
+
     pool = _render_t2_selection_pool(
         records,
         auto_t1_record_names,
         curated_t1_names,
         curated_t2_names,
+        snoozed_names=_snoozed_task_names,
     )
     rollover = _render_rollover_section(yesterday_curation, status_by_name)
 

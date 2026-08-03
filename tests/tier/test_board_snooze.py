@@ -10,7 +10,7 @@ completion.** It writes nothing to the vault.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import structlog
@@ -385,3 +385,316 @@ def test_snooze_ceiling_admits_exactly_the_ratified_verbs() -> None:
         "done", "undo_done", "accept", "snooze_1d", "snooze_3d", "snooze_7d",
         "unsnooze",
     }
+
+
+# --- END-TO-END through a PRODUCTION entry point -------------------------------
+#
+# The R3 gate BLOCKed on exactly the gap these close: compute_today_view grew a
+# snooze_path parameter that NO production caller threaded. Every unit pin was
+# green, the write side was live, the read side was dead — a configured
+# operator would be told "snoozed until X" and see the row return tomorrow.
+# That is accepted-then-ignored, the disease this whole round set out to cure,
+# reintroduced inside the cure.
+#
+# These drive a REAL vault through a REAL caller. A parameter that production
+# doesn't thread cannot pass them.
+
+
+PROD_NOW = datetime(2026, 5, 28, 13, 0, 0, tzinfo=timezone.utc)
+
+
+def _prod_vault(tmp_path: Path) -> Path:
+    vault = tmp_path / "vault"
+    (vault / "task").mkdir(parents=True, exist_ok=True)
+    (vault / "routine").mkdir(parents=True, exist_ok=True)
+    (vault / "task" / "Pay Steph.md").write_text(
+        "---\ntype: task\nstatus: todo\nname: Pay Steph\ndue: 2026-05-28\n---\n\n# Pay Steph\n",
+        encoding="utf-8",
+    )
+    return vault
+
+
+def _tier_defaults_with(store: Path | None):
+    """A real TierDefaultsConfig carrying the snooze path, exactly as
+    brief.config.load_from_unified stamps it."""
+    from alfred.routine.config import TierDefaultsConfig
+
+    td = TierDefaultsConfig()
+    td.snooze_path = str(store) if store is not None else ""
+    return td
+
+
+def test_e2e_slot_feed_omits_a_snoozed_row(tmp_path: Path) -> None:
+    """PRODUCTION ENTRY POINT: slot_suggestion_feed_items — the board's own
+    producer, called with the same 3 positionals production uses.
+
+    Mutation: revert compute_today_view to ignore tier_defaults.snooze_path
+    (i.e. the state that BLOCKed) → this fails."""
+    from alfred.brief.feed_producer import slot_suggestion_feed_items
+
+    vault = _prod_vault(tmp_path)
+    store = tmp_path / "snooze.json"
+
+    before = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(store), instance="salem",
+    )
+    assert before is not None
+    assert "slot_suggestion:task:task/Pay Steph.md" in {i.id for i in before}
+
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=3, today=PROD_NOW.date(), lane="task", due_iso="2026-05-28",
+    )
+
+    after = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(store), instance="salem",
+    )
+    assert after is not None
+    assert "slot_suggestion:task:task/Pay Steph.md" not in {i.id for i in after}
+
+
+def test_e2e_expired_snooze_lets_the_row_back_through(tmp_path: Path) -> None:
+    """The row comes BACK — a snooze that never expires is a delete.
+
+    Driven with an ALREADY-EXPIRED snooze at the same ``now`` as the other e2e
+    pins, rather than advancing the clock: a task due 2026-05-28 doesn't
+    auto-surface three days later at all, so a clock-advance version would pass
+    or fail for reasons that have nothing to do with snooze. (That was my first
+    draft, and it failed for exactly that reason.)"""
+    from alfred.brief.feed_producer import slot_suggestion_feed_items
+
+    vault = _prod_vault(tmp_path)
+    store = tmp_path / "snooze.json"
+    # Snoozed three days BEFORE 'now' for 1 day → expired by the time we look.
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=1, today=date(2026, 5, 25), lane="task", due_iso="2026-05-28",
+    )
+    assert sn.load_snoozes(store)["task:task/Pay Steph.md"].snoozed_until == "2026-05-26"
+
+    back = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(store), instance="salem",
+    )
+    assert back is not None
+    assert "slot_suggestion:task:task/Pay Steph.md" in {i.id for i in back}
+
+
+def test_e2e_unconfigured_snooze_path_is_inert(tmp_path: Path) -> None:
+    """No tier.snooze.path → the producer is byte-identical to pre-R3."""
+    from alfred.brief.feed_producer import slot_suggestion_feed_items
+
+    vault = _prod_vault(tmp_path)
+    items = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(None), instance="salem",
+    )
+    assert items is not None
+    assert "slot_suggestion:task:task/Pay Steph.md" in {i.id for i in items}
+
+
+def test_e2e_brief_tier_section_also_omits_a_snoozed_row(tmp_path: Path) -> None:
+    """SECOND production surface. The board and the brief read ONE projection,
+    so a row hidden from the deck must be absent from the rendered brief
+    section too — otherwise the operator sees it in the morning brief after
+    parking it on the board, which is the divergence the single-projection
+    design exists to prevent."""
+    from alfred.brief.tier_section import render_tier_section
+
+    vault = _prod_vault(tmp_path)
+    store = tmp_path / "snooze.json"
+
+    before = render_tier_section(vault, PROD_NOW, _tier_defaults_with(store))
+    assert "Pay Steph" in (before or "")
+
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=3, today=PROD_NOW.date(), lane="task", due_iso="2026-05-28",
+    )
+    after = render_tier_section(vault, PROD_NOW, _tier_defaults_with(store))
+    assert "Pay Steph" not in (after or "")
+
+
+def test_config_load_stamps_the_snooze_path_onto_tier_defaults(tmp_path: Path) -> None:
+    """THE WIRING PIN: brief config load is the single read-side resolution
+    point, and it must actually stamp the path where the projection reads it.
+
+    Mutation: drop the stamp line in brief/config.py → this fails, and so does
+    every e2e pin above."""
+    from alfred.brief.config import load_from_unified
+
+    cfg = load_from_unified({
+        "vault": {"path": str(tmp_path / "vault")},
+        "tier": {"snooze": {"path": "/x/board_snooze.json"}},
+    })
+    assert cfg.tier_defaults.snooze_path == "/x/board_snooze.json"
+
+
+def test_writer_and_reader_resolve_the_same_key(tmp_path: Path) -> None:
+    """Single-source: the dispatcher's resolver and the projection's resolver
+    are the same parse, so a snooze can never be written where nothing reads.
+
+    Mutation: give either side its own parse → this fails when they diverge."""
+    import yaml as _yaml
+
+    from alfred.daily_sync.action_router import _snooze_store_path
+
+    raw = {"tier": {"snooze": {"path": "/x/board_snooze.json"}}}
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(_yaml.safe_dump(raw), encoding="utf-8")
+
+    class _Cfg:
+        config_path = str(cfg_file)
+
+    writer_side = _snooze_store_path(_Cfg())
+    reader_side = sn.resolve_snooze_path(raw)
+    assert writer_side == reader_side == "/x/board_snooze.json"
+
+
+def test_e2e_snoozed_task_is_not_offered_back_in_the_t2_selection_pool(
+    tmp_path: Path,
+) -> None:
+    """FOUND BY THE E2E PIN, not by any unit pin.
+
+    The T2 selection pool is a RENDER-ONLY material computed in tier_section,
+    not sliced from today_view — so the projection's suppression never reached
+    it. A snoozed task correctly left T1 and then reappeared two sections lower
+    under "open tasks you might want to add": the system offering back the row
+    the operator had just parked. Same broken promise, different section.
+
+    Mutation: drop snoozed_names from _render_t2_selection_pool → this fails.
+    """
+    from alfred.brief.tier_section import render_tier_section
+
+    vault = _prod_vault(tmp_path)
+    store = tmp_path / "snooze.json"
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=3, today=PROD_NOW.date(), lane="task", due_iso="2026-05-28",
+    )
+    out = render_tier_section(vault, PROD_NOW, _tier_defaults_with(store)) or ""
+    assert "### T2 selection pool" in out           # the section still renders
+    assert "[[task/Pay Steph]]" not in out          # but not the parked row
+    assert "selection pool is empty" in out         # ILB sentinel, not silence
+
+
+def test_e2e_unsnoozed_task_is_still_offered_in_the_pool(tmp_path: Path) -> None:
+    """The pool filter is surgical — only parked rows drop out."""
+    from alfred.brief.tier_section import render_tier_section
+
+    vault = _prod_vault(tmp_path)
+    (vault / "task" / "File taxes.md").write_text(
+        "---\ntype: task\nstatus: todo\nname: File taxes\n---\n\n# File taxes\n",
+        encoding="utf-8",
+    )
+    store = tmp_path / "snooze.json"
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=3, today=PROD_NOW.date(), lane="task", due_iso="2026-05-28",
+    )
+    out = render_tier_section(vault, PROD_NOW, _tier_defaults_with(store)) or ""
+    assert "[[task/File taxes]]" in out
+    assert "[[task/Pay Steph]]" not in out
+
+
+# --- dispatcher-level constraint (the COMPOSITION point) ----------------------
+
+
+class _FakeStore:
+    """Records set_state calls; never touches disk."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def set_state(self, item_id, state, *, action=None):  # noqa: ANN001
+        self.calls.append((item_id, state, action))
+
+
+class _FakeItem:
+    def __init__(self, evidence: dict) -> None:
+        self.evidence = evidence
+        self.acted_action = None
+
+
+def _dispatch_config(tmp_path: Path, store: Path):
+    import yaml as _yaml
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        _yaml.safe_dump({"tier": {"snooze": {"path": str(store)}}}),
+        encoding="utf-8",
+    )
+
+    class _Cfg:
+        config_path = str(cfg_file)
+        schedule = None
+
+    return _Cfg()
+
+
+def test_dispatcher_snooze_leaves_the_vault_byte_identical(tmp_path: Path) -> None:
+    """THE COMPOSITION POINT. add_snooze's own byte-identical pin proves the
+    STORE writer touches no vault; it does NOT prove the DISPATCHER doesn't —
+    the dispatcher could route to a completion writer before or after calling
+    it, and every store-level pin would stay green.
+
+    This drives the real dispatcher end-to-end against a real vault. It is also
+    the pin that would have caught the read-side BLOCK's sibling: a snooze that
+    quietly wrote a completion would pass every unit pin and only show up here.
+
+    Mutation: call any completion writer from _dispatch_slot_snooze → fails.
+    """
+    from alfred.daily_sync.action_router import _dispatch_slot_snooze
+
+    vault = _prod_vault(tmp_path)
+    (vault / "daily").mkdir(exist_ok=True)
+    (vault / "daily" / "2026-05-28.md").write_text(
+        "---\ntype: daily\n---\n\n# 2026-05-28\n", encoding="utf-8",
+    )
+    before = {p: p.read_bytes() for p in vault.rglob("*") if p.is_file()}
+
+    store = tmp_path / "snooze.json"
+    feed_store = _FakeStore()
+    result = _dispatch_slot_snooze(
+        "slot_suggestion:task:task/Pay Steph.md", "snooze_3d",
+        _FakeItem({"origin": "task", "name": "Pay Steph",
+                   "path": "task/Pay Steph.md", "due_iso": "2026-05-28"}),
+        feed_store=feed_store,
+        config=_dispatch_config(tmp_path, store),
+    )
+
+    assert result.ok and result.status == "acted"
+    after = {p: p.read_bytes() for p in vault.rglob("*") if p.is_file()}
+    assert after == before, "the snooze DISPATCHER mutated the vault"
+    # It did do its actual job — sidecar written, verb stamped.
+    assert "task:task/Pay Steph.md" in sn.load_snoozes(store)
+    assert feed_store.calls == [
+        ("slot_suggestion:task:task/Pay Steph.md", "acted", "snooze"),
+    ]
+
+
+def test_dispatcher_refuses_a_snooze_on_a_done_row_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Refusal is honest AND inert: no store row, no state change, no vault
+    touch. An accepted-then-ignored refusal would be the same broken promise
+    in the opposite direction."""
+    from alfred.daily_sync.action_router import _dispatch_slot_snooze
+
+    vault = _prod_vault(tmp_path)
+    before = {p: p.read_bytes() for p in vault.rglob("*") if p.is_file()}
+    store = tmp_path / "snooze.json"
+    feed_store = _FakeStore()
+
+    with structlog.testing.capture_logs() as cap:
+        result = _dispatch_slot_snooze(
+            "slot_suggestion:task:task/Pay Steph.md", "snooze_3d",
+            _FakeItem({"origin": "task", "path": "task/Pay Steph.md",
+                       "done": True}),
+            feed_store=feed_store,
+            config=_dispatch_config(tmp_path, store),
+        )
+
+    assert result.ok is False
+    assert [c for c in cap if c.get("event") == "board.snooze.refused_already_done"]
+    assert sn.load_snoozes(store) == {}
+    assert feed_store.calls == []
+    assert {p: p.read_bytes() for p in vault.rglob("*") if p.is_file()} == before
