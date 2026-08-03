@@ -11,7 +11,13 @@ import time
 from pathlib import Path
 
 from alfred.common.file_lock import file_rmw_lock
-from alfred.feed.model import STATE_ACKED, STATE_ACTED, STATE_OPEN, FeedItem
+from alfred.feed.model import (
+    STATE_ACKED,
+    STATE_ACTED,
+    STATE_EXPIRED,
+    STATE_OPEN,
+    FeedItem,
+)
 from alfred.feed.store import FeedStore
 
 
@@ -422,3 +428,47 @@ def test_prechange_event_without_evidence_still_revives(tmp_path: Path) -> None:
 
     assert s.load()[f"event:{key}"].state == STATE_OPEN
     assert counts["suppressed"] == 0
+
+
+def test_open_snapshot_item_refreshes_a_non_fingerprint_field(tmp_path: Path) -> None:
+    """The decided-state guard is load-bearing, half 1 of 2.
+
+    An OPEN item must always be upserted, even when its fingerprint is
+    unchanged — otherwise a title/evidence edit outside the fingerprint fields
+    would never reach the store. Reviewer-specified: unchanged fingerprint +
+    differing NON-fingerprint field (title) → suppressed==0 AND title refreshed.
+
+    Mutation: delete the ``stored.state not in (ACTED, ACKED)`` guard → this
+    fails (the open item gets suppressed and keeps its stale title)."""
+    s = _store(tmp_path)
+    key = "2026-08-10|Dentist"
+    s.reconcile("event", [_event(key)])
+
+    renamed = _event(key)
+    renamed.title = "2026-08-10: Dentist (moved building)"  # NOT a fingerprint field
+    counts = s.reconcile("event", [renamed])
+
+    assert counts["suppressed"] == 0
+    assert s.load()[f"event:{key}"].title == "2026-08-10: Dentist (moved building)"
+
+
+def test_expired_snapshot_item_still_revives(tmp_path: Path) -> None:
+    """The decided-state guard is load-bearing, half 2 of 2.
+
+    ``expired`` is not a DECISION — the operator never acted on it, it simply
+    aged out. So an expired item whose fingerprint is unchanged must revive
+    exactly as it did before this policy; only acted/acked are sticky.
+    Reviewer-specified: expired + unchanged fingerprint → suppressed==0 AND
+    state=="open".
+
+    Mutation: widen the guard to ``stored.state != STATE_OPEN`` → this fails
+    (the expired item stays expired forever)."""
+    s = _store(tmp_path)
+    key = "2026-08-10|Dentist"
+    s.reconcile("event", [_event(key)])
+    s.set_state(f"event:{key}", STATE_EXPIRED)
+
+    counts = s.reconcile("event", [_event(key)])
+
+    assert counts["suppressed"] == 0
+    assert s.load()[f"event:{key}"].state == "open"
