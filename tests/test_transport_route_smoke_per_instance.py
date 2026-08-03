@@ -790,8 +790,8 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         # Cross-instance recall answer route (#20 S1, 2026-08-01) —
         # instances that don't enable transport.recall (every instance by
         # default) skip-log here. register_recall_routes ALSO emits its own
-        # ``transport.recall.disabled`` info log; this debug event is the
-        # wire-level skip signal.
+        # ``transport.recall.disabled`` info log; this wire-level skip signal
+        # is INFO too (promoted from debug, #16 item 14 — greppable at prod level).
         "transport.wire_transport_app.recall_skipped",
         # Feed surface (Feed Phase B, 2026-07-30) — instances wired with
         # feed_enabled=False (this smoke test omits the feed kwargs)
