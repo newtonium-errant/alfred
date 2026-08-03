@@ -77,6 +77,28 @@ export function ringItemStage(item: FeedItem): RingItemStage {
 }
 
 /**
+ * The C2 stage OVERLAY (#16 item 8 — ONE seam, was duplicated ~6 lines in RingsHeader +
+ * FeedRow): the optimistic hooks layered over the base `ringItemStage`. Precedence:
+ *   1. completion.effectiveDone → DONE   (a just-completed item flips green)
+ *   2. accept.accepted          → PLANNED (an accepted candidate flips candidate→committed)
+ *   3. base ringItemStage, with an optimistic UNDO (raw base 'done' but completion overrode
+ *      it not-done) returning the item to PLANNED, not falling through to the raw 'done'.
+ * The hooks are structural + optional so the rings panel (both present) and a feed row
+ * (either absent) share this single implementation. This MUST stay the only copy — a 4th
+ * stage or a precedence change lands HERE, once, and both surfaces move in lockstep.
+ */
+export function effectiveStageOf(
+  item: FeedItem,
+  completion: { effectiveDone: (it: FeedItem) => boolean },
+  accept: { accepted: (id: string) => boolean } | null | undefined,
+): RingItemStage {
+  if (completion.effectiveDone(item)) return 'done';
+  if (accept?.accepted(item.id)) return 'planned';
+  const base = ringItemStage(item);
+  return base === 'done' ? 'planned' : base;
+}
+
+/**
  * Whether a ring item is complete — the single choke-point for green/strikethrough,
  * now STAGE-derived so it can never disagree with `ringItemStage`. (Pre-C2 this was
  * `state==='acted' || evidence.done`; the ONLY behaviour change is that an

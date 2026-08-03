@@ -1,7 +1,7 @@
 import type { FeedItem } from '../../lib/algernon/feed';
 import { kindLabel } from '../../lib/algernon/feedConstants';
 import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
-import { COMPLETION_UNAVAILABLE_HINT, ringItemCompletable, ringItemStage, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
+import { COMPLETION_UNAVAILABLE_HINT, effectiveStageOf, ringItemCompletable, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
 import type { UseRingCompletionResult } from './useRingCompletion';
 import type { UseSlotAcceptResult } from './useSlotAccept';
 import { EvidenceBody } from './EvidenceBody';
@@ -38,18 +38,10 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, a
   // no key:value rows of its own.
   const hasBody = evidenceBody(item.evidence) !== null;
   const hasDetails = rows.length > 0 || hasBody || evidenceExternalLink(item.evidence) !== null;
-  // C2 stage seam (mirrors RingsHeader.effectiveStage): completion-done > accept-
-  // committed(planned) > base stage; an optimistic UNDO (raw done, override not-done)
-  // returns the row to PLANNED.
-  const stage: RingItemStage | null = completion
-    ? completion.effectiveDone(item)
-      ? 'done'
-      : accept?.accepted(item.id)
-        ? 'planned'
-        : ringItemStage(item) === 'done'
-          ? 'planned'
-          : ringItemStage(item)
-    : null;
+  // C2 stage overlay — the shared rings.ts seam (#16 item 8). A row with no completion
+  // context has no stage badge at all (null); otherwise it's the same overlay the rings
+  // panel uses, from one implementation.
+  const stage: RingItemStage | null = completion ? effectiveStageOf(item, completion, accept) : null;
   const done = stage === 'done';
   const suggested = stage === 'suggested';
   const busy = completion ? completion.busy(item.id) : false;
