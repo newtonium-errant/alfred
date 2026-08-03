@@ -541,7 +541,14 @@ def test_filter_fails_open_on_an_undateable_row() -> None:
     assert stats.aged_out == 0
 
 
-def test_filter_caps_the_days_list_keeping_most_recent() -> None:
+def test_filter_caps_the_days_list_fifo_oldest_first() -> None:
+    """FIFO (ruled 2026-08-03): the cap keeps the OLDEST unresolved rows, so
+    nothing can be starved out of existence.
+
+    This pin INVERTED from its original form — it previously asserted
+    ``["q2", "q3"]`` (newest-wins). The change is the ruling, not drift.
+
+    Mutation: revert to ``kept[-max_items:]`` → this fails."""
     rows = [
         _pending(query=f"q{i}", captured_at=f"2026-08-0{i}T12:00:00+00:00")
         for i in range(1, 4)
@@ -549,8 +556,27 @@ def test_filter_caps_the_days_list_keeping_most_recent() -> None:
     kept, stats = mc.filter_pending_for_review(
         rows, _glossary(), today=TODAY, max_items=2,
     )
-    assert [k.query for k in kept] == ["q2", "q3"]
+    assert [k.query for k in kept] == ["q1", "q2"]
     assert (stats.capped, stats.surfaced) == (1, 2)
+
+
+def test_fifo_cap_never_starves_a_row_out_of_existence() -> None:
+    """The reason FIFO was ruled: with newest-wins, the oldest rows sit below
+    the cut every single day and expire unseen. Under FIFO the oldest are
+    exactly the ones surfaced, so the backlog drains from the front.
+
+    Reproduces the reviewer's construction (15 rows, cap 10) and asserts the
+    survivors are the OLDEST ten — under the old rule they were the newest ten
+    and rows q1..q5 would never have been shown before aging out."""
+    rows = [
+        _pending(query=f"q{i:02d}", captured_at=f"2026-08-01T{i:02d}:00:00+00:00")
+        for i in range(1, 16)
+    ]
+    kept, stats = mc.filter_pending_for_review(
+        rows, _glossary(), today=TODAY, max_items=10,
+    )
+    assert [k.query for k in kept] == [f"q{i:02d}" for i in range(1, 11)]
+    assert (stats.capped, stats.surfaced) == (5, 10)
 
 
 def test_filter_stats_account_for_every_captured_row() -> None:

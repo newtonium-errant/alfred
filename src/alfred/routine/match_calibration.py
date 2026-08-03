@@ -385,18 +385,20 @@ def filter_pending_for_review(
        the caller's ILB log, and the starvation note on the cap below.
        Undateable rows fail OPEN (kept) — never silently retire what we
        couldn't date.
-    3. **Capped** — at most ``max_items`` rows, SELECTING the most recently
-       captured (this is a selection rule, not a render order — the kept rows
-       keep their original file order). A capture burst therefore can't wall
-       the review surface.
+    3. **Capped** — at most ``max_items`` rows, **FIFO: the OLDEST unresolved
+       rows win** (a selection rule, not a render order — the kept rows keep
+       their original file order). A capture burst can't wall the review
+       surface, and nothing is starved out of existence.
 
-       Known interaction: selecting the newest starves the oldest, and a
-       perpetually-starved row eventually ages out having never been shown.
-       Harmless while captures are rare (the cap only binds above
-       ``max_items`` in a single window), but it is a real trade — FIFO would
-       guarantee every row is seen once before it can expire, at the cost of
-       burying fresh captures behind a backlog. Left as-is deliberately;
-       flagged rather than silently chosen.
+       FIFO is the point, not an implementation detail. Selecting the NEWEST
+       (the original v1 behaviour) starves the oldest rows, and a
+       perpetually-starved row eventually ages out **having never been shown
+       once** — the system silently deciding on the operator's behalf, which
+       fails the CAPTURE half of the self-correcting standard before feedback
+       or approval ever enter it. FIFO instead guarantees every row is offered
+       at least once before it can expire; its cost is bounded LATENCY (fresh
+       captures queue behind a backlog), never loss. Ruled 2026-08-03 after a
+       reviewer drove 15 rows at ``max_items=10`` and five aged out unseen.
 
     Non-destructive by design: the sink is the capture record and stays
     intact; the corpus stays the single source of truth for verdicts. That
@@ -423,7 +425,9 @@ def filter_pending_for_review(
 
     if max_items >= 0 and len(kept) > max_items:
         stats.capped = len(kept) - max_items
-        kept = kept[-max_items:] if max_items else []
+        # FIFO — keep the OLDEST unresolved rows. ``pending`` is in file order,
+        # which is capture order, so a plain head-slice is the queue.
+        kept = kept[:max_items]
 
     stats.surfaced = len(kept)
     return kept, stats
