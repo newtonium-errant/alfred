@@ -141,9 +141,28 @@ def _resolve_gcal_enabled(raw: dict[str, Any]) -> bool:
         return False
 
 
+def _resolve_recall_ask_enabled(raw: dict[str, Any]) -> bool:
+    """Lazy-resolve whether this instance has a ``recall.ask`` edge list (#16 item 15).
+
+    Mirrors ``conversation._resolve_recall_ask_enabled_for_run_turn`` (which loads
+    from the config PATH) but reads off the already-parsed raw dict via the transport
+    loader — same shape as ``_resolve_gcal_enabled`` above. Without this the audit
+    called ``tools_for_set`` with ``recall_ask_enabled`` defaulting to False, so
+    ``recall_peers`` was INVISIBLE to the capability audit (couldn't confirm it was
+    advertised). Fail-closed (any load/parse/STAY-C-fence failure → False), matching
+    the runtime: an instance that can't prove its recall-ask edges surfaces no tool.
+    """
+    try:
+        from alfred.transport.config import load_from_unified as load_transport
+        return bool(load_transport(raw).recall.ask.peers)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _registered_tool_names(
     tool_set: str,
     gcal_enabled: bool,
+    recall_ask_enabled: bool = False,
 ) -> list[str]:
     """Return the ordered list of tool names the model would see.
 
@@ -154,7 +173,9 @@ def _registered_tool_names(
     tomorrow, the audit picks it up automatically.
     """
     from alfred.telegram.conversation import tools_for_set
-    tools = tools_for_set(tool_set, gcal_enabled=gcal_enabled)
+    tools = tools_for_set(
+        tool_set, gcal_enabled=gcal_enabled, recall_ask_enabled=recall_ask_enabled
+    )
     # Each tool schema dict has a ``name`` field — the canonical tool
     # name passed to the Anthropic Messages API. That's what gets
     # grepped against the SKILL body.
@@ -259,7 +280,10 @@ def audit_skill(raw: dict[str, Any]) -> AuditResult:
     )
 
     gcal_enabled = _resolve_gcal_enabled(raw)
-    registered = _registered_tool_names(tool_set, gcal_enabled=gcal_enabled)
+    recall_ask_enabled = _resolve_recall_ask_enabled(raw)
+    registered = _registered_tool_names(
+        tool_set, gcal_enabled=gcal_enabled, recall_ask_enabled=recall_ask_enabled
+    )
 
     skill_path = get_skills_dir() / skill_bundle / "SKILL.md"
     if not skill_path.exists():

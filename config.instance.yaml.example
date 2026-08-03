@@ -181,8 +181,8 @@ brief_digest_push:
     - "/home/andrew/aftermath-alfred"
   # data_dir defaults to logging.dir when omitted; bash_exec.jsonl +
   # instructor_state.json live there.
-  # bit_state_path is optional — KAL-LE doesn't run BIT in v1, so
-  # leaving this empty defaults posture to "green / no BIT data".
+  # bit_state_path is optional — an instance that doesn't run BIT can leave
+  # this empty (posture then defaults to "green / no BIT data").
 
 # ===========================================================================
 # OPTIONAL BLOCKS — uncomment what this instance needs.

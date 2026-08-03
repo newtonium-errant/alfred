@@ -158,7 +158,7 @@ export default function DeckPage() {
           // inline on the Feed / rings, not deck cards.
           <p data-testid="deck-unactionable" className={`mt-6 ${subtle}`}>
             {unactionableCount} item{unactionableCount > 1 ? 's are' : ' is'} on your worklist —
-            complete {unactionableCount > 1 ? 'them' : 'it'} on the{' '}
+            see {unactionableCount > 1 ? 'them' : 'it'} on the{' '}
             <Link href="/feed" className="underline underline-offset-2">
               Feed
             </Link>

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  effectiveStageOf,
   isTodayInstanceTz,
   ringItemCommitted,
   ringItemCompletable,
@@ -104,6 +105,33 @@ describe('ringItemStage — C2 lifecycle (suggested → planned → done), VERB-
     expect(ringItemCommitted(cand)).toBe(false);
     expect(ringItemCommitted(accepted)).toBe(true); // accepted = planned = committed
     expect(ringItemCommitted(done)).toBe(true);
+  });
+});
+
+describe('effectiveStageOf — the shared C2 stage overlay (#16 item 8, the one seam)', () => {
+  const doner = { effectiveDone: () => true };
+  const notDoner = { effectiveDone: () => false };
+  const accepter = { accepted: () => true };
+  const notAccepter = { accepted: () => false };
+
+  it('completion.effectiveDone WINS → done (over any base)', () => {
+    const suggested = slot({ state: 'open', evidence: { tier: 1, candidate: true } });
+    expect(effectiveStageOf(suggested, doner, notAccepter)).toBe('done');
+  });
+  it('accept.accepted → planned (optimistically flips a suggested candidate)', () => {
+    const suggested = slot({ state: 'open', evidence: { tier: 1, candidate: true } });
+    expect(effectiveStageOf(suggested, notDoner, accepter)).toBe('planned');
+  });
+  it('optimistic UNDO: raw base DONE but completion says not-done → planned (never the raw done)', () => {
+    const doneItem = slot({ state: 'acted', evidence: { tier: 1 } }); // base = done (legacy acted)
+    expect(ringItemStage(doneItem)).toBe('done');
+    expect(effectiveStageOf(doneItem, notDoner, notAccepter)).toBe('planned');
+  });
+  it('no overlay → the base stage; accept absent (null) is safe', () => {
+    const planned = slot({ state: 'open', evidence: { tier: 1 } });
+    const suggested = slot({ state: 'open', evidence: { tier: 1, candidate: true } });
+    expect(effectiveStageOf(planned, notDoner, notAccepter)).toBe('planned');
+    expect(effectiveStageOf(suggested, notDoner, null)).toBe('suggested');
   });
 });
 

@@ -15,6 +15,10 @@ import type { FeedItem } from './feed';
 // title + kind + url regardless (the lock-screen privacy pin in pushPayload.ts).
 // The poller already restricts to needs-you items (fetchNeedsYouItems), so this
 // predicate only ever narrows within that set.
+//
+// Widening the policy is expected to produce a ONE-TIME burst — the newly-eligible
+// items that were already open (previously suppressed) all ring on the next poll. That
+// is correct, not a bug, and is bounded by the current open needs-you count.
 
 export type PushPolicy = 'email_urgent_override' | 'email_urgent_all' | 'needs_you';
 

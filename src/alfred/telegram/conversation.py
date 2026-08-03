@@ -1293,7 +1293,7 @@ _RECALL_PEERS_TOOL = {
         "vault under its own disclosure policy and returns BOUNDED snippets "
         "plus a source pointer — never whole records. You MUST attribute "
         "every fact you surface from a peer to the instance it came from "
-        "(each match carries its source instance). Returns ``{status, "
+        "(each result group carries its source instance). Returns ``{status, "
         "results: [{instance, count, matches: [{type, name, snippet, "
         "truncated, path}]}], reached, unreachable, misconfigured, "
         "total_matches}``. When ``total_matches`` is 0, say so honestly — "

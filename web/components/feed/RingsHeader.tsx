@@ -14,8 +14,8 @@ import {
 } from '../../lib/algernon/ringGeometry';
 import {
   COMPLETION_UNAVAILABLE_HINT,
+  effectiveStageOf,
   ringItemCompletable,
-  ringItemStage,
   ringItemUndoable,
   tierRingBuckets,
   type RingBucket,
@@ -96,13 +96,10 @@ export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: R
   // accept optimistic-committed (candidate→planned) overlays, else the base stage.
   // An optimistic UNDO (completion says not-done while the raw stage is still done —
   // the item hasn't reconciled yet) returns the item to PLANNED, not its raw done.
+  // The C2 stage overlay is the shared rings.ts seam (#16 item 8) — this is just the
+  // rings-panel binding of its hooks; the logic lives in one place now.
   const effectiveStage = useCallback(
-    (it: FeedItem): RingItemStage => {
-      if (completion.effectiveDone(it)) return 'done';
-      if (accept.accepted(it.id)) return 'planned';
-      const base = ringItemStage(it);
-      return base === 'done' ? 'planned' : base;
-    },
+    (it: FeedItem): RingItemStage => effectiveStageOf(it, completion, accept),
     [completion, accept],
   );
 

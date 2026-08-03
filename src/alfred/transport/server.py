@@ -1087,7 +1087,7 @@ def wire_transport_app(
         register_recall_routes(
             app, enabled=False, instance_name=instance_name,
         )
-        log.debug(
+        log.info(
             "transport.wire_transport_app.recall_skipped",
             reason="transport.recall.enabled is false / absent (instance "
                    "did not opt into the cross-instance recall route)",

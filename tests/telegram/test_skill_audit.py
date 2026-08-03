@@ -74,7 +74,7 @@ def _patch_registered_tools(
     monkeypatch.setattr(
         skill_audit,
         "_registered_tool_names",
-        lambda tool_set, gcal_enabled: list(names),
+        lambda tool_set, gcal_enabled, recall_ask_enabled=False: list(names),
     )
 
 
@@ -107,6 +107,20 @@ def _base_raw_config(tool_set: str = "talker", instance_name: str = "Salem") -> 
             },
         },
     }
+
+
+def test_registered_tool_names_threads_recall_ask_enabled() -> None:
+    """#16 item 15: recall_ask_enabled must reach tools_for_set, or recall_peers is
+    INVISIBLE to the capability audit (can't confirm it's advertised). Uses the REAL
+    _registered_tool_names (not the patched stub)."""
+    with_recall = skill_audit._registered_tool_names(
+        "talker", gcal_enabled=False, recall_ask_enabled=True
+    )
+    without_recall = skill_audit._registered_tool_names(
+        "talker", gcal_enabled=False, recall_ask_enabled=False
+    )
+    assert "recall_peers" in with_recall
+    assert "recall_peers" not in without_recall
 
 
 # --- audit_skill: clean / gap / skill_missing ---------------------------------
