@@ -14,6 +14,10 @@ Coverage (mandatory regression pins, run unconditionally):
     * ILB no-match — a query with no hit → 200 {matches: []}.
     * Fail-closed — disabled → route not mounted (404); STAY-C fence.
     * Pure engine — resolve_search_types + build_snippet unit-level.
+    * Snippet frontmatter tier (#20) — person answers carry substance, the
+      field allowlist is the ceiling (a non-granted field NEVER reaches a
+      snippet), body-substance types are byte-unchanged, and the disclosure
+      accounting is logged.
 """
 
 from __future__ import annotations
@@ -38,7 +42,9 @@ from alfred.transport.peer_handlers import register_instance_identity, register_
 from alfred.transport.routes_recall import (
     _handle_peer_recall,  # noqa: F401 (import-presence sanity)
     build_snippet,
+    compose_recall_snippet,
     register_recall_routes,
+    render_frontmatter_summary,
     resolve_search_types,
 )
 from alfred.transport.server import build_app
@@ -524,3 +530,310 @@ def test_build_snippet_match_in_frontmatter_only_returns_leading() -> None:
 
 def test_build_snippet_empty_body() -> None:
     assert build_snippet("", "x", 100) == ("", False)
+
+
+# ---------------------------------------------------------------------------
+# #20 — snippet frontmatter tier (substance, not template boilerplate)
+#
+# A person record's BODY is pure base-transclusion scaffolding (see the
+# shipped scaffold/_templates/person.md); every piece of substance lives in
+# frontmatter. The snippet therefore leads with the peer-visible frontmatter
+# — gated by the SAME canonical field allowlist that serves
+# /canonical/<type>/<name>, so a snippet can never disclose more than that
+# peer could already read.
+# ---------------------------------------------------------------------------
+
+# The template-shaped body: what a real person record actually contains.
+_PERSON_TEMPLATE_BODY = (
+    "# Ben McMillan\n\n"
+    "## Decisions\n![[person.base#Decisions]]\n\n"
+    "## Tasks\n![[person.base#Tasks]]\n\n"
+    "## Projects\n![[person.base#Projects]]\n\n"
+    "## Sessions\n![[person.base#Sessions]]\n"
+)
+# Granted to kal-le for `person`. email/phone are deliberately WITHHELD —
+# they are the leak targets the security pin hunts for.
+_KALLE_PERSON_FIELDS = ["name", "role", "org", "description"]
+_WITHHELD_EMAIL = "ben@example.invalid"
+_WITHHELD_PHONE = "555-0100"
+
+
+def _fm_transport_config(*, audit_path: str) -> TransportConfig:
+    """Like `_transport_config`, plus a canonical field grant for kal-le."""
+    cfg = _transport_config(audit_path=audit_path)
+    cfg.canonical = CanonicalConfig(
+        audit_log_path=audit_path,
+        peer_permissions={
+            "kal-le": {
+                # Raw-dict shape (accepted by apply_field_permissions
+                # alongside the PeerFieldRules dataclass).
+                "person": {"fields": list(_KALLE_PERSON_FIELDS), "bodies": False},
+                # NOTE: no "project" entry → default-deny for that type.
+            },
+        },
+    )
+    return cfg
+
+
+def _write_person_with_frontmatter(vault) -> None:
+    d = vault / "person"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "Ben McMillan.md").write_text(
+        "---\n"
+        "type: person\n"
+        "name: Ben McMillan\n"
+        "description: Ops partner on the RRTS rollout\n"
+        "org: RRTS\n"
+        "role: Operations lead\n"
+        f"email: {_WITHHELD_EMAIL}\n"
+        f"phone: '{_WITHHELD_PHONE}'\n"
+        "phone_note:\n"  # empty value → must not render a dangling key
+        "---\n" + _PERSON_TEMPLATE_BODY,
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+async def recall_fm_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Recall app whose canonical config grants kal-le person fields."""
+    audit_path = str(tmp_path / "canonical_audit.jsonl")
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_fm_transport_config(audit_path=audit_path), tstate)
+    vault = _make_vault(tmp_path)
+    _write_person_with_frontmatter(vault)  # overwrite with the template shape
+    register_vault_path(app, vault)
+    register_instance_identity(app, name="Salem")
+    assert register_recall_routes(app, enabled=True, instance_name="Salem") is True
+    app["_vault"] = vault
+    return await aiohttp_client(app)
+
+
+async def _ben_match(client, query: str = "Ben McMillan") -> dict:
+    resp = await client.post(
+        "/peer/recall", headers=_KALLE_HEADERS, json={"query": query},
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    people = [m for m in data["matches"] if m["type"] == "person"]
+    assert people, f"expected a person match, got {data['matches']}"
+    return people[0]
+
+
+async def test_recall_person_snippet_carries_frontmatter_substance(
+    recall_fm_client,
+) -> None:
+    """THE #20 defect pin: a person answer returns meaning, not boilerplate."""
+    match = await _ben_match(recall_fm_client)
+    snippet = match["snippet"]
+    # The substance the operator was missing.
+    assert "role: Operations lead" in snippet
+    assert "description: Ops partner on the RRTS rollout" in snippet
+    assert "org: RRTS" in snippet
+    # Pre-fix this was the ENTIRE snippet.
+    assert snippet.split("\n")[0] != "# Ben McMillan"
+
+
+async def test_recall_snippet_never_leaks_a_non_allowlisted_field(
+    recall_fm_client,
+) -> None:
+    """THE security pin: a field outside the peer's grant NEVER appears.
+
+    email/phone are present in the record's frontmatter and absent from
+    kal-le's canonical allowlist, so they must not reach the wire by any
+    path. Reddens if the extraction is widened past
+    ``apply_field_permissions`` (e.g. to raw frontmatter).
+    """
+    match = await _ben_match(recall_fm_client)
+    snippet = match["snippet"]
+    assert _WITHHELD_EMAIL not in snippet
+    assert _WITHHELD_PHONE not in snippet
+    assert "email" not in snippet
+    assert "phone" not in snippet
+    # And the whole response, not just this field — belt for any other
+    # surface that might echo the record.
+    assert _WITHHELD_EMAIL not in str(match)
+
+
+async def test_recall_snippet_drops_empty_frontmatter_values(
+    recall_fm_client,
+) -> None:
+    # `phone_note:` is empty AND non-allowlisted; a granted-but-empty key
+    # must not render as a dangling "key: " either.
+    match = await _ben_match(recall_fm_client)
+    assert "phone_note" not in match["snippet"]
+    assert not any(
+        line.endswith(": ") for line in match["snippet"].splitlines()
+    )
+
+
+async def test_recall_snippet_type_without_grant_stays_body_only(
+    recall_fm_client,
+) -> None:
+    """Default-deny per TYPE: project has no grant → today's body snippet."""
+    resp = await recall_fm_client.post(
+        "/peer/recall", headers=_KALLE_HEADERS, json={"query": "rollout"},
+    )
+    data = await resp.json()
+    projects = [m for m in data["matches"] if m["type"] == "project"]
+    assert projects, "expected a project match"
+    snippet = projects[0]["snippet"]
+    # Body prose preserved; no frontmatter head injected.
+    assert "RRTS rollout" in snippet
+    assert "type: project" not in snippet
+    assert "name: RRTS Rollout" not in snippet
+
+
+async def test_recall_body_substance_snippet_is_unchanged_by_the_tier(
+    recall_fm_client,
+) -> None:
+    """Preservation: a body-substance record's snippet is byte-identical to
+    what `build_snippet` alone produces (no grant → no head, no reflow)."""
+    resp = await recall_fm_client.post(
+        "/peer/recall", headers=_KALLE_HEADERS, json={"query": "rollout"},
+    )
+    data = await resp.json()
+    project = next(m for m in data["matches"] if m["type"] == "project")
+    body = (
+        "Andrew is driving the RRTS rollout across the region this quarter."
+    )
+    assert project["snippet"] == build_snippet(body, "rollout", 500)[0]
+
+
+async def test_recall_snippet_respects_max_chars_with_frontmatter(
+    tmp_path, aiohttp_client,
+) -> None:
+    """The cap still bounds the TOTAL (frontmatter head + body tail)."""
+    audit_path = str(tmp_path / "canonical_audit.jsonl")
+    cfg = _fm_transport_config(audit_path=audit_path)
+    cfg.recall.snippet_max_chars = 120
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(cfg, tstate)
+    vault = _make_vault(tmp_path)
+    _write_person_with_frontmatter(vault)
+    register_vault_path(app, vault)
+    register_instance_identity(app, name="Salem")
+    register_recall_routes(app, enabled=True, instance_name="Salem")
+    client = await aiohttp_client(app)
+
+    match = await _ben_match(client)
+    assert len(match["snippet"]) <= 120
+    assert match["truncated"] is True
+    # ORDER IS LOAD-BEARING: under a tight cap the SUBSTANCE survives and the
+    # transclusion scaffolding is what gets dropped. Body-first would invert
+    # this and reproduce the original defect.
+    assert "role: Operations lead" in match["snippet"]
+    assert "![[person.base#Decisions]]" not in match["snippet"]
+
+
+async def test_recall_logs_the_disclosed_snippet_fields(recall_fm_client) -> None:
+    """ILB: the answer names WHICH fields the frontmatter tier disclosed."""
+    with structlog.testing.capture_logs() as captured:
+        await recall_fm_client.post(
+            "/peer/recall", headers=_KALLE_HEADERS, json={"query": "Ben McMillan"},
+        )
+    answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
+    assert len(answered) == 1
+    entry = answered[0]
+    assert set(entry["snippet_fields"]) == {"name", "role", "org", "description"}
+    assert entry["snippet_records_with_frontmatter"] == 1
+    assert "email" not in entry["snippet_fields"]
+    # The empty-tier signal must NOT fire when fields did contribute.
+    assert not [
+        c for c in captured
+        if c.get("event") == "transport.recall.snippet_frontmatter_empty"
+    ]
+
+
+async def test_recall_logs_when_the_allowlist_contributes_nothing(
+    recall_client,
+) -> None:
+    """ILB: matches but no field grant → the config-gap signal fires.
+
+    `recall_client`'s canonical config has NO peer_permissions, so every
+    snippet degrades to body-only. That is exactly the "names without
+    meaning" shape, and it must be greppable rather than a silent 200.
+    """
+    with structlog.testing.capture_logs() as captured:
+        resp = await recall_client.post(
+            "/peer/recall", headers=_KALLE_HEADERS, json={"query": "Andrew"},
+        )
+    assert resp.status == 200
+    assert (await resp.json())["count"] >= 1
+    empty = [
+        c for c in captured
+        if c.get("event") == "transport.recall.snippet_frontmatter_empty"
+    ]
+    assert len(empty) == 1
+    assert empty[0]["peer"] == "kal-le"
+    assert empty[0]["match_count"] >= 1
+    answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
+    assert answered[0]["snippet_fields"] == []
+    assert answered[0]["snippet_records_with_frontmatter"] == 0
+    assert answered[0]["snippet_records_filtered"] >= 1
+
+
+# --- pure helpers -----------------------------------------------------------
+
+
+def test_render_frontmatter_summary_follows_allowlist_order() -> None:
+    filtered = {"name": "Ben", "role": "Ops lead", "org": "RRTS"}
+    granted = ["role", "org", "name"]  # operator's configured order
+    assert render_frontmatter_summary(filtered, granted) == (
+        "role: Ops lead\norg: RRTS\nname: Ben"
+    )
+
+
+def test_render_frontmatter_summary_joins_lists_and_drops_empties() -> None:
+    filtered = {"aliases": ["Benny", "B"], "role": None, "org": "", "name": "Ben"}
+    out = render_frontmatter_summary(filtered, ["aliases", "role", "org", "name"])
+    assert out == "aliases: Benny, B\nname: Ben"
+
+
+def test_render_frontmatter_summary_renders_dotted_paths() -> None:
+    filtered = {"preferences": {"coding": "python"}}
+    assert render_frontmatter_summary(filtered, ["preferences.coding"]) == (
+        "preferences.coding: python"
+    )
+
+
+def test_render_frontmatter_summary_empty_is_empty() -> None:
+    assert render_frontmatter_summary({}, []) == ""
+
+
+def test_compose_snippet_without_summary_is_byte_identical_to_body_only() -> None:
+    """The degrade path is EXACTLY today's behavior — no reflow, no marker."""
+    body = "alpha beta gamma NEEDLE delta epsilon " * 4
+    for cap in (30, 80, 500):
+        assert compose_recall_snippet("", body, "needle", cap) == build_snippet(
+            body, "needle", cap,
+        )
+
+
+def test_compose_snippet_leads_with_summary() -> None:
+    snippet, truncated = compose_recall_snippet(
+        "role: Ops lead", "# Ben\n![[person.base#Decisions]]", "ben", 500,
+    )
+    assert snippet.startswith("role: Ops lead")
+    assert "![[person.base#Decisions]]" in snippet
+    assert truncated is False
+
+
+def test_compose_snippet_drops_body_when_the_cap_is_spent() -> None:
+    summary = "role: Ops lead"
+    snippet, truncated = compose_recall_snippet(
+        summary, "a body we cannot afford", "x", len(summary) + 1,
+    )
+    assert snippet == summary
+    assert truncated is True  # honest: body content WAS withheld
+
+
+def test_compose_snippet_truncates_an_oversize_summary() -> None:
+    snippet, truncated = compose_recall_snippet("x" * 400, "body", "x", 50)
+    assert len(snippet) <= 50
+    assert truncated is True
+
+
+def test_compose_snippet_summary_only_when_body_is_blank() -> None:
+    snippet, truncated = compose_recall_snippet("role: Ops lead", "   ", "x", 500)
+    assert snippet == "role: Ops lead"
+    assert truncated is False  # nothing was withheld
