@@ -115,6 +115,44 @@ KNOWN_CONFIRM_SOURCES: frozenset[str] = frozenset({
 })
 
 
+def is_safe_path_component(value: str) -> bool:
+    """True iff ``value`` can be persisted as a single path COMPONENT.
+
+    Arc #18 Layer B — the source-gate. Layer A (``vault.paths.resolve_in_vault``
+    at every writer) already makes an escape harmless at write time. This gate
+    stops the poisoned string from entering the vault in the first place, which
+    is what prevents the audit's chain from EXISTING rather than merely being
+    blocked at its last step:
+
+        LLM tool arg -> persisted here -> tier.compute interpolates it into
+        ``f"routine/{record}.md"`` / ``f"[[task/{name}]]"`` -> feed evidence ->
+        operator taps a normal-looking card -> a write aimed outside the vault
+
+    ``routine_record`` and the task ``name`` are the two fields that become path
+    components downstream, and neither was validated beyond ``.strip()``. Note
+    the module already sanitizes ONE untrusted field (``source``, via
+    :func:`sanitize_source`) — this extends the same recognised boundary to the
+    two that turned out to matter more.
+
+    Rejects: path separators (``/``, ``\\``), NUL, and the relative specials
+    ``.`` / ``..``. Deliberately NOT a character allowlist — real vault names
+    carry ``$ + * = ~``, em-dashes, apostrophes and dots (233 record stems in
+    the production vault contain a dot), and a blocklist would reject genuine
+    content. Only separators and the traversal specials are refused, because
+    only those change what the interpolated string ADDRESSES.
+
+    Box precondition (checked 2026-08-03): zero live ``task/`` or ``routine/``
+    record names contain ``/``, so this refuses nothing real. The five
+    slash-bearing records in the vault are ``decision/`` records, a type that
+    never appears in tier curation.
+    """
+    if not value:
+        return False
+    if "/" in value or "\\" in value or "\x00" in value:
+        return False
+    return value not in (".", "..")
+
+
 def sanitize_source(source: str | None) -> str:
     """Coerce an untrusted ``source`` to a known-vocab value (#21 ruling).
 
@@ -275,6 +313,10 @@ def confirm_slot_candidate(
         if origin == "task":
             if not name:
                 return _thin(origin, name, date_iso, "task_no_name")
+            # Layer B: ``name`` becomes a path component downstream via
+            # ``_task_wikilink`` -> compute._curated_task_path -> f"task/{name}.md".
+            if not is_safe_path_component(name):
+                return _thin(origin, name, date_iso, "unsafe_task_name")
             committed_name = name
             identity = ("task", name.lower())
             entry_source, confirmed = _t12_source_confirmed(tier_int, source)
@@ -284,6 +326,10 @@ def confirm_slot_candidate(
         elif is_routine:
             if not (routine_record and item_text):
                 return _thin(origin, name, date_iso, "routine_no_record_or_text")
+            # Layer B: ``routine_record`` becomes a path component downstream
+            # via compute._curated_to_tier_entry -> f"routine/{record}.md".
+            if not is_safe_path_component(routine_record):
+                return _thin(origin, name, date_iso, "unsafe_record_name")
             committed_name = item_text
             identity = ("routine", routine_record.lower(), item_text.lower())
             entry_source, confirmed = _t12_source_confirmed(tier_int, source)
@@ -381,5 +427,6 @@ __all__ = [
     "KNOWN_CONFIRM_SOURCES",
     "ConfirmResult",
     "confirm_slot_candidate",
+    "is_safe_path_component",
     "sanitize_source",
 ]
