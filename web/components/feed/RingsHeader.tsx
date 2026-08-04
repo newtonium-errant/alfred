@@ -21,7 +21,7 @@ import {
   type RingBucket,
   type RingItemStage,
 } from '../../lib/algernon/rings';
-import { useRingCompletion } from './useRingCompletion';
+import { useRingCompletion, type UseRingCompletionResult } from './useRingCompletion';
 import { useSlotAccept } from './useSlotAccept';
 
 // The segmented "balanced day" rings header. Three tier rings (T1/T2/T3) from
@@ -51,16 +51,31 @@ export interface RingsHeaderProps {
   items?: FeedItem[];
   /** Test seam: "now" for the today date-scope (defaults to the real clock). */
   now?: Date;
+  /**
+   * Composition seam (mirrors `items`): when provided, this completion hook drives
+   * the rings instead of the internal one, so a HOST page's own surfaces (the
+   * composer's needs-you count) and the rings read ONE optimistic state in the same
+   * render. Omitted → the rings own their state and stand alone.
+   */
+  completion?: UseRingCompletionResult;
 }
 
-export function RingsHeader({ onAuthExpired, items: itemsProp, now: nowProp }: RingsHeaderProps) {
+export function RingsHeader({
+  onAuthExpired,
+  items: itemsProp,
+  now: nowProp,
+  completion: completionProp,
+}: RingsHeaderProps) {
   const controlled = itemsProp !== undefined;
   const [fetched, setFetched] = useState<FeedItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [openItemId, setOpenItemId] = useState<string | null>(null);
   const [showDone, setShowDone] = useState(false);
-  const completion = useRingCompletion({ onAuthExpired });
+  // Hooks can't be conditional, so the internal instance is always constructed and
+  // simply unused when the host supplies one. Still ONE implementation either way.
+  const ownCompletion = useRingCompletion({ onAuthExpired });
+  const completion = completionProp ?? ownCompletion;
   const accept = useSlotAccept({ onAuthExpired });
   const now = useMemo(() => nowProp ?? new Date(), [nowProp]);
 

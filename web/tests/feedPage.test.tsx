@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 // Surface parity: the feed's slot rows carry the SAME per-lane completion control
 // as the rings panel — completable lanes (task / routine / free-text T3) get a live
@@ -86,5 +86,45 @@ describe('FeedPage — slot rows get the live per-lane completion control', () =
     // Done slot → not in needs-you at all → the all-clear empty state.
     expect(screen.queryByTestId('feed-needs-you')).toBeNull();
     expect(screen.queryByTestId('feed-pending')).toBeNull();
+  });
+});
+
+describe('FeedPage — needs-you reads the SAME truth as the row ✓ (no one-fetch lag)', () => {
+  const flush = () => act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+  it('completing the last slot clears needs-you in the SAME render — no refetch needed', async () => {
+    mockList.mockResolvedValue({ items: [routineSlot('r1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-pending')).not.toBeNull());
+    expect(screen.queryByTestId('feed-empty')).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('feed-row-complete'));
+    });
+    await flush();
+
+    // The lag this pins: pre-fix the filter read the RAW stage, so the completed row
+    // stayed under "Needs you" (and "All clear" stayed suppressed) until the next poll.
+    expect(screen.queryByTestId('feed-pending')).toBeNull();
+    expect(screen.queryByTestId('feed-needs-you')).toBeNull();
+    expect(screen.queryByTestId('feed-empty')).not.toBeNull();
+    // Same render pass — nothing re-fetched the feed to produce that state.
+    expect(mockList).toHaveBeenCalledTimes(1);
+  });
+
+  it('a FAILED completion keeps the row in needs-you (the drop-out tracks success, not the tap)', async () => {
+    mockAct.mockReset().mockRejectedValue(new Error('boom'));
+    mockList.mockResolvedValue({ items: [routineSlot('r1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-pending')).not.toBeNull());
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('feed-row-complete'));
+    });
+    await flush();
+
+    expect(screen.queryByTestId('feed-pending')).not.toBeNull(); // reverted → still needs you
+    expect(screen.queryByTestId('feed-empty')).toBeNull();
+    expect(screen.getByTestId('feed-row-completion-error').textContent).toBe('That action failed.');
   });
 });

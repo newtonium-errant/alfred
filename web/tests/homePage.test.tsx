@@ -1,16 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 // Composer deck-pill honesty: the deck PROMISE counts only DECK-ABLE kinds (a
 // wired verb) — never the full needs-you total (mirrors feed.tsx / b1). The
 // check-in "N things need you" line stays the feed total (true, and distinct
 // from the deck subset).
 
-const { mockList, modeState } = vi.hoisted(() => ({
+const { mockList, mockAct, modeState } = vi.hoisted(() => ({
   mockList: vi.fn(),
+  mockAct: vi.fn(),
   modeState: { current: 'checkin' as 'brief' | 'checkin' | 'feed' },
 }));
-vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: vi.fn() } }));
+vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: mockAct } }));
 vi.mock('../lib/algernon/useSession', () => ({
   useSession: () => ({ user: { name: 'andrew', role: 'owner' }, loading: false }),
 }));
@@ -50,6 +51,7 @@ function item(kind: string, id: string, attention: string, mode: string): FeedIt
 
 beforeEach(() => {
   mockList.mockReset();
+  mockAct.mockReset().mockResolvedValue({ ok: true, status: 'acted' });
   modeState.current = 'checkin';
 });
 afterEach(() => vi.restoreAllMocks());
@@ -139,5 +141,68 @@ describe('HomePage composer — the rings are PERSISTENT across every mode', () 
     // rings) — RingsHeader is controlled, so no extra slot_suggestion fetch.
     expect(mockList).toHaveBeenCalledTimes(1);
     expect(mockList).toHaveBeenCalledWith({});
+  });
+});
+
+describe('HomePage composer — a rings completion moves needs-you in the SAME render', () => {
+  const flush = () => act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  // A COMPLETABLE tier-1 slot (routine lane → a live ✓ in the rings panel).
+  const routineSlot = (id: string): FeedItem => ({
+    ...item('slot_suggestion', id, 'needs_you', 'decide'),
+    evidence: { tier: 1, routine_record: 'routine/Bills.md', item_text: 'Pay' },
+  });
+
+  it('completing a slot in the rings decrements the needs-you count without a refetch', async () => {
+    mockList.mockResolvedValue({
+      items: [item('email_tier', 'e1', 'needs_you', 'decide'), routineSlot('s1')],
+      count: 2,
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('composer-needs-you')).not.toBeNull());
+    expect(screen.getByTestId('composer-needs-you').textContent).toContain('2 things need you');
+
+    fireEvent.click(screen.getByTestId('ring-1')); // open the T1 bucket panel
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ring-complete'));
+    });
+    await flush();
+
+    // THE LAG THIS PINS: the completion hook used to live INSIDE RingsHeader, so the
+    // segment went green while this count — reading the raw stage — stayed at 2 until
+    // the next fetch. One hoisted hook = one truth, same render.
+    expect(screen.getByTestId('composer-needs-you').textContent).toContain('1 thing needs you');
+    expect(mockList).toHaveBeenCalledTimes(1);
+  });
+
+  it('the rings themselves still flip green — the hoist did not cost the ring its state', async () => {
+    mockList.mockResolvedValue({ items: [routineSlot('s1')], count: 1 });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('rings-header')).not.toBeNull());
+
+    fireEvent.click(screen.getByTestId('ring-1'));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ring-complete'));
+    });
+    await flush();
+
+    fireEvent.click(screen.getByTestId('ring-show-done'));
+    expect(screen.queryByTestId('ring-item-done')).not.toBeNull();
+    expect(screen.getByTestId('composer-needs-you').textContent).toContain('Nothing needs you');
+  });
+
+  it('a FAILED completion leaves the count where it was (tracks success, not the tap)', async () => {
+    mockAct.mockReset().mockRejectedValue(new Error('boom'));
+    mockList.mockResolvedValue({ items: [routineSlot('s1')], count: 1 });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('composer-needs-you')).not.toBeNull());
+
+    fireEvent.click(screen.getByTestId('ring-1'));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ring-complete'));
+    });
+    await flush();
+
+    expect(screen.getByTestId('composer-needs-you').textContent).toContain('1 thing needs you');
+    expect(screen.getByTestId('ring-item-error').textContent).toBe('That action failed.');
   });
 });

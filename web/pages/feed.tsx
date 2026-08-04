@@ -10,7 +10,6 @@ import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { isDeckDealt } from '../lib/algernon/feedConstants';
-import { ringItemDone } from '../lib/algernon/rings';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
@@ -63,10 +62,15 @@ export default function FeedPage() {
   const completion = useRingCompletion({ onAuthExpired });
   // The C2 accept hook — drives a SUGGESTED slot row's [Accept] + optimistic flip.
   const slotAccept = useSlotAccept({ onAuthExpired });
-  // A DONE slot item no longer needs you (isDone counting — mirrors the composer):
-  // it drops out of the needs-you groups once its completion reconciles.
+  // A DONE slot item no longer needs you (isDone counting — mirrors the composer).
+  // Reads the COMPLETION hook, not the raw `ringItemDone`, so the drop-out lands in
+  // the SAME render as the row's own ✓ flip — the raw stage only catches up on the
+  // next fetch, which left a completed row sitting under "Needs you" (and the
+  // "All clear" state suppressed) for a whole poll interval. With no override in
+  // play `effectiveDone` IS `ringItemDone`, so the server-truth baseline is
+  // unchanged; a FAILED act reverts the override and the row returns with its error.
   const activeNeedsYou = board.needsYou.filter(
-    (it) => !(it.kind === 'slot_suggestion' && ringItemDone(it)),
+    (it) => !(it.kind === 'slot_suggestion' && completion.effectiveDone(it)),
   );
   // Deck-dealt = classic decisions + SUGGESTED slots (isDeckDealt — the one predicate
   // that also drives the deck-link count, so it matches what /deck deals). Slot rows

@@ -7,12 +7,12 @@ import { PushToggle } from '../components/PushToggle';
 import { FeedRow } from '../components/feed/FeedRow';
 import { RingsHeader } from '../components/feed/RingsHeader';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
+import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { authApi } from '../lib/algernon/authClient';
 import { composeMode, halifaxHour, type ComposeMode } from '../lib/algernon/composer';
 import { useComposerLog } from '../lib/algernon/composerLog';
 import { isDeckDealt } from '../lib/algernon/feedConstants';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { ringItemDone } from '../lib/algernon/rings';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
@@ -79,13 +79,20 @@ export default function HomePage() {
   // rings (below) get the full set incl. today's done. One fetch, split here.
   const openItems = useMemo(() => (items ?? []).filter((it) => it.state === 'open'), [items]);
   const board = useFeedBoard({ items: openItems, onAuthExpired });
+  // ONE completion instance for the whole composer, HOISTED out of RingsHeader and
+  // threaded back in below. The rings are where a slot actually gets completed, so
+  // when the hook lived inside them this count (reading the raw `ringItemDone`) had
+  // no way to see the flip and lagged a whole fetch behind the green segment.
+  const completion = useRingCompletion({ onAuthExpired });
   // How many things need you (the FEED truth) vs how many the DECK can actually
   // deal. The deck only handles kinds with a wired verb — slot_suggestion et al.
   // aren't swipeable — so the deck PROMISE counts deck-able only (mirrors feed.tsx,
   // b1). A DONE slot item (board-completed) no longer needs you, so it's excluded
-  // from the needs-you total (Phase C).
+  // from the needs-you total (Phase C) — via the shared hook, so a completion in the
+  // rings drops the count in the SAME render. No override → `effectiveDone` is
+  // exactly `ringItemDone`, so the server-truth baseline is unchanged.
   const needsYouCount = board.needsYou.filter(
-    (it) => !(it.kind === 'slot_suggestion' && ringItemDone(it)),
+    (it) => !(it.kind === 'slot_suggestion' && completion.effectiveDone(it)),
   ).length;
   const deckableCount = board.needsYou.filter(isDeckDealt).length;
 
@@ -140,10 +147,11 @@ export default function HomePage() {
   // The rings are PERSISTENT across every composer mode — the completion surface
   // must exist all day, not only during the 11:00–14:00 check-in window. The mode
   // rules govern what LEADS (brief card / rings / feed board), not whether rings
-  // exist. Controlled `items` seam → no second feed fetch.
+  // exist. Controlled `items` seam → no second feed fetch; controlled `completion`
+  // seam → no second optimistic state (the needs-you count above reads the same one).
   const ringsHeader = (
     <div className="mt-3">
-      <RingsHeader items={items ?? []} onAuthExpired={onAuthExpired} />
+      <RingsHeader items={items ?? []} completion={completion} onAuthExpired={onAuthExpired} />
     </div>
   );
 
