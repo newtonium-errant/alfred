@@ -50,27 +50,11 @@ def _base_config(vault_path: Path, backend: str = "claude") -> dict[str, Any]:
     }
 
 
-@pytest.fixture(autouse=True)
-def _stub_anthropic_auth(monkeypatch):
-    """Stub the anthropic auth probe across all three tool-health modules.
-
-    With the backend-collapse contract (only ``claude`` is known),
-    the default ``_base_config`` switches from ``backend="zo"`` to
-    ``backend="claude"``, which triggers the anthropic probe in every
-    health check. Without this autouse stub, every default-backend
-    test would either hit the network or fail because the env lacks
-    an API key. Tests that want to verify probe semantics monkeypatch
-    over this stub explicitly.
-    """
-    async def _ok(api_key, model="claude-haiku-4-5"):  # noqa: ANN001
-        return CheckResult(name="anthropic-auth", status=Status.OK, detail="stubbed")
-
-    monkeypatch.setattr(curator_health, "check_anthropic_auth", _ok)
-    monkeypatch.setattr(janitor_health, "check_anthropic_auth", _ok)
-    monkeypatch.setattr(distiller_health, "check_anthropic_auth", _ok)
-    monkeypatch.setattr(curator_health, "resolve_api_key", lambda raw: "stub-key")
-    monkeypatch.setattr(janitor_health, "resolve_api_key", lambda raw: "stub-key")
-    monkeypatch.setattr(distiller_health, "resolve_api_key", lambda raw: "stub-key")
+# The ``_stub_anthropic_auth`` autouse fixture that used to live here was
+# promoted to ``tests/health/conftest.py`` (#16) so it protects the whole health
+# package, not just this file. Living here was the bug: three wiring tests in
+# test_claude_cli_auth.py drove the same health_check without it and dialled
+# api.anthropic.com for real. Do not re-add a local copy — extend the conftest.
 
 
 @pytest.fixture
