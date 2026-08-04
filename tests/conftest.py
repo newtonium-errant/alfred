@@ -260,29 +260,46 @@ def ephemeral_config(tmp_vault: Path) -> dict:
 # while leaking, which is the whole problem — a leak has no natural failure
 # signal, so it needs a dedicated one.
 #
-# WHY RECORD RATHER THAN REFUSE. A refusing guard was prototyped and measured
-# against this suite, and lost on three independent counts:
+# WHY RECORD RATHER THAN REFUSE. One measured reason, and it is sufficient:
 #
-#   1. It does not reliably stop anything. httpx/anyio resolve DNS on a
-#      ThreadPoolExecutor worker, so the raise happens off-thread and never
-#      reaches the test. Measured: the telegram leak raised EgressBlocked in a
-#      worker thread and the test still reported PASSED. (The #12 note about
-#      bare ``except`` blocks swallowing a raise is the same failure mode by a
-#      different route — both point away from refusing.)
-#   2. It shadows the sovereign-guard tests. tests/test_scribe_daemon_p1d.py
-#      asserts alfred.sovereign's OWN http_guard blocks non-loopback traffic
-#      (``exc.value.reason == "http_guard"``). A socket-level refuser fires
-#      first and the assertion breaks — measured, 1 failed. A guard that makes
-#      the real egress control untestable is worse than no guard.
-#   3. It corrupts the subsystem it is supposed to protect. Under the refuser,
-#      the scribe egress-firewall canary logged ``probe_error:EgressBlocked``
-#      AND a false ``scribe.egress_firewall.loopback_severed`` warning — a
-#      production-shaped alarm caused purely by the test harness.
+#   A refuser produces NO SIGNAL. httpx/anyio resolve DNS on a
+#   ThreadPoolExecutor worker, so a raise happens off-thread, is consumed by
+#   the transport's own error handling, and never reaches the test. Measured:
+#   under a refusing prototype the telegram leak raised in a worker thread and
+#   the test still reported PASSED. reviewer-posture measured the same shape
+#   independently during #12 — 7 tests attempted egress under its raise-only
+#   probe and all 7 passed. A guard whose output is "green" while tests are
+#   leaking is a false certificate, which is worse than no guard: it is the
+#   #12 failure mode with a badge on it. (The #12 note about bare ``except``
+#   blocks swallowing a raise is the same problem by a different route.)
 #
-# Recording has none of those failure modes: it changes no control flow, so it
-# cannot be swallowed, cannot shadow, and cannot corrupt. It does not stop the
-# packet — it makes the packet impossible to ignore, which is what actually
-# keeps the suite clean over time.
+#   Note what this argument does NOT claim: refusing usually does stop the
+#   packet. The objection is to refusing ALONE — without a record there is
+#   nothing to assert on, so the leak stays invisible.
+#
+# TWO EARLIER GROUNDS WERE RETRACTED after re-measurement, and the correction
+# matters more than the original claim did. This comment previously argued that
+# refusing (a) shadows the scribe sovereign-guard tests and (b) corrupts the
+# scribe egress firewall. Both were artefacts of the PROTOTYPE, which had no
+# ip-literal / TEST-NET exemptions — not properties of refusing:
+#
+#   * a refuser carrying the SAME exemptions as this guard leaves
+#     tests/test_scribe_daemon_p1d.py at 15 passed, no failures. The protective
+#     element is the exemption set, orthogonal to refuse-vs-record. The original
+#     "1 failed" happened because the prototype intercepted the sovereign
+#     guard's OWN getaddrinfo classification of the literal 8.8.8.8.
+#   * the ``egress_firewall.unverified`` (reason=TimeoutError) and
+#     ``egress_firewall.loopback_severed`` (reason=ConnectionRefusedError)
+#     warnings appear IDENTICALLY under this record-only guard and under an
+#     exempted refuser. They are environmental — ollama is not running on a dev
+#     box, and TEST-NET-1 is non-routable by design. The harness never caused
+#     them. Only the unexempted prototype changed anything, and only the
+#     canary's reason string.
+#
+# Recorded here rather than quietly deleted because the mistake is instructive:
+# both retracted grounds came from ONE observation of an unexempted prototype,
+# generalised without isolating the variable. Re-running with the exemptions
+# held constant retired both in about a minute.
 
 _LOOPBACK_PREFIXES = ("127.", "::1", "localhost")
 
