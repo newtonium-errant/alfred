@@ -128,3 +128,95 @@ describe('FeedPage — needs-you reads the SAME truth as the row ✓ (no one-fet
     expect(screen.getByTestId('feed-row-completion-error').textContent).toBe('That action failed.');
   });
 });
+
+// --- #26 (D4): done STAGES on the feed worklist, it never vanishes ------------
+// The feed dropped a completed slot out of the list entirely — right for the
+// COUNTS (it no longer needs you, and must not inflate the deck) and wrong for
+// the LIST, since a mis-tap was then unrecoverable here while home's rings kept
+// Undo behind a drill. One rule everywhere.
+
+describe('FeedPage — a completed slot stages behind Show done', () => {
+  const flush = () => act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+  async function completeTheOnlySlot() {
+    mockList.mockResolvedValue({ items: [routineSlot('r1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-pending')).not.toBeNull());
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('feed-row-complete'));
+    });
+    await flush();
+  }
+
+  it('the completed row leaves the worklist but STAYS in the DOM, behind the drill', async () => {
+    await completeTheOnlySlot();
+
+    // Out of the remaining-work list...
+    expect(screen.queryByTestId('feed-pending')).toBeNull();
+    // ...but reachable, not gone. Pre-fix there was no affordance at all here.
+    const drill = screen.getByTestId('feed-show-done');
+    expect(drill.textContent).toContain('Show done (1)');
+    // Same render — nothing re-fetched to produce the staged state.
+    expect(mockList).toHaveBeenCalledTimes(1);
+  });
+
+  it('the drill toggles the staged list open and closed', async () => {
+    await completeTheOnlySlot();
+
+    // Collapsed by default — the worklist still reads as remaining work.
+    expect(screen.queryByTestId('feed-done')).toBeNull();
+    expect(screen.getByTestId('feed-show-done').getAttribute('aria-expanded')).toBe('false');
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('feed-show-done'));
+    });
+    expect(screen.queryByTestId('feed-done')).not.toBeNull();
+    expect(screen.getByTestId('feed-show-done').textContent).toContain('Hide done');
+    expect(screen.getByTestId('feed-show-done').getAttribute('aria-expanded')).toBe('true');
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('feed-show-done'));
+    });
+    expect(screen.queryByTestId('feed-done')).toBeNull();
+    expect(screen.getByTestId('feed-show-done').textContent).toContain('Show done (1)');
+  });
+
+  it('the staged row still carries its row controls, so Undo is one tap in', async () => {
+    await completeTheOnlySlot();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('feed-show-done'));
+    });
+
+    // The point of staging rather than removing: the row is still a live
+    // FeedRow, and a DONE row's control is UNDO — which is the whole reason a
+    // mis-tap has to stay reachable. (A done row renders `feed-row-done` +
+    // `feed-row-undo`, not the ✓ it was completed with.)
+    const staged = screen.getByTestId('feed-done');
+    expect(staged.querySelector('[data-testid="feed-row-undo"]')).not.toBeNull();
+    expect(staged.querySelector('[data-testid="feed-row-done"]')).not.toBeNull();
+  });
+
+  it('no drill when nothing is done — the affordance is not permanent furniture', async () => {
+    mockList.mockResolvedValue({ items: [routineSlot('r1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-pending')).not.toBeNull());
+
+    expect(screen.queryByTestId('feed-show-done')).toBeNull();
+    expect(screen.queryByTestId('feed-done')).toBeNull();
+  });
+
+  it('a FAILED completion does NOT stage the row — it stays remaining work', async () => {
+    mockAct.mockReset().mockRejectedValue(new Error('boom'));
+    mockList.mockResolvedValue({ items: [routineSlot('r1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-pending')).not.toBeNull());
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('feed-row-complete'));
+    });
+    await flush();
+
+    // Staging tracks SUCCESS, not the tap — same rule the drop-out already used.
+    expect(screen.queryByTestId('feed-show-done')).toBeNull();
+    expect(screen.queryByTestId('feed-pending')).not.toBeNull();
+  });
+});
