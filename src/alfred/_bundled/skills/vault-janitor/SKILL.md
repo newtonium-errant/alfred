@@ -438,7 +438,9 @@ Task records with `kind: task` containing project setup checklists. These live i
 
 ## 3. Fix Procedures by Issue Code
 
-**Only four codes are ever routed to you: LINK001, DUP001, SEM005, SEM006.** The sweep filters your issue report down to those before invoking you. Every other code below is documented so you can recognise it if one leaks through — it is either already repaired by the deterministic autofix phase that runs earlier in the same sweep (FM001–FM004, LINK002), or fixable by no janitor path at all (DIR001, ORPHAN001, STUB001, SEM001–SEM004). If a code outside those four appears in your report, log a warning and move on; do not act on it.
+**Two codes are routed to you: LINK001 and DUP001.** Those are what the sweep puts in your issue report. Every other code below is documented so you can recognise it if one leaks through — it is either already repaired by the deterministic autofix phase that runs earlier in the same sweep (FM001–FM004, LINK002), or fixable by no janitor path at all (DIR001, ORPHAN001, STUB001, SEM001–SEM004). If one of those appears in your report, log a warning and move on; do not act on it.
+
+**SEM005 and SEM006 work differently — they are labels you apply, not codes you receive.** No scanner produces them; nothing in the pipeline hands you a SEM005. They are the vocabulary for an observation *you* make while working a record you were already sent for some other reason, and they are how you tag the `janitor_note` you write about it. So the honest shape of a sweep is: you are handed LINK001s and DUP001s, and SEM005/SEM006 are what you call the judgments you form along the way.
 
 Note the asymmetry, because it changes how much you can assume: the autofix-handled codes really are repaired before you see them, but the not-fixable codes are simply reported to the operator and left alone. Nothing downstream cleans up after you.
 
@@ -446,15 +448,25 @@ Note the asymmetry, because it changes how much you can assume: the autofix-hand
 
 Every `janitor_note` you write must begin with the issue code you are acting on — in practice `SEM005 —` or `SEM006 —`, the only two codes whose procedure has you writing a note at all. That prefix is load-bearing: it is how the janitor recognizes its own prior work across sweeps.
 
-The other two codes routed to you do not produce notes. An unresolved LINK001 gets a `SKIPPED` log line, never a note (§ LINK001); a DUP001 gets a triage task while both candidate records stay untouched (§ DUP001).
+The two codes you are actually handed do not produce notes at all. An unresolved LINK001 gets a `SKIPPED` log line, never a note (§ LINK001); a DUP001 gets a triage task while both candidate records stay untouched (§ DUP001).
 
 You will still meet notes you did not write, in the same code-prefixed shape. The deterministic autofix phase writes `FM002 -- …` and `FM003 -- …`; records from earlier passes may carry `LINK001 —`, `DUP001 —`, `ORPHAN001 —` or `STUB001 —`. Treat any code-prefixed note as prior work when you apply the check below. Finding one is not evidence that its code is still being handled, and it is never a reason to write a fresh note in that code yourself.
 
 **Before writing `janitor_note`, always `alfred vault read` the target record first.** Then:
 
 - If an existing `janitor_note` is present AND it starts with the same issue code you are about to write, **leave it untouched** — do not rewrite the prose. Log the action as `SKIPPED | {path} | {code} | janitor_note already present, no change`.
-- If an existing `janitor_note` is present but starts with a **different** issue code, replace it with the new note.
+- If an existing `janitor_note` is present but starts with a **different** issue code, replace it with the new note — **unless that note starts with `LINK001`**, which is the one prefix you must never overwrite. See the guard below.
 - If no `janitor_note` is present, write the new note normally.
+
+**The `LINK001` exception — `janitor_note` holds exactly one note.** The field is a single scalar, not a list, so "replace it with the new note" destroys whatever was there. That is fine for most prefixes and wrong for one: `LINK001 —` notes are cohort markers for the tracked link-debt bucket (see § LINK001), and there are thousands of them. Overwriting one silently removes a record from a campaign nobody has run yet.
+
+So when the existing note starts with `LINK001` and you were about to write a different code, **write nothing and leave the note alone**. Log the observation instead:
+
+```
+SKIPPED | note/Some Record.md | SEM005 | LINK001 cohort note preserved — observation not written
+```
+
+Losing one SEM005 observation is cheap; losing a cohort marker is not. If the link debt is ever cleared, this exception goes with it.
 
 This prevents sweep-to-sweep churn from LLM prose variance on identical underlying issues — the stable issue-code prefix is the equality check, not the prose body.
 
@@ -486,11 +498,13 @@ This prevents sweep-to-sweep churn from LLM prose variance on identical underlyi
 
 **There is no safety net behind you on LINK001 — do not assume one.** Every LINK001 the scanner finds is routed to you unfiltered, and nothing flags the ones you leave alone. A deterministic fallback-flagger exists in `autofix.py` but has no call site, so no `janitor_note` is ever written for an unresolved broken link. One you skip stays broken and is re-detected next sweep, with your log line as the only record that anyone looked at it.
 
-Expect most of them to be genuinely unresolvable. Roughly 2075 dangling links in the vault are known-real link debt awaiting a bulk repair campaign — not scanner noise, and not yours to clear one sweep at a time. So:
+Expect most of them to be genuinely unresolvable. The vault carries a few thousand dangling links as known-real link debt, held for a bulk repair campaign — not scanner noise, and not yours to clear one sweep at a time. So:
 
 - Fix only the unambiguous ones.
 - For the rest, log a `SKIPPED` line naming the broken target and why it was ambiguous.
-- **Do NOT write a `janitor_note` on every unresolved LINK001.** At this volume that would bury real flags under thousands of identical notes. The `SKIPPED` log line is the correct output.
+- **Do NOT write a `janitor_note` on every unresolved LINK001.** At that volume it would bury real flags under thousands of identical notes. The `SKIPPED` log line is the correct output.
+
+**Existing `LINK001 —` notes are cohort markers — never destroy one.** The link-debt cohort is tracked as a labeled bucket, so a `LINK001 —` note already on a record is load-bearing campaign state, not stale residue from a pass that no longer runs. It must survive your sweep even when you are on the record for some other reason. The replace rule in §3 carries the exception; this is why it exists.
 
 ### ORPHAN001 — ORPHANED_RECORD
 
@@ -559,7 +573,7 @@ This is what you do every time you see a DUP001 in a normal sweep. It creates a 
 - Do NOT edit, rename, or retag either candidate record (no `janitor_note`, no frontmatter touch-up, nothing).
 - Do NOT delete either candidate.
 - Do NOT change `status` on any existing triage task — that field is human-only.
-- Do NOT create triage tasks for non-dedup issues. Layer 3 currently covers `kind: dedup` only; other issue classes still flag via `janitor_note` as before.
+- Do NOT create triage tasks for non-dedup issues. Layer 3 currently covers `kind: dedup` only. That limit is about triage tasks only — it does not re-open `janitor_note` for the other codes. The note-writing rules in §3 still govern, and there the only notes you write are your own SEM005/SEM006 observations.
 
 **Worked example — Acme Corp vs Acme Corporation:**
 1. Sweep detects DUP001: `org/Acme Corp.md` and `org/Acme Corporation.md`. Both are entity type `org/` — triage applies.
@@ -581,17 +595,19 @@ When the sweep context contains an explicit operator merge instruction (resolved
 
 **No janitor path fixes these, and they are not routed to you.** The scanner detects them from date and link-count math, but the remedy is a status change, which is human-only. Nothing repairs them and nothing flags them; the sweep counts them under `not_janitor_fixable` and they surface to the operator there. Do not assume a `janitor_note` exists on these records. You should not see these codes in your issue report; if you do, log a warning and proceed.
 
-### SEM005–SEM006 — Semantic Issues (Agent-Detected)
+### SEM005–SEM006 — Semantic Issues (Your Own Labels)
 
-**Fix:** Use judgment. Add `janitor_note` with specific observations. Do NOT delete unless clearly garbage (e.g. "test test test", "asdfasdf").
+**You will never be handed one of these.** Nothing produces a SEM005 or SEM006 issue — they are not in your report because no scanner writes them. They are the two labels available to you for an observation you form yourself, about a record you were already sent for a LINK001 or DUP001. SEM005 is content too vague to be useful; SEM006 is content that duplicates another record's meaning without duplicating its name.
+
+**Use:** Judgment, and sparingly — you are the only source of these, so there is no second opinion behind you. Add a `janitor_note` prefixed `SEM005 —` or `SEM006 —` with a specific observation, not a generic one ("single unexplained fragment, no context" beats "unclear"). Respect the `LINK001` exception in §3: if the record already carries a `LINK001 —` note, leave it and log the observation instead of writing over a cohort marker. Do NOT delete unless clearly garbage (e.g. "test test test", "asdfasdf").
 
 ---
 
 ## 4. Destructive Action Rules
 
 1. **Never delete** unless the file is clearly garbage. When in doubt, flag instead.
-2. **Never merge** duplicate records. Flag with `janitor_note`.
-3. **Never move** files between directories. Flag with `janitor_note`.
+2. **Never merge** duplicate records. Emit a triage task instead (§ DUP001) and leave both candidates untouched — no `janitor_note` on either one.
+3. **Never move** files between directories. DIR001 is not routed to you at all; if one reaches you anyway, log a warning and leave the record alone.
 4. **Never touch** `_templates/`, `_bases/`, `_docs/`, `.obsidian/`, `inbox/`.
 5. **Log every deletion** — include the file path and reason.
 6. **Preserve base view embeds** — never remove `![[*.base#Section]]` lines.
@@ -623,7 +639,7 @@ FLAGGED | note/Meeting.md | SEM005 | Added janitor_note: single unexplained frag
 DELETED | note/test test.md | SEM005 | Garbage content: "test test test"
 ```
 
-Every line in your action log should carry one of the four codes routed to you (LINK001, DUP001, SEM005, SEM006). If you find yourself logging an FM00x, DIR001, ORPHAN001 or STUB001 line, something upstream misrouted — log the warning described in §3 rather than acting.
+Every line in your action log should carry either a code you were routed (LINK001, DUP001) or a label you applied yourself (SEM005, SEM006). If you find yourself logging an FM00x, DIR001, ORPHAN001 or STUB001 line, something upstream misrouted — log the warning described in §3 rather than acting.
 
 ---
 
