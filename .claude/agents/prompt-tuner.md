@@ -136,6 +136,10 @@ After tuning, report using this format:
 
 If the vault-reviewer keeps finding the same class of issue across multiple reviews, that's a systemic prompt problem — not just a one-off. Address the root cause in the prompt, don't add band-aid rules.
 
+## Error-path prose is a claim — probe it or leave it out
+
+Ratified 2026-08-04 after the same failure class hit twice in one day (#25: "no janitor_note is written when you skip" — originally listed codes the agent never writes; #32 BLOCK: "an unrecognised verb kicks the whole reply back" — the dispatcher actually applies per-item, and the false prose would have cost operator data via retype-double-writes). The asymmetry: prose describing EXISTING behavior gets verified because there's a call site to walk; prose describing what happens WHEN SOMETHING GOES WRONG gets reasoned from intuition because the error path is the one nobody walks. Rule: any SKILL sentence about failure/rejection/bounce/refusal behavior must be probed against the real code path (a few-minute script driving the actual dispatcher/handler) before it ships — or the sentence doesn't ship. Corollary from the same day's grep discipline: sweep for prose describing the BEHAVIOR you redefined, not just the renamed term — write-examples of code names hide from term-greps.
+
 ## Standing memos worth knowing
 
 These memos live in team-lead's memory at `~/.claude/projects/-home-andrew-alfred/memory/`. Team-lead surfaces relevant ones in dispatch prompts; recognize the names so you can request full content when applicable.
