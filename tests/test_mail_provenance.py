@@ -261,23 +261,73 @@ def test_structural_predicate_admits_real_curator_email_notes(body: str) -> None
     assert has_structural_email_headers(body) is True
 
 
-def test_the_structural_predicate_is_a_strict_subset_of_the_backfill_heuristic() -> None:
-    """Drift guard. If someone widens the retroactive predicate back toward the
-    permissive list, this fails — the whole point is that it is NARROWER.
+#: Bodies the PERMISSIVE heuristic admits and the structural predicate MUST NOT.
+#: This is the #40 false-positive class, verbatim in shape: word-matches on
+#: notes ABOUT email, and bare addresses quoted in ordinary prose.
+PERMISSIVE_ONLY_BODIES = [
+    SCREENSHOT_BODY,
+    "We discussed the newsletter rollout in the meeting.",
+    "Contact ben@example.com about the proposal.",
+    "Check your inbox for the unsubscribe link.",
+    "The sender was unclear about the subject line.",
+]
 
-    Asserted against the real module rather than a copied list, so the two
-    cannot drift apart silently.
+#: Bodies that ARE unambiguous curator header shape — every serialization era.
+STRUCTURAL_BODIES = [
+    "**From:** info@borrowell.com\n**Subject:** Your score\n",
+    "- **From:** team@80000hours.org\n",       # the 493-record bulleted era
+    "- **Subject:** Your weekly digest\n",     # bulleted, NO address on the line
+    "- **Account:** andrew\n",                 # bulleted, NO address at all
+    "  **Account:** andrew@example.com\n**Subject:** x\n",
+]
+
+
+def test_structural_predicate_rejects_the_entire_permissive_only_class() -> None:
+    """The property that actually matters, asserted directly.
+
+    This REPLACES a pattern-set ``structural < permissive`` assertion, which was
+    a syntactic proxy that did not survive contact with the bulleted era — and,
+    on measurement, neither did the semantic version it stood in for. Only
+    ``- **From:** addr@x`` still matches the permissive set, and only because
+    the address happens to sit on the same line; ``- **Subject:** …`` and
+    ``- **Account:** …`` match NOTHING permissive. So structural is no longer a
+    subset in either sense.
+
+    That is fine, because subset was never the real invariant. ``permissive`` is
+    not a superset of "all reasonable email signals" — it is a differently
+    shaped net that happens to be too loose in one direction. The invariant
+    worth guarding is narrower and stated here: **the structural predicate must
+    reject every body in the #40 false-positive class**, whatever the other
+    heuristic does.
     """
-    from alfred.email_classifier import backfill
-    from alfred.curator import mail_provenance
+    for body in PERMISSIVE_ONLY_BODIES:
+        assert has_structural_email_headers(body) is False, (
+            f"structural predicate admitted a permissive-only body: {body[:60]!r}"
+        )
 
-    permissive = {p.pattern for p in backfill._EMAIL_BODY_MARKERS}
-    structural = {p.pattern for p in mail_provenance._STRUCTURAL_HEADER_MARKERS}
-    assert structural < permissive, (
-        "the retroactive provenance predicate must stay a STRICT subset of the "
-        "backfill's admission heuristic — it exists because that heuristic is "
-        "too permissive to decide provenance"
-    )
+
+def test_the_permissive_heuristic_really_does_admit_that_class() -> None:
+    """Guard the guard. If the backfill heuristic were ever tightened, the pin
+    above would still pass while asserting nothing interesting — it would be
+    rejecting bodies nothing admits. Driving the real module keeps the contrast
+    live rather than assumed."""
+    from alfred.email_classifier import backfill
+
+    for body in PERMISSIVE_ONLY_BODIES:
+        assert any(p.search(body) for p in backfill._EMAIL_BODY_MARKERS), (
+            f"permissive heuristic no longer admits {body[:60]!r} — this pin's "
+            f"contrast has gone stale; re-derive the false-positive class"
+        )
+
+
+def test_structural_predicate_admits_every_known_header_era() -> None:
+    """Positive half. The bulleted entries are the 493 records the original
+    anchor missed; the two without an address on the line are the ones that
+    prove this is about HEADER SHAPE, not about finding an email address."""
+    for body in STRUCTURAL_BODIES:
+        assert has_structural_email_headers(body) is True, (
+            f"structural predicate missed a known-good header shape: {body[:60]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -552,3 +602,110 @@ def test_stamp_takes_no_session_path_parameter() -> None:
     import inspect
 
     assert "session_path" not in inspect.signature(stamp_email_provenance).parameters
+
+
+# ---------------------------------------------------------------------------
+# #40b — the bulleted era, and the probe
+# ---------------------------------------------------------------------------
+
+
+def test_bulleted_header_note_is_grantable_and_survives_neutralize(
+    tmp_path: Path,
+) -> None:
+    """THE #40b regression. 493 production records serialize headers as bullets
+    (``- **From:** team@80000hours.org``); the original anchor missed all of
+    them, so the staged apply would have STRIPPED genuine email records out of
+    the calibration pool.
+
+    Driven through both passes, in the order the box runs them — the failure
+    mode was never "grant returns False", it was "neutralize then eats it".
+    """
+    from alfred.scripts.mail_provenance_cleanup import (
+        grant_markers,
+        neutralize_stray_stamps,
+    )
+    import frontmatter
+
+    vault = _vault(tmp_path)
+    _write_note(
+        vault, "note/80000Hours Marketing Email 2026-05-27.md",
+        "type: note\nname: 80000Hours marketing\npriority: low\n",
+        "- **From:** team@80000hours.org\n- **Subject:** This week\n\nBody.\n",
+    )
+
+    granted = grant_markers(vault, apply=True, limit=0)
+    assert granted.paths == ["note/80000Hours Marketing Email 2026-05-27.md"]
+
+    neutralize_stray_stamps(vault, apply=True, limit=0)
+    fm = frontmatter.load(
+        str(vault / "note/80000Hours Marketing Email 2026-05-27.md"),
+    ).metadata
+    assert note_is_email_derived(fm) is True
+    assert fm["priority"] == "low", "neutralize ate a genuine bulleted-era email"
+
+
+def test_bulleted_note_is_sampleable_after_the_grant(tmp_path: Path) -> None:
+    """End-to-end: grant → the record re-enters the calibration pool. The point
+    of the grant is the pool, not the field."""
+    from alfred.scripts.mail_provenance_cleanup import grant_markers
+
+    vault = _vault(tmp_path)
+    _write_note(
+        vault, "note/Bulleted era.md",
+        "type: note\nname: Bulleted\npriority: low\n",
+        "- **From:** team@80000hours.org\n",
+    )
+    assert _read_candidate(vault, "note/Bulleted era.md") is None  # pre-grant
+    grant_markers(vault, apply=True, limit=0)
+    assert _read_candidate(vault, "note/Bulleted era.md") is not None
+
+
+def test_the_screenshot_note_is_still_rejected_after_widening(
+    tmp_path: Path,
+) -> None:
+    """The widening must not have loosened toward the word-list. The #40 record
+    has no header line in any serialization — only the words "email" and
+    "inbox" in prose — and must still fail."""
+    assert has_structural_email_headers(SCREENSHOT_BODY) is False
+
+    from alfred.scripts.mail_provenance_cleanup import grant_markers
+
+    vault = _vault(tmp_path)
+    _write_note(vault, SCREENSHOT_NOTE, "type: note\nname: Bug\npriority: low\n",
+                SCREENSHOT_BODY)
+    assert grant_markers(vault, apply=True, limit=0).paths == []
+
+
+def test_a_mid_line_bold_from_is_not_a_header(tmp_path: Path) -> None:
+    """The anchor still requires line-start. Prose quoting ``**From:**`` inside
+    a sentence is not a header, and widening for bullets must not have turned
+    the anchored match into a floating one."""
+    assert has_structural_email_headers(
+        "The note said **From:** was missing from the digest.",
+    ) is False
+
+
+def test_probe_buckets_the_known_eras_and_is_read_only(tmp_path: Path) -> None:
+    """The probe's job is to report SHAPE, not to judge mail-ness — the latter
+    is what got guessed wrong. Pinned on bucket assignment plus the read-only
+    guarantee, since it runs against the production vault."""
+    from alfred.scripts.mail_header_shapes import classify_shape
+
+    assert classify_shape("**From:** a@b.com\n") == "plain"
+    assert classify_shape("- **From:** team@80000hours.org\n") == "bulleted"
+    assert classify_shape("From: a@b.com\nSent: Monday\n") == "labelled_no_markup"
+    assert classify_shape("Ping ben@example.com about it.") == "address_somewhere"
+    assert classify_shape(SCREENSHOT_BODY) == "wordlist_only"
+    assert classify_shape("Just a plain note.") == "no_signal"
+
+
+def test_probe_writes_nothing(tmp_path: Path) -> None:
+    """It runs on the live vault; the read-only claim is load-bearing."""
+    from alfred.scripts.mail_header_shapes import main
+
+    vault = _vault(tmp_path)
+    p = _write_note(vault, "note/A.md", "type: note\nname: A\npriority: low\n",
+                    "- **From:** a@b.com\n")
+    before = p.read_bytes()
+    assert main([str(vault)]) == 0
+    assert p.read_bytes() == before

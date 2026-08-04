@@ -97,10 +97,28 @@ EMAIL_PROVENANCE_FIELD = "email_derived"
 #: faithfully re-import every false positive it has already produced, wearing a
 #: name that now asserts provenance with confidence — converting a soft, visibly
 #: wrong proxy into a hard, trusted, wrong claim.
+#: ``(?:[-*+>]\s+)?`` absorbs markdown list / blockquote decoration before the
+#: header. A whole curator era serialized headers as BULLETS —
+#: ``- **From:** team@80000hours.org`` — and the original bare ``^\s*\*\*``
+#: anchor missed all of them. Measured on the production vault during the
+#: staged #40 apply: of 1,895 stamped notes, 142 plain-format, **493
+#: bulleted-format**, 1,260 neither. Without this the grant would have skipped
+#: those 493 and the neutralize pass would have stripped genuine email records
+#: out of the calibration pool.
+#:
+#: This is NOT a drift toward the permissive word-list. The conservatism this
+#: predicate was built on is about AMBIGUITY, not about narrowness for its own
+#: sake: a bulleted ``**From:**`` line is unambiguous header shape, just a
+#: different serialization era. Missing a known-good format was never the
+#: conservative choice — it was a bug wearing conservatism's clothes.
+#:
+#: Only ``-`` is measured on the real vault. ``*``/``+``/``>`` are included on
+#: the same principle at zero precision cost (they are equally unambiguous
+#: header decoration); they are unmeasured, not evidence-backed.
 _STRUCTURAL_HEADER_MARKERS = (
-    re.compile(r"^\s*\*\*From:\*\*", re.MULTILINE),
-    re.compile(r"^\s*\*\*Subject:\*\*", re.MULTILINE),
-    re.compile(r"^\s*\*\*Account:\*\*", re.MULTILINE),
+    re.compile(r"^\s*(?:[-*+>]\s+)?\*\*From:\*\*", re.MULTILINE),
+    re.compile(r"^\s*(?:[-*+>]\s+)?\*\*Subject:\*\*", re.MULTILINE),
+    re.compile(r"^\s*(?:[-*+>]\s+)?\*\*Account:\*\*", re.MULTILINE),
 )
 
 
