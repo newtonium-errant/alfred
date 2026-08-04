@@ -98,6 +98,11 @@ class DigestData:
     # "BIT ran and told us nothing useful" from "no BIT on this instance";
     # only the latter may render the "no BIT data" copy.
     bit_present: bool = False
+    # True when a BIT state file EXISTS but could not be read into a run
+    # record (unreadable bytes / bad JSON / no usable runs / malformed run).
+    # Distinct from ``bit_present=False`` with ``bit_degraded=False``, which
+    # is genuine absence. See :func:`_render_posture_line`.
+    bit_degraded: bool = False
 
 
 @dataclass
@@ -116,6 +121,11 @@ class BITPosture:
     tool_counts: dict[str, int] = field(default_factory=dict)
     mode: str = ""
     present: bool = False
+    # A state file was found but could not be read into a run record. The
+    # ILB distinction: "we have nothing to tell you" (present=False,
+    # degraded=False) vs "we cannot tell" (degraded=True). Silence and
+    # broken must not render the same sentence.
+    degraded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +408,7 @@ def read_bit_state(path: Path | None) -> BITPosture:
             error=read.detail,
             error_type=read.error_type,
         )
-        return BITPosture()
+        return BITPosture(degraded=True)
     try:
         data = json.loads(read.text)
     except json.JSONDecodeError as exc:
@@ -409,7 +419,7 @@ def read_bit_state(path: Path | None) -> BITPosture:
             error=str(exc),
             error_type=exc.__class__.__name__,
         )
-        return BITPosture()
+        return BITPosture(degraded=True)
     runs = data.get("runs") if isinstance(data, dict) else None
     if not isinstance(runs, list) or not runs:
         log.warning(
@@ -417,18 +427,18 @@ def read_bit_state(path: Path | None) -> BITPosture:
             path=str(path),
             reason="not_a_list" if not isinstance(runs, list) else "empty",
             runs_type=type(runs).__name__,
-            detail="BIT state file has no usable run history — posture renders 'no BIT data'",
+            detail="BIT state file has no usable run history — posture renders 'unreadable'",
         )
-        return BITPosture()
+        return BITPosture(degraded=True)
     latest = runs[-1]
     if not isinstance(latest, dict):
         log.warning(
             "kalle_digest.bit_state_malformed_run",
             path=str(path),
             latest_type=type(latest).__name__,
-            detail="latest BIT run is not an object — posture renders 'no BIT data'",
+            detail="latest BIT run is not an object — posture renders 'unreadable'",
         )
-        return BITPosture()
+        return BITPosture(degraded=True)
     status = str(latest.get("overall_status", "")).strip().lower()
     raw_counts = latest.get("tool_counts")
     counts = dict(raw_counts) if isinstance(raw_counts, dict) else {}
@@ -471,6 +481,7 @@ def gather_digest_data(
         bit_tool_counts=bit.tool_counts,
         bit_mode=bit.mode,
         bit_present=bit.present,
+        bit_degraded=bit.degraded,
     )
 
 
@@ -604,11 +615,19 @@ def _render_posture_line(data: DigestData) -> str:
                 detail="BIT run record carries no overall_status",
             )
             return f"**Posture:** yellow — BIT ran but recorded no status{detail}."
-        # No readable BIT run record — usually an instance that doesn't
-        # run BIT, but a degraded read lands here too (read_bit_state logs
-        # which). Green so the absence of a BIT signal isn't misread as a
-        # problem. Splitting a degraded-read copy off from the no-BIT copy
-        # is boarded separately.
+        if data.bit_degraded:
+            # A state file EXISTS and we could not read it. That is not
+            # absence, and rendering it as absence is the exact ILB failure
+            # this digest already has history with: KAL-LE claimed "no BIT
+            # data" for weeks while its daemon wrote a fresh file every
+            # morning. Yellow, because an unreadable state file on a
+            # BIT-running instance is a real problem we are failing to see —
+            # green would launder a broken read into a clean bill of health.
+            # read_bit_state has already logged WHICH degradation.
+            return "**Posture:** yellow — BIT state unreadable."
+        # Genuinely absent — no state file at all, usually an instance that
+        # doesn't run BIT. Green so the absence of a BIT signal isn't
+        # misread as a problem.
         return "**Posture:** green — no BIT data on this instance."
 
     log.warning(

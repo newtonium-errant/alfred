@@ -2175,3 +2175,58 @@ async def test_assemble_end_to_end_saves_state(
     rows = read_github_audit(audit_path)
     assert len(rows) == 1
     assert rows[0]["disposition"] == "merged_clean"
+
+
+# --- degraded read vs genuine absence (smalls#2 R11) -------------------------
+
+
+def _bit_file(tmp_path: Path, text: str) -> Path:
+    p = tmp_path / "bit_state.json"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def test_bit_state_bad_json_is_degraded_not_absent(tmp_path: Path) -> None:
+    """A state file that exists but won't parse is 'we cannot tell', NOT
+    'there is nothing to tell'. ``present`` stays False (no run record was
+    recovered) but ``degraded`` distinguishes it from genuine absence."""
+    posture = read_bit_state(_bit_file(tmp_path, "{ not json"))
+    assert posture.present is False
+    assert posture.degraded is True
+
+
+def test_bit_state_no_usable_runs_is_degraded(tmp_path: Path) -> None:
+    posture = read_bit_state(_bit_file(tmp_path, '{"runs": []}'))
+    assert posture.degraded is True
+
+
+def test_bit_state_malformed_run_is_degraded(tmp_path: Path) -> None:
+    posture = read_bit_state(_bit_file(tmp_path, '{"runs": ["not-an-object"]}'))
+    assert posture.degraded is True
+
+
+def test_bit_state_genuine_absence_is_NOT_degraded(tmp_path: Path) -> None:
+    """The negative half, and the one that keeps the pins above honest: an
+    instance with no BIT configured, and a resolved-but-missing path, are both
+    absence — not degradation. Without this a build that set degraded=True
+    unconditionally would pass every pin above."""
+    assert read_bit_state(None).degraded is False
+    assert read_bit_state(tmp_path / "nope.json").degraded is False
+
+
+def test_degraded_read_renders_unreadable_not_no_data() -> None:
+    """The operator-facing half. Rendering a degraded read as
+    'no BIT data on this instance' is the exact ILB failure this digest has
+    history with — KAL-LE claimed no-BIT-data for weeks while its daemon wrote
+    a fresh state file every morning. Yellow, not green: an unreadable state
+    file on a BIT-running instance is a real problem we are failing to see,
+    and green would launder it into a clean bill of health."""
+    md = render_digest_markdown(DigestData(bit_degraded=True))
+    assert "**Posture:** yellow — BIT state unreadable." in md
+    assert "no BIT data on this instance" not in md
+
+
+def test_genuine_absence_still_renders_the_no_data_copy() -> None:
+    """Non-regression: the pre-existing copy is untouched for real absence."""
+    md = render_digest_markdown(DigestData())
+    assert "**Posture:** green — no BIT data on this instance." in md
