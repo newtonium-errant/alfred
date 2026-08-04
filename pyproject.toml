@@ -184,3 +184,11 @@ include = ["src/alfred/", "README.md", "LICENSE"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+markers = [
+    # #16 suite egress guard. Tests must not talk to the internet; the guard in
+    # tests/conftest.py records non-loopback traffic and fails the test that
+    # caused it. This marker is the ONLY opt-out, for key-gated integration
+    # runs where reaching the real service is the point. Do not add it to
+    # silence a leak — stub the transport instead.
+    "live_network: test intentionally reaches a real network service (exempt from the egress guard)",
+]

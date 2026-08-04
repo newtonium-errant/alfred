@@ -370,6 +370,7 @@ async def test_capture_task_is_gc_safe_and_discarded(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live_network
 @pytest.mark.skipif(not os.environ.get("GROQ_API_KEY"),
                     reason="real Groq gate: set GROQ_API_KEY")
 async def test_real_groq_accepts_wav_and_roundtrips() -> None:
@@ -393,6 +394,7 @@ _SPEECH_WAV = Path(__file__).parent / "fixtures" / "stt" / "short_speech.wav"
 _SPEECH_WORDS = ("quick", "brown", "fox", "jumps", "lazy", "dog")
 
 
+@pytest.mark.live_network
 @pytest.mark.skipif(
     not (os.environ.get("GROQ_API_KEY") and _SPEECH_WAV.exists()),
     reason="real Groq speech gate: set GROQ_API_KEY + drop tests/fixtures/stt/short_speech.wav",
