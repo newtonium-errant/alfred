@@ -52,6 +52,7 @@ import frontmatter
 import structlog
 
 from alfred.vault.attribution import AuditEntry, parse_audit_entries
+from alfred.vault.paths import vault_relative
 
 from .config import DailySyncConfig
 
@@ -205,10 +206,21 @@ def _walk_vault(vault_path: Path, scan_paths: list[str]) -> Iterable[Path]:
             continue
         for md in root.rglob("*.md"):
             # Skip if any ancestor is a skip_dir relative to the vault.
-            try:
-                rel_parts = md.relative_to(vault_path).parts
-            except ValueError:
-                rel_parts = md.parts
+            #
+            # Arc #18 M6: via ``vault_relative``, which resolves BOTH sides.
+            # Bare ``relative_to`` is lexical, so it raises the moment either
+            # side is resolved while the other carries the configured spelling
+            # — production's shape (the vault is configured through a symlink).
+            #
+            # The old ``except ValueError: rel_parts = md.parts`` fallback was
+            # NOT the "skip dirs stop matching" hazard it was flagged as: the
+            # absolute parts are a suffix-superset of the relative ones, so
+            # every skip_dir in the relative portion still matched. The real
+            # exposure was the opposite — OVER-skipping, if a component of the
+            # vault root ever collided with a skip_dir name, which would
+            # silently skip the whole vault. Resolving both sides removes the
+            # fallback entirely rather than picking a better one.
+            rel_parts = tuple(vault_relative(vault_path, md).split("/"))
             if any(part in skip_dirs for part in rel_parts):
                 continue
             if md in seen:
@@ -235,10 +247,16 @@ def _read_candidates(vault_path: Path, scan_paths: list[str]) -> list[_Candidate
         if not entries:
             continue
         body = post.content or ""
-        try:
-            rel_path = str(md_file.relative_to(vault_path)).replace("\\", "/")
-        except ValueError:
-            rel_path = str(md_file)
+        # Arc #18 M6 — load-bearing, not hygiene. This string becomes
+        # ``_Candidate.record_path``, which is persisted into ``last_batch`` and
+        # later fed to ``reply_dispatch._resolve_attribution_correction`` — a
+        # writer that now runs it through ``resolve_in_vault``. That gate
+        # REFUSES an absolute path by design, so the old
+        # ``except ValueError: rel_path = str(md_file)`` fallback would have
+        # turned a legitimate attribution confirm into a refusal the moment
+        # either side resolved. ``vault_relative`` resolves both sides, so the
+        # relative form survives a symlinked vault root.
+        rel_path = vault_relative(vault_path, md_file)
         for entry in entries:
             if entry.confirmed_by_andrew or entry.confirmed_at is not None:
                 continue

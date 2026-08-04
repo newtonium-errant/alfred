@@ -26,6 +26,7 @@ from typing import Any
 
 from alfred.common.stt_noise import filter_stt_noise
 from alfred._anthropic_compat import messages_create_kwargs
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 from .state import StateManager
 from .utils import get_logger
 
@@ -723,8 +724,31 @@ def apply_substance_slug(
     if new_rel_path == rel_path:
         return rel_path
 
-    src = Path(vault_path_root) / rel_path
-    dst = Path(vault_path_root) / new_rel_path
+    # Arc #18 M6 containment gate. A rename has TWO composed paths and both are
+    # writes — the source is rewritten in place (frontmatter) and then moved to
+    # the destination — so both are gated. ``new_rel_path`` is derived from
+    # ``rel_path`` plus ``new_slug``, and ``new_slug`` comes from MODEL-generated
+    # session substance: the one value in this arc that isn't operator- or
+    # vault-derived. Gated before the ``.exists()`` probes so a traversal target
+    # is never stat-ed. Refusal maps onto this function's existing
+    # "return the path unchanged" contract — the session keeps its original
+    # name, which is the correct degradation for a cosmetic rename.
+    try:
+        src = resolve_in_vault(
+            vault_path_root, rel_path, writer="talker.session.substance_slug.src",
+        )
+        dst = resolve_in_vault(
+            vault_path_root, new_rel_path,
+            writer="talker.session.substance_slug.dst",
+        )
+    except VaultContainmentError:
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="path_escape",
+            rel_path=rel_path,
+            new_rel_path=new_rel_path,
+        )
+        return rel_path
     if not src.exists():
         log.warning(
             "talker.session.substance_slug_failed",

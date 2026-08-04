@@ -45,6 +45,7 @@ import frontmatter
 from alfred._anthropic_compat import messages_create_kwargs
 from alfred.vault import ops, scope
 from alfred.vault.mutation_log import log_mutation
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 from .config import InstructorConfig
 from .state import InstructorState
@@ -752,8 +753,16 @@ async def execute(
     dry_run = is_destructive(directive, config.destructive_keywords)
     system_prompt = _load_skill(skills_dir, config)
 
+    # ``vault_path`` is still needed below (the tool-dispatch loop threads it
+    # into the vault ops layer). Arc #18 M6 removed the
+    # ``md_path = vault_path / record_path`` that used to sit here and was
+    # never read — ``execute`` addresses records through vault ops, not through
+    # this path. Deleted rather than gated: an ungated composition nothing
+    # dereferences is not a containment hole, and gating it would have added a
+    # refusal branch that can never fire plus a pin asserting nothing about
+    # production. Removing the site is the stronger containment. The LIVE
+    # composition is in ``execute_and_record`` below.
     vault_path = config.vault.vault_path
-    md_path = vault_path / record_path
 
     # Build the initial user message. We include the directive, the
     # target record path, and the dry-run flag so the model can reason
@@ -910,7 +919,32 @@ async def execute_and_record(
       changed.
     """
     vault_path = config.vault.vault_path
-    md_path = vault_path / record_path
+    # Arc #18 M6 containment gate. This is the executor's LIVE composition:
+    # ``md_path`` feeds three writers below (``_surface_error``,
+    # ``_archive_directive``, and the audit-comment append), each of which does
+    # a ``write_text``. ``record_path`` originates from an operator directive
+    # in record frontmatter, so it is the least-trusted input of the four
+    # writers in this arc.
+    #
+    # Refusal returns an ``error``-status ExecutionResult rather than raising:
+    # the caller's contract is a result object, and the directive that named an
+    # unreachable record still needs to surface to the operator. It short-
+    # circuits BEFORE ``execute`` runs, so a directive naming an out-of-vault
+    # record never reaches the model or spends a token.
+    try:
+        md_path = resolve_in_vault(
+            vault_path, record_path,
+            writer="instructor.execute_and_record",
+        )
+    except VaultContainmentError:
+        log.warning(
+            "instructor.path_escape_denied",
+            record_path=str(record_path)[:200],
+        )
+        return ExecutionResult(
+            status="error",
+            summary=f"record path is not inside the vault: {record_path}",
+        )
 
     result = await execute(
         client=client,

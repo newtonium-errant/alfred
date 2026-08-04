@@ -52,6 +52,7 @@ from alfred.vault.attribution import (
     parse_audit_entries,
     reject_marker,
 )
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 from .assembler import (
     ReplyCorrection,
@@ -1106,7 +1107,28 @@ def _resolve_attribution_correction(
             False,
         )
 
-    file_path = vault_path / record_path
+    # Arc #18 M6 containment gate. ``record_path`` reaches here from the
+    # persisted ``last_batch`` — written by ``attribution_section`` from a
+    # vault walk, so it is trusted-ish, but it round-trips through a JSON state
+    # file that nothing re-validates on load. Gate it like any other
+    # caller-composed path, and gate it BEFORE the ``.exists()`` probe so a
+    # traversal target is never even stat-ed.
+    try:
+        file_path = resolve_in_vault(
+            vault_path, record_path,
+            writer="daily_sync.attribution.resolve_correction",
+        )
+    except VaultContainmentError:
+        log.warning(
+            "daily_sync.attribution.path_escape_denied",
+            record_path=record_path[:200],
+            marker_id=marker_id,
+        )
+        return (
+            f"item {correction.item_number}: {record_path} is not a path "
+            f"inside the vault",
+            False,
+        )
     if not file_path.exists():
         log.warning(
             "daily_sync.attribution.record_missing",
