@@ -536,6 +536,20 @@ _collection_injected: list[str] = []
 _live_network_tests: list[str] = []
 
 
+def _inventory_live_network(items) -> list[str]:
+    """nodeids carrying the ``live_network`` marker, sorted.
+
+    Split out of the hook so it can be pinned directly — calling
+    ``pytest_collection_finish`` from a test would also re-run the env scrub and
+    clobber ``_collection_injected``, which another pin asserts on.
+    """
+    return sorted(
+        item.nodeid
+        for item in items
+        if item.get_closest_marker("live_network") is not None
+    )
+
+
 def pytest_collection_finish(session):
     """Undo credential env vars introduced during collection/import.
 
@@ -545,11 +559,7 @@ def pytest_collection_finish(session):
     Also inventories the ``live_network`` exemptions while the full collected
     item list is in hand.
     """
-    _live_network_tests[:] = sorted(
-        item.nodeid
-        for item in session.items
-        if item.get_closest_marker("live_network") is not None
-    )
+    _live_network_tests[:] = _inventory_live_network(session.items)
     injected = sorted(
         name
         for name in list(os.environ)

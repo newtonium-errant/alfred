@@ -22,6 +22,7 @@ from tests.conftest import (
     _collection_injected,
     _egress_exempt,
     _guard_is_live,
+    _inventory_live_network,
     _is_ip_literal,
     _leaked_cloud_keys,
     _live_network_tests,
@@ -136,20 +137,56 @@ def test_cloud_keys_are_disjoint_from_dispatcher_injection() -> None:
 # --- live_network exemption inventory (#28 NOTE-1) --------------------------
 
 
-def test_live_network_inventory_is_collected() -> None:
-    """The exemption inventory is populated at collection, not at run time.
+def test_live_network_inventory_finds_marked_items() -> None:
+    """The inventory predicate itself, driven with stub items.
 
-    live_network tests are key-gated and normally SKIP, so a run-time inventory
-    would report "no exemptions" about a suite that carries several — the exact
-    blind spot the summary section exists to close.
-
-    Not asserting a COUNT: the number is expected to change, and a count pin
-    would just be a chore. What matters is that the inventory mechanism ran and
-    that every entry is a real nodeid.
+    Stub ITEMS, not a stub inventory — the function under assertion is the
+    production one.
     """
-    assert isinstance(_live_network_tests, list)
-    assert all(isinstance(n, str) and "::" in n for n in _live_network_tests)
-    assert _live_network_tests == sorted(_live_network_tests)
+
+    class _Item:
+        def __init__(self, nodeid: str, marked: bool) -> None:
+            self.nodeid = nodeid
+            self._marked = marked
+
+        def get_closest_marker(self, name: str):
+            return object() if (self._marked and name == "live_network") else None
+
+    # Marked items are supplied in the order b, a, c — deliberately neither
+    # sorted NOR reverse-sorted, so the assertion pins the SORT rather than
+    # accidentally matching input order (with two items every input order is
+    # either sorted or its reverse, and a dropped sort slips through).
+    items = [
+        _Item("t/b.py::marked", True),
+        _Item("t/x.py::plain", False),
+        _Item("t/a.py::marked", True),
+        _Item("t/c.py::marked", True),
+    ]
+    assert _inventory_live_network(items) == [
+        "t/a.py::marked",
+        "t/b.py::marked",
+        "t/c.py::marked",
+    ]
+    assert _inventory_live_network([]) == []
+
+
+def test_live_network_inventory_matches_this_session(request) -> None:
+    """The hook WIRING: what the summary prints must match what was collected.
+
+    Scoped to whatever selection is running, which is what makes it honest — on
+    a narrow selection with no marked tests both sides are empty and this says
+    nothing; on the full suite it is exact.
+
+    That scaling is the point. An earlier version of this pin asserted only the
+    SHAPE of ``_live_network_tests`` and stayed green with the inventory line
+    deleted from ``pytest_collection_finish`` — green against a build with no
+    feature. Comparing against the live session's own items is what closes it.
+
+    Mutation: delete the ``_live_network_tests[:] = ...`` assignment from
+    ``pytest_collection_finish`` → this fails on any run that collects a marked
+    test (the full suite does; three hold the marker).
+    """
+    assert _live_network_tests == _inventory_live_network(request.session.items)
 
 
 def test_guard_is_installed() -> None:
