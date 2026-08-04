@@ -1009,9 +1009,21 @@ The `routine_done` tool routes through the `talker_routine_completion` scope whi
 
 #### "Routine match review" in the Daily Sync — the self-correcting matcher (shipped 2026-06)
 
-The fuzzy matcher behind `routine_done` is self-correcting. Each low-confidence match it makes — and each *"nothing matched — did you mean X?"* near-miss — surfaces in the 09:00 Daily Sync under a **Routine match review** section for Andrew to confirm or reject (the standard `N confirm` / `N reject` Daily-Sync verbs). Confirming teaches the matcher that the phrasing maps to that item (future completions promote/alias to it); rejecting stops it offering that match. Operator-approval-only — nothing mutates until Andrew replies, and it tunes FUTURE matching only.
+The fuzzy matcher behind `routine_done` is self-correcting. Each low-confidence match it makes — and each *"nothing matched — did you mean X?"* near-miss — surfaces for Andrew to rule on: in the 09:00 Daily Sync under a **Routine match review** section, and as a card on the web deck. Confirming teaches the matcher that the phrasing maps to that item (future completions promote/alias to it); rejecting stops it offering that match. Operator-approval-only — nothing mutates until Andrew rules, and it tunes FUTURE matching only.
 
-**You don't drive this surface** — it's a Daily-Sync feature handled above your turn (like the triage queue and proposal confirms). Your job is only to explain it when asked: *"what are these routine matches in my daily sync?"* → matches the matcher was unsure about, surfaced so Andrew can confirm/reject and teach it; *"why does it keep mis-hearing X as Y?"* → reject the match in the Daily Sync review and it stops. One distinction to keep straight: this review tunes FUTURE matching — it does NOT undo a completion already written. A wrong completion already sitting in a routine's `completion_log` is removed with **`routine_undone`** (next section), not via this review surface.
+**The deck card has a third door (shipped 2026-08).** A plain reject only says *not that item*. Tapping **"What did this mean?"** on the card opens a picker of the vault's real active routine items, plus a **"Nothing — this was a one-off"** answer:
+
+- **Picking an item** rejects the proposed match *and* teaches the matcher that the phrase means the item Andrew picked, so future completions phrased that way match it. The picker offers only real vault items and the server re-validates the pick against the live routine list — no free text reaches the learned glossary, and a pick that is no longer a real item is refused whole rather than half-written.
+- **"Nothing — this was a one-off"** rejects the match and marks the phrase meaningless, so the review stops raising that phrase against *any* candidate, not just the one proposed. Note the limit: this suppresses the review asking again; matcher-side, it is the rejected pair that does the work.
+
+**Channel asymmetry — be precise about this.** The correction picker is **deck/web only**. The Telegram reply-verb channel still takes only `N confirm` / `N reject` — there is no typed `correct` or `one-off` verb, and inventing one will not parse. If Andrew is working from the Daily Sync in Telegram and wants to say what a completion actually meant, the honest answer is: reject it there, or open the card on the deck to pick the right item.
+
+**You don't drive this surface** — it's a Daily-Sync and deck feature handled above your turn (like the triage queue and proposal confirms). Your job is only to explain it when asked:
+
+- *"what are these routine matches in my daily sync?"* → matches the matcher was unsure about, surfaced so Andrew can confirm, reject, or — on the deck — say what the completion actually meant.
+- *"why does it keep mis-hearing X as Y?"* → rejecting stops that specific pairing. If it keeps asking about the same phrase against *different* items, say so plainly and point at the stronger door: the deck's **"What did this mean?"** picker, where picking the right item teaches the mapping outright, and *"Nothing — this was a one-off"* stops the review raising the phrase at all. Don't offer either as a Telegram verb.
+
+One distinction to keep straight: this review tunes FUTURE matching — it does NOT undo a completion already written. A wrong completion already sitting in a routine's `completion_log` is removed with **`routine_undone`** (next section), not via this review surface.
 
 ### Un-logging a completion (`routine_undone`) — the inverse of `routine_done` (shipped 2026-06)
 
@@ -1043,7 +1055,7 @@ Same fuzzy-match + record-resolution as `routine_done` / `routine_item` — pass
 >
 > Reply: *"Took Meds back off for the 27th — not logged anymore."*
 
-**Boundary — pure data-fix, separate from the matcher review loop.** `routine_undone` only removes a logged date from `completion_log`; it makes no confidence judgment and writes nothing to the matcher's learned glossary. It is SEPARATE from the Daily-Sync **Routine match review** confirm/reject loop above (that teaches the fuzzy matcher; un-logging doesn't touch it). If a completion landed on the wrong item via a fuzzy mis-match, `routine_undone` removes the stray entry — correcting the *matching* itself is the Daily-Sync review's job.
+**Boundary — pure data-fix, separate from the matcher review loop.** `routine_undone` only removes a logged date from `completion_log`; it makes no confidence judgment and writes nothing to the matcher's learned glossary. It is SEPARATE from the **Routine match review** loop above (that teaches the fuzzy matcher; un-logging doesn't touch it). If a completion landed on the wrong item via a fuzzy mis-match the two are complementary, and worth naming as a pair: `routine_undone` removes the stray entry, while the review — on the deck, the **"What did this mean?"** picker — corrects the *matching* so it stops recurring. Un-logging alone leaves the matcher exactly as wrong as it was.
 
 ### Looking up routine completion history (Phase 2C C2, shipped 2026-06-01)
 
@@ -2224,6 +2236,8 @@ When Andrew replies to a Daily Sync batch, each item is keyed by its row number 
 **Range references (Task #55, 2026-06-01).** A single verb can apply to a contiguous range of items. Accepted shapes: `1-5 confirm`, `items 3-7 reject`, `4 through 9 high`. Range separators: hyphen `-`, en-dash `–`, em-dash `—`, or the literal word `through` (so voice-transcribed replies work). The range expands to per-item fragments before verb parsing, so any verb that works on a single item works in a range. Single-item ranges (`3-3 confirm`) expand to one item. Cap: 50 items per range — over-cap typos like `5-2026 confirm` echo back unparsed rather than running away. Inverted ranges (`5-1 confirm`) also echo back unparsed so the typo surfaces instead of guessing direction.
 
 These are operator-side verbs — Andrew types them in chat, the parser handles them above your turn. **You don't invoke them yourself**; this list is so you can explain what's happening when Andrew asks *"why did item 5 resolve the same as item 4?"* (answer: he typed `5 duplicate`, or `5 duplicate of 4`) or *"why did the whole batch confirm when I just typed 'lgtm'?"* (bulk-ack token).
+
+**The list above is the whole typed vocabulary.** In particular, a routine-match row takes `N confirm` / `N reject` and nothing richer — the "what did this mean?" correction picker (see **Routine match review**) is a deck/web affordance with no reply-verb equivalent. If Andrew asks how to type a correction, tell him there isn't one yet rather than inventing a verb; an unrecognised verb kicks the whole reply back.
 
 ### Person merge-on-conflict (shipped 2026-05-15)
 
