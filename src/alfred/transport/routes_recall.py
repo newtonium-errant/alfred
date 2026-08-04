@@ -154,7 +154,7 @@ def _render_value(value: Any) -> str:
 def render_frontmatter_summary(
     filtered: dict[str, Any],
     granted: list[str],
-) -> str:
+) -> tuple[str, list[str]]:
     """Render the PEER-VISIBLE frontmatter as a compact ``key: value`` block.
 
     ``filtered`` / ``granted`` are exactly what
@@ -167,19 +167,29 @@ def render_frontmatter_summary(
     controls what leads. Empty values (``None``, ``""``, ``[]``) are
     dropped rather than rendered as dangling keys — a person record's
     unset ``phone:`` is absence, not content.
+
+    Returns ``(summary, rendered_fields)``. GRANTED and RENDERED are
+    deliberately different numbers: the gate grants on KEY PRESENCE, so a
+    granted-but-empty field (``aliases: []``) counts as granted and renders
+    nothing. Both travel to the log so an operator reading "granted 3,
+    rendered 2" can see WHICH field was empty instead of suspecting the
+    gate dropped it. This is the one place the drop-empty rule lives —
+    never re-derive the rendered set by re-parsing the summary.
     """
     if not filtered:
-        return ""
+        return "", []
     order = {name: i for i, name in enumerate(granted)}
     pairs = _flatten_frontmatter(filtered)
     pairs.sort(key=lambda kv: (order.get(kv[0], len(order)), kv[0]))
-    lines = []
+    lines: list[str] = []
+    rendered_fields: list[str] = []
     for key, value in pairs:
         rendered = _render_value(value)
         if not rendered:
             continue
         lines.append(f"{key}: {rendered}")
-    return "\n".join(lines)
+        rendered_fields.append(key)
+    return "\n".join(lines), rendered_fields
 
 
 def build_snippet(body: str, query: str, max_chars: int) -> tuple[str, bool]:
@@ -278,7 +288,11 @@ class SnippetFieldStats:
     the limiter was the CODE or the operator's field allowlist.
     """
 
+    # GATE-GRANTED (config ceiling) vs ACTUALLY-RENDERED (non-empty on the
+    # records). Both are logged: their difference names the granted-but-empty
+    # fields, which is otherwise indistinguishable from the gate withholding.
     granted_fields: list[str] = field(default_factory=list)
+    rendered_fields: list[str] = field(default_factory=list)
     records_with_frontmatter: int = 0
     records_filtered_empty: int = 0
 
@@ -304,20 +318,31 @@ def _peer_visible_frontmatter(
     an empty ``fields`` list all yield ``({}, [], ...)`` upstream, so this
     returns ``("", [])`` and the snippet degrades to body-only.
 
-    Returns ``(summary_text, granted_fields)``.
+    Returns ``(summary_text, granted_fields, rendered_fields)``.
     """
     if not metadata:
-        return "", []
+        return "", [], []
     # Lazy import — keeps this module import-light for the pure-helper tests
     # (same reason vault.ops is imported inside search_recall).
     from .canonical import apply_field_permissions
 
+    # KEYWORD-bound, matching both other consumers of this gate
+    # (peer_handlers._execute_filtered_search and the /canonical/<type>/<name>
+    # handler). Positional binding on a security seam is a standing hazard:
+    # `peer` and `record_type` are both `str`, so a transposition type-checks,
+    # runs, and passes any test written against the same transposition —
+    # while silently looking up the wrong peer's grant. Keywords make a future
+    # signature change fail loudly instead.
     filtered, granted, _denied = apply_field_permissions(
-        peer, record_type, metadata, peer_permissions,
+        peer=peer,
+        record_type=record_type,
+        frontmatter=metadata,
+        perms=peer_permissions,
     )
     if not filtered:
-        return "", []
-    return render_frontmatter_summary(filtered, granted), granted
+        return "", [], []
+    summary, rendered = render_frontmatter_summary(filtered, granted)
+    return summary, granted, rendered
 
 
 def _snippet_for_path(
@@ -329,14 +354,15 @@ def _snippet_for_path(
     record_type: str,
     peer: str,
     peer_permissions: dict[str, Any] | None,
-) -> tuple[str, bool, list[str]]:
+) -> tuple[str, bool, list[str], list[str]]:
     """Load a record and build its bounded snippet. Never raises.
 
     The snippet leads with the peer-visible frontmatter (gated by
     :func:`_peer_visible_frontmatter`) and fills the remaining budget with
-    the body excerpt. Returns ``(snippet, truncated, granted_fields)``;
-    an empty ``granted_fields`` means the frontmatter tier contributed
-    nothing and the snippet is exactly today's body-only projection.
+    the body excerpt. Returns
+    ``(snippet, truncated, granted_fields, rendered_fields)``; empty
+    ``rendered_fields`` means the frontmatter tier put nothing in the
+    snippet and it is exactly today's body-only projection.
     """
     try:
         post = frontmatter.load(str(vault_path / rel_path))
@@ -347,15 +373,15 @@ def _snippet_for_path(
             "transport.recall.snippet_read_failed",
             path=rel_path, error=str(exc),
         )
-        return "", False, []
-    summary, granted = _peer_visible_frontmatter(
+        return "", False, [], []
+    summary, granted, rendered = _peer_visible_frontmatter(
         metadata,
         record_type=record_type,
         peer=peer,
         peer_permissions=peer_permissions,
     )
     snippet, truncated = compose_recall_snippet(summary, body, query, max_chars)
-    return snippet, truncated, granted
+    return snippet, truncated, granted, rendered
 
 
 def search_recall(
@@ -395,6 +421,7 @@ def search_recall(
     matches: list[dict[str, Any]] = []
     stats = SnippetFieldStats()
     seen_fields: set[str] = set()
+    seen_rendered: set[str] = set()
     for rt in search_types:
         if len(matches) >= max_matches:
             break
@@ -431,7 +458,7 @@ def search_recall(
                 break
             rel_path = hit.get("path", "")
             match_type = hit.get("type") or rt
-            snippet, truncated, granted = _snippet_for_path(
+            snippet, truncated, granted, rendered = _snippet_for_path(
                 vault_path,
                 rel_path,
                 query,
@@ -440,9 +467,13 @@ def search_recall(
                 peer=peer,
                 peer_permissions=peer_permissions,
             )
-            if granted:
+            seen_fields.update(granted)
+            seen_rendered.update(rendered)
+            # Counted on RENDERED, not granted: a record whose granted fields
+            # were all empty contributed nothing to its snippet, and calling
+            # that "with_frontmatter" would overstate what the peer received.
+            if rendered:
                 stats.records_with_frontmatter += 1
-                seen_fields.update(granted)
             else:
                 stats.records_filtered_empty += 1
             matches.append({
@@ -456,6 +487,7 @@ def search_recall(
                 },
             })
     stats.granted_fields = sorted(seen_fields)
+    stats.rendered_fields = sorted(seen_rendered)
     return matches, stats
 
 
@@ -618,24 +650,33 @@ async def _handle_peer_recall(request: web.Request) -> web.StreamResponse:
         match_count=len(matches),
         types_searched=list(search_types),
         denied_types=denied_types,
-        # Snippet frontmatter tier — names WHICH fields were disclosed and
-        # how many records got nothing. This is the line that says whether
-        # the limiter is the code or the operator's allowlist: an answer
-        # with matches but snippet_fields=[] and every record in
-        # snippet_records_filtered means the peer simply has no field grant
-        # for these types, and the fix is a canonical.peer_permissions
+        # Snippet frontmatter tier — the line that says whether the limiter
+        # is the CODE or the operator's allowlist. Two field lists, because
+        # they answer different questions and their difference is meaningful:
+        #   snippet_fields          — what the GATE granted (the config ceiling)
+        #   snippet_fields_rendered — what actually reached the snippet
+        # A field in the first but not the second was granted-but-EMPTY on
+        # these records (e.g. `aliases: []`), which is otherwise
+        # indistinguishable from the gate withholding it. An answer with
+        # matches, snippet_fields=[] and every record in
+        # snippet_records_filtered means the peer has no field grant for
+        # these types at all — that fix is a canonical.peer_permissions
         # widen, not a code change.
         snippet_fields=field_stats.granted_fields,
+        snippet_fields_rendered=field_stats.rendered_fields,
         snippet_records_with_frontmatter=field_stats.records_with_frontmatter,
         snippet_records_filtered=field_stats.records_filtered_empty,
     )
 
-    # Intentionally-left-blank, second signal: matches came back but the
-    # field allowlist contributed NOTHING to any of them, so every snippet
-    # is the old body-only projection. On a person/org query that is the
-    # "names without meaning" shape — surface it explicitly rather than
-    # letting a correct-looking 200 hide a config gap.
-    if matches and not field_stats.granted_fields:
+    # Intentionally-left-blank, second signal: matches came back but NOTHING
+    # reached any snippet's frontmatter head, so every one is the old
+    # body-only projection. On a person/org query that is the "names without
+    # meaning" shape — surface it rather than letting a correct-looking 200
+    # hide it. Keyed on RENDERED (not granted) so the grant-exists-but-every
+    # -field-empty case fires too; `reason` tells the two apart, since they
+    # need different fixes.
+    if matches and not field_stats.rendered_fields:
+        no_grant = not field_stats.granted_fields
         log.info(
             "transport.recall.snippet_frontmatter_empty",
             peer=peer,
@@ -643,9 +684,17 @@ async def _handle_peer_recall(request: web.Request) -> web.StreamResponse:
             correlation_id=cid,
             match_count=len(matches),
             types_searched=list(search_types),
-            detail="no canonical field grant for this peer × these types — "
-                   "snippets are body-only (widen canonical.peer_permissions "
-                   "to disclose frontmatter substance)",
+            reason="no_field_grant" if no_grant else "granted_fields_all_empty",
+            granted_fields=field_stats.granted_fields,
+            detail=(
+                "no canonical field grant for this peer × these types — "
+                "snippets are body-only (widen canonical.peer_permissions "
+                "to disclose frontmatter substance)"
+                if no_grant else
+                "the peer's granted fields are all EMPTY on these records — "
+                "snippets are body-only; the grant is fine, the records "
+                "(or the chosen fields) carry no value for it"
+            ),
         )
 
     return web.json_response({

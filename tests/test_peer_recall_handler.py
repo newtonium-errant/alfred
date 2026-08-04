@@ -735,8 +735,11 @@ async def test_recall_logs_the_disclosed_snippet_fields(recall_fm_client) -> Non
     assert len(answered) == 1
     entry = answered[0]
     assert set(entry["snippet_fields"]) == {"name", "role", "org", "description"}
+    # Every granted field is populated on this record → rendered == granted.
+    assert set(entry["snippet_fields_rendered"]) == {"name", "role", "org", "description"}
     assert entry["snippet_records_with_frontmatter"] == 1
     assert "email" not in entry["snippet_fields"]
+    assert "email" not in entry["snippet_fields_rendered"]
     # The empty-tier signal must NOT fire when fields did contribute.
     assert not [
         c for c in captured
@@ -766,10 +769,60 @@ async def test_recall_logs_when_the_allowlist_contributes_nothing(
     assert len(empty) == 1
     assert empty[0]["peer"] == "kal-le"
     assert empty[0]["match_count"] >= 1
+    assert empty[0]["reason"] == "no_field_grant"  # WHY it's empty, not just that
     answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
     assert answered[0]["snippet_fields"] == []
+    assert answered[0]["snippet_fields_rendered"] == []
     assert answered[0]["snippet_records_with_frontmatter"] == 0
     assert answered[0]["snippet_records_filtered"] >= 1
+
+
+async def test_recall_empty_signal_distinguishes_grant_exists_but_all_empty(
+    tmp_path, aiohttp_client,
+) -> None:
+    """The second empty reason: a grant EXISTS but every granted field is empty.
+
+    Same body-only outcome, completely different fix (the grant is fine — the
+    records or the chosen fields carry nothing), so `reason` must tell them
+    apart rather than both reading as "no grant".
+    """
+    audit_path = str(tmp_path / "canonical_audit.jsonl")
+    cfg = _transport_config(audit_path=audit_path)
+    # Granted a field that exists on the record but is EMPTY.
+    cfg.canonical = CanonicalConfig(
+        audit_log_path=audit_path,
+        peer_permissions={"kal-le": {"person": {"fields": ["aliases"]}}},
+    )
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(cfg, tstate)
+    vault = _make_vault(tmp_path)
+    _write_person_with_frontmatter(vault)  # has `aliases` absent → add it empty
+    (vault / "person" / "Ben McMillan.md").write_text(
+        "---\ntype: person\nname: Ben McMillan\naliases: []\n---\n"
+        + _PERSON_TEMPLATE_BODY,
+        encoding="utf-8",
+    )
+    register_vault_path(app, vault)
+    register_instance_identity(app, name="Salem")
+    register_recall_routes(app, enabled=True, instance_name="Salem")
+    client = await aiohttp_client(app)
+
+    with structlog.testing.capture_logs() as captured:
+        resp = await client.post(
+            "/peer/recall", headers=_KALLE_HEADERS, json={"query": "Ben McMillan"},
+        )
+    assert resp.status == 200
+    empty = [
+        c for c in captured
+        if c.get("event") == "transport.recall.snippet_frontmatter_empty"
+    ]
+    assert len(empty) == 1
+    assert empty[0]["reason"] == "granted_fields_all_empty"
+    assert empty[0]["granted_fields"] == ["aliases"]  # the grant DID resolve
+    answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
+    # granted 1, rendered 0 — the whole point of carrying both numbers.
+    assert answered[0]["snippet_fields"] == ["aliases"]
+    assert answered[0]["snippet_fields_rendered"] == []
 
 
 # --- pure helpers -----------------------------------------------------------
@@ -778,26 +831,46 @@ async def test_recall_logs_when_the_allowlist_contributes_nothing(
 def test_render_frontmatter_summary_follows_allowlist_order() -> None:
     filtered = {"name": "Ben", "role": "Ops lead", "org": "RRTS"}
     granted = ["role", "org", "name"]  # operator's configured order
-    assert render_frontmatter_summary(filtered, granted) == (
-        "role: Ops lead\norg: RRTS\nname: Ben"
-    )
+    summary, rendered = render_frontmatter_summary(filtered, granted)
+    assert summary == "role: Ops lead\norg: RRTS\nname: Ben"
+    assert rendered == ["role", "org", "name"]  # rendered order tracks the summary
 
 
 def test_render_frontmatter_summary_joins_lists_and_drops_empties() -> None:
     filtered = {"aliases": ["Benny", "B"], "role": None, "org": "", "name": "Ben"}
-    out = render_frontmatter_summary(filtered, ["aliases", "role", "org", "name"])
-    assert out == "aliases: Benny, B\nname: Ben"
+    summary, rendered = render_frontmatter_summary(
+        filtered, ["aliases", "role", "org", "name"],
+    )
+    assert summary == "aliases: Benny, B\nname: Ben"
+    # The granted-vs-rendered split: role/org were granted but empty.
+    assert rendered == ["aliases", "name"]
+
+
+def test_render_frontmatter_summary_rendered_excludes_granted_but_empty() -> None:
+    """The exact live shape: `aliases: []` is GRANTED but renders nothing.
+
+    This is what makes the log read "granted 3, rendered 2" — without the
+    second list, an empty granted field is indistinguishable from the gate
+    withholding it.
+    """
+    filtered = {"name": "Ben McMillan", "email": "ben@example.invalid", "aliases": []}
+    granted = ["name", "email", "aliases"]
+    summary, rendered = render_frontmatter_summary(filtered, granted)
+    assert summary == "name: Ben McMillan\nemail: ben@example.invalid"
+    assert rendered == ["name", "email"]
+    assert len(granted) == 3 and len(rendered) == 2
 
 
 def test_render_frontmatter_summary_renders_dotted_paths() -> None:
-    filtered = {"preferences": {"coding": "python"}}
-    assert render_frontmatter_summary(filtered, ["preferences.coding"]) == (
-        "preferences.coding: python"
+    summary, rendered = render_frontmatter_summary(
+        {"preferences": {"coding": "python"}}, ["preferences.coding"],
     )
+    assert summary == "preferences.coding: python"
+    assert rendered == ["preferences.coding"]
 
 
 def test_render_frontmatter_summary_empty_is_empty() -> None:
-    assert render_frontmatter_summary({}, []) == ""
+    assert render_frontmatter_summary({}, []) == ("", [])
 
 
 def test_compose_snippet_without_summary_is_byte_identical_to_body_only() -> None:
