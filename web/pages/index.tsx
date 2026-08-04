@@ -85,9 +85,11 @@ export default function HomePage() {
   // no way to see the flip and lagged a whole fetch behind the green segment.
   const completion = useRingCompletion({ onAuthExpired });
   // How many things need you (the FEED truth) vs how many the DECK can actually
-  // deal. The deck only handles kinds with a wired verb — slot_suggestion et al.
-  // aren't swipeable — so the deck PROMISE counts deck-able only (mirrors feed.tsx,
-  // b1). A DONE slot item (board-completed) no longer needs you, so it's excluded
+  // deal. `isDeckDealt` is the ONLY authority on which items the deck deals —
+  // don't restate its rule here, because paraphrases of it are what #22 retired
+  // (the old one said slot_suggestion "isn't swipeable"; a SUGGESTED one is). The
+  // deck PROMISE counts deck-able only, so it can never over-promise the deck
+  // (mirrors feed.tsx, b1). A DONE slot item (board-completed) no longer needs you, so it's excluded
   // from the needs-you total (Phase C) — via the shared hook, so a completion in the
   // rings drops the count in the SAME render. No override → `effectiveDone` is
   // exactly `ringItemDone`, so the server-truth baseline is unchanged.

@@ -414,13 +414,26 @@ def test_live_key_is_environment_only(monkeypatch: pytest.MonkeyPatch) -> None:
     so the skipif never fired and every full-suite run spent money.
     """
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
-    assert _live_key() == ""
+    # NEVER put `_live_key()` inside the assert. A failing assert renders its
+    # operands AND every sub-expression: `assert len(_live_key()) == 0` reports
+    # `where 51 = len('<the live key>')` / `where '<the live key>' = _live_key()`.
+    # Comparing length is not enough on its own — the CALL has to happen outside
+    # the statement, so the only thing pytest can render is a plain int.
+    # It matters because this fails exactly when the regression exists, which is
+    # when the output reaches CI logs and pasted tickets. Same standard this
+    # file's own `test_no_key_or_text_in_logs` states. Measured both ways.
+    key_len = len(_live_key())
+    assert key_len == 0, "the .env fallback is back — the gate returned a key"
 
 
 def test_live_key_honours_an_exported_value(monkeypatch: pytest.MonkeyPatch) -> None:
     """Exporting the key is how the operator opts IN — that path still works."""
     monkeypatch.setenv("ELEVENLABS_API_KEY", "DUMMY_ELEVENLABS_TEST_KEY")
-    assert _live_key() == "DUMMY_ELEVENLABS_TEST_KEY"
+    # Same rule: a regression preferring the FILE over the environment would put
+    # a real key on the left of this comparison, so the comparison happens
+    # outside the assert and only its boolean result is rendered.
+    honoured = _live_key() == "DUMMY_ELEVENLABS_TEST_KEY"
+    assert honoured is True, "an exported ELEVENLABS_API_KEY was not honoured"
 
 
 def test_live_key_touches_no_files(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -460,11 +473,15 @@ def test_live_key_touches_no_files(monkeypatch: pytest.MonkeyPatch) -> None:
     # Snapshot around the call ONLY, so unrelated pytest-internal Path use
     # before or after cannot pollute the observation.
     touched.clear()
-    result = _live_key()
+    result_len = len(_live_key())  # length only — see the env-only pin above
     observed = list(touched)
 
-    assert result == ""
+    # Filesystem assertion FIRST, deliberately: it reports PATHS, which are safe
+    # to print, and under the regression it is the one that fires — so the
+    # readable failure names the file that was reached rather than anything from
+    # inside it.
     assert observed == [], f"_live_key reached the filesystem: {observed}"
+    assert result_len == 0, "the gate returned a key with no environment variable set"
 
 
 @pytest.mark.live_network
