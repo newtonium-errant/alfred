@@ -444,9 +444,11 @@ Note the asymmetry, because it changes how much you can assume: the autofix-hand
 
 ### Writing `janitor_note` — Idempotency Rule
 
-Every `janitor_note` you write must begin with the issue code you are acting on (`SEM005 —`, `SEM006 —`, `LINK001 —`, `DUP001 —`). That prefix is load-bearing — it is how the janitor recognizes its own prior work across sweeps.
+Every `janitor_note` you write must begin with the issue code you are acting on — in practice `SEM005 —` or `SEM006 —`, the only two codes whose procedure has you writing a note at all. That prefix is load-bearing: it is how the janitor recognizes its own prior work across sweeps.
 
-You will also meet notes you did not write. The deterministic autofix phase writes `FM002 -- …` and `FM003 -- …` notes in the same code-prefixed shape, and older records may still carry prefixes from retired passes (`ORPHAN001`, `STUB001`). Treat any code-prefixed note as prior work for the check below — finding one is not evidence that the code is still being handled.
+The other two codes routed to you do not produce notes. An unresolved LINK001 gets a `SKIPPED` log line, never a note (§ LINK001); a DUP001 gets a triage task while both candidate records stay untouched (§ DUP001).
+
+You will still meet notes you did not write, in the same code-prefixed shape. The deterministic autofix phase writes `FM002 -- …` and `FM003 -- …`; records from earlier passes may carry `LINK001 —`, `DUP001 —`, `ORPHAN001 —` or `STUB001 —`. Treat any code-prefixed note as prior work when you apply the check below. Finding one is not evidence that its code is still being handled, and it is never a reason to write a fresh note in that code yourself.
 
 **Before writing `janitor_note`, always `alfred vault read` the target record first.** Then:
 
