@@ -40,6 +40,7 @@ import structlog
 from alfred.routine.match_calibration import (
     CORPUS_ALIAS,
     CORPUS_CONFIRM,
+    CORPUS_ONEOFF,
     CORPUS_REJECT,
     KIND_NO_MATCH,
     MatchCorpusEntry,
@@ -769,10 +770,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _norm_item_text(value: str) -> str:
+    """Normalised form used ONLY to look a chosen correction target up against
+    the vault's real routine items (#13).
+
+    Collapses whitespace and casefolds, so a target that came back from a card
+    rendered minutes ago still resolves after a trivial edit to the record. The
+    corpus row is always written with the VAULT's canonical spelling, never this
+    normalised form — glossary pairs key on ``item_text`` verbatim, so writing
+    the normalised string would create a pair the matcher never looks up.
+    """
+    return " ".join((value or "").split()).casefold()
+
+
 def _resolve_routine_match_correction(
     correction: ReplyCorrection,
     item: dict[str, Any],
     corpus_path: str,
+    *,
+    vault_path: Path | None = None,
 ) -> tuple[str | None, bool]:
     """Apply one routine-match confirm/reject (self-correcting matcher).
 
@@ -792,6 +808,28 @@ def _resolve_routine_match_correction(
       * reject → :data:`CORPUS_REJECT` (recorded so the capture path doesn't
         re-ask this suggestion).
 
+    #13 REJECT-WITH-CORRECTION enriches the reject side. A bare reject still
+    means "not that item" and nothing more; a reject may additionally carry:
+
+      * ``correction.correction_target`` — the routine item the completion
+        ACTUALLY meant. Writes :data:`CORPUS_REJECT` for the proposed pair AND
+        :data:`CORPUS_ALIAS` for ``(query_key, chosen item)``, so the NO both
+        suppresses the wrong answer and teaches the right one.
+      * ``correction.one_off`` — "nothing; that completion was a one-off".
+        Writes :data:`CORPUS_REJECT` plus :data:`CORPUS_ONEOFF`, which
+        suppresses the PHRASE rather than just the pair.
+
+    NO FREE-TEXT REACHES THE CORPUS. A ``correction_target`` is validated
+    against the vault's live active-routine items and the row is written with
+    the vault's canonical spelling; an unrecognised target is REFUSED WHOLE —
+    nothing is appended, not even the reject. A half-landed correction would be
+    the worst outcome available: the card would leave the deck (rejected) while
+    the answer the operator supplied was dropped, so the loop would look closed
+    and teach nothing. Every refusal logs
+    ``daily_sync.routine_match.correction_refused`` with a ``reason``, because a
+    silent-but-correct refusal and a refusal for an unrelated cause (missing
+    metadata, wrong verb) are otherwise indistinguishable in the log.
+
     Modifier / tier verbs make no sense on a routine-match item (they only
     apply to email calibration) — bucketed as an "only accept" unparsed
     string so the dispatcher shows the verb-mismatch hint.
@@ -804,6 +842,37 @@ def _resolve_routine_match_correction(
         return (
             f"item {correction.item_number}: routine matches only "
             f"accept `confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+            False,
+        )
+
+    target = (correction.correction_target or "").strip()
+
+    # #13 shape guards, BEFORE any read or write. A correction is an enriched
+    # NO; every other combination is contradictory and gets refused rather than
+    # silently reinterpreted.
+    if target and correction.one_off:
+        log.warning(
+            "daily_sync.routine_match.correction_refused",
+            item_number=correction.item_number,
+            reason="target_and_one_off",
+            target=target,
+        )
+        return (
+            f"item {correction.item_number}: pick either the item it meant "
+            f"or 'one-off', not both",
+            False,
+        )
+    if (target or correction.one_off) and not correction.reject:
+        log.warning(
+            "daily_sync.routine_match.correction_refused",
+            item_number=correction.item_number,
+            reason="correction_without_reject",
+            target=target,
+            one_off=correction.one_off,
+        )
+        return (
+            f"item {correction.item_number}: a correction only applies to a "
+            f"reject — confirm means the match was already right",
             False,
         )
 
@@ -822,6 +891,89 @@ def _resolve_routine_match_correction(
             False,
         )
 
+    qkey = query_key(query)
+
+    # Resolve the chosen target against the vault BEFORE writing anything, so a
+    # refused correction leaves the corpus (and its parent directory) untouched
+    # and the card stays on the deck for a retry.
+    chosen_text = ""
+    chosen_record = ""
+    if target:
+        if vault_path is None:
+            log.warning(
+                "daily_sync.routine_match.correction_refused",
+                item_number=correction.item_number,
+                reason="no_vault_path",
+                target=target,
+                query=query,
+            )
+            return (
+                f"item {correction.item_number}: vault not configured — "
+                f"can't check what you picked against the real routine items",
+                False,
+            )
+        try:
+            # Lazy — routine.cli is heavy and imports match_calibration; keeping
+            # it function-level mirrors _routine_match_corpus_path's imports and
+            # avoids a module-level cycle.
+            from alfred.routine.cli import _iter_active_routine_items
+
+            candidates = _iter_active_routine_items(Path(vault_path))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "daily_sync.routine_match.correction_refused",
+                item_number=correction.item_number,
+                reason="candidates_unavailable",
+                target=target,
+                error=str(exc),
+            )
+            return (
+                f"item {correction.item_number}: couldn't read the routine "
+                f"items to check what you picked",
+                False,
+            )
+
+        by_norm: dict[str, list[Any]] = {}
+        for cand in candidates:
+            by_norm.setdefault(_norm_item_text(cand.item_text), []).append(cand)
+        hits = by_norm.get(_norm_item_text(target)) or []
+        if not hits:
+            # THE corpus-poisoning guard. Anything that isn't a live routine
+            # item — a typo, a stale card, a hand-crafted request — dies here.
+            log.warning(
+                "daily_sync.routine_match.correction_refused",
+                item_number=correction.item_number,
+                reason="target_not_a_routine_item",
+                target=target,
+                query=query,
+                candidates_seen=len(candidates),
+            )
+            return (
+                f"item {correction.item_number}: “{target}” isn't an item on "
+                f"any active routine — pick one from the list",
+                False,
+            )
+        # Prefer a hit on the record the suggestion came from when two routines
+        # carry the same item text. ``record`` on the row is provenance only —
+        # the glossary keys on (query_key, item_text) — but provenance that
+        # points at the wrong record is still a lie in the log.
+        chosen = next((c for c in hits if c.record_name == record), hits[0])
+        chosen_text = chosen.item_text
+        chosen_record = chosen.record_name
+        if _norm_item_text(chosen_text) == _norm_item_text(matched_to):
+            log.warning(
+                "daily_sync.routine_match.correction_refused",
+                item_number=correction.item_number,
+                reason="target_is_the_proposal",
+                target=target,
+                matched_to=matched_to,
+            )
+            return (
+                f"item {correction.item_number}: that's the item we already "
+                f"suggested — confirm it instead of rejecting it",
+                False,
+            )
+
     # Pick the corpus row type by (kind, verb). A no_match confirm is an
     # ALIAS (closes a false-negative); everything else is the Phase-2b
     # confirm/reject pair.
@@ -832,31 +984,66 @@ def _resolve_routine_match_correction(
     else:
         entry_type = CORPUS_CONFIRM
 
-    try:
-        append_corpus(
-            corpus_path,
-            MatchCorpusEntry(
-                type=entry_type,
-                query_key=query_key(query),
-                item_text=matched_to,
-                record=record,
-                confidence_at_capture=confidence,
-                action_at=_now_iso(),
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "daily_sync.routine_match.corpus_write_failed",
-            query=query,
-            matched_to=matched_to,
-            error=str(exc),
-        )
-        return (f"item {correction.item_number}: corpus write failed", False)
+    action_at = _now_iso()
+    rows = [
+        MatchCorpusEntry(
+            type=entry_type,
+            query_key=qkey,
+            item_text=matched_to,
+            record=record,
+            confidence_at_capture=confidence,
+            action_at=action_at,
+        ),
+    ]
+    # #13 — the enriched verdict rides as a SECOND row alongside the reject,
+    # never instead of it. Two rows, one claim each: a reader that doesn't know
+    # the newer type still honours the suppression.
+    if chosen_text:
+        rows.append(MatchCorpusEntry(
+            type=CORPUS_ALIAS,
+            query_key=qkey,
+            item_text=chosen_text,
+            record=chosen_record,
+            confidence_at_capture=confidence,
+            action_at=action_at,
+            note="corrected from a rejected suggestion",
+        ))
+    elif correction.one_off:
+        rows.append(MatchCorpusEntry(
+            type=CORPUS_ONEOFF,
+            query_key=qkey,
+            # Provenance: what we had proposed when the operator said the
+            # phrase means nothing. Not a claim about the item.
+            item_text=matched_to,
+            record=record,
+            confidence_at_capture=confidence,
+            action_at=action_at,
+            note="operator marked the phrase a one-off",
+        ))
 
-    _verdict = (
-        "reject" if correction.reject
-        else ("alias" if kind == KIND_NO_MATCH else "confirm")
-    )
+    for row in rows:
+        try:
+            append_corpus(corpus_path, row)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "daily_sync.routine_match.corpus_write_failed",
+                query=query,
+                matched_to=matched_to,
+                row_type=row.type,
+                error=str(exc),
+            )
+            return (f"item {correction.item_number}: corpus write failed", False)
+
+    if chosen_text:
+        _verdict = "corrected"
+    elif correction.one_off:
+        _verdict = "one_off"
+    elif correction.reject:
+        _verdict = "reject"
+    elif kind == KIND_NO_MATCH:
+        _verdict = "alias"
+    else:
+        _verdict = "confirm"
     log.info(
         "daily_sync.routine_match.verdict_recorded",
         item_number=correction.item_number,
@@ -869,7 +1056,11 @@ def _resolve_routine_match_correction(
         # indistinguishable from the log — a distinction that cost a full
         # diagnosis cycle on 2026-08-03.
         corpus_path=str(corpus_path),
-        query_key=query_key(query),
+        query_key=qkey,
+        # #13 — the taught answer, and how many rows the verdict actually laid
+        # down. "corrected but wrote one row" is a bug shape worth grepping for.
+        corrected_to=chosen_text,
+        rows_written=len(rows),
     )
     return (None, True)
 
@@ -2714,6 +2905,7 @@ def handle_daily_sync_reply(
                     )
                     err, did_write = _resolve_routine_match_correction(
                         synthetic, item, routine_match_corpus_path,
+                        vault_path=vault_path,
                     )
                     if err is not None:
                         _bucket_resolver_error(synthetic.item_number, err)
@@ -2865,6 +3057,7 @@ def handle_daily_sync_reply(
                     continue
                 err, did_write = _resolve_routine_match_correction(
                     correction, routine_match_item, routine_match_corpus_path,
+                    vault_path=vault_path,
                 )
                 if err is not None:
                     _bucket_resolver_error(correction.item_number, err)
