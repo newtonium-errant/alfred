@@ -48,15 +48,36 @@ import { loadDirectiveAliases, matchLeadingDirective } from '../../../lib/algern
 // SHORTCUT_INGEST_SOURCE_LABEL so its captures stamp their TRUE origin instead of
 // inheriting the 'iOS Shortcut' default.
 
-// Public (non-secret) instance display name stamped into provenance — parameterised
-// (NOT a hardcoded literal) so a different deploy stamps its own origin.
-const ORIGIN_INSTANCE = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
-// Provenance label for shortcut captures. Overridable so a non-Salem deploy stamps
-// its own owner; defaults to the Salem operator.
-const INGESTED_BY = process.env.SHORTCUT_INGEST_USER || 'Andrew (shortcut)';
-// Default ingest target when the Shortcut omits one. Overridable; matched
-// case-insensitively against the configured targets (a hand-typed / defaulted name).
-const DEFAULT_TARGET = process.env.SHORTCUT_INGEST_DEFAULT_TARGET || 'salem';
+// --- operator-tunable env, one contract for all of it ------------------------
+// Every value below is read PER-REQUEST and follows the same shape:
+//   process.env.X?.trim() || <default>
+//
+// The trim is not decoration. A bare `||` only catches '' — a whitespace-only
+// value is TRUTHY, so `SHORTCUT_INGEST_USER='   '` would sail through and stamp
+// a blank `ingested_by` AND send a blank `X-Alfred-Ingest-User` (an asserted
+// identity header on a privileged relay). Same failure the source label had
+// before #27; fixing one field and leaving its neighbours is how that bug
+// survives. Unset behaviour is byte-identical to the module-const form these
+// replaced. Per-request rather than module-scope so each is settable in tests
+// without module-registry gymnastics — same reasoning as rateLimitMax().
+
+// Public (non-secret) instance display name stamped into provenance —
+// parameterised (NOT a hardcoded literal) so a different deploy stamps its own.
+function originInstance(): string {
+  return process.env.NEXT_PUBLIC_INSTANCE_NAME?.trim() || 'Algernon';
+}
+
+// Who the capture is attributed to. Rides BOTH the relayed `ingested_by` and the
+// `X-Alfred-Ingest-User` header, so a blank here is a blank asserted identity.
+function ingestedBy(): string {
+  return process.env.SHORTCUT_INGEST_USER?.trim() || 'Andrew (shortcut)';
+}
+
+// Default ingest target when the Shortcut omits one. Matched case-insensitively
+// against the configured targets.
+function defaultTarget(): string {
+  return process.env.SHORTCUT_INGEST_DEFAULT_TARGET?.trim() || 'salem';
+}
 
 // Provenance label stamped into the record's `source:` frontmatter. The route is
 // named for the iOS Shortcuts tendril it was built for, but the wire contract is
@@ -64,13 +85,23 @@ const DEFAULT_TARGET = process.env.SHORTCUT_INGEST_DEFAULT_TARGET || 'salem';
 // door. A hardcoded 'iOS Shortcut' would stamp every one of those with a false
 // origin, on a field the operator is meant to trust. Default preserved, so an
 // unset env is byte-identical to the pre-parameterised behavior.
-//
-// Read per-request (not a module const like its neighbours above) for two
-// reasons: it is settable in tests without module-registry gymnastics, and a
-// blank / whitespace-only value degrades to the default rather than stamping
-// EMPTY provenance — the same garbage-env contract as rateLimitMax() below.
 function sourceLabel(): string {
   return process.env.SHORTCUT_INGEST_SOURCE_LABEL?.trim() || 'iOS Shortcut';
+}
+
+/**
+ * The configured device secret, whitespace-normalised.
+ *
+ * A secret gets NO fallback default — the fail-closed 503 is the whole point of
+ * the not_configured gate. What it does need is trim SYMMETRY with
+ * `extractBearer`, which trims the token it parses off the header: without it,
+ * a `SHORTCUT_INGEST_TOKEN` carrying a stray trailing space or newline (routine
+ * in .env files, copy-paste and mounted secrets) can NEVER match a correctly
+ * sent token, and the door answers a permanent 401 that reads exactly like a
+ * wrong credential. Returns '' when unset or blank so the caller's guard fires.
+ */
+function expectedToken(): string {
+  return process.env.SHORTCUT_INGEST_TOKEN?.trim() || '';
 }
 
 /**
@@ -188,8 +219,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
-  const expected = process.env.SHORTCUT_INGEST_TOKEN;
-  if (!expected || !expected.trim()) {
+  const expected = expectedToken();
+  if (!expected) {
     // Deploy-inert until the operator sets the secret. Fail CLOSED.
     console.warn('[bff:ingest/shortcut] reject reason=not_configured');
     return res.status(503).json({ error: 'not_configured' });
@@ -230,7 +261,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   // the default inbox + logs the intent (for the re-homing loop). An unknown name
   // is not a directive → intact. Fail-safe: a misheard name never loses words.
   const directive = matchLeadingDirective(text, loadDirectiveAliases());
-  let requested = (target || DEFAULT_TARGET).trim();
+  let requested = (target || defaultTarget()).trim();
   let bodyText = text;
   // Resolved ONCE and reused by both provenance shapes below — the plain label and
   // the spoken-form variant must never be able to drift apart (they were two
@@ -275,6 +306,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   const now = new Date();
   const finalTitle = title ?? deriveTitle(bodyText, now);
+  // Resolved ONCE and used for BOTH the relayed field and the asserted-identity
+  // header — they name the same person and must not be able to disagree.
+  const ingester = ingestedBy();
 
   try {
     const { status, body: respBody } = await callTransportTo(match.name, 'POST', '/vault/ingest', {
@@ -283,16 +317,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         title: finalTitle,
         body: bodyText,
         source,
-        ingested_by: INGESTED_BY,
+        ingested_by: ingester,
         ingested_at: now.toISOString(),
         correlation_id: randomUUID(),
         set_fields: {
           ingested_via: 'shortcut',
-          origin_instance: ORIGIN_INSTANCE,
+          origin_instance: originInstance(),
           ...(routedViaDirective ? { routed_via: 'directive' } : {}),
         },
       },
-      headers: { 'X-Alfred-Ingest-User': INGESTED_BY },
+      headers: { 'X-Alfred-Ingest-User': ingester },
     });
     console.log(
       `[bff:ingest/shortcut] accept target=${match.name} record_type=note ` +
