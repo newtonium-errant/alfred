@@ -54,13 +54,20 @@ what this module records.
 ## What the marker does and does not claim
 
 It claims ARRIVAL: "this note was structured from email-shaped inbox content."
-It does not claim the note is correspondence worth triaging. Those differ for
-one real workflow — the operator emails screenshots to himself — so a
-mail-arrived screenshot note still carries the marker and remains sampleable.
-Closing that would require the classifier to judge "operational log vs
-correspondence", which is the shape of judgment that caused this incident; it
-is deliberately NOT attempted here. Stated plainly so it is a known limit
-rather than a surprise in a later screenshot.
+It does not claim the note is correspondence worth triaging.
+
+**Markers record FACTS; judgments live in the calibration loop.** That split is
+the design, not a shortfall of it. The one workflow where the two diverge is the
+operator emailing screenshots to himself: those notes genuinely DID arrive as
+mail, the marker records that correctly, and they stay sampleable. If he marks
+one down in review, the corpus learns his self-sent pattern — which is
+capture-the-correction doing exactly its job, so the residual shrinks with use
+instead of sitting there.
+
+The alternative — having the classifier judge "operational log vs
+correspondence" and suppress the stamp — is deliberately NOT attempted. That
+puts a judgment call back on the LLM, which is the shape that caused this
+incident in the first place.
 """
 
 from __future__ import annotations
@@ -142,8 +149,6 @@ def has_structural_email_headers(body: str) -> bool:
 def stamp_email_provenance(
     vault_path: Path | str,
     note_paths: list[str],
-    *,
-    session_path: str | None = None,
 ) -> list[str]:
     """Mark ``note_paths`` as email-derived. Returns the paths actually written.
 
@@ -157,8 +162,15 @@ def stamp_email_provenance(
     provenance write must not be the thing that breaks curation; a missing
     marker degrades to "this note won't be offered for calibration", which is
     the safe direction.
+
+    NO mutation-logging, deliberately. An earlier draft carried a
+    ``session_path`` parameter for ``log_mutation``; it was dead by
+    construction — the curator's ``cleanup_session_file`` runs well before this
+    point, so no caller could ever have supplied one. A parameter that implies
+    audit-logging which never happens is worse than its absence: it reads, to
+    the next person, as a guarantee. The vault audit log still records the
+    ``vault_edit`` itself.
     """
-    from alfred.vault.mutation_log import log_mutation
     from alfred.vault.ops import VaultError, vault_edit
 
     note_only = [
@@ -178,8 +190,6 @@ def stamp_email_provenance(
                 vault_path, rel_path,
                 set_fields={EMAIL_PROVENANCE_FIELD: True},
             )
-            if session_path:
-                log_mutation(session_path, "edit", rel_path, scope="curator")
             written.append(rel_path)
         except VaultError as exc:
             log.warning(

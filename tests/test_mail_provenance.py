@@ -126,6 +126,56 @@ def test_a_genuine_email_note_is_still_sampleable(tmp_path: Path) -> None:
     assert candidate.priority == "low"
 
 
+def test_email_message_id_is_not_a_provenance_fallback_AT_THE_SAMPLER(
+    tmp_path: Path,
+) -> None:
+    """The gate's half-refutation, closed.
+
+    The predicate-level pin below (``test_everything_else_is_not_email_derived``)
+    proves ``note_is_email_derived`` returns False for an ``email_message_id``
+    dict. That says NOTHING about whether the SAMPLER consults the predicate
+    exclusively — and the reviewer proved it: mutating ``_read_candidate`` to
+
+        if not (note_is_email_derived(fm) or fm.get("email_message_id")):
+
+    left all 598 tests green. That is the exact fallback a maintainer reaches
+    for, and the one the module docstring names as the seductive wrong answer;
+    the pin that was supposed to forbid it was testing a different subject.
+
+    So this drives the SAMPLER. ``email_message_id`` is written by
+    ``email_filing`` on an orthogonal axis and only AFTER its no-category early
+    return — the common case for personal mail — so it is a coverage trap, not
+    a marker. A record carrying it without the real marker must not be
+    sampleable.
+    """
+    vault = _vault(tmp_path)
+    _write_note(
+        vault, SCREENSHOT_NOTE,
+        "type: note\nname: Daily Sync bug\npriority: low\n"
+        "email_message_id: '<CAF=abc123@mail.example.com>'\n",
+        SCREENSHOT_BODY,
+    )
+
+    assert _read_candidate(vault, SCREENSHOT_NOTE) is None
+
+
+def test_email_category_is_not_a_provenance_fallback_either(
+    tmp_path: Path,
+) -> None:
+    """The sibling field from the same orthogonal axis. ``email_category`` is
+    written beside ``email_message_id`` and is equally not provenance — pinned
+    at the sampler so neither half of that pair can become the fallback."""
+    vault = _vault(tmp_path)
+    _write_note(
+        vault, SCREENSHOT_NOTE,
+        "type: note\nname: Daily Sync bug\npriority: low\n"
+        "email_category: 'finance/statements'\n",
+        SCREENSHOT_BODY,
+    )
+
+    assert _read_candidate(vault, SCREENSHOT_NOTE) is None
+
+
 def test_marker_without_a_real_tier_is_still_not_sampleable(
     tmp_path: Path,
 ) -> None:
@@ -405,3 +455,100 @@ def test_corpus_audit_reports_pollution_without_writing(tmp_path: Path) -> None:
 
     assert hits == [SCREENSHOT_NOTE]
     assert corpus.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Gate delta — --limit parity, and strip-means-strip
+# ---------------------------------------------------------------------------
+
+
+def _many_email_notes(vault: Path, n: int) -> None:
+    for i in range(n):
+        _write_note(
+            vault, f"note/Mail {i}.md", f"type: note\nname: Mail {i}\n",
+            f"**From:** s{i}@example.com\n**Subject:** hi\n",
+        )
+
+
+@pytest.mark.parametrize("pass_name", ["grant", "neutralize", "dedupe"])
+def test_limit_bounds_the_dry_run_identically_to_apply(
+    tmp_path: Path, pass_name: str,
+) -> None:
+    """The dry run IS the preview of the apply, so ``--limit`` must bound both
+    or the preview describes a different operation than the one that runs —
+    worse than no preview, because it looks careful.
+
+    Before the fix the limit check sat BELOW ``if not apply: continue``, so a
+    dry run reported every candidate while the apply touched N. This is
+    operationally load-bearing: the box run is staged with limits.
+    """
+    from alfred.scripts import mail_provenance_cleanup as cleanup
+
+    vault = _vault(tmp_path)
+    if pass_name == "grant":
+        _many_email_notes(vault, 10)
+        fn = cleanup.grant_markers
+    elif pass_name == "neutralize":
+        for i in range(10):
+            _write_note(
+                vault, f"note/Stray {i}.md",
+                f"type: note\nname: Stray {i}\npriority: low\n",
+                SCREENSHOT_BODY,
+            )
+        fn = cleanup.neutralize_stray_stamps
+    else:
+        for i in range(10):
+            _write_note(
+                vault, f"note/Dup {i}.md",
+                f"type: note\nname: Dup {i}\nrelated:\n"
+                "  - '[[person/Ben McMillan]]'\n"
+                "  - '[[person/Ben McMillan]]'\n",
+            )
+        fn = cleanup.dedupe_related
+
+    preview = fn(vault, apply=False, limit=3)
+    assert preview.matched == 3, (
+        f"{pass_name}: dry run reported {preview.matched} under --limit 3 — "
+        f"the preview must describe the same operation the apply performs"
+    )
+    assert preview.changed == 0
+    assert len(preview.paths) == 3
+
+    applied = fn(vault, apply=True, limit=3)
+    assert applied.matched == preview.matched
+    assert applied.changed == 3
+
+
+def test_neutralize_removes_the_keys_rather_than_nulling_them(
+    tmp_path: Path,
+) -> None:
+    """A strip should strip. Writing ``priority: null`` leaves litter in every
+    touched record, and a record carrying ``priority: null`` still reads to a
+    human as "the classifier ran here"."""
+    import frontmatter
+    from alfred.scripts.mail_provenance_cleanup import neutralize_stray_stamps
+
+    vault = _vault(tmp_path)
+    _write_note(
+        vault, SCREENSHOT_NOTE,
+        "type: note\nname: Bug\npriority: low\naction_hint: reply\n"
+        "priority_reasoning: operational log\n",
+        SCREENSHOT_BODY,
+    )
+
+    neutralize_stray_stamps(vault, apply=True, limit=0)
+
+    fm = frontmatter.load(str(vault / SCREENSHOT_NOTE)).metadata
+    for key in ("priority", "action_hint", "priority_reasoning"):
+        assert key not in fm, f"{key} was nulled, not removed: {fm.get(key)!r}"
+    # The record itself survives — this strips stamps, not content.
+    assert fm["name"] == "Bug"
+
+
+def test_stamp_takes_no_session_path_parameter() -> None:
+    """The dead parameter is gone, not just unused. It implied audit-logging
+    that never happened — a signature that promises a guarantee it does not
+    provide is worse than its absence."""
+    import inspect
+
+    assert "session_path" not in inspect.signature(stamp_email_provenance).parameters

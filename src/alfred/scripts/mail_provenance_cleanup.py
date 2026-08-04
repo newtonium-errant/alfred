@@ -42,6 +42,7 @@ error puts a non-email judgment into the email corpus, which is the incident.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,18 +101,21 @@ def grant_markers(vault: Path, *, apply: bool, limit: int) -> PassResult:
             continue
         res.matched += 1
         res.paths.append(f"note/{path.name}")
-        if not apply:
-            continue
-        try:
-            from alfred.vault.ops import vault_edit
+        if apply:
+            try:
+                from alfred.vault.ops import vault_edit
 
-            vault_edit(
-                vault, f"note/{path.name}",
-                set_fields={EMAIL_PROVENANCE_FIELD: True},
-            )
-            res.changed += 1
-        except Exception as exc:  # noqa: BLE001
-            res.errors.append((path.name, str(exc)))
+                vault_edit(
+                    vault, f"note/{path.name}",
+                    set_fields={EMAIL_PROVENANCE_FIELD: True},
+                )
+                res.changed += 1
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append((path.name, str(exc)))
+        # The limit bounds the DRY RUN as well as the apply. The dry run IS the
+        # preview of the apply, so a `--limit 3` that reports 10 candidates and
+        # then touches 3 makes the preview describe a different operation than
+        # the one that runs — worse than no preview, because it looks careful.
         if limit and res.matched >= limit:
             break
     return res
@@ -146,18 +150,22 @@ def neutralize_stray_stamps(vault: Path, *, apply: bool, limit: int) -> PassResu
             continue
         res.matched += 1
         res.paths.append(f"note/{path.name}")
-        if not apply:
-            continue
-        try:
-            from alfred.vault.ops import vault_edit
+        if apply:
+            try:
+                from alfred.vault.ops import vault_edit
 
-            vault_edit(
-                vault, f"note/{path.name}",
-                set_fields={f: None for f in _STAMP_FIELDS},
-            )
-            res.changed += 1
-        except Exception as exc:  # noqa: BLE001
-            res.errors.append((path.name, str(exc)))
+                # REMOVE the keys, don't null them. `set_fields={k: None}` writes
+                # three explicit null keys into every touched record — a strip
+                # that leaves litter, and a record carrying `priority: null`
+                # still reads as "the classifier ran here" to a human.
+                # `unset_fields` is vault_edit's own removal API.
+                vault_edit(
+                    vault, f"note/{path.name}",
+                    unset_fields=list(_STAMP_FIELDS),
+                )
+                res.changed += 1
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append((path.name, str(exc)))
         if limit and res.matched >= limit:
             break
     return res
@@ -195,15 +203,16 @@ def dedupe_related(vault: Path, *, apply: bool, limit: int) -> PassResult:
         res.paths.append(
             f"note/{path.name} ({len(related)} → {len(deduped)})"
         )
-        if not apply:
-            continue
-        try:
-            from alfred.vault.ops import vault_edit
+        if apply:
+            try:
+                from alfred.vault.ops import vault_edit
 
-            vault_edit(vault, f"note/{path.name}", set_fields={"related": deduped})
-            res.changed += 1
-        except Exception as exc:  # noqa: BLE001
-            res.errors.append((path.name, str(exc)))
+                vault_edit(
+                    vault, f"note/{path.name}", set_fields={"related": deduped},
+                )
+                res.changed += 1
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append((path.name, str(exc)))
         if limit and res.matched >= limit:
             break
     return res
@@ -221,10 +230,24 @@ def audit_corpus(corpus_path: Path, stray_paths: list[str]) -> list[str]:
         return []
     wanted = {p.split(" (")[0] for p in stray_paths}
     hits: list[str] = []
-    for line in corpus_path.read_text(encoding="utf-8").splitlines():
-        for path in wanted:
-            if path and path in line:
-                hits.append(path)
+    for raw in corpus_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Parse and compare the RECORD-PATH FIELD. A substring scan false-hits
+        # whenever a path appears inside some other field (a reasoning string
+        # quoting the filename, a cluster member list), which would report
+        # corpus pollution that isn't there — and this pass exists to tell the
+        # operator whether to go edit an append-only record.
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("record_path") or "").strip()
+        if path and path in wanted:
+            hits.append(path)
     return sorted(set(hits))
 
 
