@@ -123,8 +123,35 @@ open/close/dismiss state that the other two do not have.
 | Discoverable without being told | yes | **no** | yes |
 | Card visual weight added | **high** (5 controls) | none | low (1 control) |
 | Mobile-web gesture risk | none | **real** | none |
+| **Cost of a mis-tap** | **high** — Skip is adjacent | low | **low** — Skip is a menu away |
 | Room for plain-language durations | poor (`1d`/`3d`/`7d`) | good | good |
 | Path to the v2 date picker | needs redesign | fits | **fits** |
+
+### Mis-tap cost deserves its own paragraph, because it is asymmetric
+
+Not all mis-taps are equal, and the difference is *what a control's neighbours
+are* — the same reasoning the scope matrix applies to capabilities, applied to
+gestures.
+
+A mis-tap **inside** the duration ladder is cheap and self-correcting: you meant
+3d, you got 7d, the row comes back a few days late and you can un-snooze it. Wrong
+by days.
+
+A mis-tap **between Skip and a duration** is a different kind of error. Skip and
+snooze are near-opposites — *not this one* versus *yes, but later* — and Skip
+**parks** the suggestion (`rejectParks: true`). So the slip doesn't give you the
+wrong timing, it gives you the wrong *answer*, with a durable consequence, and the
+row does not come back to tell you.
+
+That is exactly the adjacency Option A creates: on a phone, `Skip` sits one
+thumb-width from `1d`. Option C puts a menu boundary between the destructive verb
+and the harmless ones — you cannot fat-finger from `Skip` into `7d`. Option B has
+no adjacency problem at all (it adds nothing to the card), but trades it for the
+gesture misfiring instead: a long-press the browser reads as text selection, or a
+scroll that lands as a press.
+
+This axis is the strongest single argument for C over A, and it is worth weighing
+against A's one-tap speed rather than assuming speed wins.
 
 ---
 
@@ -165,3 +192,18 @@ Unchanged by the pick:
 Still needed at deploy regardless of the pick: **`tier.snooze.path` wired on the
 box.** Until that lands the backend is inert and the affordance would write
 nowhere — worth sequencing so the UI does not ship ahead of its store.
+
+The config line, per instance (`resolve_snooze_path` reads exactly this nested
+key and nothing else — it is the single parse point for both the writer and the
+reader, so the two cannot drift to different files):
+
+```yaml
+tier:
+  snooze:
+    path: ./data/board_snooze.salem.json    # per INSTANCE — never a shared file
+```
+
+The filename must differ per instance for the same reason the feed store does:
+every instance shares one WorkingDirectory on the box and differs only by
+`--config`, so one shared default would let one instance's snoozes suppress
+another's rows.
