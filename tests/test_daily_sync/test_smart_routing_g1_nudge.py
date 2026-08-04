@@ -16,6 +16,7 @@ from alfred.daily_sync.config import DailySyncConfig
 from alfred.daily_sync.confidence import save_state
 from alfred.daily_sync.reply_dispatch import (
     _detect_mistyped_calibration,
+    _compose_calibration_hint,
     _is_calibration_verb_typo,
     _osa_distance,
     is_latest_batch_replied,
@@ -220,8 +221,47 @@ def test_is_calibration_verb_typo() -> None:
     assert _is_calibration_verb_typo("dogs", email) is False
     assert _is_calibration_verb_typo("coffee", email) is False
     assert _is_calibration_verb_typo("things", email) is False
-    # Sub-3-char tokens never match (everything is "close" at that length).
+    # Sub-4-char tokens never match (everything is "close" at that length).
     assert _is_calibration_verb_typo("us", email) is False
+
+    # smalls#2 R5a — the false positives the loose rule admitted. Each of
+    # these was True before (3-char floor / 2-edit budget) and would hijack a
+    # normal chat reply carrying a valid leading item number.
+    for word in ("sam", "spa", "lot", "cup", "sup"):          # 3-char floor
+        assert _is_calibration_verb_typo(word, email) is False, word
+    for word in ("ditch", "dirty", "median"):                  # 2-edit budget
+        assert _is_calibration_verb_typo(word, email) is False, word
+    assert _is_calibration_verb_typo("reset", confirm) is False
+    assert _is_calibration_verb_typo("nope", {"noted", "show"}) is False
+
+
+def test_one_edit_typos_still_nudge_after_tightening() -> None:
+    """The other half: tightening must not cost a real typo. Every pinned
+    incident shape is ONE edit and must still fire — "dwon" in particular is
+    the reported incident, and it is a 4-char verb, which is why the floor
+    lands at 4 rather than higher."""
+    email = {"same", "ditto", "high", "medium", "low", "spam", "up", "down", "keep"}
+    assert _is_calibration_verb_typo("dwon", email) is True
+    assert _is_calibration_verb_typo("confrim", {"confirm", "reject"}) is True
+    assert _is_calibration_verb_typo("rejcet", {"confirm", "reject"}) is True
+    assert _is_calibration_verb_typo("shwo", {"noted", "show"}) is True
+
+
+def test_email_hint_names_the_tier_verbs() -> None:
+    """smalls#2 R5b — the hint must advertise the verbs the detector fires on.
+
+    The reported incident was a typo of "down" (``3 dwon``) answered by a tip
+    that named only 'Same' / 'Ditto'. Telling the operator to use verbs we did
+    not accept a near-miss OF is the asymmetry: the nudge and the tip were
+    reading different vocabularies.
+    """
+    hint = _compose_calibration_hint(
+        has_attribution=False, has_proposal=False, has_routine_match=False,
+        has_pending=False, has_email=True,
+    )
+    for verb in ("high", "medium", "low", "spam"):
+        assert verb in hint, f"tier verb {verb!r} missing from the email hint"
+    assert "Same as #N" in hint          # the copy-previous forms stay
 
 
 def test_detect_mistyped_calibration_direct(tmp_path: Path) -> None:

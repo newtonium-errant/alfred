@@ -487,21 +487,35 @@ def _osa_distance(a: str, b: str) -> int:
 def _is_calibration_verb_typo(word: str, verbs: set[str]) -> bool:
     """True when ``word`` is a near-miss (likely typo) of an applicable verb.
 
-    Length-aware threshold — 1 edit for short verbs (<=4 chars), 2 for
-    longer. Tight enough that an ordinary short word (``"dogs"``) is NOT a
-    typo of ``"down"`` (distance 2 > threshold 1), loose enough that a
-    swapped-letter verb (``"confrim"``) matches ``"confirm"`` (distance 1).
-    Words under 3 chars are never matched — at that length everything is
-    "close" to something, which would hijack chat.
+    ONE edit, and only for words of 4+ characters. Both bounds were looser
+    (2 edits for verbs >=5 chars; a 3-char floor) and both admitted ordinary
+    English into the nudge path, where a valid leading item number is enough
+    to hijack a normal chat reply into a "Tip:" line:
+
+        3-char floor   : "sam"/"spa" -> spam, "lot"/"cup"/"sup" -> low/up
+        2-edit budget  : "reset" -> reject, "ditch"/"dirty" -> ditto,
+                         "median" -> medium, "nope" -> noted
+
+    Every real typo the feature exists for is ONE edit — a transposition
+    ("confrim" -> confirm, "dwon" -> down, "shwo" -> show) or a single
+    slip. The second edit bought false positives and no true positives.
+
+    RESIDUAL, stated rather than hidden: words that are genuinely one edit
+    from a short verb still match — "slow"/"stow"/"shot" -> show,
+    "town"/"dawn" -> down, "keen" -> keep, "notes" -> noted. They are
+    indistinguishable from a real typo without a dictionary, and tightening
+    further would kill "dwon" -> down, which IS the reported incident this
+    nudge was built for. The cost of a residual false positive is one extra
+    Tip line on a chat reply; the cost of missing a real typo is the silent
+    fall-through G1 exists to close.
     """
     w = word.lower().strip(".,!?:;\"'")
-    if len(w) < 3:
+    if len(w) < 4:
         return False
     for verb in verbs:
         if abs(len(w) - len(verb)) > 2:
             continue
-        threshold = 1 if len(verb) <= 4 else 2
-        if _osa_distance(w, verb) <= threshold:
+        if _osa_distance(w, verb) <= 1:
             return True
     return False
 
@@ -2123,7 +2137,17 @@ def _compose_calibration_hint(
     if has_pending:
         verbs.append("'N noted' / 'N show me'")
     if has_email:
-        verbs.append("'Same' / 'Ditto' / 'Same as #N'")
+        # Name the TIER verbs, not just the copy-previous shorthand. The
+        # accepted set (``_applicable_calibration_verbs``) is
+        # {same, ditto, high, medium, low, spam, up, down, keep} and the
+        # near-miss detector fires on all of them — so the reported incident
+        # was a typo of "down" answered by a tip that only mentioned "Same"
+        # and "Ditto". Telling the operator to use a verb we did not accept a
+        # near-miss of is the asymmetry; this closes it for the email lane.
+        verbs.append(
+            "'N high' / 'N medium' / 'N low' / 'N spam' / "
+            "'Same' / 'Ditto' / 'Same as #N'"
+        )
 
     if not verbs:
         return ""
