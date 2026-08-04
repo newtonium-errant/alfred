@@ -87,6 +87,8 @@ from typing import Any
 
 import structlog
 
+from alfred.tier import slots
+
 # Module logger. NOTE: the pure-compute predicates in this module
 # (``classify_routine_item``, ``compute_auto_*``) deliberately emit NO
 # logs (callers own logging — see their docstrings + the
@@ -505,6 +507,19 @@ class AutoT1Candidate:
     origin: str = "task"
     routine_record: str | None = None
     item_text: str | None = None
+    # --- slot-classifier inputs (#18 slice 1) --------------------------------
+    # Carried so the slot classifier reads OPERATOR INTENT rather than
+    # re-deriving it from surface shape. Each is a field the operator set by
+    # hand; the classifier is a reader, not an opinion.
+    #
+    # ``self_care`` is the one that must not be dropped: this dataclass already
+    # backs the self-care lanes, and a self_care item outranks every structural
+    # rule (self_care → Fuel beats cadence → Rhythm). Defaults keep every
+    # existing construction site valid per the dataclass-default extension
+    # contract.
+    self_care: bool = False
+    explicit_slot: str | None = None
+    has_due_pattern: bool = False
 
 
 def compute_auto_t1_candidates(
@@ -609,11 +624,23 @@ def compute_auto_t1_candidates(
 
         name = str(fm.get("name") or path.stem)
         rel_path = f"task/{path.name}"
+        from alfred.routine.config import _coerce_self_care
+
         candidates.append(AutoT1Candidate(
             path=rel_path,
             name=name,
             due_iso=due.isoformat(),
             surface_reason=reason,
+            # A self_care task with a NEAR deadline surfaces in T1 rather than
+            # the self-care lane, so this branch is the only place that signal
+            # survives for such a task. Under the ratified precedence
+            # (rule 3 > rule 6) it is Fuel that happens to be dated, not a Duty
+            # — which is the whole point of slot being orthogonal to tier.
+            # Shared coercion helper, no fourth reader of the raw field.
+            self_care=_coerce_self_care(fm.get("self_care", False)),
+            explicit_slot=(
+                str(fm["slot"]).strip() if fm.get("slot") is not None else None
+            ),
         ))
 
     candidates.sort(key=lambda c: (c.due_iso, c.name.lower()))
@@ -842,6 +869,12 @@ def _compute_auto_routine(
                 origin="routine",
                 routine_record=record_name,
                 item_text=item.text,
+                # Slot inputs — read the item's own fields, never the lane it
+                # landed in. This is the branch where ``has_due_pattern`` is
+                # genuinely True, which is what makes rule 4 (Duty) fire.
+                self_care=item.self_care,
+                explicit_slot=item.slot,
+                has_due_pattern=item.due_pattern is not None,
             ))
 
     candidates.sort(key=lambda c: (c.due_iso, c.name.lower()))
@@ -977,6 +1010,19 @@ class AutoT3Candidate:
     target_cadence_days: int
     days_since_last_completed: int | None
     overdue_ratio: float
+    # --- slot-classifier inputs (#18 slice 1) --------------------------------
+    # THE non-obvious plumbing cost the design flagged, located precisely.
+    # ``compute_auto_t3_candidates`` already READS ``item.self_care`` (it passes
+    # it to ``classify_routine_item``) and then discards it — so a self-care
+    # item that ALSO carries ``target_cadence_days`` arrives at the classifier
+    # indistinguishable from a plain cadence practice, and would classify Rhythm
+    # when the ratified precedence says Fuel.
+    #
+    # That is the one gap in this arc that produces a WRONG answer rather than
+    # an honest ``unslotted``, and it lands on exactly the category the feature
+    # exists to protect (restorative activity). Hence the field.
+    self_care: bool = False
+    explicit_slot: str | None = None
 
 
 def compute_auto_t3_candidates(
@@ -1127,6 +1173,12 @@ def compute_auto_t3_candidates(
                 path=rel_path,
                 routine_record=record_name,
                 item_text=item.text,
+                # THE gap the design flagged: self_care was read a few lines
+                # above (passed to classify_routine_item) and then dropped.
+                # Without it a cadence-bearing self-care item classifies Rhythm
+                # instead of Fuel.
+                self_care=item.self_care,
+                explicit_slot=item.slot,
                 target_cadence_days=target,
                 days_since_last_completed=days_since_value,
                 overdue_ratio=ratio,
@@ -1229,6 +1281,12 @@ def compute_self_care_candidates(
                 origin="routine",
                 routine_record=record_name,
                 item_text=item.text,
+                # This lane is self_care-BY-FILTER, but read the field rather
+                # than hardcoding True — a pin that asserts Fuel here should be
+                # measuring the item, not this branch's name.
+                self_care=item.self_care,
+                explicit_slot=item.slot,
+                has_due_pattern=item.due_pattern is not None,
             ))
 
     candidates.sort(key=lambda c: c.name.lower())
@@ -1296,6 +1354,11 @@ def compute_self_care_task_candidates(
             due_iso="",
             surface_reason="self-care",
             origin="task",
+            # Reached only past the ``_coerce_self_care`` filter above.
+            self_care=True,
+            explicit_slot=(
+                str(fm["slot"]).strip() if fm.get("slot") is not None else None
+            ),
         ))
 
     candidates.sort(key=lambda c: c.name.lower())
@@ -1378,6 +1441,33 @@ class TierEntry:
     # every non-cadence entry.
     target_cadence_days: int | None = None
     days_since_last_completed: int | None = None
+    # --- slot axis (#18 slice 1) ---------------------------------------------
+    # Slot is ORTHOGONAL to tier: tier answers "when does this press", slot
+    # answers "what does this do for the day". Both survive; neither replaces
+    # the other, and the T1/T2/T3 machinery is untouched.
+    #
+    # INPUTS to the classifier (operator intent, read not inferred):
+    #   ``explicit_slot``    — the operator's own ``slot:`` frontmatter (rule 1)
+    #   ``self_care``        — already means "intrinsic" here (rule 3)
+    #   ``has_due_pattern``  — a recurring hard deadline (rule 4)
+    #   ``target_cadence_days`` (above) — a soft cadence (rule 5)
+    #
+    # OUTPUT, stamped by the projection:
+    #   ``slot``      — ``duty`` / ``rhythm`` / ``fuel`` / ``unslotted``
+    #   ``slot_rule`` — WHICH rule fired, so "Duty because the operator said so"
+    #                   and "Duty because it's a dated task" stay distinguishable
+    #                   in the coverage telemetry.
+    #
+    # ``slot`` is a producer-time OVERLAY — recomputed every projection, never
+    # written to a record (the ``candidate``/``done``-derived vs
+    # ``confirmed``-persisted law). It is deliberately SEPARATE from
+    # ``explicit_slot`` so a re-projection can never read the classifier's own
+    # previous answer back in as operator intent.
+    explicit_slot: str | None = None
+    self_care: bool = False
+    has_due_pattern: bool = False
+    slot: str = "unslotted"
+    slot_rule: str = "no_signal"
     overdue_ratio: float | None = None
     # Arc #20 (2026-07-22) — free-text T3 ad-hoc done-state. Carried
     # ONLY for curated free-text T3 entries (``_curated_t3_to_tier_entry``);
@@ -1456,6 +1546,14 @@ class TodayView:
     t3: list[TierEntry] = field(default_factory=list)
     routine_today: list[RoutineLine] = field(default_factory=list)
     daily_goal: DailyGoalState = field(default_factory=DailyGoalState)
+    # #18 slice 1 — how much of today the slot classifier could answer for.
+    # The rollout's convergence metric and the number that gates the stage-2
+    # rings swap. Carried on the view (rather than only logged) so the brief
+    # and the board read the SAME figure the projection computed, never a
+    # re-derived one.
+    slot_coverage: slots.SlotCoverage = field(
+        default_factory=slots.SlotCoverage
+    )
 
 
 def _task_is_done_today(fm: dict, today: date) -> bool:
@@ -1629,6 +1727,8 @@ def compute_today_view(
             tier=1, origin="task", name=c.name, path=c.path,
             due_iso=c.due_iso, surface_reason=c.surface_reason,
             source=source, confirmed=False,
+            self_care=c.self_care, explicit_slot=c.explicit_slot,
+            has_due_pattern=c.has_due_pattern,
         ))
         t1_keys.add(key)
 
@@ -1642,6 +1742,8 @@ def compute_today_view(
             due_iso=c.due_iso, surface_reason=c.surface_reason,
             source="auto-due-routine", confirmed=False,
             routine_record=c.routine_record, item_text=c.item_text,
+            self_care=c.self_care, explicit_slot=c.explicit_slot,
+            has_due_pattern=c.has_due_pattern,
         ))
         t1_keys.add(key)
 
@@ -1658,6 +1760,8 @@ def compute_today_view(
             source="auto-surface-routine",
             escalation_state=_escalation_state_from_reason(c.surface_reason),
             routine_record=c.routine_record, item_text=c.item_text,
+            self_care=c.self_care, explicit_slot=c.explicit_slot,
+            has_due_pattern=c.has_due_pattern,
         ))
         t2_keys.add(key)
 
@@ -1678,6 +1782,7 @@ def compute_today_view(
             target_cadence_days=c.target_cadence_days,
             days_since_last_completed=c.days_since_last_completed,
             overdue_ratio=c.overdue_ratio,
+            self_care=c.self_care, explicit_slot=c.explicit_slot,
         ))
         t3_keys.add(key)
 
@@ -1695,6 +1800,8 @@ def compute_today_view(
             surface_reason="self-care",
             source="self-care",
             routine_record=c.routine_record, item_text=c.item_text,
+            self_care=c.self_care, explicit_slot=c.explicit_slot,
+            has_due_pattern=c.has_due_pattern,
         ))
         t3_keys.add(key)
 
@@ -1711,6 +1818,7 @@ def compute_today_view(
             tier=3, origin="task", name=c.name, path=c.path,
             surface_reason="self-care",
             source="self-care",
+            self_care=c.self_care, explicit_slot=c.explicit_slot,
         ))
         t3_keys.add(key)
 
@@ -1747,6 +1855,30 @@ def compute_today_view(
                         lane=_lane_name, key=_key, reason=_reason,
                     )
 
+    # --- slot classification (#18 slice 1 — classify + observe) ---
+    # ONE pass over the assembled lanes rather than a stamp at each of the six
+    # construction sites: slot is a property of the item, not of the lane it
+    # landed in, and six copies of the call is six chances for one to drift.
+    #
+    # Placed AFTER the snooze filter so the coverage number describes the board
+    # the operator will actually see — a parked row is not part of today.
+    # Placed BEFORE the daily goal because stage 3 flips that goal to read these
+    # slots; keeping the order right now means that flip is a change of
+    # definition, not a change of sequencing.
+    #
+    # STAGE 1 CONTRACT: this stamps and reports. It does NOT feed
+    # ``_compute_daily_goal`` (still tier-based) and the rings still group by
+    # tier. Nothing operator-visible changes except the coverage line.
+    _slot_verdicts: list[slots.SlotVerdict] = []
+    for _lane in (t1, t2, t3):
+        for _entry in _lane:
+            _verdict = slots.classify_slot(_entry, learned=slots.NoOverrides())
+            _entry.slot = _verdict.slot
+            _entry.slot_rule = _verdict.rule
+            _slot_verdicts.append(_verdict)
+    slot_coverage = slots.summarize_coverage(_slot_verdicts)
+    slots.log_coverage(slot_coverage, where="compute_today_view")
+
     # --- routine_today: the complement (fired today, no handoff) ---
     routine_today = _collect_routine_today(vault_path, today, tier_defaults)
 
@@ -1775,6 +1907,7 @@ def compute_today_view(
         t1=t1, t2=t2, t3=t3,
         routine_today=routine_today,
         daily_goal=daily_goal,
+        slot_coverage=slot_coverage,
     )
 
 

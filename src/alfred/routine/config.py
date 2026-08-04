@@ -237,6 +237,14 @@ class Item:
     # set). Default ``False`` per the dataclass-default extension
     # backward-compat contract.
     self_care: bool = False
+    # Slot classifier rule 1 (#18) — the operator's own word on which of
+    # Duty / Rhythm / Fuel this item is, and the highest-precedence signal
+    # there is. A PERSISTED operator decision (nothing can re-derive it),
+    # unlike the classifier's own output, which is a producer-time overlay
+    # and is never written back to a record. Left as the raw string here;
+    # ``tier.slots.normalize_slot`` validates it, so an unrecognised value
+    # falls through to the structural rules instead of inventing a category.
+    slot: str | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> Item | None:
@@ -317,6 +325,15 @@ class Item:
             escalate_at_days=escalate_at_days,
             target_cadence_days=target_cadence_days,
             self_care=self_care,
+            # Raw pass-through — validated by ``tier.slots.normalize_slot`` at
+            # classification time, so a typo degrades to the structural rules
+            # rather than being rejected here (this parser drops unknown fields
+            # silently; it must not start refusing records over a slot label).
+            slot=(
+                str(data["slot"]).strip()
+                if isinstance(data, dict) and data.get("slot") is not None
+                else None
+            ),
         )
 
 
