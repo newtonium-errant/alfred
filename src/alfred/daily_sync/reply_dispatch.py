@@ -2407,7 +2407,7 @@ def _build_confirmation_body(
     written_count: int,
     corrections_count: int,
     unparsed_item_numbers: list[int],
-    raw_errors: list[str],
+    unparsed_fragments: list[str],
     execution_errors: list[str] | None = None,
     hint: str = "",
 ) -> str:
@@ -2422,10 +2422,13 @@ def _build_confirmation_body(
         raw-token dump.
       * Pure-ack (``✅``) keeps its short one-liner form.
 
-    Fallback (written_count == 0 AND no unparsed numbers but raw errors
-    exist) prints the raw error because the parser produced fragments
-    that don't map to item numbers — the operator still needs to see
-    them.
+    ``unparsed_fragments`` is parser-orphaned text — input that never
+    reached an item number. It renders WHENEVER it is non-empty (#38):
+    it used to be a last-resort fallback shown only when nothing else
+    had happened, which meant one successful sibling silently swallowed
+    the operator's words. Callers must pass ONLY the orphans (the
+    parser's own ``unparsed``), never the accumulated error list, which
+    also holds a string per bucketed item and would double-report.
 
     2026-05-10 — split parse-shape failures (``unparsed_item_numbers``)
     from execution failures (``execution_errors``). Execution errors
@@ -2511,12 +2514,34 @@ def _build_confirmation_body(
             lines.append(f"Didn't understand {which} — could you restate?{hint}")
         else:
             lines.append(f"Calibration: didn't understand {which} — could you restate?{hint}")
-    elif raw_errors and not applied_lines and not execution_errors:
-        # Edge case: parser-level failures that never got a bucketed
-        # item number (e.g. the pre-c1 regression of orphan fragments).
-        # Render them as-is so the operator can see the raw input. This
-        # path should be very rare post-c1.
-        lines.append(f"Calibration: couldn't parse: {', '.join(raw_errors[:3])}.")
+
+    if unparsed_fragments:
+        # Text the PARSER could not attach to any item number.
+        #
+        # Rendered UNCONDITIONALLY (#38). This was previously gated on
+        # ``not applied_lines and not execution_errors`` — so a SUCCESSFUL
+        # SIBLING silently ate it: "5 confirm / 6 correct ..." wrote item 5's
+        # corpus row, discarded fragment 6, and replied as if everything
+        # landed. The fragment survived only in the programmatic ``unparsed``
+        # field, which Telegram never renders. Neither a sibling applying nor a
+        # sibling failing to execute says anything about whether THIS text
+        # parsed, so neither may suppress it.
+        #
+        # An independent ``if`` rather than an ``elif`` on
+        # ``unparsed_item_numbers`` is safe because the two are disjoint by
+        # construction: anything the resolver bucketed to an item number is
+        # reported there, and only parser-orphaned text reaches this list. That
+        # disjointness is why the caller passes ``parsed.unparsed`` and NOT the
+        # accumulated error list — the latter is a superset that also holds a
+        # string for every bucketed item, so un-gating it would echo each of
+        # those twice.
+        prefix = "Couldn't parse" if lines else "Calibration: couldn't parse"
+        lines.append(f"{prefix}: {', '.join(unparsed_fragments[:3])}.")
+        remaining = len(unparsed_fragments) - 3
+        if remaining > 0:
+            # The cap used to truncate in silence — the same silent-drop shape
+            # one level down.
+            lines.append(f"  ... and {remaining} more.")
 
     if not lines:
         return "Calibration: nothing to apply."
@@ -3142,7 +3167,12 @@ def handle_daily_sync_reply(
         written_count=written_count,
         corrections_count=corrections_count,
         unparsed_item_numbers=unparsed_item_numbers,
-        raw_errors=errors,
+        # PARSER-ORPHANED text only — deliberately NOT the accumulated ``errors``
+        # list. ``errors`` starts as a copy of this and then also collects a
+        # string for every item bucketed into ``unparsed_item_numbers`` /
+        # ``execution_errors``, so passing it would report those items twice
+        # (#38). ``parsed.unparsed`` is untouched by that accumulation.
+        unparsed_fragments=list(parsed.unparsed),
         execution_errors=execution_errors,
         hint=hint,
     )
@@ -3160,6 +3190,10 @@ def handle_daily_sync_reply(
         corrections_count=corrections_count,
         written_count=written_count,
         unparsed=len(errors),
+        # #38 — the parser-orphaned subset, counted separately. ``unparsed`` is
+        # a mixed bucket (kept as-is for existing consumers); this is the slice
+        # that now always reaches the operator's reply.
+        unparsed_fragments=len(parsed.unparsed),
         execution_failures=len(execution_errors),
     )
 
