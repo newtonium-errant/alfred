@@ -26,7 +26,7 @@ by a newer/older tool version never crashes the reader.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
@@ -157,6 +157,21 @@ KIND_NO_MATCH = "no_match"  # nothing matched; matched_to is the closest candida
 CORPUS_CONFIRM = "match_confirm"  # operator confirmed a low-conf match was right
 CORPUS_REJECT = "match_reject"    # operator rejected a match (known-bad pair)
 CORPUS_ALIAS = "match_alias"      # operator confirmed a no-match alias (Phase 3)
+# #13 reject-with-correction — the honest THIRD verdict. "No, and it doesn't mean
+# any routine item; that completion was a one-off." Distinct from a plain reject
+# (which only says "not THAT item" and leaves the phrase open to other
+# suggestions) and from an alias (which says "it means THIS item instead").
+#
+# Written ALONGSIDE a CORPUS_REJECT of the proposed pair, never instead of it —
+# two rows, each making one claim. That split is deliberate: a reader that
+# doesn't know this type still honours the reject (the if/elif chain in
+# :func:`load_glossary` skips unknown types), so an older build rolling over a
+# newer corpus degrades to "pair rejected" rather than crashing or ignoring the
+# operator entirely.
+#
+# ``item_text`` on a one-off row carries the PROPOSED candidate — provenance, not
+# a claim ("we suggested X; the operator said the phrase means nothing").
+CORPUS_ONEOFF = "match_oneoff"    # operator: this phrase means no routine item (#13)
 
 
 def query_key(text: str) -> str:
@@ -228,11 +243,29 @@ class Glossary:
     :func:`load_glossary`. An alias is a claim about the phrase ("clean hammer
     means Fully Clean House"); rejecting that exact pair withdraws the claim.
     A reject of a DIFFERENT item leaves the alias standing.
+
+    ``one_offs`` (#13) is keyed on the query_key ALONE, not a pair: the operator
+    said the phrase corresponds to no routine item at all. That is why it is a
+    separate set rather than another kind of rejected pair — a pair-reject only
+    suppresses re-asking about THAT candidate, while a one-off suppresses the
+    phrase against every candidate the matcher might propose next time.
     """
 
     confirmed: set[tuple[str, str]]   # (query_key, item_text) → fast-path True
     rejected: set[tuple[str, str]]    # (query_key, item_text) → short-circuit False
     aliases: dict[str, str]           # query_key → aliased item_text (Phase 3)
+    # #13: query_keys the operator declared meaningless ("nothing — a one-off").
+    # Defaulted so every existing positional/keyword construction still builds.
+    one_offs: set[str] = field(default_factory=set)
+
+    def is_one_off(self, qkey: str) -> bool:
+        """True when the operator declared this phrase a one-off (#13).
+
+        Phrase-level, not pair-level — see the class docstring. Consumed today by
+        :func:`filter_pending_for_review` (stop re-asking); the matcher-side
+        consumer is deliberately NOT built here (capture half only).
+        """
+        return qkey in self.one_offs
 
     def verdict(self, qkey: str, item_text: str) -> str | None:
         """Return ``"confirm"`` / ``"reject"`` for a known pair, else ``None``.
@@ -253,7 +286,9 @@ class Glossary:
         return self.aliases.get(qkey)
 
     def is_empty(self) -> bool:
-        return not (self.confirmed or self.rejected or self.aliases)
+        return not (
+            self.confirmed or self.rejected or self.aliases or self.one_offs
+        )
 
 
 def load_glossary(path: str | Path) -> Glossary:
@@ -261,13 +296,31 @@ def load_glossary(path: str | Path) -> Glossary:
 
     Last-write-wins per pair: replaying the append-only log in order, a confirm
     clears any prior reject for the same pair and vice-versa. Malformed rows are
-    skipped with a warning (graceful degradation)."""
+    skipped with a warning (graceful degradation).
+
+    ONE-OFF interactions (#13), all last-write-wins on the query_key:
+      * a one-off RETRACTS any standing alias for that key (and the confirmed
+        pair the alias implied) — the phrase means nothing, so a prior "it means
+        X" claim is withdrawn;
+      * an alias or a confirm CLEARS the one-off — the operator has now named
+        something the phrase does mean;
+      * a REJECT deliberately does NOT clear it. The #13 one-off verdict writes a
+        reject of the proposed pair AND a one-off row, so a reject that cleared
+        one_offs would make the pair's own suppression row cancel the phrase-level
+        one the same operator action just recorded — order-dependent and wrong in
+        at least one ordering. A reject says "not that item", never "the phrase
+        means something after all."
+    """
     confirmed: set[tuple[str, str]] = set()
     rejected: set[tuple[str, str]] = set()
     aliases: dict[str, str] = {}
+    one_offs: set[str] = set()
     p = Path(path)
     if not p.exists():
-        return Glossary(confirmed=confirmed, rejected=rejected, aliases=aliases)
+        return Glossary(
+            confirmed=confirmed, rejected=rejected, aliases=aliases,
+            one_offs=one_offs,
+        )
     for raw_line in p.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line:
@@ -287,6 +340,8 @@ def load_glossary(path: str | Path) -> Glossary:
         if entry.type == CORPUS_CONFIRM:
             rejected.discard(pair)
             confirmed.add(pair)
+            # The phrase demonstrably means something — retract a one-off.
+            one_offs.discard(entry.query_key)
         elif entry.type == CORPUS_REJECT:
             confirmed.discard(pair)
             rejected.add(pair)
@@ -307,7 +362,21 @@ def load_glossary(path: str | Path) -> Glossary:
             aliases[entry.query_key] = entry.item_text
             rejected.discard(pair)
             confirmed.add(pair)
-    return Glossary(confirmed=confirmed, rejected=rejected, aliases=aliases)
+            # The operator has now named what the phrase means — it is no
+            # longer a one-off.
+            one_offs.discard(entry.query_key)
+        elif entry.type == CORPUS_ONEOFF:
+            # #13 — phrase-level: it corresponds to NO routine item. Retract any
+            # standing alias for the key (and the confirmed pair that alias
+            # implied); the reject of the proposed pair rides on its own row.
+            one_offs.add(entry.query_key)
+            prior_alias = aliases.pop(entry.query_key, None)
+            if prior_alias is not None:
+                confirmed.discard((entry.query_key, prior_alias))
+    return Glossary(
+        confirmed=confirmed, rejected=rejected, aliases=aliases,
+        one_offs=one_offs,
+    )
 
 
 @dataclass
@@ -325,9 +394,14 @@ class PendingReviewStats:
     aged_out: int = 0   # older than max_age_days
     capped: int = 0     # trimmed by max_items
     surfaced: int = 0   # what the operator actually sees
+    # #13: dropped because the operator declared the PHRASE a one-off. Counted
+    # separately from ``resolved`` on purpose — "you told me this phrase means
+    # nothing" and "you already ruled on this pair" are different answers, and
+    # collapsing them would hide which verdict is doing the suppressing.
+    one_off: int = 0
 
     def suppressed(self) -> int:
-        return self.resolved + self.aged_out + self.capped
+        return self.resolved + self.aged_out + self.capped + self.one_off
 
 
 def _captured_date(entry: PendingMatch) -> date | None:
@@ -369,8 +443,13 @@ def filter_pending_for_review(
     recurring as a match) while the REVIEW CARD came back every morning
     forever, and the feed's revival-after-acted resurrected it each time. The
     operator read "reject = suppress" and was right about the matcher and
-    wrong about the card. Three drops, in order:
+    wrong about the card. Four drops, in order:
 
+    0. **One-off** (#13) — the operator declared the PHRASE meaningless
+       ("nothing — this was a one-off"), so no candidate for it is worth asking
+       about, not just the one that was proposed at the time. Checked first so
+       the count lands on ``one_off`` rather than being absorbed by the pair
+       verdict the same operator action also wrote.
     1. **Resolved** — the corpus already holds a verdict for this row. Either
        a direct ``(query_key, matched_to)`` confirm/reject, OR an alias on the
        query_key alone: once the operator has said "that phrase means X",
@@ -411,6 +490,15 @@ def filter_pending_for_review(
 
     for entry in pending:
         qkey = query_key(entry.query)
+        # #13 one-off FIRST. It is checked ahead of the pair verdict because the
+        # one-off action also writes a reject of the proposed pair — leaving the
+        # pair check first would attribute the drop to ``resolved`` and the
+        # ``one_off`` counter would read 0 even while doing the work. It is also
+        # STRICTLY broader than the pair reject: a phrase declared meaningless
+        # must stop being re-asked against candidates it was never paired with.
+        if glossary.is_one_off(qkey):
+            stats.one_off += 1
+            continue
         if glossary.verdict(qkey, entry.matched_to) is not None:
             stats.resolved += 1
             continue
@@ -445,6 +533,7 @@ __all__ = [
     "CORPUS_CONFIRM",
     "CORPUS_REJECT",
     "CORPUS_ALIAS",
+    "CORPUS_ONEOFF",
     "Glossary",
     "MatchCorpusEntry",
     "PendingMatch",

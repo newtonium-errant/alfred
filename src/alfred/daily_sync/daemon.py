@@ -289,7 +289,10 @@ async def fire_once(
     # Registered unconditionally — the provider returns None when
     # ``routine_match.enabled`` is False (Salem opts in via config), so other
     # instances stay unaffected. The pending path is read from config inside
-    # the provider (no set_* holder needed).
+    # the provider; the vault path is injected for the #13 correction
+    # pick-list (which routine items the operator can pick from when a
+    # suggestion is wrong) — without it the card offers reject / one-off only.
+    routine_match_section.set_vault_path(vault_path)
     routine_match_section.register()
 
     # #20 P5 B1 — ad-hoc-T3 recurrence→promote proposals (PROPOSE-ONLY). Needs the vault path (scans

@@ -261,3 +261,61 @@ describe('POST /api/feed/act — provenance log', () => {
     expect(line).not.toMatch(/Bearer|token/i);
   });
 });
+
+describe('POST /api/feed/act — correction_target relay (#13)', () => {
+  const correctBody = {
+    id: 'routine_match:clean hammer|Weekly',
+    action_id: 'correct',
+    correction_target: 'Tidy the workshop',
+  };
+
+  it('relays correction_target through to the transport', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq(correctBody), res);
+    const [, path, opts] = mockCallTransportFeed.mock.calls[0];
+    expect(path).toBe('/feed/act');
+    expect(opts.body).toEqual(correctBody);
+  });
+
+  it('trims the target — a padded pick must match the vault item server-side', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq({ ...correctBody, correction_target: '  Tidy the workshop  ' }), res);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body.correction_target).toBe('Tidy the workshop');
+  });
+
+  it('omits the key entirely when absent — every other action relays the old shape', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq(validBody), res);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body).toEqual({ id: validBody.id, action_id: 'confirm' });
+    expect('correction_target' in opts.body).toBe(false);
+  });
+
+  it('rejects a non-string target at the body gate (400, nothing relayed)', async () => {
+    asOwner();
+    const { res, status } = mockRes();
+    await handler(postReq({ ...correctBody, correction_target: { evil: 1 } }), res);
+    expect(status).toHaveBeenCalledWith(400);
+    expect(mockCallTransportFeed).not.toHaveBeenCalled();
+  });
+
+  it('rejects an over-long target rather than forwarding it', async () => {
+    asOwner();
+    const { res, status } = mockRes();
+    await handler(postReq({ ...correctBody, correction_target: 'x'.repeat(501) }), res);
+    expect(status).toHaveBeenCalledWith(400);
+    expect(mockCallTransportFeed).not.toHaveBeenCalled();
+  });
+
+  it('still strips unknown fields alongside a valid target', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq({ ...correctBody, evil: 'x', evidence: { secret: 1 } }), res);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body).toEqual(correctBody);
+  });
+});

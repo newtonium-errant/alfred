@@ -14,7 +14,8 @@ FIVE routed families carry resolver-backed actions:
     email_tier   high/medium/low/spam → tier · up/down → modifier · confirm → ok
     attribution  confirm → ok · reject → reject
     proposal     confirm → ok · reject → reject
-    routine_match confirm → ok · reject → reject
+    routine_match confirm → ok · reject → reject · correct → reject + the
+                 operator's chosen item (#13) · one_off → reject + "means nothing"
     pending      noted → ok+noted · show → ok+show
 
 Plus a universal ``ack`` for FYI items (``mode == "fyi"``) which sets the feed
@@ -59,6 +60,13 @@ log = structlog.get_logger(__name__)
 _SYNTHETIC_ITEM_NUMBER = 1
 
 ACK_ACTION = "ack"
+
+# routine_match #13 — the two enriched-reject actions. ``correct`` is the ONLY
+# action that consumes the act's ``correction_target``; naming it here keeps the
+# injection site and the ceiling entry from drifting apart.
+ROUTINE_MATCH_KIND = "routine_match"
+CORRECT_ACTION = "correct"
+ONE_OFF_ACTION = "one_off"
 
 # ActResult.status vocabulary.
 STATUS_ACTED = "acted"
@@ -124,9 +132,18 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "confirm": {"ok": True},
         "reject": {"reject": True},
     },
+    # routine_match — #13 reject-with-correction. ``correct`` and ``one_off`` are
+    # both REJECTS that carry more than "not that one": ``correct`` needs the
+    # operator's chosen item, supplied out-of-band as the act's
+    # ``correction_target`` and injected below (the kwargs here can't hold it —
+    # the target is per-request, the ceiling is static); ``one_off`` needs
+    # nothing and declares the phrase meaningless. The target is injected for
+    # THIS pair only, so no other (kind, action) can smuggle one in.
     "routine_match": {
         "confirm": {"ok": True},
         "reject": {"reject": True},
+        "correct": {"reject": True},
+        "one_off": {"reject": True, "one_off": True},
     },
     "pending": {
         "noted": {"ok": True, "consumed_token": "noted"},
@@ -350,16 +367,20 @@ def _dispatch(
         verb = "confirmed" if correction.ok else "rejected"
         return None, f"proposal {verb}" if did_write else f"proposal already {verb} (no change)"
 
-    if kind == "routine_match":
+    if kind == ROUTINE_MATCH_KIND:
         corpus_path = _rd._routine_match_corpus_path(config)
         if corpus_path is None:
             return "routine-match corpus not configured on this instance", ""
+        # vault_path is what the resolver validates a #13 correction target
+        # against. Passing it unconditionally (not only when a target is
+        # present) keeps this call site honest about what the resolver needs —
+        # a target that arrives with vault_path=None gets the resolver's own
+        # refusal, not a silently unvalidated write.
         err, did_write = _rd._resolve_routine_match_correction(
-            correction, item, corpus_path,
+            correction, item, corpus_path, vault_path=vault_path,
         )
         if err is not None:
             return err, ""
-        verb = "confirmed" if correction.ok else "rejected"
         # Report the WRITE, not the intent — same shape as attribution and
         # proposal above. The resolver has no idempotent no-op path today (it
         # returns did_write=True on every successful append), so this reads
@@ -367,8 +388,14 @@ def _dispatch(
         # branch can't silently show the operator a cheerful "rejected" over a
         # write that never landed. That failure mode is invisible from the
         # deck, which is exactly how a broken suppression loop survives weeks.
+        # #13's richer verdicts sit UNDER the same gate for that reason.
+        verb = "confirmed" if correction.ok else "rejected"
         if not did_write:
             return None, f"routine match already {verb} (no change)"
+        if correction.correction_target:
+            return None, f"noted — it means “{correction.correction_target}”"
+        if correction.one_off:
+            return None, "noted — a one-off, not a routine item"
         return None, f"routine match {verb}"
 
     if kind == "pending":
@@ -1015,6 +1042,7 @@ def act(
     instance_name: str,
     instance_scope: str,
     raw_config: dict[str, Any] | None = None,
+    correction_target: str | None = None,
 ) -> ActResult:
     """Apply one deck/feed action through the owning resolver.
 
@@ -1031,6 +1059,13 @@ def act(
       7. Synthesize the ReplyCorrection + dispatch to the resolver; resolver
          error → ``error`` carrying the resolver's own message.
       8. Success → set ``acted`` → ``acted`` ok.
+
+    ``correction_target`` (#13) is the routine item the operator says a rejected
+    completion ACTUALLY meant. It is consumed by exactly one (kind, action) pair
+    — ``(routine_match, correct)`` — and ignored everywhere else, so it cannot
+    add capability to any other family. It is never trusted as text: the
+    resolver validates it against the vault's live routine items and refuses
+    anything else.
 
     The whole load→check→dispatch→set_state span runs under the per-item mutex
     (:func:`_per_item_lock`) so two concurrent acts on the same open item can't
@@ -1050,7 +1085,7 @@ def act(
             feed_item_id, action_id,
             feed_store=feed_store, config=config, vault_path=vault_path,
             instance_name=instance_name, instance_scope=instance_scope,
-            raw_config=raw_config,
+            raw_config=raw_config, correction_target=correction_target,
         )
 
 
@@ -1064,6 +1099,7 @@ def _act_locked(
     instance_name: str,
     instance_scope: str,
     raw_config: dict[str, Any] | None,
+    correction_target: str | None = None,
 ) -> ActResult:
     """The critical section — runs holding this item's mutex. See :func:`act`."""
     item = feed_store.load().get(feed_item_id)
@@ -1228,8 +1264,29 @@ def _act_locked(
             feed_item_id, action_id,
         )
 
+    # #13 — the ONLY place a per-request payload joins the static ceiling kwargs.
+    # Scoped to (routine_match, correct) so no other action can carry a target:
+    # a `correction_target` posted alongside `confirm`, or alongside any other
+    # kind, is dropped here and never reaches a resolver. A `correct` with no
+    # target is refused rather than degraded into a plain reject — silently
+    # downgrading would tell the operator their answer was taken when the deck
+    # learned nothing.
+    action_kwargs = dict(kind_actions[action_id])
+    if kind == ROUTINE_MATCH_KIND and action_id == CORRECT_ACTION:
+        chosen = (correction_target or "").strip()
+        if not chosen:
+            log.info(
+                "feed.act.invalid_action", id=feed_item_id, kind=kind,
+                action=action_id, reason="correct_without_target",
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                "a correction needs the item you meant",
+                feed_item_id, action_id,
+            )
+        action_kwargs["correction_target"] = chosen
     correction = ReplyCorrection(
-        item_number=_SYNTHETIC_ITEM_NUMBER, **kind_actions[action_id],
+        item_number=_SYNTHETIC_ITEM_NUMBER, **action_kwargs,
     )
     _dispatch_barrier(feed_item_id)  # no-op in prod; concurrency-pin seam
     err, detail = _dispatch(

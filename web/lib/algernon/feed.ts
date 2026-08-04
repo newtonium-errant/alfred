@@ -79,7 +79,15 @@ export const feedApi = {
     return getJson<FeedListResponse>(`/api/feed/list${suffix ? `?${suffix}` : ''}`);
   },
 
-  act(id: string, actionId: string): Promise<FeedActResult> {
-    return postJson<FeedActResult>('/api/feed/act', { id, action_id: actionId });
+  /**
+   * Act on one card. `correctionTarget` (#13) is the routine item a rejected
+   * completion actually meant — sent only with the routine_match `correct`
+   * action, and validated server-side against the vault's live routine items
+   * (this layer never decides what is pickable).
+   */
+  act(id: string, actionId: string, correctionTarget?: string): Promise<FeedActResult> {
+    const body: Record<string, string> = { id, action_id: actionId };
+    if (correctionTarget) body.correction_target = correctionTarget;
+    return postJson<FeedActResult>('/api/feed/act', body);
   },
 };

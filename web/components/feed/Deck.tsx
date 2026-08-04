@@ -3,9 +3,14 @@ import type { FeedItem } from '../../lib/algernon/feed';
 import {
   DRAG_Y_CLAMP,
   EMAIL_PRIORITY_TIERS,
+  ONE_OFF_ACTION,
+  ROUTINE_MATCH_KIND,
   deckVerbsFor,
   emailPriority,
   kindLabel,
+  routineCandidatesFor,
+  routineProposedItem,
+  sameRoutineItem,
   stampOpacity,
   swipeActsFor,
   verdictForDrag,
@@ -35,18 +40,23 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
   const [parkedOpen, setParkedOpen] = useState(false);
   // The re-tier picker (task #28) — a deliberate multi-choice correction on the email card.
   const [reTierOpen, setReTierOpen] = useState(false);
+  // The correction picker (task #13) — "what did this mean?" on a routine match.
+  const [correctOpen, setCorrectOpen] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
 
-  // Collapse the evidence expand + close the re-tier picker whenever the top card changes.
+  // Collapse the evidence expand + close both pickers whenever the top card changes.
   useEffect(() => {
     setExpanded(false);
     setReTierOpen(false);
+    setCorrectOpen(false);
   }, [current?.id]);
 
   const confirming = current != null && confirmingId === current.id;
-  // Any open overlay (parked drill OR re-tier picker) blocks deck swipe + keyboard input,
-  // so a gesture can't act on the card hidden underneath (the parked-panel guard lesson).
-  const inputBlocked = parkedOpen || reTierOpen;
+  // Any open overlay (parked drill, re-tier picker, correction picker) blocks deck swipe +
+  // keyboard input, so a gesture can't act on the card hidden underneath (the parked-panel
+  // guard lesson). Every new overlay MUST join this list — an overlay that doesn't gate
+  // input reads as a card acting on its own.
+  const inputBlocked = parkedOpen || reTierOpen || correctOpen;
 
   // Imperative pointer drag on the top card — no React re-render per move. The
   // DISCRETE outcome (verdictForDrag → deck handler) is what the unit tests pin.
@@ -146,9 +156,27 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
     [deck],
   );
 
+  // Record a correction on the current routine-match card, then close the picker once
+  // the act resolves. `target === null` is the one-off door. On refusal the card stays
+  // (deck.correctRoutine keeps it) and the toast carries the server's reason.
+  const onPickCorrection = useCallback(
+    async (target: string | null) => {
+      await deck.correctRoutine(target);
+      setCorrectOpen(false);
+    },
+    [deck],
+  );
+
   const verbs = current ? deckVerbsFor(current.kind) : null;
   // The current email card's assigned tier (#28) — the picker offers the OTHERS.
   const assignedTier = current ? emailPriority(current) : null;
+  // The #13 pick-list: every active routine item MINUS the one this card proposed
+  // (picking the rejected item is contradictory, and the server refuses it — hiding
+  // it here keeps the UI from offering a door that can only fail).
+  const proposedItem = current ? routineProposedItem(current) : '';
+  const correctionCandidates = current
+    ? routineCandidatesFor(current).filter((c) => !sameRoutineItem(c.text, proposedItem))
+    : [];
   const stack: Array<{ item: FeedItem; depth: number }> = [];
   if (current) stack.push({ item: current, depth: 0 });
   upcoming.forEach((item, i) => stack.push({ item, depth: i + 1 }));
@@ -192,6 +220,7 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
             onConfirmHeavy={deck.confirmHeavy}
             onCancelHeavy={deck.cancelHeavy}
             onReTierOpen={depth === 0 ? () => setReTierOpen(true) : undefined}
+            onCorrectOpen={depth === 0 ? () => setCorrectOpen(true) : undefined}
           />
         ))}
 
@@ -324,6 +353,92 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
               // Intentionally-left-blank: an explicit working signal — nothing greens until acted.
               <p data-testid="deck-retier-pending" className="mt-3 text-xs text-honeydew-600">
                 Adjusting to {deck.reTiering.toUpperCase()}…
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* The correction picker (task #13): a NO that teaches. Pick the routine item
+            the completion actually meant, or say it was a one-off — either way the
+            proposed match is rejected. Choices are the vault's REAL items (the server
+            re-validates the pick), never free text. Nothing greens until the act
+            returns `acted`; a refusal keeps the card and toasts the server's reason. */}
+        {correctOpen && current && current.kind === ROUTINE_MATCH_KIND && (
+          <div
+            data-testid="deck-correct-picker"
+            role="dialog"
+            aria-label="What did this completion mean?"
+            style={{ zIndex: OVERLAY_Z_INDEX }}
+            className="absolute inset-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+          >
+            <div className="mb-2 flex shrink-0 items-center justify-between">
+              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
+                What did this mean?
+              </p>
+              <button
+                type="button"
+                data-testid="deck-correct-cancel"
+                disabled={deck.correcting !== null}
+                onClick={() => setCorrectOpen(false)}
+                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2 disabled:opacity-40"
+              >
+                Cancel
+              </button>
+            </div>
+            <p className="mb-2 shrink-0 text-xs text-honeydew-600">
+              {proposedItem ? `Not “${proposedItem}”. It was:` : 'It was:'}
+            </p>
+
+            <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+              {correctionCandidates.length === 0 ? (
+                // ILB: an empty pick-list is a real state (the vault path isn't wired
+                // on this instance), not a broken picker. Say which it is — the one-off
+                // door below still works.
+                <p data-testid="deck-correct-empty" className="text-xs text-honeydew-600">
+                  No routine items available to pick from right now — you can still mark
+                  it a one-off.
+                </p>
+              ) : (
+                correctionCandidates.map((c) => (
+                  <button
+                    key={`${c.record}|${c.text}`}
+                    type="button"
+                    data-testid="deck-correct-choice"
+                    data-item={c.text}
+                    disabled={deck.correcting !== null}
+                    onClick={() => void onPickCorrection(c.text)}
+                    className="shrink-0 rounded-xl border border-honeydew-400 px-3 py-2 text-left text-sm font-semibold text-honeydew-700 disabled:opacity-40"
+                  >
+                    {c.text}
+                    {c.record && (
+                      <span className="ml-1.5 text-[10px] font-normal uppercase tracking-wider text-honeydew-500">
+                        {c.record}
+                      </span>
+                    )}
+                  </button>
+                ))
+              )}
+            </div>
+
+            {/* The honest third verdict — kept visually apart from the items because it
+                is a different KIND of answer, not another item. */}
+            <button
+              type="button"
+              data-testid="deck-correct-one-off"
+              disabled={deck.correcting !== null}
+              onClick={() => void onPickCorrection(null)}
+              className="mt-2 shrink-0 rounded-xl border border-dashed border-honeydew-400 px-3 py-2 text-left text-sm text-honeydew-600 disabled:opacity-40"
+            >
+              Nothing — this was a one-off
+            </button>
+
+            {deck.correcting && (
+              // Intentionally-left-blank: an explicit working signal — nothing greens
+              // until the server confirms the verdict landed.
+              <p data-testid="deck-correct-pending" className="mt-2 shrink-0 text-xs text-honeydew-600">
+                {deck.correcting === ONE_OFF_ACTION
+                  ? 'Recording a one-off…'
+                  : `Recording “${deck.correcting}”…`}
               </p>
             )}
           </div>

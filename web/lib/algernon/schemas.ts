@@ -252,9 +252,21 @@ export type ShortcutIngestBody = z.infer<typeof shortcutIngestBodySchema>;
 // capability ceiling — the BFF only relays. `z.object` STRIPS unknown keys (no
 // `.strict()`), so a client can't smuggle extra fields into the transport body
 // (the transport contract defines only {id, action_id}).
+// `correction_target` (#13) is the routine item a rejected completion actually
+// meant, sent only with the routine_match `correct` action. Bounded like any
+// other client string; its CONTENT is never trusted here — the transport hands
+// it to the resolver, which refuses anything that isn't a live routine item.
+// One validation site, not two that can drift.
+export const FEED_CORRECTION_TARGET_MAX_CHARS = 500;
 export const feedActBodySchema = z.object({
   id: z.string().trim().min(1).max(512),
   action_id: z.string().trim().min(1).max(64),
+  correction_target: z
+    .string()
+    .trim()
+    .min(1)
+    .max(FEED_CORRECTION_TARGET_MAX_CHARS)
+    .optional(),
 });
 
 export type FeedActBody = z.infer<typeof feedActBodySchema>;

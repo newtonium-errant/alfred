@@ -11,7 +11,9 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pytest
 import structlog
+import yaml
 
 from alfred.daily_sync import routine_match_section as rms
 from alfred.daily_sync.config import DailySyncConfig, RoutineMatchConfig
@@ -454,3 +456,131 @@ def test_missing_corpus_file_surfaces_everything(tmp_path: Path) -> None:
     )
     assert out is not None
     assert "walk doggo" in out
+
+
+# ---------------------------------------------------------------------------
+# #13 — the correction pick-list stamped onto each item
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_vault_holder():
+    """The vault path is module-level state (the section-provider idiom). Reset
+    it around every test so one test's injection can't leak into the next and
+    make an unstamped card look stamped."""
+    rms._VAULT_PATH_HOLDER["path"] = None
+    yield
+    rms._VAULT_PATH_HOLDER["path"] = None
+
+
+def _write_routine(vault: Path, name: str, items: list[dict]) -> None:
+    routine_dir = vault / "routine"
+    routine_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "type": "routine", "name": name, "status": "active",
+        "cadence": {"type": "daily"}, "items": items,
+    }
+    fm = yaml.dump(payload, default_flow_style=False, sort_keys=False)
+    (routine_dir / f"{name}.md").write_text(
+        f"---\n{fm}---\n\n# {name}\n", encoding="utf-8",
+    )
+
+
+def _one_pending(p: Path, *, record: str = "Weekly") -> None:
+    _seed_pending(p, mc.PendingMatch(
+        query="clean hammer", matched_to="Clean house", record=record,
+        confidence=0.40, captured_at="2026-08-03T12:00:00+00:00",
+    ))
+
+
+def test_candidates_are_stamped_proposed_record_first(tmp_path: Path) -> None:
+    """The picker's list: every active routine item, the suggestion's OWN
+    record first. A wrong match is usually a sibling on the same routine, so
+    that ordering puts the likely answer under the thumb."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", [{"text": "Walk the dog"}])
+    _write_routine(vault, "Weekly", [
+        {"text": "Clean house"}, {"text": "Tidy the workshop"},
+    ])
+    rms.set_vault_path(vault)
+    p = tmp_path / "pending.jsonl"
+    _one_pending(p)
+
+    rms.routine_match_section(_cfg(p), date(2026, 8, 3))
+    batch = rms.consume_last_batch()
+
+    assert len(batch) == 1
+    cands = batch[0].candidates
+    assert [c["record"] for c in cands[:2]] == ["Weekly", "Weekly"]
+    assert {c["text"] for c in cands} == {
+        "Clean house", "Tidy the workshop", "Walk the dog",
+    }
+    # It survives to_dict() — that dict IS the feed evidence the card renders.
+    assert batch[0].to_dict()["candidates"] == cands
+
+
+def test_archived_routines_are_not_offered(tmp_path: Path) -> None:
+    """Only ACTIVE items are pickable — offering an archived one would let the
+    operator alias a phrase onto something the matcher will never scan."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Weekly", [{"text": "Clean house"}])
+    routine_dir = vault / "routine"
+    payload = {
+        "type": "routine", "name": "Retired", "status": "archived",
+        "cadence": {"type": "daily"}, "items": [{"text": "Old chore"}],
+    }
+    (routine_dir / "Retired.md").write_text(
+        "---\n" + yaml.dump(payload, sort_keys=False) + "---\n", encoding="utf-8",
+    )
+    rms.set_vault_path(vault)
+    p = tmp_path / "pending.jsonl"
+    _one_pending(p)
+
+    rms.routine_match_section(_cfg(p), date(2026, 8, 3))
+    batch = rms.consume_last_batch()
+
+    assert [c["text"] for c in batch[0].candidates] == ["Clean house"]
+
+
+def test_no_vault_path_still_renders_with_an_empty_picklist(tmp_path: Path) -> None:
+    """Degrade, don't fail: without the vault the review list is unaffected and
+    the card simply offers reject / one-off. An unstamped list is honest; a
+    broken section would not be."""
+    p = tmp_path / "pending.jsonl"
+    _one_pending(p)
+
+    out = rms.routine_match_section(_cfg(p), date(2026, 8, 3))
+    batch = rms.consume_last_batch()
+
+    assert out is not None and "clean hammer" in out
+    assert batch[0].candidates == []
+
+
+def test_one_off_suppression_is_reported_separately(tmp_path: Path) -> None:
+    """ILB: a list that shrank because the operator called the phrase a one-off
+    must say so under its own name, not be absorbed into ``resolved`` — the two
+    are different answers about why a card stopped coming back."""
+    p = tmp_path / "pending.jsonl"
+    _one_pending(p)
+    corpus = tmp_path / "corpus.jsonl"
+    qkey = mc.query_key("clean hammer")
+    mc.append_corpus(corpus, mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT, query_key=qkey, item_text="Clean house",
+    ))
+    mc.append_corpus(corpus, mc.MatchCorpusEntry(
+        type=mc.CORPUS_ONEOFF, query_key=qkey, item_text="Clean house",
+    ))
+
+    with structlog.testing.capture_logs() as cap:
+        out = rms.routine_match_section(
+            _cfg(p, corpus_path=corpus), date(2026, 8, 3),
+        )
+
+    assert "No low-confidence routine matches to review" in out
+    events = [
+        c for c in cap if c.get("event") == "routine_match.pending_suppressed"
+    ]
+    assert len(events) == 1
+    assert events[0]["one_off"] == 1
+    assert events[0]["resolved"] == 0
+    assert events[0]["surfaced"] == 0

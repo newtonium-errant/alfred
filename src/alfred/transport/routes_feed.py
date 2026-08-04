@@ -136,11 +136,17 @@ async def _handle_feed_items(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
-    """POST /feed/act ``{id, action_id}`` — act on one card via the router.
+    """POST /feed/act ``{id, action_id[, correction_target]}`` — act on one card.
 
     The router's ``(kind, action_id)`` map is the capability ceiling. The
     synchronous ``act`` runs in a thread executor so a slow pending peer-dispatch
     can't freeze the transport event loop.
+
+    ``correction_target`` (#13, optional) names the routine item a rejected
+    completion actually meant. It is accepted here as an opaque string and
+    validated downstream against the vault's live routine items — this layer
+    only enforces the TYPE, never the content, so there is one validation site
+    rather than two that can drift.
     """
     if not _pin_ok(request):
         return _json_error(401, "feed_wrong_peer")
@@ -163,6 +169,10 @@ async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
         return _json_error(400, "missing_id")
     if not isinstance(action_id, str) or not action_id.strip():
         return _json_error(400, "missing_action_id")
+    raw_target = body.get("correction_target")
+    if raw_target is not None and not isinstance(raw_target, str):
+        return _json_error(400, "invalid_correction_target")
+    correction_target = raw_target.strip() if isinstance(raw_target, str) else None
 
     vault_path = _get_vault_path(request)
     instance_name = request.app.get(_KEY_FEED_INSTANCE, "") or ""
@@ -183,6 +193,7 @@ async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
             instance_name=instance_name,
             instance_scope=instance_scope,
             raw_config=raw_config,
+            correction_target=correction_target,
         )
 
     result = await asyncio.get_running_loop().run_in_executor(None, _do_act)
@@ -194,6 +205,10 @@ async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
         action=action_id,
         status=result.status,
         ok=result.ok,
+        # Presence, not content — the resolver logs the resolved target. This
+        # line only needs to answer "did the client send one at all", which is
+        # what separates a dropped payload from a rejected one.
+        has_correction_target=bool(correction_target),
     )
     status_code = _HTTP_STATUS_BY_STATUS.get(result.status, 200 if result.ok else 400)
     return web.json_response(result.to_dict(), status=status_code)

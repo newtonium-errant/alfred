@@ -20,8 +20,9 @@ intentionally-left-blank sentinel line when enabled-but-empty.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date as date_type
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -40,6 +41,74 @@ log = structlog.get_logger(__name__)
 # Priority slot — after the attribution calibration section (25), grouping the
 # routine-match calibration with the other review/calibration surfaces.
 _PRIORITY = 27
+
+# #13 — runaway guard on the correction pick-list stamped onto each item, NOT a
+# routine trim. Salem's whole active inventory is well under this, so tripping it
+# means a routine record exploded; the truncation is logged rather than silent
+# because a picker missing the operator's item looks like a bug in the picker.
+MAX_CORRECTION_CANDIDATES = 200
+
+# Vault-path holder, mirroring attribution_section / triage_section. The daemon
+# injects it once at startup; when it is unset the section still renders (the
+# review list needs no vault) but stamps an EMPTY candidate list — the card then
+# offers the one-off door only, which is honest, rather than an empty picker
+# that looks broken.
+_VAULT_PATH_HOLDER: dict[str, Path | None] = {"path": None}
+
+
+def set_vault_path(vault_path: Path) -> None:
+    """Inject the vault path (daemon startup) so the section can stamp the #13
+    correction pick-list onto each item."""
+    _VAULT_PATH_HOLDER["path"] = vault_path
+
+
+def get_vault_path() -> Path | None:
+    return _VAULT_PATH_HOLDER.get("path")
+
+
+def _correction_candidates(record: str) -> list[dict[str, str]]:
+    """The pick-list offered when the operator rejects a suggestion (#13).
+
+    Every ACTIVE routine item in the vault, the proposed item's OWN record
+    first — a mis-match is far more often a sibling on the same routine than
+    something across the vault, so that ordering puts the likely answer where
+    the thumb already is. Returns ``[]`` (never raises) when the vault path was
+    never injected or the walk fails: the card degrades to reject / one-off
+    rather than the whole act failing over a display list.
+
+    This list drives DISPLAY only. The resolver re-reads the vault and validates
+    the operator's pick at write time, so a stale or truncated list can cost a
+    retry but can never put something into the corpus that isn't a real item.
+    """
+    vault_path = get_vault_path()
+    if vault_path is None:
+        return []
+    try:
+        from alfred.routine.cli import _iter_active_routine_items
+
+        candidates = _iter_active_routine_items(vault_path)
+    except Exception as exc:  # noqa: BLE001 — display list, never fatal
+        log.warning(
+            "routine_match.candidates_unavailable",
+            vault_path=str(vault_path),
+            error=str(exc),
+        )
+        return []
+    same = [c for c in candidates if c.record_name == record]
+    other = [c for c in candidates if c.record_name != record]
+    rows = [
+        {"text": c.item_text, "record": c.record_name}
+        for c in (*same, *other)
+    ]
+    if len(rows) > MAX_CORRECTION_CANDIDATES:
+        log.warning(
+            "routine_match.candidates_truncated",
+            total=len(rows),
+            kept=MAX_CORRECTION_CANDIDATES,
+            record=record,
+        )
+        rows = rows[:MAX_CORRECTION_CANDIDATES]
+    return rows
 
 
 @dataclass
@@ -70,6 +139,12 @@ class RoutineMatchItem:
     # "no_match" (confirm = alias the phrasing, reject = suppress the
     # suggestion). Default keeps Phase-2b rows (no kind) loading unchanged.
     kind: str = "low_conf"
+    # #13: the correction pick-list — ``{"text", "record"}`` rows for every
+    # active routine item, the proposed item's own record first. Rendered by the
+    # deck's "what did this mean?" picker. DISPLAY DATA ONLY: the resolver
+    # re-reads the vault and validates the operator's pick before writing, so a
+    # stale list can cost a retry but never poisons the corpus.
+    candidates: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +156,7 @@ class RoutineMatchItem:
             "completion_date": self.completion_date,
             "captured_at": self.captured_at,
             "kind": self.kind,
+            "candidates": list(self.candidates),
         }
 
     @classmethod
@@ -179,6 +255,10 @@ def routine_match_section(
             resolved=stats.resolved,
             aged_out=stats.aged_out,
             capped=stats.capped,
+            # #13 — reported separately from ``resolved`` so "you told me that
+            # phrase means nothing" stays legible as its own reason for a
+            # shrinking list.
+            one_off=stats.one_off,
             corpus_path=rm.corpus_path,
         )
     # Number the items GLOBALLY from the assembler's start_index so the reply
@@ -193,6 +273,7 @@ def routine_match_section(
             completion_date=p.completion_date,
             captured_at=p.captured_at,
             kind=p.kind,
+            candidates=_correction_candidates(p.record),
         )
         for i, p in enumerate(surfaced)
     ]
@@ -245,9 +326,12 @@ def register() -> None:
 
 
 __all__ = [
+    "MAX_CORRECTION_CANDIDATES",
     "RoutineMatchItem",
     "consume_last_batch",
+    "get_vault_path",
     "peek_last_batch_count",
     "register",
     "routine_match_section",
+    "set_vault_path",
 ]

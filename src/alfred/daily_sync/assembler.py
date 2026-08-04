@@ -410,6 +410,17 @@ class ReplyCorrection:
     number) when the fragment was a ``duplicate`` chain. Future few-
     shot rotation can detect "Andrew calls X a duplicate" patterns
     via this field.
+
+    ``correction_target`` and ``one_off`` (#13 reject-with-correction)
+    enrich a ``reject`` on a routine-match item — a NO that also teaches
+    the right answer. ``correction_target`` names the routine item the
+    operator says the completion ACTUALLY meant; ``one_off`` is the
+    honest third verdict ("nothing — this was a one-off"). They are
+    mutually exclusive, and both are meaningless without ``reject`` —
+    :func:`reply_dispatch._resolve_routine_match_correction` refuses
+    every other combination rather than guessing. Every other item
+    family ignores them (they default empty/False, and only the
+    routine-match resolver reads them).
     """
 
     item_number: int
@@ -422,6 +433,8 @@ class ReplyCorrection:
     consumed_token: str = ""
     duplicate_of_item: int | None = None
     via: str = ""
+    correction_target: str = ""
+    one_off: bool = False
 
 
 @dataclass
