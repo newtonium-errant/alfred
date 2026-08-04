@@ -54,6 +54,23 @@ STATE_EXPIRED = "expired"
 # default; see the module docstring note on peer_digest.
 SNAPSHOT_FINGERPRINT_FIELDS: dict[str, tuple[str, ...]] = {
     "event": ("date_iso", "name", "rec_type", "time_display"),
+    # ``peer_digest`` — same shape as ``event``, different trigger. Its stable
+    # key is ``<peer>|<today_iso>`` (feed_producer.py:277), so it is stable
+    # WITHIN a day: a brief retry or a manual re-fire re-emits the same id and
+    # the reconcile upsert revives a digest the operator already acked.
+    #
+    # Fields chosen so a CHANGED digest still revives. ``body`` is the digest's
+    # whole content and ``truncated`` distinguishes a 4000-cap clip from the
+    # same prose in full — an UPDATED re-fire (peer sent more since the first
+    # run) resurfaces, which is what the operator wants; only a byte-identical
+    # re-fire stays suppressed. Deliberately NOT keyed on ``peer``/``date``
+    # alone, which are already in the stable key and would suppress every
+    # re-fire including a changed one.
+    #
+    # Exposure was low (the brief fires once daily), which is why this rode as
+    # a smalls item rather than the #16 event fix — but the mechanism is
+    # identical and the operator-facing failure is the same groundhog ack.
+    "peer_digest": ("body", "truncated"),
 }
 
 

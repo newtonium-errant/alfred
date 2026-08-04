@@ -472,3 +472,61 @@ def test_expired_snapshot_item_still_revives(tmp_path: Path) -> None:
 
     assert counts["suppressed"] == 0
     assert s.load()[f"event:{key}"].state == "open"
+
+
+# --- peer_digest snapshot policy (smalls#2 R12) ------------------------------
+
+
+def _digest(peer: str = "kalle", *, body: str = "3 tickets closed.",
+            truncated: bool = False, date: str = "2026-08-04") -> FeedItem:
+    """A peer_digest as ``brief/feed_producer.py:276-284`` emits it."""
+    return FeedItem.create(
+        kind="peer_digest", stable_key=f"{peer}|{date}", instance="salem",
+        title=f"Peer digest: {peer}",
+        evidence={"peer": peer, "date": date, "body": body, "truncated": truncated},
+    )
+
+
+def test_acked_peer_digest_survives_a_same_day_refire(tmp_path: Path) -> None:
+    """The bug: peer_digest's stable key is ``<peer>|<today_iso>``, so it is
+    stable WITHIN a day — a brief retry or a manual re-fire re-emitted the same
+    id and the reconcile upsert revived a digest the operator had already
+    acked. Same groundhog-ack mechanism as the event fix, lower exposure
+    (the brief fires once daily) but identical operator experience."""
+    s = _store(tmp_path)
+    s.reconcile("peer_digest", [_digest()])
+    s.set_state("peer_digest:kalle|2026-08-04", STATE_ACKED)
+
+    counts = s.reconcile("peer_digest", [_digest()])  # identical re-fire
+
+    assert s.load()["peer_digest:kalle|2026-08-04"].state == STATE_ACKED
+    assert counts["suppressed"] == 1
+
+
+def test_acked_peer_digest_revives_when_the_body_changes(tmp_path: Path) -> None:
+    """The half that makes the fingerprint fields load-bearing: a re-fire
+    carrying MORE from the peer is new news and must resurface. Keying on
+    ``peer``/``date`` (both already in the stable key) would suppress this
+    too — which is why the fields are body+truncated."""
+    s = _store(tmp_path)
+    s.reconcile("peer_digest", [_digest(body="3 tickets closed.")])
+    s.set_state("peer_digest:kalle|2026-08-04", STATE_ACKED)
+
+    counts = s.reconcile("peer_digest", [_digest(body="5 tickets closed, 1 escalated.")])
+
+    assert s.load()["peer_digest:kalle|2026-08-04"].state == STATE_OPEN
+    assert counts["suppressed"] == 0
+
+
+def test_acked_peer_digest_revives_when_truncation_changes(tmp_path: Path) -> None:
+    """``truncated`` earns its place in the tuple: the same leading 4000 chars
+    clipped vs complete is a DIFFERENT digest to the reader. Mutation: drop
+    "truncated" from the tuple → this fails while the body test still passes."""
+    s = _store(tmp_path)
+    s.reconcile("peer_digest", [_digest(body="x" * 100, truncated=True)])
+    s.set_state("peer_digest:kalle|2026-08-04", STATE_ACKED)
+
+    counts = s.reconcile("peer_digest", [_digest(body="x" * 100, truncated=False)])
+
+    assert s.load()["peer_digest:kalle|2026-08-04"].state == STATE_OPEN
+    assert counts["suppressed"] == 0
