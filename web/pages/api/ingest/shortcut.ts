@@ -43,6 +43,10 @@ import { loadDirectiveAliases, matchLeadingDirective } from '../../../lib/algern
 // OPERATOR SETUP: set SHORTCUT_INGEST_TOKEN (a long random secret) in the web
 // server env; the Shortcut sends `Authorization: Bearer <token>` and a JSON body
 // `{ text, title?, record_type?, target? }`. The Shortcut recipe is operator-owned.
+// NON-iOS TENDRILS: nothing here is iOS-specific — any client that can send a
+// bearer POST (Android Tasker, a desktop hotkey) uses this same door. Set
+// SHORTCUT_INGEST_SOURCE_LABEL so its captures stamp their TRUE origin instead of
+// inheriting the 'iOS Shortcut' default.
 
 // Public (non-secret) instance display name stamped into provenance — parameterised
 // (NOT a hardcoded literal) so a different deploy stamps its own origin.
@@ -53,6 +57,29 @@ const INGESTED_BY = process.env.SHORTCUT_INGEST_USER || 'Andrew (shortcut)';
 // Default ingest target when the Shortcut omits one. Overridable; matched
 // case-insensitively against the configured targets (a hand-typed / defaulted name).
 const DEFAULT_TARGET = process.env.SHORTCUT_INGEST_DEFAULT_TARGET || 'salem';
+
+// Provenance label stamped into the record's `source:` frontmatter. The route is
+// named for the iOS Shortcuts tendril it was built for, but the wire contract is
+// just "bearer POST" — an Android Tasker recipe or a desktop hotkey hits the SAME
+// door. A hardcoded 'iOS Shortcut' would stamp every one of those with a false
+// origin, on a field the operator is meant to trust. Default preserved, so an
+// unset env is byte-identical to the pre-parameterised behavior.
+//
+// Read per-request (not a module const like its neighbours above) for two
+// reasons: it is settable in tests without module-registry gymnastics, and a
+// blank / whitespace-only value degrades to the default rather than stamping
+// EMPTY provenance — the same garbage-env contract as rateLimitMax() below.
+function sourceLabel(): string {
+  return process.env.SHORTCUT_INGEST_SOURCE_LABEL?.trim() || 'iOS Shortcut';
+}
+
+/**
+ * Test-only: the effective provenance label. Pins the garbage-env fallback at the
+ * unit level; the relayed-body pins in the route tests are the load-bearing ones.
+ */
+export function __shortcutSourceLabelForTest(): string {
+  return sourceLabel();
+}
 
 // --- Rate limiter (fixed window, in-memory) ---------------------------------
 // An abuse ceiling for a single-operator capture path — NOT a product feature.
@@ -205,7 +232,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const directive = matchLeadingDirective(text, loadDirectiveAliases());
   let requested = (target || DEFAULT_TARGET).trim();
   let bodyText = text;
-  let source = 'iOS Shortcut';
+  // Resolved ONCE and reused by both provenance shapes below — the plain label and
+  // the spoken-form variant must never be able to drift apart (they were two
+  // independent hardcoded copies of the same literal before parameterisation).
+  const label = sourceLabel();
+  let source = label;
   let routedViaDirective = false;
   if (directive) {
     const directiveTarget = listIngestTargets().find(
@@ -216,7 +247,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       bodyText = directive.rest;
       // spokenForm is already whitespace-collapsed + length-bounded by the parser
       // (SPOKEN_FORM_MAX_CHARS) — provenance only; `rest` rides verbatim.
-      source = `iOS Shortcut (spoken: "${directive.spokenForm}")`;
+      source = `${label} (spoken: "${directive.spokenForm}")`;
       routedViaDirective = true;
       if (directive.spokenFormTruncated) {
         // A bounded provenance string is a LOSSY transform — say so rather than

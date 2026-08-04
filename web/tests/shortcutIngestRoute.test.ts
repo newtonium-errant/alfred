@@ -24,6 +24,7 @@ import handler, {
   __resetShortcutRateLimitForTest,
   __shortcutRateLimitBucketCountForTest,
   __shortcutRateLimitMaxForTest,
+  __shortcutSourceLabelForTest,
 } from '../pages/api/ingest/shortcut';
 
 const TOKEN = 'DUMMY_SHORTCUT_TOKEN_1234';
@@ -53,6 +54,7 @@ beforeEach(() => {
   __resetShortcutRateLimitForTest();
   process.env.SHORTCUT_INGEST_TOKEN = TOKEN;
   delete process.env.SHORTCUT_INGEST_RATE_MAX;
+  delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
 });
 
 afterEach(() => {
@@ -60,6 +62,7 @@ afterEach(() => {
   vi.useRealTimers();
   delete process.env.SHORTCUT_INGEST_TOKEN;
   delete process.env.SHORTCUT_INGEST_RATE_MAX;
+  delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
 });
 
 // --- method + config gates ---------------------------------------------------
@@ -252,6 +255,52 @@ describe('POST /api/ingest/shortcut — relay', () => {
     await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'hi' } }), res);
     expect(status).toHaveBeenCalledWith(502);
     expect(json).toHaveBeenCalledWith({ error: 'transport_unreachable' });
+  });
+});
+
+// --- provenance label (SHORTCUT_INGEST_SOURCE_LABEL) --------------------------
+// This door is bearer-POST, not iOS-specific: an Android Tasker recipe hits the
+// SAME route. Pre-parameterisation it stamped every capture 'iOS Shortcut', so
+// an Android capture carried a FALSE origin on the one field the operator is
+// meant to trust. These assert the relayed body — the wire, not a helper.
+
+describe('POST /api/ingest/shortcut — source label', () => {
+  async function relayedSource(): Promise<string> {
+    const { res } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'buy milk' } }), res);
+    return mockCallTransportTo.mock.calls[0][3].body.source as string;
+  }
+
+  it("default preserved: an UNSET env still stamps 'iOS Shortcut' (behaviour-identical)", async () => {
+    expect(process.env.SHORTCUT_INGEST_SOURCE_LABEL).toBeUndefined();
+    expect(await relayedSource()).toBe('iOS Shortcut');
+  });
+
+  it('override honoured: the configured label rides the relayed body', async () => {
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = 'Android (Tasker)';
+    expect(await relayedSource()).toBe('Android (Tasker)');
+  });
+
+  it('a whitespace-only label degrades to the default (never stamps BLANK provenance)', async () => {
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = '   ';
+    expect(await relayedSource()).toBe('iOS Shortcut');
+  });
+
+  it('a surrounding-whitespace label is trimmed, not stamped raw', async () => {
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = '  Android (Tasker)  ';
+    expect(await relayedSource()).toBe('Android (Tasker)');
+  });
+
+  it('garbage SHORTCUT_INGEST_SOURCE_LABEL falls back to the default (never empty)', () => {
+    for (const garbage of ['', '   ', '\t\n']) {
+      process.env.SHORTCUT_INGEST_SOURCE_LABEL = garbage;
+      expect(__shortcutSourceLabelForTest()).toBe('iOS Shortcut');
+    }
+    // Controls: a real value is honoured; absent → default.
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = 'Desktop hotkey';
+    expect(__shortcutSourceLabelForTest()).toBe('Desktop hotkey');
+    delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
+    expect(__shortcutSourceLabelForTest()).toBe('iOS Shortcut');
   });
 });
 

@@ -52,12 +52,14 @@ beforeEach(() => {
   __resetShortcutRateLimitForTest();
   process.env.SHORTCUT_INGEST_TOKEN = TOKEN;
   delete process.env.SHORTCUT_DIRECTIVE_ALIASES;
+  delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.SHORTCUT_INGEST_TOKEN;
   delete process.env.SHORTCUT_DIRECTIVE_ALIASES;
+  delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
 });
 
 describe('directive routing — re-homes to a configured instance + strips + provenance', () => {
@@ -182,6 +184,37 @@ describe('directive routing — spokenForm hygiene rides the RELAY (provenance o
     const { res } = mockRes();
     await handler(req({ text: 'message for Hypatia, buy milk' }), res);
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('spoken_form_truncated'));
+  });
+});
+
+describe('directive routing — the source label is parameterised on BOTH shapes', () => {
+  // The spoken-form provenance was a SECOND independent copy of the 'iOS Shortcut'
+  // literal. Fixing only the plain-label site would leave every DIRECTIVE-routed
+  // Android capture still stamped 'iOS Shortcut' — this is the pin that catches it.
+  it('the override rides the spoken-form variant, not just the plain label', async () => {
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = 'Android (Tasker)';
+    const { res } = mockRes();
+    await handler(req({ text: 'message for Hypatia, add to my story idea' }), res);
+    expect(relayed()[3].body.source).toBe('Android (Tasker) (spoken: "message for Hypatia,")');
+  });
+
+  it('default preserved on the spoken-form variant when the env is unset', async () => {
+    const { res } = mockRes();
+    await handler(req({ text: 'message for Hypatia, add to my story idea' }), res);
+    expect(relayed()[3].body.source).toBe('iOS Shortcut (spoken: "message for Hypatia,")');
+  });
+
+  it('both shapes resolve the SAME label within one request (they cannot drift)', async () => {
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = 'Desktop hotkey';
+    const { res: res1 } = mockRes();
+    await handler(req({ text: 'no directive here' }), res1); // plain shape
+    const plain = relayed()[3].body.source as string;
+    mockCallTransportTo.mockClear();
+    const { res: res2 } = mockRes();
+    await handler(req({ text: 'Hypatia: with a directive' }), res2); // spoken shape
+    const spoken = relayed()[3].body.source as string;
+    expect(plain).toBe('Desktop hotkey');
+    expect(spoken.startsWith(plain)).toBe(true);
   });
 });
 
