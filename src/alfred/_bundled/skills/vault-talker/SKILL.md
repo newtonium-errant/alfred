@@ -1013,7 +1013,7 @@ The fuzzy matcher behind `routine_done` is self-correcting. Each low-confidence 
 
 **The deck card has a third door (shipped 2026-08).** A plain reject only says *not that item*. Tapping **"What did this mean?"** on the card opens a picker of the vault's real active routine items, plus a **"Nothing — this was a one-off"** answer:
 
-- **Picking an item** rejects the proposed match *and* teaches the matcher that the phrase means the item Andrew picked. That takes effect immediately — the *next* completion phrased that way matches the corrected item, not eventually after some retraining pass. The picker offers only real vault items (the suggestion's own routine first, then items from other routines) and the server re-validates the pick against the live routine list — free text cannot reach the learned glossary, the proposal itself is never offered as its own correction, and a pick that is no longer a real item is refused whole rather than half-written.
+- **Picking an item** rejects the proposed match *and* teaches the matcher that the phrase means the item Andrew picked. That takes effect immediately — the *next* completion phrased that way matches the corrected item, not eventually after some retraining pass. The picker offers only real vault items (the suggestion's own routine first, then items from other routines) and the server re-validates the pick against the live routine list — free text cannot reach the learned glossary, and a pick that is no longer a real item is refused whole rather than half-written. The proposal itself is excluded at both layers: the deck hides it from the picker, and the server refuses it as a target regardless of client, answering *"that's the item we already suggested — confirm it instead of rejecting it."*
 - **"Nothing — this was a one-off"** rejects the match and marks the phrase meaningless, so the review stops raising that phrase against *any* candidate, not just the one proposed. Note the limit: this suppresses the review asking again; matcher-side, it is the rejected pair that does the work.
 
 **Channel asymmetry — be precise about this.** The correction picker is **deck/web only**. The Telegram reply-verb channel still takes only `N confirm` / `N reject` — there is no typed `correct` or `one-off` verb, and inventing one will not parse. If Andrew is working from the Daily Sync in Telegram and wants to say what a completion actually meant, the honest answer is: reject it there, or open the card on the deck to pick the right item.
@@ -2223,7 +2223,11 @@ Your configured recall peers are **KAL-LE**, **Hypatia**, and **VERA** — never
 
 ### Daily Sync reply verbs
 
-When Andrew replies to a Daily Sync batch, each item is keyed by its row number and disposed by a verb. The parser recognizes a closed vocabulary — unknown verbs kick the reply back. The current vocabulary:
+When Andrew replies to a Daily Sync batch, each item is keyed by its row number and disposed by a verb. The parser recognizes a closed vocabulary and disposes **each item independently**: an unrecognised verb bounces *that item only*, echoed back as *"Didn't understand item N — could you restate?"*, while every other item in the same reply still applies and writes its corpus row. The confirmation body shows both halves together — the applied lines, then the bounced number.
+
+**This matters when Andrew asks what happened.** Tell him to re-send only the bounced item. Never tell him the reply failed and to retype the whole thing: the accepted items already landed, and re-sending them writes a second corpus row for a correction he only made once, teaching the classifier from a duplicate. A partial bounce is the normal, designed outcome, not a failed reply.
+
+The current vocabulary (each verb also has accepted synonyms — a routine-match row, for instance, takes `confirm`/`keep`/`yes` or `reject`/`delete`/`no`):
 
 - `N confirm` — accept the proposed action for item N (create the record, apply the resolution, run the proposed merge).
 - `N delete` — drop item N from the batch without action.
@@ -2236,8 +2240,6 @@ When Andrew replies to a Daily Sync batch, each item is keyed by its row number 
 **Range references (Task #55, 2026-06-01).** A single verb can apply to a contiguous range of items. Accepted shapes: `1-5 confirm`, `items 3-7 reject`, `4 through 9 high`. Range separators: hyphen `-`, en-dash `–`, em-dash `—`, or the literal word `through` (so voice-transcribed replies work). The range expands to per-item fragments before verb parsing, so any verb that works on a single item works in a range. Single-item ranges (`3-3 confirm`) expand to one item. Cap: 50 items per range — over-cap typos like `5-2026 confirm` echo back unparsed rather than running away. Inverted ranges (`5-1 confirm`) also echo back unparsed so the typo surfaces instead of guessing direction.
 
 These are operator-side verbs — Andrew types them in chat, the parser handles them above your turn. **You don't invoke them yourself**; this list is so you can explain what's happening when Andrew asks *"why did item 5 resolve the same as item 4?"* (answer: he typed `5 duplicate`, or `5 duplicate of 4`) or *"why did the whole batch confirm when I just typed 'lgtm'?"* (bulk-ack token).
-
-**The list above is the whole typed vocabulary.** In particular, a routine-match row takes `N confirm` / `N reject` and nothing richer — the "what did this mean?" correction picker (see **Routine match review**) is a deck/web affordance with no reply-verb equivalent. If Andrew asks how to type a correction, tell him there isn't one yet rather than inventing a verb; an unrecognised verb kicks the whole reply back.
 
 ### Person merge-on-conflict (shipped 2026-05-15)
 
