@@ -49,34 +49,65 @@ import { loadDirectiveAliases, matchLeadingDirective } from '../../../lib/algern
 // inheriting the 'iOS Shortcut' default.
 
 // --- operator-tunable env, one contract for all of it ------------------------
-// Every value below is read PER-REQUEST and follows the same shape:
-//   process.env.X?.trim() || <default>
+// Every value below is read PER-REQUEST and resolved through `envOrDefault`.
 //
 // The trim is not decoration. A bare `||` only catches '' — a whitespace-only
 // value is TRUTHY, so `SHORTCUT_INGEST_USER='   '` would sail through and stamp
 // a blank `ingested_by` AND send a blank `X-Alfred-Ingest-User` (an asserted
 // identity header on a privileged relay). Same failure the source label had
 // before #27; fixing one field and leaving its neighbours is how that bug
-// survives. Unset behaviour is byte-identical to the module-const form these
+// survives. Unset behaviour is byte-identical to the module consts these
 // replaced. Per-request rather than module-scope so each is settable in tests
 // without module-registry gymnastics — same reasoning as rateLimitMax().
+
+/**
+ * Trim-then-fallback with an audible degradation signal.
+ *
+ * UNSET is not degradation — it is the documented default, and warning on it
+ * would make every stock deploy shout on every request. CONFIGURED-BUT-BLANK is
+ * different: the operator set something and we are ignoring it. Falling back
+ * silently there is our own intentionally-left-blank doctrine violated — the
+ * capture survives while the operator goes on believing a broken setting is
+ * being honoured. So the value degrades AND says so.
+ *
+ * Unlatched (fires per request, not once per process) because the volume is
+ * already bounded by the rate limiter and a recurring misconfiguration should
+ * keep showing up in the log rather than scrolling out of it once.
+ *
+ * Takes the name and the value SEPARATELY, rather than doing `process.env[name]`
+ * internally, so each call site keeps a STATIC `process.env.X` read: Next
+ * inlines `process.env.NEXT_PUBLIC_*` textually at build time and a dynamic
+ * lookup would silently change how that one resolves.
+ */
+function envOrDefault(name: string, raw: string | undefined, fallback: string): string {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed) return trimmed;
+  console.warn(`[bff:ingest/shortcut] env_degraded var=${name} reason=blank`);
+  return fallback;
+}
 
 // Public (non-secret) instance display name stamped into provenance —
 // parameterised (NOT a hardcoded literal) so a different deploy stamps its own.
 function originInstance(): string {
-  return process.env.NEXT_PUBLIC_INSTANCE_NAME?.trim() || 'Algernon';
+  return envOrDefault('NEXT_PUBLIC_INSTANCE_NAME', process.env.NEXT_PUBLIC_INSTANCE_NAME, 'Algernon');
 }
 
 // Who the capture is attributed to. Rides BOTH the relayed `ingested_by` and the
 // `X-Alfred-Ingest-User` header, so a blank here is a blank asserted identity.
 function ingestedBy(): string {
-  return process.env.SHORTCUT_INGEST_USER?.trim() || 'Andrew (shortcut)';
+  return envOrDefault('SHORTCUT_INGEST_USER', process.env.SHORTCUT_INGEST_USER, 'Andrew (shortcut)');
 }
 
 // Default ingest target when the Shortcut omits one. Matched case-insensitively
-// against the configured targets.
+// against the configured targets. The loudest of the four: its degradation
+// changes ROUTING — where the record lands — not just a provenance string.
 function defaultTarget(): string {
-  return process.env.SHORTCUT_INGEST_DEFAULT_TARGET?.trim() || 'salem';
+  return envOrDefault(
+    'SHORTCUT_INGEST_DEFAULT_TARGET',
+    process.env.SHORTCUT_INGEST_DEFAULT_TARGET,
+    'salem',
+  );
 }
 
 // Provenance label stamped into the record's `source:` frontmatter. The route is
@@ -86,7 +117,11 @@ function defaultTarget(): string {
 // origin, on a field the operator is meant to trust. Default preserved, so an
 // unset env is byte-identical to the pre-parameterised behavior.
 function sourceLabel(): string {
-  return process.env.SHORTCUT_INGEST_SOURCE_LABEL?.trim() || 'iOS Shortcut';
+  return envOrDefault(
+    'SHORTCUT_INGEST_SOURCE_LABEL',
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL,
+    'iOS Shortcut',
+  );
 }
 
 /**
@@ -129,18 +164,31 @@ const RATE_WINDOW_MS = 60 * 60 * 1000;
 type RateBucket = { windowStart: number; count: number };
 const rateBuckets = new Map<string, RateBucket>();
 
+// Same degradation doctrine as envOrDefault above, different predicate: this one
+// degrades on "not a positive integer" rather than "blank", so it carries its own
+// reason code. An operator who sets RATE_MAX=0 meaning "unlimited" gets 30 — they
+// should hear about it rather than discover it at the 31st capture.
 function rateLimitMax(): number {
-  const raw = parseInt(process.env.SHORTCUT_INGEST_RATE_MAX || '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 30;
+  const rawEnv = process.env.SHORTCUT_INGEST_RATE_MAX;
+  if (rawEnv === undefined) return 30;
+  const parsed = parseInt(rawEnv, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  console.warn('[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_RATE_MAX reason=not_positive_int');
+  return 30;
 }
 
 function rateLimitOk(key: string, now: number): boolean {
+  // Resolved on EVERY request, not lazily inside the second branch: the ceiling
+  // is pure, so this is behaviour-identical for limiting, but it means a garbage
+  // SHORTCUT_INGEST_RATE_MAX is reported on the FIRST capture rather than
+  // staying silent until a window is already open.
+  const max = rateLimitMax();
   const b = rateBuckets.get(key);
   if (!b || now - b.windowStart >= RATE_WINDOW_MS) {
     rateBuckets.set(key, { windowStart: now, count: 1 });
     return true;
   }
-  if (b.count >= rateLimitMax()) return false;
+  if (b.count >= max) return false;
   b.count += 1;
   return true;
 }

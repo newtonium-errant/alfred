@@ -414,6 +414,103 @@ describe('POST /api/ingest/shortcut — token whitespace symmetry', () => {
   });
 });
 
+// --- degraded env is AUDIBLE (#29 WARN-1) ------------------------------------
+// Degrading a garbage value keeps the capture, but doing it SILENTLY is our own
+// intentionally-left-blank doctrine violated: the operator goes on believing a
+// broken setting is honoured. Every fallback announces itself. All driven
+// through the real handler.
+
+describe('POST /api/ingest/shortcut — degraded env announces itself', () => {
+  /** Collect console.warn text for the duration of a case. */
+  function captureWarns(): string[] {
+    const seen: string[] = [];
+    vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      seen.push(args.map(String).join(' '));
+    });
+    return seen;
+  }
+
+  const degraded = (warns: string[]) => warns.filter((m) => m.includes('env_degraded'));
+
+  async function post() {
+    const { res } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'buy milk' } }), res);
+  }
+
+  it('a blank default target warns — the one whose degradation changes ROUTING', async () => {
+    process.env.SHORTCUT_INGEST_DEFAULT_TARGET = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_DEFAULT_TARGET reason=blank',
+    ]);
+  });
+
+  it('a blank ingest user warns (blank attribution + blank asserted-identity header)', async () => {
+    process.env.SHORTCUT_INGEST_USER = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_USER reason=blank',
+    ]);
+  });
+
+  it('a blank source label warns', async () => {
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_SOURCE_LABEL reason=blank',
+    ]);
+  });
+
+  it('a blank instance name warns', async () => {
+    process.env.NEXT_PUBLIC_INSTANCE_NAME = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=NEXT_PUBLIC_INSTANCE_NAME reason=blank',
+    ]);
+  });
+
+  it('a non-positive rate max warns with its OWN reason code (not "blank")', async () => {
+    process.env.SHORTCUT_INGEST_RATE_MAX = '0';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_RATE_MAX reason=not_positive_int',
+    ]);
+  });
+
+  it('UNSET env is SILENT — a stock deploy must not shout on every request', async () => {
+    // The pin that keeps this signal meaningful. Unset is the documented
+    // default, not a degradation; warning on it would bury the real ones.
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([]);
+  });
+
+  it('a VALID override is silent too (only garbage is noisy)', async () => {
+    process.env.SHORTCUT_INGEST_USER = 'Sam (tasker)';
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = 'Android (Tasker)';
+    process.env.SHORTCUT_INGEST_RATE_MAX = '10';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([]);
+  });
+
+  it('several blank vars each get their own line (no swallowing after the first)', async () => {
+    process.env.SHORTCUT_INGEST_USER = '   ';
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = '  ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns).sort()).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_SOURCE_LABEL reason=blank',
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_USER reason=blank',
+    ]);
+  });
+});
+
 // --- rate limiting -----------------------------------------------------------
 
 describe('POST /api/ingest/shortcut — rate limit', () => {

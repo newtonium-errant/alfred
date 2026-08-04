@@ -90,7 +90,7 @@ Content-Type: application/json
 | `text` | yes | The record **body**, written verbatim. Max 8000 characters; blank-after-trim is a 400. |
 | `title` | no | Max 300 chars. Omit it and the route derives one from the first ~8 words plus a timestamp. |
 | `record_type` | no | Only `note` is accepted today. Omit it. |
-| `target` | no | Instance name, matched case-insensitively against the configured targets. Omit it to use the default. |
+| `target` | no | Instance name, max 64 chars, matched case-insensitively against the configured targets. Omit it to use the default. |
 
 Responses: `201` created · `400` bad body or unknown target · `401` bad/missing
 token · `429` over the hourly ceiling · `503` token not configured on the server.
