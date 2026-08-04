@@ -154,6 +154,47 @@ def test_legacy_processed_action_reproduces_old_behavior(tmp_path: Path) -> None
     assert state.state.processed[f.name].backend_used == "failed_legacy_processed"
 
 
+def test_legacy_processed_does_not_bump_last_run(tmp_path: Path) -> None:
+    """The legacy escape hatch retires a FAILED file — it must not stamp a
+    successful run.
+
+    ``last_run`` is what the curator's ``agent-failure-kind`` probe compares
+    against the failure timestamp to distinguish an ACTIVE outage from a
+    recovered one (``curator/health.py:385``). Before this pin, the legacy
+    branch called ``mark_processed`` unconditionally, which bumped ``last_run``
+    to a moment strictly AFTER the failure stamp set by the caller — so every
+    failure self-certified as recovered on the very next probe, and a
+    multi-day quota outage (the exact case the probe exists for) read green
+    throughout.
+    """
+    vault = tmp_path / "v"
+    f = _mk_inbox_file(vault)
+    config, state = _config(vault, action="processed"), _state(vault)
+
+    # A prior genuine success, so there is a real ``last_run`` to preserve.
+    state.state.mark_processed("earlier.md", "/x/earlier.md", [], [], "claude")
+    last_run_before = state.state.last_run
+    assert last_run_before                                 # a real timestamp to preserve
+
+    state.state.record_agent_failure(kind="quota_limited", summary="over quota")
+    _handle(f, state, config)
+
+    assert state.state.is_processed(f.name)               # legacy parity intact
+    assert state.state.last_run == last_run_before, (
+        "the legacy failure path must leave last_run at the last real success"
+    )
+
+
+def test_mark_processed_still_bumps_last_run_by_default(tmp_path: Path) -> None:
+    """The negative half: an ordinary success DOES stamp ``last_run``. Without
+    this, the pin above passes against a build that simply never bumps it."""
+    vault = tmp_path / "v"
+    state = _state(vault)
+    assert not state.state.last_run                       # unset on a fresh state
+    state.state.mark_processed("ok.md", "/x/ok.md", [], [], "claude")
+    assert state.state.last_run                            # a real success stamps it
+
+
 # --- exception-safety (build-time care) ------------------------------------
 
 

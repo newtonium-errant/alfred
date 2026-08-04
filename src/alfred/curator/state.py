@@ -65,7 +65,22 @@ class State:
         files_created: list[str],
         files_modified: list[str],
         backend_used: str,
+        *,
+        bump_last_run: bool = True,
     ) -> None:
+        """Record ``filename`` as handled.
+
+        ``bump_last_run`` exists because this method serves two callers with
+        different truth: a genuine success (bump — the default, correct for
+        every ordinary caller) and the legacy ``on_failure.action: "processed"``
+        escape hatch, which retires a FAILED file without a run having
+        succeeded. Passing ``True`` there would let a failure self-certify as
+        recovered — see the note at the ``last_run`` assignment below.
+
+        Clearing ``failed_attempts`` is unconditional and correct in both
+        cases: the file is being retired either way, so its attempt count has
+        no one left to count for.
+        """
         self.processed[filename] = ProcessedEntry(
             inbox_path=inbox_path,
             processed_at=datetime.now(timezone.utc).isoformat(),
@@ -73,7 +88,15 @@ class State:
             files_modified=files_modified,
             backend_used=backend_used,
         )
-        self.last_run = datetime.now(timezone.utc).isoformat()
+        if bump_last_run:
+            # ``last_run`` is the last SUCCESSFUL process, and the curator's
+            # ``agent-failure-kind`` probe reads it as exactly that: a
+            # ``last_run >= failure_ts`` comparison is how it tells a recovered
+            # pipeline from an active outage (``curator/health.py:385``).
+            # Bumping it on a failure path makes every failure look recovered
+            # on the very next probe — which is precisely the multi-day quota
+            # outage the probe was built to catch.
+            self.last_run = datetime.now(timezone.utc).isoformat()
         # Success clears any accumulated failure count (a transient failure that
         # later self-heals must not carry stale attempts toward the cap).
         self.failed_attempts.pop(filename, None)

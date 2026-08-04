@@ -363,6 +363,14 @@ def _handle_processing_failure(
                 files_created=[],
                 files_modified=[],
                 backend_used="failed_legacy_processed",
+                # This path retires a FAILED file; no run succeeded. Bumping
+                # ``last_run`` here would overwrite the timestamp the
+                # ``agent-failure-kind`` probe compares against the failure
+                # stamp set moments earlier at the caller — every failure would
+                # read as recovered on the next probe. The caller's comment
+                # ("``last_run`` is deliberately left untouched") was true of
+                # the caller and false of this branch until now.
+                bump_last_run=False,
             )
             state_mgr.save()
             log.warning(
