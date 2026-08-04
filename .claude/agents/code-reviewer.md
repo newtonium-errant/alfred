@@ -145,6 +145,7 @@ Hit 2026-08-04 (gate #27): a fresh reviewer shell resolved `npx`/`node` to the *
 Two extensions from gate #13 (same day, both nearly produced a fabricated number):
 - **The node trap poisons the PYTHON gate too**, not just vitest — `tests/test_scribe_pwa_client.py` shells out to `node` (41 environmental fails with the Windows node; 95 passed / 1 skipped with the Linux one).
 - **Never trust a bare exit code.** A suite chain ending in `| tail` exits 0 even when the interpreter itself is missing (`python` is not on PATH in a fresh agent shell — use the venv python). Assert BOTH that the interpreter resolves AND that a pytest summary line was actually produced before reporting any count.
+- **A dead `cd` silently relocates every downstream git call** (gate #15, same day): `cd` into a removed worktree fails, the compound command carries on, and `git rev-parse` answers from whatever repo the shell is actually in — output perfectly plausible, commit claim confidently wrong. Use `cd X || exit` (assert the context resolved) before trusting anything downstream, especially in end-of-review HEAD checks against worktrees that may have been cleaned up.
 
 ## Architectural-twin precision-asymmetry audit
 
