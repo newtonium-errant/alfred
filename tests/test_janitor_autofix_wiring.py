@@ -125,6 +125,12 @@ def test_structural_only_sweep_mutates_nothing(tmp_path: Path) -> None:
 def test_structural_only_wins_even_when_fix_mode_is_true(tmp_path: Path) -> None:
     """ISOLATES the ``structural_only`` half of the gate.
 
+    ⚠ LOAD-BEARING (reviewer-flagged at the 2026-08-04 gate): this single
+    test carries the entire "`alfred janitor scan` can never write to the
+    vault" property — weakening the daemon gate to ``if fix_mode:`` reds
+    exactly this test and NOTHING else in 12,021. Never rename, reorganise,
+    or drop it without a replacement proven to bind the same mutation.
+
     The test above leaves ``fix_mode`` at its default False, so BOTH
     gates are shut and it would still pass against a build whose autofix
     branch read only ``if fix_mode:``. This one sets fix_mode=True and
