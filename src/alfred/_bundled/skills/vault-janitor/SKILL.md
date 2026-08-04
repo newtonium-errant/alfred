@@ -438,9 +438,15 @@ Task records with `kind: task` containing project setup checklists. These live i
 
 ## 3. Fix Procedures by Issue Code
 
+**Only four codes are ever routed to you: LINK001, DUP001, SEM005, SEM006.** The sweep filters your issue report down to those before invoking you. Every other code below is documented so you can recognise it if one leaks through — it is either already repaired by the deterministic autofix phase that runs earlier in the same sweep (FM001–FM004, LINK002), or fixable by no janitor path at all (DIR001, ORPHAN001, STUB001, SEM001–SEM004). If a code outside those four appears in your report, log a warning and move on; do not act on it.
+
+Note the asymmetry, because it changes how much you can assume: the autofix-handled codes really are repaired before you see them, but the not-fixable codes are simply reported to the operator and left alone. Nothing downstream cleans up after you.
+
 ### Writing `janitor_note` — Idempotency Rule
 
-Every `janitor_note` written by these procedures must begin with the issue code (`FM002 —`, `LINK001 —`, `DUP001 —`, `ORPHAN001 —`, `STUB001 —`, etc.). That prefix is load-bearing — it is how the janitor recognizes its own prior work across sweeps.
+Every `janitor_note` you write must begin with the issue code you are acting on (`SEM005 —`, `SEM006 —`, `LINK001 —`, `DUP001 —`). That prefix is load-bearing — it is how the janitor recognizes its own prior work across sweeps.
+
+You will also meet notes you did not write. The deterministic autofix phase writes `FM002 -- …` and `FM003 -- …` notes in the same code-prefixed shape, and older records may still carry prefixes from retired passes (`ORPHAN001`, `STUB001`). Treat any code-prefixed note as prior work for the check below — finding one is not evidence that the code is still being handled.
 
 **Before writing `janitor_note`, always `alfred vault read` the target record first.** Then:
 
@@ -452,37 +458,47 @@ This prevents sweep-to-sweep churn from LLM prose variance on identical underlyi
 
 ### FM001 — MISSING_REQUIRED_FIELD
 
-Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
+**Pre-absorbed by autofix.** Earlier in the same sweep, `autofix.py` repairs FM001 by inference — `type` from the record's directory, `created` from the file's mtime, the title field from the filename. Records it cannot infer are left untouched for a later sweep, without a `janitor_note`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### FM002 — INVALID_TYPE_VALUE
 
-Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
+**Pre-absorbed by autofix.** Earlier in the same sweep, `autofix.py` rewrites the `type` value using the known-type correction map; a value with no mapping gets a deterministic `janitor_note` instead. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### FM003 — INVALID_STATUS_VALUE
 
-Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
+**Pre-absorbed by autofix.** Earlier in the same sweep, `autofix.py` rewrites the `status` value using the per-type status correction map; a value with no mapping gets a deterministic `janitor_note` instead. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### FM004 — INVALID_FIELD_TYPE
 
-Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
+**Pre-absorbed by autofix.** Earlier in the same sweep, `autofix.py` wraps the scalar value in a list for any list-typed field (`tags`, `related`, `aliases`, …). Cases it cannot resolve are left untouched, without a `janitor_note`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### DIR001 — WRONG_DIRECTORY
 
-Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
+**No janitor path fixes this, and it is not routed to you.** The remedy is a file move, which your scope denies outright. Nothing repairs it and nothing flags it — the scanner detects it, the sweep counts it under `not_janitor_fixable`, and it surfaces to the operator there. Do not assume a `janitor_note` exists on these records. You should not see this code in your issue report; if you do, log a warning and proceed — do not attempt the move.
 
 ### LINK001 — BROKEN_WIKILINK
 
 **Diagnosis:** A wikilink target doesn't match any file.
 
-**Fix:** If an unambiguous match exists, fix the link (update the wikilink to the correct target). Ambiguous / unresolved LINK001s are flagged by the structural scanner via deterministic janitor_note in `autofix.py` — you do not need to write the fallback flag yourself; if you see a LINK001 in your report, assume a resolution attempt is expected and only act when the mapping is unambiguous.
+**Fix:** If an unambiguous match exists, fix the link (update the wikilink to the correct target). Only act when the mapping is unambiguous.
+
+**There is no safety net behind you on LINK001 — do not assume one.** Every LINK001 the scanner finds is routed to you unfiltered, and nothing flags the ones you leave alone. A deterministic fallback-flagger exists in `autofix.py` but has no call site, so no `janitor_note` is ever written for an unresolved broken link. One you skip stays broken and is re-detected next sweep, with your log line as the only record that anyone looked at it.
+
+Expect most of them to be genuinely unresolvable. Roughly 2075 dangling links in the vault are known-real link debt awaiting a bulk repair campaign — not scanner noise, and not yours to clear one sweep at a time. So:
+
+- Fix only the unambiguous ones.
+- For the rest, log a `SKIPPED` line naming the broken target and why it was ambiguous.
+- **Do NOT write a `janitor_note` on every unresolved LINK001.** At this volume that would bury real flags under thousands of identical notes. The `SKIPPED` log line is the correct output.
 
 ### ORPHAN001 — ORPHANED_RECORD
 
-Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
+**No janitor path fixes this, and it is not routed to you.** Resolving an orphan is an editorial call — link it, or accept it as a legitimate leaf — so no automated path acts on it. Nothing repairs it and nothing flags it; the scanner detects it, the sweep counts it under `not_janitor_fixable`, and it surfaces to the operator there. Do not assume a `janitor_note` exists on these records. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### STUB001 — STUB_RECORD
 
-Handled end-to-end by the pipeline. Stage 3 enrichment (under the `janitor_enrich` scope) attempts to fill the body; any stub Stage 3 didn't enrich (capped, stale, read-failed, or LLM no-op) is flagged with a deterministic `janitor_note` by `autofix.flag_unenrichable_stubs` in the same sweep. You should not see this code in your issue report; if you do, log a warning and proceed.
+**No janitor path fixes this, and it is not routed to you.** Body enrichment belonged to the Stage 3 pass under the `janitor_enrich` scope, and that pass was retired with the OpenClaw backend (2026-05-25); the `janitor_enrich` scope still exists but nothing dispatches to it. The deterministic stub-flagger in `autofix.py` likewise has no call site. So nothing enriches a stub and nothing flags one — the scanner detects it, the sweep counts it under `not_janitor_fixable`, and it surfaces to the operator there. Do not assume a `janitor_note` exists on these records.
+
+Your scope denies body writes, so do not attempt to flesh out a stub yourself. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### DUP001 — DUPLICATE_NAME
 
@@ -496,7 +512,9 @@ This is what you do every time you see a DUP001 in a normal sweep. It creates a 
 
 **Machine-vs-human discriminator.** Only emit triage when BOTH candidates are **entity types**: `org/`, `person/`, `note/`, `project/`, `location/`, `account/`, `asset/`, `task/`, `event/`, `input/`, `conversation/`, `process/`, `run/`. Do NOT emit triage for **learn types** (`contradiction/`, `assumption/`, `decision/`, `constraint/`, `synthesis/`) — those carry legitimate human semantic pointers with their own `confidence` fields and are not dedup candidates.
 
-> **Note:** The entity-type list above must stay in sync with `KNOWN_TYPES` minus `LEARN_TYPES` in `src/alfred/vault/schema.py`. If a new record type is added there, add it here too (or to the learn-type exclusion list if it's a learn type). Learn-type DUP001s are deterministically flagged by the structural scanner in `autofix.py`; you should not see learn-type DUP001s in your issue report.
+> **Note:** The entity-type list above must stay in sync with `KNOWN_TYPES` minus `LEARN_TYPES` in `src/alfred/vault/schema.py`. If a new record type is added there, add it here too (or to the learn-type exclusion list if it's a learn type).
+>
+> **Learn-type DUP001s DO reach you.** DUP001 is routed to the agent as a single code, with no learn-type pre-filter anywhere upstream — so applying the discriminator above is your job, not the scanner's. When both candidates are learn types, create no triage task, touch neither record, and log `SKIPPED | {path} | DUP001 | Learn-type duplicate, not a triage candidate`.
 
 1. **Compute the deterministic triage ID.** Use the dedicated CLI — do NOT try to compute the ID by hand, and do NOT reuse an ID from a previous sweep. The CLI is order-independent and accepts wikilink, bare path, or `.md` forms:
    ```bash
@@ -559,7 +577,7 @@ When the sweep context contains an explicit operator merge instruction (resolved
 
 ### SEM001–SEM004 — Semantic Drift (Scanner-Detected)
 
-Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see these codes in your issue report; if you do, log a warning and proceed.
+**No janitor path fixes these, and they are not routed to you.** The scanner detects them from date and link-count math, but the remedy is a status change, which is human-only. Nothing repairs them and nothing flags them; the sweep counts them under `not_janitor_fixable` and they surface to the operator there. Do not assume a `janitor_note` exists on these records. You should not see these codes in your issue report; if you do, log a warning and proceed.
 
 ### SEM005–SEM006 — Semantic Issues (Agent-Detected)
 
@@ -595,12 +613,15 @@ SKIPPED: {count}
 DELETED: {count}
 
 === ACTION LOG ===
-FIXED | person/John Smith.md | FM001 | Added missing 'created: 2026-02-19'
-FIXED | task/Review Quote.md | FM003 | Changed status 'open' → 'todo'
-FLAGGED | note/Old Notes.md | ORPHAN001 | No inbound links, added janitor_note
-FLAGGED | project/Eagle Farm.md | STUB001 | Body minimal, added janitor_note
+FIXED | person/John Smith.md | LINK001 | Retargeted [[org/Acme]] → [[org/Acme Corp]] (only match)
+SKIPPED | note/Old Notes.md | LINK001 | [[Project X]] unresolved — 3 candidates, none unambiguous
+FLAGGED | task/Triage - Acme org dedup.md | DUP001 | Created triage task dedup-a7f3c2b1d8e4
+SKIPPED | contradiction/Pricing Conflict.md | DUP001 | Learn-type duplicate, not a triage candidate
+FLAGGED | note/Meeting.md | SEM005 | Added janitor_note: single unexplained fragment, no context
 DELETED | note/test test.md | SEM005 | Garbage content: "test test test"
 ```
+
+Every line in your action log should carry one of the four codes routed to you (LINK001, DUP001, SEM005, SEM006). If you find yourself logging an FM00x, DIR001, ORPHAN001 or STUB001 line, something upstream misrouted — log the warning described in §3 rather than acting.
 
 ---
 
