@@ -29,8 +29,22 @@ import { composerLogBodySchema } from '../../../lib/algernon/schemas';
 
 // Read the target at call time (not module load) so a per-request/test env is
 // honoured. Server-fixed: env override or the default spool — never client input.
+//
+// #33 — trim-then-fallback, same contract as the ingest doors. The stake here is
+// higher than a provenance string: `||` only catches '', so a whitespace-only
+// ALFRED_WEB_COMPOSER_LOG is TRUTHY and would become the literal FILENAME the
+// spool appends to — a file named "   " in the cwd, with the real log silently
+// never written. Degrading to the documented default is the safe read of a blank
+// value, and it says so rather than falling back in silence (#29 WARN-1).
+//
+// UNSET stays silent: that is the documented default, not a misconfiguration.
 function composerLogPath(): string {
-  return process.env.ALFRED_WEB_COMPOSER_LOG || './data/composer_log.jsonl';
+  const raw = process.env.ALFRED_WEB_COMPOSER_LOG;
+  if (raw === undefined) return './data/composer_log.jsonl';
+  const trimmed = raw.trim();
+  if (trimmed) return trimmed;
+  console.warn('[bff:feed/composer-log] env_degraded var=ALFRED_WEB_COMPOSER_LOG reason=blank');
+  return './data/composer_log.jsonl';
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {

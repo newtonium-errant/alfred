@@ -51,6 +51,7 @@ function postReq(body: unknown): NextApiRequest {
 }
 
 beforeEach(() => {
+  delete process.env.NEXT_PUBLIC_INSTANCE_NAME;
   mockResolveSessionToken.mockReset();
   mockReadDisplayIdentity.mockReset();
   mockCallTransportTo.mockReset();
@@ -62,6 +63,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  delete process.env.NEXT_PUBLIC_INSTANCE_NAME;
 });
 
 describe('POST /api/ingest/submit', () => {
@@ -141,6 +143,7 @@ describe('POST /api/ingest/submit', () => {
     expect(opts.body.body).toBe('The verbatim body.');
     expect(opts.body.ingested_by).toBe('andrew');
     expect(opts.body.set_fields.ingested_via).toBe('web');
+    expect(opts.body.set_fields.origin_instance).toBe('Algernon'); // unset → default
     expect(typeof opts.body.ingested_at).toBe('string');
     expect(opts.headers['X-Alfred-Ingest-User']).toBe('andrew');
 
@@ -177,5 +180,54 @@ describe('POST /api/ingest/submit', () => {
     await handler(postReq(validBody), res);
     expect(status).toHaveBeenCalledWith(409);
     expect(json.mock.calls[0][0].error).toBe('title_collision');
+  });
+});
+
+// --- origin_instance whitespace degradation (#33) ---------------------------
+// The last sibling of the bare-`||` class closed on the bearer door (#27/#29):
+// `||` only catches '', so a whitespace-only value is truthy and would stamp a
+// BLANK origin_instance on a real write.
+
+describe('POST /api/ingest/submit — origin_instance provenance', () => {
+  async function relayedSetFields() {
+    mockResolveSessionToken.mockReturnValue('sess');
+    mockReadDisplayIdentity.mockReturnValue({ name: 'andrew', role: 'owner' });
+    mockCallTransportTo.mockResolvedValue({ status: 201, body: {} });
+    const { res } = mockRes();
+    await handler(postReq(validBody), res);
+    return mockCallTransportTo.mock.calls[0][3].body.set_fields;
+  }
+
+  it('a configured instance name is honoured', async () => {
+    process.env.NEXT_PUBLIC_INSTANCE_NAME = 'KAL-LE';
+    expect((await relayedSetFields()).origin_instance).toBe('KAL-LE');
+  });
+
+  it('a whitespace-only name degrades to the default, never a blank stamp', async () => {
+    process.env.NEXT_PUBLIC_INSTANCE_NAME = '   ';
+    expect((await relayedSetFields()).origin_instance).toBe('Algernon');
+  });
+
+  it('surrounding whitespace is trimmed, not stamped raw', async () => {
+    process.env.NEXT_PUBLIC_INSTANCE_NAME = '  KAL-LE  ';
+    expect((await relayedSetFields()).origin_instance).toBe('KAL-LE');
+  });
+
+  it('a whitespace-only name SAYS it degraded (not a silent fallback)', async () => {
+    process.env.NEXT_PUBLIC_INSTANCE_NAME = '   ';
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await relayedSetFields();
+    expect(warn).toHaveBeenCalledWith(
+      '[bff:ingest/submit] env_degraded var=NEXT_PUBLIC_INSTANCE_NAME reason=blank',
+    );
+  });
+
+  it('UNSET is silent — the documented default is not a misconfiguration', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fields = await relayedSetFields();
+    expect(fields.origin_instance).toBe('Algernon');
+    expect(
+      warn.mock.calls.filter((c) => String(c[0]).includes('env_degraded')),
+    ).toEqual([]);
   });
 });

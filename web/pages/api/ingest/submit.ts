@@ -9,7 +9,28 @@ import { sendTransportError } from '../../../lib/algernon/bffError';
 // The origin instance label stamped into ingest provenance. Server-side read of
 // the (public, non-secret) instance display name — parameterised, NOT a hardcoded
 // "Salem", so a different deploy stamps its own origin.
-const ORIGIN_INSTANCE = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
+//
+// #33 — the last sibling of the bare-`||` whitespace class closed on the bearer
+// door (#27/#29). `||` only catches '': a whitespace-only value is TRUTHY and
+// would stamp a BLANK `origin_instance` on a real write. Trim-then-fallback, and
+// say so when it degrades — a silent fallback lets the operator go on believing
+// a broken setting is honoured (the #29 WARN-1 doctrine).
+//
+// UNSET is deliberately silent: that is the documented default, not a
+// misconfiguration, and warning on it would make every stock deploy shout on
+// every request.
+//
+// Read per-request, mirroring the shortcut door, so it is settable in tests.
+// This is the SECOND copy of this six-line shape; a THIRD site should extract it
+// to a shared module rather than duplicate again.
+function originInstance(): string {
+  const raw = process.env.NEXT_PUBLIC_INSTANCE_NAME;
+  if (raw === undefined) return 'Algernon';
+  const trimmed = raw.trim();
+  if (trimmed) return trimmed;
+  console.warn('[bff:ingest/submit] env_degraded var=NEXT_PUBLIC_INSTANCE_NAME reason=blank');
+  return 'Algernon';
+}
 
 // POST /api/ingest/submit → relays a VERBATIM artifact to the CHOSEN target
 // instance's transport /vault/ingest, using that target's server-side peer token.
@@ -69,7 +90,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         ingested_by: identity.name,
         ingested_at: new Date().toISOString(),
         correlation_id: randomUUID(),
-        set_fields: { ingested_via: 'web', origin_instance: ORIGIN_INSTANCE },
+        set_fields: { ingested_via: 'web', origin_instance: originInstance() },
       },
       headers: { 'X-Alfred-Ingest-User': identity.name },
     });

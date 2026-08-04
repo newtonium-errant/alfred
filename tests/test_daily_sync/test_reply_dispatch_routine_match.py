@@ -197,6 +197,115 @@ def test_modifier_on_routine_match_item_unparsed(
     assert _read_corpus(corpus_path) == []
 
 
+# ---------------------------------------------------------------------------
+# #38 — a fragment must never vanish just because a sibling applied
+# ---------------------------------------------------------------------------
+#
+# These assert the RENDERED operator-facing string (``result["message"]`` — what
+# Telegram actually shows), not the programmatic ``unparsed`` field. The bug was
+# invisible from ``unparsed`` precisely because the fragment WAS there; only the
+# message dropped it.
+
+
+def test_mixed_reply_shows_unparsed_fragment_next_to_applied_lines(
+    tmp_path: Path, corpus_path: Path,
+) -> None:
+    """An unrecognised fragment renders even when a sibling item applied.
+
+    "5 confirm / 6 correct ..." applies item 5 and cannot parse item 6.
+    Pre-fix the parse-failure notice was gated on ``not applied_lines``, so the
+    successful sibling SUPPRESSED it: the corpus row for 5 was written, item 6
+    was discarded, and the reply read like unqualified success. Andrew's item
+    vanished with no signal — an intentionally-left-blank violation on an
+    operator-facing surface.
+
+    Mutation: re-add ``and not applied_lines`` to the fragment branch in
+    ``_build_confirmation_body`` → this fails.
+    """
+    cfg = _config(tmp_path)
+    _seed_state(cfg, routine_match_items=[
+        _routine_match_item(5, query="walk doggo", matched_to="Walk dog"),
+        _routine_match_item(6, query="clean hammer", matched_to="Fully Clean House"),
+    ])
+
+    result = handle_daily_sync_reply(
+        cfg, parent_message_id=100, reply_text="5 confirm\n6 correct Sweep the floor",
+    )
+
+    assert result is not None
+    message = result["message"]
+    # The applied half still reports.
+    assert "applied 1 correction" in message
+    assert result["routine_match_count"] == 1
+    # ...and the dropped half is VISIBLE, carrying the operator's own words back
+    # so they can see what was not understood.
+    assert "couldn't parse" in message.lower()
+    assert "Sweep the floor" in message
+
+
+def test_unparsed_fragment_shows_alongside_an_execution_error(
+    tmp_path: Path, corpus_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same suppression existed for ``execution_errors``, one condition over.
+
+    Not in #38's brief — found by reading the gate, which carried THREE
+    suppressing conditions rather than the one reported. An execution failure on
+    item 5 says nothing about whether item 6 parsed, so it must not silence it.
+
+    Mutation: re-add ``and not execution_errors`` → this fails.
+    """
+    cfg = _config(tmp_path)
+    # Corpus unconfigured → the routine-match write fails as an EXECUTION error
+    # (the no-silent-mutation guardrail this file already pins elsewhere).
+    monkeypatch.setattr(rd, "_routine_match_corpus_path", lambda *a, **kw: None)
+    _seed_state(cfg, routine_match_items=[
+        _routine_match_item(5, query="walk doggo", matched_to="Walk dog"),
+        _routine_match_item(6, query="clean hammer", matched_to="Fully Clean House"),
+    ])
+
+    result = handle_daily_sync_reply(
+        cfg, parent_message_id=100, reply_text="5 confirm\n6 correct Sweep the floor",
+    )
+
+    assert result is not None
+    message = result["message"]
+    assert result["execution_errors"], "expected an execution failure to be set up"
+    assert "couldn't apply" in message.lower()
+    # The parse failure is a SEPARATE fact and still gets its own line.
+    assert "couldn't parse" in message.lower()
+    assert "Sweep the floor" in message
+
+
+def test_bucketed_item_is_not_also_reported_as_a_raw_fragment(
+    tmp_path: Path, corpus_path: Path,
+) -> None:
+    """No double-reporting — the hazard the original ``elif`` was avoiding.
+
+    A wrong-family verb ("6 down") is bucketed into ``unparsed_item_numbers``
+    AND appends its resolver string to the raw error list. It must render ONCE,
+    as "Didn't understand item 6" — not a second time as a raw fragment.
+
+    This is why the fix narrows what the caller passes (only parser-orphaned
+    fragments) rather than simply un-gating the accumulated error list, which
+    would have echoed every bucketed item twice.
+    """
+    cfg = _config(tmp_path)
+    _seed_state(cfg, routine_match_items=[
+        _routine_match_item(5, query="walk doggo", matched_to="Walk dog"),
+        _routine_match_item(6, query="clean hammer", matched_to="Fully Clean House"),
+    ])
+
+    result = handle_daily_sync_reply(
+        cfg, parent_message_id=100, reply_text="5 confirm\n6 down",
+    )
+
+    assert result is not None
+    message = result["message"]
+    assert "Didn't understand item 6" in message
+    assert "couldn't parse" not in message.lower()
+    assert message.count("item 6") == 1
+
+
 def test_all_ok_confirms_every_routine_match(tmp_path: Path, corpus_path: Path) -> None:
     cfg = _config(tmp_path)
     _seed_state(cfg, routine_match_items=[
