@@ -155,3 +155,64 @@ describe('POST /api/feed/composer-log', () => {
     expect(warn).toHaveBeenCalled();
   });
 });
+
+// --- spool-path degradation (#33) -------------------------------------------
+// The stake here is higher than a provenance string: `||` only catches '', so a
+// whitespace-only env is TRUTHY and became the literal FILENAME appended to.
+
+describe('POST /api/feed/composer-log — spool path degradation', () => {
+  const STRAY = '   ';
+
+  afterEach(() => {
+    // Never leave whitespace-named debris behind, even if an assertion failed.
+    // A build WITHOUT the trim creates two shapes, and mutation-testing this pin
+    // hits both: the stray file, and — from a leading-space path, which stops
+    // being absolute — a whole bogus directory tree rooted at "  " in the cwd
+    // (measured: `web/  /tmp/composer-log-*/log-N.jsonl  `). Clean both so a red
+    // run can't litter the working tree.
+    for (const name of [STRAY, '  ']) {
+      try {
+        rmSync(name, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+  });
+
+  it('a whitespace-only spool env does NOT become a whitespace FILENAME', async () => {
+    process.env.ALFRED_WEB_COMPOSER_LOG = STRAY;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { res, status } = mockRes();
+    await handler(postReq({ rule: 'brief', event: 'composed' }), res);
+
+    expect(status).toHaveBeenCalledWith(200);
+    // Pre-fix this created a file literally named "   " in the cwd, and the real
+    // spool was never written to again.
+    expect(existsSync(STRAY)).toBe(false);
+    expect(warn).toHaveBeenCalledWith(
+      '[bff:feed/composer-log] env_degraded var=ALFRED_WEB_COMPOSER_LOG reason=blank',
+    );
+  });
+
+  it('a configured path is honoured, with surrounding whitespace trimmed off', async () => {
+    process.env.ALFRED_WEB_COMPOSER_LOG = `  ${logPath}  `;
+    const { res, status } = mockRes();
+    await handler(postReq({ rule: 'brief', event: 'composed' }), res);
+
+    expect(status).toHaveBeenCalledWith(200);
+    expect(existsSync(logPath)).toBe(true);
+    expect(readRecords()).toHaveLength(1);
+  });
+
+  it('UNSET is silent — the default spool is not a misconfiguration', async () => {
+    delete process.env.ALFRED_WEB_COMPOSER_LOG;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { res, status } = mockRes();
+    await handler(postReq({ rule: 'brief', event: 'composed' }), res);
+
+    expect(status).toHaveBeenCalledWith(200);
+    expect(
+      warn.mock.calls.filter((c) => String(c[0]).includes('env_degraded')),
+    ).toEqual([]);
+  });
+});
