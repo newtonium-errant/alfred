@@ -383,3 +383,53 @@ def test_approve_is_the_only_routine_writer(tmp_path: Path) -> None:
     pid = promote.load_pending(cfg.pending_path)[0].proposal_id
     promote.approve_proposal(v, cfg, pid, routine_record="Chores", operator="a")
     assert len(_routine_items(v, "Chores")) == 1     # ONLY approve wrote the routine record
+
+
+# --- arc #18 M4: containment at the create primitive ------------------------
+
+
+def test_approve_refuses_escaping_routine_record_and_keeps_proposal_pending(
+    tmp_path: Path,
+) -> None:
+    """Containment refusal must NOT burn the proposal.
+
+    ``append_promoted_item`` is a CREATE primitive (no ``.exists()`` gate —
+    absence is a supported branch), so an escaping ``routine_record`` was
+    arbitrary-file-create. M4 gates it. The behaviour that needs pinning is what
+    happens NEXT: a refused write must not record a decided-row, because the
+    decided-set permanently excludes a proposal from detection — recording it
+    would burn the proposal on a typo and leave no way back.
+
+    Structurally the same contract as the no-junk-default guard above: refuse
+    before any write, proposal stays PENDING, operator retries with a real name.
+    """
+    cfg = _cfg(tmp_path)
+    pid = _seed_pending(cfg)
+    v = tmp_path / "vault"
+    (v / "routine").mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "escaped"
+
+    res = promote.approve_proposal(
+        v, cfg, pid, routine_record="../../escaped/Evil", operator="a",
+    )
+
+    assert "error" in res
+    assert res["proposal_id"] == pid
+    assert not outside.exists(), "no directories created outside the vault"
+    assert promote.decided_ids(cfg.decided_path) == set(), (
+        "a containment refusal must leave the proposal PENDING — recording a "
+        "decision would burn it permanently"
+    )
+
+
+def test_approve_still_works_for_a_real_record_name(tmp_path: Path) -> None:
+    """The gate is transparent to legitimate names, including the punctuation
+    shapes real vault records carry."""
+    cfg = _cfg(tmp_path)
+    pid = _seed_pending(cfg)
+    v = tmp_path / "vault"
+    res = promote.approve_proposal(
+        v, cfg, pid, routine_record="Recurring Bills + Admin", operator="a",
+    )
+    assert res.get("write") == "appended"
+    assert promote.decided_ids(cfg.decided_path) == {pid}

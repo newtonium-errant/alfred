@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 import frontmatter  # type: ignore[import-untyped]
+import structlog
 import yaml
 
 from alfred.common.file_lock import file_rmw_lock
@@ -227,81 +228,135 @@ def _symlinked_vault(tmp_path: Path) -> tuple[Path, Path]:
     return configured, real
 
 
-def test_promote_and_routine_writer_lock_paths_differ_in_spelling(tmp_path: Path) -> None:
-    """Precondition for the pin below. If these two ever converge, the
-    contention test stops proving anything and silently becomes a tautology."""
+def test_promote_lock_path_is_the_RESOLVED_path(tmp_path: Path, monkeypatch) -> None:
+    """After #18 M4, promote composes through ``resolve_in_vault`` like every
+    other gated writer, so its lock path is the RESOLVED one.
+
+    This pin DRIVES the real ``append_promoted_item`` and captures what it
+    actually locks. The version this replaces hand-built
+    ``Path(configured) / "routine" / f"{record}.md"`` with a "promote.py:349
+    verbatim" comment — a MIRROR of production, not production. When M4 migrated
+    promote, the mirror kept asserting the old world and stayed GREEN. It did not
+    fail; it went stale silently, which is worse, and it is exactly the failure
+    the pin existed to prevent (an assertion that no longer describes anything).
+    Hence: capture from the writer, never re-implement it.
+    """
+    from alfred.tier.promote import append_promoted_item
     from alfred.vault.paths import resolve_in_vault
 
     configured, _real = _symlinked_vault(tmp_path)
-    promote_target = Path(configured) / "routine" / "Chores.md"   # promote.py:349 verbatim
-    writer_target = resolve_in_vault(configured, "routine/Chores.md", writer="test")
+    locked: list[Path] = []
 
-    assert str(promote_target) != str(writer_target), (
-        "the two composers must produce DIFFERENT strings for this pin to mean anything"
+    @contextlib.contextmanager
+    def _spy(path):
+        locked.append(path)
+        yield
+
+    monkeypatch.setattr("alfred.tier.promote.file_rmw_lock", _spy)
+    append_promoted_item(configured, "Chores", text="Sweep", cadence_days=7)
+
+    expected = resolve_in_vault(configured, "routine/Chores.md", writer="test")
+    assert locked == [expected], (
+        "promote must lock the resolved path — if this fails, either the gate "
+        "was dropped or promote stopped routing through resolve_in_vault"
     )
-    assert promote_target.with_suffix(".lock") != writer_target.with_suffix(".lock")
+
+
+def test_promote_refuses_an_escaping_record_before_taking_the_lock(
+    tmp_path: Path,
+) -> None:
+    """promote is the family's most powerful primitive — no ``.exists()`` gate,
+    because absence is a supported branch (it seeds a new record). So an escape
+    here was arbitrary-file-CREATE. Assert on DEBRIS as well as contents: the
+    gate must precede ``file_rmw_lock``, whose ``mkdir(parents=True)`` would
+    otherwise build the directory chain at the out-of-vault target."""
+    from alfred.tier.promote import REFUSED_UNSAFE_TARGET, append_promoted_item
+
+    configured, _real = _symlinked_vault(tmp_path)
+    # Where the escape ACTUALLY lands: "<vault>/routine/../../escaped" climbs
+    # out of routine/ then out of the vault, so it resolves relative to the
+    # REAL vault's parent — not to tmp_path. An earlier draft asserted on
+    # tmp_path/"escaped" and therefore passed under the gate-after-lock
+    # mutation for the wrong reason; mutation testing caught it.
+    outside = configured.resolve().parent / "escaped"
+
+    with structlog.testing.capture_logs() as cap:
+        res = append_promoted_item(
+            configured, "../../escaped/Evil", text="x", cadence_days=7,
+        )
+
+    assert res == REFUSED_UNSAFE_TARGET
+    assert not outside.exists(), "containment ran after the lock — directories created"
+    denials = [c for c in cap if c.get("event") == "tier.promote.path_escape_denied"]
+    assert len(denials) == 1
+
+
+# --- the inode property, with the divergence CONSTRUCTED -------------------
+#
+# Before M4 the two spellings diverged because promote and the routine writers
+# composed differently. M4 converged them — which is correct, and which means
+# the divergence can no longer be borrowed from a code asymmetry.
+#
+# That is fine, because the property under test was never about the code: flock
+# keys on the INODE, which is a filesystem fact. So the tests now CONSTRUCT the
+# two spellings directly from the symlinked vault. This is strictly more honest
+# than the old form — it tests the property rather than a coincidence, and it
+# cannot rot when a writer migrates.
+
+
+def _both_spellings(tmp_path: Path) -> tuple[Path, Path]:
+    """``(configured_spelling, resolved_spelling)`` for one record."""
+    from alfred.vault.paths import resolve_in_vault
+
+    configured, _real = _symlinked_vault(tmp_path)
+    via_symlink = Path(configured) / "routine" / "Chores.md"
+    via_resolved = resolve_in_vault(configured, "routine/Chores.md", writer="test")
+    assert str(via_symlink) != str(via_resolved), "fixture must produce two spellings"
+    return via_symlink, via_resolved
 
 
 def test_mixed_spellings_take_the_SAME_lock_no_37_regression(tmp_path: Path) -> None:
-    """The gating question, answered by measurement.
-
-    Holding ``file_rmw_lock`` via promote's CONFIGURED spelling must block a
-    contender using the #18 writers' RESOLVED spelling. If it did not, a
-    promote-append racing a routine write on the box would lost-update exactly
-    as it did before #37.
-    """
+    """Holding ``file_rmw_lock`` via one spelling must block the other. If it
+    did not, any writer still composing the configured spelling (today: none in
+    the routine family; tomorrow: whatever M6 has not migrated yet) would
+    lost-update against a migrated one exactly as before #37."""
     import fcntl
 
-    from alfred.vault.paths import resolve_in_vault
+    via_symlink, via_resolved = _both_spellings(tmp_path)
 
-    configured, _real = _symlinked_vault(tmp_path)
-    promote_target = Path(configured) / "routine" / "Chores.md"
-    writer_target = resolve_in_vault(configured, "routine/Chores.md", writer="test")
-
-    with file_rmw_lock(promote_target):
-        # Same sidecar name the migrated writers' file_rmw_lock would open.
-        contender_lock = writer_target.with_suffix(".lock")
-        held_lock = promote_target.with_suffix(".lock")
-        assert contender_lock.stat().st_ino == held_lock.stat().st_ino, (
+    with file_rmw_lock(via_symlink):
+        held = via_symlink.with_suffix(".lock")
+        contender = via_resolved.with_suffix(".lock")
+        assert contender.stat().st_ino == held.stat().st_ino, (
             "different inodes would mean genuinely different locks"
         )
-
-        fd = open(contender_lock, "a", encoding="utf-8")
+        fd = open(contender, "a", encoding="utf-8")
         try:
             with contextlib.suppress(BlockingIOError):
                 fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 raise AssertionError(
-                    "resolved spelling acquired the lock while the configured "
-                    "spelling held it — the sidecars de-serialized and #37's "
-                    "lost-update race is reopen"
+                    "the second spelling acquired the lock while the first held "
+                    "it — the sidecars de-serialized and #37's lost-update race "
+                    "is reopen"
                 )
         finally:
             fd.close()
 
 
 def test_no_lost_update_across_mixed_spellings(tmp_path: Path) -> None:
-    """The gold-standard form of the same guarantee: two writers, two
-    spellings, one record — both changes must survive.
-
-    Mirrors the two-writer test above it, but the worker locks via the RESOLVED
-    spelling while main holds the CONFIGURED one.
-    """
-    configured, real = _symlinked_vault(tmp_path)
-    record = real / "routine" / "Chores.md"
+    """Gold-standard form: two writers, two spellings, one record — both
+    changes must survive."""
+    via_symlink, via_resolved = _both_spellings(tmp_path)
+    record = via_resolved
     record.write_text(
         "---\ntype: routine\nname: Chores\n"
         "items:\n- text: A\n  priority: tracked\ncompletion_log: {}\n---\n\n# Chores\n",
         encoding="utf-8",
     )
-
-    from alfred.vault.paths import resolve_in_vault
-
-    resolved = resolve_in_vault(configured, "routine/Chores.md", writer="test")
     done: list[str] = []
 
     def _worker() -> None:
-        # Locks via the RESOLVED spelling (what the #18 writers now compose).
-        with file_rmw_lock(resolved):
+        with file_rmw_lock(via_resolved):
             post = frontmatter.load(str(record))
             fm = dict(post.metadata or {})
             cl = dict(fm.get("completion_log") or {})
@@ -311,8 +366,7 @@ def test_no_lost_update_across_mixed_spellings(tmp_path: Path) -> None:
             record.write_text(f"---\n{fm_yaml}---\n\n{post.content}\n", encoding="utf-8")
             done.append("B")
 
-    # Main holds via the CONFIGURED spelling (what promote composes).
-    with file_rmw_lock(Path(configured) / "routine" / "Chores.md"):
+    with file_rmw_lock(via_symlink):
         post = frontmatter.load(str(record))
         fm = dict(post.metadata or {})
         stale = dict(fm.get("completion_log") or {})

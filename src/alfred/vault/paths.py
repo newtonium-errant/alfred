@@ -53,20 +53,28 @@ every escape resolves outside and is refused.
   cross-process; pinned in ``tests/routine/test_routine_record_lock.py``
   (``test_mixed_spellings_take_the_SAME_lock_no_37_regression``).
 
-  The practical consequence, and the reason this paragraph is worth its length:
-  ``tier.promote.append_promoted_item`` still composes the CONFIGURED spelling
-  while the gated writers compose the resolved one, and that split is SAFE.
-  #37's lost-update guarantee holds across the gated/ungated boundary, so
-  containment can be rolled out writer-by-writer without an atomic
-  commit-group.
+  The practical consequence: containment could be rolled out writer-by-writer
+  WITHOUT an atomic commit-group, because a migrated writer (resolved spelling)
+  and an unmigrated one (configured spelling) still contend correctly. That is
+  what made M0-M3 safe to ship while ``tier.promote`` was still ungated, and it
+  is what keeps M6's remaining writers safe until they migrate.
 
-  That safety rests on ONE assumption, named here so it cannot rot silently:
-  **the two composers must still be naming the same file.** If ``promote`` is
-  ever migrated to resolve as well, the spellings converge and the contention
-  pin above stops proving anything — it passes trivially. The guard against
-  that is ``test_promote_and_routine_writer_lock_paths_differ_in_spelling``,
-  which asserts the spellings DIFFER and fails first if they ever don't. Read
-  the two together: the precondition pin keeps the contention pin honest.
+  As of M4 every routine-family writer — including ``promote`` — composes
+  through this helper, so the two spellings have CONVERGED in production. The
+  inode property is therefore no longer observable from a code asymmetry, and
+  the pins construct the two spellings directly from a symlinked vault instead
+  (``tests/routine/test_routine_record_lock.py``,
+  ``test_mixed_spellings_take_the_SAME_lock_no_37_regression``). That is the
+  more honest form anyway: the property is a filesystem fact, not a fact about
+  which code paths happen to disagree.
+
+  History worth keeping, because it cost a round: the pin that guarded this
+  assumption was written hand-building promote's composition with a
+  "promote.py:349 verbatim" comment. When M4 migrated promote, that mirror did
+  not fail — it kept asserting a world that no longer existed and stayed green.
+  A pin that re-implements production instead of driving it cannot notice
+  production changing. ``test_promote_lock_path_is_the_RESOLVED_path`` now
+  captures the path promote ACTUALLY locks.
 * **No success log.** A per-write "allowed" line would be pure spam on the hot
   path; the REFUSAL is the signal (intentionally-left-blank — the interesting
   event is the one that stops work, and it is always emitted).
