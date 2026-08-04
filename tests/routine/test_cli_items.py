@@ -382,7 +382,7 @@ def test_atomic_item_mutate_refusal_does_not_touch_file(
             aborted=True,
         )
 
-    result = _atomic_item_mutate(test_path, _refuse_mutator)
+    result = _atomic_item_mutate(test_path, _refuse_mutator, vault_path=vault)
     assert result.aborted is True
     assert test_path.read_bytes() == test_bytes_before, (
         "aborted=True MUST NOT touch the file bytes even when the "
@@ -430,7 +430,7 @@ def test_atomic_item_mutate_success_does_touch_file(
             payload_extras={},
         )
 
-    result = _atomic_item_mutate(test_path, _success_mutator)
+    result = _atomic_item_mutate(test_path, _success_mutator, vault_path=vault)
     assert result.aborted is False  # default
     # File DID change.
     assert test_path.read_bytes() != bytes_before, (

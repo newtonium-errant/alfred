@@ -880,3 +880,124 @@ def test_done_stamps_acted_action_done(tmp_path: Path) -> None:
 
     _act(store, cfg, vault, item.id, "done")  # direct done (not via accept)
     assert store.load()[item.id].acted_action == "done"
+
+
+# ---------------------------------------------------------------------------
+# Arc #18 M3 — Layer B source-gate (the INJECTION POINT, not the write)
+# ---------------------------------------------------------------------------
+#
+# Layer A (resolve_in_vault at every writer) already makes an escape harmless at
+# WRITE time. Layer B stops the poisoned string entering the vault at all, which
+# is what prevents the audit's chain from EXISTING rather than being blocked at
+# its last step:
+#
+#   LLM tool arg -> persisted HERE -> tier.compute interpolates it into
+#   f"routine/{record}.md" / f"[[task/{name}]]" -> feed evidence -> operator
+#   taps a normal-looking card -> a write aimed outside the vault
+#
+# Refusals reuse the EXISTING thin_evidence kind via the EXISTING _thin() reason
+# channel — no result-vocabulary widening, so no SKILL pass is owed.
+
+
+def _hostile_names() -> list[str]:
+    """Values that would change what the interpolated string ADDRESSES."""
+    return ["../../etc/passwd", "..", ".", "a/b", "a\\b", "x\x00y"]
+
+
+@pytest.mark.parametrize("bad", _hostile_names())
+def test_layer_b_refuses_unsafe_routine_record(tmp_path: Path, bad: str) -> None:
+    """A hostile ``routine_record`` never reaches the daily file."""
+    vault = _vault(tmp_path)
+    res = confirm_slot_candidate(
+        vault, tier=1, origin="routine_item", name="", path="",
+        routine_record=bad, item_text="Meditate", source="operator", date=TODAY,
+    )
+    assert res.kind == "thin_evidence"
+    assert res.changed is False
+    assert load_daily_curation(vault, TODAY) is None  # nothing persisted
+
+
+@pytest.mark.parametrize("bad", _hostile_names())
+def test_layer_b_refuses_unsafe_task_name(tmp_path: Path, bad: str) -> None:
+    """A hostile task ``name`` never becomes a ``[[task/...]]`` wikilink."""
+    vault = _vault(tmp_path)
+    res = confirm_slot_candidate(
+        vault, tier=1, origin="task", name=bad, path="",
+        routine_record=None, item_text=None, source="operator", date=TODAY,
+    )
+    assert res.kind == "thin_evidence"
+    assert res.changed is False
+    assert load_daily_curation(vault, TODAY) is None
+
+
+def test_layer_b_refusal_names_its_reason(tmp_path: Path) -> None:
+    """The refusal must be distinguishable from the OTHER thin_evidence causes
+    (task_no_name / routine_no_record_or_text / unknown_origin / t3_no_text).
+    Same lesson as the containment pins: a refusal that doesn't say WHY is
+    green against a build with no gate at all."""
+    vault = _vault(tmp_path)
+    with structlog.testing.capture_logs() as cap:
+        confirm_slot_candidate(
+            vault, tier=1, origin="routine_item", name="", path="",
+            routine_record="../../evil", item_text="X", source="operator",
+            date=TODAY,
+        )
+    thin = [c for c in cap if c.get("event") == "tier.confirm.thin_evidence"]
+    assert len(thin) == 1
+    assert thin[0]["reason"] == "unsafe_record_name"
+
+
+def test_layer_b_task_refusal_names_its_reason(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    with structlog.testing.capture_logs() as cap:
+        confirm_slot_candidate(
+            vault, tier=1, origin="task", name="../../evil", path="",
+            routine_record=None, item_text=None, source="operator", date=TODAY,
+        )
+    thin = [c for c in cap if c.get("event") == "tier.confirm.thin_evidence"]
+    assert len(thin) == 1
+    assert thin[0]["reason"] == "unsafe_task_name"
+
+
+@pytest.mark.parametrize(
+    "good",
+    [
+        "Recurring Bills + Admin",
+        "S.A.L.E.M. Backronym",
+        "KAL-LE Scope — Curation Is Additive",
+        "AppleCare+ Monthly $250",
+        "Legacy *_interval_hours Fields",
+        "group=-1 Telemetry",
+        "Andrew's Morning Routine",
+    ],
+)
+def test_layer_b_accepts_real_record_name_shapes(tmp_path: Path, good: str) -> None:
+    """Blocklist-regression guard at the SOURCE gate.
+
+    These shapes exist in the production vault. Layer B rejects separators and
+    the traversal specials ONLY — not punctuation, dots, unicode or apostrophes
+    — because only separators change what the interpolated string addresses.
+    233 real record stems contain a dot; a dot rule would break all of them.
+    """
+    vault = _vault(tmp_path)
+    res = confirm_slot_candidate(
+        vault, tier=1, origin="routine_item", name="", path="",
+        routine_record=good, item_text="Meditate", source="operator", date=TODAY,
+    )
+    assert res.kind == "success", f"Layer B wrongly refused a real shape: {good!r}"
+    assert res.changed is True
+
+
+def test_layer_b_t3_free_text_is_NOT_gated(tmp_path: Path) -> None:
+    """T3 is free-text by data-model — its ``item`` never becomes a path
+    component (``_curated_t3_to_tier_entry`` hardcodes ``path="routine/"``), so
+    gating it would refuse legitimate free-text intentions for no safety gain.
+    Pinned so a future 'tighten everything' pass doesn't over-apply Layer B."""
+    vault = _vault(tmp_path)
+    res = confirm_slot_candidate(
+        vault, tier=3, origin="routine_item", name="", path="",
+        routine_record=None, item_text="email Steph re: the 50/50 split",
+        source="operator", date=TODAY,
+    )
+    assert res.kind == "success"
+    assert res.changed is True

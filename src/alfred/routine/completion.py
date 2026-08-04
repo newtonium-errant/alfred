@@ -44,6 +44,7 @@ import structlog
 import yaml
 
 from alfred.common.file_lock import file_rmw_lock
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 log = structlog.get_logger(__name__)
 
@@ -167,10 +168,36 @@ def _write_record(record_path: Path, fm: dict, content: str) -> None:
     os.replace(tmp, record_path)
 
 
+def _contained(record_path: Path, vault_path: Path, *, writer: str) -> Path | None:
+    """Re-verify an ALREADY-RESOLVED ``record_path`` sits inside the vault.
+
+    Arc #18 defence-in-depth. Both callers gate their own composition (the board
+    at ``action_router``, the CLI at ``_routine_path``), so in a correct build
+    this never fires. It exists so a FUTURE caller that composes a path and
+    forgets the gate still cannot escape — the writers are the last thing before
+    ``os.replace``, and they are the shared leaf both lanes route through.
+
+    ``vault_path`` is a REQUIRED keyword on both public writers rather than an
+    optional one, deliberately. A defaulted ``vault_path=None`` would make this
+    check silently skippable: threaded in tests, absent in production, every pin
+    green (builder.md's optional-gate rule). Requiring it costs a wider diff —
+    that is the feature.
+
+    Returns the verified path, or ``None`` on an escape (caller maps to
+    ``unknown_record``: the path does not address a record in THIS vault).
+    """
+    try:
+        return resolve_in_vault(vault_path, record_path, writer=writer)
+    except VaultContainmentError:
+        return None
+
+
 def mark_routine_item_done(
     record_path: Path,
     item_text: str,
     date: str,
+    *,
+    vault_path: Path,
 ) -> RoutineCompletionResult:
     """Append ``date`` to ``completion_log[item_text]`` on ``record_path``.
 
@@ -192,6 +219,18 @@ def mark_routine_item_done(
     (intentionally-left-blank) so the outcome is grep-able.
     """
     record_path = Path(record_path)
+    contained = _contained(record_path, vault_path, writer="routine.completion.done")
+    if contained is None:
+        log.warning(
+            "routine.completion.done.path_escape_denied",
+            path=str(record_path), item=item_text, date=date,
+        )
+        return RoutineCompletionResult(
+            kind=DONE_KIND_UNKNOWN_RECORD, item=item_text, date=date,
+            record_path=record_path,
+        )
+    record_path = contained
+
     if not record_path.is_file():
         log.info(
             "routine.completion.done.unknown_record",
@@ -261,6 +300,8 @@ def mark_routine_item_undone(
     record_path: Path,
     item_text: str,
     date: str,
+    *,
+    vault_path: Path,
 ) -> RoutineCompletionResult:
     """Remove ONE ``date`` from ``completion_log[item_text]`` — the surgical
     inverse of :func:`mark_routine_item_done`.
@@ -275,6 +316,18 @@ def mark_routine_item_undone(
       * ``unlogged`` — removed (one write).
     """
     record_path = Path(record_path)
+    contained = _contained(record_path, vault_path, writer="routine.completion.undone")
+    if contained is None:
+        log.warning(
+            "routine.completion.undone.path_escape_denied",
+            path=str(record_path), item=item_text, date=date,
+        )
+        return RoutineCompletionResult(
+            kind=DONE_KIND_UNKNOWN_RECORD, item=item_text, date=date,
+            record_path=record_path,
+        )
+    record_path = contained
+
     if not record_path.is_file():
         log.info(
             "routine.completion.undone.unknown_record",

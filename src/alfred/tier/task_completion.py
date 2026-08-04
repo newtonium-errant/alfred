@@ -42,6 +42,7 @@ import structlog
 import yaml
 
 from alfred.common.file_lock import file_rmw_lock
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 from alfred.vault.schema import STATUS_BY_TYPE
 
 log = structlog.get_logger(__name__)
@@ -113,7 +114,20 @@ def mark_task_done(
       * ``idempotent_noop`` — already ``status: done`` (no write).
       * ``success`` — flipped to done (one write).
     """
-    record_path = Path(vault_path) / task_path
+    # Arc #18 containment gate. ``task_path`` arrives as the producer-stamped
+    # ``evidence["path"]``, which for a CURATED task is interpolated from a
+    # wikilink read back out of the daily file (``tier.compute._curated_task_path``
+    # does ``f"task/{name}.md"``) — and that name is persisted from an
+    # unsanitised LLM tool argument. So it is composed BEFORE it is trusted.
+    # Refuse outside-vault targets as ``unknown_record`` (the path does not
+    # address a task in this vault) rather than widening the result vocabulary;
+    # the distinct signal lives in the log event.
+    try:
+        record_path = resolve_in_vault(vault_path, task_path, writer="tier.task_done")
+    except VaultContainmentError:
+        log.warning("tier.task_done.path_escape_denied", path=task_path, date=date)
+        return TaskCompletionResult(kind=TASK_DONE_KIND_UNKNOWN_RECORD, path=task_path)
+
     if not record_path.is_file():
         log.info("tier.task_done.unknown_record", path=task_path, date=date)
         return TaskCompletionResult(kind=TASK_DONE_KIND_UNKNOWN_RECORD, path=task_path)

@@ -58,6 +58,11 @@ from zoneinfo import ZoneInfo
 import frontmatter  # type: ignore[import-untyped]
 import structlog
 
+from alfred.vault.paths import (
+    VaultContainmentError,
+    resolve_in_vault,
+    vault_relative,
+)
 from alfred.vault.scope import ScopeError
 
 from . import completion as _completion
@@ -256,7 +261,37 @@ def _routine_path(vault_path: Path, record: str) -> Path:
         record = record[:-3]
     if record.startswith("routine/"):
         record = record[len("routine/"):]
-    candidate = routine_dir / f"{record}.md"
+
+    # Arc #18 containment gate. ``record`` is operator- OR LLM-supplied (the
+    # talker's ``routine_done`` and ``routine_item`` tools pass the model's
+    # ``record`` string straight into argv — telegram/conversation.py:2501/:2516
+    # and _dispatch_routine_item), and nothing between the tool call and here
+    # sanitises it. Without this, ``../../..``-bearing names compose a target
+    # anywhere on the filesystem, gated only by the ``.exists()`` below — i.e.
+    # arbitrary mutation of any existing ``.md`` file.
+    #
+    # NOTE the ``.relative_to(vault_path)`` calls scattered around the routine
+    # writers are NOT containment: ``relative_to`` is LEXICAL, so
+    # ``<vault>/routine/../../x.md`` passes it happily. Only resolution catches it.
+    #
+    # Raises FileNotFoundError (not the containment error) so the existing
+    # ``except FileNotFoundError`` handlers in cli_items keep working unchanged;
+    # the distinct signal lives in the logged event, so the two causes are never
+    # conflated in the logs.
+    try:
+        candidate = resolve_in_vault(
+            vault_path, f"routine/{record}.md", writer="routine.cli.routine_path",
+        )
+    except VaultContainmentError:
+        log.warning(
+            "routine.cli.path_escape_denied",
+            record=record[:200], routine_dir=str(routine_dir),
+        )
+        raise FileNotFoundError(
+            f"Routine record not found: {record!r} does not resolve inside "
+            f"the vault (looking under {routine_dir})"
+        ) from None
+
     if not candidate.exists():
         raise FileNotFoundError(
             f"Routine record not found: {candidate} "
@@ -1121,8 +1156,10 @@ def cmd_done(
         item_text = on_record_matches[0].item_text
 
     # ---- Shared completion_log write (identity-pinned with the board) ----
-    rel_path = str(path.relative_to(vault_path))
-    result = _completion.mark_routine_item_done(path, item_text, iso)
+    rel_path = vault_relative(vault_path, path)
+    result = _completion.mark_routine_item_done(
+        path, item_text, iso, vault_path=vault_path,
+    )
 
     if result.kind == _completion.DONE_KIND_UNKNOWN_ITEM:
         # TOCTOU: the item vanished between resolution and the writer's lock.

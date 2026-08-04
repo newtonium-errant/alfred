@@ -38,9 +38,14 @@ import yaml
 
 from alfred.routine.match_calibration import query_key
 from alfred.common.file_lock import file_rmw_lock
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 from alfred.tier.daily_curation import load_daily_curation
 
 log = structlog.get_logger(__name__)
+
+#: ``append_promoted_item`` outcomes. ``REFUSED_UNSAFE_TARGET`` is arc #18's
+#: containment refusal — the caller must NOT record a decision on it.
+REFUSED_UNSAFE_TARGET = "refused_unsafe_target"
 
 # Ad-hoc T3 sources eligible for recurrence promotion — a free-text chore the operator typed or aspired
 # to, NOT a routine-origin surfaced item (which already lives in a routine record). See daily_curation
@@ -346,7 +351,26 @@ def append_promoted_item(
     routine`` + ``name``) if absent. ATOMIC locked-RMW under :func:`file_rmw_lock` (``mark_t3_done``
     parity). IDEMPOTENT: returns ``"duplicate"`` (no write) when an item whose ``query_key(text)``
     already matches is present — a re-approve never adds a second copy. Returns ``"appended"`` on write."""
-    path = Path(vault_path) / "routine" / f"{routine_record}.md"
+    # Arc #18 M4 containment gate. This writer is the family's most powerful
+    # primitive: unlike the completion writers it has NO ``.exists()`` gate,
+    # because absence is a supported branch (it seeds a new record below). So an
+    # escaping ``routine_record`` was arbitrary-file-CREATE, not merely
+    # overwrite — and the directory chain would be created too, twice over
+    # (``file_lock``'s ``mkdir(parents=True)`` plus ``_atomic_write_routine``'s).
+    #
+    # The gate therefore MUST precede ``file_rmw_lock`` — a check placed after
+    # it has already made directories at the out-of-vault target. Pinned by the
+    # debris assertion, not just by the file contents.
+    try:
+        path = resolve_in_vault(
+            vault_path, f"routine/{routine_record}.md",
+            writer="tier.promote.append_promoted_item",
+        )
+    except VaultContainmentError:
+        log.warning(
+            "tier.promote.path_escape_denied", routine_record=str(routine_record)[:200],
+        )
+        return REFUSED_UNSAFE_TARGET
     target_key = query_key(text)
     with file_rmw_lock(path):
         if path.exists():
@@ -402,6 +426,13 @@ def approve_proposal(
                 "proposal_id": proposal_id_}
     cadence = int(cadence_days) if cadence_days is not None else infer_cadence_days(p)
     write = append_promoted_item(vault_path, routine, text=p.sample_text, cadence_days=cadence)
+    if write == REFUSED_UNSAFE_TARGET:
+        # Containment refused the target. Do NOT record a decision: the proposal
+        # stays PENDING so the operator can re-approve against a real record.
+        # Recording it would burn the proposal on a typo/hostile name and leave
+        # no way back (the decided-set permanently excludes it from detection).
+        return {"error": f"routine target {routine!r} does not resolve inside the vault",
+                "proposal_id": proposal_id_}
     append_decision(config.decided_path, RecurrenceDecision(
         proposal_id=proposal_id_, decision=DECISION_APPROVE, operator=operator, decided_at=_now_iso()))
     log.info("tier.recurrence.approved", proposal_id=proposal_id_, routine=routine,

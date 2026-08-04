@@ -483,9 +483,12 @@ def test_routine_writer_identity_pin_cli_and_board(tmp_path: Path, monkeypatch) 
     real = _completion.mark_routine_item_done
     seen: list[str] = []
 
-    def _spy(record_path, item_text, date_):
+    def _spy(record_path, item_text, date_, **kwargs):
+        # ``**kwargs`` carries the arc-#18 required ``vault_path``; the spy is an
+        # identity pin, so it must forward whatever the writer's contract takes
+        # rather than freeze today's signature.
         seen.append(item_text)
-        return real(record_path, item_text, date_)
+        return real(record_path, item_text, date_, **kwargs)
 
     monkeypatch.setattr(_completion, "mark_routine_item_done", _spy)
 
@@ -517,9 +520,12 @@ def test_routine_undo_writer_identity_pin_cli_and_board(tmp_path: Path, monkeypa
     real = _completion.mark_routine_item_undone
     seen: list[str] = []
 
-    def _spy(record_path, item_text, date_):
+    def _spy(record_path, item_text, date_, **kwargs):
+        # ``**kwargs`` carries the arc-#18 required ``vault_path``; the spy is an
+        # identity pin, so it must forward whatever the writer's contract takes
+        # rather than freeze today's signature.
         seen.append(item_text)
-        return real(record_path, item_text, date_)
+        return real(record_path, item_text, date_, **kwargs)
 
     monkeypatch.setattr(_completion, "mark_routine_item_undone", _spy)
 
