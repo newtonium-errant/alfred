@@ -22,6 +22,17 @@ Security shape (the centerpiece — every rule is enforced answerer-side):
   * **Bounded projection is answerer-side.** ``max_matches`` caps the
     record count; ``snippet_max_chars`` caps each snippet (oversize →
     truncated + a ``truncated`` flag). The asker cannot request "full".
+  * **A snippet's frontmatter tier is a SUBSET of canonical disclosure.**
+    Record types whose substance lives in frontmatter (person/org/location
+    — their bodies are pure base-transclusion scaffolding) would otherwise
+    return template boilerplate. The snippet therefore leads with the
+    peer-visible frontmatter, projected through
+    :func:`~alfred.transport.canonical.apply_field_permissions` — the SAME
+    gate that serves ``GET /canonical/<type>/<name>`` and the
+    filtered-search return-field tier. Recall never gets its own notion of
+    what a peer may read, so it cannot drift wider than canonical; a peer
+    with no field grant for a type sees exactly the body-only snippet it
+    saw before (default-deny inherited for free).
   * **Every answer is audited.** One ``kind: "recall_read"`` line lands in
     the answerer's existing cross-instance-read trail
     (``canonical.audit_log_path``) — who asked, which types were
@@ -41,14 +52,16 @@ recall is disabled (the default) — a non-participant never even exposes
 the route (``/peer/recall`` → 404), which is the strongest reading of
 "an instance with no recall: section answers nothing."
 
-The pure helpers (:func:`resolve_search_types`, :func:`build_snippet`)
-carry the allowlist + projection logic with no I/O, so the semantics are
+The pure helpers (:func:`resolve_search_types`, :func:`build_snippet`,
+:func:`render_frontmatter_summary`, :func:`compose_recall_snippet`) carry
+the allowlist + projection logic with no I/O, so the semantics are
 unit-testable without spinning up an aiohttp app — same split as
 ``peer_search`` vs the ``/peer/search`` handler.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +123,75 @@ def resolve_search_types(
     return search, denied
 
 
+def _flatten_frontmatter(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    """Flatten a (already field-filtered) frontmatter dict to dotted pairs.
+
+    Mirrors the dotted-path shape ``apply_field_permissions`` writes, so
+    ``preferences.coding`` comes back out under that same dotted name.
+    """
+    out: list[tuple[str, Any]] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            out.extend(_flatten_frontmatter(v, f"{prefix}.{k}" if prefix else str(k)))
+    else:
+        out.append((prefix, value))
+    return out
+
+
+def _render_value(value: Any) -> str:
+    """One frontmatter value → a compact display string ("" when empty).
+
+    ``None`` renders empty (the caller drops the key). ``False`` renders
+    "False" — a set boolean is content, not absence.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(s for s in (str(v).strip() for v in value) if s)
+    return str(value).strip()
+
+
+def render_frontmatter_summary(
+    filtered: dict[str, Any],
+    granted: list[str],
+) -> tuple[str, list[str]]:
+    """Render the PEER-VISIBLE frontmatter as a compact ``key: value`` block.
+
+    ``filtered`` / ``granted`` are exactly what
+    :func:`~alfred.transport.canonical.apply_field_permissions` returned —
+    this function only FORMATS an already-authorised projection and can
+    never reach a field the gate withheld.
+
+    Field order follows ``granted`` (i.e. the operator's configured
+    allowlist order) so the rendering is deterministic and the operator
+    controls what leads. Empty values (``None``, ``""``, ``[]``) are
+    dropped rather than rendered as dangling keys — a person record's
+    unset ``phone:`` is absence, not content.
+
+    Returns ``(summary, rendered_fields)``. GRANTED and RENDERED are
+    deliberately different numbers: the gate grants on KEY PRESENCE, so a
+    granted-but-empty field (``aliases: []``) counts as granted and renders
+    nothing. Both travel to the log so an operator reading "granted 3,
+    rendered 2" can see WHICH field was empty instead of suspecting the
+    gate dropped it. This is the one place the drop-empty rule lives —
+    never re-derive the rendered set by re-parsing the summary.
+    """
+    if not filtered:
+        return "", []
+    order = {name: i for i, name in enumerate(granted)}
+    pairs = _flatten_frontmatter(filtered)
+    pairs.sort(key=lambda kv: (order.get(kv[0], len(order)), kv[0]))
+    lines: list[str] = []
+    rendered_fields: list[str] = []
+    for key, value in pairs:
+        rendered = _render_value(value)
+        if not rendered:
+            continue
+        lines.append(f"{key}: {rendered}")
+        rendered_fields.append(key)
+    return "\n".join(lines), rendered_fields
+
+
 def build_snippet(body: str, query: str, max_chars: int) -> tuple[str, bool]:
     """Return a bounded excerpt of ``body`` around the first ``query`` hit.
 
@@ -141,25 +223,166 @@ def build_snippet(body: str, query: str, max_chars: int) -> tuple[str, bool]:
     return snippet, truncated
 
 
+# Separates the peer-visible frontmatter head from the body excerpt.
+SNIPPET_SECTION_SEPARATOR = "\n\n"
+
+
+def compose_recall_snippet(
+    summary: str,
+    body: str,
+    query: str,
+    max_chars: int,
+) -> tuple[str, bool]:
+    """Frontmatter summary FIRST, then as much body excerpt as still fits.
+
+    ORDER IS LOAD-BEARING, not cosmetic. For the record types this exists
+    for (person/org/location), the body is pure base-transclusion
+    scaffolding — ``## Decisions``, ``![[person.base#Decisions]]``, … — and
+    the substance is entirely frontmatter. Body-first would spend the whole
+    ``max_chars`` budget on that scaffolding and truncate before reaching a
+    single real field, which is precisely the "names without meaning"
+    defect. Summary-first spends the budget on substance and lets the body
+    have the remainder.
+
+    Empty ``summary`` → byte-identical to today's body-only
+    :func:`build_snippet` (the degrade path: a peer with no field grant for
+    this type sees exactly what it saw before).
+
+    ``truncated`` stays honest in every branch — True whenever the snippet
+    does not cover everything, including when the body was dropped whole
+    for lack of remaining budget.
+    """
+    if not summary:
+        return build_snippet(body, query, max_chars)
+
+    head, head_trunc = truncate_answer(summary, max_chars)
+    if head_trunc:
+        # The authorised fields alone overflow the cap — the body can't fit
+        # and the head itself is a fragment.
+        return head, True
+
+    has_body = bool((body or "").strip())
+    remaining = max_chars - len(head) - len(SNIPPET_SECTION_SEPARATOR)
+    if remaining <= 0 or not has_body:
+        # Nothing left for the body (or no body at all). Truncated iff we
+        # actually withheld body content.
+        return head, has_body
+
+    tail, tail_trunc = build_snippet(body, query, remaining)
+    if not tail:
+        return head, False
+    return f"{head}{SNIPPET_SECTION_SEPARATOR}{tail}", tail_trunc
+
+
 # ---------------------------------------------------------------------------
 # I/O engine — search this instance's vault (reuses vault_search)
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class SnippetFieldStats:
+    """Disclosure accounting for one recall answer's snippets (observability).
+
+    Aggregated across every match so the answer emits ONE honest line about
+    what the frontmatter tier actually contributed — and, crucially, whether
+    the limiter was the CODE or the operator's field allowlist.
+    """
+
+    # GATE-GRANTED (config ceiling) vs ACTUALLY-RENDERED (non-empty on the
+    # records). Both are kept as NAME lists here — the rendered names drive
+    # the empty-signal branch — but the log emits granted as a list and
+    # rendered as a COUNT; the gap is what carries the diagnosis.
+    granted_fields: list[str] = field(default_factory=list)
+    rendered_fields: list[str] = field(default_factory=list)
+    records_with_frontmatter: int = 0
+    records_filtered_empty: int = 0
+
+
+def _peer_visible_frontmatter(
+    metadata: dict[str, Any],
+    *,
+    record_type: str,
+    peer: str,
+    peer_permissions: dict[str, Any] | None,
+) -> tuple[str, list[str]]:
+    """Project a record's frontmatter down to what THIS peer may already read.
+
+    THE security seam. Delegates to
+    :func:`~alfred.transport.canonical.apply_field_permissions` VERBATIM —
+    the same gate that serves ``GET /canonical/<type>/<name>`` and (per
+    ``peer_handlers._execute_filtered_search``) the filtered-search
+    return-field tier. Reusing it is the whole point: a recall snippet is
+    a SUBSET of what canonical would already disclose to this peer, by
+    construction rather than by a parallel rule that could drift.
+
+    Default-deny inherits for free — an unlisted peer, an unlisted type, or
+    an empty ``fields`` list all yield ``({}, [], ...)`` upstream, so this
+    returns ``("", [])`` and the snippet degrades to body-only.
+
+    Returns ``(summary_text, granted_fields, rendered_fields)``.
+    """
+    if not metadata:
+        return "", [], []
+    # Lazy import — keeps this module import-light for the pure-helper tests
+    # (same reason vault.ops is imported inside search_recall).
+    from .canonical import apply_field_permissions
+
+    # KEYWORD-bound, matching both other consumers of this gate
+    # (peer_handlers._execute_filtered_search and the /canonical/<type>/<name>
+    # handler). Positional binding on a security seam is a standing hazard:
+    # `peer` and `record_type` are both `str`, so a transposition type-checks,
+    # runs, and passes any test written against the same transposition —
+    # while silently looking up the wrong peer's grant. Keywords make a future
+    # signature change fail loudly instead.
+    filtered, granted, _denied = apply_field_permissions(
+        peer=peer,
+        record_type=record_type,
+        frontmatter=metadata,
+        perms=peer_permissions,
+    )
+    if not filtered:
+        return "", [], []
+    summary, rendered = render_frontmatter_summary(filtered, granted)
+    return summary, granted, rendered
+
+
 def _snippet_for_path(
-    vault_path: Path, rel_path: str, query: str, max_chars: int,
-) -> tuple[str, bool]:
-    """Load a record's body and build its bounded snippet. Never raises."""
+    vault_path: Path,
+    rel_path: str,
+    query: str,
+    max_chars: int,
+    *,
+    record_type: str,
+    peer: str,
+    peer_permissions: dict[str, Any] | None,
+) -> tuple[str, bool, list[str], list[str]]:
+    """Load a record and build its bounded snippet. Never raises.
+
+    The snippet leads with the peer-visible frontmatter (gated by
+    :func:`_peer_visible_frontmatter`) and fills the remaining budget with
+    the body excerpt. Returns
+    ``(snippet, truncated, granted_fields, rendered_fields)``; empty
+    ``rendered_fields`` means the frontmatter tier put nothing in the
+    snippet and it is exactly today's body-only projection.
+    """
     try:
         post = frontmatter.load(str(vault_path / rel_path))
         body = post.content or ""
+        metadata = dict(post.metadata or {})
     except Exception as exc:  # noqa: BLE001 — one bad record never fails recall
         log.warning(
             "transport.recall.snippet_read_failed",
             path=rel_path, error=str(exc),
         )
-        return "", False
-    return build_snippet(body, query, max_chars)
+        return "", False, [], []
+    summary, granted, rendered = _peer_visible_frontmatter(
+        metadata,
+        record_type=record_type,
+        peer=peer,
+        peer_permissions=peer_permissions,
+    )
+    snippet, truncated = compose_recall_snippet(summary, body, query, max_chars)
+    return snippet, truncated, granted, rendered
 
 
 def search_recall(
@@ -170,7 +393,9 @@ def search_recall(
     max_matches: int,
     snippet_max_chars: int,
     answerer_instance: str,
-) -> list[dict[str, Any]]:
+    peer: str,
+    peer_permissions: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], SnippetFieldStats]:
     """Search the allowed type dirs for ``query`` → bounded match list.
 
     Reuses the house search surface (:func:`alfred.vault.ops.vault_search`)
@@ -180,6 +405,14 @@ def search_recall(
     (``vault_search``'s ``re.escape`` grep, no fuzzy). Each hit gets a
     bounded snippet + a record pointer ``{instance, path}``. Stops at
     ``max_matches`` (the answerer-side projection cap).
+
+    ``peer`` + ``peer_permissions`` drive the snippet's frontmatter tier
+    (see :func:`_peer_visible_frontmatter`). They are REQUIRED, not
+    defaulted: a default would let a caller silently fall back to
+    body-only and quietly disable the tier at a production call site.
+
+    Returns ``(matches, field_stats)`` — the stats are the answer-level
+    disclosure accounting the handler logs.
     """
     # Lazy import — vault.ops pulls schema/scope (heavy) only when a
     # request actually fires, keeping this module import-light for tests
@@ -187,6 +420,9 @@ def search_recall(
     from alfred.vault.ops import vault_search
 
     matches: list[dict[str, Any]] = []
+    stats = SnippetFieldStats()
+    seen_fields: set[str] = set()
+    seen_rendered: set[str] = set()
     for rt in search_types:
         if len(matches) >= max_matches:
             break
@@ -222,11 +458,27 @@ def search_recall(
             if len(matches) >= max_matches:
                 break
             rel_path = hit.get("path", "")
-            snippet, truncated = _snippet_for_path(
-                vault_path, rel_path, query, snippet_max_chars,
+            match_type = hit.get("type") or rt
+            snippet, truncated, granted, rendered = _snippet_for_path(
+                vault_path,
+                rel_path,
+                query,
+                snippet_max_chars,
+                record_type=match_type,
+                peer=peer,
+                peer_permissions=peer_permissions,
             )
+            seen_fields.update(granted)
+            seen_rendered.update(rendered)
+            # Counted on RENDERED, not granted: a record whose granted fields
+            # were all empty contributed nothing to its snippet, and calling
+            # that "with_frontmatter" would overstate what the peer received.
+            if rendered:
+                stats.records_with_frontmatter += 1
+            else:
+                stats.records_filtered_empty += 1
             matches.append({
-                "type": hit.get("type") or rt,
+                "type": match_type,
                 "name": hit.get("name") or "",
                 "snippet": snippet,
                 "truncated": truncated,
@@ -235,7 +487,9 @@ def search_recall(
                     "path": rel_path,
                 },
             })
-    return matches
+    stats.granted_fields = sorted(seen_fields)
+    stats.rendered_fields = sorted(seen_rendered)
+    return matches, stats
 
 
 # ---------------------------------------------------------------------------
@@ -349,13 +603,18 @@ async def _handle_peer_recall(request: web.Request) -> web.StreamResponse:
         )
         return _json_error(503, "vault_not_configured", correlation_id=cid)
 
-    matches = search_recall(
+    matches, field_stats = search_recall(
         vault_path,
         search_types,
         query,
         max_matches=recall_cfg.max_matches,
         snippet_max_chars=recall_cfg.snippet_max_chars,
         answerer_instance=answerer,
+        peer=peer,
+        # The snippet's frontmatter tier is gated by the SAME per-peer field
+        # allowlist that serves /canonical/<type>/<name> — never a second,
+        # recall-only notion of what this peer may read.
+        peer_permissions=config.canonical.peer_permissions,
     )
 
     # Audit EVERY answer (including an empty match set) — the answerer's
@@ -392,7 +651,56 @@ async def _handle_peer_recall(request: web.Request) -> web.StreamResponse:
         match_count=len(matches),
         types_searched=list(search_types),
         denied_types=denied_types,
+        # Snippet frontmatter tier — the line that says whether the limiter is
+        # the CODE or the operator's allowlist.
+        #
+        # `_granted` is the config CEILING (what the gate allowed), not a
+        # record of what left the box — the explicit name matters because this
+        # sits beside disclosure-accounting siblings, and a bare
+        # `snippet_fields` reads as "what we disclosed" and over-reports.
+        #
+        # The GAP between the two is a third diagnosis neither gives alone:
+        #   granted=0                → no field grant; widen canonical.peer_permissions
+        #   granted=n, rendered=0    → grant is fine, the records are empty
+        #   granted > rendered > 0   → partial substance; nothing to action
+        # (kal-le/person's post-deploy state is the third: granted 3,
+        # rendered 2 — `aliases` is granted but empty.)
+        snippet_fields_granted=field_stats.granted_fields,
+        snippet_fields_rendered=len(field_stats.rendered_fields),
+        snippet_records_with_frontmatter=field_stats.records_with_frontmatter,
+        snippet_records_filtered=field_stats.records_filtered_empty,
     )
+
+    # Intentionally-left-blank, second signal: matches came back but NOTHING
+    # reached any snippet's frontmatter head, so every one is the old
+    # body-only projection. On a person/org query that is the "names without
+    # meaning" shape — surface it rather than letting a correct-looking 200
+    # hide it. Keyed on RENDERED (not granted) so the grant-exists-but-every
+    # -field-empty case fires too; `reason` tells the two apart, since they
+    # need different fixes.
+    if matches and not field_stats.rendered_fields:
+        no_grant = not field_stats.granted_fields
+        log.info(
+            "transport.recall.snippet_frontmatter_empty",
+            peer=peer,
+            instance=answerer,
+            correlation_id=cid,
+            match_count=len(matches),
+            types_searched=list(search_types),
+            reason="no_field_grant" if no_grant else "granted_fields_all_empty",
+            # Same key name as the `answered` event so ONE grep
+            # (`snippet_fields_granted`) reaches both sides of the story.
+            snippet_fields_granted=field_stats.granted_fields,
+            detail=(
+                "no canonical field grant for this peer × these types — "
+                "snippets are body-only (widen canonical.peer_permissions "
+                "to disclose frontmatter substance)"
+                if no_grant else
+                "the peer's granted fields are all EMPTY on these records — "
+                "snippets are body-only; the grant is fine, the records "
+                "(or the chosen fields) carry no value for it"
+            ),
+        )
 
     return web.json_response({
         "status": "ok",
