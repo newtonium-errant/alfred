@@ -142,6 +142,10 @@ Beyond the standard review checklist above, watch for these patterns on every si
 
 Hit 2026-08-04 (gate #27): a fresh reviewer shell resolved `npx`/`node` to the **Windows** Node under `/mnt/c` (stale fnm multishell dir); CMD.EXE rejected the WSL UNC path and `vitest run` exited 1 with "No test files found". A red OR green from that path is meaningless. Before trusting any web test count: `command -v node` must resolve to the Linux fnm install (`~/.local/share/fnm/node-versions/<ver>/installation/bin`); if not, prefix PATH with it. Also standard for web gates: symlink the main repo's `web/node_modules` into your extraction tree, and remove it after.
 
+Two extensions from gate #13 (same day, both nearly produced a fabricated number):
+- **The node trap poisons the PYTHON gate too**, not just vitest — `tests/test_scribe_pwa_client.py` shells out to `node` (41 environmental fails with the Windows node; 95 passed / 1 skipped with the Linux one).
+- **Never trust a bare exit code.** A suite chain ending in `| tail` exits 0 even when the interpreter itself is missing (`python` is not on PATH in a fresh agent shell — use the venv python). Assert BOTH that the interpreter resolves AND that a pytest summary line was actually produced before reporting any count.
+
 ## Architectural-twin precision-asymmetry audit
 
 When reviewing a commit that introduces a new gate inheriting a predicate from a prior gate (e.g. `47b1b75`'s `_filter_anchored_tags` reusing `db9392f`'s `_has_textual_presence`), compare the EXTRACTION strictness side-by-side. SHARED predicate ≠ SHARED precision.
