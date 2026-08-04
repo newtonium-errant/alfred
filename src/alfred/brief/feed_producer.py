@@ -262,6 +262,20 @@ def slot_suggestion_feed_items(
             title=title,
             evidence={
                 "tier": entry.tier,
+                # #18 slice 1 — the slot axis, alongside tier rather than
+                # instead of it. Tier is NOT removed: the completion-semantics
+                # matrix still keys on ``tier === 3`` for the free-text lane,
+                # and escalation / surface windows / all_t1_done are untouched.
+                #
+                # Emitted from stage 1 so the FE can be built and the rings
+                # swapped (stage 2) without a second producer change — a
+                # contract extension that arrives with its consumer is a
+                # contract nobody can forget to thread. ``slot_rule`` rides
+                # along because "Duty because the operator said so" and "Duty
+                # because it's a dated task" are different claims, and a card
+                # that eventually explains itself needs the distinction.
+                "slot": getattr(entry, "slot", "unslotted"),
+                "slot_rule": getattr(entry, "slot_rule", "no_signal"),
                 "origin": getattr(entry, "origin", ""),
                 "name": entry.name,
                 "path": getattr(entry, "path", ""),
