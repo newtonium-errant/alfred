@@ -392,6 +392,7 @@ def _live_key() -> str:
     return ""
 
 
+@pytest.mark.live_network
 @pytest.mark.skipif(not _live_key(), reason="no ELEVENLABS_API_KEY (dev-only live gate)")
 async def test_live_one_turn() -> None:
     cfg = WebVoiceTtsConfig(
