@@ -166,6 +166,10 @@ If you ever extend a dispatcher to inject a NEW env var, audit existing tests fo
 - `obsidian.py` — optional Obsidian CLI integration
 - `cli.py` — `alfred vault` subcommands (JSON output)
 
+### Health-status enumeration must handle `skip` (and unknown statuses fail OPEN)
+
+BIT/health statuses are `ok | warn | fail | skip` — and `skip` is the steady state on instances with unconfigured tools (KAL-LE: 7 permanently-skipped). Any code that enumerates or filters health statuses MUST handle `skip` explicitly; three same-day instances of the miss (2026-08-03/04): `kalle_digest` posture rendered "no BIT data" on a BIT-running instance; `feed_producer` emitted 7 undismissable daily SKIP cards (acked health cards revive — episode kind — and a warn→skip transition never cleared); `narration` spoke "7 tools need a look" every morning. The canonical predicate is `health_section.is_attention_status` / `QUIET_HEALTH_STATUSES` — consume it, never re-localize the comparison (a cross-surface drift pin guards this). Direction: quiet-list is a DENYLIST (`{ok, skip}`) so an unknown future status fails OPEN into a card — extra noise beats a missed outage.
+
 ### State & Data
 
 - Per-tool state: `data/{tool}_state.json` — tracks processed file hashes, sweep/run history
