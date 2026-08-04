@@ -199,14 +199,34 @@ export default function HomePage() {
         {mode === 'checkin' && (
           <section data-testid="compose-checkin" className="mt-6">
             <h2 className={titleClass}>Midday check-in</h2>
-            {/* The feed total (true) — distinct from the deck pill below, which is
-                the deck-able subset. In check-in the non-deck-able needs-you items
-                (slot_suggestion) are the rings above, so total = deck + rings. */}
+            {/* WHAT THIS NUMBER IS: open feed items flagged as needing a decision
+                (attention `needs_you`, or mode `decide` on older items), minus slot
+                items already completed today. That is all it is.
+
+                It used to claim `total = deck + rings`. That identity is false in
+                BOTH directions (#22 / D5), so it is stated nowhere now:
+                  * a slot_suggestion is deck-able when `ringItemSuggested`
+                    (isDeckDealt), so "slot_suggestion" and "non-deck-able" are not
+                    the same set; and
+                  * any kind with no wired deck verb is non-deck-able and is NOT in
+                    the rings either — so total - deck can include items that live
+                    in neither.
+                The real partition is deliberately NOT redrawn here: the
+                interface-reimagine arc's Decide/Awareness split will redraw these
+                buckets, and deciding it twice in weeks is waste. Copy says what is
+                COUNTED and where the counted things can be acted on — it does not
+                account for a remainder it cannot honestly place. */}
             <p data-testid="composer-needs-you" className={`mt-3 ${subtle}`}>
               {needsYouCount > 0
                 ? `${needsYouCount} thing${needsYouCount > 1 ? 's' : ''} need${needsYouCount > 1 ? '' : 's'} you.`
                 : 'Nothing needs you right now.'}
             </p>
+            {deckableCount > 0 && deckableCount < needsYouCount && (
+              <p data-testid="composer-needs-you-deckable" className={`mt-1 ${subtle}`}>
+                {deckableCount} of them can be handled in the deck; the rest are on
+                the feed.
+              </p>
+            )}
             {deckableCount > 0 && deckPill}
           </section>
         )}
