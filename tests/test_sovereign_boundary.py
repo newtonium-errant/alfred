@@ -193,12 +193,36 @@ def test_barrier_c_refused_signal_emitted():
 
 # --- barrier (c) .env-REINTRODUCTION ORDERING PIN ---------------------------
 
-def test_barrier_c_env_reintroduction_after_dotenv(tmp_path, monkeypatch):
+def test_barrier_c_env_reintroduction_after_dotenv(tmp_path, monkeypatch, request):
     """Proves the boundary runs AFTER the config-sibling .env auto-load:
     the launch wrapper scrubs the shell env (env -u), but a .env carrying a
     cloud key re-introduces it into os.environ (auto_load_dotenv gap-fill).
     Barrier (c), reading the LIVE os.environ, must still refuse."""
+    import os
+
     from alfred._env import auto_load_dotenv
+
+    # ``auto_load_dotenv`` below writes STRAIGHT into os.environ, and monkeypatch
+    # cannot undo it: ``delenv(..., raising=False)`` records nothing when the
+    # name is already absent, so there is no saved value to restore. Without an
+    # explicit finalizer the injected key leaks into every later test in the
+    # session, un-gating credential-gated tests downstream. Caught by
+    # tests/test_suite_egress_guard.py::test_collection_leaves_no_credential_env_vars.
+    #
+    # Snapshot-and-restore rather than pop-on-teardown: finalizer vs fixture
+    # ordering is not something this test should depend on, and an unconditional
+    # pop would delete a key the operator genuinely exported if it ran after
+    # monkeypatch had already restored it.
+    _pre_cloud_keys = {k: os.environ.get(k) for k in CLOUD_KEY_ENV_VARS}
+
+    def _restore_cloud_keys():
+        for key, value in _pre_cloud_keys.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    request.addfinalizer(_restore_cloud_keys)
 
     # Simulate `env -u ANTHROPIC_API_KEY ...` — the shell env is scrubbed.
     for key in CLOUD_KEY_ENV_VARS:

@@ -408,9 +408,25 @@ def _install_egress_recorder() -> None:
     socket.getaddrinfo = getaddrinfo
     socket.socket.connect = connect
     socket.socket.connect_ex = connect_ex
+    return connect
 
 
-_install_egress_recorder()
+# Kept so the guard can tell whether it is still the live patch — see
+# ``_guard_is_live``. LAST PATCH WINS: a test that installs its own
+# ``socket.socket.connect`` patch (tests/feed/test_brief_feed_parity.py does,
+# for its own narrower egress pin) REPLACES this one for the duration of that
+# test, and this guard sees nothing. That is not hypothetical — it is why
+# reviewer-posture's #12 prototype missed the very pin that was attempting
+# egress. The guard cannot prevent being shadowed, so it reports it: a test the
+# guard could not observe is listed as UNVERIFIED rather than counted as clean.
+_OUR_CONNECT_HOOK = _install_egress_recorder()
+
+# nodeids where our patch was not the live one at teardown.
+_unverified_tests: list[str] = []
+
+
+def _guard_is_live() -> bool:
+    return socket.socket.connect is _OUR_CONNECT_HOOK
 
 
 def pytest_configure(config):
@@ -479,31 +495,60 @@ _ENV_BASELINE = dict(os.environ)
 _CREDENTIAL_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
 
+# What collection injected, recorded before it is scrubbed. This is the fact
+# ``test_collection_leaves_no_credential_env_vars`` asserts on — deliberately a
+# RECORDING rather than a live os.environ check at test time. A live check would
+# also catch credentials left behind by any earlier TEST, which is a different
+# and much broader contract: the CLI dispatchers inject ALFRED_TRANSPORT_TOKEN
+# and friends into os.environ by documented design (see CLAUDE.md, "Dispatcher
+# env-var injection"). Conflating the two would make the pin fail for a reason
+# it is not about, and the fix would be to weaken the pin.
+_collection_injected: list[str] = []
+
+
 def pytest_collection_finish(session):
     """Undo credential env vars introduced during collection/import.
 
     Runs after every test module is imported and before any test executes —
     the only window where the pollution exists but has not yet been read.
     """
-    injected = [
+    injected = sorted(
         name
         for name in list(os.environ)
         if name not in _ENV_BASELINE
         and name.endswith(_CREDENTIAL_ENV_SUFFIXES)
-    ]
+    )
     for name in injected:
         del os.environ[name]
+    _collection_injected[:] = injected
     if injected:
         # ILB: a silent scrub would be indistinguishable from "the import side
         # effect went away", and the next person would not know why the live
         # tests skip.
-        session.config._alfred_scrubbed_env = sorted(injected)
+        session.config._alfred_scrubbed_env = injected
 
 
 def pytest_runtest_protocol(item, nextitem):  # noqa: ARG001
     global _current_nodeid
     _current_nodeid = item.nodeid
     return None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """Detect shadowing while it is still observable.
+
+    Checked HERE and not in a teardown fixture: the shadowing patch is usually
+    installed by ``monkeypatch``, which reverts during teardown. Autouse
+    fixtures are set up before explicitly-requested ones and so tear down after
+    them, meaning by the time a teardown check runs our hook is already restored
+    and the shadow has vanished. Measured — a teardown check reported
+    test_brief_feed_parity as clean despite its patch having been live for the
+    whole test body. Wrapping the CALL phase looks at the moment that matters.
+    """
+    yield
+    if not _guard_is_live():
+        _unverified_tests.append(item.nodeid)
 
 
 @pytest.fixture(autouse=True)
@@ -583,6 +628,16 @@ def pytest_terminal_summary(terminalreporter, *a, **kw):  # noqa: ARG001
         if len(hosts) > 10:
             w(f"    ... and {len(hosts) - 10} more")
 
-    if not stray and not connected_any and not dns_tests:
+    if _unverified_tests:
+        w("")
+        w(f"suite egress guard: {len(_unverified_tests)} test(s) UNVERIFIED — "
+          f"another socket patch was live, so this guard could not observe them "
+          f"(last patch wins). Not a failure; those tests carry their own pin.")
+        for nodeid in _unverified_tests[:5]:
+            w(f"    {nodeid}")
+        if len(_unverified_tests) > 5:
+            w(f"    ... and {len(_unverified_tests) - 5} more")
+
+    if not stray and not connected_any and not dns_tests and not _unverified_tests:
         w("")
         w("suite egress guard: ACTIVE, no non-loopback traffic observed.")
