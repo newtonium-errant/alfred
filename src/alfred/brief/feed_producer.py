@@ -24,6 +24,11 @@ from pathlib import Path
 from typing import Any
 
 from alfred.feed import FeedItem
+from alfred.health.types import Status
+
+from .utils import get_logger
+
+log = get_logger(__name__)
 
 _SOURCE_REF = {"producer": "brief"}
 
@@ -60,11 +65,42 @@ def health_feed_items(
     *,
     instance: str,
 ) -> list[FeedItem] | None:
-    """One ``health`` item per NON-OK tool in the latest BIT record (stable key =
-    tool name). All-ok (record present, every tool ok) → ``[]`` so reconcile marks
-    stale warns acted. NO record / read error → ``None`` (can't confirm health;
-    don't mass-``acted`` on missing data)."""
-    from .health_section import _find_latest_bit_record, _per_tool_lines
+    """One ``health`` item per ATTENTION-status tool in the latest BIT record
+    (stable key = tool name). Attention = warn/fail, and any unrecognised status
+    — see :func:`~.health_section.is_attention_status`. Nothing needing attention
+    (record present, every tool ok and/or skip) → ``[]`` so reconcile marks stale
+    warns acted. NO record / read error → ``None`` (can't confirm health; don't
+    mass-``acted`` on missing data).
+
+    **``skip`` produces no card.** A skipped check is "this did not apply"
+    (unconfigured tool, fresh install), which is a standing config fact rather
+    than news, and on an instance with unconfigured tools it is a PERMANENT fact:
+    KAL-LE's measured BIT is ``tool_counts {ok: 5, warn: 0, fail: 0, skip: 7}``,
+    so the old ``status == "ok"`` filter carded all 7 every morning. Those cards
+    could not be dismissed — ``health`` is an episode kind (absent from
+    ``feed.model.SNAPSHOT_FINGERPRINT_FIELDS``), so ``_revival_suppressed``
+    declines to suppress and reconcile REVIVES an acked card on the next fire.
+    Suppressing them also restores two properties the old filter broke on any
+    skip-bearing instance:
+
+      * the genuine-empty ``[]`` became unreachable (``out`` always held the 7),
+        so the all-clear path this docstring promises was dead code there;
+      * a tool going warn → skip kept the SAME stable key in the open set, so it
+        was never ABSENT and its warn card never cleared — it silently became a
+        permanently-open "Health: <tool> SKIP" card.
+
+    No information is lost: ``health_section._render_from_frontmatter`` renders
+    every tool unfiltered, so skips stay visible in the brief's Health section.
+    The feed is the attention surface; that section is the status surface. If a
+    particular skip ever IS news, the fix belongs in the BIT check that assigns
+    the status (make it warn/fail), not here — severity is the health layer's
+    call, not the feed's.
+    """
+    from .health_section import (
+        _find_latest_bit_record,
+        _per_tool_lines,
+        is_attention_status,
+    )
 
     vault = Path(vault_path)
     try:
@@ -75,8 +111,15 @@ def health_feed_items(
     except OSError:
         return None
     out: list[FeedItem] = []
+    quiet: list[str] = []
     for tool, status, detail in _per_tool_lines(body):
-        if status == "ok":
+        if not is_attention_status(status):
+            # Log the SUPPRESSED ones an operator might expect a card for. A
+            # plain ``ok`` never raised that question, so it would be pure noise;
+            # today that leaves exactly ``skip``, but the condition is written
+            # against the quiet SET so it keeps reporting if that set ever grows.
+            if status != Status.OK.value:
+                quiet.append(tool)
             continue
         title = f"Health: {tool} {status.upper()}" + (f" — {detail}" if detail else "")
         out.append(FeedItem.create(
@@ -87,6 +130,18 @@ def health_feed_items(
             evidence={"tool": tool, "status": status, "detail": detail},
             source_ref=dict(_SOURCE_REF, record=str(record)),
         ))
+    if quiet:
+        # ILB: "ran, chose not to card these". Without this line, an operator
+        # asking "why is there no health card for my skipped tool?" has only
+        # silence to read, which is indistinguishable from a broken producer.
+        log.info(
+            "brief.health_feed_quiet_tools",
+            count=len(quiet),
+            tools=sorted(quiet),
+            instance=instance,
+            reason="status is not attention-worthy (skip = check did not apply); "
+                   "still rendered in the brief's Health section",
+        )
     return out
 
 

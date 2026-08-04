@@ -11,7 +11,8 @@ inputs — the gate surface, no I/O. Headline gates:
   * ILB empty state — no speakable content → ``BriefNarration.empty`` True.
   * Weather demote ruling — calm weather omits the slide; severe (IFR / gust /
     low-vis) includes it.
-  * Say-less health — all-green is one line; non-ok names the tools.
+  * Say-less health — nothing needing attention is one line; warn/fail (and any
+    unrecognised status) names the tools; ``skip`` is NOT "needs a look".
   * Empty sources omit their slide (no empty narration segments).
 
 Tests run unconditionally per ``feedback_regression_pin_unconditional.md``.
@@ -166,7 +167,15 @@ def test_health_all_green_one_line() -> None:
     assert len(hs) == 1 and hs[0].text == "All systems green."
 
 
-def test_health_non_ok_names_tools() -> None:
+def test_health_unrecognised_status_names_tools() -> None:
+    """An unrecognised status ("error" is not a ``Status`` value) still names the
+    tool — the attention predicate is a denylist, so unknown fails OPEN.
+
+    Renamed from ``test_health_non_ok_names_tools``: "non-ok" is the exact
+    terminology that encoded the skip-blindness, and this pin is load-bearing in
+    the other direction — it independently fails if the predicate is narrowed to
+    an allowlist of {warn, fail}.
+    """
     narr = _compose(health=[("curator", "ok", ""), ("janitor", "error", "boom")])
     hs = [s for s in narr.segments if s.section_id == SECTION_HEALTH]
     assert len(hs) == 1 and "janitor" in hs[0].text and "curator" not in hs[0].text
@@ -175,6 +184,61 @@ def test_health_non_ok_names_tools() -> None:
 def test_no_health_data_omits_slide() -> None:
     narr = _compose(health=[])
     assert not any(s.section_id == SECTION_HEALTH for s in narr.segments)
+
+
+# --- skip is not "needs a look" (#8, the narration half) ---------------------
+#
+# ``_health_text`` had the same skip-blindness as the feed's health cards — a
+# local ``s.lower() != "ok"``. Both now call the one canonical
+# ``health_section.is_attention_status``.
+
+
+def _kalle_health() -> list[tuple[str, str, str]]:
+    """KAL-LE's measured BIT shape: 5 ok + 7 skip, nothing wrong."""
+    return [
+        ("curator", "ok", ""), ("janitor", "ok", ""), ("distiller", "ok", ""),
+        ("brief", "ok", ""), ("surveyor", "ok", ""),
+        ("talker", "skip", ""), ("mail", "skip", ""), ("gcal", "skip", ""),
+        ("weather", "skip", ""), ("transport", "skip", ""),
+        ("scribe", "skip", ""), ("peer", "skip", ""),
+    ]
+
+
+def test_health_skipped_tools_do_not_need_a_look() -> None:
+    """5 ok + 7 skip speaks the green line, NOT "7 tools need a look".
+
+    Mutation: restore ``s.lower() != "ok"`` → this fails (the segment names all
+    seven unconfigured tools as needing attention, every morning).
+    """
+    narr = _compose(health=_kalle_health())
+    hs = [s for s in narr.segments if s.section_id == SECTION_HEALTH]
+    assert len(hs) == 1
+    assert hs[0].text == "All systems green."
+
+
+def test_health_skip_alongside_warn_names_only_the_warn() -> None:
+    """Preservation pin: a real warn is still spoken, and the skips are not."""
+    narr = _compose(health=_kalle_health() + [("surveyor2", "warn", "ollama 404")])
+    hs = [s for s in narr.segments if s.section_id == SECTION_HEALTH]
+    assert len(hs) == 1
+    assert "1 tool needs a look" in hs[0].text
+    assert "surveyor2" in hs[0].text
+    assert "talker" not in hs[0].text
+
+
+def test_health_all_skipped_does_not_claim_green() -> None:
+    """Zero probes passed → say so rather than claiming a clean bill of health.
+
+    Mirrors the ratified skip-posture ruling in
+    ``kalle_digest._render_skip_posture``: skips alongside PASSING probes are
+    green, but green on zero passing probes would claim checks passed on the
+    strength of no evidence. Suppressing skips is what makes this case reachable
+    (it used to fall into the "needs a look" branch).
+    """
+    narr = _compose(health=[("talker", "skip", ""), ("mail", "skip", "")])
+    hs = [s for s in narr.segments if s.section_id == SECTION_HEALTH]
+    assert len(hs) == 1
+    assert hs[0].text == "No health checks ran this morning."
 
 
 # --- empty sources omit their slide -----------------------------------------

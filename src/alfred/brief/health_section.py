@@ -34,9 +34,49 @@ from typing import Any
 
 import yaml
 
+from alfred.health.types import Status
+
 from .utils import SectionReadStatus, get_logger, safe_read_section_file
 
 log = get_logger(__name__)
+
+
+# Statuses that are NOT operator-attention news. Consumers that build an
+# ATTENTION surface (the feed's health cards, the narration's health glance)
+# filter these out; the STATUS surface (``_render_from_frontmatter`` below)
+# renders every tool unfiltered, so suppressing here loses no information —
+# a skipped tool is still visible in the brief's Health section every morning.
+#
+# ``skip`` is in here because it means "this check did not apply" (unconfigured
+# tool, fresh install, nothing to probe) — a standing config fact, not news. On
+# an instance with several unconfigured tools it is a PERMANENT fact, so carding
+# it produces a card that can never be dismissed: ``health`` is an episode kind
+# (absent from ``feed.model.SNAPSHOT_FINGERPRINT_FIELDS``), so reconcile revives
+# an acked card on the next fire, every morning, forever.
+#
+# DENYLIST, not an allowlist, and the direction is deliberate: an unrecognised
+# status (a future 5th Status value, or a hand-edited record) falls through to
+# ATTENTION and gets surfaced. For a health surface, an extra card costs noise
+# while a dropped card costs a missed outage — so unknown statuses must fail
+# OPEN. Same philosophy as ``kalle_digest._render_posture_line``, which gives an
+# unrecognised BIT status its own copy rather than laundering it into green.
+QUIET_HEALTH_STATUSES = frozenset({Status.OK.value, Status.SKIP.value})
+
+
+def is_attention_status(status: str) -> bool:
+    """Whether a per-tool BIT status warrants an operator-attention surface.
+
+    ``True`` for warn/fail (and any unrecognised status — see
+    :data:`QUIET_HEALTH_STATUSES` for why unknown fails open), ``False`` for
+    ok/skip. Case-insensitive: ``_per_tool_lines`` already lowercases, but the
+    frontmatter path and hand-edited records do not always.
+
+    CANONICAL — the feed producer and the narration both call this rather than
+    re-deriving ``status != "ok"``. Two copies of that comparison is exactly how
+    this drifted: both had it, both were skip-blind, and fixing one would have
+    left the other narrating "7 tools need a look" every morning.
+    """
+    return (status or "").strip().lower() not in QUIET_HEALTH_STATUSES
 
 
 def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
