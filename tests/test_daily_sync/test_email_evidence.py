@@ -99,6 +99,8 @@ def _seed(vault: Path, name: str, *, message_id: str, body: str) -> str:
     (vault / "note").mkdir(parents=True, exist_ok=True)
     fm = {
         "type": "note", "name": name, "priority": "high",
+        # #40 — genuine email note ⇒ carries the provenance marker.
+        "email_derived": True,
         "priority_reasoning": "reply-required", "action_hint": "calendar",
         "email_message_id": message_id,
     }

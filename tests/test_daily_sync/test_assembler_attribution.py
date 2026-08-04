@@ -59,6 +59,13 @@ def _seed_email_note(vault: Path, name: str, *, priority: str) -> None:
         "name": name,
         "tags": [],
         "priority": priority,
+        # #40 — genuine email notes carry the provenance marker. The old
+        # sampler inferred mail-ness from the priority stamp alone; these
+        # fixtures encoded that assumption, which is why they broke when the
+        # proxy was retired. They represent REAL email notes (note the
+        # **From:**/**Subject:** headers), so the marker is what production
+        # writes for them at structuring time.
+        "email_derived": True,
         "action_hint": "calendar",
         "priority_reasoning": "test",
     }

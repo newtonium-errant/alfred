@@ -616,6 +616,32 @@ async def _process_file(
     )
     state_mgr.save()
 
+    # Mail provenance marker (#40). Stamped HERE, at structuring time, and
+    # NOT inside either mail post-pass below: both are independently opt-in,
+    # and the filing pass returns before writing on its no-category branch
+    # (its own docstring calls that "the common case for personal mail /
+    # newsletters"). A marker that is absent whenever a config block is off, or
+    # whenever a category didn't match, cannot be the thing a consumer trusts.
+    #
+    # This is the ARRIVAL fact the curator actually knows: it just structured
+    # these notes from inbox content it can identify as email-shaped. It runs
+    # regardless of whether either classifier is enabled, and it writes one
+    # additive field — never priority/action_hint/priority_reasoning, since
+    # conflating the provenance axis with the tier axis is exactly the #40 bug.
+    if files_created:
+        try:
+            from alfred.curator.mail_provenance import stamp_email_provenance
+            from alfred.email_classifier import is_email_inbox
+
+            if is_email_inbox(inbox_content):
+                await asyncio.to_thread(
+                    stamp_email_provenance,
+                    config.vault.vault_path,
+                    files_created,
+                )
+        except Exception:  # noqa: BLE001 — must never crash the daemon
+            log.exception("daemon.mail_provenance_error", file=filename)
+
     # Email-classifier post-processor (per-instance, opt-in). Runs in
     # a thread so the synchronous Anthropic SDK call doesn't block the
     # asyncio loop. Failures are logged + swallowed — classification
