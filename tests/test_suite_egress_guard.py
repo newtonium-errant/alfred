@@ -16,11 +16,16 @@ from __future__ import annotations
 
 import socket
 
+from alfred.sovereign.boundary import CLOUD_KEY_ENV_VARS
 from tests.conftest import (
+    _CREDENTIAL_ENV_SUFFIXES,
     _collection_injected,
     _egress_exempt,
     _guard_is_live,
+    _inventory_live_network,
     _is_ip_literal,
+    _leaked_cloud_keys,
+    _live_network_tests,
 )
 
 
@@ -64,6 +69,124 @@ def test_collection_leaves_no_credential_env_vars() -> None:
         f"This un-gates every skipif(not os.environ.get(...)) integration test, "
         f"so the suite starts calling real paid APIs."
     )
+
+
+# --- the cloud-credential leak check (#28 WARN-1) ---------------------------
+
+
+def test_cloud_key_leak_is_detected(monkeypatch) -> None:
+    """The predicate the autouse teardown fires on sees a test-time leak.
+
+    Uses ``monkeypatch`` deliberately, which does double duty: it exercises the
+    detector, AND it demonstrates the property that keeps the check from being a
+    nuisance — autouse fixtures tear down AFTER explicitly-requested ones, so
+    this setenv is already reverted by the time the teardown check runs and this
+    test does not fail itself.
+
+    Mutation: make ``_leaked_cloud_keys`` return ``[]`` → this fails.
+    """
+    assert _leaked_cloud_keys() == []
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "DUMMY_ANTHROPIC_TEST_KEY")
+    assert "ANTHROPIC_API_KEY" in _leaked_cloud_keys()
+
+
+def test_operator_exported_keys_are_not_leaks(monkeypatch) -> None:
+    """A key present at startup is the operator's, not a leak.
+
+    Without the baseline comparison, anyone who exports a key to run the
+    key-gated live tests would have EVERY test fail — and the obvious fix would
+    be to delete the check.
+    """
+    monkeypatch.setitem(_baseline_for_test(), "GROQ_API_KEY", "operator-value")
+    monkeypatch.setenv("GROQ_API_KEY", "operator-value")
+    assert "GROQ_API_KEY" not in _leaked_cloud_keys()
+
+
+def _baseline_for_test():
+    """The conftest baseline dict, by reference (monkeypatch.setitem needs it)."""
+    from tests import conftest
+
+    return conftest._ENV_BASELINE
+
+
+def test_cloud_keys_are_disjoint_from_dispatcher_injection() -> None:
+    """The assumption that makes a LIVE per-test check safe.
+
+    The collection pin refuses to inspect live os.environ because its predicate
+    is the SUFFIX set — which includes ``_TOKEN`` and so matches
+    ``ALFRED_TRANSPORT_TOKEN``, injected by the CLI dispatchers by documented
+    design. The cloud-key check can be live precisely because it matches exact
+    NAMES with no such overlap.
+
+    If someone adds an ``ALFRED_*`` name to ``CLOUD_KEY_ENV_VARS``, that
+    reasoning silently stops holding and the teardown check starts failing
+    honest dispatcher tests. This fails first, and says why.
+    """
+    offenders = [n for n in CLOUD_KEY_ENV_VARS if n.startswith("ALFRED_")]
+    assert offenders == [], (
+        f"{offenders} are dispatcher-namespace names. The CLI dispatchers write "
+        f"ALFRED_* into os.environ by design, so the per-test cloud-key leak "
+        f"check would fail tests that are behaving correctly."
+    )
+    # The suffix predicate WOULD have collided — which is why the collection pin
+    # is scoped to a recording and this one is scoped to explicit names.
+    assert any(n.endswith(_CREDENTIAL_ENV_SUFFIXES) for n in CLOUD_KEY_ENV_VARS)
+    assert "ALFRED_TRANSPORT_TOKEN".endswith(_CREDENTIAL_ENV_SUFFIXES)
+
+
+# --- live_network exemption inventory (#28 NOTE-1) --------------------------
+
+
+def test_live_network_inventory_finds_marked_items() -> None:
+    """The inventory predicate itself, driven with stub items.
+
+    Stub ITEMS, not a stub inventory — the function under assertion is the
+    production one.
+    """
+
+    class _Item:
+        def __init__(self, nodeid: str, marked: bool) -> None:
+            self.nodeid = nodeid
+            self._marked = marked
+
+        def get_closest_marker(self, name: str):
+            return object() if (self._marked and name == "live_network") else None
+
+    # Marked items are supplied in the order b, a, c — deliberately neither
+    # sorted NOR reverse-sorted, so the assertion pins the SORT rather than
+    # accidentally matching input order (with two items every input order is
+    # either sorted or its reverse, and a dropped sort slips through).
+    items = [
+        _Item("t/b.py::marked", True),
+        _Item("t/x.py::plain", False),
+        _Item("t/a.py::marked", True),
+        _Item("t/c.py::marked", True),
+    ]
+    assert _inventory_live_network(items) == [
+        "t/a.py::marked",
+        "t/b.py::marked",
+        "t/c.py::marked",
+    ]
+    assert _inventory_live_network([]) == []
+
+
+def test_live_network_inventory_matches_this_session(request) -> None:
+    """The hook WIRING: what the summary prints must match what was collected.
+
+    Scoped to whatever selection is running, which is what makes it honest — on
+    a narrow selection with no marked tests both sides are empty and this says
+    nothing; on the full suite it is exact.
+
+    That scaling is the point. An earlier version of this pin asserted only the
+    SHAPE of ``_live_network_tests`` and stayed green with the inventory line
+    deleted from ``pytest_collection_finish`` — green against a build with no
+    feature. Comparing against the live session's own items is what closes it.
+
+    Mutation: delete the ``_live_network_tests[:] = ...`` assignment from
+    ``pytest_collection_finish`` → this fails on any run that collects a marked
+    test (the full suite does; three hold the marker).
+    """
+    assert _live_network_tests == _inventory_live_network(request.session.items)
 
 
 def test_guard_is_installed() -> None:
