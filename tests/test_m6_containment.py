@@ -457,6 +457,39 @@ async def test_instructor_absolute_record_path_is_refused(
     assert _snapshot_outside(tmp_path, vault) == before
 
 
+async def test_instructor_gate_accepts_a_legitimate_path_on_a_symlinked_vault(
+    tmp_path: Path, symlinked_vault: Path,
+) -> None:
+    """Standard (d) for the fourth writer — production's shape.
+
+    The assertion is the RAISE TYPE, not a return value. A legitimate record on
+    a symlinked vault must clear the gate and enter ``execute``, which then dies
+    in ``_load_skill`` on the absent skills bundle. That FileNotFoundError is
+    the proof of depth: if the containment gate had wrongly refused the resolved
+    path, ``execute_and_record`` would have RETURNED an error result instead and
+    never raised at all.
+    """
+    from alfred.instructor.executor import execute_and_record
+    from alfred.instructor.state import InstructorState
+
+    (symlinked_vault / "person" / "Ben.md").write_text(
+        "---\ntype: person\nname: Ben\n---\n\nBody.\n", encoding="utf-8",
+    )
+
+    with structlog.testing.capture_logs() as cap:
+        with pytest.raises(FileNotFoundError):
+            await execute_and_record(
+                client=None,
+                directive="do a thing",
+                record_path="person/Ben.md",
+                config=_instructor_config(symlinked_vault, tmp_path),
+                state=InstructorState(tmp_path / "s.json"),
+                skills_dir=tmp_path / "absent_skills",
+            )
+
+    assert _escapes(cap) == []
+
+
 def test_instructor_execute_no_longer_composes_a_dead_path() -> None:
     """``execute`` used to build ``md_path = vault_path / record_path`` and never
     read it. M6 removed the composition rather than gating it — a gate on a path
