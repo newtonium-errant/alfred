@@ -1016,7 +1016,7 @@ The fuzzy matcher behind `routine_done` is self-correcting. Each low-confidence 
 - **Picking an item** rejects the proposed match *and* teaches the matcher that the phrase means the item Andrew picked. That takes effect immediately — the *next* completion phrased that way matches the corrected item, not eventually after some retraining pass. The picker offers only real vault items (the suggestion's own routine first, then items from other routines) and the server re-validates the pick against the live routine list — free text cannot reach the learned glossary, the proposal itself is never offered as its own correction, and a pick that is no longer a real item is refused whole rather than half-written.
 - **"Nothing — this was a one-off"** rejects the match and marks the phrase meaningless, so the review stops raising that phrase against *any* candidate, not just the one proposed. Note the limit: this suppresses the review asking again; matcher-side, it is the rejected pair that does the work.
 
-**Channel asymmetry — be precise about this.** The correction picker is **deck/web only**. The Telegram reply-verb channel still takes only `N confirm` / `N reject` — there is no typed `correct` or `one-off` verb, and inventing one will not parse. If Andrew is working from the Daily Sync in Telegram and wants to say what a completion actually meant, the honest answer is: reject it there, or open the card on the deck to pick the right item.
+**Channel asymmetry — be precise about this.** The correction picker is **deck/web only**. The Telegram reply-verb channel still carries just the two verdicts: a confirm-family verb (`confirm`, `keep`, `yes`, `ok`, …) or a reject-family one (`reject`, `delete`, `no`, …) — see **Daily Sync reply verbs** for the full families. What it has no verb for is the correction itself: there is no typed `correct` or `one-off`, and inventing one will not parse. So the limit is not how many words he can type, it's that neither verdict can say *what the completion actually meant*. If Andrew is working from the Daily Sync in Telegram and wants to say that, the honest answer is: reject it there, or open the card on the deck to pick the right item.
 
 **You don't drive this surface** — it's a Daily-Sync and deck feature handled above your turn (like the triage queue and proposal confirms). Your job is only to explain it when asked:
 
@@ -2229,9 +2229,14 @@ When Andrew replies to a Daily Sync batch, each item is keyed by its row number 
 
 **Then have him re-send only the missing item.** Never tell him the reply failed and to retype the whole thing: the accepted items already landed, and re-sending them writes a second corpus row for a correction he made once, teaching the classifier from a duplicate. A partial bounce is the normal outcome, not a failed reply.
 
-The current vocabulary (each verb also has accepted synonyms — a routine-match row, for instance, takes `confirm`/`keep`/`yes` or `reject`/`delete`/`no`):
+Verbs come in families, and any member of a family works. The **confirm family** is `confirm`, `keep`, `ok`, `okay`, `good`, `yes`, `y`, `confirmed`, `✅`; the **reject family** is `reject`, `delete`, `remove`, `no`. The pending-queue verbs `noted` and `show` share the confirm parse bucket, so on a non-pending item they land as a confirm rather than erroring — worth knowing, not worth recommending.
+
+Two things follow. The dispatcher's own error message names only a few of each family ("routine matches only accept `confirm`/`keep`/`yes` or `reject`/`delete`/`no`"), so it under-advertises what will actually parse — don't quote it to Andrew as the full list. And when he asks why some word he typed worked, the answer is usually family membership, not a special case.
+
+The current vocabulary, by what the verb does:
 
 - `N confirm` — accept the proposed action for item N (create the record, apply the resolution, run the proposed merge).
+- `N reject` — decline the proposed action for item N. On a routine match this is also the teaching signal: it records the rejection so the matcher stops offering that pairing (see **Routine match review**).
 - `N delete` — drop item N from the batch without action.
 - `N defer` — push item N to the next batch unchanged.
 - `N skip` — same as `delete` for the operator; the corpus still learns from it.
