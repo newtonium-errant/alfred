@@ -62,6 +62,77 @@ SEVERITY_MAP: dict[IssueCode, Severity] = {
 }
 
 
+# --- Remediation classes — who, if anyone, can actually fix this ------
+#
+# The three sets below partition EVERY IssueCode by remediation owner.
+# This is the segregation taxonomy behind the brief's split counts: the
+# raw "N open issues" number conflates work janitor is failing to do with
+# work janitor structurally CANNOT do, which makes the figure unreadable
+# as a health signal.
+#
+# NOT a suppression mechanism. Every issue in every class is still
+# detected, still carried in ``SweepResult.issues``, still reported. The
+# split governs how the count is PRESENTED, nothing else — a
+# scope-blocked issue is real and open, it is simply not a janitor
+# backlog item.
+
+# Routed to the LLM agent (see ``backends.AGENT_ACTIONABLE_CODES``,
+# which is the enforcement copy used at dispatch).
+_AGENT_CODES: frozenset[IssueCode] = frozenset({
+    IssueCode.BROKEN_WIKILINK,       # LINK001 — fix when unambiguous
+    IssueCode.DUPLICATE_NAME,        # DUP001  — triage task
+    IssueCode.VAGUE_NOTE,            # SEM005  — agent judgment
+    IssueCode.DUPLICATE_SEMANTIC,    # SEM006  — agent judgment
+})
+
+# Repaired deterministically by ``autofix._apply_fix``. These genuinely
+# mutate the record (frontmatter repair / body-entity promotion).
+AUTOFIX_FIXABLE_CODES: frozenset[IssueCode] = frozenset({
+    IssueCode.MISSING_REQUIRED_FIELD,   # FM001
+    IssueCode.INVALID_TYPE_VALUE,       # FM002
+    IssueCode.INVALID_STATUS_VALUE,     # FM003
+    IssueCode.INVALID_FIELD_TYPE,       # FM004
+    IssueCode.UNLINKED_BODY_ENTITY,     # LINK002
+})
+
+# Detected correctly, but NO janitor path can remediate them:
+#   * DIR001    — the fix is a move; janitor scope sets ``move: False``.
+#   * STUB001   — enrichment belongs to the ``janitor_enrich`` scope.
+#   * ORPHAN001 — flag-only in ``_apply_fix``; resolving it is an
+#                 editorial decision (link it, or accept it as a leaf).
+#   * SEM001-4  — flag-only; status changes are human-only per the SKILL.
+# Real issues, correctly reported, not janitor's backlog.
+NOT_JANITOR_FIXABLE_CODES: frozenset[IssueCode] = frozenset({
+    IssueCode.WRONG_DIRECTORY,             # DIR001
+    IssueCode.STUB_RECORD,                 # STUB001
+    IssueCode.ORPHANED_RECORD,             # ORPHAN001
+    IssueCode.STALE_ACTIVE_PROJECT,        # SEM001
+    IssueCode.STALE_TODO_TASK,             # SEM002
+    IssueCode.STALE_ACTIVE_CONVERSATION,   # SEM003
+    IssueCode.STALE_ACTIVE_PERSON,         # SEM004
+})
+
+# Anything janitor can act on, by either path.
+ACTIONABLE_CODES: frozenset[IssueCode] = _AGENT_CODES | AUTOFIX_FIXABLE_CODES
+
+
+def classify_counts(issues: list[Issue]) -> dict[str, int]:
+    """Split issues into actionable vs not-janitor-fixable counts.
+
+    Returns ``{"actionable": N, "not_janitor_fixable": M, "total": N+M}``.
+    Because the three sets partition the enum exhaustively (pinned in
+    tests), ``actionable + not_janitor_fixable == total`` always holds —
+    no issue is dropped on the floor by the split.
+    """
+    actionable = sum(1 for i in issues if i.code in ACTIONABLE_CODES)
+    not_fixable = sum(1 for i in issues if i.code in NOT_JANITOR_FIXABLE_CODES)
+    return {
+        "actionable": actionable,
+        "not_janitor_fixable": not_fixable,
+        "total": len(issues),
+    }
+
+
 @dataclass
 class Issue:
     code: IssueCode
@@ -101,6 +172,11 @@ class SweepResult:
     files_skipped: int = 0
     issues_found: int = 0
     issues_by_severity: dict[str, int] = field(default_factory=dict)
+    # Segregation counts (see the remediation-class sets above). Both
+    # default 0 so a state file written by an older version loads clean
+    # under the schema-tolerance contract.
+    issues_actionable: int = 0
+    issues_not_janitor_fixable: int = 0
     files_fixed: int = 0
     files_deleted: int = 0
     agent_invoked: bool = False
@@ -115,6 +191,8 @@ class SweepResult:
             "files_skipped": self.files_skipped,
             "issues_found": self.issues_found,
             "issues_by_severity": self.issues_by_severity,
+            "issues_actionable": self.issues_actionable,
+            "issues_not_janitor_fixable": self.issues_not_janitor_fixable,
             "files_fixed": self.files_fixed,
             "files_deleted": self.files_deleted,
             "agent_invoked": self.agent_invoked,
@@ -139,6 +217,8 @@ class SweepResult:
             files_skipped=d.get("files_skipped") or 0,
             issues_found=d.get("issues_found") or 0,
             issues_by_severity=d.get("issues_by_severity") or {},
+            issues_actionable=d.get("issues_actionable") or 0,
+            issues_not_janitor_fixable=d.get("issues_not_janitor_fixable") or 0,
             files_fixed=d.get("files_fixed") or 0,
             files_deleted=d.get("files_deleted") or 0,
             agent_invoked=bool(d.get("agent_invoked", False)),

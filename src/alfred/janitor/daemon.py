@@ -33,7 +33,13 @@ from .triage import collect_open_triage_tasks, format_open_triage_block
 from .backends.cli import ClaudeBackend
 from .config import JanitorConfig
 from .context import build_vault_context
-from .issues import FixLogEntry, Issue, SweepResult, Severity
+from .issues import (
+    FixLogEntry,
+    Issue,
+    SweepResult,
+    Severity,
+    classify_counts,
+)
 from .parser import parse_file
 from .scanner import run_structural_scan
 from .state import JanitorState
@@ -190,6 +196,32 @@ async def run_sweep(
     for issue in issues:
         sev = issue.severity.value
         result.issues_by_severity[sev] = result.issues_by_severity.get(sev, 0) + 1
+
+    # Segregation split — separate what janitor CAN act on from what it
+    # structurally cannot (DIR001 needs a move janitor scope denies;
+    # STUB001 belongs to janitor_enrich; ORPHAN001/SEM001-004 are
+    # flag-only). Nothing is suppressed: every issue stays in
+    # ``result.issues`` and is still reported. This only makes the
+    # headline count readable as a janitor-backlog signal instead of
+    # conflating two populations.
+    split = classify_counts(issues)
+    result.issues_actionable = split["actionable"]
+    result.issues_not_janitor_fixable = split["not_janitor_fixable"]
+
+    # ILB: state the split EVERY sweep, so a large open-issue count is
+    # legible at a glance (and so a future refactor that drops the
+    # segregation is visible rather than silent).
+    log.info(
+        "sweep.issue_split",
+        sweep_id=sweep_id,
+        total=split["total"],
+        actionable=split["actionable"],
+        not_janitor_fixable=split["not_janitor_fixable"],
+        detail="not_janitor_fixable are REAL issues that janitor has no "
+               "path to fix (DIR001 move-blocked, STUB001 janitor_enrich "
+               "scope, ORPHAN001/SEM001-004 flag-only) — reported, never "
+               "suppressed",
+    )
 
     if not issues:
         log.info("sweep.clean", sweep_id=sweep_id)
