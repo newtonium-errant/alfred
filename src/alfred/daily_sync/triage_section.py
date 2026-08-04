@@ -63,6 +63,8 @@ from typing import Any
 import frontmatter  # type: ignore[import-untyped]
 import structlog
 
+from alfred.vault.paths import vault_relative
+
 from .config import DailySyncConfig
 
 log = structlog.get_logger(__name__)
@@ -277,13 +279,14 @@ def render_batch(
         lines.append(f"{item_no - start_index + 1}. {name}")
         # Vault-relative path for the summary — same shape as
         # attribution_section uses for ``record_path``.
-        try:
-            rel = str(path.relative_to(vault_path)).replace("\\", "/")
-        except ValueError:
-            # Defensive: path not under vault_path (shouldn't happen
-            # given the scan starts from vault_path/task) — fall back
-            # to the bare filename.
-            rel = f"task/{path.name}"
+        #
+        # Arc #18 M6: ``vault_relative`` resolves both sides, so a symlinked
+        # vault root no longer sends this down the fallback. The old
+        # ``except ValueError`` branch reconstructed ``task/<name>`` by hand,
+        # which was right only because the scan happens to start at
+        # ``vault_path/task``; a caller that ever scanned elsewhere would have
+        # silently been handed a path pointing at the wrong directory.
+        rel = vault_relative(vault_path, path)
         summaries.append(TriageItemSummary(
             item_number=item_no,
             path=rel,

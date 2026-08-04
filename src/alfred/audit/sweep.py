@@ -33,6 +33,7 @@ import frontmatter
 import structlog
 
 from alfred.vault import attribution
+from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 log = structlog.get_logger(__name__)
 
@@ -292,7 +293,19 @@ def sweep_paths(
     result = InferMarkerResult()
 
     for rel in rel_paths:
-        full = vault_path / rel
+        # Arc #18 M6 containment gate. ``rel_paths`` is the widest caller
+        # surface in this arc — the CLI defaults it to a glob, but callers may
+        # pass an arbitrary list, and ``apply=True`` writes the record back.
+        # Refusal maps onto the EXISTING per-record error channel rather than a
+        # raise, so one bad entry never aborts a sweep over the other records.
+        # Gated before ``.exists()`` so a traversal target is never stat-ed.
+        try:
+            full = resolve_in_vault(
+                vault_path, rel, writer="audit.sweep.infer_markers",
+            )
+        except VaultContainmentError:
+            result.errors.append((rel, "path escapes the vault root"))
+            continue
         if not full.exists():
             result.errors.append((rel, "file not found"))
             continue
