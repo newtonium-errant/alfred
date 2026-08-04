@@ -301,3 +301,158 @@ def test_feed_peer_name_is_web_feed() -> None:
     # The fixture pins the PRODUCTION peer NAME, not just any name that clears
     # allowed_clients (per the relay peer-pin rule).
     assert FEED_PEER_NAME == "web_feed"
+
+
+# ---------------------------------------------------------------------------
+# POST /feed/act — correction_target passthrough (#13)
+# ---------------------------------------------------------------------------
+
+
+def _routine_match_item() -> dict:
+    return {
+        "item_number": 1,
+        "query": "clean hammer",
+        "matched_to": "Clean house",
+        "record": "Weekly",
+        "confidence": 0.4,
+        "completion_date": "2026-08-03",
+        "captured_at": "2026-08-03T09:00:00+00:00",
+        "kind": "low_conf",
+    }
+
+
+@pytest.fixture
+async def routine_client(aiohttp_client, tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Transport app serving one open routine_match card over a REAL vault, so a
+    #13 correction can be driven all the way to a corpus row through the route."""
+    import yaml as _yaml
+
+    from alfred.daily_sync import reply_dispatch as _rd
+
+    vault = tmp_path / "vault"
+    routine_dir = vault / "routine"
+    routine_dir.mkdir(parents=True)
+    payload = {
+        "type": "routine", "name": "Weekly", "status": "active",
+        "cadence": {"type": "weekly"},
+        "items": [{"text": "Clean house"}, {"text": "Tidy the workshop"}],
+    }
+    (routine_dir / "Weekly.md").write_text(
+        "---\n" + _yaml.dump(payload, sort_keys=False) + "---\n", encoding="utf-8",
+    )
+
+    corpus = tmp_path / "routine_corpus.jsonl"
+    monkeypatch.setattr(
+        _rd, "_routine_match_corpus_path", lambda *a, **kw: str(corpus),
+    )
+
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+    register_vault_path(app, vault)
+
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    cfg = _ds_config(tmp_path)
+    item = _routine_match_item()
+    fi = build_feed_items("routine_match", [item], "salem")[0]
+    store.upsert(fi)
+    _seed_batch(cfg, routine_match_items=[item])
+
+    assert register_feed_routes(
+        app, enabled=True, feed_store=store, daily_sync_config=cfg,
+        instance_name="Salem", instance_scope="talker", raw_config={},
+    ) is True
+    app["_store"] = store
+    app["_corpus"] = corpus
+    app["_fid"] = fi.id
+    return await aiohttp_client(app)
+
+
+def _corpus_types(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(ln)["type"]
+        for ln in path.read_text().splitlines() if ln.strip()
+    ]
+
+
+async def test_act_correction_target_reaches_the_resolver(routine_client) -> None:
+    """The passthrough pin. Without it the target is dropped at the transport and
+    a `correct` arrives targetless — which the router refuses, so the operator's
+    answer would vanish between the BFF and the resolver."""
+    fid = routine_client.app["_fid"]
+    resp = await routine_client.post(
+        "/feed/act",
+        json={
+            "id": fid, "action_id": "correct",
+            "correction_target": "Tidy the workshop",
+        },
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True and body["status"] == "acted"
+    corpus = routine_client.app["_corpus"]
+    assert _corpus_types(corpus) == ["match_reject", "match_alias"]
+    rows = [json.loads(ln) for ln in corpus.read_text().splitlines() if ln.strip()]
+    assert rows[1]["item_text"] == "Tidy the workshop"
+    assert routine_client.app["_store"].load()[fid].state == "acted"
+
+
+async def test_act_one_off_needs_no_target(routine_client) -> None:
+    fid = routine_client.app["_fid"]
+    resp = await routine_client.post(
+        "/feed/act", json={"id": fid, "action_id": "one_off"},
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status == 200
+    assert _corpus_types(routine_client.app["_corpus"]) == [
+        "match_reject", "match_oneoff",
+    ]
+
+
+async def test_act_correct_without_a_target_is_refused_no_mutation(
+    routine_client,
+) -> None:
+    fid = routine_client.app["_fid"]
+    resp = await routine_client.post(
+        "/feed/act", json={"id": fid, "action_id": "correct"},
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status == 400
+    assert (await resp.json())["status"] == "invalid_action"
+    assert _corpus_types(routine_client.app["_corpus"]) == []
+    assert routine_client.app["_store"].load()[fid].state == "open"
+
+
+async def test_act_bogus_target_is_refused_and_writes_nothing(
+    routine_client,
+) -> None:
+    """End-to-end corpus-poisoning guard: a target that isn't a live routine item
+    dies at the resolver, and the reject doesn't land either."""
+    fid = routine_client.app["_fid"]
+    resp = await routine_client.post(
+        "/feed/act",
+        json={
+            "id": fid, "action_id": "correct",
+            "correction_target": "Polish the DeLorean",
+        },
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status >= 400
+    assert _corpus_types(routine_client.app["_corpus"]) == []
+    assert routine_client.app["_store"].load()[fid].state == "open"
+
+
+async def test_act_non_string_correction_target_400(routine_client) -> None:
+    """Type gate at the transport — the CONTENT is the resolver's business, but a
+    non-string can't reach it."""
+    fid = routine_client.app["_fid"]
+    resp = await routine_client.post(
+        "/feed/act",
+        json={"id": fid, "action_id": "correct", "correction_target": {"evil": 1}},
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "invalid_correction_target"
+    assert _corpus_types(routine_client.app["_corpus"]) == []

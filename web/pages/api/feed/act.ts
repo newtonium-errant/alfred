@@ -21,7 +21,7 @@ import { sendTransportError } from '../../../lib/algernon/bffError';
 // Provenance the BFF owns — `via: "deck"` + the acting user — is LOGGED
 // server-side (one structured line per act, no evidence content). It is NOT
 // added to the relay body: the transport /feed/act contract defines only
-// {id, action_id}, and B1 refuses unknown fields.
+// {id, action_id[, correction_target]}, and B1 refuses unknown fields.
 //
 // NO RETRY ON TIMEOUT: a timed-out act MAY have dispatched at the transport;
 // retrying could re-drive a resolver and reopen the double-dispatch B1's
@@ -60,11 +60,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
   }
 
-  const { id, action_id } = parsed.data;
+  const { id, action_id, correction_target } = parsed.data;
 
   try {
     const { status, body } = await callTransportFeed('POST', '/feed/act', {
-      body: { id, action_id },
+      // Only send `correction_target` when the client supplied one — the
+      // transport reads it as optional and an explicit `undefined` would
+      // serialize away anyway, but omitting it keeps the relayed body identical
+      // to the pre-#13 shape for every other action.
+      body: correction_target ? { id, action_id, correction_target } : { id, action_id },
     });
     // A post-auth upstream 401 can ONLY mean the BFF's own `web_feed` token is
     // wrong / missing at the transport (the browser never supplies it) — NOT a

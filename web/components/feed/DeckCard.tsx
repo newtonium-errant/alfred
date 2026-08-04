@@ -39,10 +39,12 @@ export interface DeckCardProps {
   onCancelHeavy: () => void;
   /** Open the re-tier picker (#28) — email_tier top card only; absent elsewhere. */
   onReTierOpen?: () => void;
+  /** Open the correction picker (#13) — routine_match top card only; absent elsewhere. */
+  onCorrectOpen?: () => void;
 }
 
 export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckCard(
-  { item, depth, expanded, confirming, onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen },
+  { item, depth, expanded, confirming, onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen },
   ref,
 ) {
   const verbs = deckVerbsFor(item.kind);
@@ -168,6 +170,21 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
           className="mt-1 shrink-0 self-start text-xs font-semibold text-status-progress-fg underline underline-offset-2"
         >
           Adjust tier…
+        </button>
+      )}
+
+      {/* Correction affordance (#13) — the third door on a routine match. Left-swipe
+          still means a plain "no"; this is the deliberate tap that also SAYS what the
+          completion meant, so a NO teaches instead of only suppressing. Routine-match
+          top card only, mirroring the re-tier button's placement. */}
+      {item.kind === 'routine_match' && depth === 0 && onCorrectOpen && (
+        <button
+          type="button"
+          data-testid="deck-correct-open"
+          onClick={onCorrectOpen}
+          className="mt-1 shrink-0 self-start text-xs font-semibold text-status-progress-fg underline underline-offset-2"
+        >
+          What did this mean?
         </button>
       )}
       {expanded && (

@@ -620,3 +620,197 @@ describe('Deck — email_urgent interrupt card (#27 render)', () => {
     expect(screen.getByTestId('evidence-external-link').getAttribute('href')).toContain('mail.google.com');
   });
 });
+
+describe('useDeck — reject-with-correction (#13)', () => {
+  const routineItem = (over: Partial<FeedItem> = {}) =>
+    item({
+      id: 'r',
+      kind: 'routine_match',
+      title: 'Routine match: clean hammer → Clean house',
+      evidence: {
+        query: 'clean hammer',
+        matched_to: 'Clean house',
+        record: 'Weekly',
+        candidates: [
+          { text: 'Clean house', record: 'Weekly' },
+          { text: 'Tidy the workshop', record: 'Weekly' },
+          { text: 'Walk the dog', record: 'Daily' },
+        ],
+      },
+      ...over,
+    });
+
+  it('a picked item posts `correct` WITH the target and flips on acted', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'r', action_id: 'correct', detail: '' });
+    const { result } = renderHook(() => useDeck({ items: [routineItem(), item({ id: 'b' })] }));
+    await act(async () => { await result.current.correctRoutine('Tidy the workshop'); });
+    // The three-arg shape IS the contract — a two-arg call would reach the server
+    // as a targetless `correct` and be refused.
+    expect(mockAct).toHaveBeenCalledWith('r', 'correct', 'Tidy the workshop');
+    expect(result.current.current?.id).toBe('b');
+    expect(result.current.toast?.message).toContain('Tidy the workshop');
+  });
+
+  it('the one-off door posts `one_off` with NO target', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'r', action_id: 'one_off', detail: '' });
+    const { result } = renderHook(() => useDeck({ items: [routineItem(), item({ id: 'b' })] }));
+    await act(async () => { await result.current.correctRoutine(null); });
+    expect(mockAct).toHaveBeenCalledWith('r', 'one_off', undefined);
+    expect(result.current.current?.id).toBe('b');
+    expect(result.current.toast?.message).toContain('one-off');
+  });
+
+  it('does NOT advance until acted returns — only the server knows the pick is valid', async () => {
+    let resolveAct: (v: unknown) => void = () => undefined;
+    mockAct.mockImplementation(() => new Promise((r) => { resolveAct = r; }));
+    const { result } = renderHook(() => useDeck({ items: [routineItem(), item({ id: 'b' })] }));
+    let pending: Promise<void> = Promise.resolve();
+    await act(async () => {
+      pending = result.current.correctRoutine('Tidy the workshop');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.correcting).toBe('Tidy the workshop');
+    expect(result.current.current?.id).toBe('r');
+    await act(async () => {
+      resolveAct({ ok: true, status: 'acted', id: 'r', action_id: 'correct', detail: '' });
+      await pending;
+    });
+    expect(result.current.correcting).toBeNull();
+    expect(result.current.current?.id).toBe('b');
+  });
+
+  it('a refused correction KEEPS the card and shows the server’s own reason', async () => {
+    mockAct.mockResolvedValue({
+      ok: false, status: 'error', id: 'r', action_id: 'correct',
+      detail: '“Polish the DeLorean” isn’t an item on any active routine',
+    });
+    const { result } = renderHook(() => useDeck({ items: [routineItem(), item({ id: 'b' })] }));
+    await act(async () => { await result.current.correctRoutine('Polish the DeLorean'); });
+    expect(result.current.current?.id).toBe('r'); // NOT advanced — nothing was taught
+    expect(result.current.toast?.message).toContain('active routine');
+  });
+
+  it('flushes a deferred swipe act BEFORE the correction (ordering)', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'x', action_id: 'y', detail: '' });
+    const { result } = renderHook(() => useDeck({ items: [item({ id: 'a' }), routineItem()] }));
+    act(() => result.current.affirm()); // defer a's POST
+    expect(mockAct).not.toHaveBeenCalled();
+    await act(async () => { await result.current.correctRoutine(null); });
+    expect(mockAct).toHaveBeenNthCalledWith(1, 'a', 'confirm');
+    expect(mockAct).toHaveBeenNthCalledWith(2, 'r', 'one_off', undefined);
+  });
+
+  it('is inert on a non-routine card (the verbs belong to one kind)', async () => {
+    const { result } = renderHook(() => useDeck({ items: [item({ id: 'a' })] }));
+    await act(async () => { await result.current.correctRoutine('Whatever'); });
+    expect(mockAct).not.toHaveBeenCalled();
+  });
+
+  it('an empty pick never reaches the server (it would only be refused)', async () => {
+    const { result } = renderHook(() => useDeck({ items: [routineItem()] }));
+    await act(async () => { await result.current.correctRoutine('   '); });
+    expect(mockAct).not.toHaveBeenCalled();
+  });
+});
+
+describe('Deck — correction picker (task #13 render)', () => {
+  const routineItem = (over: Partial<FeedItem> = {}) =>
+    item({
+      id: 'r',
+      kind: 'routine_match',
+      title: 'Routine match: clean hammer → Clean house',
+      evidence: {
+        query: 'clean hammer',
+        matched_to: 'Clean house',
+        record: 'Weekly',
+        candidates: [
+          { text: 'Clean house', record: 'Weekly' },
+          { text: 'Tidy the workshop', record: 'Weekly' },
+          { text: 'Walk the dog', record: 'Daily' },
+        ],
+      },
+      ...over,
+    });
+
+  it('"What did this mean?" opens the picker with every item EXCEPT the proposal', () => {
+    render(<Deck items={[routineItem()]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-open')));
+    expect(screen.getByTestId('deck-correct-picker')).toBeTruthy();
+    const labels = screen.getAllByTestId('deck-correct-choice').map((b) => b.getAttribute('data-item'));
+    // "Clean house" is what the card proposed — offering it would be a door that
+    // can only fail (the server refuses target === proposal).
+    expect(labels).toEqual(['Tidy the workshop', 'Walk the dog']);
+    expect(screen.getByTestId('deck-correct-one-off')).toBeTruthy();
+  });
+
+  it('picking an item posts correct+target, closes the picker, toasts honestly', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'r', action_id: 'correct', detail: '' });
+    render(<Deck items={[routineItem(), item({ id: 'b', title: 'Bee' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-open')));
+    await act(async () => {
+      fireEvent.click(screen.getAllByTestId('deck-correct-choice')[0]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mockAct).toHaveBeenCalledWith('r', 'correct', 'Tidy the workshop');
+    expect(screen.queryByTestId('deck-correct-picker')).toBeNull();
+    expect(screen.getByTestId('deck-toast').textContent).toContain('Tidy the workshop');
+  });
+
+  it('the one-off door posts one_off and needs no pick', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'acted', id: 'r', action_id: 'one_off', detail: '' });
+    render(<Deck items={[routineItem(), item({ id: 'b', title: 'Bee' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-open')));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('deck-correct-one-off'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mockAct).toHaveBeenCalledWith('r', 'one_off', undefined);
+    expect(screen.getByTestId('deck-toast').textContent).toContain('one-off');
+  });
+
+  it('no candidates → an explicit ILB line, and the one-off door still works', () => {
+    render(<Deck items={[routineItem({ evidence: { query: 'q', matched_to: 'Clean house', record: 'Weekly' } })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-open')));
+    // An empty picker with no explanation is indistinguishable from a broken one.
+    expect(screen.getByTestId('deck-correct-empty')).toBeTruthy();
+    expect(screen.queryAllByTestId('deck-correct-choice')).toHaveLength(0);
+    expect(screen.getByTestId('deck-correct-one-off')).toBeTruthy();
+  });
+
+  it('the affordance is routine_match only (absent on other kinds)', () => {
+    render(<Deck items={[item({ id: 'a', kind: 'email_tier' })]} />);
+    expect(screen.queryByTestId('deck-correct-open')).toBeNull();
+  });
+
+  it('picker open → an arrow key does NOT act on the hidden card (input gated)', () => {
+    render(<Deck items={[routineItem(), item({ id: 'b', title: 'Bee' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-open')));
+    act(() => fireEvent.keyDown(screen.getByTestId('deck'), { key: 'ArrowRight' }));
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-cancel')));
+    expect(screen.getAllByTestId('deck-card')[0].textContent).toContain('clean hammer');
+    expect(mockAct).not.toHaveBeenCalled();
+  });
+
+  it('the picker opens ABOVE the top card, not behind it (the #28 dead-tap class)', () => {
+    render(<Deck items={[routineItem()]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-open')));
+    const picker = screen.getByTestId('deck-correct-picker');
+    const topCard = screen.getAllByTestId('deck-card')[0];
+    expect(Number(picker.style.zIndex)).toBeGreaterThan(Number(topCard.style.zIndex));
+  });
+
+  it('a malformed candidates payload renders no choices rather than blank buttons', () => {
+    render(<Deck items={[routineItem({
+      evidence: {
+        query: 'q', matched_to: 'Clean house', record: 'Weekly',
+        candidates: [{ record: 'Weekly' }, 'nope', null, { text: '   ' }],
+      },
+    })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-correct-open')));
+    expect(screen.queryAllByTestId('deck-correct-choice')).toHaveLength(0);
+    expect(screen.getByTestId('deck-correct-empty')).toBeTruthy();
+  });
+});

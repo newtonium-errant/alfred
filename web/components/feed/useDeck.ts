@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { feedApi, type FeedActResult, type FeedItem } from '../../lib/algernon/feed';
-import { UNDO_MS, deckVerbsFor, HEAVY_KINDS, type Verdict } from '../../lib/algernon/feedConstants';
+import {
+  CORRECT_ACTION,
+  HEAVY_KINDS,
+  ONE_OFF_ACTION,
+  ROUTINE_MATCH_KIND,
+  UNDO_MS,
+  deckVerbsFor,
+  type Verdict,
+} from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
 
 // The deck state machine — deliberately DOM-free so the intricate parts (the
@@ -55,6 +63,12 @@ export interface UseDeckResult {
   reTiering: string | null;
   /** Re-tier the current email card: await the act, flip only on `acted`. Awaitable. */
   reTier: (tierId: string) => Promise<void>;
+  /** The #13 correction in flight for the current routine_match card — the chosen
+   *  item text, or the ONE_OFF_ACTION sentinel, or null when idle. */
+  correcting: string | null;
+  /** Reject the routine match AND teach the right answer. `target` = the item the
+   *  operator picked; `null` = "nothing, this was a one-off". Awaitable. */
+  correctRoutine: (target: string | null) => Promise<void>;
   dismissToast: () => void;
 }
 
@@ -83,6 +97,11 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   // swipe (optimistic advance + deferred POST), a re-tier AWAITS the act and only flips
   // on `acted` — a calibration CORRECTION must be honestly confirmed, not optimistic.
   const [reTiering, setReTiering] = useState<string | null>(null);
+  // The #13 correction in flight (chosen item text, or the one-off sentinel).
+  // Like re-tier and for the same reason: a taught answer must be confirmed by
+  // the server before the card leaves, because the server is the only thing that
+  // knows whether the pick was a real routine item.
+  const [correcting, setCorrecting] = useState<string | null>(null);
 
   const pendingRef = useRef<Pending | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -290,6 +309,62 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     [current, reTiering, flushPending, routeError],
   );
 
+  // Reject the current routine_match card AND say what it meant (#13). `target` is
+  // the routine item the operator picked; `null` is the one-off door ("nothing").
+  //
+  // AWAITED, never optimistic — deliberately unlike a swipe. A swipe's outcome is
+  // knowable client-side; a correction's is not: only the server can say whether
+  // the pick is still a live routine item, and it refuses the WHOLE verdict if it
+  // isn't. Advancing first would show the operator a card that left the deck
+  // having taught nothing. On refusal the card stays and the toast carries the
+  // server's own words, so a retry is possible from the same screen.
+  const correctRoutine = useCallback(
+    async (target: string | null) => {
+      const item = current;
+      if (!item || correcting) return;
+      if (item.kind !== ROUTINE_MATCH_KIND) return;
+      const chosen = (target || '').trim();
+      // A `correct` with an empty pick is refused server-side; don't spend a
+      // round trip to be told so. The one-off door is the explicit null.
+      if (target !== null && !chosen) return;
+      flushPending(); // fire any deferred swipe act BEFORE this one (in order)
+      setCorrecting(target === null ? ONE_OFF_ACTION : chosen);
+      let res: FeedActResult;
+      try {
+        res = await feedApi.act(
+          item.id,
+          target === null ? ONE_OFF_ACTION : CORRECT_ACTION,
+          target === null ? undefined : chosen,
+        );
+      } catch (e) {
+        setCorrecting(null);
+        routeError(e);
+        return;
+      }
+      setCorrecting(null);
+      if (res.ok && res.status === 'acted') {
+        setIndex((i) => i + 1);
+        setToast({
+          message: target === null ? 'Noted — a one-off.' : `Noted — it means “${chosen}”.`,
+          canUndo: false,
+        });
+        clearTimer();
+        timerRef.current = setTimeout(() => setToast(null), UNDO_MS);
+      } else if (res.status === 'already_acted' || res.status === 'stale_item') {
+        setIndex((i) => i + 1);
+        setToast({ message: "That one had already moved on — it'll resurface at the next sync.", canUndo: false });
+        clearTimer();
+        timerRef.current = setTimeout(() => setToast(null), UNDO_MS);
+      } else {
+        // Refused (an unpickable item, a vault the server can't read) → KEEP the
+        // card and show what the server said. Never a cheerful green over a
+        // verdict that didn't land.
+        setToast({ message: res.detail || `Couldn't record that (${res.status}).`, canUndo: false });
+      }
+    },
+    [current, correcting, flushPending, routeError],
+  );
+
   const dismissToast = useCallback(() => setToast(null), []);
 
   const remaining = Math.max(0, queue.length - index);
@@ -315,6 +390,8 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     dealNow,
     reTiering,
     reTier,
+    correcting,
+    correctRoutine,
     dismissToast,
   };
 }

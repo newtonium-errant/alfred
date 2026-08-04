@@ -182,6 +182,62 @@ export function kindLabel(kind: string): string {
 // The universal FYI ack action (feed page + FYI rows) — sets the item `acked`.
 export const ACK_ACTION = 'ack';
 
+// --- routine_match correction (#13) ------------------------------------------
+// A left-swipe reject says "not that item" and stops there. These two actions are
+// the richer doors behind the card's "What did this mean?" tap: `correct` carries
+// the item the operator picked, `one_off` says the phrase means no routine item at
+// all. Both are rejects server-side; both write the corpus through the same
+// resolver the reply grammar uses.
+export const ROUTINE_MATCH_KIND = 'routine_match';
+export const CORRECT_ACTION = 'correct';
+export const ONE_OFF_ACTION = 'one_off';
+
+export interface RoutineCandidate {
+  text: string;
+  record: string;
+}
+
+/**
+ * The pick-list for a routine_match card, read from `evidence.candidates` (the
+ * producer stamps every ACTIVE routine item, the suggestion's own record first).
+ *
+ * Defensive by contract: evidence is an untrusted `to_dict` payload, so rows
+ * missing `text` are dropped rather than rendered as blank buttons. An empty
+ * result is a legitimate state (no vault path wired) — the caller shows the
+ * one-off door alone rather than an empty picker.
+ *
+ * Display only. The server re-reads the vault and validates the pick before
+ * writing, so a stale list can cost a retry but can never poison the corpus.
+ */
+export function routineCandidatesFor(item: FeedItem): RoutineCandidate[] {
+  if (item.kind !== ROUTINE_MATCH_KIND) return [];
+  const raw = (item.evidence as Record<string, unknown> | null | undefined)?.candidates;
+  if (!Array.isArray(raw)) return [];
+  const out: RoutineCandidate[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as Record<string, unknown>;
+    const text = typeof r.text === 'string' ? r.text.trim() : '';
+    if (!text) continue;
+    out.push({ text, record: typeof r.record === 'string' ? r.record : '' });
+  }
+  return out;
+}
+
+/** The item a routine_match card proposed — excluded from the picker (saying "no,
+ *  it means the thing I just rejected" is contradictory, and the server refuses it). */
+export function routineProposedItem(item: FeedItem): string {
+  if (item.kind !== ROUTINE_MATCH_KIND) return '';
+  const raw = (item.evidence as Record<string, unknown> | null | undefined)?.matched_to;
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+/** Case/whitespace-insensitive compare, mirroring the server's target normalisation
+ *  so the picker hides exactly the option the resolver would refuse. */
+export function sameRoutineItem(a: string, b: string): boolean {
+  return a.trim().replace(/\s+/g, ' ').toLowerCase() === b.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 // --- rings (used by the rings header, B3-4) ----------------------------------
 // Slot bucket vocabulary. Per-user vocabulary comes later; centralised here so
 // it is never hardcoded inline in JSX. Keyed by the slot value a slot_suggestion
