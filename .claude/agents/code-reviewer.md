@@ -138,6 +138,10 @@ Beyond the standard review checklist above, watch for these patterns on every si
 | `feedback_substitute_env_consolidation.md` | When migrating any of the 16 unmigrated `_substitute_env` callers to the canonical `alfred._env` helper, flag if the migration is presented as a no-op refactor. Empty-string coalesce semantics differ; each call site needs downstream-usage audit. Surveyor is the structural outlier. |
 | `feedback_structlog_assertion_patterns.md` | Test-via-actual-call vs test-via-inline-mimic: `capture_logs` blocks must contain a CALL to the production function, not a manual `log.info(...)`. Inline mimic verifies log shape but not log site — false negative. |
 
+## Web-gate environment trap — verify the node before trusting any vitest number
+
+Hit 2026-08-04 (gate #27): a fresh reviewer shell resolved `npx`/`node` to the **Windows** Node under `/mnt/c` (stale fnm multishell dir); CMD.EXE rejected the WSL UNC path and `vitest run` exited 1 with "No test files found". A red OR green from that path is meaningless. Before trusting any web test count: `command -v node` must resolve to the Linux fnm install (`~/.local/share/fnm/node-versions/<ver>/installation/bin`); if not, prefix PATH with it. Also standard for web gates: symlink the main repo's `web/node_modules` into your extraction tree, and remove it after.
+
 ## Architectural-twin precision-asymmetry audit
 
 When reviewing a commit that introduces a new gate inheriting a predicate from a prior gate (e.g. `47b1b75`'s `_filter_anchored_tags` reusing `db9392f`'s `_has_textual_presence`), compare the EXTRACTION strictness side-by-side. SHARED predicate ≠ SHARED precision.
