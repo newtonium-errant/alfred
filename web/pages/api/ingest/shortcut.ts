@@ -48,15 +48,67 @@ import { loadDirectiveAliases, matchLeadingDirective } from '../../../lib/algern
 // SHORTCUT_INGEST_SOURCE_LABEL so its captures stamp their TRUE origin instead of
 // inheriting the 'iOS Shortcut' default.
 
-// Public (non-secret) instance display name stamped into provenance — parameterised
-// (NOT a hardcoded literal) so a different deploy stamps its own origin.
-const ORIGIN_INSTANCE = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
-// Provenance label for shortcut captures. Overridable so a non-Salem deploy stamps
-// its own owner; defaults to the Salem operator.
-const INGESTED_BY = process.env.SHORTCUT_INGEST_USER || 'Andrew (shortcut)';
-// Default ingest target when the Shortcut omits one. Overridable; matched
-// case-insensitively against the configured targets (a hand-typed / defaulted name).
-const DEFAULT_TARGET = process.env.SHORTCUT_INGEST_DEFAULT_TARGET || 'salem';
+// --- operator-tunable env, one contract for all of it ------------------------
+// Every value below is read PER-REQUEST and resolved through `envOrDefault`.
+//
+// The trim is not decoration. A bare `||` only catches '' — a whitespace-only
+// value is TRUTHY, so `SHORTCUT_INGEST_USER='   '` would sail through and stamp
+// a blank `ingested_by` AND send a blank `X-Alfred-Ingest-User` (an asserted
+// identity header on a privileged relay). Same failure the source label had
+// before #27; fixing one field and leaving its neighbours is how that bug
+// survives. Unset behaviour is byte-identical to the module consts these
+// replaced. Per-request rather than module-scope so each is settable in tests
+// without module-registry gymnastics — same reasoning as rateLimitMax().
+
+/**
+ * Trim-then-fallback with an audible degradation signal.
+ *
+ * UNSET is not degradation — it is the documented default, and warning on it
+ * would make every stock deploy shout on every request. CONFIGURED-BUT-BLANK is
+ * different: the operator set something and we are ignoring it. Falling back
+ * silently there is our own intentionally-left-blank doctrine violated — the
+ * capture survives while the operator goes on believing a broken setting is
+ * being honoured. So the value degrades AND says so.
+ *
+ * Unlatched (fires per request, not once per process) because the volume is
+ * already bounded by the rate limiter and a recurring misconfiguration should
+ * keep showing up in the log rather than scrolling out of it once.
+ *
+ * Takes the name and the value SEPARATELY, rather than doing `process.env[name]`
+ * internally, so each call site keeps a STATIC `process.env.X` read: Next
+ * inlines `process.env.NEXT_PUBLIC_*` textually at build time and a dynamic
+ * lookup would silently change how that one resolves.
+ */
+function envOrDefault(name: string, raw: string | undefined, fallback: string): string {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed) return trimmed;
+  console.warn(`[bff:ingest/shortcut] env_degraded var=${name} reason=blank`);
+  return fallback;
+}
+
+// Public (non-secret) instance display name stamped into provenance —
+// parameterised (NOT a hardcoded literal) so a different deploy stamps its own.
+function originInstance(): string {
+  return envOrDefault('NEXT_PUBLIC_INSTANCE_NAME', process.env.NEXT_PUBLIC_INSTANCE_NAME, 'Algernon');
+}
+
+// Who the capture is attributed to. Rides BOTH the relayed `ingested_by` and the
+// `X-Alfred-Ingest-User` header, so a blank here is a blank asserted identity.
+function ingestedBy(): string {
+  return envOrDefault('SHORTCUT_INGEST_USER', process.env.SHORTCUT_INGEST_USER, 'Andrew (shortcut)');
+}
+
+// Default ingest target when the Shortcut omits one. Matched case-insensitively
+// against the configured targets. The loudest of the four: its degradation
+// changes ROUTING — where the record lands — not just a provenance string.
+function defaultTarget(): string {
+  return envOrDefault(
+    'SHORTCUT_INGEST_DEFAULT_TARGET',
+    process.env.SHORTCUT_INGEST_DEFAULT_TARGET,
+    'salem',
+  );
+}
 
 // Provenance label stamped into the record's `source:` frontmatter. The route is
 // named for the iOS Shortcuts tendril it was built for, but the wire contract is
@@ -64,13 +116,27 @@ const DEFAULT_TARGET = process.env.SHORTCUT_INGEST_DEFAULT_TARGET || 'salem';
 // door. A hardcoded 'iOS Shortcut' would stamp every one of those with a false
 // origin, on a field the operator is meant to trust. Default preserved, so an
 // unset env is byte-identical to the pre-parameterised behavior.
-//
-// Read per-request (not a module const like its neighbours above) for two
-// reasons: it is settable in tests without module-registry gymnastics, and a
-// blank / whitespace-only value degrades to the default rather than stamping
-// EMPTY provenance — the same garbage-env contract as rateLimitMax() below.
 function sourceLabel(): string {
-  return process.env.SHORTCUT_INGEST_SOURCE_LABEL?.trim() || 'iOS Shortcut';
+  return envOrDefault(
+    'SHORTCUT_INGEST_SOURCE_LABEL',
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL,
+    'iOS Shortcut',
+  );
+}
+
+/**
+ * The configured device secret, whitespace-normalised.
+ *
+ * A secret gets NO fallback default — the fail-closed 503 is the whole point of
+ * the not_configured gate. What it does need is trim SYMMETRY with
+ * `extractBearer`, which trims the token it parses off the header: without it,
+ * a `SHORTCUT_INGEST_TOKEN` carrying a stray trailing space or newline (routine
+ * in .env files, copy-paste and mounted secrets) can NEVER match a correctly
+ * sent token, and the door answers a permanent 401 that reads exactly like a
+ * wrong credential. Returns '' when unset or blank so the caller's guard fires.
+ */
+function expectedToken(): string {
+  return process.env.SHORTCUT_INGEST_TOKEN?.trim() || '';
 }
 
 /**
@@ -98,18 +164,31 @@ const RATE_WINDOW_MS = 60 * 60 * 1000;
 type RateBucket = { windowStart: number; count: number };
 const rateBuckets = new Map<string, RateBucket>();
 
+// Same degradation doctrine as envOrDefault above, different predicate: this one
+// degrades on "not a positive integer" rather than "blank", so it carries its own
+// reason code. An operator who sets RATE_MAX=0 meaning "unlimited" gets 30 — they
+// should hear about it rather than discover it at the 31st capture.
 function rateLimitMax(): number {
-  const raw = parseInt(process.env.SHORTCUT_INGEST_RATE_MAX || '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 30;
+  const rawEnv = process.env.SHORTCUT_INGEST_RATE_MAX;
+  if (rawEnv === undefined) return 30;
+  const parsed = parseInt(rawEnv, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  console.warn('[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_RATE_MAX reason=not_positive_int');
+  return 30;
 }
 
 function rateLimitOk(key: string, now: number): boolean {
+  // Resolved on EVERY request, not lazily inside the second branch: the ceiling
+  // is pure, so this is behaviour-identical for limiting, but it means a garbage
+  // SHORTCUT_INGEST_RATE_MAX is reported on the FIRST capture rather than
+  // staying silent until a window is already open.
+  const max = rateLimitMax();
   const b = rateBuckets.get(key);
   if (!b || now - b.windowStart >= RATE_WINDOW_MS) {
     rateBuckets.set(key, { windowStart: now, count: 1 });
     return true;
   }
-  if (b.count >= rateLimitMax()) return false;
+  if (b.count >= max) return false;
   b.count += 1;
   return true;
 }
@@ -188,8 +267,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
-  const expected = process.env.SHORTCUT_INGEST_TOKEN;
-  if (!expected || !expected.trim()) {
+  const expected = expectedToken();
+  if (!expected) {
     // Deploy-inert until the operator sets the secret. Fail CLOSED.
     console.warn('[bff:ingest/shortcut] reject reason=not_configured');
     return res.status(503).json({ error: 'not_configured' });
@@ -230,7 +309,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   // the default inbox + logs the intent (for the re-homing loop). An unknown name
   // is not a directive → intact. Fail-safe: a misheard name never loses words.
   const directive = matchLeadingDirective(text, loadDirectiveAliases());
-  let requested = (target || DEFAULT_TARGET).trim();
+  let requested = (target || defaultTarget()).trim();
   let bodyText = text;
   // Resolved ONCE and reused by both provenance shapes below — the plain label and
   // the spoken-form variant must never be able to drift apart (they were two
@@ -275,6 +354,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   const now = new Date();
   const finalTitle = title ?? deriveTitle(bodyText, now);
+  // Resolved ONCE and used for BOTH the relayed field and the asserted-identity
+  // header — they name the same person and must not be able to disagree.
+  const ingester = ingestedBy();
 
   try {
     const { status, body: respBody } = await callTransportTo(match.name, 'POST', '/vault/ingest', {
@@ -283,16 +365,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         title: finalTitle,
         body: bodyText,
         source,
-        ingested_by: INGESTED_BY,
+        ingested_by: ingester,
         ingested_at: now.toISOString(),
         correlation_id: randomUUID(),
         set_fields: {
           ingested_via: 'shortcut',
-          origin_instance: ORIGIN_INSTANCE,
+          origin_instance: originInstance(),
           ...(routedViaDirective ? { routed_via: 'directive' } : {}),
         },
       },
-      headers: { 'X-Alfred-Ingest-User': INGESTED_BY },
+      headers: { 'X-Alfred-Ingest-User': ingester },
     });
     console.log(
       `[bff:ingest/shortcut] accept target=${match.name} record_type=note ` +

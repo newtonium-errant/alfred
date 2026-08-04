@@ -55,6 +55,9 @@ beforeEach(() => {
   process.env.SHORTCUT_INGEST_TOKEN = TOKEN;
   delete process.env.SHORTCUT_INGEST_RATE_MAX;
   delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
+  delete process.env.SHORTCUT_INGEST_USER;
+  delete process.env.SHORTCUT_INGEST_DEFAULT_TARGET;
+  delete process.env.NEXT_PUBLIC_INSTANCE_NAME;
 });
 
 afterEach(() => {
@@ -63,6 +66,9 @@ afterEach(() => {
   delete process.env.SHORTCUT_INGEST_TOKEN;
   delete process.env.SHORTCUT_INGEST_RATE_MAX;
   delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
+  delete process.env.SHORTCUT_INGEST_USER;
+  delete process.env.SHORTCUT_INGEST_DEFAULT_TARGET;
+  delete process.env.NEXT_PUBLIC_INSTANCE_NAME;
 });
 
 // --- method + config gates ---------------------------------------------------
@@ -301,6 +307,207 @@ describe('POST /api/ingest/shortcut — source label', () => {
     expect(__shortcutSourceLabelForTest()).toBe('Desktop hotkey');
     delete process.env.SHORTCUT_INGEST_SOURCE_LABEL;
     expect(__shortcutSourceLabelForTest()).toBe('iOS Shortcut');
+  });
+});
+
+// --- whitespace degradation across the WHOLE env family (#29 R-b) ------------
+// #27 fixed the source label; a bare `||` only catches '', so a whitespace-only
+// value is truthy and sails through. These pin the same contract on every
+// remaining operator-tunable field — all asserted on the relayed body/headers
+// (the wire), never on a helper.
+
+describe('POST /api/ingest/shortcut — env whitespace degradation', () => {
+  async function relayed() {
+    const { res } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'buy milk' } }), res);
+    return mockCallTransportTo.mock.calls[0][3];
+  }
+
+  it('a whitespace-only SHORTCUT_INGEST_USER does not blank the attribution', async () => {
+    // The exposed one: this rides BOTH the relayed field and the
+    // X-Alfred-Ingest-User asserted-identity header on a privileged relay.
+    process.env.SHORTCUT_INGEST_USER = '   ';
+    const opts = await relayed();
+    expect(opts.body.ingested_by).toBe('Andrew (shortcut)');
+    expect(opts.headers['X-Alfred-Ingest-User']).toBe('Andrew (shortcut)');
+  });
+
+  it('a real SHORTCUT_INGEST_USER is honoured on both the field AND the header', async () => {
+    process.env.SHORTCUT_INGEST_USER = 'Sam (tasker)';
+    const opts = await relayed();
+    expect(opts.body.ingested_by).toBe('Sam (tasker)');
+    expect(opts.headers['X-Alfred-Ingest-User']).toBe('Sam (tasker)');
+  });
+
+  it('the field and the header can never disagree (one resolution per request)', async () => {
+    process.env.SHORTCUT_INGEST_USER = '  Sam (tasker)  ';
+    const opts = await relayed();
+    expect(opts.headers['X-Alfred-Ingest-User']).toBe(opts.body.ingested_by);
+    expect(opts.body.ingested_by).toBe('Sam (tasker)'); // trimmed, not raw
+  });
+
+  it('a whitespace-only NEXT_PUBLIC_INSTANCE_NAME does not blank origin_instance', async () => {
+    process.env.NEXT_PUBLIC_INSTANCE_NAME = '   ';
+    const opts = await relayed();
+    expect(opts.body.set_fields.origin_instance).toBe('Algernon');
+  });
+
+  it('a whitespace-only default target routes to the built-in default, not a 400', async () => {
+    // BEHAVIOUR CHANGE, deliberate: pre-fix this trimmed to '' and 400'd
+    // unknown_target, DESTROYING the capture (the share/voice source is already
+    // gone by then). This route's stated philosophy is that a bad name never
+    // costs you the words — the directive parser keeps text intact rather than
+    // rejecting it — so a garbage default degrades to the same place an UNSET
+    // one goes, and the capture survives.
+    process.env.SHORTCUT_INGEST_DEFAULT_TARGET = '   ';
+    const { res, status } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'buy milk' } }), res);
+    expect(status).toHaveBeenCalledWith(201);
+    expect(mockCallTransportTo.mock.calls[0][0]).toBe('SALEM');
+  });
+
+  it('unset env is byte-identical to the pre-fix module-const behaviour', async () => {
+    const opts = await relayed();
+    expect(opts.body.ingested_by).toBe('Andrew (shortcut)');
+    expect(opts.body.set_fields.origin_instance).toBe('Algernon');
+    expect(opts.headers['X-Alfred-Ingest-User']).toBe('Andrew (shortcut)');
+  });
+});
+
+// --- token trim symmetry (#29 R-b, builder judgment) -------------------------
+// A secret gets NO fallback default — the fail-closed 503 is the point. But
+// extractBearer TRIMS the token it parses off the header, so an untrimmed
+// expected value could never match it.
+
+describe('POST /api/ingest/shortcut — token whitespace symmetry', () => {
+  it('a stored token with stray trailing whitespace still authenticates', async () => {
+    // Routine in .env files, copy-paste and mounted secrets. Pre-fix this was a
+    // PERMANENT 401 that reads exactly like a wrong credential — the worst kind
+    // of misconfiguration to diagnose.
+    process.env.SHORTCUT_INGEST_TOKEN = `${TOKEN}  \n`;
+    const { res, status } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'hi' } }), res);
+    expect(status).toHaveBeenCalledWith(201);
+  });
+
+  it('a leading-whitespace stored token also authenticates', async () => {
+    process.env.SHORTCUT_INGEST_TOKEN = `   ${TOKEN}`;
+    const { res, status } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'hi' } }), res);
+    expect(status).toHaveBeenCalledWith(201);
+  });
+
+  it('trimming does NOT weaken the gate — a wrong token is still 401', async () => {
+    process.env.SHORTCUT_INGEST_TOKEN = `${TOKEN}  `;
+    const { res, status } = mockRes();
+    await handler(req({ authorization: 'Bearer DUMMY_WRONG_TOKEN_zzzz', body: { text: 'hi' } }), res);
+    expect(status).toHaveBeenCalledWith(401);
+    expect(mockCallTransportTo).not.toHaveBeenCalled();
+  });
+
+  it('a whitespace-only token is still 503 not_configured (no accidental default)', async () => {
+    process.env.SHORTCUT_INGEST_TOKEN = '   ';
+    const { res, status, json } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'hi' } }), res);
+    expect(status).toHaveBeenCalledWith(503);
+    expect(json).toHaveBeenCalledWith({ error: 'not_configured' });
+  });
+});
+
+// --- degraded env is AUDIBLE (#29 WARN-1) ------------------------------------
+// Degrading a garbage value keeps the capture, but doing it SILENTLY is our own
+// intentionally-left-blank doctrine violated: the operator goes on believing a
+// broken setting is honoured. Every fallback announces itself. All driven
+// through the real handler.
+
+describe('POST /api/ingest/shortcut — degraded env announces itself', () => {
+  /** Collect console.warn text for the duration of a case. */
+  function captureWarns(): string[] {
+    const seen: string[] = [];
+    vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      seen.push(args.map(String).join(' '));
+    });
+    return seen;
+  }
+
+  const degraded = (warns: string[]) => warns.filter((m) => m.includes('env_degraded'));
+
+  async function post() {
+    const { res } = mockRes();
+    await handler(req({ authorization: `Bearer ${TOKEN}`, body: { text: 'buy milk' } }), res);
+  }
+
+  it('a blank default target warns — the one whose degradation changes ROUTING', async () => {
+    process.env.SHORTCUT_INGEST_DEFAULT_TARGET = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_DEFAULT_TARGET reason=blank',
+    ]);
+  });
+
+  it('a blank ingest user warns (blank attribution + blank asserted-identity header)', async () => {
+    process.env.SHORTCUT_INGEST_USER = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_USER reason=blank',
+    ]);
+  });
+
+  it('a blank source label warns', async () => {
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_SOURCE_LABEL reason=blank',
+    ]);
+  });
+
+  it('a blank instance name warns', async () => {
+    process.env.NEXT_PUBLIC_INSTANCE_NAME = '   ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=NEXT_PUBLIC_INSTANCE_NAME reason=blank',
+    ]);
+  });
+
+  it('a non-positive rate max warns with its OWN reason code (not "blank")', async () => {
+    process.env.SHORTCUT_INGEST_RATE_MAX = '0';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_RATE_MAX reason=not_positive_int',
+    ]);
+  });
+
+  it('UNSET env is SILENT — a stock deploy must not shout on every request', async () => {
+    // The pin that keeps this signal meaningful. Unset is the documented
+    // default, not a degradation; warning on it would bury the real ones.
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([]);
+  });
+
+  it('a VALID override is silent too (only garbage is noisy)', async () => {
+    process.env.SHORTCUT_INGEST_USER = 'Sam (tasker)';
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = 'Android (Tasker)';
+    process.env.SHORTCUT_INGEST_RATE_MAX = '10';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns)).toEqual([]);
+  });
+
+  it('several blank vars each get their own line (no swallowing after the first)', async () => {
+    process.env.SHORTCUT_INGEST_USER = '   ';
+    process.env.SHORTCUT_INGEST_SOURCE_LABEL = '  ';
+    const warns = captureWarns();
+    await post();
+    expect(degraded(warns).sort()).toEqual([
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_SOURCE_LABEL reason=blank',
+      '[bff:ingest/shortcut] env_degraded var=SHORTCUT_INGEST_USER reason=blank',
+    ]);
   });
 });
 

@@ -28,18 +28,29 @@ export function IngestForm({
   user,
   originInstance,
   onUnauthenticated,
+  initialTitle = '',
+  initialBody = '',
+  initialSource = '',
 }: {
   user: SessionUser;
   originInstance: string;
   onUnauthenticated?: () => void;
+  // Prefill for the Web Share Target handler (/share): the shared payload lands
+  // in the SAME reviewed form rather than auto-submitting, so the operator still
+  // picks the target instance and can fix the derived title before it is written.
+  // Seed values only — the fields stay fully editable, and `Ingest another`
+  // clears them.
+  initialTitle?: string;
+  initialBody?: string;
+  initialSource?: string;
 }) {
   const { targets, status, error, result, unauthenticated, submit, reset } = useIngest();
 
   const [target, setTarget] = useState('');
   const [recordType, setRecordType] = useState('');
-  const [title, setTitle] = useState('');
-  const [body, setBody] = useState('');
-  const [source, setSource] = useState('');
+  const [title, setTitle] = useState(initialTitle);
+  const [body, setBody] = useState(initialBody);
+  const [source, setSource] = useState(initialSource);
 
   // Default the picker to the first configured target once targets load.
   useEffect(() => {

@@ -17,11 +17,16 @@
  */
 
 // Bump this to invalidate the whole shell cache and force a clean roll-out.
-const CACHE_VERSION = 'v1';
+// v2: added /share to the shell (Web Share Target handler).
+const CACHE_VERSION = 'v2';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.
-const SHELL_ROUTES = ['/', '/login', '/ingest'];
+// `/share` is the manifest's share_target action: the system share sheet
+// navigates here with the payload in the query string, so the shell must be
+// available promptly (and the navigation is network-first with a cache fallback,
+// which keeps a shared capture reaching the form on a flaky connection).
+const SHELL_ROUTES = ['/', '/login', '/ingest', '/share'];
 
 // Static, immutable assets served from /public.
 const STATIC_ASSETS = [
