@@ -443,6 +443,11 @@ _unverified_tests: list[str] = []
 
 
 def _guard_is_live() -> bool:
+    # Probes ``socket.socket.connect`` ONLY. A patch that replaced just
+    # ``connect_ex`` or ``getaddrinfo`` would leave this reporting "live" while
+    # that half of the recorder is shadowed. Deliberate: ``connect`` is the call
+    # every real leak goes through, so it is the useful single probe — not a
+    # complete one. Widen it if a shadowing patch ever targets the others.
     return socket.socket.connect is _OUR_CONNECT_HOOK
 
 
@@ -522,13 +527,29 @@ _CREDENTIAL_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 # it is not about, and the fix would be to weaken the pin.
 _collection_injected: list[str] = []
 
+# nodeids carrying @pytest.mark.live_network, inventoried at COLLECTION (#28
+# NOTE-1). Collection-time, not run-time, on purpose: these tests are key-gated
+# and SKIP unless an operator exported a key, so a run-time list would be empty
+# on almost every run and the section would report "no exemptions" about a suite
+# that carries several. The marker is the guard's only opt-out by design — the
+# remedy for that is to make its use VISIBLE, not to forbid it.
+_live_network_tests: list[str] = []
+
 
 def pytest_collection_finish(session):
     """Undo credential env vars introduced during collection/import.
 
     Runs after every test module is imported and before any test executes —
     the only window where the pollution exists but has not yet been read.
+
+    Also inventories the ``live_network`` exemptions while the full collected
+    item list is in hand.
     """
+    _live_network_tests[:] = sorted(
+        item.nodeid
+        for item in session.items
+        if item.get_closest_marker("live_network") is not None
+    )
     injected = sorted(
         name
         for name in list(os.environ)
@@ -543,6 +564,80 @@ def pytest_collection_finish(session):
         # effect went away", and the next person would not know why the live
         # tests skip.
         session.config._alfred_scrubbed_env = injected
+
+
+# ---------------------------------------------------------------------------
+# Cloud-credential leak check — the TEST-time half of the contract (#28 WARN-1)
+# ---------------------------------------------------------------------------
+#
+# ``_collection_injected`` above is a RECORDING taken once, at collection. It is
+# blind by construction to a credential a TEST introduces, which is the leak the
+# sovereign boundary actually cares about: barrier (c) treats the mere presence
+# of one of these names in the process env as a breach, so a test that leaves
+# one behind hands it to every test that follows.
+#
+# This is safe to check LIVE, per-test, only because it is scoped to an explicit
+# NAME LIST rather than to a shape. The collection pin deliberately refuses to
+# check live os.environ, because its predicate is the SUFFIX set
+# ``_CREDENTIAL_ENV_SUFFIXES`` — which includes ``_TOKEN`` and so would match
+# ``ALFRED_TRANSPORT_TOKEN``, injected into os.environ by the CLI dispatchers by
+# documented design (CLAUDE.md, "Dispatcher env-var injection"). That pin would
+# fail for a reason it is not about.
+#
+# ``CLOUD_KEY_ENV_VARS`` has no such overlap — measured, and pinned by
+# ``test_cloud_keys_are_disjoint_from_dispatcher_injection`` so the assumption
+# breaks loudly rather than silently if someone adds an ALFRED_* name to it.
+# Imported rather than re-listed so it cannot drift from the source of truth.
+#
+# Placed AFTER ``_ENV_BASELINE`` on purpose: were this import to inject anything
+# itself, baselining it first would make it permanently invisible.
+from alfred.sovereign.boundary import CLOUD_KEY_ENV_VARS  # noqa: E402
+
+
+def _leaked_cloud_keys() -> list[str]:
+    """Cloud-credential names now in os.environ that were not there at startup.
+
+    Baseline-relative, so a key the OPERATOR exported stays untouched — they are
+    entitled to run the key-gated live tests.
+    """
+    return sorted(
+        name for name in CLOUD_KEY_ENV_VARS
+        if name in os.environ and name not in _ENV_BASELINE
+    )
+
+
+@pytest.fixture(autouse=True)
+def _assert_no_cloud_key_leak(request):
+    """Fail a test that leaves a cloud credential in the process env.
+
+    Teardown, not mid-call, so the body runs exactly as it does without the
+    check — same reasoning as ``_assert_no_egress``.
+
+    NO FALSE POSITIVE FROM ``monkeypatch``: autouse fixtures are set up before
+    explicitly-requested ones and so tear down AFTER them, meaning a
+    ``monkeypatch.setenv("ANTHROPIC_API_KEY", ...)`` has already been reverted by
+    the time this runs. Only a raw, uncleaned ``os.environ`` write is caught —
+    which is exactly the leak class worth failing on.
+
+    The offender is SCRUBBED before failing. Leaving it in place would fail every
+    subsequent test too, burying the one test that actually caused it under a
+    cascade.
+    """
+    yield
+    leaked = _leaked_cloud_keys()
+    if not leaked:
+        return
+    for name in leaked:
+        del os.environ[name]
+    pytest.fail(
+        "sovereign env leak: this test left cloud credential(s) in os.environ:\n  "
+        + "\n  ".join(leaked)
+        + "\n\nThe sovereign boundary treats the PRESENCE of these names as a "
+          "breach (barrier (c)), and every test after this one would have "
+          "inherited them. Use monkeypatch.setenv/delenv, which reverts itself, "
+          "rather than writing os.environ directly.",
+        pytrace=False,
+    )
 
 
 def pytest_runtest_protocol(item, nextitem):  # noqa: ARG001
@@ -654,6 +749,30 @@ def pytest_terminal_summary(terminalreporter, *a, **kw):  # noqa: ARG001
             w(f"    {nodeid}")
         if len(_unverified_tests) > 5:
             w(f"    ... and {len(_unverified_tests) - 5} more")
+
+    # The guard's ONLY opt-out, given an output surface (#28 NOTE-1). A
+    # live_network test is exempt from the egress check entirely, so the moment
+    # a new integration reaches for the marker to go green the guard becomes
+    # decorative — and nothing anywhere said so. Printed every run, in both
+    # directions, so widening the exemption is visible rather than inferable
+    # from a diff nobody re-reads.
+    w("")
+    if _live_network_tests:
+        w(f"live_network egress: {len(_live_network_tests)} test(s) hold the guard's "
+          f"exemption marker and are NOT egress-checked.")
+        for nodeid in _live_network_tests:
+            with _egress_lock:
+                dests = sorted(_connect_by_test.get(nodeid, ()))
+            w(f"    {nodeid}")
+            for dest in dests:
+                w(f"        -> {dest}")
+            if not dests:
+                # ILB: distinguishes "skipped / reached nothing" from "reached
+                # something we are not showing you".
+                w("        -> no egress observed (key-gated skip, or no connect)")
+        w("  A diff that ADDS a marker here widens the exemption — review it.")
+    else:
+        w("live_network egress: no test claims the guard's exemption marker.")
 
     if not stray and not connected_any and not dns_tests and not _unverified_tests:
         w("")

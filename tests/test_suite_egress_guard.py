@@ -16,11 +16,15 @@ from __future__ import annotations
 
 import socket
 
+from alfred.sovereign.boundary import CLOUD_KEY_ENV_VARS
 from tests.conftest import (
+    _CREDENTIAL_ENV_SUFFIXES,
     _collection_injected,
     _egress_exempt,
     _guard_is_live,
     _is_ip_literal,
+    _leaked_cloud_keys,
+    _live_network_tests,
 )
 
 
@@ -64,6 +68,88 @@ def test_collection_leaves_no_credential_env_vars() -> None:
         f"This un-gates every skipif(not os.environ.get(...)) integration test, "
         f"so the suite starts calling real paid APIs."
     )
+
+
+# --- the cloud-credential leak check (#28 WARN-1) ---------------------------
+
+
+def test_cloud_key_leak_is_detected(monkeypatch) -> None:
+    """The predicate the autouse teardown fires on sees a test-time leak.
+
+    Uses ``monkeypatch`` deliberately, which does double duty: it exercises the
+    detector, AND it demonstrates the property that keeps the check from being a
+    nuisance — autouse fixtures tear down AFTER explicitly-requested ones, so
+    this setenv is already reverted by the time the teardown check runs and this
+    test does not fail itself.
+
+    Mutation: make ``_leaked_cloud_keys`` return ``[]`` → this fails.
+    """
+    assert _leaked_cloud_keys() == []
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "DUMMY_ANTHROPIC_TEST_KEY")
+    assert "ANTHROPIC_API_KEY" in _leaked_cloud_keys()
+
+
+def test_operator_exported_keys_are_not_leaks(monkeypatch) -> None:
+    """A key present at startup is the operator's, not a leak.
+
+    Without the baseline comparison, anyone who exports a key to run the
+    key-gated live tests would have EVERY test fail — and the obvious fix would
+    be to delete the check.
+    """
+    monkeypatch.setitem(_baseline_for_test(), "GROQ_API_KEY", "operator-value")
+    monkeypatch.setenv("GROQ_API_KEY", "operator-value")
+    assert "GROQ_API_KEY" not in _leaked_cloud_keys()
+
+
+def _baseline_for_test():
+    """The conftest baseline dict, by reference (monkeypatch.setitem needs it)."""
+    from tests import conftest
+
+    return conftest._ENV_BASELINE
+
+
+def test_cloud_keys_are_disjoint_from_dispatcher_injection() -> None:
+    """The assumption that makes a LIVE per-test check safe.
+
+    The collection pin refuses to inspect live os.environ because its predicate
+    is the SUFFIX set — which includes ``_TOKEN`` and so matches
+    ``ALFRED_TRANSPORT_TOKEN``, injected by the CLI dispatchers by documented
+    design. The cloud-key check can be live precisely because it matches exact
+    NAMES with no such overlap.
+
+    If someone adds an ``ALFRED_*`` name to ``CLOUD_KEY_ENV_VARS``, that
+    reasoning silently stops holding and the teardown check starts failing
+    honest dispatcher tests. This fails first, and says why.
+    """
+    offenders = [n for n in CLOUD_KEY_ENV_VARS if n.startswith("ALFRED_")]
+    assert offenders == [], (
+        f"{offenders} are dispatcher-namespace names. The CLI dispatchers write "
+        f"ALFRED_* into os.environ by design, so the per-test cloud-key leak "
+        f"check would fail tests that are behaving correctly."
+    )
+    # The suffix predicate WOULD have collided — which is why the collection pin
+    # is scoped to a recording and this one is scoped to explicit names.
+    assert any(n.endswith(_CREDENTIAL_ENV_SUFFIXES) for n in CLOUD_KEY_ENV_VARS)
+    assert "ALFRED_TRANSPORT_TOKEN".endswith(_CREDENTIAL_ENV_SUFFIXES)
+
+
+# --- live_network exemption inventory (#28 NOTE-1) --------------------------
+
+
+def test_live_network_inventory_is_collected() -> None:
+    """The exemption inventory is populated at collection, not at run time.
+
+    live_network tests are key-gated and normally SKIP, so a run-time inventory
+    would report "no exemptions" about a suite that carries several — the exact
+    blind spot the summary section exists to close.
+
+    Not asserting a COUNT: the number is expected to change, and a count pin
+    would just be a chore. What matters is that the inventory mechanism ran and
+    that every entry is a real nodeid.
+    """
+    assert isinstance(_live_network_tests, list)
+    assert all(isinstance(n, str) and "::" in n for n in _live_network_tests)
+    assert _live_network_tests == sorted(_live_network_tests)
 
 
 def test_guard_is_installed() -> None:
