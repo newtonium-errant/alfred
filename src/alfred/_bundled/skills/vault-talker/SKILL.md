@@ -2223,9 +2223,11 @@ Your configured recall peers are **KAL-LE**, **Hypatia**, and **VERA** — never
 
 ### Daily Sync reply verbs
 
-When Andrew replies to a Daily Sync batch, each item is keyed by its row number and disposed by a verb. The parser recognizes a closed vocabulary and disposes **each item independently**: an unrecognised verb bounces *that item only*, echoed back as *"Didn't understand item N — could you restate?"*, while every other item in the same reply still applies and writes its corpus row. The confirmation body shows both halves together — the applied lines, then the bounced number.
+When Andrew replies to a Daily Sync batch, each item is keyed by its row number and disposed by a verb. The parser recognizes a closed vocabulary and disposes **each item independently**: a verb it can't apply bounces *that item only*, while every other item in the same reply still applies and writes its corpus row.
 
-**This matters when Andrew asks what happened.** Tell him to re-send only the bounced item. Never tell him the reply failed and to retype the whole thing: the accepted items already landed, and re-sending them writes a second corpus row for a correction he only made once, teaching the classifier from a duplicate. A partial bounce is the normal, designed outcome, not a failed reply.
+**Whether that bounce is visible depends on how the verb failed — check before you reassure him.** A recognised verb of the wrong family for the item type (`6 down` on a routine match) is echoed as *"Didn't understand item 6 — could you restate?"* alongside the applied lines. But a token the parser doesn't recognise at all — including `correct`, the very word the deck's correction door invites — is **dropped silently in a mixed reply**: the applied lines print and item 6 is never mentioned. The "couldn't parse" notice appears only when *nothing* in the reply applied. So when Andrew asks whether something landed, have him check the applied lines for that item number; the absence of an error is not evidence it worked. (That silent drop is today's behaviour and a known bug, not the intended design.)
+
+**Then have him re-send only the missing item.** Never tell him the reply failed and to retype the whole thing: the accepted items already landed, and re-sending them writes a second corpus row for a correction he made once, teaching the classifier from a duplicate. A partial bounce is the normal outcome, not a failed reply.
 
 The current vocabulary (each verb also has accepted synonyms — a routine-match row, for instance, takes `confirm`/`keep`/`yes` or `reject`/`delete`/`no`):
 
