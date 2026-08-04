@@ -242,7 +242,6 @@ def test_promote_lock_path_is_the_RESOLVED_path(tmp_path: Path, monkeypatch) -> 
     Hence: capture from the writer, never re-implement it.
     """
     from alfred.tier.promote import append_promoted_item
-    from alfred.vault.paths import resolve_in_vault
 
     configured, _real = _symlinked_vault(tmp_path)
     locked: list[Path] = []
@@ -255,7 +254,13 @@ def test_promote_lock_path_is_the_RESOLVED_path(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr("alfred.tier.promote.file_rmw_lock", _spy)
     append_promoted_item(configured, "Chores", text="Sweep", cadence_days=7)
 
-    expected = resolve_in_vault(configured, "routine/Chores.md", writer="test")
+    # Compute the expectation WITHOUT resolve_in_vault. Using the helper here
+    # would couple the assertion to the very function under observation: if the
+    # helper itself regressed, promote's path and the expected path would move
+    # together and this pin would stay green. That is the same defect one layer
+    # down from the mirror-pin it replaces — the spy must OBSERVE production
+    # while the expectation is derived independently.
+    expected = configured.resolve() / "routine" / "Chores.md"
     assert locked == [expected], (
         "promote must lock the resolved path — if this fails, either the gate "
         "was dropped or promote stopped routing through resolve_in_vault"

@@ -18,6 +18,7 @@ import structlog
 import yaml
 
 from . import obsidian
+from .paths import VaultContainmentError, resolve_in_vault
 from .schema import (
     KNOWN_TYPES,
     KNOWN_TYPES_BY_SCOPE,
@@ -434,11 +435,48 @@ class VaultError(Exception):
 
 
 def _resolve_vault_path(vault_path: Path, rel_path: str) -> Path:
-    """Resolve a relative path within the vault, preventing traversal."""
-    full = (vault_path / rel_path).resolve()
-    if not str(full).startswith(str(vault_path.resolve())):
-        raise VaultError(f"Path traversal denied: {rel_path}")
-    return full
+    """Resolve a relative path within the vault, preventing traversal.
+
+    Arc #18 M5. This function has guarded every agent-facing vault op since the
+    beginning — ``vault_read``, ``vault_create``, ``vault_edit``, ``vault_move``
+    (both ends), ``vault_delete``, plus ``vault/retype.py`` — and its check was
+    WRONG. The previous body was::
+
+        full = (vault_path / rel_path).resolve()
+        if not str(full).startswith(str(vault_path.resolve())):
+            raise VaultError(...)
+
+    ``str.startswith`` is a BYTE-prefix test, not a path-component test, so any
+    sibling directory whose name extends the vault root's name passed it.
+    Measured with vault ``/home/andrew/vault`` and ``rel_path``
+    ``task/../../vault-evil/pwned.md``::
+
+        resolved       = /home/andrew/vault-evil/pwned.md
+        startswith     = True    <- guard PASSED, write allowed outside the vault
+        is_relative_to = False   <- the correct answer
+
+    So the docstring said "preventing traversal" while admitting an entire class
+    of it. That is the defect this whole arc exists to fix, and it was the one
+    place already *claiming* to be the fix — which is why it survived: a guard
+    that asserts its own correctness in a docstring does not invite a second
+    look.
+
+    Now delegates to :func:`alfred.vault.paths.resolve_in_vault` — the same gate
+    the board and routine writers use (M0-M4), so there is ONE containment
+    implementation for the platform rather than two with different bugs. The
+    ``VaultError`` contract is preserved deliberately: every caller and existing
+    test expects that type and message, so this is a correctness fix with no
+    API change.
+
+    One behaviour change worth naming: an EMPTY ``rel_path`` previously resolved
+    to the vault root and was allowed through (to fail later, confusingly, on
+    the read/write). It is now refused here. Fail-closed on a caller bug is the
+    right direction, and no production caller composes an empty path.
+    """
+    try:
+        return resolve_in_vault(vault_path, rel_path, writer="vault.ops")
+    except VaultContainmentError:
+        raise VaultError(f"Path traversal denied: {rel_path}") from None
 
 
 def is_ignored_path(rel_path: str | Path, ignore_dirs: set[str] | list[str]) -> bool:
