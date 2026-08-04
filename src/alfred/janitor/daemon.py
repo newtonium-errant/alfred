@@ -33,7 +33,9 @@ from .triage import collect_open_triage_tasks, format_open_triage_block
 from .backends.cli import ClaudeBackend
 from .config import JanitorConfig
 from .context import build_vault_context
+from .autofix import autofix_issues
 from .issues import (
+    AUTOFIX_FIXABLE_CODES,
     FixLogEntry,
     Issue,
     SweepResult,
@@ -228,6 +230,58 @@ async def run_sweep(
         state.add_sweep(result)
         state.save()
         return result
+
+    # Phase 1.5: Deterministic autofix (only if fix_mode and not
+    # structural_only — this MUTATES the vault, so it is gated exactly
+    # like the agent phase below; a ``scan`` must stay read-only).
+    #
+    # Why this exists: ``autofix.py`` was orphaned by the 2026-05-25
+    # backend-abstraction-collapse — zero call sites, never executed —
+    # while the 2026-06-25 agent-routing filter began HIDING the codes it
+    # was supposed to handle from the agent (``daemon.py`` comment: "handled
+    # deterministically by the scanner + autofix"). With autofix dead, that
+    # comment was false and FM001-004/LINK002 had NO remediation path at
+    # all: detected every sweep, fixed by nobody. That is the mechanism
+    # behind "9 sweeps, 0 files fixed". Wiring it here makes the filter's
+    # premise true.
+    if fix_mode and not structural_only:
+        autofix_targets = [i for i in issues if i.code in AUTOFIX_FIXABLE_CODES]
+        if not autofix_targets:
+            # ILB: an all-agent-actionable sweep is a legitimate outcome;
+            # say so rather than leaving the autofix stage silent.
+            log.info(
+                "sweep.no_autofix_targets",
+                sweep_id=sweep_id,
+                issues_found=len(issues),
+                detail="ran, nothing to autofix — no FM001-004/LINK002 in "
+                       "this sweep",
+            )
+        else:
+            session_path = create_session_file()
+            try:
+                fixed, flagged, skipped = autofix_issues(
+                    autofix_targets, Path(config.vault.vault_path), session_path,
+                )
+                result.files_fixed += len(fixed)
+                # Same audit shape the agent phase writes, so a
+                # deterministic repair and an agent repair are one
+                # greppable stream rather than two formats.
+                mutations = read_mutations(session_path)
+                audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+                append_to_audit_log(
+                    audit_path, "janitor", mutations,
+                    detail=f"{sweep_id} autofix",
+                )
+                log.info(
+                    "sweep.autofix_complete",
+                    sweep_id=sweep_id,
+                    targets=len(autofix_targets),
+                    files_fixed=len(fixed),
+                    files_flagged=len(flagged),
+                    files_skipped=len(skipped),
+                )
+            finally:
+                cleanup_session_file(session_path)
 
     # Phase 2: Fix (only if fix_mode and not structural_only)
     if fix_mode and not structural_only:
