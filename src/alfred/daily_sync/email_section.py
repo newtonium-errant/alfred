@@ -5,10 +5,17 @@ them as a numbered batch Andrew can reply to with terse corrections.
 
 Sampling strategy:
   1. Walk ``vault/note/*.md`` newest-first by mtime.
-  2. Keep records whose frontmatter has ``priority`` set to a real tier
-     (i.e. the classifier has run and produced a confident output —
-     the unclassified sentinel is excluded so calibration only sees
-     real classifier decisions).
+  2. Keep records carrying the MAIL PROVENANCE MARKER (#40 —
+     ``email_derived``, written by the curator at structuring time), and
+     whose ``priority`` is a real tier (the classifier has run and
+     produced a confident output — the unclassified sentinel is excluded
+     so calibration only sees real classifier decisions).
+
+     Provenance is checked FIRST and separately. A real tier is NOT
+     evidence a record came from mail: the backfill's admission
+     heuristic stamps ``priority`` on any note that merely MENTIONS
+     email or inbox, and that stamp then read as provenance forever —
+     which is how an EMAIL TIER card landed on a screenshot note.
   3. Filter to records whose path is NOT already in the corpus
      (calibration corpus is append-only; we don't show Andrew the same
      note twice).
@@ -36,6 +43,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import frontmatter
+
+from alfred.curator.mail_provenance import note_is_email_derived
 
 from .config import DailySyncConfig
 from .corpus import iter_corrections
@@ -154,6 +163,23 @@ def _read_candidate(
         return None
 
     fm = post.metadata or {}
+
+    # #40 — PROVENANCE FIRST, tier second. These are two different questions and
+    # collapsing them is what put an EMAIL TIER card on a screenshot note.
+    #
+    # The old predicate was `priority in _REAL_TIERS` alone: a real tier was
+    # taken as proof the record came from mail. It is not. The backfill's
+    # permissive admission heuristic stamps `priority` on any note merely
+    # MENTIONING email or inbox — a Daily Sync bug report qualifies — and the
+    # stamp then reads as provenance forever.
+    #
+    # Requiring the marker is what makes a stray stamp UNSAMPLEABLE: no marker,
+    # no card, regardless of what `priority` says. Fail-closed on purpose — a
+    # missed calibration item costs one batch slot; a false one costs a corpus
+    # row asserting an email judgment about something that was never email.
+    if not note_is_email_derived(fm):
+        return None
+
     priority = str(fm.get("priority") or "").strip().lower()
     if priority not in _REAL_TIERS:
         return None
