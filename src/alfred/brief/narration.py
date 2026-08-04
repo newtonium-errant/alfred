@@ -177,14 +177,33 @@ def _day_state_text(view: "TodayView") -> str:
 
 def _health_text(tool_lines: list[tuple[str, str, str]]) -> str:
     """The health-glance segment from ``_per_tool_lines`` (tool, status, detail).
-    Speaks only the non-ok tools (say-less); all-green is one reassuring line."""
-    non_ok = [(t, s, d) for (t, s, d) in tool_lines if s.lower() != "ok"]
+    Speaks only the tools needing attention (say-less); nothing needing attention
+    is one reassuring line.
+
+    Attention is :func:`~.health_section.is_attention_status` — the SAME
+    predicate the feed's health cards use, not a local ``!= "ok"``. A skipped
+    check did not apply, so speaking it would tell the operator that an
+    unconfigured tool "needs a look" every single morning: KAL-LE's measured BIT
+    is ``{ok: 5, warn: 0, fail: 0, skip: 7}``, which the old comparison narrated
+    as "7 tools need a look" daily, with nothing wrong.
+    """
+    from .health_section import is_attention_status
+
+    attention = [(t, s, d) for (t, s, d) in tool_lines if is_attention_status(s)]
     if not tool_lines:
         return ""  # no health data → omit the slide (ILB handled by caller)
-    if not non_ok:
+    if not attention:
+        # Mirrors the ratified skip-posture ruling in
+        # ``kalle_digest._render_skip_posture``: skips ALONGSIDE passing probes
+        # are green, unqualified — but green on ZERO passing probes would claim
+        # checks passed on the strength of no evidence. Suppressing skips is what
+        # makes the all-skipped case reachable here (it used to fall into the
+        # "needs a look" branch), so it has to be answered honestly.
+        if not any(s.strip().lower() == "ok" for (_t, s, _d) in tool_lines):
+            return "No health checks ran this morning."
         return "All systems green."
-    names = ", ".join(t for (t, _s, _d) in non_ok)
-    n = len(non_ok)
+    names = ", ".join(t for (t, _s, _d) in attention)
+    n = len(attention)
     return f"Heads up — {n} tool{'s' if n != 1 else ''} need{'s' if n == 1 else ''} a look: {names}."
 
 

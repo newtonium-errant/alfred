@@ -6,14 +6,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import structlog
+
 from alfred.brief.feed_producer import (
     event_feed_items,
     health_feed_items,
     peer_digest_feed_items,
 )
+from alfred.feed import FeedStore
 
 
-# --- health: one item per NON-OK tool ---------------------------------------
+# --- health: one item per ATTENTION-status tool ------------------------------
 
 
 def _write_bit(vault: Path, date_str: str = "2026-07-30") -> None:
@@ -30,7 +33,44 @@ def _write_bit(vault: Path, date_str: str = "2026-07-30") -> None:
     )
 
 
-def test_health_emits_only_non_ok_tools(tmp_path: Path) -> None:
+def _write_bit_lines(vault: Path, summary: str, date_str: str = "2026-07-30") -> None:
+    """Write a BIT record whose ``## Summary`` block is exactly ``summary``.
+
+    Replaces any existing record so a test can advance the vault to "the next
+    morning's BIT" without leaving the previous day's file to win the
+    latest-record lookup.
+    """
+    run = vault / "run"
+    run.mkdir(parents=True, exist_ok=True)
+    for old in run.glob("Alfred BIT *.md"):
+        old.unlink()
+    (run / f"Alfred BIT {date_str}.md").write_text(
+        "---\ntype: run\n---\n\n## Summary\n" + summary + "## Detail\n",
+        encoding="utf-8",
+    )
+
+
+# KAL-LE's real BIT shape, measured 2026-08-03: tool_counts
+# {ok: 5, warn: 0, fail: 0, skip: 7}, overall_status "skip". The 7 skipped tools
+# are unconfigured on that instance, so this is its STEADY state, not a bad day.
+_KALLE_SUMMARY = (
+    "[OK] curator  (120 ms)\n"
+    "[OK] janitor  (88 ms)\n"
+    "[OK] distiller  (95 ms)\n"
+    "[OK] brief  (40 ms)\n"
+    "[OK] surveyor  (150 ms)\n"
+    "[SKIP] talker\n"
+    "[SKIP] mail\n"
+    "[SKIP] gcal\n"
+    "[SKIP] weather\n"
+    "[SKIP] transport\n"
+    "[SKIP] scribe\n"
+    "[SKIP] peer\n"
+)
+_KALLE_SKIPPED = ["gcal", "mail", "peer", "scribe", "talker", "transport", "weather"]
+
+
+def test_health_emits_only_attention_tools(tmp_path: Path) -> None:
     _write_bit(tmp_path)
     items = health_feed_items(tmp_path, instance="salem")
     by_id = {it.id: it for it in items}
@@ -38,6 +78,234 @@ def test_health_emits_only_non_ok_tools(tmp_path: Path) -> None:
     assert by_id["health:surveyor"].mode == "fyi"  # awareness kind
     assert "ollama 404" in by_id["health:surveyor"].title
     assert by_id["health:janitor"].evidence["status"] == "fail"
+
+
+# --- health: skip produces NO card (the #8 defect) ---------------------------
+
+
+def test_health_skip_tools_produce_no_cards(tmp_path: Path) -> None:
+    """KAL-LE's steady state (5 ok + 7 skip, nothing wrong) must card NOTHING.
+
+    The pre-fix filter was ``if status == "ok": continue``, which carded all 7
+    skipped tools as "Health: <tool> SKIP" fyi items every morning.
+
+    Mutation: restore ``if status == "ok": continue`` → this fails with 7 items.
+    """
+    _write_bit_lines(tmp_path, _KALLE_SUMMARY)
+    items = health_feed_items(tmp_path, instance="kalle")
+    assert items == []
+
+
+def test_health_skip_only_vault_is_genuine_empty(tmp_path: Path) -> None:
+    """Every tool skipped → ``[]``, the genuine-empty read (NOT ``None``).
+
+    ``[]`` and ``None`` are different contracts: ``[]`` is "I read the health
+    and nothing needs attention" (caller reconciles, stale warns clear); ``None``
+    is "I could not read it" (caller must not reconcile). An all-skip BIT is a
+    successful read, so it owes the caller ``[]``.
+    """
+    _write_bit_lines(tmp_path, "[SKIP] talker\n[SKIP] mail\n")
+    assert health_feed_items(tmp_path, instance="kalle") == []
+
+
+def test_health_mixed_skip_and_warn_cards_only_the_warn(tmp_path: Path) -> None:
+    """Skips are suppressed WITHOUT suppressing a real warn sharing the record.
+
+    Guards the over-broad fix (dropping every non-fail, or bailing out of the
+    loop on the first skip) — the warn still has to come through.
+    """
+    _write_bit_lines(
+        tmp_path,
+        "[OK] curator  (1 ms)\n[SKIP] talker\n"
+        "[WARN] surveyor — ollama 404\n[SKIP] mail\n",
+    )
+    items = health_feed_items(tmp_path, instance="kalle")
+    assert [it.id for it in items] == ["health:surveyor"]
+    assert items[0].evidence["status"] == "warn"
+
+
+def test_health_unknown_status_still_cards(tmp_path: Path) -> None:
+    """An UNRECOGNISED status fails OPEN — it still produces a card.
+
+    The suppression is a denylist ({ok, skip}), not an allowlist ({warn, fail}),
+    so a future 5th Status value or a hand-edited record surfaces instead of
+    being silently dropped. On a health surface a spurious card costs noise; a
+    dropped card costs a missed outage.
+
+    Mutation: make the predicate an allowlist (``status in {"warn", "fail"}``)
+    → this fails, and nothing else in the suite does.
+    """
+    _write_bit_lines(tmp_path, "[OK] curator  (1 ms)\n[DEGRADED] surveyor — new status\n")
+    items = health_feed_items(tmp_path, instance="kalle")
+    assert [it.id for it in items] == ["health:surveyor"]
+    assert items[0].evidence["status"] == "degraded"
+
+
+def test_health_skip_suppression_is_logged(tmp_path: Path) -> None:
+    """ILB: suppression must be greppable, not silent.
+
+    "Why is there no health card for my skipped tool?" has to be answerable from
+    the log alone — silence there is indistinguishable from a broken producer.
+    """
+    _write_bit_lines(tmp_path, _KALLE_SUMMARY)
+    with structlog.testing.capture_logs() as captured:
+        health_feed_items(tmp_path, instance="kalle")
+    matches = [c for c in captured if c.get("event") == "brief.health_feed_quiet_tools"]
+    assert len(matches) == 1
+    assert matches[0]["count"] == 7
+    assert matches[0]["tools"] == _KALLE_SKIPPED
+    assert matches[0]["instance"] == "kalle"
+    assert "reason" in matches[0]
+
+
+def test_health_no_quiet_tools_logs_nothing(tmp_path: Path) -> None:
+    """The suppression line fires only when something was actually suppressed —
+    an ok-only instance (Salem's shape) must not emit a daily count=0 line."""
+    _write_bit_lines(tmp_path, "[OK] curator  (1 ms)\n[WARN] surveyor — x\n")
+    with structlog.testing.capture_logs() as captured:
+        health_feed_items(tmp_path, instance="salem")
+    assert [c for c in captured if c.get("event") == "brief.health_feed_quiet_tools"] == []
+
+
+# --- health × reconcile: the second-order fix -------------------------------
+#
+# The point of suppressing skips is not only quieter cards — it restores the
+# store-level clearing behaviour that a skip-bearing instance had lost. These
+# drive the real ``FeedStore.reconcile``, because the defect lives in the
+# INTERACTION (stable key = tool name) and no per-extractor pin can see it.
+
+
+def _states(store: FeedStore) -> dict[str, str]:
+    return {i.id: i.state for i in store._fold_from_disk().values()}
+
+
+def test_stale_warn_clears_through_reconcile_on_a_skip_bearing_instance(
+    tmp_path: Path,
+) -> None:
+    """A warn that recovers to ok goes ``acted`` even though the instance has 7
+    permanent skips — i.e. the all-clear path is REACHABLE on KAL-LE.
+
+    Pre-fix, ``out`` on that instance always carried the 7 skip cards, so the
+    genuine-empty ``[]`` this extractor's contract promises was dead code there.
+    """
+    vault = tmp_path / "vault"
+    store = FeedStore(tmp_path / "feed.jsonl")
+
+    _write_bit_lines(vault, _KALLE_SUMMARY + "[WARN] surveyor2 — ollama 404\n")
+    day1 = health_feed_items(vault, instance="kalle")
+    assert [it.id for it in day1] == ["health:surveyor2"]
+    store.reconcile("health", day1)
+    assert _states(store)["health:surveyor2"] == "open"
+
+    # Next morning: surveyor2 recovers. Only the 7 skips remain → genuine [].
+    _write_bit_lines(vault, _KALLE_SUMMARY)
+    day2 = health_feed_items(vault, instance="kalle")
+    assert day2 == []
+    result = store.reconcile("health", day2)
+    assert result["acted"] == 1
+    assert _states(store)["health:surveyor2"] == "acted"
+
+
+def test_warn_that_becomes_skip_clears_instead_of_staying_open(tmp_path: Path) -> None:
+    """A tool going warn → skip must CLEAR its card.
+
+    The stable key is the tool NAME, so pre-fix the id stayed in the incoming
+    open set across that transition — never ABSENT, never ``acted``. The warn
+    card silently mutated into a permanently-open "Health: surveyor SKIP".
+
+    Mutation: restore ``if status == "ok": continue`` → the item stays ``open``
+    and ``acted`` is 0.
+    """
+    vault = tmp_path / "vault"
+    store = FeedStore(tmp_path / "feed.jsonl")
+
+    _write_bit_lines(vault, "[WARN] surveyor — ollama 404\n")
+    store.reconcile("health", health_feed_items(vault, instance="kalle"))
+    assert _states(store)["health:surveyor"] == "open"
+
+    # The tool is unconfigured out of the instance → its check now SKIPs.
+    _write_bit_lines(vault, "[SKIP] surveyor\n")
+    result = store.reconcile("health", health_feed_items(vault, instance="kalle"))
+    assert result["acted"] == 1
+    assert _states(store)["health:surveyor"] == "acted"
+
+
+def test_skip_cards_cannot_groundhog_because_none_are_created(tmp_path: Path) -> None:
+    """No skip card is ever created, so none can be revived after an ack.
+
+    ``health`` is an EPISODE kind (absent from
+    ``feed.model.SNAPSHOT_FINGERPRINT_FIELDS``), so ``_revival_suppressed``
+    declines to suppress and reconcile re-opens an acked item on the next fire.
+    That is correct for a real warn (ok → warn → ok → warn is genuine news) but
+    fatal for a PERMANENT skip: pre-fix, KAL-LE's 7 skip cards came back open
+    every morning no matter how many times the operator acked them. Measured on
+    the pre-fix build: ack both → next reconcile → both back to ``open``.
+
+    An aggregate "7 tools skipped" card would NOT have fixed this — it would be
+    one groundhog instead of seven.
+    """
+    vault = tmp_path / "vault"
+    store = FeedStore(tmp_path / "feed.jsonl")
+
+    _write_bit_lines(vault, _KALLE_SUMMARY)
+    store.reconcile("health", health_feed_items(vault, instance="kalle"))
+    assert _states(store) == {}  # nothing carded at all
+
+    # A real warn appears, the operator acks it, and it stays acked while the
+    # 7 skips keep re-appearing in every BIT.
+    _write_bit_lines(vault, _KALLE_SUMMARY + "[WARN] surveyor2 — ollama 404\n")
+    store.reconcile("health", health_feed_items(vault, instance="kalle"))
+    store.set_state("health:surveyor2", "acked", action="ack")
+    assert _states(store)["health:surveyor2"] == "acked"
+
+    # Next morning, same BIT: only the acked warn is in the store, and no skip
+    # card exists to be revived alongside it.
+    store.reconcile("health", health_feed_items(vault, instance="kalle"))
+    assert set(_states(store)) == {"health:surveyor2"}
+
+
+def test_feed_and_narration_agree_on_every_status(tmp_path: Path) -> None:
+    """CROSS-SURFACE DRIFT PIN: a status cards in the feed iff it is spoken by
+    the narration.
+
+    This defect existed because two surfaces each kept their OWN copy of
+    ``status != "ok"`` — the feed's health cards and ``narration._health_text``.
+    Both were skip-blind, and fixing either alone would have left the other
+    telling the operator that 7 unconfigured tools need a look. Both now call
+    ``health_section.is_attention_status``; this pin fails if either re-localises
+    the comparison.
+
+    Mutation: give ``_health_text`` its own ``s.lower() != "ok"`` back → the
+    ``skip`` row disagrees and this fails.
+    """
+    from alfred.brief.narration import _health_text
+
+    for status in ("ok", "skip", "warn", "fail", "degraded"):
+        _write_bit_lines(tmp_path, f"[{status.upper()}] surveyor — detail\n")
+        carded = [it.id for it in health_feed_items(tmp_path, instance="kalle")]
+        spoken = "surveyor" in _health_text([("surveyor", status, "detail")])
+        assert bool(carded) == spoken, (
+            f"{status}: feed carded={carded!r} but narration spoken={spoken}"
+        )
+
+
+def test_warn_and_fail_still_reconcile_open(tmp_path: Path) -> None:
+    """Preservation pin: WARN and FAIL tools still produce OPEN cards.
+
+    The paired half of the suppression — a fix that quieted real problems too
+    would pass every skip-focused test above.
+    """
+    vault = tmp_path / "vault"
+    store = FeedStore(tmp_path / "feed.jsonl")
+    _write_bit_lines(
+        vault,
+        "[OK] curator  (1 ms)\n[SKIP] talker\n"
+        "[WARN] surveyor — ollama 404\n[FAIL] janitor — boom\n",
+    )
+    items = health_feed_items(vault, instance="kalle")
+    assert {it.id for it in items} == {"health:surveyor", "health:janitor"}
+    store.reconcile("health", items)
+    assert _states(store) == {"health:surveyor": "open", "health:janitor": "open"}
 
 
 def test_health_no_record_is_none_not_empty(tmp_path: Path) -> None:
