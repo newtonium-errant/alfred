@@ -734,12 +734,15 @@ async def test_recall_logs_the_disclosed_snippet_fields(recall_fm_client) -> Non
     answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
     assert len(answered) == 1
     entry = answered[0]
-    assert set(entry["snippet_fields"]) == {"name", "role", "org", "description"}
-    # Every granted field is populated on this record → rendered == granted.
-    assert set(entry["snippet_fields_rendered"]) == {"name", "role", "org", "description"}
+    # `_granted` is the config CEILING (a name list); `_rendered` is a COUNT.
+    assert set(entry["snippet_fields_granted"]) == {"name", "role", "org", "description"}
+    # Every granted field is populated on this record → no gap.
+    assert entry["snippet_fields_rendered"] == 4
     assert entry["snippet_records_with_frontmatter"] == 1
-    assert "email" not in entry["snippet_fields"]
-    assert "email" not in entry["snippet_fields_rendered"]
+    assert "email" not in entry["snippet_fields_granted"]
+    # The old ambiguous name must not survive anywhere — a stale audit query
+    # keyed on it would silently read the ceiling as "what we disclosed".
+    assert "snippet_fields" not in entry
     # The empty-tier signal must NOT fire when fields did contribute.
     assert not [
         c for c in captured
@@ -771,10 +774,82 @@ async def test_recall_logs_when_the_allowlist_contributes_nothing(
     assert empty[0]["match_count"] >= 1
     assert empty[0]["reason"] == "no_field_grant"  # WHY it's empty, not just that
     answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
-    assert answered[0]["snippet_fields"] == []
-    assert answered[0]["snippet_fields_rendered"] == []
+    # Diagnosis 1 of 3: granted=0 → widen canonical.peer_permissions.
+    assert answered[0]["snippet_fields_granted"] == []
+    assert answered[0]["snippet_fields_rendered"] == 0
     assert answered[0]["snippet_records_with_frontmatter"] == 0
     assert answered[0]["snippet_records_filtered"] >= 1
+
+
+async def test_recall_logs_the_live_granted_gt_rendered_shape(
+    tmp_path, aiohttp_client,
+) -> None:
+    """Diagnosis 3 of 3 — and the MORNING GREP TARGET.
+
+    Reproduces Salem's live kal-le/person grant
+    (`[name, email, timezone, aliases, "preferences.coding"]`) against a
+    template-shaped record. Two of those five are not fields on `person` at
+    all, so the gate can never grant them — an allowlist entry is a ceiling,
+    not a promise. `aliases` IS granted but empty, so it renders nothing.
+    Expected on the box: granted 3, rendered 2 → partial substance, and
+    NOTHING to action. Without both numbers this reads as a failure.
+    """
+    audit_path = str(tmp_path / "canonical_audit.jsonl")
+    cfg = _transport_config(audit_path=audit_path)
+    cfg.canonical = CanonicalConfig(
+        audit_log_path=audit_path,
+        peer_permissions={
+            "kal-le": {
+                "person": {
+                    "fields": [
+                        "name", "email", "timezone", "aliases",
+                        "preferences.coding",
+                    ],
+                },
+            },
+        },
+    )
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(cfg, tstate)
+    vault = _make_vault(tmp_path)
+    _write_person_with_frontmatter(vault)
+    (vault / "person" / "Ben McMillan.md").write_text(
+        "---\ntype: person\nname: Ben McMillan\n"
+        f"email: {_WITHHELD_EMAIL}\n"
+        "aliases: []\n"           # granted, EMPTY → counted, not rendered
+        "description: Ops partner on the RRTS rollout\n"  # substance, ungranted
+        "org: RRTS\nrole: Operations lead\n"
+        "---\n" + _PERSON_TEMPLATE_BODY,
+        encoding="utf-8",
+    )
+    register_vault_path(app, vault)
+    register_instance_identity(app, name="Salem")
+    register_recall_routes(app, enabled=True, instance_name="Salem")
+    client = await aiohttp_client(app)
+
+    with structlog.testing.capture_logs() as captured:
+        resp = await client.post(
+            "/peer/recall", headers=_KALLE_HEADERS, json={"query": "Ben McMillan"},
+        )
+    assert resp.status == 200
+    answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
+    entry = answered[0]
+    assert entry["snippet_fields_granted"] == ["aliases", "email", "name"]  # 3
+    assert entry["snippet_fields_rendered"] == 2                            # aliases empty
+    assert entry["snippet_records_with_frontmatter"] == 1
+    # Granted-but-unavailable allowlist entries never appear: they are not
+    # fields on `person`, so the gate cannot grant them however config reads.
+    assert "timezone" not in entry["snippet_fields_granted"]
+    assert "preferences.coding" not in entry["snippet_fields_granted"]
+    # Partial substance is NOT the empty state — the signal must stay quiet.
+    assert not [
+        c for c in captured
+        if c.get("event") == "transport.recall.snippet_frontmatter_empty"
+    ]
+    # And the config-withheld substance is genuinely absent from the wire.
+    person = next(m for m in (await resp.json())["matches"] if m["type"] == "person")
+    assert "role: Operations lead" not in person["snippet"]
+    assert "description:" not in person["snippet"]
 
 
 async def test_recall_empty_signal_distinguishes_grant_exists_but_all_empty(
@@ -818,11 +893,13 @@ async def test_recall_empty_signal_distinguishes_grant_exists_but_all_empty(
     ]
     assert len(empty) == 1
     assert empty[0]["reason"] == "granted_fields_all_empty"
-    assert empty[0]["granted_fields"] == ["aliases"]  # the grant DID resolve
+    # Same key as the `answered` event → one grep reaches both sides.
+    assert empty[0]["snippet_fields_granted"] == ["aliases"]  # the grant DID resolve
     answered = [c for c in captured if c.get("event") == "transport.recall.answered"]
-    # granted 1, rendered 0 — the whole point of carrying both numbers.
-    assert answered[0]["snippet_fields"] == ["aliases"]
-    assert answered[0]["snippet_fields_rendered"] == []
+    # Diagnosis 2 of 3: granted=1, rendered=0 → the grant is fine, the records
+    # are empty. Indistinguishable from diagnosis 1 without BOTH numbers.
+    assert answered[0]["snippet_fields_granted"] == ["aliases"]
+    assert answered[0]["snippet_fields_rendered"] == 0
 
 
 # --- pure helpers -----------------------------------------------------------

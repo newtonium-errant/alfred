@@ -289,8 +289,9 @@ class SnippetFieldStats:
     """
 
     # GATE-GRANTED (config ceiling) vs ACTUALLY-RENDERED (non-empty on the
-    # records). Both are logged: their difference names the granted-but-empty
-    # fields, which is otherwise indistinguishable from the gate withholding.
+    # records). Both are kept as NAME lists here — the rendered names drive
+    # the empty-signal branch — but the log emits granted as a list and
+    # rendered as a COUNT; the gap is what carries the diagnosis.
     granted_fields: list[str] = field(default_factory=list)
     rendered_fields: list[str] = field(default_factory=list)
     records_with_frontmatter: int = 0
@@ -650,20 +651,22 @@ async def _handle_peer_recall(request: web.Request) -> web.StreamResponse:
         match_count=len(matches),
         types_searched=list(search_types),
         denied_types=denied_types,
-        # Snippet frontmatter tier — the line that says whether the limiter
-        # is the CODE or the operator's allowlist. Two field lists, because
-        # they answer different questions and their difference is meaningful:
-        #   snippet_fields          — what the GATE granted (the config ceiling)
-        #   snippet_fields_rendered — what actually reached the snippet
-        # A field in the first but not the second was granted-but-EMPTY on
-        # these records (e.g. `aliases: []`), which is otherwise
-        # indistinguishable from the gate withholding it. An answer with
-        # matches, snippet_fields=[] and every record in
-        # snippet_records_filtered means the peer has no field grant for
-        # these types at all — that fix is a canonical.peer_permissions
-        # widen, not a code change.
-        snippet_fields=field_stats.granted_fields,
-        snippet_fields_rendered=field_stats.rendered_fields,
+        # Snippet frontmatter tier — the line that says whether the limiter is
+        # the CODE or the operator's allowlist.
+        #
+        # `_granted` is the config CEILING (what the gate allowed), not a
+        # record of what left the box — the explicit name matters because this
+        # sits beside disclosure-accounting siblings, and a bare
+        # `snippet_fields` reads as "what we disclosed" and over-reports.
+        #
+        # The GAP between the two is a third diagnosis neither gives alone:
+        #   granted=0                → no field grant; widen canonical.peer_permissions
+        #   granted=n, rendered=0    → grant is fine, the records are empty
+        #   granted > rendered > 0   → partial substance; nothing to action
+        # (kal-le/person's post-deploy state is the third: granted 3,
+        # rendered 2 — `aliases` is granted but empty.)
+        snippet_fields_granted=field_stats.granted_fields,
+        snippet_fields_rendered=len(field_stats.rendered_fields),
         snippet_records_with_frontmatter=field_stats.records_with_frontmatter,
         snippet_records_filtered=field_stats.records_filtered_empty,
     )
@@ -685,7 +688,9 @@ async def _handle_peer_recall(request: web.Request) -> web.StreamResponse:
             match_count=len(matches),
             types_searched=list(search_types),
             reason="no_field_grant" if no_grant else "granted_fields_all_empty",
-            granted_fields=field_stats.granted_fields,
+            # Same key name as the `answered` event so ONE grep
+            # (`snippet_fields_granted`) reaches both sides of the story.
+            snippet_fields_granted=field_stats.granted_fields,
             detail=(
                 "no canonical field grant for this peer × these types — "
                 "snippets are body-only (widen canonical.peer_permissions "
