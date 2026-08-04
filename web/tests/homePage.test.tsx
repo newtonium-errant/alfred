@@ -61,7 +61,10 @@ describe('HomePage composer — the deck pill counts only deck-able kinds', () =
     mockList.mockResolvedValue({
       items: [
         item('email_tier', 'e1', 'needs_you', 'decide'), // deck-able (wired verb)
-        item('slot_suggestion', 's1', 'needs_you', 'decide'), // NOT deck-able (a ring)
+        // Non-deck-able HERE because it carries no `ringItemSuggested` marker —
+        // NOT because slot_suggestion is inherently non-deck-able (isDeckDealt
+        // deals a SUGGESTED slot). #22: that conflation was the old false claim.
+        item('slot_suggestion', 's1', 'needs_you', 'decide'),
       ],
       count: 2,
     });
@@ -74,6 +77,61 @@ describe('HomePage composer — the deck pill counts only deck-able kinds', () =
 
     // The needs-you line is the FEED total — true, and distinct from the deck.
     expect(screen.getByTestId('composer-needs-you').textContent).toContain('2 things need you');
+  });
+
+  // --- #22 / D5: the check-in says what is COUNTED, and claims nothing more ---
+  // The surface used to rest on `total = deck + rings`, false in both directions:
+  // a SUGGESTED slot_suggestion IS deck-able, and a kind with no wired verb is
+  // non-deck-able without being in the rings. The structural partition is
+  // deliberately deferred to the reimagine arc, so the copy must not imply one.
+
+  it('when the deck holds only some of them, it says so WITHOUT placing the rest in the rings', async () => {
+    mockList.mockResolvedValue({
+      items: [
+        item('email_tier', 'e1', 'needs_you', 'decide'), // deck-able
+        item('slot_suggestion', 's1', 'needs_you', 'decide'), // not deck-able here
+      ],
+      count: 2,
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('composer-needs-you-deckable')).not.toBeNull());
+
+    const split = screen.getByTestId('composer-needs-you-deckable').textContent ?? '';
+    expect(split).toContain('1 of them can be handled in the deck');
+    // The retired claim, in any of its spellings.
+    expect(split.toLowerCase()).not.toContain('ring');
+  });
+
+  it('the whole check-in section never claims the rings account for the remainder', async () => {
+    mockList.mockResolvedValue({
+      items: [
+        item('email_tier', 'e1', 'needs_you', 'decide'),
+        item('slot_suggestion', 's1', 'needs_you', 'decide'),
+      ],
+      count: 2,
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('composer-needs-you')).not.toBeNull());
+
+    // Asserted on the RENDERED section, so it holds however the copy is reworded.
+    const section = screen.getByTestId('compose-checkin').textContent ?? '';
+    expect(section.toLowerCase()).not.toContain('ring');
+  });
+
+  it('when the deck holds ALL of them there is nothing to explain, so no split line', async () => {
+    mockList.mockResolvedValue({
+      items: [
+        item('email_tier', 'e1', 'needs_you', 'decide'),
+        item('email_tier', 'e2', 'needs_you', 'decide'),
+      ],
+      count: 2,
+    });
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('composer-deck-pill')).not.toBeNull());
+
+    expect(screen.getByTestId('composer-needs-you').textContent).toContain('2 things need you');
+    expect(screen.getByTestId('composer-deck-pill').textContent).toContain('2 decisions');
+    expect(screen.queryByTestId('composer-needs-you-deckable')).toBeNull();
   });
 
   it('an ACTED email_tier is NOT counted in the deck pill (the open-split is the guard)', async () => {

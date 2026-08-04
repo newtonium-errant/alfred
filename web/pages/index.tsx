@@ -85,9 +85,11 @@ export default function HomePage() {
   // no way to see the flip and lagged a whole fetch behind the green segment.
   const completion = useRingCompletion({ onAuthExpired });
   // How many things need you (the FEED truth) vs how many the DECK can actually
-  // deal. The deck only handles kinds with a wired verb — slot_suggestion et al.
-  // aren't swipeable — so the deck PROMISE counts deck-able only (mirrors feed.tsx,
-  // b1). A DONE slot item (board-completed) no longer needs you, so it's excluded
+  // deal. `isDeckDealt` is the ONLY authority on which items the deck deals —
+  // don't restate its rule here, because paraphrases of it are what #22 retired
+  // (the old one said slot_suggestion "isn't swipeable"; a SUGGESTED one is). The
+  // deck PROMISE counts deck-able only, so it can never over-promise the deck
+  // (mirrors feed.tsx, b1). A DONE slot item (board-completed) no longer needs you, so it's excluded
   // from the needs-you total (Phase C) — via the shared hook, so a completion in the
   // rings drops the count in the SAME render. No override → `effectiveDone` is
   // exactly `ringItemDone`, so the server-truth baseline is unchanged.
@@ -199,14 +201,34 @@ export default function HomePage() {
         {mode === 'checkin' && (
           <section data-testid="compose-checkin" className="mt-6">
             <h2 className={titleClass}>Midday check-in</h2>
-            {/* The feed total (true) — distinct from the deck pill below, which is
-                the deck-able subset. In check-in the non-deck-able needs-you items
-                (slot_suggestion) are the rings above, so total = deck + rings. */}
+            {/* WHAT THIS NUMBER IS: open feed items flagged as needing a decision
+                (attention `needs_you`, or mode `decide` on older items), minus slot
+                items already completed today. That is all it is.
+
+                It used to claim `total = deck + rings`. That identity is false in
+                BOTH directions (#22 / D5), so it is stated nowhere now:
+                  * a slot_suggestion is deck-able when `ringItemSuggested`
+                    (isDeckDealt), so "slot_suggestion" and "non-deck-able" are not
+                    the same set; and
+                  * any kind with no wired deck verb is non-deck-able and is NOT in
+                    the rings either — so total - deck can include items that live
+                    in neither.
+                The real partition is deliberately NOT redrawn here: the
+                interface-reimagine arc's Decide/Awareness split will redraw these
+                buckets, and deciding it twice in weeks is waste. Copy says what is
+                COUNTED and where the counted things can be acted on — it does not
+                account for a remainder it cannot honestly place. */}
             <p data-testid="composer-needs-you" className={`mt-3 ${subtle}`}>
               {needsYouCount > 0
                 ? `${needsYouCount} thing${needsYouCount > 1 ? 's' : ''} need${needsYouCount > 1 ? '' : 's'} you.`
                 : 'Nothing needs you right now.'}
             </p>
+            {deckableCount > 0 && deckableCount < needsYouCount && (
+              <p data-testid="composer-needs-you-deckable" className={`mt-1 ${subtle}`}>
+                {deckableCount} of them can be handled in the deck; the rest are on
+                the feed.
+              </p>
+            )}
             {deckableCount > 0 && deckPill}
           </section>
         )}

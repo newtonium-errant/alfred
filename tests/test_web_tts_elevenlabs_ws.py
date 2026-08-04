@@ -15,7 +15,7 @@ import asyncio
 import base64
 import json
 import os
-from pathlib import Path
+import pathlib
 
 import aiohttp
 import pytest
@@ -380,16 +380,108 @@ async def test_no_key_or_text_in_logs() -> None:
 
 
 def _live_key() -> str:
-    key = os.environ.get("ELEVENLABS_API_KEY", "")
-    if key:
-        return key
-    env_path = Path("/home/andrew/alfred/.env")
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("ELEVENLABS_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return ""
+    """The live-gate key — from the ENVIRONMENT only.
+
+    D9 (operator ruling, 2026-08-04): this test is OPT-IN by export. It used to
+    fall back to reading the repo's ``.env`` off disk when the variable was
+    unset, which meant it never skipped: every full-suite run made a real,
+    billable ElevenLabs turn.
+
+    That fallback also went AROUND #16's whole defence. The suppression there
+    neutralises ``dotenv.load_dotenv`` and the collection pin watches
+    ``os.environ`` — both were still true and both were irrelevant, because this
+    read the file itself and never touched ``os.environ``. Nothing could see it
+    until #28's ``live_network`` inventory printed the destination.
+
+    Environment-only, like the Groq siblings in test_web_voice_stt_shadow.py.
+    Export the key to opt in; otherwise the skipif below skips.
+    """
+    return os.environ.get("ELEVENLABS_API_KEY", "")
+
+
+# --- the gate itself (#43) --------------------------------------------------
+# UNCONDITIONAL by design: these guard the opt-in gate, so they must not be
+# skipped by the very gate they guard (feedback_regression_pin_unconditional).
+# They use monkeypatch rather than raw os.environ writes — ELEVENLABS_API_KEY is
+# in CLOUD_KEY_ENV_VARS, so a raw write would trip #28's cloud-key teardown
+# check; monkeypatch reverts before that autouse teardown runs.
+
+
+def test_live_key_is_environment_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset variable → no key → the live test skips.
+
+    Pre-fix this returned the real key read straight out of the repo's ``.env``,
+    so the skipif never fired and every full-suite run spent money.
+    """
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    # NEVER put `_live_key()` inside the assert. A failing assert renders its
+    # operands AND every sub-expression: `assert len(_live_key()) == 0` reports
+    # `where 51 = len('<the live key>')` / `where '<the live key>' = _live_key()`.
+    # Comparing length is not enough on its own — the CALL has to happen outside
+    # the statement, so the only thing pytest can render is a plain int.
+    # It matters because this fails exactly when the regression exists, which is
+    # when the output reaches CI logs and pasted tickets. Same standard this
+    # file's own `test_no_key_or_text_in_logs` states. Measured both ways.
+    key_len = len(_live_key())
+    assert key_len == 0, "the .env fallback is back — the gate returned a key"
+
+
+def test_live_key_honours_an_exported_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exporting the key is how the operator opts IN — that path still works."""
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "DUMMY_ELEVENLABS_TEST_KEY")
+    # Same rule: a regression preferring the FILE over the environment would put
+    # a real key on the left of this comparison, so the comparison happens
+    # outside the assert and only its boolean result is rendered.
+    honoured = _live_key() == "DUMMY_ELEVENLABS_TEST_KEY"
+    assert honoured is True, "an exported ELEVENLABS_API_KEY was not honoured"
+
+
+def test_live_key_touches_no_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate reads os.environ and NOTHING else.
+
+    The structural half of the pin, and the one that holds on any machine: the
+    env-only assertion above is only meaningful where a ``.env`` carrying the key
+    actually exists (it does on the dev box — that is why this was live). This
+    one fails on the pre-fix code anywhere, because that code called
+    ``Path.exists()`` before deciding.
+
+    The spies RECORD and delegate rather than raising. Raising inside a patched
+    ``Path`` method looks tidier but fails catastrophically: pytest's own
+    traceback machinery calls ``Path.exists()`` while building the failure
+    report, so the sentinel fires again from inside pytest and the run dies with
+    an INTERNALERROR that aborts every remaining test. Measured, restoring the
+    fallback. Recording keeps the regression a single readable red test.
+
+    Mutation: restore the ``.env`` fallback → this fails on `touched`, naming the
+    path it reached for.
+    """
+    touched: list[str] = []
+    real_exists, real_read = pathlib.Path.exists, pathlib.Path.read_text
+
+    def _spy_exists(self: pathlib.Path, *a: object, **kw: object) -> bool:
+        touched.append(f"exists({self})")
+        return real_exists(self, *a, **kw)
+
+    def _spy_read(self: pathlib.Path, *a: object, **kw: object) -> str:
+        touched.append(f"read_text({self})")
+        return real_read(self, *a, **kw)
+
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.setattr(pathlib.Path, "exists", _spy_exists)
+    monkeypatch.setattr(pathlib.Path, "read_text", _spy_read)
+
+    # Snapshot around the call ONLY, so unrelated pytest-internal Path use
+    # before or after cannot pollute the observation.
+    touched.clear()
+    result_len = len(_live_key())  # length only — see the env-only pin above
+    observed = list(touched)
+
+    # Filesystem assertion FIRST, deliberately: it reports PATHS, which are safe
+    # to print, and under the regression it is the one that fires — so the
+    # readable failure names the file that was reached rather than anything from
+    # inside it.
+    assert observed == [], f"_live_key reached the filesystem: {observed}"
+    assert result_len == 0, "the gate returned a key with no environment variable set"
 
 
 @pytest.mark.live_network
