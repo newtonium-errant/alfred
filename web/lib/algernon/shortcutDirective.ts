@@ -69,11 +69,48 @@ function aliasToPattern(alias: string): string {
     .join('\\s+');
 }
 
+/**
+ * Hygiene bound (chars, AFTER whitespace collapse) for the provenance `spokenForm`.
+ * A real prefix ("message for hypatia,") is ~20 chars; the headroom covers a long
+ * CONFIGURED alias.
+ */
+export const SPOKEN_FORM_MAX_CHARS = 120;
+
+/**
+ * Provenance hygiene for the matched directive prefix: collapse every whitespace
+ * run to one space, trim, then cap at SPOKEN_FORM_MAX_CHARS. Provenance-ONLY — the
+ * caller's `rest` (the record body) is untouched, so this cannot change what gets
+ * ingested, only how the capture's origin is described.
+ *
+ * The two halves defend two different vectors, both measured:
+ *   COLLAPSE — the `\s+` runs between the directive words match NEWLINES too (the
+ *     patterns carry the `s` flag), so raw dictated input alone can produce a
+ *     multi-KB, multi-line prefix (measured: "message" + 7000 newlines + "for
+ *     hypatia: buy milk" produced a 7019-char, 7000-newline spokenForm) which then
+ *     rides verbatim into the record's `source:` frontmatter scalar. Reachable with
+ *     the DEFAULT aliases — no config needed.
+ *   BOUND — after collapse the prefix length is governed by the matched ALIAS, and
+ *     aliases are operator config (SHORTCUT_DIRECTIVE_ALIASES) with no length
+ *     validation, so one pasted/mistyped entry would stamp every routed capture.
+ *     Also the belt for any future prefix form that admits more variable text.
+ */
+function sanitizeSpokenForm(raw: string): { spokenForm: string; truncated: boolean } {
+  const collapsed = raw.replace(/\s+/g, ' ').trim();
+  return collapsed.length > SPOKEN_FORM_MAX_CHARS
+    ? { spokenForm: collapsed.slice(0, SPOKEN_FORM_MAX_CHARS), truncated: true }
+    : { spokenForm: collapsed, truncated: false };
+}
+
 export interface DirectiveMatch {
   /** The canonical instance name the alias resolved to (e.g. "hypatia"). */
   canonical: string;
-  /** The matched directive prefix, trimmed (provenance only, e.g. "message for hypatia,"). */
+  /**
+   * The matched directive prefix (provenance only, e.g. "message for hypatia,") —
+   * whitespace-collapsed and length-bounded per `sanitizeSpokenForm`.
+   */
   spokenForm: string;
+  /** Whether `spokenForm` lost characters to the length bound (the caller logs it). */
+  spokenFormTruncated: boolean;
   /** The capture body with the directive prefix stripped (verbatim otherwise). */
   rest: string;
 }
@@ -123,8 +160,10 @@ export function matchLeadingDirective(
       const m = re.exec(text);
       if (m) {
         const rest = m[1];
-        const spokenForm = text.slice(0, text.length - rest.length).trim();
-        return { canonical, spokenForm, rest };
+        const { spokenForm, truncated } = sanitizeSpokenForm(
+          text.slice(0, text.length - rest.length),
+        );
+        return { canonical, spokenForm, spokenFormTruncated: truncated, rest };
       }
     }
   }

@@ -3,6 +3,7 @@ import {
   DEFAULT_DIRECTIVE_ALIASES,
   loadDirectiveAliases,
   matchLeadingDirective,
+  SPOKEN_FORM_MAX_CHARS,
 } from '../lib/algernon/shortcutDirective';
 
 // Pins the DOM-free directive parser + config loader: the three accepted forms,
@@ -81,6 +82,45 @@ describe('matchLeadingDirective — fail-safe non-matches (return null → text 
   it('empty / blank text → null', () => {
     expect(matchLeadingDirective('', ALIASES)).toBeNull();
     expect(matchLeadingDirective('   ', ALIASES)).toBeNull();
+  });
+});
+
+describe('spokenForm hygiene — provenance is collapsed + bounded, the BODY never is', () => {
+  it('a normal capture is byte-identical (the sanitizer is a no-op on real input)', () => {
+    const m = matchLeadingDirective('message for hypatia, buy milk', ALIASES);
+    expect(m?.spokenForm).toBe('message for hypatia,');
+    expect(m?.spokenFormTruncated).toBe(false);
+  });
+
+  it('collapses multi-whitespace INCLUDING newlines (the raw-STT vector)', () => {
+    const m = matchLeadingDirective('  message \t\n\n for   hi patia ,   buy milk', ALIASES);
+    expect(m?.canonical).toBe('hypatia');
+    expect(m?.spokenForm).toBe('message for hi patia ,');
+    expect(m?.spokenForm).not.toMatch(/\s\s|\n/);
+    expect(m?.spokenFormTruncated).toBe(false);
+  });
+
+  it('a multi-KB whitespace run collapses instead of riding into provenance', () => {
+    // Measured pre-fix: this shape produced a 7019-char, 7000-newline spokenForm.
+    const m = matchLeadingDirective(`message${'\n'.repeat(7000)}for hypatia: buy milk`, ALIASES);
+    expect(m?.spokenForm).toBe('message for hypatia:');
+    expect(m?.spokenForm.length).toBeLessThanOrEqual(SPOKEN_FORM_MAX_CHARS);
+    expect(m?.spokenFormTruncated).toBe(false); // collapsed, not truncated
+  });
+
+  it('an overlong prefix (a long CONFIGURED alias) slices to the bound and flags it', () => {
+    const longAlias = `hypatia ${'x '.repeat(120)}`.trim(); // 247 chars
+    const m = matchLeadingDirective(`${longAlias}: buy milk`, { hypatia: [longAlias] });
+    expect(m?.canonical).toBe('hypatia');
+    expect(m?.spokenForm.length).toBe(SPOKEN_FORM_MAX_CHARS);
+    expect(m?.spokenFormTruncated).toBe(true);
+  });
+
+  it('the BODY is untouched by the collapse — internal whitespace + newlines survive', () => {
+    const m = matchLeadingDirective('hypatia:  line one\n\n   line   two  ', ALIASES);
+    // `rest` starts at the first non-space and keeps every byte after it.
+    expect(m?.rest).toBe('line one\n\n   line   two  ');
+    expect(m?.spokenForm).toBe('hypatia:');
   });
 });
 

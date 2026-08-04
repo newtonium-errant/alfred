@@ -214,8 +214,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (directiveTarget) {
       requested = directiveTarget.name;
       bodyText = directive.rest;
+      // spokenForm is already whitespace-collapsed + length-bounded by the parser
+      // (SPOKEN_FORM_MAX_CHARS) — provenance only; `rest` rides verbatim.
       source = `iOS Shortcut (spoken: "${directive.spokenForm}")`;
       routedViaDirective = true;
+      if (directive.spokenFormTruncated) {
+        // A bounded provenance string is a LOSSY transform — say so rather than
+        // silently shortening what the operator said.
+        console.warn(
+          `[bff:ingest/shortcut] spoken_form_truncated target=${directiveTarget.name} ` +
+            `kept_chars=${directive.spokenForm.length}`,
+        );
+      }
     } else {
       console.warn(
         `[bff:ingest/shortcut] directive_target_unconfigured target=${directive.canonical}`,

@@ -143,6 +143,48 @@ describe('directive routing — fail-safe (text kept INTACT to the default)', ()
   });
 });
 
+describe('directive routing — spokenForm hygiene rides the RELAY (provenance only)', () => {
+  it('a multi-KB whitespace run is collapsed in `source` while the body relays verbatim', async () => {
+    const { res } = mockRes();
+    // Measured pre-fix: this shape stamped a 7019-char, 7000-newline `source`.
+    await handler(req({ text: `message${'\n'.repeat(7000)}for Hypatia: buy milk` }), res);
+    const [targetName, , , opts] = relayed();
+    expect(targetName).toBe('HYPATIA');
+    expect(opts.body.source).toBe('iOS Shortcut (spoken: "message for Hypatia:")');
+    expect(opts.body.source as string).not.toMatch(/\n/);
+    expect(opts.body.body).toBe('buy milk'); // wire unchanged — the body is untouched
+  });
+
+  it('a normal directive capture relays a byte-identical `source` (no-op on real input)', async () => {
+    const { res } = mockRes();
+    await handler(req({ text: 'message for Hypatia, add to my story idea' }), res);
+    expect(relayed()[3].body.source).toBe('iOS Shortcut (spoken: "message for Hypatia,")');
+  });
+
+  it('an overlong prefix is bounded in `source` AND logs the lossy transform', async () => {
+    const longAlias = `hypatia ${'x '.repeat(120)}`.trim(); // 247 chars
+    process.env.SHORTCUT_DIRECTIVE_ALIASES = JSON.stringify({ hypatia: [longAlias] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { res } = mockRes();
+    await handler(req({ text: `${longAlias}: buy milk` }), res);
+    const [targetName, , , opts] = relayed();
+    expect(targetName).toBe('HYPATIA');
+    // 120 kept chars + the `iOS Shortcut (spoken: "…")` wrapper.
+    expect((opts.body.source as string).length).toBe(120 + 'iOS Shortcut (spoken: "")'.length);
+    expect(opts.body.body).toBe('buy milk');
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('spoken_form_truncated target=HYPATIA kept_chars=120'),
+    );
+  });
+
+  it('a within-bound directive does NOT log the truncation warn', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { res } = mockRes();
+    await handler(req({ text: 'message for Hypatia, buy milk' }), res);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('spoken_form_truncated'));
+  });
+});
+
 describe('directive routing — garbage-safe config', () => {
   it('a malformed SHORTCUT_DIRECTIVE_ALIASES falls back to defaults (Hypatia still routes)', async () => {
     process.env.SHORTCUT_DIRECTIVE_ALIASES = '{broken json';
