@@ -94,6 +94,69 @@ def test_an_unchanged_message_yields_nothing() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The swallowed-span defect. `difflib` coalesces a changed region into ONE
+# `replace` span and never emits an adjacent insert+delete (measured
+# 2026-08-05), so an edit that fixes a term AND touches anything beside it
+# arrives as a single span. Taken whole, that span poisons the loop: `meant` is
+# both the count key and the proposed vocabulary term, so the real term never
+# accumulates a count and a junk phrase is what reaches the operator.
+#
+# These shapes passed the original 23 pins because the only addition pin covers
+# additions with NO correction present (a pure `insert` opcode, which never
+# reaches the similarity logic at all).
+# ---------------------------------------------------------------------------
+
+
+def test_a_correction_plus_an_ADDITION_yields_only_the_term() -> None:
+    """Fixing a word and adding an afterthought in one pass is ordinary. The
+    proposal must be "tractor", never "tractor today please"."""
+    assert extract_term_corrections(
+        "clean the chicken tracker", "clean the chicken tractor today please",
+    ) == [("tracker", "tractor")]
+
+
+def test_a_correction_plus_a_DELETION_yields_only_the_term() -> None:
+    assert extract_term_corrections(
+        "clean the chicken tracker today please", "clean the chicken tractor",
+    ) == [("tracker", "tractor")]
+
+
+def test_a_correction_at_the_END_of_the_message_yields_only_the_term() -> None:
+    """No trailing matched word to close the span, so the addition rides along
+    with the correction — the same defect without a middle."""
+    assert extract_term_corrections("front rung", "front run today") == [
+        ("rung", "run"),
+    ]
+
+
+def test_a_genuinely_multiword_term_is_NOT_shaved_to_one_word() -> None:
+    """The guard against over-correcting the fix: the operator's real terms are
+    two words ("chicken tractor", "front coop"), and a mis-hearing that JOINS
+    them must still propose the whole term."""
+    assert extract_term_corrections(
+        "check the frontrun today", "check the front run today",
+    ) == [("frontrun", "front run")]
+
+
+def test_a_short_unrelated_rewrite_is_not_mined_for_a_term() -> None:
+    """The cost of recovering terms from loose spans is that a short rewrite
+    must not be searched until something vaguely similar turns up. 'two' and
+    'words' score exactly as high as the real mis-hearing 'wrong'->'run', so
+    only the structural rule (whole span vs rescued fragment) can refuse it."""
+    assert extract_term_corrections("one two three", "completely different words") == []
+    assert extract_term_corrections("send it now", "cancel that please") == []
+
+
+def test_a_loose_but_WHOLE_span_is_still_a_correction() -> None:
+    """The other side of that rule. "wrong"->"run" scores 0.50 — the same as the
+    junk fragment above — and is kept because it IS the span: the operator
+    changed exactly that word and nothing else."""
+    assert extract_term_corrections("the front wrong", "the front run") == [
+        ("wrong", "run"),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # The corpus round-trip
 # ---------------------------------------------------------------------------
 
@@ -136,19 +199,34 @@ def test_a_corrupt_row_is_skipped_LOUDLY(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_term_corrected_three_times_is_proposed() -> None:
-    pairs = [_pair("the chicken tracker", "the chicken tractor")] * MIN_CORRECTION_COUNT
+def test_the_threshold_is_TWO_per_the_operator_ruling() -> None:
+    """The ruling of 2026-08-05, pinned as a LITERAL.
+
+    Deliberately not written as ``* MIN_CORRECTION_COUNT`` asserting
+    ``count == MIN_CORRECTION_COUNT`` — that shape is self-referential and
+    passes at any threshold, so it pins the mechanism while leaving the ruling
+    itself unguarded. The literal 2 is the point of this pin.
+    """
+    assert MIN_CORRECTION_COUNT == 2
+    pairs = [_pair("the chicken tracker", "the chicken tractor")] * 2
     props = propose_vocab_additions(pairs, current_vocab=[])
     assert [p.term for p in props] == ["tractor"]
-    assert props[0].count == MIN_CORRECTION_COUNT
+    assert props[0].count == 2
     assert props[0].heard == ["tracker"]
 
 
-def test_a_term_corrected_twice_is_NOT_proposed() -> None:
-    """One correction is a typo; the threshold is what keeps the vocabulary from
-    filling with noise that degrades general accuracy."""
-    pairs = [_pair("the chicken tracker", "the chicken tractor")] * 2
+def test_a_term_corrected_ONCE_is_NOT_proposed() -> None:
+    """The boundary below. One correction is a typo or a one-off; it is the
+    SECOND that turns a slip into the operator repeating himself."""
+    pairs = [_pair("the chicken tracker", "the chicken tractor")]
     assert propose_vocab_additions(pairs, current_vocab=[]) == []
+
+
+def test_a_term_corrected_many_times_is_still_one_proposal() -> None:
+    """Above the bar the count keeps climbing; it does not split the term."""
+    pairs = [_pair("the chicken tracker", "the chicken tractor")] * 5
+    props = propose_vocab_additions(pairs, current_vocab=[])
+    assert len(props) == 1 and props[0].count == 5
 
 
 def test_a_term_ALREADY_in_the_vocabulary_is_never_proposed() -> None:

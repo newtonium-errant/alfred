@@ -52,11 +52,16 @@ log = get_logger(__name__)
 
 #: A term must be corrected this many times before it is proposed.
 #:
-#: Operator-ratified default (2026-08-05). One correction is a typo or a
-#: one-off; three is a pattern worth biasing the model toward. Set low and the
-#: vocabulary fills with noise that degrades general accuracy; set high and the
-#: loop never fires on the terms that matter.
-MIN_CORRECTION_COUNT = 3
+#: OPERATOR RULING 2026-08-05: **two**. One correction is a typo or a one-off;
+#: the second is the operator repeating himself, and that repetition is the
+#: signal.
+#:
+#: The bar is deliberately low because it gates a PROPOSAL, not a mutation.
+#: Approval is a human step, so surfacing one term too eagerly costs a single
+#: "no" at morning review, while setting it high costs the opposite and worse:
+#: the terms he corrects most often never surface at all. (An earlier revision
+#: of this module set 3 and described it as operator-ratified. It never was.)
+MIN_CORRECTION_COUNT = 2
 
 #: Cap on LEARNED additions, on top of the shipped static list.
 #:
@@ -73,6 +78,30 @@ MAX_LEARNED_TERMS = 20
 #: this is a rewrite of the sentence, not a vocabulary term — biasing on it
 #: would teach the model a whole clause.
 MAX_TERM_WORDS = 4
+
+#: How alike a WHOLE replace span must be to count as a mis-hearing.
+#:
+#: A mis-hearing is orthographically close to the truth ("tracker"/"tractor");
+#: an unrelated rewrite is not. MEASURED 2026-08-05 over the operator's own
+#: vocabulary: real mis-hearings land 0.50-0.94 ("wrong"/"run" 0.50,
+#: "cally"/"KAL-LE" 0.55, "tracker"/"tractor" 0.71, "frontrun"/"front run"
+#: 0.94), unrelated rewrites land 0.31-0.35. 0.5 sits at the bottom of the real
+#: band, which is the right side to err on: this gate only decides whether a
+#: correction is CAPTURED, and a term still needs MIN_CORRECTION_COUNT
+#: repetitions plus the operator's yes before it biases anything.
+MIN_SPAN_SIMILARITY = 0.5
+
+#: How alike a RESCUED fragment must be (see :func:`_rescue_correction`).
+#:
+#: Strictly higher than :data:`MIN_SPAN_SIMILARITY`, and the gap is the whole
+#: point. A single floor provably cannot do this job: "wrong"->"run" (a real
+#: mis-hearing) and "two"->"words" (plucked out of an unrelated rewrite) both
+#: score exactly 0.50. Nothing separates them numerically — they differ
+#: STRUCTURALLY. "wrong"->"run" is the entire span, so the operator changed
+#: exactly that word; "two"->"words" is a fragment of a span whose whole scored
+#: 0.31. So a whole span is trusted at the lower bar, while a fragment pulled
+#: out of a loose span has to be clearly tighter to earn its place.
+MIN_RESCUED_SIMILARITY = 0.7
 
 _WORD_RE = re.compile(r"[\w'’\-]+", re.UNICODE)
 
@@ -149,6 +178,64 @@ def _words(text: str) -> list[str]:
     return _WORD_RE.findall(text or "")
 
 
+def _similarity(a: str, b: str) -> float:
+    """Character-level closeness of two phrases, case-insensitive."""
+    return difflib.SequenceMatcher(None, a.casefold(), b.casefold()).ratio()
+
+
+def _rescue_correction(
+    heard_words: list[str], meant_words: list[str],
+) -> tuple[str, str] | None:
+    """Pull the real correction out of a span that swallowed other edits.
+
+    THE PROBLEM THIS SOLVES. ``difflib`` coalesces a changed region into ONE
+    ``replace`` span — it never emits an adjacent insert+delete pair (verified
+    2026-08-05). That is usually what we want, but it means an edit that fixes a
+    term AND touches anything beside it arrives as a single span:
+
+        "clean the chicken tracker"
+        "clean the chicken tractor today please"
+            -> span ("tracker", "tractor today please")
+
+    Taken whole that span is poison, because the ``meant`` side is BOTH the
+    count key and the proposed vocabulary term: the real term never accumulates
+    a count (every variant is its own key) and what reaches the operator for
+    approval is a phrase that then biases every future transcription. Editing a
+    word and adding an afterthought in one pass is an ordinary thing to do, so
+    this is the common case, not a corner.
+
+    Dropping such spans would be safe but wasteful — it throws away a real
+    correction. Instead, search the contiguous sub-spans for the tightest pair
+    and accept it only if it clears :data:`MIN_RESCUED_SIMILARITY`, recovering
+    ("tracker", "tractor") from the example above.
+
+    Ties break toward the LONGER pair so a genuinely multi-word term is not
+    shaved down to one word ("frontrun" -> "front run" must stay whole).
+    Returns ``None`` when nothing inside the span is close enough, which is how
+    an unrelated short rewrite is refused rather than mined for a spurious term.
+    """
+    best: tuple[tuple[float, int], tuple[str, str]] | None = None
+    for i in range(len(heard_words)):
+        for i2 in range(i + 1, min(len(heard_words), i + MAX_TERM_WORDS) + 1):
+            for j in range(len(meant_words)):
+                for j2 in range(j + 1, min(len(meant_words), j + MAX_TERM_WORDS) + 1):
+                    if (i2 - i) == len(heard_words) and (j2 - j) == len(meant_words):
+                        continue  # the whole span — already judged by the caller
+                    heard = " ".join(heard_words[i:i2])
+                    meant = " ".join(meant_words[j:j2])
+                    if not heard or not meant:
+                        continue
+                    if heard.casefold() == meant.casefold():
+                        continue
+                    score = _similarity(heard, meant)
+                    if score < MIN_RESCUED_SIMILARITY:
+                        continue
+                    key = (round(score, 4), (i2 - i) + (j2 - j))
+                    if best is None or key > best[0]:
+                        best = (key, (heard, meant))
+    return best[1] if best else None
+
+
 def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]]:
     """``(heard, meant)`` phrase pairs where the operator changed the words.
 
@@ -165,6 +252,12 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
     Case is preserved in the output (the vocabulary wants "KAL-LE", not
     "kal-le"); comparison is case-insensitive so a capitalisation-only edit is
     not mistaken for a mis-hearing.
+
+    A span is only a mis-hearing if the two sides actually LOOK alike
+    (:data:`MIN_SPAN_SIMILARITY`). A span that does not clear that bar gets one
+    second chance through :func:`_rescue_correction`, because ``difflib``
+    coalesces a correction with any edit beside it — see that function for why
+    the whole-span and rescued-fragment bars deliberately differ.
     """
     heard_words = _words(transcript)
     sent_words = _words(sent)
@@ -181,10 +274,18 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
             continue
         if (i2 - i1) > MAX_TERM_WORDS or (j2 - j1) > MAX_TERM_WORDS:
             continue
-        heard = " ".join(heard_words[i1:i2])
-        meant = " ".join(sent_words[j1:j2])
-        if heard and meant and heard.casefold() != meant.casefold():
+        span_heard = heard_words[i1:i2]
+        span_meant = sent_words[j1:j2]
+        heard = " ".join(span_heard)
+        meant = " ".join(span_meant)
+        if not heard or not meant or heard.casefold() == meant.casefold():
+            continue
+        if _similarity(heard, meant) >= MIN_SPAN_SIMILARITY:
             out.append((heard, meant))
+            continue
+        rescued = _rescue_correction(span_heard, span_meant)
+        if rescued is not None:
+            out.append(rescued)
     return out
 
 
@@ -310,6 +411,8 @@ __all__ = [
     "MAX_LEARNED_TERMS",
     "MAX_TERM_WORDS",
     "MIN_CORRECTION_COUNT",
+    "MIN_RESCUED_SIMILARITY",
+    "MIN_SPAN_SIMILARITY",
     "CorrectionPair",
     "VocabProposal",
     "append_correction_pair",
