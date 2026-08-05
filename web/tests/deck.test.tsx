@@ -974,13 +974,22 @@ describe('Deck — the snooze duration menu (#14 render)', () => {
     expect(screen.getByTestId('deck-snooze-menu')).toBeTruthy();
   });
 
-  it('a kind with no backend snooze verb gets NO menu — ↑ defers directly', () => {
+  it('a kind with no backend snooze verb gets NO menu, and POSTs nothing at all', () => {
     // A "3 days" button with no store behind it is the accepted-then-ignored
     // promise this round exists to stop making.
+    //
+    // The no-POST half is pinned HERE as well as at the hook layer (see "a kind
+    // with NO backend snooze verb still defers — but POSTs nothing") because a
+    // regression could live in either place: `snoozeActionFor` could start
+    // returning an id for every kind, OR Deck's own ↑ wiring could route around
+    // it. Both would 400 every email card the operator flicks up, and the field
+    // symptom is identical, so both layers carry the assert.
     render(<Deck items={[item({ id: 'e', kind: 'email_tier' }), item({ id: 'b' })]} />);
     act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
     expect(screen.queryByTestId('deck-snooze-menu')).toBeNull();
     expect(screen.getByTestId('deck-snoozed').textContent).toContain('1'); // it DID defer
+    act(() => vi.advanceTimersByTime(UNDO_MS)); // past the window: a real act would fire now
+    expect(mockAct).not.toHaveBeenCalled();
   });
 
   it('the ↑ button advertises which of the two it is', () => {
