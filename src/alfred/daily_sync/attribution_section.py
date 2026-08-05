@@ -250,12 +250,24 @@ def _read_candidates(vault_path: Path, scan_paths: list[str]) -> list[_Candidate
         # Arc #18 M6 — load-bearing, not hygiene. This string becomes
         # ``_Candidate.record_path``, which is persisted into ``last_batch`` and
         # later fed to ``reply_dispatch._resolve_attribution_correction`` — a
-        # writer that now runs it through ``resolve_in_vault``. That gate
-        # REFUSES an absolute path by design, so the old
-        # ``except ValueError: rel_path = str(md_file)`` fallback would have
-        # turned a legitimate attribution confirm into a refusal the moment
-        # either side resolved. ``vault_relative`` resolves both sides, so the
-        # relative form survives a symlinked vault root.
+        # writer that now runs it through ``resolve_in_vault``.
+        #
+        # This comment used to say that gate "REFUSES an absolute path by
+        # design". It does not, and #39 retired the claim: an absolute path is
+        # honoured iff it resolves INSIDE the vault. Measured on a symlinked
+        # root, the absolute path the old ``except ValueError: rel_path =
+        # str(md_file)`` fallback would emit is ACCEPTED by the gate — so the
+        # stated hazard (a legitimate confirm turning into a refusal) is not
+        # the real one either.
+        #
+        # The real reason to keep ``vault_relative`` is that this string is
+        # PERSISTED into ``last_batch``. An absolute path bakes the host's
+        # layout into state: it stops resolving the moment the vault moves or
+        # its symlink is repointed, and it is meaningless on another instance.
+        # The relative form survives both. The ValueError the old fallback
+        # caught is real — ``md_file.resolve().relative_to(vault_path)`` raises
+        # under a symlinked root — and ``vault_relative`` resolves BOTH sides,
+        # which is what actually fixes it.
         rel_path = vault_relative(vault_path, md_file)
         for entry in entries:
             if entry.confirmed_by_andrew or entry.confirmed_at is not None:

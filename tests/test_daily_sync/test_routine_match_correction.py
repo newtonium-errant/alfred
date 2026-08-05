@@ -38,7 +38,7 @@ from alfred.daily_sync.action_router import (
     STATUS_INVALID_ACTION,
     act,
 )
-from alfred.daily_sync.assembler import ReplyCorrection
+from alfred.daily_sync.assembler import ReplyCorrection, parse_reply
 from alfred.daily_sync.config import DailySyncConfig
 from alfred.daily_sync.confidence import save_state
 from alfred.daily_sync.feed_producer import build_feed_items
@@ -772,10 +772,73 @@ def test_a_real_confirm_still_confirms(tmp_path: Path) -> None:
     assert _rows(corpus), "a genuine confirm still teaches the matcher"
 
 
-def test_an_ok_with_no_consumed_token_is_not_refused(tmp_path: Path) -> None:
-    """The guard keys on the TOKEN, so a correction carrying ``ok`` without one
-    (chained ``same``/``ditto`` copies tier/ok but not the token) must pass —
-    refusing it would break chaining, which is a live operator idiom."""
+def test_chaining_inherits_the_token_so_a_chained_pending_verb_refuses(
+    tmp_path: Path,
+) -> None:
+    """Chaining is driven through the REAL parser, not hand-built (#34 gate).
+
+    An earlier version of this pin justified token-keying by claiming a chained
+    ``same``/``ditto`` copies ``ok`` WITHOUT the token. Measured: it copies the
+    token too — ``parse_reply("1 noted\n2 same")`` yields item 2 with
+    ``consumed_token="noted"``. So ``ok=True``-with-empty-token is unreachable
+    through the parser, and the old justification was false.
+
+    The behaviour that inheritance produces is the CORRECT one, which is what
+    this pins: chaining off a pending verb carries the pending verb, so the
+    chained item refuses on a routine match exactly as the head item does. A
+    chain cannot launder ``noted`` into a confirm.
+    """
+    parsed = parse_reply("1 noted\n2 same")
+    assert [c.consumed_token for c in parsed.corrections] == ["noted", "noted"], (
+        "the parser's chain behaviour changed — this pin's premise is measured, "
+        "not assumed"
+    )
+
+    vault = _vault(tmp_path)
+    corpus = tmp_path / "corpus.jsonl"
+    for correction in parsed.corrections:
+        correction.item_number = 1          # aim both at the routine-match item
+        err, did_write, captured = _resolve(correction, _item(), corpus, vault)
+        assert err and "noted" in err
+        assert did_write is False
+        assert "pending_only_verb" in _reasons(captured)
+    assert _rows(corpus) == []
+
+
+def test_chaining_off_a_real_confirm_still_confirms(tmp_path: Path) -> None:
+    """The other direction, also parser-driven: a chain from ``confirm``
+    inherits ``confirm`` and is applied. Without this, a build that refused
+    every chained correction would pass the pin above."""
+    parsed = parse_reply("1 confirm\n2 ditto")
+    assert [c.consumed_token for c in parsed.corrections] == ["confirm", "confirm"]
+
+    vault = _vault(tmp_path)
+    corpus = tmp_path / "corpus.jsonl"
+    correction = parsed.corrections[1]
+    correction.item_number = 1
+
+    err, did_write, _ = _resolve(correction, _item(), corpus, vault)
+
+    assert err is None
+    assert did_write is True
+
+
+def test_an_ok_with_no_consumed_token_is_accepted_defensively(
+    tmp_path: Path,
+) -> None:
+    """DEFENSIVE pin on a HAND-BUILT shape the parser does not currently emit.
+
+    Labelled as such deliberately. Every parser path that sets ``ok`` also sets
+    a token (measured above), so this correction shape is unreachable today —
+    it is pinned because the guard's keying is defined over the token, and a
+    future parser change that produced a token-less ``ok`` must degrade to
+    ACCEPT rather than to a silent refusal of ordinary confirms.
+
+    The real justification for keying on the token rather than on ``ok`` is
+    OVER-BREADTH, not chaining: ``ok``-keying would refuse every
+    ``confirm``/``keep``/``yes``, which the mutation on this suite demonstrates
+    (5 red, including two of #13's own shape guards).
+    """
     vault = _vault(tmp_path)
     corpus = tmp_path / "corpus.jsonl"
     correction = ReplyCorrection(item_number=1, ok=True)

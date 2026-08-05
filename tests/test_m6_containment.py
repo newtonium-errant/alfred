@@ -491,9 +491,16 @@ async def test_instructor_escape_is_refused_before_the_model_runs(
     assert _snapshot_outside(tmp_path, vault) == before
 
 
-async def test_instructor_absolute_record_path_is_refused(
+async def test_instructor_absolute_outside_record_path_is_refused(
     tmp_path: Path, vault: Path,
 ) -> None:
+    """Absoluteness is not the disqualifier; landing outside the vault is.
+
+    Renamed alongside its attribution sibling (#39) — this path is BOTH
+    absolute and outside, and the old name credited the wrong half. See
+    ``resolve_in_vault``'s docstring: an absolute path that resolves inside is
+    honoured.
+    """
     from alfred.instructor.executor import execute_and_record
     from alfred.instructor.state import InstructorState
 
