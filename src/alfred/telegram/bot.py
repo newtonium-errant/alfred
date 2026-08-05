@@ -53,6 +53,7 @@ from . import (
     speed_pref,
     stt_backends,
     stt_shadow,
+    stt_vocab_learning,
     transcribe,
     tts as tts_mod,
     vision,
@@ -4055,7 +4056,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         audio_bytes,
         "audio/ogg",
         chain,
-        config.stt.vocab_terms,
+        stt_vocab_learning.effective_vocab_terms(config.stt),
         config.stt.total_budget_s,
     )
 

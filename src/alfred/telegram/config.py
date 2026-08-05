@@ -217,6 +217,27 @@ class STTConfig:
     total_budget_s: float = 30.0           # global per-message chain deadline
     min_transcript_chars: int = 3          # "empty" threshold (post-trim)
     chain: list[SttBackendConfig] = field(default_factory=list)
+    # --- learned vocabulary (#54) ---
+    # The operator corrects the same mis-heard domain terms by hand every time;
+    # this is the loop that lets those corrections teach the biasing list.
+    #
+    # ``vocab_learning_enabled`` gates CAPTURE ONLY and defaults OFF, per the
+    # convention every other judgment surface follows (routine_match,
+    # tier_recurrence, shadow_capture). Default-OFF is not timidity here: capture
+    # writes the operator's own message text to a new file, and Hypatia's voice
+    # traffic is CLINICAL. An instance opts in deliberately; it is never decided
+    # for them by a default.
+    #
+    # The two paths are instance-neutral (each instance has its own ``data/``),
+    # so no per-instance literal is baked in — see the hardcoding rule.
+    vocab_learning_enabled: bool = False
+    #: Full (transcript, sent) pairs — the audit trail corrections are mined from.
+    vocab_corpus_path: str = "./data/stt_corrections.jsonl"
+    #: The operator's approve/reject verdicts. READ on every transcription via
+    #: ``stt_vocab_learning.effective_vocab_terms`` — unlike the corpus, this one
+    #: is live even when capture is off, so a term approved before an instance
+    #: disabled capture keeps biasing.
+    vocab_decided_path: str = "./data/stt_vocab_decided.jsonl"
     # --- shadow-capture (R1-baseline corpus builder; default-OFF) ---
     shadow_capture: SttShadowCaptureConfig = field(
         default_factory=SttShadowCaptureConfig

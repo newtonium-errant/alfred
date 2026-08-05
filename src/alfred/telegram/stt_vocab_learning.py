@@ -10,15 +10,19 @@ already exists rather than inventing a parallel one.
    correction — free supervision nobody had to be asked for.
 2. **Propose.** Recurring TERM-level corrections surface at morning review with
    counts ("'front run' corrected 3x — add to vocabulary?").
-3. **Approve.** On the operator's yes, the term joins the per-instance
-   ``talker.stt.vocab_terms`` list that ALREADY feeds Whisper ``prompt=`` and
-   Deepgram ``keywords`` through the whole fallback chain (``stt_backends``).
+3. **Approve.** On the operator's yes, the term is recorded in the decided store
+   and from then on it is UNIONED onto the static ``talker.stt.vocab_terms`` by
+   :func:`effective_vocab_terms` — the one accessor every consumer of vocabulary
+   goes through. It reaches Whisper ``prompt=`` and Deepgram ``keywords`` across
+   the whole fallback chain (``stt_backends``), the live stream, and the shadow
+   capture, because all of them read the seam rather than the raw config field.
 
-Step 3 is why this module is small: the consumption path needed nothing. The
-mechanism was built and threaded and fed from static config; it just never
-learned. Confirmed by reading the call sites, not by grep — the parameter is
-spelled ``vocab_terms`` at every caller and ``vocab`` inside the chain, which is
-exactly how a grep misses it.
+The biasing MECHANISM needed nothing built: it existed, threaded, fed from a
+static list that simply never learned. What it needed was a second source and a
+single place to merge the two — hence the seam. Approved terms are deliberately
+NOT appended into ``vocab_terms`` itself; see the decided-store section for the
+two reasons that design cannot hold (the cap stops binding, and a rejection has
+nowhere to live).
 
 ## Never silent auto-mutation
 
@@ -293,6 +297,7 @@ def propose_vocab_additions(
     pairs,
     *,
     current_vocab,
+    decided: "LearnedVocab | None" = None,
     min_count: int = MIN_CORRECTION_COUNT,
     max_learned: int = MAX_LEARNED_TERMS,
 ) -> list[VocabProposal]:
@@ -303,6 +308,11 @@ def propose_vocab_additions(
     * a term ALREADY in ``current_vocab`` is never proposed — it is already
       biasing, so a correction on it means the bias is not enough, which is a
       different problem than a missing term and must not read as this one;
+    * a term the operator has already RULED ON (``decided``) is never proposed
+      again — approved terms are already biasing, and a rejected one must stay
+      rejected. Re-asking a question he has answered is the groundhog bug
+      ``routine.match_calibration`` had to fix; the filter lives HERE rather
+      than in each caller so a future surface cannot forget it;
     * a term corrected fewer than ``min_count`` times is a one-off;
     * at most ``max_learned`` proposals surface, so a long tail cannot flood the
       morning review or the prompt window.
@@ -327,11 +337,27 @@ def propose_vocab_additions(
             if heard not in heard_by_term.setdefault(key, []):
                 heard_by_term[key].append(heard)
 
-    proposals = [
-        VocabProposal(term=display[k], heard=heard_by_term.get(k, []), count=n)
-        for k, n in counts.items()
-        if n >= min_count
-    ]
+    ruled_on = 0
+    proposals: list[VocabProposal] = []
+    for k, n in counts.items():
+        if n < min_count:
+            continue
+        term = display[k]
+        if decided is not None and decided.is_decided(term):
+            ruled_on += 1
+            continue
+        proposals.append(
+            VocabProposal(term=term, heard=heard_by_term.get(k, []), count=n)
+        )
+    if ruled_on:
+        # ILB: a shrinking proposal list must be explicable. "you already told me"
+        # has to be distinguishable from "the extraction stopped working".
+        log.info(
+            "stt.vocab_proposals.already_ruled",
+            suppressed=ruled_on,
+            detail="recurring corrections the operator has already approved or "
+                   "rejected — not re-proposed",
+        )
     # Highest count first, then alphabetical so the order is stable across runs
     # (an operator re-reading yesterday's review should see the same list).
     proposals.sort(key=lambda p: (-p.count, p.term.casefold()))
@@ -407,7 +433,166 @@ def apply_approved_terms(
     return base + added
 
 
+# ---------------------------------------------------------------------------
+# The decided store — the operator's verdicts, and the ONLY source of learned
+# vocabulary.
+# ---------------------------------------------------------------------------
+#
+# WHY A SEPARATE STORE rather than appending into ``stt.vocab_terms``.
+#
+# The original design said approved terms append to the per-instance
+# ``vocab_terms`` list. That cannot work, for two reasons found by audit:
+#
+# 1. THE CAP CANNOT BIND. A flat merged list cannot tell a static term from a
+#    learned one, so "at most 20 LEARNED terms" is unanswerable from it. Capping
+#    per-approval instead lets the ceiling drift upward forever — approve three
+#    terms a morning and a cap of 20 never once binds, while the Whisper prompt
+#    window (which degrades SILENTLY) fills up. Keeping learned terms separate
+#    makes the cumulative count a fact the code can read.
+# 2. REJECTIONS HAVE NOWHERE TO LIVE. A store of approvals alone cannot remember
+#    a "no", so every declined term returns to the review the next morning,
+#    forever. That is the groundhog bug ``routine.match_calibration`` already
+#    had to fix (see ``filter_pending_for_review``); this store records the
+#    refusals so it never has to be fixed twice.
+#
+# Append-only JSONL, replayed LATER-WINS per term, mirroring the match
+# calibration corpus: the operator may approve a term he once rejected, or
+# retire one he approved, and the last thing he said is what holds.
+
+DECISION_APPROVE = "vocab_approve"
+DECISION_REJECT = "vocab_reject"
+
+
+@dataclass
+class VocabDecision:
+    """One operator verdict on a proposed term."""
+
+    type: str          #: DECISION_APPROVE | DECISION_REJECT
+    term: str
+    operator: str = ""
+    at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+@dataclass
+class LearnedVocab:
+    """The replayed verdicts: what is approved, and what must not be re-asked."""
+
+    approved: list[str] = field(default_factory=list)  #: in approval order
+    rejected: set[str] = field(default_factory=set)    #: casefolded terms
+
+    def is_decided(self, term: str) -> bool:
+        """True when the operator has already ruled on this term either way.
+
+        The proposal pass consults this so a term he approved is not offered
+        again (it is already biasing) and — the part that matters — neither is
+        one he declined.
+        """
+        key = (term or "").casefold().strip()
+        return key in self.rejected or any(
+            t.casefold().strip() == key for t in self.approved
+        )
+
+
+def append_decision(decided_path: str | Path, decision: VocabDecision) -> None:
+    """Record one operator verdict (append-only, parent auto-created)."""
+    path = Path(decided_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(asdict(decision), ensure_ascii=False)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def load_decisions(decided_path: str | Path) -> LearnedVocab:
+    """Replay the decided store, LATER-WINS per term.
+
+    An approve clears a prior reject for that term and vice-versa, so the
+    operator can change his mind without editing a file. Malformed rows are
+    skipped loudly — a half-corrupt store must degrade to "fewer learned terms",
+    never to a crash on the transcription path.
+    """
+    approved: list[str] = []
+    rejected: set[str] = set()
+    path = Path(decided_path)
+    if not path.exists():
+        return LearnedVocab(approved=approved, rejected=rejected)
+
+    skipped = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("row is not a JSON object")
+            row_type = str(data.get("type") or "")
+            term = str(data.get("term") or "").strip()
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        if not term:
+            skipped += 1
+            continue
+        key = term.casefold()
+        if row_type == DECISION_APPROVE:
+            rejected.discard(key)
+            if not any(t.casefold() == key for t in approved):
+                approved.append(term)
+        elif row_type == DECISION_REJECT:
+            approved[:] = [t for t in approved if t.casefold() != key]
+            rejected.add(key)
+        # An unknown row type is ignored rather than counted as corrupt: a
+        # store written by a newer build must not make an older one shout.
+
+    if skipped:
+        log.warning(
+            "stt.vocab_decided.rows_skipped",
+            path=str(path), skipped=skipped,
+            detail="unparseable decision rows ignored — learned vocabulary may "
+                   "be missing terms the operator approved",
+        )
+    return LearnedVocab(approved=approved, rejected=rejected)
+
+
+def effective_vocab_terms(stt_config) -> list[str]:
+    """The vocabulary that ACTUALLY biases transcription. **The single seam.**
+
+    Every consumer of vocabulary — Whisper ``prompt=``, Deepgram ``keywords``,
+    the live stream, the shadow capture — must call THIS, never
+    ``stt_config.vocab_terms`` directly. That is the whole point of it existing:
+    the union, the cumulative cap, and anything added later (provenance, expiry,
+    per-backend filtering) live in one place, so a consumer written next month
+    cannot silently miss the learned terms by reading the raw config field. The
+    raw field is now only HALF the answer.
+
+    Degrades to the static list when no decided store is configured, so an
+    instance that has not opted in behaves exactly as before.
+
+    The cumulative cap binds HERE, and only because the whole approved list is
+    passed in at once: ``apply_approved_terms`` counts what it adds over the
+    static base, so N successive approvals over N mornings still total at most
+    ``MAX_LEARNED_TERMS``. Capping at each approval instead would never bind.
+    """
+    static = [str(t) for t in (getattr(stt_config, "vocab_terms", None) or [])]
+    decided_path = str(getattr(stt_config, "vocab_decided_path", "") or "")
+    if not decided_path:
+        return static
+    learned = load_decisions(decided_path)
+    if not learned.approved:
+        return static
+    return apply_approved_terms(static, learned.approved)
+
+
 __all__ = [
+    "DECISION_APPROVE",
+    "DECISION_REJECT",
+    "LearnedVocab",
+    "VocabDecision",
+    "append_decision",
+    "effective_vocab_terms",
+    "load_decisions",
     "MAX_LEARNED_TERMS",
     "MAX_TERM_WORDS",
     "MIN_CORRECTION_COUNT",

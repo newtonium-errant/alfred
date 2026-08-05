@@ -2163,3 +2163,242 @@ async def test_non_dict_primer_fails_soft_no_500(web_client) -> None:
     )
     assert r.status == 200  # NOT 500
     assert await _turn_user_text(web_client, headers, sk) == "hello"  # un-grounded
+
+
+# ---------------------------------------------------------------------------
+# #54 — voice-correction capture (the learned-vocabulary loop's capture half)
+#
+# Driven END-TO-END through the real handlers, not by calling the capture helper
+# directly. That is the point: a gate parameter tested only by direct invocation
+# is the standing trap where the pins thread it, production never does, every
+# test is green, and the feature is dead in the field. Both entry points
+# (/chat/turn AND /chat/stream) are exercised for the same reason.
+# ---------------------------------------------------------------------------
+
+
+def _enable_vocab_learning(web_client, tmp_path: Path) -> Path:
+    """Opt this instance in and point the corpus at a temp file."""
+    stt = web_client.app["_t_talker_config"].stt
+    stt.vocab_learning_enabled = True
+    corpus = tmp_path / "stt_corrections.jsonl"
+    stt.vocab_corpus_path = str(corpus)
+    return corpus
+
+
+def _corpus_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+async def test_voice_send_captures_the_transcript_and_the_sent_text(
+    web_client, tmp_path
+) -> None:
+    """The pair the whole loop is built on, recorded on a real send."""
+    corpus = _enable_vocab_learning(web_client, tmp_path)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": key,
+            "message": "clean the chicken tractor",
+            "kind": "voice",
+            "transcript": "clean the chicken tracker",
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+
+    rows = _corpus_rows(corpus)
+    assert len(rows) == 1
+    assert rows[0]["transcript"] == "clean the chicken tracker"
+    assert rows[0]["sent"] == "clean the chicken tractor"
+
+
+async def test_a_TEXT_send_captures_nothing(web_client, tmp_path) -> None:
+    """Typed text was never transcribed, so there is no correction in it."""
+    corpus = _enable_vocab_learning(web_client, tmp_path)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": key,
+            "message": "clean the chicken tractor",
+            "transcript": "clean the chicken tracker",
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+    assert _corpus_rows(corpus) == []
+
+
+async def test_an_UNEDITED_transcript_is_recorded_as_a_fact_not_skipped(
+    web_client, tmp_path
+) -> None:
+    """Zero diff is positive evidence about transcription quality and the
+    denominator for any later error rate. Storing only the failures would make
+    the STT look worse than it is, so the quiet case is recorded AND logged."""
+    corpus = _enable_vocab_learning(web_client, tmp_path)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    with structlog.testing.capture_logs() as captured:
+        r = await web_client.post(
+            "/chat/turn",
+            json={
+                "session_key": key,
+                "message": "clean the chicken tractor",
+                "kind": "voice",
+                "transcript": "clean the chicken tractor",
+            },
+            headers=headers,
+        )
+    assert r.status == 200
+
+    rows = _corpus_rows(corpus)
+    assert len(rows) == 1
+    assert rows[0]["transcript"] == rows[0]["sent"]
+    events = [
+        c for c in captured
+        if c.get("event") == "web.chat.voice_transcript_unedited"
+    ]
+    assert len(events) == 1 and events[0]["chars"] == len("clean the chicken tractor")
+
+
+async def test_no_transcript_field_is_byte_identical(web_client, tmp_path) -> None:
+    """The wire field is OPTIONAL and additive: an older client that sends
+    kind=voice without it still gets a normal turn and writes nothing."""
+    corpus = _enable_vocab_learning(web_client, tmp_path)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "hi there", "kind": "voice"},
+        headers=headers,
+    )
+    assert r.status == 200
+    assert (await r.json())["reply"] == "hello from salem"
+    assert _corpus_rows(corpus) == []
+
+
+async def test_capture_is_OFF_by_default(web_client, tmp_path) -> None:
+    """Capture writes the operator's own message text, and some instances carry
+    clinical voice traffic — so an instance opts in deliberately. Default OFF."""
+    stt = web_client.app["_t_talker_config"].stt
+    assert stt.vocab_learning_enabled is False
+    corpus = tmp_path / "stt_corrections.jsonl"
+    stt.vocab_corpus_path = str(corpus)
+
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": key,
+            "message": "clean the chicken tractor",
+            "kind": "voice",
+            "transcript": "clean the chicken tracker",
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+    assert not corpus.exists()
+
+
+async def test_the_STREAM_entry_point_also_captures(web_client, tmp_path) -> None:
+    """The second production entry point. Per-layer pins cannot catch a feature
+    threaded at one caller and forgotten at the other."""
+    corpus = _enable_vocab_learning(web_client, tmp_path)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    resp = await web_client.post(
+        "/chat/stream",
+        json={
+            "session_key": key,
+            "message": "check the front run",
+            "kind": "voice",
+            "transcript": "check the front rung",
+        },
+        headers=headers,
+    )
+    assert resp.status == 200
+    await resp.text()
+
+    rows = _corpus_rows(corpus)
+    assert len(rows) == 1
+    assert rows[0]["transcript"] == "check the front rung"
+    assert rows[0]["sent"] == "check the front run"
+
+
+async def test_a_deduped_retry_does_NOT_double_count_the_correction(
+    web_client, tmp_path
+) -> None:
+    """Counts decide whether a term crosses the proposal threshold, so a retry
+    that returns the CACHED turn must not record the pair a second time — it
+    would let one correction masquerade as a pattern."""
+    corpus = _enable_vocab_learning(web_client, tmp_path)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    payload = {
+        "session_key": key,
+        "message": "clean the chicken tractor",
+        "kind": "voice",
+        "transcript": "clean the chicken tracker",
+        "idempotency_key": "retry-me",
+    }
+    r = await web_client.post("/chat/turn", json=payload, headers=headers)
+    assert r.status == 200
+    r = await web_client.post("/chat/turn", json=payload, headers=headers)
+    assert r.status == 200
+    assert (await r.json())["deduped"] is True
+
+    assert len(_corpus_rows(corpus)) == 1
+
+
+async def test_a_deduped_STREAM_retry_does_NOT_double_count(
+    web_client, tmp_path
+) -> None:
+    """The stream's own dedup guard. Found by mutation: removing
+    ``if status != "hit"`` from the stream path reddened NOTHING, because the
+    /chat/turn double-count pin cannot reach the other entry point. Two entry
+    points need two pins."""
+    corpus = _enable_vocab_learning(web_client, tmp_path)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    payload = {
+        "session_key": key,
+        "message": "check the front run",
+        "kind": "voice",
+        "transcript": "check the front rung",
+        "idempotency_key": "stream-retry",
+    }
+    resp = await web_client.post("/chat/stream", json=payload, headers=headers)
+    assert resp.status == 200
+    await resp.text()
+
+    resp = await web_client.post("/chat/stream", json=payload, headers=headers)
+    assert resp.status == 200
+    text = await resp.text()
+    assert '"deduped":true' in text.replace(" ", "")
+
+    assert len(_corpus_rows(corpus)) == 1

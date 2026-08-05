@@ -22,13 +22,19 @@ from pathlib import Path
 import structlog
 
 from alfred.telegram.stt_vocab_learning import (
+    DECISION_APPROVE,
+    DECISION_REJECT,
     MAX_LEARNED_TERMS,
     MIN_CORRECTION_COUNT,
     CorrectionPair,
+    VocabDecision,
     append_correction_pair,
+    append_decision,
     apply_approved_terms,
+    effective_vocab_terms,
     extract_term_corrections,
     iter_correction_pairs,
+    load_decisions,
     propose_vocab_additions,
 )
 
@@ -353,3 +359,192 @@ def test_the_approved_vocabulary_still_fits_the_whisper_prompt_window() -> None:
     assert [
         c for c in captured if c.get("event") == "stt.vocab_prompt_truncated"
     ] == [], "a fully-spent learned budget must not overflow the window"
+
+
+# ---------------------------------------------------------------------------
+# The decided store + the single accessor seam
+# ---------------------------------------------------------------------------
+
+
+class _Stt:
+    """Minimal stand-in for the STT config the seam reads."""
+
+    def __init__(self, vocab_terms, vocab_decided_path=""):
+        self.vocab_terms = list(vocab_terms)
+        self.vocab_decided_path = str(vocab_decided_path)
+
+
+def _approve(path, term: str) -> None:
+    append_decision(
+        path, VocabDecision(type=DECISION_APPROVE, term=term, operator="andrew")
+    )
+
+
+def _reject(path, term: str) -> None:
+    append_decision(
+        path, VocabDecision(type=DECISION_REJECT, term=term, operator="andrew")
+    )
+
+
+def test_an_approved_term_is_emitted_by_the_seam(tmp_path: Path) -> None:
+    """The whole point of the loop: a yes at review reaches transcription."""
+    d = tmp_path / "decided.jsonl"
+    _approve(d, "chicken tractor")
+    assert effective_vocab_terms(_Stt(["Salem"], d)) == ["Salem", "chicken tractor"]
+
+
+def test_the_raw_config_list_is_no_longer_the_whole_vocabulary(tmp_path: Path) -> None:
+    """States the contract the seam exists to enforce: reading `vocab_terms`
+    directly now gives an ANSWER THAT IS WRONG, and a consumer that does so
+    silently misses everything the operator taught."""
+    d = tmp_path / "decided.jsonl"
+    _approve(d, "front coop")
+    cfg = _Stt(["Salem"], d)
+    assert cfg.vocab_terms == ["Salem"]
+    assert effective_vocab_terms(cfg) == ["Salem", "front coop"]
+
+
+def test_a_REJECTED_term_never_reaches_the_vocabulary(tmp_path: Path) -> None:
+    d = tmp_path / "decided.jsonl"
+    _reject(d, "tractor")
+    assert effective_vocab_terms(_Stt(["Salem"], d)) == ["Salem"]
+
+
+def test_a_rejected_term_is_not_proposed_again(tmp_path: Path) -> None:
+    """The groundhog guard, driven through the PRODUCTION filter.
+
+    Without a store that remembers the NO, a declined term returns to the review
+    every morning forever — the exact bug
+    `routine.match_calibration.filter_pending_for_review` had to fix. The filter
+    lives inside `propose_vocab_additions` rather than in its callers, so a
+    surface added later cannot forget it and quietly resurrect the groundhog.
+    """
+    d = tmp_path / "decided.jsonl"
+    _reject(d, "tractor")
+    pairs = [_pair("the chicken tracker", "the chicken tractor")] * 4
+
+    with structlog.testing.capture_logs() as captured:
+        props = propose_vocab_additions(
+            pairs, current_vocab=[], decided=load_decisions(d),
+        )
+
+    assert props == []
+    events = [
+        c for c in captured if c.get("event") == "stt.vocab_proposals.already_ruled"
+    ]
+    assert len(events) == 1 and events[0]["suppressed"] == 1
+
+
+def test_an_already_approved_term_is_not_proposed_again(tmp_path: Path) -> None:
+    """The other half: an approved term is already biasing, so a further
+    correction of it means the bias is not ENOUGH — a different problem, and it
+    must not read as a missing term."""
+    d = tmp_path / "decided.jsonl"
+    _approve(d, "tractor")
+    pairs = [_pair("the chicken tracker", "the chicken tractor")] * 4
+    assert propose_vocab_additions(
+        pairs, current_vocab=[], decided=load_decisions(d),
+    ) == []
+
+
+def test_an_undecided_term_is_still_proposed(tmp_path: Path) -> None:
+    """The control: the decided-store filter must not swallow everything."""
+    d = tmp_path / "decided.jsonl"
+    _reject(d, "something else entirely")
+    pairs = [_pair("the chicken tracker", "the chicken tractor")] * 2
+    props = propose_vocab_additions(
+        pairs, current_vocab=[], decided=load_decisions(d),
+    )
+    assert [p.term for p in props] == ["tractor"]
+
+
+def test_the_operator_may_change_his_mind_LATER_WINS(tmp_path: Path) -> None:
+    d = tmp_path / "decided.jsonl"
+    _reject(d, "front run")
+    _approve(d, "front run")
+    assert effective_vocab_terms(_Stt(["Salem"], d)) == ["Salem", "front run"]
+
+    _reject(d, "front run")
+    assert effective_vocab_terms(_Stt(["Salem"], d)) == ["Salem"]
+
+
+def test_no_decided_store_configured_is_byte_identical(tmp_path: Path) -> None:
+    """An instance that has not opted in behaves exactly as before."""
+    assert effective_vocab_terms(_Stt(["Salem", "KAL-LE"], "")) == ["Salem", "KAL-LE"]
+    assert effective_vocab_terms(
+        _Stt(["Salem"], tmp_path / "never_written.jsonl")
+    ) == ["Salem"]
+
+
+def test_the_seam_tolerates_a_missing_stt_config() -> None:
+    """`routes_voice` passes `getattr(talker_config, "stt", None)`, which can be
+    None on a half-configured instance. Biasing degrades; nothing raises."""
+    assert effective_vocab_terms(None) == []
+
+
+def test_a_corrupt_decision_row_is_skipped_LOUDLY(tmp_path: Path) -> None:
+    d = tmp_path / "decided.jsonl"
+    _approve(d, "front coop")
+    with d.open("a", encoding="utf-8") as f:
+        f.write("{not json\n")
+
+    with structlog.testing.capture_logs() as captured:
+        learned = load_decisions(d)
+
+    assert learned.approved == ["front coop"]
+    events = [c for c in captured if c.get("event") == "stt.vocab_decided.rows_skipped"]
+    assert len(events) == 1 and events[0]["skipped"] == 1
+
+
+def test_the_learned_cap_binds_CUMULATIVELY_across_sessions(tmp_path: Path) -> None:
+    """THE MUTATION THAT THE ORIGINAL SINGLE-CALL CAP TEST COULD NOT CATCH.
+
+    Capping per-approval over a flat list never binds in real use: approve a few
+    terms each morning and `added` restarts at zero every time, so the learned
+    list grows without limit while the Whisper prompt window — which degrades
+    SILENTLY — fills up. Reading the WHOLE approved list back out of the store on
+    every call is what makes the cap a cumulative bound rather than a per-call
+    one.
+    """
+    d = tmp_path / "decided.jsonl"
+    static = ["Salem"]
+
+    # Two separate approval sessions, each individually under the cap.
+    for i in range(MAX_LEARNED_TERMS):
+        _approve(d, f"termA{i:03d}")
+    after_first = effective_vocab_terms(_Stt(static, d))
+    assert len(after_first) == len(static) + MAX_LEARNED_TERMS
+
+    for i in range(5):
+        _approve(d, f"termB{i:03d}")
+    after_second = effective_vocab_terms(_Stt(static, d))
+
+    assert len(after_second) == len(static) + MAX_LEARNED_TERMS, (
+        "the cap must bind across sessions, not per approval call"
+    )
+
+
+def test_the_effective_vocabulary_still_fits_the_prompt_window(tmp_path: Path) -> None:
+    """The cap agreement, now driven through the SEAM rather than a direct call —
+    which is the path production actually takes."""
+    from alfred.telegram.config import _DEFAULT_STT_VOCAB_TERMS
+    from alfred.telegram.stt_backends import (
+        _WHISPER_PROMPT_CHAR_BUDGET,
+        _vocab_to_whisper_prompt,
+    )
+
+    d = tmp_path / "decided.jsonl"
+    for i in range(MAX_LEARNED_TERMS):
+        _approve(d, f"chicken tractor {i:02d}")
+
+    full = effective_vocab_terms(_Stt(list(_DEFAULT_STT_VOCAB_TERMS), d))
+    assert len(full) == len(_DEFAULT_STT_VOCAB_TERMS) + MAX_LEARNED_TERMS
+
+    with structlog.testing.capture_logs() as captured:
+        prompt = _vocab_to_whisper_prompt(full)
+
+    assert len(prompt) <= _WHISPER_PROMPT_CHAR_BUDGET
+    assert prompt.count(", ") == len(full) - 1, "every term must still be biasing"
+    assert [
+        c for c in captured if c.get("event") == "stt.vocab_prompt_truncated"
+    ] == []

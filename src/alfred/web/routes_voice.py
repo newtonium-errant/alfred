@@ -614,8 +614,12 @@ def _build_assistant_stt(voice: Any, talker_config: Any = None):
     # previously ignored vocab entirely — yet it is the path the operator
     # actually dictates into; seeding vocab that never reaches it is theatre.
     # build_deepgram_url maps these to keyterm (nova-3) / keywords (nova-2).
-    stt_norm.vocab_terms = list(
-        getattr(getattr(talker_config, "stt", None), "vocab_terms", []) or []
+    # Via the learned-vocabulary seam, so a term the operator approved this
+    # morning biases the LIVE stream too — not just the batch path.
+    from alfred.telegram.stt_vocab_learning import effective_vocab_terms
+
+    stt_norm.vocab_terms = effective_vocab_terms(
+        getattr(talker_config, "stt", None)
     )
     # Intentionally-left-blank: 0 = no biasing (distinguishable from broken).
     log.info(
@@ -721,7 +725,9 @@ def _build_stt_shadow(voice: Any, talker_config: Any, stt_norm: Any):
         )
         return None
 
-    vocab = list(getattr(tstt, "vocab_terms", []) or [])
+    from alfred.telegram.stt_vocab_learning import effective_vocab_terms
+
+    vocab = effective_vocab_terms(tstt)
     instance_name = getattr(
         getattr(talker_config, "instance", None), "name", "") or ""
     log.info(
