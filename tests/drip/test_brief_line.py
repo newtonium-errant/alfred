@@ -15,6 +15,7 @@ from alfred.drip.brief_line import (
 from alfred.drip.runner import (
     STOP_BUDGET_EXHAUSTED,
     STOP_CIRCUIT_BREAKER,
+    STOP_DISABLED,
     STOP_QUOTA_BLOCKED,
     STOP_WORKLIST_EMPTY,
 )
@@ -70,6 +71,22 @@ def test_never_run_is_distinct_from_nothing_to_do() -> None:
     complete = render_campaign_line(_p(remaining=0))
     assert "complete" in complete
     assert "not yet run" not in complete
+
+
+def test_disabled_beats_never_run_when_both_are_true() -> None:
+    """A switched-off campaign that has never fired reports DISABLED.
+
+    Ordering pin (#44b). "configured, not yet run" would send the operator to
+    debug a scheduler for a campaign that is behaving exactly as configured —
+    the off switch is the fact that explains the silence, and the never-run
+    branch means what its docstring says: an ENABLED campaign that has not
+    fired. Only observable once a real config could mark a campaign disabled.
+    """
+    line = render_campaign_line(
+        _p(last_run_at="", last_stop_reason=STOP_DISABLED),
+    )
+    assert "disabled" in line
+    assert "not yet run" not in line
 
 
 def test_quota_blocked_is_loud_not_slow(  ) -> None:

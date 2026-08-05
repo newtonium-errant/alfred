@@ -274,6 +274,32 @@ class BriefConfig:
     # Instance slug stamped into feed items (from telegram.instance.name, lowercased).
     instance_name: str = ""
 
+    # Drip campaigns (#44b) — the Campaigns section's source. ``Any`` rather
+    # than the concrete ``DripConfig`` to keep the brief→drip dependency at call
+    # time, matching the ``tier_defaults`` precedent directly above. ``None``
+    # means the block was never loaded, which renders no section at all.
+    drip: Any = None
+
+
+def _load_drip_config(raw: dict[str, Any]) -> Any:
+    """Build the drip config, or ``None`` if drip isn't importable.
+
+    Never lets a drip-side problem take the whole brief down: the morning brief
+    is the operator's primary surface and a background campaign's config is not
+    worth failing it. The degradation is visible (a warning, and no Campaigns
+    section) rather than a partial brief.
+    """
+    try:
+        from alfred.drip.config import load_from_unified as _load_drip
+        return _load_drip(raw)
+    except Exception as exc:  # noqa: BLE001 — the brief must still render
+        log.warning(
+            "brief.drip_config_failed",
+            error=str(exc), error_type=type(exc).__name__,
+            consequence="Campaigns section omitted from this brief",
+        )
+        return None
+
 
 def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     """Build BriefConfig from the unified config dict."""
@@ -510,6 +536,11 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         quarantine_dir_name=quarantine_dir_name,
         tier_defaults=tier_defaults,
         feed=_load_feed_config(raw),
+        # Drip campaigns (#44b). Built from the top-level ``drip:`` block by
+        # drip's own loader, so the brief and ``alfred drip`` read one config
+        # surface rather than two parsers that can disagree. Absent block ⇒ no
+        # campaigns ⇒ the Campaigns section never renders (deploy-inert).
+        drip=_load_drip_config(raw),
         instance_name=(
             ((raw.get("telegram") or {}).get("instance") or {}).get("name", "") or ""
         ).strip().lower(),
