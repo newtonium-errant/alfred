@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+// #54: stub VoiceCapture so a transcript is deliverable on demand. The stub's
+// button fires onTranscript exactly as the real component does in direct mode —
+// the same shape playerPage/homePage use. The other tests here don't touch
+// voice, so the stub is inert for them.
+vi.mock('../components/chat/VoiceCapture', () => ({
+  VoiceCapture: ({ onTranscript, idPrefix }: { onTranscript: (t: string) => void; idPrefix: string }) => (
+    <button type="button" data-testid={`${idPrefix}-mock-use`} onClick={() => onTranscript('why is that yellow?')}>
+      mock-stt
+    </button>
+  ),
+}));
+
 import { Composer } from '../components/chat/Composer';
 import { MAX_IMAGE_BYTES } from '../lib/algernon/schemas';
 
@@ -142,5 +154,68 @@ describe('Composer image-carry (#29)', () => {
 
     await waitFor(() => expect(screen.getAllByTestId('composer-image-preview')).toHaveLength(4));
     expect(screen.getByTestId('composer-image-error')).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #54 half 1 — the transcript lands in THIS input, and never clobbers
+// ---------------------------------------------------------------------------
+
+describe('Composer voice transcript — direct insert, append not replace', () => {
+  it('a transcript lands in the main composer input', async () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+
+    await waitFor(() =>
+      expect((screen.getByTestId('composer-input') as HTMLTextAreaElement).value).toContain(
+        'why is that yellow?',
+      ),
+    );
+  });
+
+  it('PRE-TYPED text survives — the transcript appends with one space', async () => {
+    // The reported clobber: the old handler did setValue(t) and destroyed this.
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.change(input, { target: { value: 'about the coop' } });
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+
+    await waitFor(() =>
+      expect(input.value).toBe('about the coop why is that yellow?'),
+    );
+  });
+
+  it('Send carries the COMBINED text and the voice provenance flag', async () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.change(input, { target: { value: 'quick q' } });
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toContain('why is that yellow?'));
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    const [text, source] = onSend.mock.calls[0];
+    expect(text).toBe('quick q why is that yellow?');
+    // The hidden provenance marker half 2's capture side keys on.
+    expect(source).toBe('voice');
+  });
+
+  it('clearing the input IS discard — nothing is sent', async () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).not.toBe(''));
+    fireEvent.change(input, { target: { value: '' } });
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    expect(onSend).not.toHaveBeenCalled();
   });
 });

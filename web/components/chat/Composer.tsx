@@ -166,8 +166,17 @@ export function Composer({
       <VoiceCapture
         idPrefix="composer-voice"
         disabled={disabled}
+        // #54 — the transcript lands in THIS input, editable in place, one Send.
+        insertDirectly
         onTranscript={(t) => {
-          setValue(t);
+          // APPEND, never replace. The old `setValue(t)` destroyed whatever the
+          // operator had already typed — the clobber the operator hit. A single
+          // space joins the two; no space when the input was empty, so a
+          // voice-only message carries no leading whitespace.
+          setValue((prev) => {
+            const base = prev.trimEnd();
+            return base ? `${base} ${t}` : t;
+          });
           setVoiceSeeded(true);
         }}
       />
