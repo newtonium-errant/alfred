@@ -1005,3 +1005,69 @@ describe('Deck — the snooze duration menu (#14 render)', () => {
     expect(unbacked.getAttribute('aria-haspopup')).toBeNull();
   });
 });
+
+// --- #14 WARN-1: the ↑ toast must describe what the gesture actually did -----
+// One gesture, three outcomes, three different return times. The full swipe —
+// the preserved Park muscle memory, and so the most-used path — defaults to the
+// indefinite rung, which by design NEVER comes back on its own. Telling that
+// operator "it resurfaces at the next sync" is a false promise in the round
+// whose whole thesis is copy honesty.
+//
+// Asserted on the RENDERED toast, not the hook's return value: the string the
+// operator reads is the artifact under test.
+
+describe('Deck — the snooze toast names the real outcome (#14 WARN-1)', () => {
+  it('a full ↑ swipe (indefinite) promises nothing about a sync', () => {
+    // Mutation: collapse snoozeToast to the single old sentence → this fails.
+    render(<Deck items={[slotItem(), item({ id: 'b' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('deck-snooze-choice-snooze_until_i_say')));
+
+    const toast = screen.getByTestId('deck-toast').textContent ?? '';
+    expect(toast).toContain('until you say otherwise');
+    expect(toast).not.toContain('next sync');
+  });
+
+  it('a DATED rung names the duration, and also does not claim the next sync', () => {
+    // A 3-day snooze doesn't return at the next sync either — the store is the
+    // entire point. So the dated branch gets its own true sentence rather than
+    // inheriting the set-aside wording.
+    render(<Deck items={[slotItem(), item({ id: 'b' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('deck-snooze-choice-snooze_3d')));
+
+    const toast = screen.getByTestId('deck-toast').textContent ?? '';
+    expect(toast).toContain('3 days');
+    expect(toast).not.toContain('next sync');
+  });
+
+  it('an UNBACKED kind is the one case where the next-sync wording is true', () => {
+    // Nothing was written and the item is still open server-side, so it really
+    // does come back — and the word matches the button ("Set aside for now").
+    render(<Deck items={[item({ id: 'e', kind: 'email_tier' }), item({ id: 'b' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+
+    const toast = screen.getByTestId('deck-toast').textContent ?? '';
+    expect(toast).toContain('Set aside');
+    expect(toast).toContain('next sync');
+  });
+
+  it('all three ↑ outcomes read differently from each other', () => {
+    // The point of the branch is DISCRIMINATION. A refactor that made two of
+    // them collapse to the same sentence would leave each individual assert
+    // above still passing.
+    const seen = new Set<string>();
+    for (const [items, choice] of [
+      [[slotItem()], 'deck-snooze-choice-snooze_until_i_say'],
+      [[slotItem()], 'deck-snooze-choice-snooze_3d'],
+      [[item({ id: 'e', kind: 'email_tier' })], null],
+    ] as Array<[FeedItem[], string | null]>) {
+      const { unmount } = render(<Deck items={items} />);
+      act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+      if (choice) act(() => fireEvent.click(screen.getByTestId(choice)));
+      seen.add(screen.getByTestId('deck-toast').textContent ?? '');
+      unmount();
+    }
+    expect(seen.size).toBe(3);
+  });
+});

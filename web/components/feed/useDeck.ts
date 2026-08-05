@@ -6,6 +6,7 @@ import {
   ONE_OFF_ACTION,
   ROUTINE_MATCH_KIND,
   SNOOZE_INDEFINITE_ACTION,
+  SNOOZE_LABELS,
   UNDO_MS,
   UNSNOOZE_ACTION,
   deckVerbsFor,
@@ -38,6 +39,32 @@ import { ApiError } from '../../lib/algernon/http';
 export interface DeckToast {
   message: string;
   canUndo: boolean;
+}
+
+/**
+ * What to tell the operator after a ↑, given what the gesture actually did.
+ *
+ * THREE outcomes hide behind one gesture, and they come back at three different
+ * times, so one sentence cannot cover them honestly:
+ *
+ *   - no action id  → nothing was written; the item is still open server-side,
+ *                     so it genuinely does return at the next sync.
+ *   - a dated rung  → it returns when the duration runs out. Not the next sync;
+ *                     that is the entire point of the store.
+ *   - indefinite    → it returns when the operator says so, and never on its own.
+ *                     This is the FULL-SWIPE default (the preserved Park muscle
+ *                     memory), so it is also the most-used path of the three.
+ *
+ * (Urgency can break any of them through early, which is the one thing the
+ * toast deliberately doesn't promise — a card that comes back BEFORE you were
+ * told it would is a good surprise, and the card itself explains why via
+ * `evidence.snooze_breakthrough`.)
+ */
+function snoozeToast(actionId: string | null): string {
+  if (actionId === null) return 'Set aside — it resurfaces at the next sync.';
+  if (actionId === SNOOZE_INDEFINITE_ACTION) return 'Snoozed until you say otherwise.';
+  const label = SNOOZE_LABELS[actionId as SnoozeAction];
+  return label ? `Snoozed for ${label.toLowerCase()}.` : 'Snoozed.';
 }
 
 export interface UseDeckOptions {
@@ -191,7 +218,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
       setToast({
         message:
           verdict === 'snooze'
-            ? 'Snoozed — it resurfaces at the next sync.'
+            ? snoozeToast(actionId)
             : verdict === 'skip'
               ? 'Skipped — it may resurface at the next sync.'
               : verdict === 'reject'
