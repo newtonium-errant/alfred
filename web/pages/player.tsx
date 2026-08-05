@@ -62,7 +62,32 @@ export default function PlayerPage() {
       } catch (e) {
         if (cancelled) return;
         if (e instanceof ApiError && e.status === 401) {
-          onAuthExpired();
+          // #52 — a 401 from THIS FEATURE's fetch is not proof the session is
+          // dead. `/web/brief/*` validates the session token; `/feed/*` (which
+          // fed the home page the operator just came from) validates only the
+          // BFF's peer token. So one family can reject a session the other
+          // never checked, and treating that as global session death silently
+          // "logs out" a user the home page greeted by name seconds earlier.
+          //
+          // Ask the SESSION endpoint, which is the only authority on the
+          // question. Redirect only if it agrees the session is gone.
+          try {
+            await authApi.me();
+            if (!cancelled) {
+              setError(
+                "Your briefing couldn't be loaded, but you're still signed in. Try again, or open /brief to read it.",
+              );
+            }
+          } catch (probe) {
+            if (cancelled) return;
+            if (probe instanceof ApiError && probe.status === 401) {
+              onAuthExpired(); // genuinely signed out — the redirect is honest
+            } else {
+              // The probe itself failed (offline, 5xx). Absence of an answer is
+              // not a "you are logged out" answer.
+              setError('Could not reach the server. Check your connection and try again.');
+            }
+          }
           return;
         }
         setError('Could not load the player. Try refreshing.');

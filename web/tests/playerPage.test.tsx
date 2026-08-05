@@ -6,19 +6,23 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 // briefPlayer's fetches are mocked; narrationSlides / usePlayer / useMediaSession are real
 // (Media Session no-ops without navigator.mediaSession in jsdom).
 
-const { mockFetchNarration, mockFetchAudio, mockTurn, mockOpen } = vi.hoisted(() => ({
+const { mockFetchNarration, mockFetchAudio, mockTurn, mockOpen, mockMe, mockReplace } = vi.hoisted(() => ({
   mockFetchNarration: vi.fn(),
   mockFetchAudio: vi.fn(),
   mockTurn: vi.fn(),
   mockOpen: vi.fn(),
+  // #52: the session probe the player consults before ever concluding logout,
+  // and a STABLE router spy so "did it redirect" is assertable.
+  mockMe: vi.fn(),
+  mockReplace: vi.fn(),
 }));
 vi.mock('../lib/algernon/briefPlayer', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/algernon/briefPlayer')>();
   return { ...actual, fetchNarration: mockFetchNarration, fetchAudio: mockFetchAudio };
 });
 vi.mock('../lib/algernon/useSession', () => ({ useSession: () => ({ user: { name: 'andrew', role: 'owner' }, loading: false }) }));
-vi.mock('next/router', () => ({ useRouter: () => ({ replace: vi.fn(), push: vi.fn(), query: {} }) }));
-vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
+vi.mock('next/router', () => ({ useRouter: () => ({ replace: mockReplace, push: vi.fn(), query: {} }) }));
+vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn(), me: mockMe } }));
 // The player-ask send path reuses the shared chat client — mock it (not a parallel client).
 vi.mock('../lib/algernon/client', () => ({ chatApi: { turn: mockTurn, open: mockOpen } }));
 // VoiceCapture has its own test; stub it here to isolate the page's ask logic from
@@ -201,5 +205,69 @@ describe('PlayerPage — controls + first-class interruption (C3c ask-wiring)', 
     // The keyboard input is still present and usable (the STT-fail / send-fail contract).
     expect(screen.queryByTestId('player-ask-input')).not.toBeNull();
     expect(screen.queryByTestId('player-ask-answer')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #52 — a feature 401 is not proof of logout
+// ---------------------------------------------------------------------------
+
+describe('player 401 handling — no fake logout', () => {
+  beforeEach(() => {
+    mockMe.mockReset();
+    mockReplace.mockReset();
+  });
+
+  it('LIVE session + a 401 from the brief fetch: stays put, says so honestly', async () => {
+    // The reported bug. /web/brief/* validates the session token; /feed/* (which
+    // fed the home page the operator just came from) validates only the BFF's
+    // peer token — so one family can reject a session the other never checked.
+    mockFetchNarration.mockRejectedValue(new ApiError(401, 'invalid_session'));
+    mockFetchAudio.mockRejectedValue(new ApiError(401, 'invalid_session'));
+    mockMe.mockResolvedValue({ name: 'andrew', role: 'owner' }); // session is ALIVE
+
+    render(<PlayerPage />);
+
+    await waitFor(() => expect(screen.queryByTestId('player-error')).not.toBeNull());
+    expect(mockReplace).not.toHaveBeenCalled();
+    const msg = screen.getByTestId('player-error').textContent ?? '';
+    expect(msg).toMatch(/still signed in/i);
+    expect(mockMe).toHaveBeenCalled();
+  });
+
+  it('DEAD session + a 401: the redirect still happens (honest logout preserved)', async () => {
+    // The paired pin. A build that never redirects would pass the test above and
+    // strand a genuinely signed-out user on a broken page.
+    mockFetchNarration.mockRejectedValue(new ApiError(401, 'invalid_session'));
+    mockFetchAudio.mockRejectedValue(new ApiError(401, 'invalid_session'));
+    mockMe.mockRejectedValue(new ApiError(401, 'invalid_session')); // session is GONE
+
+    render(<PlayerPage />);
+
+    await waitFor(() => expect(mockReplace).toHaveBeenCalled());
+    expect(String(mockReplace.mock.calls[0][0])).toContain('/login');
+  });
+
+  it('probe itself fails (offline/5xx): no redirect — absence is not an answer', async () => {
+    mockFetchNarration.mockRejectedValue(new ApiError(401, 'invalid_session'));
+    mockFetchAudio.mockRejectedValue(new ApiError(401, 'invalid_session'));
+    mockMe.mockRejectedValue(new Error('network down'));
+
+    render(<PlayerPage />);
+
+    await waitFor(() => expect(screen.queryByTestId('player-error')).not.toBeNull());
+    expect(mockReplace).not.toHaveBeenCalled();
+    expect(screen.getByTestId('player-error').textContent ?? '').toMatch(/connection/i);
+  });
+
+  it('a NON-401 failure never consults the session at all', async () => {
+    mockFetchNarration.mockRejectedValue(new ApiError(502, 'upstream'));
+    mockFetchAudio.mockRejectedValue(new ApiError(502, 'upstream'));
+
+    render(<PlayerPage />);
+
+    await waitFor(() => expect(screen.queryByTestId('player-error')).not.toBeNull());
+    expect(mockMe).not.toHaveBeenCalled();
+    expect(mockReplace).not.toHaveBeenCalled();
   });
 });
