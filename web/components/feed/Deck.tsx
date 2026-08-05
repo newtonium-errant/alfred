@@ -112,6 +112,14 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     // Durations only mean something where a store is behind them; on every other
     // kind the ↑ gesture is the session-local set-aside it has always been, and a
     // menu offering "3 days" would be promising persistence that doesn't exist.
+    //
+    // THE CONTRACT IS THE OBSERVABLE PROPERTY — an unbacked kind never shows a
+    // duration menu — and it is deliberately enforced twice (#48): here, so the
+    // hold never arms, and again on the menu's own JSX via `snoozeIsBacked`, so
+    // it could not render even if it did. Neither guard alone reds a test;
+    // removing both reds the "an unbacked kind never opens a duration menu" pin.
+    // Keep both — the pin defends the property, and the property is what the
+    // operator experiences.
     const durationsAvailable = snoozeIsBacked(current);
     let sx = 0;
     let sy = 0;
@@ -176,7 +184,25 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
       holdTimerRef.current = setTimeout(() => {
         holdTimerRef.current = null;
         // Spend the gesture: the card FREEZES where it was held (we simply stop
-        // updating it) and the release that follows must not also verdict.
+        // updating it), and the release that follows must not spring it back.
+        //
+        // THESE TWO LINES ARE ONE GUARD, deliberately doubled (#48). Either
+        // alone already stops onUp from reaching `resetVisual()` — `dragging =
+        // false` via its `if (!dragging) return`, the ref via its own
+        // early-return — so deleting either changes no behaviour and no test.
+        // Only removing BOTH reds the suite (`deckHoldBand.test.tsx`, the
+        // "RELEASING under the open menu does not unfreeze the card" pin). Keep
+        // the pair: the thing being protected is the freeze, and it is the
+        // whole reason the hold fires mid-drag rather than on release.
+        //
+        // What this does NOT protect against, despite how it reads: a double
+        // VERDICT. The hold can only fire from inside the band, and every
+        // in-band coordinate sits strictly inside every threshold
+        // `verdictForDrag` tests (|dx| < SNOOZE_X_TOLERANCE < SWIPE_X_THRESHOLD,
+        // and up ≤ SNOOZE_Y_THRESHOLD so the ↑ verdict can't fire either), so
+        // the release's verdict there is always null. An earlier comment here
+        // claimed otherwise; a future editor "simplifying" on that basis would
+        // delete the guard that actually matters.
         gestureConsumedRef.current = true;
         dragging = false;
         setSnoozeMenuOpen(true);
@@ -187,6 +213,8 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
       if (gestureConsumedRef.current) {
         // This gesture already opened the menu — releasing does nothing, and the
         // card stays frozen under it until the menu is dismissed or picked.
+        // Deliberately redundant with the `dragging = false` the hold sets (see
+        // the note there): belt and braces on the freeze, not dead code.
         dx = 0;
         dy = 0;
         return;
@@ -569,7 +597,9 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             dismissing springs it back.
 
             Only rendered for kinds the backend can actually snooze — everywhere
-            else ↑ is a session set-aside and there is no duration to choose. */}
+            else ↑ is a session set-aside and there is no duration to choose.
+            The second half of the doubled kind gate (see `durationsAvailable`
+            in the drag effect); deliberate, not a leftover. */}
         {snoozeMenuOpen && current && snoozeIsBacked(current) && (
           <div
             data-testid="deck-snooze-menu"
