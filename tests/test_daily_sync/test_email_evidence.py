@@ -23,6 +23,7 @@ from pathlib import Path
 from textwrap import dedent
 
 import frontmatter
+import pytest
 
 from alfred.daily_sync.email_section import (
     _EMAIL_BODY_CAP,
@@ -184,3 +185,90 @@ def test_feed_item_id_stable_when_enriched() -> None:
     # And the enriched feed item's evidence carries the body (the card's source).
     ev = build_feed_items("email_tier", [enriched.to_dict()], "salem")[0].evidence
     assert ev["body"] == "body preview" and ev["gmail_url"] == "https://mail.google.com/x"
+
+
+# ---------------------------------------------------------------------------
+# #34 rider (e) — the structural corridor: no marker, no candidate, ever
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param({}, id="bare"),
+        # Each of these is a proxy someone might be tempted to fall back on.
+        # #40 happened because a consumer treated the FIRST one as provenance.
+        pytest.param({"priority": "high"}, id="real-tier"),
+        pytest.param({"priority": "high", "action_hint": "calendar"}, id="tier+hint"),
+        pytest.param(
+            {"email_message_id": "<m@example.com>"}, id="message-id",
+        ),
+        pytest.param(
+            {"priority": "high", "priority_reasoning": "reply-required",
+             "action_hint": "calendar", "email_message_id": "<m@example.com>",
+             "subject": "Invoice", "sender": "billing@example.com"},
+            id="every-proxy-at-once",
+        ),
+        # Marker present but FALSEY in each spelling PyYAML produces.
+        pytest.param({"email_derived": False, "priority": "high"}, id="marker-false"),
+        pytest.param({"email_derived": "", "priority": "high"}, id="marker-empty"),
+        pytest.param({"email_derived": None, "priority": "high"}, id="marker-null"),
+    ],
+)
+def test_no_marker_means_no_candidate_whatever_else_the_record_says(
+    tmp_path: Path, extra: dict,
+) -> None:
+    """The corridor pin: ``_read_candidate`` returns None when the provenance
+    marker is absent or falsey, REGARDLESS of any other frontmatter.
+
+    This closes the invented-field fallback class. #40 put an EMAIL TIER card
+    on a screenshot note because a consumer treated ``priority`` as proof of
+    mail origin — a stamp the backfill's permissive heuristic applies to any
+    note merely MENTIONING email. Every field below is a proxy that reads as
+    plausible evidence and is not; the pin forbids the next one being wired in
+    as a fallback.
+
+    Fail-closed is the correct direction: a missed calibration item costs one
+    batch slot; a false one costs a corpus row asserting an email judgment
+    about something that was never email.
+    """
+    vault = tmp_path / "vault"
+    (vault / "note").mkdir(parents=True, exist_ok=True)
+    fm = {"type": "note", "name": "Suspect", **extra}
+    post = frontmatter.Post(
+        "**From:** alice@example.com\n**Subject:** Hi\n\nBody text.\n", **fm,
+    )
+    (vault / "note" / "Suspect.md").write_text(
+        frontmatter.dumps(post) + "\n", encoding="utf-8",
+    )
+
+    assert _read_candidate(vault, "note/Suspect.md") is None
+
+
+def test_the_marker_alone_is_not_enough_either(tmp_path: Path) -> None:
+    """PAIRED with the corridor pin above, in the opposite direction.
+
+    The marker is NECESSARY, not sufficient — a genuinely email-derived note
+    with no real tier is still skipped, because there is nothing to calibrate.
+    Without this, a build that returned a candidate for anything marker-bearing
+    would pass every case above.
+    """
+    vault = tmp_path / "vault"
+    (vault / "note").mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(
+        "**From:** a@b.com\n**Subject:** s\n\nBody.\n",
+        **{"type": "note", "name": "Marked", "email_derived": True},
+    )
+    (vault / "note" / "Marked.md").write_text(
+        frontmatter.dumps(post) + "\n", encoding="utf-8",
+    )
+
+    assert _read_candidate(vault, "note/Marked.md") is None
+
+
+def test_marker_plus_tier_IS_a_candidate(tmp_path: Path) -> None:
+    """And the positive case, so the two refusals above cannot be satisfied by
+    a build that simply never returns a candidate."""
+    vault = tmp_path / "vault"
+    rel = _seed(vault, "Genuine", message_id="<m@example.com>", body="Body.")
+    assert _read_candidate(vault, rel) is not None
