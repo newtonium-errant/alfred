@@ -10,7 +10,7 @@ Tests run unconditionally per ``feedback_regression_pin_unconditional.md``.
 from __future__ import annotations
 
 import socket
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import frontmatter  # type: ignore[import-untyped]
@@ -67,20 +67,60 @@ def _write_bit(vault: Path) -> None:
     )
 
 
-def _write_task_due_today(vault: Path) -> None:
+def _write_task_due_today(vault: Path, today: date) -> None:
     (vault / "task").mkdir(parents=True, exist_ok=True)
-    today = date.today().isoformat()
     (vault / "task" / "Pay Steph.md").write_text(
-        f"---\ntype: task\nstatus: todo\nname: Pay Steph\ndue: {today}\n---\n\n# Pay Steph\n",
+        f"---\ntype: task\nstatus: todo\nname: Pay Steph\ndue: {today.isoformat()}\n---\n\n# Pay Steph\n",
         encoding="utf-8",
     )
 
 
-def _config(tmp_path: Path, *, feed_enabled: bool) -> BriefConfig:
+def _freeze_clock(monkeypatch: pytest.MonkeyPatch, instant: datetime) -> None:
+    """Serve ONE instant to every clock the brief reads.
+
+    THE FLAKE THIS CLOSES: the parity test generates a brief twice and compares
+    the results byte-for-byte, but the brief stamps the wall clock into its own
+    output — ``Generated at 0016 ADT`` in the body and ``started`` in the
+    frontmatter, both from ``renderer.datetime.now(tz)``. When the two sequential
+    renders straddle a minute boundary the bodies legitimately differ and the
+    gate reds on a real red that means nothing. Observed 2026-08-05 (reviewer-b13:
+    ``2222 ADT`` vs ``2221 ADT``, 3/3 green on re-run, file untouched by the
+    branch under gate). It taxes whoever runs long, which is whoever is being
+    most careful.
+
+    ``date`` is frozen alongside ``datetime`` for the rarer sibling: two runs
+    straddling MIDNIGHT would disagree about the brief's date, not just its
+    minute. Same mechanism, ~1400× rarer, and free to close here.
+
+    The instant is the caller's REAL current time, captured once — not a fixed
+    literal. That keeps every date-derived fixture (the task due today) and the
+    brief's own notion of today in agreement, so freezing changes what the test
+    *compares* without changing what it *exercises*.
+    """
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return instant.astimezone(tz) if tz is not None else instant.replace(tzinfo=None)
+
+    class _FrozenDate(date):
+        @classmethod
+        def today(cls):  # type: ignore[override]
+            return instant.date()
+
+    # Both modules bind these names at import (`from datetime import ...`), so
+    # the patch has to land on each module's own attribute, not on the datetime
+    # module. raising=True (the default): a rename here fails loudly rather than
+    # silently restoring the flake.
+    monkeypatch.setattr("alfred.brief.renderer.datetime", _FrozenDatetime)
+    monkeypatch.setattr("alfred.brief.daemon.datetime", _FrozenDatetime)
+    monkeypatch.setattr("alfred.brief.daemon.date", _FrozenDate)
+
+
+def _config(tmp_path: Path, *, feed_enabled: bool, today: date) -> BriefConfig:
     vault = tmp_path / "vault"
     vault.mkdir(parents=True, exist_ok=True)
     _write_bit(vault)
-    _write_task_due_today(vault)  # → a T1 slot_suggestion item when the feed is on
+    _write_task_due_today(vault, today)  # → a T1 slot_suggestion item when the feed is on
     cfg = BriefConfig(vault_path=str(vault), instance_name="salem")
     cfg.state.path = str(tmp_path / "data" / "brief_state.json")
     cfg.primary_telegram_user_id = None  # no push
@@ -123,11 +163,21 @@ def _patch_weather(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("alfred.brief.weather.fetch_metars", _fake_metars)
 
 
-async def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, feed_enabled: bool) -> str:
+async def _run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    feed_enabled: bool,
+    instant: datetime | None = None,
+) -> str:
     from alfred.brief.daemon import generate_brief
 
     _patch_weather(monkeypatch)
-    cfg = _config(tmp_path, feed_enabled=feed_enabled)
+    # Default to the real clock so the other tests in this file are untouched;
+    # the parity test passes an instant so its two runs share one.
+    instant = instant or datetime.now().astimezone()
+    _freeze_clock(monkeypatch, instant)
+    cfg = _config(tmp_path, feed_enabled=feed_enabled, today=instant.date())
     rel = await generate_brief(cfg, StateManager(cfg.state.path))
     return (Path(cfg.vault_path) / rel).read_text(encoding="utf-8")
 
@@ -135,8 +185,12 @@ async def _run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, feed_enabled:
 async def test_brief_output_byte_identical_feed_on_vs_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    on = await _run(tmp_path / "on", monkeypatch, feed_enabled=True)
-    off = await _run(tmp_path / "off", monkeypatch, feed_enabled=False)
+    # ONE instant for BOTH runs — see _freeze_clock. Without this the two
+    # renders can land in different minutes and the byte-parity assert reds on a
+    # difference that has nothing to do with the feed.
+    instant = datetime.now().astimezone()
+    on = await _run(tmp_path / "on", monkeypatch, feed_enabled=True, instant=instant)
+    off = await _run(tmp_path / "off", monkeypatch, feed_enabled=False, instant=instant)
 
     on_doc, off_doc = frontmatter.loads(on), frontmatter.loads(off)
     # The rendered markdown BODY is byte-identical (the render is what the
@@ -148,6 +202,11 @@ async def test_brief_output_byte_identical_feed_on_vs_off(
     on_fm.pop("started", None)
     off_fm.pop("started", None)
     assert on_fm == off_fm
+
+    # The frozen instant really is what got stamped — so a future edit that
+    # drops the shared instant reintroduces the straddle instead of quietly
+    # passing whenever the two runs happen to land in the same minute.
+    assert f"Generated at {instant.strftime('%H%M')}" in on_doc.content
 
     # Non-vacuous: the feed actually ran when enabled (a health WARN item landed)
     # and did NOT when disabled (no store file).
@@ -162,6 +221,31 @@ async def test_brief_output_byte_identical_feed_on_vs_off(
     # All four converted sections fed the store — slot_suggestion present too.
     slots = [it for it in folded.values() if it.kind == "slot_suggestion"]
     assert any(it.id == "slot_suggestion:task:task/Pay Steph.md" for it in slots)
+
+
+def test_freeze_clock_actually_pins_every_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The freeze must reach all three bound names, not just the obvious one.
+
+    `_freeze_clock` is what makes the parity gate clock-independent, and it works
+    by patching module attributes — a mechanism that fails SILENTLY if a module
+    ever stops binding one of these names at import. `raising=True` catches a
+    rename; this catches the subtler case where the patch lands but the frozen
+    value isn't what comes back.
+
+    Deterministic on purpose: it asserts against a fixed instant far from now, so
+    it cannot pass by coincidence of the real clock being close enough.
+    """
+    import alfred.brief.daemon as daemon_mod
+    import alfred.brief.renderer as renderer_mod
+
+    instant = datetime(2019, 3, 4, 22, 21, tzinfo=timezone.utc)
+    _freeze_clock(monkeypatch, instant)
+
+    assert renderer_mod.datetime.now(timezone.utc) == instant
+    assert daemon_mod.datetime.now(timezone.utc) == instant
+    assert daemon_mod.date.today() == instant.date()
+    # The tz-less branch is used by callers that want naive local time.
+    assert renderer_mod.datetime.now().tzinfo is None
 
 
 async def test_brief_generation_makes_no_outbound_network_call(
