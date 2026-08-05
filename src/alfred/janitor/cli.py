@@ -63,7 +63,7 @@ def format_issue_split(result: SweepResult) -> str:
 
         Issues found: 0
         Issues found: 5 (5 actionable, 0 not janitor-fixable)
-        Issues found: 2075 (12 actionable, 2063 not janitor-fixable; 2051 of
+        Issues found: 2075 (2063 actionable, 12 not janitor-fixable; 2051 of
                             the actionable are spam-cohort)
         Issues found: 2075 (split not recorded)
 
@@ -100,6 +100,41 @@ def _init_state(config: JanitorConfig) -> JanitorState:
     return state
 
 
+def format_issue_counts_by_code(result: SweepResult) -> str:
+    """Per-code tally — the number an operator quotes when a fix moves a count.
+
+    WHY THIS EXISTS (#49). The scan already reports a total and its remediation
+    split, but neither answers "how many LINK001 are there?" — and that is
+    exactly the question a change to the scanner's extraction surface has to be
+    judged on. Measuring it previously meant a throwaway script, which means the
+    before/after number could not be reproduced by whoever deployed the change.
+    A per-code line makes the comparison one command, run either side of a
+    deploy, against the vault that actually matters.
+
+    Descending by count, then by code, so the dominant population reads first —
+    on the live vault that is LINK001 by an order of magnitude, which is the
+    whole reason the headline needed the #31 split in the first place.
+
+    Never silent: a sweep with issues always prints a tally, and the zero case
+    is handled by the caller (which returns early on a clean sweep).
+    """
+    counts: dict[str, int] = {}
+    for issue in result.issues:
+        code = issue.code.value
+        counts[code] = counts.get(code, 0) + 1
+    if not counts:
+        # Defensive: reachable only if a caller renders a sweep whose issue
+        # LIST is empty while ``issues_found`` is not — a state file written by
+        # a version that persisted counts without the issues. Say so rather
+        # than printing an empty block.
+        return "Issues by code: none recorded on this sweep"
+
+    lines = ["Issues by code:"]
+    for code, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"  {code}: {n}")
+    return "\n".join(lines)
+
+
 def cmd_scan(config: JanitorConfig, skills_dir: Path, structural_only: bool = False) -> None:
     """Run Phase 1 scan, print issue report, no fixes."""
     state = _init_state(config)
@@ -119,6 +154,8 @@ def cmd_scan(config: JanitorConfig, skills_dir: Path, structural_only: bool = Fa
     print(format_issue_split(result))
     for sev, count in sorted(result.issues_by_severity.items()):
         print(f"  {sev}: {count}")
+    print()
+    print(format_issue_counts_by_code(result))
     print()
     print(build_issue_report(result.issues))
 
