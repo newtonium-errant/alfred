@@ -24,6 +24,7 @@ from alfred.web.voice_turns import (
     TURN_SLOT_WAIT_S,
     TurnDeps,
     VoiceTurnDriver,
+    _INFLIGHT_POLL_S,
 )
 
 _OWNER = synthetic_chat_id("andrew")
@@ -441,6 +442,25 @@ async def test_engine_error_detail_truncated_to_1024() -> None:
 
 
 async def test_inflight_waits_then_runs_once() -> None:
+    """The slot guard: WAIT while another turn holds the key, then run exactly
+    once and release it.
+
+    Both waits are derived from ``_INFLIGHT_POLL_S`` rather than typed as
+    literals (#46). The driver notices a freed slot by POLLING, so the turn can
+    legitimately start up to one full poll interval after the discard — and the
+    old ``_wait_for`` default of 1.0s left only 4× that interval to cover the
+    poll AND the whole turn pipeline. That margin is thin enough to lose under a
+    loaded full-suite run, which is the shape of the red on record.
+
+    Deriving keeps it honest in both directions: nothing here is a magic number
+    that quietly re-tightens if someone raises the poll interval, and the numbers
+    are not simply inflated — the SHORTER wait still exceeds one poll, so
+    ``rts.calls == []`` remains a real assertion that the guard held rather than
+    one that passes because nothing has had time to happen yet.
+
+    The property is untouched: still waits, still runs exactly once, still
+    releases in ``finally``.
+    """
     ch = FakeChannel()
     in_flight = {_KEY}  # a concurrent /chat/turn holds the slot
     state = _FakeState(_active())
@@ -449,10 +469,12 @@ async def test_inflight_waits_then_runs_once() -> None:
     driver.attach_channel(ch)
     _hello(driver)
     await driver.submit_utterance("go")
-    await asyncio.sleep(0.3)
+    # Longer than one poll: the driver has demonstrably looked and declined.
+    await asyncio.sleep(_INFLIGHT_POLL_S + 0.05)
     assert rts.calls == []  # still waiting on the slot
     in_flight.discard(_KEY)  # slot freed
-    await _wait_for(ch, {"turn_final"})
+    # One poll to notice, plus the turn itself, plus loaded-machine slack.
+    await _wait_for(ch, {"turn_final"}, timeout=_INFLIGHT_POLL_S * 8)
     assert len(rts.calls) == 1
     assert _KEY not in in_flight  # released in finally
     await driver.aclose()

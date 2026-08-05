@@ -971,32 +971,71 @@ def test_json_guard_overrides_prior_stdout_structlog_config(
     """Robustness pin: even when a PRIOR caller/test left structlog globally
     configured to write to STDOUT, the ``wants_json`` guard overrides it for
     the handler's duration so stdout stays clean. Without the guard this leaks
-    (the failure mode the guard exists to close)."""
+    (the failure mode the guard exists to close).
+
+    FLAKE HISTORY (#46). This is the ONLY test in the suite that points GLOBAL
+    structlog at the real stdout, which makes it the only test that can be
+    broken by somebody else's log line: while that config is live, a structlog
+    event from ANY source — notably a background daemon thread outliving an
+    orchestrator/mail/curator test — renders straight into the stdout this test
+    is about to ``json.loads``. That is the documented Class-B pollution the
+    ``_pin_structlog_off_stdout`` conftest baseline exists to prevent, and this
+    test opts out of that protection by design. It failed once in a full suite
+    (builder-a, 2026-08-04: 12135/1) and passed on identical trees.
+
+    Two changes keep the pin's meaning while shrinking what it exposes:
+
+    1. The contaminated window is now JUST the ``cmd_done`` call. It used to
+       span the vault writes and config build too — the slow part — so the
+       window a foreign thread could land in was several times wider than the
+       behaviour under test.
+    2. Teardown restores the PREVIOUS config rather than calling
+       ``structlog.reset_defaults()``. Reset leaves structlog in its
+       unconfigured PrintLogger→**real stdout** default, i.e. this test used to
+       hand the rest of the suite the very state the conftest baseline exists
+       to remove, until the next test's autouse fixture happened to re-pin it.
+
+    NOT claimed: that the original ordering was reproduced. The competing
+    hypothesis — a logger cached under ``cache_logger_on_first_use`` surviving
+    the guard's reconfigure — was tested directly and REFUTED (priming
+    ``routine.cli.log`` under a stdout config, then calling the handler, leaks
+    nothing). The cross-thread mechanism above is what remains, and it is
+    narrowed here rather than proven.
+    """
     import json
-    # Simulate contamination: structlog rendering to stdout.
+
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Morning", {
+        "type": "routine",
+        "name": "Morning",
+        "status": "active",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Meditation practice"}],
+        "completion_log": ["corrupt"],
+    })
+    config = _config(vault, tmp_path)
+    capsys.readouterr()  # drop setup noise; the window below is what's asserted
+
+    # Simulate contamination: structlog rendering to stdout, for exactly as long
+    # as the call under test.
+    prev = structlog.get_config() if structlog.is_configured() else None
     structlog.configure(
         processors=[structlog.dev.ConsoleRenderer()],
         logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
     )
     try:
-        vault = tmp_path / "vault"
-        _write_routine(vault, "Morning", {
-            "type": "routine",
-            "name": "Morning",
-            "status": "active",
-            "cadence": {"type": "daily"},
-            "items": [{"text": "Meditation practice"}],
-            "completion_log": ["corrupt"],
-        })
-        config = _config(vault, tmp_path)
-
         cmd_done(
             config, "Morning", "Meditation practice",
             wants_json=True, today_override="2026-06-28",
         )
-        captured = capsys.readouterr()
-        payload = json.loads(captured.out)  # raises if the warning leaked
-        assert payload["ok"] is True
-        assert "completion_log_not_dict" not in captured.out
     finally:
-        structlog.reset_defaults()
+        # Restore the baseline, never reset_defaults() — see the docstring.
+        if prev is not None:
+            structlog.configure(**prev)
+        else:
+            structlog.reset_defaults()
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)  # raises if the warning leaked
+    assert payload["ok"] is True
+    assert "completion_log_not_dict" not in captured.out
