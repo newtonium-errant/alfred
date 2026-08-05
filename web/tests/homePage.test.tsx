@@ -19,8 +19,12 @@ vi.mock('next/router', () => ({
   useRouter: () => ({ replace: vi.fn(), push: vi.fn(), query: {}, events: { on: vi.fn(), off: vi.fn() } }),
 }));
 vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
-// Composition mode is controllable per test (default check-in).
-vi.mock('../lib/algernon/composer', () => ({
+// Composition mode is controllable per test (default check-in). The brief-card
+// COPY helpers are passed through to the real module on purpose (#51): this mock
+// exists to control the MODE, and a hand-written copy stub here would let the
+// card's real wording drift without any test noticing.
+vi.mock('../lib/algernon/composer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../lib/algernon/composer')>()),
   composeMode: () => modeState.current,
   halifaxHour: () => 12,
   composeModeForDate: () => modeState.current,
@@ -53,6 +57,13 @@ beforeEach(() => {
   mockList.mockReset();
   mockAct.mockReset().mockResolvedValue({ ok: true, status: 'acted' });
   modeState.current = 'checkin';
+  // #51: the brief card looks up /api/brief/latest for the artifact's DATE.
+  // Stubbed so no test makes a real request; `date: null` is the honest empty
+  // spool, which renders the neutral copy.
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ kind: 'brief', date: null, markdown: null }) })),
+  );
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -262,5 +273,82 @@ describe('HomePage composer — a rings completion moves needs-you in the SAME r
 
     expect(screen.getByTestId('composer-needs-you').textContent).toContain('1 thing needs you');
     expect(screen.getByTestId('ring-item-error').textContent).toBe('That action failed.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #51 — the brief card's RENDERED copy, date-gated
+// ---------------------------------------------------------------------------
+
+describe('HomePage brief card — a stale artifact does not call itself fresh', () => {
+  // The expectation INPUT comes from production's own day-key helper, so the
+  // fixture dates track whatever "today" is when the suite runs. The assertions
+  // are on rendered strings, not on the enum.
+  async function renderBriefCardWith(date: string | null) {
+    modeState.current = 'brief';
+    mockList.mockResolvedValue({ items: [], count: 0 });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ kind: 'brief', date, markdown: 'x' }) })),
+    );
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('compose-brief')).not.toBeNull());
+    return async () => {
+      await waitFor(() =>
+        expect(screen.getByTestId('composer-brief-headline').textContent).not.toBe('No brief yet'),
+      );
+    };
+  }
+
+  async function todayKey(): Promise<string> {
+    const { halifaxDayKey } = await import('../lib/algernon/composer');
+    return halifaxDayKey(new Date());
+  }
+
+  it("today's brief: the card says it is ready", async () => {
+    const settle = await renderBriefCardWith(await todayKey());
+    await settle();
+    expect(screen.getByTestId('composer-brief-headline').textContent).toBe(
+      'Your morning brief is ready',
+    );
+  });
+
+  it("yesterday's brief: the card names it as yesterday's and never says ready", async () => {
+    const d = new Date();
+    d.setUTCDate(d.getUTCDate() - 1);
+    const { halifaxDayKey } = await import('../lib/algernon/composer');
+    const settle = await renderBriefCardWith(halifaxDayKey(d));
+    await settle();
+
+    const headline = screen.getByTestId('composer-brief-headline').textContent ?? '';
+    const detail = screen.getByTestId('composer-brief-detail').textContent ?? '';
+    expect(headline).toBe("Yesterday's brief");
+    expect(headline).not.toMatch(/ready/i);
+    expect(detail).toMatch(/6:00/);
+  });
+
+  it('empty spool: says there is no brief yet, and when today’s arrives', async () => {
+    modeState.current = 'brief';
+    mockList.mockResolvedValue({ items: [], count: 0 });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ kind: 'brief', date: null, markdown: null }) })),
+    );
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('compose-brief')).not.toBeNull());
+    expect(screen.getByTestId('composer-brief-headline').textContent).toBe('No brief yet');
+    expect(screen.getByTestId('composer-brief-detail').textContent ?? '').toMatch(/6:00/);
+  });
+
+  it('a FAILED lookup degrades to "no brief yet", never to the fresh claim', async () => {
+    modeState.current = 'brief';
+    mockList.mockResolvedValue({ items: [], count: 0 });
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) })));
+    render(<HomePage />);
+    await waitFor(() => expect(screen.queryByTestId('compose-brief')).not.toBeNull());
+    // An unreachable API is not evidence that today's brief landed.
+    expect(screen.getByTestId('composer-brief-headline').textContent).not.toBe(
+      'Your morning brief is ready',
+    );
   });
 });

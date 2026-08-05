@@ -9,7 +9,15 @@ import { RingsHeader } from '../components/feed/RingsHeader';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { authApi } from '../lib/algernon/authClient';
-import { composeMode, halifaxHour, type ComposeMode } from '../lib/algernon/composer';
+import {
+  briefCardDetail,
+  briefCardHeadline,
+  briefFreshness,
+  composeMode,
+  halifaxHour,
+  type BriefFreshness,
+  type ComposeMode,
+} from '../lib/algernon/composer';
 import { useComposerLog } from '../lib/algernon/composerLog';
 import { isDeckDealt } from '../lib/algernon/feedConstants';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
@@ -43,6 +51,31 @@ export default function HomePage() {
     setMode(composeMode(halifaxHour(new Date())));
   }, []);
   useComposerLog(mode, router);
+
+  // #51 — the brief card must know the DATE of what it advertises. The window is
+  // a guess about when the artifact exists; this is the artifact itself. `null`
+  // means "not looked up yet" and renders the neutral copy, so a slow or failed
+  // lookup never upgrades into a freshness claim.
+  const [briefFresh, setBriefFresh] = useState<BriefFreshness | null>(null);
+  useEffect(() => {
+    if (!authed || mode !== 'brief') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/brief/latest?kind=brief');
+        if (!res.ok) throw new Error(`brief_latest_${res.status}`);
+        const body = (await res.json()) as { date?: string | null };
+        if (!cancelled) setBriefFresh(briefFreshness(body?.date ?? null));
+      } catch {
+        // Degrade to "no brief yet" rather than to the fresh claim. An
+        // unreachable API is not evidence that today's brief landed.
+        if (!cancelled) setBriefFresh('none');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authed, mode]);
 
   useEffect(() => {
     if ((!sessionLoading && !user) || unauthenticated) {
@@ -181,8 +214,15 @@ export default function HomePage() {
               data-testid="composer-brief-card"
               className="block rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft"
             >
-              <h2 className={titleClass}>Your morning brief is ready</h2>
-              <p className={`mt-1 ${subtle}`}>The brief and Daily Sync {INSTANCE_NAME} prepared — open to read →</p>
+              {/* #51 — date-gated copy. `null` (lookup in flight) renders the
+                  neutral "no brief yet" wording, so the fresh claim is only ever
+                  made once the artifact's own date has confirmed it. */}
+              <h2 className={titleClass} data-testid="composer-brief-headline">
+                {briefCardHeadline(briefFresh ?? 'none')}
+              </h2>
+              <p className={`mt-1 ${subtle}`} data-testid="composer-brief-detail">
+                {briefCardDetail(briefFresh ?? 'none', INSTANCE_NAME)}
+              </p>
             </Link>
             {/* Offer the interruptible player (C3b) — the /player page degrades gracefully
                 if there's no brief / no audio, so this is safe to offer in the brief window. */}
