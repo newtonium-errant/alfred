@@ -45,12 +45,12 @@ describe('isDeckDealt — the ONE deck dealing/count predicate', () => {
   });
 });
 
-describe('DECK_VERBS.slot_suggestion — Accept / Skip=park', () => {
-  it('affirm accepts; reject is null but rejectParks routes LEFT to a client park', () => {
+describe('DECK_VERBS.slot_suggestion — Accept / Skip=snooze', () => {
+  it('affirm accepts; reject is null but rejectDefers routes LEFT to a client snooze', () => {
     const v = deckVerbsFor('slot_suggestion');
     expect(v?.affirm).toBe('accept');
     expect(v?.reject).toBeNull();
-    expect(v?.rejectParks).toBe(true);
+    expect(v?.rejectDefers).toBe(true);
     expect(v?.rejectLabel).toBe('Skip');
   });
 

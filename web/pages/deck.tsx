@@ -13,15 +13,15 @@ import { display, subtle } from '../lib/typography';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
-// Client-side park hide-list (this session only) — a parked card is deferred to
+// Client-side snooze hide-list (this session only) — a snoozed card is deferred to
 // the next sync, so it must not re-enter the deck if the page re-mounts. No store
 // write (Phase B; the board is Phase C).
-const PARK_KEY = 'algernon_deck_parked';
+const SNOOZE_KEY = 'algernon_deck_snoozed';
 
-function readParked(): Set<string> {
+function readSnoozed(): Set<string> {
   if (typeof window === 'undefined') return new Set();
   try {
-    const raw = window.sessionStorage.getItem(PARK_KEY);
+    const raw = window.sessionStorage.getItem(SNOOZE_KEY);
     const arr = raw ? (JSON.parse(raw) as unknown) : [];
     return new Set(Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : []);
   } catch {
@@ -29,12 +29,12 @@ function readParked(): Set<string> {
   }
 }
 
-function writeParked(ids: Set<string>): void {
+function writeSnoozed(ids: Set<string>): void {
   if (typeof window === 'undefined') return;
   try {
-    window.sessionStorage.setItem(PARK_KEY, JSON.stringify([...ids]));
+    window.sessionStorage.setItem(SNOOZE_KEY, JSON.stringify([...ids]));
   } catch {
-    /* sessionStorage unavailable → park is best-effort in-memory only */
+    /* sessionStorage unavailable → snooze is best-effort in-memory only */
   }
 }
 
@@ -62,8 +62,8 @@ export default function DeckPage() {
       try {
         const res = await feedApi.list({ state: 'open', mode: 'decide' });
         if (cancelled) return;
-        const parked = readParked();
-        setItems(res.items.filter((it) => !parked.has(it.id)));
+        const snoozed = readSnoozed();
+        setItems(res.items.filter((it) => !snoozed.has(it.id)));
       } catch (e) {
         if (cancelled) return;
         if (e instanceof ApiError && e.status === 401) {
@@ -78,15 +78,15 @@ export default function DeckPage() {
     };
   }, [authed]);
 
-  const onParkPersist = useCallback((id: string) => {
-    const p = readParked();
+  const onSnoozePersist = useCallback((id: string) => {
+    const p = readSnoozed();
     p.add(id);
-    writeParked(p);
+    writeSnoozed(p);
   }, []);
-  const onUnparkPersist = useCallback((id: string) => {
-    const p = readParked();
+  const onUnsnoozePersist = useCallback((id: string) => {
+    const p = readSnoozed();
     p.delete(id);
-    writeParked(p);
+    writeSnoozed(p);
   }, []);
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
 
@@ -171,8 +171,8 @@ export default function DeckPage() {
             <Deck
               items={actionable}
               onAuthExpired={onAuthExpired}
-              onParkPersist={onParkPersist}
-              onUnparkPersist={onUnparkPersist}
+              onSnoozePersist={onSnoozePersist}
+              onUnsnoozePersist={onUnsnoozePersist}
             />
           </div>
         )}

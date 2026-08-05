@@ -3,7 +3,7 @@ import { act, fireEvent, render, renderHook, screen } from '@testing-library/rea
 
 // Pins the deck state machine (useDeck) + the card's defensive render. The
 // intricate parts — DELAYED ACT (fire on timeout / flush-on-next / cancel-on-undo,
-// never an un-act), the two-step HEAVY confirm, client-side PARK, and error
+// never an un-act), the two-step HEAVY confirm, client-side SNOOZE, and error
 // routing (stale toast / server-config banner / no-retry timeout / auth-expired)
 // — are driven through the hook with fake timers + a mocked feedApi.
 
@@ -88,50 +88,50 @@ describe('useDeck — delayed act', () => {
   });
 });
 
-describe('useDeck — park (client-side defer, no POST)', () => {
-  it('park never POSTs, counts, persists, and undo un-parks', () => {
-    const parkPersist = vi.fn();
-    const unparkPersist = vi.fn();
+describe('useDeck — snooze (client-side defer, no POST)', () => {
+  it('snooze never POSTs, counts, persists, and undo un-snoozes', () => {
+    const snoozePersist = vi.fn();
+    const unsnoozePersist = vi.fn();
     const items = [item({ id: 'a' }), item({ id: 'b' })];
     const { result } = renderHook(() =>
-      useDeck({ items, onParkPersist: parkPersist, onUnparkPersist: unparkPersist }),
+      useDeck({ items, onSnoozePersist: snoozePersist, onUnsnoozePersist: unsnoozePersist }),
     );
-    act(() => result.current.park());
+    act(() => result.current.snooze());
     expect(result.current.current?.id).toBe('b');
-    expect(result.current.parkedCount).toBe(1);
-    expect(parkPersist).toHaveBeenCalledWith('a');
+    expect(result.current.snoozedCount).toBe(1);
+    expect(snoozePersist).toHaveBeenCalledWith('a');
     act(() => vi.advanceTimersByTime(UNDO_MS));
-    expect(mockAct).not.toHaveBeenCalled(); // park is a pure client defer
+    expect(mockAct).not.toHaveBeenCalled(); // snooze is a pure client defer
 
-    act(() => result.current.park()); // park b too
-    act(() => result.current.undo()); // un-park b
-    expect(result.current.parkedCount).toBe(1);
-    expect(unparkPersist).toHaveBeenCalledWith('b');
+    act(() => result.current.snooze()); // snooze b too
+    act(() => result.current.undo()); // un-snooze b
+    expect(result.current.snoozedCount).toBe(1);
+    expect(unsnoozePersist).toHaveBeenCalledWith('b');
   });
 });
 
-describe('useDeck — parked retention + deal-now (task #26)', () => {
-  it('park RETAINS the item (title + kind) for the drill-down; parkedCount = parked.length', () => {
+describe('useDeck — snoozed retention + deal-now (task #26)', () => {
+  it('snooze RETAINS the item (title + kind) for the drill-down; snoozedCount = snoozed.length', () => {
     const items = [item({ id: 'a', title: 'Alpha' }), item({ id: 'b' })];
     const { result } = renderHook(() => useDeck({ items }));
-    act(() => result.current.park());
-    expect(result.current.parkedCount).toBe(1);
-    expect(result.current.parked.map((p) => p.id)).toEqual(['a']);
-    expect(result.current.parked[0].title).toBe('Alpha');
+    act(() => result.current.snooze());
+    expect(result.current.snoozedCount).toBe(1);
+    expect(result.current.snoozed.map((p) => p.id)).toEqual(['a']);
+    expect(result.current.snoozed[0].title).toBe('Alpha');
   });
 
-  it('dealNow un-parks (persist) and re-enters the card into the queue immediately', () => {
-    const unpark = vi.fn();
+  it('dealNow un-snoozes (persist) and re-enters the card into the queue immediately', () => {
+    const unsnooze = vi.fn();
     const items = [item({ id: 'a' }), item({ id: 'b' })];
-    const { result } = renderHook(() => useDeck({ items, onUnparkPersist: unpark }));
-    act(() => result.current.park());   // park a → current b
-    act(() => result.current.affirm()); // commit b → deck clears, a parked
+    const { result } = renderHook(() => useDeck({ items, onUnsnoozePersist: unsnooze }));
+    act(() => result.current.snooze());   // snooze a → current b
+    act(() => result.current.affirm()); // commit b → deck clears, a snoozed
     expect(result.current.cleared).toBe(true);
-    expect(result.current.parkedCount).toBe(1);
+    expect(result.current.snoozedCount).toBe(1);
 
-    act(() => result.current.dealNow(result.current.parked[0])); // deal a back
-    expect(unpark).toHaveBeenCalledWith('a');
-    expect(result.current.parkedCount).toBe(0);
+    act(() => result.current.dealNow(result.current.snoozed[0])); // deal a back
+    expect(unsnooze).toHaveBeenCalledWith('a');
+    expect(result.current.snoozedCount).toBe(0);
     expect(result.current.cleared).toBe(false);
     expect(result.current.current?.id).toBe('a'); // re-dealt, dealable now
   });
@@ -139,42 +139,42 @@ describe('useDeck — parked retention + deal-now (task #26)', () => {
   it('dealNow appends at the TAIL mid-swipe — the cursor is undisturbed', () => {
     const items = [item({ id: 'a' }), item({ id: 'b' }), item({ id: 'c' })];
     const { result } = renderHook(() => useDeck({ items }));
-    act(() => result.current.park()); // park a → current b
+    act(() => result.current.snooze()); // snooze a → current b
     expect(result.current.current?.id).toBe('b');
-    act(() => result.current.dealNow(result.current.parked[0]));
+    act(() => result.current.dealNow(result.current.snoozed[0]));
     expect(result.current.current?.id).toBe('b'); // cursor NOT reset
-    expect(result.current.parkedCount).toBe(0);
+    expect(result.current.snoozedCount).toBe(0);
     // a re-entered at the tail: b → c → a
     act(() => result.current.affirm()); // b
     act(() => result.current.affirm()); // c (flushes b in order)
     expect(result.current.current?.id).toBe('a');
   });
 
-  it('deal → re-park → deal-again works (a re-dealt card can be parked + dealt again)', () => {
+  it('deal → re-snooze → deal-again works (a re-dealt card can be snoozed + dealt again)', () => {
     const items = [item({ id: 'a' })];
     const { result } = renderHook(() => useDeck({ items }));
-    act(() => result.current.park());                            // park a (cleared)
-    act(() => result.current.dealNow(result.current.parked[0])); // deal a back → current a
+    act(() => result.current.snooze());                            // snooze a (cleared)
+    act(() => result.current.dealNow(result.current.snoozed[0])); // deal a back → current a
     expect(result.current.current?.id).toBe('a');
-    act(() => result.current.park());                            // re-park a
-    expect(result.current.parkedCount).toBe(1);
-    act(() => result.current.dealNow(result.current.parked[0])); // deal a AGAIN
-    expect(result.current.parkedCount).toBe(0);
+    act(() => result.current.snooze());                            // re-snooze a
+    expect(result.current.snoozedCount).toBe(1);
+    act(() => result.current.dealNow(result.current.snoozed[0])); // deal a AGAIN
+    expect(result.current.snoozedCount).toBe(0);
     expect(result.current.current?.id).toBe('a'); // reachable again, no stuck state
   });
 
-  it('undo after a park removes it from the parked LIST (not just the count)', () => {
+  it('undo after a snooze removes it from the snoozed LIST (not just the count)', () => {
     const items = [item({ id: 'a' }), item({ id: 'b' })];
     const { result } = renderHook(() => useDeck({ items }));
-    act(() => result.current.park());
-    expect(result.current.parked.map((p) => p.id)).toEqual(['a']);
+    act(() => result.current.snooze());
+    expect(result.current.snoozed.map((p) => p.id)).toEqual(['a']);
     act(() => result.current.undo());
-    expect(result.current.parked).toEqual([]);
+    expect(result.current.snoozed).toEqual([]);
     expect(result.current.current?.id).toBe('a'); // restored to the deck
   });
 });
 
-describe('useDeck — C2 slot: Accept POSTs, Skip = client park (rejectParks, no POST)', () => {
+describe('useDeck — C2 slot: Accept POSTs, Skip sets aside client-side (rejectDefers, no POST)', () => {
   const slotCandidate = (id: string) =>
     item({ id, kind: 'slot_suggestion', evidence: { tier: 1, origin: 'routine_item', routine_record: 'r/S.md', name: 'X', candidate: true } });
 
@@ -186,15 +186,32 @@ describe('useDeck — C2 slot: Accept POSTs, Skip = client park (rejectParks, no
     expect(mockAct).toHaveBeenCalledWith('s', 'accept');
   });
 
-  it('reject (LEFT = Skip) PARKS the candidate — no POST, counts + persists', () => {
-    const parkPersist = vi.fn();
-    const { result } = renderHook(() => useDeck({ items: [slotCandidate('s'), item({ id: 'b' })], onParkPersist: parkPersist }));
+  it('reject (LEFT = Skip) SETS THE CANDIDATE ASIDE — no POST, counts + persists', () => {
+    const snoozePersist = vi.fn();
+    const { result } = renderHook(() => useDeck({ items: [slotCandidate('s'), item({ id: 'b' })], onSnoozePersist: snoozePersist }));
     act(() => result.current.reject()); // Skip
     expect(result.current.current?.id).toBe('b'); // advanced
-    expect(result.current.parkedCount).toBe(1);
-    expect(parkPersist).toHaveBeenCalledWith('s');
+    expect(result.current.snoozedCount).toBe(1);
+    expect(snoozePersist).toHaveBeenCalledWith('s');
     act(() => vi.advanceTimersByTime(UNDO_MS));
-    expect(mockAct).not.toHaveBeenCalled(); // ← reddens if skip POSTs instead of parking
+    expect(mockAct).not.toHaveBeenCalled(); // ← reddens if Skip POSTs a decline
+  });
+
+  it('Skip and Snooze produce DIFFERENT toasts — one control never means both', () => {
+    // The #14 ruling: Skip is "not this one", Snooze is "yes, but later". They
+    // share the session-local set-aside mechanism, so the words are the only
+    // thing telling the operator which verb they just used.
+    //
+    // Mutation: route Skip back through commit('snooze', …) → both toasts read
+    // "Snoozed — …" and this fails on the second assert.
+    const skipped = renderHook(() => useDeck({ items: [slotCandidate('s')] }));
+    act(() => skipped.result.current.reject());
+    expect(skipped.result.current.toast?.message).toContain('Skipped');
+
+    const dozed = renderHook(() => useDeck({ items: [slotCandidate('s2')] }));
+    act(() => dozed.result.current.snooze());
+    expect(dozed.result.current.toast?.message).toContain('Snoozed');
+    expect(dozed.result.current.toast?.message).not.toContain('Skipped');
   });
 });
 
@@ -376,64 +393,64 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     expect(screen.getByTestId('deck-slot-why').textContent).toContain('self-care');
     const face = screen.getByTestId('deck-card').textContent ?? '';
     expect(face).toContain('Take it — T3'); // tier-bearing affirm, not a blind swipe
-    expect(face).toContain('Skip'); // LEFT is Skip (park), never a hard reject
+    expect(face).toContain('Skip'); // LEFT is Skip (a set-aside), never a hard reject
   });
 });
 
-describe('Deck — parked drill-down (task #26 render)', () => {
-  it('the Parked label is a BUTTON that opens the panel listing parked cards', () => {
+describe('Deck — snoozed drill-down (task #26 render)', () => {
+  it('the Snoozed label is a BUTTON that opens the panel listing snoozed cards', () => {
     render(<Deck items={[item({ id: 'a', title: 'Alpha' }), item({ id: 'b', title: 'Bravo' })]} />);
-    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b
-    const label = screen.getByTestId('deck-parked');
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze'))); // snooze a → current b
+    const label = screen.getByTestId('deck-snoozed');
     expect(label.tagName).toBe('BUTTON'); // never a number you can't tap
     expect(label.textContent).toContain('view'); // advertises its own verb
     act(() => fireEvent.click(label));
-    expect(screen.getByTestId('deck-parked-panel')).toBeTruthy();
-    const rows = screen.getAllByTestId('deck-parked-row');
+    expect(screen.getByTestId('deck-snoozed-panel')).toBeTruthy();
+    const rows = screen.getAllByTestId('deck-snoozed-row');
     expect(rows).toHaveLength(1);
     expect(rows[0].textContent).toContain('Alpha');
   });
 
-  it('deck-clear "View parked" opens the panel; Deal now re-deals + shows the empty ILB', () => {
+  it('deck-clear "View snoozed" opens the panel; Deal now re-deals + shows the empty ILB', () => {
     render(<Deck items={[item({ id: 'a', title: 'Alpha' })]} />);
-    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → deck clears
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze'))); // snooze a → deck clears
     expect(screen.getByTestId('deck-cleared')).toBeTruthy();
     act(() => fireEvent.click(screen.getByTestId('deck-cleared-view')));
-    expect(screen.getByTestId('deck-parked-panel')).toBeTruthy();
+    expect(screen.getByTestId('deck-snoozed-panel')).toBeTruthy();
 
-    act(() => fireEvent.click(screen.getByTestId('deck-parked-deal'))); // deal a back
-    expect(screen.getByTestId('deck-parked-empty')).toBeTruthy(); // ILB, not a blank panel
+    act(() => fireEvent.click(screen.getByTestId('deck-snoozed-deal'))); // deal a back
+    expect(screen.getByTestId('deck-snoozed-empty')).toBeTruthy(); // ILB, not a blank panel
     expect(screen.queryByTestId('deck-cleared')).toBeNull(); // deck un-cleared
 
-    act(() => fireEvent.click(screen.getByTestId('deck-parked-close')));
-    expect(screen.queryByTestId('deck-parked-panel')).toBeNull();
+    act(() => fireEvent.click(screen.getByTestId('deck-snoozed-close')));
+    expect(screen.queryByTestId('deck-snoozed-panel')).toBeNull();
     expect(screen.getByTestId('deck-card')).toBeTruthy(); // a is dealt again
   });
 
-  it('Deal now removes just that card from the list; the others stay parked', () => {
+  it('Deal now removes just that card from the list; the others stay snoozed', () => {
     render(
       <Deck
         items={[item({ id: 'a', title: 'Alpha' }), item({ id: 'b', title: 'Bravo' }), item({ id: 'c', title: 'Charlie' })]}
       />,
     );
-    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b
-    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park b → current c
-    act(() => fireEvent.click(screen.getByTestId('deck-parked'))); // open the panel
-    expect(screen.getAllByTestId('deck-parked-row')).toHaveLength(2);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze'))); // snooze a → current b
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze'))); // snooze b → current c
+    act(() => fireEvent.click(screen.getByTestId('deck-snoozed'))); // open the panel
+    expect(screen.getAllByTestId('deck-snoozed-row')).toHaveLength(2);
 
-    act(() => fireEvent.click(screen.getAllByTestId('deck-parked-deal')[0])); // deal a
-    const rows = screen.getAllByTestId('deck-parked-row');
+    act(() => fireEvent.click(screen.getAllByTestId('deck-snoozed-deal')[0])); // deal a
+    const rows = screen.getAllByTestId('deck-snoozed-row');
     expect(rows).toHaveLength(1);
-    expect(rows[0].textContent).toContain('Bravo'); // b stays parked
+    expect(rows[0].textContent).toContain('Bravo'); // b stays snoozed
   });
 
   it('panel open → an arrow key does NOT act on the underlying card', () => {
     render(<Deck items={[item({ id: 'a', title: 'Alpha' }), item({ id: 'b', title: 'Bravo' })]} />);
-    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b
-    act(() => fireEvent.click(screen.getByTestId('deck-parked'))); // open the panel
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze'))); // snooze a → current b
+    act(() => fireEvent.click(screen.getByTestId('deck-snoozed'))); // open the panel
     // An arrow key while the panel overlays the deck must be inert (the card is hidden).
     act(() => fireEvent.keyDown(screen.getByTestId('deck'), { key: 'ArrowRight' }));
-    act(() => fireEvent.click(screen.getByTestId('deck-parked-close')));
+    act(() => fireEvent.click(screen.getByTestId('deck-snoozed-close')));
     // b was NOT affirmed/advanced — still the current card, deck not cleared.
     expect(screen.queryByTestId('deck-cleared')).toBeNull();
     expect(screen.getByTestId('deck-card').textContent).toContain('Bravo');
@@ -545,11 +562,11 @@ describe('Deck — re-tier picker (task #28 render)', () => {
     expect(Number(picker.style.zIndex)).toBeGreaterThan(Number(topCard.style.zIndex));
   });
 
-  it('the parked panel also opens ABOVE the top card mid-deck (same latent z bug, closed)', () => {
+  it('the snoozed panel also opens ABOVE the top card mid-deck (same latent z bug, closed)', () => {
     render(<Deck items={[emailItem({ id: 'a', title: 'Email A' }), item({ id: 'b', title: 'Bee' })]} />);
-    act(() => fireEvent.click(screen.getByTestId('deck-btn-park'))); // park a → current b, panel available
-    act(() => fireEvent.click(screen.getByTestId('deck-parked'))); // open the panel WITH a card present
-    const panel = screen.getByTestId('deck-parked-panel');
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze'))); // snooze a → current b, panel available
+    act(() => fireEvent.click(screen.getByTestId('deck-snoozed'))); // open the panel WITH a card present
+    const panel = screen.getByTestId('deck-snoozed-panel');
     const topCard = screen.getAllByTestId('deck-card')[0];
     expect(Number(panel.style.zIndex)).toBeGreaterThan(Number(topCard.style.zIndex));
   });

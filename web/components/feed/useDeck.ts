@@ -12,14 +12,14 @@ import {
 import { ApiError } from '../../lib/algernon/http';
 
 // The deck state machine — deliberately DOM-free so the intricate parts (the
-// delayed act, the two-step heavy confirm, park, undo, and error routing) are
+// delayed act, the two-step heavy confirm, snooze, undo, and error routing) are
 // unit-testable with fake timers + a mocked feedApi, while Deck.tsx supplies the
 // pointer-drag + rendering on top.
 //
 // DELAYED ACT (light kinds + heavy reject + heavy confirm-tap): a commit advances
 // the card immediately (optimistic) but the POST is DEFERRED. It fires when the
 // 3.5s undo window expires OR the next commit lands (flush-in-order) — and UNDO
-// cancels it before it ever fires (never an un-act). PARK never POSTs (client
+// cancels it before it ever fires (never an un-act). SNOOZE never POSTs (client
 // defer). HEAVY AFFIRM's FIRST swipe does not commit — it reveals a confirm-tap.
 //
 // Because the card is already dismissed by the time a deferred POST resolves,
@@ -36,28 +36,28 @@ export interface DeckToast {
 export interface UseDeckOptions {
   items: FeedItem[];
   onAuthExpired?: () => void;
-  onParkPersist?: (id: string) => void;
-  onUnparkPersist?: (id: string) => void;
+  onSnoozePersist?: (id: string) => void;
+  onUnsnoozePersist?: (id: string) => void;
 }
 
 export interface UseDeckResult {
   current: FeedItem | null;
   upcoming: FeedItem[];
   remaining: number;
-  /** The this-session parked cards, retained for the parked drill-down. */
-  parked: FeedItem[];
-  parkedCount: number;
+  /** The this-session snoozed cards, retained for the snoozed drill-down. */
+  snoozed: FeedItem[];
+  snoozedCount: number;
   confirmingId: string | null;
   toast: DeckToast | null;
   banner: string | null;
   cleared: boolean;
   affirm: () => void;
   reject: () => void;
-  park: () => void;
+  snooze: () => void;
   confirmHeavy: () => void;
   cancelHeavy: () => void;
   undo: () => void;
-  /** Deal a parked card back into the deck queue (un-park + re-enter immediately). */
+  /** Deal a snoozed card back into the deck queue (un-snooze + re-enter immediately). */
   dealNow: (item: FeedItem) => void;
   /** The re-tier action_id in flight for the current email card (#28), or null. */
   reTiering: string | null;
@@ -74,24 +74,24 @@ export interface UseDeckResult {
 
 interface Pending {
   item: FeedItem;
-  actionId: string | null; // null = park (no POST)
+  actionId: string | null; // null = snooze (no POST)
   verdict: Verdict;
   restoreIndex: number;
-  restorePark: boolean;
+  restoreSnooze: boolean;
 }
 
 export function useDeck(opts: UseDeckOptions): UseDeckResult {
-  const { items, onAuthExpired, onParkPersist, onUnparkPersist } = opts;
+  const { items, onAuthExpired, onSnoozePersist, onUnsnoozePersist } = opts;
 
   const [index, setIndex] = useState(0);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [toast, setToast] = useState<DeckToast | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
-  // The this-session parked cards, RETAINED (not just counted) so the parked
-  // drill-down can list them (title + kind) + deal them back. undo un-parks the last.
-  const [parked, setParked] = useState<FeedItem[]>([]);
-  // Cards dealt back from the parked view — re-appended to the tail of the deck queue
-  // so an un-parked card re-enters the deck immediately without disturbing the index.
+  // The this-session snoozed cards, RETAINED (not just counted) so the snoozed
+  // drill-down can list them (title + kind) + deal them back. undo un-snoozes the last.
+  const [snoozed, setSnoozed] = useState<FeedItem[]>([]);
+  // Cards dealt back from the snoozed view — re-appended to the tail of the deck queue
+  // so an un-snoozeed card re-enters the deck immediately without disturbing the index.
   const [readded, setReadded] = useState<FeedItem[]>([]);
   // The re-tier action_id in flight for the current email card (#28), or null. Unlike a
   // swipe (optimistic advance + deferred POST), a re-tier AWAITS the act and only flips
@@ -147,7 +147,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     clearTimer();
     const p = pendingRef.current;
     pendingRef.current = null;
-    if (!p || p.actionId === null) return; // park (or nothing) → no POST
+    if (!p || p.actionId === null) return; // snooze (or nothing) → no POST
     feedApi.act(p.item.id, p.actionId).catch(routeError);
   }, [routeError]);
 
@@ -168,22 +168,27 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     (verdict: Verdict, actionId: string | null, item: FeedItem) => {
       flushPending(); // fire the previous deferred act BEFORE starting a new one
       const restoreIndex = index;
-      let restorePark = false;
-      if (verdict === 'park') {
-        restorePark = true;
-        setParked((prev) => [...prev, item]);
-        onParkPersist?.(item.id);
+      // Both defer verdicts set the card aside for the session; only their
+      // NAMES differ (and, once the backend verb is wired, whether the snooze
+      // also persists). Sharing the mechanism is fine — sharing the word is
+      // what the ruling forbids.
+      const defers = verdict === 'snooze' || verdict === 'skip';
+      if (defers) {
+        setSnoozed((prev) => [...prev, item]);
+        onSnoozePersist?.(item.id);
       }
       setConfirmingId(null);
       setIndex((i) => i + 1);
-      pendingRef.current = { item, actionId, verdict, restoreIndex, restorePark };
+      pendingRef.current = { item, actionId, verdict, restoreIndex, restoreSnooze: defers };
       setToast({
         message:
-          verdict === 'park'
-            ? 'Parked — it resurfaces at the next sync.'
-            : verdict === 'reject'
-              ? 'Rejected.'
-              : 'Confirmed.',
+          verdict === 'snooze'
+            ? 'Snoozed — it resurfaces at the next sync.'
+            : verdict === 'skip'
+              ? 'Skipped — it may resurface at the next sync.'
+              : verdict === 'reject'
+                ? 'Rejected.'
+                : 'Confirmed.',
         canUndo: true,
       });
       clearTimer();
@@ -192,10 +197,10 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
         setToast(null);
       }, UNDO_MS);
     },
-    [flushPending, index, onParkPersist],
+    [flushPending, index, onSnoozePersist],
   );
 
-  // The effective deck queue: the base items plus any cards dealt back from the parked
+  // The effective deck queue: the base items plus any cards dealt back from the snoozed
   // view (appended at the tail). The index walks this combined queue, so a re-dealt card
   // becomes reachable without shifting the cards already behind the cursor.
   const queue = readded.length > 0 ? items.concat(readded) : items;
@@ -226,20 +231,25 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     if (!current) return;
     const verbs = deckVerbsFor(current.kind);
     if (!verbs) return;
-    // C2 skip=park: a rejectParks lane (slot candidate) routes the LEFT gesture to a
-    // client-side PARK (no POST) — a skip, not a decline; it may resurface at the
-    // next sync (there's no backend decline path for slots v1).
-    if (verbs.rejectParks) {
-      commit('park', null, current);
+    // A rejectDefers lane (the slot candidate) has no backend decline path in
+    // slots v1, so the LEFT gesture SETS THE CARD ASIDE for the session (no
+    // POST) rather than declining it; it may resurface at the next sync.
+    //
+    // It rides the same client-side mechanism as an unbacked snooze but is a
+    // DIFFERENT verdict, because Skip and Snooze mean opposite things and the
+    // ruling behind #14 forbids one control meaning both. Keeping them apart
+    // here is what lets the toast and the staged list name each honestly.
+    if (verbs.rejectDefers) {
+      commit('skip', null, current);
       return;
     }
     if (verbs.reject === null) return; // no reject action (e.g. pending)
     commit('reject', verbs.reject, current);
   }, [current, commit]);
 
-  const park = useCallback(() => {
+  const snooze = useCallback(() => {
     if (!current) return;
-    commit('park', null, current);
+    commit('snooze', null, current);
   }, [current, commit]);
 
   const undo = useCallback(() => {
@@ -247,27 +257,27 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     if (!p) return;
     clearTimer();
     pendingRef.current = null; // cancel the deferred POST — never an un-act
-    if (p.restorePark) {
-      setParked((prev) => prev.filter((it) => it.id !== p.item.id));
-      onUnparkPersist?.(p.item.id);
+    if (p.restoreSnooze) {
+      setSnoozed((prev) => prev.filter((it) => it.id !== p.item.id));
+      onUnsnoozePersist?.(p.item.id);
     }
     setIndex(p.restoreIndex);
     setConfirmingId(null);
     setToast(null);
-  }, [onUnparkPersist]);
+  }, [onUnsnoozePersist]);
 
-  // Deal a parked card back into the deck: drop it from the park set (client + persist)
+  // Deal a snoozed card back into the deck: drop it from the snooze set (client + persist)
   // and re-append it to the queue tail so it's dealable immediately. The clone carries a
   // fresh render-key (__deckKey) so a re-dealt id can never collide in the visible stack
-  // (deal → re-park → deal-again is legal); id is preserved so POST/persist stay correct.
+  // (deal → re-snooze → deal-again is legal); id is preserved so POST/persist stay correct.
   const dealNow = useCallback(
     (target: FeedItem) => {
-      setParked((prev) => prev.filter((it) => it.id !== target.id));
-      onUnparkPersist?.(target.id);
+      setSnoozed((prev) => prev.filter((it) => it.id !== target.id));
+      onUnsnoozePersist?.(target.id);
       const seq = readdSeqRef.current++;
       setReadded((prev) => [...prev, { ...target, __deckKey: `readd-${seq}` } as FeedItem]);
     },
-    [onUnparkPersist],
+    [onUnsnoozePersist],
   );
 
   // Re-tier the current email card (#28): POST the chosen tier action_id, AWAIT it, and
@@ -375,15 +385,15 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     current,
     upcoming,
     remaining,
-    parked,
-    parkedCount: parked.length,
+    snoozed,
+    snoozedCount: snoozed.length,
     confirmingId,
     toast,
     banner,
     cleared,
     affirm,
     reject,
-    park,
+    snooze,
     confirmHeavy,
     cancelHeavy,
     undo,

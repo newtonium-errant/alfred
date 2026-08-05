@@ -18,7 +18,7 @@ import {
 import { useDeck } from './useDeck';
 import { DeckCard, DECK_CARD_BASE_Z } from './DeckCard';
 
-// Overlays (the parked drill, the re-tier picker) must sit ABOVE the whole card stack —
+// Overlays (the snoozed drill, the re-tier picker) must sit ABOVE the whole card stack —
 // the top card is at DECK_CARD_BASE_Z, so an overlay below it opens invisibly behind the
 // card and reads as a dead tap (the #28 re-tier bug). Derived from the card base so it
 // can't drift below. Inline (not a Tailwind z-class) so the ordering is jsdom-testable.
@@ -27,17 +27,17 @@ const OVERLAY_Z_INDEX = DECK_CARD_BASE_Z + 10;
 export interface DeckProps {
   items: FeedItem[];
   onAuthExpired?: () => void;
-  onParkPersist?: (id: string) => void;
-  onUnparkPersist?: (id: string) => void;
+  onSnoozePersist?: (id: string) => void;
+  onUnsnoozePersist?: (id: string) => void;
 }
 
-export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: DeckProps) {
-  const deck = useDeck({ items, onAuthExpired, onParkPersist, onUnparkPersist });
-  const { current, upcoming, confirmingId, toast, banner, parked } = deck;
+export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist }: DeckProps) {
+  const deck = useDeck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist });
+  const { current, upcoming, confirmingId, toast, banner, snoozed } = deck;
   const [expanded, setExpanded] = useState(false);
-  // The parked drill-down (task #26): parked cards stay hidden by default, viewable
+  // The snoozed drill-down (task #26): snoozed cards stay hidden by default, viewable
   // behind this drill so the operator can deal one back without waiting for the sync.
-  const [parkedOpen, setParkedOpen] = useState(false);
+  const [snoozedOpen, setSnoozedOpen] = useState(false);
   // The re-tier picker (task #28) — a deliberate multi-choice correction on the email card.
   const [reTierOpen, setReTierOpen] = useState(false);
   // The correction picker (task #13) — "what did this mean?" on a routine match.
@@ -52,11 +52,11 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
   }, [current?.id]);
 
   const confirming = current != null && confirmingId === current.id;
-  // Any open overlay (parked drill, re-tier picker, correction picker) blocks deck swipe +
-  // keyboard input, so a gesture can't act on the card hidden underneath (the parked-panel
+  // Any open overlay (snoozed drill, re-tier picker, correction picker) blocks deck swipe +
+  // keyboard input, so a gesture can't act on the card hidden underneath (the snoozed-panel
   // guard lesson). Every new overlay MUST join this list — an overlay that doesn't gate
   // input reads as a card acting on its own.
-  const inputBlocked = parkedOpen || reTierOpen || correctOpen;
+  const inputBlocked = snoozedOpen || reTierOpen || correctOpen;
 
   // Imperative pointer drag on the top card — no React re-render per move. The
   // DISCRETE outcome (verdictForDrag → deck handler) is what the unit tests pin.
@@ -82,7 +82,7 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
       el.style.transform = '';
       setStamp('affirm', 0);
       setStamp('reject', 0);
-      setStamp('park', 0);
+      setStamp('snooze', 0);
     };
 
     const onDown = (e: PointerEvent) => {
@@ -99,7 +99,7 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
       el.style.transform = `translate(${dx}px, ${Math.min(dy, DRAG_Y_CLAMP)}px) rotate(${dx / 18}deg)`;
       setStamp('affirm', dx > 0 ? stampOpacity(dx) : 0);
       setStamp('reject', dx < 0 ? stampOpacity(-dx) : 0);
-      setStamp('park', dy < 0 && Math.abs(dx) < 60 ? stampOpacity(-dy) : 0);
+      setStamp('snooze', dy < 0 && Math.abs(dx) < 60 ? stampOpacity(-dy) : 0);
     };
     const onUp = () => {
       if (!dragging) return;
@@ -113,7 +113,7 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
       if (verdict && swipeActsFor(verbs, verdict)) {
         if (verdict === 'affirm') deck.affirm();
         else if (verdict === 'reject') deck.reject();
-        else deck.park();
+        else deck.snooze();
       } else {
         resetVisual();
       }
@@ -131,8 +131,8 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
     };
   }, [current, confirming, inputBlocked, deck]);
 
-  // Keyboard alternates (accessibility): ← reject · → affirm · ↑ park · ↓ details.
-  // While an overlay (parked drill OR re-tier picker) is open it blocks pointer input on
+  // Keyboard alternates (accessibility): ← reject · → affirm · ↑ snooze · ↓ details.
+  // While an overlay (snoozed drill OR re-tier picker) is open it blocks pointer input on
   // the hidden card, so the keyboard MUST be gated too — otherwise an arrow key acts on
   // the card underneath the overlay (a first-contact-shaped edge).
   const onKeyDown = useCallback(
@@ -140,7 +140,7 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
       if (!current || confirming || inputBlocked) return;
       if (e.key === 'ArrowRight') deck.affirm();
       else if (e.key === 'ArrowLeft') deck.reject();
-      else if (e.key === 'ArrowUp') deck.park();
+      else if (e.key === 'ArrowUp') deck.snooze();
       else if (e.key === 'ArrowDown') setExpanded((v) => !v);
     },
     [current, confirming, inputBlocked, deck],
@@ -193,16 +193,16 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
         <span data-testid="deck-count">
           {deck.remaining > 0 ? `${deck.remaining} card${deck.remaining > 1 ? 's' : ''}` : 'Clear'}
         </span>
-        {deck.parkedCount > 0 && (
+        {deck.snoozedCount > 0 && (
           // Never a number you can't tap — the label advertises its own verb.
           <button
             type="button"
-            data-testid="deck-parked"
+            data-testid="deck-snoozed"
             aria-haspopup="dialog"
-            onClick={() => setParkedOpen(true)}
+            onClick={() => setSnoozedOpen(true)}
             className="font-semibold uppercase tracking-wider text-status-progress-fg underline underline-offset-2"
           >
-            Parked: {deck.parkedCount} — view
+            Snoozed: {deck.snoozedCount} — view
           </button>
         )}
       </div>
@@ -230,19 +230,19 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
             className="absolute inset-0 m-auto flex max-h-[360px] flex-col items-center justify-center gap-2 rounded-2xl border border-honeydew-300 bg-cream p-5 text-center shadow-card"
           >
             <p className="text-2xl font-extrabold text-honeydew-700">Deck clear.</p>
-            {deck.parkedCount > 0 ? (
+            {deck.snoozedCount > 0 ? (
               <>
                 <p className="text-sm text-honeydew-600">
-                  {deck.parkedCount} parked — the next sync will re-offer them.
+                  {deck.snoozedCount} snoozed — the next sync will re-offer them.
                 </p>
                 <button
                   type="button"
                   data-testid="deck-cleared-view"
                   aria-haspopup="dialog"
-                  onClick={() => setParkedOpen(true)}
+                  onClick={() => setSnoozedOpen(true)}
                   className="mt-1 text-sm font-semibold text-status-progress-fg underline underline-offset-2"
                 >
-                  View parked
+                  View snoozed
                 </button>
               </>
             ) : (
@@ -251,42 +251,42 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
           </div>
         )}
 
-        {/* The parked drill-down (task #26): the worklist behind the "view" — list the
-            parked cards (title + kind), each with Deal now (un-park + re-enter the queue
+        {/* The snoozed drill-down (task #26): the worklist behind the "view" — list the
+            snoozed cards (title + kind), each with Deal now (un-snooze + re-enter the queue
             immediately). Overlays the card area; z-above the cleared state. */}
-        {parkedOpen && (
+        {snoozedOpen && (
           <div
-            data-testid="deck-parked-panel"
+            data-testid="deck-snoozed-panel"
             role="dialog"
-            aria-label="Parked cards"
+            aria-label="Snoozed cards"
             style={{ zIndex: OVERLAY_Z_INDEX }}
             className="absolute inset-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
           >
             <div className="mb-2 flex items-center justify-between">
               <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
-                Parked ({parked.length})
+                Snoozed ({snoozed.length})
               </p>
               <button
                 type="button"
-                data-testid="deck-parked-close"
-                onClick={() => setParkedOpen(false)}
+                data-testid="deck-snoozed-close"
+                onClick={() => setSnoozedOpen(false)}
                 className="text-sm font-semibold text-honeydew-600 underline underline-offset-2"
               >
                 Close
               </button>
             </div>
 
-            {parked.length === 0 ? (
+            {snoozed.length === 0 ? (
               // ILB: the drill is open but everything's been dealt back — say so, don't blank.
-              <p data-testid="deck-parked-empty" className="mt-2 text-sm text-honeydew-600">
-                No parked cards — you&rsquo;ve dealt them all back in.
+              <p data-testid="deck-snoozed-empty" className="mt-2 text-sm text-honeydew-600">
+                No snoozed cards — you&rsquo;ve dealt them all back in.
               </p>
             ) : (
               <ul className="flex flex-col gap-2 overflow-y-auto">
-                {parked.map((p) => (
+                {snoozed.map((p) => (
                   <li
                     key={p.id}
-                    data-testid="deck-parked-row"
+                    data-testid="deck-snoozed-row"
                     className="flex items-center gap-2 rounded-xl border border-honeydew-200 bg-white p-2.5"
                   >
                     <span className="shrink-0 rounded-md border border-honeydew-300 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-honeydew-600">
@@ -295,7 +295,7 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
                     <span className="min-w-0 flex-1 truncate text-sm text-honeydew-700">{p.title}</span>
                     <button
                       type="button"
-                      data-testid="deck-parked-deal"
+                      data-testid="deck-snoozed-deal"
                       onClick={() => deck.dealNow(p)}
                       className="shrink-0 rounded-lg border border-honeydew-600 px-3 py-1 text-xs font-bold uppercase tracking-wider text-honeydew-700"
                     >
@@ -451,18 +451,18 @@ export function Deck({ items, onAuthExpired, onParkPersist, onUnparkPersist }: D
           type="button"
           data-testid="deck-btn-reject"
           aria-label={verbs?.rejectLabel || 'Reject'}
-          disabled={!current || confirming || !(verbs?.reject || verbs?.rejectParks)}
+          disabled={!current || confirming || !(verbs?.reject || verbs?.rejectDefers)}
           onClick={deck.reject}
-          className={`flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] p-3 disabled:opacity-30 ${verbs?.rejectParks ? 'border-status-progress-fg text-status-progress-fg' : 'border-danger text-danger'}`}
+          className={`flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] p-3 disabled:opacity-30 ${verbs?.rejectDefers ? 'border-status-progress-fg text-status-progress-fg' : 'border-danger text-danger'}`}
         >
           ✕
         </button>
         <button
           type="button"
-          data-testid="deck-btn-park"
-          aria-label="Park to the next sync"
+          data-testid="deck-btn-snooze"
+          aria-label="Snooze to the next sync"
           disabled={!current || confirming}
-          onClick={deck.park}
+          onClick={deck.snooze}
           className="flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] border-status-progress-fg p-3 text-status-progress-fg disabled:opacity-30"
         >
           ↑
