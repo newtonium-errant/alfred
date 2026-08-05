@@ -8,6 +8,7 @@ import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { useSlotAccept } from '../components/feed/useSlotAccept';
+import { useSnooze } from '../components/feed/useSnooze';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { isDeckDealt } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
@@ -29,6 +30,8 @@ export default function FeedPage() {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   // Collapsed by default — parity with the rings drill (#26).
   const [showDone, setShowDone] = useState(false);
+  // Collapsed by default — parity with the done drill (#26) and the rings.
+  const [showSnoozed, setShowSnoozed] = useState(false);
 
   useEffect(() => {
     if ((!sessionLoading && !user) || unauthenticated) {
@@ -64,6 +67,9 @@ export default function FeedPage() {
   const completion = useRingCompletion({ onAuthExpired });
   // The C2 accept hook — drives a SUGGESTED slot row's [Accept] + optimistic flip.
   const slotAccept = useSlotAccept({ onAuthExpired });
+  // The #14 defer verb for the worklist rows — the same four durations the
+  // deck's hold-band menu offers, behind a labelled button.
+  const snooze = useSnooze({ onAuthExpired });
   // A DONE slot item no longer needs you (isDone counting — mirrors the composer).
   // Reads the COMPLETION hook, not the raw `ringItemDone`, so the drop-out lands in
   // the SAME render as the row's own ✓ flip — the raw stage only catches up on the
@@ -79,7 +85,17 @@ export default function FeedPage() {
   // (suggested → Accept, planned → ✓) ALSO render inline as the worklist — a suggested
   // slot is legitimately on both the deck link and the inline list (team-lead ruling).
   const deckable = activeNeedsYou.filter(isDeckDealt);
-  const pendingRows = activeNeedsYou.filter((it) => it.kind === 'slot_suggestion');
+  const pendingRows = activeNeedsYou.filter(
+    (it) => it.kind === 'slot_suggestion' && !snooze.snoozed(it.id),
+  );
+  // #14 — a snoozed row STAGES, it does not vanish. Same shape as the done
+  // section deliberately: collapsed by default so the page still reads as
+  // remaining work, but reachable, with Unsnooze one tap in. A defer whose only
+  // escape hatch is the next sync would be a roach motel, and the indefinite
+  // rung has no next sync to wait for.
+  const snoozedRows = board.needsYou.filter(
+    (it) => it.kind === 'slot_suggestion' && snooze.snoozed(it.id),
+  );
   // #26 (D4) — a completed slot STAGES, it does not vanish. `activeNeedsYou`
   // drops done slots on purpose (they no longer need you, and must not inflate
   // the deck count), which is right for the COUNTS and wrong for the LIST: the
@@ -194,11 +210,48 @@ export default function FeedPage() {
                     onToggleEvidence={() => toggleExpanded(it.id)}
                     completion={completion}
                     accept={slotAccept}
+                    snooze={snooze}
                   />
                 ))}
               </ul>
             )}
 
+          </section>
+        )}
+
+        {loaded && snoozedRows.length > 0 && (
+          <section data-testid="feed-snoozed" className="mt-4">
+            <button
+              type="button"
+              data-testid="feed-show-snoozed"
+              onClick={() => setShowSnoozed((s) => !s)}
+              aria-expanded={showSnoozed}
+              className="text-[11px] font-semibold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+            >
+              {showSnoozed ? 'Hide snoozed' : `Show snoozed (${snoozedRows.length})`}
+            </button>
+            {showSnoozed && (
+              <ul data-testid="feed-snoozed-rows" className="mt-2 flex flex-col gap-2">
+                {snoozedRows.map((it) => (
+                  <li
+                    key={it.id}
+                    data-testid="feed-snoozed-row"
+                    className="flex items-center gap-2 rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft"
+                  >
+                    <span className="min-w-0 flex-1 truncate text-sm text-honeydew-700 opacity-70">{it.title || it.id}</span>
+                    <button
+                      type="button"
+                      data-testid="feed-row-unsnooze"
+                      disabled={snooze.busy(it.id)}
+                      onClick={() => void snooze.unsnooze(it)}
+                      className="shrink-0 rounded-lg border border-honeydew-400 px-3 py-1 text-[11px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+                    >
+                      {snooze.busy(it.id) ? '…' : 'Unsnooze'}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
         )}
 

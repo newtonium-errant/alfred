@@ -1,9 +1,11 @@
+import { useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { kindLabel } from '../../lib/algernon/feedConstants';
+import { SNOOZE_ACTIONS, SNOOZE_LABELS, kindLabel, snoozeIsBacked } from '../../lib/algernon/feedConstants';
 import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import { COMPLETION_UNAVAILABLE_HINT, effectiveStageOf, ringItemCompletable, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
 import type { UseRingCompletionResult } from './useRingCompletion';
 import type { UseSlotAcceptResult } from './useSlotAccept';
+import type { UseSnoozeResult } from './useSnooze';
 import { EvidenceBody } from './EvidenceBody';
 
 // One feed row. Content is escaped React text only (evidence is untrusted display
@@ -29,9 +31,23 @@ export interface FeedRowProps {
    * candidate's [Accept] control + its optimistic candidate→planned flip.
    */
   accept?: UseSlotAcceptResult;
+  /**
+   * Present → this row offers the #14 defer verb: a LABELLED `Snooze` button
+   * opening the same four durations the deck's hold-band menu offers. Labelled
+   * on purpose — the ruling is that Skip and Snooze each carry their own visible
+   * word, and no control means both.
+   *
+   * Ignored on a kind the backend can't snooze; the control simply isn't drawn,
+   * because a duration with no store behind it is a promise that gets broken at
+   * the next sync.
+   */
+  snooze?: UseSnoozeResult;
 }
 
-export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, accept }: FeedRowProps) {
+export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, accept, snooze }: FeedRowProps) {
+  // The row's own duration menu. Local because it is per-row transient UI, not
+  // board state — nothing outside this row needs to know it's open.
+  const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
   const rows = evidenceRows(item.evidence);
   // A digest/prose body (peer_digest et al.) OR a safe external link (the email
   // "Open in Gmail" deep-link, #26) also makes the row expandable, even when it has
@@ -49,6 +65,12 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, a
   const completable = completion ? ringItemCompletable(item) : false;
   const undoable = completion ? ringItemUndoable(item) : false;
   const completionError = (completion ? completion.errorFor(item.id) : null) ?? (accept ? accept.errorFor(item.id) : null);
+  // The defer verb is offered on a row that is still WORK: a done row has
+  // nothing to put off (the router refuses it outright), and an already-snoozed
+  // row's affordance is Unsnooze, which the staged section draws instead.
+  const snoozeBusy = snooze ? snooze.busy(item.id) : false;
+  const snoozeError = snooze ? snooze.errorFor(item.id) : null;
+  const snoozeOffered = !!snooze && snoozeIsBacked(item) && !done && !snooze.snoozed(item.id);
   return (
     <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
       <div className="flex items-start justify-between gap-3">
@@ -141,6 +163,56 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, a
         ) : null}
       </div>
 
+      {snoozeOffered && (
+        <div className="mt-2 border-t border-dashed border-honeydew-200 pt-2">
+          {!snoozeMenuOpen ? (
+            <button
+              type="button"
+              data-testid="feed-row-snooze"
+              aria-haspopup="true"
+              aria-expanded={false}
+              disabled={snoozeBusy}
+              onClick={() => setSnoozeMenuOpen(true)}
+              className="text-[11px] font-bold uppercase tracking-wider text-status-progress-fg underline underline-offset-2 disabled:opacity-50"
+            >
+              {snoozeBusy ? 'Snoozing…' : 'Snooze'}
+            </button>
+          ) : (
+            <div data-testid="feed-row-snooze-menu" className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-honeydew-600">For</span>
+              {SNOOZE_ACTIONS.map((action) => (
+                <button
+                  key={action}
+                  type="button"
+                  data-testid={`feed-row-snooze-${action}`}
+                  disabled={snoozeBusy}
+                  onClick={() => {
+                    setSnoozeMenuOpen(false);
+                    void snooze?.snooze(item, action);
+                  }}
+                  className="rounded-lg border border-honeydew-400 px-2 py-1 text-[11px] font-semibold text-honeydew-700 disabled:opacity-50"
+                >
+                  {SNOOZE_LABELS[action]}
+                </button>
+              ))}
+              <button
+                type="button"
+                data-testid="feed-row-snooze-cancel"
+                onClick={() => setSnoozeMenuOpen(false)}
+                className="text-[11px] font-semibold text-honeydew-600 underline underline-offset-2"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {snoozeError && (
+        <p data-testid="feed-row-snooze-error" role="alert" className="mt-1 text-[11px] text-danger">
+          {snoozeError}
+        </p>
+      )}
       {completionError && (
         <p data-testid="feed-row-completion-error" role="alert" className="mt-1 text-[11px] text-danger">
           {completionError}
