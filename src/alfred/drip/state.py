@@ -98,6 +98,12 @@ class ItemState:
     #: ``claimed_by`` is not the current run is a crash leftover, not a peer's
     #: live work — the single-writer assumption below makes that safe to say.
     claimed_by: str = ""
+    #: ASYNC campaigns only. A dispatched item (handed to a daemon that will do
+    #: the work later) stays ``in_flight`` until a LATER run observes its
+    #: effect. This counts how many runs it has been awaiting, so a dispatch
+    #: that never lands becomes FAILED instead of sitting invisible forever —
+    #: which would be the 907 shape with extra steps.
+    awaiting_runs: int = 0
     updated_at: str = ""
 
     @classmethod
@@ -149,6 +155,7 @@ class CampaignState:
                     "attempts": v.attempts,
                     "last_error": v.last_error,
                     "claimed_by": v.claimed_by,
+                    "awaiting_runs": v.awaiting_runs,
                     "updated_at": v.updated_at,
                 }
                 for k, v in self.items.items()
@@ -167,11 +174,24 @@ class CampaignState:
         return out
 
     def remaining(self, worklist_ids: list[str]) -> int:
-        """Items in the work-list not yet ``done``. Computed against the LIST,
-        not against state, so an item never seen still counts as remaining —
-        otherwise a campaign would report itself complete before it started."""
+        """Everything not yet ``done`` — the union of the work-list and any
+        item still tracked in state.
+
+        The union matters for campaigns whose ``work()`` removes the item from
+        its own work-list (``gmail_backlog`` moves the file out of staging). If
+        this counted the work-list alone, a dispatched-but-unverified item
+        would vanish from ``remaining`` and the campaign would report itself
+        COMPLETE while items were still awaiting confirmation — a progress
+        number that lies in the reassuring direction.
+
+        Items never seen still count, so a campaign cannot report completion
+        before it starts.
+        """
+        ids = set(worklist_ids) | {
+            iid for iid, it in self.items.items() if it.state != DONE
+        }
         return sum(
-            1 for iid in worklist_ids
+            1 for iid in ids
             if self.items.get(iid, ItemState(iid)).state != DONE
         )
 

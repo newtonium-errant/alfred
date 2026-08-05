@@ -88,6 +88,25 @@ class Campaign(Protocol):
     def verify(self, item_id: str) -> bool: ...
     def spends_quota(self) -> bool: ...
 
+    def verify_is_async(self) -> bool:
+        """True when ``work()`` DISPATCHES to a consumer that acts later.
+
+        ``gmail_backlog`` moves a file into the watched ``vault/inbox/``; the
+        curator polls every 5s and structures it whenever it gets there. So
+        ``verify()`` immediately after ``work()`` is guaranteed False, and
+        treating that as failure would mark every dispatched item FAILED on the
+        run that dispatched it.
+
+        For an async campaign an unverified dispatch stays ``in_flight`` and a
+        LATER run's verify-first resolves it — bounded by
+        ``max_awaiting_runs`` so a dispatch that never lands still becomes
+        FAILED rather than sitting invisible.
+
+        Default False, and the 907 guard stays FULL STRENGTH for sync
+        campaigns: work returned + no observable effect ⇒ FAILED, immediately.
+        """
+        return False
+
 
 @dataclass
 class RunResult:
@@ -99,6 +118,7 @@ class RunResult:
     failed: int = 0
     blocked: int = 0
     skipped_verified: int = 0     # re-queued items already done (crash recovery)
+    dispatched: int = 0           # async: handed off, effect not yet observable
     remaining: int = 0
     total: int = 0
     spent_week: int = 0
@@ -166,7 +186,8 @@ def run_increment(
     max_items_per_week: int,
     max_attempts: int,
     max_failures_per_run: int,
-    today: date,
+    max_awaiting_runs: int = 5,
+    today: date = None,  # type: ignore[assignment]
     run_id: str,
     apply: bool = True,
 ) -> RunResult:
@@ -200,6 +221,7 @@ def run_increment(
     # The per-run cap still applies to everyone: for a non-spending campaign it
     # bounds vault-write fan-out (surveyor relabel cascade), which is a real
     # cost even though it is not a credit one.
+    is_async = bool(getattr(campaign, "verify_is_async", lambda: False)())
     spends = campaign.spends_quota()
     if spends and max_items_per_week > 0:
         week_headroom = max(max_items_per_week - spent_week, 0)
@@ -212,10 +234,24 @@ def run_increment(
     def _st(iid: str) -> ItemState:
         return state.items.setdefault(iid, ItemState(item_id=iid))
 
-    candidates = [i for i in worklist if _st(i).state == IN_FLIGHT]
+    # IN-FLIGHT ITEMS COME FROM STATE, NOT FROM THE WORK-LIST.
+    #
+    # This is not a micro-optimization; it is required for any campaign whose
+    # work() REMOVES the item from its own work-list. gmail_backlog moves the
+    # file out of staging into the watched inbox, so a dispatched item vanishes
+    # from worklist() the instant it is dispatched. Sourcing candidates only
+    # from the work-list would mean a dispatched item is never re-examined:
+    # never verified, never failed, in_flight forever — silent incompleteness,
+    # and precisely the invisible-work-not-done shape this design exists to
+    # prevent. Caught by the campaign pins, not by reasoning.
+    in_flight_ids = [
+        iid for iid, it in state.items.items() if it.state == IN_FLIGHT
+    ]
+    seen: set[str] = set(in_flight_ids)
+    candidates = list(in_flight_ids)
     candidates += [
         i for i in worklist
-        if _st(i).state != IN_FLIGHT
+        if i not in seen
         and _st(i).state != DONE
         and not (_st(i).state == FAILED and _st(i).attempts >= max_attempts)
     ]
@@ -247,19 +283,49 @@ def run_increment(
         # landed and before the state write left a genuinely-done item claimed;
         # re-running it would duplicate the work — the 907 inverted.
         if item.state == IN_FLIGHT and item.claimed_by != run_id:
+            landed_already = False
             try:
-                if campaign.verify(item_id):
-                    if apply:
-                        item.state = DONE
-                        item.updated_at = now_iso()
-                    result.skipped_verified += 1
-                    result.done += 1
-                    continue
+                landed_already = bool(campaign.verify(item_id))
             except Exception as exc:  # noqa: BLE001 — a verify fault is not a loss
                 log.warning(
                     "drip.verify_failed_on_requeue",
                     campaign=campaign.name, item_id=item_id, error=str(exc),
                 )
+            if landed_already:
+                if apply:
+                    item.state = DONE
+                    item.awaiting_runs = 0
+                    item.updated_at = now_iso()
+                result.skipped_verified += 1
+                result.done += 1
+                continue
+
+            if is_async:
+                # AWAITING CONFIRMATION IS NOT WORK. An async item already
+                # handed to the consumer costs nothing to re-check, so it must
+                # NOT consume a budget slot and must NOT be re-dispatched —
+                # re-dispatching would fail anyway (the file has left staging)
+                # and would burn the run's whole budget re-examining yesterday's
+                # queue instead of feeding the consumer new items.
+                if apply:
+                    item.awaiting_runs += 1
+                    item.updated_at = now_iso()
+                    if item.awaiting_runs > max_awaiting_runs:
+                        item.state = FAILED
+                        item.attempts += 1
+                        item.last_error = (
+                            f"dispatched {item.awaiting_runs} runs ago; the "
+                            f"consumer never produced an observable effect"
+                        )
+                        result.failed += 1
+                        result.errors.append(f"{item_id}: dispatch never landed")
+                        log.warning(
+                            "drip.dispatch_never_landed",
+                            campaign=campaign.name, item_id=item_id,
+                            awaiting_runs=item.awaiting_runs,
+                        )
+                    save_state(state_path, state)
+                continue
 
         if not apply:
             # Dry run: count what WOULD be attempted, touch nothing.
@@ -274,6 +340,13 @@ def run_increment(
         save_state(state_path, state)
 
         result.attempted += 1
+        if is_async and campaign.spends_quota():
+            # Record spend at DISPATCH, not at verify. The cost is incurred by
+            # the consumer once the item is in its queue, so waiting for the
+            # effect would let one run dispatch the whole backlog with a
+            # recorded spend of zero — a budget that does not bind.
+            iso = today.isoformat()
+            state.spend_by_day[iso] = state.spend_by_day.get(iso, 0) + 1
         try:
             campaign.work(item_id)
         except Exception as exc:  # noqa: BLE001
@@ -313,11 +386,37 @@ def run_increment(
             )
         if landed:
             item.state = DONE
+            item.awaiting_runs = 0
             item.updated_at = now_iso()
             result.done += 1
-            if campaign.spends_quota():
+            if campaign.spends_quota() and not is_async:
                 iso = today.isoformat()
                 state.spend_by_day[iso] = state.spend_by_day.get(iso, 0) + 1
+        elif is_async:
+            # DISPATCHED. The consumer acts later, so "no effect yet" is the
+            # expected outcome of a successful hand-off — not a failure.
+            item.state = IN_FLIGHT
+            item.awaiting_runs += 1
+            item.updated_at = now_iso()
+            result.dispatched += 1
+            if item.awaiting_runs > max_awaiting_runs:
+                # Bounded: a dispatch that never lands must surface. Otherwise
+                # it sits in_flight forever — invisible work-not-done, which is
+                # the 907 shape with extra steps.
+                item.state = FAILED
+                item.attempts += 1
+                item.last_error = (
+                    f"dispatched {item.awaiting_runs} runs ago; the consumer "
+                    f"never produced an observable effect"
+                )
+                result.dispatched -= 1
+                result.failed += 1
+                result.errors.append(f"{item_id}: dispatch never landed")
+                log.warning(
+                    "drip.dispatch_never_landed",
+                    campaign=campaign.name, item_id=item_id,
+                    awaiting_runs=item.awaiting_runs,
+                )
         else:
             item.state = FAILED
             item.attempts += 1
