@@ -908,7 +908,7 @@ telegram:
     api_key: "${GROQ_API_KEY}"
     model: "whisper-large-v3"
     # Domain-term biasing. Defaults to a shared Algernon/Stoicism set (see
-    # _DEFAULT_STT_VOCAB_TERMS). This SAME list biases BOTH the Telegram STT
+    # DEFAULT_STT_VOCAB_TERMS). This SAME list biases BOTH the Telegram STT
     # chain (Whisper prompt= / Deepgram keywords) AND the live web/PWA Deepgram
     # stream (keyterm on nova-3 / keywords on nova-2 — clinic-capture Piece 2a).
     # Override PER INSTANCE — do NOT push instance-specific vocab into the shared
@@ -926,6 +926,25 @@ telegram:
     #     # + your practice's common injectable / medication BRAND names
     #     #   (brand names are not PHI), e.g. "Botox", "Ozempic".
     #     #   Do NOT add patient names.
+    #
+    # LEARNED VOCABULARY (#54) — the list above stops being static.
+    # When a voice-seeded chat message is edited before sending, the browser
+    # carries the raw transcript alongside the sent text; the difference is a
+    # correction. Terms corrected repeatedly surface at morning review
+    # (`daily_sync.stt_vocab`), and on your approval join the biasing list via
+    # `alfred stt-vocab approve "<term>" --operator <name>`. Approved terms are
+    # kept in their OWN store, never appended into `vocab_terms` above — that
+    # keeps the shipped list yours and makes the learned cap (20) countable.
+    #
+    # DEFAULT OFF, and deliberately so: capture writes YOUR OWN MESSAGE TEXT to
+    # a file on disk. A CLINIC instance must think before enabling it — voice
+    # traffic there is clinical, and the corpus would hold it.
+    # vocab_learning_enabled: false
+    # vocab_corpus_path: "./data/stt_corrections.jsonl"     # the (transcript, sent) pairs
+    # vocab_decided_path: "./data/stt_vocab_decided.jsonl"  # your approve/reject verdicts
+    #
+    # Nothing is ever added silently: approval is a human step by construction,
+    # and a rejected term is never proposed again.
   # wk2b: opt-in text-to-speech for /brief command. If this section is
   # absent, /brief replies "not configured". Default voice is "Rachel"
   # (ElevenLabs library default); model is Turbo v2.5 for low latency.
@@ -1109,6 +1128,22 @@ daily_sync:
     spam: false
   state:
     path: "./data/daily_sync_state.json"
+  # Learned-speech-vocabulary review (#54) — READ-ONLY proposal card. Lists the
+  # domain terms you have corrected by hand often enough to be worth teaching
+  # the transcriber, with counts and what it heard instead. Approve or reject
+  # from the CLI (`alfred stt-vocab list|approve|reject`); rendering this card
+  # never changes what biases transcription.
+  #
+  # A SEPARATE switch from `talker.stt.vocab_learning_enabled`, which gates
+  # CAPTURE. Two different decisions — "may it record my messages" and "show me
+  # the proposals" — so an instance can capture quietly for a while and turn the
+  # card on later without losing anything; the corpus keeps accumulating.
+  #
+  # The two store paths and the shipped term list are DERIVED from `talker.stt`
+  # at load time, so the side that writes and the side that reads cannot drift.
+  # Override any of them here only if you genuinely want them split.
+  # stt_vocab:
+  #   enabled: false
   # Attribution-audit section — Phase 2 of the calibration audit gap
   # arc (see ``project_calibration_audit_gap.md``). Surfaces agent-
   # inferred vault content (marked by BEGIN_INFERRED/END_INFERRED

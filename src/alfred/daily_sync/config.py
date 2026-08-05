@@ -45,6 +45,11 @@ from alfred.routine.match_calibration import (
     DEFAULT_PENDING_MAX_ITEMS as _ROUTINE_MATCH_MAX_ITEMS_DEFAULT,
     DEFAULT_PENDING_PATH as _ROUTINE_MATCH_PENDING_DEFAULT,
 )
+from alfred.telegram.config import (
+    DEFAULT_STT_VOCAB_CORPUS_PATH as _STT_VOCAB_CORPUS_DEFAULT,
+    DEFAULT_STT_VOCAB_DECIDED_PATH as _STT_VOCAB_DECIDED_DEFAULT,
+    DEFAULT_STT_VOCAB_TERMS as _STT_VOCAB_TERMS_DEFAULT,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -226,6 +231,45 @@ class RoutineMatchConfig:
 
 
 @dataclass
+class SttVocabConfig:
+    """#54 — learned-speech-vocabulary review surface (Daily Sync).
+
+    ``enabled`` defaults OFF, like every other judgment surface. It is a
+    SEPARATE switch from ``talker.stt.vocab_learning_enabled``: that one gates
+    CAPTURE (writing the operator's message text to a corpus), this one gates
+    the morning REVIEW card. An instance that captures but has not turned this
+    on simply accumulates corrections until it does — nothing is lost, and the
+    two decisions ("may it record me" / "show me the proposals") are genuinely
+    different ones.
+
+    FIELD NAMES DELIBERATELY MIRROR ``telegram.config.SttConfig``. That is not
+    sloppiness: it makes this object duck-type as an stt-config, so the section
+    can pass it straight to ``stt_vocab_learning.effective_vocab_terms`` — the
+    ONE seam every vocabulary consumer goes through. Re-deriving the
+    static ∪ learned union here would be a second implementation of the exact
+    thing that seam exists to prevent.
+
+    SINGLE-SOURCED FROM THE TALKER CONFIG, the same contract ``RoutineMatchConfig``
+    holds for ``pending_path``. The web chat route WRITES the corpus and the CLI
+    WRITES the decided store; this section READS both — they MUST be the same
+    files. Rather than hold independently-defaulted duplicates that drift the
+    moment an operator overrides the talker side, :func:`load_from_unified`
+    DERIVES all three fields from ``talker.stt`` at load time. An explicit
+    ``daily_sync.stt_vocab.<field>`` still wins (an intentional, non-silent split).
+    """
+
+    enabled: bool = False
+    #: Where capture appends (transcript, sent) pairs. Read-only here.
+    vocab_corpus_path: str = _STT_VOCAB_CORPUS_DEFAULT
+    #: The operator's approve/reject verdicts — read for BOTH the "don't re-ask"
+    #: filter and the learned half of the currently-biasing list.
+    vocab_decided_path: str = _STT_VOCAB_DECIDED_DEFAULT
+    #: The SHIPPED static terms. Carried so the card can show the full list the
+    #: operator is growing, not just the learned tail.
+    vocab_terms: list[str] = field(default_factory=list)
+
+
+@dataclass
 class TierRecurrenceConfig:
     """#20 P5 — ad-hoc-T3 recurrence→promote proposals, Daily Sync surface (B1).
 
@@ -316,6 +360,12 @@ class DailySyncConfig:
     routine_match: RoutineMatchConfig = field(
         default_factory=RoutineMatchConfig,
     )
+    # #54 — learned-speech-vocabulary proposals. Defaulted-OFF; an instance opts
+    # in via ``daily_sync.stt_vocab.enabled: true``. Paths + static terms are
+    # derived from ``talker.stt`` at load time (see SttVocabConfig).
+    stt_vocab: SttVocabConfig = field(
+        default_factory=SttVocabConfig,
+    )
     # #20 P5 — ad-hoc-T3 recurrence→promote proposal surface (B1). Defaulted-OFF;
     # Salem opts in via ``daily_sync.tier_recurrence.enabled: true``.
     tier_recurrence: TierRecurrenceConfig = field(
@@ -353,6 +403,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "friction_analyzer": FrictionAnalyzerConfig,
     "thresholds": FrictionThresholdsConfig,
     "routine_match": RoutineMatchConfig,
+    "stt_vocab": SttVocabConfig,
     "tier_recurrence": TierRecurrenceConfig,
     "ticket_notify": TicketNotifyConfig,
 }
@@ -426,6 +477,40 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
                 fields=list(_derived),
                 error=str(exc),
             )
+    # #54 — single-source the STT vocabulary fields from the talker config, the
+    # same contract routine_match holds above. The web chat route WRITES the
+    # corpus and the CLI WRITES the decided store off ``talker.stt``; this
+    # section READS both, and the static term list is what the review card shows
+    # the operator he is growing. Three values that must agree across two config
+    # blocks, so they are DERIVED rather than independently defaulted. An
+    # explicit ``daily_sync.stt_vocab.<field>`` still wins (intentional split).
+    sv_section = section.get("stt_vocab") if isinstance(section, dict) else None
+
+    def _sv_explicit(field_name: str) -> bool:
+        return isinstance(sv_section, dict) and field_name in sv_section
+
+    # Read the ``talker.stt`` BLOCK directly rather than building a whole
+    # TalkerConfig. Measured, not assumed: ``telegram.config.load_from_unified``
+    # requires an ``instance.name``, so on a config that has a talker.stt block
+    # but no instance block it raises — and the fallback would silently point
+    # this section at the DEFAULT paths while capture wrote the overridden ones.
+    # Reading three keys cannot fail that way, and ``raw`` is already
+    # env-substituted above, so ``${VAR}`` paths still resolve.
+    _talker = raw.get("talker")
+    _talker_stt = (_talker.get("stt") if isinstance(_talker, dict) else None) or {}
+    if not isinstance(_talker_stt, dict):
+        _talker_stt = {}
+    # The talker's OWN defaults, so an instance that sets no stt block still
+    # gets the same answer the talker itself would compute.
+    _sv_fallback = {
+        "vocab_corpus_path": _STT_VOCAB_CORPUS_DEFAULT,
+        "vocab_decided_path": _STT_VOCAB_DECIDED_DEFAULT,
+        "vocab_terms": list(_STT_VOCAB_TERMS_DEFAULT),
+    }
+    for _field, _default in _sv_fallback.items():
+        if _sv_explicit(_field):
+            continue  # an explicit daily_sync override wins
+        setattr(cfg.stt_vocab, _field, _talker_stt.get(_field, _default))
     # Synthetic ``_config_path`` key — set by the CLI in
     # ``_load_unified_config`` before handing ``raw`` to the
     # orchestrator, carried through ``multiprocessing`` pickling to

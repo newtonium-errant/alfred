@@ -133,7 +133,7 @@ class AnthropicConfig:
 # Deepgram keywords) — without this a fallback transcribes domain terms
 # worse than primary, breaking the "comparable = seamless" claim (§7).
 # Per-instance configs may override ``stt.vocab_terms``.
-_DEFAULT_STT_VOCAB_TERMS: list[str] = [
+DEFAULT_STT_VOCAB_TERMS: list[str] = [
     "Algernon", "Salem", "S.A.L.E.M.", "KAL-LE", "K.A.L.-L.E.", "Hypatia",
     "V.E.R.A.", "STAY-C", "Zettelkasten", "aftermath-lab",
     "library-alexandria", "distiller", "surveyor", "curator", "janitor",
@@ -141,6 +141,24 @@ _DEFAULT_STT_VOCAB_TERMS: list[str] = [
     "Marcus Aurelius", "Heraclitus", "Stoicism", "Epicureanism",
     "Meditations", "Hayes", "Ryan Holiday",
 ]
+
+
+# Learned-vocabulary store paths (#54). Named constants rather than inline
+# literals because the Daily Sync review surface DERIVES its own defaults from
+# these (``daily_sync.config.SttVocabConfig``): the web chat route writes the
+# corpus, the CLI writes the decided store, and the review card reads both — a
+# read side and a write side that disagree about the path is exactly the drift
+# the routine_match single-source contract already had to close once.
+# Instance-neutral (every instance has its own ``data/``), so no per-instance
+# literal is baked in.
+DEFAULT_STT_VOCAB_CORPUS_PATH = "./data/stt_corrections.jsonl"
+DEFAULT_STT_VOCAB_DECIDED_PATH = "./data/stt_vocab_decided.jsonl"
+
+
+#: Backward-compatible private alias. Existing tests import the underscored
+#: name; the public one exists because ``daily_sync.config`` now derives the
+#: review surface's term list from it (one source, two readers).
+_DEFAULT_STT_VOCAB_TERMS = DEFAULT_STT_VOCAB_TERMS
 
 
 @dataclass
@@ -207,7 +225,7 @@ class STTConfig:
     model: str = "whisper-large-v3"
     # --- STT fallback chain (spec §9) ---
     vocab_terms: list[str] = field(
-        default_factory=lambda: list(_DEFAULT_STT_VOCAB_TERMS)
+        default_factory=lambda: list(DEFAULT_STT_VOCAB_TERMS)
     )
     # Per-instance EXTRA caption-artifact denylist (clinic-capture Piece 2b).
     # UNIONS onto the universal ``common.stt_noise`` default (never replaces it).
@@ -232,12 +250,12 @@ class STTConfig:
     # so no per-instance literal is baked in — see the hardcoding rule.
     vocab_learning_enabled: bool = False
     #: Full (transcript, sent) pairs — the audit trail corrections are mined from.
-    vocab_corpus_path: str = "./data/stt_corrections.jsonl"
+    vocab_corpus_path: str = DEFAULT_STT_VOCAB_CORPUS_PATH
     #: The operator's approve/reject verdicts. READ on every transcription via
     #: ``stt_vocab_learning.effective_vocab_terms`` — unlike the corpus, this one
     #: is live even when capture is off, so a term approved before an instance
     #: disabled capture keeps biasing.
-    vocab_decided_path: str = "./data/stt_vocab_decided.jsonl"
+    vocab_decided_path: str = DEFAULT_STT_VOCAB_DECIDED_PATH
     # --- shadow-capture (R1-baseline corpus builder; default-OFF) ---
     shadow_capture: SttShadowCaptureConfig = field(
         default_factory=SttShadowCaptureConfig
