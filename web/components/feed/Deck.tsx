@@ -5,7 +5,14 @@ import {
   EMAIL_PRIORITY_TIERS,
   ONE_OFF_ACTION,
   ROUTINE_MATCH_KIND,
+  SNOOZE_ACTIONS,
+  SNOOZE_HOLD_MOVE_TOLERANCE,
+  SNOOZE_HOLD_MS,
+  SNOOZE_LABELS,
   deckVerbsFor,
+  inSnoozeHoldBand,
+  snoozeIsBacked,
+  type SnoozeAction,
   emailPriority,
   kindLabel,
   routineCandidatesFor,
@@ -42,21 +49,56 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   const [reTierOpen, setReTierOpen] = useState(false);
   // The correction picker (task #13) — "what did this mean?" on a routine match.
   const [correctOpen, setCorrectOpen] = useState(false);
+  // The snooze duration menu (#14) — opened by HOLDING a partial ↑ swipe in the
+  // stamp band, or by the ↑ button / ArrowUp on a card the backend can snooze.
+  const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
+  // The in-band hold timer, and the flag that says this gesture already spent
+  // itself opening the menu. Without the flag the pointerup that ends the hold
+  // would ALSO resolve a verdict, so one gesture would both open the menu and
+  // act on the card behind it.
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gestureConsumedRef = useRef(false);
 
-  // Collapse the evidence expand + close both pickers whenever the top card changes.
+  // Collapse the evidence expand + close every picker whenever the top card changes.
   useEffect(() => {
     setExpanded(false);
     setReTierOpen(false);
     setCorrectOpen(false);
+    setSnoozeMenuOpen(false);
+    gestureConsumedRef.current = false;
   }, [current?.id]);
+
+  // Spring the FROZEN card back when the snooze menu closes without a pick.
+  //
+  // While the menu is open the card holds the offset it was held at, so the menu
+  // reads as attached to the gesture rather than as a dialog that appeared out of
+  // nowhere. That freeze is just the absence of further updates (the drag
+  // listeners are torn down by `inputBlocked`), which means nothing resets the
+  // inline transform on dismiss — this does. On a PICK the card advances and the
+  // frozen element unmounts, so this is a no-op there.
+  const releaseFrozenCard = useCallback(() => {
+    gestureConsumedRef.current = false;
+    const el = topRef.current;
+    if (!el) return;
+    el.style.transition = '';
+    el.style.transform = '';
+    el.querySelectorAll<HTMLElement>('[data-stamp]').forEach((stamp) => {
+      stamp.style.opacity = '0';
+    });
+  }, []);
+
+  const closeSnoozeMenu = useCallback(() => {
+    setSnoozeMenuOpen(false);
+    releaseFrozenCard();
+  }, [releaseFrozenCard]);
 
   const confirming = current != null && confirmingId === current.id;
   // Any open overlay (snoozed drill, re-tier picker, correction picker) blocks deck swipe +
   // keyboard input, so a gesture can't act on the card hidden underneath (the snoozed-panel
   // guard lesson). Every new overlay MUST join this list — an overlay that doesn't gate
   // input reads as a card acting on its own.
-  const inputBlocked = snoozedOpen || reTierOpen || correctOpen;
+  const inputBlocked = snoozedOpen || reTierOpen || correctOpen || snoozeMenuOpen;
 
   // Imperative pointer drag on the top card — no React re-render per move. The
   // DISCRETE outcome (verdictForDrag → deck handler) is what the unit tests pin.
@@ -67,11 +109,23 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     // left/reject, e.g. email_urgent) springs the card back instead of leaving it stuck
     // half-dragged (there was no advance to unmount the stale transform).
     const verbs = deckVerbsFor(current.kind);
+    // Durations only mean something where a store is behind them; on every other
+    // kind the ↑ gesture is the session-local set-aside it has always been, and a
+    // menu offering "3 days" would be promising persistence that doesn't exist.
+    const durationsAvailable = snoozeIsBacked(current);
     let sx = 0;
     let sy = 0;
     let dx = 0;
     let dy = 0;
+    let holdX = 0;
+    let holdY = 0;
     let dragging = false;
+    const clearHold = () => {
+      if (holdTimerRef.current !== null) {
+        clearTimeout(holdTimerRef.current);
+        holdTimerRef.current = null;
+      }
+    };
     const stamps = el.querySelectorAll<HTMLElement>('[data-stamp]');
     const setStamp = (name: string, v: number) => {
       stamps.forEach((s) => {
@@ -100,8 +154,43 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
       setStamp('affirm', dx > 0 ? stampOpacity(dx) : 0);
       setStamp('reject', dx < 0 ? stampOpacity(-dx) : 0);
       setStamp('snooze', dy < 0 && Math.abs(dx) < 60 ? stampOpacity(-dy) : 0);
+      // HOLD-IN-BAND (#14) — a partial ↑ held still opens the duration menu.
+      // Additive to the release-time verdict: verdictForDrag still decides what a
+      // RELEASE means, and this only fires while the finger is down and steady.
+      if (!durationsAvailable) return;
+      if (!inSnoozeHoldBand(dx, dy)) {
+        clearHold();
+        return;
+      }
+      if (holdTimerRef.current !== null) {
+        // Already counting. Drift past the tolerance means this is a slow swipe,
+        // not a hold — RE-ANCHOR rather than fire, so the menu can't ambush a
+        // finger that is still travelling toward the full-swipe threshold.
+        if (Math.abs(dx - holdX) <= SNOOZE_HOLD_MOVE_TOLERANCE && Math.abs(dy - holdY) <= SNOOZE_HOLD_MOVE_TOLERANCE) {
+          return;
+        }
+        clearHold();
+      }
+      holdX = dx;
+      holdY = dy;
+      holdTimerRef.current = setTimeout(() => {
+        holdTimerRef.current = null;
+        // Spend the gesture: the card FREEZES where it was held (we simply stop
+        // updating it) and the release that follows must not also verdict.
+        gestureConsumedRef.current = true;
+        dragging = false;
+        setSnoozeMenuOpen(true);
+      }, SNOOZE_HOLD_MS);
     };
     const onUp = () => {
+      clearHold();
+      if (gestureConsumedRef.current) {
+        // This gesture already opened the menu — releasing does nothing, and the
+        // card stays frozen under it until the menu is dismissed or picked.
+        dx = 0;
+        dy = 0;
+        return;
+      }
       if (!dragging) return;
       dragging = false;
       el.style.transition = '';
@@ -124,12 +213,40 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     el.addEventListener('pointerup', onUp);
     el.addEventListener('pointercancel', onUp);
     return () => {
+      clearHold(); // a torn-down card must never open a menu over its successor
       el.removeEventListener('pointerdown', onDown);
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);
       el.removeEventListener('pointercancel', onUp);
     };
   }, [current, confirming, inputBlocked, deck]);
+
+  // The DELIBERATE ↑ affordance (the button and ArrowUp), as opposed to the swipe.
+  //
+  // On a card the backend can snooze it opens the durations, because a menu
+  // reachable only by holding a partial drag is a menu no keyboard and no
+  // assistive pointer can reach — the gesture is the shortcut, not the only door.
+  // On every other kind there are no durations to choose, so it defers directly.
+  const onSnoozeAffordance = useCallback(() => {
+    if (!current) return;
+    if (snoozeIsBacked(current)) {
+      setSnoozeMenuOpen(true);
+      return;
+    }
+    deck.snooze();
+  }, [current, deck]);
+
+  // Pick a duration: close the menu and commit. Deliberately NOT awaited — this
+  // is the same optimistic, undoable commit a swipe makes (the toast carries the
+  // 3.5s Undo), so choosing "7 days" costs no more certainty than flicking ↑.
+  const onPickSnooze = useCallback(
+    (action: SnoozeAction) => {
+      setSnoozeMenuOpen(false);
+      gestureConsumedRef.current = false;
+      deck.snooze(action);
+    },
+    [deck],
+  );
 
   // Keyboard alternates (accessibility): ← reject · → affirm · ↑ snooze · ↓ details.
   // While an overlay (snoozed drill OR re-tier picker) is open it blocks pointer input on
@@ -140,10 +257,10 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
       if (!current || confirming || inputBlocked) return;
       if (e.key === 'ArrowRight') deck.affirm();
       else if (e.key === 'ArrowLeft') deck.reject();
-      else if (e.key === 'ArrowUp') deck.snooze();
+      else if (e.key === 'ArrowUp') onSnoozeAffordance();
       else if (e.key === 'ArrowDown') setExpanded((v) => !v);
     },
-    [current, confirming, inputBlocked, deck],
+    [current, confirming, inputBlocked, deck, onSnoozeAffordance],
   );
 
   // Re-tier the current email card to a chosen tier, then close the picker once the act
@@ -443,6 +560,56 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             )}
           </div>
         )}
+
+        {/* The snooze duration menu (#14) — the one defer verb's ladder.
+            Reached by HOLDING a partial ↑ swipe in the band where the Snooze
+            stamp is already showing, or by the ↑ button / ArrowUp. The card
+            underneath stays frozen at the offset it was held at, so the menu
+            reads as part of the gesture rather than as a dialog from nowhere;
+            dismissing springs it back.
+
+            Only rendered for kinds the backend can actually snooze — everywhere
+            else ↑ is a session set-aside and there is no duration to choose. */}
+        {snoozeMenuOpen && current && snoozeIsBacked(current) && (
+          <div
+            data-testid="deck-snooze-menu"
+            role="dialog"
+            aria-label="Snooze for how long?"
+            style={{ zIndex: OVERLAY_Z_INDEX }}
+            className="absolute inset-x-0 bottom-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+          >
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
+                Snooze for
+              </p>
+              <button
+                type="button"
+                data-testid="deck-snooze-cancel"
+                onClick={closeSnoozeMenu}
+                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2"
+              >
+                Cancel
+              </button>
+            </div>
+            <div className="flex flex-col gap-2">
+              {SNOOZE_ACTIONS.map((action) => (
+                <button
+                  key={action}
+                  type="button"
+                  data-testid={`deck-snooze-choice-${action}`}
+                  onClick={() => onPickSnooze(action)}
+                  className="rounded-xl border border-honeydew-400 px-3 py-2 text-left text-sm font-semibold text-honeydew-700"
+                >
+                  {SNOOZE_LABELS[action]}
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] italic text-honeydew-600">
+              It stays off the board until then — unless it gets more urgent than
+              it is now.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Button + toast affordances (the accessible, testable alternates). */}
@@ -460,9 +627,10 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
         <button
           type="button"
           data-testid="deck-btn-snooze"
-          aria-label="Snooze to the next sync"
+          aria-label={current && snoozeIsBacked(current) ? 'Snooze — choose how long' : 'Set aside for now'}
+          aria-haspopup={current && snoozeIsBacked(current) ? 'dialog' : undefined}
           disabled={!current || confirming}
-          onClick={deck.snooze}
+          onClick={onSnoozeAffordance}
           className="flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] border-status-progress-fg p-3 text-status-progress-fg disabled:opacity-30"
         >
           ↑

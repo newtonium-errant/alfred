@@ -831,3 +831,168 @@ describe('Deck — correction picker (task #13 render)', () => {
     expect(screen.getByTestId('deck-correct-empty')).toBeTruthy();
   });
 });
+
+// --- #14: one defer verb, with a duration ladder behind it -------------------
+// The ruling: ↑ is Snooze; a full swipe is a quick defer recorded as
+// "until I say"; a partial ↑ HELD in the stamp band opens 1d / 3d / 7d / until
+// I say. Durations only exist where the backend can store them, so the pins
+// come in pairs — the capable kind and a kind that has no snooze verb at all.
+
+const slotItem = (over: Partial<FeedItem> = {}) =>
+  item({
+    id: 'slot_suggestion:task:task/Pay Steph.md',
+    kind: 'slot_suggestion',
+    title: 'T1: Pay Steph',
+    evidence: { tier: 1, origin: 'task', path: 'task/Pay Steph.md', name: 'Pay Steph', candidate: true },
+    ...over,
+  });
+
+describe('useDeck — snooze POSTs a real act on a snooze-capable kind (#14)', () => {
+  it('a bare snooze() records the INDEFINITE rung (the old Park), deferred + undoable', () => {
+    const { result } = renderHook(() => useDeck({ items: [slotItem()] }));
+    act(() => result.current.snooze());
+    expect(mockAct).not.toHaveBeenCalled(); // still inside the undo window
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).toHaveBeenCalledWith('slot_suggestion:task:task/Pay Steph.md', 'snooze_until_i_say');
+  });
+
+  it('a chosen duration POSTs that rung', () => {
+    const { result } = renderHook(() => useDeck({ items: [slotItem()] }));
+    act(() => result.current.snooze('snooze_3d'));
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).toHaveBeenCalledWith('slot_suggestion:task:task/Pay Steph.md', 'snooze_3d');
+  });
+
+  it('undo CANCELS the snooze POST — a defer taken back was never a defer', () => {
+    const { result } = renderHook(() => useDeck({ items: [slotItem(), item({ id: 'b' })] }));
+    act(() => result.current.snooze('snooze_7d'));
+    act(() => result.current.undo());
+    act(() => vi.advanceTimersByTime(UNDO_MS * 2));
+    expect(mockAct).not.toHaveBeenCalled();
+    expect(result.current.snoozedCount).toBe(0);
+  });
+
+  it('a kind with NO backend snooze verb still defers — but POSTs nothing', () => {
+    // The honest half of the per-kind design: the gesture works everywhere, the
+    // PERSISTENCE is only claimed where a store exists.
+    //
+    // Mutation: make snoozeActionFor return the action unconditionally → this
+    // fails, and the field gets a 400 on every email card the operator flicks up.
+    const { result } = renderHook(() => useDeck({ items: [item({ id: 'e', kind: 'email_tier' })] }));
+    act(() => result.current.snooze('snooze_3d'));
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).not.toHaveBeenCalled();
+    expect(result.current.snoozedCount).toBe(1); // deferred all the same
+  });
+});
+
+describe('useDeck — dealing a snoozed card back un-snoozes it (#14)', () => {
+  it('dealNow POSTs unsnooze once the snooze has already gone out', () => {
+    // Otherwise the card returns to THIS session's deck while the store still
+    // says snoozed, and the next sync hides it again — the divergence the
+    // delayed-act design avoids everywhere else.
+    const { result } = renderHook(() => useDeck({ items: [slotItem()] }));
+    act(() => result.current.snooze('snooze_1d'));
+    act(() => vi.advanceTimersByTime(UNDO_MS)); // the snooze POST lands
+    expect(mockAct).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.dealNow(result.current.snoozed[0]));
+    expect(mockAct).toHaveBeenCalledTimes(2);
+    expect(mockAct).toHaveBeenNthCalledWith(2, 'slot_suggestion:task:task/Pay Steph.md', 'unsnooze');
+  });
+
+  it('dealNow inside the undo window CANCELS instead of POSTing an unsnooze', () => {
+    // Nothing has been written yet, so there is nothing to un-write. POSTing
+    // anyway would ask the server to undo a row it has never heard of.
+    const { result } = renderHook(() => useDeck({ items: [slotItem()] }));
+    act(() => result.current.snooze('snooze_1d'));
+    act(() => result.current.dealNow(result.current.snoozed[0]));
+    act(() => vi.advanceTimersByTime(UNDO_MS * 2));
+    expect(mockAct).not.toHaveBeenCalled();
+    expect(result.current.current?.id).toBe('slot_suggestion:task:task/Pay Steph.md');
+  });
+
+  it('dealNow on an unbacked kind POSTs nothing (there was no act to reverse)', () => {
+    const { result } = renderHook(() => useDeck({ items: [item({ id: 'e', kind: 'email_tier' })] }));
+    act(() => result.current.snooze());
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    act(() => result.current.dealNow(result.current.snoozed[0]));
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).not.toHaveBeenCalled();
+  });
+});
+
+describe('Deck — the snooze duration menu (#14 render)', () => {
+  it('the ↑ button on a snooze-capable card opens the ladder, all four rungs labelled', () => {
+    render(<Deck items={[slotItem()]} />);
+    expect(screen.queryByTestId('deck-snooze-menu')).toBeNull();
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+
+    const menu = screen.getByTestId('deck-snooze-menu');
+    expect(menu.getAttribute('role')).toBe('dialog');
+    expect(menu.textContent).toContain('1 day');
+    expect(menu.textContent).toContain('3 days');
+    expect(menu.textContent).toContain('7 days');
+    expect(menu.textContent).toContain('Until I say');
+    // The card is still there — opening a menu is not a verdict.
+    expect(screen.getByTestId('deck-card')).toBeTruthy();
+    expect(mockAct).not.toHaveBeenCalled();
+  });
+
+  it('picking a rung closes the menu and commits THAT duration', () => {
+    render(<Deck items={[slotItem(), item({ id: 'b', title: 'Bravo' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('deck-snooze-choice-snooze_7d')));
+    expect(screen.queryByTestId('deck-snooze-menu')).toBeNull();
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).toHaveBeenCalledWith('slot_suggestion:task:task/Pay Steph.md', 'snooze_7d');
+  });
+
+  it('Cancel closes the menu, keeps the card, and springs the frozen transform back', () => {
+    // The card freezes at the held offset while the menu is open (the menu reads
+    // as attached to the gesture). Dismissing must RELEASE it — nothing else
+    // clears the inline transform, because the drag listeners are gone by then.
+    render(<Deck items={[slotItem()]} />);
+    const card = screen.getByTestId('deck-card');
+    card.style.transform = 'translate(4px, -60px) rotate(0.2deg)'; // as a held drag leaves it
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('deck-snooze-cancel')));
+
+    expect(screen.queryByTestId('deck-snooze-menu')).toBeNull();
+    expect(screen.getByTestId('deck-card')).toBeTruthy();
+    expect(card.style.transform).toBe('');
+    expect(mockAct).not.toHaveBeenCalled(); // cancelling defers nothing
+  });
+
+  it('an open menu BLOCKS the keyboard on the card underneath', () => {
+    // Every overlay must gate input or an arrow key acts on a hidden card.
+    render(<Deck items={[slotItem(), item({ id: 'b' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+    act(() => fireEvent.keyDown(screen.getByTestId('deck'), { key: 'ArrowRight' }));
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).not.toHaveBeenCalled();
+    expect(screen.getByTestId('deck-snooze-menu')).toBeTruthy();
+  });
+
+  it('a kind with no backend snooze verb gets NO menu — ↑ defers directly', () => {
+    // A "3 days" button with no store behind it is the accepted-then-ignored
+    // promise this round exists to stop making.
+    render(<Deck items={[item({ id: 'e', kind: 'email_tier' }), item({ id: 'b' })]} />);
+    act(() => fireEvent.click(screen.getByTestId('deck-btn-snooze')));
+    expect(screen.queryByTestId('deck-snooze-menu')).toBeNull();
+    expect(screen.getByTestId('deck-snoozed').textContent).toContain('1'); // it DID defer
+  });
+
+  it('the ↑ button advertises which of the two it is', () => {
+    const { unmount } = render(<Deck items={[slotItem()]} />);
+    const backed = screen.getByTestId('deck-btn-snooze');
+    expect(backed.getAttribute('aria-label')).toContain('choose how long');
+    expect(backed.getAttribute('aria-haspopup')).toBe('dialog');
+    unmount();
+
+    render(<Deck items={[item({ id: 'e', kind: 'email_tier' })]} />);
+    const unbacked = screen.getByTestId('deck-btn-snooze');
+    expect(unbacked.getAttribute('aria-label')).toBe('Set aside for now');
+    expect(unbacked.getAttribute('aria-haspopup')).toBeNull();
+  });
+});

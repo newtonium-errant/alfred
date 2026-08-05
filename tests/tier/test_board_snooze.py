@@ -493,6 +493,34 @@ def test_snooze_ceiling_admits_exactly_the_ratified_verbs() -> None:
     }
 
 
+def test_the_web_ladder_matches_the_backend_ladder() -> None:
+    """CROSS-SURFACE DRIFT PIN. The PWA hardcodes its own copy of the duration
+    ladder (TypeScript can't import a Python dict), so the two can drift in
+    silence: a rung added here and not there is a duration the operator can
+    never pick, and a rung added there and not here is a button that 400s in
+    their hand. Neither side can notice on its own — hence a pin that reads the
+    OTHER language's source.
+
+    Deliberately parsed rather than duplicated: writing the expected list here
+    would just create a third copy to drift.
+
+    Mutation: add a rung to SNOOZE_DURATIONS without touching feedConstants.ts
+    (or vice versa) → this fails and names the missing side.
+    """
+    import re
+
+    ts = Path(__file__).resolve().parents[2] / "web" / "lib" / "algernon" / "feedConstants.ts"
+    assert ts.exists(), f"the web constants moved — update this pin: {ts}"
+    match = re.search(r"SNOOZE_ACTIONS\s*=\s*\[(.*?)\]", ts.read_text(encoding="utf-8"), re.S)
+    assert match, "SNOOZE_ACTIONS not found in feedConstants.ts"
+    web_rungs = set(re.findall(r"'([^']+)'", match.group(1)))
+
+    assert web_rungs == set(sn.SNOOZE_DURATIONS), (
+        f"ladder drift — web offers {sorted(web_rungs)}, "
+        f"backend stores {sorted(sn.SNOOZE_DURATIONS)}"
+    )
+
+
 def test_every_ladder_rung_is_reachable_through_the_ceiling() -> None:
     """The ladder and the ceiling must not drift: a rung the store knows about
     but ``FEED_ACTIONS`` doesn't is a duration the FE can offer and the router

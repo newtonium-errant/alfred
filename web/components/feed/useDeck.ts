@@ -5,8 +5,13 @@ import {
   HEAVY_KINDS,
   ONE_OFF_ACTION,
   ROUTINE_MATCH_KIND,
+  SNOOZE_INDEFINITE_ACTION,
   UNDO_MS,
+  UNSNOOZE_ACTION,
   deckVerbsFor,
+  snoozeActionFor,
+  snoozeIsBacked,
+  type SnoozeAction,
   type Verdict,
 } from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
@@ -19,8 +24,10 @@ import { ApiError } from '../../lib/algernon/http';
 // DELAYED ACT (light kinds + heavy reject + heavy confirm-tap): a commit advances
 // the card immediately (optimistic) but the POST is DEFERRED. It fires when the
 // 3.5s undo window expires OR the next commit lands (flush-in-order) — and UNDO
-// cancels it before it ever fires (never an un-act). SNOOZE never POSTs (client
-// defer). HEAVY AFFIRM's FIRST swipe does not commit — it reveals a confirm-tap.
+// cancels it before it ever fires (never an un-act). SNOOZE rides the same path:
+// it POSTs on a kind the backend can snooze (#14) and is a pure client-side
+// set-aside on every other kind, which is the same code path with a null
+// actionId. HEAVY AFFIRM's FIRST swipe does not commit — it reveals a confirm-tap.
 //
 // Because the card is already dismissed by the time a deferred POST resolves,
 // outcomes surface as a TOAST (benign: stale / timeout — next list poll
@@ -53,7 +60,8 @@ export interface UseDeckResult {
   cleared: boolean;
   affirm: () => void;
   reject: () => void;
-  snooze: () => void;
+  /** Defer the top card. No argument = the indefinite rung (a full ↑ swipe). */
+  snooze: (action?: SnoozeAction) => void;
   confirmHeavy: () => void;
   cancelHeavy: () => void;
   undo: () => void;
@@ -74,7 +82,7 @@ export interface UseDeckResult {
 
 interface Pending {
   item: FeedItem;
-  actionId: string | null; // null = snooze (no POST)
+  actionId: string | null; // null = a client-side set-aside (no POST)
   verdict: Verdict;
   restoreIndex: number;
   restoreSnooze: boolean;
@@ -91,7 +99,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   // drill-down can list them (title + kind) + deal them back. undo un-snoozes the last.
   const [snoozed, setSnoozed] = useState<FeedItem[]>([]);
   // Cards dealt back from the snoozed view — re-appended to the tail of the deck queue
-  // so an un-snoozeed card re-enters the deck immediately without disturbing the index.
+  // so an un-snoozed card re-enters the deck immediately without disturbing the index.
   const [readded, setReadded] = useState<FeedItem[]>([]);
   // The re-tier action_id in flight for the current email card (#28), or null. Unlike a
   // swipe (optimistic advance + deferred POST), a re-tier AWAITS the act and only flips
@@ -147,7 +155,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     clearTimer();
     const p = pendingRef.current;
     pendingRef.current = null;
-    if (!p || p.actionId === null) return; // snooze (or nothing) → no POST
+    if (!p || p.actionId === null) return; // set-aside (or nothing) → no POST
     feedApi.act(p.item.id, p.actionId).catch(routeError);
   }, [routeError]);
 
@@ -247,10 +255,25 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     commit('reject', verbs.reject, current);
   }, [current, commit]);
 
-  const snooze = useCallback(() => {
-    if (!current) return;
-    commit('snooze', null, current);
-  }, [current, commit]);
+  // ↑ — the one defer verb (#14). A full swipe passes no argument and gets the
+  // indefinite rung (the old Park); the hold-band menu passes a duration.
+  //
+  // Routed through the SAME delayed-act machinery as every other swipe rather
+  // than awaited like re-tier: a defer is knowable client-side (the card goes
+  // away either way), and the 3.5s undo window is worth more here than an
+  // awaited confirmation — an operator who flicks ↑ by accident gets it back
+  // without a round trip, and the POST is cancelled before it ever fires.
+  //
+  // `snoozeActionFor` returns null on a kind with no backend snooze verb, and a
+  // null actionId is exactly today's no-POST set-aside. So the gesture is
+  // uniform and the PERSISTENCE is honest per-kind, with no branch here.
+  const snooze = useCallback(
+    (action: SnoozeAction = SNOOZE_INDEFINITE_ACTION) => {
+      if (!current) return;
+      commit('snooze', snoozeActionFor(current, action), current);
+    },
+    [current, commit],
+  );
 
   const undo = useCallback(() => {
     const p = pendingRef.current;
@@ -270,14 +293,36 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   // and re-append it to the queue tail so it's dealable immediately. The clone carries a
   // fresh render-key (__deckKey) so a re-dealt id can never collide in the visible stack
   // (deal → re-snooze → deal-again is legal); id is preserved so POST/persist stay correct.
+  //
+  // When the snooze REACHED the backend, dealing it back must un-reach it —
+  // otherwise the card returns to this session's deck while the store still says
+  // "snoozed", and the board hides it again on the next sync. That divergence is
+  // the whole failure class the delayed-act design avoids elsewhere.
+  //
+  // Two cases, and the first is why this isn't an unconditional POST: if the
+  // snooze is still SITTING IN THE UNDO WINDOW, nothing has been written yet, so
+  // cancelling the pending act is both correct and cheaper than POSTing an
+  // unsnooze against a row the server has never heard of (which answers
+  // `already_acted` and reads as an error in the log).
   const dealNow = useCallback(
     (target: FeedItem) => {
+      const p = pendingRef.current;
+      const pendingThisSnooze =
+        p !== null && p.item.id === target.id && p.verdict === 'snooze' && p.actionId !== null;
+      if (pendingThisSnooze) {
+        clearTimer();
+        pendingRef.current = null; // the snooze never happened — nothing to undo
+        setToast(null);
+      } else if (snoozeIsBacked(target)) {
+        flushPending(); // any OTHER deferred act fires first, in order
+        feedApi.act(target.id, UNSNOOZE_ACTION).catch(routeError);
+      }
       setSnoozed((prev) => prev.filter((it) => it.id !== target.id));
       onUnsnoozePersist?.(target.id);
       const seq = readdSeqRef.current++;
       setReadded((prev) => [...prev, { ...target, __deckKey: `readd-${seq}` } as FeedItem]);
     },
-    [onUnsnoozePersist],
+    [flushPending, onUnsnoozePersist, routeError],
   );
 
   // Re-tier the current email card (#28): POST the chosen tier action_id, AWAIT it, and

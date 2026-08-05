@@ -53,6 +53,31 @@ export function swipeActsFor(verbs: DeckVerbs | null, verdict: Verdict): boolean
   return verdict === 'snooze';
 }
 
+// --- the snooze hold-band (#14) ----------------------------------------------
+// A full ↑ swipe is a quick defer. A PARTIAL ↑ swipe held still in the band
+// between "the stamp starts showing" and "the swipe would commit" opens the
+// duration menu instead.
+//
+// The band is not a new number: it is exactly the span the Snooze stamp fades in
+// over (STAMP_FADE_START → SNOOZE_Y_THRESHOLD). Holding where the stamp is
+// already visible is what makes the affordance self-explanatory — the operator
+// is looking at the word Snooze when the menu arrives.
+export const SNOOZE_HOLD_MS = 450;
+// How far the finger may drift and still count as "held". Generous enough for a
+// thumb that isn't a tripod, tight enough that a slow full swipe reads as a
+// swipe: drift past this re-anchors the hold rather than firing it.
+export const SNOOZE_HOLD_MOVE_TOLERANCE = 12;
+
+/**
+ * Whether a live drag is sitting in the hold band — a partial ↑ with the same
+ * horizontal tolerance the ↑ verdict itself uses, so a diagonal never opens a
+ * menu the release wouldn't have honoured either.
+ */
+export function inSnoozeHoldBand(dx: number, dy: number): boolean {
+  const up = -dy;
+  return up >= STAMP_FADE_START && up <= SNOOZE_Y_THRESHOLD && Math.abs(dx) < SNOOZE_X_TOLERANCE;
+}
+
 /** Verdict-stamp opacity during a drag (0..1), mirroring the sketch's fade. */
 export function stampOpacity(distance: number): number {
   if (distance <= STAMP_FADE_START) return 0;
@@ -195,6 +220,56 @@ export function kindLabel(kind: string): string {
 
 // The universal FYI ack action (feed page + FYI rows) — sets the item `acked`.
 export const ACK_ACTION = 'ack';
+
+// --- snooze, the one defer verb (#14) ----------------------------------------
+// The duration ladder, in menu order. MUST equal `alfred.tier.snooze
+// .SNOOZE_DURATIONS`' keys — a rung offered here that the router's FEED_ACTIONS
+// ceiling doesn't admit is a button that 400s in the operator's hand. A pin in
+// tests/tier/test_board_snooze.py reads THIS array and asserts the two agree,
+// because the drift is silent on both sides otherwise.
+export const SNOOZE_ACTIONS = ['snooze_1d', 'snooze_3d', 'snooze_7d', 'snooze_until_i_say'] as const;
+export type SnoozeAction = (typeof SNOOZE_ACTIONS)[number];
+
+// The quick-defer rung: what a full ↑ swipe records, and the old Park's
+// semantics. No end date — it holds until the operator says otherwise (or the
+// urgency delta breaks it through, which fires on undated entries too).
+export const SNOOZE_INDEFINITE_ACTION: SnoozeAction = 'snooze_until_i_say';
+export const UNSNOOZE_ACTION = 'unsnooze';
+/** The verb the store stamps on a snoozed item (`acted_action`) — the staged list reads it. */
+export const SNOOZE_ACTED_VERB = 'snooze';
+
+export const SNOOZE_LABELS: Record<SnoozeAction, string> = {
+  snooze_1d: '1 day',
+  snooze_3d: '3 days',
+  snooze_7d: '7 days',
+  snooze_until_i_say: 'Until I say',
+};
+
+// Kinds the BACKEND can actually snooze. `FEED_ACTIONS` admits `snooze_*` under
+// `slot_suggestion` alone, so this is one entry — but it is a SET rather than an
+// equality check because the honest answer is per-kind and will grow.
+//
+// The ↑ gesture stays available on every card either way; what varies is whether
+// it persists. On a snooze-capable kind it POSTs and survives a reload; on the
+// others it sets the card aside for the session exactly as it always did, and
+// the copy on that path must not promise otherwise. Offering the durations menu
+// on a kind with no store behind it would be the accepted-then-ignored failure
+// this whole round set out to cure.
+export const SNOOZE_CAPABLE_KINDS: ReadonlySet<string> = new Set(['slot_suggestion']);
+
+/** Whether a ↑ on this item reaches the backend (vs. a session-local set-aside). */
+export function snoozeIsBacked(item: FeedItem): boolean {
+  return SNOOZE_CAPABLE_KINDS.has(item.kind);
+}
+
+/**
+ * The action_id a snooze of `action` should POST for this item, or `null` when
+ * the kind has no backend snooze verb (→ the caller commits a client-side
+ * set-aside instead, with no POST).
+ */
+export function snoozeActionFor(item: FeedItem, action: SnoozeAction): string | null {
+  return snoozeIsBacked(item) ? action : null;
+}
 
 // --- routine_match correction (#13) ------------------------------------------
 // A left-swipe reject says "not that item" and stops there. These two actions are
