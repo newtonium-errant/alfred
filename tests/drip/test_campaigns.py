@@ -196,7 +196,7 @@ def _link_vault(tmp_path: Path, body: str) -> tuple[Path, str]:
 
 def test_annotate_branch_keeps_the_link_and_marks_it(tmp_path: Path) -> None:
     vault, rel = _link_vault(tmp_path, "See [[learn/Some Learning]] here.\n")
-    item = Link001Campaign.build_item(rel, "learn/Some Learning", is_learn_target=True)
+    item = Link001Campaign.build_item(rel, "learn/Some Learning", citer_is_learn=True)
     c = Link001Campaign(worklist_items=[item], vault_path=vault)
 
     c.work(item)
@@ -209,7 +209,7 @@ def test_annotate_branch_keeps_the_link_and_marks_it(tmp_path: Path) -> None:
 
 def test_remove_branch_deletes_the_link(tmp_path: Path) -> None:
     vault, rel = _link_vault(tmp_path, "See [[person/Ghost]] here.\n")
-    item = Link001Campaign.build_item(rel, "person/Ghost", is_learn_target=False)
+    item = Link001Campaign.build_item(rel, "person/Ghost", citer_is_learn=False)
     c = Link001Campaign(worklist_items=[item], vault_path=vault)
 
     c.work(item)
@@ -225,7 +225,7 @@ def test_a_uniform_link_is_gone_verifier_would_fail_every_annotation(
     the link, so a uniform "the link is gone" check marks every annotation
     FAILED — and the campaign would retry them forever."""
     vault, rel = _link_vault(tmp_path, "See [[learn/L]] here.\n")
-    item = Link001Campaign.build_item(rel, "learn/L", is_learn_target=True)
+    item = Link001Campaign.build_item(rel, "learn/L", citer_is_learn=True)
     c = Link001Campaign(worklist_items=[item], vault_path=vault)
     c.work(item)
 
@@ -238,14 +238,14 @@ def test_the_branch_is_frozen_in_the_item_id(tmp_path: Path) -> None:
     """D4a. Re-deriving per run would let the same item annotate on Monday and
     DELETE on Tuesday, depending on whether a learn/ record existed in between.
     Removal is irreversible, so the decision must be a function of the input."""
-    item = Link001Campaign.build_item("note/R.md", "learn/L", is_learn_target=True)
+    item = Link001Campaign.build_item("note/R.md", "learn/L", citer_is_learn=True)
     assert item.endswith("::annotate")
     path, target, branch = Link001Campaign.parse_item(item)
     assert (path, target, branch) == ("note/R.md", "learn/L", "annotate")
 
     # The same target, decided the other way at build time, stays REMOVE — the
     # verifier reads the frozen branch, never the vault's current shape.
-    other = Link001Campaign.build_item("note/R.md", "learn/L", is_learn_target=False)
+    other = Link001Campaign.build_item("note/R.md", "learn/L", citer_is_learn=False)
     assert other.endswith("::remove")
 
 
@@ -264,7 +264,7 @@ def test_link001_does_not_spend_quota_and_verifies_synchronously() -> None:
 def test_annotate_is_idempotent(tmp_path: Path) -> None:
     """A re-run after a crash must not double-annotate."""
     vault, rel = _link_vault(tmp_path, "See [[learn/L]] here.\n")
-    item = Link001Campaign.build_item(rel, "learn/L", is_learn_target=True)
+    item = Link001Campaign.build_item(rel, "learn/L", citer_is_learn=True)
     c = Link001Campaign(worklist_items=[item], vault_path=vault)
     c.work(item)
     c.work(item)
@@ -309,7 +309,7 @@ def test_removal_heals_the_whitespace(
     rel = "note/R.md"
     (vault / rel).write_text(f"---\ntype: note\n---\n\n{before}", encoding="utf-8")
 
-    item = Link001Campaign.build_item(rel, "person/Ghost", is_learn_target=False)
+    item = Link001Campaign.build_item(rel, "person/Ghost", citer_is_learn=False)
     c = Link001Campaign(worklist_items=[item], vault_path=vault)
     c.work(item)
 

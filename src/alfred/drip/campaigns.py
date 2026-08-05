@@ -182,10 +182,24 @@ class Link001Campaign:
         return m.group("path"), m.group("target"), m.group("branch")
 
     @classmethod
-    def build_item(cls, rel_path: str, target: str, *, is_learn_target: bool) -> str:
+    def build_item(cls, rel_path: str, target: str, *, citer_is_learn: bool) -> str:
         """Freeze one item's branch AT LIST-BUILD. The only place the
-        learn-vs-other decision is ever made."""
-        branch = cls.BRANCH_ANNOTATE if is_learn_target else cls.BRANCH_REMOVE
+        learn-vs-other decision is ever made.
+
+        ``citer_is_learn`` is whether the record HOLDING the link is a learn
+        record — not whether the broken target looks like one. D2 rules on the
+        citer: a learning that cited a since-deleted source keeps its
+        provenance, so the link is annotated rather than removed. The target is
+        the deleted source and cannot be a learn record; a broken target does
+        not exist at all, so its type could only be guessed from its path.
+
+        Renamed from ``is_learn_target``, which said the opposite of what the
+        value means. The behaviour never matched the old name — only the name
+        was wrong — but a later "fix" aligning the call site to it would have
+        silently inverted every decision in a frozen work-list that drives
+        unrecoverable deletions.
+        """
+        branch = cls.BRANCH_ANNOTATE if citer_is_learn else cls.BRANCH_REMOVE
         return f"{rel_path}::{target}::{branch}"
 
     def work(self, item_id: str) -> None:

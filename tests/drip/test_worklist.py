@@ -10,9 +10,10 @@ Two things these pins guard that nothing else can:
 
 * **The branch is keyed on the CITER, not the target.** D2 rules on "inbound
   links FROM learn-records" and "non-learning CITERS" — the record HOLDING the
-  link. The campaign's parameter is spelled ``is_learn_target``, which reads as
-  the opposite; a future "fix" aligning the call site to the name would silently
-  invert every decision in the file. Pinned both directions.
+  link. The campaign's parameter is now ``citer_is_learn`` and says so; it was
+  spelled ``is_learn_target`` until the rename, and a "fix" aligning the call
+  site to THAT name would have silently inverted every decision in the file.
+  Pinned both directions, so the guarantee does not depend on the spelling.
 * **The #49 exclusion is INHERITED, not reimplemented.** A link quoted inside a
   janitor_note is annotation prose. If the builder saw those, the campaign would
   "repair" links that exist only inside explanatory sentences — editing records
@@ -120,8 +121,8 @@ def test_the_branch_follows_the_citer_not_the_target(tmp_path: Path) -> None:
 
     A non-learn record pointing at a learn-shaped target must REMOVE, and a
     learn record pointing at a non-learn-shaped target must ANNOTATE. A build
-    that keyed on the target — which is what the campaign's ``is_learn_target``
-    parameter name suggests — produces exactly the opposite pair here.
+    that keyed on the TARGET produces exactly the opposite pair here — which is
+    what the parameter's old name (``is_learn_target``) would have invited.
     """
     cfg = _vault(tmp_path, {
         "note/N.md": _rec("note", "N", "Cites [[decision/Gone]]."),

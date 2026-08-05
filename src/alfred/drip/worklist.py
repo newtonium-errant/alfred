@@ -24,12 +24,13 @@ was later deleted: we annotate so the LEARNING keeps its provenance. The target
 is the deleted note and is emphatically not a learn record — indeed a broken
 target does not exist at all, so its type can only be guessed from its path.
 
-``Link001Campaign.build_item``'s parameter is spelled ``is_learn_target``, which
-reads as the opposite. The value is used only as "annotate if True", so the
-spelling is a misnomer rather than a behavioural disagreement — but it is a
-misnomer that would silently invert this campaign if someone later "fixed" the
-call site to match the name. Flagged in the ship report; this module passes the
-CITER's classification and says so at the call.
+``Link001Campaign.build_item`` takes this as ``citer_is_learn``, which is what
+it has always meant. It was spelled ``is_learn_target`` until the rename — the
+opposite reading — and the risk was never that the behaviour disagreed with the
+name but that someone would later "fix" the call site to match it, silently
+inverting every decision in a frozen work-list that drives unrecoverable
+deletions. The pins in ``tests/drip/test_worklist.py`` hold that line in both
+directions regardless of what the parameter is called.
 
 ## The #49 coupling
 
@@ -170,12 +171,9 @@ def build_link001_worklist(config, state) -> WorklistBuild:
             )
         citer_is_learn = learn_cache[rel_path]
 
-        # NOTE THE ARGUMENT NAME. ``is_learn_target`` is a misnomer in the
-        # campaign (see this module's docstring); the value it wants is whether
-        # the CITER is a learn record, which is what D2 rules on.
         build.items.append(
             Link001Campaign.build_item(
-                rel_path, target, is_learn_target=citer_is_learn,
+                rel_path, target, citer_is_learn=citer_is_learn,
             )
         )
         if citer_is_learn:
