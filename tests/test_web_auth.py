@@ -6,7 +6,14 @@ import structlog
 from aiohttp.test_utils import make_mocked_request
 
 from alfred.web.auth import (
+    REJECT_ABSENT,
+    REJECT_ALLOWLIST,
+    REJECT_BAD_SIGNATURE,
+    REJECT_BAD_TYPE,
+    REJECT_EXPIRED,
+    REJECT_MALFORMED,
     SESSION_HEADER,
+    SESSION_REJECT_REASONS,
     USER_HEADER,
     make_magic_token,
     make_session_token,
@@ -374,3 +381,114 @@ def test_web_ingest_peer_still_rejected_after_rrts_relay_added() -> None:
     assert ident is None
     events = [c["event"] for c in captured]
     assert "web.auth.relay_wrong_peer" in events
+
+
+# ---------------------------------------------------------------------------
+# #52 — the rejection reason is RECORDED (the ILB gap the diagnosis hit)
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-05 player bounce could not be diagnosed after the fact: the brief
+# routes 401'd and nothing said why, so expired / bad-signature /
+# allowlist-rejected were indistinguishable and the rotated-secret theory had to
+# be eliminated by hash-comparing an .env backup on the box. Every pin below
+# drives the REAL verifier through require_web_session — the reason must come
+# from the code path, not from a fixture that mirrors it.
+
+
+def _rejections(captured: list[dict]) -> list[dict]:
+    return [c for c in captured if c.get("event") == "web.auth.session_rejected"]
+
+
+def _reject_reason(req, cfg) -> str:
+    with structlog.testing.capture_logs() as captured:
+        ident = require_web_session(req, cfg)
+    assert ident is None, "these fixtures must all REJECT for the reason to mean anything"
+    events = _rejections(captured)
+    assert len(events) == 1, f"expected exactly 1 rejection event, got {len(events)}"
+    return str(events[0].get("reason") or "")
+
+
+def test_absent_header_records_absent() -> None:
+    assert _reject_reason(_req_with_token(None), _web_config()) == REJECT_ABSENT
+
+
+def test_garbage_token_records_malformed() -> None:
+    assert _reject_reason(_req_with_token("garbage"), _web_config()) == REJECT_MALFORMED
+
+
+def test_wrong_secret_records_bad_signature() -> None:
+    """THE distinction the #52 diagnosis needed and did not have.
+
+    A token minted under a different secret — i.e. what a rotated
+    ``session_secret`` produces for every outstanding session — is
+    ``bad_signature``, not ``expired``. One grep now separates the two theories
+    that cost a box investigation to tell apart.
+    """
+    token = make_session_token("andrew", "owner", secret="a-different-secret", ttl_hours=168)
+    assert _reject_reason(_req_with_token(token), _web_config()) == REJECT_BAD_SIGNATURE
+
+
+def test_expired_token_records_expired() -> None:
+    """And the other half: a plain TTL rollover is ``expired``. Distinguishing
+    this from the case above is the whole point of the field."""
+    token = make_session_token(
+        "andrew", "owner", secret=SECRET, ttl_hours=1, now=NOW - 10_000
+    )
+    assert _reject_reason(_req_with_token(token), _web_config()) == REJECT_EXPIRED
+
+
+def test_magic_token_records_bad_type() -> None:
+    """The type-confusion guard reports itself rather than reading as garbage."""
+    token, _nonce = make_magic_token("andrew", secret=SECRET, ttl_minutes=15)
+    assert _reject_reason(_req_with_token(token), _web_config()) == REJECT_BAD_TYPE
+
+
+def test_removed_user_records_allowlist_rejected() -> None:
+    """A VERIFIED token whose name left the roster is its own reason — not
+    lumped in with a broken token, which is what would send the next
+    investigation looking at secrets instead of config."""
+    token = make_session_token("andrew", "owner", secret=SECRET, ttl_hours=168)
+    cfg = _web_config(users=[WebUser(name="ben", role="ops")])
+    with structlog.testing.capture_logs() as captured:
+        assert require_web_session(_req_with_token(token), cfg) is None
+    events = _rejections(captured)
+    assert len(events) == 1
+    assert events[0]["reason"] == REJECT_ALLOWLIST
+    assert events[0]["user_present"] is True
+
+
+def test_every_reason_emitted_is_in_the_closed_set() -> None:
+    """A reason string that isn't in the declared set is a typo nobody greps."""
+    cases = [
+        _req_with_token(None),
+        _req_with_token("garbage"),
+        _req_with_token(make_session_token("andrew", "owner", secret="other", ttl_hours=1)),
+        _req_with_token(make_magic_token("andrew", secret=SECRET, ttl_minutes=15)[0]),
+    ]
+    for req in cases:
+        assert _reject_reason(req, _web_config()) in SESSION_REJECT_REASONS
+
+
+def test_the_log_carries_no_token_material() -> None:
+    """A rejected token is still a credential.
+
+    The whole captured event is searched for the token, its payload half, and
+    its signature half — a reason field is worth nothing if the line beside it
+    leaks the thing that was refused.
+    """
+    token = make_session_token("andrew", "owner", secret="a-different-secret", ttl_hours=168)
+    payload_half, _, sig_half = token.partition(".")
+    with structlog.testing.capture_logs() as captured:
+        require_web_session(_req_with_token(token), _web_config())
+    blob = repr(_rejections(captured))
+    for secretish in (token, payload_half, sig_half):
+        assert secretish not in blob, "token material must never reach the log"
+
+
+def test_a_VALID_session_logs_no_rejection() -> None:
+    """The happy path stays quiet — otherwise the grep that is supposed to find
+    a bounce finds every request instead."""
+    token = make_session_token("andrew", "owner", secret=SECRET, ttl_hours=168)
+    with structlog.testing.capture_logs() as captured:
+        assert require_web_session(_req_with_token(token), _web_config()) is not None
+    assert _rejections(captured) == []

@@ -114,51 +114,98 @@ def _sign_payload(payload: dict[str, Any], secret: str) -> str:
     return f"{payload_b64}.{_b64url_encode(sig)}"
 
 
-def _verify_payload(token: str, secret: str) -> dict[str, Any] | None:
-    """Verify the HMAC signature and decode the payload, or ``None``.
+#: Why a token verification failed — a CLOSED set, and deliberately only the
+#: distinctions the verify path can actually make (#52).
+#:
+#: The #52 diagnosis needed exactly this and could not get it: the bounce window
+#: logged nothing about WHY a token was refused, so expired / bad-signature /
+#: allowlist-rejected were indistinguishable after the fact, and the leading
+#: theory (a rotated signing secret) could only be eliminated by hash-comparing
+#: an .env backup on the box. Every reason below corresponds to a real branch —
+#: none is invented for completeness, because a reason the code cannot
+#: distinguish would be a lying log.
+REJECT_ABSENT = "absent"                      # no X-Alfred-Session header
+REJECT_MALFORMED = "malformed"                # no dot / empty half / bad b64 / bad JSON
+REJECT_BAD_SIGNATURE = "bad_signature"        # HMAC mismatch (wrong or rotated secret)
+REJECT_BAD_TYPE = "bad_type"                  # magic↔session type-confusion guard
+REJECT_BAD_EXP = "bad_exp"                    # exp absent or not a number
+REJECT_EXPIRED = "expired"                    # past exp — the plain TTL case
+REJECT_ALLOWLIST = "allowlist_rejected"       # verified, but name not in web.users
+REJECT_SECRET_UNRESOLVED = "secret_unresolved"  # enabled-but-unconfigured server
 
-    Returns ``None`` on any structural problem (no dot, bad base64, bad
-    JSON, non-dict payload) or signature mismatch. Signature comparison
-    uses ``hmac.compare_digest`` (timing-safe). Does NOT check ``exp`` /
-    type — the typed verifiers below layer those on.
+SESSION_REJECT_REASONS: frozenset[str] = frozenset({
+    REJECT_ABSENT, REJECT_MALFORMED, REJECT_BAD_SIGNATURE, REJECT_BAD_TYPE,
+    REJECT_BAD_EXP, REJECT_EXPIRED, REJECT_ALLOWLIST, REJECT_SECRET_UNRESOLVED,
+})
+
+
+def _verify_payload_reason(token: str, secret: str) -> tuple[dict[str, Any] | None, str]:
+    """``(payload, reason)`` — the single implementation. ``reason`` is ``""`` on success.
+
+    Structural checks run BEFORE the HMAC compare, which is what makes
+    ``malformed`` and ``bad_signature`` separable at all. Signature comparison
+    stays ``hmac.compare_digest`` (timing-safe) and the branch ORDER is
+    unchanged, so this adds a reason without altering what verifies.
     """
     if not token or "." not in token:
-        return None
+        return None, REJECT_MALFORMED
     payload_b64, _, sig_b64 = token.partition(".")
     if not payload_b64 or not sig_b64:
-        return None
+        return None, REJECT_MALFORMED
     expected = hmac.new(
         secret.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256
     ).digest()
     try:
         provided = _b64url_decode(sig_b64)
     except Exception:  # noqa: BLE001 — malformed sig → reject
-        return None
+        return None, REJECT_MALFORMED
     if not hmac.compare_digest(expected, provided):
-        return None
+        return None, REJECT_BAD_SIGNATURE
     try:
         payload = json.loads(_b64url_decode(payload_b64))
     except Exception:  # noqa: BLE001 — malformed payload → reject
-        return None
-    return payload if isinstance(payload, dict) else None
+        return None, REJECT_MALFORMED
+    if not isinstance(payload, dict):
+        return None, REJECT_MALFORMED
+    return payload, ""
+
+
+def _verify_payload(token: str, secret: str) -> dict[str, Any] | None:
+    """Verify the HMAC signature and decode the payload, or ``None``.
+
+    Thin wrapper over :func:`_verify_payload_reason` — kept so every existing
+    caller and pin is unchanged. Callers that need the WHY take the pair.
+    """
+    return _verify_payload_reason(token, secret)[0]
+
+
+def _verify_typed_reason(
+    token: str, secret: str, expected_type: str, now: float | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """``(payload, reason)`` for signature + type tag + expiry."""
+    payload, reason = _verify_payload_reason(token, secret)
+    if payload is None:
+        return None, reason
+    if payload.get("t") != expected_type:
+        return None, REJECT_BAD_TYPE  # type-confusion guard (magic ↔ session)
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return None, REJECT_BAD_EXP
+    current = time.time() if now is None else now
+    if current > float(exp):
+        return None, REJECT_EXPIRED
+    return payload, ""
 
 
 def _verify_typed(
     token: str, secret: str, expected_type: str, now: float | None,
 ) -> dict[str, Any] | None:
-    """Shared verify: signature + type tag + expiry."""
-    payload = _verify_payload(token, secret)
-    if payload is None:
-        return None
-    if payload.get("t") != expected_type:
-        return None  # type-confusion guard (magic ↔ session)
-    exp = payload.get("exp")
-    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
-        return None
-    current = time.time() if now is None else now
-    if current > float(exp):
-        return None  # expired
-    return payload
+    """Shared verify: signature + type tag + expiry.
+
+    Thin wrapper over :func:`_verify_typed_reason`; the behaviour and return
+    shape are unchanged for every existing caller.
+    """
+    return _verify_typed_reason(token, secret, expected_type, now)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +314,18 @@ def verify_session_token(
     return _verify_typed(token, secret, TOKEN_SESSION, now)
 
 
+def verify_session_token_reason(
+    token: str, *, secret: str, now: float | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """:func:`verify_session_token` plus WHY it failed (``""`` on success).
+
+    Same verification, same order, same result — only the reason is additional.
+    Exists so ``require_web_session`` can say what happened instead of returning
+    a bare ``None`` into a silent 401.
+    """
+    return _verify_typed_reason(token, secret, TOKEN_SESSION, now)
+
+
 # ---------------------------------------------------------------------------
 # Per-request session resolution (Layer 2) — replaces the Sub-arc A seam
 # ---------------------------------------------------------------------------
@@ -289,8 +348,36 @@ def require_web_session(
     This is the Sub-arc B replacement for ``_resolve_request_identity`` —
     same ``WebIdentity | None`` shape so the route swap is localised.
     """
+    path = getattr(getattr(request, "rel_url", None), "path", "") or ""
+
+    def _reject(reason: str, **fields: Any) -> None:
+        """Say WHY a session was refused (#52).
+
+        Every rejection here becomes a fail-closed 401 that the client can only
+        read as "no". Without this line the #52 bounce was undiagnosable after
+        the fact: expired / bad-signature / allowlist-rejected are the exact
+        distinction the investigation needed, and eliminating the
+        rotated-secret theory required hash-comparing an .env backup on the box
+        instead of one grep. One warning per rejection, greppable on
+        ``web.auth.session_rejected``.
+
+        NO TOKEN MATERIAL. Not the token, not a prefix, not the signature, not
+        the decoded payload — a rejected token is still a credential (the
+        secret-in-output rule covers fragments). Reason + route is the whole
+        payload, and it is sufficient for the question that prompted this:
+        ``expired`` means the TTL rolled over, ``bad_signature`` means the
+        signing secret no longer matches the one the token was minted under.
+        Staleness-in-seconds would need ``exp`` from a token that FAILED verify,
+        and widening the verify contract to carry it is not worth a field the
+        reason already implies.
+        """
+        log.warning(
+            "web.auth.session_rejected", reason=reason, path=path, **fields,
+        )
+
     token = request.headers.get(SESSION_HEADER, "")
     if not token:
+        _reject(REJECT_ABSENT)
         return None
     try:
         secret = resolve_signing_secret(web_config.auth)
@@ -303,11 +390,20 @@ def require_web_session(
             detail="web enabled but session_secret empty/unresolved — "
                    "rejecting session (should have failed loud at startup)",
         )
+        _reject(REJECT_SECRET_UNRESOLVED)
         return None
-    payload = verify_session_token(token, secret=secret)
+    payload, reason = verify_session_token_reason(token, secret=secret)
     if payload is None:
+        _reject(reason)
         return None
-    return resolve_identity_from_name(web_config, payload.get("u"))
+    identity = resolve_identity_from_name(web_config, payload.get("u"))
+    if identity is None:
+        # Verified token, but the name is no longer (or never was) in
+        # ``web.users``. The NAME is deliberately not logged — whether one was
+        # present is the diagnostic bit, and an allowlist name in a log buys
+        # little on a single-operator instance.
+        _reject(REJECT_ALLOWLIST, user_present=bool(payload.get("u")))
+    return identity
 
 
 def _resolve_relay_identity(
