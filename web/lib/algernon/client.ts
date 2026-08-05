@@ -35,6 +35,11 @@ export interface ChatTurnOptions {
   // the answer on the slide, or answers un-grounded if invalid. Only the /player ask
   // sends it; a normal /chat turn omits it (byte-identical to the pre-feature path).
   primer?: PlayerPrimer;
+  // The STT transcript as inserted (#54). Sent as `transcript` on the turn/stream
+  // body so the backend can diff it against the sent message and learn what it
+  // mis-heard. Only a voice-seeded send carries it; a typed turn omits it
+  // (byte-identical to the pre-feature path).
+  transcript?: string;
 }
 
 export const chatApi = {
@@ -58,6 +63,8 @@ export const chatApi = {
       ...(opts.images && opts.images.length ? { images: opts.images } : {}),
       // Player-ask primer (C3c) — non-streamed turn only (the answer is one text card).
       ...(opts.primer ? { primer: opts.primer } : {}),
+      // Learned-vocabulary capture (#54) — voice-seeded sends only.
+      ...(opts.transcript ? { transcript: opts.transcript } : {}),
     }),
   history: (sessionKey: string, instance?: string): Promise<ChatHistoryResponse> =>
     getJson<ChatHistoryResponse>(
@@ -91,6 +98,9 @@ export const chatApi = {
         ...(opts.instance ? { instance: opts.instance } : {}),
         ...(opts.idempotencyKey ? { idempotency_key: opts.idempotencyKey } : {}),
         ...(opts.images && opts.images.length ? { images: opts.images } : {}),
+        // Learned-vocabulary capture (#54) — voice-seeded sends only. Carried on
+        // the STREAM path too: this is the path a real browser turn takes.
+        ...(opts.transcript ? { transcript: opts.transcript } : {}),
       }),
       signal: opts.signal,
     }),

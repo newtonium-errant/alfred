@@ -52,6 +52,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // Player-ask primer (C3c) — relayed VERBATIM; the backend validity-gates it
     // (PlayerContextPrimer) and grounds the answer on the slide, or answers un-grounded.
     ...(parsed.data.primer ? { primer: parsed.data.primer } : {}),
+    // Learned-vocabulary capture (#54) — the transcript as inserted, relayed
+    // VERBATIM. The backend records the (transcript, sent) pair only on a
+    // voice-kind REAL send (a dedup hit must not re-count a correction).
+    ...(parsed.data.transcript ? { transcript: parsed.data.transcript } : {}),
   };
 
   if (isHomeInstance(parsed.data.instance)) {

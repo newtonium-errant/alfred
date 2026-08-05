@@ -72,6 +72,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     kind: parsed.data.kind === 'voice' ? 'voice' : 'text',
     ...(parsed.data.idempotency_key ? { idempotency_key: parsed.data.idempotency_key } : {}),
     ...(parsed.data.images && parsed.data.images.length ? { images: parsed.data.images } : {}),
+    // Learned-vocabulary capture (#54) — the transcript as inserted, relayed
+    // VERBATIM. Threaded on BOTH entry points: the streamed path is the one a
+    // real browser turn actually takes, so omitting it here would leave the
+    // capture dead in the field while every direct-invocation pin stayed green.
+    ...(parsed.data.transcript ? { transcript: parsed.data.transcript } : {}),
   };
 
   const home = isHomeInstance(parsed.data.instance);

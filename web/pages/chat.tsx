@@ -238,7 +238,13 @@ export default function ChatPage() {
             onTurnFinal={refreshFromHistory}
           />
 
-          <Composer onSend={(t, kind, images) => void send(t, kind, images)} disabled={booting || sending} />
+          {/* `transcript` (#54) is the raw STT text a voice-seeded send was built
+              from — threaded through to the turn body so the backend can learn
+              from what the operator corrected. A typed send passes nothing. */}
+          <Composer
+            onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
+            disabled={booting || sending}
+          />
         </div>
       </Layout>
     </>

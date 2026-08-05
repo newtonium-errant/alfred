@@ -29,6 +29,7 @@ vi.mock('../lib/algernon/chatRouting', () => ({
 }));
 
 import handler, { config } from '../pages/api/chat/turn';
+import { MAX_TRANSCRIPT_CHARS } from '../lib/algernon/schemas';
 
 function turnReq(body: unknown): NextApiRequest {
   return { method: 'POST', headers: {}, body } as unknown as NextApiRequest;
@@ -144,5 +145,67 @@ describe('POST /api/chat/turn (player primer #C3c)', () => {
     );
     expect(status).toHaveBeenCalledWith(400);
     expect(mockCallTransport).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/chat/turn (learned-vocabulary transcript #54)', () => {
+  it('forwards the transcript to the transport VERBATIM (home path)', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransport.mockResolvedValue({ status: 200, body: { reply: 'ok', session_key: 'k', ts: '', user_ts: '' } });
+    const { res, status } = mockRes();
+    await handler(
+      turnReq({
+        session_key: 'k',
+        message: 'clean the chicken tractor',
+        kind: 'voice',
+        transcript: 'clean the chicken tracker',
+      }),
+      res,
+    );
+    expect(mockCallTransport).toHaveBeenCalledTimes(1);
+    const opts = mockCallTransport.mock.calls[0][2];
+    expect(opts.body.transcript).toBe('clean the chicken tracker');
+    // The pair is only meaningful together — the SENT message must still be the
+    // edited text, not overwritten by what was heard.
+    expect(opts.body.message).toBe('clean the chicken tractor');
+    expect(opts.body.kind).toBe('voice');
+    expect(status).toHaveBeenCalledWith(200);
+  });
+
+  it('a turn with NO transcript carries no transcript field (byte-identical)', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransport.mockResolvedValue({ status: 200, body: {} });
+    const { res } = mockRes();
+    await handler(turnReq({ session_key: 'k', message: 'hi' }), res);
+    expect('transcript' in mockCallTransport.mock.calls[0][2].body).toBe(false);
+  });
+
+  it('400s an over-long transcript (DoS bound) before any relay', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    const { res, status } = mockRes();
+    await handler(
+      turnReq({ session_key: 'k', message: 'hi', transcript: 'x'.repeat(MAX_TRANSCRIPT_CHARS + 1) }),
+      res,
+    );
+    expect(status).toHaveBeenCalledWith(400);
+    expect(mockCallTransport).not.toHaveBeenCalled();
+  });
+
+  it('relays the transcript on the CROSS-INSTANCE path too', async () => {
+    // The cross-instance branch builds no payload of its own — it relays the same
+    // object — but that is a fact worth pinning rather than assuming: a future
+    // refactor that splits the two payloads would silently drop capture for every
+    // non-home instance.
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockIsHome.mockReturnValue(false);
+    mockGate.mockReturnValue({ ok: true, targetName: 'kalle', userName: 'andrew' });
+    mockCallChatTo.mockResolvedValue({ status: 200, body: {} });
+    const { res } = mockRes();
+    await handler(
+      turnReq({ session_key: 'k', message: 'sent', kind: 'voice', instance: 'kalle', transcript: 'heard' }),
+      res,
+    );
+    expect(mockCallChatTo).toHaveBeenCalledTimes(1);
+    expect(mockCallChatTo.mock.calls[0][3].body.transcript).toBe('heard');
   });
 });

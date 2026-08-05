@@ -219,3 +219,132 @@ describe('Composer voice transcript — direct insert, append not replace', () =
     expect(onSend).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// #54 — WHAT the voice-seeded send carries: the raw transcript, and only it
+// ---------------------------------------------------------------------------
+
+describe('Composer transcript carry (#54)', () => {
+  it('carries the RAW transcript beside the EDITED text', async () => {
+    // The whole loop rests on this pair being different: the backend learns from
+    // exactly the gap between what it heard and what the operator sent.
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('why is that yellow?'));
+    fireEvent.change(input, { target: { value: 'why is that yolk?' } });
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    const [text, kind, images, transcript] = onSend.mock.calls[0];
+    expect(text).toBe('why is that yolk?');
+    expect(kind).toBe('voice');
+    expect(images).toBeUndefined();
+    expect(transcript).toBe('why is that yellow?');
+  });
+
+  it('TYPED text is not part of the transcript — only what was actually spoken', async () => {
+    // The STT never heard the typed words, so they cannot have been mis-heard.
+    // Folding them in would make the operator's edits to his OWN typing eligible
+    // to be learned as vocabulary.
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.change(input, { target: { value: 'about the coop' } });
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('about the coop why is that yellow?'));
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    const [text, , , transcript] = onSend.mock.calls[0];
+    expect(text).toBe('about the coop why is that yellow?');
+    expect(transcript).toBe('why is that yellow?');
+  });
+
+  it('dictating twice accumulates both spoken segments with the SAME join rule', async () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('why is that yellow?'));
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('why is that yellow? why is that yellow?'));
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    const [, , , transcript] = onSend.mock.calls[0];
+    // Joined the way the textarea joined them, so a multi-pass dictation still
+    // diffs as one piece against the sent message.
+    expect(transcript).toBe('why is that yellow? why is that yellow?');
+  });
+
+  it('clearing the box discards the transcript too — the next typed send carries none', async () => {
+    // Nothing spoken survives in the input, so keeping the transcript would diff
+    // the next typed message against words the operator already threw away.
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).not.toBe(''));
+    fireEvent.change(input, { target: { value: '' } });
+    fireEvent.change(input, { target: { value: 'typed from scratch' } });
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0]).toEqual(['typed from scratch', 'text']);
+  });
+
+  it('after a clear, RE-DICTATING starts a fresh transcript — no ghost of the discarded one', async () => {
+    // This is the case that makes the clear load-bearing rather than tidy. The
+    // send-time `voiceSeeded` guard already suppresses a stale transcript on a
+    // TYPED send, so the pin above passes even with the clear removed. It is
+    // dictating AGAIN that re-arms the flag: without the lockstep clear the new
+    // spoken text appends onto the discarded one, and the operator would ship a
+    // transcript containing words that are nowhere in his message — inventing a
+    // deletion the STT never made.
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('why is that yellow?'));
+    fireEvent.change(input, { target: { value: '' } });
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('why is that yellow?'));
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    const [text, kind, , transcript] = onSend.mock.calls[0];
+    expect(kind).toBe('voice');
+    // The transcript matches the message exactly — one dictation, not two.
+    expect(transcript).toBe('why is that yellow?');
+    expect(transcript).toBe(text);
+  });
+
+  it('a send RESETS the transcript — the next turn does not re-carry it', async () => {
+    // Counts are what decide whether a term crosses the propose threshold, so a
+    // stale transcript riding a second turn would let one correction masquerade
+    // as a repeated pattern.
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).not.toBe(''));
+    fireEvent.click(screen.getByTestId('composer-send'));
+    fireEvent.change(input, { target: { value: 'a plain follow-up' } });
+    fireEvent.click(screen.getByTestId('composer-send'));
+
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(onSend.mock.calls[1]).toEqual(['a plain follow-up', 'text']);
+  });
+
+  it('a typed send passes exactly TWO arguments (byte-identical to pre-feature)', async () => {
+    const onSend = vi.fn();
+    render(<Composer onSend={onSend} />);
+    fireEvent.change(screen.getByTestId('composer-input'), { target: { value: 'hello world' } });
+    fireEvent.click(screen.getByTestId('composer-send'));
+    expect(onSend.mock.calls[0]).toHaveLength(2);
+  });
+});
