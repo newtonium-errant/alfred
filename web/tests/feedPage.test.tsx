@@ -220,3 +220,111 @@ describe('FeedPage — a completed slot stages behind Show done', () => {
     expect(screen.queryByTestId('feed-pending')).not.toBeNull();
   });
 });
+
+// --- #14: the labelled Snooze verb on a worklist row -------------------------
+// The ruling: Skip and Snooze each carry their own visible word, and a snoozed
+// row STAGES rather than vanishing — un-snooze lives on it. These drive the real
+// page, so they fail if the hook is wired to the wrong rows or not at all.
+
+describe('FeedPage — the row Snooze verb (#14)', () => {
+  it('a slot row offers a LABELLED Snooze opening the four durations', async () => {
+    mockList.mockResolvedValue({ items: [routineSlot('s1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull());
+
+    const button = screen.getByTestId('feed-row-snooze');
+    expect(button.textContent).toBe('Snooze'); // the word, not an icon
+    act(() => fireEvent.click(button));
+
+    const menu = screen.getByTestId('feed-row-snooze-menu');
+    expect(menu.textContent).toContain('1 day');
+    expect(menu.textContent).toContain('3 days');
+    expect(menu.textContent).toContain('7 days');
+    expect(menu.textContent).toContain('Until I say');
+    expect(mockAct).not.toHaveBeenCalled(); // opening a menu decides nothing
+  });
+
+  it('picking a duration POSTs that rung and STAGES the row behind Show snoozed', async () => {
+    mockList.mockResolvedValue({ items: [routineSlot('s1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull());
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze-snooze_3d')));
+
+    await waitFor(() => expect(mockAct).toHaveBeenCalledWith('s1', 'snooze_3d'));
+    // Staged, not vanished — and collapsed by default (parity with done).
+    await waitFor(() => expect(screen.queryByTestId('feed-show-snoozed')).not.toBeNull());
+    expect(screen.queryByTestId('feed-snoozed-rows')).toBeNull();
+    act(() => fireEvent.click(screen.getByTestId('feed-show-snoozed')));
+    expect(screen.getAllByTestId('feed-snoozed-row')).toHaveLength(1);
+  });
+
+  it('Unsnooze on the staged row POSTs unsnooze and returns it to the worklist', async () => {
+    // The escape hatch. The indefinite rung has no clock to bring a row back, so
+    // if this door doesn't work the operator has no way out but a config file.
+    mockList.mockResolvedValue({ items: [routineSlot('s1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull());
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze-snooze_until_i_say')));
+    await waitFor(() => expect(mockAct).toHaveBeenCalledWith('s1', 'snooze_until_i_say'));
+
+    act(() => fireEvent.click(screen.getByTestId('feed-show-snoozed')));
+    act(() => fireEvent.click(screen.getByTestId('feed-row-unsnooze')));
+    await waitFor(() => expect(mockAct).toHaveBeenCalledWith('s1', 'unsnooze'));
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull());
+    expect(screen.queryByTestId('feed-snoozed')).toBeNull();
+  });
+
+  it('a REFUSED snooze keeps the row and shows the server’s own words', async () => {
+    // Success is `acted`, never a 200. The router refuses a snooze on a done row
+    // and on an instance with no tier.snooze.path — flipping the row on status
+    // alone would tell the operator "snoozed" about a row that wasn't.
+    //
+    // Mutation: gate the flip on `res.ok` alone → the row stages anyway and this
+    // fails on both the surviving-button and the error-text asserts.
+    mockList.mockResolvedValue({ items: [routineSlot('s1')], count: 1 });
+    mockAct.mockResolvedValue({
+      ok: false,
+      status: 'error',
+      detail: "board snooze isn't configured on this instance",
+    });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull());
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze-snooze_1d')));
+
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze-error')).not.toBeNull());
+    expect(screen.getByTestId('feed-row-snooze-error').textContent).toContain("isn't configured");
+    expect(screen.queryByTestId('feed-snoozed')).toBeNull(); // never staged
+    expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull(); // retry from here
+  });
+
+  it('a FYI row gets no Snooze control — there is no store behind that kind', async () => {
+    mockList.mockResolvedValue({ items: [item('radar', 'f1', 'fyi', 'fyi')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-row-ack')).not.toBeNull());
+    expect(screen.queryByTestId('feed-row-snooze')).toBeNull();
+  });
+});
+
+describe('FeedPage — an ok-but-not-acted snooze does not stage the row (#14)', () => {
+  it('already_acted (ok: true) leaves the row where it is', async () => {
+    // The shape that makes `res.ok` alone the wrong gate: the router answers
+    // ok=true / already_acted for an idempotent noop, and staging on that would
+    // hide a row on the strength of a change that didn't happen.
+    //
+    // Mutation: gate the flip on `res.ok` instead of `res.ok && status ===
+    // 'acted'` → the row stages and this fails.
+    mockList.mockResolvedValue({ items: [routineSlot('s1')], count: 1 });
+    mockAct.mockResolvedValue({ ok: true, status: 'already_acted', detail: 'wasn’t snoozed (no change)' });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull());
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze')));
+    act(() => fireEvent.click(screen.getByTestId('feed-row-snooze-snooze_1d')));
+
+    await waitFor(() => expect(screen.queryByTestId('feed-row-snooze-error')).not.toBeNull());
+    expect(screen.queryByTestId('feed-snoozed')).toBeNull();
+    expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull();
+  });
+});

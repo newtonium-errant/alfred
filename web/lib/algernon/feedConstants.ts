@@ -8,8 +8,8 @@ import { ringItemSuggested, ringTierOf } from './rings';
 
 // --- swipe geometry (ported from the ratified deck sketch) -------------------
 export const SWIPE_X_THRESHOLD = 90; // |dx| past this on release → affirm/reject
-export const PARK_Y_THRESHOLD = 80; // upward dy past this (with small dx) → park
-export const PARK_X_TOLERANCE = 70; // park only when |dx| is under this
+export const SNOOZE_Y_THRESHOLD = 80; // upward dy past this (with small dx) → snooze
+export const SNOOZE_X_TOLERANCE = 70; // the ↑ verdict needs |dx| under this
 export const DRAG_Y_CLAMP = 30; // downward drag is clamped (cards don't fall)
 export const STAMP_FADE_START = 40; // px of drag before a verdict stamp appears
 export const STAMP_FADE_RANGE = 60; // px over which it fades fully in
@@ -18,16 +18,21 @@ export const STAMP_FADE_RANGE = 60; // px over which it fades fully in
 // when this expires OR the next commit lands — never an un-act.
 export const UNDO_MS = 3500;
 
-export type Verdict = 'affirm' | 'reject' | 'park' | null;
+// 'skip' rides the same session-local set-aside as an unbacked 'snooze' but is
+// a distinct verdict on purpose: Skip means *not this one*, Snooze means *yes,
+// but later*, and the #14 ruling is explicit that no one control may mean both.
+// Keeping them apart here is what lets the toast and the staged list say which
+// verb the operator actually used.
+export type Verdict = 'affirm' | 'reject' | 'snooze' | 'skip' | null;
 
 /**
  * The verdict a drag release resolves to — the SAME thresholds the sketch used.
- * Park wins on a mostly-vertical upward flick; otherwise a horizontal past the
+ * Snooze wins on a mostly-vertical upward flick; otherwise a horizontal past the
  * threshold is affirm (right) / reject (left); anything short springs back (null).
  * Pure + DOM-free so the threshold contract is unit-pinned.
  */
 export function verdictForDrag(dx: number, dy: number): Verdict {
-  if (dy < -PARK_Y_THRESHOLD && Math.abs(dx) < PARK_X_TOLERANCE) return 'park';
+  if (dy < -SNOOZE_Y_THRESHOLD && Math.abs(dx) < SNOOZE_X_TOLERANCE) return 'snooze';
   if (dx > SWIPE_X_THRESHOLD) return 'affirm';
   if (dx < -SWIPE_X_THRESHOLD) return 'reject';
   return null;
@@ -37,12 +42,40 @@ export function verdictForDrag(dx: number, dy: number): Verdict {
  * Whether a drag VERDICT actually maps to an action for these verbs — so the deck can
  * SPRING BACK (resetVisual) on a no-op swipe instead of leaving the card stuck half-
  * dragged. An ACK-only kind (reject: null, e.g. email_urgent) reject → false; an
- * affirm-less kind affirm → false; park is always available. (#16 item 12.)
+ * affirm-less kind affirm → false; snooze is always available. (#16 item 12.)
  */
 export function swipeActsFor(verbs: DeckVerbs | null, verdict: Verdict): boolean {
   if (verdict === 'affirm') return !!verbs?.affirm;
-  if (verdict === 'reject') return !!(verbs?.reject || verbs?.rejectParks);
-  return verdict === 'park';
+  if (verdict === 'reject') return !!(verbs?.reject || verbs?.rejectDefers);
+  // 'skip' is never produced by verdictForDrag (the LEFT drag resolves to
+  // 'reject', and useDeck.reject re-routes it for a rejectDefers lane), so the
+  // gesture-level answer for the ↑ direction is the only one left.
+  return verdict === 'snooze';
+}
+
+// --- the snooze hold-band (#14) ----------------------------------------------
+// A full ↑ swipe is a quick defer. A PARTIAL ↑ swipe held still in the band
+// between "the stamp starts showing" and "the swipe would commit" opens the
+// duration menu instead.
+//
+// The band is not a new number: it is exactly the span the Snooze stamp fades in
+// over (STAMP_FADE_START → SNOOZE_Y_THRESHOLD). Holding where the stamp is
+// already visible is what makes the affordance self-explanatory — the operator
+// is looking at the word Snooze when the menu arrives.
+export const SNOOZE_HOLD_MS = 450;
+// How far the finger may drift and still count as "held". Generous enough for a
+// thumb that isn't a tripod, tight enough that a slow full swipe reads as a
+// swipe: drift past this re-anchors the hold rather than firing it.
+export const SNOOZE_HOLD_MOVE_TOLERANCE = 12;
+
+/**
+ * Whether a live drag is sitting in the hold band — a partial ↑ with the same
+ * horizontal tolerance the ↑ verdict itself uses, so a diagonal never opens a
+ * menu the release wouldn't have honoured either.
+ */
+export function inSnoozeHoldBand(dx: number, dy: number): boolean {
+  const up = -dy;
+  return up >= STAMP_FADE_START && up <= SNOOZE_Y_THRESHOLD && Math.abs(dx) < SNOOZE_X_TOLERANCE;
 }
 
 /** Verdict-stamp opacity during a drag (0..1), mirroring the sketch's fade. */
@@ -57,7 +90,7 @@ export function stampOpacity(distance: number): number {
 // (e.g. pending has no reject — only "noted"). These action_ids MUST be members
 // of the B1 transport FEED_ACTIONS map for the kind — the deck is a simplified
 // 2-way surface over the same capability ceiling (richer tier calibration stays
-// on the reply grammar). Unmapped kinds render but expose only Park.
+// on the reply grammar). Unmapped kinds render but expose only the ↑ snooze.
 export interface DeckVerbs {
   affirm: string | null;
   reject: string | null;
@@ -65,12 +98,17 @@ export interface DeckVerbs {
   rejectLabel: string;
   heavy: boolean;
   /**
-   * C2 skip=park: the LEFT (reject) gesture is a CLIENT-side park (no POST), not a
-   * decline — there's no backend decline path for slots v1, so a skipped candidate
-   * may resurface. `reject` stays null (no action_id); useDeck routes the gesture to
-   * park() when this is set. Copy must never promise "won't show again."
+   * The LEFT (reject) gesture DEFERS instead of declining: there's no backend
+   * decline path for slots v1, so a skipped candidate is set aside client-side
+   * (no POST) and may resurface. `reject` stays null (no action_id).
+   *
+   * Deliberately NOT called a snooze, and not routed through the snooze verb:
+   * Skip and Snooze are near-opposites — *not this one* versus *yes, but later*
+   * — and the ruling that opened #14 is explicit that no single control may
+   * mean both. They share a session-local mechanism; they do not share a name,
+   * a label, or a toast. Copy must never promise "won't show again."
    */
-  rejectParks?: boolean;
+  rejectDefers?: boolean;
 }
 
 // Heavy kinds create/mutate a durable record → a right-swipe does NOT commit;
@@ -82,7 +120,7 @@ export const DECK_VERBS: Record<string, DeckVerbs> = {
   email_tier: { affirm: 'confirm', reject: 'spam', affirmLabel: 'Confirm', rejectLabel: 'Spam', heavy: false },
   // #27 email_urgent — the INTERRUPT card. ACK-only: right/✓ acknowledges (POST "ack" →
   // acted → flip); no reject/left (re-tier lives on the calibration card — two cards, two
-  // claims); park works as ever (kind-generic). Having this entry is what makes
+  // claims); the ↑ snooze gesture works as ever (kind-generic). Having this entry is what makes
   // isDeckDealt(email_urgent) true → the C2-era generic deck/needs-you paths deal + count it.
   email_urgent: { affirm: 'ack', reject: null, affirmLabel: 'Got it', rejectLabel: '', heavy: false },
   attribution: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject', heavy: false },
@@ -90,9 +128,10 @@ export const DECK_VERBS: Record<string, DeckVerbs> = {
   proposal: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject', heavy: true },
   recurrence: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Promote', rejectLabel: 'Reject', heavy: true },
   pending: { affirm: 'noted', reject: null, affirmLabel: 'Noted', rejectLabel: '', heavy: false },
-  // C2 slot candidate: Accept (right, POST "accept") / Skip (left, client-park, no
-  // POST — rejectParks) / Park (up). Only SUGGESTED slots are dealt (see isDeckDealt).
-  slot_suggestion: { affirm: 'accept', reject: null, affirmLabel: 'Take it', rejectLabel: 'Skip', heavy: false, rejectParks: true },
+  // C2 slot candidate: Accept (right, POST "accept") / Skip (left, a client-side
+  // set-aside, no POST — rejectDefers) / Snooze (up). Only SUGGESTED slots are
+  // dealt (see isDeckDealt).
+  slot_suggestion: { affirm: 'accept', reject: null, affirmLabel: 'Take it', rejectLabel: 'Skip', heavy: false, rejectDefers: true },
 };
 
 /** Deck verbs for a kind, or null when the kind has no deck action mapping. */
@@ -181,6 +220,56 @@ export function kindLabel(kind: string): string {
 
 // The universal FYI ack action (feed page + FYI rows) — sets the item `acked`.
 export const ACK_ACTION = 'ack';
+
+// --- snooze, the one defer verb (#14) ----------------------------------------
+// The duration ladder, in menu order. MUST equal `alfred.tier.snooze
+// .SNOOZE_DURATIONS`' keys — a rung offered here that the router's FEED_ACTIONS
+// ceiling doesn't admit is a button that 400s in the operator's hand. A pin in
+// tests/tier/test_board_snooze.py reads THIS array and asserts the two agree,
+// because the drift is silent on both sides otherwise.
+export const SNOOZE_ACTIONS = ['snooze_1d', 'snooze_3d', 'snooze_7d', 'snooze_until_i_say'] as const;
+export type SnoozeAction = (typeof SNOOZE_ACTIONS)[number];
+
+// The quick-defer rung: what a full ↑ swipe records, and the old Park's
+// semantics. No end date — it holds until the operator says otherwise (or the
+// urgency delta breaks it through, which fires on undated entries too).
+export const SNOOZE_INDEFINITE_ACTION: SnoozeAction = 'snooze_until_i_say';
+export const UNSNOOZE_ACTION = 'unsnooze';
+/** The verb the store stamps on a snoozed item (`acted_action`) — the staged list reads it. */
+export const SNOOZE_ACTED_VERB = 'snooze';
+
+export const SNOOZE_LABELS: Record<SnoozeAction, string> = {
+  snooze_1d: '1 day',
+  snooze_3d: '3 days',
+  snooze_7d: '7 days',
+  snooze_until_i_say: 'Until I say',
+};
+
+// Kinds the BACKEND can actually snooze. `FEED_ACTIONS` admits `snooze_*` under
+// `slot_suggestion` alone, so this is one entry — but it is a SET rather than an
+// equality check because the honest answer is per-kind and will grow.
+//
+// The ↑ gesture stays available on every card either way; what varies is whether
+// it persists. On a snooze-capable kind it POSTs and survives a reload; on the
+// others it sets the card aside for the session exactly as it always did, and
+// the copy on that path must not promise otherwise. Offering the durations menu
+// on a kind with no store behind it would be the accepted-then-ignored failure
+// this whole round set out to cure.
+export const SNOOZE_CAPABLE_KINDS: ReadonlySet<string> = new Set(['slot_suggestion']);
+
+/** Whether a ↑ on this item reaches the backend (vs. a session-local set-aside). */
+export function snoozeIsBacked(item: FeedItem): boolean {
+  return SNOOZE_CAPABLE_KINDS.has(item.kind);
+}
+
+/**
+ * The action_id a snooze of `action` should POST for this item, or `null` when
+ * the kind has no backend snooze verb (→ the caller commits a client-side
+ * set-aside instead, with no POST).
+ */
+export function snoozeActionFor(item: FeedItem, action: SnoozeAction): string | null {
+  return snoozeIsBacked(item) ? action : null;
+}
 
 // --- routine_match correction (#13) ------------------------------------------
 // A left-swipe reject says "not that item" and stops there. These two actions are

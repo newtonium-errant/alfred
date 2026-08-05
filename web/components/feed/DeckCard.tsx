@@ -6,7 +6,7 @@ import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from 
 import { EvidenceBody } from './EvidenceBody';
 
 // The top card's z-index base — each card sits at `DECK_CARD_BASE_Z - depth` (the top at
-// the base). Any overlay meant to sit ABOVE the card stack (the parked drill, the re-tier
+// the base). Any overlay meant to sit ABOVE the card stack (the snoozed drill, the re-tier
 // picker) MUST exceed this, or it opens BEHIND the top card and reads as a dead tap on the
 // real device (the #28 re-tier bug: z-20 overlay < z-100 card → invisible, jsdom can't see
 // stacking). Exported so those overlays derive their z from it and can't drift below.
@@ -211,10 +211,10 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
       )}
 
       <div className="mt-auto flex shrink-0 items-center justify-between pt-3 text-[10px] font-semibold uppercase tracking-wider text-honeydew-600">
-        <span className={verbs?.reject ? 'text-danger' : verbs?.rejectParks ? 'text-status-progress-fg' : 'text-honeydew-400'}>
-          {verbs?.reject || verbs?.rejectParks ? `← ${verbs.rejectLabel}` : '—'}
+        <span className={verbs?.reject ? 'text-danger' : verbs?.rejectDefers ? 'text-status-progress-fg' : 'text-honeydew-400'}>
+          {verbs?.reject || verbs?.rejectDefers ? `← ${verbs.rejectLabel}` : '—'}
         </span>
-        <span className="text-status-progress-fg">↑ Park</span>
+        <span className="text-status-progress-fg">↑ Snooze</span>
         <span className={verbs?.affirm ? 'text-honeydew-600' : 'text-honeydew-400'}>
           {verbs?.affirm ? `${affirmLabel} →` : '—'}
         </span>
@@ -225,10 +225,10 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         {priority ? priority : urgent ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : heavy ? 'Review' : 'Yes'}
       </span>
       <span data-stamp="reject" className="pointer-events-none absolute left-4 top-4 rotate-[8deg] rounded border-2 border-danger px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-danger opacity-0">
-        {verbs?.rejectParks ? 'Skip' : 'No'}
+        {verbs?.rejectDefers ? 'Skip' : 'No'}
       </span>
-      <span data-stamp="park" className="pointer-events-none absolute left-1/2 top-4 -ml-10 rounded border-2 border-status-progress-fg px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-status-progress-fg opacity-0">
-        Park
+      <span data-stamp="snooze" className="pointer-events-none absolute left-1/2 top-4 -ml-10 rounded border-2 border-status-progress-fg px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-status-progress-fg opacity-0">
+        Snooze
       </span>
 
       {confirming && (

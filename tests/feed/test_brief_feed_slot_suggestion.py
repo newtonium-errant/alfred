@@ -240,3 +240,115 @@ def test_operator_curated_t3_is_not_candidate(tmp_path: Path) -> None:
     t3 = [it for it in _items(vault) if it.evidence.get("tier") == 3]
     assert len(t3) == 1
     assert t3[0].evidence["candidate"] is False
+
+
+# --- snooze breakthrough reaches the CARD (#14) -------------------------------
+# The reason was computed in the projection and then died in a log line, so a row
+# that returned EARLY gave the operator no way to ask "why is this back?".
+# Producer-driven per the #18 lesson: these drive the real
+# `slot_suggestion_feed_items` over a real vault + a real snooze store, so they
+# fail if the stamp stops travelling at ANY hop (compute → entry → evidence),
+# not merely if the stamping helper regresses.
+
+
+class _TierDefaults:
+    """Minimal stand-in carrying only what the producer reads for snooze."""
+
+    def __init__(self, snooze_path: str) -> None:
+        self.snooze_path = snooze_path
+
+
+def _snooze_store(tmp_path: Path, *, key: str, until: str, due_at_snooze: str,
+                  overdue_at_snooze: bool) -> str:
+    import json
+
+    path = tmp_path / "board_snooze.json"
+    path.write_text(
+        json.dumps({
+            key: {
+                "key": key,
+                "snoozed_until": until,
+                "due_iso_at_snooze": due_at_snooze,
+                "overdue_at_snooze": overdue_at_snooze,
+                "lane": "task",
+                "duration_label": "3d",
+            }
+        }),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_moved_earlier_breakthrough_reaches_the_card(tmp_path: Path) -> None:
+    """A snoozed row pulled EARLIER returns, and the card says why.
+
+    Snoozed until the 31st when the row was ALREADY overdue and due 2026-06-10;
+    the task now says 2026-05-28. Overdue-at-snooze on purpose — that is what
+    closes the `crossed_due` branch, so `moved_earlier` is the only reason that
+    can fire and the pin names one thing rather than whichever wins a race.
+    """
+    vault = _vault(tmp_path)
+    _task(vault, "Pay Steph", "type: task\nstatus: todo\nname: Pay Steph\ndue: 2026-05-28\n")
+    store = _snooze_store(
+        tmp_path,
+        key="task:task/Pay Steph.md",
+        until="2026-05-31",          # still in the future at NOW
+        due_at_snooze="2026-06-10",  # was later; the task now says the 28th
+        overdue_at_snooze=True,      # closes the crossed_due branch
+    )
+
+    items = slot_suggestion_feed_items(vault, NOW, _TierDefaults(store), instance="salem")
+
+    assert len(items) == 1, "the row must break through, not stay suppressed"
+    assert items[0].evidence["snooze_breakthrough"] == "moved_earlier"
+
+
+def test_crossed_due_breakthrough_reaches_the_card(tmp_path: Path) -> None:
+    """The other reason, isolated: NOT overdue when snoozed, overdue now.
+
+    Both reasons are pinned separately because the card renders the NAME — a fix
+    that collapsed them to a single generic "it came back" would still satisfy a
+    truthy check.
+    """
+    vault = _vault(tmp_path)
+    _task(vault, "Pay Steph", "type: task\nstatus: todo\nname: Pay Steph\ndue: 2026-05-28\n")
+    store = _snooze_store(
+        tmp_path,
+        key="task:task/Pay Steph.md",
+        until="2026-05-31",
+        due_at_snooze="2026-05-28",
+        overdue_at_snooze=False,     # was not yet due; today it is
+    )
+
+    items = slot_suggestion_feed_items(vault, NOW, _TierDefaults(store), instance="salem")
+
+    assert len(items) == 1
+    assert items[0].evidence["snooze_breakthrough"] == "crossed_due"
+
+
+def test_a_row_that_was_never_snoozed_carries_an_empty_reason(tmp_path: Path) -> None:
+    """Intentionally-left-blank: the field is always present, and empty means
+    'no early return to explain' — distinguishable from a missing key."""
+    vault = _vault(tmp_path)
+    _task(vault, "Pay Steph", "type: task\nstatus: todo\nname: Pay Steph\ndue: 2026-05-28\n")
+    items = slot_suggestion_feed_items(vault, NOW, None, instance="salem")
+    assert len(items) == 1
+    assert items[0].evidence["snooze_breakthrough"] == ""
+
+
+def test_a_held_snooze_emits_no_card_at_all(tmp_path: Path) -> None:
+    """Control: with no delta the snooze HOLDS, so there is no card to explain.
+
+    Guards against a fix that surfaced every snoozed row just to carry a reason.
+    """
+    vault = _vault(tmp_path)
+    _task(vault, "Pay Steph", "type: task\nstatus: todo\nname: Pay Steph\ndue: 2026-06-10\n")
+    store = _snooze_store(
+        tmp_path,
+        key="task:task/Pay Steph.md",
+        until="2026-05-31",
+        due_at_snooze="2026-06-10",  # unchanged → no delta
+        overdue_at_snooze=False,
+    )
+    items = slot_suggestion_feed_items(vault, NOW, _TierDefaults(store), instance="salem")
+    assert items == []

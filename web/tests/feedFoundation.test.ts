@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DECK_VERBS,
   HEAVY_KINDS,
-  PARK_Y_THRESHOLD,
+  SNOOZE_Y_THRESHOLD,
   SWIPE_X_THRESHOLD,
   affirmLabelFor,
   deckVerbsFor,
@@ -169,15 +169,15 @@ describe('verdictForDrag — swipe thresholds', () => {
   it('rejects past the left x-threshold', () => {
     expect(verdictForDrag(-(SWIPE_X_THRESHOLD + 1), 0)).toBe('reject');
   });
-  it('parks on a mostly-vertical upward flick', () => {
-    expect(verdictForDrag(10, -(PARK_Y_THRESHOLD + 1))).toBe('park');
+  it('snoozes on a mostly-vertical upward flick', () => {
+    expect(verdictForDrag(10, -(SNOOZE_Y_THRESHOLD + 1))).toBe('snooze');
   });
   it('springs back (null) when nothing crosses a threshold', () => {
     expect(verdictForDrag(20, -10)).toBeNull();
     expect(verdictForDrag(SWIPE_X_THRESHOLD, 0)).toBeNull(); // exactly at → not past
   });
-  it('a big horizontal flick with upward drift is affirm/reject, not park', () => {
-    // dx dominates → park guard (|dx|<70) fails, so horizontal wins.
+  it('a big horizontal flick with upward drift is affirm/reject, not snooze', () => {
+    // dx dominates → snooze guard (|dx|<70) fails, so horizontal wins.
     expect(verdictForDrag(120, -120)).toBe('affirm');
     expect(verdictForDrag(-120, -120)).toBe('reject');
   });
@@ -205,7 +205,7 @@ describe('deck verbs', () => {
     expect(DECK_VERBS.proposal.heavy).toBe(true);
     expect(DECK_VERBS.email_tier.heavy).toBe(false);
   });
-  it('returns null for an unmapped kind (park-only)', () => {
+  it('returns null for an unmapped kind (snooze-only)', () => {
     expect(deckVerbsFor('weather')).toBeNull();
     expect(deckVerbsFor('email_tier')).not.toBeNull();
   });
@@ -216,13 +216,13 @@ describe('swipeActsFor — no-op swipe springs back (#16 item 12)', () => {
     expect(swipeActsFor(deckVerbsFor('email_urgent'), 'reject')).toBe(false);
     expect(swipeActsFor(deckVerbsFor('pending'), 'reject')).toBe(false);
   });
-  it('a real reject acts (email_tier spam, slot rejectParks)', () => {
+  it('a real reject acts (email_tier spam, slot rejectDefers)', () => {
     expect(swipeActsFor(deckVerbsFor('email_tier'), 'reject')).toBe(true);
-    expect(swipeActsFor(deckVerbsFor('slot_suggestion'), 'reject')).toBe(true); // rejectParks routes to park
+    expect(swipeActsFor(deckVerbsFor('slot_suggestion'), 'reject')).toBe(true); // rejectDefers routes to snooze
   });
-  it('affirm acts when the kind has an affirm; park always acts; null verdict never', () => {
+  it('affirm acts when the kind has an affirm; snooze always acts; null verdict never', () => {
     expect(swipeActsFor(deckVerbsFor('email_urgent'), 'affirm')).toBe(true); // ack
-    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'park')).toBe(true);
+    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'snooze')).toBe(true);
     expect(swipeActsFor(null, 'affirm')).toBe(false);
     expect(swipeActsFor(deckVerbsFor('email_tier'), null)).toBe(false);
   });

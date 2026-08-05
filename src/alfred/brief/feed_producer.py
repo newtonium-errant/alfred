@@ -282,6 +282,13 @@ def slot_suggestion_feed_items(
                 "due_iso": getattr(entry, "due_iso", None),
                 "surface_reason": getattr(entry, "surface_reason", None),
                 "source": source,
+                # #14 — WHY this row is back before its snooze ran out
+                # (``crossed_due`` / ``moved_earlier``), or "" when it was
+                # never snoozed or simply expired. Evidence-only, like
+                # ``confirmed`` above: the brief render never reads evidence,
+                # so byte-parity holds. The card uses it to answer the question
+                # an early return provokes instead of leaving it mysterious.
+                "snooze_breakthrough": getattr(entry, "snooze_breakthrough", "") or "",
                 # Phase C slice 2 (board ACCEPT path): ``confirmed`` verbatim
                 # (T1-only; None for T2/T3) + the derived ``candidate`` flag the
                 # router's accept provenance-guard reads. Evidence-only — the
