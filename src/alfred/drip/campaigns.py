@@ -203,7 +203,7 @@ class Link001Campaign:
                 return                       # already annotated — idempotent
             body = body.replace(link, f"{link} {_PROVENANCE_MARK}")
         else:
-            body = body.replace(link, "")
+            body = _remove_link(body, link)
         path.write_text(body, encoding="utf-8")
 
     def verify(self, item_id: str) -> bool:
@@ -236,6 +236,31 @@ class Link001Campaign:
 
 #: The D-ruling's provenance annotation for a surviving learn-record link.
 _PROVENANCE_MARK = "<!-- link-provenance: retained (learn record) -->"
+
+#: Horizontal whitespace only — never a newline. A link at end-of-line must not
+#: let its trailing-whitespace match eat the line break and join two lines.
+_INLINE_WS = r"[^\S\r\n]"
+
+
+def _remove_link(body: str, link: str) -> str:
+    """Delete ``link`` and heal the whitespace it sat in.
+
+    A plain ``body.replace(link, "")`` leaves a double space behind every
+    inline link (``See [[X]] here.`` → ``See  here.``). One record it is a
+    typo; across the ~2,000 the campaign drains it becomes a second cleanup
+    campaign, which is why this is worth fixing at the removal site rather
+    than later.
+
+    The rule: consume the link together with the horizontal whitespace on
+    either side, then put back a SINGLE space only when the link had
+    whitespace on BOTH sides (i.e. it sat between words). A link that was
+    leading, trailing, or hugging punctuation leaves nothing behind, so
+    ``See [[X]].`` becomes ``See.`` rather than ``See .``.
+    """
+    pattern = re.compile(f"({_INLINE_WS}*){re.escape(link)}({_INLINE_WS}*)")
+    return pattern.sub(
+        lambda m: " " if (m.group(1) and m.group(2)) else "", body,
+    )
 
 
 #: name → campaign factory. A dict, on purpose (see the module docstring).

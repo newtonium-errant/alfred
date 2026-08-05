@@ -1695,3 +1695,51 @@ scaffold:
 #   enabled: true                              # local JSONL write; belt-guarded
 #   store_path: "./data/feed_items.jsonl"      # tool-scoped default
 #   compact_threshold_bytes: 5242880           # 5 MiB → rewrite folded state
+
+# ---------------------------------------------------------------------------
+# Drip-drain campaigns (#44 machinery, #44b wiring)
+# ---------------------------------------------------------------------------
+# A campaign is a large, mechanical, resumable work-list drained in
+# budget-capped increments. The operator's directive: "a limited budget each
+# day or week so as to not use too many credits at a time knowing that it's
+# okay for some tasks if this takes a few weeks."
+#
+# DEPLOY-INERT: with no `drip:` block, nothing runs, no state files appear,
+# and the brief shows no Campaigns section. Every campaign is opt-in — a
+# campaign spends real credits or performs irreversible vault edits, so
+# `enabled` defaults to false and must be set explicitly. A configured-but-
+# disabled campaign still gets a brief line saying it is disabled, so an off
+# switch never reads as a broken scheduler.
+#
+# Run it with `alfred drip run` (a scheduler's entry point; `--dry-run`
+# previews the same operation) and inspect with `alfred drip status`.
+#
+# The budgets below are the ratified D1 numbers (halved from the first draft)
+# and are also the built-in defaults — an omitted key still gets them.
+# drip:
+#   enabled: true
+#   campaigns:
+#     gmail_backlog:
+#       enabled: false
+#       max_items_per_run: 12       # per invocation
+#       max_items_per_week: 60      # rolling 7 days; CREDIT guard, binds only
+#                                   # campaigns that spend quota
+#       max_attempts: 3             # failed attempts before an item retires
+#       max_failures_per_run: 5     # circuit breaker
+#       max_awaiting_runs: 5        # async dispatch that never lands -> FAILED
+#       # The cohort staged OUTSIDE the curator-watched inbox. The throttle is
+#       # a MOVE into the watched dir, so the budget binds the only thing that
+#       # matters: arrival rate. Both paths are per-instance and required.
+#       staging_dir: "/home/andrew/.alfred/salem/staging/gmail-backlog"
+#       inbox_dir: "/home/andrew/.alfred/salem/vault/inbox"
+#     link001_repair:
+#       enabled: false
+#       max_items_per_run: 12
+#       # The FROZEN work-list: one `<rel_path>::<target>::<annotate|remove>`
+#       # per line (blank lines and `#` comments ignored). A FILE, not a live
+#       # scan, and that is a correctness requirement: D4a freezes each item's
+#       # branch at list-build, because re-deriving it per run would let the
+#       # same link annotate on Monday and delete on Tuesday depending on
+#       # whether a learn/ record happened to exist in between. The removal
+#       # branch is unrecoverable, so it earns the frozen decision.
+#       worklist_path: "/home/andrew/.alfred/salem/data/link001_worklist.txt"

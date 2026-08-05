@@ -38,6 +38,7 @@ from .tier_section import render_tier_section
 from .utils import get_logger
 from .operations import format_operations_section
 from .upcoming_events import render_upcoming_events_section
+from alfred.drip.brief_line import SECTION_HEADER as DRIP_SECTION_HEADER
 from .watches import check_and_format_watches
 from .weather import fetch_and_format
 
@@ -276,6 +277,59 @@ def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_l
         )
 
 
+def _render_drip_body(config: BriefConfig, today_local: date) -> str | None:
+    """The Campaigns section body, or ``None`` to omit the section entirely.
+
+    Reads persisted campaign cursors — it never runs an increment. A brief
+    render that could trigger real work would make the morning brief a side
+    effect, and a campaign that only advances when someone reads about it is
+    not a scheduled drain.
+
+    Returns ``None`` ONLY for an instance with no campaigns configured — that
+    is the deploy-inert case, and it is the sole permitted silence.
+
+    **A campaign that fails to build still gets a line.** Dropping it would
+    make "this campaign is broken" and "this campaign was never configured"
+    identical on the operator's primary surface, which is the exact ambiguity
+    the intentionally-left-blank rule exists to forbid — and it is not
+    hypothetical: enabling ``link001_repair`` before its frozen work-list file
+    exists (task #50) produces precisely that silence on day one. Same shape
+    and same wording as ``drip.cli.cmd_status`` one file over, so the two
+    operator surfaces read alike.
+    """
+    drip_cfg = getattr(config, "drip", None)
+    if drip_cfg is None or not getattr(drip_cfg, "campaigns", None):
+        return None
+
+    from alfred.drip.brief_line import render_campaign_line
+    from alfred.drip.state import campaign_state_path, load_state
+    from alfred.drip.wiring import DripConfigError, build_campaign, build_progress
+
+    lines: list[str] = []
+    for name, ccfg in sorted(drip_cfg.campaigns.items()):
+        try:
+            campaign = build_campaign(name, ccfg, drip_cfg)
+            state = load_state(
+                campaign_state_path(drip_cfg.data_dir, drip_cfg.instance, name),
+                name,
+            )
+            lines.append(
+                render_campaign_line(
+                    build_progress(name, campaign, state, ccfg, today=today_local)
+                )
+            )
+        except (DripConfigError, ValueError, OSError) as exc:
+            # Visible, not silent — and one broken campaign still must not cost
+            # the operator its sibling's line, so the loop continues.
+            lines.append(f"**{name}:** ⚠ misconfigured — {exc}")
+            log.warning(
+                "brief.drip_campaign_unbuildable",
+                campaign=name, error=str(exc), error_type=type(exc).__name__,
+                consequence="rendered as a misconfigured line in today's brief",
+            )
+    return "\n".join(lines) or None
+
+
 async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: bool = False) -> str | None:
     """Generate a morning brief. Returns the vault-relative path, or None if skipped."""
     today = date.today().isoformat()
@@ -430,6 +484,11 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         config.stayc_negation_relay, datetime.now(timezone.utc),
     )
 
+    # Drip campaigns (#44b) — body only; the renderer supplies the ``##``
+    # header from the section NAME below. ``None`` when drip is unconfigured,
+    # which omits the section entirely (deploy-inert).
+    drip_md = _render_drip_body(config, today_local)
+
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
     # second (time-sensitive but non-operational), Open Tasks by Tier
@@ -465,6 +524,14 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # one permitted silence; every CONFIGURED watch yields a line).
     if watches_md:
         sections.append(SectionResult("Watch Items", watches_md))
+    # Campaigns sits beside Watch Items — both report background work the
+    # operator is not otherwise watching. Rendered ONLY when at least one
+    # campaign is configured; an instance that never enabled drip shows no
+    # trace of it. A CONFIGURED campaign always yields a line, including the
+    # disabled / never-run / quota-blocked signals, because a background drain
+    # is the easiest thing here to die silently.
+    if drip_md:
+        sections.append(SectionResult(DRIP_SECTION_HEADER, drip_md))
     # STAY-C Bug Relay sits alongside Watch Items — both are upstream
     # operational signals (something outside Salem needs triage). Rendered
     # ONLY when the feature is enabled (the empty string from a disabled /

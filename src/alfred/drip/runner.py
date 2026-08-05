@@ -187,11 +187,20 @@ def run_increment(
     max_attempts: int,
     max_failures_per_run: int,
     max_awaiting_runs: int = 5,
-    today: date = None,  # type: ignore[assignment]
+    today: date,
     run_id: str,
     apply: bool = True,
 ) -> RunResult:
     """Drain one budgeted increment. Never raises; always reports.
+
+    ``today`` is REQUIRED keyword-only, deliberately. It was the lone optional
+    among required keyword-only siblings, and it is dereferenced
+    (``today.isoformat()``) only on the branch that records spend — so a caller
+    that let it default worked against an empty cursor and against every
+    non-spending campaign, then raised ``AttributeError`` the first time a
+    SPENDING campaign actually cost something. That asymmetry surfaces in
+    production and not in tests, which is the shape the optional-gate rule
+    exists to forbid. Structurally pinned; see ``tests/_required_kwarg.py``.
 
     ``apply=False`` is a DRY RUN — selection and budget are computed and
     reported, nothing is worked and nothing is written. Three times during the
@@ -202,10 +211,16 @@ def run_increment(
     it looks careful.
     """
     worklist = campaign.worklist()
+    # TOTAL is the UNION of the work-list and everything state has tracked —
+    # the same union ``CampaignState.remaining`` uses, and for the same reason.
+    # ``len(worklist)`` alone shrinks for any campaign whose work() removes the
+    # item from its own list (gmail_backlog moves the file out of staging), so
+    # from the second run onward this logged ``pct=100.0`` alongside
+    # ``remaining=1`` — internally contradictory, and wrong in the reassuring
+    # direction. ``week_cap`` is set below, once we know whether it binds.
     result = RunResult(
         campaign=campaign.name,
-        total=len(worklist),
-        week_cap=max_items_per_week,
+        total=len(set(worklist) | set(state.items)),
     )
 
     spent_week = state.spend_in_week_ending(today)
@@ -225,6 +240,12 @@ def run_increment(
     spends = campaign.spends_quota()
     if spends and max_items_per_week > 0:
         week_headroom = max(max_items_per_week - spent_week, 0)
+        # Report the cap ONLY where it binds. Reporting it for a non-spending
+        # campaign asserted a bound the runner then deliberately does not
+        # enforce (link001 gets infinite headroom), which invites the operator
+        # to tune a number with no effect — and disagreed with the brief line,
+        # which already zeroes it. Two surfaces, one answer.
+        result.week_cap = max_items_per_week
     else:
         week_headroom = 1 << 30
     budget = min(max_items_per_run, week_headroom)
@@ -440,6 +461,10 @@ def run_increment(
         )
 
     result.remaining = state.remaining(worklist)
+    # Re-take the union: the loop registers work-list items into state, and a
+    # campaign whose work() removes items from its own list has a SHORTER
+    # work-list now than at entry.
+    result.total = len(set(worklist) | set(state.items))
     result.spent_week = state.spend_in_week_ending(today)
     _finish(state, state_path, result, apply=apply)
     return result

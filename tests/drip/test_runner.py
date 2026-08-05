@@ -488,3 +488,70 @@ def test_corrupt_state_starts_fresh_but_says_so(tmp_path: Path) -> None:
         state = load_state(path, "c")
     assert state.items == {}
     assert [c for c in cap if c.get("event") == "drip.state.load_failed"]
+
+
+# ---------------------------------------------------------------------------
+# #44b delta — the gate parameter, and two numbers that lied
+# ---------------------------------------------------------------------------
+
+
+def test_today_is_a_required_keyword_only_argument() -> None:
+    """``today`` was the lone optional among required keyword-only siblings.
+
+    It is dereferenced (``today.isoformat()``) ONLY on the branch that records
+    spend, so a caller that let it default worked against an empty cursor and
+    against every non-spending campaign, then raised AttributeError the first
+    time a SPENDING campaign actually cost something. That asymmetry surfaces
+    in production and not in tests.
+
+    Structural half per ``tests/_required_kwarg.py``: asserting the signature
+    is the binding guarantee, because a bare ``pytest.raises(TypeError)`` can
+    be satisfied incidentally by a downstream raise — here, precisely the
+    ``AttributeError``-adjacent failure this pin exists to forbid.
+    """
+    from tests._required_kwarg import assert_required_keyword_only
+
+    assert_required_keyword_only(run_increment, "today")
+
+
+def test_omitting_today_fails_at_the_boundary(tmp_path: Path) -> None:
+    """Behavioural half — and the message is matched, so an incidental
+    downstream TypeError cannot satisfy this pin."""
+    from tests._required_kwarg import MISSING_KWARG_RE
+
+    campaign = FakeCampaign(["a"])
+    with pytest.raises(TypeError, match=MISSING_KWARG_RE):
+        run_increment(
+            campaign, CampaignState(), state_path=tmp_path / "s.json",
+            max_items_per_run=12, max_items_per_week=60, max_attempts=3,
+            max_failures_per_run=5, run_id="r1",
+        )
+
+
+def test_week_cap_is_reported_only_where_it_binds(tmp_path: Path) -> None:
+    """The runner gives a non-spending campaign INFINITE weekly headroom, so
+    logging ``week_cap=60`` for it asserted a bound nothing enforces — and
+    disagreed with the brief line, which already zeroes it."""
+    spender = FakeCampaign(["a"], spends=True)
+    free = FakeCampaign(["b"], spends=False)
+
+    assert _run(spender, CampaignState(), tmp_path).week_cap == 60
+    assert _run(free, CampaignState(), tmp_path).week_cap == 0
+
+
+def test_total_counts_items_that_left_the_worklist(tmp_path: Path) -> None:
+    """``total`` is the work-list ∪ everything state tracks — the same union
+    ``CampaignState.remaining`` uses.
+
+    ``len(worklist)`` alone shrinks for a campaign whose work() removes the
+    item from its own list, which made the runner log ``pct=100.0`` next to
+    ``remaining=1``: internally contradictory, and wrong in the reassuring
+    direction. Pinned together so a total that drops below remaining fails.
+    """
+    state = CampaignState()
+    state.items["gone"] = ItemState(item_id="gone", state=IN_FLIGHT)
+    result = _run(FakeCampaign(["still-here"]), state, tmp_path)
+
+    assert result.total == 2, "the departed item is still part of the campaign"
+    assert result.total >= result.remaining
+    assert result.pct_complete <= 100.0

@@ -76,6 +76,17 @@ class CampaignProgress:
 
 def render_campaign_line(p: CampaignProgress) -> str:
     """One line per campaign. Always returns text — never an empty string."""
+    # Disabled is checked FIRST, ahead of never-run. A campaign that is switched
+    # off and has never fired is not a scheduling problem — it is an off switch,
+    # and "configured, not yet run" would send the operator to debug a scheduler
+    # for a campaign that is working as configured. The never-run branch below
+    # means what its docstring always said: an ENABLED campaign that has not
+    # fired. (Ordering only became observable once #44b wired a real config in;
+    # nothing persists STOP_DISABLED, so this reason means exactly "config says
+    # disabled".)
+    if p.last_stop_reason == STOP_DISABLED:
+        return f"**{p.name}:** disabled — {p.remaining} left, not draining."
+
     # Never run: distinct from "nothing to do". A campaign enabled yesterday
     # that has not fired once is a scheduling problem; a campaign that has
     # drained everything is finished. Same silence, opposite meanings.
@@ -84,9 +95,6 @@ def render_campaign_line(p: CampaignProgress) -> str:
             f"**{p.name}:** configured, not yet run "
             f"({p.total} item{'s' if p.total != 1 else ''} staged)."
         )
-
-    if p.last_stop_reason == STOP_DISABLED:
-        return f"**{p.name}:** disabled — {p.remaining} left, not draining."
 
     if p.remaining <= 0:
         return f"**{p.name}:** ✓ complete — all {p.total} drained."
@@ -128,18 +136,46 @@ def render_campaign_line(p: CampaignProgress) -> str:
     return line
 
 
+#: The section's NAME, per the brief's house convention — a plain title, no
+#: ``##``. ``brief/renderer.render_brief`` emits ``## {section_name}`` itself
+#: from the ``SectionResult.name``, exactly as ``tier_section.SECTION_HEADER``
+#: and ``stayc_relay.SECTION_HEADER`` are used. Handing the assembler a body
+#: that already carried its own header would print the header twice.
+SECTION_HEADER = "Campaigns"
+
+
+def render_drip_body(progresses: list[CampaignProgress]) -> str | None:
+    """The campaign lines WITHOUT a header, or ``None`` when the feature is off.
+
+    This is what the brief assembler consumes: it supplies
+    :data:`SECTION_HEADER` as the section name and the renderer adds the ``##``.
+    """
+    if not progresses:
+        return None
+    return "\n".join(render_campaign_line(p) for p in progresses)
+
+
 def render_drip_section(progresses: list[CampaignProgress]) -> str | None:
-    """The whole section, or ``None`` when the feature is off.
+    """The whole section INCLUDING its own ``## Campaigns`` header, or ``None``.
 
     ``None`` (omit) vs an empty header is the deploy-inert distinction: an
     instance that never enabled drip should show no trace of it, while an
     instance that enabled it and has nothing to say still gets its lines.
+
+    Self-contained form, for a caller that renders the section standalone. The
+    brief assembler uses :func:`render_drip_body` instead — see
+    :data:`SECTION_HEADER`.
     """
-    if not progresses:
+    body = render_drip_body(progresses)
+    if body is None:
         return None
-    lines = ["## Campaigns", ""]
-    lines.extend(render_campaign_line(p) for p in progresses)
-    return "\n".join(lines)
+    return f"## {SECTION_HEADER}\n\n{body}"
 
 
-__all__ = ["CampaignProgress", "render_campaign_line", "render_drip_section"]
+__all__ = [
+    "SECTION_HEADER",
+    "CampaignProgress",
+    "render_campaign_line",
+    "render_drip_body",
+    "render_drip_section",
+]
