@@ -1742,4 +1742,12 @@ scaffold:
 #       # same link annotate on Monday and delete on Tuesday depending on
 #       # whether a learn/ record happened to exist in between. The removal
 #       # branch is unrecoverable, so it earns the frozen decision.
+#       #
+#       # GENERATE IT with (dry-run first, it previews the counts):
+#       #   alfred drip build-worklist link001 --out <this path>
+#       #   alfred drip build-worklist link001 --out <this path> --apply
+#       # The builder scans once, freezes each branch, and refuses to write an
+#       # empty list — "couldn't find your list" must never read as "you are
+#       # finished". Do NOT regenerate to "refresh" a live list: re-deriving
+#       # lets the same link annotate one week and delete the next.
 #       worklist_path: "/home/andrew/.alfred/salem/data/link001_worklist.txt"

@@ -284,3 +284,69 @@ def test_history_empty_says_so(capsys, monkeypatch) -> None:
     monkeypatch.setattr(cli_mod, "_init_state", lambda config: _FakeState())
     cli_mod.cmd_history(config=None)  # type: ignore[arg-type]
     assert "No sweep history." in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# #49 — the per-code tally, so a count change is quotable on the box
+# ---------------------------------------------------------------------------
+
+
+def test_issue_counts_by_code_is_descending_by_count() -> None:
+    """The dominant population reads first.
+
+    On the live vault that is LINK001 by an order of magnitude — which is the
+    whole reason the headline needed the #31 split, and the number a scanner
+    change has to be judged on.
+    """
+    from alfred.janitor.cli import format_issue_counts_by_code
+    from alfred.janitor.issues import Issue, IssueCode, Severity
+
+    def _i(code: IssueCode) -> Issue:
+        return Issue(code=code, severity=Severity.WARNING, file="x.md", message="m")
+
+    result = _sweep(found=6)
+    result.issues = (
+        [_i(IssueCode.BROKEN_WIKILINK)] * 4
+        + [_i(IssueCode.STUB_RECORD)] * 1
+        + [_i(IssueCode.ORPHANED_RECORD)] * 1
+    )
+    out = format_issue_counts_by_code(result)
+    assert out.splitlines() == [
+        "Issues by code:",
+        "  LINK001: 4",
+        "  ORPHAN001: 1",
+        "  STUB001: 1",
+    ], "descending by count, then alphabetical on a tie"
+
+
+def test_issue_counts_by_code_never_renders_an_empty_block() -> None:
+    """A sweep whose issue LIST is empty while its count is not — a state file
+    that persisted counts without issues — says so rather than printing a
+    header with nothing under it."""
+    from alfred.janitor.cli import format_issue_counts_by_code
+
+    result = _sweep(found=40)
+    result.issues = []
+    assert format_issue_counts_by_code(result) == (
+        "Issues by code: none recorded on this sweep"
+    )
+
+
+def test_split_docstring_example_is_internally_consistent() -> None:
+    """The rendered shapes in the docstring are read as a contract by the next
+    person to touch this. The cohort is a SUBSET of actionable, so an example
+    with more cohort than actionable teaches the wrong invariant."""
+    import re
+
+    from alfred.janitor.cli import format_issue_split
+
+    doc = format_issue_split.__doc__ or ""
+    m = re.search(
+        r"Issues found: (\d+) \((\d+) actionable, (\d+) not janitor-fixable; "
+        r"(\d+) of\s+the actionable are spam-cohort\)",
+        doc,
+    )
+    assert m, "the worked example shape changed — re-check this pin"
+    total, actionable, not_fixable, cohort = (int(g) for g in m.groups())
+    assert actionable + not_fixable == total, "the split must conserve"
+    assert cohort <= actionable, "the cohort is a subset of actionable"

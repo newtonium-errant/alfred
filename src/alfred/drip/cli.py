@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
+from pathlib import Path
 
 import structlog
 
@@ -151,4 +152,85 @@ def cmd_status(config: DripConfig, *, today: date | None = None) -> int:
     return 0
 
 
-__all__ = ["cmd_run", "cmd_status"]
+def cmd_build_worklist(
+    janitor_config,
+    *,
+    out_path: str,
+    apply: bool = False,
+) -> int:
+    """Build the FROZEN link001 work-list (#50). Dry-run unless ``apply``.
+
+    Dry-run is the DEFAULT here, the opposite of ``drip run``, and deliberately
+    so: writing this file commits a set of irreversible edits to a branch
+    decision that must never be regenerated. Previewing the counts before
+    freezing them is the cheap half of that.
+
+    Fails LOUD on a missing vault and on a zero-item result. An empty work-list
+    and an absent one are indistinguishable downstream — ``load_worklist_file``
+    already refuses a missing file for that reason — so writing an empty one
+    would manufacture exactly the "you are finished" signal the campaign must
+    never receive by accident.
+    """
+    from alfred.janitor.state import JanitorState
+
+    from .worklist import build_link001_worklist, render_worklist
+
+    state = JanitorState(
+        janitor_config.state.path, janitor_config.state.max_sweep_history,
+    )
+    build = build_link001_worklist(janitor_config, state)
+
+    if build.total == 0:
+        # ERROR, never a quiet empty file.
+        print(
+            "Drip build-worklist: scanned the vault and found NO LINK001 to "
+            "freeze. Refusing to write an empty work-list — an empty list and "
+            "a missing one are indistinguishable to the campaign, and this one "
+            "would read as 'the backlog is drained'."
+        )
+        log.warning(
+            "drip.worklist.empty",
+            campaign="link001_repair",
+            detail="ran, found nothing to freeze — no file written",
+        )
+        return 1
+
+    print(
+        f"Drip build-worklist link001: {build.total} item(s) — "
+        f"{build.annotate} annotate, {build.remove} remove — "
+        f"across {build.files} record(s)"
+    )
+    if build.skipped:
+        # Never silent about refusals: a reference the builder declined to
+        # freeze is work the campaign will never do, so it is named here.
+        print(f"  skipped {len(build.skipped)}:")
+        for rel_path, target, reason in build.skipped[:10]:
+            print(f"    {rel_path} :: {target or '(unparsed)'} — {reason}")
+
+    if not apply:
+        print(
+            f"  [dry run] would write {out_path} — re-run with --apply to "
+            "freeze this list."
+        )
+        for item in build.items[:5]:
+            print(f"    {item}")
+        if build.total > 5:
+            print(f"    … and {build.total - 5} more")
+        return 0
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        render_worklist(build, source=f"alfred drip build-worklist link001"),
+        encoding="utf-8",
+    )
+    print(f"  wrote {out}")
+    log.info(
+        "drip.worklist.written",
+        campaign="link001_repair", path=str(out), items=build.total,
+        annotate=build.annotate, remove=build.remove,
+    )
+    return 0
+
+
+__all__ = ["cmd_build_worklist", "cmd_run", "cmd_status"]

@@ -724,6 +724,14 @@ def cmd_drip(args: argparse.Namespace) -> None:
             )
         elif subcmd == "status":
             code = dcli.cmd_status(config)
+        elif subcmd == "build-worklist":
+            # Consumes the JANITOR's config, because the work-list is built
+            # from exactly the issue set the janitor reports — #49's
+            # annotation exclusion included, rather than re-derived here.
+            from alfred.janitor.config import load_from_unified as _load_janitor
+            code = dcli.cmd_build_worklist(
+                _load_janitor(raw), out_path=args.out, apply=args.apply,
+            )
         else:
             print(f"Unknown drip subcommand: {subcmd}")
             sys.exit(1)
@@ -5341,6 +5349,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     drip_sub.add_parser("status", help="Show each campaign's progress line")
+    drip_build = drip_sub.add_parser(
+        "build-worklist",
+        help="Build a campaign's FROZEN work-list (dry-run unless --apply)",
+    )
+    drip_build.add_argument(
+        "campaign", choices=["link001"],
+        help="Which work-list to build",
+    )
+    drip_build.add_argument(
+        "--out", required=True,
+        help="Path to write the frozen work-list to (drip.campaigns.<name>."
+             "worklist_path)",
+    )
+    drip_build.add_argument(
+        "--apply", action="store_true",
+        help=(
+            "Actually write the file. Omitted, this previews the counts and "
+            "writes nothing — freezing a branch decision is a commitment, and "
+            "the removal branch is unrecoverable."
+        ),
+    )
 
     # scribe (STAY-C sovereign scribe) — P2-a: attest a clinical_note ai_draft.
     # The ONLY sanctioned path to flip a clinical_note's status/attested_by:
