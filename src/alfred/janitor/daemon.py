@@ -36,8 +36,10 @@ from .context import build_vault_context
 from .autofix import autofix_issues
 from .issues import (
     AUTOFIX_FIXABLE_CODES,
+    COHORT_NOTE_PREFIX,
     FixLogEntry,
     Issue,
+    IssueCode,
     SweepResult,
     Severity,
     classify_counts,
@@ -126,6 +128,35 @@ def _build_affected_records(
     return "\n".join(parts)
 
 
+def _read_cohort_notes(
+    vault_path: Path, issues: list[Issue],
+) -> dict[str, str]:
+    """``rel_path -> janitor_note`` for records carrying a LINK001 (#19-B).
+
+    Bounded by construction: only records that actually have a LINK001 issue
+    are opened, because only those can be cohort members. A parse failure or a
+    missing file yields no entry, which degrades that record to NOT-cohort —
+    the safe direction, since a mis-read would silently shrink the actionable
+    bucket the operator is meant to act on.
+    """
+    paths = {
+        i.file for i in issues if i.code is IssueCode.BROKEN_WIKILINK
+    }
+    notes: dict[str, str] = {}
+    for rel in sorted(paths):
+        full = vault_path / rel
+        if not full.exists():
+            continue
+        try:
+            meta = frontmatter.load(str(full)).metadata or {}
+        except Exception:  # noqa: BLE001 — a bad record is not-cohort, not fatal
+            continue
+        note = str(meta.get("janitor_note") or "")
+        if note.lstrip().startswith(COHORT_NOTE_PREFIX):
+            notes[rel] = note
+    return notes
+
+
 def _record_triage_ids_from_created(
     created_paths: list[str],
     vault_path: Path,
@@ -206,9 +237,16 @@ async def run_sweep(
     # ``result.issues`` and is still reported. This only makes the
     # headline count readable as a janitor-backlog signal instead of
     # conflating two populations.
-    split = classify_counts(issues)
+    # #19-B — the known-debt cohort. Read janitor_note for ONLY the records
+    # carrying a LINK001 (a bounded subset of the issue list, not a vault
+    # walk); the scanner retains no frontmatter, and re-scanning everything to
+    # answer a reporting question would be a real cost for a headline number.
+    cohort_notes = _read_cohort_notes(config.vault.vault_path, issues)
+
+    split = classify_counts(issues, cohort_notes=cohort_notes)
     result.issues_actionable = split["actionable"]
     result.issues_not_janitor_fixable = split["not_janitor_fixable"]
+    result.issues_known_cohort = split["known_cohort"]
 
     # ILB: state the split EVERY sweep, so a large open-issue count is
     # legible at a glance (and so a future refactor that drops the
@@ -219,6 +257,7 @@ async def run_sweep(
         total=split["total"],
         actionable=split["actionable"],
         not_janitor_fixable=split["not_janitor_fixable"],
+        known_cohort=split["known_cohort"],
         detail="not_janitor_fixable are REAL issues that janitor has no "
                "path to fix (DIR001 move-blocked, STUB001 janitor_enrich "
                "scope, ORPHAN001/SEM001-004 flag-only) — reported, never "

@@ -45,6 +45,7 @@ from alfred.janitor.issues import (
     Severity,
     SweepResult,
     classify_counts,
+    is_known_cohort_issue,
 )
 from alfred.janitor.state import JanitorState
 
@@ -114,7 +115,14 @@ def test_classify_counts_splits_and_conserves() -> None:
         _issue(IssueCode.ORPHANED_RECORD),      # not fixable
     ]
     split = classify_counts(issues)
-    assert split == {"actionable": 2, "not_janitor_fixable": 3, "total": 5}
+    # #19-B adds known_cohort — a SUBSET of actionable, so conservation is
+    # unchanged. 0 here: no cohort_notes supplied, which is the honest
+    # default (a caller that has not wired the notes must get 0, not a
+    # guess).
+    assert split == {
+        "actionable": 2, "not_janitor_fixable": 3, "known_cohort": 0,
+        "total": 5,
+    }
 
 
 def test_classify_counts_conserves_across_every_code() -> None:
@@ -132,7 +140,8 @@ def test_classify_counts_conserves_across_every_code() -> None:
 
 def test_classify_counts_empty_is_zeroed() -> None:
     assert classify_counts([]) == {
-        "actionable": 0, "not_janitor_fixable": 0, "total": 0,
+        "actionable": 0, "not_janitor_fixable": 0, "known_cohort": 0,
+        "total": 0,
     }
 
 
@@ -270,3 +279,217 @@ def test_sweep_emits_issue_split_signal(tmp_path: Path) -> None:
     assert ev["actionable"] == result.issues_actionable
     assert ev["not_janitor_fixable"] == result.issues_not_janitor_fixable
     assert ev["total"] == ev["actionable"] + ev["not_janitor_fixable"]
+
+
+# --------------------------------------------------------------------
+# #19-B — the known-debt cohort (D2 ruled)
+# --------------------------------------------------------------------
+
+#: Verbatim shapes taken from the vault, not invented for the test. Measured
+#: over 8,614 records / 1,674 janitor_notes: 1,407 start with ``LINK001``, of
+#: which 1,372 continue with an EM-dash and 35 with no dash at all. Both forms
+#: are fixtures here because an earlier draft keyed on ``"LINK001 --"`` (two
+#: hyphens, a shape that occurs ZERO times) and would have shipped a permanent
+#: "cohort: 0" — green against every hand-written fixture that used the same
+#: wrong string.
+REAL_COHORT_NOTE = "LINK001 — scanner false positive, _bases/contradiction.base exists"
+REAL_COHORT_NOTE_NO_DASH = "LINK001 scanner false positive: _bases/person.base"
+#: 539 of the 1,407 real cohort notes quote a wikilink inside the note prose.
+#: Kept as a predicate fixture but deliberately NOT used in the sweep fixtures
+#: below: the scanner reads wikilinks out of frontmatter VALUES, so a note that
+#: mentions ``[[x]]`` adds its own LINK001 to the record it annotates. That is
+#: a real effect on the live vault, not a test artifact — it just makes a
+#: two-record fixture count three broken links and read as a cohort bug.
+REAL_COHORT_NOTE_WITH_LINK = (
+    "LINK001 — broken links to _docs/* (6 files). [[person/Your Name]]"
+)
+
+
+def test_cohort_matches_the_note_shapes_the_agent_actually_writes() -> None:
+    """The predicate is pinned against REAL note text, both observed forms.
+
+    This is the pin that would have caught the original bug. The cohort marker
+    is prose written by the agent under the SKILL's LINK001 procedure, so its
+    punctuation varies; only the leading issue code is stable — which is also
+    the exact thing the #30 SKILL overwrite-guard keys on ("unless that note
+    starts with LINK001"). Keying on anything more than the code couples this
+    count to the agent's prose style.
+    """
+    link = _issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md")
+    assert is_known_cohort_issue(link, REAL_COHORT_NOTE) is True
+    assert is_known_cohort_issue(link, REAL_COHORT_NOTE_NO_DASH) is True
+    assert is_known_cohort_issue(link, REAL_COHORT_NOTE_WITH_LINK) is True
+    # A different code's note is not a LINK001 cohort marker.
+    assert is_known_cohort_issue(link, "ORPHAN001 — no inbound links") is False
+    # Leading whitespace from a YAML block scalar must not defeat it.
+    assert is_known_cohort_issue(link, "  " + REAL_COHORT_NOTE) is True
+
+
+def test_cohort_is_a_subset_of_actionable_not_a_carve_out() -> None:
+    """The cohort is REPORTED alongside actionable, not removed from it.
+
+    Deliberate: those links are genuinely fixable — the #44 link001_repair
+    campaign drains them — so subtracting them from ``actionable`` would
+    understate what the system can still do. They are broken out because they
+    are known debt on a drain schedule, not because they are unfixable.
+    """
+    issues = [
+        _issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md"),   # cohort
+        _issue(IssueCode.BROKEN_WIKILINK, rel="note/B.md"),   # fresh
+        _issue(IssueCode.WRONG_DIRECTORY, rel="note/C.md"),   # not fixable
+    ]
+    split = classify_counts(
+        issues, cohort_notes={"note/A.md": REAL_COHORT_NOTE},
+    )
+    assert split["known_cohort"] == 1
+    assert split["actionable"] == 2, "cohort stays counted in actionable"
+    assert split["actionable"] + split["not_janitor_fixable"] == split["total"]
+
+
+def test_absent_cohort_notes_yield_zero_not_a_guess() -> None:
+    """A caller that hasn't wired the notes gets the pre-#19-B behaviour.
+    Inferring a cohort from the issue alone would be a fabricated number on the
+    operator's headline line."""
+    issues = [_issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md")]
+    assert classify_counts(issues)["known_cohort"] == 0
+
+
+def test_only_LINK001_can_be_cohort() -> None:
+    """A record carrying the marker does not drag its OTHER issues into the
+    cohort. The cohort is a LINK001 backlog; admitting other codes would
+    quietly shrink the actionable bucket for reasons nobody asked for."""
+    assert is_known_cohort_issue(
+        _issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md"), REAL_COHORT_NOTE,
+    ) is True
+    assert is_known_cohort_issue(
+        _issue(IssueCode.WRONG_DIRECTORY, rel="note/A.md"), REAL_COHORT_NOTE,
+    ) is False
+
+
+def test_a_fresh_link001_is_not_cohort() -> None:
+    """The whole point: a NEW break on a record with no marker must stay
+    visible as actionable-today rather than being absorbed into the backlog."""
+    fresh = _issue(IssueCode.BROKEN_WIKILINK, rel="note/New.md")
+    assert is_known_cohort_issue(fresh, None) is False
+    assert is_known_cohort_issue(fresh, "") is False
+    assert is_known_cohort_issue(fresh, "STUB001 — something else") is False
+
+
+def _sweep_with_one_marked_and_one_fresh_break(tmp_path: Path):
+    """A vault with two dangling links: one already triaged, one brand new.
+
+    Both point at the same nonexistent target, so the ONLY difference between
+    them is the janitor_note. That is what makes the fixture discriminating —
+    a build that counted every LINK001 as cohort, or none of them, gives the
+    same wrong answer on a vault where the two populations differ in any other
+    way.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_record(
+        vault, "note/Triaged.md",
+        dedent(
+            f"""\
+            type: note
+            name: Triaged
+            status: active
+            created: 2026-01-01
+            tags: []
+            janitor_note: "{REAL_COHORT_NOTE}"
+            """
+        ).rstrip(),
+        body="Refers to [[note/Ghost]].",
+    )
+    _write_record(
+        vault, "note/Fresh.md",
+        dedent(
+            """\
+            type: note
+            name: Fresh
+            status: active
+            created: 2026-01-01
+            tags: []
+            """
+        ).rstrip(),
+        body="Refers to [[note/Ghost]].",
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    config = _build_config(vault, state_dir)
+    state = JanitorState(config.state.path, config.state.max_sweep_history)
+    skills_dir = tmp_path / "skills"
+    (skills_dir / "vault-janitor").mkdir(parents=True)
+    (skills_dir / "vault-janitor" / "SKILL.md").write_text("# t\n", encoding="utf-8")
+    return config, state, skills_dir
+
+
+def test_cohort_count_is_wired_through_run_sweep(tmp_path: Path) -> None:
+    """END-TO-END through the production entry point — the load-bearing pin.
+
+    ``classify_counts(cohort_notes=...)`` defaults to ``None``, which means
+    every unit test above passes just as happily against a build where
+    ``run_sweep`` never reads a single janitor_note and the operator's cohort
+    line is a permanent 0. Only a sweep driven from a real vault proves the
+    notes are actually read and threaded. (Same failure shape as the R3 snooze
+    gate: write side live, read side dead, all per-layer pins green.)
+    """
+    from alfred.janitor import daemon as daemon_mod
+
+    config, state, skills_dir = _sweep_with_one_marked_and_one_fresh_break(tmp_path)
+    result = asyncio.run(
+        daemon_mod.run_sweep(config, state, skills_dir, structural_only=True)
+    )
+
+    broken = [i for i in result.issues if i.code == IssueCode.BROKEN_WIKILINK]
+    assert len(broken) == 2, f"fixture must produce 2 LINK001, got {len(broken)}"
+    assert result.issues_known_cohort == 1, (
+        "exactly the triaged record is cohort — a 0 here means run_sweep never "
+        "read the notes; a 2 means the marker is being ignored"
+    )
+    # Still a subset of actionable, and conservation is untouched.
+    assert result.issues_known_cohort <= result.issues_actionable
+    assert (
+        result.issues_actionable + result.issues_not_janitor_fixable
+        == result.issues_found
+    )
+
+
+def test_sweep_signal_carries_the_cohort_field(tmp_path: Path) -> None:
+    """ILB: the cohort is stated in the same breath as the rest of the split.
+
+    Pins the field NAME as well as its presence — the operator greps this line,
+    and a rename that only tests-by-value would sail through.
+    """
+    from alfred.janitor import daemon as daemon_mod
+
+    config, state, skills_dir = _sweep_with_one_marked_and_one_fresh_break(tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        result = asyncio.run(
+            daemon_mod.run_sweep(config, state, skills_dir, structural_only=True)
+        )
+
+    matches = [c for c in captured if c.get("event") == "sweep.issue_split"]
+    assert len(matches) == 1
+    assert matches[0]["known_cohort"] == result.issues_known_cohort == 1
+
+
+def test_unreadable_record_degrades_to_not_cohort(tmp_path: Path) -> None:
+    """A record whose frontmatter will not parse is NOT counted as cohort.
+
+    The safe direction: a mis-read that inflated the cohort would shrink the
+    actionable bucket the operator is meant to act on, which is the exact
+    failure this feature exists to prevent. Degrading the other way only
+    over-reports work.
+    """
+    from alfred.janitor import daemon as daemon_mod
+
+    config, state, skills_dir = _sweep_with_one_marked_and_one_fresh_break(tmp_path)
+    # Corrupt the triaged record's frontmatter, keeping the dangling link.
+    (config.vault.vault_path / "note" / "Triaged.md").write_text(
+        "---\ntype: note\nname: Triaged\n  bad: [unclosed\n---\n[[note/Ghost]]\n",
+        encoding="utf-8",
+    )
+    result = asyncio.run(
+        daemon_mod.run_sweep(config, state, skills_dir, structural_only=True)
+    )
+    assert result.issues_known_cohort == 0
