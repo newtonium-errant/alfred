@@ -262,6 +262,20 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
     second chance through :func:`_rescue_correction`, because ``difflib``
     coalesces a correction with any edit beside it — see that function for why
     the whole-span and rescued-fragment bars deliberately differ.
+
+    **THE GATE FILTERS EXTRACTION, NEVER THE CORPUS.** The full (transcript,
+    sent) pair is stored unconditionally at capture time; only the mining of
+    TERMS from it is gated here. That separation is deliberate and it is what
+    makes these thresholds safe to hold loosely: every span this function
+    refuses is still on disk, so a better extractor run later recovers what a
+    heuristic dropped today. Nothing is ever permanently lost to a judgment call
+    — which is also the precondition for tuning the gate itself, per the
+    self-correcting standard.
+
+    A refused span therefore logs at DEBUG rather than louder: it is a
+    diagnostic for "is the gate too tight?", not a data-loss warning, because
+    the data is not lost. Lengths and the score are recorded, never the text —
+    these are the operator's own words.
     """
     heard_words = _words(transcript)
     sent_words = _words(sent)
@@ -284,12 +298,33 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
         meant = " ".join(span_meant)
         if not heard or not meant or heard.casefold() == meant.casefold():
             continue
-        if _similarity(heard, meant) >= MIN_SPAN_SIMILARITY:
+        score = _similarity(heard, meant)
+        if score >= MIN_SPAN_SIMILARITY:
             out.append((heard, meant))
             continue
         rescued = _rescue_correction(span_heard, span_meant)
         if rescued is not None:
             out.append(rescued)
+            continue
+        # ILB on the drop. The gate is a judgment, so how often it fires has to
+        # be answerable — "the loop stopped proposing" and "the gate got too
+        # tight" must not look the same. DEBUG because the pair itself is
+        # retained in the corpus (see the docstring), so this is a tuning
+        # signal, not a loss warning. Lengths and the score only: the spans are
+        # the operator's own words and do not belong in a log line.
+        log.debug(
+            "stt.vocab_span_rejected",
+            heard_words=len(span_heard),
+            meant_words=len(span_meant),
+            heard_len=len(heard),
+            meant_len=len(meant),
+            score=round(score, 3),
+            span_floor=MIN_SPAN_SIMILARITY,
+            rescue_floor=MIN_RESCUED_SIMILARITY,
+            detail="replace span too dissimilar to be a mis-hearing, and no "
+                   "tighter fragment inside it — the pair is still in the "
+                   "corpus and re-minable",
+        )
     return out
 
 

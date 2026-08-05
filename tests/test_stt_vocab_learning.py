@@ -548,3 +548,64 @@ def test_the_effective_vocabulary_still_fits_the_prompt_window(tmp_path: Path) -
     assert [
         c for c in captured if c.get("event") == "stt.vocab_prompt_truncated"
     ] == []
+
+
+# ---------------------------------------------------------------------------
+# The gate is a JUDGMENT, so it has to be observable and it must not be
+# destructive. Two properties, pinned separately.
+# ---------------------------------------------------------------------------
+
+
+def test_a_rejected_span_is_logged_so_over_dropping_is_visible() -> None:
+    """ILB on the drop. "the loop stopped proposing" and "the gate got too
+    tight" must not look identical from the outside."""
+    with structlog.testing.capture_logs() as captured:
+        assert extract_term_corrections("one two three", "completely different words") == []
+
+    events = [c for c in captured if c.get("event") == "stt.vocab_span_rejected"]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["score"] < ev["span_floor"]
+    assert ev["heard_words"] == 3 and ev["meant_words"] == 3
+
+
+def test_the_rejection_log_carries_no_transcript_TEXT() -> None:
+    """The spans are the operator's own words. Lengths and a score are enough to
+    tune a threshold; the content is not the log's business."""
+    with structlog.testing.capture_logs() as captured:
+        extract_term_corrections("send it now", "cancel that please")
+
+    events = [c for c in captured if c.get("event") == "stt.vocab_span_rejected"]
+    assert len(events) == 1
+    rendered = " ".join(str(v) for v in events[0].values())
+    for secret_ish in ("send", "cancel", "please", "now"):
+        assert secret_ish not in rendered
+
+
+def test_a_span_the_gate_REFUSES_is_still_retained_in_the_corpus(
+    tmp_path: Path,
+) -> None:
+    """The gate filters EXTRACTION, never the corpus. This is what makes the
+    thresholds safe to hold loosely: a better extractor run later recovers
+    whatever a heuristic dropped today, so no operator correction is ever
+    permanently lost to a judgment call."""
+    corpus = tmp_path / "c.jsonl"
+    pair = _pair("one two three", "completely different words")
+    append_correction_pair(corpus, pair)
+
+    # Extraction refuses it...
+    assert extract_term_corrections(pair.transcript, pair.sent) == []
+    # ...and it is on disk regardless, in full.
+    rows = list(iter_correction_pairs(corpus))
+    assert len(rows) == 1
+    assert rows[0].transcript == "one two three"
+    assert rows[0].sent == "completely different words"
+
+
+def test_a_REORDER_recovers_the_term_rather_than_mining_the_move() -> None:
+    """Measured behaviour on the reorder case: the operator did mean "tractor",
+    and the tightest fragment in the span says so. The move itself is not a
+    vocabulary term and is not proposed."""
+    assert extract_term_corrections(
+        "the chicken tracker needs cleaning", "needs cleaning the chicken tractor",
+    ) == [("tracker", "tractor")]
