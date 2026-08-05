@@ -110,7 +110,7 @@ def peek_last_batch_count() -> int:
 def _format_item(item: SttVocabItem) -> str:
     """Render one proposal as a numbered line.
 
-    ``N. "term" — corrected 3x (heard "a", "b")``
+    ``N. "term" — corrected 2× (heard "a", "b")``
 
     The count leads because it is the whole argument for the term: the operator
     is being told how often he has already fixed this by hand.
@@ -165,12 +165,19 @@ def stt_vocab_section(
     decided = load_decisions(sv.vocab_decided_path)
     pairs = list(iter_correction_pairs(sv.vocab_corpus_path))
 
+    # The cap passed here is the REMAINING budget, not the total. Offering 20
+    # proposals when 18 learned terms already exist would be offering two the
+    # operator can act on and eighteen ``apply_approved_terms`` will silently
+    # drop — a card that asks for decisions it cannot honour. The cumulative cap
+    # is enforced at approval time regardless; this just stops the surface
+    # promising past it.
+    remaining_budget = max(0, MAX_LEARNED_TERMS - n_learned)
     proposals = propose_vocab_additions(
         pairs,
         current_vocab=current,
         decided=decided,
         min_count=MIN_CORRECTION_COUNT,
-        max_learned=MAX_LEARNED_TERMS,
+        max_learned=remaining_budget,
     )
 
     items = [
@@ -200,10 +207,22 @@ def stt_vocab_section(
             corpus_path=sv.vocab_corpus_path,
             detail="ran, nothing to propose",
         )
-        if not pairs:
+        if remaining_budget == 0:
+            # AT CAP is a third quiet case, and conflating it with "nothing to
+            # propose" would be the worst of the three to get wrong: the operator
+            # would read "no patterns found" while real recurring corrections sit
+            # unproposed behind a full budget he could free in one command.
+            why = (
+                f"The learned-vocabulary budget is full "
+                f"({n_learned}/{MAX_LEARNED_TERMS}) — no new terms are being "
+                f"proposed. Reject a learned term to free a slot: "
+                f"`alfred stt-vocab reject \"<term>\" --operator <name>`."
+            )
+        elif not pairs:
             why = (
                 "No speech corrections recorded yet — nothing to propose. "
-                "(If this stays empty, check `talker.stt.vocab_learning_enabled`.)"
+                "(If this stays empty, check `telegram.stt.vocab_learning_enabled` "
+                "in your config.)"
             )
         else:
             # Deliberately does NOT name one reason. Three different things

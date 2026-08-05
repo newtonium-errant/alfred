@@ -299,7 +299,7 @@ async def fire_once(
     # #54 — learned-speech-vocabulary proposals (PROPOSE-ONLY, read-only).
     # Registered unconditionally; the provider returns None when
     # ``stt_vocab.enabled`` is False. Needs no vault path and no raw config —
-    # both stores are plain JSONL paths derived from ``talker.stt`` at config
+    # both stores are plain JSONL paths derived from ``telegram.stt`` at config
     # load time. Mutation is the CLI's (`alfred stt-vocab approve|reject`), so
     # rendering this card can never change what biases transcription.
     stt_vocab_section.register()

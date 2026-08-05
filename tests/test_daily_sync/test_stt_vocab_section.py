@@ -53,9 +53,21 @@ def _write_corpus(path, rows):
 
 
 def _raw(tmp_path, *, enabled=True, terms=("Algernon", "KAL-LE"), extra=None):
-    """A unified config whose talker.stt points at tmp_path stores."""
+    """A production-shaped unified config whose telegram.stt points at tmp_path."""
     raw = {
-        "talker": {
+        # The SCHEMA's key is ``telegram`` (telegram/config.py reads
+        # raw.get("telegram"), config.yaml.example ships ``telegram:``). The
+        # first version of this fixture said ``talker`` — matching the shape the
+        # code READ rather than the shape the schema DEFINES — so the whole
+        # family agreed with the bug and every assertion below passed against a
+        # derive that never fired on a real config. Carries the fields
+        # telegram.config itself requires (bot_token / allowed_users /
+        # instance.name) so ONE dict can drive BOTH loaders.
+        "vault": {"path": "./vault"},
+        "telegram": {
+            "bot_token": "DUMMY_TELEGRAM_TEST_TOKEN",
+            "allowed_users": [1],
+            "instance": {"name": "test-instance"},
             "stt": {
                 "vocab_terms": list(terms),
                 "vocab_learning_enabled": True,
@@ -86,7 +98,63 @@ def test_derives_paths_and_terms_from_the_talker_config(tmp_path):
     assert cfg.vocab_terms == ["Algernon", "KAL-LE"]
 
 
-def test_absent_talker_block_falls_back_to_the_shared_constants(tmp_path):
+def test_BOTH_loaders_agree_on_one_production_shaped_config(tmp_path):
+    """The pin that would have caught the wrong-key bug, and the only one that could.
+
+    Every other derive test here hands in a dict THIS FILE wrote, so a fixture
+    keyed to the shape the code happened to read made the whole family agree
+    with the bug: the derive "worked" on `talker`, and `telegram.config` — the
+    real write side — silently saw nothing. Twenty-eight green tests said the
+    read and write sides agreed while on any real config they disagreed about
+    every field.
+
+    The fix is to stop letting one side define the schema. This drives BOTH REAL
+    LOADERS over ONE raw dict shaped like config.yaml.example and asserts the
+    three fields match. It cannot go green while the two loaders read different
+    top-level keys, whatever any fixture claims — the write side is no longer
+    something this file can assert into existence.
+    """
+    from alfred.telegram.config import load_from_unified as load_talker
+
+    corpus = str(tmp_path / "CUSTOM_corrections.jsonl")
+    decided = str(tmp_path / "CUSTOM_decided.jsonl")
+    terms = ["chicken tractor", "front run"]
+    raw = _raw(tmp_path)
+    raw["telegram"]["stt"].update({
+        "vocab_corpus_path": corpus,
+        "vocab_decided_path": decided,
+        "vocab_terms": terms,
+    })
+
+    # WRITE side: what the web capture route and the STT chain actually use.
+    write = load_talker(raw).stt
+    # READ side: what the review card and the operator CLI actually use.
+    read = load_from_unified(raw).stt_vocab
+
+    assert write.vocab_corpus_path == read.vocab_corpus_path == corpus
+    assert write.vocab_decided_path == read.vocab_decided_path == decided
+    assert list(write.vocab_terms) == list(read.vocab_terms) == terms
+
+
+def test_both_loaders_agree_on_the_DEFAULTS_too(tmp_path):
+    """The same agreement where nothing is overridden. A shared fallback constant
+    can hide a key mismatch — both sides land on the default and look identical —
+    so the override case above is the load-bearing one and this is the floor:
+    they must not diverge even when neither side was configured."""
+    from alfred.telegram.config import load_from_unified as load_talker
+
+    raw = _raw(tmp_path)
+    for k in ("vocab_corpus_path", "vocab_decided_path", "vocab_terms"):
+        raw["telegram"]["stt"].pop(k, None)
+
+    write = load_talker(raw).stt
+    read = load_from_unified(raw).stt_vocab
+    assert write.vocab_corpus_path == read.vocab_corpus_path
+    assert write.vocab_decided_path == read.vocab_decided_path
+    assert list(write.vocab_terms) == list(read.vocab_terms)
+
+
+def test_absent_telegram_block_falls_back_to_the_shared_constants(tmp_path):
     # The same constants the talker itself defaults to, so the no-override case
     # still agrees rather than silently reading a different file.
     cfg = load_from_unified({"daily_sync": {"enabled": True, "stt_vocab": {"enabled": True}}})
@@ -106,11 +174,11 @@ def test_explicit_daily_sync_override_wins_over_the_derive(tmp_path):
 def test_derive_survives_a_config_with_no_instance_block(tmp_path):
     # REGRESSION. The first cut built a whole TalkerConfig to read three fields;
     # `telegram.config.load_from_unified` requires `instance.name`, so a config
-    # carrying talker.stt but no instance block raised — and the fallback then
+    # carrying telegram.stt but no instance block raised — and the fallback then
     # pointed this section at the DEFAULT paths while capture wrote the
     # overridden ones. A read side and a write side disagreeing in silence.
     raw = _raw(tmp_path)
-    assert "instance" not in raw
+    del raw["telegram"]["instance"]
     cfg = load_from_unified(raw).stt_vocab
     assert cfg.vocab_corpus_path == str(tmp_path / "corrections.jsonl")
 
@@ -119,7 +187,7 @@ def test_env_substitution_still_applies_to_a_derived_path(tmp_path, monkeypatch)
     # The derive reads `raw` AFTER _substitute_env, so a ${VAR} path resolves.
     monkeypatch.setenv("STT_TEST_DIR", str(tmp_path))
     raw = _raw(tmp_path)
-    raw["talker"]["stt"]["vocab_corpus_path"] = "${STT_TEST_DIR}/from-env.jsonl"
+    raw["telegram"]["stt"]["vocab_corpus_path"] = "${STT_TEST_DIR}/from-env.jsonl"
     cfg = load_from_unified(raw).stt_vocab
     assert cfg.vocab_corpus_path == f"{tmp_path}/from-env.jsonl"
 
@@ -439,3 +507,102 @@ async def test_fire_once_actually_renders_the_card(tmp_path, monkeypatch):
     body = "\n".join(sent)
     assert "Speech vocabulary review" in body
     assert "“tractor” — corrected 2×" in body
+
+
+# ---------------------------------------------------------------------------
+# NOTE-3 — the cap offered is the REMAINING budget, not the total
+# ---------------------------------------------------------------------------
+
+
+def _approve_many(decided_path, n, prefix="learned"):
+    """Fill the learned store with n approved terms."""
+    from alfred.telegram.stt_vocab_learning import (
+        DECISION_APPROVE, VocabDecision, append_decision,
+    )
+    for i in range(n):
+        append_decision(decided_path, VocabDecision(
+            type=DECISION_APPROVE, term=f"{prefix}{i:03d}",
+        ))
+
+
+def test_at_cap_the_card_says_the_budget_is_full_not_nothing_to_propose(tmp_path):
+    """The worst of the three quiet cases to get wrong. At cap the operator would
+    otherwise read "no patterns found" while real recurring corrections sit
+    unproposed behind a budget he could free with one command."""
+    from alfred.telegram.stt_vocab_learning import MAX_LEARNED_TERMS
+
+    _write_corpus(tmp_path / "corrections.jsonl", TRACTOR_PAIRS)
+    _approve_many(tmp_path / "decided.jsonl", MAX_LEARNED_TERMS)
+
+    out = stt_vocab_section(_cfg(tmp_path), TODAY)
+    assert "budget is full" in out
+    assert f"{MAX_LEARNED_TERMS}/{MAX_LEARNED_TERMS}" in out
+    # It names the way OUT, not just the wall.
+    assert "reject" in out.lower()
+    # And it must NOT claim there was nothing worth proposing.
+    assert "nothing new to propose" not in out
+
+
+def test_below_cap_the_offer_is_trimmed_to_what_can_be_honoured(tmp_path):
+    """With one slot left, one proposal may surface — not the twenty the total cap
+    would allow, nineteen of which `apply_approved_terms` would drop on arrival."""
+    from alfred.telegram.stt_vocab_learning import MAX_LEARNED_TERMS
+
+    pairs = []
+    for i in range(5):
+        pairs += [{"transcript": f"word heard{i:03d} here", "sent": f"word meant{i:03d} here"}] * 2
+    _write_corpus(tmp_path / "corrections.jsonl", pairs)
+    _approve_many(tmp_path / "decided.jsonl", MAX_LEARNED_TERMS - 1)
+
+    out = stt_vocab_section(_cfg(tmp_path), TODAY)
+    assert "(1 proposal)" in out
+
+
+def test_the_cli_list_also_reports_at_cap_rather_than_going_quiet(tmp_path, capsys):
+    """Both surfaces, one message — the card and the CLI must not disagree about
+    why the list is empty."""
+    from alfred.telegram.stt_vocab_learning import MAX_LEARNED_TERMS
+
+    _write_corpus(tmp_path / "corrections.jsonl", TRACTOR_PAIRS)
+    _approve_many(tmp_path / "decided.jsonl", MAX_LEARNED_TERMS)
+    _run(tmp_path, ["stt-vocab", "list"])
+    out = capsys.readouterr().out
+    assert "budget is full" in out
+    assert "reject" in out.lower()
+
+
+def test_the_cli_json_reports_the_remaining_budget(tmp_path, capsys):
+    from alfred.telegram.stt_vocab_learning import MAX_LEARNED_TERMS
+
+    _approve_many(tmp_path / "decided.jsonl", 3)
+    _run(tmp_path, ["stt-vocab", "list", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["max_learned"] == MAX_LEARNED_TERMS
+    assert payload["learned_remaining"] == MAX_LEARNED_TERMS - 3
+
+
+def test_the_cli_writes_NOTHING_at_the_default_store_paths(tmp_path, monkeypatch):
+    """Debris pin. The wrong-key bug had a second symptom nobody was looking for:
+    with the derive reading a key that did not exist, every CLI test fell back to
+    the SHIPPED default paths and appended real decisions into the repo's own
+    `data/stt_vocab_decided.jsonl`. That file is gitignored, so the tree looked
+    clean — and it silently poisoned an unrelated suite
+    (`test_web_stt_shadow_config_gate`, which reads the default store through
+    `effective_vocab_terms` and suddenly saw a learned "tractor").
+
+    "Did it write the right file" is the wrong question; "did it touch anything
+    out there" is the right one. Runs from a CWD of its own so a relative default
+    path would land somewhere observable, and asserts it did not.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir(exist_ok=True)
+    _write_corpus(tmp_path / "corrections.jsonl", TRACTOR_PAIRS)
+
+    _run(tmp_path, ["stt-vocab", "approve", "tractor", "--operator", "andrew"])
+
+    # The decision landed in the CONFIGURED store...
+    assert (tmp_path / "decided.jsonl").exists()
+    # ...and nothing appeared at either shipped default, relative to this CWD.
+    assert not (tmp_path / DEFAULT_STT_VOCAB_DECIDED_PATH).exists()
+    assert not (tmp_path / DEFAULT_STT_VOCAB_CORPUS_PATH).exists()
+    assert list((tmp_path / "data").iterdir()) == []

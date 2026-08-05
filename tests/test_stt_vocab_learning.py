@@ -25,6 +25,7 @@ from alfred.telegram.stt_vocab_learning import (
     DECISION_APPROVE,
     DECISION_REJECT,
     MAX_LEARNED_TERMS,
+    MAX_TERM_WORDS,
     MIN_CORRECTION_COUNT,
     CorrectionPair,
     VocabDecision,
@@ -642,7 +643,7 @@ def test_the_plain_extractor_still_returns_a_bare_list() -> None:
     assert out == [("tracker", "tractor")]
 
 
-def test_the_batch_summary_carries_the_gate_rejected_aggregate() -> None:
+def test_the_batch_summary_carries_the_spans_refused_aggregate() -> None:
     """The operator's grep gets ONE number per pass at INFO, without having to
     turn on DEBUG and count per-span lines."""
     pairs = [
@@ -655,7 +656,7 @@ def test_the_batch_summary_carries_the_gate_rejected_aggregate() -> None:
 
     events = [c for c in captured if c.get("event") == "stt.vocab_proposals.computed"]
     assert len(events) == 1
-    assert events[0]["gate_rejected_spans"] == 2
+    assert events[0]["spans_refused"] == 2
 
 
 def test_the_aggregate_is_emitted_even_when_it_is_zero() -> None:
@@ -667,7 +668,7 @@ def test_the_aggregate_is_emitted_even_when_it_is_zero() -> None:
 
     events = [c for c in captured if c.get("event") == "stt.vocab_proposals.computed"]
     assert len(events) == 1
-    assert events[0]["gate_rejected_spans"] == 0
+    assert events[0]["spans_refused"] == 0
     assert events[0]["detail"] == "ran, nothing to propose"
 
 
@@ -684,3 +685,80 @@ def test_the_aggregate_stays_a_COUNT_and_never_carries_span_text() -> None:
     rendered = " ".join(str(v) for v in events[0].values())
     for word in ("send", "cancel", "please", "now"):
         assert word not in rendered
+
+
+# ---------------------------------------------------------------------------
+# WARN-2 — an over-long span must not eat the correction hiding inside it
+# ---------------------------------------------------------------------------
+
+
+def test_an_over_long_span_still_yields_its_rescued_term() -> None:
+    """The bug this closes, in one fixture: editing a word AND adding an
+    afterthought in the same pass is ordinary, and difflib coalesces the two into
+    one long span. Dropping that span whole lost the correction ENTIRELY — and
+    invisibly, because the drop happened before the counter as well as before the
+    rescue, so the aggregate read zero while a real correction was discarded."""
+    out, refused = extract_term_corrections_with_stats(
+        "clean the chicken tracker",
+        "clean the chicken tractor today if you get a chance",
+    )
+    assert out == [("tracker", "tractor")]
+    # Recovered, so nothing was refused — the count must not charge for a span it
+    # successfully mined.
+    assert refused == 0
+
+
+def test_the_rescued_term_from_a_long_span_is_still_bounded() -> None:
+    """The never-propose-a-clause guarantee survives the change. The rescue only
+    considers sub-spans of at most MAX_TERM_WORDS and refuses the whole span by
+    construction, so no clause can come back through this door."""
+    out, _refused = extract_term_corrections_with_stats(
+        "clean the chicken tracker",
+        "clean the chicken tractor today if you get a chance",
+    )
+    for heard, meant in out:
+        assert len(heard.split()) <= MAX_TERM_WORDS
+        assert len(meant.split()) <= MAX_TERM_WORDS
+
+
+def test_an_over_long_span_with_nothing_rescuable_is_counted_and_reasoned() -> None:
+    """Still refused when there is genuinely no term inside — but now COUNTED,
+    and labelled so the aggregate can be broken down."""
+    with structlog.testing.capture_logs() as captured:
+        out, refused = extract_term_corrections_with_stats(
+            "one two three", "completely different words entirely plus more text here",
+        )
+    assert out == []
+    assert refused == 1
+    events = [c for c in captured if c.get("event") == "stt.vocab_span_rejected"]
+    assert len(events) == 1
+    assert events[0]["reason"] == "length"
+
+
+def test_a_similarity_refusal_is_labelled_as_such() -> None:
+    """The other reason, distinguishable. Both refusals leave an identical
+    absence in the output, so without ``reason`` "the gate is too tight" could
+    not be told apart from "he writes long afterthoughts"."""
+    with structlog.testing.capture_logs() as captured:
+        _out, refused = extract_term_corrections_with_stats(
+            "one two three", "completely different words",
+        )
+    assert refused == 1
+    events = [c for c in captured if c.get("event") == "stt.vocab_span_rejected"]
+    assert events[0]["reason"] == "similarity"
+
+
+def test_the_aggregate_covers_BOTH_refusal_reasons() -> None:
+    """The name change earns itself here: one refusal of each kind, counted
+    together, because a number covering only the similarity gate would answer a
+    narrower question than the operator asked."""
+    pairs = [
+        _pair("one two three", "completely different words"),                        # similarity
+        _pair("one two three", "completely different words entirely plus more here"),  # length
+        _pair("clean the chicken tracker", "clean the chicken tractor"),             # accepted
+    ]
+    with structlog.testing.capture_logs() as captured:
+        propose_vocab_additions(pairs, current_vocab=[])
+    events = [c for c in captured if c.get("event") == "stt.vocab_proposals.computed"]
+    assert len(events) == 1
+    assert events[0]["spans_refused"] == 2

@@ -1134,12 +1134,12 @@ daily_sync:
   # from the CLI (`alfred stt-vocab list|approve|reject`); rendering this card
   # never changes what biases transcription.
   #
-  # A SEPARATE switch from `talker.stt.vocab_learning_enabled`, which gates
+  # A SEPARATE switch from `telegram.stt.vocab_learning_enabled`, which gates
   # CAPTURE. Two different decisions — "may it record my messages" and "show me
   # the proposals" — so an instance can capture quietly for a while and turn the
   # card on later without losing anything; the corpus keeps accumulating.
   #
-  # The two store paths and the shipped term list are DERIVED from `talker.stt`
+  # The two store paths and the shipped term list are DERIVED from `telegram.stt`
   # at load time, so the side that writes and the side that reads cannot drift.
   # Override any of them here only if you genuinely want them split.
   # stt_vocab:

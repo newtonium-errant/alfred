@@ -235,7 +235,7 @@ class SttVocabConfig:
     """#54 — learned-speech-vocabulary review surface (Daily Sync).
 
     ``enabled`` defaults OFF, like every other judgment surface. It is a
-    SEPARATE switch from ``talker.stt.vocab_learning_enabled``: that one gates
+    SEPARATE switch from ``telegram.stt.vocab_learning_enabled``: that one gates
     CAPTURE (writing the operator's message text to a corpus), this one gates
     the morning REVIEW card. An instance that captures but has not turned this
     on simply accumulates corrections until it does — nothing is lost, and the
@@ -254,7 +254,7 @@ class SttVocabConfig:
     WRITES the decided store; this section READS both — they MUST be the same
     files. Rather than hold independently-defaulted duplicates that drift the
     moment an operator overrides the talker side, :func:`load_from_unified`
-    DERIVES all three fields from ``talker.stt`` at load time. An explicit
+    DERIVES all three fields from ``telegram.stt`` at load time. An explicit
     ``daily_sync.stt_vocab.<field>`` still wins (an intentional, non-silent split).
     """
 
@@ -362,7 +362,7 @@ class DailySyncConfig:
     )
     # #54 — learned-speech-vocabulary proposals. Defaulted-OFF; an instance opts
     # in via ``daily_sync.stt_vocab.enabled: true``. Paths + static terms are
-    # derived from ``talker.stt`` at load time (see SttVocabConfig).
+    # derived from ``telegram.stt`` at load time (see SttVocabConfig).
     stt_vocab: SttVocabConfig = field(
         default_factory=SttVocabConfig,
     )
@@ -479,7 +479,7 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
             )
     # #54 — single-source the STT vocabulary fields from the talker config, the
     # same contract routine_match holds above. The web chat route WRITES the
-    # corpus and the CLI WRITES the decided store off ``talker.stt``; this
+    # corpus and the CLI WRITES the decided store off ``telegram.stt``; this
     # section READS both, and the static term list is what the review card shows
     # the operator he is growing. Three values that must agree across two config
     # blocks, so they are DERIVED rather than independently defaulted. An
@@ -489,15 +489,26 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
     def _sv_explicit(field_name: str) -> bool:
         return isinstance(sv_section, dict) and field_name in sv_section
 
-    # Read the ``talker.stt`` BLOCK directly rather than building a whole
+    # Read the ``telegram.stt`` BLOCK directly rather than building a whole
     # TalkerConfig. Measured, not assumed: ``telegram.config.load_from_unified``
-    # requires an ``instance.name``, so on a config that has a talker.stt block
-    # but no instance block it raises — and the fallback would silently point
-    # this section at the DEFAULT paths while capture wrote the overridden ones.
+    # requires an ``instance.name``, so on a config that has an stt block but no
+    # instance block it raises — and the fallback would silently point this
+    # section at the DEFAULT paths while capture wrote the overridden ones.
     # Reading three keys cannot fail that way, and ``raw`` is already
     # env-substituted above, so ``${VAR}`` paths still resolve.
-    _talker = raw.get("talker")
-    _talker_stt = (_talker.get("stt") if isinstance(_talker, dict) else None) or {}
+    #
+    # THE KEY IS ``telegram``, NOT ``talker``. The tool is *called* the talker,
+    # its config block is not: ``telegram.config.load_from_unified`` reads
+    # ``raw.get("telegram")`` and config.yaml.example ships ``telegram:``. The
+    # first cut read ``raw.get("talker")``, which never exists — so this derive
+    # silently returned defaults on every real config, and capture wrote one
+    # path while the review card read another. Exactly the drift this
+    # single-source contract exists to prevent, introduced by the contract
+    # itself. The both-loaders-agree pin in test_stt_vocab_section.py is what
+    # holds it now: it drives BOTH real loaders over ONE raw dict, so no fixture
+    # of mine can define the schema into agreement with my own mistake.
+    _telegram = raw.get("telegram")
+    _talker_stt = (_telegram.get("stt") if isinstance(_telegram, dict) else None) or {}
     if not isinstance(_talker_stt, dict):
         _talker_stt = {}
     # The talker's OWN defaults, so an instance that sets no stt block still

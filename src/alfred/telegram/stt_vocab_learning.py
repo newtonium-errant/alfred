@@ -9,7 +9,7 @@ already exists rather than inventing a parallel one.
    INSERTED and the text as SENT. If the operator edited it, the difference is a
    correction — free supervision nobody had to be asked for.
 2. **Propose.** Recurring TERM-level corrections surface at morning review with
-   counts ("'front run' corrected 3x — add to vocabulary?").
+   counts ("'front run' corrected 2× — add to vocabulary?").
 3. **Approve.** On the operator's yes, the term is recorded in the decided store
    and from then on it is UNIONED onto the static ``talker.stt.vocab_terms`` by
    :func:`effective_vocab_terms` — the one accessor every consumer of vocabulary
@@ -255,13 +255,19 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
 def extract_term_corrections_with_stats(
     transcript: str, sent: str,
 ) -> tuple[list[tuple[str, str]], int]:
-    """``(corrections, gate_rejected_span_count)``.
+    """``(corrections, spans_refused)``.
 
     Identical extraction to :func:`extract_term_corrections`, additionally
-    reporting how many ``replace`` spans the similarity gate turned down. The
-    per-span DEBUG line answers "why was THIS one refused"; the count answers
-    "how often is the gate firing at all", which is a batch-level question and
-    so cannot be answered from inside the per-pair loop.
+    reporting how many ``replace`` spans yielded no term at all — for EITHER
+    reason: too dissimilar to be a mis-hearing (``reason="similarity"``) or too
+    long to be a vocabulary term (``reason="length"``), in both cases with no
+    tighter fragment inside worth rescuing. The count is deliberately the union
+    rather than the similarity gate alone: both refusals leave an identical
+    absence in the output, so a number covering only one of them would answer a
+    narrower question than the operator is asking. The per-span DEBUG line
+    carries ``reason`` for the breakdown; the count answers "how often did a span
+    yield nothing", which is a batch-level question and so cannot be answered
+    from inside the per-pair loop.
 
     A separate function rather than a widened return, so the existing callers
     (:func:`propose_vocab_additions` aside, the web capture site) keep their
@@ -273,9 +279,14 @@ def extract_term_corrections_with_stats(
     thought, not a correction), and text they DELETED tells us nothing about what
     should have been recognised instead.
 
-    Spans longer than :data:`MAX_TERM_WORDS` are dropped — a five-word
-    replacement is the operator rewriting a sentence, and biasing the model
-    toward a whole clause is not vocabulary.
+    Spans longer than :data:`MAX_TERM_WORDS` are never proposed WHOLE — a
+    five-word replacement is the operator rewriting a sentence, and biasing the
+    model toward a whole clause is not vocabulary. They are not discarded
+    unexamined, though: an over-long span still goes through
+    :func:`_rescue_correction` first, because difflib coalesces a real
+    correction with any afterthought typed beside it, and that afterthought
+    should not cost the correction. Only sub-spans within the word bound can
+    come back, so the guarantee holds.
 
     Case is preserved in the output (the vocabulary wants "KAL-LE", not
     "kal-le"); comparison is case-insensitive so a capitalisation-only edit is
@@ -311,11 +322,47 @@ def extract_term_corrections_with_stats(
         b=[w.casefold() for w in sent_words],
     )
     out: list[tuple[str, str]] = []
-    gate_rejected = 0
+    spans_refused = 0
+
+    def _refuse(span_heard, span_meant, heard, meant, score, reason) -> None:
+        """Record one refused span: count it, then say why at DEBUG.
+
+        ILB on the drop. The gate is a judgment, so how often it fires has to be
+        answerable — "the loop stopped proposing" and "the gate got too tight"
+        must not look the same. DEBUG because the pair itself is retained in the
+        corpus (see the docstring), so this is a tuning signal, not a loss
+        warning. Lengths and a score only: the spans are the operator's own words
+        and do not belong in a log line.
+
+        Counted as well as logged: per-span at DEBUG answers "why was THIS one
+        refused", but an operator asking "is the gate eating my corrections?"
+        needs ONE number per pass, and reading it off DEBUG lines means enabling
+        the noisiest level to count something. The aggregate rides the batch
+        summary at INFO (``propose_vocab_additions``).
+        """
+        nonlocal spans_refused
+        spans_refused += 1
+        log.debug(
+            "stt.vocab_span_rejected",
+            # WHICH bar turned it down. Both refusals leave an identical absence
+            # in the output, so without this the aggregate could not be broken
+            # down and "the gate is too tight" would be unanswerable against
+            # "the operator writes long afterthoughts".
+            reason=reason,
+            heard_words=len(span_heard),
+            meant_words=len(span_meant),
+            heard_len=len(heard),
+            meant_len=len(meant),
+            score=round(score, 3),
+            span_floor=MIN_SPAN_SIMILARITY,
+            rescue_floor=MIN_RESCUED_SIMILARITY,
+            max_term_words=MAX_TERM_WORDS,
+            detail="no term could be mined from this replace span — the pair is "
+                   "still in the corpus and re-minable",
+        )
+
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "replace":
-            continue
-        if (i2 - i1) > MAX_TERM_WORDS or (j2 - j1) > MAX_TERM_WORDS:
             continue
         span_heard = heard_words[i1:i2]
         span_meant = sent_words[j1:j2]
@@ -324,6 +371,23 @@ def extract_term_corrections_with_stats(
         if not heard or not meant or heard.casefold() == meant.casefold():
             continue
         score = _similarity(heard, meant)
+        # A span longer than a vocabulary term is a REWRITE taken whole, and must
+        # never be proposed as one — but it may still CONTAIN a real correction,
+        # because difflib coalesces an edit with anything beside it. The original
+        # cut dropped these before the rescue ever ran, so "clean the chicken
+        # tracker" -> "clean the chicken tractor today if you get a chance" lost
+        # the tractor correction entirely AND silently (it was outside the
+        # counter too, so the aggregate read zero while a real correction was
+        # discarded). Try the rescue first; the never-propose-a-clause guarantee
+        # survives because ``_rescue_correction`` bounds every sub-span it
+        # considers by MAX_TERM_WORDS and refuses the whole span by construction.
+        if (i2 - i1) > MAX_TERM_WORDS or (j2 - j1) > MAX_TERM_WORDS:
+            rescued = _rescue_correction(span_heard, span_meant)
+            if rescued is not None:
+                out.append(rescued)
+                continue
+            _refuse(span_heard, span_meant, heard, meant, score, "length")
+            continue
         if score >= MIN_SPAN_SIMILARITY:
             out.append((heard, meant))
             continue
@@ -331,33 +395,8 @@ def extract_term_corrections_with_stats(
         if rescued is not None:
             out.append(rescued)
             continue
-        # ILB on the drop. The gate is a judgment, so how often it fires has to
-        # be answerable — "the loop stopped proposing" and "the gate got too
-        # tight" must not look the same. DEBUG because the pair itself is
-        # retained in the corpus (see the docstring), so this is a tuning
-        # signal, not a loss warning. Lengths and the score only: the spans are
-        # the operator's own words and do not belong in a log line.
-        #
-        # Counted as well as logged: per-span at DEBUG answers "why was THIS one
-        # refused", but an operator asking "is the gate eating my corrections?"
-        # needs ONE number per pass, and reading it off DEBUG lines means
-        # turning on the noisiest level to count something. The aggregate rides
-        # the batch summary at INFO (``propose_vocab_additions``).
-        gate_rejected += 1
-        log.debug(
-            "stt.vocab_span_rejected",
-            heard_words=len(span_heard),
-            meant_words=len(span_meant),
-            heard_len=len(heard),
-            meant_len=len(meant),
-            score=round(score, 3),
-            span_floor=MIN_SPAN_SIMILARITY,
-            rescue_floor=MIN_RESCUED_SIMILARITY,
-            detail="replace span too dissimilar to be a mis-hearing, and no "
-                   "tighter fragment inside it — the pair is still in the "
-                   "corpus and re-minable",
-        )
-    return out, gate_rejected
+        _refuse(span_heard, span_meant, heard, meant, score, "similarity")
+    return out, spans_refused
 
 
 def propose_vocab_additions(
@@ -394,12 +433,12 @@ def propose_vocab_additions(
     heard_by_term: dict[str, list[str]] = {}
     display: dict[str, str] = {}
 
-    gate_rejected = 0
+    spans_refused = 0
     for pair in pairs:
-        corrections, rejected = extract_term_corrections_with_stats(
+        corrections, refused = extract_term_corrections_with_stats(
             pair.transcript, pair.sent,
         )
-        gate_rejected += rejected
+        spans_refused += refused
         for heard, meant in corrections:
             key = meant.casefold()
             if key in have:
@@ -448,14 +487,18 @@ def propose_vocab_additions(
         proposals=len(proposals),
         distinct_corrected_terms=len(counts),
         min_count=min_count,
-        # The batch-boundary aggregate of the F4 gate. The per-span refusals log
-        # at DEBUG (deliberately — the pair is retained, so each one is a tuning
-        # datum, not a loss), but "is the gate eating my corrections?" is a
+        # The batch-boundary aggregate of every span that yielded no term, for
+        # EITHER reason (too dissimilar, or too long with nothing rescuable
+        # inside). The per-span refusals log at DEBUG with a ``reason``
+        # (deliberately — the pair is retained, so each one is a tuning datum,
+        # not a loss), but "is the extractor throwing my corrections away?" is a
         # question about the PASS, and answering it should not require enabling
-        # the noisiest level and counting lines. Emitted ALWAYS, including as 0:
-        # "the gate refused nothing this pass" is the positive evidence that
-        # makes a shrinking proposal list attributable to something else.
-        gate_rejected_spans=gate_rejected,
+        # the noisiest level and counting lines. Named ``spans_refused`` rather
+        # than after the similarity gate alone, because it covers both bars and a
+        # name that promised only one would misreport the number. Emitted ALWAYS,
+        # including as 0: "nothing was refused this pass" is the positive
+        # evidence that makes a shrinking proposal list attributable elsewhere.
+        spans_refused=spans_refused,
         detail="ran, nothing to propose" if not proposals else "recurring "
                "corrections ready for morning review",
     )

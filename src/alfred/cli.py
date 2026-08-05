@@ -5153,7 +5153,7 @@ def _cmd_stt_vocab(args: argparse.Namespace) -> None:
     APPROVE records the term in the decided store, from where
     ``effective_vocab_terms`` unions it onto the shipped list for every future
     transcription. REJECT records the refusal so the term is never proposed
-    again. Nothing here edits ``talker.stt.vocab_terms``: the shipped list stays
+    again. Nothing here edits ``telegram.stt.vocab_terms``: the shipped list stays
     the shipped list, and what the operator taught is separable from it.
 
     Approving BY TERM rather than by proposal number is deliberate — the Daily
@@ -5179,6 +5179,12 @@ def _cmd_stt_vocab(args: argparse.Namespace) -> None:
 
     if cmd == "list":
         current = effective_vocab_terms(sv)
+        static_terms = [str(t) for t in (sv.vocab_terms or [])]
+        # How many learned slots are left. Derived through the seam (learned ==
+        # whatever the effective list carries beyond the shipped one) rather than
+        # counted from the decided store, so a term the cap already dropped is
+        # not double-counted against the budget it never entered.
+        remaining_budget = max(0, MAX_LEARNED_TERMS - (len(current) - len(static_terms)))
         decided = load_decisions(sv.vocab_decided_path)
         pairs = list(iter_correction_pairs(sv.vocab_corpus_path))
         proposals = propose_vocab_additions(
@@ -5186,7 +5192,9 @@ def _cmd_stt_vocab(args: argparse.Namespace) -> None:
             current_vocab=current,
             decided=decided,
             min_count=MIN_CORRECTION_COUNT,
-            max_learned=MAX_LEARNED_TERMS,
+            # The REMAINING budget, matching the Daily Sync card: never offer an
+            # approval that ``apply_approved_terms`` would drop on arrival.
+            max_learned=remaining_budget,
         )
         if getattr(args, "json", False):
             print(json.dumps({
@@ -5200,14 +5208,22 @@ def _cmd_stt_vocab(args: argparse.Namespace) -> None:
                 "rejected": sorted(decided.rejected),
                 "min_count": MIN_CORRECTION_COUNT,
                 "max_learned": MAX_LEARNED_TERMS,
+                "learned_remaining": remaining_budget,
             }, indent=2))
             return
         if not proposals:
-            # ILB, and it names WHICH quiet case this is — "nothing recorded"
-            # and "nothing repeated yet" call for different operator actions.
-            if not pairs:
+            # ILB, and it names WHICH quiet case this is — at-cap, nothing
+            # recorded, and nothing-new-to-propose call for different actions.
+            if remaining_budget == 0:
+                print(f"The learned-vocabulary budget is full "
+                      f"({len(current) - len(static_terms)}/{MAX_LEARNED_TERMS}) — "
+                      f"no new terms are being proposed.")
+                print('Reject a learned term to free a slot: '
+                      'alfred stt-vocab reject "<term>" --operator <name>')
+            elif not pairs:
                 print("No speech corrections recorded yet — nothing to approve.")
-                print("(If this stays empty, check `talker.stt.vocab_learning_enabled`.)")
+                print("(If this stays empty, check "
+                      "`telegram.stt.vocab_learning_enabled` in your config.)")
             else:
                 # Names all three suppressing reasons rather than guessing one:
                 # "none repeated twice yet" would be a lie about a term the
@@ -5253,7 +5269,7 @@ def _cmd_stt_vocab(args: argparse.Namespace) -> None:
             print(json.dumps({
                 "error": "already shipped",
                 "term": term,
-                "detail": "this term is already in talker.stt.vocab_terms and "
+                "detail": "this term is already in telegram.stt.vocab_terms and "
                           "is biasing every transcription — nothing to approve",
             }))
             sys.exit(1)
