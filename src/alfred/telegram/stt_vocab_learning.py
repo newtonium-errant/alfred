@@ -243,6 +243,30 @@ def _rescue_correction(
 def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]]:
     """``(heard, meant)`` phrase pairs where the operator changed the words.
 
+    Thin wrapper over :func:`extract_term_corrections_with_stats` — see there for
+    the full contract. This is the shape almost every caller wants; the stats
+    variant exists only for the batch pass, which reports how often the gate
+    fired across a whole corpus.
+    """
+    corrections, _rejected = extract_term_corrections_with_stats(transcript, sent)
+    return corrections
+
+
+def extract_term_corrections_with_stats(
+    transcript: str, sent: str,
+) -> tuple[list[tuple[str, str]], int]:
+    """``(corrections, gate_rejected_span_count)``.
+
+    Identical extraction to :func:`extract_term_corrections`, additionally
+    reporting how many ``replace`` spans the similarity gate turned down. The
+    per-span DEBUG line answers "why was THIS one refused"; the count answers
+    "how often is the gate firing at all", which is a batch-level question and
+    so cannot be answered from inside the per-pair loop.
+
+    A separate function rather than a widened return, so the existing callers
+    (:func:`propose_vocab_additions` aside, the web capture site) keep their
+    signature — a count nobody asked for should not become everybody's problem.
+
     Word-level diff via :mod:`difflib`, collecting only ``replace`` spans —
     the shape of "the STT heard X, I meant Y". Pure insertions and deletions are
     ignored on purpose: text the operator ADDED was never mis-heard (it is new
@@ -280,13 +304,14 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
     heard_words = _words(transcript)
     sent_words = _words(sent)
     if not heard_words or not sent_words:
-        return []
+        return [], 0
 
     matcher = difflib.SequenceMatcher(
         a=[w.casefold() for w in heard_words],
         b=[w.casefold() for w in sent_words],
     )
     out: list[tuple[str, str]] = []
+    gate_rejected = 0
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "replace":
             continue
@@ -312,6 +337,13 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
         # retained in the corpus (see the docstring), so this is a tuning
         # signal, not a loss warning. Lengths and the score only: the spans are
         # the operator's own words and do not belong in a log line.
+        #
+        # Counted as well as logged: per-span at DEBUG answers "why was THIS one
+        # refused", but an operator asking "is the gate eating my corrections?"
+        # needs ONE number per pass, and reading it off DEBUG lines means
+        # turning on the noisiest level to count something. The aggregate rides
+        # the batch summary at INFO (``propose_vocab_additions``).
+        gate_rejected += 1
         log.debug(
             "stt.vocab_span_rejected",
             heard_words=len(span_heard),
@@ -325,7 +357,7 @@ def extract_term_corrections(transcript: str, sent: str) -> list[tuple[str, str]
                    "tighter fragment inside it — the pair is still in the "
                    "corpus and re-minable",
         )
-    return out
+    return out, gate_rejected
 
 
 def propose_vocab_additions(
@@ -362,8 +394,13 @@ def propose_vocab_additions(
     heard_by_term: dict[str, list[str]] = {}
     display: dict[str, str] = {}
 
+    gate_rejected = 0
     for pair in pairs:
-        for heard, meant in extract_term_corrections(pair.transcript, pair.sent):
+        corrections, rejected = extract_term_corrections_with_stats(
+            pair.transcript, pair.sent,
+        )
+        gate_rejected += rejected
+        for heard, meant in corrections:
             key = meant.casefold()
             if key in have:
                 continue
@@ -411,6 +448,14 @@ def propose_vocab_additions(
         proposals=len(proposals),
         distinct_corrected_terms=len(counts),
         min_count=min_count,
+        # The batch-boundary aggregate of the F4 gate. The per-span refusals log
+        # at DEBUG (deliberately — the pair is retained, so each one is a tuning
+        # datum, not a loss), but "is the gate eating my corrections?" is a
+        # question about the PASS, and answering it should not require enabling
+        # the noisiest level and counting lines. Emitted ALWAYS, including as 0:
+        # "the gate refused nothing this pass" is the positive evidence that
+        # makes a shrinking proposal list attributable to something else.
+        gate_rejected_spans=gate_rejected,
         detail="ran, nothing to propose" if not proposals else "recurring "
                "corrections ready for morning review",
     )
@@ -638,6 +683,7 @@ __all__ = [
     "append_correction_pair",
     "apply_approved_terms",
     "extract_term_corrections",
+    "extract_term_corrections_with_stats",
     "iter_correction_pairs",
     "propose_vocab_additions",
 ]

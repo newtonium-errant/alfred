@@ -33,6 +33,7 @@ from alfred.telegram.stt_vocab_learning import (
     apply_approved_terms,
     effective_vocab_terms,
     extract_term_corrections,
+    extract_term_corrections_with_stats,
     iter_correction_pairs,
     load_decisions,
     propose_vocab_additions,
@@ -609,3 +610,77 @@ def test_a_REORDER_recovers_the_term_rather_than_mining_the_move() -> None:
     assert extract_term_corrections(
         "the chicken tracker needs cleaning", "needs cleaning the chicken tractor",
     ) == [("tracker", "tractor")]
+
+
+# ---------------------------------------------------------------------------
+# The gate's BATCH-boundary aggregate — one headline number per pass
+# ---------------------------------------------------------------------------
+
+
+def test_the_stats_variant_reports_the_refused_span_count() -> None:
+    """The per-span DEBUG line answers "why was THIS one refused"; the count
+    answers "how often is the gate firing", which is not a per-pair question."""
+    corrections, rejected = extract_term_corrections_with_stats(
+        "one two three", "completely different words",
+    )
+    assert corrections == []
+    assert rejected == 1
+
+
+def test_the_stats_variant_counts_zero_when_the_gate_accepts() -> None:
+    corrections, rejected = extract_term_corrections_with_stats(
+        "clean the chicken tracker", "clean the chicken tractor",
+    )
+    assert corrections == [("tracker", "tractor")]
+    assert rejected == 0
+
+
+def test_the_plain_extractor_still_returns_a_bare_list() -> None:
+    """The wrapper's whole job. A widened return would have made a count nobody
+    asked for into every caller's problem — including the web capture site."""
+    out = extract_term_corrections("clean the chicken tracker", "clean the chicken tractor")
+    assert out == [("tracker", "tractor")]
+
+
+def test_the_batch_summary_carries_the_gate_rejected_aggregate() -> None:
+    """The operator's grep gets ONE number per pass at INFO, without having to
+    turn on DEBUG and count per-span lines."""
+    pairs = [
+        _pair("one two three", "completely different words"),   # refused
+        _pair("send it now", "cancel that please"),             # refused
+        _pair("clean the chicken tracker", "clean the chicken tractor"),  # accepted
+    ]
+    with structlog.testing.capture_logs() as captured:
+        propose_vocab_additions(pairs, current_vocab=[])
+
+    events = [c for c in captured if c.get("event") == "stt.vocab_proposals.computed"]
+    assert len(events) == 1
+    assert events[0]["gate_rejected_spans"] == 2
+
+
+def test_the_aggregate_is_emitted_even_when_it_is_zero() -> None:
+    """ILB: "the gate refused nothing this pass" is the positive evidence that
+    makes a shrinking proposal list attributable to something else. A field that
+    vanishes at zero cannot carry that."""
+    with structlog.testing.capture_logs() as captured:
+        propose_vocab_additions([], current_vocab=[])
+
+    events = [c for c in captured if c.get("event") == "stt.vocab_proposals.computed"]
+    assert len(events) == 1
+    assert events[0]["gate_rejected_spans"] == 0
+    assert events[0]["detail"] == "ran, nothing to propose"
+
+
+def test_the_aggregate_stays_a_COUNT_and_never_carries_span_text() -> None:
+    """Same privacy rule as the per-span event, re-asserted at the aggregate:
+    this is the batch summary of the messages the extractor understood LEAST,
+    which is exactly the wrong material to widen a log surface with."""
+    with structlog.testing.capture_logs() as captured:
+        propose_vocab_additions(
+            [_pair("send it now", "cancel that please")], current_vocab=[],
+        )
+
+    events = [c for c in captured if c.get("event") == "stt.vocab_proposals.computed"]
+    rendered = " ".join(str(v) for v in events[0].values())
+    for word in ("send", "cancel", "please", "now"):
+        assert word not in rendered
