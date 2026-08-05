@@ -157,18 +157,38 @@ ACTIONABLE_CODES: frozenset[IssueCode] = _AGENT_CODES | AUTOFIX_FIXABLE_CODES
 #: The marker is not invented here — it is the note the agent already writes
 #: under the SKILL's LINK001 procedure, and the #30 SKILL guard protects that
 #: population from being overwritten *precisely because* it is a cohort marker.
-#: This layer keys on the same thing the guard protects, so the two cannot
-#: drift apart.
 #:
-#: BARE PREFIX, deliberately — no dash. Measured across the vault (8,614
-#: records, 1,674 with a janitor_note): 1,407 notes start with ``LINK001``,
-#: of which 1,372 continue with an EM-dash (``LINK001 —``) and 35 with no
-#: dash at all (``LINK001 scanner false positive: …``). An earlier draft of
-#: this constant guessed ``"LINK001 --"`` (two hyphens) and would have matched
-#: ZERO records — rendering a permanent "cohort: 0" on the very line that
-#: exists to stop a number from lying. Matching the code and nothing else is
-#: also what the SKILL guard does ("unless that note starts with LINK001"),
-#: which is why punctuation drift in the agent's prose cannot break this.
+#: THE CODE AND NOTHING MORE — no dash, no punctuation. Measured across the
+#: vault (8,614 records, 1,674 with a janitor_note): 1,407 notes start with
+#: ``LINK001``, of which 1,372 continue with an EM-dash (``LINK001 —``) and 35
+#: with no dash at all (``LINK001 scanner false positive: …``). An earlier
+#: draft of this constant guessed ``"LINK001 --"`` (two hyphens), a spelling
+#: that occurs ZERO times — it would have rendered a permanent "cohort: 0" on
+#: the very line that exists to stop a number from lying. The cause, found
+#: separately: ``flag_unresolved_links``, the only double-hyphen writer, has no
+#: call site. So the constant holds the CODE only; punctuation drift in the
+#: agent's prose cannot break the match.
+#:
+#: TWO CONSUMERS, KEYED DIFFERENTLY — deliberate, and the difference is the
+#: thing to read before changing either:
+#:
+#:   * this COUNTER matches ``COHORT_NOTE_PREFIX`` + a word boundary (see
+#:     ``is_spam_cohort_issue``);
+#:   * the #30 SKILL overwrite-guard matches a bare ``startswith`` ("unless
+#:     that note starts with LINK001") and lives in the PROMPT layer.
+#:
+#: They agree on every code in today's enum, because none collides —
+#: ``LINK002`` differs at the last character. They would diverge on a future
+#: ``LINK0011``-shaped code: the guard would protect such a note, the counter
+#: would exclude it. That residual is ACCEPTED (the enum is house-controlled,
+#: and the guard's failure direction is over-protection, which costs nothing
+#: but a note nobody rewrites).
+#:
+#: Do not "fix" either side to match the other on sight. Removing the boundary
+#: here re-opens a cohort that grows silently by enum addition; adding one to
+#: the guard is a PROMPT change, which carries the SKILL-cycle contract with it
+#: (a scope/behaviour change to the guard needs a prompt-tuner pass in the same
+#: cycle). Whichever you touch, bring the other's contract with you.
 COHORT_NOTE_PREFIX = "LINK001"
 
 
@@ -193,6 +213,12 @@ def is_spam_cohort_issue(issue: Issue, janitor_note: str | None) -> bool:
     hardening rather than a fix — but a future ``LINK0011``-shaped code would
     silently start counting into this cohort, and a cohort that quietly grows
     by enum addition is exactly the kind of number this feature exists to stop.
+
+    NOTE this keys differently from the #30 SKILL overwrite-guard, which uses a
+    bare ``startswith``. Identical on today's enum, divergent on a hypothetical
+    ``LINK0011`` (guard protects, counter excludes). The divergence is accepted
+    rather than accidental — see the ``COHORT_NOTE_PREFIX`` comment for why,
+    and for what changing either side obliges you to do about the other.
     """
     if issue.code is not IssueCode.BROKEN_WIKILINK:
         return False
