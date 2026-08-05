@@ -64,7 +64,7 @@ SEVERITY_MAP: dict[IssueCode, Severity] = {
 
 # --- Remediation classes — who, if anyone, can actually fix this ------
 #
-# The three sets below partition EVERY IssueCode by remediation owner.
+# The four sets below partition EVERY IssueCode by remediation owner.
 # This is the segregation taxonomy behind the brief's split counts: the
 # raw "N open issues" number conflates work janitor is failing to do with
 # work janitor structurally CANNOT do, which makes the figure unreadable
@@ -77,12 +77,12 @@ SEVERITY_MAP: dict[IssueCode, Severity] = {
 # backlog item.
 
 # Routed to the LLM agent (see ``backends.AGENT_ACTIONABLE_CODES``,
-# which is the enforcement copy used at dispatch).
+# which is the enforcement copy used at dispatch — the two must stay in
+# lockstep, and a pin in tests/test_janitor_scanner_falsepos.py holds the
+# dispatch copy to exactly these codes).
 _AGENT_CODES: frozenset[IssueCode] = frozenset({
     IssueCode.BROKEN_WIKILINK,       # LINK001 — fix when unambiguous
     IssueCode.DUPLICATE_NAME,        # DUP001  — triage task
-    IssueCode.VAGUE_NOTE,            # SEM005  — agent judgment
-    IssueCode.DUPLICATE_SEMANTIC,    # SEM006  — agent judgment
 })
 
 # Repaired deterministically by ``autofix._apply_fix``. These genuinely
@@ -112,23 +112,180 @@ NOT_JANITOR_FIXABLE_CODES: frozenset[IssueCode] = frozenset({
     IssueCode.STALE_ACTIVE_PERSON,         # SEM004
 })
 
+# Vocabulary, not workload (#47 / review-25 O2). SEM005 and SEM006 have NO
+# producer: no scanner emits them, so they can never appear in an issue list,
+# never be routed, and never be counted. They exist as the two labels the
+# agent applies to a judgment it forms on its own while working a record it
+# was sent for some OTHER code — which is exactly what the SKILL says
+# ("You will never be handed one of these", § SEM005–SEM006).
+#
+# They were previously listed in the agent-actionable allowlist, which read as
+# "the agent is routed these" and was never true. Demoting them here is the
+# code catching up to the prompt, not a behaviour change: the dispatch filter
+# is an intersection against a list that never contains them, so removing them
+# changes nothing that runs. It removes a false claim about what the system
+# does.
+#
+# Kept as a NAMED class rather than deleted from the taxonomy so the
+# every-code-is-classified pin still covers them — an unclassified code must
+# fail loudly, and "this one is deliberately unroutable" is a classification.
+LABEL_ONLY_CODES: frozenset[IssueCode] = frozenset({
+    IssueCode.VAGUE_NOTE,          # SEM005
+    IssueCode.DUPLICATE_SEMANTIC,  # SEM006
+})
+
 # Anything janitor can act on, by either path.
 ACTIONABLE_CODES: frozenset[IssueCode] = _AGENT_CODES | AUTOFIX_FIXABLE_CODES
 
 
-def classify_counts(issues: list[Issue]) -> dict[str, int]:
-    """Split issues into actionable vs not-janitor-fixable counts.
+#: The spam-cohort marker (#19-B, D2 ruled). A LINK001 whose record already
+#: carries a ``LINK001``-prefixed janitor_note has been looked at before: real
+#: dangling links, already triaged, deliberately not actionable-today.
+#: Counting them inside ``actionable`` let one historical cohort dominate the
+#: bucket and hide the handful of FRESH breaks that a person should actually
+#: look at this morning.
+#:
+#: NAMING, so nobody has to re-derive it: "spam cohort" is the operator-facing
+#: term from the D2 ruling, and it names the POPULATION (the ~2,075 links whose
+#: sources were spam-derived), not a property this marker tests. What the
+#: marker actually encodes is *already-triaged*: a LINK001-prefixed note means
+#: the janitor has been here before, whatever the record's provenance. In the
+#: measured vault ~590 of those notes read "scanner false positive". So this
+#: counts triaged LINK001 debt, which is the cohort in practice — but do not
+#: read the field name as an assertion that a given record came from spam.
+#:
+#: The marker is not invented here — it is the note the agent already writes
+#: under the SKILL's LINK001 procedure, and the #30 SKILL guard protects that
+#: population from being overwritten *precisely because* it is a cohort marker.
+#:
+#: THE CODE AND NOTHING MORE — no dash, no punctuation. Measured across the
+#: vault (8,614 records, 1,674 with a janitor_note): 1,407 notes start with
+#: ``LINK001``, of which 1,372 continue with an EM-dash (``LINK001 —``) and 35
+#: with no dash at all (``LINK001 scanner false positive: …``). An earlier
+#: draft of this constant guessed ``"LINK001 --"`` (two hyphens), a spelling
+#: that occurs ZERO times — it would have rendered a permanent "cohort: 0" on
+#: the very line that exists to stop a number from lying. The cause, found
+#: separately: ``flag_unresolved_links``, the only double-hyphen writer, has no
+#: call site. So the constant holds the CODE only; punctuation drift in the
+#: agent's prose cannot break the match.
+#:
+#: TWO CONSUMERS, KEYED DIFFERENTLY — deliberate, and the difference is the
+#: thing to read before changing either:
+#:
+#:   * this COUNTER matches ``COHORT_NOTE_PREFIX`` + a word boundary (see
+#:     ``is_spam_cohort_issue``);
+#:   * the #30 SKILL overwrite-guard matches a bare ``startswith`` ("unless
+#:     that note starts with LINK001") and lives in the PROMPT layer.
+#:
+#: They agree on every code in today's enum, because none collides —
+#: ``LINK002`` differs at the last character. They would diverge on a future
+#: ``LINK0011``-shaped code: the guard would protect such a note, the counter
+#: would exclude it. That residual is ACCEPTED (the enum is house-controlled,
+#: and the guard's failure direction is over-protection, which costs nothing
+#: but a note nobody rewrites).
+#:
+#: Do not "fix" either side to match the other on sight. Removing the boundary
+#: here re-opens a cohort that grows silently by enum addition; adding one to
+#: the guard is a PROMPT change, which carries the SKILL-cycle contract with it
+#: (a scope/behaviour change to the guard needs a prompt-tuner pass in the same
+#: cycle). Whichever you touch, bring the other's contract with you.
+COHORT_NOTE_PREFIX = "LINK001"
 
-    Returns ``{"actionable": N, "not_janitor_fixable": M, "total": N+M}``.
-    Because the three sets partition the enum exhaustively (pinned in
-    tests), ``actionable + not_janitor_fixable == total`` always holds —
-    no issue is dropped on the floor by the split.
+
+def is_spam_cohort_issue(issue: Issue, janitor_note: str | None) -> bool:
+    """Is this LINK001 part of the spam cohort (already-triaged link debt)?
+
+    Keyed on the RECORD's existing janitor_note, not on the issue — the issue
+    is regenerated from scratch every sweep and carries no history, so the note
+    is the only durable cohort evidence. A non-LINK001 issue is never cohort,
+    whatever note the record carries: the cohort is a LINK001 backlog, and
+    admitting other codes would quietly shrink the actionable bucket for
+    reasons nobody asked for.
+
+    Self-limiting in the useful direction: a record whose note reads
+    ``LINK001 — resolved: retargeted`` still carries the marker, but once the
+    link is genuinely fixed the scanner emits no LINK001 for it, so it
+    contributes nothing. The note only ever discriminates among records that
+    have a LIVE broken link right now.
+
+    The match is prefix + WORD BOUNDARY, not a bare ``startswith``. No current
+    IssueCode collides (``LINK002`` differs at the last character), so this is
+    hardening rather than a fix — but a future ``LINK0011``-shaped code would
+    silently start counting into this cohort, and a cohort that quietly grows
+    by enum addition is exactly the kind of number this feature exists to stop.
+
+    NOTE this keys differently from the #30 SKILL overwrite-guard, which uses a
+    bare ``startswith``. Identical on today's enum, divergent on a hypothetical
+    ``LINK0011`` (guard protects, counter excludes). The divergence is accepted
+    rather than accidental — see the ``COHORT_NOTE_PREFIX`` comment for why,
+    and for what changing either side obliges you to do about the other.
+    """
+    if issue.code is not IssueCode.BROKEN_WIKILINK:
+        return False
+    note = (janitor_note or "").lstrip()
+    if not note.startswith(COHORT_NOTE_PREFIX):
+        return False
+    # Empty trailer means the note is exactly the bare code, which IS a marker.
+    trailer = note[len(COHORT_NOTE_PREFIX):][:1]
+    return not (trailer.isalnum() or trailer == "_")
+
+
+def classify_counts(
+    issues: list[Issue],
+    *,
+    cohort_notes: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """Split issues into the operator-facing buckets.
+
+    Returns ``{"actionable", "not_janitor_fixable", "label_only",
+    "spam_cohort", "total"}``.
+
+    CONSERVATION IS THREE-WAY::
+
+        actionable + not_janitor_fixable + label_only == total
+
+    one term per remediation class, so every member of the enum lands in
+    exactly one and nothing can fall out of all of them and vanish from the
+    total. ``label_only`` is 0 in practice — those codes have no producer — but
+    it is counted rather than folded into ``not_janitor_fixable`` so that the
+    day a producer IS wired, the arithmetic keeps working and the new issues
+    show up somewhere instead of being silently absorbed into a bucket that
+    means something else.
+
+    ``spam_cohort`` is NOT a fourth term: it is a SUBSET of ``actionable``,
+    reported alongside it rather than carved out of the partition. That choice
+    is deliberate: the cohort is genuinely fixable (the #44 ``link001_repair``
+    campaign drains it), so removing it from ``actionable`` would understate
+    what the system can still do. It is broken out because it is *known debt
+    being drained on a schedule*, not because it is unfixable.
+
+    Two views of one number, and they must not read as double-counting:
+
+      * this line is DEBT STANDING — "how much of today's actionable bucket is
+        the historical cohort";
+      * the drip-drain campaign line is DRAIN PROGRESS — "how fast it is going
+        down".
+
+    As the campaign drains, this count falls and the campaign's ``remaining``
+    falls in step. They are the same population seen from two angles.
+
+    ``cohort_notes`` maps record path → that record's ``janitor_note``. Absent
+    (the default) the cohort count is 0 and the other buckets are unchanged —
+    so a caller that hasn't wired the notes gets the pre-#19-B behaviour rather
+    than a silently wrong cohort figure.
     """
     actionable = sum(1 for i in issues if i.code in ACTIONABLE_CODES)
     not_fixable = sum(1 for i in issues if i.code in NOT_JANITOR_FIXABLE_CODES)
+    label_only = sum(1 for i in issues if i.code in LABEL_ONLY_CODES)
+    notes = cohort_notes or {}
+    cohort = sum(
+        1 for i in issues if is_spam_cohort_issue(i, notes.get(i.file))
+    )
     return {
         "actionable": actionable,
         "not_janitor_fixable": not_fixable,
+        "label_only": label_only,
+        "spam_cohort": cohort,
         "total": len(issues),
     }
 
@@ -177,6 +334,12 @@ class SweepResult:
     # under the schema-tolerance contract.
     issues_actionable: int = 0
     issues_not_janitor_fixable: int = 0
+    #: #19-B — the spam cohort (already-triaged LINK001 debt). A SUBSET of
+    #: ``issues_actionable``, not a carve-out from it (see
+    #: ``classify_counts``). Falls as the #44 link001_repair campaign
+    #: drains it, which is the same population that campaign's
+    #: ``remaining`` tracks — debt-standing here, drain-progress there.
+    issues_spam_cohort: int = 0
     files_fixed: int = 0
     files_deleted: int = 0
     agent_invoked: bool = False
@@ -193,6 +356,7 @@ class SweepResult:
             "issues_by_severity": self.issues_by_severity,
             "issues_actionable": self.issues_actionable,
             "issues_not_janitor_fixable": self.issues_not_janitor_fixable,
+            "issues_spam_cohort": self.issues_spam_cohort,
             "files_fixed": self.files_fixed,
             "files_deleted": self.files_deleted,
             "agent_invoked": self.agent_invoked,
@@ -219,6 +383,7 @@ class SweepResult:
             issues_by_severity=d.get("issues_by_severity") or {},
             issues_actionable=d.get("issues_actionable") or 0,
             issues_not_janitor_fixable=d.get("issues_not_janitor_fixable") or 0,
+            issues_spam_cohort=d.get("issues_spam_cohort") or 0,
             files_fixed=d.get("files_fixed") or 0,
             files_deleted=d.get("files_deleted") or 0,
             agent_invoked=bool(d.get("agent_invoked", False)),
