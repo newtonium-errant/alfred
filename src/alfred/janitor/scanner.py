@@ -6,6 +6,9 @@ import re
 from datetime import date, datetime
 from pathlib import Path
 
+import frontmatter
+import yaml
+
 from alfred.vault.ops import is_ignored_path
 from alfred.vault.schema import (
     KNOWN_TYPES,
@@ -20,7 +23,15 @@ from alfred.vault.schema import (
 
 from .config import JanitorConfig
 from .issues import Issue, IssueCode, Severity, SEVERITY_MAP
-from .parser import VaultRecord, extract_wikilinks, parse_file, stripped_body_length
+from .parser import (
+    ANNOTATION_FIELDS,
+    VaultRecord,
+    decode_yaml_apostrophe,
+    extract_wikilinks,
+    parse_file,
+    stripped_body_length,
+    structural_wikilinks,
+)
 from .state import JanitorState
 from .utils import compute_md5, get_logger
 
@@ -56,36 +67,11 @@ def _is_scaffold_doc(rel_str: str) -> bool:
     return "/" not in rel_str
 
 
-def _decode_yaml_apostrophe(target: str) -> str:
-    """Decode YAML single-quote-doubled apostrophes for stem_index lookup.
-
-    YAML's single-quoted scalar form escapes a literal apostrophe by
-    doubling it (``''``). When the distiller's writer emits a wikilink
-    target containing an apostrophe — e.g. ``[[constraint/Andrew's
-    Note]]`` — and that wikilink lands inside a single-quoted YAML
-    list item:
-
-        related:
-        - '[[constraint/Andrew''s Note]]'
-
-    the wikilink regex captures the literal text ``Andrew''s`` (the YAML
-    layer hasn't decoded yet at extraction time), and the resulting
-    target misses the on-disk file ``Andrew's.md`` in stem_index
-    lookups.
-
-    The fix normalizes ``''`` → ``'`` at lookup time so we resolve to
-    the same file Obsidian would. Applied only to the lookup string —
-    the original raw target is preserved in the user-visible LINK001
-    message so reviewers see what the source file actually contained.
-
-    Safe in practice: filenames never contain literal ``''`` (Obsidian
-    forbids it on most filesystems), so the normalization can't mask a
-    real broken link. See the 2026-04-30 categorization investigation
-    in the distiller-janitor sweep log: 252 of 761 LINK001 were this
-    exact pattern, plus the constraint record documenting the bug
-    itself appearing 20 times as its own broken target.
-    """
-    return target.replace("''", "'") if "''" in target else target
+#: Moved to ``parser`` so the scanner's target resolution and the parser's
+#: annotation subtraction share ONE normalization — see
+#: :func:`alfred.janitor.parser.decode_yaml_apostrophe`. Aliased here because
+#: this module's resolver is its only caller.
+_decode_yaml_apostrophe = decode_yaml_apostrophe
 
 
 def _normalize_wikilink_target_for_lookup(target: str) -> str:
@@ -273,7 +259,29 @@ def _build_inbound_index(
         except (OSError, UnicodeDecodeError):
             continue
 
-        links = extract_wikilinks(raw)
+        # Annotation prose is not an inbound reference. A janitor_note that
+        # quotes ``[[person/Ghost]]`` while explaining a broken link would
+        # otherwise register as a real link TO person/Ghost and suppress that
+        # record's ORPHAN001 — the janitor's own commentary making a record
+        # look connected. Same exclusion the LINK001 path applies, so the two
+        # cannot disagree about what counts as a link.
+        # NARROW except, deliberately. A bare ``except Exception`` here caught
+        # a NameError while this was being written (``frontmatter`` was not
+        # imported at module scope) and silently degraded every file to "no
+        # annotations" — the exclusion looked implemented and did nothing.
+        # Only a genuinely unparseable YAML header may fall through, and it
+        # says so rather than passing quietly.
+        try:
+            fm = frontmatter.loads(raw).metadata or {}
+        except (yaml.YAMLError, ValueError, TypeError) as exc:
+            log.debug(
+                "scanner.inbound_frontmatter_unparsed",
+                file=rel_path, error=str(exc)[:200],
+                detail="annotation links cannot be excluded for this file; "
+                       "its raw links are used as-is",
+            )
+            fm = {}
+        links = structural_wikilinks(raw, fm)
         for target in links:
             # Resolve target to actual files via the shared resolver
             # (YAML apostrophe decode + trailing ``.md`` strip +
@@ -588,7 +596,14 @@ def _check_record(
     # ``stem_index``-compatible string, so the dir/self-ref/existence
     # checks below keep working unchanged.
     _entity_dirs = set(TYPE_DIRECTORY.values())
-    fm_text = _frontmatter_text(record.frontmatter)
+    # Annotation fields are excluded here too. A target merely QUOTED in a
+    # janitor_note would otherwise count as "already present in frontmatter"
+    # and suppress a legitimate LINK002 — the body's entity link really is
+    # missing from the frontmatter that Obsidian Bases reads, and a sentence
+    # about the record is not a frontmatter reference.
+    fm_text = _frontmatter_text({
+        k: v for k, v in record.frontmatter.items() if k not in ANNOTATION_FIELDS
+    })
     fm_link_targets = {
         _canonical_link_key(t, stem_index)
         for t in extract_wikilinks(fm_text)
