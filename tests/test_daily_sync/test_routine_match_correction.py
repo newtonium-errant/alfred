@@ -723,3 +723,79 @@ def test_correct_is_not_reachable_on_another_kind(tmp_path: Path) -> None:
             continue
         assert arouter.CORRECT_ACTION not in actions
         assert arouter.ONE_OFF_ACTION not in actions
+
+
+# ---------------------------------------------------------------------------
+# #34 — pending-queue verbs must not confirm a non-pending item
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("token", ["noted", "show"])
+def test_a_pending_verb_on_a_routine_match_errors_and_teaches_nothing(
+    tmp_path: Path, token: str,
+) -> None:
+    """THE PIN. ``3 noted`` aimed at a routine match used to CONFIRM it.
+
+    ``parse_reply`` sees only text, so every OK-verb collapses to ``ok=True``
+    before any item kind is known — which made ``noted`` indistinguishable from
+    ``confirm`` at the resolver. It therefore wrote a corpus row teaching the
+    matcher a verdict the operator never gave, on an input most likely to be a
+    typo or a mis-numbered line. Erroring is the honest outcome: the operator
+    retypes, and nothing is learned from a slip.
+    """
+    vault = _vault(tmp_path)
+    corpus = tmp_path / "corpus.jsonl"
+    correction = ReplyCorrection(item_number=1, ok=True, consumed_token=token)
+
+    err, did_write, captured = _resolve(correction, _item(), corpus, vault)
+
+    assert err and token in err, "the refusal names the verb the operator typed"
+    assert did_write is False
+    assert _rows(corpus) == [], "no corpus row may be written from a slip"
+    assert "pending_only_verb" in _reasons(captured), (
+        "the refusal must be logged with its REASON — a refusal for the right "
+        "cause and one for an unrelated cause are otherwise indistinguishable"
+    )
+
+
+def test_a_real_confirm_still_confirms(tmp_path: Path) -> None:
+    """PRESERVED BEHAVIOUR, paired with the pin above. A build that "fixed" the
+    leak by refusing every ``ok=True`` passes that test and fails this one."""
+    vault = _vault(tmp_path)
+    corpus = tmp_path / "corpus.jsonl"
+    correction = ReplyCorrection(item_number=1, ok=True, consumed_token="confirm")
+
+    err, did_write, _ = _resolve(correction, _item(), corpus, vault)
+
+    assert err is None
+    assert did_write is True
+    assert _rows(corpus), "a genuine confirm still teaches the matcher"
+
+
+def test_an_ok_with_no_consumed_token_is_not_refused(tmp_path: Path) -> None:
+    """The guard keys on the TOKEN, so a correction carrying ``ok`` without one
+    (chained ``same``/``ditto`` copies tier/ok but not the token) must pass —
+    refusing it would break chaining, which is a live operator idiom."""
+    vault = _vault(tmp_path)
+    corpus = tmp_path / "corpus.jsonl"
+    correction = ReplyCorrection(item_number=1, ok=True)
+
+    err, did_write, _ = _resolve(correction, _item(), corpus, vault)
+
+    assert err is None
+    assert did_write is True
+
+
+def test_pending_only_tokens_are_exactly_the_pending_queue_verbs() -> None:
+    """Contract pin. These are the verbs `_applicable_calibration_verbs`
+    advertises for ``has_pending`` and that the capability ceiling lists under
+    the ``pending`` kind — three places that must agree about what "pending
+    verb" means."""
+    from alfred.daily_sync.action_router import FEED_ACTIONS
+    from alfred.daily_sync.assembler import PENDING_ONLY_OK_TOKENS
+
+    assert PENDING_ONLY_OK_TOKENS == frozenset({"noted", "show"})
+    assert set(FEED_ACTIONS["pending"]) == PENDING_ONLY_OK_TOKENS, (
+        "the capability ceiling's pending actions and the parser-side "
+        "pending-only verbs must name the same set"
+    )

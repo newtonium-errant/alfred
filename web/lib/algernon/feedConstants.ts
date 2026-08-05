@@ -321,8 +321,18 @@ export function routineProposedItem(item: FeedItem): string {
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
-/** Case/whitespace-insensitive compare, mirroring the server's target normalisation
- *  so the picker hides exactly the option the resolver would refuse. */
+/** Case/whitespace-insensitive compare, APPROXIMATING the server's target
+ *  normalisation so the picker hides the option the resolver would refuse.
+ *
+ *  Not an exact mirror, and the comment used to claim it was. The server folds
+ *  with Python's `str.casefold()`; JS has no equivalent, and `toLowerCase()`
+ *  differs on the ß-class: `'Straße'.toLowerCase()` is `'straße'` where
+ *  casefold gives `'strasse'`. Consequence is cosmetic and fails SAFE — the
+ *  picker would offer an option the server then refuses, so the operator sees a
+ *  refusal rather than a wrong write. Left approximate rather than hand-rolling
+ *  a partial casefold, which would drift from CPython's table on the next
+ *  Unicode revision; if this ever matters, normalise server-side and send the
+ *  folded form. */
 export function sameRoutineItem(a: string, b: string): boolean {
   return a.trim().replace(/\s+/g, ' ').toLowerCase() === b.trim().replace(/\s+/g, ' ').toLowerCase();
 }

@@ -244,6 +244,23 @@ _OK_TOKENS = {
     "noted",
     "show",
 }
+
+#: OK-verbs that mean something ONLY on a pending-queue item (#34, from the
+#: #36 tuner pass — verified by import 2026-08-04).
+#:
+#: The parser cannot enforce this. ``parse_reply`` takes only the reply TEXT, so
+#: it has no idea which kind of item each number refers to; every OK-verb
+#: collapses to ``ok=True`` and the item's kind is not known until dispatch.
+#: That collapse is the leak: ``3 noted`` aimed at a routine-match item arrived
+#: at the resolver indistinguishable from ``3 confirm`` and was applied as a
+#: CONFIRM — writing a corpus row that teaches the matcher a verdict the
+#: operator never gave, on what is most likely a typo or a mis-numbered line.
+#:
+#: ``consumed_token`` survives the collapse, so the scoping is enforced at
+#: dispatch, where the kind IS known. Kept here, beside ``_OK_TOKENS``, so the
+#: two are read together: adding a verb there without deciding its kind scope
+#: here is the mistake this constant exists to make visible.
+PENDING_ONLY_OK_TOKENS = frozenset({"noted", "show"})
 # Reject verbs — only meaningful for attribution items (email items
 # don't have a "delete the section" action). The dispatcher routes a
 # reject correction onto ``reject_marker`` for attribution items and

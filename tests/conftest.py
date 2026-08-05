@@ -618,7 +618,14 @@ def _leaked_cloud_keys() -> list[str]:
 
 @pytest.fixture(autouse=True)
 def _assert_no_cloud_key_leak(request):
-    """Fail a test that leaves a cloud credential in the process env.
+    """Surface a test that leaves a cloud credential in the process env.
+
+    It raises in TEARDOWN, so pytest reports it as an ERROR against the test
+    rather than a FAILURE — the test body itself already passed by then. Both
+    exit non-zero, so CI catches it either way; the distinction matters only
+    when reading the report, where "1 error" and "1 failed" point at different
+    parts of the run. Said precisely here because a docstring claiming "fail"
+    sends the next reader hunting for an assertion inside the test.
 
     Teardown, not mid-call, so the body runs exactly as it does without the
     check — same reasoning as ``_assert_no_egress``.

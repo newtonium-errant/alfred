@@ -261,6 +261,15 @@ def routine_match_section(
             one_off=stats.one_off,
             corpus_path=rm.corpus_path,
         )
+    # Hoisted out of the comprehension below: ``_correction_candidates`` walks
+    # the vault's ``routine/*.md`` on every call, and a surfaced batch is
+    # usually several matches against the SAME routine record — so the inline
+    # form did up to one walk per item (10 per sync at the cap) to produce at
+    # most one distinct answer per record. Keyed on the record, computed once.
+    candidates_by_record = {
+        record: _correction_candidates(record)
+        for record in {p.record for p in surfaced}
+    }
     # Number the items GLOBALLY from the assembler's start_index so the reply
     # dispatcher can route "item N confirm" against the persisted batch.
     items = [
@@ -273,7 +282,7 @@ def routine_match_section(
             completion_date=p.completion_date,
             captured_at=p.captured_at,
             kind=p.kind,
-            candidates=_correction_candidates(p.record),
+            candidates=candidates_by_record[p.record],
         )
         for i, p in enumerate(surfaced)
     ]
