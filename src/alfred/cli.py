@@ -699,6 +699,43 @@ def cmd_janitor(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_drip(args: argparse.Namespace) -> None:
+    """``alfred drip`` — the #44b ignition for budgeted campaigns.
+
+    Budgets reach the runner from config on every path (the D1 gap): this
+    handler passes no literal, so changing ``drip.campaigns.<name>.
+    max_items_per_run`` in YAML changes what the runner actually does.
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="drip")
+    from alfred.drip.config import load_from_unified
+    config = load_from_unified(raw)
+
+    from alfred.drip import cli as dcli
+    from alfred.drip.wiring import DripConfigError
+    subcmd = args.drip_cmd
+
+    try:
+        if subcmd == "run":
+            code = dcli.cmd_run(
+                config,
+                campaign_name=args.campaign,
+                apply=not args.dry_run,
+            )
+        elif subcmd == "status":
+            code = dcli.cmd_status(config)
+        else:
+            print(f"Unknown drip subcommand: {subcmd}")
+            sys.exit(1)
+    except DripConfigError as exc:
+        # A selection or config error is the operator's to fix, and saying so
+        # plainly beats a traceback.
+        print(f"Drip: {exc}")
+        sys.exit(2)
+    if code:
+        sys.exit(code)
+
+
 def cmd_distiller(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="distiller")
@@ -5286,6 +5323,25 @@ def build_parser() -> argparse.ArgumentParser:
     jan_ignore.add_argument("file", help="Relative file path to ignore")
     jan_ignore.add_argument("--reason", default="", help="Reason for ignoring")
 
+    # drip (#44b) — the ignition for the budgeted-campaign machinery. ``run``
+    # is what a scheduler invokes; ``status`` renders the ops-brief lines on
+    # demand without running anything.
+    drip_p = sub.add_parser("drip", help="Budgeted drip-drain campaigns")
+    drip_sub = drip_p.add_subparsers(dest="drip_cmd")
+    drip_run = drip_sub.add_parser("run", help="Drain one budgeted increment")
+    drip_run.add_argument(
+        "--campaign", default=None,
+        help="Run only this campaign (default: every enabled campaign)",
+    )
+    drip_run.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "Preview: compute selection and budget, work nothing, write "
+            "nothing. Describes the same operation the real run performs."
+        ),
+    )
+    drip_sub.add_parser("status", help="Show each campaign's progress line")
+
     # scribe (STAY-C sovereign scribe) — P2-a: attest a clinical_note ai_draft.
     # The ONLY sanctioned path to flip a clinical_note's status/attested_by:
     # runs scribe.authorize_attestation (forward-only + distinct-human-clinician
@@ -6721,6 +6777,7 @@ def main() -> None:
         "curator": cmd_curator,
         "email-classifier": cmd_email_classifier,
         "janitor": cmd_janitor,
+        "drip": cmd_drip,
         "distiller": cmd_distiller,
         "instructor": cmd_instructor,
         "transport": cmd_transport,
