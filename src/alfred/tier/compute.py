@@ -1441,6 +1441,17 @@ class TierEntry:
     # every non-cadence entry.
     target_cadence_days: int | None = None
     days_since_last_completed: int | None = None
+    # --- snooze breakthrough (#14) -------------------------------------------
+    # WHY this row is back before its snooze expired: ``crossed_due`` or
+    # ``moved_earlier``. Empty for every row that was never snoozed, and for a
+    # snoozed row returning because its duration simply ran out (the clock is
+    # not a delta — a return the operator can predict needs no explanation).
+    #
+    # Carried on the ENTRY rather than logged and dropped: the reason was
+    # already computed in the projection, and a card that returns early without
+    # saying why is the mysterious-resurrection shape the delta rule exists to
+    # avoid. The producer copies it into evidence so the face can answer it.
+    snooze_breakthrough: str = ""
     # --- slot axis (#18 slice 1) ---------------------------------------------
     # Slot is ORTHOGONAL to tier: tier answers "when does this press", slot
     # answers "what does this do for the day". Both survive; neither replaces
@@ -1847,6 +1858,24 @@ def compute_today_view(
                 )
                 _lane[:] = _kept
                 snooze_suppressed += _stats.suppressed
+                # STAMP, then log (#14). The log line alone left the reason
+                # dying here: the producer never saw it, so the card could not
+                # answer "why is this back?" — the one question an early return
+                # provokes. Stamped onto the entry the projection already holds,
+                # so it travels the normal path to evidence with no new plumbing.
+                #
+                # Matched by the SAME `slot_stable_key` the filter keyed on, so
+                # a reason can never land on the wrong row (the key and the
+                # card's feed id are already required to agree — see
+                # feed_producer's slot_stable_key delegation).
+                _reasons = dict(_stats.broke_through)
+                if _reasons:
+                    from alfred.tier.snooze import slot_stable_key as _stable_key
+
+                    for _entry in _lane:
+                        _r = _reasons.get(_stable_key(_entry))
+                        if _r:
+                            _entry.snooze_breakthrough = _r
                 for _key, _reason in _stats.broke_through:
                     # A card returning EARLY must be explicable, never
                     # mysterious — name which delta fired.

@@ -97,16 +97,122 @@ def test_snooze_holds_through_its_window_and_returns_on_the_boundary_day(
         assert suppressed is expected, f"{day} expected suppressed={expected}"
 
 
-def test_the_three_v1_durations(tmp_path: Path) -> None:
-    assert sn.SNOOZE_DURATIONS == {"snooze_1d": 1, "snooze_3d": 3, "snooze_7d": 7}
+def test_the_duration_ladder(tmp_path: Path) -> None:
+    """CONTRACT PIN: three dated rungs + the indefinite one (#14's folded-in
+    Park). Widening this ladder is intentional work — updating this pin in the
+    same commit is how the widening stays deliberate."""
+    assert sn.SNOOZE_DURATIONS == {
+        "snooze_1d": 1, "snooze_3d": 3, "snooze_7d": 7,
+        "snooze_until_i_say": None,
+    }
+    assert sn.SNOOZE_INDEFINITE_ACTION == "snooze_until_i_say"
     store = tmp_path / "snooze.json"
     for action, days in sn.SNOOZE_DURATIONS.items():
         e = _Entry(name=action, path=f"task/{action}.md")
-        stored = sn.add_snooze(
-            store, sn.slot_stable_key(e), days=days, today=TODAY,
-            duration_label=action.removeprefix("snooze_"),
-        )
-        assert stored.snoozed_until == (date(2026, 8, 3 + days)).isoformat()
+        stored = sn.add_snooze(store, sn.slot_stable_key(e), days=days, today=TODAY)
+        if days is None:
+            assert stored.snoozed_until == ""
+            assert stored.duration_label == sn.INDEFINITE_LABEL
+        else:
+            assert stored.snoozed_until == (date(2026, 8, 3 + days)).isoformat()
+            assert stored.duration_label == f"{days}d"
+
+
+# --- "until I say" (#14 — the indefinite rung) --------------------------------
+
+
+def test_indefinite_snooze_stores_NO_snoozed_until_key(tmp_path: Path) -> None:
+    """The ruling is specific: absence, not a null sentinel and not a far-future
+    date. Read the JSON on disk, because that is the artifact the claim is about
+    — a dataclass default would look identical here while writing ``null``.
+
+    Mutation: drop the ``payload.pop`` in ``_serialize`` → the key is present
+    (as "") and this fails."""
+    store = tmp_path / "snooze.json"
+    sn.add_snooze(store, "task:task/Pay Steph.md", days=None, today=TODAY)
+    raw = json.loads(store.read_text(encoding="utf-8"))
+    row = raw["task:task/Pay Steph.md"]
+    assert "snoozed_until" not in row, f"expected the key absent, got {row!r}"
+    # The other fields still round-trip — the omission is ONE key, not a
+    # general falsy-drop (overdue_at_snooze=False is an answer, not an absence).
+    assert row["overdue_at_snooze"] is False
+    assert row["duration_label"] == sn.INDEFINITE_LABEL
+
+
+def test_indefinite_entry_survives_the_loader(tmp_path: Path) -> None:
+    """The absence must LOAD, not be skipped as malformed.
+
+    ``load_snoozes`` swallows ``TypeError`` per row (a malformed row must not
+    take the board down), so a required ``snoozed_until`` would turn every
+    indefinite snooze into a silently-dropped row — the item would just come
+    back and nothing would say why.
+
+    Mutation: make ``snoozed_until`` required again → the row vanishes and this
+    fails on the length assert."""
+    store = tmp_path / "snooze.json"
+    sn.add_snooze(store, "task:task/Pay Steph.md", days=None, today=TODAY)
+    loaded = sn.load_snoozes(store)
+    assert list(loaded) == ["task:task/Pay Steph.md"]
+    assert loaded["task:task/Pay Steph.md"].snoozed_until == ""
+
+
+def test_indefinite_snooze_never_expires(tmp_path: Path) -> None:
+    """No end date means no clock. Ten years on it is still suppressed."""
+    store = tmp_path / "snooze.json"
+    entry = sn.add_snooze(store, "text:Write the thing", days=None, today=TODAY)
+    for day in (date(2026, 8, 3), date(2026, 8, 4), date(2027, 1, 1), date(2036, 8, 3)):
+        suppressed, reason = sn.is_snoozed(entry, today=day)
+        assert suppressed is True, f"{day} should still be suppressed"
+        assert reason is None
+
+
+def test_indefinite_snooze_still_breaks_through_on_the_delta(tmp_path: Path) -> None:
+    """RULING: breakthrough applies IDENTICALLY to dated and undated snoozes —
+    urgency earns a return, not the calendar. An item snoozed "until I say"
+    while not yet due comes back when it crosses into due.
+
+    Mutation: return early for undated entries in ``is_snoozed`` (i.e. treat
+    "until I say" as absolute) → this fails."""
+    store = tmp_path / "snooze.json"
+    entry = sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=None, today=TODAY, due_iso="2026-08-20",
+    )
+    # Nothing changed and it isn't due yet → holds, with no clock to expire it.
+    # (Deliberately a date BEFORE the due date: an undated snooze on a row whose
+    # due date is in the past has genuinely crossed into due, and holding it
+    # then would be the absolute reading this whole module rejects.)
+    suppressed, _ = sn.is_snoozed(
+        entry, today=date(2026, 8, 19), current_due_iso="2026-08-20",
+    )
+    assert suppressed is True
+    # Crossed into due → back, with the reason named.
+    suppressed, reason = sn.is_snoozed(
+        entry, today=date(2026, 8, 20), current_due_iso="2026-08-20",
+    )
+    assert (suppressed, reason) == (False, sn.REASON_CROSSED_DUE)
+    # Moved earlier → back, with the OTHER reason named.
+    suppressed, reason = sn.is_snoozed(
+        entry, today=date(2026, 8, 10), current_due_iso="2026-08-12",
+    )
+    assert (suppressed, reason) == (False, sn.REASON_MOVED_EARLIER)
+
+
+def test_indefinite_snooze_on_an_already_overdue_row_holds(tmp_path: Path) -> None:
+    """The motivating card, at the indefinite rung: "yes, I know it's late, not
+    today" must be honoured here exactly as it is for a dated snooze — the
+    absolute reading would make the indefinite rung a no-op on the one card the
+    operator most wants gone."""
+    store = tmp_path / "snooze.json"
+    entry = sn.add_snooze(
+        store, "task:task/RRTS Invoicing.md",
+        days=None, today=TODAY, due_iso="2026-08-02",  # already overdue
+    )
+    assert entry.overdue_at_snooze is True
+    suppressed, reason = sn.is_snoozed(
+        entry, today=date(2026, 9, 1), current_due_iso="2026-08-02",
+    )
+    assert (suppressed, reason) == (True, None)
 
 
 # --- the breakthrough table (all four rows) -----------------------------------
@@ -383,8 +489,23 @@ def test_snooze_ceiling_admits_exactly_the_ratified_verbs() -> None:
 
     assert set(FEED_ACTIONS["slot_suggestion"]) == {
         "done", "undo_done", "accept", "snooze_1d", "snooze_3d", "snooze_7d",
-        "unsnooze",
+        "snooze_until_i_say", "unsnooze",
     }
+
+
+def test_every_ladder_rung_is_reachable_through_the_ceiling() -> None:
+    """The ladder and the ceiling must not drift: a rung the store knows about
+    but ``FEED_ACTIONS`` doesn't is a duration the FE can offer and the router
+    will reject with ``invalid_action``.
+
+    Derived from :data:`SNOOZE_DURATIONS` rather than re-listed, so adding a
+    fifth rung without wiring it trips here instead of in the field."""
+    from alfred.daily_sync.action_router import FEED_ACTIONS
+
+    ceiling = set(FEED_ACTIONS["slot_suggestion"])
+    missing = set(sn.SNOOZE_DURATIONS) - ceiling
+    assert not missing, f"ladder rungs the router can't accept: {sorted(missing)}"
+    assert sn.UNSNOOZE_ACTION in ceiling
 
 
 # --- END-TO-END through a PRODUCTION entry point -------------------------------
@@ -477,6 +598,120 @@ def test_e2e_expired_snooze_lets_the_row_back_through(tmp_path: Path) -> None:
     )
     assert back is not None
     assert "slot_suggestion:task:task/Pay Steph.md" in {i.id for i in back}
+
+
+def test_e2e_indefinite_snooze_omits_the_row_and_unsnooze_restores_it(
+    tmp_path: Path,
+) -> None:
+    """PRODUCTION ENTRY POINT for the indefinite rung. "Until I say" has no
+    clock, so the ONLY thing that brings the row back on an unchanged vault is
+    the operator saying so — which makes ``unsnooze`` the escape hatch this rung
+    depends on rather than a nicety.
+
+    Mutation: give the indefinite entry a far-future ``snoozed_until`` instead
+    of an absent one → the omit half still passes (that's the trap), so the
+    load-bearing assert here is the one on the stored key."""
+    from alfred.brief.feed_producer import slot_suggestion_feed_items
+
+    vault = _prod_vault(tmp_path)
+    store = tmp_path / "snooze.json"
+    feed_id = "slot_suggestion:task:task/Pay Steph.md"
+
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=None, today=PROD_NOW.date(), lane="task", due_iso="2026-05-28",
+    )
+    assert "snoozed_until" not in json.loads(store.read_text(encoding="utf-8"))[
+        "task:task/Pay Steph.md"
+    ]
+
+    after = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(store), instance="salem",
+    )
+    assert after is not None and feed_id not in {i.id for i in after}
+
+    assert sn.remove_snooze(store, "task:task/Pay Steph.md") is True
+    back = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(store), instance="salem",
+    )
+    assert back is not None and feed_id in {i.id for i in back}
+
+
+def test_e2e_breakthrough_reason_reaches_the_card_evidence(tmp_path: Path) -> None:
+    """PRODUCTION ENTRY POINT: the WHY travels to the card, not just to a log.
+
+    A row returning before its snooze ran out is the one event that provokes
+    "why is this back?", and until #14 the answer died in a ``log.info`` the
+    producer never saw. This drives the real producer and reads the real
+    evidence key the card renders.
+
+    Setup: snoozed 7d on the 25th while NOT yet due (due the 28th), looked at on
+    the 28th — the snooze has 4 days left, and the row is back because it
+    crossed into due. That is ``crossed_due``.
+
+    Mutation: delete the stamping block in compute_today_view (leaving the
+    log.info) → the row still returns, the log line still fires, and this fails
+    on the evidence assert. The log alone cannot pass this."""
+    from alfred.brief.feed_producer import slot_suggestion_feed_items
+
+    vault = _prod_vault(tmp_path)
+    store = tmp_path / "snooze.json"
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=7, today=date(2026, 5, 25), lane="task", due_iso="2026-05-28",
+    )
+    stored = sn.load_snoozes(store)["task:task/Pay Steph.md"]
+    assert stored.snoozed_until == "2026-06-01"      # still snoozed on PROD_NOW
+    assert stored.overdue_at_snooze is False         # wasn't overdue when parked
+
+    items = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(store), instance="salem",
+    )
+    assert items is not None
+    row = next(i for i in items if i.id == "slot_suggestion:task:task/Pay Steph.md")
+    assert row.evidence["snooze_breakthrough"] == sn.REASON_CROSSED_DUE
+
+
+def test_e2e_a_row_that_was_never_snoozed_carries_no_breakthrough_reason(
+    tmp_path: Path,
+) -> None:
+    """The control for the pin above. Every ordinary row must carry an EMPTY
+    reason — a stamp that leaks onto un-snoozed rows would put "why is this
+    back?" on cards that never went anywhere."""
+    from alfred.brief.feed_producer import slot_suggestion_feed_items
+
+    vault = _prod_vault(tmp_path)
+    items = slot_suggestion_feed_items(
+        vault, PROD_NOW, _tier_defaults_with(tmp_path / "absent.json"),
+        instance="salem",
+    )
+    assert items is not None and items
+    assert all(i.evidence["snooze_breakthrough"] == "" for i in items)
+
+
+def test_projection_logs_the_breakthrough_it_stamps(tmp_path: Path) -> None:
+    """The stamp did not REPLACE the log line — an operator grepping
+    ``board.snooze_breakthrough`` still finds it, with the reason and the lane.
+
+    Both surfaces matter and they answer different people: the card answers the
+    operator looking at it, the log answers the operator asking why the board
+    moved last Tuesday."""
+    from alfred.tier.compute import compute_today_view
+
+    vault = _prod_vault(tmp_path)
+    store = tmp_path / "snooze.json"
+    sn.add_snooze(
+        store, "task:task/Pay Steph.md",
+        days=7, today=date(2026, 5, 25), lane="task", due_iso="2026-05-28",
+    )
+    with structlog.testing.capture_logs() as cap:
+        compute_today_view(vault, PROD_NOW, _tier_defaults_with(store))
+
+    broke = [c for c in cap if c.get("event") == "board.snooze_breakthrough"]
+    assert len(broke) == 1
+    assert broke[0]["reason"] == sn.REASON_CROSSED_DUE
+    assert broke[0]["key"] == "task:task/Pay Steph.md"
+    assert broke[0]["lane"] == "t1"
 
 
 def test_e2e_unconfigured_snooze_path_is_inert(tmp_path: Path) -> None:
@@ -669,6 +904,42 @@ def test_dispatcher_snooze_leaves_the_vault_byte_identical(tmp_path: Path) -> No
     assert feed_store.calls == [
         ("slot_suggestion:task:task/Pay Steph.md", "acted", "snooze"),
     ]
+
+
+def test_dispatcher_applies_the_indefinite_rung(tmp_path: Path) -> None:
+    """The fourth rung through the REAL dispatcher — the composition the FE
+    actually drives, not ``add_snooze`` in isolation.
+
+    Three claims, and the third is the one a "does it write the row?" pin would
+    miss: the store row carries no end date, the acted verb is the SAME
+    ``snooze`` (so the staged list finds it alongside the dated ones rather than
+    needing a second lookup), and the human detail line says what happened
+    instead of trailing off after "until"."""
+    from alfred.daily_sync.action_router import _dispatch_slot_snooze
+
+    store = tmp_path / "snooze.json"
+    feed_store = _FakeStore()
+    with structlog.testing.capture_logs() as cap:
+        result = _dispatch_slot_snooze(
+            "slot_suggestion:task:task/Pay Steph.md", "snooze_until_i_say",
+            _FakeItem({"origin": "task", "name": "Pay Steph",
+                       "path": "task/Pay Steph.md", "due_iso": "2026-05-28"}),
+            feed_store=feed_store,
+            config=_dispatch_config(tmp_path, store),
+        )
+
+    assert result.ok and result.status == "acted"
+    assert result.detail == "snoozed until you say otherwise"
+    assert not result.detail.rstrip().endswith("until")
+    stored = sn.load_snoozes(store)["task:task/Pay Steph.md"]
+    assert stored.snoozed_until == ""
+    assert stored.duration_label == sn.INDEFINITE_LABEL
+    assert feed_store.calls == [
+        ("slot_suggestion:task:task/Pay Steph.md", "acted", "snooze"),
+    ]
+    logged = [c for c in cap if c.get("event") == "board.snooze"]
+    assert len(logged) == 1
+    assert logged[0]["indefinite"] is True and logged[0]["until"] == ""
 
 
 def test_dispatcher_refuses_a_snooze_on_a_done_row_and_writes_nothing(

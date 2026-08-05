@@ -161,6 +161,9 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # `_dispatch_slot_completion` on purpose — no completion writer is
     # reachable from a snooze under any input, so "snooze never fakes a
     # completion" is enforced structurally rather than by convention.
+    # ``snooze_until_i_say`` is #14's fourth rung — the old board Park, now a
+    # duration choice on the one defer verb rather than a second verb with its
+    # own semantics. Same dispatcher, same store, no end date.
     "slot_suggestion": {
         "done": {},
         "undo_done": {},
@@ -168,6 +171,7 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "snooze_1d": {},
         "snooze_3d": {},
         "snooze_7d": {},
+        "snooze_until_i_say": {},
         "unsnooze": {},
     },
     # email_urgent (#27 slice 1) — ack-only capability ceiling. Like slot's, the
@@ -554,6 +558,8 @@ def _dispatch_slot_snooze(
             feed_item_id, action_id,
         )
 
+    # ``None`` days = the indefinite rung (#14). The label is derived inside
+    # add_snooze so the store's vocabulary has one author.
     days = SNOOZE_ACTIONS[action_id]
     lane = _slot_lane(evidence)
     entry = add_snooze(
@@ -562,19 +568,27 @@ def _dispatch_slot_snooze(
         today=_today_for(config),
         lane=lane,
         due_iso=str(evidence.get("due_iso") or ""),
-        duration_label=action_id.removeprefix("snooze_"),
     )
     # Verb-stamped so "what did I snooze?" is answerable and the FE has a place
-    # to hang an undo affordance (UI deferred).
+    # to hang an undo affordance (the staged snooze list reads this verb).
     feed_store.set_state(feed_item_id, STATE_ACTED, action=SNOOZE_ACTED_VERB)
     log.info(
         "board.snooze", id=feed_item_id, key=key, lane=lane, days=days,
-        until=entry.snoozed_until, overdue_at_snooze=entry.overdue_at_snooze,
+        # "" for the indefinite rung — the log says the same thing the store
+        # does (no end date), rather than inventing one for the sake of a
+        # uniformly-shaped field.
+        until=entry.snoozed_until, indefinite=days is None,
+        overdue_at_snooze=entry.overdue_at_snooze,
     )
-    return ActResult(
-        True, STATUS_ACTED, f"snoozed until {entry.snoozed_until}",
-        feed_item_id, action_id,
+    # Say what actually happened. "snoozed until " with nothing after the
+    # preposition is the trailing-colon failure in another costume — the
+    # indefinite rung gets its own sentence rather than a blank where the
+    # date should be.
+    detail = (
+        "snoozed until you say otherwise" if days is None
+        else f"snoozed until {entry.snoozed_until}"
     )
+    return ActResult(True, STATUS_ACTED, detail, feed_item_id, action_id)
 
 
 def _dispatch_slot_completion(
