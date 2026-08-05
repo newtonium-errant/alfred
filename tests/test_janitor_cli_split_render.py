@@ -42,7 +42,7 @@ def _sweep(
         issues_found=found,
         issues_actionable=actionable,
         issues_not_janitor_fixable=not_fixable,
-        issues_known_cohort=cohort,
+        issues_spam_cohort=cohort,
     )
 
 
@@ -71,12 +71,12 @@ def test_the_reported_incident_shape_reads_correctly() -> None:
     )
     assert line == (
         "Issues found: 2075 (12 actionable, 2063 not janitor-fixable; "
-        "11 of the actionable are known-debt cohort)"
+        "11 of the actionable are spam-cohort)"
     )
 
 
 def test_cohort_clause_is_omitted_when_empty() -> None:
-    """No ``; 0 known-debt cohort`` tail on an instance with no markers.
+    """No ``; 0 spam-cohort`` tail on an instance with no markers.
 
     Not a silent-absence violation: the parenthetical's presence already
     proves the segregation ran, so a missing cohort clause reads as "none",
@@ -123,6 +123,25 @@ def test_a_split_that_does_not_conserve_is_refused() -> None:
 
 def test_conserving_split_is_accepted() -> None:
     assert split_is_available(_sweep(found=5, actionable=2, not_fixable=3)) is True
+
+
+def test_an_unpersisted_label_only_issue_fails_closed() -> None:
+    """The #47 interaction, pinned rather than left to be discovered.
+
+    ``classify_counts`` conserves three ways; ``SweepResult`` persists two of
+    the terms, because the third is 0 for every sweep that can occur today. If
+    a producer is ever wired for SEM005, those issues count toward
+    ``issues_found`` but land in neither persisted bucket — and the operator
+    must get "split not recorded", never a parenthetical that fails to add up.
+
+    Simulated here by the shape such a sweep would have: 6 issues found, 5
+    accounted for in the two persisted buckets, 1 unrepresented.
+    """
+    unaccounted = _sweep(found=6, actionable=2, not_fixable=3)
+    assert split_is_available(unaccounted) is False
+    assert format_issue_split(unaccounted) == (
+        f"Issues found: 6 ({SPLIT_UNAVAILABLE})"
+    )
 
 
 def test_zero_issue_sweep_is_never_split_available() -> None:

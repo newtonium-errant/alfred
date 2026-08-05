@@ -137,23 +137,22 @@ LABEL_ONLY_CODES: frozenset[IssueCode] = frozenset({
 # Anything janitor can act on, by either path.
 ACTIONABLE_CODES: frozenset[IssueCode] = _AGENT_CODES | AUTOFIX_FIXABLE_CODES
 
-# Everything janitor cannot remediate, for COUNTING purposes. Two different
-# reasons, one operator-facing bucket: the scope-blocked codes above, plus the
-# label-only vocabulary. If a SEM005 ever did materialise it would be
-# unroutable, so "not janitor-fixable" is the honest bucket for it — and
-# folding it in keeps ``actionable + not_janitor_fixable == total`` true over
-# EVERY code, so no issue can fall out of both buckets and vanish.
-UNFIXABLE_CODES: frozenset[IssueCode] = (
-    NOT_JANITOR_FIXABLE_CODES | LABEL_ONLY_CODES
-)
 
-
-#: The known-debt cohort marker (#19-B, D2 ruled). A LINK001 whose record
-#: already carries a ``LINK001``-prefixed janitor_note has been looked at
-#: before: real dangling links, already triaged, deliberately not
-#: actionable-today. Counting them inside ``actionable`` let one historical
-#: cohort dominate the bucket and hide the handful of FRESH breaks that a
-#: person should actually look at this morning.
+#: The spam-cohort marker (#19-B, D2 ruled). A LINK001 whose record already
+#: carries a ``LINK001``-prefixed janitor_note has been looked at before: real
+#: dangling links, already triaged, deliberately not actionable-today.
+#: Counting them inside ``actionable`` let one historical cohort dominate the
+#: bucket and hide the handful of FRESH breaks that a person should actually
+#: look at this morning.
+#:
+#: NAMING, so nobody has to re-derive it: "spam cohort" is the operator-facing
+#: term from the D2 ruling, and it names the POPULATION (the ~2,075 links whose
+#: sources were spam-derived), not a property this marker tests. What the
+#: marker actually encodes is *already-triaged*: a LINK001-prefixed note means
+#: the janitor has been here before, whatever the record's provenance. In the
+#: measured vault ~590 of those notes read "scanner false positive". So this
+#: counts triaged LINK001 debt, which is the cohort in practice — but do not
+#: read the field name as an assertion that a given record came from spam.
 #:
 #: The marker is not invented here — it is the note the agent already writes
 #: under the SKILL's LINK001 procedure, and the #30 SKILL guard protects that
@@ -173,8 +172,8 @@ UNFIXABLE_CODES: frozenset[IssueCode] = (
 COHORT_NOTE_PREFIX = "LINK001"
 
 
-def is_known_cohort_issue(issue: Issue, janitor_note: str | None) -> bool:
-    """Is this LINK001 part of the known-debt cohort?
+def is_spam_cohort_issue(issue: Issue, janitor_note: str | None) -> bool:
+    """Is this LINK001 part of the spam cohort (already-triaged link debt)?
 
     Keyed on the RECORD's existing janitor_note, not on the issue — the issue
     is regenerated from scratch every sweep and carries no history, so the note
@@ -188,10 +187,21 @@ def is_known_cohort_issue(issue: Issue, janitor_note: str | None) -> bool:
     link is genuinely fixed the scanner emits no LINK001 for it, so it
     contributes nothing. The note only ever discriminates among records that
     have a LIVE broken link right now.
+
+    The match is prefix + WORD BOUNDARY, not a bare ``startswith``. No current
+    IssueCode collides (``LINK002`` differs at the last character), so this is
+    hardening rather than a fix — but a future ``LINK0011``-shaped code would
+    silently start counting into this cohort, and a cohort that quietly grows
+    by enum addition is exactly the kind of number this feature exists to stop.
     """
     if issue.code is not IssueCode.BROKEN_WIKILINK:
         return False
-    return (janitor_note or "").lstrip().startswith(COHORT_NOTE_PREFIX)
+    note = (janitor_note or "").lstrip()
+    if not note.startswith(COHORT_NOTE_PREFIX):
+        return False
+    # Empty trailer means the note is exactly the bare code, which IS a marker.
+    trailer = note[len(COHORT_NOTE_PREFIX):][:1]
+    return not (trailer.isalnum() or trailer == "_")
 
 
 def classify_counts(
@@ -201,19 +211,27 @@ def classify_counts(
 ) -> dict[str, int]:
     """Split issues into the operator-facing buckets.
 
-    Returns ``{"actionable", "not_janitor_fixable", "known_cohort", "total"}``.
+    Returns ``{"actionable", "not_janitor_fixable", "label_only",
+    "spam_cohort", "total"}``.
 
-    ``not_janitor_fixable`` counts ``UNFIXABLE_CODES`` — the scope-blocked
-    codes plus the label-only vocabulary — so the sum covers every member of
-    the enum and nothing can fall out of both buckets.
+    CONSERVATION IS THREE-WAY::
 
-    ``actionable + not_janitor_fixable == total`` STILL holds — the cohort is a
-    SUBSET of actionable, reported alongside it rather than carved out of the
-    partition. That choice is deliberate: the cohort is genuinely fixable
-    (the #44 ``link001_repair`` campaign drains it), so removing it from
-    ``actionable`` would understate what the system can still do. It is broken
-    out because it is *known debt being drained on a schedule*, not because it
-    is unfixable.
+        actionable + not_janitor_fixable + label_only == total
+
+    one term per remediation class, so every member of the enum lands in
+    exactly one and nothing can fall out of all of them and vanish from the
+    total. ``label_only`` is 0 in practice — those codes have no producer — but
+    it is counted rather than folded into ``not_janitor_fixable`` so that the
+    day a producer IS wired, the arithmetic keeps working and the new issues
+    show up somewhere instead of being silently absorbed into a bucket that
+    means something else.
+
+    ``spam_cohort`` is NOT a fourth term: it is a SUBSET of ``actionable``,
+    reported alongside it rather than carved out of the partition. That choice
+    is deliberate: the cohort is genuinely fixable (the #44 ``link001_repair``
+    campaign drains it), so removing it from ``actionable`` would understate
+    what the system can still do. It is broken out because it is *known debt
+    being drained on a schedule*, not because it is unfixable.
 
     Two views of one number, and they must not read as double-counting:
 
@@ -231,15 +249,17 @@ def classify_counts(
     than a silently wrong cohort figure.
     """
     actionable = sum(1 for i in issues if i.code in ACTIONABLE_CODES)
-    not_fixable = sum(1 for i in issues if i.code in UNFIXABLE_CODES)
+    not_fixable = sum(1 for i in issues if i.code in NOT_JANITOR_FIXABLE_CODES)
+    label_only = sum(1 for i in issues if i.code in LABEL_ONLY_CODES)
     notes = cohort_notes or {}
     cohort = sum(
-        1 for i in issues if is_known_cohort_issue(i, notes.get(i.file))
+        1 for i in issues if is_spam_cohort_issue(i, notes.get(i.file))
     )
     return {
         "actionable": actionable,
         "not_janitor_fixable": not_fixable,
-        "known_cohort": cohort,
+        "label_only": label_only,
+        "spam_cohort": cohort,
         "total": len(issues),
     }
 
@@ -288,12 +308,12 @@ class SweepResult:
     # under the schema-tolerance contract.
     issues_actionable: int = 0
     issues_not_janitor_fixable: int = 0
-    #: #19-B — the known-debt LINK001 cohort. A SUBSET of
+    #: #19-B — the spam cohort (already-triaged LINK001 debt). A SUBSET of
     #: ``issues_actionable``, not a carve-out from it (see
     #: ``classify_counts``). Falls as the #44 link001_repair campaign
     #: drains it, which is the same population that campaign's
     #: ``remaining`` tracks — debt-standing here, drain-progress there.
-    issues_known_cohort: int = 0
+    issues_spam_cohort: int = 0
     files_fixed: int = 0
     files_deleted: int = 0
     agent_invoked: bool = False
@@ -310,7 +330,7 @@ class SweepResult:
             "issues_by_severity": self.issues_by_severity,
             "issues_actionable": self.issues_actionable,
             "issues_not_janitor_fixable": self.issues_not_janitor_fixable,
-            "issues_known_cohort": self.issues_known_cohort,
+            "issues_spam_cohort": self.issues_spam_cohort,
             "files_fixed": self.files_fixed,
             "files_deleted": self.files_deleted,
             "agent_invoked": self.agent_invoked,
@@ -337,7 +357,7 @@ class SweepResult:
             issues_by_severity=d.get("issues_by_severity") or {},
             issues_actionable=d.get("issues_actionable") or 0,
             issues_not_janitor_fixable=d.get("issues_not_janitor_fixable") or 0,
-            issues_known_cohort=d.get("issues_known_cohort") or 0,
+            issues_spam_cohort=d.get("issues_spam_cohort") or 0,
             files_fixed=d.get("files_fixed") or 0,
             files_deleted=d.get("files_deleted") or 0,
             agent_invoked=bool(d.get("agent_invoked", False)),

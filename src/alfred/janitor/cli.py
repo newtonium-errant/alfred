@@ -28,7 +28,19 @@ SPLIT_UNAVAILABLE = "split not recorded"
 
 
 def split_is_available(result: SweepResult) -> bool:
-    """Does this sweep carry a trustworthy actionable/not-fixable split?"""
+    """Does this sweep carry a trustworthy actionable/not-fixable split?
+
+    Conservation is the test, and it does double duty. ``SweepResult`` persists
+    only two of ``classify_counts``' three conservation terms — ``label_only``
+    has no field, because it is 0 for every sweep that can currently occur (the
+    label-only codes have no producer; see ``issues.LABEL_ONLY_CODES``). If a
+    producer is ever wired, those issues count toward ``issues_found`` while
+    landing in neither persisted bucket, the sum stops matching, and this
+    returns False — so the CLI renders "split not recorded" rather than a
+    parenthetical whose numbers do not add up. Fail-closed, in the direction
+    that refuses to publish a lying figure. The day that happens, the fix is to
+    persist the third term, and the wrong-looking output is the prompt to do it.
+    """
     return (
         result.issues_found > 0
         and result.issues_actionable + result.issues_not_janitor_fixable
@@ -52,7 +64,7 @@ def format_issue_split(result: SweepResult) -> str:
         Issues found: 0
         Issues found: 5 (5 actionable, 0 not janitor-fixable)
         Issues found: 2075 (12 actionable, 2063 not janitor-fixable; 2051 of
-                            the actionable are known-debt cohort)
+                            the actionable are spam-cohort)
         Issues found: 2075 (split not recorded)
 
     No parenthetical on zero — there is nothing to disambiguate, and a
@@ -63,7 +75,7 @@ def format_issue_split(result: SweepResult) -> str:
     silent-absence violation: the parenthetical's own presence already proves
     the segregation ran, so a missing cohort clause reads as "none", not as
     "did this even happen". On an instance with no markers at all — a fresh
-    vault — every line would otherwise carry a permanent "; 0 known-debt".
+    vault — every line would otherwise carry a permanent "; 0 spam-cohort".
     """
     n = result.issues_found
     if n == 0:
@@ -75,10 +87,9 @@ def format_issue_split(result: SweepResult) -> str:
         f"{result.issues_actionable} actionable, "
         f"{result.issues_not_janitor_fixable} not janitor-fixable"
     )
-    if result.issues_known_cohort > 0:
+    if result.issues_spam_cohort > 0:
         parts += (
-            f"; {result.issues_known_cohort} of the actionable are "
-            "known-debt cohort"
+            f"; {result.issues_spam_cohort} of the actionable are spam-cohort"
         )
     return f"Issues found: {n} ({parts})"
 
@@ -227,7 +238,7 @@ def cmd_history(config: JanitorConfig, limit: int = 10) -> None:
         if split_is_available(sweep):
             actionable = str(sweep.issues_actionable)
             not_fix = str(sweep.issues_not_janitor_fixable)
-            cohort = str(sweep.issues_known_cohort)
+            cohort = str(sweep.issues_spam_cohort)
         else:
             actionable = not_fix = cohort = "—"
         print(
@@ -239,7 +250,8 @@ def cmd_history(config: JanitorConfig, limit: int = 10) -> None:
         "\nAction = janitor can act on it. NotFix = real, correctly detected, "
         "no janitor path to fix it\n(DIR001 move-blocked, STUB001 "
         "janitor_enrich scope, ORPHAN001/SEM001-004 flag-only).\nCohort = the "
-        "subset of Action that is already-triaged LINK001 debt. '—' = sweep "
+        "subset of Action that is spam-cohort (already-triaged LINK001 "
+        "debt). '—' = sweep "
         "predates the split."
     )
 

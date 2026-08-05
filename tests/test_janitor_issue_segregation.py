@@ -41,13 +41,12 @@ from alfred.janitor.issues import (
     AUTOFIX_FIXABLE_CODES,
     LABEL_ONLY_CODES,
     NOT_JANITOR_FIXABLE_CODES,
-    UNFIXABLE_CODES,
     Issue,
     IssueCode,
     Severity,
     SweepResult,
     classify_counts,
-    is_known_cohort_issue,
+    is_spam_cohort_issue,
 )
 from alfred.janitor.state import JanitorState
 
@@ -84,20 +83,23 @@ def test_remediation_classes_are_disjoint() -> None:
     assert not NOT_JANITOR_FIXABLE_CODES & LABEL_ONLY_CODES
 
 
-def test_label_only_codes_are_counted_as_not_fixable() -> None:
-    """#47: a label-only code is unroutable, so it counts as not-fixable.
+def test_label_only_codes_get_their_own_conservation_term() -> None:
+    """#47: a label-only code counts in ``label_only``, its own term.
 
-    This is what keeps conservation true over EVERY member of the enum after
-    the demotion — without it, a SEM005 would fall out of both buckets and
-    disappear from the operator's total. It cannot occur today (no producer),
-    which is exactly why it needs a pin: an invariant that only holds because
-    the input never arrives is one refactor away from being false.
+    Deliberately NOT folded into ``not_janitor_fixable``. Both choices keep
+    conservation true, but only this one keeps it MEANINGFUL: if a producer is
+    ever wired for SEM005, the issues surface in a bucket that says what they
+    are, rather than being absorbed into a bucket that means "scope-blocked"
+    and quietly changing what that number reports.
+
+    It cannot occur today (no producer), which is exactly why it needs a pin —
+    an invariant that only holds because the input never arrives is one commit
+    away from being false.
     """
-    assert LABEL_ONLY_CODES <= UNFIXABLE_CODES
     split = classify_counts([_issue(IssueCode.VAGUE_NOTE)])
     assert split == {
-        "actionable": 0, "not_janitor_fixable": 1, "known_cohort": 0,
-        "total": 1,
+        "actionable": 0, "not_janitor_fixable": 0, "label_only": 1,
+        "spam_cohort": 0, "total": 1,
     }
 
 
@@ -151,33 +153,42 @@ def test_classify_counts_splits_and_conserves() -> None:
         _issue(IssueCode.ORPHANED_RECORD),      # not fixable
     ]
     split = classify_counts(issues)
-    # #19-B adds known_cohort — a SUBSET of actionable, so conservation is
-    # unchanged. 0 here: no cohort_notes supplied, which is the honest
-    # default (a caller that has not wired the notes must get 0, not a
-    # guess).
+    # #19-B adds spam_cohort — a SUBSET of actionable, not a conservation
+    # term. 0 here: no cohort_notes supplied, which is the honest default
+    # (a caller that has not wired the notes must get 0, not a guess).
     assert split == {
-        "actionable": 2, "not_janitor_fixable": 3, "known_cohort": 0,
-        "total": 5,
+        "actionable": 2, "not_janitor_fixable": 3, "label_only": 0,
+        "spam_cohort": 0, "total": 5,
     }
 
 
 def test_classify_counts_conserves_across_every_code() -> None:
-    """actionable + not_fixable == total, for one issue of EVERY code.
+    """Three-way conservation, for one issue of EVERY code.
 
-    Conservation is the anti-masking invariant: if a future edit lets an
-    issue fall out of both buckets, the split would under-report and this
-    fails.
+    ``actionable + not_janitor_fixable + label_only == total`` — one term per
+    remediation class. Conservation is the anti-masking invariant: if a future
+    edit lets an issue fall out of all three buckets, the split would
+    under-report and this fails. The pin was NOT weakened to skip the demoted
+    codes when #47 landed; the sum grew a term instead, which is what keeps it
+    an honest statement about the whole enum.
     """
     issues = [_issue(code) for code in IssueCode]
     split = classify_counts(issues)
     assert split["total"] == len(list(IssueCode))
-    assert split["actionable"] + split["not_janitor_fixable"] == split["total"]
+    assert (
+        split["actionable"]
+        + split["not_janitor_fixable"]
+        + split["label_only"]
+        == split["total"]
+    )
+    # And the demoted codes are exactly what lands in the third term.
+    assert split["label_only"] == len(LABEL_ONLY_CODES)
 
 
 def test_classify_counts_empty_is_zeroed() -> None:
     assert classify_counts([]) == {
-        "actionable": 0, "not_janitor_fixable": 0, "known_cohort": 0,
-        "total": 0,
+        "actionable": 0, "not_janitor_fixable": 0, "label_only": 0,
+        "spam_cohort": 0, "total": 0,
     }
 
 
@@ -318,7 +329,7 @@ def test_sweep_emits_issue_split_signal(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------
-# #19-B — the known-debt cohort (D2 ruled)
+# #19-B — the spam cohort (D2 ruled)
 # --------------------------------------------------------------------
 
 #: Verbatim shapes taken from the vault, not invented for the test. Measured
@@ -352,13 +363,47 @@ def test_cohort_matches_the_note_shapes_the_agent_actually_writes() -> None:
     count to the agent's prose style.
     """
     link = _issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md")
-    assert is_known_cohort_issue(link, REAL_COHORT_NOTE) is True
-    assert is_known_cohort_issue(link, REAL_COHORT_NOTE_NO_DASH) is True
-    assert is_known_cohort_issue(link, REAL_COHORT_NOTE_WITH_LINK) is True
+    assert is_spam_cohort_issue(link, REAL_COHORT_NOTE) is True
+    assert is_spam_cohort_issue(link, REAL_COHORT_NOTE_NO_DASH) is True
+    assert is_spam_cohort_issue(link, REAL_COHORT_NOTE_WITH_LINK) is True
     # A different code's note is not a LINK001 cohort marker.
-    assert is_known_cohort_issue(link, "ORPHAN001 — no inbound links") is False
+    assert is_spam_cohort_issue(link, "ORPHAN001 — no inbound links") is False
     # Leading whitespace from a YAML block scalar must not defeat it.
-    assert is_known_cohort_issue(link, "  " + REAL_COHORT_NOTE) is True
+    assert is_spam_cohort_issue(link, "  " + REAL_COHORT_NOTE) is True
+
+
+def test_the_em_dash_is_the_literal_production_character() -> None:
+    """Guards the fixture itself, not the code.
+
+    The whole class of bug this feature nearly shipped was a fixture written in
+    a dialect no writer produces. A later edit that "tidied" U+2014 to a hyphen
+    would leave every other pin green while silently removing the only fixture
+    that represents 1,372 of the 1,407 real markers.
+    """
+    assert "—" in REAL_COHORT_NOTE
+    assert "—" in REAL_COHORT_NOTE_WITH_LINK
+    assert "--" not in REAL_COHORT_NOTE
+
+
+def test_prefix_match_respects_a_word_boundary() -> None:
+    """A future ``LINK0011``-shaped code must not fall into this cohort.
+
+    Hardening, not a bug fix: no current IssueCode collides (``LINK002``
+    differs at the last character). But a cohort that silently grows because
+    someone added an enum member is the same failure mode as a cohort that
+    silently reads 0 — the count stops meaning what its name says, and nothing
+    goes red. Credit: builder-b2 caught this in handover review.
+    """
+    link = _issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md")
+    assert is_spam_cohort_issue(link, "LINK0011 — some future code") is False
+    assert is_spam_cohort_issue(link, "LINK001X — not our code") is False
+    assert is_spam_cohort_issue(link, "LINK001_alt — not our code") is False
+    # The boundary characters that DO mean "this is a LINK001 note".
+    assert is_spam_cohort_issue(link, "LINK001 — with a space") is True
+    assert is_spam_cohort_issue(link, "LINK001: colon form") is True
+    assert is_spam_cohort_issue(link, "LINK001") is True, (
+        "a note that is exactly the bare code is still a marker"
+    )
 
 
 def test_cohort_is_a_subset_of_actionable_not_a_carve_out() -> None:
@@ -377,7 +422,7 @@ def test_cohort_is_a_subset_of_actionable_not_a_carve_out() -> None:
     split = classify_counts(
         issues, cohort_notes={"note/A.md": REAL_COHORT_NOTE},
     )
-    assert split["known_cohort"] == 1
+    assert split["spam_cohort"] == 1
     assert split["actionable"] == 2, "cohort stays counted in actionable"
     assert split["actionable"] + split["not_janitor_fixable"] == split["total"]
 
@@ -387,17 +432,17 @@ def test_absent_cohort_notes_yield_zero_not_a_guess() -> None:
     Inferring a cohort from the issue alone would be a fabricated number on the
     operator's headline line."""
     issues = [_issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md")]
-    assert classify_counts(issues)["known_cohort"] == 0
+    assert classify_counts(issues)["spam_cohort"] == 0
 
 
 def test_only_LINK001_can_be_cohort() -> None:
     """A record carrying the marker does not drag its OTHER issues into the
     cohort. The cohort is a LINK001 backlog; admitting other codes would
     quietly shrink the actionable bucket for reasons nobody asked for."""
-    assert is_known_cohort_issue(
+    assert is_spam_cohort_issue(
         _issue(IssueCode.BROKEN_WIKILINK, rel="note/A.md"), REAL_COHORT_NOTE,
     ) is True
-    assert is_known_cohort_issue(
+    assert is_spam_cohort_issue(
         _issue(IssueCode.WRONG_DIRECTORY, rel="note/A.md"), REAL_COHORT_NOTE,
     ) is False
 
@@ -406,9 +451,9 @@ def test_a_fresh_link001_is_not_cohort() -> None:
     """The whole point: a NEW break on a record with no marker must stay
     visible as actionable-today rather than being absorbed into the backlog."""
     fresh = _issue(IssueCode.BROKEN_WIKILINK, rel="note/New.md")
-    assert is_known_cohort_issue(fresh, None) is False
-    assert is_known_cohort_issue(fresh, "") is False
-    assert is_known_cohort_issue(fresh, "STUB001 — something else") is False
+    assert is_spam_cohort_issue(fresh, None) is False
+    assert is_spam_cohort_issue(fresh, "") is False
+    assert is_spam_cohort_issue(fresh, "STUB001 — something else") is False
 
 
 def _sweep_with_one_marked_and_one_fresh_break(tmp_path: Path):
@@ -478,12 +523,12 @@ def test_cohort_count_is_wired_through_run_sweep(tmp_path: Path) -> None:
 
     broken = [i for i in result.issues if i.code == IssueCode.BROKEN_WIKILINK]
     assert len(broken) == 2, f"fixture must produce 2 LINK001, got {len(broken)}"
-    assert result.issues_known_cohort == 1, (
+    assert result.issues_spam_cohort == 1, (
         "exactly the triaged record is cohort — a 0 here means run_sweep never "
         "read the notes; a 2 means the marker is being ignored"
     )
     # Still a subset of actionable, and conservation is untouched.
-    assert result.issues_known_cohort <= result.issues_actionable
+    assert result.issues_spam_cohort <= result.issues_actionable
     assert (
         result.issues_actionable + result.issues_not_janitor_fixable
         == result.issues_found
@@ -506,7 +551,7 @@ def test_sweep_signal_carries_the_cohort_field(tmp_path: Path) -> None:
 
     matches = [c for c in captured if c.get("event") == "sweep.issue_split"]
     assert len(matches) == 1
-    assert matches[0]["known_cohort"] == result.issues_known_cohort == 1
+    assert matches[0]["spam_cohort"] == result.issues_spam_cohort == 1
 
 
 def test_unreadable_record_degrades_to_not_cohort(tmp_path: Path) -> None:
@@ -528,4 +573,4 @@ def test_unreadable_record_degrades_to_not_cohort(tmp_path: Path) -> None:
     result = asyncio.run(
         daemon_mod.run_sweep(config, state, skills_dir, structural_only=True)
     )
-    assert result.issues_known_cohort == 0
+    assert result.issues_spam_cohort == 0

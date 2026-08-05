@@ -185,8 +185,18 @@ class TestAgentActionableFilter:
         assert "person/Foo.md" not in report
 
     def test_every_deterministic_code_excluded(self) -> None:
-        # Belt-and-braces: every code NOT in the allowlist is a
-        # scanner-handled code that must never reach the agent.
+        # Belt-and-braces: none of the scanner-handled codes may reach the
+        # agent.
+        #
+        # NOTE the prose here changed with #47 and the change matters. This
+        # used to read "every code NOT in the allowlist is a scanner-handled
+        # code" — true when the allowlist held four codes, FALSE the moment
+        # SEM005/SEM006 were demoted, because they are now neither in the
+        # allowlist nor scanner-handled. The assertion below would have kept
+        # passing while the sentence above it lied; the union check at the end
+        # is what makes the three-way disposition mechanical instead of
+        # prose-only. (Caught by builder-b2 in handover review — same trap
+        # class as the KNOWN_TYPES_BY_SCOPE comment in CLAUDE.md.)
         deterministic = {
             IssueCode.MISSING_REQUIRED_FIELD,   # FM001
             IssueCode.INVALID_TYPE_VALUE,       # FM002
