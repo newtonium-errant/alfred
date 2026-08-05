@@ -516,14 +516,31 @@ def _normalize_transcript(text: str) -> str:
 #: with no signal. At ~4 chars/token that window is ~896 chars; this budget keeps a
 #: deliberate margin because the ratio is an approximation, not a guarantee.
 #:
-#: MEASURED 2026-08-05 against the 28 shipped static terms: 303 chars (~75 tokens),
-#: i.e. roughly 149 tokens of headroom, or ~54 more average-length terms. Nothing
-#: bounded this before — the #54 learned-vocabulary loop is what makes it matter,
-#: since an append-on-approval path grows the list monotonically and the operator
-#: approving one more term cannot see the ceiling. The cap is in CHARS rather than
-#: term count on purpose: term lengths vary 3x here ("gcal" vs
-#: "library-alexandria"), so a count cap would bind at the wrong place.
-_WHISPER_PROMPT_CHAR_BUDGET = 700
+#: MEASURED 2026-08-05. Nothing bounded this before — the #54 learned-vocabulary
+#: loop is what makes it matter, since an append-on-approval path grows the list
+#: monotonically and the operator approving one more term cannot see the ceiling.
+#:
+#: THE ARITHMETIC, because this number has to agree with
+#: ``stt_vocab_learning.MAX_LEARNED_TERMS`` and a bare constant cannot show that:
+#:
+#:   28 shipped static terms                        =  303 chars (~75 tokens)
+#: + 20 learned terms at an 18-char worst case      = ~400 chars
+#:                                                    ----------
+#:                                                    ~703 chars (~175 tokens)
+#:
+#: 800 leaves headroom above that worst case and still sits ~24 tokens under the
+#: ~224-token window. The operator's real terms average 11.3 chars ("chicken
+#: tractor", "front run", "front coop"), so the true total is nearer 570 — the
+#: 18-char figure is deliberately pessimistic, which is the right direction for a
+#: hazard that degrades SILENTLY. An end-to-end pin in
+#: ``tests/test_stt_vocab_learning.py`` drives a fully-spent learned budget through
+#: this function and fails if the two caps stop agreeing; it caught exactly that
+#: disagreement at 700.
+#:
+#: The cap is in CHARS rather than term count on purpose: term lengths vary 3x
+#: here ("gcal" vs "library-alexandria"), so a count cap would bind at the wrong
+#: place.
+_WHISPER_PROMPT_CHAR_BUDGET = 800
 
 
 def _vocab_to_whisper_prompt(vocab: list[str]) -> str:
