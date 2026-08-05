@@ -111,10 +111,21 @@ beforeEach(() => {
   vi.useFakeTimers();
   originalPointerEvent = globalWithPointer.PointerEvent;
   globalWithPointer.PointerEvent = TestPointerEvent;
-  // jsdom implements neither pointer capture method; the drag effect calls
-  // setPointerCapture on pointerdown, so without a stub every gesture throws
-  // before the machine is reached. Same class of gap as the scrollIntoView stub
-  // in vitest.setup.ts, but scoped here — only the deck drags a pointer.
+  // jsdom implements neither pointer capture method, and the drag effect calls
+  // setPointerCapture on pointerdown. This stub silences a genuinely thrown
+  // error and matches what a browser does — it is NOT what makes the gestures
+  // work, and unlike the PointerEvent polyfill above it is hygiene rather than
+  // a prerequisite.
+  //
+  // Measured, not assumed (an earlier version of this comment claimed every
+  // gesture "throws before the machine is reached", which is false): with the
+  // stub removed all 15 tests still pass, and each gesture logs one uncaught
+  // `TypeError: el.setPointerCapture is not a function`. onDown sets dragging,
+  // sx and sy on Deck.tsx:151-153 BEFORE the throw on :154, so the machine has
+  // everything it needs; the only casualty is the cosmetic
+  // `el.style.transition = 'none'` on :155. Keep the stub anyway — a suite that
+  // throws on every gesture is one config change away from failing for a reason
+  // that has nothing to do with the code under test.
   originalSetPointerCapture = elementProto.setPointerCapture;
   elementProto.setPointerCapture = function () {};
 });
