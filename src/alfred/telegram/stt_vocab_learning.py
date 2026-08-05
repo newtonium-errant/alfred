@@ -83,6 +83,37 @@ MAX_LEARNED_TERMS = 20
 #: would teach the model a whole clause.
 MAX_TERM_WORDS = 4
 
+#: Widest ``replace`` span still SEARCHED for a correction hiding inside it.
+#:
+#: **THIS IS A PERFORMANCE SHIELD, NOT A QUALITY JUDGMENT** — and saying so is
+#: the point of the constant existing, because it is load-bearing for something
+#: other than what its neighbours above are about. :func:`_rescue_correction` is
+#: QUADRATIC in span length: sub-span WIDTH is capped at
+#: :data:`MAX_TERM_WORDS`, but the start positions iterate both word lists, so
+#: the work grows as ~16·len·len calls to ``SequenceMatcher.ratio()``.
+#:
+#: MEASURED 2026-08-05 (not extrapolated from theory — the curve was timed):
+#: 16 words 0.068s, 32 0.336s, 64 1.51s, 128 6.56s, confirming the quadratic.
+#: A wholly-rewritten dictation is ONE giant replace span, and a message may run
+#: to ``MAX_MESSAGE_CHARS`` (8000) ≈ 1100 words, which extrapolates to ~480s —
+#: EIGHT MINUTES for a single pair, on a function called once per corpus pair on
+#: every Daily Sync render and every ``alfred stt-vocab list``. A 200-pair corpus
+#: multiplies that. Before this bound existed the ``MAX_TERM_WORDS`` early-drop
+#: was the only thing shielding the rescue, so moving the rescue ahead of it (the
+#: WARN-2 fix) removed the shield without replacing it.
+#:
+#: 12 is chosen to keep the WARN-2 win while bounding the cost: the motivating
+#: counterexample — a term corrected with an afterthought typed beside it — needed
+#: only 5-6 words, and 12 comfortably covers a corrected term plus a substantial
+#: afterthought. Worst case at 12 measures 0.036s per span, ~7s across a 200-pair
+#: corpus: bounded, and fine for a daemon render.
+#:
+#: A span wider than this is REFUSED UNEXAMINED, and says so
+#: (``reason="span_too_long"``). That is a deliberate, bounded loss of recall —
+#: the pair stays in the corpus and is re-minable if this is ever revisited with
+#: a cheaper search.
+MAX_RESCUE_SPAN_WORDS = 12
+
 #: How alike a WHOLE replace span must be to count as a mis-hearing.
 #:
 #: A mis-hearing is orthographically close to the truth ("tracker"/"tractor");
@@ -258,16 +289,22 @@ def extract_term_corrections_with_stats(
     """``(corrections, spans_refused)``.
 
     Identical extraction to :func:`extract_term_corrections`, additionally
-    reporting how many ``replace`` spans yielded no term at all — for EITHER
-    reason: too dissimilar to be a mis-hearing (``reason="similarity"``) or too
-    long to be a vocabulary term (``reason="length"``), in both cases with no
-    tighter fragment inside worth rescuing. The count is deliberately the union
-    rather than the similarity gate alone: both refusals leave an identical
-    absence in the output, so a number covering only one of them would answer a
-    narrower question than the operator is asking. The per-span DEBUG line
-    carries ``reason`` for the breakdown; the count answers "how often did a span
-    yield nothing", which is a batch-level question and so cannot be answered
-    from inside the per-pair loop.
+    reporting how many ``replace`` spans yielded no term at all, for ANY of the
+    three reasons:
+
+    * ``similarity`` — term-sized but not a mis-hearing, and nothing tighter
+      inside it either;
+    * ``no_rescuable_fragment`` — searched, but no fragment cleared the rescue
+      floor;
+    * ``span_too_long`` — wider than :data:`MAX_RESCUE_SPAN_WORDS`, so not
+      searched at all (a cost bound — see that constant).
+
+    The count is deliberately the union rather than any single bar: all three
+    leave an IDENTICAL absence in the output, so a number covering one of them
+    would answer a narrower question than the operator is asking. ``reason`` on
+    the per-span DEBUG line carries the breakdown; the count answers "how often
+    did a span yield nothing", which is a batch-level question and so cannot be
+    answered from inside the per-pair loop.
 
     A separate function rather than a widened return, so the existing callers
     (:func:`propose_vocab_additions` aside, the web capture site) keep their
@@ -279,14 +316,21 @@ def extract_term_corrections_with_stats(
     thought, not a correction), and text they DELETED tells us nothing about what
     should have been recognised instead.
 
-    Spans longer than :data:`MAX_TERM_WORDS` are never proposed WHOLE — a
-    five-word replacement is the operator rewriting a sentence, and biasing the
-    model toward a whole clause is not vocabulary. They are not discarded
-    unexamined, though: an over-long span still goes through
-    :func:`_rescue_correction` first, because difflib coalesces a real
-    correction with any afterthought typed beside it, and that afterthought
-    should not cost the correction. Only sub-spans within the word bound can
-    come back, so the guarantee holds.
+    Span width is handled in three tiers, and only the first two are a judgment
+    about vocabulary:
+
+    * ``≤ MAX_TERM_WORDS`` — term-sized: the whole span is judged, then searched
+      inside;
+    * ``≤ MAX_RESCUE_SPAN_WORDS`` — too long to BE a term, but still searched,
+      because difflib coalesces a real correction with any afterthought typed
+      beside it and that afterthought must not cost the correction;
+    * wider — refused UNEXAMINED, because the search is quadratic and a
+      full-length rewrite would cost minutes per pair. A cost bound, not a
+      quality call, and it says which it is (``reason="span_too_long"``).
+
+    A clause can never be proposed through any tier: :func:`_rescue_correction`
+    bounds every sub-span it considers by :data:`MAX_TERM_WORDS` regardless of
+    what it is handed.
 
     Case is preserved in the output (the vocabulary wants "KAL-LE", not
     "kal-le"); comparison is case-insensitive so a capitalisation-only edit is
@@ -357,6 +401,7 @@ def extract_term_corrections_with_stats(
             span_floor=MIN_SPAN_SIMILARITY,
             rescue_floor=MIN_RESCUED_SIMILARITY,
             max_term_words=MAX_TERM_WORDS,
+            max_rescue_span_words=MAX_RESCUE_SPAN_WORDS,
             detail="no term could be mined from this replace span — the pair is "
                    "still in the corpus and re-minable",
         )
@@ -371,23 +416,43 @@ def extract_term_corrections_with_stats(
         if not heard or not meant or heard.casefold() == meant.casefold():
             continue
         score = _similarity(heard, meant)
-        # A span longer than a vocabulary term is a REWRITE taken whole, and must
+        widest = max(i2 - i1, j2 - j1)
+        # THREE TIERS, and the third one is a cost bound rather than a judgment.
+        #
+        # A span longer than a vocabulary term is a REWRITE taken whole and must
         # never be proposed as one — but it may still CONTAIN a real correction,
-        # because difflib coalesces an edit with anything beside it. The original
-        # cut dropped these before the rescue ever ran, so "clean the chicken
-        # tracker" -> "clean the chicken tractor today if you get a chance" lost
-        # the tractor correction entirely AND silently (it was outside the
-        # counter too, so the aggregate read zero while a real correction was
-        # discarded). Try the rescue first; the never-propose-a-clause guarantee
-        # survives because ``_rescue_correction`` bounds every sub-span it
-        # considers by MAX_TERM_WORDS and refuses the whole span by construction.
-        if (i2 - i1) > MAX_TERM_WORDS or (j2 - j1) > MAX_TERM_WORDS:
+        # because difflib coalesces an edit with anything typed beside it. The
+        # first cut dropped every such span before the rescue ran, so "clean the
+        # chicken tracker" -> "clean the chicken tractor today if you get a
+        # chance" lost the tractor correction entirely AND silently (the drop sat
+        # outside the counter too, so the aggregate read zero while a real
+        # correction was discarded).
+        #
+        # The obvious fix — always rescue first — trades that bug for a worse
+        # one: MAX_TERM_WORDS was the ONLY thing shielding a quadratic search
+        # from a full-length rewrite (~480s for one pair, measured curve; see
+        # MAX_RESCUE_SPAN_WORDS). So the bound is WIDENED, not removed.
+        #
+        # In all three tiers the never-propose-a-clause guarantee holds
+        # structurally: ``_rescue_correction`` bounds every sub-span it considers
+        # by MAX_TERM_WORDS and skips the whole span by construction, so nothing
+        # clause-shaped can come back through any of these doors.
+        if widest > MAX_RESCUE_SPAN_WORDS:
+            # Tier 3: too wide to search at all. Refused UNEXAMINED and labelled,
+            # so a bounded recall loss stays visible instead of looking like a
+            # quality verdict the extractor never actually made.
+            _refuse(span_heard, span_meant, heard, meant, score, "span_too_long")
+            continue
+        if widest > MAX_TERM_WORDS:
+            # Tier 2: too long to BE a term, narrow enough to search inside.
+            # This is where the WARN-2 win lives.
             rescued = _rescue_correction(span_heard, span_meant)
             if rescued is not None:
                 out.append(rescued)
                 continue
-            _refuse(span_heard, span_meant, heard, meant, score, "length")
+            _refuse(span_heard, span_meant, heard, meant, score, "no_rescuable_fragment")
             continue
+        # Tier 1: term-sized. Judge the whole span, then look inside it.
         if score >= MIN_SPAN_SIMILARITY:
             out.append((heard, meant))
             continue
@@ -717,6 +782,7 @@ __all__ = [
     "effective_vocab_terms",
     "load_decisions",
     "MAX_LEARNED_TERMS",
+    "MAX_RESCUE_SPAN_WORDS",
     "MAX_TERM_WORDS",
     "MIN_CORRECTION_COUNT",
     "MIN_RESCUED_SIMILARITY",

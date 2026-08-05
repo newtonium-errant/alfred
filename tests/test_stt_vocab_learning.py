@@ -25,6 +25,7 @@ from alfred.telegram.stt_vocab_learning import (
     DECISION_APPROVE,
     DECISION_REJECT,
     MAX_LEARNED_TERMS,
+    MAX_RESCUE_SPAN_WORDS,
     MAX_TERM_WORDS,
     MIN_CORRECTION_COUNT,
     CorrectionPair,
@@ -721,18 +722,89 @@ def test_the_rescued_term_from_a_long_span_is_still_bounded() -> None:
         assert len(meant.split()) <= MAX_TERM_WORDS
 
 
-def test_an_over_long_span_with_nothing_rescuable_is_counted_and_reasoned() -> None:
-    """Still refused when there is genuinely no term inside — but now COUNTED,
-    and labelled so the aggregate can be broken down."""
+def test_a_searched_span_with_nothing_rescuable_is_counted_and_reasoned() -> None:
+    """Tier 2 refusal: wide enough to search, nothing inside cleared the rescue
+    floor. Still refused — but COUNTED, and labelled so the aggregate can be
+    broken down by cause."""
     with structlog.testing.capture_logs() as captured:
         out, refused = extract_term_corrections_with_stats(
-            "one two three", "completely different words entirely plus more text here",
+            "one two three", "completely different words entirely plus more",
         )
     assert out == []
     assert refused == 1
     events = [c for c in captured if c.get("event") == "stt.vocab_span_rejected"]
     assert len(events) == 1
-    assert events[0]["reason"] == "length"
+    assert events[0]["reason"] == "no_rescuable_fragment"
+
+
+def test_a_span_wider_than_the_search_bound_is_refused_UNEXAMINED() -> None:
+    """Tier 3, and the reason it exists is COST, not quality.
+
+    `_rescue_correction` is quadratic in span length, and MAX_TERM_WORDS used to
+    be the only thing shielding it. Measured before this bound existed: 16 words
+    0.068s, 64 1.51s, 128 6.56s — extrapolating to ~480s for one full-length
+    rewritten dictation, on a function called once per corpus pair on every card
+    render. So a span wider than MAX_RESCUE_SPAN_WORDS is refused without being
+    searched, and says so, rather than pretending a verdict was reached.
+    """
+    heard = " ".join(f"alpha{i}" for i in range(MAX_RESCUE_SPAN_WORDS + 8))
+    meant = " ".join(f"beta{i}" for i in range(MAX_RESCUE_SPAN_WORDS + 8))
+    with structlog.testing.capture_logs() as captured:
+        out, refused = extract_term_corrections_with_stats(heard, meant)
+    assert out == []
+    assert refused == 1
+    events = [c for c in captured if c.get("event") == "stt.vocab_span_rejected"]
+    assert len(events) == 1
+    assert events[0]["reason"] == "span_too_long"
+    # The bound is reported, so a reader need not re-derive why it refused.
+    assert events[0]["max_rescue_span_words"] == MAX_RESCUE_SPAN_WORDS
+
+
+def test_the_search_bound_keeps_a_pathological_pair_in_MILLISECONDS() -> None:
+    """The shield, measured rather than asserted by comment.
+
+    A wholly-rewritten full-length dictation (MAX_MESSAGE_CHARS 8000 is ~1100
+    words) is ONE giant replace span — the exact input that cost ~8 minutes per
+    pair while the rescue was unbounded. A generous ceiling: the point is
+    milliseconds-not-minutes, and a bound this loose still fails by ~1000x if the
+    shield is ever removed.
+    """
+    import time
+
+    heard = " ".join(f"alpha{i}" for i in range(1100))
+    meant = " ".join(f"beta{i}" for i in range(1100))
+    t0 = time.perf_counter()
+    out, refused = extract_term_corrections_with_stats(heard, meant)
+    elapsed = time.perf_counter() - t0
+    assert out == []
+    assert refused == 1
+    assert elapsed < 1.0, f"pathological pair took {elapsed:.2f}s — the search bound is not holding"
+
+
+def test_EVERY_refusal_reason_is_reachable_by_some_input() -> None:
+    """No dead branches. A `reason` value no input can produce is a lie in the
+    vocabulary of the log — the SEM005/006 precedent, where unreachable codes sat
+    in a published set for months. Each tier gets a concrete driving input here,
+    so the taxonomy cannot outgrow the code.
+    """
+    drivers = {
+        "similarity": ("one two three", "completely different words"),
+        "no_rescuable_fragment": (
+            "one two three", "completely different words entirely plus more",
+        ),
+        "span_too_long": (
+            " ".join(f"a{i}" for i in range(MAX_RESCUE_SPAN_WORDS + 8)),
+            " ".join(f"b{i}" for i in range(MAX_RESCUE_SPAN_WORDS + 8)),
+        ),
+    }
+    for expected, (heard, meant) in drivers.items():
+        with structlog.testing.capture_logs() as captured:
+            extract_term_corrections_with_stats(heard, meant)
+        reasons = [
+            c.get("reason") for c in captured
+            if c.get("event") == "stt.vocab_span_rejected"
+        ]
+        assert expected in reasons, f"no input reaches reason={expected!r}"
 
 
 def test_a_similarity_refusal_is_labelled_as_such() -> None:
@@ -754,7 +826,7 @@ def test_the_aggregate_covers_BOTH_refusal_reasons() -> None:
     narrower question than the operator asked."""
     pairs = [
         _pair("one two three", "completely different words"),                        # similarity
-        _pair("one two three", "completely different words entirely plus more here"),  # length
+        _pair("one two three", "completely different words entirely plus more"),  # no_rescuable_fragment
         _pair("clean the chicken tracker", "clean the chicken tractor"),             # accepted
     ]
     with structlog.testing.capture_logs() as captured:
