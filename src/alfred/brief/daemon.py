@@ -285,20 +285,27 @@ def _render_drip_body(config: BriefConfig, today_local: date) -> str | None:
     effect, and a campaign that only advances when someone reads about it is
     not a scheduled drain.
 
-    Returns ``None`` for an instance with no campaigns configured (deploy-inert)
-    and for any drip-side failure: the brief is the operator's primary surface
-    and must still render. A failure is logged with its type rather than
-    swallowed, so an omitted section is diagnosable.
+    Returns ``None`` ONLY for an instance with no campaigns configured — that
+    is the deploy-inert case, and it is the sole permitted silence.
+
+    **A campaign that fails to build still gets a line.** Dropping it would
+    make "this campaign is broken" and "this campaign was never configured"
+    identical on the operator's primary surface, which is the exact ambiguity
+    the intentionally-left-blank rule exists to forbid — and it is not
+    hypothetical: enabling ``link001_repair`` before its frozen work-list file
+    exists (task #50) produces precisely that silence on day one. Same shape
+    and same wording as ``drip.cli.cmd_status`` one file over, so the two
+    operator surfaces read alike.
     """
     drip_cfg = getattr(config, "drip", None)
     if drip_cfg is None or not getattr(drip_cfg, "campaigns", None):
         return None
 
-    from alfred.drip.brief_line import render_drip_body
+    from alfred.drip.brief_line import render_campaign_line
     from alfred.drip.state import campaign_state_path, load_state
     from alfred.drip.wiring import DripConfigError, build_campaign, build_progress
 
-    progresses = []
+    lines: list[str] = []
     for name, ccfg in sorted(drip_cfg.campaigns.items()):
         try:
             campaign = build_campaign(name, ccfg, drip_cfg)
@@ -306,17 +313,21 @@ def _render_drip_body(config: BriefConfig, today_local: date) -> str | None:
                 campaign_state_path(drip_cfg.data_dir, drip_cfg.instance, name),
                 name,
             )
-            progresses.append(
-                build_progress(name, campaign, state, ccfg, today=today_local)
+            lines.append(
+                render_campaign_line(
+                    build_progress(name, campaign, state, ccfg, today=today_local)
+                )
             )
         except (DripConfigError, ValueError, OSError) as exc:
-            # One broken campaign must not cost the operator the other's line.
+            # Visible, not silent — and one broken campaign still must not cost
+            # the operator its sibling's line, so the loop continues.
+            lines.append(f"**{name}:** ⚠ misconfigured — {exc}")
             log.warning(
-                "brief.drip_campaign_skipped",
+                "brief.drip_campaign_unbuildable",
                 campaign=name, error=str(exc), error_type=type(exc).__name__,
-                consequence="this campaign has no line in today's brief",
+                consequence="rendered as a misconfigured line in today's brief",
             )
-    return render_drip_body(progresses)
+    return "\n".join(lines) or None
 
 
 async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: bool = False) -> str | None:

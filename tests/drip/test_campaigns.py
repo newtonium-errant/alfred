@@ -269,3 +269,50 @@ def test_annotate_is_idempotent(tmp_path: Path) -> None:
     c.work(item)
     c.work(item)
     assert (vault / "note" / "R.md").read_text().count("link-provenance") == 1
+
+
+# ---------------------------------------------------------------------------
+# #44b delta — removal must heal the whitespace it sat in
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        # The reported defect: a plain str.replace left a double space.
+        ("See [[person/Ghost]] here.\n", "See here.\n"),
+        # Hugging punctuation — the space before the link goes with it, so the
+        # sentence does not end with " ." dangling.
+        ("Spoke to [[person/Ghost]].\n", "Spoke to.\n"),
+        # Leading and trailing positions leave nothing behind.
+        ("[[person/Ghost]] called.\n", "called.\n"),
+        ("Called [[person/Ghost]]\n", "Called\n"),
+        # Two on one line: each heals independently.
+        (
+            "A [[person/Ghost]] B [[person/Ghost]] C\n",
+            "A B C\n",
+        ),
+        # A link alone on its line must NOT swallow the newline and join its
+        # neighbours — the reason the pattern uses horizontal whitespace only.
+        ("one\n[[person/Ghost]]\ntwo\n", "one\n\ntwo\n"),
+    ],
+)
+def test_removal_heals_the_whitespace(
+    tmp_path: Path, before: str, after: str,
+) -> None:
+    """Exact before/after through the PRODUCTION path (``work()``).
+
+    One record it is a typo; across the ~2,000 this campaign drains it becomes
+    a second cleanup campaign, which is why it is fixed at the removal site.
+    """
+    vault = _vault(tmp_path)
+    rel = "note/R.md"
+    (vault / rel).write_text(f"---\ntype: note\n---\n\n{before}", encoding="utf-8")
+
+    item = Link001Campaign.build_item(rel, "person/Ghost", is_learn_target=False)
+    c = Link001Campaign(worklist_items=[item], vault_path=vault)
+    c.work(item)
+
+    body = (vault / rel).read_text(encoding="utf-8")
+    assert body == f"---\ntype: note\n---\n\n{after}"
+    assert c.verify(item) is True, "the link is gone, so the branch verifies"

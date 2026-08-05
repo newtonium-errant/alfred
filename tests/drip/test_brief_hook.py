@@ -160,3 +160,39 @@ async def test_the_brief_reports_persisted_progress_without_running(
     assert state_path.read_bytes() == before, "the render must not touch the cursor"
     assert "1 left" in body, "one of the two items is already done"
     assert "on budget" in body, "the persisted stop reason is reported"
+
+
+async def test_a_misconfigured_campaign_renders_a_visible_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken campaign must be VISIBLE, not merely non-fatal.
+
+    Dropping the line makes "this campaign is broken" and "this campaign was
+    never configured" identical on the operator's primary surface. Not
+    hypothetical: enabling link001_repair before its frozen work-list exists
+    (task #50) produces exactly that silence on day one.
+    """
+    body = await _render(tmp_path, monkeypatch, {"campaigns": {
+        "gmail_backlog": {"enabled": True},      # no staging_dir
+    }})
+
+    assert "## Campaigns" in body, "the section renders rather than vanishing"
+    assert "**gmail_backlog:** ⚠ misconfigured" in body
+    assert "staging_dir" in body, "the line names the key the operator must fix"
+
+
+async def test_a_broken_campaign_does_not_cost_its_sibling_a_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both facts survive: one campaign's misconfiguration is reported AND the
+    healthy campaign still reports its own progress."""
+    wl = tmp_path / "wl.txt"
+    wl.write_text("note/A.md::person/Gone::remove\n", encoding="utf-8")
+    body = await _render(tmp_path, monkeypatch, {"campaigns": {
+        "gmail_backlog": {"enabled": True},                       # broken
+        "link001_repair": {"enabled": True, "worklist_path": str(wl)},
+    }})
+
+    assert "**gmail_backlog:** ⚠ misconfigured" in body
+    assert "**link001_repair:**" in body
+    assert "not yet run" in body
