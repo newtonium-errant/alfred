@@ -163,12 +163,18 @@ def test_attribution_escape_is_refused_with_reason(
     assert not corpus.exists() and not corpus.parent.exists()
 
 
-def test_attribution_absolute_path_is_refused(
+def test_attribution_absolute_outside_path_is_refused(
     tmp_path: Path, vault: Path,
 ) -> None:
-    """An absolute record_path is the shape ``attribution_section``'s old
-    ``except ValueError`` fallback could emit. pathlib would silently discard
-    the vault root and honour it, so the gate refuses rather than joins."""
+    """An absolute record_path pointing OUTSIDE the vault is refused.
+
+    Renamed from ``..._absolute_path_is_refused`` (#39): the old name claimed
+    absoluteness was the disqualifier. It is not — see the paired
+    absolute-INSIDE test below, and ``resolve_in_vault``'s docstring. What
+    disqualifies this path is where it RESOLVES. The shape matters because
+    ``attribution_section``'s old ``except ValueError`` fallback could emit an
+    absolute path, and ``vault_root / abs`` discards the root — so the
+    containment check, not an is-absolute check, is what catches it."""
     before = _snapshot_outside(tmp_path, vault)
     with structlog.testing.capture_logs() as cap:
         err, did_write = rd._resolve_attribution_correction(
@@ -178,6 +184,47 @@ def test_attribution_absolute_path_is_refused(
         )
     assert did_write is False and err is not None
     assert _escapes(cap)[0]["reason"] == "outside_vault_root"
+    assert _snapshot_outside(tmp_path, vault) == before
+
+
+def test_attribution_absolute_inside_path_is_accepted(
+    tmp_path: Path, vault: Path,
+) -> None:
+    """The other half of the rename (#39): an absolute path that resolves
+    INSIDE the vault is HONOURED, not refused.
+
+    Pinned explicitly because the previous test's name asserted the opposite
+    and nothing contradicted it. Ruled 2026-08-04: containment is the property
+    that matters, and it already holds here — refusing absolutes categorically
+    would break legitimate callers holding a real in-vault absolute path while
+    adding no containment.
+
+    It then fails on its own terms (no matching marker), which is exactly the
+    point: the failure is a CONTENT failure, not a containment refusal, so no
+    ``escape_denied`` is logged.
+    """
+    record = vault / "note" / "Real.md"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text("---\ntype: note\nname: Real\n---\n\nBody.\n", encoding="utf-8")
+
+    before = _snapshot_outside(tmp_path, vault)
+    with structlog.testing.capture_logs() as cap:
+        err, did_write = rd._resolve_attribution_correction(
+            ReplyCorrection(item_number=1, ok=True),
+            _attr_item(str(record.resolve())),
+            vault, str(tmp_path / "c.jsonl"),
+        )
+
+    assert _escapes(cap) == [], (
+        "an in-vault absolute path must clear the containment gate — a refusal "
+        "here would mean the gate rejects on absoluteness rather than on where "
+        "the path lands"
+    )
+    # Mirrors the relative-path positive below: past the gate it is the
+    # WRITER's business, and with no matching marker that is a clean no-op.
+    # The containment assertion above is what this test exists for.
+    assert err is None or "not a path inside the vault" not in err
+    assert did_write is False, "no marker to flip, so nothing is written"
     assert _snapshot_outside(tmp_path, vault) == before
 
 
@@ -410,8 +457,14 @@ async def test_instructor_escape_is_refused_before_the_model_runs(
 ) -> None:
     """``client=None`` is the assertion, not a shortcut: the gate short-circuits
     BEFORE ``execute`` is awaited, so a directive naming an out-of-vault record
-    never reaches the model. If the gate moved below the call, this raises on
-    the None client instead of returning cleanly."""
+    never reaches the model.
+
+    If the gate moved below the call, this test still fails — but on the ABSENT
+    ``skills_dir``, not on the None client (#39). ``execute`` calls
+    ``_load_skill(skills_dir, ...)`` first and raises ``FileNotFoundError``
+    there, so the None client is never reached. Named precisely because a
+    docstring pointing at the wrong raiser sends the next reader looking for a
+    client call that would not have happened."""
     from alfred.instructor.executor import execute_and_record
     from alfred.instructor.state import InstructorState
 
@@ -438,9 +491,16 @@ async def test_instructor_escape_is_refused_before_the_model_runs(
     assert _snapshot_outside(tmp_path, vault) == before
 
 
-async def test_instructor_absolute_record_path_is_refused(
+async def test_instructor_absolute_outside_record_path_is_refused(
     tmp_path: Path, vault: Path,
 ) -> None:
+    """Absoluteness is not the disqualifier; landing outside the vault is.
+
+    Renamed alongside its attribution sibling (#39) — this path is BOTH
+    absolute and outside, and the old name credited the wrong half. See
+    ``resolve_in_vault``'s docstring: an absolute path that resolves inside is
+    honoured.
+    """
     from alfred.instructor.executor import execute_and_record
     from alfred.instructor.state import InstructorState
 

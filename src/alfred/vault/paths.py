@@ -140,8 +140,19 @@ def resolve_in_vault(
     :class:`VaultContainmentError` on any escape, emitting exactly one
     ``vault.containment.escape_denied`` warning first.
 
-    An absolute ``rel_path`` is refused rather than honoured: pathlib would
-    silently discard the vault root, so honouring it would be the escape.
+    An absolute ``rel_path`` is honoured IFF it resolves inside the vault, and
+    refused with ``reason="outside_vault_root"`` otherwise. It is not rejected
+    categorically, and an earlier version of this docstring said it was.
+
+    The distinction matters because the two readings protect different things.
+    ``vault_root / rel_path`` does silently discard the root when ``rel_path``
+    is absolute — but the containment check below runs on the RESOLVED result
+    either way, so an absolute path that lands outside is caught by exactly the
+    same test that catches ``../../etc/passwd``. Containment is the property
+    this function guarantees, and it holds for absolute inputs already.
+    Refusing them categorically would add a failure mode for legitimate
+    callers (anything holding a real in-vault absolute path) while adding no
+    containment at all. Ruled 2026-08-04.
     """
     vault_root = Path(vault_path).resolve()
     raw = str(rel_path)

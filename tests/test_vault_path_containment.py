@@ -109,8 +109,13 @@ def test_sibling_prefix_escape_is_refused(vault: Path) -> None:
 
 def test_absolute_path_override_is_refused(vault: Path) -> None:
     """pathlib silently discards the root on an absolute join
-    (``Path('/vault') / '/etc/passwd'`` -> ``/etc/passwd``); the gate refuses
-    rather than honouring it."""
+    (``Path('/vault') / '/etc/passwd'`` -> ``/etc/passwd``), so the composed
+    path lands outside and the containment check refuses it.
+
+    The refusal is for WHERE it lands, not for being absolute — the asserted
+    ``reason`` says so, and an absolute path resolving INSIDE the vault is
+    honoured (#39). The pathlib footgun is what makes this input reach the
+    check looking like an ordinary join; the check is what catches it."""
     assert vault / "/etc/passwd" == Path("/etc/passwd")  # the footgun itself
     with structlog.testing.capture_logs() as cap:
         with pytest.raises(VaultContainmentError) as exc:

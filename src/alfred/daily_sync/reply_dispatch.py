@@ -55,6 +55,7 @@ from alfred.vault.attribution import (
 from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 from .assembler import (
+    PENDING_ONLY_OK_TOKENS,
     ReplyCorrection,
     ReplyParseResult,
     apply_modifier,
@@ -66,6 +67,44 @@ from .confidence import load_state, save_state
 from .corpus import CorpusEntry, append_correction
 
 log = structlog.get_logger(__name__)
+
+
+def _pending_only_verb_refusal(
+    correction: ReplyCorrection, kind: str, accepts: str,
+) -> str | None:
+    """Refuse a pending-queue verb aimed at a ``kind`` that has no such action.
+
+    Returns the operator-facing error, or ``None`` when the verb is fine here.
+
+    WHY THIS IS AT DISPATCH AND NOT IN THE PARSER (#34). ``parse_reply`` sees
+    only the reply text — it cannot know that item 3 is a routine match rather
+    than a pending item — so every OK-verb collapses to ``ok=True``. The kind is
+    known HERE, and ``consumed_token`` survives the collapse, so here is the
+    only place the scoping can be honest.
+
+    The leak this closes is small in code and not small in effect: ``3 noted``
+    on a routine-match item was indistinguishable from ``3 confirm`` by the time
+    it arrived, so it wrote a corpus row teaching the matcher a verdict the
+    operator never gave — on an input most likely to be a typo or a
+    mis-numbered line. Erroring is the honest outcome: the operator retypes,
+    and nothing is learned from a slip.
+
+    Refusals are LOGGED with a reason, per the house rule that a refusal for
+    the right cause and one for an unrelated cause must not look alike.
+    """
+    token = (correction.consumed_token or "").strip().lower()
+    if token not in PENDING_ONLY_OK_TOKENS:
+        return None
+    log.warning(
+        f"daily_sync.{kind}.correction_refused",
+        item_number=correction.item_number,
+        reason="pending_only_verb",
+        consumed_token=token,
+    )
+    return (
+        f"item {correction.item_number}: `{token}` resolves a pending item — "
+        f"a {kind.replace('_', ' ')} takes {accepts}"
+    )
 
 
 def _last_batch_message_ids(config: DailySyncConfig) -> set[int]:
@@ -826,7 +865,20 @@ def _resolve_routine_match_correction(
     nothing is appended, not even the reject. A half-landed correction would be
     the worst outcome available: the card would leave the deck (rejected) while
     the answer the operator supplied was dropped, so the loop would look closed
-    and teach nothing. Every refusal logs
+    and teach nothing.
+
+    "Refused whole" describes the VALIDATION path only, which is where the
+    guarantee is needed and where every refusal below lands: those all return
+    before any row is appended. It is NOT a claim about the write path. A
+    correction can emit two rows (reject + alias, or reject + one-off) and they
+    are appended in a loop, so an I/O failure on the second leaves the first on
+    disk — a genuinely partial write. Untreated on purpose: the exposure is a
+    disk error mid-append, the failure is logged as
+    ``corpus_write_failed`` with the row type, and the reject-then-alias order
+    means the surviving row is the conservative one (the pair is suppressed;
+    the replacement was simply not learned). Making it atomic would mean a
+    temp-file rewrite of an append-only corpus, which costs more than the
+    failure mode it removes. Every refusal logs
     ``daily_sync.routine_match.correction_refused`` with a ``reason``, because a
     silent-but-correct refusal and a refusal for an unrelated cause (missing
     metadata, wrong verb) are otherwise indistinguishable in the log.
@@ -839,6 +891,13 @@ def _resolve_routine_match_correction(
     corpus. The match/capture path (``routine.cli.cmd_done``) writes ONLY
     the pending sink, never the corpus. The corpus is operator-reply-only.
     """
+    refusal = _pending_only_verb_refusal(
+        correction, "routine_match",
+        "`confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+    )
+    if refusal:
+        return refusal, False
+
     if not (correction.ok or correction.reject):
         return (
             f"item {correction.item_number}: routine matches only "
@@ -1098,6 +1157,13 @@ def _resolve_attribution_correction(
     if not marker_id or not record_path:
         return (f"item {correction.item_number} attribution metadata missing", False)
 
+    refusal = _pending_only_verb_refusal(
+        correction, "attribution",
+        "`confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+    )
+    if refusal:
+        return refusal, False
+
     if not (correction.ok or correction.reject):
         # Modifiers / tiers don't apply to attribution items — they
         # only make sense for email calibration. Bucket as unparsed.
@@ -1302,6 +1368,13 @@ def _resolve_proposal_correction(
             f"item {correction.item_number} proposal metadata missing",
             False,
         )
+
+    refusal = _pending_only_verb_refusal(
+        correction, "proposal",
+        "`confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+    )
+    if refusal:
+        return refusal, False
 
     if not (correction.ok or correction.reject):
         return (
@@ -2590,6 +2663,16 @@ def _resolve_correction(
     item = items_by_num.get(correction.item_number)
     if item is None:
         return None, f"item {correction.item_number} not in last batch"
+
+    # Same kind-scoping as the attribution/proposal/routine_match resolvers
+    # (#34). On an email item ``noted`` would collapse to "the classifier's
+    # priority was right" and write a corpus row on what is almost certainly a
+    # mis-aimed pending verb.
+    refusal = _pending_only_verb_refusal(
+        correction, "email", "a tier, a modifier, or `confirm`/`keep`",
+    )
+    if refusal:
+        return None, refusal
 
     classifier_priority = str(item.get("classifier_priority", "")).lower()
     classifier_action_hint = item.get("classifier_action_hint")
