@@ -39,7 +39,9 @@ from alfred.janitor.config import (
 from alfred.janitor.issues import (
     ACTIONABLE_CODES,
     AUTOFIX_FIXABLE_CODES,
+    LABEL_ONLY_CODES,
     NOT_JANITOR_FIXABLE_CODES,
+    UNFIXABLE_CODES,
     Issue,
     IssueCode,
     Severity,
@@ -60,19 +62,53 @@ def test_remediation_classes_partition_every_issue_code() -> None:
     Structural pin: adding a new IssueCode without classifying it fails
     HERE rather than silently landing in neither bucket (which would
     make it vanish from both reported counts).
+
+    Three classes since #47, not two: LABEL_ONLY_CODES holds the codes with no
+    producer at all (SEM005/SEM006 — the agent's own vocabulary). They are
+    kept in the taxonomy rather than deleted precisely so this pin keeps
+    covering them.
     """
-    covered = ACTIONABLE_CODES | NOT_JANITOR_FIXABLE_CODES
+    covered = ACTIONABLE_CODES | NOT_JANITOR_FIXABLE_CODES | LABEL_ONLY_CODES
     missing = set(IssueCode) - covered
     assert not missing, (
-        f"unclassified IssueCode(s): {sorted(c.value for c in missing)} — "
-        "add each to ACTIONABLE_CODES or NOT_JANITOR_FIXABLE_CODES"
+        f"unclassified IssueCode(s): {sorted(c.value for c in missing)} — add "
+        "each to ACTIONABLE_CODES, NOT_JANITOR_FIXABLE_CODES or "
+        "LABEL_ONLY_CODES"
     )
 
 
 def test_remediation_classes_are_disjoint() -> None:
-    """No code may be both actionable and not-janitor-fixable."""
-    overlap = ACTIONABLE_CODES & NOT_JANITOR_FIXABLE_CODES
-    assert not overlap, sorted(c.value for c in overlap)
+    """No code may belong to two remediation classes."""
+    assert not ACTIONABLE_CODES & NOT_JANITOR_FIXABLE_CODES
+    assert not ACTIONABLE_CODES & LABEL_ONLY_CODES
+    assert not NOT_JANITOR_FIXABLE_CODES & LABEL_ONLY_CODES
+
+
+def test_label_only_codes_are_counted_as_not_fixable() -> None:
+    """#47: a label-only code is unroutable, so it counts as not-fixable.
+
+    This is what keeps conservation true over EVERY member of the enum after
+    the demotion — without it, a SEM005 would fall out of both buckets and
+    disappear from the operator's total. It cannot occur today (no producer),
+    which is exactly why it needs a pin: an invariant that only holds because
+    the input never arrives is one refactor away from being false.
+    """
+    assert LABEL_ONLY_CODES <= UNFIXABLE_CODES
+    split = classify_counts([_issue(IssueCode.VAGUE_NOTE)])
+    assert split == {
+        "actionable": 0, "not_janitor_fixable": 1, "known_cohort": 0,
+        "total": 1,
+    }
+
+
+def test_sem005_is_no_longer_claimed_as_agent_work() -> None:
+    """The demotion itself. SEM005/SEM006 out of the actionable bucket.
+
+    Counting them as actionable asserted the agent gets routed them; nothing
+    produces them, so that was never true.
+    """
+    assert IssueCode.VAGUE_NOTE not in ACTIONABLE_CODES
+    assert IssueCode.DUPLICATE_SEMANTIC not in ACTIONABLE_CODES
 
 
 def test_autofix_fixable_is_a_subset_of_actionable() -> None:

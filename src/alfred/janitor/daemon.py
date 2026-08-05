@@ -338,8 +338,8 @@ async def run_sweep(
             vault_path = config.vault.vault_path
 
             # Scanner-handled-code filter (2026-06-23): only the codes in
-            # ``AGENT_ACTIONABLE_CODES`` (LINK001, DUP001, SEM005, SEM006)
-            # are routed to the agent. FM*/DIR001/LINK002/ORPHAN001/
+            # ``AGENT_ACTIONABLE_CODES`` (LINK001, DUP001) are routed to
+            # the agent. FM*/DIR001/LINK002/ORPHAN001/
             # STUB001/SEM001-004 are handled deterministically by the
             # scanner + autofix; surfacing them to the agent floods the
             # prompt with false-positive busywork the SKILL explicitly

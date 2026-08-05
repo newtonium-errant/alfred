@@ -64,7 +64,7 @@ SEVERITY_MAP: dict[IssueCode, Severity] = {
 
 # --- Remediation classes — who, if anyone, can actually fix this ------
 #
-# The three sets below partition EVERY IssueCode by remediation owner.
+# The four sets below partition EVERY IssueCode by remediation owner.
 # This is the segregation taxonomy behind the brief's split counts: the
 # raw "N open issues" number conflates work janitor is failing to do with
 # work janitor structurally CANNOT do, which makes the figure unreadable
@@ -77,12 +77,12 @@ SEVERITY_MAP: dict[IssueCode, Severity] = {
 # backlog item.
 
 # Routed to the LLM agent (see ``backends.AGENT_ACTIONABLE_CODES``,
-# which is the enforcement copy used at dispatch).
+# which is the enforcement copy used at dispatch — the two must stay in
+# lockstep, and a pin in tests/test_janitor_scanner_falsepos.py holds the
+# dispatch copy to exactly these codes).
 _AGENT_CODES: frozenset[IssueCode] = frozenset({
     IssueCode.BROKEN_WIKILINK,       # LINK001 — fix when unambiguous
     IssueCode.DUPLICATE_NAME,        # DUP001  — triage task
-    IssueCode.VAGUE_NOTE,            # SEM005  — agent judgment
-    IssueCode.DUPLICATE_SEMANTIC,    # SEM006  — agent judgment
 })
 
 # Repaired deterministically by ``autofix._apply_fix``. These genuinely
@@ -112,8 +112,40 @@ NOT_JANITOR_FIXABLE_CODES: frozenset[IssueCode] = frozenset({
     IssueCode.STALE_ACTIVE_PERSON,         # SEM004
 })
 
+# Vocabulary, not workload (#47 / review-25 O2). SEM005 and SEM006 have NO
+# producer: no scanner emits them, so they can never appear in an issue list,
+# never be routed, and never be counted. They exist as the two labels the
+# agent applies to a judgment it forms on its own while working a record it
+# was sent for some OTHER code — which is exactly what the SKILL says
+# ("You will never be handed one of these", § SEM005–SEM006).
+#
+# They were previously listed in the agent-actionable allowlist, which read as
+# "the agent is routed these" and was never true. Demoting them here is the
+# code catching up to the prompt, not a behaviour change: the dispatch filter
+# is an intersection against a list that never contains them, so removing them
+# changes nothing that runs. It removes a false claim about what the system
+# does.
+#
+# Kept as a NAMED class rather than deleted from the taxonomy so the
+# every-code-is-classified pin still covers them — an unclassified code must
+# fail loudly, and "this one is deliberately unroutable" is a classification.
+LABEL_ONLY_CODES: frozenset[IssueCode] = frozenset({
+    IssueCode.VAGUE_NOTE,          # SEM005
+    IssueCode.DUPLICATE_SEMANTIC,  # SEM006
+})
+
 # Anything janitor can act on, by either path.
 ACTIONABLE_CODES: frozenset[IssueCode] = _AGENT_CODES | AUTOFIX_FIXABLE_CODES
+
+# Everything janitor cannot remediate, for COUNTING purposes. Two different
+# reasons, one operator-facing bucket: the scope-blocked codes above, plus the
+# label-only vocabulary. If a SEM005 ever did materialise it would be
+# unroutable, so "not janitor-fixable" is the honest bucket for it — and
+# folding it in keeps ``actionable + not_janitor_fixable == total`` true over
+# EVERY code, so no issue can fall out of both buckets and vanish.
+UNFIXABLE_CODES: frozenset[IssueCode] = (
+    NOT_JANITOR_FIXABLE_CODES | LABEL_ONLY_CODES
+)
 
 
 #: The known-debt cohort marker (#19-B, D2 ruled). A LINK001 whose record
@@ -171,6 +203,10 @@ def classify_counts(
 
     Returns ``{"actionable", "not_janitor_fixable", "known_cohort", "total"}``.
 
+    ``not_janitor_fixable`` counts ``UNFIXABLE_CODES`` — the scope-blocked
+    codes plus the label-only vocabulary — so the sum covers every member of
+    the enum and nothing can fall out of both buckets.
+
     ``actionable + not_janitor_fixable == total`` STILL holds — the cohort is a
     SUBSET of actionable, reported alongside it rather than carved out of the
     partition. That choice is deliberate: the cohort is genuinely fixable
@@ -195,7 +231,7 @@ def classify_counts(
     than a silently wrong cohort figure.
     """
     actionable = sum(1 for i in issues if i.code in ACTIONABLE_CODES)
-    not_fixable = sum(1 for i in issues if i.code in NOT_JANITOR_FIXABLE_CODES)
+    not_fixable = sum(1 for i in issues if i.code in UNFIXABLE_CODES)
     notes = cohort_notes or {}
     cohort = sum(
         1 for i in issues if is_known_cohort_issue(i, notes.get(i.file))

@@ -97,14 +97,64 @@ class TestAgentActionableFilter:
 
     def test_allowlist_contents_pinned(self) -> None:
         # Contract pin (SKILL.md §3): the agent-actionable set is exactly
-        # these four codes. Widening this set is a deliberate signal —
+        # these two codes. Widening this set is a deliberate signal —
         # bumping this assertion must be paired with a SKILL update.
+        #
+        # SEM005/SEM006 were removed in #47: no scanner produces them, so
+        # listing them claimed a routing that never occurred. The SKILL
+        # already said so ("You will never be handed one of these") — the
+        # allowlist was the stale half.
         assert AGENT_ACTIONABLE_CODES == frozenset({
             IssueCode.BROKEN_WIKILINK,    # LINK001
             IssueCode.DUPLICATE_NAME,     # DUP001
-            IssueCode.VAGUE_NOTE,         # SEM005
-            IssueCode.DUPLICATE_SEMANTIC, # SEM006
         })
+
+    def test_the_two_copies_of_the_agent_set_agree(self) -> None:
+        """The allowlist exists TWICE and the copies must not drift.
+
+        ``backends.AGENT_ACTIONABLE_CODES`` is the enforcement copy (the
+        daemon filters against it); ``issues._AGENT_CODES`` is the accounting
+        copy (it feeds the operator's actionable count). A change to one alone
+        makes the count disagree with what actually got routed — and neither
+        side would fail on its own.
+        """
+        from alfred.janitor.issues import _AGENT_CODES
+
+        assert AGENT_ACTIONABLE_CODES == _AGENT_CODES
+
+    def test_label_only_codes_are_not_routed(self) -> None:
+        """SEM005/SEM006 must never reach the agent as routed work.
+
+        They are the agent's own vocabulary for observations it forms, not a
+        queue it is handed. Re-adding them to the dispatch allowlist would be
+        a claim the pipeline cannot honour, since nothing emits them.
+        """
+        from alfred.janitor.issues import LABEL_ONLY_CODES
+
+        assert LABEL_ONLY_CODES == frozenset({
+            IssueCode.VAGUE_NOTE, IssueCode.DUPLICATE_SEMANTIC,
+        })
+        assert LABEL_ONLY_CODES.isdisjoint(AGENT_ACTIONABLE_CODES)
+
+    def test_no_scanner_path_can_emit_a_label_only_code(self) -> None:
+        """The premise of the demotion, asserted rather than assumed.
+
+        If a future scanner starts emitting SEM005, "it has no producer" stops
+        being true and the demotion needs revisiting — this fails at that
+        moment instead of silently dropping the new issues into a bucket
+        nobody routes.
+        """
+        import inspect
+
+        from alfred.janitor import scanner
+        from alfred.janitor.issues import LABEL_ONLY_CODES
+
+        src = inspect.getsource(scanner)
+        for code in LABEL_ONLY_CODES:
+            assert f"IssueCode.{code.name}" not in src, (
+                f"{code.value} now has a producer in scanner.py — it is no "
+                "longer label-only; revisit #47's demotion"
+            )
 
     def test_filter_drops_scanner_code_keeps_actionable(self) -> None:
         # A mixed list: one scanner-handled FM001 + one agent-actionable
@@ -152,6 +202,17 @@ class TestAgentActionableFilter:
             IssueCode.STALE_ACTIVE_PERSON,      # SEM004
         }
         assert deterministic.isdisjoint(AGENT_ACTIONABLE_CODES)
+
+        # And every code is accounted for by exactly one of the three
+        # dispositions — routed, scanner-handled, or label-only. A new
+        # IssueCode that is none of them fails here rather than quietly
+        # never reaching anyone.
+        from alfred.janitor.issues import LABEL_ONLY_CODES
+
+        assert (
+            deterministic | set(AGENT_ACTIONABLE_CODES) | set(LABEL_ONLY_CODES)
+            == set(IssueCode)
+        )
 
 
 class _RecordingBackend:
