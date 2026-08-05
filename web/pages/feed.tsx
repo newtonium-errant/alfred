@@ -27,6 +27,8 @@ export default function FeedPage() {
   const [error, setError] = useState<string | null>(null);
   const [unauthenticated, setUnauthenticated] = useState(false);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  // Collapsed by default — parity with the rings drill (#26).
+  const [showDone, setShowDone] = useState(false);
 
   useEffect(() => {
     if ((!sessionLoading && !user) || unauthenticated) {
@@ -78,6 +80,20 @@ export default function FeedPage() {
   // slot is legitimately on both the deck link and the inline list (team-lead ruling).
   const deckable = activeNeedsYou.filter(isDeckDealt);
   const pendingRows = activeNeedsYou.filter((it) => it.kind === 'slot_suggestion');
+  // #26 (D4) — a completed slot STAGES, it does not vanish. `activeNeedsYou`
+  // drops done slots on purpose (they no longer need you, and must not inflate
+  // the deck count), which is right for the COUNTS and wrong for the LIST: the
+  // row simply disappeared, so a mis-tap was unrecoverable here while home's
+  // rings offered Undo behind their drill. Derived from the unfiltered
+  // `board.needsYou` so the counting rule above is untouched.
+  //
+  // Same shape as RingsHeader's drill deliberately, not a second idea about what
+  // "done" means: same `completion.effectiveDone` predicate, same
+  // Show done (N) / Hide done copy, same collapsed-by-default. One rule
+  // everywhere — done stages, and Undo lives one tap in.
+  const doneRows = board.needsYou.filter(
+    (it) => it.kind === 'slot_suggestion' && completion.effectiveDone(it),
+  );
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -171,6 +187,44 @@ export default function FeedPage() {
             {pendingRows.length > 0 && (
               <ul data-testid="feed-pending" className="mt-2 flex flex-col gap-2">
                 {pendingRows.map((it) => (
+                  <FeedRow
+                    key={it.id}
+                    item={it}
+                    expanded={expanded.has(it.id)}
+                    onToggleEvidence={() => toggleExpanded(it.id)}
+                    completion={completion}
+                    accept={slotAccept}
+                  />
+                ))}
+              </ul>
+            )}
+
+          </section>
+        )}
+
+        {loaded && doneRows.length > 0 && (
+          // The staged section (#26). Deliberately a SIBLING of "Needs you"
+          // rather than living inside it: the enclosing section is gated on
+          // `activeNeedsYou.length > 0`, so completing the last slot unmounted
+          // it — and staging a done row under a "Needs you" heading would
+          // contradict the heading anyway. Done work is its own quiet band.
+          //
+          // Collapsed by default so the page still reads as remaining work, but
+          // the row is REACHABLE — Undo lives on the row, one tap in, exactly as
+          // it does in the rings. Same predicate, same copy, same default.
+          <section data-testid="feed-staged" className="mt-4">
+            <button
+              type="button"
+              data-testid="feed-show-done"
+              onClick={() => setShowDone((s) => !s)}
+              aria-expanded={showDone}
+              className="text-[11px] font-semibold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+            >
+              {showDone ? 'Hide done' : `Show done (${doneRows.length})`}
+            </button>
+            {showDone && (
+              <ul data-testid="feed-done" className="mt-2 flex flex-col gap-2">
+                {doneRows.map((it) => (
                   <FeedRow
                     key={it.id}
                     item={it}
