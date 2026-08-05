@@ -509,10 +509,57 @@ def _normalize_transcript(text: str) -> str:
     return s
 
 
+#: Character budget for the Whisper ``prompt=`` biasing string.
+#:
+#: Whisper's prompt window is ~224 tokens and it does NOT error on overflow — it
+#: truncates or degrades silently, which would cost general transcription accuracy
+#: with no signal. At ~4 chars/token that window is ~896 chars; this budget keeps a
+#: deliberate margin because the ratio is an approximation, not a guarantee.
+#:
+#: MEASURED 2026-08-05 against the 28 shipped static terms: 303 chars (~75 tokens),
+#: i.e. roughly 149 tokens of headroom, or ~54 more average-length terms. Nothing
+#: bounded this before — the #54 learned-vocabulary loop is what makes it matter,
+#: since an append-on-approval path grows the list monotonically and the operator
+#: approving one more term cannot see the ceiling. The cap is in CHARS rather than
+#: term count on purpose: term lengths vary 3x here ("gcal" vs
+#: "library-alexandria"), so a count cap would bind at the wrong place.
+_WHISPER_PROMPT_CHAR_BUDGET = 700
+
+
 def _vocab_to_whisper_prompt(vocab: list[str]) -> str:
-    """Join vocab terms into a Whisper ``prompt=`` biasing string."""
+    """Join vocab terms into a Whisper ``prompt=`` biasing string, bounded.
+
+    Terms are kept WHOLE — truncation drops trailing terms rather than cutting
+    mid-word, because half a term biases toward a string that does not exist and
+    is worse than omitting it. Order is preserved, so a caller that puts its
+    highest-value terms first keeps them.
+
+    Truncation logs; it never passes silently. Growth past the window is the
+    failure this budget exists to make visible.
+    """
     terms = [t.strip() for t in vocab if t and t.strip()]
-    return ", ".join(terms)
+    kept: list[str] = []
+    used = 0
+    for term in terms:
+        # +2 for the ", " separator on every term after the first.
+        cost = len(term) + (2 if kept else 0)
+        if used + cost > _WHISPER_PROMPT_CHAR_BUDGET:
+            break
+        kept.append(term)
+        used += cost
+
+    if len(kept) < len(terms):
+        log.warning(
+            "stt.vocab_prompt_truncated",
+            kept=len(kept),
+            dropped=len(terms) - len(kept),
+            chars=used,
+            budget=_WHISPER_PROMPT_CHAR_BUDGET,
+            detail="vocab_terms exceeds the Whisper prompt window — trailing "
+                   "terms are not biasing; prune the list rather than letting "
+                   "it grow",
+        )
+    return ", ".join(kept)
 
 
 # ---------------------------------------------------------------------------
