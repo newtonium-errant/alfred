@@ -22,6 +22,7 @@ export function ProvenancePreview({
   source,
   ingestedBy,
   originInstance,
+  uploadNote,
   className,
 }: {
   target?: IngestTarget;
@@ -30,6 +31,13 @@ export function ProvenancePreview({
   source: string;
   ingestedBy: string;
   originInstance: string;
+  /**
+   * An upload fact about the BODY (#57) — e.g. a CSV's row count and the fact
+   * that it was fenced. Rendered below a divider, deliberately outside the
+   * frontmatter rows: those rows promise to be the exact metadata written, and
+   * folding a non-frontmatter figure in among them would make that claim false.
+   */
+  uploadNote?: string | null;
   className?: string;
 }) {
   return (
@@ -53,6 +61,14 @@ export function ProvenancePreview({
         <Row k="ingested_via" v="web" />
         <Row k="origin_instance" v={originInstance} />
       </div>
+      {uploadNote && (
+        <p
+          data-testid="ingest-upload-note"
+          className="mt-3 border-t border-honeydew-300 pt-2 text-xs text-honeydew-700"
+        >
+          {uploadNote}
+        </p>
+      )}
     </div>
   );
 }

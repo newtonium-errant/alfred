@@ -9,15 +9,19 @@ import { TargetPicker } from './TargetPicker';
 import { ProvenancePreview } from './ProvenancePreview';
 import { useIngest } from '../../lib/algernon/useIngest';
 import { MAX_INGEST_CHARS } from '../../lib/algernon/schemas';
+import { INGEST_UPLOAD_ACCEPT, prepareUpload } from '../../lib/algernon/ingestUpload';
 import { subtle } from '../../lib/typography';
 import type { SessionUser } from '../../lib/algernon/types';
 
 // Orchestrates the cross-instance ingest form: target+type picker → title → body
-// (paste / voice transcript / .md|.txt upload) → provenance preview → submit. The
-// VoiceCapture for the body is the core of "ingest including STT" (decision F):
-// voice → editable transcript → ingest body. Verbatim — the body is written
-// exactly as composed (no LLM/run_turn), which is what fixes the large-markdown
-// wrong-order problem.
+// (paste / voice transcript / .md|.txt|.csv upload) → provenance preview →
+// submit. The VoiceCapture for the body is the core of "ingest including STT"
+// (decision F): voice → editable transcript → ingest body. Verbatim — the body
+// is written exactly as composed (no LLM/run_turn), which is what fixes the
+// large-markdown wrong-order problem.
+//
+// Uploads are prepared by `lib/algernon/ingestUpload` — .md/.txt land raw, a
+// .csv lands fenced, and an empty or over-limit file is refused with words.
 
 function stripExt(name: string): string {
   const i = name.lastIndexOf('.');
@@ -51,6 +55,11 @@ export function IngestForm({
   const [title, setTitle] = useState(initialTitle);
   const [body, setBody] = useState(initialBody);
   const [source, setSource] = useState(initialSource);
+  // Upload outcome (#57): a disclosure note for a reshaped body, or a refusal
+  // with words. Both replace a silence the operator would otherwise have to
+  // diagnose from a disabled button.
+  const [uploadNote, setUploadNote] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   // Default the picker to the first configured target once targets load.
   useEffect(() => {
@@ -90,7 +99,18 @@ export function IngestForm({
       const reader = new FileReader();
       reader.onload = () => {
         const text = typeof reader.result === 'string' ? reader.result : '';
-        setBody(text);
+        const prepared = prepareUpload(file.name, text);
+        // A refused upload leaves the body untouched rather than loading
+        // something unsubmittable: the operator keeps whatever they had, and the
+        // reason is on screen instead of hiding behind a greyed-out button.
+        if (!prepared.ok) {
+          setUploadNote(null);
+          setUploadError(prepared.message);
+          return;
+        }
+        setUploadError(null);
+        setUploadNote(prepared.note);
+        setBody(prepared.body);
         if (!title.trim()) setTitle(stripExt(file.name));
         if (!source.trim()) setSource(file.name);
       };
@@ -124,6 +144,8 @@ export function IngestForm({
     setTitle('');
     setBody('');
     setSource('');
+    setUploadNote(null);
+    setUploadError(null);
     reset();
   }, [reset]);
 
@@ -215,10 +237,10 @@ export function IngestForm({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Label htmlFor="ingest-body">Body (written verbatim)</Label>
           <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50">
-            Upload .md / .txt
+            Upload .md / .txt / .csv
             <input
               type="file"
-              accept=".md,.txt,text/markdown,text/plain"
+              accept={INGEST_UPLOAD_ACCEPT}
               className="hidden"
               data-testid="ingest-file"
               disabled={submitting}
@@ -226,6 +248,17 @@ export function IngestForm({
             />
           </label>
         </div>
+
+        {/* A refused upload says why, here at the affordance that refused it. */}
+        {uploadError && (
+          <p
+            role="alert"
+            data-testid="ingest-upload-error"
+            className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+          >
+            {uploadError}
+          </p>
+        )}
 
         {/* Decision F: voice → editable transcript → ingest body. */}
         <VoiceCapture
@@ -246,6 +279,20 @@ export function IngestForm({
         <p className={subtle}>
           {body.length.toLocaleString()} / {MAX_INGEST_CHARS.toLocaleString()} characters
         </p>
+        {/* An over-limit body already disables submit; without this line that
+            greyed-out button is the only signal, and the operator is left to
+            guess. Reachable by paste/typing — an over-limit upload is refused
+            before it lands. */}
+        {body.length > MAX_INGEST_CHARS && (
+          <p
+            role="alert"
+            data-testid="ingest-body-over-limit"
+            className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+          >
+            The body is {(body.length - MAX_INGEST_CHARS).toLocaleString()} characters over the{' '}
+            {MAX_INGEST_CHARS.toLocaleString()}-character ingest limit — trim it before ingesting.
+          </p>
+        )}
       </div>
 
       <ProvenancePreview
@@ -255,6 +302,7 @@ export function IngestForm({
         source={source}
         ingestedBy={user.name}
         originInstance={originInstance}
+        uploadNote={uploadNote}
       />
 
       {error && (
