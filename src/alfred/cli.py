@@ -724,6 +724,13 @@ def cmd_drip(args: argparse.Namespace) -> None:
             )
         elif subcmd == "status":
             code = dcli.cmd_status(config)
+        elif subcmd == "repair-verify":
+            # #60: re-ask the verify question over items already recorded done.
+            # Dry-run by default — see the handler for why this is deliberate
+            # and why it is never wired into `run`.
+            code = dcli.cmd_repair_verify(
+                config, campaign_name=args.campaign, apply=args.apply,
+            )
         elif subcmd == "build-worklist":
             # Consumes the JANITOR's config, because the work-list is built
             # from exactly the issue set the janitor reports — #49's
@@ -5559,6 +5566,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     drip_sub.add_parser("status", help="Show each campaign's progress line")
+    drip_repair = drip_sub.add_parser(
+        "repair-verify",
+        help=(
+            "Re-verify items recorded done and demote the ones that did not "
+            "land (dry-run unless --apply)"
+        ),
+    )
+    drip_repair.add_argument(
+        "--campaign", default=None,
+        help=(
+            "Repair only this campaign (default: every CONFIGURED campaign, "
+            "including disabled ones — state repair is wanted precisely when a "
+            "campaign is parked)"
+        ),
+    )
+    drip_repair.add_argument(
+        "--apply", action="store_true",
+        help=(
+            "Actually demote. Omitted, this lists the items it would reopen "
+            "and writes nothing — the deploy moment for this is one deliberate "
+            "invocation, so the preview is worth its own command."
+        ),
+    )
     drip_build = drip_sub.add_parser(
         "build-worklist",
         help="Build a campaign's FROZEN work-list (dry-run unless --apply)",

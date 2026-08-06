@@ -27,6 +27,37 @@ surfaces as FAILED rather than sitting invisible.
 
 The 907 guard stays FULL STRENGTH for sync campaigns (``link001_repair``):
 work returned + no observable effect ⇒ FAILED, immediately.
+
+## Why link001 matches links WHITESPACE-TOLERANTLY (#60)
+
+Found live on 2026-08-06 by the watched-first-increment discipline: 4 of the
+first 12 ``done`` items were false-dones. The work-list's targets come from the
+janitor scanner, which PARSES YAML frontmatter and — by explicit design, see
+``janitor/parser.extract_wikilinks`` — collapses internal whitespace runs so a
+line-wrapped link resolves like a single-line one. ``work()`` and ``verify()``
+matched the EXACT string ``[[<target>]]`` against RAW file text. So for a title
+long enough that YAML folds it::
+
+    related:
+    - '[[constraint/Multi-Instance Alfred Has Information That Cannot Be Shared Across
+      Instances]]'
+
+the scanner reports the link, the raw needle never appears, ``work()`` edits
+nothing — and ``verify()``'s ``link not in body`` PASSES, because the *wrapped*
+form does not contain the *unwrapped* needle. Detection at the parser level,
+repair at the text level: an impedance mismatch, and the failure direction was
+the silent one. Vault titles are long; wrapping is the common case, not an edge.
+
+Two structural rules came out of it, and both are load-bearing:
+
+1. **One seam.** :func:`_flexible_ws_re` is the only place a target becomes a
+   matcher, and both branches of both methods go through it. Four hand-rolled
+   copies is how ``verify()`` drifts away from what ``work()`` edits again.
+2. **A verifier must never be satisfiable by the defect it exists to catch.**
+   This bug IS that sentence: the verifier's needle and the defect were the same
+   missing string, so the one check designed to notice "the edit did not land"
+   was disabled by exactly the condition that stopped it landing. ``verify()``
+   judges on the same tolerance ``work()`` edits with, or it is decoration.
 """
 
 from __future__ import annotations
@@ -203,21 +234,65 @@ class Link001Campaign:
         return f"{rel_path}::{target}::{branch}"
 
     def work(self, item_id: str) -> None:
+        """Edit the record. WRITES ONLY WHEN THE TEXT ACTUALLY CHANGED.
+
+        The unconditional ``write_text`` this replaced moved the file's mtime on
+        a no-op edit, which is the worst possible lie for this campaign: mtime is
+        the cheapest evidence an operator has that a repair touched a record, and
+        a bumped mtime over unchanged bytes made 4 false-dones look worked. A
+        no-op is now a logged event and an untouched file.
+        """
         rel_path, target, branch = self.parse_item(item_id)
         from alfred.vault.paths import resolve_in_vault
 
         path = resolve_in_vault(
             self.vault_path, rel_path, writer="drip.link001_repair",
         )
-        body = path.read_text(encoding="utf-8")
+        original = path.read_text(encoding="utf-8")
         link = f"[[{target}]]"
+        link_re = _flexible_ws_re(link)
+
         if branch == self.BRANCH_ANNOTATE:
             # Provenance annotation; the link STAYS.
-            if f"{link} " + _PROVENANCE_MARK in body:
+            if _flexible_ws_re(f"{link} {_PROVENANCE_MARK}").search(original):
                 return                       # already annotated — idempotent
-            body = body.replace(link, f"{link} {_PROVENANCE_MARK}")
+            # The mark goes immediately after the matched ``]]``, so for a link
+            # inside a quoted YAML scalar it lands INSIDE the quotes. Measured,
+            # not assumed (#60): inside is valid YAML and the scanner still sees
+            # the link; placing it after the closing quote raises
+            # ParserError and makes the whole record unparseable. See
+            # ``_PROVENANCE_MARK`` for the constraint that keeps this true.
+            body = link_re.sub(
+                lambda m: f"{m.group(0)} {_PROVENANCE_MARK}", original,
+            )
         else:
-            body = _remove_link(body, link)
+            body = _remove_link(original, link)
+
+        if body == original:
+            # ILB: work() ran and changed nothing. Silence here is what let the
+            # first live increment look healthy — so the no-op is a named event,
+            # and its level splits on the only thing that distinguishes an
+            # anomaly from an idempotent re-run.
+            still_present = bool(link_re.search(original))
+            emit = log.warning if still_present else log.info
+            emit(
+                "drip.link001.no_change",
+                campaign=self.name,
+                item_id=item_id,
+                branch=branch,
+                path=rel_path,
+                target_present=still_present,
+                detail=(
+                    "target is still in the record but work() could not edit "
+                    "it — verify() will fail this item, which is the honest "
+                    "direction"
+                    if still_present else
+                    "ran, nothing to change — the target is already absent "
+                    "(an idempotent re-run, not a failure)"
+                ),
+            )
+            return
+
         path.write_text(body, encoding="utf-8")
 
     def verify(self, item_id: str) -> bool:
@@ -226,6 +301,16 @@ class Link001Campaign:
         A uniform "the link is gone" check would mark every annotation FAILED —
         the annotate branch deliberately keeps the link. This is why the branch
         travels in the item id rather than being looked up.
+
+        **Judged on the SAME tolerance ``work()`` edits with, via the same
+        :func:`_flexible_ws_re` seam.** A verifier must never be satisfiable by
+        the defect it exists to catch, and until #60 this one was: both used the
+        exact string ``[[<target>]]``, so a YAML-wrapped link failed to match in
+        ``work()`` (nothing edited) and failed to match here too — which the
+        removal branch reads as success. The single condition that stopped the
+        repair landing also switched off the check for whether it landed. Any
+        future change to how ``work()`` matches must move this method in the same
+        commit or it re-opens exactly this hole.
         """
         rel_path, target, branch = self.parse_item(item_id)
         from alfred.vault.paths import resolve_in_vault
@@ -238,8 +323,10 @@ class Link001Campaign:
         body = path.read_text(encoding="utf-8")
         link = f"[[{target}]]"
         if branch == self.BRANCH_ANNOTATE:
-            return f"{link} {_PROVENANCE_MARK}" in body
-        return link not in body
+            return _flexible_ws_re(
+                f"{link} {_PROVENANCE_MARK}"
+            ).search(body) is not None
+        return _flexible_ws_re(link).search(body) is None
 
     def spends_quota(self) -> bool:
         return False    # pure vault edits, no LLM
@@ -249,31 +336,108 @@ class Link001Campaign:
 
 
 #: The D-ruling's provenance annotation for a surviving learn-record link.
+#:
+#: **It must never contain an apostrophe.** ``work()`` inserts this INSIDE a
+#: single-quoted YAML scalar when the annotated link lives in frontmatter, and
+#: YAML's single-quote form escapes a literal ``'`` by doubling it. An
+#: un-doubled apostrophe here would terminate the scalar early and corrupt the
+#: record's frontmatter — a silent break, since the janitor can then no longer
+#: parse the file at all. Pinned, because the constraint is invisible at the
+#: point someone would edit the wording.
 _PROVENANCE_MARK = "<!-- link-provenance: retained (learn record) -->"
 
 #: Horizontal whitespace only — never a newline. A link at end-of-line must not
 #: let its trailing-whitespace match eat the line break and join two lines.
 _INLINE_WS = r"[^\S\r\n]"
 
+#: A list entry's bullet. YAML block sequences only ever use ``-``; ``*`` and
+#: ``+`` are markdown bullets, which reach :func:`_remove_link` the same way and
+#: leave the same debris when a link was the entry's whole content.
+_BULLET = r"[-*+]"
+
+
+def _flexible_ws_re(needle: str) -> re.Pattern[str]:
+    """Compile ``needle`` so each of its spaces matches ANY whitespace run.
+
+    THE SEAM (#60). Both branches of both ``Link001Campaign`` methods build
+    their matcher here, so ``verify()`` cannot judge on a different tolerance
+    than ``work()`` edits with. Four hand-rolled copies is how the two drifted
+    apart in the first place.
+
+    Mechanically: split on whitespace, escape each token, rejoin with ``\\s+``.
+    ``\\s+`` matches one-or-more, so the SAME pattern matches the unwrapped
+    ``[[A B]]`` and the YAML-folded ``[[A\\n  B]]`` — there is no second code
+    path for wrapped links, which is what keeps the unwrapped population's
+    behaviour unchanged.
+
+    Safe against over-matching because the needles always carry their own
+    delimiters: a target's tokens must appear between a literal ``[[`` and
+    ``]]``, separated by whitespace ONLY. ``[[Cox and Palmer]]`` therefore cannot
+    match ``[[Cox and Palmer Halifax]]`` — the closing brackets bound it — and
+    nothing but a real wikilink to the same target can satisfy it.
+
+    Returns a pattern with NO capture groups, so callers may wrap it in their
+    own; the callers that do use NAMED groups anyway, so this stays true even if
+    that changes.
+    """
+    tokens = needle.split()
+    if not tokens:
+        return re.compile(re.escape(needle))
+    return re.compile(r"\s+".join(re.escape(t) for t in tokens))
+
 
 def _remove_link(body: str, link: str) -> str:
-    """Delete ``link`` and heal the whitespace it sat in.
+    """Delete ``link`` and leave the structure it sat in intact.
 
-    A plain ``body.replace(link, "")`` leaves a double space behind every
-    inline link (``See [[X]] here.`` → ``See  here.``). One record it is a
-    typo; across the ~2,000 the campaign drains it becomes a second cleanup
-    campaign, which is why this is worth fixing at the removal site rather
-    than later.
+    Two cases, and the entry case is tried FIRST because it subsumes the other.
 
-    The rule: consume the link together with the horizontal whitespace on
-    either side, then put back a SINGLE space only when the link had
-    whitespace on BOTH sides (i.e. it sat between words). A link that was
-    leading, trailing, or hugging punctuation leaves nothing behind, so
+    **A list entry whose entire content is the link loses the WHOLE ENTRY.**
+    Healing alone would turn ``- '[[X]]'`` into ``- ''`` — an empty string
+    sitting in a list of wikilinks, which is not a link and not absence either.
+    Measured (#60): dropping the entry leaves ``related: ['[[person/Other]]']``
+    where healing leaves ``related: ['', '[[person/Other]]']``. When the link was
+    the SOLE entry the key becomes null (``related:`` → ``None``), which both
+    live consumers already tolerate — ``janitor/autofix`` coerces a non-list to
+    ``[]`` and ``surveyor/cleanup`` guards on ``isinstance(..., list)``. Applies
+    to markdown bullets too, for the same reason and with the same debris.
+
+    An entry carrying anything ELSE (``- '[[X]]' # note``, ``- [[X]] — my
+    accountant``) is NOT wholly the link, so it falls through to the heal below
+    and keeps its remaining content.
+
+    **Everything else is healed inline.** A plain ``body.replace(link, "")``
+    leaves a double space behind every inline link (``See [[X]] here.`` → ``See
+    here.``). One record it is a typo; across the ~2,000 the campaign drains it
+    becomes a second cleanup campaign, which is why this is fixed at the removal
+    site rather than later. The rule: consume the link together with the
+    horizontal whitespace on either side, then put back a SINGLE space only when
+    the link had whitespace on BOTH sides (i.e. it sat between words). A link
+    that was leading, trailing, or hugging punctuation leaves nothing behind, so
     ``See [[X]].`` becomes ``See.`` rather than ``See .``.
+
+    A frontmatter SCALAR field (``source_a: '[[X]]'``) deliberately keeps its
+    key and is left as ``''``. Deleting a declared field is a schema change, and
+    this campaign has no mandate to make one; an empty value is already how an
+    unset field is spelled.
+
+    Both cases match whitespace-tolerantly via :func:`_flexible_ws_re`, so a
+    YAML-folded link is removed exactly like an unwrapped one.
     """
-    pattern = re.compile(f"({_INLINE_WS}*){re.escape(link)}({_INLINE_WS}*)")
-    return pattern.sub(
-        lambda m: " " if (m.group(1) and m.group(2)) else "", body,
+    link_re = _flexible_ws_re(link)
+
+    entry_re = re.compile(
+        rf"^{_INLINE_WS}*{_BULLET}{_INLINE_WS}*"
+        rf"(?P<quote>['\"]?){link_re.pattern}(?P=quote)"
+        rf"{_INLINE_WS}*(?:\r?\n|\Z)",
+        re.MULTILINE,
+    )
+    body = entry_re.sub("", body)
+
+    heal_re = re.compile(
+        rf"(?P<before>{_INLINE_WS}*){link_re.pattern}(?P<after>{_INLINE_WS}*)"
+    )
+    return heal_re.sub(
+        lambda m: " " if (m.group("before") and m.group("after")) else "", body,
     )
 
 

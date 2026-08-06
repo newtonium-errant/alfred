@@ -1,12 +1,16 @@
 """``alfred drip`` subcommand handlers (#44b).
 
-Two commands, both operator-facing:
+Operator-facing commands:
 
 * ``run`` — drain one budgeted increment per enabled campaign. This is the
   ignition the #44 machinery was missing; it is what a scheduler invokes.
 * ``status`` — render the same lines the ops brief shows, on demand, without
   running anything. Deliberately the SAME renderer as the brief so the two
   surfaces can never disagree about a campaign's progress.
+* ``repair-verify`` — re-run the CURRENT verifier over items already recorded
+  ``done`` and demote the ones it no longer believes (#60). Deliberately
+  operator-invoked; see :func:`cmd_repair_verify` for why it must not be
+  automatic.
 
 Budgets come from config on every path. That is the D1 gap this slice closes,
 and it is why no call here passes a literal: a number typed at a call site is a
@@ -24,7 +28,7 @@ import structlog
 from .brief_line import render_campaign_line
 from .config import DripConfig
 from .runner import run_increment
-from .state import campaign_state_path, load_state
+from .state import DONE, PENDING, campaign_state_path, load_state, now_iso, save_state
 from .wiring import DripConfigError, build_campaign, build_progress
 
 log = structlog.get_logger(__name__)
@@ -44,6 +48,27 @@ def _select(config: DripConfig, campaign_name: str | None) -> dict:
         raise DripConfigError(
             f"campaign {campaign_name!r} is configured but not enabled — set "
             f"drip.campaigns.{campaign_name}.enabled: true"
+        )
+    return {campaign_name: config.campaigns[campaign_name]}
+
+
+def _select_configured(config: DripConfig, campaign_name: str | None) -> dict:
+    """Like :func:`_select` but WITHOUT the enabled gate.
+
+    Used by ``repair-verify``, and the difference is deliberate rather than
+    sloppy: state repair is wanted precisely when a campaign is PARKED. #60's
+    containment disabled the link001 timer the moment the false-dones were
+    found, and if the operator also flips ``enabled: false`` then an
+    enabled-only selector would refuse the one command that makes the campaign
+    safe to switch back on. ``status`` already reports disabled campaigns for
+    the same reason — "not draining" and "not there" are different facts.
+    """
+    if campaign_name is None:
+        return dict(config.campaigns)
+    if campaign_name not in config.campaigns:
+        raise DripConfigError(
+            f"unknown campaign {campaign_name!r} — configured: "
+            f"{sorted(config.campaigns) or '(none)'}"
         )
     return {campaign_name: config.campaigns[campaign_name]}
 
@@ -152,6 +177,167 @@ def cmd_status(config: DripConfig, *, today: date | None = None) -> int:
     return 0
 
 
+def cmd_repair_verify(
+    config: DripConfig,
+    *,
+    campaign_name: str | None = None,
+    apply: bool = False,
+) -> int:
+    """Re-verify every ``done`` item and demote the ones that did not land.
+
+    #60's repair half. A campaign's ``done`` rows are only as trustworthy as the
+    verifier that wrote them, and link001's verifier was satisfiable by the very
+    defect it existed to catch: a YAML-wrapped link failed the exact-string match
+    in ``work()`` (nothing edited) and failed it here too, which the removal
+    branch reads as success. 4 of the first live increment's 12 items were
+    recorded ``done`` over an untouched record and then permanently skipped, the
+    work-list being frozen. Fixing the verifier does not un-record them — only
+    re-asking the question does.
+
+    **Dry run by DEFAULT**, matching ``build-worklist`` and inverting ``run``.
+    The deploy moment for this is a single deliberate invocation, so previewing
+    which items it intends to reopen costs one command and makes the write an
+    informed one.
+
+    **Never automatic, and never wired into ``run``.** A verifier that
+    re-litigates its own history on every scheduled tick is a campaign that can
+    oscillate: one bad verify turns settled work back into pending, the next run
+    re-edits records that were already correct. Repair is a response to a KNOWN
+    verifier bug, which is a thing a human knows and a timer does not.
+
+    Three properties the demotion holds:
+
+    * **Item-keyed** — each item's own ``verify(item_id)`` decides its own fate.
+    * **Idempotent** — a second pass sees the demoted rows as ``pending`` rather
+      than ``done``, so they are out of scope; it demotes nothing and says so.
+    * **Silent on nothing** is impossible — the summary line always prints, and
+      zero demotions is an explicit sentence rather than an absent one.
+
+    A verify that RAISES does not demote. Failing to prove an item landed is not
+    proof it didn't (the #40 over-reach, same lesson): an unreadable record would
+    otherwise reopen work that was genuinely finished. Those are counted and
+    logged separately so the number is never mistaken for a clean bill.
+    """
+    selected = _select_configured(config, campaign_name)
+
+    if not selected:
+        # ILB: no configured campaigns is a legitimate state, not a crash.
+        print("Drip repair-verify: no campaigns configured — ran, nothing to check.")
+        log.info(
+            "drip.repair_verify.no_campaigns",
+            detail="ran, nothing to check — no drip campaigns configured",
+        )
+        return 0
+
+    mode = "" if apply else " [dry run]"
+
+    for name, ccfg in sorted(selected.items()):
+        try:
+            campaign = build_campaign(name, ccfg, config)
+        except DripConfigError as exc:
+            # Loud, and does not abort the other campaigns — same posture as run.
+            print(f"Drip repair-verify: campaign {name!r} could not start — {exc}")
+            log.warning(
+                "drip.repair_verify.campaign_unbuildable",
+                campaign=name, error=str(exc),
+            )
+            continue
+
+        state_path = campaign_state_path(config.data_dir, config.instance, name)
+        state = load_state(state_path, name)
+
+        done_ids = sorted(
+            iid for iid, it in state.items.items() if it.state == DONE
+        )
+        if not done_ids:
+            # ILB: "no done items" and "checked them and they were all fine" are
+            # different facts and must not render identically.
+            print(
+                f"Drip repair-verify {name}{mode}: ran, no done items to "
+                f"re-verify."
+            )
+            log.info(
+                "drip.repair_verify.no_done_items",
+                campaign=name,
+                detail="ran, nothing to check — no item is recorded done",
+            )
+            continue
+
+        demoted = confirmed = errored = 0
+        for item_id in done_ids:
+            try:
+                landed = bool(campaign.verify(item_id))
+            except Exception as exc:  # noqa: BLE001 — see the docstring
+                errored += 1
+                log.warning(
+                    "drip.repair_verify.verify_raised",
+                    campaign=name, item_id=item_id, error=str(exc),
+                    consequence="left DONE — an unprovable item is not a "
+                                "disproven one, and reopening it would re-edit "
+                                "a record that may already be correct",
+                )
+                print(f"  ? {item_id} — verify raised: {exc}")
+                continue
+
+            if landed:
+                confirmed += 1
+                continue
+
+            demoted += 1
+            item = state.items[item_id]
+            log.warning(
+                "drip.repair_verify.demoted",
+                campaign=name,
+                item_id=item_id,
+                previous_state=DONE,
+                new_state=PENDING,
+                applied=apply,
+                reason="the current verifier does not observe this item's "
+                       "effect — it was recorded done by a verifier that "
+                       "could not see the defect it was checking for",
+            )
+            print(f"  ! {item_id} — recorded done, not verifiable → pending")
+            if apply:
+                item.state = PENDING
+                # Reset the retry budget. These attempts were scored against a
+                # broken verifier, so the count carries no information — and an
+                # item that arrives back in the queue with its attempts already
+                # spent would retire without ever being genuinely tried.
+                item.attempts = 0
+                item.awaiting_runs = 0
+                item.claimed_by = ""
+                item.last_error = (
+                    "demoted by repair-verify: recorded done but the current "
+                    "verifier does not observe the effect"
+                )
+                item.updated_at = now_iso()
+
+        if apply and demoted:
+            save_state(state_path, state)
+
+        errors_note = f", {errored} unverifiable" if errored else ""
+        print(
+            f"Drip repair-verify {name}{mode}: ran, {demoted} demoted, "
+            f"{confirmed} confirmed{errors_note} (of {len(done_ids)} done)."
+        )
+        if not apply and demoted:
+            print(
+                f"  [dry run] nothing was written — re-run with --apply to "
+                f"reopen {demoted} item(s)."
+            )
+        log.info(
+            "drip.repair_verify.summary",
+            campaign=name,
+            mode="apply" if apply else "dry_run",
+            checked=len(done_ids),
+            demoted=demoted,
+            confirmed=confirmed,
+            errored=errored,
+        )
+
+    return 0
+
+
 def cmd_build_worklist(
     janitor_config,
     *,
@@ -233,4 +419,9 @@ def cmd_build_worklist(
     return 0
 
 
-__all__ = ["cmd_build_worklist", "cmd_run", "cmd_status"]
+__all__ = [
+    "cmd_build_worklist",
+    "cmd_repair_verify",
+    "cmd_run",
+    "cmd_status",
+]
