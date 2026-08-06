@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from .stt_backends import SttError, SttResult, build_chain
+from .stt_vocab_learning import effective_vocab_terms
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -177,7 +178,7 @@ async def _capture_inner(
     chat_id: int | None,
     duration: int,
 ) -> None:
-    vocab = list(getattr(stt_config, "vocab_terms", []) or [])
+    vocab = effective_vocab_terms(stt_config)
     engines = build_chain(stt_config)
 
     records: dict[str, dict] = {}

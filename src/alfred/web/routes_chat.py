@@ -363,6 +363,89 @@ def _validate_turn_images(
     return blocks, raws, None
 
 
+def _capture_voice_correction(
+    talker_config: Any,
+    *,
+    kind: str,
+    transcript: Any,
+    sent: str,
+    user: str,
+    session_key: str,
+) -> None:
+    """Record what the STT heard against what the operator actually sent (#54).
+
+    This is the CAPTURE half of the learned-vocabulary loop. When a message came
+    from voice, the composer carries the transcript as it was inserted; the
+    difference between that and the sent text is a correction the operator made
+    anyway — free supervision nobody had to be asked for.
+
+    Called on the path where the turn REALLY runs, never on the idempotency-dedup
+    path: a retried send must not count the same correction twice, because counts
+    are what decide whether a term crosses the proposal threshold.
+
+    A ZERO DIFF IS RECORDED, NOT SKIPPED. "He sent the transcript untouched" is
+    positive evidence about transcription quality and the denominator for any
+    later error rate; dropping it would leave only the failures on file and make
+    the STT look worse than it is. It is logged explicitly so the quiet case is
+    visibly a decision rather than an absence.
+
+    Best-effort throughout: a capture failure must never cost the operator their
+    turn, so everything is inside the try and the turn proceeds regardless.
+    """
+    if kind != "voice":
+        return
+    stt = getattr(talker_config, "stt", None)
+    if not getattr(stt, "vocab_learning_enabled", False):
+        return
+    if not isinstance(transcript, str) or not transcript.strip():
+        # Voice-kind with no transcript carried: an older client, or the player
+        # ask box, which does not seed from a transcript. Not an error.
+        return
+
+    try:
+        from alfred.telegram.stt_vocab_learning import (
+            CorrectionPair,
+            append_correction_pair,
+            extract_term_corrections,
+        )
+
+        corpus_path = getattr(stt, "vocab_corpus_path", "") or ""
+        if not corpus_path:
+            return
+        instance = getattr(getattr(talker_config, "instance", None), "name", "") or ""
+        append_correction_pair(
+            corpus_path,
+            CorrectionPair(transcript=transcript, sent=sent, instance=instance),
+        )
+        if transcript.strip() == sent.strip():
+            log.info(
+                "web.chat.voice_transcript_unedited",
+                user=user,
+                session_key=session_key,
+                chars=len(sent),
+                detail="operator sent the transcript unchanged — recorded as "
+                       "positive evidence about transcription quality",
+            )
+        else:
+            log.info(
+                "web.chat.voice_correction_captured",
+                user=user,
+                session_key=session_key,
+                terms=len(extract_term_corrections(transcript, sent)),
+                detail="stored the (transcript, sent) pair for the learned-"
+                       "vocabulary loop",
+            )
+    except Exception as exc:  # noqa: BLE001 — capture is never worth a turn
+        log.warning(
+            "web.chat.voice_correction_capture_failed",
+            user=user,
+            session_key=session_key,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            action="continuing_the_turn",
+        )
+
+
 def _build_turn_payload(
     session_obj: Any,
     pre_len: int,
@@ -739,6 +822,17 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
         # ``_ts`` clock ``append_turn`` writes — no new clock invented.
         pre_len = len(session_obj.transcript)
 
+        # #54 capture — this is the real-send path (a dedup HIT returned above),
+        # so a correction is counted exactly once per send.
+        _capture_voice_correction(
+            talker_config,
+            kind=kind,
+            transcript=body.get("transcript"),
+            sent=message,
+            user=identity.user,
+            session_key=session_key,
+        )
+
         user_name = _user_name_for(identity, web_config)
 
         # Persist carried screenshots to the inbox (sovereign audit trail,
@@ -931,6 +1025,21 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
 
     # pre_len captured BEFORE the run_turn task is launched/awaited.
     pre_len = len(session_obj.transcript)
+
+    # #54 capture — guarded on ``status != "hit"`` for the same reason as
+    # /chat/turn: a dedup hit never runs the turn and must not re-count the
+    # correction. Placed before the SSE handshake so a client that drops
+    # mid-stream still has its correction recorded (it did send the message).
+    if status != "hit":
+        _capture_voice_correction(
+            talker_config,
+            kind=kind,
+            transcript=body.get("transcript"),
+            sent=message,
+            user=identity.user,
+            session_key=session_key,
+        )
+
     user_name = _user_name_for(identity, web_config)
 
     # Persist carried screenshots to the inbox (sovereign audit trail,

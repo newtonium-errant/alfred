@@ -46,6 +46,7 @@ from . import (
     radar_section,
     recurrence_section,
     routine_match_section,
+    stt_vocab_section,
     ticket_notify_section,
     triage_section,
 )
@@ -294,6 +295,14 @@ async def fire_once(
     # suggestion is wrong) — without it the card offers reject / one-off only.
     routine_match_section.set_vault_path(vault_path)
     routine_match_section.register()
+
+    # #54 — learned-speech-vocabulary proposals (PROPOSE-ONLY, read-only).
+    # Registered unconditionally; the provider returns None when
+    # ``stt_vocab.enabled`` is False. Needs no vault path and no raw config —
+    # both stores are plain JSONL paths derived from ``telegram.stt`` at config
+    # load time. Mutation is the CLI's (`alfred stt-vocab approve|reject`), so
+    # rendering this card can never change what biases transcription.
+    stt_vocab_section.register()
 
     # #20 P5 B1 — ad-hoc-T3 recurrence→promote proposals (PROPOSE-ONLY). Needs the vault path (scans
     # vault/daily/*.md); registered unconditionally — the provider returns None when

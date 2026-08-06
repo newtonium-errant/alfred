@@ -13,6 +13,7 @@ import {
   ALLOWED_IMAGE_MEDIA_TYPES,
   MAX_IMAGES_PER_TURN,
   MAX_IMAGE_BYTES,
+  MAX_TRANSCRIPT_CHARS,
   base64DecodedBytes,
   type ImageAttachment,
 } from '../../lib/algernon/schemas';
@@ -31,6 +32,10 @@ import {
 // prefix stripped) matching the backend wire shape. An IMAGE-ONLY send carries
 // a placeholder caption so the backend's message_required gate is satisfied.
 // The FE caps are UX-only; the backend re-validates as the fail-loud authority.
+//
+// Learned-vocabulary capture (#54): alongside the edited text, a voice-seeded
+// send carries the RAW STT transcript so the backend can diff the two and learn
+// what it mis-heard. See `transcriptRef` for what exactly is carried and why.
 
 const IMAGE_ONLY_PLACEHOLDER = '(image attached, no caption)';
 const MAX_IMAGE_MIB = Math.round(MAX_IMAGE_BYTES / (1024 * 1024));
@@ -57,12 +62,38 @@ export function Composer({
   onSend,
   disabled = false,
 }: {
-  onSend: (text: string, kind?: ChatKind, images?: ImageAttachment[]) => void;
+  onSend: (
+    text: string,
+    kind?: ChatKind,
+    images?: ImageAttachment[],
+    transcript?: string,
+  ) => void;
   disabled?: boolean;
 }) {
   const [value, setValue] = useState('');
   // True once a voice transcript seeded the input — tags the next send as 'voice'.
   const [voiceSeeded, setVoiceSeeded] = useState(false);
+  // The RAW STT text this message was seeded from (#54) — ONLY the transcribed
+  // segments, joined by the same single-space rule the textarea append uses, and
+  // never the operator's own typed words.
+  //
+  // WHY ONLY THE SPOKEN PART. The backend diffs transcript-vs-sent and reads the
+  // `replace` spans as "the STT heard X, I meant Y". Text the operator TYPED was
+  // never heard by the STT, so it cannot have been mis-heard; folding it in would
+  // make his own edits to his own typing eligible to be learned as vocabulary.
+  // Keeping it out means a typed word only ever appears as a diff INSERT, which
+  // the extractor ignores by design.
+  //
+  // The cost, stated honestly: a send that mixes typing with a PERFECT
+  // transcription no longer looks like a zero diff, so it is recorded as a
+  // correction-bearing pair with zero extracted terms instead of as clean
+  // evidence. That understates transcription quality — the same conservative
+  // direction the rest of the loop errs in, and never the flattering one.
+  //
+  // A ref, not state: it is never rendered, and a ref is always current at the
+  // moment `submit` reads it (no stale-closure window between an async
+  // transcription landing and the next render).
+  const transcriptRef = useRef('');
   const [images, setImages] = useState<ImageAttachment[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -74,15 +105,33 @@ export function Composer({
     const text = value.trim();
     const hasImages = images.length > 0;
     const caption = text || IMAGE_ONLY_PLACEHOLDER;
+    // Only a voice-seeded send carries a transcript, and only one the BFF will
+    // actually accept. An over-long transcript is DROPPED, not sent: capture is
+    // telemetry, and letting it fail the zod bound would 400 the whole turn —
+    // the operator would lose a message he spoke, to a learning feature. The
+    // send still goes through, tagged 'voice'; only the learning is skipped.
+    const raw = voiceSeeded ? transcriptRef.current.trim() : '';
+    let transcript = raw || undefined;
+    if (transcript && transcript.length > MAX_TRANSCRIPT_CHARS) {
+      // ILB: a silently-absent transcript is indistinguishable from a broken
+      // capture. Lengths only — the transcript itself is the operator's words
+      // and never belongs in a console.
+      console.warn(
+        `[composer] transcript dropped: ${transcript.length} chars exceeds ` +
+          `${MAX_TRANSCRIPT_CHARS}; the turn is sent without it`,
+      );
+      transcript = undefined;
+    }
     // Keep the 2-arg call for the text-only path (no behavioural drift for the
-    // existing caller / tests); only widen to 3 args when images ride along.
-    if (hasImages) {
-      onSend(caption, voiceSeeded ? 'voice' : 'text', images);
+    // existing caller / tests); only widen when images or a transcript ride along.
+    if (hasImages || transcript) {
+      onSend(caption, voiceSeeded ? 'voice' : 'text', hasImages ? images : undefined, transcript);
     } else {
       onSend(caption, voiceSeeded ? 'voice' : 'text');
     }
     setValue('');
     setVoiceSeeded(false);
+    transcriptRef.current = '';
     setImages([]);
     setImageError(null);
   }
@@ -166,8 +215,23 @@ export function Composer({
       <VoiceCapture
         idPrefix="composer-voice"
         disabled={disabled}
+        // #54 — the transcript lands in THIS input, editable in place, one Send.
+        insertDirectly
         onTranscript={(t) => {
-          setValue(t);
+          // APPEND, never replace. The old `setValue(t)` destroyed whatever the
+          // operator had already typed — the clobber the operator hit. A single
+          // space joins the two; no space when the input was empty, so a
+          // voice-only message carries no leading whitespace.
+          setValue((prev) => {
+            const base = prev.trimEnd();
+            return base ? `${base} ${t}` : t;
+          });
+          // Mirror the append into the raw-transcript record with the SAME join
+          // rule, so a message dictated in several passes diffs as one piece and
+          // an early correction is still visible against a later dictation.
+          transcriptRef.current = transcriptRef.current
+            ? `${transcriptRef.current} ${t}`
+            : t;
           setVoiceSeeded(true);
         }}
       />
@@ -252,7 +316,13 @@ export function Composer({
           onChange={(e) => {
             setValue(e.target.value);
             // Cleared back to empty → the next send is a plain text turn again.
-            if (e.target.value.trim().length === 0) setVoiceSeeded(false);
+            // The transcript clears in LOCKSTEP: nothing spoken survives in the
+            // box, so keeping it would diff the next typed message against words
+            // the operator already threw away.
+            if (e.target.value.trim().length === 0) {
+              setVoiceSeeded(false);
+              transcriptRef.current = '';
+            }
           }}
           onKeyDown={onKeyDown}
           onPaste={onPaste}

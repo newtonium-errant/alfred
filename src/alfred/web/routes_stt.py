@@ -297,7 +297,7 @@ async def _handle_stt_transcribe(request: web.Request) -> web.StreamResponse:
     # Lazy import — reuse the LIVE fallback chain (NOT the legacy
     # single-Groq transcribe.py). Byte-identical to bot.py's on_voice
     # call site.
-    from alfred.telegram import stt_backends
+    from alfred.telegram import stt_backends, stt_vocab_learning
 
     try:
         chain = stt_backends.build_chain(talker_config.stt)
@@ -305,7 +305,7 @@ async def _handle_stt_transcribe(request: web.Request) -> web.StreamResponse:
             bytes(audio),
             mime,
             chain,
-            talker_config.stt.vocab_terms,
+            stt_vocab_learning.effective_vocab_terms(talker_config.stt),
             talker_config.stt.total_budget_s,
         )
     except Exception as exc:  # noqa: BLE001 — surface engine errors as 502

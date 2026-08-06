@@ -830,3 +830,63 @@ def test_dedup_cache_copies_in_and_out() -> None:
     assert got == {"transcript": "orig"}
     got["transcript"] = "mutated-after-get"  # must not affect the store
     assert cache.get(("andrew", _KEY_A)) == {"transcript": "orig"}
+
+
+# ---------------------------------------------------------------------------
+# #54 — the learned-vocabulary SEAM reaches this production consumer.
+#
+# The seam's own unit pins prove `effective_vocab_terms` is correct. They cannot
+# prove any consumer CALLS it — revert this route to `talker_config.stt.
+# vocab_terms` and every one of those pins stays green while the operator's
+# approved terms silently stop biasing. This drives the real handler and asserts
+# on what the transcribe call actually received.
+# ---------------------------------------------------------------------------
+
+
+async def test_an_approved_term_reaches_the_transcribe_call(
+    stt_client, monkeypatch, tmp_path
+) -> None:
+    from alfred.telegram.stt_vocab_learning import (
+        DECISION_APPROVE,
+        VocabDecision,
+        append_decision,
+    )
+    from alfred.web.keys import KEY_WEB_TALKER_CONFIG
+
+    decided = tmp_path / "decided.jsonl"
+    append_decision(
+        decided,
+        VocabDecision(type=DECISION_APPROVE, term="chicken tractor", operator="andrew"),
+    )
+    talker_config = stt_client.app[KEY_WEB_TALKER_CONFIG]
+    talker_config.stt.vocab_decided_path = str(decided)
+
+    seen: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(
+        stt_backends, "build_chain",
+        lambda cfg: [_FakeBackend("groq-whisper")],
+    )
+
+    async def _capture_vocab(audio, mime, chain, vocab, budget):
+        seen["vocab"] = list(vocab)
+        return stt_backends.SttResult(
+            text="clean the chicken tractor",
+            backend_id="groq-whisper",
+            tier="comparable",
+        )
+
+    monkeypatch.setattr(stt_backends, "transcribe_with_fallback", _capture_vocab)
+
+    resp = await stt_client.post(
+        "/stt/transcribe",
+        data=b"audio-bytes",
+        headers=_audio_headers("audio/webm"),
+    )
+    assert resp.status == 200
+    assert "chicken tractor" in seen["vocab"], (
+        "the approved term must reach the transcribe call — this route must read "
+        "the seam, not the raw config list"
+    )
+    # The static list still biases too; learning ADDS, never replaces.
+    assert set(talker_config.stt.vocab_terms).issubset(set(seen["vocab"]))

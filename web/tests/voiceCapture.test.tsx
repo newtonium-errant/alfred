@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { VoiceCapture } from '../components/chat/VoiceCapture';
 
@@ -147,5 +147,46 @@ describe('VoiceCapture (file upload)', () => {
     await userEvent.click(await screen.findByTestId('voice-retry'));
     await screen.findByTestId('voice-transcript');
     expect(screen.queryByTestId('voice-retry')).toBeNull(); // freed on the successful resend
+  });
+});
+
+// #54 — direct-insert mode: no confirm step, the consumer owns the edit surface.
+describe('insertDirectly', () => {
+  it('fires onTranscript without a Use press and renders NO confirm box', async () => {
+    mockTranscribe.mockResolvedValue({ transcript: 'chicken tractor', low_confidence: false });
+    const onTranscript = vi.fn();
+    render(<VoiceCapture onTranscript={onTranscript} insertDirectly />);
+
+    uploadAudio();
+
+    await waitFor(() => expect(onTranscript).toHaveBeenCalledWith('chicken tractor'));
+    // The confirm surface must be ABSENT — its presence is the friction #54 removes.
+    expect(screen.queryByTestId('voice-transcript')).toBeNull();
+    expect(screen.queryByTestId('voice-use')).toBeNull();
+  });
+
+  it('a low-confidence NOTICE still surfaces in direct mode', async () => {
+    // ILB: a shaky transcript still says so — it just annotates text the
+    // operator can already see and edit, instead of gating it behind a confirm.
+    mockTranscribe.mockResolvedValue({ transcript: 'front coop', low_confidence: true });
+    const onTranscript = vi.fn();
+    render(<VoiceCapture onTranscript={onTranscript} insertDirectly />);
+
+    uploadAudio();
+
+    await waitFor(() => expect(onTranscript).toHaveBeenCalledWith('front coop'));
+    expect(screen.queryByTestId('voice-notice')).not.toBeNull();
+  });
+
+  it('DEFAULT mode is unchanged — still waits for an explicit Use', async () => {
+    // The two surfaces that did not ask for this (player ask, ingest) rely on it.
+    mockTranscribe.mockResolvedValue({ transcript: 'front run', low_confidence: false });
+    const onTranscript = vi.fn();
+    render(<VoiceCapture onTranscript={onTranscript} />);
+
+    uploadAudio();
+
+    expect(await screen.findByTestId('voice-transcript')).not.toBeNull();
+    expect(onTranscript).not.toHaveBeenCalled();
   });
 });

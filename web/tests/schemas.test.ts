@@ -4,6 +4,7 @@ import {
   MAX_IMAGE_BYTES,
   MAX_MESSAGE_CHARS,
   MAX_SDP_CHARS,
+  MAX_TRANSCRIPT_CHARS,
   base64DecodedBytes,
   chatTurnBodySchema,
   imageAttachmentSchema,
@@ -121,6 +122,61 @@ describe('chatTurnBodySchema', () => {
   it('a turn with no primer is valid (byte-identical to the pre-feature path)', () => {
     const r = chatTurnBodySchema.safeParse({ session_key: 'k', message: 'hi' });
     expect(r.success).toBe(true);
+  });
+
+  // --- Learned-vocabulary capture (#54) -------------------------------------
+
+  it('accepts a turn carrying the STT transcript', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'clean the chicken tractor',
+      kind: 'voice',
+      transcript: 'clean the chicken tracker',
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.transcript).toBe('clean the chicken tracker');
+  });
+
+  it('a turn with no transcript is valid, and the key stays ABSENT', () => {
+    const r = chatTurnBodySchema.safeParse({ session_key: 'k', message: 'hi' });
+    expect(r.success).toBe(true);
+    // Not `undefined`-valued but PRESENT: the relay spreads on truthiness, and the
+    // backend's "an older client sent nothing" branch keys on the field's absence.
+    if (r.success) expect('transcript' in r.data).toBe(false);
+  });
+
+  it('rejects a transcript past MAX_TRANSCRIPT_CHARS (the trust-boundary bound)', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'short',
+      transcript: 'x'.repeat(MAX_TRANSCRIPT_CHARS + 1),
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts a transcript exactly AT the bound (the cap is inclusive)', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'short',
+      transcript: 'x'.repeat(MAX_TRANSCRIPT_CHARS),
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects a whitespace-only transcript (trimmed, then min(1) — same as message)', () => {
+    const r = chatTurnBodySchema.safeParse({
+      session_key: 'k',
+      message: 'hi',
+      transcript: '   \n  ',
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('the transcript bound tracks the MESSAGE cap — it is derived, not a second number', () => {
+    // Stated as a pin because the bound's whole justification is that the
+    // transcript is diffed against a message that cannot exceed this. If the
+    // message cap moves and this does not, the comment stops being true.
+    expect(MAX_TRANSCRIPT_CHARS).toBe(MAX_MESSAGE_CHARS);
   });
 });
 

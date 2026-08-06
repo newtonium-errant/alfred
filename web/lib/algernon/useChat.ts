@@ -123,6 +123,11 @@ interface PendingTurn {
   // Carried screenshots (parity #29) — resent verbatim on retry so a retried
   // image turn dedups to the same result (the SAME idempotency key rides along).
   images?: ImageAttachment[];
+  // The STT transcript as inserted (#54) — retained so a retry carries it too.
+  // Safe to resend: the backend records the correction only on a REAL send, and
+  // a retry rides the SAME idempotency key ⇒ a dedup hit, which is guarded. So
+  // one operator correction can never be counted twice by a retry.
+  transcript?: string;
 }
 
 // A live, human label for a stream `status` frame (tool activity on a long turn).
@@ -172,8 +177,15 @@ export interface UseChat {
    * `kind` tags the backend turn counter ('voice' for transcript-originated
    * sends). `images` carries optional screenshots (parity #29) — an image-only
    * turn passes a placeholder caption as `text` (the composer supplies it).
+   * `transcript` carries the STT text as inserted (#54) so the backend can learn
+   * from what the operator changed; only a voice-seeded send supplies it.
    */
-  send: (text: string, kind?: ChatKind, images?: ImageAttachment[]) => Promise<void>;
+  send: (
+    text: string,
+    kind?: ChatKind,
+    images?: ImageAttachment[],
+    transcript?: string,
+  ) => Promise<void>;
   /** Resend the last failed turn with the SAME idempotency key (no double-act). */
   retry: () => Promise<void>;
   /** Start a fresh chat (archives the prior session). */
@@ -356,7 +368,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   // SAME idempotency key (the backend dedups if it already ran).
   const runTurn = useCallback(
     async (ctx: PendingTurn) => {
-      const { key, userId, text, kind, priorLen, idk, images } = ctx;
+      const { key, userId, text, kind, priorLen, idk, images, transcript } = ctx;
       setError(null);
       setWorking(null);
       setStatus('sending');
@@ -381,7 +393,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
 
       let res: Response;
       try {
-        res = await chatApi.stream(key, text, { kind, instance, idempotencyKey: idk, images, signal: ac.signal });
+        res = await chatApi.stream(key, text, { kind, instance, idempotencyKey: idk, images, transcript, signal: ac.signal });
       } catch (e) {
         // Aborted by unmount / instance switch → the turn is being abandoned; do
         // not reconcile or touch state (the component is gone or re-bootstrapping).
@@ -409,7 +421,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
         // 200 but no readable body (old runtime) → the non-stream fallback. The
         // shared idempotency key makes this safe even after the stream attempt.
         try {
-          const d = await chatApi.turn(key, text, { kind, instance, idempotencyKey: idk, images });
+          const d = await chatApi.turn(key, text, { kind, instance, idempotencyKey: idk, images, transcript });
           finalizeReply(userId, d);
           onSuccess();
         } catch (e) {
@@ -492,7 +504,12 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   }, [openFresh, fail]);
 
   const send = useCallback(
-    async (raw: string, kind: ChatKind = 'text', images?: ImageAttachment[]) => {
+    async (
+      raw: string,
+      kind: ChatKind = 'text',
+      images?: ImageAttachment[],
+      transcript?: string,
+    ) => {
       const text = raw.trim();
       const key = sessionKeyRef.current;
       // The composer guarantees a non-empty caption even for an image-only turn
@@ -525,6 +542,9 @@ export function useChat(options: UseChatOptions = {}): UseChat {
         priorLen,
         idk,
         ...(images && images.length ? { images } : {}),
+        // Absent (not null/empty) when there is no transcript, so a typed turn's
+        // request body stays byte-identical to the pre-feature shape.
+        ...(transcript ? { transcript } : {}),
       };
       pendingRef.current = ctx;
       await runTurn(ctx);

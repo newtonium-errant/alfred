@@ -7,13 +7,24 @@ import { ApiError } from '../../lib/algernon/http';
 import type { SttTranscribeResponse } from '../../lib/algernon/types';
 
 // REUSABLE voice capture: a mic record toggle + an audio-file upload that
-// transcribe to text via the BFF, then show an EDITABLE transcript the operator
-// confirms (Use) or drops (Discard) before it commits. Wired into BOTH the chat
-// Composer and the ingest body (decision F). Per the self-correcting standard the
-// editable field IS the human-in-the-loop correction surface; per
+// transcribe to text via the BFF. Mounted by three surfaces — the chat Composer,
+// the player's ask box, and the ingest body (decision F).
+//
+// TWO DELIVERY MODES, and the difference is only WHERE the operator edits:
+//   * default — show an EDITABLE transcript here, and fire `onTranscript` only on
+//     an explicit Use (Discard drops it). Ask + ingest use this.
+//   * `insertDirectly` (#54) — fire `onTranscript` as soon as the transcript
+//     arrives and render no confirm box; the CONSUMER's input is the edit
+//     surface. Chat uses this, because editing here and then editing again in the
+//     real composer was the friction the operator reported.
+//
+// Per the self-correcting standard an editable field IS the human-in-the-loop
+// correction surface — under `insertDirectly` that field is the consumer's, not
+// ours, which is why the mode is a prop rather than a fork. Per
 // intentionally-left-blank the low_confidence/empty/degraded signals surface as a
-// NON-blocking notice (the field stays editable — a fallible transcript is never
-// auto-committed). `onTranscript` fires only on an explicit Use.
+// NON-blocking notice in BOTH modes: a shaky transcript still says so, it just
+// annotates text the operator can already see. Nothing is ever auto-SENT — only,
+// in direct mode, auto-INSERTED.
 
 type Phase = 'idle' | 'transcribing' | 'review';
 
@@ -51,11 +62,24 @@ export function VoiceCapture({
   onTranscript,
   disabled = false,
   idPrefix = 'voice',
+  insertDirectly = false,
 }: {
   onTranscript: (text: string) => void;
   disabled?: boolean;
   /** testid prefix so multiple instances (chat + ingest) don't collide. */
   idPrefix?: string;
+  /**
+   * Skip the confirm step: hand the transcript straight to ``onTranscript``
+   * (#54, operator-authored). The consumer then owns the edit surface, so the
+   * operator edits ONCE in the place they were going to send from — instead of
+   * editing here, pressing Use, and editing again in the real composer.
+   *
+   * OPT-IN, defaulting to the confirm-first flow. Three surfaces mount this
+   * component — the chat Composer, the player's ask box, and IngestForm — and
+   * only chat was asked for. A global change would silently alter two surfaces
+   * nobody reviewed; flipping either of the others later is one prop.
+   */
+  insertDirectly?: boolean;
 }) {
   const recorder = useRecorder();
   const [phase, setPhase] = useState<Phase>('idle');
@@ -80,7 +104,19 @@ export function VoiceCapture({
     try {
       const r = await sttClient.transcribe(blob);
       lastBlobRef.current = null; // success — free the audio (don't hoard mic data)
-      setTranscript(r.transcript || '');
+      const text = r.transcript || '';
+      if (insertDirectly) {
+        // Straight to the consumer's own input (#54). The low-confidence NOTICE
+        // still shows — the operator should know the transcript is shaky — but it
+        // annotates text they can already see and edit, rather than gating it
+        // behind a second confirm. Nothing is auto-SENT; only auto-inserted.
+        setTranscript('');
+        setNotice(noticeFor(r));
+        setPhase('idle');
+        if (text) onTranscript(text);
+        return;
+      }
+      setTranscript(text);
       setNotice(noticeFor(r));
       setPhase('review');
     } catch (e) {
@@ -88,7 +124,7 @@ export function VoiceCapture({
       setRetryable(true); // the blob is retained → offer a RESEND, not a re-record
       setPhase('idle');
     }
-  }, []);
+  }, [insertDirectly, onTranscript]);
 
   // Resend the SAME retained audio (a dropped/timed-out response on a transcribe
   // that likely SUCCEEDED server-side — retry recovers the message).
@@ -218,6 +254,17 @@ export function VoiceCapture({
             </div>
           )}
         </div>
+      )}
+
+      {/* The low-confidence / empty / degraded NOTICE renders in BOTH modes.
+          Direct mode has no review phase, and gating the notice on that phase
+          silently dropped the one honest signal that a transcript is shaky —
+          caught by its own pin. In direct mode it annotates text already sitting
+          in the consumer's input; in default mode it sits above the confirm box. */}
+      {insertDirectly && notice && phase !== 'review' && (
+        <p data-testid={`${idPrefix}-notice`} className="text-sm text-honeydew-600">
+          {notice}
+        </p>
       )}
 
       {phase === 'review' && (

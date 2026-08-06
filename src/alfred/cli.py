@@ -5113,6 +5113,216 @@ def cmd_msg(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _stt_vocab_state_lines(sv) -> list[str]:
+    """The vocabulary ACTUALLY biasing transcription, shipped vs learned.
+
+    Printed after every mutation on purpose: the operator is growing a list, and
+    a growth decision made without seeing the list is made blind. It also makes
+    the learned cap legible BEFORE he hits it rather than after, which matters
+    because the real ceiling past this one (the Whisper prompt window) degrades
+    silently.
+    """
+    from alfred.telegram.stt_vocab_learning import (
+        MAX_LEARNED_TERMS,
+        effective_vocab_terms,
+    )
+
+    static = [str(t) for t in (sv.vocab_terms or [])]
+    effective = effective_vocab_terms(sv)
+    learned = [t for t in effective if t not in static]
+    lines = [
+        "",
+        f"Currently biasing {len(effective)} terms "
+        f"({len(static)} shipped + {len(learned)} learned, cap {MAX_LEARNED_TERMS}):",
+        f"  shipped: {', '.join(static) if static else '(none)'}",
+        f"  learned: {', '.join(learned) if learned else '(none yet)'}",
+    ]
+    if len(learned) >= MAX_LEARNED_TERMS:
+        lines.append(
+            f"  ⚠️  the learned cap ({MAX_LEARNED_TERMS}) is reached — further "
+            f"approvals will NOT take effect until you reject something."
+        )
+    return lines
+
+
+def _cmd_stt_vocab(args: argparse.Namespace) -> None:
+    """``alfred stt-vocab {list [--json] | approve <term> --operator <name>
+    | reject <term> --operator <name>}`` — the operator decision that closes the
+    #54 learned-speech-vocabulary loop.
+
+    APPROVE records the term in the decided store, from where
+    ``effective_vocab_terms`` unions it onto the shipped list for every future
+    transcription. REJECT records the refusal so the term is never proposed
+    again. Nothing here edits ``telegram.stt.vocab_terms``: the shipped list stays
+    the shipped list, and what the operator taught is separable from it.
+
+    Approving BY TERM rather than by proposal number is deliberate — the Daily
+    Sync numbers shift between renders, and a stale number would approve the
+    wrong word into a list that biases every future transcription."""
+    from alfred.daily_sync.config import load_from_unified as load_ds_config
+    from alfred.telegram.stt_vocab_learning import (
+        DECISION_APPROVE,
+        DECISION_REJECT,
+        MAX_LEARNED_TERMS,
+        MIN_CORRECTION_COUNT,
+        VocabDecision,
+        append_decision,
+        effective_vocab_terms,
+        iter_correction_pairs,
+        load_decisions,
+        propose_vocab_additions,
+    )
+
+    raw = _load_unified_config(args.config)
+    sv = load_ds_config(raw).stt_vocab
+    cmd = getattr(args, "stt_vocab_cmd", None)
+
+    if cmd == "list":
+        current = effective_vocab_terms(sv)
+        static_terms = [str(t) for t in (sv.vocab_terms or [])]
+        # How many learned slots are left. Derived through the seam (learned ==
+        # whatever the effective list carries beyond the shipped one) rather than
+        # counted from the decided store, so a term the cap already dropped is
+        # not double-counted against the budget it never entered.
+        remaining_budget = max(0, MAX_LEARNED_TERMS - (len(current) - len(static_terms)))
+        decided = load_decisions(sv.vocab_decided_path)
+        pairs = list(iter_correction_pairs(sv.vocab_corpus_path))
+        proposals = propose_vocab_additions(
+            pairs,
+            current_vocab=current,
+            decided=decided,
+            min_count=MIN_CORRECTION_COUNT,
+            # The REMAINING budget, matching the Daily Sync card: never offer an
+            # approval that ``apply_approved_terms`` would drop on arrival.
+            max_learned=remaining_budget,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "proposals": [
+                    {"term": p.term, "heard": p.heard, "count": p.count}
+                    for p in proposals
+                ],
+                "pairs_recorded": len(pairs),
+                "biasing": current,
+                "approved": decided.approved,
+                "rejected": sorted(decided.rejected),
+                "min_count": MIN_CORRECTION_COUNT,
+                "max_learned": MAX_LEARNED_TERMS,
+                "learned_remaining": remaining_budget,
+            }, indent=2))
+            return
+        if not proposals:
+            # ILB, and it names WHICH quiet case this is — at-cap, nothing
+            # recorded, and nothing-new-to-propose call for different actions.
+            if remaining_budget == 0:
+                print(f"The learned-vocabulary budget is full "
+                      f"({len(current) - len(static_terms)}/{MAX_LEARNED_TERMS}) — "
+                      f"no new terms are being proposed.")
+                print('Reject a learned term to free a slot: '
+                      'alfred stt-vocab reject "<term>" --operator <name>')
+            elif not pairs:
+                print("No speech corrections recorded yet — nothing to approve.")
+                print("(If this stays empty, check "
+                      "`telegram.stt.vocab_learning_enabled` in your config.)")
+            else:
+                # Names all three suppressing reasons rather than guessing one:
+                # "none repeated twice yet" would be a lie about a term the
+                # operator approved a minute ago. Same wording as the Daily Sync
+                # card, so the two surfaces never disagree.
+                plural = "" if len(pairs) == 1 else "s"
+                print(f"{len(pairs)} correction pair{plural} recorded, nothing new "
+                      f"to approve — a term already approved, already rejected, or "
+                      f"not yet corrected {MIN_CORRECTION_COUNT}× does not surface.")
+        else:
+            plural = "" if len(proposals) == 1 else "s"
+            print(f"{len(proposals)} proposal{plural} "
+                  f"(from {len(pairs)} recorded correction pairs):")
+            for p in proposals:
+                heard = ", ".join(f"“{h}”" for h in p.heard)
+                print(f"  “{p.term}” — corrected {p.count}×"
+                      + (f" (heard {heard})" if heard else ""))
+        for line in _stt_vocab_state_lines(sv):
+            print(line)
+        if proposals:
+            print("")
+            print('Approve: alfred stt-vocab approve "<term>" --operator <name>')
+            print('Reject:  alfred stt-vocab reject "<term>" --operator <name>')
+        return
+
+    operator = (getattr(args, "operator", "") or "").strip()
+    if not operator:
+        print(json.dumps({"error": "--operator <name> is required (the deciding identity)"}))
+        sys.exit(1)
+    term = (getattr(args, "term", "") or "").strip()
+    if not term:
+        print(json.dumps({"error": "a non-empty <term> is required"}))
+        sys.exit(1)
+
+    if cmd in ("approve", "reject"):
+        static = [str(t) for t in (sv.vocab_terms or [])]
+        decided = load_decisions(sv.vocab_decided_path)
+        key = term.casefold()
+
+        if cmd == "approve" and any(t.casefold() == key for t in static):
+            # A shipped term is already biasing. Recording an approval would be
+            # a no-op row that reads, later, like the operator taught it.
+            print(json.dumps({
+                "error": "already shipped",
+                "term": term,
+                "detail": "this term is already in telegram.stt.vocab_terms and "
+                          "is biasing every transcription — nothing to approve",
+            }))
+            sys.exit(1)
+
+        already_approved = any(t.casefold() == key for t in decided.approved)
+        already_rejected = key in decided.rejected
+        if (cmd == "approve" and already_approved) or (cmd == "reject" and already_rejected):
+            # Idempotent, and SAID so rather than silently appending a duplicate
+            # row that would make the store's history misreport what happened.
+            print(json.dumps({
+                "status": "unchanged",
+                "term": term,
+                "detail": f"already {'approved' if cmd == 'approve' else 'rejected'}"
+                          " — no new decision recorded",
+            }))
+            for line in _stt_vocab_state_lines(sv):
+                print(line)
+            return
+
+        append_decision(
+            sv.vocab_decided_path,
+            VocabDecision(
+                type=DECISION_APPROVE if cmd == "approve" else DECISION_REJECT,
+                term=term,
+                operator=operator,
+            ),
+        )
+        result = {"status": "approved" if cmd == "approve" else "rejected",
+                  "term": term, "operator": operator,
+                  "decided_path": sv.vocab_decided_path}
+        # An approve that the cap swallowed is a LIE if reported as success —
+        # the term is in the store but biases nothing. Re-read through the seam
+        # and say which it was.
+        if cmd == "approve":
+            now_biasing = effective_vocab_terms(sv)
+            took_effect = any(t.casefold() == key for t in now_biasing)
+            result["biasing_now"] = took_effect
+            if not took_effect:
+                result["detail"] = (
+                    f"recorded, but NOT biasing: the learned cap "
+                    f"({MAX_LEARNED_TERMS}) is full. Reject a learned term to "
+                    f"free a slot — this one takes effect once there is room."
+                )
+        print(json.dumps(result, indent=2))
+        for line in _stt_vocab_state_lines(sv):
+            print(line)
+        return
+
+    print('Usage: alfred stt-vocab {list [--json] | approve "<term>" --operator <name> '
+          '| reject "<term>" --operator <name>}')
+    sys.exit(1)
+
+
 def _cmd_tier_recurrence(args: argparse.Namespace) -> None:
     """``alfred tier-recurrence {list [--json] | approve <proposal_id> --operator <name>
     [--routine <record>] [--cadence <days>] | reject <proposal_id> --operator <name>}`` — the operator
@@ -6758,6 +6968,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # #54 — learned-speech-vocabulary review + decision. Approve/reject BY TERM
+    # (never by proposal number: Daily Sync numbering shifts between renders,
+    # and this list biases every future transcription).
+    sttv_p = sub.add_parser(
+        "stt-vocab",
+        help="Review + approve/reject learned speech-vocabulary proposals (#54)",
+    )
+    sttv_sub = sttv_p.add_subparsers(dest="stt_vocab_cmd")
+    sttv_list = sttv_sub.add_parser(
+        "list", help="List recurring corrections awaiting a decision + the biasing list")
+    sttv_list.add_argument("--json", action="store_true", help="Machine-readable output")
+    sttv_approve = sttv_sub.add_parser(
+        "approve", help="Approve a term — it joins the biasing vocabulary from now on")
+    sttv_approve.add_argument("term", help="The term to add, as it should be spelled")
+    sttv_approve.add_argument("--operator", required=True, help="Approver identity (recorded)")
+    sttv_reject = sttv_sub.add_parser(
+        "reject", help="Reject a term (never proposed again)")
+    sttv_reject.add_argument("term", help="The proposed term to decline")
+    sttv_reject.add_argument("--operator", required=True, help="Rejecter identity (recorded)")
+
     # #20 P5 — ad-hoc-T3 recurrence→promote review + decision.
     trec_p = sub.add_parser(
         "tier-recurrence",
@@ -6827,6 +7057,7 @@ def main() -> None:
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
         "routine": cmd_routine,
+        "stt-vocab": _cmd_stt_vocab,
         "tier-recurrence": _cmd_tier_recurrence,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,

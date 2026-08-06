@@ -34,6 +34,7 @@ vi.mock('../lib/algernon/transport', () => ({
 }));
 
 import handler from '../pages/api/chat/stream';
+import { MAX_TRANSCRIPT_CHARS } from '../lib/algernon/schemas';
 
 function streamReq(body: unknown): NextApiRequest {
   const json = typeof body === 'string' ? body : JSON.stringify(body);
@@ -244,5 +245,54 @@ describe('POST /api/chat/stream', () => {
     expect(opts.userName).toBe('andrew');
     expect(opts.body.instance).toBeUndefined(); // BFF-only
     expect(Buffer.concat(writes).toString()).toContain('event: done');
+  });
+});
+
+describe('POST /api/chat/stream (learned-vocabulary transcript #54)', () => {
+  it('relays the transcript to the transport on the STREAM path', async () => {
+    // The stream is the path a real browser turn takes. The capture helper is
+    // wired into BOTH backend handlers, so a transcript threaded onto only the
+    // buffered route would leave the loop dead for every ordinary send.
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransportStream.mockResolvedValue(sseUpstream([DONE_FRAME]));
+    const { res, writes } = mockRes();
+    await handler(
+      streamReq({
+        session_key: 'k',
+        message: 'clean the chicken tractor',
+        kind: 'voice',
+        transcript: 'clean the chicken tracker',
+      }),
+      res,
+    );
+    expect(mockCallTransportStream).toHaveBeenCalledTimes(1);
+    const opts = mockCallTransportStream.mock.calls[0][2];
+    expect(opts.body.transcript).toBe('clean the chicken tracker');
+    expect(opts.body.message).toBe('clean the chicken tractor');
+    expect(opts.body.kind).toBe('voice');
+    expect(Buffer.concat(writes).toString()).toContain('event: done');
+  });
+
+  it('a turn with NO transcript carries no transcript field (byte-identical)', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransportStream.mockResolvedValue(sseUpstream([DONE_FRAME]));
+    const { res } = mockRes();
+    await handler(streamReq({ session_key: 'k', message: 'hi' }), res);
+    expect('transcript' in mockCallTransportStream.mock.calls[0][2].body).toBe(false);
+  });
+
+  it('400s an over-long transcript BEFORE any stream byte', async () => {
+    // The validation-before-first-byte contract: an oversized transcript must
+    // come back as clean JSON, never as a 200 event-stream the browser would
+    // read as success.
+    mockResolveSessionToken.mockReturnValue('tok');
+    const { res, status, writes } = mockRes();
+    await handler(
+      streamReq({ session_key: 'k', message: 'hi', transcript: 'x'.repeat(MAX_TRANSCRIPT_CHARS + 1) }),
+      res,
+    );
+    expect(status).toHaveBeenCalledWith(400);
+    expect(mockCallTransportStream).not.toHaveBeenCalled();
+    expect(writes).toHaveLength(0);
   });
 });

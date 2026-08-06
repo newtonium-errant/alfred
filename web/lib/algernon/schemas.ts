@@ -79,6 +79,29 @@ export const playerPrimerSchema = z.object({
 
 export type PlayerPrimerBody = z.infer<typeof playerPrimerSchema>;
 
+// --- Learned-vocabulary capture (#54) ----------------------------------------
+// The STT transcript AS INSERTED into the composer, carried alongside the SENT
+// message so the backend can diff the two and learn what it mis-heard
+// (src/alfred/telegram/stt_vocab_learning.py). Optional and additive: absent ⇒
+// byte-identical to the pre-feature body, exactly like `images` and `primer`.
+//
+// THE BOUND, and why it is the MESSAGE cap rather than something audio-derived.
+// The STT route bounds the AUDIO it accepts (MAX_AUDIO_BYTES) but places no cap
+// on the transcript it returns, so there is no upstream number to mirror. The
+// honest bound comes from what the field is FOR: the backend diffs it word-for-
+// word against `message`, which itself cannot exceed MAX_MESSAGE_CHARS. A
+// transcript longer than the longest sendable message cannot yield a meaningful
+// correction out of that diff — it degenerates into one giant delete, which the
+// extractor ignores by design — so accepting more would only widen the DoS
+// surface for no learning.
+//
+// The composer DROPS an over-long transcript rather than sending it (see
+// Composer.tsx): capture is telemetry and must never cost the operator their
+// turn, which a 400 here would. This bound is therefore the trust-boundary
+// guard against a hostile or buggy client, not the operator's everyday limit —
+// the same edge-guard-vs-UX split `images` already uses.
+export const MAX_TRANSCRIPT_CHARS = MAX_MESSAGE_CHARS;
+
 // POST /api/chat/turn body.
 export const chatTurnBodySchema = z.object({
   session_key: z.string().min(1),
@@ -97,6 +120,10 @@ export const chatTurnBodySchema = z.object({
   // Player-ask on-screen context (C3c) — relayed VERBATIM; the backend validity-gates
   // (invalid ⟹ answer un-grounded, never a 400). Only the /player ask sends it.
   primer: playerPrimerSchema.optional(),
+  // The STT transcript as inserted (#54) — relayed VERBATIM; the backend records
+  // the (transcript, sent) pair only on a voice-kind real send. Trimmed + bounded
+  // like `message`; see MAX_TRANSCRIPT_CHARS for why the bound is the message cap.
+  transcript: z.string().trim().min(1).max(MAX_TRANSCRIPT_CHARS).optional(),
 });
 
 export type ChatTurnBody = z.infer<typeof chatTurnBodySchema>;
