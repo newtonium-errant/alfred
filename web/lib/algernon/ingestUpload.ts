@@ -5,12 +5,13 @@ import { MAX_INGEST_CHARS } from './schemas';
 // POST /vault/ingest → a vault .md record — so a CSV rides it unchanged. What it
 // needs is the affordance plus an honest presentation:
 //
-//   * a CSV lands FENCED in a ```csv block — lossless and greppable, and never
+//   * a CSV lands FENCED in a ```csv block — content untouched (one
+//     trailing-newline caveat, documented on `fenceCsv`) and greppable, never
 //     parsed or reshaped (a transform is how tabular data quietly corrupts).
 //   * .md / .txt keep landing exactly as before: raw, untouched.
-//   * the two silent-absence cases get words — an empty file, and a file over
-//     the size ceiling. Neither may reach the operator as a disabled button or a
-//     server bounce.
+//   * every silent-absence case gets words — an empty file, a file over the size
+//     ceiling, and a file the browser could not read. None may reach the operator
+//     as a disabled button, a dead picker, or a server bounce.
 //
 // Pure functions: the component renders what these return, so the rules are
 // testable without a DOM.
@@ -58,12 +59,30 @@ export function fenceCsv(text: string): string {
   return `${fence}csv\n${content}${fence}\n`;
 }
 
+// "fenced in the body" rather than "fenced VERBATIM": `fenceCsv` adds a trailing
+// newline when the file lacks one, so verbatim would overclaim by exactly that
+// one character. The content itself is untouched — see `fenceCsv`.
 export function csvUploadNote(filename: string, rows: number): string {
-  return `${filename} — ${rows.toLocaleString()} rows (newline count, header included), fenced verbatim in the body`;
+  return `${filename} — ${rows.toLocaleString()} rows (newline count, header included), fenced in the body`;
 }
 
 export function emptyUploadMessage(filename: string): string {
   return `${filename} is empty — there is nothing to ingest. Pick a different file, or compose the body here.`;
+}
+
+/**
+ * A file the browser could not read at all.
+ *
+ * `FileReader` can fail after the picker has already accepted the file — moved or
+ * deleted between selection and read, a permissions change, a media error. That
+ * lands on `onerror`, where doing nothing produces exactly the silence this
+ * module exists to eliminate: the operator picked a file and the form simply did
+ * not react. `reason` carries the DOMException name when the browser supplies one
+ * rather than swallowing the only diagnostic on offer.
+ */
+export function readFailedMessage(filename: string, reason?: string): string {
+  const because = reason ? ` (${reason})` : '';
+  return `Could not read ${filename}${because} — it may have been moved, deleted, or be unreadable. Nothing was loaded; try selecting it again.`;
 }
 
 /**

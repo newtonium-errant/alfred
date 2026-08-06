@@ -45,6 +45,9 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
+  // The failed-read tests stub the global FileReader; without this the stub leaks
+  // into every later test in the file and every upload silently fails.
+  vi.unstubAllGlobals();
 });
 
 function renderForm() {
@@ -127,7 +130,7 @@ describe('a CSV upload lands fenced, with provenance derived from the filename',
     const note = screen.getByTestId('ingest-upload-note').textContent ?? '';
     expect(note).toContain('sales.csv');
     expect(note).toContain('3 rows (newline count, header included)');
-    expect(note).toContain('fenced verbatim in the body');
+    expect(note).toContain('fenced in the body');
   });
 
   it('renders the row count with a thousands separator for a big file', async () => {
@@ -165,6 +168,19 @@ describe('.md / .txt behave exactly as they did before CSV existed', () => {
     expect(field('ingest-title').value).toBe('plain');
     expect(field('ingest-source').value).toBe('plain.txt');
     expect(screen.queryByTestId('ingest-upload-note')).toBeNull();
+  });
+
+  it('derives title and source from ONE normalised filename (reviewer-57 finding 6)', async () => {
+    // A padded name is trimmed before CSV detection, so it must be trimmed before
+    // title/source derivation too — otherwise the file is treated as a CSV while
+    // the source field keeps whitespace the operator never typed.
+    renderForm();
+    await upload('  sales.csv  ', CSV, 'text/csv');
+    expect(field('ingest-source').value).toBe('sales.csv');
+    expect(field('ingest-title').value).toBe('sales');
+    // Detection agreed with derivation: it was fenced and noted as a CSV.
+    expect(field('ingest-body').value).toBe(fenceCsv(CSV));
+    expect(screen.getByTestId('ingest-upload-note').textContent).toContain('sales.csv');
   });
 
   it('still does not overwrite a title or source the operator already typed', async () => {
@@ -252,6 +268,112 @@ describe('the size limit reaches the operator here, not as a server bounce', () 
     renderForm();
     await upload('sales.csv', CSV, 'text/csv');
     expect(screen.queryByTestId('ingest-body-over-limit')).toBeNull();
+  });
+});
+
+describe('a failed READ is said out loud too (reviewer-57 finding 2)', () => {
+  // FileReader can fail after the picker accepted the file. jsdom will not produce
+  // that failure from a well-formed File, so the reader itself is stubbed — the
+  // component resolves `new FileReader()` off the global at call time.
+  function stubFailingReader(errorName?: string) {
+    class FailingReader {
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      error = errorName ? { name: errorName } : null;
+      result: string | null = null;
+      readAsText() {
+        setTimeout(() => this.onerror?.(), 0);
+      }
+    }
+    vi.stubGlobal('FileReader', FailingReader);
+  }
+
+  it('names the file and the browser reason instead of doing nothing at all', async () => {
+    stubFailingReader('NotReadableError');
+    renderForm();
+    fireEvent.change(screen.getByTestId('ingest-file'), {
+      target: { files: [new File(['whatever'], 'sales.csv', { type: 'text/csv' })] },
+    });
+    const alert = await screen.findByTestId('ingest-upload-error');
+    expect(alert.textContent).toContain('sales.csv');
+    expect(alert.textContent).toContain('Could not read');
+    expect(alert.textContent).toContain('NotReadableError');
+    expect(alert.getAttribute('role')).toBe('alert');
+  });
+
+  it('leaves the body and the note untouched when the read fails', async () => {
+    stubFailingReader();
+    renderForm();
+    fireEvent.change(field('ingest-body'), { target: { value: 'work in progress' } });
+    fireEvent.change(screen.getByTestId('ingest-file'), {
+      target: { files: [new File(['whatever'], 'sales.csv', { type: 'text/csv' })] },
+    });
+    await screen.findByTestId('ingest-upload-error');
+    expect(field('ingest-body').value).toBe('work in progress');
+    expect(screen.queryByTestId('ingest-upload-note')).toBeNull();
+  });
+
+  it('drops a stale rows-note when a later read fails', async () => {
+    renderForm();
+    await upload('sales.csv', CSV, 'text/csv');
+    expect(screen.getByTestId('ingest-upload-note')).toBeTruthy();
+    stubFailingReader();
+    fireEvent.change(screen.getByTestId('ingest-file'), {
+      target: { files: [new File(['whatever'], 'other.csv', { type: 'text/csv' })] },
+    });
+    await screen.findByTestId('ingest-upload-error');
+    // The note described the PREVIOUS upload; leaving it up would caption the
+    // body with a row count belonging to a file that never loaded.
+    expect(screen.queryByTestId('ingest-upload-note')).toBeNull();
+  });
+});
+
+describe('editing the body clears upload messages (reviewer-57 finding 4)', () => {
+  it('drops a refusal once the operator composes a body by hand', async () => {
+    renderForm();
+    await upload('empty.csv', '', 'text/csv');
+    expect(screen.getByTestId('ingest-upload-error')).toBeTruthy();
+    fireEvent.change(field('ingest-body'), { target: { value: 'composed by hand' } });
+    // A red alert must not sit beside a body that is now perfectly valid.
+    expect(screen.queryByTestId('ingest-upload-error')).toBeNull();
+    expect(field('ingest-body').value).toBe('composed by hand');
+  });
+
+  it('submits the hand-composed body, so the cleared alert was not cosmetic', async () => {
+    renderForm();
+    await upload('empty.csv', '', 'text/csv');
+    fireEvent.change(field('ingest-title'), { target: { value: 'Typed title' } });
+    fireEvent.change(field('ingest-source'), { target: { value: 'typed source' } });
+    fireEvent.change(field('ingest-body'), { target: { value: 'composed by hand' } });
+    fireEvent.click(screen.getByTestId('ingest-submit'));
+    expect(submitMock).toHaveBeenCalledTimes(1);
+    expect(submitMock.mock.calls[0][0].body).toBe('composed by hand');
+  });
+
+  it('drops the rows-note once the body no longer matches it', async () => {
+    renderForm();
+    await upload('sales.csv', CSV, 'text/csv');
+    expect(screen.getByTestId('ingest-upload-note')).toBeTruthy();
+    fireEvent.change(field('ingest-body'), { target: { value: 'edited away' } });
+    // "3 rows, fenced in the body" is a claim about the uploaded text; the body
+    // is no longer that text.
+    expect(screen.queryByTestId('ingest-upload-note')).toBeNull();
+  });
+
+  it('drops the rows-note when a voice transcript is appended to a CSV body', async () => {
+    renderForm();
+    await upload('sales.csv', CSV, 'text/csv');
+    mockTranscribe.mockResolvedValue({ transcript: 'an spoken annotation', low_confidence: false });
+    fireEvent.change(screen.getByTestId('ingest-voice-file'), {
+      target: { files: [new File(['dummy-audio'], 'note.webm', { type: 'audio/webm' })] },
+    });
+    await screen.findByTestId('ingest-voice-transcript');
+    fireEvent.click(screen.getByTestId('ingest-voice-use'));
+    await waitFor(() => expect(field('ingest-body').value).toContain('an spoken annotation'));
+    // The transcript is APPENDED, so the fenced CSV is still in there — but the
+    // body is no longer only the CSV, and the note claimed it was.
+    expect(field('ingest-body').value).toContain('```csv');
+    expect(screen.queryByTestId('ingest-upload-note')).toBeNull();
   });
 });
 

@@ -9,7 +9,11 @@ import { TargetPicker } from './TargetPicker';
 import { ProvenancePreview } from './ProvenancePreview';
 import { useIngest } from '../../lib/algernon/useIngest';
 import { MAX_INGEST_CHARS } from '../../lib/algernon/schemas';
-import { INGEST_UPLOAD_ACCEPT, prepareUpload } from '../../lib/algernon/ingestUpload';
+import {
+  INGEST_UPLOAD_ACCEPT,
+  prepareUpload,
+  readFailedMessage,
+} from '../../lib/algernon/ingestUpload';
 import { subtle } from '../../lib/typography';
 import type { SessionUser } from '../../lib/algernon/types';
 
@@ -96,10 +100,14 @@ export function IngestForm({
       const file = e.target.files?.[0];
       e.target.value = ''; // allow re-selecting the same file
       if (!file) return;
+      // Normalise the name ONCE: CSV detection trims, so deriving the title and
+      // source from the untrimmed name would let a padded filename be treated as
+      // a CSV while the source field kept the padding. One string, one answer.
+      const name = file.name.trim();
       const reader = new FileReader();
       reader.onload = () => {
         const text = typeof reader.result === 'string' ? reader.result : '';
-        const prepared = prepareUpload(file.name, text);
+        const prepared = prepareUpload(name, text);
         // A refused upload leaves the body untouched rather than loading
         // something unsubmittable: the operator keeps whatever they had, and the
         // reason is on screen instead of hiding behind a greyed-out button.
@@ -111,13 +119,40 @@ export function IngestForm({
         setUploadError(null);
         setUploadNote(prepared.note);
         setBody(prepared.body);
-        if (!title.trim()) setTitle(stripExt(file.name));
-        if (!source.trim()) setSource(file.name);
+        if (!title.trim()) setTitle(stripExt(name));
+        if (!source.trim()) setSource(name);
+      };
+      // A read can fail AFTER the picker accepted the file (moved, deleted,
+      // permissions, media error). Without this the operator picks a file and the
+      // form does nothing at all — the one silence this whole path exists to
+      // remove, and the hardest to diagnose because it looks like a no-op click.
+      reader.onerror = () => {
+        setUploadNote(null);
+        setUploadError(readFailedMessage(name, reader.error?.name));
       };
       reader.readAsText(file);
     },
     [title, source],
   );
+
+  // Any hand-edit of the body invalidates both upload messages. A refusal must
+  // not sit in red beside a body the operator has since composed by hand, and the
+  // row-count note is a claim about the UPLOADED text — once the body is edited it
+  // describes something that is no longer there.
+  const onBodyEdited = useCallback((next: string) => {
+    setBody(next);
+    setUploadNote(null);
+    setUploadError(null);
+  }, []);
+
+  // Same invalidation, but keeping the functional updater the append needs: the
+  // transcript is concatenated onto whatever the body holds NOW, not onto the
+  // value captured when this callback was created.
+  const appendTranscript = useCallback((t: string) => {
+    setBody((prev) => (prev.trim() ? `${prev}\n\n${t}` : t));
+    setUploadNote(null);
+    setUploadError(null);
+  }, []);
 
   const submitting = status === 'submitting';
   const canSubmit =
@@ -261,10 +296,12 @@ export function IngestForm({
         )}
 
         {/* Decision F: voice → editable transcript → ingest body. */}
+        {/* An appended transcript mutates the body just as typing does, so it
+            invalidates the upload messages the same way. */}
         <VoiceCapture
           idPrefix="ingest-voice"
           disabled={submitting}
-          onTranscript={(t) => setBody((prev) => (prev.trim() ? `${prev}\n\n${t}` : t))}
+          onTranscript={appendTranscript}
         />
 
         <Textarea
@@ -274,7 +311,7 @@ export function IngestForm({
           rows={10}
           value={body}
           disabled={submitting}
-          onChange={(e) => setBody(e.target.value)}
+          onChange={(e) => onBodyEdited(e.target.value)}
         />
         <p className={subtle}>
           {body.length.toLocaleString()} / {MAX_INGEST_CHARS.toLocaleString()} characters

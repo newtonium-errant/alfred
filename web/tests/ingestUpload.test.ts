@@ -6,6 +6,7 @@ import {
   fenceCsv,
   isCsvFilename,
   prepareUpload,
+  readFailedMessage,
 } from '../lib/algernon/ingestUpload';
 import { MAX_INGEST_CHARS } from '../lib/algernon/schemas';
 
@@ -62,6 +63,36 @@ describe('countCsvRows — a newline count, header included', () => {
   });
 });
 
+describe('csvUploadNote does not overclaim', () => {
+  it('says "fenced in the body", not "fenced verbatim"', () => {
+    // `fenceCsv` adds a trailing newline when the file lacks one, so "verbatim"
+    // would be false by exactly that character. The content is untouched; the
+    // wrapper is not byte-for-byte, and the copy no longer says it is.
+    const note = csvUploadNote('sales.csv', 3);
+    expect(note).toContain('fenced in the body');
+    expect(note).not.toContain('verbatim');
+  });
+});
+
+describe('readFailedMessage — a dead picker is not an outcome', () => {
+  it('names the file and says nothing was loaded', () => {
+    const msg = readFailedMessage('sales.csv');
+    expect(msg).toContain('sales.csv');
+    expect(msg).toContain('Could not read');
+    expect(msg).toContain('Nothing was loaded');
+  });
+
+  it('carries the browser reason when there is one, rather than swallowing it', () => {
+    expect(readFailedMessage('sales.csv', 'NotReadableError')).toContain('(NotReadableError)');
+  });
+
+  it('reads cleanly when the browser supplies no reason — no empty parens', () => {
+    const msg = readFailedMessage('sales.csv');
+    expect(msg).not.toContain('()');
+    expect(msg).not.toContain('undefined');
+  });
+});
+
 describe('fenceCsv — lossless', () => {
   it('wraps the content in a ```csv block without altering it', () => {
     const fenced = fenceCsv(CSV);
@@ -103,7 +134,7 @@ describe('prepareUpload — CSV', () => {
     expect(r.body).toBe('```csv\nname,qty\nwidget,3\nsprocket,12\n```\n');
     expect(r.note).toBe(csvUploadNote('sales.csv', 3));
     expect(r.note).toContain('3 rows (newline count, header included)');
-    expect(r.note).toContain('fenced verbatim in the body');
+    expect(r.note).toContain('fenced in the body');
   });
 
   it('never parses or reshapes the cells — quotes, commas and blanks survive', () => {
