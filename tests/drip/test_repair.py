@@ -331,7 +331,7 @@ def test_an_empty_state_is_a_legible_outcome_not_a_crash(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_a_demoted_row_records_why_and_keeps_its_attempt_count(
+def test_a_demoted_row_records_why_and_resets_its_attempt_count(
     tmp_path: Path,
 ) -> None:
     """The operator reading state after the deploy must be able to tell a

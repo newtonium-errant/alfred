@@ -70,15 +70,31 @@ is still broken. ``_flexible_ws_re``'s ``\\s+`` is exactly the inverse of
 the hole; ``tests/drip/test_wrapped_links.py`` pins the agreement against the
 scanner directly rather than against ``work()``.
 
-**Known residual, deliberately not closed:** an ALIASED link
-(``[[target|display]]``) is normalized by the scanner to ``target`` but is not
-matched by ``[[target]]``, so it would false-done the same way. Measured on the
-vault snapshot: 8 aliased links out of 41,074 (0.02%), and an item only matters
-here if it is ALSO broken and ALSO on the frozen work-list — an expected count
-of approximately zero across the 1,283. Widening the matcher to swallow an
-optional ``|…`` tail would add over-match surface to 758 irreversible removals
-to chase that. Left as a note rather than a change; revisit if a future
-work-list is built over a vault where aliases are common.
+**Known residuals, deliberately not closed.** Both are the same shape as the
+bug above — scanner-visible but needle-invisible — and both are documented
+rather than fixed because the fix costs over-match surface on 758 IRREVERSIBLE
+removals and the measured exposure is nil. Figures are from the vault snapshot,
+counted with the scanner's own ``extract_wikilinks``/``WIKILINK_RE`` over 8,614
+files: 61,508 wikilink occurrences, 52,813 unique (file, target) pairs.
+
+1. **Aliased links.** ``[[target|display]]`` is normalized by the scanner to
+   ``target`` but is not matched by ``[[target]]``. Measured: **8 occurrences,
+   0.013%** — and an item only matters here if it is ALSO broken and ALSO on the
+   frozen work-list, so the expected count across the 1,283 is approximately
+   zero. Closing it means widening the matcher to swallow an optional ``|…``
+   tail.
+2. **Inner-padded links.** ``extract_wikilinks`` ends in ``.strip()``
+   (``janitor/parser.py``), so ``[[ target ]]`` normalizes to ``target`` and is
+   scanner-visible, while the needle ``[[target]]`` misses the padding.
+   Measured: **0 occurrences vault-wide.** Closing it means allowing ``\\s*``
+   immediately inside the brackets.
+
+Revisit either if a future work-list is built over a vault where the shape is
+common — the measurement above is the thing to re-run, not the conclusion.
+
+For scale on why the whitespace tolerance itself was worth the change:
+**28,930 of the 61,508 occurrences (47%) are wrapped** across physical lines.
+Wrapping is not an edge case in this vault, it is the plurality.
 """
 
 from __future__ import annotations
