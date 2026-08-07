@@ -114,7 +114,17 @@ _FRONTMATTER_BLOCK_RE = re.compile(r"\A---\r?\n.*?\r?\n---(?:\r?\n|\Z)", re.DOTA
 #: both markers and requires the closer to be the SAME character and at least
 #: as long — which is what lets #57's grown fences (````csv containing a ```
 #: line) survive without the inner run terminating the block early.
-_FENCE_LINE_RE = re.compile(r"^[ \t]*(?P<marker>`{3,}|~{3,})(?P<info>[^\r\n]*)$")
+#:
+#: The trailing ``\r?`` is load-bearing, not defensive. :func:`mask_code_regions`
+#: splits on ``"\n"``, so a CRLF document hands this pattern ``"```\r"`` — and
+#: ``[^\r\n]*`` cannot consume that ``\r`` while ``$`` will not match before it,
+#: so WITHOUT this the pattern silently fails on every CRLF file and the whole
+#: exclusion quietly does nothing. Reachable in production: #57's .md/.txt
+#: ingest relays uploaded text VERBATIM, so a Windows-authored upload lands as a
+#: CRLF record.
+_FENCE_LINE_RE = re.compile(
+    r"^[ \t]*(?P<marker>`{3,}|~{3,})(?P<info>[^\r\n]*)\r?$"
+)
 
 #: A matched inline code span on ONE line. Deliberately not multi-line: a stray
 #: backtick must not be able to mask links across a paragraph the way an

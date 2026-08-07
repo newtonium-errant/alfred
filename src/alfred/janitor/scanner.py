@@ -636,9 +636,16 @@ def _check_record(
     body_links = {
         _canonical_link_key(t, stem_index)
         # #61: the BODY is document text, so fenced/inline-code regions are
-        # masked. The frontmatter side above is NOT — it is a synthesized
-        # string with no fences in it, and masking it could only subtract
-        # real references.
+        # masked. The frontmatter side above is deliberately NOT masked —
+        # masking it could only ever SUBTRACT real references, and a
+        # frontmatter reference is a reference no matter what characters
+        # surround it.
+        #
+        # Note what this reasoning does NOT rest on: the synthesized string can
+        # absolutely contain fence-shaped lines. ``yaml.dump`` of a multi-line
+        # value holding ``` emits them (measured — masking such a block drops a
+        # link, 2 -> 1). That is exactly why it stays unmasked: a janitor_note
+        # quoting a fence would otherwise hide a genuine ``related:`` entry.
         for t in extract_wikilinks(mask_code_regions(record.body))
     }
     missing_from_fm = []
