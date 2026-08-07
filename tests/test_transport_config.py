@@ -8,6 +8,9 @@ Stage 3.5 can extend in place.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from alfred.transport.config import (
@@ -305,6 +308,32 @@ def test_ingest_defaults_disabled() -> None:
     assert cfg.ingest.enabled is False
     assert cfg.ingest.max_body_chars == DEFAULT_INGEST_MAX_BODY_CHARS == 262144
     assert cfg.ingest.types == []
+
+
+def test_web_mirror_of_ingest_body_limit_has_not_drifted() -> None:
+    """The browser's ``MAX_INGEST_CHARS`` must equal this default exactly.
+
+    #57: the ingest form refuses an over-limit upload CLIENT-side and names the
+    limit in the refusal, so the operator never meets the ceiling as a relayed
+    413. That promise holds only while the two constants agree — if this default
+    moved down and the TypeScript mirror did not, the form would accept a body
+    the box then bounces, which is precisely the surprise the client-side check
+    exists to prevent. Nothing else ties the literal in ``web/lib/algernon/
+    schemas.ts`` to this one, so this is the drift detector.
+
+    A missing or unparseable file FAILS rather than skips: a pin that quietly
+    stops running is how the mirror gets to drift unobserved.
+    """
+    from alfred.transport.config import DEFAULT_INGEST_MAX_BODY_CHARS
+
+    schemas = Path(__file__).resolve().parents[1] / "web" / "lib" / "algernon" / "schemas.ts"
+    assert schemas.is_file(), f"web ingest schema not found at {schemas}"
+    match = re.search(
+        r"export const MAX_INGEST_CHARS\s*=\s*(\d+)\s*;",
+        schemas.read_text(encoding="utf-8"),
+    )
+    assert match is not None, f"MAX_INGEST_CHARS declaration not found in {schemas}"
+    assert int(match.group(1)) == DEFAULT_INGEST_MAX_BODY_CHARS
 
 
 def test_ingest_block_overrides_apply() -> None:
