@@ -268,8 +268,11 @@ async def test_an_oversize_EXTRACTION_is_a_different_refusal(
     ingest_client,
 ) -> None:
     """The character axis, and the reason the two are separate codes: this file
-    is small on disk and large once extracted. Telling the operator to shrink
-    the file would be advice that cannot work."""
+    is UNDER the byte cap but OVER the character cap. Telling the operator to
+    shrink the file would be advice that cannot work — the file was never the
+    problem. (Measured: extraction shrinks a PDF rather than growing it, 22,980
+    bytes in to 19,199 characters out, so the fixture clears the byte cap on
+    both counts.)"""
     with structlog.testing.capture_logs() as captured:
         resp = await ingest_client.post(
             "/vault/ingest", json=_pdf_payload(oversize_text_pdf(400)),

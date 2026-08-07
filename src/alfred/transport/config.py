@@ -556,9 +556,16 @@ DEFAULT_INGEST_MAX_BODY_CHARS: int = 262144
 # whole point. aiohttp enforces ``client_max_size`` in the middleware layer
 # and answers with an HTML 413 before the handler ever runs — bypassing the
 # route's JSON error taxonomy and handing the operator a bare browser error
-# instead of a sentence naming which limit they hit. Keeping this number
-# above ``MAX_PDF_BYTES * 4/3`` guarantees an oversize upload is refused by
-# OUR code, with OUR words.
+# instead of a sentence naming which limit they hit.
+#
+# The guarantee holds over a MEASURED BAND, not universally, and the honest
+# form of that sentence is: a file between 10.00 MiB (the route cap, where
+# refusal starts) and 10.50 MiB still base64s to under 14 MiB, so it REACHES
+# the handler and is refused by our code with our words. The crossover is
+# exactly 11,010,048 bytes — above it the encoded body exceeds this ceiling
+# and aiohttp answers first. That band is what matters in practice because it
+# covers the just-over-the-line case an operator actually hits: a statement a
+# little too big, refused with a sentence rather than a browser error page.
 #
 # RESIDUAL, stated rather than implied: a request above THIS number still
 # meets aiohttp's wall and still produces the bare 413. That is the correct

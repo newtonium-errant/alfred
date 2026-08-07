@@ -120,11 +120,17 @@ def empty_pdf() -> bytes:
 
 
 def oversize_text_pdf(lines: int = 400) -> bytes:
-    """A text-layer PDF whose EXTRACTION is long — for the char-cap refusal.
+    """A text-layer PDF UNDER the byte cap but OVER the character cap.
 
-    Distinct from an oversize FILE: this one is small on disk and large once
-    extracted, which is exactly the case that proves the two limits are
-    separate axes rather than one number wearing two hats.
+    That combination is the point — it proves the two limits are separate axes
+    rather than one number wearing two hats, and it is what lets the two
+    refusals be told apart.
+
+    Note the direction, because the obvious guess is wrong: extraction SHRINKS
+    a PDF rather than growing it (measured at ``lines=400``: 22,980 bytes in,
+    19,199 characters out — the file carries structure the text does not). So
+    this fixture clears the byte cap comfortably while still exceeding the much
+    smaller per-test character cap the route is configured with.
     """
     return text_layer_pdf(
         [f"Line {n:04d} of a long statement with padding text" for n in range(lines)]

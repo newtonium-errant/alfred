@@ -26,7 +26,16 @@ export interface UseIngest {
   reset: () => void;
 }
 
-function friendlyError(e: unknown): string {
+/**
+ * Map a relayed error to the sentence the operator reads.
+ *
+ * EXPORTED so the suite can pin the wording (#57 gate, WARN-1). It was
+ * module-local, which meant the operator-ruled scanned-PDF copy — a plain
+ * refusal that must NOT dangle vision or OCR as something coming later — was
+ * guarded by a comment and nothing else. A ruling enforced by a comment is a
+ * ruling that survives exactly until the next person edits the string.
+ */
+export function friendlyError(e: unknown): string {
   if (e instanceof ApiError) {
     switch (e.code) {
       case 'invalid_session':
