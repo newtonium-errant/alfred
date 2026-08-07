@@ -46,6 +46,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from alfred.documents.pdf import (
+    MAX_EXTRACTED_CHARS,
+    MAX_PDF_BYTES,
+    TRUNCATION_MARKER,
+    DocumentExtractError,
+    apply_char_truncation as _apply_char_truncation,
+    extract_pdf_text,
+)
+
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -104,7 +113,10 @@ SUPPORTED_DOCUMENT_MIME: dict[str, str] = {
 # six per-kind branches. Adding a new kind: add the cap here + the
 # MIME mapping above + the extractor. The contract-pin test surfaces
 # silent additions.
-MAX_PDF_BYTES: int = 10 * 1024 * 1024     # 10 MiB
+# MAX_PDF_BYTES is imported from ``alfred.documents.pdf`` (#57): the web
+# ingest route enforces the same ceiling, and one number across both doors
+# beats two that can drift. Re-exported here so this module's own name for
+# it — and the contract pin that reads it — keep working.
 MAX_DOCX_BYTES: int = 10 * 1024 * 1024    # mirror PDF
 MAX_TEXT_BYTES: int = 5 * 1024 * 1024     # 5 MiB
 MAX_CSV_BYTES: int = 5 * 1024 * 1024      # mirror text
@@ -134,13 +146,12 @@ MAX_BYTES_BY_KIND: dict[str, int] = {
 # Applied uniformly across ALL extractors (PDF, DOCX, text, CSV, ICS,
 # audio transcript). No per-type special-casing — the LLM's context
 # budget is the same regardless of source.
-MAX_EXTRACTED_CHARS: int = 50_000
-
-
-TRUNCATION_MARKER: str = (
-    "\n\n[... document truncated; "
-    f"only first {MAX_EXTRACTED_CHARS} characters shown ...]"
-)
+#
+# Both now live in ``alfred.documents.pdf`` and are imported above (#57).
+# They stay the TALKER's policy: the web ingest route writes a verbatim
+# record and therefore REFUSES an over-long extraction rather than
+# truncating it, passing ``max_chars=None``. Same extractor, opposite
+# policy — see that module's docstring for why that is not a bug.
 
 
 # CSV row cap — distinct from the char cap. Tabular data with 1000+
@@ -241,13 +252,18 @@ class AttachmentDownloadError(Exception):
     """Raised when fetching a Telegram document fails (network / PTB)."""
 
 
-class AttachmentExtractError(Exception):
-    """Raised when decoding a downloaded document fails.
-
-    Distinct from :class:`AttachmentDownloadError` so the caller can
-    emit a more useful user-facing reply — "I couldn't fetch your PDF"
-    (network) vs. "I couldn't read your PDF" (decoding).
-    """
+#: Raised when decoding a downloaded document fails.
+#:
+#: Distinct from :class:`AttachmentDownloadError` so the caller can emit a
+#: more useful user-facing reply — "I couldn't fetch your PDF" (network) vs.
+#: "I couldn't read your PDF" (decoding).
+#:
+#: An ALIAS of :class:`alfred.documents.pdf.DocumentExtractError` since #57,
+#: not a subclass — aliasing is what keeps every existing
+#: ``except AttachmentExtractError`` catching the shared extractor's raises.
+#: A subclass would not: the shared module raises the PARENT, which a handler
+#: catching the child would miss, and the miss would be silent.
+AttachmentExtractError = DocumentExtractError
 
 
 async def download_document_bytes(document: Any) -> bytes:
@@ -279,98 +295,13 @@ async def download_document_bytes(document: Any) -> bytes:
         ) from exc
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract text from a PDF byte stream via :mod:`pypdf`.
-
-    Iterates pages, joins with double-newlines (so the LLM sees page
-    boundaries), and trims to :data:`MAX_EXTRACTED_CHARS` with the
-    :data:`TRUNCATION_MARKER` appended when truncation fires.
-
-    Raises:
-        AttachmentExtractError: On any pypdf decoding failure, or when
-            the extracted text is empty (e.g. a scanned-image PDF with
-            no embedded text layer — text extraction can't help us
-            there; the caller should emit a "scanned PDF can't be read"
-            user-facing reply).
-    """
-    try:
-        # Lazy import: keeps the talker module importable on installs
-        # that haven't pulled the ``voice`` extra (the on_document
-        # handler's load-time guard will reply "PDF support not
-        # available in this install" rather than crashing the daemon
-        # at import time).
-        import pypdf
-    except ImportError as exc:
-        log.warning("talker.attachments.pypdf_missing", error=str(exc))
-        raise AttachmentExtractError(
-            "PDF support is not installed in this build "
-            "(pip install -e '.[voice]' to enable)"
-        ) from exc
-
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        pages_text: list[str] = []
-        for page in reader.pages:
-            try:
-                page_text = page.extract_text() or ""
-            except Exception as exc:  # noqa: BLE001
-                # Per-page extraction can fail on malformed pages while
-                # the rest of the PDF is fine. Log the per-page miss
-                # and continue — partial extraction beats total failure.
-                log.warning(
-                    "talker.attachments.page_extract_failed",
-                    error=str(exc),
-                )
-                continue
-            if page_text.strip():
-                pages_text.append(page_text)
-    except Exception as exc:  # noqa: BLE001 — wrap pypdf's exceptions
-        log.warning(
-            "talker.attachments.extract_failed",
-            error=str(exc),
-            error_type=type(exc).__name__,
-        )
-        raise AttachmentExtractError(
-            f"Failed to decode PDF: {exc!s}"
-        ) from exc
-
-    full_text = "\n\n".join(pages_text).strip()
-    if not full_text:
-        # Empty extraction is its own failure mode: typically a scanned
-        # image-only PDF with no embedded text layer. The text-extract
-        # path can't recover here; OCR would be a separate feature.
-        log.info("talker.attachments.empty_extraction")
-        raise AttachmentExtractError(
-            "No text could be extracted from this PDF "
-            "(scanned image-only PDFs need OCR, which isn't enabled)"
-        )
-
-    return _apply_char_truncation(full_text, kind="pdf")
-
-
-def _apply_char_truncation(text: str, *, kind: str) -> str:
-    """Apply the uniform :data:`MAX_EXTRACTED_CHARS` cap with a marker.
-
-    Shared helper across every extractor (PDF, DOCX, text, CSV, ICS,
-    audio transcript). When truncation fires, emits one log line with
-    the kind so dashboards can spot per-type truncation rates ("audio
-    transcripts truncate 10% of the time" is operationally useful).
-    The marker text is identical for every kind so the LLM's prompt
-    template doesn't have to branch on type.
-
-    Returns the (possibly truncated) text. No-op when text is under
-    the cap.
-    """
-    if len(text) > MAX_EXTRACTED_CHARS:
-        log.info(
-            "talker.attachments.text_truncated",
-            kind=kind,
-            original_chars=len(text),
-            kept_chars=MAX_EXTRACTED_CHARS,
-        )
-        return text[:MAX_EXTRACTED_CHARS] + TRUNCATION_MARKER
-    return text
-
+# ``extract_pdf_text`` and ``_apply_char_truncation`` now live in
+# ``alfred.documents.pdf`` and are imported at the top of this module
+# (#57). They moved because the web ingest route needs the same
+# extractor, and a transport module importing from ``telegram`` would
+# have the dependency backwards. Behaviour here is unchanged: the
+# imported names bind to the same callables with the same defaults, so
+# every call site below and the talker's log events are untouched.
 
 def extract_docx_text(docx_bytes: bytes) -> str:
     """Extract text from a .docx byte stream via :mod:`docx` (python-docx).

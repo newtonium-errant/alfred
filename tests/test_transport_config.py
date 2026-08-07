@@ -336,6 +336,80 @@ def test_web_mirror_of_ingest_body_limit_has_not_drifted() -> None:
     assert int(match.group(1)) == DEFAULT_INGEST_MAX_BODY_CHARS
 
 
+def test_web_mirror_of_pdf_byte_limit_has_not_drifted() -> None:
+    """The #57 sibling of the pin above, on the OTHER axis.
+
+    Bytes, not characters — and they are genuinely separate limits, because a
+    10 MiB bank statement is an ordinary file whose extracted text sits well
+    under the character cap. The form refuses an oversize PDF client-side and
+    names the figure; that promise holds only while the browser's
+    ``MAX_INGEST_PDF_BYTES`` equals ``alfred.documents.pdf.MAX_PDF_BYTES``.
+
+    The value is ALSO the Telegram attachment path's cap, deliberately: one
+    number across both doors so an operator never has to work out which
+    entrance has the smaller ceiling.
+
+    Missing or unparseable FAILS rather than skips — a pin that quietly stops
+    running is how a mirror drifts unobserved.
+    """
+    from alfred.documents.pdf import MAX_PDF_BYTES
+
+    schemas = Path(__file__).resolve().parents[1] / "web" / "lib" / "algernon" / "schemas.ts"
+    assert schemas.is_file(), f"web ingest schema not found at {schemas}"
+    match = re.search(
+        r"export const MAX_INGEST_PDF_BYTES\s*=\s*([0-9*\s]+?)\s*;",
+        schemas.read_text(encoding="utf-8"),
+    )
+    assert match is not None, (
+        f"MAX_INGEST_PDF_BYTES declaration not found in {schemas}"
+    )
+    # The TS side spells it ``10 * 1024 * 1024`` for legibility, so the pin
+    # evaluates the product rather than demanding a bare literal — the point is
+    # that the two NUMBERS agree, not that they are typed the same way.
+    factors = [int(p) for p in match.group(1).split("*")]
+    product = 1
+    for f in factors:
+        product *= f
+    assert product == MAX_PDF_BYTES == 10 * 1024 * 1024
+
+
+def test_the_transport_client_max_size_sits_above_the_pdf_cap() -> None:
+    """Ordering pin (#57), and it is the whole reason the number was raised.
+
+    aiohttp enforces ``client_max_size`` in its own layer and answers with a
+    bare HTML 413 BEFORE any handler runs. If it sat at or below the route's
+    byte cap, an oversize upload would meet aiohttp's wall instead of the
+    route's JSON taxonomy — the operator would get a browser error page rather
+    than a sentence naming which limit they hit, and the ILB work on those
+    refusals would be dead code for the case it most matters.
+
+    Base64 inflates by 4/3, so the ceiling must clear the byte cap by at least
+    a third plus JSON envelope.
+    """
+    from alfred.documents.pdf import MAX_PDF_BYTES
+    from alfred.transport.config import DEFAULT_TRANSPORT_CLIENT_MAX_BYTES
+
+    inflated = MAX_PDF_BYTES * 4 // 3
+    assert DEFAULT_TRANSPORT_CLIENT_MAX_BYTES > inflated, (
+        "a base64'd max-size PDF must still REACH the handler"
+    )
+    # And it must be above aiohttp's own 1 MiB default, or the raise did nothing.
+    assert DEFAULT_TRANSPORT_CLIENT_MAX_BYTES > 1024 * 1024
+
+
+def test_the_built_app_actually_carries_the_raised_ceiling(tmp_path) -> None:
+    """The threading pin. A constant that never reaches ``web.Application`` is
+    the standing trap: the value is right, the pin above is green, and the box
+    still bounces every PDF at 1 MiB. Asserted on the BUILT app."""
+    from alfred.transport.config import DEFAULT_TRANSPORT_CLIENT_MAX_BYTES
+    from alfred.transport.server import build_app
+    from alfred.transport.state import TransportState
+
+    state = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(TransportConfig(), state)
+    assert app._client_max_size == DEFAULT_TRANSPORT_CLIENT_MAX_BYTES
+
+
 def test_ingest_block_overrides_apply() -> None:
     raw = {
         "transport": {

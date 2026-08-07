@@ -11,7 +11,9 @@ import { useIngest } from '../../lib/algernon/useIngest';
 import { MAX_INGEST_CHARS } from '../../lib/algernon/schemas';
 import {
   INGEST_UPLOAD_ACCEPT,
+  isPdfFilename,
   prepareUpload,
+  preparePdfUpload,
   readFailedMessage,
 } from '../../lib/algernon/ingestUpload';
 import { subtle } from '../../lib/typography';
@@ -26,6 +28,10 @@ import type { SessionUser } from '../../lib/algernon/types';
 //
 // Uploads are prepared by `lib/algernon/ingestUpload` — .md/.txt land raw, a
 // .csv lands fenced, and an empty or over-limit file is refused with words.
+// A .pdf (#57) is the exception to "the browser reads the file": its BYTES are
+// relayed base64 and the box extracts the text with the same pypdf extractor
+// the Telegram attachment path uses, so one file yields one answer whichever
+// door it arrives through. A scanned PDF is refused there, with words.
 
 function stripExt(name: string): string {
   const i = name.lastIndexOf('.');
@@ -64,6 +70,14 @@ export function IngestForm({
   // diagnose from a disabled button.
   const [uploadNote, setUploadNote] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  // A staged PDF (#57). Held SEPARATELY from `body` because it is not text: the
+  // browser never reads a PDF's contents, it relays the bytes and the box
+  // extracts. The two are mutually exclusive — staging a PDF clears the body,
+  // and typing in the body clears the staged PDF — so there is never a question
+  // of which one the submit is about.
+  const [pdfUpload, setPdfUpload] = useState<
+    { b64: string; filename: string; bytes: number } | null
+  >(null);
 
   // Default the picker to the first configured target once targets load.
   useEffect(() => {
@@ -105,6 +119,41 @@ export function IngestForm({
       // a CSV while the source field kept the padding. One string, one answer.
       const name = file.name.trim();
       const reader = new FileReader();
+
+      // A PDF is read as BYTES and relayed base64 — the box owns extraction, so
+      // the browser never sees this file's text and must not pretend to. Every
+      // other accepted type is still read as text, unchanged.
+      if (isPdfFilename(name)) {
+        reader.onload = () => {
+          const buf = reader.result;
+          const bytes =
+            buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(0);
+          const prepared = preparePdfUpload(name, bytes);
+          if (!prepared.ok) {
+            setUploadNote(null);
+            setPdfUpload(null);
+            setUploadError(prepared.message);
+            return;
+          }
+          setUploadError(null);
+          setUploadNote(prepared.note);
+          // Staging a PDF clears any typed body: only one of them can be what
+          // gets written, and leaving stale text on screen beside a staged file
+          // is the ambiguity this pairing exists to avoid.
+          setBody('');
+          setPdfUpload({ b64: prepared.bodyB64, filename: name, bytes: prepared.bytes });
+          if (!title.trim()) setTitle(stripExt(name));
+          if (!source.trim()) setSource(name);
+        };
+        reader.onerror = () => {
+          setUploadNote(null);
+          setPdfUpload(null);
+          setUploadError(readFailedMessage(name, reader.error?.name));
+        };
+        reader.readAsArrayBuffer(file);
+        return;
+      }
+
       reader.onload = () => {
         const text = typeof reader.result === 'string' ? reader.result : '';
         const prepared = prepareUpload(name, text);
@@ -119,6 +168,13 @@ export function IngestForm({
         setUploadError(null);
         setUploadNote(prepared.note);
         setBody(prepared.body);
+        // A successful TEXT upload un-stages any PDF. The two paths share one
+        // picker, so staging must not be sticky: without this, picking a .md
+        // after a .pdf loaded the markdown into the body and still submitted
+        // the PDF — the operator's most recent, most deliberate action
+        // silently losing to the earlier one. Caught by the form-level pin,
+        // not by any unit test of the helpers.
+        setPdfUpload(null);
         if (!title.trim()) setTitle(stripExt(name));
         if (!source.trim()) setSource(name);
       };
@@ -143,6 +199,10 @@ export function IngestForm({
     setBody(next);
     setUploadNote(null);
     setUploadError(null);
+    // Typing a body un-stages a PDF. Without this the operator could type over
+    // a staged file and submit — with the typed text silently discarded in
+    // favour of the PDF, which is the worst possible resolution of the two.
+    setPdfUpload(null);
   }, []);
 
   // Same invalidation, but keeping the functional updater the append needs: the
@@ -152,15 +212,22 @@ export function IngestForm({
     setBody((prev) => (prev.trim() ? `${prev}\n\n${t}` : t));
     setUploadNote(null);
     setUploadError(null);
+    setPdfUpload(null);
   }, []);
 
   const submitting = status === 'submitting';
+  // A staged PDF satisfies the body requirement: its content is real, it just
+  // is not text yet. Gating on `body` alone would leave the picker accepting a
+  // PDF and the submit button dead — a silence with no words attached, which is
+  // the failure mode the whole upload path is shaped against.
+  const hasContent = pdfUpload
+    ? true
+    : body.trim().length > 0 && body.length <= MAX_INGEST_CHARS;
   const canSubmit =
     !!target &&
     !!recordType &&
     title.trim().length > 0 &&
-    body.trim().length > 0 &&
-    body.length <= MAX_INGEST_CHARS &&
+    hasContent &&
     source.trim().length > 0 &&
     !submitting;
 
@@ -170,10 +237,12 @@ export function IngestForm({
       target,
       record_type: recordType as 'document' | 'note' | 'source',
       title: title.trim(),
-      body,
       source: source.trim(),
+      ...(pdfUpload
+        ? { body_format: 'pdf' as const, body_b64: pdfUpload.b64 }
+        : { body }),
     });
-  }, [canSubmit, submit, target, recordType, title, body, source]);
+  }, [canSubmit, submit, target, recordType, title, body, source, pdfUpload]);
 
   const startAnother = useCallback(() => {
     setTitle('');
@@ -181,6 +250,7 @@ export function IngestForm({
     setSource('');
     setUploadNote(null);
     setUploadError(null);
+    setPdfUpload(null);
     reset();
   }, [reset]);
 
@@ -272,7 +342,7 @@ export function IngestForm({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Label htmlFor="ingest-body">Body (written verbatim)</Label>
           <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50">
-            Upload .md / .txt / .csv
+            Upload .md / .txt / .csv / .pdf
             <input
               type="file"
               accept={INGEST_UPLOAD_ACCEPT}

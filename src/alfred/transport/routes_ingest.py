@@ -39,16 +39,73 @@ instance's transport server stays byte-unchanged.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import web
+
+from alfred.documents.pdf import (
+    MAX_PDF_BYTES,
+    DocumentExtractError,
+    extract_pdf_text,
+)
 
 from .config import DEFAULT_INGEST_MAX_BODY_CHARS
 from .peer_handlers import _get_vault_path
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+#: ``body_format`` value that routes an upload through PDF extraction. Absent
+#: or ``"text"`` keeps the pre-#57 path byte-for-byte: ``body`` is taken as the
+#: record body verbatim, which is what .md / .txt / .csv still do.
+BODY_FORMAT_PDF = "pdf"
+
+#: Log-event namespace for the extractor when the INGEST route drives it. The
+#: shared module defaults to the talker's prefix; passing this keeps
+#: ``talker.attachments.*`` meaning "a Telegram attachment" rather than
+#: quietly covering web uploads too.
+_PDF_LOG_PREFIX = "transport.ingest.pdf"
+
+#: Extractor reason → (HTTP status, wire error code). Each row is a DISTINCT
+#: refusal: six failures that render identically to the operator is exactly the
+#: silence the ILB rule exists to prevent, and "it didn't work" is not a
+#: sentence anyone can act on. ``pdf_no_text_layer`` is a terminal refusal by
+#: operator ruling (2026-08-07) — deliberately NOT a fallback, and the wording
+#: promises no future capability.
+_PDF_REASON_STATUS: dict[str, tuple[int, str]] = {
+    "pdf_no_text_layer": (422, "pdf_no_text_layer"),
+    "pdf_encrypted": (422, "pdf_encrypted"),
+    "pdf_unreadable": (400, "pdf_unreadable"),
+    "pdf_empty_file": (400, "empty_file"),
+    "pdf_support_missing": (503, "pdf_support_unavailable"),
+}
+
+
+def fence_extracted_text(text: str, *, language: str = "text") -> str:
+    """Wrap extracted text in a fence that its own content cannot terminate.
+
+    Mirrors the CSV half's ``fenceCsv`` (``web/lib/algernon/ingestUpload.ts``)
+    on purpose — both surfaces reshape an upload into a record body, and two
+    different fencing rules would mean the same document reads differently
+    depending on which door it came through.
+
+    The fence grows to one backtick longer than the longest run in the content,
+    so a PDF quoting a code block cannot close the block early. Content is
+    otherwise untouched; the single departure from byte-for-byte is a newline
+    added before the closing fence when the text lacks one, because a closing
+    fence must begin a line.
+    """
+    longest = 0
+    run = 0
+    for ch in text:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * max(3, longest + 1)
+    content = text if text.endswith("\n") else text + "\n"
+    return f"{fence}{language}\n{content}{fence}\n"
 
 
 # Application-storage keys for the ingest route's config (stashed by
@@ -80,6 +137,71 @@ def _json_error(status: int, error: str, **extra: Any) -> web.Response:
     payload: dict[str, Any] = {"error": error}
     payload.update(extra)
     return web.json_response(payload, status=status)
+
+
+def _pdf_body_from_request(
+    body: dict[str, Any], *, peer: str,
+) -> "web.Response | tuple[str, int]":
+    """Decode + extract a base64 PDF, or return the refusal that explains why.
+
+    Returns ``(fenced_text, byte_count)`` on success and a ready
+    :class:`web.Response` on every refusal, so the caller stays a straight
+    line. Every exit is DISTINCT and logged with its own reason — an operator
+    who uploads a password-protected statement must be told it is encrypted,
+    not handed the same "couldn't read it" as a truncated download.
+
+    Order matters: the BYTE cap is checked before extraction, so a 40 MiB file
+    is refused without spending the memory to parse it.
+    """
+    raw_b64 = body.get("body_b64")
+    if not isinstance(raw_b64, str) or not raw_b64.strip():
+        log.warning("transport.ingest.rejected", reason="empty_body", peer=peer,
+                    body_format=BODY_FORMAT_PDF)
+        return _json_error(400, "empty_body")
+
+    try:
+        # ``validate=True`` so stray non-alphabet bytes are an error rather
+        # than silently skipped — a truncated upload should not decode into a
+        # plausible-looking shorter PDF.
+        pdf_bytes = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        log.warning("transport.ingest.rejected", reason="invalid_base64",
+                    peer=peer, error=str(exc)[:120])
+        return _json_error(400, "invalid_base64")
+
+    if not pdf_bytes:
+        log.warning("transport.ingest.rejected", reason="empty_file", peer=peer)
+        return _json_error(400, "empty_file")
+
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        log.warning(
+            "transport.ingest.rejected", reason="file_too_large", peer=peer,
+            file_bytes=len(pdf_bytes), max_bytes=MAX_PDF_BYTES,
+        )
+        return _json_error(413, "file_too_large", max_bytes=MAX_PDF_BYTES)
+
+    try:
+        # ``max_chars=None`` — this route writes a VERBATIM record, so an
+        # over-long extraction is REFUSED by the caller's char cap rather than
+        # silently truncated the way the talker's context-bound path does.
+        text = extract_pdf_text(
+            pdf_bytes, max_chars=None, log_event_prefix=_PDF_LOG_PREFIX,
+        )
+    except DocumentExtractError as exc:
+        status, code = _PDF_REASON_STATUS.get(
+            exc.reason, (400, "pdf_unreadable"),
+        )
+        log.warning(
+            "transport.ingest.rejected", reason=code, peer=peer,
+            file_bytes=len(pdf_bytes), detail=str(exc)[:200],
+        )
+        return _json_error(status, code, detail=str(exc)[:200])
+
+    log.info(
+        "transport.ingest.pdf_extracted",
+        peer=peer, file_bytes=len(pdf_bytes), text_chars=len(text),
+    )
+    return fence_extracted_text(text), len(pdf_bytes)
 
 
 async def _handle_vault_ingest(request: web.Request) -> web.StreamResponse:
@@ -171,25 +293,45 @@ async def _handle_vault_ingest(request: web.Request) -> web.StreamResponse:
         )
         return _json_error(400, "title_too_long", max_chars=_MAX_TITLE_CHARS)
 
-    # --- body (verbatim, 1..max_body_chars) -----------------------------
-    body_text = body.get("body")
-    if not isinstance(body_text, str) or not body_text.strip():
-        log.warning(
-            "transport.ingest.rejected", reason="empty_body", peer=peer,
-        )
-        return _json_error(400, "empty_body")
+    # --- body: verbatim text, or a PDF extracted into text (#57) --------
+    # ``body_format`` absent / "text" keeps the pre-#57 path byte-for-byte —
+    # .md, .txt and .csv still arrive as a ready body string and are written
+    # exactly as sent.
+    raw_format = body.get("body_format")
+    body_format = raw_format.strip().lower() if isinstance(raw_format, str) else ""
+
+    pdf_bytes_len = 0
+    if body_format == BODY_FORMAT_PDF:
+        extracted = _pdf_body_from_request(body, peer=peer)
+        if isinstance(extracted, web.Response):
+            return extracted
+        body_text, pdf_bytes_len = extracted
+    else:
+        body_text = body.get("body")
+        if not isinstance(body_text, str) or not body_text.strip():
+            log.warning(
+                "transport.ingest.rejected", reason="empty_body", peer=peer,
+            )
+            return _json_error(400, "empty_body")
+
     max_body_chars = int(
         request.app.get(_KEY_INGEST_MAX_BODY, DEFAULT_INGEST_MAX_BODY_CHARS)
     )
     if len(body_text) > max_body_chars:
+        # For a PDF this is the EXTRACTED TEXT being too long, which is a
+        # different fact from the file being too big — the two have separate
+        # limits and separate error codes so the operator is never told to
+        # shrink the wrong thing.
+        reason = "extracted_text_too_large" if pdf_bytes_len else "body_too_large"
         log.warning(
             "transport.ingest.rejected",
-            reason="body_too_large",
+            reason=reason,
             peer=peer,
             body_chars=len(body_text),
             max_chars=max_body_chars,
+            pdf_bytes=pdf_bytes_len or None,
         )
-        return _json_error(413, "body_too_large", max_chars=max_body_chars)
+        return _json_error(413, reason, max_chars=max_body_chars)
 
     # --- provenance (metadata only, never authz) ------------------------
     source = ""
@@ -225,6 +367,13 @@ async def _handle_vault_ingest(request: web.Request) -> web.StreamResponse:
             if isinstance(k, str):
                 fm[k] = v
     fm["ingested_via"] = fm.get("ingested_via", "web")
+    if pdf_bytes_len:
+        # Provenance the body itself can no longer carry: once extracted and
+        # fenced, nothing in the record says it began as a PDF or how big that
+        # PDF was. A reader six months on should not have to guess whether the
+        # fenced text is the whole document.
+        fm["ingested_format"] = BODY_FORMAT_PDF
+        fm["ingested_source_bytes"] = pdf_bytes_len
     fm["source"] = source
     fm["ingested_by"] = ingested_by
     fm["ingested_at"] = ingested_at
@@ -315,6 +464,8 @@ async def _handle_vault_ingest(request: web.Request) -> web.StreamResponse:
         instance=instance,
         correlation_id=correlation_id,
         body_chars=len(body_text),
+        body_format=body_format or "text",
+        pdf_bytes=pdf_bytes_len or None,
     )
     response: dict[str, Any] = {
         "status": "created",

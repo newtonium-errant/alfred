@@ -94,7 +94,7 @@ describe('the picker offers CSV', () => {
 
   it('says so on the label — the affordance is not a secret', () => {
     renderForm();
-    expect(screen.getByText('Upload .md / .txt / .csv')).toBeTruthy();
+    expect(screen.getByText('Upload .md / .txt / .csv / .pdf')).toBeTruthy();
   });
 });
 
@@ -415,5 +415,131 @@ describe('VoiceCapture stays on the confirm-first flow (#54 default pin)', () =>
     fireEvent.click(screen.getByTestId('ingest-voice-discard'));
     await waitFor(() => expect(screen.queryByTestId('ingest-voice-transcript')).toBeNull());
     expect(field('ingest-body').value).toBe('');
+  });
+});
+
+// --- #57 PDF half, through the REAL form ------------------------------------
+// The pins in ingestUpload.test.ts prove the helpers work. These prove the FORM
+// calls them and submits what they produced — the standing trap where every
+// unit pin is green, `body_format` is never threaded, and the box silently
+// receives a text ingest with an empty body.
+
+/**
+ * Build bytes over an EXPLICIT ArrayBuffer.
+ *
+ * `new Uint8Array([...])` infers `Uint8Array<ArrayBufferLike>` under TS 5.7,
+ * and the DOM's `BlobPart` rejects it because `ArrayBufferLike` admits
+ * `SharedArrayBuffer`. Constructing over a real ArrayBuffer narrows it so
+ * `new File([bytes], …)` typechecks.
+ */
+function pdfBytes(values: number[]): Uint8Array<ArrayBuffer> {
+  const view = new Uint8Array(new ArrayBuffer(values.length));
+  view.set(values);
+  return view;
+}
+
+/** Drive the picker with real PDF bytes and wait for the async read to land. */
+async function uploadPdf(name: string, bytes: Uint8Array<ArrayBuffer>) {
+  const snapshot = () =>
+    JSON.stringify([
+      (screen.getByTestId('ingest-body') as HTMLTextAreaElement).value,
+      screen.queryByTestId('ingest-upload-error')?.textContent ?? '',
+      screen.queryByTestId('ingest-upload-note')?.textContent ?? '',
+    ]);
+  const before = snapshot();
+  const input = screen.getByTestId('ingest-file') as HTMLInputElement;
+  fireEvent.change(input, {
+    target: { files: [new File([bytes], name, { type: 'application/pdf' })] },
+  });
+  await waitFor(() => {
+    if (snapshot() === before) throw new Error('pdf upload not settled');
+  });
+}
+
+const PDF_BYTES = pdfBytes([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a, 0x01]);
+
+describe('a PDF upload relays BYTES and lets the box extract', () => {
+  it('offers .pdf in the picker and says so on the label', () => {
+    renderForm();
+    const accept = screen.getByTestId('ingest-file').getAttribute('accept') ?? '';
+    expect(accept).toContain('.pdf');
+    expect(accept).toContain('application/pdf');
+    expect(screen.getByText('Upload .md / .txt / .csv / .pdf')).toBeTruthy();
+  });
+
+  it('THREADS body_format and body_b64 into the submit', async () => {
+    // The load-bearing one. A form that stages the PDF, enables the button, and
+    // submits `{body: ''}` would pass every other test in this file.
+    renderForm();
+    await uploadPdf('statement.pdf', PDF_BYTES);
+    fireEvent.click(screen.getByTestId('ingest-submit'));
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1));
+
+    const payload = submitMock.mock.calls[0][0];
+    expect(payload.body_format).toBe('pdf');
+    expect(typeof payload.body_b64).toBe('string');
+    expect(atob(payload.body_b64).length).toBe(PDF_BYTES.length);
+    expect(payload.body).toBeUndefined();
+  });
+
+  it('derives title and source from the filename, like every other upload', async () => {
+    renderForm();
+    await uploadPdf('Bank Statement July.pdf', PDF_BYTES);
+    expect((field('ingest-title') as HTMLInputElement).value).toBe('Bank Statement July');
+    expect((field('ingest-source') as HTMLInputElement).value).toBe('Bank Statement July.pdf');
+  });
+
+  it('discloses that the text will be extracted rather than stored as-is', async () => {
+    renderForm();
+    await uploadPdf('statement.pdf', PDF_BYTES);
+    const note = screen.getByTestId('ingest-upload-note').textContent ?? '';
+    expect(note).toContain('statement.pdf');
+    expect(note.toLowerCase()).toContain('extract');
+  });
+
+  it('enables submit on a staged PDF even though the body box is empty', async () => {
+    // Gating on `body` alone would leave the picker accepting a PDF and the
+    // button dead — a silence with no words attached.
+    renderForm();
+    await uploadPdf('statement.pdf', PDF_BYTES);
+    expect((screen.getByTestId('ingest-body') as HTMLTextAreaElement).value).toBe('');
+    expect((screen.getByTestId('ingest-submit') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('typing a body un-stages the PDF, so the submit is never ambiguous', async () => {
+    // Without this the operator could type over a staged file and submit, with
+    // the typed text silently discarded in favour of the PDF.
+    renderForm();
+    await uploadPdf('statement.pdf', PDF_BYTES);
+    fireEvent.change(screen.getByTestId('ingest-body'), {
+      target: { value: 'actually, let me type it instead' },
+    });
+    fireEvent.click(screen.getByTestId('ingest-submit'));
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1));
+
+    const payload = submitMock.mock.calls[0][0];
+    expect(payload.body_format).toBeUndefined();
+    expect(payload.body).toBe('actually, let me type it instead');
+    expect(payload.body_b64).toBeUndefined();
+  });
+
+  it('refuses an empty PDF with words and stages nothing', async () => {
+    renderForm();
+    await uploadPdf('empty.pdf', pdfBytes([]));
+    expect(screen.getByTestId('ingest-upload-error').textContent).toContain('empty.pdf');
+    expect((screen.getByTestId('ingest-submit') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('a text upload after a PDF still submits as text', async () => {
+    // The two paths share one picker; staging must not be sticky.
+    renderForm();
+    await uploadPdf('statement.pdf', PDF_BYTES);
+    await upload('notes.md', '# Heading\n\nplain words\n', 'text/markdown');
+    fireEvent.click(screen.getByTestId('ingest-submit'));
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1));
+
+    const payload = submitMock.mock.calls[0][0];
+    expect(payload.body_format).toBeUndefined();
+    expect(payload.body).toContain('plain words');
   });
 });

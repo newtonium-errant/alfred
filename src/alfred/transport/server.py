@@ -42,6 +42,7 @@ from aiohttp import web
 
 from .config import (
     DEFAULT_INGEST_MAX_BODY_CHARS,
+    DEFAULT_TRANSPORT_CLIENT_MAX_BYTES,
     TransportConfig,
     host_is_loopback,
 )
@@ -610,7 +611,18 @@ def build_app(
     talker daemon registers a real callable at startup in commit 6;
     unit tests pass in stubs via :func:`register_send_callable`.
     """
-    app = web.Application(middlewares=[auth_middleware])
+    # ``client_max_size`` is raised from aiohttp's 1 MiB default so a base64'd
+    # PDF (4/3 inflation over the 10 MiB byte cap) reaches the handler and is
+    # refused by the ingest route's OWN error taxonomy. aiohttp enforces this
+    # ceiling before any handler runs and answers with a bare HTML 413, so a
+    # value at or below the route's cap would mean the operator's oversize
+    # upload never gets a sentence explaining which limit it hit. See
+    # ``DEFAULT_TRANSPORT_CLIENT_MAX_BYTES`` for the full rationale and the
+    # stated residual above that number.
+    app = web.Application(
+        middlewares=[auth_middleware],
+        client_max_size=DEFAULT_TRANSPORT_CLIENT_MAX_BYTES,
+    )
     app[_KEY_CONFIG] = config
     app[_KEY_STATE] = state
     if send_fn is not None:

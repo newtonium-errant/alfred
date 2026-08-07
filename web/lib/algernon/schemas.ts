@@ -218,6 +218,16 @@ export const otpVerifyBodySchema = z.object({
 // `transport.ingest.max_body_chars` default (262144 = 256 KiB).
 export const MAX_INGEST_CHARS = 262144;
 
+// The PDF byte ceiling (#57). A DIFFERENT AXIS from MAX_INGEST_CHARS, and the
+// distinction is load-bearing: a 10 MiB bank statement is an ordinary file
+// whose extracted text sits comfortably under the character cap, so one number
+// cannot govern both. The form checks bytes before upload and characters are
+// the box's business after extraction. Mirrors
+// `alfred.documents.pdf.MAX_PDF_BYTES`, ratified 2026-06-06 for the Telegram
+// attachment path and re-ratified 2026-08-07 for web ingest — ONE number
+// across both doors, held by a drift pin in tests/test_transport_config.py.
+export const MAX_INGEST_PDF_BYTES = 10 * 1024 * 1024;
+
 // The MVP universal ingest record types (BUILD_DECISIONS decision B). Mirrors the
 // backend code-level `WEB_INGEST_CREATE_TYPES = {document, note, source}`. This
 // is an INTENTIONAL cross-instance constant (every target accepts the same set);
@@ -234,11 +244,42 @@ export const ingestBodySchema = z.object({
   // The artifact body is written VERBATIM (CONTRACT §2) — do NOT trim/mutate it
   // (trimming would strip the artifact's own leading/trailing whitespace). Validate
   // non-empty-AFTER-trim via .refine() while relaying the ORIGINAL untrimmed value.
+  // Exactly one of `body` (text) or `body_b64` (#57, a PDF) is supplied — see
+  // the .superRefine below. `body` stays required-shaped here so every
+  // pre-#57 caller and its error messages are unchanged.
   body: z
     .string()
     .max(MAX_INGEST_CHARS)
-    .refine((s) => s.trim().length > 0, { message: 'A body is required.' }),
+    .refine((s) => s.trim().length > 0, { message: 'A body is required.' })
+    .optional(),
   source: z.string().trim().min(1).max(500),
+  // #57 PDF half. The bytes ride base64 over the SAME peer-pinned
+  // deterministic-create route rather than a second endpoint: the peer-pin,
+  // provenance, collision handling and error taxonomy all already live there,
+  // and a parallel route is how two of them drift.
+  body_format: z.enum(['text', 'pdf']).optional(),
+  // Bounded by the base64-inflated byte cap (4/3) so an oversize upload is
+  // refused at the edge rather than buffered onward to the box.
+  body_b64: z
+    .string()
+    .max(Math.ceil((MAX_INGEST_PDF_BYTES * 4) / 3) + 4096)
+    .optional(),
+}).superRefine((val, ctx) => {
+  const isPdf = val.body_format === 'pdf';
+  if (isPdf && !val.body_b64) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['body_b64'],
+      message: 'A PDF upload is required.',
+    });
+  }
+  if (!isPdf && val.body === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['body'],
+      message: 'A body is required.',
+    });
+  }
 });
 
 export type IngestBody = z.infer<typeof ingestBodySchema>;
