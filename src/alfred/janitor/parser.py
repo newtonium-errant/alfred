@@ -115,13 +115,20 @@ _FRONTMATTER_BLOCK_RE = re.compile(r"\A---\r?\n.*?\r?\n---(?:\r?\n|\Z)", re.DOTA
 #: as long — which is what lets #57's grown fences (````csv containing a ```
 #: line) survive without the inner run terminating the block early.
 #:
-#: The trailing ``\r?`` is load-bearing, not defensive. :func:`mask_code_regions`
-#: splits on ``"\n"``, so a CRLF document hands this pattern ``"```\r"`` — and
-#: ``[^\r\n]*`` cannot consume that ``\r`` while ``$`` will not match before it,
-#: so WITHOUT this the pattern silently fails on every CRLF file and the whole
-#: exclusion quietly does nothing. Reachable in production: #57's .md/.txt
-#: ingest relays uploaded text VERBATIM, so a Windows-authored upload lands as a
-#: CRLF record.
+#: The trailing ``\r?`` is HARDENING of this function, not a fix to a live bug.
+#: :func:`mask_code_regions` splits on ``"\n"``, so CRLF text hands this pattern
+#: ``"```\r"`` — which ``[^\r\n]*`` cannot consume and ``$`` will not match
+#: before, so without it the pattern fails on every line and the exclusion
+#: silently does nothing.
+#:
+#: **CRLF cannot reach here from disk today.** ``Path.read_text()`` applies
+#: universal newlines and every production route into the masking goes through
+#: it, so the text has already been normalized by the time it arrives. This
+#: guards a future caller whose text did NOT come through universal-newline
+#: decoding — raw bytes decoded by hand, a network body, a direct unit call.
+#: Pinned both ways in ``tests/test_janitor_fence_awareness.py``: the CRLF
+#: matrix drives this function directly, and a separate test asserts the
+#: read_text normalization so the reachability claim cannot silently invert.
 _FENCE_LINE_RE = re.compile(
     r"^[ \t]*(?P<marker>`{3,}|~{3,})(?P<info>[^\r\n]*)\r?$"
 )
