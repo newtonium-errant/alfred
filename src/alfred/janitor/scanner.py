@@ -27,7 +27,9 @@ from .parser import (
     ANNOTATION_FIELDS,
     VaultRecord,
     decode_yaml_apostrophe,
+    count_masked_wikilinks,
     extract_wikilinks,
+    mask_code_regions,
     parse_file,
     stripped_body_length,
     structural_wikilinks,
@@ -384,6 +386,13 @@ def run_structural_scan(
     # 5. Per-file checks
     issues: list[Issue] = []
 
+    # #61: fenced/inline-code wikilinks are excluded from findings, and that
+    # exclusion is silent PER LINK by design — there is no useful place to log
+    # each one. Counting them per sweep is what keeps "the scanner is
+    # fence-aware" distinguishable from "the scanner stopped finding
+    # anything", which are otherwise identical from the logs.
+    fenced_links_skipped = 0
+
     for rel_path in files_to_scan:
         try:
             record = parse_file(vault_path, rel_path)
@@ -396,6 +405,16 @@ def run_structural_scan(
                 message=f"Failed to parse file: {e}",
             ))
             continue
+
+        try:
+            fenced_links_skipped += count_masked_wikilinks(
+                (vault_path / rel_path).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError):
+            # Counting is observability, never a reason to fail a sweep — the
+            # file already parsed once above, so this is a re-read racing a
+            # concurrent write at worst.
+            pass
 
         file_issues = _check_record(
             record, rel_path, stem_index, inbound_index,
@@ -412,7 +431,13 @@ def run_structural_scan(
         if rel_path not in all_files and rel_path not in state.ignored:
             state.remove_file(rel_path)
 
-    log.info("scanner.scan_complete", issues=len(issues))
+    log.info(
+        "scanner.scan_complete",
+        issues=len(issues),
+        # Emitted on EVERY sweep including zero (ILB): a field that only
+        # appears when non-zero cannot answer "is the exclusion running?"
+        fenced_links_skipped=fenced_links_skipped,
+    )
     return issues
 
 
@@ -610,7 +635,18 @@ def _check_record(
     }
     body_links = {
         _canonical_link_key(t, stem_index)
-        for t in extract_wikilinks(record.body)
+        # #61: the BODY is document text, so fenced/inline-code regions are
+        # masked. The frontmatter side above is deliberately NOT masked —
+        # masking it could only ever SUBTRACT real references, and a
+        # frontmatter reference is a reference no matter what characters
+        # surround it.
+        #
+        # Note what this reasoning does NOT rest on: the synthesized string can
+        # absolutely contain fence-shaped lines. ``yaml.dump`` of a multi-line
+        # value holding ``` emits them (measured — masking such a block drops a
+        # link, 2 -> 1). That is exactly why it stays unmasked: a janitor_note
+        # quoting a fence would otherwise hide a genuine ``related:`` entry.
+        for t in extract_wikilinks(mask_code_regions(record.body))
     }
     missing_from_fm = []
     for link in body_links - fm_link_targets:

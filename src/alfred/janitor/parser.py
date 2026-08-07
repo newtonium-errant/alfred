@@ -103,6 +103,129 @@ def annotation_wikilinks(fm: dict) -> list[str]:
     return out
 
 
+#: A leading YAML frontmatter block. Masking must SKIP it: fences are a body
+#: construct and YAML has none, so a record with ``` inside a field value (a
+#: ``janitor_note`` explaining fences, say) must not be read as opening a block
+#: that swallows the document.
+_FRONTMATTER_BLOCK_RE = re.compile(r"\A---\r?\n.*?\r?\n---(?:\r?\n|\Z)", re.DOTALL)
+
+#: An opening (or closing) fence line: three-or-more backticks or tildes,
+#: optionally indented, optionally carrying an info string. CommonMark allows
+#: both markers and requires the closer to be the SAME character and at least
+#: as long — which is what lets #57's grown fences (````csv containing a ```
+#: line) survive without the inner run terminating the block early.
+#:
+#: The trailing ``\r?`` is HARDENING of this function, not a fix to a live bug.
+#: :func:`mask_code_regions` splits on ``"\n"``, so CRLF text hands this pattern
+#: ``"```\r"`` — which ``[^\r\n]*`` cannot consume and ``$`` will not match
+#: before, so without it the pattern fails on every line and the exclusion
+#: silently does nothing.
+#:
+#: **CRLF cannot reach here from disk today.** ``Path.read_text()`` applies
+#: universal newlines and every production route into the masking goes through
+#: it, so the text has already been normalized by the time it arrives. This
+#: guards a future caller whose text did NOT come through universal-newline
+#: decoding — raw bytes decoded by hand, a network body, a direct unit call.
+#: Pinned both ways in ``tests/test_janitor_fence_awareness.py``: the CRLF
+#: matrix drives this function directly, and a separate test asserts the
+#: read_text normalization so the reachability claim cannot silently invert.
+_FENCE_LINE_RE = re.compile(
+    r"^[ \t]*(?P<marker>`{3,}|~{3,})(?P<info>[^\r\n]*)\r?$"
+)
+
+#: A matched inline code span on ONE line. Deliberately not multi-line: a stray
+#: backtick must not be able to mask links across a paragraph the way an
+#: unclosed fence otherwise could.
+_INLINE_CODE_RE = re.compile(r"(?P<ticks>`+)(?P<body>[^\r\n]*?)(?P=ticks)")
+
+
+def _blank_out(text: str) -> str:
+    """Replace every non-newline character with a space.
+
+    Blanking rather than deleting keeps line and column offsets identical, so
+    masking cannot shift anything a later pass measures — and the masked text
+    stays readable in a debugger as "a hole exactly this shape".
+    """
+    return "".join("\n" if ch == "\n" else " " for ch in text)
+
+
+def mask_code_regions(text: str) -> str:
+    """Blank out fenced blocks and inline code spans in a record's BODY.
+
+    #61. Since #57 the ingest path fences uploaded file content into record
+    bodies, so ``[[something]]`` sitting in a bank CSV is DATA, not a reference.
+    A scanner that cannot tell the difference manufactures findings about text
+    nobody linked — and, because a LINK001 work-list drives the drip campaign's
+    IRREVERSIBLE removal branch, those findings become automated deletions out
+    of a code block.
+
+    **The frontmatter block is left verbatim.** Fences are a body construct;
+    YAML has none. Masking it would let backticks inside a field value silence
+    the record's real relationship links.
+
+    **An UNCLOSED fence is treated as UNFENCED** — the opposite of the general
+    bias, and deliberately. An unterminated fence is a document defect, and if
+    it swallowed everything below it a single stray ``` would switch LINK001 off
+    for the rest of the file with no signal that it had. One defect must not
+    mask every other finding; silent under-reporting is the failure mode this
+    codebase rules against everywhere else, and a false positive is noise a
+    human triages.
+    """
+    m = _FRONTMATTER_BLOCK_RE.match(text)
+    prefix, body = (m.group(0), text[m.end():]) if m else ("", text)
+
+    lines = body.split("\n")
+    out: list[str] = list(lines)
+    open_at: int | None = None       # index of the OPENING fence line
+    marker: str = ""
+
+    for i, line in enumerate(lines):
+        hit = _FENCE_LINE_RE.match(line)
+        if open_at is None:
+            if hit:
+                open_at, marker = i, hit.group("marker")
+            continue
+        # Inside a block: a closer is the SAME character, at least as long, and
+        # carries no info string. Anything else is content.
+        if (
+            hit
+            and hit.group("marker")[0] == marker[0]
+            and len(hit.group("marker")) >= len(marker)
+            and not hit.group("info").strip()
+        ):
+            for j in range(open_at, i + 1):
+                out[j] = _blank_out(lines[j])
+            open_at, marker = None, ""
+
+    # Fence still open at EOF: the block never closed, so nothing was masked —
+    # `out` already holds the original lines for that range. Stated explicitly
+    # because "we simply don't mask" IS the fail-safe behaviour, not an
+    # oversight, and a future edit that "fixes" it by masking to EOF would
+    # reintroduce exactly the hiding this guards against.
+    if open_at is not None:
+        for j in range(open_at, len(lines)):
+            out[j] = lines[j]
+
+    masked_body = "\n".join(out)
+    # Inline spans, applied to what survived — a fenced region is already
+    # blank, so this cannot double-mask.
+    masked_body = _INLINE_CODE_RE.sub(lambda mm: _blank_out(mm.group(0)), masked_body)
+    return prefix + masked_body
+
+
+def count_masked_wikilinks(text: str) -> int:
+    """How many wikilink occurrences :func:`mask_code_regions` removes.
+
+    The per-link exclusion is silent by design — there is no useful place to
+    log each one. The SWEEP-level count is what keeps "the scanner is
+    fence-aware" distinguishable from "the scanner stopped finding anything",
+    so the scanner reports this per run.
+    """
+    return len(WIKILINK_RE.findall(text)) - len(
+        WIKILINK_RE.findall(mask_code_regions(text))
+    )
+
+
 def structural_wikilinks(raw_text: str, fm: dict) -> list[str]:
     """Wikilinks the record actually REFERENCES — annotation prose removed.
 
@@ -115,8 +238,19 @@ def structural_wikilinks(raw_text: str, fm: dict) -> list[str]:
 
     Order is preserved and the ORIGINAL target text is returned, so
     user-visible LINK001 messages still show what the source file contained.
+
+    **Fenced and inline-code regions are masked first** (#61). This is the seam
+    the awareness belongs at, rather than inside :func:`extract_wikilinks`,
+    because the exclusion is a property of DOCUMENT TEXT and that primitive is
+    also called on things that are not documents — a single ``janitor_note``
+    value, and a synthesized frontmatter string. Masking there would be
+    meaningless at best and actively wrong at worst: a ``janitor_note`` that
+    quotes backticks would stop contributing to the subtraction below, and the
+    multiset would then fail to cancel real links. Keeping the primitive
+    fence-BLIND also leaves #60's drip agreement pins measuring exactly what
+    they were written against.
     """
-    targets = extract_wikilinks(raw_text)
+    targets = extract_wikilinks(mask_code_regions(raw_text))
     noise: dict[str, int] = {}
     for t in annotation_wikilinks(fm):
         key = decode_yaml_apostrophe(t)

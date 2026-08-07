@@ -46,7 +46,7 @@ from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_read, vault_search
 
 from .config import JanitorConfig
-from .parser import extract_wikilinks
+from .parser import extract_wikilinks, mask_code_regions
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -273,7 +273,8 @@ def _collect_linked_records(
     except (OSError, UnicodeDecodeError):
         pass
 
-    outbound_targets = set(extract_wikilinks(raw_text))
+    # #61: a fenced link is data, not an outbound reference.
+    outbound_targets = set(extract_wikilinks(mask_code_regions(raw_text)))
 
     # Find inbound links by searching for the stem name
     stem = Path(file_path).stem
