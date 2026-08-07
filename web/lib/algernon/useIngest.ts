@@ -26,7 +26,16 @@ export interface UseIngest {
   reset: () => void;
 }
 
-function friendlyError(e: unknown): string {
+/**
+ * Map a relayed error to the sentence the operator reads.
+ *
+ * EXPORTED so the suite can pin the wording (#57 gate, WARN-1). It was
+ * module-local, which meant the operator-ruled scanned-PDF copy — a plain
+ * refusal that must NOT dangle vision or OCR as something coming later — was
+ * guarded by a comment and nothing else. A ruling enforced by a comment is a
+ * ruling that survives exactly until the next person edits the string.
+ */
+export function friendlyError(e: unknown): string {
   if (e instanceof ApiError) {
     switch (e.code) {
       case 'invalid_session':
@@ -39,6 +48,27 @@ function friendlyError(e: unknown): string {
         return 'A record with a very similar title already exists there — pick a different title.';
       case 'body_too_large':
         return 'That document is too large to ingest. Trim it and try again.';
+      // #57 PDF refusals. Each names its OWN cause: six failures rendered as
+      // one "something went wrong" is the operator-facing form of silence, and
+      // none of these is fixable without knowing which one happened.
+      case 'file_too_large':
+        return 'That PDF is over the 10 MB limit. Split it and upload the parts separately.';
+      case 'extracted_text_too_large':
+        return "That PDF's text is too long to ingest. Split it and upload the parts separately.";
+      case 'pdf_no_text_layer':
+        // Operator-ruled 2026-08-07: a PLAIN refusal. Deliberately promises no
+        // vision/OCR capability — that copy option was considered and NOT taken.
+        return 'That PDF has no selectable text — it looks like a scan or a photo. Try a version saved as text, or paste the text in yourself.';
+      case 'pdf_encrypted':
+        return 'That PDF is password-protected, so its text could not be read. Save an unlocked copy and upload that.';
+      case 'pdf_unreadable':
+        return 'That file could not be read as a PDF — it may be damaged or only partly downloaded.';
+      case 'pdf_support_unavailable':
+        return "That instance can't read PDFs yet. Paste the text in instead.";
+      case 'invalid_base64':
+        return "That upload didn't arrive intact. Try selecting the file again.";
+      case 'empty_file':
+        return 'That file is empty — there is nothing to ingest.';
       case 'invalid_type':
         return "That record type isn't accepted by this target.";
       case 'empty_title':

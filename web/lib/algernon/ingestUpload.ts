@@ -1,4 +1,4 @@
-import { MAX_INGEST_CHARS } from './schemas';
+import { MAX_INGEST_CHARS, MAX_INGEST_PDF_BYTES } from './schemas';
 
 // File-upload preparation for the ingest body (#57 CSV half). The whole ingest
 // pipeline is text-in-a-JSON-field — FileReader.readAsText → `body` → the box's
@@ -17,7 +17,100 @@ import { MAX_INGEST_CHARS } from './schemas';
 // testable without a DOM.
 
 /** Extensions the body picker accepts, as the `accept` attribute spells them. */
-export const INGEST_UPLOAD_ACCEPT = '.md,.txt,.csv,text/markdown,text/plain,text/csv';
+export const INGEST_UPLOAD_ACCEPT =
+  '.md,.txt,.csv,.pdf,text/markdown,text/plain,text/csv,application/pdf';
+
+// A PDF is the one upload the browser does NOT read as text (#57). Its bytes go
+// up base64'd and the BOX extracts, using the same pypdf extractor the Telegram
+// attachment path has used since 2026-06-06 — one extractor, so the same file
+// yields the same text whichever door it comes through. Doing it in the browser
+// would mean a second implementation (pdf.js) and therefore a second answer.
+export function isPdfFilename(name: string): boolean {
+  return name.trim().toLowerCase().endsWith('.pdf');
+}
+
+/**
+ * Refusal for a PDF over the byte ceiling.
+ *
+ * Quotes BYTES, not characters, because that is the axis being enforced — a
+ * PDF's character count is not known until the box extracts it, and naming the
+ * wrong unit would send the operator off to shorten a document whose length was
+ * never the problem.
+ */
+export function oversizePdfMessage(
+  filename: string,
+  bytes: number,
+  limit: number = MAX_INGEST_PDF_BYTES,
+): string {
+  const mib = (n: number) => `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${filename} is ${mib(bytes)} — over the ${mib(limit)} PDF limit. Nothing was loaded; split it and upload the parts separately.`;
+}
+
+// The BOX-side refusals (`pdf_no_text_layer`, `pdf_encrypted`,
+// `pdf_unreadable`, `pdf_support_unavailable`, …) get their words in
+// `useIngest`'s code→message mapper, alongside every other relayed code.
+// Deliberately NOT duplicated here: two homes for the same sentence is how the
+// scanned-PDF copy ends up saying different things depending on which layer
+// rendered it, and the operator ruling on that particular wording (a plain
+// refusal, no promise of vision) is precisely the kind of thing that must have
+// one owner.
+
+/**
+ * Base64-encode file bytes for the wire.
+ *
+ * Chunked rather than `String.fromCharCode(...bytes)` in one call: spreading a
+ * 10 MiB array blows the argument limit and throws RangeError on every engine,
+ * so the naive version would work in tests on small fixtures and fail on
+ * exactly the real bank statements this feature exists for.
+ */
+export function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+export type PreparedPdfUpload =
+  | { ok: true; bodyB64: string; note: string; bytes: number }
+  | { ok: false; reason: 'empty' | 'too_large'; message: string };
+
+/**
+ * Turn read PDF bytes into the base64 body to submit, or a refusal with words.
+ *
+ * Only the two checks the BROWSER can make: an empty file and an oversize one.
+ * Everything else about a PDF — whether it has a text layer, whether it is
+ * encrypted, whether it parses — is knowable only after extraction, which
+ * happens on the box. Guessing here would mean a second, worse implementation
+ * of the extractor's judgement.
+ */
+export function preparePdfUpload(
+  filename: string,
+  bytes: Uint8Array,
+  limit: number = MAX_INGEST_PDF_BYTES,
+): PreparedPdfUpload {
+  if (bytes.length === 0) {
+    return { ok: false, reason: 'empty', message: emptyUploadMessage(filename) };
+  }
+  if (bytes.length > limit) {
+    return {
+      ok: false,
+      reason: 'too_large',
+      message: oversizePdfMessage(filename, bytes.length, limit),
+    };
+  }
+  const kb = (bytes.length / 1024).toFixed(0);
+  return {
+    ok: true,
+    bodyB64: bytesToBase64(bytes),
+    bytes: bytes.length,
+    // Discloses the reshape, exactly as the CSV note does: the record will hold
+    // extracted text, not the PDF, and the operator is owed that up front
+    // rather than on discovering it in the vault.
+    note: `${filename} — ${kb} KB PDF; its text will be extracted on the box and fenced in the body`,
+  };
+}
 
 // Detection is by EXTENSION, not `File.type`: browsers disagree about the MIME
 // for .csv (Windows commonly reports application/vnd.ms-excel via the registry),

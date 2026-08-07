@@ -1,14 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   INGEST_UPLOAD_ACCEPT,
+  bytesToBase64,
   countCsvRows,
   csvUploadNote,
   fenceCsv,
   isCsvFilename,
+  isPdfFilename,
+  preparePdfUpload,
   prepareUpload,
   readFailedMessage,
 } from '../lib/algernon/ingestUpload';
-import { MAX_INGEST_CHARS } from '../lib/algernon/schemas';
+import { MAX_INGEST_CHARS, MAX_INGEST_PDF_BYTES } from '../lib/algernon/schemas';
 
 // #57 CSV half. The contract under test is LOSSLESSNESS plus honesty: a CSV body
 // is fenced and otherwise untouched, .md/.txt stay byte-identical to what they
@@ -259,5 +262,87 @@ describe('INGEST_UPLOAD_ACCEPT', () => {
     expect(INGEST_UPLOAD_ACCEPT).toContain('.txt');
     expect(INGEST_UPLOAD_ACCEPT).toContain('text/markdown');
     expect(INGEST_UPLOAD_ACCEPT).toContain('text/plain');
+  });
+});
+
+// --- #57 PDF half ----------------------------------------------------------
+// The browser makes exactly TWO judgements about a PDF — empty and oversize —
+// because everything else (text layer, encryption, parseability) is knowable
+// only after extraction, which happens on the box. These pin that boundary as
+// much as the behaviour: a client that started guessing at the rest would be a
+// second, worse copy of the extractor.
+
+describe('PDF uploads (#57)', () => {
+  it('detects .pdf by extension, case- and whitespace-insensitively', () => {
+    expect(isPdfFilename('statement.pdf')).toBe(true);
+    expect(isPdfFilename('  STATEMENT.PDF  ')).toBe(true);
+    expect(isPdfFilename('notes.md')).toBe(false);
+    expect(isPdfFilename('pdf-notes.txt')).toBe(false);
+    expect(isPdfFilename('report.pdf.txt')).toBe(false);
+  });
+
+  it('accepts .pdf in the picker alongside the text types', () => {
+    expect(INGEST_UPLOAD_ACCEPT).toContain('.pdf');
+    expect(INGEST_UPLOAD_ACCEPT).toContain('application/pdf');
+    // the CSV half's types must survive
+    expect(INGEST_UPLOAD_ACCEPT).toContain('.csv');
+    expect(INGEST_UPLOAD_ACCEPT).toContain('.md');
+  });
+
+  it('base64-encodes bytes round-trippably', () => {
+    const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x00, 0xff, 0x7f]);
+    const b64 = bytesToBase64(bytes);
+    const back = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    expect(Array.from(back)).toEqual(Array.from(bytes));
+  });
+
+  it('encodes a payload larger than the argument-spread limit', () => {
+    // The reason bytesToBase64 chunks. A naive
+    // String.fromCharCode(...bytes) throws RangeError well below the 10 MiB
+    // cap, so the naive version passes on small fixtures and fails on exactly
+    // the real bank statements this feature exists for.
+    const big = new Uint8Array(200_000).fill(0x41);
+    const b64 = bytesToBase64(big);
+    expect(atob(b64).length).toBe(200_000);
+  });
+
+  it('refuses an empty PDF with words, not a dead button', () => {
+    const out = preparePdfUpload('empty.pdf', new Uint8Array(0));
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe('empty');
+      expect(out.message).toContain('empty.pdf');
+    }
+  });
+
+  it('refuses an oversize PDF and quotes BYTES, not characters', () => {
+    // Naming characters would send the operator off to shorten a document
+    // whose length was never the problem.
+    const out = preparePdfUpload('huge.pdf', new Uint8Array(2048), 1024);
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.reason).toBe('too_large');
+      expect(out.message).toContain('MB');
+      expect(out.message).not.toContain('character');
+    }
+  });
+
+  it('stages an acceptable PDF and discloses the reshape', () => {
+    const out = preparePdfUpload('statement.pdf', new Uint8Array(4096).fill(1));
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.bytes).toBe(4096);
+      expect(atob(out.bodyB64).length).toBe(4096);
+      // The operator is owed the disclosure up front rather than on finding
+      // extracted text in the vault where they expected a PDF.
+      expect(out.note).toContain('statement.pdf');
+      expect(out.note.toLowerCase()).toContain('extract');
+    }
+  });
+
+  it('mirrors the box byte cap exactly', () => {
+    // The Python side pins the same pair from its end
+    // (tests/test_transport_config.py). One number, both doors.
+    expect(MAX_INGEST_PDF_BYTES).toBe(10 * 1024 * 1024);
   });
 });

@@ -536,7 +536,45 @@ class StateConfig:
 # Default body-size cap for the cross-instance ingest route (256 KiB).
 # Bounds the DoS surface the 8000-char chat cap doesn't cover; the BFF
 # enforces the same ceiling (CONTRACT §5 ``MAX_INGEST_CHARS``).
+#
+# A CHARACTER cap on the text that gets written, NOT a file-size cap. #57
+# added PDF upload, where the two are different axes and conflating them is
+# the trap: a 10 MiB PDF is a normal bank statement whose extracted text is
+# comfortably under this. So the byte cap lives separately
+# (``alfred.documents.pdf.MAX_PDF_BYTES``) and this one still governs what
+# lands in the record.
 DEFAULT_INGEST_MAX_BODY_CHARS: int = 262144
+
+# Request-body ceiling for the whole transport app (#57).
+#
+# aiohttp's ``Application`` default is 1 MiB, and until #57 nothing needed
+# more — the ingest route's 256 KiB of text never came close. A base64'd PDF
+# does: encoding inflates by 4/3, so the 10 MiB byte cap needs ~13.34 MiB on
+# the wire before the JSON envelope.
+#
+# It is set ABOVE the route's own cap ON PURPOSE, and the ordering is the
+# whole point. aiohttp enforces ``client_max_size`` in the middleware layer
+# and answers with an HTML 413 before the handler ever runs — bypassing the
+# route's JSON error taxonomy and handing the operator a bare browser error
+# instead of a sentence naming which limit they hit.
+#
+# The guarantee holds over a MEASURED BAND, not universally, and the honest
+# form of that sentence is: a file between 10.00 MiB (the route cap, where
+# refusal starts) and 10.50 MiB still base64s to under 14 MiB, so it REACHES
+# the handler and is refused by our code with our words. The crossover is
+# exactly 11,010,048 bytes — above it the encoded body exceeds this ceiling
+# and aiohttp answers first. That band is what matters in practice because it
+# covers the just-over-the-line case an operator actually hits: a statement a
+# little too big, refused with a sentence rather than a browser error page.
+#
+# RESIDUAL, stated rather than implied: a request above THIS number still
+# meets aiohttp's wall and still produces the bare 413. That is the correct
+# place for a hard stop — it bounds the memory an unauthenticated-but-
+# token-bearing peer can make the box buffer — but it is a different
+# experience from the route's refusal, so it is documented rather than
+# pretended away. The web client's own byte check makes it unreachable in
+# the normal path.
+DEFAULT_TRANSPORT_CLIENT_MAX_BYTES: int = 14 * 1024 * 1024   # 14 MiB
 
 
 @dataclass

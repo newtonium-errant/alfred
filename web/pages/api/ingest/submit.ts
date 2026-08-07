@@ -71,7 +71,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
   }
 
-  const { target, record_type, title, body, source } = parsed.data;
+  const { target, record_type, title, body, source, body_format, body_b64 } = parsed.data;
 
   // The target must be one the server actually configured. Distinguishes a bad
   // target NAME (400) from a configured-but-misconfigured env (→ 500 below).
@@ -85,7 +85,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       body: {
         record_type,
         title,
-        body,
+        // A PDF relays its BYTES and the box extracts; text relays verbatim.
+        // Spread rather than always-send so a text upload's request shape is
+        // byte-identical to pre-#57 — an added `body_format: undefined` key
+        // would still serialise differently and is exactly the kind of quiet
+        // wire change that costs a debugging session later.
+        ...(body_format === 'pdf'
+          ? { body_format: 'pdf', body_b64 }
+          : { body }),
         source,
         ingested_by: identity.name,
         ingested_at: new Date().toISOString(),
