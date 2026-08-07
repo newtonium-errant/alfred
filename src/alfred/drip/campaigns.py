@@ -58,6 +58,27 @@ Two structural rules came out of it, and both are load-bearing:
    missing string, so the one check designed to notice "the edit did not land"
    was disabled by exactly the condition that stopped it landing. ``verify()``
    judges on the same tolerance ``work()`` edits with, or it is decoration.
+
+Matching tolerance alone is NOT the safety property, though, and it is worth
+being precise about why: before #60 ``work()`` and ``verify()`` already agreed
+perfectly — they shared one exact-string needle — and the campaign still wrote
+false-dones. Equality between the two is an anti-DRIFT property. The property
+that actually makes a ``done`` row true is that **verify() must be at least as
+tolerant as the SCANNER**, because the scanner is what decides whether the link
+is still broken. ``_flexible_ws_re``'s ``\\s+`` is exactly the inverse of
+``extract_wikilinks``'s ``re.sub(r"\\s+", " ", target)``, which is what closes
+the hole; ``tests/drip/test_wrapped_links.py`` pins the agreement against the
+scanner directly rather than against ``work()``.
+
+**Known residual, deliberately not closed:** an ALIASED link
+(``[[target|display]]``) is normalized by the scanner to ``target`` but is not
+matched by ``[[target]]``, so it would false-done the same way. Measured on the
+vault snapshot: 8 aliased links out of 41,074 (0.02%), and an item only matters
+here if it is ALSO broken and ALSO on the frozen work-list — an expected count
+of approximately zero across the 1,283. Widening the matcher to swallow an
+optional ``|…`` tail would add over-match surface to 758 irreversible removals
+to chase that. Left as a note rather than a change; revisit if a future
+work-list is built over a vault where aliases are common.
 """
 
 from __future__ import annotations
@@ -68,6 +89,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+import yaml
 
 log = structlog.get_logger(__name__)
 
@@ -268,6 +290,11 @@ class Link001Campaign:
         else:
             body = _remove_link(original, link)
 
+        _guard_frontmatter(
+            original, body, rel_path=rel_path, branch=branch,
+            campaign=self.name, item_id=item_id,
+        )
+
         if body == original:
             # ILB: work() ran and changed nothing. Silence here is what let the
             # first live increment look healthy — so the no-op is a named event,
@@ -354,6 +381,81 @@ _INLINE_WS = r"[^\S\r\n]"
 #: ``+`` are markdown bullets, which reach :func:`_remove_link` the same way and
 #: leave the same debris when a link was the entry's whole content.
 _BULLET = r"[-*+]"
+
+#: The leading frontmatter fence and its YAML payload. Non-greedy to the FIRST
+#: closing ``---``, matching how ``python-frontmatter`` itself delimits.
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(?P<yaml>.*?)\r?\n---(?:\r?\n|\Z)", re.DOTALL)
+
+
+def _frontmatter_parses(text: str) -> bool | None:
+    """Does this record's frontmatter parse? ``None`` if it has none.
+
+    Three-valued on purpose: "no frontmatter block" and "a frontmatter block
+    that does not parse" are different facts, and :func:`_guard_frontmatter`
+    needs to tell them apart to avoid firing on body-only records.
+    """
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return None
+    try:
+        yaml.safe_load(m.group("yaml"))
+    except yaml.YAMLError:
+        return False
+    return True
+
+
+def _guard_frontmatter(
+    original: str,
+    mutated: str,
+    *,
+    rel_path: str,
+    branch: str,
+    campaign: str,
+    item_id: str,
+) -> None:
+    """Refuse a mutation that would turn parseable frontmatter into garbage.
+
+    MEASURED, not defensive decoration (#60). Annotating a link that sits in an
+    UNQUOTED plain scalar injects ``": "`` into it, and PyYAML then rejects the
+    whole document with *"mapping values are not allowed here"*::
+
+        title: See [[learn/L]] here
+        →  title: See [[learn/L]] <!-- link-provenance: retained (…) --> here
+
+    The quoted-scalar case is safe (the mark lands inside the quotes and carries
+    no apostrophe — see ``_PROVENANCE_MARK``), which is exactly why this needs a
+    guard rather than a rule: the safe and unsafe shapes are indistinguishable
+    at the point the substitution is made.
+
+    Writing that file would convert a *broken link* — an annoyance the janitor
+    reports and this campaign repairs — into an *unparseable record*, which the
+    janitor cannot even read to report. That is strictly worse than the defect,
+    and it is unrecoverable from the vault. So the mutation raises instead, the
+    runner records the item FAILED with the reason, and the file is left byte
+    for byte as it was.
+
+    Compares BEFORE against AFTER rather than asserting the result parses: a
+    record whose frontmatter was ALREADY broken must still be repairable, or the
+    guard would quarantine precisely the records most in need of the sweep.
+    """
+    if _frontmatter_parses(original) is not True:
+        return
+    if _frontmatter_parses(mutated) is not False:
+        return
+    log.warning(
+        "drip.link001.yaml_guard",
+        campaign=campaign,
+        item_id=item_id,
+        branch=branch,
+        path=rel_path,
+        detail="the edit would have made this record's frontmatter "
+               "unparseable — refused, and the file is untouched",
+    )
+    raise ValueError(
+        f"{rel_path}: the {branch} edit would corrupt the record's YAML "
+        f"frontmatter — refusing to write (the link stays broken, which is "
+        f"recoverable; an unparseable record is not)"
+    )
 
 
 def _flexible_ws_re(needle: str) -> re.Pattern[str]:

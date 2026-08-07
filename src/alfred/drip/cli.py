@@ -28,7 +28,8 @@ import structlog
 from .brief_line import render_campaign_line
 from .config import DripConfig
 from .runner import run_increment
-from .state import DONE, PENDING, campaign_state_path, load_state, now_iso, save_state
+from .repair import repair_false_dones
+from .state import campaign_state_path, load_state, save_state
 from .wiring import DripConfigError, build_campaign, build_progress
 
 log = structlog.get_logger(__name__)
@@ -210,13 +211,22 @@ def cmd_repair_verify(
     * **Item-keyed** — each item's own ``verify(item_id)`` decides its own fate.
     * **Idempotent** — a second pass sees the demoted rows as ``pending`` rather
       than ``done``, so they are out of scope; it demotes nothing and says so.
-    * **Silent on nothing** is impossible — the summary line always prints, and
-      zero demotions is an explicit sentence rather than an absent one.
+    * **Silent on nothing** is impossible — every campaign prints a sentence on
+      every run. Zero demotions renders as "ran, 0 demoted"; zero ``done`` rows
+      to examine renders as its own distinct line, because "checked them and
+      they were all fine" and "there was nothing to check" are different facts.
+      The ``drip.repair_verify.summary`` event fires on both paths, so one grep
+      covers every outcome.
 
     A verify that RAISES does not demote. Failing to prove an item landed is not
     proof it didn't (the #40 over-reach, same lesson): an unreadable record would
     otherwise reopen work that was genuinely finished. Those are counted and
     logged separately so the number is never mistaken for a clean bill.
+
+    The audit itself lives in :func:`alfred.drip.repair.repair_false_dones`,
+    where it is a pure function of a campaign and a state object and the rules
+    above can be pinned without a config, a work-list file or a state file. This
+    handler is the operator-facing shell: select, load, delegate, save, print.
     """
     selected = _select_configured(config, campaign_name)
 
@@ -246,94 +256,38 @@ def cmd_repair_verify(
         state_path = campaign_state_path(config.data_dir, config.instance, name)
         state = load_state(state_path, name)
 
-        done_ids = sorted(
-            iid for iid, it in state.items.items() if it.state == DONE
-        )
-        if not done_ids:
-            # ILB: "no done items" and "checked them and they were all fine" are
-            # different facts and must not render identically.
+        result = repair_false_dones(campaign, state, apply=apply)
+
+        for item_id, error in result.unverifiable_items:
+            print(f"  ? {item_id} — verify raised: {error}")
+        for item_id in result.demoted_items:
+            print(f"  ! {item_id} — recorded done, not verifiable → pending")
+
+        if apply and result.demoted:
+            save_state(state_path, state)
+
+        if not result.audited:
+            # ILB: "no done rows to check" and "checked them and they were all
+            # fine" are different facts and must not render identically.
             print(
                 f"Drip repair-verify {name}{mode}: ran, no done items to "
                 f"re-verify."
             )
-            log.info(
-                "drip.repair_verify.no_done_items",
-                campaign=name,
-                detail="ran, nothing to check — no item is recorded done",
-            )
             continue
 
-        demoted = confirmed = errored = 0
-        for item_id in done_ids:
-            try:
-                landed = bool(campaign.verify(item_id))
-            except Exception as exc:  # noqa: BLE001 — see the docstring
-                errored += 1
-                log.warning(
-                    "drip.repair_verify.verify_raised",
-                    campaign=name, item_id=item_id, error=str(exc),
-                    consequence="left DONE — an unprovable item is not a "
-                                "disproven one, and reopening it would re-edit "
-                                "a record that may already be correct",
-                )
-                print(f"  ? {item_id} — verify raised: {exc}")
-                continue
-
-            if landed:
-                confirmed += 1
-                continue
-
-            demoted += 1
-            item = state.items[item_id]
-            log.warning(
-                "drip.repair_verify.demoted",
-                campaign=name,
-                item_id=item_id,
-                previous_state=DONE,
-                new_state=PENDING,
-                applied=apply,
-                reason="the current verifier does not observe this item's "
-                       "effect — it was recorded done by a verifier that "
-                       "could not see the defect it was checking for",
-            )
-            print(f"  ! {item_id} — recorded done, not verifiable → pending")
-            if apply:
-                item.state = PENDING
-                # Reset the retry budget. These attempts were scored against a
-                # broken verifier, so the count carries no information — and an
-                # item that arrives back in the queue with its attempts already
-                # spent would retire without ever being genuinely tried.
-                item.attempts = 0
-                item.awaiting_runs = 0
-                item.claimed_by = ""
-                item.last_error = (
-                    "demoted by repair-verify: recorded done but the current "
-                    "verifier does not observe the effect"
-                )
-                item.updated_at = now_iso()
-
-        if apply and demoted:
-            save_state(state_path, state)
-
-        errors_note = f", {errored} unverifiable" if errored else ""
-        print(
-            f"Drip repair-verify {name}{mode}: ran, {demoted} demoted, "
-            f"{confirmed} confirmed{errors_note} (of {len(done_ids)} done)."
+        errors_note = (
+            f", {result.unverifiable} unverifiable" if result.unverifiable else ""
         )
-        if not apply and demoted:
+        print(
+            f"Drip repair-verify {name}{mode}: ran, {result.demoted} demoted, "
+            f"{result.confirmed} confirmed{errors_note} "
+            f"(of {result.audited} done)."
+        )
+        if not apply and result.demoted:
             print(
                 f"  [dry run] nothing was written — re-run with --apply to "
-                f"reopen {demoted} item(s)."
+                f"reopen {result.demoted} item(s)."
             )
-        log.info(
-            "drip.repair_verify.summary",
-            campaign=name,
-            mode="apply" if apply else "dry_run",
-            checked=len(done_ids),
-            demoted=demoted,
-            confirmed=confirmed,
-            errored=errored,
-        )
 
     return 0
 
