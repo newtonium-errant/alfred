@@ -53,7 +53,7 @@ import structlog
 import yaml
 
 from alfred.drip.campaigns import Link001Campaign
-from alfred.janitor.parser import extract_wikilinks
+from alfred.janitor.parser import extract_wikilinks, mask_code_regions
 
 #: Long enough that PyYAML's 80-column default folds it. The length is
 #: load-bearing, not decorative — see ``_assert_folded``.
@@ -63,6 +63,29 @@ LONG_TARGET = (
 )
 
 PROVENANCE = "link-provenance"
+
+
+def scanner_sees(text: str) -> list[str]:
+    """What the scanner ACTUALLY extracts from document text, post-#61.
+
+    PIN EVOLUTION (#69). These tests originally compared verify() against the
+    bare ``extract_wikilinks``, because that WAS the scanner's seam when #60
+    shipped. #61 moved it: ``structural_wikilinks`` now composes
+    ``mask_code_regions`` with the primitive, so a fenced link is not something
+    the scanner reports.
+
+    The safety property has not changed — verify's tolerance must be at least
+    the SCANNER's — but the thing it must agree WITH has. Left pointing at the
+    bare primitive, these pins would keep passing while measuring a seam
+    production no longer uses: green, and about the wrong composition. That is
+    the same failure shape #60 and #61 each cost a round to, so the pins move
+    with the seam rather than being left to rot politely.
+
+    The existing fixtures here are fence-free, so this is a no-op for every one
+    of them today. It is the FUTURE fence-bearing fixture that would otherwise
+    be measured against the wrong thing.
+    """
+    return extract_wikilinks(mask_code_regions(text))
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +109,7 @@ def _assert_folded(text: str, target: str) -> None:
         "FIXTURE INTEGRITY: this text is NOT folded, so it cannot exercise the "
         "wrapped-link path — lengthen the target"
     )
-    assert target in extract_wikilinks(text), (
+    assert target in scanner_sees(text), (
         "FIXTURE INTEGRITY: the scanner must still see the link, otherwise the "
         "fixture is not the production shape"
     )
@@ -186,7 +209,7 @@ def test_verify_agrees_with_the_scanner_not_with_the_raw_substring(
     item = Link001Campaign.build_item(rel, LONG_TARGET, citer_is_learn=False)
     c = _campaign(vault, item)
 
-    scanner_sees_it = LONG_TARGET in extract_wikilinks(_read(vault))
+    scanner_sees_it = LONG_TARGET in scanner_sees(_read(vault))
     assert scanner_sees_it is True
     assert c.verify(item) is not scanner_sees_it, (
         "verify and the scanner must never disagree about the same record"
@@ -206,7 +229,7 @@ def test_remove_finds_and_deletes_a_folded_link(tmp_path: Path) -> None:
     c.work(item)
 
     after = _read(vault)
-    assert LONG_TARGET not in extract_wikilinks(after), (
+    assert LONG_TARGET not in scanner_sees(after), (
         "the scanner must no longer see the link — that is what 'removed' means"
     )
     assert c.verify(item) is True
@@ -235,7 +258,7 @@ def test_annotate_finds_and_marks_a_folded_link(tmp_path: Path) -> None:
 
     after = _read(vault)
     assert PROVENANCE in after, "the annotate branch must actually annotate"
-    assert LONG_TARGET in extract_wikilinks(after), (
+    assert LONG_TARGET in scanner_sees(after), (
         "…and the annotate branch KEEPS the link"
     )
     assert isinstance(_fm_parses(after), dict), "…leaving valid YAML"
@@ -306,7 +329,7 @@ def test_the_mutation_lands_where_aimed_and_spares_the_neighbour(
     c = _campaign(vault, item)
     c.work(item)
 
-    seen = extract_wikilinks(_read(vault))
+    seen = scanner_sees(_read(vault))
     assert LONG_TARGET not in seen, "the aimed link is gone"
     assert other in seen, "the neighbouring folded link is untouched"
 
@@ -326,7 +349,7 @@ def test_a_folded_link_in_the_body_is_also_repaired(tmp_path: Path) -> None:
 
     assert c.verify(item) is False, "still present, however it is spelled"
     c.work(item)
-    assert target not in extract_wikilinks(_read(vault))
+    assert target not in scanner_sees(_read(vault))
     assert c.verify(item) is True
 
 
@@ -437,7 +460,7 @@ def test_the_guard_does_not_fire_on_a_record_whose_yaml_was_already_broken(
 
     c.work(item)   # must not raise
 
-    assert "person/Ghost" not in extract_wikilinks(_read(vault))
+    assert "person/Ghost" not in scanner_sees(_read(vault))
 
 
 def test_the_valid_yaml_guard_logs_what_it_refused(tmp_path: Path) -> None:

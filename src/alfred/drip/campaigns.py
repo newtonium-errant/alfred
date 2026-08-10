@@ -73,16 +73,29 @@ scanner directly rather than against ``work()``.
 **Known residuals, deliberately not closed.** Both are the same shape as the
 bug above — scanner-visible but needle-invisible — and both are documented
 rather than fixed because the fix costs over-match surface on 758 IRREVERSIBLE
-removals and the measured exposure is nil. Figures are from the vault snapshot,
-counted with the scanner's own ``extract_wikilinks``/``WIKILINK_RE`` over 8,614
-files: 61,508 wikilink occurrences, 52,813 unique (file, target) pairs.
+removals and the measured exposure is nil.
+
+Figures are re-measured with the POST-#61 instrument, which matters: the
+scanner's document seam now composes ``mask_code_regions`` with
+``extract_wikilinks``, so counting with the bare primitive would overstate what
+the scanner actually reports. Over 8,614 files: **60,939 wikilink occurrences**
+(569 excluded as fenced or inline-code), 52,747 unique (file, target) pairs.
 
 1. **Aliased links.** ``[[target|display]]`` is normalized by the scanner to
-   ``target`` but is not matched by ``[[target]]``. Measured: **8 occurrences,
-   0.013%** — and an item only matters here if it is ALSO broken and ALSO on the
-   frozen work-list, so the expected count across the 1,283 is approximately
-   zero. Closing it means widening the matcher to swallow an optional ``|…``
-   tail.
+   ``target`` but is not matched by ``[[target]]``. Measured post-#61: **6
+   occurrences** (8 raw, 2 of them inside code spans and therefore no longer
+   scanner-visible).
+
+   The material line is stronger than "approximately zero", so it is worth
+   stating exactly: aliased **and** broken **and** still scanner-visible after
+   #69 is **ZERO**. Both broken aliased links in the vault —
+   ``[[person/Alice|Alice]]`` and ``[[link2|alias]]`` — sit inside code spans,
+   so the fence guard already excludes them from any work-list and from the
+   mutation path. There is nothing for this residual to reach.
+
+   Closing it anyway means widening the matcher to swallow an optional ``|…``
+   tail. Re-run the measurement before doing so; the conclusion is downstream
+   of a count that a future vault can move.
 2. **Inner-padded links.** ``extract_wikilinks`` ends in ``.strip()``
    (``janitor/parser.py``), so ``[[ target ]]`` normalizes to ``target`` and is
    scanner-visible, while the needle ``[[target]]`` misses the padding.
@@ -93,8 +106,10 @@ Revisit either if a future work-list is built over a vault where the shape is
 common — the measurement above is the thing to re-run, not the conclusion.
 
 For scale on why the whitespace tolerance itself was worth the change:
-**28,930 of the 61,508 occurrences (47%) are wrapped** across physical lines.
-Wrapping is not an edge case in this vault, it is the plurality.
+**28,929 of the 60,939 occurrences (47.5%) are wrapped** across physical lines.
+Wrapping is not an edge case in this vault — it is nearly half of all
+occurrences. (Not "the plurality": at 47.5% the unwrapped majority is larger,
+so that word overstated it.)
 """
 
 from __future__ import annotations
@@ -290,9 +305,16 @@ class Link001Campaign:
         link = f"[[{target}]]"
         link_re = _flexible_ws_re(link)
 
+        fenced_skipped = 0
         if branch == self.BRANCH_ANNOTATE:
             # Provenance annotation; the link STAYS.
-            if _flexible_ws_re(f"{link} {_PROVENANCE_MARK}").search(original):
+            # The idempotence probe reads the UNFENCED view (#69): an
+            # annotation that exists only inside a fence is text in a code
+            # block, not provenance on a reference, and treating it as "already
+            # done" would leave the real reference unmarked forever.
+            if _flexible_ws_re(f"{link} {_PROVENANCE_MARK}").search(
+                unfenced_view(original)
+            ):
                 return                       # already annotated — idempotent
             # The mark goes immediately after the matched ``]]``, so for a link
             # inside a quoted YAML scalar it lands INSIDE the quotes. Measured,
@@ -300,11 +322,28 @@ class Link001Campaign:
             # the link; placing it after the closing quote raises
             # ParserError and makes the whole record unparseable. See
             # ``_PROVENANCE_MARK`` for the constraint that keeps this true.
-            body = link_re.sub(
-                lambda m: f"{m.group(0)} {_PROVENANCE_MARK}", original,
+            body, fenced_skipped = _sub_unfenced(
+                link_re, lambda m: f"{m.group(0)} {_PROVENANCE_MARK}", original,
             )
         else:
-            body = _remove_link(original, link)
+            body, fenced_skipped = _remove_link(original, link)
+
+        if fenced_skipped:
+            # ILB (#69): the guard touched LESS than raw-text matching would
+            # have. Without this line that narrowing is invisible, and "the
+            # guard is live" is indistinguishable from "nothing needed
+            # guarding" — which are the two states an operator most needs to
+            # tell apart when deciding whether the campaign is safe to resume.
+            log.info(
+                "drip.link001.fenced_skip",
+                campaign=self.name,
+                item_id=item_id,
+                branch=branch,
+                path=rel_path,
+                skipped=fenced_skipped,
+                detail="occurrence(s) left alone inside a fenced block or "
+                       "inline code span — that text is data, not a reference",
+            )
 
         _guard_frontmatter(
             original, body, rel_path=rel_path, branch=branch,
@@ -363,7 +402,22 @@ class Link001Campaign:
         )
         if not path.exists():
             return False
-        body = path.read_text(encoding="utf-8")
+        # VERIFY OBSERVES THE UNFENCED TEXT ONLY — the same view work() is
+        # allowed to mutate (#69). Two consequences, both contract:
+        #
+        #   * a fenced-only surviving copy is DATA, so it must not read as
+        #     "link still present" — otherwise the item retries forever against
+        #     text the guard forbids touching (false-pending);
+        #   * a fenced copy must never satisfy "link removed" while an unfenced
+        #     copy survives (false-done) — that is the 907 shape wearing the
+        #     verifier's uniform.
+        #
+        # Masking here is also what keeps the #60 safety property true after
+        # #61: verify's tolerance must be at least the SCANNER's, and the
+        # scanner now composes mask_code_regions with extract_wikilinks for
+        # document text. Judging on raw text would make verify MORE tolerant
+        # than the scanner in exactly the direction that writes false dones.
+        body = unfenced_view(path.read_text(encoding="utf-8"))
         link = f"[[{target}]]"
         if branch == self.BRANCH_ANNOTATE:
             return _flexible_ws_re(
@@ -504,7 +558,64 @@ def _flexible_ws_re(needle: str) -> re.Pattern[str]:
     return re.compile(r"\s+".join(re.escape(t) for t in tokens))
 
 
-def _remove_link(body: str, link: str) -> str:
+def unfenced_view(text: str) -> str:
+    """The text with fenced blocks and inline code spans blanked out (#69).
+
+    Delegates to :func:`alfred.janitor.parser.mask_code_regions` rather than
+    re-deriving the rule, because the WHOLE POINT is that the mutation and the
+    scanner agree about what counts as a link. Two implementations of "is this
+    fenced" is how they drift, and the drift is only visible after an
+    irreversible delete.
+
+    Length-preserving — the masking blanks characters in place rather than
+    removing them (verified: it replaces every non-newline character with a
+    space). That is what lets :func:`_sub_unfenced` match on THIS string and
+    apply the result to the ORIGINAL at identical offsets.
+    """
+    from alfred.janitor.parser import mask_code_regions
+
+    return mask_code_regions(text)
+
+
+def _sub_unfenced(
+    pattern: "re.Pattern[str]",
+    repl: "Any",
+    text: str,
+    *,
+    on_skip: "Any" = None,
+) -> tuple[str, int]:
+    """``pattern.sub(repl, text)`` — but never inside a fence or code span.
+
+    The mechanism (#69), and it is exact rather than heuristic: the mask is the
+    same length as the text, so a match's span in ``text`` addresses the same
+    characters in the mask. If the mask still holds the matched characters, the
+    match is live; if the mask holds blanks there, the match is inside a
+    protected region and is returned UNCHANGED.
+
+    Returns ``(new_text, skipped)`` so the caller can report how many
+    occurrences the guard spared — a removal that touched less than raw-text
+    matching would have must be observable, not silent.
+
+    Direction: this can only ever cause FEWER substitutions than the
+    unguarded form. On a path whose removals are irreversible that asymmetry
+    is the whole design — a missed removal is a retry, an extra one is gone.
+    """
+    masked = unfenced_view(text)
+    skipped = 0
+
+    def _apply(m: "re.Match[str]") -> str:
+        nonlocal skipped
+        if masked[m.start():m.end()] != m.group(0):
+            skipped += 1
+            if on_skip is not None:
+                on_skip(m)
+            return m.group(0)
+        return repl(m)
+
+    return pattern.sub(_apply, text), skipped
+
+
+def _remove_link(body: str, link: str) -> tuple[str, int]:
     """Delete ``link`` and leave the structure it sat in intact.
 
     Two cases, and the entry case is tried FIRST because it subsumes the other.
@@ -540,6 +651,15 @@ def _remove_link(body: str, link: str) -> str:
 
     Both cases match whitespace-tolerantly via :func:`_flexible_ws_re`, so a
     YAML-folded link is removed exactly like an unwrapped one.
+
+    **Neither case touches fenced or inline-code regions** (#69). Both passes go
+    through :func:`_sub_unfenced`, so a wikilink sitting in a CSV cell or a code
+    sample is left exactly as it was. The mask is recomputed between the two
+    passes because the first one changes the text's length and the offsets have
+    to keep addressing the same characters.
+
+    Returns ``(new_body, skipped)`` — the count is what makes the guard
+    observable rather than a silent narrowing of what the campaign does.
     """
     link_re = _flexible_ws_re(link)
 
@@ -549,14 +669,21 @@ def _remove_link(body: str, link: str) -> str:
         rf"{_INLINE_WS}*(?:\r?\n|\Z)",
         re.MULTILINE,
     )
-    body = entry_re.sub("", body)
+    body, skipped_entry = _sub_unfenced(entry_re, lambda m: "", body)
 
     heal_re = re.compile(
         rf"(?P<before>{_INLINE_WS}*){link_re.pattern}(?P<after>{_INLINE_WS}*)"
     )
-    return heal_re.sub(
-        lambda m: " " if (m.group("before") and m.group("after")) else "", body,
+    body, skipped_heal = _sub_unfenced(
+        heal_re,
+        lambda m: " " if (m.group("before") and m.group("after")) else "",
+        body,
     )
+    # The entry pass and the heal pass can both decline the SAME occurrence
+    # (an entry-shaped fenced line is seen by each), so the counts are not
+    # additive — what the caller wants to know is "did the guard spare
+    # anything here", and the heal pass sees every surviving occurrence.
+    return body, max(skipped_entry, skipped_heal)
 
 
 #: name → campaign factory. A dict, on purpose (see the module docstring).
