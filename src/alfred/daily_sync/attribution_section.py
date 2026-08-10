@@ -61,6 +61,11 @@ from alfred.vault.attribution import (
 from alfred.vault.paths import vault_relative
 
 from .attribution_corpus import AttributionCorpusEntry, append_entry
+from .attribution_quality import (
+    DEFAULT_WINDOW_DAYS,
+    attribution_quality_stats,
+    render_quality_line,
+)
 from .confidence import load_state, save_state
 from .config import DailySyncConfig
 
@@ -585,7 +590,9 @@ def auto_confirm_sweep(
     return result
 
 
-def render_batch(items: list[AttributionItem]) -> str:
+def render_batch(
+    items: list[AttributionItem], quality_line: str = "",
+) -> str:
     """Render the attribution batch as the section body.
 
     Format (per spec)::
@@ -604,10 +611,12 @@ def render_batch(items: list[AttributionItem]) -> str:
         # Empty state — intentionally-left-blank principle: a section
         # header that says "nothing to do" beats a missing section
         # because operator visibility is the load-bearing property.
-        return (
-            "## Attribution audit\n\n"
-            "No attribution items pending review.\n"
-        )
+        # #72 item 2 — the quality line rides the EMPTY state too. A caught-up
+        # operator sees this section every day and never sees a batch; hanging
+        # the metric off the batch would mean it renders only when there is
+        # already something to look at, which is the opposite of the point.
+        body = "## Attribution audit\n\nNo attribution items pending review.\n"
+        return f"{body}\n{quality_line}\n" if quality_line else body
     plural = "s" if len(items) != 1 else ""
     lines = [f"## Attribution audit ({len(items)} item{plural})", ""]
     for item in items:
@@ -626,6 +635,9 @@ def render_batch(items: list[AttributionItem]) -> str:
         "Reply with `N confirm` to keep, `N reject` to strip the section. "
         "Anything you leave alone confirms itself after a day."
     )
+    if quality_line:
+        lines.append("")
+        lines.append(quality_line)
     return "\n".join(lines).rstrip()
 
 
@@ -706,7 +718,16 @@ def attribution_audit_section(
         return None
     items = build_batch(vault_path, config, start_index=start_index)
     _LAST_BATCH_HOLDER["items"] = items
-    return render_batch(items)
+    # #72 item 2 — computed here rather than inside render_batch so the
+    # renderer stays a pure function of what it is handed (it is called
+    # directly by tests and by the reply surfaces).
+    corpus_path = getattr(config.attribution, "corpus_path", "") or ""
+    window = int(getattr(config.attribution, "quality_window_days", 0)
+                 or DEFAULT_WINDOW_DAYS)
+    quality_line = render_quality_line(
+        attribution_quality_stats(corpus_path, window_days=window)
+    ) if corpus_path else ""
+    return render_batch(items, quality_line)
 
 
 def register() -> None:

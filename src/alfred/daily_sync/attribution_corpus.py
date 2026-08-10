@@ -38,8 +38,9 @@ how heavily an agent should rely on a given inferred rule.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+from typing import Iterator
 
 
 @dataclass
@@ -70,6 +71,20 @@ class AttributionCorpusEntry:
     # vault. Empty on reject/contest rows (nothing was confirmed) and on rows
     # written before #63a.
     confirmed_via: str = ""
+    # #72 item 4 — the section the OPERATOR named when contesting, from a small
+    # controlled vocabulary he taps (Topics / Decisions / Action Items / ...).
+    #
+    # Deliberately NOT ``section_title`` above. That one is free text chosen by
+    # whichever producer wrote the marker — ``spec.title``, ``"Structured
+    # Summary"``, ``f"Calibration — {sub}"``, even ``name or rel_path or
+    # "instructor-write"``. Keying per-section rates on it would yield a long
+    # tail of one-off strings and never surface "this section stands out",
+    # which is the entire point of the tracking.
+    #
+    # Empty when the operator contested the card as a whole, which stays
+    # allowed; the stats file that under ``SECTION_UNKNOWN`` rather than
+    # dropping it from the denominator.
+    section: str = ""
 
 
 def append_entry(corpus_path: str | Path, entry: AttributionCorpusEntry) -> None:
@@ -86,4 +101,116 @@ def append_entry(corpus_path: str | Path, entry: AttributionCorpusEntry) -> None
         f.write(line + "\n")
 
 
-__all__ = ["AttributionCorpusEntry", "append_entry"]
+# A row is gated TWICE, and this tuple is only the first gate.
+#
+# These FOUR keys are checked explicitly below — the ones without which a row
+# says nothing at all (which marker, which record, what was done, when). They
+# are not the requirement. ``AttributionCorpusEntry`` has EIGHT fields with no
+# default: these four plus ``type``, ``agent``, ``section_title`` and
+# ``marker_date``. A row missing any of those four raises ``TypeError`` at
+# construction, and the ``except TypeError: continue`` below turns that into a
+# skip — so the EFFECTIVE requirement is all eight, and this tuple is a
+# readable subset of it rather than the boundary.
+#
+# Load-bearing when hand-building a fixture: a row carrying only these four
+# reads back ZERO rows (verified by running it, not by reading the code).
+# Build fixtures from the no-default field set.
+#
+# What the tolerance actually buys is the fields that DO have defaults
+# (``andrew_note``, ``original_section_content``, ``confirmed_via``,
+# ``section``). That is why a pre-#63a row with no ``confirmed_via`` still
+# loads — which is the history the stat line has to read — and it is not
+# something this tuple's length controls.
+_REQUIRED_KEYS = ("marker_id", "record_path", "andrew_action", "action_at")
+
+
+@dataclass
+class CorpusReadStats:
+    """How many rows the reader DECLINED, for callers that report a metric.
+
+    The reader skips unreadable rows by design (see below). That silence is
+    fine for a caller that just wants the good rows and wrong for one that
+    publishes a count off them: a quality metric whose denominator quietly
+    shrank looks like a quiet fortnight rather than like a broken writer.
+
+    Blank lines are not counted — they are whitespace, not declined data.
+
+    Pass an instance to :func:`iter_attribution_rows` and read ``skipped``
+    AFTER the generator is exhausted. It is filled in as rows are consumed, so
+    a caller that breaks out of the loop early gets a partial count.
+    """
+
+    skipped: int = 0
+
+
+def iter_attribution_rows(
+    corpus_path: str | Path,
+    *,
+    stats: CorpusReadStats | None = None,
+) -> Iterator[AttributionCorpusEntry]:
+    """Yield every corpus row, OLDEST FIRST. The read side of #63a's append.
+
+    #63a shipped capture with no reader, which left the platform's
+    self-correcting loop half-closed: the signal was durable and nothing
+    consumed it. This is the ONE seam every #72 consumer reads through — the
+    stat line, the demotion trigger, and the per-section rates all come through
+    here rather than each re-parsing the JSONL, so they cannot disagree about
+    what the corpus says.
+
+    Tolerant in both directions, and the tolerance is load-bearing rather than
+    tidy:
+
+    * A row that will not parse is SKIPPED, not raised. A quality metric that
+      dies on one corrupt line stops being computed on the day something went
+      wrong enough to write one.
+    * A row missing a field added later loads with that field's default. Those
+      rows are the bulk of the history the first stat line reads; dropping them
+      would make a busy instance look quiet.
+    * A row carrying a field from a NEWER build is loaded without it, rather
+      than exploding — the house schema-tolerance contract, both directions.
+
+    Mirrors ``daily_sync/corpus.py::iter_corrections`` deliberately; the two
+    corpora stay independently auditable but read the same way.
+
+    Pass a :class:`CorpusReadStats` as ``stats`` to learn how many rows were
+    declined — a caller that publishes a number off these rows should say when
+    its denominator shrank.
+    """
+    path = Path(corpus_path)
+    if not path.exists():
+        return
+    # Local throwaway when the caller does not want the count, so the four
+    # decline paths below stay unconditional one-liners.
+    tally = stats if stats is not None else CorpusReadStats()
+    known = {f.name for f in fields(AttributionCorpusEntry)}
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                tally.skipped += 1
+                continue
+            if not isinstance(data, dict):
+                tally.skipped += 1
+                continue
+            if any(k not in data for k in _REQUIRED_KEYS):
+                tally.skipped += 1
+                continue
+            try:
+                yield AttributionCorpusEntry(
+                    **{k: v for k, v in data.items() if k in known}
+                )
+            except TypeError:
+                tally.skipped += 1
+                continue
+
+
+__all__ = [
+    "AttributionCorpusEntry",
+    "CorpusReadStats",
+    "append_entry",
+    "iter_attribution_rows",
+]
