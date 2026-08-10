@@ -324,6 +324,26 @@ async def fire_once(
         ticket_notify_section.set_raw_config(raw_config)
     ticket_notify_section.register()
 
+    # #63a — the attribution auto-confirm sweep, BEFORE assembly on purpose:
+    # entries that age out this run must drop out of the batch the operator is
+    # about to be shown, not be offered once more and confirmed behind him.
+    #
+    # Belt-guarded like the feed reconcile: this is the one write in the fire
+    # path that isn't the operator's own action, and a vault it can't parse must
+    # not be able to take the whole Daily Sync down with it.
+    #
+    # Effective window is 24-48h rather than exactly 24h, because the clock is
+    # only read when this daily job runs. See AUTO_CONFIRM_AFTER_HOURS.
+    try:
+        attribution_section.auto_confirm_sweep(vault_path, config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "daily_sync.attribution.sweep_failed",
+            date=today_iso,
+            error_type=exc.__class__.__name__,
+            error=str(exc),
+        )
+
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
     attribution_items = attribution_section.consume_last_batch()

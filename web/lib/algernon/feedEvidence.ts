@@ -26,6 +26,15 @@ const HIDDEN_KEYS: ReadonlySet<string> = new Set([
   // #27 email_urgent: `high_source` renders as the on-face provenance chip
   // ("Priority sender" / "Classifier: high"), never as a raw key:value row.
   'high_source',
+  // #63a attribution: `contested` drives the card's TIER (a contested inference
+  // sits under needs-you rather than in the glance pile) and the presence of the
+  // "Not right" door. It is plumbing, not information.
+  //
+  // Hidden in BOTH states, and the false case is the reason this entry exists:
+  // `coerceEvidenceValue(false)` is the STRING "false", which is truthy and so
+  // survives the empty-value filter — every uncontested attribution card would
+  // otherwise carry a "Contested: false" row saying nothing.
+  'contested',
 ]);
 
 // Digest/long-form body is capped at 4000 chars by the producer; mirror that as a

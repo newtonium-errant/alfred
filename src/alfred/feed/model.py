@@ -118,7 +118,6 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     # decide/needs_you: deals into the deck + counts in rings/needs-you. Single
     # verb is ``ack`` → acted (see FEED_ACTIONS in daily_sync/action_router).
     "email_urgent": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
-    "attribution": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "proposal": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "pending": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "routine_match": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
@@ -127,6 +126,13 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     "slot_suggestion": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "routing": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     # Awareness kinds — surfaced for glance, no decision demanded.
+    # attribution (#63a) was a decide kind until the operator ruled that these
+    # confirmations are consistently correct, so reviewing them in the deck cost
+    # him time and returned no information. It is now a glance card that
+    # auto-confirms after 24h. A CONTESTED entry is the exception and the
+    # producer promotes it back to decide/needs_you per-item — the default here
+    # is the uncontested case.
+    "attribution": (MODE_FYI, ATTENTION_FYI),
     "health": (MODE_FYI, ATTENTION_FYI),
     "weather": (MODE_FYI, ATTENTION_FYI),
     "event": (MODE_FYI, ATTENTION_FYI),

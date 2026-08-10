@@ -11,7 +11,7 @@ import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
 import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { useSnooze } from '../components/feed/useSnooze';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { isDeckDealt } from '../lib/algernon/feedConstants';
+import { contestableItem, isDeckDealt } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
@@ -336,6 +336,7 @@ export default function FeedPage() {
                   expanded={expanded.has(it.id)}
                   onToggleEvidence={() => toggleExpanded(it.id)}
                   onAck={() => board.ack(it.id)}
+                  onContest={contestableItem(it) ? () => board.contest(it.id) : undefined}
                 />
               ))}
             </ul>
