@@ -60,6 +60,7 @@ from alfred.feed.model import (
     STATE_OPEN,
     make_id,
 )
+from alfred.telegram.capture_sections import is_known_section
 from alfred.vault.attribution import contest_marker
 from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
@@ -1073,6 +1074,34 @@ def _confirm_writer_detail(kind: str) -> str:
     return "could not add this suggestion to today's plan"
 
 
+def _normalise_contested_section(value: str | None) -> str:
+    """Map an incoming tap to the controlled vocabulary, or to ``""``.
+
+    The tap arrives over HTTP from the PWA, so it is caller-composed input and
+    gets the same treatment as any other: recognised values pass through
+    verbatim, everything else — empty, whitespace, a heading from a build that
+    renamed one, an outright invention — becomes ``""`` and files under
+    ``unknown`` downstream.
+
+    Rejecting into ``unknown`` rather than refusing the whole act is the right
+    trade: the contest itself is the operator's signal and must land. Losing
+    which section it came from costs one dimension of a statistic; losing the
+    contest costs the correction.
+    """
+    name = (value or "").strip()
+    if not name:
+        return ""
+    if not is_known_section(name):
+        log.info(
+            "feed.act.attribution.section_unknown",
+            section=name[:120],
+            detail="tapped section is not a rendered summary heading — filing "
+                   "the contest under unknown rather than minting a bucket",
+        )
+        return ""
+    return name
+
+
 def _dispatch_attribution_contest(
     feed_item_id: str,
     action_id: str,
@@ -1081,6 +1110,7 @@ def _dispatch_attribution_contest(
     feed_store: Any,
     config: Any,
     vault_path: Path | None,
+    contested_section: str = "",
 ) -> ActResult:
     """#63a — the contest door: "don't decide this one for me."
 
@@ -1098,6 +1128,15 @@ def _dispatch_attribution_contest(
     Ordering is load-bearing: the vault write happens first, and the feed item is
     only re-tiered once it lands. A re-tier over a failed write would show the
     operator a contested card whose next sweep confirms it anyway.
+
+    ``contested_section`` (#72 item 4) is the summary heading the operator
+    TAPPED — the section the bad inference came from. It rides onto the corpus
+    row so per-section rates can be counted, and it is optional by design:
+    contesting the card as a whole stays allowed and files under ``unknown``
+    rather than dropping out of the denominator. Deliberately NOT
+    ``section_title``, which is free text chosen by whichever producer wrote the
+    marker; keying rates on that would give a long tail of one-off strings and
+    never surface "this section stands out".
     """
     marker_id = str(batch_item.get("marker_id") or "")
     record_path = str(batch_item.get("record_path") or "")
@@ -1198,6 +1237,10 @@ def _dispatch_attribution_contest(
                     marker_date=str(batch_item.get("date") or ""),
                     andrew_action="contest",
                     action_at=datetime.now(timezone.utc).isoformat(),
+                    # Normalised at the boundary: an unrecognised value is
+                    # filed as unknown rather than minting a new bucket, so a
+                    # stale client cannot invent sections in the stats.
+                    section=_normalise_contested_section(contested_section),
                 ))
             except OSError as exc:
                 # The vault write already landed and is the source of truth for
@@ -1242,6 +1285,7 @@ def act(
     instance_scope: str,
     raw_config: dict[str, Any] | None = None,
     correction_target: str | None = None,
+    contested_section: str | None = None,
 ) -> ActResult:
     """Apply one deck/feed action through the owning resolver.
 
@@ -1285,6 +1329,7 @@ def act(
             feed_store=feed_store, config=config, vault_path=vault_path,
             instance_name=instance_name, instance_scope=instance_scope,
             raw_config=raw_config, correction_target=correction_target,
+            contested_section=contested_section,
         )
 
 
@@ -1299,6 +1344,7 @@ def _act_locked(
     instance_scope: str,
     raw_config: dict[str, Any] | None,
     correction_target: str | None = None,
+    contested_section: str | None = None,
 ) -> ActResult:
     """The critical section — runs holding this item's mutex. See :func:`act`."""
     item = feed_store.load().get(feed_item_id)
@@ -1472,6 +1518,10 @@ def _act_locked(
         return _dispatch_attribution_contest(
             feed_item_id, action_id, batch_item,
             feed_store=feed_store, config=config, vault_path=vault_path,
+            # Scoped exactly like correction_target below: the payload reaches
+            # ONE (kind, action) pair. A contested_section posted alongside any
+            # other action never gets here.
+            contested_section=contested_section or "",
         )
 
     # #13 — the ONLY place a per-request payload joins the static ceiling kwargs.

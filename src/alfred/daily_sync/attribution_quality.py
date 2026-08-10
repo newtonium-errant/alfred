@@ -67,6 +67,28 @@ QUALITY_EVENT = "daily_sync.attribution.quality"
 # the health layer has QUIET_HEALTH_STATUSES rather than scattered ``!= "ok"``.
 DEMOTION_COUNTING_VIA = frozenset({"timeout_24h"})
 
+# #72 item (c), NOT YET BUILT — the cooldown decision, recorded here because
+# this is the count the trigger will read.
+#
+# When the operator REJECTS a demotion proposal, wait ONE FULL
+# ``quality_window_days`` from the rejection before proposing again — not a
+# fixed number of days, and not "until the count rises again".
+#
+# The reason is the window's own arithmetic. The trigger fires on contests
+# inside a trailing window; a rejected proposal leaves those same contests
+# sitting in that window. Any cooldown shorter than the window re-proposes off
+# evidence the operator has just declined to act on, so the second card is not
+# a new signal — it is the same one, re-asked. That is how an operator learns
+# to dismiss a card without reading it, which costs far more than a late
+# demotion: it burns the propose-then-approve channel that the self-correcting
+# standard depends on.
+#
+# Waiting one window guarantees the next proposal is built from contests that
+# are entirely new since the rejection.
+#
+# Corollary for the trigger: only ONE proposal may be live at a time, so a
+# pending proposal suppresses re-proposal regardless of cooldown.
+
 # What a contest with no operator-named section is filed under. Card-level
 # contest stays allowed (contract item 4), and it must remain visible in the
 # stats rather than silently dropping out of the denominator.
@@ -115,7 +137,21 @@ class AttributionQuality:
     #: Contests that bear on the demotion question — see the module docstring.
     demotion_contests: int = 0
     #: Every contest, keyed by operator-named section (``unknown`` when none).
+    #: INTERNAL accumulator — read it through :meth:`per_section_counts`, which
+    #: refuses while the tap is dark. A cross-module drift pin asserts nothing
+    #: outside this module touches the attribute directly.
     contests_by_section: Counter = field(default_factory=Counter)
+    #: True once ANY row in the window carried a non-empty section.
+    #:
+    #: #72 item 4's guarantee, and the reason it is a field rather than a
+    #: convention: between the corpus half shipping and the operator tap
+    #: shipping, EVERY contest filed under ``unknown``. The breakdown was
+    #: computed on every call and was structurally 100% one bucket, so any
+    #: surface that rendered it would have shown a clean-looking histogram
+    #: carrying no information — and it would have looked healthy, which is the
+    #: worst kind of wrong. The refusal is mechanical so it does not depend on
+    #: whoever writes the next consumer noticing.
+    section_tap_live: bool = False
     #: Rows in the corpus the READER declined — corrupt JSON, not an object,
     #: or missing a field the entry cannot be built without. Counted because
     #: the alternative is a metric whose denominator shrinks in silence: a
@@ -129,13 +165,34 @@ class AttributionQuality:
     #: drifting.
     undated_rows: int = 0
 
+    def per_section_counts(self) -> dict[str, int] | None:
+        """The per-section breakdown, or ``None`` while the tap is dark.
+
+        THE accessor. Every consumer goes through here rather than reading
+        ``contests_by_section``, so "is this breakdown meaningful yet" is
+        answered once, here, instead of at each surface that might forget to
+        ask.
+
+        ``None`` is deliberately not an empty dict: a caller that treats
+        falsy-as-empty renders "no sections contested", which is a different
+        and false claim. ``None`` means "not measurable yet".
+        """
+        if not self.section_tap_live:
+            return None
+        return dict(self.contests_by_section)
+
     def to_dict(self) -> dict:
+        # ILB: ``sections`` is null rather than absent while the tap is dark,
+        # and ``section_tap_live`` says which of the two zero-shaped answers
+        # this is — "nobody has tapped a section yet" or "sections exist and
+        # none were contested".
         return {
             "window_days": self.window_days,
             "auto_confirmed": self.auto_confirmed,
             "contested": self.contested,
             "demotion_contests": self.demotion_contests,
-            "sections": dict(self.contests_by_section),
+            "sections": self.per_section_counts(),
+            "section_tap_live": self.section_tap_live,
             "unreadable_rows": self.unreadable_rows,
             "undated_rows": self.undated_rows,
         }
@@ -185,8 +242,12 @@ def attribution_quality_stats(
             stats.auto_confirmed += 1
         elif action == "contest":
             stats.contested += 1
-            section = (getattr(row, "section", "") or "").strip() or SECTION_UNKNOWN
-            stats.contests_by_section[section] += 1
+            named = (getattr(row, "section", "") or "").strip()
+            if named:
+                # One non-empty section anywhere in the window is what makes the
+                # breakdown mean something; see AttributionQuality.section_tap_live.
+                stats.section_tap_live = True
+            stats.contests_by_section[named or SECTION_UNKNOWN] += 1
             if (row.confirmed_via or "").strip() in DEMOTION_COUNTING_VIA:
                 stats.demotion_contests += 1
 

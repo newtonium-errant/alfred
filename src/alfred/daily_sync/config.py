@@ -144,6 +144,27 @@ class AttributionConfig:
     # trigger. Config-backed rather than a literal at the call site: the
     # operator tunes how much history "recently" means without a code change.
     quality_window_days: int = 14
+    # ------------------------------------------------------------------
+    # #72 item (c), NOT YET BUILT — decision recorded for whoever adds the
+    # demotion proposal's two paths (the pending-proposal queue and the
+    # persisted tier override).
+    #
+    # DERIVE THEM FROM ``corpus_path``'s PARENT DIRECTORY. Default the new
+    # fields to ``""`` and resolve at use time against
+    # ``Path(corpus_path).parent``; an explicit config value always wins.
+    #
+    # Do NOT give them their own ``./data/...`` defaults. ``corpus_path``
+    # above is already a cwd-relative literal and one of the eight leakers
+    # the debris guard allowlists for #74. Two more independent literals
+    # would be two more for that sweep to find, and they would need fixing
+    # separately. Deriving from the sibling means they inherit whatever
+    # correctness ``corpus_path`` has, follow it automatically when #74
+    # anchors it, and add nothing new to the allowlist.
+    #
+    # The trap to avoid is the half-derived section: anchoring only the new
+    # paths while ``corpus_path`` beside them stays cwd-relative splits one
+    # section's state across two directories.
+    # ------------------------------------------------------------------
 
 
 @dataclass

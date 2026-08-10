@@ -136,7 +136,7 @@ async def _handle_feed_items(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
-    """POST /feed/act ``{id, action_id[, correction_target]}`` — act on one card.
+    """POST /feed/act ``{id, action_id[, correction_target][, contested_section]}``.
 
     The router's ``(kind, action_id)`` map is the capability ceiling. The
     synchronous ``act`` runs in a thread executor so a slow pending peer-dispatch
@@ -173,6 +173,15 @@ async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
     if raw_target is not None and not isinstance(raw_target, str):
         return _json_error(400, "invalid_correction_target")
     correction_target = raw_target.strip() if isinstance(raw_target, str) else None
+    # #72 item 4 — the summary heading the operator tapped when contesting.
+    # Type-checked here (a non-string is a client bug, so 400 it); the VALUE is
+    # validated against the controlled vocabulary in the router, which is where
+    # the vocabulary lives. Splitting it that way keeps this route from
+    # acquiring an opinion about what the sections are.
+    raw_section = body.get("contested_section")
+    if raw_section is not None and not isinstance(raw_section, str):
+        return _json_error(400, "invalid_contested_section")
+    contested_section = raw_section.strip() if isinstance(raw_section, str) else None
 
     vault_path = _get_vault_path(request)
     instance_name = request.app.get(_KEY_FEED_INSTANCE, "") or ""
@@ -194,6 +203,7 @@ async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
             instance_scope=instance_scope,
             raw_config=raw_config,
             correction_target=correction_target,
+            contested_section=contested_section,
         )
 
     result = await asyncio.get_running_loop().run_in_executor(None, _do_act)
@@ -209,6 +219,7 @@ async def _handle_feed_act(request: web.Request) -> web.StreamResponse:
         # line only needs to answer "did the client send one at all", which is
         # what separates a dropped payload from a rejected one.
         has_correction_target=bool(correction_target),
+        has_contested_section=bool(contested_section),
     )
     status_code = _HTTP_STATUS_BY_STATUS.get(result.status, 200 if result.ok else 400)
     return web.json_response(result.to_dict(), status=status_code)
