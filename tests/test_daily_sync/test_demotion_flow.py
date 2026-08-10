@@ -111,6 +111,47 @@ def test_the_section_renders_nothing_and_logs_why_on_a_healthy_instance(
     assert _events(captured, TRIGGER_EVENT)[0]["proposed"] is False
 
 
+def test_raising_the_card_moves_no_tier_and_touches_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """NEVER A SILENT FLIP — asserted where the operator would notice.
+
+    An earlier version of this pin asked "did the override file I named in the
+    fixture appear". It passed against a build whose trigger DID write an
+    override, because the write went to a path the fixture had not named. The
+    question a pin has to ask is not "did my file appear" but "did the tier
+    move", and then separately "did anything at all get written out there".
+
+    So: the card is raised, and then a feed is built through the same resolved
+    path production reads — it must still come out at the code default. Plus a
+    debris check over the whole tmp tree, which catches a write to any path the
+    fixture did not anticipate.
+    """
+    cfg = _config(tmp_path, threshold=2)
+    for i in range(3):
+        _contest(cfg, marker=f"m{i}", when=NOW - timedelta(days=i + 1),
+                 via="timeout_24h")
+    before = {p for p in tmp_path.rglob("*") if p.is_file()}
+
+    body = demotion_section.demotion_proposals_section(cfg, date(2026, 8, 10))
+    assert body is not None, "the card must actually have been raised"
+
+    # 1. The tier did not move, read through the production path.
+    overrides = load_overrides(cfg.attribution.resolved_tier_override_path())
+    assert overrides.tier_for("attribution") is None
+    feed = build_feed_items(
+        "attribution", [{"record_path": "note/A.md", "marker_id": "x"}],
+        "salem", tier_overrides=overrides,
+    )
+    assert (feed[0].mode, feed[0].attention) == KIND_DEFAULTS["attribution"]
+
+    # 2. The ONLY thing that appeared is the proposal queue.
+    created = {p for p in tmp_path.rglob("*") if p.is_file()} - before
+    assert created == {Path(cfg.attribution.resolved_demotion_queue_path())}, (
+        f"the trigger wrote something besides the proposal queue: {created}"
+    )
+
+
 def test_enough_contests_produce_a_numbered_card_naming_the_evidence(
     tmp_path: Path,
 ) -> None:
