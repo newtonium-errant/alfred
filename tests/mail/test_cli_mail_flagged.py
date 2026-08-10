@@ -43,7 +43,9 @@ def test_cli_fetch_flagged_threads_only_flagged_true(tmp_path, monkeypatch):
     """--flagged → fetch_all(only_flagged=True), called exactly once with --once."""
     calls = []
 
-    def _spy(config, vault_path, *, only_flagged=False):
+    # #75 — mirrors the real signature; the CLI now builds one state
+    # manager up front and threads it through each fetch.
+    def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
         calls.append(only_flagged)
         return 0
 
@@ -53,11 +55,36 @@ def test_cli_fetch_flagged_threads_only_flagged_true(tmp_path, monkeypatch):
     assert calls == [True]                    # threaded True, one run (--once)
 
 
+def test_cli_fetch_threads_a_state_manager(tmp_path, monkeypatch):
+    """#75 — the CLI is the second POLLING caller, so it must build the manager
+    once and hand it in.
+
+    Without this the fix is half-applied in the shape that hides: the daemon
+    loop threads it, the CLI keeps rebuilding per tick, and every pin stays
+    green because nothing asserted the CLI's side.
+    """
+    handed = []
+
+    def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
+        handed.append(state_mgr)
+        return 0
+
+    _patch_env(monkeypatch, _raw(tmp_path))
+    monkeypatch.setattr("alfred.mail.fetcher.fetch_all", _spy)
+    cli.cmd_mail(_args(flagged=True))
+
+    assert len(handed) == 1
+    assert handed[0] is not None, "the CLI let fetch_all rebuild its own manager"
+    assert handed[0].path == (tmp_path / "mail_state.json").resolve()
+
+
 def test_cli_fetch_no_flag_is_all_accounts(tmp_path, monkeypatch):
     """No flag → fetch_all(only_flagged=False) — current behavior, byte-unchanged."""
     calls = []
 
-    def _spy(config, vault_path, *, only_flagged=False):
+    # #75 — mirrors the real signature; the CLI now builds one state
+    # manager up front and threads it through each fetch.
+    def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
         calls.append(only_flagged)
         return 0
 

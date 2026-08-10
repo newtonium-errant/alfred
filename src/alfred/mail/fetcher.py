@@ -462,7 +462,43 @@ def fetch_account(
     return count
 
 
-def fetch_all(config: MailConfig, vault_path: Path, *, only_flagged: bool = False) -> int:
+def state_manager_for(config: MailConfig) -> StateManager:
+    """Build the mail state manager, resolving its path ONCE, here.
+
+    The one place a mail ``StateManager`` is constructed from config, so the
+    fail-loud rule below has a single home rather than a copy at each caller.
+
+    Refuses an empty ``state_path`` instead of falling back to a relative
+    default. The fallback is what #53 and #75 were both about: ``StateManager``
+    resolves at construction, so a relative path silently anchors to whatever
+    cwd the caller happens to have, and ``save()`` then does
+    ``mkdir(parents=True)`` there. Under the suite that meant one test's tmp
+    dir; in production it would mean the process's WorkingDirectory instead of
+    the instance's own data dir — the cross-instance collision the CLAUDE.md
+    state-path rule exists to prevent.
+
+    Callers that want a default should go through
+    ``mail.config.load_from_unified``, which derives it from ``logging.dir``.
+    """
+    if not (config.state_path or "").strip():
+        raise ValueError(
+            "mail state_path is empty. Load the mail config through "
+            "alfred.mail.config.load_from_unified (it derives the path from "
+            "logging.dir), or set mail.state.path explicitly. Refusing to "
+            "default to a cwd-relative path: the state writer resolves at "
+            "construction, so that lands the file wherever the process is "
+            "standing rather than in this instance's data dir (#53/#75)."
+        )
+    return StateManager(config.state_path)
+
+
+def fetch_all(
+    config: MailConfig,
+    vault_path: Path,
+    *,
+    only_flagged: bool = False,
+    state_mgr: StateManager | None = None,
+) -> int:
     """Fetch new emails and drop them into the vault inbox. Returns total new emails.
 
     ``only_flagged=False`` (the manual ``alfred mail fetch`` CLI): pull EVERY configured account — the
@@ -473,6 +509,14 @@ def fetch_all(config: MailConfig, vault_path: Path, *, only_flagged: bool = Fals
     The live inbound flow remains the webhook (n8n → tunnel → ``mail.webhook``); with the fetch loop
     turned on it runs ALONGSIDE the webhook, never replacing it. Logs route to ``mail.log`` (CLI) or
     ``mail_webhook.log`` (the daemon thread shares the webhook runner's logging).
+
+    ``state_mgr`` — #75. A POLLING caller must build one manager at loop start
+    and hand the same instance to every tick. Constructing per tick re-resolves
+    the path against the cwd of that tick, which is how a long-lived loop's
+    state file moves when something else changes directory underneath it. Both
+    polling callers (the orchestrator's daemon thread and ``alfred mail
+    fetch``'s poll loop) pass it. Omitted → one is built here, which is right
+    for the one-shot calls (``--once``, tests).
     """
     inbox_path = vault_path / config.inbox_dir
     inbox_path.mkdir(parents=True, exist_ok=True)
@@ -489,7 +533,8 @@ def fetch_all(config: MailConfig, vault_path: Path, *, only_flagged: bool = Fals
         only_flagged=only_flagged,
     )
 
-    state_mgr = StateManager(config.state_path)
+    if state_mgr is None:
+        state_mgr = state_manager_for(config)
     state_mgr.load()
 
     total = 0
