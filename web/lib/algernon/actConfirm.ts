@@ -74,6 +74,23 @@ export const ACT_LANDED_MESSAGE =
 export const ACT_UNCONFIRMED_MESSAGE =
   "That didn't confirm in time — the next sync will reconcile it.";
 
+/**
+ * The verify's OWN request budget, deliberately far below the 70s browser
+ * default (#62 gate, WARN-2).
+ *
+ * The caller is by definition on a bad connection — that is what produced the
+ * inconclusive failure in the first place. Inheriting the default meant two
+ * attempts could run ~140s on top of the act's own 70s, leaving a spinner up
+ * for roughly three and a half minutes on a phone that had just lost network.
+ * The docstring below promised a bound "in two directions"; this is the second
+ * one, and without it the first (two attempts) bounds only the COUNT.
+ *
+ * 8s is chosen to be longer than any healthy round trip and shorter than an
+ * operator's patience with a spinner. If the network is well enough to answer,
+ * it answers inside this; if it is not, waiting longer does not help.
+ */
+export const VERIFY_TIMEOUT_MS = 8_000;
+
 interface VerifyDeps {
   list: typeof feedApi.list;
 }
@@ -107,7 +124,7 @@ export async function verifyActLanded(
 ): Promise<VerifyOutcome> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const res = await deps.list({});
+      const res = await deps.list({}, { timeoutMs: VERIFY_TIMEOUT_MS });
       const item = res.items.find((i) => i.id === itemId);
       if (!item) return 'unknown';
       return landed(item) ? 'landed' : 'not_landed';

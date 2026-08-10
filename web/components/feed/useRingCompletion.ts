@@ -4,6 +4,7 @@ import { ApiError } from '../../lib/algernon/http';
 import { RING_ACTION_DONE, RING_ACTION_UNDO, ringItemDone } from '../../lib/algernon/rings';
 import {
   ACT_LANDED_MESSAGE,
+  ACT_UNCONFIRMED_MESSAGE,
   isInconclusive,
   supersede,
   verifyActLanded,
@@ -72,8 +73,13 @@ function messageFor(e: unknown): string {
     ) {
       return "Can't reach Algernon right now — this is server-side, not your session.";
     }
-    if (e.status === 504 || e.code === 'timeout' || e.code === 'gateway_timeout' || e.code === 'network_error') {
-      return "That didn't confirm in time — the next sync will reconcile it.";
+    // #62 gate WARN-3: this branch is LIVE on the verify fall-through, so the
+    // incident-path copy renders from here. It was the FOURTH paste of a
+    // predicate the module docstring claimed had one owner — the three siblings
+    // were converted and this one, the primary hook, was not. Consuming the
+    // shared owner is the point of the extraction.
+    if (isInconclusive(e)) {
+      return ACT_UNCONFIRMED_MESSAGE;
     }
     if (e.status === 400 || e.code === 'invalid_action') {
       // Includes graceful degradation: an OLD router that doesn't know `done` yet

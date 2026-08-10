@@ -70,13 +70,18 @@ export interface FeedListParams {
 }
 
 export const feedApi = {
-  list(params: FeedListParams = {}): Promise<FeedListResponse> {
+  /**
+   * `opts.timeoutMs` overrides the 70s browser default. Needed by #62's
+   * post-failure verify, whose caller is by definition on a bad connection —
+   * the default budget there would leave a spinner up for minutes.
+   */
+  list(params: FeedListParams = {}, opts: { timeoutMs?: number } = {}): Promise<FeedListResponse> {
     const qs = new URLSearchParams();
     if (params.state) qs.set('state', params.state);
     if (params.mode) qs.set('mode', params.mode);
     if (params.kind) qs.set('kind', params.kind);
     const suffix = qs.toString();
-    return getJson<FeedListResponse>(`/api/feed/list${suffix ? `?${suffix}` : ''}`);
+    return getJson<FeedListResponse>(`/api/feed/list${suffix ? `?${suffix}` : ''}`, opts);
   },
 
   /**

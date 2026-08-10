@@ -4,6 +4,7 @@ import {
   ACT_UNCONFIRMED_MESSAGE,
   isInconclusive,
   supersede,
+  VERIFY_TIMEOUT_MS,
   verifyActLanded,
 } from '../lib/algernon/actConfirm';
 import { ApiError } from '../lib/algernon/http';
@@ -164,5 +165,57 @@ describe('the copy tells the truth about what happened', () => {
     // did; with verify + supersession + resume refetch it describes something
     // that actually happens, so it stays rather than being softened.
     expect(ACT_UNCONFIRMED_MESSAGE).toContain('next sync will reconcile');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #62 gate, WARN-2 — the verify's own request budget must REACH the call
+// ---------------------------------------------------------------------------
+//
+// The bound was promised "in two directions" and only one was delivered. Two
+// attempts bounded the COUNT; each attempt still inherited the 70s browser
+// default, so a verify could run ~140s on top of the act's own 70s — a ~3.5
+// minute spinner on a phone that had just lost network, which is precisely the
+// case that constructs an inconclusive failure.
+//
+// Pinned at the CALL SITE, not on the constant. Every other test here injects a
+// fake `list`, so a constant that is declared and never threaded would leave
+// them all green — the same trap as #57's client_max_size, where the value was
+// correct and never reached `web.Application`.
+
+describe('the verify carries its own short timeout to the wire', () => {
+  it('THREADS timeoutMs into the list call', async () => {
+    const list = vi.fn().mockResolvedValue({ items: [], count: 0 });
+    await verifyActLanded('itm-1', () => true, { list });
+
+    expect(list).toHaveBeenCalledWith({}, { timeoutMs: VERIFY_TIMEOUT_MS });
+  });
+
+  it('threads it on the RETRY too — the second attempt is the slow one', async () => {
+    // The retry runs when the first attempt already failed, i.e. when the
+    // network is worst. An unbudgeted retry is the half that actually hurts.
+    const list = vi.fn()
+      .mockRejectedValueOnce(new ApiError(0, 'network_error'))
+      .mockResolvedValueOnce({ items: [], count: 0 });
+    await verifyActLanded('itm-1', () => true, { list });
+
+    expect(list).toHaveBeenCalledTimes(2);
+    for (const call of list.mock.calls) {
+      expect(call[1]).toEqual({ timeoutMs: VERIFY_TIMEOUT_MS });
+    }
+  });
+
+  it('the budget is far below the 70s browser default', () => {
+    // The value itself, so a later edit that "simplifies" it back toward the
+    // default has to argue with a number. Longer than any healthy round trip,
+    // shorter than an operator's patience with a spinner.
+    expect(VERIFY_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
+    expect(VERIFY_TIMEOUT_MS).toBeGreaterThanOrEqual(3_000);
+  });
+
+  it('worst-case verify time stays a fraction of the act budget', () => {
+    // Two attempts at the budget must not approach the 70s the act itself may
+    // already have burned — that sum is what the operator experiences.
+    expect(VERIFY_TIMEOUT_MS * 2).toBeLessThan(70_000 / 2);
   });
 });
