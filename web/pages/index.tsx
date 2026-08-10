@@ -310,7 +310,7 @@ export default function HomePage() {
                         expanded={expanded.has(it.id)}
                         onToggleEvidence={() => toggleExpanded(it.id)}
                         onAck={() => board.ack(it.id)}
-                        onContest={contestableItem(it) ? () => board.contest(it.id) : undefined}
+                        onContest={contestableItem(it) ? (section?: string) => board.contest(it.id, section) : undefined}
                       />
                     ))}
                   </ul>

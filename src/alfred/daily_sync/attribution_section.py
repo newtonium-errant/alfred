@@ -65,6 +65,7 @@ from .attribution_quality import (
     DEFAULT_WINDOW_DAYS,
     attribution_quality_stats,
     render_quality_line,
+    render_section_line,
 )
 from .confidence import load_state, save_state
 from .config import DailySyncConfig
@@ -724,9 +725,18 @@ def attribution_audit_section(
     corpus_path = getattr(config.attribution, "corpus_path", "") or ""
     window = int(getattr(config.attribution, "quality_window_days", 0)
                  or DEFAULT_WINDOW_DAYS)
-    quality_line = render_quality_line(
-        attribution_quality_stats(corpus_path, window_days=window)
-    ) if corpus_path else ""
+    quality_line = ""
+    if corpus_path:
+        stats = attribution_quality_stats(corpus_path, window_days=window)
+        # #72 item 5 — the per-section line rides WITH the quality line, on the
+        # same every-sync cadence and through the same one corpus read. Two
+        # lines rather than one sentence because they answer different
+        # questions ("is auto-confirm letting things through" vs "which section
+        # produces them") off the same rows, and the module docstring keeps
+        # those apart on purpose.
+        quality_line = (
+            f"{render_quality_line(stats)}\n{render_section_line(stats)}"
+        )
     return render_batch(items, quality_line)
 
 

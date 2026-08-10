@@ -19,6 +19,8 @@ from typing import Any, Callable
 from alfred.feed import FeedItem, FeedStore, try_feed_reconcile
 from alfred.feed.model import ATTENTION_NEEDS_YOU, MODE_DECIDE
 
+from .tier_override import TierOverrides
+
 _SOURCE_REF = {"producer": "daily_sync"}
 
 
@@ -126,8 +128,8 @@ def _as_dict(item: Any) -> dict[str, Any]:
 # write would be flattened back to FYI by the next sync and the contested card
 # would quietly rejoin the glance pile.
 #
-# #72 item (c)/2, NOT YET BUILT — this is the function the approved demotion
-# override plugs into, and two decisions are recorded here.
+# #72 item (c)/2, BUILT — this is the function the approved demotion override
+# plugs into, and the two decisions recorded when the seam was cut still hold.
 #
 # WHERE IT GOES. An approved demotion returns attribution cards to needs-you
 # WHOLESALE, not per item. So it belongs above the ``contested`` check as an
@@ -137,36 +139,63 @@ def _as_dict(item: Any) -> dict[str, Any]:
 # re-upserts every open item each fire, so a tier written once into the store
 # would be flattened back to FYI by the next sync.
 #
-# REVERSIBILITY, v1. A manual escape hatch is sufficient — a CLI subcommand (or
-# editing the one persisted value) to clear the override and return the kind to
-# its KIND_DEFAULTS tier. A second propose-flow for re-demotion is NOT built:
-# it is speculative until an operator actually asks to undo one, and the
-# demotion direction is the safe one (more review, not less), so a stuck
-# override over-asks rather than silently under-asks. The state must still be
-# schema-tolerant and instance-scoped per the CLAUDE.md state rules, because
-# the escape hatch reads it too.
-def _attribution_tier(d: dict[str, Any]) -> tuple[str, str] | None:
+# It arrives as an ARGUMENT rather than being read from disk in here. Same
+# reason ``contested`` is read off the item: this function is called once per
+# item, and a file read per item would turn one daily read into a per-card one.
+# :func:`build_feed_items` resolves the kind's override once and hands it down.
+#
+# REVERSIBILITY, v1. A manual escape hatch is sufficient — ``alfred
+# tier-override clear <kind>`` returns the kind to its KIND_DEFAULTS tier. A second
+# propose-flow for re-demotion is NOT built: it is speculative until an operator
+# actually asks to undo one, and the demotion direction is the safe one (more
+# review, not less), so a stuck override over-asks rather than silently
+# under-asks. The state is schema-tolerant and instance-scoped per the CLAUDE.md
+# state rules, because the escape hatch reads it too.
+def _attribution_tier(
+    d: dict[str, Any], override: tuple[str, str] | None,
+) -> tuple[str, str] | None:
+    if override is not None:
+        return override
     if d.get("contested"):
         return (MODE_DECIDE, ATTENTION_NEEDS_YOU)
     return None
 
 
-_TIER_OVERRIDES: dict[str, Callable[[dict], tuple[str, str] | None]] = {
+_TIER_OVERRIDES: dict[
+    str, Callable[[dict, tuple[str, str] | None], tuple[str, str] | None]
+] = {
     "attribution": _attribution_tier,
 }
 
 
-def build_feed_items(kind: str, raw_items: list[Any] | None, instance: str) -> list[FeedItem]:
-    """Translate one batch family's raw items into FeedItems (evidence verbatim)."""
+def build_feed_items(
+    kind: str,
+    raw_items: list[Any] | None,
+    instance: str,
+    *,
+    tier_overrides: TierOverrides | None = None,
+) -> list[FeedItem]:
+    """Translate one batch family's raw items into FeedItems (evidence verbatim).
+
+    ``tier_overrides`` (#72) is the operator's persisted standing decision about
+    which tier a KIND sits at, layered over ``KIND_DEFAULTS``. Resolved once per
+    kind here and handed to the per-item hook, so the file is read once per fire
+    rather than once per card.
+    """
     key_fn, title_fn = _FAMILIES[kind]
     override_fn = _TIER_OVERRIDES.get(kind)
+    kind_override = tier_overrides.tier_for(kind) if tier_overrides else None
     out: list[FeedItem] = []
     for item in raw_items or []:
         d = _as_dict(item)
         stable = key_fn(d)
         if not stable:
             continue  # can't stably key it — skip rather than mint an unstable id
-        override = override_fn(d) if override_fn else None
+        # A kind with no per-item hook still honours a stored kind-level
+        # override. Falling back to ``None`` here instead would make the escape
+        # hatch a silent no-op on every kind but attribution — an operator
+        # setting one, seeing no error, and getting no change.
+        override = override_fn(d, kind_override) if override_fn else kind_override
         mode, attention = override if override else (None, None)
         out.append(FeedItem.create(
             kind=kind,
@@ -192,9 +221,16 @@ def emit_sync_feed(
     routine_match_items: list[Any] | None = None,
     radar_items: list[Any] | None = None,
     friction_items: list[Any] | None = None,
+    tier_overrides: TierOverrides | None = None,
 ) -> None:
     """Reconcile every daily-sync family into the feed store. Belt-guarded per
-    family; reconciled every fire (empty family → prior open items go acted)."""
+    family; reconciled every fire (empty family → prior open items go acted).
+
+    ``tier_overrides`` (#72) carries the operator's approved per-kind tier
+    decisions. Threaded from the daemon's ONE production call site in the same
+    commit that added it: a default-``None`` gate parameter that only tests pass
+    is a live write side with a dead read side, and every pin stays green.
+    """
     by_family = {
         "email_tier": email_items,
         "attribution": attribution_items,
@@ -205,5 +241,7 @@ def emit_sync_feed(
         "friction": friction_items,
     }
     for kind in _FAMILIES:
-        feed_items = build_feed_items(kind, by_family[kind], instance)
+        feed_items = build_feed_items(
+            kind, by_family[kind], instance, tier_overrides=tier_overrides,
+        )
         try_feed_reconcile(store, kind, feed_items)

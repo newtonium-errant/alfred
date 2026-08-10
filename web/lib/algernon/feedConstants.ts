@@ -254,6 +254,46 @@ export function contestableItem(item: FeedItem): boolean {
   return !(item.attention === 'needs_you' || item.mode === 'decide');
 }
 
+// --- which section was wrong (#72 item 4) ------------------------------------
+// A contest says "this inference is wrong". This says WHICH PART of the capture
+// summary produced it, so the per-section statistic can answer "which section
+// produces bad inferences" rather than only "how many were wrong".
+//
+// MUST equal `alfred.telegram.capture_sections.SUMMARY_SECTIONS` — same order,
+// same spellings. A Python-side drift pin parses THIS array out of the TS
+// source and holds it against that tuple, the same shape as the CONTEST_ACTION
+// pin above, because neither side can notice the drift alone. Rename a heading
+// in the renderer only and this picker keeps offering the old spelling: the
+// router normalises the unrecognised value to `''`, so the contest still lands
+// (correct — the correction must never be lost to a UI detail) but files under
+// `unknown`, and the statistic loses a dimension with every test on both sides
+// still green.
+//
+// This IS a second spelling of the vocabulary, deliberately — TypeScript cannot
+// import a Python tuple. The pin is what makes the copy safe. Do not add a
+// third copy; import from here.
+export const CONTEST_SECTIONS = [
+  'Topics',
+  'Decisions',
+  'Open Questions',
+  'Action Items',
+  'Key Insights',
+  'Raw Contradictions',
+  'Discarded Noise',
+  'Re-encounters',
+] as const;
+
+export type ContestSection = (typeof CONTEST_SECTIONS)[number];
+
+// The body-gate bound for `contested_section` lives with its siblings in
+// schemas.ts (`CONTEST_SECTION_MAX_CHARS`), not here — the relay bounds are one
+// group and splitting them across two files is how one of them gets missed.
+
+/** The picker's stable per-section test/DOM id fragment (no spaces). */
+export function contestSectionSlug(section: string): string {
+  return section.toLowerCase().replace(/\s+/g, '-');
+}
+
 // --- snooze, the one defer verb (#14) ----------------------------------------
 // The duration ladder, in menu order. MUST equal `alfred.tier.snooze
 // .SNOOZE_DURATIONS`' keys — a rung offered here that the router's FEED_ACTIONS

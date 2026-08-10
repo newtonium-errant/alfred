@@ -60,15 +60,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
   }
 
-  const { id, action_id, correction_target } = parsed.data;
+  const { id, action_id, correction_target, contested_section } = parsed.data;
+
+  // Only send the optional keys the client actually supplied — the transport
+  // reads both as optional and an explicit `undefined` would serialize away
+  // anyway, but omitting them keeps the relayed body byte-identical to the
+  // pre-#13 / pre-#72 shape for every action that carries neither.
+  //
+  // Built additively rather than as a ternary chain: with two optional keys the
+  // chain has four arms, and the arm nobody writes a case for is the one where
+  // both are present.
+  const relayBody: Record<string, string> = { id, action_id };
+  if (correction_target) relayBody.correction_target = correction_target;
+  if (contested_section) relayBody.contested_section = contested_section;
 
   try {
     const { status, body } = await callTransportFeed('POST', '/feed/act', {
-      // Only send `correction_target` when the client supplied one — the
-      // transport reads it as optional and an explicit `undefined` would
-      // serialize away anyway, but omitting it keeps the relayed body identical
-      // to the pre-#13 shape for every other action.
-      body: correction_target ? { id, action_id, correction_target } : { id, action_id },
+      body: relayBody,
     });
     // A post-auth upstream 401 can ONLY mean the BFF's own `web_feed` token is
     // wrong / missing at the transport (the browser never supplies it) — NOT a

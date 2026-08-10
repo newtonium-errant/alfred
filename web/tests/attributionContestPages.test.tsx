@@ -76,7 +76,7 @@ describe('FeedPage — the contest door is actually wired', () => {
 
     fireEvent.click(screen.getByTestId('feed-row-contest'));
 
-    expect(mockAct).toHaveBeenCalledWith(ATTRIBUTION_ID, 'contest');
+    expect(mockAct).toHaveBeenCalledWith(ATTRIBUTION_ID, 'contest', undefined, undefined);
   });
 
   it('leaves other FYI kinds alone — an Ack, and no contest door', async () => {
@@ -111,6 +111,6 @@ describe('HomePage composer — the contest door is actually wired', () => {
 
     fireEvent.click(screen.getByTestId('feed-row-contest'));
 
-    expect(mockAct).toHaveBeenCalledWith(ATTRIBUTION_ID, 'contest');
+    expect(mockAct).toHaveBeenCalledWith(ATTRIBUTION_ID, 'contest', undefined, undefined);
   });
 });

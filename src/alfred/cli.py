@@ -5167,6 +5167,85 @@ def _stt_vocab_state_lines(sv) -> list[str]:
     return lines
 
 
+def _cmd_tier_override(args: argparse.Namespace) -> None:
+    """``alfred tier-override {list [--json] | clear <kind>}`` — #72's escape hatch.
+
+    An approved demotion proposal writes a persisted per-kind feed tier
+    override. This is how it comes back off. Reversibility v1 is deliberately a
+    CLI subcommand rather than a second propose-flow, per the decision recorded
+    above ``feed_producer._attribution_tier``: a re-demotion proposal is
+    speculative until an operator actually asks to undo one, and the demotion
+    direction over-asks rather than silently under-asking.
+
+    A SUBCOMMAND rather than "edit the JSON by hand", which was the other
+    option on the table. The override file has a nested shape and a value gate
+    (``VALID_MODES`` / ``VALID_ATTENTIONS``), and a hand-edit is exactly where
+    an unrecognised tier value would come from — the loader would then decline
+    the row and fall back to the code default, silently doing the right thing
+    for the wrong reason and leaving the operator sure he had changed something.
+
+    There is no ``set``. Putting a kind INTO an override is the operator
+    answering a proposal, which is what the Daily Sync card is for; a CLI that
+    could do it too would be a second door onto a decision the propose-then-
+    approve channel exists to keep in one place. Clearing is different: it
+    UNDOES, and an undo the operator cannot reach without waiting for a card is
+    not an undo.
+    """
+    from alfred.daily_sync.config import load_from_unified as load_ds_config
+    from alfred.daily_sync.tier_override import clear_override, load_overrides
+
+    raw = _load_unified_config(args.config)
+    attribution = load_ds_config(raw).attribution
+    path = attribution.resolved_tier_override_path()
+    cmd = getattr(args, "tier_override_cmd", None)
+
+    if cmd == "list":
+        overrides = load_overrides(path)
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "path": path,
+                "unreadable": overrides.unreadable,
+                "declined": overrides.declined,
+                "overrides": [o.to_dict() for o in overrides.by_kind.values()],
+            }, indent=2))
+            return
+        print(f"Tier overrides ({path}):")
+        if overrides.unreadable:
+            print("  ! the file exists but could not be read — every kind is")
+            print("    running at its code default until it is fixed.")
+            return
+        if not overrides.by_kind:
+            # ILB: an empty override file and a missing one both mean "no kind
+            # is overridden", and that is a real, reportable state — not an
+            # absence of output.
+            print("  none — every kind is at its code default (KIND_DEFAULTS).")
+        for kind, row in sorted(overrides.by_kind.items()):
+            print(f"  {kind}: {row.mode}/{row.attention}")
+            if row.reason:
+                print(f"    why: {row.reason}")
+            if row.approved_at:
+                print(f"    approved: {row.approved_at}")
+            print(f"    clear with: alfred tier-override clear {kind}")
+        if overrides.declined:
+            print(f"  ({overrides.declined} row(s) declined — unrecognised tier values)")
+        return
+
+    if cmd == "clear":
+        kind = args.kind
+        if clear_override(path, kind):
+            print(f"Cleared the {kind} tier override — it returns to its code default")
+            print("at the next Daily Sync fire (the producer re-derives every fire).")
+        else:
+            # Distinct sentence from the success case on purpose: "there was
+            # nothing to clear" and "cleared" are different facts, and an
+            # operator who mistyped the kind needs to be able to tell.
+            print(f"No override was stored for {kind!r} — nothing to clear.")
+            print(f"See what is set: alfred tier-override list")
+        return
+
+    print("Usage: alfred tier-override {list [--json] | clear <kind>}")
+
+
 def _cmd_stt_vocab(args: argparse.Namespace) -> None:
     """``alfred stt-vocab {list [--json] | approve <term> --operator <name>
     | reject <term> --operator <name>}`` — the operator decision that closes the
@@ -7033,6 +7112,21 @@ def build_parser() -> argparse.ArgumentParser:
     sttv_reject.add_argument("term", help="The proposed term to decline")
     sttv_reject.add_argument("--operator", required=True, help="Rejecter identity (recorded)")
 
+    # #72 — the tier-override escape hatch. `clear` only: putting a kind INTO
+    # an override is the operator answering a Daily Sync proposal, and a second
+    # door onto that decision would defeat the propose-then-approve channel.
+    tovr_p = sub.add_parser(
+        "tier-override",
+        help="Inspect or clear approved feed tier overrides (#72)",
+    )
+    tovr_sub = tovr_p.add_subparsers(dest="tier_override_cmd")
+    tovr_list = tovr_sub.add_parser(
+        "list", help="Show which kinds are overridden away from their code default")
+    tovr_list.add_argument("--json", action="store_true", help="Machine-readable output")
+    tovr_clear = tovr_sub.add_parser(
+        "clear", help="Undo an override — the kind returns to its KIND_DEFAULTS tier")
+    tovr_clear.add_argument("kind", help="Feed kind, e.g. attribution")
+
     # #20 P5 — ad-hoc-T3 recurrence→promote review + decision.
     trec_p = sub.add_parser(
         "tier-recurrence",
@@ -7103,6 +7197,7 @@ def main() -> None:
         "bit": cmd_bit,
         "routine": cmd_routine,
         "stt-vocab": _cmd_stt_vocab,
+        "tier-override": _cmd_tier_override,
         "tier-recurrence": _cmd_tier_recurrence,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,

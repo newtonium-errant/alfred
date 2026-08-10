@@ -152,6 +152,20 @@ def _last_batch_proposal_items(config: DailySyncConfig) -> list[dict[str, Any]]:
     return [i for i in items if isinstance(i, dict)]
 
 
+def _last_batch_demotion_items(config: DailySyncConfig) -> list[dict[str, Any]]:
+    """Return the demotion-proposal items the daemon stashed at fire time.
+
+    Each item carries ``item_number``, ``proposal_id``, ``kind``,
+    ``demotion_contests``, ``window_days``, ``threshold``. Empty list on every
+    fire that raised no proposal, which is the steady state — the trigger's own
+    log line is what says the evaluation happened.
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch") or {}
+    items = batch.get("demotion_items") or []
+    return [i for i in items if isinstance(i, dict)]
+
+
 def _last_batch_pending_items(config: DailySyncConfig) -> list[dict[str, Any]]:
     """Return the pending-items entries the daemon stashed at fire time.
 
@@ -197,6 +211,7 @@ def _batch_item_numbers(config: DailySyncConfig) -> set[int]:
         _last_batch_items,
         _last_batch_attribution_items,
         _last_batch_proposal_items,
+        _last_batch_demotion_items,
         _last_batch_pending_items,
         _last_batch_routine_match_items,
     ):
@@ -221,6 +236,7 @@ def _batch_type_flags(config: DailySyncConfig) -> dict[str, bool]:
         "has_email": bool(_last_batch_items(config)),
         "has_attribution": bool(_last_batch_attribution_items(config)),
         "has_proposal": bool(_last_batch_proposal_items(config)),
+        "has_demotion": bool(_last_batch_demotion_items(config)),
         "has_pending": bool(_last_batch_pending_items(config)),
         "has_routine_match": bool(_last_batch_routine_match_items(config)),
     }
@@ -235,7 +251,10 @@ def _applicable_calibration_verbs(flags: dict[str, bool]) -> set[str]:
     typo of an inapplicable verb won't false-fire.
     """
     verbs: set[str] = set()
-    if flags["has_attribution"] or flags["has_proposal"] or flags["has_routine_match"]:
+    if (
+        flags["has_attribution"] or flags["has_proposal"]
+        or flags["has_routine_match"] or flags["has_demotion"]
+    ):
         verbs.update({"confirm", "reject"})
     if flags["has_pending"]:
         verbs.update({"noted", "show"})
@@ -1325,6 +1344,136 @@ def _resolve_attribution_correction(
     return (None, True)
 
 
+def _resolve_demotion_correction(
+    correction: ReplyCorrection,
+    item: dict[str, Any],
+    config: DailySyncConfig,
+) -> tuple[str | None, bool]:
+    """Apply one demotion-proposal confirm/reject. ``(error_or_None, did_write)``.
+
+    CONFIRM writes the persisted tier override AND marks the proposal accepted,
+    in that order. The order is load-bearing for the same reason the contest
+    dispatcher's is: the override is the thing the operator asked for, and a
+    queue marked accepted over a failed override write would leave him told
+    "back under review" by a card that is still glance-tier tomorrow. Marking
+    the queue is the bookkeeping; if only one of the two can land, it must be
+    the override.
+
+    REJECT marks the proposal rejected and writes nothing else. The rejection's
+    ``resolved_at`` IS the cooldown clock — see
+    :func:`~.demotion_proposals.cooldown_until` — so a reject that failed to
+    record its timestamp would re-ask tomorrow off the same evidence, which is
+    the specific failure the cooldown exists to prevent. Hence the write is
+    checked and a failure is surfaced rather than swallowed.
+    """
+    from alfred.feed.model import ATTENTION_NEEDS_YOU, MODE_DECIDE
+
+    from .demotion_proposals import (
+        STATE_ACCEPTED,
+        STATE_REJECTED,
+        resolve_proposal,
+    )
+    from .tier_override import TierOverride, set_override
+
+    proposal_id = str(item.get("proposal_id") or "")
+    kind = str(item.get("kind") or "")
+    if not proposal_id or not kind:
+        return (
+            f"item {correction.item_number} demotion proposal metadata missing",
+            False,
+        )
+
+    refusal = _pending_only_verb_refusal(
+        correction, "demotion",
+        "`confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+    )
+    if refusal:
+        return refusal, False
+
+    if not (correction.ok or correction.reject):
+        return (
+            f"item {correction.item_number}: the attribution-tier proposal only "
+            f"accepts `confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+            False,
+        )
+
+    attribution = getattr(config, "attribution", None)
+    if attribution is None:
+        return (f"item {correction.item_number}: attribution not configured", False)
+    queue_path = attribution.resolved_demotion_queue_path()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if correction.reject:
+        try:
+            flipped = resolve_proposal(
+                queue_path, proposal_id, STATE_REJECTED, resolved_at=now_iso,
+            )
+        except OSError as exc:
+            log.warning(
+                "daily_sync.demotion.state_write_failed",
+                proposal_id=proposal_id, action="reject", error=str(exc),
+            )
+            return (f"item {correction.item_number}: queue write failed", False)
+        if not flipped:
+            log.info(
+                "daily_sync.demotion.reject_noop", proposal_id=proposal_id,
+                detail="already resolved or no longer in the queue",
+            )
+            return None, False
+        log.info(
+            "daily_sync.demotion.rejected", proposal_id=proposal_id, kind=kind,
+            cooldown_days=item.get("window_days"),
+        )
+        return None, True
+
+    # Confirm — the override FIRST, then the bookkeeping.
+    try:
+        set_override(
+            attribution.resolved_tier_override_path(),
+            TierOverride(
+                kind=kind,
+                mode=MODE_DECIDE,
+                attention=ATTENTION_NEEDS_YOU,
+                approved_at=now_iso,
+                reason=(
+                    f"{item.get('demotion_contests', '?')} wrong auto-confirms "
+                    f"in {item.get('window_days', '?')} days"
+                ),
+                proposal_id=proposal_id,
+            ),
+        )
+    except OSError as exc:
+        log.warning(
+            "daily_sync.demotion.override_write_failed",
+            proposal_id=proposal_id, kind=kind, error=str(exc),
+        )
+        return (
+            f"item {correction.item_number}: couldn't record the tier change",
+            False,
+        )
+
+    try:
+        resolve_proposal(
+            queue_path, proposal_id, STATE_ACCEPTED, resolved_at=now_iso,
+        )
+    except OSError as exc:
+        # The override LANDED, which is what the operator asked for, so this is
+        # reported as applied. The cost of the unmarked queue row is one
+        # suppressed re-proposal, and the trigger suppresses on
+        # ``override_in_force`` anyway — which is why that check exists as well
+        # as the pending-one-at-a-time check, rather than instead of it.
+        log.warning(
+            "daily_sync.demotion.state_write_failed",
+            proposal_id=proposal_id, action="confirm", error=str(exc),
+            detail="the tier override landed; only the queue row is unmarked",
+        )
+    log.info(
+        "daily_sync.demotion.approved", proposal_id=proposal_id, kind=kind,
+        demotion_contests=item.get("demotion_contests"),
+    )
+    return None, True
+
+
 def _resolve_proposal_correction(
     correction: ReplyCorrection,
     item: dict[str, Any],
@@ -2239,6 +2388,32 @@ def _format_pending_item_applied_line(
     return f"Item {item_number}: [{instance}] {category} → {resolution_id}{tail}"
 
 
+def _format_demotion_applied_line(
+    item: dict[str, Any],
+    *,
+    action: str,
+) -> str:
+    """One-liner describing a demotion-proposal confirm/reject.
+
+    The CONFIRM line names the escape hatch. The operator has just changed a
+    standing tier with two words, and the sentence that tells him it worked is
+    the only natural place to tell him how to undo it — a reversibility that
+    lives only in a module docstring is one he does not have.
+    """
+    item_number = item.get("item_number") or "?"
+    kind = str(item.get("kind") or "attribution").strip()
+    if action == "reject":
+        window = item.get("window_days") or "?"
+        return (
+            f"Item {item_number}: left {kind} cards as they are — "
+            f"I won't ask again for {window} days"
+        )
+    return (
+        f"Item {item_number}: {kind} cards are back under review "
+        f"(undo with `alfred tier-override clear {kind}`)"
+    )
+
+
 def _format_proposal_applied_line(
     item: dict[str, Any],
     *,
@@ -2394,6 +2569,7 @@ def _compose_calibration_hint(
     has_proposal: bool,
     has_pending: bool,
     has_routine_match: bool = False,
+    has_demotion: bool = False,
 ) -> str:
     """Build the "Tip: ..." hint based on which item types are in the batch.
 
@@ -2407,10 +2583,10 @@ def _compose_calibration_hint(
       * Email only → preserve the historical Salem hint
         ("Same / Ditto / Same as #N" — the chaining shortcut for
         contiguous identical-priority items).
-      * Attribution / proposal items → ``N confirm`` / ``N reject``
-        (matches what attribution_section.py:357 and
-        canonical_proposals_section.py:186 advertise in the batch
-        message body).
+      * Attribution / proposal / demotion items → ``N confirm`` /
+        ``N reject`` (matches what attribution_section.py:357,
+        canonical_proposals_section.py:186 and demotion_section's
+        ``render_batch`` advertise in the batch message body).
       * Pending items → ``N noted`` / ``N show me``.
       * Mixed → list the applicable verbs.
 
@@ -2418,7 +2594,7 @@ def _compose_calibration_hint(
     suggest). Falls through cleanly without a stray "Tip:" prefix.
     """
     verbs: list[str] = []
-    if has_attribution or has_proposal or has_routine_match:
+    if has_attribution or has_proposal or has_routine_match or has_demotion:
         verbs.append("'N confirm' / 'N reject'")
     if has_pending:
         verbs.append("'N noted' / 'N show me'")
@@ -2819,6 +2995,7 @@ def handle_daily_sync_reply(
       - ``email_count``: int — email rows written
       - ``attribution_count``: int — attribution actions applied
       - ``proposal_count``: int — canonical-proposal actions applied
+      - ``demotion_count``: int — attribution-tier proposals answered
       - ``pending_count``: int — pending-item resolutions executed
     """
     if not reply_targets_daily_sync(config, parent_message_id):
@@ -2833,6 +3010,10 @@ def handle_daily_sync_reply(
     proposal_items = _last_batch_proposal_items(config)
     proposal_by_num = {
         int(i.get("item_number", 0)): i for i in proposal_items
+    }
+    demotion_items = _last_batch_demotion_items(config)
+    demotion_by_num = {
+        int(i.get("item_number", 0)): i for i in demotion_items
     }
     pending_items = _last_batch_pending_items(config)
     pending_by_num = {
@@ -2849,6 +3030,7 @@ def handle_daily_sync_reply(
     email_items_corrected = 0  # email ITEMS resolved (N — one per applied_lines line)
     attribution_written = 0
     proposal_written = 0  # propose-person c2
+    demotion_written = 0  # #72 — attribution-tier demotion proposals
     pending_written = 0  # Pending Items Queue Phase 1
     routine_match_written = 0  # self-correcting matcher Phase 2b — glossary verdicts
     applied_lines: list[str] = []  # c3 — one per-item summary line per accepted correction
@@ -2986,6 +3168,19 @@ def handle_daily_sync_reply(
                         applied_lines.append(
                             _format_proposal_applied_line(item, action="confirm")
                         )
+        # #72 — the all_ok shortcut deliberately does NOT touch a demotion
+        # proposal. A bare "ok" acknowledging a batch of email items must never
+        # be read as approving a standing change to a feed tier: the whole point
+        # of routing this through propose-then-approve is that the operator says
+        # yes TO THIS QUESTION, by its number. An unanswered proposal simply
+        # stays pending and is re-rendered tomorrow.
+        if demotion_items:
+            log.info(
+                "daily_sync.demotion.all_ok_skipped",
+                count=len(demotion_items),
+                detail="a bare ack does not approve a tier change — reply "
+                       "`N confirm` to the numbered item",
+            )
         # Pending Items Queue Phase 1 — all_ok shortcut maps to the
         # ``noted`` resolution on every pending item. ``show me``
         # never fires from a pure-ack token; Andrew only triggers
@@ -3052,6 +3247,7 @@ def handle_daily_sync_reply(
             email_item = email_by_num.get(correction.item_number)
             attribution_item = attribution_by_num.get(correction.item_number)
             proposal_item = proposal_by_num.get(correction.item_number)
+            demotion_item = demotion_by_num.get(correction.item_number)
             pending_item = pending_by_num.get(correction.item_number)
             routine_match_item = routine_match_by_num.get(correction.item_number)
 
@@ -3140,6 +3336,21 @@ def handle_daily_sync_reply(
                             action="reject" if correction.reject else "confirm",
                         )
                     )
+            elif demotion_item is not None:
+                err, did_write = _resolve_demotion_correction(
+                    correction, demotion_item, config,
+                )
+                if err is not None:
+                    _bucket_resolver_error(correction.item_number, err)
+                    continue
+                if did_write:
+                    demotion_written += 1
+                    applied_lines.append(
+                        _format_demotion_applied_line(
+                            demotion_item,
+                            action="reject" if correction.reject else "confirm",
+                        )
+                    )
             elif pending_item is not None:
                 # Pending Items Queue Phase 1 — ``noted`` / ``show me``.
                 # Reject verbs make no sense here (use ``noted`` for
@@ -3214,7 +3425,7 @@ def handle_daily_sync_reply(
 
     written_count = (
         email_written + attribution_written + proposal_written
-        + pending_written + routine_match_written
+        + pending_written + routine_match_written + demotion_written
     )
     # 2026-05-18 — N (items corrected) vs M (corpus rows written). When
     # an email correction lands on a c5 cluster of size K > 1, the corpus
@@ -3229,6 +3440,7 @@ def handle_daily_sync_reply(
         + proposal_written
         + pending_written
         + routine_match_written
+        + demotion_written
     )
 
     # c3 — user-facing body. Per-item summary lines go in (capped at 5
@@ -3243,6 +3455,7 @@ def handle_daily_sync_reply(
         has_proposal=bool(proposal_items),
         has_pending=bool(pending_items),
         has_routine_match=bool(routine_match_items),
+        has_demotion=bool(demotion_items),
     )
     body = _build_confirmation_body(
         parsed_all_ok=parsed.all_ok,
@@ -3270,6 +3483,7 @@ def handle_daily_sync_reply(
         proposal_written=proposal_written,
         pending_written=pending_written,
         routine_match_written=routine_match_written,
+        demotion_written=demotion_written,
         corrections_count=corrections_count,
         written_count=written_count,
         unparsed=len(errors),
@@ -3307,6 +3521,7 @@ def handle_daily_sync_reply(
         "corrections_count": corrections_count,
         "attribution_count": attribution_written,
         "proposal_count": proposal_written,
+        "demotion_count": demotion_written,
         "pending_count": pending_written,
         "routine_match_count": routine_match_written,
         "unparsed": errors,

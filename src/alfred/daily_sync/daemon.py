@@ -40,6 +40,7 @@ from . import (
     attribution_section,
     canonical_proposals_section,
     contracts_awaiting_section,
+    demotion_section,
     email_section,
     friction_section,
     pending_items_section,
@@ -136,6 +137,7 @@ def _build_state_payload(
     radar_items: list[Any] | None = None,
     friction_items: list[Any] | None = None,
     routine_match_items: list[Any] | None = None,
+    demotion_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the per-fire batch payload persisted to the state file.
 
@@ -151,8 +153,10 @@ def _build_state_payload(
     today; smart-routing dispatcher hooks deferred. ``routine_match_items``
     (self-correcting matcher Phase 2b) is the parallel low-confidence
     routine-match review batch — confirm/reject routes a verdict into the
-    learned glossary corpus. The reply parser reads every list to resolve
-    item numbers against a Telegram reply.
+    learned glossary corpus. ``demotion_items`` (#72) is the parallel
+    attribution-tier demotion-proposal batch — confirm writes the persisted tier
+    override, reject starts the cooldown. The reply parser reads every list to
+    resolve item numbers against a Telegram reply.
     """
     payload: dict[str, Any] = {
         "date": today_iso,
@@ -183,6 +187,10 @@ def _build_state_payload(
     if routine_match_items:
         payload["routine_match_items"] = [
             item.to_dict() for item in routine_match_items if hasattr(item, "to_dict")
+        ]
+    if demotion_items:
+        payload["demotion_items"] = [
+            item.to_dict() for item in demotion_items if hasattr(item, "to_dict")
         ]
     return payload
 
@@ -242,6 +250,12 @@ async def fire_once(
     # (the queue path lives under transport.canonical.proposals_path),
     # so it doesn't need set_vault_path.
     canonical_proposals_section.register()
+    # #72 — the demotion-proposal section. Priority 24, immediately above
+    # attribution at 25, so the question sits directly on top of the batch that
+    # is its evidence. Reads the corpus + override paths off the attribution
+    # config block itself, so no set_* call. Dormant on a healthy instance: it
+    # renders nothing until the trigger raises a proposal.
+    demotion_section.register()
     # contracts_awaiting_section reads the contracts store itself (the
     # store path lives under the contracts: config block), like
     # canonical_proposals. Priority 16 — right after canonical proposals;
@@ -348,6 +362,7 @@ async def fire_once(
     items = email_section.consume_last_batch()
     attribution_items = attribution_section.consume_last_batch()
     proposal_items = canonical_proposals_section.consume_last_batch()
+    demotion_items = demotion_section.consume_last_batch()
     pending_items = pending_items_section.consume_last_batch()
     radar_items = radar_section.consume_last_batch()
     friction_items = friction_section.consume_last_batch()
@@ -360,6 +375,7 @@ async def fire_once(
         items_count=len(items),
         attribution_items_count=len(attribution_items),
         proposal_items_count=len(proposal_items),
+        demotion_items_count=len(demotion_items),
         pending_items_count=len(pending_items),
         radar_items_count=len(radar_items),
         friction_items_count=len(friction_items),
@@ -405,7 +421,7 @@ async def fire_once(
     if (
         items or attribution_items or proposal_items
         or pending_items or radar_items or friction_items
-        or routine_match_items
+        or routine_match_items or demotion_items
     ) and message_ids:
         state["last_batch"] = _build_state_payload(
             today_iso,
@@ -417,6 +433,7 @@ async def fire_once(
             radar_items=radar_items,
             friction_items=friction_items,
             routine_match_items=routine_match_items,
+            demotion_items=demotion_items,
         )
     state["last_fired_date"] = today_iso
     # Clear-on-success: reaching this save point means the fire
@@ -440,6 +457,7 @@ async def fire_once(
             feed_cfg = _load_feed_config(raw_config)
             if feed_cfg.enabled:
                 from .feed_producer import emit_sync_feed
+                from .tier_override import load_overrides as load_tier_overrides
 
                 emit_sync_feed(
                     FeedStore(
@@ -457,6 +475,15 @@ async def fire_once(
                     routine_match_items=routine_match_items,
                     radar_items=radar_items,
                     friction_items=friction_items,
+                    # #72 — the operator's approved per-kind tier decisions,
+                    # re-read every fire. Read here rather than inside the
+                    # producer so the whole feed emit still sits under the one
+                    # belt above: a tuning file that will not parse must not be
+                    # able to break the fire, and load_overrides' own fail-open
+                    # is the second layer, not the only one.
+                    tier_overrides=load_tier_overrides(
+                        config.attribution.resolved_tier_override_path(),
+                    ),
                 )
         except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the fire
             log.warning(
@@ -470,6 +497,7 @@ async def fire_once(
         "items_count": len(items),
         "attribution_items_count": len(attribution_items),
         "proposal_items_count": len(proposal_items),
+        "demotion_items_count": len(demotion_items),
         "pending_items_count": len(pending_items),
         "radar_items_count": len(radar_items),
         "friction_items_count": len(friction_items),

@@ -89,10 +89,26 @@ export const feedApi = {
    * completion actually meant — sent only with the routine_match `correct`
    * action, and validated server-side against the vault's live routine items
    * (this layer never decides what is pickable).
+   *
+   * `contestedSection` (#72 item 4) is the capture-summary heading the operator
+   * tapped when contesting an attribution inference — sent only with the
+   * `contest` action, and likewise validated server-side (an unrecognised
+   * heading files the contest under `unknown` rather than refusing it).
+   *
+   * Both are trailing optionals rather than an options object because the
+   * signature mirrors the router's own keyword-only pair, and the two are never
+   * sent together — they belong to different actions on different kinds. A
+   * contest passes `undefined` for the target.
    */
-  act(id: string, actionId: string, correctionTarget?: string): Promise<FeedActResult> {
+  act(
+    id: string,
+    actionId: string,
+    correctionTarget?: string,
+    contestedSection?: string,
+  ): Promise<FeedActResult> {
     const body: Record<string, string> = { id, action_id: actionId };
     if (correctionTarget) body.correction_target = correctionTarget;
+    if (contestedSection) body.contested_section = contestedSection;
     return postJson<FeedActResult>('/api/feed/act', body);
   },
 };

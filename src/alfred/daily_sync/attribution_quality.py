@@ -94,6 +94,32 @@ DEMOTION_COUNTING_VIA = frozenset({"timeout_24h"})
 # stats rather than silently dropping out of the denominator.
 SECTION_UNKNOWN = "unknown"
 
+# --- when a section "stands out" (#72 item 5) --------------------------------
+# The surfacing line REPORTS. It never edits a prompt, never re-weights an
+# extraction, never files anything. That restraint is the whole design: the
+# thing a per-section rate is evidence for is a change to how a section is
+# extracted, and that is prompt-layer work with a human in the loop. An
+# automatic edit off this number would be the silent unsupervised mutation the
+# self-correcting standard explicitly rules out.
+#
+# Two gates, because a "standout" off thin data is worse than no line at all —
+# it names a section on no evidence, and the operator has no way to tell that
+# from a real signal.
+#
+#   1. A FLOOR. One contest is 100% of one contest. Below this many, the
+#      question "which section stands out" has no answer worth printing.
+#   2. A SHARE. A strict majority, not merely the largest bucket: with eight
+#      headings, the top of a flat spread is noise wearing a name.
+SECTION_STANDOUT_MIN_CONTESTS = 3
+SECTION_STANDOUT_SHARE = 0.5
+
+# ``unknown`` is a candidate for NEITHER — it is the absence of a section, not a
+# section — but it stays in the DENOMINATOR. That is deliberate and it is the
+# conservative direction: when most contests named no section, no section CAN
+# cross the share gate, and the honest answer is that the data does not support
+# naming one. Dropping unknown from the denominator instead would let three
+# sectioned contests out of thirty declare a standout.
+
 # ---------------------------------------------------------------------------
 # Successor pointers — where the two unbuilt halves of item 4 start.
 #
@@ -181,6 +207,28 @@ class AttributionQuality:
             return None
         return dict(self.contests_by_section)
 
+    def standout_section(self) -> tuple[str, int, int] | None:
+        """``(section, its_contests, total_contests)`` when one stands out.
+
+        ``None`` while the tap is dark, below the floor, or when no section
+        holds a strict majority — three different reasons for the same answer,
+        which is why :func:`render_section_line` distinguishes them in words
+        rather than printing nothing for all three.
+        """
+        counts = self.per_section_counts()
+        if counts is None:
+            return None
+        total = sum(counts.values())
+        if total < SECTION_STANDOUT_MIN_CONTESTS:
+            return None
+        named = {k: v for k, v in counts.items() if k != SECTION_UNKNOWN}
+        if not named:
+            return None
+        section, hits = max(named.items(), key=lambda kv: (kv[1], kv[0]))
+        if hits <= total * SECTION_STANDOUT_SHARE:
+            return None
+        return section, hits, total
+
     def to_dict(self) -> dict:
         # ILB: ``sections`` is null rather than absent while the tap is dark,
         # and ``section_tap_live`` says which of the two zero-shaped answers
@@ -193,6 +241,14 @@ class AttributionQuality:
             "demotion_contests": self.demotion_contests,
             "sections": self.per_section_counts(),
             "section_tap_live": self.section_tap_live,
+            # #72 item 5 — the standout, resolved here so the log carries the
+            # same answer the rendered line does. Null covers all three "no
+            # standout" reasons; the line below is what tells them apart, and
+            # the raw ``sections`` breakdown beside it is what a reader checks
+            # it against.
+            "standout_section": (
+                self.standout_section()[0] if self.standout_section() else None
+            ),
             "unreadable_rows": self.unreadable_rows,
             "undated_rows": self.undated_rows,
         }
@@ -275,8 +331,60 @@ def render_quality_line(stats: AttributionQuality) -> str:
     )
 
 
+def render_section_line(stats: AttributionQuality) -> str:
+    """One operator-facing line about the per-section breakdown. Never empty.
+
+    Four different sentences for what is, underneath, four different states —
+    and the reason they are four sentences rather than one absence is that the
+    zero-shaped ones are the states a reader is most likely to misread:
+
+      * TAP DARK — nobody has named a section yet. Says so, rather than
+        printing "no section stands out", which would claim the sections were
+        measured and found even. Same distinction ``per_section_counts``
+        refuses on, carried through to the words.
+      * BELOW THE FLOOR — some sections named, not enough to say anything.
+      * NO MAJORITY — measured, genuinely spread out. That IS the finding.
+      * A STANDOUT — names it, with the raw counts rather than a bare percent
+        so a small denominator is visible in the sentence that reports it.
+
+    It REPORTS. Acting on it — rewriting how a section is extracted — is
+    prompt-layer work with a human in the loop, deliberately not wired to this.
+    """
+    counts = stats.per_section_counts()
+    if counts is None:
+        return (
+            "Section breakdown: nothing yet — no contest has named a section "
+            "(tap one on the card to start the count)."
+        )
+    total = sum(counts.values())
+    if total == 0:
+        return "Section breakdown: no contests in the window."
+    standout = stats.standout_section()
+    if standout is None:
+        if total < SECTION_STANDOUT_MIN_CONTESTS:
+            return (
+                f"Section breakdown: {total} contested so far — too few to "
+                f"single out a section."
+            )
+        named = len([k for k in counts if k != SECTION_UNKNOWN])
+        return (
+            f"Section breakdown: no single section stands out "
+            f"({total} contests across {named} section"
+            f"{'' if named == 1 else 's'})."
+        )
+    section, hits, denom = standout
+    pct = round(100 * hits / denom)
+    return (
+        f"Section breakdown: {section} accounts for {hits} of {denom} "
+        f"contests ({pct}%)."
+    )
+
+
 __all__ = [
     "DEFAULT_WINDOW_DAYS",
+    "SECTION_STANDOUT_MIN_CONTESTS",
+    "SECTION_STANDOUT_SHARE",
+    "render_section_line",
     "DEMOTION_COUNTING_VIA",
     "QUALITY_EVENT",
     "SECTION_UNKNOWN",

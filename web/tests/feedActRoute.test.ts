@@ -319,3 +319,78 @@ describe('POST /api/feed/act — correction_target relay (#13)', () => {
     expect(opts.body).toEqual(correctBody);
   });
 });
+
+describe('POST /api/feed/act — contested_section relay (#72 item 4)', () => {
+  const contestBody = {
+    id: 'attribution:note/A.md|inf-1',
+    action_id: 'contest',
+    contested_section: 'Decisions',
+  };
+
+  it('relays contested_section through to the transport', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq(contestBody), res);
+    const [, path, opts] = mockCallTransportFeed.mock.calls[0];
+    expect(path).toBe('/feed/act');
+    expect(opts.body).toEqual(contestBody);
+  });
+
+  it('trims it — a padded heading must still match the server vocabulary, which\n     compares exactly (no casefold, no strip beyond the caller\'s own)', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq({ ...contestBody, contested_section: '  Decisions  ' }), res);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body.contested_section).toBe('Decisions');
+  });
+
+  it('omits the key entirely when absent — a card-level contest relays the\n     pre-#72 shape, byte for byte', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq({ id: contestBody.id, action_id: 'contest' }), res);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body).toEqual({ id: contestBody.id, action_id: 'contest' });
+    expect('contested_section' in opts.body).toBe(false);
+  });
+
+  it('rejects a non-string section at the body gate (400, nothing relayed)', async () => {
+    asOwner();
+    const { res, status } = mockRes();
+    await handler(postReq({ ...contestBody, contested_section: 17 }), res);
+    expect(status).toHaveBeenCalledWith(400);
+    expect(mockCallTransportFeed).not.toHaveBeenCalled();
+  });
+
+  it('rejects an over-long section rather than forwarding it', async () => {
+    asOwner();
+    const { res, status } = mockRes();
+    await handler(postReq({ ...contestBody, contested_section: 'x'.repeat(65) }), res);
+    expect(status).toHaveBeenCalledWith(400);
+    expect(mockCallTransportFeed).not.toHaveBeenCalled();
+  });
+
+  it('does NOT second-guess the vocabulary — an unrecognised heading relays and\n     the server files it under unknown. Re-checking the list here would put a\n     second gate on a value whose one authority is the Python renderer, so a\n     heading added there would 400 until someone remembered this file', async () => {
+    asOwner();
+    const { res, status } = mockRes();
+    await handler(postReq({ ...contestBody, contested_section: 'Made Up Heading' }), res);
+    expect(status).not.toHaveBeenCalledWith(400);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body.contested_section).toBe('Made Up Heading');
+  });
+
+  it('carries both optionals when both are somehow present — the additive build\n     has no arm that drops one', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq({ ...contestBody, correction_target: 'Tidy the workshop' }), res);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body).toEqual({ ...contestBody, correction_target: 'Tidy the workshop' });
+  });
+
+  it('still strips unknown fields alongside a valid section', async () => {
+    asOwner();
+    const { res } = mockRes();
+    await handler(postReq({ ...contestBody, evil: 'x', evidence: { secret: 1 } }), res);
+    const [, , opts] = mockCallTransportFeed.mock.calls[0];
+    expect(opts.body).toEqual(contestBody);
+  });
+});

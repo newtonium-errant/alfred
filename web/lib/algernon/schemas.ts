@@ -335,6 +335,13 @@ export type ShortcutIngestBody = z.infer<typeof shortcutIngestBodySchema>;
 // it to the resolver, which refuses anything that isn't a live routine item.
 // One validation site, not two that can drift.
 export const FEED_CORRECTION_TARGET_MAX_CHARS = 500;
+// #72 item 4 — bound for the tapped summary heading. Sized off the vocabulary
+// rather than picked round: the field only ever legitimately carries one of the
+// eight `CONTEST_SECTIONS` headings, so anything materially longer is a client
+// that has stopped speaking the contract and should be refused here rather than
+// relayed. Headroom over the longest heading leaves room for a ninth without a
+// schema change.
+export const CONTEST_SECTION_MAX_CHARS = 64;
 export const feedActBodySchema = z.object({
   id: z.string().trim().min(1).max(512),
   action_id: z.string().trim().min(1).max(64),
@@ -343,6 +350,19 @@ export const feedActBodySchema = z.object({
     .trim()
     .min(1)
     .max(FEED_CORRECTION_TARGET_MAX_CHARS)
+    .optional(),
+  // #72 item 4 — the summary heading the operator tapped when contesting an
+  // attribution inference. Bounded like every other relayed string; the VALUE
+  // is not validated here. The transport normalises an unrecognised heading to
+  // "unknown" server-side (`_normalise_contested_section`), and duplicating
+  // that vocabulary check at the BFF would put a second gate on a value whose
+  // one authority is the Python renderer — a heading added there would then be
+  // refused here until someone remembered this file.
+  contested_section: z
+    .string()
+    .trim()
+    .min(1)
+    .max(CONTEST_SECTION_MAX_CHARS)
     .optional(),
 });
 
