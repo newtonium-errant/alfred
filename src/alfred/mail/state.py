@@ -38,7 +38,23 @@ class State:
 
 class StateManager:
     def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
+        # ABSOLUTE AT CONSTRUCTION (#53). ``save()`` does a
+        # ``mkdir(parents=True)`` + write, so a relative path here means the
+        # destination is whatever ``cwd`` happens to be AT WRITE TIME — not at
+        # config time. That is a live hazard rather than a tidiness one,
+        # because the writer is a daemon thread: ``orchestrator
+        # ._maybe_start_mail_fetch_loop`` starts ``mail-fetch`` as
+        # ``daemon=True`` and it ticks forever. Under the test suite that
+        # thread OUTLIVES the test that started it and keeps writing against
+        # the process cwd, materialising ``data/mail_state.json`` in whatever
+        # tree the suite is running from — the debris that produced two prior
+        # incidents and reviewer-60's near-false-BLOCK on the #57 gate (two
+        # phantom failures from a concurrent run).
+        #
+        # Resolving HERE pins the destination to the moment the manager was
+        # constructed, so a later cwd change (or a thread still ticking after
+        # its test unwound) can no longer redirect the write somewhere new.
+        self.path = Path(path).resolve()
         self.state = State()
 
     def load(self) -> State:

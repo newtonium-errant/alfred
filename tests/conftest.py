@@ -794,3 +794,181 @@ def pytest_terminal_summary(terminalreporter, *a, **kw):  # noqa: ARG001
     if not stray and not connected_any and not dns_tests and not _unverified_tests:
         w("")
         w("suite egress guard: ACTIVE, no non-loopback traffic observed.")
+
+    # --- debris guard (#59) — see the section at the end of this file -------
+    debris = _debris_compute()
+    w("")
+    if debris["leaked"]:
+        w("suite debris guard: the run WROTE INTO THE TREE. Files that "
+          "materialised and are not allowlisted:")
+        for path in debris["leaked"]:
+            w(f"  {path}")
+        w("")
+        w("  Each is a writer resolving a path against the process cwd instead "
+          "of its configured")
+        w("  state dir — the #53 shape. Fix it at the source (anchor the path, "
+          "derive the default")
+        w("  from the instance's data dir); allowlist it in _DEBRIS_ALLOWLIST "
+          "only with a boarded")
+        w("  follow-up. The run is failed: debris caused two phantom failures "
+          "on the #57 gate.")
+    else:
+        # ILB: a guard that is silent when healthy is indistinguishable from a
+        # guard that never installed — the same argument the egress guard makes.
+        #
+        # NOT "tree clean". That would be false in every run today: nine
+        # allowlisted leakers DO materialise, so a healthy run still ends with
+        # files in the tree. An observability line that overstates the state it
+        # reports is the failure this guard exists to catch, and it does not get
+        # an exemption for being the guard's own sentence.
+        w(f"suite debris guard: ACTIVE, no new debris outside the allowlist "
+          f"({debris['watched']} watched, "
+          f"{len(debris['allowed'])} allowlisted).")
+
+
+# ---------------------------------------------------------------------------
+# Suite debris guard (#59) — snapshot the tree, then name what appeared.
+# ---------------------------------------------------------------------------
+#
+# Sibling of the egress guard above, and the same argument: the suite must not
+# write into the tree it runs from, historically it did, and every leaking run
+# PASSED. A leak has no natural failure signal, so it needs a dedicated one.
+#
+# The cost was not hypothetical. Debris from a concurrent run produced two
+# phantom failures on the #57 gate and nearly cost a false BLOCK (#53), and the
+# suite has been worktree-only ever since to keep the main repo clean — a
+# workaround for a bug rather than a fix.
+#
+# WHY A SNAPSHOT RATHER THAN A WATCHER. A watcher would have to hook every
+# write path in the process (open, os.replace, mkdir, C extensions, threads
+# that outlive their test) and would still miss a subprocess. Comparing the
+# tree before and after is oblivious to HOW a file arrived, which is the
+# property that matters: the guard cannot be outrun by a writer it did not
+# anticipate. It has TWO blind spots, both named here rather than left to be
+# discovered:
+#
+#   * A file created AND deleted within the run is invisible. That one is
+#     fine — it left nothing behind.
+#   * A writer that MODIFIES a file which already existed is invisible too:
+#     this compares the SET of paths, and rewriting a tracked file does not
+#     change that set. Not hypothetical — it is exactly the remembered "the
+#     suite touched the main-repo .env" case, which is therefore NOT covered
+#     by this guard. Catching it needs content hashing of the pre-existing
+#     tree: a heavier, separate detector.
+#
+# WHAT IT WATCHES: the tree the suite runs from. Anything present at session
+# start is ignored, so a dirty working tree never trips it — only files that
+# MATERIALISED during the run count.
+
+_DEBRIS_ROOT = Path(__file__).resolve().parent.parent
+# Walk-time skips: build/cache noise that is expected, plus directories whose
+# size would make the walk a cost of its own.
+_DEBRIS_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", ".pytest_cache", "node_modules",
+    ".venv", ".mypy_cache", ".ruff_cache", ".claude",
+})
+
+# KNOWN UNFIXED LEAKERS — each is a #53-shaped bug (a cwd-relative default that
+# resolves against the process cwd instead of the instance's configured data
+# dir). They are allowlisted so the guard can go live NOW and catch the NEXT
+# one, rather than waiting on a sweep. Derived empirically (2026-08-10) by
+# running the full suite in a pristine clone and diffing the tree — not from a
+# remembered list.
+#
+# Every entry is a debt with a name. Removing an entry is the definition of
+# done for its follow-up; adding one needs the same justification these had.
+#
+#   data/canonical_audit.jsonl            transport/config.py  -> #74
+#   data/feed_items.jsonl,  .lock         feed store default   -> #74
+#   data/scribe/scribe/*  (4 files)       scribe config default (note the
+#                                         doubled segment — a joined path bug
+#                                         in its own right)    -> #74
+#   data/voice_calibration/events.jsonl   web/config.py:208 +
+#                                         hardcoded fallbacks at
+#                                         routes_voice.py:490,646  -> #74
+#
+#   data/mail_state.json                  RESIDUE of #53              -> #75
+#
+# The mail entry needs its own note, because it is the item this same lane
+# claimed to fix and the claim was only PARTLY true — this guard is what caught
+# that, on its first full-suite run.
+#
+# #53 did fix two real halves: the path is now absolute at construction (a
+# daemon thread can no longer be redirected by a later cwd change), and
+# ``load_from_unified`` derives the default from the instance's ``logging.dir``.
+# What survives is the DATACLASS default — ``MailConfig.state_path`` is still
+# the cwd-relative ``"./data/mail_state.json"``, so a bare ``MailConfig()``
+# built in a test still points at the tree.
+#
+# It does not reproduce from any single test file. Measured: ``tests/mail`` is
+# clean alone, ``tests/orchestrator`` and ``tests/test_orchestrator_spawn.py``
+# are clean alone, every ``tests/mail/test_*.py`` paired with spawn is clean —
+# but ``tests/mail`` + the orchestrator files together leak it. That is a
+# cross-file interaction (a monkeypatch that stops covering ``fetch_all`` once
+# enough of the module graph is imported), and isolating it is a bisect, not a
+# one-liner. Allowlisted so the suite stays GREEN and the debt stays NAMED,
+# rather than left red overnight or quietly dropped.
+_DEBRIS_ALLOWLIST = frozenset({
+    "data/mail_state.json",
+    "data/canonical_audit.jsonl",
+    "data/feed_items.jsonl",
+    "data/feed_items.lock",
+    "data/scribe/scribe/negation_candidates.jsonl",
+    "data/scribe/scribe/.negation_candidates.jsonl.lock",
+    "data/scribe/scribe/notegen_edit.jsonl",
+    "data/scribe/scribe/.notegen_edit.lock",
+    "data/voice_calibration/events.jsonl",
+})
+
+_debris_before: set[str] = set()
+_debris_state: dict = {"computed": False, "leaked": [], "allowed": [], "watched": 0}
+
+
+def _debris_snapshot() -> set[str]:
+    """Repo-relative paths of every file under the tree, minus the skip dirs.
+
+    ``os.walk`` does not follow symlinks by default, which is what keeps a
+    symlinked ``web/node_modules`` from turning this into a slow walk.
+    """
+    seen: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(_DEBRIS_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _DEBRIS_SKIP_DIRS]
+        base = Path(dirpath)
+        for name in filenames:
+            if name.endswith(".pyc"):
+                continue
+            try:
+                seen.add(str((base / name).relative_to(_DEBRIS_ROOT)))
+            except ValueError:  # pragma: no cover - defensive
+                continue
+    return seen
+
+
+def pytest_sessionstart(session):  # noqa: ARG001
+    global _debris_before
+    _debris_before = _debris_snapshot()
+
+
+def _debris_compute() -> dict:
+    """Diff the tree once; both the report and the exit status read this."""
+    if _debris_state["computed"]:
+        return _debris_state
+    appeared = _debris_snapshot() - _debris_before
+    _debris_state.update(
+        computed=True,
+        watched=len(_debris_before),
+        allowed=sorted(p for p in appeared if p in _DEBRIS_ALLOWLIST),
+        leaked=sorted(p for p in appeared if p not in _DEBRIS_ALLOWLIST),
+    )
+    return _debris_state
+
+
+def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
+    """Fail the run when an unallowlisted file materialised.
+
+    Set on the session rather than raised: the tests themselves passed, and
+    reporting this as a test failure would pin it on whichever test happened to
+    run last rather than on the writer.
+    """
+    if _debris_compute()["leaked"] and session.exitstatus == 0:
+        session.exitstatus = 1

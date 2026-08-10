@@ -128,8 +128,22 @@ class MailConfig:
 
 
 def load_from_unified(raw: dict) -> MailConfig:
-    """Build MailConfig from the unified config dict."""
+    """Build MailConfig from the unified config dict.
+
+    #53 — the ``data/`` defaults derive from the instance's CONFIGURED data
+    directory (``logging.dir``) instead of each carrying its own hardcoded
+    ``./data``. Same precedent as ``drip/config.py``, and the reason is the
+    CLAUDE.md state-path rule: a per-instance default that ignores the
+    instance's own data dir is how one instance's writer lands in another's
+    store. An explicit ``mail.state.path`` still wins outright.
+    """
     section = raw.get("mail", {})
+    # The instance's data dir, same source drip reads. Kept relative if the
+    # operator wrote it relative — production runs with cwd = WorkingDirectory,
+    # so ``./data`` resolves exactly where it always did. What changes is that
+    # the value is now SINGLE-SOURCED rather than duplicated per module.
+    log_raw = raw.get("logging") or {}
+    data_dir = str(log_raw.get("dir") or "./data") if isinstance(log_raw, dict) else "./data"
     accounts = []
     for acc in section.get("accounts", []):
         accounts.append(MailAccount(
@@ -148,7 +162,7 @@ def load_from_unified(raw: dict) -> MailConfig:
         enabled=bool(fetch_raw.get("enabled", False)),
         poll_interval=fetch_raw.get("poll_interval"),
         max_per_run=fetch_raw.get("max_per_run"),
-        shadow_dir=fetch_raw.get("shadow_dir", "./data/mail_shadow"),
+        shadow_dir=fetch_raw.get("shadow_dir") or f"{data_dir}/mail_shadow",
     )
     # Idle-tick — defaulted-on; partial dict merges over dataclass default.
     idle_raw = section.get("idle_tick") or {}
@@ -165,7 +179,7 @@ def load_from_unified(raw: dict) -> MailConfig:
     return MailConfig(
         accounts=accounts,
         poll_interval=section.get("poll_interval", 300),
-        state_path=section.get("state", {}).get("path", "./data/mail_state.json"),
+        state_path=(section.get("state", {}) or {}).get("path") or f"{data_dir}/mail_state.json",
         inbox_dir=section.get("inbox_dir", "inbox"),
         idle_tick=idle_tick,
         fetch=fetch_cfg,
