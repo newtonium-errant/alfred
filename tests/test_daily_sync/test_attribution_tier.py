@@ -708,6 +708,37 @@ def test_sweep_auto_confirms_regardless_of_any_ui_surface(tmp_path: Path) -> Non
     assert _entries(vault, "note/A.md")[0].confirmed_by_andrew is True
 
 
+def test_an_old_web_bundle_can_still_ack_the_demoted_card(tmp_path: Path) -> None:
+    """Half-deploy order A — Python live, the OLD web bundle still cached on the
+    phone. That bundle has no contest door; its only affordance on an FYI row is
+    Ack, which POSTs the universal ``ack``.
+
+    Two things must hold. It must SUCCEED — the universal FYI-ack gate admits it
+    precisely because the item is now MODE_FYI, so the demotion is what makes the
+    old button keep working. And it must NOT confirm the marker: an ack is "seen",
+    not "endorsed", and quietly converting one into the other would manufacture
+    exactly the operator endorsement the confirmed_via split exists to keep
+    honest. The entry stays unconfirmed and ages out through the sweep instead.
+    """
+    cfg = _ds_config(tmp_path)
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    vault = _make_vault(tmp_path)
+    _seed_record(vault, "note/A.md", marker_id="ack1", date=_iso(NOW - timedelta(hours=2)))
+    item = _attribution_item("ack1", record_path="note/A.md")
+    fid = _publish(store, item)
+    _seed_batch(cfg, [item])
+
+    result = act(
+        fid, "ack", feed_store=store, config=cfg, vault_path=vault,
+        instance_name="salem", instance_scope="talker",
+    )
+
+    assert result.ok
+    entry = _entries(vault, "note/A.md")[0]
+    assert entry.confirmed_by_andrew is False
+    assert entry.confirmed_via is None
+
+
 def test_an_unswept_fyi_item_simply_sits_unconfirmed(tmp_path: Path) -> None:
     """Half-deploy order B — web live, sweep not yet running. The FYI card
     renders and the entry stays unconfirmed. Harmless: no data is lost and no

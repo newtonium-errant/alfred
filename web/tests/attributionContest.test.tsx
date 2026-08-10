@@ -16,6 +16,7 @@ vi.mock('../lib/algernon/feed', () => ({ feedApi: { act: mockAct, list: vi.fn() 
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { FeedRow } from '../components/feed/FeedRow';
 import { CONTEST_ACTION, contestableItem } from '../lib/algernon/feedConstants';
+import { evidenceRows } from '../lib/algernon/feedEvidence';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
 
@@ -70,6 +71,20 @@ describe('contestableItem — which rows offer the door', () => {
 describe('the wire value', () => {
   it('is the LITERAL string "contest" — the backend capability ceiling admits\n     that exact action_id and nothing else, so this is pinned against the\n     literal rather than against CONTEST_ACTION. Asserting the constant against\n     itself is a tautology: renaming the value would move both sides of the\n     comparison together and the button would 400 in the operator\'s hand with\n     every test still green. A Python-side drift pin reads this same constant\n     out of the TS source and holds it against the router\'s ceiling.', () => {
     expect(CONTEST_ACTION).toBe('contest');
+  });
+});
+
+describe('the contested flag is plumbing, not a card row', () => {
+  it('never renders as an evidence row in either state', () => {
+    // `coerceEvidenceValue(false)` is the STRING "false" — truthy, so it clears
+    // the empty-value filter. Without the HIDDEN_KEYS entry, EVERY uncontested
+    // attribution card carries a "Contested: false" row that tells the operator
+    // nothing. Verified against the real helper rather than reasoned about.
+    const keys = (c: boolean) =>
+      evidenceRows({ record_path: 'note/A.md', marker_id: 'inf-1', contested: c })
+        .map((r) => r.key);
+    expect(keys(false)).toEqual(['record_path', 'marker_id']);
+    expect(keys(true)).toEqual(['record_path', 'marker_id']);
   });
 });
 
