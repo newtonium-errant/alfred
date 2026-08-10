@@ -146,6 +146,33 @@ def test_raising_the_card_moves_no_tier_and_touches_nothing_else(
     assert (feed[0].mode, feed[0].attention) == KIND_DEFAULTS["attribution"]
 
     # 2. The ONLY thing that appeared is the proposal queue.
+    #
+    # WHAT THIS DOES NOT COVER, stated so the next reader does not inherit the
+    # assumption that it does. There is a THIRD evasion shape: a write OUTSIDE
+    # tmp_path, to a hardcoded path (e.g. a literal "data/feed_tier_overrides
+    # .json" relative to the run's cwd). Both assertions above are blind to it —
+    # the first reads the configured path, the second only sees tmp_path.
+    #
+    # It is covered, but by the SUITE DEBRIS GUARD, not by this pin: that write
+    # materialises a file inside the repo tree and the guard fails the run
+    # (verified — exit 1 mutated vs exit 0 clean, same selection). The coverage
+    # is real and it lives somewhere else.
+    #
+    # Deliberately NOT closed here, per the #72 gate ruling. A pin can only
+    # catch a hardcoded path by naming that path in advance, which means
+    # guessing which wrong path a future bug picks — and a pin built on a
+    # correct guess reads afterwards like proof that the whole class is
+    # covered. That illusion is worse than the gap: the debris guard catches
+    # the class without guessing any member of it.
+    #
+    # RE-LOOK WHEN #74 LANDS. What makes this shape dangerous TODAY is that on
+    # a default config the hardcoded literal and the resolved path COINCIDE
+    # (corpus_path defaults cwd-relative under ./data, and both #72 paths derive
+    # from its parent) — so such a write is a genuine silent flip, not just
+    # debris. Once #74 anchors those literals to a per-instance data dir the
+    # two stop coinciding, and the same bug degrades to a write nothing reads.
+    # The residual changes shape at that point and this comment should be
+    # re-read rather than trusted.
     created = {p for p in tmp_path.rglob("*") if p.is_file()} - before
     assert created == {Path(cfg.attribution.resolved_demotion_queue_path())}, (
         f"the trigger wrote something besides the proposal queue: {created}"
