@@ -815,9 +815,15 @@ def pytest_terminal_summary(terminalreporter, *a, **kw):  # noqa: ARG001
     else:
         # ILB: a guard that is silent when healthy is indistinguishable from a
         # guard that never installed — the same argument the egress guard makes.
-        w(f"suite debris guard: ACTIVE, tree clean "
-          f"({debris['watched']} files watched, "
-          f"{len(debris['allowed'])} known leaker(s) allowlisted).")
+        #
+        # NOT "tree clean". That would be false in every run today: nine
+        # allowlisted leakers DO materialise, so a healthy run still ends with
+        # files in the tree. An observability line that overstates the state it
+        # reports is the failure this guard exists to catch, and it does not get
+        # an exemption for being the guard's own sentence.
+        w(f"suite debris guard: ACTIVE, no new debris outside the allowlist "
+          f"({debris['watched']} watched, "
+          f"{len(debris['allowed'])} allowlisted).")
 
 
 # ---------------------------------------------------------------------------
@@ -838,9 +844,17 @@ def pytest_terminal_summary(terminalreporter, *a, **kw):  # noqa: ARG001
 # that outlive their test) and would still miss a subprocess. Comparing the
 # tree before and after is oblivious to HOW a file arrived, which is the
 # property that matters: the guard cannot be outrun by a writer it did not
-# anticipate. Its blind spot is the honest inverse — a file created AND
-# deleted within the run is invisible, and that is fine, because it left
-# nothing behind.
+# anticipate. It has TWO blind spots, both named here rather than left to be
+# discovered:
+#
+#   * A file created AND deleted within the run is invisible. That one is
+#     fine — it left nothing behind.
+#   * A writer that MODIFIES a file which already existed is invisible too:
+#     this compares the SET of paths, and rewriting a tracked file does not
+#     change that set. Not hypothetical — it is exactly the remembered "the
+#     suite touched the main-repo .env" case, which is therefore NOT covered
+#     by this guard. Catching it needs content hashing of the pre-existing
+#     tree: a heavier, separate detector.
 #
 # WHAT IT WATCHES: the tree the suite runs from. Anything present at session
 # start is ignored, so a dirty working tree never trips it — only files that
