@@ -73,16 +73,29 @@ scanner directly rather than against ``work()``.
 **Known residuals, deliberately not closed.** Both are the same shape as the
 bug above — scanner-visible but needle-invisible — and both are documented
 rather than fixed because the fix costs over-match surface on 758 IRREVERSIBLE
-removals and the measured exposure is nil. Figures are from the vault snapshot,
-counted with the scanner's own ``extract_wikilinks``/``WIKILINK_RE`` over 8,614
-files: 61,508 wikilink occurrences, 52,813 unique (file, target) pairs.
+removals and the measured exposure is nil.
+
+Figures are re-measured with the POST-#61 instrument, which matters: the
+scanner's document seam now composes ``mask_code_regions`` with
+``extract_wikilinks``, so counting with the bare primitive would overstate what
+the scanner actually reports. Over 8,614 files: **60,939 wikilink occurrences**
+(569 excluded as fenced or inline-code), 52,747 unique (file, target) pairs.
 
 1. **Aliased links.** ``[[target|display]]`` is normalized by the scanner to
-   ``target`` but is not matched by ``[[target]]``. Measured: **8 occurrences,
-   0.013%** — and an item only matters here if it is ALSO broken and ALSO on the
-   frozen work-list, so the expected count across the 1,283 is approximately
-   zero. Closing it means widening the matcher to swallow an optional ``|…``
-   tail.
+   ``target`` but is not matched by ``[[target]]``. Measured post-#61: **6
+   occurrences** (8 raw, 2 of them inside code spans and therefore no longer
+   scanner-visible).
+
+   The material line is stronger than "approximately zero", so it is worth
+   stating exactly: aliased **and** broken **and** still scanner-visible after
+   #69 is **ZERO**. Both broken aliased links in the vault —
+   ``[[person/Alice|Alice]]`` and ``[[link2|alias]]`` — sit inside code spans,
+   so the fence guard already excludes them from any work-list and from the
+   mutation path. There is nothing for this residual to reach.
+
+   Closing it anyway means widening the matcher to swallow an optional ``|…``
+   tail. Re-run the measurement before doing so; the conclusion is downstream
+   of a count that a future vault can move.
 2. **Inner-padded links.** ``extract_wikilinks`` ends in ``.strip()``
    (``janitor/parser.py``), so ``[[ target ]]`` normalizes to ``target`` and is
    scanner-visible, while the needle ``[[target]]`` misses the padding.
@@ -93,8 +106,10 @@ Revisit either if a future work-list is built over a vault where the shape is
 common — the measurement above is the thing to re-run, not the conclusion.
 
 For scale on why the whitespace tolerance itself was worth the change:
-**28,930 of the 61,508 occurrences (47%) are wrapped** across physical lines.
-Wrapping is not an edge case in this vault, it is the plurality.
+**28,929 of the 60,939 occurrences (47.5%) are wrapped** across physical lines.
+Wrapping is not an edge case in this vault — it is nearly half of all
+occurrences. (Not "the plurality": at 47.5% the unwrapped majority is larger,
+so that word overstated it.)
 """
 
 from __future__ import annotations
