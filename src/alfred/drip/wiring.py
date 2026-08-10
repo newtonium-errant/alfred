@@ -22,20 +22,15 @@ import structlog
 
 from .brief_line import CampaignProgress
 from .campaigns import GmailBacklogCampaign, Link001Campaign
-from .config import CampaignConfig, DripConfig
+# DripConfigError moved to .config in #66 so `state` can raise it without an
+# import cycle (wiring imports state). Re-exported here — and listed in
+# __all__ — because `from .wiring import DripConfigError` is the established
+# import across cli.py, brief/daemon.py and the drip tests.
+from .config import CampaignConfig, DripConfig, DripConfigError
 from .runner import STOP_DISABLED
 from .state import DONE, IN_FLIGHT, CampaignState
 
 log = structlog.get_logger(__name__)
-
-
-class DripConfigError(ValueError):
-    """A campaign is enabled but cannot be built from its config.
-
-    Loud on purpose. The alternative — skipping an unbuildable campaign — is a
-    campaign that is configured, believed to be draining, and silently doing
-    nothing, which is the failure this whole feature is shaped against.
-    """
 
 
 def load_worklist_file(path: Path | str) -> list[str]:
