@@ -18,12 +18,20 @@ export function PushToggle() {
         <p className="font-semibold text-honeydew-700">Push notifications</p>
         <p className="text-honeydew-600">
           {status === 'on'
-            ? 'On — Algernon rings you when something needs a decision.'
+            // #62 rider (operator-ruled 2026-08-07). The old line —
+            // "rings you when something needs a decision" — promised far more
+            // than the push policy delivers. Under the strict policy ONLY
+            // override-list sender highs ring, and that policy STAYS strict per
+            // the operator philosophy memo. So the copy moves to meet the
+            // behaviour, not the other way round: a toggle that overstates its
+            // reach teaches the operator to expect rings that will never come,
+            // and then to distrust the ones that do.
+            ? 'On — rings only for urgent email from senders on your override list.'
             : status === 'denied'
               ? 'Blocked in your browser settings. Re-allow notifications for this site to turn them on.'
               : status === 'error'
                 ? 'Something went wrong — try again.'
-                : 'Get a nudge when something needs you, even with the app closed.'}
+                : 'Ring for urgent email from senders on your override list, even with the app closed.'}
         </p>
       </div>
       {status !== 'denied' && (

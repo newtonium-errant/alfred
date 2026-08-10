@@ -2,6 +2,12 @@ import { useCallback, useRef, useState } from 'react';
 import { feedApi, type FeedItem } from '../../lib/algernon/feed';
 import { ApiError } from '../../lib/algernon/http';
 import { RING_ACTION_DONE, RING_ACTION_UNDO, ringItemDone } from '../../lib/algernon/rings';
+import {
+  ACT_LANDED_MESSAGE,
+  isInconclusive,
+  supersede,
+  verifyActLanded,
+} from '../../lib/algernon/actConfirm';
 
 // The rings-panel completion state machine (Phase C DONE path). DOM-free + driven
 // by a mocked feedApi so the per-lane optimistic flip, the ActResult status map,
@@ -18,6 +24,8 @@ interface Override {
   done: boolean;
   busy: boolean;
   error?: string;
+  /** A non-failure explanation — the act landed, the reply did not (#62). */
+  notice?: string;
 }
 
 export interface UseRingCompletionOptions {
@@ -31,10 +39,21 @@ export interface UseRingCompletionResult {
   busy: (id: string) => boolean;
   /** The last error message for this item, or null. */
   errorFor: (id: string) => string | null;
+  /** A non-failure notice (the act landed late), or null. */
+  noticeFor: (id: string) => string | null;
   /** Complete an item (✓). */
   complete: (item: FeedItem) => void;
   /** Undo a completed item. */
   undo: (item: FeedItem) => void;
+  /**
+   * Retire overrides that a fresh render has answered (#62).
+   *
+   * Call with each feed render. An override is a record of "what happened to
+   * my tap"; once the server has answered that question, keeping it means
+   * preferring a stale opinion over a fact — which is what held a 12-hour-old
+   * failure line on screen after the act had committed.
+   */
+  reconcile: (items: FeedItem[]) => void;
 }
 
 // Human message for a failed act — mirrors the deck's routeError taxonomy so the
@@ -102,13 +121,37 @@ export function useRingCompletion(opts: UseRingCompletionOptions = {}): UseRingC
                 : optimisticDone;
           setOverrides((prev) => ({ ...prev, [item.id]: { done: nowDone, busy: false } }));
         })
-        .catch((e: unknown) => {
+        .catch(async (e: unknown) => {
           if (e instanceof ApiError && e.status === 401) {
             onAuthExpired?.();
             // Clear busy but keep the pre-act state (the page redirects on 401).
             setOverrides((prev) => ({ ...prev, [item.id]: { done: revertDone, busy: false } }));
             return;
           }
+
+          // VERIFY BEFORE DECLARING FAILURE (#62). Only for an INCONCLUSIVE
+          // failure — a timeout or a dropped connection, where the act may well
+          // have committed and we simply never heard. A 4xx/5xx is a real answer
+          // and needs no second opinion.
+          if (isInconclusive(e)) {
+            const outcome = await verifyActLanded(item.id, (fresh) => ringItemDone(fresh) === optimisticDone);
+            if (outcome === 'landed') {
+              // It worked. Say so, and say why the operator saw a pause — the
+              // alternative is telling them their action failed when it did not,
+              // which is the incident this whole path exists to prevent.
+              setOverrides((prev) => ({
+                ...prev,
+                [item.id]: { done: optimisticDone, busy: false, notice: ACT_LANDED_MESSAGE },
+              }));
+              return;
+            }
+            // 'not_landed' and 'unknown' both fall through to the error copy.
+            // They are NOT merged into one meaning: the message promises the
+            // next sync will reconcile, which is now true either way, and
+            // claiming a definite failure we did not observe would be the
+            // original bug wearing new words.
+          }
+
           setOverrides((prev) => ({ ...prev, [item.id]: { done: revertDone, busy: false, error: messageFor(e) } }));
         });
     },
@@ -125,8 +168,22 @@ export function useRingCompletion(opts: UseRingCompletionOptions = {}): UseRingC
     },
     [overrides],
   );
+  const reconcile = useCallback(
+    (items: FeedItem[]) => {
+      setOverrides((prev) =>
+        // The question an override answers is "is this item done?", so a
+        // render whose server state already AGREES with the override has
+        // answered it — and a render that disagrees is newer truth. Either
+        // way the override has nothing left to add.
+        supersede(prev, items, () => true),
+      );
+    },
+    [setOverrides],
+  );
+
   const busy = useCallback((id: string) => overrides[id]?.busy ?? false, [overrides]);
   const errorFor = useCallback((id: string) => overrides[id]?.error ?? null, [overrides]);
+  const noticeFor = useCallback((id: string) => overrides[id]?.notice ?? null, [overrides]);
 
-  return { effectiveDone, busy, errorFor, complete, undo };
+  return { effectiveDone, busy, errorFor, noticeFor, complete, undo, reconcile };
 }

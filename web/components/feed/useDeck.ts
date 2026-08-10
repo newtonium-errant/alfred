@@ -16,6 +16,7 @@ import {
   type Verdict,
 } from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
+import { ACT_UNCONFIRMED_MESSAGE, isInconclusive } from '../../lib/algernon/actConfirm';
 
 // The deck state machine — deliberately DOM-free so the intricate parts (the
 // delayed act, the two-step heavy confirm, snooze, undo, and error routing) are
@@ -164,9 +165,11 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
           setBanner("The deck can't reach Algernon right now — this is a server-side issue, not your session.");
           return;
         }
-        if (e.status === 504 || e.code === 'timeout' || e.code === 'gateway_timeout' || e.code === 'network_error') {
-          // NO retry — the act may have landed; the next list poll reconciles.
-          setToast({ message: "That didn't confirm in time — the next sync will reconcile it.", canUndo: false });
+        // #62: shared predicate, one owner. The act MAY have landed — the deck's
+        // own reconciliation is its list poll plus the resume refetch, and the
+        // message below is only true because those now actually run.
+        if (isInconclusive(e)) {
+          setToast({ message: ACT_UNCONFIRMED_MESSAGE, canUndo: false });
           return;
         }
         setToast({ message: e.detail || e.code || 'That action failed.', canUndo: false });

@@ -7,6 +7,7 @@ import { FeedRow } from '../components/feed/FeedRow';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
+import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
 import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { useSnooze } from '../components/feed/useSnooze';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
@@ -39,22 +40,37 @@ export default function FeedPage() {
     }
   }, [sessionLoading, user, unauthenticated, router]);
 
+  // Hoisted out of the mount effect so the RESUME path can call it too (#62).
+  // A load that only exists inside useEffect is a load that only ever runs at
+  // mount — and an iOS PWA resumes without mounting.
+  const loadFeed = useCallback(async () => {
+    try {
+      const res = await feedApi.list({ state: 'open' });
+      setItems(res.items);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        setUnauthenticated(true);
+        return;
+      }
+      setError('Could not load the feed. Try refreshing.');
+    }
+  }, []);
+
   useEffect(() => {
     if (!authed) return;
     let cancelled = false;
     void (async () => {
-      try {
-        const res = await feedApi.list({ state: 'open' });
-        if (cancelled) return;
-        setItems(res.items);
-      } catch (e) {
-        if (cancelled) return;
-        if (e instanceof ApiError && e.status === 401) {
-          setUnauthenticated(true);
-          return;
-        }
-        setError('Could not load the feed. Try refreshing.');
+      const res = await feedApi.list({ state: 'open' }).catch((e: unknown) => e);
+      if (cancelled) return;
+      if (res instanceof ApiError && res.status === 401) {
+        setUnauthenticated(true);
+        return;
       }
+      if (res instanceof Error) {
+        setError('Could not load the feed. Try refreshing.');
+        return;
+      }
+      setItems((res as { items: FeedItem[] }).items);
     })();
     return () => {
       cancelled = true;
@@ -65,6 +81,23 @@ export default function FeedPage() {
   const board = useFeedBoard({ items: items ?? [], onAuthExpired });
   // ONE completion implementation, shared with the rings panel (never a second).
   const completion = useRingCompletion({ onAuthExpired });
+
+  // #62 defect (3): an iOS PWA resumes with its heap intact — same tree, same
+  // rows, no mount and no fetch. Without this a deck reopened in the morning
+  // renders last night's DOM, which is exactly what showed a completed item as
+  // pending twelve hours after it committed.
+  useResumeRefetch(() => { if (authed) void loadFeed(); });
+
+  // #62 defect (2): retire overrides the server has now answered. An override
+  // records what happened to a tap; once a render carries the server's own
+  // answer, keeping it means preferring a stale opinion over a fact.
+  useEffect(() => {
+    if (items) completion.reconcile(items);
+    // `completion` is intentionally not a dep: reconcile is stable and
+    // including the hook result would re-run this on every override change,
+    // which is the loop it exists to break.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items]);
   // The C2 accept hook — drives a SUGGESTED slot row's [Accept] + optimistic flip.
   const slotAccept = useSlotAccept({ onAuthExpired });
   // The #14 defer verb for the worklist rows — the same four durations the

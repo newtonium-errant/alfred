@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { feedApi, type FeedItem } from '../../lib/algernon/feed';
 import { ApiError } from '../../lib/algernon/http';
+import { ACT_UNCONFIRMED_MESSAGE, isInconclusive } from '../../lib/algernon/actConfirm';
 
 // The C2 slot-ACCEPT action + optimistic committed flip. Separate from
 // useRingCompletion (done / undo_done) because accept is a distinct verb whose
@@ -56,8 +57,11 @@ function messageFor(e: unknown): string {
     ) {
       return "Can't reach Algernon right now — this is server-side, not your session.";
     }
-    if (e.status === 504 || e.code === 'timeout' || e.code === 'gateway_timeout' || e.code === 'network_error') {
-      return "That didn't confirm in time — the next sync will reconcile it.";
+    // #62: ONE owner of "did the server actually answer us". The four hooks
+    // each carried their own copy of this predicate, which is precisely why a
+    // single incident implicated all four.
+    if (isInconclusive(e)) {
+      return ACT_UNCONFIRMED_MESSAGE;
     }
     if (e.status === 400 || e.code === 'invalid_action') {
       // The provenance guard: accept on a non-candidate (already committed), or an

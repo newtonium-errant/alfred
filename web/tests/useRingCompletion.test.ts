@@ -4,8 +4,8 @@ import { act, renderHook } from '@testing-library/react';
 // Pins the rings completion state machine: optimistic busy→green on success,
 // revert+message on failure, undo cycle, the ActResult status map, and 401 → auth.
 
-const { mockAct } = vi.hoisted(() => ({ mockAct: vi.fn() }));
-vi.mock('../lib/algernon/feed', () => ({ feedApi: { act: mockAct, list: vi.fn() } }));
+const { mockAct, mockList } = vi.hoisted(() => ({ mockAct: vi.fn(), mockList: vi.fn() }));
+vi.mock('../lib/algernon/feed', () => ({ feedApi: { act: mockAct, list: mockList } }));
 
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { ApiError } from '../lib/algernon/http';
@@ -34,6 +34,8 @@ const flush = () => act(async () => { await Promise.resolve(); await Promise.res
 
 beforeEach(() => {
   mockAct.mockReset();
+  mockList.mockReset();
+  mockList.mockResolvedValue({ items: [], count: 0 });
   mockAct.mockResolvedValue({ ok: true, status: 'acted', detail: '', id: 'x', action_id: 'done' });
 });
 afterEach(() => vi.restoreAllMocks());
@@ -128,5 +130,132 @@ describe('useRingCompletion — undo', () => {
     await flush();
     expect(result.current.effectiveDone(item)).toBe(true); // stayed done
     expect(result.current.errorFor(item.id)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #62 — the incident, pinned
+// ---------------------------------------------------------------------------
+//
+// 2026-08-07 23:43 ADT: the act COMMITTED server-side in 30ms; the phone never
+// saw the response; the client reverted the tick and rendered a failure line.
+// Twelve hours later the resumed PWA still showed it pending under that line.
+//
+// The rule these hold: a network failure is not an act failure — it is a
+// failure to LEARN THE OUTCOME, and the client must go and find out before it
+// tells the operator their action did not happen.
+
+describe('#62 a timeout no longer declares failure without checking', () => {
+  it('THE INCIDENT: act times out but the server DID act → done + honest notice', async () => {
+    const it0 = slot();
+    mockAct.mockRejectedValue(new ApiError(0, 'timeout'));
+    // The server's truth: it landed.
+    mockList.mockResolvedValue({ items: [{ ...it0, state: 'acted', acted_action: 'done' }], count: 1 });
+
+    const { result } = renderHook(() => useRingCompletion());
+    act(() => result.current.complete(it0));
+    await flush();
+    await flush();
+
+    expect(result.current.effectiveDone(it0)).toBe(true);
+    expect(result.current.errorFor(it0.id)).toBeNull();
+    expect(result.current.noticeFor(it0.id)).toContain('landed');
+    expect(result.current.busy(it0.id)).toBe(false);
+  });
+
+  it('a timeout where the act genuinely did NOT land keeps the error line', async () => {
+    const it0 = slot();
+    mockAct.mockRejectedValue(new ApiError(0, 'timeout'));
+    mockList.mockResolvedValue({ items: [{ ...it0, state: 'open' }], count: 1 });
+
+    const { result } = renderHook(() => useRingCompletion());
+    act(() => result.current.complete(it0));
+    await flush();
+    await flush();
+
+    expect(result.current.effectiveDone(it0)).toBe(false);
+    expect(result.current.errorFor(it0.id)).toContain('next sync will reconcile');
+    expect(result.current.noticeFor(it0.id)).toBeNull();
+  });
+
+  it('an UNVERIFIABLE timeout keeps the error line — unknown is not success', async () => {
+    // The direction matters: claiming success we did not observe would be the
+    // mirror of the original bug, and worse (a false done cannot be retried).
+    const it0 = slot();
+    mockAct.mockRejectedValue(new ApiError(0, 'network_error'));
+    mockList.mockRejectedValue(new ApiError(0, 'network_error'));
+
+    const { result } = renderHook(() => useRingCompletion());
+    act(() => result.current.complete(it0));
+    await flush();
+    await flush();
+
+    expect(result.current.effectiveDone(it0)).toBe(false);
+    expect(result.current.errorFor(it0.id)).toContain('next sync will reconcile');
+  });
+
+  it('a 4xx does NOT trigger a verify — the server already answered', async () => {
+    const it0 = slot();
+    mockAct.mockRejectedValue(new ApiError(409, 'stale_item'));
+
+    const { result } = renderHook(() => useRingCompletion());
+    act(() => result.current.complete(it0));
+    await flush();
+
+    expect(mockList).not.toHaveBeenCalled();
+    expect(result.current.errorFor(it0.id)).toContain('moved on');
+  });
+
+  it('a 401 still routes to auth without probing', async () => {
+    const onAuthExpired = vi.fn();
+    const it0 = slot();
+    mockAct.mockRejectedValue(new ApiError(401, 'invalid_session'));
+
+    const { result } = renderHook(() => useRingCompletion({ onAuthExpired }));
+    act(() => result.current.complete(it0));
+    await flush();
+
+    expect(onAuthExpired).toHaveBeenCalled();
+    expect(mockList).not.toHaveBeenCalled();
+  });
+});
+
+describe('#62 an override must not outlive the question it answered', () => {
+  it('a fresh render clears a stale failure override', async () => {
+    // Defect (2): before this, effectiveDone preferred the override for the
+    // page's lifetime, so a refetch showing `acted` could not correct the
+    // display. That is what held a 12-hour-old red line on screen.
+    const it0 = slot();
+    mockAct.mockRejectedValue(new ApiError(409, 'stale_item'));
+
+    const { result } = renderHook(() => useRingCompletion());
+    act(() => result.current.complete(it0));
+    await flush();
+    expect(result.current.errorFor(it0.id)).not.toBeNull();
+
+    const fresh = { ...it0, state: 'acted', acted_action: 'done' };
+    act(() => result.current.reconcile([fresh]));
+
+    expect(result.current.errorFor(it0.id)).toBeNull();
+    expect(result.current.effectiveDone(fresh)).toBe(true);
+  });
+
+  it('a render mid-flight does NOT clear the spinner', async () => {
+    const it0 = slot();
+    let resolveAct: (v: unknown) => void = () => {};
+    mockAct.mockReturnValue(new Promise((r) => { resolveAct = r; }));
+
+    const { result } = renderHook(() => useRingCompletion());
+    act(() => result.current.complete(it0));
+    expect(result.current.busy(it0.id)).toBe(true);
+
+    act(() => result.current.reconcile([{ ...it0, state: 'acted' }]));
+    expect(result.current.busy(it0.id)).toBe(true);
+
+    await act(async () => {
+      resolveAct({ ok: true, status: 'acted', detail: '', id: 'x', action_id: 'done' });
+      await Promise.resolve();
+    });
+    expect(result.current.busy(it0.id)).toBe(false);
   });
 });
