@@ -188,14 +188,28 @@ def test_attribution_kind_default_is_fyi_tier() -> None:
     assert KIND_DEFAULTS["attribution"] == (MODE_FYI, ATTENTION_FYI)
 
 
-def test_fyi_attribution_is_excluded_by_the_deck_mode_query() -> None:
-    """The deck fetches ``mode=decide`` server-side (routes_feed filters
-    ``it.mode != q_mode``), so an FYI-tier attribution item is never dealt as a
-    card. This is the mechanism the demotion actually rides on — pinned rather
-    than reasoned about."""
+def test_the_producer_emits_attribution_at_the_fyi_tier() -> None:
+    """PRODUCER-SIDE HALF ONLY — read the name literally.
+
+    This asserts what the producer STAMPS. It does not, and cannot, pin the
+    demotion mechanism: the exclusion happens in ``routes_feed
+    ._handle_feed_items``, whose ``it.mode != q_mode`` branch is what turns a
+    tier difference into a card the deck never deals. Deleting that branch
+    leaves everything here green — measured, not assumed (reviewer gate WARN-1
+    disabled the filter and this file passed 34/34).
+
+    The mechanism pin lives at the route layer, where it can see that:
+    ``tests/test_routes_feed.py::test_the_deck_query_excludes_the_demoted_
+    attribution_card`` and its two siblings.
+
+    An earlier version of this docstring claimed the mechanism was "pinned
+    rather than reasoned about". It was reasoned about. The claim is retired
+    rather than softened, because a test that overstates its own reach is worse
+    than one that admits a gap — the first stops anyone from looking.
+    """
     item = build_feed_items("attribution", [_attribution_item("m1", record_path="note/A.md")], "salem")[0]
     assert item.mode == MODE_FYI
-    assert item.mode != MODE_DECIDE  # the deck's query value
+    assert item.attention == ATTENTION_FYI
 
 
 def test_contested_attribution_is_produced_as_needs_you() -> None:

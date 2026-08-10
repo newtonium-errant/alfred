@@ -157,6 +157,107 @@ async def test_get_items_filters_by_kind(feed_client) -> None:
     assert (await resp.json())["count"] == 0  # no proposal items published
 
 
+# ---------------------------------------------------------------------------
+# #63a — the demotion mechanism, pinned AT the layer that implements it
+# ---------------------------------------------------------------------------
+
+
+def _attribution_item(marker_id: str, *, contested: bool = False) -> dict:
+    return {
+        "item_number": 1,
+        "record_path": f"note/{marker_id}.md",
+        "marker_id": marker_id,
+        "agent": "salem",
+        "date": "2026-08-09T18:44:00+00:00",
+        "section_title": "Test Section",
+        "reason": "talker conversation turn",
+        "content_preview": "Wrapped content preview text.",
+        "contested": contested,
+    }
+
+
+@pytest.fixture
+async def tier_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Store carrying the three shapes #63a distinguishes: an uncontested
+    attribution card (demoted to FYI), a contested one (returned to needs-you),
+    and an unrelated decide card that must survive the deck's filter."""
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+    register_vault_path(app, tmp_path / "vault")
+
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    cfg = _ds_config(tmp_path)
+
+    plain = build_feed_items("attribution", [_attribution_item("inf-plain")], "salem")[0]
+    contested = build_feed_items(
+        "attribution", [_attribution_item("inf-contested", contested=True)], "salem",
+    )[0]
+    decide = build_feed_items("email_tier", [_email_item()], "salem")[0]
+    for it in (plain, contested, decide):
+        store.upsert(it)
+
+    assert register_feed_routes(
+        app, enabled=True, feed_store=store, daily_sync_config=cfg,
+        instance_name="Salem", instance_scope="talker", raw_config={},
+    ) is True
+    app["_plain_fid"] = plain.id
+    app["_contested_fid"] = contested.id
+    app["_decide_fid"] = decide.id
+    return await aiohttp_client(app)
+
+
+async def _deck_ids(client) -> set[str]:  # type: ignore[no-untyped-def]
+    """The ids the DECK would deal — the exact query `deck.tsx` issues
+    (`feedApi.list({ state: 'open', mode: 'decide' })`)."""
+    resp = await client.get("/feed/items?state=open&mode=decide", headers=_FEED_HEADERS)
+    assert resp.status == 200
+    return {i["id"] for i in (await resp.json())["items"]}
+
+
+async def test_the_deck_query_excludes_the_demoted_attribution_card(tier_client) -> None:
+    """#63a ruling 1's mechanism, driven through the REAL route handler.
+
+    This crosses the boundary on purpose. The producer only stamps
+    ``mode=fyi``; asserting that alongside ``MODE_FYI != MODE_DECIDE`` is a fact
+    about two constants that stays true whether or not anything filters on it,
+    so a producer-side pin cannot see the mechanism break. What actually keeps
+    attribution out of the deck is the ``it.mode != q_mode`` branch in
+    ``_handle_feed_items`` — delete that branch and the demoted card is dealt
+    again. Only a request that goes through the handler goes red.
+
+    The decide-card assertion is half the pin: without it, a filter that
+    returned nothing at all would pass just as happily as a correct one.
+    """
+    ids = await _deck_ids(tier_client)
+    assert tier_client.app["_plain_fid"] not in ids
+    assert tier_client.app["_decide_fid"] in ids
+
+
+async def test_the_demoted_card_is_present_in_the_store_the_FILTER_hides_it(
+    tier_client,
+) -> None:
+    """Absence from the deck query must mean "filtered out", not "never
+    published" — otherwise the pin above would also pass against a producer
+    that had silently stopped emitting attribution items at all."""
+    resp = await tier_client.get("/feed/items", headers=_FEED_HEADERS)
+    assert resp.status == 200
+    body = await resp.json()
+    by_id = {i["id"]: i for i in body["items"]}
+    assert tier_client.app["_plain_fid"] in by_id
+    assert by_id[tier_client.app["_plain_fid"]]["mode"] == "fyi"
+
+
+async def test_a_contested_attribution_card_comes_back_to_the_deck_query(
+    tier_client,
+) -> None:
+    """Ruling 3's other half, at the same layer: contesting returns the card to
+    needs-you, and "needs-you" is only meaningful if the deck's own query picks
+    it up again. A contest that re-tiered the item but left it invisible to the
+    deck would be a door onto nowhere."""
+    ids = await _deck_ids(tier_client)
+    assert tier_client.app["_contested_fid"] in ids
+
+
 async def test_get_items_requires_feed_peer(feed_client) -> None:
     # A valid chat ``web`` token clears Layer 1 as peer ``web`` (shared
     # allowed_clients) but the peer-pin refuses it.
