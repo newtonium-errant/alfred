@@ -623,7 +623,8 @@ def render_batch(items: list[AttributionItem]) -> str:
             lines.append(f"   Reason: {item.reason}")
         lines.append("")
     lines.append(
-        "Reply with `N confirm` to keep, `N reject` to strip the section."
+        "Reply with `N confirm` to keep, `N reject` to strip the section. "
+        "Anything you leave alone confirms itself after a day."
     )
     return "\n".join(lines).rstrip()
 

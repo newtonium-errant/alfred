@@ -708,6 +708,25 @@ def test_sweep_auto_confirms_regardless_of_any_ui_surface(tmp_path: Path) -> Non
     assert _entries(vault, "note/A.md")[0].confirmed_by_andrew is True
 
 
+def test_the_section_footer_tells_the_operator_that_silence_confirms(tmp_path: Path) -> None:
+    """The reply grammar's copy predates auto-confirm and read as though an
+    answer were required. It isn't any more — and the difference matters,
+    because under the new policy NOT replying is itself a decision. Copy that
+    hides that is the system quietly acting on his behalf while implying it
+    won't.
+    """
+    items = asec.build_batch(_seeded_vault_for_footer(tmp_path), _ds_config(tmp_path))
+    rendered = asec.render_batch(items)
+
+    assert "confirms itself after a day" in rendered
+
+
+def _seeded_vault_for_footer(tmp_path: Path) -> Path:
+    vault = _make_vault(tmp_path)
+    _seed_record(vault, "note/A.md", marker_id="foot", date=_iso(NOW - timedelta(hours=2)))
+    return vault
+
+
 def test_an_old_web_bundle_can_still_ack_the_demoted_card(tmp_path: Path) -> None:
     """Half-deploy order A — Python live, the OLD web bundle still cached on the
     phone. That bundle has no contest door; its only affordance on an FYI row is
