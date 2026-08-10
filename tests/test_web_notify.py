@@ -940,6 +940,33 @@ async def test_an_already_public_issue_link_is_untouched_and_unlabelled(
     assert "box-local" not in p["text"].lower()
 
 
+async def test_the_notify_carries_the_ticket_content_for_the_pwa_card(
+    aiohttp_client, tmp_path, notify_recorder,
+) -> None:
+    """#76 e2e — push a REAL ticket and read the emitted payload.
+
+    The unit pins cover the composer and the store, and every one of them stays
+    green if `_notify_ticket_created_web` is never handed the body. Only a real
+    push proves the content actually leaves the intake.
+
+    Also pins what must NOT travel: the dedupe marker is machine plumbing, and
+    shipping it to a phone tray would put an `algernon-ticket` line in the
+    middle of what the operator is trying to read.
+    """
+    fake = FakeGitHubClient(tmp_path / "audit.jsonl")
+    client = await _build_kalle_app(aiohttp_client, tmp_path, fake_client=fake)
+
+    assert (await (await _push_ticket(client, _ticket_payload())).json())[
+        "status"
+    ] == "created"
+
+    p = notify_recorder[0]["payload"]
+    assert "Repro" in p["ticket_body"], "the ticket's own text must reach the card"
+    assert "Reported by: Ben" in p["ticket_body"], "the metadata header travels too"
+    assert "algernon-ticket" not in p["ticket_body"], "markers are plumbing, not content"
+    assert p["issue_number"] == 7
+
+
 async def test_exists_repush_emits_zero_notifies(
     aiohttp_client, tmp_path, notify_recorder,
 ) -> None:

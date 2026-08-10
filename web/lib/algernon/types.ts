@@ -84,6 +84,11 @@ export interface NotificationItem {
   source: string;
   ticket_uid?: string;
   issue_url?: string;
+  // #76 — the ticket's content, carried on the notice so the card can expand
+  // and be READ. Optional: entries written before #76 simply have none.
+  ticket_body?: string;
+  ticket_body_truncated?: boolean;
+  issue_number?: number;
   ts: string;
   read: boolean;
 }
