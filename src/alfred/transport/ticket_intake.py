@@ -109,6 +109,21 @@ class TicketIntakeConfig:
     # for the send to route; unset/unknown → logged skip
     # (``transport.ticket.web_notify_skipped``), never an error.
     notify_peer: str = "salem"
+    # #63b: PUBLIC origin of the forge, for links that leave the box.
+    #
+    # The forge is on-box, so the ``html_url`` its API returns carries whatever
+    # ROOT_URL it was configured with — in practice ``http://localhost:3001``.
+    # That URL travels into the ticket-created notice, which lands on the
+    # operator's PHONE, where it goes nowhere.
+    #
+    # Set this to the externally-reachable origin (scheme + host [+ port], e.g.
+    # ``https://forge.example.com``) and the notify rewrites the ORIGIN of
+    # box-local issue links, keeping the forge's own path. Empty (the default)
+    # is a supported state, not a broken one: the link is still carried but
+    # arrives LABELLED box-local, so a tap that fails is expected rather than
+    # baffling. Never defaulted to a hostname — one instance's forge is not
+    # another's.
+    public_base_url: str = ""
 
 
 def load_ticket_intake_config(raw: dict[str, Any]) -> TicketIntakeConfig:
@@ -142,6 +157,7 @@ def load_ticket_intake_config(raw: dict[str, Any]) -> TicketIntakeConfig:
         # An explicit empty string is a deliberate opt-out (skip+log at
         # the notify site); only an ABSENT key gets the default.
         notify_peer=str(section.get("notify_peer", "salem") or ""),
+        public_base_url=str(section.get("public_base_url", "") or "").strip(),
     )
 
 

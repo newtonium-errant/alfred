@@ -1538,6 +1538,25 @@ scaffold:
 #   # THIS instance's transport.peers to route; unset it to "" to opt
 #   # out (logged skip either way — never an error, never blocks the ack).
 #   notify_peer: "salem"
+#   # #63b — PUBLIC origin of the forge, for links that leave the box.
+#   # The tracker is on-box, so the issue URL its API returns carries the
+#   # forge's own ROOT_URL (in practice http://localhost:3001/...). That URL
+#   # travels into the ticket-created notice, which lands on the operator's
+#   # PHONE — where a localhost link goes nowhere.
+#   #
+#   # Set this to the externally-reachable origin (scheme + host [+ port]) and
+#   # the notify swaps the ORIGIN of box-local issue links, keeping the
+#   # forge's own path. Requires a tunnel/route to the forge to exist.
+#   #
+#   # Leaving it EMPTY is a supported state, not a broken one: the link is
+#   # still sent (it works at the desk) but arrives labelled
+#   # "(box-local link — only opens on the box)". Honest degradation — the
+#   # defect being fixed is a dead link presented as a live one.
+#   #
+#   # Only box-local links are touched. A GitHub-backed instance's
+#   # https://github.com/... link is already public: never rewritten, never
+#   # labelled, no config needed.
+#   public_base_url: "https://forge.example.com"
 
 # Ticket forwarder — VERA-ONLY sender half of the same pipeline.
 # Deterministic 15-minute scanner over <vault>/ticket/: every ticket
