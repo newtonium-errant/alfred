@@ -557,3 +557,118 @@ async def test_act_non_string_correction_target_400(routine_client) -> None:
     assert resp.status == 400
     assert (await resp.json())["error"] == "invalid_correction_target"
     assert _corpus_types(routine_client.app["_corpus"]) == []
+
+
+# ---------------------------------------------------------------------------
+# POST /feed/act — contested_section passthrough (#72 item 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def attribution_client(aiohttp_client, tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Transport app serving one open attribution card over a REAL vault, so a
+    #72 section tap can be driven all the way to a corpus row through the route.
+
+    Sibling of ``routine_client`` above, and it exists for the same reason: the
+    router-level pins all stay green if the ROUTE drops the payload, which is
+    the accepted-then-ignored shape a per-layer test cannot see."""
+    from typing import Any
+
+    import yaml as _yaml
+
+    from alfred.daily_sync import reply_dispatch as _rd
+    from alfred.vault.attribution import AuditEntry, append_audit_entry
+
+    vault = tmp_path / "vault"
+    (vault / "note").mkdir(parents=True)
+    fm: dict[str, Any] = {"type": "note", "name": "A"}
+    append_audit_entry(fm, AuditEntry(
+        marker_id="m1", agent="salem", date="2026-08-09T00:00:00+00:00",
+        section_title="Structured Summary", reason="talker conversation turn",
+    ))
+    (vault / "note" / "A.md").write_text(
+        "---\n" + _yaml.dump(fm, sort_keys=False) + "---\n\nbody\n", encoding="utf-8",
+    )
+
+    corpus = tmp_path / "attr_corpus.jsonl"
+    monkeypatch.setattr(
+        _rd, "_attribution_corpus_path", lambda *a, **kw: str(corpus),
+    )
+
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+    register_vault_path(app, vault)
+
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    cfg = _ds_config(tmp_path)
+    item = {
+        "marker_id": "m1", "record_path": "note/A.md", "agent": "salem",
+        "section_title": "Structured Summary",
+        "date": "2026-08-09T00:00:00+00:00",
+    }
+    fi = build_feed_items("attribution", [item], "salem")[0]
+    store.upsert(fi)
+    _seed_batch(cfg, attribution_items=[item])
+
+    assert register_feed_routes(
+        app, enabled=True, feed_store=store, daily_sync_config=cfg,
+        instance_name="Salem", instance_scope="talker", raw_config={},
+    ) is True
+    app["_corpus"] = corpus
+    app["_fid"] = fi.id
+    return await aiohttp_client(app)
+
+
+async def test_act_contested_section_reaches_the_corpus(attribution_client) -> None:
+    """The passthrough pin. Without it the tap is dropped at the transport and
+    every contest files under `unknown` — the per-section statistic stays dark
+    forever while all its unit tests pass."""
+    resp = await attribution_client.post(
+        "/feed/act",
+        json={
+            "id": attribution_client.app["_fid"], "action_id": "contest",
+            "contested_section": "Decisions",
+        },
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+
+    corpus = attribution_client.app["_corpus"]
+    rows = [
+        json.loads(ln) for ln in corpus.read_text().splitlines() if ln.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["section"] == "Decisions", "the route dropped the tap"
+
+
+async def test_act_without_a_section_still_contests(attribution_client) -> None:
+    """Card-level contest stays allowed — the tap is optional by design."""
+    resp = await attribution_client.post(
+        "/feed/act",
+        json={"id": attribution_client.app["_fid"], "action_id": "contest"},
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status == 200
+    rows = [
+        json.loads(ln)
+        for ln in attribution_client.app["_corpus"].read_text().splitlines()
+        if ln.strip()
+    ]
+    assert rows[0]["section"] == ""
+
+
+async def test_act_rejects_a_non_string_section(attribution_client) -> None:
+    """Type-checked at the transport; the VALUE is judged in the router, which
+    is where the vocabulary lives."""
+    resp = await attribution_client.post(
+        "/feed/act",
+        json={
+            "id": attribution_client.app["_fid"], "action_id": "contest",
+            "contested_section": 17,
+        },
+        headers=_FEED_HEADERS,
+    )
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "invalid_contested_section"

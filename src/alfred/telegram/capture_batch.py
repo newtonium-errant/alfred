@@ -37,6 +37,11 @@ from alfred.common.stt_noise import filter_stt_noise
 from alfred.vault import ops
 
 from alfred._anthropic_compat import messages_create_kwargs
+from .capture_sections import (
+    BRIEF_RECAP_SECTIONS,
+    RE_ENCOUNTERS_SECTION,
+    SUMMARY_SECTIONS,
+)
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -366,23 +371,29 @@ def render_summary_markdown(
                 lines.append(f"- {item}")
         lines.append("")
 
-    _section("Topics", summary.topics)
-    _section("Decisions", summary.decisions)
-    _section("Open Questions", summary.open_questions)
-    _section("Action Items", summary.action_items)
-    _section("Key Insights", summary.key_insights)
-    _section("Raw Contradictions", summary.raw_contradictions)
-    # Discarded Noise (clinic-capture Piece 2c) — caption-artifact lines the
-    # deterministic filter dropped pre-structuring. ``(none)`` per
-    # intentionally-left-blank when nothing was dropped (the live-filtered norm).
-    _section("Discarded Noise", summary.discarded_noise)
-
-    # Re-encounters (7th section, at end). Pre-rendered body in,
-    # heading added here so the section shape matches its siblings.
-    lines.append("### Re-encounters")
-    body = re_encounters_body.strip() or "(none)"
-    lines.append(body)
-    lines.append("")
+    # #72 item 4 — the headings come from SUMMARY_SECTIONS, which is now the one
+    # place they are spelled. Byte-identical output to the eight literal calls
+    # this replaced; what changes is that the attribution stats key on the SAME
+    # list, so a renamed heading can no longer leave the stats counting a
+    # section the card stopped showing.
+    #
+    # Two sections keep their own shape and both are preserved:
+    #   Discarded Noise (clinic-capture Piece 2c) — caption-artifact lines the
+    #     deterministic filter dropped pre-structuring. ``(none)`` per
+    #     intentionally-left-blank when nothing was dropped (the live-filtered
+    #     norm), which the shared ``_section`` helper already does.
+    #   Re-encounters — body is pre-rendered by capture_source_anchor and passed
+    #     in, so only the heading is added here; the shape matches its siblings.
+    for heading in SUMMARY_SECTIONS:
+        if heading == RE_ENCOUNTERS_SECTION:
+            lines.append(f"### {heading}")
+            lines.append(re_encounters_body.strip() or "(none)")
+            lines.append("")
+            continue
+        # No getattr default: a heading whose backing field is missing is drift
+        # between the vocabulary and StructuredSummary, and it must fail loudly
+        # here rather than render an empty section that reads as "nothing found".
+        _section(heading, getattr(summary, heading.lower().replace(" ", "_")))
 
     lines.append(SUMMARY_MARKER_END)
     return "\n".join(lines).rstrip() + "\n"
@@ -1480,8 +1491,11 @@ def render_recap_markdown(
                     lines.append(f"- {item}")
             lines.append("")
 
-        _section("Topics", summary.topics)
-        _section("Key Insights", summary.key_insights)
+        # #72 item 4 — the brief recap is a SUBSET of the same vocabulary, and
+        # it takes its spellings from the same module so it cannot drift into a
+        # second spelling of a heading the stats key on.
+        for heading in BRIEF_RECAP_SECTIONS:
+            _section(heading, getattr(summary, heading.lower().replace(" ", "_")))
     elif mode == "verbose":
         if not isinstance(summary, StructuredSummary):
             raise ValueError(
