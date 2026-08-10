@@ -161,8 +161,10 @@ function fakeCompletion(over: Partial<UseRingCompletionResult> = {}): UseRingCom
     effectiveDone: () => false,
     busy: () => false,
     errorFor: () => null,
+    noticeFor: () => null,
     complete: vi.fn(),
     undo: vi.fn(),
+    reconcile: vi.fn(),
     ...over,
   };
 }

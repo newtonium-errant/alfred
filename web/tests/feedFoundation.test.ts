@@ -313,10 +313,16 @@ describe('feed client request shaping', () => {
   it('list builds an allowlisted query string, omitting empties', async () => {
     const { feedApi } = await import('../lib/algernon/feed');
     mockGetJson.mockResolvedValue({ items: [], count: 0 });
+    // The second argument is the request-options bag added in #62 so the
+    // post-failure verify can carry its own short timeout. Empty for every
+    // ordinary caller, so the wire behaviour is unchanged — `getJson` defaults
+    // `timeoutMs` to the browser budget either way. This pin's SUBJECT is still
+    // the query string; the shape is asserted alongside it so a future caller
+    // that starts smuggling options through here has to say so.
     await feedApi.list({ state: 'open', mode: 'decide' });
-    expect(mockGetJson).toHaveBeenCalledWith('/api/feed/list?state=open&mode=decide');
+    expect(mockGetJson).toHaveBeenCalledWith('/api/feed/list?state=open&mode=decide', {});
     await feedApi.list();
-    expect(mockGetJson).toHaveBeenLastCalledWith('/api/feed/list');
+    expect(mockGetJson).toHaveBeenLastCalledWith('/api/feed/list', {});
   });
 
   it('act posts {id, action_id}', async () => {

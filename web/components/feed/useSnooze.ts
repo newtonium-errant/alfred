@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from 'react';
 import { feedApi, type FeedItem } from '../../lib/algernon/feed';
 import { UNSNOOZE_ACTION, snoozeIsBacked, type SnoozeAction } from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
+import { ACT_UNCONFIRMED_MESSAGE, isInconclusive } from '../../lib/algernon/actConfirm';
 
 // The snooze verb for the INLINE surfaces (the feed's worklist rows), sibling to
 // useRingCompletion (done / undo_done) and useSlotAccept (accept). The deck does
@@ -60,8 +61,11 @@ function messageFor(e: unknown): string {
     ) {
       return "Can't reach Algernon right now — this is server-side, not your session.";
     }
-    if (e.status === 504 || e.code === 'timeout' || e.code === 'gateway_timeout' || e.code === 'network_error') {
-      return "That didn't confirm in time — the next sync will reconcile it.";
+    // #62: ONE owner of "did the server actually answer us". The four hooks
+    // each carried their own copy of this predicate, which is precisely why a
+    // single incident implicated all four.
+    if (isInconclusive(e)) {
+      return ACT_UNCONFIRMED_MESSAGE;
     }
     return e.detail || "That couldn't be snoozed.";
   }

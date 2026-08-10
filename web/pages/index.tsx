@@ -8,6 +8,7 @@ import { FeedRow } from '../components/feed/FeedRow';
 import { RingsHeader } from '../components/feed/RingsHeader';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
+import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
 import { authApi } from '../lib/algernon/authClient';
 import {
   briefCardDetail,
@@ -83,29 +84,28 @@ export default function HomePage() {
     }
   }, [sessionLoading, user, unauthenticated, router]);
 
+  // Hoisted so the RESUME path can call it too (#62) — a load that lives only
+  // inside useEffect runs only at mount, and an iOS PWA resumes without one.
+  const loadFeed = useCallback(async () => {
+    try {
+      // No state filter: the rings need today's DONE (state=acted) slot items
+      // too (completion is a STAGE, not a disappearance). The needs-you / deck /
+      // board surfaces below split back to open-only. One fetch, client-split.
+      const res = await feedApi.list({});
+      setItems(res.items);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        setUnauthenticated(true);
+      }
+      // A non-401 feed failure is non-fatal for the composer: the surfaces
+      // degrade to their own empty/loading states rather than blocking home.
+    }
+  }, []);
+
   useEffect(() => {
     if (!authed) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        // No state filter: the rings need today's DONE (state=acted) slot items
-        // too (completion is a STAGE, not a disappearance). The needs-you / deck /
-        // board surfaces below split back to open-only. One fetch, client-split.
-        const res = await feedApi.list({});
-        if (!cancelled) setItems(res.items);
-      } catch (e) {
-        if (cancelled) return;
-        if (e instanceof ApiError && e.status === 401) {
-          setUnauthenticated(true);
-        }
-        // A non-401 feed failure is non-fatal for the composer: the surfaces
-        // degrade to their own empty/loading states rather than blocking home.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [authed]);
+    void loadFeed();
+  }, [authed, loadFeed]);
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
   // OPEN-only for the remaining-work surfaces (board / needs-you / deck) — the
@@ -117,6 +117,14 @@ export default function HomePage() {
   // when the hook lived inside them this count (reading the raw `ringItemDone`) had
   // no way to see the flip and lagged a whole fetch behind the green segment.
   const completion = useRingCompletion({ onAuthExpired });
+
+  // #62 (3) resume freshness + (2) override supersession, on the composer too —
+  // this is the surface the operator actually reopens in the morning.
+  useResumeRefetch(() => { if (authed) void loadFeed(); });
+  useEffect(() => {
+    if (items) completion.reconcile(items);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items]);
   // How many things need you (the FEED truth) vs how many the DECK can actually
   // deal. `isDeckDealt` is the ONLY authority on which items the deck deals —
   // don't restate its rule here, because paraphrases of it are what #22 retired
