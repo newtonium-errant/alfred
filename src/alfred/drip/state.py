@@ -65,6 +65,8 @@ from typing import Any
 
 import structlog
 
+from .config import DripConfigError
+
 log = structlog.get_logger(__name__)
 
 # --- item lifecycle ---------------------------------------------------------
@@ -237,7 +239,15 @@ def campaign_state_path(
     slug = (instance or "").strip().lower().replace(" ", "-")
     if not slug:
         # Fail loud: a shared/unnamed path is the incident above.
-        raise ValueError(
+        #
+        # #66: DripConfigError, not a bare ValueError. The refusal is correct
+        # and stays correct — what changed is that it now carries a type the
+        # CLI boundary already handles, so the operator gets "Drip: ..." and
+        # exit 2 instead of a stack dump for a missing line of YAML. Typed at
+        # the SOURCE rather than caught at each of the three call sites, so a
+        # fourth caller cannot reintroduce the traceback by forgetting.
+        # Still a ValueError subclass — existing ValueError handlers unaffected.
+        raise DripConfigError(
             "drip campaign state needs an instance name — an unscoped path is "
             "shared across instances on the box and silently corrupts cursors"
         )

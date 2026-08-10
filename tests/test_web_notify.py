@@ -762,6 +762,7 @@ def _kalle_transport_config(*, with_salem_peer: bool = True) -> TransportConfig:
 
 async def _build_kalle_app(
     aiohttp_client, tmp_path, *, fake_client, with_salem_peer: bool = True,
+    public_base_url: str = "",
 ):  # type: ignore[no-untyped-def]
     config = _kalle_transport_config(with_salem_peer=with_salem_peer)
     state = TransportState.create(tmp_path / "transport_state.json")
@@ -775,6 +776,9 @@ async def _build_kalle_app(
         intake_config=TicketIntakeConfig(
             enabled=True,
             state_path=str(tmp_path / "ticket_intake_state.json"),
+            # #63b — default empty keeps every existing test on the
+            # unconfigured path, which is also production's default.
+            public_base_url=public_base_url,
         ),
         github_client=fake_client,
     )
@@ -856,6 +860,84 @@ async def test_created_emits_exactly_one_notify(
     assert p["issue_url"] == "https://github.com/acme/site/issues/7"
     assert "Login button broken" in p["text"]
     assert "#7" in p["text"]
+
+
+# --- #63b: the link the operator's PHONE receives -------------------------
+# These drive the REAL notify path end-to-end rather than the URL helper alone.
+# The helper is thoroughly unit-pinned in tests/test_ticket_notify_public_url.py,
+# and every one of those pins stays green if `_notify_ticket_created_web` never
+# calls it — a pure function nobody invokes is the classic accepted-then-ignored
+# shape. Only a test that pushes a real ticket and reads the emitted payload
+# can tell the difference.
+
+BOX_LOCAL_ISSUE = "http://localhost:3001/andrew/algernon/issues/7"
+
+
+async def test_box_local_issue_link_is_labelled_when_no_public_base(
+    aiohttp_client, tmp_path, notify_recorder,
+) -> None:
+    """THE #63b pin. On-box forgejo returns a localhost URL; the notice goes to
+    the operator's phone. With no public origin configured the link is still
+    carried — it works at the desk — but it arrives SAID to be box-local, so a
+    tap that fails is expected rather than baffling."""
+    fake = FakeGitHubClient(tmp_path / "audit.jsonl")
+    fake.create_result = {"number": 7, "html_url": BOX_LOCAL_ISSUE}
+    client = await _build_kalle_app(aiohttp_client, tmp_path, fake_client=fake)
+
+    assert (await (await _push_ticket(client, _ticket_payload())).json())[
+        "status"
+    ] == "created"
+
+    p = notify_recorder[0]["payload"]
+    assert "box-local" in p["text"].lower(), "an unreachable link must say so"
+    assert BOX_LOCAL_ISSUE in p["text"]
+    assert p["issue_url"] == BOX_LOCAL_ISSUE, "labelled, not withheld"
+
+
+async def test_a_configured_public_base_rewrites_the_link_end_to_end(
+    aiohttp_client, tmp_path, notify_recorder,
+) -> None:
+    """With the public origin configured the operator gets a link that works
+    from anywhere — and no apology, because none is owed.
+
+    Asserts BOTH surfaces: the prose (Telegram relay) and the structured
+    ``issue_url`` (the PWA's anchor). Rewriting one and not the other would
+    show him a working link and navigate him to a dead one, or vice-versa.
+    """
+    fake = FakeGitHubClient(tmp_path / "audit.jsonl")
+    fake.create_result = {"number": 7, "html_url": BOX_LOCAL_ISSUE}
+    client = await _build_kalle_app(
+        aiohttp_client, tmp_path, fake_client=fake,
+        public_base_url="https://forge.example.com",
+    )
+
+    assert (await (await _push_ticket(client, _ticket_payload())).json())[
+        "status"
+    ] == "created"
+
+    p = notify_recorder[0]["payload"]
+    expected = "https://forge.example.com/andrew/algernon/issues/7"
+    assert p["issue_url"] == expected
+    assert expected in p["text"]
+    assert "localhost" not in p["text"]
+    assert "box-local" not in p["text"].lower()
+
+
+async def test_an_already_public_issue_link_is_untouched_and_unlabelled(
+    aiohttp_client, tmp_path, notify_recorder,
+) -> None:
+    """A GitHub-backed instance needs no config and must gain no label —
+    labelling a working link teaches the operator to distrust good ones."""
+    fake = FakeGitHubClient(tmp_path / "audit.jsonl")  # public html_url default
+    client = await _build_kalle_app(aiohttp_client, tmp_path, fake_client=fake)
+
+    assert (await (await _push_ticket(client, _ticket_payload())).json())[
+        "status"
+    ] == "created"
+
+    p = notify_recorder[0]["payload"]
+    assert p["issue_url"] == "https://github.com/acme/site/issues/7"
+    assert "box-local" not in p["text"].lower()
 
 
 async def test_exists_repush_emits_zero_notifies(

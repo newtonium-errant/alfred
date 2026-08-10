@@ -557,17 +557,31 @@ async def test_gcal_sync_non_gcalerror_post_commit_returns_created(app_factory):
 
 def test_gcal_phase_deadline_bounds_two_phases_under_client_timeout():
     """PRIMARY guard for the 2026-07-09 propose_event incident (#61 FIX B):
-    the two blocking GCal phases (conflict-scan + create-sync), each bounded by
-    ``_GCAL_PHASE_DEADLINE_S``, must together stay under the peer client's
-    per-attempt read timeout ``_REQUEST_TIMEOUT``. If they don't, a
-    slow-but-committed sync breaches the client deadline and the client's retry
-    lands on the 409 already_exists path while the create actually succeeded —
-    the create-succeeded-but-client-saw-error class. This coupling lives only
-    in comments at both sites; pin it so a future bump of the 6s deadline that
-    re-opens the window fails here instead of in production."""
+    the two blocking GCal phases (conflict-scan + create-sync) must TOGETHER
+    stay under the peer client's per-attempt read timeout ``_REQUEST_TIMEOUT``.
+    If they don't, a slow-but-committed sync breaches the client deadline and
+    the client's retry lands on the 409 already_exists path while the create
+    actually succeeded — the create-succeeded-but-client-saw-error class. This
+    coupling lives only in comments at both sites; pin it so a future bump of
+    either deadline that re-opens the window fails here instead of in
+    production.
+
+    Their SUM, not ``2 * one`` (#71): the phases now carry separately-named
+    budgets, so the composition this guards is genuinely additive. The old
+    doubling silently assumed they could never differ — which is exactly the
+    assumption that stopped being true, and it would have kept passing while
+    one phase was raised."""
     from alfred.transport.client import _REQUEST_TIMEOUT
 
-    assert 2 * peer_handlers._GCAL_PHASE_DEADLINE_S < _REQUEST_TIMEOUT
+    total = (
+        peer_handlers._GCAL_CONFLICT_DEADLINE_S
+        + peer_handlers._GCAL_SYNC_DEADLINE_S
+    )
+    assert total < _REQUEST_TIMEOUT, (
+        f"the two GCal phases total {total}s, at or over the client's "
+        f"{_REQUEST_TIMEOUT}s read timeout — a committed create would surface "
+        f"to the caller as an error"
+    )
 
 
 async def test_gcal_sync_timeout_returns_committed_success(app_factory, monkeypatch):  # type: ignore[no-untyped-def]
@@ -575,9 +589,11 @@ async def test_gcal_sync_timeout_returns_committed_success(app_factory, monkeypa
     server-side deadline → the handler still returns the committed 201 with
     ``error_code == "sync_timeout"`` (never a client-visible timeout that
     triggers a retry-into-409)."""
-    # Shrink the deadline so the test doesn't have to block for 6 real
-    # seconds. The handler reads the module global at call time.
-    monkeypatch.setattr(peer_handlers, "_GCAL_PHASE_DEADLINE_S", 0.2)
+    # Shrink ONLY the SYNC budget — the phase this test probes — so it doesn't
+    # have to block for 6 real seconds. The conflict scan keeps its real budget;
+    # squeezing a phase the test isn't probing is what made #71 flaky. The
+    # handler reads the module global at call time.
+    monkeypatch.setattr(peer_handlers, "_GCAL_SYNC_DEADLINE_S", 0.2)
 
     gcal_client = MagicMock()
     gcal_client.list_events.return_value = []  # conflict scan is fast
@@ -629,8 +645,21 @@ async def test_gcal_slow_conflict_scan_degrades_and_still_creates(app_factory, m
     """Companion to the timeout fix: the conflict-scan is ALSO a blocking
     GCal round trip (and carries the cold-start cost). A slow scan degrades
     to vault-only conflicts and the create still proceeds within the client
-    deadline, returning a normal committed success."""
-    monkeypatch.setattr(peer_handlers, "_GCAL_PHASE_DEADLINE_S", 0.2)
+    deadline, returning a normal committed success.
+
+    #71 — this test used to be flaky, and the racing phase was NOT the one it
+    was probing. Both phases shared one budget, so shrinking it to 200ms to
+    make the scan breach also gave the CREATE 200ms to finish. The scan side
+    was never at risk (it sleeps 0.8s against a 0.2s budget, and load only
+    makes a sleep longer); the create side had to beat a wall clock, and under
+    full-suite load it lost.
+
+    Squeezing only ``_GCAL_CONFLICT_DEADLINE_S`` removes the race rather than
+    narrowing it: the breach direction keeps its 4x margin, and the phase that
+    must SUCCEED gets its real 6s budget for a mocked call plus one frontmatter
+    write. Widening the shared deadline would have left the same race with a
+    bigger number in it."""
+    monkeypatch.setattr(peer_handlers, "_GCAL_CONFLICT_DEADLINE_S", 0.2)
 
     gcal_client = MagicMock()
 
@@ -672,6 +701,61 @@ async def test_gcal_slow_conflict_scan_degrades_and_still_creates(app_factory, m
         if c.get("event") == "transport.canonical.event_propose_gcal_conflict_timeout"
     ]
     assert len(matches) == 1
+
+
+async def test_a_squeezed_conflict_budget_does_not_squeeze_the_create(app_factory, monkeypatch):  # type: ignore[no-untyped-def]
+    """#71 REGRESSION PIN — the property that actually retires the flake.
+
+    The bug was budget COUPLING: one constant governed both phases, so a test
+    that squeezed the scan silently squeezed the create too. Restructuring
+    alone leaves nothing asserting they stayed decoupled — recombine them and
+    every other test here still passes, because none of them has a create that
+    is slow relative to the squeezed budget. This one does.
+
+    The create takes 0.4s: comfortably OVER the 0.2s conflict budget (so a
+    shared budget fails this, deterministically — load only lengthens a sleep)
+    and far UNDER the sync phase's real 6s (so the pass does not depend on
+    timing luck). That two-sided margin is what makes this a pin rather than
+    the flake in a new costume.
+    """
+    monkeypatch.setattr(peer_handlers, "_GCAL_CONFLICT_DEADLINE_S", 0.2)
+
+    gcal_client = MagicMock()
+
+    def _slow_list(*args, **kwargs):
+        time.sleep(0.8)  # breaches the squeezed CONFLICT budget
+        return []
+
+    def _deliberate_create(*args, **kwargs):
+        time.sleep(0.4)  # > conflict budget, << sync budget
+        return "created-despite-slow-scan"
+
+    gcal_client.list_events.side_effect = _slow_list
+    gcal_client.create_event.side_effect = _deliberate_create
+    gcal_config = _make_gcal_config()
+
+    client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
+    resp = await client.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "decoupled-budgets",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "Decoupled budgets",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+
+    assert resp.status == 201
+    body = await resp.json()
+    assert body["gcal_sync"] == {"status": "ok"}, (
+        "the create was charged the conflict phase's budget — the two deadlines "
+        "have been recoupled"
+    )
 
 
 async def test_gcal_409_already_exists_returns_before_sync(app_factory):  # type: ignore[no-untyped-def]

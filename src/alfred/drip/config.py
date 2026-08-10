@@ -47,6 +47,27 @@ log = structlog.get_logger(__name__)
 
 ENV_RE = re.compile(r"\$\{(\w+)\}")
 
+
+class DripConfigError(ValueError):
+    """A drip campaign cannot be built or scoped from its config.
+
+    Loud on purpose. The alternative — skipping an unbuildable campaign — is a
+    campaign that is configured, believed to be draining, and silently doing
+    nothing, which is the failure this whole feature is shaped against.
+
+    Lives HERE rather than in ``wiring`` (#66) so the layers that detect a
+    config problem can raise it without an import cycle: ``wiring`` imports
+    ``state``, so ``state`` could not import back from ``wiring``, which is why
+    ``campaign_state_path``'s missing-instance refusal used to be a bare
+    ``ValueError`` and escaped the CLI's ``except`` as a traceback. ``config``
+    imports nothing from the package, so everything can reach it.
+
+    Still subclasses ``ValueError``, so existing handlers that catch
+    ``ValueError`` (``brief/daemon.py`` does) are unaffected. ``wiring``
+    re-exports it, so every ``from .wiring import DripConfigError`` keeps
+    working.
+    """
+
 #: Operator ruling 2026-08-04 (D1, halved from the first draft). These are the
 #: DEFAULTS, not the values — an instance's YAML always wins. They live here so
 #: that a config which omits them still gets the ruled numbers rather than a

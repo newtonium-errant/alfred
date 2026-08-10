@@ -2472,7 +2472,23 @@ def _scan_event_conflicts(
 # slow-but-healthy GCal past 6s degrades to vault-only conflicts / a
 # ``sync_timeout`` report rather than breaching the client deadline — we
 # would rather say "sync unconfirmed" than lie about a committed create.
-_GCAL_PHASE_DEADLINE_S = 6.0
+#
+# ONE budget PER PHASE, named separately (#71). They are equal today and the
+# composition pin is what actually protects the client deadline (their SUM must
+# stay under ``_REQUEST_TIMEOUT``), so this is not two knobs where one would do:
+# the phases differ in kind. The conflict scan is BEST-EFFORT enrichment that
+# degrades to vault-only conflicts and costs the operator nothing when it
+# lapses; the sync is the WRITE, whose lapse the operator actually sees as
+# ``sync_timeout``. Tuning one should not silently retune the other.
+#
+# Naming them apart also makes the phases independently controllable in tests,
+# which is what retires the #71 flake: exercising a scan that BREACHES its
+# budget used to require shrinking the budget for BOTH phases, so the create —
+# which the same test requires to SUCCEED — was left racing a 200ms wall clock
+# and lost under full-suite load. A test can now squeeze the phase it is
+# probing and leave the other at its real budget.
+_GCAL_CONFLICT_DEADLINE_S = 6.0
+_GCAL_SYNC_DEADLINE_S = 6.0
 
 
 def _scan_gcal_conflicts(
@@ -2608,7 +2624,7 @@ async def _scan_gcal_conflicts_bounded(
     handler past the peer client's per-attempt read timeout, so a
     slow-but-eventually-successful scan makes the client read-time-out and
     retry into the 409 path while the create succeeds (see
-    :data:`_GCAL_PHASE_DEADLINE_S`).
+    :data:`_GCAL_CONFLICT_DEADLINE_S`).
 
     Bound + degrade: on deadline OR any unexpected error, fall back to the
     vault-only conflict map (empty GCal list) — the same fail-open posture
@@ -2627,12 +2643,12 @@ async def _scan_gcal_conflicts_bounded(
                 proposed_end,
                 correlation_id,
             ),
-            timeout=_GCAL_PHASE_DEADLINE_S,
+            timeout=_GCAL_CONFLICT_DEADLINE_S,
         )
     except asyncio.TimeoutError:
         log.warning(
             "transport.canonical.event_propose_gcal_conflict_timeout",
-            deadline_s=_GCAL_PHASE_DEADLINE_S,
+            deadline_s=_GCAL_CONFLICT_DEADLINE_S,
             correlation_id=correlation_id,
         )
         return []
@@ -2700,7 +2716,7 @@ async def _handle_canonical_event_propose_create(
             ``stale_gcal_id`` / ``sync_timeout`` / ``unknown``.
             ``sync_timeout`` means the blocking GCal round trip exceeded
             the server-side per-phase deadline
-            (:data:`_GCAL_PHASE_DEADLINE_S`) and was NOT confirmed within
+            (:data:`_GCAL_SYNC_DEADLINE_S`) and was NOT confirmed within
             the caller's read window — the vault create is committed and
             the projection may still land in the background (a
             daemon/operator re-sync reconciles). Vault record IS preserved;
@@ -3032,7 +3048,7 @@ async def _handle_canonical_event_propose_create(
                 end_dt=end_dt,
                 correlation_id=correlation_id,
             ),
-            timeout=_GCAL_PHASE_DEADLINE_S,
+            timeout=_GCAL_SYNC_DEADLINE_S,
         )
     except asyncio.TimeoutError:
         log.warning(
@@ -3040,14 +3056,14 @@ async def _handle_canonical_event_propose_create(
             peer=peer,
             title=title[:80],
             path=rel_path,
-            deadline_s=_GCAL_PHASE_DEADLINE_S,
+            deadline_s=_GCAL_SYNC_DEADLINE_S,
             correlation_id=correlation_id,
         )
         sync_result = {
             "error": {
                 "code": "sync_timeout",
                 "detail": (
-                    f"gcal sync exceeded the {_GCAL_PHASE_DEADLINE_S:.0f}s "
+                    f"gcal sync exceeded the {_GCAL_SYNC_DEADLINE_S:.0f}s "
                     "server budget; vault record committed, GCal projection "
                     "still in flight (daemon/operator will reconcile)"
                 ),
@@ -3841,6 +3857,99 @@ async def _handle_ticket_intake(
     })
 
 
+# --- #63b: making a forge link usable off the box ---------------------------
+# Hostnames that never resolve to anything outside the machine serving them.
+_BOX_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+# The note appended when a link is box-local and no public origin is
+# configured. Operator-facing: it must say WHY the tap will fail, because the
+# alternative is a link that looks live and silently isn't.
+BOX_LOCAL_LINK_NOTE = "(box-local link — only opens on the box)"
+
+
+def _is_box_local_url(url: str) -> bool:
+    """Whether ``url``'s host is unreachable from off the box.
+
+    Deliberately conservative: it answers True only for hosts that provably
+    cannot resolve publicly — loopback names, loopback/private/link-local IPs,
+    and single-label hostnames (public DNS requires a dot, so ``algernon-box``
+    is a LAN name by construction).
+
+    Everything else, including anything unparseable, answers False. A false
+    NEGATIVE costs an unlabelled link that happens not to work; a false
+    POSITIVE tells the operator a perfectly good GitHub link is box-local,
+    which teaches him to distrust links that are fine. The second error is
+    worse and this errs away from it.
+    """
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    text = (url or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        host = urlsplit(text).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.lower()
+    if host in _BOX_LOCAL_HOSTS:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # A name, not an address. No dot ⇒ not publicly resolvable.
+        return "." not in host
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
+
+
+def _operator_facing_issue_url(
+    issue_url: str,
+    public_base_url: str,
+) -> tuple[str, str]:
+    """Return ``(url, note)`` for a forge issue link shown to the operator.
+
+    The forge is on-box, so the ``html_url`` it reports carries its own
+    ROOT_URL — usually ``http://localhost:3001``. That link is fine in a vault
+    record read at the desk and useless in a phone notification, which is where
+    this one goes.
+
+    With ``public_base_url`` set, the ORIGIN is swapped and the forge's path is
+    kept verbatim (rebuilding the path would mean re-deriving a URL layout the
+    forge owns). Without it, the URL is returned unchanged alongside a note
+    saying it is box-local: the link still works at the desk, and it no longer
+    pretends to work anywhere else.
+
+    Only ever touches a box-local URL. An instance whose forge is already
+    public needs no config and gets no note.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    url = (issue_url or "").strip()
+    if not url or not _is_box_local_url(url):
+        return url, ""
+
+    base = (public_base_url or "").strip().rstrip("/")
+    if base:
+        try:
+            b, u = urlsplit(base), urlsplit(url)
+        except ValueError:
+            b = None  # type: ignore[assignment]
+        if b is not None and b.scheme and b.netloc:
+            return urlunsplit(
+                (b.scheme, b.netloc, u.path, u.query, u.fragment)
+            ), ""
+        # A base that isn't a usable origin is a misconfiguration; degrade to
+        # the honest label rather than emitting a mangled URL.
+        log.warning(
+            "transport.ticket.public_base_url_unusable",
+            public_base_url=base[:200],
+        )
+
+    return url, BOX_LOCAL_LINK_NOTE
+
+
 async def _notify_ticket_created_web(
     request: web.Request,
     *,
@@ -3883,9 +3992,26 @@ async def _notify_ticket_created_web(
         )
         return
     self_name = _get_instance_self_name(request)
+    # #63b — this notice lands on the operator's PHONE (Telegram relay + the
+    # PWA tray), and the forge's own ``html_url`` is box-local. Rewrite it to
+    # the configured public origin, or say plainly that it isn't reachable.
+    # Both the prose and the structured field carry the SAME url, so the PWA's
+    # anchor and the text can never disagree about where the link goes.
+    link_url, link_note = _operator_facing_issue_url(
+        issue_url, str(getattr(intake_config, "public_base_url", "") or ""),
+    )
     text = (
         f"New ticket [{ticket_type}] {title} — filed as issue "
-        f"#{issue_number}: {issue_url}"
+        f"#{issue_number}: {link_url}"
+    )
+    if link_note:
+        text = f"{text} {link_note}"
+    log.info(
+        "transport.ticket.notify_link",
+        ticket_uid=ticket_uid,
+        box_local=bool(link_note),
+        rewritten=bool(link_url != issue_url),
+        correlation_id=correlation_id,
     )
     try:
         # Late import at call time (module style) — also what lets tests
@@ -3901,7 +4027,7 @@ async def _notify_ticket_created_web(
                 "source": self_name or "kal-le",
                 "web_notify": True,
                 "ticket_uid": ticket_uid,
-                "issue_url": issue_url,
+                "issue_url": link_url,
             },
             config=config,
             self_name=self_name,
