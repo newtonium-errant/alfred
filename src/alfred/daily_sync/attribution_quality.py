@@ -67,6 +67,28 @@ QUALITY_EVENT = "daily_sync.attribution.quality"
 # the health layer has QUIET_HEALTH_STATUSES rather than scattered ``!= "ok"``.
 DEMOTION_COUNTING_VIA = frozenset({"timeout_24h"})
 
+# #72 item (c), NOT YET BUILT — the cooldown decision, recorded here because
+# this is the count the trigger will read.
+#
+# When the operator REJECTS a demotion proposal, wait ONE FULL
+# ``quality_window_days`` from the rejection before proposing again — not a
+# fixed number of days, and not "until the count rises again".
+#
+# The reason is the window's own arithmetic. The trigger fires on contests
+# inside a trailing window; a rejected proposal leaves those same contests
+# sitting in that window. Any cooldown shorter than the window re-proposes off
+# evidence the operator has just declined to act on, so the second card is not
+# a new signal — it is the same one, re-asked. That is how an operator learns
+# to dismiss a card without reading it, which costs far more than a late
+# demotion: it burns the propose-then-approve channel that the self-correcting
+# standard depends on.
+#
+# Waiting one window guarantees the next proposal is built from contests that
+# are entirely new since the rejection.
+#
+# Corollary for the trigger: only ONE proposal may be live at a time, so a
+# pending proposal suppresses re-proposal regardless of cooldown.
+
 # What a contest with no operator-named section is filed under. Card-level
 # contest stays allowed (contract item 4), and it must remain visible in the
 # stats rather than silently dropping out of the denominator.

@@ -736,6 +736,18 @@ def register() -> None:
     Registers at priority 25 — between the friction-queue slot (20,
     reserved) and open-questions slot (30, reserved). Email calibration
     at priority 10 renders first; attribution renders second.
+
+    #72 item (c), NOT YET BUILT — the demotion proposal section registers at
+    priority **24**, immediately above this one. Recorded here because this is
+    the neighbour whose number decides it.
+
+    Not 15 alongside the canonical proposals section, even though it copies
+    that section's propose-then-approve machinery. Priority is about where the
+    operator READS it, and a card asking "should attribution cards go back
+    under review?" is unreadable without the attribution section beneath it —
+    the batch it is talking about is the evidence for the answer. Filing it
+    with the other proposals would separate the question from its evidence by
+    ten priority slots and a screen of email calibration.
     """
     from . import assembler
     if "attribution_audit" in assembler.registered_providers():

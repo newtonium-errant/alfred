@@ -125,6 +125,26 @@ def _as_dict(item: Any) -> dict[str, Any]:
 # durable: reconcile re-upserts every open item each fire, so a one-off store
 # write would be flattened back to FYI by the next sync and the contested card
 # would quietly rejoin the glance pile.
+#
+# #72 item (c)/2, NOT YET BUILT — this is the function the approved demotion
+# override plugs into, and two decisions are recorded here.
+#
+# WHERE IT GOES. An approved demotion returns attribution cards to needs-you
+# WHOLESALE, not per item. So it belongs above the ``contested`` check as an
+# early return, and KIND_DEFAULTS stays the code default — the override is a
+# persisted operator decision layered over it, never an edit to the dict.
+# Re-derive it on every emit, exactly as ``contested`` is re-derived: reconcile
+# re-upserts every open item each fire, so a tier written once into the store
+# would be flattened back to FYI by the next sync.
+#
+# REVERSIBILITY, v1. A manual escape hatch is sufficient — a CLI subcommand (or
+# editing the one persisted value) to clear the override and return the kind to
+# its KIND_DEFAULTS tier. A second propose-flow for re-demotion is NOT built:
+# it is speculative until an operator actually asks to undo one, and the
+# demotion direction is the safe one (more review, not less), so a stuck
+# override over-asks rather than silently under-asks. The state must still be
+# schema-tolerant and instance-scoped per the CLAUDE.md state rules, because
+# the escape hatch reads it too.
 def _attribution_tier(d: dict[str, Any]) -> tuple[str, str] | None:
     if d.get("contested"):
         return (MODE_DECIDE, ATTENTION_NEEDS_YOU)
