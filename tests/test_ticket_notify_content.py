@@ -176,3 +176,63 @@ def test_a_notice_with_no_ticket_body_stays_empty_not_absent(tmp_path) -> None:
     entry = store.enqueue(1, text="a plain notice")
     assert entry["ticket_body"] == ""
     assert entry["issue_number"] == 0
+
+
+# --- the SINK: the bridge the mutation round proved was untested -------------
+#
+# Found by mutating, not by reading. Dropping `ticket_body` from the sink left
+# all 46 pins green: the intake's e2e pin proves the payload LEAVES KAL-LE, and
+# the store pins prove enqueue ACCEPTS the field — but nothing exercised the
+# receiving bridge in between, which is Salem-side and is exactly where a
+# silently-emptied card would come from.
+#
+# This is the "threaded at every production call site" trap one layer further
+# along than the intake: two correct endpoints with an untested wire between.
+
+
+def _sink_for(tmp_path) -> tuple[Any, Any]:
+    """The REAL sink over a real store. `WebUser`/`WebConfig` are the actual
+    config types, not stand-ins — the sink resolves its recipient through them
+    and a namespace would quietly excuse a lookup that had broken."""
+    from alfred.web.config import WebConfig, WebUser
+    from alfred.web.notify_state import build_web_notify_sink
+
+    store = WebNotifyStore.create(tmp_path / "notify.json")
+    store.load()
+    sink = build_web_notify_sink(store, WebConfig(users=[WebUser(name="andrew")]))
+    return store, sink
+
+
+def test_the_sink_carries_the_ticket_content_into_the_store(tmp_path) -> None:
+    from alfred.web.identity import synthetic_chat_id
+
+    store, sink = _sink_for(tmp_path)
+    sink(
+        payload={
+            "text": "New ticket [bug] Payroll",
+            "ticket_uid": TICKET_UID,
+            "ticket_body": "Reported by: Ben\n\n## Repro\n1. Click Submit",
+            "issue_number": 9,
+            "web_notify": True,
+        },
+        from_peer="kal-le",
+    )
+
+    row = store.list_for(synthetic_chat_id("andrew"))[0]
+    assert "Click Submit" in row["ticket_body"], (
+        "the sink dropped the ticket body — the card would expand to nothing"
+    )
+    assert row["issue_number"] == 9
+
+
+def test_the_sink_leaves_a_plain_notice_with_empty_content(tmp_path) -> None:
+    """A non-ticket notice must not acquire phantom content, and must still
+    land — the sink is shared by every peer notice, not just tickets."""
+    from alfred.web.identity import synthetic_chat_id
+
+    store, sink = _sink_for(tmp_path)
+    sink(payload={"text": "just a notice"}, from_peer="kal-le")
+
+    row = store.list_for(synthetic_chat_id("andrew"))[0]
+    assert row["text"] == "just a notice"
+    assert row["ticket_body"] == ""
