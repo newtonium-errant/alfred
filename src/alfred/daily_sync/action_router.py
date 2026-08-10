@@ -35,20 +35,32 @@ from __future__ import annotations
 import contextlib
 import threading
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date as _date
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import frontmatter
 import structlog
 
 from alfred.daily_sync import reply_dispatch as _rd
 from alfred.daily_sync.assembler import ReplyCorrection
+from alfred.daily_sync.attribution_corpus import AttributionCorpusEntry
+from alfred.daily_sync.attribution_corpus import append_entry as append_attribution_entry
 from alfred.daily_sync.corpus import append_correction
 from alfred.daily_sync.feed_producer import _FAMILIES, _as_dict
-from alfred.feed.model import MODE_FYI, STATE_ACKED, STATE_ACTED, STATE_OPEN, make_id
+from alfred.feed.model import (
+    ATTENTION_NEEDS_YOU,
+    MODE_DECIDE,
+    MODE_FYI,
+    STATE_ACKED,
+    STATE_ACTED,
+    STATE_OPEN,
+    make_id,
+)
+from alfred.vault.attribution import contest_marker
 from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
 log = structlog.get_logger(__name__)
@@ -78,6 +90,15 @@ STATUS_ERROR = "error"
 # Phase C slice 1 (board DONE path) — the slot-completion vocabulary.
 STATUS_UNDONE = "undone"  # undo_done succeeded → item back to open
 STATUS_UNSUPPORTED_ITEM = "unsupported_item"  # lane has no completion writer (task/unknown)
+# #63a — a contested attribution item goes BACK to needs-you and stays OPEN.
+# It needs its own status because every other successful act ends the item's
+# life (acted/acked); this one reopens the question instead.
+STATUS_CONTESTED = "contested"
+
+# #63a attribution contest. The door out of the FYI tier: "don't decide this one
+# for me." Attribution's verb alone — see the ceiling entry below.
+ATTRIBUTION_KIND = "attribution"
+CONTEST_ACTION = "contest"
 
 # slot_suggestion completion actions (handled by the dedicated dispatcher, NOT
 # the ReplyCorrection/last_batch path — the writers are called directly).
@@ -124,9 +145,15 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "down": {"modifier": "down"},
         "confirm": {"ok": True},
     },
+    # attribution — confirm/reject synthesize a ReplyCorrection as ever. #63a's
+    # ``contest`` does NOT: like the slot verbs, its kwargs are UNUSED and it is
+    # intercepted by :func:`_dispatch_attribution_contest` below. It is listed
+    # here because this map is the capability ceiling, and an action absent from
+    # it can never reach any handler.
     "attribution": {
         "confirm": {"ok": True},
         "reject": {"reject": True},
+        CONTEST_ACTION: {},
     },
     "proposal": {
         "confirm": {"ok": True},
@@ -1046,6 +1073,164 @@ def _confirm_writer_detail(kind: str) -> str:
     return "could not add this suggestion to today's plan"
 
 
+def _dispatch_attribution_contest(
+    feed_item_id: str,
+    action_id: str,
+    batch_item: dict[str, Any],
+    *,
+    feed_store: Any,
+    config: Any,
+    vault_path: Path | None,
+) -> ActResult:
+    """#63a — the contest door: "don't decide this one for me."
+
+    A dedicated dispatcher rather than a ReplyCorrection verb, because a contest
+    is neither a confirm nor a reject. It leaves the marked section in the body
+    and the entry in frontmatter; what it changes is WHO decides. Two effects,
+    and the feature is broken if either is missing:
+
+      1. It RECORDS the contest — in the vault entry (which stops the 24h clock
+         permanently) and in the audit corpus (which is the correction signal
+         the self-correcting standard requires be captured, not dropped).
+      2. It REVERTS the item to needs-you and leaves it OPEN, so the question
+         comes back to the operator instead of ending here.
+
+    Ordering is load-bearing: the vault write happens first, and the feed item is
+    only re-tiered once it lands. A re-tier over a failed write would show the
+    operator a contested card whose next sweep confirms it anyway.
+    """
+    marker_id = str(batch_item.get("marker_id") or "")
+    record_path = str(batch_item.get("record_path") or "")
+    if vault_path is None:
+        log.info(
+            "feed.act.attribution.contest_no_vault", id=feed_item_id,
+            marker_id=marker_id,
+        )
+        return ActResult(
+            False, STATUS_ERROR, "vault not configured — can't record a contest",
+            feed_item_id, action_id,
+        )
+    if not marker_id or not record_path:
+        log.info(
+            "feed.act.attribution.contest_metadata_missing", id=feed_item_id,
+            marker_id=marker_id, record_path=record_path[:200],
+        )
+        return ActResult(
+            False, STATUS_ERROR, "attribution metadata missing — can't record a contest",
+            feed_item_id, action_id,
+        )
+
+    # Same containment gate the confirm/reject resolver applies: record_path
+    # round-trips through a JSON state file that nothing re-validates on load,
+    # so it is gated like any caller-composed path — and BEFORE any stat, so a
+    # traversal target is never even probed.
+    try:
+        file_path = resolve_in_vault(
+            vault_path, record_path,
+            writer="daily_sync.attribution.contest",
+        )
+    except VaultContainmentError:
+        log.warning(
+            "feed.act.attribution.path_escape_denied",
+            record_path=record_path[:200], marker_id=marker_id,
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            f"{record_path} is not a path inside the vault",
+            feed_item_id, action_id,
+        )
+    if not file_path.exists():
+        log.warning(
+            "feed.act.attribution.contest_record_missing",
+            record_path=record_path, marker_id=marker_id,
+        )
+        return ActResult(
+            False, STATUS_ERROR, f"record {record_path} no longer exists",
+            feed_item_id, action_id,
+        )
+
+    try:
+        post = frontmatter.load(str(file_path))
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "feed.act.attribution.contest_read_failed",
+            record_path=record_path, error=str(exc),
+        )
+        return ActResult(
+            False, STATUS_ERROR, f"couldn't read {record_path}",
+            feed_item_id, action_id,
+        )
+
+    fm = post.metadata or {}
+    changed = contest_marker(fm, marker_id)
+    if not changed:
+        # Already contested (or the entry is gone). Idempotent ok-noop — but we
+        # still re-tier below, because the whole point is that the operator sees
+        # it under needs-you, and a double-tap must not leave it stranded in FYI.
+        log.info(
+            "feed.act.attribution.contest_noop", id=feed_item_id,
+            marker_id=marker_id,
+        )
+    else:
+        post.metadata = fm
+        try:
+            file_path.write_text(
+                frontmatter.dumps(post) + "\n", encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning(
+                "feed.act.attribution.contest_write_failed",
+                record_path=record_path, error=str(exc),
+            )
+            return ActResult(
+                False, STATUS_ERROR, "write failed — the contest wasn't recorded",
+                feed_item_id, action_id,
+            )
+        corpus_path = _rd._attribution_corpus_path(config)
+        if corpus_path:
+            try:
+                append_attribution_entry(corpus_path, AttributionCorpusEntry(
+                    type="attribution_contest",
+                    marker_id=marker_id,
+                    record_path=record_path,
+                    agent=str(batch_item.get("agent") or ""),
+                    section_title=str(batch_item.get("section_title") or ""),
+                    marker_date=str(batch_item.get("date") or ""),
+                    andrew_action="contest",
+                    action_at=datetime.now(timezone.utc).isoformat(),
+                ))
+            except OSError as exc:
+                # The vault write already landed and is the source of truth for
+                # suppression; a missing corpus row costs signal, not correctness.
+                log.warning(
+                    "feed.act.attribution.contest_corpus_write_failed",
+                    record_path=record_path, marker_id=marker_id, error=str(exc),
+                )
+
+    # Re-tier: back to needs-you, still OPEN. `contested` also goes into the
+    # stored evidence so the tier survives until the next sync re-derives it
+    # from the vault (feed_producer._attribution_tier).
+    stored = feed_store.load().get(feed_item_id)
+    if stored is not None:
+        evidence = dict(stored.evidence or {})
+        evidence["contested"] = True
+        feed_store.upsert(replace(
+            stored,
+            mode=MODE_DECIDE,
+            attention=ATTENTION_NEEDS_YOU,
+            evidence=evidence,
+        ))
+    log.info(
+        "feed.act.attribution.contested", id=feed_item_id,
+        marker_id=marker_id, recorded=changed,
+    )
+    return ActResult(
+        True, STATUS_CONTESTED,
+        "contested — it's back under things that need you",
+        feed_item_id, action_id,
+    )
+
+
 def act(
     feed_item_id: str,
     action_id: str,
@@ -1276,6 +1461,17 @@ def _act_locked(
             False, STATUS_STALE_ITEM,
             "this batch has moved on — it'll resurface at the next sync",
             feed_item_id, action_id,
+        )
+
+    # #63a attribution contest — intercepted AFTER the authoritative batch item
+    # loads (it needs the record_path/marker_id from last_batch, never from the
+    # feed item's display evidence) and BEFORE the ReplyCorrection synthesis,
+    # because a contest is not a correction: it records a disagreement and hands
+    # the decision back, rather than resolving the entry either way.
+    if kind == ATTRIBUTION_KIND and action_id == CONTEST_ACTION:
+        return _dispatch_attribution_contest(
+            feed_item_id, action_id, batch_item,
+            feed_store=feed_store, config=config, vault_path=vault_path,
         )
 
     # #13 — the ONLY place a per-request payload joins the static ceiling kwargs.

@@ -221,6 +221,39 @@ export function kindLabel(kind: string): string {
 // The universal FYI ack action (feed page + FYI rows) — sets the item `acked`.
 export const ACK_ACTION = 'ack';
 
+// --- attribution contest (#63a) ----------------------------------------------
+// The operator ruled attribution confirmations down to the FYI/glance tier: they
+// are consistently correct, so reviewing them in the deck spent his attention
+// and returned nothing. They now auto-confirm after 24h.
+//
+// This is the door back out. "Not right" says the inference is wrong, which
+// stops that item's auto-confirm clock for good and returns it to needs-you for
+// a deliberate confirm or reject. It is also the correction signal the platform's
+// self-correcting standard requires — the server records it in the audit corpus,
+// so a demotion that would otherwise have hidden a systematic error still
+// surfaces one.
+export const ATTRIBUTION_KIND = 'attribution';
+export const CONTEST_ACTION = 'contest';
+
+/**
+ * Whether this row should offer the contest door.
+ *
+ * Attribution only (it is the only kind the backend's capability ceiling admits
+ * `contest` for — offering it elsewhere would be a button that 400s in the
+ * operator's hand), and only while the item is still FYI. An attribution item
+ * already sitting in needs-you has either been contested or was never demoted,
+ * and in both cases the operator is already being asked to decide it; a second
+ * control meaning "ask me about this" would be noise.
+ *
+ * That second clause is also what makes the half-deployed state honest: against
+ * a backend that has not yet demoted the tier, every attribution item arrives as
+ * needs-you and the door simply never draws.
+ */
+export function contestableItem(item: FeedItem): boolean {
+  if (item.kind !== ATTRIBUTION_KIND) return false;
+  return !(item.attention === 'needs_you' || item.mode === 'decide');
+}
+
 // --- snooze, the one defer verb (#14) ----------------------------------------
 // The duration ladder, in menu order. MUST equal `alfred.tier.snooze
 // .SNOOZE_DURATIONS`' keys — a rung offered here that the router's FEED_ACTIONS

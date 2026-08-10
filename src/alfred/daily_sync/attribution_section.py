@@ -44,16 +44,24 @@ explicit "nothing to do" is observability.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 import frontmatter
 import structlog
 
-from alfred.vault.attribution import AuditEntry, parse_audit_entries
+from alfred.vault.attribution import (
+    CONFIRMED_VIA_BACKFILL,
+    CONFIRMED_VIA_TIMEOUT,
+    AuditEntry,
+    confirm_marker,
+    parse_audit_entries,
+)
 from alfred.vault.paths import vault_relative
 
+from .attribution_corpus import AttributionCorpusEntry, append_entry
+from .confidence import load_state, save_state
 from .config import DailySyncConfig
 
 log = structlog.get_logger(__name__)
@@ -63,6 +71,27 @@ log = structlog.get_logger(__name__)
 # absent — enabled, batch of 5, scan the whole vault. Mirrored in
 # ``config.yaml.example`` so the default behaviour is documented.
 _DEFAULT_BATCH_SIZE = 5
+
+# --- #63a auto-confirm policy ------------------------------------------------
+# How long an unconfirmed entry sits before the sweep confirms it on the
+# operator's behalf. The ruling is 24 hours.
+#
+# TIMING DEVIATION, stated rather than buried: the sweep runs on the daily-sync
+# schedule, so the EFFECTIVE window is 24-48h from the entry's date, not exactly
+# 24h — an entry created just after one fire waits nearly a full day before the
+# next fire can even look at it, and only then is it 24h old. This matches the
+# ruling's intent ("nobody objected within a day") and is the honest cost of
+# hosting the sweep on an existing daily job rather than adding a timer.
+AUTO_CONFIRM_AFTER_HOURS = 24
+
+# State key holding the moment the auto-confirm policy first ran on this
+# instance. Stamped ONCE, never moved: it is the line that separates "existed
+# before the policy" (backfill) from "lived under the policy" (timeout_24h).
+POLICY_START_STATE_KEY = "attribution_policy_start_at"
+
+# The ONE sweep event. Named as a constant because the operator's grep is a
+# consumer: a silent rename would strand it.
+SWEEP_EVENT = "daily_sync.attribution.auto_confirm_sweep"
 
 
 @dataclass
@@ -84,6 +113,11 @@ class AttributionItem:
     section_title: str
     reason: str
     content_preview: str  # first ~140 chars of the wrapped body
+    # #63a — the operator contested this inference. Carried into the feed
+    # item's evidence so the producer can re-derive the needs-you tier on
+    # EVERY sync, rather than the revert living only in one store write that
+    # the next reconcile would flatten back to FYI.
+    contested: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +129,7 @@ class AttributionItem:
             "section_title": self.section_title,
             "reason": self.reason,
             "content_preview": self.content_preview,
+            "contested": self.contested,
         }
 
 
@@ -341,9 +376,213 @@ def build_batch(
             section_title=c.entry.section_title,
             reason=c.entry.reason,
             content_preview=c.content_preview,
+            contested=c.entry.contested,
         )
         for i, c in enumerate(chosen)
     ]
+
+
+# ---------------------------------------------------------------------------
+# #63a — the 24h auto-confirm sweep
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SweepResult:
+    """Counts from one auto-confirm sweep. Every field is also logged.
+
+    ``audited`` is every UNCONFIRMED entry the walk saw — the denominator. The
+    rest partition it: entries that were confirmed this run (``auto_confirmed``,
+    split into ``timed_out`` + ``backfilled``), entries deliberately left alone
+    (``contested_preserved``, ``undated_preserved``), and the remainder, which
+    are simply not old enough yet.
+    """
+
+    audited: int = 0
+    auto_confirmed: int = 0
+    timed_out: int = 0
+    backfilled: int = 0
+    contested_preserved: int = 0
+    undated_preserved: int = 0
+    records_written: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "audited": self.audited,
+            "auto_confirmed": self.auto_confirmed,
+            "timed_out": self.timed_out,
+            "backfilled": self.backfilled,
+            "contested_preserved": self.contested_preserved,
+            "undated_preserved": self.undated_preserved,
+            "records_written": self.records_written,
+        }
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Coerce to aware UTC. A naive timestamp is assumed UTC — the same
+    assumption ``vault.attribution._iso`` makes when it writes one."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _policy_start(config: DailySyncConfig, now: datetime) -> datetime:
+    """Read the persisted policy-start instant, stamping ``now`` on first use.
+
+    Stamped once and never moved. If it drifted forward each run, entries
+    created between runs would keep landing on the wrong side of the line and
+    be labelled ``backfill`` forever — which is precisely the inflation of the
+    attribution-quality signal the ruling forbids.
+    """
+    state = load_state(config.state.path)
+    raw = state.get(POLICY_START_STATE_KEY)
+    if isinstance(raw, str) and raw:
+        parsed = _parse_iso(raw)
+        if parsed is not None:
+            return _as_utc(parsed)
+    state[POLICY_START_STATE_KEY] = now.isoformat()
+    save_state(config.state.path, state)
+    log.info(
+        "daily_sync.attribution.policy_start_stamped",
+        policy_start_at=now.isoformat(),
+    )
+    return now
+
+
+def auto_confirm_sweep(
+    vault_path: Path,
+    config: DailySyncConfig,
+    *,
+    now: datetime | None = None,
+) -> SweepResult:
+    """Confirm untouched attribution entries older than the policy window.
+
+    The operator ruling: attribution confirmations are consistently correct, so
+    reviewing them costs him time for no information. They auto-confirm after
+    24h **unless contested**.
+
+    Three things this deliberately does NOT do:
+
+      * It never touches a CONTESTED entry. A contest is the operator saying the
+        machine got it wrong; auto-confirming past that would overrule him
+        silently, which is the exact failure the contest door exists to prevent.
+      * It never re-stamps an ALREADY-confirmed entry, so an operator confirm is
+        never downgraded to a machine one by a later run.
+      * It never confirms an entry whose date won't parse. An age that can't be
+        computed hasn't been demonstrated to exceed the window, and the safe
+        direction on an audit trail is to leave the human a decision rather than
+        to invent an endorsement.
+
+    Runs the SAME ``_walk_vault`` the review batch uses, under the same
+    ``scan_paths``, so the sweep and the batch can never disagree about which
+    records are in scope — two walkers with two answers is how an entry becomes
+    invisible to one surface and live on the other.
+    """
+    when = _as_utc(now or datetime.now(timezone.utc))
+    result = SweepResult()
+    enabled, _batch_size, scan_paths = _attribution_settings(config)
+    if not enabled:
+        # ILB: an explicit "ran, did nothing, and here is why" beats silence.
+        log.info(SWEEP_EVENT, **result.to_dict(), skipped="attribution_disabled")
+        return result
+
+    policy_start = _policy_start(config, when)
+    cutoff = when - timedelta(hours=AUTO_CONFIRM_AFTER_HOURS)
+    corpus_path = getattr(config.attribution, "corpus_path", "") or ""
+
+    for md_file in _walk_vault(vault_path, scan_paths):
+        try:
+            post = frontmatter.load(str(md_file))
+        except Exception:
+            log.info("daily_sync.attribution.read_failed", path=str(md_file))
+            continue
+        fm = post.metadata or {}
+        entries = parse_audit_entries(fm)
+        if not entries:
+            continue
+        rel_path = vault_relative(vault_path, md_file)
+        confirmed_here: list[tuple[AuditEntry, str]] = []
+
+        for entry in entries:
+            if entry.confirmed_by_andrew or entry.confirmed_at is not None:
+                continue  # already resolved — not part of the denominator
+            result.audited += 1
+            if entry.contested:
+                result.contested_preserved += 1
+                continue
+            parsed = _parse_iso(entry.date)
+            if parsed is None:
+                result.undated_preserved += 1
+                log.info(
+                    "daily_sync.attribution.unparseable_date",
+                    record_path=rel_path,
+                    marker_id=entry.marker_id,
+                    date=entry.date[:64],
+                )
+                continue
+            if _as_utc(parsed) > cutoff:
+                continue  # still inside its window
+            via = (
+                CONFIRMED_VIA_BACKFILL
+                if _as_utc(parsed) < policy_start
+                else CONFIRMED_VIA_TIMEOUT
+            )
+            confirm_marker(fm, entry.marker_id, by="auto", at=when, via=via)
+            confirmed_here.append((entry, via))
+
+        if not confirmed_here:
+            continue
+
+        post.metadata = fm
+        try:
+            md_file.write_text(
+                frontmatter.dumps(post) + "\n", encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning(
+                "daily_sync.attribution.sweep_write_failed",
+                record_path=rel_path,
+                error=str(exc),
+            )
+            continue
+
+        result.records_written += 1
+        for entry, via in confirmed_here:
+            result.auto_confirmed += 1
+            if via == CONFIRMED_VIA_BACKFILL:
+                result.backfilled += 1
+            else:
+                result.timed_out += 1
+            if not corpus_path:
+                continue
+            try:
+                append_entry(corpus_path, AttributionCorpusEntry(
+                    type="attribution_auto_confirm",
+                    marker_id=entry.marker_id,
+                    record_path=rel_path,
+                    agent=entry.agent,
+                    section_title=entry.section_title,
+                    marker_date=entry.date,
+                    andrew_action="auto_confirm",
+                    action_at=when.isoformat(),
+                    confirmed_via=via,
+                ))
+            except OSError as exc:
+                # One unwritable corpus row must not abort the sweep — the vault
+                # write already landed, and dropping the rest would leave the
+                # trail worse off than a single missing row.
+                log.warning(
+                    "daily_sync.attribution.sweep_corpus_write_failed",
+                    record_path=rel_path,
+                    marker_id=entry.marker_id,
+                    error=str(exc),
+                )
+
+    # ILB: ONE grep-able event on EVERY run, including the all-zero steady state
+    # this reaches once the backlog is cleared. A sweep that logged only when it
+    # did work would be indistinguishable from a sweep that stopped running.
+    log.info(SWEEP_EVENT, **result.to_dict(), policy_start_at=policy_start.isoformat())
+    return result
 
 
 def render_batch(items: list[AttributionItem]) -> str:
@@ -488,8 +727,13 @@ def register() -> None:
 
 
 __all__ = [
+    "AUTO_CONFIRM_AFTER_HOURS",
+    "POLICY_START_STATE_KEY",
+    "SWEEP_EVENT",
     "AttributionItem",
+    "SweepResult",
     "attribution_audit_section",
+    "auto_confirm_sweep",
     "build_batch",
     "consume_last_batch",
     "get_vault_path",

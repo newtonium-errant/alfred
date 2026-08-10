@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from alfred.feed import FeedItem, FeedStore, try_feed_reconcile
+from alfred.feed.model import ATTENTION_NEEDS_YOU, MODE_DECIDE
 
 _SOURCE_REF = {"producer": "daily_sync"}
 
@@ -114,21 +115,47 @@ def _as_dict(item: Any) -> dict[str, Any]:
     return dict(item) if isinstance(item, dict) else {}
 
 
+# --- per-ITEM tier overrides (#63a) ------------------------------------------
+# KIND_DEFAULTS answers "what tier is this kind"; this answers "…except for this
+# particular item". Only attribution needs one today: the kind is FYI, but an
+# entry the operator CONTESTED is a live question and belongs back in needs-you.
+#
+# Deriving the promotion from the item's own evidence on every emit — rather
+# than writing the tier once when the contest lands — is what makes the revert
+# durable: reconcile re-upserts every open item each fire, so a one-off store
+# write would be flattened back to FYI by the next sync and the contested card
+# would quietly rejoin the glance pile.
+def _attribution_tier(d: dict[str, Any]) -> tuple[str, str] | None:
+    if d.get("contested"):
+        return (MODE_DECIDE, ATTENTION_NEEDS_YOU)
+    return None
+
+
+_TIER_OVERRIDES: dict[str, Callable[[dict], tuple[str, str] | None]] = {
+    "attribution": _attribution_tier,
+}
+
+
 def build_feed_items(kind: str, raw_items: list[Any] | None, instance: str) -> list[FeedItem]:
     """Translate one batch family's raw items into FeedItems (evidence verbatim)."""
     key_fn, title_fn = _FAMILIES[kind]
+    override_fn = _TIER_OVERRIDES.get(kind)
     out: list[FeedItem] = []
     for item in raw_items or []:
         d = _as_dict(item)
         stable = key_fn(d)
         if not stable:
             continue  # can't stably key it — skip rather than mint an unstable id
+        override = override_fn(d) if override_fn else None
+        mode, attention = override if override else (None, None)
         out.append(FeedItem.create(
             kind=kind,
             stable_key=stable,
             instance=instance,
             title=title_fn(d),
             evidence=d,
+            mode=mode,
+            attention=attention,
             source_ref=dict(_SOURCE_REF),
         ))
     return out

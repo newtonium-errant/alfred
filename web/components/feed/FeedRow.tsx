@@ -21,6 +21,17 @@ export interface FeedRowProps {
   /** Present → an Ack button (FYI rows). */
   onAck?: () => void;
   /**
+   * Present → this FYI row offers the #63a contest door ("Not right"). Supplied
+   * only for attribution rows (see `contestableItem`), which are the one kind the
+   * backend admits `contest` for.
+   *
+   * Rendered ALONGSIDE the Ack rather than replacing it: Ack means "seen, fine"
+   * and contest means "seen, wrong", and the ruling that demoted these cards
+   * depends on both being one tap away — the glance tier is only safe while
+   * disagreeing stays as cheap as agreeing.
+   */
+  onContest?: () => void;
+  /**
    * Present → this is a slot row: render the per-STAGE affordance (SUGGESTED→Accept /
    * PLANNED→✓ / DONE→marker+undo) driven by the SHARED hooks (the identical per-lane
    * logic the rings panel uses). Takes precedence over onAck.
@@ -44,7 +55,7 @@ export interface FeedRowProps {
   snooze?: UseSnoozeResult;
 }
 
-export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, accept, snooze }: FeedRowProps) {
+export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, completion, accept, snooze }: FeedRowProps) {
   // The row's own duration menu. Local because it is per-row transient UI, not
   // board state — nothing outside this row needs to know it's open.
   const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
@@ -151,15 +162,28 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, completion, a
             </span>
           )
         ) : onAck ? (
-          <button
-            type="button"
-            data-testid="feed-row-ack"
-            aria-label={`Acknowledge: ${item.title || item.id}`}
-            onClick={onAck}
-            className="shrink-0 rounded-lg border border-honeydew-400 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-600"
-          >
-            Ack
-          </button>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {onContest && (
+              <button
+                type="button"
+                data-testid="feed-row-contest"
+                aria-label={`Not right — send back for review: ${item.title || item.id}`}
+                onClick={onContest}
+                className="rounded-lg border border-honeydew-300 px-2 py-1.5 text-[11px] font-bold uppercase tracking-wider text-honeydew-600"
+              >
+                Not right
+              </button>
+            )}
+            <button
+              type="button"
+              data-testid="feed-row-ack"
+              aria-label={`Acknowledge: ${item.title || item.id}`}
+              onClick={onAck}
+              className="rounded-lg border border-honeydew-400 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-600"
+            >
+              Ack
+            </button>
+          </div>
         ) : null}
       </div>
 

@@ -85,6 +85,32 @@ _END_RE_TEMPLATE = (
 )
 
 
+# --- how an entry came to be confirmed (#63a) -------------------------------
+# Three values, deliberately NOT merged. The operator ruling is explicit that
+# collapsing them is irreversible:
+#
+#   operator    — Andrew explicitly confirmed it (deck, reply grammar, or after
+#                 resolving his own contest). The strongest signal in the trail.
+#   timeout_24h — it had its 24 hours under the current rules and nobody
+#                 objected. A real, if weak, endorsement.
+#   backfill    — it was swept in at deploy, having existed BEFORE the
+#                 auto-confirm policy did. It was never offered under these
+#                 rules, so it endorses nothing.
+#
+# The distinction is load-bearing for weighing contests later: counting backfill
+# as timeout would inflate the apparent attribution-quality signal by exactly
+# the size of whatever historical backlog happened to be sitting there at
+# deploy time.
+CONFIRMED_VIA_OPERATOR = "operator"
+CONFIRMED_VIA_TIMEOUT = "timeout_24h"
+CONFIRMED_VIA_BACKFILL = "backfill"
+CONFIRMED_VIA_VALUES = frozenset({
+    CONFIRMED_VIA_OPERATOR,
+    CONFIRMED_VIA_TIMEOUT,
+    CONFIRMED_VIA_BACKFILL,
+})
+
+
 @dataclass
 class AuditEntry:
     """One entry in a record's ``attribution_audit`` frontmatter list.
@@ -101,6 +127,16 @@ class AuditEntry:
     reason: str
     confirmed_by_andrew: bool = False
     confirmed_at: str | None = None
+    # #63a. ``confirmed_via`` names WHICH path confirmed this entry — one of
+    # CONFIRMED_VIA_*. ``None`` on an unconfirmed entry, and also on entries
+    # confirmed before #63a existed (we cannot retroactively know how those
+    # were confirmed, and guessing would be a fabricated audit trail).
+    confirmed_via: str | None = None
+    # ``contested`` is the operator saying the inference is wrong. It suppresses
+    # auto-confirm permanently — the 24h clock never runs on a contested entry —
+    # and re-tiers the card back to needs-you until he resolves it.
+    contested: bool = False
+    contested_at: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -112,11 +148,18 @@ class AuditEntry:
         Tolerates extra keys (forward-compat) but requires the core five.
         Raises ``ValueError`` on missing required fields — callers (e.g.
         ``parse_audit_entries``) catch and skip with a log line.
+
+        Schema tolerance runs BOTH directions, which is what lets #63a's new
+        fields land on a live vault: records written before this build carry no
+        ``confirmed_via`` / ``contested`` keys and load with the defaults, and
+        records written by a NEWER build carrying fields we don't know about
+        load fine too (unknown keys are ignored rather than splatted in).
         """
         required = ("marker_id", "agent", "date", "section_title", "reason")
         missing = [k for k in required if k not in raw]
         if missing:
             raise ValueError(f"AuditEntry missing required keys: {missing}")
+        via = raw.get("confirmed_via")
         return cls(
             marker_id=str(raw["marker_id"]),
             agent=str(raw["agent"]),
@@ -125,6 +168,9 @@ class AuditEntry:
             reason=str(raw["reason"]),
             confirmed_by_andrew=bool(raw.get("confirmed_by_andrew", False)),
             confirmed_at=raw.get("confirmed_at"),
+            confirmed_via=str(via) if via else None,
+            contested=bool(raw.get("contested", False)),
+            contested_at=raw.get("contested_at"),
         )
 
 
@@ -313,12 +359,25 @@ def confirm_marker(
     marker_id: str,
     by: str = "andrew",
     at: datetime | None = None,
+    via: str = CONFIRMED_VIA_OPERATOR,
 ) -> dict:
     """Flip the audit entry for ``marker_id`` to confirmed.
 
-    Sets ``confirmed_by_andrew=True`` and ``confirmed_at`` to the timestamp.
-    Returns frontmatter (mutated in place). If no matching entry is found,
-    returns frontmatter unchanged and logs a warning.
+    Sets ``confirmed_by_andrew=True``, ``confirmed_at`` to the timestamp, and
+    ``confirmed_via`` to ``via``. Returns frontmatter (mutated in place). If no
+    matching entry is found, returns frontmatter unchanged and logs a warning.
+
+    ``via`` defaults to :data:`CONFIRMED_VIA_OPERATOR` because every call site
+    that predates #63a is an explicit operator confirm — the default keeps those
+    honest without touching them. The sweep passes ``timeout_24h`` /
+    ``backfill`` explicitly.
+
+    ``confirmed_by_andrew`` stays True on the machine paths even though Andrew
+    didn't act, because it is the field the whole read path filters on
+    ("unconfirmed" == needs review) and splitting it would fork that predicate
+    across every consumer. ``confirmed_via`` is what carries the truth about who
+    or what did it, which is exactly why the ruling insists the three values
+    stay distinct.
 
     ``by`` is currently informational — the entry only stores ``confirmed_at``
     and a boolean — but accepting it now means Phase 2's Daily Sync flow
@@ -335,6 +394,7 @@ def confirm_marker(
         if isinstance(raw, dict) and raw.get("marker_id") == marker_id:
             raw["confirmed_by_andrew"] = True
             raw["confirmed_at"] = _iso(when)
+            raw["confirmed_via"] = via
             found = True
             break
     if not found:
@@ -344,6 +404,41 @@ def confirm_marker(
             confirmer=by,
         )
     return frontmatter
+
+
+def contest_marker(
+    frontmatter: dict,
+    marker_id: str,
+    at: datetime | None = None,
+) -> bool:
+    """Mark the audit entry for ``marker_id`` as contested.
+
+    Returns ``True`` when the entry was found and changed, ``False`` otherwise
+    (already contested, or no such entry) — the caller reports the WRITE, not
+    the intent, so a no-op can't be shown to the operator as a recorded contest.
+
+    Contesting is NOT rejecting: the marked section stays in the body and the
+    audit entry stays in frontmatter. It says "don't decide this for me" — it
+    stops the 24h auto-confirm clock permanently and sends the card back to the
+    needs-you tier so the operator can confirm or reject it deliberately.
+    """
+    when = at or _now_utc()
+    entries = frontmatter.get("attribution_audit")
+    if not isinstance(entries, list):
+        log.info("attribution.contest.no_audit_list", marker_id=marker_id)
+        return False
+    for raw in entries:
+        if isinstance(raw, dict) and raw.get("marker_id") == marker_id:
+            if raw.get("contested"):
+                log.info(
+                    "attribution.contest.idempotent_noop", marker_id=marker_id,
+                )
+                return False
+            raw["contested"] = True
+            raw["contested_at"] = _iso(when)
+            return True
+    log.warning("attribution.contest.marker_not_found", marker_id=marker_id)
+    return False
 
 
 def reject_marker(
@@ -392,6 +487,10 @@ def reject_marker(
 
 
 __all__ = [
+    "CONFIRMED_VIA_BACKFILL",
+    "CONFIRMED_VIA_OPERATOR",
+    "CONFIRMED_VIA_TIMEOUT",
+    "CONFIRMED_VIA_VALUES",
     "AuditEntry",
     "make_marker_id",
     "with_inferred_marker",
@@ -399,5 +498,6 @@ __all__ = [
     "parse_audit_entries",
     "find_marker_bounds",
     "confirm_marker",
+    "contest_marker",
     "reject_marker",
 ]

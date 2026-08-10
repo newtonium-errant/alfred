@@ -20,7 +20,7 @@ import {
   type ComposeMode,
 } from '../lib/algernon/composer';
 import { useComposerLog } from '../lib/algernon/composerLog';
-import { isDeckDealt } from '../lib/algernon/feedConstants';
+import { contestableItem, isDeckDealt } from '../lib/algernon/feedConstants';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
@@ -310,6 +310,7 @@ export default function HomePage() {
                         expanded={expanded.has(it.id)}
                         onToggleEvidence={() => toggleExpanded(it.id)}
                         onAck={() => board.ack(it.id)}
+                        onContest={contestableItem(it) ? () => board.contest(it.id) : undefined}
                       />
                     ))}
                   </ul>
