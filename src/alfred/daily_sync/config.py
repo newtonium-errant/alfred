@@ -140,6 +140,10 @@ class AttributionConfig:
     # JSONL; one row per Andrew confirm or reject. The path is a
     # default; the production config may override it.
     corpus_path: str = "./data/attribution_audit_corpus.jsonl"
+    # #72 item 2 — trailing window for the quality stat line and the demotion
+    # trigger. Config-backed rather than a literal at the call site: the
+    # operator tunes how much history "recently" means without a code change.
+    quality_window_days: int = 14
 
 
 @dataclass

@@ -1,0 +1,170 @@
+"""Attribution quality — the consumer side of #63a's corpus (#72 items 2 + 6).
+
+#63a made attribution cards auto-confirm after 24h and captured every operator
+contest into an append-only corpus. Nothing read it. That left the platform's
+self-correcting standard half-satisfied: the correction signal was durable and
+no behaviour anywhere improved from it.
+
+This module is the reading half. It answers two DIFFERENT questions off the same
+rows, and keeping them separate is the substance of item 6:
+
+    1. "Is auto-confirm letting wrong inferences through?"  -> demotion_contests
+    2. "Which section produces bad inferences?"             -> contests_by_section
+
+## Which contests count toward demotion
+
+The demotion proposal asks the operator to put attribution cards BACK under
+needs-you review. The only evidence that bears on it is a contest that review
+would have PREVENTED:
+
+  ``timeout_24h``   the machine confirmed it unreviewed and it was wrong.
+                    COUNTS — this is the entire case for demotion.
+
+  unconfirmed       contested while still inside its window: the operator caught
+                    it in the FYI tier before the clock ran out. That is the
+                    current design working. Counting it would demote the tier
+                    for succeeding.
+
+  ``backfill``      swept in at deploy, never offered under these rules (the
+                    ratified #63a argument). Evidence about historical inference
+                    quality, not about the policy.
+
+  ``operator``      he reviewed it and approved it, then changed his mind.
+                    Review is exactly what already happened, so returning these
+                    to review would not have caught it — arguably evidence
+                    AGAINST demotion.
+
+The dispatch's prior excluded only ``backfill``. This is tighter, on the same
+principle. Flagged for overrule: it decides what the operator is being asked to
+approve, so it is a judgement, not a detail.
+
+Per-section counting deliberately includes EVERY contest regardless of via —
+"which section is weak" does not care how the entry was later confirmed.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import structlog
+
+from .attribution_corpus import iter_attribution_rows
+
+log = structlog.get_logger(__name__)
+
+# Default trailing window. Config-backed at the call site (contract item 3);
+# this is the fallback, not the value.
+DEFAULT_WINDOW_DAYS = 14
+
+# The ONE grep-able quality event.
+QUALITY_EVENT = "daily_sync.attribution.quality"
+
+# The confirmed_via values whose contests bear on the demotion question. A SET
+# rather than an inline comparison so the rule has one home — the same reason
+# the health layer has QUIET_HEALTH_STATUSES rather than scattered ``!= "ok"``.
+DEMOTION_COUNTING_VIA = frozenset({"timeout_24h"})
+
+# What a contest with no operator-named section is filed under. Card-level
+# contest stays allowed (contract item 4), and it must remain visible in the
+# stats rather than silently dropping out of the denominator.
+SECTION_UNKNOWN = "unknown"
+
+
+@dataclass
+class AttributionQuality:
+    """Counts over a trailing window. Every field is also logged."""
+
+    window_days: int = DEFAULT_WINDOW_DAYS
+    auto_confirmed: int = 0
+    contested: int = 0
+    #: Contests that bear on the demotion question — see the module docstring.
+    demotion_contests: int = 0
+    #: Every contest, keyed by operator-named section (``unknown`` when none).
+    contests_by_section: Counter = field(default_factory=Counter)
+
+    def to_dict(self) -> dict:
+        return {
+            "window_days": self.window_days,
+            "auto_confirmed": self.auto_confirmed,
+            "contested": self.contested,
+            "demotion_contests": self.demotion_contests,
+            "sections": dict(self.contests_by_section),
+        }
+
+
+def _parse(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def attribution_quality_stats(
+    corpus_path: str | Path,
+    *,
+    now: datetime | None = None,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+) -> AttributionQuality:
+    """Count corpus activity over the trailing ``window_days``.
+
+    Reads through :func:`iter_attribution_rows` — the ONE corpus reader — so
+    this, the demotion trigger and the per-section rates can never disagree
+    about what the corpus says.
+
+    A row whose ``action_at`` will not parse is skipped rather than raised: the
+    same posture as the reader, for the same reason (a metric that dies on one
+    bad row stops being computed when it matters most).
+    """
+    when = now or datetime.now(timezone.utc)
+    cutoff = when - timedelta(days=window_days)
+    stats = AttributionQuality(window_days=window_days)
+
+    for row in iter_attribution_rows(corpus_path):
+        acted = _parse(row.action_at)
+        if acted is None or acted < cutoff:
+            continue
+        action = (row.andrew_action or "").strip()
+        if action == "auto_confirm":
+            stats.auto_confirmed += 1
+        elif action == "contest":
+            stats.contested += 1
+            section = (getattr(row, "section", "") or "").strip() or SECTION_UNKNOWN
+            stats.contests_by_section[section] += 1
+            if (row.confirmed_via or "").strip() in DEMOTION_COUNTING_VIA:
+                stats.demotion_contests += 1
+
+    # ILB: fires on EVERY call, including the all-zero quiet window that is the
+    # healthy steady state. A metric that logs only when it has news is
+    # indistinguishable from one that stopped running.
+    log.info(QUALITY_EVENT, **stats.to_dict())
+    return stats
+
+
+def render_quality_line(stats: AttributionQuality) -> str:
+    """One operator-facing line. Rendered on EVERY sync, zero included.
+
+    Says the plain counts rather than a rate: "3 of 40" is a number the operator
+    can act on, and a percentage of a small denominator would overstate a quiet
+    fortnight.
+    """
+    return (
+        f"Attribution quality: {stats.auto_confirmed} auto-confirmed, "
+        f"{stats.contested} contested ({stats.window_days}-day)."
+    )
+
+
+__all__ = [
+    "DEFAULT_WINDOW_DAYS",
+    "DEMOTION_COUNTING_VIA",
+    "QUALITY_EVENT",
+    "SECTION_UNKNOWN",
+    "AttributionQuality",
+    "attribution_quality_stats",
+    "render_quality_line",
+]

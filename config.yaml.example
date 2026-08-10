@@ -1190,6 +1190,12 @@ daily_sync:
     # calibration corpus above). Append-only JSONL; one row per
     # confirm, reject, contest, or auto-confirm.
     corpus_path: "./data/attribution_audit_corpus.jsonl"
+    # #72 — trailing window for the attribution quality stat line (and, when it
+    # lands, the self-demotion trigger). The sync renders
+    # "Attribution quality: N auto-confirmed, M contested (14-day)" on EVERY
+    # run, zero included — a metric that prints only when it has news is
+    # indistinguishable from one that stopped running.
+    quality_window_days: 14
 
 # Pending Items Queue (Phase 1) — items only Andrew can answer.
 # Per-instance JSONL queue (data/pending_items.jsonl) + auto-

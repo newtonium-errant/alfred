@@ -71,6 +71,20 @@ class AttributionCorpusEntry:
     # vault. Empty on reject/contest rows (nothing was confirmed) and on rows
     # written before #63a.
     confirmed_via: str = ""
+    # #72 item 4 — the section the OPERATOR named when contesting, from a small
+    # controlled vocabulary he taps (Topics / Decisions / Action Items / ...).
+    #
+    # Deliberately NOT ``section_title`` above. That one is free text chosen by
+    # whichever producer wrote the marker — ``spec.title``, ``"Structured
+    # Summary"``, ``f"Calibration — {sub}"``, even ``name or rel_path or
+    # "instructor-write"``. Keying per-section rates on it would yield a long
+    # tail of one-off strings and never surface "this section stands out",
+    # which is the entire point of the tracking.
+    #
+    # Empty when the operator contested the card as a whole, which stays
+    # allowed; the stats file that under ``SECTION_UNKNOWN`` rather than
+    # dropping it from the denominator.
+    section: str = ""
 
 
 def append_entry(corpus_path: str | Path, entry: AttributionCorpusEntry) -> None:
