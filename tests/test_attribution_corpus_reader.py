@@ -24,7 +24,9 @@ from pathlib import Path
 import pytest
 
 from alfred.daily_sync.attribution_corpus import (
+    _REQUIRED_KEYS,
     AttributionCorpusEntry,
+    CorpusReadStats,
     append_entry,
     iter_attribution_rows,
 )
@@ -150,3 +152,86 @@ def test_the_reader_is_lazy(tmp_path: Path) -> None:
     path = tmp_path / "c.jsonl"
     _write(path, [_row()])
     assert isinstance(iter_attribution_rows(path), types.GeneratorType)
+
+
+# --- what a row actually has to carry ---------------------------------------
+
+
+def test_the_four_checked_keys_are_not_enough_to_load_a_row(tmp_path: Path) -> None:
+    """The comment on `_REQUIRED_KEYS` used to say five keys were the bar, and a
+    successor hand-building a fixture from it would read back NOTHING.
+
+    Two gates: the explicit check is four keys, but the entry has eight fields
+    with no default, and the `except TypeError` turns the other four into a
+    skip. This pins the real bar so the comment can't drift back.
+    """
+    from dataclasses import MISSING, fields
+
+    no_default = [
+        f.name for f in fields(AttributionCorpusEntry)
+        if f.default is MISSING and f.default_factory is MISSING
+    ]
+    assert len(_REQUIRED_KEYS) == 4
+    assert len(no_default) == 8
+    assert set(_REQUIRED_KEYS) < set(no_default), "checked keys are a strict subset"
+
+    path = tmp_path / "c.jsonl"
+    _write(path, [{k: "x" for k in _REQUIRED_KEYS}])
+    assert list(iter_attribution_rows(path)) == [], "four keys must not be enough"
+
+    _write(path, [{k: "x" for k in no_default}])
+    assert len(list(iter_attribution_rows(path))) == 1, "all eight must be enough"
+
+
+# --- declined rows are countable --------------------------------------------
+
+
+def test_every_decline_path_is_counted_for_a_caller_that_asks(tmp_path: Path) -> None:
+    """Skipping is right; skipping SILENTLY is what makes a metric built on
+    these rows lie. All four decline shapes must reach the tally."""
+    path = tmp_path / "c.jsonl"
+    path.write_text(
+        "\n".join([
+            "{not json",                       # corrupt
+            json.dumps([1, 2, 3]),             # valid JSON, not an object
+            json.dumps({"nothing": "useful"}),  # missing the checked keys
+            json.dumps({k: "x" for k in _REQUIRED_KEYS}),  # missing the other four
+            json.dumps(_row(marker_id="good")),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    read = CorpusReadStats()
+    rows = list(iter_attribution_rows(path, stats=read))
+
+    assert [r.marker_id for r in rows] == ["good"]
+    assert read.skipped == 4
+
+
+def test_blank_lines_are_not_counted_as_declined(tmp_path: Path) -> None:
+    """Whitespace is not malformed data. Counting it would make a trailing
+    newline look like corruption."""
+    path = tmp_path / "c.jsonl"
+    path.write_text(
+        "\n\n" + json.dumps(_row(marker_id="a")) + "\n\n  \n", encoding="utf-8",
+    )
+    read = CorpusReadStats()
+    assert len(list(iter_attribution_rows(path, stats=read))) == 1
+    assert read.skipped == 0
+
+
+def test_a_clean_corpus_declines_nothing(tmp_path: Path) -> None:
+    """The zero case is the steady state and must be reachable — otherwise a
+    nonzero count says nothing."""
+    path = tmp_path / "c.jsonl"
+    _write(path, [_row(marker_id="a"), _row(marker_id="b")])
+    read = CorpusReadStats()
+    assert len(list(iter_attribution_rows(path, stats=read))) == 2
+    assert read.skipped == 0
+
+
+def test_the_tally_is_opt_in(tmp_path: Path) -> None:
+    """Callers that don't care pass nothing and still get the good rows — the
+    counting must not become a required argument at every call site."""
+    path = tmp_path / "c.jsonl"
+    _write(path, [{"nothing": "useful"}, _row(marker_id="ok")])
+    assert [r.marker_id for r in iter_attribution_rows(path)] == ["ok"]

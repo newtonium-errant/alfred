@@ -51,7 +51,7 @@ from pathlib import Path
 
 import structlog
 
-from .attribution_corpus import iter_attribution_rows
+from .attribution_corpus import CorpusReadStats, iter_attribution_rows
 
 log = structlog.get_logger(__name__)
 
@@ -72,6 +72,38 @@ DEMOTION_COUNTING_VIA = frozenset({"timeout_24h"})
 # stats rather than silently dropping out of the denominator.
 SECTION_UNKNOWN = "unknown"
 
+# ---------------------------------------------------------------------------
+# Successor pointers — where the two unbuilt halves of item 4 start.
+#
+# 1. THE CONTROLLED SECTION VOCABULARY (what the operator taps).
+#    It exists already, as inline string literals in the capture summary
+#    renderer: ``alfred/telegram/capture_batch.py``, in
+#    ``render_summary_markdown``. EIGHT headings, and note they are not one
+#    uniform block — SEVEN go through the local ``_section(...)`` helper
+#    (Topics, Decisions, Open Questions, Action Items, Key Insights, Raw
+#    Contradictions at lines 369-374, then Discarded Noise at 378, separated
+#    from the first six by a comment), and Re-encounters is appended directly
+#    at line 382 rather than through the helper. A ninth site, the brief-mode
+#    recap near line 1483, emits a two-heading SUBSET (Topics, Key Insights).
+#
+#    LIFT into one shared constant and have every site render from it; do NOT
+#    copy the list here. Two hand-maintained copies of a vocabulary drift, and
+#    when they do the stats key on headings the card no longer shows — the
+#    snooze-ladder precedent. Grepping only the contiguous 369-374 block is the
+#    specific way to get this wrong: it silently omits two live headings.
+#
+# 2. CARRYING THE TAPPED SECTION ON THE CONTEST ACT.
+#    The per-request payload precedent is ``correction_target`` —
+#    ``alfred/daily_sync/action_router.py`` line 1244, a keyword-only
+#    ``str | None = None`` on the act entry point. Thread ``section`` the same
+#    way; it lands on the corpus row's ``section`` field, which already exists
+#    and is already read below.
+#
+#    Whatever plumbs it must thread it at EVERY production call site in the
+#    same commit — an optional gate parameter that only tests pass is a live
+#    write side with a dead read side, and every pin stays green.
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class AttributionQuality:
@@ -84,6 +116,18 @@ class AttributionQuality:
     demotion_contests: int = 0
     #: Every contest, keyed by operator-named section (``unknown`` when none).
     contests_by_section: Counter = field(default_factory=Counter)
+    #: Rows in the corpus the READER declined — corrupt JSON, not an object,
+    #: or missing a field the entry cannot be built without. Counted because
+    #: the alternative is a metric whose denominator shrinks in silence: a
+    #: broken writer and a quiet fortnight produce the same low numbers, and
+    #: only this field tells them apart.
+    unreadable_rows: int = 0
+    #: Rows that read fine but whose ``action_at`` will not parse, so they
+    #: cannot be placed in or out of the window. Kept separate from
+    #: ``unreadable_rows`` because the two mean different things to whoever
+    #: reads the log — a writer emitting bad JSON is not a timestamp format
+    #: drifting.
+    undated_rows: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -92,6 +136,8 @@ class AttributionQuality:
             "contested": self.contested,
             "demotion_contests": self.demotion_contests,
             "sections": dict(self.contests_by_section),
+            "unreadable_rows": self.unreadable_rows,
+            "undated_rows": self.undated_rows,
         }
 
 
@@ -119,15 +165,20 @@ def attribution_quality_stats(
 
     A row whose ``action_at`` will not parse is skipped rather than raised: the
     same posture as the reader, for the same reason (a metric that dies on one
-    bad row stops being computed when it matters most).
+    bad row stops being computed when it matters most). Both kinds of skip are
+    COUNTED and logged — skipping quietly is what would make this metric lie.
     """
     when = now or datetime.now(timezone.utc)
     cutoff = when - timedelta(days=window_days)
     stats = AttributionQuality(window_days=window_days)
+    read = CorpusReadStats()
 
-    for row in iter_attribution_rows(corpus_path):
+    for row in iter_attribution_rows(corpus_path, stats=read):
         acted = _parse(row.action_at)
-        if acted is None or acted < cutoff:
+        if acted is None:
+            stats.undated_rows += 1
+            continue
+        if acted < cutoff:
             continue
         action = (row.andrew_action or "").strip()
         if action == "auto_confirm":
@@ -138,6 +189,10 @@ def attribution_quality_stats(
             stats.contests_by_section[section] += 1
             if (row.confirmed_via or "").strip() in DEMOTION_COUNTING_VIA:
                 stats.demotion_contests += 1
+
+    # Safe to read only now: the generator fills this in as rows are consumed
+    # and the loop above always runs it to exhaustion.
+    stats.unreadable_rows = read.skipped
 
     # ILB: fires on EVERY call, including the all-zero quiet window that is the
     # healthy steady state. A metric that logs only when it has news is

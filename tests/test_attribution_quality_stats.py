@@ -201,6 +201,65 @@ def test_a_missing_corpus_is_a_quiet_window_not_an_error(tmp_path: Path) -> None
     assert render_quality_line(s)
 
 
+# --- the denominator can't shrink in silence --------------------------------
+
+
+def test_rows_the_reader_declined_are_counted_and_logged(tmp_path: Path) -> None:
+    """A broken writer and a quiet fortnight both produce low counts. Only this
+    field tells them apart, so it has to reach the event."""
+    path = tmp_path / "corpus.jsonl"
+    path.write_text(
+        "\n".join([
+            "{not json",
+            json.dumps({"nothing": "useful"}),
+            json.dumps(_row("contest", days_ago=1, via="timeout_24h")),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    with structlog.testing.capture_logs() as cap:
+        s = attribution_quality_stats(path, now=NOW)
+
+    assert s.contested == 1
+    assert s.unreadable_rows == 2
+    matches = [c for c in cap if c.get("event") == QUALITY_EVENT]
+    assert len(matches) == 1
+    assert matches[0]["unreadable_rows"] == 2
+
+
+def test_an_undated_row_is_counted_apart_from_an_unreadable_one(
+    tmp_path: Path,
+) -> None:
+    """Different causes, different fixes: bad JSON is a writer emitting garbage,
+    a bad timestamp is a format drifting. One number would hide which."""
+    bad = _row("contest", via="timeout_24h")
+    bad["action_at"] = "not-a-date"
+    with structlog.testing.capture_logs() as cap:
+        s = _stats(tmp_path, [bad, _row("contest", days_ago=1, via="timeout_24h")])
+
+    assert s.contested == 1
+    assert s.undated_rows == 1
+    assert s.unreadable_rows == 0, "it parsed fine — only its date didn't"
+    matches = [c for c in cap if c.get("event") == QUALITY_EVENT]
+    assert matches[0]["undated_rows"] == 1
+
+
+def test_a_row_merely_outside_the_window_is_not_a_decline(tmp_path: Path) -> None:
+    """The window excluding old activity is the metric working. Counting that
+    as a declined row would make every healthy corpus look damaged."""
+    s = _stats(tmp_path, [_row("contest", days_ago=40, via="timeout_24h")])
+    assert s.contested == 0
+    assert s.undated_rows == 0 and s.unreadable_rows == 0
+
+
+def test_both_decline_counts_ride_the_zero_path(tmp_path: Path) -> None:
+    """ILB: the healthy answer is an explicit zero, not an absent key."""
+    with structlog.testing.capture_logs() as cap:
+        _stats(tmp_path, [])
+    matches = [c for c in cap if c.get("event") == QUALITY_EVENT]
+    assert matches[0]["unreadable_rows"] == 0
+    assert matches[0]["undated_rows"] == 0
+
+
 # --- the provider actually renders it (the gate-param trap) ------------------
 
 
