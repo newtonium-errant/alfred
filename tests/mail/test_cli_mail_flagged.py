@@ -43,7 +43,9 @@ def test_cli_fetch_flagged_threads_only_flagged_true(tmp_path, monkeypatch):
     """--flagged → fetch_all(only_flagged=True), called exactly once with --once."""
     calls = []
 
-    def _spy(config, vault_path, *, only_flagged=False):
+    # #75 — mirrors the real signature; the CLI now builds one state
+    # manager up front and threads it through each fetch.
+    def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
         calls.append(only_flagged)
         return 0
 
@@ -57,7 +59,9 @@ def test_cli_fetch_no_flag_is_all_accounts(tmp_path, monkeypatch):
     """No flag → fetch_all(only_flagged=False) — current behavior, byte-unchanged."""
     calls = []
 
-    def _spy(config, vault_path, *, only_flagged=False):
+    # #75 — mirrors the real signature; the CLI now builds one state
+    # manager up front and threads it through each fetch.
+    def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
         calls.append(only_flagged)
         return 0
 

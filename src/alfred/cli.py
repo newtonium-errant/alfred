@@ -4417,7 +4417,15 @@ def cmd_mail(args: argparse.Namespace) -> None:
         # scope so a scoped/overnight drain doesn't also IMAP-fetch the dead
         # live.ca/Outlook account. Absent → all accounts (byte-unchanged).
         only_flagged = getattr(args, "flagged", False)
-        total = fetch_all(config, vault_path, only_flagged=only_flagged)
+        # #75 — one manager for however long this command runs, built before
+        # the first fetch. Same rule as the daemon loop below the CLI: the
+        # polling form ticks indefinitely, and rebuilding per tick would
+        # re-resolve the state path against the cwd of that tick.
+        from alfred.mail.fetcher import state_manager_for
+        state_mgr = state_manager_for(config)
+        total = fetch_all(
+            config, vault_path, only_flagged=only_flagged, state_mgr=state_mgr
+        )
         print(f"Fetched {total} new email(s).")
         if not args.once:
             import time
@@ -4425,7 +4433,10 @@ def cmd_mail(args: argparse.Namespace) -> None:
             try:
                 while True:
                     time.sleep(config.poll_interval)
-                    total = fetch_all(config, vault_path, only_flagged=only_flagged)
+                    total = fetch_all(
+                        config, vault_path,
+                        only_flagged=only_flagged, state_mgr=state_mgr,
+                    )
                     if total:
                         print(f"Fetched {total} new email(s).")
             except KeyboardInterrupt:
@@ -4436,7 +4447,11 @@ def cmd_mail(args: argparse.Namespace) -> None:
         inbox_path = vault_path / config.inbox_dir
         run_webhook(inbox_path, host=args.host, port=args.port, token=token)
     elif subcmd == "status":
-        sm = StateManager(config.state_path)
+        # #75 — through the same helper as every other mail state construction,
+        # so an unset state_path says so instead of silently reading nothing
+        # out of the cwd and reporting "no emails fetched yet."
+        from alfred.mail.fetcher import state_manager_for
+        sm = state_manager_for(config)
         sm.load()
         for name, ids in sm.state.seen_ids.items():
             print(f"  {name}: {len(ids)} emails fetched")

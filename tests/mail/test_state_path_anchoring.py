@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from alfred.mail.config import load_from_unified
+from alfred.mail.config import MailAccount, MailConfig, load_from_unified
 from alfred.mail.state import StateManager
 
 
@@ -135,3 +135,181 @@ def test_the_fetch_path_leaves_no_debris_outside_the_configured_state_dir(
     assert (state_dir / "mail_state.json").exists(), (
         "state went somewhere other than the configured dir"
     )
+
+
+# ===========================================================================
+# #75 — the residue #53 left behind
+#
+# #53 fixed absolute-at-construction and the derived default, and the debris
+# guard still caught ``data/mail_state.json`` on its first full-suite run. Two
+# things survived:
+#
+#   1. ``MailConfig.state_path`` was still the cwd-relative literal, so a
+#      hand-built config aimed the writer at the cwd. The live contaminator was
+#      ``orchestrator._fetch_tick(MailConfig(), ...)`` in the shadow-parity
+#      tests: ``fetch_all`` has no early return for "no accounts", so a
+#      zero-account tick still ran ``save()``.
+#   2. The fetcher built a NEW manager EVERY TICK. Since the path resolves at
+#      construction, a long-lived loop re-aimed itself at whatever cwd each
+#      tick happened to see — the defect that made this cross-file and
+#      nondeterministic rather than reproducible from one file.
+# ===========================================================================
+
+
+def test_a_bare_config_carries_no_cwd_relative_default():
+    """The literal itself. A default that resolves against the cwd is wrong on
+    every instance, so there is deliberately no fallback to be right about."""
+    assert MailConfig().state_path == ""
+
+
+def test_an_empty_state_path_fails_loud_rather_than_guessing():
+    """Refusal, not a fallback. A guessed path writes somewhere real and nobody
+    notices; the error names the two supported ways to set it."""
+    from alfred.mail.fetcher import state_manager_for
+
+    with pytest.raises(ValueError) as exc:
+        state_manager_for(MailConfig())
+    msg = str(exc.value)
+    assert "load_from_unified" in msg
+    assert "mail.state.path" in msg
+
+
+def test_the_contaminator_shape_leaves_nothing_in_the_cwd(tmp_path, monkeypatch):
+    """THE acceptance pin — the exact call that was seeding the suite.
+
+    A bare-config tick from a foreign cwd. Before #75 this wrote
+    ``data/mail_state.json`` into whatever directory was live, which under the
+    suite meant the repo root or an unrelated test's tmp dir. The tick must
+    still not RAISE (fault isolation is what keeps the webhook alive), so the
+    assertion is about the filesystem, not about the return.
+    """
+    import alfred.orchestrator as orch
+
+    foreign = tmp_path / "foreign_cwd"
+    foreign.mkdir()
+    monkeypatch.chdir(foreign)
+
+    orch._fetch_tick(MailConfig(), Path("/tmp"))
+
+    leaked = sorted(str(p.relative_to(foreign)) for p in foreign.rglob("*"))
+    assert leaked == [], f"the tick seeded the cwd: {leaked}"
+
+
+def _fetch_enabled_config(state_path: str) -> MailConfig:
+    cfg = MailConfig(
+        accounts=[MailAccount(
+            name="gmail", email="a@gmail.com", imap_host="imap.gmail.com", fetch=True,
+        )],
+        state_path=state_path,
+    )
+    cfg.fetch.enabled = True
+    return cfg
+
+
+def test_the_daemon_loop_builds_one_manager_for_every_tick(tmp_path, monkeypatch):
+    """The per-tick-reconstruction pin.
+
+    Constructing inside the tick is wrong even with a good default, because the
+    path is resolved at construction: a daemon's state file must not move when
+    something else changes directory underneath it. Pins the loop handing the
+    SAME instance to every tick, so a regression that moves construction back
+    into the tick fails here rather than as debris three files away.
+    """
+    import threading
+    import time
+
+    import alfred.orchestrator as orch
+
+    class _Stop(Exception):
+        pass
+
+    seen: list[object] = []
+
+    def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
+        seen.append(state_mgr)
+        return 0
+
+    def _fake_sleep(_seconds):
+        if len(seen) >= 3:
+            raise _Stop
+
+    captured: dict = {}
+
+    class _FakeThread:
+        def __init__(self, target=None, name=None, daemon=None, **kw):
+            captured["target"] = target
+
+        def start(self):
+            pass  # run it ourselves, bounded
+
+    monkeypatch.setattr("alfred.mail.fetcher.fetch_all", _spy)
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+    monkeypatch.setattr(time, "sleep", _fake_sleep)
+
+    orch._maybe_start_mail_fetch_loop(
+        _fetch_enabled_config(str(tmp_path / "state" / "mail_state.json")),
+        tmp_path / "vault",
+    )
+    with pytest.raises(_Stop):
+        captured["target"]()
+
+    assert len(seen) == 3, "the loop did not tick"
+    assert all(m is not None for m in seen), "the loop never passed a manager"
+    assert seen[0] is seen[1] is seen[2], "a NEW manager per tick — the #75 defect"
+
+
+def test_the_loop_refuses_to_start_on_an_unusable_state_path(tmp_path, monkeypatch):
+    """Fail at STARTUP, not once per tick.
+
+    Inside the tick the refusal would be swallowed by ``_fetch_tick``'s
+    catch-all and logged forever as ``mail.fetch.loop_error`` — a daemon that
+    looks alive and persists nothing. Building the manager before the thread
+    exists puts the error where the operator sees it, and starts no thread.
+    """
+    import threading
+
+    import alfred.orchestrator as orch
+
+    started: list[str] = []
+
+    class _FakeThread:
+        def __init__(self, target=None, name=None, daemon=None, **kw):
+            pass
+
+        def start(self):
+            started.append("started")
+
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+
+    with pytest.raises(ValueError):
+        orch._maybe_start_mail_fetch_loop(_fetch_enabled_config(""), tmp_path / "vault")
+    assert started == [], "a thread was started on an unusable state path"
+
+
+def test_the_loop_logs_where_it_will_write(tmp_path, monkeypatch):
+    """ILB: the debris was invisible partly because nothing said where the loop
+    was writing. The resolved destination is reported once, at start."""
+    import threading
+
+    import structlog
+
+    import alfred.orchestrator as orch
+
+    class _FakeThread:
+        def __init__(self, target=None, name=None, daemon=None, **kw):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+    target = tmp_path / "state" / "mail_state.json"
+
+    with structlog.testing.capture_logs() as cap:
+        orch._maybe_start_mail_fetch_loop(
+            _fetch_enabled_config(str(target)), tmp_path / "vault",
+        )
+
+    started = [c for c in cap if c.get("event") == "mail.fetch.loop_started"]
+    assert len(started) == 1
+    assert started[0]["state_path"] == str(target.resolve())

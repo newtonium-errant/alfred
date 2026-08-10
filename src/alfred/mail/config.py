@@ -101,7 +101,22 @@ class GmailFilingConfig:
 class MailConfig:
     accounts: list[MailAccount] = field(default_factory=list)
     poll_interval: int = 300  # seconds
-    state_path: str = "./data/mail_state.json"
+    # #75 — EMPTY, deliberately, and it is not an oversight that there is no
+    # fallback here. This was ``"./data/mail_state.json"``: cwd-relative, so a
+    # bare ``MailConfig()`` aimed the state writer at whatever directory the
+    # process happened to be standing in. #53 fixed the two halves around it
+    # (absolute-at-construction, and ``load_from_unified`` deriving from the
+    # instance's ``logging.dir``) but left this literal, and this literal is
+    # what kept writing ``data/mail_state.json`` into the repo and into other
+    # tests' tmp dirs.
+    #
+    # Production never reads this default — ``load_from_unified`` always sets
+    # the field. So the only callers it can serve are hand-built configs, and
+    # for those a wrong-but-plausible path is worse than a refusal: it writes
+    # somewhere real and nobody notices. ``fetcher.state_manager_for`` fails
+    # loud on empty rather than guessing. Per the per-instance-defaults rule —
+    # a default that would be wrong on another instance must not ship.
+    state_path: str = ""
     inbox_dir: str = "inbox"
     # #7 7a — the native IMAP fetch-loop gate (INERT by default).
     fetch: MailFetchConfig = field(default_factory=MailFetchConfig)

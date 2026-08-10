@@ -287,7 +287,10 @@ def test_fetch_tick_survives_raising_fetch_all_and_logs(monkeypatch):
 
 def test_fetch_tick_happy_path_calls_fetch_all_only_flagged(monkeypatch):
     seen = {}
-    def _spy(config, vault_path, *, only_flagged=False):
+    # #75 — mirrors the real signature, including the state manager the loop
+    # now threads through. A double that drifts from the function it stands in
+    # for stops testing the call it claims to test.
+    def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
         seen["only_flagged"] = only_flagged
         return 0
     monkeypatch.setattr("alfred.mail.fetcher.fetch_all", _spy)

@@ -589,19 +589,24 @@ def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> Non
     )
 
 
-def _fetch_tick(config, vault_path: Path) -> None:
+def _fetch_tick(config, vault_path: Path, state_mgr=None) -> None:
     """#7 7b — one iteration of the native fetch loop's work, isolated for fault-tolerance.
 
     Extracted from ``_maybe_start_mail_fetch_loop._loop`` (behavior-preserving) so the fault-isolation
     guarantee is independently testable: a transient IMAP fault raised by ``fetch_all`` is caught HERE and
     logged as ``mail.fetch.loop_error``, so the loop (and the webhook sharing this process) never die on a
     transient fault. ``fetch_all`` is imported at call time so the loop picks up config/monkeypatch state
-    live (and the mail dependency isn't dragged in unless the loop actually runs)."""
+    live (and the mail dependency isn't dragged in unless the loop actually runs).
+
+    ``state_mgr`` — #75. The loop builds ONE manager before the thread starts and passes the same
+    instance every tick, so the state file's location is fixed at daemon start. Building it per tick
+    re-resolved a relative path against that tick's cwd; that is how ``data/mail_state.json`` kept
+    appearing in the repo root and in unrelated tests' tmp dirs."""
     import structlog
     log = structlog.get_logger(__name__)
     from alfred.mail.fetcher import fetch_all
     try:
-        fetch_all(config, vault_path, only_flagged=True)
+        fetch_all(config, vault_path, only_flagged=True, state_mgr=state_mgr)
     except Exception:  # noqa: BLE001 — a transient IMAP fault must not kill the loop or webhook
         log.exception("mail.fetch.loop_error")
 
@@ -629,15 +634,34 @@ def _maybe_start_mail_fetch_loop(config, vault_path: Path) -> None:
 
     interval = config.fetch_poll_interval()
 
+    # #75 — ONE manager, built HERE, before the thread exists. Two reasons it
+    # has to be here rather than inside the tick:
+    #
+    #   * The path resolves at construction. Building it now pins the state
+    #     file to the daemon's own cwd; building it per tick re-resolved it
+    #     against whatever cwd was live at that moment, so the file followed
+    #     the process around.
+    #   * An unusable state_path fails LOUD here, at startup, where the
+    #     operator sees it. Inside the tick it would be swallowed by
+    #     ``_fetch_tick``'s catch-all and logged forever as a per-tick
+    #     ``mail.fetch.loop_error`` — a daemon that looks alive and never
+    #     persists anything.
+    from alfred.mail.fetcher import state_manager_for
+    state_mgr = state_manager_for(config)
+
     def _loop() -> None:
         while True:
-            _fetch_tick(config, vault_path)
+            _fetch_tick(config, vault_path, state_mgr)
             time.sleep(interval)
 
     threading.Thread(target=_loop, name="mail-fetch", daemon=True).start()
     log.info(
         "mail.fetch.loop_started",
         accounts=[a.name for a in fetch_accounts], poll_interval=interval,
+        # #75 — the resolved destination, logged once at start. The debris this
+        # fixes was invisible partly because nothing ever said where the loop
+        # was writing.
+        state_path=str(state_mgr.path),
         detail="native IMAP fetch loop started ALONGSIDE the webhook (#7 rehome — the webhook is not "
                "evicted; live.ca still arrives via n8n).")
 

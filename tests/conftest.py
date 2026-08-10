@@ -887,29 +887,24 @@ _DEBRIS_SKIP_DIRS = frozenset({
 #                                         hardcoded fallbacks at
 #                                         routes_voice.py:490,646  -> #74
 #
-#   data/mail_state.json                  RESIDUE of #53              -> #75
+# ``data/mail_state.json`` WAS here, as the residue of #53. It is gone — #75
+# closed it, and this list is one shorter as the definition of done. Kept as a
+# note because the shape is the one to look for in the remaining entries:
 #
-# The mail entry needs its own note, because it is the item this same lane
-# claimed to fix and the claim was only PARTLY true — this guard is what caught
-# that, on its first full-suite run.
+# #53 fixed two real halves (absolute-at-construction, and
+# ``load_from_unified`` deriving from the instance's ``logging.dir``) and the
+# guard still caught the file, because two things survived. The DATACLASS
+# default was still cwd-relative, so a bare ``MailConfig()`` aimed the writer
+# at the cwd — and ``fetch_all`` has no early return for "no accounts", so even
+# a zero-account tick saved. And the fetcher rebuilt its ``StateManager`` every
+# tick, which re-resolved that relative path against whatever cwd the tick
+# happened to see. The second half is why it never reproduced from a single
+# file: the leak needed one test's chdir window to overlap another's tick.
 #
-# #53 did fix two real halves: the path is now absolute at construction (a
-# daemon thread can no longer be redirected by a later cwd change), and
-# ``load_from_unified`` derives the default from the instance's ``logging.dir``.
-# What survives is the DATACLASS default — ``MailConfig.state_path`` is still
-# the cwd-relative ``"./data/mail_state.json"``, so a bare ``MailConfig()``
-# built in a test still points at the tree.
-#
-# It does not reproduce from any single test file. Measured: ``tests/mail`` is
-# clean alone, ``tests/orchestrator`` and ``tests/test_orchestrator_spawn.py``
-# are clean alone, every ``tests/mail/test_*.py`` paired with spawn is clean —
-# but ``tests/mail`` + the orchestrator files together leak it. That is a
-# cross-file interaction (a monkeypatch that stops covering ``fetch_all`` once
-# enough of the module graph is imported), and isolating it is a bisect, not a
-# one-liner. Allowlisted so the suite stays GREEN and the debt stays NAMED,
-# rather than left red overnight or quietly dropped.
+# Fixed by removing the default outright (empty + fail-loud, since production
+# always derives it) and by constructing the manager ONCE at loop start. The
+# regression pins live in ``tests/mail/test_state_path_anchoring.py``.
 _DEBRIS_ALLOWLIST = frozenset({
-    "data/mail_state.json",
     "data/canonical_audit.jsonl",
     "data/feed_items.jsonl",
     "data/feed_items.lock",
