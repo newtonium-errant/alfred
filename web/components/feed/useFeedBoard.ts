@@ -31,8 +31,19 @@ export interface UseFeedBoardResult {
   toast: FeedBoardToast | null;
   banner: string | null;
   ack: (id: string) => void;
-  /** #63a — "not right": contest an attribution inference (FYI → needs-you). */
-  contest: (id: string) => void;
+  /**
+   * #63a — "not right": contest an attribution inference (FYI → needs-you).
+   *
+   * `section` (#72 item 4) is the capture-summary heading the operator named,
+   * when he named one. It rides the SAME act as the contest and cannot be sent
+   * afterwards: the server writes the corpus row inside the branch that flips
+   * the vault entry, and a second contest on an already-contested entry is an
+   * idempotent no-op that writes nothing. So a card-level contest is
+   * permanently sectionless — which is why the picker must be reachable before
+   * the tap that lands, and why omitting it stays a first-class choice rather
+   * than something to be nagged out of the operator.
+   */
+  contest: (id: string, section?: string) => void;
   dismissToast: () => void;
 }
 
@@ -103,10 +114,12 @@ export function useFeedBoard(opts: UseFeedBoardOptions): UseFeedBoardResult {
   );
 
   const contest = useCallback(
-    (id: string) => {
+    (id: string, section?: string) => {
       // Optimistic PROMOTE — the row crosses from FYI to needs-you on tap.
       setContestedIds((prev) => new Set(prev).add(id));
-      feedApi.act(id, CONTEST_ACTION).catch((e: unknown) => {
+      // `undefined` for correctionTarget: the two optionals belong to different
+      // actions and are never sent together.
+      feedApi.act(id, CONTEST_ACTION, undefined, section).catch((e: unknown) => {
         if (e instanceof ApiError) {
           if (e.status === 401) {
             onAuthExpired?.();

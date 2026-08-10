@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { SNOOZE_ACTIONS, SNOOZE_LABELS, kindLabel, snoozeIsBacked } from '../../lib/algernon/feedConstants';
+import { CONTEST_SECTIONS, SNOOZE_ACTIONS, SNOOZE_LABELS, contestSectionSlug, kindLabel, snoozeIsBacked } from '../../lib/algernon/feedConstants';
 import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import { COMPLETION_UNAVAILABLE_HINT, effectiveStageOf, ringItemCompletable, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
 import type { UseRingCompletionResult } from './useRingCompletion';
@@ -29,8 +29,20 @@ export interface FeedRowProps {
    * and contest means "seen, wrong", and the ruling that demoted these cards
    * depends on both being one tap away — the glance tier is only safe while
    * disagreeing stays as cheap as agreeing.
+   *
+   * The optional `section` (#72 item 4) is the capture-summary heading the
+   * operator named via the picker below. WHY THE PICKER IS A SECOND CONTROL
+   * rather than an expansion behind "Not right": the section has to ride the
+   * contest act itself (the server writes the corpus row only in the branch
+   * that flips the vault entry, and a second contest is an idempotent no-op
+   * that records nothing), so a picker in front of "Not right" would make every
+   * card-level contest cost two taps. That directly contradicts the invariant
+   * the demotion rests on — disagreeing must stay as cheap as agreeing. The
+   * house precedent is routine_match: the left-swipe reject says "not that
+   * item" and stops there, while the richer "what did this mean?" doors sit one
+   * tap further in.
    */
-  onContest?: () => void;
+  onContest?: (section?: string) => void;
   /**
    * Present → this is a slot row: render the per-STAGE affordance (SUGGESTED→Accept /
    * PLANNED→✓ / DONE→marker+undo) driven by the SHARED hooks (the identical per-lane
@@ -59,6 +71,8 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
   // The row's own duration menu. Local because it is per-row transient UI, not
   // board state — nothing outside this row needs to know it's open.
   const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
+  // Same reasoning for the #72 section picker: transient, per-row, never lifted.
+  const [sectionPickerOpen, setSectionPickerOpen] = useState(false);
   const rows = evidenceRows(item.evidence);
   // A digest/prose body (peer_digest et al.) OR a safe external link (the email
   // "Open in Gmail" deep-link, #26) also makes the row expandable, even when it has
@@ -168,7 +182,7 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
                 type="button"
                 data-testid="feed-row-contest"
                 aria-label={`Not right — send back for review: ${item.title || item.id}`}
-                onClick={onContest}
+                onClick={() => onContest()}
                 className="rounded-lg border border-honeydew-300 px-2 py-1.5 text-[11px] font-bold uppercase tracking-wider text-honeydew-600"
               >
                 Not right
@@ -186,6 +200,52 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
           </div>
         ) : null}
       </div>
+
+      {onContest && (
+        <div className="mt-2 border-t border-dashed border-honeydew-200 pt-2">
+          {!sectionPickerOpen ? (
+            <button
+              type="button"
+              data-testid="feed-row-contest-which"
+              aria-haspopup="true"
+              aria-expanded={false}
+              onClick={() => setSectionPickerOpen(true)}
+              className="text-[11px] font-bold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+            >
+              Which part was wrong?
+            </button>
+          ) : (
+            <div data-testid="feed-row-contest-sections" className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-honeydew-600">
+                Section
+              </span>
+              {CONTEST_SECTIONS.map((section) => (
+                <button
+                  key={section}
+                  type="button"
+                  data-testid={`feed-row-contest-section-${contestSectionSlug(section)}`}
+                  aria-label={`Not right — ${section}: ${item.title || item.id}`}
+                  onClick={() => {
+                    setSectionPickerOpen(false);
+                    onContest(section);
+                  }}
+                  className="rounded-lg border border-honeydew-400 px-2 py-1 text-[11px] font-semibold text-honeydew-700"
+                >
+                  {section}
+                </button>
+              ))}
+              <button
+                type="button"
+                data-testid="feed-row-contest-section-cancel"
+                onClick={() => setSectionPickerOpen(false)}
+                className="text-[11px] font-semibold text-honeydew-600 underline underline-offset-2"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {snoozeOffered && (
         <div className="mt-2 border-t border-dashed border-honeydew-200 pt-2">

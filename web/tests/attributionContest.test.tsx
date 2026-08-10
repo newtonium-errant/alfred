@@ -92,7 +92,7 @@ describe('useFeedBoard — contest', () => {
   it('POSTs the contest action', async () => {
     const { result } = renderHook(() => useFeedBoard({ items: [item({ id: 'a1' })] }));
     act(() => result.current.contest('a1'));
-    expect(mockAct).toHaveBeenCalledWith('a1', 'contest');
+    expect(mockAct).toHaveBeenCalledWith('a1', 'contest', undefined, undefined);
     await flush();
   });
 

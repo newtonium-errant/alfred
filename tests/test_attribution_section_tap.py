@@ -327,3 +327,66 @@ def test_an_invented_section_still_records_the_contest_as_unknown(
         json.loads(ln) for ln in corpus.read_text().splitlines() if ln.strip()
     ]
     assert rows[0]["section"] == "", "an invented section minted a bucket"
+
+
+# ---------------------------------------------------------------------------
+# #72 item 4, the web half — CROSS-SURFACE DRIFT PIN.
+#
+# Same shape as the CONTEST_ACTION pin in test_daily_sync/test_attribution_tier
+# and the snooze-ladder pin in tier/test_board_snooze: the PWA cannot import a
+# Python tuple, so it keeps its own spelling of the vocabulary and the two can
+# drift in silence. Parsed out of the TS source rather than restated, so this
+# does not become the third copy the capture_sections docstring warns about.
+# ---------------------------------------------------------------------------
+
+
+def _web_contest_sections() -> list[str]:
+    """The picker's vocabulary, read out of feedConstants.ts."""
+    import re
+
+    ts = (
+        Path(__file__).resolve().parents[1]
+        / "web" / "lib" / "algernon" / "feedConstants.ts"
+    )
+    assert ts.exists(), f"the web constants moved — update this pin: {ts}"
+    block = re.search(
+        r"export const CONTEST_SECTIONS = \[(.*?)\] as const;",
+        ts.read_text(encoding="utf-8"),
+        re.S,
+    )
+    assert block, "CONTEST_SECTIONS not found in feedConstants.ts"
+    return re.findall(r"'([^']+)'", block.group(1))
+
+
+def test_web_picker_offers_exactly_the_rendered_headings_in_order() -> None:
+    """The tap's vocabulary and the renderer's must be the same list.
+
+    Order counts as well as membership: the operator picks from this list on the
+    card, and capture_sections' own comment makes the order part of the contract
+    rather than incidental.
+
+    Mutation: drop or rename one entry on either side alone → this fails and
+    names the mismatch. It is the only thing that can: the web tests compare the
+    array against itself, and the Python tests never look at the browser.
+    """
+    assert _web_contest_sections() == list(SUMMARY_SECTIONS), (
+        "section vocabulary drift — the PWA picker and the summary renderer "
+        "disagree about the headings"
+    )
+
+
+def test_every_heading_the_web_offers_survives_the_router_normaliser() -> None:
+    """The end the drift actually costs.
+
+    A picker value the router does not recognise is normalised to ``""`` and
+    files under ``unknown``. That fails SAFE — the contest still lands — which
+    is exactly why it is invisible: the operator gets his correction recorded,
+    and the per-section statistic silently loses the dimension it exists for.
+    So the pin asserts the round trip, not just the list equality above.
+    """
+    from alfred.daily_sync.action_router import _normalise_contested_section
+
+    for section in _web_contest_sections():
+        assert _normalise_contested_section(section) == section, (
+            f"the PWA offers {section!r}, which the router files under unknown"
+        )
