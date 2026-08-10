@@ -258,6 +258,47 @@ def test_the_daemon_loop_builds_one_manager_for_every_tick(tmp_path, monkeypatch
     assert seen[0] is seen[1] is seen[2], "a NEW manager per tick — the #75 defect"
 
 
+def test_fetch_all_writes_through_the_manager_it_was_handed(tmp_path, monkeypatch):
+    """The other half of the per-tick pin, and the half that actually catches
+    the revert.
+
+    The loop-level pin above proves the LOOP builds one manager and passes it
+    every tick. It monkeypatches ``fetch_all``, so it stays green if
+    ``fetch_all`` ignores the argument and rebuilds from config — which is
+    precisely the regression (construction moves back inside, the path
+    re-resolves per call, the handed manager becomes decorative). Found by
+    mutation: reverting ``fetch_all`` to unconditional construction left the
+    loop pin green.
+
+    So drive the REAL ``fetch_all`` and aim the three locations apart: the
+    manager points at one dir, the config at another, the cwd at a third. Only
+    the handed manager's dir may be written.
+    """
+    from alfred.mail.fetcher import fetch_all
+
+    handed = tmp_path / "handed"
+    from_config = tmp_path / "from_config"
+    foreign = tmp_path / "foreign_cwd"
+    foreign.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    mgr = StateManager(handed / "mail_state.json")
+    cfg = MailConfig(state_path=str(from_config / "mail_state.json"))
+
+    monkeypatch.chdir(foreign)
+    fetch_all(cfg, vault, only_flagged=True, state_mgr=mgr)
+
+    assert (handed / "mail_state.json").exists(), (
+        "the handed manager was ignored"
+    )
+    assert not from_config.exists(), (
+        "rebuilt from config — per-tick construction is back"
+    )
+    leaked = sorted(str(p.relative_to(foreign)) for p in foreign.rglob("*"))
+    assert leaked == [], f"debris in the cwd: {leaked}"
+
+
 def test_the_loop_refuses_to_start_on_an_unusable_state_path(tmp_path, monkeypatch):
     """Fail at STARTUP, not once per tick.
 
