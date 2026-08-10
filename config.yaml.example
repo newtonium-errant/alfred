@@ -1190,12 +1190,41 @@ daily_sync:
     # calibration corpus above). Append-only JSONL; one row per
     # confirm, reject, contest, or auto-confirm.
     corpus_path: "./data/attribution_audit_corpus.jsonl"
-    # #72 — trailing window for the attribution quality stat line (and, when it
-    # lands, the self-demotion trigger). The sync renders
+    # #72 — trailing window for the attribution quality stat line AND the
+    # demotion trigger. The sync renders
     # "Attribution quality: N auto-confirmed, M contested (14-day)" on EVERY
     # run, zero included — a metric that prints only when it has news is
-    # indistinguishable from one that stopped running.
+    # indistinguishable from one that stopped running. A second line beside it
+    # reports the per-section breakdown, or says plainly that no contest has
+    # named a section yet.
     quality_window_days: 14
+    # #72 — how many demotion-bearing contests inside that window it takes to
+    # RAISE A QUESTION. Not to change anything: crossing this appends one
+    # pending proposal to the Daily Sync ("put attribution cards back under
+    # review?"), which moves the tier only if you reply `N confirm`. Rejecting
+    # it stays quiet for one full quality_window_days, so the next card is
+    # built from contests that are entirely new since you said no.
+    #
+    # Only contests against entries the 24h sweep confirmed UNREVIEWED count —
+    # a contest you made inside the window is the current design working, not
+    # evidence against it.
+    #
+    # Raise it to be asked less often; lower it to be asked sooner. 1 means a
+    # single wrong auto-confirm raises the card, which is usually too eager:
+    # one is not a pattern, and a card that arrives on noise is one you learn
+    # to dismiss unread.
+    demotion_threshold: 2
+    # Both #72 state files DERIVE from corpus_path's directory when left empty,
+    # so they follow it automatically and add no new cwd-relative literals of
+    # their own. Set them only to put this state somewhere else — and if you
+    # do, move corpus_path with them, or one section's state ends up split
+    # across two directories.
+    #   demotion_queue_path: ""   # default: <corpus dir>/attribution_demotion_queue.jsonl
+    #   tier_override_path:  ""   # default: <corpus dir>/feed_tier_overrides.json
+    #
+    # An approved demotion is undone with:
+    #   alfred tier-override list
+    #   alfred tier-override clear attribution
 
 # Pending Items Queue (Phase 1) — items only Andrew can answer.
 # Per-instance JSONL queue (data/pending_items.jsonl) + auto-

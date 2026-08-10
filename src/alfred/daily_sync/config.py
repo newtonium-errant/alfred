@@ -164,7 +164,44 @@ class AttributionConfig:
     # The trap to avoid is the half-derived section: anchoring only the new
     # paths while ``corpus_path`` beside them stays cwd-relative splits one
     # section's state across two directories.
+    #
+    # BUILT (#72 final lane) — the two fields below, resolved by the two
+    # accessors at the bottom of this class. The decision above is what they
+    # implement; it stays here because it is the reason they have no defaults
+    # of their own.
     # ------------------------------------------------------------------
+    #: Pending demotion proposals (JSONL queue). Empty → derived; see
+    #: :meth:`resolved_demotion_queue_path`.
+    demotion_queue_path: str = ""
+    #: Approved per-kind feed tier overrides (JSON). Empty → derived; see
+    #: :meth:`resolved_tier_override_path`.
+    tier_override_path: str = ""
+    # How many demotion-bearing contests inside ``quality_window_days`` it takes
+    # to raise ONE proposal. Config-backed for the same reason the window is:
+    # the operator tunes how loud the evidence has to be before he is asked,
+    # without a code change.
+    #
+    # Two rather than one because a single wrong auto-confirm is not a pattern —
+    # it is the thing the contest door already handled, per item. The proposal
+    # asks a policy question ("should this whole tier go back under review?"),
+    # and asking it off one data point trains the operator to dismiss it.
+    demotion_threshold: int = 2
+
+    def _sibling(self, filename: str) -> str:
+        """``filename`` beside the corpus, per the derivation decision above."""
+        return str(Path(self.corpus_path).parent / filename)
+
+    def resolved_demotion_queue_path(self) -> str:
+        """Explicit config wins; otherwise derive beside ``corpus_path``."""
+        return self.demotion_queue_path or self._sibling(
+            "attribution_demotion_queue.jsonl",
+        )
+
+    def resolved_tier_override_path(self) -> str:
+        """Explicit config wins; otherwise derive beside ``corpus_path``."""
+        return self.tier_override_path or self._sibling(
+            "feed_tier_overrides.json",
+        )
 
 
 @dataclass
