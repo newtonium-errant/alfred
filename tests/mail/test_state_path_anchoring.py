@@ -195,12 +195,13 @@ def test_the_contaminator_shape_leaves_nothing_in_the_cwd(tmp_path, monkeypatch)
     assert leaked == [], f"the tick seeded the cwd: {leaked}"
 
 
-def _fetch_enabled_config(state_path: str) -> MailConfig:
+def _fetch_enabled_config(state_path: str, *, poll_interval: int = 300) -> MailConfig:
     cfg = MailConfig(
         accounts=[MailAccount(
             name="gmail", email="a@gmail.com", imap_host="imap.gmail.com", fetch=True,
         )],
         state_path=state_path,
+        poll_interval=poll_interval,
     )
     cfg.fetch.enabled = True
     return cfg
@@ -214,48 +215,90 @@ def test_the_daemon_loop_builds_one_manager_for_every_tick(tmp_path, monkeypatch
     something else changes directory underneath it. Pins the loop handing the
     SAME instance to every tick, so a regression that moves construction back
     into the tick fails here rather than as debris three files away.
+
+    Drives the REAL thread and stops it through the real stop event, rather
+    than substituting a fake thread and a fake sleep. The earlier version
+    faked both, which meant it never exercised the mechanism it depended on.
     """
     import threading
-    import time
 
     import alfred.orchestrator as orch
 
-    class _Stop(Exception):
-        pass
-
+    stop = threading.Event()
     seen: list[object] = []
 
     def _spy(config, vault_path, *, only_flagged=False, state_mgr=None):
         seen.append(state_mgr)
+        if len(seen) >= 3:
+            stop.set()
         return 0
 
-    def _fake_sleep(_seconds):
-        if len(seen) >= 3:
-            raise _Stop
-
-    captured: dict = {}
-
-    class _FakeThread:
-        def __init__(self, target=None, name=None, daemon=None, **kw):
-            captured["target"] = target
-
-        def start(self):
-            pass  # run it ourselves, bounded
-
     monkeypatch.setattr("alfred.mail.fetcher.fetch_all", _spy)
-    monkeypatch.setattr(threading, "Thread", _FakeThread)
-    monkeypatch.setattr(time, "sleep", _fake_sleep)
 
-    orch._maybe_start_mail_fetch_loop(
-        _fetch_enabled_config(str(tmp_path / "state" / "mail_state.json")),
+    thread = orch._maybe_start_mail_fetch_loop(
+        _fetch_enabled_config(
+            str(tmp_path / "state" / "mail_state.json"), poll_interval=1,
+        ),
         tmp_path / "vault",
+        stop_event=stop,
     )
-    with pytest.raises(_Stop):
-        captured["target"]()
+    thread.join(timeout=10)
 
-    assert len(seen) == 3, "the loop did not tick"
+    assert not thread.is_alive(), "the loop ignored its stop event"
+    assert len(seen) == 3, f"expected 3 ticks, saw {len(seen)}"
     assert all(m is not None for m in seen), "the loop never passed a manager"
     assert seen[0] is seen[1] is seen[2], "a NEW manager per tick — the #75 defect"
+
+
+def test_a_stopped_loop_falls_silent(tmp_path, monkeypatch):
+    """The teardown contract, asserted from outside: a stopped loop emits NOTHING.
+
+    This is the pin that protects the rest of the suite. A loop nobody can stop
+    keeps logging for the remainder of the session, and a ``capture_logs()``
+    block anywhere downstream collects those events as if they were its own —
+    measured at 8 foreign ``mail.*`` events in one 2.2s window. Any test
+    asserting ``len(captured) == N`` is then one scheduling accident from a
+    false red, which is this lane's own failure class one layer up.
+
+    Deliberately asserts on the LOG WINDOW rather than only on
+    ``is_alive()``: a dead thread is the mechanism, silence is the property
+    other tests actually depend on.
+    """
+    import threading
+    import time
+
+    import structlog
+
+    import alfred.orchestrator as orch
+
+    stop = threading.Event()
+    ticked = threading.Event()
+
+    def _noisy(config, vault_path, *, only_flagged=False, state_mgr=None):
+        # Stands in for the real fetch_all, which logs mail.fetch.starting /
+        # mail.state.loaded / mail.fetch_complete every tick.
+        structlog.get_logger("alfred.mail.fetcher").info("mail.fetch.starting", accounts=0)
+        ticked.set()
+        return 0
+
+    monkeypatch.setattr("alfred.mail.fetcher.fetch_all", _noisy)
+
+    thread = orch._maybe_start_mail_fetch_loop(
+        _fetch_enabled_config(str(tmp_path / "state" / "mail_state.json"), poll_interval=1),
+        tmp_path / "vault",
+        stop_event=stop,
+    )
+    assert ticked.wait(timeout=10), "the loop never ran — the silence below would prove nothing"
+
+    stop.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the thread outlived its stop"
+
+    # The window every other test's capture_logs() stands for.
+    with structlog.testing.capture_logs() as cap:
+        time.sleep(0.3)
+    foreign = [e for e in cap if str(e.get("event", "")).startswith("mail.")]
+    assert foreign == [], f"a stopped loop is still emitting into other tests: {foreign}"
 
 
 def test_fetch_all_writes_through_the_manager_it_was_handed(tmp_path, monkeypatch):

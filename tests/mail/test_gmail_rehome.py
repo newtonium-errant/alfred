@@ -79,6 +79,13 @@ def test_enabled_but_no_fetch_accounts_is_ilb_no_thread(monkeypatch):
 
 def test_enabled_with_accounts_runs_fetch_only_flagged(tmp_path, monkeypatch):
     done = threading.Event()
+    # #75 fix round — this test's point is that a REAL thread runs the fetch, so
+    # it still starts one; what it must not do is walk away from it. Left
+    # running, the thread kept emitting mail.* events for the rest of the
+    # session: a 2.2s capture_logs() block elsewhere in the suite collected 8
+    # foreign events from it, which is a false red waiting for the right
+    # scheduling accident in any test that counts what it captured.
+    stop = threading.Event()
     seen = {}
 
     # #75 — ``state_mgr`` mirrors the real signature (the loop threads one
@@ -89,7 +96,7 @@ def test_enabled_with_accounts_runs_fetch_only_flagged(tmp_path, monkeypatch):
         done.set()
         return 0
     monkeypatch.setattr("alfred.mail.fetcher.fetch_all", _spy)
-    orch._maybe_start_mail_fetch_loop(
+    thread = orch._maybe_start_mail_fetch_loop(
         # #75 — an EXPLICIT tmp state path, and it is load-bearing rather than
         # tidy. This test starts a REAL daemon thread on a 1s interval and
         # nothing ever stops it: it outlives the test, and once monkeypatch
@@ -102,9 +109,14 @@ def test_enabled_with_accounts_runs_fetch_only_flagged(tmp_path, monkeypatch):
         _cfg(fetch={"enabled": True, "poll_interval": 1},
              state={"path": str(tmp_path / "mail_state.json")},
              accounts=[{"name": "gmail", "email": "g", "imap_host": "h", "fetch": True}]),
-        Path("/tmp"))
-    assert done.wait(timeout=5)                     # the daemon thread ran the fetch once
-    assert seen["only_flagged"] is True and seen["names"] == ["gmail"]
+        Path("/tmp"), stop_event=stop)
+    try:
+        assert done.wait(timeout=5)                 # the daemon thread ran the fetch once
+        assert seen["only_flagged"] is True and seen["names"] == ["gmail"]
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive(), "the fetch thread outlived the test that started it"
 
 
 # ===========================================================================

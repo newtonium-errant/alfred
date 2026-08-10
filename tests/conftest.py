@@ -816,14 +816,25 @@ def pytest_terminal_summary(terminalreporter, *a, **kw):  # noqa: ARG001
         # ILB: a guard that is silent when healthy is indistinguishable from a
         # guard that never installed — the same argument the egress guard makes.
         #
-        # NOT "tree clean". That would be false in every run today: nine
-        # allowlisted leakers DO materialise, so a healthy run still ends with
-        # files in the tree. An observability line that overstates the state it
-        # reports is the failure this guard exists to catch, and it does not get
-        # an exemption for being the guard's own sentence.
+        # NOT "tree clean". That would be false in most runs: the allowlisted
+        # leakers DO materialise, so a healthy run still ends with files in the
+        # tree. An observability line that overstates the state it reports is
+        # the failure this guard exists to catch, and it does not get an
+        # exemption for being the guard's own sentence.
+        #
+        # The count was "N allowlisted", which MEANT "fired this run" and READ
+        # as "registered". Two readers compared a 0 against an 8 and took it
+        # for a discrepancy; both numbers were right. Worse, "fired" is a DIFF
+        # (``appeared = snapshot - before``), so a leaker already on disk from
+        # an earlier run does not fire — a fresh clone prints 8 where a
+        # worked-in tree prints 0, for identical behaviour. Both numbers now
+        # appear, and the sentence says which is which.
         w(f"suite debris guard: ACTIVE, no new debris outside the allowlist "
-          f"({debris['watched']} watched, "
-          f"{len(debris['allowed'])} allowlisted).")
+          f"({len(debris['allowed'])} of {len(_DEBRIS_ALLOWLIST)} known leakers "
+          f"fired this run; {debris['watched']} files present at session start).")
+        w("  'Fired' = appeared DURING this run. A known leaker already on disk "
+          "beforehand cannot fire, so a low count is not evidence a leak is "
+          "fixed — only the allowlist shrinking is.")
 
 
 # ---------------------------------------------------------------------------
