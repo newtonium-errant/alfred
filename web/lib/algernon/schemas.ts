@@ -157,6 +157,15 @@ export const notificationSchema = z.object({
     .string()
     .optional()
     .transform((u) => (u && /^https?:\/\//i.test(u.trim()) ? u : undefined)),
+  // #76 — the ticket body the intake sent with the notice, so the card can
+  // expand. Plain TEXT, rendered as escaped React children and never as
+  // markup (the #22 stored-XSS precedent: this is reporter-authored text that
+  // crossed a peer protocol). Optional throughout — a tray holding pre-#76
+  // entries must keep rendering rather than failing the parse and emptying
+  // itself on rollout.
+  ticket_body: z.string().optional(),
+  ticket_body_truncated: z.boolean().optional(),
+  issue_number: z.number().optional(),
   ts: z.string(),
   read: z.boolean(),
 });

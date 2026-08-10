@@ -3252,6 +3252,7 @@ def _build_issue_body(
     body: str,
     ticket_uid: str,
     project_slug: str = "",
+    include_markers: bool = True,
 ) -> str:
     """Compose the GitHub issue body — deterministic, no LLM.
 
@@ -3284,10 +3285,21 @@ def _build_issue_body(
     body_text = body.strip()
     if body_text:
         parts.append(body_text)
-    markers = [issue_marker(ticket_uid)]
-    if project_slug:
-        markers.append(project_marker(project_slug))
-    parts.append("\n".join(markers))
+    # #76 — ``include_markers=False`` yields the DISPLAY body the PWA card
+    # expands to show. The markers are machine plumbing: ``algernon-ticket`` is
+    # the dedupe anchor a VERA re-push matches on, ``algernon-project`` routes
+    # the drafter. Neither is reading material.
+    #
+    # Deliberately the SAME composer rather than a second one. Header and body
+    # are then physically incapable of drifting between the card and the
+    # tracker; only the marker tail differs, which is the whole intended
+    # difference. A hand-rolled display variant is how "the card said something
+    # the issue didn't" starts.
+    if include_markers:
+        markers = [issue_marker(ticket_uid)]
+        if project_slug:
+            markers.append(project_marker(project_slug))
+        parts.append("\n".join(markers))
     return "\n\n".join(parts) + "\n"
 
 
@@ -3846,6 +3858,18 @@ async def _handle_ticket_intake(
         issue_number=entry.issue_number,
         issue_url=entry.issue_url,
         correlation_id=correlation_id,
+        # #76 — the same composer that built the issue, markers off. Recomputed
+        # rather than sliced off `issue_body` so the display text can never be a
+        # stale substring of a body that has since changed shape.
+        ticket_body=_build_issue_body(
+            fm=fm_in,
+            relpath=relpath,
+            auth_peer=auth_peer,
+            body=body_in,
+            ticket_uid=ticket_uid,
+            project_slug=project_slug,
+            include_markers=False,
+        ),
     )
     # (The github client already audited outcome="created".)
     return web.json_response({
@@ -3960,6 +3984,7 @@ async def _notify_ticket_created_web(
     issue_number: Any,
     issue_url: str,
     correlation_id: str,
+    ticket_body: str = "",
 ) -> None:
     """Best-effort ticket-created notify to the principal (parity #22).
 
@@ -4028,6 +4053,11 @@ async def _notify_ticket_created_web(
                 "web_notify": True,
                 "ticket_uid": ticket_uid,
                 "issue_url": link_url,
+                # #76 — the ticket's content travels WITH the notice so the PWA
+                # card can expand without a route back. The rendering instance
+                # (Salem) has no forgejo client; this one does.
+                "ticket_body": ticket_body,
+                "issue_number": issue_number,
             },
             config=config,
             self_name=self_name,

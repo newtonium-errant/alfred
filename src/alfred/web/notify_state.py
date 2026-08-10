@@ -41,6 +41,14 @@ log = get_logger(__name__)
 # the durable artifacts).
 NOTIFY_CAP = 200
 
+# #76 — cap on the ticket body an entry carries. Owned HERE, by the store that
+# enforces it: this is the last point every producer passes through, so a
+# producer cannot route around it and no second literal can drift from it. The
+# producer deliberately does NOT truncate — it sends what it has and the store
+# decides, which keeps the bound in one place. 4000 mirrors the feed's evidence
+# body cap so the two read-surfaces agree on "too long to inline".
+NOTIFY_BODY_MAX_CHARS = 4000
+
 
 def _safe_http_url(value: Any) -> str:
     """Return ``value`` only if it is an ``http(s)`` URL, else ``""`` (#22 XSS guard).
@@ -147,6 +155,8 @@ class WebNotifyStore:
         source: str = "",
         ticket_uid: str = "",
         issue_url: str = "",
+        ticket_body: str = "",
+        issue_number: Any = 0,
     ) -> dict[str, Any]:
         """Append one unread notification for ``user_key``; saves.
 
@@ -159,6 +169,9 @@ class WebNotifyStore:
         poll fires once per ticket); add a ``ticket_uid`` dedup guard if a
         RETRYING producer is ever introduced.
         """
+        raw_body = str(ticket_body or "")
+        truncated = len(raw_body) > NOTIFY_BODY_MAX_CHARS
+        body_text = raw_body[:NOTIFY_BODY_MAX_CHARS] if truncated else raw_body
         entry = {
             "id": uuid.uuid4().hex[:16],
             "text": str(text),
@@ -168,6 +181,18 @@ class WebNotifyStore:
             # #22 XSS guard — a peer-supplied issue_url renders into an <a href>
             # in the operator's session; store it only if it's an http(s) URL.
             "issue_url": _safe_http_url(issue_url),
+            # #76 — the ticket's content, so the PWA card can expand and be READ
+            # rather than merely linked to. Always PRESENT, even when empty:
+            # that is what lets the renderer tell "this notice carries no
+            # content" from "this notice predates the field", and only the first
+            # of those deserves the honest "content unavailable" line.
+            #
+            # Bounded HERE, at the store, because this is the last point every
+            # producer passes through — a cap applied only at the notify site
+            # would miss any future producer.
+            "ticket_body": body_text,
+            "ticket_body_truncated": truncated,
+            "issue_number": issue_number if isinstance(issue_number, int) else 0,
             "ts": datetime.now(timezone.utc).isoformat(),
             "read": False,
         }
@@ -259,6 +284,12 @@ def build_web_notify_sink(
             source=str(payload.get("source") or from_peer or ""),
             ticket_uid=str(payload.get("ticket_uid") or ""),
             issue_url=str(payload.get("issue_url") or ""),
+            # #76 — the ticket content the intake sent with the notice. Threaded
+            # HERE as well as accepted by enqueue: a parameter the store takes
+            # but no producer passes is a feature that is green in every unit
+            # test and dead in the field.
+            ticket_body=str(payload.get("ticket_body") or ""),
+            issue_number=payload.get("issue_number") or 0,
         )
         log.info(
             "web.notify.enqueued",
