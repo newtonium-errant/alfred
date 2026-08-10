@@ -549,6 +549,45 @@ def test_contest_is_in_the_capability_ceiling() -> None:
     assert CONTEST_ACTION in FEED_ACTIONS["attribution"]
 
 
+def test_the_web_contest_verb_matches_the_backend_ceiling() -> None:
+    """CROSS-SURFACE DRIFT PIN, same shape as the snooze-ladder pin in
+    tests/tier/test_board_snooze.py.
+
+    The PWA hardcodes its own copy of the action_id (TypeScript can't import a
+    Python constant), so the two can drift in silence — and neither side can
+    notice alone. Rename it on one side only and the operator gets a button that
+    400s with `invalid_action`, while every test on both sides stays green: the
+    web tests compare the constant against itself, and the backend tests never
+    look at the browser.
+
+    Parsed out of the TS source rather than restated here, so this doesn't just
+    become a third copy that drifts too.
+
+    Mutation: change CONTEST_ACTION on either side alone → this fails and names
+    the mismatch.
+    """
+    import re
+
+    ts = (
+        Path(__file__).resolve().parents[2]
+        / "web" / "lib" / "algernon" / "feedConstants.ts"
+    )
+    assert ts.exists(), f"the web constants moved — update this pin: {ts}"
+    match = re.search(
+        r"CONTEST_ACTION\s*=\s*'([^']+)'", ts.read_text(encoding="utf-8"),
+    )
+    assert match, "CONTEST_ACTION not found in feedConstants.ts"
+    web_verb = match.group(1)
+
+    assert web_verb == CONTEST_ACTION, (
+        f"contest verb drift — web POSTs {web_verb!r}, "
+        f"backend ceiling admits {CONTEST_ACTION!r}"
+    )
+    assert web_verb in FEED_ACTIONS["attribution"], (
+        f"the web's {web_verb!r} is not in the attribution capability ceiling"
+    )
+
+
 def test_contest_records_the_signal_and_reverts_to_needs_you(tmp_path: Path) -> None:
     """Ruling 3, both halves in one act: the contest is RECORDED (the correction
     signal is not dropped on the floor) AND the item goes back to needs-you."""

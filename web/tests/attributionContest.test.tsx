@@ -67,11 +67,17 @@ describe('contestableItem — which rows offer the door', () => {
   });
 });
 
+describe('the wire value', () => {
+  it('is the LITERAL string "contest" — the backend capability ceiling admits\n     that exact action_id and nothing else, so this is pinned against the\n     literal rather than against CONTEST_ACTION. Asserting the constant against\n     itself is a tautology: renaming the value would move both sides of the\n     comparison together and the button would 400 in the operator\'s hand with\n     every test still green. A Python-side drift pin reads this same constant\n     out of the TS source and holds it against the router\'s ceiling.', () => {
+    expect(CONTEST_ACTION).toBe('contest');
+  });
+});
+
 describe('useFeedBoard — contest', () => {
   it('POSTs the contest action', async () => {
     const { result } = renderHook(() => useFeedBoard({ items: [item({ id: 'a1' })] }));
     act(() => result.current.contest('a1'));
-    expect(mockAct).toHaveBeenCalledWith('a1', CONTEST_ACTION);
+    expect(mockAct).toHaveBeenCalledWith('a1', 'contest');
     await flush();
   });
 
