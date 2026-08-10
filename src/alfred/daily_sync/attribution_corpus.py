@@ -38,8 +38,9 @@ how heavily an agent should rely on a given inferred rule.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+from typing import Iterator
 
 
 @dataclass
@@ -86,4 +87,63 @@ def append_entry(corpus_path: str | Path, entry: AttributionCorpusEntry) -> None
         f.write(line + "\n")
 
 
-__all__ = ["AttributionCorpusEntry", "append_entry"]
+# The five keys a row must carry to be interpretable at all. Everything else
+# has a default — see the class — so a row from before a field existed still
+# loads. Deliberately NOT every field: requiring the full set would drop the
+# pre-#63a history that the first stat line has to read.
+_REQUIRED_KEYS = ("marker_id", "record_path", "andrew_action", "action_at")
+
+
+def iter_attribution_rows(
+    corpus_path: str | Path,
+) -> Iterator[AttributionCorpusEntry]:
+    """Yield every corpus row, OLDEST FIRST. The read side of #63a's append.
+
+    #63a shipped capture with no reader, which left the platform's
+    self-correcting loop half-closed: the signal was durable and nothing
+    consumed it. This is the ONE seam every #72 consumer reads through — the
+    stat line, the demotion trigger, and the per-section rates all come through
+    here rather than each re-parsing the JSONL, so they cannot disagree about
+    what the corpus says.
+
+    Tolerant in both directions, and the tolerance is load-bearing rather than
+    tidy:
+
+    * A row that will not parse is SKIPPED, not raised. A quality metric that
+      dies on one corrupt line stops being computed on the day something went
+      wrong enough to write one.
+    * A row missing a field added later loads with that field's default. Those
+      rows are the bulk of the history the first stat line reads; dropping them
+      would make a busy instance look quiet.
+    * A row carrying a field from a NEWER build is loaded without it, rather
+      than exploding — the house schema-tolerance contract, both directions.
+
+    Mirrors ``daily_sync/corpus.py::iter_corrections`` deliberately; the two
+    corpora stay independently auditable but read the same way.
+    """
+    path = Path(corpus_path)
+    if not path.exists():
+        return
+    known = {f.name for f in fields(AttributionCorpusEntry)}
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if any(k not in data for k in _REQUIRED_KEYS):
+                continue
+            try:
+                yield AttributionCorpusEntry(
+                    **{k: v for k, v in data.items() if k in known}
+                )
+            except TypeError:
+                continue
+
+
+__all__ = ["AttributionCorpusEntry", "append_entry", "iter_attribution_rows"]
