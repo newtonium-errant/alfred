@@ -77,7 +77,8 @@ log = structlog.get_logger(__name__)
 # fall back to google-auth's ~120s default and leave the cold/expiry path
 # unbounded). All are synchronous and blocking; the propose-create handler
 # runs them in ``asyncio.to_thread`` (per-phase deadline
-# ``_GCAL_PHASE_DEADLINE_S = 6s`` in ``transport/peer_handlers.py``). Without a
+# ``_GCAL_CONFLICT_DEADLINE_S`` / ``_GCAL_SYNC_DEADLINE_S``, 6s each, in
+# ``transport/peer_handlers.py``). Without a
 # socket timeout a hung Google socket blocks the underlying ``httplib2`` read
 # forever, pinning a ThreadPoolExecutor worker for minutes past that soft
 # deadline. Bounded below the transport client's per-attempt read timeout

@@ -2472,7 +2472,23 @@ def _scan_event_conflicts(
 # slow-but-healthy GCal past 6s degrades to vault-only conflicts / a
 # ``sync_timeout`` report rather than breaching the client deadline — we
 # would rather say "sync unconfirmed" than lie about a committed create.
-_GCAL_PHASE_DEADLINE_S = 6.0
+#
+# ONE budget PER PHASE, named separately (#71). They are equal today and the
+# composition pin is what actually protects the client deadline (their SUM must
+# stay under ``_REQUEST_TIMEOUT``), so this is not two knobs where one would do:
+# the phases differ in kind. The conflict scan is BEST-EFFORT enrichment that
+# degrades to vault-only conflicts and costs the operator nothing when it
+# lapses; the sync is the WRITE, whose lapse the operator actually sees as
+# ``sync_timeout``. Tuning one should not silently retune the other.
+#
+# Naming them apart also makes the phases independently controllable in tests,
+# which is what retires the #71 flake: exercising a scan that BREACHES its
+# budget used to require shrinking the budget for BOTH phases, so the create —
+# which the same test requires to SUCCEED — was left racing a 200ms wall clock
+# and lost under full-suite load. A test can now squeeze the phase it is
+# probing and leave the other at its real budget.
+_GCAL_CONFLICT_DEADLINE_S = 6.0
+_GCAL_SYNC_DEADLINE_S = 6.0
 
 
 def _scan_gcal_conflicts(
@@ -2608,7 +2624,7 @@ async def _scan_gcal_conflicts_bounded(
     handler past the peer client's per-attempt read timeout, so a
     slow-but-eventually-successful scan makes the client read-time-out and
     retry into the 409 path while the create succeeds (see
-    :data:`_GCAL_PHASE_DEADLINE_S`).
+    :data:`_GCAL_CONFLICT_DEADLINE_S`).
 
     Bound + degrade: on deadline OR any unexpected error, fall back to the
     vault-only conflict map (empty GCal list) — the same fail-open posture
@@ -2627,12 +2643,12 @@ async def _scan_gcal_conflicts_bounded(
                 proposed_end,
                 correlation_id,
             ),
-            timeout=_GCAL_PHASE_DEADLINE_S,
+            timeout=_GCAL_CONFLICT_DEADLINE_S,
         )
     except asyncio.TimeoutError:
         log.warning(
             "transport.canonical.event_propose_gcal_conflict_timeout",
-            deadline_s=_GCAL_PHASE_DEADLINE_S,
+            deadline_s=_GCAL_CONFLICT_DEADLINE_S,
             correlation_id=correlation_id,
         )
         return []
@@ -2700,7 +2716,7 @@ async def _handle_canonical_event_propose_create(
             ``stale_gcal_id`` / ``sync_timeout`` / ``unknown``.
             ``sync_timeout`` means the blocking GCal round trip exceeded
             the server-side per-phase deadline
-            (:data:`_GCAL_PHASE_DEADLINE_S`) and was NOT confirmed within
+            (:data:`_GCAL_SYNC_DEADLINE_S`) and was NOT confirmed within
             the caller's read window — the vault create is committed and
             the projection may still land in the background (a
             daemon/operator re-sync reconciles). Vault record IS preserved;
@@ -3032,7 +3048,7 @@ async def _handle_canonical_event_propose_create(
                 end_dt=end_dt,
                 correlation_id=correlation_id,
             ),
-            timeout=_GCAL_PHASE_DEADLINE_S,
+            timeout=_GCAL_SYNC_DEADLINE_S,
         )
     except asyncio.TimeoutError:
         log.warning(
@@ -3040,14 +3056,14 @@ async def _handle_canonical_event_propose_create(
             peer=peer,
             title=title[:80],
             path=rel_path,
-            deadline_s=_GCAL_PHASE_DEADLINE_S,
+            deadline_s=_GCAL_SYNC_DEADLINE_S,
             correlation_id=correlation_id,
         )
         sync_result = {
             "error": {
                 "code": "sync_timeout",
                 "detail": (
-                    f"gcal sync exceeded the {_GCAL_PHASE_DEADLINE_S:.0f}s "
+                    f"gcal sync exceeded the {_GCAL_SYNC_DEADLINE_S:.0f}s "
                     "server budget; vault record committed, GCal projection "
                     "still in flight (daemon/operator will reconcile)"
                 ),

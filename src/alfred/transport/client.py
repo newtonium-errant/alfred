@@ -57,7 +57,8 @@ DEFAULT_PORT = 8891
 # chance for a transient aiohttp hiccup.
 _RETRY_BACKOFFS: tuple[float, ...] = (0.5, 2.0)
 # COUPLING NOTE: the propose-create handler's per-phase GCal deadline
-# (``transport/peer_handlers.py`` ``_GCAL_PHASE_DEADLINE_S = 6.0``) is tuned so
+# (``transport/peer_handlers.py`` ``_GCAL_CONFLICT_DEADLINE_S`` +
+# ``_GCAL_SYNC_DEADLINE_S``, 6.0 each) is tuned so
 # its two blocking phases (~12s worst case) stay under this per-attempt read
 # timeout with ~3s margin — a slow-but-committed GCal sync that breached this
 # would trip a client retry into the 409 already_exists path (the 2026-07-09
