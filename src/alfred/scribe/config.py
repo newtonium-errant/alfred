@@ -40,6 +40,7 @@ from typing import Any
 import structlog
 
 from alfred._env import substitute_env_in_value
+from alfred.common.instance_paths import instance_data_path
 
 log = structlog.get_logger(__name__)
 
@@ -56,7 +57,27 @@ SCRIBE_MODE_CLINICAL = "clinical"
 RETENTION_MODE_RETAINED = "retained"
 RETENTION_MODE_TRANSIENT = "transient"
 
+# ``input_dir``'s default is DERIVED per-instance from ``logging.dir`` at load
+# (see :func:`default_input_dir`) — a cwd-relative literal is one shared
+# directory across co-located instances (the #53/#74 shape). This constant is
+# the dataclass placeholder for DIRECT construction only; every load path
+# replaces it. It stays ``./data/scribe/inbox`` because Salem's ``logging.dir``
+# IS ``./data``, so the derived value is byte-identical to it.
+#
+# NOTE (#74 batch 2): the DOUBLING is deliberately untouched here.
+# ``resolve_candidates_dir`` / ``resolve_notegen_feedback_dir`` /
+# ``resolve_bug_dir`` compute ``<input_dir>.parent / "scribe"`` on the contract
+# that ``input_dir`` is ``<DATA>/inbox`` — but this default's parent is already
+# ``<DATA>/scribe``, so they resolve ``<DATA>/scribe/scribe``. Anchoring the
+# default (batch 1) does not change that: it only moves the whole structure
+# under the configured data dir instead of the cwd, so the doubling is
+# preserved EXACTLY where it was, byte for byte. Re-siting it is batch 2, where
+# it needs a compat note because it moves files an operator may already have.
 _DEFAULT_INPUT_DIR = "./data/scribe/inbox"
+# Where the scribe tree sits under the instance data dir, and the inbox within
+# it. Named so the derivation and the placeholder above can never drift.
+_SCRIBE_DIR_NAME = "scribe"
+_INBOX_DIR_NAME = "inbox"
 # Abandoned/never-attested encounter defensive-seal grace (§3.6) — days of enc-dir inactivity
 # after which a still-un-closed encounter is defensively sealed-and-kept (never auto-deleted).
 _DEFAULT_ABANDON_GRACE_DAYS = 7
@@ -449,6 +470,19 @@ def _warn_deprecated_scribe_keys(scribe: dict[str, Any]) -> None:
         )
 
 
+def default_input_dir(raw: dict[str, Any]) -> str:
+    """The default ``scribe.input_dir`` — ``<logging.dir>/scribe/inbox``.
+
+    Derived from the instance's own data dir rather than the process cwd, so
+    co-located instances (one WorkingDirectory, differing only by ``--config``)
+    never share a scribe tree. Salem's ``logging.dir`` is ``./data``, so this
+    returns the exact string the old literal did — the retrofit moves no files.
+
+    An explicit ``scribe.input_dir`` always wins; this only fills the gap.
+    """
+    return instance_data_path(raw, _SCRIBE_DIR_NAME, _INBOX_DIR_NAME)
+
+
 def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
     """Build :class:`ScribeConfig` from the unified config dict.
 
@@ -465,7 +499,7 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
     scribe = substitute_env_in_value(scribe)
     _warn_deprecated_scribe_keys(scribe)
 
-    input_dir = scribe.get("input_dir") or _DEFAULT_INPUT_DIR
+    input_dir = scribe.get("input_dir") or default_input_dir(raw)
     clinicians_raw = scribe.get("clinicians") or []
     clinicians = _validate_clinicians(clinicians_raw)
     return ScribeConfig(

@@ -891,12 +891,19 @@ _DEBRIS_SKIP_DIRS = frozenset({
 #
 #   data/canonical_audit.jsonl            transport/config.py  -> #74
 #   data/feed_items.jsonl,  .lock         feed store default   -> #74
-#   data/scribe/scribe/*  (4 files)       scribe config default (note the
-#                                         doubled segment — a joined path bug
-#                                         in its own right)    -> #74
 #   data/voice_calibration/events.jsonl   web/config.py:208 +
 #                                         hardcoded fallbacks at
 #                                         routes_voice.py:490,646  -> #74
+#
+# ``data/scribe/scribe/*`` (4 files) WAS here — the scribe config's
+# cwd-relative ``input_dir`` default. #74 batch 1 closed it by deriving the
+# default from the instance's ``logging.dir``, so the sinks the resolvers hang
+# off it land in the configured data dir. The list is four shorter as the
+# definition of done. The DOUBLED segment that made the path memorable is a
+# SEPARATE bug and still live (the resolvers assume ``input_dir`` is
+# ``<DATA>/inbox`` and append ``scribe`` to its parent); it is now harmless —
+# it doubles inside whatever data dir is configured, never in the cwd — and is
+# batch 2, pinned as deliberate in ``tests/test_instance_path_anchoring.py``.
 #
 # ``data/mail_state.json`` WAS here, as the residue of #53. It is gone — #75
 # closed it, and this list is one shorter as the definition of done. Kept as a
@@ -919,10 +926,6 @@ _DEBRIS_ALLOWLIST = frozenset({
     "data/canonical_audit.jsonl",
     "data/feed_items.jsonl",
     "data/feed_items.lock",
-    "data/scribe/scribe/negation_candidates.jsonl",
-    "data/scribe/scribe/.negation_candidates.jsonl.lock",
-    "data/scribe/scribe/notegen_edit.jsonl",
-    "data/scribe/scribe/.notegen_edit.lock",
     "data/voice_calibration/events.jsonl",
 })
 
