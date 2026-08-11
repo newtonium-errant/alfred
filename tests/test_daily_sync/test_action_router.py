@@ -1067,21 +1067,58 @@ def test_a_dated_defer_through_act_carries_its_window(tmp_path: Path) -> None:
     assert defer_window_open(stored.deferred_until) is True
 
 
-def test_a_defer_verb_on_the_EXCLUDED_kind_is_refused(tmp_path: Path) -> None:
-    """slot_suggestion keeps its board snooze; the ceiling must refuse `defer`.
+def test_the_ceiling_MAP_carries_no_defer_for_the_excluded_kind(tmp_path: Path) -> None:
+    """A statement about the MAP — renamed to stop claiming a runtime behaviour.
 
-    The positive control for the exclusion: `snooze_3d` on the same kind is a
-    real verb, so this is not passing because slot acts fail generally.
+    This asserts the declaration only. It stayed green when the interception's
+    ceiling check was deleted, because nothing here drives an act: the runtime
+    refusal is pinned by the test below, which is the one that matters.
     """
-    cfg = _ds_config(tmp_path)
-    store = _store(tmp_path)
-    item = _email_item(priority="medium")
-    fid = _publish(store, "email_tier", item)
-    _seed_batch(cfg, items=[item])
-
-    # An email_tier item CAN defer (the control) …
-    assert _call(store, cfg, fid, "defer_1d").ok is True
-    # … while the excluded kind never advertises or admits one.
     from alfred.daily_sync.action_router import DEFER_ACTIONS, FEED_ACTIONS
 
     assert not any(v in FEED_ACTIONS["slot_suggestion"] for v in DEFER_ACTIONS)
+    # Positive control: the kind does carry its OWN defer family.
+    assert "snooze_3d" in FEED_ACTIONS["slot_suggestion"]
+
+
+def test_a_defer_verb_on_the_EXCLUDED_kind_is_REFUSED_AT_RUNTIME(
+    tmp_path: Path,
+) -> None:
+    """The runtime half — drive the act, don't describe the map.
+
+    THE HAZARD: with the interception's ceiling check dropped
+    (`and action_id in FEED_ACTIONS.get(kind, {})`), a defer on a
+    slot_suggestion routes into the FEED store while the board's snooze sidecar
+    keeps its own answer — two defer mechanisms on one card, which is the entire
+    reason DEFER_EXCLUDED_KINDS exists. That deletion left every adjacent test
+    green until this one existed.
+    """
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    slot = FeedItem.create(
+        kind="slot_suggestion",
+        stable_key="task:task/Pay Steph.md",
+        instance="salem",
+        title="T1: Pay Steph",
+        evidence={"tier": 1, "origin": "task", "path": "task/Pay Steph.md"},
+    )
+    store.upsert(slot)
+
+    result = _call(store, cfg, slot.id, "defer_1d")
+
+    assert result.ok is False
+    assert result.status == STATUS_INVALID_ACTION
+    # And nothing was deferred: the feed store's state is untouched.
+    assert store.load()[slot.id].state == STATE_OPEN
+
+    # POSITIVE CONTROL, on the same item: this kind's OWN defer verb is a real
+    # capability. Without it, the refusal above would pass identically against a
+    # build where every slot act failed — a dead kind reported as a guard.
+    assert _call(store, cfg, slot.id, "snooze_1d").status != STATUS_INVALID_ACTION
+
+    # And the CONTROL for the other side of the exclusion: an eligible kind
+    # really can defer, so the refusal is about slot_suggestion and not defer.
+    email = _email_item(priority="medium")
+    efid = _publish(store, "email_tier", email)
+    _seed_batch(cfg, items=[email])
+    assert _call(store, cfg, efid, "defer_1d").ok is True

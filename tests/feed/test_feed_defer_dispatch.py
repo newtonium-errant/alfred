@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
 import structlog
 
 from alfred.daily_sync.action_router import (
@@ -216,7 +215,12 @@ class TestAdvertised:
         assert "snooze_3d" in verbs
 
 
-@pytest.mark.parametrize("state_const", [STATE_DEFERRED])
-def test_the_state_the_dispatcher_drives_is_the_one_the_filter_excludes(state_const):
-    """No leak path: the deck asks `state=open`, an exact match, and this is not it."""
-    assert state_const != "open"
+def test_the_state_the_dispatcher_drives_is_not_the_one_the_deck_asks_for():
+    """A statement about two CONSTANTS — kept, but honestly named.
+
+    It was called a leak pin and asserted `STATE_DEFERRED != "open"`: two
+    literals, true on any build, including one whose route had no state filter
+    at all. The real pin lives in tests/test_routes_feed.py, driving the list
+    route. This survives only as the cheap declaration it always was.
+    """
+    assert STATE_DEFERRED != "open"

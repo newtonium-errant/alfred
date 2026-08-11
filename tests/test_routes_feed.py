@@ -766,3 +766,39 @@ async def test_the_stamp_is_announced_even_when_it_stamps_nothing(
     assert len(events) == 1
     assert events[0]["stamped"] == 0
     assert events[0]["total"] == 0
+
+
+async def test_a_DEFERRED_item_does_not_reach_a_client_asking_for_open(
+    feed_client,
+) -> None:
+    """The real leak pin (#102 1b-ii) — driven through the list route.
+
+    THE HAZARD: the deck queries `state=open`, so a deferred card must not come
+    back in that answer; if it did, "later" would put the card straight back in
+    front of the operator and the whole vertical gesture would be a lie.
+
+    Its predecessor asserted `STATE_DEFERRED != "open"` — two constants, true on
+    any build. Deleting the route's ENTIRE state filter left it green.
+    """
+    store = feed_client.app["_store"]
+    fid = feed_client.app["_fid"]
+
+    # PRESENT BEFORE — the control that makes the absence mean something. Without
+    # it, an empty result would pass just as well against a broken route.
+    before = await (await feed_client.get("/feed/items?state=open", headers=_FEED_HEADERS)).json()
+    assert [i["id"] for i in before["items"]] == [fid]
+
+    store.defer(fid)
+
+    after = await (await feed_client.get("/feed/items?state=open", headers=_FEED_HEADERS)).json()
+    assert fid not in [i["id"] for i in after["items"]], (
+        "a deferred card came back to a client asking for open items"
+    )
+
+    # AND it still exists — deferred is "later", not "gone". An item that
+    # vanished from the store entirely would also pass the assertion above,
+    # and would be a far worse bug than the one being excluded.
+    unfiltered = await (await feed_client.get("/feed/items", headers=_FEED_HEADERS)).json()
+    deferred = [i for i in unfiltered["items"] if i["id"] == fid]
+    assert len(deferred) == 1
+    assert deferred[0]["state"] == "deferred"
