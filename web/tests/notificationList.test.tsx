@@ -19,7 +19,7 @@ const ITEM: NotificationItem = {
 
 describe('NotificationList', () => {
   it('renders the explicit "No notifications" empty state (ILB)', () => {
-    render(<NotificationList notifications={[]} onAck={() => {}} />);
+    render(<NotificationList notifications={[]} onAck={() => {}} onDismiss={() => {}} />);
     const empty = screen.getByTestId('notifications-empty');
     expect(empty.textContent).toBe('No notifications');
     expect(screen.queryByTestId('notification-list')).toBeNull();
@@ -27,7 +27,7 @@ describe('NotificationList', () => {
 
   it('renders an unread item with a Mark-read button that acks its id', () => {
     const onAck = vi.fn();
-    render(<NotificationList notifications={[ITEM]} onAck={onAck} />);
+    render(<NotificationList notifications={[ITEM]} onAck={onAck} onDismiss={vi.fn()} />);
     expect(screen.getByTestId('notification-item').textContent).toContain(
       'New ticket [bug]',
     );
@@ -39,14 +39,14 @@ describe('NotificationList', () => {
     render(
       <NotificationList
         notifications={[{ ...ITEM, read: true }]}
-        onAck={() => {}}
+        onAck={() => {}} onDismiss={() => {}}
       />,
     );
     expect(screen.queryByTestId('notification-ack')).toBeNull();
   });
 
   it('links out to the GitHub issue when issue_url is present', () => {
-    render(<NotificationList notifications={[ITEM]} onAck={() => {}} />);
+    render(<NotificationList notifications={[ITEM]} onAck={() => {}} onDismiss={() => {}} />);
     const link = screen.getByTestId('notification-issue-link');
     expect(link.getAttribute('href')).toBe('https://github.com/acme/site/issues/7');
   });
@@ -55,7 +55,7 @@ describe('NotificationList', () => {
     render(
       <NotificationList
         notifications={[{ ...ITEM, issue_url: '' }]}
-        onAck={() => {}}
+        onAck={() => {}} onDismiss={() => {}}
       />,
     );
     expect(screen.queryByTestId('notification-issue-link')).toBeNull();

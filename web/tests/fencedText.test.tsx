@@ -200,11 +200,14 @@ describe('the four production surfaces route through FencedText', () => {
           source: 'kal-le',
           ticket_uid: 'tkt-1',
           issue_url: 'http://localhost:3001/x/y/issues/9',
+          // Unread: #86 collapses READ entries into a history disclosure, so
+          // an unread entry is the one on the glance surface. This test is
+          // about the fenced-block download, not about which list it sits in.
           ts: '2026-08-11T02:00:00Z',
-          read: true,
+          read: false,
           ticket_body: FENCED,
         } as never]}
-        onAck={vi.fn()}
+        onAck={vi.fn()} onDismiss={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByTestId('notification-expand'));

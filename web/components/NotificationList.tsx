@@ -29,9 +29,11 @@ function isTicketEntry(n: NotificationItem): boolean {
 function NotificationRow({
   n,
   onAck,
+  onDismiss,
 }: {
   n: NotificationItem;
   onAck: (ids: string[]) => void;
+  onDismiss: (ids: string[]) => void;
 }) {
   // Per-row, because expansion is transient per-row UI — nothing outside this
   // row needs to know, and hoisting it would make one card's tap open another's.
@@ -65,7 +67,11 @@ function NotificationRow({
             </>
           ) : null}
         </span>
-        {!n.read && (
+        {/* One control per row, and WHICH one is the whole lifecycle: an
+            unread notice offers the step that calms it, a read one offers the
+            step that clears it. Showing both at once would ask the operator to
+            choose between two words for "deal with this". */}
+        {!n.read ? (
           <button
             type="button"
             data-testid="notification-ack"
@@ -73,6 +79,16 @@ function NotificationRow({
             className="shrink-0 rounded-lg border border-honeydew-300 bg-white px-2 py-1 text-xs font-semibold text-honeydew-700 hover:bg-honeydew-50"
           >
             Mark read
+          </button>
+        ) : (
+          <button
+            type="button"
+            data-testid="notification-dismiss"
+            aria-label={`Dismiss notification: ${n.text}`}
+            onClick={() => onDismiss([n.id])}
+            className="shrink-0 rounded-lg border border-honeydew-300 bg-white px-2 py-1 text-xs font-semibold text-honeydew-700 hover:bg-honeydew-50"
+          >
+            Dismiss
           </button>
         )}
       </div>
@@ -137,10 +153,42 @@ function NotificationRow({
 export function NotificationList({
   notifications,
   onAck,
+  onDismiss,
 }: {
   notifications: NotificationItem[];
   onAck: (ids: string[]) => void;
+  onDismiss: (ids: string[]) => void;
 }) {
+  // WHY READ ENTRIES COLLAPSE (#86 — the UI half of the operator's report).
+  //
+  // The complaint was that a notice they had already read stayed on screen for
+  // four days. Two shapes were available: put a Dismiss button on every read
+  // row, or move read rows out of the glance surface automatically. Both ship
+  // here, and the split follows the grammar the rest of this surface already
+  // uses — the same glance-then-tap the feed rows and the #76 ticket expander
+  // use:
+  //
+  //   GLANCE  — the top level shows what still wants attention (unread).
+  //   TAP     — going deeper is deliberate ("N read" opens history; a ticket
+  //             row expands to its body).
+  //
+  // So marking read is enough to clear the glance surface, which is the fix for
+  // the four-days complaint and costs the operator no NEW tap — it is the tap
+  // they were already making. Dismiss then lives one level down, inside the
+  // disclosure, because permanently clearing history is a deliberate act and
+  // does not belong on a surface meant to be read at a glance.
+  //
+  // Rejected: auto-dismissing on mark-read. It would collapse `read` and
+  // `dismissed` into one state, and the operator would lose the ability to
+  // re-read something they had acknowledged — turning a tray into a shredder.
+  const unread = notifications.filter((n) => !n.read);
+  const read = notifications.filter((n) => n.read);
+  const [historyOpen, setHistoryOpen] = useState(false);
+
+  // ILB, and the subtle case: an empty GLANCE list is not an empty TRAY. With
+  // nothing unread but three read notices still held, "No notifications" would
+  // be false — the operator has three, they are just not new. Saying the wrong
+  // one of these is how a surface teaches you to distrust it.
   if (notifications.length === 0) {
     return (
       <p data-testid="notifications-empty" className={subtle}>
@@ -150,10 +198,63 @@ export function NotificationList({
   }
 
   return (
-    <ul data-testid="notification-list" className="flex flex-col gap-2">
-      {notifications.map((n) => (
-        <NotificationRow key={n.id} n={n} onAck={onAck} />
-      ))}
-    </ul>
+    <div className="flex flex-col gap-2">
+      {unread.length > 0 ? (
+        <ul data-testid="notification-list" className="flex flex-col gap-2">
+          {unread.map((n) => (
+            <NotificationRow key={n.id} n={n} onAck={onAck} onDismiss={onDismiss} />
+          ))}
+        </ul>
+      ) : (
+        <p data-testid="notifications-none-new" className={subtle}>
+          Nothing new
+        </p>
+      )}
+
+      {read.length > 0 && (
+        <div data-testid="notification-history">
+          <button
+            type="button"
+            data-testid="notification-history-toggle"
+            aria-expanded={historyOpen}
+            onClick={() => setHistoryOpen((v) => !v)}
+            className="text-xs font-semibold text-honeydew-600 underline underline-offset-2"
+          >
+            {historyOpen ? 'Hide' : 'Show'} {read.length} read
+          </button>
+
+          {historyOpen && (
+            <div className="mt-2 flex flex-col gap-2">
+              <ul
+                data-testid="notification-read-list"
+                className="flex flex-col gap-2"
+              >
+                {read.map((n) => (
+                  <NotificationRow
+                    key={n.id}
+                    n={n}
+                    onAck={onAck}
+                    onDismiss={onDismiss}
+                  />
+                ))}
+              </ul>
+              {/* Bulk clear. Without it, a tray holding twenty read notices
+                  costs twenty taps — which is the original complaint again,
+                  only slower. */}
+              <div>
+                <button
+                  type="button"
+                  data-testid="notification-dismiss-all"
+                  onClick={() => onDismiss(read.map((n) => n.id))}
+                  className="text-xs font-semibold text-honeydew-600 underline underline-offset-2"
+                >
+                  Dismiss all {read.length}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

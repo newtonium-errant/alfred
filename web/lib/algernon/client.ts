@@ -8,6 +8,7 @@ import type {
   IngestSubmitResponse,
   IngestTargetsResponse,
   NotificationsAckResponse,
+  NotificationsDismissResponse,
   NotificationsResponse,
 } from './types';
 import type { ImageAttachment, IngestBody } from './schemas';
@@ -77,6 +78,13 @@ export const chatApi = {
     getJson<NotificationsResponse>('/api/chat/notifications'),
   ackNotifications: (ids: string[]): Promise<NotificationsAckResponse> =>
     postJson<NotificationsAckResponse>('/api/chat/notifications/ack', { ids }),
+  // #86 — clear an entry from the tray. Distinct from ack: ack says "seen",
+  // this says "done with it". The entry stops being listed (here AND in the
+  // daily brief) but stays in the store.
+  dismissNotifications: (ids: string[]): Promise<NotificationsDismissResponse> =>
+    postJson<NotificationsDismissResponse>('/api/chat/notifications/dismiss', {
+      ids,
+    }),
   // Opens the SSE turn stream and returns the RAW Response so useChat can read
   // res.body.getReader() (the success signal is the terminal `done` frame, not a
   // JSON body). Validation errors come back as JSON BEFORE the stream begins —
