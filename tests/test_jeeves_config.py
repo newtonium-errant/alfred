@@ -87,6 +87,45 @@ def test_paths_derive_from_the_instances_own_data_dir():
         "/home/andrew/.alfred/other/data/jeeves/marks.jsonl"
 
 
+def test_the_suspend_store_is_ALWAYS_derived_never_left_empty():
+    """#98, ruling 3. Every other path knob here means "off" when unset; this
+    one cannot, because a suspension with nowhere to live would not survive
+    the restart it exists to survive. ``suspend.read_status("")`` resolves to
+    NOT suspended (a config state, not an unknown one), so a loaded config
+    reaching that branch would be a toggle silently enforcing nothing."""
+    for raw in ({}, KALLE_LIKE, SALEM_LIKE, {"jeeves": {}}):
+        loaded = cfg.load_from_unified(raw)
+        assert loaded.suspend_state_path, (
+            f"a loaded config left the company toggle storeless: {raw}"
+        )
+        assert loaded.suspend_state_path.endswith("jeeves/suspended.json")
+
+
+def test_the_suspend_store_is_per_instance_too():
+    a = cfg.load_from_unified(KALLE_LIKE)
+    b = cfg.load_from_unified(SALEM_LIKE)
+    assert a.suspend_state_path != b.suspend_state_path
+    # ...and an explicit value still wins over the derivation.
+    explicit = cfg.load_from_unified({
+        "logging": {"dir": "/data/x"},
+        "jeeves": {"suspend_state_path": "/var/jeeves/s.json"},
+    })
+    assert explicit.suspend_state_path == "/var/jeeves/s.json"
+
+
+def test_the_retention_window_falls_back_on_nonsense():
+    """A zero or negative retention would delete every retained window on the
+    next sweep, including the one reported thirty seconds ago."""
+    for bad in (0, -3, "seven", None, [], 0.0):
+        loaded = cfg.load_from_unified({"jeeves": {"miss_audio_retention_days": bad}})
+        assert loaded.miss_audio_retention_days == \
+            cfg.DEFAULT_MISS_AUDIO_RETENTION_DAYS
+    # ...and a real value is honoured (the control).
+    assert cfg.load_from_unified(
+        {"jeeves": {"miss_audio_retention_days": 3}}
+    ).miss_audio_retention_days == 3
+
+
 def test_two_instances_never_share_a_jeeves_file():
     """The failure this prevents is real and has happened for other stores:
     co-located instances share one WorkingDirectory and differ only by

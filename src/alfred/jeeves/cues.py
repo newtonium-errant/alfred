@@ -33,8 +33,18 @@ than trusted:
   utterance stays local and the refusal is logged with its reason — rather
   than guessing a destination for audio that leaves the property.
 
-A third cue exists for a reason the design argues at length: cue FALSE
-NEGATIVES are invisible by construction ("I said Jeeves and nothing
+A FOURTH grammar is not a capture verb at all: the COMPANY TOGGLE (#98,
+ruling 3). "Jeeves, company" suspends wake-word and capture until a release
+phrase; the release is deliberately narrower than the suspend, because the
+two mistakes are not symmetric — a false suspend makes the device visibly
+deaf, a false release makes it listen while the operator believes it is not.
+The toggle is also the one grammar matched against a SCOPE of the transcript
+rather than all of it (:func:`_toggle_scope`): the window opens 45 seconds
+before the cue, and a conversation about "the company" in that lookback must
+not reach into the microphone.
+
+A third capture cue exists for a reason the design argues at length: cue
+FALSE NEGATIVES are invisible by construction ("I said Jeeves and nothing
 happened" leaves no trace anywhere), so a system that learns only from its
 false positives drifts toward being deaf. The miss-report cue — "Jeeves, you
 missed that" — is itself a wake event, and it is the single highest-value
@@ -60,11 +70,16 @@ from .config import JeevesCueConfig
 
 log = structlog.get_logger(__name__)
 
-# The four classification outcomes. Stable strings — telemetry buckets on
-# them and the morning-review surfacing will too.
+# The classification outcomes. Stable strings — telemetry buckets on them and
+# the morning-review surfacing will too.
 CUE_MARK_DOWN = "mark_down"
 CUE_ROUTE = "route"
 CUE_MISS_REPORT = "miss_report"
+# The company toggle (#98, ruling 3) — the SPOKEN door onto the suspended
+# state. Not a capture verb: nothing is transcribed, logged or sent; the
+# utterance flips a flag that :mod:`.suspend` owns.
+CUE_SUSPEND = "suspend"
+CUE_RESUME = "resume"
 CUE_NONE = "none"
 
 # Why a transcript classified as CUE_NONE. Distinct reasons because they
@@ -123,6 +138,45 @@ MISS_PHRASES: tuple[str, ...] = (
     "you didn't catch that",
     "you did not get that",
 )
+
+# THE COMPANY TOGGLE (#98, ruling 3). Two grammars with DELIBERATELY OPPOSITE
+# strictness, because their false-positive costs point opposite ways:
+#
+# * A false SUSPEND makes the device deaf. Annoying, visible (the banner says
+#   so), fixed by one release. So suspend is allowed to be generous.
+# * A false RESUME makes the device listen while the operator believes it is
+#   not. That is the failure the toggle exists to prevent, and it is silent
+#   from where he is standing. So release is the narrow, marked phrase.
+#
+# "company" is the operator's ruled word. The variants are the same sentence
+# said naturally; "stop listening" is the plain-language form somebody
+# reaches for when the ruled phrase does not come to mind, and it fails in
+# the safe direction.
+SUSPEND_PHRASES: tuple[str, ...] = (
+    "company",
+    "we have company",
+    "we've got company",
+    "stop listening",
+)
+
+# PROPOSED, not ruled — the operator ruled that a release phrase exists and
+# left the words open (#98 B.3). "all clear" is the idiomatic counterpart to
+# "company" (it means precisely "the visitor has gone"), and "as you were" is
+# the butler register this whole device is named for. Both are two- and
+# three-token phrases with no neighbour anywhere in this grammar, which is
+# what ``test_the_toggle_grammars_are_not_minimal_pairs`` checks rather than
+# asserts.
+RESUME_PHRASES: tuple[str, ...] = (
+    "all clear",
+    "as you were",
+)
+
+# How far back from the END of a window transcript the toggle phrases may be
+# matched when the wake word was not rendered at all. See
+# :func:`_toggle_scope` — a cued window opens up to 45 seconds BEFORE the
+# operator spoke, so an unanchored match would let a conversation about
+# "the company" half a minute earlier suspend the device.
+TOGGLE_TAIL_TOKENS = 8
 
 # Lookback modifiers (design §3 + §4.3). Without a way to EXPRESS a long
 # lookback the telemetry only ever measures the default, and ruling 5's
@@ -283,6 +337,58 @@ def _detect_wake_variant(
     return ""
 
 
+def _find_phrase_bounded(text: str, phrases: tuple[str, ...]) -> str:
+    """:func:`_find_phrase`, but on TOKEN boundaries — longest match wins.
+
+    The plain substring form is right for the capture verbs (a stray match
+    costs a junk line in a log). It is wrong for the toggle: ``"company"``
+    is a substring of ``"accompany"``, and "I'll accompany you" must not
+    make the device deaf. Padding both sides turns containment into
+    whole-token containment without a regex per phrase.
+    """
+    padded = f" {text} "
+    best = ""
+    for phrase in phrases:
+        if phrase and f" {phrase} " in padded and len(phrase) > len(best):
+            best = phrase
+    return best
+
+
+def _toggle_scope(
+    text: str, wake_word: str, confusables: tuple[str, ...],
+) -> str:
+    """The part of a window transcript a TOGGLE phrase may be matched in.
+
+    A cued window opens up to ``lookback_seconds`` (45 s by default) BEFORE
+    the operator spoke, so most of the transcript is ordinary conversation
+    that happened to be in the ring. Matching the toggle anywhere in it
+    would mean "we have company coming over on Saturday", said half a minute
+    before an unrelated "Jeeves, note that", suspends the microphone.
+
+    So the toggle is anchored to the CUE, two ways:
+
+    * From the LAST rendering of the wake word onwards — "…jeeves company".
+      This is the normal case and it tolerates the operator carrying on
+      talking afterwards, because the scope runs to the end.
+    * Failing that (the Q6 finding: an STT may render the wake word as
+      something else entirely, or drop it), the final
+      :data:`TOGGLE_TAIL_TOKENS` tokens, which is where a phrase spoken at
+      the cue position ends up.
+
+    The capture verbs are deliberately NOT scoped this way. Their grammars
+    are shipped and their false positives are cheap; the toggle's are not
+    symmetric — see the phrase tables.
+    """
+    tokens = text.split()
+    if not tokens:
+        return ""
+    wake_tokens = {wake_word, *confusables}
+    for index in range(len(tokens) - 1, -1, -1):
+        if tokens[index] in wake_tokens:
+            return " ".join(tokens[index:])
+    return " ".join(tokens[-TOGGLE_TAIL_TOKENS:])
+
+
 def _parse_modifier(
     text: str, extended_seconds: float,
 ) -> tuple[str, float | None]:
@@ -318,11 +424,15 @@ def classify(
 ) -> CueClassification:
     """Classify a cued window's transcript into a verb.
 
-    Order is MISS → ROUTE → MARK, and it is not arbitrary. A miss report
-    must never be swallowed by a mark (it is the scarce signal). ROUTE
-    precedes MARK because a transcript can legitimately contain both — "note
-    that and tell <target>" — and the more consequential verb, which the
-    operator went out of his way to say, wins.
+    Order is SUSPEND → RESUME → MISS → ROUTE → MARK, and it is not
+    arbitrary. The TOGGLE runs first because "Jeeves, company" must suspend
+    even when the same window carries a capture verb: a window that contains
+    both is a window in which the operator asked for privacy, and honouring
+    the capture instead is the one outcome he cannot undo. A miss report is
+    next (it must never be swallowed by a mark — it is the scarce signal),
+    and ROUTE precedes MARK because a transcript can legitimately contain
+    both — "note that and tell <target>" — and the more consequential verb,
+    which the operator went out of his way to say, wins.
     """
     text = normalize(transcript)
     if not text:
@@ -341,6 +451,24 @@ def classify(
         text, wake_word.lower(), tuple(t.lower() for t in confusable_terms),
     )
     modifier, lookback = _parse_modifier(text, extended_lookback_seconds)
+
+    # THE TOGGLE, first and anchored to the cue. Neither branch carries a
+    # lookback modifier: suspending is not a capture, so "how far back"
+    # means nothing for it, and recording one would put a number in the
+    # telemetry row that no window was ever cut with.
+    scope = _toggle_scope(
+        text, wake_word.lower(), tuple(t.lower() for t in confusable_terms),
+    )
+    suspend = _find_phrase_bounded(scope, SUSPEND_PHRASES)
+    if suspend:
+        return _classified(CueClassification(
+            verb=CUE_SUSPEND, matched_phrase=suspend, wake_variant=wake_variant,
+        ))
+    resume = _find_phrase_bounded(scope, RESUME_PHRASES)
+    if resume:
+        return _classified(CueClassification(
+            verb=CUE_RESUME, matched_phrase=resume, wake_variant=wake_variant,
+        ))
 
     miss = _find_phrase(text, MISS_PHRASES)
     if miss:

@@ -51,6 +51,11 @@ EVENT_CAPTURE_ROUTED = "capture_routed"
 EVENT_MISS_REPORTED = "miss_reported"
 EVENT_CAPTURE_DROPPED = "capture_dropped"
 EVENT_SERVICE_IDLE = "service_idle"
+# The company toggle (#98, ruling 3). BOTH directions get a row, from
+# WHICHEVER door drove the transition — a rollup that recorded suspensions
+# and not releases would show a device that goes deaf and never comes back.
+EVENT_SUSPENDED = "suspended"
+EVENT_RESUMED = "resumed"
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,21 @@ class TelemetryRow:
     has_speech_signal: bool | None = None
     transcript_chars: int = 0
     ring_held_seconds: float | None = None
+    #: Which door drove a suspend/resume transition — a member of
+    #: :data:`alfred.jeeves.suspend.SUSPEND_SOURCES`, one of three fixed
+    #: words. Empty on every other event kind.
+    toggle_source: str = ""
+    #: MISS-REPORT RETENTION (#98, ruling 1). ``miss_audio_retained`` is a
+    #: BOOLEAN — it says whether the ring window behind a miss report was
+    #: kept, never what was in it. ``miss_audio_id`` is the generated
+    #: artefact id (``miss-<utc stamp>-<hex>``, a fixed shape from
+    #: :func:`alfred.jeeves.miss_store.new_artifact_id`), which is what lets
+    #: morning review join a telemetry row to the artefact WITHOUT the row
+    #: carrying a path — a path is long, environment-specific, and the one
+    #: string in this design that could plausibly grow. Paths live in the
+    #: artefact index; telemetry carries the id and the boolean.
+    miss_audio_retained: bool = False
+    miss_audio_id: str = ""
 
 
 #: The closed set of keys a telemetry row may carry. Kept in lockstep with

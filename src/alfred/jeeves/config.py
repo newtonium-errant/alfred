@@ -23,9 +23,17 @@ FAIL-CLOSED VALUES, three of them, each failing in the safe direction:
   Route is the verb with effects OUTSIDE the garage, so an unconfigured
   target must not guess a destination; the utterance stays local.
 * ``miss_audio_dir`` — empty (the default) means miss-report audio is NEVER
-  written to disk. Persisting training audio is a bigger step than v1 was
-  ratified for; the knob exists so the decision has a place to land, and its
-  default is the one that keeps fence 2 intact.
+  written to disk. The DECISION has since been made (#98, ruling 1: an
+  explicit miss report is in-the-moment consent, so its window is retained
+  sensitive-local, surfaced for the recogniser example, then deleted), but
+  the default stays empty: setting this directory is the same deliberate,
+  once, at-deploy edit as ``mode: live``, and an instance that has not made
+  it keeps fence 2 whole. See :mod:`.miss_store`.
+* ``suspend_state_path`` — the COMPANY TOGGLE's store (#98, ruling 3), and
+  the one path here that is ALWAYS derived rather than left empty. The other
+  two knobs mean "off" when unset; a suspension that could not be recorded
+  would mean "on", which is the wrong direction for a microphone. See
+  :mod:`.suspend` for why the load itself is fail-closed.
 """
 
 from __future__ import annotations
@@ -52,6 +60,25 @@ JEEVES_MODE_LIVE = "live"
 _JEEVES_DIR_NAME = "jeeves"
 _TELEMETRY_FILE_NAME = "telemetry.jsonl"
 _MARK_LOG_FILE_NAME = "marks.jsonl"
+_SUSPEND_FILE_NAME = "suspended.json"
+
+# How long a retained miss-report window survives WITHOUT being extracted
+# (#98, ruling 1). Seven days, and the number is a judgement about two
+# opposite failures:
+#
+# * Too short (1–3 days) silently destroys the scarce signal. Miss reports
+#   are the only labelled negative examples this system can produce, and a
+#   weekend away or a skipped morning review would delete one before it was
+#   ever seen.
+# * Too long (30 days) turns "a training sample awaiting review" into an
+#   audio archive of the garage, which is the exact artefact fence 2 exists
+#   to prevent. Retention that outlives the operator's memory of the
+#   conversation is retention he can no longer consent to meaningfully.
+#
+# A week is the shortest window that survives a normal gap in a daily
+# habit: morning review gets ~7 chances at each artefact, and an artefact
+# nobody has acted on in seven days is one nobody is going to.
+DEFAULT_MISS_AUDIO_RETENTION_DAYS = 7
 
 # Ring default — 30 minutes, ratified (ruling 5) and explicitly NOT to be
 # tuned on a handful of captures. ``window.lookback_used_seconds`` telemetry
@@ -296,6 +323,14 @@ class JeevesConfig:
     # Miss-report AUDIO samples. Empty (the default) ⇒ never written. See
     # the module docstring: the fail-closed direction keeps fence 2 intact.
     miss_audio_dir: str = ""
+    # How many days a retained miss window survives without being extracted
+    # into a recogniser example. Only meaningful when miss_audio_dir is set.
+    miss_audio_retention_days: int = DEFAULT_MISS_AUDIO_RETENTION_DAYS
+    # The COMPANY TOGGLE's store (#98, ruling 3). Derived per-instance at
+    # load, so a loaded config is never in the "no store" state — the
+    # toggle's whole point is surviving a restart, and a suspension with
+    # nowhere to live would not. See :mod:`.suspend`.
+    suspend_state_path: str = ""
 
     @property
     def is_live(self) -> bool:
@@ -512,6 +547,11 @@ def default_mark_log_path(raw: dict[str, Any]) -> str:
     return instance_data_path(raw, _JEEVES_DIR_NAME, _MARK_LOG_FILE_NAME)
 
 
+def default_suspend_state_path(raw: dict[str, Any]) -> str:
+    """``<instance data dir>/jeeves/suspended.json``."""
+    return instance_data_path(raw, _JEEVES_DIR_NAME, _SUSPEND_FILE_NAME)
+
+
 def load_from_unified(raw: dict[str, Any]) -> JeevesConfig:
     """Build :class:`JeevesConfig` from the unified config dict.
 
@@ -540,4 +580,14 @@ def load_from_unified(raw: dict[str, Any]) -> JeevesConfig:
             _coerce_str(block.get("mark_log_path")) or default_mark_log_path(raw)
         ),
         miss_audio_dir=_coerce_str(block.get("miss_audio_dir")),
+        miss_audio_retention_days=_coerce_positive_int(
+            block.get(
+                "miss_audio_retention_days", DEFAULT_MISS_AUDIO_RETENTION_DAYS,
+            ),
+            DEFAULT_MISS_AUDIO_RETENTION_DAYS,
+        ),
+        suspend_state_path=(
+            _coerce_str(block.get("suspend_state_path"))
+            or default_suspend_state_path(raw)
+        ),
     )

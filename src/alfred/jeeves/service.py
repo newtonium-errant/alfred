@@ -10,9 +10,14 @@ DISPATCH, and where each verb's output lands:
 
 * **MARK-DOWN** → the local log (:mod:`.marklog`). Stays on the device.
 * **ROUTE** → the injected sink (stage 2's peer intake route). Leaves.
-* **MISS REPORT** → the local log, tagged ``miss``, plus its telemetry row.
-  The scarce signal: cue false-negatives are invisible by construction, so
-  this is the only labelled negative example the system can ever get.
+* **MISS REPORT** → the local log, tagged ``miss``, plus its telemetry row —
+  AND, alone among the verbs, the window's AUDIO (:mod:`.miss_store`, #98
+  ruling 1). The scarce signal: cue false-negatives are invisible by
+  construction, so this is the only labelled negative example the system can
+  ever get, and it is worth nothing without the audio it refers to.
+* **SUSPEND / RESUME** → the company toggle (:mod:`.suspend`, #98 ruling 3).
+  Not a capture at all: nothing is written, sent or kept: a flag moves, and
+  the ring is emptied on the way down.
 * **NONE** → a telemetry row with its reason, and nothing else. A cue fired
   and no verb matched; that is data, not an error.
 
@@ -34,10 +39,10 @@ from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 import structlog
 
-from . import cues, marklog, stt, telemetry, window
+from . import cues, marklog, miss_store, stt, suspend, telemetry, window
 from .audio import AudioChunk, AudioFormat, AudioSource
 from .config import JeevesConfig
-from .gate import JeevesCaptureRefused, guard_capture
+from .gate import JeevesCaptureRefused, guard_capture, guard_not_suspended
 from .ring import RingBuffer
 from .wake import WakeEvent, WakeWordDetector, build_detector
 
@@ -50,6 +55,10 @@ DISPOSITION_ROUTED = "routed"
 DISPOSITION_MISS_LOGGED = "miss_logged"
 DISPOSITION_DROPPED = "dropped"
 DISPOSITION_REFUSED = "refused"
+#: The company toggle fired (#98, ruling 3). Not a capture at all — nothing
+#: was written, sent or kept; a flag moved.
+DISPOSITION_SUSPENDED = "suspended"
+DISPOSITION_RESUMED = "resumed"
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,7 @@ class JeevesService:
         stt_backend: Any = None,
         route_sink: SinkCallable | None = None,
         provenance: Any = None,
+        release_detector: WakeWordDetector | None = None,
     ) -> None:
         self.config = config
         self.audio_format = audio_format or AudioFormat(
@@ -125,9 +135,23 @@ class JeevesService:
         #: REFUSED in synthetic mode — the correct posture for a service
         #: constructed without anyone declaring what it is listening to.
         self._provenance = provenance
+        #: The ONLY thing fed audio while suspended. See :meth:`feed`: the
+        #: spoken RELEASE cannot come through the capture path, because that
+        #: path is the ring plus a cloud STT call and suspension is exactly
+        #: the state in which neither may happen. A release therefore needs
+        #: a second LOCAL, transcript-free recogniser — a second wake model,
+        #: which is deploy-stage territory. Absent (the default), the manual
+        #: control is the only door out, and the service says so once per
+        #: suspension rather than leaving the operator talking to a device
+        #: that structurally cannot answer.
+        self._release_detector = release_detector
         self._pending: _PendingCapture | None = None
         self._cues_seen = 0
         self._captures_completed = 0
+        #: Latches so a suspension logs once per EPISODE, not once per audio
+        #: chunk. Twelve identical lines a second is not observability.
+        self._suspended_notice_given = False
+        self._release_gap_notice_given = False
 
     # -- the audio path --------------------------------------------------
 
@@ -136,7 +160,29 @@ class JeevesService:
 
         Returns the outcomes that COMPLETED on this chunk — usually empty,
         because a cue's lookahead spans many chunks.
+
+        **SUSPENSION IS CHECKED HERE, FIRST, AND IT MAKES THE RING INERT.**
+        Not just the capture path: while the company toggle is on, the audio
+        never enters the buffer at all, so there is nothing for a later cue
+        to reach back into. Refusing at the gate alone would leave thirty
+        minutes of a visitor's conversation sitting in RAM, retrievable the
+        moment the toggle came off — which is not what the operator was
+        promised when he said the word.
+
+        The state is re-read on every chunk rather than cached, because the
+        manual door is a DIFFERENT PROCESS: a cached flag would mean the
+        button does nothing until the service restarts, at precisely the
+        moment the operator is standing there watching for it to take
+        effect. The read is a small file the OS has in cache; the wake model
+        running on this same chunk costs orders of magnitude more.
         """
+        status = suspend.read_status(self.config.suspend_state_path)
+        if status.suspended:
+            self._note_suspended(status)
+            self._listen_for_release(chunk)
+            return []
+        self._clear_suspension_latches()
+
         self.ring.append(chunk.data)
 
         outcomes: list[CaptureOutcome] = []
@@ -165,6 +211,94 @@ class JeevesService:
             )
             break  # one capture at a time; the rest of this chunk feeds it
         return outcomes
+
+    # -- the company toggle (#98, ruling 3) -------------------------------
+
+    def suspend_status(self) -> suspend.SuspendStatus:
+        """READ HOOK: the state the vehicle UI renders.
+
+        The seam Part C consumes. Returns the whole struct, not a boolean,
+        because a banner that says only "SUSPENDED" cannot tell the operator
+        whether the device heard him or whether it fell back to suspended
+        because its state file is corrupt — and those need different actions
+        from him.
+        """
+        return suspend.read_status(self.config.suspend_state_path)
+
+    def _note_suspended(self, status: suspend.SuspendStatus) -> None:
+        """Say once per episode that audio is being dropped, and why."""
+        if self._suspended_notice_given:
+            return
+        self._suspended_notice_given = True
+        # Intentionally-left-blank: a suspended Jeeves and a broken Jeeves
+        # produce the same silence, and only one of them is what the
+        # operator asked for.
+        log.info(
+            "jeeves.service.suspended",
+            reason=status.reason,
+            source=status.source,
+            fail_closed=status.fail_closed,
+            since=status.since,
+            release_path=(
+                "spoken_or_manual" if self._release_detector is not None
+                else "manual_only"
+            ),
+            detail=status.detail or "the company toggle is on: audio is not "
+                                    "entering the ring and no cue can fire",
+        )
+
+    def _clear_suspension_latches(self) -> None:
+        if self._suspended_notice_given or self._release_gap_notice_given:
+            log.info(
+                "jeeves.service.resumed",
+                detail="the company toggle is off: audio is entering the ring "
+                       "again and cues can fire",
+            )
+        self._suspended_notice_given = False
+        self._release_gap_notice_given = False
+
+    def _listen_for_release(self, chunk: AudioChunk) -> None:
+        """While suspended, the ONE thing audio may still be fed to.
+
+        A local, transcript-free recogniser for the release phrase. No ring,
+        no STT, no network — otherwise "suspended" would mean "still
+        uploading, just quietly", which is the opposite of the promise.
+        """
+        if self._release_detector is None:
+            if not self._release_gap_notice_given:
+                self._release_gap_notice_given = True
+                # Intentionally-left-blank: an operator saying the release
+                # phrase at a device with no release recogniser gets silence
+                # from a system that CANNOT hear him, and nothing anywhere
+                # would say so.
+                log.warning(
+                    "jeeves.service.no_release_detector",
+                    detail="Jeeves is suspended and no local release "
+                           "recogniser is wired, so the SPOKEN release "
+                           "phrase cannot be heard — the manual control is "
+                           "the only way back. A spoken release needs a "
+                           "second on-device wake model; it cannot go "
+                           "through the capture path, because that path is "
+                           "the ring plus a cloud STT call and suspension is "
+                           "exactly the state in which neither may happen.",
+                )
+            return
+
+        for event in self._release_detector.feed(chunk):
+            log.info(
+                "jeeves.service.release_detected",
+                confidence=round(event.confidence, 4),
+                model=event.model,
+                detail="the local release recogniser fired while suspended",
+            )
+            suspend.set_suspended(
+                self.config.suspend_state_path,
+                False,
+                source=suspend.SOURCE_SPOKEN,
+                telemetry_path=self.config.telemetry_path,
+            )
+            self._clear_suspension_latches()
+            break
 
     async def flush(self) -> list[CaptureOutcome]:
         """Complete any capture still collecting lookahead (stream end)."""
@@ -211,6 +345,14 @@ class JeevesService:
 
         source_id = f"cue@{pending.event.position_s:.3f}s"
         try:
+            # THE SECOND ENFORCEMENT POINT, and not redundant with the one in
+            # ``feed``. The manual door is another process: the operator can
+            # press the button while a lookahead is still collecting, which
+            # means a capture that began legitimately can be in flight when
+            # suspension lands. Checked FIRST because it is the more
+            # absolute refusal — "you told me to stop" outranks "this
+            # instance is in synthetic mode".
+            guard_not_suspended(self.config, source_id=source_id)
             guard_capture(
                 self.config, provenance=self._provenance, source_id=source_id,
             )
@@ -303,16 +445,28 @@ class JeevesService:
     ) -> CaptureOutcome:
         facts = self._capture_facts(event, extracted, transcript, stt_calls)
 
+        # THE TOGGLE FIRST — it is not a capture. Nothing is written to the
+        # mark log, nothing is sent, and the window's audio is dropped along
+        # with everything else on this path. A transition row goes to
+        # telemetry from inside :func:`alfred.jeeves.suspend.set_suspended`,
+        # so the spoken door and the manual door leave identical evidence.
+        if classification.verb in (cues.CUE_SUSPEND, cues.CUE_RESUME):
+            return self._dispatch_toggle(classification, extracted, stt_calls)
+
         if classification.verb == cues.CUE_MISS_REPORT:
             wrote = marklog.append_mark(
                 self.config.mark_log_path, transcript.text,
                 kind=marklog.KIND_MISS, provenance=facts,
             )
+            # THE ONE PATH WHERE RING AUDIO SURVIVES (#98, ruling 1). The
+            # miss report IS the consent, and it is worth nothing without
+            # the audio it refers to.
+            artifact = self._retain_miss_audio(extracted)
             self._emit_telemetry(self._row(
                 telemetry.EVENT_MISS_REPORTED, classification, extracted,
                 transcript, event, stt_calls,
+                miss_audio_id=artifact.id if artifact else "",
             ))
-            self._note_miss_audio_inert()
             return CaptureOutcome(
                 verb=classification.verb,
                 disposition=DISPOSITION_MISS_LOGGED if wrote
@@ -369,6 +523,84 @@ class JeevesService:
             transcript_chars=len(transcript.text),
             lookback_used_seconds=extracted.lookback_used_seconds,
             stt_calls=stt_calls, telemetry_written=True,
+        )
+
+    def _dispatch_toggle(
+        self,
+        classification: cues.CueClassification,
+        extracted: window.ExtractedWindow,
+        stt_calls: int,
+    ) -> CaptureOutcome:
+        """The SPOKEN door onto the suspended state — same function as the UI.
+
+        Both doors call :func:`alfred.jeeves.suspend.set_suspended`; the only
+        difference is ``source``. That is what makes "spoken-or-manual
+        interchangeable" true rather than aspirational — two code paths that
+        each wrote the flag themselves would drift, and one of them would
+        eventually forget the atomic write, the 0600, or the log line.
+
+        ``transcript_chars`` is deliberately 0: a toggle utterance is not a
+        capture, and counting its characters would put it in the same
+        telemetry column as captures for no reason anyone could interpret.
+        """
+        want_suspended = classification.verb == cues.CUE_SUSPEND
+        status = suspend.set_suspended(
+            self.config.suspend_state_path,
+            want_suspended,
+            source=suspend.SOURCE_SPOKEN,
+            telemetry_path=self.config.telemetry_path,
+        )
+        if want_suspended:
+            # Coming down: drop everything already held. The ring is RAM and
+            # dies on wrap anyway, but "you asked me to stop" should not
+            # leave half an hour of the preceding conversation retrievable
+            # for as long as it takes to wrap.
+            self.ring.clear()
+            self._suspended_notice_given = False
+        log.info(
+            "jeeves.service.toggle",
+            verb=classification.verb,
+            matched_phrase=classification.matched_phrase,
+            suspended=status.suspended,
+            source=status.source,
+            detail="the spoken company toggle fired; nothing was captured, "
+                   "written or sent",
+        )
+        return CaptureOutcome(
+            verb=classification.verb,
+            disposition=(
+                DISPOSITION_SUSPENDED if status.suspended else DISPOSITION_RESUMED
+            ),
+            reason=status.reason,
+            transcript_chars=0,
+            lookback_used_seconds=extracted.lookback_used_seconds,
+            stt_calls=stt_calls,
+            telemetry_written=bool(self.config.telemetry_path),
+        )
+
+    def _retain_miss_audio(
+        self, extracted: window.ExtractedWindow,
+    ) -> miss_store.MissArtifact | None:
+        """Persist the window behind a miss report (#98, ruling 1).
+
+        Unconfigured ``miss_audio_dir`` writes nothing and says so — the
+        fail-closed default, and the same deliberate at-deploy edit as
+        ``mode: live``. See :mod:`.miss_store` for why this is the only
+        exception to "cued audio is deleted as soon as STT returns", and for
+        the auto-delete that closes it.
+        """
+        if not self.config.miss_audio_dir:
+            self._note_miss_audio_inert()
+            return None
+        return miss_store.persist_miss_window(
+            self.config.miss_audio_dir,
+            extracted.audio,
+            sample_rate=self.audio_format.sample_rate,
+            sample_width=self.audio_format.sample_width,
+            channels=self.audio_format.channels,
+            lookback_used_seconds=extracted.lookback_used_seconds,
+            lookahead_used_seconds=extracted.lookahead_used_seconds,
+            truncated_by_ring=extracted.truncated_by_ring,
         )
 
     async def _dispatch_route(
@@ -511,6 +743,7 @@ class JeevesService:
         event: WakeEvent,
         stt_calls: int,
         reason: str = "",
+        miss_audio_id: str = "",
     ) -> telemetry.TelemetryRow:
         return telemetry.TelemetryRow(
             at=telemetry.now_iso(),
@@ -535,6 +768,11 @@ class JeevesService:
             # the transcript that helps read the lookback distribution.
             transcript_chars=len(transcript.text),
             ring_held_seconds=round(self.ring.held_seconds, 3),
+            # A BOOLEAN and an id, never a path. The id joins this row to
+            # the artefact index at morning review; the index is where a
+            # path is allowed to be long.
+            miss_audio_retained=bool(miss_audio_id),
+            miss_audio_id=miss_audio_id,
         )
 
     def _emit_telemetry(self, row: telemetry.TelemetryRow) -> bool:
@@ -561,18 +799,20 @@ class JeevesService:
         """Say out loud that miss-report AUDIO is not being kept.
 
         The design calls a miss report the highest-value training data this
-        system can produce, and v1 keeps only its transcript. An operator
-        reporting misses deserves to know the audio behind them is not
-        being retained — otherwise he is producing a dataset that does not
-        exist.
+        system can produce. Ruling 1 (#98) decided the audio behind one IS
+        retained — but the DIRECTORY is still the operator's deliberate
+        at-deploy edit, exactly like ``mode: live``, so an instance that has
+        not made it keeps only the transcript. He deserves to know that,
+        otherwise he is producing a dataset that does not exist.
         """
         if not self.config.miss_audio_dir:
             log.info(
                 "jeeves.service.miss_audio_not_retained",
-                detail="jeeves.miss_audio_dir is unset (the v1 default), so "
-                       "the miss report's transcript was kept and its AUDIO "
-                       "was not. Retaining audio is a deliberate decision "
-                       "that has not been made.",
+                detail="jeeves.miss_audio_dir is unset, so the miss report's "
+                       "transcript was kept and its AUDIO was not. Set the "
+                       "directory to retain the window for the recogniser "
+                       "example (#98 ruling 1) — it auto-deletes once the "
+                       "example is taken, and ages out if it is not.",
             )
 
 

@@ -2149,7 +2149,38 @@ scaffold:
 #   # marks.jsonl holds MARK-DOWN transcripts and is written 0600.
 #   telemetry_path: ""
 #   mark_log_path: ""
-#   # Empty (the default) = miss-report AUDIO is NEVER written to disk. Only
-#   # the transcript is kept. Retaining audio is a decision that has not been
-#   # made; this knob is where it would land.
+#
+#   # THE COMPANY TOGGLE's store (#98, ruling 3). "Jeeves, company" suspends
+#   # wake-word AND capture — audio stops entering the ring at all — until a
+#   # release. Two doors set the same state: the spoken phrase and the manual
+#   # control on the client, both logged with which one it was.
+#   #
+#   # This is the one path here that always DERIVES a default rather than
+#   # meaning "off" when unset, because the whole point is surviving a
+#   # restart: the state is READ FRESH on every check (the manual button is a
+#   # different process), and a state that cannot be read — missing,
+#   # unreadable, corrupt, or carrying a non-boolean — resolves to SUSPENDED.
+#   # A first boot is therefore suspended until released once; the log and
+#   # the client both say `no_state_file` so it reads as "never initialised"
+#   # rather than as a mystery.
+#   suspend_state_path: ""
+#
+#   # MISS-REPORT RETENTION (#98, ruling 1). "Jeeves, you missed that" is the
+#   # only cue whose AUDIO survives — the report is the in-the-moment consent,
+#   # and it trains nothing if the window it refers to is already gone. Every
+#   # other cue still leaves the ring to die (pinned in
+#   # tests/test_jeeves_miss_retention.py, which snapshots the filesystem
+#   # around each verb).
+#   #
+#   # Empty (the default) = no audio is written, only the transcript, and the
+#   # log says so on every miss report. Setting the directory is the same
+#   # deliberate at-deploy edit as `mode: live`. SENSITIVE-LOCAL: put it under
+#   # this instance's own data dir, never in the vault — 0700 directory, 0600
+#   # files, syncs nowhere.
 #   miss_audio_dir: ""
+#   # How long a retained window survives if no recogniser example is ever
+#   # taken from it. Extraction deletes the audio immediately; this is the
+#   # backstop for the ones nobody gets to. Short enough that a training
+#   # sample cannot become an audio archive of the garage, long enough to
+#   # survive a weekend away from morning review.
+#   miss_audio_retention_days: 7
