@@ -6,7 +6,9 @@ import { NotificationList } from '../components/NotificationList';
 import { ChatThread } from '../components/chat/ChatThread';
 import { ChatTargetPicker } from '../components/chat/ChatTargetPicker';
 import { Composer } from '../components/chat/Composer';
+import { UnifiedComposer } from '../components/chat/UnifiedComposer';
 import { VoicePanel } from '../components/chat/VoicePanel';
+import { unifiedComposerEnabled } from '../lib/algernon/composerFlag';
 import { Button } from '../components/ui/button';
 import { authApi } from '../lib/algernon/authClient';
 import { chatApi } from '../lib/algernon/client';
@@ -244,13 +246,33 @@ export default function ChatPage() {
 
           {/* `transcript` (#54) is the raw STT text a voice-seeded send was built
               from — threaded through to the turn body so the backend can learn
-              from what the operator corrected. A typed send passes nothing. */}
-          <Composer
-            onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
-            disabled={booting || sending}
-            seedText={unsentText}
-            onSeedConsumed={clearUnsent}
-          />
+              from what the operator corrected. A typed send passes nothing.
+
+              #97: with NEXT_PUBLIC_UNIFIED_COMPOSER on, the universal composer
+              mounts here instead — the same `onSend` contract, plus attachment
+              routing to the ingest and batch doors. OFF (the default, and the
+              shipped state until the operator has walked the chip defaults) this
+              renders exactly what it always did. The two are alternatives, never
+              layered, so "flag off" is the old component itself rather than the
+              new one in a quiet mode. */}
+          {unifiedComposerEnabled() ? (
+            <UnifiedComposer
+              onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
+              disabled={booting || sending}
+              seedText={unsentText}
+              onSeedConsumed={clearUnsent}
+              instance={instance}
+              instanceLabel={activeLabel}
+              onUnauthenticated={() => router.replace(`/login?next=${encodeURIComponent('/chat')}`)}
+            />
+          ) : (
+            <Composer
+              onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
+              disabled={booting || sending}
+              seedText={unsentText}
+              onSeedConsumed={clearUnsent}
+            />
+          )}
         </div>
       </Layout>
     </>

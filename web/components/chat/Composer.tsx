@@ -2,7 +2,6 @@ import {
   ClipboardEvent,
   DragEvent,
   KeyboardEvent,
-  useEffect,
   useRef,
   useState,
 } from 'react';
@@ -13,12 +12,10 @@ import type { ChatKind } from '../../lib/algernon/types';
 import {
   ALLOWED_IMAGE_MEDIA_TYPES,
   MAX_IMAGES_PER_TURN,
-  MAX_IMAGE_BYTES,
-  MAX_TRANSCRIPT_CHARS,
-  base64DecodedBytes,
   type ImageAttachment,
 } from '../../lib/algernon/schemas';
-import { prepareImageForUpload } from '../../lib/algernon/imagePrepare';
+import { collectImageAttachments } from '../../lib/algernon/imageAttach';
+import { useComposerText } from '../../lib/algernon/useComposerText';
 
 // The message composer. Enter sends; Shift+Enter inserts a newline. An empty /
 // whitespace-only message never sends UNLESS an image is attached. `disabled`
@@ -37,28 +34,16 @@ import { prepareImageForUpload } from '../../lib/algernon/imagePrepare';
 //
 // Learned-vocabulary capture (#54): alongside the edited text, a voice-seeded
 // send carries the RAW STT transcript so the backend can diff the two and learn
-// what it mis-heard. See `transcriptRef` for what exactly is carried and why.
+// what it mis-heard. See `useComposerText` for what exactly is carried and why.
+//
+// TWO SHARED HOMES, since the unified composer (#97) became a second door onto
+// the same conversation route: the text/transcript/seed rules live in
+// `useComposerText`, and the image caps + their refusal sentences live in
+// `imageAttach.collectImageAttachments`. Both are behaviour this file used to
+// own inline; both are now single-sourced so the two composers cannot drift on
+// which images they accept or what a transcript carries.
 
 const IMAGE_ONLY_PLACEHOLDER = '(image attached, no caption)';
-const MAX_IMAGE_MIB = Math.round(MAX_IMAGE_BYTES / (1024 * 1024));
-
-// Read a File to a bare standard-base64 string (data: prefix stripped).
-function readAsBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error('read_failed'));
-    reader.onload = () => {
-      const result = reader.result;
-      if (typeof result !== 'string') {
-        reject(new Error('unexpected_reader_result'));
-        return;
-      }
-      const comma = result.indexOf(',');
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.readAsDataURL(file);
-  });
-}
 
 export function Composer({
   onSend,
@@ -83,139 +68,49 @@ export function Composer({
   /** Called once the seed has been placed, so it is offered exactly once. */
   onSeedConsumed?: () => void;
 }) {
-  const [value, setValue] = useState('');
-
-  // Restore the held text — but never over live typing. If the operator has
-  // already started rewriting, their current words win; re-composing is a
-  // choice they have visibly made, and clobbering it would be the same loss
-  // in the other direction.
-  useEffect(() => {
-    if (!seedText) return;
-    setValue((prev) => (prev.trim() ? prev : seedText));
-    onSeedConsumed?.();
-  }, [seedText, onSeedConsumed]);
-  // True once a voice transcript seeded the input — tags the next send as 'voice'.
-  const [voiceSeeded, setVoiceSeeded] = useState(false);
-  // The RAW STT text this message was seeded from (#54) — ONLY the transcribed
-  // segments, joined by the same single-space rule the textarea append uses, and
-  // never the operator's own typed words.
-  //
-  // WHY ONLY THE SPOKEN PART. The backend diffs transcript-vs-sent and reads the
-  // `replace` spans as "the STT heard X, I meant Y". Text the operator TYPED was
-  // never heard by the STT, so it cannot have been mis-heard; folding it in would
-  // make his own edits to his own typing eligible to be learned as vocabulary.
-  // Keeping it out means a typed word only ever appears as a diff INSERT, which
-  // the extractor ignores by design.
-  //
-  // The cost, stated honestly: a send that mixes typing with a PERFECT
-  // transcription no longer looks like a zero diff, so it is recorded as a
-  // correction-bearing pair with zero extracted terms instead of as clean
-  // evidence. That understates transcription quality — the same conservative
-  // direction the rest of the loop errs in, and never the flattering one.
-  //
-  // A ref, not state: it is never rendered, and a ref is always current at the
-  // moment `submit` reads it (no stale-closure window between an async
-  // transcription landing and the next render).
-  const transcriptRef = useRef('');
+  const text = useComposerText({ seedText, onSeedConsumed });
   const [images, setImages] = useState<ImageAttachment[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const canSend = value.trim().length > 0 || images.length > 0;
+  const canSend = text.value.trim().length > 0 || images.length > 0;
 
   function submit() {
     if (disabled || !canSend) return;
-    const text = value.trim();
+    const trimmed = text.value.trim();
     const hasImages = images.length > 0;
-    const caption = text || IMAGE_ONLY_PLACEHOLDER;
-    // Only a voice-seeded send carries a transcript, and only one the BFF will
-    // actually accept. An over-long transcript is DROPPED, not sent: capture is
-    // telemetry, and letting it fail the zod bound would 400 the whole turn —
-    // the operator would lose a message he spoke, to a learning feature. The
-    // send still goes through, tagged 'voice'; only the learning is skipped.
-    const raw = voiceSeeded ? transcriptRef.current.trim() : '';
-    let transcript = raw || undefined;
-    if (transcript && transcript.length > MAX_TRANSCRIPT_CHARS) {
-      // ILB: a silently-absent transcript is indistinguishable from a broken
-      // capture. Lengths only — the transcript itself is the operator's words
-      // and never belongs in a console.
-      console.warn(
-        `[composer] transcript dropped: ${transcript.length} chars exceeds ` +
-          `${MAX_TRANSCRIPT_CHARS}; the turn is sent without it`,
-      );
-      transcript = undefined;
-    }
+    const caption = trimmed || IMAGE_ONLY_PLACEHOLDER;
+    const transcript = text.takeTranscript();
     // Keep the 2-arg call for the text-only path (no behavioural drift for the
     // existing caller / tests); only widen when images or a transcript ride along.
     if (hasImages || transcript) {
-      onSend(caption, voiceSeeded ? 'voice' : 'text', hasImages ? images : undefined, transcript);
+      onSend(caption, text.kind, hasImages ? images : undefined, transcript);
     } else {
-      onSend(caption, voiceSeeded ? 'voice' : 'text');
+      onSend(caption, text.kind);
     }
-    setValue('');
-    setVoiceSeeded(false);
-    transcriptRef.current = '';
+    text.reset();
     setImages([]);
     setImageError(null);
   }
 
   // Ingest a batch of picked/pasted/dropped files, enforcing the UX caps and
   // surfacing ONE inline error (never a silent drop — intentionally-left-blank).
+  //
+  // The caps, the preparation and the refusal wording all live in
+  // `collectImageAttachments`. Two things it does that are easy to get
+  // backwards, and are explained where the code is: the downscale runs BEFORE
+  // the size gate, and the DECODED byte length is the quantity being capped.
+  //
+  // Downscaling does NOT hold the wedge — the history trim does, by bounding
+  // the image COUNT per request (see imageDownscale.ts). Downscaling is about
+  // fidelity-per-byte, not about the dimension limit.
   async function addFiles(files: FileList | File[]) {
     const list = Array.from(files);
     if (list.length === 0) return;
     setImageError(null);
-    const accepted: ImageAttachment[] = [];
-    let error: string | null = null;
-    for (const file of list) {
-      if (images.length + accepted.length >= MAX_IMAGES_PER_TURN) {
-        error = `You can attach at most ${MAX_IMAGES_PER_TURN} images.`;
-        break;
-      }
-      const mime = (file.type || '').toLowerCase();
-      if (!(ALLOWED_IMAGE_MEDIA_TYPES as readonly string[]).includes(mime)) {
-        error = 'Only PNG, JPEG, GIF, or WebP images are supported.';
-        continue;
-      }
-      try {
-        // Downscale-then-step-down, shared with the batch upload form (#83).
-        // The order (downscale BEFORE the size gate) and the single retry are
-        // explained in `prepareImageForUpload`; they moved there rather than
-        // being copied so the two upload doors cannot drift apart on which
-        // images they accept.
-        //
-        // This does NOT hold the wedge — the history trim does, by bounding
-        // the image COUNT per request (see imageDownscale.ts). Downscaling is
-        // about fidelity-per-byte, not about the dimension limit.
-        //
-        // `size` is the DECODED byte length — the same quantity the backend
-        // caps — so that is the primary size gate; the base64 recheck below is
-        // belt-and-suspenders against a reader that inflates.
-        const { file: prepared, withinBudget } = await prepareImageForUpload(
-          file,
-          MAX_IMAGE_BYTES,
-        );
-        if (!withinBudget) {
-          error = `Each image must be under ${MAX_IMAGE_MIB} MiB.`;
-          continue;
-        }
-        const data = await readAsBase64(prepared);
-        if (base64DecodedBytes(data) > MAX_IMAGE_BYTES) {
-          error = `Each image must be under ${MAX_IMAGE_MIB} MiB.`;
-          continue;
-        }
-        // The re-encode can change the media type (a WebP becomes a JPEG), so
-        // the block must carry the PREPARED file's type, not the picked one —
-        // a mismatch here is what makes the model see a corrupt image.
-        const preparedMime = (prepared.type || mime).toLowerCase();
-        const outMime = (ALLOWED_IMAGE_MEDIA_TYPES as readonly string[]).includes(preparedMime)
-          ? preparedMime
-          : mime;
-        accepted.push({ media_type: outMime as ImageAttachment['media_type'], data });
-      } catch {
-        error = 'Could not read that image.';
-      }
-    }
+    const { accepted, error } = await collectImageAttachments(list, {
+      alreadyCount: images.length,
+    });
     if (accepted.length > 0) {
       setImages((prev) => [...prev, ...accepted].slice(0, MAX_IMAGES_PER_TURN));
     }
@@ -261,23 +156,7 @@ export function Composer({
         disabled={disabled}
         // #54 — the transcript lands in THIS input, editable in place, one Send.
         insertDirectly
-        onTranscript={(t) => {
-          // APPEND, never replace. The old `setValue(t)` destroyed whatever the
-          // operator had already typed — the clobber the operator hit. A single
-          // space joins the two; no space when the input was empty, so a
-          // voice-only message carries no leading whitespace.
-          setValue((prev) => {
-            const base = prev.trimEnd();
-            return base ? `${base} ${t}` : t;
-          });
-          // Mirror the append into the raw-transcript record with the SAME join
-          // rule, so a message dictated in several passes diffs as one piece and
-          // an early correction is still visible against a later dictation.
-          transcriptRef.current = transcriptRef.current
-            ? `${transcriptRef.current} ${t}`
-            : t;
-          setVoiceSeeded(true);
-        }}
+        onTranscript={text.appendTranscript}
       />
 
       {images.length > 0 && (
@@ -331,7 +210,7 @@ export function Composer({
           ref={fileInputRef}
           data-testid="composer-file-input"
           type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
+          accept={ALLOWED_IMAGE_MEDIA_TYPES.join(',')}
           multiple
           className="hidden"
           onChange={(e) => {
@@ -355,19 +234,9 @@ export function Composer({
           aria-label="Message"
           placeholder="Message…"
           rows={1}
-          value={value}
+          value={text.value}
           disabled={disabled}
-          onChange={(e) => {
-            setValue(e.target.value);
-            // Cleared back to empty → the next send is a plain text turn again.
-            // The transcript clears in LOCKSTEP: nothing spoken survives in the
-            // box, so keeping it would diff the next typed message against words
-            // the operator already threw away.
-            if (e.target.value.trim().length === 0) {
-              setVoiceSeeded(false);
-              transcriptRef.current = '';
-            }
-          }}
+          onChange={(e) => text.setValue(e.target.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
           onDrop={onDrop}
