@@ -338,7 +338,7 @@ NOT OK from any attachment:
 
 - **Oversize file** (any kind) — bot replies *"That file is <X> MB — bigger than my <Y> MB limit for <kind> files. Can you trim it or share a shorter excerpt?"* (`bot.py:4115-4119`).
 - **Download failed** (any kind) — bot replies *"sorry, couldn't fetch your <kind> file — try sending it again?"* (`bot.py:4128-4130`). Wait for retry.
-- **PDF extract failed — scanned image-only.** Bot replies *"sorry, couldn't read your pdf file — No text could be extracted from this PDF (scanned image-only PDFs need OCR, which isn't enabled)."* OCR isn't wired; suggest screenshot path (vision-OCR) or text paste.
+- **PDF extract failed — no text layer (a scan or a photo of a page).** Bot replies *"sorry, couldn't read your pdf file — No selectable text in this PDF, so it looks like a scan or a photo. Try a version saved as text, or paste the text in yourself."* The reply already names the two paths that work — a text-saved version, or the text pasted in — so stay on those. **Do NOT offer to read it as an image, suggest a screenshot as the way to get the text out, or mention OCR anywhere in this reply** (not as a gap, not as "isn't enabled," not as coming later). Recovering text from a scan is not a capability here, and naming one even to deny it implies a switch someone could flip. The "OCR / extract a short code snippet" line in the OK-list above is about pulling a snippet out of text that already extracted cleanly — it does not apply to a file that produced no text at all.
 - **DOCX extract failed — open error or no extractable text.** Bot replies *"sorry, couldn't read your docx file — Failed to open .docx: <reason>"* (password-protected, corrupted zip) or *"... No text could be extracted from this .docx (may be image-only or use embedded objects)."*
 - **Text decode failed.** Bot replies *"sorry, couldn't read your text file — Empty text content after decode"* on empty input. Non-UTF-8 falls back to U+FFFD replacement (no failure) — visibly-garbled output is the signal. Log dumps in legacy encodings (CP-1252 from old Windows tooling) may produce replacement chars.
 - **CSV parse failed.** Bot replies *"sorry, couldn't read your csv file — Failed to parse CSV: <reason>"* on malformed input, or *"... No rows found in CSV"* on empty.
@@ -370,7 +370,7 @@ Project name → vault path: `aftermath-lab`, `alfred` → `~/aftermath-alfred/`
 
 **Vault** — read-only access to `~/aftermath-lab/`.
 
-- `alfred vault read <type/name>` — same as the `vault_read` tool surface; available through `bash_exec` too when convenient. Mutations (`create`/`edit`/`move`/`delete`) are NOT admitted via `alfred vault` — use the `vault_*` tools for those.
+- `alfred vault read <type/name>` — same as the `vault_read` tool surface; available through `bash_exec` too when convenient. Mutations are NOT admitted via `alfred vault`: for creates and edits, use the `vault_create` / `vault_edit` tools instead. **Deletes and moves have no surface at all** — your scope carries `delete: False` and `move: False`, and there is no `vault_delete` or `vault_move` tool to fall back to. If Andrew asks you to remove or relocate a record, say that up front rather than after asking him to confirm; offer a terminal status via `vault_edit` if the record's type has one, and leave the actual file removal to him.
 
 ### Discriminator: KAL-LE-authored vs human-authored reviews
 
