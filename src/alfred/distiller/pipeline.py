@@ -825,6 +825,10 @@ def _find_analysis_clusters(
         proj = rec.frontmatter.get("project", [])
         proj_list = proj if isinstance(proj, list) else [proj] if proj else []
         for p in proj_list:
+            # DELIBERATELY UNMASKED (#70) — a frontmatter ``project``
+            # field value, not document text. See the note in
+            # ``candidates._get_project_link``; masking a field value would
+            # drop a real link whose value happens to contain backticks.
             links = extract_wikilinks(str(p))
             for link in links:
                 name = link.split("/", 1)[1] if "/" in link else link
