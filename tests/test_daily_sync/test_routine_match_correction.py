@@ -854,11 +854,21 @@ def test_pending_only_tokens_are_exactly_the_pending_queue_verbs() -> None:
     advertises for ``has_pending`` and that the capability ceiling lists under
     the ``pending`` kind — three places that must agree about what "pending
     verb" means."""
-    from alfred.daily_sync.action_router import FEED_ACTIONS
+    from alfred.daily_sync.action_router import DEFER_ACTIONS, FEED_ACTIONS
     from alfred.daily_sync.assembler import PENDING_ONLY_OK_TOKENS
 
     assert PENDING_ONLY_OK_TOKENS == frozenset({"noted", "show"})
-    assert set(FEED_ACTIONS["pending"]) == PENDING_ONLY_OK_TOKENS, (
+    # The ceiling also carries the GESTURE-only defer verbs (#102 1b-ii), which
+    # have no text grammar and must never gain one: F5 freezes the reply verb
+    # set, and a defer is a swipe, not a word the operator types. So the sets
+    # agree on the RESOLVER-BACKED verbs — which is what this pin has always
+    # been about — with the gesture family excluded by name rather than by a
+    # loosened comparison that would stop noticing a real addition.
+    resolver_backed = set(FEED_ACTIONS["pending"]) - set(DEFER_ACTIONS)
+    assert resolver_backed == PENDING_ONLY_OK_TOKENS, (
         "the capability ceiling's pending actions and the parser-side "
         "pending-only verbs must name the same set"
     )
+    # And the defer family really is present — otherwise the subtraction above
+    # would be silently vacuous and this pin would pass on a build that lost it.
+    assert set(DEFER_ACTIONS) <= set(FEED_ACTIONS["pending"])

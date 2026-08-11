@@ -43,7 +43,15 @@ from alfred.daily_sync.confidence import save_state
 from alfred.daily_sync.corpus import iter_corrections
 from alfred.daily_sync.feed_producer import _FAMILIES, build_feed_items
 from alfred.feed import FeedStore
-from alfred.feed.model import STATE_ACKED, STATE_ACTED, STATE_OPEN, FeedItem, make_id
+from alfred.feed.model import (
+    STATE_ACKED,
+    STATE_ACTED,
+    STATE_DEFERRED,
+    STATE_OPEN,
+    FeedItem,
+    defer_window_open,
+    make_id,
+)
 from alfred.vault.attribution import (
     AuditEntry,
     append_audit_entry,
@@ -1013,3 +1021,104 @@ def test_invalid_action_log_emitted(tmp_path: Path) -> None:
     assert len(matches) == 1
     assert matches[0]["kind"] == "email_tier"
     assert matches[0]["action"] == "reject"
+
+
+# ---------------------------------------------------------------------------
+# Generic defer through the REAL act() entry point (#102 1b-ii)
+# ---------------------------------------------------------------------------
+# tests/feed/test_feed_defer_dispatch.py pins the dispatcher by calling it
+# directly, and stays fully green against a build where `act` never routes to
+# it — the interception deleted, every unit pin passing, the gesture dead in the
+# operator's hand. That is the same wiring gap the serve-time stamping needed
+# route-driven pins to close, so the defer verbs get theirs here.
+
+
+def test_a_defer_through_act_reaches_the_store_and_leaves_the_corpus_alone(
+    tmp_path: Path,
+) -> None:
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    result = _call(store, cfg, fid, "defer")
+
+    assert result.ok is True
+    # The state the deck's `state=open` query excludes — the whole mechanism.
+    assert store.load()[fid].state == STATE_DEFERRED
+    # A defer decides NOTHING: no resolver ran, so no correction was written.
+    assert list(iter_corrections(cfg.corpus.path)) == []
+
+
+def test_a_dated_defer_through_act_carries_its_window(tmp_path: Path) -> None:
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    assert _call(store, cfg, fid, "defer_7d").ok is True
+
+    stored = store.load()[fid]
+    assert stored.state == STATE_DEFERRED
+    assert stored.deferred_until, "a dated rung must record its window"
+    # Asked of the canonical predicate, not a re-derived string comparison.
+    assert defer_window_open(stored.deferred_until) is True
+
+
+def test_the_ceiling_MAP_carries_no_defer_for_the_excluded_kind(tmp_path: Path) -> None:
+    """A statement about the MAP — renamed to stop claiming a runtime behaviour.
+
+    This asserts the declaration only. It stayed green when the interception's
+    ceiling check was deleted, because nothing here drives an act: the runtime
+    refusal is pinned by the test below, which is the one that matters.
+    """
+    from alfred.daily_sync.action_router import DEFER_ACTIONS, FEED_ACTIONS
+
+    assert not any(v in FEED_ACTIONS["slot_suggestion"] for v in DEFER_ACTIONS)
+    # Positive control: the kind does carry its OWN defer family.
+    assert "snooze_3d" in FEED_ACTIONS["slot_suggestion"]
+
+
+def test_a_defer_verb_on_the_EXCLUDED_kind_is_REFUSED_AT_RUNTIME(
+    tmp_path: Path,
+) -> None:
+    """The runtime half — drive the act, don't describe the map.
+
+    THE HAZARD: with the interception's ceiling check dropped
+    (`and action_id in FEED_ACTIONS.get(kind, {})`), a defer on a
+    slot_suggestion routes into the FEED store while the board's snooze sidecar
+    keeps its own answer — two defer mechanisms on one card, which is the entire
+    reason DEFER_EXCLUDED_KINDS exists. That deletion left every adjacent test
+    green until this one existed.
+    """
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    slot = FeedItem.create(
+        kind="slot_suggestion",
+        stable_key="task:task/Pay Steph.md",
+        instance="salem",
+        title="T1: Pay Steph",
+        evidence={"tier": 1, "origin": "task", "path": "task/Pay Steph.md"},
+    )
+    store.upsert(slot)
+
+    result = _call(store, cfg, slot.id, "defer_1d")
+
+    assert result.ok is False
+    assert result.status == STATUS_INVALID_ACTION
+    # And nothing was deferred: the feed store's state is untouched.
+    assert store.load()[slot.id].state == STATE_OPEN
+
+    # POSITIVE CONTROL, on the same item: this kind's OWN defer verb is a real
+    # capability. Without it, the refusal above would pass identically against a
+    # build where every slot act failed — a dead kind reported as a guard.
+    assert _call(store, cfg, slot.id, "snooze_1d").status != STATUS_INVALID_ACTION
+
+    # And the CONTROL for the other side of the exclusion: an eligible kind
+    # really can defer, so the refusal is about slot_suggestion and not defer.
+    email = _email_item(priority="medium")
+    efid = _publish(store, "email_tier", email)
+    _seed_batch(cfg, items=[email])
+    assert _call(store, cfg, efid, "defer_1d").ok is True

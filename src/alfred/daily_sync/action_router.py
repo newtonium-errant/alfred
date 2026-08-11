@@ -37,7 +37,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import date as _date
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -136,6 +136,40 @@ URGENT_KIND = "email_urgent"
 # ``ReplyCorrection``. THIS MAP IS THE CAPABILITY CEILING — a pair absent here
 # can never reach a resolver. A fresh ReplyCorrection is built per call (never a
 # shared mutable instance) from these kwargs.
+# --- the generic defer verbs (#102 1b-ii) ------------------------------------
+# The vertical gesture's capability, for every decide kind that is NOT a board
+# slot. DISTINCT IDS FROM ``snooze_*`` ON PURPOSE, and the distinction is
+# load-bearing rather than cosmetic: a slot ``snooze_*`` writes the tier.snooze
+# SIDECAR and marks the feed item ``acted``; a ``defer_*`` writes the FEED STORE
+# and marks it ``deferred`` with a window. Different store, different state,
+# different return mechanism. One action_id meaning either depending on kind
+# would be the same-concept-divergent-constants trap wearing verb clothing.
+#
+# THERE IS NO ``defer_until_i_say``, and its absence is a DESIGN CONSTRAINT of
+# the store rather than an omission. ``FeedStore.defer`` takes exactly two
+# shapes — a window, or none (next render) — because the model deliberately
+# separates a defer from a sticky ack: "a deferred item ALWAYS has a return
+# date, and defer_window_open is the single place that decides it has arrived"
+# (feed/store.py). An indefinite rung would need a sentinel far-future date,
+# which is a lie the return-date invariant exists to prevent. The board keeps
+# its own indefinite rung because its sidecar was built to hold one.
+DEFER_NEXT_RENDER = "defer"
+#: verb id -> days held. The dated rungs mirror the board ladder's shape so the
+#: two surfaces read alike, without sharing its ids or its store.
+DEFER_DURATIONS: dict[str, int] = {
+    "defer_1d": 1,
+    "defer_3d": 3,
+    "defer_7d": 7,
+}
+#: Every generic defer verb, in menu order (quick defer first).
+DEFER_ACTIONS: tuple[str, ...] = (DEFER_NEXT_RENDER, *DEFER_DURATIONS)
+
+#: Kinds that get the generic defer capability. Every decide kind EXCEPT
+#: ``slot_suggestion``, which keeps its board snooze semantics untouched —
+#: giving it both would put two defer mechanisms on one card.
+DEFER_EXCLUDED_KINDS: frozenset[str] = frozenset({"slot_suggestion"})
+
+
 FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     "email_tier": {
         "high": {"new_tier": "high"},
@@ -212,6 +246,18 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     },
 }
 
+# The generic defer capability, folded into the ceiling for every eligible kind.
+# WIDENED HERE rather than typed into each kind's literal so the eligibility rule
+# has one author: a kind added to FEED_ACTIONS above gets defer automatically
+# unless it is excluded, and the exclusion is a named set rather than an omission
+# someone has to notice.
+for _kind in FEED_ACTIONS:
+    if _kind in DEFER_EXCLUDED_KINDS:
+        continue
+    for _verb in DEFER_ACTIONS:
+        FEED_ACTIONS[_kind][_verb] = {}
+del _kind, _verb
+
 # --- advertised verbs (#102 1b) ----------------------------------------------
 # What a CLIENT is told it may do with an item, derived from the ceiling above.
 #
@@ -240,6 +286,9 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
 # re-growing a private opinion about verbs it was just relieved of.
 _GESTURE_AFFIRM = "affirm"
 _GESTURE_REJECT = "reject"
+# The vertical family. Its own direction, never folded into reject: "later" and
+# "no" are opposite answers and the #14 ruling forbids one control meaning both.
+_GESTURE_DEFER = "defer"
 
 # weight: "light" commits on the gesture, inside the undo window. "heavy" ARMS,
 # showing `note`, and commits on a second tap — a mutation-bearing verb never
@@ -289,6 +338,28 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
         "ack": {"label": "Got it", "weight": "light", "gesture": _GESTURE_AFFIRM},
     },
 }
+
+# Defer presentation, applied to every kind the ceiling widened. Light in every
+# case: a defer is reversible by construction — the card comes back — so arming
+# it would spend a tap protecting nothing. Only the QUICK defer carries the
+# gesture; the dated rungs live behind the hold menu, which is a choice the
+# operator has already opened rather than a direction they can swipe by accident.
+_DEFER_LABELS: dict[str, str] = {
+    DEFER_NEXT_RENDER: "Later",
+    "defer_1d": "1 day",
+    "defer_3d": "3 days",
+    "defer_7d": "7 days",
+}
+for _kind in FEED_ACTIONS:
+    if _kind in DEFER_EXCLUDED_KINDS:
+        continue
+    _slot = ACTION_META.setdefault(_kind, {})
+    for _verb in DEFER_ACTIONS:
+        _entry: dict[str, Any] = {"label": _DEFER_LABELS[_verb], "weight": "light"}
+        if _verb == DEFER_NEXT_RENDER:
+            _entry["gesture"] = _GESTURE_DEFER
+        _slot[_verb] = _entry
+del _kind, _verb, _slot, _entry
 
 
 def actions_for(kind: str) -> list[dict[str, Any]]:
@@ -629,6 +700,77 @@ def _snooze_store_path(config: Any) -> str | None:
         return None
     # Shared parse — the reader resolves the SAME key through the SAME helper.
     return resolve_snooze_path(raw)
+
+
+def _defer_until_iso(action_id: str, *, now: Any = None) -> str | None:
+    """The window a defer verb asks for — or ``None`` for next-render.
+
+    Pure, so the ladder's arithmetic is pinnable without a store. An unknown id
+    yields ``None`` rather than raising: the ceiling has already refused
+    anything unmapped, so reaching here with a stranger means a bug, and the
+    fail-safe direction is the one the model chose everywhere else — the item
+    comes back SOONER (next render), never later than asked.
+    """
+    days = DEFER_DURATIONS.get(action_id)
+    if days is None:
+        return None
+    base = now or datetime.now(timezone.utc)
+    return (base + timedelta(days=days)).isoformat()
+
+
+def _dispatch_feed_defer(
+    feed_item_id: str,
+    action_id: str,
+    *,
+    feed_store: Any,
+) -> ActResult:
+    """Apply a generic ``defer`` / ``defer_Nd`` — the vertical gesture (D2).
+
+    DELIBERATELY SEPARATE from :func:`_dispatch_slot_snooze`, and the separation
+    is the same structural argument that one makes about completions: this
+    function imports no board writer and touches no sidecar, so a defer can
+    never fake a snooze (or a completion) no matter what evidence arrives. It
+    writes ONE thing — the feed store's own deferred state.
+
+    IT DOES NOT RE-IMPLEMENT THE WINDOW. ``FeedStore.defer`` owns the event and
+    the log; ``defer_window_open`` owns the question of whether a window still
+    holds. A second opinion about either — a comparison re-localized here —
+    is precisely the drift the model's docstring rules out by naming itself the
+    single place that decides.
+
+    CRASH-ISOLATED FROM THE OTHER VERBS: a fault here returns an error for THIS
+    act and nothing else. It cannot be reached from, and cannot fall through
+    into, the resolver path that confirms and rejects — so a broken defer never
+    costs the operator a confirm.
+    """
+    until = _defer_until_iso(action_id)
+    try:
+        feed_store.defer(feed_item_id, until=until)
+    except Exception as exc:
+        # The isolation, made real. A store fault is reported as a failed defer;
+        # it does not raise into `act`, where it would abort a request that may
+        # be carrying nothing else — and it never leaves the item half-judged,
+        # because the only write this function makes is the one that failed.
+        log.warning(
+            "feed.act.defer_failed",
+            id=feed_item_id, action=action_id, error=type(exc).__name__,
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "couldn't set that aside just now — it stays where it is",
+            feed_item_id, action_id,
+        )
+    log.info(
+        "feed.act.deferred",
+        id=feed_item_id, action=action_id,
+        shape="until_time" if until else "next_render",
+    )
+    return ActResult(
+        True, STATUS_ACTED,
+        "set aside — it comes back when the window lapses" if until
+        else "set aside — it comes back at the next sync",
+        feed_item_id, action_id,
+    )
 
 
 def _dispatch_slot_snooze(
@@ -1565,6 +1707,15 @@ def _act_locked(
         feed_store.set_state(feed_item_id, STATE_ACKED)
         log.info("feed.act.acked", id=feed_item_id, kind=kind)
         return ActResult(True, STATUS_ACKED, "acknowledged", feed_item_id, action_id)
+
+    # Generic defer (#102 1b-ii) — intercepted BEFORE the resolver path, like
+    # the slot snooze and the urgent ack before it. A defer decides nothing, so
+    # it must never reach a resolver: the whole point of the vertical gesture is
+    # that the judgement has not been made yet. The ceiling above already
+    # refused any defer verb on an excluded kind (slot_suggestion keeps its
+    # board snooze), so arriving here means this kind really does have it.
+    if action_id in DEFER_ACTIONS and action_id in FEED_ACTIONS.get(kind, {}):
+        return _dispatch_feed_defer(feed_item_id, action_id, feed_store=feed_store)
 
     # The (kind, action) map is the capability ceiling.
     kind_actions = FEED_ACTIONS.get(kind)
