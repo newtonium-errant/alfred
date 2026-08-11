@@ -787,6 +787,12 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         # ``transport.ingest.disabled`` info log; this debug event is the
         # wire-level skip signal.
         "transport.wire_transport_app.ingest_skipped",
+        # In-app bug reporting (#95, 2026-08-11) — instances that don't enable
+        # transport.bugreport (every instance by default) skip-log here.
+        # register_bugreport_routes ALSO emits its own
+        # ``transport.bugreport.disabled`` info log; this debug event is the
+        # wire-level skip signal, exactly as for ingest above.
+        "transport.wire_transport_app.bugreport_skipped",
         # Jeeves capture intake (#81, 2026-08-11) — instances with no garage
         # capture device pointed at them (every instance by default)
         # skip-log here. register_jeeves_routes ALSO emits its own

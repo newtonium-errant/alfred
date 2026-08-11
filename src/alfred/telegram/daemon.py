@@ -1684,6 +1684,12 @@ async def run(
             # transport.ingest.enabled (default False → route not mounted).
             ingest_enabled=transport_config.ingest.enabled,
             ingest_config=transport_config.ingest,
+            # In-app bug reporting (#95). Opt-in via transport.bugreport.enabled
+            # (default False → route not mounted). Threaded HERE and not only in
+            # tests: a gate parameter a test passes and production never does is
+            # a feature that is green everywhere and dead in the field.
+            bugreport_enabled=transport_config.bugreport.enabled,
+            bugreport_config=transport_config.bugreport,
             # Jeeves capture intake (#81). Opt-in via transport.jeeves.enabled
             # (default False → route not mounted). ``jeeves_raw_config`` is the
             # UNIFIED config dict, not the transport sub-block: the route's

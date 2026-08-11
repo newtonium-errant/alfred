@@ -45,6 +45,8 @@ from .config import (
     DEFAULT_BATCH_MAX_IMAGES,
     DEFAULT_BATCH_MAX_INSTRUCTION_CHARS,
     DEFAULT_BATCH_MAX_TOTAL_BYTES,
+    DEFAULT_BUGREPORT_MAX_DESCRIPTION_CHARS,
+    DEFAULT_BUGREPORT_MAX_SCREENSHOT_BYTES,
     DEFAULT_INGEST_MAX_BODY_CHARS,
     DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS,
     DEFAULT_TRANSPORT_CLIENT_MAX_BYTES,
@@ -725,6 +727,8 @@ def wire_transport_app(
     batch_instance: str = "",
     batch_config_path: str = "",
     batch_kick_enabled: bool = False,
+    bugreport_enabled: bool = False,
+    bugreport_config: Any | None = None,
     recall_enabled: bool = False,
     feed_enabled: bool = False,
     feed_store: Any | None = None,
@@ -824,6 +828,15 @@ def wire_transport_app(
         batch_config: The typed
             :class:`alfred.transport.config.BatchConfig` carrying the
             three upload caps. Read only when ``batch_enabled`` is True.
+        bugreport_enabled: Mount the in-app bug-report route
+            (``POST /vault/bugreport``, #95). Default ``False`` — an
+            un-opted-in instance never mounts it (opt-in inertness).
+            Gated by the dedicated ``web_bugreport`` peer pin, so it
+            stays dark until the operator adds that token.
+        bugreport_config: The typed
+            :class:`alfred.transport.config.BugReportConfig` carrying the
+            description + screenshot caps. Read only when
+            ``bugreport_enabled`` is True.
         batch_data_dir: The DRIP config's resolved ``data_dir``. Passed
             in rather than re-derived from ``logging.dir`` here because
             the route WRITES to ``<data_dir>/batch/<instance>/<id>/`` and
@@ -893,6 +906,7 @@ def wire_transport_app(
         register_vault_path,
     )
     from .routes_batch import register_batch_routes
+    from .routes_bugreport import register_bugreport_routes
     from .routes_feed import register_feed_routes
     from .routes_ingest import register_ingest_routes
     from .routes_jeeves import register_jeeves_routes
@@ -1124,6 +1138,43 @@ def wire_transport_app(
             "transport.wire_transport_app.ingest_skipped",
             reason="transport.ingest.enabled is false / absent (instance "
                    "did not opt into the cross-instance ingest route)",
+        )
+
+    # In-app bug reporting (#95). Opt-in via ``transport.bugreport.enabled``;
+    # register_bugreport_routes emits its own explicit disabled-skip log
+    # (intentionally-left-blank) when off, so the wire-level branch only needs
+    # to surface the wired case.
+    _bugreport_max_desc = getattr(
+        bugreport_config, "max_description_chars",
+        DEFAULT_BUGREPORT_MAX_DESCRIPTION_CHARS,
+    )
+    _bugreport_max_shot = getattr(
+        bugreport_config, "max_screenshot_bytes",
+        DEFAULT_BUGREPORT_MAX_SCREENSHOT_BYTES,
+    )
+    if bugreport_enabled:
+        register_bugreport_routes(
+            app,
+            enabled=True,
+            instance_name=instance_name,
+            max_description_chars=_bugreport_max_desc,
+            max_screenshot_bytes=_bugreport_max_shot,
+        )
+        log.info(
+            "transport.wire_transport_app.bugreport_registered",
+            max_description_chars=_bugreport_max_desc,
+            max_screenshot_bytes=_bugreport_max_shot,
+        )
+    else:
+        # Still call the registrar so its own disabled-skip log fires — keeps
+        # the "ran, did not mount" signal greppable + symmetric with ingest.
+        register_bugreport_routes(
+            app, enabled=False, instance_name=instance_name,
+        )
+        log.debug(
+            "transport.wire_transport_app.bugreport_skipped",
+            reason="transport.bugreport.enabled is false / absent (instance "
+                   "did not opt into the in-app bug-report route)",
         )
 
     # Jeeves capture intake (#81). Opt-in via ``transport.jeeves.enabled``;

@@ -1,6 +1,7 @@
 import { ReactNode, useState } from 'react';
 import Link from 'next/link';
 import { cn } from '../lib/utils';
+import { ReportBugFab } from './ReportBugFab';
 
 // One frontend deployment targets ONE instance (blueprint §5). The instance's
 // display name is config-driven, NOT hardcoded — per the codebase's
@@ -24,6 +25,15 @@ type LayoutProps = {
   unreadCount?: number;
   /** Max content width; defaults to a comfortable reading column. */
   maxWidthClassName?: string;
+  /**
+   * Show the floating "Report a bug" button (#95). Defaults to `showNav` — the
+   * authed surfaces are exactly where a bug report makes sense, and the login
+   * screen is not somewhere to offer one (there is no verified reporter yet,
+   * and the BFF would refuse it with `invalid_session` anyway).
+   *
+   * Pass `false` explicitly for a surface that must not carry it.
+   */
+  showBugReport?: boolean;
 };
 
 // The app's surfaces. The logo (✦) links to `/`, the home COMPOSER (B3-3); Chat
@@ -50,6 +60,7 @@ export function Layout({
   onSignOut,
   unreadCount = 0,
   maxWidthClassName = 'max-w-2xl',
+  showBugReport,
 }: LayoutProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   // A single nav item with no sign-out needs no mobile overflow menu.
@@ -154,6 +165,7 @@ export function Layout({
         )}
       </header>
       <main className={cn('mx-auto px-5 py-8', maxWidthClassName)}>{children}</main>
+      {(showBugReport ?? showNav) && <ReportBugFab />}
     </div>
   );
 }

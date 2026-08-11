@@ -702,6 +702,44 @@ class BatchConfig:
     max_instruction_chars: int = DEFAULT_BATCH_MAX_INSTRUCTION_CHARS
 
 
+# --- In-app bug reporting (#95, 2026-08-11) ---------------------------------
+
+# Description ceiling for one report. Mirrors the reference implementation's
+# 5000-char body cap by INTENT, but is its own constant: what an operator may
+# write about a bug is not the same decision as what any other surface carries,
+# and a shared constant would silently move both. The PWA's textarea caps at the
+# same number so the count the reporter sees is honest.
+DEFAULT_BUGREPORT_MAX_DESCRIPTION_CHARS: int = 5000
+
+# Screenshot ceiling, in DECODED bytes. 5 MiB is the reference implementation's
+# figure and is generous for a page capture that the client already downscales
+# through ``imageDownscale`` before sending — it exists to stop a malfunctioning
+# or hostile client, not to constrain a real screenshot.
+#
+# NOTE the units: this bounds the IMAGE, not the request. The base64 that
+# carries it is ~4/3 of this, so the transport app's 14 MiB body ceiling
+# (:data:`DEFAULT_TRANSPORT_CLIENT_MAX_BYTES`) sits comfortably above a
+# maximal report and refuses anything wilder before this handler runs.
+DEFAULT_BUGREPORT_MAX_SCREENSHOT_BYTES: int = 5 * 1024 * 1024
+
+
+@dataclass
+class BugReportConfig:
+    """In-app bug reporting route config (#95).
+
+    The opt-in ``POST /vault/bugreport`` route. Default ``enabled=False`` — an
+    un-opted-in instance never mounts it, so its transport server stays
+    byte-unchanged (the same posture as ``ingest`` and ``batch`` above).
+
+    Both caps are config-backed rather than code literals so that changing what
+    a reporter may send is a YAML edit, not a deploy.
+    """
+
+    enabled: bool = False
+    max_description_chars: int = DEFAULT_BUGREPORT_MAX_DESCRIPTION_CHARS
+    max_screenshot_bytes: int = DEFAULT_BUGREPORT_MAX_SCREENSHOT_BYTES
+
+
 # --- Cross-instance recall (#20 S1, 2026-08-01) -----------------------------
 
 # Hard ceiling on how many bounded matches one recall answer may return,
@@ -840,6 +878,7 @@ class TransportConfig:
     canonical: CanonicalConfig = field(default_factory=CanonicalConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
     batch: BatchConfig = field(default_factory=BatchConfig)
+    bugreport: BugReportConfig = field(default_factory=BugReportConfig)
     jeeves: JeevesRouteConfig = field(default_factory=JeevesRouteConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
     peers: dict[str, PeerEntry] = field(default_factory=dict)
@@ -1159,6 +1198,36 @@ def _build_batch(data: dict[str, Any]) -> BatchConfig:
     )
 
 
+def _build_bugreport(data: dict[str, Any]) -> BugReportConfig:
+    """Build the optional ``bugreport`` block (defaults = disabled, ruled caps).
+
+    Both caps are int-coerced with the dataclass default as a fallback and
+    floored at 1, for the same reason ``_build_batch`` floors its own: a zero or
+    negative cap would wedge the route into refusing every report, and that
+    presents to an operator as "the bug button is broken" rather than as a bad
+    number in a YAML file — the hardest kind of misconfiguration to find,
+    because the surface it breaks is the one you would use to report it.
+    """
+    if not isinstance(data, dict):
+        return BugReportConfig()
+
+    def _positive(key: str, default: int) -> int:
+        try:
+            return max(1, int(data.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    return BugReportConfig(
+        enabled=bool(data.get("enabled", False)),
+        max_description_chars=_positive(
+            "max_description_chars", DEFAULT_BUGREPORT_MAX_DESCRIPTION_CHARS,
+        ),
+        max_screenshot_bytes=_positive(
+            "max_screenshot_bytes", DEFAULT_BUGREPORT_MAX_SCREENSHOT_BYTES,
+        ),
+    )
+
+
 def _build_recall(
     data: Any, *, instance_name: str = "", instance_scope: str = "",
 ) -> RecallConfig:
@@ -1391,6 +1460,8 @@ def _build(
             kwargs["ingest"] = _build_ingest(data["ingest"])
         if "batch" in data and isinstance(data["batch"], dict):
             kwargs["batch"] = _build_batch(data["batch"])
+        if "bugreport" in data and isinstance(data["bugreport"], dict):
+            kwargs["bugreport"] = _build_bugreport(data["bugreport"])
         if "jeeves" in data and isinstance(data["jeeves"], dict):
             kwargs["jeeves"] = _build_jeeves(data["jeeves"])
         # ``recall`` fence must fire even when the section is absent-but-
