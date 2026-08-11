@@ -95,15 +95,66 @@ def test_the_reasons_are_actually_distinct_from_each_other() -> None:
     assert len(reasons) == 4
 
 
-def test_a_scanned_pdf_does_not_promise_a_future_capability(tmp_path) -> None:
+#: Language that turns this refusal into a promise. Mirrors the web suite's
+#: ``FUTURE_PROMISE`` (web/tests/ingestRefusalCopy.test.ts) — deliberately, and
+#: the alignment is the #68 fix.
+#:
+#: The list used to be TEMPORAL ONLY ("coming soon", "not yet", …) while the
+#: docstring claimed the message "must not dangle vision/OCR". So the pin's name
+#: and its docstring described a stricter rule than its assertions enforced, and
+#: the message it guarded said "needs OCR, which isn't enabled" — naming the
+#: capability outright and passing, because no listed phrase appeared in it.
+#: That is the same gap this file's web sibling was created to close: a name
+#: that matches the claim is not an assertion that supports it.
+#:
+#: The BARE NOUNS are the substance. The ruling was not "avoid the future
+#: tense", it was "do not point at the vision work at all" — so naming OCR or
+#: vision violates it in any tense, including a denial ("isn't enabled", which
+#: implies a switch someone could flip).
+_FUTURE_PROMISE = (
+    "vision",
+    "ocr",
+    "coming soon",
+    "not yet",
+    "will be",
+    "will be able",
+    "in future",
+    "for now",
+    "later",
+    "soon",
+)
+
+
+@pytest.mark.parametrize("promise", _FUTURE_PROMISE)
+def test_a_scanned_pdf_does_not_promise_a_future_capability(promise) -> None:
     """Operator ruling 2026-08-07: the scanned case is a plain refusal. The
-    user-facing words must not dangle vision/OCR as something coming soon —
-    that was explicitly NOT the copy option chosen."""
+    user-facing words must not dangle vision/OCR — that was explicitly NOT the
+    copy option chosen, and #67 remains deferred and unruled.
+
+    Parametrized so a failure NAMES the offending phrase instead of reporting
+    that one of ten substrings was present somewhere.
+    """
     with pytest.raises(DocumentExtractError) as excinfo:
         extract_pdf_text(scanned_pdf())
     message = str(excinfo.value).lower()
-    for promise in ("coming soon", "not yet", "will be", "in future", "later"):
-        assert promise not in message, f"message dangles a future capability: {promise}"
+    assert promise not in message, f"message dangles a future capability: {promise}"
+
+
+def test_the_scanned_refusal_still_says_what_happened_and_what_to_do() -> None:
+    """The other half of the ruling, and the reason the list above is safe.
+
+    A forbidden-word list alone is satisfiable by saying nothing useful — the
+    emptiest possible message passes every row of it. So this pins the content:
+    the operator learns WHY it failed in the web copy's words ("no selectable
+    text" / a scan), and gets the two routes out that exist TODAY with no new
+    capability.
+    """
+    with pytest.raises(DocumentExtractError) as excinfo:
+        extract_pdf_text(scanned_pdf())
+    message = str(excinfo.value).lower()
+    assert "no selectable text" in message
+    assert "scan" in message
+    assert "paste" in message or "saved as text" in message
 
 
 def test_a_scanned_pdf_logs_its_reason() -> None:
@@ -196,15 +247,25 @@ def test_the_talker_module_still_exposes_the_lifted_names() -> None:
 
 
 def test_the_talker_message_wording_is_unchanged_by_the_lift() -> None:
-    """The talker prints ``str(exc)`` to the user verbatim, and that wording
-    was reviewed when it shipped. #57 added ``.reason`` ALONGSIDE it rather
-    than encoding the distinction into the sentence, precisely so this text
-    could stay put."""
+    """The talker prints ``str(exc)`` to the user verbatim, so the exact
+    sentence is pinned — casual edits to operator-facing copy are the thing
+    this catches. #57 added ``.reason`` ALONGSIDE the message rather than
+    encoding the distinction into the sentence, precisely so the text could be
+    changed on purpose without moving the routing.
+
+    UPDATED UNDER #68, in lockstep with the copy change rather than deleted.
+    The tripwire is the point: it fired on this very edit, which is how a
+    deliberate rewording is meant to feel. The old sentence — "scanned
+    image-only PDFs need OCR, which isn't enabled" — named the deferred
+    capability outright, and "isn't enabled" implies a switch someone could
+    flip. The new one matches the web copy's voice ("no selectable text", a
+    scan) and offers only routes that exist today.
+    """
     with pytest.raises(DocumentExtractError) as excinfo:
         extract_pdf_text(scanned_pdf())
     assert str(excinfo.value) == (
-        "No text could be extracted from this PDF "
-        "(scanned image-only PDFs need OCR, which isn't enabled)"
+        "No selectable text in this PDF, so it looks like a scan or a "
+        "photo. Try a version saved as text, or paste the text in yourself"
     )
 
     with pytest.raises(DocumentExtractError) as excinfo:

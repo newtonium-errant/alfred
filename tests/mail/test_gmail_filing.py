@@ -317,6 +317,95 @@ def test_loop_enabled_no_accounts_is_ilb(tmp_path, monkeypatch):
     assert [e for e in cap if e.get("event") == "gmail_filing.loop_no_accounts"]
 
 
+def test_the_started_loop_can_be_stopped(tmp_path, monkeypatch):
+    """#77 — the off switch, exercised on the REAL thread.
+
+    Nothing in production or in this file starts this loop for real: the two
+    callers above both hit early returns (gate off; enabled with no fetch
+    account). That is exactly why the pin exists rather than why it doesn't.
+    The defect being closed is inherited, not observed — the FIRST test to
+    exercise the enabled path would otherwise start a thread nobody can stop,
+    which on the sibling loop (#75) meant it went on emitting events for the
+    rest of the session and a downstream ``capture_logs()`` window collected 8
+    foreign ones. This pin is what makes the enabled path safe to write.
+
+    Drives the real thread and stops it through the real event — the #75
+    lesson, where the earlier version faked both the thread and the sleep and
+    so never exercised the mechanism it was pinning. A fake here would pass
+    against a ``while True`` that ignores the event entirely.
+    """
+    import threading
+
+    stop = threading.Event()
+    ticks: list[int] = []
+
+    def _spy(config, vault_path, confidence_state_path):
+        ticks.append(1)
+        if len(ticks) >= 3:
+            stop.set()  # stop from INSIDE, so the wait is what has to honour it
+        return None
+
+    monkeypatch.setattr("alfred.mail.gmail_filing.file_inbox_messages", _spy)
+    cfg = load_from_unified({"mail": {
+        "poll_interval": 1,
+        "gmail_filing": {"enabled": True},
+        "accounts": [{"name": "gmail", "email": "g", "imap_host": "h", "fetch": True}],
+    }})
+
+    thread = orch._maybe_start_gmail_filing_loop(
+        cfg, tmp_path, str(tmp_path / "s.json"), stop_event=stop,
+    )
+    assert thread is not None, "the enabled path must hand back its thread"
+    thread.join(timeout=10)
+
+    assert not thread.is_alive(), "the loop ignored its stop event"
+    assert len(ticks) == 3, f"expected 3 ticks, saw {len(ticks)}"
+
+
+def test_a_stopped_filing_loop_falls_silent(tmp_path, monkeypatch):
+    """The property the rest of the suite depends on: after stop, NO events.
+
+    ``is_alive()`` is the mechanism; silence is the contract. Asserted on a log
+    window rather than on the thread, because what breaks a neighbouring test
+    is a stray ``gmail_filing.*`` event landing inside ITS ``capture_logs()``,
+    not a thread object being alive somewhere.
+    """
+    import threading
+    import time
+
+    stop = threading.Event()
+    ticked = threading.Event()
+
+    def _noisy(config, vault_path, confidence_state_path):
+        # Stands in for the real file_inbox_messages, which logs per tick.
+        structlog.get_logger("alfred.mail.gmail_filing").info(
+            "gmail_filing.starting", accounts=0,
+        )
+        ticked.set()
+        return None
+
+    monkeypatch.setattr("alfred.mail.gmail_filing.file_inbox_messages", _noisy)
+    cfg = load_from_unified({"mail": {
+        "poll_interval": 1,
+        "gmail_filing": {"enabled": True},
+        "accounts": [{"name": "gmail", "email": "g", "imap_host": "h", "fetch": True}],
+    }})
+
+    thread = orch._maybe_start_gmail_filing_loop(
+        cfg, tmp_path, str(tmp_path / "s.json"), stop_event=stop,
+    )
+    assert ticked.wait(timeout=10), "the loop never ran — the silence below would prove nothing"
+
+    stop.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the thread outlived its stop"
+
+    with structlog.testing.capture_logs() as cap:
+        time.sleep(0.3)
+    foreign = [e for e in cap if str(e.get("event", "")).startswith("gmail_filing.")]
+    assert foreign == [], f"a stopped loop is still emitting: {foreign}"
+
+
 def test_tick_fault_isolated_logs_loop_error(tmp_path, monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("transient")

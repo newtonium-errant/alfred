@@ -699,13 +699,33 @@ def _gmail_filing_tick(config, vault_path: Path, confidence_state_path: str) -> 
         log.exception("gmail_filing.loop_error")
 
 
-def _maybe_start_gmail_filing_loop(config, vault_path: Path, confidence_state_path: str) -> None:
+def _maybe_start_gmail_filing_loop(
+    config, vault_path: Path, confidence_state_path: str,
+    *, stop_event: threading.Event | None = None,
+) -> threading.Thread | None:
     """#7 7c-ii — start the Gmail-side label-apply loop as a daemon THREAD alongside the webhook, IF AND
     ONLY IF ``mail.gmail_filing.enabled`` (the STATIC per-instance gate). INERT default returns immediately
     (no thread). Note the thread starting is NOT a live-mailbox write: each tick STILL re-reads the DYNAMIC
     ``confidence.filing`` gate before any IMAP connect, so with the operator gate closed the started thread
     opens no connection and mutates nothing — it just polls the gate. Both gates (static enabled + dynamic
-    confidence.filing) must be true for a single Gmail write."""
+    confidence.filing) must be true for a single Gmail write.
+
+    ``stop_event`` / the returned thread — #77, the same fix ``_maybe_start_mail_fetch_loop`` took in
+    #75, applied to the sibling that was left standing. It had the identical unstoppable shape: `while
+    True` + `time.sleep`, daemon=True, dies only with the process. Fine in production, where the
+    process IS the lifetime; not fine anywhere else, because a caller that starts it cannot end it.
+
+    WHY IT WAS FIXED WHILE STILL HARMLESS. Nothing starts this thread for real today — both existing
+    callers hit early returns (gate off, and enabled-with-no-fetch-accounts), re-verified at #77. So
+    the log-debris failure the fetch loop actually caused has never happened here. It was fixed anyway
+    because the cost of the fix is six lines and the cost of the alternative is that the FIRST test to
+    exercise the enabled path inherits the defect: a thread emitting ``gmail_filing.*`` for the rest of
+    the session, and any downstream ``capture_logs()`` block asserting ``len(captured) == N`` one
+    scheduling accident from a false red. That is measured history on the sibling, not a theory.
+
+    The loop waits on an Event instead of sleeping, and the thread is returned. Waiting rather than
+    sleeping also makes a stop immediate rather than up to one poll interval late. Production passes
+    nothing and ignores the return — behaviour there is unchanged."""
     import structlog
     log = structlog.get_logger(__name__)
     gf_cfg = getattr(config, "gmail_filing", None)
@@ -719,21 +739,26 @@ def _maybe_start_gmail_filing_loop(config, vault_path: Path, confidence_state_pa
                    "loop has no account to file against.")
         return
     import threading
-    import time
     interval = config.gmail_filing_poll_interval()
 
-    def _loop() -> None:
-        while True:
-            _gmail_filing_tick(config, vault_path, confidence_state_path)
-            time.sleep(interval)
+    # #77 — waited on, not slept through, so a stop takes effect at once rather
+    # than up to one poll interval later.
+    stop = stop_event if stop_event is not None else threading.Event()
 
-    threading.Thread(target=_loop, name="gmail-filing", daemon=True).start()
+    def _loop() -> None:
+        while not stop.is_set():
+            _gmail_filing_tick(config, vault_path, confidence_state_path)
+            stop.wait(interval)
+
+    thread = threading.Thread(target=_loop, name="gmail-filing", daemon=True)
+    thread.start()
     log.info(
         "gmail_filing.loop_started",
         accounts=[a.name for a in fetch_accounts], poll_interval=interval,
         confidence_state_path=confidence_state_path,
         detail="Gmail-filing loop started; DORMANT until confidence.filing is flipped True via "
                "/calibration_ok filing (each tick re-reads the gate before any IMAP connect).")
+    return thread
 
 
 def _run_talker(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = False) -> None:
