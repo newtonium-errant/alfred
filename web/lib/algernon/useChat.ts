@@ -92,8 +92,31 @@ const RECOVERABLE_CODES = new Set([
   'timeout',
 ]);
 
-function isRecoverable(e: unknown): boolean {
-  return e instanceof ApiError && RECOVERABLE_CODES.has(e.code);
+// EXPORTED so the suite pins the REAL predicate, not a copy of it (#94) —
+// the same reason `friendlyError` below is exported. A mirrored decision table
+// in the test file would pass against a build where this function was broken,
+// which is precisely the failure mode being fixed here (a verdict computed in
+// one place and ignored in another).
+export function isRecoverable(e: unknown): boolean {
+  if (!(e instanceof ApiError)) return false;
+  // THE SERVER'S VERDICT WINS when it has one (#94). `telegram/api_errors.py`
+  // already decides retryability — it is the layer holding the actual
+  // exception — and ships the answer on the wire as `retryable`. The client
+  // used to drop that field and re-decide from a local code list, which is how
+  // an upstream Anthropic 500 got treated as definitive: the pending turn was
+  // cleared, no retry button appeared, and the operator recovered by typing
+  // "Try now" by hand.
+  //
+  // Deferring here rather than adding 'engine_unavailable' to the set above
+  // keeps ONE source of truth: a future retryable condition is a classifier
+  // change and needs no client edit. Same doctrine as the health-status
+  // predicate — consume the decision, never re-localize the comparison.
+  //
+  // `undefined` means the server had no opinion (the classifier abstained), so
+  // the local set below still answers for network/timeout failures, which the
+  // server never sees at all.
+  if (typeof e.retryable === 'boolean') return e.retryable;
+  return RECOVERABLE_CODES.has(e.code);
 }
 
 function safeJson<T>(s: string): T | null {
@@ -427,8 +450,14 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       const usableStream = res.ok && res.body && typeof res.body.getReader === 'function';
       if (!usableStream) {
         if (!res.ok) {
-          const body = (await res.json().catch(() => null)) as { error?: string; detail?: string } | null;
-          const err = new ApiError(res.status, body?.error || 'request_failed', body?.detail);
+          const body = (await res.json().catch(() => null)) as
+            { error?: string; detail?: string; retryable?: boolean } | null;
+          // `retryable` threaded through (#94) — the field exists on the wire
+          // (classification_payload) and was being dropped here, so the
+          // server's verdict never reached isRecoverable.
+          const err = new ApiError(
+            res.status, body?.error || 'request_failed', body?.detail, body?.retryable,
+          );
           if (isRecoverable(err)) {
             if (await reconcileFromHistory(key, priorLen)) onSuccess();
             else onRecoverable(err);
@@ -474,7 +503,9 @@ export function useChat(options: UseChatOptions = {}): UseChat {
               }
             } else if (ev.event === 'error') {
               const er = safeJson<StreamErrorEvent>(ev.data);
-              const err = new ApiError(502, er?.error || 'engine_error', er?.detail);
+              const err = new ApiError(
+                502, er?.error || 'engine_error', er?.detail, er?.retryable,
+              );
               settled = true;
               if (isRecoverable(err)) {
                 if (await reconcileFromHistory(key, priorLen)) onSuccess();

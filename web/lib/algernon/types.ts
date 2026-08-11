@@ -48,6 +48,10 @@ export type StreamDoneEvent = ChatTurnResponse;
 export interface StreamErrorEvent {
   error: string;
   detail?: string;
+  // The server's retryability verdict (#94), present when the engine-error
+  // classifier recognised the failure. Absent means it abstained — which is
+  // NOT the same as false; the client falls back to its own code list.
+  retryable?: boolean;
 }
 
 // GET /chat/history/{session_key} → { turns: [...] }
