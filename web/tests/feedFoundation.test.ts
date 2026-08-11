@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   DECK_VERBS,
-  HEAVY_KINDS,
+  isHeavyVerb,
   SNOOZE_Y_THRESHOLD,
   SWIPE_X_THRESHOLD,
   affirmLabelFor,
@@ -199,11 +199,25 @@ describe('deck verbs', () => {
     expect(DECK_VERBS.pending.reject).toBeNull(); // pending has no reject
     expect(DECK_VERBS.pending.affirm).toBe('noted');
   });
-  it('flags proposal + recurrence as heavy (two-step confirm)', () => {
-    expect(HEAVY_KINDS.has('proposal')).toBe(true);
-    expect(HEAVY_KINDS.has('recurrence')).toBe(true);
-    expect(DECK_VERBS.proposal.heavy).toBe(true);
-    expect(DECK_VERBS.email_tier.heavy).toBe(false);
+  it('weights the MUTATION-BEARING verb heavy, per direction (§3 catalog)', () => {
+    // Was a per-KIND boolean. The catalog has always been per-verb, and the two
+    // directions of one card are different transactions.
+    expect(DECK_VERBS.proposal.affirmWeight).toBe('heavy');
+    expect(DECK_VERBS.recurrence.affirmWeight).toBe('heavy');
+    expect(DECK_VERBS.email_tier.affirmWeight).toBe('light');
+    // The reject halves of proposal/recurrence record a correction and write no
+    // record — light per §3, where the whole KIND used to be heavy.
+    expect(DECK_VERBS.proposal.rejectWeight).toBe('light');
+    expect(DECK_VERBS.recurrence.rejectWeight).toBe('light');
+  });
+  it('ATTRIBUTION: confirm light, reject HEAVY — the asymmetry a kind flag could not hold', () => {
+    // The reject strips the marked section out of the record body
+    // (`vault/attribution.py::reject_marker`). It shipped as a light verb and
+    // committed on a single left swipe.
+    expect(DECK_VERBS.attribution.affirmWeight).toBe('light');
+    expect(DECK_VERBS.attribution.rejectWeight).toBe('heavy');
+    expect(isHeavyVerb('attribution', 'reject')).toBe(true);
+    expect(isHeavyVerb('attribution', 'affirm')).toBe(false);
   });
   it('returns null for an unmapped kind (snooze-only)', () => {
     expect(deckVerbsFor('weather')).toBeNull();
@@ -239,7 +253,7 @@ describe('email_urgent — the interrupt kind deals + acks (#27)', () => {
     const v = deckVerbsFor('email_urgent');
     expect(v?.affirm).toBe('ack');
     expect(v?.reject).toBeNull();
-    expect(v?.heavy).toBe(false);
+    expect(v?.affirmWeight).toBe('light');
   });
   it('affirmLabelFor is the static "Got it" (no tier append — not a calibration card)', () => {
     expect(affirmLabelFor(urgent())).toBe('Got it');

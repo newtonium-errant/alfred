@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { feedApi, type FeedActResult, type FeedItem } from '../../lib/algernon/feed';
 import {
   CORRECT_ACTION,
-  HEAVY_KINDS,
+  isHeavyVerb,
   ONE_OFF_ACTION,
   ROUTINE_MATCH_KIND,
   SNOOZE_INDEFINITE_ACTION,
@@ -23,13 +23,14 @@ import { ACT_UNCONFIRMED_MESSAGE, isInconclusive } from '../../lib/algernon/actC
 // unit-testable with fake timers + a mocked feedApi, while Deck.tsx supplies the
 // pointer-drag + rendering on top.
 //
-// DELAYED ACT (light kinds + heavy reject + heavy confirm-tap): a commit advances
+// DELAYED ACT (light verbs + a heavy verb's confirm-tap): a commit advances
 // the card immediately (optimistic) but the POST is DEFERRED. It fires when the
 // 3.5s undo window expires OR the next commit lands (flush-in-order) — and UNDO
 // cancels it before it ever fires (never an un-act). SNOOZE rides the same path:
 // it POSTs on a kind the backend can snooze (#14) and is a pure client-side
 // set-aside on every other kind, which is the same code path with a null
-// actionId. HEAVY AFFIRM's FIRST swipe does not commit — it reveals a confirm-tap.
+// actionId. A HEAVY VERB's FIRST swipe does not commit — either direction — it
+// reveals a confirm-tap showing what that verb will write (D4).
 //
 // Because the card is already dismissed by the time a deferred POST resolves,
 // outcomes surface as a TOAST (benign: stale / timeout — next list poll
@@ -83,6 +84,8 @@ export interface UseDeckResult {
   snoozed: FeedItem[];
   snoozedCount: number;
   confirmingId: string | null;
+  /** Which direction is armed on that card ('affirm' | 'reject'), or null. */
+  confirmingVerdict: 'affirm' | 'reject' | null;
   toast: DeckToast | null;
   banner: string | null;
   cleared: boolean;
@@ -120,7 +123,12 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   const { items, onAuthExpired, onSnoozePersist, onUnsnoozePersist } = opts;
 
   const [index, setIndex] = useState(0);
-  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  // WHICH card and WHICH direction is armed. An id alone was enough while only
+  // affirm could arm; now that a heavy REJECT arms too, the pair is what tells
+  // the confirm tap which transaction it is committing — and stops a card armed
+  // one way from being committed the other.
+  const [confirming, setConfirming] = useState<{ id: string; verdict: 'affirm' | 'reject' } | null>(null);
+  const confirmingId = confirming?.id ?? null;
   const [toast, setToast] = useState<DeckToast | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   // The this-session snoozed cards, RETAINED (not just counted) so the snoozed
@@ -215,7 +223,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
         setSnoozed((prev) => [...prev, item]);
         onSnoozePersist?.(item.id);
       }
-      setConfirmingId(null);
+      setConfirming(null);
       setIndex((i) => i + 1);
       pendingRef.current = { item, actionId, verdict, restoreIndex, restoreSnooze: defers };
       setToast({
@@ -248,22 +256,33 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     if (!current) return;
     const verbs = deckVerbsFor(current.kind);
     if (!verbs || verbs.affirm === null) return; // no affirm action for this kind
-    // Heavy affirm's FIRST swipe reveals the confirm stage (does not commit).
-    if (HEAVY_KINDS.has(current.kind) && confirmingId !== current.id) {
-      setConfirmingId(current.id);
+    // A heavy affirm's FIRST swipe reveals the confirm stage (does not commit).
+    if (isHeavyVerb(current.kind, 'affirm') && !(confirming?.id === current.id && confirming.verdict === 'affirm')) {
+      setConfirming({ id: current.id, verdict: 'affirm' });
       return;
     }
     commit('affirm', verbs.affirm, current);
-  }, [current, confirmingId, commit]);
+  }, [current, confirming, commit]);
 
   const confirmHeavy = useCallback(() => {
-    if (!current || confirmingId !== current.id) return;
+    if (!current || confirming?.id !== current.id) return;
     const verbs = deckVerbsFor(current.kind);
-    if (!verbs || verbs.affirm === null) return;
+    if (!verbs) return;
+    // The armed DIRECTION decides what commits. Reading `affirm` here
+    // unconditionally — as this did while only affirm could arm — would make a
+    // confirm tap on an armed REJECT fire the opposite verb, which on an
+    // attribution card is the difference between agreeing with a record and
+    // cutting a section out of it.
+    if (confirming.verdict === 'reject') {
+      if (verbs.reject === null) return;
+      commit('reject', verbs.reject, current);
+      return;
+    }
+    if (verbs.affirm === null) return;
     commit('affirm', verbs.affirm, current);
-  }, [current, confirmingId, commit]);
+  }, [current, confirming, commit]);
 
-  const cancelHeavy = useCallback(() => setConfirmingId(null), []);
+  const cancelHeavy = useCallback(() => setConfirming(null), []);
 
   const reject = useCallback(() => {
     if (!current) return;
@@ -282,8 +301,15 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
       return;
     }
     if (verbs.reject === null) return; // no reject action (e.g. pending)
+    // A heavy REJECT arms exactly as a heavy affirm does. This is the gap that
+    // let an attribution reject — which strips the marked section out of the
+    // record body — commit on a single left swipe.
+    if (isHeavyVerb(current.kind, 'reject') && !(confirming?.id === current.id && confirming.verdict === 'reject')) {
+      setConfirming({ id: current.id, verdict: 'reject' });
+      return;
+    }
     commit('reject', verbs.reject, current);
-  }, [current, commit]);
+  }, [current, confirming, commit]);
 
   // ↑ — the one defer verb (#14). A full swipe passes no argument and gets the
   // indefinite rung (the old Park); the hold-band menu passes a duration.
@@ -315,7 +341,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
       onUnsnoozePersist?.(p.item.id);
     }
     setIndex(p.restoreIndex);
-    setConfirmingId(null);
+    setConfirming(null);
     setToast(null);
   }, [onUnsnoozePersist]);
 
@@ -463,6 +489,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     snoozed,
     snoozedCount: snoozed.length,
     confirmingId,
+    confirmingVerdict: confirming?.verdict ?? null,
     toast,
     banner,
     cleared,

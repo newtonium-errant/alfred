@@ -14,9 +14,17 @@ export const DRAG_Y_CLAMP = 30; // downward drag is clamped (cards don't fall)
 export const STAMP_FADE_START = 40; // px of drag before a verdict stamp appears
 export const STAMP_FADE_RANGE = 60; // px over which it fades fully in
 
-// Delayed-act window for LIGHT kinds: the undo toast lifetime. The POST fires
+// Delayed-act window for LIGHT verbs: the undo toast lifetime. The POST fires
 // when this expires OR the next commit lands — never an un-act.
-export const UNDO_MS = 3500;
+//
+// SIX seconds (D8), up from 3.5. The mechanism was never the weak part — a
+// delayed act that CANCELS is strictly stronger than a post-hoc undo, because
+// nothing has been written yet to reverse. What was weak was the visibility: a
+// 3.5s window with no indication of how much of it is left asks the operator to
+// notice a toast, read it, and decide, inside a span they cannot see. The
+// draining bar (`deck-toast-bar`) is the other half of the same ruling — the
+// remaining time is on screen, so the deadline is a fact rather than a gamble.
+export const UNDO_MS = 6000;
 
 // 'skip' rides the same session-local set-aside as an unbacked 'snooze' but is
 // a distinct verdict on purpose: Skip means *not this one*, Snooze means *yes,
@@ -91,12 +99,42 @@ export function stampOpacity(distance: number): number {
 // of the B1 transport FEED_ACTIONS map for the kind — the deck is a simplified
 // 2-way surface over the same capability ceiling (richer tier calibration stays
 // on the reply grammar). Unmapped kinds render but expose only the ↑ snooze.
+/**
+ * How much a single verb costs to get wrong (step-2 §3).
+ *
+ * LIGHT — the wrong swipe is cheap corpus noise: idempotent, correctable, or
+ * both. Commits on the gesture, with the undo window to take it back.
+ * HEAVY — the verb writes or destroys something durable. It ARMS on the
+ * gesture, showing what it will write, and commits on a second tap. A
+ * mutation-bearing verb never fires on a single motion.
+ */
+export type VerbWeight = 'light' | 'heavy';
+
 export interface DeckVerbs {
   affirm: string | null;
   reject: string | null;
   affirmLabel: string;
   rejectLabel: string;
-  heavy: boolean;
+  /**
+   * PER-VERB, not per-kind. The two directions of one card are genuinely
+   * different transactions and the catalog has always said so: an attribution
+   * CONFIRM records agreement, while its REJECT strips the marked section out
+   * of the record's body (`vault/attribution.py::reject_marker` — it drops the
+   * marked line range and removes the audit entry). One boolean per KIND cannot
+   * express that, so it did not: attribution shipped as `heavy: false` and its
+   * reject committed on a single left swipe, protected only by the undo window.
+   *
+   * Weights below follow the §3 catalog verb-for-verb.
+   */
+  affirmWeight: VerbWeight;
+  rejectWeight: VerbWeight;
+  /**
+   * What a HEAVY verb will actually write, shown on the arm stage (D4: "the arm
+   * shows exactly what will be written"). Omitted for a light verb, which has no
+   * arm stage to show it on.
+   */
+  affirmArmNote?: string;
+  rejectArmNote?: string;
   /**
    * The LEFT (reject) gesture DEFERS instead of declining: there's no backend
    * decline path for slots v1, so a skipped candidate is set aside client-side
@@ -111,32 +149,98 @@ export interface DeckVerbs {
   rejectDefers?: boolean;
 }
 
-// Heavy kinds create/mutate a durable record → a right-swipe does NOT commit;
-// it reveals a confirm-tap stage (two-step). Recurrence is future-proofed
-// (arrives with the board work); proposal is live today.
-export const HEAVY_KINDS: ReadonlySet<string> = new Set(['proposal', 'recurrence']);
-
 export const DECK_VERBS: Record<string, DeckVerbs> = {
-  email_tier: { affirm: 'confirm', reject: 'spam', affirmLabel: 'Confirm', rejectLabel: 'Spam', heavy: false },
+  email_tier: { affirm: 'confirm', reject: 'spam', affirmLabel: 'Confirm', rejectLabel: 'Spam', affirmWeight: 'light', rejectWeight: 'light' },
   // #27 email_urgent — the INTERRUPT card. ACK-only: right/✓ acknowledges (POST "ack" →
   // acted → flip); no reject/left (re-tier lives on the calibration card — two cards, two
   // claims); the ↑ snooze gesture works as ever (kind-generic). Having this entry is what makes
   // isDeckDealt(email_urgent) true → the C2-era generic deck/needs-you paths deal + count it.
-  email_urgent: { affirm: 'ack', reject: null, affirmLabel: 'Got it', rejectLabel: '', heavy: false },
-  attribution: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject', heavy: false },
-  routine_match: { affirm: 'confirm', reject: 'reject', affirmLabel: "That's it", rejectLabel: 'No', heavy: false },
-  proposal: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject', heavy: true },
-  recurrence: { affirm: 'confirm', reject: 'reject', affirmLabel: 'Promote', rejectLabel: 'Reject', heavy: true },
-  pending: { affirm: 'noted', reject: null, affirmLabel: 'Noted', rejectLabel: '', heavy: false },
+  email_urgent: { affirm: 'ack', reject: null, affirmLabel: 'Got it', rejectLabel: '', affirmWeight: 'light', rejectWeight: 'light' },
+  // Attribution: confirm records agreement (light); reject STRIPS THE MARKED
+  // SECTION out of the record body and drops its audit entry (heavy). The two
+  // are not symmetric and never were — see `reject_marker`.
+  attribution: {
+    affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject',
+    affirmWeight: 'light', rejectWeight: 'heavy',
+    rejectArmNote: 'Removes the marked section from the record body and drops its audit entry.',
+  },
+  routine_match: { affirm: 'confirm', reject: 'reject', affirmLabel: "That's it", rejectLabel: 'No', affirmWeight: 'light', rejectWeight: 'light' },
+  // Proposal / recurrence: the CONFIRM is the mutation-bearing half (§3 —
+  // "canonical proposal confirm (creates/merges vault records)", "recurrence
+  // approve (writes a routine item)"). Their rejects record a correction and
+  // write no record, so per the catalog they are light — a narrowing of what
+  // shipped, where the whole KIND was heavy in both directions.
+  proposal: {
+    affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject',
+    affirmWeight: 'heavy', rejectWeight: 'light',
+    affirmArmNote: 'Creates or merges the vault records described above.',
+  },
+  recurrence: {
+    affirm: 'confirm', reject: 'reject', affirmLabel: 'Promote', rejectLabel: 'Reject',
+    affirmWeight: 'heavy', rejectWeight: 'light',
+    affirmArmNote: 'Writes this as a recurring routine item.',
+  },
+  pending: { affirm: 'noted', reject: null, affirmLabel: 'Noted', rejectLabel: '', affirmWeight: 'light', rejectWeight: 'light' },
   // C2 slot candidate: Accept (right, POST "accept") / Skip (left, a client-side
   // set-aside, no POST — rejectDefers) / Snooze (up). Only SUGGESTED slots are
   // dealt (see isDeckDealt).
-  slot_suggestion: { affirm: 'accept', reject: null, affirmLabel: 'Take it', rejectLabel: 'Skip', heavy: false, rejectDefers: true },
+  slot_suggestion: { affirm: 'accept', reject: null, affirmLabel: 'Take it', rejectLabel: 'Skip', affirmWeight: 'light', rejectWeight: 'light', rejectDefers: true },
 };
 
 /** Deck verbs for a kind, or null when the kind has no deck action mapping. */
 export function deckVerbsFor(kind: string): DeckVerbs | null {
   return Object.prototype.hasOwnProperty.call(DECK_VERBS, kind) ? DECK_VERBS[kind] : null;
+}
+
+/**
+ * The weight of ONE direction on ONE kind — the predicate the deck arms on.
+ *
+ * Unmapped kind, or a direction with no verb, answers 'light': there is nothing
+ * to arm, and returning 'heavy' would put a confirm stage in front of a gesture
+ * that does nothing at all.
+ *
+ * `snooze` / `skip` are always light. A defer is reversible by construction (the
+ * card comes back), so arming it would spend a tap to protect nothing.
+ */
+export function verbWeightFor(kind: string, verdict: Verdict): VerbWeight {
+  const verbs = deckVerbsFor(kind);
+  if (!verbs) return 'light';
+  if (verdict === 'affirm') return verbs.affirm === null ? 'light' : verbs.affirmWeight;
+  if (verdict === 'reject') {
+    // A rejectDefers lane writes nothing at all — it is a session-local
+    // set-aside — so it is light regardless of the declared weight.
+    if (verbs.rejectDefers || verbs.reject === null) return 'light';
+    return verbs.rejectWeight;
+  }
+  return 'light';
+}
+
+/** Whether this direction on this kind must ARM rather than commit (D4). */
+export function isHeavyVerb(kind: string, verdict: Verdict): boolean {
+  return verbWeightFor(kind, verdict) === 'heavy';
+}
+
+/**
+ * What the armed verb will write — the sentence the arm stage shows (D4).
+ *
+ * Null when the verb is light (no arm stage) or when a heavy verb has declared
+ * no note. That second case is deliberately visible rather than papered over
+ * with a generic "this writes a record": a heavy verb whose consequence nobody
+ * wrote down should read as missing, not as reassuring.
+ */
+export function armNoteFor(kind: string, verdict: Verdict): string | null {
+  if (!isHeavyVerb(kind, verdict)) return null;
+  const verbs = deckVerbsFor(kind);
+  if (!verbs) return null;
+  const note = verdict === 'affirm' ? verbs.affirmArmNote : verbs.rejectArmNote;
+  return note ?? null;
+}
+
+/** The label of one direction — what the arm stage's commit button says. */
+export function verbLabelFor(kind: string, verdict: Verdict): string {
+  const verbs = deckVerbsFor(kind);
+  if (!verbs) return '';
+  return verdict === 'affirm' ? verbs.affirmLabel : verbs.rejectLabel;
 }
 
 /**

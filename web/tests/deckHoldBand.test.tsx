@@ -32,6 +32,7 @@ import {
   SNOOZE_X_TOLERANCE,
   SNOOZE_Y_THRESHOLD,
   STAMP_FADE_START,
+  UNDO_MS,
   verdictForDrag,
 } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
@@ -155,7 +156,11 @@ describe('hold-band harness', () => {
     move(ORIGIN_X, at(PAST_BAND));
     act(() => up(ORIGIN_X, at(PAST_BAND)));
     expect(menuOpen()).toBe(false);
-    act(() => vi.advanceTimersByTime(SNOOZE_HOLD_MS * 10));
+    // Past the UNDO window — that timer is what flushes the deferred POST.
+    // Spelled with UNDO_MS rather than a multiple of the hold constant: the two
+    // are unrelated numbers, and borrowing one to stand for the other is why
+    // this broke when the window moved 3.5s → 6s.
+    act(() => vi.advanceTimersByTime(UNDO_MS + 1));
     expect(mockAct).toHaveBeenCalledWith('slot_suggestion:task:task/Pay Steph.md', 'snooze_until_i_say');
   });
 });
@@ -378,7 +383,7 @@ describe('Deck hold band — freeze at the held offset', () => {
     move(ORIGIN_X, at(IN_BAND));
     act(() => vi.advanceTimersByTime(SNOOZE_HOLD_MS));
     act(() => fireEvent.click(screen.getByTestId('deck-snooze-choice-snooze_3d')));
-    act(() => vi.advanceTimersByTime(SNOOZE_HOLD_MS * 10));
+    act(() => vi.advanceTimersByTime(UNDO_MS + 1));
     expect(mockAct).toHaveBeenCalledWith('slot_suggestion:task:task/Pay Steph.md', 'snooze_3d');
   });
 });

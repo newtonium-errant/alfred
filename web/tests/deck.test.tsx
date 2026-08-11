@@ -313,7 +313,7 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     expect(document.querySelector('img')).toBeNull();
   });
 
-  it('shows the heavy badge for a proposal', () => {
+  it('badges the heavy DIRECTION, not the card (a proposal: its Confirm)', () => {
     render(
       <DeckCard
         item={item({ kind: 'proposal', title: 'New person' })}
@@ -325,7 +325,10 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
         onCancelHeavy={() => {}}
       />,
     );
-    expect(screen.getByText(/writes a record/i)).toBeTruthy();
+    // Was "Heavy · writes a record" for the whole kind. The badge now names the
+    // verb that is heavy, because on an attribution card only one of the two is.
+    expect(screen.getByTestId('deck-heavy-affirm').textContent).toContain('Confirm');
+    expect(screen.queryByTestId('deck-heavy-reject')).toBeNull();
   });
 
   function renderCard(overrides: Partial<Parameters<typeof item>[0]> = {}, expanded = false) {

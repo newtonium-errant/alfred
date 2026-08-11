@@ -36,3 +36,33 @@
     outline-offset: 2px;
   }
 }
+
+/* The undo toast's draining bar (#102 / D8).
+ *
+ * The bar's DURATION is set inline from `UNDO_MS` — never restated here — so
+ * the animation and the timer that actually flushes the deferred POST cannot
+ * drift apart. A bar that emptied at a different rate than the window it
+ * depicts would be worse than no bar at all: it would look like information.
+ *
+ * `prefers-reduced-motion` gets a static full-width bar rather than nothing:
+ * the operator still needs to see that a window exists, and an element that
+ * vanishes for a whole class of users is a signal that silently stops signalling
+ * for them.
+ */
+@keyframes deck-undo-drain {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+.deck-undo-bar {
+  animation-name: deck-undo-drain;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deck-undo-bar {
+    animation: none;
+    transform: scaleX(1);
+  }
+}

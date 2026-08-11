@@ -7,7 +7,37 @@ import { getJson, postJson } from './http';
 
 export type FeedMode = 'decide' | 'fyi';
 export type FeedAttention = 'needs_you' | 'fyi';
-export type FeedState = 'open' | 'acted' | 'acked' | 'expired';
+/**
+ * `deferred` is the store's fifth state (`alfred.feed.store.STATE_DEFERRED`),
+ * added here so the closed union stops lying about what the backend can hold.
+ *
+ * HONEST ABOUT ITS REACH TODAY: the store persists this state and
+ * `defer_window_open` reads `deferred_until`, but the action ceiling
+ * (`daily_sync/action_router.FEED_ACTIONS`) admits `snooze_*` for
+ * `slot_suggestion` alone — so on every other kind the deck's ↑ is still a
+ * session-local set-aside that writes nothing, and its copy says so. Wiring the
+ * defer verbs per kind is its own lane; this type is the contract half, landed
+ * first so that lane cannot be written against a union missing its own state.
+ */
+export type FeedState = 'open' | 'acted' | 'acked' | 'expired' | 'deferred';
+
+/** Every state the store can hold — the runtime twin of `FeedState`. */
+export const FEED_STATES: readonly FeedState[] = [
+  'open', 'acted', 'acked', 'expired', 'deferred',
+] as const;
+
+/**
+ * Narrow an untrusted wire string to `FeedState`.
+ *
+ * `FeedItem.state` stays a plain `string` on purpose — it is a raw `to_dict`
+ * value and typing it as the closed union would be a claim about untrusted
+ * input this layer cannot make. This guard is the seam where a consumer opts
+ * into the union deliberately, and where an unrecognised future state is
+ * observable instead of silently mis-typed.
+ */
+export function isFeedState(raw: unknown): raw is FeedState {
+  return typeof raw === 'string' && (FEED_STATES as readonly string[]).includes(raw);
+}
 
 // The FeedItem shape mirrors the backend model.FeedItem to_dict (Feed Phase A).
 // `evidence` / `source_ref` are RAW to_dict payloads with NO schema guarantee —

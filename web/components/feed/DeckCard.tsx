@@ -1,6 +1,6 @@
 import { forwardRef } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { affirmLabelFor, deckVerbsFor, emailPriority, kindLabel, HEAVY_KINDS, type EmailPriority } from '../../lib/algernon/feedConstants';
+import { affirmLabelFor, armNoteFor, deckVerbsFor, emailPriority, isHeavyVerb, kindLabel, verbLabelFor, type EmailPriority } from '../../lib/algernon/feedConstants';
 import { ringTierOf } from '../../lib/algernon/rings';
 import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import { EvidenceBody } from './EvidenceBody';
@@ -34,6 +34,8 @@ export interface DeckCardProps {
   depth: number; // 0 = top (interactive), 1..n = stacked behind
   expanded: boolean;
   confirming: boolean;
+  /** Which direction is armed — decides what the confirm overlay promises. */
+  confirmingVerdict?: 'affirm' | 'reject' | null;
   onToggleEvidence: () => void;
   onConfirmHeavy: () => void;
   onCancelHeavy: () => void;
@@ -44,11 +46,16 @@ export interface DeckCardProps {
 }
 
 export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckCard(
-  { item, depth, expanded, confirming, onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen },
+  { item, depth, expanded, confirming, confirmingVerdict = 'affirm', onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen },
   ref,
 ) {
   const verbs = deckVerbsFor(item.kind);
-  const heavy = HEAVY_KINDS.has(item.kind);
+  // PER-DIRECTION. A card is no longer heavy or light as a whole: an attribution
+  // confirm is light and its reject is heavy, and a badge that averaged the two
+  // would be wrong in both directions at once.
+  const affirmHeavy = isHeavyVerb(item.kind, 'affirm');
+  const rejectHeavy = isHeavyVerb(item.kind, 'reject');
+  const armNote = armNoteFor(item.kind, confirmingVerdict ?? 'affirm');
   const rows = evidenceRows(item.evidence);
   // Email-tier decisions carry their assigned tier on the FACE (no blind confirm):
   // a colour-coded badge + a dynamic affirm label ("Confirm HIGH"). Absent/spam →
@@ -123,9 +130,20 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
             {item.instance}
           </span>
         )}
-        {heavy && (
-          <span className="rounded border border-status-progress-fg px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-status-progress-fg">
-            Heavy · writes a record
+        {affirmHeavy && (
+          <span
+            data-testid="deck-heavy-affirm"
+            className="rounded border border-status-progress-fg px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-status-progress-fg"
+          >
+            Heavy · {verbs?.affirmLabel}
+          </span>
+        )}
+        {rejectHeavy && (
+          <span
+            data-testid="deck-heavy-reject"
+            className="rounded border border-danger px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-danger"
+          >
+            Heavy · {verbs?.rejectLabel}
           </span>
         )}
       </div>
@@ -222,10 +240,10 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
 
       {/* Verdict stamps — Deck sets their opacity imperatively during a drag. */}
       <span data-stamp="affirm" className="pointer-events-none absolute right-4 top-4 rotate-[-8deg] rounded border-2 border-honeydew-600 px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-honeydew-600 opacity-0">
-        {priority ? priority : urgent ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : heavy ? 'Review' : 'Yes'}
+        {priority ? priority : urgent ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : affirmHeavy ? 'Review' : 'Yes'}
       </span>
       <span data-stamp="reject" className="pointer-events-none absolute left-4 top-4 rotate-[8deg] rounded border-2 border-danger px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-danger opacity-0">
-        {verbs?.rejectDefers ? 'Skip' : 'No'}
+        {verbs?.rejectDefers ? 'Skip' : rejectHeavy ? 'Review' : 'No'}
       </span>
       <span data-stamp="snooze" className="pointer-events-none absolute left-1/2 top-4 -ml-10 rounded border-2 border-status-progress-fg px-2.5 py-1 text-sm font-extrabold uppercase tracking-widest text-status-progress-fg opacity-0">
         Snooze
@@ -236,10 +254,25 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
           data-testid="deck-confirm"
           className="absolute inset-0 flex flex-col items-center justify-center gap-3.5 rounded-2xl bg-cream p-5 text-center"
         >
+          {/* D4: the arm shows exactly what will be written. The old copy asked
+              "Write this to the vault?" for every heavy verb, which is not what
+              an attribution REJECT does — it removes text. A verb whose
+              consequence is stated wrongly is worse than one stated vaguely. */}
           <p className="text-sm text-honeydew-600">
-            {item.kind === 'proposal' ? 'Create this canonical record?' : 'Write this to the vault?'}
+            {verbLabelFor(item.kind, confirmingVerdict ?? 'affirm')} this?
           </p>
           <p className="text-base font-bold text-honeydew-700">{item.title || item.id}</p>
+          {armNote ? (
+            <p data-testid="deck-confirm-note" className="text-xs font-semibold text-danger">
+              {armNote}
+            </p>
+          ) : (
+            // ILB: a heavy verb with no declared consequence says so, rather
+            // than reading as a reassuring blank.
+            <p data-testid="deck-confirm-note-missing" className="text-xs text-honeydew-600">
+              This writes to the vault. The exact change isn’t described for this card type.
+            </p>
+          )}
           <div className="flex gap-3">
             <button
               type="button"
@@ -247,7 +280,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
               onClick={onConfirmHeavy}
               className="rounded-lg border border-honeydew-600 bg-honeydew-600 px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-cream"
             >
-              Confirm
+              {verbLabelFor(item.kind, confirmingVerdict ?? 'affirm') || 'Confirm'}
             </button>
             <button
               type="button"
