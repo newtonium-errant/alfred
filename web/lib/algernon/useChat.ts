@@ -211,7 +211,9 @@ export const IMAGE_TOO_LARGE_FALLBACK =
   'many images. Retrying won’t help — start a new chat and re-attach ' +
   'the images you still need.';
 
-function friendlyError(e: unknown): string {
+// Exported for the #82 WARN-2 unit: the switch is the seam that decides what
+// an operator reads, so it is pinned directly rather than only through the hook.
+export function friendlyError(e: unknown): string {
   if (e instanceof ApiError) {
     switch (e.code) {
       case 'invalid_session':

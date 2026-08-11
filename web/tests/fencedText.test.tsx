@@ -78,6 +78,20 @@ describe('FencedText — rendering', () => {
     );
   });
 
+  it('does NOT render markdown — headings and links stay literal', () => {
+    // The restraint is the design, not an omission (#85 NOTE-3). FencedText
+    // chooses which ELEMENT a run of text lands in; it never turns text into
+    // markup. Widening it to real markdown would change four surfaces at once,
+    // so a heading stays a literal '# Heading' and a link stays literal
+    // '[a](b)'. If this ever goes red, that widening happened by accident.
+    render(<FencedText text={'# Heading\n[a](b)'} data-testid="body" />);
+    const body = screen.getByTestId('body');
+    expect(body.textContent).toContain('# Heading');
+    expect(body.textContent).toContain('[a](b)');
+    expect(body.querySelector('h1')).toBeNull();
+    expect(body.querySelector('a')).toBeNull();
+  });
+
   it('renders every fence in a multi-fence message', () => {
     render(<FencedText text={'```csv\na\n```\nmid\n```json\n{}\n```'} />);
     expect(screen.getAllByTestId('fenced-block')).toHaveLength(2);

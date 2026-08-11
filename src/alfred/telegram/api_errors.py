@@ -9,7 +9,8 @@ fail, with no hint of what would actually clear it.
 
 The 2026-08-11 VERA incident is the worked example. Anthropic applies a
 stricter per-image dimension limit — 2000px on either edge — once a request
-carries more than 20 image/document blocks; over it, the request is rejected
+carries more than 20 image blocks (document blocks share that count on some
+platforms, though not on this one); over it, the request is rejected
 with an ``invalid_request_error`` naming "many-image requests". Every chat turn
 resends the whole transcript, so once an oversized screenshot is in history the
 same 400 fires on every subsequent turn: the SESSION WEDGES. The operator

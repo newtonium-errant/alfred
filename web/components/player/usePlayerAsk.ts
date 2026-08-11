@@ -73,7 +73,8 @@ export interface UsePlayerAskResult {
 
 // Generic per-instance-safe copy (never an instance literal — mirrors useChat's
 // friendlyError, which says "the assistant", not a name). Per feedback_hardcoding.
-function askErrorMessage(e: unknown): string {
+// Exported for the #82 WARN-2 unit — see useChat.friendlyError.
+export function askErrorMessage(e: unknown): string {
   if (e instanceof ApiError) {
     switch (e.code) {
       case 'invalid_session':

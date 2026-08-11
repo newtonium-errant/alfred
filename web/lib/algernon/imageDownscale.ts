@@ -2,8 +2,9 @@
  * Client-side image downscaling for chat attachments (#82).
  *
  * WHY THIS EXISTS — the wedge. Anthropic applies a stricter per-image
- * dimension limit once a single request carries more than 20 image (and
- * document) blocks: every image must then be at most 2000px on either edge.
+ * dimension limit once a single request carries more than 20 image blocks
+ * (document blocks share that count on some platforms, though not on this
+ * one): every image must then be at most 2000px on either edge.
  * Over that, the request is rejected with an `invalid_request_error` naming
  * "many-image requests". A chat turn resends the whole conversation history,
  * so once enough oversized screenshots accumulate the 400 repeats on every
@@ -11,36 +12,67 @@
  * the offending image is in the history being resent. That is the live
  * incident this fixes (VERA, 2026-08-11, ~24 claims screenshots).
  *
- * WHY 1568 AND NOT 2000. 1568px is the max long edge the STANDARD resolution
- * tier actually consumes — Claude downscales anything larger to fit before
- * processing. VERA runs `claude-sonnet-4-6`, a standard-tier model, so a
- * 1568px long edge is not a quality compromise: it is precisely what the model
- * sees either way. It also leaves a wide margin under the 2000px many-image
- * limit rather than sitting on it.
+ * WHY 2576 — AND WHY THE ANSWER IS PER-TIER. Claude has two vision resolution
+ * tiers, and THIS ONE COMPOSER FEEDS INSTANCES ON BOTH, so a single constant
+ * has to be judged against each:
  *
- * WHAT THIS DOES *NOT* BUY. It does not meaningfully cut image tokens on a
- * standard-tier model — the API caps those at 1568 visual tokens by
- * downscaling regardless. The wins are the wedge above, plus a much smaller
- * base64 payload (a 3000px JPG scan is several times the bytes of its 1568px
- * equivalent), which means faster uploads and more headroom under the 5 MiB
- * per-image and 32 MiB per-request caps. Do not describe this as a token
- * optimisation; on a high-resolution-tier model (Claude 4.7+) it would be one.
+ *   HIGH-RESOLUTION tier (Claude 4.7 and later) — 2576px long edge, up to 4784
+ *     visual tokens. KAL-LE and Hypatia run `claude-opus-4-7`. A 2576px input
+ *     is consumed at full fidelity.
+ *   STANDARD tier (everything else) — 1568px long edge, capped at 1568 visual
+ *     tokens. Salem/VERA runs `claude-sonnet-4-6`. A 2576px input is
+ *     downscaled BY THE API to 1568 before processing.
+ *
+ * So 2576 is lossless on both tiers today: high-res gets its native
+ * resolution, standard gets exactly what it would have got from a 1568px
+ * upload because the API does that downscale itself. 1568 was NOT neutral —
+ * it silently discarded ~1.64x linear resolution (2576/1568) from KAL-LE's and
+ * Hypatia's dense scans, which is the whole reason this constant moved.
+ *
+ * REVISIT WHEN: a tier above 2576px ships. Then this becomes the old mistake
+ * pointed the other way — a cap set to yesterday's top tier, quietly throwing
+ * away detail for whoever runs the newer models. The check is the long-edge
+ * column of the vision docs' resolution-tier table, not this comment.
+ *
+ * TOKENS: this is not a token optimisation on the standard tier (the API caps
+ * those at 1568 regardless of what we send) and raising the cap to 2576 does
+ * increase tokens on the HIGH-RES tier, up to 4784/image — that is the cost of
+ * the fidelity, paid deliberately. What downscaling always buys is a much
+ * smaller base64 payload than a raw 3000-4000px scan: faster uploads, and
+ * headroom under the 5 MiB per-image and 32 MiB per-request caps.
+ *
+ * WHY THE 2000px MANY-IMAGE CAP IS NOT A CONSTRAINT ON THIS VALUE. 2576 is
+ * above 2000, which would matter only if a request could ever carry more than
+ * 20 image blocks. It cannot: `conversation.MAX_HISTORY_IMAGE_BLOCKS` trims
+ * every outgoing request to 12 image blocks TOTAL — the trim runs after the
+ * new turn is appended, so the current turn's images are counted too — and on
+ * this platform document blocks contribute nothing to that count. 12 against a
+ * threshold of >20 is the margin, and it is the trim, not this constant, that
+ * holds it.
  *
  * NEVER BLOCKS THE USER. Every failure path returns the ORIGINAL file rather
  * than throwing: an unreadable image, a browser without canvas, a tainted
  * context, an encoder that returns null. Downscaling is an optimisation, and a
- * broken optimisation must not cost the operator their attachment — the
- * box-side guards still stand behind it.
+ * broken optimisation must not cost the operator their attachment. The real
+ * backstop is the history trim named above — it bounds the image COUNT, which
+ * is what makes the dimension limit unreachable no matter what any client
+ * uploads. The byte and per-turn-count caps in `schemas.ts` are input
+ * validation, not a wedge guard; don't mistake them for one.
  */
 
-/** Max long edge, in pixels. The standard tier's native resolution. */
-export const MAX_IMAGE_EDGE_PX = 1568;
+/**
+ * Max long edge, in pixels: the HIGH-RESOLUTION tier's native resolution.
+ * Lossless on both tiers today — see the per-tier note above before changing.
+ */
+export const MAX_IMAGE_EDGE_PX = 2576;
 
 /**
  * The dimension ceiling Anthropic imposes on requests carrying more than 20
- * image/document blocks. Not our target (we aim at MAX_IMAGE_EDGE_PX, well
- * under it) — it is here so the reason for the target is greppable from the
- * constant, and so a test can assert we stay below it.
+ * image blocks (document blocks share the count on some platforms, though not
+ * on this one). Kept as a named constant so the threshold this whole fix is
+ * about is greppable — but note MAX_IMAGE_EDGE_PX is deliberately ABOVE it,
+ * because the history trim makes the >20 condition unreachable. See the
+ * per-tier note in the module docstring.
  */
 export const MANY_IMAGE_DIMENSION_LIMIT_PX = 2000;
 

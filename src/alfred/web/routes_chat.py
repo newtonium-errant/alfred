@@ -893,8 +893,11 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 session_key=session_key,
                 error=str(exc),
                 error_type=type(exc).__name__,
-                # Present only when recognised, so a grep for the code finds
-                # every occurrence of a KNOWN failure and nothing else.
+                # Always emitted; the VALUE is the code when recognised and
+                # None otherwise. So `classified_as=image_too_large` greps to
+                # exactly the known failures, and its presence-with-None on
+                # every other engine error is the ILB signal that the
+                # classifier ran and abstained rather than never running.
                 classified_as=classified.code if classified else None,
             )
             if classified is not None:

@@ -36,31 +36,32 @@ describe('targetDimensions', () => {
   });
 
   it('scales the long edge down to the cap, preserving aspect ratio', () => {
-    // A 3000x2000 desktop scan — the shape from the live incident.
-    const out = targetDimensions(3000, 2000);
+    // A 4000x2667 desktop scan — above the cap on both tiers.
+    const out = targetDimensions(4000, 2667);
     expect(out.width).toBe(MAX_IMAGE_EDGE_PX);
-    // 2000 * (1568/3000) = 1045.33 -> floor
-    expect(out.height).toBe(1045);
+    // 2667 * (2576/4000) = 1717.5 -> round
+    expect(out.height).toBe(1718);
     // Aspect ratio preserved within a pixel of rounding.
-    expect(Math.abs(out.width / out.height - 3000 / 2000)).toBeLessThan(0.01);
+    expect(Math.abs(out.width / out.height - 4000 / 2667)).toBeLessThan(0.01);
   });
 
   it('scales by the LONG edge regardless of orientation', () => {
     // Portrait: the height is the constraint. Getting this backwards would
     // leave portrait scans oversized — the exact images a claims workflow has.
-    const out = targetDimensions(2000, 3000);
+    const out = targetDimensions(2667, 4000);
     expect(out.height).toBe(MAX_IMAGE_EDGE_PX);
-    expect(out.width).toBe(1045);
+    expect(out.width).toBe(1718);
   });
 
-  it('keeps every output under the many-image dimension limit', () => {
-    // The load-bearing property: whatever comes in, what goes out cannot trip
-    // the >20-image rejection that wedged the session.
+  it('caps every output at the tier resolution, whatever comes in', () => {
+    // Note what this does NOT claim: outputs are NOT under the 2000px
+    // many-image limit, and deliberately so — 2576 is above it. The wedge is
+    // held by the history trim bounding the image COUNT to 12 (threshold >20),
+    // not by this constant. See the module docstring.
     for (const [w, h] of [
-      [3000, 2000], [8000, 8000], [2001, 10], [10, 2001], [4000, 1],
+      [4000, 2667], [8000, 8000], [3001, 10], [10, 3001], [4000, 1],
     ]) {
       const out = targetDimensions(w, h);
-      expect(exceedsManyImageLimit(out.width, out.height)).toBe(false);
       expect(Math.max(out.width, out.height)).toBeLessThanOrEqual(MAX_IMAGE_EDGE_PX);
     }
   });
@@ -91,11 +92,22 @@ describe('exceedsManyImageLimit', () => {
     expect(exceedsManyImageLimit(10, 2001)).toBe(true);
   });
 
-  it('is strictly above our downscale target, so the target has headroom', () => {
-    // Not an arbitrary pair of constants: 1568 is what the standard-tier model
-    // actually consumes, and it must sit under the many-image ceiling rather
-    // than on it.
-    expect(MAX_IMAGE_EDGE_PX).toBeLessThan(MANY_IMAGE_DIMENSION_LIMIT_PX);
+  it('is BELOW our downscale target — the trim, not this cap, holds the wedge', () => {
+    // This assertion was inverted in the first ship, when the target was 1568
+    // and the reasoning was "stay under the many-image ceiling". That framing
+    // was wrong twice over: it cost the high-res-tier instances ~1.64x linear
+    // resolution, and it credited the wrong guard. The >20-block condition is
+    // unreachable because conversation.MAX_HISTORY_IMAGE_BLOCKS trims every
+    // request to 12 images total, so the dimension ceiling never applies and
+    // the target is free to sit at the tier's native resolution.
+    expect(MAX_IMAGE_EDGE_PX).toBeGreaterThan(MANY_IMAGE_DIMENSION_LIMIT_PX);
+  });
+
+  it('pins the tier resolution as an exact value', () => {
+    // Exact-value pin: 2576 is the HIGH-RESOLUTION tier's long edge (Claude
+    // 4.7+, which KAL-LE and Hypatia run). Lossless on the standard tier too,
+    // which self-downscales to 1568. Revisit only when a tier above 2576 ships.
+    expect(MAX_IMAGE_EDGE_PX).toBe(2576);
   });
 });
 
