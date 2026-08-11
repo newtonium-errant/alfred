@@ -64,7 +64,14 @@ export const TRIAL_WINDOW_BASES_MIN = [8 * 60, 13 * 60, 19 * 60];
 // on a tidy hour boundary invites coincidence with other wakeups).
 export const TRIAL_WINDOW_SPREAD_MIN = 90;
 
-export type TrialRowType = 'scheduled' | 'sent' | 'send_failed' | 'receipt';
+// `ruling` is the one row type this side never WRITES — it is appended by
+// `alfred push-trial rule`, the operator's after-the-fact answer about a slot
+// that was sent and never tapped. Named here anyway because both runtimes must
+// READ every type either one writes: an unlisted type would be a whole class of
+// ledger row this side silently ignored, and `dueSlots` in particular must keep
+// treating a ruled slot as already attempted (it filters on sent/send_failed,
+// so it does — pinned rather than assumed).
+export type TrialRowType = 'scheduled' | 'sent' | 'send_failed' | 'receipt' | 'ruling';
 
 export interface TrialRow {
   type: TrialRowType;
@@ -76,6 +83,10 @@ export interface TrialRow {
   /** ISO — when the operator tapped. Present on `receipt`. */
   received_ts?: string;
   error?: string;
+  /** `arrived` | `missed` — the operator's verdict. Present on `ruling`. */
+  verdict?: string;
+  /** ISO — when he ruled. Present on `ruling`. */
+  ruled_ts?: string;
 }
 
 export interface TrialConfig {

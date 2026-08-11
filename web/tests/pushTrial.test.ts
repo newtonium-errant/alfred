@@ -311,6 +311,45 @@ describe('ledger', () => {
     expect(written).toBe(committed);
   });
 
+  it('tolerates the `ruling` row the PYTHON side writes', async () => {
+    // Cross-language, the other direction: `alfred push-trial rule` appends a
+    // row type this runtime never writes. A reader that dropped it would be
+    // fine today (nothing here consumes rulings) and wrong the moment anything
+    // does — and the drop would be silent, which is the failure mode.
+    const dir = await mkdtemp(join(tmpdir(), 'trial-'));
+    const path = join(dir, 'push_trial.jsonl');
+    await writeFile(
+      path,
+      '{"type":"scheduled","push_id":"trial-d1-w1","due_ts":"2026-08-12T08:07:00.000Z"}\n' +
+        '{"type":"sent","push_id":"trial-d1-w1","sent_ts":"2026-08-12T08:07:30.000Z"}\n' +
+        '{"type":"ruling","push_id":"trial-d1-w1","verdict":"missed","ruled_ts":"2026-08-13T12:00:00.000Z"}\n',
+    );
+
+    const rows = await readTrialRows(path);
+
+    expect(rows).toHaveLength(3);
+    expect(rows[2].type).toBe('ruling');
+    expect(rows[2].verdict).toBe('missed');
+  });
+
+  it('a ruled slot stays ATTEMPTED — a ruling never re-arms a send', async () => {
+    // dueSlots filters on sent/send_failed, so this holds today; pinned because
+    // the alternative is the instrument re-firing a slot the operator has
+    // already answered, at an unplanned time, corrupting his own ruling.
+    const schedule = buildSchedule({ startMs: START_MS, days: 1 });
+    const rows: TrialRow[] = [
+      { type: 'sent', push_id: schedule[0].push_id, sent_ts: START },
+      {
+        type: 'ruling', push_id: schedule[0].push_id,
+        verdict: 'missed', ruled_ts: START,
+      },
+    ];
+
+    const due = dueSlots(schedule, rows, schedule[0].dueMs);
+
+    expect(due.map((s) => s.push_id)).not.toContain(schedule[0].push_id);
+  });
+
   it('a newline in a value cannot forge a second row', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'trial-'));
     const path = join(dir, 'push_trial.jsonl');

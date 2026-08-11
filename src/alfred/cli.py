@@ -5179,9 +5179,27 @@ def _cmd_push_trial(args: argparse.Namespace) -> None:
     The rendered table refuses to collapse "sent, never tapped" into "did not
     arrive". That distinction IS the trial — see ``push_trial`` for why.
     """
-    from alfred.push_trial import build_status, render_status, trial_path
+    from alfred.push_trial import (
+        RulingError, build_status, record_ruling, render_status, trial_path,
+    )
 
     path = trial_path()
+    cmd = getattr(args, "push_trial_cmd", None)
+
+    if cmd == "rule":
+        # The ONLY write this surface makes, and it writes the operator's
+        # ANSWER — never the instrument's. Appended as its own row so the
+        # original slot row stays intact and the ledger remains readable as a
+        # history of what was unknown and when it was settled.
+        try:
+            slot = record_ruling(path, args.push_id, args.verdict)
+        except RulingError as exc:
+            print(f"Refused: {exc}")
+            raise SystemExit(2)
+        print(f"Recorded: {slot.push_id} → {slot.state} (you said {slot.ruling}).")
+        print("The original send row is untouched; this is an added answer.")
+        return
+
     status = build_status(path)
     if getattr(args, "json", False):
         print(json.dumps({"path": path, **status.to_dict()}, indent=2))
@@ -7145,6 +7163,17 @@ def build_parser() -> argparse.ArgumentParser:
     ptrial_status = ptrial_sub.add_parser(
         "status", help="Per-slot delivery state — sent/received/not-sent, never conflated")
     ptrial_status.add_argument("--json", action="store_true", help="Machine-readable output")
+    # The reconcile half. A slot the instrument sent and he never tapped is
+    # UNKNOWN, and only he can say which way — this is where that answer becomes
+    # data instead of a remark in a chat log the decision later rests on.
+    ptrial_rule = ptrial_sub.add_parser(
+        "rule", help="Settle one unknown slot: did it actually reach the phone?")
+    ptrial_rule.add_argument("push_id", help="Slot id, e.g. trial-d3-w2")
+    ptrial_rule.add_argument(
+        "verdict", choices=["arrived", "missed"],
+        help="arrived = it reached the phone (you just didn't tap); "
+             "missed = it never showed up",
+    )
 
     # #72 — the tier-override escape hatch. `clear` only: putting a kind INTO
     # an override is the operator answering a Daily Sync proposal, and a second

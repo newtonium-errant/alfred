@@ -88,6 +88,10 @@ def test_full_counts() -> None:
         STATE_SEND_FAILED: 1,
         STATE_NOT_SENT: 1,
         STATE_PENDING: 2,
+        # Present-and-zero rather than absent: a reader that branches on these
+        # keys must not KeyError on a trial nobody has ruled yet.
+        "ruled_arrived": 0,
+        "ruled_missed": 0,
     }
 
 
@@ -233,3 +237,200 @@ def test_every_fixture_row_type_is_understood() -> None:
             "send_failed": "sent_ts", "receipt": "received_ts",
         }[r["type"]]
         assert isinstance(r.get(field), str) and r[field]
+
+
+# ===========================================================================
+# The reconcile writer — turning a remark into data
+# ===========================================================================
+#
+# The trial's OUTPUT is the ruling data. If day-3 unknowns get settled in
+# conversation, the envelope decision ends up resting on someone's recollection
+# of chat messages rather than on the ledger — so the answer has to land in the
+# file, under its own state, distinguishable from a measured tap.
+
+from alfred.push_trial import (  # noqa: E402
+    ROW_RULING,
+    RULABLE_STATES,
+    STATE_RULED_ARRIVED,
+    STATE_RULED_MISSED,
+    VERDICT_ARRIVED,
+    VERDICT_MISSED,
+    RulingError,
+    record_ruling,
+)
+
+
+@pytest.fixture
+def ledger(tmp_path: Path) -> Path:
+    """A working copy of the fixture, so rulings can be appended to it."""
+    p = tmp_path / "push_trial.jsonl"
+    p.write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    return p
+
+
+def test_ruling_arrived_lands_under_its_own_state(ledger: Path) -> None:
+    slot = record_ruling(ledger, "trial-d1-w2", VERDICT_ARRIVED, now=NOW)
+
+    assert slot.state == STATE_RULED_ARRIVED
+    # NOT `received` — a recollection must never be counted as a measurement.
+    assert slot.state != STATE_RECEIVED
+    assert slot.is_ruled is True
+    assert slot.latency_s is None, "a ruling carries no timing"
+
+
+def test_ruling_missed_is_the_only_genuine_delivery_failure(ledger: Path) -> None:
+    record_ruling(ledger, "trial-d1-w2", VERDICT_MISSED, now=NOW)
+    counts = build_status(ledger, now=NOW).counts
+
+    assert counts[STATE_RULED_MISSED] == 1
+    assert counts[STATE_UNKNOWN] == 0
+    # The instrument-side states are untouched by a delivery ruling.
+    assert counts[STATE_NOT_SENT] == 1
+    assert counts[STATE_SEND_FAILED] == 1
+
+
+def test_the_ruling_is_APPENDED_and_the_send_row_is_untouched(ledger: Path) -> None:
+    """The audit trail is the point: the ledger must still show what was unknown
+    and when it was settled."""
+    before = ledger.read_text(encoding="utf-8")
+    record_ruling(ledger, "trial-d1-w2", VERDICT_ARRIVED, now=NOW)
+    after = ledger.read_text(encoding="utf-8")
+
+    assert after.startswith(before), "an existing row was rewritten"
+    added = [json.loads(l) for l in after[len(before):].strip().splitlines()]
+    assert len(added) == 1
+    assert added[0] == {
+        "type": ROW_RULING,
+        "push_id": "trial-d1-w2",
+        "verdict": VERDICT_ARRIVED,
+        "ruled_ts": NOW.isoformat(),
+    }
+    # The original sent row is still there, verbatim.
+    assert '{"type":"sent","push_id":"trial-d1-w2"' in after
+
+
+def test_a_later_ruling_wins_and_both_stay_on_disk(ledger: Path) -> None:
+    record_ruling(ledger, "trial-d1-w2", VERDICT_MISSED, now=NOW)
+    later = datetime(2026, 8, 13, 18, 0, 0, tzinfo=timezone.utc)
+    slot = record_ruling(ledger, "trial-d1-w2", VERDICT_ARRIVED, now=later)
+
+    assert slot.state == STATE_RULED_ARRIVED
+    text = ledger.read_text(encoding="utf-8")
+    assert text.count(f'"type": "{ROW_RULING}"') == 2, "the correction erased history"
+
+
+def test_a_measurement_outranks_a_recollection(ledger: Path) -> None:
+    """He tapped d1-w1. A ruling cannot demote a measured arrival — and the
+    ruling row is still written, so the disagreement stays visible."""
+    with pytest.raises(RulingError) as exc:
+        record_ruling(ledger, "trial-d1-w1", VERDICT_MISSED, now=NOW)
+
+    assert "tapped" in str(exc.value).lower()
+    assert build_status(ledger, now=NOW).counts[STATE_RECEIVED] == 1
+
+
+@pytest.mark.parametrize("push_id,state", [
+    ("trial-d2-w1", STATE_NOT_SENT),
+    ("trial-d1-w3", STATE_SEND_FAILED),
+    ("trial-d2-w2", STATE_PENDING),
+])
+def test_only_a_sent_but_untapped_slot_is_rulable(
+    ledger: Path, push_id: str, state: str,
+) -> None:
+    """Ruling a never-sent / failed / future slot asserts something about a
+    delivery that never had a chance to happen."""
+    with pytest.raises(RulingError) as exc:
+        record_ruling(ledger, push_id, VERDICT_ARRIVED, now=NOW)
+
+    assert state in str(exc.value)
+    assert state not in RULABLE_STATES
+    # Nothing was written.
+    assert ROW_RULING not in ledger.read_text(encoding="utf-8")
+
+
+def test_the_rulable_set_is_exactly_the_sent_untapped_family() -> None:
+    """Named explicitly so a future widening is a deliberate edit here, not a
+    side effect. `received` is the one that must never join: a recollection
+    overwriting a measurement is the blend this whole state model prevents."""
+    assert set(RULABLE_STATES) == {
+        STATE_UNKNOWN, STATE_RULED_ARRIVED, STATE_RULED_MISSED,
+    }
+    for excluded in (STATE_RECEIVED, STATE_NOT_SENT, STATE_SEND_FAILED,
+                     STATE_PENDING):
+        assert excluded not in RULABLE_STATES
+
+
+def test_an_unknown_slot_id_is_refused_with_help(ledger: Path) -> None:
+    with pytest.raises(RulingError) as exc:
+        record_ruling(ledger, "trial-d9-w9", VERDICT_ARRIVED, now=NOW)
+
+    assert "no scheduled slot" in str(exc.value)
+    assert "trial-d1-w1" in str(exc.value), "the refusal should name real slots"
+
+
+@pytest.mark.parametrize("verdict", ["", "yes", "ARRIVED?", "maybe", "true"])
+def test_a_junk_verdict_is_refused(ledger: Path, verdict: str) -> None:
+    with pytest.raises(RulingError):
+        record_ruling(ledger, "trial-d1-w2", verdict, now=NOW)
+    assert ROW_RULING not in ledger.read_text(encoding="utf-8")
+
+
+def test_verdict_is_case_and_space_tolerant(ledger: Path) -> None:
+    slot = record_ruling(ledger, "trial-d1-w2", "  Arrived  ", now=NOW)
+    assert slot.state == STATE_RULED_ARRIVED
+
+
+def test_an_unreadable_ledger_refuses_the_append(tmp_path: Path, monkeypatch) -> None:
+    """Never append to a store whose current contents are unknown — the slot
+    might already be tapped."""
+    p = tmp_path / "ledger.jsonl"
+    p.write_text("{}\n", encoding="utf-8")
+
+    def _boom(*a, **k):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+    with pytest.raises(RulingError) as exc:
+        record_ruling(p, "trial-d1-w2", VERDICT_ARRIVED, now=NOW)
+    assert "could not be read" in str(exc.value)
+
+
+def test_ruled_slots_render_as_rulings_not_as_taps(ledger: Path) -> None:
+    """The two qualities of evidence must not look alike in the table the
+    envelope decision is read off."""
+    record_ruling(ledger, "trial-d1-w2", VERDICT_ARRIVED, now=NOW)
+    body = render_status(build_status(ledger, now=NOW), "x.jsonl")
+
+    assert "ruled arrived" in body
+    assert "RECALLED" in body
+    # d1-w1 was tapped; its evidence column shows the latency.
+    assert "tapped +100s" in body
+    # d1-w2 was ruled; its evidence column shows the ruling date, not a latency.
+    ruled_line = [l for l in body.splitlines() if "trial-d1-w2" in l][0]
+    assert "ruled 2026-08-13" in ruled_line
+    assert "tapped" not in ruled_line
+
+
+def test_the_ruling_prompt_disappears_once_everything_is_settled(
+    ledger: Path,
+) -> None:
+    record_ruling(ledger, "trial-d1-w2", VERDICT_MISSED, now=NOW)
+    body = render_status(build_status(ledger, now=NOW), "x.jsonl")
+
+    assert "did it arrive?" not in body
+
+
+def test_the_prompt_names_a_real_runnable_command(ledger: Path) -> None:
+    body = render_status(build_status(ledger, now=NOW), "x.jsonl")
+
+    assert "alfred push-trial rule trial-d1-w2 arrived" in body
+
+
+def test_ruling_is_logged(ledger: Path) -> None:
+    with structlog.testing.capture_logs() as captured:
+        record_ruling(ledger, "trial-d1-w2", VERDICT_ARRIVED, now=NOW)
+
+    events = [c for c in captured if c.get("event") == "push_trial.ruling_recorded"]
+    assert len(events) == 1
+    assert events[0]["push_id"] == "trial-d1-w2"
+    assert events[0]["verdict"] == VERDICT_ARRIVED
