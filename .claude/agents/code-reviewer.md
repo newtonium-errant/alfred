@@ -62,6 +62,10 @@ You review code changes to Alfred for correctness, safety, and consistency with 
 - Does it change CLI interface? (could break user scripts)
 - Does it touch the orchestrator? (could affect all tools)
 
+### Vacuity checks (a check that cannot fire is not a check)
+- **Exclusion/deny/filter pins need a positive control in the same test.** "Excluded input → 0 results" passes identically when the whole pipeline is dead; demand (or build) the paired assertion that the nearest admissible neighbour IS accepted (2026-08-11 #64 gate: identical-title self-transcript → 0 candidates was only meaningful because a genuine record scored 0.979 in the same harness). Sibling of probe-hygiene (an applied-at-the-site probe with a ran/collected count, then color).
+- **Inherited numbers are claims.** A baseline handed down by a dispatch prompt or a predecessor's report is verified by running it, not by subtracting from it — an unreconcilable delta hides which end is wrong (2026-08-11 #64: two cancelling errors produced a clean-looking +112; the measured, per-file-reconciled delta was 146).
+
 ## Review Output Format
 
 Use BLOCK / WARN / NOTE:
