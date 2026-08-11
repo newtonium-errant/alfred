@@ -43,6 +43,8 @@ export default function ChatPage() {
     notice,
     unauthenticated,
     retryable,
+    unsentText,
+    clearUnsent,
     send,
     retry,
     newChat,
@@ -246,6 +248,8 @@ export default function ChatPage() {
           <Composer
             onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
             disabled={booting || sending}
+            seedText={unsentText}
+            onSeedConsumed={clearUnsent}
           />
         </div>
       </Layout>

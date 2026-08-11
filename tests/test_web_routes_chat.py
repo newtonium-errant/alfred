@@ -1400,6 +1400,9 @@ def test_register_web_routes_enabled_mounts_chat_and_auth(tmp_path) -> None:
         "/chat/turn",
         "/chat/stream",
         "/chat/history/{session_key}",
+        # #94(c) — the read-only probe that lets a stale key RESUME the live
+        # session instead of opening over the top of it.
+        "/chat/active",
         # Parity #22 — notifications default ON (web.notifications.enabled).
         "/chat/notifications",
         "/chat/notifications/ack",
@@ -2512,3 +2515,93 @@ async def test_stream_dimension_400_error_frame_carries_image_too_large(
     assert errors[0]["retryable"] is False
     assert "try again" not in errors[0]["detail"].lower()
     assert not [d for (e, d) in events if e == "done"]
+
+
+# ---------------------------------------------------------------------------
+# #94(c) — GET /chat/active: open-or-resume without destroying the answer
+# ---------------------------------------------------------------------------
+#
+# The bootstrap 404 used to lead straight to /chat/open, which is
+# close-prior-then-fresh — so asking "do I have a session?" DESTROYED the
+# session. Two devices holding stale keys then killed each other's live one in
+# a loop (three opens in 22s, 2026-08-11 04:25:50-04:26:12Z). This route lets
+# the client ask without breaking anything.
+
+
+async def test_active_returns_null_when_there_is_no_session(web_client) -> None:
+    """Absence is a normal ANSWER, not an error.
+
+    A 404 here would push the client back toward treating "no session" as a
+    failure — the reflex that produced the open-storm in the first place.
+    """
+    r = await web_client.get("/chat/active", headers=_session_headers())
+    assert r.status == 200
+    body = await r.json()
+    assert body["session_key"] is None
+    assert body["turns"] == 0
+
+
+async def test_active_returns_the_live_session_key(web_client) -> None:
+    """THE resume pin — a second device can find the live conversation."""
+    opened = await web_client.post(
+        "/chat/open", json={}, headers=_session_headers(),
+    )
+    session_key = (await opened.json())["session_key"]
+
+    r = await web_client.get("/chat/active", headers=_session_headers())
+    assert r.status == 200
+    assert (await r.json())["session_key"] == session_key
+
+
+async def test_active_does_not_close_the_session_it_reports(web_client) -> None:
+    """READ-ONLY, asserted as an EFFECT rather than trusted from the name.
+
+    This is the whole reason the route exists: probing must be safe to repeat.
+    Ten probes then a history read — the session must still be there, which is
+    exactly what /chat/open could not promise.
+    """
+    opened = await web_client.post(
+        "/chat/open", json={}, headers=_session_headers(),
+    )
+    session_key = (await opened.json())["session_key"]
+
+    for _ in range(10):
+        r = await web_client.get("/chat/active", headers=_session_headers())
+        assert (await r.json())["session_key"] == session_key
+
+    hist = await web_client.get(
+        f"/chat/history/{session_key}", headers=_session_headers(),
+    )
+    assert hist.status == 200, "probing closed the session it was asked about"
+
+
+async def test_active_is_fail_closed_at_BOTH_auth_layers(web_client) -> None:
+    """The new route inherits the full spine — asserted layer by layer.
+
+    My first draft sent no headers at all and expected ``invalid_session``; the
+    real answer is ``missing_bearer``, because Layer 1 (the transport peer
+    gate) rejects before the handler runs. That is the stronger behaviour, but
+    a test asserting only it would never exercise the Layer-2 session gate —
+    so both are pinned, each with the error that identifies it.
+    """
+    # Layer 1 — no peer token at all.
+    bare = await web_client.get("/chat/active")
+    assert bare.status == 401
+    assert (await bare.json())["error"] == "missing_bearer"
+
+    # Layer 2 — a valid peer token, but no verified user.
+    no_session = await web_client.get("/chat/active", headers=_PEER_HEADERS)
+    assert no_session.status == 401
+    assert (await no_session.json())["error"] == "invalid_session"
+
+
+async def test_active_reports_what_it_found(web_client) -> None:
+    """ILB on both branches — the probe must be greppable either way."""
+    import structlog
+
+    with structlog.testing.capture_logs() as captured:
+        await web_client.get("/chat/active", headers=_session_headers())
+    events = [c for c in captured if c.get("event") == "web.chat.active_probed"]
+    assert len(events) == 1
+    assert events[0]["session_key"] is None
+    assert "nothing to resume" in events[0]["detail"]

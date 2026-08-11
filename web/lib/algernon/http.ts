@@ -9,13 +9,24 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly detail?: string;
+  /**
+   * The server's own verdict on whether resending can help (#94).
+   *
+   * `undefined` when the response carried none — the common case, and NOT the
+   * same as `false`. The classifier that sets it (`telegram/api_errors.py`)
+   * abstains on anything it does not recognise, so absence means "no opinion",
+   * which the caller resolves with its own fallback. Collapsing absent into
+   * `false` here would silently make every unclassified failure permanent.
+   */
+  readonly retryable?: boolean;
 
-  constructor(status: number, code: string, detail?: string) {
+  constructor(status: number, code: string, detail?: string, retryable?: boolean) {
     super(detail ? `${code}: ${detail}` : code);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.detail = detail;
+    this.retryable = retryable;
   }
 }
 

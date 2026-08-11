@@ -48,6 +48,19 @@ export type StreamDoneEvent = ChatTurnResponse;
 export interface StreamErrorEvent {
   error: string;
   detail?: string;
+  // The server's retryability verdict (#94), present when the engine-error
+  // classifier recognised the failure. Absent means it abstained — which is
+  // NOT the same as false; the client falls back to its own code list.
+  retryable?: boolean;
+}
+
+// GET /chat/active → the caller's live session key, or null when there is none
+// (#94c). An explicit null, NOT a 404: "you have no session" is a normal answer
+// to a normal question, and a 404 would push the client back toward treating
+// absence as an error — the reflex that produced the open-storm.
+export interface ChatActiveResponse {
+  session_key: string | null;
+  turns: number;
 }
 
 // GET /chat/history/{session_key} → { turns: [...] }

@@ -59,6 +59,35 @@ class WebIdentity:
     synthetic_chat_id: int
 
 
+def is_web_chat_id(chat_id: int | str) -> bool:
+    """True when ``chat_id`` is a WEB session key, not a Telegram one (#94).
+
+    Reads the reserved band directly rather than requiring a marker stashed on
+    the session dict, and that choice is load-bearing rather than stylistic:
+    the sessions that most need to be recognised are the ones already OPEN when
+    a new build starts — opened by the previous binary, which stashed no such
+    marker. A stash-based test would close exactly those sessions one last
+    time, on the very deploy that ships the fix. The band is a property of the
+    id itself, so it answers correctly for a session opened at any point in the
+    past.
+
+    Safe because the band is reserved and collision-proof in both directions
+    (see the module docstring): no Telegram id reaches ``9e15``, and every
+    synthetic id is minted inside ``[BASE, BASE + SPAN)``.
+
+    Tolerates a string because ``StateManager`` keys ``active_sessions`` by
+    ``str(chat_id)``, so every sweep iterates strings. A value that is not an
+    integer at all is NOT a web session — the honest answer for a corrupt key,
+    and it routes such an entry to the Telegram path, which already logs and
+    skips what it cannot parse.
+    """
+    try:
+        value = int(chat_id)
+    except (TypeError, ValueError):
+        return False
+    return WEB_USER_ID_BASE <= value < WEB_USER_ID_BASE + WEB_USER_ID_SPAN
+
+
 def synthetic_chat_id(name: str) -> int:
     """Map a web-user name to its stable synthetic session id.
 

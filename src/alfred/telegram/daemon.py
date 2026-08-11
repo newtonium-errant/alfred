@@ -316,12 +316,38 @@ async def _close_open_sessions_on_shutdown(
     pushback_level: null`` while the other three close paths (bot
     ``/end``, timeout sweeper, startup sweep) all read the stash.
 
+    WEB SESSIONS ARE PRESERVED, NOT CLOSED (#94). A deploy restart used to
+    sever the operator's live browser conversation: this sweep closed the
+    session with ``close_reason=shutdown``, the client's stored key then 404'd,
+    and the PWA showed "conversation has ended" — losing a reply he had already
+    composed. Three restarts hit one conversation window on 2026-08-11.
+
+    Telegram has no equivalent exposure: its client holds no session key and
+    the next message simply opens a session. The browser DOES hold a key, so
+    for it a shutdown-close is indistinguishable from the conversation being
+    deliberately ended.
+
+    Preserving costs nothing, because the survival machinery already exists:
+    ``StateManager`` persists ``active_sessions`` atomically after every turn,
+    and ``resolve_on_startup`` closes only sessions that have EXCEEDED the idle
+    gap — one active seconds before a restart is left in place and reused. So
+    the whole fix is to stop deleting it on the way out. Idle-timeout semantics
+    are untouched in both sweepers: a web session abandoned for the gap still
+    closes normally, on the same cadence as before.
+
     Returns the vault-relative paths of the records written.
     """
+    from alfred.web.identity import is_web_chat_id
+
     closed_paths: list[str] = []
+    preserved: list[str] = []
     active_all = dict(state_mgr.state.get("active_sessions", {}) or {})
     for chat_id_str in list(active_all.keys()):
         raw_sess = active_all[chat_id_str]
+        if is_web_chat_id(chat_id_str):
+            # Left in ``active_sessions`` deliberately — see above.
+            preserved.append(chat_id_str)
+            continue
         vault_root = raw_sess.get("_vault_path_root") or config.vault.path
         user_path = raw_sess.get("_user_vault_path") or (
             config.primary_users[0] if config.primary_users else None
@@ -386,6 +412,35 @@ async def _close_open_sessions_on_shutdown(
                 "talker.daemon.shutdown_substance_slug_failed",
                 chat_id=chat_id_str,
             )
+
+    # Persist explicitly. The state file is already current (every turn saves),
+    # but the sweep above popped the Telegram sessions from the in-memory dict
+    # via ``close_session``, and only a save makes that deletion durable
+    # alongside the web sessions we are keeping. Without it, the preserved set
+    # would be correct and the closed set would come back from the dead on the
+    # next boot.
+    try:
+        state_mgr.save()
+    except Exception:  # noqa: BLE001 — never block shutdown on a state write
+        log.exception("talker.daemon.shutdown_state_save_failed")
+
+    # Intentionally-left-blank: fires on EVERY shutdown, including the zero
+    # case. "No web session survived this restart" and "the preserve branch
+    # stopped running" are different facts, and without a line for the first
+    # one they look identical in the log — which is exactly how this defect
+    # went unnoticed while three restarts severed a live conversation.
+    log.info(
+        "talker.daemon.web_sessions_preserved",
+        preserved=len(preserved),
+        chat_ids=preserved,
+        closed_telegram=len(closed_paths),
+        detail=(
+            "web sessions carried across the restart — the browser's stored "
+            "key stays valid and history-resume finds the conversation alive"
+            if preserved else
+            "ran, nothing to preserve — no web session was active at shutdown"
+        ),
+    )
     return closed_paths
 
 
@@ -569,6 +624,33 @@ async def run(
     closed = session.resolve_on_startup(state_mgr, now, gap)
     if closed:
         log.info("talker.daemon.startup_sweep", closed=len(closed))
+
+    # The other half of #94's survival signal, reported from the BOOT side.
+    # The shutdown line says what was preserved; this says what actually came
+    # back, and only the pair proves the round trip — a session preserved into
+    # a state file that then failed to load would leave the shutdown line
+    # cheerful and the operator staring at "conversation has ended".
+    #
+    # Counted AFTER the startup sweep on purpose, so the number is sessions
+    # genuinely resumable now, not sessions that existed a moment ago and have
+    # just been closed for being idle.
+    from alfred.web.identity import is_web_chat_id
+
+    surviving_web = [
+        cid for cid in (state_mgr.state.get("active_sessions", {}) or {})
+        if is_web_chat_id(cid)
+    ]
+    log.info(
+        "talker.daemon.web_sessions_resumed",
+        resumed=len(surviving_web),
+        chat_ids=surviving_web,
+        detail=(
+            "web sessions survived the restart and are resumable — a browser "
+            "holding one of these keys reconnects without noticing"
+            if surviving_web else
+            "ran, nothing to resume — no web session was carried across"
+        ),
+    )
 
     # Dangling-tool_use detector (P2 from QA 2026-05-04). Walks every
     # surviving active session's transcript; logs a warning per

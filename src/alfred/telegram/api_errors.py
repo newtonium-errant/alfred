@@ -35,6 +35,20 @@ from typing import Any
 # unknown one silently renders the generic fallback.
 CODE_IMAGE_TOO_LARGE = "image_too_large"
 
+#: An UPSTREAM failure at Anthropic — a 5xx / ``api_error`` / overloaded. The
+#: opposite of ``image_too_large`` in the only way that matters to the operator:
+#: retrying is exactly the right move, because nothing about the request is
+#: wrong. Two Anthropic 500s at 03:32:49 and 03:33:11Z on 2026-08-11
+#: (req_011CdvFpoMNP77eBm93fwrLk, req_011CdvFtEjvkX7M3Wx3Pg9LD) killed a
+#: session's turns and the client cleared the pending turn with no retry
+#: affordance — the operator recovered by typing "Try now" by hand.
+CODE_ENGINE_UNAVAILABLE = "engine_unavailable"
+
+#: Upstream statuses that mean "the request was fine, the service was not".
+#: 429 is included deliberately: rate-limiting is transient by construction and
+#: a resend after a moment is the correct response to it.
+_TRANSIENT_UPSTREAM_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
+
 
 @dataclass(frozen=True)
 class EngineErrorClassification:
@@ -82,9 +96,49 @@ def _is_image_dimension_error(text: str) -> bool:
     return "many-image" in lowered or "many image" in lowered
 
 
+def _upstream_status(exc: BaseException) -> int | None:
+    """The HTTP status Anthropic returned, when the exception carries one.
+
+    Read off the attribute rather than the class name: the SDK's exception
+    hierarchy (``APIStatusError`` and its subclasses) is free to change, and
+    every one of them exposes ``status_code``. Matching on class names would be
+    a second thing to keep in sync with a library we do not control.
+    """
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _is_transient_upstream(exc: BaseException) -> bool:
+    """True for an upstream failure that a resend can plausibly clear.
+
+    Status FIRST, text second. A 500 is a 500 whatever its prose says, and the
+    message wording is the part Anthropic can change without notice — the same
+    reasoning that keeps ``_is_image_dimension_error`` off a full-string match.
+
+    The text fallback exists for SDK errors that carry no status: a connection
+    reset or a read timeout mid-request is transient in exactly the same way,
+    and refusing to classify it would leave the operator with a cleared turn
+    and no retry button for the most obviously retryable failure there is.
+    """
+    status = _upstream_status(exc)
+    if status is not None:
+        return status in _TRANSIENT_UPSTREAM_STATUSES
+    name = exc.__class__.__name__.lower()
+    return (
+        "overloaded" in name
+        or "apiconnection" in name
+        or "apitimeout" in name
+        or "internalserver" in name
+    )
+
+
 def classify_engine_error(exc: BaseException) -> EngineErrorClassification | None:
     """Classify ``exc``, or return ``None`` to leave it to generic handling."""
     text = extract_error_text(exc)
+    # Deterministic causes are checked FIRST. A request can be both malformed
+    # and unlucky, and telling the operator to retry something that cannot
+    # succeed is the exact harm this module was written to stop — so a
+    # recognised deterministic failure must never be masked by a transient one.
     if _is_image_dimension_error(text):
         return EngineErrorClassification(
             code=CODE_IMAGE_TOO_LARGE,
@@ -97,6 +151,17 @@ def classify_engine_error(exc: BaseException) -> EngineErrorClassification | Non
             ),
             retryable=False,
         )
+    if _is_transient_upstream(exc):
+        status = _upstream_status(exc)
+        return EngineErrorClassification(
+            code=CODE_ENGINE_UNAVAILABLE,
+            message=(
+                "The assistant's engine was briefly unavailable"
+                + (f" (upstream {status})" if status else "")
+                + ". Nothing is wrong with your message — send it again."
+            ),
+            retryable=True,
+        )
     return None
 
 
@@ -106,6 +171,7 @@ def classification_payload(c: EngineErrorClassification) -> dict[str, Any]:
 
 
 __all__ = [
+    "CODE_ENGINE_UNAVAILABLE",
     "CODE_IMAGE_TOO_LARGE",
     "EngineErrorClassification",
     "classification_payload",
