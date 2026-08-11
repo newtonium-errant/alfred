@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { readDisplayIdentity, resolveSessionToken } from '../../../lib/algernon/identity';
-import { callTransportBatch, isBatchConfigured } from '../../../lib/algernon/transport';
+import { callTransportBatch, listBatchTargets } from '../../../lib/algernon/transport';
 import { sendTransportError } from '../../../lib/algernon/bffError';
 
 // POST /api/batch/submit → relays a multipart bulk scan submission to the box's
@@ -69,10 +69,29 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  if (!isBatchConfigured()) {
+  // Which instance (#90). The selector rides the QUERY STRING, not the body:
+  // this route's body is raw multipart bytes with the parser off, so reading a
+  // form field would mean parsing the multipart here — the exact second
+  // implementation the byte-pipe design exists to avoid.
+  const rawTarget = req.query.target;
+  const target = (Array.isArray(rawTarget) ? rawTarget[0] : rawTarget || '').trim();
+
+  // Validate against the CONFIGURED list before touching any env, so a bogus
+  // name cannot probe which instances exist. An empty selector means home.
+  const targets = listBatchTargets();
+  if (targets.length === 0) {
     // Fail-closed and NAMED: "not wired up here" is a different fact from "the
     // instance refused you", and the operator can act on only one of them.
     return res.status(503).json({ error: 'transport_misconfigured' });
+  }
+  const chosen = target
+    ? targets.find((t) => t.name.toUpperCase() === target.toUpperCase())
+    : targets.find((t) => t.home) || targets[0];
+  if (!chosen) {
+    // NAMES the instance. "Unknown target" alone would leave the operator
+    // guessing whether they mistyped it or it was never configured, and the
+    // answer is the same env pair either way.
+    return res.status(400).json({ error: 'unknown_target', target });
   }
 
   const contentType = req.headers['content-type'] || '';
@@ -92,6 +111,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       body,
       contentType,
       user: identity.name,
+      target: chosen.name,
     });
     return res.status(status).json(respBody ?? {});
   } catch (e) {

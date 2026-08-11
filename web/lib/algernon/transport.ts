@@ -10,6 +10,7 @@
 //   - X-Alfred-Session: <instance-signed session token>   (verified server-side)
 // The /auth/* routes carry NO session token (the user isn't signed in yet).
 
+import { HOME_INSTANCE_NAME, isHomeInstance } from './instance';
 import { STT_IDEMPOTENCY_HEADER } from './schemas';
 
 // The peer/client name the transport knows this front-end by. Must match the
@@ -268,9 +269,106 @@ function batchToken(): string {
   return token;
 }
 
-/** True when this deploy is wired for bulk upload (fail-closed: needs BOTH). */
+/** True when the HOME instance is wired for bulk upload (needs BOTH). */
 export function isBatchConfigured(): boolean {
   return Boolean(process.env.ALFRED_WEB_TRANSPORT_URL && process.env.ALFRED_WEB_BATCH_TOKEN);
+}
+
+// --- Per-instance batch targets (#90) ---------------------------------------
+// Mirrors the chat + ingest target families, with its OWN env prefix and its own
+// per-instance token:
+//   ALFRED_WEB_BATCH_<NAME>_URL    — that instance's transport base URL
+//   ALFRED_WEB_BATCH_<NAME>_TOKEN  — that instance's dedicated `web_batch` token
+//   ALFRED_WEB_BATCH_<NAME>_LABEL  — (optional) display label; defaults to <NAME>
+// Fail-closed: a target counts as configured only when BOTH URL and token are
+// present, so a half-finished deploy never appears in the picker.
+//
+// WHERE THIS DIFFERS FROM THE CHAT FAMILY, deliberately. Chat excludes the home
+// instance from its target list because home rides the SESSION path — a
+// genuinely different auth mechanism, so relay env for home would be a
+// misconfiguration. Batch has no such split: every target, home included, is
+// reached with a `web_batch` peer token. So home IS resolvable here, from the
+// unprefixed ALFRED_WEB_BATCH_TOKEN pair, and the picker's default. One
+// resolution path for every instance is simpler than two, and it is available
+// precisely because the auth story is uniform.
+const BATCH_ENV_PREFIX = 'ALFRED_WEB_BATCH_';
+
+export interface BatchTargetMeta {
+  name: string;
+  label: string;
+  home: boolean;
+}
+
+/**
+ * Every batch target the operator can submit to: the home instance (when
+ * configured) plus each fully-configured `ALFRED_WEB_BATCH_<NAME>_*` pair.
+ * Metadata ONLY — never a URL or token. Home first, then the rest by label.
+ *
+ * An empty list is a real answer (nothing wired), and the page renders an
+ * explicit empty state for it rather than an inert picker.
+ */
+export function listBatchTargets(): BatchTargetMeta[] {
+  const out: BatchTargetMeta[] = [];
+  if (isBatchConfigured()) {
+    out.push({ name: HOME_INSTANCE_NAME, label: HOME_INSTANCE_NAME, home: true });
+  }
+  const cross: BatchTargetMeta[] = [];
+  const seen = new Set<string>();
+  for (const key of Object.keys(process.env)) {
+    const m = key.match(/^ALFRED_WEB_BATCH_([A-Z0-9_]+)_URL$/);
+    if (!m) continue;
+    const name = m[1];
+    if (seen.has(name)) continue;
+    const url = process.env[`${BATCH_ENV_PREFIX}${name}_URL`];
+    const token = process.env[`${BATCH_ENV_PREFIX}${name}_TOKEN`];
+    if (!url || !url.trim() || !token || !token.trim()) continue; // fail-closed
+    // A per-instance pair naming the HOME instance would shadow the unprefixed
+    // home pair with a second source of truth for the same target. Dropped, so
+    // "which env did this use?" always has one answer.
+    if (name.toUpperCase() === HOME_INSTANCE_NAME.toUpperCase()) continue;
+    seen.add(name);
+    const label = (process.env[`${BATCH_ENV_PREFIX}${name}_LABEL`] || name).trim();
+    cross.push({ name, label, home: false });
+  }
+  cross.sort((a, b) => a.label.localeCompare(b.label));
+  return [...out, ...cross];
+}
+
+/**
+ * Resolve a batch target name to its server-side URL + token.
+ *
+ * An empty / home name resolves to the home pair; anything else to that
+ * instance's prefixed pair. Throws `TransportConfigError` when the env is
+ * missing — the BFF validates the name against `listBatchTargets()` FIRST and
+ * answers `unknown_target`, so reaching a throw here means a target that was
+ * listed and then could not be resolved, which is a server misconfiguration
+ * rather than a client error.
+ */
+export function resolveBatchTarget(name: string): ResolvedChatTarget {
+  if (isHomeInstance(name)) {
+    return {
+      baseUrl: baseUrl().replace(/\/+$/, ''),
+      token: batchToken(),
+      client: BATCH_PEER_CLIENT,
+    };
+  }
+  if (!isValidTargetName(name)) {
+    throw new TransportConfigError(`invalid batch target name: ${name}`);
+  }
+  const key = name.toUpperCase();
+  const url = process.env[`${BATCH_ENV_PREFIX}${key}_URL`];
+  const token = process.env[`${BATCH_ENV_PREFIX}${key}_TOKEN`];
+  if (!url || !url.trim()) {
+    throw new TransportConfigError(`${BATCH_ENV_PREFIX}${key}_URL is not set`);
+  }
+  if (!token || !token.trim()) {
+    throw new TransportConfigError(`${BATCH_ENV_PREFIX}${key}_TOKEN is not set`);
+  }
+  return {
+    baseUrl: url.replace(/\/+$/, ''),
+    token,
+    client: BATCH_PEER_CLIENT,
+  };
 }
 
 export interface BatchCallOptions {
@@ -280,6 +378,12 @@ export interface BatchCallOptions {
   contentType: string;
   /** Verified display name → X-Alfred-Batch-User (provenance only, never authz). */
   user?: string;
+  /**
+   * Which instance to submit to (#90). Absent / home → the home pair; any
+   * other name → that instance's own URL + `web_batch` token. The BFF has
+   * already validated the name against `listBatchTargets()`.
+   */
+  target?: string;
 }
 
 /**
@@ -299,9 +403,12 @@ export async function callTransportBatch(
   path: string,
   opts: BatchCallOptions,
 ): Promise<TransportResult> {
+  // One resolution path for every instance, home included (#90) — see
+  // `resolveBatchTarget` for why batch can do that where chat cannot.
+  const resolved = resolveBatchTarget(opts.target || '');
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${batchToken()}`,
-    'X-Alfred-Client': BATCH_PEER_CLIENT,
+    Authorization: `Bearer ${resolved.token}`,
+    'X-Alfred-Client': resolved.client,
     Accept: 'application/json',
     'Content-Type': opts.contentType,
   };
@@ -309,7 +416,7 @@ export async function callTransportBatch(
     headers['X-Alfred-Batch-User'] = opts.user;
   }
 
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await fetch(`${resolved.baseUrl}${path}`, {
     method: 'POST',
     headers,
     // Re-wrap so the body is a plain ArrayBuffer view — undici rejects a Node

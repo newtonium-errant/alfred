@@ -115,6 +115,19 @@ export interface NotificationsAckResponse {
 // Clearing, not reading: the entry stops being listed anywhere (tray AND the
 // daily brief) while staying in the store for audit. Idempotent — re-dismissing
 // dismisses 0 and never errors.
+// GET /api/batch/targets → the instances a scan batch can be sent to (#90).
+// `home` marks the deployment's own instance (the default). Metadata only — no
+// URL or token ever reaches the browser.
+export interface BatchTarget {
+  name: string;
+  label: string;
+  home: boolean;
+}
+
+export interface BatchTargetsResponse {
+  targets: BatchTarget[];
+}
+
 export interface NotificationsDismissResponse {
   dismissed: number;
   unread: number;
