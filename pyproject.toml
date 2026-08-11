@@ -67,6 +67,27 @@ scribe-diarize = [
     "torch>=2.2,<2.6",
     "torchaudio>=2.2,<2.6",
 ]
+# Jeeves garage ambient scribe (task #81) — LOCAL wake-word detection on the
+# capture device. openWakeWord runs a small ONNX/TFLite acoustic model on the
+# raw mic stream so that ONLY cued windows ever reach cloud STT; it is the
+# dependency that makes the privacy fence real (and, incidentally, makes the
+# thing ~100x cheaper than streaming the room).
+#
+# CAPTURE-DEVICE ONLY — deliberately NOT in [all], for the same reason
+# [scribe-diarize] is not: this belongs in the venv of the one box with a
+# microphone (tablet / Pi), not on every instance that merely RECEIVES a
+# capture. The receiving side (the transport intake route + the jeeves vault
+# scope) needs none of it. CI needs none of it either: the detector is a seam
+# with a deterministic fake (``jeeves.wake.ScriptedWakeDetector``), so the
+# suite exercises the whole capture chain without this extra and without any
+# model files in the repo.
+#
+# The wake-word model itself is a FILE, not a dependency — it is downloaded /
+# trained per device and pointed at by ``jeeves.wake.model_path``. No model
+# binaries live in this repo.
+jeeves = [
+    "openwakeword>=0.6",
+]
 surveyor = [
     # PINNED 2026-06-25: >=2.4 let the box's fresh install grab pymilvus 3.0 /
     # milvus-lite 3.0 (directory-based), which cannot open the existing 2.5.1

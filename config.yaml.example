@@ -1935,3 +1935,93 @@ scaffold:
 #       # still renders all of them, so nothing is lost by trimming the prompt.
 #       # 0 disables the context entirely (each scan judged on its own).
 #       carried_context_max_chars: 8000
+
+# ---------------------------------------------------------------------------
+# Jeeves — the garage ambient scribe (task #81)
+# ---------------------------------------------------------------------------
+# A capture APPLIANCE, not an agent. It listens continuously and LOCALLY, and
+# sends only CUED windows to cloud STT. Non-cued audio dies with the RAM ring
+# and is never written to disk.
+#
+# ENTIRELY OPTIONAL AND INERT BY DEFAULT. Omit this block and nothing changes:
+# mode resolves to synthetic, the wake provider is "off" (the detector never
+# fires), and the route target is unset (a ROUTE cue stays local). Every
+# instance that has no microphone attached should leave it out.
+#
+# TWO CONFIGS, NOT ONE. The capture DEVICE (tablet / Pi) needs this whole
+# block plus the [jeeves] pip extra. The RECEIVING instance needs only
+# `transport.jeeves.enabled` plus a `jeeves` peer token under `transport.auth`
+# — no ring, no wake model, no STT key.
+#
+# jeeves:
+#   # FAIL-CLOSED. Only the exact string "live" lets real garage audio be
+#   # processed; anything else (including absent) is "synthetic", which
+#   # accepts only captures tagged synthetic:true. Flip it once the device is
+#   # actually deployed — one deliberate edit, nothing else hard-codes it.
+#   mode: synthetic
+#
+#   ring:
+#     # 30 minutes, ratified (ruling 5) and to be revisited against
+#     # `lookback_used_seconds` telemetry after ~4 weeks of real use — NOT on
+#     # a handful of captures. At the defaults below this is ~57 MB of RAM.
+#     seconds: 1800
+#     sample_rate: 16000    # openWakeWord's native rate; also Whisper's
+#     sample_width: 2       # 16-bit PCM
+#     channels: 1
+#
+#   wake:
+#     # off (default, never fires) | fake (deterministic, CI) | openwakeword
+#     provider: "openwakeword"
+#     # REQUIRED for the openwakeword provider — an empty path is a loud
+#     # refusal at startup, never a silently deaf device.
+#     model_path: "/opt/jeeves/models/jeeves.onnx"
+#     threshold: 0.5
+#     # One spoken wake word spans several model frames, so a raw detector
+#     # emits a burst. This suppresses re-fires (and the duplicate STT spend).
+#     refractory_seconds: 2.0
+#     wake_word: "jeeves"
+#     # The CLOSED confusion set the Q6 trial measured over a bass line. Used
+#     # only to tag telemetry, never to gate a capture.
+#     confusable_terms: [cheese, leaves, jesus, jeeps, eaves]
+#
+#   window:
+#     lookback_seconds: 45          # the retrospective default (a GUESS —
+#                                   #   the telemetry is how it stops being one)
+#     extended_lookback_seconds: 120  # "Jeeves, note the last couple of minutes"
+#     silence_seconds: 3.0          # contiguous silence that ends the lookahead
+#     max_lookahead_seconds: 60
+#     # Ceiling on a SPOKEN modifier. A mis-heard "the last thirty minutes"
+#     # would otherwise upload most of the ring in one call.
+#     max_lookback_seconds: 300
+#     # A lounge with music has a HIGH noise floor — this is the field-tuned
+#     # number, which is why it is config and not a constant.
+#     silence_rms_threshold: 0.01
+#
+#   stt:
+#     api_key: "${GROQ_API_KEY}"
+#     model: whisper-large-v3
+#     language: en
+#     timeout_seconds: 30
+#     vocab_terms: []
+#     # Point this at the instance's #54 decided-vocab store to inherit every
+#     # operator-APPROVED learned term. Empty = static vocab_terms only, and
+#     # the STT layer says so in the log rather than leaving it ambiguous.
+#     vocab_decided_path: ""
+#
+#   cues:
+#     # REQUIRED to arm the ROUTE verb. Empty leaves ROUTE inert: "tell
+#     # <someone>" is recognised as a route ATTEMPT, logged with its reason,
+#     # and the transcript stays on the device. Naming the target explicitly
+#     # is the asymmetry that makes ROUTE the marked, deliberate verb.
+#     route_target: "salem"
+#     route_aliases: []
+#
+#   # Both default to <logging.dir>/jeeves/… — per-instance, never a shared
+#   # ./data literal. telemetry.jsonl is CONTENT-FREE by construction;
+#   # marks.jsonl holds MARK-DOWN transcripts and is written 0600.
+#   telemetry_path: ""
+#   mark_log_path: ""
+#   # Empty (the default) = miss-report AUDIO is NEVER written to disk. Only
+#   # the transcript is kept. Retaining audio is a decision that has not been
+#   # made; this knob is where it would land.
+#   miss_audio_dir: ""
