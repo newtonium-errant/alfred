@@ -175,13 +175,56 @@ _BATCH_TOOL_SCHEMA: dict[str, Any] = {
 # --- Batch call ----------------------------------------------------------
 
 
+#: Stands in for one image the operator attached, in the flattened transcript.
+#:
+#: The structurer cannot SEE images (there is no vision on this path), so this
+#: marker asserts exactly one thing: an attachment ARRIVED at this point in the
+#: session. Never what it depicted. One marker per image block, so counting them
+#: is how the structurer knows four screenshots came through and two did not.
+#:
+#: THE PROMPT LAYER QUOTES THIS STRING VERBATIM. The (a) instruction in
+#: ``_BATCH_SYSTEM_PROMPT`` tells the model what the marker means, so the literal
+#: here and the literal there must match exactly — a rename that updates only one
+#: side leaves the model reading a token it was never told about. Exported as a
+#: named constant (rather than inlined below) so the prompt can cite it by
+#: import path and a test can pin the pair.
+IMAGE_MARKER = "[image attached]"
+
+
 def _flatten_transcript(transcript: list[dict[str, Any]]) -> str:
     """Render the transcript as a plain-text monologue for Sonnet.
 
-    Capture sessions are user-only for the conversational turns (the
-    bot stayed silent), so the flattener concatenates user turn content
-    with timestamps. Assistant turns shouldn't exist in a capture
-    session but we skip them defensively if present.
+    Capture sessions are user-only for the conversational turns (the bot stayed
+    silent), so the flattener concatenates user turn content with timestamps.
+    Assistant turns shouldn't exist in a capture session but we skip them
+    defensively if present.
+
+    ## Multimodal turns (#96 — the #64 incident's first cause)
+
+    This used to ``continue`` on ANY list content, with a comment saying the
+    lists were tool_results. That was true when it was written and false by the
+    time it mattered: ``vision.build_user_content`` returns a LIST whenever the
+    turn carries images, so a captioned photo turn took the tool_result branch
+    and vanished **whole** — caption included.
+
+    The cost was the motivating #64 case. The operator said he would attach
+    workout-plan screenshots, then attached four of six IN THE SAME SESSION.
+    Every one of those turns was a list, so the structurer saw no captions and
+    no attachments at all, and emitted the promise as a fresh open task while
+    the evidence for closing it sat in the same transcript.
+
+    So a list is now WALKED, mirroring
+    ``session._format_transcript_for_substance``: ``text`` blocks are joined
+    (captions survive) and each ``image`` block contributes one
+    :data:`IMAGE_MARKER`. Blocks of any other type — ``tool_result`` above all —
+    still contribute nothing, so the original intent is preserved rather than
+    overturned; a turn that is PURELY tool_result yields no text and is skipped
+    exactly as before.
+
+    What this does NOT do is let the structurer see the images. A marker is
+    evidence that something arrived, not evidence of what it was — a distinction
+    the prompt layer states explicitly, because inferring content from a count
+    is the failure mode this invites.
     """
     lines: list[str] = []
     for turn in transcript:
@@ -192,8 +235,20 @@ def _flatten_transcript(transcript: list[dict[str, Any]]) -> str:
         if isinstance(content, str):
             text = content.strip()
         elif isinstance(content, list):
-            # tool_result and other block lists — ignore in capture mode.
-            continue
+            chunks: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    btext = (block.get("text") or "").strip()
+                    if btext:
+                        chunks.append(btext)
+                elif btype == "image":
+                    chunks.append(IMAGE_MARKER)
+            # Image-then-text is build_user_content's order; markers therefore
+            # lead the caption, which reads the way the turn happened.
+            text = " ".join(chunks).strip()
         else:
             text = str(content)
         if not text:

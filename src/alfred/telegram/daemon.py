@@ -444,6 +444,40 @@ async def _close_open_sessions_on_shutdown(
     return closed_paths
 
 
+def log_web_sessions_resumed(state_mgr: "StateManager") -> list[str]:
+    """Emit the BOOT half of #94's survival signal. Returns the surviving keys.
+
+    Extracted from ``run()`` (#96 part 4) for one reason: the shutdown half is a
+    callable function and this half was not, so the PAIR could not be compared —
+    only each side visited separately. A test that asserts "shutdown said 2" and
+    separately "boot said 2" passes against a build where the two counted
+    DIFFERENT sessions; the round trip is the claim, so the round trip has to be
+    what gets driven.
+
+    Called AFTER the startup sweep so the number is sessions genuinely resumable
+    now, not sessions that existed a moment ago and have just been closed for
+    being idle.
+    """
+    from alfred.web.identity import is_web_chat_id
+
+    surviving_web = [
+        cid for cid in (state_mgr.state.get("active_sessions", {}) or {})
+        if is_web_chat_id(cid)
+    ]
+    log.info(
+        "talker.daemon.web_sessions_resumed",
+        resumed=len(surviving_web),
+        chat_ids=surviving_web,
+        detail=(
+            "web sessions survived the restart and are resumable — a browser "
+            "holding one of these keys reconnects without noticing"
+            if surviving_web else
+            "ran, nothing to resume — no web session was carried across"
+        ),
+    )
+    return surviving_web
+
+
 def _classify_transport_task_outcome(
     *,
     cancelled: bool,
@@ -634,23 +668,7 @@ async def run(
     # Counted AFTER the startup sweep on purpose, so the number is sessions
     # genuinely resumable now, not sessions that existed a moment ago and have
     # just been closed for being idle.
-    from alfred.web.identity import is_web_chat_id
-
-    surviving_web = [
-        cid for cid in (state_mgr.state.get("active_sessions", {}) or {})
-        if is_web_chat_id(cid)
-    ]
-    log.info(
-        "talker.daemon.web_sessions_resumed",
-        resumed=len(surviving_web),
-        chat_ids=surviving_web,
-        detail=(
-            "web sessions survived the restart and are resumable — a browser "
-            "holding one of these keys reconnects without noticing"
-            if surviving_web else
-            "ran, nothing to resume — no web session was carried across"
-        ),
-    )
+    log_web_sessions_resumed(state_mgr)
 
     # Dangling-tool_use detector (P2 from QA 2026-05-04). Walks every
     # surviving active session's transcript; logs a warning per

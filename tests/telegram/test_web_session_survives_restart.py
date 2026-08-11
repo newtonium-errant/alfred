@@ -315,3 +315,97 @@ def test_the_round_trip_end_to_end(state_mgr, talker_config) -> None:
     resumed = booted.get_active(WEB_CHAT_ID)
     assert resumed is not None, "the conversation did not survive the restart"
     assert resumed["session_id"] == f"sess-{WEB_CHAT_ID}"
+
+
+# ---------------------------------------------------------------------------
+# #96 part 4 — the two survival SIGNALS must agree (reviewer-60 WARN-1)
+# ---------------------------------------------------------------------------
+#
+# The round-trip test above proves the SESSION survives. These prove the LOG
+# does — and specifically that the two halves agree with each other.
+#
+# WHY THE PAIR AND NOT EACH HALF. The shutdown line says what was preserved;
+# the boot line says what came back. A test that asserts "shutdown said 1" and
+# separately "boot said 1" passes against a build where the two counted
+# DIFFERENT sessions — the round trip is the claim, so the comparison has to be
+# between the two reports, not between each report and a literal.
+#
+# What the operator loses without this: the shutdown line stays cheerful while
+# the boot line reports nothing resumable, and the only place that disagreement
+# is visible is in a log nobody diffs. That is the shape #94 shipped as WARN-1.
+
+def _events(captured: list[dict], event: str) -> list[dict]:
+    return [c for c in captured if c.get("event") == event]
+
+
+def test_the_preserved_and_resumed_signals_agree(state_mgr, talker_config) -> None:
+    """Same chat_ids out of the boot line as went into the shutdown line."""
+    import asyncio
+
+    from alfred.telegram.daemon import log_web_sessions_resumed
+    from alfred.telegram.state import StateManager
+
+    _seed(state_mgr, talker_config, WEB_CHAT_ID, minutes_ago=1)
+    _seed(state_mgr, talker_config, TELEGRAM_CHAT_ID, minutes_ago=1)
+
+    with structlog.testing.capture_logs() as shutdown_logs:
+        asyncio.run(
+            _close_open_sessions_on_shutdown(state_mgr, talker_config, client=None)
+        )
+
+    booted = StateManager(state_mgr.path)   # the next process
+    booted.load()
+    session_mod.resolve_on_startup(
+        booted, datetime.now(timezone.utc), gap_seconds=3600,
+    )
+    with structlog.testing.capture_logs() as boot_logs:
+        log_web_sessions_resumed(booted)
+
+    preserved = _events(shutdown_logs, "talker.daemon.web_sessions_preserved")
+    resumed = _events(boot_logs, "talker.daemon.web_sessions_resumed")
+    assert len(preserved) == 1 and len(resumed) == 1
+
+    # THE AGREEMENT. Compared to each other, not to a literal.
+    assert resumed[0]["chat_ids"] == preserved[0]["chat_ids"]
+    assert resumed[0]["resumed"] == preserved[0]["preserved"]
+    # ...and non-empty, so the equality above is not two empty lists agreeing.
+    assert preserved[0]["preserved"] == 1
+    assert str(WEB_CHAT_ID) in resumed[0]["chat_ids"]
+    # The Telegram session was closed, so it must appear in NEITHER.
+    assert str(TELEGRAM_CHAT_ID) not in resumed[0]["chat_ids"]
+
+
+def test_both_signals_fire_on_the_zero_case(state_mgr, talker_config) -> None:
+    """The ILB twin: nothing to preserve and nothing to resume both SAY so.
+
+    "No web session survived" and "the branch stopped running" are different
+    facts that look identical in a silent log — which is how the original defect
+    went unnoticed across three restarts.
+    """
+    import asyncio
+
+    from alfred.telegram.daemon import log_web_sessions_resumed
+    from alfred.telegram.state import StateManager
+
+    _seed(state_mgr, talker_config, TELEGRAM_CHAT_ID, minutes_ago=1)
+
+    with structlog.testing.capture_logs() as shutdown_logs:
+        asyncio.run(
+            _close_open_sessions_on_shutdown(state_mgr, talker_config, client=None)
+        )
+    booted = StateManager(state_mgr.path)
+    booted.load()
+    with structlog.testing.capture_logs() as boot_logs:
+        log_web_sessions_resumed(booted)
+
+    preserved = _events(shutdown_logs, "talker.daemon.web_sessions_preserved")
+    resumed = _events(boot_logs, "talker.daemon.web_sessions_resumed")
+
+    assert len(preserved) == 1, "the shutdown half went silent on the zero case"
+    assert len(resumed) == 1, "the boot half went silent on the zero case"
+    assert preserved[0]["preserved"] == 0
+    assert resumed[0]["resumed"] == 0
+    assert resumed[0]["chat_ids"] == preserved[0]["chat_ids"] == []
+    # Each names its own state rather than sharing one vague sentence.
+    assert "nothing to preserve" in preserved[0]["detail"]
+    assert "nothing to resume" in resumed[0]["detail"]
