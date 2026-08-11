@@ -423,3 +423,47 @@ def test_no_cwd_relative_voice_calibration_literal_survives_at_the_call_sites() 
     source = Path(rv.__file__).read_text(encoding="utf-8")
     assert '"./data/voice_calibration"' not in source
     assert "'./data/voice_calibration'" not in source
+
+
+# ===========================================================================
+# Leaker 1, second writer — the scribe eval harness's default config
+# ===========================================================================
+#
+# Anchoring scribe.input_dir (above) moved the notegen sink but NOT the
+# negation-candidate sink, because a SECOND writer reaches it through a config
+# that names no data dir: alfred.scribe.eval.harness._default_config. The
+# full-suite run is what surfaced it — the per-file subset used to probe
+# leaker 1 never touched the eval path. Fourth distinct source in one batch.
+
+def test_scribe_eval_default_config_spools_outside_the_repo(tmp_path) -> None:
+    """``alfred scribe eval`` must not write into the operator's real spool.
+
+    This is a correctness pin, not just a debris pin. The candidate spool feeds
+    a SELF-CORRECTING loop — morning-review approves rows out of it into a
+    learned suppression glossary — so scoring synthetic eval fixtures through a
+    config resolving to the live spool would seed that glossary with
+    eval-fixture vocabulary. The fixture-seam CLI path (`alfred scribe eval`
+    with no --real) reaches this default, so on the box it wrote into
+    <data>/scribe/scribe/.
+    """
+    from pathlib import Path
+
+    from alfred.scribe.eval.harness import _default_config
+    from alfred.scribe.negation_suppression import resolve_candidates_dir
+
+    cand_dir = resolve_candidates_dir(_default_config())
+    repo_root = Path(__file__).resolve().parent.parent
+    # Not under the repo (the debris half) …
+    assert repo_root not in cand_dir.resolve().parents
+    assert cand_dir.resolve() != repo_root
+    # … and absolute, so it cannot follow the process cwd around (the half a
+    # debris guard run from one directory would never notice).
+    assert cand_dir.is_absolute()
+
+
+def test_scribe_eval_scratch_dir_is_stable_within_a_process() -> None:
+    # Two configs must share one scratch dir — a fresh mkdtemp per call would
+    # litter the temp dir once per scored case.
+    from alfred.scribe.eval.harness import _default_config
+
+    assert _default_config().input_dir == _default_config().input_dir

@@ -17,7 +17,10 @@ same pipeline that ships (no eval-vs-prod drift).
 
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,10 +40,48 @@ class FixtureMissing(Exception):
     NOT silently score an empty (trivially-clean) note."""
 
 
+def _eval_scratch_dir() -> str:
+    """A private throwaway data dir for the fixture-eval config.
+
+    ``mkdtemp`` (0700, unguessable name) rather than a fixed ``/tmp`` path: this
+    box is PHI-adjacent, and a predictable shared spool location is a smell even
+    when — as here — only synthetic fixture data reaches it. Created once per
+    process, removed at exit.
+    """
+    global _EVAL_SCRATCH_DIR
+    if _EVAL_SCRATCH_DIR is None:
+        _EVAL_SCRATCH_DIR = tempfile.mkdtemp(prefix="alfred-scribe-eval-")
+        atexit.register(shutil.rmtree, _EVAL_SCRATCH_DIR, True)
+    return _EVAL_SCRATCH_DIR
+
+
+_EVAL_SCRATCH_DIR: str | None = None
+
+
 def _default_config() -> ScribeConfig:
-    """A minimal ScribeConfig sufficient for the deterministic composition
-    (``render_verified_note`` only reads ``config.diarize.purity_threshold``)."""
-    return load_from_unified({"scribe": {"mode": "synthetic", "stt": {"provider": "fake"}}})
+    """A minimal ScribeConfig for the deterministic composition.
+
+    ``render_verified_note`` reads ``config.diarize.purity_threshold`` — and,
+    since #26, ALSO ``resolve_candidates_dir(config)``: it spools negation
+    paraphrase CANDIDATES at render time. So this config is not inert, and where
+    it points matters.
+
+    It points at a throwaway dir, which is a correctness requirement and not
+    just suite hygiene. The candidate spool is the Tier-1 input to a
+    self-correcting loop — morning-review approves rows out of it into a learned
+    suppression glossary. Scoring SYNTHETIC eval fixtures through a config that
+    resolves to an operator's real spool would seed that glossary with
+    eval-fixture vocabulary. ``alfred scribe eval`` (without ``--real``) reaches
+    exactly this default, so on the box it would have written into the live
+    ``<data>/scribe/scribe/`` spool; #74 caught it as suite debris.
+
+    A caller with a real config passes it (``run_suite(config=...)``) and this
+    is never consulted.
+    """
+    return load_from_unified({
+        "logging": {"dir": _eval_scratch_dir()},
+        "scribe": {"mode": "synthetic", "stt": {"provider": "fake"}},
+    })
 
 
 @dataclass
