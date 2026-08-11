@@ -9,6 +9,7 @@ import {
   buildBugReportContext,
   formatBytes,
   isAllowedShotType,
+  type ShotMime,
 } from '../lib/algernon/bugReport';
 import { blobToBase64 } from '../lib/algernon/screenCapture';
 
@@ -17,6 +18,27 @@ const APP_VERSION = process.env.NEXT_PUBLIC_COMMIT_SHA || 'dev';
 
 // How long the success confirmation stays up before the dialog closes itself.
 const SUCCESS_DISMISS_MS = 2200;
+
+/**
+ * The media type to declare for `blob`, derived from the blob ITSELF.
+ *
+ * This must never be a constant. The box names the stored file
+ * `<report-id>.<ext>` from whatever media type it is told, so declaring PNG for
+ * JPEG bytes writes a file whose name disagrees with its content — exactly what
+ * `routes_bugreport.py` refuses to do and what the BFF's zod pairing check
+ * exists to prevent. Two server layers guard this; a hardcoded value here walks
+ * around both of them, because it makes the lie internally consistent.
+ *
+ * PNG is the fallback rather than a refusal because the only blob that can
+ * arrive with an absent or unrecognised type is the AUTO-CAPTURE, which is
+ * always PNG (`captureScreen` encodes it, and `downscaleImage` re-encodes to
+ * PNG). Picked files cannot reach here with a bad type — `handlePickFile`
+ * refuses anything outside the allowlist before it is ever attached.
+ */
+function shotMediaType(blob: Blob | null): ShotMime {
+  const type = blob?.type ?? '';
+  return isAllowedShotType(type) ? (type as ShotMime) : 'image/png';
+}
 
 type ReportBugModalProps = {
   /** Route captured AT OPEN — frozen so a later navigation can't rewrite it. */
@@ -239,7 +261,7 @@ export function ReportBugModal({
             appVersion: APP_VERSION,
           }),
           ...(screenshotB64
-            ? { screenshot_b64: screenshotB64, screenshot_media_type: 'image/png' }
+            ? { screenshot_b64: screenshotB64, screenshot_media_type: shotMediaType(shot) }
             : {}),
         }),
       });

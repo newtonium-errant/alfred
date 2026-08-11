@@ -183,10 +183,26 @@ describe('bugReportErrorMessage', () => {
     expect(bugReportErrorMessage('wrong_peer')).toContain('nothing was sent');
   });
 
-  it('is honest that a timeout did NOT save the report', () => {
-    // The dangerous ambiguity: a reporter who thinks it might have gone through
-    // does not resend, and the bug is never filed.
-    expect(bugReportErrorMessage('gateway_timeout')).toContain('NOT saved');
+  it('admits a timeout leaves the outcome UNKNOWN rather than claiming either', () => {
+    // The route writes the report to disk and THEN responds, so a 504 means the
+    // BFF stopped waiting — not that nothing landed. Claiming "not saved" would
+    // invite a resend that files the bug twice; claiming "saved" would lose it
+    // when the write really did fail. The only honest answer names both
+    // possibilities and points at the place the reporter can check.
+    const msg = bugReportErrorMessage('gateway_timeout');
+    expect(msg).toContain('may or may not');
+    expect(msg).toContain('notifications');
+    // Must not assert EITHER outcome as fact.
+    expect(msg).not.toContain('NOT saved');
+    expect(msg).not.toContain('was filed.');
+  });
+
+  it('still says NOTHING WAS SENT for failures that never reached the box', () => {
+    // The distinction the timeout case turns on: these are refusals decided
+    // BEFORE any write could happen, so certainty is warranted here and only
+    // here. Keeping them definite is what makes the timeout's hedge meaningful
+    // rather than blanket hand-wringing on every error.
+    expect(bugReportErrorMessage('wrong_peer')).toContain('nothing was sent');
   });
 
   it('falls back without trailing punctuation garbage on an unknown code', () => {

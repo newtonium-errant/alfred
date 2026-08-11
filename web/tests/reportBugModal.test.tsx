@@ -252,6 +252,70 @@ describe('ReportBugModal — screenshot', () => {
     );
   });
 
+  // WARN-1 regression. The picker accepts PNG, JPEG and WebP; the submit path
+  // used to declare `image/png` unconditionally, so JPEG and WebP bytes were
+  // filed under a `.png` name — the exact "file whose bytes disagree with its
+  // extension" the route refuses to create and the BFF's zod pairing check
+  // exists to prevent. Both server guards were walked around, because a
+  // hardcoded value makes the lie internally consistent all the way down.
+  //
+  // The pin was vacuous before this: every fixture was a PNG, so a constant and
+  // a derivation were indistinguishable. Driving all three types is the same
+  // positive-control discipline as the retake pin.
+  it.each([
+    ['image/jpeg', 'shot.jpg'],
+    ['image/webp', 'shot.webp'],
+    ['image/png', 'shot.png'],
+  ])('declares %s when that is what the reporter attached', async (mime, name) => {
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: 'filed', report_id: 'r1', instance: 'Salem' }),
+    });
+
+    renderModal({ initialShot: null });
+    const picked = new File(['bytes'], name, { type: mime });
+    fireEvent.change(screen.getByTestId('report-bug-file'), {
+      target: { files: [picked] },
+    });
+    // The file must actually have been accepted — otherwise this test would
+    // pass by sending no screenshot at all, which is the vacuity it replaces.
+    expect(screen.queryByTestId('report-bug-error')).toBe(null);
+    expect(screen.getByTestId('report-bug-preview')).toBeTruthy();
+
+    fireEvent.change(body(), { target: { value: 'wrong colours' } });
+    await act(async () => {
+      fireEvent.click(submit());
+    });
+
+    const sent = JSON.parse(
+      ((global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(sent.screenshot_b64).toBeTruthy();
+    expect(sent.screenshot_media_type).toBe(mime);
+  });
+
+  it('falls back to PNG for an auto-capture with no declared type', async () => {
+    // Some encoders hand back a type-less blob. The auto-capture is always PNG
+    // (captureScreen encodes it, downscaleImage re-encodes to PNG), and a
+    // picked file cannot reach here untyped because handlePickFile refuses
+    // anything outside the allowlist — so PNG is a sound default, not a guess.
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: 'filed', report_id: 'r1', instance: 'Salem' }),
+    });
+
+    renderModal({ initialShot: new Blob(['x']) }); // no type
+    fireEvent.change(body(), { target: { value: 'typeless' } });
+    await act(async () => {
+      fireEvent.click(submit());
+    });
+
+    const sent = JSON.parse(
+      ((global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(sent.screenshot_media_type).toBe('image/png');
+  });
+
   it('refuses an oversize or wrong-typed attachment by naming the limit', async () => {
     renderModal();
     const input = screen.getByTestId('report-bug-file') as HTMLInputElement;

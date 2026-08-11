@@ -211,11 +211,17 @@ def _render_report(
         f"- Reported at: {reported_at}",
     ]
     if screenshot_rel:
-        # An Obsidian embed AND the plain path. The embed is what makes the
-        # picture visible when the record is opened; the path is what survives
-        # being read by anything that is not Obsidian.
-        lines += ["", f"## Screenshot", "", f"![[{screenshot_rel}]]", "",
-                  f"Saved at `{screenshot_rel}` (relative to the vault root)."]
+        # THE PLAIN PATH IS THE LOAD-BEARING HALF. Obsidian does not index
+        # dot-folders, so the embed below will usually render UNRESOLVED —
+        # it is kept because it costs nothing and would resolve for anyone
+        # who does index the attachment directory, but it is NOT what makes
+        # the picture findable. The path is, and the record says so rather
+        # than leaving a reader to conclude the screenshot went missing when
+        # an embed fails to render.
+        lines += ["", "## Screenshot", "", f"![[{screenshot_rel}]]", "",
+                  f"Saved at `{screenshot_rel}` (relative to the vault root). "
+                  "Open it by that path — the embed above may not render, "
+                  "because Obsidian does not index dotted folders."]
     else:
         # Intentionally-left-blank: "no screenshot" is a real outcome (capture
         # can fail, and the reporter can remove it), and saying so is what

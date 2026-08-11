@@ -159,7 +159,13 @@ export function bugReportErrorMessage(code: string, detail?: string): string {
     case 'invalid_session':
       return 'Your session expired — please sign in again.';
     case 'gateway_timeout':
-      return 'The server took too long to answer. Your report was NOT saved — please try again.';
+      // HONEST UNCERTAINTY, not a verdict. A 504 means the BFF stopped waiting
+      // — it does NOT mean nothing landed. The route writes the report to disk
+      // and THEN responds, so a timed-out request may well have filed it. The
+      // earlier wording here ("your report was NOT saved") asserted the one
+      // thing this status cannot tell us, and it invited the duplicate filing
+      // the notification design deliberately refuses to invite elsewhere.
+      return 'We didn’t hear back in time. Your report may or may not have been filed — check your notifications before sending it again.';
     case 'unknown_target':
       return 'That instance isn’t configured to receive bug reports.';
     default:

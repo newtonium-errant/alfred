@@ -19,7 +19,7 @@ holding if the directory is ever renamed.
 from __future__ import annotations
 
 import base64
-import json
+import re
 from pathlib import Path
 
 import pytest
@@ -213,6 +213,72 @@ async def test_files_a_report_with_a_screenshot(aiohttp_client, vault) -> None:
     # The markdown must POINT at the picture, or the picture may as well not
     # exist — nothing downstream would ever find it.
     assert f"inbox/{ATTACHMENT_DIRNAME}/{shots[0].name}" in text
+
+
+@pytest.mark.parametrize(
+    ("media_type", "ext"),
+    [("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp")],
+)
+async def test_stored_extension_agrees_with_the_declared_type(
+    aiohttp_client, vault, media_type, ext,
+) -> None:
+    """Every accepted type is stored under an extension matching its bytes.
+
+    The box half of the WARN-1 pair. The client used to declare ``image/png``
+    for everything, so JPEG and WebP landed as ``.png`` — a file whose name
+    disagrees with its content, which the module docstring calls out as worse
+    than no file because nothing downstream can tell.
+
+    Parametrised over the WHOLE allowlist rather than PNG alone: a single-type
+    fixture cannot distinguish a real mapping from a hardcoded extension, which
+    is exactly how the client-side defect stayed invisible.
+    """
+    client = await aiohttp_client(_make_app(vault=vault))
+    res = await client.post("/vault/bugreport", json=_payload(
+        screenshot_b64=base64.b64encode(_PNG).decode(),
+        screenshot_media_type=media_type,
+    ))
+
+    assert res.status == 200
+    body = await res.json()
+    shots = _attachments(vault)
+    assert len(shots) == 1
+    assert shots[0].name == f"{body['report_id']}.{ext}"
+    # And the record points at the SAME name — a correct file the markdown
+    # cannot locate is not findable.
+    text = _reports(vault)[0].read_text(encoding="utf-8")
+    assert f"inbox/{ATTACHMENT_DIRNAME}/{shots[0].name}" in text
+
+
+def test_every_allowed_type_has_an_extension() -> None:
+    """The two tables must not drift apart.
+
+    ``_EXT_BY_MEDIA_TYPE[media_type]`` is indexed unguarded after the allowlist
+    check passes, so a type added to :data:`ALLOWED_SHOT_MEDIA_TYPES` without an
+    extension entry would be a ``KeyError`` at request time — a 502 on a report
+    that was perfectly valid.
+    """
+    from alfred.transport.routes_bugreport import _EXT_BY_MEDIA_TYPE
+
+    assert set(ALLOWED_SHOT_MEDIA_TYPES) == set(_EXT_BY_MEDIA_TYPE)
+
+
+def test_client_and_box_agree_on_the_screenshot_allowlist() -> None:
+    """The PWA's accepted types must equal the box's, in BOTH directions.
+
+    A type the client offers but the box refuses is a reporter picking a file
+    and being rejected after the fact; a type the box accepts but the client
+    hides is a capability nobody can reach. The set-equality is what makes the
+    per-type extension pin above meaningful — it proves the parametrisation
+    covers everything the picker can actually produce.
+    """
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "web" / "lib" / "algernon" / "bugReport.ts"
+    ).read_text(encoding="utf-8")
+
+    declared = re.findall(r"'(image/[a-z]+)'", src.split("ALLOWED_SHOT_MIME")[1])
+    assert set(declared[: len(ALLOWED_SHOT_MEDIA_TYPES)]) == set(ALLOWED_SHOT_MEDIA_TYPES)
 
 
 async def test_files_a_report_without_a_screenshot(aiohttp_client, vault) -> None:
