@@ -485,17 +485,34 @@ def register_voice_handlers(
         # event_family). Mount-time ILB: log which state we're in.
         barge_tel_dir = ""
         if barge_settings is not None:
+            # The dir comes from the CONFIG only — it is derived per-instance at
+            # load (<logging.dir>/voice_calibration). The two cwd-relative
+            # fallbacks that used to sit here were the #74 leak: they fired for
+            # any directly-built config and aimed the corpus at the process cwd,
+            # which on the box is one shared file across every instance. Empty
+            # now means the sink is off, which _barge_telemetry_for already
+            # handles by returning None.
             barge_tel_dir = getattr(
-                getattr(voice.stt, "endpoint_hold", None), "telemetry_dir",
-                "./data/voice_calibration") or "./data/voice_calibration"
+                getattr(voice.stt, "endpoint_hold", None), "telemetry_dir", "") or ""
             app[_KEY_WEB_BARGE_TELEMETRY_DIR] = barge_tel_dir
             instance_name = getattr(
                 getattr(app.get(KEY_WEB_TALKER_CONFIG), "instance", None),
                 "name", "") or ""
-            log.info(
-                "web.voice.barge.telemetry_enabled",
-                telemetry_dir=barge_tel_dir, instance=instance_name,
-            )
+            if barge_tel_dir:
+                log.info(
+                    "web.voice.barge.telemetry_enabled",
+                    telemetry_dir=barge_tel_dir, instance=instance_name,
+                )
+            else:
+                # Barge IS on but the corpus has nowhere to go. Distinct reason
+                # from barge-off: the comment above has always said "always-on
+                # when barge is enabled AND a corpus dir resolves", and this is
+                # the second half finally getting its own line rather than
+                # riding an "enabled" event that names an empty dir.
+                log.info(
+                    "web.voice.barge.telemetry_disabled",
+                    reason="no_telemetry_dir", instance=instance_name,
+                )
         else:
             # Intentionally-left-blank: idle distinguishable from broken.
             log.info(
@@ -641,14 +658,22 @@ def _build_assistant_stt(voice: Any, talker_config: Any = None):
         getattr(talker_config, "instance", None), "name", "") or ""
     telemetry_dir = ""
     if endpoint_settings.enabled:
+        # CONFIG only — the dir is derived per-instance at load. See the barge
+        # site above for why the two cwd-relative fallbacks that used to be here
+        # are gone (#74); empty means the sink is off, which the per-session
+        # wiring below already handles by not building the telemetry hook.
         telemetry_dir = getattr(
-            getattr(stt, "endpoint_hold", None), "telemetry_dir",
-            "./data/voice_calibration") or "./data/voice_calibration"
+            getattr(stt, "endpoint_hold", None), "telemetry_dir", "") or ""
         log.info(
             "web.voice.stt.endpoint_hold_enabled",
             base_extend_ms=endpoint_settings.base_extend_ms,
             max_total_hold_ms=endpoint_settings.max_total_hold_ms,
-            telemetry_dir=telemetry_dir, instance=instance_name,
+            telemetry_dir=telemetry_dir,
+            # The hold gate still WORKS without a corpus dir — only the
+            # collect-only telemetry stops. Naming it here keeps the "enabled"
+            # event from implying a sink that isn't there.
+            telemetry=bool(telemetry_dir),
+            instance=instance_name,
         )
     else:
         # Intentionally-left-blank: idle distinguishable from broken.

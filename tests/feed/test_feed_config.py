@@ -9,9 +9,23 @@ from alfred.feed.store import DEFAULT_COMPACT_THRESHOLD_BYTES
 
 
 def test_defaults_when_block_absent() -> None:
+    # A config that names an instance data dir but no feed block: on by
+    # default (local write, belt-guarded), path derived from logging.dir.
+    cfg = load_from_unified({"logging": {"dir": "./data"}})
+    assert cfg.enabled is True
+    assert cfg.store_path == "./data/feed_items.jsonl"
+    assert cfg.compact_threshold_bytes == DEFAULT_COMPACT_THRESHOLD_BYTES
+
+
+def test_unanchored_config_is_off_not_cwd_relative() -> None:
+    # #74: the resolver used to fall back to a cwd-relative "./data" when a
+    # config named no data dir, which is how the suite wrote
+    # data/feed_items.jsonl into the repo tree (the daily-sync fire path loads
+    # this config from a raw dict with no logging block). There is no correct
+    # answer for such a config, so the guess is gone and the feed goes OFF.
     cfg = load_from_unified({})
-    assert cfg.enabled is True  # local write, belt-guarded → on by default
-    assert cfg.store_path == "./data/feed_items.jsonl"  # tool-scoped default
+    assert cfg.store_path == ""
+    assert cfg.enabled is False  # __post_init__ coercion — never a cwd write
     assert cfg.compact_threshold_bytes == DEFAULT_COMPACT_THRESHOLD_BYTES
 
 
@@ -25,13 +39,20 @@ def test_values_honoured() -> None:
 
 
 def test_unknown_keys_ignored_forward_compat() -> None:
-    cfg = load_from_unified({"feed": {"enabled": True, "future_knob": "x"}})
+    # logging.dir present so the config is anchored — otherwise the #74
+    # coercion would flip ``enabled``, and this test is about the schema
+    # filter, not about anchoring.
+    cfg = load_from_unified({
+        "logging": {"dir": "./data"},
+        "feed": {"enabled": True, "future_knob": "x"},
+    })
     assert isinstance(cfg, FeedConfig)
     assert cfg.enabled is True
 
 
 def test_empty_block_is_defaults() -> None:
-    assert load_from_unified({"feed": {}}).store_path == "./data/feed_items.jsonl"
+    raw = {"logging": {"dir": "./data"}, "feed": {}}
+    assert load_from_unified(raw).store_path == "./data/feed_items.jsonl"
 
 
 # --- instance-scoped default store path (2026-07-31 cross-instance fix) -------

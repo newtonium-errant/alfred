@@ -1,7 +1,7 @@
 """Adaptive-endpointing telemetry — features-only, collect-only, privacy-critical.
 
 Increment 1 emits ONE durable event per endpoint decision into the UNIFIED
-voice-calibration corpus (``data/voice_calibration/events.jsonl`` — the SAME
+voice-calibration corpus (``<logging.dir>/voice_calibration/events.jsonl`` — the SAME
 corpus V3.1 barge uses, discriminated by ``event_family``). It APPLIES NOTHING
 (no learning in Increment 1); it is passive evidence for the Increment-2 go/no-go.
 

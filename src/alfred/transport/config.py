@@ -33,10 +33,17 @@ from alfred._env import (
     ENV_PLACEHOLDER_RE as ENV_RE,
     substitute_env_in_value as _substitute_env,
 )
+from alfred.common.instance_paths import LEGACY_DATA_DIR, instance_data_dir
 
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+# The two canonical-block filenames, placed inside the instance's data dir when
+# the config omits the path. Named constants so the loader's derivation and the
+# CLI's ``resolve_audit_path`` fallback can never drift apart.
+CANONICAL_AUDIT_FILENAME = "canonical_audit.jsonl"
+CANONICAL_PROPOSALS_FILENAME = "canonical_proposals.jsonl"
 
 
 # --- Dataclasses ------------------------------------------------------------
@@ -506,8 +513,20 @@ class CanonicalConfig:
     """
 
     owner: bool = False
-    audit_log_path: str = "./data/canonical_audit.jsonl"
-    proposals_path: str = "./data/canonical_proposals.jsonl"
+    # BOTH paths default EMPTY, and empty means DISABLED — ``append_audit`` /
+    # ``append_proposal`` return early on a falsy path, and both daily_sync
+    # readers already coalesce it to ``None``. That is deliberate (#74): the
+    # previous cwd-relative literals made a bare ``TransportConfig()`` — the
+    # shape every route-smoke test builds — aim its writer at the process cwd,
+    # which wrote ``data/canonical_audit.jsonl`` into the repo tree on every
+    # suite run, and on the box would be ONE file shared by every co-located
+    # instance. Removing the default rather than anchoring it is the #75 fix
+    # shape: production NEVER sees the empty value because
+    # ``_build_canonical`` derives ``<logging.dir>/canonical_*.jsonl`` for any
+    # config that omits the key, and every instance config sets
+    # ``audit_log_path`` explicitly anyway. An explicit path always wins.
+    audit_log_path: str = ""
+    proposals_path: str = ""
     peer_permissions: dict[str, dict[str, PeerFieldRules]] = field(
         default_factory=dict,
     )
@@ -909,8 +928,16 @@ def _build_nl_broker(raw: Any) -> NLBrokerConfig:
     )
 
 
-def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
-    """Build ``CanonicalConfig`` + nested per-peer-type rules."""
+def _build_canonical(
+    data: dict[str, Any], *, data_dir: str = LEGACY_DATA_DIR,
+) -> CanonicalConfig:
+    """Build ``CanonicalConfig`` + nested per-peer-type rules.
+
+    ``data_dir`` is the instance's data dir (``logging.dir``), the anchor for
+    the two default paths. Salem's is ``./data``, so the derived defaults are
+    byte-identical to the literals they replaced; co-located instances get
+    their own files instead of sharing one (#74).
+    """
     peer_perms_raw = data.get("peer_permissions", {}) or {}
     peer_perms: dict[str, dict[str, PeerFieldRules]] = {}
     if isinstance(peer_perms_raw, dict):
@@ -937,10 +964,12 @@ def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
     return CanonicalConfig(
         owner=bool(data.get("owner", False)),
         audit_log_path=str(
-            data.get("audit_log_path", "./data/canonical_audit.jsonl")
+            data.get("audit_log_path")
+            or f"{data_dir.rstrip('/')}/{CANONICAL_AUDIT_FILENAME}"
         ),
         proposals_path=str(
-            data.get("proposals_path", "./data/canonical_proposals.jsonl")
+            data.get("proposals_path")
+            or f"{data_dir.rstrip('/')}/{CANONICAL_PROPOSALS_FILENAME}"
         ),
         peer_permissions=peer_perms,
         nl_broker=_build_nl_broker(data.get("nl_broker")),
@@ -1152,6 +1181,7 @@ def _build_peers(data: dict[str, Any]) -> dict[str, PeerEntry]:
 def _build(
     cls: type, data: dict[str, Any], *,
     instance_name: str = "", instance_scope: str = "",
+    data_dir: str = LEGACY_DATA_DIR,
 ) -> Any:
     """Recursively construct a dataclass from a dict.
 
@@ -1166,6 +1196,15 @@ def _build(
     ``instance_scope`` for the allowlist type-validation set (the recall
     types are validated against ``known_types(instance_scope)`` — the same
     per-scope set the vault's ``_validate_type`` gate uses).
+
+    ``data_dir`` (the instance's ``logging.dir``) anchors the canonical
+    block's two default paths. The canonical block is built even when the
+    section is ABSENT, unlike every other optional section here: its
+    dataclass defaults are empty-means-disabled (#74), so leaving it to
+    ``default_factory`` would silently turn the audit off for a config that
+    omits the block — where the pre-#74 behaviour was a real (if
+    cwd-relative) path. Building it unconditionally keeps that behaviour and
+    just aims it at the right directory.
     """
     if cls is TransportConfig:
         kwargs: dict[str, Any] = {}
@@ -1186,8 +1225,11 @@ def _build(
                 k: v for k, v in data["state"].items()
                 if k in {"path", "dead_letter_max_age_days"}
             })
-        if "canonical" in data and isinstance(data["canonical"], dict):
-            kwargs["canonical"] = _build_canonical(data["canonical"])
+        canonical_raw = data.get("canonical")
+        kwargs["canonical"] = _build_canonical(
+            canonical_raw if isinstance(canonical_raw, dict) else {},
+            data_dir=data_dir,
+        )
         if "ingest" in data and isinstance(data["ingest"], dict):
             kwargs["ingest"] = _build_ingest(data["ingest"])
         # ``recall`` fence must fire even when the section is absent-but-
@@ -1249,4 +1291,7 @@ def load_from_unified(raw: dict[str, Any]) -> TransportConfig:
         TransportConfig, tool,
         instance_name=instance_name,
         instance_scope=instance_scope,
+        # From the UNIFIED dict, not the transport section — logging.dir is a
+        # top-level block.
+        data_dir=instance_data_dir(raw),
     )

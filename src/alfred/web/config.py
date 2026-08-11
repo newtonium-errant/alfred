@@ -31,6 +31,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from alfred._env import substitute_env_in_value
+from alfred.common.instance_paths import configured_logging_dir
+
+# The voice-calibration corpus directory, under the instance's data dir. Both
+# telemetry families (endpoint-hold and V3.1 barge) share it, discriminated by
+# ``event_family`` inside one ``events.jsonl``.
+VOICE_CALIBRATION_DIR_NAME = "voice_calibration"
 
 
 def _is_unresolved(value: str | None) -> bool:
@@ -195,7 +201,11 @@ class WebVoiceEndpointHoldConfig:
     ``base_extend_ms`` extends per hold; ``max_total_hold_ms`` is the hard
     cumulative ceiling (deterministic worst-case latency). The three
     ``hold_on_*`` toggles gate a signal category without a code change.
-    Telemetry (features-only) writes to ``data/voice_calibration/events.jsonl``.
+    Telemetry (features-only) writes to ``<telemetry_dir>/events.jsonl``, where
+    ``telemetry_dir`` defaults to ``<logging.dir>/voice_calibration`` — DERIVED
+    per-instance at load, never a cwd-relative literal (#74). Empty means the
+    sink is off: both consumers in ``routes_voice`` skip telemetry on a falsy
+    dir rather than guessing a path.
     See docs/adaptive_endpointing_scope.md.
     """
 
@@ -205,7 +215,9 @@ class WebVoiceEndpointHoldConfig:
     hold_on_conjunction: bool = True
     hold_on_filler: bool = True
     hold_on_dangling: bool = True
-    telemetry_dir: str = "./data/voice_calibration"
+    # Empty = DERIVE at load (``_build_endpoint_hold``), or OFF when nothing
+    # anchors it. Never a cwd-relative default — see the class docstring.
+    telemetry_dir: str = ""
 
 
 @dataclass
@@ -510,7 +522,7 @@ def _build_voice_ice(raw: Any) -> VoiceIceConfig:
     )
 
 
-def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
+def _build_voice_stt(raw: Any, *, data_dir: str = "") -> WebVoiceSttConfig:
     """Hand-roll ``WebVoiceSttConfig`` with a schema-tolerance filter.
 
     Mirrors ``_build_voice_ice`` — dict guard, ``__dataclass_fields__``
@@ -521,7 +533,9 @@ def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
     unset/empty ``${DEEPGRAM_API_KEY}`` at the mount gate.
     """
     if not isinstance(raw, dict):
-        return WebVoiceSttConfig()
+        return WebVoiceSttConfig(
+            endpoint_hold=_build_endpoint_hold(None, data_dir=data_dir),
+        )
     known = WebVoiceSttConfig.__dataclass_fields__
     filtered = {k: v for k, v in raw.items() if k in known}
     defaults = WebVoiceSttConfig()
@@ -541,17 +555,37 @@ def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
         ),
         smart_format=bool(filtered.get("smart_format", defaults.smart_format)),
         shadow_capture=_build_shadow_capture(filtered.get("shadow_capture")),
-        endpoint_hold=_build_endpoint_hold(filtered.get("endpoint_hold")),
+        endpoint_hold=_build_endpoint_hold(
+            filtered.get("endpoint_hold"), data_dir=data_dir),
     )
 
 
-def _build_endpoint_hold(raw: Any) -> WebVoiceEndpointHoldConfig:
+def _default_telemetry_dir(data_dir: str) -> str:
+    """``<data_dir>/voice_calibration``, or ``""`` when nothing anchors it.
+
+    String join, not pathlib: Salem's ``logging.dir`` is ``./data``, so this
+    reproduces the exact ``"./data/voice_calibration"`` the literal produced
+    (pathlib would normalise it to ``"data/voice_calibration"``).
+    """
+    d = (data_dir or "").strip().rstrip("/")
+    return f"{d}/{VOICE_CALIBRATION_DIR_NAME}" if d else ""
+
+
+def _build_endpoint_hold(
+    raw: Any, *, data_dir: str = "",
+) -> WebVoiceEndpointHoldConfig:
     """Hand-roll ``WebVoiceEndpointHoldConfig`` (nested on stt) with a
     schema-tolerance filter — dodges the ``_build`` collision footgun. DEFAULT-OFF;
-    numeric fields are mount-clamped later by ``normalize_endpoint_hold_settings``."""
+    numeric fields are mount-clamped later by ``normalize_endpoint_hold_settings``.
+
+    ``data_dir`` (the instance's ``logging.dir``) anchors ``telemetry_dir`` when
+    the config omits it — the endpoint-hold AND barge telemetry both write there.
+    """
     defaults = WebVoiceEndpointHoldConfig()
     if not isinstance(raw, dict):
-        return defaults
+        return WebVoiceEndpointHoldConfig(
+            telemetry_dir=_default_telemetry_dir(data_dir),
+        )
     known = WebVoiceEndpointHoldConfig.__dataclass_fields__
     filtered = {k: v for k, v in raw.items() if k in known}
     return WebVoiceEndpointHoldConfig(
@@ -564,9 +598,12 @@ def _build_endpoint_hold(raw: Any) -> WebVoiceEndpointHoldConfig:
         hold_on_filler=bool(filtered.get("hold_on_filler", defaults.hold_on_filler)),
         hold_on_dangling=bool(
             filtered.get("hold_on_dangling", defaults.hold_on_dangling)),
+        # Explicit wins; otherwise DERIVE <data_dir>/voice_calibration. With no
+        # data_dir (a directly-built config) it stays empty and the sink is off
+        # — never the process cwd (#74).
         telemetry_dir=str(
-            filtered.get("telemetry_dir", defaults.telemetry_dir)
-            or defaults.telemetry_dir),
+            filtered.get("telemetry_dir")
+            or _default_telemetry_dir(data_dir)),
     )
 
 
@@ -649,7 +686,7 @@ def _build_voice_tts(raw: Any) -> WebVoiceTtsConfig:
     )
 
 
-def _build_voice(raw: Any) -> WebVoiceConfig:
+def _build_voice(raw: Any, *, data_dir: str = "") -> WebVoiceConfig:
     """Hand-roll ``WebVoiceConfig`` with a schema-tolerance filter.
 
     Mirrors ``_build_auth`` — isinstance-dict guard, ``__dataclass_fields__``
@@ -659,7 +696,9 @@ def _build_voice(raw: Any) -> WebVoiceConfig:
     footgun).
     """
     if not isinstance(raw, dict):
-        return WebVoiceConfig()
+        return WebVoiceConfig(
+            stt=_build_voice_stt(None, data_dir=data_dir),
+        )
     known = WebVoiceConfig.__dataclass_fields__
     filtered = {k: v for k, v in raw.items() if k in known}
     defaults = WebVoiceConfig()
@@ -694,7 +733,7 @@ def _build_voice(raw: Any) -> WebVoiceConfig:
         ),
         reply_guidance=str(filtered.get("reply_guidance", "") or ""),
         ice=_build_voice_ice(filtered.get("ice")),
-        stt=_build_voice_stt(filtered.get("stt")),
+        stt=_build_voice_stt(filtered.get("stt"), data_dir=data_dir),
         tts=_build_voice_tts(filtered.get("tts")),
     )
 
@@ -747,7 +786,15 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
         users=_build_users(section.get("users")),
         auth=_build_auth(section.get("auth")),
         email=_build_email(section.get("email")),
-        voice=_build_voice(section.get("voice")),
+        # data_dir comes from the UNIFIED dict (logging.dir is top-level), not
+        # the web section. ``configured_logging_dir`` rather than
+        # ``instance_data_dir``: the latter falls back to a cwd-relative
+        # "./data", and for a COLLECT-ONLY sink the right answer to "no data dir
+        # configured" is to collect nothing, not to guess the process cwd (#74 —
+        # same call as the feed store). Every instance config sets logging.dir,
+        # so this is the unconfigured-fixture path, not a production one.
+        voice=_build_voice(
+            section.get("voice"), data_dir=configured_logging_dir(raw) or ""),
         notifications=_build_notifications(section.get("notifications")),
         state_path=str(
             section.get("state_path", "./data/web_auth_state.json")

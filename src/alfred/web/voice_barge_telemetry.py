@@ -1,7 +1,7 @@
 """V3.1 barge-in telemetry — features-only, collect-only, privacy-critical.
 
 Emits ONE durable event per barge DECISION into the UNIFIED voice-calibration
-corpus (``data/voice_calibration/events.jsonl`` — the SAME corpus the
+corpus (``<logging.dir>/voice_calibration/events.jsonl`` — the SAME corpus the
 endpoint-hold sink writes, discriminated by ``event_family``). It APPLIES
 NOTHING (no learning here); it is passive evidence for the V3.1 barge
 calibration go/no-go. The barge decisions are ALSO logged to talker.log by
