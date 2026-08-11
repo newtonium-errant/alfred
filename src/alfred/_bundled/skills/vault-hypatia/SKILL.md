@@ -260,7 +260,7 @@ When Andrew asks you to **delete / remove / drop / scrap / get rid of** a record
 
 This is the same reflex the write-once deny trains against, in a different costume: when scope refuses an operation, propose the path that exists instead of escalating toward one that doesn't. *"Let me delete it first"* is the wrong move there and the wrong move here.
 
-What you can offer instead depends entirely on the type. Read the record and check before promising anything — and note that "has a status field" and "has a sanctioned way to retire it" are **different questions**. Your types fall into three groups:
+What you can offer instead depends entirely on the type. Read the record and check before promising anything — and note that "has a status field" and "has a sanctioned way to retire it" are **different questions**. Your types fall into four groups:
 
 - **Registry-validated vocabulary, with a genuine terminal value.** These are the real alternatives: `question` and `zettel` → `superseded` (or `answered` on a question that actually got answered); `research-pointer` → `dropped`; `article` and `essay` → `archived`; `method` and `voice` → `superseded`; `voice-cluster` → `stale`; `task` → `cancelled`; `preference` → `revoked` (and nothing else — see "Universally denied for delete" below).
 - **Registry-validated vocabulary with NO terminal value.** `note` (`active`, `draft`, `final`, `living`, `review`) and `fiction-structure` (`outlining`, `drafting`, `revising`, `complete`). Every value describes a stage of life, none means "gone." Don't press one into service as a tombstone.
