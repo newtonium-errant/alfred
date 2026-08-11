@@ -50,6 +50,10 @@ from typing import Any, Callable
 
 from aiohttp import web
 
+from alfred.telegram.api_errors import (
+    classification_payload,
+    classify_engine_error,
+)
 from alfred.vault.scope import RRTS_INTAKE_ROLE
 
 from .auth import resolve_web_identity
@@ -882,13 +886,24 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 image_blocks=image_blocks,
             )
         except Exception as exc:  # noqa: BLE001 — surface engine errors as 502
+            classified = classify_engine_error(exc)
             log.warning(
                 "web.chat.engine_error",
                 user=identity.user,
                 session_key=session_key,
                 error=str(exc),
                 error_type=type(exc).__name__,
+                # Always emitted; the VALUE is the code when recognised and
+                # None otherwise. So `classified_as=image_too_large` greps to
+                # exactly the known failures, and its presence-with-None on
+                # every other engine error is the ILB signal that the
+                # classifier ran and abstained rather than never running.
+                classified_as=classified.code if classified else None,
             )
+            if classified is not None:
+                return web.json_response(
+                    classification_payload(classified), status=502,
+                )
             return web.json_response(
                 {"error": "engine_error", "detail": str(exc)},
                 status=502,
@@ -1165,17 +1180,22 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
     try:
         reply = task.result()
     except Exception as exc:  # noqa: BLE001 — engine failure → SSE error frame
+        classified = classify_engine_error(exc)
         log.warning(
             "web.chat.stream_engine_error",
             user=identity.user,
             session_key=session_key,
             error=str(exc),
             error_type=type(exc).__name__,
+            classified_as=classified.code if classified else None,
         )
         if not client_gone["v"]:
             try:
                 await _sse_write_event(
-                    resp, "error", {"error": "engine_error", "detail": str(exc)}
+                    resp,
+                    "error",
+                    classification_payload(classified) if classified is not None
+                    else {"error": "engine_error", "detail": str(exc)},
                 )
             except (ConnectionResetError, RuntimeError):
                 pass

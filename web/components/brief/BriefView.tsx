@@ -1,3 +1,4 @@
+import { FencedText } from '../markdown/FencedText';
 import { subtle } from '../../lib/typography';
 
 type BriefViewProps = {
@@ -37,11 +38,16 @@ export function BriefView({ title, date, markdown, emptyMessage, testId }: Brief
           {emptyMessage}
         </p>
       ) : (
-        <div
-          data-testid={`${testId}-content`}
-          className="mt-3 whitespace-pre-wrap break-words rounded-xl border border-honeydew-200 bg-white px-4 py-3 text-sm leading-relaxed text-neutral-800"
-        >
-          {markdown}
+        <div className="mt-3 rounded-xl border border-honeydew-200 bg-white px-4 py-3">
+          {/* #85: fenced blocks (the ```csv the ingest path writes) get their
+              own panel + a download button; everything else keeps the exact
+              pre-wrap treatment it had. Still escaped text children only. */}
+          <FencedText
+            data-testid={`${testId}-content`}
+            text={markdown}
+            nameHint={testId}
+            className="whitespace-pre-wrap break-words text-sm leading-relaxed text-neutral-800"
+          />
         </div>
       )}
     </section>

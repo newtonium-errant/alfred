@@ -17,6 +17,7 @@ import {
   base64DecodedBytes,
   type ImageAttachment,
 } from '../../lib/algernon/schemas';
+import { downscaleImage } from '../../lib/algernon/imageDownscale';
 
 // The message composer. Enter sends; Shift+Enter inserts a newline. An empty /
 // whitespace-only message never sends UNLESS an image is attached. `disabled`
@@ -154,20 +155,35 @@ export function Composer({
         error = 'Only PNG, JPEG, GIF, or WebP images are supported.';
         continue;
       }
-      // `file.size` is the DECODED byte length — the same quantity the backend
-      // caps — so this is the primary size gate; the base64 recheck below is
-      // belt-and-suspenders against a reader that inflates.
-      if (file.size > MAX_IMAGE_BYTES) {
-        error = `Each image must be under ${MAX_IMAGE_MIB} MiB.`;
-        continue;
-      }
       try {
-        const data = await readAsBase64(file);
+        // Downscale BEFORE the size gate (#82). A 3000px scan is routinely
+        // over the MiB cap at full size and comfortably under it at 1568px,
+        // so gating first would reject images we can perfectly well send —
+        // and it is oversized DIMENSIONS, not bytes, that wedge a session
+        // once the conversation crosses Anthropic's 20-image threshold.
+        // Never throws: on any failure it hands back the original, which then
+        // meets the same gates it would have met before.
+        const { file: prepared } = await downscaleImage(file);
+        // `size` is the DECODED byte length — the same quantity the backend
+        // caps — so this is the primary size gate; the base64 recheck below is
+        // belt-and-suspenders against a reader that inflates.
+        if (prepared.size > MAX_IMAGE_BYTES) {
+          error = `Each image must be under ${MAX_IMAGE_MIB} MiB.`;
+          continue;
+        }
+        const data = await readAsBase64(prepared);
         if (base64DecodedBytes(data) > MAX_IMAGE_BYTES) {
           error = `Each image must be under ${MAX_IMAGE_MIB} MiB.`;
           continue;
         }
-        accepted.push({ media_type: mime as ImageAttachment['media_type'], data });
+        // The re-encode can change the media type (a WebP becomes a JPEG), so
+        // the block must carry the PREPARED file's type, not the picked one —
+        // a mismatch here is what makes the model see a corrupt image.
+        const preparedMime = (prepared.type || mime).toLowerCase();
+        const outMime = (ALLOWED_IMAGE_MEDIA_TYPES as readonly string[]).includes(preparedMime)
+          ? preparedMime
+          : mime;
+        accepted.push({ media_type: outMime as ImageAttachment['media_type'], data });
       } catch {
         error = 'Could not read that image.';
       }

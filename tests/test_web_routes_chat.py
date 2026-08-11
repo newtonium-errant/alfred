@@ -2402,3 +2402,109 @@ async def test_a_deduped_STREAM_retry_does_NOT_double_count(
     assert '"deduped":true' in text.replace(" ", "")
 
     assert len(_corpus_rows(corpus)) == 1
+
+
+# ---------------------------------------------------------------------------
+# #82 WARN-2 — the honest-error leg is WIRED, not merely implemented
+# ---------------------------------------------------------------------------
+#
+# `tests/test_image_wedge_guards.py` proves classify_engine_error() returns the
+# right thing. It stays fully green against a build where no route calls it —
+# the exact gap `web/tests/composerDownscale.test.tsx` documents for the
+# downscale leg, which the first ship closed there and left open here. These
+# drive a dimension-shaped 400 through each production seam and assert the
+# operator-visible surface, not the classifier.
+
+
+class _DimensionAPIError(Exception):
+    """Shaped like the live 400: message on .body and in str()."""
+
+    _MSG = (
+        "messages.11.content.0.image.source.base64: image dimensions exceed "
+        "max allowed size for many-image requests: 2000 pixels"
+    )
+
+    def __init__(self) -> None:
+        super().__init__(self._MSG)
+        self.body = {"error": {"type": "invalid_request_error", "message": self._MSG}}
+
+
+async def test_turn_dimension_400_carries_image_too_large(
+    web_client, monkeypatch,
+) -> None:
+    """/chat/turn's 502 body must name the actionable code, not engine_error."""
+
+    async def _boom(**kwargs):
+        raise _DimensionAPIError()
+
+    monkeypatch.setattr("alfred.telegram.conversation.run_turn", _boom)
+
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    resp = await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "what is on page 3?"},
+        headers=headers,
+    )
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["error"] == "image_too_large"
+    assert body["retryable"] is False
+    # The copy the operator reads must not send them back into the wedge.
+    assert "try again" not in body["detail"].lower()
+    assert "new chat" in body["detail"].lower()
+
+
+async def test_turn_unrecognised_error_still_generic(web_client, monkeypatch) -> None:
+    """The classifier abstains rather than guessing — the other half of WARN-2.
+
+    Without this, a change that classified EVERYTHING as image_too_large would
+    pass the pin above.
+    """
+
+    async def _boom(**kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr("alfred.telegram.conversation.run_turn", _boom)
+
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    resp = await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "explode"},
+        headers=headers,
+    )
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["error"] == "engine_error"
+    assert "kaboom" in body["detail"]
+
+
+async def test_stream_dimension_400_error_frame_carries_image_too_large(
+    web_client, monkeypatch,
+) -> None:
+    """The SSE seam is a SEPARATE write path from /chat/turn's json_response."""
+
+    async def _boom(**kwargs):
+        raise _DimensionAPIError()
+
+    monkeypatch.setattr("alfred.telegram.conversation.run_turn", _boom)
+
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "what is on page 3?"},
+        headers=headers,
+    )
+    assert resp.status == 200
+    events = await _read_sse(resp)
+    errors = [d for (e, d) in events if e == "error"]
+    assert len(errors) == 1
+    assert errors[0]["error"] == "image_too_large"
+    assert errors[0]["retryable"] is False
+    assert "try again" not in errors[0]["detail"].lower()
+    assert not [d for (e, d) in events if e == "done"]

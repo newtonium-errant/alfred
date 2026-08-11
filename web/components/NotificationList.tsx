@@ -1,3 +1,4 @@
+import { FencedText } from './markdown/FencedText';
 import { useState } from 'react';
 import type { NotificationItem } from '../lib/algernon/types';
 import { subtle } from '../lib/typography';
@@ -100,9 +101,16 @@ function NotificationRow({
                   precedent applies exactly as it does to feed evidence. Do not
                   "improve" this into markdown-via-innerHTML. Bounded +
                   scrollable so a long ticket can't blow out the tray. */}
-              <p className="max-h-64 overflow-y-auto whitespace-pre-wrap break-words text-xs font-normal leading-relaxed text-honeydew-700">
-                {body}
-              </p>
+              {/* #85: a fenced block in a forwarded ticket gets a download
+                  button. Still escaped React text children — FencedText only
+                  chooses which ELEMENT text lands in, never renders markup. */}
+              <div className="max-h-64 overflow-y-auto">
+                <FencedText
+                  text={body}
+                  nameHint={`ticket-${n.id}`}
+                  className="whitespace-pre-wrap break-words text-xs font-normal leading-relaxed text-honeydew-700"
+                />
+              </div>
               {n.ticket_body_truncated && (
                 <p
                   data-testid="notification-body-truncated"

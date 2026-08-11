@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from 'react';
 import { chatApi } from '../../lib/algernon/client';
 import { ApiError } from '../../lib/algernon/http';
 import { HOME_INSTANCE_NAME } from '../../lib/algernon/instance';
+import { IMAGE_TOO_LARGE_FALLBACK } from '../../lib/algernon/useChat';
 import type { PlayerPrimer } from '../../lib/algernon/player';
 
 // The player's ASK flow (C3c) — a single-shot contextual question to the assistant,
@@ -72,7 +73,8 @@ export interface UsePlayerAskResult {
 
 // Generic per-instance-safe copy (never an instance literal — mirrors useChat's
 // friendlyError, which says "the assistant", not a name). Per feedback_hardcoding.
-function askErrorMessage(e: unknown): string {
+// Exported for the #82 WARN-2 unit — see useChat.friendlyError.
+export function askErrorMessage(e: unknown): string {
   if (e instanceof ApiError) {
     switch (e.code) {
       case 'invalid_session':
@@ -81,6 +83,11 @@ function askErrorMessage(e: unknown): string {
         return "This account isn't on the allowlist for this instance.";
       case 'engine_error':
         return 'The assistant hit a snag answering that. Try again in a moment.';
+      case 'image_too_large':
+        // Mirrors useChat's case (#82) — deterministic 400, retrying can't
+        // clear it. Both switches must carry every code the box can emit, or
+        // the new one silently renders the generic fallback below.
+        return e.detail || IMAGE_TOO_LARGE_FALLBACK;
       case 'transport_unreachable':
       case 'network_error':
         return "Can't reach the assistant right now. Try again shortly.";
