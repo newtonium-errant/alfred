@@ -114,6 +114,12 @@ def _get_project_link(record: VaultRecord) -> str | None:
         proj = proj[0] if proj else ""
     if isinstance(proj, str) and proj:
         # Extract name from wikilink: "[[project/Eagle Farm]]" -> "Eagle Farm"
+        # DELIBERATELY UNMASKED (#70). This reads a FRONTMATTER FIELD
+        # VALUE, not document text — the same reasoning that keeps janitor's
+        # annotation site blind. A field value has no body and no fences; if
+        # one contains backticks it is still a real link the operator wrote,
+        # and masking would silently drop it. The masking sweep covers
+        # document text only.
         links = extract_wikilinks(proj)
         if links:
             name = links[0]

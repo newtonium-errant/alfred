@@ -58,15 +58,28 @@ def instance_slug(instance: str) -> str:
     shared across instances on the box and silently corrupts state, so
     the failure is loud at derivation time rather than quiet at write
     time.
+
+    DELEGATES to :func:`alfred.common.instance_paths.instance_slug` (#84)
+    rather than keeping a second copy of the rule. The state files that
+    carry an instance in their NAME and the directories that carry one in
+    their PATH must agree about what "Salem" slugs to; two spellings is how
+    a writer and a reader end up on different files. The blank-name error is
+    re-raised as :class:`BatchPathError` so this module's contract — and its
+    existing tests — are unchanged.
     """
-    slug = (instance or "").strip().lower().replace(" ", "-")
-    if not slug:
+    from alfred.common.instance_paths import (
+        InstanceSlugError,
+        instance_slug as _shared_slug,
+    )
+
+    try:
+        return _shared_slug(instance)
+    except InstanceSlugError as exc:
         raise BatchPathError(
             "batch paths need an instance name — an unscoped path is "
             "shared across instances on the box and silently mixes one "
             "instance's batches into another's"
-        )
-    return slug
+        ) from exc
 
 
 def validate_batch_id(batch_id: str) -> str:

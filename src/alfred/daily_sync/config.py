@@ -10,7 +10,7 @@ daily_sync:
     timezone: "America/Halifax"
   batch_size: 5
   corpus:
-    path: "./data/email_calibration.salem.jsonl"
+    path: "./data/email_calibration.<instance>.jsonl"   # derived; see #84
   confidence:
     high: false
     medium: false
@@ -78,7 +78,7 @@ class CorpusConfig:
     reader rotates the tail into its few-shot example slots.
     """
 
-    path: str = "./data/email_calibration.salem.jsonl"
+    path: str = "./data/email_calibration.jsonl"
 
 
 @dataclass
@@ -345,8 +345,8 @@ class TierRecurrenceConfig:
     """
 
     enabled: bool = False
-    pending_path: str = "./data/tier_recurrence_pending.salem.jsonl"
-    decided_path: str = "./data/tier_recurrence_decided.salem.jsonl"
+    pending_path: str = "./data/tier_recurrence_pending.jsonl"
+    decided_path: str = "./data/tier_recurrence_decided.jsonl"
     threshold_done_days: int = 3
     window_days: int = 30
     # B2 — the routine record a REPLY-approve places a promoted chore into. NO junk default: when unset
@@ -499,6 +499,31 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
     """
     raw = _substitute_env(raw)
     section = raw.get("daily_sync", {}) or {}
+    # #84 — instance-DERIVED state filenames. These three carried a literal
+    # ``.salem.`` on a shared code path, so every non-Salem instance running
+    # the same subsystem wrote into a file named for Salem. The module's own
+    # docstring already described the intent as
+    # ``data/email_calibration.{instance}.jsonl``; the literal was the bug.
+    #
+    # Byte-identical for Salem (``instance.name`` "Salem" -> slug "salem"), so
+    # the live corpora keep working with nothing to move. An explicit config
+    # path always wins — the derivation only fills the gap.
+    _instance_name = ""
+    _telegram = raw.get("telegram")
+    if isinstance(_telegram, dict):
+        _inst = _telegram.get("instance")
+        if isinstance(_inst, dict):
+            _instance_name = str(_inst.get("name") or "")
+
+    def _derived_name(stem: str) -> str:
+        from alfred.common.instance_paths import instance_state_filename_or_unscoped
+        return "./data/" + instance_state_filename_or_unscoped(
+            stem, _instance_name, suffix="jsonl")
+
+    def _explicit(block: str, field_name: str) -> bool:
+        sub = section.get(block) if isinstance(section, dict) else None
+        return isinstance(sub, dict) and field_name in sub
+
     if not section:
         cfg = DailySyncConfig(enabled=False)
     else:
@@ -592,6 +617,15 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
     raw_path = raw.get("_config_path")
     if isinstance(raw_path, str) and raw_path:
         cfg.config_path = raw_path
+
+    # Apply the #84 derivations LAST, so an explicit operator path still wins
+    # and the single-source routine_match derivation above is untouched.
+    if not _explicit("corpus", "path"):
+        cfg.corpus.path = _derived_name("email_calibration")
+    if not _explicit("tier_recurrence", "pending_path"):
+        cfg.tier_recurrence.pending_path = _derived_name("tier_recurrence_pending")
+    if not _explicit("tier_recurrence", "decided_path"):
+        cfg.tier_recurrence.decided_path = _derived_name("tier_recurrence_decided")
     return cfg
 
 

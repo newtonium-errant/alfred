@@ -8,6 +8,11 @@ from pathlib import Path
 
 import frontmatter
 
+# #70 — IMPORTED, not re-derived; see the note in ``surveyor/parser.py`` for
+# the lift-vs-import reasoning. The rule that decides "is this fenced" must
+# have exactly one implementation across the tools that consume it.
+from alfred.janitor.parser import mask_code_regions
+
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 
 # Embed pattern: ![[something.base#Section]] or ![[file]]
@@ -103,7 +108,14 @@ def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:
     body = _strip_excluded_blocks(post.content)
     record_type = fm.get("type", "")
 
-    wikilinks = extract_wikilinks(raw_text)
+    # Fenced blocks + inline code MASKED first (#70). Since #57 uploaded
+    # file content is fenced into record bodies, and the SKILL pass now has
+    # agents writing fenced CSV into bodies too — a ``[[thing]]`` inside a
+    # CSV is DATA. Distiller's links drive candidate selection and cluster
+    # grouping, so an unmasked read distills relationships nobody wrote.
+    # ``mask_code_regions`` leaves frontmatter verbatim, so real frontmatter
+    # links survive.
+    wikilinks = extract_wikilinks(mask_code_regions(raw_text))
 
     return VaultRecord(
         rel_path=rel_path,

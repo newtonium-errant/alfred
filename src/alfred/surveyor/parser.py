@@ -8,6 +8,22 @@ from pathlib import Path
 
 import frontmatter
 
+# #70 — IMPORTED, not re-derived. Delegating to janitor's masker rather than
+# copying the rule follows the precedent ``drip.campaigns.unfenced_view``
+# already set, and for its stated reason: two implementations of "is this
+# fenced" is how they drift, and here the drift would be invisible (a wrong
+# relationship written into the vault reads exactly like a right one).
+#
+# Deliberately NOT lifted to a shared module in this commit. The function
+# carries hardening (the CRLF ``\r?`` form) whose reachability claim is
+# pinned in ``tests/test_janitor_fence_awareness.py``, and moving it would
+# put that pin, three janitor call sites and drip's delegation in the blast
+# radius of a lane already carrying two other items. Cross-tool consumers
+# reach THREE with this commit (drip, surveyor, distiller) — a lift to
+# ``alfred/common`` is the right follow-up at the next consumer; flagged in
+# the report rather than done mid-lane.
+from alfred.janitor.parser import mask_code_regions
+
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 
 # Max chars for embedding text. Previous value (8_000) was based on a wrong
@@ -82,8 +98,21 @@ def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:
     body = post.content
     record_type = _coerce_record_type(fm.get("type"))
 
-    # Extract wikilinks from the entire raw text (both frontmatter and body)
-    wikilinks = extract_wikilinks(raw_text)
+    # Extract wikilinks from the entire raw text (both frontmatter and body),
+    # with fenced blocks and inline code spans MASKED first (#70).
+    #
+    # Since #57 the ingest path fences uploaded file content into record
+    # bodies, and the SKILL pass now has all four agents writing fenced CSV
+    # into bodies too — so the fenced population is growing. A ``[[thing]]``
+    # inside a bank CSV is DATA, not a reference. Surveyor's links feed the
+    # clusterer, the labeler and ``writer.write_relationships``, so an
+    # unmasked read manufactures relationship signal out of code blocks and
+    # then WRITES it back into the vault as wikilinks.
+    #
+    # ``mask_code_regions`` leaves the frontmatter block verbatim (fences are
+    # a body construct; YAML has none), so passing the whole raw text is
+    # correct — real frontmatter links survive.
+    wikilinks = extract_wikilinks(mask_code_regions(raw_text))
 
     return VaultRecord(
         rel_path=rel_path,

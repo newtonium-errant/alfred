@@ -50,6 +50,8 @@ import frontmatter
 from .candidates import compute_score, score_candidate
 from .config import DistillerConfig
 from .extractor import extract as v2_extract
+from alfred.janitor.parser import mask_code_regions
+
 from .parser import VaultRecord, extract_alfred_learnings_section, extract_wikilinks
 from .utils import get_logger
 from .writer import write_learn_record
@@ -152,7 +154,11 @@ def _parse_source_file(source_path: Path) -> VaultRecord | None:
     fm = dict(post.metadata)
     body = post.content
     record_type = fm.get("type", "session")
-    wikilinks = extract_wikilinks(raw_text)
+    # Fenced blocks + inline code MASKED first (#70) — same rule as
+    # ``parser.parse_file``. Backfill reads the SAME documents through a
+    # different door, so leaving it unmasked would reintroduce the defect on
+    # every backfilled source.
+    wikilinks = extract_wikilinks(mask_code_regions(raw_text))
     return VaultRecord(
         rel_path=str(source_path),
         frontmatter=fm,

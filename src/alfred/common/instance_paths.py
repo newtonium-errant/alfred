@@ -55,6 +55,78 @@ def instance_data_dir(raw: dict[str, Any]) -> str:
     return configured_logging_dir(raw) or LEGACY_DATA_DIR
 
 
+class InstanceSlugError(ValueError):
+    """Raised when an instance-scoped name is derived from a blank instance."""
+
+
+def instance_slug(instance: str) -> str:
+    """Filesystem-safe instance segment. Blank is a hard error.
+
+    THE one derivation, lifted here from ``batch.paths`` (#84) so the state
+    files that carry an instance in their NAME and the directories that carry
+    one in their PATH cannot disagree about what "Salem" slugs to. Two
+    spellings of the same rule is how a writer and a reader end up on
+    different files.
+
+    ``batch.paths.instance_slug`` now delegates and re-raises as its own
+    ``BatchPathError`` so that module's contract is unchanged.
+    """
+    slug = (instance or "").strip().lower().replace(" ", "-")
+    if not slug:
+        raise InstanceSlugError(
+            "an instance-scoped path needs an instance name — an unscoped "
+            "path is shared across instances on the box and silently mixes "
+            "one instance's state into another's"
+        )
+    return slug
+
+
+def instance_state_filename(stem: str, instance: str, *, suffix: str) -> str:
+    """``<stem>.<slug>.<suffix>`` — e.g. ``email_calibration.salem.jsonl``.
+
+    The naming shape these state files already use, with the instance
+    DERIVED rather than baked in (#84). Seven files carried a literal
+    ``.salem.`` on shared code paths: on the box every instance shares one
+    WorkingDirectory and differs only by ``--config``, so KAL-LE running the
+    same subsystem wrote into a file named for Salem — the 2026-07-31
+    feed-store shape, with the instance name in the filename making it look
+    intentional.
+
+    **BYTE-IDENTICAL FOR SALEM, so there is nothing to migrate.**
+    ``instance.name`` is ``"Salem"``, which slugs to ``salem``, which
+    reproduces the previous literal exactly. That is the same property
+    :func:`instance_data_path` relies on, and it is why this fix needs no
+    rename shim and no deploy step: Salem's live calibration corpora and
+    snooze store keep working because their paths do not move.
+
+    An EMPTY instance yields ``<stem>.<suffix>`` with no instance segment
+    (see :func:`instance_state_filename_or_unscoped`) rather than raising —
+    callers in the config layer resolve to empty when the operator omitted
+    ``telegram.instance.name``, and the daemon-start guard is what refuses
+    that case. What must not happen is an unnamed instance silently
+    inheriting Salem's filename, which is what the literal did.
+    """
+    return f"{stem}.{instance_slug(instance)}.{suffix}"
+
+
+def instance_state_filename_or_unscoped(
+    stem: str, instance: str, *, suffix: str,
+) -> str:
+    """:func:`instance_state_filename`, or ``<stem>.<suffix>`` when blank.
+
+    The config-layer variant. Blank instance names reach config loading
+    legitimately (minimal test fixtures; an operator mid-setup), and the
+    established pattern — see ``routine.config.load_from_unified`` — is to
+    resolve to empty and let the daemon-start guard refuse, NOT to raise at
+    load. The unscoped name is deliberately not Salem's: an unnamed instance
+    that quietly adopted ``.salem.`` is precisely the defect being fixed.
+    """
+    try:
+        return instance_state_filename(stem, instance, suffix=suffix)
+    except InstanceSlugError:
+        return f"{stem}.{suffix}"
+
+
 def instance_data_path(raw: dict[str, Any], *parts: str) -> str:
     """A path under the instance data dir, joined as a STRING.
 
