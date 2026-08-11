@@ -249,3 +249,85 @@ def test_transport_cli_resolver_matches_the_loader() -> None:
     assert resolve_audit_path(raw_explicit) == "/x/audit.jsonl"
     # And the legacy fallback is unchanged for a config with no logging block.
     assert resolve_audit_path({}) == "./data/canonical_audit.jsonl"
+
+
+# ===========================================================================
+# Leaker 3 — feed store  (data/feed_items.jsonl + data/feed_items.lock)
+# ===========================================================================
+#
+# The resolver was already per-instance-correct; what leaked was its LAST
+# RUNG. When a config named no data dir at all it fell back to a cwd-relative
+# "./data" — and the daily-sync fire path (daemon.py's feed block) loads this
+# config from a raw dict that, in tests, carries no logging block. So the
+# leak came through the LOADER here, unlike leaker 2. The bare-FeedConfig()
+# path (BriefConfig's default_factory) is the same defect's other half; both
+# close on one mechanism, FeedConfig.__post_init__.
+
+def _feed(raw: dict) -> object:
+    from alfred.feed.config import load_from_unified
+
+    return load_from_unified(raw)
+
+
+def test_feed_unanchored_config_writes_nowhere() -> None:
+    """The fix: no data dir named => empty path AND the feed switches off.
+
+    Mutation check — restore the "./data" last rung and
+    tests/test_daily_sync/test_fire_once_ticket_notify.py writes
+    data/feed_items.jsonl + .lock into the repo tree again.
+    """
+    cfg = _feed({})
+    assert cfg.store_path == ""
+    assert cfg.enabled is False
+
+
+def test_feed_dataclass_default_is_also_off() -> None:
+    # The other entry point: BriefConfig's default_factory never touches the
+    # loader, so the dataclass must be safe on its own.
+    from alfred.brief.config import BriefConfig
+    from alfred.feed.config import FeedConfig
+
+    assert FeedConfig().store_path == ""
+    assert FeedConfig().enabled is False
+    assert BriefConfig(vault_path="/x").feed.enabled is False
+
+
+def test_feed_disabled_for_lack_of_path_is_logged_not_silent() -> None:
+    """An enabled-looking feed that writes nothing must say why, once."""
+    import structlog
+
+    from alfred.feed import config as feed_config
+
+    feed_config._unanchored_logged = False
+    try:
+        with structlog.testing.capture_logs() as captured:
+            feed_config.FeedConfig()
+            feed_config.FeedConfig()  # latched — must not re-log
+    finally:
+        feed_config._unanchored_logged = False
+
+    matches = [c for c in captured
+               if c.get("event") == "feed.config.disabled_no_store_path"]
+    assert len(matches) == 1
+    assert matches[0]["reason"] == "unanchored_store_path"
+
+
+def test_feed_explicit_path_keeps_the_feed_on() -> None:
+    # The coercion must fire ONLY on a missing path — an explicitly configured
+    # feed stays on regardless of whether logging.dir is present.
+    cfg = _feed({"feed": {"store_path": "/x/feed.jsonl"}})
+    assert cfg.enabled is True
+    assert cfg.store_path == "/x/feed.jsonl"
+
+
+def test_feed_salem_default_is_byte_identical() -> None:
+    cfg = _feed({"logging": {"dir": _SALEM_DATA_DIR}})
+    assert cfg.store_path == "./data/feed_items.jsonl"
+    assert cfg.enabled is True
+
+
+def test_feed_paths_are_distinct_across_instances() -> None:
+    salem = _feed({"logging": {"dir": _SALEM_DATA_DIR}}).store_path
+    kalle = _feed({"logging": {"dir": _KALLE_DATA_DIR}}).store_path
+    assert kalle == f"{_KALLE_DATA_DIR}/feed_items.jsonl"
+    assert salem != kalle

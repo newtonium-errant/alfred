@@ -889,10 +889,20 @@ _DEBRIS_SKIP_DIRS = frozenset({
 # Every entry is a debt with a name. Removing an entry is the definition of
 # done for its follow-up; adding one needs the same justification these had.
 #
-#   data/feed_items.jsonl,  .lock         feed store default   -> #74
 #   data/voice_calibration/events.jsonl   web/config.py:208 +
 #                                         hardcoded fallbacks at
 #                                         routes_voice.py:490,646  -> #74
+#
+# ``data/feed_items.jsonl`` + ``.lock`` WERE here — and they are the entry that
+# shows the leak can live in a resolver that is otherwise CORRECT. The feed's
+# store-path resolver was already per-instance; what leaked was its LAST RUNG,
+# a cwd-relative ``./data`` guess for a config naming no data dir at all. The
+# daily-sync fire path loads feed config from a raw dict that in tests carries
+# no ``logging`` block, so the guess fired every run. There is no right answer
+# for an unanchored config, so #74 batch 1 deleted the guess: the path resolves
+# EMPTY and ``FeedConfig.__post_init__`` turns the feed off (loudly, once) —
+# the same coercion covers the bare ``FeedConfig()`` that ``BriefConfig``'s
+# default_factory builds.
 #
 # ``data/canonical_audit.jsonl`` WAS here — the transport canonical block's
 # cwd-relative path defaults. #74 batch 1 closed it, and it is the entry that
@@ -933,8 +943,6 @@ _DEBRIS_SKIP_DIRS = frozenset({
 # always derives it) and by constructing the manager ONCE at loop start. The
 # regression pins live in ``tests/mail/test_state_path_anchoring.py``.
 _DEBRIS_ALLOWLIST = frozenset({
-    "data/feed_items.jsonl",
-    "data/feed_items.lock",
     "data/voice_calibration/events.jsonl",
 })
 

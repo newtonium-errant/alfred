@@ -96,14 +96,21 @@ def test_empty_parts_dropped() -> None:
 # --- feed keeps its own extra rung, on top of the shared read ---------------
 
 def test_feed_still_prefers_logging_dir_then_daily_sync() -> None:
-    # feed layers a daily_sync rung between logging.dir and the legacy default;
-    # pin that delegating the logging.dir read did not drop it.
+    # feed layers a daily_sync rung under logging.dir; pin that delegating the
+    # logging.dir read did not drop it. There is no third rung — an unanchored
+    # config yields None, and the feed turns itself off rather than guessing
+    # the cwd (see tests/feed/test_feed_config.py).
     from alfred.feed.config import _instance_data_dir
 
     assert _instance_data_dir({"logging": {"dir": _KALLE_DATA_DIR}}) == _KALLE_DATA_DIR
     assert _instance_data_dir(
         {"daily_sync": {"state": {"path": f"{_KALLE_DATA_DIR}/daily_sync_state.json"}}},
     ) == _KALLE_DATA_DIR
-    assert _instance_data_dir({}) == "./data"
-    # And the blank-dir hole is closed for feed too, via the shared read.
-    assert _instance_data_dir({"logging": {"dir": "  "}}) == "./data"
+    assert _instance_data_dir({}) is None
+    # And the blank-dir hole is closed for feed too, via the shared read — a
+    # blank dir falls THROUGH to the daily_sync rung rather than joining "".
+    assert _instance_data_dir({"logging": {"dir": "  "}}) is None
+    assert _instance_data_dir({
+        "logging": {"dir": "  "},
+        "daily_sync": {"state": {"path": f"{_KALLE_DATA_DIR}/s.json"}},
+    }) == _KALLE_DATA_DIR
