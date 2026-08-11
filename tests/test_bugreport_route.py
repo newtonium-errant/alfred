@@ -214,6 +214,15 @@ async def test_files_a_report_with_a_screenshot(aiohttp_client, vault) -> None:
     # exist — nothing downstream would ever find it.
     assert f"inbox/{ATTACHMENT_DIRNAME}/{shots[0].name}" in text
 
+    # The ADVISORY SENTENCE, pinned as well as the path. Obsidian does not index
+    # dot-folders, so the embed usually renders unresolved and the record has to
+    # say to open by path — otherwise a reader meets a broken embed and concludes
+    # the screenshot went missing. Prose in an emitted artifact with no pin can
+    # drift back silently, which is exactly what happened to this line once
+    # already in this lane: the path was pinned, the sentence around it was not.
+    assert "Open it by that path" in text
+    assert "does not index dotted folders" in text
+
 
 @pytest.mark.parametrize(
     ("media_type", "ext"),
@@ -271,14 +280,28 @@ def test_client_and_box_agree_on_the_screenshot_allowlist() -> None:
     hides is a capability nobody can reach. The set-equality is what makes the
     per-type extension pin above meaningful — it proves the parametrisation
     covers everything the picker can actually produce.
+
+    The earlier version of this pin did NOT do what this docstring says. It
+    truncated the parsed client list to the box's length before comparing
+    (``declared[: len(ALLOWED_SHOT_MEDIA_TYPES)]``), so a client-side APPEND —
+    the way a type actually gets added — was sliced off and never read, and the
+    check was order-dependent into the bargain: a prepend was caught, an append
+    was invisible. A one-directional check under a "both directions" docstring
+    is worse than no check, because the docstring is what a reader trusts.
+
+    Two things make the replacement honest: the comparison is a plain set
+    equality over the WHOLE list, and the parse is bounded to the array literal
+    (up to its closing bracket) so it reads the allowlist rather than whatever
+    MIME strings happen to appear later in the module.
     """
     src = (
         Path(__file__).resolve().parents[1]
         / "web" / "lib" / "algernon" / "bugReport.ts"
     ).read_text(encoding="utf-8")
 
-    declared = re.findall(r"'(image/[a-z]+)'", src.split("ALLOWED_SHOT_MIME")[1])
-    assert set(declared[: len(ALLOWED_SHOT_MEDIA_TYPES)]) == set(ALLOWED_SHOT_MEDIA_TYPES)
+    literal = src.split("ALLOWED_SHOT_MIME = ")[1].split("]")[0]
+    declared = re.findall(r"'(image/[a-z+]+)'", literal)
+    assert set(declared) == set(ALLOWED_SHOT_MEDIA_TYPES)
 
 
 async def test_files_a_report_without_a_screenshot(aiohttp_client, vault) -> None:
