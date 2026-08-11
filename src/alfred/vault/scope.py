@@ -1115,6 +1115,60 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
+    # ``jeeves`` — the garage ambient scribe's WRITE-ONLY APPLIANCE scope
+    # (task #81, design §5.3, ratified 2026-08-10). A microphone in the
+    # garage cues a capture, the transcript reaches this instance over the
+    # dedicated ``jeeves`` peer token, and it lands as one record.
+    #
+    # PERSONAL / RRTS ONLY, NEVER CLINICAL. This scope copies the STAY-C
+    # scribe's fail-closed posture and shares none of its machinery; the
+    # ``jeeves`` peer token must have no route to a clinical instance. Two
+    # ambient scribes on one codepath is how personal audio ends up
+    # somewhere it needs consent to be.
+    #
+    # Scope-first matrix (the principal artifact — the design's §5.3 table
+    # implemented exactly):
+    #
+    #   | op                       | jeeves                                |
+    #   |--------------------------|---------------------------------------|
+    #   | create                   | {note, source} ONLY (gate 2 below)    |
+    #   | read/search/list/context | FALSE — narrower than every other     |
+    #   |                          |   ingest-shaped scope, deliberately   |
+    #   | edit / move / delete     | False — create-once                   |
+    #   | allow_body_writes        | True — the transcript IS the payload  |
+    #   | body_insert_at / replace | {} deny-all                           |
+    #
+    # THE TWO DELIBERATE NARROWINGS, both worth arguing about:
+    #
+    #   * **No read.** Every other ingest-shaped scope (``web_ingest``,
+    #     ``rrts_intake``) grants read/search/list/context. Jeeves does not
+    #     need them: the device transcribes and posts, it never resolves a
+    #     record first. Granting read would turn an always-on microphone in
+    #     a shed into a vault query surface for no gain. Verified against
+    #     ``ops.vault_create``, which calls ``check_scope`` for ``create``
+    #     only — the near-match collision check is a filesystem glob and
+    #     needs no read permission, so the 409 path still works.
+    #
+    #   * **No ``task``.** Tempting: "Jeeves, tell <peer> to order a 6203
+    #     bearing" is obviously a task. But a device that mints tasks from
+    #     ambient speech in a noisy room will mint junk tasks, and tasks are
+    #     the type the operator's day is built from. Notes-only is ratified
+    #     for v1 (ruling 4); the existing capture-to-task path promotes one
+    #     under review. Revisit when cue precision has been MEASURED rather
+    #     than guessed.
+    "jeeves": {
+        "read": False,
+        "search": False,
+        "list": False,
+        "context": False,
+        "create": "jeeves_types_only",
+        "edit": False,
+        "move": False,
+        "delete": False,
+        "allow_body_writes": True,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     # ``stayc_clinical`` — the SOVEREIGN ambient-scribe scope (scribe P1-b).
     # The clinical instance's vault scope: the AI-drafted, human-attested
     # ``clinical_note`` (DDx + future clinical work live under it). This is
@@ -1774,6 +1828,25 @@ CANONICAL_RECORD_TYPES: set[str] = {
 WEB_INGEST_CREATE_TYPES: set[str] = {"document", "note", "source"}
 
 
+# ``jeeves`` create allowlist (task #81, design §5.3). A garage utterance is
+# a note, or a captured source. Nothing else — and specifically NOT ``task``:
+# see the reasoning on the SCOPE_RULES entry, which is the argument, not this
+# comment.
+#
+# Neither type is canonical, so the ``jeeves_types_only`` gate carries no
+# propose hint (the device writes DIRECTLY into the receiving instance's own
+# vault; there is no peer-proposes-to-canonical semantics here).
+#
+# Keep in sync with the ``available_in_scopes`` ``jeeves`` tag on the
+# ``source`` TypeDefinition in schema.py (gate 1); ``note`` is
+# SCOPE_CANONICAL so gate 1 already admits it under every scope.
+# Contract-pinned in tests/test_jeeves_scope.py — widening this set is a
+# deliberate matrix change and needs a ratified ruling, not a commit; update
+# the pin in the same commit.
+JEEVES_SCOPE: str = "jeeves"
+JEEVES_CREATE_TYPES: set[str] = {"note", "source"}
+
+
 # --- RRTS bug-report intake (2026-06-29) ----------------------------------
 #
 # The VOUCHED RRTS bug-report → VERA lane. RRTS staff reach VERA through the
@@ -2325,6 +2398,29 @@ def check_scope(
                 f"({', '.join(sorted(RRTS_INTAKE_CREATE_TYPES))}). "
                 f"Got: '{record_type}'. The vouched RRTS intake scope "
                 f"files held tickets only; it cannot create any other type."
+            )
+        return
+
+    if permission == "jeeves_types_only":
+        # Garage ambient-scribe create gate (task #81). The allowlist is
+        # JEEVES_CREATE_TYPES {note, source} — notes-only v1 (ruling 4). NO
+        # canonical-type propose hint: neither type is canonical, and the
+        # device writes directly into the receiving instance's own vault.
+        # Fail-CLOSED on an empty record_type: an empty value is a caller
+        # bug, not a licence to create any type.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'jeeves_types_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass record_type."
+            )
+        if record_type not in JEEVES_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create jeeves types "
+                f"({', '.join(sorted(JEEVES_CREATE_TYPES))}). "
+                f"Got: '{record_type}'. The garage capture appliance is "
+                f"notes-only for v1 — in particular it may not mint tasks "
+                f"from ambient speech in a noisy room."
             )
         return
 

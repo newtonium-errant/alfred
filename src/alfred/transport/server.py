@@ -46,6 +46,7 @@ from .config import (
     DEFAULT_BATCH_MAX_INSTRUCTION_CHARS,
     DEFAULT_BATCH_MAX_TOTAL_BYTES,
     DEFAULT_INGEST_MAX_BODY_CHARS,
+    DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS,
     DEFAULT_TRANSPORT_CLIENT_MAX_BYTES,
     TransportConfig,
     host_is_loopback,
@@ -715,6 +716,9 @@ def wire_transport_app(
     ticket_outcome_resolve_callable: _TicketOutcomeResolveCallable | None = None,
     ingest_enabled: bool = False,
     ingest_config: Any | None = None,
+    jeeves_enabled: bool = False,
+    jeeves_config: Any | None = None,
+    jeeves_raw_config: "dict[str, Any] | None" = None,
     batch_enabled: bool = False,
     batch_config: Any | None = None,
     batch_data_dir: str = "",
@@ -891,6 +895,7 @@ def wire_transport_app(
     from .routes_batch import register_batch_routes
     from .routes_feed import register_feed_routes
     from .routes_ingest import register_ingest_routes
+    from .routes_jeeves import register_jeeves_routes
     from .routes_recall import register_recall_routes
 
     # Identity is unconditional — every instance has a name.
@@ -1119,6 +1124,38 @@ def wire_transport_app(
             "transport.wire_transport_app.ingest_skipped",
             reason="transport.ingest.enabled is false / absent (instance "
                    "did not opt into the cross-instance ingest route)",
+        )
+
+    # Jeeves capture intake (#81). Opt-in via ``transport.jeeves.enabled``;
+    # register_jeeves_routes emits its own disabled-skip log when off. The
+    # RAW config is threaded through because the route's fail-closed mode
+    # gate builds the typed jeeves config itself — an instance that never
+    # receives a capture never imports the jeeves package at all.
+    if jeeves_enabled:
+        register_jeeves_routes(
+            app,
+            enabled=True,
+            instance_name=instance_name,
+            max_transcript_chars=getattr(
+                jeeves_config, "max_transcript_chars",
+                DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS,
+            ),
+            types=list(getattr(jeeves_config, "types", []) or []),
+            jeeves_raw_config=jeeves_raw_config or {},
+        )
+        log.info(
+            "transport.wire_transport_app.jeeves_registered",
+            max_transcript_chars=getattr(
+                jeeves_config, "max_transcript_chars",
+                DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS,
+            ),
+        )
+    else:
+        register_jeeves_routes(app, enabled=False)
+        log.debug(
+            "transport.wire_transport_app.jeeves_skipped",
+            reason="transport.jeeves.enabled is false / absent (instance has "
+                   "no garage capture device pointed at it)",
         )
 
     # Bulk scan intake (#83). Opt-in via ``transport.batch.enabled``;

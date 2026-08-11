@@ -622,6 +622,38 @@ class IngestConfig:
     types: list[str] = field(default_factory=list)
 
 
+# --- Jeeves capture intake (#81, 2026-08-11) --------------------------------
+
+# Transcript ceiling for one cued capture. A cued window is at most a few
+# minutes of speech — a few thousand characters — so this is generous by an
+# order of magnitude. It exists so a MALFUNCTIONING device cannot fill the
+# vault with one request, not to constrain how long the operator talks.
+DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS: int = 32768
+
+
+@dataclass
+class JeevesRouteConfig:
+    """The garage ambient scribe's intake route (task #81).
+
+    The RECEIVING side only. An instance enabling this needs no ring, no
+    wake model and no STT key — just this flag and a dedicated ``jeeves``
+    peer token under ``transport.auth.tokens``. The capture DEVICE is a
+    separate config (the top-level ``jeeves:`` block).
+
+    Default ``enabled=False``: an instance with no garage microphone mounts
+    nothing and its transport server is byte-unchanged.
+
+    ``types`` is an OPTIONAL per-instance NARROWING of the universal create
+    set (``JEEVES_CREATE_TYPES`` = {note, source}). It can only narrow —
+    ``check_scope``'s ``jeeves_types_only`` gate is the hard ceiling, and
+    widening it is a ratified design decision rather than a config edit.
+    """
+
+    enabled: bool = False
+    max_transcript_chars: int = DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS
+    types: list[str] = field(default_factory=list)
+
+
 # --- Bulk scan intake (#83, 2026-08-11) -------------------------------------
 
 # The three caps on ``POST /vault/batch``. They are DEFAULTS, not values — an
@@ -808,6 +840,7 @@ class TransportConfig:
     canonical: CanonicalConfig = field(default_factory=CanonicalConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
     batch: BatchConfig = field(default_factory=BatchConfig)
+    jeeves: JeevesRouteConfig = field(default_factory=JeevesRouteConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
     peers: dict[str, PeerEntry] = field(default_factory=dict)
 
@@ -1047,6 +1080,49 @@ def _build_ingest(data: dict[str, Any]) -> IngestConfig:
     return IngestConfig(
         enabled=bool(data.get("enabled", False)),
         max_body_chars=max_body_chars,
+        types=types,
+    )
+
+
+def _build_jeeves(data: dict[str, Any]) -> JeevesRouteConfig:
+    """Build the optional ``jeeves`` block (defaults = disabled).
+
+    ``max_transcript_chars`` falls back to the DEFAULT on any non-positive
+    or unparseable value — deliberately NOT floored at 1 the way
+    :func:`_build_ingest` floors its own cap. A cap of 1 is not meaningfully
+    less broken than a cap of 0: both refuse every real capture, and the
+    symptom in the garage is "Jeeves stopped working" rather than "that
+    number is wrong". Falling back to a working default is the fail-SAFE
+    direction for a device the operator cannot see. (The ingest floor is
+    left as it is — changing it is its own decision, not a side effect of
+    this one.) ``types`` keeps only non-empty string entries.
+    """
+    if not isinstance(data, dict):
+        return JeevesRouteConfig()
+
+    raw_max = data.get(
+        "max_transcript_chars", DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS)
+    try:
+        max_chars = int(raw_max)
+    except (TypeError, ValueError):
+        max_chars = DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS
+    if max_chars < 1:
+        log.warning(
+            "transport.jeeves.max_transcript_chars_invalid",
+            configured=max_chars,
+            applied=DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS,
+            detail="transport.jeeves.max_transcript_chars must be positive — "
+                   "a non-positive cap refuses every capture. REFUSED; using "
+                   "the default.",
+        )
+        max_chars = DEFAULT_JEEVES_MAX_TRANSCRIPT_CHARS
+
+    types_raw = data.get("types", []) or []
+    types = [str(t) for t in types_raw if isinstance(t, str) and t.strip()]
+
+    return JeevesRouteConfig(
+        enabled=bool(data.get("enabled", False)),
+        max_transcript_chars=max_chars,
         types=types,
     )
 
@@ -1315,6 +1391,8 @@ def _build(
             kwargs["ingest"] = _build_ingest(data["ingest"])
         if "batch" in data and isinstance(data["batch"], dict):
             kwargs["batch"] = _build_batch(data["batch"])
+        if "jeeves" in data and isinstance(data["jeeves"], dict):
+            kwargs["jeeves"] = _build_jeeves(data["jeeves"])
         # ``recall`` fence must fire even when the section is absent-but-
         # the-instance-is-STAY-C? No — a STAY-C instance with NO recall
         # section legitimately answers nothing; the fence only fires on
