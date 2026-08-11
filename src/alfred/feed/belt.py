@@ -52,5 +52,12 @@ def try_feed_reconcile(
         # a card that stops re-appearing must be explicable as "we chose not to
         # revive it" rather than looking like the producer went quiet.
         suppressed=counts["suppressed"],
+        # Defer (D2), both directions. Same ILB reasoning as ``suppressed``, and
+        # the pair matters more here because a defer is a PROMISE: ``held`` says
+        # "parked, still inside its window", ``returned`` says "the window
+        # lapsed and it is back". Always emitted, including 0, so an operator
+        # can see the promise being kept on a quiet day.
+        deferred_held=counts.get("deferred_held", 0),
+        defer_returned=counts.get("defer_returned", 0),
     )
     return counts

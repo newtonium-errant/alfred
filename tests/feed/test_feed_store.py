@@ -168,12 +168,14 @@ def test_reconcile_upserts_and_marks_absent_acted(tmp_path: Path) -> None:
     s = _store(tmp_path)
     # Fire 1: two proposals open.
     counts1 = s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
-    assert counts1 == {"open": 2, "acted": 0, "suppressed": 0}
+    assert counts1 == {"open": 2, "acted": 0, "suppressed": 0,
+                       "deferred_held": 0, "defer_returned": 0}
     assert {i for i, it in s.load().items() if it.state == STATE_OPEN} == {"proposal:c1", "proposal:c2"}
 
     # Fire 2: c1 still open, c2 gone (decided elsewhere) → c2 becomes acted.
     counts2 = s.reconcile("proposal", [_item("proposal", "c1")])
-    assert counts2 == {"open": 1, "acted": 1, "suppressed": 0}
+    assert counts2 == {"open": 1, "acted": 1, "suppressed": 0,
+                       "deferred_held": 0, "defer_returned": 0}
     folded = s.load()
     assert folded["proposal:c1"].state == STATE_OPEN
     assert folded["proposal:c2"].state == STATE_ACTED
@@ -239,7 +241,8 @@ def test_reconcile_idempotent_rerun(tmp_path: Path) -> None:
     s.reconcile("routine_match", open_set)
     first = {i: it.state for i, it in s.load().items()}
     counts = s.reconcile("routine_match", open_set)  # same set again
-    assert counts == {"open": 2, "acted": 0, "suppressed": 0}
+    assert counts == {"open": 2, "acted": 0, "suppressed": 0,
+                      "deferred_held": 0, "defer_returned": 0}
     assert {i: it.state for i, it in s.load().items()} == first  # folded state unchanged
 
 

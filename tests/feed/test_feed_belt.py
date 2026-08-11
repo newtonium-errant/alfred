@@ -26,7 +26,8 @@ def test_success_returns_counts_and_logs_ok(tmp_path: Path) -> None:
     store = FeedStore(tmp_path / "feed.jsonl")
     with structlog.testing.capture_logs() as cap:
         counts = try_feed_reconcile(store, "proposal", [_item("proposal", "c1")])
-    assert counts == {"open": 1, "acted": 0, "suppressed": 0}
+    assert counts == {"open": 1, "acted": 0, "suppressed": 0,
+                      "deferred_held": 0, "defer_returned": 0}
     ok = [c for c in cap if c.get("event") == "feed.reconcile"]
     assert len(ok) == 1
     assert ok[0]["ok"] is True

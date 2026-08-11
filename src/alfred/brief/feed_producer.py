@@ -184,6 +184,19 @@ def event_feed_items(
                 "rec_type": ev.rec_type,
                 "time_display": ev.time_display,
             },
+            # Interval extent (D7, 2026-08-11) — the event's own span, off the
+            # record's ``start``/``end`` frontmatter. Deliberately NOT folded
+            # into ``evidence``: evidence is the card body (what the operator
+            # reads), while the extent is structural (what a time-shaped render
+            # LAYS OUT against). It also must not join the snapshot fingerprint
+            # by the back door — ``SNAPSHOT_FINGERPRINT_FIELDS["event"]`` reads
+            # evidence keys, and a moved appointment already re-surfaces through
+            # ``time_display`` there. Adding a second, differently-formatted
+            # spelling of the same fact to that tuple would let an all-day event
+            # whose ``end`` normalization changed revive an ack for no
+            # operator-visible reason.
+            starts_at=ev.starts_at,
+            ends_at=ev.ends_at,
             source_ref=dict(_SOURCE_REF),
         ))
     return out

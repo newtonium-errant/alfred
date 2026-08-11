@@ -210,6 +210,24 @@ async def _spool_brief_narration(config: BriefConfig, today: str, now_local) -> 
     )
 
 
+def _ops_baseline_path(config: BriefConfig) -> str:
+    """Where the ops-notable delta baseline lives, as a SIBLING of the feed store.
+
+    The store path is already instance-anchored with the cwd guess removed
+    (#74), so a sibling inherits that anchoring instead of re-deriving it —
+    one rule, one place to get wrong. Instance-scoped in the FILENAME too,
+    because instances on the box share a working directory and differ only by
+    ``--config``: an unscoped name would let KAL-LE's baseline decide whether
+    Salem sees a delta.
+    """
+    from alfred.common.instance_paths import instance_state_filename
+
+    store = Path(config.feed.store_path)
+    return str(store.parent / instance_state_filename(
+        "ops_notable_baseline", config.instance_name, suffix="json",
+    ))
+
+
 def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_local, now_local) -> None:
     """Reconcile the converted sections' feed items into the feed store.
 
@@ -228,10 +246,26 @@ def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_l
             peer_digest_feed_items,
             slot_suggestion_feed_items,
         )
+        from .ops_notable import ops_notable_feed_items
 
         instance = config.instance_name
+        # The ops baseline sits BESIDE the feed store rather than resolving its
+        # own path. That store path is already instance-anchored with no cwd
+        # guess (#74), so inheriting it keeps one anchoring rule instead of two
+        # — and this block only runs when the store resolved at all.
+        ops_baseline_path = _ops_baseline_path(config)
         extractors = {
             "health": lambda: health_feed_items(config.vault_path, instance=instance),
+            "ops_notable": lambda: ops_notable_feed_items(
+                # SAME derivation the Operations render uses, so the projection
+                # measures the files the section describes rather than a second
+                # guess at where state lives.
+                str(Path(config.state.path).parent),
+                config.vault_path,
+                ops_baseline_path,
+                instance=instance,
+                quarantine_dir_name=config.quarantine_dir_name,
+            ),
             "slot_suggestion": lambda: slot_suggestion_feed_items(
                 config.vault_path, now_local, config.tier_defaults, instance=instance,
             ),
@@ -513,7 +547,11 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         # lane entry. Markdown byte-identical — the feed reads the same projection.
         SectionResult(TIER_SECTION_HEADER, tier_md, feed_kind="slot_suggestion"),
         SectionResult("Today's Routines", routines_md),
-        SectionResult("Operations", ops_md),
+        # Operations → ops_notable feed (Phase A). The MARKDOWN is untouched:
+        # the section still renders the full status snapshot. Only the feed
+        # projection is delta-filtered, because a card is an attention claim and
+        # steady state — even steady-bad — is not news.
+        SectionResult("Operations", ops_md, feed_kind="ops_notable"),
     ]
     # Watch Items sits after Operations, before Upcoming Events:
     # upstream watches are forward-looking operational signals — more

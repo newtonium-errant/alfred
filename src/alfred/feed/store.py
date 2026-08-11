@@ -29,9 +29,11 @@ from alfred.common.file_lock import file_rmw_lock
 from .model import (
     STATE_ACKED,
     STATE_ACTED,
+    STATE_DEFERRED,
     STATE_OPEN,
     FeedItem,
     _now_iso,
+    defer_window_open,
     snapshot_fingerprint,
 )
 
@@ -42,6 +44,7 @@ DEFAULT_COMPACT_THRESHOLD_BYTES = 5 * 1024 * 1024  # 5 MiB
 
 def _revival_suppressed(
     kind: str, incoming: FeedItem, stored: FeedItem | None,
+    *, now: str | None = None,
 ) -> bool:
     """Should this reconcile upsert be SKIPPED to keep a decision sticky?
 
@@ -64,8 +67,21 @@ def _revival_suppressed(
     the read-belt: an item written before this policy (or with evidence we
     can't fingerprint) behaves exactly as it does today rather than being
     silently suppressed forever on the strength of a guess.
+
+    **Defer (D2) rides HERE rather than in a second predicate.** This function
+    is already "should this upsert be skipped to keep a prior decision sticky",
+    and a defer is exactly that with an expiry. Two mechanisms would be two
+    places to fix the groundhog bug, which this codebase has now had to fix
+    twice. Note the asymmetry that keeps them honest: a sticky ACK suppresses
+    indefinitely (until the content changes), while a defer suppresses only
+    until its window passes — so a deferred item ALWAYS has a return date, and
+    ``defer_window_open`` is the single place that decides it has arrived.
     """
-    if stored is None or stored.state not in (STATE_ACTED, STATE_ACKED):
+    if stored is None:
+        return False
+    if stored.state == STATE_DEFERRED:
+        return defer_window_open(stored.deferred_until, now)
+    if stored.state not in (STATE_ACTED, STATE_ACKED):
         return False
     fp_incoming = snapshot_fingerprint(kind, incoming.evidence)
     if fp_incoming is None:
@@ -144,6 +160,12 @@ class FeedStore:
             if existing is None:
                 return  # state for an id we've never upserted — nothing to fold onto
             existing.state = new_state
+            # The defer window lives and dies with the deferred state. Carrying
+            # it out of that state would leave a returned item holding a stale
+            # timestamp that a later reader could mistake for a live defer.
+            existing.deferred_until = (
+                event.get("deferred_until") if new_state == STATE_DEFERRED else None
+            )
             if new_state == STATE_ACTED:
                 # ``acted_action`` tracks the VERB of the LATEST acted event
                 # (newest wins: an accept then a later done ends "done"). A
@@ -202,6 +224,11 @@ class FeedStore:
           * stored item exists AND is still ``open`` → preserve its stored
             ``created_at`` (the episode continues; producers pass a fresh
             timestamp each fire, which must NOT drift the first-seen);
+          * stored item is ``deferred`` → ALSO preserve it. A defer pauses an
+            episode, it does not end one: the operator said "later", not "done".
+            Resetting first-seen on return would erase that he has been carrying
+            this for a week and make a long-deferred item read as brand new —
+            precisely the age signal an attention policy needs most;
           * stored item was ``acted`` / ``acked`` / ``expired`` and the same key
             reappears in the open set → a NEW episode: keep the incoming fresh
             ``created_at``, and the upsert (state=open) legitimately REVIVES it —
@@ -210,7 +237,7 @@ class FeedStore:
         """
         payload = item.to_dict()
         stored = current.get(item.id)
-        if stored is not None and stored.state == STATE_OPEN:
+        if stored is not None and stored.state in (STATE_OPEN, STATE_DEFERRED):
             payload["created_at"] = stored.created_at
         return payload
 
@@ -235,6 +262,34 @@ class FeedStore:
             self._append_lines_locked([event])
             self._maybe_compact_locked()
 
+    def defer(self, item_id: str, *, until: str | None = None) -> None:
+        """Move an item to ``deferred`` — "later", not "judged" (D2).
+
+        ``until=None`` defers to the NEXT RENDER; an ISO instant defers to A
+        TIME. Both shapes go through this one method so the deferral is logged
+        in one place and the window can only be set alongside the state.
+
+        ILB, outbound half: every deferral is announced. The return half is
+        logged by :meth:`reconcile` when the window lapses, so a deferred item
+        leaves a matched pair of log lines and "where did that card go" is a
+        greppable question rather than a mystery.
+        """
+        event: dict[str, Any] = {
+            "ev": "state", "ts": _now_iso(), "id": item_id, "state": STATE_DEFERRED,
+        }
+        if until is not None:
+            event["deferred_until"] = until
+        with file_rmw_lock(self.path):
+            self._append_lines_locked([event])
+            self._maybe_compact_locked()
+        log.info(
+            "feed.store.deferred",
+            id=item_id,
+            shape="until_time" if until else "next_render",
+            deferred_until=until or "",
+            detail="item is deferred, not decided — it returns when the window lapses",
+        )
+
     def compact(self) -> None:
         """Force a compaction (rewrite folded state as fresh upserts)."""
         with file_rmw_lock(self.path):
@@ -257,20 +312,36 @@ class FeedStore:
         with file_rmw_lock(self.path):
             current = self._fold_from_disk()
             incoming_ids = {item.id for item in open_items}
-            previously_open = {
+            # DEFERRED counts as present for absent-detection. A deferred item
+            # that vanishes from the producer's open set was resolved in the
+            # owning store while the operator had it parked, and marking it
+            # acted is the same decided-detection every open item gets. Omitting
+            # it would strand the item as deferred forever with no producer left
+            # to return it — an immortal ghost, the failure this whole amendment
+            # exists to prevent, reintroduced through the back door.
+            previously_present = {
                 item_id
                 for item_id, item in current.items()
-                if item.kind == kind and item.state == STATE_OPEN
+                if item.kind == kind and item.state in (STATE_OPEN, STATE_DEFERRED)
             }
-            absent = previously_open - incoming_ids
+            absent = previously_present - incoming_ids
 
             ts = _now_iso()
             events: list[dict[str, Any]] = []
             suppressed = 0
+            held: list[str] = []
+            returned: list[str] = []
             for item in open_items:
-                if _revival_suppressed(kind, item, current.get(item.id)):
+                stored = current.get(item.id)
+                was_deferred = stored is not None and stored.state == STATE_DEFERRED
+                if _revival_suppressed(kind, item, stored, now=ts):
                     suppressed += 1
+                    if was_deferred:
+                        held.append(item.id)
                     continue
+                if was_deferred:
+                    # The window lapsed — this upsert (state=open) IS the return.
+                    returned.append(item.id)
                 events.append(
                     {"ev": "upsert", "ts": ts,
                      "item": self._episode_merged_payload(item, current)}
@@ -282,8 +353,30 @@ class FeedStore:
             self._append_lines_locked(events)
             self._maybe_compact_locked()
 
+        if returned:
+            # ILB, inbound half — the matched pair to ``feed.store.deferred``.
+            # A card silently reappearing is as confusing as one silently
+            # vanishing; this is the line that explains it.
+            log.info(
+                "feed.store.defer_returned",
+                kind=kind,
+                count=len(returned),
+                ids=sorted(returned),
+                detail="defer window lapsed — item returned to attention",
+            )
+        if held:
+            log.info(
+                "feed.store.defer_held",
+                kind=kind,
+                count=len(held),
+                ids=sorted(held),
+                detail="still inside the defer window — suppressed this fire, will return",
+            )
+
         return {
             "open": len(open_items),
             "acted": len(absent),
             "suppressed": suppressed,
+            "deferred_held": len(held),
+            "defer_returned": len(returned),
         }

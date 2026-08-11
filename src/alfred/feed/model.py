@@ -30,6 +30,18 @@ STATE_OPEN = "open"
 STATE_ACTED = "acted"
 STATE_ACKED = "acked"
 STATE_EXPIRED = "expired"
+# "later" (D2, 2026-08-11). A DEFERRED item is not open (it stays out of the
+# deck and out of every ``state=open`` query) and is not decided either — the
+# operator has not judged it, only moved it. It therefore MUST come back; a
+# defer that never returns is a silent drop wearing a politer name.
+#
+# Two shapes, distinguished by ``FeedItem.deferred_until``:
+#   * ``None`` — defer to NEXT RENDER. The next producer fire returns it.
+#   * an ISO timestamp — defer to A TIME. Fires before that instant leave it
+#     alone; the first fire at/after it returns the item.
+# Both are consumed through ONE predicate, :func:`defer_window_open`, so no
+# consumer re-derives "is this still deferred" and drifts.
+STATE_DEFERRED = "deferred"
 
 # --- snapshot kinds: per-kind revival policy ---------------------------------
 #
@@ -149,6 +161,51 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO-8601 instant, or ``None`` when it isn't one.
+
+    A NAIVE value is read as UTC rather than rejected: every producer in-tree
+    stamps aware UTC, so a naive one is an older/hand-written value, and reading
+    it as UTC is the interpretation that keeps a comparison possible instead of
+    raising ``TypeError`` mid-reconcile.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def defer_window_open(deferred_until: str | None, now: str | None = None) -> bool:
+    """Is this defer still holding? THE canonical defer predicate (D2).
+
+    ``True`` means the item stays suppressed this fire; ``False`` means it
+    RETURNS to attention. Every consumer asks this function — the health-status
+    ``skip`` lesson applies exactly: a re-localized comparison drifts, so there
+    is one predicate and no second spelling of it.
+
+    The fail direction is deliberate and one-way: **when in doubt, the item
+    returns.** A missing window (next-render defer), an unparseable one, and an
+    unreadable clock all yield ``False``. Extra noise costs the operator a
+    glance; a commitment that silently never comes back costs him the thing
+    itself, and he cannot notice its absence to ask about it.
+    """
+    if not deferred_until:
+        # Defer-to-next-render. Nothing to hold against: the item was hidden for
+        # the render in which it was deferred (it is not ``open``), and the very
+        # next fire is the return this shape promises.
+        return False
+    until = _parse_iso(deferred_until)
+    if until is None:
+        return False
+    now_dt = _parse_iso(now) if now else datetime.now(timezone.utc)
+    if now_dt is None:
+        return False
+    return now_dt < until
+
+
 def make_id(kind: str, stable_key: str) -> str:
     """The feed id for a thing: ``<kind>:<stable_key>``. Never a render ordinal."""
     return f"{kind}:{stable_key}"
@@ -183,6 +240,33 @@ class FeedItem:
     # ``done`` through on an accepted item. Newest acted event wins the fold.
     acted_action: str | None = None
     expires_at: str | None = None
+    # --- interval extent (D7, 2026-08-11) ------------------------------------
+    # WHEN THE THING ITSELF IS, as opposed to when the feed learned about it.
+    # ``created_at`` is provenance; these two are content. Time-shaped items are
+    # the norm rather than the exception here — a fog window runs 11:00–15:00, a
+    # run is a moment at 09:30, a driver's corridor exposure is four hours, a
+    # routine has a cadence — and the pre-amendment model could only carry a
+    # POINT, so every renderer that wanted a duration had to re-parse it out of
+    # a display string (``event`` evidence carried ``time_display``, a rendered
+    # ``"%H:%M"``, which is lossy by construction: no end, no date, no tz).
+    #
+    # Both are OPTIONAL and both are independently optional: an instant carries
+    # ``starts_at`` with ``ends_at=None`` (a moment, not a zero-length span), and
+    # an item with no time dimension at all leaves both ``None``. Renderers MUST
+    # treat ``ends_at=None`` as "no known end" and never as "ends immediately".
+    #
+    # ISO-8601 strings, not datetimes, because the whole model round-trips
+    # through JSON in the store — the same reason ``created_at`` is a string.
+    # Producers stamp whatever offset the source carries; normalization is a
+    # render-layer concern, so nothing here silently shifts an operator's clock.
+    starts_at: str | None = None
+    ends_at: str | None = None
+    # --- defer (D2, 2026-08-11) ----------------------------------------------
+    # Meaningful only while ``state == STATE_DEFERRED``, and cleared by any
+    # transition out of it so a returned item can never carry a stale window.
+    # ``None`` while deferred = defer-to-next-render; an ISO instant =
+    # defer-to-a-time. Read ONLY through :func:`defer_window_open`.
+    deferred_until: str | None = None
     source_ref: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -200,10 +284,16 @@ class FeedItem:
         state: str = STATE_OPEN,
         created_at: str | None = None,
         expires_at: str | None = None,
+        starts_at: str | None = None,
+        ends_at: str | None = None,
         source_ref: dict[str, Any] | None = None,
     ) -> "FeedItem":
         """Build a FeedItem, applying KIND_DEFAULTS for mode/attention unless
-        explicitly overridden. Producers use this; the stable_key becomes the id."""
+        explicitly overridden. Producers use this; the stable_key becomes the id.
+
+        ``starts_at`` / ``ends_at`` are the item's own interval extent (D7) and
+        both default to ``None`` — a producer with no time dimension passes
+        neither, exactly as every producer did before the amendment."""
         default_mode, default_attention = KIND_DEFAULTS.get(kind, (MODE_FYI, ATTENTION_FYI))
         return cls(
             id=make_id(kind, stable_key),
@@ -217,6 +307,8 @@ class FeedItem:
             state=state,
             created_at=created_at or _now_iso(),
             expires_at=expires_at,
+            starts_at=starts_at,
+            ends_at=ends_at,
             source_ref=dict(source_ref or {}),
         )
 
