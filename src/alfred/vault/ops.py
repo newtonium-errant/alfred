@@ -1436,8 +1436,11 @@ def vault_edit(
       * ``body_replace: str`` — full body rewrite (frontmatter
         preserved). Per-instance × per-type allowlist via
         ``check_scope("body_replace", ...)``. Salem ``event`` records
-        with ``gcal_event_id`` are refused at the scope layer; the
-        operator must vault_delete first to clear the GCal mirror.
+        with ``gcal_event_id`` are refused at the scope layer, which
+        names a SCOPE-AWARE remedy (#80): body_append / body_insert_at
+        for the delete-less scopes that can reach the rule, and
+        delete-then-recreate only for a scope that actually holds
+        delete.
 
     Mutual exclusion: at most one body-mutation kwarg per call. If
     multiple are supplied, raises VaultError naming the conflict.

@@ -270,11 +270,13 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                         "Full body rewrite (frontmatter preserved). HIGH-"
                         "RISK — use only when the user explicitly asks for "
                         "a full rewrite. Per-instance × per-type allowlist "
-                        "applies. Salem ``event`` records with a synced "
-                        "GCal mirror REFUSE body_replace at the scope "
-                        "layer; vault_delete the event first to clear "
-                        "the GCal mirror, then create a fresh record. "
-                        "Mutually exclusive with body_append and "
+                        "applies. ``event`` records with a synced GCal "
+                        "mirror REFUSE body_replace at the scope layer — "
+                        "use body_append or body_insert_at to add to the "
+                        "body instead, or ask the operator to cancel the "
+                        "event (which clears the GCal mirror) before a "
+                        "fresh record is created. You cannot delete "
+                        "records. Mutually exclusive with body_append and "
                         "body_insert_at."
                     ),
                 },
