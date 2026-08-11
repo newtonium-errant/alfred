@@ -9,6 +9,7 @@ import {
   SNOOZE_HOLD_MOVE_TOLERANCE,
   SNOOZE_HOLD_MS,
   SNOOZE_LABELS,
+  UNDO_MS,
   deckVerbsFor,
   inSnoozeHoldBand,
   snoozeIsBacked,
@@ -40,7 +41,7 @@ export interface DeckProps {
 
 export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist }: DeckProps) {
   const deck = useDeck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist });
-  const { current, upcoming, confirmingId, toast, banner, snoozed } = deck;
+  const { current, upcoming, confirmingId, confirmingVerdict, toast, banner, snoozed } = deck;
   const [expanded, setExpanded] = useState(false);
   // The snoozed drill-down (task #26): snoozed cards stay hidden by default, viewable
   // behind this drill so the operator can deal one back without waiting for the sync.
@@ -361,6 +362,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             depth={depth}
             expanded={depth === 0 && expanded}
             confirming={depth === 0 && confirming}
+            confirmingVerdict={confirmingVerdict}
             onToggleEvidence={() => setExpanded((v) => !v)}
             onConfirmHeavy={deck.confirmHeavy}
             onCancelHeavy={deck.cancelHeavy}
@@ -678,9 +680,9 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
         <button
           type="button"
           data-testid="deck-btn-affirm"
-          aria-label={confirming ? 'Confirm' : 'Affirm'}
+          aria-label={confirming && confirmingVerdict === 'affirm' ? 'Confirm' : 'Affirm'}
           disabled={!current || !verbs?.affirm}
-          onClick={confirming ? deck.confirmHeavy : deck.affirm}
+          onClick={confirming && confirmingVerdict === 'affirm' ? deck.confirmHeavy : deck.affirm}
           className="flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] border-honeydew-600 p-3 text-honeydew-600 disabled:opacity-30"
         >
           ✓
@@ -690,7 +692,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
       {toast && (
         <div
           data-testid="deck-toast"
-          className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3.5 rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card"
+          className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3.5 overflow-hidden rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card"
         >
           <span>{toast.message}</span>
           {toast.canUndo && (
@@ -702,6 +704,19 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             >
               Undo
             </button>
+          )}
+          {/* D8 — the remaining time, on screen. The window was already the
+              strong part (the POST has not fired yet, so Undo cancels rather
+              than reverses); what was missing was any way to see how much of it
+              is left. The duration is READ FROM `UNDO_MS`, never re-typed, so
+              the bar and the timer that actually flushes cannot disagree. */}
+          {toast.canUndo && (
+            <span
+              data-testid="deck-toast-bar"
+              aria-hidden="true"
+              style={{ animationDuration: `${UNDO_MS}ms` }}
+              className="deck-undo-bar absolute inset-x-0 bottom-0 h-1 origin-left rounded-b-xl bg-cream/70"
+            />
           )}
         </div>
       )}
