@@ -28,7 +28,13 @@ import type { SttTranscribeResponse } from '../../lib/algernon/types';
 
 type Phase = 'idle' | 'transcribing' | 'review';
 
-function sttErrorMessage(e: unknown): string {
+// EXPORTED so the unified composer (#97) renders the SAME sentence when a
+// recording attached through its universal picker fails to transcribe. Same
+// doctrine as `friendlyError` in useIngest and `friendlyBatchError`: copy
+// guarded only by a comment survives exactly until someone edits the string,
+// and two homes for "that audio format isn't supported" is two answers to the
+// same failure depending on which door the file came through.
+export function sttErrorMessage(e: unknown): string {
   if (e instanceof ApiError) {
     switch (e.code) {
       case 'unsupported_media_type':
@@ -63,11 +69,24 @@ export function VoiceCapture({
   disabled = false,
   idPrefix = 'voice',
   insertDirectly = false,
+  showFileUpload = true,
 }: {
   onTranscript: (text: string) => void;
   disabled?: boolean;
   /** testid prefix so multiple instances (chat + ingest) don't collide. */
   idPrefix?: string;
+  /**
+   * Whether to offer the audio-FILE picker beside the mic (#97).
+   *
+   * Defaults to ON — every surface that mounts this today keeps exactly what it
+   * has. The unified composer passes false because its universal Attach already
+   * takes audio files and routes them by chip; leaving this one on would give
+   * the same surface two audio doors with DIFFERENT outcomes (one inserts a
+   * transcript, one offers to file it), which is precisely the "distinction made
+   * by which control you used" the unified composer exists to remove. The mic is
+   * untouched: dictation into the box is not an attachment.
+   */
+  showFileUpload?: boolean;
   /**
    * Skip the confirm step: hand the transcript straight to ``onTranscript``
    * (#54, operator-authored). The consumer then owns the edit surface, so the
@@ -197,21 +216,23 @@ export function VoiceCapture({
           {recorder.recording ? '■ Stop' : retryable ? '🎤 Record again' : '🎤 Record'}
         </Button>
 
-        <label
-          className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50"
-          data-testid={`${idPrefix}-file-label`}
-        >
-          Upload audio
-          <input
-            ref={fileRef}
-            type="file"
-            accept="audio/*"
-            className="hidden"
-            data-testid={`${idPrefix}-file`}
-            disabled={controlsDisabled}
-            onChange={(e) => void onFile(e)}
-          />
-        </label>
+        {showFileUpload && (
+          <label
+            className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50"
+            data-testid={`${idPrefix}-file-label`}
+          >
+            Upload audio
+            <input
+              ref={fileRef}
+              type="file"
+              accept="audio/*"
+              className="hidden"
+              data-testid={`${idPrefix}-file`}
+              disabled={controlsDisabled}
+              onChange={(e) => void onFile(e)}
+            />
+          </label>
+        )}
 
         {busy && (
           // Intentionally-left-blank: an explicit working signal, not a dead UI.
