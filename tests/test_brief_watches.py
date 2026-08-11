@@ -369,9 +369,12 @@ async def test_daemon_level_watches_crash_never_kills_brief(tmp_path, monkeypatc
     # Weather must not hit the network in this test either.
 
     async def _no_weather(config):  # type: ignore[no-untyped-def]
-        return "*Weather data unavailable.*"
+        # generate_brief now takes the COLLECTING form (markdown + parsed TAFs)
+        # so the feed reuses its fetch. Patch THAT name — patching the old one
+        # would leave the real fetch live and make this test hit the network.
+        return "*Weather data unavailable.*", []
 
-    monkeypatch.setattr(daemon_mod, "fetch_and_format", _no_weather)
+    monkeypatch.setattr(daemon_mod, "fetch_and_format_collect", _no_weather)
 
     # The NARRATION path reaches weather by a function-local import of
     # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
@@ -415,9 +418,12 @@ async def test_daemon_omits_section_when_unconfigured(tmp_path, monkeypatch) -> 
     data_dir.mkdir()
 
     async def _no_weather(config):  # type: ignore[no-untyped-def]
-        return "*Weather data unavailable.*"
+        # generate_brief now takes the COLLECTING form (markdown + parsed TAFs)
+        # so the feed reuses its fetch. Patch THAT name — patching the old one
+        # would leave the real fetch live and make this test hit the network.
+        return "*Weather data unavailable.*", []
 
-    monkeypatch.setattr(daemon_mod, "fetch_and_format", _no_weather)
+    monkeypatch.setattr(daemon_mod, "fetch_and_format_collect", _no_weather)
 
     # The NARRATION path reaches weather by a function-local import of
     # alfred.brief.weather.fetch_metars, which the daemon patch above cannot

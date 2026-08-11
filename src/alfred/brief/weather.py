@@ -580,6 +580,12 @@ def format_taf_section(tafs: list[dict], station_configs: list[StationConfig]) -
 async def fetch_and_format(config: WeatherConfig) -> str:
     """Top-level: fetch weather data and return formatted markdown section.
 
+    Thin wrapper over :func:`fetch_and_format_collect`, which does the work and
+    ALSO hands back the parsed TAFs. Kept as-is so every existing caller and
+    test is untouched; the daemon uses the collecting form so the feed
+    projection can reuse the forecast this call already fetched instead of
+    issuing a second request for data we are holding.
+
     SECTION-BOUNDARY CONTAINMENT (2026-06-11, closing the 2026-04-30 /
     2026-05-10 incident class): pre-fix, only httpx errors were caught
     here, so any parse/format exception (e.g. the mixed-type TypeErrors)
@@ -589,7 +595,29 @@ async def fetch_and_format(config: WeatherConfig) -> str:
     explicit "unavailable" line (intentionally-left-blank — visible
     absence, never silence) and the rest of the brief continues.
     """
+    markdown, _tafs = await fetch_and_format_collect(config)
+    return markdown
+
+
+async def fetch_and_format_collect(
+    config: WeatherConfig,
+) -> tuple[str, list[dict]]:
+    """The real body: returns ``(markdown, parsed_tafs)``.
+
+    Split out so the feed projection can reuse the SAME forecast this render
+    already fetched. The alternative — a second ``fetch_tafs`` from the
+    producer — would double the outbound requests and, worse, could disagree
+    with the rendered section if the API moved between the two calls.
+
+    The TAF list is ``[]`` whenever the forecast leg failed, which is
+    indistinguishable from "no forecast data" ON PURPOSE at this layer: the
+    caller decides what an empty list means (the feed producer treats a failed
+    leg as a non-read and declines to reconcile, so a fetch blip never
+    mass-``acted`` the weather kind). The markdown is byte-for-byte what
+    ``fetch_and_format`` always produced.
+    """
     parts = []
+    tafs: list[dict] = []
 
     # METAR (current conditions)
     try:
@@ -632,4 +660,4 @@ async def fetch_and_format(config: WeatherConfig) -> str:
             "*Forecast unavailable — TAF data could not be processed.*"
         )
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), tafs

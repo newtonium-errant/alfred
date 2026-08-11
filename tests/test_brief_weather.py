@@ -761,7 +761,7 @@ class TestGenerateBriefWeatherGuard:
         async def _structural_bug(config):  # type: ignore[no-untyped-def]
             raise TypeError("'>=' not supported between instances of 'str' and 'int'")
 
-        monkeypatch.setattr(daemon_mod, "fetch_and_format", _structural_bug)
+        monkeypatch.setattr(daemon_mod, "fetch_and_format_collect", _structural_bug)
 
         # The NARRATION path reaches weather by a function-local import of
         # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
