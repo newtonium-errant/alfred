@@ -405,6 +405,58 @@ def test_work_on_a_sealed_record_refuses_without_spending(
     assert load_rows(ledger_path(data_dir, "Salem", _BATCH)) == []
 
 
+def test_work_on_another_batchs_record_refuses_and_leaves_it_untouched(
+    data_dir, vault,
+) -> None:
+    """Gate review WARN-1, driven through the REAL vault_edit path.
+
+    Batch A's manifest points at batch B's record — a wiring fault
+    (stale record_path, a rename, an id collision). Every scope check
+    admits it: the target is a note, it carries a ``batch_id``, and its
+    status is ``open``. The per-type allowlist and the scope layer's
+    presence check are both satisfied, which is exactly why the identity
+    comparison has to exist.
+
+    The assertion that matters is the LAST one. "Did it raise" is weak —
+    a refusal for any unrelated reason looks identical. What proves the
+    guard is that batch B's record is byte-for-byte what it was: neither
+    the body_replace nor the frontmatter counters landed, so both write
+    surfaces of the single ``vault_edit`` call were prevented.
+    """
+    from alfred.batch.manifest import save_manifest
+
+    # Batch B's record — the victim. Open, batch-owned, entirely valid.
+    victim = vault_create(
+        vault,
+        "note",
+        "Batch batch-OTHER",
+        set_fields={
+            "batch_id": "batch-OTHER",
+            "batch_status": "open",
+            "batch_items_total": 5,
+        },
+        body="BATCH B RESULTS — must survive untouched",
+        scope="vera_batch",
+    )
+    before = (vault / victim["path"]).read_text(encoding="utf-8")
+
+    # Batch A, mis-wired to point at B's record.
+    m = _seed_batch(data_dir, vault, n=1)
+    m.record_path = victim["path"]
+    save_manifest(manifest_path(data_dir, "Salem", _BATCH), m)
+
+    c = build_campaign("batch_image", _cfg(), _drip(data_dir, vault))
+    client = FakeClient([])  # any model call raises
+    with pytest.raises(BatchSealedError, match="DIFFERENT"):
+        _run_one(c, f"{_BATCH}::hash0", client)
+
+    # Refused before spending.
+    assert client.messages.calls == []
+    assert load_rows(ledger_path(data_dir, "Salem", _BATCH)) == []
+    # And — the point of the test — B's record is untouched.
+    assert (vault / victim["path"]).read_text(encoding="utf-8") == before
+
+
 def test_quota_error_propagates_for_the_runner_to_classify(
     data_dir, vault,
 ) -> None:

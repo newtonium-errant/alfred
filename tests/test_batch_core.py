@@ -392,6 +392,70 @@ def test_seal_message_names_the_recovery_path() -> None:
     assert BATCH_STATUS_OPEN in msg
 
 
+def test_wrong_owner_refuses_naming_both_ids() -> None:
+    """Gate review WARN-1: an OPEN record of a DIFFERENT batch.
+
+    Every other check passes — the record is a note, it carries a
+    batch_id, its status is ``open``. Only the identity comparison
+    stands between batch A and batch B's results. The message must name
+    both ids, because "refused" without them leaves the operator with no
+    way to tell which record was wrong.
+    """
+    with pytest.raises(BatchSealedError) as ei:
+        assert_regenerable(
+            {"batch_status": BATCH_STATUS_OPEN, "batch_id": "batch-B"},
+            batch_id="batch-A",
+        )
+    msg = str(ei.value)
+    assert "batch-A" in msg
+    assert "batch-B" in msg
+    assert "DIFFERENT" in msg
+
+
+def test_wrong_owner_beats_the_status_check() -> None:
+    """Order matters: report the wrong record, not its status.
+
+    A SEALED record of another batch must refuse for OWNERSHIP, not for
+    the seal — telling the operator "sealed" would send them to unseal a
+    note that was never ours.
+    """
+    with pytest.raises(BatchSealedError, match="DIFFERENT"):
+        assert_regenerable(
+            {"batch_status": BATCH_STATUS_SEALED, "batch_id": "batch-B"},
+            batch_id="batch-A",
+        )
+
+
+def test_matching_owner_still_regenerates() -> None:
+    """The fix must not refuse the legitimate case."""
+    assert_regenerable(
+        {"batch_status": BATCH_STATUS_OPEN, "batch_id": "batch-A"},
+        batch_id="batch-A",
+    )
+
+
+def test_wrong_owner_is_logged_under_its_own_event() -> None:
+    """Distinct event, so a wiring fault is greppable apart from a seal."""
+    import structlog
+
+    with structlog.testing.capture_logs() as captured:
+        with pytest.raises(BatchSealedError):
+            assert_regenerable(
+                {"batch_status": BATCH_STATUS_OPEN, "batch_id": "batch-B"},
+                batch_id="batch-A",
+                record_path="note/Other.md",
+            )
+    wrong = [c for c in captured
+             if c.get("event") == "batch.seal.wrong_owner"]
+    sealed = [c for c in captured
+              if c.get("event") == "batch.seal.regenerate_refused"]
+    assert len(wrong) == 1
+    assert wrong[0]["batch_id"] == "batch-A"
+    assert wrong[0]["record_owner"] == "batch-B"
+    # The two causes must not be conflated in the log either.
+    assert sealed == []
+
+
 def test_seal_refusal_is_logged_with_reason() -> None:
     """Observability: the refusal must be greppable, with its cause."""
     import structlog

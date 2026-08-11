@@ -268,10 +268,21 @@ def _check_body_mutation_allowed(
     # This sits deliberately BELOW the per-type allowlist rather than
     # replacing it, because the two answer different questions: the
     # allowlist says "notes are a body_replace-able shape," and this
-    # says "and specifically THIS note is ours." Granting the former
+    # says "and this note belongs to A BATCH." Granting the former
     # without the latter is the whole risk of the feature — a wholesale
     # body replace on someone's meeting notes is unrecoverable from the
     # vault alone.
+    #
+    # PRECISELY what this proves, and what it does NOT (gate review
+    # WARN-1): it is a PRESENCE check, so it separates batch-owned
+    # records from operator-authored ones — and nothing more. It cannot
+    # tell one batch's record from another's, because ``check_scope``
+    # never receives the expected batch id and adding it would widen a
+    # signature every scope in this file shares. The IDENTITY half lives
+    # in ``alfred.batch.seal.assert_regenerable``, which holds both the
+    # expected id and the record's own and refuses a mismatch before any
+    # write. Read the two together: this gate keeps the worker off
+    # operator notes, that one keeps it off other batches' notes.
     #
     # Fail-CLOSED on missing frontmatter: if the caller did not thread
     # the on-disk read, ownership is unproven, and unproven is refused.
@@ -2437,6 +2448,16 @@ def check_scope(
         # reused, walk onto an unrelated operator note and start
         # rewriting it. So the record's own LIVE frontmatter must claim
         # the batch: ``BATCH_OWNER_FIELD`` present and non-empty.
+        #
+        # Scope of that claim (gate review WARN-1): presence proves the
+        # record is batch-owned, NOT that it is THIS batch's. The
+        # mistyped-id scenario above therefore splits in two — landing
+        # on an operator note is refused HERE, while landing on ANOTHER
+        # BATCH's note is refused by
+        # ``alfred.batch.seal.assert_regenerable``, which compares the
+        # ids directly. Both cases are closed; they are closed in
+        # different places, because only the caller knows which batch it
+        # is supposed to be.
         #
         # ``existing_frontmatter`` is the on-disk read that ``vault_edit``
         # performs before the gate (ops.py threads it for both ``edit``
