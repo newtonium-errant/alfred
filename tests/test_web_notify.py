@@ -1067,3 +1067,192 @@ async def test_notify_failure_never_fails_the_ack(
     fails = _log_events(captured, "transport.ticket.web_notify_failed")
     assert len(fails) == 1
     assert "salem unreachable" in fails[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# #86 — dismiss + age-out at the ROUTE layer
+#
+# The store-level behaviour has its own file (test_web_notify_lifecycle.py).
+# These cover what only a route test can: that the new endpoint carries the
+# SAME three-layer auth spine as ack, and that the age-out sweep is actually
+# WIRED to the read path — a retirement method nothing calls is the standing
+# trap here, and it would be invisible in a store-level test.
+# ---------------------------------------------------------------------------
+
+
+async def test_dismiss_clears_the_entry_from_the_tray(salem_client) -> None:
+    """The operator's report, end to end through the real routes."""
+    await _push_notice(salem_client, _notice_payload())
+    r = await salem_client.get("/chat/notifications", headers=_session_headers())
+    entry_id = (await r.json())["notifications"][0]["id"]
+
+    r = await salem_client.post(
+        "/chat/notifications/dismiss",
+        json={"ids": [entry_id]},
+        headers=_session_headers(),
+    )
+    assert r.status == 200
+    body = await r.json()
+    assert body["dismissed"] == 1
+    assert body["unread"] == 0
+
+    r = await salem_client.get("/chat/notifications", headers=_session_headers())
+    assert (await r.json())["notifications"] == []
+
+
+async def test_dismiss_is_idempotent_over_the_route(salem_client) -> None:
+    await _push_notice(salem_client, _notice_payload())
+    r = await salem_client.get("/chat/notifications", headers=_session_headers())
+    entry_id = (await r.json())["notifications"][0]["id"]
+
+    for expected in (1, 0):
+        r = await salem_client.post(
+            "/chat/notifications/dismiss",
+            json={"ids": [entry_id]},
+            headers=_session_headers(),
+        )
+        assert r.status == 200
+        assert (await r.json())["dismissed"] == expected
+
+
+async def test_dismiss_requires_the_peer_token(salem_client) -> None:
+    r = await salem_client.post(
+        "/chat/notifications/dismiss", json={"ids": ["x"]},
+    )
+    assert r.status == 401
+
+
+async def test_dismiss_requires_a_valid_session(salem_client) -> None:
+    for headers in (
+        _PEER_HEADERS,
+        {**_PEER_HEADERS, SESSION_HEADER: "garbage.token"},
+    ):
+        r = await salem_client.post(
+            "/chat/notifications/dismiss", json={"ids": ["x"]}, headers=headers,
+        )
+        assert r.status == 401
+        assert (await r.json())["error"] == "invalid_session"
+
+
+async def test_dismiss_is_peer_pinned_against_web_ingest(salem_client) -> None:
+    """The new route inherits the SAME escalation guard as ack.
+
+    A deterministic-create-only ingest token shares ``allowed_clients: [web]``;
+    without the pin it could clear the operator's tray. Asserts the reason AND
+    that the entry SURVIVED — a 401 alone would also come from an unrelated
+    auth failure.
+    """
+    await _push_notice(salem_client, _notice_payload())
+    with structlog.testing.capture_logs() as captured:
+        r = await salem_client.post(
+            "/chat/notifications/dismiss",
+            json={"ids": ["x"]},
+            headers=_ingest_peer_session_headers(),
+        )
+    assert r.status == 401
+    assert (await r.json())["error"] == "wrong_peer"
+    assert len(_log_events(captured, "web.notify.wrong_peer")) == 1
+
+    r = await salem_client.get("/chat/notifications", headers=_session_headers())
+    assert len((await r.json())["notifications"]) == 1, "the notice was cleared"
+
+
+async def test_vouched_reporter_cannot_dismiss(relay_salem_client) -> None:
+    """Recipient-pin: a reporter must not clear the operator's tray."""
+    headers = {
+        "Authorization": f"Bearer {DUMMY_RRTS_RELAY_TOKEN}",
+        "X-Alfred-Client": "web",
+        USER_HEADER: "Dana Dispatcher",
+    }
+    with structlog.testing.capture_logs() as captured:
+        r = await relay_salem_client.post(
+            "/chat/notifications/dismiss", json={"ids": ["x"]}, headers=headers,
+        )
+    assert r.status == 403
+    assert (await r.json())["error"] == "forbidden"
+    assert len(_log_events(captured, "web.notify.reporter_refused")) == 1
+
+
+async def test_dismiss_rejects_a_malformed_id_list(salem_client) -> None:
+    """Shared validator with ack — same body rules, same 400."""
+    for bad in ({"ids": "not-a-list"}, {"ids": [""]}, {"ids": [1, 2]}):
+        r = await salem_client.post(
+            "/chat/notifications/dismiss", json=bad, headers=_session_headers(),
+        )
+        assert r.status == 400
+        assert (await r.json())["error"] == "invalid_ids"
+
+
+async def test_reading_the_tray_retires_aged_entries(salem_client) -> None:
+    """THE WIRING PIN — the sweep must actually fire on the read path.
+
+    ``retire_aged`` has no daemon behind it; it runs only because this handler
+    calls it. A store-level test of the method passes just as happily against a
+    build where nothing calls it at all, and the tray would fill up forever
+    with nobody noticing. So this backdates a READ entry past the window and
+    asserts a plain GET makes it disappear.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    await _push_notice(salem_client, _notice_payload())
+    r = await salem_client.get("/chat/notifications", headers=_session_headers())
+    entry_id = (await r.json())["notifications"][0]["id"]
+    await salem_client.post(
+        "/chat/notifications/ack",
+        json={"ids": [entry_id]},
+        headers=_session_headers(),
+    )
+
+    # Backdate it past the default 7-day window, through the live store.
+    store = salem_client.app[KEY_WEB_NOTIFY_STORE]
+    key = str(synthetic_chat_id("andrew"))
+    store.notifications[key][0]["ts"] = (
+        datetime.now(timezone.utc) - timedelta(days=30)
+    ).isoformat()
+
+    with structlog.testing.capture_logs() as captured:
+        r = await salem_client.get(
+            "/chat/notifications", headers=_session_headers(),
+        )
+    assert (await r.json())["notifications"] == [], (
+        "an aged read entry survived a tray read — the sweep is not wired"
+    )
+    swept = _log_events(captured, "web.notify.retired_aged")
+    assert len(swept) == 1
+    assert swept[0]["retired"] == 1
+
+
+async def test_an_unread_entry_survives_the_read_path_sweep(
+    salem_client,
+) -> None:
+    """The negative half, at the route: age never clears something unseen."""
+    from datetime import datetime, timedelta, timezone
+
+    await _push_notice(salem_client, _notice_payload())
+    store = salem_client.app[KEY_WEB_NOTIFY_STORE]
+    key = str(synthetic_chat_id("andrew"))
+    store.notifications[key][0]["ts"] = (
+        datetime.now(timezone.utc) - timedelta(days=365)
+    ).isoformat()
+
+    r = await salem_client.get("/chat/notifications", headers=_session_headers())
+    body = await r.json()
+    assert len(body["notifications"]) == 1
+    assert body["unread"] == 1
+
+
+async def test_dismiss_without_a_store_is_an_explicit_zero(
+    aiohttp_client, tmp_path,
+) -> None:
+    """ILB: notifications on but no data_dir → an honest 200, never a 500."""
+    app = _build_salem_app(tmp_path, data_dir=None)
+    client = await aiohttp_client(app)
+    with structlog.testing.capture_logs() as captured:
+        r = await client.post(
+            "/chat/notifications/dismiss",
+            json={"ids": ["x"]},
+            headers=_session_headers(),
+        )
+    assert r.status == 200
+    assert await r.json() == {"dismissed": 0, "unread": 0}
+    assert len(_log_events(captured, "web.notify.store_absent")) == 1

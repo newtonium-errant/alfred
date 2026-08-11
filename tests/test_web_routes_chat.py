@@ -1403,6 +1403,10 @@ def test_register_web_routes_enabled_mounts_chat_and_auth(tmp_path) -> None:
         # Parity #22 — notifications default ON (web.notifications.enabled).
         "/chat/notifications",
         "/chat/notifications/ack",
+        # #86 — clearing an entry is its own route, not a flag on ack: the two
+        # differ in reversibility, and one endpoint with a mode switch is how a
+        # client bug turns a read into a clear.
+        "/chat/notifications/dismiss",
         "/auth/login",
         "/auth/verify",
         # OTP re-auth (#23): mounted in session mode alongside login/verify,

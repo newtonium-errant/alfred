@@ -24,7 +24,20 @@ data/
 # 251b2a5a. Ignored here so the accident cannot recur, and because the debris
 # guard structurally cannot catch it — a TRACKED file is "present at session
 # start" by definition, so the guard reports the tree clean.
-batch/
+#
+# THE LEADING SLASH IS LOAD-BEARING. A bare `batch/` matches a directory of
+# that name at ANY DEPTH, so it also swallowed `web/pages/api/batch/` and
+# shadowed `src/alfred/batch/` — two real source packages that happen to share
+# the word. That is not a hypothetical either: the unanchored form silently
+# excluded `web/pages/api/batch/targets.ts` from #90's commit. `git add`
+# NO-OPS on an ignored path and `git status` still reports clean, so the
+# worktree was correct, every suite run was correct, and the COMMITTED tree
+# was broken — a failure the worktree structurally cannot show you.
+#
+# Root-anchored, it means "the batch/ directory at the repo root" and nothing
+# else, which is all this rule ever needed to say. `tests/test_gitignore_scope.py`
+# holds the line for both packages.
+/batch/
 
 # Config with secrets
 .env

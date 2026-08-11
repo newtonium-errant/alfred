@@ -168,6 +168,11 @@ export const notificationSchema = z.object({
   issue_number: z.number().optional(),
   ts: z.string(),
   read: z.boolean(),
+  // #86 — optional for the same reason ticket_body is: a tray holding pre-#86
+  // entries must keep parsing rather than failing and emptying itself on
+  // rollout. The backend already filters dismissed entries out of the list, so
+  // this arriving true would be a backend bug, not a rendering case.
+  dismissed: z.boolean().optional(),
 });
 
 export type Notification = z.infer<typeof notificationSchema>;
@@ -187,6 +192,19 @@ export const notificationsAckBodySchema = z.object({
 });
 
 export type NotificationsAckBody = z.infer<typeof notificationsAckBodySchema>;
+
+// POST /api/chat/notifications/dismiss body (#86). Deliberately its OWN schema
+// object rather than an alias of the ack one: they validate the same shape
+// today, and an alias would quietly couple two endpoints whose rules are free
+// to diverge (dismiss is the less reversible of the two). The shared BOUND is
+// the constant above, which is the part that must not drift.
+export const notificationsDismissBodySchema = z.object({
+  ids: z.array(z.string().min(1).max(64)).min(1).max(MAX_NOTIFICATION_ACK_IDS),
+});
+
+export type NotificationsDismissBody = z.infer<
+  typeof notificationsDismissBodySchema
+>;
 
 // POST /api/auth/login body. Light edge guard; the backend is the authority on
 // the uniform { status:"sent" } response (no account enumeration). We only ensure

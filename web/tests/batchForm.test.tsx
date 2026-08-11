@@ -26,8 +26,29 @@ function img(name: string, size: number, type = 'image/jpeg'): File {
 
 const originalFetch = global.fetch;
 
+const TARGETS = { targets: [{ name: 'Salem', label: 'Salem', home: true }] };
+
+/**
+ * Route the mock by URL. The form makes TWO calls now — the target list on
+ * mount and the submit — and a single-response mock answered the first with
+ * the second's payload. Centralised so a new test cannot forget the targets
+ * leg and see a confusing "no batch targets configured" empty state instead of
+ * the form.
+ */
+function mockFetch(submit?: { ok: boolean; status: number; json: () => unknown }) {
+  const fn = vi.fn(async (url: string) => {
+    if (String(url).startsWith('/api/batch/targets')) {
+      return { ok: true, status: 200, json: async () => TARGETS };
+    }
+    if (!submit) throw new Error(`unexpected fetch: ${url}`);
+    return submit;
+  });
+  global.fetch = fn as unknown as typeof global.fetch;
+  return fn;
+}
+
 beforeEach(() => {
-  global.fetch = vi.fn();
+  mockFetch();
 });
 
 afterEach(() => {
@@ -159,7 +180,7 @@ describe('BatchForm', () => {
     // The browser must set it so the multipart boundary is generated; setting
     // it by hand produces a body the box cannot parse, and the failure looks
     // like an empty batch rather than a malformed request.
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+    mockFetch({
       ok: true,
       status: 200,
       json: async () => ({
@@ -175,9 +196,19 @@ describe('BatchForm', () => {
     });
     fireEvent.click(screen.getByTestId('batch-submit'));
 
-    await waitFor(() => expect(global.fetch).toHaveBeenCalled());
-    const [url, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(url).toBe('/api/batch/submit');
+    // Find the SUBMIT call by URL — call[0] is now the on-mount targets fetch.
+    await waitFor(() =>
+      expect(
+        (global.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([u]) => String(u).startsWith('/api/batch/submit'),
+        ),
+      ).toBe(true),
+    );
+    const [url, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([u]) => String(u).startsWith('/api/batch/submit'),
+    )!;
+    // The chosen instance rides the query string (#90), not the body.
+    expect(url).toBe('/api/batch/submit?target=Salem');
     expect(init.method).toBe('POST');
     expect(init.body).toBeInstanceOf(FormData);
     expect(init.headers).toBeUndefined();
@@ -185,7 +216,7 @@ describe('BatchForm', () => {
   });
 
   it('a queued submit promises processing and shows the record path', async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+    mockFetch({
       ok: true,
       status: 200,
       json: async () => ({
@@ -212,7 +243,7 @@ describe('BatchForm', () => {
     // THE honesty pin at the UI layer. With no campaign enabled the record sits
     // at 0 of N forever; telling the operator it is being processed would send
     // them away to wait for results that cannot arrive.
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+    mockFetch({
       ok: true,
       status: 200,
       json: async () => ({
@@ -236,7 +267,7 @@ describe('BatchForm', () => {
 
   it('a refused submit says why and KEEPS the staged scans', async () => {
     // The operator must not have to re-pick thirty files because of one 413.
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+    mockFetch({
       ok: false,
       status: 413,
       json: async () => ({ error: 'batch_too_large' }),
@@ -257,7 +288,7 @@ describe('BatchForm', () => {
 
   it('a 401 bubbles up so the page can redirect to login', async () => {
     const onUnauthenticated = vi.fn();
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+    mockFetch({
       ok: false,
       status: 401,
       json: async () => ({ error: 'invalid_session' }),
@@ -274,7 +305,13 @@ describe('BatchForm', () => {
   });
 
   it('a network failure is reported, not swallowed', async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('offline'));
+    // Targets still resolve; only the SUBMIT leg fails.
+    global.fetch = vi.fn(async (url: string) => {
+      if (String(url).startsWith('/api/batch/targets')) {
+        return { ok: true, status: 200, json: async () => TARGETS };
+      }
+      throw new Error('offline');
+    }) as unknown as typeof global.fetch;
     render(<BatchForm />);
     pick(screen.getByTestId('batch-files') as HTMLInputElement, [img('a.jpg', 10)]);
     await waitFor(() => expect(screen.getByTestId('batch-count')).toBeTruthy());
@@ -286,5 +323,101 @@ describe('BatchForm', () => {
     await waitFor(() =>
       expect(screen.getByTestId('batch-error').textContent).toContain('were not submitted'),
     );
+  });
+});
+
+
+describe('BatchForm — instance selection (#90)', () => {
+  function withTargets(list: Array<{ name: string; label: string; home: boolean }>) {
+    global.fetch = vi.fn(async (url: string) => {
+      if (String(url).startsWith('/api/batch/targets')) {
+        return { ok: true, status: 200, json: async () => ({ targets: list }) };
+      }
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          status: 'queued', batch_id: 'b1', images: 1, bytes: 10,
+          path: 'note/B.md', instance: 'VERA',
+        }),
+      };
+    }) as unknown as typeof global.fetch;
+  }
+
+  it('hides the picker on a single-instance deploy', async () => {
+    // A select with one option is a control that cannot be used.
+    withTargets([{ name: 'Salem', label: 'Salem', home: true }]);
+    render(<BatchForm />);
+    await waitFor(() => expect(screen.getByTestId('batch-limits')).toBeTruthy());
+    expect(screen.queryByTestId('batch-target-picker')).toBeNull();
+  });
+
+  it('STILL names the destination when the picker is hidden', async () => {
+    // The absence of a picker must not mean the destination goes unsaid.
+    withTargets([{ name: 'Salem', label: 'Salem', home: true }]);
+    render(<BatchForm />);
+    await waitFor(() =>
+      expect(screen.getByTestId('batch-limits').textContent).toContain('Sending to'),
+    );
+    expect(screen.getByTestId('batch-limits').textContent).toContain('Salem');
+  });
+
+  it('shows the picker once a second instance is configured', async () => {
+    withTargets([
+      { name: 'Salem', label: 'Salem', home: true },
+      { name: 'VERA', label: 'VERA', home: false },
+    ]);
+    render(<BatchForm />);
+    await waitFor(() => expect(screen.getByTestId('batch-target-picker')).toBeTruthy());
+    const select = screen.getByTestId('batch-target') as HTMLSelectElement;
+    expect(select.value).toBe('Salem'); // home is the default
+    expect(select.querySelectorAll('option')).toHaveLength(2);
+  });
+
+  it('submits to the SELECTED instance', async () => {
+    withTargets([
+      { name: 'Salem', label: 'Salem', home: true },
+      { name: 'VERA', label: 'VERA', home: false },
+    ]);
+    render(<BatchForm />);
+    await waitFor(() => expect(screen.getByTestId('batch-target')).toBeTruthy());
+    fireEvent.change(screen.getByTestId('batch-target'), { target: { value: 'VERA' } });
+
+    pick(screen.getByTestId('batch-files') as HTMLInputElement, [img('a.jpg', 10)]);
+    await waitFor(() => expect(screen.getByTestId('batch-count')).toBeTruthy());
+    fireEvent.change(screen.getByTestId('batch-instruction'), {
+      target: { value: 'Read the total.' },
+    });
+    fireEvent.click(screen.getByTestId('batch-submit'));
+
+    await waitFor(() =>
+      expect(
+        (global.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([u]) => String(u) === '/api/batch/submit?target=VERA',
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it('says so explicitly when NO instance is configured', async () => {
+    // ILB: not an inert picker over an empty list, and not a form whose submit
+    // would 503 — a stated reason with the fix in it.
+    withTargets([]);
+    render(<BatchForm />);
+    await waitFor(() => expect(screen.getByTestId('batch-no-targets')).toBeTruthy());
+    expect(screen.queryByTestId('batch-form')).toBeNull();
+  });
+
+  it('does not flash the empty state while targets are loading', async () => {
+    // `null` means loading; showing "nothing configured" for one frame on a
+    // healthy deploy would teach the operator to distrust the message.
+    let resolveTargets: (v: unknown) => void = () => {};
+    global.fetch = vi.fn(
+      () => new Promise((r) => { resolveTargets = r; }),
+    ) as unknown as typeof global.fetch;
+    render(<BatchForm />);
+    expect(screen.queryByTestId('batch-no-targets')).toBeNull();
+    expect(screen.getByTestId('batch-form')).toBeTruthy();
+    resolveTargets({ ok: true, status: 200, json: async () => ({ targets: [] }) });
+    await waitFor(() => expect(screen.getByTestId('batch-no-targets')).toBeTruthy());
   });
 });

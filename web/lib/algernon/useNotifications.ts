@@ -25,6 +25,8 @@ export interface UseNotifications {
   unread: number;
   /** Mark the given ids read (server-side + local mirror). */
   ack: (ids: string[]) => Promise<void>;
+  /** Clear the given ids from the tray (#86) — server-side + local removal. */
+  dismiss: (ids: string[]) => Promise<void>;
   /** Re-fetch the tray now (bootstrap / after-turn hook-in). */
   refresh: () => Promise<void>;
 }
@@ -81,5 +83,21 @@ export function useNotifications({ enabled }: { enabled: boolean }): UseNotifica
     }
   }, []);
 
-  return { notifications, unread, ack, refresh };
+  const dismiss = useCallback(async (ids: string[]) => {
+    if (!ids.length) return;
+    try {
+      const r = await chatApi.dismissNotifications(ids);
+      if (!alive.current) return;
+      setUnread(r.unread);
+      // REMOVED locally, not flagged. The server has already stopped listing
+      // these, so leaving them on screen until the next poll would show the
+      // operator a row that no longer exists — and this whole feature is about
+      // a row that would not go away.
+      setNotifications((prev) => prev.filter((n) => !ids.includes(n.id)));
+    } catch {
+      /* best-effort — the entry stays and can be re-dismissed */
+    }
+  }, []);
+
+  return { notifications, unread, ack, dismiss, refresh };
 }

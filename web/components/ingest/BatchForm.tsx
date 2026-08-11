@@ -1,7 +1,10 @@
-import { ChangeEvent, useCallback, useState } from 'react';
+import { ChangeEvent, useCallback, useEffect, useState } from 'react';
 import { Button } from '../ui/button';
 import { Label } from '../ui/label';
 import { Textarea } from '../ui/textarea';
+import { EmptyState } from '../EmptyState';
+import { BatchTargetPicker } from './BatchTargetPicker';
+import type { BatchTarget, BatchTargetsResponse } from '../../lib/algernon/types';
 import { prepareImageForUpload } from '../../lib/algernon/imagePrepare';
 import {
   ALLOWED_BATCH_MEDIA_TYPES,
@@ -50,6 +53,31 @@ export function BatchForm({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<BatchSubmitResponse | null>(null);
+  // #90 — which instance receives the batch. `null` while loading, so the
+  // "nothing configured" empty state is not shown for the first render of a
+  // deploy that is perfectly fine.
+  const [targets, setTargets] = useState<BatchTarget[] | null>(null);
+  const [target, setTarget] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    fetch('/api/batch/targets')
+      .then((r) => (r.ok ? r.json() : { targets: [] }))
+      .then((body: BatchTargetsResponse) => {
+        if (!active) return;
+        const list = body?.targets ?? [];
+        setTargets(list);
+        // Default to home, falling back to the first configured instance —
+        // never to a hardcoded name.
+        setTarget((list.find((t) => t.home) || list[0])?.name ?? '');
+      })
+      .catch(() => {
+        if (active) setTargets([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const onPick = useCallback(
     async (e: ChangeEvent<HTMLInputElement>) => {
@@ -101,14 +129,19 @@ export function BatchForm({
     setSubmitting(true);
     setSubmitError(null);
     try {
-      const res = await fetch('/api/batch/submit', {
-        method: 'POST',
-        // NO Content-Type header: the browser must set it so the multipart
-        // boundary is generated. Setting it by hand produces a body the box
-        // cannot parse — a boundary-less multipart is unreadable, and the
-        // failure looks like an empty batch rather than a malformed request.
-        body: buildBatchForm(instruction.trim(), files),
-      });
+      // The target rides the QUERY STRING: the body is raw multipart bytes the
+      // BFF relays without parsing, so a form field would force it to parse.
+      const res = await fetch(
+        `/api/batch/submit?target=${encodeURIComponent(target)}`,
+        {
+          method: 'POST',
+          // NO Content-Type header: the browser must set it so the multipart
+          // boundary is generated. Setting it by hand produces a body the box
+          // cannot parse — a boundary-less multipart is unreadable, and the
+          // failure looks like an empty batch rather than a malformed request.
+          body: buildBatchForm(instruction.trim(), files),
+        },
+      );
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
         const err = new ApiError(res.status, body?.error ?? 'network_error');
@@ -125,7 +158,7 @@ export function BatchForm({
     } finally {
       setSubmitting(false);
     }
-  }, [canSubmit, instruction, files, onUnauthenticated]);
+  }, [canSubmit, instruction, files, onUnauthenticated, target]);
 
   const startAnother = useCallback(() => {
     setResult(null);
@@ -159,6 +192,23 @@ export function BatchForm({
     );
   }
 
+  // Intentionally-left-blank: nothing wired for bulk upload is a real,
+  // explicit state — not an inert picker over an empty list, and not a form
+  // whose submit would 503. `null` means still loading, so a healthy deploy
+  // never flashes this on first render.
+  if (targets !== null && targets.length === 0) {
+    return (
+      <EmptyState
+        icon="📷"
+        title="No batch targets configured"
+        message="No instance on this deployment is wired for bulk scan upload yet. Set the per-target batch env on the server to enable it."
+        testId="batch-no-targets"
+      />
+    );
+  }
+
+  const activeTarget = targets?.find((t) => t.name === target);
+
   return (
     <form
       data-testid="batch-form"
@@ -168,6 +218,13 @@ export function BatchForm({
         void handleSubmit();
       }}
     >
+      <BatchTargetPicker
+        targets={targets ?? []}
+        target={target}
+        onTargetChange={setTarget}
+        disabled={submitting}
+      />
+
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Label htmlFor="batch-files">Scans</Label>
@@ -188,6 +245,7 @@ export function BatchForm({
 
         {/* The caps, stated BEFORE the operator does the scanning work. */}
         <p className={subtle} data-testid="batch-limits">
+          {activeTarget ? <>Sending to <strong>{activeTarget.label}</strong>. </> : null}
           Up to {MAX_BATCH_IMAGES} scans per batch, {mib(MAX_BATCH_IMAGE_BYTES)} MiB
           each and {mib(MAX_BATCH_TOTAL_BYTES)} MiB in total.{' '}
           {ALLOWED_BATCH_MEDIA_TYPES.map((t) => t.replace('image/', '').toUpperCase()).join(', ')}.

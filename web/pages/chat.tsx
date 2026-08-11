@@ -62,6 +62,7 @@ export default function ChatPage() {
     notifications,
     unread,
     ack: ackNotifications,
+    dismiss: dismissNotifications,
     refresh: refreshNotifications,
   } = useNotifications({ enabled: authed });
   const wasSending = useRef(false);
@@ -203,6 +204,7 @@ export default function ChatPage() {
             <NotificationList
               notifications={notifications}
               onAck={(ids) => void ackNotifications(ids)}
+              onDismiss={(ids) => void dismissNotifications(ids)}
             />
           </section>
 

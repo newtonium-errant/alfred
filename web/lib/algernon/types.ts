@@ -91,6 +91,10 @@ export interface NotificationItem {
   issue_number?: number;
   ts: string;
   read: boolean;
+  // #86 — terminal for rendering. A dismissed entry never reaches the client
+  // (the backend filters it), so this is present for the audit/debug shape
+  // rather than for the tray, and is optional because pre-#86 entries lack it.
+  dismissed?: boolean;
 }
 
 // GET /api/chat/notifications → the caller's own tray, newest-first. An empty
@@ -104,6 +108,28 @@ export interface NotificationsResponse {
 // re-acking acks 0 and never errors.
 export interface NotificationsAckResponse {
   acked: number;
+  unread: number;
+}
+
+// POST /api/chat/notifications/dismiss { ids } → { dismissed, unread } (#86).
+// Clearing, not reading: the entry stops being listed anywhere (tray AND the
+// daily brief) while staying in the store for audit. Idempotent — re-dismissing
+// dismisses 0 and never errors.
+// GET /api/batch/targets → the instances a scan batch can be sent to (#90).
+// `home` marks the deployment's own instance (the default). Metadata only — no
+// URL or token ever reaches the browser.
+export interface BatchTarget {
+  name: string;
+  label: string;
+  home: boolean;
+}
+
+export interface BatchTargetsResponse {
+  targets: BatchTarget[];
+}
+
+export interface NotificationsDismissResponse {
+  dismissed: number;
   unread: number;
 }
 

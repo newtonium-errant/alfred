@@ -26,7 +26,7 @@ function item(over: Partial<NotificationItem> = {}): NotificationItem {
     ticket_uid: 'tkt-1',
     issue_url: 'http://localhost:3001/x/y/issues/9',
     ts: '2026-08-10T09:00:00Z',
-    read: true,
+    read: false,
     ...over,
   };
 }
@@ -35,13 +35,13 @@ const BODY = 'Reported by: Ben\nPriority: high\n\n## Repro\n1. Click Submit Payr
 
 describe('the card expands to show the ticket', () => {
   it('is collapsed by default — glance first, per the interaction grammar', () => {
-    render(<NotificationList notifications={[item({ ticket_body: BODY })]} onAck={vi.fn()} />);
+    render(<NotificationList notifications={[item({ ticket_body: BODY })]} onAck={vi.fn()} onDismiss={vi.fn()} />);
     expect(screen.queryByTestId('notification-body')).toBeNull();
     expect(screen.getByTestId('notification-expand')).toBeTruthy();
   });
 
   it('tapping expands to reveal the content', () => {
-    render(<NotificationList notifications={[item({ ticket_body: BODY })]} onAck={vi.fn()} />);
+    render(<NotificationList notifications={[item({ ticket_body: BODY })]} onAck={vi.fn()} onDismiss={vi.fn()} />);
     fireEvent.click(screen.getByTestId('notification-expand'));
     const body = screen.getByTestId('notification-body');
     expect(body.textContent).toContain('Click Submit Payroll');
@@ -49,7 +49,7 @@ describe('the card expands to show the ticket', () => {
   });
 
   it('tapping again collapses it', () => {
-    render(<NotificationList notifications={[item({ ticket_body: BODY })]} onAck={vi.fn()} />);
+    render(<NotificationList notifications={[item({ ticket_body: BODY })]} onAck={vi.fn()} onDismiss={vi.fn()} />);
     fireEvent.click(screen.getByTestId('notification-expand'));
     fireEvent.click(screen.getByTestId('notification-expand'));
     expect(screen.queryByTestId('notification-body')).toBeNull();
@@ -62,7 +62,7 @@ describe('the card expands to show the ticket', () => {
           item({ id: 'a', ticket_body: 'AAA content' }),
           item({ id: 'b', ticket_body: 'BBB content' }),
         ]}
-        onAck={vi.fn()}
+        onAck={vi.fn()} onDismiss={vi.fn()}
       />,
     );
     fireEvent.click(screen.getAllByTestId('notification-expand')[0]);
@@ -74,12 +74,12 @@ describe('the card expands to show the ticket', () => {
 
 describe('what has no content to show', () => {
   it('a plain (non-ticket) notice offers no expand affordance at all', () => {
-    render(<NotificationList notifications={[item({ ticket_uid: '', ticket_body: '' })]} onAck={vi.fn()} />);
+    render(<NotificationList notifications={[item({ ticket_uid: '', ticket_body: '' })]} onAck={vi.fn()} onDismiss={vi.fn()} />);
     expect(screen.queryByTestId('notification-expand')).toBeNull();
   });
 
   it('ILB — a TICKET notice whose content is missing says so, rather than\n     opening an empty panel. A ticket that arrived without its body is a\n     real state (a pre-#76 entry, or an intake that could not compose one),\n     and an empty expansion would read as a broken card.', () => {
-    render(<NotificationList notifications={[item({ ticket_body: '' })]} onAck={vi.fn()} />);
+    render(<NotificationList notifications={[item({ ticket_body: '' })]} onAck={vi.fn()} onDismiss={vi.fn()} />);
     fireEvent.click(screen.getByTestId('notification-expand'));
     const body = screen.getByTestId('notification-body');
     expect(body.textContent).toMatch(/content unavailable/i);
@@ -89,7 +89,7 @@ describe('what has no content to show', () => {
     render(
       <NotificationList
         notifications={[item({ ticket_body: BODY, ticket_body_truncated: true })]}
-        onAck={vi.fn()}
+        onAck={vi.fn()} onDismiss={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByTestId('notification-expand'));
@@ -104,7 +104,7 @@ describe('the content is TEXT, never markup', () => {
     // feed evidence. React escapes by default; this pins that nobody
     // "improves" it into dangerouslySetInnerHTML for markdown rendering.
     const hostile = '<img src=x onerror=alert(1)> <script>alert(2)</script>';
-    render(<NotificationList notifications={[item({ ticket_body: hostile })]} onAck={vi.fn()} />);
+    render(<NotificationList notifications={[item({ ticket_body: hostile })]} onAck={vi.fn()} onDismiss={vi.fn()} />);
     fireEvent.click(screen.getByTestId('notification-expand'));
     const body = screen.getByTestId('notification-body');
     expect(body.textContent).toContain('<script>');
