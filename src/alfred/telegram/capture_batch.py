@@ -111,6 +111,37 @@ exploratory.
 - raw_contradictions: moments where the user contradicted themselves \
 earlier in the same session. Quote both sides briefly.
 
+Fulfilment check before emitting an action item. An action item is \
+something still OUTSTANDING when the session ends. Before you emit one, \
+read forward through the rest of the transcript: if the user later says \
+they already did it, already sent it, or already have it, do NOT emit \
+it. A promise made at 14:02 and satisfied at 14:20 is not an open task, \
+and filing it as one leaves the user to close by hand something they \
+already finished.
+
+Attachments appear in the transcript as the literal marker \
+``[image attached]`` — one per image, sometimes several in a row, \
+sometimes with no caption beside them. (The exported constant \
+``capture_batch.IMAGE_MARKER`` is the source of truth for that string; \
+if this instruction and the constant ever disagree, the constant wins.) \
+The marker asserts that something ARRIVED, never what it was. You \
+cannot see the contents of any image — you see only markers plus what \
+the user typed or said. So do not infer from four markers that the four \
+right things were sent, and never describe or summarize what an image \
+depicts.
+
+Use the markers for COUNTING against what was promised. If the user \
+promised a specific quantity and fewer markers follow, that is PARTIAL \
+fulfilment: emit the action item, and write the REMAINDER as the thing \
+outstanding — "send the last two pages of the workout plan (four \
+already attached in session)" rather than "send the workout plan". If \
+the count matches what was promised, or the user says in words that \
+they are finished, treat the promise as satisfied and emit nothing.
+
+When you cannot tell whether a promise was satisfied, EMIT the action \
+item. A task the user closes in one tap costs less than a promise that \
+disappears.
+
 Entity discrimination — default to NEW, not SAME. When this transcript \
 references a known entity (person, building, org, project, location), \
 treat it as a NEW reference unless the transcript explicitly \
