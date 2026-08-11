@@ -137,6 +137,13 @@ _KEY_BATCH_MAX_IMAGES = "transport.batch_max_images"
 _KEY_BATCH_MAX_IMAGE_BYTES = "transport.batch_max_image_bytes"
 _KEY_BATCH_MAX_TOTAL_BYTES = "transport.batch_max_total_bytes"
 _KEY_BATCH_MAX_INSTRUCTION_CHARS = "transport.batch_max_instruction_chars"
+_KEY_BATCH_CONFIG_PATH = "transport.batch_config_path"
+_KEY_BATCH_KICK_ENABLED = "transport.batch_kick_enabled"
+
+#: The drip campaign that drains submitted batches. Named here because the
+#: route KICKS it by name; it must match the campaign key in the operator's
+#: ``drip.campaigns`` block.
+BATCH_CAMPAIGN_NAME = "batch_image"
 
 
 class _Refused(Exception):
@@ -562,6 +569,34 @@ async def _handle_vault_batch(request: web.Request) -> web.StreamResponse:
         _discard_batch(root, batch_id=batch_id, reason="error")
         return _json_error(502, "batch_create_failed", detail=str(exc)[:200])
 
+    # --- the kick (#83 item 5) ------------------------------------------
+    # Everything above is durable. This is the optional head start, and the
+    # response tells the truth about whether it happened.
+    kick_enabled = bool(request.app.get(_KEY_BATCH_KICK_ENABLED, False))
+    kicked_pid: int | None = None
+    if kick_enabled:
+        from alfred.drip.kick import kick_drip_run
+
+        kicked_pid = kick_drip_run(
+            config_path=str(request.app.get(_KEY_BATCH_CONFIG_PATH, "") or ""),
+            campaign=BATCH_CAMPAIGN_NAME,
+            data_dir=data_dir,
+        )
+    else:
+        # ILB, and the most important signal on this route. Without it the
+        # operator uploads thirty scans, gets a cheerful id back, and watches a
+        # record sit at 0 of N forever with nothing anywhere saying why. The
+        # scans ARE saved; what is missing is anything configured to read them.
+        log.warning(
+            "transport.batch.no_consumer",
+            batch_id=batch_id,
+            campaign=BATCH_CAMPAIGN_NAME,
+            images=len(images),
+            detail="batch saved but NOT queued — the batch_image drip "
+                   "campaign is not enabled on this instance, so nothing "
+                   "will process these scans until it is",
+        )
+
     log.info(
         "transport.batch.created",
         peer=peer,
@@ -572,9 +607,14 @@ async def _handle_vault_batch(request: web.Request) -> web.StreamResponse:
         bytes=transferred_bytes,
         path=manifest.record_path,
         instance=instance,
+        kicked_pid=kicked_pid,
     )
     response: dict[str, Any] = {
-        "status": "queued",
+        # "queued" means something is configured to process this batch;
+        # "saved" means the files are safe but nothing will read them. They
+        # are different facts and the UI says different things about them, so
+        # they must not share a word.
+        "status": "queued" if kick_enabled else "saved",
         "batch_id": batch_id,
         "images": len(images),
         "bytes": transferred_bytes,
@@ -634,12 +674,25 @@ def register_batch_routes(
     max_image_bytes: int = DEFAULT_BATCH_MAX_IMAGE_BYTES,
     max_total_bytes: int = DEFAULT_BATCH_MAX_TOTAL_BYTES,
     max_instruction_chars: int = DEFAULT_BATCH_MAX_INSTRUCTION_CHARS,
+    config_path: str = "",
+    kick_enabled: bool = False,
 ) -> bool:
     """Mount ``POST /vault/batch`` — IFF batch submit is enabled.
 
     Returns ``True`` when mounted, ``False`` when disabled (opt-in inertness:
     nothing is registered and the transport server stays byte-unchanged). Must
     be called BEFORE the app is started, like every other ``register_*`` helper.
+
+    ``kick_enabled`` should be TRUE exactly when the ``batch_image`` drip
+    campaign is enabled on this instance. It is not a second on/off switch for
+    the operator: it is how the route knows whether anything will actually
+    process a submission, which is the difference between answering "queued"
+    and answering "saved". Guessing True here would promise processing that
+    never happens; guessing False would under-report a working setup.
+
+    ``config_path`` is this instance's config file, passed to the kicked run as
+    ``--config``. Empty means no kick — see :func:`~alfred.drip.kick.kick_drip_run`
+    for why running without it would drain a DIFFERENT instance's campaigns.
     """
     if not enabled:
         # Intentionally-left-blank: disabled is a deliberate state, logged so
@@ -656,7 +709,20 @@ def register_batch_routes(
     app[_KEY_BATCH_MAX_IMAGE_BYTES] = int(max_image_bytes)
     app[_KEY_BATCH_MAX_TOTAL_BYTES] = int(max_total_bytes)
     app[_KEY_BATCH_MAX_INSTRUCTION_CHARS] = int(max_instruction_chars)
+    app[_KEY_BATCH_CONFIG_PATH] = str(config_path or "")
+    # A kick without a config path would drain the wrong instance, so the two
+    # are ANDed here rather than checked separately at request time.
+    app[_KEY_BATCH_KICK_ENABLED] = bool(kick_enabled and config_path)
     app.router.add_post("/vault/batch", _handle_vault_batch)
+    if kick_enabled and not config_path:
+        log.warning(
+            "transport.batch.kick_unavailable",
+            instance=instance_name,
+            detail="the batch_image campaign is enabled but no config path "
+                   "reached the route, so submissions will not kick a run. "
+                   "They are still saved, and the hourly timer still drains "
+                   "them — only the head start is lost.",
+        )
     log.info(
         "transport.batch.registered",
         instance=instance_name,
@@ -664,6 +730,7 @@ def register_batch_routes(
         max_images=int(max_images),
         max_image_bytes=int(max_image_bytes),
         max_total_bytes=int(max_total_bytes),
+        kick_enabled=bool(kick_enabled and config_path),
     )
     return True
 

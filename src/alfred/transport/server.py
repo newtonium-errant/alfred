@@ -719,6 +719,8 @@ def wire_transport_app(
     batch_config: Any | None = None,
     batch_data_dir: str = "",
     batch_instance: str = "",
+    batch_config_path: str = "",
+    batch_kick_enabled: bool = False,
     recall_enabled: bool = False,
     feed_enabled: bool = False,
     feed_store: Any | None = None,
@@ -831,6 +833,14 @@ def wire_transport_app(
             the batch path. Falls back to ``instance_name`` (both read
             ``telegram.instance.name``, so they agree today; the explicit
             kwarg is what keeps them agreeing if either moves).
+        batch_config_path: This instance's config file, handed to the
+            kicked drip run as ``--config``. Required for the kick: a run
+            spawned without it reads ``config.yaml`` and would drain a
+            DIFFERENT instance's campaigns.
+        batch_kick_enabled: True exactly when the ``batch_image`` drip
+            campaign is enabled here. Not an operator switch — it is how
+            the route knows whether anything will process a submission,
+            and therefore whether to answer "queued" or "saved".
         recall_enabled: Mount the cross-instance recall answer route
             (``POST /peer/recall``, #20 S1). Default ``False`` — an
             un-opted-in instance never mounts the route (opt-in inertness;
@@ -1132,11 +1142,14 @@ def wire_transport_app(
                 batch_config, "max_instruction_chars",
                 DEFAULT_BATCH_MAX_INSTRUCTION_CHARS,
             ),
+            config_path=batch_config_path,
+            kick_enabled=batch_kick_enabled,
         )
         log.info(
             "transport.wire_transport_app.batch_registered",
             instance=batch_instance or instance_name,
             data_dir=batch_data_dir or "(unset)",
+            kick_enabled=bool(batch_kick_enabled and batch_config_path),
         )
     else:
         # Symmetric with ingest: still call the registrar so its own

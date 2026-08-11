@@ -190,7 +190,10 @@ async def test_a_submission_saves_images_manifest_and_record(
     assert resp.status == 200
     body = await resp.json()
 
-    assert body["status"] == "queued"
+    # "saved" because this fixture wires no consumer; the queued-vs-saved
+    # distinction has its own pins below. What this test is about is that the
+    # three durable artifacts exist either way.
+    assert body["status"] == "saved"
     assert body["images"] == 2
     batch_id = body["batch_id"]
 
@@ -533,6 +536,137 @@ async def test_an_unconfigured_batch_path_is_refused_not_guessed(
     resp = await client.post("/vault/batch", data=_form([("a.jpg", _scan(1), "image/jpeg")]))
     assert resp.status == 503
     assert (await resp.json())["error"] == "batch_not_configured"
+
+
+# ---------------------------------------------------------------------------
+# The on-submit kick (#83 item 5)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_submission_kicks_one_drip_run(
+    aiohttp_client, vault: Path, data_dir: Path, monkeypatch,
+) -> None:
+    """THE wiring pin for the kick, driven through the production route.
+
+    A kick helper that nothing calls is the standing trap here: its own unit
+    tests pass, the route returns 200, and every batch quietly waits for the
+    hourly timer. Only a test that goes through the route can see it.
+    """
+    calls: list[dict] = []
+    import alfred.drip.kick as kick_mod
+
+    monkeypatch.setattr(
+        kick_mod, "kick_drip_run",
+        lambda **kw: calls.append(kw) or 999,
+    )
+
+    client = await aiohttp_client(_make_app(
+        vault=vault, data_dir=data_dir,
+        config_path="/etc/alfred/config.vera.yaml", kick_enabled=True,
+    ))
+    resp = await client.post("/vault/batch", data=_form([("a.jpg", _scan(1), "image/jpeg")]))
+    assert resp.status == 200
+    assert (await resp.json())["status"] == "queued"
+
+    assert len(calls) == 1, "the route did not kick a run"
+    assert calls[0]["campaign"] == "batch_image"
+    assert calls[0]["config_path"] == "/etc/alfred/config.vera.yaml"
+    # The kicked run must look in the directory the route just wrote to.
+    assert str(calls[0]["data_dir"]) == str(data_dir)
+
+
+async def test_exactly_one_run_is_kicked_per_submission(
+    aiohttp_client, vault: Path, data_dir: Path, monkeypatch,
+) -> None:
+    """One submission, one kick — not one per image.
+
+    Sixty scans kicking sixty runs would be sixty processes contending for one
+    lock, of which 59 immediately stand down. Harmless by luck, wasteful by
+    design, and the sort of thing that only shows up on a big real batch.
+    """
+    calls: list[dict] = []
+    import alfred.drip.kick as kick_mod
+
+    monkeypatch.setattr(kick_mod, "kick_drip_run", lambda **kw: calls.append(kw) or 1)
+
+    client = await aiohttp_client(_make_app(
+        vault=vault, data_dir=data_dir, config_path="c.yaml", kick_enabled=True,
+    ))
+    await client.post("/vault/batch", data=_form([
+        (f"s{i}.jpg", _scan(i), "image/jpeg") for i in range(5)
+    ]))
+    assert len(calls) == 1
+
+
+async def test_a_refused_submission_kicks_nothing(
+    aiohttp_client, vault: Path, data_dir: Path, monkeypatch,
+) -> None:
+    """There is nothing to drain, so there is nothing to start."""
+    calls: list[dict] = []
+    import alfred.drip.kick as kick_mod
+
+    monkeypatch.setattr(kick_mod, "kick_drip_run", lambda **kw: calls.append(kw) or 1)
+
+    client = await aiohttp_client(_make_app(
+        vault=vault, data_dir=data_dir, config_path="c.yaml", kick_enabled=True,
+    ))
+    resp = await client.post("/vault/batch", data=_form(
+        [("a.jpg", _scan(1), "image/jpeg")], instruction=None,
+    ))
+    assert resp.status == 400
+    assert calls == []
+
+
+async def test_with_no_consumer_the_answer_is_saved_not_queued(
+    aiohttp_client, vault: Path, data_dir: Path,
+) -> None:
+    """ILB, and the most important signal on this route.
+
+    With the batch_image campaign disabled the scans ARE saved but nothing will
+    ever read them. Answering "queued" would send the operator away to wait for
+    results that cannot arrive, so the two facts get two different words — and
+    the warn line names the campaign they need to enable.
+    """
+    import structlog
+
+    client = await aiohttp_client(_make_app(
+        vault=vault, data_dir=data_dir, kick_enabled=False,
+    ))
+    with structlog.testing.capture_logs() as captured:
+        resp = await client.post(
+            "/vault/batch", data=_form([("a.jpg", _scan(1), "image/jpeg")]),
+        )
+
+    body = await resp.json()
+    assert resp.status == 200
+    assert body["status"] == "saved", "promised processing with no consumer"
+    # The submission is still fully durable — this is not a refusal.
+    assert body["images"] == 1
+    assert _saved_batches(data_dir) != []
+
+    warned = [c for c in captured if c.get("event") == "transport.batch.no_consumer"]
+    assert len(warned) == 1
+    assert warned[0]["campaign"] == "batch_image"
+
+
+def test_a_kick_without_a_config_path_is_disabled_and_says_so() -> None:
+    """Enabled-but-unusable must not present as enabled.
+
+    ``kick_enabled`` and ``config_path`` are ANDed at registration rather than
+    checked per request, so the route cannot promise "queued" while every kick
+    silently declines for a missing ``--config``.
+    """
+    import structlog
+
+    app = web.Application()
+    with structlog.testing.capture_logs() as captured:
+        register_batch_routes(
+            app, enabled=True, instance_name=_INSTANCE, data_dir="/tmp/x",
+            kick_enabled=True, config_path="",
+        )
+    events = {c["event"]: c for c in captured}
+    assert "transport.batch.kick_unavailable" in events
+    assert events["transport.batch.registered"]["kick_enabled"] is False
 
 
 # ---------------------------------------------------------------------------
