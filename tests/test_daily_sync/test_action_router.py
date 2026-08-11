@@ -43,7 +43,15 @@ from alfred.daily_sync.confidence import save_state
 from alfred.daily_sync.corpus import iter_corrections
 from alfred.daily_sync.feed_producer import _FAMILIES, build_feed_items
 from alfred.feed import FeedStore
-from alfred.feed.model import STATE_ACKED, STATE_ACTED, STATE_OPEN, FeedItem, make_id
+from alfred.feed.model import (
+    STATE_ACKED,
+    STATE_ACTED,
+    STATE_DEFERRED,
+    STATE_OPEN,
+    FeedItem,
+    defer_window_open,
+    make_id,
+)
 from alfred.vault.attribution import (
     AuditEntry,
     append_audit_entry,
@@ -1013,3 +1021,67 @@ def test_invalid_action_log_emitted(tmp_path: Path) -> None:
     assert len(matches) == 1
     assert matches[0]["kind"] == "email_tier"
     assert matches[0]["action"] == "reject"
+
+
+# ---------------------------------------------------------------------------
+# Generic defer through the REAL act() entry point (#102 1b-ii)
+# ---------------------------------------------------------------------------
+# tests/feed/test_feed_defer_dispatch.py pins the dispatcher by calling it
+# directly, and stays fully green against a build where `act` never routes to
+# it — the interception deleted, every unit pin passing, the gesture dead in the
+# operator's hand. That is the same wiring gap the serve-time stamping needed
+# route-driven pins to close, so the defer verbs get theirs here.
+
+
+def test_a_defer_through_act_reaches_the_store_and_leaves_the_corpus_alone(
+    tmp_path: Path,
+) -> None:
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    result = _call(store, cfg, fid, "defer")
+
+    assert result.ok is True
+    # The state the deck's `state=open` query excludes — the whole mechanism.
+    assert store.load()[fid].state == STATE_DEFERRED
+    # A defer decides NOTHING: no resolver ran, so no correction was written.
+    assert list(iter_corrections(cfg.corpus.path)) == []
+
+
+def test_a_dated_defer_through_act_carries_its_window(tmp_path: Path) -> None:
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    assert _call(store, cfg, fid, "defer_7d").ok is True
+
+    stored = store.load()[fid]
+    assert stored.state == STATE_DEFERRED
+    assert stored.deferred_until, "a dated rung must record its window"
+    # Asked of the canonical predicate, not a re-derived string comparison.
+    assert defer_window_open(stored.deferred_until) is True
+
+
+def test_a_defer_verb_on_the_EXCLUDED_kind_is_refused(tmp_path: Path) -> None:
+    """slot_suggestion keeps its board snooze; the ceiling must refuse `defer`.
+
+    The positive control for the exclusion: `snooze_3d` on the same kind is a
+    real verb, so this is not passing because slot acts fail generally.
+    """
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+
+    # An email_tier item CAN defer (the control) …
+    assert _call(store, cfg, fid, "defer_1d").ok is True
+    # … while the excluded kind never advertises or admits one.
+    from alfred.daily_sync.action_router import DEFER_ACTIONS, FEED_ACTIONS
+
+    assert not any(v in FEED_ACTIONS["slot_suggestion"] for v in DEFER_ACTIONS)
