@@ -211,6 +211,34 @@ class JeevesCueConfig:
 
     ``route_aliases`` lets one target answer to more than one spoken form
     (a name that STT renders inconsistently) without widening the grammar.
+
+    **ONE DESTINATION, BY DESIGN — and aliases are not a second one.** Every
+    alias resolves to the SAME ``route_target``. With a target of ``"<A>"`` and
+    an alias of ``"<B>"``, saying "Jeeves, tell <B> …" routes the capture to
+    **<A>**. Aliases exist for one destination that STT spells inconsistently,
+    not for a choice of destinations. Anyone reading ``route_aliases`` as "the
+    list of places Jeeves can send to" would be wrong in the one direction that
+    matters — audio leaving the garage to a destination the operator did not
+    name.
+
+    A SECOND destination is therefore a CODE change, not a config change, and
+    that is deliberate (#98 Part B, operator ruling): the design rides ONE peer
+    for v1, and plural destinations buy nothing until a second instance
+    actually wants Jeeves captures. Building the target table now would add a
+    config surface the operator maintains for a capability nobody has asked to
+    use. The trigger for plurality is real friction from a real consumer — not
+    completeness.
+
+    What promotion-readiness already means here, and why it is satisfied: the
+    destination is DATA (this field), the sink carries its own peer token
+    (:class:`JeevesRouteSinkConfig`), and no module couples to a named instance
+    — a fence the suite enforces over this package's whole text, docstrings
+    included, which is why the illustration above is ``<A>``/``<B>`` and not
+    two real names. Pointing Jeeves at a different instance is a config edit
+    today. What is not a config edit is pointing it at *two at once*.
+
+    Pinned by ``test_an_alias_routes_to_the_ONE_target_not_a_second_one`` so
+    this paragraph cannot quietly become false.
     """
 
     route_target: str = ""

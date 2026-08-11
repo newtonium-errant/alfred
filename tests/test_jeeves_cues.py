@@ -340,3 +340,50 @@ def test_the_longest_matching_phrase_is_the_one_reported():
     what was actually heard in every telemetry row."""
     result = classify("Jeeves, you missed that")
     assert result.matched_phrase == "you missed that"
+
+
+def test_an_alias_routes_to_the_ONE_target_not_a_second_one():
+    """ONE destination by design — the pin behind ``JeevesCueConfig``'s
+    single-target paragraph (#98 Part B, operator ruling (a)).
+
+    ``route_aliases`` exists for a target STT spells inconsistently, NOT for a
+    choice of destinations. Read the other way — "the list of places Jeeves can
+    send to" — it would be wrong in the one direction that matters: audio
+    leaving the garage to a destination the operator never named.
+
+    So this asserts the alias resolves to the CONFIGURED target, not to itself.
+    Without it the docstring is prose that a future target-table refactor could
+    silently falsify, which is this codebase's named comment-lies trap.
+    """
+    config = JeevesCueConfig(route_target="Salem", route_aliases=["Hypatia"])
+
+    spoken_alias = cues.classify(
+        "jeeves tell hypatia the compressor is leaking", cue_config=config)
+
+    assert spoken_alias.verb == cues.CUE_ROUTE
+    # The matched PHRASE is normalized (lower-cased) because matching happens
+    # against normalized transcript text; the carried TARGET keeps the casing
+    # the operator configured. Two different values on purpose — a sink that
+    # assumed the target was lower-cased would build the wrong peer name.
+    assert spoken_alias.matched_phrase == "tell hypatia"   # heard the alias
+    assert spoken_alias.route_target == "Salem"            # routes to the TARGET
+    assert spoken_alias.route_target.lower() != "hypatia"
+
+    # Positive control: the target's own name routes identically, so the
+    # assertion above is about resolution and not about the alias being
+    # rejected outright.
+    spoken_target = cues.classify(
+        "jeeves tell salem the compressor is leaking", cue_config=config)
+    assert spoken_target.verb == cues.CUE_ROUTE
+    assert spoken_target.route_target == spoken_alias.route_target
+
+
+def test_an_unconfigured_target_leaves_route_inert():
+    """The other half of one-destination: with no target there is no ROUTE
+    grammar at all, rather than a guess about where audio should go."""
+    config = JeevesCueConfig(route_target="", route_aliases=["Hypatia"])
+
+    assert cues.route_phrases(config) == ()
+    result = cues.classify(
+        "jeeves tell hypatia the compressor is leaking", cue_config=config)
+    assert result.verb != cues.CUE_ROUTE
