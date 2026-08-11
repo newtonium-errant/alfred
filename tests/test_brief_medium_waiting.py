@@ -183,12 +183,14 @@ async def test_medium_waiting_line_rides_into_full_brief(
     _seed(store, kind="email_tier", priority="high", state="open", key="note/h1.md")      # excluded
 
     async def _fake_weather(_wc):
-        return "*Weather: fixed.*"
+        # COLLECTING form: (markdown, parsed TAFs) — generate_brief takes this
+        # one now so the feed reuses its fetch.
+        return "*Weather: fixed.*", []
 
     async def _no_metars(_wc):
         return []
 
-    monkeypatch.setattr("alfred.brief.daemon.fetch_and_format", _fake_weather)
+    monkeypatch.setattr("alfred.brief.daemon.fetch_and_format_collect", _fake_weather)
     # The NARRATION path reaches weather by a function-local import of
     # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
     # cover — without this, generate_brief makes a live aviationweather.gov

@@ -20,6 +20,7 @@ the section's own record (not the whole markdown).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -198,6 +199,111 @@ def event_feed_items(
             starts_at=ev.starts_at,
             ends_at=ev.ends_at,
             source_ref=dict(_SOURCE_REF),
+        ))
+    return out
+
+
+def _epoch_iso(value: Any) -> str | None:
+    """aviationweather.gov epoch SECONDS → ISO-8601 UTC, or ``None``.
+
+    The API hands times as ints (verified against the 2026-08-11 capture:
+    ``timeFrom: 1786471200`` → ``2026-08-11T18:00:00+00:00``). Anything else —
+    missing, null, a string, a bool — yields ``None`` rather than a guess,
+    because a wrong interval silently moves weather on the operator's timeline.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def weather_feed_items(
+    tafs: list[dict] | None,
+    station_configs: Any,
+    *,
+    instance: str,
+) -> list[FeedItem] | None:
+    """One ``weather`` item per station whose TAF we hold (stable key = ICAO id).
+
+    **This is the interval case D7 exists for** — a forecast is not a moment.
+
+    *Item extent = the TAF's VALIDITY window* (``validTimeFrom`` /
+    ``validTimeTo``), which is the one interval the forecast asserts outright.
+
+    *Probabilistic blocks do NOT set the item's extent* — the call the fixture
+    capture asked for. A ``PROB30`` block covering 19:00–22:00 says there is a
+    30% chance of thunderstorms in that window, NOT that thunderstorms occupy
+    it. Promoting it to the item's extent would state as fact something the
+    data explicitly qualifies, which is the same error as stamping a task's
+    ``due`` as a span or promoting an all-day date to midnight. Nothing is
+    lost: every block is carried in ``evidence["periods"]`` with its OWN
+    interval plus ``probability`` and ``possible: True``, so a renderer can
+    draw the maybe-window in its own register and the operator sees the
+    forecast's real shape.
+
+    *``timeBec`` is kept as ``becoming_at``, never merged into ``starts_at``.*
+    On a BECMG block it marks when the transition COMPLETES, and it sits inside
+    the block's window rather than replacing its start (confirmed on the
+    capture's CYZX record: ``timeBec`` 19:40 inside a 19:00–21:00 block).
+    Conflating them would report a change as finished before the forecast says
+    it is.
+
+    ``None`` (a failed/absent forecast leg) → don't reconcile. ``[]`` is a
+    genuine empty (no stations forecast) and DOES reconcile, clearing stale
+    items.
+    """
+    if tafs is None:
+        return None
+    name_map: dict[str, str] = {}
+    try:
+        name_map = {s.id: s.name for s in (station_configs or [])}
+    except (AttributeError, TypeError):  # station configs are optional context
+        name_map = {}
+
+    out: list[FeedItem] = []
+    for taf in tafs:
+        if not isinstance(taf, dict):
+            continue
+        station = str(taf.get("icaoId", "") or "")
+        if not station:
+            # No stable key available — skip the record rather than invent one
+            # (an ordinal key is the thing the identity rule forbids).
+            log.warning("brief.weather_feed_no_station", detail="TAF record without icaoId")
+            continue
+        periods: list[dict[str, Any]] = []
+        for block in taf.get("fcsts", []) or []:
+            if not isinstance(block, dict):
+                continue
+            prob = block.get("probability")
+            periods.append({
+                "starts_at": _epoch_iso(block.get("timeFrom")),
+                "ends_at": _epoch_iso(block.get("timeTo")),
+                # None on the BASE block; "FM"/"TEMPO"/"PROB"/"BECMG" otherwise.
+                "change": block.get("fcstChange") or "BASE",
+                "probability": prob,
+                # The renderer's cue to draw this as a MAYBE rather than a will.
+                "possible": prob is not None,
+                "becoming_at": _epoch_iso(block.get("timeBec")),
+                "wx": block.get("wxString") or "",
+                "visibility": block.get("visib"),
+            })
+        out.append(FeedItem.create(
+            kind="weather",
+            stable_key=station,
+            instance=instance,
+            title=f"Forecast: {name_map.get(station, station)}",
+            evidence={
+                "station": station,
+                "name": name_map.get(station, station),
+                "periods": periods,
+                "period_count": len(periods),
+            },
+            # The asserted interval: the forecast's own validity window.
+            starts_at=_epoch_iso(taf.get("validTimeFrom")),
+            ends_at=_epoch_iso(taf.get("validTimeTo")),
+            source_ref=dict(_SOURCE_REF, station=station),
         ))
     return out
 

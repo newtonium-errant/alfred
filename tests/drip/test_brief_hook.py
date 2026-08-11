@@ -32,12 +32,13 @@ def _patch_weather(monkeypatch: pytest.MonkeyPatch) -> None:
     incident, patching only the first leaves a real request to
     aviationweather.gov on every run."""
     async def _fake_weather(_cfg):
-        return "*Weather: fixed for the test.*"
+        # COLLECTING form: (markdown, parsed TAFs).
+        return "*Weather: fixed for the test.*", []
 
     async def _fake_metars(_cfg):
         return []
 
-    monkeypatch.setattr("alfred.brief.daemon.fetch_and_format", _fake_weather)
+    monkeypatch.setattr("alfred.brief.daemon.fetch_and_format_collect", _fake_weather)
     monkeypatch.setattr("alfred.brief.weather.fetch_metars", _fake_metars)
 
 

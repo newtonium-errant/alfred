@@ -396,9 +396,11 @@ async def test_generate_brief_roundtrip_byte_identical(
     from alfred.brief.state import StateManager as BriefStateManager
 
     async def _fake_weather(config):  # type: ignore[no-untyped-def]
-        return "Sunny, 21C."
+        # COLLECTING form: (markdown, parsed TAFs) — generate_brief takes
+        # this one now so the feed reuses its fetch.
+        return "Sunny, 21C.", []
 
-    monkeypatch.setattr(brief_daemon_mod, "fetch_and_format", _fake_weather)
+    monkeypatch.setattr(brief_daemon_mod, "fetch_and_format_collect", _fake_weather)
 
     # The NARRATION path reaches weather by a function-local import of
     # alfred.brief.weather.fetch_metars, which the daemon patch above cannot
@@ -501,9 +503,11 @@ async def test_brief_spool_failure_swallowed_vault_and_push_succeed(
     import alfred.transport.client as transport_client_mod
 
     async def _fake_weather(config):  # type: ignore[no-untyped-def]
-        return "Sunny, 21C."
+        # COLLECTING form: (markdown, parsed TAFs) — generate_brief takes
+        # this one now so the feed reuses its fetch.
+        return "Sunny, 21C.", []
 
-    monkeypatch.setattr(brief_daemon_mod, "fetch_and_format", _fake_weather)
+    monkeypatch.setattr(brief_daemon_mod, "fetch_and_format_collect", _fake_weather)
 
     # The NARRATION path reaches weather by a function-local import of
     # alfred.brief.weather.fetch_metars, which the daemon patch above cannot

@@ -40,7 +40,7 @@ from .operations import format_operations_section
 from .upcoming_events import render_upcoming_events_section
 from alfred.drip.brief_line import SECTION_HEADER as DRIP_SECTION_HEADER
 from .watches import check_and_format_watches
-from .weather import fetch_and_format
+from .weather import fetch_and_format, fetch_and_format_collect
 
 log = get_logger(__name__)
 
@@ -228,7 +228,10 @@ def _ops_baseline_path(config: BriefConfig) -> str:
     ))
 
 
-def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_local, now_local) -> None:
+def _emit_brief_feed(
+    config: BriefConfig, sections: list[SectionResult], today_local, now_local,
+    weather_tafs: list[dict] | None = None,
+) -> None:
     """Reconcile the converted sections' feed items into the feed store.
 
     Belt-in-depth: an outer guard around store/extractor construction, and each
@@ -245,6 +248,7 @@ def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_l
             health_feed_items,
             peer_digest_feed_items,
             slot_suggestion_feed_items,
+            weather_feed_items,
         )
         from .ops_notable import ops_notable_feed_items
 
@@ -256,6 +260,9 @@ def _emit_brief_feed(config: BriefConfig, sections: list[SectionResult], today_l
         ops_baseline_path = _ops_baseline_path(config)
         extractors = {
             "health": lambda: health_feed_items(config.vault_path, instance=instance),
+            "weather": lambda: weather_feed_items(
+                weather_tafs, config.weather.stations, instance=instance,
+            ),
             "ops_notable": lambda: ops_notable_feed_items(
                 # SAME derivation the Operations render uses, so the projection
                 # measures the files the section describes rather than a second
@@ -382,8 +389,13 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # ~9h; TypeError from mixed-type API fields reached
     # brief.daemon.error). Weather is one section of the brief; the
     # brief must out-rank it.
+    # The COLLECTING form hands back the parsed TAFs alongside the markdown so
+    # the feed projection reuses this fetch instead of issuing a second one —
+    # which would double the outbound requests and could disagree with the
+    # rendered section if the API moved between the two calls.
+    weather_tafs: list[dict] | None = None
     try:
-        weather_md = await fetch_and_format(config.weather)
+        weather_md, weather_tafs = await fetch_and_format_collect(config.weather)
     except Exception as exc:  # noqa: BLE001 — section never kills the run
         log.warning(
             "brief.weather_section_failed",
@@ -391,6 +403,10 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
             error_type=exc.__class__.__name__,
         )
         weather_md = "*Weather unavailable.*"
+        # Failure ≠ emptiness: leave the TAFs None so the feed declines to
+        # reconcile rather than mass-``acted``-ing every station's forecast on
+        # a transient fetch blip.
+        weather_tafs = None
 
     # Operations snapshot. quarantine_dir_name threads through from the
     # email_classifier YAML block via BriefConfig.load_from_unified so a
@@ -542,7 +558,9 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # actionable surface and peer chatter follows.
     sections = [
         SectionResult("Health", health_md, feed_kind="health"),
-        SectionResult("Weather", weather_md),
+        # Weather → the interval case (D7): the feed projection carries each
+        # forecast's validity window, markdown untouched.
+        SectionResult("Weather", weather_md, feed_kind="weather"),
         # tier/slots → slot_suggestion feed (A3b): one item per TodayView tier-
         # lane entry. Markdown byte-identical — the feed reads the same projection.
         SectionResult(TIER_SECTION_HEADER, tier_md, feed_kind="slot_suggestion"),
@@ -601,7 +619,7 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # Feed Phase A (producer #2) — project the converted sections into the feed
     # store. Runs AFTER the render above off the SAME section objects, so it can
     # never perturb the markdown. Belt-in-depth: outer guard + per-section belt.
-    _emit_brief_feed(config, sections, today_local, now_local)
+    _emit_brief_feed(config, sections, today_local, now_local, weather_tafs)
 
     # Write to vault
     vault_path = Path(config.vault_path)

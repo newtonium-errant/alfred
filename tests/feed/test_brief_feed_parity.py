@@ -151,12 +151,16 @@ def _patch_weather(monkeypatch: pytest.MonkeyPatch) -> None:
     is what the late import binds against.
     """
     async def _fake_weather(_weather_config):
-        return "*Weather: fixed for the test.*"
+        # COLLECTING form: (markdown, parsed TAFs). generate_brief takes this
+        # one so the feed reuses its fetch — stubbing the old markdown-only
+        # name would leave the real fetch live (the egress guard below is what
+        # catches that, and did).
+        return "*Weather: fixed for the test.*", []
 
     async def _fake_metars(_weather_config):
         return []
 
-    monkeypatch.setattr("alfred.brief.daemon.fetch_and_format", _fake_weather)
+    monkeypatch.setattr("alfred.brief.daemon.fetch_and_format_collect", _fake_weather)
     # String target + default raising=True: if `fetch_metars` is ever renamed or
     # moved, this raises AttributeError instead of silently becoming a no-op and
     # letting the live call back in.
