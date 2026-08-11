@@ -136,6 +136,20 @@ curator:
   watcher:
     poll_interval: 5
     debounce_seconds: 10
+    # File types the curator will ADMIT from the inbox (#88). Anything else
+    # is SKIPPED and logged once per filename — never silently ignored.
+    #
+    # This filter is load-bearing, not tidiness. The talker saves chat
+    # attachments into this same watched directory (screenshot-*,
+    # document-*, audio-*) as an audit trail; without a filter the curator
+    # picked every one of them up and pushed it through the LLM a SECOND
+    # time, minting junk records and burning real spend.
+    #
+    # The default admits what the legitimate writers produce: the mail
+    # webhook and fetcher write email-*.md, and hand-dropped notes are
+    # markdown or text. Widen it here (values may omit the dot) to teach
+    # the curator a new ingestable type — a config edit, not a code change.
+    ingestable_extensions: [".md", ".markdown", ".txt"]
   state:
     path: "./data/curator_state.json"
   # Idle-tick heartbeat — emits a periodic ``curator.idle_tick`` log
