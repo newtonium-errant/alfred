@@ -331,3 +331,95 @@ def test_feed_paths_are_distinct_across_instances() -> None:
     kalle = _feed({"logging": {"dir": _KALLE_DATA_DIR}}).store_path
     assert kalle == f"{_KALLE_DATA_DIR}/feed_items.jsonl"
     assert salem != kalle
+
+
+# ===========================================================================
+# Leaker 4 — voice-calibration telemetry  (data/voice_calibration/events.jsonl)
+# ===========================================================================
+#
+# The third distinct source in this batch. Here the CONFIG value was only half
+# the story: four hardcoded "./data/voice_calibration" fallbacks sat at the two
+# mount sites in routes_voice.py — each site had it twice, as a getattr default
+# AND as an or-fallback — so they would have won over any config value that was
+# empty or absent. Anchoring web/config.py alone would have left all four
+# standing and the file still appearing. Both halves are pinned.
+
+def _web(raw: dict) -> object:
+    from alfred.web.config import load_from_unified
+
+    return load_from_unified(raw)
+
+
+def _hold(raw: dict) -> object:
+    return _web(raw).voice.stt.endpoint_hold
+
+
+def test_voice_telemetry_dir_anchors_on_logging_dir() -> None:
+    raw = {"logging": {"dir": _KALLE_DATA_DIR}, "web": {"voice": {"stt": {}}}}
+    assert _hold(raw).telemetry_dir == f"{_KALLE_DATA_DIR}/voice_calibration"
+
+
+def test_voice_telemetry_dir_salem_is_byte_identical() -> None:
+    raw = {"logging": {"dir": _SALEM_DATA_DIR}, "web": {"voice": {"stt": {}}}}
+    assert _hold(raw).telemetry_dir == "./data/voice_calibration"
+
+
+def test_voice_telemetry_dir_derives_through_absent_nested_blocks() -> None:
+    # The derivation must survive every level of the nesting being absent —
+    # web -> voice -> stt -> endpoint_hold. Each builder has an isinstance
+    # guard that returns a default-constructed config, and each had to be
+    # taught to carry data_dir through; miss one and the anchor is silently
+    # dropped for exactly the configs that omit the block.
+    for raw in (
+        {"logging": {"dir": _KALLE_DATA_DIR}},
+        {"logging": {"dir": _KALLE_DATA_DIR}, "web": {}},
+        {"logging": {"dir": _KALLE_DATA_DIR}, "web": {"voice": {}}},
+        {"logging": {"dir": _KALLE_DATA_DIR}, "web": {"voice": {"stt": {}}}},
+        {"logging": {"dir": _KALLE_DATA_DIR},
+         "web": {"voice": {"stt": {"endpoint_hold": {}}}}},
+    ):
+        assert _hold(raw).telemetry_dir == f"{_KALLE_DATA_DIR}/voice_calibration", raw
+
+
+def test_voice_telemetry_dataclass_default_is_empty() -> None:
+    from alfred.web.config import WebVoiceEndpointHoldConfig
+
+    assert WebVoiceEndpointHoldConfig().telemetry_dir == ""
+
+
+def test_voice_telemetry_unanchored_is_off_not_cwd() -> None:
+    # No logging.dir anywhere: the sink is OFF, not pointed at the cwd. Both
+    # consumers in routes_voice skip telemetry on a falsy dir.
+    assert _hold({"web": {"voice": {"stt": {}}}}).telemetry_dir == ""
+
+
+def test_voice_explicit_telemetry_dir_wins() -> None:
+    raw = {
+        "logging": {"dir": _KALLE_DATA_DIR},
+        "web": {"voice": {"stt": {"endpoint_hold": {"telemetry_dir": "/x/cal"}}}},
+    }
+    assert _hold(raw).telemetry_dir == "/x/cal"
+
+
+def test_voice_telemetry_dirs_are_distinct_across_instances() -> None:
+    salem = _hold({"logging": {"dir": _SALEM_DATA_DIR}}).telemetry_dir
+    kalle = _hold({"logging": {"dir": _KALLE_DATA_DIR}}).telemetry_dir
+    assert salem != kalle
+
+
+def test_no_cwd_relative_voice_calibration_literal_survives_at_the_call_sites() -> None:
+    """The four fallbacks are GONE from routes_voice.py — source-level pin.
+
+    This is a text assertion on purpose. The four literals were unreachable
+    from a normal config load (the config value shadowed them), so no
+    behavioural pin distinguishes "removed" from "still there but not taken
+    today" — the exact shape that let them sit unnoticed. A grep is the honest
+    test for a dead-but-loaded fallback.
+    """
+    from pathlib import Path
+
+    import alfred.web.routes_voice as rv
+
+    source = Path(rv.__file__).read_text(encoding="utf-8")
+    assert '"./data/voice_calibration"' not in source
+    assert "'./data/voice_calibration'" not in source

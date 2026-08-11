@@ -812,15 +812,29 @@ def pytest_terminal_summary(terminalreporter, *a, **kw):  # noqa: ARG001
           "only with a boarded")
         w("  follow-up. The run is failed: debris caused two phantom failures "
           "on the #57 gate.")
+    elif not _DEBRIS_ALLOWLIST:
+        # The allowlist is EMPTY (#74 batch 1 closed the last of the eight), so
+        # here "wrote nothing" is the literal truth and the sentence may finally
+        # say so. Nothing is exempt: every file that appears now fails the run.
+        #
+        # This branch exists rather than letting the message below degrade to
+        # "0 of 0 known leakers fired" — a true but hollow sentence that would
+        # read as though the guard had nothing to check. Which state the guard
+        # is in is the whole point of the line.
+        w(f"suite debris guard: ACTIVE, tree CLEAN — the run wrote nothing "
+          f"into it, and the known-leaker allowlist is empty, so nothing was "
+          f"exempt ({debris['watched']} files present at session start).")
     else:
         # ILB: a guard that is silent when healthy is indistinguishable from a
         # guard that never installed — the same argument the egress guard makes.
         #
-        # NOT "tree clean". That would be false in most runs: the allowlisted
-        # leakers DO materialise, so a healthy run still ends with files in the
-        # tree. An observability line that overstates the state it reports is
-        # the failure this guard exists to catch, and it does not get an
-        # exemption for being the guard's own sentence.
+        # NOT "tree clean" while the allowlist has entries. That would be false
+        # in most runs: the allowlisted leakers DO materialise, so a healthy run
+        # still ends with files in the tree. An observability line that
+        # overstates the state it reports is the failure this guard exists to
+        # catch, and it does not get an exemption for being the guard's own
+        # sentence. (The branch above earns the stronger claim by having an
+        # empty allowlist — it is the same rule, not a relaxation of it.)
         #
         # The count was "N allowlisted", which MEANT "fired this run" and READ
         # as "registered". Two readers compared a 0 against an 8 and took it
@@ -879,9 +893,9 @@ _DEBRIS_SKIP_DIRS = frozenset({
     ".venv", ".mypy_cache", ".ruff_cache", ".claude",
 })
 
-# KNOWN UNFIXED LEAKERS — each is a #53-shaped bug (a cwd-relative default that
+# KNOWN UNFIXED LEAKERS — each was a #53-shaped bug (a cwd-relative default that
 # resolves against the process cwd instead of the instance's configured data
-# dir). They are allowlisted so the guard can go live NOW and catch the NEXT
+# dir). They were allowlisted so the guard could go live NOW and catch the NEXT
 # one, rather than waiting on a sweep. Derived empirically (2026-08-10) by
 # running the full suite in a pristine clone and diffing the tree — not from a
 # remembered list.
@@ -889,9 +903,28 @@ _DEBRIS_SKIP_DIRS = frozenset({
 # Every entry is a debt with a name. Removing an entry is the definition of
 # done for its follow-up; adding one needs the same justification these had.
 #
-#   data/voice_calibration/events.jsonl   web/config.py:208 +
-#                                         hardcoded fallbacks at
-#                                         routes_voice.py:490,646  -> #74
+# THE LIST IS NOW EMPTY. #74 batch 1 closed the last of the eight (2026-08-11);
+# an empty allowlist is the strongest state this guard can be in — any file that
+# materialises during a run now fails it, with nothing exempt. Keep it empty:
+# the next entry needs a boarded follow-up, and the four notes below are the
+# worked examples of what "closed" looks like.
+#
+# What the eight taught, and the reason the notes are kept rather than deleted:
+# THE SAME SYMPTOM HAD FOUR DIFFERENT SOURCES. Two leaked through the loader
+# (scribe's default, feed's last rung), one leaked ONLY through the dataclass
+# default with the loader innocent (transport), and one leaked through hardcoded
+# fallbacks at the CALL SITES with the config already correct (voice). A fix
+# aimed at whichever half you looked at first would have left the file appearing
+# and every pin green. Attribute the writer before fixing the default.
+#
+# ``data/voice_calibration/events.jsonl`` WAS here — and it is the entry that
+# shows a config-layer fix can be entirely beside the point. Anchoring
+# ``WebVoiceEndpointHoldConfig.telemetry_dir`` alone would have changed nothing:
+# FOUR hardcoded ``"./data/voice_calibration"`` fallbacks sat at the two mount
+# sites in ``routes_voice.py`` (each site had it twice — a getattr default AND
+# an or-fallback), and they would have won over any config value that was empty
+# or absent. #74 batch 1 derived the config value per-instance AND deleted all
+# four, so the dir now comes from ONE place.
 #
 # ``data/feed_items.jsonl`` + ``.lock`` WERE here — and they are the entry that
 # shows the leak can live in a resolver that is otherwise CORRECT. The feed's
@@ -942,9 +975,7 @@ _DEBRIS_SKIP_DIRS = frozenset({
 # Fixed by removing the default outright (empty + fail-loud, since production
 # always derives it) and by constructing the manager ONCE at loop start. The
 # regression pins live in ``tests/mail/test_state_path_anchoring.py``.
-_DEBRIS_ALLOWLIST = frozenset({
-    "data/voice_calibration/events.jsonl",
-})
+_DEBRIS_ALLOWLIST: frozenset[str] = frozenset()
 
 _debris_before: set[str] = set()
 _debris_state: dict = {"computed": False, "leaked": [], "allowed": [], "watched": 0}
