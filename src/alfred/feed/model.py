@@ -30,6 +30,18 @@ STATE_OPEN = "open"
 STATE_ACTED = "acted"
 STATE_ACKED = "acked"
 STATE_EXPIRED = "expired"
+# "later" (D2, 2026-08-11). A DEFERRED item is not open (it stays out of the
+# deck and out of every ``state=open`` query) and is not decided either — the
+# operator has not judged it, only moved it. It therefore MUST come back; a
+# defer that never returns is a silent drop wearing a politer name.
+#
+# Two shapes, distinguished by ``FeedItem.deferred_until``:
+#   * ``None`` — defer to NEXT RENDER. The next producer fire returns it.
+#   * an ISO timestamp — defer to A TIME. Fires before that instant leave it
+#     alone; the first fire at/after it returns the item.
+# Both are consumed through ONE predicate, :func:`defer_window_open`, so no
+# consumer re-derives "is this still deferred" and drifts.
+STATE_DEFERRED = "deferred"
 
 # --- snapshot kinds: per-kind revival policy ---------------------------------
 #
@@ -149,6 +161,51 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO-8601 instant, or ``None`` when it isn't one.
+
+    A NAIVE value is read as UTC rather than rejected: every producer in-tree
+    stamps aware UTC, so a naive one is an older/hand-written value, and reading
+    it as UTC is the interpretation that keeps a comparison possible instead of
+    raising ``TypeError`` mid-reconcile.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def defer_window_open(deferred_until: str | None, now: str | None = None) -> bool:
+    """Is this defer still holding? THE canonical defer predicate (D2).
+
+    ``True`` means the item stays suppressed this fire; ``False`` means it
+    RETURNS to attention. Every consumer asks this function — the health-status
+    ``skip`` lesson applies exactly: a re-localized comparison drifts, so there
+    is one predicate and no second spelling of it.
+
+    The fail direction is deliberate and one-way: **when in doubt, the item
+    returns.** A missing window (next-render defer), an unparseable one, and an
+    unreadable clock all yield ``False``. Extra noise costs the operator a
+    glance; a commitment that silently never comes back costs him the thing
+    itself, and he cannot notice its absence to ask about it.
+    """
+    if not deferred_until:
+        # Defer-to-next-render. Nothing to hold against: the item was hidden for
+        # the render in which it was deferred (it is not ``open``), and the very
+        # next fire is the return this shape promises.
+        return False
+    until = _parse_iso(deferred_until)
+    if until is None:
+        return False
+    now_dt = _parse_iso(now) if now else datetime.now(timezone.utc)
+    if now_dt is None:
+        return False
+    return now_dt < until
+
+
 def make_id(kind: str, stable_key: str) -> str:
     """The feed id for a thing: ``<kind>:<stable_key>``. Never a render ordinal."""
     return f"{kind}:{stable_key}"
@@ -204,6 +261,12 @@ class FeedItem:
     # render-layer concern, so nothing here silently shifts an operator's clock.
     starts_at: str | None = None
     ends_at: str | None = None
+    # --- defer (D2, 2026-08-11) ----------------------------------------------
+    # Meaningful only while ``state == STATE_DEFERRED``, and cleared by any
+    # transition out of it so a returned item can never carry a stale window.
+    # ``None`` while deferred = defer-to-next-render; an ISO instant =
+    # defer-to-a-time. Read ONLY through :func:`defer_window_open`.
+    deferred_until: str | None = None
     source_ref: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
