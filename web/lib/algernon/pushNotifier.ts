@@ -11,6 +11,13 @@ import {
   writeSeenIds,
   type StoredSubscription,
 } from './pushStore';
+import {
+  appendTrialRow,
+  readTrialConfig,
+  readTrialRows,
+  runTrialOnce,
+  type TrialDeps,
+} from './pushTrial';
 
 // SERVER-ONLY. The push notifier: a background poller that diffs the HOME feed's
 // needs-you items and rings the doorbell (one push per NEWLY-seen item id) to
@@ -184,6 +191,38 @@ const realDeps: PollDeps = {
   sendPush: realSendPush,
 };
 
+// --- the delivery trial, riding the same heartbeat ---------------------------
+
+/** Send one trial push to every stored subscription. Returns the recipient count;
+ * throws only if EVERY subscription failed, so a partial send still counts as
+ * sent (the trial measures whether the doorbell reaches the phone, and one live
+ * endpoint answers that). */
+async function sendTrialToAll(payload: string): Promise<number> {
+  const subs = await readSubscriptions();
+  if (subs.length === 0) throw new Error('no_subscriptions');
+  let ok = 0;
+  let lastErr = 'unknown';
+  for (const sub of subs) {
+    try {
+      await realSendPush(sub, payload);
+      ok += 1;
+    } catch (e) {
+      lastErr = errName(e);
+      if (isGoneError(e)) await removeSubscription(sub.endpoint);
+    }
+  }
+  if (ok === 0) throw new Error(lastErr);
+  return ok;
+}
+
+const realTrialDeps: TrialDeps = {
+  readRows: () => readTrialRows(),
+  appendRow: (row) => appendTrialRow(row),
+  sendTrialPush: sendTrialToAll,
+  now: () => Date.now(),
+  config: readTrialConfig,
+};
+
 let pollerTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -199,6 +238,14 @@ export function ensurePushPoller(): void {
   pollerTimer = setInterval(() => {
     void runPollOnce(realDeps).catch((e) => {
       console.warn(`[push:poll] iteration_failed err=${errName(e)}`);
+    });
+    // The delivery trial rides this heartbeat rather than owning a timer: it is
+    // a seven-day instrument, and a second scheduler would be a second thing
+    // that can silently stop. Crash-isolated SEPARATELY from the feed poll —
+    // neither can take the other down, and a trial fault must never cost the
+    // operator a real doorbell.
+    void runTrialOnce(realTrialDeps).catch((e) => {
+      console.warn(`[push:trial] iteration_failed err=${errName(e)}`);
     });
   }, POLL_INTERVAL_MS);
   if (typeof pollerTimer.unref === 'function') pollerTimer.unref();

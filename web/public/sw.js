@@ -127,10 +127,39 @@ self.addEventListener('push', (event) => {
 
 // Click → focus an existing same-origin tab (routing it to the deep link) or open
 // a new one. Only ever navigates to the relative path stored on the notification.
+// Extract a trial push_id from a deep link (`/feed?push=trial-d1-w2`). Returns
+// '' for anything that isn't one, so a normal doorbell click posts no receipt.
+// Charset-fenced to match the receipt route's validator — a value that route
+// would reject is not worth a request.
+function trialPushId(url) {
+  if (typeof url !== 'string') return '';
+  const q = url.indexOf('?');
+  if (q < 0) return '';
+  const params = new URLSearchParams(url.slice(q + 1));
+  const id = params.get('push') || '';
+  return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : '';
+}
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const data = event.notification.data || {};
   const target = sanitizeDeepLink(data.url);
+  // DELIVERY-TRIAL RECEIPT. A tap is the only evidence that a push actually
+  // reached the phone; posted from here rather than from page code because the
+  // tap is the event being measured, and a page-load signal would miss a tap
+  // that focused an already-open tab. Same-origin, so the session + identity
+  // cookies ride along. Fire-and-forget: the receipt must NEVER be able to cost
+  // the operator the navigation he asked for.
+  const pushId = trialPushId(target);
+  if (pushId) {
+    event.waitUntil(
+      fetch('/api/push/receipt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ push_id: pushId }),
+      }).catch(() => undefined),
+    );
+  }
   event.waitUntil(
     (async () => {
       const clientsArr = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });

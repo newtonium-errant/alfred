@@ -5167,6 +5167,46 @@ def _stt_vocab_state_lines(sv) -> list[str]:
     return lines
 
 
+def _cmd_push_trial(args: argparse.Namespace) -> None:
+    """``alfred push-trial status [--json]`` — read the delivery-trial ledger.
+
+    READ-ONLY BY DESIGN. The sender lives in the web app (web-push is a Node
+    library and the schedule rides the Next poller's heartbeat); this surface
+    only reports what that sender wrote. A CLI that could also send would be a
+    second scheduler firing at unplanned times, and a push arriving off-schedule
+    is not the datum the slot claims it is.
+
+    The rendered table refuses to collapse "sent, never tapped" into "did not
+    arrive". That distinction IS the trial — see ``push_trial`` for why.
+    """
+    from alfred.push_trial import (
+        RulingError, build_status, record_ruling, render_status, trial_path,
+    )
+
+    path = trial_path()
+    cmd = getattr(args, "push_trial_cmd", None)
+
+    if cmd == "rule":
+        # The ONLY write this surface makes, and it writes the operator's
+        # ANSWER — never the instrument's. Appended as its own row so the
+        # original slot row stays intact and the ledger remains readable as a
+        # history of what was unknown and when it was settled.
+        try:
+            slot = record_ruling(path, args.push_id, args.verdict)
+        except RulingError as exc:
+            print(f"Refused: {exc}")
+            raise SystemExit(2)
+        print(f"Recorded: {slot.push_id} → {slot.state} (you said {slot.ruling}).")
+        print("The original send row is untouched; this is an added answer.")
+        return
+
+    status = build_status(path)
+    if getattr(args, "json", False):
+        print(json.dumps({"path": path, **status.to_dict()}, indent=2))
+        return
+    print(render_status(status, path))
+
+
 def _cmd_tier_override(args: argparse.Namespace) -> None:
     """``alfred tier-override {list [--json] | clear <kind>}`` — #72's escape hatch.
 
@@ -7112,6 +7152,29 @@ def build_parser() -> argparse.ArgumentParser:
     sttv_reject.add_argument("term", help="The proposed term to decline")
     sttv_reject.add_argument("--operator", required=True, help="Rejecter identity (recorded)")
 
+    # #96 stage 1 — the VAPID delivery trial's READ surface. Status only: the
+    # sender is the web app's poller heartbeat, and a CLI that could also send
+    # would fire pushes at unplanned times, corrupting the measurement.
+    ptrial_p = sub.add_parser(
+        "push-trial",
+        help="Report the VAPID push delivery trial (#96)",
+    )
+    ptrial_sub = ptrial_p.add_subparsers(dest="push_trial_cmd")
+    ptrial_status = ptrial_sub.add_parser(
+        "status", help="Per-slot delivery state — sent/received/not-sent, never conflated")
+    ptrial_status.add_argument("--json", action="store_true", help="Machine-readable output")
+    # The reconcile half. A slot the instrument sent and he never tapped is
+    # UNKNOWN, and only he can say which way — this is where that answer becomes
+    # data instead of a remark in a chat log the decision later rests on.
+    ptrial_rule = ptrial_sub.add_parser(
+        "rule", help="Settle one unknown slot: did it actually reach the phone?")
+    ptrial_rule.add_argument("push_id", help="Slot id, e.g. trial-d3-w2")
+    ptrial_rule.add_argument(
+        "verdict", choices=["arrived", "missed"],
+        help="arrived = it reached the phone (you just didn't tap); "
+             "missed = it never showed up",
+    )
+
     # #72 — the tier-override escape hatch. `clear` only: putting a kind INTO
     # an override is the operator answering a Daily Sync proposal, and a second
     # door onto that decision would defeat the propose-then-approve channel.
@@ -7198,6 +7261,7 @@ def main() -> None:
         "routine": cmd_routine,
         "stt-vocab": _cmd_stt_vocab,
         "tier-override": _cmd_tier_override,
+        "push-trial": _cmd_push_trial,
         "tier-recurrence": _cmd_tier_recurrence,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,

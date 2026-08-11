@@ -159,6 +159,90 @@ def test_kind_is_in_the_result_dict(kind: str) -> None:
 # The exemption, written down
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# VALUE pins — the drift pin above holds KEY level only
+# ---------------------------------------------------------------------------
+#
+# Every assertion above this line is satisfied by the STRING `"has_<kind>"`
+# appearing in the function. A flag hard-wired to a constant — `"has_pending":
+# True` — passes all of them, and the has_demotion control confirmed that is the
+# family's pre-existing shape rather than a suspicion about one kind.
+#
+# What that costs: `_batch_type_flags` drives `_applicable_calibration_verbs`,
+# so a stuck flag degrades the G1 calibration hint — the operator typos a verb
+# and is either offered verbs for a kind that isn't in his batch, or not nudged
+# at all for the kind that is. Bounded, not catastrophic, and invisible from the
+# key-level pin.
+#
+# So: each flag must FLIP with its own kind's items, and must not flip with
+# anybody else's. The cross-check is the half that matters — a flag wired to the
+# wrong reader still flips, just not for its own reason.
+
+#: kind → the `last_batch` key its reader reads. `email` is the irregular one
+#: (plain `items`) for the reason named in the exemption test below.
+BATCH_KEY_BY_KIND = {
+    "email": "items",
+    "attribution": "attribution_items",
+    "proposal": "proposal_items",
+    "demotion": "demotion_items",
+    "pending": "pending_items",
+    "routine_match": "routine_match_items",
+    "capture_close": "capture_close_items",
+}
+
+ALL_KINDS = tuple(BATCH_KEY_BY_KIND)
+
+
+def _config_with_batch(tmp_path, batch: dict):
+    from alfred.daily_sync.confidence import save_state
+    from alfred.daily_sync.config import DailySyncConfig
+
+    cfg = DailySyncConfig(enabled=True, batch_size=5)
+    cfg.state.path = str(tmp_path / "state.json")
+    save_state(cfg.state.path, {"last_batch": {"date": "2026-08-11",
+                                               "message_ids": [1], **batch}})
+    return cfg
+
+
+def test_all_flags_are_false_on_an_empty_batch(tmp_path) -> None:
+    flags = rd._batch_type_flags(_config_with_batch(tmp_path, {}))
+
+    assert set(flags) == set(ALL_KINDS_FLAGS := {f"has_{k}" for k in ALL_KINDS})
+    assert not any(flags.values()), "an empty batch must not flag any kind"
+
+
+@pytest.mark.parametrize("kind", ALL_KINDS)
+def test_flag_flips_with_its_own_kind(kind: str, tmp_path) -> None:
+    """Present → True. A flag hard-wired to False fails here."""
+    cfg = _config_with_batch(
+        tmp_path, {BATCH_KEY_BY_KIND[kind]: [{"item_number": 1}]},
+    )
+
+    assert rd._batch_type_flags(cfg)[f"has_{kind}"] is True
+
+
+@pytest.mark.parametrize("kind", ALL_KINDS)
+def test_flag_does_not_flip_for_anybody_elses_items(kind: str, tmp_path) -> None:
+    """Absent → False, even when EVERY other kind has items.
+
+    This is the half a hard-wired `True` fails, and it also catches a flag wired
+    to the wrong reader: such a flag still flips, just not for its own reason.
+    """
+    others = {
+        BATCH_KEY_BY_KIND[k]: [{"item_number": i + 1}]
+        for i, k in enumerate(ALL_KINDS) if k != kind
+    }
+    flags = rd._batch_type_flags(_config_with_batch(tmp_path, others))
+
+    assert flags[f"has_{kind}"] is False
+    # ...and every other kind DID flip — the positive control that proves this
+    # assertion means something. Without it, a reader that returns False for
+    # everything passes the line above.
+    for other in ALL_KINDS:
+        if other != kind:
+            assert flags[f"has_{other}"] is True, f"{other} should have flipped"
+
+
 def test_email_is_the_named_exemption() -> None:
     """``email`` predates the regular scheme and breaks it in two places: its
     reader is ``_last_batch_items`` (no kind segment, it was the only kind), and
