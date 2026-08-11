@@ -12,6 +12,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   MANY_IMAGE_DIMENSION_LIMIT_PX,
   MAX_IMAGE_EDGE_PX,
+  STEP_DOWN_EDGE_PX,
+  STEP_DOWN_QUALITY,
   downscaleImage,
   exceedsManyImageLimit,
   targetDimensions,
@@ -191,5 +193,95 @@ describe('downscaleImage — never costs the user their attachment', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// ===========================================================================
+// #83 NOTE-B — the byte-budget step-down
+// ===========================================================================
+
+describe('downscaleImage step-down (explicit quality)', () => {
+  /** A canvas stub that reports a byte size proportional to edge x quality. */
+  function stubCanvas(bytesFor: (edge: number, quality: number) => number) {
+    const orig = document.createElement.bind(document);
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      if (tag !== 'canvas') return orig(tag as 'div');
+      const el = orig('canvas') as HTMLCanvasElement;
+      el.getContext = (() => ({ drawImage: () => {} })) as never;
+      el.toBlob = ((cb: (b: Blob | null) => void, type: string, q: number) => {
+        const edge = Math.max(el.width, el.height);
+        cb(new Blob([new Uint8Array(bytesFor(edge, q))], { type }));
+      }) as never;
+      return el;
+    });
+  }
+
+  it('forces a re-encode even when the dimensions already fit', async () => {
+    // The case a resize-only step-down silently fails: a 1200x1200 PNG that is
+    // over budget is over budget BECAUSE it is a PNG. Without the forced
+    // re-encode the retry returns the original and the operator is refused
+    // anyway — the step-down would be decorative.
+    vi.stubGlobal(
+      'createImageBitmap',
+      vi.fn().mockResolvedValue({ width: 1200, height: 1200, close: () => {} }),
+    );
+    stubCanvas(() => 64);
+    try {
+      const png = new File([new Uint8Array(4096)], 'scan.png', { type: 'image/png' });
+      const plain = await downscaleImage(png);
+      expect(plain.resized).toBe(false);       // fits -> untouched, as before
+      const stepped = await downscaleImage(png, STEP_DOWN_EDGE_PX, STEP_DOWN_QUALITY);
+      expect(stepped.resized).toBe(true);      // forced
+      expect(stepped.file.type).toBe('image/jpeg');  // PNG -> JPEG sheds the bytes
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('passes the lower quality through to the encoder', async () => {
+    // Pins that the parameter reaches toBlob — a step-down that re-encoded at
+    // q0.9 would shed almost nothing and the retry would be a no-op.
+    const seen: number[] = [];
+    vi.stubGlobal(
+      'createImageBitmap',
+      vi.fn().mockResolvedValue({ width: 4000, height: 3000, close: () => {} }),
+    );
+    stubCanvas((_edge, q) => { seen.push(q); return 32; });
+    try {
+      const f = new File([new Uint8Array(64)], 'a.jpg', { type: 'image/jpeg' });
+      await downscaleImage(f);
+      await downscaleImage(f, STEP_DOWN_EDGE_PX, STEP_DOWN_QUALITY);
+      expect(seen).toEqual([0.9, STEP_DOWN_QUALITY]);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('keeps GIF as GIF even under a forced re-encode', async () => {
+    // A GIF may be animated; converting it to a still JPEG silently drops
+    // frames. Byte pressure is not a reason to do that.
+    vi.stubGlobal(
+      'createImageBitmap',
+      vi.fn().mockResolvedValue({ width: 4000, height: 3000, close: () => {} }),
+    );
+    stubCanvas(() => 32);
+    try {
+      const gif = new File([new Uint8Array(64)], 'a.gif', { type: 'image/gif' });
+      const out = await downscaleImage(gif, STEP_DOWN_EDGE_PX, STEP_DOWN_QUALITY);
+      expect(out.file.type).toBe('image/gif');
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('step-down constants sit between the cap and the standard tier', () => {
+    // Not arbitrary: the step-down must still exceed what the standard tier
+    // consumes (1568), or it would degrade Salem's images to buy bytes.
+    expect(STEP_DOWN_EDGE_PX).toBeLessThan(MAX_IMAGE_EDGE_PX);
+    expect(STEP_DOWN_EDGE_PX).toBeGreaterThan(1568);
+    expect(STEP_DOWN_QUALITY).toBeLessThan(0.9);
   });
 });

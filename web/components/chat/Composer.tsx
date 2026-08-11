@@ -17,7 +17,11 @@ import {
   base64DecodedBytes,
   type ImageAttachment,
 } from '../../lib/algernon/schemas';
-import { downscaleImage } from '../../lib/algernon/imageDownscale';
+import {
+  STEP_DOWN_EDGE_PX,
+  STEP_DOWN_QUALITY,
+  downscaleImage,
+} from '../../lib/algernon/imageDownscale';
 
 // The message composer. Enter sends; Shift+Enter inserts a newline. An empty /
 // whitespace-only message never sends UNLESS an image is attached. `disabled`
@@ -156,17 +160,30 @@ export function Composer({
         continue;
       }
       try {
-        // Downscale BEFORE the size gate (#82). A 3000px scan is routinely
-        // over the MiB cap at full size and comfortably under it at 1568px,
-        // so gating first would reject images we can perfectly well send —
-        // and it is oversized DIMENSIONS, not bytes, that wedge a session
-        // once the conversation crosses Anthropic's 20-image threshold.
-        // Never throws: on any failure it hands back the original, which then
-        // meets the same gates it would have met before.
-        const { file: prepared } = await downscaleImage(file);
+        // Downscale BEFORE the size gate (#82). A 4000px scan is routinely
+        // over the MiB cap at full size and under it once capped at the tier
+        // resolution, so gating first would reject images we can perfectly
+        // well send. Never throws: on any failure it hands back the original,
+        // which then meets the same gates it would have met before.
+        //
+        // This does NOT hold the wedge — the history trim does, by bounding
+        // the image COUNT per request (see imageDownscale.ts). Downscaling is
+        // about fidelity-per-byte, not about the dimension limit.
+        let prepared = (await downscaleImage(file)).file;
         // `size` is the DECODED byte length — the same quantity the backend
         // caps — so this is the primary size gate; the base64 recheck below is
         // belt-and-suspenders against a reader that inflates.
+        if (prepared.size > MAX_IMAGE_BYTES) {
+          // At the tier-resolution cap a dense full-page scan can still clear
+          // 5 MiB at q0.9 — materially likelier than under the older, smaller
+          // cap this replaced. Rejecting outright would
+          // break the module's never-blocks-the-user principle over a byte
+          // budget we can simply re-encode into, so step down ONCE — smaller
+          // edge, lower quality — and only then give up. One retry, not a
+          // loop: a second failure means the image is genuinely unusable here
+          // and the operator needs to be told rather than made to wait.
+          prepared = (await downscaleImage(file, STEP_DOWN_EDGE_PX, STEP_DOWN_QUALITY)).file;
+        }
         if (prepared.size > MAX_IMAGE_BYTES) {
           error = `Each image must be under ${MAX_IMAGE_MIB} MiB.`;
           continue;

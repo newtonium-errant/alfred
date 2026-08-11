@@ -79,6 +79,21 @@ export const MANY_IMAGE_DIMENSION_LIMIT_PX = 2000;
 /** Quality for re-encoded JPEG/WebP output. */
 const REENCODE_QUALITY = 0.9;
 
+/**
+ * Step-down parameters for the one retry the Composer makes when a prepared
+ * image is still over the per-image byte budget (#83 NOTE-B).
+ *
+ * At the 2576px cap a dense full-page scan can clear 5 MiB at q0.9 — the
+ * 1568px cap made that unlikely, so the gate is materially closer now.
+ * Rejecting outright would break the never-blocks-the-user principle over a
+ * byte budget we can simply re-encode into. These values are a deliberate
+ * fidelity trade taken ONLY on an image that would otherwise be refused: still
+ * comfortably above the standard tier's 1568px consumption, at a quality that
+ * roughly halves JPEG bytes.
+ */
+export const STEP_DOWN_EDGE_PX = 1800;
+export const STEP_DOWN_QUALITY = 0.72;
+
 export interface Dimensions {
   width: number;
   height: number;
@@ -132,8 +147,14 @@ export function exceedsManyImageLimit(width: number, height: number): boolean {
  * format; everything else re-encodes as JPEG, which is far smaller for the
  * photographic and screenshot content this path actually carries.
  */
-function reencodeType(sourceType: string): string {
-  if (sourceType === 'image/png' || sourceType === 'image/gif') return sourceType;
+function reencodeType(sourceType: string, forced = false): string {
+  // A GIF may be animated, so it always keeps its own format — re-encoding it
+  // to a still JPEG would silently drop frames.
+  if (sourceType === 'image/gif') return sourceType;
+  // PNG normally keeps its format (transparency would flatten onto black), but
+  // the forced byte-budget step-down converts it: a PNG that is over budget is
+  // over budget BECAUSE it is a PNG, and losing alpha beats being refused.
+  if (sourceType === 'image/png' && !forced) return sourceType;
   return 'image/jpeg';
 }
 
@@ -161,10 +182,18 @@ export interface DownscaleResult {
  *
  * Returns the original file (with `resized: false`) whenever the image already
  * fits or any step fails — see the module docstring on never blocking the user.
+ *
+ * `quality` re-encodes more aggressively for the byte-budget step-down. Passing
+ * it also FORCES a re-encode when the dimensions already fit, which is the only
+ * way the step-down helps an image that is small but heavy — a 1200x1200 PNG
+ * over budget needs the PNG->JPEG conversion, not a resize. Without that, the
+ * retry would silently return the original and the operator would still be
+ * refused.
  */
 export async function downscaleImage(
   file: File,
   maxEdge: number = MAX_IMAGE_EDGE_PX,
+  quality?: number,
 ): Promise<DownscaleResult> {
   const decoded = await decode(file);
   if (!decoded) return { file, resized: false, source: null };
@@ -173,7 +202,12 @@ export async function downscaleImage(
   const source = { width: bitmap.width, height: bitmap.height };
   try {
     const target = targetDimensions(source.width, source.height, maxEdge);
-    if (target.width === source.width && target.height === source.height) {
+    // An explicit `quality` means "re-encode regardless" — see the docstring.
+    if (
+      quality === undefined
+      && target.width === source.width
+      && target.height === source.height
+    ) {
       return { file, resized: false, source };
     }
 
@@ -184,10 +218,10 @@ export async function downscaleImage(
     if (!ctx) return { file, resized: false, source };
     ctx.drawImage(bitmap, 0, 0, target.width, target.height);
 
-    const type = reencodeType(file.type);
+    const type = reencodeType(file.type, quality !== undefined);
     const blob = await new Promise<Blob | null>((resolve) => {
       if (typeof canvas.toBlob !== 'function') { resolve(null); return; }
-      canvas.toBlob(resolve, type, REENCODE_QUALITY);
+      canvas.toBlob(resolve, type, quality ?? REENCODE_QUALITY);
     });
     if (!blob) return { file, resized: false, source };
 
