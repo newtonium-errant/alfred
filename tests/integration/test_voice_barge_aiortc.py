@@ -332,6 +332,27 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
         if etype == "turn_final" and got_barge.is_set():
             got_t2_final.set()
 
+    # #73 — why the consumer stopped, RECORDED rather than swallowed.
+    #
+    # This test was 2-of-4 flaky in the full suite (8/8 alone) and always died
+    # on `assert post` — "no audio frames captured after the barge" — which
+    # says WHAT was missing and nothing about WHY. The consumer used a bare
+    # `except Exception: pass`, so a track that ended mid-run left no trace and
+    # every firing produced the same uninformative line.
+    #
+    # Two candidate roots were CHECKED and REFUTED rather than assumed:
+    #   * "the server stops emitting once T2 is silent" — it does not.
+    #     ``voice_tts._pull_frame`` returns a SILENCE frame on an empty buffer,
+    #     so frames keep flowing throughout the post-barge window.
+    #   * "the unreferenced ensure_future task is GC'd mid-flight" — measured
+    #     on this 3.12 venv: an unreferenced task awaiting a future keeps
+    #     ticking across repeated gc.collect(), because the loop holds a
+    #     reference through the awaited future.
+    # So the remaining suspect is a real track/transport end under load, which
+    # is inside aiortc rather than our code — hence INSTRUMENT, not guess.
+    consumer_stopped: list[tuple[str, str, float]] = []   # (exc type, detail, t)
+    consumer_tasks: list[asyncio.Future] = []
+
     @pc.on("track")
     def _on_track(track) -> None:
         async def consume():
@@ -341,10 +362,16 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
                     arr = frame.to_ndarray()
                     frame_peaks.append(
                         (asyncio.get_event_loop().time(), int(np.abs(arr).max())))
-            except Exception:  # noqa: BLE001 — track ends on teardown
-                pass
+            except Exception as exc:  # noqa: BLE001 — track ends on teardown
+                consumer_stopped.append((
+                    type(exc).__name__, str(exc)[:200],
+                    asyncio.get_event_loop().time(),
+                ))
 
-        asyncio.ensure_future(consume())
+        # Referenced per the asyncio fire-and-forget contract. The GC hazard was
+        # measured NOT to bite here; holding the reference costs nothing and
+        # removes it from what a future reader has to re-derive.
+        consumer_tasks.append(asyncio.ensure_future(consume()))
 
     pc.addTrack(_tone_track())
     try:
@@ -366,9 +393,24 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
         barge_time = barge_at[0]
         # T2 (empty reply) completes fast after the barge.
         await asyncio.wait_for(got_t2_final.wait(), timeout=10)
-        # Let the post-barge window fill: this is where T1's FLUSHED tone would
-        # have kept playing if the gen-gate leaked. Also drains the jitter buffer.
-        await asyncio.sleep(2.5)
+
+        # Fill the post-barge window: this is where T1's FLUSHED tone would
+        # have kept playing if the gen-gate leaked. Previously a flat
+        # `sleep(2.5)` — a fixed budget for "enough frames past
+        # barge_time + 1.0 to judge", which is the thing that went empty
+        # under load. Now it WAITS FOR THE CONDITION the assertions actually
+        # need, with a ceiling only so a dead track fails instead of hanging.
+        # This is not a widened deadline: the old sleep always burned 2.5 s
+        # and then hoped; this returns as soon as the window is genuinely
+        # judgeable, and its ceiling exists to bound the failure, not to buy
+        # more room for the race.
+        deadline = asyncio.get_event_loop().time() + 8.0
+        while asyncio.get_event_loop().time() < deadline:
+            if sum(1 for (t, _) in frame_peaks if t > barge_time + 1.0) >= 10:
+                break
+            if consumer_stopped:
+                break     # the track died — fail fast WITH the reason below
+            await asyncio.sleep(0.1)
 
         # --- DC wire: the §1.6 table order --------------------------------
         # Exactly one speaking_done, and it is the barge (reason barged_in).
@@ -409,8 +451,22 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
         # --- outbound audio: T1 heard, flush stops it, NO stale T1 tone ----
         pre = [p for (t, p) in frame_peaks if t < barge_time]
         post = [p for (t, p) in frame_peaks if t > barge_time + 1.0]
-        assert pre and max(pre) > 500, "T1 never spoke on the outbound track"
-        assert post, "no audio frames captured after the barge"
+        # #73 — the evidence the old one-liner never carried. When this fires
+        # again, the message says whether the track DIED (and with what) or
+        # merely ran dry, and where the frames actually landed relative to the
+        # barge. Built lazily-ish but unconditionally: it is a handful of
+        # arithmetic on a list the test already holds.
+        last_frame_at = max((t for (t, _) in frame_peaks), default=None)
+        evidence = (
+            f"frames={len(frame_peaks)} pre={len(pre)} post={len(post)} "
+            f"barge_at={barge_time:.3f} "
+            f"last_frame_at={last_frame_at if last_frame_at is None else round(last_frame_at, 3)} "
+            f"last_frame_rel_barge="
+            f"{None if last_frame_at is None else round(last_frame_at - barge_time, 3)} "
+            f"consumer_stopped={consumer_stopped or 'no'}"
+        )
+        assert pre and max(pre) > 500, f"T1 never spoke on the outbound track — {evidence}"
+        assert post, f"no audio frames captured after the barge — {evidence}"
         # The flush dropped T1's queued tone; T2 is silent — so a full second+
         # after the barge the track must be silent. A leaked T1 frame (gen-gate
         # miss) would ring at the ~440 Hz tone's amplitude here.

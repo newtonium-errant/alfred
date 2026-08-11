@@ -101,14 +101,32 @@ describe('FeedPage — needs-you reads the SAME truth as the row ✓ (no one-fet
     await act(async () => {
       fireEvent.click(screen.getByTestId('feed-row-complete'));
     });
-    await flush();
 
-    // The lag this pins: pre-fix the filter read the RAW stage, so the completed row
-    // stayed under "Needs you" (and "All clear" stayed suppressed) until the next poll.
-    expect(screen.queryByTestId('feed-pending')).toBeNull();
-    expect(screen.queryByTestId('feed-needs-you')).toBeNull();
-    expect(screen.queryByTestId('feed-empty')).not.toBeNull();
+    // #87 — WAIT FOR THE CONDITION, don't budget microtasks for it.
+    //
+    // This previously used a fixed `flush()` (act + exactly two `await
+    // Promise.resolve()` ticks) and was 1-of-3 flaky in the full vitest run
+    // while 16/16 green alone. Two ticks is a FIXED BUDGET for a settle whose
+    // real cost varies: the completion path is `feedApi.act(...).then(setState)`
+    // with a `.catch` attached after it, so the state lands some microtask hops
+    // later and React then schedules the re-render. Under a loaded run those
+    // hops can outlast the budget. `waitFor` retries until the DOM actually
+    // says what we claim, which is the same assertion without the guess — NOT
+    // a widened deadline, because nothing here waits on a clock.
+    await waitFor(() => {
+      // The lag this pins: pre-fix the filter read the RAW stage, so the
+      // completed row stayed under "Needs you" (and "All clear" stayed
+      // suppressed) until the next poll.
+      expect(screen.queryByTestId('feed-pending')).toBeNull();
+      expect(screen.queryByTestId('feed-needs-you')).toBeNull();
+      expect(screen.queryByTestId('feed-empty')).not.toBeNull();
+    });
+
     // Same render pass — nothing re-fetched the feed to produce that state.
+    // OUTSIDE the waitFor deliberately: this is the invariant that keeps the
+    // test meaningful. If the clear only ever came from a refetch, waitFor
+    // would happily retry until that refetch landed — and this assertion is
+    // what refuses it, because a refetch makes the count 2.
     expect(mockList).toHaveBeenCalledTimes(1);
   });
 
