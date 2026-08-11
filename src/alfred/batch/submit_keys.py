@@ -187,10 +187,17 @@ def _parse_ts(value: str) -> datetime | None:
 def _is_fresh(entry: SubmitKeyEntry, *, now: datetime) -> bool:
     """True while an entry is inside the TTL.
 
-    An UNPARSEABLE timestamp is treated as EXPIRED. That direction is chosen
-    deliberately: keeping it forever would let one corrupt row occupy the store
-    permanently, and the cost of dropping it is one un-deduped retry — where the
-    cost of the opposite mistake is a receipt replayed for the wrong batch.
+    An UNPARSEABLE timestamp is treated as EXPIRED, so that one corrupt row
+    cannot occupy the store permanently.
+
+    BOTH COSTS ARE SMALL AND BOUNDED, which is what makes this a free choice
+    rather than a risk trade. Dropping the row costs one un-deduped retry.
+    Keeping it would cost a slot held indefinitely and a receipt replayed past
+    its window — note that the replayed receipt would still be the CORRECT one
+    for that key: a replay requires an exact match on a client-minted UUID, so a
+    stale row can only ever answer for the batch it was written for. Serving
+    another batch's receipt would take a UUID collision, which no TTL decision
+    makes more or less likely.
     """
     stamp = _parse_ts(entry.created_at)
     if stamp is None:

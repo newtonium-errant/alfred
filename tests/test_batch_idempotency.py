@@ -427,8 +427,10 @@ def test_entries_expire_on_the_named_window(data_dir: Path) -> None:
 def test_an_unparseable_timestamp_expires_rather_than_sticking(data_dir: Path) -> None:
     """A corrupt row must not hold a slot forever.
 
-    The cost of dropping it is one un-deduped retry; the cost of keeping it is a
-    permanent entry that could replay a receipt for the wrong batch.
+    Both costs are small and bounded: dropping it costs one un-deduped retry,
+    keeping it would cost a slot held indefinitely. It could NOT cost a wrong
+    answer — a replay needs an exact match on a client-minted UUID, so a stale
+    row can only ever replay the receipt it was written for.
     """
     path = store_path(data_dir, _INSTANCE)
     path.parent.mkdir(parents=True, exist_ok=True)
