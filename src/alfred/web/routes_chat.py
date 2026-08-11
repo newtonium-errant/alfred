@@ -168,11 +168,13 @@ def _flatten_transcript_for_web(
 # /chat/turn + /chat/stream may now carry base64 image blocks (up to
 # MAX_IMAGES_PER_TURN × MAX_IMAGE_BYTES ≈ 4 × 5 MiB decoded, plus base64's
 # ~33% inflation + the JSON envelope). That is FAR above the shared transport
-# app's DEFAULT 1 MiB ``client_max_size`` (``build_app`` passes no override),
-# and ``request.json()`` / ``request.read()`` enforce that global cap — they
-# would 413 every screenshot turn. So this helper STREAMS ``request.content``
+# app's ``client_max_size``, which ``build_app`` sets to
+# ``DEFAULT_TRANSPORT_CLIENT_MAX_BYTES`` = 14 MiB (NOT aiohttp's 1 MiB default —
+# #57 raised it so a base64'd PDF reaches the ingest route's own taxonomy), and
+# ``request.json()`` / ``request.read()`` enforce that global cap — they would
+# 413 every screenshot turn. So this helper STREAMS ``request.content``
 # with its OWN byte cap (:data:`MAX_TURN_BODY_BYTES`), EXACTLY as
-# ``routes_stt.py`` streams audio, leaving the 1 MiB guard on every OTHER
+# ``routes_stt.py`` streams audio, leaving the 14 MiB guard on every OTHER
 # peer/auth/ingest route UNTOUCHED. Do NOT "fix" this by raising
 # ``client_max_size`` on the shared app — that weakens DoS protection on every
 # peer route (see the ``routes_stt.py`` module docstring). This cap MUST move
@@ -194,7 +196,7 @@ async def _read_json_body(request: web.Request) -> dict[str, Any] | web.Response
     VERBATIM (it is the body-too-large error) before touching it as a dict.
 
     Streams ``request.content`` rather than ``request.json()`` so the body cap
-    is OURS (:data:`MAX_TURN_BODY_BYTES`), not the transport app's 1 MiB
+    is OURS (:data:`MAX_TURN_BODY_BYTES`), not the transport app's 14 MiB
     ``client_max_size`` — image turns can be ~28 MiB (4 × 5 MiB base64) and
     ``request.json()`` would 413 them under the global guard. EXACT copy of
     the ``routes_stt.py`` streamed read; do NOT raise ``client_max_size``

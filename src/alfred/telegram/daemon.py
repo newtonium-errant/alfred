@@ -1611,6 +1611,37 @@ async def run(
             log.exception("talker.daemon.feed_setup_failed")
             feed_enabled = False
 
+        # ---- Batch intake paths (#83) --------------------------------
+        # Read from the DRIP config so the route writes to exactly the
+        # directory ``build_campaign`` will read. Deriving data_dir from
+        # ``logging.dir`` a second time here would work today and drift
+        # later, and the drift is invisible: the submit succeeds, the
+        # record is minted, and the campaign simply never sees the batch.
+        batch_data_dir = ""
+        batch_instance = ""
+        batch_kick_enabled = False
+        try:
+            from alfred.drip.config import (
+                load_from_unified as load_drip_config,
+            )
+            from alfred.transport.routes_batch import BATCH_CAMPAIGN_NAME
+
+            _drip_cfg = load_drip_config(raw)
+            batch_data_dir = _drip_cfg.data_dir
+            batch_instance = _drip_cfg.instance
+            # Whether anything will actually PROCESS a submission. Read from
+            # the same enabled-campaign view the runner uses, so the route's
+            # "queued" vs "saved" answer cannot claim a consumer that a
+            # disabled campaign will never provide.
+            batch_kick_enabled = (
+                BATCH_CAMPAIGN_NAME in _drip_cfg.enabled_campaigns()
+            )
+        except Exception:  # noqa: BLE001 — must never break transport setup
+            # Left empty on purpose: the route's own ``batch_not_configured``
+            # refusal is a clearer signal than a guessed path that silently
+            # writes somewhere no campaign reads.
+            log.exception("talker.daemon.batch_paths_setup_failed")
+
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper
         # conditionally based on what we pass in. This is the single
@@ -1653,6 +1684,19 @@ async def run(
             # transport.ingest.enabled (default False → route not mounted).
             ingest_enabled=transport_config.ingest.enabled,
             ingest_config=transport_config.ingest,
+            # Bulk scan intake (#83). Opt-in via transport.batch.enabled.
+            # data_dir + instance come from the DRIP config, not from a second
+            # read of logging.dir here: the route WRITES the batch directory
+            # and the batch_image campaign READS it, so a divergence between
+            # the two resolutions would mean submissions land where nothing
+            # looks for them — a silent, total failure of the feature.
+            batch_enabled=transport_config.batch.enabled,
+            batch_config=transport_config.batch,
+            batch_data_dir=batch_data_dir,
+            batch_instance=batch_instance,
+            # The kicked run needs THIS instance's config, not config.yaml.
+            batch_config_path=config.config_path or "",
+            batch_kick_enabled=batch_kick_enabled,
             # Cross-instance recall answer route (#20 S1). Opt-in via
             # transport.recall.enabled (default False → route not mounted).
             recall_enabled=transport_config.recall.enabled,

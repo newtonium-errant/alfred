@@ -122,6 +122,10 @@ from typing import Any
 import structlog
 import yaml
 
+# Safe: ``config`` imports nothing from this package (see its docstring), so
+# it is reachable from every module here without a cycle.
+from .config import DEFAULT_BATCH_CARRIED_CONTEXT_MAX_CHARS
+
 log = structlog.get_logger(__name__)
 
 #: The 07-30 rename-requeue suffix. Curator dedups by filename, so the live
@@ -723,6 +727,10 @@ class BatchImageCampaign:
     model: str
     max_tokens: int
     api_key: str
+    #: Ceiling on prior-results context per scan. A cost lever: unbounded, the
+    #: tokens paid across a batch grow with the SQUARE of its size. See
+    #: ``alfred.batch.render.render_carried_context``.
+    carried_context_max_chars: int = DEFAULT_BATCH_CARRIED_CONTEXT_MAX_CHARS
     name: str = "batch_image"
 
     SEP = "::"
@@ -829,6 +837,7 @@ class BatchImageCampaign:
             item_id=content_hash,
             model=self.model,
             max_tokens=self.max_tokens,
+            carried_context_max_chars=self.carried_context_max_chars,
         )
 
     def verify(self, item_id: str) -> bool:

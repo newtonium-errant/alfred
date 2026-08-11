@@ -116,6 +116,86 @@ def render_body(
     return "\n".join(out).rstrip() + "\n"
 
 
+def render_carried_context(
+    manifest: BatchManifest,
+    rows: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> str:
+    """The prior-results context for ONE per-scan model call, BOUNDED.
+
+    Deliberately not :func:`render_body`. The body is the operator's document
+    and must show every result; this is a prompt fragment whose only job is
+    keeping scan N's format and terminology consistent with the scans just
+    before it.
+
+    Passing the whole body here made the batch quadratic: scan N carried N-1
+    results, so a sixty-scan batch paid for roughly eighteen hundred
+    result-readings of text the model is explicitly instructed NOT to
+    re-process. This keeps the header and the TAIL — the most recent rows,
+    which are the ones consistency is measured against — and drops the distant
+    ones. Nothing is lost by dropping them: the ledger holds every result and
+    the record renders all of them; only the prompt is trimmed.
+
+    Results appear in MANIFEST order (submission order) like the body, so the
+    tail is "the scans just before this one" rather than whichever rows
+    happened to land last.
+
+    ``max_chars <= 0`` yields no context at all, which is a legitimate
+    operator choice (each scan judged entirely on its own) rather than an
+    error — and it is stated in the output, never a silent empty string.
+    """
+    by_item: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        iid = str(r.get("item_id") or "")
+        if iid:
+            by_item[iid] = r
+    done = [i for i in manifest.images if i.item_id in by_item]
+
+    if not done:
+        return ""
+    if max_chars <= 0:
+        return ""
+
+    header = f"{len(done)} of {len(manifest.images)} scans processed so far."
+
+    # Build newest-first, then reverse: the tail is what must survive, so the
+    # budget is spent from the most recent row backwards.
+    blocks: list[str] = []
+    used = len(header)
+    dropped = 0
+    for img in reversed(done):
+        row = by_item[img.item_id]
+        result = str(row.get("result") or "").strip()
+        if not result:
+            # A quarantined scan has no result to be consistent WITH, and its
+            # note describes a broken image rather than the batch's format.
+            dropped += 1
+            continue
+        block = f"### {img.filename}\n{result}"
+        if used + len(block) + 2 > max_chars:
+            dropped += 1
+            continue
+        blocks.append(block)
+        used += len(block) + 2
+
+    if not blocks:
+        return ""
+
+    parts = [header]
+    if dropped:
+        # Stated, not silent: the model is being shown a SUBSET, and a prompt
+        # that implied otherwise would invite it to reason about totals it
+        # cannot see.
+        parts.append(
+            f"(Showing the {len(blocks)} most recent; {dropped} earlier "
+            f"result(s) omitted for length.)"
+        )
+    parts.append("")
+    parts.extend(reversed(blocks))
+    return "\n".join(parts).rstrip() + "\n"
+
+
 def progress_counts(
     manifest: BatchManifest,
     rows: list[dict[str, Any]],
@@ -137,4 +217,4 @@ def progress_counts(
     }
 
 
-__all__ = ["progress_counts", "render_body"]
+__all__ = ["progress_counts", "render_body", "render_carried_context"]

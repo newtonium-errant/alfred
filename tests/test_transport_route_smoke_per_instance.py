@@ -787,6 +787,12 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         # ``transport.ingest.disabled`` info log; this debug event is the
         # wire-level skip signal.
         "transport.wire_transport_app.ingest_skipped",
+        # Bulk scan intake (#83, 2026-08-11) — instances that don't enable
+        # transport.batch (every instance by default) skip-log here.
+        # register_batch_routes ALSO emits its own
+        # ``transport.batch.disabled`` info log; this debug event is the
+        # wire-level skip signal.
+        "transport.wire_transport_app.batch_skipped",
         # Cross-instance recall answer route (#20 S1, 2026-08-01) —
         # instances that don't enable transport.recall (every instance by
         # default) skip-log here. register_recall_routes ALSO emits its own

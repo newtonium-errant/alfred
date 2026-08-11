@@ -215,10 +215,8 @@ class CampaignState:
         return total
 
 
-def campaign_state_path(
-    data_dir: Path | str, instance: str, campaign: str,
-) -> Path:
-    """``<data_dir>/drip/<instance>/<campaign>_state.json``.
+def drip_instance_dir(data_dir: Path | str, instance: str) -> Path:
+    """``<data_dir>/drip/<instance-slug>`` — one instance's whole drip state.
 
     Tool-scoped AND instance-scoped, per the CLAUDE.md state contract. Both
     matter, for different reasons:
@@ -235,6 +233,12 @@ def campaign_state_path(
     other's cursor past items neither processed — a silent-loss generator with
     no failure anywhere to notice. Hence single-writer-by-path, and hence
     ``instance`` is required rather than defaulted.
+
+    Extracted from :func:`campaign_state_path` (#83) so the run lock lands in
+    the SAME directory by construction rather than by a second copy of the slug
+    rule. That is a correctness coupling, not tidiness: a lock derived from a
+    drifted slug would guard a directory no runner writes to, and would fail
+    OPEN — silently — which is the one failure mode a lock must not have.
     """
     slug = (instance or "").strip().lower().replace(" ", "-")
     if not slug:
@@ -248,10 +252,20 @@ def campaign_state_path(
         # fourth caller cannot reintroduce the traceback by forgetting.
         # Still a ValueError subclass — existing ValueError handlers unaffected.
         raise DripConfigError(
-            "drip campaign state needs an instance name — an unscoped path is "
+            "drip state needs an instance name — an unscoped path is "
             "shared across instances on the box and silently corrupts cursors"
         )
-    return Path(data_dir) / "drip" / slug / f"{campaign}_state.json"
+    return Path(data_dir) / "drip" / slug
+
+
+def campaign_state_path(
+    data_dir: Path | str, instance: str, campaign: str,
+) -> Path:
+    """``<data_dir>/drip/<instance>/<campaign>_state.json``.
+
+    See :func:`drip_instance_dir` for why both scopings are load-bearing.
+    """
+    return drip_instance_dir(data_dir, instance) / f"{campaign}_state.json"
 
 
 def load_state(path: Path | str, campaign: str) -> CampaignState:
@@ -325,6 +339,7 @@ __all__ = [
     "CampaignState",
     "ItemState",
     "campaign_state_path",
+    "drip_instance_dir",
     "load_state",
     "now_iso",
     "save_state",
