@@ -5167,6 +5167,28 @@ def _stt_vocab_state_lines(sv) -> list[str]:
     return lines
 
 
+def _cmd_push_trial(args: argparse.Namespace) -> None:
+    """``alfred push-trial status [--json]`` — read the delivery-trial ledger.
+
+    READ-ONLY BY DESIGN. The sender lives in the web app (web-push is a Node
+    library and the schedule rides the Next poller's heartbeat); this surface
+    only reports what that sender wrote. A CLI that could also send would be a
+    second scheduler firing at unplanned times, and a push arriving off-schedule
+    is not the datum the slot claims it is.
+
+    The rendered table refuses to collapse "sent, never tapped" into "did not
+    arrive". That distinction IS the trial — see ``push_trial`` for why.
+    """
+    from alfred.push_trial import build_status, render_status, trial_path
+
+    path = trial_path()
+    status = build_status(path)
+    if getattr(args, "json", False):
+        print(json.dumps({"path": path, **status.to_dict()}, indent=2))
+        return
+    print(render_status(status, path))
+
+
 def _cmd_tier_override(args: argparse.Namespace) -> None:
     """``alfred tier-override {list [--json] | clear <kind>}`` — #72's escape hatch.
 
@@ -7112,6 +7134,18 @@ def build_parser() -> argparse.ArgumentParser:
     sttv_reject.add_argument("term", help="The proposed term to decline")
     sttv_reject.add_argument("--operator", required=True, help="Rejecter identity (recorded)")
 
+    # #96 stage 1 — the VAPID delivery trial's READ surface. Status only: the
+    # sender is the web app's poller heartbeat, and a CLI that could also send
+    # would fire pushes at unplanned times, corrupting the measurement.
+    ptrial_p = sub.add_parser(
+        "push-trial",
+        help="Report the VAPID push delivery trial (#96)",
+    )
+    ptrial_sub = ptrial_p.add_subparsers(dest="push_trial_cmd")
+    ptrial_status = ptrial_sub.add_parser(
+        "status", help="Per-slot delivery state — sent/received/not-sent, never conflated")
+    ptrial_status.add_argument("--json", action="store_true", help="Machine-readable output")
+
     # #72 — the tier-override escape hatch. `clear` only: putting a kind INTO
     # an override is the operator answering a Daily Sync proposal, and a second
     # door onto that decision would defeat the propose-then-approve channel.
@@ -7198,6 +7232,7 @@ def main() -> None:
         "routine": cmd_routine,
         "stt-vocab": _cmd_stt_vocab,
         "tier-override": _cmd_tier_override,
+        "push-trial": _cmd_push_trial,
         "tier-recurrence": _cmd_tier_recurrence,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,
