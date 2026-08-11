@@ -198,10 +198,14 @@ def _check_body_mutation_allowed(
         absent.
       - ``operation == "body_replace"``, record_type is ``event``,
         and the existing record has ``gcal_event_id`` set (would lose
-        GCal sync state on rewrite). The operator must vault_delete
-        the event first — which fires the GCal cancel hook and
-        properly removes the calendar mirror — before any body
-        rewrite. Refuse-at-scope keeps the contract centralised; the
+        GCal sync state on rewrite). The remedy named in the refusal is
+        SCOPE-AWARE (see :func:`_gcal_replace_remedy`): a delete-capable
+        scope is pointed at delete-then-recreate, while the scopes that
+        can actually reach this rule — ``talker`` and ``instructor``,
+        both ``delete: False`` — are pointed at body_append /
+        body_insert_at, because naming an operation the caller is
+        forbidden from performing is worse than naming none.
+        Refuse-at-scope keeps the contract centralised; the
         sync-layer-preserves alternative would have to live in
         every future sync hook.
 
@@ -312,11 +316,51 @@ def _check_body_mutation_allowed(
         raise ScopeError(
             f"Scope '{scope}' refuses 'body_replace' on event records "
             f"with a synced GCal mirror (gcal_event_id present). "
-            f"Rewriting the body could lose sync state. To proceed, "
-            f"first vault_delete the event (fires the GCal cancel "
-            f"hook and removes the calendar mirror cleanly), then "
-            f"vault_create the replacement."
+            f"Rewriting the body could lose sync state. "
+            + _gcal_replace_remedy(scope, record_type)
         )
+
+
+def _gcal_replace_remedy(scope: str | None, record_type: str) -> str:
+    """The actionable next step for a refused GCal-mirrored body_replace.
+
+    SCOPE-AWARE because the old single sentence — "first vault_delete the
+    event, then vault_create the replacement" — was DEAD ADVICE for every
+    caller that could actually receive it (#80). Only two scopes permit
+    ``body_replace`` on ``event`` at all, ``talker`` and ``instructor``, and
+    BOTH carry ``delete: False``. So the message named the one operation the
+    reader was structurally forbidden from performing, and the agent-facing
+    SKILLs had to carry warn-clauses telling agents to disregard it.
+
+    A refusal that names an impossible remedy is worse than a refusal that
+    names none: it sends a capable agent into a second failure to discover
+    what the first one should have said.
+    """
+    rules = SCOPE_RULES.get(scope or "", {})
+    if rules.get("delete"):
+        # Retained for a scope that genuinely holds delete (janitor today,
+        # and any future one) — for those the original path is correct.
+        return (
+            "To proceed, first vault_delete the event (fires the GCal "
+            "cancel hook and removes the calendar mirror cleanly), then "
+            "vault_create the replacement."
+        )
+
+    # The delete-less case — every caller that can reach this today.
+    alternatives = ["body_append"]
+    insert_at = rules.get("allow_body_insert_at") or {}
+    if isinstance(insert_at, dict) and (
+        insert_at.get(record_type) or insert_at.get("*")
+    ):
+        alternatives.append("body_insert_at")
+    joined = " or ".join(alternatives)
+    return (
+        f"This scope cannot delete records, so the event must not be "
+        f"removed here. Add to the existing body with {joined} instead of "
+        f"replacing it; if the event genuinely needs replacing, ask the "
+        f"operator to cancel it (which clears the GCal mirror) and then "
+        f"create a fresh record."
+    )
 
 
 # Operation → {scope: checker_function}
@@ -505,10 +549,11 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # event for calendar-relevant content additions. ``event``
         # body_replace is gated INSIDE _check_body_mutation_allowed
         # by the gcal_event_id carve-out: an event with a synced GCal
-        # mirror refuses body_replace and points the operator at the
-        # vault_delete-then-vault_create path instead. So the entry
-        # below ALLOWS event in the dict but the carve-out runtime-
-        # enforces "only events without gcal mirrors".
+        # mirror refuses body_replace and points the caller at
+        # body_append / body_insert_at instead — NOT at vault_delete,
+        # which this scope does not hold (#80). So the entry below
+        # ALLOWS event in the dict but the carve-out runtime-enforces
+        # "only events without gcal mirrors".
         "allow_body_insert_at": {
             "note": True, "task": True, "event": True,
         },

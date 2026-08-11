@@ -111,6 +111,54 @@ class WatcherConfig:
     # subprocesses or HTTP) run in parallel up to this limit. Ref upstream
     # 163b7f9; default matches upstream.
     max_concurrent: int = 4
+    # File extensions the curator will ADMIT from the inbox (#88).
+    #
+    # Before this existed, admission was "every file that is not hidden, a
+    # .lock, or in a small skip-name set" — no extension filter at all. That
+    # is a real, measured spend-burner rather than a theoretical one: THREE
+    # attachment savers write BINARIES into this same watched directory —
+    # ``telegram.vision.save_image_to_inbox`` (``screenshot-*``),
+    # ``telegram.attachments.save_document_to_inbox`` (``document-*``) and
+    # ``save_audio_to_inbox`` (``audio-*``) — so every screenshot, PDF and
+    # voice attachment was picked up and pushed through ``claude -p`` a
+    # second time, minting junk records. (#83's batch lane already dodged
+    # this by siting its scans OUTSIDE the vault; see ``batch/paths.py``,
+    # which documents the same hazard.)
+    #
+    # The default admits exactly what the legitimate writers produce: the
+    # mail webhook and fetcher both write ``email-*.md``, and an operator's
+    # hand-dropped note is markdown or plain text. A non-admitted file is
+    # SKIPPED AND LOGGED (once per filename), never silently ignored — so an
+    # operator who deliberately drops something unusual sees why it sat
+    # there rather than wondering.
+    #
+    # Widening this is how a new ingestable type is enabled; it is a config
+    # edit, not a code change. Values are normalized to lowercase and
+    # dot-prefixed at load, so ``[md, .TXT]`` works.
+    ingestable_extensions: list[str] = field(
+        default_factory=lambda: [".md", ".markdown", ".txt"],
+    )
+
+    def __post_init__(self) -> None:
+        # Normalize here rather than at the call site: the config is built by
+        # the shared ``_build`` dispatch AND by direct construction in tests,
+        # and a predicate that had to remember to normalize would eventually
+        # be called by someone who didn't.
+        normalized: list[str] = []
+        for raw in self.ingestable_extensions or []:
+            # A YAML null in the list is ``None``, and ``str(None)`` is the
+            # non-empty ``"None"`` — which would normalize to a live ``.none``
+            # entry. Drop non-strings rather than coercing them.
+            if not isinstance(raw, str):
+                continue
+            ext = raw.strip().lower()
+            if not ext:
+                continue
+            if not ext.startswith("."):
+                ext = f".{ext}"
+            if ext not in normalized:
+                normalized.append(ext)
+        self.ingestable_extensions = normalized
 
 
 @dataclass

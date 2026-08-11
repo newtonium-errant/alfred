@@ -266,6 +266,16 @@ def cmd_repair_verify(
     where it is a pure function of a campaign and a state object and the rules
     above can be pinned without a config, a work-list file or a state file. This
     handler is the operator-facing shell: select, load, delegate, save, print.
+
+    **``--apply`` takes the run lock** (#89). The demotion is a
+    read-modify-write on the SAME per-campaign state file ``run_increment``
+    writes, and it was happening outside the lock the hourly timer holds. The
+    interleaving loses data silently in either direction: repair loads state,
+    the timer's run claims items and saves, repair saves its now-stale copy and
+    the claims vanish — or the reverse, and the demotions do. Both runs report
+    success, which is the same signature the lock was introduced for
+    (``run_lock``'s docstring: two concurrent runs produced 12 work() calls over
+    a 6-item list and both reported a clean done=6).
     """
     selected = _select_configured(config, campaign_name)
 
@@ -278,6 +288,44 @@ def cmd_repair_verify(
         )
         return 0
 
+    # A dry run reads and reports; it writes no state, so it takes NO lock —
+    # the same reasoning ``cmd_run`` applies to its own preview. Refusing to
+    # tell an operator what repair WOULD do because a run is in progress
+    # would deny the answer at the moment it is most worth having.
+    if not apply:
+        return _repair_all(selected, config, apply=False)
+
+    with run_lock(config.data_dir, config.instance) as acquired:
+        if not acquired:
+            # ILB, and NOT an error — but a DIFFERENT outcome from ``run``'s
+            # stand-down, and it must not borrow that wording. A skipped run
+            # is covered by the run holding the lock; a skipped REPAIR is not
+            # covered by anything, because ``run`` never re-verifies done
+            # rows. So this says plainly that the repair did not happen and
+            # has to be re-issued.
+            print(
+                "Drip repair-verify: a drip run is in progress on this "
+                "instance — standing down WITHOUT repairing. Nothing was "
+                "demoted; re-run this command once the run finishes."
+            )
+            log.warning(
+                "drip.repair_verify.lock_busy",
+                instance=config.instance,
+                detail="repair-verify --apply could not take the run lock; no "
+                       "state was read or written. Unlike a skipped run, this "
+                       "work is NOT covered by the lock holder — re-issue it.",
+            )
+            return 0
+        return _repair_all(selected, config, apply=True)
+
+
+def _repair_all(selected: dict, config: DripConfig, *, apply: bool) -> int:
+    """Re-verify each selected campaign. Returns an exit code.
+
+    Split out of :func:`cmd_repair_verify` so the lock can wrap the whole pass
+    without the body existing twice — one copy under the lock and one without
+    is exactly how the two drift. Mirrors ``cmd_run`` / :func:`_drain`.
+    """
     mode = "" if apply else " [dry run]"
 
     for name, ccfg in sorted(selected.items()):

@@ -277,7 +277,11 @@ async def run_batch(
     state_lock = asyncio.Lock()
 
     # Find unprocessed files
-    watcher = InboxWatcher(inbox_path=config.vault.inbox_path)
+    watcher = InboxWatcher(
+        inbox_path=config.vault.inbox_path,
+        # #88 — admission filter, same config source as the daemon's.
+        ingestable_extensions=config.watcher.ingestable_extensions,
+    )
     unprocessed = watcher.full_scan(
         state_processed=set(state_mgr.state.processed.keys()),
     )

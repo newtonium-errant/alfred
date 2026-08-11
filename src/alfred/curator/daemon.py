@@ -749,6 +749,11 @@ async def run(
     watcher = InboxWatcher(
         inbox_path=config.vault.inbox_path,
         debounce_seconds=config.watcher.debounce_seconds,
+        # #88 — admission filter. Threaded from config here AND in
+        # ``curator/process.py``; an un-threaded call site would silently
+        # fall back to the module default and stop honouring an operator
+        # who widened the set.
+        ingestable_extensions=config.watcher.ingestable_extensions,
     )
 
     # Startup scan for unprocessed files — process concurrently up to
