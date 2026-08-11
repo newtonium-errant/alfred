@@ -98,6 +98,30 @@ def _resolve_notify_identity(
     return identity, None
 
 
+async def _read_ids(
+    request: web.Request,
+) -> tuple[list[str], web.Response | None]:
+    """Parse + validate an ``{"ids": [...]}`` body — ``(ids, error_response)``.
+
+    Shared by ack and dismiss (#86) so the two cannot drift on what a valid id
+    list is. They are different acts, but "which ids did you mean" is the same
+    question, and a second copy of this guard is how one endpoint ends up
+    accepting a body the other rejects.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — malformed body → 400
+        return [], web.json_response({"error": "invalid_json"}, status=400)
+    ids = body.get("ids") if isinstance(body, dict) else None
+    if (
+        not isinstance(ids, list)
+        or len(ids) > MAX_ACK_IDS
+        or not all(isinstance(i, str) and i for i in ids)
+    ):
+        return [], web.json_response({"error": "invalid_ids"}, status=400)
+    return ids, None
+
+
 async def _handle_notifications_list(request: web.Request) -> web.StreamResponse:
     """GET /chat/notifications — the caller's own tray, newest-first."""
     identity, err = _resolve_notify_identity(request)
@@ -116,6 +140,21 @@ async def _handle_notifications_list(request: web.Request) -> web.StreamResponse
         )
         return web.json_response({"notifications": [], "unread": 0})
 
+    # Retirement runs HERE, on the read path, and this is the only place it
+    # may run (#86). The store has no daemon of its own, so there is no sweep
+    # loop to hang it on — but the alternative of hooking it inside
+    # ``list_for`` would be worse than merely inelegant: the daily-sync brief
+    # is a SEPARATE daemon that also calls ``list_for`` and is documented
+    # read-only, so a write hidden in the read path would make two processes
+    # read-modify-write one unlocked JSON file. This handler runs in the
+    # talker daemon, which is the store's only writer, so the sweep stays
+    # single-writer by construction.
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    store.retire_aged(
+        identity.synthetic_chat_id,
+        max_age_days=web_config.notifications.retain_read_days,
+    )
+
     items = store.list_for(identity.synthetic_chat_id)
     unread = store.unread_count(identity.synthetic_chat_id)
     if not items:
@@ -132,17 +171,9 @@ async def _handle_notifications_ack(request: web.Request) -> web.StreamResponse:
         return err
     assert identity is not None  # narrowed by the shared spine
 
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001 — malformed body → 400
-        return web.json_response({"error": "invalid_json"}, status=400)
-    ids = body.get("ids") if isinstance(body, dict) else None
-    if (
-        not isinstance(ids, list)
-        or len(ids) > MAX_ACK_IDS
-        or not all(isinstance(i, str) and i for i in ids)
-    ):
-        return web.json_response({"error": "invalid_ids"}, status=400)
+    ids, bad = await _read_ids(request)
+    if bad is not None:
+        return bad
 
     store = request.app.get(KEY_WEB_NOTIFY_STORE)
     if store is None:
@@ -165,8 +196,53 @@ async def _handle_notifications_ack(request: web.Request) -> web.StreamResponse:
     return web.json_response({"acked": acked, "unread": unread})
 
 
+async def _handle_notifications_dismiss(request: web.Request) -> web.StreamResponse:
+    """POST /chat/notifications/dismiss {ids: [...]} — clear from the tray (#86).
+
+    The operator-facing half of the lifecycle the tray was missing: ``ack``
+    makes a notice calm, this makes it GONE. Non-destructive — the entry stays
+    in the store for audit and simply stops being listed.
+
+    Deliberately its own route rather than a flag on ``ack``. They are
+    different acts with different reversibility ("I have seen this" vs "I am
+    done with this"), and a single endpoint with a mode switch is how a client
+    bug turns a read into a clear.
+    """
+    identity, err = _resolve_notify_identity(request)
+    if err is not None:
+        return err
+    assert identity is not None  # narrowed by the shared spine
+
+    ids, bad = await _read_ids(request)
+    if bad is not None:
+        return bad
+
+    store = request.app.get(KEY_WEB_NOTIFY_STORE)
+    if store is None:
+        log.info(
+            "web.notify.store_absent",
+            user=identity.user,
+            reason="no notify store wired (data_dir not threaded)",
+        )
+        return web.json_response({"dismissed": 0, "unread": 0})
+
+    dismissed = store.dismiss(identity.synthetic_chat_id, ids)
+    unread = store.unread_count(identity.synthetic_chat_id)
+    log.info(
+        "web.notify.dismissed",
+        user=identity.user,
+        requested=len(ids),
+        dismissed=dismissed,
+        unread=unread,
+    )
+    return web.json_response({"dismissed": dismissed, "unread": unread})
+
+
 def register_notify_routes(app: web.Application) -> None:
-    """Mount the notification read/ack routes. Called by
+    """Mount the notification read/ack/dismiss routes. Called by
     ``register_web_routes`` (web config + store already stashed)."""
     app.router.add_get("/chat/notifications", _handle_notifications_list)
     app.router.add_post("/chat/notifications/ack", _handle_notifications_ack)
+    app.router.add_post(
+        "/chat/notifications/dismiss", _handle_notifications_dismiss,
+    )

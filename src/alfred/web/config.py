@@ -363,9 +363,17 @@ class WebNotificationsConfig:
     on every instance nothing notifies. Setting ``enabled: false`` skips
     the sink registration AND the ``/chat/notifications*`` route mount
     (opt-out inertness, logged).
+
+    ``retain_read_days`` is how long a READ notice stays in the tray before it
+    is auto-dismissed (#86). Only read entries age out — an unread notice is
+    kept at any age, because clearing something the operator never saw is the
+    failure this feature exists to prevent, pointed backwards. ``0`` disables
+    retirement entirely (keep until dismissed by hand), and says so in the log
+    rather than silently retiring everything.
     """
 
     enabled: bool = True
+    retain_read_days: int = 7
 
 
 @dataclass
@@ -751,6 +759,12 @@ def _build_notifications(raw: Any) -> WebNotificationsConfig:
     filtered = {k: v for k, v in raw.items() if k in known}
     return WebNotificationsConfig(
         enabled=bool(filtered.get("enabled", defaults.enabled)),
+        # Negatives are clamped to 0 (= retirement off) rather than rejected:
+        # a negative window is meaningless, and the honest reading of "less
+        # than no retention" is "do not retire", not "retire everything".
+        retain_read_days=max(
+            0, _int(filtered.get("retain_read_days"), defaults.retain_read_days)
+        ),
     )
 
 

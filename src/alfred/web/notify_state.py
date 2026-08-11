@@ -27,7 +27,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,6 +49,23 @@ NOTIFY_CAP = 200
 # body cap so the two read-surfaces agree on "too long to inline".
 NOTIFY_BODY_MAX_CHARS = 4000
 
+# #86 — how a notification LEAVES the tray.
+#
+# The operator's report: a ticket notice they had already read sat on screen for
+# four days with no way to clear it. ``read`` restyles an entry forever; nothing
+# ever removed one. So ``dismissed`` is added as a SECOND, terminal state:
+#
+#   unread    → bold, counted in the pill, offers "Mark read"
+#   read      → calm, uncounted, collapsed out of the glance list
+#   dismissed → not rendered at all, still IN the store (audit trail)
+#
+# Dismissal is reached two ways, and both land on the same field so there is
+# exactly one rendering rule to reason about:
+#   * the operator dismisses it        → reason ``operator``
+#   * it ages out of the retention window → reason ``aged_out``
+DISMISS_REASON_OPERATOR = "operator"
+DISMISS_REASON_AGED_OUT = "aged_out"
+
 
 def _safe_http_url(value: Any) -> str:
     """Return ``value`` only if it is an ``http(s)`` URL, else ``""`` (#22 XSS guard).
@@ -67,6 +84,28 @@ def _safe_http_url(value: Any) -> str:
     return ""
 
 
+def _parse_ts(value: Any) -> "datetime | None":
+    """Parse an entry's ``ts`` to an aware datetime, or ``None`` if unusable.
+
+    ``None`` on anything unparseable is load-bearing for :meth:`retire_aged`:
+    an entry whose age cannot be established must NOT be treated as ancient.
+    Failing the other way would auto-clear notices on a guess about their age.
+
+    A naive timestamp (no offset) is read as UTC — every writer here stamps
+    ``datetime.now(timezone.utc).isoformat()``, so a naive value can only come
+    from a hand-edited file, and UTC is the only defensible reading of it.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 @dataclass
 class WebNotifyStore:
     """In-memory mirror of the web-notification state file.
@@ -75,7 +114,14 @@ class WebNotifyStore:
     OLDEST-FIRST (append on enqueue, pop-front on eviction). Each entry::
 
         {"id": str, "text": str, "precedence": str, "source": str,
-         "ticket_uid": str, "issue_url": str, "ts": iso8601, "read": bool}
+         "ticket_uid": str, "issue_url": str, "ts": iso8601, "read": bool,
+         "dismissed": bool,                       # #86, terminal for rendering
+         "dismissed_at": iso8601,                 # present once dismissed
+         "dismissed_reason": "operator"|"aged_out"}
+
+    ``dismissed`` and its two companions are ADDITIVE: pre-#86 entries simply
+    lack them and every check is a falsy ``.get``, so no migration is needed
+    and a rollback leaves the older build reading the file unchanged.
     """
 
     state_path: Path
@@ -195,6 +241,12 @@ class WebNotifyStore:
             "issue_number": issue_number if isinstance(issue_number, int) else 0,
             "ts": datetime.now(timezone.utc).isoformat(),
             "read": False,
+            # #86 — always PRESENT on a new entry, for the same reason
+            # ``ticket_body`` is: a reader can then tell "not dismissed" from
+            # "predates the field" without guessing. Entries written before
+            # #86 simply lack it, and every check is a falsy ``.get``, so the
+            # rollout needs no migration.
+            "dismissed": False,
         }
         bucket = self.notifications.setdefault(str(user_key), [])
         bucket.append(entry)
@@ -203,14 +255,49 @@ class WebNotifyStore:
         self.save()
         return entry
 
-    def list_for(self, user_key: int | str) -> list[dict[str, Any]]:
-        """Return ``user_key``'s notifications NEWEST-FIRST (copies)."""
+    def list_for(
+        self,
+        user_key: int | str,
+        *,
+        include_dismissed: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return ``user_key``'s notifications NEWEST-FIRST (copies).
+
+        Dismissed entries are EXCLUDED by default (#86). That default is the
+        one that matters, because this method has two callers in two different
+        daemons: the PWA tray (``routes_notify``) and the daily-sync brief
+        (``daily_sync.ticket_notify_section``). If dismissal only hid an entry
+        in the tray, a notice the operator had explicitly cleared would
+        reappear in tomorrow's brief — the revive-after-ack failure the health
+        cards already taught us (CLAUDE.md: acked cards reviving because one
+        surface forgot the other's terminal state). One filter here fixes both
+        surfaces at once.
+
+        ``include_dismissed=True`` is the audit escape: the entries never leave
+        the store, so anything that needs the full history can still ask for it.
+
+        READ-ONLY, and deliberately so — see :meth:`retire_aged` for why this
+        method must never write.
+        """
         bucket = self.notifications.get(str(user_key), [])
-        return [dict(e) for e in reversed(bucket)]
+        out = reversed(bucket) if include_dismissed else (
+            e for e in reversed(bucket) if not e.get("dismissed")
+        )
+        return [dict(e) for e in out]
 
     def unread_count(self, user_key: int | str) -> int:
+        """Unread AND not dismissed.
+
+        ``dismiss`` already marks an entry read, so the second clause is
+        unreachable through the API — it is here for a store file that was
+        hand-edited or written by an older build. A badge counting something
+        the tray does not render is the exact inversion of the
+        intentionally-left-blank rule: it reports work that cannot be found.
+        """
         bucket = self.notifications.get(str(user_key), [])
-        return sum(1 for e in bucket if not e.get("read"))
+        return sum(
+            1 for e in bucket if not e.get("read") and not e.get("dismissed")
+        )
 
     def ack(self, user_key: int | str, ids: list[str]) -> int:
         """Mark the given ids read for ``user_key``; saves; returns count.
@@ -229,6 +316,123 @@ class WebNotifyStore:
         if changed:
             self.save()
         return changed
+
+    def dismiss(self, user_key: int | str, ids: list[str]) -> int:
+        """Dismiss the given ids for ``user_key``; saves; returns count (#86).
+
+        Dismissal is TERMINAL for rendering and NON-DESTRUCTIVE for storage:
+        the entry stops appearing in the tray and the brief, and stays in the
+        file. The store is a tray, not an archive — but it is also the only
+        record that a notice was ever delivered, so clearing the screen must
+        not erase the evidence.
+
+        Dismissing also marks the entry READ. Not a convenience: it makes
+        "dismissed but unread" unreachable, so there is no state in which the
+        unread pill counts something the operator cannot see or reach. One
+        invariant (dismissed ⇒ read) beats a compound condition every reader
+        of this store would otherwise have to remember.
+
+        Idempotent, like :meth:`ack` — unknown or already-dismissed ids are
+        skipped, so a retried dismiss returns 0 and never errors.
+        """
+        wanted = {str(i) for i in ids}
+        if not wanted:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        changed = 0
+        for entry in self.notifications.get(str(user_key), []):
+            if entry.get("id") in wanted and not entry.get("dismissed"):
+                entry["dismissed"] = True
+                entry["read"] = True
+                entry["dismissed_at"] = now
+                entry["dismissed_reason"] = DISMISS_REASON_OPERATOR
+                changed += 1
+        if changed:
+            self.save()
+        return changed
+
+    def retire_aged(
+        self,
+        user_key: int | str,
+        *,
+        max_age_days: int,
+        now: datetime | None = None,
+    ) -> int:
+        """Auto-dismiss READ entries older than ``max_age_days``; returns count.
+
+        The third way a tray empties, and the only one needing no operator
+        action: a notice read three weeks ago is history, not a task.
+
+        WHY THIS IS A SEPARATE METHOD AND NOT A HOOK INSIDE ``list_for``.
+        ``list_for`` has two callers in two different DAEMONS — the talker
+        (which owns this file and is its only writer) and the daily-sync brief
+        (documented read-only). Retiring inside the read path would turn the
+        brief daemon into a second writer of an unlocked JSON file, and two
+        read-modify-write processes with no lock is a lost-update generator:
+        the brief's save would clobber whatever the talker enqueued or acked in
+        between. So retirement lives in an explicitly-named method that only
+        the owning process calls (``routes_notify``'s list handler), and the
+        read path stays pure.
+
+        UNREAD ENTRIES ARE NEVER RETIRED, at any age. An unread notice that
+        aged out would be work the operator never saw, deleted for being old —
+        which is the failure this whole feature exists to prevent, pointed the
+        other way. Age is only permission to clear something already seen.
+
+        ``max_age_days <= 0`` disables retirement (an operator choice: keep the
+        tray until it is cleared by hand), and says so rather than silently
+        retiring everything on a zero.
+        """
+        key = str(user_key)
+        bucket = self.notifications.get(key, [])
+        if max_age_days <= 0:
+            # ILB: "retention off" is a configured state, not a broken sweep.
+            log.info(
+                "web.notify.retire_disabled",
+                user_key=key,
+                entries=len(bucket),
+                detail="web.notifications.retain_read_days <= 0 — read "
+                       "entries are kept until dismissed by hand",
+            )
+            return 0
+
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(
+            days=max_age_days,
+        )
+        stamp = (now or datetime.now(timezone.utc)).isoformat()
+        retired = 0
+        for entry in bucket:
+            if entry.get("dismissed") or not entry.get("read"):
+                continue
+            ts = _parse_ts(entry.get("ts"))
+            if ts is None or ts > cutoff:
+                # An unparseable timestamp is NOT treated as ancient. Failing
+                # open here would auto-clear entries whose age we cannot
+                # actually establish — deleting on a guess.
+                continue
+            entry["dismissed"] = True
+            entry["dismissed_at"] = stamp
+            entry["dismissed_reason"] = DISMISS_REASON_AGED_OUT
+            retired += 1
+        if retired:
+            self.save()
+
+        # ILB: fires on EVERY sweep including zero. A retirement mechanism that
+        # only speaks when it acts is indistinguishable from one that stopped
+        # running, and this one runs on a read path where nobody would notice.
+        log.info(
+            "web.notify.retired_aged",
+            user_key=key,
+            retired=retired,
+            entries=len(bucket),
+            max_age_days=max_age_days,
+            detail=(
+                "ran, nothing to retire — no read entry is older than the "
+                "retention window" if not retired else
+                "read entries past the retention window were auto-dismissed"
+            ),
+        )
+        return retired
 
 
 def build_web_notify_sink(

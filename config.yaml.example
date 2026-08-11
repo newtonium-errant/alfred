@@ -718,6 +718,16 @@ transport:
 #   # skip the sink + route mount entirely.
 #   # notifications:
 #   #   enabled: true
+#   #   # How long a READ notice stays in the tray before it is auto-dismissed
+#   #   # (#86 — the operator reported a read notice sitting on screen for four
+#   #   # days with no way to clear it). Only READ entries age out: an unread
+#   #   # notice is kept at any age, because clearing something never seen is
+#   #   # the same bug pointed backwards. Retired entries stop rendering but
+#   #   # stay in the store, so the delivery record survives.
+#   #   # 0 disables retirement (keep until dismissed by hand) — logged, not
+#   #   # silent. The sweep runs when the tray is read (the store has no daemon)
+#   #   # and reports its count every time, including zero.
+#   #   retain_read_days: 7
 #   # --- WebRTC voice (PWA voice arc) ---
 #   # Browser mic → WebRTC → this server. DISABLED by default — an absent or
 #   # ``enabled: false`` block mounts NO /voice/* routes (route table
