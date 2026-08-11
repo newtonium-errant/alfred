@@ -69,11 +69,21 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-# Default store path. Instance-scoped per the CLAUDE.md per-instance-defaults
-# rule (the 2026-07-31 feed-store incident: a cwd-relative shared default let
-# one instance's writer pollute another's store). Operators override via
-# ``tier.snooze.path``; every caller threads an explicit path in production.
-DEFAULT_SNOOZE_PATH = "./data/board_snooze.salem.json"
+# Default store path — a DIRECT-CONSTRUCTION placeholder with no instance
+# segment (#84).
+#
+# The previous value was ``board_snooze.salem.json``, and the comment above it
+# claimed the path was "instance-scoped per the CLAUDE.md per-instance-defaults
+# rule". It was instance-NAMED, which is the opposite: a shared code path
+# carrying one instance's name means every other instance writes into a file
+# labelled Salem. A comment asserting the property it violates is worse than no
+# comment, because it stops the next reader looking.
+#
+# Production threads an explicit path (``tier.snooze.path`` via
+# :func:`resolve_snooze_path`, the single parse both the writer and the reader
+# come through). :func:`default_snooze_path` is the instance-derived value for
+# a caller that needs one — byte-identical to the old literal for Salem.
+DEFAULT_SNOOZE_PATH = "./data/board_snooze.json"
 
 # The duration ladder. Three dated rungs plus the INDEFINITE one — ``None`` days,
 # meaning "until I say". That fourth rung is the old board **Park** verb: #14
@@ -144,6 +154,39 @@ class SnoozeEntry:
         """Schema-tolerant construct (the house load() contract)."""
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(**known)
+
+
+def default_snooze_path(raw: Any) -> str:
+    """The instance-derived snooze store path for a unified config (#84).
+
+    ``<data dir>/board_snooze.<slug>.json``. For Salem this is
+    ``./data/board_snooze.salem.json`` — byte-identical to the literal this
+    replaced, so an instance that adopts it inherits its existing store
+    rather than starting empty.
+
+    NOT a fallback inside :func:`resolve_snooze_path`: that function returning
+    ``None`` for an unconfigured instance is load-bearing (callers treat the
+    empty as "snoozing not configured"), and quietly manufacturing a path
+    would turn an off feature on. This is for a caller that wants the
+    conventional location by name.
+    """
+    from alfred.common.instance_paths import (
+        instance_data_path,
+        instance_state_filename_or_unscoped,
+    )
+
+    instance = ""
+    if isinstance(raw, dict):
+        telegram = raw.get("telegram")
+        if isinstance(telegram, dict):
+            block = telegram.get("instance")
+            if isinstance(block, dict):
+                instance = str(block.get("name") or "")
+    return instance_data_path(
+        raw if isinstance(raw, dict) else {},
+        instance_state_filename_or_unscoped(
+            "board_snooze", instance, suffix="json"),
+    )
 
 
 def resolve_snooze_path(raw: Any) -> str | None:
@@ -397,6 +440,7 @@ def filter_snoozed_entries(
 
 __all__ = [
     "DEFAULT_SNOOZE_PATH",
+    "default_snooze_path",
     "INDEFINITE_LABEL",
     "REASON_CROSSED_DUE",
     "REASON_MOVED_EARLIER",

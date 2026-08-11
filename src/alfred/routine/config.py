@@ -54,6 +54,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from alfred.common.instance_paths import instance_state_filename_or_unscoped
 from alfred.common.schedule import ScheduleConfig
 
 from . import match_calibration
@@ -517,18 +518,38 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
     # config convention. Absent block → module defaults (pending_path under
     # data/, threshold 0.5). pending_path defaults under the configured log_dir
     # so it co-locates with the other per-instance state files.
+    # Resolve instance name via the canonical normaliser. Empty when
+    # the operator omitted ``telegram.instance.name`` from config —
+    # the daemon-start guard refuses to start in that case (rather
+    # than silently treating an unset instance as Salem). Per
+    # ``feedback_hardcoding_and_alfred_naming.md`` we fail-loud on
+    # missing instance name.
+    from alfred.telegram._compat import _normalize_instance_name
+    telegram_raw = raw.get("telegram") or {}
+    instance_raw = telegram_raw.get("instance") or {}
+    raw_name = ""
+    if isinstance(instance_raw, dict):
+        raw_name = str(instance_raw.get("name") or "")
+    instance_name = _normalize_instance_name(raw_name)
+
     mc_raw = section.get("match_calibration", {}) or {}
     match_calibration_cfg = MatchCalibrationConfig(
+        # #84 — instance DERIVED, not baked in. The old literal named
+        # Salem on a shared code path, so KAL-LE running the same matcher
+        # wrote into a file named for another instance. Byte-identical for
+        # Salem (name "Salem" slugs to "salem"), so nothing moves.
         pending_path=mc_raw.get(
             "pending_path",
-            f"{log_dir}/routine_match_pending.salem.jsonl",
+            f"{log_dir}/" + instance_state_filename_or_unscoped(
+                "routine_match_pending", instance_name, suffix="jsonl"),
         ),
         threshold=float(
             mc_raw.get("threshold", match_calibration.DEFAULT_CONFIDENCE_THRESHOLD)
         ),
         corpus_path=mc_raw.get(
             "corpus_path",
-            f"{log_dir}/routine_match_corpus.salem.jsonl",
+            f"{log_dir}/" + instance_state_filename_or_unscoped(
+                "routine_match_corpus", instance_name, suffix="jsonl"),
         ),
         no_match_floor=float(
             mc_raw.get("no_match_floor", match_calibration.DEFAULT_NO_MATCH_FLOOR)
@@ -546,20 +567,6 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
             )
         ),
     )
-
-    # Resolve instance name via the canonical normaliser. Empty when
-    # the operator omitted ``telegram.instance.name`` from config —
-    # the daemon-start guard refuses to start in that case (rather
-    # than silently treating an unset instance as Salem). Per
-    # ``feedback_hardcoding_and_alfred_naming.md`` we fail-loud on
-    # missing instance name.
-    from alfred.telegram._compat import _normalize_instance_name
-    telegram_raw = raw.get("telegram") or {}
-    instance_raw = telegram_raw.get("instance") or {}
-    raw_name = ""
-    if isinstance(instance_raw, dict):
-        raw_name = str(instance_raw.get("name") or "")
-    instance_name = _normalize_instance_name(raw_name)
 
     return RoutineConfig(
         vault_path=vault_path,

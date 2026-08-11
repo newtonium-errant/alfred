@@ -34,12 +34,26 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-# Default capture sink + threshold. Per-instance ``.salem.jsonl`` mirrors the
-# existing calibration corpora (``email_calibration.salem.jsonl`` etc.);
+# Default capture sink + threshold.
+#
+# #84 — these are DIRECT-CONSTRUCTION placeholders and carry NO instance
+# segment. Every load path replaces them with an instance-DERIVED name via
+# ``common.instance_paths.instance_state_filename_or_unscoped`` (see
+# ``routine.config.load_from_unified``), which for Salem reproduces the old
+# ``.salem.`` filename byte-for-byte. They previously hard-coded ``.salem.``
+# on a shared code path, so a KAL-LE process constructing these directly
+# wrote into a file named for another instance. Same placeholder posture as
+# ``scribe.config._DEFAULT_INPUT_DIR``.
+#
+# Kept as shared constants because ``daily_sync.config.RoutineMatchConfig``
+# uses the SAME ones as its dataclass defaults: the routine CLI writes this
+# capture sink and daily_sync reads it, so a no-override divergence between
+# the two would be a silent read/write split.
+# Previously mirrored the calibration corpora (``email_calibration.*.jsonl``);
 # routine + the Daily Sync channel are both Salem-scoped. Operators override
 # via the ``routine.match_calibration`` config block. T=0.5 is the Phase 1
 # starting floor (GREENLIT Q1) — observability refines it from real traffic.
-DEFAULT_PENDING_PATH = "./data/routine_match_pending.salem.jsonl"
+DEFAULT_PENDING_PATH = "./data/routine_match_pending.jsonl"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5
 # Phase 3 (no-match / alias path) min-plausibility floor. When a completion
 # matches NOTHING, the closest candidate is only surfaced as a "did you mean…"
@@ -50,7 +64,7 @@ DEFAULT_NO_MATCH_FLOOR = 0.3
 # The learned glossary (Phase 2) — operator-approved confirm/reject/alias rows
 # the matcher consults. Mutated ONLY by an operator reply through the Daily Sync
 # reply_dispatch; never by a match. Per-instance, mirrors the pending sink.
-DEFAULT_CORPUS_PATH = "./data/routine_match_corpus.salem.jsonl"
+DEFAULT_CORPUS_PATH = "./data/routine_match_corpus.jsonl"
 # Review-surface bounds (see :func:`filter_pending_for_review`). The pending
 # sink is append-only and never pruned, so without these a captured row is
 # re-surfaced every single morning forever. ``MAX_AGE_DAYS`` retires a row the
