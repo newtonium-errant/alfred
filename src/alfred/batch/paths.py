@@ -34,8 +34,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ..common.instance_paths import instance_data_path
-
 #: Directory name under the instance data dir.
 _BATCH_DIR_NAME = "batch"
 _IMAGES_DIR_NAME = "images"
@@ -84,28 +82,33 @@ def validate_batch_id(batch_id: str) -> str:
     return bid
 
 
-def batch_root(raw: dict, instance: str) -> Path:
-    """``<data_dir>/batch/<instance-slug>`` — every batch for one instance."""
-    return Path(
-        instance_data_path(raw, _BATCH_DIR_NAME, instance_slug(instance)),
-    )
+def batch_root(data_dir: Path | str, instance: str) -> Path:
+    """``<data_dir>/batch/<instance-slug>`` — every batch for one instance.
+
+    Takes ``data_dir`` rather than the raw config for the same reason
+    ``drip.state.campaign_state_path`` does: the caller (``build_campaign``)
+    holds a resolved ``DripConfig.data_dir``, which is already
+    ``logging.dir`` with the legacy fallback applied. Re-deriving it from
+    ``raw`` here would be a second, divergable resolution of the same value.
+    """
+    return Path(data_dir) / _BATCH_DIR_NAME / instance_slug(instance)
 
 
-def batch_dir(raw: dict, instance: str, batch_id: str) -> Path:
+def batch_dir(data_dir: Path | str, instance: str, batch_id: str) -> Path:
     """``<data_dir>/batch/<instance-slug>/<batch_id>``."""
-    return batch_root(raw, instance) / validate_batch_id(batch_id)
+    return batch_root(data_dir, instance) / validate_batch_id(batch_id)
 
 
-def manifest_path(raw: dict, instance: str, batch_id: str) -> Path:
-    return batch_dir(raw, instance, batch_id) / _MANIFEST_NAME
+def manifest_path(data_dir: Path | str, instance: str, batch_id: str) -> Path:
+    return batch_dir(data_dir, instance, batch_id) / _MANIFEST_NAME
 
 
-def ledger_path(raw: dict, instance: str, batch_id: str) -> Path:
-    return batch_dir(raw, instance, batch_id) / _LEDGER_NAME
+def ledger_path(data_dir: Path | str, instance: str, batch_id: str) -> Path:
+    return batch_dir(data_dir, instance, batch_id) / _LEDGER_NAME
 
 
-def images_dir(raw: dict, instance: str, batch_id: str) -> Path:
-    return batch_dir(raw, instance, batch_id) / _IMAGES_DIR_NAME
+def images_dir(data_dir: Path | str, instance: str, batch_id: str) -> Path:
+    return batch_dir(data_dir, instance, batch_id) / _IMAGES_DIR_NAME
 
 
 __all__ = [

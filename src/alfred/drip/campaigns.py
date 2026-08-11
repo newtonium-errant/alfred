@@ -686,16 +686,199 @@ def _remove_link(body: str, link: str) -> tuple[str, int]:
     return body, max(skipped_entry, skipped_heal)
 
 
+@dataclass
+class BatchImageCampaign:
+    """Drain bulk-image batches, one scan per drip item (#83, D1).
+
+    Item id is ``<batch_id>::<content_hash>`` — the link001 composite-id
+    precedent. It has to carry the batch because one campaign covers
+    every batch the operator has ever submitted, and the content hash is
+    what makes a replayed image free.
+
+    **The admission test and the verifier observe DIFFERENT things**,
+    which the module docstring above requires and which is easy to get
+    wrong here. The naive pairing — admit "no ledger row", verify "has
+    ledger row" — is exactly the negation, and it is satisfiable by the
+    defect it exists to catch: a run that appends the ledger row and
+    then fails the vault write would be marked DONE while the operator's
+    record shows nothing. So:
+
+      * **admission** is BATCH-level: every item of a batch that is not
+        yet fully drained.
+      * **verify** is ITEM-level and DOWNSTREAM: the ledger row exists
+        AND the carried record's rendered body actually contains that
+        scan's section. The render landing is the observable effect the
+        operator cares about, and it is the thing a failed vault write
+        would not produce.
+
+    ``spends_quota`` is True (a vision call per item) and
+    ``verify_is_async`` is False: the effect is synchronous and fully
+    landed by the time ``work()`` returns, so an unverified return is a
+    genuine failure rather than a dispatch.
+    """
+
+    data_dir: Path
+    instance: str
+    vault_path: Path
+    model: str
+    max_tokens: int
+    api_key: str
+    name: str = "batch_image"
+
+    SEP = "::"
+
+    # --- item id ---------------------------------------------------------
+
+    @classmethod
+    def build_item(cls, batch_id: str, content_hash: str) -> str:
+        return f"{batch_id}{cls.SEP}{content_hash}"
+
+    @classmethod
+    def parse_item(cls, item_id: str) -> tuple[str, str]:
+        batch_id, sep, content_hash = (item_id or "").partition(cls.SEP)
+        if not sep or not batch_id or not content_hash:
+            raise ValueError(
+                f"malformed batch item id {item_id!r} — expected "
+                f"<batch_id>{cls.SEP}<content_hash>"
+            )
+        return batch_id, content_hash
+
+    # --- paths -----------------------------------------------------------
+
+    def _root(self) -> Path:
+        from alfred.batch.paths import batch_root
+
+        return batch_root(self.data_dir, self.instance)
+
+    def _manifest_for(self, batch_id: str):
+        from alfred.batch.manifest import load_manifest
+        from alfred.batch.paths import manifest_path
+
+        return load_manifest(manifest_path(self.data_dir, self.instance, batch_id))
+
+    def _ledger_for(self, batch_id: str) -> Path:
+        from alfred.batch.paths import ledger_path
+
+        return ledger_path(self.data_dir, self.instance, batch_id)
+
+    # --- Campaign protocol ----------------------------------------------
+
+    def worklist(self) -> list[str]:
+        """Every item of every batch that is not yet fully drained."""
+        from alfred.batch.ledger import load_rows, processed_item_ids
+
+        root = self._root()
+        if not root.is_dir():
+            # ILB: no batch directory is a legitimate "nothing submitted
+            # yet" state (pre-first-use), not a broken campaign.
+            log.info(
+                "drip.batch_image.no_batch_dir",
+                batch_root=str(root),
+                detail="ran, nothing to drain — no batch has been "
+                       "submitted on this instance yet",
+            )
+            return []
+
+        items: list[str] = []
+        batches = 0
+        drained = 0
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            manifest = self._manifest_for(entry.name)
+            if manifest is None:
+                continue
+            batches += 1
+            done = processed_item_ids(load_rows(self._ledger_for(entry.name)))
+            ids = manifest.item_ids()
+            if ids and all(i in done for i in ids):
+                drained += 1
+                continue
+            items.extend(self.build_item(entry.name, i) for i in ids)
+
+        if not items:
+            log.info(
+                "drip.batch_image.nothing_pending",
+                batches=batches,
+                drained=drained,
+                detail="ran, nothing to drain — every submitted batch is "
+                       "fully processed",
+            )
+        return items
+
+    def work(self, item_id: str) -> None:
+        """Process one scan. See ``alfred.batch.worker.process_one``."""
+        from anthropic import Anthropic
+
+        from alfred.batch.paths import images_dir
+        from alfred.batch.worker import process_one
+
+        batch_id, content_hash = self.parse_item(item_id)
+        manifest = self._manifest_for(batch_id)
+        if manifest is None:
+            raise FileNotFoundError(
+                f"batch {batch_id}: manifest is missing or unreadable — "
+                f"cannot process {content_hash}"
+            )
+        process_one(
+            client=Anthropic(api_key=self.api_key),
+            manifest=manifest,
+            ledger_file=self._ledger_for(batch_id),
+            images_root=images_dir(self.data_dir, self.instance, batch_id),
+            vault_path=self.vault_path,
+            item_id=content_hash,
+            model=self.model,
+            max_tokens=self.max_tokens,
+        )
+
+    def verify(self, item_id: str) -> bool:
+        """Ledger row exists AND its section landed in the record body.
+
+        Two observations, not one. The ledger row alone would be
+        satisfied by a run whose vault write failed — see the class
+        docstring.
+        """
+        from alfred.batch.ledger import load_rows, processed_item_ids
+
+        batch_id, content_hash = self.parse_item(item_id)
+        manifest = self._manifest_for(batch_id)
+        if manifest is None:
+            return False
+        if content_hash not in processed_item_ids(
+            load_rows(self._ledger_for(batch_id))
+        ):
+            return False
+        image = manifest.image_for(content_hash)
+        if image is None or not manifest.record_path:
+            return False
+        from alfred.vault.ops import VaultError, vault_read
+
+        try:
+            record = vault_read(self.vault_path, manifest.record_path)
+        except (VaultError, OSError):
+            return False
+        body = (record.get("body") or "") if isinstance(record, dict) else ""
+        return f"### {image.filename}" in body
+
+    def spends_quota(self) -> bool:
+        return True  # one vision call per scan
+
+    def verify_is_async(self) -> bool:
+        return False  # the render lands before work() returns
+
+
 #: name → campaign factory. A dict, on purpose (see the module docstring).
 CAMPAIGN_KINDS = {
     "gmail_backlog": GmailBacklogCampaign,
     "link001_repair": Link001Campaign,
+    "batch_image": BatchImageCampaign,
 }
 
 
 __all__ = [
     "CAMPAIGN_KINDS",
     "RECOV_SUFFIX",
+    "BatchImageCampaign",
     "GmailBacklogCampaign",
     "Link001Campaign",
 ]

@@ -52,7 +52,7 @@ from alfred.batch.seal import (
     is_regenerable,
 )
 
-_RAW = {"logging": {"dir": "/tmp/does-not-need-to-exist/data"}}
+_DATA_DIR = "/tmp/does-not-need-to-exist/data"
 
 
 def _manifest(n: int = 3) -> BatchManifest:
@@ -80,30 +80,30 @@ def _manifest(n: int = 3) -> BatchManifest:
 
 
 def test_paths_derive_from_configured_data_dir() -> None:
-    root = batch_root(_RAW, "Salem")
+    root = batch_root(_DATA_DIR, "Salem")
     assert str(root) == "/tmp/does-not-need-to-exist/data/batch/salem"
 
 
 def test_paths_are_instance_scoped() -> None:
     """Two instances must never share a batch directory (#53)."""
-    assert batch_root(_RAW, "Salem") != batch_root(_RAW, "KAL-LE")
+    assert batch_root(_DATA_DIR, "Salem") != batch_root(_DATA_DIR, "KAL-LE")
 
 
 def test_blank_instance_is_a_hard_error() -> None:
     """Fail loud at derivation, not quietly at write time."""
     with pytest.raises(BatchPathError, match="instance name"):
-        batch_root(_RAW, "")
+        batch_root(_DATA_DIR, "")
 
 
 def test_instance_slug_normalises_spaces_and_case() -> None:
-    assert str(batch_root(_RAW, "KAL LE")).endswith("/kal-le")
+    assert str(batch_root(_DATA_DIR, "KAL LE")).endswith("/kal-le")
 
 
 def test_batch_layout() -> None:
-    d = batch_dir(_RAW, "Salem", "batch-1")
-    assert manifest_path(_RAW, "Salem", "batch-1") == d / "manifest.json"
-    assert ledger_path(_RAW, "Salem", "batch-1") == d / "ledger.jsonl"
-    assert images_dir(_RAW, "Salem", "batch-1") == d / "images"
+    d = batch_dir(_DATA_DIR, "Salem", "batch-1")
+    assert manifest_path(_DATA_DIR, "Salem", "batch-1") == d / "manifest.json"
+    assert ledger_path(_DATA_DIR, "Salem", "batch-1") == d / "ledger.jsonl"
+    assert images_dir(_DATA_DIR, "Salem", "batch-1") == d / "images"
 
 
 @pytest.mark.parametrize(
@@ -122,8 +122,7 @@ def test_good_batch_ids_accepted(good: str) -> None:
 
 def test_paths_never_use_a_cwd_relative_literal(tmp_path) -> None:
     """The debris-guard property: nothing resolves under ``./data``."""
-    raw = {"logging": {"dir": str(tmp_path)}}
-    assert str(batch_root(raw, "Salem")).startswith(str(tmp_path))
+    assert str(batch_root(str(tmp_path), "Salem")).startswith(str(tmp_path))
 
 
 # ---------------------------------------------------------------------------

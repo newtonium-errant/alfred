@@ -21,7 +21,11 @@ from typing import Any
 import structlog
 
 from .brief_line import CampaignProgress
-from .campaigns import GmailBacklogCampaign, Link001Campaign
+from .campaigns import (
+    BatchImageCampaign,
+    GmailBacklogCampaign,
+    Link001Campaign,
+)
 # DripConfigError moved to .config in #66 so `state` can raise it without an
 # import cycle (wiring imports state). Re-exported here — and listed in
 # __all__ — because `from .wiring import DripConfigError` is the established
@@ -102,9 +106,39 @@ def build_campaign(name: str, cfg: CampaignConfig, drip: DripConfig) -> Any:
             name=name,
         )
 
+    if kind == "batch_image":
+        # #83. Unlike the other two kinds this one needs no operator
+        # path: every location is DERIVED from the instance's own
+        # data_dir (see alfred.batch.paths), which is what keeps two
+        # co-located instances out of each other's batches. What it does
+        # need is an API key, and a missing one must fail HERE with the
+        # config key to fix rather than as an SDK auth error on the
+        # first scan of a thirty-image run.
+        if not drip.instance:
+            raise DripConfigError(
+                f"campaign {name!r}: telegram.instance.name is unset — "
+                "batch paths are instance-scoped and an unscoped path "
+                "would mix one instance's batches into another's"
+            )
+        if not cfg.api_key:
+            raise DripConfigError(
+                f"campaign {name!r}: drip.campaigns.{name}.api_key is "
+                "required (the Anthropic key for per-scan vision "
+                "calls; use ${ANTHROPIC_API_KEY})"
+            )
+        return BatchImageCampaign(
+            data_dir=Path(drip.data_dir),
+            instance=drip.instance,
+            vault_path=Path(vault_path),
+            model=cfg.model,
+            max_tokens=cfg.max_tokens,
+            api_key=cfg.api_key,
+            name=name,
+        )
+
     raise DripConfigError(
         f"campaign {name!r}: unknown kind {kind!r} — expected one of "
-        "gmail_backlog, link001_repair"
+        "gmail_backlog, link001_repair, batch_image"
     )
 
 

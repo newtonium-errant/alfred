@@ -87,8 +87,17 @@ DEFAULT_MAX_AWAITING_RUNS = 5
 #: config-layer error with a config-layer message, and so importing config does
 #: not drag in the campaign implementations.
 KNOWN_CAMPAIGN_KINDS: frozenset[str] = frozenset({
-    "gmail_backlog", "link001_repair",
+    "gmail_backlog", "link001_repair", "batch_image",
 })
+
+#: ``batch_image`` model defaults (#83). The model is a genuine COST LEVER
+#: alongside the budget knobs — an operator who wants cheaper batch runs
+#: changes it here rather than editing code. ``max_tokens`` is deliberately
+#: generous: on current models thinking is on by default and ``max_tokens``
+#: caps thinking PLUS response text together, so a tight value truncates the
+#: extraction mid-answer.
+DEFAULT_BATCH_MODEL = "claude-opus-5"
+DEFAULT_BATCH_MAX_TOKENS = 8192
 
 
 def _substitute_env(value: Any) -> Any:
@@ -150,6 +159,14 @@ class CampaignConfig:
     #: exactly what the removal branch — which is unrecoverable data loss — must
     #: not be.
     worklist_path: str = ""
+
+    # --- batch_image only (#83) ---
+    #: Vision model for per-scan extraction. A cost lever; see the
+    #: DEFAULT_BATCH_* rationale above.
+    model: str = DEFAULT_BATCH_MODEL
+    max_tokens: int = DEFAULT_BATCH_MAX_TOKENS
+    #: ``${ANTHROPIC_API_KEY}`` in YAML; _substitute_env resolves it.
+    api_key: str = ""
 
 
 @dataclass
