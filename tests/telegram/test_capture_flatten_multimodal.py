@@ -183,3 +183,110 @@ def test_the_marker_is_a_stable_exported_constant() -> None:
     that updates only one side leaves the model reading a token it was never
     told about."""
     assert IMAGE_MARKER == "[image attached]"
+
+
+# ---------------------------------------------------------------------------
+# #96 part 2 — the prompt⟷constant pin (cross-agent contract)
+# ---------------------------------------------------------------------------
+#
+# Part 1 emits the marker; Part 2's prompt tells the model what it means and
+# instructs it to COUNT markers against a promised quantity. Those are two
+# files, two authors, and one shared literal — a cross-agent contract, so it
+# gets pinned rather than trusted.
+#
+# THE FAILURE IS SILENT AND ONE-DIRECTIONAL. Rename `IMAGE_MARKER` and the
+# flattener's output changes while the prompt keeps describing the old string.
+# Nothing raises. The model is told to count a token the transcript no longer
+# contains, so it counts zero, so captured promises stop being recognised as
+# fulfilled — #64 returning by a different route, with a green suite.
+#
+# Pinned in BOTH directions, because a stale SECOND literal in the prose does
+# the same damage as a stale first one.
+
+def _prompt() -> str:
+    from alfred.telegram.capture_batch import _BATCH_SYSTEM_PROMPT
+
+    return _BATCH_SYSTEM_PROMPT
+
+
+def test_the_prompt_quotes_the_marker_literal_verbatim() -> None:
+    """Forward direction: the prose names the exact string the code emits."""
+    assert IMAGE_MARKER in _prompt()
+
+
+def test_the_marker_is_the_ONLY_bracketed_literal_in_the_prompt() -> None:
+    """Reverse direction, and the sharper half.
+
+    Asserting only "the marker appears" would stay green if a rename left the
+    OLD literal behind beside the new one — the model would then be told about
+    two markers, one of which never appears in any transcript. The prompt
+    currently carries exactly one bracketed literal, so pinning the SET catches
+    a stale rename and an invented second marker with one assertion.
+    """
+    import re
+
+    found = set(re.findall(r"\[[^\]\n]{0,40}\]", _prompt()))
+
+    assert found == {IMAGE_MARKER}, (
+        "the prompt names a bracketed marker the flattener does not emit "
+        f"(found {sorted(found)}, code emits {IMAGE_MARKER!r})"
+    )
+
+
+def test_the_prompts_import_path_citation_actually_resolves() -> None:
+    """The prose cites ``capture_batch.IMAGE_MARKER`` as the source of truth.
+
+    A citation to a name that no longer exists is worse than none: it tells a
+    future editor the pair is pinned somewhere it is not.
+    """
+    from alfred.telegram import capture_batch
+
+    assert "capture_batch.IMAGE_MARKER" in _prompt()
+    assert getattr(capture_batch, "IMAGE_MARKER", None) == IMAGE_MARKER
+
+
+def test_the_prompt_subordinates_itself_to_the_constant() -> None:
+    """The prose says the constant wins on disagreement. That hedge is what
+    makes a drift degrade into a stale sentence rather than a contradiction the
+    model has to arbitrate."""
+    assert "the constant wins" in _prompt()
+
+
+def test_the_prompt_forbids_inferring_image_CONTENT() -> None:
+    """Evidence class 3 stays closed. Four markers invite exactly this — and
+    Part 1 added no vision, so any described image content is invention."""
+    prompt = _prompt()
+
+    assert "never describe or summarize what an image depicts" in prompt
+    assert "ARRIVED" in prompt
+
+
+def test_the_flattener_emits_what_the_prompt_promises_it_will() -> None:
+    """THE PAIR, DRIVEN — not two constants compared to each other.
+
+    A #64-shaped turn goes through the REAL composer and the REAL flattener,
+    and every marker in the resulting transcript is asserted to be the literal
+    the prompt describes. This is what binds the two halves through BEHAVIOUR:
+    the string pins above would all pass if the flattener stopped emitting
+    markers entirely.
+    """
+    import re
+
+    flat = _flatten_transcript([
+        _turn(build_user_content("here's the first part of the plan", _img(2))),
+        _turn(build_user_content("", _img(2)), ts="2026-08-05T14:21:00Z"),
+    ])
+
+    bracketed = re.findall(r"\[[^\]\n]{0,40}\]", flat)
+    # The flattener legitimately brackets its [HH:MM] timestamp prefix, so the
+    # marker set is everything bracketed that is NOT a timestamp.
+    markers = [b for b in bracketed if not re.fullmatch(r"\[\d{2}:\d{2}\]", b)]
+
+    assert markers, "the flattener emitted no marker at all"
+    assert set(markers) == {IMAGE_MARKER}, (
+        "the flattener emits a bracketed token the prompt does not describe"
+    )
+    # Four images promised the model four countable markers.
+    assert len(markers) == 4
+    # And the prompt's counting instruction is about exactly this token.
+    assert IMAGE_MARKER in _prompt()
