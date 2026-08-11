@@ -20,15 +20,19 @@ import {
 } from '../../lib/algernon/schemas';
 import {
   ALLOWED_BATCH_MEDIA_TYPES,
+  BATCH_IDEMPOTENCY_HEADER,
   MAX_BATCH_IMAGES,
   MAX_BATCH_IMAGE_BYTES,
   MAX_BATCH_INSTRUCTION_CHARS,
   MAX_BATCH_TOTAL_BYTES,
   buildBatchForm,
   friendlyBatchError,
+  keyForStagedBatch,
   mib,
   prepareBatch,
+  stagedBatchSignature,
   type BatchSubmitResponse,
+  type StagedBatchKey,
 } from '../../lib/algernon/batchSubmit';
 import { prepareImageForUpload } from '../../lib/algernon/imagePrepare';
 import { collectImageAttachments } from '../../lib/algernon/imageAttach';
@@ -141,19 +145,30 @@ export interface UnifiedComposerProps {
   instanceLabel: string;
   /** Injected in tests; defaults to the real BFF clients. */
   submitIngest?: typeof ingestApi.submit;
-  submitBatchRequest?: (target: string, form: FormData) => Promise<BatchSubmitResponse>;
+  submitBatchRequest?: (
+    target: string,
+    form: FormData,
+    idempotencyKey?: string,
+  ) => Promise<BatchSubmitResponse>;
   transcribe?: (file: File) => Promise<string>;
   onUnauthenticated?: () => void;
 }
 
 /** The real batch submit — a multipart POST relayed byte-for-byte by the BFF. */
-async function defaultSubmitBatch(target: string, form: FormData): Promise<BatchSubmitResponse> {
+async function defaultSubmitBatch(
+  target: string,
+  form: FormData,
+  idempotencyKey?: string,
+): Promise<BatchSubmitResponse> {
   // The target rides the QUERY STRING: the body is raw multipart bytes the BFF
   // relays without parsing, so a form field would force it to parse. NO
   // Content-Type header — the browser must set it so the multipart boundary is
-  // generated; setting it by hand produces a body the box cannot parse.
+  // generated; setting it by hand produces a body the box cannot parse. The
+  // idempotency key (#100) rides a header, which is safe for the same reason
+  // Content-Type is not: only Content-Type carries the boundary.
   const res = await fetch(`/api/batch/submit?target=${encodeURIComponent(target)}`, {
     method: 'POST',
+    ...(idempotencyKey ? { headers: { [BATCH_IDEMPOTENCY_HEADER]: idempotencyKey } } : {}),
     body: form,
   });
   const body = await res.json().catch(() => ({}));
@@ -210,6 +225,12 @@ export function UnifiedComposer({
   const [ingestTargets, setIngestTargets] = useState<IngestTarget[]>([]);
   const [batchTargets, setBatchTargets] = useState<BatchTarget[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // The idempotency key for the currently staged batch (#100). A ref, because a
+  // FAILED send keeps its chip and its files — so pressing Send again must
+  // resend the SAME key rather than mint a second batch. The chip-level
+  // mitigation shipped with #97 (a done chip clears and is never resent) does
+  // not cover this: the response was lost, so the chip never became done.
+  const batchKeyRef = useRef<StagedBatchKey | null>(null);
 
   // Which instances accept documents / bulk scans. Metadata only; a failure
   // leaves the lists empty, which reads as "not configured here" — the same
@@ -459,12 +480,26 @@ export function UnifiedComposer({
         );
         imageBlocked = true;
       } else {
+        // Same staged set ⇒ same key. The signature covers the target, the
+        // instruction and the files, so editing any of them mints a new key and
+        // the edit is honoured rather than being replaced by a replay of the
+        // first receipt.
+        const staged = keyForStagedBatch(
+          batchKeyRef.current,
+          stagedBatchSignature({
+            target: target.name,
+            instruction: typed,
+            files: images,
+          }),
+        );
+        batchKeyRef.current = staged;
         jobs.push({
           id: 'images',
           route: 'batch',
           target: target.name,
           instruction: typed,
           files: images,
+          idempotencyKey: staged.key,
         });
       }
     }
@@ -548,8 +583,12 @@ export function UnifiedComposer({
       }
       const { outcomes, filedPaths: freshPaths } = await runFanout(jobs, {
         submitIngest,
-        submitBatch: ({ target, instruction, files, title }) =>
-          submitBatchRequest(target, buildBatchForm(instruction, files, title)),
+        submitBatch: ({ target, instruction, files, title, idempotencyKey }) =>
+          submitBatchRequest(
+            target,
+            buildBatchForm(instruction, files, title),
+            idempotencyKey,
+          ),
       });
 
       let batchSucceeded = false;
@@ -562,6 +601,11 @@ export function UnifiedComposer({
           setImageState(outcome.status);
           setImageMessage(outcome.status === 'done' ? null : outcome.message);
           batchSucceeded = outcome.status === 'done';
+          // RETIRE the key once its submission has been answered. A key answers
+          // for ONE batch; holding it would mean a later re-pick of the same
+          // scans with the same instruction rebuilt the same signature and was
+          // handed the old receipt — a second batch asked for and not created.
+          if (batchSucceeded) batchKeyRef.current = null;
         } else {
           patchDoc(id, {
             state: outcome.status,

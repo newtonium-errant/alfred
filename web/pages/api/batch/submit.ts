@@ -2,6 +2,10 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { readDisplayIdentity, resolveSessionToken } from '../../../lib/algernon/identity';
 import { callTransportBatch, listBatchTargets } from '../../../lib/algernon/transport';
 import { sendTransportError } from '../../../lib/algernon/bffError';
+import {
+  BATCH_IDEMPOTENCY_HEADER,
+  isBatchIdempotencyKey,
+} from '../../../lib/algernon/batchSubmit';
 
 // POST /api/batch/submit → relays a multipart bulk scan submission to the box's
 // POST /vault/batch, using the server-side `web_batch` peer token.
@@ -106,12 +110,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(413).json({ error: 'batch_too_large' });
   }
 
+  // Allowlist ONLY the idempotency header (#100), and only when well-formed —
+  // the same discipline /api/stt/transcribe applies to its own key. The BFF
+  // never MINTS one: a key minted per relay would differ on every retry, which
+  // is precisely the double-mint the key exists to prevent. A malformed value is
+  // dropped rather than relayed, so the submission simply runs undeduped.
+  const rawKey = req.headers[BATCH_IDEMPOTENCY_HEADER.toLowerCase()];
+  const idempotencyKey = isBatchIdempotencyKey(rawKey) ? rawKey : undefined;
+
   try {
     const { status, body: respBody } = await callTransportBatch('/vault/batch', {
       body,
       contentType,
       user: identity.name,
       target: chosen.name,
+      idempotencyKey,
     });
     return res.status(status).json(respBody ?? {});
   } catch (e) {

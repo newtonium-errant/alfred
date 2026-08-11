@@ -1,4 +1,4 @@
-import { ChangeEvent, useCallback, useEffect, useState } from 'react';
+import { ChangeEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '../ui/button';
 import { Label } from '../ui/label';
 import { Textarea } from '../ui/textarea';
@@ -8,6 +8,7 @@ import type { BatchTarget, BatchTargetsResponse } from '../../lib/algernon/types
 import { prepareImageForUpload } from '../../lib/algernon/imagePrepare';
 import {
   ALLOWED_BATCH_MEDIA_TYPES,
+  BATCH_IDEMPOTENCY_HEADER,
   BATCH_UPLOAD_ACCEPT,
   MAX_BATCH_IMAGES,
   MAX_BATCH_IMAGE_BYTES,
@@ -16,9 +17,12 @@ import {
   batchSuccessMessage,
   buildBatchForm,
   friendlyBatchError,
+  keyForStagedBatch,
   mib,
   prepareBatch,
+  stagedBatchSignature,
   type BatchSubmitResponse,
+  type StagedBatchKey,
 } from '../../lib/algernon/batchSubmit';
 import { ApiError } from '../../lib/algernon/http';
 import { subtle } from '../../lib/typography';
@@ -58,6 +62,13 @@ export function BatchForm({
   // deploy that is perfectly fine.
   const [targets, setTargets] = useState<BatchTarget[] | null>(null);
   const [target, setTarget] = useState('');
+  // The idempotency key for what is currently staged (#100). Held in a REF, not
+  // state: it must survive a failed attempt without re-rendering, and the whole
+  // point is that pressing Submit a second time sends the SAME key. A change to
+  // the files, the instruction or the target changes the signature and mints a
+  // new one, so an edited submission is a new batch rather than a replay of the
+  // old receipt.
+  const idempotencyRef = useRef<StagedBatchKey | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -128,6 +139,13 @@ export function BatchForm({
     if (!canSubmit) return;
     setSubmitting(true);
     setSubmitError(null);
+    // Same staged set ⇒ same key, so a retry after a lost response is answered
+    // with the original receipt instead of minting a second batch.
+    const staged = keyForStagedBatch(
+      idempotencyRef.current,
+      stagedBatchSignature({ target, instruction: instruction.trim(), files }),
+    );
+    idempotencyRef.current = staged;
     try {
       // The target rides the QUERY STRING: the body is raw multipart bytes the
       // BFF relays without parsing, so a form field would force it to parse.
@@ -135,6 +153,10 @@ export function BatchForm({
         `/api/batch/submit?target=${encodeURIComponent(target)}`,
         {
           method: 'POST',
+          // The idempotency key rides a HEADER for the same reason — and a
+          // header is safe here where Content-Type is not: only Content-Type
+          // carries the generated multipart boundary.
+          headers: { [BATCH_IDEMPOTENCY_HEADER]: staged.key },
           // NO Content-Type header: the browser must set it so the multipart
           // boundary is generated. Setting it by hand produces a body the box
           // cannot parse — a boundary-less multipart is unreadable, and the
@@ -150,6 +172,12 @@ export function BatchForm({
         return;
       }
       setResult(body as BatchSubmitResponse);
+      // RETIRE the key on success. Without this, an operator who deliberately
+      // re-picks the same scans with the same instruction would rebuild the
+      // same signature, resend the same key, and be handed the first batch's
+      // receipt — a second batch they asked for and did not get. A key answers
+      // for one submission; once that submission is answered, it is spent.
+      idempotencyRef.current = null;
       setFiles([]);
       setTotalBytes(0);
       setInstruction('');
