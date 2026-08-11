@@ -31,6 +31,17 @@ THE FENCES (ratification 2026-08-10; none of these is negotiable in code):
    RAM-only and has NO persistence surface — no save, no path, no file
    handle. Eviction is the wrap, and there is no code path that retrieves
    an evicted chunk. (Pinned in ``tests/test_jeeves_ring.py``.)
+   **ONE RULED EXCEPTION, and only one:** an explicit miss report ("Jeeves,
+   you missed that") retains the window it refers to, sensitive-local, until
+   a recogniser example is taken or it ages out (:mod:`.miss_store`, #98
+   ruling 1 — the report is the in-the-moment consent). Every other cue
+   leaves the filesystem byte-identical, which
+   ``tests/test_jeeves_miss_retention.py`` checks by snapshotting it.
+7. **The operator can turn it off by saying so.** "Jeeves, company"
+   suspends wake-word AND capture — the ring stops being fed at all — until
+   a release (:mod:`.suspend`, #98 ruling 3). Two doors, spoken and manual,
+   one transition function; the state is a file, so it survives a restart,
+   and a state that cannot be read resolves to SUSPENDED.
 3. **Cued captures are routinely MULTI-SPEAKER.** The garage is a
    workout/lounge; a second household voice is the room's NORMAL condition
    (trial verdict 2026-08-11). Nothing here assumes a single speaker, and
@@ -70,9 +81,11 @@ __all__ = [
     "cues",
     "gate",
     "marklog",
+    "miss_store",
     "ring",
     "service",
     "stt",
+    "suspend",
     "telemetry",
     "transport_sink",
     "wake",

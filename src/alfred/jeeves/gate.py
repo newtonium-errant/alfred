@@ -22,6 +22,15 @@ captures carrying ``synthetic: true`` provenance. ``live`` — reachable only
 by writing exactly ``mode: live`` in config — lets real garage audio
 through. Absent, None, unknown and malformed all resolve to synthetic, so a
 typo cannot arm a microphone.
+
+TWO GATES LIVE HERE, and they are separate functions on purpose.
+:func:`guard_capture` is the MODE line above, and it runs on both sides of
+the peer link (the device, and the receiving instance's capture route).
+:func:`guard_not_suspended` is the COMPANY TOGGLE (#98, ruling 3) and runs
+on the DEVICE ONLY — suspension is a property of a microphone, and the
+receiving instance does not have one. Its docstring argues that at length,
+because folding the two together is the obvious-looking refactor and it
+would make a peer refuse every capture the device successfully sent.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from typing import Any
 
 import structlog
 
+from . import suspend
 from .config import JEEVES_MODE_LIVE, JEEVES_MODE_SYNTHETIC, JeevesConfig
 
 log = structlog.get_logger(__name__)
@@ -37,8 +47,10 @@ log = structlog.get_logger(__name__)
 #: Refusal reasons. Greppable, and distinct from the accept reasons so an
 #: operator reading a log can count either without reading the other.
 REFUSED_MISSING_SYNTHETIC = "missing_synthetic_provenance"
+REFUSED_SUSPENDED = "capture_suspended"
 ACCEPTED_LIVE_MODE = "live_mode"
 ACCEPTED_SYNTHETIC_PROVENANCE = "synthetic_provenance_present"
+ACCEPTED_NOT_SUSPENDED = "not_suspended"
 
 
 class JeevesCaptureRefused(Exception):
@@ -58,6 +70,32 @@ class JeevesCaptureRefused(Exception):
         self.mode = mode
         self.source_id = source_id
         super().__init__(f"jeeves capture refused [{reason}]: {detail}")
+
+
+class JeevesCaptureSuspended(JeevesCaptureRefused):
+    """Raised when the COMPANY TOGGLE refuses a capture (#98, ruling 3).
+
+    A subclass so a caller that only cares "was this capture refused" needs
+    no change, while one that has to tell the operator WHY can catch this
+    specifically — "you asked me to stop listening" and "this instance is in
+    synthetic mode" are the same refusal and completely different sentences.
+
+    Carries the :class:`~alfred.jeeves.suspend.SuspendStatus` that refused
+    it, so the vehicle UI can render the reason without re-reading the store
+    (and without the two disagreeing across the read).
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        detail: str,
+        mode: str,
+        source_id: str = "",
+        *,
+        status: suspend.SuspendStatus | None = None,
+    ) -> None:
+        super().__init__(reason, detail, mode, source_id)
+        self.status = status
 
 
 def _provenance_is_synthetic(provenance: Any) -> bool:
@@ -136,4 +174,59 @@ def guard_capture(
         "config edit, made once the capture device is actually deployed.",
         JEEVES_MODE_SYNTHETIC,
         source_id,
+    )
+
+
+def guard_not_suspended(
+    config: JeevesConfig, *, source_id: str = "",
+) -> suspend.SuspendStatus:
+    """The COMPANY-TOGGLE gate — a SECOND, DEVICE-ONLY line (#98, ruling 3).
+
+    Deliberately NOT folded into :func:`guard_capture`, and the reason is
+    the one thing worth reading in this docstring. ``guard_capture`` has two
+    callers: this package's capture service, which runs ON the garage
+    device, and ``alfred.transport.routes_jeeves``, which runs on the
+    RECEIVING instance and validates an inbound POST. Suspension is a
+    property of a microphone. The receiving instance has no microphone, and
+    its copy of ``jeeves.suspend_state_path`` names a file on the wrong
+    machine — one that has never been written, which is the fail-closed
+    case. Putting the check inside the shared gate would therefore make a
+    peer refuse every capture the device successfully sent, with a reason
+    that is true of neither of them.
+
+    So: same MODULE (this is where the fences live), same posture, separate
+    entry point, called only from the device side.
+
+    Raises :class:`JeevesCaptureSuspended` when suspended; returns the
+    status otherwise, so a caller that wants to log the resolved state does
+    not have to read the store twice.
+    """
+    status = suspend.read_status(config.suspend_state_path)
+    if not status.suspended:
+        log.info(
+            "jeeves.suspend_decision",
+            accepted=True,
+            reason=ACCEPTED_NOT_SUSPENDED,
+            state_reason=status.reason,
+            source_id=source_id,
+        )
+        return status
+
+    log.info(
+        "jeeves.suspend_decision",
+        accepted=False,
+        reason=REFUSED_SUSPENDED,
+        state_reason=status.reason,
+        fail_closed=status.fail_closed,
+        source_id=source_id,
+    )
+    raise JeevesCaptureSuspended(
+        REFUSED_SUSPENDED,
+        "Jeeves is SUSPENDED, so this capture was refused before anything "
+        "was extracted, transcribed or sent. "
+        + (status.detail or "The company toggle is on.")
+        + " Release it with the manual control or the spoken release phrase.",
+        config.mode,
+        source_id,
+        status=status,
     )

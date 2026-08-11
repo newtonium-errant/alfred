@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from alfred import jeeves
+from alfred.jeeves import miss_store as miss_store_mod
 from alfred.jeeves import ring as ring_mod
 from alfred.jeeves import telemetry as telemetry_mod
 
@@ -101,6 +102,81 @@ def test_telemetry_row_carries_no_transcript_field():
         )
 
 
+def test_the_miss_index_carries_no_transcript_field_either():
+    """FENCE 4, EXTENDED TO THE SECOND RETAINED ARTEFACT (#98, ruling 1).
+
+    Ruling 1 added a durable artefact beside the telemetry file: an index of
+    retained miss-report windows. An index is exactly the shape that
+    acquires a "just the transcript, for convenience" field six months
+    later, at which point the package has a second, quieter copy of what was
+    said — with the audio sitting next to it. Same pin, same reason.
+    """
+    field_names = {f.name for f in fields(miss_store_mod.MissArtifact)}
+    for content_shaped in (
+        "text", "transcript", "body", "content", "words", "utterance",
+        "audio", "audio_b64", "speech", "matched_phrase",
+    ):
+        assert content_shaped not in field_names, (
+            f"MissArtifact.{content_shaped} would carry content into the index "
+            "that sits beside RETAINED garage audio (fence 4)"
+        )
+
+
+def test_the_miss_index_allowlist_matches_its_row_exactly():
+    """DRIFT PIN, the telemetry writer's, for the index writer."""
+    assert miss_store_mod.ALLOWED_FIELDS == {
+        f.name for f in fields(miss_store_mod.MissArtifact)
+    }
+
+
+def test_only_ONE_module_can_put_bytes_on_disk():
+    """FENCE 2 MADE STRUCTURAL FOR RULING 1's CARVE-OUT.
+
+    ``tests/test_jeeves_miss_retention.py`` proves BEHAVIOURALLY that only
+    the miss path retains audio. This proves it about the SOURCE: exactly
+    one module in the package can open a file for binary writing at all, so
+    a future capture path cannot quietly acquire the ability without this
+    going red. The behavioural pin can only see the code paths a test
+    happens to drive; this one sees the whole package.
+    """
+    offenders: dict[str, list[str]] = {}
+    for path in _module_paths():
+        source = path.read_text(encoding="utf-8")
+        hits = [
+            token for token in ('"wb"', "'wb'", "write_bytes", '"ab"', "'ab'")
+            if token in source
+        ]
+        if hits:
+            offenders[path.name] = hits
+    assert offenders == {"miss_store.py": ['"wb"']}, (
+        "exactly one module may write binary data to disk — the retained "
+        f"miss-report window (#98 ruling 1). Got: {offenders}"
+    )
+
+
+def test_a_generated_artefact_id_fits_the_telemetry_string_ceiling():
+    """The id rides in a telemetry row so morning review can join a row to
+    an artefact. That only stays safe while it is SHORT and fixed-shape —
+    a path in the same slot would be neither."""
+    for _ in range(20):
+        generated = miss_store_mod.new_artifact_id()
+        assert miss_store_mod.ARTIFACT_ID_RE.match(generated), generated
+        assert len(generated) < telemetry_mod.MAX_STRING_CHARS
+
+
+def test_the_retention_telemetry_fields_cannot_carry_a_window():
+    """The two fields ruling 1 added to the row are a BOOLEAN and a
+    fixed-shape id. Neither can hold what was said or what was heard, which
+    is the property that let fence 4 survive the carve-out."""
+    annotations = {f.name: f.type for f in fields(telemetry_mod.TelemetryRow)}
+    assert annotations["miss_audio_retained"] == "bool"
+    assert "miss_audio_id" in annotations
+    assert "miss_audio_path" not in annotations, (
+        "a PATH in a telemetry row is the one string here that is long and "
+        "environment-specific — paths live in the artefact index"
+    )
+
+
 def test_telemetry_allowlist_matches_the_row_exactly():
     """DRIFT PIN. The write-time allowlist and the dataclass must be the same
     set: a field added to one and not the other is either a silent drop or a
@@ -133,8 +209,9 @@ def test_no_module_hardcodes_an_instance_name():
 
 
 @pytest.mark.parametrize("module_name", [
-    "audio", "config", "cues", "gate", "marklog", "ring", "service", "stt",
-    "telemetry", "transport_sink", "wake", "window",
+    "audio", "config", "cues", "gate", "marklog", "miss_store", "ring",
+    "service", "stt", "suspend", "telemetry", "transport_sink", "wake",
+    "window",
 ])
 def test_every_declared_module_exists(module_name: str):
     """The package ``__all__`` is a claim about what is here; keep it true."""
