@@ -161,9 +161,34 @@ def test_destroy_happy_path_two_phase_and_chain_survives(tmp_path, capsys, monke
     assert ev.retention_destroyed_row(_ENC) is not None
     # the PHI-FREE chain SURVIVES — audit_encounter ends in retention.destroyed (proof-of-destruction).
     timeline = ev.audit_encounter(_ENC)
-    assert timeline[-1]["kind"] == "retention.destroyed"
+    # #78 — the ORDERING evidence this assertion never carried.
+    #
+    # 1-of-3 flaky in the full suite, green alone, and it recurred AFTER #75's
+    # mail-debris fix, so a second cause exists. `timeline[-1]` is an ORDER
+    # claim, and `audit_encounter` sorts by `(ts, stream, seq)` — so anything
+    # that makes two rows tie on `ts` hands the tiebreak to the STREAM NAME,
+    # which is alphabetical and not causal.
+    #
+    # Checked and NOT the cause (recorded so the next reader skips them):
+    #   * no injected clock here — `ts` is `datetime.now(utc).isoformat()` at
+    #     microsecond precision, so ties need two emits inside one microsecond;
+    #   * lexicographic isoformat ordering is CORRECT for equal-offset stamps
+    #     (a whole-second stamp omits `.ffffff`, and '+' < '.', so it still
+    #     sorts first, which is the right answer).
+    # The root is unproven — two full-suite runs did not reproduce it — so this
+    # captures what a firing would need to identify it. TEST-FILE ONLY: nothing
+    # here touches `count_rows_for_source` or the retention.destroyed gate.
+    chain = [(r.get("kind"), r.get("ts"), r.get("stream"), r.get("seq")) for r in timeline]
+    assert timeline[-1]["kind"] == "retention.destroyed", (
+        "audit_encounter must END in retention.destroyed (proof-of-destruction). "
+        f"Got {timeline[-1].get('kind')!r} last. Full chain "
+        f"(kind, ts, stream, seq) in sort order: {chain}"
+    )
     assert {r["kind"] for r in timeline} >= {"retention.sealed", "retention.destroy_intent",
-                                             "retention.destroyed"}
+                                             "retention.destroyed"}, (
+        f"missing a required chain row; got {sorted({r['kind'] for r in timeline})} "
+        f"— full chain: {chain}"
+    )
 
 
 def test_destroy_intent_before_any_unlink(tmp_path, capsys, monkeypatch):
