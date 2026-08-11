@@ -712,7 +712,14 @@ _DEFINITIONS: list[TypeDefinition] = [
         directory=None,
         statuses=None,
         # ``web_ingest`` (2026-06-29) — see the ``document`` note above.
-        available_in_scopes=frozenset({"hypatia", "web_ingest"}),
+        #
+        # ``jeeves`` (#81, 2026-08-11) — the garage capture appliance writes
+        # {note, source}; ``note`` is SCOPE_CANONICAL so gate 1 admits it
+        # already, but ``source`` needs this tag or gate 1 rejects it with
+        # "Unknown type under scope 'jeeves'" BEFORE gate 2's
+        # ``jeeves_types_only`` policy ever runs. Gate 2 remains the
+        # create-policy ceiling; this tag only opens gate 1.
+        available_in_scopes=frozenset({"hypatia", "web_ingest", "jeeves"}),
     ),
     TypeDefinition(
         name="citation",

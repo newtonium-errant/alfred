@@ -425,6 +425,14 @@ transport:
       #   token: "${ALFRED_WEB_INGEST_TOKEN}"
       #   allowed_clients:
       #     - web
+      # The garage capture device (#81). Its OWN dedicated secret, and the
+      # route pins this peer NAME — `allowed_clients` alone cannot tell two
+      # tokens apart. Only present on instances enabling
+      # `transport.jeeves`. This token must never reach a clinical instance.
+      # jeeves:
+      #   token: "${ALFRED_JEEVES_TOKEN}"
+      #   allowed_clients:
+      #     - jeeves
       # Bulk scan intake (#83), POST /vault/batch. Its OWN dedicated secret,
       # for the same reason web_ingest has one: this token and the chat
       # ``web`` token both carry ``allowed_clients: [web]``, so
@@ -453,6 +461,31 @@ transport:
   #   # types: [document, note, source]   # optional per-instance NARROWING
   #   #   of the universal {document, note, source} set; can only narrow,
   #   #   never widen (the web_ingest scope gate is the hard ceiling).
+
+  # Jeeves capture intake (#81), POST /vault/jeeves/capture. The RECEIVING
+  # half of the garage ambient scribe: a capture device posts a cued
+  # TRANSCRIPT and this instance writes it as one {note, source} record.
+  #
+  # Enabling this needs NO ring, NO wake model and NO STT key — those live on
+  # the capture device (the top-level `jeeves:` block). What it does need is
+  # a DEDICATED `jeeves` peer token below: the route pins the peer NAME, so a
+  # shared token is refused with 401 wrong_peer. That token grants ONLY this
+  # narrow write-only capability — a credential sitting on a box in a garage
+  # must not be interchangeable with one that can hold a conversation, and it
+  # must have no route to a clinical instance at all.
+  #
+  # The route ALSO runs the fail-closed `jeeves.mode` gate: in the default
+  # synthetic mode every capture without synthetic:true provenance is refused
+  # with 403. Set the top-level `jeeves.mode: live` on THIS instance once the
+  # device is really deployed — the startup log says which mode is active.
+  #
+  # jeeves:
+  #   enabled: true
+  #   max_transcript_chars: 32768   # one cued capture → 413 above this
+  #   # types: [note, source]       # optional per-instance NARROWING of the
+  #   #   universal {note, source} set; can only narrow, never widen (the
+  #   #   jeeves scope gate is the hard ceiling, and widening it is a
+  #   #   ratified design decision, not a config edit).
 
   # Bulk scan intake (#83). Opt-in route ``POST /vault/batch`` that SAVES a
   # set of scans plus one instruction and answers with a batch id — it looks
@@ -2007,6 +2040,16 @@ scaffold:
 #     # operator-APPROVED learned term. Empty = static vocab_terms only, and
 #     # the STT layer says so in the log rather than leaving it ambiguous.
 #     vocab_decided_path: ""
+#
+#   # Where a ROUTE capture is SENT — the device side of the peer link. Both
+#   # fields are required; either one missing leaves the sink INERT and ROUTE
+#   # cues fall back to the local mark log (nothing lost, nothing sent). The
+#   # token is the receiving instance's dedicated `jeeves` peer token.
+#   route:
+#     base_url: "https://peerbox.example:8891"
+#     token: "${ALFRED_JEEVES_TOKEN}"
+#     client_name: "jeeves"       # must match the receiver's allowed_clients
+#     timeout_seconds: 15
 #
 #   cues:
 #     # REQUIRED to arm the ROUTE verb. Empty leaves ROUTE inert: "tell

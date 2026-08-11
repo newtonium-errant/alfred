@@ -134,7 +134,7 @@ def test_no_module_hardcodes_an_instance_name():
 
 @pytest.mark.parametrize("module_name", [
     "audio", "config", "cues", "gate", "marklog", "ring", "service", "stt",
-    "telemetry", "wake", "window",
+    "telemetry", "transport_sink", "wake", "window",
 ])
 def test_every_declared_module_exists(module_name: str):
     """The package ``__all__`` is a claim about what is here; keep it true."""

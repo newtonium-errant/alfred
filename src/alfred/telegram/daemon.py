@@ -1684,6 +1684,16 @@ async def run(
             # transport.ingest.enabled (default False → route not mounted).
             ingest_enabled=transport_config.ingest.enabled,
             ingest_config=transport_config.ingest,
+            # Jeeves capture intake (#81). Opt-in via transport.jeeves.enabled
+            # (default False → route not mounted). ``jeeves_raw_config`` is the
+            # UNIFIED config dict, not the transport sub-block: the route's
+            # fail-closed mode gate reads the TOP-LEVEL ``jeeves:`` block, so
+            # handing it the transport section would leave the gate reading an
+            # empty config — which fails closed, and would therefore refuse
+            # every real capture on a correctly-configured live instance.
+            jeeves_enabled=transport_config.jeeves.enabled,
+            jeeves_config=transport_config.jeeves,
+            jeeves_raw_config=raw,
             # Bulk scan intake (#83). Opt-in via transport.batch.enabled.
             # data_dir + instance come from the DRIP config, not from a second
             # read of logging.dir here: the route WRITES the batch directory

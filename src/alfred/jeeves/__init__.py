@@ -74,6 +74,7 @@ __all__ = [
     "service",
     "stt",
     "telemetry",
+    "transport_sink",
     "wake",
     "window",
 ]

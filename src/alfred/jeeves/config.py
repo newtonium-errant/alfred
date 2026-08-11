@@ -218,6 +218,30 @@ class JeevesCueConfig:
 
 
 @dataclass
+class JeevesRouteSinkConfig:
+    """Where a ROUTE capture is sent — the DEVICE side of the peer link.
+
+    Jeeves authenticates as its own peer with its own token, not via an
+    asserted header: it is a device, and the stronger model is the right one
+    for a credential that lives on a box in a garage. That token grants ONLY
+    the narrow write-only capture capability, and it must have no route to a
+    clinical instance at all.
+
+    Empty ``base_url`` or ``token`` ⇒ the sink is INERT (not constructed),
+    and a ROUTE cue falls back to the local log rather than being lost. Both
+    are required because either alone cannot send anything.
+    """
+
+    base_url: str = ""
+    token: str = ""
+    # The ``X-Alfred-Client`` header value. Kept configurable because the
+    # receiving instance's ``allowed_clients`` list must agree with it, and
+    # that list is the operator's to write.
+    client_name: str = "jeeves"
+    timeout_seconds: float = 15.0
+
+
+@dataclass
 class JeevesConfig:
     """The typed ``jeeves:`` block.
 
@@ -232,6 +256,9 @@ class JeevesConfig:
     window: JeevesWindowConfig = field(default_factory=JeevesWindowConfig)
     stt: JeevesSttConfig = field(default_factory=JeevesSttConfig)
     cues: JeevesCueConfig = field(default_factory=JeevesCueConfig)
+    # Where a ROUTE capture goes. Unconfigured ⇒ the sink is inert and a
+    # ROUTE cue stays LOCAL (never dropped, never misdirected).
+    route: JeevesRouteSinkConfig = field(default_factory=JeevesRouteSinkConfig)
     # Content-free telemetry rows (JSONL). Derived per-instance at load.
     telemetry_path: str = ""
     # MARK-DOWN transcripts — the on-device log that syncs nowhere. Derived
@@ -406,6 +433,39 @@ def _build_stt(data: Any) -> JeevesSttConfig:
     return cfg
 
 
+def _build_route(data: Any) -> JeevesRouteSinkConfig:
+    """Schema-tolerant build of :class:`JeevesRouteSinkConfig`.
+
+    The token gets the same fail-closed treatment as the STT key: an
+    unresolved ``${VAR}`` placeholder survives substitution as a truthy,
+    publicly-known literal, and arming a peer link with a guessable bearer
+    is strictly worse than leaving the sink inert (which keeps captures
+    local rather than losing them).
+    """
+    known = _known(JeevesRouteSinkConfig, data)
+    cfg = JeevesRouteSinkConfig()
+    cfg.base_url = _coerce_str(known.get("base_url", cfg.base_url)).rstrip("/")
+    cfg.token = _coerce_str(known.get("token", cfg.token))
+    cfg.client_name = (
+        _coerce_str(known.get("client_name", cfg.client_name)) or cfg.client_name
+    )
+    cfg.timeout_seconds = _coerce_positive_float(
+        known.get("timeout_seconds", cfg.timeout_seconds), cfg.timeout_seconds)
+    if "${" in cfg.token:
+        log.error(
+            "jeeves.config.unresolved_route_token_placeholder",
+            detail="an UNRESOLVED ${VAR} placeholder survived env "
+                   "substitution in jeeves.route.token — the environment "
+                   "variable is NOT set, so the value is the literal, "
+                   "PUBLICLY-KNOWN placeholder string. Treating it as EMPTY "
+                   "(fail-closed): the sink stays INERT and ROUTE captures "
+                   "stay on the device, rather than the peer link arming "
+                   "with a guessable credential.",
+        )
+        cfg.token = ""
+    return cfg
+
+
 def _build_cues(data: Any) -> JeevesCueConfig:
     known = _known(JeevesCueConfig, data)
     cfg = JeevesCueConfig()
@@ -444,6 +504,7 @@ def load_from_unified(raw: dict[str, Any]) -> JeevesConfig:
         window=_build_window(block.get("window")),
         stt=_build_stt(block.get("stt")),
         cues=_build_cues(block.get("cues")),
+        route=_build_route(block.get("route")),
         telemetry_path=(
             _coerce_str(block.get("telemetry_path")) or default_telemetry_path(raw)
         ),
