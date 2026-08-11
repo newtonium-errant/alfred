@@ -159,6 +159,42 @@ def test_deferred_to_next_render_returns_on_the_very_next_fire(tmp_path: Path) -
     assert counts["deferred_held"] == 1
 
 
+def test_a_state_transition_out_of_deferred_clears_the_window(tmp_path: Path) -> None:
+    """The window must die with the state on the STATE-EVENT path too.
+
+    Caught by mutation: the sibling assertion in the held-then-returns test is
+    VACUOUS on its own, because a return happens via an UPSERT and the incoming
+    producer item carries ``deferred_until=None`` anyway — so the fold's
+    clearing logic was never exercised and deleting it stayed green. The path
+    that genuinely depends on it is ``set_state``, which is what the action
+    router calls for undo (``set_state(id, STATE_OPEN)``) and for acting on an
+    item. Without clearing, an OPEN item would carry a stale window that a
+    later reader could mistake for a live defer.
+
+    Both transitions out are asserted, with the still-deferred case as the
+    positive control.
+    """
+    store = FeedStore(tmp_path / "feed.jsonl")
+    store.reconcile("proposal", [_proposal()])
+
+    # Positive control: while deferred, the window IS held.
+    store.defer("proposal:corr-1", until=_future())
+    assert store.load()["proposal:corr-1"].deferred_until is not None
+
+    # deferred → open (the router's undo path)
+    store.set_state("proposal:corr-1", STATE_OPEN)
+    revived = store.load()["proposal:corr-1"]
+    assert revived.state == STATE_OPEN
+    assert revived.deferred_until is None
+
+    # deferred → acted (the operator judged it instead of re-parking it)
+    store.defer("proposal:corr-1", until=_future())
+    store.set_state("proposal:corr-1", "acted", action="confirm")
+    decided = store.load()["proposal:corr-1"]
+    assert decided.state == "acted"
+    assert decided.deferred_until is None
+
+
 def test_a_returning_item_keeps_its_interval_extent(tmp_path: Path) -> None:
     """D7 and D2 on one item: the fog's 11:00–15:00 span survives a defer and
     its return, because the extent is content, not lifecycle."""
