@@ -11,6 +11,7 @@
 // The /auth/* routes carry NO session token (the user isn't signed in yet).
 
 import { HOME_INSTANCE_NAME, isHomeInstance } from './instance';
+import { BATCH_IDEMPOTENCY_HEADER } from './batchSubmit';
 import { STT_IDEMPOTENCY_HEADER } from './schemas';
 
 // The peer/client name the transport knows this front-end by. Must match the
@@ -384,6 +385,12 @@ export interface BatchCallOptions {
    * already validated the name against `listBatchTargets()`.
    */
   target?: string;
+  /**
+   * The client-minted idempotency key (#100), relayed VERBATIM when present.
+   * The BFF has already validated it with `isBatchIdempotencyKey`; absent ⇒ the
+   * box runs the submission without dedupe protection and says so in its log.
+   */
+  idempotencyKey?: string;
 }
 
 /**
@@ -414,6 +421,13 @@ export async function callTransportBatch(
   };
   if (opts.user) {
     headers['X-Alfred-Batch-User'] = opts.user;
+  }
+  // The client-minted idempotency key (#100), relayed VERBATIM. The BFF neither
+  // mints nor rewrites it: a key minted here would be per-RELAY, so the retry it
+  // is supposed to recognise would arrive carrying a different one and mint a
+  // second batch — the exact failure the key exists to prevent.
+  if (opts.idempotencyKey) {
+    headers[BATCH_IDEMPOTENCY_HEADER] = opts.idempotencyKey;
   }
 
   const res = await fetch(`${resolved.baseUrl}${path}`, {

@@ -249,6 +249,16 @@ export type FanoutJob =
       instruction: string;
       files: File[];
       title?: string;
+      /**
+       * Wire-level idempotency key for this batch (#100) — minted per STAGED
+       * SET by the composer and resent unchanged on a retry, so a submit whose
+       * response was lost does not mint a second batch.
+       *
+       * NOTE that `id` is NOT this: `id` is the CHIP's identifier, used as the
+       * key of the outcomes map so each chip gets its own sentence. It is
+       * generated per chip and means nothing to the box.
+       */
+      idempotencyKey?: string;
     };
 
 export interface FanoutOutcome {
@@ -266,6 +276,7 @@ export interface FanoutDeps {
     instruction: string;
     files: File[];
     title?: string;
+    idempotencyKey?: string;
   }) => Promise<BatchSubmitResponse>;
 }
 
@@ -317,6 +328,7 @@ export async function runFanout(
           instruction: job.instruction,
           files: job.files,
           title: job.title,
+          idempotencyKey: job.idempotencyKey,
         });
         outcomes[job.id] = {
           status: 'done',

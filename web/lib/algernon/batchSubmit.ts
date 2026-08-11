@@ -143,6 +143,123 @@ export interface BatchSubmitResponse {
   path: string;
   instance: string;
   duplicates?: number;
+  /**
+   * True when the box REPLAYED an earlier answer for this idempotency key
+   * rather than creating a batch (#100). The rest of the body is that original
+   * receipt verbatim, so nothing else needs to branch on it — a retry after a
+   * lost response shows the operator the batch that already exists.
+   */
+  deduped?: boolean;
+}
+
+// --- Wire-level idempotency (#100) -------------------------------------------
+//
+// THE FAILURE: a submit lands on the box, the box saves the scans and answers,
+// and the ANSWER is lost. The operator sees "couldn't reach the instance" and
+// presses Submit again — and without a key on the wire that second request is
+// indistinguishable from a first, so a SECOND batch is minted and the drip pays
+// for every scan twice. The content-hash dedupe inside `routes_batch` does not
+// help: it dedupes within ONE submission, and these are two.
+//
+// MIRRORS THE CHAT TURN'S S6 CONTRACT in semantics — a client-minted key, the
+// SAME key on a retry, and a server that replays its stored answer rather than
+// re-acting. It rides a HEADER rather than the body because this submission is
+// multipart and the BFF in front of it must not parse it (see the box's
+// `alfred.batch.submit_keys` for the full contract, including why there is no
+// "same key, different content" branch on this route).
+
+// The SIBLING is `X-Alfred-Stt-Idempotency-Key` (#STT lost-message #2), and this
+// follows its naming and its BFF discipline — allowlist ONLY this header, and
+// relay it only when well-formed. It diverges on how the key is DERIVED: STT
+// content-addresses (the SHA-256 of the audio blob), which needs no client state
+// at all, but hashing a 128 MiB staged batch in the browser on every attempt
+// would cost more than the whole feature saves. Hence a minted token, held
+// against the staged signature below.
+
+/** Request header carrying the key. Mirrors `routes_batch.BATCH_IDEMPOTENCY_HEADER`. */
+export const BATCH_IDEMPOTENCY_HEADER = 'X-Alfred-Batch-Idempotency-Key';
+
+/**
+ * Well-formed keys: a bounded, header-safe token.
+ *
+ * Deliberately narrow — a UUID (the normal mint) matches, and so does the
+ * fallback mint, while anything carrying whitespace, control characters or a
+ * newline does not. The BFF relays a client-supplied value into an outbound
+ * request header, and the cheapest way to keep that from ever being a header
+ * injection is to allow only characters that cannot express one.
+ */
+const BATCH_IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_-]{1,200}$/;
+
+/** True when a value may be relayed as an idempotency key. */
+export function isBatchIdempotencyKey(value: unknown): value is string {
+  return typeof value === 'string' && BATCH_IDEMPOTENCY_KEY_RE.test(value);
+}
+
+/** A minted key and the staged submission it belongs to. */
+export interface StagedBatchKey {
+  /** Signature of the submission this key was minted for. */
+  sig: string;
+  /** The key itself — sent on every attempt at THIS staged submission. */
+  key: string;
+}
+
+/**
+ * A cheap, stable signature of a staged submission.
+ *
+ * PER STAGED SET, NOT PER ATTEMPT is the whole requirement, and this is what
+ * makes it self-maintaining: the key is reused for as long as the signature is
+ * unchanged, so pressing Submit again after a failure resends the same key
+ * without any component having to remember to hold it.
+ *
+ * Files are identified by name + size + last-modified rather than by content:
+ * hashing megabytes on every keystroke would cost far more than it buys, and
+ * the question being asked is only "is this the same staged set the operator
+ * already tried to send?".
+ *
+ * The instruction and title are IN the signature deliberately. Editing them
+ * makes a new submission, which must mint a new key — otherwise the box would
+ * replay the first receipt and the operator's correction would be silently
+ * discarded while the UI said it had been sent.
+ */
+export function stagedBatchSignature(opts: {
+  target: string;
+  instruction: string;
+  files: File[];
+  title?: string;
+}): string {
+  return JSON.stringify([
+    opts.target,
+    opts.instruction,
+    opts.title ?? '',
+    opts.files.map((f) => [f.name, f.size, f.lastModified]),
+  ]);
+}
+
+/** Mint a key. Injectable so tests are deterministic and jsdom needs no crypto. */
+function defaultMintKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  // Fallback for an environment without `crypto.randomUUID`. Uniqueness is what
+  // matters here, not unpredictability: the key is a dedupe token the operator's
+  // own session mints for itself, never a credential.
+  return `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * The key to send for this staged submission — the held one when nothing has
+ * changed, a fresh one when it has.
+ *
+ * Callers keep the returned value (in a ref) and pass it back next time. The
+ * comparison is what makes a retry idempotent and an edit-then-resend honest.
+ */
+export function keyForStagedBatch(
+  held: StagedBatchKey | null,
+  sig: string,
+  mint: () => string = defaultMintKey,
+): StagedBatchKey {
+  if (held && held.sig === sig) return held;
+  return { sig, key: mint() };
 }
 
 /** Build the multipart body. Field names match the box's part names exactly. */

@@ -94,6 +94,14 @@ log = get_logger(__name__)
 #: Layer 1 and queue paid vision work. See the module docstring.
 BATCH_PEER_NAME = "web_batch"
 
+#: Request header carrying the client-minted idempotency key (#100). A HEADER
+#: rather than a form field because the BFF in front of this route is a byte
+#: pipe that must not parse the multipart, and because a form field would only
+#: be readable mid-stream — after the batch directory had already been created.
+#: See ``alfred.batch.submit_keys`` for the whole contract and how it mirrors
+#: the chat turn's S6 shape.
+BATCH_IDEMPOTENCY_HEADER = "X-Alfred-Batch-Idempotency-Key"
+
 #: Image types accepted for a scan. Deliberately a LOCAL constant rather than an
 #: import of ``alfred.web.routes_chat.ALLOWED_IMAGE_MEDIA_TYPES``: this is a
 #: transport route and that is a web route, and the import would point the
@@ -306,6 +314,10 @@ async def _drain_image_part(
 async def _handle_vault_batch(request: web.Request) -> web.StreamResponse:
     """POST /vault/batch — save N scans + one instruction, answer with an id.
 
+    Idempotent on :data:`BATCH_IDEMPOTENCY_HEADER`: a repeat of a key that was
+    already answered replays the original receipt (plus ``deduped: true``) and
+    creates NOTHING. Absent header ⇒ the pre-#100 behaviour, logged.
+
     Error taxonomy (JSON ``{"error": <code>}``)::
 
         wrong_peer (401)            batch_not_configured (503)
@@ -329,6 +341,12 @@ async def _handle_vault_batch(request: web.Request) -> web.StreamResponse:
     )
     from alfred.batch.render import render_body
     from alfred.batch.seal import BATCH_STATUS_OPEN
+    from alfred.batch.submit_keys import (
+        clean_key,
+        find_receipt,
+        record_receipt,
+        store_path,
+    )
     from alfred.vault.ops import VaultError, vault_create
     from alfred.vault.scope import ScopeError
 
@@ -375,6 +393,51 @@ async def _handle_vault_batch(request: web.Request) -> web.StreamResponse:
             content_type=request.content_type or "(none)",
         )
         return _json_error(415, "not_multipart")
+
+    # --- wire-level idempotency (#100) ----------------------------------
+    # BEFORE the batch id is minted and before a single byte is written: a
+    # retry whose first attempt already succeeded must not create a second
+    # directory, a second record or a second set of drip items. The client
+    # mints this key per STAGED SET, so a retry carries the same one.
+    idempotency_key = clean_key(request.headers.get(BATCH_IDEMPOTENCY_HEADER))
+    try:
+        keys_path = store_path(data_dir, instance)
+    except BatchPathError as exc:
+        log.warning(
+            "transport.batch.rejected",
+            reason="batch_not_configured", peer=peer, detail=str(exc)[:200],
+        )
+        return _json_error(503, "batch_not_configured", detail=str(exc)[:200])
+
+    if idempotency_key:
+        seen = find_receipt(keys_path, idempotency_key)
+        if seen is not None:
+            # The ORIGINAL receipt, replayed verbatim plus the flag. Same shape
+            # as a fresh answer (the S6 doctrine) so a client that ignores
+            # `deduped` still reads the right batch id and record path — the
+            # answer is not "you already did that", it is the answer it lost.
+            log.info(
+                "transport.batch.deduped",
+                peer=peer,
+                batch_id=seen.get("batch_id", "(unknown)"),
+                idempotency_key_prefix=idempotency_key[:8],
+                detail="a submission with this idempotency key was already "
+                       "answered — replaying the original receipt; NO second "
+                       "batch was created and nothing was re-queued",
+            )
+            return web.json_response({**seen, "deduped": True})
+    else:
+        # ILB: a submission with no key is a submission that CANNOT be deduped,
+        # and that is worth being able to grep for. It is the pre-#100 client
+        # shape, so it is expected during a rollout and a defect afterwards —
+        # neither reading is available from silence.
+        log.info(
+            "transport.batch.no_idempotency_key",
+            peer=peer,
+            header=BATCH_IDEMPOTENCY_HEADER,
+            detail="submission carries no idempotency key — proceeding, but a "
+                   "retry after a lost response would mint a second batch",
+        )
 
     max_images = int(request.app.get(_KEY_BATCH_MAX_IMAGES, DEFAULT_BATCH_MAX_IMAGES))
     max_image_bytes = int(request.app.get(
@@ -626,6 +689,12 @@ async def _handle_vault_batch(request: web.Request) -> web.StreamResponse:
         # show fewer sections. Saying so here is the difference between a
         # dedupe and an apparent silent loss.
         response["duplicates"] = duplicates
+
+    # Remembered LAST, and only on the success path: a submission that was
+    # refused must stay retryable, so only an answer that actually created a
+    # batch is worth replaying. Never raises — see ``record_receipt``.
+    record_receipt(keys_path, idempotency_key, response)
+
     return web.json_response(response)
 
 
@@ -737,6 +806,7 @@ def register_batch_routes(
 
 __all__ = [
     "ALLOWED_SCAN_MEDIA_TYPES",
+    "BATCH_IDEMPOTENCY_HEADER",
     "BATCH_PEER_NAME",
     "mint_batch_id",
     "register_batch_routes",

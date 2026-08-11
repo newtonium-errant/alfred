@@ -211,7 +211,15 @@ describe('BatchForm', () => {
     expect(url).toBe('/api/batch/submit?target=Salem');
     expect(init.method).toBe('POST');
     expect(init.body).toBeInstanceOf(FormData);
-    expect(init.headers).toBeUndefined();
+    // NO Content-Type. This pin read `headers === undefined` until #100 added
+    // the idempotency key, but "no headers at all" was never the contract — the
+    // contract is that the BROWSER must set Content-Type so the multipart
+    // boundary is generated, and a hand-set one produces a body the box cannot
+    // parse. So the assertion is narrowed to the header that actually matters
+    // rather than dropped. (The key's own wiring is pinned in
+    // `batchIdempotency.test.tsx`.)
+    const sentHeaders = (init.headers ?? {}) as Record<string, string>;
+    expect(Object.keys(sentHeaders).map((k) => k.toLowerCase())).not.toContain('content-type');
     expect((init.body as FormData).get('instruction')).toBe('Read the total.');
   });
 
