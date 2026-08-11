@@ -29,6 +29,7 @@ from .brief_line import render_campaign_line
 from .config import DripConfig
 from .runner import run_increment
 from .repair import repair_false_dones
+from .run_lock import run_lock
 from .state import campaign_state_path, load_state, save_state
 from .wiring import DripConfigError, build_campaign, build_progress
 
@@ -104,6 +105,44 @@ def cmd_run(
         )
         return 0
 
+    # A dry run reads and reports; it claims nothing and spends nothing, so it
+    # takes NO lock. Locking it would mean an operator asking "what would run?"
+    # gets refused for the hour a real run is in progress — the one moment the
+    # question is most worth asking.
+    if not apply:
+        return _drain(selected, config, day=day, apply=False)
+
+    # Everything below this point can spend money and claim items, so exactly
+    # one process per instance may be here at a time. See ``run_lock`` for the
+    # measurement: without this, a kicked run overlapping the hourly timer
+    # processes every claimed item TWICE and both runs report success.
+    #
+    # This also moves the blank-instance refusal earlier than it used to fire
+    # (it came from ``campaign_state_path`` inside the loop). Same
+    # ``DripConfigError``, same CLI boundary that #66 gave it — just raised
+    # before any campaign is built rather than after.
+    with run_lock(config.data_dir, config.instance) as acquired:
+        if not acquired:
+            # ILB, and NOT an error: the work this run wanted done is already
+            # being done by the run holding the lock. Exit 0 so a kicked run
+            # colliding with the timer is not reported as a failure.
+            print(
+                "Drip: another run is already in progress on this instance — "
+                "standing down (its work covers this one)."
+            )
+            return 0
+        return _drain(selected, config, day=day, apply=True)
+
+
+def _drain(
+    selected: dict, config: DripConfig, *, day: date, apply: bool,
+) -> int:
+    """Run one increment for each selected campaign. Returns an exit code.
+
+    Split out of :func:`cmd_run` so the lock can wrap the whole drain without
+    the body being written twice — one copy under the lock and one without is
+    exactly how the two would drift.
+    """
     exit_code = 0
     for name, ccfg in sorted(selected.items()):
         try:
