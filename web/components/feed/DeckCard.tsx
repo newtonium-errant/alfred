@@ -270,7 +270,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
             // ILB: a heavy verb with no declared consequence says so, rather
             // than reading as a reassuring blank.
             <p data-testid="deck-confirm-note-missing" className="text-xs text-honeydew-600">
-              This writes to the vault. The exact change isn’t described for this card type.
+              This makes a durable change to the vault. The exact change isn’t described for this card type.
             </p>
           )}
           <div className="flex gap-3">
