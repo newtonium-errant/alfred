@@ -39,6 +39,14 @@ import structlog
 import yaml
 
 from alfred.common.schedule import ScheduleConfig
+# #64 — the two matcher bounds, imported rather than re-typed. The config
+# default and the matcher's own constant must be the SAME number: a config that
+# silently disagreed with the module documenting why 0.45 sits below 0.5 would
+# make the false-positive guard's measured reasoning wrong without touching it.
+from alfred.daily_sync.capture_close_match import (
+    DEFAULT_CONFIDENCE_THRESHOLD as _CAPTURE_CLOSE_THRESHOLD_DEFAULT,
+    DEFAULT_NO_MATCH_FLOOR as _CAPTURE_CLOSE_FLOOR_DEFAULT,
+)
 from alfred.routine.match_calibration import (
     DEFAULT_CORPUS_PATH as _ROUTINE_MATCH_CORPUS_DEFAULT,
     DEFAULT_PENDING_MAX_AGE_DAYS as _ROUTINE_MATCH_MAX_AGE_DEFAULT,
@@ -332,6 +340,68 @@ class SttVocabConfig:
 
 
 @dataclass
+class CaptureCloseConfig:
+    """#64 — propose closing a capture-born task when evidence of fulfilment
+    arrives. Daily Sync surface at priority 26.
+
+    ``enabled`` defaults OFF. Every judgment-making surface in this file does,
+    and this one makes a FUZZY judgment about closing the operator's work — the
+    least appropriate place to opt an instance in by default.
+
+    **THE THREE PATHS HAVE NO DEFAULT VALUE HERE, DELIBERATELY.** They are
+    resolved in :func:`load_from_unified` through
+    ``alfred.common.instance_paths.instance_data_path``, which anchors them on
+    the instance's own ``logging.dir``. A ``"./data/..."`` literal in this
+    dataclass would be the #53 / #74 shape: on the box every instance shares one
+    WorkingDirectory and differs only by ``--config``, so the literal is ONE
+    file for Salem, KAL-LE, Hypatia and VERA — one instance proposing closes
+    against another's tasks, which is the 2026-07-31 feed-store incident wearing
+    different clothes. Anchoring keeps Salem byte-identical (its ``logging.dir``
+    IS ``./data``) while giving every other instance its own file, and adds
+    nothing to the #59 debris-guard allowlist.
+
+    An EMPTY path is therefore "not configured", not "use the default": the
+    section refuses to run and says so (``capture_close.not_configured``) rather
+    than silently resolving somewhere shared. Fail-loud-on-empty over a
+    single-instance literal.
+
+    ``threshold`` / ``floor`` mirror the two matcher constants and carry the
+    same meaning: at or above ``threshold`` a match may spend a card; between
+    ``floor`` and ``threshold`` it is a NEAR MISS recorded to the pending store
+    as evidence, never surfaced; below ``floor`` it is not evidence of anything.
+    Config-backed rather than literals at the call site so the operator can tune
+    how strong the evidence must be without a code change — and so a threshold
+    PROPOSAL built from corpus statistics has somewhere to land.
+    """
+
+    enabled: bool = False
+    #: Pending/answered close proposals (JSONL). Empty → resolved at load.
+    queue_path: str = ""
+    #: Answered (task_key, evidence) pairs — the learned glossary. Empty → load.
+    corpus_path: str = ""
+    #: Near misses: scored between ``floor`` and ``threshold``. Empty → load.
+    pending_path: str = ""
+    threshold: float = _CAPTURE_CLOSE_THRESHOLD_DEFAULT
+    floor: float = _CAPTURE_CLOSE_FLOOR_DEFAULT
+    #: How long after a task is created a record can still count as evidence of
+    #: fulfilling it — AND the per-task cooldown after a rejection. One number
+    #: for both because they answer the same question ("how long is this promise
+    #: live?"), and two independently-tunable numbers here would be two ways to
+    #: express one intent.
+    window_days: int = 14
+    #: Cards this section may raise in ONE pass. The deck is a scarce surface;
+    #: a first run over a long backlog could otherwise raise dozens and teach
+    #: the operator to skim the section.
+    max_proposals: int = 3
+    #: Open capture-born tasks SCANNED in one pass, oldest first. Distinct from
+    #: ``max_proposals``: that bounds cards, this bounds WORK. The scan reads
+    #: every candidate record in each task's window, so an unbounded scan of a
+    #: long backlog is the expensive half even on a day that proposes nothing.
+    #: When the cap bites it is named in the log, never silently truncated.
+    max_tasks: int = 50
+
+
+@dataclass
 class TierRecurrenceConfig:
     """#20 P5 — ad-hoc-T3 recurrence→promote proposals, Daily Sync surface (B1).
 
@@ -439,6 +509,12 @@ class DailySyncConfig:
     ticket_notify: TicketNotifyConfig = field(
         default_factory=TicketNotifyConfig,
     )
+    # #64 — capture-born task propose-close. Defaulted-OFF; an instance opts in
+    # via ``daily_sync.capture_close.enabled: true``. The three store paths are
+    # anchored per-instance in load_from_unified (see CaptureCloseConfig).
+    capture_close: CaptureCloseConfig = field(
+        default_factory=CaptureCloseConfig,
+    )
     # Path to the config file this DailySyncConfig was loaded from.
     # Carried so lazy/late loaders (the canonical-proposals queue-path
     # helpers in ``canonical_proposals_section`` and ``reply_dispatch``)
@@ -468,6 +544,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "stt_vocab": SttVocabConfig,
     "tier_recurrence": TierRecurrenceConfig,
     "ticket_notify": TicketNotifyConfig,
+    "capture_close": CaptureCloseConfig,
 }
 
 
@@ -626,6 +703,23 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
         cfg.tier_recurrence.pending_path = _derived_name("tier_recurrence_pending")
     if not _explicit("tier_recurrence", "decided_path"):
         cfg.tier_recurrence.decided_path = _derived_name("tier_recurrence_decided")
+
+    # #64 — anchor the three capture-close stores on the INSTANCE's data dir
+    # rather than the process cwd. See ``CaptureCloseConfig`` for why these have
+    # no dataclass default: a "./data/..." literal is one shared file across
+    # every instance on the box, which here would mean one instance proposing
+    # closes against another instance's tasks. Byte-identical for Salem
+    # (``logging.dir`` IS "./data"), so there is nothing to migrate.
+    #
+    # An explicit ``daily_sync.capture_close.<field>`` always wins.
+    from alfred.common.instance_paths import instance_data_path
+    for _field, _stem in (
+        ("queue_path", "capture_close_queue.jsonl"),
+        ("corpus_path", "capture_close_corpus.jsonl"),
+        ("pending_path", "capture_close_pending.jsonl"),
+    ):
+        if not _explicit("capture_close", _field):
+            setattr(cfg.capture_close, _field, instance_data_path(raw, _stem))
     return cfg
 
 

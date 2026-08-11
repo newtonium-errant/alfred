@@ -166,6 +166,28 @@ def _last_batch_demotion_items(config: DailySyncConfig) -> list[dict[str, Any]]:
     return [i for i in items if isinstance(i, dict)]
 
 
+def _last_batch_capture_close_items(
+    config: DailySyncConfig,
+) -> list[dict[str, Any]]:
+    """Return the capture-close items the daemon stashed at fire time.
+
+    Each item carries ``item_number``, ``proposal_id``, ``task_path``,
+    ``task_text``, ``evidence_path``, ``evidence_name``, ``score``,
+    ``match_source``. Empty list on every fire that raised no proposal, which is
+    the steady state — the section's own scan + trigger log lines are what say
+    the evaluation happened.
+
+    The evidence fields are read from HERE rather than recomputed against the
+    vault, so a confirm applies the question the operator was actually asked. A
+    match that moved between the card and the reply would be a different
+    question wearing the same item number.
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch") or {}
+    items = batch.get("capture_close_items") or []
+    return [i for i in items if isinstance(i, dict)]
+
+
 def _last_batch_pending_items(config: DailySyncConfig) -> list[dict[str, Any]]:
     """Return the pending-items entries the daemon stashed at fire time.
 
@@ -212,6 +234,7 @@ def _batch_item_numbers(config: DailySyncConfig) -> set[int]:
         _last_batch_attribution_items,
         _last_batch_proposal_items,
         _last_batch_demotion_items,
+        _last_batch_capture_close_items,
         _last_batch_pending_items,
         _last_batch_routine_match_items,
     ):
@@ -237,6 +260,7 @@ def _batch_type_flags(config: DailySyncConfig) -> dict[str, bool]:
         "has_attribution": bool(_last_batch_attribution_items(config)),
         "has_proposal": bool(_last_batch_proposal_items(config)),
         "has_demotion": bool(_last_batch_demotion_items(config)),
+        "has_capture_close": bool(_last_batch_capture_close_items(config)),
         "has_pending": bool(_last_batch_pending_items(config)),
         "has_routine_match": bool(_last_batch_routine_match_items(config)),
     }
@@ -254,6 +278,7 @@ def _applicable_calibration_verbs(flags: dict[str, bool]) -> set[str]:
     if (
         flags["has_attribution"] or flags["has_proposal"]
         or flags["has_routine_match"] or flags["has_demotion"]
+        or flags["has_capture_close"]
     ):
         verbs.update({"confirm", "reject"})
     if flags["has_pending"]:
@@ -1474,6 +1499,185 @@ def _resolve_demotion_correction(
     return None, True
 
 
+def _resolve_capture_close_correction(
+    correction: ReplyCorrection,
+    item: dict[str, Any],
+    config: DailySyncConfig,
+    vault_path: Path | None,
+    *,
+    instance_scope: str = "talker",
+) -> tuple[str | None, bool]:
+    """Apply one capture-close confirm/reject. ``(error_or_None, did_write)``.
+
+    THE ORDER IS THE DESIGN, and it differs per verb.
+
+    CONFIRM: close the task, THEN write the corpus row, THEN mark the queue.
+    The close is what he asked for; everything after it is bookkeeping and
+    learning. If the vault write fails nothing else happens and he is told —
+    reporting "closed" over a task still sitting ``todo`` is the precise lie
+    this feature exists to stop telling. If the corpus append fails afterwards
+    the close still stands: the cost is one lost training pair, not a wrong
+    state, so it is logged and the resolve continues. If the queue flip fails
+    the close still stands too, and the section's already-resolved suppression
+    catches the orphaned pending row at the next render.
+
+    REJECT: write the NEGATIVE corpus row, THEN mark the queue rejected. Nothing
+    touches the vault — a rejection means the task stays open, which is what it
+    already is. Both writes are load-bearing in different ways: the corpus row
+    excludes this pair from ever being proposed again, and the queue flip's
+    ``resolved_at`` IS the per-task cooldown clock. A reject that failed to
+    record its timestamp would re-ask tomorrow off the same evidence, so that
+    write is checked and its failure surfaced rather than swallowed.
+    """
+    from alfred.vault.ops import VaultError, vault_edit
+
+    from .capture_close_match import (
+        MatchCorpusEntry,
+        VERDICT_CONFIRMED,
+        VERDICT_REJECTED,
+        append_corpus,
+        now_iso,
+        query_key,
+    )
+    from .capture_close_proposals import (
+        STATE_ACCEPTED,
+        STATE_REJECTED,
+        resolve_proposal,
+    )
+
+    proposal_id = str(item.get("proposal_id") or "")
+    task_path = str(item.get("task_path") or "")
+    if not proposal_id or not task_path:
+        return (
+            f"item {correction.item_number} capture-close metadata missing",
+            False,
+        )
+
+    refusal = _pending_only_verb_refusal(
+        correction, "capture_close",
+        "`confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+    )
+    if refusal:
+        return refusal, False
+
+    if not (correction.ok or correction.reject):
+        return (
+            f"item {correction.item_number}: the captured-task proposal only "
+            f"accepts `confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+            False,
+        )
+
+    cc = getattr(config, "capture_close", None)
+    if cc is None or not (getattr(cc, "queue_path", "") or "").strip():
+        return (
+            f"item {correction.item_number}: capture-close queue not configured",
+            False,
+        )
+
+    task_text = str(item.get("task_text") or "")
+    evidence_name = str(item.get("evidence_name") or "")
+    corpus_path = (getattr(cc, "corpus_path", "") or "").strip()
+    ts = now_iso()
+
+    def _learn(verdict: str) -> None:
+        """Append the answered pair. Never fatal — see the docstring."""
+        if not corpus_path:
+            log.warning(
+                "daily_sync.capture_close.corpus_unconfigured",
+                proposal_id=proposal_id, verdict=verdict,
+                detail="the operator's verdict could not be learned from — the "
+                       "same pair may be proposed again",
+            )
+            return
+        try:
+            append_corpus(corpus_path, MatchCorpusEntry(
+                ts=ts,
+                task_key=query_key(task_text),
+                task_text=task_text,
+                evidence_name=evidence_name,
+                verdict=verdict,
+                score=float(item.get("score") or 0.0),
+            ))
+        except OSError as exc:
+            log.warning(
+                "daily_sync.capture_close.corpus_write_failed",
+                proposal_id=proposal_id, verdict=verdict, error=str(exc),
+                detail="the verdict was applied but not learned from",
+            )
+
+    if correction.reject:
+        _learn(VERDICT_REJECTED)
+        try:
+            flipped = resolve_proposal(
+                cc.queue_path, proposal_id, STATE_REJECTED, resolved_at=ts,
+            )
+        except OSError as exc:
+            log.warning(
+                "daily_sync.capture_close.state_write_failed",
+                proposal_id=proposal_id, action="reject", error=str(exc),
+            )
+            return (f"item {correction.item_number}: queue write failed", False)
+        if not flipped:
+            log.info(
+                "daily_sync.capture_close.reject_noop", proposal_id=proposal_id,
+                detail="already resolved or no longer in the queue",
+            )
+            return None, False
+        log.info(
+            "daily_sync.capture_close.rejected", proposal_id=proposal_id,
+            task_path=task_path, evidence_path=item.get("evidence_path"),
+            cooldown_days=getattr(cc, "window_days", None),
+        )
+        return None, True
+
+    # Confirm — the close FIRST.
+    if vault_path is None:
+        return (
+            f"item {correction.item_number}: vault_path not provided",
+            False,
+        )
+    try:
+        vault_edit(
+            vault_path, task_path,
+            set_fields={"status": "done"},
+            scope=instance_scope,
+        )
+    except (VaultError, OSError) as exc:
+        log.warning(
+            "daily_sync.capture_close.close_failed",
+            proposal_id=proposal_id, task_path=task_path,
+            error_type=exc.__class__.__name__, error=str(exc),
+        )
+        return (
+            f"item {correction.item_number}: couldn't close {task_path} "
+            f"({exc})",
+            False,
+        )
+
+    _learn(VERDICT_CONFIRMED)
+
+    try:
+        resolve_proposal(
+            cc.queue_path, proposal_id, STATE_ACCEPTED, resolved_at=ts,
+        )
+    except OSError as exc:
+        # The task IS closed, which is what he asked for, so this reports as
+        # applied. The orphaned pending row is caught by the section's
+        # already-resolved suppression at the next render — which is why that
+        # suppression exists as well as the one-per-task check, not instead.
+        log.warning(
+            "daily_sync.capture_close.state_write_failed",
+            proposal_id=proposal_id, action="confirm", error=str(exc),
+            detail="the task was closed; only the queue row is unmarked",
+        )
+    log.info(
+        "daily_sync.capture_close.approved", proposal_id=proposal_id,
+        task_path=task_path, evidence_path=item.get("evidence_path"),
+        score=item.get("score"), match_source=item.get("match_source"),
+    )
+    return None, True
+
+
 def _resolve_proposal_correction(
     correction: ReplyCorrection,
     item: dict[str, Any],
@@ -2414,6 +2618,28 @@ def _format_demotion_applied_line(
     )
 
 
+def _format_capture_close_applied_line(
+    item: dict[str, Any],
+    *,
+    action: str,
+) -> str:
+    """One-liner describing a capture-close confirm/reject.
+
+    The CONFIRM line names the task it closed, not just the item number. He is
+    answering several cards in one reply and the numbers are not memorable; the
+    sentence that tells him it worked is the only place he can check that the
+    thing that closed is the thing he meant to close.
+    """
+    item_number = item.get("item_number") or "?"
+    task_text = str(item.get("task_text") or item.get("task_path") or "the task")
+    if action == "reject":
+        return (
+            f"Item {item_number}: left \"{task_text}\" open — that wasn't the "
+            f"evidence, and I won't offer that pairing again"
+        )
+    return f"Item {item_number}: closed \"{task_text}\" as done"
+
+
 def _format_proposal_applied_line(
     item: dict[str, Any],
     *,
@@ -2570,6 +2796,7 @@ def _compose_calibration_hint(
     has_pending: bool,
     has_routine_match: bool = False,
     has_demotion: bool = False,
+    has_capture_close: bool = False,
 ) -> str:
     """Build the "Tip: ..." hint based on which item types are in the batch.
 
@@ -2583,7 +2810,7 @@ def _compose_calibration_hint(
       * Email only → preserve the historical Salem hint
         ("Same / Ditto / Same as #N" — the chaining shortcut for
         contiguous identical-priority items).
-      * Attribution / proposal / demotion items → ``N confirm`` /
+      * Attribution / proposal / demotion / capture-close items → ``N confirm`` /
         ``N reject`` (matches what attribution_section.py:357,
         canonical_proposals_section.py:186 and demotion_section's
         ``render_batch`` advertise in the batch message body).
@@ -2594,7 +2821,10 @@ def _compose_calibration_hint(
     suggest). Falls through cleanly without a stray "Tip:" prefix.
     """
     verbs: list[str] = []
-    if has_attribution or has_proposal or has_routine_match or has_demotion:
+    if (
+        has_attribution or has_proposal or has_routine_match or has_demotion
+        or has_capture_close
+    ):
         verbs.append("'N confirm' / 'N reject'")
     if has_pending:
         verbs.append("'N noted' / 'N show me'")
@@ -2996,6 +3226,7 @@ def handle_daily_sync_reply(
       - ``attribution_count``: int — attribution actions applied
       - ``proposal_count``: int — canonical-proposal actions applied
       - ``demotion_count``: int — attribution-tier proposals answered
+      - ``capture_close_count``: int — capture-born tasks closed as fulfilled
       - ``pending_count``: int — pending-item resolutions executed
     """
     if not reply_targets_daily_sync(config, parent_message_id):
@@ -3015,6 +3246,10 @@ def handle_daily_sync_reply(
     demotion_by_num = {
         int(i.get("item_number", 0)): i for i in demotion_items
     }
+    capture_close_items = _last_batch_capture_close_items(config)
+    capture_close_by_num = {
+        int(i.get("item_number", 0)): i for i in capture_close_items
+    }
     pending_items = _last_batch_pending_items(config)
     pending_by_num = {
         int(i.get("item_number", 0)): i for i in pending_items
@@ -3031,6 +3266,7 @@ def handle_daily_sync_reply(
     attribution_written = 0
     proposal_written = 0  # propose-person c2
     demotion_written = 0  # #72 — attribution-tier demotion proposals
+    capture_close_written = 0  # #64 — capture-born tasks closed as fulfilled
     pending_written = 0  # Pending Items Queue Phase 1
     routine_match_written = 0  # self-correcting matcher Phase 2b — glossary verdicts
     applied_lines: list[str] = []  # c3 — one per-item summary line per accepted correction
@@ -3181,6 +3417,20 @@ def handle_daily_sync_reply(
                 detail="a bare ack does not approve a tier change — reply "
                        "`N confirm` to the numbered item",
             )
+        # #64 — the all_ok shortcut deliberately does NOT close a captured task,
+        # for the same reason it does not approve a tier change, and one more.
+        # The evidence here is a FUZZY MATCH: a bare "ok" acknowledging a batch
+        # of email items must never be read as agreeing that a promise was kept.
+        # A wrong close silently deletes work he still intended to do, and he
+        # would find it the way he found the stale task — by accident, later.
+        # An unanswered proposal simply stays pending and is re-rendered.
+        if capture_close_items:
+            log.info(
+                "daily_sync.capture_close.all_ok_skipped",
+                count=len(capture_close_items),
+                detail="a bare ack does not close a captured task — reply "
+                       "`N confirm` to the numbered item",
+            )
         # Pending Items Queue Phase 1 — all_ok shortcut maps to the
         # ``noted`` resolution on every pending item. ``show me``
         # never fires from a pure-ack token; Andrew only triggers
@@ -3248,6 +3498,7 @@ def handle_daily_sync_reply(
             attribution_item = attribution_by_num.get(correction.item_number)
             proposal_item = proposal_by_num.get(correction.item_number)
             demotion_item = demotion_by_num.get(correction.item_number)
+            capture_close_item = capture_close_by_num.get(correction.item_number)
             pending_item = pending_by_num.get(correction.item_number)
             routine_match_item = routine_match_by_num.get(correction.item_number)
 
@@ -3351,6 +3602,27 @@ def handle_daily_sync_reply(
                             action="reject" if correction.reject else "confirm",
                         )
                     )
+            elif capture_close_item is not None:
+                # #64 — confirm closes the capture-born task and writes a
+                # POSITIVE corpus row; reject writes a NEGATIVE one and starts
+                # the per-task cooldown. Both verdicts feed the glossary, which
+                # is what makes answering a card change future behaviour rather
+                # than just this one card.
+                err, did_write = _resolve_capture_close_correction(
+                    correction, capture_close_item, config, vault_path,
+                    instance_scope=instance_scope,
+                )
+                if err is not None:
+                    _bucket_resolver_error(correction.item_number, err)
+                    continue
+                if did_write:
+                    capture_close_written += 1
+                    applied_lines.append(
+                        _format_capture_close_applied_line(
+                            capture_close_item,
+                            action="reject" if correction.reject else "confirm",
+                        )
+                    )
             elif pending_item is not None:
                 # Pending Items Queue Phase 1 — ``noted`` / ``show me``.
                 # Reject verbs make no sense here (use ``noted`` for
@@ -3426,6 +3698,7 @@ def handle_daily_sync_reply(
     written_count = (
         email_written + attribution_written + proposal_written
         + pending_written + routine_match_written + demotion_written
+        + capture_close_written
     )
     # 2026-05-18 — N (items corrected) vs M (corpus rows written). When
     # an email correction lands on a c5 cluster of size K > 1, the corpus
@@ -3441,6 +3714,7 @@ def handle_daily_sync_reply(
         + pending_written
         + routine_match_written
         + demotion_written
+        + capture_close_written
     )
 
     # c3 — user-facing body. Per-item summary lines go in (capped at 5
@@ -3456,6 +3730,7 @@ def handle_daily_sync_reply(
         has_pending=bool(pending_items),
         has_routine_match=bool(routine_match_items),
         has_demotion=bool(demotion_items),
+        has_capture_close=bool(capture_close_items),
     )
     body = _build_confirmation_body(
         parsed_all_ok=parsed.all_ok,
@@ -3484,6 +3759,7 @@ def handle_daily_sync_reply(
         pending_written=pending_written,
         routine_match_written=routine_match_written,
         demotion_written=demotion_written,
+        capture_close_written=capture_close_written,
         corrections_count=corrections_count,
         written_count=written_count,
         unparsed=len(errors),
@@ -3522,6 +3798,7 @@ def handle_daily_sync_reply(
         "attribution_count": attribution_written,
         "proposal_count": proposal_written,
         "demotion_count": demotion_written,
+        "capture_close_count": capture_close_written,
         "pending_count": pending_written,
         "routine_match_count": routine_match_written,
         "unparsed": errors,
