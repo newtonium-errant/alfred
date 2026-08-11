@@ -16,6 +16,16 @@ env/
 data/
 !data/.gitkeep
 
+# Batch scan intake (#83). Normally these live under the instance's data dir
+# (data/batch/<instance>/<id>/) and are covered by the rule above — but a
+# batch route reachable with an unset data_dir resolves the path against the
+# process CWD, which puts a REPO-ROOT batch/ tree one misconfiguration away.
+# That is not hypothetical: it is how two smoke artifacts were committed in
+# 251b2a5a. Ignored here so the accident cannot recur, and because the debris
+# guard structurally cannot catch it — a TRACKED file is "present at session
+# start" by definition, so the guard reports the tree clean.
+batch/
+
 # Config with secrets
 .env
 config.yaml
