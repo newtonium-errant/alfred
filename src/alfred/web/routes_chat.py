@@ -1239,6 +1239,60 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
     return resp
 
 
+async def _handle_chat_active(request: web.Request) -> web.StreamResponse:
+    """GET /chat/active — the caller's live session, if they have one (#94).
+
+    READ-ONLY, and that is the entire point. ``/chat/open`` is
+    close-prior-then-fresh, so a client that reaches for it to answer "do I
+    have a session?" DESTROYS the answer. On 2026-08-11 that showed up as
+    open-storms — three opens in 22 seconds — consistent with two devices
+    (phone + tablet) holding device-local keys: A's stale key 404s, A opens
+    fresh, which closes B's LIVE session, so B 404s and opens fresh, which
+    closes A's. Each device is behaving correctly on its own and together they
+    tear the conversation apart.
+
+    This endpoint gives the bootstrap path a way to ask without breaking
+    anything, so a 404 on a stale key becomes "adopt the live session" instead
+    of "start a new one over the top of it".
+
+    Returns ``{"session_key": "..."}`` when a session is active and
+    ``{"session_key": null}`` when none is — an explicit null rather than a
+    404, because "you have no session" is a normal answer to a normal
+    question, not a failure. A 404 here would push the client back toward
+    treating absence as an error condition, which is the reflex this whole
+    item exists to unwind.
+
+    Auth is the shared web-chat spine (``resolve_web_identity``) on the
+    existing mount, so it inherits the ``WEB_CHAT_PEER`` pin from
+    ``auth_middleware`` and introduces NO new asserted-identity surface.
+    Scoped to the caller's OWN ``synthetic_chat_id``; it can no more see
+    another user's session than ``/chat/history`` can.
+    """
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+
+    identity = resolve_web_identity(request, web_config)
+    if identity is None:
+        return web.json_response({"error": "invalid_session"}, status=401)
+
+    active_dict = state_mgr.get_active(identity.synthetic_chat_id)
+    session_key = (active_dict or {}).get("session_id") or None
+    turns = len((active_dict or {}).get("transcript") or [])
+    log.info(
+        "web.chat.active_probed",
+        user=identity.user,
+        session_key=session_key,
+        turns=turns,
+        detail=(
+            "live session found — the client resumes it instead of opening "
+            "over the top of it"
+            if session_key else
+            "ran, nothing to resume — no active session for this user"
+        ),
+    )
+    return web.json_response({"session_key": session_key, "turns": turns})
+
+
 async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
     """GET /chat/history/{session_key} — current active session transcript.
 
@@ -1361,9 +1415,11 @@ def register_web_routes(
     app.router.add_post("/chat/turn", _handle_chat_turn)
     app.router.add_post("/chat/stream", _handle_chat_stream)
     app.router.add_get("/chat/history/{session_key}", _handle_chat_history)
+    app.router.add_get("/chat/active", _handle_chat_active)
 
     mounted_routes = [
         "/chat/open",
+        "/chat/active",
         "/chat/turn",
         "/chat/stream",
         "/chat/history/{session_key}",

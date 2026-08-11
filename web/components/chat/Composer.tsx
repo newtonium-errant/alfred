@@ -2,6 +2,7 @@ import {
   ClipboardEvent,
   DragEvent,
   KeyboardEvent,
+  useEffect,
   useRef,
   useState,
 } from 'react';
@@ -62,6 +63,8 @@ function readAsBase64(file: File): Promise<string> {
 export function Composer({
   onSend,
   disabled = false,
+  seedText = null,
+  onSeedConsumed,
 }: {
   onSend: (
     text: string,
@@ -70,8 +73,27 @@ export function Composer({
     transcript?: string,
   ) => void;
   disabled?: boolean;
+  /**
+   * Text handed back after a send failed against a dead session (#94c). The
+   * operator wrote it; losing it to a deploy restart is what turned a
+   * background annoyance into "my reply is gone" — he recovered a 50-minute
+   * conversation's reply by screenshotting it into the next session.
+   */
+  seedText?: string | null;
+  /** Called once the seed has been placed, so it is offered exactly once. */
+  onSeedConsumed?: () => void;
 }) {
   const [value, setValue] = useState('');
+
+  // Restore the held text — but never over live typing. If the operator has
+  // already started rewriting, their current words win; re-composing is a
+  // choice they have visibly made, and clobbering it would be the same loss
+  // in the other direction.
+  useEffect(() => {
+    if (!seedText) return;
+    setValue((prev) => (prev.trim() ? prev : seedText));
+    onSeedConsumed?.();
+  }, [seedText, onSeedConsumed]);
   // True once a voice transcript seeded the input — tags the next send as 'voice'.
   const [voiceSeeded, setVoiceSeeded] = useState(false);
   // The RAW STT text this message was seeded from (#54) — ONLY the transcribed

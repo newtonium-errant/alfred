@@ -197,6 +197,14 @@ export interface UseChat {
   /** True when the last turn failed recoverably and retry() will resend it. */
   retryable: boolean;
   /**
+   * The operator's composed text, held when the send hit a dead session (#94c).
+   * Survives the re-bootstrap that wipes the thread, so the page can offer it
+   * back instead of the operator losing what they wrote.
+   */
+  unsentText: string | null;
+  /** Retire the held text once it has been handed back. */
+  clearUnsent: () => void;
+  /**
    * `kind` tags the backend turn counter ('voice' for transcript-originated
    * sends). `images` carries optional screenshots (parity #29) — an image-only
    * turn passes a placeholder caption as `text` (the composer supplies it).
@@ -247,6 +255,18 @@ export function friendlyError(e: unknown): string {
         return 'That conversation has ended. Start a new chat to continue.';
       case 'engine_error':
         return 'The assistant hit a snag answering that. Try again in a moment.';
+      case 'engine_unavailable':
+        // #94(b). The server's own words when it classified an upstream 5xx —
+        // they name the cause and say the request was fine. The literal below
+        // is only the floor for a response that lost its detail.
+        return e.detail
+          || 'The assistant’s engine was briefly unavailable. Nothing is wrong with your message — send it again.';
+      case 'turn_in_flight':
+        // #94(d). Previously fell through to "Something went wrong", which is
+        // both wrong and alarming: nothing went wrong, the previous message is
+        // still being answered. Says what is happening and what to do, and
+        // does NOT invite a retry that would be refused the same way.
+        return 'Your previous message is still being answered. Wait for that reply before sending the next one.';
       case 'image_too_large':
         // Deterministic 400, NOT retryable (#82): an oversized image already in
         // the conversation history fails the same way on every resend, so the
@@ -282,6 +302,11 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   const [working, setWorking] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [retryable, setRetryable] = useState(false);
+  // #94(c) — the operator's COMPOSED text, held when the session turned out to
+  // be gone. Deliberately NOT cleared by bootstrap: the whole point is that it
+  // outlives the re-open that wipes the thread, which is where it was being
+  // lost (he recovered a 50-minute conversation's reply by screenshotting it).
+  const [unsentText, setUnsentText] = useState<string | null>(null);
   const [unauthenticated, setUnauthenticated] = useState(false);
   // session_key held in a ref for synchronous reads inside async send flows, AND
   // mirrored to state so the page can plumb it to VoicePanel (voice binds it at
@@ -346,6 +371,26 @@ export function useChat(options: UseChatOptions = {}): UseChat {
           // the same way and would silently lose the resume attempt.
           if (!(e instanceof ApiError && e.status === 404)) throw e;
         }
+      }
+      // OPEN-OR-RESUME (#94c). A stale key must not mean "open a new session":
+      // /chat/open is close-prior-then-fresh, so doing that DESTROYS whatever
+      // live session exists — which is how two devices tore one conversation
+      // apart (A's 404 killed B's live session, B 404'd, killed A's; three
+      // opens in 22 seconds in the log). Ask first, and adopt what is there.
+      try {
+        const { session_key: live } = await chatApi.active(instance);
+        if (live) {
+          const { turns } = await chatApi.history(live, instance);
+          setKey(live);
+          writeStored(instance, live);
+          setMessages(turns.map(turnToMessage));
+          setStatus('ready');
+          return;
+        }
+      } catch {
+        // Probing is an OPTIMISATION, never a gate: if it fails we fall
+        // through to the old behaviour rather than leaving the operator with
+        // no chat at all. Worst case is the pre-#94 open.
       }
       await openFresh();
       setStatus('ready');
@@ -422,8 +467,16 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       const onSuccess = () => {
         pendingRef.current = null;
         setRetryable(false);
+        // It went through — nothing left to hand back.
+        setUnsentText(null);
       };
       const onDefinitive = (e: unknown) => {
+        // A vanished session is definitive for THIS send — the key is dead, so
+        // resending it cannot work — but the operator's words are not the
+        // session's property. Hold them so the re-open can hand them back.
+        if (e instanceof ApiError && e.code === 'no_such_session') {
+          setUnsentText(text);
+        }
         pendingRef.current = null;
         setRetryable(false);
         fail(e);
@@ -634,6 +687,8 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     notice,
     unauthenticated,
     retryable,
+    unsentText,
+    clearUnsent: () => setUnsentText(null),
     send,
     retry,
     newChat,

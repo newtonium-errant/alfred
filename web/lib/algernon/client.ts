@@ -2,6 +2,7 @@ import { getJson, postJson } from './http';
 import type {
   ChatHistoryResponse,
   ChatKind,
+  ChatActiveResponse,
   ChatOpenResponse,
   ChatTargetsResponse,
   ChatTurnResponse,
@@ -46,6 +47,12 @@ export interface ChatTurnOptions {
 export const chatApi = {
   targets: (): Promise<ChatTargetsResponse> =>
     getJson<ChatTargetsResponse>('/api/chat/targets'),
+  // #94(c) — READ-ONLY "do I have a live session?". Distinct from open(),
+  // which is close-prior-then-fresh and therefore destroys the answer.
+  active: (instance?: string): Promise<ChatActiveResponse> =>
+    getJson<ChatActiveResponse>(
+      '/api/chat/active' + (instance ? `?instance=${encodeURIComponent(instance)}` : ''),
+    ),
   open: (instance?: string): Promise<ChatOpenResponse> =>
     postJson<ChatOpenResponse>('/api/chat/open', instance ? { instance } : {}),
   turn: (
