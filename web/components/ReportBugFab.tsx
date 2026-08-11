@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from 'react';
 import { useRouter } from 'next/router';
 import { ReportBugModal } from './ReportBugModal';
 import { CAPTURE_IGNORE_ATTR, captureScreen } from '../lib/algernon/screenCapture';
+import { HOME_INSTANCE_NAME } from '../lib/algernon/instance';
 
 /**
  * The discreet floating "Report a bug" button, plus the dialog it opens (#95).
@@ -20,12 +21,27 @@ import { CAPTURE_IGNORE_ATTR, captureScreen } from '../lib/algernon/screenCaptur
  * eight seconds, which is the worst possible behaviour for the control someone
  * reaches for when the app is already misbehaving.
  */
-export function ReportBugFab() {
+export function ReportBugFab({
+  viewedInstance,
+}: {
+  /**
+   * The instance whose surface is on screen (#99) — the /chat switcher's
+   * current selection, threaded down through `Layout`. Omitted on every surface
+   * that has no instance concept of its own, where the reporter is looking at
+   * the home app and the home name is the truthful answer.
+   */
+  viewedInstance?: string;
+} = {}) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   // The route frozen AT OPEN, so navigating afterwards can't change the
   // breadcrumb attached to this report.
   const [openRoute, setOpenRoute] = useState('');
+  // The viewed instance is frozen at open for the SAME reason as the route:
+  // both describe the screen the reporter was looking at when they reached for
+  // the button, and a switcher flipped while the dialog is up must not rewrite
+  // the report's account of where they were.
+  const [openInstance, setOpenInstance] = useState('');
   const [shot, setShot] = useState<Blob | null>(null);
   const [capturing, setCapturing] = useState(false);
   // Focus returns here when the dialog closes (a11y).
@@ -34,13 +50,17 @@ export function ReportBugFab() {
   const handleOpen = useCallback(async () => {
     if (capturing || open) return;
     setOpenRoute(router.asPath);
+    // Falls back to the home name — never to an empty string, which the box
+    // would record as "(unset)" and read as a capture failure rather than as
+    // "this surface has no instance of its own".
+    setOpenInstance(viewedInstance?.trim() || HOME_INSTANCE_NAME);
     setShot(null);
     setCapturing(true);
     setOpen(true);
     const blob = await captureScreen();
     setShot(blob);
     setCapturing(false);
-  }, [capturing, open, router.asPath]);
+  }, [capturing, open, router.asPath, viewedInstance]);
 
   /**
    * Retake. Returns the new blob (or `null` on failure/timeout) and lets the
@@ -89,6 +109,7 @@ export function ReportBugFab() {
         <div {...{ [CAPTURE_IGNORE_ATTR]: '' }}>
           <ReportBugModal
             route={openRoute}
+            viewedInstance={openInstance}
             initialShot={shot}
             capturing={capturing}
             onRetake={handleRetake}

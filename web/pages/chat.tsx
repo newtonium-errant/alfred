@@ -136,7 +136,14 @@ export default function ChatPage() {
       <Head>
         <title>Chat · {INSTANCE_NAME}</title>
       </Head>
-      <Layout onSignOut={() => void handleSignOut()} unreadCount={unread}>
+      {/* `viewedInstance` is the switcher's current selection (#99): a bug
+          report filed while reading Hypatia must RECORD Hypatia. Delivery is
+          unchanged — every report still lands on the home instance. */}
+      <Layout
+        onSignOut={() => void handleSignOut()}
+        unreadCount={unread}
+        viewedInstance={instance}
+      >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h1 className={display}>Chat</h1>

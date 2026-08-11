@@ -43,6 +43,7 @@ function renderModal(over: Partial<React.ComponentProps<typeof ReportBugModal>> 
   const utils = render(
     <ReportBugModal
       route="/chat"
+      viewedInstance="Salem"
       initialShot={null}
       capturing={false}
       onRetake={onRetake}
@@ -222,6 +223,7 @@ describe('ReportBugModal — screenshot', () => {
     rerender(
       <ReportBugModal
         route="/chat"
+        viewedInstance="Salem"
         initialShot={shot('late')}
         capturing={false}
         onRetake={onRetake}
@@ -241,6 +243,7 @@ describe('ReportBugModal — screenshot', () => {
     rerender(
       <ReportBugModal
         route="/chat"
+        viewedInstance="Salem"
         initialShot={shot('two')}
         capturing={false}
         onRetake={onRetake}

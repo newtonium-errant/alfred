@@ -34,6 +34,16 @@ type LayoutProps = {
    * Pass `false` explicitly for a surface that must not carry it.
    */
   showBugReport?: boolean;
+  /**
+   * The instance whose content this surface is currently showing (#99) — passed
+   * by the pages that have an instance switcher, so a bug report filed while
+   * reading another instance RECORDS that instance instead of the build-time
+   * home name. Omitted elsewhere: a surface with no instance concept of its own
+   * is the home app, and the FAB falls back to the home name.
+   *
+   * Metadata only. Delivery of a report is home-only either way.
+   */
+  viewedInstance?: string;
 };
 
 // The app's surfaces. The logo (✦) links to `/`, the home COMPOSER (B3-3); Chat
@@ -61,6 +71,7 @@ export function Layout({
   unreadCount = 0,
   maxWidthClassName = 'max-w-2xl',
   showBugReport,
+  viewedInstance,
 }: LayoutProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   // A single nav item with no sign-out needs no mobile overflow menu.
@@ -165,7 +176,7 @@ export function Layout({
         )}
       </header>
       <main className={cn('mx-auto px-5 py-8', maxWidthClassName)}>{children}</main>
-      {(showBugReport ?? showNav) && <ReportBugFab />}
+      {(showBugReport ?? showNav) && <ReportBugFab viewedInstance={viewedInstance} />}
     </div>
   );
 }

@@ -69,6 +69,21 @@ function capStr(value: unknown, limit = MAX_CONTEXT_STR): string {
 /** The auto-captured breadcrumb context attached to every report. */
 export type BugReportContext = {
   route: string;
+  /**
+   * The instance whose surface the reporter was LOOKING AT — not where the
+   * report is delivered (#99).
+   *
+   * On a surface with an instance switcher (/chat) this is the switcher's
+   * current selection, so a report filed while reading Hypatia says Hypatia.
+   * On every other surface it is the home instance, because that is what the
+   * reporter was actually looking at: a page that only picks a DESTINATION for
+   * something (the /batch target, the /ingest target) is still the home app's
+   * own page, and recording the destination there would misname the screen.
+   *
+   * DELIVERY is home-only regardless (v1) — every report lands in the home
+   * instance's inbox. This field is metadata about the screen, which is exactly
+   * why it must not be read as a routing decision.
+   */
   instance: string;
   user_agent: string;
   viewport_w: number;

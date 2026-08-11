@@ -12,8 +12,8 @@ import {
   type ShotMime,
 } from '../lib/algernon/bugReport';
 import { blobToBase64 } from '../lib/algernon/screenCapture';
+import { HOME_INSTANCE_NAME } from '../lib/algernon/instance';
 
-const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 const APP_VERSION = process.env.NEXT_PUBLIC_COMMIT_SHA || 'dev';
 
 // How long the success confirmation stays up before the dialog closes itself.
@@ -43,6 +43,15 @@ function shotMediaType(blob: Blob | null): ShotMime {
 type ReportBugModalProps = {
   /** Route captured AT OPEN — frozen so a later navigation can't rewrite it. */
   route: string;
+  /**
+   * The instance the reporter was VIEWING, captured at open alongside `route`
+   * (#99). Threaded from the page rather than read from
+   * `NEXT_PUBLIC_INSTANCE_NAME` here: that constant is inlined at BUILD time and
+   * is therefore always the home instance, so a report filed while reading
+   * Hypatia through the switcher recorded "Salem" and sent whoever picked it up
+   * to the wrong instance's logs. See `BugReportContext.instance`.
+   */
+  viewedInstance: string;
   /**
    * The auto-capture of the screen as it looked when the dialog OPENED, taken
    * before the dialog rendered. `null` when the capture failed or is still
@@ -78,6 +87,7 @@ type ReportBugModalProps = {
  */
 export function ReportBugModal({
   route,
+  viewedInstance,
   initialShot,
   capturing,
   onRetake,
@@ -254,7 +264,7 @@ export function ReportBugModal({
           description: bounded,
           context: buildBugReportContext({
             route,
-            instance: INSTANCE_NAME,
+            instance: viewedInstance,
             userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
             viewportW: typeof window !== 'undefined' ? window.innerWidth : 0,
             viewportH: typeof window !== 'undefined' ? window.innerHeight : 0,
@@ -275,7 +285,13 @@ export function ReportBugModal({
       }
       // ILB: a successful submit says so VISIBLY, and names where it landed —
       // "sent" with no destination leaves the reporter unable to check.
-      setFiledTo(payload?.instance || INSTANCE_NAME);
+      //
+      // DELIVERY, not the viewed surface: the box answers with the instance
+      // that actually stored the report, and the fallback is HOME because
+      // delivery is home-only (v1). Naming `viewedInstance` here would tell a
+      // reporter reading Hypatia that their report was filed to Hypatia, which
+      // is the one place it is not.
+      setFiledTo(payload?.instance || HOME_INSTANCE_NAME);
       setSubmitting(false);
       successTimerRef.current = setTimeout(() => onClose(), SUCCESS_DISMISS_MS);
     } catch {
