@@ -889,11 +889,21 @@ _DEBRIS_SKIP_DIRS = frozenset({
 # Every entry is a debt with a name. Removing an entry is the definition of
 # done for its follow-up; adding one needs the same justification these had.
 #
-#   data/canonical_audit.jsonl            transport/config.py  -> #74
 #   data/feed_items.jsonl,  .lock         feed store default   -> #74
 #   data/voice_calibration/events.jsonl   web/config.py:208 +
 #                                         hardcoded fallbacks at
 #                                         routes_voice.py:490,646  -> #74
+#
+# ``data/canonical_audit.jsonl`` WAS here — the transport canonical block's
+# cwd-relative path defaults. #74 batch 1 closed it, and it is the entry that
+# proves the #75 lesson generalises: the leak did NOT come through
+# ``load_from_unified`` at all. Every route-smoke test builds a bare
+# ``TransportConfig(...)``, so the DATACLASS default was the whole bug —
+# anchoring only the loader would have left the file appearing and every pin
+# green. Both halves shipped: the defaults are now empty (= disabled, the
+# contract ``append_audit`` / ``append_proposal`` already had), and the loader
+# derives ``<logging.dir>/canonical_*.jsonl``. The latent sibling
+# ``proposals_path`` went with it.
 #
 # ``data/scribe/scribe/*`` (4 files) WAS here — the scribe config's
 # cwd-relative ``input_dir`` default. #74 batch 1 closed it by deriving the
@@ -923,7 +933,6 @@ _DEBRIS_SKIP_DIRS = frozenset({
 # always derives it) and by constructing the manager ONCE at loop start. The
 # regression pins live in ``tests/mail/test_state_path_anchoring.py``.
 _DEBRIS_ALLOWLIST = frozenset({
-    "data/canonical_audit.jsonl",
     "data/feed_items.jsonl",
     "data/feed_items.lock",
     "data/voice_calibration/events.jsonl",

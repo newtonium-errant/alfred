@@ -112,3 +112,140 @@ def test_scribe_doubling_is_preserved_deliberately(tmp_path) -> None:
 
     cfg = _scribe({"logging": {"dir": str(tmp_path)}})
     assert resolve_candidates_dir(cfg) == tmp_path / "scribe" / "scribe"
+
+
+# ===========================================================================
+# Leaker 2 — transport.canonical.{audit_log_path, proposals_path}
+#            (data/canonical_audit.jsonl)
+# ===========================================================================
+#
+# This one did NOT leak through the load path. The route-smoke tests build a
+# bare ``TransportConfig(...)`` with no canonical block at all, so the leak
+# came from the DATACLASS default — the #75 shape, where anchoring the loader
+# alone would have left the writer aimed at the cwd and every pin still green.
+# Hence two independent obligations, pinned separately below: the dataclass
+# default is EMPTY (= disabled, the contract append_audit/append_proposal
+# already had), and the LOADER derives a real per-instance path.
+
+def _transport(raw: dict) -> object:
+    from alfred.transport.config import load_from_unified
+
+    return load_from_unified(raw)
+
+
+def test_transport_canonical_dataclass_defaults_are_empty() -> None:
+    """The half that actually stopped the leak.
+
+    Mutation check — restore either literal and the route-smoke files write
+    data/canonical_audit.jsonl into the repo tree again.
+    """
+    from alfred.transport.config import CanonicalConfig, TransportConfig
+
+    assert CanonicalConfig().audit_log_path == ""
+    assert CanonicalConfig().proposals_path == ""
+    # And through the parent's default_factory — the exact shape the smoke
+    # tests construct.
+    assert TransportConfig().canonical.audit_log_path == ""
+    assert TransportConfig().canonical.proposals_path == ""
+
+
+def test_transport_empty_path_disables_rather_than_writing_to_cwd() -> None:
+    # The empty default is only safe because both writers treat it as
+    # disabled. Pin that contract — it is what makes "" the right default
+    # rather than a silent cwd write.
+    from alfred.transport.canonical_audit import append_audit
+    from alfred.transport.canonical_proposals import append_proposal
+
+    append_audit("", peer="p", record_type="person", name="x",
+                 requested=[], granted=[], denied=[])
+    append_proposal("", object())  # never dereferenced — returns on the path
+
+
+def test_transport_audit_disabled_is_logged_not_silent() -> None:
+    """Silence is ambiguous: an audit writing nothing must say so once.
+
+    Per ``feedback_intentionally_left_blank.md`` — before this, an empty path
+    was a bare ``return``, so "audit off" and "audit broken" looked identical
+    in a log. Latched once per process, so the latch is reset here.
+    """
+    import structlog
+
+    from alfred.transport import canonical_audit
+
+    canonical_audit._audit_disabled_logged = False
+    try:
+        with structlog.testing.capture_logs() as captured:
+            canonical_audit.append_audit(
+                "", peer="p", record_type="person", name="x",
+                requested=[], granted=[], denied=[])
+            # Second call must NOT re-log — the latch is the anti-spam half.
+            canonical_audit.append_audit(
+                "", peer="p", record_type="person", name="y",
+                requested=[], granted=[], denied=[])
+    finally:
+        canonical_audit._audit_disabled_logged = False
+
+    matches = [c for c in captured
+               if c.get("event") == "transport.canonical.audit_disabled"]
+    assert len(matches) == 1
+    assert matches[0]["reason"] == "empty_audit_log_path"
+
+
+def test_transport_loader_derives_real_paths_when_block_absent() -> None:
+    # A config with NO canonical block must still get working paths — the
+    # pre-#74 behaviour. Building the block unconditionally is what preserves
+    # it; leaving it to default_factory would silently disable the audit.
+    cfg = _transport({"logging": {"dir": _KALLE_DATA_DIR}, "transport": {}})
+    assert cfg.canonical.audit_log_path == f"{_KALLE_DATA_DIR}/canonical_audit.jsonl"
+    assert cfg.canonical.proposals_path == f"{_KALLE_DATA_DIR}/canonical_proposals.jsonl"
+
+
+def test_transport_salem_defaults_are_byte_identical() -> None:
+    # Salem's config sets audit_log_path explicitly to this exact string, and
+    # sets no proposals_path at all — so BOTH must resolve to the old literals.
+    cfg = _transport({"logging": {"dir": _SALEM_DATA_DIR}, "transport": {}})
+    assert cfg.canonical.audit_log_path == "./data/canonical_audit.jsonl"
+    assert cfg.canonical.proposals_path == "./data/canonical_proposals.jsonl"
+
+
+def test_transport_defaults_unchanged_when_no_logging_block() -> None:
+    cfg = _transport({"transport": {}})
+    assert cfg.canonical.audit_log_path == "./data/canonical_audit.jsonl"
+    assert cfg.canonical.proposals_path == "./data/canonical_proposals.jsonl"
+
+
+def test_transport_explicit_paths_win() -> None:
+    cfg = _transport({
+        "logging": {"dir": _KALLE_DATA_DIR},
+        "transport": {"canonical": {
+            "audit_log_path": "/x/audit.jsonl",
+            "proposals_path": "/x/props.jsonl",
+        }},
+    })
+    assert cfg.canonical.audit_log_path == "/x/audit.jsonl"
+    assert cfg.canonical.proposals_path == "/x/props.jsonl"
+
+
+def test_transport_canonical_paths_are_distinct_across_instances() -> None:
+    salem = _transport({"logging": {"dir": _SALEM_DATA_DIR}, "transport": {}})
+    kalle = _transport({"logging": {"dir": _KALLE_DATA_DIR}, "transport": {}})
+    assert salem.canonical.audit_log_path != kalle.canonical.audit_log_path
+    assert salem.canonical.proposals_path != kalle.canonical.proposals_path
+
+
+def test_transport_cli_resolver_matches_the_loader() -> None:
+    # ``resolve_audit_path`` is the CLI's separate read of the same value. If
+    # it kept its own literal the CLI would tail a different file than the
+    # daemon writes — pin the two agree, derived and explicit.
+    from alfred.transport.canonical_audit import resolve_audit_path
+
+    raw = {"logging": {"dir": _KALLE_DATA_DIR}, "transport": {}}
+    assert resolve_audit_path(raw) == _transport(raw).canonical.audit_log_path
+
+    raw_explicit = {
+        "logging": {"dir": _KALLE_DATA_DIR},
+        "transport": {"canonical": {"audit_log_path": "/x/audit.jsonl"}},
+    }
+    assert resolve_audit_path(raw_explicit) == "/x/audit.jsonl"
+    # And the legacy fallback is unchanged for a config with no logging block.
+    assert resolve_audit_path({}) == "./data/canonical_audit.jsonl"

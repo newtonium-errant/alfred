@@ -1,8 +1,10 @@
 """Append-only JSONL audit log for canonical record reads.
 
 Every ``GET /canonical/<type>/<name>`` call appends one line to
-``transport.canonical.audit_log_path`` (default
-``./data/canonical_audit.jsonl``). Line shape:
+``transport.canonical.audit_log_path``. When the config omits the key the
+path is derived per-instance as ``<logging.dir>/canonical_audit.jsonl``
+(#74 — the old cwd-relative literal was one file shared by every co-located
+instance). Line shape:
 
 .. code-block:: json
 
@@ -29,6 +31,13 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .utils import get_logger
+
+log = get_logger(__name__)
+
+# Latch for the audit-disabled notice below — once per process, not per read.
+_audit_disabled_logged = False
 
 
 def append_audit(
@@ -65,8 +74,22 @@ def append_audit(
     conflicting ``peer`` can't corrupt the audit identity.
     """
     if not audit_log_path:
-        # Audit explicitly disabled — skip. Used by tests that don't
-        # care about the audit trail; prod configs always set this.
+        # Audit disabled — skip. The empty path is the DIRECT-CONSTRUCTION
+        # default (#74); every load path derives a real one, so production
+        # never lands here. Latched once per process: an audit that silently
+        # writes nothing is indistinguishable from a broken one, and this is
+        # the line that tells them apart in a log.
+        global _audit_disabled_logged
+        if not _audit_disabled_logged:
+            _audit_disabled_logged = True
+            log.info(
+                "transport.canonical.audit_disabled",
+                reason="empty_audit_log_path",
+                detail="transport.canonical.audit_log_path is empty, so "
+                       "canonical reads are NOT being audited. Expected only "
+                       "for a directly-constructed config (tests); any loaded "
+                       "config derives <logging.dir>/canonical_audit.jsonl.",
+            )
         return
     path = Path(audit_log_path)
     try:
@@ -132,10 +155,28 @@ __all__ = ["append_audit", "read_audit"]
 # the audit path from raw config without instantiating CanonicalConfig.
 def resolve_audit_path(
     raw: dict[str, Any],
-    default: str = "./data/canonical_audit.jsonl",
+    default: str = "",
 ) -> str:
-    """Pull ``transport.canonical.audit_log_path`` out of a raw config dict."""
+    """Pull ``transport.canonical.audit_log_path`` out of a raw config dict.
+
+    When the key is absent the path is DERIVED from the instance's own data
+    dir (``logging.dir``) — the same derivation ``_build_canonical`` applies,
+    so the CLI's view of the audit log can't drift from the daemon's. The old
+    cwd-relative literal made both resolve to one shared file across
+    co-located instances (#74). Salem's ``logging.dir`` is ``./data``, so the
+    derived value is byte-identical to the literal it replaced.
+
+    An explicit ``default`` argument still overrides the derivation, for
+    callers that want their own fallback.
+    """
+    from alfred.common.instance_paths import instance_data_path
+    from .config import CANONICAL_AUDIT_FILENAME
+
     transport = raw.get("transport", {}) or {}
     canonical = transport.get("canonical", {}) or {}
-    path = canonical.get("audit_log_path") or default
+    path = (
+        canonical.get("audit_log_path")
+        or default
+        or instance_data_path(raw, CANONICAL_AUDIT_FILENAME)
+    )
     return os.path.expanduser(str(path))
