@@ -36,6 +36,7 @@ const NAV_LINKS = [
   { href: '/deck', label: 'Deck' },
   { href: '/feed', label: 'Feed' },
   { href: '/ingest', label: 'Ingest' },
+  { href: '/batch', label: 'Scans' },
 ] as const;
 
 // Sticky melon header + centered content container with the warm page wash.

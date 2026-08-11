@@ -252,6 +252,74 @@ export async function callTransportBinary(
   return { status: res.status, body: await parseJsonOrNull(res) };
 }
 
+// --- Bulk scan intake (#83) -------------------------------------------------
+// Its OWN dedicated token, NEVER the chat peer token. The box peer-pins
+// `web_batch` on POST /vault/batch precisely because the chat `web` token and
+// this one can both carry `allowed_clients: [web]` — so reusing the chat token
+// here would be refused by the pin, and reusing THIS one for chat would be an
+// escalation. One token, one door.
+const BATCH_PEER_CLIENT = process.env.ALFRED_WEB_BATCH_PEER_CLIENT || 'web';
+
+function batchToken(): string {
+  const token = process.env.ALFRED_WEB_BATCH_TOKEN;
+  if (!token) {
+    throw new TransportConfigError('ALFRED_WEB_BATCH_TOKEN is not set');
+  }
+  return token;
+}
+
+/** True when this deploy is wired for bulk upload (fail-closed: needs BOTH). */
+export function isBatchConfigured(): boolean {
+  return Boolean(process.env.ALFRED_WEB_TRANSPORT_URL && process.env.ALFRED_WEB_BATCH_TOKEN);
+}
+
+export interface BatchCallOptions {
+  /** The multipart body, relayed VERBATIM. */
+  body: Buffer;
+  /** The inbound Content-Type, including its multipart boundary. */
+  contentType: string;
+  /** Verified display name → X-Alfred-Batch-User (provenance only, never authz). */
+  user?: string;
+}
+
+/**
+ * Relay a multipart batch submission to the box's `POST /vault/batch`.
+ *
+ * A BYTE PIPE, deliberately: the BFF does not parse the multipart body, it
+ * forwards it unchanged with its original Content-Type (boundary and all).
+ * Parsing here would mean a second multipart implementation whose limits could
+ * disagree with the box's, and the box is the authority on those limits — it
+ * has to be, since it is the only layer an attacker cannot skip.
+ *
+ * No `fetchJsonWithTimeout`: a 128 MiB upload legitimately outlasts the
+ * buffered-call budget, which is sized for chat turns. The route is save-only
+ * (no model call), so the box answers as fast as it can write to disk.
+ */
+export async function callTransportBatch(
+  path: string,
+  opts: BatchCallOptions,
+): Promise<TransportResult> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${batchToken()}`,
+    'X-Alfred-Client': BATCH_PEER_CLIENT,
+    Accept: 'application/json',
+    'Content-Type': opts.contentType,
+  };
+  if (opts.user) {
+    headers['X-Alfred-Batch-User'] = opts.user;
+  }
+
+  const res = await fetch(`${baseUrl()}${path}`, {
+    method: 'POST',
+    headers,
+    // Re-wrap so the body is a plain ArrayBuffer view — undici rejects a Node
+    // Buffer subarray that aliases a larger pool buffer.
+    body: new Uint8Array(opts.body),
+  });
+
+  return { status: res.status, body: await parseJsonOrNull(res) };
+}
+
 // --- Cross-instance ingest target resolution (BUILD_DECISIONS §2 / §3) ------
 // Each ingest target has its OWN server-side env pair (NEVER NEXT_PUBLIC_):
 //   ALFRED_WEB_INGEST_<NAME>_URL    — the target transport base URL (loopback)
