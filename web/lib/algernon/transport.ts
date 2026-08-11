@@ -427,6 +427,81 @@ export async function callTransportBatch(
   return { status: res.status, body: await parseJsonOrNull(res) };
 }
 
+// --- In-app bug reporting (#95) ---------------------------------------------
+// Its OWN dedicated token, NEVER the chat / ingest / batch peer token. The box
+// peer-pins `web_bugreport` on POST /vault/bugreport for the same reason every
+// sibling route pins its own: all four tokens can legitimately carry
+// `allowed_clients: [web]`, so `allowed_clients` cannot tell them apart, and a
+// token that opens two doors is a token that opens the wrong one. One token,
+// one door.
+//
+// SINGLE-HOME, like feed and unlike ingest/chat/batch. A bug report is about
+// the app the operator is looking at, and the PWA is one deployment pointed at
+// one home instance — so there is no target to pick and no per-instance env
+// family here. The report records which instance the reporter was VIEWING in
+// its context block; that is metadata about the screen, not a routing decision.
+const BUGREPORT_PEER_CLIENT = process.env.ALFRED_WEB_BUGREPORT_PEER_CLIENT || 'web';
+
+function bugReportToken(): string {
+  const token = process.env.ALFRED_WEB_BUGREPORT_TOKEN;
+  if (!token || !token.trim()) {
+    throw new TransportConfigError('ALFRED_WEB_BUGREPORT_TOKEN is not set');
+  }
+  return token;
+}
+
+/**
+ * True when the home instance is wired to receive bug reports — needs BOTH the
+ * transport URL and the dedicated token.
+ *
+ * The BFF checks this at the top of the submit route and answers 503
+ * `not_configured` when false, so the feature is DEPLOY-INERT: it ships dark
+ * and lights up when the operator adds the token. A SET-but-WRONG token is not
+ * caught here (it looks configured) — the box then 401s `wrong_peer`, which the
+ * BFF relays as an error rather than a silent success.
+ */
+export function isBugReportConfigured(): boolean {
+  const url = process.env.ALFRED_WEB_TRANSPORT_URL;
+  const token = process.env.ALFRED_WEB_BUGREPORT_TOKEN;
+  return Boolean(url && url.trim() && token && token.trim());
+}
+
+export interface BugReportCallOptions {
+  /** The JSON report body. */
+  body: unknown;
+  /** Verified display name → X-Alfred-BugReport-User (provenance only, never authz). */
+  user?: string;
+}
+
+/**
+ * Relay a bug report to the home transport's `POST /vault/bugreport` using the
+ * server-side `web_bugreport` peer token. Buffered + timeout-bounded (a wedged
+ * transport → a clean TransportTimeoutError → the BFF's 504); the browser never
+ * sees the token.
+ */
+export async function callTransportBugReport(
+  path: string,
+  opts: BugReportCallOptions,
+): Promise<TransportResult> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${bugReportToken()}`,
+    'X-Alfred-Client': BUGREPORT_PEER_CLIENT,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  };
+  if (opts.user) {
+    headers['X-Alfred-BugReport-User'] = opts.user;
+  }
+
+  const res = await fetchJsonWithTimeout(`${baseUrl()}${path}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(opts.body),
+  });
+
+  return { status: res.status, body: await parseJsonOrNull(res) };
+}
+
 // --- Cross-instance ingest target resolution (BUILD_DECISIONS §2 / §3) ------
 // Each ingest target has its OWN server-side env pair (NEVER NEXT_PUBLIC_):
 //   ALFRED_WEB_INGEST_<NAME>_URL    — the target transport base URL (loopback)

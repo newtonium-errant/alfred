@@ -457,6 +457,16 @@ transport:
       #   token: "${ALFRED_WEB_BATCH_TOKEN}"
       #   allowed_clients:
       #     - web
+      # In-app bug reports (#95), POST /vault/bugreport. Its OWN dedicated
+      # secret, for the same reason as web_ingest and web_batch: this token and
+      # the chat ``web`` token both carry ``allowed_clients: [web]``, so
+      # allowed_clients cannot tell them apart and the route peer-pins the NAME.
+      # Sharing a token here would let a chat session write into ``inbox/``.
+      # Only present on instances enabling ``transport.bugreport``.
+      # web_bugreport:
+      #   token: "${ALFRED_WEB_BUGREPORT_TOKEN}"
+      #   allowed_clients:
+      #     - web
   state:
     path: "./data/transport_state.json"
     dead_letter_max_age_days: 30
@@ -522,6 +532,30 @@ transport:
   #   max_image_bytes: 5242880   # 5 MiB per image          → image_too_large
   #   max_total_bytes: 134217728 # 128 MiB per batch, TOTAL → batch_too_large
   #   max_instruction_chars: 4000  # resent with EVERY per-image model call
+
+  # In-app bug reporting (#95), ``POST /vault/bugreport``. The PWA's "Report a
+  # bug" button files one report into this instance's ``inbox/``: the reporter's
+  # words as markdown, plus the auto-captured screenshot alongside it. SAVE-ONLY
+  # — no model runs on the route; the curator picks the report up like any other
+  # inbox item.
+  #
+  # Requires the dedicated ``web_bugreport`` peer token above. The route pins
+  # that peer NAME for the same reason ``web_ingest`` and ``web_batch`` do: all
+  # of them can carry ``allowed_clients: [web]``, so allowed_clients cannot tell
+  # them apart, and a shared token would let a chat session write to the vault.
+  #
+  # Default ``enabled: false`` — an un-opted-in instance mounts nothing, and the
+  # PWA's BFF answers 503 ``bugreport_not_configured`` until its own
+  # ``ALFRED_WEB_BUGREPORT_TOKEN`` env matches the token below.
+  #
+  # The screenshot lands in ``inbox/.bugreport-attachments/``. The leading dot
+  # keeps the curator's scan away from it — see #88, where chat screenshots left
+  # where the curator could see them were pushed through ``claude -p`` a second
+  # time. Do not "tidy" that directory into a visible one.
+  # bugreport:
+  #   enabled: true
+  #   max_description_chars: 5000  # the reporter's words → description_too_long
+  #   max_screenshot_bytes: 5242880  # 5 MiB, DECODED     → screenshot_too_large
 
   # Cross-instance recall — the ANSWER side (#20 S1). This instance answers
   # a free-text recall query from an allowed peer by searching ITS OWN vault

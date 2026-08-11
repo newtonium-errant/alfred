@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  ALLOWED_SHOT_MIME,
+  MAX_BUGREPORT_DESCRIPTION_CHARS,
+  MAX_BUGREPORT_SCREENSHOT_BYTES,
+} from './bugReport';
 
 // zod validation at the BFF trust boundary. The browser is untrusted input even
 // behind the session cookie — every BFF route parses its body before relaying to
@@ -634,3 +639,53 @@ export function voiceCancelFrame(turnId?: string): string {
     ...(turnId ? { turn_id: turnId } : {}),
   });
 }
+
+// --- In-app bug reporting (#95) ---------------------------------------------
+// The BFF's edge validation for POST /api/bugreport/submit. Bounds are IMPORTED
+// from `bugReport.ts` rather than re-typed, so the client's textarea cap, this
+// schema and the refusal copy can never disagree with each other — three
+// literals that must match is three chances to drift, and the one that drifts
+// silently refuses reports the box would have accepted.
+//
+// The box re-validates every one of these. This layer exists so an oversize or
+// malformed payload is refused at the edge rather than relayed onward, not
+// because the box trusts it.
+
+export const bugReportBodySchema = z.object({
+  description: z
+    .string()
+    .max(MAX_BUGREPORT_DESCRIPTION_CHARS)
+    .refine((s) => s.trim().length > 0, { message: 'A description is required.' }),
+  context: z.object({
+    route: z.string().max(512).default(''),
+    instance: z.string().max(120).default(''),
+    user_agent: z.string().max(512).default(''),
+    // Non-negative and integral; the client already floors these, and a
+    // negative viewport is a malformed client rather than a small screen.
+    viewport_w: z.number().int().min(0).max(100000).default(0),
+    viewport_h: z.number().int().min(0).max(100000).default(0),
+    app_version: z.string().max(120).default(''),
+    ts: z.string().max(64).default(''),
+  }),
+  // Bounded by the base64-inflated byte cap (4/3 plus padding slack) so an
+  // oversize screenshot is refused HERE rather than buffered onward to the box.
+  screenshot_b64: z
+    .string()
+    .max(Math.ceil((MAX_BUGREPORT_SCREENSHOT_BYTES * 4) / 3) + 4096)
+    .optional(),
+  screenshot_media_type: z.enum(ALLOWED_SHOT_MIME).optional(),
+}).superRefine((val, ctx) => {
+  // A media type with no image, or an image with no media type, is a client
+  // bug — and one that would otherwise be stored with a GUESSED extension.
+  // Refusing the pair outright is better than filing a report whose attachment
+  // has a name that disagrees with its bytes.
+  if (val.screenshot_media_type && !val.screenshot_b64) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['screenshot_b64'],
+      message: 'A screenshot media type was sent without any screenshot data.',
+    });
+  }
+});
+
+export type BugReportBody = z.infer<typeof bugReportBodySchema>;
