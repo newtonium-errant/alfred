@@ -78,7 +78,7 @@ from .voice_session import (
 log = get_logger(__name__)
 
 
-# Defense-in-depth cap on the offer SDP, INSIDE the app's shared 1 MB
+# Defense-in-depth cap on the offer SDP, INSIDE the app's shared 14 MiB
 # client_max_size envelope (real offers are ~2-20 KB). 128 KB.
 MAX_SDP_BYTES = 128 * 1024
 

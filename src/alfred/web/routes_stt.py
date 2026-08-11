@@ -17,14 +17,24 @@ Auth layering (reused unchanged from the chat handlers):
     verified named user from the ``X-Alfred-Session`` token, fail-closed
     401.
 
-The one load-bearing aiohttp detail (verified, aiohttp 3.13.x): the shared
-transport app is built with the DEFAULT ``client_max_size`` of 1 MB
-(``build_app`` passes no override), and ``request.read()`` /
-``request.post()`` / ``request.multipart()`` all enforce it — they would
-413 every voice note. So this handler STREAMS ``request.content`` with its
-OWN byte cap (:data:`MAX_AUDIO_BYTES`), leaving the 1 MB guard on the peer
-JSON routes untouched. Do NOT "fix" this by raising ``client_max_size`` on
-the shared app — that weakens DoS protection on every peer route.
+The one load-bearing aiohttp detail (re-measured 2026-08-11, aiohttp 3.13.5):
+the shared transport app is built with ``client_max_size`` =
+``DEFAULT_TRANSPORT_CLIENT_MAX_BYTES`` (14 MiB) — NOT aiohttp's 1 MiB default,
+which is what ``build_app`` used until #57 raised it. ``request.read()`` and
+``request.post()`` enforce that ceiling, so either would 413 a voice note above
+it. This handler therefore STREAMS ``request.content`` with its OWN byte cap
+(:data:`MAX_AUDIO_BYTES` = 25 MiB, above the app ceiling), leaving the 14 MiB
+guard on the peer JSON routes untouched. Do NOT "fix" this by raising
+``client_max_size`` on the shared app — that weakens DoS protection on every
+peer route.
+
+``request.multipart()`` is the EXCEPTION and does NOT enforce
+``client_max_size``: it returns a streaming reader whose ``read_chunk()`` never
+consults the ceiling. Measured directly — a 200 KiB multipart body read through
+a 1 KiB ``client_max_size`` returns 200, while ``request.post()`` and
+``request.read()`` both 413 on the same app. The consequence for any multipart
+route on this app is that it owns its refusals ENTIRELY: nothing below it will
+refuse an oversize upload on its behalf, so its own caps are the only caps.
 
 Per the intentionally-left-blank + self-correcting standards, the response
 surfaces ``low_confidence`` / ``empty`` / ``degraded`` / ``fell_back`` so
@@ -233,9 +243,10 @@ async def _handle_stt_transcribe(request: web.Request) -> web.StreamResponse:
             {"error": "unsupported_media_type"}, status=415,
         )
 
-    # Stream the body with our OWN cap — NOT request.read()/post()/
-    # multipart() (those enforce the app's 1 MB client_max_size). See the
-    # module docstring for the aiohttp rationale.
+    # Stream the body with our OWN cap — NOT request.read()/post(), which
+    # enforce the app's 14 MiB client_max_size. (request.multipart() would
+    # NOT enforce it, but this route takes a raw body, not a multipart one.)
+    # See the module docstring for the measured aiohttp rationale.
     audio = bytearray()
     async for chunk in request.content.iter_chunked(_CHUNK_BYTES):
         audio.extend(chunk)
