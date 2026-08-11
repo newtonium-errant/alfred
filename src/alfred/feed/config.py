@@ -27,13 +27,15 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from alfred.common.instance_paths import LEGACY_DATA_DIR, configured_logging_dir
+
 from .store import DEFAULT_COMPACT_THRESHOLD_BYTES
 
 # The default feed store filename, placed inside the resolved instance data dir.
 DEFAULT_STORE_FILENAME = "feed_items.jsonl"
 # The legacy cwd-relative default — also the fallback data dir when a config
 # carries neither ``logging.dir`` nor a ``daily_sync`` state path.
-_LEGACY_DATA_DIR = "./data"
+_LEGACY_DATA_DIR = LEGACY_DATA_DIR
 
 
 @dataclass
@@ -53,12 +55,16 @@ def _instance_data_dir(raw: dict[str, Any]) -> str:
     directory of ``daily_sync.state.path`` (the primary feed producer's own
     per-instance state); finally ``./data`` (legacy cwd-relative — keeps Salem
     unchanged and covers minimal test configs).
+
+    The ``logging.dir`` read is the shared
+    :func:`alfred.common.instance_paths.configured_logging_dir`; the
+    ``daily_sync`` rung between it and the legacy fallback is feed-specific
+    (the daily-sync producer is the feed's primary writer), so this stays a
+    feed-local function that layers that rung onto the shared read.
     """
-    logging_block = raw.get("logging")
-    if isinstance(logging_block, dict):
-        d = logging_block.get("dir")
-        if isinstance(d, str) and d.strip():
-            return d.strip()
+    d = configured_logging_dir(raw)
+    if d:
+        return d
     ds = raw.get("daily_sync")
     if isinstance(ds, dict):
         state = ds.get("state")
