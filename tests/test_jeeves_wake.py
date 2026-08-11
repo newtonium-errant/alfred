@@ -230,3 +230,96 @@ def test_the_model_frame_size_is_openwakewords_native_stride():
     assert AudioFormat().duration_of(
         wake.OWW_FRAME_SAMPLES * AudioFormat().frame_bytes,
     ) == pytest.approx(0.08)
+
+
+def test_openwakeword_model_that_will_not_load_fails_LOUD(monkeypatch):
+    """The THIRD refusal — a model file the runtime cannot open (#98 Part B).
+
+    RAISE-SITE CENSUS, by reading ``OpenWakeWordDetector.__init__`` rather than
+    by exercising it: there are THREE ``raise JeevesWakeError`` sites — empty
+    ``model_path``, openWakeWord not importable, and this one, ``Model()``
+    itself raising. The first two have had pins since #81; this had none,
+    because it sits AFTER the ``import openwakeword`` and so is unreachable in
+    a venv without the dependency. A probe run in that venv reports two and
+    looks complete: the probe only ever gives the numerator.
+
+    WHY IT MATTERS NOW. The Termux spike's likeliest hardware failure after
+    "openWakeWord will not install" is "it installed, but the runtime cannot
+    open this model" — an ``.onnx`` file against a tflite-only runtime, or the
+    reverse. The operator will paste that message back, and everything we then
+    conclude rests on it.
+
+    So the assertion is on the ``{exc}`` INTERPOLATION, not on the wrapper
+    prose. The wrapper says "failed to load"; the underlying runtime error is
+    the part that says WHICH incompatibility it was. A message that dropped it
+    would still read like a sensible error and would be diagnostically empty.
+    """
+    import sys
+    import types
+
+    class _WillNotLoad:
+        def __init__(self, **kwargs):
+            raise RuntimeError(
+                "Unsupported model format: .tflite requires tflite-runtime"
+            )
+
+    pkg = types.ModuleType("openwakeword")
+    mod = types.ModuleType("openwakeword.model")
+    mod.Model = _WillNotLoad  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openwakeword", pkg)
+    monkeypatch.setitem(sys.modules, "openwakeword.model", mod)
+
+    with pytest.raises(wake.JeevesWakeError) as exc:
+        wake.build_detector(
+            JeevesWakeConfig(
+                provider=WAKE_PROVIDER_OPENWAKEWORD,
+                model_path="/opt/jeeves/models/jeeves.tflite"),
+            FMT,
+        )
+
+    msg = str(exc.value)
+    assert "failed to load the model" in msg
+    # Names WHICH file — a device may carry several.
+    assert "/opt/jeeves/models/jeeves.tflite" in msg
+    # THE LOAD-BEARING ONE: the runtime's own words survive into the message.
+    assert "tflite-runtime" in msg
+    assert "Unsupported model format" in msg
+
+
+def test_the_load_failure_message_carries_the_cause_not_just_a_category(
+    monkeypatch,
+):
+    """Positive control for the pin above: a DIFFERENT underlying cause must
+    produce a DIFFERENT message.
+
+    Without this, ``"tflite-runtime" in msg`` could pass against an
+    implementation that hard-coded that phrase into the wrapper — which is
+    exactly the failure mode of asserting on a string that the code under test
+    could plausibly contain for the wrong reason.
+    """
+    import sys
+    import types
+
+    class _DifferentFailure:
+        def __init__(self, **kwargs):
+            raise OSError("No such file or directory")
+
+    pkg = types.ModuleType("openwakeword")
+    mod = types.ModuleType("openwakeword.model")
+    mod.Model = _DifferentFailure  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openwakeword", pkg)
+    monkeypatch.setitem(sys.modules, "openwakeword.model", mod)
+
+    with pytest.raises(wake.JeevesWakeError) as exc:
+        wake.build_detector(
+            JeevesWakeConfig(
+                provider=WAKE_PROVIDER_OPENWAKEWORD, model_path="/gone.onnx"),
+            FMT,
+        )
+
+    msg = str(exc.value)
+    assert "No such file or directory" in msg
+    assert "tflite-runtime" not in msg, (
+        "the cause is being invented by the wrapper, not carried from the "
+        "runtime — the previous test would then be vacuous"
+    )
