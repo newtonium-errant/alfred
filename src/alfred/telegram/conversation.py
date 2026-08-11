@@ -1517,10 +1517,102 @@ _TOOL_TO_OP = {
 MAX_TOOL_ITERATIONS = 10
 
 
-def _messages_for_api(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+# The number of image blocks a single outgoing request may carry (#82).
+#
+# Anthropic applies a STRICTER per-image dimension limit — 2000px on either
+# edge — once a request contains more than 20 image (and, on some platforms,
+# document) blocks. Beyond it the request is rejected with an
+# `invalid_request_error` naming "many-image requests". Because every chat turn
+# resends the whole transcript, one oversized image that lands in history makes
+# that 400 repeat on EVERY subsequent turn: the session wedges, and retrying is
+# guaranteed to fail because the offending image is in the history being
+# resent. That is the 2026-08-11 VERA incident (~24 claims screenshots).
+#
+# 12 rather than 20: it keeps a wide margin under the threshold (the count is
+# shared with document blocks on some platforms), and it caps unbounded payload
+# growth in image-heavy sessions independently of the dimension question.
+# Downscaling at intake is the other half of the fix — either alone prevents
+# the wedge, which is why both ship.
+MAX_HISTORY_IMAGE_BLOCKS = 12
+
+
+def _trim_history_images(
+    messages: list[dict[str, Any]],
+    max_images: int = MAX_HISTORY_IMAGE_BLOCKS,
+) -> tuple[list[dict[str, Any]], int]:
+    """Replace all but the newest ``max_images`` image blocks with placeholders.
+
+    The NEWEST images are kept — in a working session the operator is asking
+    about what they just attached, so recency is the right thing to preserve.
+    Older ones become a text block that says what used to be there, keeping the
+    conversation coherent: the model can still see that an image was discussed
+    and reason about its own earlier reply about it, rather than the turn simply
+    losing content and reading as a non-sequitur.
+
+    Placeholders are numbered in CHRONOLOGICAL order (image 1 is the oldest) so
+    the number matches the order the operator sent them, not the internal
+    replacement order.
+
+    Returns ``(messages, replaced_count)``. The input list and its message
+    dicts are not mutated — content lists are rebuilt.
+    """
+    if max_images < 0:
+        return messages, 0
+
+    positions: list[tuple[int, int]] = []
+    for m_idx, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for b_idx, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "image":
+                positions.append((m_idx, b_idx))
+
+    total = len(positions)
+    if total <= max_images:
+        return messages, 0
+
+    # Keep the tail; everything before it is replaced.
+    replace = positions[: total - max_images] if max_images else positions
+    replace_set = set(replace)
+
+    out: list[dict[str, Any]] = []
+    for m_idx, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        rebuilt: list[Any] = []
+        touched = False
+        for b_idx, block in enumerate(content):
+            if (m_idx, b_idx) in replace_set:
+                ordinal = positions.index((m_idx, b_idx)) + 1
+                rebuilt.append({
+                    "type": "text",
+                    "text": (
+                        f"[image {ordinal} of {total} — sent earlier in this "
+                        f"conversation, no longer attached]"
+                    ),
+                })
+                touched = True
+            else:
+                rebuilt.append(block)
+        if touched:
+            out.append({**message, "content": rebuilt})
+        else:
+            out.append(message)
+    return out, len(replace)
+
+
+def _messages_for_api(
+    transcript: list[dict[str, Any]],
+    max_images: int = MAX_HISTORY_IMAGE_BLOCKS,
+) -> list[dict[str, Any]]:
     """Strip metadata-only keys + heal dangling tool_use blocks before API send.
 
-    Two responsibilities:
+    Three responsibilities (the third, image trimming, is ``max_images`` —
+    default-ON, so a caller that forgets to thread it is still protected; see
+    :data:`MAX_HISTORY_IMAGE_BLOCKS`):
 
     1. **Metadata strip** (wk2): stamps like ``_ts`` / ``_kind`` are
        persisted to the transcript for session-record rendering but the
@@ -1574,6 +1666,17 @@ def _messages_for_api(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 for b in content
             ]
         stripped.append(clean)
+    stripped, replaced = _trim_history_images(stripped, max_images)
+    if replaced:
+        # Per feedback_intentionally_left_blank.md: dropping content from a
+        # request is exactly the kind of silent change an operator must be able
+        # to see — "why did it forget the first screenshot?" has an answer here.
+        log.info(
+            "conversation.history_images_trimmed",
+            replaced=replaced,
+            kept=max_images,
+            reason="many_image_request_guard",
+        )
     return _heal_dangling_tool_use(stripped)
 
 

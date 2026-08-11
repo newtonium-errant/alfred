@@ -202,6 +202,15 @@ export interface UseChat {
   refreshFromHistory: () => Promise<boolean>;
 }
 
+// Floor copy for `image_too_large` when the response carried no detail. Kept
+// next to the switch that uses it, and deliberately says the same thing the box
+// classifier says — if these ever disagree, the box wins (it is what `detail`
+// carries). Exported so usePlayerAsk shares the one literal.
+export const IMAGE_TOO_LARGE_FALLBACK =
+  'An image earlier in this conversation is too large for a chat with this ' +
+  'many images. Retrying won’t help — start a new chat and re-attach ' +
+  'the images you still need.';
+
 function friendlyError(e: unknown): string {
   if (e instanceof ApiError) {
     switch (e.code) {
@@ -213,6 +222,14 @@ function friendlyError(e: unknown): string {
         return 'That conversation has ended. Start a new chat to continue.';
       case 'engine_error':
         return 'The assistant hit a snag answering that. Try again in a moment.';
+      case 'image_too_large':
+        // Deterministic 400, NOT retryable (#82): an oversized image already in
+        // the conversation history fails the same way on every resend, so the
+        // "try again in a moment" copy above is exactly wrong here. The box
+        // classifier owns the wording and ships it in `detail` — one source of
+        // truth across this switch, usePlayerAsk, and the Telegram reply. The
+        // literal is only the floor for a response that lost its detail.
+        return e.detail || IMAGE_TOO_LARGE_FALLBACK;
       case 'transport_unreachable':
       case 'network_error':
         return "Can't reach the assistant right now. Try again shortly.";

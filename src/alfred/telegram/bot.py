@@ -59,6 +59,7 @@ from . import (
     vision,
     voice_train,
 )
+from .api_errors import classify_engine_error
 from .config import TalkerConfig
 from .session import (
     Session,
@@ -6030,13 +6031,20 @@ async def handle_message(
                 user_name=user_name,
             )
         except anthropic.APIError as exc:
+            # Telegram wedges the same way the web chat does — its photos are
+            # pre-compressed, but history still accumulates across turns, so a
+            # deterministic 400 repeats forever. Same classifier, same rule:
+            # never say "try again" for a failure that retrying cannot clear.
+            classified = classify_engine_error(exc)
             log.warning(
                 "talker.bot.api_error",
                 chat_id=chat_id,
                 error=str(exc),
+                classified_as=classified.code if classified else None,
             )
             await update.message.reply_text(
-                "Sorry — I hit an API error. Try again in a moment?"
+                classified.message if classified is not None
+                else "Sorry — I hit an API error. Try again in a moment?"
             )
             return
         except transcribe.TranscribeError as exc:
