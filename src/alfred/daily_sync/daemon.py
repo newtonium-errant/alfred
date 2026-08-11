@@ -39,6 +39,7 @@ from alfred.common.schedule import (
 from . import (
     attribution_section,
     canonical_proposals_section,
+    capture_close_section,
     contracts_awaiting_section,
     demotion_section,
     email_section,
@@ -138,6 +139,7 @@ def _build_state_payload(
     friction_items: list[Any] | None = None,
     routine_match_items: list[Any] | None = None,
     demotion_items: list[Any] | None = None,
+    capture_close_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the per-fire batch payload persisted to the state file.
 
@@ -155,8 +157,11 @@ def _build_state_payload(
     routine-match review batch — confirm/reject routes a verdict into the
     learned glossary corpus. ``demotion_items`` (#72) is the parallel
     attribution-tier demotion-proposal batch — confirm writes the persisted tier
-    override, reject starts the cooldown. The reply parser reads every list to
-    resolve item numbers against a Telegram reply.
+    override, reject starts the cooldown. ``capture_close_items`` (#64) is the
+    parallel capture-born propose-close batch — confirm marks the task done and
+    writes a POSITIVE corpus row, reject writes a NEGATIVE one and starts the
+    per-task cooldown. The reply parser reads every list to resolve item
+    numbers against a Telegram reply.
     """
     payload: dict[str, Any] = {
         "date": today_iso,
@@ -191,6 +196,10 @@ def _build_state_payload(
     if demotion_items:
         payload["demotion_items"] = [
             item.to_dict() for item in demotion_items if hasattr(item, "to_dict")
+        ]
+    if capture_close_items:
+        payload["capture_close_items"] = [
+            item.to_dict() for item in capture_close_items if hasattr(item, "to_dict")
         ]
     return payload
 
@@ -256,6 +265,14 @@ async def fire_once(
     # config block itself, so no set_* call. Dormant on a healthy instance: it
     # renders nothing until the trigger raises a proposal.
     demotion_section.register()
+    # #64 — the capture-born propose-close section. Priority 26: below
+    # attribution(25) with the other propose-then-approve items, adjacent to
+    # routine_match(27), the other learned-matcher card. Needs the vault (it
+    # scans open capture-born tasks against records that followed them), so
+    # unlike demotion it takes a set_vault_path. Dormant unless the instance
+    # opts in via daily_sync.capture_close.enabled.
+    capture_close_section.set_vault_path(vault_path)
+    capture_close_section.register()
     # contracts_awaiting_section reads the contracts store itself (the
     # store path lives under the contracts: config block), like
     # canonical_proposals. Priority 16 — right after canonical proposals;
@@ -363,6 +380,7 @@ async def fire_once(
     attribution_items = attribution_section.consume_last_batch()
     proposal_items = canonical_proposals_section.consume_last_batch()
     demotion_items = demotion_section.consume_last_batch()
+    capture_close_items = capture_close_section.consume_last_batch()
     pending_items = pending_items_section.consume_last_batch()
     radar_items = radar_section.consume_last_batch()
     friction_items = friction_section.consume_last_batch()
@@ -376,6 +394,7 @@ async def fire_once(
         attribution_items_count=len(attribution_items),
         proposal_items_count=len(proposal_items),
         demotion_items_count=len(demotion_items),
+        capture_close_items_count=len(capture_close_items),
         pending_items_count=len(pending_items),
         radar_items_count=len(radar_items),
         friction_items_count=len(friction_items),
@@ -421,7 +440,7 @@ async def fire_once(
     if (
         items or attribution_items or proposal_items
         or pending_items or radar_items or friction_items
-        or routine_match_items or demotion_items
+        or routine_match_items or demotion_items or capture_close_items
     ) and message_ids:
         state["last_batch"] = _build_state_payload(
             today_iso,
@@ -434,6 +453,7 @@ async def fire_once(
             friction_items=friction_items,
             routine_match_items=routine_match_items,
             demotion_items=demotion_items,
+            capture_close_items=capture_close_items,
         )
     state["last_fired_date"] = today_iso
     # Clear-on-success: reaching this save point means the fire
@@ -498,6 +518,7 @@ async def fire_once(
         "attribution_items_count": len(attribution_items),
         "proposal_items_count": len(proposal_items),
         "demotion_items_count": len(demotion_items),
+        "capture_close_items_count": len(capture_close_items),
         "pending_items_count": len(pending_items),
         "radar_items_count": len(radar_items),
         "friction_items_count": len(friction_items),
