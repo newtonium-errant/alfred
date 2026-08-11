@@ -76,6 +76,35 @@ export function friendlyError(e: unknown): string {
         return 'A title and body are both required.';
       case 'invalid_request':
         return 'Please check the form and try again.';
+      // #68 — three codes the transport really emits on this route that used to
+      // land on the generic message. Each names its own cause, for the reason
+      // the PDF block above states: a refusal the operator cannot act on is the
+      // operator-facing form of silence.
+      case 'invalid_json':
+        // The BODY didn't parse at the instance. Nothing the operator typed
+        // caused it — the form serialises its own payload — so the copy says
+        // so rather than sending them to re-read a field. Distinct from
+        // `invalid_base64`, which is a file that arrived damaged; this is a
+        // request that arrived unreadable.
+        return "That request didn't reach the instance in a form it could read. Try again — if it keeps happening that's a bug, not something you did.";
+      case 'title_too_long':
+        // Deliberately states NO number. The transport sends the real limit as
+        // `max_chars`, but ApiError carries only status/code/detail, so a
+        // figure here would be a second copy of a constant this layer cannot
+        // read — wrong the day the box changes it, and wrong silently.
+        return 'That title is too long — shorten it and try again.';
+      case 'wrong_peer':
+        // The security-relevant one, and the advice is the opposite of the
+        // obvious one. The browser never supplies the peer token: `web_ingest`
+        // is the BFF's own SERVER-side credential, so this refusal can only
+        // mean that token is missing or wrong at the server. Telling the
+        // operator to sign in again would send them through a logout that
+        // cannot fix it — the same trap the brief routes avoid by mapping this
+        // to a 502 rather than relaying a bare 401 (see bffError.ts).
+        //
+        // Says WHAT was refused and WHAT WON'T HELP, and names no token, peer
+        // or check — an attacker learns nothing about which credential failed.
+        return "That instance refused the request for identity reasons. That's a configuration problem on the server, not your sign-in — signing in again won't change it.";
       case 'vault_not_configured':
         return "That instance isn't set up to receive documents yet.";
       case 'ingest_failed':

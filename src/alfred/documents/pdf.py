@@ -210,10 +210,29 @@ def extract_pdf_text(
         # Its own failure mode: a scanned, image-only PDF. Text extraction
         # cannot recover here and — operator-ruled 2026-08-07 — does not fall
         # back to anything. The wording promises no future capability.
+        #
+        # #68 — realigned to the web copy, which is the voice reference for this
+        # refusal. The old text said the file "needs OCR, which isn't enabled",
+        # and "isn't enabled" is a promise wearing a denial: it names a
+        # capability and implies a switch someone could flip. #67 (vision for
+        # scanned PDFs) is DEFERRED AND UNRULED, so that sentence was
+        # advertising an outcome nobody has approved.
+        #
+        # This message is operator-facing on BOTH paths — the talker replies
+        # with it verbatim ("sorry, couldn't read your pdf file — {exc}."), and
+        # the ingest route relays it as the error `detail`. Nothing MATCHES on
+        # it: routing is by ``reason`` (``_PDF_REASON_STATUS`` keys off
+        # ``exc.reason``), verified before this edit, so the words are free to
+        # change and the failure shape is not.
+        #
+        # Stays distinct from its siblings — docx says "image-only or embedded
+        # objects", text says "empty after decode", csv says "no rows" — because
+        # the whole point of per-kind messages is that the operator can tell
+        # which one he hit.
         log.info(f"{log_event_prefix}.empty_extraction", reason=REASON_NO_TEXT_LAYER)
         raise DocumentExtractError(
-            "No text could be extracted from this PDF "
-            "(scanned image-only PDFs need OCR, which isn't enabled)",
+            "No selectable text in this PDF, so it looks like a scan or a "
+            "photo. Try a version saved as text, or paste the text in yourself",
             reason=REASON_NO_TEXT_LAYER,
         )
 
