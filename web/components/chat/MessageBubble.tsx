@@ -1,3 +1,4 @@
+import { FencedText } from '../markdown/FencedText';
 import { cn, formatMessageTime } from '../../lib/utils';
 import type { ChatRole } from '../../lib/algernon/types';
 
@@ -24,13 +25,21 @@ export function MessageBubble({
     >
       <div
         className={cn(
-          'max-w-[85%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-base',
+          'max-w-[85%] break-words rounded-2xl px-4 py-2.5 text-base',
           isUser
             ? 'bg-honeydew-500 text-white'
             : 'border border-honeydew-200 bg-cream text-honeydew-900'
         )}
       >
-        {text}
+        {/* #85: a ```csv block in a reply becomes downloadable. The pre-wrap
+            moved from this container onto the text segments so a fence can
+            render its own panel; unfenced messages emit the same single
+            pre-wrap block as before. */}
+        <FencedText
+          text={text}
+          nameHint={`message-${role}`}
+          className="whitespace-pre-wrap break-words"
+        />
         {time && (
           <time
             dateTime={ts}

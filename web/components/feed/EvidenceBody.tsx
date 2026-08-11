@@ -1,3 +1,4 @@
+import { FencedText } from '../markdown/FencedText';
 import { evidenceBody, evidenceExternalLink, isEmailEvidence } from '../../lib/algernon/feedEvidence';
 
 // Renders an item's evidence `body` as readable multiline PROSE (paragraph flow,
@@ -23,9 +24,15 @@ export function EvidenceBody({ evidence }: { evidence: unknown }) {
   return (
     <div data-testid="evidence-body" className="mt-2">
       {body && (
-        <p className="max-h-64 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-honeydew-200 bg-honeydew-50 px-3 py-2 text-xs leading-relaxed text-honeydew-700">
-          {body.text}
-        </p>
+        // #85: a fenced block in digest / email evidence gets a download
+        // button. Escaping is unchanged — see FencedText's docstring.
+        <div className="max-h-64 overflow-y-auto rounded-lg border border-honeydew-200 bg-honeydew-50 px-3 py-2">
+          <FencedText
+            text={body.text}
+            nameHint="evidence"
+            className="whitespace-pre-wrap break-words text-xs leading-relaxed text-honeydew-700"
+          />
+        </div>
       )}
       {body?.truncated && (
         <p data-testid="evidence-truncated" className="mt-1 text-[11px] italic text-honeydew-600/80">
