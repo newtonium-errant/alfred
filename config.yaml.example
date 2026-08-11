@@ -425,6 +425,16 @@ transport:
       #   token: "${ALFRED_WEB_INGEST_TOKEN}"
       #   allowed_clients:
       #     - web
+      # Bulk scan intake (#83), POST /vault/batch. Its OWN dedicated secret,
+      # for the same reason web_ingest has one: this token and the chat
+      # ``web`` token both carry ``allowed_clients: [web]``, so
+      # allowed_clients cannot tell them apart and the route peer-pins the
+      # NAME. Sharing a token here would let a chat session queue paid
+      # vision work. Only present on instances enabling ``transport.batch``.
+      # web_batch:
+      #   token: "${ALFRED_WEB_BATCH_TOKEN}"
+      #   allowed_clients:
+      #     - web
   state:
     path: "./data/transport_state.json"
     dead_letter_max_age_days: 30
@@ -443,6 +453,28 @@ transport:
   #   # types: [document, note, source]   # optional per-instance NARROWING
   #   #   of the universal {document, note, source} set; can only narrow,
   #   #   never widen (the web_ingest scope gate is the hard ceiling).
+
+  # Bulk scan intake (#83). Opt-in route ``POST /vault/batch`` that SAVES a
+  # set of scans plus one instruction and answers with a batch id — it looks
+  # at no image itself. Extraction is the ``batch_image`` drip campaign's
+  # job, one scan per item, budgeted and resumable, so a thirty-scan batch
+  # never depends on one long-lived HTTP request.
+  #
+  # Needs its own ``web_batch`` peer token above (NOT the chat ``web`` one:
+  # the route peer-pins ``web_batch``, so a chat token is refused). Needs
+  # ``drip.campaigns.batch_image`` enabled to actually process anything —
+  # without it the scans are saved and the record sits at 0 of N.
+  #
+  # The three caps are separate facts with separate remedies, and the route
+  # enforces all three itself: aiohttp's ``client_max_size`` does NOT apply
+  # to streamed multipart bodies (measured), so nothing below the route will
+  # refuse an oversize upload on its behalf.
+  # batch:
+  #   enabled: true
+  #   max_images: 60             # per batch, by COUNT      → too_many_images
+  #   max_image_bytes: 5242880   # 5 MiB per image          → image_too_large
+  #   max_total_bytes: 134217728 # 128 MiB per batch, TOTAL → batch_too_large
+  #   max_instruction_chars: 4000  # resent with EVERY per-image model call
 
   # Cross-instance recall — the ANSWER side (#20 S1). This instance answers
   # a free-text recall query from an allowed peer by searching ITS OWN vault

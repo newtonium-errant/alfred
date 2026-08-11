@@ -622,6 +622,54 @@ class IngestConfig:
     types: list[str] = field(default_factory=list)
 
 
+# --- Bulk scan intake (#83, 2026-08-11) -------------------------------------
+
+# The three caps on ``POST /vault/batch``. They are DEFAULTS, not values — an
+# instance's YAML always wins — and they live here so a config that omits them
+# still gets the considered numbers rather than a handler-side accident.
+#
+# All three are enforced by the ROUTE, because nothing else will. Measured on
+# aiohttp 3.13.5: ``request.multipart()`` does not consult ``client_max_size``,
+# so the app's 14 MiB ceiling — which refuses an oversize JSON ingest before any
+# handler runs — never fires on a streamed multipart body. See
+# ``transport/routes_batch.py``.
+#
+# They are also three SEPARATE facts with three separate remedies, which is why
+# they are three constants and three error codes rather than one budget:
+#   * per-image — "send a smaller scan"
+#   * count     — "send fewer scans"
+#   * total     — "split the batch"
+# 60 x 5 MiB is 300 MiB, so on heavy scans the total cap binds first and on
+# light ones the count cap does. Both bind in practice; neither is decorative.
+DEFAULT_BATCH_MAX_IMAGES: int = 60
+DEFAULT_BATCH_MAX_IMAGE_BYTES: int = 5 * 1024 * 1024        # 5 MiB per image
+DEFAULT_BATCH_MAX_TOTAL_BYTES: int = 128 * 1024 * 1024      # 128 MiB per batch
+
+# The instruction applies to every scan in the batch, so it is prose, not a
+# document. Bounded because it is resent with EVERY per-image model call — an
+# unbounded instruction multiplies its own cost by the batch size.
+DEFAULT_BATCH_MAX_INSTRUCTION_CHARS: int = 4000
+
+
+@dataclass
+class BatchConfig:
+    """Bulk scan intake route config (#83).
+
+    The opt-in ``POST /vault/batch`` route. Default ``enabled=False`` — an
+    un-opted-in instance never mounts it, so its transport server stays
+    byte-unchanged (the same posture as ``ingest`` above).
+
+    Every cap is config-backed rather than a code literal so that changing what
+    an operator may upload is a YAML edit, not a deploy.
+    """
+
+    enabled: bool = False
+    max_images: int = DEFAULT_BATCH_MAX_IMAGES
+    max_image_bytes: int = DEFAULT_BATCH_MAX_IMAGE_BYTES
+    max_total_bytes: int = DEFAULT_BATCH_MAX_TOTAL_BYTES
+    max_instruction_chars: int = DEFAULT_BATCH_MAX_INSTRUCTION_CHARS
+
+
 # --- Cross-instance recall (#20 S1, 2026-08-01) -----------------------------
 
 # Hard ceiling on how many bounded matches one recall answer may return,
@@ -759,6 +807,7 @@ class TransportConfig:
     state: StateConfig = field(default_factory=StateConfig)
     canonical: CanonicalConfig = field(default_factory=CanonicalConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    batch: BatchConfig = field(default_factory=BatchConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
     peers: dict[str, PeerEntry] = field(default_factory=dict)
 
@@ -1002,6 +1051,38 @@ def _build_ingest(data: dict[str, Any]) -> IngestConfig:
     )
 
 
+def _build_batch(data: dict[str, Any]) -> BatchConfig:
+    """Build the optional ``batch`` block (defaults = disabled, ruled caps).
+
+    Every cap is int-coerced with the dataclass default as a fallback and
+    floored at 1. A zero or negative cap would otherwise wedge the route into
+    refusing every submission — a config typo that presents as "batch upload is
+    broken" rather than as a bad number.
+    """
+    if not isinstance(data, dict):
+        return BatchConfig()
+
+    def _positive(key: str, default: int) -> int:
+        try:
+            return max(1, int(data.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    return BatchConfig(
+        enabled=bool(data.get("enabled", False)),
+        max_images=_positive("max_images", DEFAULT_BATCH_MAX_IMAGES),
+        max_image_bytes=_positive(
+            "max_image_bytes", DEFAULT_BATCH_MAX_IMAGE_BYTES,
+        ),
+        max_total_bytes=_positive(
+            "max_total_bytes", DEFAULT_BATCH_MAX_TOTAL_BYTES,
+        ),
+        max_instruction_chars=_positive(
+            "max_instruction_chars", DEFAULT_BATCH_MAX_INSTRUCTION_CHARS,
+        ),
+    )
+
+
 def _build_recall(
     data: Any, *, instance_name: str = "", instance_scope: str = "",
 ) -> RecallConfig:
@@ -1232,6 +1313,8 @@ def _build(
         )
         if "ingest" in data and isinstance(data["ingest"], dict):
             kwargs["ingest"] = _build_ingest(data["ingest"])
+        if "batch" in data and isinstance(data["batch"], dict):
+            kwargs["batch"] = _build_batch(data["batch"])
         # ``recall`` fence must fire even when the section is absent-but-
         # the-instance-is-STAY-C? No — a STAY-C instance with NO recall
         # section legitimately answers nothing; the fence only fires on

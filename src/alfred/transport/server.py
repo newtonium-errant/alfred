@@ -41,6 +41,10 @@ from typing import Any
 from aiohttp import web
 
 from .config import (
+    DEFAULT_BATCH_MAX_IMAGE_BYTES,
+    DEFAULT_BATCH_MAX_IMAGES,
+    DEFAULT_BATCH_MAX_INSTRUCTION_CHARS,
+    DEFAULT_BATCH_MAX_TOTAL_BYTES,
     DEFAULT_INGEST_MAX_BODY_CHARS,
     DEFAULT_TRANSPORT_CLIENT_MAX_BYTES,
     TransportConfig,
@@ -711,6 +715,10 @@ def wire_transport_app(
     ticket_outcome_resolve_callable: _TicketOutcomeResolveCallable | None = None,
     ingest_enabled: bool = False,
     ingest_config: Any | None = None,
+    batch_enabled: bool = False,
+    batch_config: Any | None = None,
+    batch_data_dir: str = "",
+    batch_instance: str = "",
     recall_enabled: bool = False,
     feed_enabled: bool = False,
     feed_store: Any | None = None,
@@ -802,6 +810,27 @@ def wire_transport_app(
             :class:`alfred.transport.config.IngestConfig` carrying
             ``max_body_chars`` + the optional per-instance ``types``
             narrowing list. Read only when ``ingest_enabled`` is True.
+        batch_enabled: Mount the bulk scan intake route
+            (``POST /vault/batch``, #83). Default ``False`` — an
+            un-opted-in instance never mounts it (opt-in inertness).
+            Gated by the dedicated ``web_batch`` peer pin, so it stays
+            dark until the operator adds that token.
+        batch_config: The typed
+            :class:`alfred.transport.config.BatchConfig` carrying the
+            three upload caps. Read only when ``batch_enabled`` is True.
+        batch_data_dir: The DRIP config's resolved ``data_dir``. Passed
+            in rather than re-derived from ``logging.dir`` here because
+            the route WRITES to ``<data_dir>/batch/<instance>/<id>/`` and
+            the ``batch_image`` campaign READS from the path
+            ``build_campaign`` derives from ``DripConfig.data_dir``. Two
+            independent resolutions of the same value would eventually
+            disagree, and the failure is silent and total: submissions
+            land where nothing looks for them. One value, one source.
+        batch_instance: The DRIP config's instance name, passed for the
+            same reason as ``batch_data_dir`` — it is the other half of
+            the batch path. Falls back to ``instance_name`` (both read
+            ``telegram.instance.name``, so they agree today; the explicit
+            kwarg is what keeps them agreeing if either moves).
         recall_enabled: Mount the cross-instance recall answer route
             (``POST /peer/recall``, #20 S1). Default ``False`` — an
             un-opted-in instance never mounts the route (opt-in inertness;
@@ -849,6 +878,7 @@ def wire_transport_app(
         register_ticket_outcome_resolver_callable,
         register_vault_path,
     )
+    from .routes_batch import register_batch_routes
     from .routes_feed import register_feed_routes
     from .routes_ingest import register_ingest_routes
     from .routes_recall import register_recall_routes
@@ -1079,6 +1109,45 @@ def wire_transport_app(
             "transport.wire_transport_app.ingest_skipped",
             reason="transport.ingest.enabled is false / absent (instance "
                    "did not opt into the cross-instance ingest route)",
+        )
+
+    # Bulk scan intake (#83). Opt-in via ``transport.batch.enabled``;
+    # register_batch_routes emits its own disabled-skip log when off.
+    if batch_enabled:
+        register_batch_routes(
+            app,
+            enabled=True,
+            instance_name=batch_instance or instance_name,
+            data_dir=batch_data_dir,
+            max_images=getattr(
+                batch_config, "max_images", DEFAULT_BATCH_MAX_IMAGES,
+            ),
+            max_image_bytes=getattr(
+                batch_config, "max_image_bytes", DEFAULT_BATCH_MAX_IMAGE_BYTES,
+            ),
+            max_total_bytes=getattr(
+                batch_config, "max_total_bytes", DEFAULT_BATCH_MAX_TOTAL_BYTES,
+            ),
+            max_instruction_chars=getattr(
+                batch_config, "max_instruction_chars",
+                DEFAULT_BATCH_MAX_INSTRUCTION_CHARS,
+            ),
+        )
+        log.info(
+            "transport.wire_transport_app.batch_registered",
+            instance=batch_instance or instance_name,
+            data_dir=batch_data_dir or "(unset)",
+        )
+    else:
+        # Symmetric with ingest: still call the registrar so its own
+        # "ran, did not mount" signal fires and stays greppable.
+        register_batch_routes(
+            app, enabled=False, instance_name=batch_instance or instance_name,
+        )
+        log.debug(
+            "transport.wire_transport_app.batch_skipped",
+            reason="transport.batch.enabled is false / absent (instance did "
+                   "not opt into the bulk scan intake route)",
         )
 
     # Cross-instance recall answer route (#20 S1). Opt-in via
