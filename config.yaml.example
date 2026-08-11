@@ -1233,6 +1233,43 @@ daily_sync:
   # Override any of them here only if you genuinely want them split.
   # stt_vocab:
   #   enabled: false
+  # Capture-born task propose-close (#64) — the other half of proactive capture.
+  # When you say "I'm going to attach some screenshots of workout plans", capture
+  # files a task. Nothing used to notice when you DID it, so the task sat `todo`
+  # until you found it by hand. This scans open `created_by_capture` tasks
+  # against records that arrived after them and proposes a close as a numbered
+  # card: `N confirm` marks the task done, `N reject` leaves it open.
+  #
+  # IT NEVER CLOSES ANYTHING ON ITS OWN. The evidence is a fuzzy match, and a
+  # wrong auto-close would silently delete work you still meant to do — which
+  # you would discover the same way you discovered the stale task: by accident,
+  # later.
+  #
+  # SELF-CORRECTING: your answers are the training signal. A confirm teaches the
+  # phrase→record pairing (it scores 1.0 forever after); a reject excludes that
+  # pair and starts a per-task cooldown. Matches that land between `floor` and
+  # `threshold` are recorded to the pending store as evidence the bar may be
+  # wrong — never surfaced as a card.
+  #
+  # The three store paths are DERIVED from `logging.dir` at load time, so each
+  # instance gets its own and nothing here is shared across the box. Override
+  # only if you want them somewhere specific.
+  # capture_close:
+  #   enabled: false
+  #   # At or above this, a match may spend a card. Between floor and threshold
+  #   # it is recorded as a near miss instead. Below floor it is not evidence.
+  #   threshold: 0.5
+  #   floor: 0.3
+  #   # How long a promise stays live: a record only counts as evidence if it
+  #   # arrived within this many days of the task, and a rejected task is not
+  #   # re-proposed for this long.
+  #   window_days: 14
+  #   # Cards per pass. Kept small on purpose — a first run over a long backlog
+  #   # that raised a dozen would teach you to skim the section.
+  #   max_proposals: 3
+  #   # Open capture-born tasks looked at per pass, oldest first. Bounds WORK,
+  #   # not cards; when it bites it is named in the log.
+  #   max_tasks: 50
   # Attribution-audit section — Phase 2 of the calibration audit gap
   # arc (see ``project_calibration_audit_gap.md``). Surfaces agent-
   # inferred vault content (marked by BEGIN_INFERRED/END_INFERRED
