@@ -15,10 +15,15 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 // silently takes the FAB with it. There was no pin on that at all, in either
 // direction — so both are asserted here, on both sides of the flag.
 
-const { mockReplace } = vi.hoisted(() => ({ mockReplace: vi.fn() }));
+const { mockReplace, session } = vi.hoisted(() => ({
+  mockReplace: vi.fn(),
+  // Mutable so one test can render the PRE-AUTH branch. Defaults to signed in,
+  // so every other test here is unchanged.
+  session: { user: { name: 'andrew', role: 'owner' } as { name: string; role: string } | null, loading: false },
+}));
 
 vi.mock('../lib/algernon/useSession', () => ({
-  useSession: () => ({ user: { name: 'andrew', role: 'owner' }, loading: false }),
+  useSession: () => ({ user: session.user, loading: session.loading }),
 }));
 vi.mock('next/router', () => ({
   useRouter: () => ({ replace: mockReplace, push: vi.fn(), query: {} }),
@@ -84,6 +89,8 @@ function lastBodyTo(url: string): Record<string, unknown> | null {
 
 beforeEach(() => {
   mockReplace.mockReset();
+  session.user = { name: 'andrew', role: 'owner' };
+  session.loading = false;
   localStorage.clear();
   installFetch();
 });
@@ -210,5 +217,29 @@ describe('the bug-report FAB survives this change (#95 watch-item)', () => {
     render(<ChatPage />);
     await waitFor(() => expect(screen.queryByTestId('unified-composer')).not.toBeNull());
     expect(screen.getByTestId('report-bug-fab')).toBeTruthy();
+  });
+
+  it('is ABSENT on the pre-auth surface, where showNav is false', async () => {
+    // The OTHER branch of `showBugReport ?? showNav`, which the two pins above
+    // cannot reach: they both vary the composer flag, an axis the guard does not
+    // read, so both stay green against `{true && <ReportBugFab />}` — a FAB that
+    // renders unconditionally, including on the signed-out screen #95's docstring
+    // is explicit about excluding (no verified reporter yet, and the BFF would
+    // refuse the report with invalid_session anyway).
+    //
+    // Driven through /chat's OWN pre-auth branch rather than a hand-rendered
+    // Layout: that branch is the production call site that passes showNav={false},
+    // and a test that reconstructs the composition instead of driving it is
+    // testing its own copy of it.
+    session.user = null;
+    session.loading = true;
+    render(<ChatPage />);
+
+    // The control that makes the absence mean something: the pre-auth branch
+    // really did render. Without it this passes just as well against a page that
+    // rendered nothing at all.
+    expect(await screen.findByTestId('auth-gate')).toBeTruthy();
+    expect(screen.queryByTestId('composer-input')).toBeNull();
+    expect(screen.queryByTestId('report-bug-fab')).toBeNull();
   });
 });
