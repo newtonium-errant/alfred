@@ -109,6 +109,16 @@ class _UpcomingItem:
     description: str | None
     rec_type: str = "event"
     time_display: str | None = None
+    # Raw interval extent off the record's ``start`` / ``end`` frontmatter
+    # (D7, 2026-08-11). Collected but NOT rendered — every list view still
+    # emits ``time_display`` exactly as before, so the brief is byte-identical.
+    # These exist for the feed projection, which needs the real interval rather
+    # than a lossy ``"%H:%M"`` display string. ``end`` is written by gcal_sync
+    # alongside ``start`` but is absent on hand-authored events, so ``ends_at``
+    # is independently optional: an event can legitimately have a start and no
+    # known end, and that must not be confused with a zero-length one.
+    starts_at: str | None = None
+    ends_at: str | None = None
 
 
 # Closed-state denyset — records in any of these statuses are excluded
@@ -235,6 +245,49 @@ def _event_time_display(fm: dict) -> str | None:
             start_dt = None
     if start_dt is not None:
         return start_dt.strftime("%H:%M")
+    return None
+
+
+def _iso_extent(value: Any) -> str | None:
+    """One end of an interval extent, as an ISO-8601 string (D7, 2026-08-11).
+
+    Accepts what the frontmatter loader actually hands us for ``start`` /
+    ``end``: a ``datetime`` (PyYAML resolves an unquoted ISO timestamp to one),
+    a ``date``, or a string. Anything unparseable — a bare time, prose, a
+    number, ``None`` — returns ``None`` rather than guessing, because a WRONG
+    interval is worse than an absent one: an absent extent renders as "no known
+    end", a wrong one silently moves an appointment.
+
+    Strings are validated by round-tripping through ``fromisoformat`` and are
+    re-emitted from the PARSED value, so the stored extent is canonical ISO
+    regardless of the spacing/format the record used. Offsets are preserved
+    (never coerced to UTC, never stripped) — dropping a tz would shift the
+    operator's clock, which is exactly the lossiness this field exists to end.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        # An all-day event: a real date with no clock time. ``date.isoformat()``
+        # yields ``YYYY-MM-DD``, which is a valid ISO-8601 extent.
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        raw = value.strip()
+        # DATE-ONLY IS TRIED FIRST, and the order is load-bearing. On 3.11+
+        # ``datetime.fromisoformat("2026-08-11")`` SUCCEEDS and silently invents
+        # midnight, so a datetime-first helper turns an all-day event into a
+        # zero-length one at 00:00 — a clock time the record never claimed, and
+        # exactly the kind of confident wrong answer this function refuses to
+        # give. ``date.fromisoformat`` is the precise discriminator: it raises on
+        # anything carrying a time component (verified on 3.12), so a date-only
+        # string can only reach it and a timestamp can only fall through.
+        try:
+            return date.fromisoformat(raw).isoformat()
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(raw).isoformat()
+        except ValueError:
+            return None
     return None
 
 
@@ -394,6 +447,28 @@ def _collect_items(
         # Time only applies to events; tasks have no clock time in the
         # list view (they render off ``due`` date only).
         time_display = _event_time_display(fm) if rec_type == "event" else None
+        # Interval extent (D7) — events only. A task's ``due`` is a deadline, not
+        # a span the task occupies, so stamping it as a start would assert an
+        # interval the record does not claim.
+        starts_at = _iso_extent(fm.get("start")) if rec_type == "event" else None
+        ends_at = _iso_extent(fm.get("end")) if rec_type == "event" else None
+        if rec_type == "event":
+            # ILB: a PRESENT-but-unparseable start/end loses the extent, and
+            # silence here is indistinguishable from "this event has no time".
+            # Only fires when the field exists and we refused it — an event with
+            # no ``start`` at all is the ordinary all-day case, not a defect.
+            for field_name, parsed in (("start", starts_at), ("end", ends_at)):
+                if fm.get(field_name) is not None and parsed is None:
+                    log.info(
+                        "upcoming_events.extent_unparseable",
+                        path=str(path),
+                        field=field_name,
+                        raw=str(fm.get(field_name))[:80],
+                        detail=(
+                            "event still rendered and still fed; only the "
+                            "interval extent was dropped"
+                        ),
+                    )
         items.append(
             _UpcomingItem(
                 date_iso=d.isoformat(),
@@ -402,6 +477,8 @@ def _collect_items(
                 description=str(description) if description else None,
                 rec_type=str(rec_type),
                 time_display=time_display,
+                starts_at=starts_at,
+                ends_at=ends_at,
             )
         )
     return items, preference_filtered

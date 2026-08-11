@@ -183,6 +183,27 @@ class FeedItem:
     # ``done`` through on an accepted item. Newest acted event wins the fold.
     acted_action: str | None = None
     expires_at: str | None = None
+    # --- interval extent (D7, 2026-08-11) ------------------------------------
+    # WHEN THE THING ITSELF IS, as opposed to when the feed learned about it.
+    # ``created_at`` is provenance; these two are content. Time-shaped items are
+    # the norm rather than the exception here — a fog window runs 11:00–15:00, a
+    # run is a moment at 09:30, a driver's corridor exposure is four hours, a
+    # routine has a cadence — and the pre-amendment model could only carry a
+    # POINT, so every renderer that wanted a duration had to re-parse it out of
+    # a display string (``event`` evidence carried ``time_display``, a rendered
+    # ``"%H:%M"``, which is lossy by construction: no end, no date, no tz).
+    #
+    # Both are OPTIONAL and both are independently optional: an instant carries
+    # ``starts_at`` with ``ends_at=None`` (a moment, not a zero-length span), and
+    # an item with no time dimension at all leaves both ``None``. Renderers MUST
+    # treat ``ends_at=None`` as "no known end" and never as "ends immediately".
+    #
+    # ISO-8601 strings, not datetimes, because the whole model round-trips
+    # through JSON in the store — the same reason ``created_at`` is a string.
+    # Producers stamp whatever offset the source carries; normalization is a
+    # render-layer concern, so nothing here silently shifts an operator's clock.
+    starts_at: str | None = None
+    ends_at: str | None = None
     source_ref: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -200,10 +221,16 @@ class FeedItem:
         state: str = STATE_OPEN,
         created_at: str | None = None,
         expires_at: str | None = None,
+        starts_at: str | None = None,
+        ends_at: str | None = None,
         source_ref: dict[str, Any] | None = None,
     ) -> "FeedItem":
         """Build a FeedItem, applying KIND_DEFAULTS for mode/attention unless
-        explicitly overridden. Producers use this; the stable_key becomes the id."""
+        explicitly overridden. Producers use this; the stable_key becomes the id.
+
+        ``starts_at`` / ``ends_at`` are the item's own interval extent (D7) and
+        both default to ``None`` — a producer with no time dimension passes
+        neither, exactly as every producer did before the amendment."""
         default_mode, default_attention = KIND_DEFAULTS.get(kind, (MODE_FYI, ATTENTION_FYI))
         return cls(
             id=make_id(kind, stable_key),
@@ -217,6 +244,8 @@ class FeedItem:
             state=state,
             created_at=created_at or _now_iso(),
             expires_at=expires_at,
+            starts_at=starts_at,
+            ends_at=ends_at,
             source_ref=dict(source_ref or {}),
         )
 
