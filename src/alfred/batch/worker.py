@@ -50,7 +50,7 @@ from .ledger import (
     load_rows,
 )
 from .manifest import BatchImage, BatchManifest
-from .render import progress_counts, render_body
+from .render import progress_counts, render_body, render_carried_context
 from .seal import assert_regenerable
 
 log = structlog.get_logger(__name__)
@@ -195,6 +195,7 @@ def process_one(
     item_id: str,
     model: str,
     max_tokens: int,
+    carried_context_max_chars: int,
 ) -> str:
     """Process one image. Returns the outcome, or ``"skipped"``.
 
@@ -250,7 +251,13 @@ def process_one(
         image_bytes=image_bytes,
         media_type=image.media_type,
         instruction=manifest.instruction,
-        carried_context=render_body(manifest, rows),
+        # BOUNDED, and deliberately not ``render_body``: the body is the
+        # operator's document and shows every result, while this is a prompt
+        # fragment that only needs the recent tail. Passing the whole body made
+        # the batch quadratic — see ``render_carried_context``.
+        carried_context=render_carried_context(
+            manifest, rows, max_chars=carried_context_max_chars,
+        ),
         model=model,
         max_tokens=max_tokens,
     )

@@ -30,7 +30,12 @@ from .campaigns import (
 # import cycle (wiring imports state). Re-exported here — and listed in
 # __all__ — because `from .wiring import DripConfigError` is the established
 # import across cli.py, brief/daemon.py and the drip tests.
-from .config import CampaignConfig, DripConfig, DripConfigError
+from .config import (
+    DEFAULT_BATCH_MODEL_FALLBACK,
+    CampaignConfig,
+    DripConfig,
+    DripConfigError,
+)
 from .runner import STOP_DISABLED
 from .state import DONE, IN_FLIGHT, CampaignState
 
@@ -126,13 +131,35 @@ def build_campaign(name: str, cfg: CampaignConfig, drip: DripConfig) -> Any:
                 "required (the Anthropic key for per-scan vision "
                 "calls; use ${ANTHROPIC_API_KEY})"
             )
+        # Model resolution, most-specific first. An unset campaign model
+        # INHERITS the instance's own talker model rather than pinning a
+        # tier here: a batch pays its model choice once per scan, so a
+        # code-level default is thirty decisions the operator did not make.
+        # The fallback is last-resort only (no telegram block at all).
+        model = (
+            cfg.model.strip()
+            or drip.talker_model.strip()
+            or DEFAULT_BATCH_MODEL_FALLBACK
+        )
+        if not cfg.model.strip() and not drip.talker_model.strip():
+            # ILB: an instance running on a code literal should know it. This
+            # is the only path where nobody chose the model.
+            log.info(
+                "drip.batch_image.model_fallback",
+                campaign=name,
+                model=model,
+                detail="neither drip.campaigns.%s.model nor "
+                       "telegram.anthropic.model is set — using the "
+                       "last-resort default" % name,
+            )
         return BatchImageCampaign(
             data_dir=Path(drip.data_dir),
             instance=drip.instance,
             vault_path=Path(vault_path),
-            model=cfg.model,
+            model=model,
             max_tokens=cfg.max_tokens,
             api_key=cfg.api_key,
+            carried_context_max_chars=cfg.carried_context_max_chars,
             name=name,
         )
 

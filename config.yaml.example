@@ -1896,3 +1896,32 @@ scaffold:
 #       # finished". Do NOT regenerate to "refresh" a live list: re-deriving
 #       # lets the same link annotate one week and delete the next.
 #       worklist_path: "/home/andrew/.alfred/salem/data/link001_worklist.txt"
+#     batch_image:
+#       # Drains batches submitted via the transport.batch route above, one
+#       # scan per drip item. WITHOUT this enabled, submissions are saved and
+#       # nothing processes them — the route answers "saved" rather than
+#       # "queued" and says so, but the batch waits indefinitely.
+#       enabled: false
+#       max_items_per_run: 12       # scans per invocation
+#       max_items_per_week: 60      # rolling 7 days; this campaign DOES spend
+#       api_key: "${ANTHROPIC_API_KEY}"
+#       # Vision model. "" (the default) INHERITS telegram.anthropic.model —
+#       # this instance's own configured model, which is the one already chosen
+#       # for its work. A batch pays its model choice ONCE PER SCAN, so a
+#       # thirty-scan batch pays any difference thirty times over; the tiers
+#       # are not close (high-resolution up to 4784 visual tokens per image vs
+#       # the standard tier's 1568). Set it explicitly for a dense-scan batch
+#       # that genuinely needs the high-resolution tier.
+#       model: ""
+#       # Caps thinking PLUS response text together on current models, so a
+#       # tight value truncates an extraction mid-answer.
+#       max_tokens: 8192
+#       # Ceiling on the prior-results context carried into EACH per-scan call
+#       # — a cost lever, not formatting. Unbounded (the whole rendered body,
+#       # pre-#83) scan N carried N-1 results and the tokens paid across a
+#       # batch grew with the SQUARE of its size. The bound keeps the most
+#       # RECENT results, which is what the context is for (consistent format
+#       # and terminology); the ledger still holds every result and the record
+#       # still renders all of them, so nothing is lost by trimming the prompt.
+#       # 0 disables the context entirely (each scan judged on its own).
+#       carried_context_max_chars: 8000

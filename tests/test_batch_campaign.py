@@ -309,6 +309,11 @@ def _run_one(campaign, item, client) -> None:
             item_id=content_hash,
             model=self.model,
             max_tokens=self.max_tokens,
+            # Read off the campaign, never a literal: this helper mirrors
+            # ``work``, and a hardcoded value here would let the real
+            # threading break while every test using it stayed green.
+            # ``test_work_threads_the_carried_context_bound`` pins the real one.
+            carried_context_max_chars=self.carried_context_max_chars,
         )
 
     mod.BatchImageCampaign.work = patched

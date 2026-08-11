@@ -90,14 +90,46 @@ KNOWN_CAMPAIGN_KINDS: frozenset[str] = frozenset({
     "gmail_backlog", "link001_repair", "batch_image",
 })
 
-#: ``batch_image`` model defaults (#83). The model is a genuine COST LEVER
-#: alongside the budget knobs — an operator who wants cheaper batch runs
-#: changes it here rather than editing code. ``max_tokens`` is deliberately
-#: generous: on current models thinking is on by default and ``max_tokens``
-#: caps thinking PLUS response text together, so a tight value truncates the
-#: extraction mid-answer.
-DEFAULT_BATCH_MODEL = "claude-opus-5"
+#: Last-resort ``batch_image`` model, used ONLY when neither
+#: ``drip.campaigns.<name>.model`` nor ``telegram.anthropic.model`` is set.
+#: The normal path is inheritance — see :attr:`CampaignConfig.model`.
+#:
+#: WHY THE DEFAULT IS NOT OPUS ANY MORE. A batch is the one workload where the
+#: model choice multiplies: the cost is per scan, so a thirty-scan batch pays
+#: the difference thirty times over. The two vision tiers are not close:
+#:
+#:   high-resolution (opus-5)  — up to 4784 visual tokens per image
+#:   standard        (sonnet)  — capped at 1568 visual tokens per image
+#:
+#: That is roughly 3x the visual tokens per scan before any price difference,
+#: and it buys fidelity that the live reconciliation which motivated this
+#: feature did not need — it ran fine on VERA's configured sonnet-4-6. So the
+#: default follows the instance's OWN talker model, which is the model the
+#: operator already chose for that instance's work, and an operator who wants
+#: the high-resolution tier for a dense-scan batch sets ``model:`` explicitly.
+#: Both directions stay a one-line config change; neither requires a deploy.
+DEFAULT_BATCH_MODEL_FALLBACK = "claude-sonnet-4-6"
+
+#: ``max_tokens`` is deliberately generous: on current models thinking is on by
+#: default and ``max_tokens`` caps thinking PLUS response text together, so a
+#: tight value truncates the extraction mid-answer.
 DEFAULT_BATCH_MAX_TOKENS = 8192
+
+#: Ceiling on the prior-results context carried into each per-scan call (#83).
+#:
+#: This is a COST LEVER disguised as a formatting knob. The carried context is
+#: the batch's own accumulated results, and it used to be the WHOLE rendered
+#: body — so scan N carried N-1 results, and the tokens paid across a batch
+#: grew with the SQUARE of its size. On a sixty-scan batch that is the dominant
+#: cost, and it is spent re-reading text the model is explicitly told not to
+#: re-process.
+#:
+#: What the bound preserves is what the context is FOR: consistency of format
+#: and terminology with the scans just processed, which the most recent rows
+#: carry as well as all of them. What it drops is distant rows — and nothing is
+#: lost by dropping them, because the ledger still holds every result and the
+#: record still renders all of them.
+DEFAULT_BATCH_CARRIED_CONTEXT_MAX_CHARS = 8000
 
 
 def _substitute_env(value: Any) -> Any:
@@ -163,8 +195,18 @@ class CampaignConfig:
     # --- batch_image only (#83) ---
     #: Vision model for per-scan extraction. A cost lever; see the
     #: DEFAULT_BATCH_* rationale above.
-    model: str = DEFAULT_BATCH_MODEL
+    #:
+    #: ``""`` means INHERIT ``telegram.anthropic.model`` — this instance's own
+    #: configured model, which is the one the operator already chose for its
+    #: work. Same convention as ``transport.peers.*.nl_broker.model``. Set it
+    #: explicitly to override in either direction (e.g. the high-resolution
+    #: tier for a batch of dense scans).
+    model: str = ""
     max_tokens: int = DEFAULT_BATCH_MAX_TOKENS
+    #: Ceiling on prior-results context carried into each per-scan call. See
+    #: DEFAULT_BATCH_CARRIED_CONTEXT_MAX_CHARS — this bounds a cost that would
+    #: otherwise grow with the SQUARE of the batch size.
+    carried_context_max_chars: int = DEFAULT_BATCH_CARRIED_CONTEXT_MAX_CHARS
     #: ``${ANTHROPIC_API_KEY}`` in YAML; _substitute_env resolves it.
     api_key: str = ""
 
@@ -183,6 +225,11 @@ class DripConfig:
     #: processed. Empty here is not fixed up with a default — it fails at the
     #: point of use, loudly.
     instance: str = ""
+    #: This instance's ``telegram.anthropic.model``, carried here so
+    #: ``build_campaign`` can resolve a campaign that inherits rather than
+    #: names its own model. Read at load rather than re-read from ``raw`` at
+    #: build time, because ``build_campaign`` never sees ``raw``.
+    talker_model: str = ""
     campaigns: dict[str, CampaignConfig] = field(default_factory=dict)
 
     def enabled_campaigns(self) -> dict[str, CampaignConfig]:
@@ -216,6 +263,16 @@ def load_from_unified(raw: dict[str, Any]) -> DripConfig:
 
     instance = instance_name_from_raw(raw)
 
+    # This instance's configured model, for campaigns that inherit rather than
+    # name their own. Read defensively — an absent telegram block is normal on
+    # a non-talker instance, and it simply means there is nothing to inherit.
+    talker_model = ""
+    telegram_raw = raw.get("telegram")
+    if isinstance(telegram_raw, dict):
+        anthropic_raw = telegram_raw.get("anthropic")
+        if isinstance(anthropic_raw, dict):
+            talker_model = str(anthropic_raw.get("model") or "").strip()
+
     if not isinstance(block, dict) or not block:
         # ILB: deploy-inert is a legitimate steady state on every instance that
         # has not turned drip on. Say so, so "no campaigns configured" is
@@ -227,7 +284,7 @@ def load_from_unified(raw: dict[str, Any]) -> DripConfig:
         )
         return DripConfig(
             enabled=False, vault_path=vault_path, data_dir=data_dir,
-            instance=instance,
+            instance=instance, talker_model=talker_model,
         )
 
     top = _known_only(DripConfig, block)
@@ -238,6 +295,7 @@ def load_from_unified(raw: dict[str, Any]) -> DripConfig:
             "vault_path": str(block.get("vault_path") or vault_path),
             "data_dir": str(block.get("data_dir") or data_dir),
             "instance": instance,
+            "talker_model": talker_model,
         }
     )
 
