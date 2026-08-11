@@ -319,7 +319,15 @@ _DEFINITIONS: list[TypeDefinition] = [
         # ``{vera, vera_ops}`` (2026-06-15, vera-assistant arc) — both
         # VERA roles create+edit ``note`` (jottings / meeting notes).
         # See the ``project`` note above for the gate-1/gate-2 contract.
-        available_in_scopes=frozenset({SCOPE_CANONICAL, "vera", "vera_ops"}),
+        #
+        # ``vera_batch`` (#83) — the bulk-image batch campaign's carried
+        # record is a ``note``. ``note`` is already SCOPE_CANONICAL so
+        # gate 1 admits it regardless; the explicit tag is what creates
+        # the ``vera_batch`` key in ``KNOWN_TYPES_BY_SCOPE`` and keeps
+        # the capability greppable, exactly as the VERA tags do.
+        available_in_scopes=frozenset(
+            {SCOPE_CANONICAL, "vera", "vera_ops", "vera_batch"},
+        ),
         # Leaf-by-design: 258 of 360 ORPHAN001s lived under note/ in the
         # 2026-04-30 residual categorization. Notes are mostly captured
         # emails / one-off jottings; the few that DO get linked already

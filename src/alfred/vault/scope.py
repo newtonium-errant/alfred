@@ -262,6 +262,35 @@ def _check_body_mutation_allowed(
             f"'{record_type}'. Permitted types: "
             f"{', '.join(permitted) if permitted else '(none)'}."
         )
+    # vera_batch OWNERSHIP carve-out (#83) — the batch worker may
+    # wholesale-replace ONLY the body of a record its own run minted.
+    #
+    # This sits deliberately BELOW the per-type allowlist rather than
+    # replacing it, because the two answer different questions: the
+    # allowlist says "notes are a body_replace-able shape," and this
+    # says "and specifically THIS note is ours." Granting the former
+    # without the latter is the whole risk of the feature — a wholesale
+    # body replace on someone's meeting notes is unrecoverable from the
+    # vault alone.
+    #
+    # Fail-CLOSED on missing frontmatter: if the caller did not thread
+    # the on-disk read, ownership is unproven, and unproven is refused.
+    if scope == "vera_batch" and operation == "body_replace":
+        owner = (
+            existing_frontmatter.get(BATCH_OWNER_FIELD)
+            if isinstance(existing_frontmatter, dict)
+            else None
+        )
+        if not str(owner or "").strip():
+            raise ScopeError(
+                f"Scope '{scope}' refuses 'body_replace' on a record "
+                f"that carries no '{BATCH_OWNER_FIELD}'. The batch "
+                f"worker rewrites only the carried record its own run "
+                f"created; a note without that marker is operator-owned "
+                f"and a wholesale body replace on it would be "
+                f"unrecoverable."
+            )
+
     # gcal carve-out — Salem event with a synced GCal mirror.
     if (
         operation == "body_replace"
@@ -869,6 +898,53 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_writes": False,
         "allow_body_insert_at": {},
         "allow_body_replace": {},
+    },
+    # ``vera_batch`` — the bulk-image batch campaign's write authority
+    # (#83). The narrowest scope that can still body_replace, because
+    # the ONE thing this identity does is rewrite its own carried record
+    # from the sidecar ledger, once per processed image.
+    #
+    # The design constraint that shapes every row below: the ledger is
+    # the truth and the vault record is a RENDER of it, so the worker
+    # needs exactly two writes — mint the record once, then flatten and
+    # re-render its body N times. Nothing else.
+    #
+    #   * ``create`` → ``vera_batch_types_only`` = {note}. One record
+    #     per batch, minted at batch-open.
+    #   * ``edit`` → ``vera_batch_own_records_only``: the combined
+    #     type + OWNERSHIP + field gate. Three checks, all fail-closed
+    #     (see the gate in ``check_scope``). Fields are limited to
+    #     ``VERA_BATCH_EDIT_FIELDS`` — progress counters only.
+    #   * ``read`` stays on: the regenerate path must re-read the
+    #     record to evaluate the seal before replacing its body.
+    #   * ``search`` / ``list`` / ``context`` DENIED — the batch id
+    #     names its record directly; a worker that could enumerate the
+    #     vault could read records that have nothing to do with its
+    #     batch. "No reads beyond the carried record" is the rule, and
+    #     denying discovery is how it is enforced rather than promised.
+    #   * ``move`` / ``delete`` DENIED — a bulk processor must never be
+    #     able to relocate or destroy operator records.
+    #   * ``allow_body_writes: True`` — the create-time body.
+    #   * ``allow_body_insert_at: {}`` — mid-document patching is not
+    #     how this works; the render is always wholesale.
+    #   * ``allow_body_replace: {"note": True}`` — the regenerate path,
+    #     further narrowed by the ownership marker inside
+    #     ``_check_body_mutation_allowed``. The per-type allowlist alone
+    #     would permit flattening ANY note in the vault; the marker is
+    #     what makes the grant safe.
+    "vera_batch": {
+        "read": True,
+        "search": False,
+        "list": False,
+        "context": False,
+        # → VERA_BATCH_CREATE_TYPES = {note}
+        "create": "vera_batch_types_only",
+        "edit": "vera_batch_own_records_only",
+        "move": False,
+        "delete": False,
+        "allow_body_writes": True,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {"note": True},
     },
     # Migration scope — one-shot operational scripts under
     # ``scripts/migrate_*.py`` that perform schema rewrites against the
@@ -1568,6 +1644,43 @@ VERA_OPS_CREATE_TYPES: set[str] = {
 
 VERA_CREATE_TYPES: set[str] = {
     "ticket", "note", "task", "decision", "project",
+}
+
+
+# ``vera_batch`` — the bulk-image batch campaign's write surface (#83).
+#
+# The batch worker is a DAEMON identity, not a role: it creates exactly
+# one carried record per batch and then rewrites that record's body once
+# per checkpoint from the append-only sidecar ledger. It is deliberately
+# the narrowest write scope in this file, because the thing it does —
+# wholesale body replacement — is the most destructive non-delete
+# operation available.
+#
+# The ownership marker is what makes ``body_replace`` safe to grant at
+# all. Without it, "may body_replace a note" means "may flatten ANY note
+# in the vault," which is categorically broader than the feature needs.
+# ``BATCH_OWNER_FIELD`` is written by ``vault_create`` at batch-open time
+# and re-read from the record's LIVE on-disk frontmatter on every
+# subsequent edit; a record that does not carry it is not ours and is
+# refused. See ``_check_body_mutation_allowed``.
+#
+# Contract-pinned in tests/test_batch_scope.py — widening any of these
+# three sets must update the pin in the same commit.
+VERA_BATCH_CREATE_TYPES: set[str] = {"note"}
+
+#: Frontmatter field whose PRESENCE marks a record as owned by a batch
+#: campaign run. Value is the batch id. Absence ⇒ not ours ⇒ refuse.
+BATCH_OWNER_FIELD = "batch_id"
+
+#: The only frontmatter fields the batch worker may edit post-create.
+#: Progress bookkeeping only — never ``title``, never ``type``, never
+#: ``status`` (the operator owns the record's lifecycle once it lands).
+VERA_BATCH_EDIT_FIELDS: set[str] = {
+    "batch_items_done",
+    "batch_items_total",
+    "batch_items_failed",
+    "batch_updated_at",
+    "batch_last_error",
 }
 
 
@@ -2288,6 +2401,92 @@ def check_scope(
                 f"Got: '{record_type}'. Types outside this allowlist "
                 f"(learn types except decision, canonical/PHI types) are "
                 f"denied for both VERA roles."
+            )
+        return
+
+    if permission == "vera_batch_types_only":
+        # #83 — bulk-image batch campaign create gate. One type: the
+        # carried ``note`` the batch renders into. Fail-CLOSED on a
+        # missing type, same as every other type-restricted gate here.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'vera_batch_types_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed."
+            )
+        if record_type not in VERA_BATCH_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create "
+                f"({', '.join(sorted(VERA_BATCH_CREATE_TYPES))}). "
+                f"Got: '{record_type}'. The batch worker mints exactly "
+                f"one carried record per batch and renders into it; it "
+                f"has no authority to create anything else."
+            )
+        return
+
+    if permission == "vera_batch_own_records_only":
+        # #83 — bulk-image batch campaign edit gate. THREE checks, all
+        # fail-closed, in escalating specificity: type, then OWNERSHIP,
+        # then field allowlist.
+        #
+        # The ownership check is the one that matters and the one with
+        # no precedent above it: every other narrow gate in this file
+        # restricts WHICH TYPE and WHICH FIELDS, which is not sufficient
+        # here. "May edit note records" would let a batch worker whose
+        # id was mistyped, or whose record was deleted and the title
+        # reused, walk onto an unrelated operator note and start
+        # rewriting it. So the record's own LIVE frontmatter must claim
+        # the batch: ``BATCH_OWNER_FIELD`` present and non-empty.
+        #
+        # ``existing_frontmatter`` is the on-disk read that ``vault_edit``
+        # performs before the gate (ops.py threads it for both ``edit``
+        # and ``body_replace``). Absent ⇒ the caller did not plumb it ⇒
+        # refuse, rather than assume ownership we cannot verify.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'vera_batch_own_records_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass "
+                f"record_type (vault_edit parses it from the target "
+                f"record's frontmatter)."
+            )
+        if record_type not in VERA_BATCH_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit record types "
+                f"({', '.join(sorted(VERA_BATCH_CREATE_TYPES))}). "
+                f"Got: '{record_type}'. The batch worker's write "
+                f"authority is its own carried record only."
+            )
+        if not isinstance(existing_frontmatter, dict):
+            raise ScopeError(
+                f"Scope '{scope}' may only edit records it owns, but the "
+                f"target's existing frontmatter was not supplied — "
+                f"failing closed. Ownership is proven by the record's "
+                f"own '{BATCH_OWNER_FIELD}' field, which cannot be "
+                f"checked without reading it."
+            )
+        if not str(existing_frontmatter.get(BATCH_OWNER_FIELD) or "").strip():
+            raise ScopeError(
+                f"Scope '{scope}' may only edit records it owns. The "
+                f"target record carries no '{BATCH_OWNER_FIELD}' — it "
+                f"was not created by a batch run, so the batch worker "
+                f"will not touch it. This is the guard that keeps a "
+                f"bulk processor away from operator-authored notes."
+            )
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(VERA_BATCH_EDIT_FIELDS))}); "
+                f"caller did not supply the field list."
+            )
+        rejected = [f for f in fields if f not in VERA_BATCH_EDIT_FIELDS]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(VERA_BATCH_EDIT_FIELDS))}). "
+                f"Rejected: {', '.join(rejected)}. The batch worker "
+                f"updates progress counters; the record's title, type, "
+                f"and status belong to the operator."
             )
         return
 
