@@ -212,6 +212,119 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     },
 }
 
+# --- advertised verbs (#102 1b) ----------------------------------------------
+# What a CLIENT is told it may do with an item, derived from the ceiling above.
+#
+# WHY THIS EXISTS. The web deck carried its own hand-written per-kind verb map
+# (`web/lib/algernon/feedConstants.DECK_VERBS`) whose own comment conceded the
+# coupling: "these action_ids MUST be members of the B1 transport FEED_ACTIONS
+# map for the kind". A mirror maintained by vigilance drifts the day someone
+# edits one side, and the drift is silent in both directions — a verb the client
+# offers that the ceiling refuses 400s in the operator's hand, and a verb the
+# ceiling gained that the client never shows is a capability nobody can reach.
+# Serving the verbs from the ceiling itself is F3 "fixed by construction".
+#
+# THE CEILING IS THE SET; THIS TABLE IS THE PRESENTATION. `FEED_ACTIONS` decides
+# WHICH pairs exist and is the only authority on that. This adds what a ceiling
+# entry cannot know: the operator-facing label, the gesture weight, the gesture
+# direction, and (for a heavy verb) the consequence sentence. An action present
+# in the ceiling with no entry here is still advertised — with its raw id as the
+# label and no gesture — because dropping it would make this table a second,
+# quieter ceiling, which is the failure being removed.
+#
+# GESTURE IS AN ADDITION TO THE §4 CONTRACT, and a necessary one. §4 specifies
+# ``{verb, label, weight, effect_ref}`` — no direction. A two-way swipe surface
+# cannot be generated from that: nothing in the payload says `spam` is the LEFT
+# swipe and `confirm` the right. Adding the direction here rather than inferring
+# it client-side (by verb NAME, the obvious shortcut) is what keeps the deck from
+# re-growing a private opinion about verbs it was just relieved of.
+_GESTURE_AFFIRM = "affirm"
+_GESTURE_REJECT = "reject"
+
+# weight: "light" commits on the gesture, inside the undo window. "heavy" ARMS,
+# showing `note`, and commits on a second tap — a mutation-bearing verb never
+# fires on a single motion (step-2 §3). The weights here are the catalog's,
+# verb-for-verb, and they are the SAME judgements the web deck now renders.
+ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
+    "email_tier": {
+        "confirm": {"label": "Confirm", "weight": "light", "gesture": _GESTURE_AFFIRM},
+        "spam": {"label": "Spam", "weight": "light", "gesture": _GESTURE_REJECT},
+    },
+    "attribution": {
+        "confirm": {"label": "Confirm", "weight": "light", "gesture": _GESTURE_AFFIRM},
+        # HEAVY, and the one this table was worth building for: the reject
+        # strips the marked section out of the record body and drops its audit
+        # entry (:func:`alfred.vault.attribution.reject_marker`). It shipped as
+        # a light verb and committed on a single left swipe.
+        "reject": {
+            "label": "Reject",
+            "weight": "heavy",
+            "gesture": _GESTURE_REJECT,
+            "note": (
+                "Removes the marked section from the record body and drops its "
+                "audit entry."
+            ),
+        },
+    },
+    "proposal": {
+        "confirm": {
+            "label": "Confirm",
+            "weight": "heavy",
+            "gesture": _GESTURE_AFFIRM,
+            "note": "Creates or merges the vault records described above.",
+        },
+        "reject": {"label": "Reject", "weight": "light", "gesture": _GESTURE_REJECT},
+    },
+    "routine_match": {
+        "confirm": {"label": "That's it", "weight": "light", "gesture": _GESTURE_AFFIRM},
+        "reject": {"label": "No", "weight": "light", "gesture": _GESTURE_REJECT},
+    },
+    "pending": {
+        "noted": {"label": "Noted", "weight": "light", "gesture": _GESTURE_AFFIRM},
+    },
+    "slot_suggestion": {
+        "accept": {"label": "Take it", "weight": "light", "gesture": _GESTURE_AFFIRM},
+    },
+    "email_urgent": {
+        "ack": {"label": "Got it", "weight": "light", "gesture": _GESTURE_AFFIRM},
+    },
+}
+
+
+def actions_for(kind: str) -> list[dict[str, Any]]:
+    """The advertised verbs for ``kind`` — every ceiling pair, presented.
+
+    Derived from :data:`FEED_ACTIONS` so the set can never exceed what the
+    router will actually admit, and never lag a verb the ceiling gains. Order
+    follows the ceiling's own declaration order, which is stable per kind.
+
+    Returns ``[]`` for a kind with no ceiling entry — a real answer (that kind
+    has no actions), not a missing one.
+    """
+    ceiling = FEED_ACTIONS.get(kind)
+    if not ceiling:
+        return []
+    meta = ACTION_META.get(kind, {})
+    out: list[dict[str, Any]] = []
+    for action_id in ceiling:
+        entry = meta.get(action_id, {})
+        advertised: dict[str, Any] = {
+            "verb": action_id,
+            # An unlabelled ceiling action still ships, under its raw id. It is
+            # visibly unfinished rather than invisibly absent.
+            "label": entry.get("label") or action_id,
+            "weight": entry.get("weight") or "light",
+        }
+        gesture = entry.get("gesture")
+        if gesture:
+            advertised["gesture"] = gesture
+        note = entry.get("note")
+        if note:
+            advertised["note"] = note
+        out.append(advertised)
+    return out
+
+
 # kind → the ``reply_dispatch`` loader name for that family's last_batch list.
 # Resolved via ``getattr(_rd, name)`` at call time (not pre-bound) so the
 # lookup always reflects the live module.

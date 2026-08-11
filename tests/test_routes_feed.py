@@ -672,3 +672,97 @@ async def test_act_rejects_a_non_string_section(attribution_client) -> None:
     )
     assert resp.status == 400
     assert (await resp.json())["error"] == "invalid_contested_section"
+
+
+# ---------------------------------------------------------------------------
+# Serve-time advertised actions (#102 1b)
+# ---------------------------------------------------------------------------
+# The verbs a client may use are DERIVED from the capability ceiling and stamped
+# on the way out, so an item already sitting in the store gains them on the next
+# read — no backfill, no migration. Driven through the real route because that
+# is the seam being claimed: `actions_for` is unit-pinned in
+# tests/feed/test_feed_advertised_actions.py and stays green against a route
+# that never calls it, which is precisely the shape this project keeps closing.
+
+
+async def test_served_items_carry_the_advertised_verbs(feed_client) -> None:
+    resp = await feed_client.get("/feed/items", headers=_FEED_HEADERS)
+    body = await resp.json()
+    actions = body["items"][0]["actions"]
+    assert actions, "a served email_tier item must advertise its verbs"
+    verbs = {a["verb"] for a in actions}
+    # The ceiling's own set, reaching the client without a hand-written mirror.
+    assert {"confirm", "spam"} <= verbs
+    confirm = next(a for a in actions if a["verb"] == "confirm")
+    assert confirm["label"] == "Confirm"
+    assert confirm["weight"] == "light"
+    assert confirm["gesture"] == "affirm"
+
+
+async def test_the_stored_item_itself_is_NOT_rewritten(feed_client) -> None:
+    """Serve-time means serve-time: the store keeps what the producer wrote.
+
+    Stamping into the store would be a migration performed by a GET — a read
+    that mutates, and one that would have to be re-run for every future change
+    to a label.
+    """
+    await feed_client.get("/feed/items", headers=_FEED_HEADERS)
+    stored = list(feed_client.app["_store"].load().values())[0]
+    assert stored.actions == []
+
+
+async def test_a_producer_stamped_item_is_left_alone(feed_client) -> None:
+    """A per-ITEM verb the per-KIND ceiling cannot express must survive.
+
+    Nothing does this today; the point is that the door is open, and that this
+    function is an enrichment of absence rather than an overwrite.
+    """
+    store = feed_client.app["_store"]
+    item = list(store.load().values())[0]
+    item.actions = [{"verb": "confirm", "label": "Bespoke", "weight": "light"}]
+    store.upsert(item)
+
+    resp = await feed_client.get("/feed/items", headers=_FEED_HEADERS)
+    served = (await resp.json())["items"][0]["actions"]
+    assert served == [{"verb": "confirm", "label": "Bespoke", "weight": "light"}]
+
+
+async def test_a_broken_verb_table_does_NOT_cost_the_operator_the_feed(
+    feed_client, monkeypatch
+) -> None:
+    """Isolation: the items are the payload, the verbs are an enrichment.
+
+    A fault in the presentation layer must degrade to verbless items, never to a
+    500 that empties a working surface. Mutation: drop the try/except in
+    `_stamp_actions` → this test raises instead of asserting.
+    """
+    import alfred.daily_sync.action_router as ar
+
+    def _boom(kind: str):
+        raise RuntimeError("verb table is broken")
+
+    monkeypatch.setattr(ar, "actions_for", _boom)
+
+    resp = await feed_client.get("/feed/items", headers=_FEED_HEADERS)
+    assert resp.status == 200
+    body = await resp.json()
+    # The item still arrives — that is the contract.
+    assert body["count"] == 1
+    assert body["items"][0]["id"] == feed_client.app["_fid"]
+    assert body["items"][0]["actions"] == []
+
+
+async def test_the_stamp_is_announced_even_when_it_stamps_nothing(
+    feed_client,
+) -> None:
+    """ILB: an all-FYI feed legitimately stamps zero, and must say so.
+
+    Without the line, "stamped nothing" and "the stamping never ran" look
+    identical in the log — and one of them is a broken deck.
+    """
+    with structlog.testing.capture_logs() as captured:
+        await feed_client.get("/feed/items?kind=weather", headers=_FEED_HEADERS)
+    events = [c for c in captured if c.get("event") == "transport.feed.actions_stamped"]
+    assert len(events) == 1
+    assert events[0]["stamped"] == 0
+    assert events[0]["total"] == 0

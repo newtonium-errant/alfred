@@ -88,6 +88,56 @@ def _pin_ok(request: web.Request) -> bool:
     return True
 
 
+def _stamp_actions(items: list[dict[str, Any]]) -> None:
+    """Fill each served item's ``actions`` from the capability ceiling (#102 1b).
+
+    SERVE-TIME, not produce-time, and the difference is the whole point: every
+    item ALREADY SITTING IN THE STORE gains its verbs on the next read, with no
+    backfill and no migration. Stamping at production would leave the live
+    store's existing items verbless until each one happened to be re-produced —
+    which for a decided-once item is never.
+
+    Producers keep the right to stamp their own: an item that arrives with a
+    non-empty ``actions`` list is left ALONE. Nothing does that today (every
+    ``FeedItem.create`` call site passes none, which is why the field has been
+    ``[]`` in production since it was defined), but a producer that later needs
+    a per-ITEM verb — one the per-KIND ceiling cannot express — must be able to
+    say so without this function overwriting the answer.
+
+    ISOLATED FROM THE READ. A fault in the verb table must never cost the
+    operator their feed: the items are the payload, the verbs are an
+    enrichment. On any failure the read completes with whatever was stamped so
+    far and the rest keep ``[]`` — degraded and SAID SO in the log, rather than
+    a 500 that empties a working surface.
+    """
+    try:
+        from alfred.daily_sync.action_router import actions_for
+    except Exception:  # pragma: no cover - import-time failure is not a read failure
+        log.warning("transport.feed.actions_unavailable", reason="import_failed")
+        return
+    stamped = 0
+    for item in items:
+        try:
+            if item.get("actions"):
+                continue
+            verbs = actions_for(str(item.get("kind") or ""))
+            if verbs:
+                item["actions"] = verbs
+                stamped += 1
+        except Exception as exc:
+            # Per-item, so one bad kind cannot cost the rest their verbs — the
+            # same partial-failure shape the act path uses.
+            log.warning(
+                "transport.feed.actions_stamp_failed",
+                id=item.get("id", ""),
+                kind=item.get("kind", ""),
+                error=type(exc).__name__,
+            )
+    # ILB: a read that stamped nothing is a real state (an all-FYI feed has no
+    # actionable kinds) and must be distinguishable from a table that broke.
+    log.info("transport.feed.actions_stamped", stamped=stamped, total=len(items))
+
+
 async def _handle_feed_items(request: web.Request) -> web.StreamResponse:
     """GET /feed/items — the folded feed store, optionally filtered.
 
@@ -121,6 +171,7 @@ async def _handle_feed_items(request: web.Request) -> web.StreamResponse:
         (it.to_dict() for it in all_items if _match(it)),
         key=lambda d: (d.get("created_at") or "", d.get("id") or ""),
     )
+    _stamp_actions(filtered)
     # ILB: log every read (even count=0) so "empty feed" is distinguishable
     # from "route silently broke".
     log.info(
