@@ -253,6 +253,134 @@ def test_an_omitted_bound_gets_the_considered_default() -> None:
     )
 
 
+def _seed_for_consumption(tmp_path: Path, *, n: int, processed: int) -> tuple:
+    """A real batch on disk: vault record, manifest, images, and a LONG ledger.
+
+    Returns ``(manifest, ledger_file, images_root, vault, rows)``. Deliberately
+    a real record rather than a stub — ``process_one`` reads it for the seal
+    check before the model call, so a stub would never reach the consumption
+    site this pin is about.
+    """
+    from alfred.batch.ledger import append_row, build_row, load_rows
+    from alfred.batch.manifest import save_manifest
+    from alfred.batch.paths import images_dir, ledger_path, manifest_path
+    from alfred.vault.ops import vault_create
+
+    vault = tmp_path / "vault"
+    (vault / "note").mkdir(parents=True, exist_ok=True)
+    data_dir = tmp_path / "data"
+    batch_id = "20260811-abcd1234"
+
+    result = vault_create(
+        vault, "note", f"Batch {batch_id}",
+        set_fields={
+            "batch_id": batch_id, "batch_status": "open",
+            "batch_items_total": n,
+        },
+        body="placeholder", scope="vera_batch",
+    )
+
+    imgs = images_dir(data_dir, "Salem", batch_id)
+    imgs.mkdir(parents=True, exist_ok=True)
+    manifest = _manifest(n)
+    manifest.record_path = result["path"]
+    for image in manifest.images:
+        (imgs / image.filename).write_bytes(b"\xff\xd8\xff" + b"\x01" * 32)
+    save_manifest(manifest_path(data_dir, "Salem", batch_id), manifest)
+
+    # A long ledger: every result is big enough that the whole body cannot fit
+    # inside the bound, which is what makes the two renderings distinguishable.
+    lp = ledger_path(data_dir, "Salem", batch_id)
+    for i in range(processed):
+        append_row(lp, build_row(
+            item_id=f"hash{i}", filename=f"scan-{i}.jpg",
+            outcome="ok", result=f"RESULT-{i} " + "y" * 400,
+        ))
+    return manifest, lp, imgs, vault, load_rows(lp)
+
+
+class _SpyClient:
+    """Captures the user content of the one model call it is asked to make."""
+
+    def __init__(self) -> None:
+        self.carried = ""
+        outer = self
+
+        class _Messages:
+            def create(self, **kwargs):
+                blocks = kwargs["messages"][0]["content"]
+                texts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
+                # The carried context is the block that names prior results.
+                outer.carried = next(
+                    (t for t in texts if "already recorded" in t), "",
+                )
+                return type("R", (), {"content": [
+                    type("B", (), {"type": "text", "text": "ok"})(),
+                ]})()
+
+        self.messages = _Messages()
+
+
+def test_process_one_actually_uses_the_bound_it_is_given(tmp_path: Path) -> None:
+    """THE CONSUMPTION pin (gate WARN-1) — the sibling of the threading pin.
+
+    The threading pin below proves the configured value ARRIVES at
+    ``process_one``. It cannot prove ``process_one`` USES it, and that gap was
+    real: swapping ``render_carried_context`` for ``render_body`` at the call
+    site — the bound accepted and then ignored — left 300 tests green. An
+    accepted-then-ignored parameter is the exact shape that ships a cost fix
+    which is never actually applied in the field.
+
+    So this drives the REAL ``process_one`` against a REAL long ledger and
+    asserts on what reached the model:
+
+      1. it is strictly SHORTER than the whole body would have been, and
+      2. it is the TAIL rather than everything — the earliest scan's section is
+         absent while the latest is present.
+
+    (2) is what makes this a bound rather than a coincidence. "Shorter" alone
+    could be satisfied by any truncation; only the head-absent/tail-present
+    pair distinguishes "kept the recent results" from "cut the string".
+    """
+    n, processed, bound = 20, 19, 1500
+    manifest, ledger_file, imgs, vault, rows = _seed_for_consumption(
+        tmp_path, n=n, processed=processed,
+    )
+    client = _SpyClient()
+
+    from alfred.batch.worker import process_one
+
+    process_one(
+        client=client,
+        manifest=manifest,
+        ledger_file=ledger_file,
+        images_root=imgs,
+        vault_path=vault,
+        item_id=f"hash{processed}",       # the one not yet in the ledger
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        carried_context_max_chars=bound,
+    )
+
+    carried = client.carried
+    assert carried, "no prior-results context reached the model at all"
+
+    whole_body = render_body(manifest, rows)
+    assert len(carried) < len(whole_body), (
+        f"process_one ignored its bound: it sent {len(carried)} chars, and the "
+        f"unbounded body is {len(whole_body)} — the cost fix is not applied"
+    )
+    # The bound binds (plus the wrapper prose the worker adds around it).
+    assert len(carried) < bound + 500, f"context was {len(carried)} chars"
+
+    # The TAIL survived and the HEAD did not — a real bound, not a truncation.
+    assert f"scan-{processed - 1}.jpg" in carried, "the most recent result was dropped"
+    assert "scan-0.jpg" not in carried, (
+        "the earliest result survived a 1500-char bound over 19 x ~400-char "
+        "results — the whole body is being sent"
+    )
+
+
 def test_work_threads_the_carried_context_bound(tmp_path: Path, monkeypatch) -> None:
     """THE wiring pin — driven through the REAL ``work()``.
 
