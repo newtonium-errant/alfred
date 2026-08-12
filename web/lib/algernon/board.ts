@@ -147,16 +147,31 @@ export const UNSLOTTED_LABEL = 'Not sorted yet';
  *
  * All three are true of the mechanism, and none of them may imply the operator
  * fell short. A stack empties two ways, neither of which is a miss: nothing was
- * classified into that slot, or its items were SNOOZED out of view on an earlier
- * day (`ringItemVisibleToday` drops an acted item once `acted_at` is no longer
- * today, and snoozing is an act). Completion is NOT one of the ways — a done
- * item keeps its stack non-empty and settles into the drill — so an empty stack
- * can never be the record of something left undone.
+ * classified into that slot, or its items were SNOOZED out of view. Completion
+ * is NOT one of the ways — a done item keeps its stack non-empty and settles
+ * into the drill — so an empty stack can never be the record of something left
+ * undone.
  *
- * The snooze path leaves every "today" here true: the shortest rung is
- * `snooze_1d`, so a snoozed item is never due back on the day it left, and the
- * day it was snoozed it was still on the board. A sub-day rung would break that
- * and these lines would need re-checking.
+ * THE SNOOZE PATH, WALKED (an earlier revision of this paragraph named the wrong
+ * branch, in the file this pass calls its constitution, so it is spelled out):
+ *
+ *   - A snooze does NOT travel the `acted_at` route. `FeedStore.defer`
+ *     (`feed/store.py`) writes `state=deferred` — never `acted`, and it never
+ *     touches `acted_at`. So `ringItemVisibleToday` falls past both of its
+ *     branches and drops the item at its FINAL unconditional `return false`,
+ *     the one that catches every state that is neither `open` nor `acted`.
+ *   - That gate is the WHOLE of the exclusion on this surface. Home fetches
+ *     `feedApi.list({})` with NO state filter, on purpose (the rings need
+ *     today's done items), so a deferred item IS delivered to the board and is
+ *     filtered here rather than at the wire. The `state: 'open'` fetch belongs
+ *     to the FEED page — do not borrow its reasoning for this one.
+ *
+ * The consequence the copy rests on: a snoozed item leaves the board on the NEXT
+ * POLL, the SAME day — not the following one. So "today" in these lines is
+ * guaranteed by RUNG LENGTH alone: the shortest rung is `snooze_1d`, so no timer
+ * can return an item on the day it left. A sub-day rung would break that and
+ * these lines would need re-checking. (An urgency breakthrough can return one
+ * early — at which point the stack is no longer empty and none of these render.)
  */
 export const SLOT_EMPTY_COPY: Record<string, string> = {
   duty: 'Nothing owed today.',
