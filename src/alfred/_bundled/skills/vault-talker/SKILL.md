@@ -196,7 +196,7 @@ For exact frontmatter shapes beyond these headline fields, trust the CLI — it 
 
 ### Task tiers — daily curation ritual (V2, shipped 2026-05-29)
 
-Tier is a **daily curation ritual**, not a persistent task attribute. Each morning Salem presents materials (auto-T1 candidates + T2 selection pool + yesterday's rollover) in the brief's **Open Tasks by Tier** section; the operator replies via Telegram to pick that day's T1/T2/T3 shortlists; Salem writes the selections into `vault/daily/<date>.md` under a `tier_curation` frontmatter block. The brief renders the curated shortlists from that point forward that day. Tomorrow morning the cycle restarts from a clean slate (with rollover indicators for yesterday's incomplete T1/T2).
+Tier is a **daily curation ritual**, not a persistent task attribute. Each morning Salem presents materials (auto-T1 candidates + T2 selection pool + yesterday's rollover) in the brief's **Today's Plan** section; the operator replies via Telegram to pick that day's T1/T2/T3 shortlists; Salem writes the selections into `vault/daily/<date>.md` under a `tier_curation` frontmatter block. The brief renders the curated shortlists from that point forward that day. Tomorrow morning the cycle restarts from a clean slate (with rollover indicators for yesterday's incomplete T1/T2).
 
 **Day-planning commitment is a live, deterministic capability.** When Andrew says *"put the interview on today's list"*, *"T2 confirm the rent item"*, or *"T1 confirm RRTS Payroll"*, you commit it with the **`tier_confirm` tool** (#21, shipped 2026-08-01; Salem-only like the rest of the tier system) — one call per item, deterministic write, no hand-assembled frontmatter. Never tell the operator you can't put something on the day's list.
 
@@ -370,7 +370,7 @@ Each routine item composes its tier surface via three fields: `due_pattern`, `su
 
 - **`escalate_at_days` ABSENT → item never auto-surfaces in tier.** This is the Walk-Fergus / daily-routine shape — no deadline, surfaces by cadence in the brief's routines section but NOT in the tier section. Reading and the other Aspirational items in `routine/Standing Practices.md` are this shape.
 - **`escalate_at_days` PRESENT + `surface_at_days` absent or `≤ escalate_at_days` → T1-only window** (the Garbage-Day shape). The item surfaces directly as a T1 candidate when inside the escalation window; no T2 ramp.
-- **`surface_at_days > escalate_at_days` → T2 ramp + T1 escalation** (the Pay-Clinic-Rental shape). The item surfaces as a T2 candidate (in the `T2_AUTO_ROUTINE_HEADER` subsection — see below) when `due - today ≤ surface_at_days`, then promotes to T1 when `due - today ≤ escalate_at_days`.
+- **`surface_at_days > escalate_at_days` → T2 ramp + T1 escalation** (the Pay-Clinic-Rental shape). The item surfaces as a T2 candidate when `due - today ≤ surface_at_days`, then promotes to T1 when `due - today ≤ escalate_at_days`. (It used to surface under a `T2_AUTO_ROUTINE_HEADER` subsection; since Phase C that heading is no longer rendered and the item appears inside its slot instead — see below. The tier LOGIC here is unchanged; only where it shows up moved.)
 
 Window boundaries (verified against the module docstring):
 
@@ -401,7 +401,7 @@ The brief's T2 bucket has a **new dedicated subsection** for routine-origin auto
 ```
 
 **Two new exported constants** (Ship B, in `alfred.brief.tier_section`):
-- `T2_AUTO_ROUTINE_HEADER = "#### Auto-surfaced (from routines)"` — the heading line for the auto-T2-routine subsection.
+- `T2_AUTO_ROUTINE_HEADER = "#### Auto-surfaced (from routines)"` — **defined but NO LONGER RENDERED as of Phase C.** The constant still exists in `tier_section` (and its value is still pinned), but the slot-arranged `Today's Plan` emits no such subsection: auto-surfaced routine items now appear inside their slot. Do not look for this heading in a brief, and do not tell Andrew to look for it. Regression pins assert it is absent from the rendered body.
 - `T2_ROUTINE_CONFIRM_PROMPT = '*(reply "T2 confirm" to keep on today\'s list)*'` — the canary string at the end of each auto-T2-routine line.
 
 These join the existing five exported constants (`T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`) as stable verbatim contracts. Salem recognises these strings in the brief to know which reply pattern is expected for each surface. If any rename at the code layer, this SKILL needs a follow-up sweep.
@@ -417,7 +417,7 @@ The verb grammar is the same as task-origin — `T1 confirm <item text>` and `T2
 
 #### The brief surface — render shapes operator will see
 
-The morning brief has a section titled exactly `Open Tasks by Tier` (single source of truth in `alfred.brief.tier_section.SECTION_HEADER`). It leads with the **daily-goal status line** (see **The daily goal — a balanced day** below), then three subsections of curated shortlists followed by materials:
+The morning brief has a section titled exactly `Today's Plan` (single source of truth in `alfred.brief.tier_section.SECTION_HEADER` — renamed from `Open Tasks by Tier` in Phase C; the same constant also titles `/today`'s first section, so the two surfaces cannot drift). Its rows are now **arranged by slot** (Duty / Rhythm / Fuel), while the daily goal it leads with is still **measured by tier** — group by slot, measure by tier, and never describe the goal as slot-based. It leads with the **daily-goal status line** (see **The daily goal — a balanced day** below), then three subsections of curated shortlists followed by materials:
 
 ```
 **Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1
@@ -443,11 +443,11 @@ The morning brief has a section titled exactly `Open Tasks by Tier` (single sour
 - T2: [[task/Connect QBO API — RRTS]] *(uncompleted yesterday)*
 ```
 
-**The empty-bucket prompt strings, rollover header, pool header, and routine-T2 affordances are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`, plus the two Ship B additions `T2_AUTO_ROUTINE_HEADER` and `T2_ROUTINE_CONFIRM_PROMPT` (see **Routine-origin tier entries** above for the routine-specific shapes). Salem recognises these strings in the brief to know which reply pattern is expected. If any string changes at the code layer, this SKILL needs a follow-up sweep.
+**The empty-bucket prompt strings, rollover header, pool header, and routine-T2 affordances are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`, plus the Ship B addition `T2_ROUTINE_CONFIRM_PROMPT` (see **Routine-origin tier entries** above for the routine-specific shapes). Salem recognises these strings in the brief to know which reply pattern is expected. **All of the above are still rendered and still verbatim — the Phase C restructure changed the section's title and the arrangement of its rows, not one byte of any reply affordance.** The one exception is `T2_AUTO_ROUTINE_HEADER`, which is still defined but no longer rendered (see above), so it is no longer a string to recognise in a brief. If any string changes at the code layer, this SKILL needs a follow-up sweep.
 
 #### The daily goal — a balanced day
 
-The **point** of the three tiers isn't to clear the urgent lane — it's a **balanced day**. The daily goal is to finish **at least one item from each of T1, T2, and T3** (urgent + medium + self-care), ideally with all T1 done. The brief renders this as a status line at the **top** of the `Open Tasks by Tier` section. The exact strings (verbatim from `alfred.brief.tier_section.render_daily_goal_line`):
+The **point** of the three tiers isn't to clear the urgent lane — it's a **balanced day**. The daily goal is to finish **at least one item from each of T1, T2, and T3** (urgent + medium + self-care), ideally with all T1 done. The brief renders this as a status line at the **top** of the `Today's Plan` section. Note the deliberate asymmetry: that section ARRANGES its rows by slot, but this goal is still counted across T1/T2/T3, so the balanced-day claim keys to tiers. Do not restate it as "one in every slot" — the flip of this metric to the slot axis is a separate gated change and has not happened. The exact strings (verbatim from `alfred.brief.tier_section.render_daily_goal_line`):
 
 - Goal met: `**Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 0/1`
 - Goal not yet met: `**Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1`
@@ -590,7 +590,7 @@ This is the pattern Andrew explicitly surfaced in the 2026-05-29 motivating conv
 When Andrew asks to **add a recurring practice** (not a today-only intention), the canonical home is `routine/Standing Practices.md`'s items list. This is distinct from T3 curation:
 
 - **Today-only intention** ("T3 add walk Fergus") → write to `tier_curation.t3` on today's daily file (Worked example C above).
-- **Recurring practice** ("add meditation to my standing practices") → `vault_edit path="routine/Standing Practices.md" append_fields={"items": {"text": "Meditation", "priority": "aspirational"}}`. The routine aggregator picks up the addition on its next daily run (~05:59 ADT); the item then appears in tomorrow's T3 selection pool and Today's Routines (Aspirational bucket).
+- **Recurring practice** ("add meditation to my standing practices") → `vault_edit path="routine/Standing Practices.md" append_fields={"items": {"text": "Meditation", "priority": "aspirational"}}`. The routine aggregator picks up the addition on its next daily run (~05:59 ADT); the item then appears in tomorrow's T3 selection pool, and — if it fires without escalating into a tier — inside its slot in the brief's `Today's Plan` (Phase C dissolved the standalone `Today's Routines` section into the slot groups; the daily checklist in `vault/daily/<date>.md` is unchanged).
 
 **Routine body mutation is denied.** Routine records are in `_BODY_MUTATE_DENIED_TYPES` — `body_insert_at` and `body_replace` both refuse. Frontmatter mutation via `set_fields` / `append_fields` is the only authorised path. The two-gate scope model: frontmatter mutation rides on `check_scope("edit", ...)` which the talker scope permits across all types; body mutation rides on the per-type deny set. A type can be permitted at frontmatter level AND denied at body level simultaneously, which is exactly the routine case. When debugging a scope refusal, check WHICH gate fired — the message names the rule.
 
@@ -2665,12 +2665,12 @@ Andrew can invoke these directly from Telegram. They're handled by the bot layer
 - `/end` — close the current session; transcript is persisted and the distiller picks it up later.
 - `/extract <short-id>` — pull standalone notes from a closed capture session.
 - `/brief <short-id>` — send a ~300-word audio summary of a closed capture session via ElevenLabs TTS.
-- `/today` — glance-view mini-brief composed in a single Telegram reply: **Open Tasks by Tier** + **Upcoming Events**. Salem-only (gated by `telegram.today_command.enabled` in `config.yaml`; default-disabled per-instance, currently on for Salem). Shipped 2026-05-28; routines section dropped 2026-05-29 in the Tier-V2 arc (Ship 3 scope refinement — routines live in the morning brief, `/today` is the mid-day glance focused on tier + calendar).
+- `/today` — glance-view mini-brief composed in a single Telegram reply: **Today's Plan** + **Upcoming Events**. Salem-only (gated by `telegram.today_command.enabled` in `config.yaml`; default-disabled per-instance, currently on for Salem). Shipped 2026-05-28; routines section dropped 2026-05-29 in the Tier-V2 arc (Ship 3 scope refinement — routines live in the morning brief, `/today` is the mid-day glance focused on tier + calendar).
 - `/speed [0.7-1.2]` — adjust TTS speed for this instance. `/speed` alone reports current + last 3 history entries. `/speed default` resets to 1.0. Per-(instance, user) — Salem and STAY-C each have their own stored value.
 - `/opus`, `/sonnet`, `/no_auto_escalate` — model-override controls for the active session.
 - `/status` — debug helper showing session stats.
 
-**Conversational affordance for `/today`.** When Andrew asks something `/today` would answer — *"what's on my today list?"* / *"what's on my plate right now?"* / *"what's my tier list?"* — you CAN suggest the command as a faster path: *"You can type `/today` for the glance view — Open Tasks by Tier + Upcoming Events in one reply."* Then answer his actual question from `vault_search` / `vault_read` as you normally would, in case he prefers your synthesised answer over the structured view. **Do NOT pre-emptively offer `/today` on unrelated messages.** It's an operator-tool surface, not a default-suggest; mention it only when his framing maps directly to the two sections it composes. **If Andrew asks about routines via `/today`** — *"why don't my routines show in /today anymore?"* — that's the Ship 3 scope refinement: routines live in the morning brief now, `/today` is the mid-day tier+calendar glance. Point him at the morning brief's `Today's Routines` section (which still renders Critical / Tracked / Aspirational buckets unchanged).
+**Conversational affordance for `/today`.** When Andrew asks something `/today` would answer — *"what's on my today list?"* / *"what's on my plate right now?"* / *"what's my tier list?"* — you CAN suggest the command as a faster path: *"You can type `/today` for the glance view — Today's Plan + Upcoming Events in one reply."* Then answer his actual question from `vault_search` / `vault_read` as you normally would, in case he prefers your synthesised answer over the structured view. **Do NOT pre-emptively offer `/today` on unrelated messages.** It's an operator-tool surface, not a default-suggest; mention it only when his framing maps directly to the two sections it composes. **If Andrew asks about routines via `/today`** — *"why don't my routines show in /today anymore?"* — that's the Ship 3 scope refinement: routines live in the morning brief now, `/today` is the mid-day glance. **The answer changed again in Phase C, so do not send him to a `Today's Routines` section — there no longer is one.** Routines were dissolved INTO the brief's `Today's Plan`, where each one now renders inside its own slot (Rhythm, mostly) beside that slot's tier rows; the per-item display is unchanged, only the grouping moved. Point him at `Today's Plan`. The full checklist is still `vault/daily/<date>.md` in Obsidian, written by the aggregator at ~05:59 exactly as before — the routine DATA did not change, only where the brief shows it.
 
 ---
 

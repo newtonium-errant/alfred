@@ -32,7 +32,7 @@ from alfred.brief.narration import (
 )
 from alfred.brief.weather import StationWeather
 from alfred.tier.compute import DailyGoalState, TierEntry, TodayView
-from alfred.tier.day_plan import build_day_plan
+from alfred.tier.day_plan import RolloverRef, build_day_plan
 
 DATE = "2026-08-01"
 
@@ -385,3 +385,156 @@ def test_waiting_count_zero_when_no_store_yet(tmp_path) -> None:
     from alfred.brief.narration import count_waiting_items
 
     assert count_waiting_items(str(tmp_path / "never-written.jsonl")) == 0
+
+
+# --- the day_plan segment speaks SLOTS (voice pass, pass 2) ------------------
+#
+# These are the pins the re-voicing needed and did not have: before it, the
+# day_plan / day_state / sign_off strings carried NO literal coverage at all,
+# so any drift in them was invisible to the suite. The same unpinned shape the
+# board pass found in its own introduced copy.
+
+
+def _slotted(name: str, slot: str, tier: int = 1) -> TierEntry:
+    """A tier entry whose slot is already STAMPED — the production shape here.
+
+    ``slot`` is set directly, not via ``explicit_slot``, because
+    ``build_day_plan`` does not classify: ``PlanRow.slot`` reads the stamped
+    ``entry.slot``, and ``classify_slot`` runs upstream when the view is built.
+    A fixture using ``explicit_slot`` lands every row in ``unslotted`` — which
+    is how this helper was first written, and what the axis pin below caught.
+    The overlay is computed once and re-projected, never re-derived here.
+    """
+    return TierEntry(
+        tier=tier, origin="task", name=name,
+        path=f"task/{name}.md", slot=slot,
+    )
+
+
+def _plan_of(*entries: TierEntry) -> object:
+    view = TodayView(daily_goal=DailyGoalState())
+    for e in entries:
+        {1: view.t1, 2: view.t2, 3: view.t3}[e.tier].append(e)
+    return build_day_plan(view, rollover=[], is_done=lambda _e: False)
+
+
+def _seg(narr, section_id: str) -> str:
+    hit = [s.text for s in narr.segments if s.section_id == section_id]
+    return hit[0] if hit else ""
+
+
+def test_day_plan_segment_names_the_slots() -> None:
+    """Duty / Rhythm / Fuel are spoken — the arrangement the brief renders."""
+    narr = _compose(plan=_plan_of(
+        _slotted("Rent", "duty"),
+        _slotted("Guitar", "fuel", tier=3),
+    ))
+    said = _seg(narr, "day_plan")
+    assert "Duty: Rent." in said, said
+    assert "Fuel: Guitar." in said, said
+
+
+def test_day_plan_speaks_the_stamped_slot_not_the_tier() -> None:
+    """THE AXIS PIN, and the reason this re-voicing is legal at all.
+
+    A TIER-1 item stamped ``rhythm`` must be spoken under Rhythm. If the
+    segment were reading ``rows_in_tier`` and printing slot labels over it —
+    the superseded G9 rename — this row would be announced as Duty: a
+    confident wrong answer printed on top of data that already holds the right
+    one. The render-level twin of the board's own axis pin.
+    """
+    narr = _compose(plan=_plan_of(_slotted("Walk Fergus", "rhythm", tier=1)))
+    said = _seg(narr, "day_plan")
+    assert "Rhythm: Walk Fergus." in said, said
+    assert "Duty" not in said, said
+
+
+def test_day_plan_leads_with_what_is_still_carried() -> None:
+    """Carryover is announced before today's own commitments, and named as
+    carried — the board's ordering, spoken."""
+    plan = build_day_plan(
+        TodayView(t1=[_slotted("Pay Eastlink", "duty")], daily_goal=DailyGoalState()),
+        rollover=[RolloverRef(
+            tier_label="T1", wikilink="[[task/Pay Eastlink]]",
+            record_name="Pay Eastlink",
+        )],
+        is_done=lambda _e: False,
+    )
+    said = _seg(_compose(plan=plan), "day_plan")
+    assert said.startswith("Still carrying:"), said
+    assert "Pay Eastlink" in said
+
+
+def test_day_plan_says_so_when_the_day_is_empty() -> None:
+    """ILB: an empty plan says it ran and found nothing, rather than omitting
+    the slide and leaving 'no plan' indistinguishable from 'no data'."""
+    said = _seg(_compose(plan=_plan_of()), "day_plan")
+    assert said == "Today's plan is empty so far — nothing due, and no routines firing."
+
+
+def test_the_goal_segments_never_name_a_slot() -> None:
+    """THE FENCE, pinned where it can actually fail.
+
+    ``day_state`` and ``sign_off`` key on ``daily_goal``, which is TIER-based
+    until a separate gated flip. Naming a slot in either would claim a
+    slot-based goal the server does not measure. This also guards the specific
+    regression the voice pass fixed: the old sign-off closed on "take it one
+    slot at a time", which put the word in the one place it may not appear.
+    """
+    narr = _compose(
+        view=_view(t1_available=2, t1_done=0, t2_available=1, t3_available=1),
+        plan=_plan_of(_slotted("Rent", "duty"), _slotted("Guitar", "fuel", tier=3)),
+    )
+    for section in (SECTION_DAY_STATE, SECTION_SIGN_OFF):
+        text = _seg(narr, section)
+        assert text, section
+        for word in ("slot", "Duty", "Rhythm", "Fuel"):
+            assert word not in text, (section, word, text)
+
+
+def test_sign_off_grants_rather_than_urges() -> None:
+    """The board pass's register ruling, carried into the spoken close: state
+    where the day stands, leave the choosing to him. No cheerleading."""
+    balanced = _seg(_compose(view=_view(balanced_day=True)), SECTION_SIGN_OFF)
+    assert balanced == "One in every tier already. The rest of the day is yours."
+    for banned in ("You've got this", "Go get it"):
+        assert banned not in balanced
+
+
+def test_a_carryover_only_slot_is_still_named() -> None:
+    """WARN-1, half one. A slot whose every row is carried hit neither branch
+    and VANISHED — the slot holding the day's oldest weight was the one the
+    copy never mentioned. Its items still reached the lead line, so the loss
+    was WHICH SLOT they sit in, which is the whole point of speaking slots.
+    """
+    plan = build_day_plan(
+        TodayView(t1=[_slotted("Morning pages", "rhythm")], daily_goal=DailyGoalState()),
+        rollover=[RolloverRef(
+            tier_label="T1", wikilink="[[task/Morning pages]]",
+            record_name="Morning pages",
+        )],
+        is_done=lambda _e: False,
+    )
+    said = _seg(_compose(plan=plan), "day_plan")
+    assert "Rhythm: 1 carried." in said, said
+    assert "Still carrying: Morning pages." in said, said
+
+
+def test_the_carried_cap_speaks_its_own_overflow() -> None:
+    """WARN-1, half two. The carried list capped at two SILENTLY, beside a
+    committed branch that says ", and N more." honestly — the one list that
+    dropped items without a word was the one the function leads with because
+    it has already cost him a day. A rule this function states is a rule it is
+    held to first.
+    """
+    names = ["Alpha", "Bravo", "Charlie", "Delta"]
+    plan = build_day_plan(
+        TodayView(t1=[_slotted(n, "duty") for n in names], daily_goal=DailyGoalState()),
+        rollover=[
+            RolloverRef(tier_label="T1", wikilink=f"[[task/{n}]]", record_name=n)
+            for n in names
+        ],
+        is_done=lambda _e: False,
+    )
+    said = _seg(_compose(plan=plan), "day_plan")
+    assert "Still carrying: Alpha, Bravo, and 2 more." in said, said
