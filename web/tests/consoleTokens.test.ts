@@ -39,7 +39,7 @@ const tailwindConfig = require('../tailwind.config.cjs') as {
 };
 const CONSOLE_CSS = readFileSync(resolve(__dirname, '../styles/console.css'), 'utf8');
 
-const ROLES: ConsoleRole[] = ['affirm', 'negative', 'caution', 'info'];
+const ROLES: ConsoleRole[] = ['affirm', 'negative', 'caution', 'info', 'environment'];
 
 /**
  * Every Tailwind colour name the config defines, in the `family-shade` (and
@@ -205,7 +205,15 @@ describe('console identity — the wiring has no silent failure', () => {
     // `var(--console-typo)` generates a perfectly valid rule that resolves to
     // nothing. Checked against the stylesheet's real text.
     const colors = tailwindConfig.theme.extend.colors as Record<string, unknown>;
-    const consoleFamilies = ['console', 'affirm', 'negative', 'caution', 'info', 'accent'];
+    // DERIVED from ROLES, not restated. The first spelling of this list was a
+    // hardcoded ['console','affirm','negative','caution','info','accent'], which
+    // made the guard silently role-blind: adding `environment` to ROLES extended
+    // the Tailwind half of the chain (that check IS ROLES-driven) while this
+    // half kept checking the original four, so a role could ship with no CSS
+    // variables behind it and the suite stayed green. Verified by deleting the
+    // new role's three custom properties — 0 failures before this change, 2
+    // after. The same map-pin-under-a-runtime-name shape the arc has hit before.
+    const consoleFamilies = ['console', ...ROLES, 'accent'];
     let checked = 0;
     for (const family of consoleFamilies) {
       const value = colors[family];

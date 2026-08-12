@@ -96,6 +96,11 @@ module.exports = {
           deep: 'var(--console-info-deep)',
           wash: 'var(--console-info-wash)',
         },
+        environment: {
+          DEFAULT: 'var(--console-environment)',
+          deep: 'var(--console-environment-deep)',
+          wash: 'var(--console-environment-wash)',
+        },
         // Instance provenance — identity, not judgement. Hues chosen to avoid
         // every function role, and assigned by a stable hash of the instance
         // name (lib/algernon/consoleTokens.ts), never by a name literal.

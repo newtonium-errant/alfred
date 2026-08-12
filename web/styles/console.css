@@ -26,13 +26,20 @@
  *
  * THE LOAD-BEARING PART IS THE FUNCTION ROLES, NOT THE HEXES.
  * LCARS's actual idea — the one thing worth keeping from 1987 — is that
- * colour CARRIES MEANING rather than decorating. Four roles, and every
+ * colour CARRIES MEANING rather than decorating. Five roles, and every
  * surface must spend them the same way or the grammar stops being a grammar:
  *
- *   affirm    teal   yes · confirm · accept · it landed
- *   negative  rust   no · reject · spam · this destroys something
- *   caution   amber  not now, or not without a second look
- *   info      slate  neutral structure; carries no verdict
+ *   affirm       teal        yes · confirm · accept · it landed
+ *   negative     rust        no · reject · spam · this destroys something
+ *   caution      amber       not now, or not without a second look
+ *   info         slate       neutral structure; carries no verdict
+ *   environment  periwinkle  the world, not the work — weather, a time extent
+ *
+ * `environment` and `info` are both non-verdict and that is the pair a
+ * consumer will confuse. `info` dresses the surface's OWN structure — a
+ * divider, a count, a label the app drew. `environment` is the ambient world
+ * the surface reports on: a fog corridor from 11:00 to 15:00 is true with the
+ * screen off. That test settles it.
  *
  * `caution` deliberately covers BOTH the defer family (swipe-up, snooze) and
  * the heavy-verb arm stage. They are one idea to the eye — *slow down* — and
@@ -87,6 +94,23 @@
   --console-info: #77839b;
   --console-info-deep: #414a5c;
   --console-info-wash: #1e2530;
+
+  /* The environment role (added 2026-08-12 with the feed's sensor-log swap).
+   * Hue 254 — periwinkle — picked by MEASURING the circle rather than by eye:
+   * it sits in the largest gap the identity had left (69 degrees, between
+   * info/slate at 220 and the plum instance accent at 289), and its chroma is
+   * 23-25 points above both of those, which is what actually separates it since
+   * they are near-grey. The four function hues and the four accent hues were
+   * all enumerated first; amber was never a candidate — it is caution's alone.
+   *
+   * Ramp matched to the family, not invented: signal 4.9:1 on panel (between
+   * info's 4.49 and affirm's 6.02), ink-on-deep 7.5:1 (alongside info's 7.2
+   * and negative's 7.75), wash within a point of info-wash's lightness.
+   * NOT yet seen on a real screen — the numbers say it belongs; the walkthrough
+   * says whether it reads. */
+  --console-environment: #907ec8;
+  --console-environment-deep: #4c3e79;
+  --console-environment-wash: #211c30;
 
   /* ── instance accents — IDENTITY, DELIBERATELY NOT A VERDICT ─────────────
    * Which instance an item came from is provenance, not a judgement, so the
