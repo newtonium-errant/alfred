@@ -36,11 +36,18 @@ loop the standard asks for.
 are derivable from the numbers on the line. Duplicate-denial,
 documentation-required, resubmission-required and identity-mismatch are
 statements ABOUT the line that only its EOB code (or the operator) can
-make — in particular identity-mismatch (the Slaney/Staney shape) is not
-derivable statement-side at all, because detecting it needs a reference
-for the correct spelling, which is the P2 invoice export. The class exists
-in the vocabulary and is reachable through the map and through a
-correction; it is not claimed to be auto-detected.
+make — in particular identity-mismatch (the Smith/Smyth shape: a claimant
+name transposed by a letter, so the provider cannot match it to a member)
+is not derivable statement-side at all, because detecting it needs a
+reference for the correct spelling, which is the P2 invoice export. The
+class exists in the vocabulary and is reachable through the map and
+through a correction; it is not claimed to be auto-detected.
+
+The example pair above is INVENTED, and that is a rule rather than an
+accident: this repository is public and this package's subject is real
+claims data. The fixtures carry a WHOLLY-INVENTED banner for that reason,
+and the same reason covers prose — a real claimant name in a docstring is
+the same disclosure as one in a table row, read more often.
 """
 
 from __future__ import annotations
