@@ -52,6 +52,21 @@ export interface TimelineViewProps {
   renderDetail?: (item: FeedItem) => ReactNode;
 }
 
+/**
+ * A role token at a given opacity, kept TRANSLUCENT on purpose.
+ *
+ * The five trace fills were inline `rgba()` literals before the token swap. The
+ * obvious re-point was the role's opaque `-wash` hex, and it would have been
+ * wrong: these fills composite over the band, so the hour gridlines show
+ * THROUGH a trace, and an opaque backing would occlude them — the axis would
+ * lose its ruling wherever an item sat on it. `color-mix` re-points the colour
+ * to the role while preserving exactly that behaviour.
+ *
+ * Supported on the PWA's floor (Safari 16.2+; the installed-PWA target is 16.4).
+ */
+const MIX = (token: string, pct: number): string =>
+  `color-mix(in srgb, var(${token}) ${pct}%, transparent)`;
+
 /** A trace's own colour register. Weather is the environment, not an errand. */
 function traceTone(item: FeedItem): 'weather' | 'quiet' | 'live' {
   if (item.kind === 'weather') return 'weather';
@@ -59,9 +74,9 @@ function traceTone(item: FeedItem): 'weather' | 'quiet' | 'live' {
 }
 
 const TONE_STYLE: Record<'weather' | 'quiet' | 'live', { border: string; fill: string; text: string }> = {
-  weather: { border: 'var(--sensor-amber2)', fill: 'rgba(201,154,76,0.10)', text: 'var(--sensor-amber)' },
-  live: { border: 'var(--sensor-teal2)', fill: 'rgba(79,167,161,0.10)', text: 'var(--sensor-teal)' },
-  quiet: { border: 'var(--sensor-slate2)', fill: 'rgba(119,131,155,0.08)', text: 'var(--sensor-slate)' },
+  weather: { border: 'var(--sensor-environment-deep)', fill: MIX('--sensor-environment', 10), text: 'var(--sensor-environment)' },
+  live: { border: 'var(--sensor-affirm-deep)', fill: MIX('--sensor-affirm', 10), text: 'var(--sensor-affirm)' },
+  quiet: { border: 'var(--sensor-info-deep)', fill: MIX('--sensor-info', 8), text: 'var(--sensor-info)' },
 };
 
 function clippedClass(p: BandPlacement): string {
@@ -92,8 +107,8 @@ function WeatherPeriods({ item, window: w }: { item: FeedItem; window: TimeWindo
               // above and left untinted, so the two never read alike. The
               // producer keeps probabilistic blocks out of the item's extent
               // precisely so a renderer can hold them in a separate register.
-              backgroundColor: p.possible ? 'transparent' : 'rgba(201,154,76,0.13)',
-              borderTop: '1px solid rgba(201,154,76,0.35)',
+              backgroundColor: p.possible ? 'transparent' : MIX('--sensor-environment', 13),
+              borderTop: `1px solid ${MIX('--sensor-environment', 35)}`,
             }}
           />
         );
@@ -130,10 +145,10 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
   return (
     <section data-surface="sensor-log" data-testid="feed-timeline" className="mt-4 rounded-lg p-3">
       <header className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-        <span className="sensor-label" style={{ color: 'var(--sensor-teal)' }}>
+        <span className="sensor-label" style={{ color: 'var(--sensor-affirm)' }}>
           Sensor log
         </span>
-        <span data-testid="timeline-window" className="sensor-num text-[11px]" style={{ color: 'var(--sensor-ink3)' }}>
+        <span data-testid="timeline-window" className="sensor-num text-[11px]" style={{ color: 'var(--sensor-ink-dim)' }}>
           {formatClock(w.from)} → {formatClock(w.to)}
         </span>
         <span data-testid="timeline-counts" className="sensor-label ml-auto">
@@ -147,7 +162,7 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
         // full while the band is empty, because only some producers stamp an
         // extent, and "nothing is happening" must never be confused with
         // "nothing here knows when it happens".
-        <p data-testid="timeline-empty" className="mt-3 text-sm" style={{ color: 'var(--sensor-ink3)' }}>
+        <p data-testid="timeline-empty" className="mt-3 text-sm" style={{ color: 'var(--sensor-ink-dim)' }}>
           Nothing on the band in this window
           {split.untimed.length + split.beyond.length > 0
             ? ' — every item the feed is holding sits in the registers below.'
@@ -166,7 +181,7 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
                 key={t}
                 data-testid="timeline-tick"
                 className="sensor-num absolute right-1 -translate-y-1/2 text-[10px]"
-                style={{ top: `${positionPct(t, w)}%`, color: 'var(--sensor-ink4)' }}
+                style={{ top: `${positionPct(t, w)}%`, color: 'var(--sensor-ink-ghost)' }}
               >
                 {formatClock(t)}
               </li>
@@ -234,7 +249,7 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
                   </span>
                   <span
                     className="relative mt-0.5 block truncate text-[11px] leading-tight"
-                    style={{ color: 'var(--sensor-ink2)' }}
+                    style={{ color: 'var(--sensor-ink-dim)' }}
                   >
                     {item.title || item.id}
                   </span>
@@ -256,7 +271,7 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
             <span
               data-testid="timeline-now-label"
               className="sensor-num pointer-events-none absolute right-1 z-10 text-[10px] font-bold"
-              style={{ top: `calc(${nowPct}% + 3px)`, color: 'var(--sensor-teal)' }}
+              style={{ top: `calc(${nowPct}% + 3px)`, color: 'var(--sensor-affirm)' }}
             >
               NOW {formatClock(clock)}
             </span>
@@ -315,7 +330,7 @@ function Register({
   return (
     <section data-testid={testId} className="mt-4">
       <h3 className="sensor-label">{label}</h3>
-      <p className="mt-0.5 text-[11px]" style={{ color: 'var(--sensor-ink4)' }}>
+      <p className="mt-0.5 text-[11px]" style={{ color: 'var(--sensor-ink-ghost)' }}>
         {note}
       </p>
       <ul className="mt-2 flex flex-col gap-2">
@@ -329,7 +344,7 @@ function Register({
               key={item.id}
               data-testid={`${testId}-item`}
               className="rounded px-2 py-1.5 text-[11px]"
-              style={{ backgroundColor: 'var(--sensor-panel)', color: 'var(--sensor-ink2)' }}
+              style={{ backgroundColor: 'var(--sensor-panel)', color: 'var(--sensor-ink-dim)' }}
             >
               {item.title || item.id}
             </li>
