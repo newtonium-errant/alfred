@@ -94,8 +94,19 @@ export interface FeedItem {
    * `new Date("2026-08-12")` succeeds and invents midnight UTC, turning an
    * all-day event into a zero-length one at 00:00.
    *
-   * Optional on this interface (rather than `string | null`) because a cached
-   * pre-D7 payload in the service worker legitimately has neither key.
+   * Optional on this interface (rather than `string | null`) because a payload
+   * from a pre-D7 BACKEND legitimately has neither key: the box can be
+   * half-deployed — a client that declares them against a transport that does
+   * not yet stamp them — and the BFF relays the transport body VERBATIM
+   * (`pages/api/feed/list.ts`), so nothing on the response path supplies a
+   * default for a key the producer never wrote.
+   *
+   * NOT a service-worker cache. `sw.js` never intercepts `/api/*` at all — it
+   * returns early on that prefix before any cache lookup (sw.js:229, the
+   * "never intercept or cache live/session-scoped endpoints" rule) — so no feed
+   * payload is ever served from a cache, and a stale cached body cannot be the
+   * reason for either key's absence. The conclusion stands; only the mechanism
+   * was wrong.
    */
   starts_at?: string | null;
   ends_at?: string | null;
