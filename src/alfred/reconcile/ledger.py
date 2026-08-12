@@ -97,12 +97,31 @@ def _money_out(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
 
+def statement_key(statement_date: str, statement_occurrence: int = 0) -> str:
+    """A statement's identity: its date, plus a tiebreak for same-day blocks.
+
+    The date alone is NOT unique. A provider can issue two statements on one
+    day, and the note prints each with its own header block — so keying on
+    the date alone makes the second block's header overwrite the first's on
+    upsert, taking its ``payment_total`` with it and silently attributing
+    both blocks' claim lines to one statement. That is not hypothetical: it
+    happened on the real note (2026-04-23), where the fold hid a second
+    statement's lines inside the first and put the cross-foot 16,894 out.
+
+    ``statement_occurrence`` is assigned by the parser, which folds same-date
+    blocks only when their header facts are compatible and splits them
+    otherwise. See :func:`alfred.reconcile.parser.parse_note`.
+    """
+    return f"{statement_date or ''}#{statement_occurrence}"
+
+
 def line_key(
     statement_date: str,
     claim_no: str,
     dos: str,
     benefit_code: str,
     occurrence: int = 0,
+    statement_occurrence: int = 0,
 ) -> str:
     """The claim line's identity: the ratified key, plus a tiebreak.
 
@@ -127,6 +146,13 @@ def line_key(
         dos or "",
         benefit_code or "",
         str(occurrence),
+        # The statement occurrence is part of the LINE key, not only the
+        # statement key. Two same-day statements can each carry the same
+        # claim_no + dos + benefit_code — a re-billed claim, which is
+        # precisely the population a duplicate-denial produces — and without
+        # this the two rows collide and the upsert keeps one. Losing a
+        # re-billed line is losing the evidence that it was re-billed.
+        str(statement_occurrence),
     ])
 
 
@@ -152,6 +178,9 @@ class ClaimLine:
     #: Parsed out of ``comments`` — the join key to the invoice side (P2).
     invoice_no: str = ""
     occurrence: int = 0
+    #: Which same-day statement block this line belongs to. Stamped by the
+    #: parser at statement-flush time; part of :attr:`key`.
+    statement_occurrence: int = 0
     row_type: str = ROW_CLAIM
 
     # --- provenance -------------------------------------------------------
@@ -175,6 +204,7 @@ class ClaimLine:
             self.dos,
             self.benefit_code,
             self.occurrence,
+            self.statement_occurrence,
         )
 
     @property
@@ -224,6 +254,13 @@ class ClaimLine:
                 known["occurrence"] = int(known["occurrence"] or 0)
             except (TypeError, ValueError):
                 known["occurrence"] = 0
+        if "statement_occurrence" in known:
+            try:
+                known["statement_occurrence"] = int(
+                    known["statement_occurrence"] or 0
+                )
+            except (TypeError, ValueError):
+                known["statement_occurrence"] = 0
         if "inferred" in known:
             known["inferred"] = bool(known["inferred"])
         return cls(**known)
@@ -253,6 +290,9 @@ class Statement:
     #: between the two is surfaced as a finding rather than resolved by this
     #: layer guessing which source wins.
     declared_totals: dict[str, str] = field(default_factory=dict)
+    #: Distinguishes two statements issued on the SAME DAY. Assigned by the
+    #: parser; see :func:`statement_key`.
+    statement_occurrence: int = 0
     row_type: str = ROW_STATEMENT
 
     source_note: str = ""
@@ -264,7 +304,7 @@ class Statement:
 
     @property
     def key(self) -> str:
-        return self.statement_date or ""
+        return statement_key(self.statement_date, self.statement_occurrence)
 
     def declared_totals_decimal(self) -> dict[str, Decimal]:
         """The declared totals as Decimals, skipping any that will not parse.
@@ -307,6 +347,13 @@ class Statement:
                 known["claim_line_count"] = int(known["claim_line_count"] or 0)
             except (TypeError, ValueError):
                 known["claim_line_count"] = 0
+        if "statement_occurrence" in known:
+            try:
+                known["statement_occurrence"] = int(
+                    known["statement_occurrence"] or 0
+                )
+            except (TypeError, ValueError):
+                known["statement_occurrence"] = 0
         if "declared_totals" in known:
             # Coerced to a str->str mapping. A hand-edited or older ledger may
             # carry numbers here; normalising on load keeps every reader from
@@ -551,42 +598,61 @@ def upsert(
 def group_by_statement(
     contents: LedgerContents,
 ) -> list[tuple[Statement, list[ClaimLine], list[ClaimLine]]]:
-    """``[(statement, claim_lines, subtotals)]`` in statement-date order.
+    """``[(statement, claim_lines, subtotals)]`` in date-then-occurrence order.
 
-    Claim lines whose ``statement_date`` matches no statement header are
-    still returned, under a SYNTHESISED statement carrying just that date.
+    Grouping is on ``(statement_date, statement_occurrence)``, NOT on the
+    date alone. Two statements issued on one day are two groups, and their
+    claim lines follow their own block — grouping by date would put both
+    blocks' lines under whichever header won the upsert and hand the
+    cross-foot a sum that belongs to two statements and reconciles against
+    neither.
+
+    Claim lines whose group matches no statement header are still returned,
+    under a SYNTHESISED statement carrying that date and occurrence.
     Dropping them would be the silent-absence failure: a note whose header
     this parser did not recognise would render as no statement at all
     rather than as a statement with an unknown provider.
     """
-    by_date: dict[str, Statement] = {s.statement_date: s for s in contents.statements}
-    claims_by_date: dict[str, list[ClaimLine]] = {}
-    subs_by_date: dict[str, list[ClaimLine]] = {}
+    def _group(row: Any) -> tuple[str, int]:
+        return (row.statement_date, row.statement_occurrence)
+
+    by_group: dict[tuple[str, int], Statement] = {
+        _group(s): s for s in contents.statements
+    }
+    claims_by_group: dict[tuple[str, int], list[ClaimLine]] = {}
+    subs_by_group: dict[tuple[str, int], list[ClaimLine]] = {}
 
     for c in contents.claim_lines:
-        claims_by_date.setdefault(c.statement_date, []).append(c)
+        claims_by_group.setdefault(_group(c), []).append(c)
     for c in contents.subtotals:
-        subs_by_date.setdefault(c.statement_date, []).append(c)
+        subs_by_group.setdefault(_group(c), []).append(c)
 
-    all_dates = set(by_date) | set(claims_by_date) | set(subs_by_date)
+    all_groups = set(by_group) | set(claims_by_group) | set(subs_by_group)
     out: list[tuple[Statement, list[ClaimLine], list[ClaimLine]]] = []
-    for d in sorted(all_dates):
-        stmt = by_date.get(d)
+    for key in sorted(all_groups):
+        date, occurrence = key
+        stmt = by_group.get(key)
         if stmt is None:
-            stmt = Statement(statement_date=d, provider="", company="")
+            stmt = Statement(
+                statement_date=date,
+                provider="",
+                company="",
+                statement_occurrence=occurrence,
+            )
             log.info(
                 "reconcile.ledger.synthesised_statement",
-                statement_date=d,
-                claim_lines=len(claims_by_date.get(d, [])),
+                statement_date=date,
+                statement_occurrence=occurrence,
+                claim_lines=len(claims_by_group.get(key, [])),
                 detail="claim lines carry a statement date with no matching "
                        "statement header row — grouped under a header with "
                        "no provider rather than dropped",
             )
         claims = sorted(
-            claims_by_date.get(d, []), key=lambda r: (r.source_line, r.key)
+            claims_by_group.get(key, []), key=lambda r: (r.source_line, r.key)
         )
         subs = sorted(
-            subs_by_date.get(d, []), key=lambda r: (r.source_line, r.key)
+            subs_by_group.get(key, []), key=lambda r: (r.source_line, r.key)
         )
         out.append((stmt, claims, subs))
     return out

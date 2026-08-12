@@ -50,16 +50,37 @@ Structural quirks handled, each because the real source has them:
 * **two-column statement-totals blocks** — captured into
   :attr:`alfred.reconcile.ledger.Statement.declared_totals` and
   deliberately NOT assigned to ``payment_total``
+* **full-width aggregate rows** — per-claimant sub-totals and grand totals
+  printed with the SAME column count as claim lines and a WORD in the id
+  cell, so neither the totals-block detector nor a literal-label check sees
+  them. Discriminated on field population (see :func:`_looks_like_aggregate`)
+  and captured as :data:`~alfred.reconcile.ledger.ROW_SUBTOTAL`. Absorbed as
+  claim lines they double-count the provider's own arithmetic into ours,
+  which is the one error a cross-foot cannot catch — it corrupts the number
+  being checked.
+* **two statements issued on one date** — each printed with its own header
+  block. The statement key carries an occurrence
+  (:func:`~alfred.reconcile.ledger.statement_key`) and so does the LINE key,
+  because two same-day statements can each hold the same claim. Blocks fold
+  only when their header facts are compatible; a conflict splits them, and
+  both outcomes are logged with provenance.
 
 **Validation status, because the earlier version of this note said the
-opposite and a docstring that lies is worse than one that hedges.** A
-read-only dry run against a genuine provider payment summary has now
-happened: 23 statements, 274 claim lines, 19 of 21 tables parsed, every
-skipped row named. The statement-header patterns below are therefore
-CONFIRMED against real input rather than modelled from a spec. The three
-bullets above are the shapes that run found — all three were absent from
-the synthetic fixtures, which is why a fully green suite said nothing
-about any of them.
+opposite and a docstring that lies is worse than one that hedges.** Two
+read-only dry runs against a genuine provider payment summary have now
+happened. The first: 23 statements, 274 claim lines, 19 of 21 tables, 146
+rows skipped — every loss named, and the three shapes it exposed are the
+bold-aggregate, continuation and totals-block bullets above. The second,
+after those fixes: **0 rows skipped, 414 claim lines** — and the cross-foot
+then caught what it exists to catch, one statement 45,178.00 out,
+decomposing exactly into absorbed aggregate rows (28,284.00) and a wrongly
+folded same-day statement (16,894.00). Those are the last two bullets.
+
+The pattern across both rounds is worth keeping: **every shape that cost us
+money was one the fixtures did not contain**, and in each case a fully green
+suite said nothing, because a fixture set that omits a shape cannot fail on
+it. The parse layer is now confirmed against real input; the fixtures carry
+each shape with invented content.
 
 The COLUMN mapping remains robust by construction — it keys on names, and
 unknown headings are reported through
@@ -319,6 +340,18 @@ class ParseResult:
     #: collisions are: an inherited mapping is an inference, and an inference
     #: the operator cannot see is one nobody can check.
     continuations: list[int] = field(default_factory=list)
+    #: Line numbers of full-width rows reclassified as the provider's own
+    #: arithmetic on field population rather than on a literal label. Same
+    #: reason as ``continuations``: an inference that moves money between the
+    #: claim sum and the cross-foot inputs must be visible.
+    aggregate_rows: list[int] = field(default_factory=list)
+    #: Same-date statement blocks that were kept APART because their header
+    #: facts conflicted, as ``(date, occurrence, reason)``.
+    statement_splits: list[tuple[str, int, str]] = field(default_factory=list)
+    #: Same-date statement blocks folded together as one statement, as
+    #: ``(date, occurrence)``. A fold is the legitimate re-printed-header
+    #: case; it is logged anyway so a WRONG fold is never silent.
+    statement_folds: list[tuple[str, int]] = field(default_factory=list)
     tables_seen: int = 0
     tables_parsed: int = 0
 
@@ -375,8 +408,8 @@ def _map_columns(
     return mapping, unmapped
 
 
-def _is_subtotal_row(cells: list[str], mapping: dict[int, str]) -> bool:
-    """Whether this data row is the provider's own arithmetic."""
+def _has_subtotal_label(cells: list[str], mapping: dict[int, str]) -> bool:
+    """Whether an identity cell carries a literal SUB-TOTAL / TOTAL label."""
     # Check the identity-ish columns: a subtotal row typically carries the
     # label where the claim number or the surname would be.
     for idx, field_name in mapping.items():
@@ -393,6 +426,61 @@ def _is_subtotal_row(cells: list[str], mapping: dict[int, str]) -> bool:
         if any(norm_first.startswith(marker) for marker in _SUBTOTAL_MARKERS):
             return True
     return False
+
+
+#: Header facts compared when deciding whether two same-date blocks are one
+#: statement re-printed or two statements issued the same day. Only fields a
+#: provider would not vary WITHIN one statement belong here.
+_STATEMENT_IDENTITY_FIELDS = ("provider", "company", "payment_total")
+
+
+def _header_conflict(a: Statement, b: Statement) -> str | None:
+    """The first conflicting header fact between two blocks, or ``None``.
+
+    ``None`` means COMPATIBLE — every field is either absent on one side or
+    equal on both. A field present on one side and absent on the other is
+    NOT a conflict: that is exactly what a continuation header looks like.
+    """
+    for name in _STATEMENT_IDENTITY_FIELDS:
+        left, right = getattr(a, name), getattr(b, name)
+        if left in (None, "") or right in (None, ""):
+            continue
+        if left != right:
+            return f"{name} differs ({left!r} vs {right!r})"
+    return None
+
+
+def _looks_like_aggregate(row: ClaimLine) -> bool:
+    """Whether a FULL-WIDTH row is an aggregate wearing a claim row's shape.
+
+    Real statements print per-claimant sub-totals and a grand total as rows
+    with the SAME column count as claim lines, so the two-column totals-block
+    detector cannot see them and a literal-label check misses any whose id
+    cell is a word rather than the string "SUB-TOTAL". Absorbed as claim
+    lines they inflate the statement's paid sum by their own value — the
+    provider's arithmetic double-counted into ours, which is the one error a
+    cross-foot cannot catch, because it corrupts the very number being
+    checked.
+
+    The discriminator is the FIELD POPULATION, which is deterministic and
+    already parsed: an aggregate carries no date of service, no benefit code
+    and no unit count, and its identity cell holds no digit. A real claim
+    line has all three, whatever its id looks like.
+
+    That last clause is what keeps this safe. Claim rows whose id is a
+    parenthetical (``(Ambulance Claims)``) also hold no digit — and they are
+    KEPT, because they are fully populated. The rule tests for the absence
+    of claim-shaped data, never for the shape of the id alone.
+
+    Deliberately conservative: every one of the three fields must be empty.
+    A row missing only its benefit code is a claim line with a gap, and
+    treating it as an aggregate would delete a real payment from the ledger.
+    Erring toward "claim line" leaves a visible oddity; erring toward
+    "aggregate" loses money quietly.
+    """
+    if any(ch.isdigit() for ch in (row.claim_no or "")):
+        return False
+    return not (row.dos or row.benefit_code or row.units is not None)
 
 
 def parse_note(
@@ -437,6 +525,7 @@ def parse_note(
     occurrences: dict[tuple[str, str, str, str], int] = {}
     sub_occurrences: dict[tuple[str, str, str, str], int] = {}
     claims_for_current: list[ClaimLine] = []
+    subs_for_current: list[ClaimLine] = []
 
     def _flush_statement() -> None:
         """Emit the current statement, unless it is a heading with nothing
@@ -459,13 +548,118 @@ def parse_note(
         ))
         if has_content:
             current_stmt.claim_line_count = len(claims_for_current)
-            result.statements.append(current_stmt)
+            folded_onto = _assign_statement_occurrence(current_stmt)
+            # Stamp this block's rows with the occurrence they belong to.
+            # Done HERE, not at row-build time, because the fold/split
+            # decision needs the whole header block read first.
+            for r in (*claims_for_current, *subs_for_current):
+                r.statement_occurrence = current_stmt.statement_occurrence
+            if folded_onto is None:
+                result.statements.append(current_stmt)
+            else:
+                _merge_into(folded_onto, current_stmt)
         current_stmt = None
 
+    def _merge_into(prior: Statement, extra: Statement) -> None:
+        """Fold a continuation block's header facts onto the block it continues.
+
+        Appending BOTH would leave two Statement rows sharing one key, and
+        every downstream reader that indexes by key keeps whichever it saw
+        last — which is how the continuation's empty header silently erased
+        the real block's declared payment total, and how its claim lines
+        landed under a statement whose own count said it had fewer.
+
+        Merge direction: the prior block wins on any field it already has,
+        and the continuation fills only what is empty. A continuation
+        repeating the header restates the same facts, so this is a no-op in
+        the common case; where it is not a no-op, the FIRST statement of a
+        fact is the one printed with the claim lines it describes.
+        """
+        for name in _STATEMENT_IDENTITY_FIELDS:
+            if getattr(prior, name) in (None, "") and getattr(extra, name) not in (None, ""):
+                setattr(prior, name, getattr(extra, name))
+        for label, value in (extra.declared_totals or {}).items():
+            prior.declared_totals.setdefault(label, value)
+        # Counts ADD. The declared count is per printed block; the ledger
+        # holds the union, and the report cross-foots the two against each
+        # other — so a sum here is what makes that check meaningful rather
+        # than a guaranteed mismatch on every folded statement.
+        prior.claim_line_count += extra.claim_line_count
+        prior.inferred = prior.inferred or extra.inferred
+
+    def _assign_statement_occurrence(stmt: Statement) -> Statement | None:
+        """Decide whether this block folds onto a same-date one, or splits.
+
+        DEFAULT IS TO SPLIT. The asymmetry decides it: two statements where
+        the provider issued one is visible and recoverable — the operator
+        sees a duplicate and says so. One statement where the provider
+        issued two silently swallows the second's payment total and
+        attributes its claim lines to the first, which is what happened on
+        the real note and what put a statement 16,894 out.
+
+        A block folds only when its header facts are COMPATIBLE with an
+        existing same-date block: no field where both carry a value and the
+        values differ. A bare continuation header (no provider, no total)
+        conflicts with nothing and folds, which is the legitimate case.
+
+        Returns the statement this block FOLDS ONTO, or ``None`` when it
+        stands alone. The caller merges rather than appending in the fold
+        case — two Statement rows sharing one key is how a continuation's
+        empty header erases the real block's declared total.
+        """
+        same_date = [
+            s for s in result.statements
+            if s.statement_date == stmt.statement_date
+        ]
+        if not same_date:
+            stmt.statement_occurrence = 0
+            return None
+
+        for prior in same_date:
+            conflict = _header_conflict(prior, stmt)
+            if conflict is None:
+                stmt.statement_occurrence = prior.statement_occurrence
+                result.statement_folds.append(
+                    (stmt.statement_date, prior.statement_occurrence)
+                )
+                log.info(
+                    "reconcile.parser.statement_fold",
+                    statement_date=stmt.statement_date,
+                    occurrence=prior.statement_occurrence,
+                    prior_line=prior.source_line,
+                    folded_line=stmt.source_line,
+                    claim_lines=stmt.claim_line_count,
+                    detail="same-date block with no conflicting header fact "
+                           "— treated as a re-printed header for one "
+                           "statement, and its rows join the prior block",
+                )
+                return prior
+
+        occurrence = max(s.statement_occurrence for s in same_date) + 1
+        stmt.statement_occurrence = occurrence
+        reason = _header_conflict(same_date[-1], stmt) or "unknown"
+        result.statement_splits.append(
+            (stmt.statement_date, occurrence, reason)
+        )
+        log.warning(
+            "reconcile.parser.statement_split",
+            statement_date=stmt.statement_date,
+            occurrence=occurrence,
+            reason=reason,
+            prior_line=same_date[-1].source_line,
+            split_line=stmt.source_line,
+            claim_lines=stmt.claim_line_count,
+            detail="a second statement was issued on this date — kept "
+                   "separate so its payment total is not overwritten and "
+                   "its claim lines are not attributed to the first",
+        )
+        return None
+
     def _begin_statement(line_no: int) -> Statement:
-        nonlocal current_stmt, claims_for_current
+        nonlocal current_stmt, claims_for_current, subs_for_current
         _flush_statement()
         claims_for_current = []
+        subs_for_current = []
         current_stmt = Statement(
             source_note=source_note,
             source_line=line_no,
@@ -715,8 +909,27 @@ def parse_note(
                 continue
             assert row is not None  # _build_claim_line returns one or the other
 
-            is_sub = _is_subtotal_row(cells, mapping)
+            labelled = _has_subtotal_label(cells, mapping)
+            unlabelled = _looks_like_aggregate(row)
+            is_sub = labelled or unlabelled
             row.row_type = ROW_SUBTOTAL if is_sub else ROW_CLAIM
+            if unlabelled and not labelled:
+                # The population-derived case is an INFERENCE, unlike a row
+                # that says SUB-TOTAL on it. It is logged for the same reason
+                # an inherited column mapping is: the operator cannot check a
+                # judgement he cannot see, and this one moves money between
+                # the claim-line sum and the cross-foot's inputs.
+                result.aggregate_rows.append(line_no)
+                log.info(
+                    "reconcile.parser.aggregate_row",
+                    line_no=line_no,
+                    claim_no=row.claim_no,
+                    amount_paid=str(row.amount_paid),
+                    detail="full-width row with no date of service, benefit "
+                           "code or units and a non-numeric id — captured as "
+                           "the provider's own arithmetic, NOT as a claim "
+                           "line",
+                )
 
             # Occurrence disambiguation, in source order.
             ident = (
@@ -736,6 +949,7 @@ def parse_note(
 
             if is_sub:
                 result.subtotals.append(row)
+                subs_for_current.append(row)
             else:
                 result.claim_lines.append(row)
                 claims_for_current.append(row)

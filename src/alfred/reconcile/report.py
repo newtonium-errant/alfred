@@ -163,6 +163,32 @@ class StatementTotals:
     #: this layer deciding that the matching one is therefore "the" payment
     #: total. That call is his, and it needs the provider's semantics.
     declared_matching_paid: list[str] = field(default_factory=list)
+    #: The statement's own declared claim-line count against what the ledger
+    #: actually holds for it, when they disagree. A free self-check: both
+    #: numbers are already stored, and on the real note this one alone would
+    #: have caught a wrong same-day fold (declared 24, held 41) without any
+    #: reference to the provider's money figures.
+    line_count_mismatch: tuple[int, int] | None = None
+    #: Aggregate rows naming no claimant that were NOT the grand total.
+    #: Recorded rather than alarmed about — see
+    #: :func:`compute_statement_totals`. Informational, so deliberately not
+    #: part of :func:`_is_discrepant`.
+    unattributed_aggregates: list[str] = field(default_factory=list)
+
+
+def _is_discrepant(totals: "StatementTotals") -> bool:
+    """Whether a statement has ANY cross-foot finding.
+
+    ONE predicate, consulted by the summary, the has_discrepancies flag and
+    the log line. Three copies of this comparison is how a new finding class
+    gets counted in one place and missed in the other two — the same drift
+    the health-status doctrine names.
+    """
+    return bool(
+        (totals.payment_total_delta not in (None, _ZERO))
+        or totals.subtotal_mismatches
+        or totals.line_count_mismatch
+    )
 
 
 def _claimant_paid_sums(lines: list[ClaimLine]) -> dict[str, Decimal]:
@@ -194,6 +220,14 @@ def compute_statement_totals(
     if statement.payment_total is not None:
         totals.payment_total_delta = totals.paid - statement.payment_total
 
+    if (
+        statement.claim_line_count
+        and statement.claim_line_count != len(claim_lines)
+    ):
+        totals.line_count_mismatch = (
+            statement.claim_line_count, len(claim_lines)
+        )
+
     totals.declared_matching_paid = [
         label
         for label, value in sorted(statement.declared_totals_decimal().items())
@@ -201,32 +235,70 @@ def compute_statement_totals(
     ]
 
     ours = _claimant_paid_sums(claim_lines)
+    unattributable: list[ClaimLine] = []
+
     for sub in subtotals:
         if sub.amount_paid is None:
             continue
         claimant = sub.claimant
-        # A subtotal row's claimant label carries the SUB-TOTAL marker, so
-        # match it against the claim lines by surname where possible; when
-        # the row names no claimant it is a statement-level total and is
-        # compared against the whole statement instead.
-        our_value = ours.get(claimant)
+        # Match the aggregate to a claimant where possible: exact label
+        # first, then a single unambiguous surname match.
+        #
+        # An EMPTY claimant never matches. Aggregate rows carry no name, and
+        # so do claim lines on statements that omit the name columns — so a
+        # bare `ours.get("")` pairs an aggregate with "the claim lines that
+        # also named nobody" and calls that an attribution. It is not one;
+        # it is two blanks agreeing, and it routes a grand total into the
+        # per-claimant check where it is guaranteed to mismatch.
+        our_value = ours.get(claimant) if claimant else None
         if our_value is None:
             candidates = [
                 v for k, v in ours.items()
                 if sub.surname and sub.surname.strip().lower() in k.lower()
             ]
             our_value = candidates[0] if len(candidates) == 1 else None
+
         if our_value is None:
-            our_value = totals.paid
-            label = f"statement-level subtotal (line {sub.source_line})"
-        else:
-            label = f"{claimant or sub.surname} (line {sub.source_line})"
+            # Names nobody — deferred to the pass below rather than compared
+            # against the statement total here. A statement carries SEVERAL
+            # unattributable aggregates (per-claimant figures whose id cell
+            # is a word, plus one grand total), and comparing each of them
+            # against the statement sum reports every non-grand-total row as
+            # a mismatch. That is crying wolf, and a cross-foot that cries
+            # wolf is one the operator stops reading — which costs more than
+            # the check is worth.
+            unattributable.append(sub)
+            continue
+
         totals.subtotals_checked += 1
+        label = f"{claimant or sub.surname} (line {sub.source_line})"
         if our_value != sub.amount_paid:
             totals.subtotal_mismatches.append(
                 f"{label}: ours {format_money(our_value)} vs provider "
                 f"{format_money(sub.amount_paid)} "
                 f"(delta {format_money(our_value - sub.amount_paid)})"
+            )
+
+    if unattributable:
+        # Among rows that name no claimant, the GRAND TOTAL is the one that
+        # should equal our statement sum. If one does, the check passes and
+        # the rest are per-claimant figures we simply could not attribute —
+        # recorded, not alarmed about. If NONE does, that is a real finding:
+        # the statement's own total does not reproduce our arithmetic.
+        matching = [s for s in unattributable if s.amount_paid == totals.paid]
+        totals.subtotals_checked += 1
+        totals.unattributed_aggregates = [
+            f"{format_money(s.amount_paid)} (line {s.source_line})"
+            for s in unattributable if s not in matching
+        ]
+        if not matching:
+            amounts = ", ".join(
+                format_money(s.amount_paid) for s in unattributable
+            )
+            totals.subtotal_mismatches.append(
+                f"no statement-level aggregate equals our sum "
+                f"{format_money(totals.paid)} — the unattributed aggregate "
+                f"rows are {amounts}"
             )
     return totals
 
@@ -245,10 +317,7 @@ class BacklogReport:
 
     @property
     def has_discrepancies(self) -> bool:
-        return any(
-            (t.payment_total_delta not in (None, _ZERO)) or t.subtotal_mismatches
-            for t in self.statement_totals
-        )
+        return any(_is_discrepant(t) for t in self.statement_totals)
 
 
 def build_summary(
@@ -390,10 +459,7 @@ def build_summary(
                 )
         out.append("")
 
-    discrepancies = [
-        t for t in grouped_totals
-        if (t.payment_total_delta not in (None, _ZERO)) or t.subtotal_mismatches
-    ]
+    discrepancies = [t for t in grouped_totals if _is_discrepant(t)]
     out.append("## Cross-foot findings")
     out.append("")
     if not discrepancies:
@@ -420,6 +486,15 @@ def build_summary(
                 )
             for m in t.subtotal_mismatches:
                 out.append(f"  - {m}")
+            if t.line_count_mismatch:
+                declared, held = t.line_count_mismatch
+                out.append(
+                    f"  - the statement declares {declared} claim line(s), "
+                    f"the ledger holds {held}. A gap here usually means two "
+                    f"statements issued on one date were folded into one, or "
+                    f"rows were attributed to the wrong block — check the "
+                    f"seed's statement_split / statement_fold lines."
+                )
     out.append("")
 
     out.append("## Proposed EOB mappings")
@@ -496,10 +571,7 @@ def build_report(
         total_lines=report.total_lines,
         flagged=report.flagged_lines,
         statements=len(totals),
-        discrepancies=sum(
-            1 for t in totals
-            if (t.payment_total_delta not in (None, _ZERO)) or t.subtotal_mismatches
-        ),
+        discrepancies=sum(1 for t in totals if _is_discrepant(t)),
         detail=(
             "ledger is empty — the report states that rather than rendering "
             "blank sections"
