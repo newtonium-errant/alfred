@@ -1,9 +1,18 @@
-"""Brief integration — render the "Today's Routines" section.
+"""Reader for the routine aggregator's daily note.
 
-The routine daemon writes ``vault/daily/<today>.md`` at 05:59 Halifax;
-the brief reads that file at 06:00 and inlines its body as the
-``## Today's Routines`` section. Loose-coupling-via-filesystem mirrors
-the BIT → brief health-section pattern.
+**NO LONGER WIRED INTO THE BRIEF (Phase C, 2026-08-12).** This module used to
+render the brief's ``## Today's Routines`` section: the routine daemon writes
+``vault/daily/<today>.md`` at 05:59 Halifax and the brief inlined its body at
+06:00, loose-coupled via the filesystem the way the BIT → brief health section
+is. That section DISSOLVED into the day plan — today's habit anchors now render
+inside their slot in ``brief/tier_section.py``, projected from the same
+``_collect_items_for_today`` output this note is rendered from (identical item
+set; the grouping moved from priority to slot).
+
+The daily note itself is unchanged and still the operator's checklist in
+Obsidian. What follows is its canonical reader, retained but currently
+UNCALLED — a deletion candidate that was deliberately not bundled into the
+restructure commit.
 
 Per ``feedback_intentionally_left_blank.md`` the renderer ALWAYS returns
 a non-empty string when the section is enabled:

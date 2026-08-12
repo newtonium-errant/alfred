@@ -23,7 +23,6 @@ from .renderer import (
     render_process_hub_record,
     serialize_record,
 )
-from .routine_section import render_routine_section
 from .stayc_relay import NEGATION_SECTION_HEADER as STAYC_NEGATION_SECTION_HEADER
 from .stayc_relay import RETENTION_SECTION_HEADER as STAYC_RETENTION_SECTION_HEADER
 from .stayc_relay import SECTION_HEADER as STAYC_RELAY_SECTION_HEADER
@@ -487,7 +486,7 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
             peer_canonical_names=config.peer_digests.peer_canonical_names,
         )
 
-    # Open Tasks by Tier — Salem-only Phase 1 (2026-05-28). Live vault
+    # Today's Plan — Salem-only Phase 1 (2026-05-28). Live vault
     # scan over ``vault/task/*.md``, filters open tasks, computes
     # ``effective_tier`` per task (deadline-relative escalation), renders
     # three buckets T1/T2/T3. Unlike the routine section's filesystem
@@ -500,17 +499,21 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         Path(config.vault_path), now_local, config.tier_defaults,
     )
 
-    # Today's Routines — Salem-only Phase 1. Renders the body of
-    # ``vault/daily/<today>.md`` (written by the routine daemon at
-    # 05:59 Halifax). High-attention slot per dispatch — time-anchored
-    # actions for the day belong above the retrospective Operations
-    # summary so the reader sees what to DO before what was. Empty
-    # string when no salem instance / no daily note expected — but
-    # render_routine_section always returns a non-empty sentinel string
-    # per intentionally-left-blank, so this stays in the section list
-    # unconditionally (no enable/disable gate yet; Phase 2 may add one
-    # via brief config).
-    routines_md = render_routine_section(Path(config.vault_path), today_local)
+    # Today's Routines DISSOLVED into the day plan (Phase C, 2026-08-12).
+    #
+    # It used to be its own ``## Today's Routines`` section rendering the body
+    # of ``vault/daily/<today>.md``. The ratified content pass folds it into the
+    # slot board: today's habit anchors now render inside the slot they belong
+    # to (Rhythm, mostly), beside the tier rows they were always adjacent to in
+    # spirit. The routine DATA is unchanged — the aggregator still writes
+    # ``vault/daily/<today>.md`` at 05:59 and it is still the operator's
+    # checklist in Obsidian. The projection reads the same
+    # ``_collect_items_for_today`` output that note is rendered from, so the
+    # item SET is identical; only the grouping moved (priority → slot).
+    #
+    # This removed ``render_routine_section``'s ONLY caller. The module is left
+    # in place and retargeted in its own docstring rather than deleted inside
+    # the same commit as the restructure — flagged for the reviewer to rule on.
 
     # STAY-C Bug Relay — reads the box watcher's relay spool and renders one
     # PHI-free count line (never bug bodies — the brief transits Telegram and
@@ -541,7 +544,7 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
 
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
-    # second (time-sensitive but non-operational), Open Tasks by Tier
+    # second (time-sensitive but non-operational), Today's Plan
     # third (deadline-driven actionable queue — T1 tasks are the most
     # attention-critical line of the brief; ratified 2026-05-28 to sit
     # above Routines because a missed payroll deadline outranks today's
@@ -564,7 +567,6 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         # tier/slots → slot_suggestion feed (A3b): one item per TodayView tier-
         # lane entry. Markdown byte-identical — the feed reads the same projection.
         SectionResult(TIER_SECTION_HEADER, tier_md, feed_kind="slot_suggestion"),
-        SectionResult("Today's Routines", routines_md),
         # Operations → ops_notable feed (Phase A). The MARKDOWN is untouched:
         # the section still renders the full status snapshot. Only the feed
         # projection is delta-filtered, because a card is an attention claim and

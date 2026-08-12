@@ -667,6 +667,17 @@ def _collect_items_for_today(
                 "priority": priority,
                 "annotation": annotation,
                 "time": time_str,
+                # --- slot-classifier signals (Phase C, §4 dissolution) -------
+                # Emitted for the items that did NOT hand off to a tier — the
+                # brief now renders them inside their slot rather than in a
+                # standalone routines section, and the classifier needs the
+                # same inputs the tier path already reads. Purely additive:
+                # ``_format_item_line`` and the daily-note render read named
+                # keys, so a wider dict cannot change the aggregator's output.
+                "slot": raw_item.get("slot"),
+                "self_care": self_care,
+                "has_due_pattern": due_pattern is not None,
+                "target_cadence_days": target_cadence_days,
             }
 
     items = list(items_by_text.values())

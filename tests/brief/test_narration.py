@@ -32,6 +32,7 @@ from alfred.brief.narration import (
 )
 from alfred.brief.weather import StationWeather
 from alfred.tier.compute import DailyGoalState, TierEntry, TodayView
+from alfred.tier.day_plan import build_day_plan
 
 DATE = "2026-08-01"
 
@@ -44,10 +45,26 @@ def _entry(name: str, tier: int = 1) -> TierEntry:
     return TierEntry(tier=tier, origin="task", name=name, path=f"task/{name}.md")
 
 
-def _compose(view=None, health=None, events=None, weather=None, config=None):
+def _plan(view=None):
+    """Project a view into the shared ``DayPlan`` the composer now takes.
+
+    Phase C re-pointed the composer from ``TodayView`` to the SAME projection
+    the brief's day section renders, so these pins drive the production spine
+    rather than a view the production path no longer hands it. ``is_done`` is
+    supplied explicitly because the composer's argument is required — see
+    ``build_day_plan``'s docstring on why it is not defaulted.
+    """
+    return build_day_plan(
+        view if view is not None else _view(),
+        rollover=[],
+        is_done=lambda _entry: False,
+    )
+
+
+def _compose(view=None, health=None, events=None, weather=None, config=None, plan=None):
     return compose_narration(
         brief_date=DATE,
-        view=view if view is not None else _view(),
+        plan=plan if plan is not None else _plan(view),
         health_lines=health or [],
         events=events or [],
         weather_stations=weather or [],
