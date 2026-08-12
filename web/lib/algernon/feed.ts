@@ -102,8 +102,8 @@ export interface FeedItem {
    * default for a key the producer never wrote.
    *
    * NOT a service-worker cache. `sw.js` never intercepts `/api/*` at all — it
-   * returns early on that prefix before any cache lookup (sw.js:229, the
-   * "never intercept or cache live/session-scoped endpoints" rule) — so no feed
+   * returns early on that prefix before any cache lookup (the "never intercept
+   * or cache live/session-scoped endpoints" rule, sw.js:232-234) — so no feed
    * payload is ever served from a cache, and a stale cached body cannot be the
    * reason for either key's absence. The conclusion stands; only the mechanism
    * was wrong.
