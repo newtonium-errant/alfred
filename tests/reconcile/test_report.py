@@ -138,6 +138,39 @@ def test_mapping_a_code_moves_it_out_of_unknown():
     assert report.class_counts[CLASS_DOCUMENTATION_REQUIRED] == 1
 
 
+def test_unknown_eob_lines_are_framed_as_the_loop_starting():
+    """The framing has to live in the artifact the operator OPENS.
+
+    A first run against a real statement puts most coded lines in the
+    unknown bucket, and a bare count there reads as the classifier failing.
+    It is the opposite — nothing is mapped until he maps it — and the
+    report is where that has to be said, not a commit message he will never
+    read at 2 a.m.
+    """
+    report = build_report(_clean_contents(), generated_at="FIXED")
+    assert report.class_counts[CLASS_UNKNOWN_EOB] == 2
+    assert "has not been taught yet" in report.summary_text
+    assert "the loop starting, not the classifier failing" in report.summary_text
+    assert "invented authority" in report.summary_text
+    # It must also tell him what to DO about it, or the framing is just
+    # reassurance with no next step.
+    assert "alfred reconcile correct" in report.summary_text
+
+
+def test_the_unknown_eob_framing_is_absent_when_there_is_nothing_to_frame():
+    """The positive control for the pin above: a report with every code
+    mapped must NOT carry the explanation, or it becomes boilerplate the
+    operator learns to skip past — and the pin above would pass against a
+    build that printed it unconditionally."""
+    report = build_report(
+        _clean_contents(),
+        eob_map={"ZZ14": CLASS_DOCUMENTATION_REQUIRED, "ZZ22": CLASS_REVERSAL},
+        generated_at="FIXED",
+    )
+    assert CLASS_UNKNOWN_EOB not in report.class_counts
+    assert "has not been taught yet" not in report.summary_text
+
+
 def test_clean_lines_are_counted_not_omitted():
     report = build_report(_clean_contents(), generated_at="FIXED")
     assert "classified clean" in report.summary_text

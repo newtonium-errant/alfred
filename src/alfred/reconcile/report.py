@@ -24,6 +24,18 @@ amount of internal consistency can substitute for it.
 lines, a report with no discrepancies — each says so explicitly. A report
 that renders nothing when it finds nothing is indistinguishable from a
 report that failed to run.
+
+**Delivery is a SEAM, not code here** (ratified 2026-08-12). Both halves are
+written as files into the instance's own reports directory and nothing in
+this package sends them anywhere. The intended read path adds no surface at
+all: the operator asks the instance to show him the report, the talker reads
+the file, and the web surface's existing fenced-text rendering supplies the
+download affordance. That seam is deliberately not built here — pushing a
+file outward is an auth decision, and this module's job ends at producing
+the artifact. There is NO Python CSV-export path in the tree to ride; the
+only CSV code that exists is inbound (``telegram.attachments`` decoding an
+UPLOADED CSV into a Markdown table for a prompt), which is the opposite
+direction and shares nothing with this.
 """
 
 from __future__ import annotations
@@ -41,6 +53,7 @@ import structlog
 
 from .attention import (
     CLASS_LABELS,
+    CLASS_UNKNOWN_EOB,
     Classification,
     Correction,
     ProposedMapping,
@@ -274,6 +287,34 @@ def build_summary(
         for cls, n in counts.items():
             out.append(f"- **{CLASS_LABELS.get(cls, cls)}** ({cls}): {n}")
     out.append("")
+
+    if counts.get(CLASS_UNKNOWN_EOB):
+        # The framing belongs HERE, next to the number, not in a commit
+        # message or a config comment. A first run against a real statement
+        # puts most coded lines in this bucket, and without the explanation
+        # that reads as the classifier failing. It is the opposite: no EOB
+        # code is mapped until the operator maps it, because inventing a
+        # provider's code meanings would classify real money on fabricated
+        # authority. This section is where that mapping gets built.
+        out.append(
+            f"> **{counts[CLASS_UNKNOWN_EOB]} line(s) carry an EOB code this "
+            f"instance has not been taught yet.** That is the loop starting, "
+            f"not the classifier failing — no code is mapped until you map "
+            f"it, because guessing a provider's code meanings would classify "
+            f"real money on invented authority. Unmapped codes surface rather "
+            f"than staying silent, which is the safe direction: an extra line "
+            f"to read costs a glance, a missed one costs the payment."
+        )
+        out.append(">")
+        out.append(
+            "> Rule them with `alfred reconcile correct --line-key <key> "
+            "--operator <you> --classes <class>` (empty `--classes` rules a "
+            "line clear). Once the same code has been ruled the same way "
+            "twice, it appears under *Proposed EOB mappings* below for you to "
+            "accept into `reconcile.eob_classes` — the tool never applies one "
+            "itself."
+        )
+        out.append("")
 
     out.append("## By statement")
     out.append("")

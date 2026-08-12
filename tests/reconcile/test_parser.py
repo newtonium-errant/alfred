@@ -39,6 +39,7 @@ from alfred.reconcile.parser import (
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 CLEAN_NOTE = FIXTURES / "remittance_note_synthetic.md"
 DAMAGED_NOTE = FIXTURES / "remittance_note_damaged.md"
+PARTIAL_PAGE_NOTE = FIXTURES / "remittance_note_partial_page.md"
 
 
 @pytest.fixture(scope="module")
@@ -284,6 +285,67 @@ def test_slash_date_parses_once_the_order_is_configured():
     dev = [c for c in result.claim_lines if c.surname == "Corvallis"]
     assert len(dev) == 1
     assert dev[0].dos == "2026-04-03"
+
+
+# --- the headingless partial page ---------------------------------------------
+#
+# This shape CRASHED the parser with an UnboundLocalError while all 271 other
+# tests passed, because every other fixture happened to open with a Markdown
+# heading and so always bound the statement context first. It gets its own
+# block because the lesson is structural, not incidental: a fixture set that
+# omits a shape production runs in cannot fail on it, however green it is.
+
+
+def test_metadata_before_any_heading_does_not_crash():
+    """The regression pin. A partial-page statement — header block captured,
+    title not — is a shape the design names, and it must parse rather than
+    raise."""
+    result = parse_note(PARTIAL_PAGE_NOTE.read_text(encoding="utf-8"),
+                        source_note="partial-page")
+    assert result.ok
+    assert len(result.claim_lines) == 2
+    assert len(result.subtotals) == 1
+
+
+def test_a_headingless_statement_keeps_its_metadata():
+    """Not merely "did not crash": the header facts must actually land, or
+    the fix would be a crash traded for a silently empty statement."""
+    result = parse_note(PARTIAL_PAGE_NOTE.read_text(encoding="utf-8"))
+    assert len(result.statements) == 1
+    stmt = result.statements[0]
+    assert stmt.provider == "Wren Alderly"
+    assert stmt.company == "Northbay Therapy Services"
+    assert stmt.statement_date == "2026-05-01"
+    assert stmt.payment_total == Decimal("175.00")
+    assert stmt.claim_line_count == 2
+
+
+def test_a_headingless_statement_stamps_its_date_on_its_rows():
+    """The statement date is part of the ledger key, so a headingless
+    statement whose rows carried no date would key every line wrong."""
+    result = parse_note(PARTIAL_PAGE_NOTE.read_text(encoding="utf-8"))
+    assert {c.statement_date for c in result.claim_lines} == {"2026-05-01"}
+
+
+def test_a_headingless_statement_round_trips():
+    """The render emits a heading, so the regenerated note takes the normal
+    path — proving the recovered statement is a first-class one and not a
+    special case that only half works."""
+    from alfred.reconcile.ledger import LedgerContents
+    from alfred.reconcile.render import render_note
+
+    original = parse_note(PARTIAL_PAGE_NOTE.read_text(encoding="utf-8"))
+    rendered = render_note(LedgerContents(
+        statements=original.statements,
+        claim_lines=original.claim_lines,
+        subtotals=original.subtotals,
+    ))
+    reparsed = parse_note(rendered)
+    assert reparsed.ok
+    assert [c.key for c in reparsed.claim_lines] == [
+        c.key for c in original.claim_lines
+    ]
+    assert reparsed.statements[0].provider == "Wren Alderly"
 
 
 # --- header-driven mapping ----------------------------------------------------

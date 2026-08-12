@@ -440,8 +440,6 @@ def parse_note(
             in_table = False
             stmt = _begin_statement(line_no)
             stmt.inferred = inferred_depth > 0
-            stmt_meta = {}
-            stmt_line_no = line_no
             # A heading often carries the statement date: "## Statement —
             # 11 Jun 2026". Try it, but never fail the note over a heading.
             title = heading.group(1).strip()
@@ -594,9 +592,12 @@ def parse_note(
             norm = normalise_heading(meta.group(1))
             target = STATEMENT_FIELD_SYNONYMS.get(norm)
             if target:
+                # A metadata line can legitimately arrive BEFORE any heading —
+                # a partial-page statement whose header row was captured but
+                # whose title was not. Opening the statement here is what makes
+                # that shape parse instead of crashing.
                 if current_stmt is None:
                     _begin_statement(line_no)
-                stmt_meta[target] = meta.group(2).strip()
                 _apply_meta(current_stmt, target, meta.group(2).strip(), date_order)
 
     _flush_statement()
