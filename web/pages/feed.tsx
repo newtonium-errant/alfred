@@ -16,9 +16,14 @@ import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { contestableItem, isDeckDealt } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
-import { display, subtle, title as titleClass } from '../lib/typography';
+import { subtle, title as titleClass } from '../lib/typography';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
+
+// Section headings keep the shared type scale (`title`) but not its warm colour:
+// honeydew-700 is a dark green that all but disappears on the console's ground.
+// One constant so the two headings cannot drift apart again.
+const SENSOR_HEADING = { color: 'var(--sensor-ink)' } as const;
 
 // The Awareness feed — the platform's SENSOR LOG (canonical-surface ruling:
 // brief = viewscreen, deck = tactical console, feed = sensor log). It reports
@@ -365,7 +370,7 @@ export default function FeedPage() {
 
         {loaded && view === 'list' && pendingRows.length > 0 && (
           <section data-testid="feed-needs-you" className="mt-6">
-            <h2 className={titleClass} style={{ color: 'var(--sensor-ink)' }}>
+            <h2 className={titleClass} style={SENSOR_HEADING}>
               Needs you
             </h2>
             {/* Slot rows (non-deck-able needs-you) carry the SAME live per-lane
@@ -394,7 +399,8 @@ export default function FeedPage() {
               data-testid="feed-show-snoozed"
               onClick={() => setShowSnoozed((s) => !s)}
               aria-expanded={showSnoozed}
-              className="text-[11px] font-semibold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+              className="text-[11px] font-semibold uppercase tracking-wider underline underline-offset-2"
+              style={{ color: 'var(--sensor-ink2)' }}
             >
               {showSnoozed ? 'Hide snoozed' : `Show snoozed (${snoozedRows.length})`}
             </button>
@@ -439,7 +445,8 @@ export default function FeedPage() {
               data-testid="feed-show-done"
               onClick={() => setShowDone((s) => !s)}
               aria-expanded={showDone}
-              className="text-[11px] font-semibold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+              className="text-[11px] font-semibold uppercase tracking-wider underline underline-offset-2"
+              style={{ color: 'var(--sensor-ink2)' }}
             >
               {showDone ? 'Hide done' : `Show done (${doneRows.length})`}
             </button>
@@ -462,7 +469,9 @@ export default function FeedPage() {
 
         {loaded && view === 'list' && board.fyi.length > 0 && (
           <section data-testid="feed-fyi" className="mt-6">
-            <h2 className={titleClass}>For your awareness</h2>
+            <h2 className={titleClass} style={SENSOR_HEADING}>
+              For your awareness
+            </h2>
             <ul className="mt-2 flex flex-col gap-2">
               {board.fyi.map((it) => (
                 <FeedRow
@@ -479,7 +488,8 @@ export default function FeedPage() {
         )}
 
         {board.toast && (
-          <div data-testid="feed-toast" role="status" className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3 rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card">
+          <div data-testid="feed-toast" role="status" className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3 rounded-lg px-3.5 py-2.5 text-sm shadow-card"
+            style={{ backgroundColor: 'var(--sensor-raise)', color: 'var(--sensor-ink)', border: '1px solid var(--sensor-edge2)' }}>
             <span>{board.toast.message}</span>
             <button type="button" onClick={board.dismissToast} className="font-bold uppercase tracking-wider underline">
               Dismiss

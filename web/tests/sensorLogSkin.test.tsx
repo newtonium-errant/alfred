@@ -27,7 +27,15 @@ import type { FeedItem } from '../lib/algernon/feed';
 
 const WEB_ROOT = join(__dirname, '..');
 const CSS_PATH = join(WEB_ROOT, 'styles', 'sensorLog.css');
-const SKINNED_SOURCES = ['components/feed/FeedRow.tsx', 'components/feed/EvidenceBody.tsx'];
+// Everything the skin is allowed to re-point lives in one of these. `feed.tsx`
+// is in the list because the console skins its OWN markup too — the snoozed row
+// is built there, not in FeedRow, and an earlier cut of this pin only looked
+// inside `[data-testid='feed-row']` selectors and so watched half the skin.
+const SKINNED_SOURCES = [
+  'components/feed/FeedRow.tsx',
+  'components/feed/EvidenceBody.tsx',
+  'pages/feed.tsx',
+];
 
 const rawCss = readFileSync(CSS_PATH, 'utf8');
 
@@ -51,16 +59,18 @@ function selectors(): string[] {
 }
 
 /**
- * Every utility class the skin targets INSIDE a feed row — i.e. each `.foo` that
- * appears in a selector qualified by `[data-testid='feed-row']`. Escaped slashes
- * (`.text-honeydew-600\/80`) are unescaped back to the literal Tailwind class.
+ * Every BORROWED class the skin re-points — each `.foo` in any selector that the
+ * stylesheet does not own. `.sensor-*` classes are excluded: those are defined
+ * here and consumed by the feed's own markup, so they are not a coupling to
+ * anyone else's naming. Escaped slashes (`.text-honeydew-600\/80`) are unescaped
+ * back to the literal Tailwind class.
  */
 function skinnedClasses(): string[] {
   const found = new Set<string>();
   for (const selector of selectors()) {
-    if (!selector.includes("[data-testid='feed-row']")) continue;
-    for (const m of selector.matchAll(/\s\.((?:[\w-]|\\\/)+)/g)) {
-      found.add(m[1].replace(/\\\//g, '/'));
+    for (const m of selector.matchAll(/\.((?:[\w-]|\\\/)+)/g)) {
+      const cls = m[1].replace(/\\\//g, '/');
+      if (!cls.startsWith('sensor-')) found.add(cls);
     }
   }
   return [...found].sort();
@@ -115,11 +125,12 @@ describe('sensor-log skin — the shared row still presents the hooks the CSS ta
 
   it('the skin is scoped so it CANNOT reach the brief', () => {
     // The structural guarantee, asserted on the stylesheet: no rule in this file
-    // may target a feed row without the surface attribute in front of it. The
-    // brief renders the same component and must keep its warm palette.
-    const rowSelectors = selectors().filter((s) => s.includes("[data-testid='feed-row']"));
-    expect(rowSelectors.length).toBeGreaterThan(0);
-    for (const selector of rowSelectors) {
+    // may target a testid-identified element without the surface attribute in
+    // front of it. The brief renders the same `FeedRow` and must keep its warm
+    // palette; the attribute is the only thing standing between the two.
+    const testidSelectors = selectors().filter((s) => s.includes('[data-testid='));
+    expect(testidSelectors.length).toBeGreaterThan(0);
+    for (const selector of testidSelectors) {
       expect(selector).toContain("[data-surface='sensor-log']");
     }
   });
