@@ -11,6 +11,7 @@ import {
   SNOOZE_LABELS,
   UNDO_MS,
   deckVerbsFor,
+  isHeavyVerb,
   inSnoozeHoldBand,
   snoozeIsBacked,
   type SnoozeAction,
@@ -23,6 +24,11 @@ import {
   swipeActsFor,
   verdictForDrag,
 } from '../../lib/algernon/feedConstants';
+import {
+  CONSOLE_LABEL,
+  ROLE_TEXT_CLASS,
+  roleChipClass,
+} from '../../lib/algernon/consoleTokens';
 import { useDeck } from './useDeck';
 import { DeckCard, DECK_CARD_BASE_Z } from './DeckCard';
 
@@ -31,6 +37,28 @@ import { DeckCard, DECK_CARD_BASE_Z } from './DeckCard';
 // card and reads as a dead tap (the #28 re-tier bug). Derived from the card base so it
 // can't drift below. Inline (not a Tailwind z-class) so the ordering is jsdom-testable.
 const OVERLAY_Z_INDEX = DECK_CARD_BASE_Z + 10;
+
+// The three full-card overlays (snoozed drill, re-tier picker, correction
+// picker) are the same object wearing different content, so they share one set
+// of classes rather than three drifting copies. The snooze duration menu is
+// deliberately NOT one of them: it is a bottom sheet attached to a frozen
+// gesture, and it carries the caution edge that says so.
+const OVERLAY_PANEL_CLASS =
+  'absolute inset-0 flex flex-col rounded-sm border border-console-edge-bright bg-console-panel p-4';
+const OVERLAY_TITLE_CLASS =
+  'text-[11px] font-bold uppercase tracking-[0.18em] text-console-ink';
+const OVERLAY_DISMISS_CLASS =
+  'text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-faint underline underline-offset-4';
+const OVERLAY_CHOICE_CLASS =
+  'rounded-sm border border-console-edge-bright bg-console-raise px-3 py-2 text-left text-sm font-semibold text-console-ink hover:border-affirm hover:text-affirm';
+
+// The gesture buttons stay ROUND on an otherwise square identity. That is not
+// an inconsistency: everything else on this surface is a panel bolted to a
+// hull, and these four are the only things meant to read as a thing you press.
+// Sizing is unchanged from the honeydew build — it was already a comfortable
+// thumb target on the phone posture, which is the posture that matters here.
+const DECK_BUTTON_CLASS =
+  'flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] p-3 disabled:opacity-30';
 
 export interface DeckProps {
   items: FeedItem[];
@@ -323,6 +351,12 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   const correctionCandidates = current
     ? routineCandidatesFor(current).filter((c) => !sameRoutineItem(c.text, proposedItem))
     : [];
+  // How many of the cards still to come will ARM rather than commit. Counted
+  // per-direction (a card is heavy if EITHER direction is), which is the same
+  // question the card's own rail answers — one number, one predicate.
+  const aheadHeavyCount = deck.ahead.filter(
+    (it) => isHeavyVerb(it.kind, 'affirm') || isHeavyVerb(it.kind, 'reject'),
+  ).length;
   const stack: Array<{ item: FeedItem; depth: number }> = [];
   if (current) stack.push({ item: current, depth: 0 });
   upcoming.forEach((item, i) => stack.push({ item, depth: i + 1 }));
@@ -330,13 +364,20 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   return (
     <div data-testid="deck" className="flex flex-1 flex-col" onKeyDown={onKeyDown}>
       {banner && (
-        <div role="alert" data-testid="deck-banner" className="mb-3 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
+        <div role="alert" data-testid="deck-banner" className="mb-3 rounded-sm border-l-2 border-negative bg-negative-wash px-3 py-2 text-sm text-negative">
           {banner}
         </div>
       )}
 
-      <div className="mb-1.5 flex items-center justify-between px-0.5 text-[11px] font-semibold uppercase tracking-wider text-honeydew-600">
-        <span data-testid="deck-count">
+      {/* THE TWO POSTURES. Phone = tricorder: one column, the card is the
+          screen. Tablet/desktop = workstation: the same deck with a standing
+          pane beside it, because a workstation has the room to show what is
+          coming and a tricorder does not. Both are deliberate; the pane is
+          additive and the deck column is identical in both. */}
+      <div className="flex min-h-0 flex-1 gap-3">
+      <div className="flex min-w-0 flex-1 flex-col">
+      <div className={`mb-1.5 flex items-center justify-between px-0.5 ${CONSOLE_LABEL}`}>
+        <span data-testid="deck-count" className="text-console-ink-dim">
           {deck.remaining > 0 ? `${deck.remaining} card${deck.remaining > 1 ? 's' : ''}` : 'Clear'}
         </span>
         {deck.snoozedCount > 0 && (
@@ -346,7 +387,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             data-testid="deck-snoozed"
             aria-haspopup="dialog"
             onClick={() => setSnoozedOpen(true)}
-            className="font-semibold uppercase tracking-wider text-status-progress-fg underline underline-offset-2"
+            className={`${ROLE_TEXT_CLASS.caution} underline underline-offset-4`}
           >
             Snoozed: {deck.snoozedCount} — view
           </button>
@@ -374,12 +415,12 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
         {deck.cleared && (
           <div
             data-testid="deck-cleared"
-            className="absolute inset-0 m-auto flex max-h-[360px] flex-col items-center justify-center gap-2 rounded-2xl border border-honeydew-300 bg-cream p-5 text-center shadow-card"
+            className="absolute inset-0 m-auto flex max-h-[380px] flex-col items-center justify-center gap-2 rounded-sm border border-console-edge bg-console-panel p-5 text-center"
           >
-            <p className="text-2xl font-extrabold text-honeydew-700">Deck clear.</p>
+            <p className="text-xl font-bold uppercase tracking-[0.22em] text-affirm">Deck clear.</p>
             {deck.snoozedCount > 0 ? (
               <>
-                <p className="text-sm text-honeydew-600">
+                <p className="text-sm text-console-ink-dim">
                   {deck.snoozedCount} snoozed — the next sync will re-offer them.
                 </p>
                 <button
@@ -387,13 +428,13 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
                   data-testid="deck-cleared-view"
                   aria-haspopup="dialog"
                   onClick={() => setSnoozedOpen(true)}
-                  className="mt-1 text-sm font-semibold text-status-progress-fg underline underline-offset-2"
+                  className={`mt-1 text-sm ${ROLE_TEXT_CLASS.caution} underline underline-offset-4`}
                 >
                   View snoozed
                 </button>
               </>
             ) : (
-              <p className="text-sm text-honeydew-600">Nothing left to decide right now.</p>
+              <p className="text-sm text-console-ink-dim">Nothing left to decide right now.</p>
             )}
           </div>
         )}
@@ -407,17 +448,17 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             role="dialog"
             aria-label="Snoozed cards"
             style={{ zIndex: OVERLAY_Z_INDEX }}
-            className="absolute inset-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+            className={OVERLAY_PANEL_CLASS}
           >
             <div className="mb-2 flex items-center justify-between">
-              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
+              <p className={OVERLAY_TITLE_CLASS}>
                 Snoozed ({snoozed.length})
               </p>
               <button
                 type="button"
                 data-testid="deck-snoozed-close"
                 onClick={() => setSnoozedOpen(false)}
-                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2"
+                className={OVERLAY_DISMISS_CLASS}
               >
                 Close
               </button>
@@ -425,26 +466,29 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
 
             {snoozed.length === 0 ? (
               // ILB: the drill is open but everything's been dealt back — say so, don't blank.
-              <p data-testid="deck-snoozed-empty" className="mt-2 text-sm text-honeydew-600">
+              <p data-testid="deck-snoozed-empty" className="mt-2 text-sm text-console-ink-dim">
                 No snoozed cards — you&rsquo;ve dealt them all back in.
               </p>
             ) : (
-              <ul className="flex flex-col gap-2 overflow-y-auto">
+              // The one genuinely ACCRETED surface on the deck: cards that have
+              // piled up over the session, as opposed to the authored card in
+              // front of you (D5's authored-vs-accreted distinction).
+              <ul className="console-accreted flex flex-col gap-2 overflow-y-auto">
                 {snoozed.map((p) => (
                   <li
                     key={p.id}
                     data-testid="deck-snoozed-row"
-                    className="flex items-center gap-2 rounded-xl border border-honeydew-200 bg-white p-2.5"
+                    className="flex items-center gap-2 rounded-sm border border-console-edge bg-console-raise p-2.5"
                   >
-                    <span className="shrink-0 rounded-md border border-honeydew-300 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-honeydew-600">
+                    <span className={`shrink-0 rounded-sm border border-console-edge-bright px-1.5 py-0.5 ${CONSOLE_LABEL}`}>
                       {kindLabel(p.kind)}
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-sm text-honeydew-700">{p.title}</span>
+                    <span className="min-w-0 flex-1 truncate text-sm text-console-ink">{p.title}</span>
                     <button
                       type="button"
                       data-testid="deck-snoozed-deal"
                       onClick={() => deck.dealNow(p)}
-                      className="shrink-0 rounded-lg border border-honeydew-600 px-3 py-1 text-xs font-bold uppercase tracking-wider text-honeydew-700"
+                      className={`shrink-0 rounded-sm border px-3 py-1 ${CONSOLE_LABEL} ${roleChipClass('affirm')}`}
                     >
                       Deal now
                     </button>
@@ -465,21 +509,21 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             role="dialog"
             aria-label="Adjust email tier"
             style={{ zIndex: OVERLAY_Z_INDEX }}
-            className="absolute inset-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+            className={OVERLAY_PANEL_CLASS}
           >
             <div className="mb-2 flex items-center justify-between">
-              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">Adjust tier</p>
+              <p className={OVERLAY_TITLE_CLASS}>Adjust tier</p>
               <button
                 type="button"
                 data-testid="deck-retier-cancel"
                 disabled={deck.reTiering !== null}
                 onClick={() => setReTierOpen(false)}
-                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2 disabled:opacity-40"
+                className={`${OVERLAY_DISMISS_CLASS} disabled:opacity-40`}
               >
                 Cancel
               </button>
             </div>
-            <p className="mb-2 text-xs text-honeydew-600">
+            <p className="mb-2 text-xs text-console-ink-dim">
               {assignedTier ? `Now: ${assignedTier.toUpperCase()}. Move it to:` : 'Set the tier:'}
             </p>
             <div className="flex flex-col gap-2">
@@ -490,7 +534,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
                   data-testid={`deck-retier-choice-${tier}`}
                   disabled={deck.reTiering !== null}
                   onClick={() => void onPickTier(tier)}
-                  className="rounded-xl border border-honeydew-400 px-3 py-2 text-left text-sm font-semibold uppercase tracking-wider text-honeydew-700 disabled:opacity-40"
+                  className={`${OVERLAY_CHOICE_CLASS} uppercase tracking-[0.14em] disabled:opacity-40`}
                 >
                   {tier}
                 </button>
@@ -498,7 +542,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             </div>
             {deck.reTiering && (
               // Intentionally-left-blank: an explicit working signal — nothing greens until acted.
-              <p data-testid="deck-retier-pending" className="mt-3 text-xs text-honeydew-600">
+              <p data-testid="deck-retier-pending" className="mt-3 text-xs text-caution">
                 Adjusting to {deck.reTiering.toUpperCase()}…
               </p>
             )}
@@ -516,10 +560,10 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             role="dialog"
             aria-label="What did this completion mean?"
             style={{ zIndex: OVERLAY_Z_INDEX }}
-            className="absolute inset-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+            className={OVERLAY_PANEL_CLASS}
           >
             <div className="mb-2 flex shrink-0 items-center justify-between">
-              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
+              <p className={OVERLAY_TITLE_CLASS}>
                 What did this mean?
               </p>
               <button
@@ -527,12 +571,12 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
                 data-testid="deck-correct-cancel"
                 disabled={deck.correcting !== null}
                 onClick={() => setCorrectOpen(false)}
-                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2 disabled:opacity-40"
+                className={`${OVERLAY_DISMISS_CLASS} disabled:opacity-40`}
               >
                 Cancel
               </button>
             </div>
-            <p className="mb-2 shrink-0 text-xs text-honeydew-600">
+            <p className="mb-2 shrink-0 text-xs text-console-ink-dim">
               {proposedItem ? `Not “${proposedItem}”. It was:` : 'It was:'}
             </p>
 
@@ -541,7 +585,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
                 // ILB: an empty pick-list is a real state (the vault path isn't wired
                 // on this instance), not a broken picker. Say which it is — the one-off
                 // door below still works.
-                <p data-testid="deck-correct-empty" className="text-xs text-honeydew-600">
+                <p data-testid="deck-correct-empty" className="text-xs text-console-ink-dim">
                   No routine items available to pick from right now — you can still mark
                   it a one-off.
                 </p>
@@ -554,11 +598,11 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
                     data-item={c.text}
                     disabled={deck.correcting !== null}
                     onClick={() => void onPickCorrection(c.text)}
-                    className="shrink-0 rounded-xl border border-honeydew-400 px-3 py-2 text-left text-sm font-semibold text-honeydew-700 disabled:opacity-40"
+                    className={`shrink-0 ${OVERLAY_CHOICE_CLASS} disabled:opacity-40`}
                   >
                     {c.text}
                     {c.record && (
-                      <span className="ml-1.5 text-[10px] font-normal uppercase tracking-wider text-honeydew-500">
+                      <span className="ml-1.5 text-[10px] font-normal uppercase tracking-[0.14em] text-console-ink-faint">
                         {c.record}
                       </span>
                     )}
@@ -574,7 +618,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
               data-testid="deck-correct-one-off"
               disabled={deck.correcting !== null}
               onClick={() => void onPickCorrection(null)}
-              className="mt-2 shrink-0 rounded-xl border border-dashed border-honeydew-400 px-3 py-2 text-left text-sm text-honeydew-600 disabled:opacity-40"
+              className="mt-2 shrink-0 rounded-sm border border-dashed border-console-edge-bright px-3 py-2 text-left text-sm text-console-ink-dim disabled:opacity-40"
             >
               Nothing — this was a one-off
             </button>
@@ -582,7 +626,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             {deck.correcting && (
               // Intentionally-left-blank: an explicit working signal — nothing greens
               // until the server confirms the verdict landed.
-              <p data-testid="deck-correct-pending" className="mt-2 shrink-0 text-xs text-honeydew-600">
+              <p data-testid="deck-correct-pending" className="mt-2 shrink-0 text-xs text-caution">
                 {deck.correcting === ONE_OFF_ACTION
                   ? 'Recording a one-off…'
                   : `Recording “${deck.correcting}”…`}
@@ -608,17 +652,17 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             role="dialog"
             aria-label="Snooze for how long?"
             style={{ zIndex: OVERLAY_Z_INDEX }}
-            className="absolute inset-x-0 bottom-0 flex flex-col rounded-2xl border border-honeydew-300 bg-cream p-4 shadow-card"
+            className="absolute inset-x-0 bottom-0 flex flex-col rounded-sm border-t-2 border-caution bg-console-panel p-4"
           >
             <div className="mb-2 flex items-center justify-between">
-              <p className="text-sm font-extrabold uppercase tracking-wider text-honeydew-700">
+              <p className={`${OVERLAY_TITLE_CLASS} ${ROLE_TEXT_CLASS.caution}`}>
                 Snooze for
               </p>
               <button
                 type="button"
                 data-testid="deck-snooze-cancel"
                 onClick={closeSnoozeMenu}
-                className="text-sm font-semibold text-honeydew-600 underline underline-offset-2"
+                className={OVERLAY_DISMISS_CLASS}
               >
                 Cancel
               </button>
@@ -630,13 +674,13 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
                   type="button"
                   data-testid={`deck-snooze-choice-${action}`}
                   onClick={() => onPickSnooze(action)}
-                  className="rounded-xl border border-honeydew-400 px-3 py-2 text-left text-sm font-semibold text-honeydew-700"
+                  className={OVERLAY_CHOICE_CLASS}
                 >
                   {SNOOZE_LABELS[action]}
                 </button>
               ))}
             </div>
-            <p className="mt-2 text-[11px] italic text-honeydew-600">
+            <p className="mt-2 text-[11px] italic text-console-ink-faint">
               It stays off the board until then — unless it gets more urgent than
               it is now.
             </p>
@@ -644,7 +688,11 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
         )}
       </div>
 
-      {/* Button + toast affordances (the accessible, testable alternates). */}
+      {/* Button + toast affordances (the accessible, testable alternates).
+          Each is drawn in ITS OWN verdict's role, so the button row teaches the
+          same axis the swipe does: reject left in negative, defer up in
+          caution, affirm right in affirm. The details control carries no
+          verdict, so it is neutral structure. */}
       <div className="flex justify-center gap-2.5 py-1">
         <button
           type="button"
@@ -652,7 +700,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
           aria-label={verbs?.rejectLabel || 'Reject'}
           disabled={!current || confirming || !(verbs?.reject || verbs?.rejectDefers)}
           onClick={deck.reject}
-          className={`flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] p-3 disabled:opacity-30 ${verbs?.rejectDefers ? 'border-status-progress-fg text-status-progress-fg' : 'border-danger text-danger'}`}
+          className={`${DECK_BUTTON_CLASS} ${verbs?.rejectDefers ? 'border-caution text-caution' : 'border-negative text-negative'}`}
         >
           ✕
         </button>
@@ -663,7 +711,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
           aria-haspopup={current && snoozeIsBacked(current) ? 'dialog' : undefined}
           disabled={!current || confirming}
           onClick={onSnoozeAffordance}
-          className="flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] border-status-progress-fg p-3 text-status-progress-fg disabled:opacity-30"
+          className={`${DECK_BUTTON_CLASS} border-caution text-caution`}
         >
           ↑
         </button>
@@ -673,7 +721,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
           aria-label="Toggle details"
           disabled={!current}
           onClick={() => setExpanded((v) => !v)}
-          className="flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] border-honeydew-400 p-3 text-honeydew-600 disabled:opacity-30"
+          className={`${DECK_BUTTON_CLASS} border-console-edge-bright text-console-ink-dim`}
         >
           ···
         </button>
@@ -683,16 +731,63 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
           aria-label={confirming && confirmingVerdict === 'affirm' ? 'Confirm' : 'Affirm'}
           disabled={!current || !verbs?.affirm}
           onClick={confirming && confirmingVerdict === 'affirm' ? deck.confirmHeavy : deck.affirm}
-          className="flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] border-honeydew-600 p-3 text-honeydew-600 disabled:opacity-30"
+          className={`${DECK_BUTTON_CLASS} border-affirm text-affirm`}
         >
           ✓
         </button>
+      </div>
+      </div>
+
+      {/* WORKSTATION PANE — the posture difference, and nothing else.
+          Hidden below lg, so the phone stays a tricorder: one card, the whole
+          screen, no peripheral vision competing with the decision in front of
+          you. Everything in here is DERIVED from the same queue the deck deals
+          from (`deck.ahead` is the real remainder, not the two-card render
+          slice), so it can never disagree with the count above it. */}
+      <aside data-testid="deck-queue-pane" className="hidden w-64 shrink-0 flex-col lg:flex">
+        <p className={`mb-1.5 px-0.5 ${CONSOLE_LABEL}`}>Queue</p>
+        <div className="min-h-0 flex-1 overflow-y-auto rounded-sm border border-console-edge bg-console-panel p-2.5">
+          {aheadHeavyCount > 0 && (
+            // Worth knowing BEFORE you start: how much of what is coming will
+            // ask for a second tap rather than a flick.
+            <p data-testid="deck-queue-heavy" className={`mb-2 ${CONSOLE_LABEL} ${ROLE_TEXT_CLASS.caution}`}>
+              {aheadHeavyCount} need{aheadHeavyCount === 1 ? 's' : ''} a second look
+            </p>
+          )}
+          {deck.ahead.length === 0 ? (
+            // ILB: an empty pane is a real state — this is the last card, or
+            // the deck is clear — and saying which is the difference between
+            // "nothing behind this" and "the pane is broken".
+            <p data-testid="deck-queue-empty" className="text-xs text-console-ink-faint">
+              {current ? 'Nothing behind this one.' : 'Queue empty.'}
+            </p>
+          ) : (
+            <ul className="flex flex-col">
+              {deck.ahead.map((it, i) => (
+                <li
+                  key={(it as { __deckKey?: string }).__deckKey ?? it.id}
+                  data-testid="deck-queue-row"
+                  className="flex gap-2 border-b border-console-edge py-2 last:border-b-0"
+                >
+                  <span className="w-4 shrink-0 pt-0.5 font-mono text-[10px] tabular-nums text-console-ink-ghost">
+                    {i + 1}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs text-console-ink-dim">{it.title || it.id}</span>
+                    <span className={`mt-0.5 block ${CONSOLE_LABEL}`}>{kindLabel(it.kind)}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </aside>
       </div>
 
       {toast && (
         <div
           data-testid="deck-toast"
-          className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3.5 overflow-hidden rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card"
+          className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3.5 overflow-hidden rounded-sm border border-console-edge-bright bg-console-raise px-3.5 py-2.5 text-sm text-console-ink shadow-[0_12px_34px_rgba(0,0,0,0.6)]"
         >
           <span>{toast.message}</span>
           {toast.canUndo && (
@@ -700,7 +795,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
               type="button"
               data-testid="deck-toast-undo"
               onClick={deck.undo}
-              className="font-bold uppercase tracking-wider underline"
+              className="text-[11px] font-bold uppercase tracking-[0.14em] text-affirm underline underline-offset-4"
             >
               Undo
             </button>
@@ -715,7 +810,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
               data-testid="deck-toast-bar"
               aria-hidden="true"
               style={{ animationDuration: `${UNDO_MS}ms` }}
-              className="deck-undo-bar absolute inset-x-0 bottom-0 h-1 origin-left rounded-b-xl bg-cream/70"
+              className="deck-undo-bar absolute inset-x-0 bottom-0 h-[3px] origin-left bg-affirm-deep"
             />
           )}
         </div>

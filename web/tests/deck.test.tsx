@@ -349,9 +349,38 @@ describe('DeckCard — defensive render (untrusted evidence)', () => {
     renderCard({ evidence: { classifier_priority: 'high', sender: 'a@b.com' } });
     const badge = screen.getByTestId('deck-tier-badge');
     expect(badge.textContent?.toLowerCase()).toContain('high');
-    expect(badge.className).toContain('text-danger'); // high → danger colour
+    // HIGH is drawn in the alert role. (Was `text-danger` under the honeydew
+    // palette; the console identity spends the same meaning as `negative`.)
+    expect(badge.className).toContain('text-negative');
     // Footer affirm verb is dynamic (no blind confirm).
     expect(screen.getByTestId('deck-card').textContent).toContain('Confirm HIGH');
+  });
+
+  it('draws the tiers apart — only HIGH gets the alert role, and SPAM is quietest', () => {
+    // The positive/negative control the assertion above needs to mean anything:
+    // "HIGH is red" is equally true of a card that painted every tier red. What
+    // the operator relies on is the DIFFERENCE between tiers at a glance.
+    const classFor = (tier: string) => {
+      const { unmount } = renderCard({ evidence: { classifier_priority: tier, sender: 'a@b.com' } });
+      const cls = screen.getByTestId('deck-tier-badge').className;
+      unmount();
+      return cls;
+    };
+    const high = classFor('high');
+    const medium = classFor('medium');
+    const low = classFor('low');
+    const spam = classFor('spam');
+
+    expect(high).toContain('text-negative');
+    // Nothing else claims the alert role.
+    for (const other of [medium, low, spam]) {
+      expect(other).not.toContain('text-negative');
+    }
+    // And the four are genuinely four treatments, not one repeated.
+    expect(new Set([high, medium, low, spam]).size).toBe(4);
+    // The standing ruling, carried across the repalette: spam is junk, not
+    // urgency, so it must never be drawn like the urgent tier.
+    expect(spam).not.toBe(high);
   });
 
   it('an email card with NO recognised priority shows no badge and the plain Confirm verb', () => {

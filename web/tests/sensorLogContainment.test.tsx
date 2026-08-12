@@ -12,7 +12,16 @@ import { render, screen, waitFor } from '@testing-library/react';
 // happily as a correct one.
 //
 // So: the feed page HAS the attribute, and the home page — same components,
-// same rows — does NOT. Both rendered for real, not asserted from source.
+// same rows — is labelled as SOMETHING ELSE. Both rendered for real, not
+// asserted from source.
+//
+// That home-side wording is narrower than it first was, and the narrowing is
+// deliberate. The shared Layout now labels every surface it renders, so "home
+// has no `data-surface` at all" stopped being true for a reason unrelated to
+// leaking. The assertion moved to "home is not labelled sensor-log", paired
+// with a control proving the labelling mechanism is live — see the comment on
+// the home-side test for why the pair is needed and the narrowed half alone
+// would rot.
 //
 // `sensorLogSkin.test.tsx` is the sibling half: it guards the SELECTORS (which
 // classes the skin borrows). This file guards the SCOPE (who is inside it).
@@ -42,6 +51,18 @@ import FeedPage from '../pages/feed';
 import HomePage from '../pages/index';
 import type { FeedItem } from '../lib/algernon/feed';
 
+// The scope token, named ONCE. Threaded through all three places this file
+// spells it — the feed-side attribute, the home-side exclusion, and the
+// stylesheet check — so a rename cannot leave one of them querying a string
+// nothing sets any more. That failure would be silent in the worst way: the
+// home-side assertion below is an ABSENCE check, and an absence check against
+// a stale selector passes forever.
+//
+// Deliberately test-local rather than exported from production: the scope
+// token is the stylesheet's own business, and widening it to a public constant
+// is more surface than this guarantee needs.
+const SENSOR_SURFACE = 'sensor-log';
+
 // An FYI item, so BOTH surfaces render a real `FeedRow` from it — the shared
 // component whose colours are the thing at stake.
 const fyiItem: FeedItem = {
@@ -70,34 +91,66 @@ afterEach(() => vi.restoreAllMocks());
 describe('sensor-log containment — the attribute is set on the feed and nowhere else', () => {
   it('the FEED page declares the surface, on an ancestor of its rows', async () => {
     const { container } = render(<FeedPage />);
-    await waitFor(() => expect(screen.queryByTestId('feed-console')).not.toBeNull());
+    // SYNCHRONISE ON THE ASSERTED ELEMENT, not on a nearby one.
+    //
+    // This waited on `feed-console`, which is rendered OUTSIDE every `loaded &&`
+    // gate and therefore paints on the first frame — before the feed fetch has
+    // resolved. The assertions below need `feed-row`, which is behind those
+    // gates, so the synchronisation point was satisfied while the asserted
+    // element could still be absent: a real 1-in-5 flake under parallel-worker
+    // load, and one that would read as "containment broke" rather than "the
+    // wait was mistargeted".
+    //
+    // Waiting on the row (exactly what the home-side sibling below already
+    // does) makes the wait cover everything the test touches. Causality is
+    // proven, not argued: a 40ms delay on the mocked fetch fails this test
+    // deterministically with the old target and passes with this one.
+    await waitFor(() => expect(container.querySelector('[data-testid="feed-row"]')).not.toBeNull());
 
     const console_ = screen.getByTestId('feed-console');
-    expect(console_.getAttribute('data-surface')).toBe('sensor-log');
+    expect(console_.getAttribute('data-surface')).toBe(SENSOR_SURFACE);
 
     // ANCESTOR, not merely present somewhere on the page: a skin rule reads
     // `[data-surface='sensor-log'] [data-testid='feed-row']`, so an attribute
     // sitting in a sibling branch would style nothing at all.
     const row = container.querySelector('[data-testid="feed-row"]');
     expect(row).not.toBeNull();
-    expect(row!.closest('[data-surface="sensor-log"]')).toBe(console_);
+    expect(row!.closest(`[data-surface="${SENSOR_SURFACE}"]`)).toBe(console_);
   });
 
-  it('the HOME page renders the SAME row and declares no surface at all', async () => {
+  it('the HOME page renders the SAME row and is NOT labelled as this surface', async () => {
     const { container } = render(<HomePage />);
     // Wait for the feed-driven render, so the assertion is made against a
     // populated page rather than a spinner that trivially has no attributes.
     await waitFor(() => expect(container.querySelector('[data-testid="feed-row"]')).not.toBeNull());
 
-    // The positive control is the row itself: the brief IS rendering the shared
-    // component this skin re-points. If it were not, "no data-surface here"
-    // would be true and meaningless.
+    // The first positive control is the row itself: the brief IS rendering the
+    // shared component this skin re-points. If it were not, "not labelled
+    // sensor-log here" would be true and meaningless.
     const row = container.querySelector('[data-testid="feed-row"]');
     expect(row).not.toBeNull();
 
-    // …and there is no surface declaration anywhere on it.
-    expect(container.querySelectorAll('[data-surface]')).toHaveLength(0);
-    expect(row!.closest('[data-surface]')).toBeNull();
+    // THE PAIRED VACUITY CONTROL, and the reason this assertion is narrowed
+    // rather than "no [data-surface] at all".
+    //
+    // The shared Layout now labels EVERY surface it renders (`data-surface` is
+    // the containment mechanism the whole arc keys off; the prop is just its
+    // ergonomic spelling), so home legitimately carries an attribute — just not
+    // this one. Asserting the attribute is absent would now fail for a reason
+    // that has nothing to do with leaking.
+    //
+    // But narrowing alone would rot: in a world where Layout stopped emitting
+    // `data-surface` entirely, BOTH directions would go green — home trivially,
+    // because nothing matches, and the feed via its own inner console div,
+    // whose attribute it sets itself independently of Layout. So the claim is
+    // TWO facts and both are pinned: the labelling mechanism is LIVE, and
+    // home's label is not ours.
+    //
+    // Presence form, deliberately not `=== 'warm'`: this file must not pin the
+    // deck lane's choice of default name. What matters here is that something
+    // labels the surface, not what it chose to call it.
+    expect(row!.closest('[data-surface]')).not.toBeNull();
+    expect(row!.closest(`[data-surface="${SENSOR_SURFACE}"]`)).toBeNull();
   });
 
   it('the two directions are asserted against the same attribute VALUE', () => {
@@ -109,6 +162,6 @@ describe('sensor-log containment — the attribute is set on the feed and nowher
       require('node:path').join(__dirname, '..', 'styles', 'sensorLog.css'),
       'utf8',
     );
-    expect(css).toContain("[data-surface='sensor-log']");
+    expect(css).toContain(`[data-surface='${SENSOR_SURFACE}']`);
   });
 });

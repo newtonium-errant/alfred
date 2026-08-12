@@ -1,0 +1,200 @@
+/* ═══════════════ ALGERNON CONSOLE — shared surface vocabulary ═══════════════
+ *
+ * The ratified visual identity (interface-reimagine arc, sketch review
+ * 2026-08-11): **LCARS grammar, explicitly NOT the 1987 palette.** Asymmetric
+ * colour-blocked layout, elbows, function-grouping by colour, no chrome, no
+ * gradients — carried on a modern muted palette (desaturated teal / amber /
+ * rust, off-white on deep neutrals) with Expanse lived-in-ness. Dark-first.
+ *
+ * WHY THIS FILE EXISTS SEPARATELY FROM globals.css
+ * The PWA's other surfaces (chat, brief, ingest, batch, home) are the warm
+ * honeydew light theme and are NOT part of this arc. So this layer is
+ * strictly ADDITIVE and OPT-IN: every token name here is new, no existing
+ * component references one, and nothing below restyles an existing element.
+ * A surface joins the console identity by rendering inside `data-surface=
+ * "console"` (the `surface="console"` prop on the shared Layout) — never by
+ * this file reaching out and changing it.
+ *
+ * PORTABILITY CONTRACT (this is a shared layer, not the deck's private CSS)
+ * The Decide deck is the first consumer; the Awareness feed / sensor-log is
+ * the second, and the brief-as-viewscreen the third. So the vocabulary is
+ * named for FUNCTION, never for the deck: `--console-affirm` not
+ * `--deck-swipe-right`. Consumers should reach for the Tailwind names
+ * (`bg-console-panel`, `text-affirm`, `border-caution`) which are wired to
+ * these vars in tailwind.config.cjs; the raw vars are for the few places
+ * a computed colour is genuinely needed.
+ *
+ * THE LOAD-BEARING PART IS THE FUNCTION ROLES, NOT THE HEXES.
+ * LCARS's actual idea — the one thing worth keeping from 1987 — is that
+ * colour CARRIES MEANING rather than decorating. Four roles, and every
+ * surface must spend them the same way or the grammar stops being a grammar:
+ *
+ *   affirm    teal   yes · confirm · accept · it landed
+ *   negative  rust   no · reject · spam · this destroys something
+ *   caution   amber  not now, or not without a second look
+ *   info      slate  neutral structure; carries no verdict
+ *
+ * `caution` deliberately covers BOTH the defer family (swipe-up, snooze) and
+ * the heavy-verb arm stage. They are one idea to the eye — *slow down* — and
+ * the approved sketch spends amber on both. Do not split them into two hues
+ * without re-ratifying: a defer that looked like a reject would be a lie
+ * about the axis (D3: horizontal = affirm/reject, vertical = the defer family).
+ *
+ * ALPHA MODIFIERS: these tokens are plain hex, NOT the `<alpha-value>` channel
+ * form, so Tailwind opacity modifiers (`bg-console-panel/50`) do NOT work on
+ * them. That is deliberate — the palette is layered by picking the next rung
+ * of the surface ramp, not by making a surface translucent, which is how the
+ * depth stays legible on a dark ground. Where translucency is genuinely
+ * needed there is an explicit token (`--console-scrim`).
+ */
+
+:root {
+  /* ── surface ramp: deep ground → the control resting on top of it ──────── */
+  --console-void: #05080a; /* behind everything; the overscroll ground */
+  --console-hull: #0d1316; /* the page floor a surface sits on */
+  --console-panel: #131d21; /* a card / pane face */
+  --console-raise: #1a262b; /* a control resting on a panel */
+  --console-edge: #25373e; /* hairline divider / card border */
+  --console-edge-bright: #31474f; /* an edge that needs to be found */
+
+  /* ── ink ramp ───────────────────────────────────────────────────────────
+   * `ink` and `ink-dim` are for reading. `ink-faint` is for UPPERCASE micro
+   * labels only — at ~4.2:1 on panel it is legible as a tracked-out caps
+   * label and NOT legible enough for body copy. `ink-ghost` is disabled
+   * state, which is allowed to be quiet because it is also inert. */
+  --console-ink: #eae7dd;
+  --console-ink-dim: #a6b2b4;
+  --console-ink-faint: #6e7f84;
+  --console-ink-ghost: #465559;
+
+  /* ── function roles ─────────────────────────────────────────────────────
+   * Each role is a triad: the SIGNAL (text/border on a dark ground), the DEEP
+   * (a filled block that ink sits on), and the WASH (a tinted backing that
+   * stays subordinate to panel). Same three rungs for every role so a
+   * consumer can swap role without rethinking depth. */
+  --console-affirm: #4fa7a1;
+  --console-affirm-deep: #2e6d69;
+  --console-affirm-wash: #173a39;
+
+  --console-negative: #b25740;
+  --console-negative-deep: #6d3527;
+  --console-negative-wash: #301813;
+
+  --console-caution: #c99a4c;
+  --console-caution-deep: #8b6a30;
+  --console-caution-wash: #3a2c15;
+
+  --console-info: #77839b;
+  --console-info-deep: #414a5c;
+  --console-info-wash: #1e2530;
+
+  /* ── instance accents — IDENTITY, DELIBERATELY NOT A VERDICT ─────────────
+   * Which instance an item came from is provenance, not a judgement, so the
+   * accents are drawn from hues the four function roles do NOT use. The
+   * approved sketch tinted Salem's chip the same teal as affirm; that is the
+   * one place this layer departs from it, because on a card whose whole left
+   * edge is already spending teal to mean "yes", a teal chip reads as a
+   * verdict about the item rather than a label for its origin.
+   *
+   * Assigned by a stable hash of the instance name, never by a name literal —
+   * a per-instance colour map would be wrong the day a fifth instance exists,
+   * and this codebase's instance names are config, not constants. */
+  --console-accent-1: #8b7091; /* plum */
+  --console-accent-2: #77839b; /* slate */
+  --console-accent-3: #7d9a6b; /* sage */
+  --console-accent-4: #9c7f6a; /* clay */
+
+  --console-accent-1-wash: #24202c;
+  --console-accent-2-wash: #1e2530;
+  --console-accent-3-wash: #1e2820;
+  --console-accent-4-wash: #2a221c;
+
+  /* Ink that sits ON a filled role block (affirm-deep / caution / negative
+     fills). Near-black rather than the page ground, so a filled control reads
+     as lit rather than as a hole. */
+  --console-on-fill: #06131a;
+
+  /* The only translucent token — an overlay backing that must let the frozen
+     card underneath stay faintly legible (the snooze menu rides the gesture). */
+  --console-scrim: rgba(5, 8, 10, 0.72);
+}
+
+/* Deliberately PLAIN CSS, not `@layer components`. Tailwind only hoists a
+ * `@layer` block in a file that also carries the `@tailwind` directives, and
+ * this file is imported on its own (in _app.tsx, AFTER globals.css) so it stays
+ * separately owned. Loading order is what gives the focus-ring override below
+ * its win; nothing here shares an element with a conflicting Tailwind utility.
+ *
+ * One consequence to respect: never put a `rounded-*` utility on an element
+ * that also carries `.console-elbow` / `.console-railseg` — this file loads
+ * later and would win. Use one or the other. */
+
+/* The console ground. Applied by Layout's `surface="console"` variant. */
+[data-surface='console'] {
+  background-color: var(--console-hull);
+  color: var(--console-ink);
+}
+
+/* The page ground behind a console surface, so iOS overscroll reveals the
+   console's own void rather than the warm honeydew wash of the other
+   surfaces. `:has()` keeps this opt-in from the markup with no JS and no
+   global default to reset — a page without a console surface is untouched. */
+body:has([data-surface='console']) {
+  background-color: var(--console-void);
+}
+
+/* globals.css sets a honeydew focus ring app-wide. On the console ground
+   that is off-identity, so re-point it INSIDE the console surface only.
+   Keeps the ring (never remove a keyboard affordance) — changes its colour. */
+[data-surface='console'] :focus-visible {
+  outline: 2px solid var(--console-affirm);
+  outline-offset: 2px;
+}
+
+/* ── LCARS primitives ──────────────────────────────────────────────────
+ * The shape grammar, as classes rather than utilities: the asymmetric
+ * corner radii that make an elbow are unreadable spelled as four arbitrary
+ * Tailwind values at every call site, and they are exactly the vocabulary
+ * the sibling surfaces need to look like the same system. */
+
+/* The corner block that turns a vertical rail into a horizontal header —
+   LCARS's signature join. Colour is left to the caller (function-grouped). */
+.console-elbow {
+  border-start-start-radius: 10px;
+  border-end-start-radius: 28px;
+}
+
+/* A rail segment: a block that is square where it meets the rail and
+   pill-capped where it meets content. */
+.console-railseg {
+  border-start-end-radius: 999px;
+  border-end-end-radius: 999px;
+}
+
+/* ACCRETED treatment — the authored/accreted distinction from the sketch
+   review (D5: the deck renders authored-complete; settled history accretes).
+   A surface that has been LIVED IN gets this faint horizontal striping;
+   an authored surface stays flat. This is the Expanse texture note, and it
+   is the one place the identity is allowed to add visual noise. */
+.console-accreted {
+  background-image: repeating-linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.014) 0 1px,
+    transparent 1px 3px
+  );
+}
+
+/* HATCH — the heavy-verb marking. A hatched rail means "this verb writes or
+   destroys something durable; it will arm, not fire." Diagonal because it
+   must be distinguishable from a solid caution block at a glance and
+   without relying on colour alone (the weight signal is also carried by the
+   card's own "Heavy · <verb>" chip, so this is reinforcement, not the sole
+   channel). */
+.console-hatch {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--console-caution-deep) 0 4px,
+    var(--console-caution-wash) 4px 8px
+  );
+}
+

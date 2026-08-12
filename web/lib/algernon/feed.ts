@@ -62,25 +62,37 @@ export interface FeedItem {
   acted_at: string | null;
   expires_at: string | null;
   /**
-   * The item's own INTERVAL EXTENT (D7) — when the thing itself is, as opposed
+   * The item's own INTERVAL EXTENT (D7) — when the thing itself IS, as opposed
    * to when the feed learned about it (`created_at`, which is provenance).
    *
-   * Mirrors `alfred.feed.model.FeedItem.starts_at` / `.ends_at`, which the
-   * `/feed/items` body already carried before this declaration existed; the BFF
-   * relays the payload verbatim, so nothing on the wire changes here. What
-   * changes is that the timeline view can LAY OUT against them instead of
-   * re-parsing a rendered display string (`evidence.time_display` is a lossy
-   * `"%H:%M"` — no end, no date, no offset).
+   * Mirrors `alfred.feed.model.FeedItem.starts_at` / `.ends_at`. The
+   * `/feed/items` body already carried these before any client declared them:
+   * the BFF relays the transport payload VERBATIM (`pages/api/feed/list.ts`
+   * returns `body` untouched) and the browser side is a bare cast, so there is
+   * no schema on the response path to strip an unknown key. Nothing on the wire
+   * changed when this declaration landed — declaring it IS the whole of the
+   * client-side wiring.
    *
    * Both are INDEPENDENTLY optional, and the asymmetry is load-bearing:
-   *   - both absent  → the item has no time dimension at all (a merge proposal)
+   *   - both absent   → the item has no time dimension at all (a merge proposal)
    *   - start, no end → a MOMENT (a 09:30 run), *not* a zero-length span
    *   - start + end   → a real interval (a TAF validity window, a fog corridor)
    *
    * A renderer MUST read `ends_at: null` as "no known end" and never as "ends
-   * immediately" — the backend model states this as a contract on producers,
-   * and drawing a zero-height bar would silently invert it. `itemExtent` in
-   * `feedTime.ts` is the one place that decision is made; go through it.
+   * immediately" — the backend states this as a contract on producers, and
+   * drawing a zero-length bar would silently invert it.
+   *
+   * TWO READERS, ONE FACT, DIFFERENT QUESTIONS — go through one of them rather
+   * than parsing these strings at a call site:
+   *   - `feedTime.ts::itemExtent` — the timeline's LAYOUT question (where does
+   *     this sit on a day axis, and how wide is it).
+   *   - `timeExtent.ts::readTimeExtent` — the DISPLAY question (what does this
+   *     say to a reader, and how long is it).
+   * They disagree on date-only values, and both are right: an all-day item
+   * cannot be positioned on an hour axis, but it must still be shown. Whichever
+   * you use, the date-only discrimination has to be made on the STRING —
+   * `new Date("2026-08-12")` succeeds and invents midnight UTC, turning an
+   * all-day event into a zero-length one at 00:00.
    *
    * Optional on this interface (rather than `string | null`) because a cached
    * pre-D7 payload in the service worker legitimately has neither key.

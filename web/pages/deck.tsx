@@ -9,7 +9,7 @@ import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { isDeckDealt } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
-import { display, subtle } from '../lib/typography';
+import { CONSOLE_LABEL } from '../lib/algernon/consoleTokens';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
@@ -115,8 +115,8 @@ export default function DeckPage() {
         <Head>
           <title>Deck · {INSTANCE_NAME}</title>
         </Head>
-        <Layout showNav={false}>
-          <p data-testid="auth-gate" className={subtle}>
+        <Layout showNav={false} surface="console">
+          <p data-testid="auth-gate" className="text-sm text-console-ink-dim">
             Loading…
           </p>
         </Layout>
@@ -129,25 +129,34 @@ export default function DeckPage() {
       <Head>
         <title>Deck · {INSTANCE_NAME}</title>
       </Head>
-      <Layout onSignOut={() => void handleSignOut()}>
-        <h1 className={display}>Deck</h1>
-        <p className={`mt-1 ${subtle}`}>Decisions {INSTANCE_NAME} needs from you — swipe, tap, or use the arrow keys.</p>
+      <Layout onSignOut={() => void handleSignOut()} surface="console" maxWidthClassName="max-w-5xl">
+        {/* The deck is a TACTICAL CONSOLE, so its title is a read-out rather
+            than a page heading — tracked-out caps on the affirm rail colour,
+            with the instance it belongs to stated beside it. */}
+        <div className="mb-3 flex items-baseline gap-3">
+          {/* Still "Deck", not "Decide". D1 makes this THE Decide surface, but
+              the nav link, the document title and every test id call it the
+              deck — renaming only the heading would be drift, and renaming the
+              surface is an arc-level call, not this lane's. */}
+          <h1 className="text-lg font-bold uppercase tracking-[0.26em] text-affirm">Deck</h1>
+          <p className={CONSOLE_LABEL}>{INSTANCE_NAME} · swipe, tap, or arrow keys</p>
+        </div>
 
         {error && (
-          <div role="alert" data-testid="deck-error" className="mt-6 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
+          <div role="alert" data-testid="deck-error" className="mt-6 rounded-sm border-l-2 border-negative bg-negative-wash px-3 py-2 text-sm text-negative">
             {error}
           </div>
         )}
 
         {items == null && !error && (
-          <p data-testid="deck-loading" className={`mt-6 ${subtle}`}>
+          <p data-testid="deck-loading" className="mt-6 text-sm text-console-ink-dim">
             Loading the deck…
           </p>
         )}
 
         {items != null && !error && actionable.length === 0 && unactionableCount === 0 && (
           // ILB: empty because there is genuinely nothing open to decide.
-          <p data-testid="deck-empty" className={`mt-6 ${subtle}`}>
+          <p data-testid="deck-empty" className="mt-6 text-sm text-console-ink-dim">
             Nothing to decide right now — new decisions arrive with each sync.
           </p>
         )}
@@ -156,10 +165,10 @@ export default function DeckPage() {
           // ILB: nothing to SWIPE, but there are non-deck-dealt open items — PLANNED
           // slots (committed, awaiting their ✓). Those are worklist items, actionable
           // inline on the Feed / rings, not deck cards.
-          <p data-testid="deck-unactionable" className={`mt-6 ${subtle}`}>
+          <p data-testid="deck-unactionable" className="mt-6 text-sm text-console-ink-dim">
             {unactionableCount} item{unactionableCount > 1 ? 's are' : ' is'} on your worklist —
             see {unactionableCount > 1 ? 'them' : 'it'} on the{' '}
-            <Link href="/feed" className="underline underline-offset-2">
+            <Link href="/feed" className="text-affirm underline underline-offset-4">
               Feed
             </Link>
             .
@@ -167,7 +176,7 @@ export default function DeckPage() {
         )}
 
         {actionable.length > 0 && (
-          <div className="mt-6 flex min-h-[440px] flex-col">
+          <div className="mt-4 flex min-h-[460px] flex-col">
             <Deck
               items={actionable}
               onAuthExpired={onAuthExpired}

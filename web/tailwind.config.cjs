@@ -44,6 +44,71 @@ module.exports = {
           bg: '#fde2e1',
         },
         cream: '#fdfdf8', // card surface
+
+        // ── ALGERNON CONSOLE identity (interface-reimagine arc) ─────────────
+        // The dark-first LCARS-grammar vocabulary. Values live as CSS custom
+        // properties in styles/console.css (which carries the full contract:
+        // what each role MEANS, and why `caution` covers both defer and heavy);
+        // these are the Tailwind names surfaces actually type.
+        //
+        // ADDITIVE AND OPT-IN. None of the warm honeydew surfaces reference
+        // these, so adding them restyles nothing — a surface joins the identity
+        // by rendering inside Layout's `surface="console"` variant.
+        //
+        // NO OPACITY MODIFIERS: these resolve to plain hex through var(), not
+        // the `<alpha-value>` channel form, so `bg-console-panel/50` silently
+        // produces nothing. Layer by climbing the surface ramp instead
+        // (hull → panel → raise), which is how depth stays legible on a dark
+        // ground; `console-scrim` is the one deliberate translucent token.
+        console: {
+          void: 'var(--console-void)',
+          hull: 'var(--console-hull)',
+          panel: 'var(--console-panel)',
+          raise: 'var(--console-raise)',
+          edge: 'var(--console-edge)',
+          'edge-bright': 'var(--console-edge-bright)',
+          ink: 'var(--console-ink)',
+          'ink-dim': 'var(--console-ink-dim)',
+          'ink-faint': 'var(--console-ink-faint)',
+          'ink-ghost': 'var(--console-ink-ghost)',
+          'on-fill': 'var(--console-on-fill)',
+          scrim: 'var(--console-scrim)',
+        },
+        // The four FUNCTION roles. Colour carries meaning here — spend them by
+        // what the element DOES, never by what looks good in the slot.
+        affirm: {
+          DEFAULT: 'var(--console-affirm)',
+          deep: 'var(--console-affirm-deep)',
+          wash: 'var(--console-affirm-wash)',
+        },
+        negative: {
+          DEFAULT: 'var(--console-negative)',
+          deep: 'var(--console-negative-deep)',
+          wash: 'var(--console-negative-wash)',
+        },
+        caution: {
+          DEFAULT: 'var(--console-caution)',
+          deep: 'var(--console-caution-deep)',
+          wash: 'var(--console-caution-wash)',
+        },
+        info: {
+          DEFAULT: 'var(--console-info)',
+          deep: 'var(--console-info-deep)',
+          wash: 'var(--console-info-wash)',
+        },
+        // Instance provenance — identity, not judgement. Hues chosen to avoid
+        // every function role, and assigned by a stable hash of the instance
+        // name (lib/algernon/consoleTokens.ts), never by a name literal.
+        accent: {
+          1: 'var(--console-accent-1)',
+          2: 'var(--console-accent-2)',
+          3: 'var(--console-accent-3)',
+          4: 'var(--console-accent-4)',
+          '1-wash': 'var(--console-accent-1-wash)',
+          '2-wash': 'var(--console-accent-2-wash)',
+          '3-wash': 'var(--console-accent-3-wash)',
+          '4-wash': 'var(--console-accent-4-wash)',
+        },
       },
       fontFamily: {
         // Friendly rounded sans, injected via next/font in _app.tsx.

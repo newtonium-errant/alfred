@@ -134,3 +134,62 @@ class TestCrossLanguageAgreement:
         served = {a["verb"]: a for a in actions_for("attribution")}
         note = served["reject"]["note"]
         assert note in src, "the FE arm note and the served note have drifted"
+
+    def _fe_deck_verb_kinds(self) -> set[str]:
+        """The kinds the web deck's own verb map claims it can act on."""
+        src = self._fe_source()
+        block = re.search(
+            r"^export const DECK_VERBS: Record<string, DeckVerbs> = \{$(.*?)^\};$",
+            src,
+            re.S | re.M,
+        )
+        assert block, "DECK_VERBS block not found — the FE table moved or was renamed"
+        kinds = set(re.findall(r"^  ([a-z_]+): \{", block.group(1), re.M))
+        # Guard the denominator: an over-tight regex would silently make every
+        # set comparison below trivially true.
+        assert len(kinds) >= 5, f"parsed only {kinds} — the regex has gone stale"
+        return kinds
+
+    def test_the_FE_never_offers_a_kind_the_CEILING_REFUSES(self):
+        """The failure direction that reaches the operator: a card that 400s.
+
+        ``isDeckDealt`` deals any kind with a ``DECK_VERBS`` entry, so a kind the
+        FE knows and the ceiling does not becomes a dealt card whose verb the
+        router answers ``invalid_action``. Neither side can notice alone.
+
+        ONE KNOWN EXCEPTION, recorded rather than hidden (found 2026-08-12
+        during the deck identity lane): ``recurrence``. The FE offers a heavy
+        "Promote"; ``FEED_ACTIONS`` has no ``recurrence`` entry at all. It is
+        LATENT, not live — no producer constructs a ``recurrence`` FeedItem
+        today (the tier-recurrence loop is CLI-only), though ``recurrence`` IS a
+        declared decide-mode kind in ``feed.model``, and step-2 G6 boards the
+        card redirect. So this fires the day either half moves: a producer
+        landing makes it live, and closing the gap by giving the ceiling a
+        ``recurrence`` entry ALSO reds this, which is the point — the exception
+        must be deleted deliberately, not decay quietly.
+
+        Retires with ``DECK_VERBS`` itself. Consuming the served ``actions[]``
+        dissolves this whole class by construction, because the FE would then
+        only ever offer what the ceiling served.
+        """
+        KNOWN_LATENT_EXCEPTIONS = {"recurrence"}
+        fe_only = self._fe_deck_verb_kinds() - set(FEED_ACTIONS)
+        assert fe_only == KNOWN_LATENT_EXCEPTIONS, (
+            "the FE's deck verb map and the capability ceiling have drifted: "
+            f"FE-only kinds are {sorted(fe_only)}, expected {sorted(KNOWN_LATENT_EXCEPTIONS)}"
+        )
+
+    def test_the_two_tables_genuinely_overlap(self):
+        """Positive control for the exception pin above.
+
+        ``fe_only == {"recurrence"}`` would also hold if the FE map had somehow
+        shrunk to nothing but recurrence, or if the ceiling had swallowed
+        everything. Assert the agreement is real and broad, so the pin above is
+        measuring drift rather than collapse.
+        """
+        fe = self._fe_deck_verb_kinds()
+        shared = fe & set(FEED_ACTIONS)
+        assert len(shared) >= 6, f"only {sorted(shared)} in common — one side has collapsed"
+        # And every shared kind actually advertises at least one verb.
+        for kind in sorted(shared):
+            assert actions_for(kind), kind

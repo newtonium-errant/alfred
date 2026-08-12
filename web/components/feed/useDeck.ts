@@ -82,6 +82,16 @@ export interface UseDeckResult {
   remaining: number;
   /** The this-session snoozed cards, retained for the snoozed drill-down. */
   snoozed: FeedItem[];
+  /**
+   * EVERY card still behind the current one, in order — as opposed to
+   * `upcoming`, which is the two the visual stack draws.
+   *
+   * The workstation posture has room to show what is coming and the phone does
+   * not; that is the whole difference between the two, and it needs the real
+   * remainder rather than the render slice. Derived from the same queue and
+   * index as everything else here, so it cannot disagree with `remaining`.
+   */
+  ahead: FeedItem[];
   snoozedCount: number;
   confirmingId: string | null;
   /** Which direction is armed on that card ('affirm' | 'reject'), or null. */
@@ -480,11 +490,13 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
 
   const remaining = Math.max(0, queue.length - index);
   const upcoming = queue.slice(index + 1, index + 3);
+  const ahead = queue.slice(index + 1);
   const cleared = index >= queue.length;
 
   return {
     current,
     upcoming,
+    ahead,
     remaining,
     snoozed,
     snoozedCount: snoozed.length,
