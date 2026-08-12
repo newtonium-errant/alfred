@@ -79,6 +79,14 @@ _REGEN_BANNER = (
 _ABSENT = "—"
 
 
+def _decimal_or_none(raw: str) -> Decimal | None:
+    """Parse a stored declared-total string, or ``None`` if it will not."""
+    try:
+        return Decimal(str(raw))
+    except Exception:  # noqa: BLE001 — an unreadable stored figure renders raw
+        return None
+
+
 def _escape_cell(text: str) -> str:
     """Make a value safe inside a Markdown table cell.
 
@@ -151,6 +159,21 @@ def render_statement_section(
         out.append(f"**Company:** {statement.company}")
     if statement.payment_total is not None:
         out.append(f"**Payment Total:** {format_money(statement.payment_total)}")
+    if statement.declared_totals:
+        # Re-emitted as the same two-column block the parser reads, NOT as
+        # metadata lines. Metadata keys go through a synonym table, so an
+        # unrecognised label would be dropped on the next parse and the note
+        # would shed these figures one regeneration at a time — the exact
+        # shape the provenance line already had to be rescued from.
+        out.append("")
+        out.append("|  | Amount |")
+        out.append("| --- | --- |")
+        for label in sorted(statement.declared_totals):
+            raw = statement.declared_totals[label]
+            value = _decimal_or_none(raw)
+            rendered = format_money(value) if value is not None else str(raw)
+            out.append(f"| {_escape_cell(label)} | {rendered} |")
+
     if statement.inferred:
         # A STRUCTURED metadata line, not loose prose, and the leading
         # token is what the parser keys on. The distinction matters: this

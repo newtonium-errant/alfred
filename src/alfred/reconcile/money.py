@@ -105,11 +105,44 @@ class CellParseError(ValueError):
     """
 
 
+def strip_emphasis(text: str | None) -> str:
+    """Drop Markdown bold/italic markers. THE one spelling of this rule.
+
+    Real provider summaries bold their aggregate figures — ``**4104.00**``,
+    ``**$40,641.00**``, ``**-52440.00**`` — so emphasis is a SPELLING of a
+    value in exactly the way a currency symbol or a thousands comma is, not
+    a presentational detail some other layer should have removed first.
+    Every cell parser below therefore strips it, and so does the statement
+    metadata matcher in :mod:`alfred.reconcile.parser`, which imports this
+    rather than keeping a second copy.
+
+    The cost of the second copy is not hypothetical here: bolded aggregates
+    were refused outright by the first build, which zeroed every subtotal
+    row and left the report's cross-foot with nothing to check — including
+    a bolded negative subtotal, which is real money going quiet.
+
+    Only the DOUBLE markers are stripped — ``**`` and ``__``. A single
+    ``*`` or ``_`` is left alone, because both are legal inside a claim
+    number, a benefit code and free-text comments, and corrupting an
+    identifier to tidy a style marker is the worse trade. The consequence
+    is that a single-asterisk italic amount (``*1234.00*``) is REFUSED
+    rather than read: it is not a shape the real statements produce, and a
+    loud refusal that names the cell beats a silent strip that might have
+    eaten part of a claim number.
+    """
+    if not text:
+        return ""
+    return text.replace("**", "").replace("__", "")
+
+
 def is_absent(text: str | None) -> bool:
-    """Whether a cell means "no value", as opposed to zero."""
+    """Whether a cell means "no value", as opposed to zero.
+
+    Emphasis is stripped first, so ``**—**`` is as absent as ``—``.
+    """
     if text is None:
         return True
-    return text.strip().lower() in ABSENT_CELL_VALUES
+    return strip_emphasis(text).strip().lower() in ABSENT_CELL_VALUES
 
 
 def parse_money(text: str | None, *, field: str = "amount") -> Decimal | None:
@@ -128,7 +161,7 @@ def parse_money(text: str | None, *, field: str = "amount") -> Decimal | None:
     """
     if is_absent(text):
         return None
-    raw = str(text).strip()
+    raw = strip_emphasis(text).strip()
 
     negative = False
 
@@ -196,7 +229,7 @@ def parse_percent(text: str | None, *, field: str = "percent") -> Decimal | None
     """
     if is_absent(text):
         return None
-    raw = str(text).strip().rstrip("%").strip()
+    raw = strip_emphasis(text).strip().rstrip("%").strip()
     raw = raw.replace(",", "")
     if raw and raw[0] in _MINUS_CHARS:
         raw = "-" + raw[1:]
@@ -229,7 +262,7 @@ def parse_int(text: str | None, *, field: str = "units") -> int | None:
     """
     if is_absent(text):
         return None
-    raw = str(text).strip().replace(",", "")
+    raw = strip_emphasis(text).strip().replace(",", "")
     try:
         value = Decimal(raw)
     except InvalidOperation as exc:
@@ -266,7 +299,7 @@ def parse_date(
     """
     if is_absent(text):
         return None
-    raw = str(text).strip()
+    raw = strip_emphasis(text).strip()
 
     m = _ISO_DATE_RE.match(raw)
     if m:
