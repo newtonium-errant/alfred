@@ -8,6 +8,9 @@ import {
   BOARD_UNSLOTTED,
   CANDIDATE_CAP,
   CARRYOVER_CAP,
+  SLOT_COVERAGE_WARN,
+  boardCoverage,
+  boardCoverageIsLow,
   boardIsCarryover,
   boardIsOverdue,
   boardSlotOf,
@@ -213,6 +216,59 @@ describe('carryoverRank — attention ordering over stamped evidence', () => {
       mk('broke', '2026-08-10T13:00:00Z', { snooze_breakthrough: 'moved_earlier' }),
     ];
     expect(stackFor(items, 'duty')?.carryover.map((i) => i.id)).toEqual(['broke', 'overdue', 'plain-old']);
+  });
+});
+
+describe('boardCoverage — the ratified 0.80 floor', () => {
+  const slotted = (n: number) =>
+    Array.from({ length: n }, (_, i) => slot({ id: `s${i}` }, { slot: 'duty' }));
+  const unslotted = (n: number) =>
+    Array.from({ length: n }, (_, i) => slot({ id: `u${i}` }, {}));
+  const cov = (s: number, u: number) => boardCoverage(boardStacks([...slotted(s), ...unslotted(u)], stageOf, NOW));
+
+  it('counts slotted vs residue off the rendered stacks', () => {
+    const c = cov(3, 1);
+    expect([c.slotted, c.unslotted, c.total]).toEqual([3, 1, 4]);
+    expect(c.fraction).toBe(0.75);
+  });
+
+  it('an empty board has NO fraction — no denominator, no claim', () => {
+    const c = boardCoverage(boardStacks([], stageOf, NOW));
+    expect(c.fraction).toBeNull();
+    expect(c.total).toBe(0);
+    // …and therefore cannot warn. This is the third state, and it is the one a
+    // naive `slotted / total || 0` would get wrong by warning at 0%.
+    expect(boardCoverageIsLow(c)).toBe(false);
+  });
+
+  // THE BOUNDARY. `< SLOT_COVERAGE_WARN` means exactly 80% is silent, and that
+  // edge is a float question: 4/5 is exactly 0.8 in IEEE double, so no epsilon is
+  // needed — but if the comparison ever becomes `<=`, this reddens.
+  it('exactly 80% does NOT warn; a hair under DOES', () => {
+    const at = cov(4, 1); // 4/5 = 0.8 exactly
+    expect(at.fraction).toBe(SLOT_COVERAGE_WARN);
+    expect(boardCoverageIsLow(at)).toBe(false);
+
+    const under = cov(3, 1); // 0.75
+    expect(boardCoverageIsLow(under)).toBe(true);
+  });
+
+  it('holds at the boundary for other ratios that reduce to 4/5', () => {
+    for (const [s, u] of [[8, 2], [16, 4], [40, 10]] as const) {
+      expect(boardCoverageIsLow(cov(s, u))).toBe(false);
+    }
+  });
+
+  it('full coverage is silent — the dormant case that ships today', () => {
+    const c = cov(3, 0);
+    expect(c.fraction).toBe(1);
+    expect(boardCoverageIsLow(c)).toBe(false);
+  });
+
+  it('the threshold is the ratified 0.80', () => {
+    // Pinned as a VALUE, not just consumed: the operator set this dial on
+    // 2026-08-12 and a silent drift of it changes what the board admits to.
+    expect(SLOT_COVERAGE_WARN).toBe(0.8);
   });
 });
 

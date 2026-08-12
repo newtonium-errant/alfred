@@ -140,6 +140,51 @@ describe('SlotBoard — the three stacks speak SLOTS', () => {
     expect(screen.getByTestId('board-balance').textContent).toContain('Nothing on the board yet today');
   });
 
+  // The coverage floor at the RENDER. Ships dormant (the box is at 100% today),
+  // so the pins are the only thing that will ever have exercised it before the
+  // morning it first fires.
+  it('below 80%: one warning line, above the rings, naming the balance', () => {
+    render(
+      <Harness
+        items={[
+          slot({ id: 'a' }, { slot: 'duty' }),
+          slot({ id: 'b' }, { slot: 'rhythm' }),
+          slot({ id: 'c' }, { slot: 'fuel' }),
+          slot({ id: 'x' }, {}), // 3/4 = 75%
+        ]}
+      />,
+    );
+    const warn = screen.getByTestId('board-coverage-warning');
+    expect(warn.textContent).toContain('1 of 4 items');
+    expect(warn.textContent).toContain('the balance below counts only the rest');
+    // It must NOT blame the rings — they show unslotted items in their tier
+    // bucket, so a "the rings are missing part of your day" claim would be false.
+    expect(warn.textContent).not.toContain('rings');
+    // Above the rings in document order.
+    const rings = screen.getByTestId('rings-header');
+    expect(warn.compareDocumentPosition(rings) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('at or above 80%: silent (the dormant case that ships today)', () => {
+    render(
+      <Harness
+        items={[
+          slot({ id: 'a' }, { slot: 'duty' }),
+          slot({ id: 'b' }, { slot: 'rhythm' }),
+          slot({ id: 'c' }, { slot: 'fuel' }),
+          slot({ id: 'd' }, { slot: 'duty' }),
+          slot({ id: 'x' }, {}), // 4/5 = exactly 80%
+        ]}
+      />,
+    );
+    expect(screen.queryByTestId('board-coverage-warning')).toBeNull();
+  });
+
+  it('an empty board makes no coverage claim at all', () => {
+    render(<Harness items={[]} />);
+    expect(screen.queryByTestId('board-coverage-warning')).toBeNull();
+  });
+
   it('shows the unslotted residue with its own honest note, and only when present', () => {
     const { unmount } = render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' })]} />);
     expect(screen.queryByTestId(`board-stack-unslotted`)).toBeNull();

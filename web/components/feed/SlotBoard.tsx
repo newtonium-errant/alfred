@@ -4,7 +4,10 @@ import { UNDO_MS } from '../../lib/algernon/feedConstants';
 import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import {
   BOARD_UNSLOTTED,
+  boardCoverage,
+  boardCoverageIsLow,
   boardSlotsWithADone,
+  boardStackSize,
   boardStacks,
   carryoverReason,
   type BoardStack,
@@ -91,10 +94,11 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
   // The residue stack exists only when something went unclassified — see the
   // ILB line below for what renders in its place when it doesn't.
   const hasResidue = stacks.some((s) => s.key === BOARD_UNSLOTTED);
-  const totalOnBoard = stacks.reduce(
-    (n, s) => n + s.today.length + s.carryover.length + s.candidates.length + s.done.length + s.overflow.length,
-    0,
-  );
+  const totalOnBoard = stacks.reduce((n, s) => n + boardStackSize(s), 0);
+  // How much of today the classifier could answer for. Derived from the same
+  // stacks rendered below, so the warning and the board can never disagree.
+  const coverage = boardCoverage(stacks);
+  const coverageLow = boardCoverageIsLow(coverage);
 
   const toggle = (setter: (fn: (prev: ReadonlySet<string>) => ReadonlySet<string>) => void, key: string) => {
     setter((prev) => {
@@ -362,6 +366,25 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
 
   return (
     <section aria-label="Your day" data-testid="slot-board">
+      {coverageLow && (
+        // COVERAGE FLOOR (operator-ratified 0.80). When too much of the day went
+        // unclassified, the module says so BEFORE he reads any of it — a
+        // completeness caveat belongs at the top even though its subject is below.
+        //
+        // NAMING THE RIGHT VICTIM: this does NOT say the rings are missing part of
+        // the day, because they aren't. `tierRingBuckets` filters on kind,
+        // visible-today and a valid TIER — there is no slot filter — so an
+        // unslotted item still draws its ring segment. What genuinely excludes
+        // them is the balance scoreline and the three stacks
+        // (`boardSlotsWithADone` counts only `SLOT_ORDER` keys). Blaming the one
+        // part of the module that IS showing him everything would teach exactly
+        // the wrong distrust.
+        <p data-testid="board-coverage-warning" role="status" className="mb-2 text-[11px] text-honeydew-600">
+          {coverage.unslotted} of {coverage.total} items couldn&rsquo;t be sorted into a slot — the
+          balance below counts only the rest.
+        </p>
+      )}
+
       {/* The rings stay the headline: they are the URGENCY glance, and they are
           a different question from the slots below, not a smaller version of it. */}
       <RingsHeader items={items ?? []} completion={completion} now={nowProp} onAuthExpired={onAuthExpired} />
