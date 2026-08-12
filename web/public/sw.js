@@ -18,7 +18,7 @@
 
 // Bump this to invalidate the whole shell cache and force a clean roll-out.
 // v2: added /share to the shell (Web Share Target handler).
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.
