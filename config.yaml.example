@@ -2184,3 +2184,61 @@ scaffold:
 #   # sample cannot become an audio archive of the garage, long enough to
 #   # survive a weekend away from morning review.
 #   miss_audio_retention_days: 7
+
+# --- Remittance reconciliation (Blue Cross payment loop, P1) ----------------
+#
+# Parses a provider payment summary note into a JSONL ledger, classifies the
+# claim lines that need a human, and produces the backlog bulk-review report.
+# PROPOSE-ONLY: nothing here closes an item, and P1 writes NOTHING to the
+# vault — `alfred reconcile render` regenerates the note text and prints it.
+#
+# "Ledger is truth, note is a render" — the same direction the batch pipeline
+# ships. The ledger is the record of what the provider paid; the note is a
+# view of it, regenerated wholesale rather than patched.
+#
+# Commands:
+#   alfred reconcile seed --note <path>   parse a summary into the ledger
+#   alfred reconcile render               regenerate the note text (prints)
+#   alfred reconcile report               build the CSV + summary artifact
+#   alfred reconcile status               what is in the ledger
+#   alfred reconcile correct ...          record an operator ruling
+#
+# reconcile:
+#   enabled: true
+#
+#   # Where the ledger lives. Leave unset and it resolves to
+#   # <logging.dir>/remittance/<instance-slug>/ — INSTANCE-scoped, because on
+#   # the box every instance shares one WorkingDirectory and differs only by
+#   # --config, so an unscoped path would be one ledger shared by all of them.
+#   # When neither logging.dir nor telegram.instance.name is set, reconcile is
+#   # OFF (loudly) rather than falling back to the process cwd.
+#   store_dir: ""
+#
+#   # How to read a slash-form date (03/04/2026). UNSET means such dates are
+#   # REFUSED rather than guessed at — the date is part of the ledger key, so
+#   # a wrong guess splits one claim into two rows or merges two into one.
+#   # ISO (2026-06-11) and text (11 Jun 2026) dates always parse without this.
+#   # One of: "dmy", "mdy".
+#   date_order: ""
+#
+#   # EOB code -> attention class. EMPTY BY DEFAULT AND DELIBERATELY SO: the
+#   # provider's real code list is not in this repo, and a fabricated mapping
+#   # would classify real money with invented authority. Until a code is
+#   # mapped here it surfaces as `unknown_eob` — unknown codes fail OPEN,
+#   # because an extra card costs a glance and a dropped one costs the money.
+#   #
+#   # Build this map from the bulk-review report: rule lines with
+#   # `alfred reconcile correct`, and repeated rulings on the same code become
+#   # a PROPOSED mapping in the next report. Proposals are never auto-applied.
+#   #
+#   # Valid classes: duplicate_denial, documentation_required,
+#   # resubmission_required, identity_mismatch, reversal, short_pay.
+#   # (reversal and short_pay are also derived from the line arithmetic and
+#   # need no mapping.)
+#   eob_classes: {}
+#     # "42": documentation_required
+#     # "91": duplicate_denial
+#
+#   # How many consistent operator rulings before a code mapping is PROPOSED.
+#   # Two, not one: a single ruling is as likely a one-off as a pattern.
+#   min_correction_support: 2
