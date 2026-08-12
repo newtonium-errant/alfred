@@ -1,4 +1,10 @@
 import '../styles/globals.css';
+// The Awareness feed's sensor-log surface. Every rule inside is scoped under
+// `[data-surface='sensor-log']` (or a `.sensor-*` class the feed alone uses), so
+// importing it app-wide costs the other pages nothing but keeps Next's
+// global-CSS-in-_app-only rule satisfied. It is also THE cross-lane token seam —
+// see the header comment in the file itself.
+import '../styles/sensorLog.css';
 import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { Nunito } from 'next/font/google';

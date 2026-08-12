@@ -1,0 +1,218 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE SENSOR LOG — the Awareness feed's ratified surface identity.
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Canonical-surface ruling: brief = viewscreen, deck = tactical console,
+   feed = SENSOR LOG. The feed is where the instruments report: it does not ask
+   for judgment (that is the deck's job, D1), it tells you what is out there and
+   when. Its grammar is LCARS — elbow rails, pill-terminated bars, tiny bold
+   letter-spaced labels, tabular mono numerals, flat blocks of colour, hard
+   structure, no gradients — but NOT the 1987 palette. The colours below are the
+   modern, lived-in register the four sketches shared as "ALGERNON UI KERNEL
+   v0.1": deep desaturated blue-greens, warm rather than clinical ink, a teal
+   instrument accent, amber for weather and heavy verbs.
+
+   ───────────────────────────────────────────────────────────────────────────
+   ⚠  THIS FILE IS THE SEAM.  ⚠
+   ───────────────────────────────────────────────────────────────────────────
+   The shared design-token / theme layer is owned by the DECK lane, which is
+   building in parallel. Until that layer lands and is relayed, these tokens are
+   feed-local. THIS BLOCK IS THE ONLY PLACE THEY ARE DEFINED — every consumer
+   (the feed page, the timeline view, the row skin below) references
+   `var(--sensor-*)` and nothing else, so the swap is a single edit HERE:
+   re-point each custom property at its shared-layer equivalent and delete
+   nothing else. No consumer changes. No second token vocabulary was invented
+   and no shared token was guessed at; if a name below has no counterpart in the
+   shared layer, that is a conversation, not a silent divergence.
+
+   Scoped to `[data-surface='sensor-log']` rather than `:root` DELIBERATELY:
+   `FeedRow` / `RingsHeader` are shared with `pages/index.tsx`, which is the
+   BRIEF — a different canonical surface (the viewscreen). A `:root` palette
+   would have leaked the instrument dark onto it. The attribute selector makes
+   that leak structurally impossible: only the feed page sets the attribute.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+[data-surface='sensor-log'] {
+  /* ground → raised, darkest first */
+  --sensor-void: #070a0c;
+  --sensor-hull: #0d1316;
+  --sensor-panel: #131d21;
+  --sensor-raise: #1a262b;
+
+  /* structure */
+  --sensor-edge: #25373e;
+  --sensor-edge2: #31474f;
+
+  /* type, brightest first */
+  --sensor-ink: #eae7dd;
+  --sensor-ink2: #a6b2b4;
+  --sensor-ink3: #6e7f84;
+  --sensor-ink4: #465559;
+
+  /* instrument accent — NOW, live readings, affirmative state */
+  --sensor-teal: #4fa7a1;
+  --sensor-teal2: #2e6d69;
+  --sensor-teal3: #173a39;
+
+  /* environment — weather, intervals, heavy verbs */
+  --sensor-amber: #c99a4c;
+  --sensor-amber2: #8b6a30;
+  --sensor-amber3: #3a2c15;
+
+  /* alert */
+  --sensor-rust: #b25740;
+  --sensor-rust2: #6d3527;
+  --sensor-rust3: #301813;
+
+  /* quiet / settled / FYI */
+  --sensor-slate: #77839b;
+  --sensor-slate2: #414a5c;
+
+  --sensor-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'Roboto Mono', Consolas, monospace;
+
+  background-color: var(--sensor-void);
+  color: var(--sensor-ink);
+}
+
+/* ── LCARS primitives ─────────────────────────────────────────────────────── */
+
+/* Tiny, bold, letter-spaced, uppercase. The label voice of the whole surface. */
+.sensor-label {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--sensor-ink3);
+}
+
+/* Tabular mono numerals — clock times and counts must not shift width as they
+   tick, or the axis appears to breathe. */
+.sensor-num {
+  font-family: var(--sensor-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The elbow: LCARS' load-bearing shape. A block whose inner corner is radiused
+   hard and whose outer corner is square, joining a vertical rail to a
+   horizontal bar. */
+.sensor-elbow {
+  background: var(--sensor-teal2);
+  border-top-left-radius: 9px;
+  border-bottom-left-radius: 26px;
+}
+
+/* A bar that terminates in a pill on its free end — the other half of the
+   elbow's sentence. */
+.sensor-bar {
+  background: var(--sensor-panel);
+  border-radius: 0 999px 999px 0;
+}
+
+/* ── the row skin ─────────────────────────────────────────────────────────────
+   `FeedRow` / `EvidenceBody` are SHARED with the brief. They are not recoloured
+   at source — they are skinned here, under the surface attribute, so the brief
+   keeps its warm palette untouched.
+
+   COUPLING, STATED PLAINLY: this block targets `[data-testid='feed-row']` plus
+   the exact honeydew utilities those two components emit. That is a real
+   coupling and its failure mode is ugly-but-not-silent — a renamed utility
+   leaves dark text on a dark row. It is therefore PINNED, not trusted:
+   `tests/sensorLogSkin.test.tsx` asserts the row still emits the testid and
+   still uses each class listed here, and fails with a pointer back to this file
+   if either drifts. Update both together or not at all. */
+
+[data-surface='sensor-log'] [data-testid='feed-row'],
+[data-surface='sensor-log'] [data-testid='feed-snoozed-row'] {
+  background-color: var(--sensor-panel);
+  border-color: var(--sensor-edge2);
+  box-shadow: none;
+}
+
+[data-surface='sensor-log'] [data-testid='feed-row'] .bg-cream,
+[data-surface='sensor-log'] [data-testid='feed-row'] .bg-honeydew-50 {
+  background-color: var(--sensor-raise);
+}
+
+[data-surface='sensor-log'] [data-testid='feed-row'] .text-honeydew-700,
+[data-surface='sensor-log'] [data-testid='feed-snoozed-row'] .text-honeydew-700 {
+  color: var(--sensor-ink);
+}
+
+[data-surface='sensor-log'] [data-testid='feed-row'] .text-honeydew-600,
+[data-surface='sensor-log'] [data-testid='feed-row'] .text-honeydew-600\/80 {
+  color: var(--sensor-ink2);
+}
+
+[data-surface='sensor-log'] [data-testid='feed-row'] .border-honeydew-200,
+[data-surface='sensor-log'] [data-testid='feed-row'] .border-honeydew-300,
+[data-surface='sensor-log'] [data-testid='feed-snoozed-row'].border-honeydew-200 {
+  border-color: var(--sensor-edge);
+}
+
+[data-surface='sensor-log'] [data-testid='feed-row'] .border-honeydew-400,
+[data-surface='sensor-log'] [data-testid='feed-row'] .border-honeydew-500,
+[data-surface='sensor-log'] [data-testid='feed-snoozed-row'] .border-honeydew-400 {
+  border-color: var(--sensor-teal2);
+}
+
+/* Danger keeps its own voice — rust rather than the warm surface's red, but
+   still unmistakably not-normal. Never remapped to an ink token: an error that
+   reads as body copy is an error nobody sees. */
+[data-surface='sensor-log'] [data-testid='feed-row'] .text-danger {
+  color: var(--sensor-rust);
+}
+[data-surface='sensor-log'] .bg-danger-bg {
+  background-color: var(--sensor-rust3);
+}
+[data-surface='sensor-log'] .text-danger {
+  color: var(--sensor-rust);
+}
+
+/* ── the band ─────────────────────────────────────────────────────────────────
+   Structural rules the utility layer can't express: hour gridlines and the NOW
+   line are absolutely positioned against a percentage substrate. */
+
+.sensor-band {
+  background-color: var(--sensor-hull);
+  background-image: repeating-linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.012) 0 1px,
+    transparent 1px 3px
+  );
+}
+
+/* NOW: the one live reading on the surface. Glows so it is findable without
+   being read for. */
+.sensor-now {
+  background-color: var(--sensor-teal);
+  box-shadow: 0 0 14px rgba(79, 167, 161, 0.5);
+}
+
+/* A probabilistic weather block — the "maybe" register. Hatched rather than
+   filled, because a PROB30 window says there is a 30% chance of weather in it,
+   NOT that weather occupies it. Painting it like a certainty would state as
+   fact what the forecast explicitly qualifies. */
+.sensor-maybe {
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(201, 154, 76, 0.16) 0 5px,
+    transparent 5px 10px
+  );
+}
+
+/* An extent whose real start or end lies outside the rendered band. The dashed
+   edge says "this continues" so the clamp reads as a clip rather than as the
+   thing's actual boundary. */
+.sensor-clipped-start {
+  border-top: 1px dashed var(--sensor-amber);
+}
+.sensor-clipped-end {
+  border-bottom: 1px dashed var(--sensor-amber);
+}
+
+/* Focus stays visible on the dark ground — the warm honeydew ring disappears
+   against it. */
+[data-surface='sensor-log'] :focus-visible {
+  outline: 2px solid var(--sensor-teal);
+  outline-offset: 2px;
+}

@@ -11,6 +11,7 @@ import {
   hourTicks,
   isTimed,
   itemExtent,
+  packLanes,
   parseInstant,
   placeExtent,
   positionPct,
@@ -337,6 +338,67 @@ describe('formatting', () => {
     expect(formatDuration({ start: localMs(2026, 8, 12, 11), end: localMs(2026, 8, 12, 11, 45) })).toBe('45m');
     expect(formatDuration({ start: localMs(2026, 8, 12, 11), end: localMs(2026, 8, 12, 12, 30) })).toBe('1h 30m');
     expect(formatDuration({ start: localMs(2026, 8, 12, 11), end: null })).toBeNull();
+  });
+});
+
+describe('packLanes — overlapping traces never cover each other', () => {
+  const w = { from: localMs(2026, 8, 12, 6), to: localMs(2026, 8, 12, 18) };
+  const place = (fromH: number, toH: number | null) =>
+    placeExtent({ start: localMs(2026, 8, 12, fromH), end: toH === null ? null : localMs(2026, 8, 12, toH) }, w);
+
+  it('keeps sequential extents in ONE lane (the sparse common case pays nothing)', () => {
+    const packed = packLanes([
+      { item: 'run', placement: place(9, null) },
+      { item: 'fog', placement: place(11, 15) },
+      { item: 'call', placement: place(16, 17) },
+    ]);
+    expect(packed.laneCount).toBe(1);
+    expect(packed.traces.map((t) => t.lane)).toEqual([0, 0, 0]);
+  });
+
+  it('opens a second lane for a genuine overlap, and only for as long as it lasts', () => {
+    const packed = packLanes([
+      { item: 'fog', placement: place(9, 15) }, // spans the next two
+      { item: 'run', placement: place(10, null) }, // inside fog → lane 1
+      { item: 'later', placement: place(16, 17) }, // both free again → lane 0
+    ]);
+    expect(packed.laneCount).toBe(2);
+    expect(packed.traces.map((t) => t.lane)).toEqual([0, 1, 0]);
+  });
+
+  it('separates two MOMENTS at the same instant — zero duration still occupies space', () => {
+    // The reason lane packing measures VISUAL height: temporally these two do
+    // not overlap at all (both are zero-length), so a duration-only rule would
+    // stack them and one item would silently vanish behind the other.
+    const packed = packLanes([
+      { item: 'a', placement: place(9, null) },
+      { item: 'b', placement: place(9, null) },
+    ]);
+    expect(packed.laneCount).toBe(2);
+    expect(packed.traces.map((t) => t.lane)).toEqual([0, 1]);
+    // Positive control on the same axis: pushed far enough apart to clear the
+    // minimum trace height, they share a lane again — so the pin above is
+    // measuring the overlap rule, not just "packLanes always splits".
+    const apart = packLanes([
+      { item: 'a', placement: place(6, null) },
+      { item: 'b', placement: place(17, null) },
+    ]);
+    expect(apart.laneCount).toBe(1);
+  });
+
+  it('reports no lanes for an empty band rather than a phantom column', () => {
+    expect(packLanes([])).toEqual({ traces: [], laneCount: 0 });
+  });
+
+  it('returns one trace per input — packing never drops an item', () => {
+    const entries = [place(7, 9), place(8, 10), place(8, 12), place(9, null)].map((placement, i) => ({
+      item: `i${i}`,
+      placement,
+    }));
+    const packed = packLanes(entries);
+    expect(packed.traces).toHaveLength(entries.length);
+    expect(packed.traces.map((t) => t.item)).toEqual(['i0', 'i1', 'i2', 'i3']);
+    expect(packed.laneCount).toBeGreaterThanOrEqual(3);
   });
 });
 

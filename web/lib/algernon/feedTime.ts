@@ -351,6 +351,63 @@ export function formatDuration(extent: Extent): string | null {
   return `${h}h ${m}m`;
 }
 
+// --- lane packing ------------------------------------------------------------
+
+/**
+ * Minimum VISUAL height an entry occupies, in percent of the band. A moment has
+ * no duration, and two 09:30 items would otherwise be judged non-overlapping
+ * and drawn on top of each other. Overlap has to be decided in the space the
+ * operator actually sees, not in the space the data occupies.
+ */
+export const MIN_TRACE_HEIGHT_PCT = 7;
+
+export interface LanedTrace<T> {
+  item: T;
+  placement: BandPlacement;
+  /** Column index, 0-based. */
+  lane: number;
+}
+
+export interface LanePacking<T> {
+  traces: LanedTrace<T>[];
+  /** How many columns the band needs. `0` when there is nothing to place. */
+  laneCount: number;
+}
+
+/**
+ * Assign side-by-side columns so overlapping extents never cover each other.
+ *
+ * The standard calendar sweep: walk entries in time order and drop each into
+ * the FIRST column whose previous occupant has visually finished. A new column
+ * opens only when every existing one is still busy, so the common sparse case
+ * (a run at 09:30, a fog window at 11:00) stays a single full-width column and
+ * only genuinely concurrent items pay the narrowing.
+ *
+ * Pure, and separated from the view for the same reason the rest of this module
+ * is: a packing bug hides an item behind another one, which on an awareness
+ * surface is indistinguishable from the item not existing.
+ */
+export function packLanes<T>(
+  entries: readonly { item: T; placement: BandPlacement }[],
+  minHeightPct: number = MIN_TRACE_HEIGHT_PCT,
+): LanePacking<T> {
+  const laneBottoms: number[] = [];
+  const traces: LanedTrace<T>[] = [];
+  for (const entry of entries) {
+    const { topPct, heightPct } = entry.placement;
+    const bottom = topPct + Math.max(heightPct, minHeightPct);
+    let lane = laneBottoms.findIndex((b) => b <= topPct);
+    if (lane === -1) {
+      lane = laneBottoms.length;
+      laneBottoms.push(bottom);
+    } else {
+      laneBottoms[lane] = bottom;
+    }
+    traces.push({ item: entry.item, placement: entry.placement, lane });
+  }
+  return { traces, laneCount: laneBottoms.length };
+}
+
 /**
  * Sort items into reading order for the band: earliest start first, and for a
  * shared start the LONGER extent first so a wide interval renders behind the
