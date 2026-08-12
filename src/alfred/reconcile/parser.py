@@ -1,0 +1,798 @@
+"""A provider payment summary note -> ledger rows. Fail-loud by design.
+
+**Column mapping is HEADER-DRIVEN, never positional.** The parser reads
+each table's header row and maps columns by name (with synonyms), so a
+statement that reorders, adds or omits a column still parses, and one that
+uses an unrecognised heading says so instead of silently reading the wrong
+column. Positional parsing of financial data is how a "Deduct" figure ends
+up in the "Amount Paid" field with nothing to show for it.
+
+**A partial parse must say what it skipped.** Every row the parser cannot
+read is collected into :attr:`ParseResult.skipped` with its line number,
+its raw text and a reason — and the CLI prints the count and the list. A
+parser that reads 440 of 459 rows and reports success has not succeeded;
+it has lost nineteen claim lines and told nobody. This is the
+intentionally-left-blank rule applied to the case that matters most,
+because the missing rows here are money.
+
+**Re-runs are idempotent.** Rows are keyed content, not arrival events
+(see :func:`alfred.reconcile.ledger.line_key`), so parsing the same note
+twice produces the same keys and the second upsert reports every row
+unchanged.
+
+Structural quirks handled, each because the real source has them:
+
+* per-claimant ``SUB-TOTAL`` rows interleaved with claim lines — kept as
+  :data:`~alfred.reconcile.ledger.ROW_SUBTOTAL`, not discarded, so the
+  report can cross-foot our sums against the provider's own
+* ``(Ambulance Claims)`` appearing in the ``Claim #`` column instead of a
+  number — kept verbatim; the occurrence tiebreak keeps two such lines
+  from colliding
+* OGST sibling lines sharing a claim number with their base benefit line
+* negative ``Amount Paid`` values (reversals/clawbacks), in any of the
+  spellings :mod:`alfred.reconcile.money` accepts
+* ``Invoice #N`` inside the comments column — the P2 join key, extracted
+  now so the ledger carries it from the first seed
+* attribution ``BEGIN_INFERRED`` / ``END_INFERRED`` spans — rows inside
+  one are flagged ``inferred``, preserving the distinction between a
+  transcribed figure and an inferred one
+* partial-page statements whose header the parser cannot find — their
+  lines are still parsed and grouped under a synthesised header rather
+  than dropped
+
+**One caveat, stated because it is load-bearing:** the surrounding
+document structure (how statement headers are written) is modelled from
+the schema described in the design, not from a byte-level reading of the
+live note, which is box-side. The COLUMN mapping is robust to that
+uncertainty by construction — it keys on names, and unknown headings are
+reported. The statement-header patterns are the part that wants one
+validation pass against the real note before the first seed is trusted;
+:attr:`ParseResult.unmapped_headings` exists to make any mismatch loud on
+that first run rather than quiet.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import structlog
+
+from alfred.vault.attribution import _BEGIN_RE as _INFERRED_BEGIN_RE
+
+from .ledger import (
+    ROW_CLAIM,
+    ROW_SUBTOTAL,
+    ClaimLine,
+    Statement,
+    line_key,
+)
+from .money import (
+    CellParseError,
+    is_absent,
+    parse_date,
+    parse_int,
+    parse_money,
+    parse_percent,
+)
+
+log = structlog.get_logger(__name__)
+
+#: END marker for an inferred span. The BEGIN pattern is imported from
+#: :mod:`alfred.vault.attribution` rather than re-spelled — the marker
+#: contract has one author, and a second copy of the regex is how a writer
+#: and a reader drift onto different shapes.
+_INFERRED_END_RE = re.compile(r"<!--\s*END_INFERRED\b")
+
+#: Column synonyms. The key is the normalised heading (lowercased, ``%``
+#: spelled ``pct``, every non-alphanumeric character removed); the value is
+#: the :class:`~alfred.reconcile.ledger.ClaimLine` field it fills.
+#:
+#: Matching is EXACT on the normalised form, never substring: "paid" is a
+#: substring of both "amount paid" and "% pd", and a substring match would
+#: put the percentage in the money column on any statement that abbreviates.
+COLUMN_SYNONYMS: dict[str, str] = {
+    # Claim number
+    "claim": "claim_no", "claimno": "claim_no", "claimnum": "claim_no",
+    "claimnumber": "claim_no", "claimhash": "claim_no",
+    # Date of service
+    "dateofservice": "dos", "dos": "dos", "servicedate": "dos",
+    "datedeservice": "dos",
+    # Names
+    "surname": "surname", "lastname": "surname", "last": "surname",
+    "firstname": "first_name", "first": "first_name",
+    "givenname": "first_name",
+    # Benefit
+    "benefitcode": "benefit_code", "benefit": "benefit_code",
+    "code": "benefit_code", "procedurecode": "benefit_code",
+    # Units
+    "units": "units", "unit": "units", "qty": "units", "quantity": "units",
+    # Money columns
+    "totalbilled": "total_billed", "billed": "total_billed",
+    "totalsubmitted": "total_billed", "submitted": "total_billed",
+    "amtsubmitted": "total_billed",
+    "amtexcluded": "amt_excluded", "amountexcluded": "amt_excluded",
+    "excluded": "amt_excluded",
+    "deduct": "deduct", "deductible": "deduct",
+    "amteligible": "amt_eligible", "amounteligible": "amt_eligible",
+    "eligible": "amt_eligible",
+    "pctpd": "pct_paid", "pctpaid": "pct_paid", "percentpaid": "pct_paid",
+    "pd": "pct_paid", "pct": "pct_paid",
+    "amountpaid": "amount_paid", "amtpaid": "amount_paid",
+    "paid": "amount_paid", "payment": "amount_paid",
+    # EOB + comments
+    "eob": "eob_code", "eobcode": "eob_code", "eobs": "eob_code",
+    "explanation": "eob_code", "explanationofbenefits": "eob_code",
+    "comments": "comments", "comment": "comments", "notes": "comments",
+    "note": "comments", "remarks": "comments",
+}
+
+#: Statement-header metadata synonyms, same normalisation as the columns.
+STATEMENT_FIELD_SYNONYMS: dict[str, str] = {
+    "provider": "provider", "providername": "provider",
+    "practitioner": "provider",
+    "company": "company", "companyname": "company", "clinic": "company",
+    "payee": "company",
+    "paymenttotal": "payment_total", "totalpayment": "payment_total",
+    "totalpaid": "payment_total", "chequeamount": "payment_total",
+    "checkamount": "payment_total", "amountofpayment": "payment_total",
+    "statementdate": "statement_date", "paymentdate": "statement_date",
+    "date": "statement_date", "chequedate": "statement_date",
+    "checkdate": "statement_date",
+    # Capture provenance, written by this package's own renderer. Keying on
+    # a structured field rather than prose is what makes render -> parse ->
+    # render a fixed point: a fact stated only in prose is dropped on the
+    # second regeneration, and the note quietly sheds its provenance.
+    "provenance": "inferred",
+}
+
+#: The leading token of a ``**Provenance:**`` line that means the figures
+#: were inferred at capture rather than transcribed. Shared with
+#: :mod:`alfred.reconcile.render`, which writes it — a second spelling on
+#: the writing side is how a renderer and its parser drift apart.
+INFERRED_TOKEN = "INFERRED"
+
+#: A claim table must map these before the parser will read data rows from
+#: it. Without an amount-paid column there is nothing to reconcile, and
+#: without a date of service there is no key — so a table missing either is
+#: reported as unrecognised rather than half-read.
+REQUIRED_COLUMNS = frozenset({"amount_paid", "dos"})
+
+#: Normalised first-cell values that mark a row as the provider's own
+#: arithmetic rather than a claim line.
+_SUBTOTAL_MARKERS = ("subtotal", "subtotals", "total", "totals", "grandtotal")
+
+_INVOICE_RE = re.compile(r"(?:invoice|inv)\.?\s*#?\s*(\d+)", re.IGNORECASE)
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
+#: Metadata is matched AFTER emphasis markers are stripped (see
+#: :func:`_strip_emphasis`), so this pattern never has to reason about
+#: where the asterisks fell. ``**Provider:** Wren`` and ``Provider: Wren``
+#: reach it as the same string — trying to encode both shapes in the regex
+#: is how the value ends up captured as ``"** Wren"``.
+_META_RE = re.compile(
+    r"^\s*[-*]?\s*([A-Za-z][A-Za-z0-9 /#%._-]{0,48}?)\s*:\s*(.+?)\s*$"
+)
+_TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]*$")
+_ISO_IN_TEXT_RE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}")
+
+
+def _strip_emphasis(text: str) -> str:
+    """Drop Markdown bold/italic markers so metadata matching sees the text."""
+    return (text or "").replace("**", "").replace("__", "")
+
+
+def normalise_heading(text: str) -> str:
+    """Lowercase, ``%`` -> ``pct``, ``#`` -> ``hash``, drop the rest.
+
+    ``"% PD"`` -> ``"pctpd"``, ``"Claim #"`` -> ``"claimhash"``,
+    ``"Amt. Eligible"`` -> ``"amteligible"``.
+    """
+    t = (text or "").strip().lower()
+    t = t.replace("%", "pct").replace("#", "hash")
+    return re.sub(r"[^a-z0-9]+", "", t)
+
+
+def split_table_row(line: str) -> list[str]:
+    """Split a Markdown table row into cells, honouring ``\\|`` escapes.
+
+    A naive ``line.split("|")`` breaks any cell containing an escaped pipe —
+    and the comments column is free text, which is exactly where one shows
+    up. Escaped pipes are restored to literal ``|`` in the returned cells.
+    """
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+
+    cells: list[str] = []
+    buf: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s) and s[i + 1] == "|":
+            buf.append("|")
+            i += 2
+            continue
+        if ch == "|":
+            cells.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    cells.append("".join(buf).strip())
+    return cells
+
+
+def is_table_row(line: str) -> bool:
+    return line.strip().startswith("|")
+
+
+def parse_invoice_no(comments: str) -> str:
+    """Extract ``Invoice #163`` -> ``"163"`` from a comments cell.
+
+    Returns ``""`` when the cell names no invoice. Only the FIRST match is
+    taken: a comment mentioning two invoices is genuinely ambiguous about
+    which one the line belongs to, and picking one silently would create a
+    join the operator never made. The full comment stays on the row, so the
+    ambiguity is visible in the report.
+    """
+    m = _INVOICE_RE.search(comments or "")
+    return m.group(1) if m else ""
+
+
+@dataclass
+class SkippedRow:
+    """A row the parser could not read, with everything needed to find it."""
+
+    line_no: int
+    raw: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"line_no": self.line_no, "raw": self.raw, "reason": self.reason}
+
+
+@dataclass
+class ParseResult:
+    """Everything one note yielded, including what it did NOT yield."""
+
+    statements: list[Statement] = field(default_factory=list)
+    claim_lines: list[ClaimLine] = field(default_factory=list)
+    subtotals: list[ClaimLine] = field(default_factory=list)
+    skipped: list[SkippedRow] = field(default_factory=list)
+    #: Keys that needed a non-zero occurrence to stay distinct. Surfaced so
+    #: a disambiguated key is never a silent event.
+    collisions: list[str] = field(default_factory=list)
+    #: Table headings that matched no known column, per table. A populated
+    #: list on the first seed is the signal that the synonym map needs a row.
+    unmapped_headings: list[str] = field(default_factory=list)
+    tables_seen: int = 0
+    tables_parsed: int = 0
+
+    @property
+    def ok(self) -> bool:
+        """No rows lost. Note this is about LOSS, not about attention."""
+        return not self.skipped
+
+    def summary(self) -> str:
+        """A one-line human summary. Never empty — see the ILB rule."""
+        if not self.tables_seen:
+            return (
+                "Parsed the note and found no claim tables at all. If the "
+                "note does contain statements, the table headers did not "
+                "match any known column names — check "
+                "reconcile.parser.COLUMN_SYNONYMS."
+            )
+        parts = [
+            f"{len(self.statements)} statement(s)",
+            f"{len(self.claim_lines)} claim line(s)",
+            f"{len(self.subtotals)} subtotal row(s)",
+        ]
+        if self.skipped:
+            parts.append(f"{len(self.skipped)} row(s) SKIPPED")
+        else:
+            parts.append("0 rows skipped")
+        if self.collisions:
+            parts.append(f"{len(self.collisions)} key collision(s) disambiguated")
+        return ", ".join(parts) + "."
+
+
+def _map_columns(
+    header_cells: list[str],
+) -> tuple[dict[int, str], list[str]]:
+    """``({column_index: field_name}, [unmapped headings])``."""
+    mapping: dict[int, str] = {}
+    unmapped: list[str] = []
+    for idx, cell in enumerate(header_cells):
+        norm = normalise_heading(cell)
+        if not norm:
+            continue
+        field_name = COLUMN_SYNONYMS.get(norm)
+        if field_name is None:
+            unmapped.append(cell.strip())
+            continue
+        # First mapping wins. A statement with two columns normalising to
+        # the same field (e.g. "Paid" and "Amount Paid") is malformed; taking
+        # the first and reporting the second as unmapped keeps the anomaly
+        # visible instead of letting the later column overwrite the earlier.
+        if field_name in mapping.values():
+            unmapped.append(cell.strip())
+            continue
+        mapping[idx] = field_name
+    return mapping, unmapped
+
+
+def _is_subtotal_row(cells: list[str], mapping: dict[int, str]) -> bool:
+    """Whether this data row is the provider's own arithmetic."""
+    # Check the identity-ish columns: a subtotal row typically carries the
+    # label where the claim number or the surname would be.
+    for idx, field_name in mapping.items():
+        if field_name not in ("claim_no", "surname", "first_name"):
+            continue
+        if idx >= len(cells):
+            continue
+        norm = normalise_heading(cells[idx])
+        if any(norm.startswith(marker) for marker in _SUBTOTAL_MARKERS):
+            return True
+    # Some statements put the label in the first cell regardless of column.
+    if cells:
+        norm_first = normalise_heading(cells[0])
+        if any(norm_first.startswith(marker) for marker in _SUBTOTAL_MARKERS):
+            return True
+    return False
+
+
+def parse_note(
+    text: str,
+    *,
+    source_note: str = "",
+    batch_id: str = "",
+    session: str = "",
+    capture_ref: str = "",
+    date_order: str | None = None,
+) -> ParseResult:
+    """Parse a payment-summary note into ledger rows.
+
+    ``date_order`` is passed through to :func:`alfred.reconcile.money.parse_date`
+    and is only consulted for slash-form dates, which are refused without it.
+    """
+    result = ParseResult()
+    lines = (text or "").splitlines()
+
+    current_stmt: Statement | None = None
+    mapping: dict[int, str] = {}
+    header_width = 0
+    in_table = False
+    inferred_depth = 0
+    #: Line number of a table header this parser refused, so the rows under
+    #: it can name the cause instead of each re-reporting it.
+    rejected_header_line: int | None = None
+    # Occurrence counters, per (statement_date, claim_no, dos, benefit_code).
+    # Claim lines and subtotal rows count SEPARATELY: they live in separate
+    # indexes in the ledger, and sharing one counter would make a claim
+    # line's occurrence depend on how many subtotal rows happened to precede
+    # it — which is not what "the Nth line sharing this key" should mean.
+    occurrences: dict[tuple[str, str, str, str], int] = {}
+    sub_occurrences: dict[tuple[str, str, str, str], int] = {}
+    claims_for_current: list[ClaimLine] = []
+
+    def _flush_statement() -> None:
+        """Emit the current statement, unless it is a heading with nothing
+        under it.
+
+        A document's title heading (``# Provider Payment Summary``) is a
+        heading like any other and would otherwise mint an empty statement
+        carrying no date, no provider and no lines — which then renders as
+        a phantom section and inflates every statement count in the report.
+        A statement is real if it has claim lines OR any header fact.
+        """
+        nonlocal current_stmt
+        if current_stmt is None:
+            return
+        has_content = bool(claims_for_current) or any((
+            current_stmt.statement_date,
+            current_stmt.provider,
+            current_stmt.company,
+            current_stmt.payment_total is not None,
+        ))
+        if has_content:
+            current_stmt.claim_line_count = len(claims_for_current)
+            result.statements.append(current_stmt)
+        current_stmt = None
+
+    def _begin_statement(line_no: int) -> Statement:
+        nonlocal current_stmt, claims_for_current
+        _flush_statement()
+        claims_for_current = []
+        current_stmt = Statement(
+            source_note=source_note,
+            source_line=line_no,
+            batch_id=batch_id,
+            session=session,
+            capture_ref=capture_ref,
+            inferred=inferred_depth > 0,
+        )
+        return current_stmt
+
+    for i, raw_line in enumerate(lines):
+        line_no = i + 1
+        stripped = raw_line.strip()
+
+        # Attribution spans. Tracked before anything else so a marker on the
+        # same line as content still flags that content.
+        if _INFERRED_BEGIN_RE.search(raw_line):
+            inferred_depth += 1
+            continue
+        if _INFERRED_END_RE.search(raw_line):
+            inferred_depth = max(0, inferred_depth - 1)
+            continue
+
+        if not stripped:
+            in_table = False
+            continue
+
+        # A heading always starts a new statement context.
+        heading = _HEADING_RE.match(stripped)
+        if heading:
+            in_table = False
+            stmt = _begin_statement(line_no)
+            stmt.inferred = inferred_depth > 0
+            stmt_meta = {}
+            stmt_line_no = line_no
+            # A heading often carries the statement date: "## Statement —
+            # 11 Jun 2026". Try it, but never fail the note over a heading.
+            title = heading.group(1).strip()
+            found = _date_from_free_text(title, date_order)
+            if found:
+                stmt.statement_date = found
+            continue
+
+        # Table rows.
+        if is_table_row(stripped):
+            cells = split_table_row(stripped)
+            if _TABLE_SEP_RE.match(stripped):
+                # The |---|---| separator under a header. Nothing to read.
+                continue
+            if not in_table:
+                # This is a header row: map its columns.
+                result.tables_seen += 1
+                mapping, unmapped = _map_columns(cells)
+                header_width = len(cells)
+                missing = REQUIRED_COLUMNS - set(mapping.values())
+                if missing:
+                    log.warning(
+                        "reconcile.parser.table_unrecognised",
+                        line_no=line_no,
+                        missing=sorted(missing),
+                        headings=[c.strip() for c in cells],
+                        detail="table skipped — without these columns there "
+                               "is no key and nothing to reconcile",
+                    )
+                    result.skipped.append(SkippedRow(
+                        line_no=line_no,
+                        raw=stripped,
+                        reason=(
+                            "table header missing required column(s): "
+                            + ", ".join(sorted(missing))
+                        ),
+                    ))
+                    # Stay "in" the rejected table with an empty mapping. The
+                    # alternative — dropping back out — makes the very next
+                    # DATA row look like a fresh header, so a single bad table
+                    # reports the same header error once per row and buries
+                    # the actual cause.
+                    mapping = {}
+                    in_table = True
+                    rejected_header_line = line_no
+                    continue
+                result.tables_parsed += 1
+                rejected_header_line = None
+                result.unmapped_headings.extend(unmapped)
+                if unmapped:
+                    log.info(
+                        "reconcile.parser.unmapped_headings",
+                        line_no=line_no,
+                        headings=unmapped,
+                        detail="columns present in the source that this "
+                               "parser has no field for — data in them is "
+                               "not captured; add a COLUMN_SYNONYMS row",
+                    )
+                in_table = True
+                if current_stmt is None:
+                    _begin_statement(line_no)
+                continue
+
+            # A data row.
+            if not mapping:
+                # Belongs to a table whose header this parser rejected. Each
+                # row still gets its own skip entry — the operator's question
+                # is "how many claim lines did I lose", and answering it with
+                # one line per lost row is the only form that answers it.
+                result.skipped.append(SkippedRow(
+                    line_no=line_no,
+                    raw=stripped,
+                    reason=(
+                        f"row belongs to the table whose header at line "
+                        f"{rejected_header_line} was rejected"
+                        if rejected_header_line
+                        else "row appeared outside any recognised table"
+                    ),
+                ))
+                continue
+            if len(cells) != header_width:
+                result.skipped.append(SkippedRow(
+                    line_no=line_no,
+                    raw=stripped,
+                    reason=(
+                        f"ragged row: {len(cells)} cells against a "
+                        f"{header_width}-column header. Refused rather than "
+                        f"padded — padding money columns invents figures."
+                    ),
+                ))
+                continue
+
+            row, error = _build_claim_line(
+                cells=cells,
+                mapping=mapping,
+                statement=current_stmt,
+                line_no=line_no,
+                source_note=source_note,
+                batch_id=batch_id,
+                session=session,
+                capture_ref=capture_ref,
+                # A row is inferred if it sits inside an attribution span OR
+                # its statement is flagged. The second half is what carries
+                # the flag across a regeneration: the render states the fact
+                # once, on the statement, and its rows inherit it.
+                inferred=(
+                    inferred_depth > 0
+                    or bool(current_stmt and current_stmt.inferred)
+                ),
+                date_order=date_order,
+            )
+            if error is not None:
+                result.skipped.append(SkippedRow(
+                    line_no=line_no, raw=stripped, reason=error
+                ))
+                continue
+            assert row is not None  # _build_claim_line returns one or the other
+
+            is_sub = _is_subtotal_row(cells, mapping)
+            row.row_type = ROW_SUBTOTAL if is_sub else ROW_CLAIM
+
+            # Occurrence disambiguation, in source order.
+            ident = (
+                row.statement_date, row.claim_no, row.dos, row.benefit_code
+            )
+            counter = sub_occurrences if is_sub else occurrences
+            seen = counter.get(ident, 0)
+            row.occurrence = seen
+            counter[ident] = seen + 1
+            if seen and not is_sub:
+                # Only CLAIM-line collisions are reported. Every subtotal row
+                # on a statement shares a key by construction (they carry a
+                # label instead of a claim number and no date), so counting
+                # them would bury the one collision that means something — a
+                # real claim line that could have been silently overwritten.
+                result.collisions.append(line_key(*ident, seen))
+
+            if is_sub:
+                result.subtotals.append(row)
+            else:
+                result.claim_lines.append(row)
+                claims_for_current.append(row)
+            continue
+
+        in_table = False
+
+        # Statement metadata: "**Provider:** Jane Roe" / "Provider: Jane Roe".
+        meta = _META_RE.match(_strip_emphasis(stripped))
+        if meta:
+            norm = normalise_heading(meta.group(1))
+            target = STATEMENT_FIELD_SYNONYMS.get(norm)
+            if target:
+                if current_stmt is None:
+                    _begin_statement(line_no)
+                stmt_meta[target] = meta.group(2).strip()
+                _apply_meta(current_stmt, target, meta.group(2).strip(), date_order)
+
+    _flush_statement()
+
+    # Statement rows carry the date their claim lines were stamped with; a
+    # statement whose header never named a date inherits it from its lines,
+    # because the lines' date is what the ledger key uses.
+    _backfill_statement_dates(result)
+
+    if not result.tables_seen:
+        # ILB: "found nothing" is a result, and it must be stated. A silent
+        # empty return is indistinguishable from a parser that crashed.
+        log.info(
+            "reconcile.parser.no_tables",
+            source_note=source_note,
+            lines=len(lines),
+            detail="the note contained no recognisable claim table; nothing "
+                   "was written",
+        )
+    log.info(
+        "reconcile.parser.parsed",
+        source_note=source_note,
+        statements=len(result.statements),
+        claim_lines=len(result.claim_lines),
+        subtotals=len(result.subtotals),
+        skipped=len(result.skipped),
+        collisions=len(result.collisions),
+        tables_seen=result.tables_seen,
+        tables_parsed=result.tables_parsed,
+    )
+    if result.skipped:
+        log.warning(
+            "reconcile.parser.rows_skipped",
+            source_note=source_note,
+            skipped=len(result.skipped),
+            kept=len(result.claim_lines) + len(result.subtotals),
+            first_reasons=[s.reason for s in result.skipped[:5]],
+            detail="these rows are NOT in the ledger — a partial parse names "
+                   "what it lost",
+        )
+    return result
+
+
+def _apply_meta(
+    stmt: Statement | None,
+    target: str,
+    value: str,
+    date_order: str | None,
+) -> None:
+    if stmt is None:
+        return
+    if target == "statement_date":
+        try:
+            iso = parse_date(value, field="statement date", date_order=date_order)
+        except CellParseError:
+            iso = None
+        if iso:
+            stmt.statement_date = iso
+        return
+    if target == "inferred":
+        stmt.inferred = value.strip().upper().startswith(INFERRED_TOKEN)
+        return
+    if target == "payment_total":
+        try:
+            stmt.payment_total = parse_money(value, field="payment total")
+        except CellParseError:
+            log.warning(
+                "reconcile.parser.payment_total_unreadable",
+                raw=value,
+                detail="statement header payment total could not be parsed; "
+                       "the statement is kept without it and the report's "
+                       "cross-foot for it is skipped",
+            )
+        return
+    setattr(stmt, target, value)
+
+
+def _date_from_free_text(text: str, date_order: str | None) -> str | None:
+    """Best-effort date out of a heading. Never raises.
+
+    An embedded ISO date is looked for FIRST and matched as a unit. The
+    token scan below splits on whitespace and dashes, which would tear
+    ``2026-02-26`` into three meaningless tokens — so a heading carrying the
+    single most machine-readable form of a date would be the one form this
+    function failed to read.
+
+    Used only for headings, where a failure costs nothing (the statement
+    date is backfilled from its claim lines), so this one place is allowed
+    to guess where a data cell never is.
+    """
+    body = (text or "").strip()
+    iso_hit = _ISO_IN_TEXT_RE.search(body)
+    if iso_hit:
+        try:
+            iso = parse_date(iso_hit.group(0), date_order=date_order)
+        except CellParseError:
+            iso = None
+        if iso:
+            return iso
+
+    # Em/en dashes separate a title from its date ("Statement — 11 Jun 2026").
+    # The ASCII hyphen is deliberately NOT a separator here: it is the ISO
+    # date's own separator, handled above.
+    tokens = [t for t in re.split(r"[\s—–]+", body) if t]
+    for size in (3, 1):
+        for start in range(len(tokens)):
+            window = " ".join(tokens[start:start + size])
+            if not window:
+                continue
+            try:
+                iso = parse_date(window, date_order=date_order)
+            except CellParseError:
+                continue
+            if iso:
+                return iso
+    return None
+
+
+def _backfill_statement_dates(result: ParseResult) -> None:
+    """Give a dateless statement the date its own claim lines carry."""
+    for stmt in result.statements:
+        if stmt.statement_date:
+            continue
+        dates = {
+            c.statement_date
+            for c in result.claim_lines
+            if c.source_line > stmt.source_line and c.statement_date
+        }
+        if len(dates) == 1:
+            stmt.statement_date = next(iter(dates))
+
+
+def _build_claim_line(
+    *,
+    cells: list[str],
+    mapping: dict[int, str],
+    statement: Statement | None,
+    line_no: int,
+    source_note: str,
+    batch_id: str,
+    session: str,
+    capture_ref: str,
+    inferred: bool,
+    date_order: str | None,
+) -> tuple[ClaimLine | None, str | None]:
+    """``(row, None)`` or ``(None, reason)``. Never both, never neither."""
+    row = ClaimLine(
+        source_note=source_note,
+        source_line=line_no,
+        batch_id=batch_id,
+        session=session,
+        capture_ref=capture_ref,
+        inferred=inferred,
+    )
+    row.statement_date = statement.statement_date if statement else ""
+
+    for idx, field_name in mapping.items():
+        raw = cells[idx] if idx < len(cells) else ""
+        try:
+            if field_name == "dos":
+                row.dos = parse_date(
+                    raw, field="date of service", date_order=date_order
+                ) or ""
+            elif field_name == "units":
+                row.units = parse_int(raw, field="units")
+            elif field_name == "pct_paid":
+                row.pct_paid = parse_percent(raw, field="% pd")
+            elif field_name in (
+                "total_billed", "amt_excluded", "deduct",
+                "amt_eligible", "amount_paid",
+            ):
+                setattr(
+                    row, field_name, parse_money(raw, field=field_name)
+                )
+            else:
+                # Text columns honour the absent-cell vocabulary too: an
+                # em-dash placeholder means "nothing here", and carrying the
+                # dash through would put it in the ledger KEY (benefit_code
+                # is part of it) and print it back as if it were data.
+                setattr(row, field_name, "" if is_absent(raw) else raw.strip())
+        except CellParseError as exc:
+            return None, str(exc)
+
+    row.invoice_no = parse_invoice_no(row.comments)
+    return row, None
+
+
+__all__ = [
+    "COLUMN_SYNONYMS",
+    "REQUIRED_COLUMNS",
+    "STATEMENT_FIELD_SYNONYMS",
+    "ParseResult",
+    "SkippedRow",
+    "is_table_row",
+    "normalise_heading",
+    "parse_invoice_no",
+    "parse_note",
+    "split_table_row",
+]
