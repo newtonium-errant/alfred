@@ -117,10 +117,17 @@ describe('Layout surface identities', () => {
   });
 
   it('gives an unregistered surface the warm chrome rather than crashing', () => {
-    // The fallback is what makes the open contract a seam instead of a trap.
-    // A surface that skins itself from its own stylesheet gets today's default
-    // chrome PLUS its attribute — so adopting the prop is visually a no-op for
-    // it, and an unknown name can never blow up on an undefined class table.
+    // The fallback is what makes the open contract a seam instead of a trap:
+    // a surface that skins itself from its own stylesheet gets today's default
+    // chrome PLUS its attribute, and an unknown name can never blow up on an
+    // undefined class table.
+    //
+    // That is the whole of what this side promises. It is NOT a promise that
+    // adoption changes nothing to look at — the attribute moving to the root
+    // widens its coverage to the shell, and the Awareness feed's 2026-08-12
+    // audit found 3 of its 28 selectors would repaint it. That pin belongs to
+    // the adopting surface, against its own stylesheet; this one only covers
+    // the fallback.
     const { container } = render(
       <Layout onSignOut={() => {}} surface="sensor-log">
         <p>content</p>

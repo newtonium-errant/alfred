@@ -64,10 +64,24 @@ type LayoutProps = {
    * next one) and adopt this prop without waiting on a change here.
    *
    * A name with no entry in `SURFACE` below gets the `warm` chrome — today's
-   * default appearance — plus its own attribute. So adopting the prop is
-   * VISUALLY A NO-OP for a surface that already renders warm chrome and skins
-   * itself through the attribute; it just moves the attribute up to the root,
-   * where it also covers the shell.
+   * default appearance — plus its own attribute.
+   *
+   * WHAT THAT DOES NOT PROMISE is that adopting the prop changes nothing to
+   * look at. Moving the attribute to the ROOT widens its coverage to the shell,
+   * so any of the adopting surface's own `[data-surface="…"]`-scoped selectors
+   * now reach the nav and the header too. Whether that is visible is a fact
+   * about the adopter's stylesheet, not about this component: the Awareness
+   * feed's 2026-08-12 selector audit found 3 of its 28 would repaint the shell
+   * (its bare root rule, its `:focus-visible` retarget, and its danger-class
+   * descendants). So an adopting surface owes itself a pin that its scoped
+   * selectors stay off the shell — keeping property definitions on the root
+   * while painting declarations move to a content-scoped element. This side
+   * promises only the chrome fallback and the verbatim attribute.
+   *
+   * (An earlier version of this note called adoption "visually a no-op". It
+   * stated the widening in the same breath and then concluded the opposite;
+   * the audit refuted it. Retired in place rather than softened, because the
+   * one person who reads this docstring is the one about to adopt the seam.)
    *
    * `warm` is the honeydew light theme every existing surface has always worn.
    * `console` is the ratified Phase B identity (LCARS grammar, modern dark
