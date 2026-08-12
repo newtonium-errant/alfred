@@ -91,7 +91,21 @@ afterEach(() => vi.restoreAllMocks());
 describe('sensor-log containment — the attribute is set on the feed and nowhere else', () => {
   it('the FEED page declares the surface, on an ancestor of its rows', async () => {
     const { container } = render(<FeedPage />);
-    await waitFor(() => expect(screen.queryByTestId('feed-console')).not.toBeNull());
+    // SYNCHRONISE ON THE ASSERTED ELEMENT, not on a nearby one.
+    //
+    // This waited on `feed-console`, which is rendered OUTSIDE every `loaded &&`
+    // gate and therefore paints on the first frame — before the feed fetch has
+    // resolved. The assertions below need `feed-row`, which is behind those
+    // gates, so the synchronisation point was satisfied while the asserted
+    // element could still be absent: a real 1-in-5 flake under parallel-worker
+    // load, and one that would read as "containment broke" rather than "the
+    // wait was mistargeted".
+    //
+    // Waiting on the row (exactly what the home-side sibling below already
+    // does) makes the wait cover everything the test touches. Causality is
+    // proven, not argued: a 40ms delay on the mocked fetch fails this test
+    // deterministically with the old target and passes with this one.
+    await waitFor(() => expect(container.querySelector('[data-testid="feed-row"]')).not.toBeNull());
 
     const console_ = screen.getByTestId('feed-console');
     expect(console_.getAttribute('data-surface')).toBe(SENSOR_SURFACE);
