@@ -261,6 +261,34 @@ export function verbsFromActions(item: FeedItem): DeckVerbs | null {
 }
 
 /**
+ * Whether this item arrived carrying NO verbs at all — the degraded payload.
+ *
+ * WHY THIS IS A SEPARATE QUESTION FROM `isDeckDealt`. Both a committed slot and
+ * a verbless item fail `isDeckDealt`, but for opposite reasons, and the operator
+ * needs them told apart:
+ *
+ *   - A committed slot is WORKING AS DESIGNED. It carries a full verb list
+ *     (done, undo_done, the snoozes); none of them is a swipe verb, because it
+ *     belongs to the board rather than the deck.
+ *   - A verbless item is a FAULT somewhere upstream — a half-deployed box, the
+ *     serve side's `actions_unavailable` / `actions_stamp_failed` degradation,
+ *     or a decide kind the ceiling has no entry for. Nothing is wrong with the
+ *     item; the controls for it never arrived.
+ *
+ * Telling the operator "these are on your worklist" in the second case is a lie
+ * with a plausible shape — they would go to the Feed and find items they still
+ * cannot act on. The two populations are disjoint and together they exhaust the
+ * non-dealt set, so one predicate splits them cleanly.
+ *
+ * Deliberately asks about the WIRE (`actions`), not about gestures: an item with
+ * verbs that merely lack gestures is the worklist case, and folding the two
+ * together is exactly the distinction this exists to preserve.
+ */
+export function arrivedVerbless(item: FeedItem): boolean {
+  return servedActions(item).length === 0;
+}
+
+/**
  * The weight of ONE direction — the predicate the deck arms on.
  *
  * Takes the item's DERIVED verbs (`verbsFromActions`) rather than its kind: the

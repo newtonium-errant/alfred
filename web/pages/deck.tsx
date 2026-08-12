@@ -6,7 +6,7 @@ import { Deck } from '../components/feed/Deck';
 import { authApi } from '../lib/algernon/authClient';
 import Link from 'next/link';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { isDeckDealt } from '../lib/algernon/feedConstants';
+import { arrivedVerbless, isDeckDealt } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { CONSOLE_LABEL } from '../lib/algernon/consoleTokens';
@@ -107,7 +107,23 @@ export default function DeckPage() {
     () => (items ?? []).filter(isDeckDealt),
     [items],
   );
-  const unactionableCount = (items?.length ?? 0) - actionable.length;
+  // The non-dealt items, SPLIT BY CAUSE — because the two causes are opposite
+  // and need opposite copy. This list is decide-mode only (see the fetch), so
+  // there are exactly two ways to be here:
+  //   worklist — a committed slot, carrying board verbs but no swipe verb. This
+  //              is the system working; the Feed really can action it.
+  //   verbless — nothing arrived at all. A fault upstream (a half-deployed box,
+  //              a stamp failure, a decide kind with no ceiling entry). The Feed
+  //              cannot action it either, so sending the operator there would be
+  //              a wrong steer dressed as a helpful one.
+  // ILB: absence has to be legible as deliberate vs broken, and "N on your
+  // worklist" is precisely the deliberate-sounding sentence.
+  const notDealt = useMemo(
+    () => (items ?? []).filter((it) => !isDeckDealt(it)),
+    [items],
+  );
+  const verblessCount = useMemo(() => notDealt.filter(arrivedVerbless).length, [notDealt]);
+  const worklistCount = notDealt.length - verblessCount;
 
   if (!authed) {
     return (
@@ -154,20 +170,39 @@ export default function DeckPage() {
           </p>
         )}
 
-        {items != null && !error && actionable.length === 0 && unactionableCount === 0 && (
+        {items != null && !error && actionable.length === 0 && notDealt.length === 0 && (
           // ILB: empty because there is genuinely nothing open to decide.
           <p data-testid="deck-empty" className="mt-6 text-sm text-console-ink-dim">
             Nothing to decide right now — new decisions arrive with each sync.
           </p>
         )}
 
-        {items != null && !error && actionable.length === 0 && unactionableCount > 0 && (
+        {items != null && !error && actionable.length === 0 && verblessCount > 0 && (
+          // ILB: the FAULT case, and it takes precedence over the worklist line
+          // when both are present — one of the two says something is wrong, and
+          // that is the half worth the operator's attention.
+          //
+          // The copy states the fault, refuses to claim loss, and does NOT send
+          // them to the Feed: the Feed cannot action a verbless item either, and
+          // pointing there would spend a trip to arrive at the same wall. It also
+          // promises no remedy, because there may not be one on this side — box
+          // skew clears on deploy, a ceiling gap does not clear at all.
+          <p data-testid="deck-verbless" className="mt-6 text-sm text-caution">
+            {verblessCount} decision{verblessCount > 1 ? 's' : ''} arrived without controls, so
+            there{verblessCount > 1 ? ' is' : "'s"} nothing here to swipe. That{"'"}s a fault on the
+            way here, not an empty queue —{' '}
+            {verblessCount > 1 ? 'the items are' : 'the item is'} still held, and nothing has been
+            decided or lost.
+          </p>
+        )}
+
+        {items != null && !error && actionable.length === 0 && verblessCount === 0 && worklistCount > 0 && (
           // ILB: nothing to SWIPE, but there are non-deck-dealt open items — PLANNED
           // slots (committed, awaiting their ✓). Those are worklist items, actionable
           // inline on the Feed / rings, not deck cards.
           <p data-testid="deck-unactionable" className="mt-6 text-sm text-console-ink-dim">
-            {unactionableCount} item{unactionableCount > 1 ? 's are' : ' is'} on your worklist —
-            see {unactionableCount > 1 ? 'them' : 'it'} on the{' '}
+            {worklistCount} item{worklistCount > 1 ? 's are' : ' is'} on your worklist —
+            see {worklistCount > 1 ? 'them' : 'it'} on the{' '}
             <Link href="/feed" className="text-affirm underline underline-offset-4">
               Feed
             </Link>
