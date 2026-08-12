@@ -280,7 +280,7 @@ describe('TimelineView — selection expands the page’s own row', () => {
         now={NOW}
         renderDetail={(it) => {
           seen.push(it.id);
-          return <div data-testid="detail-row">detail for {it.id}</div>;
+          return <li data-testid="detail-row">detail for {it.id}</li>;
         }}
       />,
     );
@@ -293,7 +293,7 @@ describe('TimelineView — selection expands the page’s own row', () => {
   });
 
   it('selecting the same trace again collapses it', () => {
-    render(<TimelineView items={[timed]} now={NOW} renderDetail={(it) => <span>detail {it.id}</span>} />);
+    render(<TimelineView items={[timed]} now={NOW} renderDetail={(it) => <li>detail {it.id}</li>} />);
     fireEvent.click(traceFor('ev')!);
     expect(screen.queryByTestId('timeline-detail')).not.toBeNull();
     fireEvent.click(traceFor('ev')!);

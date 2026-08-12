@@ -1,4 +1,4 @@
-import { type ReactNode, useMemo, useState } from 'react';
+import { Fragment, type ReactNode, useMemo, useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
 import { kindLabel } from '../../lib/algernon/feedConstants';
 import {
@@ -40,9 +40,14 @@ export interface TimelineViewProps {
   /** Injectable clock. Defaults to the real one; tests pass a fixed instant. */
   now?: number;
   /**
-   * How the page renders a selected item's detail. The page owns this because
-   * the row's verbs live on the page's hooks (completion / accept / snooze /
-   * ack); the timeline owns layout and nothing else.
+   * How the page renders one item's detail. The page owns this because the
+   * row's verbs live on the page's hooks (completion / accept / snooze / ack);
+   * the timeline owns layout and nothing else.
+   *
+   * CONTRACT: returns a LIST ITEM. The production caller returns a `FeedRow`,
+   * which is an `<li>`, and every slot this is dropped into here is a `<ul>` —
+   * so the detail panel and the two registers are real lists rather than a div
+   * pretending to be one.
    */
   renderDetail?: (item: FeedItem) => ReactNode;
 }
@@ -263,9 +268,9 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
         // Depth two of the three-depth grammar (glance → expand → investigate):
         // the band is the glance, this is the expand, and it is the page's own
         // row — same component, same verbs, same hooks as the list view.
-        <div data-testid="timeline-detail" className="mt-3">
+        <ul data-testid="timeline-detail" className="mt-3">
           {renderDetail(selected)}
-        </div>
+        </ul>
       )}
 
       {split.beyond.length > 0 && (
@@ -316,9 +321,9 @@ function Register({
       <ul className="mt-2 flex flex-col gap-2">
         {items.map((item) =>
           renderDetail ? (
-            <li key={item.id} data-testid={`${testId}-item`}>
-              {renderDetail(item)}
-            </li>
+            // Already an `<li>` per the renderDetail contract — wrapping it in
+            // another one would nest list items.
+            <Fragment key={item.id}>{renderDetail(item)}</Fragment>
           ) : (
             <li
               key={item.id}

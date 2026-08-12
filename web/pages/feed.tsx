@@ -4,6 +4,8 @@ import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
 import { FeedRow } from '../components/feed/FeedRow';
+import { TimelineView } from '../components/feed/TimelineView';
+import { FEED_VIEWS, type FeedView, feedViewFromQuery, isFeedView } from '../lib/algernon/feedView';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
@@ -18,7 +20,17 @@ import { display, subtle, title as titleClass } from '../lib/typography';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
-// The Awareness feed: open items grouped needs-you (→ the deck) above FYI (Ack).
+// The Awareness feed — the platform's SENSOR LOG (canonical-surface ruling:
+// brief = viewscreen, deck = tactical console, feed = sensor log). It reports
+// what the instance is tracking; it does not ask for judgment, which is the
+// deck's job (D1).
+//
+// TWO VIEWS OF ONE FEED. The list is the shipped worklist form. The timeline is
+// the Waterline element the operator graduated: the same items laid out against
+// time, so a fog window occupies its four hours instead of becoming one more row
+// sorted by urgency. Neither is a different surface and neither has verbs the
+// other lacks — both render the same `FeedRow` from the same hooks.
+//
 // Auth-gated like the brief/deck pages.
 export default function FeedPage() {
   const router = useRouter();
@@ -33,6 +45,11 @@ export default function FeedPage() {
   const [showDone, setShowDone] = useState(false);
   // Collapsed by default — parity with the done drill (#26) and the rings.
   const [showSnoozed, setShowSnoozed] = useState(false);
+  // The chosen view. Held in state AND mirrored to the URL rather than read
+  // straight off the router: the state is what makes the toggle respond on the
+  // spot, the URL is what makes a view linkable and reload-stable. Seeded from
+  // the query below once the router has hydrated it.
+  const [view, setView] = useState<FeedView>('list');
 
   useEffect(() => {
     if ((!sessionLoading && !user) || unauthenticated) {
@@ -76,6 +93,29 @@ export default function FeedPage() {
       cancelled = true;
     };
   }, [authed]);
+
+  // Seed from `?view=` when the router hydrates it. Deliberately one-directional
+  // and value-guarded: it only ever adopts a RECOGNISED view, so a mistyped URL
+  // leaves the operator on the default rather than on nothing, and choosing a
+  // view (which writes the same value back) can't cycle.
+  const queryView = router.query.view;
+  useEffect(() => {
+    if (isFeedView(Array.isArray(queryView) ? queryView[0] : queryView)) {
+      setView(feedViewFromQuery(queryView));
+    }
+  }, [queryView]);
+
+  const chooseView = useCallback(
+    (next: FeedView) => {
+      setView(next);
+      // Shallow + replace: switching view is not a navigation and must not
+      // stack history entries the back button then has to walk through.
+      router.replace({ pathname: '/feed', query: next === 'list' ? {} : { view: next } }, undefined, {
+        shallow: true,
+      });
+    },
+    [router],
+  );
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
   const board = useFeedBoard({ items: items ?? [], onAuthExpired });
@@ -153,6 +193,38 @@ export default function FeedPage() {
     });
   }, []);
 
+  // ONE row renderer, shared by the timeline's detail panel and both of its
+  // registers. It is the mechanism behind "neither view has verbs the other
+  // lacks": a row reached through the band is the SAME component with the SAME
+  // hooks it would have in the list, so the two cannot drift apart.
+  const renderRow = useCallback(
+    (it: FeedItem) => {
+      const common = {
+        item: it,
+        expanded: expanded.has(it.id),
+        onToggleEvidence: () => toggleExpanded(it.id),
+      };
+      if (board.fyi.some((f) => f.id === it.id)) {
+        return (
+          <FeedRow
+            key={it.id}
+            {...common}
+            onAck={() => board.ack(it.id)}
+            onContest={contestableItem(it) ? (section?: string) => board.contest(it.id, section) : undefined}
+          />
+        );
+      }
+      if (it.kind === 'slot_suggestion') {
+        return <FeedRow key={it.id} {...common} completion={completion} accept={slotAccept} snooze={snooze} />;
+      }
+      // A deck-able decision on the band renders at AWARENESS depth only —
+      // glance and expand, no verbs. Judgment is the deck's (D1), and the deck
+      // link above is the route to it.
+      return <FeedRow key={it.id} {...common} />;
+    },
+    [board, completion, expanded, slotAccept, snooze, toggleExpanded],
+  );
+
   const handleSignOut = useCallback(async () => {
     try {
       await authApi.logout();
@@ -185,9 +257,59 @@ export default function FeedPage() {
       <Head>
         <title>Feed · {INSTANCE_NAME}</title>
       </Head>
-      <Layout onSignOut={() => void handleSignOut()}>
-        <h1 className={display}>Feed</h1>
-        <p className={`mt-1 ${subtle}`}>What {INSTANCE_NAME} is tracking — decisions up top, glance items below.</p>
+      {/* Wider than the default reading column: the workstation posture has a
+          time axis to lay out, and the tricorder posture is capped by the
+          viewport anyway. */}
+      <Layout onSignOut={() => void handleSignOut()} maxWidthClassName="max-w-4xl">
+        {/* The console. Bleeds to the edges on a phone (tricorder, held close)
+            and insets into a panel on a tablet (workstation, at arm's length).
+            `data-surface` is also the scope that lets styles/sensorLog.css skin
+            the SHARED rows here without touching the brief's copies of them. */}
+        <div
+          data-surface="sensor-log"
+          data-testid="feed-console"
+          className="-mx-5 -my-4 min-h-[80vh] px-4 py-5 sm:mx-0 sm:rounded-xl sm:px-6"
+        >
+          {/* LCARS: elbow into a pill-terminated bar. */}
+          <div className="flex items-stretch gap-1">
+            <div className="sensor-elbow w-10 shrink-0 sm:w-16" aria-hidden />
+            <div className="sensor-bar flex flex-1 flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2">
+              <h1 className="text-base font-extrabold uppercase tracking-[0.26em]" style={{ color: 'var(--sensor-teal)' }}>
+                Feed
+              </h1>
+              <span className="sensor-label">Sensor log · {INSTANCE_NAME}</span>
+            </div>
+          </div>
+          <p className="mt-2 text-sm" style={{ color: 'var(--sensor-ink3)' }}>
+            What {INSTANCE_NAME} is tracking — decisions up top, glance items below.
+          </p>
+
+          <div
+            role="group"
+            aria-label="Feed view"
+            data-testid="feed-view-switch"
+            className="mt-3 inline-flex gap-0.5 rounded-full p-0.5"
+            style={{ backgroundColor: 'var(--sensor-hull)' }}
+          >
+            {FEED_VIEWS.map((v) => (
+              <button
+                key={v.id}
+                type="button"
+                data-testid={`feed-view-${v.id}`}
+                aria-pressed={view === v.id}
+                title={v.hint}
+                onClick={() => chooseView(v.id)}
+                className="sensor-label rounded-full px-4 py-1.5"
+                style={
+                  view === v.id
+                    ? { backgroundColor: 'var(--sensor-teal3)', color: 'var(--sensor-teal)' }
+                    : { color: 'var(--sensor-ink4)' }
+                }
+              >
+                {v.label}
+              </button>
+            ))}
+          </div>
 
         {board.banner && (
           <div role="alert" data-testid="feed-banner" className="mt-4 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
@@ -213,46 +335,59 @@ export default function FeedPage() {
           </p>
         )}
 
-        {loaded && activeNeedsYou.length > 0 && (
+        {/* Deck-able decisions (a wired verb) route to the swipe deck; the count
+            matches what the deck actually deals (see deck.tsx). HOISTED out of
+            the worklist section so it shows in BOTH views — it is the surface's
+            route to judgment, not a member of any one list. Gating on
+            `deckable` alone is equivalent to the old `activeNeedsYou &&
+            deckable` pair, since deckable is a subset of activeNeedsYou. */}
+        {loaded && deckable.length > 0 && (
+          <Link
+            href="/deck"
+            data-testid="feed-deck-link"
+            className="mt-4 flex items-center justify-between rounded-lg px-4 py-3 text-sm font-semibold"
+            style={{
+              backgroundColor: 'var(--sensor-teal3)',
+              color: 'var(--sensor-teal)',
+              border: '1px solid var(--sensor-teal2)',
+            }}
+          >
+            <span>
+              {deckable.length} decision{deckable.length > 1 ? 's' : ''} waiting
+            </span>
+            <span aria-hidden>Open the deck →</span>
+          </Link>
+        )}
+
+        {loaded && view === 'timeline' && (
+          <TimelineView items={items ?? []} renderDetail={renderRow} />
+        )}
+
+        {loaded && view === 'list' && pendingRows.length > 0 && (
           <section data-testid="feed-needs-you" className="mt-6">
-            <h2 className={titleClass}>Needs you</h2>
-            {/* Deck-able decisions (a wired verb) route to the swipe deck; the
-                count matches what the deck actually deals (see deck.tsx). */}
-            {deckable.length > 0 && (
-              <Link
-                href="/deck"
-                data-testid="feed-deck-link"
-                className="mt-2 flex items-center justify-between rounded-xl border border-honeydew-300 bg-honeydew-50 px-4 py-3 text-sm font-semibold text-honeydew-700"
-              >
-                <span>
-                  {deckable.length} decision{deckable.length > 1 ? 's' : ''} waiting
-                </span>
-                <span aria-hidden>Open the deck →</span>
-              </Link>
-            )}
+            <h2 className={titleClass} style={{ color: 'var(--sensor-ink)' }}>
+              Needs you
+            </h2>
             {/* Slot rows (non-deck-able needs-you) carry the SAME live per-lane
                 completion control as the rings panel — completable lanes get a
                 real ✓; task/unknown lanes get an honest note (no dead control). */}
-            {pendingRows.length > 0 && (
-              <ul data-testid="feed-pending" className="mt-2 flex flex-col gap-2">
-                {pendingRows.map((it) => (
-                  <FeedRow
-                    key={it.id}
-                    item={it}
-                    expanded={expanded.has(it.id)}
-                    onToggleEvidence={() => toggleExpanded(it.id)}
-                    completion={completion}
-                    accept={slotAccept}
-                    snooze={snooze}
-                  />
-                ))}
-              </ul>
-            )}
-
+            <ul data-testid="feed-pending" className="mt-2 flex flex-col gap-2">
+              {pendingRows.map((it) => (
+                <FeedRow
+                  key={it.id}
+                  item={it}
+                  expanded={expanded.has(it.id)}
+                  onToggleEvidence={() => toggleExpanded(it.id)}
+                  completion={completion}
+                  accept={slotAccept}
+                  snooze={snooze}
+                />
+              ))}
+            </ul>
           </section>
         )}
 
-        {loaded && snoozedRows.length > 0 && (
+        {loaded && view === 'list' && snoozedRows.length > 0 && (
           <section data-testid="feed-snoozed" className="mt-4">
             <button
               type="button"
@@ -288,11 +423,11 @@ export default function FeedPage() {
           </section>
         )}
 
-        {loaded && doneRows.length > 0 && (
+        {loaded && view === 'list' && doneRows.length > 0 && (
           // The staged section (#26). Deliberately a SIBLING of "Needs you"
           // rather than living inside it: the enclosing section is gated on
-          // `activeNeedsYou.length > 0`, so completing the last slot unmounted
-          // it — and staging a done row under a "Needs you" heading would
+          // its own pending rows, so completing the last slot unmounts it — and
+          // staging a done row under a "Needs you" heading would
           // contradict the heading anyway. Done work is its own quiet band.
           //
           // Collapsed by default so the page still reads as remaining work, but
@@ -325,7 +460,7 @@ export default function FeedPage() {
           </section>
         )}
 
-        {loaded && board.fyi.length > 0 && (
+        {loaded && view === 'list' && board.fyi.length > 0 && (
           <section data-testid="feed-fyi" className="mt-6">
             <h2 className={titleClass}>For your awareness</h2>
             <ul className="mt-2 flex flex-col gap-2">
@@ -351,6 +486,7 @@ export default function FeedPage() {
             </button>
           </div>
         )}
+        </div>
       </Layout>
     </>
   );
