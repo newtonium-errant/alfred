@@ -89,6 +89,20 @@ export function boardSlotLabel(slot: string): string {
 // obligations (a `due_pattern` routine, a dated task), Rhythm holds practice
 // (`target_cadence_days` — a cadence, NOT a schedule), Fuel holds restoration
 // (`self_care`). Copy that calls Rhythm "scheduled" would be describing Duty.
+//
+// ── THE FENCE: ARRANGEMENT, NOT GOAL (holds until the gated flip) ───────────
+// SLOTS ARE HOW THE DAY IS ARRANGED. The balanced-day CLAIM keys to what the
+// server computes, and that metric is still TIER-based until stage 3 of the
+// classifier rollout flips it. So no string on this board may assert a
+// slot-based GOAL or target — not "aim for all three", not "a balanced day
+// needs one of each", and not scoring vocabulary that implies the slots feed a
+// tally the server does not yet keep on that axis.
+//
+// The permissible register is standing and placement: what the slots ARE to one
+// another, where an item sits, what is on the board. `boardSlotsWithADone` is
+// deliberately named apart from `balanced_day` for this reason; keep the copy
+// on the same side of that line. Re-check every string here against this fence
+// when the metric does flip — several of them become sayable that are not now.
 export const UNSLOTTED_LABEL = 'Not sorted yet';
 
 /**

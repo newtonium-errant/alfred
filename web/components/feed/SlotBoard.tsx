@@ -428,16 +428,32 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                 'Nothing on the board yet today — it fills as the day’s items arrive.'
               : // The scoreline is the SIGNAL; the clause after it is the
                 // interpretation, and it is the one sentence carrying the whole
-                // taxonomy ruling. It states the co-equality as a FACT about the
-                // machine — `boardSlotsWithADone` increments identically for a
-                // done Fuel item and a done Duty item — so the permission is
-                // earned by the mechanism rather than asserted as encouragement.
+                // taxonomy ruling — that the three slots are a permission system
+                // and not a priority stack.
+                //
+                // IT IS A CLAIM ABOUT ARRANGEMENT, NEVER ABOUT SCORE, and the
+                // distinction is load-bearing rather than stylistic. The
+                // `balanced_day` METRIC is still tier-based server-side until a
+                // gated future flip (see `boardSlotsWithADone`, which is named
+                // apart from it for exactly this reason), so no string on this
+                // board may claim a slot-based GOAL. An earlier draft read "all
+                // three count the same" and was pulled: "count" is scoring
+                // vocabulary, and on a surface whose scoring is not slot-based
+                // yet it would have promised a flip that has not happened.
+                // "Outranks" keeps the sentence on standing, which IS true today
+                // and is what the operator needs to hear.
+                //
+                // It also disarms the one hierarchy signal still on screen: the
+                // stacks render in a fixed order and Fuel is last, which is the
+                // very shape the ruling named when it said the numbered tiers
+                // "re-encoded the hierarchy [they were] built to escape (T3 named
+                // last, rendered last)".
                 //
                 // Deliberately NOT a progress nudge. No "keep going", no streak,
                 // no target language: a scoreline that pressures the operator
-                // toward a complete set would re-create the hierarchy this
-                // taxonomy was built to escape, with Fuel as the box left unticked.
-                `${balanced} of 3 slots have something done — all three count the same.`}
+                // toward a complete set would rebuild that same hierarchy, with
+                // Fuel as the box left unticked.
+                `${balanced} of 3 slots have something done — no slot outranks another.`}
           </p>
           <div data-testid="board-stacks" className="mt-2 flex flex-col gap-3">
             {stacks.map(renderStack)}

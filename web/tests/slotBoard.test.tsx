@@ -210,7 +210,7 @@ describe('SlotBoard — intentionally-left-blank states', () => {
 
   it('reports the balanced-day scoreline once anything is on the board', () => {
     render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' })]} />);
-    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done — all three count the same.');
+    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done — no slot outranks another.');
   });
 });
 
@@ -341,9 +341,9 @@ describe('SlotBoard — undo-grace holds the write (option (a), board layer)', (
   it('the scoreline counts the completion immediately, wherever the row renders', () => {
     vi.useFakeTimers();
     render(<Harness items={[slot({ id: 'r' }, { slot: 'duty' })]} />);
-    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done — all three count the same.');
+    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done — no slot outranks another.');
     fireEvent.click(screen.getByTestId('board-complete'));
-    expect(screen.getByTestId('board-balance').textContent).toBe('1 of 3 slots have something done — all three count the same.');
+    expect(screen.getByTestId('board-balance').textContent).toBe('1 of 3 slots have something done — no slot outranks another.');
     expect(screen.getByTestId('board-stack-score-duty').textContent).toBe('1/1 done');
   });
 
