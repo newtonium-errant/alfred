@@ -62,7 +62,7 @@ function item(over: Partial<FeedItem> & { id: string }): FeedItem {
 
 const timedFyi = item({ id: 'radar1', starts_at: fromNow(2) });
 const untimed = item({ id: 'proposal1' });
-const deckable = item({ id: 'mail1', kind: 'email_tier', mode: 'decide', attention: 'needs_you' });
+const deckable = item({ id: 'mail1', kind: 'email_tier', mode: 'decide', attention: 'needs_you', starts_at: fromNow(4) });
 
 beforeEach(() => {
   mockList.mockReset().mockResolvedValue({ items: [timedFyi, untimed, deckable], count: 3 });
@@ -165,6 +165,52 @@ describe('FeedPage — the timeline is wired to the page, not just wire-able', (
     expect(detail.querySelector('[data-testid="feed-row"]')).not.toBeNull();
     // …carrying the verb this kind carries in the list view.
     expect(detail.querySelector('[data-testid="feed-row-ack"]')).not.toBeNull();
+  });
+
+  it('D1: a deck-able decision on the band gets NO judgment verbs, while the FYI row keeps its Ack', async () => {
+    // THE D1 GUARD. `renderRow`'s fall-through deliberately hands a deck-able
+    // decision a BARE FeedRow — glance and expand, nothing to act on — because
+    // judgment belongs to the deck. Nothing pinned that until now: handing the
+    // fall-through `completion`/`accept`/`snooze` (the timeline growing the full
+    // verb set, exactly what D1 forbids) left the whole suite green.
+    //
+    // The load-bearing assertion is `feed-row-unavailable`. It is the branch
+    // FeedRow renders when `completion` IS supplied and the item is not
+    // done/suggested/completable — so it is ABSENT today and PRESENT the moment
+    // the hooks leak in. Asserting only accept/complete/snooze would be nearly
+    // vacuous here: those three are additionally gated on per-kind predicates
+    // that an email_tier item fails anyway, so they would stay absent under the
+    // very mutation this test exists to catch.
+    routerQuery.current = { view: 'timeline' };
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-timeline')).not.toBeNull());
+
+    // --- branch A: the deck-able decision, at awareness depth only ---
+    const deckTrace = screen.getAllByTestId('timeline-trace').find((t) => t.textContent?.includes('title mail1'))!;
+    expect(deckTrace).toBeTruthy();
+    fireEvent.click(deckTrace);
+
+    const deckDetail = screen.getByTestId('timeline-detail');
+    // Positive control: a real row IS rendered. Without this, every absence
+    // below would also hold for a detail panel that rendered nothing at all.
+    expect(deckDetail.querySelector('[data-testid="feed-row"]')).not.toBeNull();
+    for (const verb of [
+      'feed-row-unavailable',
+      'feed-row-accept',
+      'feed-row-complete',
+      'feed-row-undo',
+      'feed-row-snooze',
+    ]) {
+      expect(deckDetail.querySelector(`[data-testid="${verb}"]`)).toBeNull();
+    }
+
+    // --- branch B: the FYI row, same render, verb PRESENT ---
+    // Both branches in one test on purpose: this is what separates "the feed
+    // withholds judgment verbs from deck-able items" from "the timeline renders
+    // no verbs at all", which would be a different bug wearing the same green.
+    const fyiTrace = screen.getAllByTestId('timeline-trace').find((t) => t.textContent?.includes('title radar1'))!;
+    fireEvent.click(fyiTrace);
+    expect(screen.getByTestId('timeline-detail').querySelector('[data-testid="feed-row-ack"]')).not.toBeNull();
   });
 
   it('the untimed register renders real rows too, not bare titles', async () => {

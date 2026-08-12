@@ -20,6 +20,11 @@ import type { FeedItem } from '../lib/algernon/feed';
 // add a selector to the CSS for a class no component emits and this fails; rename
 // a class in the component and this fails.
 //
+// Each class is checked against the markup ITS OWN SELECTOR REACHES, not against
+// every skinned file at once. That distinction is the whole pin: the union
+// lookup this replaced could not see an orphaned snoozed-row rule, because every
+// class it borrows also appears in FeedRow.tsx.
+//
 // WHAT IT DOES NOT CLAIM: that the cascade actually applies. jsdom does not
 // evaluate an external stylesheet imported through `_app`, so no test here can
 // assert a computed colour. This pin guards the SELECTOR TARGETS — the part that
@@ -27,15 +32,36 @@ import type { FeedItem } from '../lib/algernon/feed';
 
 const WEB_ROOT = join(__dirname, '..');
 const CSS_PATH = join(WEB_ROOT, 'styles', 'sensorLog.css');
-// Everything the skin is allowed to re-point lives in one of these. `feed.tsx`
-// is in the list because the console skins its OWN markup too — the snoozed row
-// is built there, not in FeedRow, and an earlier cut of this pin only looked
-// inside `[data-testid='feed-row']` selectors and so watched half the skin.
-const SKINNED_SOURCES = [
-  'components/feed/FeedRow.tsx',
-  'components/feed/EvidenceBody.tsx',
-  'pages/feed.tsx',
-];
+// WHICH SOURCE EACH SELECTOR ACTUALLY TARGETS.
+//
+// Checking every borrowed class against the CONCATENATION of these files was the
+// second way this pin watched less than it claimed: every class the snoozed-row
+// rules borrow also appears in FeedRow.tsx, so the snoozed row's skin could be
+// orphaned outright — its unsnooze button left warm-on-dark in production, the
+// exact failure guarded — and the union lookup would still find the string in a
+// file that selector cannot match. Per-source is the fix: a class is verified
+// against the markup its own selector reaches, and nowhere else.
+const ROW_SOURCES = ['components/feed/FeedRow.tsx', 'components/feed/EvidenceBody.tsx'];
+const SNOOZED_ROW_SOURCES = ['pages/feed.tsx'];
+// A console-level rule (no testid qualifier) can match anywhere on the surface.
+const CONSOLE_SOURCES = [...ROW_SOURCES, ...SNOOZED_ROW_SOURCES];
+
+/** The files a selector can actually reach, by its testid qualifier. */
+function sourcesFor(selector: string): string[] {
+  if (selector.includes("[data-testid='feed-snoozed-row']")) return SNOOZED_ROW_SOURCES;
+  if (selector.includes("[data-testid='feed-row']")) return ROW_SOURCES;
+  return CONSOLE_SOURCES;
+}
+
+const sourceCache = new Map<string, string>();
+function sourceText(rel: string): string {
+  let text = sourceCache.get(rel);
+  if (text === undefined) {
+    text = readFileSync(join(WEB_ROOT, rel), 'utf8');
+    sourceCache.set(rel, text);
+  }
+  return text;
+}
 
 const rawCss = readFileSync(CSS_PATH, 'utf8');
 
@@ -52,28 +78,41 @@ function selectors(): string[] {
   return css
     .split('}')
     .map((chunk) => chunk.slice(0, chunk.indexOf('{')))
-    .filter((head, i, all) => i < all.length && head.trim() && !head.trim().startsWith('@'))
+    .filter((head) => head.trim() && !head.trim().startsWith('@'))
     .flatMap((head) => head.split(','))
     .map((s) => s.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 }
 
 /**
- * Every BORROWED class the skin re-points — each `.foo` in any selector that the
- * stylesheet does not own. `.sensor-*` classes are excluded: those are defined
- * here and consumed by the feed's own markup, so they are not a coupling to
- * anyone else's naming. Escaped slashes (`.text-honeydew-600\/80`) are unescaped
- * back to the literal Tailwind class.
+ * One BORROWED class, bound to the selector that re-points it and to the files
+ * that selector can actually reach. `.sensor-*` classes are excluded: the
+ * stylesheet defines those itself, so they are not a coupling to anyone else's
+ * naming. Escaped slashes (`.text-honeydew-600\/80`) are unescaped back to the
+ * literal Tailwind class.
  */
-function skinnedClasses(): string[] {
-  const found = new Set<string>();
+interface SkinBinding {
+  cls: string;
+  selector: string;
+  /** The files this class must appear in — its own selector's reach. */
+  sources: string[];
+}
+
+function skinBindings(): SkinBinding[] {
+  const out: SkinBinding[] = [];
   for (const selector of selectors()) {
     for (const m of selector.matchAll(/\.((?:[\w-]|\\\/)+)/g)) {
       const cls = m[1].replace(/\\\//g, '/');
-      if (!cls.startsWith('sensor-')) found.add(cls);
+      if (cls.startsWith('sensor-')) continue;
+      out.push({ cls, selector, sources: sourcesFor(selector) });
     }
   }
-  return [...found].sort();
+  return out;
+}
+
+/** The distinct borrowed classes, for the vacuity guard. */
+function skinnedClasses(): string[] {
+  return [...new Set(skinBindings().map((b) => b.cls))].sort();
 }
 
 function item(over: Partial<FeedItem> = {}): FeedItem {
@@ -105,13 +144,31 @@ describe('sensor-log skin — the shared row still presents the hooks the CSS ta
     expect(classes).toContain('text-honeydew-700');
   });
 
-  it('every class the skin targets is still emitted by a skinned component', () => {
-    const sources = SKINNED_SOURCES.map((rel) => readFileSync(join(WEB_ROOT, rel), 'utf8')).join('\n');
-    const orphans = skinnedClasses().filter((cls) => !sources.includes(cls));
-    // A failure here means styles/sensorLog.css and the shared row have drifted.
-    // Fix BOTH together: update the selector to the component's new class, or
-    // drop the now-dead rule.
+  it('every class the skin targets is still emitted by the markup THAT selector reaches', () => {
+    const orphans = skinBindings()
+      .filter(({ cls, sources }) => !sources.some((rel) => sourceText(rel).includes(cls)))
+      // The message is the point on failure: it names the selector, so the fix
+      // is obvious without re-deriving which rule went stale.
+      .map(({ cls, selector }) => `.${cls} — orphaned, targeted by: ${selector}`);
+    // A failure here means styles/sensorLog.css and the markup it skins have
+    // drifted. Fix BOTH together: re-point the selector at the element's new
+    // class, or drop the now-dead rule.
     expect(orphans).toEqual([]);
+  });
+
+  it('the per-source check is real — a class present in a file the selector CANNOT reach is still an orphan', () => {
+    // The guard on the guard. The union-lookup bug this replaced was invisible
+    // precisely because every snoozed-row class also lives in FeedRow.tsx, so a
+    // fully-orphaned snoozed-row rule still found its string somewhere. Prove
+    // the new lookup is scoped by asking it the same question directly.
+    const snoozedOnly = sourcesFor("[data-surface='sensor-log'] [data-testid='feed-snoozed-row'] .bg-cream");
+    expect(snoozedOnly).toEqual(['pages/feed.tsx']);
+    expect(snoozedOnly).not.toContain('components/feed/FeedRow.tsx');
+
+    // …and that the two qualifiers really do resolve to different file sets.
+    const rowOnly = sourcesFor("[data-surface='sensor-log'] [data-testid='feed-row'] .bg-cream");
+    expect(rowOnly).not.toContain('pages/feed.tsx');
+    expect(rowOnly).toContain('components/feed/FeedRow.tsx');
   });
 
   it('the row still carries the data-testid the skin keys on', () => {

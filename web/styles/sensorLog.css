@@ -18,10 +18,16 @@
    The shared design-token / theme layer is owned by the DECK lane, which is
    building in parallel. Until that layer lands and is relayed, these tokens are
    feed-local. THIS BLOCK IS THE ONLY PLACE THEY ARE DEFINED — every consumer
-   (the feed page, the timeline view, the row skin below) references
-   `var(--sensor-*)` and nothing else, so the swap is a single edit HERE:
-   re-point each custom property at its shared-layer equivalent and delete
-   nothing else. No consumer changes. No second token vocabulary was invented
+   reads them through `var(--sensor-*)`, so the swap is ONE EDIT HERE PLUS THE
+   ENUMERATED CONSUMER FILLS: re-point each custom property at its shared-layer
+   equivalent, then tokenize the five inline `rgba(...)` literals in
+   TimelineView.tsx (`:62-64` the three trace fills, `:95-96` the weather tint
+   and its border) that predate the token set and are listed with their target
+   roles in the swap block below. Nothing else moves.
+
+   Saying "no consumer changes" here would be simpler and false — those five
+   fills ARE consumers, they just aren't reading a variable yet, and the swap
+   block already treats them as work. No second token vocabulary was invented
    and no shared token was guessed at; if a name below has no counterpart in the
    shared layer, that is a conversation, not a silent divergence.
 
@@ -73,6 +79,24 @@
        defer verb, which is precisely the kind of collision that makes a token
        system stop being true. Raise it before swapping — the seam's own rule is
        that a missing counterpart is a conversation, not a silent divergence.
+
+   THE FIVE CONSUMER FILLS — the swap's only work outside this file. All in
+   `components/feed/TimelineView.tsx`, all inline `rgba(...)` literals that
+   predate the token set:
+
+     :62  weather trace fill  rgba(201,154,76,0.10) → ENVIRONMENT -wash
+     :63  live trace fill     rgba(79,167,161,0.10) → affirm-wash
+     :64  quiet trace fill    rgba(119,131,155,0.08) → info-wash
+     :95  weather certain-block tint rgba(201,154,76,0.13) → ENVIRONMENT -wash
+     :96  weather block border rgba(201,154,76,0.35) → ENVIRONMENT -deep
+
+   The two weather entries take the ENVIRONMENT role, never `caution` — the
+   ruling above, applied. And one caveat that stops this being purely
+   mechanical: these are TRANSLUCENT, so they composite over the band's hull and
+   its gridlines show THROUGH a trace. An opaque `-wash` hex would occlude them.
+   If that reads worse, the fix is to keep the fill translucent via
+   `console-scrim` layering rather than to un-ratify the role — check it against
+   a real render before calling the swap done.
 
    THREE GOTCHAS from the layer's owner, recorded because they bite at swap time:
      · NO opacity modifiers — the tokens are plain hex, so `bg-console-panel/50`
