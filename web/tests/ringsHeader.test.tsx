@@ -12,6 +12,7 @@ vi.mock('../lib/algernon/feed', () => ({ feedApi: { list: mockList, act: mockAct
 import { RingsHeader } from '../components/feed/RingsHeader';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 // A completable (routine-item) lane item — enables the ✓.
 function routineSlot(overrides: Partial<FeedItem> = {}): FeedItem {
@@ -27,7 +28,7 @@ function routineSlot(overrides: Partial<FeedItem> = {}): FeedItem {
 const flushAct = () => act(async () => { await Promise.resolve(); await Promise.resolve(); });
 
 function slot(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'slot_suggestion:task/A.md',
     kind: 'slot_suggestion',
     instance: 'salem',
@@ -42,7 +43,7 @@ function slot(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 // Completion is a STAGE, not a disappearance: an acted item stays on the ring for

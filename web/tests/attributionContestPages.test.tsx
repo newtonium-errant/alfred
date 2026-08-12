@@ -39,11 +39,12 @@ vi.mock('../lib/algernon/composerLog', () => ({ useComposerLog: () => {} }));
 import FeedPage from '../pages/feed';
 import HomePage from '../pages/index';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 const ATTRIBUTION_ID = 'attribution:note/A.md|inf-1';
 
 function attributionItem(over: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: ATTRIBUTION_ID,
     kind: 'attribution',
     instance: 'salem',
@@ -58,7 +59,7 @@ function attributionItem(over: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...over,
-  };
+  });
 }
 
 beforeEach(() => {

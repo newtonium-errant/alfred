@@ -261,14 +261,22 @@ del _kind, _verb
 # --- advertised verbs (#102 1b) ----------------------------------------------
 # What a CLIENT is told it may do with an item, derived from the ceiling above.
 #
-# WHY THIS EXISTS. The web deck carried its own hand-written per-kind verb map
-# (`web/lib/algernon/feedConstants.DECK_VERBS`) whose own comment conceded the
-# coupling: "these action_ids MUST be members of the B1 transport FEED_ACTIONS
-# map for the kind". A mirror maintained by vigilance drifts the day someone
-# edits one side, and the drift is silent in both directions — a verb the client
-# offers that the ceiling refuses 400s in the operator's hand, and a verb the
-# ceiling gained that the client never shows is a capability nobody can reach.
-# Serving the verbs from the ceiling itself is F3 "fixed by construction".
+# WHY THIS EXISTS. The web deck used to carry its own hand-written per-kind verb
+# map (`web/lib/algernon/feedConstants.DECK_VERBS`) whose own comment conceded
+# the coupling: "these action_ids MUST be members of the B1 transport
+# FEED_ACTIONS map for the kind". A mirror maintained by vigilance drifts the day
+# someone edits one side, and the drift is silent in both directions — a verb the
+# client offers that the ceiling refuses 400s in the operator's hand, and a verb
+# the ceiling gained that the client never shows is a capability nobody can
+# reach. Serving the verbs from the ceiling itself is F3 "fixed by construction".
+#
+# THAT MAP IS NOW DELETED (1b-ii): the deck derives its verbs from the served
+# `actions[]` via `feedConstants.verbsFromActions`, so there is no second table
+# left to drift. Consequences for anyone editing below — a verb added here
+# reaches the deck with no client change, and a verb REMOVED here disappears from
+# the deck the same way. The client can no longer paper over a gap in this table,
+# which is the point; it also means this table is now load-bearing for the UI, so
+# an accidental deletion here is an accidental capability removal there.
 #
 # THE CEILING IS THE SET; THIS TABLE IS THE PRESENTATION. `FEED_ACTIONS` decides
 # WHICH pairs exist and is the only authority on that. This adds what a ceiling

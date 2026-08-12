@@ -16,9 +16,10 @@ import { DeckCard } from '../components/feed/DeckCard';
 import { UNDO_MS } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function item(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'email_tier:note/A.md',
     kind: 'email_tier',
     instance: 'salem',
@@ -33,7 +34,7 @@ function item(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 beforeEach(() => {

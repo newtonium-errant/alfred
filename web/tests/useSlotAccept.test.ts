@@ -10,9 +10,10 @@ vi.mock('../lib/algernon/feed', () => ({ feedApi: { act: mockAct, list: vi.fn() 
 import { useSlotAccept, SLOT_ACTION_ACCEPT } from '../components/feed/useSlotAccept';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function candidate(over: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'slot_suggestion:task:task/Interview.md',
     kind: 'slot_suggestion',
     instance: 'salem',
@@ -27,7 +28,7 @@ function candidate(over: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...over,
-  };
+  });
 }
 
 // A verbatim accept-success response (from builder-c2's T1_task fixture).

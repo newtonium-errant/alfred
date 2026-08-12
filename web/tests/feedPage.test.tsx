@@ -17,9 +17,10 @@ vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
 
 import FeedPage from '../pages/feed';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function item(kind: string, id: string, attention: string, mode: string, evidence: Record<string, unknown> = {}): FeedItem {
-  return {
+  return withServedActions({
     id,
     kind,
     instance: 'salem',
@@ -33,7 +34,7 @@ function item(kind: string, id: string, attention: string, mode: string, evidenc
     acted_at: null,
     expires_at: null,
     source_ref: {},
-  };
+  });
 }
 const routineSlot = (id: string, over: Partial<FeedItem> = {}): FeedItem => ({
   ...item('slot_suggestion', id, 'needs_you', 'decide', { tier: 1, routine_record: 'routine/Bills.md', item_text: 'Pay' }),

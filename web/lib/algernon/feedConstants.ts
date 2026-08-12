@@ -92,13 +92,15 @@ export function stampOpacity(distance: number): number {
   return Math.min((distance - STAMP_FADE_START) / STAMP_FADE_RANGE, 1);
 }
 
-// --- per-kind deck verbs -----------------------------------------------------
-// Maps a decide-mode kind to the action_id its affirm (right / ✓) and reject
-// (left / ✕) swipes POST. `null` = that direction is unavailable for the kind
-// (e.g. pending has no reject — only "noted"). These action_ids MUST be members
-// of the B1 transport FEED_ACTIONS map for the kind — the deck is a simplified
-// 2-way surface over the same capability ceiling (richer tier calibration stays
-// on the reply grammar). Unmapped kinds render but expose only the ↑ snooze.
+// --- the deck's verbs, READ FROM THE WIRE ------------------------------------
+// The shape the deck consumes: the action_id its affirm (right / ✓) and reject
+// (left / ✕) swipes POST, plus the presentation each carries. `null` = that
+// direction is unavailable for this item (e.g. pending has no reject — only
+// "noted"). The deck is a simplified 2-way surface over the transport's
+// capability ceiling (richer tier calibration stays on the reply grammar), and
+// it now learns the ceiling's answer from `item.actions` instead of asserting
+// its own — see `verbsFromActions`. An item served no gesture-bearing verb
+// renders but exposes only the ↑ snooze.
 /**
  * How much a single verb costs to get wrong (step-2 §3).
  *
@@ -124,7 +126,8 @@ export interface DeckVerbs {
    * express that, so it did not: attribution shipped as `heavy: false` and its
    * reject committed on a single left swipe, protected only by the undo window.
    *
-   * Weights below follow the §3 catalog verb-for-verb.
+   * The weights are the SERVER's, per verb, arriving in `item.actions` — the
+   * §3 catalog is now read rather than transcribed.
    */
   affirmWeight: VerbWeight;
   rejectWeight: VerbWeight;
@@ -140,6 +143,13 @@ export interface DeckVerbs {
    * decline path for slots v1, so a skipped candidate is set aside client-side
    * (no POST) and may resurface. `reject` stays null (no action_id).
    *
+   * THE ONE FLAG THAT CANNOT COME FROM THE WIRE, and the reason is structural
+   * rather than incidental: this is a client MECHANISM with no ceiling verb
+   * behind it. `FEED_ACTIONS` describes what the router will ACCEPT, and a Skip
+   * POSTs nothing at all — so there is no entry for the server to serve, and
+   * inventing one would advertise a verb the router must then refuse. It stays
+   * client-side until slots gain a real decline path.
+   *
    * Deliberately NOT called a snooze, and not routed through the snooze verb:
    * Skip and Snooze are near-opposites — *not this one* versus *yes, but later*
    * — and the ruling that opened #14 is explicit that no single control may
@@ -149,61 +159,122 @@ export interface DeckVerbs {
   rejectDefers?: boolean;
 }
 
-export const DECK_VERBS: Record<string, DeckVerbs> = {
-  email_tier: { affirm: 'confirm', reject: 'spam', affirmLabel: 'Confirm', rejectLabel: 'Spam', affirmWeight: 'light', rejectWeight: 'light' },
-  // #27 email_urgent — the INTERRUPT card. ACK-only: right/✓ acknowledges (POST "ack" →
-  // acted → flip); no reject/left (re-tier lives on the calibration card — two cards, two
-  // claims); the ↑ snooze gesture works as ever (kind-generic). Having this entry is what makes
-  // isDeckDealt(email_urgent) true → the C2-era generic deck/needs-you paths deal + count it.
-  email_urgent: { affirm: 'ack', reject: null, affirmLabel: 'Got it', rejectLabel: '', affirmWeight: 'light', rejectWeight: 'light' },
-  // Attribution: confirm records agreement (light); reject STRIPS THE MARKED
-  // SECTION out of the record body and drops its audit entry (heavy). The two
-  // are not symmetric and never were — see `reject_marker`.
-  attribution: {
-    affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject',
-    affirmWeight: 'light', rejectWeight: 'heavy',
-    rejectArmNote: 'Removes the marked section from the record body and drops its audit entry.',
-  },
-  routine_match: { affirm: 'confirm', reject: 'reject', affirmLabel: "That's it", rejectLabel: 'No', affirmWeight: 'light', rejectWeight: 'light' },
-  // Proposal / recurrence: the CONFIRM is the mutation-bearing half (§3 —
-  // "canonical proposal confirm (creates/merges vault records)", "recurrence
-  // approve (writes a routine item)"). Their rejects record a correction and
-  // write no record, so per the catalog they are light — a narrowing of what
-  // shipped, where the whole KIND was heavy in both directions.
-  proposal: {
-    affirm: 'confirm', reject: 'reject', affirmLabel: 'Confirm', rejectLabel: 'Reject',
-    affirmWeight: 'heavy', rejectWeight: 'light',
-    affirmArmNote: 'Creates or merges the vault records described above.',
-  },
-  recurrence: {
-    affirm: 'confirm', reject: 'reject', affirmLabel: 'Promote', rejectLabel: 'Reject',
-    affirmWeight: 'heavy', rejectWeight: 'light',
-    affirmArmNote: 'Writes this as a recurring routine item.',
-  },
-  pending: { affirm: 'noted', reject: null, affirmLabel: 'Noted', rejectLabel: '', affirmWeight: 'light', rejectWeight: 'light' },
-  // C2 slot candidate: Accept (right, POST "accept") / Skip (left, a client-side
-  // set-aside, no POST — rejectDefers) / Snooze (up). Only SUGGESTED slots are
-  // dealt (see isDeckDealt).
-  slot_suggestion: { affirm: 'accept', reject: null, affirmLabel: 'Take it', rejectLabel: 'Skip', affirmWeight: 'light', rejectWeight: 'light', rejectDefers: true },
-};
+// The kind whose LEFT gesture is a client-side set-aside rather than a verb.
+// See `rejectDefers` on DeckVerbs for why this cannot come from the wire.
+const SLOT_KIND = 'slot_suggestion';
 
-/** Deck verbs for a kind, or null when the kind has no deck action mapping. */
-export function deckVerbsFor(kind: string): DeckVerbs | null {
-  return Object.prototype.hasOwnProperty.call(DECK_VERBS, kind) ? DECK_VERBS[kind] : null;
+// The gesture names on the wire (`ACTION_META`'s gesture field, the §4 contract
+// amendment). The deck's two horizontal axes, and nothing else: a served verb
+// with no gesture is a MENU verb, not a swipe verb.
+const GESTURE_AFFIRM = 'affirm';
+const GESTURE_REJECT = 'reject';
+
+/** One served verb, as it arrives in `item.actions` (§4 + the gesture field). */
+interface ServedAction {
+  verb: string;
+  label: string;
+  weight: VerbWeight;
+  gesture?: string;
+  note?: string;
 }
 
 /**
- * The weight of ONE direction on ONE kind — the predicate the deck arms on.
+ * Read `item.actions` defensively — it is a bare cast off the wire.
  *
- * Unmapped kind, or a direction with no verb, answers 'light': there is nothing
- * to arm, and returning 'heavy' would put a confirm stage in front of a gesture
+ * `FeedItem.actions` is declared REQUIRED, but the declaration is a compile-time
+ * claim about a runtime value nothing validates: `pages/api/feed/list.ts` relays
+ * the transport body verbatim and the browser side casts. So a half-deployed box
+ * really can hand us an item with no `actions` key at all, and the type says
+ * otherwise. Anything that isn't a well-formed entry is dropped rather than
+ * coerced — a verb we cannot read is a verb we must not offer.
+ */
+function servedActions(item: FeedItem): ServedAction[] {
+  const raw: unknown = (item as { actions?: unknown }).actions;
+  if (!Array.isArray(raw)) return [];
+  const out: ServedAction[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.verb !== 'string' || !e.verb) continue;
+    out.push({
+      verb: e.verb,
+      // The server already falls back to the raw id for an unlabelled ceiling
+      // verb, so an empty label here means the payload itself is malformed.
+      label: typeof e.label === 'string' && e.label ? e.label : e.verb,
+      weight: e.weight === 'heavy' ? 'heavy' : 'light',
+      gesture: typeof e.gesture === 'string' ? e.gesture : undefined,
+      note: typeof e.note === 'string' && e.note ? e.note : undefined,
+    });
+  }
+  return out;
+}
+
+/**
+ * The deck's verbs for ONE item, read from what the server SERVED it (#102 1b-ii).
+ *
+ * THE ONE SEAM. This replaces the hand-written per-kind `DECK_VERBS` map, whose
+ * own comment conceded the coupling it could not enforce ("these action_ids MUST
+ * be members of the B1 transport FEED_ACTIONS map for the kind"). A mirror
+ * maintained by vigilance drifts the day either side is edited, silently and in
+ * both directions: a verb the client offers that the ceiling refuses 400s in the
+ * operator's hand, and a verb the ceiling gains that the client never shows is a
+ * capability nobody can reach. The client no longer holds an opinion about which
+ * verbs exist — it renders the answer.
+ *
+ * GESTURE-DRIVEN, and this is the load-bearing part. The deck is a two-way swipe
+ * surface; a served verb becomes a swipe verb ONLY by carrying a `gesture`. That
+ * is not a shortcut, it is the contract: `ACTION_META` gives `slot_suggestion`
+ * exactly one presentation entry (`accept`), and its other seven ceiling verbs
+ * (done, undo_done, the four snoozes, unsnooze) ship with raw-id labels and NO
+ * gesture BY DESIGN, because they belong to the board and the hold menu rather
+ * than to a swipe. Mapping by position or by name instead would hand the deck
+ * five-to-seven verbs on a surface that renders one.
+ *
+ * Returns null when the item was served no gesture-bearing verb at all — an FYI
+ * kind, a kind the ceiling does not know, or a degraded payload. Null means "no
+ * swipe verbs", which is what the old unmapped-kind answer meant, so every
+ * `verbs?.` consumer keeps its existing behaviour.
+ */
+export function verbsFromActions(item: FeedItem): DeckVerbs | null {
+  const served = servedActions(item);
+  const affirm = served.find((a) => a.gesture === GESTURE_AFFIRM);
+  const reject = served.find((a) => a.gesture === GESTURE_REJECT);
+  if (!affirm && !reject) return null;
+  // PRESENTATIONAL, client-side, and it cannot come from the wire: there is no
+  // ceiling verb for it. A slot's LEFT gesture is a session-local set-aside that
+  // POSTs nothing (slots v1 have no backend decline path), so no `FEED_ACTIONS`
+  // entry could ever describe it. Deliberately NOT borrowed from the snooze
+  // verb either — the #14 ruling is explicit that no one control may mean both
+  // *not this one* and *yes, but later*.
+  const rejectDefers = item.kind === SLOT_KIND && !reject;
+  return {
+    affirm: affirm?.verb ?? null,
+    reject: reject?.verb ?? null,
+    affirmLabel: affirm?.label ?? '',
+    rejectLabel: reject?.label ?? (rejectDefers ? 'Skip' : ''),
+    affirmWeight: affirm?.weight ?? 'light',
+    rejectWeight: reject?.weight ?? 'light',
+    affirmArmNote: affirm?.note,
+    rejectArmNote: reject?.note,
+    ...(rejectDefers ? { rejectDefers: true } : {}),
+  };
+}
+
+/**
+ * The weight of ONE direction — the predicate the deck arms on.
+ *
+ * Takes the item's DERIVED verbs (`verbsFromActions`) rather than its kind: the
+ * weight is now a per-verb fact carried on the wire, and two items of one kind
+ * can legitimately be served different verbs.
+ *
+ * No verbs, or a direction with no verb, answers 'light': there is nothing to
+ * arm, and returning 'heavy' would put a confirm stage in front of a gesture
  * that does nothing at all.
  *
  * `snooze` / `skip` are always light. A defer is reversible by construction (the
  * card comes back), so arming it would spend a tap to protect nothing.
  */
-export function verbWeightFor(kind: string, verdict: Verdict): VerbWeight {
-  const verbs = deckVerbsFor(kind);
+export function verbWeightFor(verbs: DeckVerbs | null, verdict: Verdict): VerbWeight {
   if (!verbs) return 'light';
   if (verdict === 'affirm') return verbs.affirm === null ? 'light' : verbs.affirmWeight;
   if (verdict === 'reject') {
@@ -215,9 +286,9 @@ export function verbWeightFor(kind: string, verdict: Verdict): VerbWeight {
   return 'light';
 }
 
-/** Whether this direction on this kind must ARM rather than commit (D4). */
-export function isHeavyVerb(kind: string, verdict: Verdict): boolean {
-  return verbWeightFor(kind, verdict) === 'heavy';
+/** Whether this direction must ARM rather than commit (D4). */
+export function isHeavyVerb(verbs: DeckVerbs | null, verdict: Verdict): boolean {
+  return verbWeightFor(verbs, verdict) === 'heavy';
 }
 
 /**
@@ -228,17 +299,15 @@ export function isHeavyVerb(kind: string, verdict: Verdict): boolean {
  * with a generic "this writes a record": a heavy verb whose consequence nobody
  * wrote down should read as missing, not as reassuring.
  */
-export function armNoteFor(kind: string, verdict: Verdict): string | null {
-  if (!isHeavyVerb(kind, verdict)) return null;
-  const verbs = deckVerbsFor(kind);
+export function armNoteFor(verbs: DeckVerbs | null, verdict: Verdict): string | null {
+  if (!isHeavyVerb(verbs, verdict)) return null;
   if (!verbs) return null;
   const note = verdict === 'affirm' ? verbs.affirmArmNote : verbs.rejectArmNote;
   return note ?? null;
 }
 
 /** The label of one direction — what the arm stage's commit button says. */
-export function verbLabelFor(kind: string, verdict: Verdict): string {
-  const verbs = deckVerbsFor(kind);
+export function verbLabelFor(verbs: DeckVerbs | null, verdict: Verdict): string {
   if (!verbs) return '';
   return verdict === 'affirm' ? verbs.affirmLabel : verbs.rejectLabel;
 }
@@ -253,8 +322,19 @@ export function verbLabelFor(kind: string, verdict: Verdict): string {
  * feed row / rings panel worklist) — same item, two surfaces.
  */
 export function isDeckDealt(item: FeedItem): boolean {
-  if (item.kind === 'slot_suggestion') return ringItemSuggested(item);
-  return deckVerbsFor(item.kind) !== null;
+  // Slots keep a LIFECYCLE clause, and it CANNOT come from the wire.
+  //
+  // Dealing a slot is a question about its STAGE, not its verbs: only a
+  // SUGGESTED candidate is a card, while planned and done slots are worklist /
+  // glance items. `ringItemStage` answers that from `state` + `acted_action` +
+  // `evidence.candidate`, and the served verb list cannot substitute for it —
+  // an ACTED slot still carries `candidate: true` in its evidence (accept means
+  // committed, not un-candidate), and a COMMITTED one still legitimately
+  // advertises done / undo_done / the snoozes. Either would deal as a card on a
+  // verbs-are-non-empty test. The verb list narrows what a slot may DO; the
+  // stage decides whether it is a card at all.
+  if (item.kind === SLOT_KIND) return ringItemSuggested(item) && verbsFromActions(item) !== null;
+  return verbsFromActions(item) !== null;
 }
 
 // --- email-tier priority (on-face tier badge + dynamic affirm label) ----------
@@ -278,16 +358,22 @@ export function emailPriority(item: FeedItem): EmailPriority | null {
 }
 
 /**
- * The affirm verb label for an item, WITH per-item context — a kind-generic hook
- * over the static DECK_VERBS label. email_tier appends its assigned tier
- * ("Confirm HIGH"); every other kind returns its static label unchanged. Null
- * when the kind has no affirm action.
+ * The affirm verb label for an item, WITH per-item context — a hook over the
+ * SERVED label. email_tier appends its assigned tier ("Confirm HIGH"); every
+ * other kind returns the served label unchanged. Null when the item has no
+ * affirm verb.
+ *
+ * PRESENTATIONAL-ONLY, and stays client-side on purpose: the served label is a
+ * per-KIND string, while the suffix here is a fact about THIS item's evidence
+ * (its classifier tier, its ring tier). Pushing it onto the wire would mean the
+ * server rendering operator-facing copy per item — a different contract from the
+ * one §4 describes.
  */
 export function affirmLabelFor(item: FeedItem): string | null {
-  const verbs = deckVerbsFor(item.kind);
+  const verbs = verbsFromActions(item);
   if (!verbs || verbs.affirm === null) return null;
   // A slot candidate's Accept carries its tier on the face — "Take it — T2".
-  if (item.kind === 'slot_suggestion') {
+  if (item.kind === SLOT_KIND) {
     const t = ringTierOf(item);
     return t ? `${verbs.affirmLabel} — T${t}` : verbs.affirmLabel;
   }

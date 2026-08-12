@@ -1,6 +1,6 @@
 import { forwardRef } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { affirmLabelFor, armNoteFor, deckVerbsFor, emailPriority, isHeavyVerb, kindLabel, verbLabelFor, type EmailPriority } from '../../lib/algernon/feedConstants';
+import { affirmLabelFor, armNoteFor, emailPriority, isHeavyVerb, kindLabel, verbLabelFor, verbsFromActions, type EmailPriority } from '../../lib/algernon/feedConstants';
 import {
   CONSOLE_LABEL,
   ROLE_TEXT_CLASS,
@@ -71,13 +71,13 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
   { item, depth, expanded, confirming, confirmingVerdict = 'affirm', onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen },
   ref,
 ) {
-  const verbs = deckVerbsFor(item.kind);
+  const verbs = verbsFromActions(item);
   // PER-DIRECTION. A card is no longer heavy or light as a whole: an attribution
   // confirm is light and its reject is heavy, and a badge that averaged the two
   // would be wrong in both directions at once.
-  const affirmHeavy = isHeavyVerb(item.kind, 'affirm');
-  const rejectHeavy = isHeavyVerb(item.kind, 'reject');
-  const armNote = armNoteFor(item.kind, confirmingVerdict ?? 'affirm');
+  const affirmHeavy = isHeavyVerb(verbs, 'affirm');
+  const rejectHeavy = isHeavyVerb(verbs, 'reject');
+  const armNote = armNoteFor(verbs, confirmingVerdict ?? 'affirm');
   const rows = evidenceRows(item.evidence);
   // Email-tier decisions carry their assigned tier on the FACE (no blind confirm):
   // a role-coded badge + a dynamic affirm label ("Confirm HIGH"). Absent/spam →
@@ -321,7 +321,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
               "Write this to the vault?" for every heavy verb, which is not what
               an attribution REJECT does — it removes text. A verb whose
               consequence is stated wrongly is worse than one stated vaguely. */}
-          <p className={CONSOLE_LABEL}>{verbLabelFor(item.kind, confirmingVerdict ?? 'affirm')} this?</p>
+          <p className={CONSOLE_LABEL}>{verbLabelFor(verbs, confirmingVerdict ?? 'affirm')} this?</p>
           <p className="text-base font-bold text-console-ink">{item.title || item.id}</p>
           {armNote ? (
             <p data-testid="deck-confirm-note" className={`text-xs font-semibold ${ROLE_TEXT_CLASS[armRole]}`}>
@@ -343,7 +343,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
               }`}
               onClick={onConfirmHeavy}
             >
-              {verbLabelFor(item.kind, confirmingVerdict ?? 'affirm') || 'Confirm'}
+              {verbLabelFor(verbs, confirmingVerdict ?? 'affirm') || 'Confirm'}
             </button>
             <button
               type="button"

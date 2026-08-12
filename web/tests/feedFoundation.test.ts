@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// Pins the DOM-free feed foundation: swipe geometry, per-kind deck verbs, kind
+// Pins the DOM-free feed foundation: swipe geometry, the WIRE-DERIVED deck verbs, kind
 // labels, defensive evidence flattening, and the browser feed client's request
 // shaping. These are the contracts the deck + feed pages build on.
 
 import {
-  DECK_VERBS,
+  armNoteFor,
   isHeavyVerb,
   SNOOZE_Y_THRESHOLD,
   SWIPE_X_THRESHOLD,
   affirmLabelFor,
-  deckVerbsFor,
+  verbsFromActions,
   emailPriority,
   isDeckDealt,
   kindLabel,
@@ -20,6 +20,7 @@ import {
 } from '../lib/algernon/feedConstants';
 import { coerceEvidenceValue, evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows, isEmailEvidence } from '../lib/algernon/feedEvidence';
 import type { FeedItem } from '../lib/algernon/feed';
+import { servedActionsForItem } from './helpers/servedActions';
 
 function feedItem(kind: string, evidence: Record<string, unknown>): FeedItem {
   return {
@@ -30,7 +31,8 @@ function feedItem(kind: string, evidence: Record<string, unknown>): FeedItem {
     mode: 'decide',
     attention: 'needs_you',
     evidence,
-    actions: [],
+    // Served verbs, not an empty list — see tests/helpers/servedActions.ts.
+    actions: servedActionsForItem(kind, evidence),
     state: 'open',
     created_at: '2026-07-31T00:00:00Z',
     acted_at: null,
@@ -192,53 +194,85 @@ describe('stampOpacity', () => {
   });
 });
 
-describe('deck verbs', () => {
+describe('deck verbs — READ FROM THE WIRE, not from a client table (#102 1b-ii)', () => {
+  // These asserted a hand-written `DECK_VERBS` map. The map is gone: the deck
+  // now derives its verbs from the `actions[]` the server stamps, so the same
+  // claims are made against the SERVED payload. The fixture those items carry is
+  // generated from `actions_for()` and pinned against it in
+  // tests/feed/test_feed_advertised_actions.py, so these read the real wire shape.
+  const verbsOf = (kind: string, evidence: Record<string, unknown> = {}) =>
+    verbsFromActions(feedItem(kind, evidence));
+
   it('maps each decide family to action_ids within its B1 capability', () => {
-    expect(DECK_VERBS.email_tier.affirm).toBe('confirm');
-    expect(DECK_VERBS.email_tier.reject).toBe('spam');
-    expect(DECK_VERBS.pending.reject).toBeNull(); // pending has no reject
-    expect(DECK_VERBS.pending.affirm).toBe('noted');
+    expect(verbsOf('email_tier')?.affirm).toBe('confirm');
+    expect(verbsOf('email_tier')?.reject).toBe('spam');
+    expect(verbsOf('pending')?.reject).toBeNull(); // pending has no reject
+    expect(verbsOf('pending')?.affirm).toBe('noted');
   });
   it('weights the MUTATION-BEARING verb heavy, per direction (§3 catalog)', () => {
     // Was a per-KIND boolean. The catalog has always been per-verb, and the two
-    // directions of one card are different transactions.
-    expect(DECK_VERBS.proposal.affirmWeight).toBe('heavy');
-    expect(DECK_VERBS.recurrence.affirmWeight).toBe('heavy');
-    expect(DECK_VERBS.email_tier.affirmWeight).toBe('light');
-    // The reject halves of proposal/recurrence record a correction and write no
-    // record — light per §3, where the whole KIND used to be heavy.
-    expect(DECK_VERBS.proposal.rejectWeight).toBe('light');
-    expect(DECK_VERBS.recurrence.rejectWeight).toBe('light');
+    // directions of one card are different transactions. The weight now arrives
+    // ON THE WIRE, per verb, so the client cannot disagree with the catalog.
+    expect(verbsOf('proposal')?.affirmWeight).toBe('heavy');
+    expect(verbsOf('email_tier')?.affirmWeight).toBe('light');
+    // The reject half of proposal records a correction and writes no record —
+    // light per §3, where the whole KIND used to be heavy.
+    expect(verbsOf('proposal')?.rejectWeight).toBe('light');
   });
   it('ATTRIBUTION: confirm light, reject HEAVY — the asymmetry a kind flag could not hold', () => {
     // The reject strips the marked section out of the record body
     // (`vault/attribution.py::reject_marker`). It shipped as a light verb and
     // committed on a single left swipe.
-    expect(DECK_VERBS.attribution.affirmWeight).toBe('light');
-    expect(DECK_VERBS.attribution.rejectWeight).toBe('heavy');
-    expect(isHeavyVerb('attribution', 'reject')).toBe(true);
-    expect(isHeavyVerb('attribution', 'affirm')).toBe(false);
+    const v = verbsOf('attribution');
+    expect(v?.affirmWeight).toBe('light');
+    expect(v?.rejectWeight).toBe('heavy');
+    expect(isHeavyVerb(v, 'reject')).toBe(true);
+    expect(isHeavyVerb(v, 'affirm')).toBe(false);
+    // The consequence sentence travels with the verb now, rather than being
+    // transcribed into a client constant beside it.
+    expect(armNoteFor(v, 'reject')).toContain('Removes the marked section');
   });
-  it('returns null for an unmapped kind (snooze-only)', () => {
-    expect(deckVerbsFor('weather')).toBeNull();
-    expect(deckVerbsFor('email_tier')).not.toBeNull();
+  it('returns null for a kind the CEILING does not serve (snooze-only)', () => {
+    expect(verbsOf('weather')).toBeNull();
+    expect(verbsOf('email_tier')).not.toBeNull();
+  });
+  it('RECURRENCE is no longer offered — the latent misfire the old table carried', () => {
+    // The deleted `DECK_VERBS` had a `recurrence` entry with a heavy "Promote",
+    // while `FEED_ACTIONS` has no `recurrence` key at all: the client offered a
+    // verb the router would refuse. Latent only because no producer builds one
+    // today. Deriving from the wire closes it — a recurrence item arrives with
+    // no verbs and is simply not dealt.
+    expect(verbsOf('recurrence')).toBeNull();
+    expect(isDeckDealt(feedItem('recurrence', {}))).toBe(false);
+  });
+  it('a verb with NO GESTURE is not a swipe verb (the mapping rule)', () => {
+    // pending serves `show` and four defer rungs besides `noted`; only the
+    // gesture-bearing ones become swipe verbs. A mapping by position or by name
+    // would hand the deck six verbs on a two-way surface.
+    const v = verbsOf('pending');
+    expect(v?.affirm).toBe('noted');
+    expect(v?.reject).toBeNull();
   });
 });
 
 describe('swipeActsFor — no-op swipe springs back (#16 item 12)', () => {
+  const verbsOf = (kind: string, evidence: Record<string, unknown> = {}) =>
+    verbsFromActions(feedItem(kind, evidence));
+  const slotCandidate = () => verbsOf('slot_suggestion', { tier: 1, candidate: true });
+
   it('an ACK-only kind reject is a NO-OP (email_urgent/pending → spring back)', () => {
-    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'reject')).toBe(false);
-    expect(swipeActsFor(deckVerbsFor('pending'), 'reject')).toBe(false);
+    expect(swipeActsFor(verbsOf('email_urgent'), 'reject')).toBe(false);
+    expect(swipeActsFor(verbsOf('pending'), 'reject')).toBe(false);
   });
   it('a real reject acts (email_tier spam, slot rejectDefers)', () => {
-    expect(swipeActsFor(deckVerbsFor('email_tier'), 'reject')).toBe(true);
-    expect(swipeActsFor(deckVerbsFor('slot_suggestion'), 'reject')).toBe(true); // rejectDefers routes to snooze
+    expect(swipeActsFor(verbsOf('email_tier'), 'reject')).toBe(true);
+    expect(swipeActsFor(slotCandidate(), 'reject')).toBe(true); // rejectDefers routes to skip
   });
-  it('affirm acts when the kind has an affirm; snooze always acts; null verdict never', () => {
-    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'affirm')).toBe(true); // ack
-    expect(swipeActsFor(deckVerbsFor('email_urgent'), 'snooze')).toBe(true);
+  it('affirm acts when the item has an affirm; snooze always acts; null verdict never', () => {
+    expect(swipeActsFor(verbsOf('email_urgent'), 'affirm')).toBe(true); // ack
+    expect(swipeActsFor(verbsOf('email_urgent'), 'snooze')).toBe(true);
     expect(swipeActsFor(null, 'affirm')).toBe(false);
-    expect(swipeActsFor(deckVerbsFor('email_tier'), null)).toBe(false);
+    expect(swipeActsFor(verbsOf('email_tier'), null)).toBe(false);
   });
 });
 
@@ -250,7 +284,7 @@ describe('email_urgent — the interrupt kind deals + acks (#27)', () => {
     expect(isDeckDealt(urgent())).toBe(true);
   });
   it('is ACK-only: affirm "ack", no reject (re-tier stays on the calibration card)', () => {
-    const v = deckVerbsFor('email_urgent');
+    const v = verbsFromActions(urgent());
     expect(v?.affirm).toBe('ack');
     expect(v?.reject).toBeNull();
     expect(v?.affirmWeight).toBe('light');

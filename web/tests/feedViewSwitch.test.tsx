@@ -26,6 +26,7 @@ vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
 
 import FeedPage from '../pages/feed';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 const pad = (n: number) => String(Math.abs(Math.trunc(n))).padStart(2, '0');
 function localIso(y: number, mo: number, d: number, h: number, mi = 0): string {
@@ -41,7 +42,7 @@ function fromNow(hours: number): string {
 }
 
 function item(over: Partial<FeedItem> & { id: string }): FeedItem {
-  return {
+  return withServedActions({
     kind: 'radar',
     instance: 'salem',
     title: `title ${over.id}`,
@@ -57,7 +58,7 @@ function item(over: Partial<FeedItem> & { id: string }): FeedItem {
     ends_at: null,
     source_ref: {},
     ...over,
-  };
+  });
 }
 
 const timedFyi = item({ id: 'radar1', starts_at: fromNow(2) });

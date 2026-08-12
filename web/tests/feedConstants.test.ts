@@ -7,13 +7,14 @@ import {
   SNOOZE_Y_THRESHOLD,
   STAMP_FADE_START,
   affirmLabelFor,
-  deckVerbsFor,
+  verbsFromActions,
   inSnoozeHoldBand,
   isDeckDealt,
   snoozeActionFor,
   snoozeIsBacked,
 } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
+import { servedActionsForItem } from './helpers/servedActions';
 
 // The C2 deck routing predicate + slot verbs. isDeckDealt is the ONE predicate the
 // deck's dealing AND the deck-link count both use (team-lead ruling) — pinned here
@@ -28,7 +29,9 @@ function feedItem(kind: string, evidence: Record<string, unknown> = {}, over: Pa
     mode: 'decide',
     attention: 'needs_you',
     evidence,
-    actions: [],
+    // Fixtures carry the verbs the SERVER would have served for this kind +
+    // stage — an item with `actions: []` is a DEGRADED payload, not a neutral one.
+    actions: servedActionsForItem(kind, evidence),
     state: 'open',
     created_at: '2026-07-22T00:00:00Z',
     acted_at: null,
@@ -58,17 +61,37 @@ describe('isDeckDealt — the ONE deck dealing/count predicate', () => {
   });
 });
 
-describe('DECK_VERBS.slot_suggestion — Accept / Skip=snooze', () => {
-  it('affirm accepts; reject is null but rejectDefers routes LEFT to a client snooze', () => {
-    const v = deckVerbsFor('slot_suggestion');
+describe('slot verbs, READ FROM THE WIRE — Accept / Skip (#102 1b-ii)', () => {
+  it('affirm accepts; reject is null but rejectDefers routes LEFT to a client skip', () => {
+    const v = verbsFromActions(feedItem('slot_suggestion', { tier: 1, candidate: true }));
     expect(v?.affirm).toBe('accept');
     expect(v?.reject).toBeNull();
     expect(v?.rejectDefers).toBe(true);
     expect(v?.rejectLabel).toBe('Skip');
   });
 
+  it('a COMMITTED slot is offered NO swipe verb — the server withheld its accept', () => {
+    // The per-item narrowing, seen from the client end: `actions_for_item` drops
+    // `accept` for a non-candidate, and the slot's other seven ceiling verbs
+    // (done / undo_done / the snoozes) carry no gesture, so nothing is left to
+    // swipe. This is why `isDeckDealt` can stop dealing it without the client
+    // knowing anything about slot lifecycle rules beyond its stage.
+    expect(verbsFromActions(feedItem('slot_suggestion', { tier: 1 }))).toBeNull();
+  });
+
   it('affirmLabelFor a slot candidate carries the tier — "Take it — T2"', () => {
     expect(affirmLabelFor(feedItem('slot_suggestion', { tier: 2, candidate: true }))).toBe('Take it — T2');
+  });
+
+  it('a DEGRADED payload (no actions at all) yields no verbs and no card', () => {
+    // Half-deployed box: a client that reads verbs from the wire against a
+    // backend that does not yet stamp them. The honest answer is no swipe verbs
+    // — never a guessed one, which is what a client-side fallback table would
+    // have supplied. The item still exists and still lists in the feed; only the
+    // gesture surface declines to invent controls for it.
+    const undealt = feedItem('email_tier', {}, { actions: [] });
+    expect(verbsFromActions(undealt)).toBeNull();
+    expect(isDeckDealt(undealt)).toBe(false);
   });
 });
 

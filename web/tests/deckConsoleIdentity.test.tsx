@@ -18,9 +18,10 @@ import { Deck } from '../components/feed/Deck';
 import { DeckCard } from '../components/feed/DeckCard';
 import { instanceAccentClass } from '../lib/algernon/consoleTokens';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function item(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'email_tier:note/A.md',
     kind: 'email_tier',
     instance: 'salem',
@@ -35,7 +36,7 @@ function item(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 function card(overrides: Partial<FeedItem> = {}) {
@@ -103,7 +104,7 @@ describe('the gesture axis is legible mid-drag (D3)', () => {
     // A slot candidate's left gesture SKIPS (a session set-aside, no POST); it
     // is not a rejection, and drawing it as one would report a card that is
     // coming back as one that was turned down.
-    render(<Deck items={[item({ kind: 'slot_suggestion', evidence: { status: 'suggested', tier: 2 } })]} />);
+    render(<Deck items={[item({ kind: 'slot_suggestion', evidence: { status: 'suggested', tier: 2, candidate: true } })]} />);
     const reject = screen.getByTestId('deck-btn-reject').className;
     expect(reject).toContain('text-caution');
     expect(reject).not.toContain('text-negative');
@@ -224,7 +225,10 @@ describe('the workstation posture', () => {
     const items = [
       item({ id: 'a' }),
       item({ id: 'b', kind: 'proposal' }),
-      item({ id: 'c', kind: 'recurrence' }),
+      // Was `recurrence` — a kind the client used to offer a heavy verb for and
+      // the ceiling never admitted (#102 1b-ii retired that entry). Attribution
+      // is a REAL heavy card: its reject strips a section out of a record.
+      item({ id: 'c', kind: 'attribution' }),
     ];
     render(<Deck items={items} />);
     expect(screen.getByTestId('deck-queue-heavy').textContent).toContain('2');
