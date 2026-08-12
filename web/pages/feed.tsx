@@ -419,7 +419,11 @@ export default function FeedPage() {
               "back at the next sync"      false for B — the bug this replaced
               "until you bring them back"  false for A — it returns unaided
               "you can bring them back"    false for A — no un-hide control here
-              "they'll come back"          TRUE for every member
+              "they'll come back"          TRUE for every member — but the
+                                           indefinite rung returns by
+                                           breakthrough or unsnooze, NOT by
+                                           timer, which is why the line may
+                                           assert return and nothing more
               "set aside" / nothing lost   TRUE for every member
 
             THE RULE THAT FALLS OUT: ASSERT RETURN, NEVER TIMING AND NEVER

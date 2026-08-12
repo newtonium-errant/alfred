@@ -152,26 +152,40 @@ export const UNSLOTTED_LABEL = 'Not sorted yet';
  * into the drill — so an empty stack can never be the record of something left
  * undone.
  *
- * THE SNOOZE PATH, WALKED (an earlier revision of this paragraph named the wrong
- * branch, in the file this pass calls its constitution, so it is spelled out):
+ * THE TWO DEFER VERBS — WALK BOTH OR NEITHER. This paragraph has now been wrong
+ * in both directions, because the verb space has two families and each revision
+ * followed one of them and stopped. `daily_sync/action_router.py` states the
+ * split itself and calls it "load-bearing rather than cosmetic":
  *
- *   - A snooze does NOT travel the `acted_at` route. `FeedStore.defer`
- *     (`feed/store.py`) writes `state=deferred` — never `acted`, and it never
- *     touches `acted_at`. So `ringItemVisibleToday` falls past both of its
- *     branches and drops the item at its FINAL unconditional `return false`,
- *     the one that catches every state that is neither `open` nor `acted`.
- *   - That gate is the WHOLE of the exclusion on this surface. Home fetches
- *     `feedApi.list({})` with NO state filter, on purpose (the rings need
- *     today's done items), so a deferred item IS delivered to the board and is
- *     filtered here rather than at the wire. The `state: 'open'` fetch belongs
- *     to the FEED page — do not borrow its reasoning for this one.
+ *   snooze_*  BOARD SLOTS — this surface's entire snoozable population.
+ *             Writes the tier.snooze SIDECAR (`tier/snooze.py`) and marks the
+ *             feed item ACTED: `feed_store.set_state(id, STATE_ACTED,
+ *             action=SNOOZE_ACTED_VERB)`. No feed-store defer, no vault write.
+ *   defer_*   Every decide kind that is NOT a board slot — NOT this surface.
+ *             `FeedStore.defer` writes the FEED STORE, state DEFERRED, with a
+ *             return window.
  *
- * The consequence the copy rests on: a snoozed item leaves the board on the NEXT
- * POLL, the SAME day — not the following one. So "today" in these lines is
- * guaranteed by RUNG LENGTH alone: the shortest rung is `snooze_1d`, so no timer
- * can return an item on the day it left. A sub-day rung would break that and
- * these lines would need re-checking. (An urgency breakthrough can return one
- * early — at which point the stack is no longer empty and none of these render.)
+ * Different store, different state, different return mechanism; the ids are kept
+ * distinct on purpose so the two can never be conflated. `slot_suggestion`
+ * travels `snooze_*` ONLY — `snoozeActionFor` gates on `SNOOZE_CAPABLE_KINDS`,
+ * and `useDeck.snooze` defaults to `SNOOZE_INDEFINITE_ACTION` — so on THIS board
+ * the `deferred` branch is UNREACHABLE. Reasoning from `FeedStore.defer` here is
+ * the right function for the wrong verb, and describes a different population.
+ *
+ * What that buys these lines. A snoozed slot item is ACTED with `acted_at` = now,
+ * so `ringItemVisibleToday` takes its `acted` branch and the item is STILL ON THE
+ * BOARD for the rest of that day, dropping the following day once `acted_at` is
+ * no longer today. So a snooze CANNOT empty a stack on the day it is made — and
+ * rung length is the second belt, the shortest being `snooze_1d`, so no timer
+ * returns an item within the day it left either. A sub-day rung would break the
+ * second belt and these lines would need re-checking. (An urgency breakthrough
+ * can return one early; the stack is then non-empty and none of these render.)
+ *
+ * One surface fact that composes with all of the above and is easy to assume
+ * wrong in the other direction: home fetches `feedApi.list({})` with NO state
+ * filter, deliberately, because the rings need today's done items. Every state
+ * reaches the board and `ringItemVisibleToday` is the entire gate. The
+ * `state: 'open'` fetch belongs to the FEED page — don't borrow its reasoning.
  */
 export const SLOT_EMPTY_COPY: Record<string, string> = {
   duty: 'Nothing owed today.',
