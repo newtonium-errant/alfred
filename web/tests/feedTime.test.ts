@@ -5,9 +5,8 @@ import {
   WINDOW_PAST_MS,
   byTimeOrder,
   extentEnd,
+  classifyFeedTime,
   formatClock,
-  formatDuration,
-  formatExtent,
   hourTicks,
   isTimed,
   itemExtent,
@@ -189,6 +188,18 @@ describe('weatherPeriods — the maybe-window keeps its own register', () => {
 describe('splitByWindow — three registers, nothing dropped', () => {
   const now = localMs(2026, 8, 12, 10);
 
+  it('routes an all-day item to its own register, not to untimed', () => {
+    // The imprecision this closes: both used to land in `untimed`, telling the
+    // operator the same thing about "has a date but no hour" and "has no time".
+    const split = splitByWindow(
+      [timed('allday', '2026-08-12'), timed('nothing', null), timed('at-nine', localIso(2026, 8, 12, 9))],
+      now,
+    );
+    expect(split.allDay.map((i) => i.id)).toEqual(['allday']);
+    expect(split.untimed.map((i) => i.id)).toEqual(['nothing']);
+    expect(split.onBand.map((i) => i.id)).toEqual(['at-nine']);
+  });
+
   it('sorts timed-and-reachable, timed-but-far, and untimed apart', () => {
     const split = splitByWindow(
       [
@@ -203,7 +214,7 @@ describe('splitByWindow — three registers, nothing dropped', () => {
     expect(split.beyond.map((i) => i.id).sort()).toEqual(['far', 'stale']);
     expect(split.untimed.map((i) => i.id)).toEqual(['untimed']);
     // Nothing is silently discarded — every input lands in exactly one register.
-    expect(split.onBand.length + split.beyond.length + split.untimed.length).toBe(4);
+    expect(split.onBand.length + split.beyond.length + split.allDay.length + split.untimed.length).toBe(4);
   });
 
   it('an interval that STARTED before the window but is still running stays on the band', () => {
@@ -227,7 +238,7 @@ describe('splitByWindow — three registers, nothing dropped', () => {
   });
 
   it('an empty feed yields three empty registers, not a throw', () => {
-    expect(splitByWindow([], now)).toEqual({ onBand: [], beyond: [], untimed: [] });
+    expect(splitByWindow([], now)).toEqual({ onBand: [], beyond: [], allDay: [], untimed: [] });
   });
 });
 
@@ -323,21 +334,29 @@ describe('hourTicks', () => {
   });
 });
 
-describe('formatting', () => {
-  it('a moment reads as one clock time; an interval reads as a span', () => {
-    expect(formatExtent({ start: localMs(2026, 8, 12, 9, 30), end: null })).toBe('09:30');
-    expect(formatExtent({ start: localMs(2026, 8, 12, 11), end: localMs(2026, 8, 12, 15) })).toBe('11:00 – 15:00');
+describe('classifyFeedTime — all-day is not the same fact as untimed', () => {
+  it('separates the three ways an item can relate to a day axis', () => {
+    // positionable: a real clock position.
+    expect(classifyFeedTime({ starts_at: localIso(2026, 8, 12, 9, 30), ends_at: null })).toBe('positionable');
+    expect(classifyFeedTime({ starts_at: localIso(2026, 8, 12, 11), ends_at: localIso(2026, 8, 12, 15) })).toBe('positionable');
+    // all_day: a DATE, no hour. This is the case that used to read as untimed.
+    expect(classifyFeedTime({ starts_at: '2026-08-12', ends_at: null })).toBe('all_day');
+    // timeless: no time dimension at all.
+    expect(classifyFeedTime({ starts_at: null, ends_at: null })).toBe('timeless');
   });
 
-  it('a span crossing midnight says so, instead of reading as a trip backwards', () => {
-    expect(formatExtent({ start: localMs(2026, 8, 12, 18), end: localMs(2026, 8, 13, 6) })).toBe('18:00 – 06:00 +1d');
+  it('an unreadable time cannot be positioned, so it reads as timeless', () => {
+    // The axis has nothing to place. The item is not swallowed — it renders in
+    // the untimed register, and the shared formatter has its own label for it.
+    expect(classifyFeedTime({ starts_at: 'not-a-time', ends_at: null })).toBe('timeless');
   });
 
-  it('durations are compact, and a moment has none', () => {
-    expect(formatDuration({ start: localMs(2026, 8, 12, 11), end: localMs(2026, 8, 12, 15) })).toBe('4h');
-    expect(formatDuration({ start: localMs(2026, 8, 12, 11), end: localMs(2026, 8, 12, 11, 45) })).toBe('45m');
-    expect(formatDuration({ start: localMs(2026, 8, 12, 11), end: localMs(2026, 8, 12, 12, 30) })).toBe('1h 30m');
-    expect(formatDuration({ start: localMs(2026, 8, 12, 11), end: null })).toBeNull();
+  it('the discrimination is made on the STRING, never after parsing', () => {
+    // `new Date("2026-08-12")` succeeds and invents midnight UTC, so a classifier
+    // that parsed first would call this an instant and place it at 00:00 — the
+    // exact fabrication the register split exists to prevent.
+    expect(new Date('2026-08-12').getTime()).toBe(Date.UTC(2026, 7, 12));
+    expect(classifyFeedTime({ starts_at: '2026-08-12', ends_at: null })).not.toBe('positionable');
   });
 });
 

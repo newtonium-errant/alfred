@@ -203,4 +203,21 @@ describe('public/sw.js keeps /share in the offline shell', () => {
     expect(match).not.toBeNull();
     expect(match![1]).not.toBe('v1');
   });
+
+  it('the CURRENT cache version has a line in the per-version log', () => {
+    // The pin above is a FLOOR, not a check: it has been permanently satisfied
+    // since v2 and cannot fail for the reason it exists. That is why v3 shipped
+    // with no annotation at all and the gap was only caught later by reading.
+    //
+    // This is the invariant that can actually fail: whatever version the file
+    // declares, the log above it explains what changed in the shell. It fails on
+    // the NEXT bump that forgets its line, which is the recurrence rather than
+    // the instance.
+    const version = swSource.match(/const CACHE_VERSION = '([^']+)';/)![1];
+    const logged = [...swSource.matchAll(/^\/\/ (v\d+):/gm)].map((m) => m[1]);
+    // Positive control on the denominator: the log must really be a log. An
+    // empty scan would make the assertion below vacuously true.
+    expect(logged.length).toBeGreaterThanOrEqual(2);
+    expect(logged, `sw.js declares ${version} but the version log has no line for it`).toContain(version);
+  });
 });

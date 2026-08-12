@@ -1,13 +1,15 @@
 import { Fragment, type ReactNode, useMemo, useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
 import { kindLabel } from '../../lib/algernon/feedConstants';
+// Extent DISPLAY is the shared layer's, per the ruled ownership split: what an
+// extent says to a reader is one question with one answer across surfaces, while
+// where it sits on a day axis is feedTime's.
+import { formatTimeExtent, readTimeExtent } from '../../lib/algernon/timeExtent';
 import {
   type BandPlacement,
   type TimeWindow,
   byTimeOrder,
   formatClock,
-  formatDuration,
-  formatExtent,
   hourTicks,
   itemExtent,
   packLanes,
@@ -152,9 +154,57 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
           {formatClock(w.from)} → {formatClock(w.to)}
         </span>
         <span data-testid="timeline-counts" className="sensor-label ml-auto">
-          {split.onBand.length} on the band · {split.beyond.length} beyond · {split.untimed.length} untimed
+          {split.onBand.length} on the band · {split.allDay.length} all day · {split.beyond.length} beyond ·{' '}
+          {split.untimed.length} untimed
         </span>
       </header>
+
+      {split.allDay.length > 0 && (
+        // THE DAY-HEADER STRIP (ruled 2026-08-12). An all-day item renders as its
+        // real extent — the whole day — which is D7 at day granularity.
+        //
+        // A FULL-WIDTH STRIP, NOT A LANE OCCUPANT, and that is a measured
+        // decision rather than a layout preference: `packLanes` frees a lane only
+        // when its occupant's visual bottom clears the next item's top, so a
+        // day-spanning bar never frees one. Three all-day items would open three
+        // lanes and squeeze every clock-positioned trace to a quarter width. An
+        // all-day event is context FOR the day, not an event at an hour within
+        // it, so it belongs above the substrate rather than competing inside it.
+        <section data-testid="timeline-allday" className="mt-3">
+          <h3 className="sensor-label">All day</h3>
+          <ul className="mt-1 flex flex-wrap gap-1.5">
+            {split.allDay.map((item) => {
+              const shown = formatTimeExtent(readTimeExtent(item));
+              const selected = item.id === selectedId;
+              return (
+                <li key={item.id} className="min-w-0">
+                  <button
+                    type="button"
+                    data-testid="timeline-allday-item"
+                    data-kind={item.kind}
+                    aria-pressed={selected}
+                    onClick={() => setSelectedId(selected ? null : item.id)}
+                    className="flex w-full items-baseline gap-2 rounded-sm px-2 py-1 text-left"
+                    style={{
+                      borderLeft: '3px solid var(--sensor-environment-deep)',
+                      backgroundColor: 'var(--sensor-panel)',
+                      boxShadow: selected ? '0 0 0 1px var(--sensor-environment-deep)' : 'none',
+                    }}
+                  >
+                    <span className="sensor-num text-[10px]" style={{ color: 'var(--sensor-environment)' }}>
+                      {shown?.label}
+                    </span>
+                    <span className="truncate text-[11px]" style={{ color: 'var(--sensor-ink-dim)' }}>
+                      {item.title || item.id}
+                    </span>
+                    <span className="sensor-label shrink-0 text-[8px]">{kindLabel(item.kind)}</span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
 
       {traces.length === 0 ? (
         // Intentionally-left-blank: an empty band is a REPORT, not a blank. The
@@ -164,8 +214,8 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
         // "nothing here knows when it happens".
         <p data-testid="timeline-empty" className="mt-3 text-sm" style={{ color: 'var(--sensor-ink-dim)' }}>
           Nothing on the band in this window
-          {split.untimed.length + split.beyond.length > 0
-            ? ' — every item the feed is holding sits in the registers below.'
+          {split.untimed.length + split.beyond.length + split.allDay.length > 0
+            ? ' — every item the feed is holding sits in the registers around it.'
             : '. The feed is empty too.'}
         </p>
       ) : (
@@ -207,6 +257,9 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
             {traces.map(({ item, placement, lane }) => {
               const extent = itemExtent(item)!;
               const moment = extent.end === null;
+              // One formatter for the label AND the duration chip, so a trace can
+              // never show a span whose duration disagrees with it.
+              const shown = formatTimeExtent(readTimeExtent(item));
               const tone = TONE_STYLE[traceTone(item)];
               const isSelected = item.id === selectedId;
               return (
@@ -239,11 +292,11 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
                   {item.kind === 'weather' && <WeatherPeriods item={item} window={w} />}
                   <span className="relative flex items-baseline gap-1.5">
                     <span className="sensor-num text-[10px]" style={{ color: tone.text }}>
-                      {formatExtent(extent)}
+                      {shown?.label}
                     </span>
-                    {!moment && (
+                    {shown?.duration && (
                       <span data-testid="timeline-duration" className="sensor-label text-[8.5px]">
-                        {formatDuration(extent)}
+                        {shown.duration}
                       </span>
                     )}
                   </span>
@@ -305,7 +358,7 @@ export function TimelineView({ items, now, renderDetail }: TimelineViewProps) {
           // The sketch's own stated weakness, answered rather than inherited:
           // "genuinely untimed items must be given a time they do not really
           // have." They are not. They are reported as untimed.
-          note="No time dimension — listed here rather than placed at an hour they don't have."
+          note="No time dimension at all — not merely no clock position (an all-day item has a date, and rides the strip above)."
           items={split.untimed}
           renderDetail={renderDetail}
         />

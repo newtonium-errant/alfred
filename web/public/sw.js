@@ -18,7 +18,10 @@
 
 // Bump this to invalidate the whole shell cache and force a clean roll-out.
 // v2: added /share to the shell (Web Share Target handler).
-const CACHE_VERSION = 'v3';
+// v3: Phase B FE — sensor-log + console identities changed the shell shape.
+// v4: the feed adopted Layout's surface prop — the surface attribute and the
+//     definitions/painting split moved onto the shell root.
+const CACHE_VERSION = 'v4';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.
