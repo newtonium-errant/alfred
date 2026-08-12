@@ -61,7 +61,9 @@ import type { FeedItem } from '../lib/algernon/feed';
 // Deliberately test-local rather than exported from production: the scope
 // token is the stylesheet's own business, and widening it to a public constant
 // is more surface than this guarantee needs.
-const SENSOR_SURFACE = 'sensor-log';
+// Imported from production rather than restated: the page and the tests now
+// share one spelling, so a rename cannot half-land.
+import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 
 // An FYI item, so BOTH surfaces render a real `FeedRow` from it — the shared
 // component whose colours are the thing at stake.
@@ -107,15 +109,23 @@ describe('sensor-log containment — the attribute is set on the feed and nowher
     // deterministically with the old target and passes with this one.
     await waitFor(() => expect(container.querySelector('[data-testid="feed-row"]')).not.toBeNull());
 
-    const console_ = screen.getByTestId('feed-console');
-    expect(console_.getAttribute('data-surface')).toBe(SENSOR_SURFACE);
-
-    // ANCESTOR, not merely present somewhere on the page: a skin rule reads
-    // `[data-surface='sensor-log'] [data-testid='feed-row']`, so an attribute
-    // sitting in a sibling branch would style nothing at all.
+    // POST-ADOPTION: the attribute is emitted by Layout on the surface ROOT, not
+    // by this page on its own inner div. The claim being pinned is unchanged —
+    // the skin's scope must be an ANCESTOR of the rows it dresses, because a
+    // rule reads `[data-surface='sensor-log'] [data-testid='feed-row']` and an
+    // attribute in a sibling branch would style nothing. Only WHERE that
+    // ancestor sits moved.
     const row = container.querySelector('[data-testid="feed-row"]');
     expect(row).not.toBeNull();
-    expect(row!.closest(`[data-surface="${SENSOR_SURFACE}"]`)).toBe(console_);
+    const scope = row!.closest(`[data-surface="${SENSOR_SURFACE}"]`);
+    expect(scope).not.toBeNull();
+
+    // …and the console element (which now carries the PAINTING, not the
+    // attribute) sits inside that scope. Both halves of the adoption split are
+    // asserted here: the attribute above the content, the paint on the content.
+    const console_ = screen.getByTestId('feed-console');
+    expect(console_.className).toContain('sensor-console');
+    expect(scope!.contains(console_)).toBe(true);
   });
 
   it('the HOME page renders the SAME row and is NOT labelled as this surface', async () => {
