@@ -401,7 +401,13 @@ export default function FeedPage() {
             the deck has nothing to deal BECAUSE things are set aside, say which
             rather than rendering nothing. Silence here is what let the old
             banner's disappearance read as "handled" when it meant "deferred".
-            TODO(voicing). */}
+
+            VOICING PASS (2026-08-12): reviewed and KEPT verbatim. "Snoozed" is
+            the word on the control the operator actually pressed (`FeedRow`'s
+            Snooze button, the deck's snooze menu), so the warmer "set aside"
+            would have cost the link between the line and the act that caused it.
+            Setting something aside is a sanctioned move here, and the line
+            already states it without a verdict. */}
         {loaded && deckable.length === 0 && setAsideDeckable.length > 0 && (
           <p data-testid="feed-deck-set-aside" className="mt-4 text-sm text-honeydew-600">
             {setAsideDeckable.length} snoozed — back at the next sync. Nothing else

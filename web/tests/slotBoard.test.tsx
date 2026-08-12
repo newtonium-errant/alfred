@@ -123,7 +123,7 @@ describe('SlotBoard — the three stacks speak SLOTS', () => {
   // rarer branch, and neither may be silent.
   it('unslotted=0 with items on the board: the line renders, no stack', () => {
     render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' })]} />);
-    expect(screen.getByTestId('board-residue-clear').textContent).toBe('Everything today was sorted.');
+    expect(screen.getByTestId('board-residue-clear').textContent).toBe('Everything on the board found a slot.');
     expect(screen.queryByTestId('board-stack-unslotted')).toBeNull();
   });
 
@@ -210,7 +210,7 @@ describe('SlotBoard — intentionally-left-blank states', () => {
 
   it('reports the balanced-day scoreline once anything is on the board', () => {
     render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' })]} />);
-    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done.');
+    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done — all three count the same.');
   });
 });
 
@@ -230,7 +230,7 @@ describe('SlotBoard — carryover, candidates, browse-on-swap', () => {
     expect(screen.getByTestId('board-today-duty').textContent).toContain('Fresh');
     const carried = screen.getByTestId('board-carryover-duty');
     expect(carried.textContent).toContain('Late');
-    expect(carried.textContent).toContain('Overdue');
+    expect(carried.textContent).toContain('Past its due date');
   });
 
   it('offers candidates with Accept, capped at three, the rest behind browse', () => {
@@ -341,9 +341,9 @@ describe('SlotBoard — undo-grace holds the write (option (a), board layer)', (
   it('the scoreline counts the completion immediately, wherever the row renders', () => {
     vi.useFakeTimers();
     render(<Harness items={[slot({ id: 'r' }, { slot: 'duty' })]} />);
-    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done.');
+    expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done — all three count the same.');
     fireEvent.click(screen.getByTestId('board-complete'));
-    expect(screen.getByTestId('board-balance').textContent).toBe('1 of 3 slots have something done.');
+    expect(screen.getByTestId('board-balance').textContent).toBe('1 of 3 slots have something done — all three count the same.');
     expect(screen.getByTestId('board-stack-score-duty').textContent).toBe('1/1 done');
   });
 
@@ -452,7 +452,7 @@ describe('SlotBoard — a settled completion lives behind the done drill', () =>
 
   it('says the slot is clear rather than leaving a box whose only content is a button', () => {
     render(<Harness items={[settled()]} />);
-    expect(screen.getByTestId('board-stack-clear-duty').textContent).toContain('Nothing left here today');
+    expect(screen.getByTestId('board-stack-clear-duty').textContent).toContain('All done here today');
   });
 });
 

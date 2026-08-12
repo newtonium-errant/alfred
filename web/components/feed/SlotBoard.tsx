@@ -10,6 +10,8 @@ import {
   boardStackSize,
   boardStacks,
   carryoverReason,
+  SLOT_EMPTY_COPY,
+  SLOT_EMPTY_FALLBACK,
   type BoardStack,
 } from '../../lib/algernon/board';
 import {
@@ -40,8 +42,11 @@ import { useSlotAccept } from './useSlotAccept';
 //   today's commitments → carryover (capped, attention-ranked) → 1-3 candidates
 //   → done (drill) → the long tail (browse-on-swap).
 //
-// TODO(voicing): all operator-facing copy here is a plain placeholder. The
-// permission-granting no-shame voice is the prompt-tuner's; the signal ships now.
+// VOICE: every operator-facing string here is written to the permission-granting
+// no-shame register — facts about the day, never verdicts about the operator; a
+// shortfall names the MECHANISM as its subject. The rule and its vocabulary
+// (Duty=obligation, Rhythm=practice, Fuel=restoration) live at the top of
+// `lib/algernon/board.ts`; read it before editing any copy below.
 
 export interface SlotBoardProps {
   /** Today's feed items (the full set, incl. acted — the board date-scopes). */
@@ -277,8 +282,12 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         {nothing ? (
           // Intentionally-left-blank: an empty stack is a fact about the day, and
           // an empty box that says nothing is indistinguishable from a broken one.
+          //
+          // The line is PER SLOT because the flat one landed under Fuel every
+          // morning, where a bare "nothing here" reads as a verdict on the exact
+          // slot the taxonomy exists to protect. See `SLOT_EMPTY_COPY`.
           <p data-testid={`board-stack-empty-${stack.key}`} className="mt-2 text-xs text-honeydew-600">
-            Nothing here today.
+            {SLOT_EMPTY_COPY[stack.key] ?? SLOT_EMPTY_FALLBACK}
           </p>
         ) : (
           <>
@@ -301,8 +310,11 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
 
             {stack.candidates.length > 0 && (
               <div className="mt-3">
+                {/* Not "Worth considering" — that is the system asserting these
+                    have value. These are OFFERS awaiting a yes/no, and declining
+                    costs nothing; the heading says who holds the choice. */}
                 <p className="text-[10px] font-bold uppercase tracking-wider text-honeydew-600">
-                  Worth considering
+                  If you want
                 </p>
                 <ul data-testid={`board-candidates-${stack.key}`} className="mt-1.5 flex flex-col gap-2">
                   {stack.candidates.map((it) => renderRow(it))}
@@ -311,10 +323,17 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
             )}
 
             {stack.today.length === 0 && stack.carryover.length === 0 && stack.candidates.length === 0 && (
-              // Everything in this slot is done (or demoted). Say which, rather
-              // than rendering a box whose only content is a drill-down button.
+              // Everything in this slot is done. Say which, rather than
+              // rendering a box whose only content is a drill-down button.
+              //
+              // This must not sound like the EMPTY line: "finished this slot"
+              // and "this slot never had anything" are opposite facts, and the
+              // old pair ("Nothing here today." / "Nothing left here today.")
+              // differed by one word. Overflow cannot be present here — an empty
+              // carryover means `carriedAll` was empty, so its post-cap slice is
+              // too, and likewise for candidates — so "all done" is exact.
               <p data-testid={`board-stack-clear-${stack.key}`} className="mt-2 text-xs font-semibold text-status-done-fg">
-                Nothing left here today.
+                All done here today.
               </p>
             )}
 
@@ -379,8 +398,14 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         // (`boardSlotsWithADone` counts only `SLOT_ORDER` keys). Blaming the one
         // part of the module that IS showing him everything would teach exactly
         // the wrong distrust.
+        //
+        // The SUBJECT of the sentence is the slot rules, not the operator and not
+        // a passive "items couldn't be sorted" — a shortfall the machine owns
+        // should say so in its own grammar. "No slot rule matched" is the same
+        // vocabulary the residue note uses one level down, and both trace to
+        // `tier/slots.py` rule 7 ("anything else → unslotted → refuse to guess").
         <p data-testid="board-coverage-warning" role="status" className="mb-2 text-[11px] text-honeydew-600">
-          {coverage.unslotted} of {coverage.total} items couldn&rsquo;t be sorted into a slot — the
+          The slot rules couldn&rsquo;t place {coverage.unslotted} of {coverage.total} items — the
           balance below counts only the rest.
         </p>
       )}
@@ -400,8 +425,19 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
             {totalOnBoard === 0
               ? // Intentionally-left-blank: three empty stacks could read as a
                 // broken board — say that it ran and found nothing.
-                'Nothing on the board yet today — it fills as the day’s items surface.'
-              : `${balanced} of 3 slots have something done.`}
+                'Nothing on the board yet today — it fills as the day’s items arrive.'
+              : // The scoreline is the SIGNAL; the clause after it is the
+                // interpretation, and it is the one sentence carrying the whole
+                // taxonomy ruling. It states the co-equality as a FACT about the
+                // machine — `boardSlotsWithADone` increments identically for a
+                // done Fuel item and a done Duty item — so the permission is
+                // earned by the mechanism rather than asserted as encouragement.
+                //
+                // Deliberately NOT a progress nudge. No "keep going", no streak,
+                // no target language: a scoreline that pressures the operator
+                // toward a complete set would re-create the hierarchy this
+                // taxonomy was built to escape, with Fuel as the box left unticked.
+                `${balanced} of 3 slots have something done — all three count the same.`}
           </p>
           <div data-testid="board-stacks" className="mt-2 flex flex-col gap-3">
             {stacks.map(renderStack)}
@@ -418,7 +454,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
             // sorted, so this sentence would be a small lie told on the quietest
             // morning — the board-level line above already says the true thing.
             <p data-testid="board-residue-clear" className="mt-2 text-[11px] text-honeydew-600">
-              Everything today was sorted.
+              Everything on the board found a slot.
             </p>
           )}
         </>
@@ -430,7 +466,12 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           role="status"
           className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3.5 overflow-hidden rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card"
         >
-          <span>Done: {grace.toast.title}</span>
+          {/* "Got it", not "Done" — during the grace window NOTHING HAS BEEN
+              WRITTEN yet, so this acknowledges the tap it actually has rather
+              than asserting a completion it has not yet made. On the surface
+              built to end done-but-unrecorded, the toast must not be the first
+              thing on it that overstates. */}
+          <span>Got it: {grace.toast.title}</span>
           <button
             type="button"
             data-testid="board-toast-undo"

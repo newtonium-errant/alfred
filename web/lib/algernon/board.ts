@@ -71,10 +71,54 @@ export function boardSlotLabel(slot: string): string {
   return SLOT_LABELS[slot] ?? UNSLOTTED_LABEL;
 }
 
-// TODO(voicing): every operator-visible string in this module and in SlotBoard.tsx
-// is a plain placeholder. The permission-granting no-shame voice is the
-// prompt-tuner's to write; the SIGNAL is what ships here. Listed in the C1 report.
+// ── THE BOARD'S VOICE (voicing pass, operator-released 2026-08-12) ──────────
+//
+// Every operator-visible string in this module and in SlotBoard.tsx is written
+// to one rule, from the step-1 taxonomy ruling: the three slots are a PERMISSION
+// SYSTEM, not a priority stack. Duty / Rhythm / Fuel are co-equal, and Fuel
+// exists because restorative things felt "indulgent" when they are what makes
+// the operator happier and more productive.
+//
+// So the copy STATES FACTS ABOUT THE DAY AND NEVER VERDICTS ABOUT THE OPERATOR.
+// Where a shortfall is real, the sentence names the MECHANISM as its subject
+// ("the slot rules couldn't place…"), never the person. The ILB refinement holds
+// underneath: the SIGNAL always renders — only its voicing is gentle. Honesty is
+// never softened into vagueness, and warmth is never inflated into cheerleading.
+//
+// Vocabulary is taken from `tier/slots.py` rather than invented: Duty holds
+// obligations (a `due_pattern` routine, a dated task), Rhythm holds practice
+// (`target_cadence_days` — a cadence, NOT a schedule), Fuel holds restoration
+// (`self_care`). Copy that calls Rhythm "scheduled" would be describing Duty.
 export const UNSLOTTED_LABEL = 'Not sorted yet';
+
+/**
+ * The empty-stack line, PER SLOT — the highest-stakes copy on the board.
+ *
+ * A single flat "Nothing here today." renders under Fuel every single morning
+ * (production runs {duty:2, rhythm:1}, so Fuel is empty daily), and a bare
+ * nothing-here under the restorative slot reads as a verdict on the operator —
+ * on the exact slot this taxonomy was built to protect. Duty and Rhythm get the
+ * terse factual line their emptiness deserves (an empty Duty is relief, an empty
+ * Rhythm is a fact); Fuel deliberately breaks the parallel and spends its extra
+ * words on PERMISSION, because that is the whole reason the slot exists.
+ *
+ * All three are true of the mechanism: an empty stack means nothing was
+ * classified into that slot today — never that the operator skipped it. Items
+ * do not leave a stack by being completed (done items keep it non-empty and
+ * settle into the drill), so an empty stack cannot be a record of a miss.
+ */
+export const SLOT_EMPTY_COPY: Record<string, string> = {
+  duty: 'Nothing owed today.',
+  rhythm: 'No practice today.',
+  fuel: 'Nothing here yet — there’s room when you want it.',
+};
+
+/**
+ * Fallback for the empty line. Unreachable for `unslotted` in practice — the
+ * residue stack is appended only when it holds items, and every member lands in
+ * a rendered section — but the lookup is total rather than trusting that proof.
+ */
+export const SLOT_EMPTY_FALLBACK = 'Nothing here today.';
 
 /**
  * Whether a committed item was first seen BEFORE today — i.e. it is carryover.
@@ -133,11 +177,18 @@ export function carryoverRank(item: FeedItem, now: Date = new Date()): number {
 export function carryoverReason(item: FeedItem, now: Date = new Date()): string | null {
   const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
   const breakthrough = typeof ev.snooze_breakthrough === 'string' ? ev.snooze_breakthrough.trim() : '';
-  // TODO(voicing) — placeholder copy.
+  // Every reason takes the ITEM as its subject, not the operator — "past ITS due
+  // date", not "you are overdue". `Overdue` was the one word here shaped like a
+  // verdict, and it is the same fact either way; the frame is what changes.
   if (breakthrough === 'crossed_due') return 'Back early — its due date passed';
   if (breakthrough === 'moved_earlier') return 'Back early — it moved sooner';
   if (breakthrough) return 'Back early';
-  if (boardIsOverdue(item, now)) return 'Overdue';
+  if (boardIsOverdue(item, now)) return 'Past its due date';
+  // Deliberately left as the vaguest line here, NOT sharpened to something like
+  // "from an earlier day". This is a total fallback and the browse-on-swap call
+  // site passes OVERFLOW items through it — including demoted candidates created
+  // today, for which any age claim would be false. A wrong-but-confident reason
+  // is worse than a thin one. (Mechanism finding, reported with the ship.)
   return 'Carried over';
 }
 
