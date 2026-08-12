@@ -1,4 +1,5 @@
 import '../styles/globals.css';
+import '../styles/sensorLog.css'; // feed surface skin + token seam; see that file's header
 import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { Nunito } from 'next/font/google';
