@@ -21,7 +21,10 @@
 // v3: Phase B FE — sensor-log + console identities changed the shell shape.
 // v4: the feed adopted Layout's surface prop — the surface attribute and the
 //     definitions/painting split moved onto the shell root.
-const CACHE_VERSION = 'v4';
+// v5: Phase C — home's top module became the Duty/Rhythm/Fuel day board. `/` is
+//     a SHELL_ROUTE, so its precached HTML (the offline boot, and the fallback
+//     for any unmatched navigation) is exactly what changed shape here.
+const CACHE_VERSION = 'v5';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.

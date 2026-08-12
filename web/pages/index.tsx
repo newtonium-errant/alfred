@@ -5,7 +5,7 @@ import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
 import { PushToggle } from '../components/PushToggle';
 import { FeedRow } from '../components/feed/FeedRow';
-import { RingsHeader } from '../components/feed/RingsHeader';
+import { SlotBoard } from '../components/feed/SlotBoard';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
@@ -108,14 +108,19 @@ export default function HomePage() {
   }, [authed, loadFeed]);
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
-  // OPEN-only for the remaining-work surfaces (board / needs-you / deck) — the
-  // rings (below) get the full set incl. today's done. One fetch, split here.
+  // OPEN-only for the remaining-work surfaces (feed board / needs-you / deck) —
+  // the DAY BOARD (below) gets the full set incl. today's done, because a
+  // completion there is a stage change, not a disappearance. One fetch, split here.
+  //
+  // NAMING, since this page now has two: `board` here is the FEED board
+  // (needs-you / FYI triage, `useFeedBoard`); the DAY board is the Duty /
+  // Rhythm / Fuel module rendered by `SlotBoard`. Different surfaces, one word.
   const openItems = useMemo(() => (items ?? []).filter((it) => it.state === 'open'), [items]);
   const board = useFeedBoard({ items: openItems, onAuthExpired });
-  // ONE completion instance for the whole composer, HOISTED out of RingsHeader and
-  // threaded back in below. The rings are where a slot actually gets completed, so
-  // when the hook lived inside them this count (reading the raw `ringItemDone`) had
-  // no way to see the flip and lagged a whole fetch behind the green segment.
+  // ONE completion instance for the whole composer, owned HERE and threaded into
+  // the day board below. Completion happens on that board, so when the hook lived
+  // inside the rings this count (reading the raw `ringItemDone`) had no way to see
+  // the flip and lagged a whole fetch behind the green segment.
   const completion = useRingCompletion({ onAuthExpired });
 
   // #62 (3) resume freshness + (2) override supersession, on the composer too —
@@ -187,14 +192,19 @@ export default function HomePage() {
     </Link>
   );
 
-  // The rings are PERSISTENT across every composer mode — the completion surface
-  // must exist all day, not only during the 11:00–14:00 check-in window. The mode
-  // rules govern what LEADS (brief card / rings / feed board), not whether rings
-  // exist. Controlled `items` seam → no second feed fetch; controlled `completion`
-  // seam → no second optimistic state (the needs-you count above reads the same one).
-  const ringsHeader = (
+  // THE DAY BOARD is home's top module (Phase C / C1, ratified): the rings
+  // headline plus the Duty / Rhythm / Fuel stacks. PERSISTENT across every
+  // composer mode — the completion surface must exist all day, not only during
+  // the 11:00–14:00 check-in window. The mode rules govern what LEADS BELOW it
+  // (brief card / check-in / feed board), not whether the board exists.
+  //
+  // Both composition seams are preserved from the rings it replaces: controlled
+  // `items` → no second feed fetch, and the shared `completion` → no second
+  // optimistic state (the needs-you count above reads the same instance, so a
+  // completion on the board drops that count in the SAME render).
+  const dayBoard = (
     <div className="mt-3">
-      <RingsHeader items={items ?? []} completion={completion} onAuthExpired={onAuthExpired} />
+      <SlotBoard items={items} completion={completion} onAuthExpired={onAuthExpired} />
     </div>
   );
 
@@ -210,10 +220,11 @@ export default function HomePage() {
           COMPOSED · {mode}
         </p>
 
-        {/* The rings are a PERSISTENT glance strip (the ratified sketch) — present
-            in every mode so the completion surface exists all day, not only during
-            the check-in window. The mode's lead content follows below. */}
-        {ringsHeader}
+        {/* The board is the TOP MODULE in every mode (the step-1 "promote to
+            headline" ruling) so the day's commitments and the completion surface
+            exist all day, not only during the check-in window. The mode's lead
+            content — brief card, check-in, feed — follows below it, untouched. */}
+        {dayBoard}
 
         {mode === 'brief' && (
           <section data-testid="compose-brief" className="mt-6">

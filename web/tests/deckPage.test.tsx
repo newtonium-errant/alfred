@@ -105,3 +105,90 @@ describe('DeckPage — deals only actionable kinds', () => {
     expect(screen.queryByTestId('deck-card')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// The DEGRADED payload — an empty deck that must not read as a tidy one
+// ---------------------------------------------------------------------------
+// Since the deck derives its verbs from the wire, an item can arrive with NO
+// actions at all: a half-deployed box, the serve side's actions_unavailable /
+// actions_stamp_failed degradation, or a decide kind the ceiling has no entry
+// for. Such an item fails `isDeckDealt` exactly as a committed slot does — and
+// before this split it was counted into the same sentence, so the operator was
+// told they had a worklist. They did not: the Feed cannot action a verbless
+// item either, so that line sent them somewhere to hit the same wall.
+//
+// ILB in its sharpest form: the absence was legible, just legible as the WRONG
+// thing. A wrong explanation is worse than a bare count, because it forecloses
+// the question.
+
+/** An item stripped of its served verbs — the wire shape of a degraded payload. */
+function verbless(kind: string, id: string): FeedItem {
+  return { ...item(kind, id), actions: [] };
+}
+
+describe('DeckPage — a verbless payload is a FAULT, not an empty queue', () => {
+  beforeEach(() => {
+    mockList.mockReset();
+    try {
+      window.sessionStorage.clear();
+    } catch {
+      /* jsdom without storage */
+    }
+  });
+
+  it('says the controls did not arrive — and does NOT claim a worklist', async () => {
+    mockList.mockResolvedValue({ items: [verbless('email_tier', 'e1')], count: 1 });
+    render(<DeckPage />);
+    await waitFor(() => expect(screen.queryByTestId('deck-verbless')).not.toBeNull());
+    const text = screen.getByTestId('deck-verbless').textContent ?? '';
+    expect(text).toContain('without controls');
+    // The three things the copy must NOT do: claim a worklist, claim the
+    // queue is empty, or imply anything was decided or lost.
+    expect(screen.queryByTestId('deck-unactionable')).toBeNull();
+    expect(screen.queryByTestId('deck-empty')).toBeNull();
+    expect(text).not.toContain('worklist');
+    expect(text).toContain('nothing has been decided or lost');
+  });
+
+  it('POSITIVE CONTROL — a real worklist item still gets the worklist line', async () => {
+    // The pin above is only meaningful if the OTHER branch still fires for the
+    // population it was written for. A committed slot carries a full verb list
+    // (done / undo_done / the snoozes) — it is simply not a SWIPE card, and
+    // sending the operator to the Feed for it is correct advice.
+    mockList.mockResolvedValue({ items: [slotItem('s1', { tier: 1 })], count: 1 });
+    render(<DeckPage />);
+    await waitFor(() => expect(screen.queryByTestId('deck-unactionable')).not.toBeNull());
+    expect(screen.getByTestId('deck-unactionable').textContent).toContain('worklist');
+    expect(screen.queryByTestId('deck-verbless')).toBeNull();
+  });
+
+  it('a MIXED population reports the fault, not the worklist', async () => {
+    // Both branches are eligible. The fault wins: one of the two sentences says
+    // something is wrong, and that is the half worth the operator's attention —
+    // a worklist line here would bury it under a routine-sounding count.
+    mockList.mockResolvedValue({
+      items: [verbless('email_tier', 'e1'), slotItem('s1', { tier: 1 })],
+      count: 2,
+    });
+    render(<DeckPage />);
+    await waitFor(() => expect(screen.queryByTestId('deck-verbless')).not.toBeNull());
+    expect(screen.getByTestId('deck-verbless').textContent).toContain('1 decision');
+    expect(screen.queryByTestId('deck-unactionable')).toBeNull();
+  });
+
+  it('counts only the verbless ones, and still deals the cards that DID arrive', async () => {
+    // Partial degradation: the dealt cards are unaffected, so no empty state
+    // renders at all. Pinned so the split cannot start swallowing live cards —
+    // and noted as the known gap: the verbless items are invisible while a deck
+    // is live. That needs a note beside a running deck, not an empty state.
+    mockList.mockResolvedValue({
+      items: [item('email_tier', 'e1'), verbless('proposal', 'p1')],
+      count: 2,
+    });
+    render(<DeckPage />);
+    await waitFor(() => expect(screen.queryByTestId('deck-card')).not.toBeNull());
+    expect(screen.getByTestId('deck-count').textContent).toBe('1 card');
+    expect(screen.queryByTestId('deck-verbless')).toBeNull();
+    expect(screen.queryByTestId('deck-empty')).toBeNull();
+  });
+});
