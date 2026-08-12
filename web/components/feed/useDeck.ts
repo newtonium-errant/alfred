@@ -9,7 +9,7 @@ import {
   SNOOZE_LABELS,
   UNDO_MS,
   UNSNOOZE_ACTION,
-  deckVerbsFor,
+  verbsFromActions,
   snoozeActionFor,
   snoozeIsBacked,
   type SnoozeAction,
@@ -264,10 +264,10 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
 
   const affirm = useCallback(() => {
     if (!current) return;
-    const verbs = deckVerbsFor(current.kind);
-    if (!verbs || verbs.affirm === null) return; // no affirm action for this kind
+    const verbs = verbsFromActions(current);
+    if (!verbs || verbs.affirm === null) return; // no affirm verb served for this item
     // A heavy affirm's FIRST swipe reveals the confirm stage (does not commit).
-    if (isHeavyVerb(current.kind, 'affirm') && !(confirming?.id === current.id && confirming.verdict === 'affirm')) {
+    if (isHeavyVerb(verbs, 'affirm') && !(confirming?.id === current.id && confirming.verdict === 'affirm')) {
       setConfirming({ id: current.id, verdict: 'affirm' });
       return;
     }
@@ -276,7 +276,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
 
   const confirmHeavy = useCallback(() => {
     if (!current || confirming?.id !== current.id) return;
-    const verbs = deckVerbsFor(current.kind);
+    const verbs = verbsFromActions(current);
     if (!verbs) return;
     // The armed DIRECTION decides what commits. Reading `affirm` here
     // unconditionally — as this did while only affirm could arm — would make a
@@ -296,7 +296,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
 
   const reject = useCallback(() => {
     if (!current) return;
-    const verbs = deckVerbsFor(current.kind);
+    const verbs = verbsFromActions(current);
     if (!verbs) return;
     // A rejectDefers lane (the slot candidate) has no backend decline path in
     // slots v1, so the LEFT gesture SETS THE CARD ASIDE for the session (no
@@ -314,7 +314,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     // A heavy REJECT arms exactly as a heavy affirm does. This is the gap that
     // let an attribution reject — which strips the marked section out of the
     // record body — commit on a single left swipe.
-    if (isHeavyVerb(current.kind, 'reject') && !(confirming?.id === current.id && confirming.verdict === 'reject')) {
+    if (isHeavyVerb(verbs, 'reject') && !(confirming?.id === current.id && confirming.verdict === 'reject')) {
       setConfirming({ id: current.id, verdict: 'reject' });
       return;
     }

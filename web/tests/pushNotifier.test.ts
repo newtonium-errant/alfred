@@ -9,12 +9,13 @@ import {
 } from '../lib/algernon/pushNotifier';
 import type { StoredSubscription } from '../lib/algernon/pushStore';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 // Pins the poll diff (new-item detection, no-re-push, seen persistence, gone-sub
 // pruning), the seen-set bounding, and the inert singleton gate.
 
 function item(id: string, overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id,
     kind: 'email_tier',
     instance: 'salem',
@@ -29,7 +30,7 @@ function item(id: string, overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 function sub(endpoint: string): StoredSubscription {
   return { user: 'Andrew', endpoint, p256dh: 'p', auth: 'a', at: '' };

@@ -10,13 +10,13 @@ import {
   SNOOZE_HOLD_MS,
   SNOOZE_LABELS,
   UNDO_MS,
-  deckVerbsFor,
   isHeavyVerb,
   inSnoozeHoldBand,
   snoozeIsBacked,
   type SnoozeAction,
   emailPriority,
   kindLabel,
+  verbsFromActions,
   routineCandidatesFor,
   routineProposedItem,
   sameRoutineItem,
@@ -137,7 +137,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     // The current card's verbs — so a swipe toward a NO-OP verdict (an ACK-only kind's
     // left/reject, e.g. email_urgent) springs the card back instead of leaving it stuck
     // half-dragged (there was no advance to unmount the stale transform).
-    const verbs = deckVerbsFor(current.kind);
+    const verbs = verbsFromActions(current);
     // Durations only mean something where a store is behind them; on every other
     // kind the ↑ gesture is the session-local set-aside it has always been, and a
     // menu offering "3 days" would be promising persistence that doesn't exist.
@@ -341,7 +341,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     [deck],
   );
 
-  const verbs = current ? deckVerbsFor(current.kind) : null;
+  const verbs = current ? verbsFromActions(current) : null;
   // The current email card's assigned tier (#28) — the picker offers the OTHERS.
   const assignedTier = current ? emailPriority(current) : null;
   // The #13 pick-list: every active routine item MINUS the one this card proposed
@@ -354,9 +354,10 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   // How many of the cards still to come will ARM rather than commit. Counted
   // per-direction (a card is heavy if EITHER direction is), which is the same
   // question the card's own rail answers — one number, one predicate.
-  const aheadHeavyCount = deck.ahead.filter(
-    (it) => isHeavyVerb(it.kind, 'affirm') || isHeavyVerb(it.kind, 'reject'),
-  ).length;
+  const aheadHeavyCount = deck.ahead.filter((it) => {
+    const v = verbsFromActions(it);
+    return isHeavyVerb(v, 'affirm') || isHeavyVerb(v, 'reject');
+  }).length;
   const stack: Array<{ item: FeedItem; depth: number }> = [];
   if (current) stack.push({ item: current, depth: 0 });
   upcoming.forEach((item, i) => stack.push({ item, depth: i + 1 }));

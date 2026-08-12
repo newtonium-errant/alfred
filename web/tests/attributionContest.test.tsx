@@ -19,9 +19,10 @@ import { CONTEST_ACTION, contestableItem } from '../lib/algernon/feedConstants';
 import { evidenceRows } from '../lib/algernon/feedEvidence';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function item(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'attribution:note/A.md|inf-1',
     kind: 'attribution',
     instance: 'salem',
@@ -36,7 +37,7 @@ function item(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 beforeEach(() => {

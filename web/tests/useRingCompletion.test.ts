@@ -10,9 +10,10 @@ vi.mock('../lib/algernon/feed', () => ({ feedApi: { act: mockAct, list: mockList
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function slot(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'slot_suggestion:routine/Bills.md::Pay',
     kind: 'slot_suggestion',
     instance: 'salem',
@@ -27,7 +28,7 @@ function slot(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 const flush = () => act(async () => { await Promise.resolve(); await Promise.resolve(); });

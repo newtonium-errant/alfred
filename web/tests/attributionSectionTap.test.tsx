@@ -48,11 +48,12 @@ import {
 } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 const ATTRIBUTION_ID = 'attribution:note/A.md|inf-1';
 
 function item(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: ATTRIBUTION_ID,
     kind: 'attribution',
     instance: 'salem',
@@ -67,7 +68,7 @@ function item(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 beforeEach(() => {

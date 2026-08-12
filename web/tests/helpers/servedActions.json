@@ -1,0 +1,299 @@
+{
+  "README": [
+    "GENERATED FROM THE SERVER, then guarded by a pin \u2014 do not hand-edit.",
+    "Source of truth: alfred.daily_sync.action_router.actions_for(kind).",
+    "Regenerate when the ceiling changes; tests/feed/test_feed_advertised_actions.py",
+    "::TestTheFEFixtureMatchesWhatIsServed reds if this drifts from actions_for.",
+    "Consumed by web/tests/helpers/servedActions.ts. NEVER imported by production code."
+  ],
+  "kinds": {
+    "email_tier": [
+      {
+        "verb": "high",
+        "label": "high",
+        "weight": "light"
+      },
+      {
+        "verb": "medium",
+        "label": "medium",
+        "weight": "light"
+      },
+      {
+        "verb": "low",
+        "label": "low",
+        "weight": "light"
+      },
+      {
+        "verb": "spam",
+        "label": "Spam",
+        "weight": "light",
+        "gesture": "reject"
+      },
+      {
+        "verb": "up",
+        "label": "up",
+        "weight": "light"
+      },
+      {
+        "verb": "down",
+        "label": "down",
+        "weight": "light"
+      },
+      {
+        "verb": "confirm",
+        "label": "Confirm",
+        "weight": "light",
+        "gesture": "affirm"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
+    ],
+    "attribution": [
+      {
+        "verb": "confirm",
+        "label": "Confirm",
+        "weight": "light",
+        "gesture": "affirm"
+      },
+      {
+        "verb": "reject",
+        "label": "Reject",
+        "weight": "heavy",
+        "gesture": "reject",
+        "note": "Removes the marked section from the record body and drops its audit entry."
+      },
+      {
+        "verb": "contest",
+        "label": "contest",
+        "weight": "light"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
+    ],
+    "proposal": [
+      {
+        "verb": "confirm",
+        "label": "Confirm",
+        "weight": "heavy",
+        "gesture": "affirm",
+        "note": "Creates or merges the vault records described above."
+      },
+      {
+        "verb": "reject",
+        "label": "Reject",
+        "weight": "light",
+        "gesture": "reject"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
+    ],
+    "routine_match": [
+      {
+        "verb": "confirm",
+        "label": "That's it",
+        "weight": "light",
+        "gesture": "affirm"
+      },
+      {
+        "verb": "reject",
+        "label": "No",
+        "weight": "light",
+        "gesture": "reject"
+      },
+      {
+        "verb": "correct",
+        "label": "correct",
+        "weight": "light"
+      },
+      {
+        "verb": "one_off",
+        "label": "one_off",
+        "weight": "light"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
+    ],
+    "pending": [
+      {
+        "verb": "noted",
+        "label": "Noted",
+        "weight": "light",
+        "gesture": "affirm"
+      },
+      {
+        "verb": "show",
+        "label": "show",
+        "weight": "light"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
+    ],
+    "slot_suggestion": [
+      {
+        "verb": "done",
+        "label": "done",
+        "weight": "light"
+      },
+      {
+        "verb": "undo_done",
+        "label": "undo_done",
+        "weight": "light"
+      },
+      {
+        "verb": "accept",
+        "label": "Take it",
+        "weight": "light",
+        "gesture": "affirm"
+      },
+      {
+        "verb": "snooze_1d",
+        "label": "snooze_1d",
+        "weight": "light"
+      },
+      {
+        "verb": "snooze_3d",
+        "label": "snooze_3d",
+        "weight": "light"
+      },
+      {
+        "verb": "snooze_7d",
+        "label": "snooze_7d",
+        "weight": "light"
+      },
+      {
+        "verb": "snooze_until_i_say",
+        "label": "snooze_until_i_say",
+        "weight": "light"
+      },
+      {
+        "verb": "unsnooze",
+        "label": "unsnooze",
+        "weight": "light"
+      }
+    ],
+    "email_urgent": [
+      {
+        "verb": "ack",
+        "label": "Got it",
+        "weight": "light",
+        "gesture": "affirm"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
+    ]
+  }
+}

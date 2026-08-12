@@ -13,13 +13,14 @@ import {
   tierRingBuckets,
 } from '../lib/algernon/rings';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 // Ring DATA binding — grouping open slot_suggestion feed items into the three
 // tier rings. Pins the VERIFIED reality: evidence carries `tier` ∈ {1,2,3} (no
 // duty/rhythm/fuel bucket) and no completion flag (every item planned in B).
 
 function slot(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'slot_suggestion:task/A.md',
     kind: 'slot_suggestion',
     instance: 'salem',
@@ -34,7 +35,7 @@ function slot(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 describe('ringTierOf', () => {

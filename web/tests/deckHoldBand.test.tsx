@@ -36,11 +36,12 @@ import {
   verdictForDrag,
 } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 // A snooze-capable card — the only kind that offers durations, so the only kind
 // whose hold band is live (`durationsAvailable` in the drag effect).
 function slotItem(over: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'slot_suggestion:task:task/Pay Steph.md',
     kind: 'slot_suggestion',
     instance: 'salem',
@@ -55,7 +56,7 @@ function slotItem(over: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...over,
-  };
+  });
 }
 
 // The gesture origin. Upward drag = DECREASING clientY, so `at(up)` converts a

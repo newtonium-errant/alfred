@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { PUSH_TITLE_MAX_CHARS, pushDeepLink, pushPayloadFor } from '../lib/algernon/pushPayload';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 // Lock-screen privacy is the hard rule: the payload is title + kind + url ONLY,
 // and NEVER anything from `evidence`.
 
 function item(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'email_tier:note/A.md',
     kind: 'email_tier',
     instance: 'salem',
@@ -21,7 +22,7 @@ function item(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 describe('pushPayloadFor', () => {

@@ -16,9 +16,10 @@ vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
 
 import DeckPage from '../pages/deck';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function item(kind: string, id: string): FeedItem {
-  return {
+  return withServedActions({
     id,
     kind,
     instance: 'salem',
@@ -32,10 +33,13 @@ function item(kind: string, id: string): FeedItem {
     acted_at: null,
     expires_at: null,
     source_ref: {},
-  };
+  });
 }
 function slotItem(id: string, evidence: Record<string, unknown>): FeedItem {
-  return { ...item('slot_suggestion', id), evidence };
+  // `actions: []` resets the base item's verbs so they are re-derived from THIS
+  // evidence — a slot's accept is stage-dependent, and the base was built with
+  // no evidence at all.
+  return withServedActions({ ...item('slot_suggestion', id), evidence, actions: [] });
 }
 
 beforeEach(() => {

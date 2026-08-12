@@ -91,6 +91,11 @@ def _pin_ok(request: web.Request) -> bool:
 def _stamp_actions(items: list[dict[str, Any]]) -> None:
     """Fill each served item's ``actions`` from the capability ceiling (#102 1b).
 
+    Via :func:`~alfred.daily_sync.action_router.actions_for_item`, which narrows
+    the per-kind ceiling by what THIS item's own evidence puts out of reach — so
+    a committed slot is not offered an ``accept`` the router would refuse. This
+    layer holds no verb rules of its own; it only carries the answer.
+
     SERVE-TIME, not produce-time, and the difference is the whole point: every
     item ALREADY SITTING IN THE STORE gains its verbs on the next read, with no
     backfill and no migration. Stamping at production would leave the live
@@ -111,7 +116,7 @@ def _stamp_actions(items: list[dict[str, Any]]) -> None:
     a 500 that empties a working surface.
     """
     try:
-        from alfred.daily_sync.action_router import actions_for
+        from alfred.daily_sync.action_router import actions_for_item
     except Exception:  # pragma: no cover - import-time failure is not a read failure
         log.warning("transport.feed.actions_unavailable", reason="import_failed")
         return
@@ -120,7 +125,12 @@ def _stamp_actions(items: list[dict[str, Any]]) -> None:
         try:
             if item.get("actions"):
                 continue
-            verbs = actions_for(str(item.get("kind") or ""))
+            # PER-ITEM, not per-kind: the router refuses some verbs on the
+            # item's own evidence, and a verb that will be refused must not be
+            # offered. The rule lives in the router beside the gate it mirrors —
+            # deliberately NOT inlined here, so the transport layer keeps no
+            # opinion of its own about verbs.
+            verbs = actions_for_item(item)
             if verbs:
                 item["actions"] = verbs
                 stamped += 1

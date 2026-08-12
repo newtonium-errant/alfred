@@ -20,9 +20,10 @@ vi.mock('../lib/algernon/feed', () => ({ feedApi: { act: mockAct, list: vi.fn() 
 import { Deck } from '../components/feed/Deck';
 import { UNDO_MS } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function item(over: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'attribution:marker:inf-20260811-salem-abc123',
     kind: 'attribution',
     instance: 'salem',
@@ -37,7 +38,7 @@ function item(over: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...over,
-  };
+  });
 }
 
 // The drag harness is the one deckHoldBand.test.tsx established: the deck

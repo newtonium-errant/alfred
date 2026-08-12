@@ -752,6 +752,65 @@ async def test_a_broken_verb_table_does_NOT_cost_the_operator_the_feed(
     assert body["items"][0]["actions"] == []
 
 
+async def test_a_COMMITTED_slot_arrives_WITHOUT_the_accept_it_would_be_refused(
+    feed_client,
+) -> None:
+    """Per-item narrowing, pinned AT THE WIRE (#102 1b — the deck reads this).
+
+    The unit answer lives in tests/feed/test_feed_advertised_actions.py; this
+    asserts the narrowed list actually reaches the client, because a filter the
+    route does not call is a filter that does not exist. Both slots are served
+    in ONE request so the candidate is a positive control for the committed one:
+    "accept absent" would hold identically against a build that served no verbs
+    at all, or that failed to serve slots.
+    """
+    from alfred.feed.model import FeedItem
+
+    store = feed_client.app["_store"]
+    candidate = FeedItem.create(
+        kind="slot_suggestion", stable_key="task:task/Candidate.md", instance="salem",
+        title="T1: Candidate", evidence={"tier": 1, "origin": "task", "candidate": True},
+    )
+    committed = FeedItem.create(
+        kind="slot_suggestion", stable_key="task:task/Committed.md", instance="salem",
+        title="T1: Committed", evidence={"tier": 1, "origin": "task", "candidate": False},
+    )
+    store.upsert(candidate)
+    store.upsert(committed)
+
+    resp = await feed_client.get("/feed/items?kind=slot_suggestion", headers=_FEED_HEADERS)
+    served = {i["id"]: {a["verb"] for a in i["actions"]} for i in (await resp.json())["items"]}
+
+    assert "accept" in served[candidate.id], "the candidate must still be accept-able"
+    assert "accept" not in served[committed.id]
+    # And the committed slot is not left verbless — it keeps the verbs it CAN use.
+    assert {"done", "undo_done"} <= served[committed.id]
+
+
+async def test_an_URGENT_item_arrives_with_its_ack(feed_client) -> None:
+    """The trap, pinned at the wire: ``ack`` is the ONLY verb an urgent card has.
+
+    ``email_urgent`` is MODE_DECIDE, so the universal FYI-ack gate would refuse
+    this verb — except the router intercepts the urgent ack BEFORE that gate on
+    purpose. Any future "strip what the gates would refuse" pass that consults
+    the FYI gate reds THIS test rather than shipping un-actionable interrupt
+    cards to the operator.
+    """
+    from alfred.feed.model import FeedItem
+
+    store = feed_client.app["_store"]
+    urgent = FeedItem.create(
+        kind="email_urgent", stable_key="msg:99", instance="salem",
+        title="Urgent: pipe burst", evidence={"sender": "s@example.com"},
+    )
+    store.upsert(urgent)
+
+    resp = await feed_client.get("/feed/items?kind=email_urgent", headers=_FEED_HEADERS)
+    items = (await resp.json())["items"]
+    assert len(items) == 1
+    assert "ack" in {a["verb"] for a in items[0]["actions"]}
+
+
 async def test_the_stamp_is_announced_even_when_it_stamps_nothing(
     feed_client,
 ) -> None:

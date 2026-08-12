@@ -34,9 +34,10 @@ vi.mock('../lib/algernon/composerLog', () => ({ useComposerLog: () => {} }));
 
 import HomePage from '../pages/index';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 function item(kind: string, id: string, attention: string, mode: string): FeedItem {
-  return {
+  return withServedActions({
     id,
     kind,
     instance: 'salem',
@@ -50,7 +51,7 @@ function item(kind: string, id: string, attention: string, mode: string): FeedIt
     acted_at: null,
     expires_at: null,
     source_ref: {},
-  };
+  });
 }
 
 beforeEach(() => {

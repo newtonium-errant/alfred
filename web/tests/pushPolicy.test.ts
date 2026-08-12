@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { isPushEligible, readPushPolicy, type PushPolicy } from '../lib/algernon/pushPolicy';
 import type { FeedItem } from '../lib/algernon/feed';
+import { withServedActions } from './helpers/servedActions';
 
 // #27 slice 3 — the push-eligibility policy. Default is the STRICTEST gate
 // (operator ruling C): only email_urgent + high_source==="override". Widening is
 // a PUSH_POLICY env flip, never a code change.
 
 function item(overrides: Partial<FeedItem> = {}): FeedItem {
-  return {
+  return withServedActions({
     id: 'email_urgent:note/A.md',
     kind: 'email_urgent',
     instance: 'salem',
@@ -22,7 +23,7 @@ function item(overrides: Partial<FeedItem> = {}): FeedItem {
     expires_at: null,
     source_ref: {},
     ...overrides,
-  };
+  });
 }
 
 beforeEach(() => {
