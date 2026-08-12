@@ -286,7 +286,7 @@ describe('carryoverReason — the row says WHY it is still here', () => {
   });
 
   it('falls back to overdue, then to the plain carried note', () => {
-    expect(carryoverReason(slot({}, { due_iso: '2026-08-11' }), NOW)).toBe('Overdue');
+    expect(carryoverReason(slot({}, { due_iso: '2026-08-11' }), NOW)).toBe('Past its due date');
     expect(carryoverReason(slot({}, { due_iso: '2026-08-12' }), NOW)).toBe('Carried over');
     expect(carryoverReason(slot({}, {}), NOW)).toBe('Carried over');
   });
