@@ -46,7 +46,10 @@ import { useSlotAccept } from './useSlotAccept';
 // no-shame register — facts about the day, never verdicts about the operator; a
 // shortfall names the MECHANISM as its subject. The rule and its vocabulary
 // (Duty=obligation, Rhythm=practice, Fuel=restoration) live at the top of
-// `lib/algernon/board.ts`; read it before editing any copy below.
+// `lib/algernon/board.ts` — as does THE FENCE, which bars any slot-based GOAL
+// claim while the balanced-day metric is still tier-based, names the two
+// adjudicated exceptions to it, and carries the instruction for whoever ships
+// the stage-3 flip. Read it before editing any copy below.
 
 export interface SlotBoardProps {
   /** Today's feed items (the full set, incl. acted — the board date-scopes). */
@@ -275,14 +278,22 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           // every count above — an unreachable daily goal would read as personal
           // failure rather than as an unclassified item.
           //
-          // "Stay out of the balance" states that exclusion as PLACEMENT, on the
-          // arrangement side of the fence at the top of `board.ts`; the earlier
-          // "don't count for or against your day" said the same true thing in the
-          // scoring register the fence pulled from the scoreline. "Either way"
-          // is load-bearing and survives the rewrite — it is the half that says
-          // these cannot be held against him, not merely that they are ignored.
+          // ADJUDICATED EXCEPTION to the fence's bar on scoring vocabulary (see
+          // `board.ts`, which names this site). "Count for or against" is the
+          // RECKONING idiom — to be held for or against someone — not the
+          // tallying sense the fence pulled from the scoreline. The distinction
+          // is the whole value of the line: it does not say these are omitted
+          // from a total, it says they cannot be held against him, which is the
+          // one thing the operator needs to hear about work the classifier
+          // failed on. It is also the shape `tier/slots.py` reaches for in its
+          // own words ("EXCLUDED from the balanced-day denominator rather than
+          // counted against it").
+          //
+          // A round-2 rewrite to "they stay out of the balance, either way" was
+          // reverted: it read as placement and lost the held-against-him sense.
+          // Ruled KEEP — do not "fix" this back.
           <p data-testid="board-residue-note" className="mt-1 text-[11px] text-honeydew-600">
-            No slot rule matched these yet — they stay out of the balance, either way.
+            No slot rule matched these yet — they don&rsquo;t count for or against your day.
           </p>
         )}
 
@@ -412,13 +423,17 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         // vocabulary the residue note uses one level down, and both trace to
         // `tier/slots.py` rule 7 ("anything else → unslotted → refuse to guess").
         //
-        // The tail still states the DENOMINATOR — that is its whole job, and it
-        // may not be softened into vagueness — but it states it as exclusion
-        // ("leaves them out") rather than as tallying ("counts only the rest"),
-        // which keeps it on the same side of the fence as the scoreline.
+        // The tail is the fence's OTHER adjudicated exception (named in
+        // `board.ts`). "The balance BELOW" is deictic — it points at the line on
+        // this screen, which is `boardSlotsWithADone`, not at the server's
+        // `balanced_day` metric — so stating what that on-screen line is computed
+        // over is a fact about this render and claims nothing about the tier-based
+        // metric. Stating the DENOMINATOR is the sentence's whole job and it may
+        // not be softened into vagueness. A round-2 rewrite to "leaves them out"
+        // was reverted. Ruled KEEP.
         <p data-testid="board-coverage-warning" role="status" className="mb-2 text-[11px] text-honeydew-600">
           The slot rules couldn&rsquo;t place {coverage.unslotted} of {coverage.total} items — the
-          balance below leaves them out.
+          balance below counts only the rest.
         </p>
       )}
 
@@ -455,11 +470,13 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                 // "Outranks" keeps the sentence on standing, which IS true today
                 // and is what the operator needs to hear.
                 //
-                // It also disarms the one hierarchy signal still on screen: the
-                // stacks render in a fixed order and Fuel is last, which is the
-                // very shape the ruling named when it said the numbered tiers
-                // "re-encoded the hierarchy [they were] built to escape (T3 named
-                // last, rendered last)".
+                // It also MITIGATES — it cannot close — the one hierarchy signal
+                // still on screen: the stacks render in a fixed order with Fuel
+                // last, the very shape the ruling named when it said the numbered
+                // tiers "re-encoded the hierarchy [they were] built to escape (T3
+                // named last, rendered last)". A copy line can speak against a
+                // layout; it cannot undo one. Closing it is a design pass, and
+                // this sentence is not a substitute for that work.
                 //
                 // Deliberately NOT a progress nudge. No "keep going", no streak,
                 // no target language: a scoreline that pressures the operator

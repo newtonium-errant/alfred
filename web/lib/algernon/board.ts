@@ -90,7 +90,7 @@ export function boardSlotLabel(slot: string): string {
 // (`target_cadence_days` — a cadence, NOT a schedule), Fuel holds restoration
 // (`self_care`). Copy that calls Rhythm "scheduled" would be describing Duty.
 //
-// ── THE FENCE: ARRANGEMENT, NOT GOAL (holds until the gated flip) ───────────
+// ── THE FENCE: ARRANGEMENT, NOT GOAL (a STAGING guard, not a permanent ban) ─
 // SLOTS ARE HOW THE DAY IS ARRANGED. The balanced-day CLAIM keys to what the
 // server computes, and that metric is still TIER-based until stage 3 of the
 // classifier rollout flips it. So no string on this board may assert a
@@ -100,9 +100,38 @@ export function boardSlotLabel(slot: string): string {
 //
 // The permissible register is standing and placement: what the slots ARE to one
 // another, where an item sits, what is on the board. `boardSlotsWithADone` is
-// deliberately named apart from `balanced_day` for this reason; keep the copy
-// on the same side of that line. Re-check every string here against this fence
-// when the metric does flip — several of them become sayable that are not now.
+// deliberately named apart from `balanced_day` for this reason.
+//
+// THE GOAL FRAME IS THE RATIFIED DESTINATION, NOT THE ENEMY. The operator's own
+// step-1 ruling is that the "Daily goal: balanced day" scoreline is "the real
+// centerpiece, promote to headline". This fence is the STAGING discipline that
+// gets there honestly — it bars the claim only while the metric behind it is
+// still tier-based, so the board never promises a flip that has not shipped.
+//
+// SO, TO WHOEVER SHIPS STAGE 3: this is your instruction, not merely your
+// prohibition. When the metric flips to the slot axis, the work is to PROMOTE
+// THE SCORELINE WITH THE GOAL FRAMING, per the ruling — not to leave these
+// strings as they are because a comment once said "don't". Re-read every string
+// below against the flipped metric; several become sayable that are not now,
+// and the scoreline is meant to become the headline.
+//
+// WHAT THE HOST SCORELINE MAY SAY, MEANWHILE. "N of 3 slots have something
+// done" is PERMITTED: it states the day as a fact, and a count of stacks is an
+// observation about the board. What is barred is framing the 3 as a TARGET —
+// no "only N of 3", no progress-toward language, nothing that makes the
+// remainder read as a shortfall.
+//
+// TWO ADJUDICATED EXCEPTIONS (ruled KEEP on review — do not "fix" them):
+//   1. The residue note's "they don't count for or against your day"
+//      (`SlotBoard.tsx`). "Count for or against" is the RECKONING idiom — held
+//      for or against someone — not the tallying sense barred here, and the
+//      held-against-him half is the line's entire value.
+//   2. The coverage warning's "the balance below counts only the rest". "The
+//      balance BELOW" is deictic: it points at the on-screen line, which is
+//      `boardSlotsWithADone`, so it states this render's denominator and claims
+//      nothing about the server metric.
+// Both were rewritten once for surface consistency with this fence and both
+// were reverted. The fence is about the CLAIM, not about the word "count".
 export const UNSLOTTED_LABEL = 'Not sorted yet';
 
 /**

@@ -157,7 +157,7 @@ describe('SlotBoard — the three stacks speak SLOTS', () => {
     );
     const warn = screen.getByTestId('board-coverage-warning');
     expect(warn.textContent).toContain('1 of 4 items');
-    expect(warn.textContent).toContain('the balance below leaves them out');
+    expect(warn.textContent).toContain('the balance below counts only the rest');
     // It must NOT blame the rings — they show unslotted items in their tier
     // bucket, so a "the rings are missing part of your day" claim would be false.
     expect(warn.textContent).not.toContain('rings');
@@ -192,7 +192,7 @@ describe('SlotBoard — the three stacks speak SLOTS', () => {
     unmount();
     render(<Harness items={[slot({ id: 'b', title: 'Mystery' }, {})]} />);
     expect(screen.getByTestId('board-stack-unslotted').textContent).toContain('Mystery');
-    expect(screen.getByTestId('board-residue-note').textContent).toContain('stay out of the balance');
+    expect(screen.getByTestId('board-residue-note').textContent).toContain('they don’t count for or against your day');
   });
 });
 
