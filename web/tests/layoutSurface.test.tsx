@@ -129,12 +129,18 @@ describe('Layout surface identities', () => {
     // (their count, cited not measured here). That pin belongs to
     // the adopting surface, against its own stylesheet; this one only covers
     // the fallback.
+    //
+    // THE EXAMPLE NAME MUST STAY UNREGISTERED. This used `sensor-log`, which
+    // took a chrome entry on 2026-08-12 — so the pin silently became a test of
+    // that entry instead of the fallback. A fictitious name keeps it testing
+    // what its own comment says it tests; the sensor-log entry has its own pin
+    // below.
     const { container } = render(
-      <Layout onSignOut={() => {}} surface="sensor-log">
+      <Layout onSignOut={() => {}} surface="not-a-registered-surface">
         <p>content</p>
       </Layout>,
     );
-    const root = container.querySelector('[data-surface="sensor-log"]');
+    const root = container.querySelector('[data-surface="not-a-registered-surface"]');
     expect(root).not.toBeNull();
     // Warm chrome, not console chrome — an unregistered surface must not
     // inherit the deck's dark ground by accident.
@@ -143,6 +149,43 @@ describe('Layout surface identities', () => {
     // And it still gets the full affordance set.
     expect(screen.queryByTestId('nav-signout')).not.toBeNull();
     // The console's structural extras stay with the console.
+    expect(screen.queryByTestId('console-elbow')).toBeNull();
+  });
+
+  // The feed's dark shell, operator-ruled 2026-08-12 by live verdict ("mixed
+  // aesthetics" — a warm shell framing a dark sensor panel). It arrives through
+  // the CHROME TABLE; the inertness pins in sensorLogShell.test.tsx separately
+  // hold that no content CSS leaked upward to do it.
+  it('gives the sensor-log surface the console HULL, via the chrome table', () => {
+    const { container } = render(
+      <Layout onSignOut={() => {}} surface="sensor-log">
+        <p>content</p>
+      </Layout>,
+    );
+    const root = container.querySelector('[data-surface="sensor-log"]');
+    expect(root).not.toBeNull();
+    expect(root?.className).toContain('bg-console-hull');
+    expect(root?.className).not.toContain('bg-honeydew-50');
+    // The hull's structural extras come WITH the hull — the elbow is what turns
+    // the vertical rail into a horizontal header, so a dark shell without it
+    // renders a gap. This is the chrome-derived `isConsole`, not a name list.
+    expect(screen.queryByTestId('console-elbow')).not.toBeNull();
+    // Same affordances as everywhere else — adopting a skin never forks the tree.
+    expect(screen.queryByTestId('nav-signout')).not.toBeNull();
+  });
+
+  it('leaves the WARM surfaces untouched — no sensor-log anything on home/brief', () => {
+    // The other half of the containment claim, at the chrome layer: the default
+    // surface must not have picked up the hull when the feed did.
+    const { container } = render(
+      <Layout onSignOut={() => {}}>
+        <p>content</p>
+      </Layout>,
+    );
+    const root = container.firstElementChild;
+    expect(root?.getAttribute('data-surface')).toBe('warm');
+    expect(root?.className).toContain('bg-honeydew-50');
+    expect(root?.className).not.toContain('bg-console-hull');
     expect(screen.queryByTestId('console-elbow')).toBeNull();
   });
 

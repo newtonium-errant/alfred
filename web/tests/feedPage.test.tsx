@@ -18,6 +18,7 @@ vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
 import FeedPage from '../pages/feed';
 import type { FeedItem } from '../lib/algernon/feed';
 import { withServedActions } from './helpers/servedActions';
+import { DECK_SNOOZE_KEY, writeDeckSnoozed } from '../lib/algernon/deckSnooze';
 
 function item(kind: string, id: string, attention: string, mode: string, evidence: Record<string, unknown> = {}): FeedItem {
   return withServedActions({
@@ -44,6 +45,9 @@ const routineSlot = (id: string, over: Partial<FeedItem> = {}): FeedItem => ({
 beforeEach(() => {
   mockList.mockReset();
   mockAct.mockReset().mockResolvedValue({ ok: true, status: 'acted' });
+  // The deck's hide-list is sessionStorage — real state that survives a test.
+  // Clearing it here keeps one test's snooze out of the next test's banner.
+  window.sessionStorage.clear();
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -345,5 +349,60 @@ describe('FeedPage — an ok-but-not-acted snooze does not stage the row (#14)',
     await waitFor(() => expect(screen.queryByTestId('feed-row-snooze-error')).not.toBeNull());
     expect(screen.queryByTestId('feed-snoozed')).toBeNull();
     expect(screen.queryByTestId('feed-row-snooze')).not.toBeNull();
+  });
+});
+
+// ── The banner counts what the DECK WILL ACTUALLY DEAL ───────────────────────
+//
+// The operator's 2026-08-12 screenshots: the feed promised "2 decisions waiting
+// → Open the deck", and the deck answered "DECK CLEAR — 2 snoozed". The banner
+// was counting cards the deck had already set aside, because a deck snooze lives
+// in `sessionStorage` and this page had no way to see it. Both directions are
+// pinned — a count that never fires and a count that always fires would each
+// pass half of this on their own.
+describe('FeedPage — the deck banner promises no trip to a wall', () => {
+  const deckable = (id: string) => item('email_tier', id, 'needs_you', 'decide');
+
+  it('a population the deck WILL deal is counted (positive control)', async () => {
+    mockList.mockResolvedValue({ items: [deckable('e1'), deckable('e2')], count: 2 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-deck-link')).not.toBeNull());
+    expect(screen.getByTestId('feed-deck-link').textContent).toContain('2 decisions waiting');
+    expect(screen.queryByTestId('feed-deck-set-aside')).toBeNull();
+  });
+
+  it('cards the DECK snoozed are not "waiting" — and the zero case says why', async () => {
+    // Seeded exactly as the deck writes it, through the shared owner both pages
+    // now read. Before that owner existed this page could not have known.
+    writeDeckSnoozed(new Set(['e1', 'e2']));
+    mockList.mockResolvedValue({ items: [deckable('e1'), deckable('e2')], count: 2 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-deck-set-aside')).not.toBeNull());
+
+    // No promise of a trip to a clear deck…
+    expect(screen.queryByTestId('feed-deck-link')).toBeNull();
+    // …and not silence either: the page says where they went.
+    expect(screen.getByTestId('feed-deck-set-aside').textContent).toContain('2 snoozed');
+  });
+
+  it('counts only the dealable remainder when the deck holds SOME of them', async () => {
+    writeDeckSnoozed(new Set(['e1']));
+    mockList.mockResolvedValue({ items: [deckable('e1'), deckable('e2')], count: 2 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-deck-link')).not.toBeNull());
+    expect(screen.getByTestId('feed-deck-link').textContent).toContain('1 decision waiting');
+    // The set-aside line is for the ZERO case only — one waiting card is not a
+    // moment to also narrate what isn't.
+    expect(screen.queryByTestId('feed-deck-set-aside')).toBeNull();
+  });
+
+  it('an unreadable hide-list hides NOTHING rather than everything', async () => {
+    // The safe direction: a corrupt store must not empty the banner, because an
+    // empty deck link with no explanation is the failure this whole fix is about.
+    window.sessionStorage.setItem(DECK_SNOOZE_KEY, '{not json');
+    mockList.mockResolvedValue({ items: [deckable('e1')], count: 1 });
+    render(<FeedPage />);
+    await waitFor(() => expect(screen.queryByTestId('feed-deck-link')).not.toBeNull());
+    expect(screen.getByTestId('feed-deck-link').textContent).toContain('1 decision waiting');
   });
 });

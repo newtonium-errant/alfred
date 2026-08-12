@@ -7,36 +7,20 @@ import { authApi } from '../lib/algernon/authClient';
 import Link from 'next/link';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { arrivedVerbless, isDeckDealt } from '../lib/algernon/feedConstants';
+import { readDeckSnoozed, writeDeckSnoozed } from '../lib/algernon/deckSnooze';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { CONSOLE_LABEL } from '../lib/algernon/consoleTokens';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
-// Client-side snooze hide-list (this session only) — a snoozed card is deferred to
-// the next sync, so it must not re-enter the deck if the page re-mounts. No store
-// write (Phase B; the board is Phase C).
-const SNOOZE_KEY = 'algernon_deck_snoozed';
-
-function readSnoozed(): Set<string> {
-  if (typeof window === 'undefined') return new Set();
-  try {
-    const raw = window.sessionStorage.getItem(SNOOZE_KEY);
-    const arr = raw ? (JSON.parse(raw) as unknown) : [];
-    return new Set(Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : []);
-  } catch {
-    return new Set();
-  }
-}
-
-function writeSnoozed(ids: Set<string>): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.sessionStorage.setItem(SNOOZE_KEY, JSON.stringify([...ids]));
-  } catch {
-    /* sessionStorage unavailable → snooze is best-effort in-memory only */
-  }
-}
+// The snooze hide-list moved to `lib/algernon/deckSnooze.ts` — unchanged logic,
+// same key, now with ONE owner. The feed's "N decisions waiting" banner has to
+// consult it too, and while it lived here as a module-private the feed could not:
+// it counted cards this deck had already refused to deal. See that module for
+// the incident.
+const readSnoozed = readDeckSnoozed;
+const writeSnoozed = writeDeckSnoozed;
 
 // The Decide deck: open decide-mode feed items as swipeable cards. Auth-gated
 // like the brief page (signed-out → /login?next=/deck).
