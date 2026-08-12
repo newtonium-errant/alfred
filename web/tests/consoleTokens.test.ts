@@ -212,7 +212,8 @@ describe('console identity — the wiring has no silent failure', () => {
     // half kept checking the original four, so a role could ship with no CSS
     // variables behind it and the suite stayed green. Verified by deleting the
     // new role's three custom properties — 0 failures before this change, 1
-    // after. The same map-pin-under-a-runtime-name shape the arc has hit before.
+    // after (single-file 1/14, full-suite 1/2001 at 5fc787bc). The same
+    // map-pin-under-a-runtime-name shape the arc has hit before.
     const consoleFamilies = ['console', ...ROLES, 'accent'];
     let checked = 0;
     for (const family of consoleFamilies) {
