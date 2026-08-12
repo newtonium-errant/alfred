@@ -1,4 +1,9 @@
 import '../styles/globals.css';
+// The console identity layer (interface-reimagine arc). Imported AFTER globals
+// so its console-scoped focus-ring override wins on order. Additive and
+// opt-in: it defines new tokens and new classes only, and restyles nothing
+// until a surface renders inside Layout's `surface="console"` variant.
+import '../styles/console.css';
 import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { Nunito } from 'next/font/google';
