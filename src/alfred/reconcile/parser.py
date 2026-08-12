@@ -191,6 +191,26 @@ STATEMENT_FIELD_SYNONYMS: dict[str, str] = {
 #: the writing side is how a renderer and its parser drift apart.
 INFERRED_TOKEN = "INFERRED"
 
+#: Where a statement date came from. A provider-printed date and one
+#: recovered from a scan batch's own label are NOT the same claim, and
+#: collapsing them would let a mistyped batch label re-home every claim
+#: line under it with no way to tell.
+DATE_SOURCE_HEADER = "header"
+DATE_SOURCE_CAPTURE = "capture_metadata"
+
+#: ``Page 3 of 4`` in a heading. ``N > 1`` means the provider is stating,
+#: in the document, that this block continues a statement already begun —
+#: the positive evidence a fold needs when the block carries no date.
+_PAGE_RE = re.compile(r"\bpage\s+(\d+)\s+of\s+(\d+)\b", re.IGNORECASE)
+
+#: ``Statement: 05 Jun 2026`` inside a scan-batch attribution comment. This
+#: is CAPTURE metadata, not provider content — see :data:`DATE_SOURCE_CAPTURE`.
+_CAPTURE_DATE_RE = re.compile(
+    r"statement\s*:\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\.?\s+[0-9]{4}"
+    r"|[0-9]{4}-[0-9]{1,2}-[0-9]{1,2})",
+    re.IGNORECASE,
+)
+
 #: A claim table must map these before the parser will read data rows from
 #: it. Without an amount-paid column there is nothing to reconcile, and
 #: without a date of service there is no key — so a table missing either is
@@ -335,6 +355,10 @@ class ParseResult:
     #: Table headings that matched no known column, per table. A populated
     #: list on the first seed is the signal that the synonym map needs a row.
     unmapped_headings: list[str] = field(default_factory=list)
+    #: Header labels carrying money that matched no known statement field.
+    #: A populated list is the signal that STATEMENT_FIELD_SYNONYMS needs a
+    #: row — the figure is captured meanwhile, never dropped.
+    unmapped_header_labels: list[str] = field(default_factory=list)
     #: Line numbers of headerless continuation tables whose column mapping was
     #: inherited from the previous table. Surfaced for the same reason
     #: collisions are: an inherited mapping is an inference, and an inference
@@ -345,6 +369,11 @@ class ParseResult:
     #: reason as ``continuations``: an inference that moves money between the
     #: claim sum and the cross-foot inputs must be visible.
     aggregate_rows: list[int] = field(default_factory=list)
+    #: Line numbers of statement blocks whose date was recovered from scan
+    #: batch metadata rather than printed by the provider. Surfaced because
+    #: it is a weaker claim, and one the operator cannot see is one he
+    #: cannot weigh.
+    capture_dated: list[int] = field(default_factory=list)
     #: Same-date statement blocks that were kept APART because their header
     #: facts conflicted, as ``(date, occurrence, reason)``.
     statement_splits: list[tuple[str, int, str]] = field(default_factory=list)
@@ -440,6 +469,10 @@ def _header_conflict(a: Statement, b: Statement) -> str | None:
     ``None`` means COMPATIBLE — every field is either absent on one side or
     equal on both. A field present on one side and absent on the other is
     NOT a conflict: that is exactly what a continuation header looks like.
+
+    Compatibility is NECESSARY BUT NOT SUFFICIENT for a fold. See
+    :func:`_fold_evidence` — two blocks that agree about nothing are
+    compatible and are not the same statement.
     """
     for name in _STATEMENT_IDENTITY_FIELDS:
         left, right = getattr(a, name), getattr(b, name)
@@ -447,6 +480,43 @@ def _header_conflict(a: Statement, b: Statement) -> str | None:
             continue
         if left != right:
             return f"{name} differs ({left!r} vs {right!r})"
+    return None
+
+
+def _fold_evidence(prior: Statement, block: Statement) -> str | None:
+    """What POSITIVELY identifies ``block`` as part of ``prior``, or ``None``.
+
+    THE rule this parser folds on, and the correction that the real note
+    forced: **a fold requires positive evidence of identity, not merely the
+    absence of contradiction.**
+
+    The bc1c rule folded any pair of same-date blocks with no conflicting
+    header fact. For DATED blocks that was accidentally sound — the shared
+    date IS positive evidence. For UNDATED ones it was not: two empty
+    headers contradict nothing, so every undated block folded into a single
+    pool, and on the real note that pool swallowed 175 claim lines (~45% of
+    the note) under one dateless statement with no declared total.
+
+    That is the same error as an empty claimant matching an empty aggregate
+    label — two blanks agreeing, called an identity. It was fixed one tier
+    down in bc1c and reappeared here, which is why the rule is now stated
+    once, positively, rather than as a list of things that would refuse it.
+
+    Two kinds of evidence, strongest first:
+
+    * ``page_continuation`` — the block is headed ``Page N of M`` with
+      ``N > 1``. The provider is saying, in the document, that this is a
+      later page of a statement already begun. Strong enough to fold a
+      block that carries NO date of its own, which is exactly the case
+      that was pooling.
+    * ``same_date`` — both blocks name the same statement date.
+
+    A block with neither stands alone, however compatible it looks.
+    """
+    if block.page_continuation:
+        return "page_continuation"
+    if block.statement_date and block.statement_date == prior.statement_date:
+        return "same_date"
     return None
 
 
@@ -517,6 +587,16 @@ def parse_note(
     last_mapping_stmt: Statement | None = None
     #: True while reading a two-column statement-totals block.
     in_totals_block = False
+    #: Most recent statement date seen in a scan-batch attribution comment.
+    pending_capture_date: str = ""
+    #: Header facts printed above a heading, awaiting the block they belong to.
+    pending_header: Statement | None = None
+    #: True between a statement's opening and its first table row. Unknown
+    #: header labels carrying money are only captured inside this window —
+    #: prose after the rows must not be able to inject a phantom total.
+    #: Starts TRUE: a note can open with header facts before any heading,
+    #: which is exactly the variant that lost a declared total.
+    in_statement_header = True
     # Occurrence counters, per (statement_date, claim_no, dos, benefit_code).
     # Claim lines and subtotal rows count SEPARATELY: they live in separate
     # indexes in the ledger, and sharing one counter would make a claim
@@ -540,6 +620,36 @@ def parse_note(
         nonlocal current_stmt
         if current_stmt is None:
             return
+        if (
+            not claims_for_current
+            and not current_stmt.statement_date
+            and (
+                current_stmt.declared_totals
+                or current_stmt.provider
+                or current_stmt.company
+                or current_stmt.payment_total is not None
+            )
+        ):
+            # HEADER FACTS PRINTED ABOVE THE HEADING. The real note's header
+            # variant puts an address line and a bolded total BEFORE the
+            # `## ...` that opens the statement, so this block holds facts
+            # and no rows. Flushing it as its own statement would mint a
+            # dateless, rowless phantom; dropping it loses the total — which
+            # is what happened, to the tune of a declared figure the
+            # statement then had none of. It is CARRIED FORWARD to the block
+            # the heading opens, which is whose facts they are.
+            nonlocal pending_header
+            pending_header = current_stmt
+            log.info(
+                "reconcile.parser.header_facts_carried",
+                line_no=current_stmt.source_line,
+                declared_totals=list(current_stmt.declared_totals),
+                detail="a header block with facts but no rows and no date — "
+                       "its facts belong to the statement that follows",
+            )
+            current_stmt = None
+            return
+
         has_content = bool(claims_for_current) or any((
             current_stmt.statement_date,
             current_stmt.provider,
@@ -554,6 +664,12 @@ def parse_note(
             # decision needs the whole header block read first.
             for r in (*claims_for_current, *subs_for_current):
                 r.statement_occurrence = current_stmt.statement_occurrence
+                if not r.statement_date and current_stmt.statement_date:
+                    # The row was built before the block's date was known
+                    # (a page continuation inherits its parent's at fold
+                    # time). Without this the rows keep an empty date and
+                    # group under the "(no date)" pool regardless.
+                    r.statement_date = current_stmt.statement_date
             if folded_onto is None:
                 result.statements.append(current_stmt)
             else:
@@ -597,47 +713,73 @@ def parse_note(
         attributes its claim lines to the first, which is what happened on
         the real note and what put a statement 16,894 out.
 
-        A block folds only when its header facts are COMPATIBLE with an
-        existing same-date block: no field where both carry a value and the
-        values differ. A bare continuation header (no provider, no total)
-        conflicts with nothing and folds, which is the legitimate case.
+        A block folds only on POSITIVE EVIDENCE of identity — see
+        :func:`_fold_evidence`. Compatibility alone is not enough: two
+        blocks that contradict each other about nothing agree about nothing
+        either, and treating that as identity is what pooled 175 undated
+        claim lines into one dateless statement on the real note.
 
         Returns the statement this block FOLDS ONTO, or ``None`` when it
         stands alone. The caller merges rather than appending in the fold
         case — two Statement rows sharing one key is how a continuation's
         empty header erases the real block's declared total.
         """
-        same_date = [
-            s for s in result.statements
-            if s.statement_date == stmt.statement_date
-        ]
-        if not same_date:
+        # A page continuation attaches to the statement it continues — the
+        # most recent one — rather than to a same-date cohort, because its
+        # own header usually carries no date at all. That is the case the
+        # date-cohort search structurally cannot serve.
+        if stmt.page_continuation and result.statements:
+            candidates = [result.statements[-1]]
+        else:
+            candidates = [
+                s for s in result.statements
+                if s.statement_date == stmt.statement_date
+            ]
+
+        if not candidates:
             stmt.statement_occurrence = 0
             return None
 
-        for prior in same_date:
+        for prior in candidates:
+            evidence = _fold_evidence(prior, stmt)
+            if evidence is None:
+                continue
             conflict = _header_conflict(prior, stmt)
-            if conflict is None:
-                stmt.statement_occurrence = prior.statement_occurrence
-                result.statement_folds.append(
-                    (stmt.statement_date, prior.statement_occurrence)
-                )
-                log.info(
-                    "reconcile.parser.statement_fold",
-                    statement_date=stmt.statement_date,
-                    occurrence=prior.statement_occurrence,
-                    prior_line=prior.source_line,
-                    folded_line=stmt.source_line,
-                    claim_lines=stmt.claim_line_count,
-                    detail="same-date block with no conflicting header fact "
-                           "— treated as a re-printed header for one "
-                           "statement, and its rows join the prior block",
-                )
-                return prior
+            if conflict is not None:
+                continue
+            if not stmt.statement_date:
+                # A page continuation inherits its parent's date. Without
+                # this the folded rows keep an empty statement_date and
+                # group_by_statement files them under the "(no date)" pool
+                # anyway — the fold would be recorded and have no effect.
+                stmt.statement_date = prior.statement_date
+                stmt.date_source = prior.date_source or DATE_SOURCE_HEADER
+            stmt.statement_occurrence = prior.statement_occurrence
+            result.statement_folds.append(
+                (stmt.statement_date, prior.statement_occurrence)
+            )
+            log.info(
+                "reconcile.parser.statement_fold",
+                statement_date=stmt.statement_date,
+                occurrence=prior.statement_occurrence,
+                evidence=evidence,
+                prior_line=prior.source_line,
+                folded_line=stmt.source_line,
+                claim_lines=stmt.claim_line_count,
+                detail="block folded onto a prior statement on positive "
+                       "evidence of identity; its rows join that block",
+            )
+            return prior
 
-        occurrence = max(s.statement_occurrence for s in same_date) + 1
+        occurrence = (
+            max(s.statement_occurrence for s in candidates) + 1
+            if candidates else 0
+        )
         stmt.statement_occurrence = occurrence
-        reason = _header_conflict(same_date[-1], stmt) or "unknown"
+        reason = (
+            _header_conflict(candidates[-1], stmt)
+            or "no positive evidence that these blocks are one statement"
+        )
         result.statement_splits.append(
             (stmt.statement_date, occurrence, reason)
         )
@@ -646,7 +788,7 @@ def parse_note(
             statement_date=stmt.statement_date,
             occurrence=occurrence,
             reason=reason,
-            prior_line=same_date[-1].source_line,
+            prior_line=candidates[-1].source_line,
             split_line=stmt.source_line,
             claim_lines=stmt.claim_line_count,
             detail="a second statement was issued on this date — kept "
@@ -657,9 +799,12 @@ def parse_note(
 
     def _begin_statement(line_no: int) -> Statement:
         nonlocal current_stmt, claims_for_current, subs_for_current
+        nonlocal in_statement_header
         _flush_statement()
         claims_for_current = []
         subs_for_current = []
+        nonlocal pending_header
+        in_statement_header = True
         current_stmt = Statement(
             source_note=source_note,
             source_line=line_no,
@@ -668,6 +813,13 @@ def parse_note(
             capture_ref=capture_ref,
             inferred=inferred_depth > 0,
         )
+        if pending_header is not None:
+            # Seed from the header facts printed above this heading.
+            current_stmt.declared_totals.update(pending_header.declared_totals)
+            for _f in _STATEMENT_IDENTITY_FIELDS:
+                if getattr(current_stmt, _f) in (None, ""):
+                    setattr(current_stmt, _f, getattr(pending_header, _f))
+            pending_header = None
         return current_stmt
 
     for i, raw_line in enumerate(lines):
@@ -676,6 +828,15 @@ def parse_note(
 
         # Attribution spans. Tracked before anything else so a marker on the
         # same line as content still flags that content.
+        capture_hit = _CAPTURE_DATE_RE.search(raw_line)
+        if capture_hit and stripped.startswith("<!--"):
+            try:
+                iso = parse_date(capture_hit.group(1), date_order=date_order)
+            except CellParseError:
+                iso = None
+            if iso:
+                pending_capture_date = iso
+
         if _INFERRED_BEGIN_RE.search(raw_line):
             inferred_depth += 1
             continue
@@ -698,13 +859,40 @@ def parse_note(
             # A heading often carries the statement date: "## Statement —
             # 11 Jun 2026". Try it, but never fail the note over a heading.
             title = heading.group(1).strip()
+            page = _PAGE_RE.search(title)
+            if page and int(page.group(1)) > 1:
+                stmt.page_continuation = True
             found = _date_from_free_text(title, date_order)
             if found:
                 stmt.statement_date = found
+                stmt.date_source = DATE_SOURCE_HEADER
+            elif pending_capture_date and not stmt.page_continuation:
+                # No printed date. Fall back to the scan batch's own label,
+                # recorded as the WEAKER provenance it is. Page continuations
+                # are excluded: they inherit their parent's date at fold time,
+                # which is a stronger claim than a batch label.
+                stmt.statement_date = pending_capture_date
+                stmt.date_source = DATE_SOURCE_CAPTURE
+                pending_capture_date = ""
+                result.capture_dated.append(line_no)
+                log.info(
+                    "reconcile.parser.date_from_capture_metadata",
+                    line_no=line_no,
+                    # The STATEMENT's date, not the pending buffer — the
+                    # buffer is consumed just above, so logging it reported
+                    # an empty string and the line that exists to make this
+                    # weaker provenance visible said nothing at all.
+                    statement_date=stmt.statement_date,
+                    detail="the block printed no date; recovered from the "
+                           "scan batch's own label. A CAPTURE claim, not a "
+                           "provider one — weaker, and recorded as such",
+                )
             continue
 
         # Table rows.
         if is_table_row(stripped):
+            # The header window closes at the statement's first table row.
+            in_statement_header = False
             cells = split_table_row(stripped)
             if _TABLE_SEP_RE.match(stripped):
                 # The |---|---| separator under a header. Nothing to read.
@@ -971,6 +1159,42 @@ def parse_note(
                 if current_stmt is None:
                     _begin_statement(line_no)
                 _apply_meta(current_stmt, target, meta.group(2).strip(), date_order)
+            elif in_statement_header:
+                if current_stmt is None:
+                    _begin_statement(line_no)
+                # An UNKNOWN header label carrying money. Captured into
+                # declared_totals rather than dropped — the same
+                # captured-not-interpreted posture the two-column totals
+                # block uses, and for the same reason: the figure is real
+                # and the label's meaning is not ours to invent.
+                #
+                # This is the half of the real note's header variant that
+                # silently lost $54,549 — a bolded multi-word total label
+                # matching no synonym, so the line parsed as prose and the
+                # statement opened with no declared total at all.
+                #
+                # Gated on being INSIDE a header block (before this
+                # statement's first table) so a stray "Note: $5 fee" in
+                # free text after the rows cannot inject a phantom total.
+                raw_value = meta.group(2).strip()
+                try:
+                    amount = parse_money(raw_value, field="header amount")
+                except CellParseError:
+                    amount = None
+                if amount is not None:
+                    label = strip_emphasis(meta.group(1)).strip()
+                    current_stmt.declared_totals.setdefault(label, str(amount))
+                    result.unmapped_header_labels.append(label)
+                    log.info(
+                        "reconcile.parser.unmapped_header_amount",
+                        line_no=line_no,
+                        label=label,
+                        amount=str(amount),
+                        detail="header line with an unrecognised label and a "
+                               "money value — captured as a declared total, "
+                               "NOT assigned to payment_total; add a "
+                               "STATEMENT_FIELD_SYNONYMS row if it is one",
+                    )
 
     _flush_statement()
 

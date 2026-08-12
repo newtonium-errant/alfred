@@ -174,6 +174,13 @@ class StatementTotals:
     #: :func:`compute_statement_totals`. Informational, so deliberately not
     #: part of :func:`_is_discrepant`.
     unattributed_aggregates: list[str] = field(default_factory=list)
+    #: Claim lines sitting under a statement with NO date. Its own finding
+    #: class, because an undated pool is not a cross-foot discrepancy — it
+    #: is rows that never reached a statement to be checked against, and
+    #: the cross-foot cannot see what was never filed. On the real note a
+    #: pool of 175 lines (~45% of the note) sat undated with no declared
+    #: total, and every dated statement's figures were collateral.
+    undated_lines: int = 0
 
 
 def _is_discrepant(totals: "StatementTotals") -> bool:
@@ -188,6 +195,7 @@ def _is_discrepant(totals: "StatementTotals") -> bool:
         (totals.payment_total_delta not in (None, _ZERO))
         or totals.subtotal_mismatches
         or totals.line_count_mismatch
+        or totals.undated_lines
     )
 
 
@@ -219,6 +227,14 @@ def compute_statement_totals(
 
     if statement.payment_total is not None:
         totals.payment_total_delta = totals.paid - statement.payment_total
+
+    if not statement.statement_date and claim_lines:
+        # An undated statement holding rows is a POOL: lines the parser
+        # could not attribute to any dated statement. Counted here so it
+        # can never be silent again — the cross-foot only checks rows that
+        # reached a statement, so a pool is invisible to every other check
+        # in this function by construction.
+        totals.undated_lines = len(claim_lines)
 
     if (
         statement.claim_line_count
@@ -486,6 +502,16 @@ def build_summary(
                 )
             for m in t.subtotal_mismatches:
                 out.append(f"  - {m}")
+            if t.undated_lines:
+                out.append(
+                    f"  - **{t.undated_lines} claim line(s) are not "
+                    f"attributed to any dated statement.** They parsed "
+                    f"cleanly but their block carried no date the parser "
+                    f"could read, so they are pooled under a dateless "
+                    f"statement and reconcile against nothing. Check the "
+                    f"seed's date_from_capture_metadata and statement_split "
+                    f"lines for where the attribution broke."
+                )
             if t.line_count_mismatch:
                 declared, held = t.line_count_mismatch
                 out.append(
