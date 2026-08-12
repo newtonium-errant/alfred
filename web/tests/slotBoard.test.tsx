@@ -116,6 +116,30 @@ describe('SlotBoard — the three stacks speak SLOTS', () => {
     expect(screen.queryByTestId('board-today-rhythm')).toBeNull();
   });
 
+  // The residue signal drives BOTH directions plus the honesty carve-out, because
+  // an absent stack alone cannot distinguish "the classifier answered everything"
+  // from "the residue feature isn't wired". Coverage is 100% on the box today, so
+  // the LINE is what the operator actually sees every morning — the stack is the
+  // rarer branch, and neither may be silent.
+  it('unslotted=0 with items on the board: the line renders, no stack', () => {
+    render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' })]} />);
+    expect(screen.getByTestId('board-residue-clear').textContent).toBe('Everything today was sorted.');
+    expect(screen.queryByTestId('board-stack-unslotted')).toBeNull();
+  });
+
+  it('unslotted>0: the full stack renders, no line', () => {
+    render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' }), slot({ id: 'b', title: 'Mystery' }, {})]} />);
+    expect(screen.getByTestId('board-stack-unslotted').textContent).toContain('Mystery');
+    expect(screen.queryByTestId('board-residue-clear')).toBeNull();
+  });
+
+  it('an EMPTY board claims neither — nothing was sorted, so it must not say so', () => {
+    render(<Harness items={[]} />);
+    expect(screen.queryByTestId('board-residue-clear')).toBeNull();
+    expect(screen.queryByTestId('board-stack-unslotted')).toBeNull();
+    expect(screen.getByTestId('board-balance').textContent).toContain('Nothing on the board yet today');
+  });
+
   it('shows the unslotted residue with its own honest note, and only when present', () => {
     const { unmount } = render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' })]} />);
     expect(screen.queryByTestId(`board-stack-unslotted`)).toBeNull();

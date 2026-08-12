@@ -88,6 +88,9 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     [items, stageOf, now, grace.optimisticallyDone],
   );
   const balanced = boardSlotsWithADone(stacks);
+  // The residue stack exists only when something went unclassified — see the
+  // ILB line below for what renders in its place when it doesn't.
+  const hasResidue = stacks.some((s) => s.key === BOARD_UNSLOTTED);
   const totalOnBoard = stacks.reduce(
     (n, s) => n + s.today.length + s.carryover.length + s.candidates.length + s.done.length + s.overflow.length,
     0,
@@ -380,6 +383,21 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           <div data-testid="board-stacks" className="mt-2 flex flex-col gap-3">
             {stacks.map(renderStack)}
           </div>
+          {totalOnBoard > 0 && !hasResidue && (
+            // Intentionally-left-blank for the RESIDUE: when the classifier
+            // answered for everything there is no fourth stack, and an absent
+            // stack makes "it sorted all of today" and "the residue feature
+            // isn't wired" look identical. One subordinate line rather than a
+            // permanently-empty container: the signal always fires, and it costs
+            // a line instead of a box on the operator's primary morning surface.
+            //
+            // Gated on the board having ITEMS. On an empty board nothing was
+            // sorted, so this sentence would be a small lie told on the quietest
+            // morning — the board-level line above already says the true thing.
+            <p data-testid="board-residue-clear" className="mt-2 text-[11px] text-honeydew-600">
+              Everything today was sorted.
+            </p>
+          )}
         </>
       )}
 
