@@ -157,6 +157,35 @@ export const UNSLOTTED_LABEL = 'Not sorted yet';
  * `snooze_1d`, so a snoozed item is never due back on the day it left, and the
  * day it was snoozed it was still on the board. A sub-day rung would break that
  * and these lines would need re-checking.
+ *
+ * ── WHICH POPULATION EACH BRANCH GOVERNS ────────────────────────────────────
+ * Spelled out because "snoozing is an act" is true but underspecified, and that
+ * gap let three successive walks of this paragraph diverge — each following one
+ * handler in a verb space that has two. Anchored below to the lines that WRITE
+ * the state rather than to the comments describing it: every wrong revision of
+ * this paragraph came from reasoning over prose.
+ *
+ * A slot snooze sets `state=acted` with `acted_action='snooze'` — literally
+ * `feed_store.set_state(id, STATE_ACTED, action=SNOOZE_ACTED_VERB)` in
+ * `_dispatch_slot_snooze` (`daily_sync/action_router.py:911`; the verb is
+ * `"snooze"` at :124). So the item stays visible the day it is snoozed and
+ * drops the following day, via `ringItemVisibleToday`'s `acted_at` check.
+ *
+ * THE TRAP, NAMED — because a correct description does not stop the next reader
+ * rediscovering the wrong answer. `FeedStore.defer` / `STATE_DEFERRED`
+ * (`feed/store.py`) is real, reachable and correct — FOR OTHER KINDS. It cannot
+ * apply to anything on this board:
+ * `DEFER_EXCLUDED_KINDS = frozenset({"slot_suggestion"})` (`action_router.py`)
+ * is consulted where FEED_ACTIONS and ACTION_META are built, so a `defer_*` verb
+ * is never ATTACHED to the board's only kind — unreachable at the capability
+ * ceiling, not merely unused. It is the plausible wrong answer one file from the
+ * right one, and it has already misled every pass over this paragraph that began
+ * from the function name. Check the exclusion set before believing it applies.
+ *
+ * The surface fact that composes with both: home fetches `feedApi.list({})` with
+ * NO state filter, deliberately (`pages/index.tsx` — the rings need today's done
+ * items), so every state reaches the board and `ringItemVisibleToday` is the
+ * whole gate here. The `state: 'open'` fetch is the FEED page's, not this one's.
  */
 export const SLOT_EMPTY_COPY: Record<string, string> = {
   duty: 'Nothing owed today.',

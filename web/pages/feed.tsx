@@ -419,7 +419,14 @@ export default function FeedPage() {
               "back at the next sync"      false for B — the bug this replaced
               "until you bring them back"  false for A — it returns unaided
               "you can bring them back"    false for A — no un-hide control here
-              "they'll come back"          TRUE for every member
+              "they'll come back"          TRUE for every member — but the
+                                           indefinite rung returns by
+                                           breakthrough or unsnooze, NEVER by
+                                           timer ("what earns a row its way
+                                           back is urgency, not the calendar"
+                                           — tier/snooze.py, on that very rung).
+                                           Which is precisely why the line may
+                                           assert return and must not say when.
               "set aside" / nothing lost   TRUE for every member
 
             THE RULE THAT FALLS OUT: ASSERT RETURN, NEVER TIMING AND NEVER
