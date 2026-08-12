@@ -1,6 +1,7 @@
 import { ReactNode, useState } from 'react';
 import Link from 'next/link';
 import { cn } from '../lib/utils';
+import type { SurfaceIdentity } from '../lib/algernon/consoleTokens';
 import { ReportBugFab } from './ReportBugFab';
 
 // One frontend deployment targets ONE instance (blueprint §5). The instance's
@@ -61,8 +62,6 @@ type LayoutProps = {
    */
   surface?: SurfaceIdentity;
 };
-
-export type SurfaceIdentity = 'warm' | 'console';
 
 /**
  * The per-surface class table. Every visual difference between the two

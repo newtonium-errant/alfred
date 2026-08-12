@@ -31,6 +31,21 @@ import type { Verdict, VerbWeight } from './feedConstants';
 export type ConsoleRole = 'affirm' | 'negative' | 'caution' | 'info';
 
 /**
+ * Which visual identity a surface (or a shared component rendered inside one)
+ * is wearing.
+ *
+ * Lives here rather than in Layout because Layout is not the only thing that
+ * needs it: components shared between an adopted surface and a not-yet-adopted
+ * one — `EvidenceBody` renders inside both the console deck card and the warm
+ * feed row — take it as a prop so they can be correct in both places without
+ * either surface reaching into the other.
+ *
+ * `warm` is always the default. A shared component must render exactly as it
+ * did before when nobody passes anything.
+ */
+export type SurfaceIdentity = 'warm' | 'console';
+
+/**
  * The role a gesture verdict is drawn in — the D3 axis made visible.
  *
  * Horizontal is the judgement axis (right affirms, left declines) and vertical

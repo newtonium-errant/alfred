@@ -62,6 +62,21 @@ export interface FeedItem {
   acted_at: string | null;
   expires_at: string | null;
   source_ref: Record<string, unknown>;
+  /**
+   * The item's own interval extent (D7) — when the thing HAPPENS, as opposed to
+   * `created_at`, which is when the feed learned about it (provenance, not
+   * content). Independently optional: an instant is start-only, and
+   * `ends_at: null` means "no known end", never "ends immediately".
+   *
+   * These already arrive on the wire — the BFF relays the transport body
+   * verbatim and there is no schema on the response path — so declaring them
+   * here is the whole of the client-side wiring. Read them through
+   * `lib/algernon/timeExtent.ts`, never by parsing the strings at a call site:
+   * a date-only value (an all-day event) parses to midnight UTC and would
+   * otherwise render as a zero-length interval at 00:00.
+   */
+  starts_at?: string | null;
+  ends_at?: string | null;
 }
 
 export interface FeedListResponse {
