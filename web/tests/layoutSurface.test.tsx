@@ -125,7 +125,8 @@ describe('Layout surface identities', () => {
     // That is the whole of what this side promises. It is NOT a promise that
     // adoption changes nothing to look at — the attribute moving to the root
     // widens its coverage to the shell, and the Awareness feed's 2026-08-12
-    // audit found 3 of its 28 selectors would repaint it. That pin belongs to
+    // audit found 4 selectors, across 3 rule categories, that would repaint it
+    // (their count, cited not measured here). That pin belongs to
     // the adopting surface, against its own stylesheet; this one only covers
     // the fallback.
     const { container } = render(

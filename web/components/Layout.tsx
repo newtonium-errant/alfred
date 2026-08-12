@@ -71,9 +71,11 @@ type LayoutProps = {
    * so any of the adopting surface's own `[data-surface="…"]`-scoped selectors
    * now reach the nav and the header too. Whether that is visible is a fact
    * about the adopter's stylesheet, not about this component: the Awareness
-   * feed's 2026-08-12 selector audit found 3 of its 28 would repaint the shell
-   * (its bare root rule, its `:focus-visible` retarget, and its danger-class
-   * descendants). So an adopting surface owes itself a pin that its scoped
+   * feed's 2026-08-12 selector audit found 4 selectors, across 3 rule
+   * categories, that would repaint the shell (its bare root rule, its
+   * `:focus-visible` retarget, and its danger-class descendants). Those are
+   * THEIR counts, cited not measured — this side cannot see that stylesheet.
+   * So an adopting surface owes itself a pin that its scoped
    * selectors stay off the shell — keeping property definitions on the root
    * while painting declarations move to a content-scoped element. This side
    * promises only the chrome fallback and the verbatim attribute.

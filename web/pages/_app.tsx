@@ -1,9 +1,11 @@
 import '../styles/globals.css';
-// The console identity layer (interface-reimagine arc). Imported AFTER globals
-// so its console-scoped focus-ring override wins on order. Additive and
-// opt-in: it defines new tokens and new classes only, and restyles nothing
-// until a surface renders inside Layout's `surface="console"` variant.
+// The two Phase B surface skins, both imported AFTER globals so their
+// surface-scoped overrides (the console's focus ring, the sensor log's own)
+// win on order. Each is additive and opt-in: neither defines a rule that is
+// not scoped under its surface's `data-surface` attribute, so importing both
+// unconditionally restyles nothing that has not asked for it.
 import '../styles/console.css';
+import '../styles/sensorLog.css'; // feed surface skin + token seam; see that file's header
 import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { Nunito } from 'next/font/google';

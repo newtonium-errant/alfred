@@ -1,6 +1,6 @@
 import { FencedText } from '../markdown/FencedText';
 import { evidenceBody, evidenceExternalLink, isEmailEvidence } from '../../lib/algernon/feedEvidence';
-import type { SurfaceIdentity } from '../../lib/algernon/consoleTokens';
+import { WARM_SURFACE, type KnownSurface, type SurfaceIdentity } from '../../lib/algernon/consoleTokens';
 
 // Renders an item's evidence `body` as readable multiline PROSE (paragraph flow,
 // not a key:value row) — the digest text a peer_digest card was otherwise missing,
@@ -21,10 +21,26 @@ import type { SurfaceIdentity } from '../../lib/algernon/consoleTokens';
 //
 // SHARED BETWEEN TWO IDENTITIES. This renders inside the console deck card AND
 // inside the warm feed row, so the palette is a prop rather than a rewrite.
-// `warm` is the default and is byte-identical to what shipped — a surface that
-// has not adopted the console identity passes nothing and changes not at all.
+// `warm` is the default and renders exactly the classes this component always
+// rendered — a surface that has not adopted the console identity passes nothing
+// and this component changes not at all.
+//
+// Scoped to THIS COMPONENT deliberately. It says nothing about the surrounding
+// page: the shared Layout now labels every surface with a `data-surface`
+// attribute, so a page's own root markup is not unchanged even where this
+// component's output is. The narrower claim is the true one, and the broader
+// one is the misreading worth foreclosing.
 // The feed lane flips its own call site when it adopts.
-const SKIN: Record<SurfaceIdentity, { frame: string; text: string; note: string; link: string }> = {
+//
+// KEYED ON `KnownSurface`, NOT `SurfaceIdentity` — and that is load-bearing,
+// not a tidy-up. `SurfaceIdentity` is an OPEN union (`KnownSurface | (string &
+// {})`), and `Record<open-union, T>` degenerates to a string index signature:
+// the lookup below would type as `T` rather than `T | undefined`, so TypeScript
+// would report nothing at all for a name with no entry. Keying the table on the
+// closed union is what keeps the compiler able to see the gap; the fallback in
+// `skinFor` is what makes the gap survivable at runtime. Both halves, or
+// neither works.
+const SKIN: Record<KnownSurface, { frame: string; text: string; note: string; link: string }> = {
   warm: {
     frame: 'max-h-64 overflow-y-auto rounded-lg border border-honeydew-200 bg-honeydew-50 px-3 py-2',
     text: 'whitespace-pre-wrap break-words text-xs leading-relaxed text-honeydew-700',
@@ -39,14 +55,29 @@ const SKIN: Record<SurfaceIdentity, { frame: string; text: string; note: string;
   },
 };
 
+/**
+ * The skin for a surface name, falling back to `warm` for any name this
+ * component has no entry for.
+ *
+ * The same contract as Layout's `surfaceClasses`, and it exists for the same
+ * reason: `surface` accepts ANY name (a surface owns its skin in its own
+ * stylesheet and adopts the prop without waiting on a change here), so a bare
+ * lookup would throw on the first unregistered one. This component is rendered
+ * inside surfaces it has never heard of by design — that is the point of the
+ * seam — and a shared component that crashes its host is not a seam.
+ */
+function skinFor(name: SurfaceIdentity) {
+  return (SKIN as Record<string, (typeof SKIN)[KnownSurface] | undefined>)[name] ?? SKIN[WARM_SURFACE];
+}
+
 export function EvidenceBody({
   evidence,
-  surface = 'warm',
+  surface = WARM_SURFACE,
 }: {
   evidence: unknown;
   surface?: SurfaceIdentity;
 }) {
-  const skin = SKIN[surface];
+  const skin = skinFor(surface);
   const body = evidenceBody(evidence);
   const link = evidenceExternalLink(evidence);
   if (!body && !link) return null;
