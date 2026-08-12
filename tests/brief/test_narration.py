@@ -61,10 +61,12 @@ def _plan(view=None):
     )
 
 
-def _compose(view=None, health=None, events=None, weather=None, config=None, plan=None):
+def _compose(view=None, health=None, events=None, weather=None, config=None,
+             plan=None, waiting=None):
     return compose_narration(
         brief_date=DATE,
         plan=plan if plan is not None else _plan(view),
+        waiting_count=waiting,
         health_lines=health or [],
         events=events or [],
         weather_stations=weather or [],
@@ -289,3 +291,97 @@ def test_compose_emits_named_log() -> None:
     assert len(events) == 1
     assert events[0]["brief_date"] == DATE
     assert "sections" in events[0]
+
+
+# --- deck-waiting segment (C3: "N waiting", never read the items out) --------
+
+
+def test_waiting_says_the_count_and_routes_to_the_deck() -> None:
+    """A briefing is one-way audio: an item needing a yes/no cannot be answered
+    by listening to it. The count is the actionable part; the deck is where the
+    answering happens."""
+    from alfred.brief.narration import SECTION_WAITING
+
+    seg = [s for s in _compose(waiting=3).segments if s.section_id == SECTION_WAITING]
+    assert len(seg) == 1
+    assert "3 things waiting" in seg[0].text
+    assert "deck" in seg[0].text.lower()
+
+
+def test_waiting_singular_reads_naturally() -> None:
+    from alfred.brief.narration import SECTION_WAITING
+
+    seg = [s for s in _compose(waiting=1).segments if s.section_id == SECTION_WAITING]
+    assert "1 thing waiting" in seg[0].text
+
+
+def test_waiting_zero_is_spoken_not_omitted() -> None:
+    """Intentionally-left-blank: "nothing waiting" is a real and welcome
+    answer. A slide that vanished at zero would be indistinguishable from one
+    whose count failed to load — which is the case where the operator most
+    needs to know not to trust it."""
+    from alfred.brief.narration import SECTION_WAITING
+
+    seg = [s for s in _compose(waiting=0).segments if s.section_id == SECTION_WAITING]
+    assert len(seg) == 1
+    assert "Nothing waiting" in seg[0].text
+
+
+def test_waiting_unreadable_omits_the_slide() -> None:
+    """``None`` is the read-failure signal — speaking a number we could not
+    read is worse than silence, and a confident "nothing waiting" would be
+    actively misleading. Paired with the zero case above, which proves the
+    slide CAN render, so this is not passing on a dead segment."""
+    from alfred.brief.narration import SECTION_WAITING
+
+    narr = _compose(waiting=None)
+    assert not any(s.section_id == SECTION_WAITING for s in narr.segments)
+
+
+def test_waiting_count_counts_open_decide_items_only(tmp_path) -> None:
+    """Waiting = mode decide AND state open. An FYI item is not waiting on a
+    decision, and an acted one was already answered — both are the nearest
+    admissible neighbours to a genuine waiting item, so both are seeded here
+    alongside one that MUST count."""
+    from alfred.brief.narration import count_waiting_items
+    from alfred.feed import FeedItem, FeedStore
+
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    # decide + open → counts.
+    store.upsert(FeedItem.create(
+        kind="proposal", stable_key="p1", instance="salem", title="decide me",
+        evidence={},
+    ))
+    # decide + acted → already answered.
+    acted = FeedItem.create(
+        kind="proposal", stable_key="p2", instance="salem", title="done",
+        evidence={},
+    )
+    store.upsert(acted)
+    store.set_state(acted.id, "acted")
+    # fyi + open → nothing to answer.
+    store.upsert(FeedItem.create(
+        kind="health", stable_key="h1", instance="salem", title="fyi",
+        evidence={},
+    ))
+
+    assert count_waiting_items(str(tmp_path / "feed.jsonl")) == 1
+
+
+def test_waiting_count_returns_none_on_a_read_failure(tmp_path) -> None:
+    """Degrade to the omitted slide rather than to a confident zero."""
+    from alfred.brief.narration import count_waiting_items
+
+    bad = tmp_path / "feed.jsonl"
+    bad.mkdir()  # a directory where a file is expected
+    assert count_waiting_items(str(bad)) is None
+
+
+def test_waiting_count_zero_when_no_store_yet(tmp_path) -> None:
+    """A store that does not exist YET is a genuine zero, not a failure — an
+    instance with no feed has nothing waiting, and that is worth saying. The
+    positive control for the unreadable pin above: without it, "returns None on
+    failure" would pass against a function that returned None always."""
+    from alfred.brief.narration import count_waiting_items
+
+    assert count_waiting_items(str(tmp_path / "never-written.jsonl")) == 0
