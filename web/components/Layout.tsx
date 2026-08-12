@@ -2,11 +2,11 @@ import { ReactNode, useState } from 'react';
 import Link from 'next/link';
 import { cn } from '../lib/utils';
 import {
-  CONSOLE_SURFACE,
   WARM_SURFACE,
   type KnownSurface,
   type SurfaceIdentity,
 } from '../lib/algernon/consoleTokens';
+import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 import { ReportBugFab } from './ReportBugFab';
 
 // One frontend deployment targets ONE instance (blueprint §5). The instance's
@@ -105,7 +105,51 @@ type SurfaceClasses = Record<string, string>;
  * skins itself entirely from its own stylesheet needs no entry here — see
  * `surfaceClasses` for what an unregistered name gets.
  */
-const SURFACE: Record<KnownSurface, SurfaceClasses> = {
+/**
+ * The console HULL — extracted and named because two surfaces wear it. The deck
+ * is its origin; the Awareness feed adopted it on the operator's live verdict
+ * (deck "good", feed "mixed aesthetics" — a warm shell framing a dark sensor
+ * panel), which settled the standing dark-shell option BY OBSERVATION.
+ *
+ * SHARED BY REFERENCE, not copied, and that is load-bearing: `wearsConsoleChrome`
+ * below is an identity test against this object, so "which surfaces wear the
+ * hull" is ONE fact rather than two lists to keep aligned. A surface that needs
+ * to diverge forks this object, and in doing so consciously decides whether the
+ * hull's structural extras come with it.
+ */
+const CONSOLE_CHROME: SurfaceClasses = {
+  root: 'min-h-screen bg-console-hull',
+  // No backdrop-blur and no translucency: the console reads as panels bolted
+  // to a hull, and a frosted header would be the chrome the grammar refuses.
+  header: 'sticky top-0 z-10 bg-console-void',
+  headerInner: 'mx-auto flex max-w-5xl items-stretch gap-[3px] px-2 py-2 sm:px-3',
+  logo:
+    'console-railseg flex min-w-0 shrink items-center gap-2 truncate bg-console-panel px-4 text-sm font-extrabold uppercase tracking-[0.22em] text-affirm',
+  badge: 'rounded-full bg-caution px-2 py-0.5 text-xs font-bold text-console-on-fill',
+  navLink:
+    'console-railseg flex items-center whitespace-nowrap bg-console-raise px-3.5 text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-dim hover:bg-affirm-wash hover:text-affirm',
+  signOut:
+    'console-railseg flex items-center whitespace-nowrap bg-console-raise px-3.5 text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-faint hover:text-negative',
+  burger:
+    'console-railseg shrink-0 bg-console-raise px-3 text-lg leading-none text-console-ink-dim sm:hidden',
+  mobilePanel: 'bg-console-void px-2 pb-2 sm:hidden',
+  mobileLink:
+    'console-railseg bg-console-raise px-3.5 py-2.5 text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-dim',
+  mobileSignOut:
+    'console-railseg bg-console-raise px-3.5 py-2.5 text-left text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-faint',
+  main: 'mx-auto px-3 py-4 sm:px-4',
+};
+
+/**
+ * Keyed by `KnownSurface` PLUS the feed's own name, imported rather than
+ * re-typed. `sensor-log` deliberately does NOT join `KnownSurface` in
+ * consoleTokens.ts: `sensorSurface.ts` states that the name belongs to the feed
+ * and that the shared layer needs no entry for it, and having the shared layer
+ * import the feed's module would invert the dependency. Widening the key type
+ * HERE keeps that true while still giving the entry a compile-time home — and
+ * the literal still exists in exactly one place.
+ */
+const SURFACE: Record<KnownSurface | typeof SENSOR_SURFACE, SurfaceClasses> = {
   warm: {
     root: 'min-h-screen bg-honeydew-50',
     header: 'sticky top-0 z-10 border-b border-honeydew-200 bg-honeydew-50/90 backdrop-blur',
@@ -123,28 +167,15 @@ const SURFACE: Record<KnownSurface, SurfaceClasses> = {
       'rounded-xl border border-honeydew-300 bg-white px-3 py-2 text-left text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50',
     main: 'mx-auto px-5 py-8',
   },
-  console: {
-    root: 'min-h-screen bg-console-hull',
-    // No backdrop-blur and no translucency: the console reads as panels bolted
-    // to a hull, and a frosted header would be the chrome the grammar refuses.
-    header: 'sticky top-0 z-10 bg-console-void',
-    headerInner: 'mx-auto flex max-w-5xl items-stretch gap-[3px] px-2 py-2 sm:px-3',
-    logo:
-      'console-railseg flex min-w-0 shrink items-center gap-2 truncate bg-console-panel px-4 text-sm font-extrabold uppercase tracking-[0.22em] text-affirm',
-    badge: 'rounded-full bg-caution px-2 py-0.5 text-xs font-bold text-console-on-fill',
-    navLink:
-      'console-railseg flex items-center whitespace-nowrap bg-console-raise px-3.5 text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-dim hover:bg-affirm-wash hover:text-affirm',
-    signOut:
-      'console-railseg flex items-center whitespace-nowrap bg-console-raise px-3.5 text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-faint hover:text-negative',
-    burger:
-      'console-railseg shrink-0 bg-console-raise px-3 text-lg leading-none text-console-ink-dim sm:hidden',
-    mobilePanel: 'bg-console-void px-2 pb-2 sm:hidden',
-    mobileLink:
-      'console-railseg bg-console-raise px-3.5 py-2.5 text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-dim',
-    mobileSignOut:
-      'console-railseg bg-console-raise px-3.5 py-2.5 text-left text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-faint',
-    main: 'mx-auto px-3 py-4 sm:px-4',
-  },
+  console: CONSOLE_CHROME,
+  // The Awareness feed wears the same HULL as the deck — the designed path the
+  // open seam anticipated ("requires a chrome-table entry — a contract
+  // conversation"), now operator-ruled. Its own identity stays in its CONTENT
+  // register (styles/sensorLog.css, scoped under `[data-surface='sensor-log']`).
+  // Nothing about this entry paints content: the shell goes dark because the
+  // chrome table says so, NOT because the sensor stylesheet leaked upward, which
+  // is the distinction `sensorLogShell.test.tsx` exists to keep true.
+  [SENSOR_SURFACE]: CONSOLE_CHROME,
 };
 
 /**
@@ -195,10 +226,17 @@ export function Layout({
   // A single nav item with no sign-out needs no mobile overflow menu.
   const showHamburger = NAV_LINKS.length > 1 || onSignOut != null;
   const s = surfaceClasses(surface);
-  // Drives the console's two structural extras (the elbow, and the rail's
-  // fill spacer). Skin only — the `data-surface` emission below is
-  // deliberately free of any per-name branch.
-  const isConsole = surface === CONSOLE_SURFACE;
+  // Drives the hull's two structural extras (the elbow, and the rail's fill
+  // spacer). Skin only — the `data-surface` emission below is deliberately free
+  // of any per-name branch.
+  //
+  // CHROME-DERIVED, not name-derived. The elbow is the corner block that turns a
+  // vertical rail into a horizontal header, and the hull's `items-stretch`
+  // railseg layout is built around it — so a surface wearing this chrome without
+  // it renders a gap. Testing the resolved chrome by identity means the extras
+  // belong to whoever wears the hull, which is one fact instead of a name list
+  // that drifts as surfaces adopt it.
+  const isConsole = s === CONSOLE_CHROME;
 
   return (
     <div className={s.root} data-surface={surface}>

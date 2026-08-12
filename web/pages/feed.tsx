@@ -15,6 +15,7 @@ import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { useSnooze } from '../components/feed/useSnooze';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { contestableItem, isDeckDealt } from '../lib/algernon/feedConstants';
+import { readDeckSnoozed } from '../lib/algernon/deckSnooze';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { subtle, title as titleClass } from '../lib/typography';
@@ -51,6 +52,10 @@ export default function FeedPage() {
   const [showDone, setShowDone] = useState(false);
   // Collapsed by default — parity with the done drill (#26) and the rings.
   const [showSnoozed, setShowSnoozed] = useState(false);
+  // The DECK's own hide-list, re-read on every feed load. Starts empty so the
+  // server render and the first client render agree; a hide-list that cannot be
+  // read hides nothing, which is the safe direction (see deckSnooze.ts).
+  const [deckHidden, setDeckHidden] = useState<ReadonlySet<string>>(() => new Set());
   // The chosen view. Held in state AND mirrored to the URL rather than read
   // straight off the router: the state is what makes the toggle respond on the
   // spot, the URL is what makes a view linkable and reload-stable. Seeded from
@@ -99,6 +104,21 @@ export default function FeedPage() {
       cancelled = true;
     };
   }, [authed]);
+
+  // Re-read the DECK's hide-list whenever the feed re-reads, keyed on `items`
+  // rather than hung off a loader. THIS PAGE HAS TWO LOAD PATHS — the mount
+  // effect above and the hoisted `loadFeed` the resume refetch calls — and
+  // putting the sync in one of them is precisely the standing trap where a
+  // feature is live on the path the tests drive and dead on the other. Every
+  // load lands in `items` by definition, so a third loader inherits this for
+  // free instead of having to remember it.
+  //
+  // The operator's usual path is feed → deck → snooze → back, so the resume
+  // refetch is exactly when this page needs to learn what the deck set aside
+  // while it wasn't looking.
+  useEffect(() => {
+    setDeckHidden(readDeckSnoozed());
+  }, [items]);
 
   // Seed from `?view=` when the router hydrates it. Deliberately one-directional
   // and value-guarded: it only ever adopts a RECOGNISED view, so a mistyped URL
@@ -163,7 +183,20 @@ export default function FeedPage() {
   // that also drives the deck-link count, so it matches what /deck deals). Slot rows
   // (suggested → Accept, planned → ✓) ALSO render inline as the worklist — a suggested
   // slot is legitimately on both the deck link and the inline list (team-lead ruling).
-  const deckable = activeNeedsYou.filter(isDeckDealt);
+  //
+  // …AND MINUS WHAT THE DECK WILL REFUSE TO DEAL. `isDeckDealt` answers "is this
+  // kind dealable", which is not the same question as "will the deck actually
+  // deal it today". A snooze lives in one of two places and this banner has to
+  // respect both: the deck's own sessionStorage hide-list (`deckHidden` — it
+  // filters its load through exactly this set) and this page's server-confirmed
+  // `useSnooze`. Counting either as "waiting" sends the operator to a deck that
+  // has already set it aside — the promise-a-trip-to-a-wall bug his 2026-08-12
+  // screenshots caught ("2 decisions waiting" → "DECK CLEAR — 2 snoozed").
+  const setAside = (it: FeedItem) => snooze.snoozed(it.id) || deckHidden.has(it.id);
+  const deckable = activeNeedsYou.filter((it) => isDeckDealt(it) && !setAside(it));
+  // What the deck is holding rather than dealing — counted so the zero case can
+  // explain itself instead of going quiet.
+  const setAsideDeckable = activeNeedsYou.filter((it) => isDeckDealt(it) && setAside(it));
   const pendingRows = activeNeedsYou.filter(
     (it) => it.kind === 'slot_suggestion' && !snooze.snoozed(it.id),
   );
@@ -362,6 +395,18 @@ export default function FeedPage() {
             </span>
             <span aria-hidden>Open the deck →</span>
           </Link>
+        )}
+
+        {/* Intentionally-left-blank, and the other half of the honesty fix: when
+            the deck has nothing to deal BECAUSE things are set aside, say which
+            rather than rendering nothing. Silence here is what let the old
+            banner's disappearance read as "handled" when it meant "deferred".
+            TODO(voicing). */}
+        {loaded && deckable.length === 0 && setAsideDeckable.length > 0 && (
+          <p data-testid="feed-deck-set-aside" className="mt-4 text-sm text-honeydew-600">
+            {setAsideDeckable.length} snoozed — back at the next sync. Nothing else
+            is waiting in the deck.
+          </p>
         )}
 
         {loaded && view === 'timeline' && (

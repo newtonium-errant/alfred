@@ -297,3 +297,77 @@ export function boardStacks(
 export function boardSlotsWithADone(stacks: BoardStack[]): number {
   return stacks.filter((s) => SLOT_ORDER.includes(s.key) && s.doneCount > 0).length;
 }
+
+/** Every item a stack holds, across all of its sections. One owner for the sum. */
+export function boardStackSize(stack: BoardStack): number {
+  return (
+    stack.today.length +
+    stack.carryover.length +
+    stack.candidates.length +
+    stack.done.length +
+    stack.overflow.length
+  );
+}
+
+/**
+ * The coverage floor below which the board admits it is working from part of the
+ * day. **Operator-ratified at 0.80 on 2026-08-12** ("use the 80% default and
+ * we'll see how it looks in practice"), filling the dial the 2026-08-04
+ * slot-classifier design §8 specified and left unset. It is a DIAL, not a
+ * constant of nature — moving it is a one-line edit plus its boundary pin.
+ *
+ * The comparison is `< SLOT_COVERAGE_WARN`, so exactly 80% does NOT warn.
+ * Measured rather than assumed, because that edge is a float question: every
+ * ratio reducing to 4/5 (4/5, 8/10, 16/20, 40/50, 80/100 …) is exactly `0.8` in
+ * IEEE double, so the boundary is exact and needs no epsilon.
+ */
+export const SLOT_COVERAGE_WARN = 0.8;
+
+/** How much of today the slot classifier could actually answer for. */
+export interface BoardCoverage {
+  /** Items in a canonical slot. */
+  slotted: number;
+  /** Items the classifier refused to guess at. */
+  unslotted: number;
+  total: number;
+  /**
+   * Slotted share, 0..1 — or **null when there is nothing to measure**.
+   *
+   * The empty board is a THIRD state, expressed in the type so that a warning
+   * about it is unrepresentable rather than merely unrendered: with no
+   * denominator there is no claim to make.
+   *
+   * DELIBERATE DIVERGENCE from the backend's `SlotCoverage.coverage_pct`, which
+   * returns 100.0 on an empty day ("nothing was left unanswered, so nothing is
+   * missing"). That is right for a LOG metric — 0.0 would read as total
+   * classifier failure on a quiet day — and wrong for a UI claim. Note the two
+   * agree on every rendered outcome, including this one (100.0 clears the
+   * threshold, null cannot reach it, neither warns); they differ only in what
+   * they ASSERT. Don't "fix" either to match the other.
+   */
+  fraction: number | null;
+}
+
+/**
+ * Coverage from what the board already holds — the same populations
+ * `boardStacks` split, so this reads no new input and cannot disagree with what
+ * is on screen. Anything outside `SLOT_ORDER` counts as residue (matching
+ * `boardSlotsWithADone`'s exclusion), so a future fourth canonical slot is
+ * counted as covered the moment it joins the order.
+ */
+export function boardCoverage(stacks: BoardStack[]): BoardCoverage {
+  let slotted = 0;
+  let unslotted = 0;
+  for (const stack of stacks) {
+    const n = boardStackSize(stack);
+    if (SLOT_ORDER.includes(stack.key)) slotted += n;
+    else unslotted += n;
+  }
+  const total = slotted + unslotted;
+  return { slotted, unslotted, total, fraction: total > 0 ? slotted / total : null };
+}
+
+/** Whether the board should admit it is missing part of the day. */
+export function boardCoverageIsLow(coverage: BoardCoverage): boolean {
+  return coverage.fraction !== null && coverage.fraction < SLOT_COVERAGE_WARN;
+}
