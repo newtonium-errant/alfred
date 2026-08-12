@@ -12,7 +12,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from alfred.daily_sync.action_router import ACTION_META, FEED_ACTIONS, actions_for
+from alfred.daily_sync.action_router import (
+    ACTION_META,
+    FEED_ACTIONS,
+    actions_for,
+    actions_for_item,
+)
 
 
 class TestDerivedFromTheCeiling:
@@ -99,6 +104,106 @@ class TestTheWeightsOnTheWire:
         for kind in FEED_ACTIONS:
             gestures = [a.get("gesture") for a in actions_for(kind) if a.get("gesture")]
             assert len(gestures) == len(set(gestures)), kind
+
+
+class TestPerItemNarrowing:
+    """``actions_for_item`` — the kind's ceiling, minus what THIS item refuses.
+
+    ``actions_for`` can only answer the per-KIND question. Some of the router's
+    refusals are per-ITEM: it reads the item's stamped evidence and declines. A
+    verb that will be refused must not be OFFERED, or the operator gets a
+    control that 400s in their hand — the same failure the served verb list was
+    built to remove, just one level down.
+    """
+
+    def _slot(self, **evidence: object) -> dict:
+        """A serialised slot item — the shape the read path holds."""
+        return {
+            "kind": "slot_suggestion",
+            "evidence": {"tier": 1, "origin": "task", **evidence},
+        }
+
+    def test_a_candidate_slot_IS_offered_accept(self):
+        """Positive control for the whole class: the filter can be passed."""
+        verbs = [a["verb"] for a in actions_for_item(self._slot(candidate=True))]
+        assert "accept" in verbs
+
+    def test_a_COMMITTED_slot_is_NOT_offered_accept(self):
+        """The narrowing itself — mirrors the guard at ``_dispatch_slot_confirm``.
+
+        A committed slot is already on today's plan; there is nothing to accept
+        and the router says so (``invalid_action``, no write).
+        """
+        item = self._slot(candidate=False)
+        verbs = [a["verb"] for a in actions_for_item(item)]
+        assert "accept" not in verbs
+        # Positive control in the same test: SURGICAL, not a collapse. Only the
+        # one unreachable verb goes; a pin that just checked "accept absent"
+        # would pass identically against a build that returned nothing at all.
+        assert {"done", "undo_done", "unsnooze", "snooze_1d"} <= set(verbs)
+
+    def test_the_flag_is_matched_BY_IDENTITY_so_a_near_miss_fails_CLOSED(self):
+        """``is not True`` — the router's exact predicate, not truthiness.
+
+        A producer that stamps ``1`` or ``"yes"`` has not stamped a candidate.
+        Withholding the verb on anything but a real ``True`` keeps this table on
+        the same side of the line as the gate it mirrors; matching truthiness
+        here would advertise a verb the router then refuses.
+        """
+        for flag in ({}, {"candidate": None}, {"candidate": "yes"}, {"candidate": 1}):
+            item = {"kind": "slot_suggestion", "evidence": dict(flag)}
+            assert "accept" not in [a["verb"] for a in actions_for_item(item)], flag
+
+    def test_malformed_evidence_withholds_accept_without_raising(self):
+        """Evidence is producer-written and reaches here as parsed JSON."""
+        for ev in (None, [], "candidate", 7):
+            item = {"kind": "slot_suggestion", "evidence": ev}
+            assert "accept" not in [a["verb"] for a in actions_for_item(item)], ev
+
+    def test_the_surviving_entries_keep_their_FULL_presentation(self):
+        """Filtering drops entries; it must not flatten the ones it keeps."""
+        served = {a["verb"]: a for a in actions_for_item(self._slot(candidate=True))}
+        assert served["accept"]["label"] == "Take it"
+        assert served["accept"]["gesture"] == "affirm"
+        assert served["accept"]["weight"] == "light"
+
+    def test_done_and_undo_done_are_STILL_advertised_unconditionally(self):
+        """Recorded as a BOARDED follow-up, not an oversight.
+
+        Their per-item conditions (the completion-lane matrix; undo's
+        accepted-vs-done distinction) are their own lane. This pin exists so
+        that widening into them is a DELIBERATE act that reds a test, rather
+        than a quiet behaviour change nobody chose.
+        """
+        verbs = [a["verb"] for a in actions_for_item(self._slot(candidate=False))]
+        assert "done" in verbs and "undo_done" in verbs
+
+    def test_an_URGENT_item_still_arrives_with_its_ONLY_verb(self):
+        """THE TRAP. ``email_urgent`` is MODE_DECIDE, and the universal FYI gate
+        refuses ``ack`` on any non-FYI item — but the urgent ack is intercepted
+        BEFORE that gate reaches it, on purpose. A generalised "strip the verbs
+        the gates would refuse" pass that consulted the FYI gate would take the
+        ONLY verb off every urgent interrupt card, leaving an un-actionable
+        card with a stamped-out face.
+        """
+        verbs = [a["verb"] for a in actions_for_item({"kind": "email_urgent", "evidence": {}})]
+        assert "ack" in verbs
+
+    def test_ONLY_slots_are_narrowed(self):
+        """Every other kind passes through byte-identical to the per-kind answer.
+
+        The blast radius of the per-item layer, asserted rather than assumed.
+        """
+        narrowed = []
+        for kind in FEED_ACTIONS:
+            per_item = actions_for_item({"kind": kind, "evidence": {}})
+            if per_item != actions_for(kind):
+                narrowed.append(kind)
+        assert narrowed == ["slot_suggestion"], narrowed
+
+    def test_an_unknown_kind_is_still_empty(self):
+        assert actions_for_item({"kind": "weather", "evidence": {}}) == []
+        assert actions_for_item({}) == []
 
 
 class TestCrossLanguageAgreement:

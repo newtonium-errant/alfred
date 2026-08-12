@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import date as _date
 from datetime import datetime, timedelta, timezone
@@ -394,6 +394,52 @@ def actions_for(kind: str) -> list[dict[str, Any]]:
             advertised["note"] = note
         out.append(advertised)
     return out
+
+
+def actions_for_item(item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The advertised verbs for ONE item — its kind's ceiling, minus the verbs
+    THIS item's own state puts out of reach.
+
+    :func:`actions_for` answers the per-KIND question, which is all the ceiling
+    can express. Some refusals are per-ITEM: the router looks at the item's
+    stamped evidence and declines. Advertising such a verb would put a control
+    in the operator's hand that 400s when pressed — the exact failure the served
+    verb list exists to remove — so the filtering belongs on the SERVE side,
+    next to the ceiling it derives from, and NOT in the transport layer (a
+    per-item rule written at the stamp site would drift from the gate it
+    mirrors, which is how the client's private verb map went wrong).
+
+    Takes the SERIALISED item mapping — the shape the read path already holds.
+
+    WHAT IS FILTERED, and only this: ``slot_suggestion``'s ``accept``, which
+    :func:`_dispatch_slot_confirm` refuses unless ``evidence.candidate is True``
+    (a committed slot is already on today's plan — there is nothing to accept).
+
+    WHAT IS DELIBERATELY NOT FILTERED:
+
+    * ``done`` / ``undo_done`` — their per-item conditions (the completion-lane
+      matrix, and undo's accepted-vs-done distinction) are a BOARDED follow-up.
+      Advertising them unconditionally is the pre-existing behaviour, kept.
+    * ``ack`` on ``email_urgent`` — and this one is a TRAP, not an oversight.
+      The universal FYI gate in :func:`_act_locked` refuses ``ack`` on any
+      non-FYI item, and ``email_urgent`` is MODE_DECIDE; a generalised "strip
+      the verbs the gates would refuse" pass that consulted that gate would
+      remove the ONLY verb from every urgent interrupt card. The urgent ack is
+      intercepted BEFORE that gate on purpose (see the URGENT_KIND block), so
+      the gate does not apply to it. Do not fold the FYI gate in here.
+
+    The act-time gates STAY exactly as they are. This narrows what is OFFERED;
+    it is not a substitute for refusing at the door. Defence in depth: a stale
+    client, a hand-crafted POST, or an item whose state changed between the read
+    and the tap all still meet the real gate.
+    """
+    kind = str(item.get("kind") or "")
+    verbs = actions_for(kind)
+    if kind == SLOT_KIND:
+        evidence = item.get("evidence") or {}
+        if not isinstance(evidence, Mapping) or evidence.get("candidate") is not True:
+            verbs = [v for v in verbs if v.get("verb") != ACCEPT_ACTION]
+    return verbs
 
 
 # kind → the ``reply_dispatch`` loader name for that family's last_batch list.
