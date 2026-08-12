@@ -79,6 +79,78 @@ def is_attention_status(status: str) -> bool:
     return (status or "").strip().lower() not in QUIET_HEALTH_STATUSES
 
 
+# ---------------------------------------------------------------------------
+# §1's glance stat (Phase C, item 5) — "X/Y green" LEADS the section
+# ---------------------------------------------------------------------------
+
+
+def health_glance_stat(counts: dict[str, int]) -> str:
+    """The one-line glance stat §1 leads with: how much of health is green.
+
+    ``counts`` is a ``{status: n}`` map (BIT's ``tool_counts`` shape, or one
+    tallied from the per-tool body lines).
+
+    **The denominator excludes ``skip``, and that is the whole design.** A
+    skipped check is "this did not apply on this instance" — an unconfigured
+    tool, a fresh install — not a check that failed to be green. KAL-LE's
+    MEASURED BIT is ``{ok: 5, warn: 0, fail: 0, skip: 7}``: over the raw total
+    that reads "5/12 green", which is a false alarm printed at the very top of
+    the brief every morning on an instance where nothing is wrong. Over the
+    applicable checks it reads "5/5 green · 7 not applicable", which is true.
+    This is the same skip-blindness that made the narration say "7 tools need a
+    look" daily; the fix is the same predicate, applied one surface later.
+
+    All-skipped is answered honestly rather than as a vacuous "0/0 green":
+    claiming green on the strength of no evidence is the one direction this
+    must not take (mirrors ``narration._health_text`` and
+    ``kalle_digest._render_skip_posture``).
+    """
+    ok = 0
+    skipped = 0
+    total = 0
+    for raw_status, raw_n in (counts or {}).items():
+        try:
+            n = int(raw_n or 0)
+        except (TypeError, ValueError):
+            continue
+        if n <= 0:
+            continue
+        status = str(raw_status).strip().lower()
+        total += n
+        if status == Status.SKIP.value:
+            skipped += n
+        elif status == Status.OK.value:
+            ok += n
+    if total == 0:
+        return "**No tools checked**"
+    applicable = total - skipped
+    if applicable == 0:
+        return (
+            f"**No checks ran** — all {skipped} skipped "
+            "(nothing applicable on this instance)"
+        )
+    stat = f"**{ok}/{applicable} green**"
+    if skipped:
+        stat += f" · {skipped} not applicable"
+    return stat
+
+
+def _counts_from_tool_lines(
+    per_tool: list[tuple[str, str, str]],
+) -> dict[str, int]:
+    """Tally a ``{status: n}`` map from the per-tool body lines.
+
+    Preferred over the record's ``tool_counts`` when the body parsed, because
+    the body is the per-tool truth the section goes on to list — a stat that
+    disagreed with the list directly beneath it is worse than no stat.
+    """
+    counts: dict[str, int] = {}
+    for _tool, status, _detail in per_tool:
+        key = (status or "").strip().lower()
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
     """Parse YAML frontmatter out of a Markdown file.
 
@@ -336,13 +408,23 @@ def _render_from_frontmatter(
 
     stale = record_date and record_date != today_str
     date_note = f" — stale ({record_date})" if stale else ""
-    lines.append(
-        f"**Overall:** {overall} "
-        f"(last run {started}, {mode} mode{date_note})"
+
+    # Phase C item 5 — the GLANCE STAT leads, then the list, then the why.
+    # The section is the first thing in the brief and was previously led by
+    # "**Overall:** ok (last run …)", which makes the reader parse a sentence
+    # to learn a number. The stat answers "is the system fine?" in one glance;
+    # the per-tool list answers "which parts"; the run metadata answers "says
+    # who, and how fresh" and moves below both.
+    per_tool = _per_tool_lines(body)
+    counts = (
+        _counts_from_tool_lines(per_tool)
+        if per_tool
+        else (frontmatter.get("tool_counts") or {})
     )
+    lines.append(health_glance_stat(counts))
+    lines.append("")
 
     # Prefer per-tool breakdown from the body; fall back to tool_counts
-    per_tool = _per_tool_lines(body)
     if per_tool:
         # Pad tool names to a consistent width for readability
         width = max(len(t[0]) for t in per_tool) if per_tool else 0
@@ -359,6 +441,12 @@ def _render_from_frontmatter(
 
     record_link = frontmatter.get("name") or "latest BIT"
     lines.append("")
+    # The WHY, below the glance + list: whose verdict this is and how fresh.
+    lines.append(
+        f"**Overall:** {overall} "
+        f"(last run {started}, {mode} mode{date_note})"
+    )
+    lines.append("")
     lines.append(f"See full report: [[{record_dir}/{record_link}]]")
     return "\n".join(lines)
 
@@ -374,14 +462,18 @@ def _render_from_state(latest: dict[str, Any], today_str: str) -> str:
     stale = record_date and record_date != today_str
     stale_note = f" — stale ({record_date})" if stale else ""
 
-    lines = [
-        f"**Overall:** {overall} (last run {generated}, {mode} mode{stale_note})",
-    ]
+    # Same glance-first shape as the record path — a reader must not have to
+    # learn a second layout on the mornings the vault record is unreadable.
+    lines = [health_glance_stat(counts), ""]
     if counts:
         counts_str = ", ".join(
             f"{v} {k}" for k, v in sorted(counts.items()) if v
         )
         lines.append(f"- tool summary: {counts_str or 'no tools'}")
+    lines.append("")
+    lines.append(
+        f"**Overall:** {overall} (last run {generated}, {mode} mode{stale_note})",
+    )
     lines.append("")
     lines.append(
         "_Full report unavailable — falling back to BIT state file._"

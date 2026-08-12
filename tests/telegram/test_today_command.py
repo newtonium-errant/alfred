@@ -145,11 +145,11 @@ def test_talker_config_today_command_block_present_with_timezone_override() -> N
 
 def test_compose_includes_tier_section_header(salem_vault: Path) -> None:
     """The composed body MUST include the canonical tier section header
-    string (``"Open Tasks by Tier"``) — operator's mental model is the
+    string (``"Today's Plan"``) — operator's mental model is the
     brief's exact wording."""
     now = datetime(2026, 5, 28, 14, 0, tzinfo=HALIFAX)
     body = compose_today_reply(salem_vault, now)
-    assert "## Open Tasks by Tier" in body
+    assert "## Today's Plan" in body
 
 
 def test_compose_excludes_routines_section_header(salem_vault: Path) -> None:
@@ -197,7 +197,7 @@ def test_compose_section_ordering_matches_brief(salem_vault: Path) -> None:
     test now pins the two-section ordering."""
     now = datetime(2026, 5, 28, 14, 0, tzinfo=HALIFAX)
     body = compose_today_reply(salem_vault, now)
-    tier_idx = body.index("## Open Tasks by Tier")
+    tier_idx = body.index("## Today's Plan")
     events_idx = body.index("## Upcoming Events")
     assert tier_idx < events_idx, (
         f"Section ordering must match the brief: tier ({tier_idx}) → "
@@ -231,7 +231,7 @@ def test_compose_uses_intentionally_left_blank_sentinels_when_empty(
     # only two headers now.
     lines = body.splitlines()
     headers = [
-        "## Open Tasks by Tier",
+        "## Today's Plan",
         "## Upcoming Events",
     ]
     for header in headers:
@@ -303,7 +303,7 @@ def test_compose_both_renders_failing_emits_combined_sentinels(
     # Section headers still emit so the operator's mental model of
     # the brief surface stays intact (failed section ≠ missing
     # section).
-    assert "## Open Tasks by Tier" in body
+    assert "## Today's Plan" in body
     assert "## Upcoming Events" in body
     # Routines header NOT in body.
     assert "## Today's Routines" not in body
@@ -371,7 +371,7 @@ async def test_handler_dispatches_when_enabled(salem_vault: Path) -> None:
     # Composed reply carries the TWO section headers (Ship 3 scope
     # refinement, 2026-05-29 — routines dropped from /today; lives
     # in the morning brief or via the routine CLI surface).
-    assert "## Open Tasks by Tier" in reply
+    assert "## Today's Plan" in reply
     assert "## Upcoming Events" in reply
     # Parallel scope-refinement pin: routines section MUST NOT
     # appear in the handler-dispatched reply. Mirrors the
@@ -690,5 +690,5 @@ def test_compose_today_reply_end_to_end_excludes_materials_surfaces(
     assert '*(reply "T2 confirm" to keep on today\'s list)*' not in body
     # The composer still emits the section headers (operator's mental
     # model of the brief carries over).
-    assert "## Open Tasks by Tier" in body
+    assert "## Today's Plan" in body
     assert "## Upcoming Events" in body

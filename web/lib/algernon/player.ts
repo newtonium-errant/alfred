@@ -25,7 +25,15 @@ export interface BriefNarration {
 // an OMITTED slide (calm weather → no weather slide — the operator's demote ruling);
 // the deck collapses the gap (no blank slide). Ordering is applied here as the single
 // seam so a producer reorder can't desync the deck.
-export const SEGMENT_ORDER = ['day_state', 'health', 'day_plan', 'events', 'weather', 'sign_off'] as const;
+//
+// MUST match `SEGMENT_ORDER` in `src/alfred/brief/narration.py`, element for
+// element and IN ORDER. Neither language can import the other, so the list is
+// duplicated by necessity — `tests/brief/test_narration_segment_order_parity.py`
+// reads this line and asserts the two agree, because the failure is quiet:
+// `slideIndex` maps an unknown id to `SEGMENT_ORDER.length` so a segment missing
+// from THIS list still renders, just sorted to the very end. A `waiting` slide
+// added server-side and forgotten here would have played AFTER the sign-off.
+export const SEGMENT_ORDER = ['day_state', 'health', 'day_plan', 'events', 'weather', 'waiting', 'sign_off'] as const;
 export type SectionId = (typeof SEGMENT_ORDER)[number];
 
 export interface PlayerSlide {
