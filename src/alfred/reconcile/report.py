@@ -157,6 +157,12 @@ class StatementTotals:
     #: Claimants whose subtotal agreed — counted so agreement is visible
     #: rather than merely implied by the absence of a mismatch.
     subtotals_checked: int = 0
+    #: Labels from the statement's two-column totals block whose figure
+    #: equals our computed paid sum. Reported rather than acted on: it tells
+    #: the operator which declared figure our arithmetic reproduces, without
+    #: this layer deciding that the matching one is therefore "the" payment
+    #: total. That call is his, and it needs the provider's semantics.
+    declared_matching_paid: list[str] = field(default_factory=list)
 
 
 def _claimant_paid_sums(lines: list[ClaimLine]) -> dict[str, Decimal]:
@@ -187,6 +193,12 @@ def compute_statement_totals(
 
     if statement.payment_total is not None:
         totals.payment_total_delta = totals.paid - statement.payment_total
+
+    totals.declared_matching_paid = [
+        label
+        for label, value in sorted(statement.declared_totals_decimal().items())
+        if value == totals.paid
+    ]
 
     ours = _claimant_paid_sums(claim_lines)
     for sub in subtotals:
@@ -341,6 +353,42 @@ def build_summary(
             f"| {crossfoot} |"
         )
     out.append("")
+
+    with_declared = [t for t in grouped_totals if t.statement.declared_totals]
+    if with_declared:
+        out.append("## Declared statement totals")
+        out.append("")
+        out.append(
+            "Figures the statement declares in its own totals block, shown "
+            "beside what our claim lines sum to. They are **reported, not "
+            "interpreted**: which labelled figure is *the* payment total is "
+            "a question the statement does not answer, so nothing here is "
+            "used as the reconciliation baseline. `payment_total` — the "
+            "figure that sits with the claim lines it summarises — stays "
+            "authoritative for the cross-foot above."
+        )
+        out.append("")
+        for t in with_declared:
+            out.append(
+                f"- **{t.statement.statement_date or '(no date)'}** — our "
+                f"claim lines sum to {format_money(t.paid)}"
+            )
+            for label, value in sorted(
+                t.statement.declared_totals_decimal().items()
+            ):
+                match = (
+                    "  ← matches our sum"
+                    if label in t.declared_matching_paid else ""
+                )
+                out.append(f"  - {label}: {format_money(value)}{match}")
+            if not t.declared_matching_paid:
+                # ILB: "none of them matched" is a finding, and leaving it
+                # implicit would let a reader assume the check was not run.
+                out.append(
+                    "  - _none of the declared figures equals our sum — worth "
+                    "a look before trusting either side._"
+                )
+        out.append("")
 
     discrepancies = [
         t for t in grouped_totals
