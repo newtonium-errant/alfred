@@ -247,6 +247,14 @@ def _day_plan_text(plan: "DayPlan") -> str:
     Carryover leads, because ``SlotGroup`` orders it first for the same reason
     the board does: it has already cost him a day.
 
+    **AND THAT RULE APPLIES TO THIS FUNCTION TOO.** The carried list was once
+    the only list here that dropped items in silence — a bare ``[:2]`` beside a
+    committed branch that says ", and N more." honestly. Stating why carryover
+    outranks everything and then truncating it without a word was the sharpest
+    version of the defect this docstring exists to prevent, so: any cap applied
+    to carryover SAYS it was applied. A rule a function states is a rule it is
+    held to first.
+
     **THE FENCE.** This segment describes ARRANGEMENT only. The goal claim
     lives in :func:`_day_state_text` and stays TIER-based for as long as
     ``daily_goal`` is. So no slot is ranked above another here, no slot is
@@ -261,29 +269,46 @@ def _day_plan_text(plan: "DayPlan") -> str:
     parts: list[str] = []
     # Across all slots, not per slot: carryover is the day's one attention
     # claim, and splitting it per group would bury it three times over.
-    carried = [r.name for g in groups for r in g.carryover if r.name][:2]
+    carried = [r.name for g in groups for r in g.carryover if r.name]
     if carried:
-        parts.append("Still carrying: " + ", ".join(carried) + ".")
+        # The cap SPEAKS. Mirrors the committed branch below rather than
+        # trimming quietly — see the docstring on why this list least of all.
+        over = len(carried) - 2
+        parts.append(
+            "Still carrying: " + ", ".join(carried[:2])
+            + (f", and {over} more." if over > 0 else ".")
+        )
     for g in groups:
         named = [r.name for r in g.committed if r.name]
         if named:
-            # ONE name per slot, then a count. Two names each read fine on a
-            # light day and ran to 52 of the 55-word budget on a loaded one —
-            # three words from the clip, which is a runaway guard, not a plan.
-            # The count also carries more than a second title does: it says how
-            # heavy the slot is, which is the thing a spoken list cannot show.
-            # One-each is the co-equal shape too — naming two in Duty and one
-            # in Fuel would rank them by airtime.
+            # ONE name per slot, then a count — and the argument is about the
+            # MEDIUM, not about word budget. Speech is linear, so time spent on
+            # a slot reads as emphasis on it: two names under Duty and one under
+            # Fuel ranks them by airtime, in a taxonomy whose whole point is
+            # that neither outranks the other. A uniform one-name-plus-count
+            # gives every slot identical structural airtime, and the count
+            # carries the magnitude a second title would not have shown anyway.
             rest = len(named) - 1
             parts.append(
                 f"{g.label}: {named[0]}" + (f", and {rest} more." if rest else ".")
             )
-        elif g.routines:
-            # A slot holding only habit anchors still gets named — §4's
-            # dissolution put them here, and a slot that goes unmentioned reads
-            # as an empty one.
-            n = len(g.routines)
-            parts.append(f"{g.label}: {n} routine{'s' if n != 1 else ''}.")
+        elif g.carryover or g.routines:
+            # A slot with no fresh commitments still gets NAMED. Two ways to
+            # reach here, and both used to vanish out of a slot that had
+            # something in it:
+            #   * carryover-only — every row carried, nothing new. The names are
+            #     in the lead line; what is missing without this branch is WHICH
+            #     SLOT the day's weight is sitting in.
+            #   * routines-only — §4's dissolution put habit anchors here.
+            # A slot that goes unmentioned reads as an empty one, which is the
+            # single thing the per-slot empty copy exists to keep honest.
+            bits: list[str] = []
+            if g.carryover:
+                bits.append(f"{len(g.carryover)} carried")
+            if g.routines:
+                n = len(g.routines)
+                bits.append(f"{n} routine{'s' if n != 1 else ''}")
+            parts.append(f"{g.label}: " + " and ".join(bits) + ".")
     offers = sum(len(g.suggestions) for g in groups)
     if offers:
         # Counted, never listed: a suggestion needs a yes/no, and this is a

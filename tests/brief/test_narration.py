@@ -499,3 +499,42 @@ def test_sign_off_grants_rather_than_urges() -> None:
     assert balanced == "One in every tier already. The rest of the day is yours."
     for banned in ("You've got this", "Go get it"):
         assert banned not in balanced
+
+
+def test_a_carryover_only_slot_is_still_named() -> None:
+    """WARN-1, half one. A slot whose every row is carried hit neither branch
+    and VANISHED — the slot holding the day's oldest weight was the one the
+    copy never mentioned. Its items still reached the lead line, so the loss
+    was WHICH SLOT they sit in, which is the whole point of speaking slots.
+    """
+    plan = build_day_plan(
+        TodayView(t1=[_slotted("Morning pages", "rhythm")], daily_goal=DailyGoalState()),
+        rollover=[RolloverRef(
+            tier_label="T1", wikilink="[[task/Morning pages]]",
+            record_name="Morning pages",
+        )],
+        is_done=lambda _e: False,
+    )
+    said = _seg(_compose(plan=plan), "day_plan")
+    assert "Rhythm: 1 carried." in said, said
+    assert "Still carrying: Morning pages." in said, said
+
+
+def test_the_carried_cap_speaks_its_own_overflow() -> None:
+    """WARN-1, half two. The carried list capped at two SILENTLY, beside a
+    committed branch that says ", and N more." honestly — the one list that
+    dropped items without a word was the one the function leads with because
+    it has already cost him a day. A rule this function states is a rule it is
+    held to first.
+    """
+    names = ["Alpha", "Bravo", "Charlie", "Delta"]
+    plan = build_day_plan(
+        TodayView(t1=[_slotted(n, "duty") for n in names], daily_goal=DailyGoalState()),
+        rollover=[
+            RolloverRef(tier_label="T1", wikilink=f"[[task/{n}]]", record_name=n)
+            for n in names
+        ],
+        is_done=lambda _e: False,
+    )
+    said = _seg(_compose(plan=plan), "day_plan")
+    assert "Still carrying: Alpha, Bravo, and 2 more." in said, said
