@@ -1,7 +1,12 @@
 import { ReactNode, useState } from 'react';
 import Link from 'next/link';
 import { cn } from '../lib/utils';
-import type { SurfaceIdentity } from '../lib/algernon/consoleTokens';
+import {
+  CONSOLE_SURFACE,
+  WARM_SURFACE,
+  type KnownSurface,
+  type SurfaceIdentity,
+} from '../lib/algernon/consoleTokens';
 import { ReportBugFab } from './ReportBugFab';
 
 // One frontend deployment targets ONE instance (blueprint §5). The instance's
@@ -46,29 +51,45 @@ type LayoutProps = {
    */
   viewedInstance?: string;
   /**
-   * Which visual identity this surface wears (interface-reimagine arc).
+   * WHICH SURFACE THIS IS. Emitted VERBATIM as `data-surface="<name>"` on the
+   * root element, and that attribute — not this prop — is the containment
+   * mechanism the whole arc keys off: a surface's stylesheet scopes itself
+   * under `[data-surface="…"]` so its skin structurally cannot reach another
+   * surface. The prop is just the ergonomic spelling of the attribute.
    *
-   * `warm` (the default) is the honeydew light theme every existing surface
-   * has always used — chat, brief, ingest, batch, home. `console` is the
-   * ratified Phase B identity: LCARS grammar on the modern dark palette, worn
-   * today by the Decide deck and available to the Awareness feed and the
-   * brief-as-viewscreen when their lanes take it.
+   * DELIBERATELY OPEN. Any name is legal, and no value is privileged in the
+   * emission path — `console` goes through exactly the same line as a name
+   * this file has never heard of. That is what lets a surface own its skin
+   * entirely in its own stylesheet (the Awareness feed's `sensor-log` is the
+   * next one) and adopt this prop without waiting on a change here.
    *
-   * Deliberately ONE structure with two skins rather than two components. The
-   * nav, the mobile overflow, the unread badge and the sign-out control are the
-   * same affordances with the same test ids on both — forking the tree would
-   * have meant maintaining two of every one of them, and the second copy is
+   * A name with no entry in `SURFACE` below gets the `warm` chrome — today's
+   * default appearance — plus its own attribute. So adopting the prop is
+   * VISUALLY A NO-OP for a surface that already renders warm chrome and skins
+   * itself through the attribute; it just moves the attribute up to the root,
+   * where it also covers the shell.
+   *
+   * `warm` is the honeydew light theme every existing surface has always worn.
+   * `console` is the ratified Phase B identity (LCARS grammar, modern dark
+   * palette), worn today by the Decide deck.
+   *
+   * Deliberately ONE structure with N skins rather than N components. The nav,
+   * the mobile overflow, the unread badge and the sign-out control are the same
+   * affordances with the same test ids on every surface — forking the tree
+   * would mean maintaining a copy of each per identity, and the second copy is
    * always the one that drifts.
    */
   surface?: SurfaceIdentity;
 };
 
+type SurfaceClasses = Record<string, string>;
+
 /**
- * The per-surface class table. Every visual difference between the two
- * identities lives HERE rather than as conditionals scattered through the
- * markup, so adding a third surface is a column, not an archaeology exercise.
+ * The chrome table for surfaces this component dresses itself. A surface that
+ * skins itself entirely from its own stylesheet needs no entry here — see
+ * `surfaceClasses` for what an unregistered name gets.
  */
-const SURFACE: Record<SurfaceIdentity, Record<string, string>> = {
+const SURFACE: Record<KnownSurface, SurfaceClasses> = {
   warm: {
     root: 'min-h-screen bg-honeydew-50',
     header: 'sticky top-0 z-10 border-b border-honeydew-200 bg-honeydew-50/90 backdrop-blur',
@@ -110,6 +131,22 @@ const SURFACE: Record<SurfaceIdentity, Record<string, string>> = {
   },
 };
 
+/**
+ * The chrome for a surface name — falling back to `warm` for any name this
+ * table has no entry for.
+ *
+ * The fallback is the load-bearing half of the open-name contract. A surface
+ * that skins itself from its own stylesheet (scoped under its
+ * `data-surface` attribute) gets today's default chrome plus its attribute,
+ * so adopting the prop changes nothing visually and cannot crash on a name
+ * nobody registered. Throwing, or returning undefined and letting every
+ * `s.root` read blow up, would make the open contract a trap instead of a
+ * seam.
+ */
+function surfaceClasses(name: SurfaceIdentity): SurfaceClasses {
+  return (SURFACE as Record<string, SurfaceClasses | undefined>)[name] ?? SURFACE[WARM_SURFACE];
+}
+
 // The app's surfaces. The logo (✦) links to `/`, the home COMPOSER (B3-3); Chat
 // moved to /chat when the composer took the landing. Keeping this an array
 // preserves honeydew's nav structure so a new surface adds a link without
@@ -136,13 +173,16 @@ export function Layout({
   maxWidthClassName = 'max-w-2xl',
   showBugReport,
   viewedInstance,
-  surface = 'warm',
+  surface = WARM_SURFACE,
 }: LayoutProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   // A single nav item with no sign-out needs no mobile overflow menu.
   const showHamburger = NAV_LINKS.length > 1 || onSignOut != null;
-  const s = SURFACE[surface];
-  const isConsole = surface === 'console';
+  const s = surfaceClasses(surface);
+  // Drives the console's two structural extras (the elbow, and the rail's
+  // fill spacer). Skin only — the `data-surface` emission below is
+  // deliberately free of any per-name branch.
+  const isConsole = surface === CONSOLE_SURFACE;
 
   return (
     <div className={s.root} data-surface={surface}>

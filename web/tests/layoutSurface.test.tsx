@@ -94,6 +94,50 @@ describe('Layout surface identities', () => {
     expect(screen.getByTestId('console-elbow').getAttribute('aria-hidden')).toBe('true');
   });
 
+  it('emits ANY surface name verbatim, with no privileged value', () => {
+    // The ratified cross-lane contract. `data-surface` — not the prop — is the
+    // containment mechanism the arc keys off: a surface scopes its stylesheet
+    // under `[data-surface="…"]` so its skin structurally cannot reach another
+    // surface. For that to work the attribute has to carry whatever name the
+    // page asked for, including names this component has never heard of.
+    //
+    // `sensor-log` is the Awareness feed's name and is NOT in Layout's chrome
+    // table. That it appears here at all is the compile-level half of the
+    // assertion: if `SurfaceIdentity` were still a closed two-value union,
+    // `npx tsc --noEmit` would fail on this line.
+    for (const name of ['console', 'warm', 'sensor-log', 'viewscreen', 'a-name-nobody-registered']) {
+      const { container, unmount } = render(
+        <Layout onSignOut={() => {}} surface={name}>
+          <p>content</p>
+        </Layout>,
+      );
+      expect(container.querySelector(`[data-surface="${name}"]`), name).not.toBeNull();
+      unmount();
+    }
+  });
+
+  it('gives an unregistered surface the warm chrome rather than crashing', () => {
+    // The fallback is what makes the open contract a seam instead of a trap.
+    // A surface that skins itself from its own stylesheet gets today's default
+    // chrome PLUS its attribute — so adopting the prop is visually a no-op for
+    // it, and an unknown name can never blow up on an undefined class table.
+    const { container } = render(
+      <Layout onSignOut={() => {}} surface="sensor-log">
+        <p>content</p>
+      </Layout>,
+    );
+    const root = container.querySelector('[data-surface="sensor-log"]');
+    expect(root).not.toBeNull();
+    // Warm chrome, not console chrome — an unregistered surface must not
+    // inherit the deck's dark ground by accident.
+    expect(root?.className).toContain('bg-honeydew-50');
+    expect(root?.className).not.toContain('bg-console-hull');
+    // And it still gets the full affordance set.
+    expect(screen.queryByTestId('nav-signout')).not.toBeNull();
+    // The console's structural extras stay with the console.
+    expect(screen.queryByTestId('console-elbow')).toBeNull();
+  });
+
   it('never draws the unread badge in the negative role', () => {
     // Parity with the warm surface's own rule ("calm pill — never danger-red,
     // which is reserved for true system errors"). On the console the badge is

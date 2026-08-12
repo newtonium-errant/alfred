@@ -31,19 +31,36 @@ import type { Verdict, VerbWeight } from './feedConstants';
 export type ConsoleRole = 'affirm' | 'negative' | 'caution' | 'info';
 
 /**
- * Which visual identity a surface (or a shared component rendered inside one)
- * is wearing.
+ * The names this layer dresses itself. Not the full set of legal surface
+ * names — see `SurfaceIdentity`.
+ */
+export type KnownSurface = 'warm' | 'console';
+
+/** The default every surface and every shared component falls back to. */
+export const WARM_SURFACE: KnownSurface = 'warm';
+/** The Phase B identity. Named so no consumer has to type the string. */
+export const CONSOLE_SURFACE: KnownSurface = 'console';
+
+/**
+ * Which surface a component is rendering inside.
  *
- * Lives here rather than in Layout because Layout is not the only thing that
- * needs it: components shared between an adopted surface and a not-yet-adopted
+ * DELIBERATELY OPEN — `KnownSurface` gives editor completion for the names
+ * this layer dresses, and `(string & {})` keeps every other name legal without
+ * collapsing the union to bare `string`. That openness is the ratified
+ * cross-lane contract: a surface owns its skin in its own stylesheet, scoped
+ * under `[data-surface="<name>"]`, and adopts the prop without needing an entry
+ * here first. The Awareness feed's `sensor-log` is the next such name.
+ *
+ * Lives in this module rather than in Layout because Layout is not the only
+ * consumer: components shared between an adopted surface and a not-yet-adopted
  * one — `EvidenceBody` renders inside both the console deck card and the warm
- * feed row — take it as a prop so they can be correct in both places without
+ * feed row — take it as a prop so they are correct in both places without
  * either surface reaching into the other.
  *
  * `warm` is always the default. A shared component must render exactly as it
  * did before when nobody passes anything.
  */
-export type SurfaceIdentity = 'warm' | 'console';
+export type SurfaceIdentity = KnownSurface | (string & {});
 
 /**
  * The role a gesture verdict is drawn in — the D3 axis made visible.
