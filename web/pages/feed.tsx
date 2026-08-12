@@ -402,16 +402,40 @@ export default function FeedPage() {
             rather than rendering nothing. Silence here is what let the old
             banner's disappearance read as "handled" when it meant "deferred".
 
-            VOICING PASS (2026-08-12): reviewed and KEPT verbatim. "Snoozed" is
-            the word on the control the operator actually pressed (`FeedRow`'s
-            Snooze button, the deck's snooze menu), so the warmer "set aside"
-            would have cost the link between the line and the act that caused it.
-            Setting something aside is a sanctioned move here, and the line
-            already states it without a verdict. */}
+            VOICING PASS (2026-08-12): the count is a UNION OF TWO STORES, and
+            NO CLAUSE HERE MAY BE FALSE FOR EITHER HALF. `setAside` is
+            `snooze.snoozed(id) || deckHidden.has(id)`:
+
+              - deckHidden — the deck's SESSION hide-list. Returns at the next
+                sync, on its own, without the operator.
+              - snooze.snoozed — the SERVER rungs (1d / 3d / 7d / until-I-say).
+                Returns when the rung expires, and the indefinite rung never
+                expires at all — as this same file says at the snoozed-rows
+                comment above: "the indefinite rung has no next sync to wait for".
+
+            Both of the obvious sentences are therefore false for half the
+            population, in mirror image: "back at the next sync" (was here, and
+            wrong for every server rung) and "waiting until you bring them back"
+            (wrong for the session hides, which return unaided). There is no
+            short true clause about return TIME, so the line makes none — a
+            false promise inside the sentence written to cure false promises is
+            the worst place in the app to put one.
+
+            "Snoozed" went the same way, and for the same reason rather than for
+            warmth: it is the word on the backed control ("Snooze — choose how
+            long"), but the session half's control says "Set aside for now" and
+            its own constant carries the warning that "the copy on that path
+            must not promise otherwise". "Set aside" is the honest union term —
+            it is what this testid has always been called, and what the comment
+            above has always called them.
+
+            Splitting the counts per store was the alternative; rejected because
+            backed-vs-session is an implementation distinction the operator does
+            not model, and it buys precision he cannot act on at the cost of a
+            longer line on a phone. */}
         {loaded && deckable.length === 0 && setAsideDeckable.length > 0 && (
           <p data-testid="feed-deck-set-aside" className="mt-4 text-sm text-honeydew-600">
-            {setAsideDeckable.length} snoozed — back at the next sync. Nothing else
-            is waiting in the deck.
+            {setAsideDeckable.length} set aside. Nothing else is waiting in the deck.
           </p>
         )}
 

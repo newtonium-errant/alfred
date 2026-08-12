@@ -274,8 +274,15 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           // The classifier refused to guess, and says so. These are excluded from
           // every count above — an unreachable daily goal would read as personal
           // failure rather than as an unclassified item.
+          //
+          // "Stay out of the balance" states that exclusion as PLACEMENT, on the
+          // arrangement side of the fence at the top of `board.ts`; the earlier
+          // "don't count for or against your day" said the same true thing in the
+          // scoring register the fence pulled from the scoreline. "Either way"
+          // is load-bearing and survives the rewrite — it is the half that says
+          // these cannot be held against him, not merely that they are ignored.
           <p data-testid="board-residue-note" className="mt-1 text-[11px] text-honeydew-600">
-            No slot rule matched these yet — they don&rsquo;t count for or against your day.
+            No slot rule matched these yet — they stay out of the balance, either way.
           </p>
         )}
 
@@ -404,9 +411,14 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         // should say so in its own grammar. "No slot rule matched" is the same
         // vocabulary the residue note uses one level down, and both trace to
         // `tier/slots.py` rule 7 ("anything else → unslotted → refuse to guess").
+        //
+        // The tail still states the DENOMINATOR — that is its whole job, and it
+        // may not be softened into vagueness — but it states it as exclusion
+        // ("leaves them out") rather than as tallying ("counts only the rest"),
+        // which keeps it on the same side of the fence as the scoreline.
         <p data-testid="board-coverage-warning" role="status" className="mb-2 text-[11px] text-honeydew-600">
           The slot rules couldn&rsquo;t place {coverage.unslotted} of {coverage.total} items — the
-          balance below counts only the rest.
+          balance below leaves them out.
         </p>
       )}
 

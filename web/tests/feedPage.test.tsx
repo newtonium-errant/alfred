@@ -382,7 +382,7 @@ describe('FeedPage — the deck banner promises no trip to a wall', () => {
     // No promise of a trip to a clear deck…
     expect(screen.queryByTestId('feed-deck-link')).toBeNull();
     // …and not silence either: the page says where they went.
-    expect(screen.getByTestId('feed-deck-set-aside').textContent).toContain('2 snoozed');
+    expect(screen.getByTestId('feed-deck-set-aside').textContent).toContain('2 set aside');
   });
 
   it('counts only the dealable remainder when the deck holds SOME of them', async () => {

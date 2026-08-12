@@ -29,7 +29,8 @@ vi.mock('../lib/algernon/composerLog', () => ({ useComposerLog: () => {} }));
 import HomePage from '../pages/index';
 import { SlotBoard } from '../components/feed/SlotBoard';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
-import { UNDO_MS } from '../lib/algernon/feedConstants';
+import { SLOT_EMPTY_COPY, SLOT_EMPTY_FALLBACK } from '../lib/algernon/board';
+import { SLOT_ORDER, UNDO_MS } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
 import { withServedActions } from './helpers/servedActions';
 
@@ -156,7 +157,7 @@ describe('SlotBoard — the three stacks speak SLOTS', () => {
     );
     const warn = screen.getByTestId('board-coverage-warning');
     expect(warn.textContent).toContain('1 of 4 items');
-    expect(warn.textContent).toContain('the balance below counts only the rest');
+    expect(warn.textContent).toContain('the balance below leaves them out');
     // It must NOT blame the rings — they show unslotted items in their tier
     // bucket, so a "the rings are missing part of your day" claim would be false.
     expect(warn.textContent).not.toContain('rings');
@@ -191,7 +192,7 @@ describe('SlotBoard — the three stacks speak SLOTS', () => {
     unmount();
     render(<Harness items={[slot({ id: 'b', title: 'Mystery' }, {})]} />);
     expect(screen.getByTestId('board-stack-unslotted').textContent).toContain('Mystery');
-    expect(screen.getByTestId('board-residue-note').textContent).toContain('don’t count');
+    expect(screen.getByTestId('board-residue-note').textContent).toContain('stay out of the balance');
   });
 });
 
@@ -211,6 +212,50 @@ describe('SlotBoard — intentionally-left-blank states', () => {
   it('reports the balanced-day scoreline once anything is on the board', () => {
     render(<Harness items={[slot({ id: 'a' }, { slot: 'duty' })]} />);
     expect(screen.getByTestId('board-balance').textContent).toBe('0 of 3 slots have something done — no slot outranks another.');
+  });
+});
+
+// The empty line is the ONLY copy on this board that renders on the production
+// day shape every single morning ({duty:2, rhythm:1} leaves Fuel empty daily),
+// and it was the whole reason the voicing pass was commissioned. It shipped
+// unpinned; these are its pins.
+describe('SlotBoard — each slot owns its empty line', () => {
+  // The expected words, keyed by slot. Held here rather than imported from
+  // `SLOT_EMPTY_COPY` ON PURPOSE: a pin that reads the same constant the render
+  // reads asserts only that the lookup works, and would stay green through any
+  // rewrite of the words — including a rewrite back to the flat line.
+  const EMPTY_LINES: ReadonlyArray<readonly [string, string]> = [
+    ['duty', 'Nothing owed today.'],
+    ['rhythm', 'Nothing comes round today.'],
+    ['fuel', 'Nothing here yet — there’s room when you want it.'],
+  ];
+
+  // The guard that will actually fire one day. A fourth canonical slot added to
+  // SLOT_ORDER with no `SLOT_EMPTY_COPY` entry silently takes the FALLBACK —
+  // the flat "Nothing here today." this pass exists to get out from under,
+  // reappearing on the newest and least-established slot, where a bare
+  // nothing-here reads worst. Failing here is the cheap version of that.
+  it('covers every canonical slot, in order, with copy of its own', () => {
+    expect(EMPTY_LINES.map(([key]) => key)).toEqual([...SLOT_ORDER]);
+    for (const key of SLOT_ORDER) {
+      expect(SLOT_EMPTY_COPY[key]).toBeTruthy();
+      expect(SLOT_EMPTY_COPY[key]).not.toBe(SLOT_EMPTY_FALLBACK);
+    }
+  });
+
+  it.each(EMPTY_LINES)('renders %s its own words, not the fallback', (key, text) => {
+    render(<Harness items={[]} />);
+    expect(screen.getByTestId(`board-stack-empty-${key}`).textContent).toBe(text);
+  });
+
+  // Fuel's line carries the pass's whole argument, so it gets an assertion about
+  // its SHAPE and not only its bytes: it must not be the terse register Duty and
+  // Rhythm use. If a later edit flattens it back to a bare "Nothing …today.",
+  // the words-pin above catches the text and this catches the intent.
+  it('gives Fuel the permission line, not the terse one', () => {
+    const fuel = SLOT_EMPTY_COPY.fuel;
+    expect(fuel).toContain('there’s room when you want it');
+    expect(fuel.length).toBeGreaterThan(SLOT_EMPTY_COPY.duty.length);
   });
 });
 

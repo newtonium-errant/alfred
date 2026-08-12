@@ -116,14 +116,27 @@ export const UNSLOTTED_LABEL = 'Not sorted yet';
  * Rhythm is a fact); Fuel deliberately breaks the parallel and spends its extra
  * words on PERMISSION, because that is the whole reason the slot exists.
  *
- * All three are true of the mechanism: an empty stack means nothing was
- * classified into that slot today — never that the operator skipped it. Items
- * do not leave a stack by being completed (done items keep it non-empty and
- * settle into the drill), so an empty stack cannot be a record of a miss.
+ * All three are true of the mechanism, and none of them may imply the operator
+ * fell short. A stack empties two ways, neither of which is a miss: nothing was
+ * classified into that slot, or its items were SNOOZED out of view on an earlier
+ * day (`ringItemVisibleToday` drops an acted item once `acted_at` is no longer
+ * today, and snoozing is an act). Completion is NOT one of the ways — a done
+ * item keeps its stack non-empty and settles into the drill — so an empty stack
+ * can never be the record of something left undone.
+ *
+ * The snooze path leaves every "today" here true: the shortest rung is
+ * `snooze_1d`, so a snoozed item is never due back on the day it left, and the
+ * day it was snoozed it was still on the board. A sub-day rung would break that
+ * and these lines would need re-checking.
  */
 export const SLOT_EMPTY_COPY: Record<string, string> = {
   duty: 'Nothing owed today.',
-  rhythm: 'No practice today.',
+  // Keyed to the CADENCE, not to the operator's doing: "No practice today."
+  // has a second reading ("you didn't practice") on the one slot whose items
+  // are things he does repeatedly. A practice "comes round" — that is what
+  // `target_cadence_days` means. "Scheduled" is barred here; scheduling is
+  // Duty's basis (slots.py rule 4, `due_pattern`), so it would name the wrong slot.
+  rhythm: 'Nothing comes round today.',
   fuel: 'Nothing here yet — there’s room when you want it.',
 };
 
