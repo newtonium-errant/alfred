@@ -307,6 +307,19 @@ export function hourTicks(w: TimeWindow): number[] {
   return ticks;
 }
 
+// --- display formatting: BEHIND THE SWAP SEAM, deliberately minimal ----------
+//
+// OWNERSHIP (team-lead ruling, cross-lane): the human-readable extent STRING
+// belongs to the deck lane's shared layer, which is building a portable
+// formatter; the POSITIONING MATHS above is this module's. The four helpers
+// below exist because the timeline had to render something before that layer
+// landed, and they are kept to exactly what the band's own labels need.
+//
+// DO NOT GROW THEM into general display formatting — relative times, date
+// headers, "in 3 hours", locale variants. The merge that lands second unifies
+// on the shared formatter, and every extra behaviour added here is another
+// thing that unification has to reconcile or silently diverge from.
+
 /** Local wall-clock `HH:MM`. The operator reads their own clock, not UTC. */
 export function formatClock(ms: number): string {
   const d = new Date(ms);

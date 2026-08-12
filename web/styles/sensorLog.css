@@ -29,7 +29,61 @@
    `FeedRow` / `RingsHeader` are shared with `pages/index.tsx`, which is the
    BRIEF — a different canonical surface (the viewscreen). A `:root` palette
    would have leaked the instrument dark onto it. The attribute selector makes
-   that leak structurally impossible: only the feed page sets the attribute.
+   that leak structurally impossible: only the feed page sets the attribute, and
+   `tests/sensorLogContainment.test.tsx` asserts BOTH halves of that by rendering
+   both pages — feed has it on an ancestor of its rows, home has none at all.
+
+   ───────────────────────────────────────────────────────────────────────────
+   THE SWAP, PRE-RESOLVED (team-lead relay, deck lane's layer now stable)
+   ───────────────────────────────────────────────────────────────────────────
+   Landing with the deck lane's merge: `web/styles/console.css` (tokens + LCARS
+   shape primitives) and `web/lib/algernon/consoleTokens.ts` (domain-fact→role
+   mapping), wired through tailwind.config.cjs and imported in `_app.tsx`. The
+   intended re-point, recorded now so the post-merge commit is a lookup rather
+   than a re-derivation:
+
+     --sensor-void   → console-void        --sensor-teal   → affirm
+     --sensor-hull   → console-hull        --sensor-teal2  → affirm-deep
+     --sensor-panel  → console-panel       --sensor-teal3  → affirm-wash
+     --sensor-raise  → console-raise       --sensor-rust   → negative
+     --sensor-edge   → console-edge        --sensor-rust2  → negative-deep
+     --sensor-edge2  → console-edge-bright --sensor-rust3  → negative-wash
+     --sensor-ink    → console-ink         --sensor-slate  → info
+     --sensor-ink2   → console-ink-dim     --sensor-slate2 → info-deep
+     --sensor-ink4   → console-ink-ghost
+     .sensor-elbow   → .console-elbow      .sensor-maybe   → .console-hatch
+     .sensor-bar     → .console-railseg (VERIFY: our bar is pill-terminated;
+                        confirm railseg is the same shape before adopting)
+     .sensor-band's accreted texture → .console-accreted
+
+   TWO MAPPINGS THAT ARE NOT MECHANICAL — resolve them, do not assume:
+
+   (1) `--sensor-ink3` splits. The shared `console-ink-faint` is documented as
+       UPPERCASE-micro-label-only (~4.2:1). We use ink3 for `.sensor-label`
+       (uppercase micro-label — `-faint` is correct) AND for sentence-case body
+       (the page subtitle, the empty-band line, the timeline window readout),
+       which must take `console-ink-dim` instead. One token here, two roles
+       there; re-pointing it wholesale would drop real body copy to a contrast
+       ratio it was never cleared for.
+
+   (2) `--sensor-amber` is the ENVIRONMENT register — weather extents, the
+       maybe-hatch, time-shaped things. The shared `caution` is amber too, but
+       it MEANS the defer family and the heavy-verb arm (deliberately one idea,
+       per the relay). Equating them would give a fog window the same hue as a
+       defer verb, which is precisely the kind of collision that makes a token
+       system stop being true. Raise it before swapping — the seam's own rule is
+       that a missing counterpart is a conversation, not a silent divergence.
+
+   THREE GOTCHAS from the layer's owner, recorded because they bite at swap time:
+     · NO opacity modifiers — the tokens are plain hex, so `bg-console-panel/50`
+       silently emits nothing. Climb the surface ramp instead; `console-scrim` is
+       the one translucent token. (Our inline `rgba(...)` trace fills become the
+       `-wash` roles; our `opacity:` declarations are CSS properties, not colour
+       modifiers, and are unaffected.)
+     · Never put a `rounded-*` utility on an element carrying `.console-elbow` or
+       `.console-railseg` — console.css loads after globals and wins.
+     · Instance-accent collisions are ACCEPTED by design (`instanceAccentClass`
+       is hash-based, not a name map); text is the identifying channel.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 [data-surface='sensor-log'] {
