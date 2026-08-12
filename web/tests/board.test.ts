@@ -14,6 +14,7 @@ import {
   boardSlotsWithADone,
   boardStacks,
   carryoverRank,
+  carryoverReason,
 } from '../lib/algernon/board';
 import { ringItemStage } from '../lib/algernon/rings';
 import type { FeedItem } from '../lib/algernon/feed';
@@ -212,6 +213,26 @@ describe('carryoverRank — attention ordering over stamped evidence', () => {
       mk('broke', '2026-08-10T13:00:00Z', { snooze_breakthrough: 'moved_earlier' }),
     ];
     expect(stackFor(items, 'duty')?.carryover.map((i) => i.id)).toEqual(['broke', 'overdue', 'plain-old']);
+  });
+});
+
+describe('carryoverReason — the row says WHY it is still here', () => {
+  it('names the breakthrough cause when the item came back early', () => {
+    expect(carryoverReason(slot({}, { snooze_breakthrough: 'crossed_due' }), NOW)).toBe(
+      'Back early — its due date passed',
+    );
+    expect(carryoverReason(slot({}, { snooze_breakthrough: 'moved_earlier' }), NOW)).toBe(
+      'Back early — it moved sooner',
+    );
+    // An unrecognised breakthrough value still says the true, weaker thing rather
+    // than inventing a cause it does not know.
+    expect(carryoverReason(slot({}, { snooze_breakthrough: 'something_new' }), NOW)).toBe('Back early');
+  });
+
+  it('falls back to overdue, then to the plain carried note', () => {
+    expect(carryoverReason(slot({}, { due_iso: '2026-08-11' }), NOW)).toBe('Overdue');
+    expect(carryoverReason(slot({}, { due_iso: '2026-08-12' }), NOW)).toBe('Carried over');
+    expect(carryoverReason(slot({}, {}), NOW)).toBe('Carried over');
   });
 });
 

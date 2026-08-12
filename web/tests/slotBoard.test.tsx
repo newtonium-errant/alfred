@@ -178,6 +178,38 @@ describe('SlotBoard — carryover, candidates, browse-on-swap', () => {
     expect(screen.getByTestId('board-overflow-fuel').querySelectorAll('[data-testid="board-item"]')).toHaveLength(2);
   });
 
+  // The Accept control has to be PRESSED by a pin, not merely counted: a rendered
+  // button nobody clicks passes identically against one wired to nothing.
+  it('pressing Accept commits the candidate through the accept verb', async () => {
+    // The RENDER-PRESENT GATE is `useSlotAccept`'s, not the board's: the flip lands
+    // on a response that carries a render payload, never on the optimistic tap.
+    mockAct.mockResolvedValue({
+      ok: true,
+      status: 'acted',
+      id: 'cand',
+      action_id: 'accept',
+      render: { tier: 1, name: 'Walk', committed: true },
+    });
+    render(<Harness items={[slot({ id: 'cand', title: 'Walk' }, { slot: 'fuel', candidate: true })]} />);
+    await act(async () => { fireEvent.click(screen.getByTestId('board-accept')); });
+    await flush();
+    expect(mockAct).toHaveBeenCalledWith('cand', 'accept');
+    // …and an accepted candidate becomes a COMMITMENT, not a completion — it moves
+    // out of "Worth considering" and onto the plan with a live ✓.
+    expect(screen.getByTestId('board-item').getAttribute('data-stage')).toBe('planned');
+    expect(screen.queryByTestId('board-accept')).toBeNull();
+    expect(screen.getByTestId('board-complete')).toBeTruthy();
+  });
+
+  it('an accept with NO render payload does not flip — it stays a candidate', async () => {
+    mockAct.mockResolvedValue({ ok: true, status: 'already_acted', id: 'cand', action_id: 'accept' });
+    render(<Harness items={[slot({ id: 'cand', title: 'Walk' }, { slot: 'fuel', candidate: true })]} />);
+    await act(async () => { fireEvent.click(screen.getByTestId('board-accept')); });
+    await flush();
+    expect(screen.getByTestId('board-item').getAttribute('data-stage')).toBe('suggested');
+    expect(screen.getByTestId('board-accept')).toBeTruthy();
+  });
+
   it('an unknown-origin lane gets an honestly DISABLED ✓, not a dead control', () => {
     render(
       <Harness
@@ -317,6 +349,41 @@ describe('SlotBoard — undo-grace holds the write (option (a), board layer)', (
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect(screen.getByTestId('board-item').getAttribute('data-stage')).not.toBe('done');
     expect(screen.getByTestId('board-item-error')).toBeTruthy();
+  });
+});
+
+describe('SlotBoard — a settled completion lives behind the done drill', () => {
+  // A server-done item: not completed on this board this session, so it does NOT
+  // stay in place. This is the positive control for the stay-in-place pin AND for
+  // the row-level Undo, which the grace tests only ever assert ABSENT.
+  const settled = () =>
+    slot(
+      { id: 'r', title: 'Pay Eastlink', state: 'acted', acted_at: '2026-08-12T14:00:00Z' },
+      { slot: 'duty', done: true },
+    );
+
+  it('hides it behind Show done, and reveals it on tap', () => {
+    render(<Harness items={[settled()]} />);
+    expect(screen.queryByTestId('board-done-duty')).toBeNull();
+    const disclosure = screen.getByTestId('board-show-done-duty');
+    expect(disclosure.textContent).toBe('Show done (1)');
+    fireEvent.click(disclosure);
+    expect(screen.getByTestId('board-done-duty').textContent).toContain('Pay Eastlink');
+  });
+
+  it('renders a working row-level Undo there (the control the grace pins assert absent)', async () => {
+    render(<Harness items={[settled()]} />);
+    fireEvent.click(screen.getByTestId('board-show-done-duty'));
+    const undo = screen.getByTestId('board-undo');
+    expect(undo).toBeTruthy();
+    fireEvent.click(undo);
+    await flush();
+    expect(mockAct).toHaveBeenCalledWith('r', 'undo_done');
+  });
+
+  it('says the slot is clear rather than leaving a box whose only content is a button', () => {
+    render(<Harness items={[settled()]} />);
+    expect(screen.getByTestId('board-stack-clear-duty').textContent).toContain('Nothing left here today');
   });
 });
 
