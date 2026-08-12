@@ -5531,6 +5531,65 @@ def _cmd_tier_recurrence(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_reconcile(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred reconcile`` subcommands.
+
+    P1 is the statement side of the payment loop: seed the ledger from a
+    provider payment summary, classify what needs attention, and produce
+    the backlog bulk-review report. Propose-only — no path here closes an
+    item, and none writes to a vault.
+    """
+    raw = _load_unified_config(args.config)
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(raw, tool="reconcile", suppress_stdout=wants_json)
+
+    from alfred.reconcile import cli as rcli
+    from alfred.reconcile.config import load_from_unified
+
+    config = load_from_unified(raw)
+    subcmd = getattr(args, "reconcile_cmd", None)
+
+    if subcmd == "seed":
+        code = rcli.cmd_seed(
+            config,
+            note_path=getattr(args, "note", ""),
+            batch_id=getattr(args, "batch_id", "") or "",
+            session=getattr(args, "session", "") or "",
+            capture_ref=getattr(args, "capture_ref", "") or "",
+            dry_run=bool(getattr(args, "dry_run", False)),
+            wants_json=wants_json,
+        )
+    elif subcmd == "render":
+        code = rcli.cmd_render(config, wants_json=wants_json)
+    elif subcmd == "report":
+        code = rcli.cmd_report(config, wants_json=wants_json)
+    elif subcmd == "status":
+        code = rcli.cmd_status(config, wants_json=wants_json)
+    elif subcmd == "correct":
+        # An EMPTY --classes is meaningful: it rules the line clear. So the
+        # split has to yield [] for "" rather than [""], which would then be
+        # refused as an unknown class and make "clear" unreachable.
+        raw_classes = (getattr(args, "classes", "") or "").strip()
+        classes = [c.strip() for c in raw_classes.split(",") if c.strip()]
+        code = rcli.cmd_correct(
+            config,
+            line_key=getattr(args, "line_key", "") or "",
+            classes=classes,
+            operator=getattr(args, "operator", "") or "",
+            note=getattr(args, "correction_note", "") or "",
+            wants_json=wants_json,
+        )
+    else:
+        print(
+            "Usage: alfred reconcile {seed --note <path> [--dry-run] | "
+            "render | report | status | "
+            "correct --line-key <key> --operator <name> [--classes a,b]}"
+        )
+        code = 1
+
+    sys.exit(code)
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -7132,6 +7191,103 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # reconcile — remittance reconciliation, statement side (P1).
+    # Ledger is truth, note is a render. NO vault writes in P1: ``render``
+    # prints the regenerated text and stops there.
+    rec_p = sub.add_parser(
+        "reconcile",
+        help=(
+            "Remittance reconciliation — parse a provider payment summary "
+            "into the ledger, classify lines needing attention, and build "
+            "the backlog bulk-review report. Propose-only; nothing closes "
+            "automatically and nothing is written to the vault."
+        ),
+    )
+    rec_sub = rec_p.add_subparsers(dest="reconcile_cmd")
+
+    rec_seed = rec_sub.add_parser(
+        "seed",
+        help=(
+            "Parse a payment-summary note into the ledger. Idempotent: "
+            "re-running on the same note changes nothing. Exits 2 if any "
+            "row could not be parsed (the rows are listed)."
+        ),
+    )
+    rec_seed.add_argument(
+        "--note", required=True,
+        help="Path to the provider payment summary Markdown note",
+    )
+    rec_seed.add_argument(
+        "--batch-id", default="",
+        help="Batch id to record as provenance on every row",
+    )
+    rec_seed.add_argument(
+        "--session", default="",
+        help="Session id to record as provenance on every row",
+    )
+    rec_seed.add_argument(
+        "--capture-ref", default="",
+        help="Capture/scan reference to record as provenance on every row",
+    )
+    rec_seed.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Parse and report, but do not write the ledger",
+    )
+    rec_seed.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    rec_render = rec_sub.add_parser(
+        "render",
+        help=(
+            "Regenerate the note text FROM the ledger and print it. Writes "
+            "nothing to any vault — this proves the ledger is regenerable."
+        ),
+    )
+    rec_render.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    rec_report = rec_sub.add_parser(
+        "report",
+        help=(
+            "Build the backlog bulk-review artifact (CSV + summary) from "
+            "the ledger, into the instance's own reports directory."
+        ),
+    )
+    rec_report.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    rec_status = rec_sub.add_parser(
+        "status",
+        help="What is in the ledger, where it lives, and what needs attention",
+    )
+    rec_status.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    rec_correct = rec_sub.add_parser(
+        "correct",
+        help=(
+            "Record an operator ruling on one line's classification. "
+            "Repeated rulings on the same EOB code become a PROPOSED "
+            "mapping in the report — never an applied one."
+        ),
+    )
+    rec_correct.add_argument(
+        "--line-key", required=True,
+        help="The line's key, copied from the report's line_key column",
+    )
+    rec_correct.add_argument(
+        "--classes", default="",
+        help=(
+            "Comma-separated attention classes for this line. Pass an "
+            "empty value to rule the line CLEAR (no attention needed)."
+        ),
+    )
+    rec_correct.add_argument(
+        "--operator", required=True,
+        help="Who is making this ruling (recorded — a ruling with no author is not evidence)",
+    )
+    rec_correct.add_argument(
+        "--note", default="", dest="correction_note",
+        help="Free-text reason for the ruling",
+    )
+    rec_correct.add_argument("--json", action="store_true", help="Machine-readable output")
+
     # #54 — learned-speech-vocabulary review + decision. Approve/reject BY TERM
     # (never by proposal number: Daily Sync numbering shifts between renders,
     # and this list biases every future transcription).
@@ -7259,6 +7415,7 @@ def main() -> None:
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
         "routine": cmd_routine,
+        "reconcile": cmd_reconcile,
         "stt-vocab": _cmd_stt_vocab,
         "tier-override": _cmd_tier_override,
         "push-trial": _cmd_push_trial,
