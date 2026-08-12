@@ -401,11 +401,61 @@ export default function FeedPage() {
             the deck has nothing to deal BECAUSE things are set aside, say which
             rather than rendering nothing. Silence here is what let the old
             banner's disappearance read as "handled" when it meant "deferred".
-            TODO(voicing). */}
+
+            VOICING PASS (2026-08-12): the count is a UNION OF TWO STORES, and
+            NO CLAUSE HERE MAY BE FALSE FOR EITHER HALF. `setAside` is
+            `snooze.snoozed(id) || deckHidden.has(id)`:
+
+              - deckHidden — the deck's SESSION hide-list. Returns at the next
+                sync, on its own, without the operator.
+              - snooze.snoozed — the SERVER rungs (1d / 3d / 7d / until-I-say).
+                Returns when the rung expires, and the indefinite rung never
+                expires at all — as this same file says at the snoozed-rows
+                comment above: "the indefinite rung has no next sync to wait for".
+
+            The two mechanisms differ in LIFETIME and in RECOVERY, so the
+            truth-table over the union is narrow (verified, review round 2):
+
+              "back at the next sync"      false for B — the bug this replaced
+              "until you bring them back"  false for A — it returns unaided
+              "you can bring them back"    false for A — no un-hide control here
+              "they'll come back"          TRUE for every member — but the
+                                           indefinite rung returns by
+                                           breakthrough or unsnooze, NEVER by
+                                           timer ("what earns a row its way
+                                           back is urgency, not the calendar"
+                                           — tier/snooze.py, on that very rung).
+                                           Which is precisely why the line may
+                                           assert return and must not say when.
+              "set aside" / nothing lost   TRUE for every member
+
+            THE RULE THAT FALLS OUT: ASSERT RETURN, NEVER TIMING AND NEVER
+            TRIGGER. Return is the only universally true claim; when it comes
+            back and what brings it back both vary by store. So the line asserts
+            exactly that and stops.
+
+            A timing claim is UNWRITEABLE while the count is a union — that is a
+            builder change (split the count), boarded separately, not a copy
+            problem to solve harder. This is the `carryoverReason` fallback
+            reasoning at a second site: a line covering a heterogeneous
+            population may claim only what is common to all of it.
+
+            "Snoozed" went the same way, and for the same reason rather than for
+            warmth: it is the word on the backed control ("Snooze — choose how
+            long"), but the session half's control says "Set aside for now" and
+            its own constant carries the warning that "the copy on that path
+            must not promise otherwise". "Set aside" is the honest union term —
+            it is what this testid has always been called, and what the comment
+            above has always called them.
+
+            Splitting the counts per store was the alternative; rejected because
+            backed-vs-session is an implementation distinction the operator does
+            not model, and it buys precision he cannot act on at the cost of a
+            longer line on a phone. */}
         {loaded && deckable.length === 0 && setAsideDeckable.length > 0 && (
           <p data-testid="feed-deck-set-aside" className="mt-4 text-sm text-honeydew-600">
-            {setAsideDeckable.length} snoozed — back at the next sync. Nothing else
-            is waiting in the deck.
+            {setAsideDeckable.length} set aside — they&rsquo;ll come back. Nothing else is
+            waiting in the deck.
           </p>
         )}
 

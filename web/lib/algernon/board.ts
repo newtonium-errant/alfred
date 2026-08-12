@@ -71,10 +71,139 @@ export function boardSlotLabel(slot: string): string {
   return SLOT_LABELS[slot] ?? UNSLOTTED_LABEL;
 }
 
-// TODO(voicing): every operator-visible string in this module and in SlotBoard.tsx
-// is a plain placeholder. The permission-granting no-shame voice is the
-// prompt-tuner's to write; the SIGNAL is what ships here. Listed in the C1 report.
+// ── THE BOARD'S VOICE (voicing pass, operator-released 2026-08-12) ──────────
+//
+// Every operator-visible string in this module and in SlotBoard.tsx is written
+// to one rule, from the step-1 taxonomy ruling: the three slots are a PERMISSION
+// SYSTEM, not a priority stack. Duty / Rhythm / Fuel are co-equal, and Fuel
+// exists because restorative things felt "indulgent" when they are what makes
+// the operator happier and more productive.
+//
+// So the copy STATES FACTS ABOUT THE DAY AND NEVER VERDICTS ABOUT THE OPERATOR.
+// Where a shortfall is real, the sentence names the MECHANISM as its subject
+// ("the slot rules couldn't place…"), never the person. The ILB refinement holds
+// underneath: the SIGNAL always renders — only its voicing is gentle. Honesty is
+// never softened into vagueness, and warmth is never inflated into cheerleading.
+//
+// Vocabulary is taken from `tier/slots.py` rather than invented: Duty holds
+// obligations (a `due_pattern` routine, a dated task), Rhythm holds practice
+// (`target_cadence_days` — a cadence, NOT a schedule), Fuel holds restoration
+// (`self_care`). Copy that calls Rhythm "scheduled" would be describing Duty.
+//
+// ── THE FENCE: ARRANGEMENT, NOT GOAL (a STAGING guard, not a permanent ban) ─
+// SLOTS ARE HOW THE DAY IS ARRANGED. The balanced-day CLAIM keys to what the
+// server computes, and that metric is still TIER-based until stage 3 of the
+// classifier rollout flips it. So no string on this board may assert a
+// slot-based GOAL or target — not "aim for all three", not "a balanced day
+// needs one of each", and not scoring vocabulary that implies the slots feed a
+// tally the server does not yet keep on that axis.
+//
+// The permissible register is standing and placement: what the slots ARE to one
+// another, where an item sits, what is on the board. `boardSlotsWithADone` is
+// deliberately named apart from `balanced_day` for this reason.
+//
+// THE GOAL FRAME IS THE RATIFIED DESTINATION, NOT THE ENEMY. The operator's own
+// step-1 ruling is that the "Daily goal: balanced day" scoreline is "the real
+// centerpiece, promote to headline". This fence is the STAGING discipline that
+// gets there honestly — it bars the claim only while the metric behind it is
+// still tier-based, so the board never promises a flip that has not shipped.
+//
+// SO, TO WHOEVER SHIPS STAGE 3: this is your instruction, not merely your
+// prohibition. When the metric flips to the slot axis, the work is to PROMOTE
+// THE SCORELINE WITH THE GOAL FRAMING, per the ruling — not to leave these
+// strings as they are because a comment once said "don't". Re-read every string
+// below against the flipped metric; several become sayable that are not now,
+// and the scoreline is meant to become the headline.
+//
+// WHAT THE HOST SCORELINE MAY SAY, MEANWHILE. "N of 3 slots have something
+// done" is PERMITTED: it states the day as a fact, and a count of stacks is an
+// observation about the board. What is barred is framing the 3 as a TARGET —
+// no "only N of 3", no progress-toward language, nothing that makes the
+// remainder read as a shortfall.
+//
+// TWO ADJUDICATED EXCEPTIONS (ruled KEEP on review — do not "fix" them):
+//   1. The residue note's "they don't count for or against your day"
+//      (`SlotBoard.tsx`). "Count for or against" is the RECKONING idiom — held
+//      for or against someone — not the tallying sense barred here, and the
+//      held-against-him half is the line's entire value.
+//   2. The coverage warning's "the balance below counts only the rest". "The
+//      balance BELOW" is deictic: it points at the on-screen line, which is
+//      `boardSlotsWithADone`, so it states this render's denominator and claims
+//      nothing about the server metric.
+// Both were rewritten once for surface consistency with this fence and both
+// were reverted. The fence is about the CLAIM, not about the word "count".
 export const UNSLOTTED_LABEL = 'Not sorted yet';
+
+/**
+ * The empty-stack line, PER SLOT — the highest-stakes copy on the board.
+ *
+ * A single flat "Nothing here today." renders under Fuel every single morning
+ * (production runs {duty:2, rhythm:1}, so Fuel is empty daily), and a bare
+ * nothing-here under the restorative slot reads as a verdict on the operator —
+ * on the exact slot this taxonomy was built to protect. Duty and Rhythm get the
+ * terse factual line their emptiness deserves (an empty Duty is relief, an empty
+ * Rhythm is a fact); Fuel deliberately breaks the parallel and spends its extra
+ * words on PERMISSION, because that is the whole reason the slot exists.
+ *
+ * All three are true of the mechanism, and none of them may imply the operator
+ * fell short. A stack empties two ways, neither of which is a miss: nothing was
+ * classified into that slot, or its items were SNOOZED out of view on an earlier
+ * day (`ringItemVisibleToday` drops an acted item once `acted_at` is no longer
+ * today, and snoozing is an act). Completion is NOT one of the ways — a done
+ * item keeps its stack non-empty and settles into the drill — so an empty stack
+ * can never be the record of something left undone.
+ *
+ * The snooze path leaves every "today" here true: the shortest rung is
+ * `snooze_1d`, so a snoozed item is never due back on the day it left, and the
+ * day it was snoozed it was still on the board. A sub-day rung would break that
+ * and these lines would need re-checking.
+ *
+ * ── WHICH POPULATION EACH BRANCH GOVERNS ────────────────────────────────────
+ * Spelled out because "snoozing is an act" is true but underspecified, and that
+ * gap let three successive walks of this paragraph diverge — each following one
+ * handler in a verb space that has two. Anchored below to the lines that WRITE
+ * the state rather than to the comments describing it: every wrong revision of
+ * this paragraph came from reasoning over prose.
+ *
+ * A slot snooze sets `state=acted` with `acted_action='snooze'` — literally
+ * `feed_store.set_state(id, STATE_ACTED, action=SNOOZE_ACTED_VERB)` in
+ * `_dispatch_slot_snooze` (`daily_sync/action_router.py:911`; the verb is
+ * `"snooze"` at :124). So the item stays visible the day it is snoozed and
+ * drops the following day, via `ringItemVisibleToday`'s `acted_at` check.
+ *
+ * THE TRAP, NAMED — because a correct description does not stop the next reader
+ * rediscovering the wrong answer. `FeedStore.defer` / `STATE_DEFERRED`
+ * (`feed/store.py`) is real, reachable and correct — FOR OTHER KINDS. It cannot
+ * apply to anything on this board:
+ * `DEFER_EXCLUDED_KINDS = frozenset({"slot_suggestion"})` (`action_router.py`)
+ * is consulted where FEED_ACTIONS and ACTION_META are built, so a `defer_*` verb
+ * is never ATTACHED to the board's only kind — unreachable at the capability
+ * ceiling, not merely unused. It is the plausible wrong answer one file from the
+ * right one, and it has already misled every pass over this paragraph that began
+ * from the function name. Check the exclusion set before believing it applies.
+ *
+ * The surface fact that composes with both: home fetches `feedApi.list({})` with
+ * NO state filter, deliberately (`pages/index.tsx` — the rings need today's done
+ * items), so every state reaches the board and `ringItemVisibleToday` is the
+ * whole gate here. The `state: 'open'` fetch is the FEED page's, not this one's.
+ */
+export const SLOT_EMPTY_COPY: Record<string, string> = {
+  duty: 'Nothing owed today.',
+  // Keyed to the CADENCE, not to the operator's doing: "No practice today."
+  // has a second reading ("you didn't practice") on the one slot whose items
+  // are things he does repeatedly. A practice "comes round" — that is what
+  // `target_cadence_days` means. "Scheduled" is barred here; scheduling is
+  // Duty's basis (slots.py rule 4, `due_pattern`), so it would name the wrong slot.
+  rhythm: 'Nothing comes round today.',
+  fuel: 'Nothing here yet — there’s room when you want it.',
+};
+
+/**
+ * Fallback for the empty line. Unreachable for `unslotted` in practice — the
+ * residue stack is appended only when it holds items, and every member lands in
+ * a rendered section — but the lookup is total rather than trusting that proof.
+ */
+export const SLOT_EMPTY_FALLBACK = 'Nothing here today.';
 
 /**
  * Whether a committed item was first seen BEFORE today — i.e. it is carryover.
@@ -133,11 +262,18 @@ export function carryoverRank(item: FeedItem, now: Date = new Date()): number {
 export function carryoverReason(item: FeedItem, now: Date = new Date()): string | null {
   const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
   const breakthrough = typeof ev.snooze_breakthrough === 'string' ? ev.snooze_breakthrough.trim() : '';
-  // TODO(voicing) — placeholder copy.
+  // Every reason takes the ITEM as its subject, not the operator — "past ITS due
+  // date", not "you are overdue". `Overdue` was the one word here shaped like a
+  // verdict, and it is the same fact either way; the frame is what changes.
   if (breakthrough === 'crossed_due') return 'Back early — its due date passed';
   if (breakthrough === 'moved_earlier') return 'Back early — it moved sooner';
   if (breakthrough) return 'Back early';
-  if (boardIsOverdue(item, now)) return 'Overdue';
+  if (boardIsOverdue(item, now)) return 'Past its due date';
+  // Deliberately left as the vaguest line here, NOT sharpened to something like
+  // "from an earlier day". This is a total fallback and the browse-on-swap call
+  // site passes OVERFLOW items through it — including demoted candidates created
+  // today, for which any age claim would be false. A wrong-but-confident reason
+  // is worse than a thin one. (Mechanism finding, reported with the ship.)
   return 'Carried over';
 }
 
