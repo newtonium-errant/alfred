@@ -161,7 +161,16 @@ export function ringItemUndoable(item: FeedItem): boolean {
 // configurable in the web yet.
 const RING_TZ = 'America/Halifax';
 
-function instanceDayKey(d: Date): string {
+/**
+ * YYYY-MM-DD in the instance tz. EXPORTED because the board's overdue test has
+ * to compare a BARE `due_iso` date ("2026-08-12", what `date.isoformat()` emits)
+ * against today, and the only correct instrument for that is a day-key string
+ * compare. Parsing a bare date with `new Date()` lands it at UTC midnight, which
+ * west of Greenwich is the PREVIOUS calendar day — so a task due today reads as
+ * overdue. Measured, not reasoned: `new Date('2026-08-12')` → its Halifax day key
+ * is `2026-08-11`. One owner for the day key; see `boardIsOverdue`.
+ */
+export function instanceDayKey(d: Date): string {
   // YYYY-MM-DD in the instance tz — the calendar-day identity for date-scoping.
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: RING_TZ,
