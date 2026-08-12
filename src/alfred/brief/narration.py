@@ -233,33 +233,63 @@ def _day_plan_text(plan: "DayPlan") -> str:
     read plan can no longer disagree about what is on today's plan. Before
     this, each render read ``TodayView`` independently.
 
-    **STALE COPY, deliberately left in place.** The strings below still speak
-    the TIER axis ("Urgent", "Then", "self-care intentions") while the brief
-    now ARRANGES the same rows by slot (Duty / Rhythm / Fuel). That is not an
-    oversight and it is not a bug to fix here: this lane re-points the
-    structure and freezes the voice, and the prompt-tuner's voice pass
-    re-voices these strings against the slot vocabulary afterwards. Changing
-    them here would collide with that pass — and, worse, would be the first
-    copy in the system to name a slot while ``daily_goal`` still measures
-    tiers. ``rows_in_tier`` exists precisely so this stayed byte-identical
-    across the re-point: it preserves the view's own lane order.
-    """
-    def _names(rows, limit):
-        return [r.name for r in rows[:limit] if r.name]
+    **RE-VOICED ONTO THE SLOT AXIS (voice pass, pass 2)** — the re-voicing the
+    C2+C3 lane deliberately deferred to here. This reads ``plan.groups``, the
+    arrangement the brief itself renders, and speaks Duty / Rhythm / Fuel.
 
-    t3_rows = plan.rows_in_tier(3)
-    t1 = _names(plan.rows_in_tier(1), 3)
-    t2 = _names(plan.rows_in_tier(2), 2)
-    if not t1 and not t2 and not t3_rows:
-        return "No urgent or medium items — today's yours to shape."
+    It is NOT a relabelling of tiers, and that is the whole reason it is legal:
+    every row comes from the slot the classifier STAMPED, so a cadence routine
+    that happens to be due today is spoken as Rhythm — which is what it is.
+    Reading ``rows_in_tier`` and printing slot names over it would be the
+    superseded G9 rename, a confident wrong answer on top of data that already
+    holds the right one.
+
+    Carryover leads, because ``SlotGroup`` orders it first for the same reason
+    the board does: it has already cost him a day.
+
+    **THE FENCE.** This segment describes ARRANGEMENT only. The goal claim
+    lives in :func:`_day_state_text` and stays TIER-based for as long as
+    ``daily_goal`` is. So no slot is ranked above another here, no slot is
+    called the important one, and nothing resembling "one in every slot" may be
+    spoken until that metric flips. Group by slot; measure by tier.
+    """
+    groups = [g for g in plan.groups if not g.is_empty]
+    empty_line = "Today's plan is empty so far — nothing due, and no routines firing."
+    if not groups:
+        return empty_line
+
     parts: list[str] = []
-    if t1:
-        parts.append("Urgent: " + ", ".join(t1) + ".")
-    if t2:
-        parts.append("Then: " + ", ".join(t2) + ".")
-    if t3_rows:
-        parts.append(f"Plus {len(t3_rows)} self-care intention{'s' if len(t3_rows) != 1 else ''}.")
-    return " ".join(parts)
+    # Across all slots, not per slot: carryover is the day's one attention
+    # claim, and splitting it per group would bury it three times over.
+    carried = [r.name for g in groups for r in g.carryover if r.name][:2]
+    if carried:
+        parts.append("Still carrying: " + ", ".join(carried) + ".")
+    for g in groups:
+        named = [r.name for r in g.committed if r.name]
+        if named:
+            # ONE name per slot, then a count. Two names each read fine on a
+            # light day and ran to 52 of the 55-word budget on a loaded one —
+            # three words from the clip, which is a runaway guard, not a plan.
+            # The count also carries more than a second title does: it says how
+            # heavy the slot is, which is the thing a spoken list cannot show.
+            # One-each is the co-equal shape too — naming two in Duty and one
+            # in Fuel would rank them by airtime.
+            rest = len(named) - 1
+            parts.append(
+                f"{g.label}: {named[0]}" + (f", and {rest} more." if rest else ".")
+            )
+        elif g.routines:
+            # A slot holding only habit anchors still gets named — §4's
+            # dissolution put them here, and a slot that goes unmentioned reads
+            # as an empty one.
+            n = len(g.routines)
+            parts.append(f"{g.label}: {n} routine{'s' if n != 1 else ''}.")
+    offers = sum(len(g.suggestions) for g in groups)
+    if offers:
+        # Counted, never listed: a suggestion needs a yes/no, and this is a
+        # one-way surface. Same rule the waiting segment runs on.
+        parts.append(f"Plus {offers} to say yes or no to.")
+    return " ".join(parts) if parts else empty_line
 
 
 def _events_text(events: list[Any]) -> str:
@@ -409,14 +439,22 @@ def _sign_off_text(g: "DailyGoalState") -> str:
     """A short encouraging close keyed on the daily goal (self-correcting-friendly
     tone; the composer log captures which segments draw questions later).
 
-    Tier-based like :func:`_day_state_text`, and stale in the same deliberate
-    way — "one urgent thing first" names a tier, not a slot.
+    Tier-based like :func:`_day_state_text` and STAYS so — it keys on
+    ``daily_goal``, so naming a slot here would be the fence violation.
+
+    Two voice-pass fixes. The old close said "Take it one slot at a time",
+    which was idiomatic when written and is now a collision: it used the word
+    "slot" in the one segment forbidden from naming slots, next to a brief that
+    renders Duty / Rhythm / Fuel. And the old branches closed on "Go get it" /
+    "You've got this" — the cheerleading register the board pass ruled out.
+    What replaces it grants permission instead of urging: it states where the
+    day stands and leaves the choosing to him.
     """
     if g.balanced_day:
-        return "You're set up well. Go get it."
+        return "One in every tier already. The rest of the day is yours."
     if g.t1_available and g.t1_done < g.t1_available:
-        return "One urgent thing first, then the rest follows. You've got this."
-    return "That's the shape of your day. Take it one slot at a time."
+        return "The urgent lane is where the pressure is. The rest can wait for you."
+    return "That's the shape of your day. Take it in whatever order suits you."
 
 
 # --- pure composer (the gate surface) ----------------------------------------
