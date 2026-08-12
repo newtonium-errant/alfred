@@ -1,4 +1,5 @@
 import type { FeedItem } from './feed';
+import { readTimeExtent } from './timeExtent';
 
 // The TIME SUBSTRATE for the Awareness feed's timeline view (D7 — "time-extent
 // rendering adopted everywhere applicable"; the Waterline's portable insight,
@@ -168,6 +169,8 @@ export interface TimeSplit<T> {
   onBand: T[];
   /** Timed, but outside the reachable span (a next-week event). */
   beyond: T[];
+  /** Has a DATE but no clock position — the day-header strip, not a lane. */
+  allDay: T[];
   /** No time dimension at all — never given a fabricated position. */
   untimed: T[];
 }
@@ -186,9 +189,17 @@ export function splitByWindow<T extends Pick<FeedItem, 'starts_at' | 'ends_at'>>
 ): TimeSplit<T> {
   const lo = now - WINDOW_PAST_MS;
   const hi = now + WINDOW_FUTURE_MS;
-  const split: TimeSplit<T> = { onBand: [], beyond: [], untimed: [] };
+  const split: TimeSplit<T> = { onBand: [], beyond: [], allDay: [], untimed: [] };
   for (const it of items) {
-    const extent = itemExtent(it);
+    // Class FIRST, position second. An all-day item would otherwise be refused
+    // by `parseInstant` (correctly — it has no hour) and land in `untimed`,
+    // which is where it used to go and why the register was imprecise.
+    const cls = classifyFeedTime(it);
+    if (cls === 'all_day') {
+      split.allDay.push(it);
+      continue;
+    }
+    const extent = cls === 'positionable' ? itemExtent(it) : null;
     if (!extent) {
       split.untimed.push(it);
     } else if (extent.start <= hi && extentEnd(extent) >= lo) {
@@ -307,61 +318,54 @@ export function hourTicks(w: TimeWindow): number[] {
   return ticks;
 }
 
-// --- display formatting: BEHIND THE SWAP SEAM, deliberately minimal ----------
-//
-// OWNERSHIP (team-lead ruling, cross-lane): the human-readable extent STRING
-// belongs to the deck lane's shared layer, which is building a portable
-// formatter; the POSITIONING MATHS above is this module's. The four helpers
-// below exist because the timeline had to render something before that layer
-// landed, and they are kept to exactly what the band's own labels need.
-//
-// DO NOT GROW THEM into general display formatting — relative times, date
-// headers, "in 3 hours", locale variants. The merge that lands second unifies
-// on the shared formatter, and every extra behaviour added here is another
-// thing that unification has to reconcile or silently diverge from.
+// --- time CLASS: the three ways an item can relate to a day axis -------------
 
-/** Local wall-clock `HH:MM`. The operator reads their own clock, not UTC. */
+/**
+ * What an item's time lets a DAY AXIS do with it.
+ *
+ *   positionable  it has a clock position — place it on the substrate
+ *   all_day       it has a DATE but no clock position — the day-header strip
+ *   timeless      it has no time dimension at all — the untimed register
+ *
+ * THE all_day / timeless SPLIT IS THE POINT. Both were `timeless` before, which
+ * was correct-but-imprecise: a merge proposal has no time, whereas an all-day
+ * event has a date and merely no hour, and lumping them under "Untimed" told the
+ * operator the same thing about two different facts.
+ *
+ * The discrimination is DELEGATED to `readTimeExtent` — the shared layer owns the
+ * date-only question, and owns it once. It has to be decided on the STRING:
+ * `new Date("2026-08-12")` succeeds and invents midnight UTC, so anything that
+ * parses first and asks questions later has already lost the distinction.
+ *
+ * `unparseable` maps to `timeless` here: an axis cannot place a value it could
+ * not read. The item is not swallowed — it renders in the untimed register, and
+ * the shared formatter has its own ILB label for the case.
+ */
+export type FeedTimeClass = 'positionable' | 'all_day' | 'timeless';
+
+export function classifyFeedTime(item: Pick<FeedItem, 'starts_at' | 'ends_at'>): FeedTimeClass {
+  const read = readTimeExtent(item);
+  if (read.kind === 'all_day') return 'all_day';
+  if (read.kind === 'instant' || read.kind === 'interval') return 'positionable';
+  return 'timeless';
+}
+
+// Display strings are the SHARED layer's (`timeExtent.formatTimeExtent`) — the
+// ownership split ruled cross-lane: what an extent SAYS to a reader is one
+// question with one answer, while where it SITS on a day axis is this module's.
+// `formatExtent` / `formatDuration` / `extentMinutes` lived here only because the
+// timeline needed labels before that layer existed; they are gone rather than
+// wrapped. `formatClock` stays: it labels AXIS TICKS and the NOW readout, which
+// are the axis's own furniture and have no extent to format.
+
+/**
+ * Local wall-clock `HH:MM` for AXIS FURNITURE — the hour ticks and the NOW
+ * readout. Not extent display: those go through the shared formatter. The
+ * operator reads their own clock, so this is local time, never UTC.
+ */
 export function formatClock(ms: number): string {
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
-
-/**
- * A human span for an extent: `"09:30"` for a moment, `"11:00 – 15:00"` for an
- * interval, with a `+1d`-style suffix when the end lands on a later date (a TAF
- * validity window routinely crosses midnight, and a bare `"18:00 – 06:00"`
- * would read as a twelve-hour trip backwards).
- */
-export function formatExtent(extent: Extent): string {
-  if (extent.end === null) return formatClock(extent.start);
-  const startDay = new Date(extent.start);
-  const endDay = new Date(extent.end);
-  const dayDelta = Math.round(
-    (new Date(endDay.getFullYear(), endDay.getMonth(), endDay.getDate()).getTime() -
-      new Date(startDay.getFullYear(), startDay.getMonth(), startDay.getDate()).getTime()) /
-      (24 * HOUR),
-  );
-  const suffix = dayDelta > 0 ? ` +${dayDelta}d` : '';
-  return `${formatClock(extent.start)} – ${formatClock(extent.end)}${suffix}`;
-}
-
-/**
- * Duration in whole minutes, or `null` for a moment. Display-only.
- */
-export function extentMinutes(extent: Extent): number | null {
-  if (extent.end === null) return null;
-  return Math.round((extent.end - extent.start) / MINUTE);
-}
-
-/** Compact duration: `"4h"`, `"45m"`, `"1h 30m"`; `null` for a moment. */
-export function formatDuration(extent: Extent): string | null {
-  const mins = extentMinutes(extent);
-  if (mins === null) return null;
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  if (h === 0) return `${m}m`;
-  if (m === 0) return `${h}h`;
-  return `${h}h ${m}m`;
 }
 
 // --- lane packing ------------------------------------------------------------

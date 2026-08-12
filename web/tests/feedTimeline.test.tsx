@@ -60,7 +60,7 @@ describe('TimelineView — the empty band reports, never just blanks', () => {
     // knows when it happens" are different facts and must not read alike.
     render(<TimelineView items={[item({ id: 'u1' }), item({ id: 'u2' })]} now={NOW} />);
     const empty = screen.getByTestId('timeline-empty');
-    expect(empty.textContent).toContain('sits in the registers below');
+    expect(empty.textContent).toContain('sits in the registers around it');
     expect(empty.textContent).not.toContain('The feed is empty too');
     expect(screen.getByTestId('timeline-untimed').textContent).toContain('Untimed (2)');
   });
@@ -124,7 +124,8 @@ describe('TimelineView — the three registers', () => {
 
     const untimed = screen.getByTestId('timeline-untimed');
     expect(untimed.textContent).toContain('title proposal');
-    expect(untimed.textContent).toContain("rather than placed at an hour they don't have");
+    expect(untimed.textContent).toContain('No time dimension at all');
+    expect(untimed.textContent).toContain('an all-day item has a date');
   });
 
   it('holds a far-future item in its own register rather than squashing the axis', () => {
@@ -139,13 +140,57 @@ describe('TimelineView — the three registers', () => {
     );
     expect(traces()).toHaveLength(1);
     expect(screen.getByTestId('timeline-beyond').textContent).toContain('Beyond this window (1)');
-    expect(screen.getByTestId('timeline-counts').textContent).toBe('1 on the band · 1 beyond · 0 untimed');
+    expect(screen.getByTestId('timeline-counts').textContent).toBe('1 on the band · 0 all day · 1 beyond · 0 untimed');
   });
 
   it('a register that is empty is not rendered at all', () => {
     render(<TimelineView items={[item({ id: 'timed', starts_at: localIso(2026, 8, 12, 9) })]} now={NOW} />);
     expect(screen.queryByTestId('timeline-beyond')).toBeNull();
     expect(screen.queryByTestId('timeline-untimed')).toBeNull();
+  });
+});
+
+describe('TimelineView — the all-day strip', () => {
+  const allDay = item({ id: 'holiday', starts_at: '2026-08-12', ends_at: null });
+  const atNine = item({ id: 'run', starts_at: localIso(2026, 8, 12, 9) });
+  const nothing = item({ id: 'proposal' });
+
+  it('renders an all-day item in the STRIP, not as a lane on the substrate', () => {
+    render(<TimelineView items={[allDay, atNine]} now={NOW} />);
+    const strip = screen.getByTestId('timeline-allday');
+    expect(strip.textContent).toContain('All day');
+    expect(strip.textContent).toContain('title holiday');
+
+    // Not a trace, and — the load-bearing half — it did not open a second lane.
+    // A day-spanning bar never frees its lane, so as a lane occupant it would
+    // squeeze every clock-positioned trace. One item, one lane, full width.
+    expect(traceFor('holiday')).toBeUndefined();
+    expect(screen.getByTestId('timeline-band').getAttribute('data-lane-count')).toBe('1');
+    expect(traceFor('run')!.style.width).toBe('100%');
+  });
+
+  it('narrows Untimed back to the genuinely timeless', () => {
+    render(<TimelineView items={[allDay, nothing]} now={NOW} />);
+    // The two facts are now told apart: a date without an hour vs no time at all.
+    expect(screen.getByTestId('timeline-allday').textContent).toContain('title holiday');
+    const untimed = screen.getByTestId('timeline-untimed');
+    expect(untimed.textContent).toContain('title proposal');
+    expect(untimed.textContent).not.toContain('title holiday');
+    expect(screen.getByTestId('timeline-counts').textContent).toBe('0 on the band · 1 all day · 0 beyond · 1 untimed');
+  });
+
+  it('an all-day item is selectable, and reaches the same row as a trace', () => {
+    render(
+      <TimelineView items={[allDay]} now={NOW} renderDetail={(it) => <li data-testid="detail">detail {it.id}</li>} />,
+    );
+    expect(screen.queryByTestId('timeline-detail')).toBeNull();
+    fireEvent.click(screen.getByTestId('timeline-allday-item'));
+    expect(screen.getByTestId('timeline-detail').textContent).toContain('detail holiday');
+  });
+
+  it('the strip is absent when nothing is all-day', () => {
+    render(<TimelineView items={[atNine]} now={NOW} />);
+    expect(screen.queryByTestId('timeline-allday')).toBeNull();
   });
 });
 

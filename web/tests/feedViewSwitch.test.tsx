@@ -25,6 +25,7 @@ vi.mock('next/router', () => ({
 vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
 
 import FeedPage from '../pages/feed';
+import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 import type { FeedItem } from '../lib/algernon/feed';
 
 const pad = (n: number) => String(Math.abs(Math.trunc(n))).padStart(2, '0');
@@ -232,9 +233,18 @@ describe('FeedPage — the timeline is wired to the page, not just wire-able', (
     expect(screen.getByTestId('feed-deck-link').textContent).toContain('1 decision');
   });
 
-  it('the page declares the sensor-log surface (the skin scope)', async () => {
+  it('the page declares the sensor-log surface, and the console carries the paint', async () => {
+    // POST-ADOPTION the attribute is Layout's (`surface` prop) rather than this
+    // page's own div, so the assertion moved with it — deliberately to the
+    // ANCESTOR relationship rather than to whichever element happens to hold it,
+    // which is the fact the skin's scoping actually depends on. The split's other
+    // half is asserted alongside: the console element keeps the PAINTING class,
+    // which must not sit on the surface root or it would reach the shell.
     render(<FeedPage />);
     await loaded();
-    expect(screen.getByTestId('feed-console').getAttribute('data-surface')).toBe('sensor-log');
+    const console_ = screen.getByTestId('feed-console');
+    expect(console_.closest(`[data-surface="${SENSOR_SURFACE}"]`)).not.toBeNull();
+    expect(console_.className).toContain('sensor-console');
+    expect(console_.getAttribute('data-surface')).toBeNull();
   });
 });

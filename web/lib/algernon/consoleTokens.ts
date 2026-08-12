@@ -20,15 +20,28 @@ import type { Verdict, VerbWeight } from './feedConstants';
 // literals and are never assembled as `text-${role}`.
 
 /**
- * The four function roles of the identity. Colour carries meaning: pick the
+ * The five function roles of the identity. Colour carries meaning: pick the
  * role by what the element DOES, never by what reads well in the slot.
  *
- *   affirm    yes · confirm · accept · it landed
- *   negative  no · reject · spam · this destroys something
- *   caution   not now, or not without a second look
- *   info      neutral structure; carries no verdict at all
+ *   affirm       yes · confirm · accept · it landed
+ *   negative     no · reject · spam · this destroys something
+ *   caution      not now, or not without a second look
+ *   info         neutral structure; carries no verdict at all
+ *   environment  the world, not the work — a weather window, a time extent
+ *
+ * `environment` and `info` are BOTH non-verdict, so the line between them is
+ * the one a consumer will get wrong. `info` dresses the SURFACE'S OWN
+ * structure — a divider, a count, a label the app drew. `environment` is the
+ * ambient WORLD the surface is reporting on: a fog corridor from 11:00 to
+ * 15:00 exists whether or not anything renders it. Ask "would this fact be
+ * true with the screen off?" — if yes, it is environment.
+ *
+ * It exists because the feed's timeline was spending amber on weather while
+ * the deck spends amber on the defer family, and one hue cannot mean both
+ * "slow down" and "this is what the sky is doing" (ruled 2026-08-12). Amber
+ * stays exclusively caution's.
  */
-export type ConsoleRole = 'affirm' | 'negative' | 'caution' | 'info';
+export type ConsoleRole = 'affirm' | 'negative' | 'caution' | 'info' | 'environment';
 
 /**
  * The names this layer dresses itself. Not the full set of legal surface
@@ -107,6 +120,7 @@ export const ROLE_TEXT_CLASS: Record<ConsoleRole, string> = {
   negative: 'text-negative',
   caution: 'text-caution',
   info: 'text-info',
+  environment: 'text-environment',
 };
 
 export const ROLE_BORDER_CLASS: Record<ConsoleRole, string> = {
@@ -114,6 +128,7 @@ export const ROLE_BORDER_CLASS: Record<ConsoleRole, string> = {
   negative: 'border-negative',
   caution: 'border-caution',
   info: 'border-info',
+  environment: 'border-environment',
 };
 
 export const ROLE_WASH_CLASS: Record<ConsoleRole, string> = {
@@ -121,6 +136,7 @@ export const ROLE_WASH_CLASS: Record<ConsoleRole, string> = {
   negative: 'bg-negative-wash',
   caution: 'bg-caution-wash',
   info: 'bg-info-wash',
+  environment: 'bg-environment-wash',
 };
 
 export const ROLE_FILL_CLASS: Record<ConsoleRole, string> = {
@@ -128,6 +144,7 @@ export const ROLE_FILL_CLASS: Record<ConsoleRole, string> = {
   negative: 'bg-negative-deep text-console-ink',
   caution: 'bg-caution text-console-on-fill',
   info: 'bg-info-deep text-console-ink',
+  environment: 'bg-environment-deep text-console-ink',
 };
 
 /**

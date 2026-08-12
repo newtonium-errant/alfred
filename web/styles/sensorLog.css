@@ -13,141 +13,129 @@
    instrument accent, amber for weather and heavy verbs.
 
    ───────────────────────────────────────────────────────────────────────────
-   ⚠  THIS FILE IS THE SEAM.  ⚠
+   THE SEAM IS CLOSED — this file now re-points, it no longer stands in.
    ───────────────────────────────────────────────────────────────────────────
-   The shared design-token / theme layer is owned by the DECK lane, which is
-   building in parallel. Until that layer lands and is relayed, these tokens are
-   feed-local. THIS BLOCK IS THE ONLY PLACE THEY ARE DEFINED — every consumer
-   reads them through `var(--sensor-*)`, so the swap is ONE EDIT HERE PLUS THE
-   ENUMERATED CONSUMER FILLS: re-point each custom property at its shared-layer
-   equivalent, then tokenize the five inline `rgba(...)` literals in
-   TimelineView.tsx (`:62-64` the three trace fills, `:95-96` the weather tint
-   and its border) that predate the token set and are listed with their target
-   roles in the swap block below. Nothing else moves.
+   Every colour below resolves to the shared layer (`styles/console.css`, owned
+   by the deck lane, imported in `_app.tsx`). Nothing here holds a hex any more.
+   What survives is the SURFACE'S VOCABULARY — one place that says what this
+   surface means by each role — bound to the shared layer's values.
 
-   Saying "no consumer changes" here would be simpler and false — those five
-   fills ARE consumers, they just aren't reading a variable yet, and the swap
-   block already treats them as work. No second token vocabulary was invented
-   and no shared token was guessed at; if a name below has no counterpart in the
-   shared layer, that is a conversation, not a silent divergence.
+   The names were renamed off their old hue spellings in the same pass that
+   re-pointed them (`--sensor-amber` → `--sensor-environment`, `--sensor-teal` →
+   `--sensor-affirm`, and so on). A token called `amber` bound to periwinkle
+   would be exactly the comment-that-lies this file warns about elsewhere. That
+   rename was NOT in the ratified spec — it is a judgment call, flagged as one.
 
-   Scoped to `[data-surface='sensor-log']` rather than `:root` DELIBERATELY:
-   `FeedRow` / `RingsHeader` are shared with `pages/index.tsx`, which is the
-   BRIEF — a different canonical surface (the viewscreen). A `:root` palette
-   would have leaked the instrument dark onto it. The attribute selector makes
-   that leak structurally impossible: only the feed page sets the attribute, and
-   `tests/sensorLogContainment.test.tsx` asserts BOTH halves of that by rendering
-   both pages — feed has it on an ancestor of its rows, home has none at all.
+   BOTH NON-MECHANICAL MAPPINGS ARE RESOLVED, and neither resolved the easy way:
 
-   ───────────────────────────────────────────────────────────────────────────
-   THE SWAP, PRE-RESOLVED (team-lead relay, deck lane's layer now stable)
-   ───────────────────────────────────────────────────────────────────────────
-   Landing with the deck lane's merge: `web/styles/console.css` (tokens + LCARS
-   shape primitives) and `web/lib/algernon/consoleTokens.ts` (domain-fact→role
-   mapping), wired through tailwind.config.cjs and imported in `_app.tsx`. The
-   intended re-point, recorded now so the post-merge commit is a lookup rather
-   than a re-derivation:
+   (1) THE INK SPLIT, applied. `-faint` is cleared for UPPERCASE micro-labels
+       only (~4.2:1) and is now spent by exactly ONE rule, `.sensor-label`. The
+       three sentence-case body spends — the page subtitle, the empty-band line,
+       the timeline window readout — took `-dim`. Re-pointing the old single
+       token wholesale would have dropped real body copy below a ratio it was
+       never cleared for.
 
-     --sensor-void   → console-void        --sensor-teal   → affirm
-     --sensor-hull   → console-hull        --sensor-teal2  → affirm-deep
-     --sensor-panel  → console-panel       --sensor-teal3  → affirm-wash
-     --sensor-raise  → console-raise       --sensor-rust   → negative
-     --sensor-edge   → console-edge        --sensor-rust2  → negative-deep
-     --sensor-edge2  → console-edge-bright --sensor-rust3  → negative-wash
-     --sensor-ink    → console-ink         --sensor-slate  → info
-     --sensor-ink2   → console-ink-dim     --sensor-slate2 → info-deep
-     --sensor-ink4   → console-ink-ghost
-     .sensor-elbow   → .console-elbow      .sensor-maybe   → .console-hatch
-     .sensor-bar     → .console-railseg (VERIFY: our bar is pill-terminated;
-                        confirm railseg is the same shape before adopting)
-     .sensor-band's accreted texture → .console-accreted
+   (2) AMBER DID NOT BECOME `caution`. The shared layer gained a fifth role,
+       ENVIRONMENT, for the ambient world (ruled 2026-08-12 after this file
+       raised the collision). Amber stays exclusively caution's — the defer
+       family and the heavy-verb arm — so a fog window can never wear the hue
+       that means "slow down". `--sensor-environment` points at that new role.
 
-   TWO MAPPINGS THAT ARE NOT MECHANICAL — resolve them, do not assume:
+   STILL OWED, and it cannot be discharged from a terminal: THE REAL-RENDER
+   CHECK. Two questions, both open until someone looks at the screen —
+     · does periwinkle read as "the world" next to the affirm teal, at the
+       measured 4.9:1 on panel? The numbers place it; only eyes confirm it.
+     · do the trace fills still let the hour gridlines through? They are
+       `color-mix(... 10%, transparent)` on the role tokens rather than opaque
+       `-wash` hexes precisely so the answer stays yes — an opaque wash would
+       occlude them, which is why the seam refused a flat swap. If it reads
+       wrong, layer `--console-scrim`; never un-ratify the role.
 
-   (1) `--sensor-ink3` splits. The shared `console-ink-faint` is documented as
-       UPPERCASE-micro-label-only (~4.2:1). We use ink3 for `.sensor-label`
-       (uppercase micro-label — `-faint` is correct) AND for sentence-case body
-       (the page subtitle, the empty-band line, the timeline window readout),
-       which must take `console-ink-dim` instead. One token here, two roles
-       there; re-pointing it wholesale would drop real body copy to a contrast
-       ratio it was never cleared for.
+   DEFINITIONS vs PAINTING — the ratified adoption split. The attribute now
+   lives on the LAYOUT ROOT (`surface="sensor-log"`), so the definition block is
+   deliberately inert: custom properties inherit and paint nothing. Everything
+   that paints is scoped to `.sensor-console`, the feed's own content element.
+   That is not tidiness. A selector audit found 3 of this file's rules would
+   reach the app shell from a root-level attribute — the root paint (nav
+   included), the focus ring (the bug FAB renders outside <main> and this file
+   loads after globals, so it would have won), and the danger descendants.
+   Shell stays warm.
 
-   (2) `--sensor-amber` is the ENVIRONMENT register — weather extents, the
-       maybe-hatch, time-shaped things. The shared `caution` is amber too, but
-       it MEANS the defer family and the heavy-verb arm (deliberately one idea,
-       per the relay). Equating them would give a fog window the same hue as a
-       defer verb, which is precisely the kind of collision that makes a token
-       system stop being true. Raise it before swapping — the seam's own rule is
-       that a missing counterpart is a conversation, not a silent divergence.
-
-   THE FIVE CONSUMER FILLS — the swap's only work outside this file. All in
-   `components/feed/TimelineView.tsx`, all inline `rgba(...)` literals that
-   predate the token set:
-
-     :62  weather trace fill  rgba(201,154,76,0.10) → ENVIRONMENT -wash
-     :63  live trace fill     rgba(79,167,161,0.10) → affirm-wash
-     :64  quiet trace fill    rgba(119,131,155,0.08) → info-wash
-     :95  weather certain-block tint rgba(201,154,76,0.13) → ENVIRONMENT -wash
-     :96  weather block border rgba(201,154,76,0.35) → ENVIRONMENT -deep
-
-   The two weather entries take the ENVIRONMENT role, never `caution` — the
-   ruling above, applied. And one caveat that stops this being purely
-   mechanical: these are TRANSLUCENT, so they composite over the band's hull and
-   its gridlines show THROUGH a trace. An opaque `-wash` hex would occlude them.
-   If that reads worse, the fix is to keep the fill translucent via
-   `console-scrim` layering rather than to un-ratify the role — check it against
-   a real render before calling the swap done.
-
-   THREE GOTCHAS from the layer's owner, recorded because they bite at swap time:
-     · NO opacity modifiers — the tokens are plain hex, so `bg-console-panel/50`
-       silently emits nothing. Climb the surface ramp instead; `console-scrim` is
-       the one translucent token. (Our inline `rgba(...)` trace fills become the
-       `-wash` roles; our `opacity:` declarations are CSS properties, not colour
-       modifiers, and are unaffected.)
-     · Never put a `rounded-*` utility on an element carrying `.console-elbow` or
-       `.console-railseg` — console.css loads after globals and wins.
-     · Instance-accent collisions are ACCEPTED by design (`instanceAccentClass`
-       is hash-based, not a name map); text is the identifying channel.
+   The ROW rules stay attribute-scoped on purpose: `FeedRow` / `RingsHeader` are
+   shared with `pages/index.tsx` — the BRIEF, a different canonical surface — and
+   the attribute is what makes that leak structurally impossible.
+   `tests/sensorLogContainment.test.tsx` asserts both halves by rendering both
+   pages, and `tests/sensorLogShell.test.tsx` asserts the shell is untouched
+   under the root-level attribute.
    ═══════════════════════════════════════════════════════════════════════════ */
 
+/* DEFINITIONS ONLY — deliberately inert.
+ *
+ * Custom properties inherit and paint nothing, so this block is safe on the
+ * Layout ROOT, which is where the attribute now lives (`surface="sensor-log"`).
+ * Everything that PAINTS lives on `.sensor-console` below. That split is the
+ * ratified adoption default and it is not cosmetic: a selector audit found 3 of
+ * this file's 28 rules would reach the app shell from a root-level attribute —
+ * this block (repainting the nav via background/color), the focus ring, and the
+ * danger descendants. Shell stays warm; the console paints only its own content.
+ *
+ * The names are the SURFACE'S vocabulary; the values are the shared layer's.
+ * They were renamed off their old hue spellings in the same commit that
+ * re-pointed them — a token called `--sensor-amber` bound to periwinkle would
+ * be a comment that lies, and this file already carries the rule that a missing
+ * counterpart is a conversation rather than a silent divergence. */
 [data-surface='sensor-log'] {
   /* ground → raised, darkest first */
-  --sensor-void: #070a0c;
-  --sensor-hull: #0d1316;
-  --sensor-panel: #131d21;
-  --sensor-raise: #1a262b;
+  --sensor-void: var(--console-void);
+  --sensor-hull: var(--console-hull);
+  --sensor-panel: var(--console-panel);
+  --sensor-raise: var(--console-raise);
 
   /* structure */
-  --sensor-edge: #25373e;
-  --sensor-edge2: #31474f;
+  --sensor-edge: var(--console-edge);
+  --sensor-edge-bright: var(--console-edge-bright);
 
-  /* type, brightest first */
-  --sensor-ink: #eae7dd;
-  --sensor-ink2: #a6b2b4;
-  --sensor-ink3: #6e7f84;
-  --sensor-ink4: #465559;
+  /* type, brightest first.
+   * THE INK SPLIT: `-faint` is cleared for UPPERCASE micro-labels only (~4.2:1)
+   * and is spent by exactly one rule, `.sensor-label`. Sentence-case body — the
+   * page subtitle, the empty-band line, the window readout — takes `-dim`.
+   * Re-pointing the old single token wholesale would have dropped real body
+   * copy to a contrast ratio it was never cleared for. */
+  --sensor-ink: var(--console-ink);
+  --sensor-ink-dim: var(--console-ink-dim);
+  --sensor-ink-faint: var(--console-ink-faint);
+  --sensor-ink-ghost: var(--console-ink-ghost);
 
-  /* instrument accent — NOW, live readings, affirmative state */
-  --sensor-teal: #4fa7a1;
-  --sensor-teal2: #2e6d69;
-  --sensor-teal3: #173a39;
+  /* NOW, live readings, affirmative state */
+  --sensor-affirm: var(--console-affirm);
+  --sensor-affirm-deep: var(--console-affirm-deep);
+  --sensor-affirm-wash: var(--console-affirm-wash);
 
-  /* environment — weather, intervals, heavy verbs */
-  --sensor-amber: #c99a4c;
-  --sensor-amber2: #8b6a30;
-  --sensor-amber3: #3a2c15;
+  /* The environment: weather windows, time extents — the world, not the work.
+   * NEVER `caution`. Amber is the defer family's and the heavy-verb arm's; a
+   * fog window wearing it would read as a verb. This is the role the swap was
+   * held for. */
+  --sensor-environment: var(--console-environment);
+  --sensor-environment-deep: var(--console-environment-deep);
+  --sensor-environment-wash: var(--console-environment-wash);
 
   /* alert */
-  --sensor-rust: #b25740;
-  --sensor-rust2: #6d3527;
-  --sensor-rust3: #301813;
+  --sensor-negative: var(--console-negative);
+  --sensor-negative-deep: var(--console-negative-deep);
+  --sensor-negative-wash: var(--console-negative-wash);
 
   /* quiet / settled / FYI */
-  --sensor-slate: #77839b;
-  --sensor-slate2: #414a5c;
+  --sensor-info: var(--console-info);
+  --sensor-info-deep: var(--console-info-deep);
 
   --sensor-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'Roboto Mono', Consolas, monospace;
+}
 
+/* THE PAINTING — the feed's own content, never the shell.
+ * Applied to the console element inside `<main>`, so the nav, header and
+ * sign-out keep the warm chrome the Layout fallback gives an unregistered
+ * surface name. */
+.sensor-console {
   background-color: var(--sensor-void);
   color: var(--sensor-ink);
 }
@@ -160,7 +148,7 @@
   letter-spacing: 0.16em;
   text-transform: uppercase;
   font-weight: 700;
-  color: var(--sensor-ink3);
+  color: var(--sensor-ink-faint);
 }
 
 /* Tabular mono numerals — clock times and counts must not shift width as they
@@ -174,7 +162,7 @@
    hard and whose outer corner is square, joining a vertical rail to a
    horizontal bar. */
 .sensor-elbow {
-  background: var(--sensor-teal2);
+  background: var(--sensor-affirm-deep);
   border-top-left-radius: 9px;
   border-bottom-left-radius: 26px;
 }
@@ -202,7 +190,7 @@
 [data-surface='sensor-log'] [data-testid='feed-row'],
 [data-surface='sensor-log'] [data-testid='feed-snoozed-row'] {
   background-color: var(--sensor-panel);
-  border-color: var(--sensor-edge2);
+  border-color: var(--sensor-edge-bright);
   box-shadow: none;
 }
 
@@ -218,7 +206,7 @@
 
 [data-surface='sensor-log'] [data-testid='feed-row'] .text-honeydew-600,
 [data-surface='sensor-log'] [data-testid='feed-row'] .text-honeydew-600\/80 {
-  color: var(--sensor-ink2);
+  color: var(--sensor-ink-dim);
 }
 
 [data-surface='sensor-log'] [data-testid='feed-row'] .border-honeydew-200,
@@ -230,20 +218,20 @@
 [data-surface='sensor-log'] [data-testid='feed-row'] .border-honeydew-400,
 [data-surface='sensor-log'] [data-testid='feed-row'] .border-honeydew-500,
 [data-surface='sensor-log'] [data-testid='feed-snoozed-row'] .border-honeydew-400 {
-  border-color: var(--sensor-teal2);
+  border-color: var(--sensor-affirm-deep);
 }
 
 /* Danger keeps its own voice — rust rather than the warm surface's red, but
    still unmistakably not-normal. Never remapped to an ink token: an error that
    reads as body copy is an error nobody sees. */
 [data-surface='sensor-log'] [data-testid='feed-row'] .text-danger {
-  color: var(--sensor-rust);
+  color: var(--sensor-negative);
 }
-[data-surface='sensor-log'] .bg-danger-bg {
-  background-color: var(--sensor-rust3);
+.sensor-console .bg-danger-bg {
+  background-color: var(--sensor-negative-wash);
 }
-[data-surface='sensor-log'] .text-danger {
-  color: var(--sensor-rust);
+.sensor-console .text-danger {
+  color: var(--sensor-negative);
 }
 
 /* ── the band ─────────────────────────────────────────────────────────────────
@@ -262,7 +250,7 @@
 /* NOW: the one live reading on the surface. Glows so it is findable without
    being read for. */
 .sensor-now {
-  background-color: var(--sensor-teal);
+  background-color: var(--sensor-affirm);
   box-shadow: 0 0 14px rgba(79, 167, 161, 0.5);
 }
 
@@ -282,15 +270,18 @@
    edge says "this continues" so the clamp reads as a clip rather than as the
    thing's actual boundary. */
 .sensor-clipped-start {
-  border-top: 1px dashed var(--sensor-amber);
+  border-top: 1px dashed var(--sensor-environment);
 }
 .sensor-clipped-end {
-  border-bottom: 1px dashed var(--sensor-amber);
+  border-bottom: 1px dashed var(--sensor-environment);
 }
 
 /* Focus stays visible on the dark ground — the warm honeydew ring disappears
-   against it. */
-[data-surface='sensor-log'] :focus-visible {
-  outline: 2px solid var(--sensor-teal);
+   against it. Scoped to the console CONTENT, not the surface: the bug-report
+   FAB is rendered by Layout outside <main> and carries its own warm ring, and
+   this file loads after globals so a surface-level rule would have won and
+   retargeted it. One of the three shell-reachers the selector audit found. */
+.sensor-console :focus-visible {
+  outline: 2px solid var(--sensor-affirm);
   outline-offset: 2px;
 }

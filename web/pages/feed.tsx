@@ -6,6 +6,7 @@ import { Layout } from '../components/Layout';
 import { FeedRow } from '../components/feed/FeedRow';
 import { TimelineView } from '../components/feed/TimelineView';
 import { FEED_VIEWS, type FeedView, feedViewFromQuery, isFeedView } from '../lib/algernon/feedView';
+import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { authApi } from '../lib/algernon/authClient';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
@@ -265,27 +266,26 @@ export default function FeedPage() {
       {/* Wider than the default reading column: the workstation posture has a
           time axis to lay out, and the tricorder posture is capped by the
           viewport anyway. */}
-      <Layout onSignOut={() => void handleSignOut()} maxWidthClassName="max-w-4xl">
+      <Layout onSignOut={() => void handleSignOut()} maxWidthClassName="max-w-4xl" surface={SENSOR_SURFACE}>
         {/* The console. Bleeds to the edges on a phone (tricorder, held close)
             and insets into a panel on a tablet (workstation, at arm's length).
             `data-surface` is also the scope that lets styles/sensorLog.css skin
             the SHARED rows here without touching the brief's copies of them. */}
         <div
-          data-surface="sensor-log"
           data-testid="feed-console"
-          className="-mx-5 -my-4 min-h-[80vh] px-4 py-5 sm:mx-0 sm:rounded-xl sm:px-6"
+          className="sensor-console -mx-5 -my-4 min-h-[80vh] px-4 py-5 sm:mx-0 sm:rounded-xl sm:px-6"
         >
           {/* LCARS: elbow into a pill-terminated bar. */}
           <div className="flex items-stretch gap-1">
             <div className="sensor-elbow w-10 shrink-0 sm:w-16" aria-hidden />
             <div className="sensor-bar flex flex-1 flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2">
-              <h1 className="text-base font-extrabold uppercase tracking-[0.26em]" style={{ color: 'var(--sensor-teal)' }}>
+              <h1 className="text-base font-extrabold uppercase tracking-[0.26em]" style={{ color: 'var(--sensor-affirm)' }}>
                 Feed
               </h1>
               <span className="sensor-label">Sensor log · {INSTANCE_NAME}</span>
             </div>
           </div>
-          <p className="mt-2 text-sm" style={{ color: 'var(--sensor-ink3)' }}>
+          <p className="mt-2 text-sm" style={{ color: 'var(--sensor-ink-dim)' }}>
             What {INSTANCE_NAME} is tracking — decisions up top, glance items below.
           </p>
 
@@ -307,8 +307,8 @@ export default function FeedPage() {
                 className="sensor-label rounded-full px-4 py-1.5"
                 style={
                   view === v.id
-                    ? { backgroundColor: 'var(--sensor-teal3)', color: 'var(--sensor-teal)' }
-                    : { color: 'var(--sensor-ink4)' }
+                    ? { backgroundColor: 'var(--sensor-affirm-wash)', color: 'var(--sensor-affirm)' }
+                    : { color: 'var(--sensor-ink-ghost)' }
                 }
               >
                 {v.label}
@@ -352,9 +352,9 @@ export default function FeedPage() {
             data-testid="feed-deck-link"
             className="mt-4 flex items-center justify-between rounded-lg px-4 py-3 text-sm font-semibold"
             style={{
-              backgroundColor: 'var(--sensor-teal3)',
-              color: 'var(--sensor-teal)',
-              border: '1px solid var(--sensor-teal2)',
+              backgroundColor: 'var(--sensor-affirm-wash)',
+              color: 'var(--sensor-affirm)',
+              border: '1px solid var(--sensor-affirm-deep)',
             }}
           >
             <span>
@@ -400,7 +400,7 @@ export default function FeedPage() {
               onClick={() => setShowSnoozed((s) => !s)}
               aria-expanded={showSnoozed}
               className="text-[11px] font-semibold uppercase tracking-wider underline underline-offset-2"
-              style={{ color: 'var(--sensor-ink2)' }}
+              style={{ color: 'var(--sensor-ink-dim)' }}
             >
               {showSnoozed ? 'Hide snoozed' : `Show snoozed (${snoozedRows.length})`}
             </button>
@@ -446,7 +446,7 @@ export default function FeedPage() {
               onClick={() => setShowDone((s) => !s)}
               aria-expanded={showDone}
               className="text-[11px] font-semibold uppercase tracking-wider underline underline-offset-2"
-              style={{ color: 'var(--sensor-ink2)' }}
+              style={{ color: 'var(--sensor-ink-dim)' }}
             >
               {showDone ? 'Hide done' : `Show done (${doneRows.length})`}
             </button>
@@ -489,7 +489,7 @@ export default function FeedPage() {
 
         {board.toast && (
           <div data-testid="feed-toast" role="status" className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3 rounded-lg px-3.5 py-2.5 text-sm shadow-card"
-            style={{ backgroundColor: 'var(--sensor-raise)', color: 'var(--sensor-ink)', border: '1px solid var(--sensor-edge2)' }}>
+            style={{ backgroundColor: 'var(--sensor-raise)', color: 'var(--sensor-ink)', border: '1px solid var(--sensor-edge-bright)' }}>
             <span>{board.toast.message}</span>
             <button type="button" onClick={board.dismissToast} className="font-bold uppercase tracking-wider underline">
               Dismiss
