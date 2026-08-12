@@ -39,16 +39,32 @@ Structural quirks handled, each because the real source has them:
 * partial-page statements whose header the parser cannot find — their
   lines are still parsed and grouped under a synthesised header rather
   than dropped
+* **bolded aggregates** — real statements bold their SUB-TOTAL and
+  STATEMENT-TOTAL rows, amount AND label, so emphasis is stripped in the
+  money layer for every cell (see
+  :func:`alfred.reconcile.money.strip_emphasis`)
+* **headerless continuation tables** — a multi-page statement resumes its
+  rows without repeating the header, so a table whose first row is data
+  inherits the previous table's column mapping, gated on an exact column
+  count and logged as ``reconcile.parser.continuation_table``
+* **two-column statement-totals blocks** — captured into
+  :attr:`alfred.reconcile.ledger.Statement.declared_totals` and
+  deliberately NOT assigned to ``payment_total``
 
-**One caveat, stated because it is load-bearing:** the surrounding
-document structure (how statement headers are written) is modelled from
-the schema described in the design, not from a byte-level reading of the
-live note, which is box-side. The COLUMN mapping is robust to that
-uncertainty by construction — it keys on names, and unknown headings are
-reported. The statement-header patterns are the part that wants one
-validation pass against the real note before the first seed is trusted;
-:attr:`ParseResult.unmapped_headings` exists to make any mismatch loud on
-that first run rather than quiet.
+**Validation status, because the earlier version of this note said the
+opposite and a docstring that lies is worse than one that hedges.** A
+read-only dry run against a genuine provider payment summary has now
+happened: 23 statements, 274 claim lines, 19 of 21 tables parsed, every
+skipped row named. The statement-header patterns below are therefore
+CONFIRMED against real input rather than modelled from a spec. The three
+bullets above are the shapes that run found — all three were absent from
+the synthetic fixtures, which is why a fully green suite said nothing
+about any of them.
+
+The COLUMN mapping remains robust by construction — it keys on names, and
+unknown headings are reported through
+:attr:`ParseResult.unmapped_headings` rather than silently read as some
+other column.
 """
 
 from __future__ import annotations
@@ -75,6 +91,7 @@ from .money import (
     parse_int,
     parse_money,
     parse_percent,
+    strip_emphasis,
 )
 
 log = structlog.get_logger(__name__)
@@ -163,6 +180,32 @@ REQUIRED_COLUMNS = frozenset({"amount_paid", "dos"})
 #: arithmetic rather than a claim line.
 _SUBTOTAL_MARKERS = ("subtotal", "subtotals", "total", "totals", "grandtotal")
 
+#: The second heading of a two-column statement-totals block.
+_TOTALS_AMOUNT_HEADINGS = frozenset({"amount", "amt", "total", "value"})
+#: Its first heading, which is usually blank — the labels are in the rows.
+_TOTALS_LABEL_HEADINGS = frozenset({
+    "", "description", "item", "label", "type", "statement",
+})
+
+
+def _is_totals_block_header(cells: list[str]) -> bool:
+    """Whether this row heads a two-column key-value totals block.
+
+    Exactly two columns, an amount-ish second heading and a blank-or-label
+    first one. Deliberately narrow: this branch diverts a table away from
+    claim-line parsing entirely, so it must not fire on anything that could
+    be a claim table. A two-column table headed ``Date of Service | Amount
+    Paid`` maps the required columns and is caught by the header check
+    BEFORE this one ever runs — order matters here and is why this is not
+    the first test in the chain.
+    """
+    if len(cells) != 2:
+        return False
+    return (
+        normalise_heading(cells[0]) in _TOTALS_LABEL_HEADINGS
+        and normalise_heading(cells[1]) in _TOTALS_AMOUNT_HEADINGS
+    )
+
 _INVOICE_RE = re.compile(r"(?:invoice|inv)\.?\s*#?\s*(\d+)", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$")
 #: Metadata is matched AFTER emphasis markers are stripped (see
@@ -177,9 +220,11 @@ _TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]*$")
 _ISO_IN_TEXT_RE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}")
 
 
-def _strip_emphasis(text: str) -> str:
-    """Drop Markdown bold/italic markers so metadata matching sees the text."""
-    return (text or "").replace("**", "").replace("__", "")
+#: Emphasis stripping has ONE author, in the money layer, and this module
+#: imports it. It used to be a private copy here; the copy was harmless only
+#: because the two happened to agree, which is not a property anyone was
+#: maintaining. The rule now lives beside the cell parsers that consume it.
+_strip_emphasis = strip_emphasis
 
 
 def normalise_heading(text: str) -> str:
@@ -269,6 +314,11 @@ class ParseResult:
     #: Table headings that matched no known column, per table. A populated
     #: list on the first seed is the signal that the synonym map needs a row.
     unmapped_headings: list[str] = field(default_factory=list)
+    #: Line numbers of headerless continuation tables whose column mapping was
+    #: inherited from the previous table. Surfaced for the same reason
+    #: collisions are: an inherited mapping is an inference, and an inference
+    #: the operator cannot see is one nobody can check.
+    continuations: list[int] = field(default_factory=list)
     tables_seen: int = 0
     tables_parsed: int = 0
 
@@ -370,6 +420,15 @@ def parse_note(
     #: Line number of a table header this parser refused, so the rows under
     #: it can name the cause instead of each re-reporting it.
     rejected_header_line: int | None = None
+    #: The last ACCEPTED column mapping, its width, and the statement it was
+    #: read under. A headerless continuation table inherits these; the
+    #: statement is kept only so the log can say whether the inheritance
+    #: crossed a statement boundary.
+    last_mapping: dict[int, str] = {}
+    last_header_width = 0
+    last_mapping_stmt: Statement | None = None
+    #: True while reading a two-column statement-totals block.
+    in_totals_block = False
     # Occurrence counters, per (statement_date, claim_no, dos, benefit_code).
     # Claim lines and subtotal rows count SEPARATELY: they live in separate
     # indexes in the ledger, and sharing one counter would make a claim
@@ -432,12 +491,14 @@ def parse_note(
 
         if not stripped:
             in_table = False
+            in_totals_block = False
             continue
 
         # A heading always starts a new statement context.
         heading = _HEADING_RE.match(stripped)
         if heading:
             in_table = False
+            in_totals_block = False
             stmt = _begin_statement(line_no)
             stmt.inferred = inferred_depth > 0
             # A heading often carries the statement date: "## Statement —
@@ -455,19 +516,107 @@ def parse_note(
                 # The |---|---| separator under a header. Nothing to read.
                 continue
             if not in_table:
-                # This is a header row: map its columns.
+                # A table starts here. It is a HEADER row if its cells map to
+                # the required columns; otherwise it may be a CONTINUATION —
+                # a multi-page statement whose second page resumes the rows
+                # without repeating the header.
                 result.tables_seen += 1
-                mapping, unmapped = _map_columns(cells)
-                header_width = len(cells)
-                missing = REQUIRED_COLUMNS - set(mapping.values())
-                if missing:
+                candidate, unmapped = _map_columns(cells)
+                missing = REQUIRED_COLUMNS - set(candidate.values())
+
+                if not missing:
+                    mapping = candidate
+                    header_width = len(cells)
+                    last_mapping = dict(mapping)
+                    last_header_width = header_width
+                    last_mapping_stmt = current_stmt
+                    result.tables_parsed += 1
+                    rejected_header_line = None
+                    result.unmapped_headings.extend(unmapped)
+                    if unmapped:
+                        log.info(
+                            "reconcile.parser.unmapped_headings",
+                            line_no=line_no,
+                            headings=unmapped,
+                            detail="columns present in the source that this "
+                                   "parser has no field for — data in them is "
+                                   "not captured; add a COLUMN_SYNONYMS row",
+                        )
+                    in_table = True
+                    if current_stmt is None:
+                        _begin_statement(line_no)
+                    continue
+
+                if _is_totals_block_header(cells):
+                    # A key-value STATEMENT TOTALS block: two columns, a
+                    # blank-ish label heading and an "Amount" heading. Its
+                    # rows are declared totals (BC statement amount, payment
+                    # amount, and friends), which is reconciliation gold.
+                    #
+                    # It is CAPTURED, not INTERPRETED. Which labelled figure
+                    # is "the" payment total is a semantic question the note
+                    # does not answer, and picking one would be the same
+                    # invent-authority error the empty EOB map exists to
+                    # avoid. See ``Statement.declared_totals``.
+                    in_table = True
+                    in_totals_block = True
+                    mapping = {}
+                    header_width = len(cells)
+                    rejected_header_line = None
+                    result.tables_parsed += 1
+                    if current_stmt is None:
+                        _begin_statement(line_no)
+                    log.info(
+                        "reconcile.parser.totals_block",
+                        line_no=line_no,
+                        detail="two-column statement-totals block; rows are "
+                               "captured as declared totals and are NOT "
+                               "assigned to payment_total",
+                    )
+                    continue
+
+                if last_mapping and len(cells) == last_header_width:
+                    # CONTINUATION. This row is DATA, and it is the shape that
+                    # silently ate real claim lines: read as a header it maps
+                    # nothing, so the whole continuation table was skipped and
+                    # its rows never reached the ledger.
+                    #
+                    # The column-count match is the gate. It is deliberately
+                    # strict — a differently-shaped table (the two-column
+                    # totals block, for one) cannot inherit by accident.
+                    #
+                    # Inheritance is NOT scoped to the current statement, and
+                    # that is a considered widening: a continuation may sit
+                    # after a page heading, and a statement-scoped rule would
+                    # then fail to fix the very case it was written for. The
+                    # log records which side of that line it fell on, so an
+                    # inherited mapping is never a silent event.
+                    mapping = dict(last_mapping)
+                    header_width = last_header_width
+                    in_table = True
+                    rejected_header_line = None
+                    result.tables_parsed += 1
+                    result.continuations.append(line_no)
+                    log.info(
+                        "reconcile.parser.continuation_table",
+                        line_no=line_no,
+                        columns=header_width,
+                        same_statement=(last_mapping_stmt is current_stmt),
+                        detail="table has no header row; inherited the column "
+                               "mapping from the previous table and read this "
+                               "row as data",
+                    )
+                    # Deliberately NO continue — fall through to the data-row
+                    # handler below, because this row IS a data row.
+                else:
                     log.warning(
                         "reconcile.parser.table_unrecognised",
                         line_no=line_no,
                         missing=sorted(missing),
                         headings=[c.strip() for c in cells],
                         detail="table skipped — without these columns there "
-                               "is no key and nothing to reconcile",
+                               "is no key and nothing to reconcile, and no "
+                               "prior table's mapping fits its column count",
                     )
                     result.skipped.append(SkippedRow(
                         line_no=line_no,
@@ -486,24 +635,32 @@ def parse_note(
                     in_table = True
                     rejected_header_line = line_no
                     continue
-                result.tables_parsed += 1
-                rejected_header_line = None
-                result.unmapped_headings.extend(unmapped)
-                if unmapped:
-                    log.info(
-                        "reconcile.parser.unmapped_headings",
-                        line_no=line_no,
-                        headings=unmapped,
-                        detail="columns present in the source that this "
-                               "parser has no field for — data in them is "
-                               "not captured; add a COLUMN_SYNONYMS row",
-                    )
-                in_table = True
-                if current_stmt is None:
-                    _begin_statement(line_no)
-                continue
 
             # A data row.
+            if in_totals_block:
+                label = strip_emphasis(cells[0] if cells else "").strip()
+                amount_raw = cells[1] if len(cells) > 1 else ""
+                if not label or is_absent(amount_raw):
+                    # A blank label or a blank amount carries no fact. Skipped
+                    # rather than stored as an empty entry, and counted so the
+                    # absence is visible in the seed output.
+                    result.skipped.append(SkippedRow(
+                        line_no=line_no,
+                        raw=stripped,
+                        reason="statement-totals row has no label or no amount",
+                    ))
+                    continue
+                try:
+                    amount = parse_money(amount_raw, field=f"declared total {label!r}")
+                except CellParseError as exc:
+                    result.skipped.append(SkippedRow(
+                        line_no=line_no, raw=stripped, reason=str(exc)
+                    ))
+                    continue
+                if current_stmt is not None and amount is not None:
+                    current_stmt.declared_totals[label] = str(amount)
+                continue
+
             if not mapping:
                 # Belongs to a table whose header this parser rejected. Each
                 # row still gets its own skip entry — the operator's question
@@ -585,6 +742,7 @@ def parse_note(
             continue
 
         in_table = False
+        in_totals_block = False
 
         # Statement metadata: "**Provider:** Jane Roe" / "Provider: Jane Roe".
         meta = _META_RE.match(_strip_emphasis(stripped))
@@ -777,7 +935,20 @@ def _build_claim_line(
                 # em-dash placeholder means "nothing here", and carrying the
                 # dash through would put it in the ledger KEY (benefit_code
                 # is part of it) and print it back as if it were data.
-                setattr(row, field_name, "" if is_absent(raw) else raw.strip())
+                # Text columns get emphasis stripped too, and that is not
+                # cosmetic. Real statements bold their aggregate ROWS, label
+                # and all, so a subtotal's surname arrives as ``**Aldenshaw**``
+                # — which then fails to match the claim lines' ``Aldenshaw,
+                # Marisol`` in the report's cross-foot, silently turning the
+                # one independent check into a statement-level fallback.
+                # Un-bolding the amount without un-bolding the label would
+                # have fixed half of this shape and left the useful half
+                # broken.
+                setattr(
+                    row,
+                    field_name,
+                    "" if is_absent(raw) else strip_emphasis(raw).strip(),
+                )
         except CellParseError as exc:
             return None, str(exc)
 

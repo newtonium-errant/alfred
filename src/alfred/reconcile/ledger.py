@@ -239,6 +239,20 @@ class Statement:
     payment_total: Decimal | None = None
     #: How many claim lines the parser attributed to this statement.
     claim_line_count: int = 0
+    #: Labelled figures from a two-column statement-totals block, e.g.
+    #: ``{"BC Statement Amount": "40641.00"}``. Amounts are STRINGS for the
+    #: same exactness reason the other money fields are; read them through
+    #: :meth:`declared_totals_decimal`.
+    #:
+    #: CAPTURED, NOT INTERPRETED — and the distinction is the whole point.
+    #: Which labelled figure is "the" payment total is a semantic question
+    #: the note does not answer, so nothing here is ever assigned to
+    #: :attr:`payment_total`. ``payment_total`` stays authoritative for the
+    #: cross-foot because it is the figure that sits with the claim lines it
+    #: summarises; these are reported ALONGSIDE it, and a disagreement
+    #: between the two is surfaced as a finding rather than resolved by this
+    #: layer guessing which source wins.
+    declared_totals: dict[str, str] = field(default_factory=dict)
     row_type: str = ROW_STATEMENT
 
     source_note: str = ""
@@ -252,12 +266,28 @@ class Statement:
     def key(self) -> str:
         return self.statement_date or ""
 
+    def declared_totals_decimal(self) -> dict[str, Decimal]:
+        """The declared totals as Decimals, skipping any that will not parse.
+
+        Unparseable entries are DROPPED here rather than raising: they are
+        reported figures, not the ledger's own arithmetic, and one unreadable
+        label must not make the readable ones unavailable.
+        """
+        out: dict[str, Decimal] = {}
+        for label, raw in (self.declared_totals or {}).items():
+            value = _dec(raw)
+            if value is not None:
+                out[label] = value
+        return out
+
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for f_ in fields(self):
             value = getattr(self, f_.name)
             if f_.name in _STATEMENT_MONEY_FIELDS:
                 out[f_.name] = _money_out(value)
+            elif f_.name == "declared_totals":
+                out[f_.name] = dict(value or {})
             else:
                 out[f_.name] = value
         out["key"] = self.key
@@ -277,6 +307,15 @@ class Statement:
                 known["claim_line_count"] = int(known["claim_line_count"] or 0)
             except (TypeError, ValueError):
                 known["claim_line_count"] = 0
+        if "declared_totals" in known:
+            # Coerced to a str->str mapping. A hand-edited or older ledger may
+            # carry numbers here; normalising on load keeps every reader from
+            # having to handle both spellings.
+            value = known["declared_totals"]
+            known["declared_totals"] = (
+                {str(k): str(v) for k, v in value.items()}
+                if isinstance(value, dict) else {}
+            )
         if "inferred" in known:
             known["inferred"] = bool(known["inferred"])
         return cls(**known)
