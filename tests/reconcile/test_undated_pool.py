@@ -268,3 +268,48 @@ def test_zero_units_parses_rather_than_refusing(parsed):
     reversals = [c for c in parsed.claim_lines if c.claim_no == "00000702"]
     assert len(reversals) == 1
     assert reversals[0].units == 0
+
+
+# --- the label that graduated from unknown to known -------------------------------
+
+
+def test_statement_total_paid_is_a_payment_total_synonym():
+    """Added on EVIDENCE. The real note prints this label bolded in a
+    header AND repeats the same figure twice in that statement's
+    two-column totals block under two other labels — three spellings of one
+    number. A plausible-looking label alone would not have earned this; the
+    unknown-label capture is what let it wait in declared_totals until the
+    corroboration arrived."""
+    note = (
+        "## Provider Payment\n\n"
+        "**Statement Date:** 2026-06-05\n"
+        "**Statement Total Paid:** $54,549.00\n\n"
+        "| Claim # | Date of Service | Amount Paid |\n"
+        "| --- | --- | --- |\n"
+        "| 900 | 2026-06-01 | 54549.00 |\n"
+    )
+    result = parse_note(note)
+    stmt = result.statements[0]
+    assert stmt.payment_total == Decimal("54549.00")
+    # It is a KNOWN field now, so it must NOT also land in declared_totals.
+    assert stmt.declared_totals == {}
+    assert result.unmapped_header_labels == []
+
+
+def test_an_unknown_money_label_still_falls_to_declared_totals():
+    """The posture stands. One label graduating on evidence does not mean
+    the next plausible one is assumed — it means the capture path is what
+    keeps a figure alive until evidence exists."""
+    note = (
+        "## Provider Payment\n\n"
+        "**Statement Date:** 2026-06-05\n"
+        "**Some Other Total Label:** $1,234.00\n\n"
+        "| Claim # | Date of Service | Amount Paid |\n"
+        "| --- | --- | --- |\n"
+        "| 900 | 2026-06-01 | 1234.00 |\n"
+    )
+    result = parse_note(note)
+    stmt = result.statements[0]
+    assert stmt.payment_total is None
+    assert stmt.declared_totals == {"Some Other Total Label": "1234.00"}
+    assert result.unmapped_header_labels == ["Some Other Total Label"]

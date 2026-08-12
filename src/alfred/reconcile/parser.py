@@ -174,6 +174,14 @@ STATEMENT_FIELD_SYNONYMS: dict[str, str] = {
     "payee": "company",
     "paymenttotal": "payment_total", "totalpayment": "payment_total",
     "totalpaid": "payment_total", "chequeamount": "payment_total",
+    # "Statement Total Paid" — added on EVIDENCE, not inference. The real
+    # note prints it as a bolded header label, and the same figure appears
+    # twice more in that statement's two-column totals block under two
+    # other labels. Three spellings of one number is corroboration; a
+    # plausible-looking label alone would not have been, and the
+    # unknown-label capture below exists precisely so a label can wait in
+    # declared_totals until evidence like this arrives.
+    "statementtotalpaid": "payment_total",
     "checkamount": "payment_total", "amountofpayment": "payment_total",
     "statementdate": "statement_date", "paymentdate": "statement_date",
     "date": "statement_date", "chequedate": "statement_date",
