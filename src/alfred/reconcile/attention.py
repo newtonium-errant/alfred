@@ -44,10 +44,18 @@ class exists in the vocabulary and is reachable through the map and
 through a correction; it is not claimed to be auto-detected.
 
 The example pair above is INVENTED, and that is a rule rather than an
-accident: this repository is public and this package's subject is real
-claims data. The fixtures carry a WHOLLY-INVENTED banner for that reason,
-and the same reason covers prose — a real claimant name in a docstring is
-the same disclosure as one in a table row, read more often.
+accident. This is shared multi-instance infrastructure, and shared code
+travels — into clones, worktrees, wheels, other instances, and any future
+change of repository visibility. Real claims data belongs in VERA's own
+fenced stores, at any visibility. The fixtures carry a WHOLLY-INVENTED
+banner for that reason, and the same reason covers prose: a real claimant
+name in a docstring is the same disclosure as one in a table row, and gets
+read more often.
+
+Note what the rule does NOT rest on. "Nobody can see this repository" is a
+justification one settings change can retire, and a reader who checks and
+finds it false is handed an argument against the rule rather than for it.
+Where the data belongs does not move.
 """
 
 from __future__ import annotations

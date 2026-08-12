@@ -3,8 +3,15 @@
 <!--
 WHOLLY INVENTED DATA. Every name, claim number, invoice number, EOB code
 and dollar figure in this file was made up for the test suite. No real
-claimant, provider, company or payment appears here, and none ever may:
-this repository is public, and the live source material is billing data.
+claimant, provider, company or payment appears here, and none ever may.
+
+The reason is NOT about who can currently read this repository. It is that
+this is shared multi-instance infrastructure, and shared code travels —
+into clones, worktrees, wheels, other instances, and any future change of
+visibility. Real claims data belongs in VERA's own fenced stores, at any
+visibility. A rule resting on "nobody can see this" retires itself the day
+a setting changes; this one cannot, because it is about where the data
+belongs rather than about who is currently looking.
 
 The file's job is to reproduce the STRUCTURAL quirks of a real provider
 payment summary so the parser is exercised against the shapes it will
