@@ -61,6 +61,32 @@ export interface FeedItem {
   created_at: string;
   acted_at: string | null;
   expires_at: string | null;
+  /**
+   * The item's own INTERVAL EXTENT (D7) — when the thing itself is, as opposed
+   * to when the feed learned about it (`created_at`, which is provenance).
+   *
+   * Mirrors `alfred.feed.model.FeedItem.starts_at` / `.ends_at`, which the
+   * `/feed/items` body already carried before this declaration existed; the BFF
+   * relays the payload verbatim, so nothing on the wire changes here. What
+   * changes is that the timeline view can LAY OUT against them instead of
+   * re-parsing a rendered display string (`evidence.time_display` is a lossy
+   * `"%H:%M"` — no end, no date, no offset).
+   *
+   * Both are INDEPENDENTLY optional, and the asymmetry is load-bearing:
+   *   - both absent  → the item has no time dimension at all (a merge proposal)
+   *   - start, no end → a MOMENT (a 09:30 run), *not* a zero-length span
+   *   - start + end   → a real interval (a TAF validity window, a fog corridor)
+   *
+   * A renderer MUST read `ends_at: null` as "no known end" and never as "ends
+   * immediately" — the backend model states this as a contract on producers,
+   * and drawing a zero-height bar would silently invert it. `itemExtent` in
+   * `feedTime.ts` is the one place that decision is made; go through it.
+   *
+   * Optional on this interface (rather than `string | null`) because a cached
+   * pre-D7 payload in the service worker legitimately has neither key.
+   */
+  starts_at?: string | null;
+  ends_at?: string | null;
   source_ref: Record<string, unknown>;
 }
 
