@@ -661,7 +661,7 @@ _TIER_UNDONE_TOOL_SCHEMA = {
 # allowlist with ZERO widening — bypasses check_scope exactly as tier_done does).
 #
 # NO fuzzy matching in the tool: the model identifies WHICH candidate from the
-# brief's own "Open Tasks by Tier" surfaced list and passes its fields; the tool
+# brief's own "Today's Plan" surfaced list and passes its fields; the tool
 # validates + writes or fails loud (invalid_tier / thin_evidence). The
 # LLM-supplied ``source`` is sanitized against the known vocab before the write
 # (an invented enum coerces to "operator" — never fake provenance).
@@ -673,7 +673,7 @@ _TIER_CONFIRM_TOOL_SCHEMA = {
     "description": (
         "Commit an auto-surfaced tier candidate onto today's T1/T2/T3 "
         "shortlist. Salem-only. Use this when the operator confirms/accepts "
-        "a candidate the morning brief surfaced in its 'Open Tasks by Tier' "
+        "a candidate the morning brief surfaced in its \"Today's Plan\" "
         "section (e.g. 'T1 confirm RRTS Payroll', 'yes add Pay Rent to T2', "
         "'put walk Fergus on today's T3'). Identify WHICH candidate the "
         "operator means from the brief's surfaced list, then pass ITS fields "

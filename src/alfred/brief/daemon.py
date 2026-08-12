@@ -23,7 +23,6 @@ from .renderer import (
     render_process_hub_record,
     serialize_record,
 )
-from .routine_section import render_routine_section
 from .stayc_relay import NEGATION_SECTION_HEADER as STAYC_NEGATION_SECTION_HEADER
 from .stayc_relay import RETENTION_SECTION_HEADER as STAYC_RETENTION_SECTION_HEADER
 from .stayc_relay import SECTION_HEADER as STAYC_RELAY_SECTION_HEADER
@@ -36,7 +35,7 @@ from .state import BriefRun, StateManager
 from .tier_section import SECTION_HEADER as TIER_SECTION_HEADER
 from .tier_section import render_tier_section
 from .utils import get_logger
-from .operations import format_operations_section
+from .ops_notable import render_ops_notable_section
 from .upcoming_events import render_upcoming_events_section
 from alfred.drip.brief_line import SECTION_HEADER as DRIP_SECTION_HEADER
 from .watches import check_and_format_watches
@@ -228,9 +227,56 @@ def _ops_baseline_path(config: BriefConfig) -> str:
     ))
 
 
+def _collect_ops_notables(config: BriefConfig) -> tuple[list | None, bool]:
+    """Compute the Operations delta ONCE per run: ``(items, had_baseline)``.
+
+    ``ops_notable_feed_items`` advances the baseline as a side effect, so it
+    must be called exactly once — the §5 markdown and the feed projection then
+    share the result. Calling it per-surface would make the second caller
+    compare against the first caller's own writes and report a quiet morning
+    on a day something moved.
+
+    ``had_baseline`` is read BEFORE the call (``load_baseline`` is a pure read)
+    so the render can tell a first render apart from a genuinely quiet one —
+    both of which return ``[]``.
+
+    Runs UNCONDITIONALLY, not gated on ``feed.enabled``: §5 needs the delta
+    whether or not this instance keeps a feed, and computing it on both paths
+    is what keeps the feed-enabled and feed-disabled briefs byte-identical
+    (the feed-parity golden gate). Failure degrades to ``None``, which the
+    render surfaces as unreadable rather than as quiet.
+    """
+    from .ops_notable import load_baseline, ops_notable_feed_items
+
+    try:
+        baseline_path = _ops_baseline_path(config)
+        had_baseline = load_baseline(baseline_path).recorded
+        items = ops_notable_feed_items(
+            # SAME derivation the Operations render uses, so the projection
+            # measures the files the section describes rather than a second
+            # guess at where state lives.
+            str(Path(config.state.path).parent),
+            config.vault_path,
+            baseline_path,
+            instance=config.instance_name,
+            quarantine_dir_name=config.quarantine_dir_name,
+        )
+        return items, had_baseline
+    except Exception as exc:  # noqa: BLE001 — ops never kills the brief
+        log.warning(
+            "brief.ops_notable_failed",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            detail="Operations section renders its unreadable signal; the feed "
+                   "projection is skipped so no ops card is spuriously acted.",
+        )
+        return None, False
+
+
 def _emit_brief_feed(
     config: BriefConfig, sections: list[SectionResult], today_local, now_local,
     weather_tafs: list[dict] | None = None,
+    ops_notables: list | None = None,
 ) -> None:
     """Reconcile the converted sections' feed items into the feed store.
 
@@ -250,29 +296,17 @@ def _emit_brief_feed(
             slot_suggestion_feed_items,
             weather_feed_items,
         )
-        from .ops_notable import ops_notable_feed_items
-
         instance = config.instance_name
-        # The ops baseline sits BESIDE the feed store rather than resolving its
-        # own path. That store path is already instance-anchored with no cwd
-        # guess (#74), so inheriting it keeps one anchoring rule instead of two
-        # — and this block only runs when the store resolved at all.
-        ops_baseline_path = _ops_baseline_path(config)
         extractors = {
             "health": lambda: health_feed_items(config.vault_path, instance=instance),
             "weather": lambda: weather_feed_items(
                 weather_tafs, config.weather.stations, instance=instance,
             ),
-            "ops_notable": lambda: ops_notable_feed_items(
-                # SAME derivation the Operations render uses, so the projection
-                # measures the files the section describes rather than a second
-                # guess at where state lives.
-                str(Path(config.state.path).parent),
-                config.vault_path,
-                ops_baseline_path,
-                instance=instance,
-                quarantine_dir_name=config.quarantine_dir_name,
-            ),
+            # PRECOMPUTED by ``_collect_ops_notables`` before the render, because
+            # the underlying call advances the ops baseline as a side effect and
+            # must happen exactly once per run. ``None`` propagates its meaning
+            # unchanged here: a read failure, so this kind is NOT reconciled.
+            "ops_notable": lambda: ops_notables,
             "slot_suggestion": lambda: slot_suggestion_feed_items(
                 config.vault_path, now_local, config.tier_defaults, instance=instance,
             ),
@@ -414,16 +448,24 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # without a separate brief config knob (2026-05-31 followup to
     # 164839a — code-reviewer WARN: previously hardcoded to default).
     data_dir = str(Path(config.state.path).parent)
-    ops_md = format_operations_section(
-        data_dir,
-        config.vault_path,
-        since=today,
-        quarantine_dir_name=config.quarantine_dir_name,
-        # #27 slice 2 — the "medium emails waiting" line reads the feed store.
-        # Threaded UNCONDITIONALLY (not gated on feed.enabled): both the feed-
-        # enabled and feed-disabled briefs then read the SAME store at this
-        # point (before _emit_brief_feed's writes, and the brief never writes
-        # email_tier), keeping the feed-parity golden gate byte-identical.
+    # §5 is NOTABLE-EVENTS-ONLY as of Phase C — the delta predicate that already
+    # governed the ops feed cards now governs the section too. Computed once
+    # here (it advances the baseline) and shared with the feed projection below.
+    ops_notables, ops_had_baseline = _collect_ops_notables(config)
+    ops_md = render_ops_notable_section(
+        ops_notables,
+        had_baseline=ops_had_baseline,
+        # #27 slice 2 — "medium waits, but never SILENTLY." This line is an
+        # OPEN-ITEM COUNT, not a delta, so the notable predicate is the wrong
+        # filter for it: a medium email that has waited three days is not news
+        # by the delta rule and IS exactly what the operator needs told. It
+        # survives the notable-only cut for that reason, and keeps its explicit
+        # zero-state.
+        #
+        # Read UNCONDITIONALLY (not gated on feed.enabled): the feed-enabled and
+        # feed-disabled briefs then read the SAME store at this point (before
+        # _emit_brief_feed's writes, and the brief never writes email_tier),
+        # keeping the feed-parity golden gate byte-identical.
         # FeedStore.load is safe on a missing/empty file, so an off/absent feed
         # renders the honest zero-state.
         feed_store_path=config.feed.store_path,
@@ -487,7 +529,7 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
             peer_canonical_names=config.peer_digests.peer_canonical_names,
         )
 
-    # Open Tasks by Tier — Salem-only Phase 1 (2026-05-28). Live vault
+    # Today's Plan — Salem-only Phase 1 (2026-05-28). Live vault
     # scan over ``vault/task/*.md``, filters open tasks, computes
     # ``effective_tier`` per task (deadline-relative escalation), renders
     # three buckets T1/T2/T3. Unlike the routine section's filesystem
@@ -500,17 +542,21 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         Path(config.vault_path), now_local, config.tier_defaults,
     )
 
-    # Today's Routines — Salem-only Phase 1. Renders the body of
-    # ``vault/daily/<today>.md`` (written by the routine daemon at
-    # 05:59 Halifax). High-attention slot per dispatch — time-anchored
-    # actions for the day belong above the retrospective Operations
-    # summary so the reader sees what to DO before what was. Empty
-    # string when no salem instance / no daily note expected — but
-    # render_routine_section always returns a non-empty sentinel string
-    # per intentionally-left-blank, so this stays in the section list
-    # unconditionally (no enable/disable gate yet; Phase 2 may add one
-    # via brief config).
-    routines_md = render_routine_section(Path(config.vault_path), today_local)
+    # Today's Routines DISSOLVED into the day plan (Phase C, 2026-08-12).
+    #
+    # It used to be its own ``## Today's Routines`` section rendering the body
+    # of ``vault/daily/<today>.md``. The ratified content pass folds it into the
+    # slot board: today's habit anchors now render inside the slot they belong
+    # to (Rhythm, mostly), beside the tier rows they were always adjacent to in
+    # spirit. The routine DATA is unchanged — the aggregator still writes
+    # ``vault/daily/<today>.md`` at 05:59 and it is still the operator's
+    # checklist in Obsidian. The projection reads the same
+    # ``_collect_items_for_today`` output that note is rendered from, so the
+    # item SET is identical; only the grouping moved (priority → slot).
+    #
+    # This removed ``render_routine_section``'s ONLY caller. The module is left
+    # in place and retargeted in its own docstring rather than deleted inside
+    # the same commit as the restructure — flagged for the reviewer to rule on.
 
     # STAY-C Bug Relay — reads the box watcher's relay spool and renders one
     # PHI-free count line (never bug bodies — the brief transits Telegram and
@@ -541,7 +587,7 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
 
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
-    # second (time-sensitive but non-operational), Open Tasks by Tier
+    # second (time-sensitive but non-operational), Today's Plan
     # third (deadline-driven actionable queue — T1 tasks are the most
     # attention-critical line of the brief; ratified 2026-05-28 to sit
     # above Routines because a missed payroll deadline outranks today's
@@ -564,7 +610,6 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         # tier/slots → slot_suggestion feed (A3b): one item per TodayView tier-
         # lane entry. Markdown byte-identical — the feed reads the same projection.
         SectionResult(TIER_SECTION_HEADER, tier_md, feed_kind="slot_suggestion"),
-        SectionResult("Today's Routines", routines_md),
         # Operations → ops_notable feed (Phase A). The MARKDOWN is untouched:
         # the section still renders the full status snapshot. Only the feed
         # projection is delta-filtered, because a card is an attention claim and

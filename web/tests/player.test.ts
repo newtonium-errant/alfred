@@ -17,11 +17,13 @@ describe('narrationSlides', () => {
   });
 
   it('one slide per segment, in SEGMENT_ORDER, with a 0-based rendered index', () => {
-    const slides = narrationSlides(
-      narration([seg('day_state'), seg('health'), seg('day_plan'), seg('events'), seg('weather'), seg('sign_off')]),
-    );
+    // Built FROM SEGMENT_ORDER rather than from a hand-listed copy of it: the
+    // hand-listed version silently stopped covering the full deck the moment a
+    // segment was added (Phase C's `waiting`), because a missing id sorts last
+    // instead of failing. Derive it, and the pin grows with the contract.
+    const slides = narrationSlides(narration(SEGMENT_ORDER.map((id) => seg(id))));
     expect(slides.map((s) => s.sectionId)).toEqual([...SEGMENT_ORDER]);
-    expect(slides.map((s) => s.index)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(slides.map((s) => s.index)).toEqual(SEGMENT_ORDER.map((_id, i) => i));
   });
 
   it('OMITS an absent segment (calm weather → no weather slide) and collapses the index — no gap', () => {

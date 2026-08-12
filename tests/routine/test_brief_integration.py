@@ -132,35 +132,66 @@ def test_brief_section_rendered_log_event(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_brief_daemon_section_list_includes_todays_routines() -> None:
-    """Pin: ``Today's Routines`` is a load-bearing section name in brief
-    daemon's section list, between Weather and Operations.
+def test_brief_daemon_has_no_standalone_routines_section() -> None:
+    """Pin the §4 DISSOLUTION (Phase C): the brief no longer emits a
+    standalone ``## Today's Routines`` section.
 
-    Source-pin via inspect rather than running the daemon — the daemon
-    needs config + network + transport to run end-to-end, but the
-    section list literal is the contract we care about.
+    This is the negative half only — on its own it would pass just as happily
+    against a build where the routine data vanished entirely, which is exactly
+    the failure this dissolution risks. Its positive control is the test
+    directly below, which drives a real render and proves a routine item still
+    reaches the operator inside its slot.
     """
     import inspect
     from alfred.brief import daemon
 
-    src = inspect.getsource(daemon)
-    # The literal lives inside generate_brief — easier to check substring
-    # than parse the source tree. We assert order: Weather → Today's
-    # Routines → Operations.
+    src = inspect.getsource(daemon.generate_brief)
+    assert 'SectionResult("Today\'s Routines"' not in src
+    # The section it dissolved INTO is still assembled, in its ordered place.
     weather_idx = src.find('"Weather"')
-    routines_idx = src.find('"Today\'s Routines"')
+    tier_idx = src.find("TIER_SECTION_HEADER")
     operations_idx = src.find('"Operations"')
-
-    assert weather_idx > 0
-    assert routines_idx > 0
-    assert operations_idx > 0
-    assert weather_idx < routines_idx < operations_idx, (
-        f"Section order violated. Weather idx={weather_idx}, "
-        f"Today's Routines idx={routines_idx}, Operations idx={operations_idx}"
-    )
+    assert 0 < weather_idx < tier_idx < operations_idx
 
 
-def test_brief_daemon_imports_routine_section() -> None:
-    """Sanity import: ``from .routine_section import render_routine_section``."""
-    from alfred.brief import daemon
-    assert hasattr(daemon, "render_routine_section")
+def test_dissolved_routine_item_renders_inside_its_slot(tmp_path: Path) -> None:
+    """The POSITIVE control for the dissolution: a routine item that fires
+    today and never escalates into a tier still reaches the operator — now
+    inside its slot in the day plan rather than in its own section.
+
+    Drives the real production render (``render_tier_section``), not a helper,
+    because the thing at risk is the WIRING: the projection could classify
+    perfectly while the render never asked it for routines.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from alfred.brief.tier_section import render_tier_section
+
+    vault = tmp_path / "vault"
+    # ``target_cadence_days`` with a fresh completion today ⟹ NOT overdue, so
+    # the item does NOT hand off to T3 and lands in the routine complement —
+    # the exact population this dissolution is responsible for.
+    _write_routine(vault, "Daily", {
+        "type": "routine",
+        "name": "Daily",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Morning pages",
+                "priority": "tracked",
+                "target_cadence_days": 3,
+            },
+        ],
+        "completion_log": {"Morning pages": ["2026-05-26"]},
+    })
+    now = datetime(2026, 5, 26, 6, 0, tzinfo=ZoneInfo("America/Halifax"))
+
+    body = render_tier_section(vault, now)
+
+    assert "Morning pages" in body
+    # Rhythm, because ``target_cadence_days`` is the classifier's practice
+    # rule — not defaulted into Duty to fill the board.
+    rhythm_idx = body.index("### Rhythm")
+    fuel_idx = body.index("### Fuel")
+    assert rhythm_idx < body.index("Morning pages") < fuel_idx

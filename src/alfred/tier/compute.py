@@ -80,7 +80,7 @@ lockstep.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1371,9 +1371,11 @@ def compute_self_care_task_candidates(
 #
 # The spec's keystone: ONE computed read over the substrate (tasks +
 # behind-routines + imminent-events) that the voice/surfacing layer
-# renders into channels. The brief's "Open Tasks by Tier" + "Today's
-# Routines" become two RENDERINGS of this one object — collapsing the
-# hand-mirrored two-pipeline math.
+# renders into channels. The brief's day section and its routines section
+# became two RENDERINGS of this one object — collapsing the hand-mirrored
+# two-pipeline math. Phase C (2026-08-12) finished the collapse: the two
+# renderings merged into ONE section ("Today's Plan"), projected through
+# ``tier/day_plan.py`` and shared with the briefing player's spoken segment.
 #
 # Structural-dedup invariant: a routine item appears in EXACTLY ONE of
 # {t1, t2, t3, routine_today}. Items that classify into a tier (via the
@@ -1382,8 +1384,9 @@ def compute_self_care_task_candidates(
 # two are complements by construction — no convention-enforced dedup.
 #
 # This commit (2b) builds the VIEW + the daily-goal. The render
-# re-pointing (making ``render_tier_section`` / ``render_routine_section``
-# consume this object) is Step 2c.
+# re-pointing (making ``render_tier_section`` consume this object) was
+# Step 2c; Phase C re-pointed the briefing player's narration at the same
+# object too, through the shared ``tier/day_plan.py`` projection.
 
 
 @dataclass
@@ -1495,16 +1498,36 @@ class RoutineLine:
     """One routine item that fired today but did NOT classify into any
     tier — the complement of {t1, t2, t3} for routine items.
 
-    These render in the brief's "Today's Routines" section. The fields
-    mirror what the aggregator's ``_collect_items_for_today`` already
-    produces per item (text + priority + annotation + time), so Step 2c's
-    render re-point is a straight read.
+    These are today's habit anchors that never escalated. Phase C dissolved
+    the brief's standalone "Today's Routines" section INTO the slot board, so
+    they now render inside their slot alongside the tier rows — which is why
+    they carry the slot axis below. The text + priority + annotation + time
+    fields still mirror what the aggregator's ``_collect_items_for_today``
+    produces per item, so the render re-point stays a straight read.
     """
 
     text: str
     priority: str
     annotation: str = ""
     time: str = ""
+    # --- slot axis (Phase C, §4 dissolution) ---------------------------------
+    # A routine item that fired today but stayed OUT of every tier still has a
+    # slot: "water the plants" is Rhythm whether or not it escalated. Stamped
+    # by ``_collect_routine_today`` through ``slots.classify_slot`` — the SAME
+    # classifier the tier lanes use, never a second look-alike rule — over the
+    # signals the aggregator now emits alongside each item.
+    #
+    # ``origin`` is fixed at ``"routine_item"`` so the classifier's rule 6
+    # (dated TASK ⟹ Duty) cannot fire on these: a routine item is not a task
+    # record, and letting rule 6 reach it would put habit anchors under Duty on
+    # the strength of a field they do not have.
+    explicit_slot: str | None = None
+    self_care: bool = False
+    has_due_pattern: bool = False
+    target_cadence_days: int | None = None
+    origin: str = "routine_item"
+    slot: str = slots.SLOT_UNSLOTTED
+    slot_rule: str = slots.RULE_NONE
 
 
 @dataclass
@@ -1542,9 +1565,12 @@ class DailyGoalState:
 class TodayView:
     """The unified today view — ONE computed read the voice layer renders.
 
-    Two renderings consume this:
-      * brief "Open Tasks by Tier" ← ``t1`` / ``t2`` / ``t3`` + ``daily_goal``
-      * brief "Today's Routines"   ← ``routine_today``
+    Consumed through ``tier/day_plan.build_day_plan``, which projects it into
+    the slot arrangement BOTH morning renders format:
+      * brief "Today's Plan"           ← ``t1`` / ``t2`` / ``t3`` (slot-grouped)
+                                         + ``routine_today`` (§4's dissolution)
+                                         + ``daily_goal`` (tier-based, unchanged)
+      * the briefing player's spoken ``day_plan`` segment ← the same projection
 
     The ``t1`` / ``t2`` / ``t3`` lanes hold :class:`TierEntry` (tasks +
     routine-items + curated). ``routine_today`` holds :class:`RoutineLine`
@@ -2069,12 +2095,21 @@ def _collect_routine_today(
     )
     out: list[RoutineLine] = []
     for it in items:
-        out.append(RoutineLine(
+        line = RoutineLine(
             text=str(it.get("text") or ""),
             priority=str(it.get("priority") or "tracked"),
             annotation=str(it.get("annotation") or ""),
             time=str(it.get("time") or ""),
-        ))
+            explicit_slot=it.get("slot"),
+            self_care=bool(it.get("self_care", False)),
+            has_due_pattern=bool(it.get("has_due_pattern", False)),
+            target_cadence_days=it.get("target_cadence_days"),
+        )
+        # Same classifier as the tier lanes (§4 dissolution) — a habit anchor
+        # that never escalated is still Duty / Rhythm / Fuel, and answering
+        # that question twice in two places is how the two answers drift.
+        verdict = slots.classify_slot(line, learned=slots.NoOverrides())
+        out.append(replace(line, slot=verdict.slot, slot_rule=verdict.rule))
     return out
 
 

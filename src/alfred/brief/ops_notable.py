@@ -336,3 +336,86 @@ def ops_notable_feed_items(
             detail="metrics steady or improving since the previous render",
         )
     return items
+
+
+# ---------------------------------------------------------------------------
+# The §5 MARKDOWN render — the same delta filter, one surface later
+# ---------------------------------------------------------------------------
+
+#: Nothing moved the wrong way. The ILB one-liner, not silence: an Operations
+#: section that renders empty is indistinguishable from one that failed to run.
+NOTHING_NOTABLE_LINE = (
+    "*(nothing notable — every metric steady or improving since the last "
+    "brief)*"
+)
+
+#: No baseline yet, so there is no "since" to measure against. Distinct from
+#: NOTHING_NOTABLE_LINE on purpose: "we compared and found nothing" and "we had
+#: nothing to compare against" are different claims, and only one of them is
+#: evidence that the instance is quiet.
+FIRST_RENDER_LINE = (
+    "*(first Operations render on this instance — recording the baseline; "
+    "changes are reported from tomorrow)*"
+)
+
+#: The read failed. Never rendered as quiet — an unreadable source claiming
+#: "all steady" is the failure mode this whole module is shaped against.
+UNREADABLE_LINE = (
+    "*(operations state could not be read this morning — see the brief log "
+    "for `ops_notable`)*"
+)
+
+
+def render_ops_notable_section(
+    items: list[FeedItem] | None,
+    *,
+    had_baseline: bool,
+    feed_store_path: str | None = None,
+) -> str:
+    """Render the Operations section body from ALREADY-COMPUTED notables.
+
+    Phase C extended the ratified delta principle from the feed to the
+    markdown. The brief's own section-assembly comment stated it, for the feed
+    half, in these words:
+
+        "The MARKDOWN is untouched: the section still renders the full status
+        snapshot. Only the feed projection is delta-filtered, because a card is
+        an attention claim and steady state — even steady-bad — is not news."
+
+    A section of the morning brief is an attention claim too. The full snapshot
+    re-stated every metric every morning, which trained the eye to skip it — so
+    the same predicate now governs both surfaces, and the snapshot's job (what
+    ARE the numbers right now) belongs to a surface the operator opens on
+    purpose rather than one that arrives daily.
+
+    Takes the items rather than computing them because
+    :func:`ops_notable_feed_items` ADVANCES THE BASELINE as a side effect:
+    calling it once for the markdown and once for the feed would make the
+    second call compare against the first call's own writes and report nothing.
+    One call, one baseline advance, both surfaces.
+
+    Three outcomes, deliberately distinguishable — ``None`` (unreadable) is
+    never allowed to look like ``[]`` (genuinely quiet), and neither is allowed
+    to look like a first render.
+
+    ``feed_store_path`` appends the #27 "medium emails waiting" line. That line
+    is an OPEN-ITEM COUNT, not a delta, so the notable predicate is the wrong
+    filter for it: a medium email that has waited three days is not news by the
+    delta rule and is exactly what the operator needs told. It therefore
+    survives the notable-only cut, ALWAYS renders (including its explicit
+    zero-state), and appears even on the unreadable/first-render paths above —
+    held email must never be silently held, whatever the ops metrics did.
+    """
+    body: str
+    if items is None:
+        body = UNREADABLE_LINE
+    elif not items:
+        body = FIRST_RENDER_LINE if not had_baseline else NOTHING_NOTABLE_LINE
+    else:
+        body = "\n".join(f"- {item.title}" for item in items)
+
+    if feed_store_path:
+        from .operations import _medium_waiting_summary
+
+        body += f"\n\n**{_medium_waiting_summary(feed_store_path)}**"
+    return body

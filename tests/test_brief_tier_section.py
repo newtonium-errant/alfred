@@ -34,6 +34,10 @@ from pathlib import Path
 import structlog
 
 from alfred.brief.tier_section import (
+    PLAN_EMPTY_SENTINEL,
+    render_curated_tier_section_for_today,
+    render_daily_goal_line,
+    render_tier_section,
     ROLLOVER_HEADER,
     SECTION_HEADER,
     T1_CONFIRM_PROMPT,
@@ -47,9 +51,6 @@ from alfred.brief.tier_section import (
     T3_AUTO_SECTION_HEADER,
     T3_AUTO_TALKER_DEFERRED_NOTE,
     T3_EMPTY_PROMPT,
-    render_curated_tier_section_for_today,
-    render_daily_goal_line,
-    render_tier_section,
 )
 from alfred.tier.compute import DailyGoalState
 from alfred.tier.daily_curation import (
@@ -139,8 +140,12 @@ def test_section_header_pinned() -> None:
 
     Renaming here would break the daemon's section-list wiring; pin
     so a typo surfaces immediately.
+
+    Renamed in Phase C (2026-08-12): the section is grouped by SLOT, not by
+    tier, and it absorbed the dissolved routines section — a header naming the
+    old axis would be copy that lies about the render underneath it.
     """
-    assert SECTION_HEADER == "Open Tasks by Tier"
+    assert SECTION_HEADER == "Today's Plan"
 
 
 def test_t1_confirm_prompt_pinned() -> None:
@@ -182,14 +187,11 @@ def test_empty_vault_renders_all_sentinels(tmp_path: Path) -> None:
     prompts, T2 pool sentinel, rollover suppressed."""
     body = render_tier_section(tmp_path, NOW)
 
-    # Three curated headers always emit.
-    assert "### T1 — Imminent deadlines" in body
-    assert "### T2 — On the radar" in body
-    assert "### T3 — Self-care for today" in body
-
-    # T1 has the no-candidates sentinel (no auto-T1 + no curation).
-    assert "*(no T1 candidates today)*" in body
-    # T2 + T3 empty-bucket prompts surface verbatim.
+    # Phase C: a day with NOTHING arranged renders the one honest
+    # section-level sentinel rather than three empty slot headers.
+    assert PLAN_EMPTY_SENTINEL in body
+    # T2 + T3 empty-bucket prompts still surface verbatim — they are about a
+    # TIER lane being empty, which is still true and still the talker's cue.
     assert T2_EMPTY_PROMPT in body
     assert T3_EMPTY_PROMPT in body
 
@@ -269,7 +271,7 @@ def test_curated_empty_buckets_show_prompts(tmp_path: Path) -> None:
         tier_curation_yaml="t1: []\nt2: []\nt3: []\n",
     )
     body = render_tier_section(tmp_path, NOW)
-    assert "*(no T1 candidates today)*" in body
+    assert PLAN_EMPTY_SENTINEL in body
     assert T2_EMPTY_PROMPT in body
     assert T3_EMPTY_PROMPT in body
 
@@ -794,15 +796,14 @@ def test_non_task_type_logged_and_skipped(tmp_path: Path) -> None:
 def test_render_includes_separator_between_shortlists_and_pool(
     tmp_path: Path,
 ) -> None:
-    """The render shape is: shortlists → ``---`` → pool → (rollover).
-    The ``---`` separator anchors the curated/materials split."""
+    """The render shape is: day plan → ``---`` → pool.
+    The ``---`` separator anchors the plan/materials split (Phase C: the plan
+    half is the slot board; the materials half is unchanged)."""
     body = render_tier_section(tmp_path, NOW)
-    # The separator appears between the last shortlist section
-    # (### T3) and the T2 pool header.
-    idx_t3 = body.index("### T3")
-    idx_sep = body.index("\n---\n", idx_t3)
+    idx_plan = body.index(PLAN_EMPTY_SENTINEL)
+    idx_sep = body.index("\n---\n", idx_plan)
     idx_pool = body.index(T2_POOL_HEADER, idx_sep)
-    assert idx_t3 < idx_sep < idx_pool
+    assert idx_plan < idx_sep < idx_pool
 
 
 def test_render_logs_rendered_event_with_counts(tmp_path: Path) -> None:
@@ -902,13 +903,19 @@ def test_routine_auto_t1_renders_with_routine_wikilink_and_confirm(
     assert "[[routine/Weekly Chores]]" in body
     # Auto-surfaced (not yet confirmed) gets the confirm prompt.
     assert T1_CONFIRM_PROMPT in body
-    # Render shape: ``- Garbage Out — due tomorrow, from [[routine/Weekly Chores]]``
+    # Phase C shape: one line, tagged with its TIER (the goal metric is still
+    # tier-based) inside its SLOT stack — Duty, because a recurring hard
+    # deadline is a scheduled obligation (classifier rule 4).
     t1_lines = [
         ln for ln in body.splitlines()
         if "Garbage Out" in ln and "[[routine/Weekly Chores]]" in ln
     ]
     assert len(t1_lines) == 1
-    assert "due tomorrow, from [[routine/Weekly Chores]]" in t1_lines[0]
+    assert t1_lines[0].startswith("- [T1] ")
+    assert "due tomorrow" in t1_lines[0]
+    duty_idx = body.index("### Duty")
+    rhythm_idx = body.index("### Rhythm")
+    assert duty_idx < body.index("Garbage Out") < rhythm_idx
 
 
 def test_routine_auto_t2_renders_in_auto_surfaced_subsection(
@@ -936,14 +943,16 @@ def test_routine_auto_t2_renders_in_auto_surfaced_subsection(
         "  escalate_at_days: 0\n",
     )
     body = render_tier_section(tmp_path, NOW)
-    assert T2_AUTO_ROUTINE_HEADER in body
-    # The T2 auto subsection sits inside the T2 bucket — verify
-    # ordering: T2 header → auto-surfaced subsection.
-    t2_idx = body.index("### T2 — On the radar")
-    auto_idx = body.index(T2_AUTO_ROUTINE_HEADER)
-    assert t2_idx < auto_idx
-    # The auto-T2-routine confirm prompt fires.
+    # Phase C: the ``#### Auto-surfaced (from routines)`` SUBHEADER is retired
+    # — the slot stack's own ordering (carryover → committed → suggestions)
+    # performs the grouping it used to do. The reply AFFORDANCE is what the
+    # talker actually keys on, and it is preserved verbatim, per row.
+    assert T2_AUTO_ROUTINE_HEADER not in body
     assert T2_ROUTINE_CONFIRM_PROMPT in body
+    # It is a suggestion in its slot, tagged T2.
+    line = [ln for ln in body.splitlines() if "Pay Clinic Rental" in ln]
+    assert len(line) == 1
+    assert line[0].startswith("- [T2] ")
     # Item rendered with reason + routine wikilink.
     assert "Pay Clinic Rental" in body
     assert "surface window (4d before due)" in body
@@ -1187,10 +1196,12 @@ def test_routine_auto_t1_includes_formatted_due_date(tmp_path: Path) -> None:
         "  escalate_at_days: 1\n",
     )
     body = render_tier_section(tmp_path, NOW)
-    # Formatted date appears in the head, BEFORE the parenthetical.
+    # Formatted date + reason both survive the Phase C regroup; the
+    # from-wikilink moved into the row HEAD (it identifies the item) while the
+    # date + reason are the row's annotation.
     assert "due Fri May 29" in body
-    # Inside the parenthetical: reason + from-wikilink.
-    assert "(due tomorrow, from [[routine/Weekly Chores]])" in body
+    assert "(due tomorrow)" in body
+    assert "(from [[routine/Weekly Chores]])" in body
 
 
 def test_routine_auto_t2_includes_formatted_due_date(tmp_path: Path) -> None:
@@ -1213,10 +1224,8 @@ def test_routine_auto_t2_includes_formatted_due_date(tmp_path: Path) -> None:
     )
     body = render_tier_section(tmp_path, NOW)
     assert "due Mon Jun 1" in body
-    assert (
-        "(surface window (4d before due), "
-        "from [[routine/Recurring Bills]])"
-    ) in body
+    assert "(surface window (4d before due))" in body
+    assert "(from [[routine/Recurring Bills]])" in body
 
 
 def test_routine_t1_entry_excluded_from_rollover(tmp_path: Path) -> None:
@@ -1815,13 +1824,18 @@ def test_t3_auto_section_header_emits_when_candidates_present(
         "  target_cadence_days: 3\n",
     )
     body = render_tier_section(tmp_path, NOW)
-    assert T3_AUTO_SECTION_HEADER in body
+    # Phase C: the ``#### Auto-suggested (from routine cadence)`` SUBHEADER is
+    # retired — the slot stack orders suggestions after committed rows, which
+    # is the grouping it performed. Everything the operator READS is preserved:
+    # the routine link, the item, the never-done label, the cadence target and
+    # the reply affordance.
+    assert T3_AUTO_SECTION_HEADER not in body
     assert "[[routine/Self Care]]" in body
     assert "Walk dog" in body
     # Never-completed → "never done" label, NOT a day count.
     assert "never done" in body
     assert "target every 3d" in body
-    # Confirm prompt fires below candidates — still load-bearing.
+    # Confirm prompt still fires on the candidate row — load-bearing.
     assert T3_AUTO_CONFIRM_PROMPT in body
     # ILB deferred note RETIRED 2026-05-30 — see regression test below.
     assert T3_AUTO_TALKER_DEFERRED_NOTE not in body
@@ -1849,8 +1863,9 @@ def test_t3_auto_talker_deferred_note_no_longer_rendered(
         "  target_cadence_days: 3\n",
     )
     body = render_tier_section(tmp_path, NOW)
-    # Sanity: the auto-T3 subsection DID render (candidates present).
-    assert T3_AUTO_SECTION_HEADER in body
+    # Sanity POSITIVE control: the auto-T3 candidate DID render (so the
+    # negative assertions below are not passing on an empty body).
+    assert "Walk dog" in body
     assert T3_AUTO_CONFIRM_PROMPT in body
     # The retired ILB note is gone.
     assert T3_AUTO_TALKER_DEFERRED_NOTE not in body
@@ -1941,15 +1956,30 @@ def test_t3_curated_plus_auto_renders_curated_first_then_auto(
     # Both surfaces present.
     assert "Read 30 minutes" in body
     assert "Walk dog" in body
-    assert T3_AUTO_SECTION_HEADER in body
-    # Order: curated first, then auto subhead. Compare positions.
-    curated_idx = body.index("Read 30 minutes")
-    auto_idx = body.index(T3_AUTO_SECTION_HEADER)
-    walk_idx = body.index("Walk dog")
-    assert curated_idx < auto_idx < walk_idx, (
-        "Curated T3 entries must render BEFORE the auto-suggested "
-        "subsection (operator's choices lead)."
-    )
+    # Phase C: the operator's-choices-lead ordering is now enforced by the slot
+    # stack itself (committed rows before suggestions) rather than by a
+    # subsection header, so the header is gone.
+    assert T3_AUTO_SECTION_HEADER not in body
+    # The ordering is WITHIN a slot, not across the body — these two rows land
+    # in DIFFERENT slots, which is the honest answer for what they are:
+    #   * "Walk dog" carries ``target_cadence_days`` ⟹ Rhythm (rule 5).
+    #   * "Read 30 minutes" is a curated FREE-TEXT T3 intention, and
+    #     ``_curated_t3_to_tier_entry`` stamps no slot signals on it at all, so
+    #     the classifier refuses to guess ⟹ unslotted.
+    #
+    # KNOWN GAP, deliberately pinned rather than papered over: a T3 lane the
+    # codebase itself calls "self-care" should arguably carry ``self_care``
+    # into the classifier and land in FUEL. That is a change to the
+    # CLASSIFIER's inputs (#18's surface), and it moves the board as well as
+    # the brief — the feed producer stamps ``evidence.slot`` off these same
+    # entries, so the board has shown these rows unslotted since the classifier
+    # shipped. This render lane made the pre-existing gap VISIBLE; it is not
+    # its author, and fixing it here would move C1's board outside C1's gate.
+    from alfred.tier.day_plan import UNSLOTTED_LABEL
+    rhythm_idx = body.index("### Rhythm")
+    residue_idx = body.index(f"### {UNSLOTTED_LABEL}")
+    assert rhythm_idx < body.index("Walk dog") < residue_idx
+    assert residue_idx < body.index("Read 30 minutes")
 
 
 def test_t3_auto_render_line_shape_with_days_count(
@@ -1979,8 +2009,10 @@ def test_t3_auto_render_line_shape_with_days_count(
     ]
     assert len(walk_lines) == 1
     line = walk_lines[0]
-    # Render shape: includes record wikilink + item text + annotation.
-    assert line.startswith("- [[routine/Self Care]] — Walk dog ")
+    # Phase C shape: ``- [Tn] <item> (from [[routine/<record>]]) <annotation>``.
+    # The record link moved into the row HEAD (it identifies the item) and the
+    # cadence annotation is unchanged — same information, one arrangement.
+    assert line.startswith("- [T3] Walk dog (from [[routine/Self Care]]) ")
     assert "*(4 days since last; target every 3d)*" in line
 
 
@@ -2290,9 +2322,14 @@ def test_morning_brief_strikes_done_t3_only_on_render_date(tmp_path: Path) -> No
         ),
     )
     body = render_tier_section(tmp_path, NOW)
-    assert "- ~~Rake leaves~~ ✓" in body        # same-day done → struck (progress snapshot)
-    assert "- Wash car" in body                 # stale done → PLAIN
-    assert "~~Wash car~~" not in body            # NOT falsely struck as done-today
+    # Phase C: rows carry their tier tag, and done-ness now comes from the
+    # SHARED ``entry_is_done`` predicate (the same one the daily goal and the
+    # feed's ``done`` flag use) rather than a render-local ``done_at`` read —
+    # so the same-day/stale distinction is enforced in one place for every
+    # surface instead of three.
+    assert "- [T3] ~~Rake leaves~~ ✓" in body   # same-day done → struck (progress snapshot)
+    assert "- [T3] Wash car" in body            # stale done → PLAIN
+    assert "~~Wash car~~" not in body           # NOT falsely struck as done-today
 
 
 def test_curated_for_today_drops_done_t3_when_today_threaded() -> None:

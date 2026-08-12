@@ -36,7 +36,8 @@ from .utils import get_logger
 
 if TYPE_CHECKING:  # avoid heavy imports at brief import time
     from alfred.brief.weather import StationWeather
-    from alfred.tier.compute import TodayView
+    from alfred.tier.compute import DailyGoalState
+    from alfred.tier.day_plan import DayPlan
 
 log = get_logger(__name__)
 
@@ -47,15 +48,19 @@ SECTION_HEALTH = "health"
 SECTION_DAY_PLAN = "day_plan"
 SECTION_EVENTS = "events"
 SECTION_WEATHER = "weather"
+SECTION_WAITING = "waiting"
 SECTION_SIGN_OFF = "sign_off"
 
-# Segment order — the player renders slides in this order.
+# Segment order — the player renders slides in this order. ``waiting`` sits
+# LAST before the sign-off on purpose: it is the segment that hands the
+# operator off to the deck, so it is the last thing said before "go".
 SEGMENT_ORDER = (
     SECTION_DAY_STATE,
     SECTION_HEALTH,
     SECTION_DAY_PLAN,
     SECTION_EVENTS,
     SECTION_WEATHER,
+    SECTION_WAITING,
     SECTION_SIGN_OFF,
 )
 
@@ -72,6 +77,10 @@ class NarrationConfig:
     budget_day_plan: int = 55
     budget_events: int = 40
     budget_weather: int = 35
+    # Tight ON PURPOSE: the waiting segment's whole job is to say HOW MANY and
+    # send the operator to the deck. A budget large enough to list the items
+    # would invite exactly the read-them-aloud behaviour it exists to prevent.
+    budget_waiting: int = 25
     budget_sign_off: int = 20
 
     def budget_for(self, section_id: str) -> int:
@@ -81,6 +90,7 @@ class NarrationConfig:
             SECTION_DAY_PLAN: self.budget_day_plan,
             SECTION_EVENTS: self.budget_events,
             SECTION_WEATHER: self.budget_weather,
+            SECTION_WAITING: self.budget_waiting,
             SECTION_SIGN_OFF: self.budget_sign_off,
         }.get(section_id, 40)
 
@@ -150,9 +160,16 @@ def _clip_words(text: str, budget: int) -> str:
 # --- per-segment speakable generators (pure) ---------------------------------
 
 
-def _day_state_text(view: "TodayView") -> str:
-    """The rings/day-state segment from the C2 ``daily_goal`` stage data."""
-    g = view.daily_goal
+def _day_state_text(g: "DailyGoalState") -> str:
+    """The rings/day-state segment from the C2 ``daily_goal`` stage data.
+
+    ``daily_goal`` is TIER-based and stays that way — ``balanced_day`` counts
+    one-done in each of T1/T2/T3, and flipping that metric to the slot axis is
+    a separate gated lane. The copy below therefore speaks tiers ("urgent",
+    "medium", "self-care") even though the brief now ARRANGES the same rows by
+    slot. Per ``tier/day_plan.py``: no copy anywhere may claim a slot-based
+    goal while the metric is tier-based.
+    """
     total = g.t1_available + g.t2_available + g.t3_available
     if total == 0:
         return "Your day is a clean slate — nothing tiered up yet."
@@ -207,23 +224,41 @@ def _health_text(tool_lines: list[tuple[str, str, str]]) -> str:
     return f"Heads up — {n} tool{'s' if n != 1 else ''} need{'s' if n == 1 else ''} a look: {names}."
 
 
-def _day_plan_text(view: "TodayView") -> str:
-    """The day-plan segment — the T1/T2/T3 items, urgent first, names only
-    (the visual slide carries the full list; narration names the top few)."""
-    def _names(entries, limit):
-        return [e.name for e in entries[:limit] if getattr(e, "name", "")]
+def _day_plan_text(plan: "DayPlan") -> str:
+    """The day-plan segment — names only (the visual slide carries the full
+    list; narration names the top few).
 
-    t1 = _names(view.t1, 3)
-    t2 = _names(view.t2, 2)
-    if not t1 and not t2 and not view.t3:
+    **Re-pointed (Phase C, C2+C3) at the shared ``DayPlan`` projection** — the
+    SAME object the brief's day section renders, so the spoken plan and the
+    read plan can no longer disagree about what is on today's plan. Before
+    this, each render read ``TodayView`` independently.
+
+    **STALE COPY, deliberately left in place.** The strings below still speak
+    the TIER axis ("Urgent", "Then", "self-care intentions") while the brief
+    now ARRANGES the same rows by slot (Duty / Rhythm / Fuel). That is not an
+    oversight and it is not a bug to fix here: this lane re-points the
+    structure and freezes the voice, and the prompt-tuner's voice pass
+    re-voices these strings against the slot vocabulary afterwards. Changing
+    them here would collide with that pass — and, worse, would be the first
+    copy in the system to name a slot while ``daily_goal`` still measures
+    tiers. ``rows_in_tier`` exists precisely so this stayed byte-identical
+    across the re-point: it preserves the view's own lane order.
+    """
+    def _names(rows, limit):
+        return [r.name for r in rows[:limit] if r.name]
+
+    t3_rows = plan.rows_in_tier(3)
+    t1 = _names(plan.rows_in_tier(1), 3)
+    t2 = _names(plan.rows_in_tier(2), 2)
+    if not t1 and not t2 and not t3_rows:
         return "No urgent or medium items — today's yours to shape."
     parts: list[str] = []
     if t1:
         parts.append("Urgent: " + ", ".join(t1) + ".")
     if t2:
         parts.append("Then: " + ", ".join(t2) + ".")
-    if view.t3:
-        parts.append(f"Plus {len(view.t3)} self-care intention{'s' if len(view.t3) != 1 else ''}.")
+    if t3_rows:
+        parts.append(f"Plus {len(t3_rows)} self-care intention{'s' if len(t3_rows) != 1 else ''}.")
     return " ".join(parts)
 
 
@@ -289,10 +324,94 @@ def _weather_text(stations: list["StationWeather"]) -> str:
     return head + ", ".join(bits) + "." if bits else ""
 
 
-def _sign_off_text(view: "TodayView") -> str:
+def count_waiting_items(feed_store_path: str) -> int | None:
+    """How many feed items are actually waiting on a decision.
+
+    Waiting = ``mode == decide`` AND ``state == open``. Deliberately NOT
+    ``attention == needs_you``: attention is a learned re-tiering signal that
+    answers "how loudly", while mode answers "does this need an answer from
+    him at all" — and the deck is the answering surface, so mode is the
+    question this count is asking. A DEFERRED item is not waiting either; it
+    was answered, with "later".
+
+    ``None`` on a read failure, which omits the slide — speaking a number we
+    could not read is worse than not speaking, and it is the one case where a
+    confident "nothing waiting" would be actively misleading.
+
+    **The unreadable case has to be detected HERE.** ``FeedStore.load`` is
+    deliberately crash-proof for lock-free concurrent reads: a missing store, an
+    ``OSError``, and a corrupt tail all fold to ``{}``. That is right for the
+    store and wrong for this caller, because it makes "no feed" and "cannot read
+    the feed" arrive as the same zero — so a "nothing waiting on you" would be
+    spoken with full confidence over an unreadable store. Hence the explicit
+    probe below rather than relying on an exception that never comes.
+
+    A store that does not exist YET is a genuine zero, not a failure: an
+    instance with no feed has nothing waiting, and that is worth saying.
+    """
+    try:
+        from alfred.feed import MODE_DECIDE, STATE_OPEN, FeedStore
+
+        path = Path(feed_store_path)
+        if path.exists() and not path.is_file():
+            log.warning(
+                "brief.narration.waiting_count_failed",
+                path=str(path),
+                error_type="NotAFile",
+                error="feed store path exists but is not a readable file",
+                detail="deck-waiting slide omitted; a spoken count we could not "
+                       "read would be worse than silence here.",
+            )
+            return None
+        items = FeedStore(feed_store_path).load()
+        return sum(
+            1 for it in items.values()
+            if it.mode == MODE_DECIDE and it.state == STATE_OPEN
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade to an omitted slide
+        log.warning(
+            "brief.narration.waiting_count_failed",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            detail="deck-waiting slide omitted; a spoken count we could not "
+                   "read would be worse than silence here.",
+        )
+        return None
+
+
+def _waiting_text(waiting_count: int) -> str:
+    """The interactive-items segment: say HOW MANY, then route to the deck.
+
+    The C3 ruling in its own terms — "interactive items say 'N waiting' and
+    route to the deck". A briefing is a one-way audio surface: an item that
+    needs a yes/no cannot be answered by listening to it, so reading the items
+    aloud spends the operator's attention on decisions they are structurally
+    unable to make while driving. The count is the actionable part; the deck is
+    where the answering happens.
+
+    Zero is SPOKEN, not omitted (intentionally-left-blank). "Nothing waiting"
+    is a real and welcome answer, and a segment that vanishes when the count is
+    zero is indistinguishable from a segment whose count failed to load — which
+    is the one case where the operator most needs to know not to trust it.
+    ``_gather_waiting_count`` returns ``None`` for that failure, and the caller
+    omits the slide only then.
+    """
+    if waiting_count <= 0:
+        return "Nothing waiting on you in the deck."
+    n = waiting_count
+    return (
+        f"{n} thing{'s' if n != 1 else ''} waiting on you in the deck. "
+        "Open it when you're at a screen."
+    )
+
+
+def _sign_off_text(g: "DailyGoalState") -> str:
     """A short encouraging close keyed on the daily goal (self-correcting-friendly
-    tone; the composer log captures which segments draw questions later)."""
-    g = view.daily_goal
+    tone; the composer log captures which segments draw questions later).
+
+    Tier-based like :func:`_day_state_text`, and stale in the same deliberate
+    way — "one urgent thing first" names a tier, not a slot.
+    """
     if g.balanced_day:
         return "You're set up well. Go get it."
     if g.t1_available and g.t1_done < g.t1_available:
@@ -306,10 +425,11 @@ def _sign_off_text(view: "TodayView") -> str:
 def compose_narration(
     *,
     brief_date: str,
-    view: "TodayView",
+    plan: "DayPlan",
     health_lines: list[tuple[str, str, str]],
     events: list[Any],
     weather_stations: list["StationWeather"],
+    waiting_count: int | None,
     config: NarrationConfig | None = None,
 ) -> BriefNarration:
     """Compose the sectioned narration from already-gathered STRUCTURED inputs.
@@ -319,15 +439,33 @@ def compose_narration(
     (no health data / no events / non-severe weather) are DROPPED so the player
     renders only real slides — but the whole thing being empty is a valid ILB
     state the caller surfaces (``BriefNarration.empty``).
+
+    ``plan`` REPLACED ``view`` in Phase C (C2+C3) and is REQUIRED, not an added
+    optional argument: an optional ``plan`` would have left the gatherer free
+    to keep passing a raw view forever while every unit pin that passed a plan
+    stayed green — the shared spine would be live in the tests and dead in the
+    morning. The one production caller (:func:`build_narration`) threads it in
+    the same commit.
     """
     cfg = config or NarrationConfig()
+    from alfred.tier.compute import DailyGoalState
+
+    goal = plan.daily_goal or DailyGoalState()
     raw: list[tuple[str, str, str]] = [
-        (SECTION_DAY_STATE, "State of your day", _day_state_text(view)),
+        (SECTION_DAY_STATE, "State of your day", _day_state_text(goal)),
         (SECTION_HEALTH, "Health", _health_text(health_lines)),
-        (SECTION_DAY_PLAN, "Today's plan", _day_plan_text(view)),
+        (SECTION_DAY_PLAN, "Today's plan", _day_plan_text(plan)),
         (SECTION_EVENTS, "Coming up", _events_text(events)),
         (SECTION_WEATHER, "Weather", _weather_text(weather_stations)),
-        (SECTION_SIGN_OFF, "Sign-off", _sign_off_text(view)),
+        # ``None`` means the count could not be read — omit the slide rather
+        # than speak a number we do not have. Zero is a real answer and IS
+        # spoken (see _waiting_text).
+        (
+            SECTION_WAITING,
+            "Waiting on you",
+            "" if waiting_count is None else _waiting_text(waiting_count),
+        ),
+        (SECTION_SIGN_OFF, "Sign-off", _sign_off_text(goal)),
     ]
     segments: list[NarrationSegment] = []
     for section_id, title, text in raw:
@@ -366,6 +504,7 @@ async def build_narration(
     slide rather than killing the narration (the brief's section-containment
     idiom). ``config`` is a ``BriefConfig``."""
     from alfred.tier.compute import compute_today_view
+    from alfred.tier.day_plan import build_day_plan_for_vault
 
     vault_path = Path(config.vault_path)
     today_local = now.date()
@@ -377,6 +516,26 @@ async def build_narration(
         log.warning("brief.narration.view_failed", error=str(exc), error_type=exc.__class__.__name__)
         from alfred.tier.compute import TodayView
         view = TodayView()
+
+    # 1b. The SHARED slot projection (Phase C) — the same object the brief's
+    # day section renders, so the spoken and read plans cannot diverge.
+    #
+    # ``rollover`` is deliberately NOT threaded here. Rollover needs yesterday's
+    # curation block plus a scan of the whole task pool for current statuses,
+    # which is a second full vault walk, and the spoken segment does not say
+    # anything about carryover — the strings are frozen this lane. An empty
+    # rollover means every row projects as non-carryover, which is exactly what
+    # the current copy describes. When the voice pass gives the player something
+    # to SAY about carryover, this is the line that grows the argument.
+    try:
+        plan = build_day_plan_for_vault(vault_path, view, today_local)
+    except Exception as exc:  # noqa: BLE001 — a bad plan degrades, never kills
+        log.warning(
+            "brief.narration.plan_failed",
+            error=str(exc), error_type=exc.__class__.__name__,
+        )
+        from alfred.tier.day_plan import DayPlan
+        plan = DayPlan(daily_goal=view.daily_goal)
 
     # 2. Health — structured per-tool lines from the latest BIT record.
     health_lines: list[tuple[str, str, str]] = []
@@ -412,9 +571,15 @@ async def build_narration(
     except Exception as exc:  # noqa: BLE001 — weather degrades to an omitted slide
         log.warning("brief.narration.weather_failed", error=str(exc), error_type=exc.__class__.__name__)
 
+    # 5. Deck-waiting count (C3) — the interactive items say HOW MANY and route
+    # to the deck rather than being read out. Threaded at the one production
+    # entry point in the same commit that added the parameter.
+    waiting_count = count_waiting_items(config.feed.store_path)
+
     return compose_narration(
         brief_date=brief_date,
-        view=view,
+        plan=plan,
+        waiting_count=waiting_count,
         health_lines=health_lines,
         events=events,
         weather_stations=weather_stations,
@@ -428,6 +593,7 @@ __all__ = [
     "SECTION_DAY_PLAN",
     "SECTION_EVENTS",
     "SECTION_WEATHER",
+    "SECTION_WAITING",
     "SECTION_SIGN_OFF",
     "SEGMENT_ORDER",
     "NarrationConfig",
@@ -435,4 +601,5 @@ __all__ = [
     "BriefNarration",
     "compose_narration",
     "build_narration",
+    "count_waiting_items",
 ]

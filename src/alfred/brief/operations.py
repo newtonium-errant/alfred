@@ -258,7 +258,23 @@ def format_operations_section(
     quarantine_dir_name: str = "quarantine",
     feed_store_path: str | None = None,
 ) -> str:
-    """Render the Operations section as markdown.
+    """Render the FULL Operations status snapshot as markdown.
+
+    **NO LONGER THE BRIEF'S §5 (Phase C, 2026-08-12).** The morning section is
+    now notable-events-only — ``ops_notable.render_ops_notable_section`` — on
+    the ratified reasoning that a section of the brief is an attention claim
+    and steady state, even steady-bad, is not news. Restating every metric each
+    morning is what trained the eye to skip the section.
+
+    This snapshot answers a different and still-legitimate question — "what ARE
+    the numbers right now" — which belongs to a surface the operator opens on
+    purpose. No such surface exists yet, so this function is currently
+    UNCALLED in production: a deletion candidate held back from the same commit
+    as the restructure, alongside ``brief/routine_section.py``.
+
+    Its ``feed_store_path`` "medium emails waiting" line did NOT leave the
+    brief with it — that line is an open-item count rather than a delta, so §5
+    renders it directly via :func:`_medium_waiting_summary`.
 
     Args:
         data_dir: Path to Alfred data directory (state files + audit log).

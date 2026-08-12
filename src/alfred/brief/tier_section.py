@@ -1,4 +1,4 @@
-"""Brief integration — render the "Open Tasks by Tier" section (V2).
+"""Brief integration — render the "Today's Plan" section (V2).
 
 Tier-V2 reframes tier as a **daily curation ritual** stored in
 ``vault/daily/<date>.md`` (the ``tier_curation`` frontmatter block —
@@ -17,28 +17,47 @@ being stripped, not backfilled, so the once-deferred "Ship 5 backfill"
 is moot. The migration script ``scripts/migrate_tier_phase1.py`` (which
 populated those fields) is ARCHIVED as a completed one-time migration.
 
+Phase C (2026-08-12) turned this section into the BOARD'S MORNING PROJECTION.
+It is grouped by SLOT (Duty / Rhythm / Fuel) rather than by tier, carryover
+renders first inside its slot, and the brief's former standalone "Today's
+Routines" section dissolved into it — today's habit anchors render beside the
+tier rows in the slot they belong to. Both this render and the briefing
+player's spoken ``day_plan`` segment format ONE shared projection
+(:mod:`alfred.tier.day_plan`), so the read and spoken plans cannot disagree.
+
+The daily-goal line at the top is still TIER-based (``balanced_day`` counts
+one-done in each of T1/T2/T3). Grouping by slot is an ARRANGEMENT of the same
+rows, not a new target — which is why every row keeps a visible ``[Tn]`` tag.
+See :mod:`alfred.tier.day_plan`: no copy anywhere may claim a slot-based goal
+while the metric is tier-based.
+
 Render shape (the section body — the brief renderer wraps it under
-``## Open Tasks by Tier``):
+``## Today's Plan``):
 
-    ### T1 — Imminent deadlines (auto-surfaced — confirm or drop)
-    - [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
-    - [[task/Pay Clinic Rental]] — due tomorrow
+    **Today's goal:** T1 0/2 · T2 1/1 ✓ · T3 0/1 — one to go for a balanced day
 
-    ### T2 — On the radar
-    *(empty — reply "T2 add <items from selection pool below or anywhere>")*
+    ### Duty
+    - [T1] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
+    - [T2] [[task/Connect QBO API — RRTS]] *(carried from yesterday)*
 
-    ### T3 — Self-care for today
-    *(empty — pick from Aspirational routines below or add new — reply "T3 add walk Fergus")*
+    ### Rhythm
+    - [T2] Water the plants (from [[routine/Weekly Chores]]) — due Fri Aug 14
+
+    *Today's rhythm items:*
+
+    - Morning pages *(3 days since last)*
+
+    ### Fuel
+    *(nothing in Fuel today)*
+
+    ### Rollover from yesterday (incomplete)
+    *(everything carried over is on today's plan above, marked where it sits)*
 
     ---
 
     ### T2 selection pool
     (open ``todo``/``active`` tasks, NOT auto-T1, NOT alfred_triage)
     - [[task/RRTS Bug List — Burn Through]]
-    - [[task/Set Up QuickBooks Online Developer Access for RRTS Website]]
-
-    ### Rollover from yesterday (incomplete)
-    - T2: [[task/Connect QBO API — RRTS]] *(uncompleted yesterday)*
 
 Read path (Step 2c, 2026-06-26 — the SINGLE computed view + materials):
 
@@ -54,10 +73,12 @@ Read path (Step 2c, 2026-06-26 — the SINGLE computed view + materials):
      is re-derived here. The view merged curated + auto per lane via the
      single ``classify_routine_item`` predicate.
   3. ``load_daily_curation(vault_path, today - 1 day)`` — yesterday's
-     curation, for rollover detection. Each yesterday-T1/T2 entry is
-     checked against the current task record's status; incomplete
-     entries surface in the Rollover section. (Render-only material —
-     not a substrate lane assignment.)
+     curation, for rollover detection (:func:`compute_rollover`). Each
+     yesterday-T1/T2 entry is checked against the current task record's
+     status; incomplete entries either MARK their row on today's board
+     (carryover, rendered first in its slot) or, when they are no longer on
+     the board at all, list under :data:`ROLLOVER_HEADER`. (Render-only
+     material — not a substrate lane assignment.)
   4. Open-task pool scan over ``vault/task/*.md`` for the T2 selection
      pool (status in OPEN_STATUSES, NOT ``alfred_triage``, NOT in
      today's auto-T1 set, NOT already-curated T1/T2). (Render-only
@@ -104,6 +125,13 @@ from alfred.tier.daily_curation import (
     T3Entry,
     load_daily_curation,
 )
+from alfred.tier.day_plan import (
+    DayPlan,
+    PlanRow,
+    RolloverRef,
+    SlotGroup,
+    build_day_plan_for_vault,
+)
 
 from .utils import SectionReadStatus, safe_read_section_file
 
@@ -113,9 +141,19 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Section header — referenced by ``brief/daemon.py`` + ``today_command.py``.
 # Single source of truth so a rename here propagates without grep-replace.
+#
+# Renamed from "Open Tasks by Tier" in Phase C (2026-08-12). Two reasons, both
+# forced by the ratified content pass rather than chosen for taste:
+#   * the section is no longer grouped BY TIER — it is the board's morning
+#     projection, grouped by slot (Duty / Rhythm / Fuel), and a header that
+#     names the wrong axis is the "comment lies about behaviour" trap in copy;
+#   * it is no longer only TASKS — the standalone "Today's Routines" section
+#     dissolved into it, so today's habit anchors render here too.
+# Matches the narration's own ``day_plan`` slide title ("Today's plan"), so the
+# read surface and the spoken surface name the same thing.
 # ---------------------------------------------------------------------------
 
-SECTION_HEADER = "Open Tasks by Tier"
+SECTION_HEADER = "Today's Plan"
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +173,46 @@ T3_EMPTY_PROMPT = (
     '*(empty — pick from Aspirational routines below or add new — '
     'reply "T3 add walk Fergus")*'
 )
+# ``ROLLOVER_HEADER``'s SCOPE NARROWED in Phase C, its STRING did not.
+#
+# Before: every one of yesterday's still-open commitments was listed under this
+# header, in its own block at the bottom of the section. Now the ones that are
+# also on today's board render INLINE in their slot, carryover-first — which is
+# the whole point of a carryover-first morning. What stays under this header is
+# the honest remainder: yesterday's commitments that are NOT on today's board at
+# all, so there is no row to mark and no slot to place them in without guessing.
+#
+# The string is unchanged because the talker SKILL quotes it verbatim as a
+# stable contract (see the cross-agent block above); the prompt-tuner pass that
+# follows this merge is what re-voices it.
 ROLLOVER_HEADER = "### Rollover from yesterday (incomplete)"
 T2_POOL_HEADER = "### T2 selection pool"
+
+# --- Phase C day-plan render strings ---------------------------------------
+#
+# The per-row carryover marker. Rendered on rows that ARE on today's board and
+# were also open yesterday — the inline half of the rollover above.
+CARRYOVER_MARKER = "*(carried from yesterday)*"
+
+#: Header for the habit anchors inside a slot — what the dissolved "Today's
+#: Routines" section used to hold. Rendered per-slot, only when that slot has
+#: any (an empty slot's routine block would be noise, and the section-level ILB
+#: sentinel already covers "nothing at all today").
+ROUTINES_SUBHEADER = "*Today's rhythm items:*"
+
+#: The section-level intentionally-left-blank line. Fires when the projection
+#: arranged NOTHING — no rows, no routines, no rollover. Distinguishable from a
+#: crash (no section at all) and from a quiet-but-live day (a slot renders its
+#: own empty line).
+PLAN_EMPTY_SENTINEL = (
+    "*(nothing on today's plan yet — no tasks due, no routines firing, and "
+    "nothing carried over)*"
+)
+
+#: Per-slot empty line. A slot with no rows is a real, reportable fact ("no
+#: Fuel today" is exactly the imbalance the board exists to show), so it is
+#: never silently omitted.
+SLOT_EMPTY_TEMPLATE = "*(nothing in {label} today)*"
 
 # Phase 2A Ship B (2026-05-29): routine-origin tier surfaces.
 #
@@ -376,75 +452,6 @@ def _wikilink_to_record_name(wikilink: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _render_t1_entry(
-    entry: T1T2Entry,
-    auto_t1_reason_by_name: dict[str, str],
-    auto_t1_reason_by_routine_key: dict[tuple[str, str], str],
-    auto_t1_due_iso_by_routine_key: dict[tuple[str, str], str],
-) -> str:
-    """Render one T1 line.
-
-    Origin discrimination:
-      * Task-origin (``entry.task`` populated) — renders as
-        ``- [[task/Name]] — due today  *(confirm)*``. Reason
-        lookup keyed on record name.
-      * Routine-origin (``entry.routine_item`` populated) — renders as
-        ``- <text> — due <date> (<reason>, from
-        [[routine/<record>]])  *(confirm)*`` when an auto-T1 candidate
-        matches (date + reason inline); otherwise
-        ``- <text> (from [[routine/<record>]])`` for operator-
-        added entries the auto layer doesn't know about.
-
-    Confirm-affordance logic (same for both origins):
-      * If ``confirmed is True`` → render bare (operator signed off).
-      * Else → append :data:`T1_CONFIRM_PROMPT` so the talker reply
-        pattern is visible.
-
-    Surface reason (``due today`` / ``due tomorrow`` / ``escalate
-    window ...``) comes from the auto-T1 candidate map when the entry
-    matches one; otherwise no reason annotation (operator manually
-    added a T1 entry that wasn't auto-surfaced).
-
-    Worked example (the canonical dispatch shape):
-      ``- Garbage Out — due Fri May 29 (escalate window (1d before
-      due), from [[routine/Weekly Chores]])  *(confirm? reply "T1 confirm")*``
-    """
-    # Routine-origin discrimination — exactly one of task / routine_item
-    # is populated per the T1T2Entry invariant.
-    if entry.routine_item is not None:
-        record = str(entry.routine_item.get("record", ""))
-        text = str(entry.routine_item.get("text", ""))
-        reason = auto_t1_reason_by_routine_key.get((record, text), "")
-        due_iso = auto_t1_due_iso_by_routine_key.get((record, text), "")
-        if reason and due_iso:
-            head = (
-                f"- {text} — due {_format_due_date(due_iso)} "
-                f"({reason}, from [[routine/{record}]])"
-            )
-        elif reason:
-            head = (
-                f"- {text} — {reason}, from [[routine/{record}]]"
-            )
-        else:
-            head = f"- {text} (from [[routine/{record}]])"
-    else:
-        # Task-origin path (the original Tier-V2 Ship 1 shape).
-        task_str = entry.task or ""
-        record_name = _wikilink_to_record_name(task_str) or ""
-        reason = auto_t1_reason_by_name.get(record_name, "")
-        if reason:
-            head = f"- {task_str} — {reason}"
-        else:
-            head = f"- {task_str}"
-
-    if entry.confirmed is True:
-        return head
-    # Auto-surfaced (confirmed=False) OR operator-added (confirmed=None)
-    # both get the confirm affordance — the prompt names the canonical
-    # talker-reply pattern.
-    return f"{head}  {T1_CONFIRM_PROMPT}"
-
-
 def _render_t2_entry(entry: T1T2Entry) -> str:
     """Render one curated T2 line — bare wikilink (or routine reference)
     with no confirm affordance.
@@ -458,37 +465,6 @@ def _render_t2_entry(entry: T1T2Entry) -> str:
         text = str(entry.routine_item.get("text", ""))
         return f"- {text} (from [[routine/{record}]])"
     return f"- {entry.task or ''}"
-
-
-def _render_auto_t2_routine_entry(candidate: Any) -> str:
-    """Render one auto-surfaced T2 routine candidate line.
-
-    ``candidate`` is an :class:`alfred.tier.compute.AutoT1Candidate`
-    with ``origin == "routine"``. Renders as:
-
-      ``- <text> — due <date> (<reason>, from
-      [[routine/<record>]])  *(reply "T2 confirm" to keep on today's
-      list)*``
-
-    matching the dispatch's worked example for the
-    :data:`T2_AUTO_ROUTINE_HEADER` subsection.
-
-    Phase 2A Ship B contract: this is the ONLY auto-surface in the
-    tier section that renders WITHOUT being merged into curated state.
-    The brief shows it; the operator confirms via talker; Ship D writes
-    the curation back via ``save_tier_curation``. Curation read-side
-    stability stays intact (this render is a pure projection of
-    compute-layer output).
-    """
-    record = candidate.routine_record or ""
-    text = candidate.item_text or candidate.name
-    reason = candidate.surface_reason
-    due_display = _format_due_date(candidate.due_iso)
-    return (
-        f"- {text} — due {due_display} "
-        f"({reason}, from [[routine/{record}]])"
-        f"  {T2_ROUTINE_CONFIRM_PROMPT}"
-    )
 
 
 def _render_t3_entry(entry: T3Entry, today_iso: str | None = None) -> str:
@@ -518,316 +494,6 @@ def _render_t3_entry(entry: T3Entry, today_iso: str | None = None) -> str:
     if done_at and (today_iso is None or done_at == today_iso):
         return f"- ~~{entry.item}~~ ✓"
     return f"- {entry.item}"
-
-
-def _render_auto_t3_routine_entry(candidate: Any) -> str:
-    """Render one auto-suggested T3 routine candidate line.
-
-    ``candidate`` is an :class:`alfred.tier.compute.AutoT3Candidate`.
-    Renders as:
-
-      ``- [[routine/<record>]] — <item> *(Nd days since last;
-      target every Md)*``
-
-    For never-completed items (``days_since_last_completed is None``)
-    the annotation uses :data:`T3_AUTO_DAYS_SINCE_NEVER_LABEL` instead
-    of an integer day count. Keeps the operator's eye drawn to the
-    "this has never been done" signal — distinct from "0 days since
-    last" which would imply "done today."
-
-    Phase 2A-soft-cadence contract: this is the auto-T3 sibling to
-    :func:`_render_auto_t2_routine_entry` (T2 ramp surface). The two
-    render paths share the wikilink shape but the annotation format
-    differs because the semantics differ (deadline-driven vs
-    cadence-driven). Per-candidate confirm prompt is NOT inlined per
-    item — instead, a single :data:`T3_AUTO_CONFIRM_PROMPT` line
-    fires once below the candidate list. Mirrors the T2-auto
-    subsection's prompt placement.
-    """
-    record = candidate.routine_record or ""
-    text = candidate.item_text or ""
-    target = candidate.target_cadence_days
-    days_since = candidate.days_since_last_completed
-    if days_since is None:
-        annotation = (
-            f"*({T3_AUTO_DAYS_SINCE_NEVER_LABEL}; "
-            f"target every {target}d)*"
-        )
-    else:
-        annotation = T3_AUTO_ANNOTATION_TEMPLATE.format(
-            days_since=days_since, target=target,
-        )
-    return (
-        f"- [[routine/{record}]] — {text} {annotation}"
-    )
-
-
-def _merge_auto_t1_into_curated(
-    curated_t1: list[T1T2Entry],
-    auto_t1_task_candidates: list[Any],     # list[AutoT1Candidate] origin=task
-    auto_t1_routine_candidates: list[Any],  # list[AutoT1Candidate] origin=routine
-) -> tuple[
-    list[T1T2Entry],
-    dict[str, str],
-    dict[tuple[str, str], str],
-    dict[tuple[str, str], str],
-]:
-    """Merge auto-T1 candidates (both task + routine origin) with
-    operator-curated T1 entries.
-
-    Returns ``(merged_t1, reason_by_name, reason_by_routine_key,
-    due_iso_by_routine_key)``:
-      * ``merged_t1`` — curated_t1 entries kept verbatim (operator
-        wins on the per-entry confirmed state). Auto-T1 task candidates
-        NOT already in curated_t1 are appended as ``confirmed=False``
-        entries with ``source="auto-due"``. Auto-T1 routine candidates
-        NOT already in curated_t1 are appended with
-        ``source="auto-due-routine"``.
-      * ``reason_by_name`` — map of task-record-name → canonical
-        surface reason string. Used by :func:`_render_t1_entry`'s
-        task-origin branch to inline the reason text.
-      * ``reason_by_routine_key`` — map of ``(record, text)`` tuple →
-        canonical surface reason string. Used by the routine-origin
-        branch.
-      * ``due_iso_by_routine_key`` — map of ``(record, text)`` tuple →
-        ISO due-date string. Used by the routine-origin branch to
-        inline the formatted due date per the dispatch worked example.
-
-    Dedup keys:
-      * Task-origin: record name (via wikilink parse).
-      * Routine-origin: ``(routine_record, item_text)`` tuple.
-
-    Cross-Ship contract: this merge is read-side only — the resulting
-    list reflects what the brief SHOULD show, not what the operator's
-    curation block contains. The persisted curation is left
-    untouched (Ship 4's talker writes confirmations back via
-    :func:`save_tier_curation`).
-    """
-    reason_by_name: dict[str, str] = {}
-    for cand in auto_t1_task_candidates:
-        reason_by_name[cand.name] = cand.surface_reason
-
-    reason_by_routine_key: dict[tuple[str, str], str] = {}
-    due_iso_by_routine_key: dict[tuple[str, str], str] = {}
-    for cand in auto_t1_routine_candidates:
-        # ``cand.routine_record`` + ``cand.item_text`` populated for
-        # routine-origin (Ship A contract). Defensive fallback to name
-        # for the item_text key in case a future variant omits it.
-        record = cand.routine_record or ""
-        text = cand.item_text or cand.name
-        key = (record, text)
-        reason_by_routine_key[key] = cand.surface_reason
-        due_iso_by_routine_key[key] = cand.due_iso
-
-    # Build dedup sets from curated entries — separate sets for task
-    # vs routine origin keep the discriminated-union clean.
-    curated_task_names: set[str] = set()
-    curated_routine_keys: set[tuple[str, str]] = set()
-    for entry in curated_t1:
-        if entry.routine_item is not None:
-            record = str(entry.routine_item.get("record", ""))
-            text = str(entry.routine_item.get("text", ""))
-            curated_routine_keys.add((record, text))
-        elif entry.task is not None:
-            rec_name = _wikilink_to_record_name(entry.task)
-            if rec_name:
-                curated_task_names.add(rec_name)
-
-    merged: list[T1T2Entry] = list(curated_t1)
-
-    # Task-origin auto-T1 candidates not yet curated.
-    for cand in auto_t1_task_candidates:
-        if cand.name in curated_task_names:
-            continue
-        wikilink = f"[[task/{cand.name}]]"
-        merged.append(T1T2Entry(
-            task=wikilink,
-            source="auto-due",
-            confirmed=False,
-        ))
-
-    # Routine-origin auto-T1 candidates not yet curated.
-    for cand in auto_t1_routine_candidates:
-        record = cand.routine_record or ""
-        text = cand.item_text or cand.name
-        if (record, text) in curated_routine_keys:
-            continue
-        merged.append(T1T2Entry(
-            routine_item={"record": record, "text": text},
-            source="auto-due-routine",
-            confirmed=False,
-        ))
-
-    return (
-        merged,
-        reason_by_name,
-        reason_by_routine_key,
-        due_iso_by_routine_key,
-    )
-
-
-def _render_curated_shortlists(
-    curation: DailyCuration | None,
-    auto_t1_task_candidates: list[Any],
-    auto_t1_routine_candidates: list[Any],
-    auto_t2_routine_candidates: list[Any],
-    auto_t3_routine_candidates: list[Any] | None = None,
-    today_iso: str | None = None,
-) -> str:
-    """Compose the three ``### T1 / T2 / T3`` subsections.
-
-    When curation is ``None`` (un-curated state — file missing or no
-    ``tier_curation`` block yet), we still surface auto-T1 candidates
-    + empty-bucket prompts so the operator's first brief of the day
-    is actionable.
-
-    Phase 2A Ship B (2026-05-29): T1 merges both task-origin AND
-    routine-origin auto candidates. T2 grows an
-    :data:`T2_AUTO_ROUTINE_HEADER` subsection BELOW the curated T2
-    bucket — auto-surfaced routine items that are inside their T2 ramp
-    window but the operator hasn't yet confirmed via talker.
-
-    Auto-T2-routine items dedup against curated T1 + T2: if the
-    operator has already curated the (record, text) into either tier,
-    suppress the auto-T2-routine render line (the curated entry
-    already covers it).
-
-    Phase 2A-soft-cadence (2026-05-30): T3 grows an
-    :data:`T3_AUTO_SECTION_HEADER` subsection BELOW the curated T3
-    entries — auto-suggested routine items overdue against their
-    soft cadence target. Empty auto-T3 with populated curated T3 →
-    auto subsection silently omitted (NOT polluted with "auto-
-    suggested: nothing" header). Empty curated T3 + empty auto-T3 →
-    existing :data:`T3_EMPTY_PROMPT` sentinel fires. Empty curated T3
-    + populated auto-T3 → subsection renders normally with NO
-    ``T3_EMPTY_PROMPT`` (the auto candidates fill the bucket).
-
-    Operator-axis ILB acknowledgement
-    (:data:`T3_AUTO_TALKER_DEFERRED_NOTE`) RETIRED 2026-05-30 when
-    Phase 2B B1 shipped the talker T3 confirm grammar + the
-    ``routine_done`` conversational completion tool. The deferred
-    note is no longer rendered in the auto-T3 subsection; the
-    constant is preserved for backwards-compat but the render loop
-    deliberately omits it. The auto-T3 subsection now emits only
-    the confirm prompt after the candidate list.
-    """
-    auto_t3_routine_candidates = auto_t3_routine_candidates or []
-    curated_t1: list[T1T2Entry] = curation.t1 if curation else []
-    curated_t2: list[T1T2Entry] = curation.t2 if curation else []
-    curated_t3: list[T3Entry] = curation.t3 if curation else []
-
-    (
-        merged_t1,
-        reason_by_name,
-        reason_by_routine_key,
-        due_iso_by_routine_key,
-    ) = _merge_auto_t1_into_curated(
-        curated_t1,
-        auto_t1_task_candidates,
-        auto_t1_routine_candidates,
-    )
-
-    # --- T1 -----------------------------------------------------------
-    t1_lines = [
-        "### T1 — Imminent deadlines (auto-surfaced — confirm or drop)",
-        "",
-    ]
-    if not merged_t1:
-        t1_lines.append("*(no T1 candidates today)*")
-        t1_lines.append("")
-    else:
-        for entry in merged_t1:
-            t1_lines.append(_render_t1_entry(
-                entry,
-                reason_by_name,
-                reason_by_routine_key,
-                due_iso_by_routine_key,
-            ))
-        t1_lines.append("")
-
-    # --- T2 -----------------------------------------------------------
-    t2_lines = ["### T2 — On the radar", ""]
-    if not curated_t2:
-        t2_lines.append(T2_EMPTY_PROMPT)
-        t2_lines.append("")
-    else:
-        for entry in curated_t2:
-            t2_lines.append(_render_t2_entry(entry))
-        t2_lines.append("")
-
-    # Auto-surfaced T2-routine subsection — dedup against curated T1
-    # (operator may have confirmed already at T1) + curated T2.
-    curated_routine_keys: set[tuple[str, str]] = set()
-    for entry in curated_t1 + curated_t2:
-        if entry.routine_item is not None:
-            curated_routine_keys.add((
-                str(entry.routine_item.get("record", "")),
-                str(entry.routine_item.get("text", "")),
-            ))
-    visible_auto_t2: list[Any] = []
-    for cand in auto_t2_routine_candidates:
-        record = cand.routine_record or ""
-        text = cand.item_text or cand.name
-        if (record, text) in curated_routine_keys:
-            continue
-        visible_auto_t2.append(cand)
-
-    if visible_auto_t2:
-        t2_lines.append(T2_AUTO_ROUTINE_HEADER)
-        t2_lines.append("")
-        for cand in visible_auto_t2:
-            t2_lines.append(_render_auto_t2_routine_entry(cand))
-        t2_lines.append("")
-
-    # --- T3 -----------------------------------------------------------
-    # Phase 2A-soft-cadence (2026-05-30): T3 bucket now has two
-    # populating sources — curated entries (operator-added) and
-    # auto-T3 candidates (overdue against soft cadence). The empty-
-    # state contract distinguishes three cases:
-    #
-    #   Case A: curated T3 populated + auto-T3 empty
-    #     → curated entries + NO auto subsection (silent omission;
-    #     a "auto-suggested: nothing" header would be noise).
-    #
-    #   Case B: curated T3 empty + auto-T3 populated
-    #     → auto subsection ONLY (no T3_EMPTY_PROMPT — the auto
-    #     candidates fill the bucket).
-    #
-    #   Case C: curated T3 empty + auto-T3 empty
-    #     → T3_EMPTY_PROMPT sentinel (existing behavior preserved).
-    #
-    #   Case D: curated T3 populated + auto-T3 populated
-    #     → curated entries FIRST, then auto subsection BELOW.
-    t3_lines = ["### T3 — Self-care for today", ""]
-    has_curated_t3 = bool(curated_t3)
-    has_auto_t3 = bool(auto_t3_routine_candidates)
-    if has_curated_t3:
-        for entry in curated_t3:
-            t3_lines.append(_render_t3_entry(entry, today_iso))
-        t3_lines.append("")
-    if has_auto_t3:
-        t3_lines.append(T3_AUTO_SECTION_HEADER)
-        t3_lines.append("")
-        for cand in auto_t3_routine_candidates:
-            t3_lines.append(_render_auto_t3_routine_entry(cand))
-        t3_lines.append("")
-        t3_lines.append(T3_AUTO_CONFIRM_PROMPT)
-        t3_lines.append("")
-        # ILB acknowledgement RETIRED 2026-05-30 — Phase 2B B1 ships
-        # the talker T3 confirm grammar + the conversational
-        # completion path (``routine_done`` tool). The deferred-note
-        # line is no longer accurate; rendering it would be stale
-        # operator-facing copy. The constant
-        # ``T3_AUTO_TALKER_DEFERRED_NOTE`` is preserved for backwards-
-        # compat with any downstream consumer that may have grepped
-        # for it, but the render loop deliberately doesn't emit it.
-        # See ``project_routine_followups.md`` Phase 2B B1 handoff
-        # note for the contract retirement.
-    if not has_curated_t3 and not has_auto_t3:
-        t3_lines.append(T3_EMPTY_PROMPT)
-        t3_lines.append("")
-
-    return "\n".join(t1_lines + t2_lines + t3_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -928,89 +594,290 @@ def _build_status_lookup(
     return lookup
 
 
-def _render_rollover_section(
+def compute_rollover(
     yesterday_curation: DailyCuration | None,
     status_by_name: dict[str, str],
-) -> str:
-    """Compose the ``### Rollover from yesterday (incomplete)`` subsection.
+) -> list[RolloverRef] | None:
+    """THE server rollover: yesterday's commitments that are still open today.
 
-    Logic:
-      * If ``yesterday_curation`` is ``None`` (no yesterday daily file
-        OR no ``tier_curation`` block) → return empty string (the
-        section is suppressed entirely — rollover is opt-in by data
-        existence, not unconditional like the curated shortlists).
-      * Walk yesterday's T1 + T2 entries. For each:
-          - Parse the wikilink to a record name.
-          - Look up the current status.
-          - If status is missing OR in OPEN_STATUSES → incomplete,
-            surface in rollover.
-          - Otherwise (done/cancelled today) → completed, skip.
+    Factored out of the old ``_render_rollover_section`` so the day-plan
+    projection can consume the same computation the brief has always used,
+    rather than a second definition of "carried over". The word has two correct
+    meanings on two surfaces — see ``tier/day_plan.py``'s module docstring for
+    why the board's ``boardIsCarryover`` is a DIFFERENT and equally right rule,
+    and why neither should be made to swallow the other.
 
-    T3 is NOT included in rollover per dispatch — T3 is today's
-    intentions, picked fresh each day.
-
-    Empty-rollover path (yesterday had a block, but everything was
-    completed) → surface the header + sentinel rather than suppress,
-    so the operator can distinguish "no yesterday file" (suppressed)
-    from "yesterday tracked, all done" (header + sentinel).
+    Logic (unchanged from the renderer this replaces):
+      * ``yesterday_curation is None`` (no yesterday daily file OR no
+        ``tier_curation`` block) → return ``None``. Rollover is opt-in by data
+        existence, so "we have no idea" is a distinct answer from "we looked
+        and everything was finished" (``[]``). The render keeps that
+        distinction visible; collapsing the two to ``[]`` here would destroy it
+        before the render could.
+      * Walk yesterday's T1 + T2 entries: parse the wikilink to a record name,
+        look up the current status, and treat MISSING or open as incomplete
+        (missing = the task may have been moved or deleted, which the operator
+        wants flagged rather than silently dropped).
+      * Routine-origin entries never roll over — the next cycle resolves them
+        through the routine's own ``due_pattern``.
+      * T3 is deliberately excluded: self-care intentions are picked fresh each
+        day, so "you didn't do yesterday's" is the wrong thing to say about one.
     """
     if yesterday_curation is None:
-        # Section suppressed entirely. Per intentionally-left-blank,
-        # we DO emit a log signal so the operator can grep the brief
-        # log for "did rollover run?" — the suppression here is
-        # render-level only.
+        # Per intentionally-left-blank we still emit the signal, so the
+        # operator can grep the brief log for "did rollover run?" — the
+        # absence here is a data fact, not a skipped step.
         log.info(
             "brief.tier_section.rollover_suppressed_no_yesterday",
             detail=(
                 "yesterday's daily file is absent or has no "
-                "tier_curation block; rollover section omitted."
+                "tier_curation block; rollover material unavailable."
             ),
         )
+        return None
+
+    refs: list[RolloverRef] = []
+    for tier_label, entries in (("T1", yesterday_curation.t1), ("T2", yesterday_curation.t2)):
+        for entry in entries:
+            if entry.routine_item is not None:
+                continue
+            if entry.task is None:
+                continue
+            rec_name = _wikilink_to_record_name(entry.task)
+            if rec_name is None:
+                continue
+            status = status_by_name.get(rec_name)
+            if status is None or status in OPEN_STATUSES:
+                refs.append(RolloverRef(
+                    tier_label=tier_label,
+                    wikilink=entry.task,
+                    record_name=rec_name,
+                ))
+    return refs
+
+
+# ---------------------------------------------------------------------------
+# The day-plan render — §3 as the board's morning projection
+# ---------------------------------------------------------------------------
+
+
+def _row_head(row: PlanRow) -> str:
+    """The identifying half of a plan row: what the item IS and where it lives.
+
+    Preserves the information the per-tier renderers carried before the slot
+    regroup — the task wikilink, or the routine item's text plus a link to its
+    owning routine record — so nothing an operator could previously click or
+    grep for went away in the rearrangement.
+    """
+    entry = row.entry
+    record = getattr(entry, "routine_record", None)
+    if getattr(entry, "origin", "") == "routine_item" and record:
+        text = getattr(entry, "item_text", None) or entry.name
+        return f"{text} (from [[routine/{record}]])"
+    if getattr(entry, "origin", "") == "task":
+        return f"[[task/{entry.name}]]"
+    return entry.name
+
+
+def _row_annotation(row: PlanRow) -> str:
+    """The WHY of a row — surface reason, due date, or cadence gap.
+
+    One annotation per row, in precedence order, because a row carrying three
+    of them reads as noise on a surface whose whole promise is a 30-second
+    morning. Cadence rows keep the "never done" wording rather than "0 days
+    since last", which would read as done-today.
+    """
+    entry = row.entry
+    reason = getattr(entry, "surface_reason", None) or ""
+    due_iso = getattr(entry, "due_iso", None) or ""
+    target = getattr(entry, "target_cadence_days", None)
+    if reason and due_iso:
+        return f"— due {_format_due_date(due_iso)} ({reason})"
+    if reason:
+        return f"— {reason}"
+    if due_iso:
+        return f"— due {_format_due_date(due_iso)}"
+    if target is not None:
+        days_since = getattr(entry, "days_since_last_completed", None)
+        if days_since is None:
+            return f"*({T3_AUTO_DAYS_SINCE_NEVER_LABEL}; target every {target}d)*"
+        return T3_AUTO_ANNOTATION_TEMPLATE.format(
+            days_since=days_since, target=target,
+        )
+    return ""
+
+
+def _row_affordance(row: PlanRow) -> str:
+    """The reply affordance for a row, or empty.
+
+    These strings are the talker's stable verbatim contract (the SKILL quotes
+    them), so the regroup RELOCATES them and never rewords them. Which one
+    fires is unchanged: an unconfirmed T1 gets the T1 confirm prompt, an
+    auto-surfaced T2 routine candidate gets the T2 one. A committed row gets
+    nothing — the commitment already happened.
+    """
+    entry = row.entry
+    if not row.candidate:
         return ""
+    if row.tier == 1:
+        return T1_CONFIRM_PROMPT
+    if row.tier == 2 and getattr(entry, "origin", "") == "routine_item":
+        return T2_ROUTINE_CONFIRM_PROMPT
+    if row.tier == 3 and getattr(entry, "target_cadence_days", None) is not None:
+        return T3_AUTO_CONFIRM_PROMPT
+    return ""
 
-    incomplete: list[tuple[str, str]] = []  # (tier_label, wikilink)
-    for entry in yesterday_curation.t1:
-        # Phase 2A Ship B: routine-origin entries don't roll over —
-        # the next cycle resolves naturally via the routine's
-        # due_pattern. Skip them silently (the routine's compute
-        # surface will re-fire next morning if still due).
-        if entry.routine_item is not None:
-            continue
-        if entry.task is None:
-            continue
-        rec_name = _wikilink_to_record_name(entry.task)
-        if rec_name is None:
-            continue
-        status = status_by_name.get(rec_name)
-        # Missing OR open → incomplete (treat missing as "task may have
-        # been moved/deleted; flag to operator").
-        if status is None or status in OPEN_STATUSES:
-            incomplete.append(("T1", entry.task))
-    for entry in yesterday_curation.t2:
-        if entry.routine_item is not None:
-            continue
-        if entry.task is None:
-            continue
-        rec_name = _wikilink_to_record_name(entry.task)
-        if rec_name is None:
-            continue
-        status = status_by_name.get(rec_name)
-        if status is None or status in OPEN_STATUSES:
-            incomplete.append(("T2", entry.task))
 
+def _render_plan_row(row: PlanRow) -> str:
+    """Render one row of a slot stack.
+
+    Shape: ``- [T1] <what it is> <why> <affordance> <carryover marker>``.
+
+    The ``[Tn]`` tag is load-bearing, not decoration. The board ARRANGES by
+    slot while the daily goal MEASURES by tier, so a reader looking at a Duty
+    stack still has to be able to see which of those rows the balanced-day line
+    is counting. Dropping the tag is how the arrangement quietly becomes the
+    target — see ``tier/day_plan.py``'s constraint.
+
+    A row completed today renders struck-through with a ✓ and KEEPS its place:
+    the morning brief is a snapshot of the day, and progress is part of it.
+    """
+    head = _row_head(row)
+    if row.done:
+        head = f"~~{head}~~ ✓"
+    parts = [f"- [T{row.tier}]", head]
+    annotation = _row_annotation(row)
+    if annotation:
+        parts.append(annotation)
+    affordance = _row_affordance(row)
+    if affordance:
+        parts.append(f" {affordance}")
+    if row.carryover:
+        parts.append(f" {CARRYOVER_MARKER}")
+    return " ".join(p for p in parts if p).rstrip()
+
+
+def _render_routine_line(line: Any) -> str:
+    """Render one habit anchor inside its slot (the dissolved §4).
+
+    Byte-compatible with what the standalone routines section showed per item —
+    text, an ``@ HH:MM`` for timed critical items, and the cadence annotation —
+    so the dissolution moved the lines without rewriting them.
+    """
+    text = getattr(line, "text", "") or ""
+    out = f"- {text}"
+    time_str = getattr(line, "time", "") or ""
+    if getattr(line, "priority", "") == "critical" and time_str:
+        out += f" @ {time_str}"
+    annotation = getattr(line, "annotation", "") or ""
+    if annotation:
+        out += f" {annotation}"
+    return out
+
+
+def _render_slot_group(group: SlotGroup) -> list[str]:
+    """Render one slot's stack: header, then carryover → committed →
+    suggestions → habit anchors, in that order.
+
+    An empty slot still renders its header and an explicit empty line. "No Fuel
+    today" is precisely the signal a balance board exists to surface; omitting
+    the header would make an unbalanced day look like a shorter one.
+    """
+    out = [f"### {group.label}", ""]
+    if group.is_empty:
+        out.append(SLOT_EMPTY_TEMPLATE.format(label=group.label))
+        out.append("")
+        return out
+    for row in group.rows:
+        out.append(_render_plan_row(row))
+    if group.routines:
+        if group.rows:
+            out.append("")
+        out.append(ROUTINES_SUBHEADER)
+        out.append("")
+        for line in group.routines:
+            out.append(_render_routine_line(line))
+    out.append("")
+    return out
+
+
+def _render_unplaced_carryover(
+    plan: DayPlan, rollover: list[RolloverRef] | None,
+) -> list[str]:
+    """Render the rollover remainder under :data:`ROLLOVER_HEADER`.
+
+    Three distinct states, all of which the operator can tell apart — the
+    distinction the section this replaces was careful to preserve, carried
+    forward verbatim:
+
+      * ``rollover is None`` — no yesterday file / no curation block. We do not
+        KNOW what was carried, so the block is suppressed entirely (the log
+        line above records that it ran).
+      * ``rollover == []`` — we looked, and yesterday's commitments are all
+        finished. Header plus the "all completed" sentinel, so "all clear" is
+        never rendered as "no data".
+      * everything on today's board already — every carried item is marked
+        inline in its slot, so there is nothing left to list here; say that
+        rather than falling through to a silent absence.
+    """
+    if rollover is None:
+        return []
     out = [ROLLOVER_HEADER, ""]
-    if not incomplete:
+    if not rollover:
         out.append(
             "*(yesterday's tracked items all completed — nothing to "
             "roll over)*"
         )
         out.append("")
-        return "\n".join(out)
-    for tier_label, wikilink in incomplete:
+        return out
+    if not plan.unplaced_carryover:
         out.append(
-            f"- {tier_label}: {wikilink} *(uncompleted yesterday)*"
+            "*(everything carried over is on today's plan above, marked "
+            "where it sits)*"
+        )
+        out.append("")
+        return out
+    for ref in plan.unplaced_carryover:
+        out.append(
+            f"- {ref.tier_label}: {ref.wikilink} *(uncompleted yesterday)*"
         )
     out.append("")
+    return out
+
+
+def _render_day_plan(
+    plan: DayPlan, rollover: list[RolloverRef] | None,
+) -> str:
+    """Compose the whole slot-grouped plan body.
+
+    ARRANGEMENT ONLY. This function groups the day by slot; it does not compute
+    or claim any goal. The balanced-day line is rendered separately by
+    :func:`render_daily_goal_line` off ``DailyGoalState``, which is tier-based —
+    see ``tier/day_plan.py``: no copy anywhere may claim a slot-based goal while
+    the metric is tier-based.
+    """
+    out: list[str] = []
+    if plan.is_empty:
+        out.append(PLAN_EMPTY_SENTINEL)
+        out.append("")
+    else:
+        for group in plan.groups:
+            out.extend(_render_slot_group(group))
+    out.extend(_render_unplaced_carryover(plan, rollover))
+
+    # Empty-bucket reply affordances. These strings fire under exactly the
+    # condition they always did — the tier lane is empty — and are preserved
+    # verbatim because the talker SKILL quotes them as stable contracts. They
+    # sit here rather than inside a slot because they are about a TIER being
+    # empty, and tiers no longer have their own headers to be empty under.
+    prompts: list[str] = []
+    if not plan.rows_in_tier(2):
+        prompts.append(T2_EMPTY_PROMPT)
+    if not plan.rows_in_tier(3):
+        prompts.append(T3_EMPTY_PROMPT)
+    if prompts:
+        out.extend(prompts)
+        out.append("")
     return "\n".join(out)
 
 
@@ -1170,7 +1037,8 @@ def render_tier_section(
     now: datetime,
     tier_defaults: Any = None,
 ) -> str:
-    """Render the brief's ``Open Tasks by Tier`` section body (V2).
+    """Render the brief's ``Today's Plan`` section body — the board's morning
+    projection (V2; slot-grouped since Phase C).
 
     ``now`` is the reference instant — passed by the brief daemon at
     fire time + by ``/today`` at request time. ``now.date()`` is "today"
@@ -1245,14 +1113,17 @@ def render_tier_section(
                     curated_t2_names.add(n)
 
     # --- 5. Compose render --------------------------------------------
-    shortlists = _render_curated_shortlists(
-        curation,
-        auto_t1_task_candidates,
-        auto_t1_routine_candidates,
-        auto_t2_routine_candidates,
-        auto_t3_routine_candidates,
-        today_iso=today.isoformat(),  # #20 P5 NOTE-2: ✓-strike done T3 only on the rendered day
+    # Phase C: the section is the board's MORNING PROJECTION — one shared slot
+    # projection, grouped Duty / Rhythm / Fuel, carryover-first, with the
+    # dissolved routines section's habit anchors inside their slot. The same
+    # ``DayPlan`` object drives the briefing player's spoken day-plan segment,
+    # so the read surface and the spoken surface cannot disagree about what is
+    # on today's plan.
+    rollover = compute_rollover(yesterday_curation, status_by_name)
+    plan = build_day_plan_for_vault(
+        vault_path, today_view, today, rollover=rollover or (),
     )
+    day_plan_md = _render_day_plan(plan, rollover)
     # Snoozed rows must not reappear in the pool. The pool is a RENDER-ONLY
     # material computed here, not sliced from today_view, so the projection's
     # suppression does not reach it — a snoozed task dropped out of T1 and
@@ -1286,20 +1157,20 @@ def render_tier_section(
         curated_t2_names,
         snoozed_names=_snoozed_task_names,
     )
-    rollover = _render_rollover_section(yesterday_curation, status_by_name)
-
     # Daily-goal status line (Q4, 2026-06-26). Read from the SAME
     # ``today_view`` computed once at the top — no second compute. The
-    # line renders first so the tier view is framed around the
-    # balanced-day goal, not just three buckets.
+    # line renders first so the day is framed around the balanced-day goal.
+    #
+    # It is TIER-based and stays that way in this lane: the slot regroup below
+    # it is an ARRANGEMENT of the same rows, not a new target. Flipping the
+    # metric to the slot axis is a separate, separately-gated lane; until it
+    # lands, this line and the stacks under it are deliberately on different
+    # axes, and the ``[Tn]`` tag on each row is what keeps that legible.
     goal_line = render_daily_goal_line(today_view.daily_goal)
 
-    # Compose: goal line first, then shortlists, separator, pool, and
-    # (optional) rollover. Rollover is appended only when non-empty
-    # (suppressed when yesterday's file is absent).
-    parts = [goal_line, "", shortlists, "---", "", pool]
-    if rollover:
-        parts.append(rollover)
+    # Compose: goal line, the slot-grouped plan (incl. rollover remainder),
+    # separator, selection pool.
+    parts = [goal_line, "", day_plan_md, "---", "", pool]
 
     body = "\n".join(parts)
 
@@ -1318,7 +1189,19 @@ def render_tier_section(
         # test asserts this field is present in the log when
         # candidates exist, AND when bucket is empty.
         auto_t3_routine_count=len(auto_t3_routine_candidates),
+        # ``rollover_present`` now means "yesterday's block existed AND held
+        # something still open" — the tri-state (None / [] / non-empty) that
+        # ``compute_rollover`` returns, flattened for the log. The suppressed
+        # case keeps its own dedicated event above.
         rollover_present=bool(rollover),
+        rollover_count=len(rollover) if rollover is not None else 0,
+        # Phase C: how the day actually arranged, pinned per
+        # ``feedback_log_emission_test_pattern`` — a slot board that silently
+        # stopped grouping would otherwise be invisible in the logs.
+        plan_rows=plan.total_rows,
+        plan_carryover=sum(len(g.carryover) for g in plan.groups),
+        plan_unplaced_carryover=len(plan.unplaced_carryover),
+        plan_slots_occupied=[g.slot for g in plan.groups if not g.is_empty],
         yesterday_curation_loaded=yesterday_curation is not None,
         # Step 2c (2026-06-26): the daily-goal rollup, surfaced from the
         # unified compute_today_view, pinned per
