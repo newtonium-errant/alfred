@@ -60,9 +60,9 @@ def _contents(result) -> LedgerContents:
 def test_the_whole_fixture_parses_without_losses(parsed):
     assert parsed.ok
     assert parsed.skipped == []
-    assert len(parsed.claim_lines) == 5
-    assert len(parsed.subtotals) == 4
-    assert len(parsed.statements) == 2
+    assert len(parsed.claim_lines) == 10
+    assert len(parsed.subtotals) == 6
+    assert len(parsed.statements) == 3
 
 
 # --- shape 1: bolded aggregates ----------------------------------------------
@@ -115,7 +115,7 @@ def test_bolded_labels_are_unbolded_too(parsed):
     report's per-claimant cross-foot silently degrades to a statement-level
     fallback — fixed amount, broken check."""
     assert {s.surname for s in parsed.subtotals} == {
-        "Aldenshaw", "Brightwater", "Corvallis", "Dunmoor",
+        "Aldenshaw", "Brightwater", "Corvallis", "Dunmoor", "Everly", "Falkirk",
     }
     assert all("*" not in (s.surname or "") for s in parsed.subtotals)
 
@@ -315,3 +315,168 @@ def test_the_reversal_still_classifies(parsed):
     outcome for the operator."""
     report = build_report(_contents(parsed), generated_at="FIXED")
     assert report.class_counts.get(CLASS_REVERSAL) == 1
+
+
+# --- the marker-boundary continuation: two mechanisms, one outcome ------------
+#
+# The real continuation resumes immediately after an END_INFERRED /
+# BEGIN_INFERRED pair. Whether a blank line surrounds that pair decides WHICH
+# mechanism carries the rows, and the two are invisible from the outside:
+#
+#   no blank line -> the table never closes; rows arrive as ordinary data rows
+#   blank line    -> the table closes; the continuation branch inherits
+#
+# Both are pinned. "It parses" and "it parses for the reason I think" are
+# different claims, and only the second survives someone refactoring the
+# marker handling.
+
+_HDR = (
+    "| Claim # | Date of Service | Surname | First Name | Benefit Code | "
+    "Units | Total Billed | Amt Excluded | Deduct | Amt Eligible | % PD | "
+    "Amount Paid | EOB | Comments |"
+)
+_SEP = "| --- " * 14 + "|"
+_ROW_A = (
+    "| 00000101 | 23 Feb 2026 | Aldenshaw | Marisol | 700409 | 2 | 100.00 | "
+    "0.00 | 0.00 | 100.00 | 100 | 100.00 | — | Invoice #501 |"
+)
+_ROW_B = (
+    "| 00000197 | 24 Feb 2026 | Brightwater | Tomas | 700409 | 2 | 200.00 | "
+    "0.00 | 0.00 | 200.00 | 100 | 200.00 | — | Invoice #502 |"
+)
+_MARKERS = (
+    '<!-- END_INFERRED marker_id="inf-20260812-fixture-aa11bb" -->\n'
+    '<!-- BEGIN_INFERRED marker_id="inf-20260812-fixture-cc22dd" -->'
+)
+
+
+def _marker_boundary_note(gap: str) -> str:
+    return (
+        "## Statement — 26 Feb 2026\n\n**Statement Date:** 2026-02-26\n\n"
+        + _HDR + "\n" + _SEP + "\n" + _ROW_A + "\n"
+        + gap + _MARKERS + "\n" + gap + _ROW_B + "\n"
+    )
+
+
+@pytest.mark.parametrize("gap,label", [("", "no blank line"), ("\n", "blank line")])
+def test_rows_after_a_marker_pair_survive_either_way(gap, label):
+    """The outcome that must hold regardless of mechanism: no lost rows."""
+    result = parse_note(_marker_boundary_note(gap))
+    assert result.ok, label
+    assert [c.claim_no for c in result.claim_lines] == ["00000101", "00000197"]
+    assert result.claim_lines[1].amount_paid == Decimal("200.00")
+
+
+def test_without_a_blank_line_the_table_simply_stays_open():
+    """No continuation is logged, because none happened — the markers are
+    comment lines inside a table that never closed."""
+    with structlog.testing.capture_logs() as captured:
+        result = parse_note(_marker_boundary_note(""))
+    events = [
+        c for c in captured
+        if c.get("event") == "reconcile.parser.continuation_table"
+    ]
+    assert events == []
+    assert result.continuations == []
+    assert len(result.claim_lines) == 2
+
+
+def test_with_a_blank_line_the_continuation_branch_carries_the_rows():
+    """The other mechanism, same outcome — and here it IS logged, with
+    ``same_statement`` true because the marker pair is not a heading."""
+    with structlog.testing.capture_logs() as captured:
+        result = parse_note(_marker_boundary_note("\n"))
+    events = [
+        c for c in captured
+        if c.get("event") == "reconcile.parser.continuation_table"
+    ]
+    assert len(events) == 1
+    assert events[0]["same_statement"] is True
+    assert result.continuations != []
+    assert len(result.claim_lines) == 2
+
+
+def test_rows_after_begin_inferred_are_flagged_inferred():
+    """The marker pair is a capture-batch boundary, so what follows is a
+    different batch's provenance. Its positive control is in the same
+    assertion: the row BEFORE the pair must stay un-inferred."""
+    result = parse_note(_marker_boundary_note("\n"))
+    assert [c.inferred for c in result.claim_lines] == [False, True]
+
+
+# --- the bonus shapes from the same block -------------------------------------
+
+
+def test_a_claim_cell_with_a_parenthetical_is_its_own_claim_number(parsed):
+    """``00000301 (Ambulance Claims)``, bare ``(Ambulance Claims)`` and plain
+    ``00000301`` are THREE claim numbers, hence three ledger keys.
+
+    That is a decision, not an accident: the cell is what the statement says,
+    and normalising the parenthetical away would merge rows the provider
+    deliberately kept apart — silently, and in the direction that loses one.
+    """
+    july = [c for c in parsed.claim_lines if c.statement_date == "2026-07-30"]
+    numbers = [c.claim_no for c in july]
+    assert "00000301 (Ambulance Claims)" in numbers
+    assert "(Ambulance Claims)" in numbers
+    assert "00000301" in numbers
+    assert len({c.key for c in july}) == len(july)
+
+
+def test_multiple_ogst_rows_for_one_claimant_stay_distinct(parsed):
+    """A second, independent shape exercising the occurrence tiebreak: two
+    OGST rows share the ENTIRE ratified four-tuple and differ only in
+    amount. Without the tiebreak the larger silently overwrites the smaller.
+    """
+    ogst = [
+        c for c in parsed.claim_lines
+        if c.benefit_code == "OGST" and c.statement_date == "2026-07-30"
+    ]
+    assert len(ogst) == 2
+    assert {c.occurrence for c in ogst} == {0, 1}
+    assert {c.amount_paid for c in ogst} == {Decimal("20.00"), Decimal("10.00")}
+    assert len({c.key for c in ogst}) == 2
+
+
+def test_the_ogst_collision_is_reported(parsed):
+    """Same rule as the ambulance pair: a key that had to disambiguate is
+    never a silent event."""
+    assert len(parsed.collisions) == 1
+
+
+def test_an_invoice_reference_with_a_trailing_stop_is_read(parsed):
+    """``Invoice #197.`` — the whole comment, full stop included."""
+    row = [
+        c for c in parsed.claim_lines
+        if c.eob_code == "EOB-02" and c.statement_date == "2026-07-30"
+    ]
+    assert len(row) == 1
+    assert row[0].invoice_no == "197"
+
+
+def test_the_eob_coded_row_fails_open(parsed):
+    """``EOB-02`` is unmapped, so it surfaces. The positive control is the
+    neighbouring OGST row with no code, which stays clean."""
+    report = build_report(_contents(parsed), generated_at="FIXED")
+    from alfred.reconcile.attention import CLASS_UNKNOWN_EOB
+
+    assert report.class_counts.get(CLASS_UNKNOWN_EOB) == 2
+    clean = [
+        c for c in parsed.claim_lines
+        if c.benefit_code == "OGST" and not c.eob_code
+    ]
+    assert clean
+
+
+def test_the_third_statement_cross_foots(parsed):
+    """All the bonus shapes at once, arithmetically. If the parenthetical
+    claim numbers or the duplicate OGST rows were being merged, this sum
+    would come up short and the subtotals would disagree."""
+    report = build_report(_contents(parsed), generated_at="FIXED")
+    july = [
+        t for t in report.statement_totals
+        if t.statement.statement_date == "2026-07-30"
+    ][0]
+    assert july.paid == Decimal("930.00")
+    assert july.subtotals_checked == 2
+    assert july.subtotal_mismatches == []
