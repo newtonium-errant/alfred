@@ -42,13 +42,15 @@ on purpose. Shape C is "undated blocks fold WITH EACH OTHER", so a single
 orphan cannot test it: with one undated block, "exactly one undated block
 survives" is true whether the rule works or not. The first draft of this
 fixture had exactly one, and the mutation that reverts to the old
-compatibility-only rule scored 1 red instead of the 8 it scores now — the
+compatibility-only rule scored 1 red instead of the 7 it scores now — the
 pin was nearly vacuous, and only running the mutation showed it. Two
 orphans, neither identifying the other, must stay two.
 
 ARITHMETIC, run not reasoned: statement one pays 1,200.00 (700 + 500) across
-its own block and its Page 2; statement two pays 800.00. The orphan block
-pays 300.00 and reconciles against nothing, which is the finding.
+its own block and its Page 2 — its two reversal rows (-1,700 and -3,400) are
+carried as attention, not as payment. Statement two pays 800.00. The TWO
+orphan blocks pay 300.00 and 400.00, each reconciling against nothing, which
+is the finding — and there are two of them for the reason given above.
 -->
 
 <!-- BEGIN_INFERRED marker_id="inf-20260812-fixture-11aa22" -->

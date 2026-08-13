@@ -184,5 +184,5 @@ def test_format_money_renders_absent_as_a_dash_that_reparses_as_absent():
 
 
 def test_format_money_round_trips_a_negative():
-    value = Decimal("-27444.00")
+    value = Decimal("-31285.00")
     assert parse_money(format_money(value)) == value

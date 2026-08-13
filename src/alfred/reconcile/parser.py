@@ -325,7 +325,7 @@ def is_table_row(line: str) -> bool:
 
 
 def parse_invoice_no(comments: str) -> str:
-    """Extract ``Invoice #163`` -> ``"163"`` from a comments cell.
+    """Extract ``Invoice #487`` -> ``"487"`` from a comments cell.
 
     Returns ``""`` when the cell names no invoice. Only the FIRST match is
     taken: a comment mentioning two invoices is genuinely ambiguous about
@@ -874,6 +874,17 @@ def parse_note(
             if found:
                 stmt.statement_date = found
                 stmt.date_source = DATE_SOURCE_HEADER
+                # WARN-1: the buffer is consumed when USED, but it must also
+                # be consumed when OVERRIDDEN. A batch label describes the
+                # block it precedes; once that block takes a printed date the
+                # label has done its job, and leaving it set lets a LATER
+                # undated block inherit it as capture_metadata — re-homing an
+                # orphan out of the pool and suppressing the very finding
+                # this lane added. The failure needs three blocks in order
+                # (comment, dated statement, orphan), which is why the
+                # use-path pin could not see it: that pin varies "was it
+                # used", and this bug lives on "was it never used".
+                pending_capture_date = ""
             elif pending_capture_date and not stmt.page_continuation:
                 # No printed date. Fall back to the scan batch's own label,
                 # recorded as the WEAKER provenance it is. Page continuations

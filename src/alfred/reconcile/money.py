@@ -360,7 +360,7 @@ def _build_date(
 
 
 def format_money(value: Decimal | None) -> str:
-    """Render a Decimal for display: ``-27444.00`` -> ``-27,444.00``.
+    """Render a Decimal for display: ``-31285.00`` -> ``-31,285.00``.
 
     ``None`` renders as an em-dash rather than ``0.00`` — the display has
     the same duty as the parser to keep "absent" distinct from "zero".
