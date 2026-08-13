@@ -33,6 +33,7 @@ import pytest
 import structlog
 from aiohttp import web
 
+from alfred.common import rrts_export as rrts_export_module
 from alfred.telegram import daemon as telegram_daemon
 from alfred.transport import server as transport_server
 from alfred.transport.config import (
@@ -219,6 +220,17 @@ def test_the_skip_log_is_emitted_at_INFO() -> None:
 # before any reader code can spell it. A second spelling is how a writer and a
 # reader land on different files while both look correct, and the failure is
 # silent and total: the snapshot arrives where nothing looks for it.
+#
+# THE HOME MOVED ONCE MORE when the reader was actually built, and the reason
+# is worth keeping. The first lift put the segment in ``routes_rrts`` — correct
+# while the receiver was the only end. But ``routes_rrts`` imports aiohttp,
+# which is the OPTIONAL ``voice`` extra, and the reader is the reconciler,
+# which is base-install. A base-install reader importing the writer's module
+# to learn its own input path is a crash; spelling the segment itself is the
+# duplication this pin exists to forbid. So the fact moved to a
+# dependency-free module both tiers can import, and the writer re-exports it
+# for its existing callers. One END existed, so one resolution existed — the
+# same lesson, one layer out.
 
 
 def test_the_segment_is_spelled_in_exactly_one_place() -> None:
@@ -228,6 +240,8 @@ def test_the_segment_is_spelled_in_exactly_one_place() -> None:
     day they were written and diverge later — which is precisely why this
     asserts on the source rather than on a resolved path.
     """
+    from alfred.common import rrts_export
+    from alfred.reconcile import config as reconcile_config
     from alfred.transport import routes_rrts
 
     # BARE substring, not the quoted form. The first version of this pin
@@ -240,8 +254,16 @@ def test_the_segment_is_spelled_in_exactly_one_place() -> None:
     # occurrence in total": the home file names it in the constant AND in
     # the docstrings that explain it, and counting those would make the pin
     # fail on prose.
-    home = Path(routes_rrts.__file__)
-    others = [Path(transport_server.__file__), Path(telegram_daemon.__file__)]
+    home = Path(rrts_export.__file__)
+    # BOTH ends are now covered, which is the point of the move: the writer
+    # (routes_rrts) and the reader (reconcile.config) are the two files most
+    # able to grow a private copy, and neither may spell it.
+    others = [
+        Path(routes_rrts.__file__),
+        Path(reconcile_config.__file__),
+        Path(transport_server.__file__),
+        Path(telegram_daemon.__file__),
+    ]
 
     assert "rrts-export" in home.read_text(encoding="utf-8"), (
         "the segment vanished from its home — the constant was renamed or "
@@ -254,9 +276,39 @@ def test_the_segment_is_spelled_in_exactly_one_place() -> None:
             if "rrts-export" in line:
                 strays.append(f"{f.name}:{i}: {line.strip()[:70]}")
     assert not strays, (
-        "the directory segment is spelled outside routes_rrts.py, which is "
-        "how a writer and a reader land on different files while both look "
-        f"correct:\n  " + "\n  ".join(strays)
+        "the directory segment is spelled outside alfred/common/rrts_export.py, "
+        "which is how a writer and a reader land on different files while both "
+        f"look correct:\n  " + "\n  ".join(strays)
+    )
+
+
+def test_the_reader_reaches_the_derivation_without_the_optional_extra() -> None:
+    """The reason the home moved: the reader is base-install, aiohttp is not.
+
+    ``alfred.common.rrts_export`` must import with nothing but the standard
+    library behind it. If it ever grows a transport import, a base install
+    loses the ability to find its own invoices export — and the symptom is
+    the reconcile CLI crashing on startup, not a clear missing-extra message.
+    """
+    import ast as _ast
+
+    source = Path(rrts_export_module.__file__).read_text(encoding="utf-8")
+    tree = _ast.parse(source)
+    imported: list[str] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            imported.extend(a.name for a in node.names)
+        elif isinstance(node, _ast.ImportFrom) and node.module:
+            imported.append(node.module)
+
+    forbidden = [
+        m for m in imported
+        if m.split(".")[0] in {"aiohttp", "anthropic", "telegram"}
+        or m.startswith("alfred.transport")
+    ]
+    assert not forbidden, (
+        f"the shared landing-path module imports {forbidden}, which puts an "
+        f"optional extra back between the reader and its own input path"
     )
 
 

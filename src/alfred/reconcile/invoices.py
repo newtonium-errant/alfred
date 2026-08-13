@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, fields
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -281,6 +281,43 @@ class InvoiceSnapshot:
         return ", ".join(parts) + "."
 
 
+def parse_snapshot_date(value: str) -> "date | None":
+    """A calendar date from a snapshot-side date string, or ``None``.
+
+    Never raises. Their dates arrive as ``YYYY-MM-DD`` or as full
+    timestamps, and both are accepted; anything else yields ``None``, which
+    every caller reads as "no usable date" rather than as a guessed one.
+
+    **Lifted here when the SECOND consumer arrived**, not before. It began
+    as a private helper in :mod:`alfred.reconcile.aging` because the
+    watchdog was the only thing reading a snapshot date. The matcher reads
+    them too, and the commit that adds a second reader is exactly the commit
+    that would otherwise create a second spelling — two date parsers that
+    agree today and diverge the first time RRTS sends a format one of them
+    tolerates. It lives in this module because this module is where "how
+    RRTS spells things" is decided.
+
+    Distinct from :func:`alfred.reconcile.money.parse_date`, which reads a
+    PROVIDER'S cell: that one carries the ``date_order`` question and RAISES
+    on an unreadable cell, because a misread date there becomes part of the
+    ledger key. These dates are not keys and their format is RRTS's own, so
+    degrading to ``None`` is right here and would be wrong there.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
 def _parse_exported_at(value: str) -> datetime | None:
     """Parse the snapshot's timestamp. ``Z`` suffix and fractional seconds
     both occur in the live document (``2026-08-13T22:40:00.116Z``)."""
@@ -418,4 +455,5 @@ __all__ = [
     "InvoiceLineItem",
     "InvoiceSnapshot",
     "load_snapshot",
+    "parse_snapshot_date",
 ]

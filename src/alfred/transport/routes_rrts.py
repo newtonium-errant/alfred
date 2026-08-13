@@ -50,6 +50,21 @@ from typing import Any
 
 from aiohttp import web
 
+# The landing-path derivation lives in a DEPENDENCY-FREE module and is
+# re-exported here for every existing caller. It cannot live in this file:
+# the reader is the reconciler, which is part of the base install, and this
+# module imports aiohttp (the ``voice`` extra). A reader importing from here
+# would break a base install; a reader spelling the segment itself would be
+# the second spelling. So neither end owns it — see
+# :mod:`alfred.common.rrts_export`.
+from alfred.common.rrts_export import (  # noqa: F401 — re-exported surface
+    EXPORT_DIR_NAME,
+    EXPORT_FILENAME,
+    export_dir_for,
+    export_path,
+    export_path_for,
+)
+
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -64,19 +79,6 @@ RRTS_EXPORT_PEER_NAME = "rrts_export"
 #: tight.
 DEFAULT_RRTS_MAX_BYTES = 10 * 1024 * 1024
 
-#: The filename under the export directory. Fixed, because the reconciler
-#: reads it by name — the DIRECTORY is config-derived, this is not.
-EXPORT_FILENAME = "invoices.json"
-
-#: Directory segment under the instance data dir. Lifted here from an inline
-#: f-string in the wiring because the landing path is about to have TWO ends:
-#: the receiver writes it and the P2 reader reads it. One resolution existed
-#: only because one end existed — and a second spelling of a path is how a
-#: writer and a reader end up on different files while both look correct.
-#: The failure mode is silent and total: the snapshot lands where nothing
-#: looks for it, and neither side reports anything wrong.
-EXPORT_DIR_NAME = "rrts-export"
-
 _KEY_RRTS_DIR = "_rrts_export_dir"
 _KEY_RRTS_MAX = "_rrts_export_max_bytes"
 
@@ -85,43 +87,6 @@ def _json_error(status: int, error: str, **extra: Any) -> web.Response:
     payload: dict[str, Any] = {"ok": False, "error": error}
     payload.update(extra)
     return web.json_response(payload, status=status)
-
-
-def export_dir_for(data_dir: str) -> str:
-    """``<data_dir>/rrts-export`` — the landing directory, or ``""``.
-
-    THE one derivation. Both ends call it: the transport wiring resolves the
-    receiver's write target through it, and the reconcile reader resolves its
-    read source through it. Neither spells the segment.
-
-    A STRING join rather than ``pathlib``, matching
-    :func:`alfred.common.instance_paths.instance_data_path`: ``Path("./data")
-    / "x"`` normalises the leading ``./`` away, and the byte-identity of a
-    relative anchor is what lets this be introduced without moving anything
-    already on disk.
-
-    Empty ``data_dir`` yields ``""`` — the caller's cue to refuse rather than
-    guess. Guessing the process cwd is the defect this whole family of path
-    helpers exists to prevent.
-    """
-    base = (data_dir or "").strip().rstrip("/")
-    return f"{base}/{EXPORT_DIR_NAME}" if base else ""
-
-
-def export_path(export_dir: Path | str) -> Path:
-    """``<export_dir>/invoices.json`` — the file the reconciler reads."""
-    return Path(export_dir) / EXPORT_FILENAME
-
-
-def export_path_for(data_dir: str) -> str:
-    """``<data_dir>/rrts-export/invoices.json``, or ``""``.
-
-    The whole path in one call, for readers that hold a data dir rather than
-    a resolved export directory. Composed from the two helpers above so there
-    is still exactly one place that knows either segment.
-    """
-    directory = export_dir_for(data_dir)
-    return str(export_path(directory)) if directory else ""
 
 
 def read_stored_exported_at(export_dir: Path | str) -> str:

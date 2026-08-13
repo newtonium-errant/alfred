@@ -38,6 +38,7 @@ from .attention import (
     load_corrections,
 )
 from .config import ReconcileConfig
+from .invoices import load_snapshot
 from .ledger import load_ledger, upsert
 from .parser import parse_note
 from .paths import corrections_path_in, ledger_path_in, reports_dir_in
@@ -208,10 +209,30 @@ def cmd_report(config: ReconcileConfig, *, wants_json: bool = False) -> int:
 
     contents = load_ledger(ledger_path_in(config.store_dir))
     corrections = load_corrections(corrections_path_in(config.store_dir))
+
+    # THE INVOICE SIDE, THREADED AT THE PRODUCTION CALL SITE. A snapshot
+    # kwarg that only tests ever pass is the standing trap: every pin green,
+    # the feature dead in the field, and the operator told "nothing is late"
+    # by a report that never opened the export. When no path resolves, the
+    # snapshot stays None and the report SAYS the invoice side is absent —
+    # which is a different statement from "nothing is late".
+    snapshot = (
+        load_snapshot(config.invoices_path) if config.invoices_path else None
+    )
+    if snapshot is None:
+        log.info(
+            "reconcile.cli.no_invoices_path",
+            detail="reconcile.invoices_path is empty (no logging.dir to "
+                   "derive it from, and none set explicitly), so the report "
+                   "covers the statement side only — no late detection, no "
+                   "payment matching.",
+        )
+
     report = build_report(
         contents,
         eob_map=config.eob_classes,
         corrections=corrections,
+        snapshot=snapshot,
     )
     stem = report_stem()
     csv_path, summary_path = write_report(
@@ -227,6 +248,13 @@ def cmd_report(config: ReconcileConfig, *, wants_json: bool = False) -> int:
         "class_counts": report.class_counts,
         "has_discrepancies": report.has_discrepancies,
         "proposals": [p.to_dict() for p in report.proposals],
+        "invoices_path": config.invoices_path,
+        "invoice_side": snapshot is not None,
+        "invoices_stale": bool(snapshot.is_stale) if snapshot else None,
+        "unknown_statuses": dict(snapshot.unknown_statuses) if snapshot else {},
+        "late": len(report.aging.late) if report.aging else 0,
+        "match_proposals": len(report.match.proposals) if report.match else 0,
+        "match_ambiguous": len(report.match.ambiguous) if report.match else 0,
     }
     lines = [
         f"Wrote {csv_path}",
@@ -256,6 +284,28 @@ def cmd_report(config: ReconcileConfig, *, wants_json: bool = False) -> int:
             "'Cross-foot findings' section; treat them as parse findings "
             "first."
         )
+
+    lines.append("")
+    if snapshot is None:
+        lines.append(
+            "No invoice export was read, so this report covers only what the "
+            "provider ANSWERED. Late detection and payment matching need "
+            "reconcile.invoices_path to resolve to RRTS's export."
+        )
+    else:
+        lines.append(f"Invoice side: {snapshot.summary()}")
+        if snapshot.unknown_statuses:
+            total = sum(snapshot.unknown_statuses.values())
+            lines.append(
+                f"  {total} invoice(s) carry an unrecognised status "
+                f"({', '.join(sorted(snapshot.unknown_statuses))}) — neither "
+                f"chased nor matched. The report's 'Invoice side' section is "
+                f"the only place they surface."
+            )
+        if report.aging is not None:
+            lines.append(f"  {report.aging.summary()}")
+        if report.match is not None:
+            lines.append(f"  {report.match.summary()}")
     _emit(payload, wants_json, *lines)
     return 0
 

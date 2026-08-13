@@ -41,12 +41,17 @@ should look different from one chased on the date it was actually sent.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import structlog
 
-from .invoices import DATE_SOURCE_SENT, Invoice, InvoiceSnapshot
+from .invoices import (
+    DATE_SOURCE_SENT,
+    Invoice,
+    InvoiceSnapshot,
+    parse_snapshot_date,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -54,27 +59,12 @@ log = structlog.get_logger(__name__)
 #: than six weeks after the invoice was sent. Six weeks in days.
 LATE_AFTER_DAYS = 42
 
-
-def _parse_date(value: str) -> date | None:
-    """ISO date from the snapshot, or ``None``. Never raises.
-
-    Their dates arrive as ``YYYY-MM-DD`` or as full timestamps; both are
-    accepted, and anything else yields ``None`` — which routes the invoice
-    to the *undateable* bucket rather than to a guessed clock.
-    """
-    raw = (value or "").strip()
-    if not raw:
-        return None
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(raw).date()
-    except ValueError:
-        pass
-    try:
-        return date.fromisoformat(raw[:10])
-    except ValueError:
-        return None
+# The snapshot-date parser used to live here as a private helper, back when
+# the watchdog was its only consumer. The matcher reads snapshot dates too,
+# so it was LIFTED to :mod:`alfred.reconcile.invoices` — the module that
+# owns how RRTS spells things — rather than copied. An unreadable date still
+# routes an invoice to the *undateable* bucket rather than to a guessed
+# clock; that behaviour is unchanged, it just has one author now.
 
 
 @dataclass
@@ -179,7 +169,7 @@ def find_late(
         if invoice.invoice_no in matched:
             continue
         since, source = invoice.aging_basis()
-        started = _parse_date(since)
+        started = parse_snapshot_date(since)
         if started is None:
             report.undateable.append(invoice.invoice_no)
             continue
