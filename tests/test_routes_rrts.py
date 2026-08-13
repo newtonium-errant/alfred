@@ -29,6 +29,7 @@ scanners match on prefix + entropy and cannot tell a fixture from a leak.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import structlog
@@ -175,9 +176,15 @@ async def test_the_stored_document_is_byte_identical(rrts_client) -> None:
         "/rrts/export", json=doc, headers=_RRTS_HEADERS
     )
     assert resp.status == 200
-    stored = json.loads(
-        export_path(rrts_client.app["_export_dir"]).read_text(encoding="utf-8")
-    )
+    # BYTES, not just structure. Structural equality passes even if the
+    # receiver re-serialised the document — which would silently normalise
+    # key order, whitespace and number formatting on a file another system
+    # produced. The stronger assertion is free, so it is the one to make.
+    raw_posted = json.dumps(doc).encode("utf-8")
+    stored_bytes = export_path(rrts_client.app["_export_dir"]).read_bytes()
+    assert stored_bytes == raw_posted
+
+    stored = json.loads(stored_bytes.decode("utf-8"))
     assert stored == doc
     assert stored["their_future_field"] == {"nested": [1, 2, 3]}
 
@@ -441,3 +448,73 @@ def test_read_stored_exported_at_tolerates_everything(tmp_path) -> None:
         '{"exported_at": "2026-08-13T02:30:00Z"}', encoding="utf-8"
     )
     assert read_stored_exported_at(tmp_path) == "2026-08-13T02:30:00Z"
+
+
+# --- the atomicity pin (reviewer WARN from the receiver's gate) -------------------
+#
+# The read-back tests above pass against a PLAIN DIRECT WRITE — they only
+# prove the bytes arrived, not how. Atomicity is the property that a reader
+# never catches a partial file, and the only way to assert it from outside is
+# to watch the mechanism: the write goes to a temp path and is put in place
+# with os.replace. The reviewer proved the gap by leaving all 31 green with
+# the rename removed.
+
+
+async def test_the_write_goes_through_os_replace(rrts_client, monkeypatch) -> None:
+    """Spy the mechanism, because the outcome cannot distinguish it.
+
+    Asserts BOTH arguments: the source is the ``.tmp`` sibling and the
+    destination is the final file. A rename from somewhere else would be a
+    different bug with the same read-back.
+    """
+    from alfred.transport import routes_rrts
+
+    calls: list[tuple[str, str]] = []
+    real_replace = routes_rrts.os.replace
+
+    def _spy(src, dst):  # type: ignore[no-untyped-def]
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(routes_rrts.os, "replace", _spy)
+
+    resp = await rrts_client.post(
+        "/rrts/export", json=_document(), headers=_RRTS_HEADERS
+    )
+    assert resp.status == 200
+
+    final = export_path(rrts_client.app["_export_dir"])
+    assert len(calls) == 1, "exactly one rename per export"
+    src, dst = calls[0]
+    assert dst == str(final)
+    assert src == str(final) + ".tmp"
+
+
+async def test_the_temp_file_lives_beside_its_destination(rrts_client) -> None:
+    """``os.replace`` is only atomic WITHIN one filesystem. A temp file in
+    the system temp dir would degrade the rename to copy-then-delete across
+    a device boundary — reintroducing exactly the torn read this prevents,
+    on the machines where it matters and nowhere else."""
+    from alfred.transport import routes_rrts
+
+    seen: list[str] = []
+    real_replace = routes_rrts.os.replace
+
+    def _spy(src, dst):  # type: ignore[no-untyped-def]
+        seen.append(str(src))
+        return real_replace(src, dst)
+
+    import pytest as _pytest  # local, to keep the fixture list unchanged
+
+    mp = _pytest.MonkeyPatch()
+    mp.setattr(routes_rrts.os, "replace", _spy)
+    try:
+        await rrts_client.post(
+            "/rrts/export", json=_document(), headers=_RRTS_HEADERS
+        )
+    finally:
+        mp.undo()
+
+    export_dir = rrts_client.app["_export_dir"]
+    assert len(seen) == 1
+    assert Path(seen[0]).parent == Path(export_dir)

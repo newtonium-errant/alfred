@@ -1186,7 +1186,14 @@ def wire_transport_app(
         # "ran, did not mount" greppable and symmetric with every other
         # opt-in route.
         _register_rrts_routes(app, enabled=False)
-        log.debug(
+        # INFO, not DEBUG. This log exists to distinguish "not wired" from
+        # "forgotten" — and it just failed to do that: the route was never
+        # threaded at the production call site, the skip fired on every
+        # startup, and nobody saw it because production runs at INFO. A
+        # signal emitted below the level anyone reads is the silence it was
+        # written to prevent. It fires once per startup, so there is no spam
+        # case to weigh against being visible.
+        log.info(
             "transport.wire_transport_app.rrts_export_skipped",
             reason="transport.rrts_export.enabled is false / absent",
         )
