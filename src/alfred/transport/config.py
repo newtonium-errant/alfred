@@ -595,6 +595,11 @@ DEFAULT_INGEST_MAX_BODY_CHARS: int = 262144
 # the normal path.
 DEFAULT_TRANSPORT_CLIENT_MAX_BYTES: int = 14 * 1024 * 1024   # 14 MiB
 
+#: Size ceiling for one RRTS invoices-export snapshot. Their document is
+#: ~159 invoices; 10 MiB is headroom for growth while still making SOME
+#: size impossible, which is the whole point of a cap.
+DEFAULT_RRTS_MAX_BYTES: int = 10 * 1024 * 1024   # 10 MiB
+
 
 @dataclass
 class IngestConfig:
@@ -620,6 +625,27 @@ class IngestConfig:
     enabled: bool = False
     max_body_chars: int = DEFAULT_INGEST_MAX_BODY_CHARS
     types: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RrtsExportConfig:
+    """RRTS invoices-export receiver config (``POST /rrts/export``).
+
+    Opt-in inert by default, the same posture as ``ingest`` above: an
+    instance that does not receive an RRTS export mounts nothing and its
+    transport server is byte-unchanged.
+
+    ``export_dir`` is where the snapshot lands. Left EMPTY here on purpose
+    — the wiring resolves it from the instance's own data dir, because a
+    literal in config (or worse, in the route) is the shape that puts every
+    instance's export in one file. An explicitly configured value always
+    wins; an unresolvable one leaves the route mounted and returning 503,
+    which is louder than writing to a guessed path.
+    """
+
+    enabled: bool = False
+    export_dir: str = ""
+    max_bytes: int = DEFAULT_RRTS_MAX_BYTES
 
 
 # --- Jeeves capture intake (#81, 2026-08-11) --------------------------------
@@ -877,6 +903,7 @@ class TransportConfig:
     state: StateConfig = field(default_factory=StateConfig)
     canonical: CanonicalConfig = field(default_factory=CanonicalConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    rrts_export: RrtsExportConfig = field(default_factory=RrtsExportConfig)
     batch: BatchConfig = field(default_factory=BatchConfig)
     bugreport: BugReportConfig = field(default_factory=BugReportConfig)
     jeeves: JeevesRouteConfig = field(default_factory=JeevesRouteConfig)
@@ -1094,6 +1121,28 @@ def _build_canonical(
         ),
         peer_permissions=peer_perms,
         nl_broker=_build_nl_broker(data.get("nl_broker")),
+    )
+
+
+def _build_rrts_export(data: dict[str, Any]) -> RrtsExportConfig:
+    """Build the optional ``rrts_export`` block (defaults = disabled).
+
+    ``max_bytes`` is int-coerced and floored at 1 for the same reason
+    ``_build_ingest`` floors its cap: a zero or negative config value would
+    wedge the route into refusing every request, which looks like a broken
+    peer rather than a bad setting.
+    """
+    if not isinstance(data, dict):
+        return RrtsExportConfig()
+    try:
+        max_bytes = max(1, int(data.get("max_bytes", DEFAULT_RRTS_MAX_BYTES)))
+    except (TypeError, ValueError):
+        max_bytes = DEFAULT_RRTS_MAX_BYTES
+    export_dir = data.get("export_dir", "")
+    return RrtsExportConfig(
+        enabled=bool(data.get("enabled", False)),
+        export_dir=str(export_dir).strip() if isinstance(export_dir, str) else "",
+        max_bytes=max_bytes,
     )
 
 
@@ -1458,6 +1507,8 @@ def _build(
         )
         if "ingest" in data and isinstance(data["ingest"], dict):
             kwargs["ingest"] = _build_ingest(data["ingest"])
+        if "rrts_export" in data:
+            kwargs["rrts_export"] = _build_rrts_export(data["rrts_export"])
         if "batch" in data and isinstance(data["batch"], dict):
             kwargs["batch"] = _build_batch(data["batch"])
         if "bugreport" in data and isinstance(data["bugreport"], dict):
