@@ -1756,6 +1756,8 @@ async def run(
         # register_vault_path here after a 1-day production outage;
         # wire_transport_app is the structural fix that prevents the
         # next instance from re-discovering the same gap.
+        from alfred.common.instance_paths import instance_data_dir
+
         wire_transport_app(
             transport_app,
             transport_config,
@@ -1823,6 +1825,28 @@ async def run(
             feed_daily_sync_config=feed_daily_sync_config,
             feed_instance_scope=feed_instance_scope,
             feed_raw_config=raw,
+            # RRTS invoices-export receiver. Opt-in via
+            # transport.rrts_export.enabled (default False → route not
+            # mounted).
+            #
+            # THREADED HERE, and the omission is why this exists as its own
+            # commit: the first ship wired the kwargs into wire_transport_app
+            # and its tests, and never into this call — so every pin was
+            # green, the route was never mounted in production, and the box
+            # answered 404 to an authenticated peer. That is the exact shape
+            # the bugreport comment forty lines above warns about, written by
+            # the same hand that then repeated it. A gate parameter tested
+            # only by direct invocation is a feature accepted-then-ignored in
+            # the field.
+            #
+            # ``rrts_data_dir`` is the INSTANCE's own data dir, from the
+            # canonical resolver rather than a second read of logging.dir —
+            # the receiver WRITES this path and the reconciler READS it, so
+            # two resolutions of it would eventually disagree and the
+            # snapshot would land where nothing looks for it.
+            rrts_export_enabled=transport_config.rrts_export.enabled,
+            rrts_export_config=transport_config.rrts_export,
+            rrts_data_dir=instance_data_dir(raw),
         )
         log.info(
             "talker.daemon.transport_configured",

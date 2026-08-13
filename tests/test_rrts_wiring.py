@@ -1,0 +1,211 @@
+"""Production wiring for the RRTS invoices-export route.
+
+THE TRAP THIS FILE EXISTS FOR, and this time it did not stay hypothetical.
+The receiver shipped with its kwargs wired into ``wire_transport_app`` and
+into its own tests — and never into the daemon's call. Every pin was green,
+23 of them, and the route was never mounted on a real instance: the box
+answered **404 to a correctly authenticated peer**. The skip-log fired on
+every startup at DEBUG, under the production level, so the one signal that
+would have said so was invisible.
+
+That is the standing hazard the builder doctrine names in as many words: a
+gate parameter tested only by direct invocation is a feature accepted-then-
+ignored in the field. ``test_routes_rrts.py`` calls ``register_rrts_routes``
+itself — which proves the registrar works and proves nothing whatever about
+whether anything CALLS it.
+
+So these pins walk the real chain: the talker daemon's ``wire_transport_app``
+call, ``wire_transport_app``'s registrar call, and the transport config that
+supplies the flag. All three must agree or the route never mounts.
+
+Modelled on ``test_jeeves_wiring.py``, deliberately — the same trap already
+had a canonical shape in this repo, and a second spelling of it would be one
+more thing to keep in sync.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+from pathlib import Path
+
+import pytest
+import structlog
+from aiohttp import web
+
+from alfred.telegram import daemon as telegram_daemon
+from alfred.transport import server as transport_server
+from alfred.transport.config import (
+    AuthConfig,
+    AuthTokenEntry,
+    RrtsExportConfig,
+    ServerConfig,
+    StateConfig,
+    TransportConfig,
+    load_from_unified,
+)
+from alfred.transport.routes_rrts import RRTS_EXPORT_PEER_NAME
+from alfred.transport.server import build_app, wire_transport_app
+from alfred.transport.state import TransportState
+
+DUMMY_RRTS_EXPORT_TOKEN = "DUMMY_RRTS_EXPORT_TEST_TOKEN"
+_HEADERS = {
+    "Authorization": f"Bearer {DUMMY_RRTS_EXPORT_TOKEN}",
+    "X-Alfred-Client": "rrts",
+}
+
+
+def _wire_call_kwargs() -> set[str]:
+    """Keyword names the daemon passes to ``wire_transport_app``.
+
+    An AST walk rather than a grep: the call spans ninety-odd lines and a
+    substring search would match the explanatory comment as happily as the
+    argument — which is exactly how a comment ABOUT threading a parameter
+    can sit directly above a call that does not thread it.
+    """
+    tree = ast.parse(Path(telegram_daemon.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "wire_transport_app"
+        ):
+            return {kw.arg for kw in node.keywords if kw.arg}
+    raise AssertionError("the daemon no longer calls wire_transport_app")
+
+
+# --- the production call site ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwarg", ["rrts_export_enabled", "rrts_export_config", "rrts_data_dir"],
+)
+def test_the_daemon_threads_every_rrts_parameter(kwarg: str) -> None:
+    """The pin that would have caught the 404. Each parameter separately, so
+    a failure names WHICH one went missing rather than "the wiring changed".
+    """
+    assert kwarg in _wire_call_kwargs(), (
+        f"the talker daemon does not pass {kwarg!r} to wire_transport_app — "
+        f"the route will not mount on a real instance however green the "
+        f"route's own tests are"
+    )
+
+
+def test_wire_transport_app_accepts_exactly_those_parameters() -> None:
+    """The other end of the same handshake: the daemon can only thread what
+    the signature accepts, and a rename on either side breaks the chain
+    silently."""
+    params = inspect.signature(transport_server.wire_transport_app).parameters
+    for kwarg in ("rrts_export_enabled", "rrts_export_config", "rrts_data_dir"):
+        assert kwarg in params
+
+
+def test_the_transport_config_exposes_the_flag_the_daemon_reads() -> None:
+    """The third link. The daemon reads ``transport_config.rrts_export``; if
+    the config block stopped loading, the daemon would thread a default and
+    the route would go dark with nothing failing."""
+    config = load_from_unified({
+        "transport": {"rrts_export": {"enabled": True, "max_bytes": 4096}}
+    })
+    assert isinstance(config.rrts_export, RrtsExportConfig)
+    assert config.rrts_export.enabled is True
+    assert config.rrts_export.max_bytes == 4096
+
+
+# --- end to end: does the route actually MOUNT ---------------------------------
+
+
+def _config() -> TransportConfig:
+    return TransportConfig(
+        server=ServerConfig(),
+        auth=AuthConfig(
+            tokens={
+                RRTS_EXPORT_PEER_NAME: AuthTokenEntry(
+                    token=DUMMY_RRTS_EXPORT_TOKEN, allowed_clients=["rrts"],
+                ),
+            }
+        ),
+        state=StateConfig(),
+    )
+
+
+async def test_enabled_through_wire_transport_app_the_route_answers(
+    aiohttp_client, tmp_path,
+) -> None:
+    """THE pin the doctrine asks for: drive the production composition, not
+    the registrar, and assert the route is REACHABLE. A per-layer pin cannot
+    catch this class — that is the whole point of the paragraph."""
+    state = TransportState.create(tmp_path / "state.json")
+    app = build_app(_config(), state)
+    wire_transport_app(
+        app,
+        _config(),
+        instance_name="VERA",
+        rrts_export_enabled=True,
+        rrts_export_config=RrtsExportConfig(enabled=True, max_bytes=8192),
+        rrts_data_dir=str(tmp_path / "data"),
+    )
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/rrts/export",
+        json={"exported_at": "2026-08-13T05:30:00Z", "invoices": []},
+        headers=_HEADERS,
+    )
+    assert resp.status == 200, (
+        "the route did not mount through the production wiring path — this "
+        "is the 404 the live box returned"
+    )
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["exported_at"] == "2026-08-13T05:30:00Z"
+
+    # And it landed under the INSTANCE data dir, not a guessed path.
+    landed = tmp_path / "data" / "rrts-export" / "invoices.json"
+    assert landed.is_file()
+
+
+async def test_disabled_through_wire_transport_app_the_route_is_absent(
+    aiohttp_client, tmp_path,
+) -> None:
+    """The twin. Opt-in inertness has to be real: an instance that does not
+    configure the receiver must 404, and must SAY it skipped."""
+    state = TransportState.create(tmp_path / "state.json")
+    app = build_app(_config(), state)
+    with structlog.testing.capture_logs() as captured:
+        wire_transport_app(app, _config(), instance_name="Salem")
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/rrts/export",
+        json={"exported_at": "2026-08-13T05:30:00Z"},
+        headers=_HEADERS,
+    )
+    assert resp.status == 404
+
+    skips = [
+        c for c in captured
+        if c.get("event") == "transport.wire_transport_app.rrts_export_skipped"
+    ]
+    assert len(skips) == 1
+
+
+def test_the_skip_log_is_emitted_at_INFO() -> None:
+    """The level is part of the contract, and this is why.
+
+    The skip fired on every production startup while the route was
+    unmounted — at DEBUG, under the level production runs at, so the one
+    signal that would have said "not wired" was invisible. A log that exists
+    to distinguish not-wired from forgotten must be readable at the level
+    anyone reads. It fires once per startup; there is no spam case.
+    """
+    app = web.Application()
+    with structlog.testing.capture_logs() as captured:
+        wire_transport_app(app, _config(), instance_name="Salem")
+    skips = [
+        c for c in captured
+        if c.get("event") == "transport.wire_transport_app.rrts_export_skipped"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["log_level"] == "info", (
+        "the skip-log must be INFO — at DEBUG it is invisible in production, "
+        "which is how an unmounted route went unnoticed until a peer got a 404"
+    )
