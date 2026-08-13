@@ -293,6 +293,18 @@ class Statement:
     #: Distinguishes two statements issued on the SAME DAY. Assigned by the
     #: parser; see :func:`statement_key`.
     statement_occurrence: int = 0
+    #: WHERE ``statement_date`` came from. ``header`` means the provider
+    #: printed it; ``capture_metadata`` means it was recovered from a scan
+    #: batch's own label, which is a CAPTURE claim rather than a provider
+    #: one and can be wrong in ways a printed date cannot — a mistyped batch
+    #: label re-homes every claim line under it. Kept distinct rather than
+    #: laundered into one field so the weaker provenance stays visible.
+    date_source: str = ""
+    #: True when the block was headed ``Page N of M`` with ``N > 1``. That
+    #: is the provider stating, in the document, that this is a later page
+    #: of a statement already begun — the positive evidence a fold needs
+    #: when the block's own header carries no date.
+    page_continuation: bool = False
     row_type: str = ROW_STATEMENT
 
     source_note: str = ""
@@ -354,6 +366,8 @@ class Statement:
                 )
             except (TypeError, ValueError):
                 known["statement_occurrence"] = 0
+        if "page_continuation" in known:
+            known["page_continuation"] = bool(known["page_continuation"])
         if "declared_totals" in known:
             # Coerced to a str->str mapping. A hand-edited or older ledger may
             # carry numbers here; normalising on load keeps every reader from
