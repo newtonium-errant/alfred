@@ -209,3 +209,110 @@ def test_the_skip_log_is_emitted_at_INFO() -> None:
         "the skip-log must be INFO — at DEBUG it is invisible in production, "
         "which is how an unmounted route went unnoticed until a peer got a 404"
     )
+
+
+# --- item 0: the derivation has ONE home -----------------------------------------
+#
+# The reviewer's WARN from the receiver's gate: the directory segment was an
+# inline f-string in the wiring, and one resolution existed only because one
+# END existed. P2 adds the second end — the reader — so the segment is lifted
+# before any reader code can spell it. A second spelling is how a writer and a
+# reader land on different files while both look correct, and the failure is
+# silent and total: the snapshot arrives where nothing looks for it.
+
+
+def test_the_segment_is_spelled_in_exactly_one_place() -> None:
+    """Source-level, because behaviour cannot see a duplicate that agrees.
+
+    Two copies of ``rrts-export`` would pass every functional test on the
+    day they were written and diverge later — which is precisely why this
+    asserts on the source rather than on a resolved path.
+    """
+    from alfred.transport import routes_rrts
+
+    # BARE substring, not the quoted form. The first version of this pin
+    # looked for `"rrts-export"` with its quotes and scored ZERO against a
+    # mutation that re-spelled the segment inside an f-string — where the
+    # token never appears quoted. That is misaim rather than vacuity: the
+    # pin fired correctly at a shape the duplication does not take.
+    #
+    # The property is "outside its home, ZERO occurrences" rather than "one
+    # occurrence in total": the home file names it in the constant AND in
+    # the docstrings that explain it, and counting those would make the pin
+    # fail on prose.
+    home = Path(routes_rrts.__file__)
+    others = [Path(transport_server.__file__), Path(telegram_daemon.__file__)]
+
+    assert "rrts-export" in home.read_text(encoding="utf-8"), (
+        "the segment vanished from its home — the constant was renamed or "
+        "removed and this pin would now pass trivially"
+    )
+
+    strays: list[str] = []
+    for f in others:
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if "rrts-export" in line:
+                strays.append(f"{f.name}:{i}: {line.strip()[:70]}")
+    assert not strays, (
+        "the directory segment is spelled outside routes_rrts.py, which is "
+        "how a writer and a reader land on different files while both look "
+        f"correct:\n  " + "\n  ".join(strays)
+    )
+
+
+def test_export_dir_for_is_the_derivation() -> None:
+    from alfred.transport.routes_rrts import EXPORT_DIR_NAME, export_dir_for
+
+    assert export_dir_for("/srv/vera/data") == f"/srv/vera/data/{EXPORT_DIR_NAME}"
+    # Relative anchors keep their exact string — a pathlib join would
+    # normalise the leading ./ away and move an existing landing path.
+    assert export_dir_for("./data") == f"./data/{EXPORT_DIR_NAME}"
+    assert export_dir_for("/srv/data/") == f"/srv/data/{EXPORT_DIR_NAME}"
+
+
+def test_an_empty_data_dir_yields_no_path_rather_than_a_guess() -> None:
+    """The caller's cue to refuse. Guessing the process cwd is the defect
+    this family of helpers exists to prevent."""
+    from alfred.transport.routes_rrts import export_dir_for, export_path_for
+
+    assert export_dir_for("") == ""
+    assert export_dir_for("   ") == ""
+    assert export_path_for("") == ""
+
+
+def test_export_path_for_composes_both_segments() -> None:
+    from alfred.transport.routes_rrts import (
+        EXPORT_DIR_NAME,
+        EXPORT_FILENAME,
+        export_path_for,
+    )
+
+    assert export_path_for("/srv/vera/data") == (
+        f"/srv/vera/data/{EXPORT_DIR_NAME}/{EXPORT_FILENAME}"
+    )
+
+
+async def test_the_wiring_resolves_through_the_helper(
+    aiohttp_client, tmp_path,
+) -> None:
+    """End to end: the path the RECEIVER writes is the path the helper
+    names. This is the half a source-level pin cannot prove."""
+    from alfred.transport.routes_rrts import export_path_for
+
+    state = TransportState.create(tmp_path / "state.json")
+    app = build_app(_config(), state)
+    data_dir = str(tmp_path / "data")
+    wire_transport_app(
+        app, _config(), instance_name="VERA",
+        rrts_export_enabled=True,
+        rrts_export_config=RrtsExportConfig(enabled=True, max_bytes=8192),
+        rrts_data_dir=data_dir,
+    )
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/rrts/export",
+        json={"exported_at": "2026-08-13T22:40:00.116Z", "invoices": []},
+        headers=_HEADERS,
+    )
+    assert resp.status == 200
+    assert Path(export_path_for(data_dir)).is_file()

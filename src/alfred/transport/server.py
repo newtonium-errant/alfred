@@ -1149,6 +1149,7 @@ def wire_transport_app(
     # case — same symmetry as ingest below it.
     from .routes_rrts import (
         DEFAULT_RRTS_MAX_BYTES as _RRTS_MAX,
+        export_dir_for as _rrts_export_dir_for,
         register_rrts_routes as _register_rrts_routes,
     )
 
@@ -1165,9 +1166,11 @@ def wire_transport_app(
         configured_dir = str(
             getattr(rrts_export_config, "export_dir", "") or ""
         ).strip()
-        resolved_dir = configured_dir or (
-            f"{rrts_data_dir.rstrip('/')}/rrts-export" if rrts_data_dir else ""
-        )
+        # The segment is NOT spelled here. `export_dir_for` is the one
+        # derivation, and the P2 reader calls the same helper — a second
+        # spelling is how a writer and a reader land on different files
+        # while both look correct.
+        resolved_dir = configured_dir or _rrts_export_dir_for(rrts_data_dir)
         _register_rrts_routes(
             app,
             enabled=True,
