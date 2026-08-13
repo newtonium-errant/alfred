@@ -817,6 +817,13 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         # ``transport.feed.disabled`` info log; this debug event is the
         # wire-level skip signal.
         "transport.wire_transport_app.feed_skipped",
+        # RRTS invoices-export receiver (the invoice half of the Blue Cross
+        # loop) — instances that don't enable transport.rrts_export (every
+        # instance except VERA) skip-log here. register_rrts_routes ALSO
+        # emits its own ``transport.rrts_export.disabled`` info log; this
+        # debug event is the wire-level skip signal, exactly as for ingest
+        # and batch above.
+        "transport.wire_transport_app.rrts_export_skipped",
     }
     actual_skips = set(skip_events)
     missing = expected_skips - actual_skips

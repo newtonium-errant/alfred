@@ -724,6 +724,9 @@ def wire_transport_app(
     batch_enabled: bool = False,
     batch_config: Any | None = None,
     batch_data_dir: str = "",
+    rrts_export_enabled: bool = False,
+    rrts_export_config: Any | None = None,
+    rrts_data_dir: str = "",
     batch_instance: str = "",
     batch_config_path: str = "",
     batch_kick_enabled: bool = False,
@@ -1138,6 +1141,54 @@ def wire_transport_app(
             "transport.wire_transport_app.ingest_skipped",
             reason="transport.ingest.enabled is false / absent (instance "
                    "did not opt into the cross-instance ingest route)",
+        )
+
+    # RRTS invoices-export receiver. Opt-in via
+    # ``transport.rrts_export.enabled``; register_rrts_routes emits its own
+    # disabled-skip log, so the wire-level branch only surfaces the wired
+    # case — same symmetry as ingest below it.
+    from .routes_rrts import (
+        DEFAULT_RRTS_MAX_BYTES as _RRTS_MAX,
+        register_rrts_routes as _register_rrts_routes,
+    )
+
+    if rrts_export_enabled:
+        # The export directory is RESOLVED HERE from the value passed in,
+        # never re-derived and never a literal. Same reasoning as
+        # ``batch_data_dir`` above: the receiver WRITES this path and the
+        # reconciler READS it, so two independent resolutions would
+        # eventually disagree — and that failure is silent and total, the
+        # snapshot landing where nothing looks for it. An explicitly
+        # configured ``export_dir`` wins; otherwise it is the instance's
+        # own data dir, which is what keeps two instances on one box from
+        # sharing one invoices.json.
+        configured_dir = str(
+            getattr(rrts_export_config, "export_dir", "") or ""
+        ).strip()
+        resolved_dir = configured_dir or (
+            f"{rrts_data_dir.rstrip('/')}/rrts-export" if rrts_data_dir else ""
+        )
+        _register_rrts_routes(
+            app,
+            enabled=True,
+            export_dir=resolved_dir,
+            max_bytes=int(
+                getattr(rrts_export_config, "max_bytes", _RRTS_MAX) or _RRTS_MAX
+            ),
+        )
+        log.info(
+            "transport.wire_transport_app.rrts_export_registered",
+            export_dir=resolved_dir or "(unresolved — writes will 503)",
+            source="config" if configured_dir else "instance data dir",
+        )
+    else:
+        # Still call the registrar so its disabled-skip log fires — keeps
+        # "ran, did not mount" greppable and symmetric with every other
+        # opt-in route.
+        _register_rrts_routes(app, enabled=False)
+        log.debug(
+            "transport.wire_transport_app.rrts_export_skipped",
+            reason="transport.rrts_export.enabled is false / absent",
         )
 
     # In-app bug reporting (#95). Opt-in via ``transport.bugreport.enabled``;

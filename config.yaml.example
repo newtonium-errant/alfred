@@ -2242,3 +2242,56 @@ scaffold:
 #   # How many consistent operator rulings before a code mapping is PROPOSED.
 #   # Two, not one: a single ruling is as likely a one-off as a pattern.
 #   min_correction_support: 2
+
+# --- RRTS invoices-export receiver (transport.rrts_export) -------------------
+#
+# The INVOICE half of the Blue Cross payment loop. RRTS's n8n POSTs a full
+# JSON snapshot of its invoices nightly; this route writes it whole to a file
+# the reconciler reads. Without it the loop only ever sees what the provider
+# ANSWERED — never what it ignored, which is the half an aging watchdog needs.
+#
+# OPT-IN INERT. Absent or disabled, nothing is mounted and the transport
+# server is byte-unchanged — so every instance that does not receive an RRTS
+# export is unaffected by this block existing.
+#
+# SCOPE: this peer can do exactly ONE thing. The dedicated `rrts_export` token
+# reaches this route and nothing else; the handler pins the peer NAME and
+# fails closed 401 otherwise. Do NOT widen an existing token to cover this —
+# two peers can share `allowed_clients`, which is precisely why the pin is on
+# the name.
+#
+# The token itself lives in .env and is substituted here, never written into
+# the YAML:
+#
+#   auth:
+#     tokens:
+#       rrts_export:
+#         token: ${RRTS_EXPORT_TOKEN}
+#         allowed_clients: [rrts]
+#
+# transport:
+#   rrts_export:
+#     enabled: true
+#
+#     # Where the snapshot lands. LEAVE UNSET and it resolves to the
+#     # instance's own data dir (<logging.dir>/rrts-export/), which is what
+#     # keeps two instances on one box from sharing one invoices.json. An
+#     # explicit value always wins. If neither resolves, the route stays
+#     # mounted and returns 503 — louder than writing to a guessed path.
+#     export_dir: ""
+#
+#     # Size ceiling for one snapshot. ~159 invoices today; 10 MiB is headroom
+#     # for growth while still making SOME size impossible, which is the whole
+#     # point of a cap. Oversize is refused 413 with a logged reason.
+#     max_bytes: 10485760
+#
+# WHAT IS VALIDATED, AND WHAT IS NOT. Exactly two things: the body parses as
+# JSON, and it carries a top-level `exported_at`. That field is required
+# because it is what makes one snapshot orderable against another. Everything
+# else is written through untouched — the document's shape is RRTS's, and a
+# receiver enforcing more would break the day they add a field.
+#
+# A BACKWARDS `exported_at` IS WRITTEN ANYWAY and logged loudly
+# (`transport.rrts_export.stale_export`). Full replace is the contract, and
+# refusing would leave stale data AND no signal; a backwards-moving export
+# means an upstream job re-ran or a clock moved, which the operator needs.
