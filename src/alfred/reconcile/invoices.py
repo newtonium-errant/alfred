@@ -68,6 +68,13 @@ STATUS_PAID = "paid"
 #: see :func:`expects_payment`, which fails CLOSED for unknown statuses.
 AGEABLE_STATUSES = frozenset({STATUS_SENT})
 
+#: Every status this build understands. A status outside this set is counted
+#: onto the snapshot and surfaced in the report — see
+#: :attr:`InvoiceSnapshot.unknown_statuses`.
+_KNOWN_STATUSES = frozenset(
+    {STATUS_SENT, STATUS_VOID, STATUS_CREATED, STATUS_PAID}
+)
+
 #: The junk row's invoice number in the live snapshot. Named, not
 #: pattern-matched, because a nameless malformed-row bucket is where the
 #: NEXT anomaly hides.
@@ -155,15 +162,12 @@ class Invoice:
         status = (self.status or "").strip().lower()
         if status in AGEABLE_STATUSES:
             return True
-        if status not in {STATUS_VOID, STATUS_CREATED, STATUS_PAID}:
+        if status not in _KNOWN_STATUSES:
             log.warning(
                 "reconcile.invoices.unknown_status",
                 invoice_no=self.invoice_no,
                 status=self.status,
-                known=sorted(
-                    AGEABLE_STATUSES
-                    | {STATUS_VOID, STATUS_CREATED, STATUS_PAID}
-                ),
+                known=sorted(_KNOWN_STATUSES),
                 detail="status not recognised — NOT treated as chaseable; "
                        "add it to the status set once its meaning is known",
             )
@@ -220,6 +224,12 @@ class InvoiceSnapshot:
     absent: bool = False
     #: Hours between ``exported_at`` and now, or ``None`` when unparseable.
     age_hours: float | None = None
+    #: ``{status: count}`` for statuses this build does not recognise.
+    #: AGGREGATED, not merely logged: a status that only ever appears in a
+    #: log line stays unknown for a month, because nobody greps for a thing
+    #: they do not know exists. The report surfaces the count so the unknown
+    #: has somewhere to be seen.
+    unknown_statuses: dict[str, int] = field(default_factory=dict)
 
     @property
     def is_stale(self) -> bool:
@@ -343,6 +353,11 @@ def load_snapshot(
         if not isinstance(row, dict):
             continue
         invoice = Invoice.from_dict(row)
+        status = (invoice.status or "").strip().lower()
+        if status and status not in _KNOWN_STATUSES:
+            snapshot.unknown_statuses[status] = (
+                snapshot.unknown_statuses.get(status, 0) + 1
+            )
         if invoice.is_junk:
             # Named, counted, logged, and never handed to the matcher. A
             # nameless "malformed" bucket is where the NEXT anomaly hides.
