@@ -313,3 +313,112 @@ def test_an_unknown_money_label_still_falls_to_declared_totals():
     assert stmt.payment_total is None
     assert stmt.declared_totals == {"Some Other Total Label": "1234.00"}
     assert result.unmapped_header_labels == ["Some Other Total Label"]
+
+
+# --- WARN-1: the buffer must be cleared when a printed date WINS -----------------
+#
+# The use-path pin above varies "was the label used". This bug lives on "was
+# it never used": a batch comment, then a statement that prints its own date
+# (so the label is overridden, not consumed), then an orphan — which inherits
+# the STALE label, is re-homed out of the pool, and suppresses the pool
+# finding entirely. Three blocks in that order are required to see it, which
+# is why a two-block fixture could not.
+
+
+def _stale_label_note() -> str:
+    return (
+        "<!-- batch-09: 'Statement: 05 Jun 2026 — Page 1 of 1' -->\n\n"
+        "## Statement — 20 Jun 2026\n\n"
+        "**Statement Date:** 2026-06-20\n\n"
+        "| Claim # | Date of Service | Amount Paid |\n"
+        "| --- | --- | --- |\n"
+        "| 900 | 2026-06-01 | 50.00 |\n\n"
+        "## Unattributable Block\n\n"
+        "| Claim # | Date of Service | Amount Paid |\n"
+        "| --- | --- | --- |\n"
+        "| 901 | 2026-06-02 | 60.00 |\n"
+    )
+
+
+def test_a_printed_date_consumes_the_batch_label():
+    """The orphan after a dated statement must stay UNDATED. Inheriting the
+    stale label would re-home it out of the pool and silence the finding."""
+    result = parse_note(_stale_label_note())
+    dates = [s.statement_date for s in result.statements]
+    assert dates.count("") == 1, (
+        "the orphan must not inherit the batch label that the dated "
+        "statement already overrode"
+    )
+    assert "2026-06-05" not in dates
+
+
+def test_the_stale_label_does_not_reach_the_orphan_as_capture_metadata():
+    result = parse_note(_stale_label_note())
+    orphan = [s for s in result.statements if not s.statement_date][0]
+    assert orphan.date_source == ""
+    assert result.capture_dated == []
+
+
+def test_the_pool_finding_survives_a_preceding_batch_label():
+    """The consequence that matters: this lane's headline finding must still
+    fire. Positive control in the same test — the DATED statement is not
+    flagged, so the assertion is about the orphan specifically."""
+    result = parse_note(_stale_label_note())
+    report = build_report(_contents(result), generated_at="F")
+    pool = [t for t in report.statement_totals if not t.statement.statement_date]
+    assert len(pool) == 1
+    assert pool[0].undated_lines == 1
+    dated = [t for t in report.statement_totals if t.statement.statement_date]
+    assert all(t.undated_lines == 0 for t in dated)
+    assert "not attributed to any dated statement" in report.summary_text
+
+
+def test_a_label_still_reaches_a_block_that_needs_it():
+    """The control for the fix: clearing the buffer on override must not
+    break the recovery it exists for. A comment followed directly by an
+    undated block still dates that block."""
+    note = (
+        "<!-- batch-09: 'Statement: 05 Jun 2026 — Page 1 of 1' -->\n\n"
+        "## Provider Payment\n\n"
+        "| Claim # | Date of Service | Amount Paid |\n"
+        "| --- | --- | --- |\n"
+        "| 900 | 2026-06-01 | 50.00 |\n"
+    )
+    result = parse_note(note)
+    assert result.statements[0].statement_date == "2026-06-05"
+    assert result.statements[0].date_source == DATE_SOURCE_CAPTURE
+    assert len(result.capture_dated) == 1
+
+
+# --- NOTE-1: the weaker provenance is RENDERED weaker ----------------------------
+
+
+def test_a_capture_dated_statement_is_marked_in_the_report(parsed):
+    """Recorded distinctly is not enough. Rendered as an ordinary dated row
+    it carries the same authority as a printed date — which is precisely
+    what compounds a stale-label misattribution: the row that should invite
+    a second look invites none."""
+    report = build_report(_contents(parsed), generated_at="F")
+    assert "2026-06-05 ~" in report.summary_text
+    assert "recovered from a scan batch's own label" in report.summary_text
+
+
+def test_a_header_dated_statement_carries_no_marker(parsed):
+    """The control — the marker must distinguish, not decorate. If every row
+    carried it, it would say nothing."""
+    report = build_report(_contents(parsed), generated_at="F")
+    assert "2026-06-20 ~" not in report.summary_text
+
+
+def test_the_legend_is_absent_when_nothing_is_capture_dated():
+    """ILB in the other direction: a legend for a glyph that appears nowhere
+    is noise, and noise trains the reader to skip the section."""
+    contents = LedgerContents(
+        statements=[Statement(statement_date="2026-01-05")],
+        claim_lines=[ClaimLine(
+            statement_date="2026-01-05", claim_no="900", dos="2026-01-01",
+            amount_paid=Decimal("10.00"),
+        )],
+    )
+    report = build_report(contents, generated_at="F")
+    assert "recovered from a scan batch" not in report.summary_text

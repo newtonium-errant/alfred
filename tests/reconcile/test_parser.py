@@ -454,10 +454,10 @@ def test_split_table_row_plain():
 @pytest.mark.parametrize(
     "comment,expected",
     [
-        ("Invoice #163", "163"),
-        ("invoice 163", "163"),
-        ("Inv. #163 partial", "163"),
-        ("see INVOICE#163", "163"),
+        ("Invoice #487", "487"),
+        ("invoice 487", "487"),
+        ("Inv. #487 partial", "487"),
+        ("see INVOICE#487", "487"),
         ("no invoice here", ""),
         ("", ""),
     ],
@@ -470,4 +470,4 @@ def test_parse_invoice_no_takes_only_the_first_of_two():
     """Two invoices in one comment is genuinely ambiguous about which the
     line belongs to. The full comment stays on the row, so the ambiguity
     stays visible rather than being resolved by a silent guess."""
-    assert parse_invoice_no("Invoice #163 and Invoice #164") == "163"
+    assert parse_invoice_no("Invoice #487 and Invoice #488") == "487"

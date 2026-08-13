@@ -163,7 +163,7 @@ def test_eob_codes_match_case_insensitively():
 
 
 def test_negative_payment_is_a_reversal():
-    result = classify(_line(amount_paid=Decimal("-27444.00")))
+    result = classify(_line(amount_paid=Decimal("-31285.00")))
     assert CLASS_REVERSAL in result.classes
     assert "negative" in " ".join(result.reasons)
 

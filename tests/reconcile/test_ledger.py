@@ -73,10 +73,10 @@ def test_two_keyless_lines_stay_distinct():
 
 
 def test_money_round_trips_exactly_through_json():
-    line = _line(amount_paid=Decimal("-27444.00"), total_billed=Decimal("0.10"))
+    line = _line(amount_paid=Decimal("-31285.00"), total_billed=Decimal("0.10"))
     encoded = json.dumps(line.to_dict())
     restored = ClaimLine.from_dict(json.loads(encoded))
-    assert restored.amount_paid == Decimal("-27444.00")
+    assert restored.amount_paid == Decimal("-31285.00")
     assert restored.total_billed == Decimal("0.10")
     # And the sum is exact — the property a float would silently break.
     assert restored.total_billed * 3 == Decimal("0.30")

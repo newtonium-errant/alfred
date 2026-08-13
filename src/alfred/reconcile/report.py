@@ -62,6 +62,7 @@ from .attention import (
     propose_eob_mappings,
 )
 from .ledger import ClaimLine, LedgerContents, Statement, group_by_statement
+from .parser import DATE_SOURCE_CAPTURE
 from .money import format_money
 
 log = structlog.get_logger(__name__)
@@ -428,8 +429,16 @@ def build_summary(
             crossfoot += f"; {len(t.subtotal_mismatches)} subtotal mismatch(es)"
         elif t.subtotals_checked:
             crossfoot += f"; {t.subtotals_checked} subtotal(s) agree"
+        # NOTE-1: a capture-derived date is rendered DISTINCTLY, not just
+        # recorded distinctly. Shown as an ordinary dated statement it reads
+        # with the same authority as a printed one, which is exactly what
+        # compounds a stale-label misattribution: the row that should invite
+        # a second look invites none.
+        date_cell = t.statement.statement_date or "(no date)"
+        if t.statement.date_source == DATE_SOURCE_CAPTURE:
+            date_cell += " ~"
         out.append(
-            f"| {t.statement.statement_date or '(no date)'} "
+            f"| {date_cell} "
             f"| {t.statement.provider or '(unknown)'} "
             f"| {t.line_count} "
             f"| {format_money(t.billed)} "
@@ -473,6 +482,19 @@ def build_summary(
                     "  - _none of the declared figures equals our sum — worth "
                     "a look before trusting either side._"
                 )
+        out.append("")
+
+    if any(
+        t.statement.date_source == DATE_SOURCE_CAPTURE for t in grouped_totals
+    ):
+        # Stated, not left to be inferred from a glyph.
+        out.append(
+            "_`~` marks a statement whose DATE was recovered from a scan "
+            "batch's own label rather than printed by the provider. That is "
+            "a capture claim, not a provider one — it can be wrong in ways a "
+            "printed date cannot, and every line filed under it inherits the "
+            "doubt. Worth confirming before acting on those rows._"
+        )
         out.append("")
 
     discrepancies = [t for t in grouped_totals if _is_discrepant(t)]
