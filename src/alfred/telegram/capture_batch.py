@@ -169,7 +169,11 @@ of a possibility that was never chosen.
 
 Where each class goes. TEMPORARY until ambiguous-routing ships — when \
 the pending/decide surface exists, ``ambiguous`` will route there \
-instead of becoming a task, and this paragraph gets rewritten:
+instead of becoming a task, and this paragraph gets rewritten. \
+Whoever does that must revisit the "When you cannot tell whether a \
+promise was satisfied, EMIT the action item" rule above in the same \
+change: that rule and ``ambiguous`` agree today only because both \
+currently emit, and they stop agreeing the moment ``ambiguous`` stops:
 - ``commitment`` → emit as an action item.
 - ``exploration`` → do NOT emit as an action item. Write it into \
 ``open_questions`` as the open question it actually is, so it stays \
@@ -198,24 +202,36 @@ commitment from what the USER said.
 exploration and a commitment at once, and a session that is mostly \
 exploratory can still contain a real commitment.
 
-3. A hedge on TIMING is not a hedge on INTENT. "I think it'll be done \
-in the next day or two" commits to the work and estimates the date. \
-"It might need a second roost" commits to nothing.
+3. A hedge on TIMING is not a hedge on INTENT. "I think the main \
+hardening we're going to do is going to be done in the next day or \
+two" commits to the work and estimates the date. "It might need some \
+adjustment with a second roost" commits to nothing.
 
 4. If you are writing the same uncertainty into ``open_questions``, it \
-is not an action item — pick one. An item cannot be both something the \
-user is unsure about and something he undertook to do.
+is not an action item — UNLESS the user undertook to RESOLVE that \
+uncertainty. The open question is what is UNKNOWN; the action item is \
+the ACT OF FINDING OUT, and those are two different records. "And \
+those latches should be hard for a raccoon to open. I'm going to work \
+on that… I'm not sure if they'll be able to open it or not…" is \
+legitimately both: the question is whether the latches hold, the task \
+is going and checking. The roost failed this rule because nothing in \
+"It might need some adjustment with a second roost" undertakes \
+anything — no one in that sentence is going to go find out.
 
 Two further things that are not action items:
-- Practice already underway. "I'm still running the live trap every \
-night" describes a standing habit, not new outstanding work. There is \
-nothing for the user to close.
-- Day-scoped micro-instructions. "Complete the remaining sets today", \
-"log the sets in real time", "tell me when the first set begins" are \
-scoped to the day they were spoken in. They feed that day's totals and \
-expire with it; as backlog they are stale by morning. Do not emit them \
-as action items — the same way the fulfilment check above drops a \
-promise the user already kept.
+- Practice already underway. "I'm still using a live trap for the \
+raccoons every night…" describes a standing habit, not new outstanding \
+work. There is nothing for the user to close.
+- Day-scoped micro-instructions. Mid-activity notes are scoped to the \
+day they were spoken in. "All right, I'm doing workout B today… My \
+goal was four sets today, increase the volume" became the action item \
+"Complete remaining sets of goblet squat (55 lbs, targeting 4 sets, \
+first set was 8 reps)" — a live progress note filed as backlog, stale \
+by morning, and closed ``stale_day_scoped``. The same goes for \
+anything that only makes sense during the activity: logging sets as \
+they happen, pinging the user when the next one starts. Do not emit \
+these as action items — the same way the fulfilment check above drops \
+a promise the user already kept.
 
 Worked examples. The first three were emitted as tasks and the operator \
 cancelled all three:
@@ -245,9 +261,10 @@ second roost, but I think the main hardening we're going to do is going \
 to be done in the next day or two." Rule 2 splits this into two \
 candidates. "It might need" → ``exploration``, so the roost goes to \
 ``open_questions`` as "Does the baby barn coop need a second roost?" \
-and NOT to action items. "We're going to do ... in the next day or \
-two" → ``commitment``: "I think" hedges the date, not the intent (rule \
-3). The real failure emitted the roost BOTH as the open question "Does \
+and NOT to action items. "the main hardening we're going to do is \
+going to be done in the next day or two" → ``commitment``: "I think" \
+hedges the date, not the intent (rule 3). The real failure emitted the \
+roost BOTH as the open question "Does \
 the baby barn coop need a second roost added, and if so, when?" AND as \
 the action item "Assess whether the baby barn coop needs a second roost \
 added" — exactly the duplication rule 4 forbids.
@@ -261,18 +278,36 @@ with nothing conditional anywhere in it. → ``commitment``; emit it. \
 This is the pole to compare against: when the user has really \
 committed, you do not have to hunt for the evidence.
 
+BOTH AT ONCE, LEGITIMATELY — rule 4's carve-out, the shape that looks \
+like the roost and is not. The user asks "What was louka’s advice on \
+increasing sets reps and weight in the first few weeks?", then says \
+"If that’s what the instructions are then I’ll go with that until my \
+next check in". The uncertainty is real, so ``open_questions`` gets \
+"What exactly is Louka's/Lucas's advice on increasing sets, reps, and \
+weight in the first few weeks?". The undertaking is also real — "I’ll \
+go with that until my next check in" names the point at which he will \
+resolve it — so "Clarify progression guidelines at next check-in" is a \
+genuine action item. Emitting BOTH was correct here; the task closed \
+done. Compare the roost, where the same duplication was wrong because \
+no one undertook to find out.
+
 ALREADY UNDERWAY — "I'm still using a live trap for the raccoons every \
 night to see if we can discourage them…" Present progressive describing \
 a habit already running. Not an action item; the operator cancelled \
 this one as absorbed into ongoing practice.
 
 Where corrections accumulate: when a capture-emitted task turns out to \
-be a phantom, the operator cancels it and marks the task record \
-``closure_class: exploration``. Those cancelled records ARE the corpus \
-for this section — the three exploration examples above came from them. \
-Whoever edits this prompt next should read the ``closure_class`` \
-records added since the last edit and append any new failure shape here \
-as a worked example.
+be a phantom, the operator closes it and marks the task record with a \
+``closure_class`` — ``exploration`` for a thing never committed to, \
+``absorbed`` for standing practice, ``stale_day_scoped`` for an \
+instruction that outlived its day. EVERY ``closure_class`` on a \
+``created_by_capture`` task is corpus for this section, whatever its \
+value; the three above are only the classes that exist today. Each of \
+them taught something here — the exploration examples came from the \
+first, the live-trap bullet from the second, the workout bullet from \
+the third. Whoever edits this prompt next should read the ones added \
+since the last edit, including any class not named here, and append \
+each new failure shape as a worked example.
 
 Entity discrimination — default to NEW, not SAME. When this transcript \
 references a known entity (person, building, org, project, location), \
