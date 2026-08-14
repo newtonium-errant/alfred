@@ -70,17 +70,30 @@ describe.each(REGISTERS)('$name keeps the verdict hues out of reach', ({ name, f
     expect(selectors(css).length).toBeGreaterThan(3);
   });
 
-  it('re-points a role class only to the SAME role', () => {
+  it('re-points a role class only to the SAME role — FOLLOWING THE ALIAS CHAIN', () => {
     // NOT "never names a role class" — that was this pin's first form and it
     // failed the INCUMBENT for doing the right thing. `sensorLog.css` maps
     // `.text-danger -> var(--sensor-negative)`: the warm role class re-expressed
     // in the register's own vocabulary, where `--sensor-negative` itself aliases
     // `--console-negative`. Meaning preserved, hue preserved, palette local.
-    // That is the pattern, not the violation.
     //
-    // The violation is a role re-pointed to a DIFFERENT role — `.text-danger`
-    // painted with an affirm token. That is what makes the operator re-learn
-    // his colour vocabulary per room, and it is what this now checks.
+    // AND NOT the second form either, which compared the token's NAME. That
+    // enforced "re-pointed to a token NAMED like the same role" while the prose
+    // promised "re-pointed to the same role" — and name-consistency is a
+    // convention, not the property. The escape is one line:
+    //
+    //     --crt-negative: var(--console-affirm);
+    //     .text-danger { color: var(--crt-negative); }
+    //
+    // Every guard in this file went green — token-resolution satisfied, no-own-
+    // colour satisfied, the role pin satisfied by NAME — while danger rendered
+    // in the affirm hue. A guard that checks the label instead of the thing.
+    //
+    // So the walk follows each assignment through its aliases to the TERMINAL
+    // `--console-*` token and compares THAT role. An unresolvable terminal is a
+    // FAILURE, not a skip: a chain that does not end at a shared-layer role is
+    // exactly the smell this is looking for. The walk is bounded and tracks
+    // visited, so a cyclic alias fails loud rather than hanging the suite.
     const ROLE_OF: Record<string, string> = {
       danger: 'negative', negative: 'negative',
       affirm: 'affirm', caution: 'caution', info: 'info',
@@ -93,24 +106,63 @@ describe.each(REGISTERS)('$name keeps the verdict hues out of reach', ({ name, f
       })
       .filter((r): r is { sel: string; body: string } => r != null);
 
+    // Every `--x: <value>` in this sheet, LAST definition winning (the cascade's
+    // own rule — an appended redefinition is what the escape used).
+    const defs = new Map<string, string>();
+    for (const { body } of rules) {
+      for (const m of body.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+        defs.set(m[1], m[2].trim());
+      }
+    }
+
+    /** Follow a token to its terminal `--console-<role>`, or report why not. */
+    function terminalRole(token: string): { role: string | null; why: string } {
+      const seen = new Set<string>();
+      let cur = token;
+      for (let hop = 0; hop < 12; hop += 1) {
+        const direct = /^--console-(affirm|negative|caution|info)(?:-[a-z]+)?$/.exec(cur);
+        if (direct) return { role: direct[1], why: cur };
+        if (seen.has(cur)) return { role: null, why: `cyclic alias at ${cur}` };
+        seen.add(cur);
+        const value = defs.get(cur);
+        if (value === undefined) return { role: null, why: `${cur} is not defined here` };
+        const next = /^var\((--[a-z0-9-]+)\)$/.exec(value.trim());
+        if (!next) return { role: null, why: `${cur} resolves to a non-alias: ${value}` };
+        cur = next[1];
+      }
+      return { role: null, why: `alias chain from ${token} exceeded the hop cap` };
+    }
+
     const offenders: string[] = [];
+    let checked = 0;
     for (const { sel, body } of rules) {
       const named = [...sel.matchAll(/\.(?:text|bg|border)-(affirm|negative|caution|info|danger)\b/g)]
         .map((m) => ROLE_OF[m[1]]);
       if (named.length === 0) continue;
-      const assigned = [...body.matchAll(/var\(--[a-z-]*?-(affirm|negative|caution|info)(?:-[a-z]+)?\)/g)]
-        .map((m) => m[1]);
+      const used = [...body.matchAll(/var\((--[a-z0-9-]+)\)/g)].map((m) => m[1]);
       for (const want of new Set(named)) {
-        for (const got of assigned) {
-          if (got !== want) offenders.push(`${sel.trim()} -> ${got} (expected ${want})`);
+        for (const token of used) {
+          checked += 1;
+          const { role, why } = terminalRole(token);
+          if (role === null) {
+            offenders.push(`${sel.trim()} -> ${token}: ${why}`);
+          } else if (role !== want) {
+            offenders.push(`${sel.trim()} -> ${token} terminates at ${why} (${role}), expected ${want}`);
+          }
         }
       }
     }
     expect(
       offenders,
-      `${file} paints one role's class with another role's token — the operator ` +
-        'would have to re-learn the colour vocabulary in this room.',
+      `${file} paints one role's class with another role's hue. The check FOLLOWS ` +
+        'aliases to the shared layer, so naming a token like the role it is not ' +
+        'no longer passes.',
     ).toEqual([]);
+    // Vacuity control: this register may legitimately re-point no role class at
+    // all (viewscreen/crt do not), but if it does, the walk must have run.
+    if (rules.some((r) => /\.(?:text|bg|border)-(affirm|negative|caution|info|danger)\b/.test(r.sel))) {
+      expect(checked).toBeGreaterThan(0);
+    }
   });
 
   it('scopes every surface rule to a CLASS, never a bare element', () => {
