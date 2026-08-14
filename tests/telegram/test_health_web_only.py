@@ -24,6 +24,7 @@ from alfred.telegram.health import (
     _check_allowed_users,
     _check_bot_token,
     _check_stt_key,
+    _check_tts_key,
     _web_only_enabled,
     health_check,
 )
@@ -146,7 +147,7 @@ def test_stt_key_skips_under_web_only_and_warns_otherwise() -> None:
     )
 
 
-def test_all_three_skips_use_the_one_wording() -> None:
+def test_all_four_skips_use_the_one_wording() -> None:
     """Single-spelled, so a grep finds every quieted check at once and the
     three cannot drift into three different explanations of the same
     state."""
@@ -154,6 +155,7 @@ def test_all_three_skips_use_the_one_wording() -> None:
         _check_bot_token("", web_only=True).detail,
         _check_allowed_users([], web_only=True).detail,
         _check_stt_key({}, web_only=True).detail,
+        _check_tts_key({"api_key": ""}, web_only=True).detail,
     }
     assert details == {WEB_ONLY_SKIP_DETAIL}
     # The wording has to answer "quiet or broken?" for a digest reader.
@@ -174,11 +176,14 @@ async def test_health_check_quiets_the_three_on_a_web_only_instance() -> None:
     """Drives ``health_check``, not the helpers — a probe that skips only
     when called directly is a fix nothing runs."""
     raw = {
-        "telegram": {"bot_token": "", "allowed_users": [], "stt": {}},
+        "telegram": {
+            "bot_token": "", "allowed_users": [], "stt": {},
+            "tts": {"api_key": "${ELEVENLABS_API_KEY_UNSET}"},
+        },
         "web": {"enabled": True, "web_only": True},
     }
     got = _results_by_name(await health_check(raw))
-    for name in ("bot-token", "allowed-users", "stt-key"):
+    for name in ("bot-token", "allowed-users", "stt-key", "tts-key"):
         assert got[name].status is Status.SKIP, name
         assert got[name].detail == WEB_ONLY_SKIP_DETAIL
 
@@ -197,7 +202,10 @@ async def test_health_check_logs_that_it_quieted_checks() -> None:
     """Quieting a check is exactly where silence and breakage look alike,
     so the run says so out loud, at production log level."""
     raw = {
-        "telegram": {"bot_token": "", "allowed_users": [], "stt": {}},
+        "telegram": {
+            "bot_token": "", "allowed_users": [], "stt": {},
+            "tts": {"api_key": "${ELEVENLABS_API_KEY_UNSET}"},
+        },
         "web": {"enabled": True, "web_only": True},
     }
     with structlog.testing.capture_logs() as captured:
@@ -208,7 +216,9 @@ async def test_health_check_logs_that_it_quieted_checks() -> None:
         if c.get("event") == "talker.health.web_only_checks_skipped"
     ]
     assert len(matches) == 1
-    assert matches[0]["skipped"] == ["bot-token", "allowed-users", "stt-key"]
+    assert matches[0]["skipped"] == [
+        "bot-token", "allowed-users", "stt-key", "tts-key",
+    ]
     assert matches[0]["detail"] == WEB_ONLY_SKIP_DETAIL
 
 
@@ -224,3 +234,87 @@ async def test_health_check_does_not_log_quieting_on_a_standard_instance(
         c for c in captured
         if c.get("event") == "talker.health.web_only_checks_skipped"
     ] == []
+
+
+# ---------------------------------------------------------------------------
+# The fourth sibling — tts-key (reviewer fold)
+# ---------------------------------------------------------------------------
+#
+# Found by the reviewer, not by this lane, and it carries the SAME
+# half-removal shape the lane's own commit body cites as the reason for
+# gating both bot-token branches. The driven table below crosses both
+# axes deliberately: three key states x web_only on/off, so "quiet when
+# declared" and "loud otherwise" are both pinned rather than assumed.
+
+
+def test_tts_absent_section_still_skips_on_a_standard_instance() -> None:
+    """Pre-existing behaviour preserved: an absent tts section is opt-out,
+    not breakage. The fold must not disturb it."""
+    r = _check_tts_key(None, web_only=False)
+    assert r.status is Status.SKIP
+    assert "opt-in" in r.detail
+
+
+def test_tts_absent_section_skips_under_web_only_with_instance_wording() -> None:
+    """Still SKIP; the detail now explains the INSTANCE rather than the
+    section, so all four probes give one answer to "why is this quiet?"."""
+    r = _check_tts_key(None, web_only=True)
+    assert r.status is Status.SKIP
+    assert r.detail == WEB_ONLY_SKIP_DETAIL
+
+
+def test_tts_empty_key_skips_under_web_only() -> None:
+    r = _check_tts_key({"api_key": ""}, web_only=True)
+    assert r.status is Status.SKIP
+    assert r.detail == WEB_ONLY_SKIP_DETAIL
+
+
+def test_tts_unresolved_placeholder_skips_under_web_only() -> None:
+    """The half-removal shape on the fourth probe — a tts block left
+    behind with its key re-commented, on an instance with no Telegram to
+    speak through."""
+    r = _check_tts_key({"api_key": "${ELEVENLABS_API_KEY}"}, web_only=True)
+    assert r.status is Status.SKIP
+    assert r.detail == WEB_ONLY_SKIP_DETAIL
+
+
+def test_tts_both_failure_branches_stay_loud_on_a_standard_instance() -> None:
+    """Positive control crossing the same axis. Identical inputs, no
+    web_only declaration, and both branches must still report — otherwise
+    the SKIP pins above would pass against a probe that never speaks."""
+    assert _check_tts_key({"api_key": ""}, web_only=False).status is Status.FAIL
+    assert (
+        _check_tts_key({"api_key": "${ELEVENLABS_API_KEY}"}, web_only=False).status
+        is Status.FAIL
+    )
+    assert (
+        _check_tts_key({"api_key": "DUMMY_ELEVENLABS_TEST_KEY"}, web_only=False).status
+        is Status.OK
+    )
+
+
+async def test_health_check_quiets_tts_on_a_web_only_instance() -> None:
+    """Through the production entry point, with the tts block present and
+    half-removed — the exact state a Telegram cleanup leaves behind."""
+    raw = {
+        "telegram": {
+            "bot_token": "", "allowed_users": [], "stt": {},
+            "tts": {"api_key": "${ELEVENLABS_API_KEY}"},
+        },
+        "web": {"enabled": True, "web_only": True},
+    }
+    got = _results_by_name(await health_check(raw))
+    assert got["tts-key"].status is Status.SKIP
+    assert got["tts-key"].detail == WEB_ONLY_SKIP_DETAIL
+
+
+async def test_health_check_tts_still_fails_on_a_standard_instance() -> None:
+    """Same config minus the declaration — the probe stays loud."""
+    raw = {
+        "telegram": {
+            "bot_token": "", "allowed_users": [], "stt": {},
+            "tts": {"api_key": "${ELEVENLABS_API_KEY}"},
+        },
+    }
+    got = _results_by_name(await health_check(raw))
+    assert got["tts-key"].status is Status.FAIL

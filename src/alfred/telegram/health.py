@@ -35,7 +35,7 @@ log = structlog.get_logger(__name__)
 #: This string is read by a human scanning a digest or BIT rollup, and it has
 #: to answer the question a quiet check provokes — is it quiet, or is it
 #: broken? Naming the mode AND the intent does that; "skipped" alone does not.
-#: Single-spelled so all three probes say the same thing and a grep finds every
+#: Single-spelled so all four probes say the same thing and a grep finds every
 #: quieted check at once.
 WEB_ONLY_SKIP_DETAIL = (
     "web_only mode — Telegram intentionally disabled "
@@ -155,12 +155,33 @@ def _check_allowed_users(allowed: list, *, web_only: bool) -> CheckResult:
 # --- wk2b c6: TTS probes --------------------------------------------------
 
 
-def _check_tts_key(tts: dict | None) -> CheckResult:
+def _check_tts_key(tts: dict | None, *, web_only: bool) -> CheckResult:
     """Static probe: TTS api_key present + env var resolved.
 
     SKIPs when the ``tts`` section is absent (opt-in feature — its
-    absence shouldn't fail the talker's overall health rollup).
+    absence shouldn't fail the talker's overall health rollup), and
+    SKIPs entirely under ``web_only``.
+
+    The fourth sibling. This probe carries the SAME half-removal shape
+    as ``_check_bot_token``: a ``telegram.tts`` block left behind with
+    its key re-commented resolves to a ``${...}`` placeholder and FAILs,
+    on an instance that has no Telegram to speak through. Latent while
+    the env var happens to resolve; it bites precisely during a "we're
+    done with Telegram here" cleanup, which is the quiesce's own
+    trajectory. Both failure branches skip, for the same reason both
+    bot-token branches do.
+
+    ``web_only`` is checked FIRST, so on a web-only instance the detail
+    explains the instance rather than the section — all four probes then
+    give one answer to "why is this quiet?" instead of four. Absent-tts
+    still SKIPs either way; only the wording changes.
     """
+    if web_only:
+        return CheckResult(
+            name="tts-key",
+            status=Status.SKIP,
+            detail=WEB_ONLY_SKIP_DETAIL,
+        )
     if tts is None:
         return CheckResult(
             name="tts-key",
@@ -432,7 +453,7 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
         # wearing a log statement.
         log.info(
             "talker.health.web_only_checks_skipped",
-            skipped=["bot-token", "allowed-users", "stt-key"],
+            skipped=["bot-token", "allowed-users", "stt-key", "tts-key"],
             detail=WEB_ONLY_SKIP_DETAIL,
         )
 
@@ -442,7 +463,7 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
             tel.get("allowed_users", []) or [], web_only=web_only,
         ),
         _check_stt_key(tel.get("stt", {}) or {}, web_only=web_only),
-        _check_tts_key(tts_raw),
+        _check_tts_key(tts_raw, web_only=web_only),
         _check_capture_handlers(),
         _check_skill_capability_audit(raw),
     ]
