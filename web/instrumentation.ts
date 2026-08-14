@@ -23,9 +23,13 @@
  *    part the first version of this file got wrong, so it is written down
  *    precisely:
  *
- *    `pushNotifier` pulls in `web-push` and the node fs-backed stores, so its
- *    transitive imports need `fs/promises`, `path` and `http` — none of which
- *    resolve in the EDGE compilation. Next replaces `process.env.NEXT_RUNTIME`
+ *    `pushNotifier` pulls in `web-push` and the node fs-backed stores. What the
+ *    failing build ACTUALLY reported (quoted from the compiler, per this trap's
+ *    own thesis that only the real compiler tells the truth about the bundle):
+ *    `Can't resolve 'http'` x2, `'https'` x2, `'net'` x1 — via
+ *    web-push -> https-proxy-agent -> agent-base. The fs-backed stores'
+ *    `fs/promises` would ALSO fail here, but it is not what the compiler
+ *    printed; none of these resolve in the EDGE compilation. Next replaces `process.env.NEXT_RUNTIME`
  *    with a per-compilation literal, so a guard on it is statically decidable;
  *    but webpack eliminates dead BRANCH BODIES, and an early return is not one.
  *    Written as
