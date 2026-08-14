@@ -1689,6 +1689,11 @@ async def run(
         feed_store = None
         feed_daily_sync_config = None
         feed_instance_scope = ""
+        # The contact router's emit handle (C4). Built HERE, inside the same
+        # belt, because this is where the resolved feed store path exists —
+        # ``None`` (an unwired or failed feed) means the router records
+        # overrides and proposes nothing, which it logs at the override site.
+        feed_emit_handle = None
         try:
             from alfred.daily_sync.config import (
                 load_from_unified as load_daily_sync_config,
@@ -1707,6 +1712,15 @@ async def run(
                 )
                 feed_daily_sync_config = load_daily_sync_config(raw)
                 feed_instance_scope = config.instance.tool_set or "talker"
+                # Same store the deck reads and the sync producer writes — the
+                # pattern card must land where the operator already looks.
+                from alfred.feed.emit import FeedEmitHandle
+
+                feed_emit_handle = FeedEmitHandle(
+                    store_path=_feed_cfg.store_path,
+                    instance=config.instance.name,
+                    enabled=True,
+                )
         except Exception:  # noqa: BLE001 — feed must never break transport setup
             log.exception("talker.daemon.feed_setup_failed")
             feed_enabled = False
@@ -1949,6 +1963,10 @@ async def run(
                         if transport_config is not None
                         else None
                     ),
+                    # C4 contact router: the handle the pattern cards are
+                    # dealt through. ``None`` when the feed is off/unwired —
+                    # the router still records, and says it proposed nowhere.
+                    feed_emit=feed_emit_handle,
                 )
         else:
             # Intentionally-left-blank: a disabled / unmountable web

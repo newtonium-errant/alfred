@@ -38,3 +38,16 @@ KEY_WEB_DATA_DIR = "web.data_dir"
 # (peer_handlers.register_web_notify_sink) on web_notify-tagged notices;
 # read by routes_notify keyed to the resolving identity's synthetic id.
 KEY_WEB_NOTIFY_STORE = "web.notify_store"
+# The contact-surface router's state store (C4), or ``None`` when no state path
+# is anchored (``web.contact_router.state_path`` absent AND no ``logging.dir`` to
+# derive from). ``None`` is a supported state, not a failure: ``/day/state`` then
+# serves ``configured: false`` and the PWA does not route at all — staying put is
+# the fail-safe, and a cwd-guessed path would let one instance route on another's
+# contact log (#74). Written only by the ``/day/*`` handlers and the feed-act
+# dispatcher, both of which run in the talker daemon (single-writer).
+KEY_WEB_CONTACT_STORE = "web.contact_store"
+# The ``FeedEmitHandle`` the contact router deals pattern cards through, or
+# ``None`` when the feed is unwired/disabled. Optional by design: absent means
+# overrides are still recorded and simply proposed nowhere (logged, never
+# silent) — the same no-emit fail-safe the classify-time email handle uses.
+KEY_WEB_CONTACT_FEED = "web.contact_feed"

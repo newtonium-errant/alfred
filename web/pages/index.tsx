@@ -9,6 +9,7 @@ import { SlotBoard } from '../components/feed/SlotBoard';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
+import { useContactRouter } from '../lib/algernon/useContactRouter';
 import { authApi } from '../lib/algernon/authClient';
 import {
   briefCardDetail,
@@ -126,6 +127,13 @@ export default function HomePage() {
   // #62 (3) resume freshness + (2) override supersession, on the composer too —
   // this is the surface the operator actually reopens in the morning.
   useResumeRefetch(() => { if (authed) void loadFeed(); });
+
+  // C4 contact-surface router. `/` is the PWA's start_url, so landing here IS
+  // app-open — the one entry point that has not already expressed an intent (a
+  // push tap, a share, a bookmark all name their own surface). Fires once per
+  // mount and never on resume: a router that re-ran would pull the operator off
+  // whatever they had deliberately opened.
+  useContactRouter({ enabled: authed, router });
   useEffect(() => {
     if (items) completion.reconcile(items);
     // eslint-disable-next-line react-hooks/exhaustive-deps

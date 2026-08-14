@@ -63,6 +63,8 @@ from .keys import (
     KEY_WEB_ANTHROPIC,
     KEY_WEB_AUTH_STATE,
     KEY_WEB_CONFIG,
+    KEY_WEB_CONTACT_FEED,
+    KEY_WEB_CONTACT_STORE,
     KEY_WEB_DATA_DIR,
     KEY_WEB_INFLIGHT,
     KEY_WEB_NOTIFY_STORE,
@@ -1341,6 +1343,7 @@ def register_web_routes(
     vault_context_str: str,
     allowed_user_ids: "list[int] | None" = None,
     data_dir: "str | None" = None,
+    feed_emit: Any = None,
 ) -> bool:
     """Mount the web chat + auth routes onto ``app`` — IFF web is enabled.
 
@@ -1525,6 +1528,58 @@ def register_web_routes(
         log.info(
             "web.routes.notifications_disabled",
             reason="web.notifications.enabled=false",
+        )
+
+    # Contact-surface router routes (/day/*) — C4, the consumer of the
+    # operator's ``contact-surface routing`` preference record. Default-ON
+    # (web.contact_router.enabled) but INERT until a state path is anchored:
+    # with no store the routes serve ``configured: false`` and the PWA stays
+    # exactly where it is, so a default-on router does nothing on an instance
+    # that has not wired it. The path comes from the config layer, which
+    # resolved it through the SAME helper the feed-act dispatcher uses.
+    if web_config.contact_router.enabled:
+        from .contact_state import WebContactStore
+        from .routes_day import register_day_routes
+
+        contact_store = None
+        if web_config.contact_router.state_path:
+            contact_store = WebContactStore.create(
+                web_config.contact_router.state_path
+            )
+            contact_store.load()
+            log.info(
+                "web.routes.contact_store_wired",
+                state_path=str(contact_store.state_path),
+            )
+        else:
+            # Intentionally-left-blank: nothing anchored the path (no
+            # logging.dir, no explicit state_path). The routes still mount and
+            # answer honestly; guessing the cwd would be worse than not routing.
+            log.info(
+                "web.routes.contact_store_skipped",
+                reason="no state path anchored (web.contact_router.state_path "
+                       "absent and no logging.dir to derive from) — /day/state "
+                       "serves configured:false and the PWA will not route",
+            )
+        app[KEY_WEB_CONTACT_STORE] = contact_store
+        # Optional: absent means overrides are still recorded and pattern cards
+        # are proposed nowhere (logged at the override site, never silent).
+        app[KEY_WEB_CONTACT_FEED] = feed_emit
+        if feed_emit is None:
+            log.info(
+                "web.routes.contact_feed_absent",
+                reason="no feed emit handle threaded — override patterns will "
+                       "be recorded but no deck card can be dealt",
+            )
+        register_day_routes(app)
+        mounted_routes += ["/day/state", "/day/contact", "/day/override"]
+    else:
+        # Intentionally-left-blank: an explicit opt-out is a deliberate state.
+        app[KEY_WEB_CONTACT_STORE] = None
+        app[KEY_WEB_CONTACT_FEED] = None
+        log.info(
+            "web.routes.contact_router_disabled",
+            reason="web.contact_router.enabled=false",
         )
 
     # Voice routes (/voice/*) — V0 WebRTC echo, default-OFF behind

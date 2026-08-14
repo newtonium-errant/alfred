@@ -430,6 +430,7 @@ export const KIND_LABELS: Record<string, string> = {
   peer_digest: 'Peer digest',
   weather: 'Weather',
   ops_notable: 'Ops',
+  pattern_surfaced: 'Pattern',
 };
 
 export function kindLabel(kind: string): string {

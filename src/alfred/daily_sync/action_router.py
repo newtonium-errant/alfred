@@ -167,7 +167,18 @@ DEFER_ACTIONS: tuple[str, ...] = (DEFER_NEXT_RENDER, *DEFER_DURATIONS)
 #: Kinds that get the generic defer capability. Every decide kind EXCEPT
 #: ``slot_suggestion``, which keeps its board snooze semantics untouched —
 #: giving it both would put two defer mechanisms on one card.
-DEFER_EXCLUDED_KINDS: frozenset[str] = frozenset({"slot_suggestion"})
+#:
+#: ``pattern_surfaced`` (C4) is excluded for the SAME reason with a different
+#: store: its ``ignore`` verb is a windowed set-aside written to the contact
+#: router's own suppression map (the window is the operator's own
+#: ``pattern_surfacing.window_days``, not this ladder's 1/3/7), and it is what
+#: stops the pattern being re-detected and re-dealt. A generic defer beside it
+#: would be a second set-aside that the detector does not consult — the card
+#: would return on the next override regardless, which is a promise broken
+#: rather than a rung offered.
+DEFER_EXCLUDED_KINDS: frozenset[str] = frozenset(
+    {"slot_suggestion", "pattern_surfaced"}
+)
 
 
 FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
@@ -243,6 +254,22 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # action other than ``ack`` is invalid — the ceiling stays closed.
     "email_urgent": {
         "ack": {},
+    },
+    # pattern_surfaced (C4) — the contact-surface router's propose-only card.
+    # Like slot's and email_urgent's, the kwargs are UNUSED: it synthesizes no
+    # ReplyCorrection and reads no last_batch. It is intercepted by
+    # :func:`_dispatch_contact_pattern`, which writes the contact router's own
+    # store and nothing else.
+    #
+    # TWO verbs, and the ceiling is closed at two on purpose. The spec's card
+    # offers four adjustments; "Dismiss" and "Ignore for N days" are the same
+    # act once a suppression window backs both, and "Add inferred condition"
+    # edits the operator's rule set rather than the router's behaviour — that
+    # is a change to the policy, not a use of it, and it is declared unbuilt on
+    # the card itself rather than stubbed here.
+    "pattern_surfaced": {
+        "adopt": {},
+        "ignore": {},
     },
 }
 
@@ -344,6 +371,26 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
     },
     "email_urgent": {
         "ack": {"label": "Got it", "weight": "light", "gesture": _GESTURE_AFFIRM},
+    },
+    "pattern_surfaced": {
+        # HEAVY: this is the only tap in the system that changes what the router
+        # opens to. Everything else in C4 observes; this decides. A verb that
+        # alters future behaviour must not commit on one motion.
+        "adopt": {
+            "label": "Adopt",
+            "weight": "heavy",
+            "gesture": _GESTURE_AFFIRM,
+            "note": (
+                "Opens the surface you keep choosing whenever this rule fires, "
+                "from your next contact on. Nothing in your preference record "
+                "changes."
+            ),
+        },
+        "ignore": {
+            "label": "Ignore",
+            "weight": "light",
+            "gesture": _GESTURE_REJECT,
+        },
     },
 }
 
@@ -825,6 +872,136 @@ def _dispatch_feed_defer(
         else "set aside — it comes back at the next sync",
         feed_item_id, action_id,
     )
+
+
+#: The contact-surface router's kind + its two verbs, spelled once here so the
+#: intercept below and the ceiling above cannot drift. The producer's own copy
+#: lives in ``alfred.web.contact_patterns``; these are pinned equal by
+#: ``tests/web/test_contact_pattern_card.py``.
+PATTERN_KIND = "pattern_surfaced"
+PATTERN_ADOPT = "adopt"
+PATTERN_IGNORE = "ignore"
+
+
+def _contact_store_path(config: Any) -> str | None:
+    """Resolve the contact-router store from the instance's OWN config file.
+
+    The exact shape of :func:`_snooze_store_path`, and for the exact reason:
+    the ``/day/*`` routes write this file and this dispatcher writes it too, so
+    both must resolve it through ONE parse. ``resolve_contact_state_path`` is
+    that parse — the web config layer calls the same function at config load.
+
+    ``None`` = not wired on this instance, and the verbs then refuse honestly
+    rather than accepting a tap they would silently drop.
+    """
+    from alfred.web.contact_state import resolve_contact_state_path
+
+    config_path = getattr(config, "config_path", None) or "config.yaml"
+    try:
+        import yaml as _yaml
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f) or {}
+    except Exception as exc:  # noqa: BLE001
+        log.info("contact_router.config_unavailable", error=str(exc))
+        return None
+    return resolve_contact_state_path(raw)
+
+
+def _dispatch_contact_pattern(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    config: Any,
+) -> ActResult:
+    """Apply ``adopt`` / ``ignore`` on a ``pattern_surfaced`` card (C4).
+
+    The operator-approval end of the self-correcting loop. ``adopt`` is the ONLY
+    write in the system that changes what the contact router opens to; ``ignore``
+    silences this pattern for the operator's own ``window_days``.
+
+    WRITES EXACTLY ONE FILE — the contact router's store — and reads the card's
+    own ``source_ref``/``evidence`` for everything it needs. No vault op, no
+    preference-record edit (the rule set and levers stay the operator's, edited
+    where they live), no resolver, no ``last_batch``. Adopting a routing habit
+    must not be able to touch a record.
+
+    CRASH-ISOLATED like every other dispatcher: a store fault fails THIS act and
+    leaves the card open, rather than raising into ``act`` or leaving the card
+    judged with nothing written behind it.
+    """
+    evidence = getattr(item, "evidence", None) or {}
+    source_ref = getattr(item, "source_ref", None) or {}
+    rule = str(evidence.get("rule") or "")
+    surface = str(evidence.get("observed_surface") or "")
+    window_days = evidence.get("window_days")
+    # The key the card was minted for — carried on the card rather than
+    # re-derived here, so the act path holds no opinion about who the operator
+    # is (see ``contact_patterns.build_pattern_item``).
+    user_key = str(source_ref.get("user_key") or "")
+    if not rule or not surface or not user_key:
+        log.warning(
+            "contact_router.act_incomplete_card",
+            id=feed_item_id, action=action_id,
+            has_rule=bool(rule), has_surface=bool(surface),
+            has_user_key=bool(user_key),
+            detail="the card is missing what the write needs — refusing rather "
+                   "than guessing which rule or operator it meant",
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "this card is missing the detail that tap needs — it stays open",
+            feed_item_id, action_id,
+        )
+
+    store_path = _contact_store_path(config)
+    if store_path is None:
+        # Honest refusal, not a silent no-op: the operator tapped, and a tap
+        # that writes nowhere must say so rather than flipping the card.
+        log.info(
+            "contact_router.act_not_wired",
+            id=feed_item_id, action=action_id,
+            detail="no contact-router state path on this instance — refusing "
+                   "the tap rather than dropping it",
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "the contact router isn't wired on this instance — nothing changed",
+            feed_item_id, action_id,
+        )
+
+    try:
+        from alfred.web.contact_state import WebContactStore
+
+        store = WebContactStore.create(store_path)
+        store.load()
+        if action_id == PATTERN_ADOPT:
+            store.adopt_default(user_key, rule=rule, surface=surface)
+            detail = f"opening {surface} for this rule from now on"
+        else:
+            days = window_days if isinstance(window_days, int) else 14
+            store.suppress_pattern(user_key, f"{rule}->{surface}", days=days)
+            detail = f"won't raise this again for {days} days"
+    except Exception as exc:  # noqa: BLE001 — a store fault fails one act only
+        log.warning(
+            "contact_router.act_failed",
+            id=feed_item_id, action=action_id, error=type(exc).__name__,
+            detail=str(exc)[:200],
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "couldn't save that just now — the card stays open",
+            feed_item_id, action_id,
+        )
+
+    feed_store.set_state(feed_item_id, STATE_ACTED, action=action_id)
+    log.info(
+        "contact_router.acted",
+        id=feed_item_id, action=action_id, rule=rule, surface=surface,
+    )
+    return ActResult(True, STATUS_ACTED, detail, feed_item_id, action_id)
 
 
 def _dispatch_slot_snooze(
@@ -1770,6 +1947,26 @@ def _act_locked(
     # board snooze), so arriving here means this kind really does have it.
     if action_id in DEFER_ACTIONS and action_id in FEED_ACTIONS.get(kind, {}):
         return _dispatch_feed_defer(feed_item_id, action_id, feed_store=feed_store)
+
+    # Contact-surface router (C4) — intercepted here for the same reason the
+    # urgent ack and the slot verbs are: this kind is emitted per-override by
+    # the web surface, so there is no sync batch to re-derive it from and
+    # ``_load_batch_item`` below would answer stale_item for every tap. The
+    # ceiling check runs FIRST so an unmapped verb is still invalid_action.
+    if kind == PATTERN_KIND:
+        if action_id not in FEED_ACTIONS.get(PATTERN_KIND, {}):
+            log.info(
+                "feed.act.invalid_action", id=feed_item_id, kind=kind,
+                action=action_id, reason="pattern_unmapped_verb",
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                f"'{action_id}' is not a valid action for a {kind} item",
+                feed_item_id, action_id,
+            )
+        return _dispatch_contact_pattern(
+            feed_item_id, action_id, item, feed_store=feed_store, config=config,
+        )
 
     # The (kind, action) map is the capability ceiling.
     kind_actions = FEED_ACTIONS.get(kind)

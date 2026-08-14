@@ -33,6 +33,8 @@ from typing import Any
 from alfred._env import substitute_env_in_value
 from alfred.common.instance_paths import configured_logging_dir
 
+from .contact_state import resolve_contact_state_path
+
 # The voice-calibration corpus directory, under the instance's data dir. Both
 # telemetry families (endpoint-hold and V3.1 barge) share it, discriminated by
 # ``event_family`` inside one ``events.jsonl``.
@@ -377,6 +379,30 @@ class WebNotificationsConfig:
 
 
 @dataclass
+class WebContactRouterConfig:
+    """Contact-surface router config (``web.contact_router``, C4).
+
+    ``enabled`` defaults **True**, like notifications and for the same reason:
+    the surface is inert until there is something to route on. The routes serve
+    ``configured: false`` whenever no state path is anchored, and the PWA then
+    stays exactly where it is — so a default-on router does nothing at all on an
+    instance that has not wired it.
+
+    ``state_path`` is the RESOLVED path, filled by
+    :func:`alfred.web.contact_state.resolve_contact_state_path` at config load
+    (explicit ``web.contact_router.state_path`` wins; otherwise it derives from
+    the instance's own ``logging.dir``). ``""`` means nothing anchored it —
+    deliberately NOT a cwd-relative fallback, which is how one instance's writer
+    lands in another's store (#74). The feed-act dispatcher resolves the same
+    path through the same function from the instance's own config file, so the
+    writer here and the reader there cannot drift.
+    """
+
+    enabled: bool = True
+    state_path: str = ""
+
+
+@dataclass
 class WebConfig:
     """Typed config for the ``web:`` section.
 
@@ -392,6 +418,8 @@ class WebConfig:
     voice: WebVoiceConfig = field(default_factory=WebVoiceConfig)
     notifications: WebNotificationsConfig = field(
         default_factory=WebNotificationsConfig)
+    contact_router: WebContactRouterConfig = field(
+        default_factory=WebContactRouterConfig)
     # Tool-scoped state path for the single-use magic-link nonce store
     # (per the load() schema-tolerance contract's "default state paths must
     # be tool-scoped" rule). Overridable per-instance.
@@ -768,6 +796,27 @@ def _build_notifications(raw: Any) -> WebNotificationsConfig:
     )
 
 
+def _build_contact_router(
+    raw_section: Any, *, unified: dict[str, Any]
+) -> WebContactRouterConfig:
+    """Hand-roll ``WebContactRouterConfig`` with a schema-tolerance filter.
+
+    ``state_path`` is NOT read off the section directly — it comes from
+    :func:`resolve_contact_state_path`, which is THE parse of that key and is
+    also what the feed-act dispatcher calls. Reading it here as well would be a
+    second spelling of one derivation, and the failure mode of two spellings is
+    silent: overrides written to a file nothing reads.
+    """
+    defaults = WebContactRouterConfig()
+    section = raw_section if isinstance(raw_section, dict) else {}
+    known = WebContactRouterConfig.__dataclass_fields__
+    filtered = {k: v for k, v in section.items() if k in known}
+    return WebContactRouterConfig(
+        enabled=bool(filtered.get("enabled", defaults.enabled)),
+        state_path=resolve_contact_state_path(unified) or "",
+    )
+
+
 def _int(value: Any, default: int) -> int:
     """Coerce to int, falling back to ``default`` on None / bad input."""
     try:
@@ -810,6 +859,12 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
         voice=_build_voice(
             section.get("voice"), data_dir=configured_logging_dir(raw) or ""),
         notifications=_build_notifications(section.get("notifications")),
+        # Resolved from the UNIFIED dict, not the web section: the derived
+        # default anchors on top-level ``logging.dir``, exactly like ``voice``'s
+        # data_dir above.
+        contact_router=_build_contact_router(
+            section.get("contact_router"), unified=raw
+        ),
         state_path=str(
             section.get("state_path", "./data/web_auth_state.json")
             or "./data/web_auth_state.json"

@@ -115,7 +115,7 @@ KINDS: frozenset[str] = frozenset({
     "email_tier", "email_urgent", "attribution", "proposal", "pending", "routine_match",
     "recurrence", "contract", "slot_suggestion", "routing", "health", "weather",
     "event", "ops_notable", "ticket_notice", "radar", "friction",
-    "notegen_readout", "peer_digest",
+    "notegen_readout", "peer_digest", "pattern_surfaced",
 })
 
 # Static per-kind (mode, attention) defaults, seeded from the step-2 severity map
@@ -137,6 +137,12 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     "contract": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "slot_suggestion": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     "routing": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
+    # C4 — the contact-surface router noticed it keeps being overridden the same
+    # way and is ASKING. decide/needs_you because the whole point is that it is
+    # never applied silently: the operator's tap is the only thing that changes
+    # the router's behaviour (the self-correcting standard's propose-then-
+    # approve arrow, made visible on the deck).
+    "pattern_surfaced": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     # Awareness kinds — surfaced for glance, no decision demanded.
     # attribution (#63a) was a decide kind until the operator ruled that these
     # confirmations are consistently correct, so reviewing them in the deck cost

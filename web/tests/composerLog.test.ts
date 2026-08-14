@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
 import type { NextRouter } from 'next/router';
-import { useComposerLog } from '../lib/algernon/composerLog';
+import {
+  ROUTER_NAV_SUPPRESSION_MS,
+  __resetRouterNavigation,
+  markRouterNavigation,
+  useComposerLog,
+} from '../lib/algernon/composerLog';
 
 // Pins the composer telemetry wiring: 'composed' once on mount, 'navigated_away'
 // on the FIRST route change within the 10s window (and never after, never twice),
@@ -34,6 +39,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   fetchMock = vi.fn().mockResolvedValue({});
   vi.stubGlobal('fetch', fetchMock);
+  __resetRouterNavigation();
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -97,5 +103,62 @@ describe('useComposerLog', () => {
     vi.advanceTimersByTime(500);
     act(() => router.emit('/x'.repeat(300)));
     expect((lastBody().path as string).length).toBe(200);
+  });
+});
+
+// C4: an auto-routed app-open is not the operator abandoning the composer.
+// `navigated_away` is not gated on the operator having typed anything — ANY
+// route change inside the window counts — so without this suppression every
+// routed open would log "abandoned after 200ms" into the very dataset Phase D
+// tunes the composer's rule from.
+describe('a machine-driven navigation is not the operator leaving', () => {
+  it('suppresses the navigated_away for a marked navigation', () => {
+    const router = mockRouter();
+    renderHook(() => useComposerLog('feed', router));
+    fetchMock.mockClear();
+    vi.advanceTimersByTime(200);
+    markRouterNavigation(Date.now());
+    act(() => router.emit('/chat'));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('still logs the operator OWN navigation after a suppressed one', () => {
+    // The suppression is one-shot: spending it on the router's navigation must
+    // not spend the operator's. Without this, one routed open would blind the
+    // telemetry for the rest of the window.
+    const router = mockRouter();
+    renderHook(() => useComposerLog('feed', router));
+    fetchMock.mockClear();
+    vi.advanceTimersByTime(200);
+    markRouterNavigation(Date.now());
+    act(() => router.emit('/chat'));
+    act(() => router.emit('/deck'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(lastBody().event).toBe('navigated_away');
+    expect(lastBody().path).toBe('/deck');
+  });
+
+  it('does not suppress a navigation long after the mark', () => {
+    // A timestamp, not a boolean: a decision that never navigated must not
+    // leave the suppression latched on for the operator's next real move.
+    const router = mockRouter();
+    renderHook(() => useComposerLog('feed', router));
+    fetchMock.mockClear();
+    markRouterNavigation(Date.now());
+    vi.advanceTimersByTime(ROUTER_NAV_SUPPRESSION_MS + 1000);
+    act(() => router.emit('/deck'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(lastBody().event).toBe('navigated_away');
+  });
+
+  it('suppresses nothing when no navigation was marked', () => {
+    // The positive control for the three cases above: with no mark, the
+    // telemetry behaves exactly as it did before C4 existed.
+    const router = mockRouter();
+    renderHook(() => useComposerLog('feed', router));
+    fetchMock.mockClear();
+    vi.advanceTimersByTime(200);
+    act(() => router.emit('/chat'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
