@@ -39,28 +39,52 @@ Three things this module is deliberately careful about:
   a payment belongs to an invoice that may have been superseded, and every
   downstream figure would inherit the error silently.
 
-**The amount comparison has THREE outcomes, not two.** Agrees, disagrees,
-and *cannot be compared* — a ledger line with no ``total_billed`` or an
-invoice with no ``amount_excl_tax`` supports neither conclusion. Absent and
-zero are different facts, and this package refuses to launder one into the
-other anywhere else either.
+**The amount comparison has FOUR outcomes, not two.** Agrees; *cannot be
+compared* — a ledger line with no ``total_billed`` or an invoice with no
+``amount_excl_tax`` supports neither conclusion, and absent is not zero;
+**reconciles on a recognised other basis** (:data:`AMOUNT_OTHER_BASIS`);
+and disagrees.
 
-**Amount disagreement does not veto a sole candidate.** Whether the
-ledger's ``total_billed`` is on the same tax basis as RRTS's
-``amount_excl_tax`` is NOT established by anything in this repo — it is a
-semantic question about two external documents. So the matcher STATES the
-delta rather than requiring agreement: if the two figures turn out to sit
-on different bases, every proposal shows a consistent delta, which is a
-legible finding on the first report. A matcher that required agreement
-would instead propose nothing at all and look broken, which is the failure
-mode that takes a week to diagnose.
+The fourth is its own outcome rather than a discounted disagreement, and
+that is a deliberate constraint rather than a stylistic choice. "These
+figures disagree, but forgive it by this much" and "these figures agree,
+on a basis we can name" are different claims about the evidence. Only the
+second is true when a ratio lands on a recognised class, and a proposal
+whose basis sentence said the first would be telling the operator something
+the data does not say. An UNrecognised ratio stays a plain disagreement and
+stays visible — that bucket is the discovery channel that produced the two
+classes now recognised, and a recogniser that absorbed everything would
+close it behind itself.
+
+**Amount disagreement does not veto a sole candidate — and the measurement
+has since settled why that was right.** The question was whether the
+ledger's ``total_billed`` sits on the same tax basis as RRTS's
+``amount_excl_tax``. Nothing in this repo could answer it; it is a semantic
+question about two external documents. So the matcher STATES the delta
+rather than requiring agreement, on the reasoning that a matcher which
+required agreement would propose nothing at all if the bases differed —
+a silent total failure — whereas a stated delta is a legible finding on the
+first report.
+
+Measured 2026-08-13 against the live ledger and the first RRTS snapshot,
+via the sole-candidate probe (pairs where exactly one invoice cleared
+surname + date_of_service): **63 sole-candidate pairs, 36 agreeing EXACTLY
+to the cent, 27 structured disagreements.** So the shared basis is real for
+the majority, and the disagreements are not noise — they cluster on the
+ratios named in :data:`BASIS_INCL_TAX` and :data:`BASIS_TAX_LINE`. A veto
+would have silently discarded 43% of sole candidates; instead the deltas it
+computed are what made the classes visible at all.
+
+That is the argument for the design, and it is also the argument for the
+fourth outcome: the tax rate did not have to be assumed into this module,
+it appeared in the data because the data was allowed to disagree out loud.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 import structlog
 
@@ -101,6 +125,19 @@ WEIGHT_BUCKET = 0.55
 #: ``amount_excl_tax`` reproduced the ledger's billed sum for the bucket.
 #: The confirmation half of the ratified join.
 WEIGHT_AMOUNT_AGREES = 0.35
+
+#: The two figures reconcile exactly on a RECOGNISED other basis
+#: (:data:`AMOUNT_OTHER_BASIS`). Its own constant BESIDE the others, not a
+#: reduced penalty inside the disagreement path.
+#:
+#: Below :data:`WEIGHT_AMOUNT_AGREES` because a recognised class is an
+#: inference about which basis the ledger row is on, and a raw agreement is
+#: not. Chosen so that recognised-other-basis can never reach FULL
+#: confidence even with a confirmed crosswalk (0.55 + 0.20 + 0.20 = 0.95):
+#: full stays reserved for exact agreement plus a crosswalk, which is the
+#: 0.90-headroom rule holding under the new outcome rather than being
+#: quietly widened by it.
+WEIGHT_AMOUNT_OTHER_BASIS = 0.20
 
 # THE BASE WEIGHTS DELIBERATELY SUM TO 0.90, NOT 1.00, and the headroom is
 # load-bearing rather than cosmetic. A clean client + date + amount agreement
@@ -175,10 +212,89 @@ CITATION_NONE = ""
 CITATION_UNCONFIRMABLE = "unconfirmable"
 CITATION_CROSSWALK = "crosswalk_confirmed"
 
-#: The three outcomes of the amount comparison.
+#: The outcomes of the amount comparison. FOUR now, and the fourth is a
+#: distinct KIND OF FACT rather than a softened disagreement — see
+#: :data:`AMOUNT_OTHER_BASIS`.
 AMOUNT_AGREES = "agrees"
 AMOUNT_DISAGREES = "disagrees"
 AMOUNT_UNCOMPARABLE = "uncomparable"
+
+#: The two figures reconcile EXACTLY once a known other basis is applied.
+#:
+#: This is deliberately its own outcome and not ``AMOUNT_DISAGREES`` with a
+#: smaller penalty, and the distinction is the whole design. "These numbers
+#: disagree, but forgive it" and "these numbers agree, on a basis we can
+#: name" are different claims about the evidence, and only the second is
+#: true here. Collapsing them would make the basis sentence say the opposite
+#: of what the data shows, and would fold a recognised, explainable shape
+#: back into the bucket that exists to hold the UNexplained ones.
+AMOUNT_OTHER_BASIS = "other_basis"
+
+#: The recognised classes. Exactly two ship, both measured (2026-08-13, the
+#: sole-candidate probe over the live ledger + first snapshot: 63 pairs, 36
+#: exact to the cent, 27 structured).
+#:
+#: A THIRD ratio (0.7826) was observed ONCE and is deliberately NOT here.
+#: One example is not a class, and a vocabulary that admits a guess is how a
+#: heuristic starts laundering coincidences into confidence. It stays in the
+#: unrecognised bucket until it has been measured the way these two were.
+BASIS_INCL_TAX = "incl_tax_basis"
+BASIS_TAX_LINE = "tax_line_shape"
+
+#: Ledger-over-invoice ratio when the ledger row carries the tax-INCLUSIVE
+#: figure and ``amount_excl_tax`` does not. The HST factor, appearing in the
+#: data rather than being asserted into it.
+HST_RATIO = Decimal("1.14")
+
+#: Tax-line/aggregate shapes land on exact multiples of the tax fraction.
+TAX_LINE_STEP = Decimal("0.14")
+
+#: How close a ratio must sit to a class to be recognised. The width is
+#: BOUNDED AT BOTH ENDS by measured quantities rather than chosen for
+#: tidiness, and both bounds were run rather than reasoned:
+#:
+#: * **Lower bound — cent rounding.** Both figures come from independently
+#:   rounded documents, so each carries up to half a cent. At the smallest
+#:   amounts these documents actually carry, a $10 invoice against its
+#:   $11.40 ledger row, the induced ratio error is ~0.00094. A tolerance
+#:   below that would reject genuine members of a class for rounding alone.
+#: * **Upper bound — class separation.** 1.14 is NOT an exact multiple of
+#:   0.14: the nearest is 1.12, a gap of 0.02. A tolerance approaching that
+#:   would let the two classes claim the same row.
+#:
+#: 0.001 sits just above the first and twenty times below the second, so the
+#: classes cannot collide at this width — pinned, not merely intended.
+RATIO_TOLERANCE = Decimal("0.001")
+
+#: Short operator-facing names for the classes. Consumed by the report; kept
+#: beside the classes so a new class cannot be added without a label.
+BASIS_CLASS_LABELS: dict[str, str] = {
+    BASIS_INCL_TAX: "tax-inclusive ledger row (x1.14)",
+    BASIS_TAX_LINE: "tax-line/aggregate shape",
+}
+
+#: Each recognised class gets its OWN basis sentence, per the ratified
+#: constraint. The sentence must state that the figures RECONCILE — the
+#: whole point of the fourth outcome is that it does not read as a forgiven
+#: disagreement. Keyed by class so the mapping is exhaustive by
+#: construction: a class added without a sentence raises here rather than
+#: silently rendering a disagreement's words over a reconciliation.
+BASIS_SENTENCES: dict[str, str] = {
+    BASIS_INCL_TAX: (
+        "the amounts RECONCILE on a known other basis: the ledger's "
+        "{billed} is the TAX-INCLUSIVE figure for the invoice's "
+        "amount_excl_tax {amount} (ratio 1.14, the HST factor; delta "
+        "{delta}). This is agreement once the basis is named, not a "
+        "disagreement that has been forgiven."
+    ),
+    BASIS_TAX_LINE: (
+        "the amounts RECONCILE on a known other basis: the ledger's "
+        "{billed} sits on an exact multiple of the tax fraction against "
+        "the invoice's amount_excl_tax {amount} (delta {delta}) — the "
+        "tax-line/aggregate shape. Agreement once the basis is named, not "
+        "a forgiven disagreement."
+    ),
+}
 
 
 def _band(score: float) -> str:
@@ -259,6 +375,11 @@ class MatchProposal:
     #: Ledger sum minus invoice amount. ``None`` when not comparable.
     amount_delta: Decimal | None = None
     amount_outcome: str = AMOUNT_UNCOMPARABLE
+    #: The recognised delta class when :attr:`amount_outcome` is
+    #: :data:`AMOUNT_OTHER_BASIS`, else ``""``. Carried so a consumer can
+    #: group by class without re-deriving the ratio — and so an unrecognised
+    #: disagreement stays distinguishable from a recognised one at a glance.
+    basis_class: str = ""
     confidence: float = 0.0
     band: str = BAND_LOW
     #: The reasons, in words. Every score component contributes one line, so
@@ -451,21 +572,69 @@ def build_accounting_index(
     return index
 
 
+def recognise_basis(
+    bucket_billed: Decimal, invoice_amount: Decimal
+) -> str:
+    """The recognised delta class for this pair, or ``""``.
+
+    Returns :data:`BASIS_INCL_TAX`, :data:`BASIS_TAX_LINE`, or empty —
+    empty being the DISCOVERY CHANNEL, not a failure. An unrecognised ratio
+    must stay visible as a plain disagreement so the next class can be found
+    the way these two were; a recogniser that quietly absorbed everything
+    would close the loop that produced it.
+
+    **Precedence is explicit.** The specific class is tried first. On the
+    shipped tolerance the two cannot both match — 1.14 is not an exact
+    multiple of 0.14, and the 0.02 gap is twenty times the tolerance — so
+    the ordering is currently non-binding. It is written and pinned anyway,
+    because a future widening of the tolerance would otherwise turn class
+    selection into a question of which branch happens to run first.
+
+    **Signs must agree.** A reversal row is negative on both sides and its
+    ratio is meaningful; a pair whose signs DIFFER is not on another basis,
+    it is on the other side of the ledger, and calling that a tax shape
+    would explain away a real finding.
+    """
+    if not invoice_amount or not bucket_billed:
+        # A zero on either side has no ratio. Not a class, and not an error.
+        return ""
+    if (bucket_billed > 0) != (invoice_amount > 0):
+        return ""
+
+    ratio = abs(bucket_billed) / abs(invoice_amount)
+
+    if abs(ratio - HST_RATIO) <= RATIO_TOLERANCE:
+        return BASIS_INCL_TAX
+
+    steps = (ratio / TAX_LINE_STEP).to_integral_value(rounding=ROUND_HALF_EVEN)
+    if steps >= 1 and abs(ratio - steps * TAX_LINE_STEP) <= RATIO_TOLERANCE:
+        return BASIS_TAX_LINE
+
+    return ""
+
+
 def _compare_amounts(
     bucket_billed: Decimal | None, invoice_amount: Decimal | None
-) -> tuple[str, Decimal | None]:
-    """``(outcome, delta)`` — three outcomes, never two.
+) -> tuple[str, Decimal | None, str]:
+    """``(outcome, delta, basis_class)`` — FOUR outcomes, never two.
 
     ``None`` on either side yields :data:`AMOUNT_UNCOMPARABLE` with no
     delta. Treating an absent figure as a zero that disagrees would
     manufacture a finding out of a missing cell.
+
+    A non-zero delta is then offered to :func:`recognise_basis`. A hit is
+    :data:`AMOUNT_OTHER_BASIS` — the figures DO reconcile, on a basis we can
+    name. A miss stays :data:`AMOUNT_DISAGREES` and fully visible.
     """
     if bucket_billed is None or invoice_amount is None:
-        return AMOUNT_UNCOMPARABLE, None
+        return AMOUNT_UNCOMPARABLE, None, ""
     delta = bucket_billed - invoice_amount
     if delta == 0:
-        return AMOUNT_AGREES, delta
-    return AMOUNT_DISAGREES, delta
+        return AMOUNT_AGREES, delta, ""
+    basis_class = recognise_basis(bucket_billed, invoice_amount)
+    if basis_class:
+        return AMOUNT_OTHER_BASIS, delta, basis_class
+    return AMOUNT_DISAGREES, delta, ""
 
 
 def _score_candidate(
@@ -481,7 +650,9 @@ def _score_candidate(
     words are produced together and cannot drift.
     """
     billed = bucket.billed
-    outcome, delta = _compare_amounts(billed, invoice.amount_excl_tax)
+    outcome, delta, basis_class = _compare_amounts(
+        billed, invoice.amount_excl_tax
+    )
 
     score = WEIGHT_BUCKET
     basis = [
@@ -495,6 +666,15 @@ def _score_candidate(
             f"amount_excl_tax reproduces the ledger's billed sum for this "
             f"day ({billed})"
         )
+    elif outcome == AMOUNT_OTHER_BASIS:
+        # A PEER of the branches above, not a softened disagreement. The
+        # sentence says the figures reconcile, because they do.
+        score += WEIGHT_AMOUNT_OTHER_BASIS
+        basis.append(BASIS_SENTENCES[basis_class].format(
+            billed=billed,
+            amount=invoice.amount_excl_tax,
+            delta=delta,
+        ))
     elif outcome == AMOUNT_DISAGREES:
         score -= PENALTY_AMOUNT_DISAGREES
         basis.append(
@@ -502,7 +682,8 @@ def _score_candidate(
             f"amount_excl_tax {invoice.amount_excl_tax} (delta {delta}). The "
             f"client and date still agree, so this is proposed rather than "
             f"discarded — but the money is the confirmation, and it did not "
-            f"confirm."
+            f"confirm. The ratio matches no recognised basis class, which is "
+            f"how the next class gets found rather than absorbed."
         )
     else:
         basis.append(
@@ -558,6 +739,7 @@ def _score_candidate(
         invoice_amount_excl_tax=invoice.amount_excl_tax,
         amount_delta=delta,
         amount_outcome=outcome,
+        basis_class=basis_class,
         confidence=round(score, 4),
         band=_band(score),
         basis=basis,
@@ -659,9 +841,22 @@ def match_snapshot(
         # Several same-day candidates for one client: the AMOUNT is the
         # discriminator, which is the half of the ratified join that exists
         # for exactly this case.
+        #
+        # TIERED, and the order is the point: an EXACT agreement outranks a
+        # recognised other basis. A recognised class is an inference about
+        # which basis a row is on; a raw agreement is not, and letting the
+        # inference outrank the fact would be the tuning quietly widening
+        # what counts as confirmation.
         agreeing = [c for c in candidates if c.amount_outcome == AMOUNT_AGREES]
         if len(agreeing) == 1:
             report.proposals.append(agreeing[0])
+            continue
+
+        on_basis = [
+            c for c in candidates if c.amount_outcome == AMOUNT_OTHER_BASIS
+        ]
+        if not agreeing and len(on_basis) == 1:
+            report.proposals.append(on_basis[0])
             continue
 
         report.ambiguous.append(AmbiguousBucket(
@@ -670,7 +865,8 @@ def match_snapshot(
             reason=(
                 f"{len(candidates)} invoices name this client on this date "
                 f"and the amount could not single one out "
-                f"({len(agreeing)} reproduce the ledger's billed sum). "
+                f"({len(agreeing)} reproduce the ledger's billed sum, "
+                f"{len(on_basis)} reconcile on a recognised other basis). "
                 f"Left unresolved rather than picked: attaching this payment "
                 f"to the wrong same-day invoice is not recoverable from the "
                 f"report."
@@ -765,7 +961,17 @@ __all__ = [
     "ACCOUNTING_REF_FIELD",
     "AMOUNT_AGREES",
     "AMOUNT_DISAGREES",
+    "AMOUNT_OTHER_BASIS",
     "AMOUNT_UNCOMPARABLE",
+    "BASIS_CLASS_LABELS",
+    "BASIS_INCL_TAX",
+    "BASIS_SENTENCES",
+    "BASIS_TAX_LINE",
+    "HST_RATIO",
+    "RATIO_TOLERANCE",
+    "TAX_LINE_STEP",
+    "WEIGHT_AMOUNT_OTHER_BASIS",
+    "recognise_basis",
     "BAND_HIGH",
     "BAND_HIGH_AT",
     "BAND_LOW",
