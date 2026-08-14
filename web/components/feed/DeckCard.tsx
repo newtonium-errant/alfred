@@ -21,6 +21,20 @@ import { TimeExtent } from './TimeExtent';
 // stacking). Exported so those overlays derive their z from it and can't drift below.
 export const DECK_CARD_BASE_Z = 100;
 
+// How far DOWN each card behind the top one is pushed. This is what makes the
+// stack read as a stack — and it is also why the stack does not end where its
+// container does: the deepest card hangs `OFFSET * MAX_VISIBLE_DEPTH` below the
+// box, which is how the cards came to sit on the ✕ ↑ ⋯ ✓ buttons underneath
+// (the operator's overlap report). Deck reserves clearance DERIVED from these
+// two, so the reservation cannot drift from the transform that needs it.
+export const DECK_CARD_DEPTH_OFFSET_PX = 10;
+
+// Cards deeper than this render fully transparent, so the visible stack is
+// depth 0..2 — and the furthest spill is bounded by that. `useDeck` hands over
+// two upcoming cards, which is the same bound arrived at from the other side;
+// this constant is the one the RENDER obeys.
+export const DECK_MAX_VISIBLE_DEPTH = 2;
+
 // Presentational deck card. All content is rendered as React text children
 // (auto-escaped) — evidence is untrusted display data, so NOTHING here uses
 // dangerouslySetInnerHTML or renders an href from item data (#22 XSS precedent).
@@ -117,8 +131,8 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
       className="absolute inset-0 m-auto flex max-h-[380px] touch-none select-none overflow-hidden rounded-sm border border-console-edge bg-console-panel shadow-[0_18px_40px_rgba(0,0,0,0.5)]"
       style={{
         zIndex: DECK_CARD_BASE_Z - depth,
-        transform: `translateY(${depth * 10}px) scale(${1 - depth * 0.035})`,
-        opacity: depth > 2 ? 0 : 1,
+        transform: `translateY(${depth * DECK_CARD_DEPTH_OFFSET_PX}px) scale(${1 - depth * 0.035})`,
+        opacity: depth > DECK_MAX_VISIBLE_DEPTH ? 0 : 1,
         pointerEvents: depth === 0 ? 'auto' : 'none',
         transition: 'transform .22s ease, opacity .22s ease',
       }}
@@ -242,21 +256,61 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
           // space between the title and the pinned verb footer, overflow-y-auto keeps
           // long snippets / a long digest body from spilling past the card onto the
           // buttons below.
-          <div
-            data-testid="deck-evidence"
-            className="mt-2 min-h-0 flex-1 space-y-1 overflow-y-auto border-t border-console-edge pt-2 text-xs text-console-ink-dim"
-          >
-            <EvidenceBody evidence={item.evidence} surface="console" />
-            {rows.length > 0 && (
-              <dl className="space-y-1">
-                {rows.map((r) => (
-                  <div key={r.key} className="flex gap-3">
-                    <dt className={`shrink-0 ${CONSOLE_LABEL} pt-0.5`}>{evidenceLabel(r.key)}</dt>
-                    <dd className="min-w-0 break-words font-mono text-[11.5px] text-console-ink-dim">{r.value}</dd>
-                  </div>
-                ))}
-              </dl>
-            )}
+          //
+          // THE CHROME IS NOT INSIDE THE SCROLLER. The divider used to be a
+          // `border-t` on the scrolling element itself, so scrolled content slid up
+          // under the padding and the rule was drawn THROUGH whatever row happened to
+          // straddle the boundary — a half-cut line of caps with a line across it,
+          // which is what the operator read as two text layers stacked on each other.
+          // A border on a box that doesn't move can't be crossed by content that does.
+          <div className="mt-2 flex min-h-0 flex-1 flex-col border-t border-console-edge pt-2">
+            <div
+              data-testid="deck-evidence"
+              className="min-h-0 flex-1 space-y-1 overflow-y-auto text-xs text-console-ink-dim"
+            >
+              <EvidenceBody evidence={item.evidence} surface="console" />
+              {rows.length > 0 && (
+                <dl className="space-y-2">
+                  {rows.map((r) => (
+                    // LABEL ABOVE VALUE, not beside it. The card is ~330px wide; a
+                    // `shrink-0` label ate half of that ("Cluster Record Paths" alone
+                    // is 157px), leaving long values a narrow column that ran for a
+                    // dozen wrapped lines DOWN THE SIDE of its own label. Stacking
+                    // gives the value the full width and leaves the label a line of
+                    // its own, which is the half of the garbling that wasn't the rule.
+                    <div key={r.key}>
+                      <dt className={CONSOLE_LABEL}>{evidenceLabel(r.key)}</dt>
+                      <dd className="mt-0.5 min-w-0 break-words font-mono text-[11.5px] text-console-ink-dim">
+                        {r.list ? (
+                          <ul data-testid="deck-evidence-list" className="space-y-0.5">
+                            {r.list.entries.map((entry, i) => (
+                              <li key={`${entry.prefix}${entry.name}#${i}`}>
+                                {entry.prefix && (
+                                  // Provenance, quieter than the name it belongs to —
+                                  // the correction picker's split, reused rather than
+                                  // re-invented.
+                                  <span className="text-console-ink-faint">{entry.prefix}</span>
+                                )}
+                                {entry.name}
+                              </li>
+                            ))}
+                            {r.list.total > r.list.entries.length && (
+                              // ILB: a capped list SAYS it was capped. Silently drawing
+                              // the first eight of twelve is a card that lies by omission.
+                              <li data-testid="deck-evidence-list-more" className="italic text-console-ink-faint">
+                                +{r.list.total - r.list.entries.length} more
+                              </li>
+                            )}
+                          </ul>
+                        ) : (
+                          r.value
+                        )}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+            </div>
           </div>
         )}
 

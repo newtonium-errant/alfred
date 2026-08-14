@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import Head from 'next/head';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
-import { Deck } from '../components/feed/Deck';
+import { Deck, DECK_COLUMN_MIN_PX } from '../components/feed/Deck';
 import { authApi } from '../lib/algernon/authClient';
 import Link from 'next/link';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
@@ -195,7 +195,12 @@ export default function DeckPage() {
         )}
 
         {actionable.length > 0 && (
-          <div className="mt-4 flex min-h-[460px] flex-col">
+          // The floor comes FROM the deck (DECK_COLUMN_MIN_PX), not from a number
+          // typed here. The deck reserves clearance under its card stack so the
+          // cards stop landing on the verb buttons, and this wrapper is a
+          // min-height — so a literal left behind here would have paid for that
+          // clearance out of the card instead of out of the page.
+          <div className="mt-4 flex flex-col" style={{ minHeight: DECK_COLUMN_MIN_PX }}>
             <Deck
               items={actionable}
               onAuthExpired={onAuthExpired}
