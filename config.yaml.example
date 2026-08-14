@@ -809,6 +809,30 @@ transport:
 #   #   # silent. The sweep runs when the tray is read (the store has no daemon)
 #   #   # and reports its count every time, including zero.
 #   #   retain_read_days: 7
+#   # --- Contact-surface router (C4) ---
+#   # When the operator opens Algernon, evaluate the rule set in
+#   # `preference/Algernon — contact-surface routing.md` and open the first
+#   # surface whose condition matches — state-aware routing, not the clock.
+#   # Default-ON, and INERT until a state path is anchored: with no store,
+#   # GET /day/state answers `configured: false` and the PWA stays exactly
+#   # where it is, so a default-on router does nothing on an instance that
+#   # has not wired one. Set false to skip the /day/* route mount entirely.
+#   #
+#   # THE RULES AND THE LEVERS ARE NOT CONFIGURED HERE. They live in the
+#   # operator's preference record and are read from the vault at request
+#   # time (gap_hours_new_day, brief_read_decay_hours, and the whole
+#   # pattern_surfacing block), so tuning them is a vault edit, not a
+#   # deploy. This block only says WHERE the router keeps its own state.
+#   # contact_router:
+#   #   enabled: true
+#   #   # The contact log + the operator's adopted defaults + dismissed
+#   #   # patterns. Defaults to <logging.dir>/web_contact_state.json.
+#   #   # Set it explicitly only to move the file; leave it unset and it
+#   #   # follows the instance's own data dir. If NOTHING anchors it (no
+#   #   # logging.dir either), the router stays unwired rather than guessing
+#   #   # a cwd-relative path — that guess is how one instance's writer
+#   #   # landed in another instance's store (#74).
+#   #   state_path: ./data/web_contact_state.json
 #   # --- WebRTC voice (PWA voice arc) ---
 #   # Browser mic → WebRTC → this server. DISABLED by default — an absent or
 #   # ``enabled: false`` block mounts NO /voice/* routes (route table
