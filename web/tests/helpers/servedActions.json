@@ -1,6 +1,6 @@
 {
   "README": [
-    "GENERATED FROM THE SERVER, then guarded by a pin \u2014 do not hand-edit.",
+    "GENERATED FROM THE SERVER, then guarded by a pin — do not hand-edit.",
     "Source of truth: alfred.daily_sync.action_router.actions_for(kind).",
     "Regenerate when the ceiling changes; tests/feed/test_feed_advertised_actions.py",
     "::TestTheFEFixtureMatchesWhatIsServed reds if this drifts from actions_for.",
@@ -293,6 +293,21 @@
         "verb": "defer_7d",
         "label": "7 days",
         "weight": "light"
+      }
+    ],
+    "pattern_surfaced": [
+      {
+        "verb": "adopt",
+        "label": "Adopt",
+        "weight": "heavy",
+        "gesture": "affirm",
+        "note": "Opens the surface you keep choosing whenever this rule fires, from your next contact on. Nothing in your preference record changes."
+      },
+      {
+        "verb": "ignore",
+        "label": "Ignore",
+        "weight": "light",
+        "gesture": "reject"
       }
     ]
   }

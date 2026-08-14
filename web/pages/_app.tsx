@@ -10,6 +10,7 @@ import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { Nunito } from 'next/font/google';
 import { useEffect } from 'react';
+import { ContactRouteToast } from '../components/ContactRouteToast';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
@@ -72,6 +73,12 @@ export default function App({ Component, pageProps }: AppProps) {
         <meta name="mobile-web-app-capable" content="yes" />
       </Head>
       <Component {...pageProps} />
+      {/* C4 contact-surface router: the override affordance for a routed open.
+          Mounted HERE rather than per-page because the decision is made on the
+          landing and rendered on the destination — a client-side navigation
+          unmounts the page, not the app. Renders null until a routed open
+          publishes one, so every manually-opened session is unchanged. */}
+      <ContactRouteToast />
     </div>
   );
 }
