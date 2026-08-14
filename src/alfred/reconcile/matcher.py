@@ -259,22 +259,63 @@ HST_RATIO = Decimal("1.14")
 #: Tax-line/aggregate shapes land on exact multiples of the tax fraction.
 TAX_LINE_STEP = Decimal("0.14")
 
+#: Half a cent — the rounding each independently-rounded figure carries.
+_HALF_CENT = Decimal("0.005")
+
+#: The smallest invoice amount these documents carry. The lower bound below
+#: is evaluated HERE because rounding error on a ratio is worst where the
+#: denominator is smallest; a bound argued at a typical amount would be
+#: comfortably true and useless.
+SMALLEST_INVOICE_AMOUNT = Decimal("10.00")
+
+#: Distance between the two classes in ratio space. DERIVED, not asserted:
+#: 1.14's nearest 0.14-multiple is 1.12 (8 x 0.14), so the gap is 0.02. If
+#: either class constant moves, this moves with it and the bound relation
+#: below is re-checked automatically.
+CLASS_SEPARATION = abs(HST_RATIO - Decimal("8") * TAX_LINE_STEP)
+
+
+def worst_case_ratio_deviation(
+    invoice_amount: Decimal, ratio: Decimal = HST_RATIO
+) -> Decimal:
+    """Largest ratio deviation cent-rounding alone can produce.
+
+    Both figures are independently rounded, so the ratio is worst at
+    ``(ledger + half a cent) / (invoice - half a cent)``. Expanding that and
+    dropping the second-order term gives ``(0.005 + ratio*0.005) / invoice``
+    — note the denominator is the INVOICE, the quantity actually dividing.
+
+    **The bug this function exists to prevent, because I shipped it once.**
+    The first version of the bound computed ``0.005/invoice + 0.005/ledger``,
+    which is the RELATIVE error ``dr/r`` — a fraction of the ratio, not a
+    deviation of it. Compared against an absolute tolerance it reads a factor
+    of ``ratio`` too small: 0.00094 where the truth is 0.00107. The stated
+    bound was then violated by the very worked example the docstring cited,
+    and a genuine x1.14 member at $10 would be rejected for rounding alone.
+    Relative and absolute are different quantities; a tolerance is absolute.
+    """
+    return (_HALF_CENT + ratio * _HALF_CENT) / invoice_amount
+
+
 #: How close a ratio must sit to a class to be recognised. The width is
 #: BOUNDED AT BOTH ENDS by measured quantities rather than chosen for
-#: tidiness, and both bounds were run rather than reasoned:
+#: tidiness, and both bounds are RUN — by
+#: ``test_the_tolerance_sits_inside_both_of_its_bounds``, which pins the
+#: RELATIONSHIPS rather than these digits. A literal cannot notice that its
+#: own justification stopped being true.
 #:
-#: * **Lower bound — cent rounding.** Both figures come from independently
-#:   rounded documents, so each carries up to half a cent. At the smallest
-#:   amounts these documents actually carry, a $10 invoice against its
-#:   $11.40 ledger row, the induced ratio error is ~0.00094. A tolerance
-#:   below that would reject genuine members of a class for rounding alone.
-#: * **Upper bound — class separation.** 1.14 is NOT an exact multiple of
-#:   0.14: the nearest is 1.12, a gap of 0.02. A tolerance approaching that
-#:   would let the two classes claim the same row.
+#: * **Lower bound — cent rounding, at the smallest amount.**
+#:   :func:`worst_case_ratio_deviation` at
+#:   :data:`SMALLEST_INVOICE_AMOUNT` is 0.00107. A tolerance at or below
+#:   that rejects genuine members of a class for rounding alone.
+#: * **Upper bound — class separation**, :data:`CLASS_SEPARATION` = 0.02,
+#:   carrying a 10x margin. Bare ``< 0.02`` is not enough: 0.015 would
+#:   satisfy it while sitting close enough to make the classes neighbours,
+#:   so the relation is ``tolerance * 10 <= separation``.
 #:
-#: 0.001 sits just above the first and twenty times below the second, so the
-#: classes cannot collide at this width — pinned, not merely intended.
-RATIO_TOLERANCE = Decimal("0.001")
+#: 0.002 clears the first (0.00107) and exactly meets the second
+#: (0.002 * 10 == 0.02).
+RATIO_TOLERANCE = Decimal("0.002")
 
 #: Short operator-facing names for the classes. Consumed by the report; kept
 #: beside the classes so a new class cannot be added without a label.
@@ -977,11 +1018,14 @@ __all__ = [
     "BASIS_INCL_TAX",
     "BASIS_SENTENCES",
     "BASIS_TAX_LINE",
+    "CLASS_SEPARATION",
     "HST_RATIO",
     "RATIO_TOLERANCE",
+    "SMALLEST_INVOICE_AMOUNT",
     "TAX_LINE_STEP",
     "WEIGHT_AMOUNT_OTHER_BASIS",
     "recognise_basis",
+    "worst_case_ratio_deviation",
     "BAND_HIGH",
     "BAND_HIGH_AT",
     "BAND_LOW",

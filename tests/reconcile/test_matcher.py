@@ -39,8 +39,11 @@ from alfred.reconcile.matcher import (
     HST_RATIO,
     RATIO_TOLERANCE,
     TAX_LINE_STEP,
+    CLASS_SEPARATION,
+    SMALLEST_INVOICE_AMOUNT,
     WEIGHT_AMOUNT_OTHER_BASIS,
     _band,
+    worst_case_ratio_deviation,
     recognise_basis,
     BAND_HIGH,
     BAND_LOW,
@@ -137,7 +140,10 @@ def test_a_clean_single_candidate_is_proposed_at_high_confidence() -> None:
     assert p.amount_outcome == AMOUNT_AGREES
     assert p.amount_delta == Decimal("0")
     assert p.band == BAND_HIGH
-    assert p.confidence == WEIGHT_BUCKET + WEIGHT_AMOUNT_AGREES
+    # LITERAL, never recomputed from the constants under test: a pin that
+    # derives its expectation from the thing it guards moves WITH it and
+    # can never detect a change to it.
+    assert p.confidence == 0.90
     assert p.citation_status == CITATION_NONE
     assert not report.ambiguous
     assert not report.unmatched
@@ -297,9 +303,7 @@ def test_an_ambiguous_surname_split_is_weighted_down_and_stated() -> None:
     assert len(report.proposals) == 1
     p = report.proposals[0]
     assert p.ambiguous_name is True
-    assert p.confidence == (
-        WEIGHT_BUCKET + WEIGHT_AMOUNT_AGREES - PENALTY_AMBIGUOUS_SURNAME
-    )
+    assert p.confidence == 0.70  # literal, not recomputed from the weights
     assert p.band == BAND_MEDIUM, (
         "an ambiguous split must not read as high confidence — a confident "
         "wrong join is the specific harm this penalty exists for"
@@ -340,9 +344,7 @@ def test_a_citation_matching_the_rrts_number_is_marked_unconfirmable() -> None:
     p = report.proposals[0]
     assert p.citation == "487"
     assert p.citation_status == CITATION_UNCONFIRMABLE
-    assert p.confidence == round(
-        WEIGHT_BUCKET + WEIGHT_AMOUNT_AGREES + BOOST_CITATION_UNCONFIRMABLE, 4
-    )
+    assert p.confidence == 0.95  # literal, not recomputed from the weights
     reason = " ".join(p.basis)
     assert "CANNOT be confirmed" in reason
     assert "ACCOUNTING REFERENCE" in reason
@@ -697,9 +699,7 @@ def test_a_tax_inclusive_ledger_row_reconciles_rather_than_disagreeing() -> None
     assert p.amount_outcome == AMOUNT_OTHER_BASIS
     assert p.basis_class == BASIS_INCL_TAX
     assert p.amount_delta == Decimal("42.00"), "the delta is still stated"
-    assert p.confidence == round(
-        WEIGHT_BUCKET + WEIGHT_AMOUNT_OTHER_BASIS, 4
-    )
+    assert p.confidence == 0.75  # literal, not recomputed from the weights
     sentence = " ".join(p.basis)
     assert "RECONCILE" in sentence
     assert "not a disagreement that has been forgiven" in sentence
@@ -774,7 +774,8 @@ def test_the_two_classes_cannot_collide_at_the_shipped_tolerance() -> None:
     """
     gap = abs(HST_RATIO - Decimal("8") * TAX_LINE_STEP)
     assert gap == Decimal("0.02")
-    assert RATIO_TOLERANCE * 20 <= gap, (
+    assert gap == CLASS_SEPARATION, "the derived separation must equal the gap"
+    assert RATIO_TOLERANCE * 10 <= gap, (
         "the tolerance has grown far enough that the two classes could claim "
         "the same row — precedence would then be doing real work and must be "
         "re-argued, not left to branch order"
@@ -857,7 +858,10 @@ def test_a_recognised_class_rises_out_of_the_low_band() -> None:
     ).proposals[0]
     assert p.band == BAND_MEDIUM
 
-    scored_as_plain_disagreement = WEIGHT_BUCKET - PENALTY_AMOUNT_DISAGREES
+    # The before-figure as a LITERAL: this pair scored 0.30 (LOW) before the
+    # class existed. Recomputing it from the weights would make the pin
+    # follow any change to them and prove nothing.
+    scored_as_plain_disagreement = 0.30
     assert scored_as_plain_disagreement < BAND_MEDIUM_AT, (
         "before the class existed this pair scored into the low band — that "
         "is the before-figure this tuning moves"
@@ -975,9 +979,12 @@ def test_the_cannot_compare_population_stays_medium() -> None:
     )
 
     # The edge itself, stated so the next reader sees WHY this is fragile.
-    assert WEIGHT_BUCKET == BAND_MEDIUM_AT
-    assert _band(WEIGHT_BUCKET) == BAND_MEDIUM
-    assert _band(WEIGHT_BUCKET - 0.01) == BAND_LOW, (
+    # LITERALS on both sides. Written as _band(0.55)/_band(0.54) rather
+    # than _band(WEIGHT_BUCKET)/_band(WEIGHT_BUCKET - 0.01) precisely so
+    # that moving WEIGHT_BUCKET or BAND_MEDIUM_AT is DETECTED here instead
+    # of being tracked silently.
+    assert _band(0.55) == BAND_MEDIUM
+    assert _band(0.54) == BAND_LOW, (
         "one hundredth below the base flips the whole population — that is "
         "the margin this pin is protecting"
     )
@@ -1040,3 +1047,94 @@ def test_the_unrecognised_outlier_lands_audibly() -> None:
     )
     assert "how the next class gets found" in sentence
     assert str(p.amount_delta) in sentence
+
+
+def test_the_tolerance_sits_inside_both_of_its_bounds() -> None:
+    """The RELATIONSHIP, not the literal — a literal cannot notice that its
+    own justification stopped being true.
+
+    THE BUG THIS REPLACES, because it shipped: the first bound computed
+    ``0.005/invoice + 0.005/ledger``, which is the RELATIVE error ``dr/r``,
+    and compared it against an ABSOLUTE tolerance. That reads a factor of
+    ``ratio`` too small — 0.00094 where the truth is 0.00107 — so the stated
+    width was violated by the very worked example the docstring cited, and a
+    genuine x1.14 member at the smallest amount would have been rejected for
+    rounding alone. The failure was SAFE (the row stayed audibly
+    unrecognised) and it was still a bound that lied.
+
+    Both directions are asserted, because a one-directional bound is the
+    original gap wearing a pin's clothes.
+    """
+    worst = worst_case_ratio_deviation(SMALLEST_INVOICE_AMOUNT)
+    assert worst == Decimal("0.00107"), (
+        "the worst-case rounding deviation moved; re-derive the bound rather "
+        "than re-fitting the number to it"
+    )
+
+    # LOWER: strictly above the worst rounding error at the smallest amount
+    # the data carries. At or below it, genuine members are rejected.
+    assert RATIO_TOLERANCE > worst
+
+    # UPPER: a 10x margin under the class separation. Bare `< separation` is
+    # NOT enough — 0.015 satisfies that while sitting close enough to make
+    # the classes neighbours, which is why the relation carries the margin.
+    assert RATIO_TOLERANCE * 10 <= CLASS_SEPARATION
+
+    # And the relation must actually be able to fail, in BOTH directions.
+    too_tight = Decimal("0.0005")
+    too_wide = Decimal("0.015")
+    assert not (too_tight > worst), (
+        "0.0005 must fail the LOWER relation — it rejects genuine members"
+    )
+    assert not (too_wide * 10 <= CLASS_SEPARATION), (
+        "0.015 must fail the UPPER relation — bare '< 0.02' would pass it, "
+        "which is exactly the gap the margin closes"
+    )
+
+
+def test_the_widening_admits_nothing_new_in_the_fixtures() -> None:
+    """The tolerance fold is a PRODUCTION change — it widens what gets
+    recognised — so its reach is measured rather than assumed.
+
+    Every ratio these fixtures exercise is checked for whether it sits in
+    the newly-admitted band between the old width and the new one. None
+    does: the nearest non-member is 1.145 (deviation 0.005, still outside),
+    and the 0.7826 outlier's nearest class centre is 0.84 (deviation
+    0.0574). So the widening changes no classification here — it restores
+    the members the wrong bound would have rejected at the small end.
+    """
+    old_width = Decimal("0.001")
+    fixtures = [
+        ("clean x1.14", Decimal("342.00"), Decimal("300.00")),
+        ("small x1.14", Decimal("11.40"), Decimal("10.00")),
+        ("cent low", Decimal("11.39"), Decimal("10.00")),
+        ("cent high", Decimal("11.41"), Decimal("10.00")),
+        ("tax line 0.14", Decimal("42.00"), Decimal("300.00")),
+        ("tax line 0.28", Decimal("84.00"), Decimal("300.00")),
+        ("just outside", Decimal("343.50"), Decimal("300.00")),
+        ("the 0.7826 outlier", Decimal("234.78"), Decimal("300.00")),
+        ("plain disagreement", Decimal("345.00"), Decimal("300.00")),
+    ]
+    newly_admitted = []
+    for label, ledger, invoice in fixtures:
+        ratio = ledger / invoice
+        steps = (ratio / TAX_LINE_STEP).to_integral_value()
+        deviation = min(
+            abs(ratio - HST_RATIO),
+            abs(ratio - steps * TAX_LINE_STEP) if steps >= 1 else Decimal("99"),
+        )
+        if old_width < deviation <= RATIO_TOLERANCE:
+            newly_admitted.append((label, deviation))
+
+    assert newly_admitted == [], (
+        f"the widening changed classification for {newly_admitted} — that is "
+        f"a real behaviour change and must be stated, not discovered"
+    )
+
+    # POSITIVE CONTROL: the band the check looks at is not empty by
+    # construction — a ratio placed inside it IS detected.
+    planted = HST_RATIO + Decimal("0.0015")
+    assert old_width < abs(planted - HST_RATIO) <= RATIO_TOLERANCE, (
+        "the newly-admitted band must be non-empty, or the assertion above "
+        "is vacuous"
+    )
