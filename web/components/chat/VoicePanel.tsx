@@ -114,7 +114,7 @@ export function VoicePanel({
   return (
     <div
       data-testid="voice-panel"
-      className="flex flex-col gap-2 rounded-xl border border-honeydew-300 bg-honeydew-50 px-3 py-2"
+      className="flex flex-col gap-2 rounded-xl border border-console-edge bg-console-raise px-3 py-2"
     >
       {/* Mounted whenever the panel renders so it exists BEFORE ontrack fires. */}
       <audio ref={audioRef} autoPlay playsInline className="hidden" data-testid="voice-audio" />
@@ -140,11 +140,11 @@ export function VoicePanel({
               <>
                 <span
                   data-testid="voice-reconnecting"
-                  className="inline-flex items-center gap-2 text-sm text-honeydew-600"
+                  className="inline-flex items-center gap-2 text-sm text-console-ink-dim"
                 >
                   <span
                     aria-hidden
-                    className="h-2 w-2 rounded-full bg-honeydew-500 motion-safe:animate-pulse"
+                    className="h-2 w-2 rounded-full bg-console-raise0 motion-safe:animate-pulse"
                   />
                   Reconnecting…
                 </span>
@@ -186,11 +186,11 @@ export function VoicePanel({
               (state === 'requesting-mic' || state === 'connecting' || state === 'closing') && (
                 <span
                   data-testid="voice-status"
-                  className="inline-flex items-center gap-2 text-sm text-honeydew-600"
+                  className="inline-flex items-center gap-2 text-sm text-console-ink-dim"
                 >
                   <span
                     aria-hidden
-                    className="h-2 w-2 rounded-full bg-honeydew-500 motion-safe:animate-pulse"
+                    className="h-2 w-2 rounded-full bg-console-raise0 motion-safe:animate-pulse"
                   />
                   {state === 'requesting-mic' && 'Requesting microphone…'}
                   {state === 'connecting' && 'Connecting…'}
@@ -265,7 +265,7 @@ export function VoicePanel({
             <p
               data-testid="voice-tool"
               aria-live="polite"
-              className="text-sm text-honeydew-600"
+              className="text-sm text-console-ink-dim"
             >
               Using {toolName}…
             </p>
@@ -276,18 +276,22 @@ export function VoicePanel({
             <div
               data-testid="voice-reply"
               aria-live="polite"
-              className="max-h-40 overflow-y-auto rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
+              className="max-h-40 overflow-y-auto rounded-xl bg-console-raise px-3 py-2 text-sm text-console-ink"
             >
               {replyText}
             </div>
           )}
 
-          {/* Non-fatal per-turn failure notice (call stays live) — honeydew, not red. */}
+          {/* Non-fatal per-turn failure notice (the call stays live) — deliberately
+              NEUTRAL chrome, not the negative role. The distinction outlived the
+              honeydew palette this comment used to name: a turn that failed while
+              the call continues is not a verdict, and drawing it in the alert hue
+              would say the call had dropped. */}
           {turnError && (
             <p
               role="status"
               data-testid="voice-turn-error"
-              className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-700"
+              className="rounded-xl bg-console-raise px-3 py-2 text-sm text-console-ink"
             >
               {turnError}
             </p>
@@ -318,14 +322,14 @@ export function VoicePanel({
           {audioBlocked && (state === 'live' || state === 'connecting') && (
             <div
               data-testid="voice-audio-blocked"
-              className="flex items-center justify-between gap-3 rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-700"
+              className="flex items-center justify-between gap-3 rounded-xl bg-console-raise px-3 py-2 text-sm text-console-ink"
             >
               <span>Audio is muted by the browser.</span>
               <button
                 type="button"
                 data-testid="voice-audio-unblock"
                 onClick={() => voice.retryAudio()}
-                className="shrink-0 rounded-lg border border-honeydew-300 px-2 py-1 font-semibold hover:bg-honeydew-50"
+                className="shrink-0 rounded-lg border border-console-edge px-2 py-1 font-semibold hover:bg-console-raise"
               >
                 Tap to enable audio
               </button>

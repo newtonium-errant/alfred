@@ -9,26 +9,32 @@ import { describe, expect, it } from 'vitest';
 // never adopted: the T1/T2/T3 strip, DUTY/RHYTHM/FUEL and the push card were
 // still cream panels with green ink sitting on a dark hull.
 //
-// WHY THESE THREE AND NOT EVERY WARM PANEL IN THE APP. A component may be warm
+// Chat's Voice container bar is here too, for the same reason and by the same
+// treatment — one register over (comms), one operator report later.
+//
+// WHY THESE AND NOT EVERY WARM PANEL IN THE APP. A component may be warm
 // legitimately — `pages/share.tsx` renders `<Layout showNav={false}>` with no
 // surface prop, so it is a WARM route, and it renders `IngestForm` (which
 // contains `ProvenancePreview` and both upload pills). Rewriting a straddler's
-// classes to console tokens fixes the dark route and breaks the warm one. These
-// three are the ones that render on home and NOWHERE else, which is what makes
-// direct token adoption correct for them and a marker seam the right answer for
-// the straddlers. That reachability claim is asserted below, not assumed — it is
-// the whole justification for the treatment.
+// classes to console tokens fixes the dark route and breaks the warm one. Every
+// file listed below renders on exactly ONE route, which is what makes direct
+// token adoption correct for them and a marker seam the right answer for the
+// straddlers. That reachability claim is asserted below, not assumed — it is the
+// whole justification for the treatment.
 //
 // TWO DIRECTIONS, because "no warm classes" alone is satisfied by a component
 // that has stopped rendering anything: the role tokens must still be here. A
-// register restyles chrome and never a verdict, so the T1/T2/T3 state dots and
-// the danger ink survive the re-hull unchanged.
+// register restyles chrome and never a verdict, so the T1/T2/T3 state dots, the
+// voice call's state dots and the danger ink survive the re-hull unchanged.
 
 const ROOT = join(__dirname, '..');
 const ADOPTED = [
   'components/feed/SlotBoard.tsx',
   'components/feed/RingsHeader.tsx',
   'components/PushToggle.tsx',
+  // Chat's Voice container bar (comms register). Same treatment for the same
+  // reason: pages/chat.tsx is its only render site, so it is not a straddler.
+  'components/chat/VoicePanel.tsx',
 ] as const;
 
 const WARM = /\b(?:bg-white|bg-cream|text-cream|(?:bg|border|text|ring|placeholder|divide|from|to|via)-honeydew-\d+)\b/g;
@@ -39,7 +45,7 @@ function src(rel: string): string {
   return readFileSync(join(ROOT, rel), 'utf8');
 }
 
-describe('home adopts the viewscreen register', () => {
+describe('single-route panels adopt their register', () => {
   it.each(ADOPTED)('%s carries no warm class', (rel) => {
     expect([...src(rel).matchAll(WARM)].map((m) => m[0])).toEqual([]);
   });
@@ -68,17 +74,21 @@ describe('home adopts the viewscreen register', () => {
     // The census below is the census measured across the three files immediately
     // BEFORE the token mapping was applied, via:
     //   grep -ohE "bg-status-[a-z-]+|text-status-[a-z-]+|text-danger|bg-danger-bg" \
-    //     components/feed/SlotBoard.tsx components/feed/RingsHeader.tsx \
-    //     components/PushToggle.tsx | sort | uniq -c
+    //     <each file in ADOPTED> | sort | uniq -c
+    // run against each file immediately before its mapping was applied — the
+    // home three in one pass, VoicePanel in a second, and the totals summed here.
     const census: Record<string, number> = {};
     for (const rel of ADOPTED) {
       for (const m of src(rel).matchAll(ROLE)) census[m[0]] = (census[m[0]] ?? 0) + 1;
     }
-    expect(census['bg-danger-bg']).toBe(1);
+    expect(census['bg-danger-bg']).toBe(2); // 1 home + 1 VoicePanel
     expect(census['bg-status-done-fg']).toBe(2);
     expect(census['bg-status-progress-fg']).toBe(2);
-    expect(census['text-danger']).toBe(3);
-    expect(census['text-status-done-fg']).toBe(4);
+    expect(census['bg-status-done']).toBe(1); // VoicePanel's own, a different token
+    expect(census['bg-status-progress']).toBe(1);
+    expect(census['text-danger']).toBe(4); // 3 home + 1 VoicePanel
+    expect(census['text-status-done-fg']).toBe(5); // 4 home + 1 VoicePanel
+    expect(census['text-status-progress-fg']).toBe(1);
   });
 
   it('spends no console token at an alpha it cannot honour', () => {
@@ -95,10 +105,10 @@ describe('home adopts the viewscreen register', () => {
 
   it('re-hulls only components no WARM route renders', () => {
     // The reachability claim this treatment rests on. `/share` takes no surface
-    // prop and so is warm; it must not reach any of these three, or the adoption
+    // prop and so is warm; it must not reach any of them, or the adoption
     // above would be shipping a dark panel onto a warm page.
     const share = src('pages/share.tsx');
-    for (const name of ['SlotBoard', 'RingsHeader', 'PushToggle']) {
+    for (const name of ['SlotBoard', 'RingsHeader', 'PushToggle', 'VoicePanel']) {
       expect(share).not.toContain(`<${name}`);
     }
     // POSITIVE CONTROL: /share really is warm and really does render page
