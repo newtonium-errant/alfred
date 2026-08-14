@@ -8,6 +8,9 @@ import type { ChatTarget } from '../../lib/algernon/types';
 // deploy needs no picker). Native <select> styled to match ui/input (no select
 // primitive in the kit), mirroring ingest/TargetPicker.
 const selectClass = cn(
+  // Register seam — see ui/input. The comms shell reaches this picker
+  // through the marker, never through an element selector.
+  'ui-field',
   'rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-900',
   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-honeydew-600 focus-visible:ring-offset-1',
   'disabled:cursor-default disabled:opacity-70',

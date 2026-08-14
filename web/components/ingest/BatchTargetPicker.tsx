@@ -11,6 +11,9 @@ import type { BatchTarget } from '../../lib/algernon/types';
 // used. The page still states WHERE the batch is going in that case — the
 // absence of a picker must not mean the destination goes unsaid.
 const selectClass = cn(
+  // Same register seam as ui/input — a native <select> with no kit primitive
+  // still opts in by marker, so the crt/comms shells reach it too.
+  'ui-field',
   'rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-900',
   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-honeydew-600 focus-visible:ring-offset-1',
   'disabled:cursor-default disabled:opacity-70',

@@ -76,3 +76,46 @@
   outline: 2px solid var(--crt-phosphor);
   outline-offset: 2px;
 }
+
+/* --- the utility rooms' CONTROLS ------------------------------------------
+ *
+ * Reached through the `ui-field` / `ui-btn` MARKERS, never through element
+ * selectors. `[data-surface='crt'] input` would be (0,1,1) and would silently
+ * outrank a Tailwind role class like `.text-danger` at (0,1,0) — repainting a
+ * verdict, which is the one thing a register may never do. The marker keeps the
+ * reach to controls that opted in; role-coloured markup never carries it, so it
+ * is out of range by construction rather than by careful selector-writing.
+ *
+ * Chrome only: ground, edge, ink, placeholder, focus. No role hue is touched
+ * here and none may be added — consoleRegisters' role-inviolate pin renders a
+ * role-coloured control inside this hull and asserts the role survives. */
+[data-surface='crt'] .ui-field {
+  background-color: var(--crt-panel);
+  border-color: var(--crt-edge);
+  color: var(--crt-ink);
+}
+
+[data-surface='crt'] .ui-field::placeholder {
+  /* `ink-faint` is the micro-label rung and is too quiet for a placeholder the
+     operator must actually read; `ink-dim` is the reading rung. */
+  color: var(--crt-ink-dim);
+}
+
+[data-surface='crt'] .ui-field:focus-visible {
+  outline: 2px solid var(--crt-phosphor);
+  outline-offset: 1px;
+}
+
+[data-surface='crt'] .ui-label {
+  color: var(--crt-ink-dim);
+  font-family: var(--crt-mono);
+  letter-spacing: 0.02em;
+}
+
+/* The NEUTRAL button variants only — `destructive` carries a role colour and
+   deliberately does not take the marker. */
+[data-surface='crt'] .ui-btn {
+  background-color: var(--crt-panel);
+  border-color: var(--crt-edge);
+  color: var(--crt-phosphor);
+}
