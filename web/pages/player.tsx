@@ -298,10 +298,8 @@ export default function PlayerPage() {
         )}
 
         {/* ILB: brief exists but its narration/audio is unavailable → offer the
-            reading surface. Points at HOME, not at the retired /brief: home renders
-            the brief markdown below the board, so this is where "read it" is true.
-            Sending it to /brief would now redirect straight back here — the player
-            telling you to go read the brief and returning you to the player. */}
+            reading surface: the full text below on this page (see the inner
+            comment on the link for the anchor rationale). */}
         {loaded && narrationState === 'narration_unavailable' && (
           <div data-testid="player-narration-unavailable" className="mt-6 rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft">
             <p className={titleClass}>Brief exists — audio unavailable.</p>
