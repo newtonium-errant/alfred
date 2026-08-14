@@ -27,13 +27,15 @@ from alfred.telegram import health
 
 
 def test_tts_key_skip_when_section_absent() -> None:
-    r = health._check_tts_key(None)
+    r = health._check_tts_key(None, web_only=False)
     assert r.status == Status.SKIP
     assert "absent" in r.detail.lower() or "opt-in" in r.detail.lower()
 
 
 def test_tts_key_fail_on_empty() -> None:
-    r = health._check_tts_key({"provider": "elevenlabs", "api_key": ""})
+    r = health._check_tts_key(
+        {"provider": "elevenlabs", "api_key": ""}, web_only=False,
+    )
     assert r.status == Status.FAIL
     assert "missing" in r.detail.lower()
 
@@ -42,7 +44,7 @@ def test_tts_key_fail_on_unresolved_placeholder() -> None:
     r = health._check_tts_key({
         "provider": "elevenlabs",
         "api_key": "${ELEVENLABS_API_KEY}",
-    })
+    }, web_only=False)
     assert r.status == Status.FAIL
     assert "placeholder" in r.detail.lower()
 
@@ -51,7 +53,7 @@ def test_tts_key_ok_when_populated() -> None:
     r = health._check_tts_key({
         "provider": "elevenlabs",
         "api_key": "DUMMY_ELEVENLABS_TEST_KEY",
-    })
+    }, web_only=False)
     assert r.status == Status.OK
     assert r.data["length"] == len("DUMMY_ELEVENLABS_TEST_KEY")
 

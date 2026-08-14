@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 import httpx
+import structlog
 
 from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth
@@ -26,12 +27,82 @@ from alfred.telegram.config import _substitute_env
 from alfred.telegram.skill_audit import audit_skill
 
 
+log = structlog.get_logger(__name__)
+
+
+#: The one wording for "this check is quiet on purpose".
+#:
+#: This string is read by a human scanning a digest or BIT rollup, and it has
+#: to answer the question a quiet check provokes — is it quiet, or is it
+#: broken? Naming the mode AND the intent does that; "skipped" alone does not.
+#: Single-spelled so all four probes say the same thing and a grep finds every
+#: quieted check at once.
+WEB_ONLY_SKIP_DETAIL = (
+    "web_only mode — Telegram intentionally disabled "
+    "(operator set web.enabled + web.web_only; this instance runs the PWA only)"
+)
+
+
 def _is_unresolved(value: str) -> bool:
     """True if the string looks like an unresolved ``${VAR}`` placeholder."""
     return bool(value) and value.startswith("${") and value.endswith("}")
 
 
-def _check_bot_token(token: str) -> CheckResult:
+def _web_only_enabled(raw: dict[str, Any]) -> bool:
+    """True when this instance runs the web surface WITHOUT a Telegram bot.
+
+    Mirrors the daemon's own probe (``telegram/daemon.py``, the
+    ``web_only`` derivation) deliberately and line-for-line in behaviour:
+    ``web.enabled AND web.web_only``, both explicit, either absent →
+    False. Health and boot must agree about what web-only means, or the
+    daemon starts happily while health reports a broken instance.
+
+    **Fails toward strict.** Any problem reading the web config — missing
+    section, malformed block, import error — returns False, which keeps
+    today's behaviour (Telegram prerequisites required, empty token
+    FAILs). The dangerous direction here is the opposite one: a parse
+    error must never be able to silently *quiet* a check, because that
+    turns a config bug into invisible health. Logged so the fallback is
+    observable rather than assumed.
+    """
+    try:
+        from alfred.web.config import load_from_unified as _load_web_cfg
+
+        probe = _load_web_cfg(raw)
+        return bool(probe.enabled and probe.web_only)
+    except Exception:  # noqa: BLE001 — a web-config issue must not break health
+        log.exception(
+            "talker.health.web_only_probe_failed",
+            hint=(
+                "could not read the web config — falling back to strict "
+                "(Telegram checks stay enforced). A quieted check is never "
+                "the fallback."
+            ),
+        )
+        return False
+
+
+def _check_bot_token(token: str, *, web_only: bool) -> CheckResult:
+    """Bot-token probe. SKIPs entirely under ``web_only``.
+
+    ``web_only`` is REQUIRED keyword-only, not defaulted. A defaulted gate
+    is the standing trap: the tests would thread it, production never
+    would, every pin stays green and the fix is accepted-then-ignored.
+    Required means a missed call site is a TypeError at import, not a
+    silent FAIL on a quiesced instance.
+
+    BOTH failure branches skip, not just the empty one. If only the empty
+    branch were quieted, re-commenting the token line without setting the
+    env var — the ordinary way an operator half-removes a bot — would
+    resolve to a ``${...}`` placeholder and restore the daily noise on an
+    instance that is still, by declaration, web-only.
+    """
+    if web_only:
+        return CheckResult(
+            name="bot-token",
+            status=Status.SKIP,
+            detail=WEB_ONLY_SKIP_DETAIL,
+        )
     if not token:
         return CheckResult(
             name="bot-token",
@@ -52,7 +123,21 @@ def _check_bot_token(token: str) -> CheckResult:
     )
 
 
-def _check_allowed_users(allowed: list) -> CheckResult:
+def _check_allowed_users(allowed: list, *, web_only: bool) -> CheckResult:
+    """Allowlist probe. SKIPs under ``web_only`` — there is no inbound
+    Telegram traffic to allowlist.
+
+    Note this branch is WARN, not FAIL. Both are attention statuses (the
+    quiet list is ``{ok, skip}``), so a WARN is just as much daily digest
+    noise on a quiesced instance — the fix is the same, but calling it
+    "SKIP-not-FAIL" would misdescribe what it does.
+    """
+    if web_only:
+        return CheckResult(
+            name="allowed-users",
+            status=Status.SKIP,
+            detail=WEB_ONLY_SKIP_DETAIL,
+        )
     if not allowed:
         return CheckResult(
             name="allowed-users",
@@ -70,12 +155,33 @@ def _check_allowed_users(allowed: list) -> CheckResult:
 # --- wk2b c6: TTS probes --------------------------------------------------
 
 
-def _check_tts_key(tts: dict | None) -> CheckResult:
+def _check_tts_key(tts: dict | None, *, web_only: bool) -> CheckResult:
     """Static probe: TTS api_key present + env var resolved.
 
     SKIPs when the ``tts`` section is absent (opt-in feature — its
-    absence shouldn't fail the talker's overall health rollup).
+    absence shouldn't fail the talker's overall health rollup), and
+    SKIPs entirely under ``web_only``.
+
+    The fourth sibling. This probe carries the SAME half-removal shape
+    as ``_check_bot_token``: a ``telegram.tts`` block left behind with
+    its key re-commented resolves to a ``${...}`` placeholder and FAILs,
+    on an instance that has no Telegram to speak through. Latent while
+    the env var happens to resolve; it bites precisely during a "we're
+    done with Telegram here" cleanup, which is the quiesce's own
+    trajectory. Both failure branches skip, for the same reason both
+    bot-token branches do.
+
+    ``web_only`` is checked FIRST, so on a web-only instance the detail
+    explains the instance rather than the section — all four probes then
+    give one answer to "why is this quiet?" instead of four. Absent-tts
+    still SKIPs either way; only the wording changes.
     """
+    if web_only:
+        return CheckResult(
+            name="tts-key",
+            status=Status.SKIP,
+            detail=WEB_ONLY_SKIP_DETAIL,
+        )
     if tts is None:
         return CheckResult(
             name="tts-key",
@@ -179,7 +285,20 @@ async def _check_elevenlabs_auth(tts: dict | None) -> CheckResult:
     )
 
 
-def _check_stt_key(stt: dict) -> CheckResult:
+def _check_stt_key(stt: dict, *, web_only: bool) -> CheckResult:
+    """Telegram STT probe. SKIPs under ``web_only``.
+
+    Voice on a web-only instance arrives through the web surface, which
+    carries its own STT config and its own health probe — this one is
+    specifically about transcribing Telegram voice notes, and there are
+    none. Also WARN rather than FAIL; see ``_check_allowed_users``.
+    """
+    if web_only:
+        return CheckResult(
+            name="stt-key",
+            status=Status.SKIP,
+            detail=WEB_ONLY_SKIP_DETAIL,
+        )
     provider = stt.get("provider", "groq")
     api_key = stt.get("api_key", "") or ""
     if not api_key or _is_unresolved(api_key):
@@ -320,11 +439,31 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     if not isinstance(tts_raw, dict):
         tts_raw = None
 
+    # Web-only instances (web.enabled AND web.web_only) have no Telegram
+    # bot by explicit operator declaration, so the three Telegram-specific
+    # prerequisite probes below quiet down rather than reporting a broken
+    # instance every day. Derived once here and threaded, so all three
+    # agree and there is no second derivation to drift.
+    web_only = _web_only_enabled(raw)
+    if web_only:
+        # Intentionally-left-blank: quieting a check is exactly the case
+        # where silence is indistinguishable from breakage, so the run
+        # says out loud that it quieted them and why. INFO, not DEBUG —
+        # a honesty signal below the production log level is silence
+        # wearing a log statement.
+        log.info(
+            "talker.health.web_only_checks_skipped",
+            skipped=["bot-token", "allowed-users", "stt-key", "tts-key"],
+            detail=WEB_ONLY_SKIP_DETAIL,
+        )
+
     results: list[CheckResult] = [
-        _check_bot_token(tel.get("bot_token", "") or ""),
-        _check_allowed_users(tel.get("allowed_users", []) or []),
-        _check_stt_key(tel.get("stt", {}) or {}),
-        _check_tts_key(tts_raw),
+        _check_bot_token(tel.get("bot_token", "") or "", web_only=web_only),
+        _check_allowed_users(
+            tel.get("allowed_users", []) or [], web_only=web_only,
+        ),
+        _check_stt_key(tel.get("stt", {}) or {}, web_only=web_only),
+        _check_tts_key(tts_raw, web_only=web_only),
         _check_capture_handlers(),
         _check_skill_capability_audit(raw),
     ]
