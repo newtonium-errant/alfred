@@ -105,10 +105,21 @@ describe('what the page carried moved with it', () => {
 });
 
 describe('the slide fallback is a decision, not a leftover', () => {
-  it('unmapped sections land on home', () => {
-    expect(SECTION_DEEP_LINK_FALLBACK).toBe('/');
-    expect(slideDeepLink('mystery')).toBe('/');
-    expect(slideDeepLink('health')).toBe('/');
+  it('unmapped sections land on the brief text on THIS page', () => {
+    // Not home: home renders a summary card from the brief's `date` and never
+    // its markdown, so a cross-page link there would be the retirement's
+    // self-loop wearing a fix's clothes. The player carries both BriefViews, so
+    // the honest destination for "the rest of this section" is just below.
+    expect(SECTION_DEEP_LINK_FALLBACK).toBe('#brief-text');
+    expect(slideDeepLink('mystery')).toBe('#brief-text');
+    expect(slideDeepLink('health')).toBe('#brief-text');
+  });
+
+  it('the anchor it points at actually EXISTS on the player', () => {
+    // The half that makes the fallback a destination rather than a string. An
+    // anchor with no matching id is a dead link that no type checker can see.
+    const player = read('pages', 'player.tsx');
+    expect(player).toContain(`id="${SECTION_DEEP_LINK_FALLBACK.slice(1)}"`);
   });
 
   it('the mapped sections still win over the fallback', () => {

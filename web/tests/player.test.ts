@@ -51,13 +51,13 @@ describe('narrationSlides', () => {
 });
 
 describe('slideDeepLink', () => {
-  it('day_state → /feed, day_plan → /deck, everything else (incl. unknown) → / — never a dead link', () => {
+  it('day_state → /feed, day_plan → /deck, everything else (incl. unknown) → the on-page brief anchor — never a dead link', () => {
     expect(slideDeepLink('day_state')).toBe('/feed');
     expect(slideDeepLink('day_plan')).toBe('/deck');
-    expect(slideDeepLink('health')).toBe('/');
-    expect(slideDeepLink('weather')).toBe('/');
-    expect(slideDeepLink('sign_off')).toBe('/');
-    expect(slideDeepLink('mystery')).toBe('/');
+    expect(slideDeepLink('health')).toBe('#brief-text');
+    expect(slideDeepLink('weather')).toBe('#brief-text');
+    expect(slideDeepLink('sign_off')).toBe('#brief-text');
+    expect(slideDeepLink('mystery')).toBe('#brief-text');
   });
 });
 

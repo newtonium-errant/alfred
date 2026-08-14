@@ -85,18 +85,23 @@ export function narrationSlides(n: BriefNarration | null | undefined): PlayerSli
 
 // Where a slide's deep-link (tap the slide element) lands — the REAL surface for that
 // section, per the design. day_state (goal rings) → the feed; day_plan (slots) → the
-// deck (accept/complete).
+// deck (accept/complete); everything else → the brief text on this page (see below).
 //
-// THE FALLBACK IS HOME, and it is a decision rather than a leftover. It used to be
-// `/brief`, which is retired; home is the canonical morning surface by C1's own
-// ratification ("one canonical morning surface, no new nav") and it renders the brief
-// markdown, so an unmapped section landing on the viewscreen is coherent navigation.
-// A real destination beats both alternatives — a dead link, and silently not rendering
-// the link at all.
+// THE FALLBACK IS THE PLAYER'S OWN BRIEF TEXT, and it is a decision rather than a
+// leftover. It used to be `/brief`, which is retired. It is deliberately NOT home:
+// home renders a summary CARD built from the brief's `date` and never renders its
+// markdown, so sending "here is the rest of this section" to the home screen would
+// be a cross-page link to a card — the same self-loop the retirement was supposed to
+// remove, wearing a fix's clothes.
 //
-// Pinned by player.test.ts. A future section that wants its OWN destination has to add
-// a row here consciously; inheriting home by accident is exactly what the pin stops.
-export const SECTION_DEEP_LINK_FALLBACK = '/';
+// Since both `BriefView`s now render on `/player`, the player is SELF-CONTAINED for
+// brief content, and the most truthful destination for an unmapped section is the
+// full text immediately below it. An in-page anchor, not a route.
+//
+// Pinned by player.test.ts + briefRetired.test.ts. A future section that wants a real
+// CROSS-SURFACE destination has to add a row to the map consciously; inheriting the
+// anchor by accident is exactly what the pin stops.
+export const SECTION_DEEP_LINK_FALLBACK = '#brief-text';
 const SECTION_DEEP_LINK: Record<string, string> = {
   day_state: '/feed',
   day_plan: '/deck',
