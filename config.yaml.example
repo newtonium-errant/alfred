@@ -833,6 +833,14 @@ transport:
 #   #   # a cwd-relative path — that guess is how one instance's writer
 #   #   # landed in another instance's store (#74).
 #   #   state_path: ./data/web_contact_state.json
+#   #
+#   # NOTE: the router's LEVERS are not here. gap_hours_new_day,
+#   # brief_read_decay_hours and reroute_min_minutes all live in the operator's
+#   # preference record and are read from the vault at request time, so tuning
+#   # them is a vault edit rather than a deploy. `reroute_min_minutes` (default
+#   # 30) is how long after a route the app treats a return to `/` as the SAME
+#   # visit — it is what stops a logo-tap from bouncing you off the page you
+#   # just chose.
 #   # --- WebRTC voice (PWA voice arc) ---
 #   # Browser mic → WebRTC → this server. DISABLED by default — an absent or
 #   # ``enabled: false`` block mounts NO /voice/* routes (route table

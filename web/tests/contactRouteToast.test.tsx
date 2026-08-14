@@ -1,12 +1,17 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockState, mockContact, mockOverride, mockReplace } = vi.hoisted(() => ({
+const { mockState, mockContact, mockOverride, mockReplace, routeHandlers } = vi.hoisted(() => ({
   mockState: vi.fn(),
   mockContact: vi.fn(),
   mockOverride: vi.fn(),
   mockReplace: vi.fn(),
+  // Real handler registry, not a no-op spy: the toast's dismiss-on-navigate
+  // cannot be driven against `events: { on: vi.fn() }`, which is exactly how
+  // this fix could have shipped with a green suite and the operator's bug
+  // still live.
+  routeHandlers: [] as Array<(url: string) => void>,
 }));
 
 vi.mock('../lib/algernon/dayClient', () => ({
@@ -18,7 +23,13 @@ vi.mock('next/router', () => ({
     push: vi.fn(),
     asPath: '/',
     query: {},
-    events: { on: vi.fn(), off: vi.fn() },
+    events: {
+      on: (_e: string, h: (url: string) => void) => routeHandlers.push(h),
+      off: (_e: string, h: (url: string) => void) => {
+        const i = routeHandlers.indexOf(h);
+        if (i >= 0) routeHandlers.splice(i, 1);
+      },
+    },
   }),
 }));
 
@@ -47,11 +58,12 @@ function dayState(overrides: Partial<DayState> = {}): DayState {
     unresolved_flagged_notifications: 0,
     first_unresolved_notification_id: null,
     last_active_surface: '',
+    minutes_since_last_contact: null,
     rule_order: [...CONTACT_RULE_ORDER],
     armed_rules: ['unresolved_notification', 'first_contact_after_gap', 'default'],
     unarmed_rules: {},
     adopted_defaults: {},
-    levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12 },
+    levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12, reroute_min_minutes: 30 },
     levers_source: 'defaults',
     configured: true,
     ...overrides,
@@ -72,6 +84,7 @@ function Harness({ enabled = true }: { enabled?: boolean }) {
 }
 
 beforeEach(() => {
+  routeHandlers.length = 0;
   __resetContactRouteToast();
   mockState.mockReset().mockResolvedValue(dayState());
   mockContact.mockReset().mockResolvedValue({ contact_id: 'c-1', recorded: true });
@@ -171,6 +184,56 @@ describe('dismiss', () => {
       expect(screen.queryByTestId('contact-route-toast')).toBeNull(),
     );
     expect(mockOverride).not.toHaveBeenCalled();
+  });
+});
+
+describe('it never follows the operator to the next page', () => {
+  // THE OPERATOR'S BUG REPORT. This component lives in `_app`, so a client-side
+  // navigation does not unmount it — the affordance outlived the surface it was
+  // about and was found sitting over the /ingest textarea, long after the open
+  // it described. A note about THIS open has no business on the next page.
+  it('dismisses on a route change', async () => {
+    render(<Harness />);
+    await waitFor(() => screen.getByTestId('contact-route-toast'));
+    expect(routeHandlers.length).toBeGreaterThan(0); // vacuity control
+
+    act(() => { routeHandlers.forEach((h) => h('/ingest')); });
+    await waitFor(() =>
+      expect(screen.queryByTestId('contact-route-toast')).toBeNull(),
+    );
+  });
+
+  it('unsubscribes once dismissed, so it cannot be revived by a later nav', async () => {
+    render(<Harness />);
+    await waitFor(() => screen.getByTestId('contact-route-toast'));
+    act(() => { routeHandlers.forEach((h) => h('/ingest')); });
+    await waitFor(() =>
+      expect(screen.queryByTestId('contact-route-toast')).toBeNull(),
+    );
+    act(() => { routeHandlers.forEach((h) => h('/deck')); });
+    expect(screen.queryByTestId('contact-route-toast')).toBeNull();
+  });
+
+  it('sits clear of the composer, not over it', async () => {
+    // Asserted on the RENDERED element, not the source. The first version of
+    // this read the file as text and failed — because the comment explaining
+    // the fix names `bottom-20`, the very string it was checking for the
+    // absence of. Third time today that a text scan could not tell code from
+    // prose about code; the DOM cannot be fooled that way.
+    render(<Harness />);
+    await waitFor(() => screen.getByTestId('contact-route-toast'));
+    const cls = screen.getByTestId('contact-route-toast').className;
+    expect(cls).toContain('top-20');
+    expect(cls).not.toContain('bottom-20');
+  });
+});
+
+describe('the chips read as surfaces, not as wire keys', () => {
+  it('labels the brief chip Player', async () => {
+    render(<Harness />);
+    await waitFor(() => screen.getByTestId('contact-route-toast'));
+    // The testid still carries the KEY (parity-pinned); the text carries the label.
+    expect(screen.getByTestId('contact-route-override-brief').textContent).toBe('Player');
   });
 });
 

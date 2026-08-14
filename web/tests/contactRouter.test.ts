@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONTACT_RULE_ORDER,
   CONTACT_SURFACES,
+  SURFACE_LABELS,
   SURFACE_PATHS,
   evaluateRoute,
   isContactSurface,
@@ -25,11 +26,12 @@ function state(overrides: Partial<DayState> = {}): DayState {
     unresolved_flagged_notifications: 0,
     first_unresolved_notification_id: null,
     last_active_surface: 'chat',
+    minutes_since_last_contact: null,
     rule_order: [...CONTACT_RULE_ORDER],
     armed_rules: ['unresolved_notification', 'first_contact_after_gap', 'default'],
     unarmed_rules: { resume_pending_capture: 'needs open_capture_pending' },
     adopted_defaults: {},
-    levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12 },
+    levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12, reroute_min_minutes: 30 },
     levers_source: 'preference_record',
     configured: true,
     ...overrides,
@@ -52,6 +54,49 @@ describe('the fail-safe is staying put', () => {
   it('DOES route on the same payload once armed — the positive control', () => {
     // Without this, every assertion above passes against a broken evaluator.
     expect(evaluateRoute(state())?.rule).toBe('default');
+  });
+});
+
+describe('the same-visit window — asked before any rule', () => {
+  // THE OPERATOR'S SECOND TOAST. The hook's once-guard is a React ref that
+  // resets on every mount of `/`, so tapping the logo re-ran the router and
+  // bounced him off the page he had just chosen. This is the question a mount
+  // guard structurally cannot answer, and it is answered from SERVER state —
+  // not sessionStorage, which survives an iOS PWA resume and would silently
+  // kill a genuine next-morning open.
+  it('stays put when the router routed a moment ago', () => {
+    expect(evaluateRoute(state({ minutes_since_last_contact: 5 }))).toBeNull();
+  });
+
+  it('routes again once the window has passed', () => {
+    // The positive control: same payload, older contact. Without it the
+    // assertion above passes against a router that never routes at all.
+    expect(evaluateRoute(state({ minutes_since_last_contact: 45 }))?.rule).toBe('default');
+  });
+
+  it('routes on a first-ever contact (null is not "recent")', () => {
+    expect(evaluateRoute(state({ minutes_since_last_contact: null }))?.rule).toBe('default');
+  });
+
+  it('uses the RECORD lever, not a number of its own', () => {
+    const s10 = state({
+      minutes_since_last_contact: 20,
+      levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12, reroute_min_minutes: 10 },
+    });
+    expect(evaluateRoute(s10)?.rule).toBe('default'); // 20 >= 10 → a new visit
+    const s60 = state({
+      minutes_since_last_contact: 20,
+      levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12, reroute_min_minutes: 60 },
+    });
+    expect(evaluateRoute(s60)).toBeNull();            // 20 < 60 → same visit
+  });
+
+  it('outranks every rule, including one that would otherwise fire', () => {
+    // Rule 2 would fire on its own; the window is asked first.
+    expect(evaluateRoute(state({
+      minutes_since_last_contact: 2,
+      unresolved_flagged_notifications: 3,
+    }))).toBeNull();
   });
 });
 
@@ -117,7 +162,7 @@ describe('rule 3 — first contact after a gap', () => {
     const seven = state({
       time_since_last_session_hours: 7,
       brief_read_today: false,
-      levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12 },
+      levers: { gap_hours_new_day: 6, brief_read_decay_hours: 12, reroute_min_minutes: 30 },
     });
     expect(evaluateRoute(seven)?.rule).toBe('first_contact_after_gap');
     // Same gap, a wider lever from the record — now inside the threshold.
@@ -201,6 +246,29 @@ describe('the server owns the priority order', () => {
       unresolved_flagged_notifications: 1,
     }));
     expect(d?.rule).toBe('unresolved_notification');
+  });
+});
+
+describe('the labels are not the wire keys', () => {
+  it('every surface has a label', () => {
+    for (const s of CONTACT_SURFACES) {
+      expect(SURFACE_LABELS[s], s).toBeTruthy();
+    }
+  });
+
+  it('the brief surface READS as Player while its KEY stays brief', () => {
+    // The retirement moved the page, not the vocabulary. The key is
+    // parity-pinned against Python's SURFACES; the label is what the operator
+    // sees, and "Brief" now names a page that redirects.
+    expect(SURFACE_LABELS.brief).toBe('Player');
+    expect(CONTACT_SURFACES).toContain('brief');
+    expect(SURFACE_PATHS.brief).toBe('/player');
+  });
+
+  it('no label leaks into the key set — the pin that keeps them separable', () => {
+    // Vacuity control AND the real invariant: if someone "fixes" the label by
+    // renaming the key, this fails rather than silently breaking Python parity.
+    expect(Object.keys(SURFACE_PATHS).sort()).toEqual([...CONTACT_SURFACES].sort());
   });
 });
 

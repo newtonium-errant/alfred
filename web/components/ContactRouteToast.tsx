@@ -1,7 +1,11 @@
 import { useEffect } from 'react';
 import { useRouter } from 'next/router';
 import { CONSOLE_LABEL, roleChipClass } from '../lib/algernon/consoleTokens';
-import { SURFACE_PATHS, type ContactSurface } from '../lib/algernon/contactRouter';
+import {
+  SURFACE_LABELS,
+  SURFACE_PATHS,
+  type ContactSurface,
+} from '../lib/algernon/contactRouter';
 import {
   OVERRIDE_WINDOW_MS,
   overrideChoices,
@@ -30,11 +34,27 @@ export function ContactRouteToast() {
   const router = useRouter();
   const { toast, dismiss, override } = useContactRouteToast();
 
+  // TWO ways it goes away, and the second one is the operator's bug report.
+  //
+  // The timer was always here. What was missing is that this component lives in
+  // `_app`, so a client-side navigation does NOT unmount it — the affordance
+  // outlived the surface it was about and rode along to the next page. The
+  // operator caught it sitting over the /ingest textarea, thirty minutes and
+  // several navigations after the open it described.
+  //
+  // So: any route change dismisses it. An override chip navigates too, but it
+  // publishes `null` before navigating, so there is nothing left to dismiss —
+  // the listener is about the operator's OWN navigation, which is precisely the
+  // signal that they are done with this open.
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(dismiss, OVERRIDE_WINDOW_MS);
-    return () => clearTimeout(timer);
-  }, [toast, dismiss]);
+    router.events.on('routeChangeStart', dismiss);
+    return () => {
+      clearTimeout(timer);
+      router.events.off('routeChangeStart', dismiss);
+    };
+  }, [toast, dismiss, router.events]);
 
   if (!toast) return null;
 
@@ -52,7 +72,11 @@ export function ContactRouteToast() {
     <div
       data-testid="contact-route-toast"
       role="status"
-      className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit max-w-[92vw] flex-col gap-2 rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card"
+      /* TOP, not bottom. It used to sit at `bottom-20`, which is exactly where
+         this app puts its composers — the chat input, the ingest textarea — so
+         a transient affordance covered the control the operator had navigated
+         to use. Nothing about an app-open note needs the thumb zone. */
+      className="fixed inset-x-0 top-20 z-50 mx-auto flex w-fit max-w-[92vw] flex-col gap-2 rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card"
     >
       <div className="flex items-center gap-3">
         <span className={CONSOLE_LABEL} data-testid="contact-route-reason">
@@ -75,9 +99,9 @@ export function ContactRouteToast() {
             type="button"
             data-testid={`contact-route-override-${surface}`}
             onClick={() => go(surface)}
-            className={`rounded-md px-2 py-1 text-xs font-semibold capitalize ${roleChipClass('info')}`}
+            className={`rounded-md px-2 py-1 text-xs font-semibold ${roleChipClass('info')}`}
           >
-            {surface}
+            {SURFACE_LABELS[surface]}
           </button>
         ))}
       </div>

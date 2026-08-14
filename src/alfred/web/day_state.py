@@ -35,6 +35,7 @@ from .contact_state import (
     DEFAULT_PATTERN_SAME_CONTEXT_REQUIRED,
     DEFAULT_PATTERN_THRESHOLD_RATIO,
     DEFAULT_PATTERN_WINDOW_DAYS,
+    DEFAULT_REROUTE_MIN_MINUTES,
     RULE_ORDER,
     UNARMED_RULE_REASONS,
     WebContactStore,
@@ -159,6 +160,11 @@ def levers_from_args(args: dict[str, Any]) -> dict[str, float]:
         "brief_read_decay_hours": _float_or(
             raw.get("brief_read_decay_hours"), DEFAULT_BRIEF_READ_DECAY_HOURS
         ),
+        # Read from the same record as its siblings, so a Hypatia-side edit
+        # tunes it with no deploy — the whole reason the levers live there.
+        "reroute_min_minutes": _float_or(
+            raw.get("reroute_min_minutes"), DEFAULT_REROUTE_MIN_MINUTES
+        ),
     }
 
 
@@ -238,6 +244,7 @@ def compute_day_state(
     notify_store: Any,
     state_mgr: Any,
     vault_path: Path | str | None,
+    current_brief_date: str = "",
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Assemble the day-state payload the PWA evaluates the rule set against.
@@ -288,11 +295,46 @@ def compute_day_state(
         else None
     )
 
-    brief_ts = contact_store.last_brief_contact_ts(user_key) if contact_store else None
+    # BRIEF_READ_TODAY IS TWO QUESTIONS, AND THE FIRST ONE USED TO BE MISSING.
+    #
+    # The original derivation asked only "how long ago did they land on the
+    # brief", which a 28-second glance at YESTERDAY'S brief answers exactly like
+    # a real read of today's — so a 04:48 look at the previous day's artifact
+    # suppressed rule 3 for the one that landed at 06:00. Observed in the
+    # operator's own contact log; the lever was never wrong, it was the only
+    # question being asked.
+    #
+    # So: WHICH, then WHEN.
+    #   WHICH — identity, not arithmetic. The artifact date recorded on the
+    #     contact (read server-side when it happened) must equal the artifact
+    #     date current now. Comparing a timestamp against a date string would
+    #     need a local-midnight boundary this module has no business inventing,
+    #     and the operator's case sits exactly where that guess would decide.
+    #   WHEN — the decay lever, unchanged and still doing its own job: after
+    #     `brief_read_decay_hours` a genuine morning read stops suppressing the
+    #     evening offer.
+    #
+    # An unrecorded date (a contact predating this field, or an instance with no
+    # spool) is NOT a match. The failure direction is being offered the brief
+    # again, never having it silently withheld.
+    brief_ts, brief_read_date = (
+        contact_store.last_brief_read(user_key) if contact_store else (None, "")
+    )
     decay_hours = levers["brief_read_decay_hours"]
+    same_artifact = bool(
+        brief_read_date and current_brief_date and brief_read_date == current_brief_date
+    )
     brief_read_today = bool(
         brief_ts is not None
+        and same_artifact
         and (at - brief_ts).total_seconds() / 3600.0 < decay_hours
+    )
+
+    # Minutes since the router last routed — the CONTACT log alone, not the
+    # blended "last session" above. Chat activity is not a routing event, and
+    # counting it would make a long conversation suppress the next real open.
+    minutes_since_contact = (
+        (at - last_contact).total_seconds() / 60.0 if last_contact is not None else None
     )
 
     last_surface = contact_store.last_landed_surface(user_key) if contact_store else ""
@@ -309,9 +351,19 @@ def compute_day_state(
             round(hours_since, 4) if hours_since is not None else None
         ),
         "brief_read_today": brief_read_today,
+        # Served so the client (and a human reading the payload) can see WHICH
+        # artifact the answer is about. A bare boolean is what let the previous
+        # derivation be wrong without looking wrong.
+        "current_brief_date": current_brief_date,
+        "brief_read_date": brief_read_date,
         "unresolved_flagged_notifications": unresolved,
         "first_unresolved_notification_id": first_unresolved,
         "last_active_surface": last_surface,
+        # `None` = never routed for this identity, which the client reads as
+        # "route" — a first-ever contact is a new visit by definition.
+        "minutes_since_last_contact": (
+            round(minutes_since_contact, 4) if minutes_since_contact is not None else None
+        ),
         # Which rungs are live, and why the rest are not.
         "rule_order": list(RULE_ORDER),
         "armed_rules": list(ARMED_RULES),
@@ -336,10 +388,15 @@ def compute_day_state(
         configured=payload["configured"],
         unresolved=unresolved,
         brief_read_today=brief_read_today,
+        current_brief_date=current_brief_date or "(none)",
+        brief_read_date=brief_read_date or "(none)",
         hours_since_last_session=(
             round(hours_since, 2) if hours_since is not None else None
         ),
         last_active_surface=last_surface or "(none)",
+        minutes_since_last_contact=(
+            round(minutes_since_contact, 1) if minutes_since_contact is not None else None
+        ),
         levers_source=levers_source,
         armed=len(ARMED_RULES),
     )

@@ -74,9 +74,11 @@ from .keys import (
     KEY_WEB_CONFIG,
     KEY_WEB_CONTACT_FEED,
     KEY_WEB_CONTACT_STORE,
+    KEY_WEB_DATA_DIR,
     KEY_WEB_NOTIFY_STORE,
     KEY_WEB_STATE_MGR,
 )
+from .outbound_store import read_latest
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -145,6 +147,24 @@ def _resolve_day_identity(
     return identity, None
 
 
+def _current_brief_date(request: web.Request) -> str:
+    """The date of the brief artifact that is current RIGHT NOW, or ``""``.
+
+    THE single read of this fact, used by both consumers: the day-state
+    derivation (which artifact is current) and the contact recorder (which
+    artifact the operator is being shown). One function so the two cannot
+    disagree about what "the current brief" means — a writer and a reader
+    deriving it separately is the drift `resolve_contact_state_path` exists to
+    prevent, one layer up.
+
+    ``read_latest`` never raises: an absent spool, an unthreaded data_dir or a
+    corrupt sidecar all read as "nothing spooled", which becomes ``""`` — and
+    every consumer treats that as NOT-read rather than as a match.
+    """
+    spooled = read_latest(request.app.get(KEY_WEB_DATA_DIR), "brief")
+    return str((spooled or {}).get("date") or "")
+
+
 def _compute(request: web.Request, identity: WebIdentity) -> dict[str, Any]:
     """Assemble the day-state payload for ``identity``."""
     return compute_day_state(
@@ -153,6 +173,7 @@ def _compute(request: web.Request, identity: WebIdentity) -> dict[str, Any]:
         notify_store=request.app.get(KEY_WEB_NOTIFY_STORE),
         state_mgr=request.app.get(KEY_WEB_STATE_MGR),
         vault_path=_get_vault_path(request),
+        current_brief_date=_current_brief_date(request),
     )
 
 
@@ -235,6 +256,9 @@ async def _handle_day_contact(request: web.Request) -> web.StreamResponse:
         rule=rule,
         surface=surface,
         state=snapshot,
+        # WHICH brief they are being shown, read here rather than taken from the
+        # client — the same trust boundary as the state snapshot above.
+        brief_date=_current_brief_date(request),
     )
     log.info(
         "web.day.contact",

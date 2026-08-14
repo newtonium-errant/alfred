@@ -133,6 +133,19 @@ SURFACES: tuple[str, ...] = (
 # record is the only place either number is set.
 DEFAULT_GAP_HOURS_NEW_DAY = 6.0
 DEFAULT_BRIEF_READ_DECAY_HOURS = 12.0
+# How recently the router must have ALREADY routed for this contact to be
+# treated as the same visit rather than a new one.
+#
+# The mount-guard alone cannot answer this: it is a React ref, so it resets
+# whenever `/` mounts — and tapping the logo to go home remounts it. The
+# operator got bounced off the page he had deliberately navigated to, with a
+# fresh toast, minutes after the open it was about.
+#
+# Server state answers it and browser storage cannot: sessionStorage survives an
+# iOS PWA resume, so a genuine next-morning open would stop routing; the contact
+# log is the truth and it is on this side. The shape rhymes with the spec's own
+# `first_contact_after_gap` one level up — a gap decides what counts as new.
+DEFAULT_REROUTE_MIN_MINUTES = 30.0
 
 # Spec defaults for pattern-surfacing.
 DEFAULT_PATTERN_ENABLED = True
@@ -297,6 +310,7 @@ class WebContactStore:
         rule: str,
         surface: str,
         state: dict[str, Any] | None = None,
+        brief_date: str = "",
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Append one contact for ``user_key``; saves; returns the entry.
@@ -304,6 +318,16 @@ class WebContactStore:
         ``rule`` and ``surface`` are assumed already validated against the
         vocabulary by the caller (the route validates, so an invalid value is a
         4xx rather than a stored string nothing can interpret).
+
+        ``brief_date`` is the date of the brief artifact that was CURRENT when
+        this contact happened, read server-side by the route. It is what makes
+        "has the operator read today's brief" answerable: without it the only
+        available question is "how long ago did they land on the brief", and a
+        28-second glance at YESTERDAY'S brief answers that identically to a real
+        read of today's. Empty string means unrecorded (a contact written before
+        this field existed, or an instance with no spool) — and every reader
+        treats unrecorded as NOT-read, so the failure direction is being offered
+        the brief again rather than having it silently suppressed.
         """
         stamp = (now or _now()).isoformat()
         entry = {
@@ -319,6 +343,8 @@ class WebContactStore:
             # logged WITH it, and an override is only discovered later, so the
             # state must already be on the contact when the tap arrives.
             "state": dict(state or {}),
+            # The brief that was current at this moment (see the docstring).
+            "brief_date": str(brief_date or ""),
         }
         bucket = self.contacts.setdefault(str(user_key), [])
         bucket.append(entry)
@@ -387,12 +413,38 @@ class WebContactStore:
                 return landed
         return ""
 
-    def last_brief_contact_ts(self, user_key: int | str) -> datetime | None:
-        """When the operator last LANDED on the brief, or ``None``.
+    def last_brief_read(
+        self, user_key: int | str
+    ) -> "tuple[datetime | None, str]":
+        """The operator's most recent brief LANDING — ``(when, which)``.
+
+        ``which`` is the ``brief_date`` recorded on that contact: the artifact
+        that was current when they landed. ``("", None)`` shapes mean nothing to
+        compare, and every caller must read that as NOT-read rather than as a
+        pass.
 
         ``landed``, not ``surface``: a contact the router sent to the brief and
         the operator immediately overrode away from is not a brief read. That
         distinction is the whole reason ``landed`` is a separate field.
+        """
+        best_ts: datetime | None = None
+        best_date = ""
+        for entry in self.contacts.get(str(user_key), []):
+            if str(entry.get("landed") or "") != SURFACE_BRIEF:
+                continue
+            ts = parse_ts(entry.get("ts"))
+            if ts is None:
+                continue
+            if best_ts is None or ts > best_ts:
+                best_ts = ts
+                best_date = str(entry.get("brief_date") or "")
+        return best_ts, best_date
+
+    def last_brief_contact_ts(self, user_key: int | str) -> datetime | None:
+        """When the operator last LANDED on the brief, or ``None``.
+
+        Kept as the timestamp-only view; :meth:`last_brief_read` is the one that
+        can answer WHICH brief, and is what the day-state derivation uses.
         """
         stamps = [
             ts

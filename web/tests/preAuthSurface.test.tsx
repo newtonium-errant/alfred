@@ -65,7 +65,14 @@ describe('the driven half — the feed gate really wears the register', () => {
 describe('the class half — no page declares a surface on only some of its branches', () => {
   // Every page that passes `surface=` to ANY Layout must pass it to EVERY
   // Layout. Pages that never adopt a register are untouched by this rule.
-  const PAGES = ['index.tsx', 'chat.tsx', 'feed.tsx', 'deck.tsx', 'ingest.tsx', 'batch.tsx'];
+  // `player.tsx` joined when it adopted viewscreen, IN THE SAME COMMIT — the
+  // rule three sibling-omissions bought: when a page adopts a register, the
+  // register's pins are part of the adoption, not a follow-up. Adding the page
+  // and leaving this list alone is how the newest member becomes the one member
+  // nothing checks.
+  const PAGES = [
+    'index.tsx', 'chat.tsx', 'feed.tsx', 'deck.tsx', 'ingest.tsx', 'batch.tsx', 'player.tsx',
+  ];
 
   it('the pin is reading real files with real Layouts — the positive control', () => {
     let withLayout = 0;

@@ -484,7 +484,11 @@ class TestOneIdentityCannotReadAnother:
         )).json()
 
         assert mine["last_active_surface"] == SURFACE_BRIEF
-        assert mine["brief_read_today"] is True
+        # NOT read-today: this fixture spools no brief, so there is no artifact
+        # identity to match. Two empty dates agreeing about nothing is not a
+        # read — the property under test here is per-identity isolation, and
+        # `last_active_surface` carries it without needing a spool.
+        assert mine["brief_read_today"] is False
         # The other operator has no history at all — not mine.
         assert theirs["last_active_surface"] == ""
         assert theirs["brief_read_today"] is False

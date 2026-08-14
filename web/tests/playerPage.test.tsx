@@ -273,3 +273,65 @@ describe('player 401 handling — no fake logout', () => {
     expect(mockReplace).not.toHaveBeenCalled();
   });
 });
+
+describe('the arrows do not start audio when nothing is playing', () => {
+  // HIS SILENT REVIEW STARTED TALKING. `goToSlide` wrote `audio.currentTime`
+  // unconditionally, including when the player was idle or paused — and writing
+  // currentTime on a paused or ended element is not inert on every browser.
+  //
+  // Visual-follows-narration is a rule about a briefing being NARRATED, not
+  // about the slides as a document. Once playback stops, the arrows are a
+  // reader's controls: they move the slide and touch the audio element not at
+  // all. This pins BOTH halves, because a fix that simply stopped seeking would
+  // also break the playing case, and that case has no visible symptom to catch it.
+
+  async function mounted() {
+    mockFetchNarration.mockResolvedValue({ narration: narration([seg('day_state'), seg('day_plan'), seg('health')]) });
+    mockFetchAudio.mockResolvedValue({ kind: 'audio', url: 'blob:test' });
+    render(<PlayerPage />);
+    await waitFor(() => expect(screen.queryByTestId('player')).not.toBeNull());
+    const el = screen.queryByTestId('player-audio') as HTMLAudioElement | null;
+    expect(el).not.toBeNull();
+    // jsdom leaves duration NaN; the seek path needs a real one.
+    Object.defineProperty(el as HTMLAudioElement, 'duration', { value: 100, configurable: true });
+    (el as HTMLAudioElement).currentTime = 0;
+    return el as HTMLAudioElement;
+  }
+
+  // The slide the page is showing. Asserted as a CHANGE rather than a named
+  // section: slides sort by SEGMENT_ORDER, which `player.test.ts` already pins,
+  // and hard-coding an order here would make this file fail for a reason that
+  // has nothing to do with what it is guarding.
+  const section = () => screen.getByTestId('player-slide').getAttribute('data-section');
+
+  it('IDLE: next moves the slide and leaves currentTime alone', async () => {
+    const el = await mounted();
+    const before = section();
+    act(() => fireEvent.click(screen.getByTestId('player-next')));
+    expect(section()).not.toBe(before); // the slide DID move
+    expect(el.currentTime).toBe(0);     // the audio did NOT
+  });
+
+  it('PAUSED: next moves the slide and leaves currentTime alone', async () => {
+    const el = await mounted();
+    act(() => fireEvent.click(screen.getByTestId('player-play')));
+    act(() => fireEvent.click(screen.getByTestId('player-pause')));
+    el.currentTime = 0;
+    const before = section();
+    act(() => fireEvent.click(screen.getByTestId('player-next')));
+    expect(section()).not.toBe(before);
+    expect(el.currentTime).toBe(0);
+  });
+
+  it('PLAYING: next DOES seek — the rule still holds while narrating', async () => {
+    // The other half, and the reason the fix is a condition rather than a
+    // deletion. Without this, "never seek" would pass every assertion above.
+    const el = await mounted();
+    act(() => fireEvent.click(screen.getByTestId('player-play')));
+    el.currentTime = 0;
+    const before = section();
+    act(() => fireEvent.click(screen.getByTestId('player-next')));
+    expect(section()).not.toBe(before);
+    expect(el.currentTime).toBeGreaterThan(0);
+  });
+});
