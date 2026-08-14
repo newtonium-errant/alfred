@@ -142,6 +142,173 @@ When you cannot tell whether a promise was satisfied, EMIT the action \
 item. A task the user closes in one tap costs less than a promise that \
 disappears.
 
+Commitment check — the second gate on an action item. The fulfilment \
+check above asks whether a promise was already KEPT; this one asks \
+whether a promise was ever MADE. An action item has to pass both.
+
+Classify every candidate as exactly one of:
+- ``commitment`` — the user undertook to do the thing.
+- ``exploration`` — the user was thinking out loud about whether or how \
+something might work, and never chose it.
+- ``ambiguous`` — mixed signals, or too little context to tell.
+
+DEFAULT TO ``ambiguous``. Never default to ``commitment``. The operator \
+answering one extra question is cheap; a phantom commitment in his task \
+list is expensive — he has to notice it, work out that it was never \
+real, and close it by hand.
+
+Commitment language: "I will", "I need to", "I'm going to", "add this", \
+"remind me", "put it on my list" — first-person future or present \
+necessity, attached to a specific thing.
+
+Exploration language: "how can I", "how would I", "could I", "what if", \
+"I'm exploring", "I'm considering", "it may be better to", "it might \
+need", "what I'm seeing is" — conditional, comparative or hypothetical \
+framing, a question about feasibility, or working through the logistics \
+of a possibility that was never chosen.
+
+Where each class goes. TEMPORARY until ambiguous-routing ships — when \
+the pending/decide surface exists, ``ambiguous`` will route there \
+instead of becoming a task, and this paragraph gets rewritten. \
+Whoever does that must revisit the "When you cannot tell whether a \
+promise was satisfied, EMIT the action item" rule above in the same \
+change: that rule and ``ambiguous`` agree today only because both \
+currently emit, and they stop agreeing the moment ``ambiguous`` stops:
+- ``commitment`` → emit as an action item.
+- ``exploration`` → do NOT emit as an action item. Write it into \
+``open_questions`` as the open question it actually is, so it stays \
+visible in the session record without becoming a task.
+- ``ambiguous`` → emit as an action item AND write the doubt into \
+``open_questions`` as "Commit or drop: <thing>?". Every capture-emitted \
+task lands in the operator's Captured Tasks review view, so an \
+ambiguous item that turns out to be real costs him one tap — but he \
+only knows to look at it if the doubt is written down. Emitting \
+nothing is not an option: an item you drop in silence is one he never \
+sees again.
+
+The same gate applies to ``decisions``. "It may be better to X" is the \
+user weighing an option, not a choice made out loud — it belongs in \
+``open_questions``, not in ``decisions``.
+
+Four rules that settle most real cases:
+
+1. Specificity that came from ALFRED is not evidence of commitment. \
+When the assistant supplied the crate count, the dimensions, the \
+schedule or the step-by-step plan, and the user supplied only a \
+question and some constraints, that detail belongs to the answer. Judge \
+commitment from what the USER said.
+
+2. Classify each candidate on its own. One sentence can carry an \
+exploration and a commitment at once, and a session that is mostly \
+exploratory can still contain a real commitment.
+
+3. A hedge on TIMING is not a hedge on INTENT. "I think the main \
+hardening we're going to do is going to be done in the next day or \
+two" commits to the work and estimates the date. "It might need some \
+adjustment with a second roost" commits to nothing.
+
+4. If you are writing the same uncertainty into ``open_questions``, it \
+is not an action item — UNLESS the user undertook to RESOLVE that \
+uncertainty. The open question is what is UNKNOWN; the action item is \
+the ACT OF FINDING OUT, and those are two different records. "And \
+those latches should be hard for a raccoon to open. I'm going to work \
+on that… I'm not sure if they'll be able to open it or not…" is \
+legitimately both: the question is whether the latches hold, the task \
+is going and checking. The roost failed this rule because nothing in \
+"It might need some adjustment with a second roost" undertakes \
+anything — no one in that sentence is going to go find out.
+
+Two further things that are not action items:
+- Practice already underway. "I'm still using a live trap for the \
+raccoons every night…" describes a standing habit, not new outstanding \
+work. There is nothing for the user to close.
+- Day-scoped micro-instructions. Mid-activity notes are scoped to the \
+day they were spoken in. "All right, I'm doing workout B today… My \
+goal was four sets today, increase the volume" became the action item \
+"Complete remaining sets of goblet squat (55 lbs, targeting 4 sets, \
+first set was 8 reps)" — a live progress note filed as backlog, stale \
+by morning, and closed ``stale_day_scoped``. The same goes for \
+anything that only makes sense during the activity: logging sets as \
+they happen, pinging the user when the next one starts. Do not emit \
+these as action items — the same way the fulfilment check above drops \
+a promise the user already kept.
+
+Worked examples. The first three were emitted as tasks and the operator \
+cancelled all three:
+
+EXPLORATION — the user opens with "How can I transport 17 chickens in a \
+vehicle about a two-hour drive?", then adds "It's an SUV, a 2020 Ford \
+Explorer. So air conditioning is good and strong. There's plenty of \
+room in the back for crates." The opening is interrogative — "How can \
+I" is exploration language. The follow-up hands the advisor a \
+constraint; it never says he will make the trip. The crates, the A/C \
+and the two-hour drive all came out of the assistant's own answer, so \
+rule 1 strips them as evidence. → ``exploration``; ``open_questions`` \
+gets "How would 17 birds be transported on a ~2-hour drive?". Do NOT \
+emit "Transport 17 new chickens in the 2020 Ford Explorer (crates in \
+the back, use A/C for the ~2-hour drive)" — that action item is the \
+assistant's plan wearing the user's voice.
+
+EXPLORATION — "All right, so what I'm seeing is it may actually be \
+better to move the 12 remaining birds to the front, because that is \
+actually meant to be a chicken tractor…" "What I'm seeing is" plus "it \
+may actually be better to" is a comparison being weighed, not an option \
+chosen. → ``exploration``; it goes to ``open_questions``, and by the \
+``decisions`` rule above it does not belong in ``decisions`` either.
+
+BOTH CLASSES IN ONE SENTENCE — "It might need some adjustment with a \
+second roost, but I think the main hardening we're going to do is going \
+to be done in the next day or two." Rule 2 splits this into two \
+candidates. "It might need" → ``exploration``, so the roost goes to \
+``open_questions`` as "Does the baby barn coop need a second roost?" \
+and NOT to action items. "the main hardening we're going to do is \
+going to be done in the next day or two" → ``commitment``: "I think" \
+hedges the date, not the intent (rule 3). The real failure emitted the \
+roost BOTH as the open question "Does \
+the baby barn coop need a second roost added, and if so, when?" AND as \
+the action item "Assess whether the baby barn coop needs a second roost \
+added" — exactly the duplication rule 4 forbids.
+
+COMMITMENT — "We spoke earlier about the septic tank being pumped \
+yesterday, July 31, 2026. And I asked for a reminder in five years. I \
+need to change that to a three-year reminder to get it pumped again." \
+"I need to change that to a three-year reminder" is first-person \
+present necessity pointed at a specific record and a specific value, \
+with nothing conditional anywhere in it. → ``commitment``; emit it. \
+This is the pole to compare against: when the user has really \
+committed, you do not have to hunt for the evidence.
+
+BOTH AT ONCE, LEGITIMATELY — rule 4's carve-out, the shape that looks \
+like the roost and is not. The user asks "What was louka’s advice on \
+increasing sets reps and weight in the first few weeks?", then says \
+"If that’s what the instructions are then I’ll go with that until my \
+next check in". The uncertainty is real, so ``open_questions`` gets \
+"What exactly is Louka's/Lucas's advice on increasing sets, reps, and \
+weight in the first few weeks?". The undertaking is also real — "I’ll \
+go with that until my next check in" names the point at which he will \
+resolve it — so "Clarify progression guidelines at next check-in" is a \
+genuine action item. Emitting BOTH was correct here; the task closed \
+done. Compare the roost, where the same duplication was wrong because \
+no one undertook to find out.
+
+ALREADY UNDERWAY — "I'm still using a live trap for the raccoons every \
+night to see if we can discourage them…" Present progressive describing \
+a habit already running. Not an action item; the operator cancelled \
+this one as absorbed into ongoing practice.
+
+Where corrections accumulate: when a capture-emitted task turns out to \
+be a phantom, the operator closes it and marks the task record with a \
+``closure_class`` — ``exploration`` for a thing never committed to, \
+``absorbed`` for standing practice, ``stale_day_scoped`` for an \
+instruction that outlived its day. EVERY ``closure_class`` on a \
+``created_by_capture`` task is corpus for this section, whatever its \
+value; the three above are only the classes that exist today. Each of \
+them taught something here — the exploration examples came from the \
+first, the live-trap bullet from the second, the workout bullet from \
+the third. Whoever edits this prompt next should read the ones added \
+since the last edit, including any class not named here, and append \
+each new failure shape as a worked example.
+
 Entity discrimination — default to NEW, not SAME. When this transcript \
 references a known entity (person, building, org, project, location), \
 treat it as a NEW reference unless the transcript explicitly \
