@@ -1,6 +1,32 @@
 import { FencedText } from '../markdown/FencedText';
 import { subtle } from '../../lib/typography';
 
+/**
+ * Strip a leading YAML frontmatter block from a spooled artifact.
+ *
+ * The daemons spool their markdown with the record's frontmatter still attached,
+ * and this view renders markdown as ESCAPED TEXT — so the operator was reading
+ * `type: run`, `status: completed` and friends as the first lines of his brief.
+ * Machine metadata rendered as prose.
+ *
+ * Deliberately narrow: only a block that OPENS ON THE FIRST LINE is removed, and
+ * only up to its matching close. A `---` used mid-document as a horizontal rule
+ * is untouched, and an unterminated opening fence returns the text UNCHANGED
+ * rather than swallowing the document — the failure direction is showing too
+ * much, never eating the brief.
+ */
+export function stripFrontmatter(markdown: string): string {
+  const lines = markdown.split('\n');
+  if (lines.length === 0 || lines[0].trim() !== '---') return markdown;
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === '---') {
+      return lines.slice(i + 1).join('\n').replace(/^\n+/, '');
+    }
+  }
+  // No closing delimiter: not frontmatter, or a truncated artifact. Show it all.
+  return markdown;
+}
+
 type BriefViewProps = {
   /** Section heading ("Morning Brief" / "Daily Sync"). */
   title: string;
@@ -44,7 +70,7 @@ export function BriefView({ title, date, markdown, emptyMessage, testId }: Brief
               pre-wrap treatment it had. Still escaped text children only. */}
           <FencedText
             data-testid={`${testId}-content`}
-            text={markdown}
+            text={stripFrontmatter(markdown)}
             nameHint={testId}
             className="whitespace-pre-wrap break-words text-sm leading-relaxed text-neutral-800"
           />

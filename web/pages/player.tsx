@@ -3,6 +3,7 @@ import Head from 'next/head';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
+import { VIEWSCREEN_SURFACE } from '../lib/algernon/viewscreenSurface';
 import { BriefView } from '../components/brief/BriefView';
 import { authApi } from '../lib/algernon/authClient';
 import { fetchAudio, fetchNarration, type NarrationResult, type PlayerAudioState } from '../lib/algernon/briefPlayer';
@@ -224,10 +225,22 @@ export default function PlayerPage() {
     if (idx !== position.slideIndex) player.seekToSlide(idx);
   }, [player, slides, position.slideIndex]);
 
-  // A manual slide jump also seeks the audio to that slide's start (word_count share).
+  // A manual slide jump seeks the audio to that slide's start (word_count
+  // share) — but ONLY WHILE NARRATION IS PLAYING.
+  //
+  // Visual-follows-narration is the rule for a briefing being NARRATED; it is
+  // not a rule about the slides as a document. Once playback has finished or
+  // been paused, the operator is reviewing, and the arrows are a reader's
+  // controls: they must move the slide and touch the audio element not at all.
+  // Writing `currentTime` on a paused or ended element is not inert on every
+  // browser, which is how a silent review turned into unexpected audio.
+  //
+  // The state machine stays the source of truth either way — `seekToSlide`
+  // moves the slide in both branches; only the audio side is conditional.
   const goToSlide = useCallback(
     (idx: number) => {
       player.seekToSlide(idx);
+      if (state !== 'playing') return;
       const el = audioRef.current;
       if (el && hasAudio && el.duration) {
         const total = slides.reduce((n, s) => n + Math.max(0, s.wordCount), 0);
@@ -236,7 +249,7 @@ export default function PlayerPage() {
         el.currentTime = total > 0 ? (acc / total) * el.duration : 0;
       }
     },
-    [player, slides, hasAudio],
+    [player, slides, hasAudio, state],
   );
 
   const handleSignOut = useCallback(async () => {
@@ -254,7 +267,7 @@ export default function PlayerPage() {
         <Head>
           <title>Briefing · {INSTANCE_NAME}</title>
         </Head>
-        <Layout showNav={false}>
+        <Layout showNav={false} surface={VIEWSCREEN_SURFACE}>
           <p data-testid="auth-gate" className={subtle}>
             Loading…
           </p>
@@ -271,7 +284,7 @@ export default function PlayerPage() {
       <Head>
         <title>Briefing · {INSTANCE_NAME}</title>
       </Head>
-      <Layout onSignOut={() => void handleSignOut()}>
+      <Layout onSignOut={() => void handleSignOut()} surface={VIEWSCREEN_SURFACE}>
         <h1 className={display}>Your briefing</h1>
 
         {error && (
