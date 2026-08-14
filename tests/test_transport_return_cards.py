@@ -857,6 +857,96 @@ class TestContainment:
             "the evidence type guard should have handled this, not the belt"
         )
 
+    async def test_a_non_string_id_does_not_wedge_the_sweep(
+        self, vault, handle, store,
+    ) -> None:
+        """The SIBLING of the malformed-evidence hazard, found by sweeping for
+        it rather than by hitting it.
+
+        The fold does not coerce types, so a card can carry a non-string id.
+        Comparing one against a string id raises TypeError inside ``sorted`` —
+        BEFORE the per-card belt, which is why this sweep's sort key is rendered
+        rather than raw. Asserted through ``_tick`` because what is actually at
+        stake is the leg below it: the pending-queue drain.
+
+        WHAT THIS TEST ALSO RECORDS, because it is the honest answer rather than
+        the one I set out to write: the same mixed-type comparison reappears
+        DOWNSTREAM, in ``FeedStore.reconcile``'s own ``sorted(absent)`` when two
+        or more items of the kind are absent. That is shared store code with
+        every producer behind it, so this lane does not touch it. The belt
+        (``try_feed_reconcile``) catches it, says so as ``feed.reconcile_failed``,
+        and the tick continues — retirement for this kind is BLOCKED until the
+        malformed line leaves the store, loudly rather than silently. Asserted
+        here so the degradation is documented where someone will find it; if the
+        shared sort is ever made total, this expectation flips deliberately.
+        """
+        good = FeedItem.create(
+            kind=KIND_REMINDER_RETURNED,
+            stable_key=return_card_stable_key("task/Gone.md", FIXED_REMIND_AT),
+            instance="Salem", title="Real card",
+            evidence={"record_path": "task/Gone.md", "remind_at": FIXED_REMIND_AT},
+        )
+        store.upsert(good)
+        with open(store.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ev": "upsert", "ts": _now().isoformat(),
+                "item": {
+                    "id": 12345,  # not a string — sorts against `good.id`
+                    "kind": KIND_REMINDER_RETURNED,
+                    "title": "Numeric id",
+                    "state": STATE_OPEN,
+                    "evidence": {"record_path": "task/Gone.md"},
+                },
+            }) + "\n")
+
+        config, state, sent, send = _env(vault)
+        state.pending_queue.append({
+            "id": "pending-1", "user_id": 42, "text": "parked message",
+            "dedupe_key": "pending-1",
+            "scheduled_at": (_now() - timedelta(minutes=1)).isoformat(),
+        })
+
+        with structlog.testing.capture_logs() as captured:
+            await _tick(config, state, send, vault, 42, feed_handle=handle)
+
+        assert sent == ["parked message"], "the pending drain ran"
+        assert not _events(captured, "transport.scheduler.tick_error")
+        # THIS sweep's sort survived — with a raw-id key the TypeError would be
+        # caught by the outer belt instead, aborting every per-card verdict.
+        assert not _events(captured, "transport.scheduler.return_card_sweep_failed")
+        # Positive control that the sweep really ran and reached a verdict on
+        # BOTH cards (neither record exists), rather than returning early.
+        retired = _events(captured, "transport.scheduler.return_cards_retired")
+        assert len(retired) == 1
+        assert {r["reason"] for r in retired[0]["retired"]} == {RETIRE_RECORD_GONE}
+        assert len(retired[0]["retired"]) == 2
+        # …and the documented degradation: the shared reconcile's own sort over
+        # the absent set hits the same mixed-type comparison, so the WRITE is
+        # refused by the belt and the cards stay open. Loud, not silent.
+        assert _events(captured, "feed.reconcile_failed")
+        assert store.load()[good.id].state == STATE_OPEN
+
+    def test_the_outer_belt_keeps_a_sweep_fault_off_the_rest_of_the_tick(
+        self, vault, handle, store, monkeypatch,
+    ) -> None:
+        """The layer of last resort: whatever the sweep body raises, the tick
+        continues. Distinct from the per-card belt — this covers the code
+        OUTSIDE the loop, where a raise would otherwise reach ``_tick``."""
+        from alfred.transport import returns_feed
+
+        def _boom(*a: Any, **kw: Any) -> None:
+            raise RuntimeError("sweep body exploded")
+
+        monkeypatch.setattr(returns_feed, "_sweep_locked", _boom)
+
+        with structlog.testing.capture_logs() as captured:
+            result = sweep_return_cards(handle, vault, _now())
+
+        assert result is None
+        failures = _events(captured, "transport.scheduler.return_card_sweep_failed")
+        assert len(failures) == 1
+        assert failures[0]["error_type"] == "RuntimeError"
+
     def test_an_unexpected_verdict_fault_holds_the_card(
         self, vault, handle, store, monkeypatch,
     ) -> None:

@@ -395,16 +395,40 @@ def sweep_return_cards(
     """
     if handle is None or not handle.enabled:
         return None
-    store = FeedStore(handle.store_path)
     try:
-        stored_items = store.load()
-    except Exception as exc:  # noqa: BLE001 — a read fault must not wedge the tick
+        return _sweep_locked(handle, vault_path, now)
+    except Exception as exc:  # noqa: BLE001 — the feed can never break its host
+        # THE OUTER BELT, and it is deliberately blanket. This function is the
+        # feed's entry point INTO the scheduler tick, exactly as
+        # ``try_feed_reconcile`` is its entry point into sync and brief, and the
+        # rule there is the rule here: "a feed store bug must degrade to no feed
+        # update this fire, not a broken brief or a stalled daemon". Anything
+        # escaping this call would skip the pending-queue drain below it in
+        # ``_tick`` — an unrelated leg, taken down by the feed.
+        #
+        # It does NOT replace the two guards inside. The type guard handles the
+        # ONE malformed shape we can name, cleanly and without noise; the
+        # per-card belt keeps one bad card from costing the others their sweep;
+        # this catches the shape nobody has thought of yet. Three layers, three
+        # different jobs — a blanket catch alone would turn every future bug
+        # into a silent hold.
         log.warning(
             "transport.scheduler.return_card_sweep_failed",
             error=str(exc),
             error_type=type(exc).__name__,
+            detail="no card retirement this tick — the rest of the tick is unaffected",
         )
         return None
+
+
+def _sweep_locked(
+    handle: FeedEmitHandle,
+    vault_path: Path,
+    now: datetime,
+) -> dict[str, int] | None:
+    """The sweep body. See :func:`sweep_return_cards` for the contract."""
+    store = FeedStore(handle.store_path)
+    stored_items = store.load()
 
     live = [
         item for item in stored_items.values()
@@ -416,7 +440,12 @@ def sweep_return_cards(
 
     retired: list[tuple[str, str]] = []
     open_items: list[FeedItem] = []
-    for stored in sorted(live, key=lambda i: i.id):
+    # ``str(i.id)`` rather than ``i.id``: the fold does not coerce types either
+    # (the same forward-compat property that let a string arrive as evidence), so
+    # one card carrying a non-string id would make this sort raise TypeError on
+    # the COMPARISON — outside the per-card belt, taking the whole sweep with it.
+    # Sorting the rendered key is total over every id shape.
+    for stored in sorted(live, key=lambda i: str(i.id)):
         try:
             verdict = _refresh_or_retire(
                 stored, vault_path, now, instance=handle.instance, retired=retired,
