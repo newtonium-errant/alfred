@@ -5,9 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // `ensurePushPoller`'s guard was `if (pollerTimer != null) return` over a
 // MODULE-LEVEL `let`. That is idempotent within one module instance, and the
 // server does not have one. `next build` emits the poller into TWO server
-// chunks — `.next/server/chunks/4477.js` and `1867.js`, one `setInterval` and
-// one "poller started" log each — because `instrumentation.ts` and the
-// pages-router API routes are separate compilations. Boot-arming touches one
+// chunks, one `setInterval` and one "poller started" log each, because
+// `instrumentation.ts` and the pages-router API routes are separate
+// compilations. The chunk filenames are build coordinates rather than names and
+// change between builds of the same tree — count the chunks carrying the start
+// log; do not go looking for a numbered file. Boot-arming touches one
 // copy, the first route hit touches the other, each reads its own `null`, and
 // both arm. Every due item then rings TWICE, forever, with two "poller started"
 // lines in the journal as the only tell.

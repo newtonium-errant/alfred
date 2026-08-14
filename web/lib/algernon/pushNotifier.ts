@@ -120,11 +120,18 @@ export async function runPollOnce(deps: PollDeps): Promise<PollResult> {
   }
 
   const items = await deps.fetchNeedsYouItems();
-  // #27 slice 3 — push-eligibility gate. Ring ONLY for items the operator's
-  // policy permits (default: email_urgent + high_source==="override"). Widening
-  // is a PUSH_POLICY env flip, not a code change (see pushPolicy.ts). Applied
-  // HERE (not inside fetchNeedsYouItems) so the gate is exercised regardless of
-  // the injected fetch dep.
+  // Push-eligibility gate. The DEFAULT is `needs_you` — every needs-you item
+  // rings (operator ruling); NARROWING is the `PUSH_POLICY` env flip, not a code
+  // change (see pushPolicy.ts). Applied HERE, not inside fetchNeedsYouItems, so
+  // the gate is exercised regardless of the injected fetch dep.
+  //
+  // This comment said the opposite until the gate caught it, and the reason is
+  // worth more than the correction: the default was swept where it is DEFINED
+  // and not where it is CONSUMED. A semantic inversion leaves every NAME
+  // untouched — "default" and "widening" were both still literally the right
+  // words — so a rename-grep cannot see it. Whoever debugs a doorbell reads
+  // THIS line before pushPolicy.ts, which is what made a stale comment three
+  // lines above the call the expensive place for it to sit.
   const policy = readPushPolicy();
   const eligible = items.filter((it) => isPushEligible(it, policy));
   const seen = await deps.readSeenIds();
@@ -243,11 +250,13 @@ const realTrialDeps: TrialDeps = {
 //
 // This was a module-level `let`, and `ensurePushPoller`'s `if (pollerTimer !=
 // null) return` is idempotent only WITHIN one module instance. It is not one
-// instance. `next build` emits this module into TWO server chunks — verified
-// from the artifact rather than reasoned: `.next/server/chunks/4477.js` and
-// `.next/server/chunks/1867.js`, each carrying its own `setInterval` and its own
-// "poller started" log — because `instrumentation.ts` and the pages-router API
-// routes are separate compilations. Boot-arming touches one copy, the first
+// instance. `next build` emits this module into TWO server chunks, each carrying
+// its own `setInterval` and its own "poller started" log, because
+// `instrumentation.ts` and the pages-router API routes are separate
+// compilations. THAT is the invariant; the chunk FILENAMES are build
+// coordinates, not names — they differ run to run (4477/1867 and 4294/4676 were
+// two builds of the identical tree), so reproduce the claim by counting chunks
+// that contain the start log, never by looking for a numbered file. Boot-arming touches one copy, the first
 // route hit touches the other, each sees its own `null`, and BOTH arm. Every due
 // item then rings twice on every poll.
 //

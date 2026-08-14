@@ -25,10 +25,12 @@ import type { FeedItem } from './feed';
 // THE WIDENING BURST IS NOW A DEPLOY EVENT, not a config event. Every needs-you
 // item that is already open and was suppressed under the old default becomes
 // eligible at once, so the first poll after this ships rings for all of them.
-// That is correct rather than a bug, and it is bounded by the current open
-// needs-you count — but it lands unannounced on a restart instead of when
-// somebody types a flag, which is the difference worth knowing before deploying
-// into a full queue.
+// That is correct rather than a bug, but the bound is open needs-you count
+// MULTIPLIED BY the subscription count — one push per item per subscription —
+// which this comment first stated as the item count alone and thereby halved at
+// today's subs=2. The number matters precisely because it is what someone reads
+// before deciding whether to deploy into a full queue, and it lands unannounced
+// on a restart rather than when somebody types a flag.
 
 export type PushPolicy = 'email_urgent_override' | 'email_urgent_all' | 'needs_you';
 
