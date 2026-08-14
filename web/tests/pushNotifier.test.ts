@@ -144,8 +144,10 @@ describe('runPollOnce', () => {
     item(id, { kind: 'email_urgent', evidence: { high_source: 'llm' } });
   const tierMedium = (id: string) => item(id, { kind: 'email_tier' }); // needs-you, non-urgent
 
-  it('default policy rings ONLY for the override-high email_urgent (not llm-high, not email_tier)', async () => {
-    // No PUSH_POLICY set → email_urgent_override (operator ruling C).
+  it('default policy rings for EVERY needs-you item — the operator ruling', async () => {
+    // No PUSH_POLICY set → needs_you. Reversed from #27 slice 3's strictest
+    // default: the needs-you set already IS the "this needs a person" set, so
+    // gating inside it suppressed exactly what the operator asked to hear about.
     const sendPush = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
       readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
@@ -157,12 +159,17 @@ describe('runPollOnce', () => {
       sendPush,
     });
     const r = await runPollOnce(deps);
-    expect(r.sent).toBe(1);
+    expect(r.sent).toBe(3);
     const pushedTitles = sendPush.mock.calls.map((c) => JSON.parse(c[1] as string).title);
-    expect(pushedTitles).toEqual(['Item u-ovr']);
+    expect(pushedTitles).toEqual(['Item u-ovr', 'Item u-llm', 'Item t-med']);
   });
 
-  it('does NOT ring at all when the only fresh items are ineligible under the default policy', async () => {
+  it('STILL suppresses everything under an explicitly NARROWED policy', async () => {
+    // The counterpart the default flip must not delete: narrowing is now the
+    // config flip, and it has to still work, or "needs_you by default" would
+    // really mean "needs_you, always". Same fixture as the default case above,
+    // opposite expectation, one env var apart.
+    process.env.PUSH_POLICY = 'email_urgent_override';
     const sendPush = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
       readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
@@ -193,8 +200,13 @@ describe('runPollOnce', () => {
   });
 
   it('only the ELIGIBLE open ids are pinned in the persisted seen-set', async () => {
-    // Default policy: the override-urgent is pushed+seen; the ineligible items are
-    // never added to seen (never pushed). Pins that boundSeen gets eligible ids.
+    // Driven under an explicitly NARROWED policy now that the default is
+    // needs_you. The property is unchanged and still worth pinning — an
+    // ineligible item is never pushed and so must never enter the seen-set, or
+    // it would be suppressed forever if the policy later widened. Under the new
+    // default every needs-you item is eligible, so the default can no longer
+    // EXPRESS this distinction: the pin needs a policy that filters something.
+    process.env.PUSH_POLICY = 'email_urgent_override';
     const writeSeenIds = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
       readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),

@@ -238,7 +238,37 @@ const realTrialDeps: TrialDeps = {
   config: readTrialConfig,
 };
 
-let pollerTimer: ReturnType<typeof setInterval> | null = null;
+// THE SINGLETON HAS TO OUTLIVE THE MODULE INSTANCE, because there is more than
+// one of those.
+//
+// This was a module-level `let`, and `ensurePushPoller`'s `if (pollerTimer !=
+// null) return` is idempotent only WITHIN one module instance. It is not one
+// instance. `next build` emits this module into TWO server chunks — verified
+// from the artifact rather than reasoned: `.next/server/chunks/4477.js` and
+// `.next/server/chunks/1867.js`, each carrying its own `setInterval` and its own
+// "poller started" log — because `instrumentation.ts` and the pages-router API
+// routes are separate compilations. Boot-arming touches one copy, the first
+// route hit touches the other, each sees its own `null`, and BOTH arm. Every due
+// item then rings twice on every poll.
+//
+// No unit test can see this: vitest loads exactly one module instance, which is
+// precisely the world the old guard was written for and the only world in which
+// it was sufficient. The two arming paths were called "both idempotent" — true
+// of each path, false of the pair.
+//
+// `globalThis` is per-PROCESS and is the one scope the copies share, so the
+// timer handle lives there. The accessors exist so no call site can reach past
+// them and re-introduce a local.
+const POLLER_GLOBAL_KEY = '__algernonPushPollerTimer__';
+type PollerHost = Record<string, ReturnType<typeof setInterval> | null | undefined>;
+
+function pollerTimerGet(): ReturnType<typeof setInterval> | null {
+  return (globalThis as unknown as PollerHost)[POLLER_GLOBAL_KEY] ?? null;
+}
+
+function pollerTimerSet(t: ReturnType<typeof setInterval> | null): void {
+  (globalThis as unknown as PollerHost)[POLLER_GLOBAL_KEY] = t;
+}
 
 /**
  * Start the background poller IF push is enabled and it isn't already running.
@@ -248,9 +278,9 @@ let pollerTimer: ReturnType<typeof setInterval> | null = null;
  * down.
  */
 export function ensurePushPoller(): void {
-  if (pollerTimer != null) return;
+  if (pollerTimerGet() != null) return;
   if (!isPushEnabled()) return;
-  pollerTimer = setInterval(() => {
+  const timer = setInterval(() => {
     void runPollOnce(realDeps).catch((e) => {
       console.warn(`[push:poll] iteration_failed err=${errName(e)}`);
     });
@@ -263,7 +293,8 @@ export function ensurePushPoller(): void {
       console.warn(`[push:trial] iteration_failed err=${errName(e)}`);
     });
   }, POLL_INTERVAL_MS);
-  if (typeof pollerTimer.unref === 'function') pollerTimer.unref();
+  pollerTimerSet(timer);
+  if (typeof timer.unref === 'function') timer.unref();
   console.log(`[push:poll] poller started interval_ms=${POLL_INTERVAL_MS}`);
 }
 
@@ -291,7 +322,7 @@ export async function armPushPollerAtBoot(): Promise<void> {
       console.log('[push:boot] instrument inert reason=push_disabled_or_unconfigured');
       return;
     }
-    const already = pollerTimer != null;
+    const already = pollerTimerGet() != null;
     ensurePushPoller();
     let subs = -1;
     try {
@@ -312,13 +343,14 @@ export async function armPushPollerAtBoot(): Promise<void> {
 
 /** Test seam: whether the singleton interval is currently constructed. */
 export function __isPushPollerRunningForTest(): boolean {
-  return pollerTimer != null;
+  return pollerTimerGet() != null;
 }
 
 /** Test seam: stop + reset the singleton between cases. */
 export function __stopPushPollerForTest(): void {
-  if (pollerTimer != null) {
-    clearInterval(pollerTimer);
-    pollerTimer = null;
+  const t = pollerTimerGet();
+  if (t != null) {
+    clearInterval(t);
+    pollerTimerSet(null);
   }
 }
