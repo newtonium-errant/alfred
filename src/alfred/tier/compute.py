@@ -1365,6 +1365,100 @@ def compute_self_care_task_candidates(
     return candidates
 
 
+def compute_returned_task_candidates(
+    vault_path: Path,
+    now: datetime,
+) -> list[AutoT1Candidate]:
+    """Tasks whose reminder has returned and has not been acted on.
+
+    This is the READ half of the snooze-return contract. The transport
+    scheduler fires a reminder and writes the ruled ``slot:`` onto the
+    record; without this function nothing ever looks, and the return is
+    invisible on every surface. Measured before it existed: no module
+    outside ``transport/`` read ``remind_at``/``reminded_at`` at all,
+    and an undated task could not become a candidate by any other path
+    (``compute_auto_t1_candidates`` requires a due date;
+    ``compute_self_care_task_candidates`` requires ``self_care``). Four
+    of the six live carriers have no due date, so their returns had
+    nowhere to land.
+
+    **Predicate (ratified, deliberately minimal):** ``status: todo``
+    AND ``reminded_at`` set AND ``remind_at`` absent.
+
+    The state it describes is "came back, still open, not re-armed".
+    Every exit from that state runs through a verb that already exists,
+    which is why this needs no new dismissal store:
+
+      * completing it changes ``status`` — falls out of the predicate;
+      * re-snoozing sets ``remind_at`` — falls out, and the scheduler's
+        re-snooze signal fires on the next return;
+      * a board-side snooze suppresses at the surface layer, above this.
+
+    Nothing here prejudges the rotation lane's ack model; when that
+    lane ships shelve/ack it inherits and refines this predicate.
+
+    Slot and escalation come from the shared
+    :func:`alfred.tier.slots.resolve_effective_slot`, so a boundary that
+    passes AFTER the fire still escalates — the septic case, which fires
+    2029-06-01 as rhythm and escalates three months later while sitting
+    in returned-state.
+
+    Pure, per this module's contract: no logging here, the call site
+    reports the count.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+    from alfred.routine.config import _coerce_self_care
+
+    task_dir = vault_path / "task"
+    if not task_dir.is_dir():
+        return []
+
+    today_local = now.date()
+    candidates: list[AutoT1Candidate] = []
+    for path in sorted(task_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "task":
+            continue
+        if str(fm.get("status") or "todo").lower() != "todo":
+            continue
+        if not str(fm.get("reminded_at") or "").strip():
+            continue
+        # Re-armed — it is a pending reminder again, not a return.
+        if str(fm.get("remind_at") or "").strip():
+            continue
+
+        waiting_on = str(fm.get("waiting_on") or "").strip()
+        slot, _rule = slots.resolve_effective_slot(
+            return_slot=fm.get("return_slot"),
+            escalate_on=fm.get("escalate_on"),
+            escalate_to=fm.get("escalate_to"),
+            today=today_local,
+        )
+        candidates.append(AutoT1Candidate(
+            path=f"task/{path.name}",
+            name=str(fm.get("name") or path.stem),
+            due_iso=str(fm.get("due") or ""),
+            # A waiting item is not a snooze that came back — it is
+            # blocked on somebody. The framing says what the next
+            # physical action is.
+            surface_reason=(
+                f"chase {waiting_on}" if waiting_on else "returned"
+            ),
+            origin="task",
+            self_care=_coerce_self_care(fm.get("self_care", False)),
+            # Feeds rule 1 of the slot classifier — the operator's own
+            # word, highest precedence.
+            explicit_slot=slot,
+        ))
+
+    candidates.sort(key=lambda c: c.name.lower())
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # compute_today_view — the unified "today" view (Step 2b, 2026-06-26)
 # ---------------------------------------------------------------------------
@@ -1672,6 +1766,11 @@ def compute_today_view(
     # and task origins.
     self_care_routine = compute_self_care_candidates(vault_path, now)
     self_care_task = compute_self_care_task_candidates(vault_path, now)
+    # Phase 2c+h: snooze returns and waiting-chases whose reminder has
+    # fired and not been acted on. Without this THREADING the reader
+    # exists but nothing calls it, which is the same write-live/read-
+    # dead failure the reader was built to fix — one layer up.
+    returned_task = compute_returned_task_candidates(vault_path, now)
 
     # --- operator curation ----------------------------------------
     curation = load_daily_curation(vault_path, today)
@@ -1764,6 +1863,29 @@ def compute_today_view(
             tier=1, origin="task", name=c.name, path=c.path,
             due_iso=c.due_iso, surface_reason=c.surface_reason,
             source=source, confirmed=False,
+            self_care=c.self_care, explicit_slot=c.explicit_slot,
+            has_due_pattern=c.has_due_pattern,
+        ))
+        t1_keys.add(key)
+
+    # 2b. Returned snoozes and waiting-chases (Phase 2c+h).
+    #
+    # T1 because the operator picked the date: a snooze returning today
+    # is pressing today by his own choice, which is exactly what T1
+    # means. The SLOT it lands in is separate and comes from his ruling
+    # via ``explicit_slot`` — tier and slot are orthogonal axes.
+    #
+    # Runs after the auto-due block and dedups against it, so a returned
+    # task that ALSO has a due date today surfaces once, keeping the
+    # deadline framing rather than being doubled.
+    for c in returned_task:
+        key = _task_key(c.name)
+        if key in t1_keys:
+            continue
+        t1.append(TierEntry(
+            tier=1, origin="task", name=c.name, path=c.path,
+            due_iso=c.due_iso, surface_reason=c.surface_reason,
+            source="auto-returned", confirmed=False,
             self_care=c.self_care, explicit_slot=c.explicit_slot,
             has_due_pattern=c.has_due_pattern,
         ))
@@ -2293,6 +2415,7 @@ __all__ = [
     "compute_auto_t3_candidates",
     "compute_self_care_candidates",
     "compute_self_care_task_candidates",
+    "compute_returned_task_candidates",
     "compute_today_view",
     "entry_is_done",
 ]

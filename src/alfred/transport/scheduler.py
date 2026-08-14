@@ -448,28 +448,17 @@ def resolve_return_slot(
     into Duty), so an unparseable date must not be able to trigger it;
     failing back to the calmer answer is the safe direction.
     """
-    from alfred.tier.slots import normalize_slot
+    from alfred.tier.slots import resolve_effective_slot
 
-    raw = entry.return_slot
-    rule = "return_slot"
-
-    escalate_on = _parse_iso(entry.escalate_on)
-    if (
-        escalate_on is not None
-        and now >= escalate_on
-        and _nonempty(entry.escalate_to)
-    ):
-        raw = entry.escalate_to
-        rule = "escalated"
-
-    if not _nonempty(raw):
-        return None, "none"
-
-    # normalize_slot logs its own warning on an unrecognised value.
-    canonical = normalize_slot(raw)
-    if canonical is None:
-        return None, "unrecognized"
-    return canonical, rule
+    # Delegates to the ONE spelling of the escalation rule, shared with
+    # the returned-task reader in ``tier.compute``. See that function's
+    # docstring for why fire-time and read-time both need it.
+    return resolve_effective_slot(
+        return_slot=entry.return_slot,
+        escalate_on=entry.escalate_on,
+        escalate_to=entry.escalate_to,
+        today=now.date(),
+    )
 
 
 def clear_remind_at_and_stamp(entry: DueReminder, now: datetime) -> None:

@@ -188,6 +188,82 @@ def normalize_slot(raw: Any) -> str | None:
     return None
 
 
+def _as_date_like(raw: Any) -> Any | None:
+    """Best-effort coercion of an ``escalate_on`` value to something
+    comparable with a date. Returns ``None`` when it cannot be read.
+
+    PyYAML gives back ``date``/``datetime`` for unquoted ISO dates and
+    ``str`` when quoted, so both arrive in practice.
+    """
+    from datetime import date as _date, datetime as _dt
+
+    if isinstance(raw, _dt):
+        return raw.date()
+    if isinstance(raw, _date):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()[:10]
+        try:
+            return _date.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_effective_slot(
+    *,
+    return_slot: Any,
+    escalate_on: Any,
+    escalate_to: Any,
+    today: Any,
+) -> tuple[str | None, str]:
+    """Resolve which slot a returning task belongs in, with escalation.
+
+    Returns ``(canonical_slot_or_None, rule)`` where rule is one of
+    ``return_slot`` / ``escalated`` / ``none`` / ``unrecognized``.
+
+    **This is the single spelling of the escalation rule, deliberately.**
+    It has two consumers that fire at different moments and neither one
+    alone is sufficient:
+
+      * the transport scheduler, at FIRE time — covers a reminder that
+        fires after the escalation boundary has already passed;
+      * the returned-task reader, at READ time — covers a boundary that
+        passes while the task is sitting in returned-state, which is the
+        septic case exactly (fires 2029-06-01 as rhythm, escalates
+        2029-09-01, three months later).
+
+    Two copies of this rule would drift, and the drift would be
+    invisible: both consumers would look correct in isolation and
+    disagree only for records sitting across a boundary.
+
+    Escalation is generic — any record carrying both fields. A
+    ``escalate_on`` that cannot be read does NOT escalate: escalation
+    moves work into Duty, so an unparseable date must fail toward the
+    calmer answer rather than the sharper one.
+    """
+    raw = return_slot
+    rule = "return_slot"
+
+    boundary = _as_date_like(escalate_on)
+    escalate_to_value = (
+        escalate_to.strip()
+        if isinstance(escalate_to, str) and escalate_to.strip()
+        else None
+    )
+    if boundary is not None and escalate_to_value and today >= boundary:
+        raw = escalate_to_value
+        rule = "escalated"
+
+    if not (isinstance(raw, str) and raw.strip()):
+        return None, "none"
+
+    canonical = normalize_slot(raw)
+    if canonical is None:
+        return None, "unrecognized"
+    return canonical, rule
+
+
 class SlotOverrides(Protocol):
     """The learned-override lookup (rule 2). Slice 2 supplies the real store.
 
