@@ -192,7 +192,7 @@ export default function HomePage() {
     <Link
       href="/deck"
       data-testid="composer-deck-pill"
-      className="mt-3 flex items-center justify-between rounded-xl border border-honeydew-300 bg-honeydew-50 px-4 py-3 text-sm font-semibold text-honeydew-700"
+      className="mt-3 flex items-center justify-between rounded-xl border border-console-edge bg-console-raise px-4 py-3 text-sm font-semibold text-console-ink"
     >
       <span>
         {deckableCount} decision{deckableCount > 1 ? 's' : ''} waiting
@@ -240,7 +240,7 @@ export default function HomePage() {
             <Link
               href="/player"
               data-testid="composer-brief-card"
-              className="block rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft"
+              className="block rounded-xl border border-console-edge bg-console-panel p-4 shadow-soft"
             >
               {/* #51 — date-gated copy. `null` (lookup in flight) renders the
                   neutral "no brief yet" wording, so the fresh claim is only ever
@@ -257,7 +257,7 @@ export default function HomePage() {
             <Link
               href="/player"
               data-testid="composer-player-link"
-              className="mt-3 flex items-center justify-between rounded-xl border border-honeydew-300 bg-honeydew-50 px-4 py-3 text-sm font-semibold text-honeydew-700"
+              className="mt-3 flex items-center justify-between rounded-xl border border-console-edge bg-console-raise px-4 py-3 text-sm font-semibold text-console-ink"
             >
               <span>Play your briefing</span>
               <span aria-hidden>▶</span>
@@ -344,7 +344,7 @@ export default function HomePage() {
         <PushToggle />
 
         {board.toast && (
-          <div data-testid="composer-toast" role="status" className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3 rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card">
+          <div data-testid="composer-toast" role="status" className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3 rounded-xl bg-console-raise px-3.5 py-2.5 text-sm text-console-ink shadow-card">
             <span>{board.toast.message}</span>
             <button type="button" onClick={board.dismissToast} className="font-bold uppercase tracking-wider underline">
               Dismiss
