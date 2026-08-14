@@ -27,9 +27,16 @@ from alfred.transport.config import (
     TransportConfig,
 )
 from alfred.transport.scheduler import (
+    RETURN_KIND_PLAIN,
+    RETURN_KIND_SNOOZE,
+    RETURN_KIND_WAITING,
+    DueReminder,
+    classify_return,
     clear_remind_at_and_stamp,
     find_due_reminders,
     format_reminder,
+    render_return_line,
+    resolve_return_slot,
     _tick,
 )
 from alfred.transport.state import TransportState
@@ -110,7 +117,7 @@ def test_find_due_reminders_returns_past_due(tmp_task_vault: Path) -> None:
         remind_at=WITHIN_GRACE_REMIND_AT,
     )
 
-    due, stale, refused = find_due_reminders(
+    due, stale, refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert len(due) == 1
@@ -127,7 +134,7 @@ def test_find_due_reminders_skips_future(tmp_task_vault: Path) -> None:
         remind_at="2099-04-20T18:00:00+00:00",
     )
 
-    due, stale, refused = find_due_reminders(
+    due, stale, refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert due == []
@@ -145,7 +152,7 @@ def test_find_due_reminders_skips_already_reminded(tmp_task_vault: Path) -> None
         reminded_at=NOW.isoformat(),
     )
 
-    due, _stale, _refused = find_due_reminders(
+    due, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert due == []
@@ -162,7 +169,7 @@ def test_find_due_reminders_re_arms_when_remind_at_moves_forward(
         reminded_at=WITHIN_GRACE_REMINDED_AT_OLDER,  # older — re-arm fires
     )
 
-    due, _stale, _refused = find_due_reminders(
+    due, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert len(due) == 1
@@ -180,7 +187,7 @@ def test_find_due_reminders_skips_wrong_status(tmp_task_vault: Path) -> None:
         remind_at=WITHIN_GRACE_REMIND_AT,
     )
 
-    due, stale, refused = find_due_reminders(
+    due, stale, refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert due == []
@@ -210,7 +217,7 @@ def test_find_due_reminders_splits_stale_from_live(tmp_task_vault: Path) -> None
         remind_at="2026-04-17T00:00:00+00:00",  # days past — outside grace
     )
 
-    due, stale, refused = find_due_reminders(
+    due, stale, refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert [e.title for e in due] == ["Within grace"]
@@ -225,7 +232,7 @@ def test_find_due_reminders_splits_stale_from_live(tmp_task_vault: Path) -> None
 
 def test_find_due_reminders_no_task_dir(tmp_path: Path) -> None:
     """Missing task/ directory returns empty — don't raise."""
-    due, stale, refused = find_due_reminders(
+    due, stale, refused, _skipped = find_due_reminders(
         tmp_path, NOW, stale_max_minutes=180,
     )
     assert due == []
@@ -247,7 +254,7 @@ def test_refused_past_time_at_grace_boundary_just_past(
         task_dir, "Slightly past grace",
         remind_at=(NOW - timedelta(seconds=90)).isoformat(),
     )
-    due, _stale, refused = find_due_reminders(
+    due, _stale, refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert due == []
@@ -264,7 +271,7 @@ def test_refused_past_time_at_grace_boundary_just_within(
         task_dir, "Within grace",
         remind_at=(NOW - timedelta(seconds=30)).isoformat(),
     )
-    due, _stale, refused = find_due_reminders(
+    due, _stale, refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert len(due) == 1
@@ -287,7 +294,7 @@ def test_refused_past_time_six_days_past_qa_repro(
         task_dir, "QA repro",
         remind_at=(NOW - timedelta(days=6)).isoformat(),
     )
-    due, stale, refused = find_due_reminders(
+    due, stale, refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert due == []
@@ -308,7 +315,7 @@ def test_format_reminder_uses_reminder_text_when_set(tmp_task_vault: Path) -> No
         remind_at=WITHIN_GRACE_REMIND_AT,
         reminder_text="Get gas before the route",
     )
-    due, _stale, _refused = find_due_reminders(
+    due, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert format_reminder(due[0]) == "Get gas before the route"
@@ -321,7 +328,7 @@ def test_format_reminder_includes_due_when_present(tmp_task_vault: Path) -> None
         remind_at=WITHIN_GRACE_REMIND_AT,
         due="2026-04-24",
     )
-    due, _stale, _refused = find_due_reminders(
+    due, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert format_reminder(due[0]) == "Reminder: Call Dr Bailey (due 2026-04-24)"
@@ -333,7 +340,7 @@ def test_format_reminder_title_only_when_no_due(tmp_task_vault: Path) -> None:
         task_dir, "Plain reminder",
         remind_at=WITHIN_GRACE_REMIND_AT,
     )
-    due, _stale, _refused = find_due_reminders(
+    due, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert format_reminder(due[0]) == "Reminder: Plain reminder"
@@ -351,14 +358,14 @@ def test_clear_remind_at_and_stamp_mutates_frontmatter(tmp_task_vault: Path) -> 
         remind_at=WITHIN_GRACE_REMIND_AT,
     )
 
-    due, _stale, _refused = find_due_reminders(
+    due, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert len(due) == 1
     clear_remind_at_and_stamp(due[0], NOW)
 
     # Re-scan — the stamped task should no longer be due.
-    due_after, _stale, _refused = find_due_reminders(
+    due_after, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     assert due_after == []
@@ -385,7 +392,7 @@ def test_clear_remind_at_and_stamp_idempotent_same_timestamp(
         task_dir, "Idempotent",
         remind_at=WITHIN_GRACE_REMIND_AT,
     )
-    due, _stale, _refused = find_due_reminders(
+    due, _stale, _refused, _skipped = find_due_reminders(
         tmp_task_vault, NOW, stale_max_minutes=180,
     )
     clear_remind_at_and_stamp(due[0], NOW)
@@ -685,3 +692,561 @@ def test_talker_skill_has_setting_reminders_section() -> None:
     assert "## Setting reminders" in content
     assert "remind_at" in content
     assert "reminder_text" in content
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c+h — return kinds, chase framing, closed-skip signal, re-snooze
+# ---------------------------------------------------------------------------
+
+
+def _entry(
+    *,
+    waiting_on: str | None = None,
+    return_slot: str | None = None,
+    due: str | None = None,
+    reminder_text: str | None = None,
+    title: str = "Some task",
+    reminded_at: datetime | None = None,
+) -> DueReminder:
+    """Build a DueReminder directly.
+
+    Every entry gets a ``remind_at`` — that is the point. A due reminder
+    always has one, so any classifier that keys off it would put all of
+    these in the same bucket.
+    """
+    return DueReminder(
+        abs_path=Path("/nonexistent/task/x.md"),
+        rel_path="task/x.md",
+        title=title,
+        remind_at=NOW,
+        due=due,
+        reminder_text=reminder_text,
+        status="todo",
+        waiting_on=waiting_on,
+        return_slot=return_slot,
+        reminded_at=reminded_at,
+    )
+
+
+def test_classify_return_snooze_when_return_slot_present() -> None:
+    assert classify_return(_entry(return_slot="duty")) == RETURN_KIND_SNOOZE
+
+
+def test_classify_return_waiting_when_waiting_on_present() -> None:
+    assert classify_return(_entry(waiting_on="Carfax")) == RETURN_KIND_WAITING
+
+
+def test_classify_return_plain_when_neither_field_present() -> None:
+    """The third class is a real answer, not a fallback.
+
+    ``task/Order Fergus Tick Meds from Vet.md`` in the live vault is
+    exactly this shape: a residual ``remind_at`` and neither field.
+    """
+    assert classify_return(_entry()) == RETURN_KIND_PLAIN
+
+
+def test_classify_return_return_slot_outranks_waiting_on() -> None:
+    """Both fields set — the explicitly-chosen slot wins."""
+    entry = _entry(return_slot="duty", waiting_on="Carfax")
+    assert classify_return(entry) == RETURN_KIND_SNOOZE
+
+
+def test_classify_return_treats_blank_strings_as_absent() -> None:
+    """Frontmatter round-trips a blanked field as ``""``.
+
+    Without this, ``waiting_on: ""`` would frame a message as a chase
+    against nobody.
+    """
+    assert classify_return(_entry(return_slot="", waiting_on="")) == (
+        RETURN_KIND_PLAIN
+    )
+    assert classify_return(_entry(waiting_on="   ")) == RETURN_KIND_PLAIN
+
+
+def test_classify_return_is_not_driven_by_remind_at_presence() -> None:
+    """Anti-proxy pin: the discriminator is the FIELDS, never remind_at.
+
+    All three entries carry an identical ``remind_at`` and differ only
+    in ``return_slot`` / ``waiting_on``. Any implementation that keys
+    off ``remind_at`` — the mismeasurement this rule exists to prevent —
+    collapses these into one kind and fails here.
+
+    The assertion is on the whole set rather than one arm, so the pin
+    cannot pass while a single class is broken.
+    """
+    entries = {
+        "snooze": _entry(return_slot="duty"),
+        "waiting": _entry(waiting_on="Carfax"),
+        "plain": _entry(),
+    }
+    assert all(e.remind_at == NOW for e in entries.values())
+
+    kinds = {name: classify_return(e) for name, e in entries.items()}
+    assert kinds == {
+        "snooze": RETURN_KIND_SNOOZE,
+        "waiting": RETURN_KIND_WAITING,
+        "plain": RETURN_KIND_PLAIN,
+    }
+    assert len(set(kinds.values())) == 3
+
+
+def test_format_reminder_frames_waiting_item_as_chase() -> None:
+    text = format_reminder(_entry(waiting_on="Carfax", title="Fix mileage"))
+    assert text == "Chase Carfax: Fix mileage"
+    assert "Reminder:" not in text
+
+
+def test_format_reminder_chase_keeps_due_date() -> None:
+    text = format_reminder(
+        _entry(waiting_on="Duncan (Cleveland Insurance)",
+               title="Confirm cancellation", due="2026-08-21")
+    )
+    assert text == (
+        "Chase Duncan (Cleveland Insurance): Confirm cancellation "
+        "(due 2026-08-21)"
+    )
+
+
+def test_format_reminder_operator_text_outranks_chase_framing() -> None:
+    """Rule 1 still wins — a generated frame must not overwrite the
+    operator's own words."""
+    text = format_reminder(
+        _entry(waiting_on="Carfax", reminder_text="Ring them, ask for Dave")
+    )
+    assert text == "Ring them, ask for Dave"
+
+
+def test_format_reminder_snooze_and_plain_are_not_framed_as_chase() -> None:
+    """Positive control for the chase pin: the OTHER kinds must keep the
+    plain wording, so the chase arm is proven to be selective rather
+    than always-on."""
+    assert format_reminder(_entry(return_slot="duty", title="Pay MBF")) == (
+        "Reminder: Pay MBF"
+    )
+    assert format_reminder(_entry(title="Pay MBF")) == "Reminder: Pay MBF"
+
+
+def test_find_due_reminders_populates_return_kind_fields(
+    tmp_task_vault: Path,
+) -> None:
+    """The fields the routing pass wrote must actually reach the entry."""
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "Septic", remind_at=WITHIN_GRACE_REMIND_AT,
+        extra='return_slot: "routine"\nescalate_on: "2029-09-01"\n'
+              'escalate_to: "duty"',
+    )
+    due, _stale, _refused, _skipped = find_due_reminders(
+        tmp_task_vault, NOW, 180,
+    )
+    assert len(due) == 1
+    assert due[0].return_slot == "routine"
+    assert due[0].escalate_on == "2029-09-01"
+    assert due[0].escalate_to == "duty"
+    assert classify_return(due[0]) == RETURN_KIND_SNOOZE
+
+
+def test_find_due_reminders_closed_task_lands_in_skipped_closed(
+    tmp_task_vault: Path,
+) -> None:
+    """A due reminder on an already-done task is reported, not silent.
+
+    Carries its own positive control: an otherwise-identical OPEN task
+    in the same vault must still land in ``due``. Without that, this
+    pin would pass just as happily against a scanner that returned
+    nothing at all.
+    """
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "Already done", status="done",
+        remind_at=WITHIN_GRACE_REMIND_AT,
+    )
+    _write_task(
+        task_dir, "Still open", status="todo",
+        remind_at=WITHIN_GRACE_REMIND_AT,
+    )
+
+    due, _stale, _refused, skipped = find_due_reminders(
+        tmp_task_vault, NOW, 180,
+    )
+
+    assert [e.title for e in skipped] == ["Already done"]
+    assert skipped[0].status == "done"
+    # Positive control — the scan CAN still return a live reminder.
+    assert [e.title for e in due] == ["Still open"]
+
+
+def test_find_due_reminders_future_reminder_on_closed_task_is_not_skipped(
+    tmp_task_vault: Path,
+) -> None:
+    """Not-yet-due is not a skip. A closed task holding a future
+    ``remind_at`` is just history."""
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "Closed future", status="done",
+        remind_at=(NOW + timedelta(days=30)).isoformat(),
+    )
+    due, _stale, _refused, skipped = find_due_reminders(
+        tmp_task_vault, NOW, 180,
+    )
+    assert due == []
+    assert skipped == []
+
+
+def test_find_due_reminders_already_fired_closed_task_is_not_skipped(
+    tmp_task_vault: Path,
+) -> None:
+    """A closed task whose reminder already fired is finished business —
+    reporting it every tick would be the noise this signal avoids."""
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "Closed fired", status="cancelled",
+        remind_at=WITHIN_GRACE_REMIND_AT,
+        reminded_at=(NOW + timedelta(seconds=1)).isoformat(),
+    )
+    _due, _stale, _refused, skipped = find_due_reminders(
+        tmp_task_vault, NOW, 180,
+    )
+    assert skipped == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c+h — log emission, driven through _tick (the production path)
+# ---------------------------------------------------------------------------
+
+
+def _tick_env(vault: Path) -> tuple[TransportConfig, TransportState, list, object]:
+    """Config/state/send-collector for a _tick run."""
+    sent: list[dict] = []
+
+    async def _send(
+        user_id: int, text: str, dedupe_key: str | None = None,
+    ) -> list[int]:
+        sent.append({"user_id": user_id, "text": text, "dedupe_key": dedupe_key})
+        return [100 + len(sent)]
+
+    config = TransportConfig(
+        server=ServerConfig(),
+        scheduler=SchedulerConfig(
+            poll_interval_seconds=30, stale_reminder_max_minutes=180,
+        ),
+        auth=AuthConfig(),
+        state=StateConfig(),
+    )
+    state = TransportState.create(vault / "state.json")
+    return config, state, sent, _send
+
+
+def _events(captured: list[dict], name: str) -> list[dict]:
+    return [c for c in captured if c.get("event") == name]
+
+
+async def test_tick_logs_skipped_task_closed(tmp_task_vault: Path) -> None:
+    """The closed-task skip must be visible at production log level.
+
+    Drives ``_tick``, not ``find_due_reminders`` — a bucket nobody logs
+    is still silence. Positive control in the same test: an open task
+    fires, proving the tick ran rather than erroring out early.
+    """
+    import structlog
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    fresh = (real_now - timedelta(seconds=30)).isoformat()
+    _write_task(task_dir, "Done already", status="done", remind_at=fresh)
+    _write_task(task_dir, "Open one", status="todo", remind_at=fresh)
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    with structlog.testing.capture_logs() as captured:
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    matches = _events(captured, "transport.scheduler.reminders_skipped_task_closed")
+    assert len(matches) == 1
+    event = matches[0]
+    assert event["count"] == 1
+    assert event["paths"] == ["task/Done already.md"]
+    assert event["statuses"] == ["done"]
+    assert event["kinds"] == [RETURN_KIND_PLAIN]
+
+    # Positive control: the tick really ran and the open task fired.
+    assert len(sent) == 1
+    assert "Open one" in sent[0]["text"]
+
+
+async def test_tick_emits_no_skip_log_when_nothing_closed(
+    tmp_task_vault: Path,
+) -> None:
+    """Negative control — the signal must not fire spuriously, or it
+    stops meaning anything."""
+    import structlog
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    _write_task(
+        task_dir, "Open one", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    with structlog.testing.capture_logs() as captured:
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    assert _events(captured, "transport.scheduler.reminders_skipped_task_closed") == []
+    assert len(sent) == 1
+
+
+async def test_tick_emits_resnooze_signal_on_rearmed_reminder(
+    tmp_task_vault: Path,
+) -> None:
+    """A reminder that fired before and was re-armed is a correction
+    signal: the operator pushed it rather than acting on it."""
+    import structlog
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    remind_at = real_now - timedelta(seconds=30)
+    previously_reminded = remind_at - timedelta(hours=1)
+    _write_task(
+        task_dir, "Pay MBF", status="todo",
+        remind_at=remind_at.isoformat(),
+        reminded_at=previously_reminded.isoformat(),
+        extra='return_slot: "duty"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    with structlog.testing.capture_logs() as captured:
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    matches = _events(captured, "transport.scheduler.reminder_resnoozed")
+    assert len(matches) == 1
+    event = matches[0]
+    assert event["kind"] == RETURN_KIND_SNOOZE
+    assert event["return_slot"] == "duty"
+    assert event["pushed_by_seconds"] == 3600.0
+    # It still fires — the signal observes, it does not suppress.
+    assert len(sent) == 1
+
+
+async def test_tick_emits_no_resnooze_on_first_fire(
+    tmp_task_vault: Path,
+) -> None:
+    """Negative control: a first-time fire is not a re-snooze."""
+    import structlog
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    _write_task(
+        task_dir, "First fire", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    with structlog.testing.capture_logs() as captured:
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    assert _events(captured, "transport.scheduler.reminder_resnoozed") == []
+    assert len(sent) == 1
+
+
+async def test_tick_fired_log_carries_return_kind_and_chase_text(
+    tmp_task_vault: Path,
+) -> None:
+    """End-to-end: a waiting item reaches the operator as a chase, and
+    the fire log records which kind it was."""
+    import structlog
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    _write_task(
+        task_dir, "Fix Carfax mileage", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+        extra='waiting_on: "Carfax"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    with structlog.testing.capture_logs() as captured:
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    matches = _events(captured, "transport.scheduler.reminder_fired")
+    assert len(matches) == 1
+    assert matches[0]["kind"] == RETURN_KIND_WAITING
+    assert matches[0]["waiting_on"] == "Carfax"
+
+    assert len(sent) == 1
+    assert sent[0]["text"] == "Chase Carfax: Fix Carfax mileage"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c+h — slot resolution + slot-write at fire time
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_return_slot_uses_return_slot() -> None:
+    slot, rule = resolve_return_slot(_entry(return_slot="duty"), NOW)
+    assert (slot, rule) == ("duty", "return_slot")
+
+
+def test_resolve_return_slot_applies_operator_routine_alias() -> None:
+    """The two live records say ``routine``; the deck speaks ``rhythm``."""
+    slot, rule = resolve_return_slot(_entry(return_slot="routine"), NOW)
+    assert (slot, rule) == ("rhythm", "return_slot")
+
+
+def test_resolve_return_slot_escalates_once_escalate_on_has_passed() -> None:
+    """Escalation is generic — any record with the two fields, not
+    septic-special."""
+    entry = _entry(return_slot="routine")
+    entry.escalate_on = "2020-01-01"
+    entry.escalate_to = "duty"
+    slot, rule = resolve_return_slot(entry, NOW)
+    assert (slot, rule) == ("duty", "escalated")
+
+
+def test_resolve_return_slot_does_not_escalate_before_the_date() -> None:
+    """Positive control for the escalation pin: the same record before
+    its date keeps its ordinary slot, so the pin proves the DATE is what
+    fires rather than the mere presence of the fields."""
+    entry = _entry(return_slot="routine")
+    entry.escalate_on = "2099-01-01"
+    entry.escalate_to = "duty"
+    slot, rule = resolve_return_slot(entry, NOW)
+    assert (slot, rule) == ("rhythm", "return_slot")
+
+
+def test_resolve_return_slot_malformed_escalate_on_does_not_escalate() -> None:
+    """Escalation moves work INTO Duty, so an unparseable date must not
+    be able to trigger it. Fail toward the calmer answer."""
+    entry = _entry(return_slot="routine")
+    entry.escalate_on = "not-a-date"
+    entry.escalate_to = "duty"
+    slot, rule = resolve_return_slot(entry, NOW)
+    assert (slot, rule) == ("rhythm", "return_slot")
+
+
+def test_resolve_return_slot_none_for_waiting_item() -> None:
+    """A chase has no ruled slot — and must not borrow one."""
+    slot, rule = resolve_return_slot(_entry(waiting_on="Carfax"), NOW)
+    assert (slot, rule) == (None, "none")
+
+
+def test_resolve_return_slot_reports_unrecognized_separately_from_absent() -> None:
+    """``none`` and ``unrecognized`` are different failures: one is a
+    record that never asked for a slot, the other is a ruling that did
+    not land."""
+    slot, rule = resolve_return_slot(_entry(return_slot="wobble"), NOW)
+    assert (slot, rule) == (None, "unrecognized")
+
+
+async def test_tick_writes_ruled_slot_onto_returning_snooze(
+    tmp_task_vault: Path,
+) -> None:
+    """End-to-end delivery: the record comes back carrying its slot, so
+    the deck's rule-1 classifier deals it where the operator ruled."""
+    import frontmatter
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    path = _write_task(
+        task_dir, "Pay MBF", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+        extra='return_slot: "duty"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    fm = frontmatter.load(str(path)).metadata
+    assert fm["slot"] == "duty"
+    # Written on the SAME round-trip that disarms the reminder.
+    assert "remind_at" not in fm
+    assert fm.get("reminded_at")
+    assert fm["return_slot"] == "duty"  # the ruling itself is preserved
+
+
+async def test_tick_writes_rhythm_for_operator_routine_wording(
+    tmp_task_vault: Path,
+) -> None:
+    """The real TheJamieClinic/Septic shape, end to end."""
+    import frontmatter
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    path = _write_task(
+        task_dir, "Setup TheJamieClinic Email", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+        extra='return_slot: "routine"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    assert frontmatter.load(str(path)).metadata["slot"] == "rhythm"
+
+
+async def test_tick_does_not_write_slot_for_waiting_item(
+    tmp_task_vault: Path,
+) -> None:
+    """Negative control — a chase gets no slot invented for it."""
+    import frontmatter
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    path = _write_task(
+        task_dir, "Fix Carfax mileage", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+        extra='waiting_on: "Carfax"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    fm = frontmatter.load(str(path)).metadata
+    assert "slot" not in fm
+    assert "remind_at" not in fm  # still disarmed
+
+
+async def test_tick_logs_slot_write_and_non_application(
+    tmp_task_vault: Path,
+) -> None:
+    """Both outcomes are observable: a slot that landed, and a ruling
+    that did not."""
+    import structlog
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    fresh = (real_now - timedelta(seconds=30)).isoformat()
+    _write_task(task_dir, "Good slot", remind_at=fresh,
+                extra='return_slot: "duty"')
+    _write_task(task_dir, "Typo slot", remind_at=fresh,
+                extra='return_slot: "duti"')
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    with structlog.testing.capture_logs() as captured:
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    written = _events(captured, "transport.scheduler.return_slot_written")
+    assert len(written) == 1
+    assert written[0]["slot"] == "duty"
+    assert written[0]["rule"] == "return_slot"
+
+    lost = _events(captured, "transport.scheduler.return_slot_not_applied")
+    assert len(lost) == 1
+    assert lost[0]["return_slot"] == "duti"
+
+    assert len(sent) == 2  # both still fired
+
+
+def test_format_reminder_delegates_to_the_shared_renderer() -> None:
+    """One wording, every surface.
+
+    The Telegram wrapper must not drift from the renderer the deck
+    reader will call — two surfaces wording the same return differently
+    is a bug that only appears in front of the operator.
+    """
+    for entry in (
+        _entry(waiting_on="Carfax", title="Fix mileage"),
+        _entry(return_slot="duty", title="Pay MBF", due="2026-08-21"),
+        _entry(title="Plain one"),
+        _entry(reminder_text="Verbatim", title="Ignored"),
+    ):
+        assert format_reminder(entry) == render_return_line(entry)

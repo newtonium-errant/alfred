@@ -127,20 +127,169 @@ RULE_DATED_TASK = "dated_task"
 RULE_NONE = "no_signal"
 
 
+#: Operator-vocabulary aliases for canonical slot keys.
+#:
+#: The operator says "routine" for what this module calls Rhythm, and it is
+#: very likely the app taught him the word: the home view renders T3 items as
+#: "RHYTHM — auto-cadence-routine" every morning. His 2026-08-14 routing
+#: rulings used it as a slot name directly ("surface as ROUTINE slot; ESCALATE
+#: to DUTY"), pairing it with a real slot, and the Phase-1 pass wrote
+#: ``return_slot: routine`` onto two live records.
+#:
+#: The mapping lives HERE, at the read boundary, rather than being normalised
+#: away in the vault: the operator will keep saying "routine", and the talker
+#: will keep writing what he says. One named mapping is the cheap place for the
+#: impedance mismatch; rewriting records would have to be redone every time a
+#: new snooze is spoken.
+SLOT_ALIASES: dict[str, str] = {
+    "routine": SLOT_RHYTHM,
+}
+
+
 def normalize_slot(raw: Any) -> str | None:
     """Coerce an operator-written ``slot:`` value to a canonical key, or None.
 
     Case- and whitespace-insensitive, because this reads hand-edited
-    frontmatter. Returns ``None`` for anything unrecognised — including
+    frontmatter. Accepts :data:`SLOT_ALIASES` as operator vocabulary for a
+    canonical key. Returns ``None`` for anything unrecognised — including
     ``"unslotted"`` itself, which is the classifier's answer to give, never the
     operator's to write. An unrecognised value falls through to the next rule
     rather than becoming a slot, so a typo degrades to a lower-precedence
     (still honest) answer instead of inventing a fourth category.
+
+    **An unrecognised non-empty value is LOGGED, not silently dropped.**
+    Falling through is the right behaviour but it is indistinguishable, from
+    the outside, from a value that was never written — and this function now
+    sits on the path that decides where a returning snooze lands. A typo in
+    ``return_slot`` would otherwise present as "the operator's ruling quietly
+    did nothing". Absent and blank values are NOT logged: they mean "not set",
+    which is ordinary.
     """
     if not isinstance(raw, str):
         return None
     value = raw.strip().lower()
-    return value if value in CANONICAL_SLOTS else None
+    if value in CANONICAL_SLOTS:
+        return value
+    aliased = SLOT_ALIASES.get(value)
+    if aliased is not None:
+        return aliased
+    if value:
+        log.warning(
+            "tier.slots.unrecognized_slot_value",
+            value=value,
+            canonical=list(CANONICAL_SLOTS),
+            aliases=sorted(SLOT_ALIASES),
+            hint=(
+                "slot value not recognised — falling through to the next "
+                "classifier rule, so this record will NOT land in the slot "
+                "that was written. Fix the value or add an alias."
+            ),
+        )
+    return None
+
+
+def _as_date_like(raw: Any) -> Any | None:
+    """Best-effort coercion of an ``escalate_on`` value to something
+    comparable with a date. Returns ``None`` when it cannot be read.
+
+    PyYAML gives back ``date``/``datetime`` for unquoted ISO dates and
+    ``str`` when quoted, so both arrive in practice.
+    """
+    from datetime import date as _date, datetime as _dt
+
+    if isinstance(raw, _dt):
+        return raw.date()
+    if isinstance(raw, _date):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()[:10]
+        try:
+            return _date.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_effective_slot(
+    *,
+    return_slot: Any,
+    escalate_on: Any,
+    escalate_to: Any,
+    today: Any,
+) -> tuple[str | None, str]:
+    """Resolve which slot a returning task belongs in, with escalation.
+
+    Returns ``(canonical_slot_or_None, rule)`` where rule is one of
+    ``return_slot`` / ``escalated`` / ``none`` / ``unrecognized``.
+
+    **This is the single spelling of the escalation rule, deliberately.**
+    It has two consumers that fire at different moments and neither one
+    alone is sufficient:
+
+      * the transport scheduler, at FIRE time — covers a reminder that
+        fires after the escalation boundary has already passed;
+      * the returned-task reader, at READ time — covers a boundary that
+        passes while the task is sitting in returned-state, which is the
+        septic case exactly (fires 2029-06-01 as rhythm, escalates
+        2029-09-01, three months later).
+
+    Two copies of this rule would drift, and the drift would be
+    invisible: both consumers would look correct in isolation and
+    disagree only for records sitting across a boundary.
+
+    Escalation is generic — any record carrying both fields. A
+    ``escalate_on`` that cannot be read does NOT escalate: escalation
+    moves work into Duty, so an unparseable date must fail toward the
+    calmer answer rather than the sharper one.
+    """
+    raw = return_slot
+    rule = "return_slot"
+
+    boundary = _as_date_like(escalate_on)
+    escalate_to_value = (
+        escalate_to.strip()
+        if isinstance(escalate_to, str) and escalate_to.strip()
+        else None
+    )
+    if boundary is not None and escalate_to_value and today >= boundary:
+        raw = escalate_to_value
+        rule = "escalated"
+
+    if not (isinstance(raw, str) and raw.strip()):
+        return None, "none"
+
+    canonical = normalize_slot(raw)
+    if canonical is None:
+        return None, "unrecognized"
+    return canonical, rule
+
+
+def chase_phrase(waiting_on: Any) -> str | None:
+    """The canonical wording for "this is blocked on somebody".
+
+    Returns ``"chase <who>"``, or ``None`` when nobody is named — absent
+    and blank both mean "not waiting on anyone", so neither may produce
+    a chase against nobody.
+
+    **One spelling, two presentations.** Two consumers word a chase at
+    different granularities and both go through here:
+
+      * :func:`alfred.transport.scheduler.render_return_line` builds a
+        full message line — ``"Chase Carfax: Fix mileage"``;
+      * :func:`alfred.tier.compute.compute_returned_task_candidates`
+        sets a short ``surface_reason`` — ``"chase Carfax"``.
+
+    Granularity and capitalisation are PRESENTATION and stay with each
+    consumer. The vocabulary — the verb, and how the name is joined to
+    it — lives here. The distinction matters because the two spellings
+    would agree today and diverge the first time the wording changed,
+    and a divergence in operator-facing words is invisible from inside
+    the code: both surfaces keep passing their own tests while showing
+    the person two different things for the same state.
+    """
+    if not (isinstance(waiting_on, str) and waiting_on.strip()):
+        return None
+    return f"chase {waiting_on.strip()}"
 
 
 class SlotOverrides(Protocol):
