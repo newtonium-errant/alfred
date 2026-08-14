@@ -26,15 +26,30 @@ import {
 //
 // Lifecycle (VERIFIED, not assumed — Next 14.2.35, plain `next start`): a
 // lazy module-level SINGLETON kicked by the push routes (subscribe + public-key
-// GET, which the client hits on every PWA load). Chosen over instrumentation.ts
-// because that hook is still behind `experimental.instrumentationHook` in 14.2
-// (an experimental global toggle) and runs in every runtime (needs a
-// NEXT_RUNTIME guard). The singleton needs no config change, no edge hazard, and
-// for an inert-by-default doorbell it's the lower-risk boot path. Trade-off: after
-// a server restart the poller resumes on the next push-route hit (the client's
-// on-load public-key probe covers this) rather than at boot — acceptable for the
-// operator trial. It reads the feed through the EXISTING BFF-internal path
-// (callTransportFeed) — NO new transport surface.
+// GET, which the client hits on every PWA load) — AND, since the arming gap
+// below was observed in production, ALSO at server boot via instrumentation.ts.
+// It reads the feed through the EXISTING BFF-internal path (callTransportFeed)
+// — NO new transport surface.
+//
+// THE TRADE-OFF THAT WAS REVISED, AND WHY IT IS RECORDED RATHER THAN ERASED.
+// The original design chose the lazy singleton over instrumentation.ts because
+// that hook sits behind `experimental.instrumentationHook` in 14.2 (verified
+// again here: `next/dist/server/config-shared.js` defaults it false inside the
+// experimental block, in the installed 14.2.35) and runs in EVERY runtime, so it
+// needs a NEXT_RUNTIME guard. Both objections were true and remain true. The
+// stated trade-off was: "after a server restart the poller resumes on the next
+// push-route hit (the client's on-load public-key probe covers this) rather than
+// at boot — acceptable for the operator trial."
+//
+// The probe does NOT cover it, and the gap has a cost that was invisible until
+// it was paid: after a deploy restart the poller sits dormant until the operator
+// opens the app, so a scheduled wave that comes due in that window is simply
+// never sent. Nothing logs, because dormancy's only signature is absence. That
+// is the friction the deferral was waiting for, so the deferral is now spent —
+// boot arming is added, the two objections are paid rather than dodged (the
+// experimental flag is set deliberately in next.config.js; the runtime guard is
+// in instrumentation.ts and is why its import is dynamic), and the lazy kick
+// STAYS as the belt: two independent arming paths, both idempotent.
 
 const POLL_INTERVAL_MS = 60_000;
 const SEEN_MAX = 500;
@@ -250,6 +265,49 @@ export function ensurePushPoller(): void {
   }, POLL_INTERVAL_MS);
   if (typeof pollerTimer.unref === 'function') pollerTimer.unref();
   console.log(`[push:poll] poller started interval_ms=${POLL_INTERVAL_MS}`);
+}
+
+/**
+ * Arm the poller at server boot — called from `instrumentation.ts`.
+ *
+ * SPEAKS ON BOTH OUTCOMES, and that is the point rather than a nicety.
+ * `ensurePushPoller` logs only when it STARTS something; on a disabled or
+ * already-armed instance it returns in silence. A boot line that appears only on
+ * success reproduces exactly the failure this function exists to fix — dormancy
+ * whose only signature is absence. So every path says which path it took, and
+ * "the doorbell is off" is as visible in the journal as "the doorbell is on".
+ *
+ * The subscription count rides the armed line because it is the number that
+ * makes the line actionable: an armed poller with `subs=0` is a doorbell with
+ * nobody behind it, which reads as healthy and delivers nothing.
+ *
+ * NEVER THROWS. This runs inside Next's boot hook; an exception here would take
+ * the server down at start, which is a strictly worse failure than the one being
+ * fixed. A push doorbell must not be able to stop the app from serving.
+ */
+export async function armPushPollerAtBoot(): Promise<void> {
+  try {
+    if (!isPushEnabled()) {
+      console.log('[push:boot] instrument inert reason=push_disabled_or_unconfigured');
+      return;
+    }
+    const already = pollerTimer != null;
+    ensurePushPoller();
+    let subs = -1;
+    try {
+      subs = (await readSubscriptions()).length;
+    } catch (e) {
+      // A store read failure must not un-arm the poller — it is already running
+      // by this point. Report the count as unknown rather than claiming zero.
+      console.warn(`[push:boot] subs_unreadable err=${errName(e)}`);
+    }
+    console.log(
+      `[push:boot] instrument armed subs=${subs < 0 ? 'unknown' : subs}` +
+        `${already ? ' (already running — kicked by a route first)' : ''}`,
+    );
+  } catch (e) {
+    console.warn(`[push:boot] arming_failed err=${errName(e)}`);
+  }
 }
 
 /** Test seam: whether the singleton interval is currently constructed. */

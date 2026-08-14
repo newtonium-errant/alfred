@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 import { VIEWSCREEN_SURFACE } from '../lib/algernon/viewscreenSurface';
 import { CRT_SURFACE } from '../lib/algernon/crtSurface';
 import { COMMS_SURFACE } from '../lib/algernon/commsSurface';
@@ -21,7 +22,16 @@ import { COMMS_SURFACE } from '../lib/algernon/commsSurface';
 // `180deg` and a sentence from a file header as "unscoped selectors", because
 // comments and gradient arguments look exactly like selectors to a line matcher.
 
+// SENSOR-LOG IS FIRST IN THIS LIST, AND ITS ABSENCE WAS THE POINT.
+// This guard was written to close a hole FOUND IN sensor-log — a register can
+// rename one of its own custom properties while a reader still references it,
+// and CSS resolves the stale reference to nothing: no error, the value silently
+// disappears, every test stays green. The guard then shipped covering only the
+// three registers being added, which left the register that motivated it
+// outside its own fix. The `prefix` column exists because a surface NAME and
+// its token PREFIX are not the same string here (`sensor-log` / `--sensor-*`).
 const REGISTERS = [
+  { name: SENSOR_SURFACE, file: 'sensorLog.css', prefix: 'sensor' },
   { name: VIEWSCREEN_SURFACE, file: 'viewscreen.css', prefix: 'viewscreen' },
   { name: CRT_SURFACE, file: 'crt.css', prefix: 'crt' },
   { name: COMMS_SURFACE, file: 'comms.css', prefix: 'comms' },
