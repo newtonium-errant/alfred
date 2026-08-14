@@ -50,7 +50,7 @@ export function BriefView({ title, date, markdown, emptyMessage, testId }: Brief
   return (
     <section data-testid={testId}>
       <div className="flex items-baseline justify-between gap-3">
-        <h2 className="text-lg font-bold text-honeydew-700">{title}</h2>
+        <h2 className="text-lg font-bold text-console-ink">{title}</h2>
         {!empty && (
           <span data-testid={`${testId}-date`} className={subtle}>
             {date}
@@ -64,7 +64,7 @@ export function BriefView({ title, date, markdown, emptyMessage, testId }: Brief
           {emptyMessage}
         </p>
       ) : (
-        <div className="mt-3 rounded-xl border border-honeydew-200 bg-white px-4 py-3">
+        <div className="mt-3 rounded-xl border border-console-edge bg-console-panel px-4 py-3">
           {/* #85: fenced blocks (the ```csv the ingest path writes) get their
               own panel + a download button; everything else keeps the exact
               pre-wrap treatment it had. Still escaped text children only. */}

@@ -1,5 +1,5 @@
 import { ChangeEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { Button } from '../ui/button';
+import { Button, FILE_PILL_CLASS } from '../ui/button';
 import { Label } from '../ui/label';
 import { Textarea } from '../ui/textarea';
 import { EmptyState } from '../EmptyState';
@@ -256,7 +256,7 @@ export function BatchForm({
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Label htmlFor="batch-files">Scans</Label>
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50">
+          <label className={FILE_PILL_CLASS}>
             Add images
             <input
               id="batch-files"

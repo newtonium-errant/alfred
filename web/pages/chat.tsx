@@ -150,7 +150,7 @@ export default function ChatPage() {
           <div className="min-w-0">
             <h1 className={display}>Chat</h1>
             <p className={`mt-1 ${subtle}`}>
-              Signed in as <span className="font-semibold text-honeydew-700">{user.name}</span>{' '}
+              Signed in as <span className="font-semibold text-console-ink">{user.name}</span>{' '}
               · a vault-grounded conversation with {activeLabel}.
             </p>
           </div>
@@ -200,7 +200,7 @@ export default function ChatPage() {
             <p
               role="status"
               data-testid="chat-notice"
-              className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-700"
+              className="rounded-xl bg-console-raise px-3 py-2 text-sm text-console-ink"
             >
               {notice}
             </p>

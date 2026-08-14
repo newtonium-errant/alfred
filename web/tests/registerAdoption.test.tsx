@@ -1,0 +1,313 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { render } from '@testing-library/react';
+import { ProvenancePreview } from '../components/ingest/ProvenancePreview';
+import { EmptyState } from '../components/EmptyState';
+
+// HOME'S SLOT CARDS JOIN THE VIEWSCREEN REGISTER — the operator's "this main
+// view still has white blocks".
+//
+// Home was ratified viewscreen and its SHELL went dark, but the cards inside it
+// never adopted: the T1/T2/T3 strip, DUTY/RHYTHM/FUEL and the push card were
+// still cream panels with green ink sitting on a dark hull.
+//
+// Chat's Voice container bar is here too, for the same reason and by the same
+// treatment — one register over (comms), one operator report later.
+//
+// WHY THESE AND NOT EVERY WARM PANEL IN THE APP. A component may be warm
+// legitimately — `pages/share.tsx` renders `<Layout showNav={false}>` with no
+// surface prop, so it is a WARM route, and it renders `IngestForm` (which
+// contains `ProvenancePreview` and both upload pills). Rewriting a straddler's
+// classes to console tokens fixes the dark route and breaks the warm one. Every
+// file listed below renders on exactly ONE route, which is what makes direct
+// token adoption correct for them and a marker seam the right answer for the
+// straddlers. That reachability claim is asserted below, not assumed — it is the
+// whole justification for the treatment.
+//
+// TWO DIRECTIONS, because "no warm classes" alone is satisfied by a component
+// that has stopped rendering anything: the role tokens must still be here. A
+// register restyles chrome and never a verdict, so the T1/T2/T3 state dots, the
+// voice call's state dots and the danger ink survive the re-hull unchanged.
+
+const ROOT = join(__dirname, '..');
+const ADOPTED = [
+  'components/feed/SlotBoard.tsx',
+  'components/feed/RingsHeader.tsx',
+  'components/PushToggle.tsx',
+  // Chat's Voice container bar (comms register). Same treatment for the same
+  // reason: pages/chat.tsx is its only render site, so it is not a straddler.
+  'components/chat/VoicePanel.tsx',
+  // The player's Morning Brief document render (viewscreen). Rendered only from
+  // pages/player.tsx, so also not a straddler.
+  'components/brief/BriefView.tsx',
+  // The PAGES themselves. A page is its own route by definition, so it can never
+  // straddle — and each of these carried panels of its own that no component fix
+  // would have reached.
+  'pages/index.tsx',
+  'pages/chat.tsx',
+] as const;
+
+// `pages/player.tsx` adopts too, but it CANNOT join the list above, because the
+// operator ruled three things keep their existing colours: the slide-progress
+// dots, the filled Ask button, and the four transport buttons. Those are borders
+// and fills rather than light blocks, and they already read correctly on a dark
+// hull — so a whole-file "no warm class" scan would be asserting something the
+// ruling says is wrong.
+//
+// The exceptions are therefore ENUMERATED, by shape rather than by line number
+// so they survive the file moving. Pinning them is what stops the carve-out
+// becoming a hiding place: a NEW warm panel added to the player would have to
+// both match one of these shapes and keep the total at six.
+const PLAYER_WARM_EXCEPTIONS: ReadonlyArray<[string, RegExp]> = [
+  ['slide-progress dots', /rounded-full transition-all/],
+  ['the filled Ask button', /data-testid="player-ask-send"|bg-honeydew-600 px-4/],
+  ['a transport button', /rounded-full border-\[1\.5px\]/],
+];
+const PLAYER_WARM_LINE_COUNT = 6; // 1 dots + 1 Ask + 4 transport
+
+const WARM = /\b(?:bg-white|bg-cream|text-cream|(?:bg|border|text|ring|placeholder|divide|from|to|via)-honeydew-\d+)\b/g;
+// Role-carrying classes. These are verdict colour and are inviolate.
+const ROLE = /\b(?:bg-status-[a-z-]+|text-status-[a-z-]+|text-danger|bg-danger-bg|text-affirm|bg-affirm[a-z-]*|text-caution|text-negative)\b/g;
+
+function src(rel: string): string {
+  return readFileSync(join(ROOT, rel), 'utf8');
+}
+
+describe('single-route panels adopt their register', () => {
+  it.each(ADOPTED)('%s carries no warm class', (rel) => {
+    expect([...src(rel).matchAll(WARM)].map((m) => m[0])).toEqual([]);
+  });
+
+  it('the scanner can still SEE a warm class — the positive control', () => {
+    // Without this, a broken pattern would report every file clean and the pins
+    // above would be green against a build that never adopted anything.
+    const sample = 'className="rounded-xl border border-honeydew-200 bg-cream text-honeydew-700"';
+    expect([...sample.matchAll(WARM)].map((m) => m[0])).toEqual([
+      'border-honeydew-200',
+      'bg-cream',
+      'text-honeydew-700',
+    ]);
+  });
+
+  it('carries the SAME role colours it carried before the re-hull', () => {
+    // The half that makes "no warm classes" mean adoption rather than deletion —
+    // and it is a per-token census, not a count, because a re-hull that swapped
+    // one verdict hue for another would keep the count and break the vocabulary.
+    //
+    // NOT `.length > 0` per file, which is what this pin said first and which
+    // FAILED honestly: PushToggle has no role-coloured element at all (its "Turn
+    // off" border was warm CHROME, not a verdict), so a per-file lower bound was
+    // asserting something untrue about a correct component.
+    //
+    // MEASURED, not transcribed. This pin already caught its own set growing —
+    // when pages/index.tsx and pages/chat.tsx joined ADOPTED it went red, which
+    // is the correct behaviour and the reason the figures were re-run rather than
+    // adjusted by arithmetic. The invocation that produces them, over exactly the
+    // files in ADOPTED:
+    //   grep -ohE "\b(bg-status-[a-z-]+|text-status-[a-z-]+|text-danger|\
+    //     bg-danger-bg|text-affirm|bg-affirm[a-z-]*|text-caution|text-negative)\b" \
+    //     <ADOPTED> | sort | uniq -c
+    const census: Record<string, number> = {};
+    for (const rel of ADOPTED) {
+      for (const m of src(rel).matchAll(ROLE)) census[m[0]] = (census[m[0]] ?? 0) + 1;
+    }
+    expect(census['bg-affirm-deep']).toBe(1); // the undo bar, matched to the deck's
+    expect(census['bg-danger-bg']).toBe(4);
+    expect(census['bg-status-done']).toBe(1); // VoicePanel's own, a distinct token
+    expect(census['bg-status-done-fg']).toBe(2);
+    expect(census['bg-status-progress']).toBe(1);
+    expect(census['bg-status-progress-fg']).toBe(2);
+    expect(census['text-danger']).toBe(6);
+    expect(census['text-status-done-fg']).toBe(5);
+    expect(census['text-status-progress-fg']).toBe(1);
+  });
+
+  it('spends no console token at an alpha it cannot honour', () => {
+    // `--console-*` are plain hex, NOT the `<alpha-value>` channel form Tailwind
+    // needs, so `bg-console-panel/70` compiles to nothing and the element loses
+    // its background silently. The tailwind config says so; this catches the
+    // translation that forgets it (the re-hull did, once, on the undo bar —
+    // `bg-cream/70` became `bg-console-panel/70` before it became the deck's own
+    // `bg-affirm-deep`).
+    for (const rel of ADOPTED) {
+      expect([...src(rel).matchAll(/\bconsole-[a-z-]+\/\d+/g)].map((m) => m[0])).toEqual([]);
+    }
+  });
+
+  it('the player keeps warm colour ONLY where the operator ruled it should', () => {
+    // NON-GLOBAL on purpose. `WARM` carries /g, and `RegExp.test` on a /g regex
+    // advances `lastIndex` between calls — so testing it line by line would skip
+    // matches and under-report, which is a pin quietly lying rather than failing.
+    const warmLine = new RegExp(WARM.source);
+    const warmLines = src('pages/player.tsx')
+      .split('\n')
+      .filter((l) => warmLine.test(l));
+    // POSITIVE CONTROL: there ARE warm lines to classify. If the player were
+    // fully converted this pin would be vacuous, and the ruling would have been
+    // silently overridden rather than obeyed.
+    expect(warmLines.length).toBe(PLAYER_WARM_LINE_COUNT);
+
+    for (const line of warmLines) {
+      const matched = PLAYER_WARM_EXCEPTIONS.filter(([, re]) => re.test(line));
+      // Named, so a failure says WHICH element is unaccounted for rather than
+      // just that a count moved.
+      expect(matched.length, `unaccounted warm line: ${line.trim().slice(0, 90)}`).toBeGreaterThan(0);
+    }
+  });
+
+  it('re-hulls only components no WARM route renders', () => {
+    // The reachability claim this treatment rests on. `/share` takes no surface
+    // prop and so is warm; it must not reach any of them, or the adoption
+    // above would be shipping a dark panel onto a warm page.
+    const share = src('pages/share.tsx');
+    for (const name of ['SlotBoard', 'RingsHeader', 'PushToggle', 'VoicePanel', 'BriefView']) {
+      expect(share).not.toContain(`<${name}`);
+    }
+    // POSITIVE CONTROL: /share really is warm and really does render page
+    // content — so "does not contain" is a fact about this page, not about an
+    // empty file or a mis-read path.
+    expect(share).toContain('<Layout showNav={false}>');
+    expect(share).toContain('<IngestForm');
+    expect(share).not.toContain('surface=');
+  });
+});
+
+// ── THE `ui-panel` SEAM ─────────────────────────────────────────────────────
+//
+// The STRADDLERS. `ProvenancePreview` renders on /ingest (crt) and on /share
+// (warm — `<Layout showNav={false}>`, no surface prop); `EmptyState` renders on
+// six dark routes and on /share. Neither can be fixed by rewriting classes: that
+// fixes the dark route and ships a dark panel onto the warm one. So the warm
+// chrome stays the UNMARKED DEFAULT and the registers reach in through an opt-in
+// marker, exactly as they already do for `ui-field` and `ui-btn`.
+//
+// PARAMETRIZED OVER THE REGISTERS A MARKED PANEL CAN ACTUALLY REACH, and
+// `sensor-log` is deliberately NOT one of them — with its own pin below saying
+// so, so the omission is a recorded decision rather than a hole.
+//
+// That started as the opposite. The family-hole lesson says a guard written for
+// the members that prompted it leaves a gap, so the first cut put `.ui-panel`
+// into all four stylesheets — and `sensorLogSkin.test.tsx` immediately went red
+// with twelve orphaned selectors. It was right: no marked panel renders on
+// /feed, so those rules matched nothing. Dead CSS is dead CSS whether it comes
+// from carelessness or from over-generalising, and the fix was to delete the
+// rules rather than to widen the pin that caught them. Completeness is measured
+// against what is REACHABLE, not against the list of registers.
+
+const PANEL_REGISTERS = [
+  { surface: 'viewscreen', prefix: 'viewscreen', file: 'viewscreen.css' },
+  { surface: 'crt', prefix: 'crt', file: 'crt.css' },
+  { surface: 'comms', prefix: 'comms', file: 'comms.css' },
+] as const;
+
+const MARKED_PANELS = [
+  ['components/ingest/ProvenancePreview.tsx', 'ui-panel'],
+  ['components/EmptyState.tsx', 'ui-panel'],
+] as const;
+
+function css(file: string): string {
+  return readFileSync(join(ROOT, 'styles', file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
+describe.each(PANEL_REGISTERS)('$surface reaches adopted panels', ({ surface, prefix, file }) => {
+  const sheet = css(file);
+
+  it('declares a .ui-panel rule under its own attribute', () => {
+    expect(sheet).toContain(`[data-surface='${surface}'] .ui-panel`);
+    // Scoped, never bare: an unscoped `.ui-panel` would repaint the marker on
+    // every surface including the warm ones, which is the defect the seam exists
+    // to avoid rather than a shortcut to it.
+    const bare = sheet.split('\n').filter((l) => /^\s*\.ui-panel\b/.test(l));
+    expect(bare).toEqual([]);
+  });
+
+  it('spends only its OWN tokens, and never a role', () => {
+    const block = sheet
+      .split('}')
+      .filter((c) => c.includes(`[data-surface='${surface}'] .ui-panel`))
+      .join('}');
+    const vars = [...block.matchAll(/var\(--([a-z-]+)\)/g)].map((m) => m[1]);
+    expect(vars.length).toBeGreaterThan(0); // positive control: there ARE declarations
+    for (const v of vars) {
+      expect(v.startsWith(`${prefix}-`)).toBe(true);
+      // A register restyles chrome, never a verdict — the same guarantee ui-btn
+      // has. `panel`/`edge`/`ink` only; no affirm/negative/caution/info.
+      expect(/-(affirm|negative|caution|info)/.test(v)).toBe(false);
+    }
+  });
+
+  it('has a marked panel to reach — the vacuity control', () => {
+    // RENDERED, not grepped. This pin's first form was `src(file).toContain
+    // ('ui-panel')`, and removing the marker from ProvenancePreview did not red
+    // it — because the COMMENT above the marker says the word "ui-panel" too.
+    // It was measuring a string in a file rather than a class on an element: the
+    // guard-checks-a-proxy failure, caught by mutating the thing it claimed to
+    // protect. The DOM cannot be fooled by prose.
+    const { container: panel } = render(
+      <ProvenancePreview
+        target={undefined}
+        recordType="document"
+        title=""
+        source=""
+        ingestedBy="andrew"
+        originInstance="Salem"
+      />,
+    );
+    expect(panel.querySelector('.ui-panel')).not.toBeNull();
+
+    const { container: empty } = render(<EmptyState icon="💬" message="nothing here" />);
+    expect(empty.querySelector('.ui-panel')).not.toBeNull();
+  });
+});
+
+describe('/share stays warm — the regression the seam exists to prevent', () => {
+  it('renders a straddler whose warm chrome is intact and unreachable by any register', () => {
+    // /share takes NO surface prop, so no `[data-surface='…'] .ui-panel` rule can
+    // match anything on it. That is what makes the marker safe: adopting cost
+    // /share nothing.
+    const share = src('pages/share.tsx');
+    expect(share).toContain('<IngestForm');
+    expect(share).not.toContain('surface=');
+
+    // The warm chrome is STILL THERE on the straddler — it is the unmarked
+    // default, not a leftover. If a later hand converted it to console tokens
+    // this reds, which is the exact regression the finding predicted.
+    const panel = src('components/ingest/ProvenancePreview.tsx');
+    expect(panel).toContain('bg-honeydew-100');
+    expect(panel).toContain('border-honeydew-300');
+    expect(panel).toContain('ui-panel');
+    // Same for the other straddler's disc.
+    expect(src('components/EmptyState.tsx')).toContain('ui-panel flex h-11 w-11');
+    expect(src('components/EmptyState.tsx')).toContain('bg-honeydew-100');
+  });
+
+  it('the straddlers are NOT in the token-adopted set — the two treatments stay apart', () => {
+    // A straddler that also got the token treatment would be dark on /share. The
+    // two lists must never intersect.
+    for (const [rel] of MARKED_PANELS) {
+      expect(ADOPTED as readonly string[]).not.toContain(rel);
+    }
+  });
+});
+
+describe('sensor-log deliberately has no panel rules', () => {
+  it('declares none, because no marked panel is reachable from /feed', () => {
+    // The REASON is the assertion. Stating "sensor-log has no ui-panel rule"
+    // alone would be satisfied by an oversight; pairing it with the reachability
+    // fact makes it a decision that reds if either half changes — if a marked
+    // panel ever lands on the feed, the second expectation fails and the missing
+    // rule becomes visible instead of staying quietly absent.
+    expect(css('sensorLog.css')).not.toContain('.ui-panel');
+
+    const feedSurfaces = [src('pages/feed.tsx'), src('components/feed/FeedRow.tsx')].join('\n');
+    for (const [rel] of MARKED_PANELS) {
+      const component = rel.split('/').pop()!.replace('.tsx', '');
+      expect(feedSurfaces).not.toContain(`<${component}`);
+    }
+    // POSITIVE CONTROL: the marked panels exist and are reachable SOMEWHERE, so
+    // "not on the feed" is a fact about the feed rather than about a marker
+    // nobody applied.
+    expect(src('components/ingest/IngestForm.tsx')).toContain('<ProvenancePreview');
+  });
+});

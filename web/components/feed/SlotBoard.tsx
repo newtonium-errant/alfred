@@ -130,7 +130,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     const notice = completion.noticeFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
-    const dot = done ? 'bg-status-done-fg' : suggested ? 'bg-honeydew-400' : 'bg-status-progress-fg';
+    const dot = done ? 'bg-status-done-fg' : suggested ? 'bg-console-ink-faint' : 'bg-status-progress-fg';
 
     return (
       <li
@@ -138,7 +138,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         data-testid="board-item"
         data-stage={stage}
         data-pending={pending}
-        className="border-t border-dashed border-honeydew-200 pt-2 first:border-0 first:pt-0"
+        className="border-t border-dashed border-console-edge pt-2 first:border-0 first:pt-0"
       >
         <div className="flex items-start justify-between gap-2">
           <button
@@ -150,13 +150,13 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           >
             <span aria-hidden className={`mt-1 h-2 w-2 shrink-0 rounded-full ${dot}`} />
             <span className="min-w-0">
-              <span className={`block break-words text-sm font-semibold text-honeydew-700 ${done ? 'line-through opacity-70' : ''}`}>
+              <span className={`block break-words text-sm font-semibold text-console-ink ${done ? 'line-through opacity-70' : ''}`}>
                 {it.title || it.id}
               </span>
               {opts.reason && (
                 // WHY this is still on the board — the question a carried item
                 // provokes, answered in place rather than left mysterious.
-                <span data-testid="board-item-reason" className="mt-0.5 block text-[11px] text-honeydew-600">
+                <span data-testid="board-item-reason" className="mt-0.5 block text-[11px] text-console-ink-dim">
                   {opts.reason}
                 </span>
               )}
@@ -177,7 +177,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                   data-testid="board-undo"
                   disabled={compBusy}
                   onClick={() => completion.undo(it)}
-                  className="rounded-lg border border-honeydew-300 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-600 disabled:opacity-50"
+                  className="rounded-lg border border-console-edge px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink-dim disabled:opacity-50"
                 >
                   {compBusy ? '…' : 'Undo'}
                 </button>
@@ -189,7 +189,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
               data-testid="board-accept"
               disabled={acceptBusy}
               onClick={() => accept.accept(it)}
-              className="shrink-0 rounded-lg border border-honeydew-500 bg-honeydew-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+              className="shrink-0 rounded-lg border border-console-edge-bright bg-console-raise px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
             >
               {acceptBusy ? '…' : 'Accept'}
             </button>
@@ -199,7 +199,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
               data-testid="board-complete"
               disabled={compBusy}
               onClick={() => grace.tap(it)}
-              className="shrink-0 rounded-lg border border-honeydew-400 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+              className="shrink-0 rounded-lg border border-console-edge-bright px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
             >
               {compBusy ? '…' : '✓ Done'}
             </button>
@@ -214,7 +214,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
               disabled
               aria-disabled="true"
               title={COMPLETION_UNAVAILABLE_HINT}
-              className="shrink-0 cursor-default rounded-lg border border-honeydew-200 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-400 opacity-50"
+              className="shrink-0 cursor-default rounded-lg border border-console-edge px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink-faint opacity-50"
             >
               ✓ Done
             </button>
@@ -227,16 +227,16 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           </p>
         )}
         {!itemError && notice && (
-          <p data-testid="board-item-notice" className="mt-1 pl-4 text-[11px] text-honeydew-600">
+          <p data-testid="board-item-notice" className="mt-1 pl-4 text-[11px] text-console-ink-dim">
             {notice}
           </p>
         )}
 
         {expanded && rows.length > 0 && (
-          <dl data-testid="board-item-evidence" className="mt-1.5 space-y-1 pl-4 text-xs text-honeydew-600">
+          <dl data-testid="board-item-evidence" className="mt-1.5 space-y-1 pl-4 text-xs text-console-ink-dim">
             {rows.map((r) => (
               <div key={r.key} className="flex gap-2">
-                <dt className="shrink-0 font-semibold text-honeydew-700">{evidenceLabel(r.key)}:</dt>
+                <dt className="shrink-0 font-semibold text-console-ink">{evidenceLabel(r.key)}:</dt>
                 <dd className="min-w-0 break-words">{r.value}</dd>
               </div>
             ))}
@@ -262,12 +262,12 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         key={stack.key}
         data-testid={`board-stack-${stack.key}`}
         data-residue={residue}
-        className={`rounded-xl border p-3 shadow-soft ${residue ? 'border-dashed border-honeydew-200 bg-honeydew-50/40' : 'border-honeydew-200 bg-cream'}`}
+        className={`rounded-xl border p-3 shadow-soft ${residue ? 'border-dashed border-console-edge bg-console-raise' : 'border-console-edge bg-console-panel'}`}
       >
-        <h3 className="flex items-baseline justify-between gap-2 text-xs font-bold uppercase tracking-wider text-honeydew-700">
+        <h3 className="flex items-baseline justify-between gap-2 text-xs font-bold uppercase tracking-wider text-console-ink">
           <span data-testid={`board-stack-label-${stack.key}`}>{stack.label}</span>
           {!residue && stack.committedCount > 0 && (
-            <span data-testid={`board-stack-score-${stack.key}`} className="font-mono text-[11px] font-semibold tracking-normal text-honeydew-600">
+            <span data-testid={`board-stack-score-${stack.key}`} className="font-mono text-[11px] font-semibold tracking-normal text-console-ink-dim">
               {stack.doneCount}/{stack.committedCount} done
             </span>
           )}
@@ -292,7 +292,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           // A round-2 rewrite to "they stay out of the balance, either way" was
           // reverted: it read as placement and lost the held-against-him sense.
           // Ruled KEEP — do not "fix" this back.
-          <p data-testid="board-residue-note" className="mt-1 text-[11px] text-honeydew-600">
+          <p data-testid="board-residue-note" className="mt-1 text-[11px] text-console-ink-dim">
             No slot rule matched these yet — they don&rsquo;t count for or against your day.
           </p>
         )}
@@ -304,7 +304,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           // The line is PER SLOT because the flat one landed under Fuel every
           // morning, where a bare "nothing here" reads as a verdict on the exact
           // slot the taxonomy exists to protect. See `SLOT_EMPTY_COPY`.
-          <p data-testid={`board-stack-empty-${stack.key}`} className="mt-2 text-xs text-honeydew-600">
+          <p data-testid={`board-stack-empty-${stack.key}`} className="mt-2 text-xs text-console-ink-dim">
             {SLOT_EMPTY_COPY[stack.key] ?? SLOT_EMPTY_FALLBACK}
           </p>
         ) : (
@@ -317,7 +317,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
 
             {stack.carryover.length > 0 && (
               <div className="mt-3">
-                <p className="text-[10px] font-bold uppercase tracking-wider text-honeydew-600">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-console-ink-dim">
                   Carried over
                 </p>
                 <ul data-testid={`board-carryover-${stack.key}`} className="mt-1.5 flex flex-col gap-2">
@@ -331,7 +331,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                 {/* Not "Worth considering" — that is the system asserting these
                     have value. These are OFFERS awaiting a yes/no, and declining
                     costs nothing; the heading says who holds the choice. */}
-                <p className="text-[10px] font-bold uppercase tracking-wider text-honeydew-600">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-console-ink-dim">
                   If you want
                 </p>
                 <ul data-testid={`board-candidates-${stack.key}`} className="mt-1.5 flex flex-col gap-2">
@@ -362,7 +362,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                   data-testid={`board-show-done-${stack.key}`}
                   onClick={() => toggle(setOpenDone, stack.key)}
                   aria-expanded={showDone}
-                  className="text-[11px] font-semibold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+                  className="text-[11px] font-semibold uppercase tracking-wider text-console-ink-dim underline underline-offset-2"
                 >
                   {showDone ? 'Hide done' : `Show done (${stack.done.length})`}
                 </button>
@@ -384,7 +384,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                   data-testid={`board-browse-${stack.key}`}
                   onClick={() => toggle(setOpenBrowse, stack.key)}
                   aria-expanded={browsing}
-                  className="text-[11px] font-semibold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+                  className="text-[11px] font-semibold uppercase tracking-wider text-console-ink-dim underline underline-offset-2"
                 >
                   {browsing ? 'Hide the rest' : `Browse the rest (${stack.overflow.length})`}
                 </button>
@@ -431,7 +431,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         // metric. Stating the DENOMINATOR is the sentence's whole job and it may
         // not be softened into vagueness. A round-2 rewrite to "leaves them out"
         // was reverted. Ruled KEEP.
-        <p data-testid="board-coverage-warning" role="status" className="mb-2 text-[11px] text-honeydew-600">
+        <p data-testid="board-coverage-warning" role="status" className="mb-2 text-[11px] text-console-ink-dim">
           The slot rules couldn&rsquo;t place {coverage.unslotted} of {coverage.total} items — the
           balance below counts only the rest.
         </p>
@@ -443,12 +443,12 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
 
       {items == null ? (
         // Intentionally-left-blank: an explicit loading signal, not a blank board.
-        <p data-testid="board-loading" className="mt-3 text-sm text-honeydew-600">
+        <p data-testid="board-loading" className="mt-3 text-sm text-console-ink-dim">
           Loading your day…
         </p>
       ) : (
         <>
-          <p data-testid="board-balance" className="mt-3 text-xs text-honeydew-600">
+          <p data-testid="board-balance" className="mt-3 text-xs text-console-ink-dim">
             {totalOnBoard === 0
               ? // Intentionally-left-blank: three empty stacks could read as a
                 // broken board — say that it ran and found nothing.
@@ -498,7 +498,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
             // Gated on the board having ITEMS. On an empty board nothing was
             // sorted, so this sentence would be a small lie told on the quietest
             // morning — the board-level line above already says the true thing.
-            <p data-testid="board-residue-clear" className="mt-2 text-[11px] text-honeydew-600">
+            <p data-testid="board-residue-clear" className="mt-2 text-[11px] text-console-ink-dim">
               Everything on the board found a slot.
             </p>
           )}
@@ -509,7 +509,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         <div
           data-testid="board-toast"
           role="status"
-          className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3.5 overflow-hidden rounded-xl bg-honeydew-700 px-3.5 py-2.5 text-sm text-cream shadow-card"
+          className="fixed inset-x-0 bottom-20 z-50 mx-auto flex w-fit items-center gap-3.5 overflow-hidden rounded-xl bg-console-raise px-3.5 py-2.5 text-sm text-console-ink shadow-card"
         >
           {/* "Got it", not "Done" — during the grace window NOTHING HAS BEEN
               WRITTEN yet, so this acknowledges the tap it actually has rather
@@ -532,7 +532,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
             data-testid="board-toast-bar"
             aria-hidden="true"
             style={{ animationDuration: `${UNDO_MS}ms` }}
-            className="deck-undo-bar absolute inset-x-0 bottom-0 h-[3px] origin-left bg-cream/70"
+            className="deck-undo-bar absolute inset-x-0 bottom-0 h-[3px] origin-left bg-affirm-deep"
           />
         </div>
       )}

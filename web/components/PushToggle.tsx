@@ -13,10 +13,10 @@ export function PushToggle() {
   }
 
   return (
-    <div data-testid="push-toggle" className="mt-6 flex items-center justify-between gap-3 rounded-xl border border-honeydew-200 bg-cream px-4 py-3 text-sm shadow-soft">
+    <div data-testid="push-toggle" className="mt-6 flex items-center justify-between gap-3 rounded-xl border border-console-edge bg-console-panel px-4 py-3 text-sm shadow-soft">
       <div className="min-w-0">
-        <p className="font-semibold text-honeydew-700">Push notifications</p>
-        <p className="text-honeydew-600">
+        <p className="font-semibold text-console-ink">Push notifications</p>
+        <p className="text-console-ink-dim">
           {status === 'on'
             // #62 rider (operator-ruled 2026-08-07). The old line —
             // "rings you when something needs a decision" — promised far more
@@ -40,7 +40,7 @@ export function PushToggle() {
           data-testid="push-toggle-button"
           disabled={busy}
           onClick={() => (status === 'on' ? disable() : enable())}
-          className="shrink-0 rounded-lg border border-honeydew-400 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+          className="shrink-0 rounded-lg border border-console-edge-bright px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
         >
           {busy ? '…' : status === 'on' ? 'Turn off' : 'Turn on'}
         </button>

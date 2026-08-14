@@ -301,10 +301,10 @@ export default function PlayerPage() {
 
         {/* ILB: no brief spooled → offer the deck (not an error). */}
         {loaded && narrationState === 'no_brief' && (
-          <div data-testid="player-no-brief" className="mt-6 rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft">
+          <div data-testid="player-no-brief" className="mt-6 rounded-xl border border-console-edge bg-console-panel p-4 shadow-soft">
             <p className={titleClass}>No brief today.</p>
             <p className={`mt-1 ${subtle}`}>Nothing to play yet — decisions are on the deck.</p>
-            <Link href="/deck" data-testid="player-no-brief-link" className="mt-3 inline-block font-semibold text-honeydew-700 underline underline-offset-2">
+            <Link href="/deck" data-testid="player-no-brief-link" className="mt-3 inline-block font-semibold text-console-ink underline underline-offset-2">
               Open the deck →
             </Link>
           </div>
@@ -314,7 +314,7 @@ export default function PlayerPage() {
             reading surface: the full text below on this page (see the inner
             comment on the link for the anchor rationale). */}
         {loaded && narrationState === 'narration_unavailable' && (
-          <div data-testid="player-narration-unavailable" className="mt-6 rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft">
+          <div data-testid="player-narration-unavailable" className="mt-6 rounded-xl border border-console-edge bg-console-panel p-4 shadow-soft">
             <p className={titleClass}>Brief exists — audio unavailable.</p>
             <p className={`mt-1 ${subtle}`}>The narration isn&rsquo;t ready, but the brief itself is.</p>
             {/* Points DOWN THIS PAGE, not away — the brief text is rendered
@@ -326,7 +326,7 @@ export default function PlayerPage() {
                 the page for /brief; on an in-page jump it points the wrong way,
                 and an affordance that gestures away from where it lands is the
                 same small lie as the copy that used to say "/brief". */}
-            <a href="#brief-text" data-testid="player-narration-link" className="mt-3 inline-block font-semibold text-honeydew-700 underline underline-offset-2">
+            <a href="#brief-text" data-testid="player-narration-link" className="mt-3 inline-block font-semibold text-console-ink underline underline-offset-2">
               Full text below ↓
             </a>
           </div>
@@ -334,13 +334,13 @@ export default function PlayerPage() {
 
         {/* ILB: a brief with no speakable segments (empty narration) → nothing to play. */}
         {loaded && narrationState === null && slideCount === 0 && (
-          <div data-testid="player-empty" className="mt-6 rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft">
+          <div data-testid="player-empty" className="mt-6 rounded-xl border border-console-edge bg-console-panel p-4 shadow-soft">
             <p className={titleClass}>Nothing to play.</p>
             <p className={`mt-1 ${subtle}`}>Today&rsquo;s brief has nothing to narrate.</p>
             {/* Same in-page destination and same words as the
                 narration-unavailable link above: one affordance, two states
                 that reach it, so it should not read as two different offers. */}
-            <a href="#brief-text" data-testid="player-empty-link" className="mt-3 inline-block font-semibold text-honeydew-700 underline underline-offset-2">
+            <a href="#brief-text" data-testid="player-empty-link" className="mt-3 inline-block font-semibold text-console-ink underline underline-offset-2">
               Full text below ↓
             </a>
           </div>
@@ -350,7 +350,7 @@ export default function PlayerPage() {
           <section data-testid="player" className="mt-4">
             {/* Text-along / degraded-audio banner — honest, never a broken play button. */}
             {!hasAudio && (
-              <p data-testid="player-textalong" className={`mb-3 rounded-lg bg-honeydew-50 px-3 py-2 text-xs ${subtle}`}>
+              <p data-testid="player-textalong" className={`mb-3 rounded-lg bg-console-raise px-3 py-2 text-xs ${subtle}`}>
                 {audio?.kind === 'tts_not_configured'
                   ? 'Audio isn’t configured — read along below.'
                   : 'Audio is unavailable right now — read along below.'}
@@ -369,16 +369,16 @@ export default function PlayerPage() {
 
             {/* The current slide — its element deep-links to the real surface. */}
             {currentSlide && (
-              <div data-testid="player-slide" data-section={currentSlide.sectionId} className="rounded-2xl border border-honeydew-200 bg-cream p-5 shadow-card">
-                <p className="text-[10px] font-bold uppercase tracking-wider text-honeydew-500">
+              <div data-testid="player-slide" data-section={currentSlide.sectionId} className="rounded-2xl border border-console-edge bg-console-panel p-5 shadow-card">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-console-ink-faint">
                   Slide {position.slideIndex + 1} / {slideCount}
                 </p>
-                <h2 className="mt-1 text-lg font-extrabold leading-snug text-honeydew-700">{currentSlide.title}</h2>
-                <p className="mt-2 break-words text-sm text-honeydew-600">{currentSlide.text}</p>
+                <h2 className="mt-1 text-lg font-extrabold leading-snug text-console-ink">{currentSlide.title}</h2>
+                <p className="mt-2 break-words text-sm text-console-ink-dim">{currentSlide.text}</p>
                 <Link
                   href={slideDeepLink(currentSlide.sectionId)}
                   data-testid="player-slide-link"
-                  className="mt-3 inline-block text-xs font-semibold text-honeydew-600 underline underline-offset-2"
+                  className="mt-3 inline-block text-xs font-semibold text-console-ink-dim underline underline-offset-2"
                 >
                   Open →
                 </Link>
@@ -390,8 +390,8 @@ export default function PlayerPage() {
                 a text card → resume at the held instant. The keyboard stays live even when
                 STT fails (VoiceCapture shows its own honest "type it instead"). */}
             {state === 'asking' && (
-              <div data-testid="player-ask" className="mt-3 rounded-xl border border-honeydew-300 bg-honeydew-50 p-4">
-                <p className="text-sm font-semibold text-honeydew-700">
+              <div data-testid="player-ask" className="mt-3 rounded-xl border border-console-edge bg-console-raise p-4">
+                <p className="text-sm font-semibold text-console-ink">
                   Paused{currentSlide ? ` — ask about ${currentSlide.title}` : ' — ask a question'}.
                 </p>
 
@@ -403,7 +403,7 @@ export default function PlayerPage() {
                   value={question}
                   disabled={playerAsk.sending}
                   onChange={(e) => setQuestion(e.target.value)}
-                  className="mt-2 w-full rounded-lg border border-honeydew-300 bg-white px-3 py-2 text-sm text-honeydew-700 disabled:opacity-60"
+                  className="mt-2 w-full rounded-lg border border-console-edge bg-console-panel px-3 py-2 text-sm text-console-ink disabled:opacity-60"
                 />
                 <div className="mt-2 flex items-center gap-2">
                   <button
@@ -438,7 +438,7 @@ export default function PlayerPage() {
 
                 {/* The answer — a TEXT card in-player (answer-TTS is boarded, not built). */}
                 {playerAsk.answer != null && (
-                  <div data-testid="player-ask-answer" className="mt-3 rounded-lg border border-honeydew-200 bg-cream p-3 text-sm text-honeydew-700">
+                  <div data-testid="player-ask-answer" className="mt-3 rounded-lg border border-console-edge bg-console-panel p-3 text-sm text-console-ink">
                     {playerAsk.answer}
                   </div>
                 )}
@@ -447,7 +447,7 @@ export default function PlayerPage() {
                   type="button"
                   data-testid="player-resume"
                   onClick={onResume}
-                  className="mt-3 rounded-lg border border-honeydew-400 px-4 py-2 text-xs font-bold uppercase tracking-wider text-honeydew-700"
+                  className="mt-3 rounded-lg border border-console-edge-bright px-4 py-2 text-xs font-bold uppercase tracking-wider text-console-ink"
                 >
                   Resume
                 </button>

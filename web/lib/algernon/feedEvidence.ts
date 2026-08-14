@@ -6,9 +6,30 @@
 // precedent). This helper coerces arbitrary values to safe display strings; the
 // card renders the returned {label, value} rows as plain text.
 
+/** One entry of a LIST-valued evidence row, split for display. */
+export interface EvidenceListEntry {
+  /** The record name — a vault path's basename with its `.md` dropped — else the raw entry. */
+  name: string;
+  /** The path's leading directory (`'note/'`), or `''` when the entry carries none. */
+  prefix: string;
+}
+
+export interface EvidenceList {
+  /** The entries to draw, capped for display. */
+  entries: EvidenceListEntry[];
+  /** How many the value ACTUALLY held, so the card can say "+N more" instead of dropping silently. */
+  total: number;
+}
+
 export interface EvidenceRow {
   key: string;
   value: string;
+  /**
+   * Present when the raw value was an array of display strings — the card draws
+   * one entry per line instead of a JSON blob. Optional: a surface that ignores
+   * it renders `value` exactly as it always did.
+   */
+  list?: EvidenceList;
 }
 
 // Keys hidden from the key:value rows: internal plumbing, plus `body`/`truncated`
@@ -126,11 +147,56 @@ export function coerceEvidenceValue(value: unknown): string {
 
 const MAX_ROWS = 12;
 const MAX_VALUE_CHARS = 400;
+const MAX_LIST_ENTRIES = 8;
+const MAX_ENTRY_CHARS = 200;
+
+/**
+ * Split a list entry into the parts a card wants to draw at different weights.
+ *
+ * The entries this exists for are VAULT RECORD PATHS (`note/Some Record.md`), so
+ * the name is the part that identifies the record and the directory is provenance
+ * — the same split the deck's correction picker already draws (item text loud,
+ * `record` quiet). An entry that isn't a path degrades to `prefix: ''` and the
+ * whole string as the name: nothing is invented, and nothing is dropped.
+ */
+function splitListEntry(entry: string): EvidenceListEntry {
+  const trimmed = entry.trim().slice(0, MAX_ENTRY_CHARS);
+  const cut = trimmed.lastIndexOf('/');
+  const prefix = cut >= 0 ? trimmed.slice(0, cut + 1) : '';
+  let name = cut >= 0 ? trimmed.slice(cut + 1) : trimmed;
+  if (name.toLowerCase().endsWith('.md')) name = name.slice(0, -3);
+  // A trailing-slash entry ('note/') would otherwise render as a blank line —
+  // an entry that shows nothing is worse than one that shows its raw self.
+  if (!name) return { name: trimmed, prefix: '' };
+  return { name, prefix };
+}
+
+/**
+ * The LIST view of a raw evidence value, or null when the value isn't one.
+ *
+ * Strict on purpose: an array of non-empty strings and nothing else. A mixed or
+ * numeric array (`[1,2]`) keeps its JSON rendering, which is already legible at
+ * that size — the defect this addresses is a long array of long strings crammed
+ * into a narrow column, not the presence of brackets as such.
+ */
+export function evidenceList(value: unknown): EvidenceList | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  if (!value.every((e) => typeof e === 'string' && e.trim().length > 0)) return null;
+  return {
+    entries: (value as string[]).slice(0, MAX_LIST_ENTRIES).map(splitListEntry),
+    total: value.length,
+  };
+}
 
 /**
  * Flatten an evidence dict into bounded display rows (empty values + hidden
  * plumbing keys dropped). Order-stable (insertion order), capped so a pathological
  * payload can't blow up the card. Pure + DOM-free → unit-testable.
+ *
+ * `value` is ALWAYS populated, including for list-valued rows: it is the flat
+ * fallback every existing consumer (feed row, rings header, slot board) still
+ * renders. `list` is additive — a surface adopts it by reading it, and one that
+ * doesn't is unchanged.
  */
 export function evidenceRows(evidence: unknown): EvidenceRow[] {
   if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return [];
@@ -139,7 +205,8 @@ export function evidenceRows(evidence: unknown): EvidenceRow[] {
     if (HIDDEN_KEYS.has(key)) continue;
     const value = coerceEvidenceValue(raw).trim();
     if (!value) continue;
-    rows.push({ key, value: value.slice(0, MAX_VALUE_CHARS) });
+    const list = evidenceList(raw);
+    rows.push({ key, value: value.slice(0, MAX_VALUE_CHARS), ...(list ? { list } : {}) });
     if (rows.length >= MAX_ROWS) break;
   }
   return rows;

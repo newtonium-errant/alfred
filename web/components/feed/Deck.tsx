@@ -30,7 +30,46 @@ import {
   roleChipClass,
 } from '../../lib/algernon/consoleTokens';
 import { useDeck } from './useDeck';
-import { DeckCard, DECK_CARD_BASE_Z } from './DeckCard';
+import {
+  DeckCard,
+  DECK_CARD_BASE_Z,
+  DECK_CARD_DEPTH_OFFSET_PX,
+  DECK_CARD_SHADOW_REACH_PX,
+  DECK_MAX_VISIBLE_DEPTH,
+} from './DeckCard';
+
+// CLEARANCE BETWEEN THE STACK AND THE VERB BUTTONS.
+//
+// The cards are absolutely positioned inside the stack box, so the box says
+// nothing about where they END: every card behind the top one is translated DOWN
+// by DECK_CARD_DEPTH_OFFSET_PX per depth, and the deepest one therefore hangs
+// below the box entirely — onto the ✕ ↑ ⋯ ✓ row, which had only its own 4px of
+// padding between it and a card edge. That is the operator's report, and it is
+// not a tall-card bug: the card's height is `max-h-[380px]` and is identical
+// expanded and collapsed. Nothing reserved the space, so nothing was clear.
+//
+// TWO TERMS, not one, because the card has two footprints. The GEOMETRIC one is
+// the deepest card's translate. The VISUAL one is the drop shadow, which paints
+// over whatever is beneath it and reaches DECK_CARD_SHADOW_REACH_PX past the edge
+// it falls from — and that is the footprint the operator's photograph actually
+// shows lying across the buttons. A reserve counting only the geometry would have
+// fixed the measurement and kept the complaint, so both terms are in it.
+//
+// DERIVED, never typed. Every term reads the constant that produces it, so a
+// change to the depth offset or to the shadow moves this with it rather than
+// silently outgrowing it.
+const DECK_STACK_SPILL_PX = DECK_CARD_DEPTH_OFFSET_PX * DECK_MAX_VISIBLE_DEPTH;
+const DECK_STACK_GAP_PX = 8; // breathing room beyond BOTH footprints
+export const DECK_STACK_RESERVE_PX =
+  DECK_STACK_SPILL_PX + DECK_CARD_SHADOW_REACH_PX + DECK_STACK_GAP_PX;
+
+// The deck column's floor, which the PAGE owns (it renders the wrapper). 460px is
+// the authored minimum this column has always had; the reservation is ADDED to it
+// rather than taken out of it. That direction is the whole point — the wrapper is
+// a min-height, so leaving it at 460 would have funded the buttons' new gap out of
+// the card's own height, and the card would have shrunk by exactly the clearance
+// it gained. Exported so the page cannot re-type the number and get that wrong.
+export const DECK_COLUMN_MIN_PX = 460 + DECK_STACK_RESERVE_PX;
 
 // Overlays (the snoozed drill, the re-tier picker) must sit ABOVE the whole card stack —
 // the top card is at DECK_CARD_BASE_Z, so an overlay below it opens invisibly behind the
@@ -55,10 +94,18 @@ const OVERLAY_CHOICE_CLASS =
 // The gesture buttons stay ROUND on an otherwise square identity. That is not
 // an inconsistency: everything else on this surface is a panel bolted to a
 // hull, and these four are the only things meant to read as a thing you press.
-// Sizing is unchanged from the honeydew build — it was already a comfortable
-// thumb target on the phone posture, which is the posture that matters here.
+//
+// THE SIZE IS AN ARBITRARY VALUE BECAUSE `h-13` IS NOT A CLASS. Tailwind 3.4's
+// default spacing scale jumps 12 → 14 and this project extends no spacing, so
+// the `h-13 w-13` these carried compiled to NOTHING: the buttons were sized by
+// `p-3` plus a glyph — about 40px, under Apple's 44pt target and 12px short of
+// what the comment here claimed they were. The dead class is why the row read as
+// crowded in the operator's screenshot as much as the stack hanging over it did.
+// 52px is what `13` meant on the 4px scale, so this restores the authored intent
+// rather than picking a new size. `deckLayout.test.tsx` pins that every spacing
+// utility here resolves to something Tailwind actually emits.
 const DECK_BUTTON_CLASS =
-  'flex h-13 w-13 items-center justify-center rounded-full border-[1.5px] p-3 disabled:opacity-30';
+  'flex h-[52px] w-[52px] items-center justify-center rounded-full border-[1.5px] p-3 disabled:opacity-30';
 
 export interface DeckProps {
   items: FeedItem[];
@@ -395,7 +442,15 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
         )}
       </div>
 
-      <div className="relative min-h-[340px] flex-1">
+      <div
+        data-testid="deck-stack"
+        className="relative min-h-[340px] flex-1"
+        // Inline, not a Tailwind class, for the same reason OVERLAY_Z_INDEX is:
+        // the value is DERIVED from the card's depth transform, and a class would
+        // be a second place to type it. It is also then readable in jsdom, which
+        // has no layout engine but can see a declared reservation.
+        style={{ marginBottom: DECK_STACK_RESERVE_PX }}
+      >
         {stack.map(({ item, depth }) => (
           <DeckCard
             key={(item as { __deckKey?: string }).__deckKey ?? item.id}
