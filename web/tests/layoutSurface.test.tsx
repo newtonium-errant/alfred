@@ -151,23 +151,36 @@ describe('Layout surface identities', () => {
     expect(screen.queryByTestId('console-elbow')).toBeNull();
   });
 
-  // The feed's dark shell, operator-ruled 2026-08-12 by live verdict ("mixed
-  // aesthetics" — a warm shell framing a dark sensor panel). It arrives through
-  // the CHROME TABLE; the inertness pins in sensorLogShell.test.tsx separately
-  // hold that no content CSS leaked upward to do it.
-  it('gives the sensor-log surface the console HULL, via the chrome table', () => {
+  // Every surface that wears the console HULL, parametrized.
+  //
+  // WHY THIS IS A LOOP AND NOT ONE CASE. It was one case, for `sensor-log`,
+  // written when sensor-log was the only adopter. Three registers joined the
+  // family afterwards and the pin stayed scoped to the incumbent — so the shape
+  // it guards (a chrome entry that COPIES the literal instead of sharing
+  // `CONSOLE_CHROME` by reference) was pinned on one register and unpinned on
+  // three. The elbow is the tell: `isConsole` is an identity test against that
+  // object, so a copied literal looks identical in the table and silently loses
+  // the elbow and the rail spacer. A dark shell without the elbow renders a gap
+  // where the vertical rail should turn into the header.
+  //
+  // The general form, worth more than the fix: when a lane adds siblings to an
+  // existing family, the new guard gets written for the new members while the
+  // old guard stays scoped to the old. Neither is wrong on its own; the family
+  // is what goes uncovered.
+  const HULL_SURFACES = ['sensor-log', 'viewscreen', 'crt', 'comms'] as const;
+
+  it.each(HULL_SURFACES)('gives %s the console HULL, via the chrome table', (name) => {
     const { container } = render(
-      <Layout onSignOut={() => {}} surface="sensor-log">
+      <Layout onSignOut={() => {}} surface={name}>
         <p>content</p>
       </Layout>,
     );
-    const root = container.querySelector('[data-surface="sensor-log"]');
+    const root = container.querySelector(`[data-surface="${name}"]`);
     expect(root).not.toBeNull();
     expect(root?.className).toContain('bg-console-hull');
     expect(root?.className).not.toContain('bg-honeydew-50');
-    // The hull's structural extras come WITH the hull — the elbow is what turns
-    // the vertical rail into a horizontal header, so a dark shell without it
-    // renders a gap. This is the chrome-derived `isConsole`, not a name list.
+    // The hull's structural extras come WITH the hull — chrome-derived
+    // `isConsole`, not a name list.
     expect(screen.queryByTestId('console-elbow')).not.toBeNull();
     // Same affordances as everywhere else — adopting a skin never forks the tree.
     expect(screen.queryByTestId('nav-signout')).not.toBeNull();

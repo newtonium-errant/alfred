@@ -279,7 +279,13 @@ export default function FeedPage() {
         <Head>
           <title>Feed · {INSTANCE_NAME}</title>
         </Head>
-        <Layout showNav={false}>
+        {/* The surface prop belongs on BOTH branches. Without it here the feed
+            renders warm chrome for the length of the session probe and then
+            snaps to the console hull — a visible flash on every cold open, and
+            the pre-auth gate is the FIRST thing the operator sees. The authed
+            branch below had it from the start, which is exactly why the gap
+            survived: the surface was correct everywhere anyone looked. */}
+        <Layout showNav={false} surface={SENSOR_SURFACE}>
           <p data-testid="auth-gate" className={subtle}>
             Loading…
           </p>
