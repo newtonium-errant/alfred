@@ -195,6 +195,16 @@ BOOST_CITATION_CROSSWALK = 0.20
 #: Score at or above which a proposal reads as HIGH confidence.
 BAND_HIGH_AT = 0.85
 #: Score at or above which a proposal reads as MEDIUM confidence.
+#:
+#: **KNIFE EDGE — read before touching :data:`WEIGHT_BUCKET`.** This is equal
+#: to ``WEIGHT_BUCKET``, and the comparison in :func:`_band` is ``>=``. So the
+#: entire CANNOT-COMPARE population — proposals resting on client and date
+#: alone, which add nothing to the base — sits at exactly 0.55 and is MEDIUM
+#: by the boundary and nothing else. Lower ``WEIGHT_BUCKET`` by a hundredth,
+#: or add any penalty to that path, and every one of those proposals silently
+#: becomes LOW. That is collateral on a population nobody editing the
+#: disagreement weights is thinking about, so it is pinned in
+#: ``test_matcher.py`` rather than left to be rediscovered.
 BAND_MEDIUM_AT = 0.55
 
 BAND_HIGH = "high"

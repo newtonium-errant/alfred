@@ -40,6 +40,7 @@ from alfred.reconcile.matcher import (
     RATIO_TOLERANCE,
     TAX_LINE_STEP,
     WEIGHT_AMOUNT_OTHER_BASIS,
+    _band,
     recognise_basis,
     BAND_HIGH,
     BAND_LOW,
@@ -942,3 +943,100 @@ def test_two_exact_agreements_are_not_broken_by_a_recognised_basis() -> None:
         ),
     )
     assert [p.invoice_no for p in broken_tie.proposals] == ["INV-EXACT-A"]
+
+
+# --- gate-1 pre-registered criteria ------------------------------------------
+
+
+def test_the_cannot_compare_population_stays_medium() -> None:
+    """A KNIFE EDGE, pinned because nobody editing the disagree path is
+    looking at it.
+
+    A proposal resting on client and date alone adds nothing to the base, so
+    it scores exactly WEIGHT_BUCKET — which happens to EQUAL BAND_MEDIUM_AT,
+    and `_band` compares with `>=`. The whole cannot-compare population is
+    therefore MEDIUM by the boundary and nothing else. Drop WEIGHT_BUCKET by
+    a hundredth, or add any penalty to that path, and every one of them
+    silently becomes LOW — collateral from a change aimed somewhere else
+    entirely.
+
+    Pinned as a BAND, not as a number, so the pin survives a deliberate
+    re-tune that keeps the intent and fails a change that does not.
+    """
+    uncomparable = match_snapshot(
+        [_line(billed=None)],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    ).proposals[0]
+    assert uncomparable.amount_outcome == AMOUNT_UNCOMPARABLE
+    assert uncomparable.band == BAND_MEDIUM, (
+        "the cannot-compare population dropped out of MEDIUM. If that was "
+        "intended, say so here; if it was collateral from a weight change "
+        "aimed at the disagreement path, this is the pin catching it"
+    )
+
+    # The edge itself, stated so the next reader sees WHY this is fragile.
+    assert WEIGHT_BUCKET == BAND_MEDIUM_AT
+    assert _band(WEIGHT_BUCKET) == BAND_MEDIUM
+    assert _band(WEIGHT_BUCKET - 0.01) == BAND_LOW, (
+        "one hundredth below the base flips the whole population — that is "
+        "the margin this pin is protecting"
+    )
+
+
+def test_a_recognised_class_is_never_a_match_claim() -> None:
+    """Gate-explicit form of the ratified constraint: a recognised class must
+    be distinguishable from AGREEMENT in BOTH score and words.
+
+    x1.14 recognised is *a disagreement with an explanation*. It must never
+    present as a match — not at the agreement score, not in the HIGH band,
+    and not with a sentence a reader could mistake for one.
+    """
+    agree = match_snapshot(
+        [_line(billed="300.00")], _snapshot(_invoice("INV-1", amount="300.00"))
+    ).proposals[0]
+    basis = match_snapshot(
+        [_line(billed="342.00")], _snapshot(_invoice("INV-1", amount="300.00"))
+    ).proposals[0]
+
+    # Score: strictly between the disagree and agree paths, never equal to
+    # the agreement score, never HIGH.
+    assert -PENALTY_AMOUNT_DISAGREES < WEIGHT_AMOUNT_OTHER_BASIS
+    assert WEIGHT_AMOUNT_OTHER_BASIS < WEIGHT_AMOUNT_AGREES
+    assert basis.confidence < agree.confidence
+    assert basis.band == BAND_MEDIUM and agree.band == BAND_HIGH
+    assert basis.band != BAND_HIGH
+
+    # Words: the basis line names WHICH class, not merely that some basis
+    # applied — and it still carries the delta, because the figures did not
+    # match and the report must not imply they did.
+    sentence = " ".join(basis.basis)
+    assert "1.14" in sentence and "HST" in sentence
+    assert str(basis.amount_delta) in sentence
+    assert basis.basis_class == BASIS_INCL_TAX
+
+    # The two classes are distinguishable from EACH OTHER in words too.
+    tax_line = match_snapshot(
+        [_line(billed="42.00")], _snapshot(_invoice("INV-1", amount="300.00"))
+    ).proposals[0]
+    assert "tax-line" in " ".join(tax_line.basis)
+    assert " ".join(tax_line.basis) != sentence
+
+
+def test_the_unrecognised_outlier_lands_audibly() -> None:
+    """Not merely 'not recognised' — SAID. A ratio that matched no class
+    must announce that it matched none, or the operator cannot tell a
+    considered miss from a check that never ran."""
+    p = match_snapshot(
+        [_line(billed="234.78")],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    ).proposals[0]
+
+    assert p.amount_outcome == AMOUNT_DISAGREES
+    assert p.basis_class == ""
+    sentence = " ".join(p.basis)
+    assert "no recognised basis class" in sentence, (
+        "the miss must be audible — silence here is indistinguishable from a "
+        "recogniser that never ran"
+    )
+    assert "how the next class gets found" in sentence
+    assert str(p.amount_delta) in sentence
