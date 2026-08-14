@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONTACT_RULE_ORDER,
   CONTACT_SURFACES,
+  SURFACE_LABELS,
   SURFACE_PATHS,
   evaluateRoute,
   isContactSurface,
@@ -201,6 +202,29 @@ describe('the server owns the priority order', () => {
       unresolved_flagged_notifications: 1,
     }));
     expect(d?.rule).toBe('unresolved_notification');
+  });
+});
+
+describe('the labels are not the wire keys', () => {
+  it('every surface has a label', () => {
+    for (const s of CONTACT_SURFACES) {
+      expect(SURFACE_LABELS[s], s).toBeTruthy();
+    }
+  });
+
+  it('the brief surface READS as Player while its KEY stays brief', () => {
+    // The retirement moved the page, not the vocabulary. The key is
+    // parity-pinned against Python's SURFACES; the label is what the operator
+    // sees, and "Brief" now names a page that redirects.
+    expect(SURFACE_LABELS.brief).toBe('Player');
+    expect(CONTACT_SURFACES).toContain('brief');
+    expect(SURFACE_PATHS.brief).toBe('/player');
+  });
+
+  it('no label leaks into the key set — the pin that keeps them separable', () => {
+    // Vacuity control AND the real invariant: if someone "fixes" the label by
+    // renaming the key, this fails rather than silently breaking Python parity.
+    expect(Object.keys(SURFACE_PATHS).sort()).toEqual([...CONTACT_SURFACES].sort());
   });
 });
 

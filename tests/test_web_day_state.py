@@ -32,6 +32,7 @@ from alfred.web.contact_state import (
     RULE_RESUME_PENDING_CAPTURE,
     SURFACE_BRIEF,
     SURFACE_CHAT,
+    SURFACE_CHAT,
     WebContactStore,
 )
 from alfred.web.day_state import (
@@ -109,6 +110,7 @@ def _compute(**kw):
         notify_store=None,
         state_mgr=None,
         vault_path=None,
+        current_brief_date="",
         now=NOW,
     )
     base.update(kw)
@@ -284,30 +286,99 @@ class TestSessionAndContactInputs:
         assert state["time_since_last_session_hours"] is None
 
 
-class TestBriefReadDecay:
-    def _with_brief_at(self, tmp_path, when):
+class TestBriefReadToday:
+    """WHICH brief, then WHEN — and the first question used to be missing.
+
+    THE DEFECT THESE PINS REPLACE, stated because the old ones were confidently
+    wrong: `brief_read_today` was derived from contact recency alone. A
+    28-second glance at YESTERDAY'S brief is indistinguishable from a real read
+    of today's under that rule, so the operator's 04:48 look at the previous
+    day's artifact suppressed rule 3 for the one that landed at 06:00.
+
+    Worse than the miss: the old suite PINNED it. `test_a_recent_brief_read_
+    counts` asserted true for a contact with no artifact identity at all, and
+    `test_the_records_decay_lever_is_what_decides` carried a positive control I
+    wrote to prove the lever bites — which it did, while proving nothing about
+    whether the right brief had been read. A green positive control on the wrong
+    proposition is worse than no control, because it reads as diligence.
+    """
+
+    def _read_at(self, tmp_path, when, *, showing: str):
+        """A brief LANDING at ``when``, showing the artifact dated ``showing``."""
         store = WebContactStore.create(tmp_path / "c.json")
         store.record_contact(
-            "u1", rule=RULE_FIRST_CONTACT_AFTER_GAP, surface=SURFACE_BRIEF, now=when,
+            "u1",
+            rule=RULE_FIRST_CONTACT_AFTER_GAP,
+            surface=SURFACE_BRIEF,
+            brief_date=showing,
+            now=when,
         )
         return store
 
-    def test_a_recent_brief_read_counts(self, tmp_path):
-        store = self._with_brief_at(tmp_path, NOW - timedelta(hours=2))
-        assert _compute(contact_store=store)["brief_read_today"] is True
+    def test_reading_TODAYS_brief_counts(self, tmp_path):
+        store = self._read_at(tmp_path, NOW - timedelta(hours=2), showing="2026-08-13")
+        state = _compute(contact_store=store, current_brief_date="2026-08-13")
+        assert state["brief_read_today"] is True
 
-    def test_it_decays_after_the_lever(self, tmp_path):
-        store = self._with_brief_at(tmp_path, NOW - timedelta(hours=13))
-        # Default decay is 12h — 13h ago has lapsed.
-        assert _compute(contact_store=store)["brief_read_today"] is False
+    def test_reading_YESTERDAYS_brief_does_NOT_count(self, tmp_path):
+        """The operator's actual case: a glance at the previous day's artifact,
+        recent enough to pass every decay check, must not suppress today's."""
+        store = self._read_at(tmp_path, NOW - timedelta(hours=2), showing="2026-08-12")
+        state = _compute(contact_store=store, current_brief_date="2026-08-13")
+        assert state["brief_read_today"] is False
+        # And the payload says WHICH, so the answer is inspectable rather than a
+        # bare boolean nobody can check.
+        assert state["brief_read_date"] == "2026-08-12"
+        assert state["current_brief_date"] == "2026-08-13"
+
+    def test_it_still_decays_after_the_lever(self, tmp_path):
+        """WHEN is unchanged and still does its own job: a genuine morning read
+        stops suppressing the evening offer."""
+        store = self._read_at(tmp_path, NOW - timedelta(hours=13), showing="2026-08-13")
+        assert _compute(
+            contact_store=store, current_brief_date="2026-08-13"
+        )["brief_read_today"] is False
 
     def test_the_records_decay_lever_is_what_decides(self, tmp_path):
-        store = self._with_brief_at(tmp_path, NOW - timedelta(hours=6))
+        store = self._read_at(tmp_path, NOW - timedelta(hours=6), showing="2026-08-13")
         vault = _vault(tmp_path)  # brief_read_decay_hours: 4
-        assert _compute(contact_store=store, vault_path=vault)["brief_read_today"] is False
-        # Positive control: the same contact under the DEFAULT 12h decay reads true,
-        # so the assertion above is the lever biting rather than the store being empty.
-        assert _compute(contact_store=store)["brief_read_today"] is True
+        assert _compute(
+            contact_store=store, vault_path=vault, current_brief_date="2026-08-13"
+        )["brief_read_today"] is False
+        # Positive control, now on the RIGHT proposition: same contact, same
+        # artifact, default 12h decay reads true — so the assertion above is the
+        # lever biting and not the identity check silently failing.
+        assert _compute(
+            contact_store=store, current_brief_date="2026-08-13"
+        )["brief_read_today"] is True
+
+    def test_an_UNRECORDED_artifact_date_is_not_a_match(self, tmp_path):
+        """Contacts written before this field existed have no date. Absence must
+        read as not-read — the failure direction is offering the brief again,
+        never withholding it."""
+        store = self._read_at(tmp_path, NOW - timedelta(hours=1), showing="")
+        assert _compute(
+            contact_store=store, current_brief_date="2026-08-13"
+        )["brief_read_today"] is False
+
+    def test_NO_brief_spooled_is_not_a_match_either(self, tmp_path):
+        """Nothing current to have read. Two empty strings agreeing about
+        nothing is not identity."""
+        store = self._read_at(tmp_path, NOW - timedelta(hours=1), showing="")
+        assert _compute(contact_store=store, current_brief_date="")["brief_read_today"] is False
+
+    def test_an_OVERRIDDEN_brief_open_is_still_not_a_read(self, tmp_path):
+        """The `landed`-not-`surface` rule survives the rewrite: routed to the
+        brief, overridden away, never read — whatever the artifact date says."""
+        store = WebContactStore.create(tmp_path / "c.json")
+        e = store.record_contact(
+            "u1", rule=RULE_FIRST_CONTACT_AFTER_GAP, surface=SURFACE_BRIEF,
+            brief_date="2026-08-13", now=NOW - timedelta(hours=1),
+        )
+        store.record_override("u1", e["id"], surface=SURFACE_CHAT, now=NOW)
+        assert _compute(
+            contact_store=store, current_brief_date="2026-08-13"
+        )["brief_read_today"] is False
 
 
 # ---------------------------------------------------------------------------

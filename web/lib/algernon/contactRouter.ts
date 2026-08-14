@@ -58,6 +58,27 @@ export const SURFACE_PATHS: Record<ContactSurface, string> = {
   batch: '/batch',
 };
 
+/**
+ * What the operator READS for each surface. Labels only — never the wire key.
+ *
+ * `brief` is the one that matters and the reason this map exists: the surface
+ * NAME is wire vocabulary, parity-pinned against Python's `SURFACES`, so it
+ * cannot be renamed to follow the retirement. But `/brief` is gone and
+ * `SURFACE_PATHS.brief` opens the player, so a chip reading "Brief" now names a
+ * page that no longer exists and lands somewhere else. The label moves; the key
+ * stays. Pinned by contactRouter.test.ts in both directions.
+ */
+export const SURFACE_LABELS: Record<ContactSurface, string> = {
+  home: 'Home',
+  chat: 'Chat',
+  feed: 'Feed',
+  brief: 'Player',
+  deck: 'Deck',
+  player: 'Player',
+  ingest: 'Ingest',
+  batch: 'Scans',
+};
+
 export function isContactSurface(raw: unknown): raw is ContactSurface {
   return typeof raw === 'string' && (CONTACT_SURFACES as readonly string[]).includes(raw);
 }

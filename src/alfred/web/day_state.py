@@ -238,6 +238,7 @@ def compute_day_state(
     notify_store: Any,
     state_mgr: Any,
     vault_path: Path | str | None,
+    current_brief_date: str = "",
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Assemble the day-state payload the PWA evaluates the rule set against.
@@ -288,10 +289,38 @@ def compute_day_state(
         else None
     )
 
-    brief_ts = contact_store.last_brief_contact_ts(user_key) if contact_store else None
+    # BRIEF_READ_TODAY IS TWO QUESTIONS, AND THE FIRST ONE USED TO BE MISSING.
+    #
+    # The original derivation asked only "how long ago did they land on the
+    # brief", which a 28-second glance at YESTERDAY'S brief answers exactly like
+    # a real read of today's — so a 04:48 look at the previous day's artifact
+    # suppressed rule 3 for the one that landed at 06:00. Observed in the
+    # operator's own contact log; the lever was never wrong, it was the only
+    # question being asked.
+    #
+    # So: WHICH, then WHEN.
+    #   WHICH — identity, not arithmetic. The artifact date recorded on the
+    #     contact (read server-side when it happened) must equal the artifact
+    #     date current now. Comparing a timestamp against a date string would
+    #     need a local-midnight boundary this module has no business inventing,
+    #     and the operator's case sits exactly where that guess would decide.
+    #   WHEN — the decay lever, unchanged and still doing its own job: after
+    #     `brief_read_decay_hours` a genuine morning read stops suppressing the
+    #     evening offer.
+    #
+    # An unrecorded date (a contact predating this field, or an instance with no
+    # spool) is NOT a match. The failure direction is being offered the brief
+    # again, never having it silently withheld.
+    brief_ts, brief_read_date = (
+        contact_store.last_brief_read(user_key) if contact_store else (None, "")
+    )
     decay_hours = levers["brief_read_decay_hours"]
+    same_artifact = bool(
+        brief_read_date and current_brief_date and brief_read_date == current_brief_date
+    )
     brief_read_today = bool(
         brief_ts is not None
+        and same_artifact
         and (at - brief_ts).total_seconds() / 3600.0 < decay_hours
     )
 
@@ -309,6 +338,11 @@ def compute_day_state(
             round(hours_since, 4) if hours_since is not None else None
         ),
         "brief_read_today": brief_read_today,
+        # Served so the client (and a human reading the payload) can see WHICH
+        # artifact the answer is about. A bare boolean is what let the previous
+        # derivation be wrong without looking wrong.
+        "current_brief_date": current_brief_date,
+        "brief_read_date": brief_read_date,
         "unresolved_flagged_notifications": unresolved,
         "first_unresolved_notification_id": first_unresolved,
         "last_active_surface": last_surface,
@@ -336,6 +370,8 @@ def compute_day_state(
         configured=payload["configured"],
         unresolved=unresolved,
         brief_read_today=brief_read_today,
+        current_brief_date=current_brief_date or "(none)",
+        brief_read_date=brief_read_date or "(none)",
         hours_since_last_session=(
             round(hours_since, 2) if hours_since is not None else None
         ),
