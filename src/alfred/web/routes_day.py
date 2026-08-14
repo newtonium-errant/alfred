@@ -25,6 +25,29 @@ here, which surfaces they use):
    operator's day, nor write contacts into the operator's own log.
 4. **Read/write** — keyed to the identity's OWN ``synthetic_chat_id``.
 
+WHERE THE DAY STATE ACTUALLY COMES FROM — because two of its four inputs did
+not exist before this lane, and a reader who assumes otherwise will look for a
+source that isn't there:
+
+* ``unresolved_flagged_notifications`` — PRE-EXISTING, read from
+  :mod:`alfred.web.notify_state` (the #86 tray, dismissed entries excluded).
+* ``last_session_ended`` — PRE-EXISTING, read from
+  :mod:`alfred.telegram.state` (active ``last_message_at`` + closed
+  ``ended_at``), widened here to also count an app-open.
+* ``brief_read_today`` — **DERIVED FROM THIS SURFACE'S OWN CONTACT LOG.**
+  Nothing in the system recorded that the brief had been read; ``GET
+  /web/outbound/brief/latest`` still records nothing. It is computed from the
+  most recent contact whose LANDED surface was the brief, decayed by the
+  operator's own ``brief_read_decay_hours``.
+* ``last_active_surface`` — **DERIVED THE SAME WAY.** Nothing tracked which
+  surface the operator used either.
+
+So this endpoint is not a read-only aggregation of state that already existed;
+it is a reader of a log this surface also writes. That is not a workaround —
+the spec already required overrides to be logged with their triggering state,
+so the write path existed regardless, and these two fall out of it rather than
+needing two more stores.
+
 THE CLIENT NEVER SENDS STATE. ``POST /day/contact`` carries a rule id and a
 surface — nothing else. The triggering state stored alongside is recomputed HERE
 from the same sources ``GET /day/state`` reads. The spec requires overrides to be

@@ -48,7 +48,7 @@ from alfred.transport.config import (
 from alfred.transport.server import build_app
 from alfred.transport.state import TransportState
 from alfred.vault.scope import RRTS_INTAKE_ROLE
-from alfred.web.auth import SESSION_HEADER, make_session_token
+from alfred.web.auth import SESSION_HEADER, USER_HEADER, make_session_token
 from alfred.web.config import (
     WebAuthConfig,
     WebConfig,
@@ -77,6 +77,7 @@ from tests.telegram.conftest import (
 DUMMY_WEB_PEER_TOKEN = "DUMMY_WEB_PEER_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_0123456"
 DUMMY_WEB_INGEST_TOKEN = "DUMMY_WEB_INGEST_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234"
 DUMMY_WEB_FEED_TOKEN = "DUMMY_WEB_FEED_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_012345"
+DUMMY_RRTS_RELAY_TOKEN = "DUMMY_RRTS_RELAY_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234"
 DUMMY_WEB_SIGNING_SECRET = "DUMMY_WEB_SIGNING_SECRET_FOR_TESTING_ONLY_0123456789"
 
 _PEER_HEADERS = {
@@ -86,6 +87,16 @@ _PEER_HEADERS = {
 
 OPERATOR = "andrew"
 OPERATOR_KEY = str(synthetic_chat_id(OPERATOR))
+# A SECOND owner on the same instance. The chat ``web`` token is shared by every
+# web user, so the token alone cannot separate them — only the resolved identity
+# can, which is what the cross-identity tests below exercise.
+OTHER_OPERATOR = "morgan"
+OTHER_OPERATOR_KEY = str(synthetic_chat_id(OTHER_OPERATOR))
+
+_RELAY_PEER_HEADERS = {
+    "Authorization": f"Bearer {DUMMY_RRTS_RELAY_TOKEN}",
+    "X-Alfred-Client": "web",
+}
 
 
 def _session_headers(name: str = OPERATOR, role: str = "owner") -> dict[str, str]:
@@ -146,27 +157,58 @@ def _transport_config() -> TransportConfig:
                 "web_feed": AuthTokenEntry(
                     token=DUMMY_WEB_FEED_TOKEN, allowed_clients=["web"],
                 ),
+                # The vouched relay peer. Present so the OTHER arm of the
+                # handler's pin tuple is actually exercised — without a token
+                # for it, ``RRTS_RELAY_PEER`` could be deleted from the tuple
+                # and every test here would still pass.
+                "rrts_relay": AuthTokenEntry(
+                    token=DUMMY_RRTS_RELAY_TOKEN, allowed_clients=["web"],
+                ),
             }
         ),
         state=StateConfig(),
     )
 
 
-def _web_config(state_path: str, *, enabled: bool = True) -> WebConfig:
+def _web_config(
+    state_path: str,
+    *,
+    enabled: bool = True,
+    mode: str = "session",
+    users: "list[WebUser] | None" = None,
+) -> WebConfig:
+    """The web config under test.
+
+    ``mode="relay"`` (with no signing secret, like the production relay
+    posture) is what makes the VOUCHED ``rrts_relay`` identity actually
+    resolve — the surface the recipient-pin exists to refuse.
+    """
     return WebConfig(
         enabled=True,
-        users=[
+        users=users or [
             WebUser(name=OPERATOR, role="owner"),
             WebUser(name="reporter", role=RRTS_INTAKE_ROLE),
         ],
-        auth=WebAuthConfig(session_secret=DUMMY_WEB_SIGNING_SECRET),
+        auth=WebAuthConfig(
+            mode=mode,
+            session_secret=(
+                "" if mode == "relay" else DUMMY_WEB_SIGNING_SECRET
+            ),
+        ),
         contact_router=WebContactRouterConfig(
             enabled=enabled, state_path=state_path,
         ),
     )
 
 
-def _build(tmp_path: Path, *, state_path: str, enabled: bool = True):
+def _build(
+    tmp_path: Path,
+    *,
+    state_path: str,
+    enabled: bool = True,
+    mode: str = "session",
+    users: "list[WebUser] | None" = None,
+):
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
     state_mgr = StateManager(tmp_path / "talker_state.json")
@@ -175,7 +217,9 @@ def _build(tmp_path: Path, *, state_path: str, enabled: bool = True):
     web_auth_state.load()
     register_web_routes(
         app,
-        web_config=_web_config(state_path, enabled=enabled),
+        web_config=_web_config(
+            state_path, enabled=enabled, mode=mode, users=users,
+        ),
         web_auth_state=web_auth_state,
         anthropic_client=FakeAnthropicClient(
             [FakeResponse(content=[FakeBlock(type="text", text="hi")])]
@@ -204,6 +248,38 @@ async def client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
 async def unwired_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
     """Router enabled but NO state path anchored — the honest-inert posture."""
     return await aiohttp_client(_build(tmp_path, state_path=""))
+
+
+@pytest.fixture
+async def relay_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Relay-mode app, so the VOUCHED ``rrts_relay`` identity resolves.
+
+    Mirrors ``test_web_notify.py``'s ``relay_salem_client`` — the reference
+    spine this surface copies. Without relay mode the vouched identity never
+    resolves at all, and a 403 test would be passing for the wrong reason.
+    """
+    path = tmp_path / "contacts.json"
+    app = _build(tmp_path, state_path=str(path), mode="relay")
+    c = await aiohttp_client(app)
+    c._contact_path = path  # type: ignore[attr-defined]
+    return c
+
+
+@pytest.fixture
+async def two_user_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Two OWNERS on one instance — the cross-identity read surface."""
+    path = tmp_path / "contacts.json"
+    app = _build(
+        tmp_path,
+        state_path=str(path),
+        users=[
+            WebUser(name=OPERATOR, role="owner"),
+            WebUser(name=OTHER_OPERATOR, role="owner"),
+        ],
+    )
+    c = await aiohttp_client(app)
+    c._contact_path = path  # type: ignore[attr-defined]
+    return c
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +349,172 @@ class TestAuthSpine:
         store = WebContactStore.create(client._contact_path)
         store.load()
         assert store.contacts_for(OPERATOR_KEY) == []
+
+    async def test_the_peer_pin_runs_BEFORE_identity_resolution(self, client):
+        """Stage ordering, and it needs a request that the two orders answer
+        DIFFERENTLY.
+
+        Every other wrong-peer test here carries a VALID session, so it cannot
+        tell peer-pin-first from identity-first — both orders end in 401
+        ``wrong_peer``. A wrong peer with NO session separates them: pin-first
+        answers ``wrong_peer``, identity-first would answer ``invalid_session``
+        and would have resolved (and logged) an identity for a peer that was
+        never allowed to ask.
+        """
+        with structlog.testing.capture_logs() as captured:
+            resp = await client.get(
+                "/day/state",
+                headers={
+                    "Authorization": f"Bearer {DUMMY_WEB_FEED_TOKEN}",
+                    "X-Alfred-Client": "web",
+                },
+            )
+        assert resp.status == 401
+        assert (await resp.json())["error"] == "wrong_peer"
+        assert len(
+            [c for c in captured if c["event"] == "web.day.wrong_peer"]
+        ) == 1
+
+
+class TestTheVouchedRelayPeer:
+    """The OTHER arm of the pin tuple, and the escalation it exists to stop.
+
+    The handler admits ``WEB_CHAT_PEER`` **or** ``RRTS_RELAY_PEER`` because
+    ``resolve_web_identity`` admits both — so a vouched RRTS reporter clears
+    stage 1 BY DESIGN, and the pin that actually refuses them is the
+    recipient-pin, the one furthest from the door.
+
+    Driven through the composed app in relay mode, never against the helper:
+    a unit call to ``_resolve_day_identity`` would be a replica of the route's
+    composition rather than the route.
+    """
+
+    def _reporter(self) -> dict[str, str]:
+        return {**_RELAY_PEER_HEADERS, USER_HEADER: "Dana Dispatcher"}
+
+    async def test_the_relay_peer_CLEARS_the_peer_pin(self, relay_client):
+        """Stage 1 must pass, or the 403 below would prove nothing about the
+        recipient-pin — it would just be the peer-pin firing twice."""
+        with structlog.testing.capture_logs() as captured:
+            resp = await relay_client.get("/day/state", headers=self._reporter())
+        assert resp.status == 403  # refused LATER, not at the door
+        assert [c for c in captured if c["event"] == "web.day.wrong_peer"] == []
+
+    @pytest.mark.parametrize(
+        "method,path,body",
+        [
+            ("get", "/day/state", None),
+            ("post", "/day/contact", {"rule": RULE_DEFAULT, "surface": SURFACE_CHAT}),
+            ("post", "/day/override", {"contact_id": "x", "surface": SURFACE_CHAT}),
+        ],
+    )
+    async def test_the_reporter_is_refused_403_on_every_route(
+        self, relay_client, method, path, body
+    ):
+        with structlog.testing.capture_logs() as captured:
+            resp = await getattr(relay_client, method)(
+                path, headers=self._reporter(), json=body,
+            )
+        assert resp.status == 403
+        assert (await resp.json())["error"] == "forbidden"
+        # 403, deliberately not an empty 200: a misrouted reporter client must
+        # fail loud and diagnosably rather than be served a blank day.
+        assert len(
+            [c for c in captured if c["event"] == "web.day.reporter_refused"]
+        ) == 1
+
+    async def test_the_reporter_writes_nothing(self, relay_client):
+        await relay_client.post(
+            "/day/contact",
+            headers=self._reporter(),
+            json={"rule": RULE_DEFAULT, "surface": SURFACE_CHAT},
+        )
+        store = WebContactStore.create(relay_client._contact_path)
+        store.load()
+        assert store.contacts == {}
+
+    async def test_the_relay_mode_OWNER_still_reads(self, relay_client):
+        """The positive control: the 403 pins the ROLE, not relay mode.
+
+        Without this, refusing every relay request would score identically."""
+        resp = await relay_client.get(
+            "/day/state", headers={**_PEER_HEADERS, USER_HEADER: OPERATOR},
+        )
+        assert resp.status == 200
+        assert (await resp.json())["configured"] is True
+
+
+class TestOneIdentityCannotReadAnother:
+    """The chat ``web`` token is shared by every web user on the instance, so
+    possession of it must not be reach. Everything here is keyed to the
+    resolving identity's OWN ``synthetic_chat_id``."""
+
+    async def _contact_as(self, client, name: str, surface: str) -> str:
+        resp = await client.post(
+            "/day/contact",
+            headers=_session_headers(name),
+            json={"rule": RULE_DEFAULT, "surface": surface},
+        )
+        assert resp.status == 200
+        return (await resp.json())["contact_id"]
+
+    async def test_each_identity_writes_to_its_own_log(self, two_user_client):
+        await self._contact_as(two_user_client, OPERATOR, SURFACE_CHAT)
+        await self._contact_as(two_user_client, OTHER_OPERATOR, SURFACE_FEED)
+
+        store = WebContactStore.create(two_user_client._contact_path)
+        store.load()
+        assert [c["surface"] for c in store.contacts_for(OPERATOR_KEY)] == [
+            SURFACE_CHAT
+        ]
+        assert [c["surface"] for c in store.contacts_for(OTHER_OPERATOR_KEY)] == [
+            SURFACE_FEED
+        ]
+
+    async def test_one_identitys_day_does_not_leak_into_anothers(
+        self, two_user_client
+    ):
+        await self._contact_as(two_user_client, OPERATOR, SURFACE_BRIEF)
+
+        mine = await (await two_user_client.get(
+            "/day/state", headers=_session_headers(OPERATOR),
+        )).json()
+        theirs = await (await two_user_client.get(
+            "/day/state", headers=_session_headers(OTHER_OPERATOR),
+        )).json()
+
+        assert mine["last_active_surface"] == SURFACE_BRIEF
+        assert mine["brief_read_today"] is True
+        # The other operator has no history at all — not mine.
+        assert theirs["last_active_surface"] == ""
+        assert theirs["brief_read_today"] is False
+        assert theirs["last_session_ended"] is None
+
+    async def test_one_identity_cannot_override_anothers_contact(
+        self, two_user_client
+    ):
+        cid = await self._contact_as(two_user_client, OPERATOR, SURFACE_CHAT)
+
+        resp = await two_user_client.post(
+            "/day/override",
+            headers=_session_headers(OTHER_OPERATOR),
+            json={"contact_id": cid, "surface": SURFACE_FEED},
+        )
+        assert resp.status == 404
+        assert (await resp.json())["error"] == "unknown_contact"
+
+        # Untouched — and the positive control that the id was real all along:
+        # its own identity CAN override it.
+        store = WebContactStore.create(two_user_client._contact_path)
+        store.load()
+        assert store.contacts_for(OPERATOR_KEY)[0]["overridden"] is False
+
+        ok = await two_user_client.post(
+            "/day/override",
+            headers=_session_headers(OPERATOR),
+            json={"contact_id": cid, "surface": SURFACE_FEED},
+        )
+        assert ok.status == 200
 
 
 # ---------------------------------------------------------------------------
