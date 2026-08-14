@@ -85,14 +85,24 @@ export function narrationSlides(n: BriefNarration | null | undefined): PlayerSli
 
 // Where a slide's deep-link (tap the slide element) lands — the REAL surface for that
 // section, per the design. day_state (goal rings) → the feed; day_plan (slots) → the
-// deck (accept/complete); everything else (health/events/weather/sign_off) → the brief
-// page. Unknown sections default to the brief page (never a dead link).
+// deck (accept/complete).
+//
+// THE FALLBACK IS HOME, and it is a decision rather than a leftover. It used to be
+// `/brief`, which is retired; home is the canonical morning surface by C1's own
+// ratification ("one canonical morning surface, no new nav") and it renders the brief
+// markdown, so an unmapped section landing on the viewscreen is coherent navigation.
+// A real destination beats both alternatives — a dead link, and silently not rendering
+// the link at all.
+//
+// Pinned by player.test.ts. A future section that wants its OWN destination has to add
+// a row here consciously; inheriting home by accident is exactly what the pin stops.
+export const SECTION_DEEP_LINK_FALLBACK = '/';
 const SECTION_DEEP_LINK: Record<string, string> = {
   day_state: '/feed',
   day_plan: '/deck',
 };
 export function slideDeepLink(sectionId: string): string {
-  return SECTION_DEEP_LINK[sectionId] ?? '/brief';
+  return SECTION_DEEP_LINK[sectionId] ?? SECTION_DEEP_LINK_FALLBACK;
 }
 
 /**

@@ -223,9 +223,12 @@ function surfaceClasses(name: SurfaceIdentity): SurfaceClasses {
 // moved to /chat when the composer took the landing. Keeping this an array
 // preserves honeydew's nav structure so a new surface adds a link without
 // re-architecting the header.
+// `/brief` RETIRED (console-completion arc): the player replaces it and carries
+// what it rendered. Removed rather than left pointing at the redirect — a nav
+// entry that bounces is a nav entry that lies about where it goes. Its
+// re-introduction is pinned by tests/briefRetired.test.ts.
 const NAV_LINKS = [
   { href: '/chat', label: 'Chat' },
-  { href: '/brief', label: 'Brief' },
   { href: '/deck', label: 'Deck' },
   { href: '/feed', label: 'Feed' },
   { href: '/ingest', label: 'Ingest' },

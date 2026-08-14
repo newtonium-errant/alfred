@@ -93,7 +93,8 @@ describe('rule 3 — first contact after a gap', () => {
       brief_read_today: false,
     }));
     expect(d?.rule).toBe('first_contact_after_gap');
-    expect(d?.path).toBe('/brief');
+    // /brief is retired; the player replaces it and carries the brief text.
+    expect(d?.path).toBe('/player');
   });
 
   it('does not fire inside the gap', () => {

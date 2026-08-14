@@ -22,7 +22,6 @@ vi.mock('next/router', () => ({
 /** Every interactive affordance the shell owes a signed-in operator. */
 const NAV_AFFORDANCES = [
   'nav-chat',
-  'nav-brief',
   'nav-deck',
   'nav-feed',
   'nav-ingest',

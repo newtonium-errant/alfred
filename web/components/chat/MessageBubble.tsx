@@ -1,6 +1,7 @@
 import { FencedText } from '../markdown/FencedText';
 import { cn, formatMessageTime } from '../../lib/utils';
 import type { ChatRole } from '../../lib/algernon/types';
+import { COMMS_QUOTED_CLASS } from '../../lib/algernon/commsSurface';
 
 // One chat message. Text is rendered as escaped React children (never
 // dangerouslySetInnerHTML) — the untrusted-data discipline: model + vault text
@@ -34,11 +35,23 @@ export function MessageBubble({
         {/* #85: a ```csv block in a reply becomes downloadable. The pre-wrap
             moved from this container onto the text segments so a fence can
             render its own panel; unfenced messages emit the same single
-            pre-wrap block as before. */}
+            pre-wrap block as before.
+
+            THE QUOTATION (comms register): the assistant's turns — and ONLY
+            those — carry `.comms-quoted`, which renders them monospace-phosphor:
+            the ship's computer speaking. The operator's own turns stay in the
+            proportional face, because the operator is not the computer. This is
+            a quotation of the CRT register, the same move TimelineView makes on
+            sensor-log; the surface stays comms and exactly one region borrows
+            another register's voice. Pinned, boundary and all, by
+            commsQuotation.test.tsx. */}
         <FencedText
           text={text}
           nameHint={`message-${role}`}
-          className="whitespace-pre-wrap break-words"
+          className={cn(
+            'whitespace-pre-wrap break-words',
+            !isUser && COMMS_QUOTED_CLASS,
+          )}
         />
         {time && (
           <time

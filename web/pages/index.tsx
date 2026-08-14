@@ -238,7 +238,7 @@ export default function HomePage() {
         {mode === 'brief' && (
           <section data-testid="compose-brief" className="mt-6">
             <Link
-              href="/brief"
+              href="/player"
               data-testid="composer-brief-card"
               className="block rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft"
             >

@@ -1,197 +1,36 @@
-import { useCallback, useEffect, useState } from 'react';
-import Head from 'next/head';
-import Link from 'next/link';
-import { useRouter } from 'next/router';
-import { Layout } from '../components/Layout';
-import { BriefView } from '../components/brief/BriefView';
-import { authApi } from '../lib/algernon/authClient';
-import { ApiError, getJson } from '../lib/algernon/http';
-import { useSession } from '../lib/algernon/useSession';
-import { display, subtle } from '../lib/typography';
+import type { GetServerSideProps } from 'next';
 
-const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
+/**
+ * `/brief` is RETIRED — the player replaces it (console-completion arc,
+ * operator-ratified 2026-08-14).
+ *
+ * The route survives only as this redirect. Keeping the URL alive is the point:
+ * it is in the operator's muscle memory, it may sit in a bookmark or an old push
+ * payload, and a 404 would punish them for a decision they did not make.
+ *
+ * WHAT MOVED, AND WHY THE MOVE WAS NOT JUST A REDIRECT. This page was the only
+ * surface in the PWA that fetched `kind=daily_sync`, and the only full-text
+ * render of EITHER artifact — home fetches the brief but reads only its `date`
+ * to label a summary card, and never touches `markdown`. So retiring the page
+ * without moving what it rendered would have made both the Morning Brief and
+ * the Daily Sync unreachable. Both now render on `/player` below the narration,
+ * which is what "the player replaces it" has to mean: the player inherits what
+ * this page CARRIED, not merely its URL.
+ *
+ * `getServerSideProps` rather than a `next.config.js` rule — it is the only
+ * pure-redirect precedent in this tree (`pages/auth/callback.tsx`), and it keeps
+ * the decision in the file whose retirement it documents. `permanent: false`
+ * matches that precedent and leaves the ruling reversible without fighting a
+ * cached 308 in every browser that ever saw it.
+ *
+ * Re-introduction is pinned by `tests/briefRetired.test.ts`.
+ */
+export const getServerSideProps: GetServerSideProps = async () => ({
+  redirect: { destination: '/player', permanent: false },
+});
 
-type OutboundLatest = {
-  kind: string;
-  date: string | null;
-  markdown: string | null;
-};
-
-// The Brief surface (#30 READ-ON-OPEN): the morning brief + Daily Sync the
-// daemons already pushed to Telegram, readable in the PWA on open. Auth-gated
-// like the chat page (signed-out → /login?next=/brief). Both kinds are fetched
-// on mount; each section renders its own ILB empty state when nothing has been
-// spooled yet today (the backend's 200 {date:null} — never an error).
-export default function BriefPage() {
-  const router = useRouter();
-  const { user, loading: sessionLoading } = useSession();
-  const authed = !sessionLoading && user !== null;
-
-  const [brief, setBrief] = useState<OutboundLatest | null>(null);
-  const [dailySync, setDailySync] = useState<OutboundLatest | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [unauthenticated, setUnauthenticated] = useState(false);
-  // Signpost banner (client-side page element ONLY — never touches the brief
-  // record/markdown; Phase-A byte-parity is sacred). Starts hidden to avoid an
-  // SSR flash, then reveals on mount unless previously dismissed (localStorage).
-  const [showSignpost, setShowSignpost] = useState(false);
-
-  // Redirect signed-out visitors to login — either /api/auth/me said "no
-  // session" or a /api/brief call returned 401 invalid_session.
-  useEffect(() => {
-    if ((!sessionLoading && !user) || unauthenticated) {
-      router.replace(`/login?next=${encodeURIComponent('/brief')}`);
-    }
-  }, [sessionLoading, user, unauthenticated, router]);
-
-  useEffect(() => {
-    if (!authed) return;
-    let cancelled = false;
-    const fetchKind = async (kind: 'brief' | 'daily_sync') =>
-      getJson<OutboundLatest>(`/api/brief/latest?kind=${kind}`);
-    void (async () => {
-      try {
-        const [b, d] = await Promise.all([fetchKind('brief'), fetchKind('daily_sync')]);
-        if (cancelled) return;
-        setBrief(b);
-        setDailySync(d);
-      } catch (e) {
-        if (cancelled) return;
-        if (e instanceof ApiError && e.status === 401) {
-          setUnauthenticated(true);
-          return;
-        }
-        setError('Could not load the brief. Try refreshing.');
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [authed]);
-
-  const SIGNPOST_KEY = 'algernon_brief_signpost';
-  useEffect(() => {
-    try {
-      if (window.localStorage.getItem(SIGNPOST_KEY) !== 'dismissed') setShowSignpost(true);
-    } catch {
-      setShowSignpost(true); // storage blocked → still surface the informational note
-    }
-  }, []);
-  const dismissSignpost = useCallback(() => {
-    setShowSignpost(false);
-    try {
-      window.localStorage.setItem(SIGNPOST_KEY, 'dismissed');
-    } catch {
-      /* best-effort — the banner just reappears next load */
-    }
-  }, []);
-
-  const handleSignOut = useCallback(async () => {
-    try {
-      await authApi.logout();
-    } catch {
-      /* clearing is best-effort; redirect regardless */
-    }
-    router.replace('/login');
-  }, [router]);
-
-  // Pre-auth (resolving session, or about to redirect): an explicit loading
-  // signal, never a flash of content or a blank pane.
-  if (!authed) {
-    return (
-      <>
-        <Head>
-          <title>Brief · {INSTANCE_NAME}</title>
-        </Head>
-        <Layout showNav={false}>
-          <p data-testid="auth-gate" className={subtle}>
-            Loading…
-          </p>
-        </Layout>
-      </>
-    );
-  }
-
-  const loading = brief === null && dailySync === null && !error;
-
-  return (
-    <>
-      <Head>
-        <title>Brief · {INSTANCE_NAME}</title>
-      </Head>
-      <Layout onSignOut={() => void handleSignOut()}>
-        <h1 className={display}>Brief</h1>
-        <p className={`mt-1 ${subtle}`}>
-          Today&apos;s morning brief and Daily Sync from {INSTANCE_NAME}.
-        </p>
-
-        {showSignpost && (
-          <div
-            data-testid="brief-signpost"
-            className="mt-4 flex items-start justify-between gap-3 rounded-xl border border-honeydew-300 bg-honeydew-50 px-3 py-2 text-sm text-honeydew-700"
-          >
-            <span>
-              Reply verbs in the text (&ldquo;T1 confirm&rdquo;, …) work in Telegram. On the web,
-              decisions live in the{' '}
-              <Link href="/deck" className="underline underline-offset-2">
-                Deck
-              </Link>{' '}
-              and{' '}
-              <Link href="/feed" className="underline underline-offset-2">
-                Feed
-              </Link>
-              .
-            </span>
-            <button
-              type="button"
-              data-testid="brief-signpost-dismiss"
-              aria-label="Dismiss"
-              onClick={dismissSignpost}
-              className="shrink-0 text-honeydew-600 underline underline-offset-2"
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {error && (
-          <div
-            role="alert"
-            data-testid="brief-error"
-            className="mt-6 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
-          >
-            {error}
-          </div>
-        )}
-
-        {loading ? (
-          // Intentionally-left-blank: an explicit loading signal.
-          <p data-testid="brief-loading" className={`mt-6 ${subtle}`}>
-            Loading the brief…
-          </p>
-        ) : (
-          <div className="mt-6 flex flex-col gap-8">
-            {brief && (
-              <BriefView
-                testId="brief-view"
-                title="Morning Brief"
-                date={brief.date}
-                markdown={brief.markdown}
-                emptyMessage="No brief yet today — it lands ~06:00."
-              />
-            )}
-            {dailySync && (
-              <BriefView
-                testId="daily-sync-view"
-                title="Daily Sync"
-                date={dailySync.date}
-                markdown={dailySync.markdown}
-                emptyMessage="No Daily Sync yet today — it lands ~09:00."
-              />
-            )}
-          </div>
-        )}
-      </Layout>
-    </>
-  );
+// Never rendered — `getServerSideProps` redirects on every request. Next still
+// requires a default export for the route to exist at all.
+export default function BriefRetired() {
+  return null;
 }

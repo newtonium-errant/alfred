@@ -47,7 +47,11 @@ export const SURFACE_PATHS: Record<ContactSurface, string> = {
   home: '/',
   chat: '/chat',
   feed: '/feed',
-  brief: '/brief',
+  // The brief SURFACE now opens the player: /brief is retired and the player
+  // replaces it, carrying the narration AND the brief text. The surface NAME
+  // stays 'brief' — it is wire vocabulary, parity-pinned against Python's
+  // SURFACES, and the parity test compares map KEYS. Only the route moved.
+  brief: '/player',
   deck: '/deck',
   player: '/player',
   ingest: '/ingest',
