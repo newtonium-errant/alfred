@@ -68,9 +68,15 @@ export function EmptyState({
     >
       {icon != null && (
         // The soft honeydew circle — the mascot's future home. ~44px.
+        //
+        // REGISTER SEAM, and the marker sits HERE rather than on the root because
+        // the disc is the only element that renders as a block — the root has no
+        // background of its own. EmptyState is the lane's other STRADDLER: six
+        // dark routes and warm /share, so the warm class stays the unmarked
+        // default and `ui-panel` is what a register reaches.
         <span
           aria-hidden="true"
-          className="flex h-11 w-11 items-center justify-center rounded-full bg-honeydew-100 text-2xl"
+          className="ui-panel flex h-11 w-11 items-center justify-center rounded-full bg-honeydew-100 text-2xl"
         >
           {icon}
         </span>

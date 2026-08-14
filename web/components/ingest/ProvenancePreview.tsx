@@ -44,6 +44,12 @@ export function ProvenancePreview({
     <div
       data-testid="ingest-provenance"
       className={cn(
+        // REGISTER SEAM. This panel is a STRADDLER: /ingest is crt-registered and
+        // /share is warm (it takes no surface prop and renders IngestForm), so the
+        // warm classes below stay as the unmarked default and `ui-panel` is what
+        // lets a register reach in. Converting these to console tokens instead
+        // would have fixed /ingest and put a dark panel on a warm page.
+        'ui-panel',
         'rounded-xl border border-honeydew-300 bg-honeydew-100 px-3 py-3',
         className,
       )}

@@ -1,6 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { render } from '@testing-library/react';
+import { ProvenancePreview } from '../components/ingest/ProvenancePreview';
+import { EmptyState } from '../components/EmptyState';
 
 // HOME'S SLOT CARDS JOIN THE VIEWSCREEN REGISTER — the operator's "this main
 // view still has white blocks".
@@ -167,5 +170,144 @@ describe('single-route panels adopt their register', () => {
     expect(share).toContain('<Layout showNav={false}>');
     expect(share).toContain('<IngestForm');
     expect(share).not.toContain('surface=');
+  });
+});
+
+// ── THE `ui-panel` SEAM ─────────────────────────────────────────────────────
+//
+// The STRADDLERS. `ProvenancePreview` renders on /ingest (crt) and on /share
+// (warm — `<Layout showNav={false}>`, no surface prop); `EmptyState` renders on
+// six dark routes and on /share. Neither can be fixed by rewriting classes: that
+// fixes the dark route and ships a dark panel onto the warm one. So the warm
+// chrome stays the UNMARKED DEFAULT and the registers reach in through an opt-in
+// marker, exactly as they already do for `ui-field` and `ui-btn`.
+//
+// PARAMETRIZED OVER THE REGISTERS A MARKED PANEL CAN ACTUALLY REACH, and
+// `sensor-log` is deliberately NOT one of them — with its own pin below saying
+// so, so the omission is a recorded decision rather than a hole.
+//
+// That started as the opposite. The family-hole lesson says a guard written for
+// the members that prompted it leaves a gap, so the first cut put `.ui-panel`
+// into all four stylesheets — and `sensorLogSkin.test.tsx` immediately went red
+// with twelve orphaned selectors. It was right: no marked panel renders on
+// /feed, so those rules matched nothing. Dead CSS is dead CSS whether it comes
+// from carelessness or from over-generalising, and the fix was to delete the
+// rules rather than to widen the pin that caught them. Completeness is measured
+// against what is REACHABLE, not against the list of registers.
+
+const PANEL_REGISTERS = [
+  { surface: 'viewscreen', prefix: 'viewscreen', file: 'viewscreen.css' },
+  { surface: 'crt', prefix: 'crt', file: 'crt.css' },
+  { surface: 'comms', prefix: 'comms', file: 'comms.css' },
+] as const;
+
+const MARKED_PANELS = [
+  ['components/ingest/ProvenancePreview.tsx', 'ui-panel'],
+  ['components/EmptyState.tsx', 'ui-panel'],
+] as const;
+
+function css(file: string): string {
+  return readFileSync(join(ROOT, 'styles', file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
+describe.each(PANEL_REGISTERS)('$surface reaches adopted panels', ({ surface, prefix, file }) => {
+  const sheet = css(file);
+
+  it('declares a .ui-panel rule under its own attribute', () => {
+    expect(sheet).toContain(`[data-surface='${surface}'] .ui-panel`);
+    // Scoped, never bare: an unscoped `.ui-panel` would repaint the marker on
+    // every surface including the warm ones, which is the defect the seam exists
+    // to avoid rather than a shortcut to it.
+    const bare = sheet.split('\n').filter((l) => /^\s*\.ui-panel\b/.test(l));
+    expect(bare).toEqual([]);
+  });
+
+  it('spends only its OWN tokens, and never a role', () => {
+    const block = sheet
+      .split('}')
+      .filter((c) => c.includes(`[data-surface='${surface}'] .ui-panel`))
+      .join('}');
+    const vars = [...block.matchAll(/var\(--([a-z-]+)\)/g)].map((m) => m[1]);
+    expect(vars.length).toBeGreaterThan(0); // positive control: there ARE declarations
+    for (const v of vars) {
+      expect(v.startsWith(`${prefix}-`)).toBe(true);
+      // A register restyles chrome, never a verdict — the same guarantee ui-btn
+      // has. `panel`/`edge`/`ink` only; no affirm/negative/caution/info.
+      expect(/-(affirm|negative|caution|info)/.test(v)).toBe(false);
+    }
+  });
+
+  it('has a marked panel to reach — the vacuity control', () => {
+    // RENDERED, not grepped. This pin's first form was `src(file).toContain
+    // ('ui-panel')`, and removing the marker from ProvenancePreview did not red
+    // it — because the COMMENT above the marker says the word "ui-panel" too.
+    // It was measuring a string in a file rather than a class on an element: the
+    // guard-checks-a-proxy failure, caught by mutating the thing it claimed to
+    // protect. The DOM cannot be fooled by prose.
+    const { container: panel } = render(
+      <ProvenancePreview
+        target={undefined}
+        recordType="document"
+        title=""
+        source=""
+        ingestedBy="andrew"
+        originInstance="Salem"
+      />,
+    );
+    expect(panel.querySelector('.ui-panel')).not.toBeNull();
+
+    const { container: empty } = render(<EmptyState icon="💬" message="nothing here" />);
+    expect(empty.querySelector('.ui-panel')).not.toBeNull();
+  });
+});
+
+describe('/share stays warm — the regression the seam exists to prevent', () => {
+  it('renders a straddler whose warm chrome is intact and unreachable by any register', () => {
+    // /share takes NO surface prop, so no `[data-surface='…'] .ui-panel` rule can
+    // match anything on it. That is what makes the marker safe: adopting cost
+    // /share nothing.
+    const share = src('pages/share.tsx');
+    expect(share).toContain('<IngestForm');
+    expect(share).not.toContain('surface=');
+
+    // The warm chrome is STILL THERE on the straddler — it is the unmarked
+    // default, not a leftover. If a later hand converted it to console tokens
+    // this reds, which is the exact regression the finding predicted.
+    const panel = src('components/ingest/ProvenancePreview.tsx');
+    expect(panel).toContain('bg-honeydew-100');
+    expect(panel).toContain('border-honeydew-300');
+    expect(panel).toContain('ui-panel');
+    // Same for the other straddler's disc.
+    expect(src('components/EmptyState.tsx')).toContain('ui-panel flex h-11 w-11');
+    expect(src('components/EmptyState.tsx')).toContain('bg-honeydew-100');
+  });
+
+  it('the straddlers are NOT in the token-adopted set — the two treatments stay apart', () => {
+    // A straddler that also got the token treatment would be dark on /share. The
+    // two lists must never intersect.
+    for (const [rel] of MARKED_PANELS) {
+      expect(ADOPTED as readonly string[]).not.toContain(rel);
+    }
+  });
+});
+
+describe('sensor-log deliberately has no panel rules', () => {
+  it('declares none, because no marked panel is reachable from /feed', () => {
+    // The REASON is the assertion. Stating "sensor-log has no ui-panel rule"
+    // alone would be satisfied by an oversight; pairing it with the reachability
+    // fact makes it a decision that reds if either half changes — if a marked
+    // panel ever lands on the feed, the second expectation fails and the missing
+    // rule becomes visible instead of staying quietly absent.
+    expect(css('sensorLog.css')).not.toContain('.ui-panel');
+
+    const feedSurfaces = [src('pages/feed.tsx'), src('components/feed/FeedRow.tsx')].join('\n');
+    for (const [rel] of MARKED_PANELS) {
+      const component = rel.split('/').pop()!.replace('.tsx', '');
+      expect(feedSurfaces).not.toContain(`<${component}`);
+    }
+    // POSITIVE CONTROL: the marked panels exist and are reachable SOMEWHERE, so
+    // "not on the feed" is a fact about the feed rather than about a marker
+    // nobody applied.
+    expect(src('components/ingest/IngestForm.tsx')).toContain('<ProvenancePreview');
   });
 });

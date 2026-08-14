@@ -119,3 +119,40 @@
   border-color: var(--crt-edge);
   color: var(--crt-phosphor);
 }
+
+/* --- ADOPTED PANELS (the `ui-panel` marker) --------------------------------
+ *
+ * The THIRD element class to reach a register through an opt-in marker, after
+ * `ui-field` and `ui-btn` — and it exists for a reason this lane proved rather
+ * than assumed. Some panels render on a WARM route AND a dark one:
+ * `pages/share.tsx` takes no surface prop and renders `IngestForm`, so
+ * rewriting `ProvenancePreview`'s classes to console tokens would have fixed
+ * /ingest and shipped a dark panel onto a warm page. The marker leaves the warm
+ * chrome as the UNMARKED DEFAULT — /share renders byte-identically — and lets a
+ * register reach in only under its own attribute.
+ *
+ * The ink rules name honeydew CHROME utilities and never a role class, so a
+ * verdict inside an adopted panel is out of reach by construction — the same
+ * guarantee `.ui-btn` has, for the same reason, checked by the same pin.
+ */
+[data-surface='crt'] .ui-panel {
+  background-color: var(--crt-panel);
+  border-color: var(--crt-edge);
+}
+
+[data-surface='crt'] .ui-panel .text-honeydew-900,
+[data-surface='crt'] .ui-panel .text-honeydew-800,
+[data-surface='crt'] .ui-panel .text-honeydew-700 {
+  color: var(--crt-ink);
+}
+
+[data-surface='crt'] .ui-panel .text-honeydew-600,
+[data-surface='crt'] .ui-panel .text-honeydew-500 {
+  color: var(--crt-ink-dim);
+}
+
+[data-surface='crt'] .ui-panel .border-honeydew-200,
+[data-surface='crt'] .ui-panel .border-honeydew-300,
+[data-surface='crt'] .ui-panel .border-honeydew-400 {
+  border-color: var(--crt-edge);
+}
