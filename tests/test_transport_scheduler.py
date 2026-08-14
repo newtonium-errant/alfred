@@ -35,6 +35,8 @@ from alfred.transport.scheduler import (
     clear_remind_at_and_stamp,
     find_due_reminders,
     format_reminder,
+    render_return_line,
+    resolve_return_slot,
     _tick,
 )
 from alfred.transport.state import TransportState
@@ -1072,3 +1074,179 @@ async def test_tick_fired_log_carries_return_kind_and_chase_text(
 
     assert len(sent) == 1
     assert sent[0]["text"] == "Chase Carfax: Fix Carfax mileage"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c+h — slot resolution + slot-write at fire time
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_return_slot_uses_return_slot() -> None:
+    slot, rule = resolve_return_slot(_entry(return_slot="duty"), NOW)
+    assert (slot, rule) == ("duty", "return_slot")
+
+
+def test_resolve_return_slot_applies_operator_routine_alias() -> None:
+    """The two live records say ``routine``; the deck speaks ``rhythm``."""
+    slot, rule = resolve_return_slot(_entry(return_slot="routine"), NOW)
+    assert (slot, rule) == ("rhythm", "return_slot")
+
+
+def test_resolve_return_slot_escalates_once_escalate_on_has_passed() -> None:
+    """Escalation is generic — any record with the two fields, not
+    septic-special."""
+    entry = _entry(return_slot="routine")
+    entry.escalate_on = "2020-01-01"
+    entry.escalate_to = "duty"
+    slot, rule = resolve_return_slot(entry, NOW)
+    assert (slot, rule) == ("duty", "escalated")
+
+
+def test_resolve_return_slot_does_not_escalate_before_the_date() -> None:
+    """Positive control for the escalation pin: the same record before
+    its date keeps its ordinary slot, so the pin proves the DATE is what
+    fires rather than the mere presence of the fields."""
+    entry = _entry(return_slot="routine")
+    entry.escalate_on = "2099-01-01"
+    entry.escalate_to = "duty"
+    slot, rule = resolve_return_slot(entry, NOW)
+    assert (slot, rule) == ("rhythm", "return_slot")
+
+
+def test_resolve_return_slot_malformed_escalate_on_does_not_escalate() -> None:
+    """Escalation moves work INTO Duty, so an unparseable date must not
+    be able to trigger it. Fail toward the calmer answer."""
+    entry = _entry(return_slot="routine")
+    entry.escalate_on = "not-a-date"
+    entry.escalate_to = "duty"
+    slot, rule = resolve_return_slot(entry, NOW)
+    assert (slot, rule) == ("rhythm", "return_slot")
+
+
+def test_resolve_return_slot_none_for_waiting_item() -> None:
+    """A chase has no ruled slot — and must not borrow one."""
+    slot, rule = resolve_return_slot(_entry(waiting_on="Carfax"), NOW)
+    assert (slot, rule) == (None, "none")
+
+
+def test_resolve_return_slot_reports_unrecognized_separately_from_absent() -> None:
+    """``none`` and ``unrecognized`` are different failures: one is a
+    record that never asked for a slot, the other is a ruling that did
+    not land."""
+    slot, rule = resolve_return_slot(_entry(return_slot="wobble"), NOW)
+    assert (slot, rule) == (None, "unrecognized")
+
+
+async def test_tick_writes_ruled_slot_onto_returning_snooze(
+    tmp_task_vault: Path,
+) -> None:
+    """End-to-end delivery: the record comes back carrying its slot, so
+    the deck's rule-1 classifier deals it where the operator ruled."""
+    import frontmatter
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    path = _write_task(
+        task_dir, "Pay MBF", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+        extra='return_slot: "duty"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    fm = frontmatter.load(str(path)).metadata
+    assert fm["slot"] == "duty"
+    # Written on the SAME round-trip that disarms the reminder.
+    assert "remind_at" not in fm
+    assert fm.get("reminded_at")
+    assert fm["return_slot"] == "duty"  # the ruling itself is preserved
+
+
+async def test_tick_writes_rhythm_for_operator_routine_wording(
+    tmp_task_vault: Path,
+) -> None:
+    """The real TheJamieClinic/Septic shape, end to end."""
+    import frontmatter
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    path = _write_task(
+        task_dir, "Setup TheJamieClinic Email", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+        extra='return_slot: "routine"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    assert frontmatter.load(str(path)).metadata["slot"] == "rhythm"
+
+
+async def test_tick_does_not_write_slot_for_waiting_item(
+    tmp_task_vault: Path,
+) -> None:
+    """Negative control — a chase gets no slot invented for it."""
+    import frontmatter
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    path = _write_task(
+        task_dir, "Fix Carfax mileage", status="todo",
+        remind_at=(real_now - timedelta(seconds=30)).isoformat(),
+        extra='waiting_on: "Carfax"',
+    )
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    fm = frontmatter.load(str(path)).metadata
+    assert "slot" not in fm
+    assert "remind_at" not in fm  # still disarmed
+
+
+async def test_tick_logs_slot_write_and_non_application(
+    tmp_task_vault: Path,
+) -> None:
+    """Both outcomes are observable: a slot that landed, and a ruling
+    that did not."""
+    import structlog
+
+    task_dir = tmp_task_vault / "task"
+    real_now = datetime.now(timezone.utc)
+    fresh = (real_now - timedelta(seconds=30)).isoformat()
+    _write_task(task_dir, "Good slot", remind_at=fresh,
+                extra='return_slot: "duty"')
+    _write_task(task_dir, "Typo slot", remind_at=fresh,
+                extra='return_slot: "duti"')
+
+    config, state, sent, send = _tick_env(tmp_task_vault)
+    with structlog.testing.capture_logs() as captured:
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+    written = _events(captured, "transport.scheduler.return_slot_written")
+    assert len(written) == 1
+    assert written[0]["slot"] == "duty"
+    assert written[0]["rule"] == "return_slot"
+
+    lost = _events(captured, "transport.scheduler.return_slot_not_applied")
+    assert len(lost) == 1
+    assert lost[0]["return_slot"] == "duti"
+
+    assert len(sent) == 2  # both still fired
+
+
+def test_format_reminder_delegates_to_the_shared_renderer() -> None:
+    """One wording, every surface.
+
+    The Telegram wrapper must not drift from the renderer the deck
+    reader will call — two surfaces wording the same return differently
+    is a bug that only appears in front of the operator.
+    """
+    for entry in (
+        _entry(waiting_on="Carfax", title="Fix mileage"),
+        _entry(return_slot="duty", title="Pay MBF", due="2026-08-21"),
+        _entry(title="Plain one"),
+        _entry(reminder_text="Verbatim", title="Ignored"),
+    ):
+        assert format_reminder(entry) == render_return_line(entry)

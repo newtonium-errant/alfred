@@ -1273,6 +1273,51 @@ REMINDER_FIELDS: tuple[str, ...] = (
     "reminder_text",
 )
 
+# Optional frontmatter fields on ``task`` records that describe HOW a
+# reminder returns, as distinct from WHEN (``REMINDER_FIELDS`` above).
+# Written by the 2026-08-14 operator routing pass and read by
+# ``alfred.transport.scheduler`` from Phase 2c+h onward:
+#
+#   - ``return_slot``  — which day-plan slot a snoozed task returns
+#     into. Operator vocabulary; ``rhythm`` is canonical and
+#     ``routine`` is accepted as an alias (see
+#     ``alfred.tier.slots.normalize_slot``). Its PRESENCE is also the
+#     snooze-vs-waiting discriminator — never ``remind_at``, which
+#     every reminder carries.
+#   - ``waiting_on``   — who the task is blocked on. Presence marks a
+#     waiting-chase rather than a snooze return, and supplies the name
+#     the chase framing addresses.
+#   - ``escalate_to``  — slot to use INSTEAD of ``return_slot`` once
+#     ``escalate_on`` has passed.
+#   - ``escalate_on``  — date after which the escalation applies.
+#   - ``recurrence``   — cycle a completed task should propose next
+#     (e.g. ``3y``). Read by Phase 2d, not by any code today.
+#   - ``propose_on_completion`` — bool; on close, propose the next
+#     occurrence for operator approval rather than auto-creating it.
+#
+# All optional, all opt-in per task, none required.
+#
+# NOTE ON WHAT THIS TUPLE DOES. It is DOCUMENTATION of the contract,
+# not enforcement — same as ``REMINDER_FIELDS``, which has no code
+# consumer either. Nothing in this repo filters vault frontmatter
+# against an allowlist: every writer round-trips through
+# ``frontmatter.load`` -> mutate -> ``frontmatter.dumps``, so unknown
+# keys survive by construction. Listing these fields here therefore
+# does NOT protect them from being dropped by the surveyor/distiller
+# enrichment passes; they were never at risk of that. What it does is
+# tell the next reader that these six keys are a deliberate contract
+# with a live consumer rather than stray operator hand-edits — which
+# is the thing that actually gets them deleted by a well-meaning
+# cleanup.
+RETURN_FIELDS: tuple[str, ...] = (
+    "return_slot",
+    "waiting_on",
+    "escalate_to",
+    "escalate_on",
+    "recurrence",
+    "propose_on_completion",
+)
+
 # Optional frontmatter fields on ``event`` records that interact with
 # the Google Calendar sync layer. Per ``project_inter_instance_communication``
 # (Phase A+) GCal events are a projection of vault records — these

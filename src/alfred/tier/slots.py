@@ -127,20 +127,65 @@ RULE_DATED_TASK = "dated_task"
 RULE_NONE = "no_signal"
 
 
+#: Operator-vocabulary aliases for canonical slot keys.
+#:
+#: The operator says "routine" for what this module calls Rhythm, and it is
+#: very likely the app taught him the word: the home view renders T3 items as
+#: "RHYTHM — auto-cadence-routine" every morning. His 2026-08-14 routing
+#: rulings used it as a slot name directly ("surface as ROUTINE slot; ESCALATE
+#: to DUTY"), pairing it with a real slot, and the Phase-1 pass wrote
+#: ``return_slot: routine`` onto two live records.
+#:
+#: The mapping lives HERE, at the read boundary, rather than being normalised
+#: away in the vault: the operator will keep saying "routine", and the talker
+#: will keep writing what he says. One named mapping is the cheap place for the
+#: impedance mismatch; rewriting records would have to be redone every time a
+#: new snooze is spoken.
+SLOT_ALIASES: dict[str, str] = {
+    "routine": SLOT_RHYTHM,
+}
+
+
 def normalize_slot(raw: Any) -> str | None:
     """Coerce an operator-written ``slot:`` value to a canonical key, or None.
 
     Case- and whitespace-insensitive, because this reads hand-edited
-    frontmatter. Returns ``None`` for anything unrecognised — including
+    frontmatter. Accepts :data:`SLOT_ALIASES` as operator vocabulary for a
+    canonical key. Returns ``None`` for anything unrecognised — including
     ``"unslotted"`` itself, which is the classifier's answer to give, never the
     operator's to write. An unrecognised value falls through to the next rule
     rather than becoming a slot, so a typo degrades to a lower-precedence
     (still honest) answer instead of inventing a fourth category.
+
+    **An unrecognised non-empty value is LOGGED, not silently dropped.**
+    Falling through is the right behaviour but it is indistinguishable, from
+    the outside, from a value that was never written — and this function now
+    sits on the path that decides where a returning snooze lands. A typo in
+    ``return_slot`` would otherwise present as "the operator's ruling quietly
+    did nothing". Absent and blank values are NOT logged: they mean "not set",
+    which is ordinary.
     """
     if not isinstance(raw, str):
         return None
     value = raw.strip().lower()
-    return value if value in CANONICAL_SLOTS else None
+    if value in CANONICAL_SLOTS:
+        return value
+    aliased = SLOT_ALIASES.get(value)
+    if aliased is not None:
+        return aliased
+    if value:
+        log.warning(
+            "tier.slots.unrecognized_slot_value",
+            value=value,
+            canonical=list(CANONICAL_SLOTS),
+            aliases=sorted(SLOT_ALIASES),
+            hint=(
+                "slot value not recognised — falling through to the next "
+                "classifier rule, so this record will NOT land in the slot "
+                "that was written. Fix the value or add an alias."
+            ),
+        )
+    return None
 
 
 class SlotOverrides(Protocol):

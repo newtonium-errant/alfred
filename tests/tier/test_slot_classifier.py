@@ -433,3 +433,75 @@ def test_feed_evidence_carries_slot_alongside_tier(tmp_path: Path) -> None:
     assert ev["slot"] in slots.ALL_SLOT_VALUES
     assert ev["slot_rule"]
     assert "tier" in ev, "tier must survive — slot rides alongside it"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c+h — operator-vocabulary aliases
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_slot_accepts_routine_as_alias_for_rhythm() -> None:
+    """The operator says "routine"; the classifier speaks "rhythm".
+
+    His 2026-08-14 rulings used it as a slot name ("surface as ROUTINE
+    slot; ESCALATE to DUTY") and the Phase-1 pass wrote
+    ``return_slot: routine`` onto two live records. Without the alias
+    those returns land unslotted.
+    """
+    assert slots.normalize_slot("routine") == slots.SLOT_RHYTHM
+    assert slots.normalize_slot("  ROUTINE  ") == slots.SLOT_RHYTHM
+
+
+def test_normalize_slot_canonical_values_still_win() -> None:
+    """Positive control — the alias must not disturb the real keys."""
+    assert slots.normalize_slot("duty") == slots.SLOT_DUTY
+    assert slots.normalize_slot("rhythm") == slots.SLOT_RHYTHM
+    assert slots.normalize_slot("fuel") == slots.SLOT_FUEL
+
+
+def test_normalize_slot_still_refuses_unslotted_and_typos() -> None:
+    """The alias table is not a general escape hatch."""
+    assert slots.normalize_slot("unslotted") is None
+    assert slots.normalize_slot("rythm") is None
+    assert slots.normalize_slot("duti") is None
+
+
+def test_normalize_slot_logs_unrecognized_value() -> None:
+    """A typo must not be indistinguishable from an unset field.
+
+    This function now decides where a returning snooze lands, so a
+    silent fall-through would present as "the operator's ruling quietly
+    did nothing".
+    """
+    import structlog
+
+    with structlog.testing.capture_logs() as captured:
+        assert slots.normalize_slot("rythm") is None
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "tier.slots.unrecognized_slot_value"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["value"] == "rythm"
+    assert slots.SLOT_RHYTHM in matches[0]["canonical"]
+
+
+def test_normalize_slot_does_not_log_for_absent_or_blank() -> None:
+    """Negative control — "not set" is ordinary, not a warning.
+
+    Without this the log would fill with noise for every unslotted
+    record and the real typo signal would be buried.
+    """
+    import structlog
+
+    with structlog.testing.capture_logs() as captured:
+        assert slots.normalize_slot(None) is None
+        assert slots.normalize_slot("") is None
+        assert slots.normalize_slot("   ") is None
+        assert slots.normalize_slot(42) is None
+
+    assert [
+        c for c in captured
+        if c.get("event") == "tier.slots.unrecognized_slot_value"
+    ] == []

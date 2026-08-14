@@ -373,8 +373,20 @@ def find_due_reminders(
     return due, stale, refused_past_time, skipped_closed
 
 
-def format_reminder(entry: DueReminder) -> str:
-    """Render the message body for a due reminder.
+def render_return_line(entry: DueReminder) -> str:
+    """Render a due reminder as one line of operator-facing text.
+
+    SURFACE-AGNOSTIC. This is the one place a returning reminder is put
+    into words, so the wording is not owned by any single channel. The
+    Telegram path reaches it through :func:`format_reminder`; the deck /
+    PWA reader calls it directly. Two surfaces rendering the same return
+    differently is a bug that only shows up in front of the operator.
+
+    The record stays the source of truth: this function DERIVES the line
+    from ``waiting_on`` and the title rather than the fire path stamping
+    a rendered string onto the record. A stamped string would go stale
+    the moment ``waiting_on`` changed, and there is no way to tell a
+    stale stamp from a current one by looking at it.
 
     Precedence (per ratified recommendation 3, extended by Phase 2c+h):
 
@@ -405,6 +417,61 @@ def format_reminder(entry: DueReminder) -> str:
     return f"Reminder: {entry.title}"
 
 
+def format_reminder(entry: DueReminder) -> str:
+    """Telegram message body for a due reminder.
+
+    Delegates to :func:`render_return_line`. Kept as its own name
+    because the send path and its tests have called it since the
+    scheduler shipped, and because the Telegram transport is being
+    retired: when that happens this wrapper goes and the renderer
+    stays, since the wording was never Telegram's to own.
+    """
+    return render_return_line(entry)
+
+
+def resolve_return_slot(
+    entry: DueReminder, now: datetime,
+) -> tuple[str | None, str]:
+    """Resolve which slot a returning task should land in.
+
+    Returns ``(canonical_slot_or_None, rule)``. The rule is the "why",
+    for logging: ``return_slot`` / ``escalated`` / ``none`` /
+    ``unrecognized``.
+
+    Escalation is GENERIC, not septic-special: any record carrying
+    ``escalate_on`` in the past AND ``escalate_to`` returns the
+    escalated slot instead of its ordinary one. Septic is simply the
+    first carrier.
+
+    A malformed ``escalate_on`` does NOT escalate — the ordinary slot
+    still applies. Escalation is the sharper outcome (it moves work
+    into Duty), so an unparseable date must not be able to trigger it;
+    failing back to the calmer answer is the safe direction.
+    """
+    from alfred.tier.slots import normalize_slot
+
+    raw = entry.return_slot
+    rule = "return_slot"
+
+    escalate_on = _parse_iso(entry.escalate_on)
+    if (
+        escalate_on is not None
+        and now >= escalate_on
+        and _nonempty(entry.escalate_to)
+    ):
+        raw = entry.escalate_to
+        rule = "escalated"
+
+    if not _nonempty(raw):
+        return None, "none"
+
+    # normalize_slot logs its own warning on an unrecognised value.
+    canonical = normalize_slot(raw)
+    if canonical is None:
+        return None, "unrecognized"
+    return canonical, rule
+
+
 def clear_remind_at_and_stamp(entry: DueReminder, now: datetime) -> None:
     """Mark a task as reminded: clear ``remind_at``, stamp ``reminded_at``,
     append an ``<!-- ALFRED:REMINDER -->`` body comment.
@@ -417,6 +484,44 @@ def clear_remind_at_and_stamp(entry: DueReminder, now: datetime) -> None:
     post = frontmatter.load(str(entry.abs_path))
     post.metadata.pop("remind_at", None)
     post.metadata["reminded_at"] = now.isoformat()
+
+    # Phase 2c+h — the return lands in its ruled slot.
+    #
+    # This is the DELIVERY step, not a bookkeeping one. Writing ``slot:``
+    # here feeds rule 1 of the day-plan classifier (``explicit_slot`` —
+    # the operator's own word, highest precedence), so the deck's own
+    # projection deals the returning task into the right slot on its
+    # next pass. No parallel card emitter, no second dealing path.
+    #
+    # It is written on the SAME frontmatter round-trip that clears
+    # ``remind_at``, so a task can never end up reminded-but-unslotted
+    # (or slotted-but-still-armed) through a partial write.
+    slot, slot_rule = resolve_return_slot(entry, now)
+    if slot is not None:
+        post.metadata["slot"] = slot
+        log.info(
+            "transport.scheduler.return_slot_written",
+            path=entry.rel_path,
+            slot=slot,
+            rule=slot_rule,
+            return_slot=entry.return_slot,
+            escalate_to=entry.escalate_to,
+            escalate_on=entry.escalate_on,
+        )
+    elif slot_rule == "unrecognized":
+        # normalize_slot already warned with the offending value; this
+        # line records the CONSEQUENCE at the point of loss — the
+        # operator's ruling did not land on this record.
+        log.warning(
+            "transport.scheduler.return_slot_not_applied",
+            path=entry.rel_path,
+            return_slot=entry.return_slot,
+            escalate_to=entry.escalate_to,
+            hint=(
+                "return_slot did not resolve to a canonical slot — the "
+                "task returns unslotted rather than where it was ruled."
+            ),
+        )
 
     audit_line = (
         f"<!-- ALFRED:REMINDER fired_at={now.isoformat()} "
