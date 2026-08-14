@@ -1,5 +1,5 @@
 import { ChangeEvent, useCallback, useRef, useState } from 'react';
-import { Button } from '../ui/button';
+import { Button, FILE_PILL_CLASS } from '../ui/button';
 import { Textarea } from '../ui/textarea';
 import { sttClient } from '../../lib/algernon/sttClient';
 import { useRecorder } from '../../lib/algernon/useRecorder';
@@ -218,7 +218,7 @@ export function VoiceCapture({
 
         {showFileUpload && (
           <label
-            className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50"
+            className={FILE_PILL_CLASS}
             data-testid={`${idPrefix}-file-label`}
           >
             Upload audio

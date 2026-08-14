@@ -51,3 +51,22 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
 Button.displayName = 'Button';
 
 export { buttonVariants };
+
+/**
+ * The class string for a <label> that ACTS as a button — the file-picker pill.
+ *
+ * A native file input can't be opened from a <button> without extra JS, so these
+ * affordances are <label>s wrapping a hidden input. That made them BESPOKE: three
+ * hand-typed copies of the `outline` variant's classes, and every one of them
+ * missing `ui-btn` — so a register reached every real button on the page and none
+ * of these. The operator photographed all three in ten minutes ("Add images" on
+ * batch, "Upload .md/.txt/.csv/.pdf" and "Upload audio" on ingest, the same
+ * "Upload audio" again on chat), each of them a white pill beside a correctly
+ * dark Record button.
+ *
+ * DERIVED from the same cva the buttons use, so the marker arrives by
+ * construction and a pill can never again drift from the button next to it.
+ * `cursor-pointer` is the one genuine difference: a <label> doesn't get the
+ * pointer cursor a <button> does.
+ */
+export const FILE_PILL_CLASS = cn(buttonVariants({ variant: 'outline', size: 'sm' }), 'cursor-pointer');

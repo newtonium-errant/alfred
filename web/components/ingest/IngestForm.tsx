@@ -1,5 +1,5 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useState } from 'react';
-import { Button } from '../ui/button';
+import { Button, FILE_PILL_CLASS } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Textarea } from '../ui/textarea';
@@ -341,7 +341,7 @@ export function IngestForm({
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Label htmlFor="ingest-body">Body (written verbatim)</Label>
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5 text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50">
+          <label className={FILE_PILL_CLASS}>
             Upload .md / .txt / .csv / .pdf
             <input
               type="file"

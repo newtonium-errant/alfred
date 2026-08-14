@@ -29,7 +29,18 @@ vi.mock('next/router', () => ({ useRouter: () => ({ replace: vi.fn(), push: vi.f
 vi.mock('../lib/algernon/authClient', () => ({ authApi: { logout: vi.fn() } }));
 
 import { Deck, DECK_COLUMN_MIN_PX, DECK_STACK_RESERVE_PX } from '../components/feed/Deck';
-import { DeckCard, DECK_CARD_DEPTH_OFFSET_PX, DECK_MAX_VISIBLE_DEPTH } from '../components/feed/DeckCard';
+import {
+  DeckCard,
+  DECK_CARD_DEPTH_OFFSET_PX,
+  DECK_CARD_SHADOW_BLUR_PX,
+  DECK_CARD_SHADOW_CLASS,
+  DECK_CARD_SHADOW_REACH_PX,
+  DECK_CARD_SHADOW_Y_PX,
+  DECK_MAX_VISIBLE_DEPTH,
+} from '../components/feed/DeckCard';
+import { FILE_PILL_CLASS } from '../components/ui/button';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import DeckPage from '../pages/deck';
 import { evidenceList } from '../lib/algernon/feedEvidence';
 import type { FeedItem } from '../lib/algernon/feed';
@@ -79,10 +90,33 @@ afterEach(() => {
 });
 
 describe('the card stack cannot reach the verb buttons', () => {
-  it('reserves MORE than the deepest card spills — the gap is real, not merely break-even', () => {
-    // The invariant the reservation exists for. `>=` would be satisfied by a zero
-    // gap, which is the state the operator photographed: edges touching.
-    expect(DECK_STACK_RESERVE_PX).toBeGreaterThan(DECK_CARD_DEPTH_OFFSET_PX * DECK_MAX_VISIBLE_DEPTH);
+  it('clears BOTH footprints — the deepest card AND the shadow it casts', () => {
+    // Two terms, because the card occupies space two ways. `>=` on either alone
+    // would be satisfied by a zero gap, which is the state the operator
+    // photographed: edges touching under a shadow lying across the buttons.
+    const spill = DECK_CARD_DEPTH_OFFSET_PX * DECK_MAX_VISIBLE_DEPTH;
+    expect(DECK_STACK_RESERVE_PX).toBeGreaterThan(spill + DECK_CARD_SHADOW_REACH_PX);
+    // And the shadow term is not a rounding error next to the geometric one —
+    // it is the larger of the two, which is why counting only geometry left the
+    // complaint standing.
+    expect(DECK_CARD_SHADOW_REACH_PX).toBeGreaterThan(spill);
+  });
+
+  it('takes its shadow arithmetic from the class that actually renders', () => {
+    // The class is a Tailwind ARBITRARY value and must stay written out — the JIT
+    // scans source text, so a class name built from these constants would emit no
+    // CSS at all (the `h-13` species again, one file over). That leaves two
+    // sources of truth, so this reconciles them: the literal is what paints, the
+    // constants are what the reserve is computed from, and they must agree.
+    const m = /shadow-\[0_(\d+)px_(\d+)px_/.exec(DECK_CARD_SHADOW_CLASS);
+    expect(m).not.toBeNull(); // positive control: the literal is still parseable
+    expect(Number(m?.[1])).toBe(DECK_CARD_SHADOW_Y_PX);
+    expect(Number(m?.[2])).toBe(DECK_CARD_SHADOW_BLUR_PX);
+    // A drop shadow reaches its offset plus half its blur past the edge.
+    expect(DECK_CARD_SHADOW_REACH_PX).toBe(DECK_CARD_SHADOW_Y_PX + DECK_CARD_SHADOW_BLUR_PX / 2);
+    // ...and the literal is the one the card is actually wearing.
+    render(<Deck items={[item('a')]} />);
+    expect(screen.getAllByTestId('deck-card')[0].className).toContain(DECK_CARD_SHADOW_CLASS);
   });
 
   it('declares that reservation on the stack box, and the deepest card spills by the SAME constant', () => {
@@ -149,6 +183,58 @@ describe('the card stack cannot reach the verb buttons', () => {
     await waitFor(() => expect(screen.getByTestId('deck')).not.toBeNull());
     expect(screen.getByTestId('deck').parentElement?.style.minHeight).toBe(`${DECK_COLUMN_MIN_PX}px`);
     expect(DECK_COLUMN_MIN_PX).toBeGreaterThan(DECK_STACK_RESERVE_PX);
+  });
+});
+
+// Walk every .tsx under the app's source roots — the sweep has to be able to see
+// a file nobody thought to list, which is the whole point of a species claim.
+function sourceFiles(dir: string, out: string[] = []): string[] {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name !== 'node_modules' && e.name !== '.next') sourceFiles(p, out);
+    } else if (e.name.endsWith('.tsx')) out.push(p);
+  }
+  return out;
+}
+
+// A <label> carrying a LITERAL className that dresses it as a pill. This is the
+// shape of the defect: `className="…rounded-xl border border-honeydew-300
+// bg-white…"` typed by hand instead of taken from the kit, so `ui-btn` never
+// arrives and the register cannot reach it.
+const BESPOKE_PILL_LABEL = /<label[^>]*className="([^"]*(?:bg-white|bg-honeydew-)[^"]*rounded[^"]*|[^"]*rounded[^"]*(?:bg-white|bg-honeydew-)[^"]*)"/g;
+
+describe('bespoke file-picker pills — the species, not the five instances', () => {
+  const ROOTS = [join(__dirname, '..', 'components'), join(__dirname, '..', 'pages')];
+
+  it('routes every file-picker label through the kit, so the marker arrives by construction', () => {
+    expect(FILE_PILL_CLASS).toContain('ui-btn');
+    // The kit's own marker, not a string this constant happens to contain: the
+    // pill IS the outline button plus a cursor, so it must also carry that
+    // variant's chrome.
+    expect(FILE_PILL_CLASS).toContain('cursor-pointer');
+  });
+
+  it('leaves NO hand-dressed <label> anywhere in components/ or pages/', () => {
+    const offenders: string[] = [];
+    let scanned = 0;
+    for (const root of ROOTS) {
+      for (const file of sourceFiles(root)) {
+        scanned += 1;
+        const src = readFileSync(file, 'utf8');
+        for (const m of src.matchAll(BESPOKE_PILL_LABEL)) {
+          offenders.push(`${file.replace(join(__dirname, '..'), '.')}: ${m[1].slice(0, 60)}…`);
+        }
+      }
+    }
+    // POSITIVE CONTROLS, both halves. The sweep reached real files...
+    expect(scanned).toBeGreaterThan(30);
+    // ...and the matcher can actually see the defect it claims is extinct. Without
+    // this the assertion below would pass just as happily against a broken regex.
+    const known = `<label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-honeydew-300 bg-white px-3 py-1.5">`;
+    expect([...known.matchAll(BESPOKE_PILL_LABEL)].length).toBe(1);
+
+    expect(offenders).toEqual([]);
   });
 });
 

@@ -35,6 +35,26 @@ export const DECK_CARD_DEPTH_OFFSET_PX = 10;
 // this constant is the one the RENDER obeys.
 export const DECK_MAX_VISIBLE_DEPTH = 2;
 
+// THE CARD'S DROP SHADOW, as a Tailwind arbitrary value.
+//
+// WRITTEN OUT, never composed from the constants below. Tailwind's JIT scans
+// source TEXT, so a template-built class name emits no CSS at all — which is the
+// identical species as the `h-13` that had been silently sizing nothing on the
+// gesture buttons (see Deck.tsx). So the literal is the source of truth for what
+// renders, the constants are the source of truth for the arithmetic, and
+// `deckLayout.test.tsx` parses the literal and asserts the two agree.
+export const DECK_CARD_SHADOW_CLASS = 'shadow-[0_18px_40px_rgba(0,0,0,0.5)]';
+export const DECK_CARD_SHADOW_Y_PX = 18;
+export const DECK_CARD_SHADOW_BLUR_PX = 40;
+
+// How far the shadow reaches PAST the edge it falls from: its offset plus half
+// its blur (a Gaussian blur of radius r spreads r/2 beyond the shadow's edge).
+// This is not layout — it paints over whatever is beneath it — but it is part of
+// the card's visual footprint, and it is the part the operator actually
+// photographed lying over the buttons. Clearance that counted only the geometry
+// would have fixed the measurement and left the complaint.
+export const DECK_CARD_SHADOW_REACH_PX = DECK_CARD_SHADOW_Y_PX + DECK_CARD_SHADOW_BLUR_PX / 2;
+
 // Presentational deck card. All content is rendered as React text children
 // (auto-escaped) — evidence is untrusted display data, so NOTHING here uses
 // dangerouslySetInnerHTML or renders an href from item data (#22 XSS precedent).
@@ -128,7 +148,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
       ref={ref}
       data-testid="deck-card"
       data-kind={item.kind}
-      className="absolute inset-0 m-auto flex max-h-[380px] touch-none select-none overflow-hidden rounded-sm border border-console-edge bg-console-panel shadow-[0_18px_40px_rgba(0,0,0,0.5)]"
+      className={`absolute inset-0 m-auto flex max-h-[380px] touch-none select-none overflow-hidden rounded-sm border border-console-edge bg-console-panel ${DECK_CARD_SHADOW_CLASS}`}
       style={{
         zIndex: DECK_CARD_BASE_Z - depth,
         transform: `translateY(${depth * DECK_CARD_DEPTH_OFFSET_PX}px) scale(${1 - depth * 0.035})`,

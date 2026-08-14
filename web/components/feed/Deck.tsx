@@ -30,7 +30,13 @@ import {
   roleChipClass,
 } from '../../lib/algernon/consoleTokens';
 import { useDeck } from './useDeck';
-import { DeckCard, DECK_CARD_BASE_Z, DECK_CARD_DEPTH_OFFSET_PX, DECK_MAX_VISIBLE_DEPTH } from './DeckCard';
+import {
+  DeckCard,
+  DECK_CARD_BASE_Z,
+  DECK_CARD_DEPTH_OFFSET_PX,
+  DECK_CARD_SHADOW_REACH_PX,
+  DECK_MAX_VISIBLE_DEPTH,
+} from './DeckCard';
 
 // CLEARANCE BETWEEN THE STACK AND THE VERB BUTTONS.
 //
@@ -42,12 +48,20 @@ import { DeckCard, DECK_CARD_BASE_Z, DECK_CARD_DEPTH_OFFSET_PX, DECK_MAX_VISIBLE
 // not a tall-card bug: the card's height is `max-h-[380px]` and is identical
 // expanded and collapsed. Nothing reserved the space, so nothing was clear.
 //
-// DERIVED, never typed. The spill is a consequence of the transform, so the
-// reservation reads the same two constants the transform does — a change to the
-// depth offset moves this with it rather than silently outgrowing it.
-const DECK_STACK_GAP_PX = 16; // visible breathing room BEYOND the spill
+// TWO TERMS, not one, because the card has two footprints. The GEOMETRIC one is
+// the deepest card's translate. The VISUAL one is the drop shadow, which paints
+// over whatever is beneath it and reaches DECK_CARD_SHADOW_REACH_PX past the edge
+// it falls from — and that is the footprint the operator's photograph actually
+// shows lying across the buttons. A reserve counting only the geometry would have
+// fixed the measurement and kept the complaint, so both terms are in it.
+//
+// DERIVED, never typed. Every term reads the constant that produces it, so a
+// change to the depth offset or to the shadow moves this with it rather than
+// silently outgrowing it.
+const DECK_STACK_SPILL_PX = DECK_CARD_DEPTH_OFFSET_PX * DECK_MAX_VISIBLE_DEPTH;
+const DECK_STACK_GAP_PX = 8; // breathing room beyond BOTH footprints
 export const DECK_STACK_RESERVE_PX =
-  DECK_CARD_DEPTH_OFFSET_PX * DECK_MAX_VISIBLE_DEPTH + DECK_STACK_GAP_PX;
+  DECK_STACK_SPILL_PX + DECK_CARD_SHADOW_REACH_PX + DECK_STACK_GAP_PX;
 
 // The deck column's floor, which the PAGE owns (it renders the wrapper). 460px is
 // the authored minimum this column has always had; the reservation is ADDED to it
