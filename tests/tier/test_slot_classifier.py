@@ -505,3 +505,24 @@ def test_normalize_slot_does_not_log_for_absent_or_blank() -> None:
         c for c in captured
         if c.get("event") == "tier.slots.unrecognized_slot_value"
     ] == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c+h — chase vocabulary, one spelling
+# ---------------------------------------------------------------------------
+
+
+def test_chase_phrase_wording() -> None:
+    assert slots.chase_phrase("Carfax") == "chase Carfax"
+    assert slots.chase_phrase("  Duncan (Cleveland Insurance)  ") == (
+        "chase Duncan (Cleveland Insurance)"
+    )
+
+
+def test_chase_phrase_none_when_nobody_named() -> None:
+    """Absent and blank both mean "not waiting on anyone" — neither may
+    produce a chase against nobody."""
+    assert slots.chase_phrase(None) is None
+    assert slots.chase_phrase("") is None
+    assert slots.chase_phrase("   ") is None
+    assert slots.chase_phrase(42) is None

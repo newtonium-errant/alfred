@@ -407,11 +407,16 @@ def render_return_line(entry: DueReminder) -> str:
     """
     if entry.reminder_text:
         return entry.reminder_text
-    if _nonempty(entry.waiting_on):
-        waiting_on = str(entry.waiting_on).strip()
+    # Vocabulary from the shared helper; capitalisation and the
+    # full-line shape are this surface's presentation.
+    from alfred.tier.slots import chase_phrase
+
+    phrase = chase_phrase(entry.waiting_on)
+    if phrase is not None:
+        opener = phrase[:1].upper() + phrase[1:]
         if entry.due:
-            return f"Chase {waiting_on}: {entry.title} (due {entry.due})"
-        return f"Chase {waiting_on}: {entry.title}"
+            return f"{opener}: {entry.title} (due {entry.due})"
+        return f"{opener}: {entry.title}"
     if entry.due:
         return f"Reminder: {entry.title} (due {entry.due})"
     return f"Reminder: {entry.title}"

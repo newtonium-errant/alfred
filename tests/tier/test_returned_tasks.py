@@ -243,3 +243,37 @@ def test_today_view_without_returns_is_unaffected(vault: Path) -> None:
     _task(vault / "task", "Ordinary task", reminded_at=None)
     view = compute_today_view(vault, NOW)
     assert [e for e in view.t1 if e.source == "auto-returned"] == []
+
+
+def test_chase_vocabulary_is_single_spelled_across_surfaces(
+    vault: Path,
+) -> None:
+    """Cross-surface drift pin.
+
+    Two surfaces word a chase at different granularities — a full message
+    line and a short reason. Granularity is presentation; the VOCABULARY
+    must have one spelling. This fails the moment either side re-hardcodes
+    its own wording instead of consuming ``chase_phrase``, which is the
+    failure that is invisible from inside the code: both surfaces would
+    keep passing their own tests while showing the operator two different
+    things for the same state.
+    """
+    from alfred.tier.slots import chase_phrase
+    from alfred.transport.scheduler import DueReminder, render_return_line
+
+    who = "Carfax"
+    canonical = chase_phrase(who)
+    assert canonical is not None
+
+    _task(vault / "task", "Fix mileage", extra=f'waiting_on: "{who}"')
+    reader_reason = compute_returned_task_candidates(vault, NOW)[0].surface_reason
+
+    line = render_return_line(DueReminder(
+        abs_path=Path("/nonexistent/task/x.md"), rel_path="task/x.md",
+        title="Fix mileage", remind_at=NOW, due=None, reminder_text=None,
+        status="todo", waiting_on=who,
+    ))
+
+    # Both surfaces speak the one vocabulary.
+    assert reader_reason == canonical
+    assert line.lower().startswith(canonical.lower())

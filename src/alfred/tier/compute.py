@@ -1445,9 +1445,7 @@ def compute_returned_task_candidates(
             # A waiting item is not a snooze that came back — it is
             # blocked on somebody. The framing says what the next
             # physical action is.
-            surface_reason=(
-                f"chase {waiting_on}" if waiting_on else "returned"
-            ),
+            surface_reason=slots.chase_phrase(waiting_on) or "returned",
             origin="task",
             self_care=_coerce_self_care(fm.get("self_care", False)),
             # Feeds rule 1 of the slot classifier — the operator's own

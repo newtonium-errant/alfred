@@ -264,6 +264,34 @@ def resolve_effective_slot(
     return canonical, rule
 
 
+def chase_phrase(waiting_on: Any) -> str | None:
+    """The canonical wording for "this is blocked on somebody".
+
+    Returns ``"chase <who>"``, or ``None`` when nobody is named — absent
+    and blank both mean "not waiting on anyone", so neither may produce
+    a chase against nobody.
+
+    **One spelling, two presentations.** Two consumers word a chase at
+    different granularities and both go through here:
+
+      * :func:`alfred.transport.scheduler.render_return_line` builds a
+        full message line — ``"Chase Carfax: Fix mileage"``;
+      * :func:`alfred.tier.compute.compute_returned_task_candidates`
+        sets a short ``surface_reason`` — ``"chase Carfax"``.
+
+    Granularity and capitalisation are PRESENTATION and stay with each
+    consumer. The vocabulary — the verb, and how the name is joined to
+    it — lives here. The distinction matters because the two spellings
+    would agree today and diverge the first time the wording changed,
+    and a divergence in operator-facing words is invisible from inside
+    the code: both surfaces keep passing their own tests while showing
+    the person two different things for the same state.
+    """
+    if not (isinstance(waiting_on, str) and waiting_on.strip()):
+        return None
+    return f"chase {waiting_on.strip()}"
+
+
 class SlotOverrides(Protocol):
     """The learned-override lookup (rule 2). Slice 2 supplies the real store.
 
