@@ -109,6 +109,14 @@ def snapshot_fingerprint(kind: str, evidence: dict[str, Any] | None) -> str | No
     return "\x1f".join(parts)
 
 
+# T2-1 — the returned-reminder ring. A NAMED constant where its siblings are
+# bare literals, because two packages OUTSIDE ``alfred.feed`` have to spell this
+# kind: the transport scheduler emits it and the daily-sync action router gates
+# it. The sibling locals (``URGENT_KIND`` &c. in action_router) each have one
+# owner and predate this; they are deliberately left alone rather than swept
+# into a half-migration.
+KIND_REMINDER_RETURNED = "reminder_returned"
+
 # Every kind the feed can carry (step-2 contract + brief peer_digest). Kept as a
 # frozenset so producers/tests can assert membership without importing the dict.
 KINDS: frozenset[str] = frozenset({
@@ -116,6 +124,7 @@ KINDS: frozenset[str] = frozenset({
     "recurrence", "contract", "slot_suggestion", "routing", "health", "weather",
     "event", "ops_notable", "ticket_notice", "radar", "friction",
     "notegen_readout", "peer_digest", "pattern_surfaced",
+    KIND_REMINDER_RETURNED,
 })
 
 # Static per-kind (mode, attention) defaults, seeded from the step-2 severity map
@@ -143,6 +152,15 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     # the router's behaviour (the self-correcting standard's propose-then-
     # approve arrow, made visible on the deck).
     "pattern_surfaced": (MODE_DECIDE, ATTENTION_NEEDS_YOU),
+    # T2-1 — a snoozed/waiting task's reminder came due. THIS LINE IS THE ONE
+    # THAT RINGS THE PHONE, and it is worth saying where the ring actually comes
+    # from, because nothing else in this file mentions it: the web push poller
+    # fetches by ATTENTION (``feedNeedsYou.isNeedsYouItem``) with no kind
+    # allowlist, and the default push policy admits every needs-you item. So
+    # ``ATTENTION_NEEDS_YOU`` here is the whole wiring — downgrade this entry to
+    # FYI and the doorbell goes silent with every Python test still green, which
+    # is why the pin that guards it is a web test rather than a Python one.
+    KIND_REMINDER_RETURNED: (MODE_DECIDE, ATTENTION_NEEDS_YOU),
     # Awareness kinds — surfaced for glance, no decision demanded.
     # attribution (#63a) was a decide kind until the operator ruled that these
     # confirmations are consistently correct, so reviewing them in the deck cost

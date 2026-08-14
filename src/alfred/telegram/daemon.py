@@ -2200,6 +2200,21 @@ async def run(
                     Path(config.vault.path),
                     scheduler_user_id,
                     shutdown_event=shutdown_event,
+                    # T2-1 — the returned-reminder ring. THE SAME handle the
+                    # contact router uses, so the card lands in the store the
+                    # deck reads and the push poller polls. Threaded at this,
+                    # the ONE production call site, in the commit that added
+                    # the parameter: a default-None gate that only tests pass
+                    # is a live write side with a dead read side and every pin
+                    # green. ``None`` here (feed disabled, or feed setup
+                    # failed) is the pre-T2-1 behaviour, announced by the
+                    # scheduler's own ``feed_ring`` startup field.
+                    #
+                    # In scope unconditionally: it is initialised at the top of
+                    # the transport try-block, and that block's ``except``
+                    # resets ``transport_app`` to None — so reaching this line
+                    # at all means the assignment ran.
+                    feed_handle=feed_emit_handle,
                 ),
                 name="transport-scheduler",
             )

@@ -30,13 +30,17 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import frontmatter
 
 from .config import TransportConfig
+from .returns_feed import emit_return_card, sweep_return_cards
 from .state import TransportState
 from .utils import get_logger
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from alfred.feed import FeedEmitHandle
 
 log = get_logger(__name__)
 
@@ -542,11 +546,17 @@ async def run(
     vault_path: Path,
     user_id: int,
     shutdown_event: asyncio.Event | None = None,
+    feed_handle: "FeedEmitHandle | None" = None,
 ) -> None:
     """Scheduler loop — fire due reminders and drain scheduled pending sends.
 
     Returns when ``shutdown_event`` is set. Exceptions inside a tick
     are caught and logged so one bad record cannot wedge the loop.
+
+    ``feed_handle`` is the returned-reminder ring (T2-1): present → every fire
+    also deals a ``reminder_returned`` card, which is what reaches the deck and
+    the phone. ``None`` → the record write and the Telegram send are the only
+    legs, i.e. the pre-T2-1 behaviour.
     """
     interval = max(1, int(config.scheduler.poll_interval_seconds))
     stale_max = int(config.scheduler.stale_reminder_max_minutes)
@@ -556,6 +566,13 @@ async def run(
         poll_interval_seconds=interval,
         stale_reminder_max_minutes=stale_max,
         user_id=user_id,
+        # ILB, and at INFO because a doorbell that was never armed has no
+        # signature of its own — the failure looks exactly like "no reminders
+        # came due". This is the one line that distinguishes them, so it says
+        # which state it is on BOTH outcomes rather than only on the good one.
+        feed_ring=(
+            "armed" if feed_handle is not None and feed_handle.enabled else "off"
+        ),
     )
 
     while True:
@@ -563,7 +580,10 @@ async def run(
             log.info("transport.scheduler.stopped")
             return
         try:
-            await _tick(config, state, send_fn, vault_path, user_id)
+            await _tick(
+                config, state, send_fn, vault_path, user_id,
+                feed_handle=feed_handle,
+            )
         except Exception:  # noqa: BLE001 — loop must survive
             log.exception("transport.scheduler.tick_error")
 
@@ -584,6 +604,8 @@ async def _tick(
     send_fn: SendCallable,
     vault_path: Path,
     user_id: int,
+    *,
+    feed_handle: "FeedEmitHandle | None" = None,
 ) -> None:
     """Run one scheduler pass — due reminders, stale reminders, pending queue."""
     now = datetime.now(timezone.utc)
@@ -698,6 +720,27 @@ async def _tick(
                 waiting_on=entry.waiting_on,
             )
 
+        # THE RING (T2-1) — dealt HERE, above the send, and deliberately not
+        # beside the stamp below.
+        #
+        # The entry is due and eligible at this point; nothing after this can
+        # make it un-returned. Putting the emit below ``send_fn`` would put it
+        # behind that call's failure ``continue``, which is precisely the
+        # consumed-as-sent hazard this leg exists to close: on an instance with
+        # no Telegram bot the send returns ``[]`` — read as success — so the
+        # return was stamped and the operator was told nothing at all.
+        #
+        # The two legs share NO failure exit. ``emit_return_card`` never raises
+        # (it logs loud and answers False), so a feed fault cannot cost the
+        # Telegram message; and the send's ``continue`` below does not un-emit,
+        # because the card's key is the (record, remind_at) pair — the retry
+        # tick re-derives the same id and folds to a no-op.
+        #
+        # WHEN T4 REMOVES THE SEND LEG: the stamp moves up to follow the EMIT,
+        # not the send. The ordering intent is that a return is consumed once
+        # the operator has been told, and after T4 the card IS the telling.
+        emit_return_card(feed_handle, entry, now=now)
+
         text = format_reminder(entry)
         dedupe_key = (
             f"reminder-{entry.rel_path}-{entry.remind_at.isoformat()}"
@@ -743,6 +786,16 @@ async def _tick(
             "sent_at": now.isoformat(),
             "rel_path": entry.rel_path,
         })
+
+    # 1b) Retire the returned-reminder cards whose task has moved on.
+    #
+    # AFTER the due-loop on purpose: a task completed since the last tick
+    # retires within one interval, and a card dealt THIS tick survives the same
+    # tick's sweep because the record either carries the fire's stamp (send
+    # succeeded) or still carries the SAME ``remind_at`` (send failed) — and the
+    # sweep reads an identical ``remind_at`` as "not yet stamped", never as a
+    # re-arm. Belt-guarded inside; a feed fault cannot reach the queue drain.
+    sweep_return_cards(feed_handle, vault_path, now)
 
     # 2) Pending-queue drain.
     due_scheduled = state.pop_due(now)
