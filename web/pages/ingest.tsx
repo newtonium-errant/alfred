@@ -2,6 +2,7 @@ import { useCallback, useEffect } from 'react';
 import Head from 'next/head';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
+import { CRT_SURFACE } from '../lib/algernon/crtSurface';
 import { EmptyState } from '../components/EmptyState';
 import { IngestForm } from '../components/ingest/IngestForm';
 import { authApi } from '../lib/algernon/authClient';
@@ -46,7 +47,7 @@ export default function IngestPage() {
         <Head>
           <title>Ingest · {INSTANCE_NAME}</title>
         </Head>
-        <Layout showNav={false}>
+        <Layout showNav={false} surface={CRT_SURFACE}>
           <p data-testid="auth-gate" className={subtle}>
             Loading…
           </p>
@@ -62,7 +63,7 @@ export default function IngestPage() {
       <Head>
         <title>Ingest · {INSTANCE_NAME}</title>
       </Head>
-      <Layout onSignOut={() => void handleSignOut()}>
+      <Layout onSignOut={() => void handleSignOut()} surface={CRT_SURFACE}>
         <div className="min-w-0">
           <h1 className={display}>Ingest</h1>
           <p className={`mt-1 ${subtle}`}>

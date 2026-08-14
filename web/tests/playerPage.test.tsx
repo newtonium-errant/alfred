@@ -80,7 +80,9 @@ describe('PlayerPage — ILB states', () => {
     mockFetchAudio.mockResolvedValue({ kind: 'narration_unavailable' });
     render(<PlayerPage />);
     await waitFor(() => expect(screen.queryByTestId('player-narration-unavailable')).not.toBeNull());
-    expect(screen.getByTestId('player-narration-link').getAttribute('href')).toBe('/brief');
+    // Points DOWN THIS PAGE: the brief text renders below the player now that
+    // /brief is retired. Sending it to /brief would redirect straight back here.
+    expect(screen.getByTestId('player-narration-link').getAttribute('href')).toBe('#brief-text');
   });
 
   it('an empty narration dict → the "nothing to play" state', async () => {

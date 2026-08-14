@@ -3,6 +3,7 @@ import Head from 'next/head';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
+import { BriefView } from '../components/brief/BriefView';
 import { authApi } from '../lib/algernon/authClient';
 import { fetchAudio, fetchNarration, type NarrationResult, type PlayerAudioState } from '../lib/algernon/briefPlayer';
 import { narrationSlides, slideAtFraction, slideDeepLink } from '../lib/algernon/player';
@@ -10,11 +11,18 @@ import { usePlayer } from '../components/player/usePlayer';
 import { usePlayerAsk } from '../components/player/usePlayerAsk';
 import { useMediaSession } from '../components/player/useMediaSession';
 import { VoiceCapture } from '../components/chat/VoiceCapture';
-import { ApiError } from '../lib/algernon/http';
+import { ApiError, getJson } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
 import { display, subtle, title as titleClass } from '../lib/typography';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
+
+// The #30 outbound-read payload, as the retired /brief page typed it.
+type OutboundLatest = {
+  kind: string;
+  date: string | null;
+  markdown: string | null;
+};
 
 // The interruptible briefing player (C3b + C3c). Renders the narration as slides, plays
 // the cached audio when available, and degrades to TEXT-ALONG when it isn't — never a
@@ -29,6 +37,12 @@ export default function PlayerPage() {
   const { user, loading: sessionLoading } = useSession();
   const authed = !sessionLoading && user !== null;
 
+  // The READ surfaces the retired /brief page carried. The player replaces that
+  // page, so it inherits what the page CARRIED, not merely its URL — these two
+  // artifacts had no other reachability path in the PWA (home renders a summary
+  // CARD from `date` alone and never touches `markdown`).
+  const [brief, setBrief] = useState<OutboundLatest | null>(null);
+  const [dailySync, setDailySync] = useState<OutboundLatest | null>(null);
   const [narration, setNarration] = useState<NarrationResult | null>(null);
   const [audio, setAudio] = useState<PlayerAudioState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -45,6 +59,33 @@ export default function PlayerPage() {
   }, [sessionLoading, user, unauthenticated, router]);
 
   const onAuthExpired = useCallback(() => setUnauthenticated(true), []);
+
+  // The reading half, fetched separately from the narration on purpose: a brief
+  // whose AUDIO failed is exactly when the operator most needs to read it, so a
+  // narration error must not take the text down with it. Each kind renders its
+  // own intentionally-left-blank empty state from the backend's 200 {date:null}.
+  useEffect(() => {
+    if (!authed) return;
+    let cancelled = false;
+    void (async () => {
+      for (const [kind, set] of [
+        ['brief', setBrief],
+        ['daily_sync', setDailySync],
+      ] as const) {
+        try {
+          const res = await getJson<OutboundLatest>(`/api/brief/latest?kind=${kind}`);
+          if (!cancelled) set(res);
+        } catch {
+          // Silent per-kind degrade: the player's own error surface owns the
+          // visible failure state, and a spooled-artifact read that fails is a
+          // missing section, not a broken page.
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authed]);
 
   useEffect(() => {
     if (!authed) return;
@@ -75,7 +116,8 @@ export default function PlayerPage() {
             await authApi.me();
             if (!cancelled) {
               setError(
-                "Your briefing couldn't be loaded, but you're still signed in. Try again, or open /brief to read it.",
+                // VOICE-RIDER: functional copy, awaiting the tuner's pass.
+                "Your briefing couldn't be loaded, but you're still signed in. Try again, or read the full brief below.",
               );
             }
           } catch (probe) {
@@ -251,14 +293,23 @@ export default function PlayerPage() {
           </div>
         )}
 
-        {/* ILB: brief exists but its narration/audio is unavailable → offer the brief page. */}
+        {/* ILB: brief exists but its narration/audio is unavailable → offer the
+            reading surface. Points at HOME, not at the retired /brief: home renders
+            the brief markdown below the board, so this is where "read it" is true.
+            Sending it to /brief would now redirect straight back here — the player
+            telling you to go read the brief and returning you to the player. */}
         {loaded && narrationState === 'narration_unavailable' && (
           <div data-testid="player-narration-unavailable" className="mt-6 rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft">
             <p className={titleClass}>Brief exists — audio unavailable.</p>
             <p className={`mt-1 ${subtle}`}>The narration isn&rsquo;t ready, but the brief itself is.</p>
-            <Link href="/brief" data-testid="player-narration-link" className="mt-3 inline-block font-semibold text-honeydew-700 underline underline-offset-2">
-              Read the brief →
-            </Link>
+            {/* VOICE-RIDER: functional copy, awaiting the tuner's pass.
+                Points DOWN THIS PAGE, not away — the brief text is rendered
+                below. Sending it to /brief would now redirect back here, and
+                sending it home would be false: home renders a summary card from
+                the brief's DATE and never touches its markdown. */}
+            <a href="#brief-text" data-testid="player-narration-link" className="mt-3 inline-block font-semibold text-honeydew-700 underline underline-offset-2">
+              Read the full brief below →
+            </a>
           </div>
         )}
 
@@ -267,9 +318,10 @@ export default function PlayerPage() {
           <div data-testid="player-empty" className="mt-6 rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft">
             <p className={titleClass}>Nothing to play.</p>
             <p className={`mt-1 ${subtle}`}>Today&rsquo;s brief has nothing to narrate.</p>
-            <Link href="/brief" className="mt-3 inline-block font-semibold text-honeydew-700 underline underline-offset-2">
-              Read the brief →
-            </Link>
+            {/* VOICE-RIDER: functional copy, awaiting the tuner's pass. */}
+            <a href="#brief-text" data-testid="player-empty-link" className="mt-3 inline-block font-semibold text-honeydew-700 underline underline-offset-2">
+              Read the full brief below →
+            </a>
           </div>
         )}
 
@@ -451,6 +503,30 @@ export default function PlayerPage() {
             )}
           </section>
         )}
+        {/* The reading surfaces the retired /brief page carried. Below the
+            player because the player is the headline of this surface and the
+            text is the fallback — but ON this surface, because after the
+            retirement there is nowhere else either artifact can be read. */}
+        <div id="brief-text" className="mt-10 flex flex-col gap-8">
+          {brief && (
+            <BriefView
+              testId="brief-view"
+              title="Morning Brief"
+              date={brief.date}
+              markdown={brief.markdown}
+              emptyMessage="No brief yet today — it lands ~06:00."
+            />
+          )}
+          {dailySync && (
+            <BriefView
+              testId="daily-sync-view"
+              title="Daily Sync"
+              date={dailySync.date}
+              markdown={dailySync.markdown}
+              emptyMessage="No Daily Sync yet today — it lands ~09:00."
+            />
+          )}
+        </div>
       </Layout>
     </>
   );

@@ -9,6 +9,7 @@ import { SlotBoard } from '../components/feed/SlotBoard';
 import { useFeedBoard } from '../components/feed/useFeedBoard';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
+import { VIEWSCREEN_SURFACE } from '../lib/algernon/viewscreenSurface';
 import { useContactRouter } from '../lib/algernon/useContactRouter';
 import { authApi } from '../lib/algernon/authClient';
 import {
@@ -176,7 +177,7 @@ export default function HomePage() {
         <Head>
           <title>{INSTANCE_NAME}</title>
         </Head>
-        <Layout showNav={false}>
+        <Layout showNav={false} surface={VIEWSCREEN_SURFACE}>
           <p data-testid="auth-gate" className={subtle}>
             Loading…
           </p>
@@ -221,7 +222,7 @@ export default function HomePage() {
       <Head>
         <title>{INSTANCE_NAME}</title>
       </Head>
-      <Layout onSignOut={() => void handleSignOut()}>
+      <Layout onSignOut={() => void handleSignOut()} surface={VIEWSCREEN_SURFACE}>
         <h1 className={display}>Good to see you{user.name ? `, ${user.name}` : ''}.</h1>
         {/* Self-explaining composition line (verbatim requirement) — the trust ramp. */}
         <p data-testid="composed-line" className={`mt-1 font-mono text-xs uppercase tracking-widest ${subtle}`}>
@@ -237,7 +238,7 @@ export default function HomePage() {
         {mode === 'brief' && (
           <section data-testid="compose-brief" className="mt-6">
             <Link
-              href="/brief"
+              href="/player"
               data-testid="composer-brief-card"
               className="block rounded-xl border border-honeydew-200 bg-cream p-4 shadow-soft"
             >

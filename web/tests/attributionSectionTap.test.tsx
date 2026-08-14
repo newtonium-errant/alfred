@@ -35,6 +35,21 @@ vi.mock('../lib/algernon/composer', async (importOriginal) => ({
   halifaxHour: () => 12,
   composeModeForDate: () => modeState.current,
 }));
+
+// C4 router (folded here with the console-completion lane, which owns this
+// merge surface): `HomePage` runs `useContactRouter` on mount, so without this
+// mock every test in this file makes a real `/api/day/state` fetch. It is
+// caught by the router's own fail-safe and harmless, but an unmocked network
+// call in a unit test is a latent flake and a lie about what the test exercises.
+// `configured: false` is the router's stay-put state — the page renders exactly
+// as it did before C4 existed.
+vi.mock('../lib/algernon/dayClient', () => ({
+  dayApi: {
+    state: vi.fn().mockResolvedValue({ configured: false, armed_rules: [], rule_order: [] }),
+    contact: vi.fn().mockResolvedValue({ contact_id: '', recorded: false }),
+    override: vi.fn().mockResolvedValue({ recorded: false, patterns_surfaced: 0 }),
+  },
+}));
 vi.mock('../lib/algernon/composerLog', () => ({ useComposerLog: () => {} }));
 
 import FeedPage from '../pages/feed';

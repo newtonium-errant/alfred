@@ -1,0 +1,74 @@
+/*
+ * The chat surface's register — comms. The third pillar (deck = tactical,
+ * feed = sensors, chat = comms).
+ *
+ * THE QUOTATION, AND ITS BOUNDARY. Salem's replies render monospace-phosphor —
+ * the ship's computer speaking — by borrowing the CRT register's voice for
+ * exactly one region. Everything else is comms-grade: the chrome, the composer,
+ * and every voice state (speaking pill, dictation, barge affordances). The
+ * precedent is TimelineView borrowing sensor-log; a region may quote another
+ * register without the page changing identity.
+ *
+ * That boundary is the thing most likely to erode, because the quotation looks
+ * good and the temptation is to spread it. `.comms-quoted` is therefore the ONLY
+ * rule here that reaches for a CRT token, and commsContainment.test.tsx pins
+ * both halves: the quoted turn HAS the treatment, and the composer and voice
+ * states do NOT.
+ *
+ * Same definitions-inert / painting-on-content split as its siblings.
+ */
+
+/* --- definitions: inert, safe on the shell ------------------------------- */
+[data-surface='comms'] {
+  --comms-hull: var(--console-hull);
+  --comms-panel: var(--console-panel);
+  --comms-raise: var(--console-raise);
+  --comms-edge: var(--console-edge);
+
+  --comms-ink: var(--console-ink);
+  --comms-ink-dim: var(--console-ink-dim);
+  --comms-ink-faint: var(--console-ink-faint);
+
+  /* Function roles — UNCHANGED aliases, same constraint as every register:
+     chrome may be restyled, a verdict may not. */
+  --comms-affirm: var(--console-affirm);
+  --comms-negative: var(--console-negative);
+  --comms-caution: var(--console-caution);
+  --comms-info: var(--console-info);
+
+  /* The quotation's two values, named in THIS surface's vocabulary even though
+     they resolve to the CRT register's. Naming them here is what keeps the
+     borrowing explicit: a reader of comms.css can see the whole quotation
+     without opening crt.css, and the token-drift guard can check it. */
+  --comms-quoted-ink: var(--console-affirm);
+  --comms-quoted-face: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+/* --- painting: the surface's own content, never the shell ---------------- */
+.comms-channel {
+  background-color: var(--comms-hull);
+  color: var(--comms-ink);
+}
+
+/* THE QUOTATION. The ship's computer speaking — and the only rule in this file
+   that reaches for the borrowed voice. */
+.comms-quoted {
+  color: var(--comms-quoted-ink);
+  font-family: var(--comms-quoted-face);
+  letter-spacing: 0.01em;
+}
+
+.comms-label {
+  color: var(--comms-ink-faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+/* Focus on the dark ground; content-scoped, not surface-scoped — see
+   viewscreen.css for the shell-reacher rationale. */
+.comms-channel :focus-visible {
+  outline: 2px solid var(--comms-affirm);
+  outline-offset: 2px;
+}
