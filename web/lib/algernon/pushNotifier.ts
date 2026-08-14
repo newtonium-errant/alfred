@@ -254,9 +254,16 @@ const realTrialDeps: TrialDeps = {
 // its own `setInterval` and its own "poller started" log, because
 // `instrumentation.ts` and the pages-router API routes are separate
 // compilations. THAT is the invariant; the chunk FILENAMES are build
-// coordinates, not names — they differ run to run (4477/1867 and 4294/4676 were
-// two builds of the identical tree), so reproduce the claim by counting chunks
-// that contain the start log, never by looking for a numbered file. Boot-arming touches one copy, the first
+// coordinates, not names — reproduce the claim by COUNTING chunks that contain
+// the start log, never by looking for a numbered file.
+//
+// And the reason is worse than "the ids are random". They are STABLE WITHIN AN
+// ENVIRONMENT ACROSS COMMITS and DIFFER ACROSS ENVIRONMENTS: this machine
+// produced 4477/1867 from two different trees, the reviewer's produced
+// 4294/4676 from two different trees. So the number is perfectly reproducible
+// for whoever writes it down, holds every time they re-check it, and is wrong
+// for everybody else. A reproducible-but-local coordinate is more dangerous in
+// a comment than a random one, because nothing the author can do will catch it. Boot-arming touches one copy, the first
 // route hit touches the other, each sees its own `null`, and BOTH arm. Every due
 // item then rings twice on every poll.
 //

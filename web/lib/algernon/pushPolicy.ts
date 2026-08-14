@@ -26,11 +26,13 @@ import type { FeedItem } from './feed';
 // item that is already open and was suppressed under the old default becomes
 // eligible at once, so the first poll after this ships rings for all of them.
 // That is correct rather than a bug, but the bound is open needs-you count
-// MULTIPLIED BY the subscription count — one push per item per subscription —
-// which this comment first stated as the item count alone and thereby halved at
-// today's subs=2. The number matters precisely because it is what someone reads
-// before deciding whether to deploy into a full queue, and it lands unannounced
-// on a restart rather than when somebody types a flag.
+// MULTIPLIED BY the live subscription count at deploy time — one push per item
+// per subscription — which this comment first stated as the item count alone.
+// No figure is quoted here on purpose: the subscriber count is production state,
+// and a durable comment cannot keep a production number true. Read it at deploy
+// time; the multiplier is the part that stays. It matters because it is what
+// someone checks before shipping into a full queue, and it lands unannounced on
+// a restart rather than when somebody types a flag.
 
 export type PushPolicy = 'email_urgent_override' | 'email_urgent_all' | 'needs_you';
 
