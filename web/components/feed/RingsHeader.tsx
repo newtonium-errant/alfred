@@ -141,9 +141,9 @@ export function RingsHeader({
     const itemError = completion.errorFor(it.id) ?? accept.errorFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
-    const dotClass = done ? 'bg-status-done-fg' : suggested ? 'bg-honeydew-400' : 'bg-status-progress-fg';
+    const dotClass = done ? 'bg-status-done-fg' : suggested ? 'bg-console-ink-faint' : 'bg-status-progress-fg';
     return (
-      <li key={it.id} data-testid="ring-panel-item" data-done={done} data-stage={stage} className="border-t border-dashed border-honeydew-200 pt-2 first:border-0 first:pt-0">
+      <li key={it.id} data-testid="ring-panel-item" data-done={done} data-stage={stage} className="border-t border-dashed border-console-edge pt-2 first:border-0 first:pt-0">
         <div className="flex items-start justify-between gap-2">
           <button
             type="button"
@@ -153,7 +153,7 @@ export function RingsHeader({
             className="flex min-w-0 flex-1 items-start gap-2 text-left"
           >
             <span aria-hidden className={`mt-1 h-2 w-2 shrink-0 rounded-full ${dotClass}`} />
-            <span className={`min-w-0 break-words text-sm font-semibold text-honeydew-700 ${done ? 'line-through opacity-70' : ''}`}>
+            <span className={`min-w-0 break-words text-sm font-semibold text-console-ink ${done ? 'line-through opacity-70' : ''}`}>
               {it.title || it.id}
             </span>
           </button>
@@ -172,7 +172,7 @@ export function RingsHeader({
                   data-testid="ring-undo"
                   disabled={compBusy}
                   onClick={() => completion.undo(it)}
-                  className="rounded-lg border border-honeydew-300 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-600 disabled:opacity-50"
+                  className="rounded-lg border border-console-edge px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink-dim disabled:opacity-50"
                 >
                   {compBusy ? '…' : 'Undo'}
                 </button>
@@ -187,7 +187,7 @@ export function RingsHeader({
               data-testid="ring-accept"
               disabled={acceptBusy}
               onClick={() => accept.accept(it)}
-              className="shrink-0 rounded-lg border border-honeydew-500 bg-honeydew-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+              className="shrink-0 rounded-lg border border-console-edge-bright bg-console-raise px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
             >
               {acceptBusy ? '…' : 'Accept'}
             </button>
@@ -198,7 +198,7 @@ export function RingsHeader({
               data-testid="ring-complete"
               disabled={compBusy}
               onClick={() => completion.complete(it)}
-              className="shrink-0 rounded-lg border border-honeydew-400 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+              className="shrink-0 rounded-lg border border-console-edge-bright px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
             >
               {compBusy ? '…' : '✓ Done'}
             </button>
@@ -212,7 +212,7 @@ export function RingsHeader({
               disabled
               aria-disabled="true"
               title={COMPLETION_UNAVAILABLE_HINT}
-              className="shrink-0 cursor-default rounded-lg border border-honeydew-200 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-honeydew-400 opacity-50"
+              className="shrink-0 cursor-default rounded-lg border border-console-edge px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink-faint opacity-50"
             >
               ✓ Done
             </button>
@@ -226,10 +226,10 @@ export function RingsHeader({
         )}
 
         {expanded && rows.length > 0 && (
-          <dl data-testid="ring-item-evidence" className="mt-1.5 space-y-1 pl-4 text-xs text-honeydew-600">
+          <dl data-testid="ring-item-evidence" className="mt-1.5 space-y-1 pl-4 text-xs text-console-ink-dim">
             {rows.map((r) => (
               <div key={r.key} className="flex gap-2">
-                <dt className="shrink-0 font-semibold text-honeydew-700">{evidenceLabel(r.key)}:</dt>
+                <dt className="shrink-0 font-semibold text-console-ink">{evidenceLabel(r.key)}:</dt>
                 <dd className="min-w-0 break-words">{r.value}</dd>
               </div>
             ))}
@@ -251,10 +251,10 @@ export function RingsHeader({
 
   return (
     <section aria-label="Today's tier rings" data-testid="rings-header">
-      <div className="flex items-center gap-3 rounded-xl border border-honeydew-200 bg-cream px-3 py-2 shadow-soft">
+      <div className="flex items-center gap-3 rounded-xl border border-console-edge bg-console-panel px-3 py-2 shadow-soft">
         {loading ? (
           // Intentionally-left-blank: an explicit loading signal, not a blank strip.
-          <p data-testid="rings-loading" className="text-sm text-honeydew-600">
+          <p data-testid="rings-loading" className="text-sm text-console-ink-dim">
             Loading your rings…
           </p>
         ) : (
@@ -266,7 +266,7 @@ export function RingsHeader({
 
       {!loading && totalItems === 0 && (
         // Intentionally-left-blank: three empty rings could read as broken — say so.
-        <p data-testid="rings-empty" className="mt-1.5 text-xs text-honeydew-600">
+        <p data-testid="rings-empty" className="mt-1.5 text-xs text-console-ink-dim">
           No tier suggestions yet — your rings fill as the day&rsquo;s tiers surface.
         </p>
       )}
@@ -279,16 +279,16 @@ export function RingsHeader({
           // COMMITTED = planned + done (the count denominator); SUGGESTED excluded.
           const committedCount = bucketItems.filter((it) => effectiveStage(it) !== 'suggested').length;
           return (
-            <div data-testid={`ring-panel-${activeBucket.key}`} className="mt-2 rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
+            <div data-testid={`ring-panel-${activeBucket.key}`} className="mt-2 rounded-xl border border-console-edge bg-console-panel p-3 shadow-soft">
               {/* Honest header: the committed ratio ("T2 · 1/2 done"), or — when nothing
                   is committed yet, only candidates — the suggested count. */}
-              <h3 className="text-xs font-bold uppercase tracking-wider text-honeydew-700">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-console-ink">
                 {activeBucket.label} · {committedCount > 0 ? `${doneItems.length}/${committedCount} done` : `${bucketItems.length} suggested`}
               </h3>
 
               {bucketItems.length === 0 ? (
                 // Genuinely nothing in this tier (the red-empty ring).
-                <p data-testid="ring-panel-empty" className="mt-2 text-xs text-honeydew-600">
+                <p data-testid="ring-panel-empty" className="mt-2 text-xs text-console-ink-dim">
                   Empty — nothing in this tier yet. Suggestions arrive with each sync.
                 </p>
               ) : (
@@ -313,7 +313,7 @@ export function RingsHeader({
                         data-testid="ring-show-done"
                         onClick={() => setShowDone((s) => !s)}
                         aria-expanded={showDone}
-                        className="text-[11px] font-semibold uppercase tracking-wider text-honeydew-600 underline underline-offset-2"
+                        className="text-[11px] font-semibold uppercase tracking-wider text-console-ink-dim underline underline-offset-2"
                       >
                         {showDone ? 'Hide done' : `Show done (${doneItems.length})`}
                       </button>
@@ -357,7 +357,7 @@ function Ring({
       aria-label={`${bucket.label} ring — ${n} item${n === 1 ? '' : 's'}, tap to view`}
       aria-expanded={active}
       onClick={onTap}
-      className={`relative block h-9 w-9 rounded-full ${active ? 'ring-2 ring-honeydew-400' : ''}`}
+      className={`relative block h-9 w-9 rounded-full ${active ? 'ring-2 ring-console-edge-bright' : ''}`}
     >
       <svg viewBox={`0 0 ${RING_VIEWBOX} ${RING_VIEWBOX}`} width="34" height="34" className="block">
         {n === 0 ? (
@@ -386,7 +386,7 @@ function Ring({
           ))
         )}
       </svg>
-      <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[8.5px] font-semibold text-honeydew-600">
+      <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[8.5px] font-semibold text-console-ink-dim">
         {bucket.label}
       </span>
     </button>
