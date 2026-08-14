@@ -172,15 +172,25 @@ async def test_the_stored_document_is_byte_identical(rrts_client) -> None:
     """Full replace, captured not interpreted: what lands is what was
     posted, including fields this receiver knows nothing about."""
     doc = _document(their_future_field={"nested": [1, 2, 3]})
+    # POST THE BYTES, do not hand aiohttp an object to serialise. With
+    # ``json=doc`` the posted bytes are aiohttp's serialiser's output and the
+    # expectation below is stdlib's, so the assertion silently depends on the
+    # two agreeing on separators and key order. They do today; nothing in
+    # this test pins that they must, and the day they diverge this fails
+    # while the receiver is behaving perfectly. Sending the exact bytes makes
+    # the posted payload the test's OWN known quantity — which is the only
+    # thing a byte-identity claim can honestly be made against.
+    raw_posted = json.dumps(doc).encode("utf-8")
     resp = await rrts_client.post(
-        "/rrts/export", json=doc, headers=_RRTS_HEADERS
+        "/rrts/export",
+        data=raw_posted,
+        headers={**_RRTS_HEADERS, "Content-Type": "application/json"},
     )
     assert resp.status == 200
     # BYTES, not just structure. Structural equality passes even if the
     # receiver re-serialised the document — which would silently normalise
     # key order, whitespace and number formatting on a file another system
     # produced. The stronger assertion is free, so it is the one to make.
-    raw_posted = json.dumps(doc).encode("utf-8")
     stored_bytes = export_path(rrts_client.app["_export_dir"]).read_bytes()
     assert stored_bytes == raw_posted
 

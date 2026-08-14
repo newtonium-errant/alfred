@@ -50,6 +50,21 @@ from typing import Any
 
 from aiohttp import web
 
+# The landing-path derivation lives in a DEPENDENCY-FREE module and is
+# re-exported here for every existing caller. It cannot live in this file:
+# the reader is the reconciler, which is part of the base install, and this
+# module imports aiohttp (the ``voice`` extra). A reader importing from here
+# would break a base install; a reader spelling the segment itself would be
+# the second spelling. So neither end owns it — see
+# :mod:`alfred.common.rrts_export`.
+from alfred.common.rrts_export import (  # noqa: F401 — re-exported surface
+    EXPORT_DIR_NAME,
+    EXPORT_FILENAME,
+    export_dir_for,
+    export_path,
+    export_path_for,
+)
+
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -64,10 +79,6 @@ RRTS_EXPORT_PEER_NAME = "rrts_export"
 #: tight.
 DEFAULT_RRTS_MAX_BYTES = 10 * 1024 * 1024
 
-#: The filename under the export directory. Fixed, because the reconciler
-#: reads it by name — the DIRECTORY is config-derived, this is not.
-EXPORT_FILENAME = "invoices.json"
-
 _KEY_RRTS_DIR = "_rrts_export_dir"
 _KEY_RRTS_MAX = "_rrts_export_max_bytes"
 
@@ -76,11 +87,6 @@ def _json_error(status: int, error: str, **extra: Any) -> web.Response:
     payload: dict[str, Any] = {"ok": False, "error": error}
     payload.update(extra)
     return web.json_response(payload, status=status)
-
-
-def export_path(export_dir: Path | str) -> Path:
-    """``<export_dir>/invoices.json`` — the file the reconciler reads."""
-    return Path(export_dir) / EXPORT_FILENAME
 
 
 def read_stored_exported_at(export_dir: Path | str) -> str:
@@ -301,7 +307,10 @@ def register_rrts_routes(
 
 __all__ = [
     "DEFAULT_RRTS_MAX_BYTES",
+    "EXPORT_DIR_NAME",
     "EXPORT_FILENAME",
+    "export_dir_for",
+    "export_path_for",
     "RRTS_EXPORT_PEER_NAME",
     "export_path",
     "read_stored_exported_at",

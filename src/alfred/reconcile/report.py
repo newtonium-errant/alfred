@@ -51,6 +51,7 @@ from typing import Any
 
 import structlog
 
+from .aging import LATE_AFTER_DAYS, AgingReport, find_late
 from .attention import (
     CLASS_LABELS,
     CLASS_UNKNOWN_EOB,
@@ -61,7 +62,9 @@ from .attention import (
     classify_all,
     propose_eob_mappings,
 )
+from .invoices import STALE_AFTER_HOURS, InvoiceSnapshot
 from .ledger import ClaimLine, LedgerContents, Statement, group_by_statement
+from .matcher import BAND_HIGH, MatchReport, match_snapshot
 from .parser import DATE_SOURCE_CAPTURE
 from .money import format_money
 
@@ -331,10 +334,232 @@ class BacklogReport:
     flagged_lines: int = 0
     total_lines: int = 0
     proposals: list[ProposedMapping] = field(default_factory=list)
+    #: The invoice side, when an export was available. ``None`` means the
+    #: caller passed no snapshot at all — a DIFFERENT state from "the export
+    #: is missing from disk", which is an :class:`InvoiceSnapshot` with
+    #: ``absent=True``. The report distinguishes them because they need
+    #: different actions: one is unconfigured, the other is a feed that
+    #: stopped arriving.
+    snapshot: InvoiceSnapshot | None = None
+    match: MatchReport | None = None
+    aging: AgingReport | None = None
 
     @property
     def has_discrepancies(self) -> bool:
         return any(_is_discrepant(t) for t in self.statement_totals)
+
+
+def _invoice_side_sections(
+    snapshot: InvoiceSnapshot | None,
+    match: MatchReport | None,
+    aging: AgingReport | None,
+) -> list[str]:
+    """The invoice side: the feed's state, the late list, the proposed joins.
+
+    **Rendered ABOVE the empty-ledger early return, deliberately.** These are
+    OBSERVATIONS ABOUT THE INVOICE FEED, and the feed's state does not depend
+    on whether anything has been seeded into the ledger — an instance with an
+    empty ledger and a three-day-old export needs to be told about the export.
+    Placing them after the early return would silence exactly the case where
+    the signal matters most, which is the same trap the surveyor's
+    ``no_changed_clusters`` early-return already documents.
+    """
+    out: list[str] = []
+    out.append("## Invoice side")
+    out.append("")
+
+    if snapshot is None:
+        # ILB, and distinct from "the export is missing". No invoice side was
+        # supplied at all, so nothing here was even attempted.
+        out.append(
+            "_No invoice export was read for this report, so nothing on this "
+            "page can say what was ASKED — only what the provider answered. "
+            "Late-invoice detection and payment matching are both unavailable "
+            "until `reconcile.invoices_path` resolves to RRTS's export._"
+        )
+        out.append("")
+        return out
+
+    out.append(snapshot.summary())
+    out.append("")
+
+    if snapshot.unknown_statuses:
+        # The count line the loader's aggregation exists for. A status that
+        # only ever appears in a log line stays unknown for a month, because
+        # nobody greps for a thing they do not know exists. It is also the
+        # SAFETY VALVE for two deliberate fail-closed exclusions: an
+        # unknown-status invoice is matched by nothing and aged by nothing,
+        # so this line is the only place it can surface at all.
+        total = sum(snapshot.unknown_statuses.values())
+        out.append(
+            f"**{total} invoice(s) carry a status this build does not "
+            f"recognise.** They are neither chased nor matched — both gates "
+            f"fail closed on an unknown status rather than inventing a "
+            f"meaning for it — so this line is the only place they appear. "
+            f"Teach the status or check the export:"
+        )
+        for status, n in sorted(snapshot.unknown_statuses.items()):
+            out.append(f"- `{status}`: {n}")
+        out.append("")
+    else:
+        out.append(
+            "_Every invoice status in the export is one this build "
+            "recognises — the check ran and found nothing unknown._"
+        )
+        out.append("")
+
+    if snapshot.is_stale:
+        out.append(
+            f"> **The export is STALE** (the agreed window is "
+            f"{STALE_AFTER_HOURS}h). Nothing was matched or aged against it: "
+            f"a chase computed from old data sends you after money that may "
+            f"already have arrived, and a join made from it can attach a "
+            f"payment to an invoice that has since changed."
+        )
+        out.append("")
+        return out
+
+    out.append("## Late invoices")
+    out.append("")
+    if aging is None:
+        out.append(
+            "_The aging watchdog did not run for this report._"
+        )
+    elif not aging.examined:
+        out.append(
+            "_No chaseable invoice in the export — there is nothing to age. "
+            "The watchdog ran and the loop has nothing to chase._"
+        )
+    elif not aging.late:
+        # The ILB line the watchdog exists to be able to say.
+        out.append(
+            f"_**No invoice is late — the loop has nothing to chase.** All "
+            f"{aging.examined} chaseable invoice(s) are inside the "
+            f"{LATE_AFTER_DAYS}-day window. This is the watchdog reporting a "
+            f"clean result, not an empty section._"
+        )
+    else:
+        out.append(
+            f"{len(aging.late)} invoice(s) are more than {LATE_AFTER_DAYS} "
+            f"days past the date they were sent, with no payment matched "
+            f"against them. Oldest first."
+        )
+        out.append("")
+        out.append("| Invoice | Client | Amount | Sent | Days | Basis |")
+        out.append("| --- | --- | --- | --- | --- | --- |")
+        for entry in aging.late:
+            basis = (
+                "**invoice_date (weaker)**" if entry.basis_is_weak
+                else "date_sent"
+            )
+            out.append(
+                f"| {entry.invoice_no} "
+                f"| {entry.client_name or '(unnamed)'} "
+                f"| {format_money(entry.amount_excl_tax)} "
+                f"| {entry.since} "
+                f"| {entry.days_outstanding} "
+                f"| {basis} |"
+            )
+        if any(e.basis_is_weak for e in aging.late):
+            out.append("")
+            out.append(
+                "_A **weaker** basis means the invoice carried no `date_sent` "
+                "and its clock was started from `invoice_date` instead, per "
+                "RRTS's own rider. It is a real clock on a weaker fact — "
+                "worth confirming before making the call._"
+            )
+    if aging is not None and aging.undateable:
+        out.append("")
+        out.append(
+            f"_{len(aging.undateable)} chaseable invoice(s) carry neither "
+            f"`date_sent` nor `invoice_date`, so no clock can be started for "
+            f"them. They are reported rather than aged from an invented "
+            f"moment: {', '.join(aging.undateable)}._"
+        )
+    out.append("")
+
+    out.append("## Proposed payment matches")
+    out.append("")
+    if match is None:
+        out.append("_The matcher did not run for this report._")
+        out.append("")
+        return out
+
+    out.append(
+        "**Proposals only.** Nothing below has been actioned, closed or "
+        "written back, and the confidence is this build's own judgement — "
+        "the join is client and date of service for the group, with "
+        "`amount_excl_tax` confirming which invoice inside it."
+    )
+    out.append("")
+    if not match.proposals:
+        out.append(
+            f"_No proposal met the join. {match.summary()}_"
+        )
+    else:
+        high = sum(1 for p in match.proposals if p.band == BAND_HIGH)
+        out.append(
+            f"{len(match.proposals)} proposal(s), {high} at high confidence."
+        )
+        out.append("")
+        out.append(
+            "| Invoice | Claimant | Service date | Ledger billed | "
+            "Invoice amount | Confidence |"
+        )
+        out.append("| --- | --- | --- | --- | --- | --- |")
+        for p in match.proposals:
+            out.append(
+                f"| {p.invoice_no} "
+                f"| {p.claimant or '(unnamed)'} "
+                f"| {p.service_date} "
+                f"| {format_money(p.ledger_billed)} "
+                f"| {format_money(p.invoice_amount_excl_tax)} "
+                f"| {p.band} ({p.confidence:.2f}) |"
+            )
+        out.append("")
+        out.append("Why each one, in the matcher's own words:")
+        out.append("")
+        for p in match.proposals:
+            out.append(f"- **{p.invoice_no}** — {p.claimant}, {p.service_date}")
+            for reason in p.basis:
+                out.append(f"  - {reason}")
+    out.append("")
+
+    if match.ambiguous:
+        out.append(
+            f"**{len(match.ambiguous)} group(s) were left UNRESOLVED** rather "
+            f"than guessed at. Attaching a payment to the wrong same-day "
+            f"invoice is not recoverable from this report, so the matcher "
+            f"refuses instead:"
+        )
+        for amb in match.ambiguous:
+            candidates = (
+                f" (candidates: {', '.join(amb.candidate_invoice_nos)})"
+                if amb.candidate_invoice_nos else ""
+            )
+            out.append(
+                f"- {amb.claimant or '(unnamed)'}, {amb.service_date} — "
+                f"{amb.reason}{candidates}"
+            )
+        out.append("")
+    if match.unmatched:
+        out.append(
+            f"**{len(match.unmatched)} claimant/date group(s) have no "
+            f"candidate invoice at all.** The ledger says a claim was "
+            f"processed and the export has nothing to join it to — worth a "
+            f"look at whether the invoice was ever raised:"
+        )
+        for miss in match.unmatched:
+            out.append(f"- {miss.claimant or '(unnamed)'}, {miss.service_date}")
+        out.append("")
+    if match.unbucketable:
+        out.append(
+            f"_{len(match.unbucketable)} claim line(s) could not be grouped "
+            f"at all — no surname, or no readable date of service. They can "
+            f"be joined to nothing and are counted here rather than dropped._"
+        )
+        out.append("")
+    return out
 
 
 def build_summary(
@@ -345,6 +570,9 @@ def build_summary(
     flagged_lines: int,
     proposals: list[ProposedMapping],
     generated_at: str,
+    snapshot: InvoiceSnapshot | None = None,
+    match: MatchReport | None = None,
+    aging: AgingReport | None = None,
 ) -> str:
     """The orientation half. Never empty, whatever the ledger holds."""
     out: list[str] = []
@@ -353,6 +581,12 @@ def build_summary(
     out.append(f"_Generated {generated_at}. Propose-only: nothing in this "
                f"report has been actioned, closed, or written back._")
     out.append("")
+
+    # ABOVE the empty-ledger early return. See _invoice_side_sections: the
+    # invoice feed's state is independent of whether the ledger holds
+    # anything, and a stale export on an unseeded instance is exactly the
+    # case a post-return placement would silence.
+    out.extend(_invoice_side_sections(snapshot, match, aging))
 
     if not total_lines:
         # ILB — an empty ledger is a state, and it must be readable as one.
@@ -579,8 +813,23 @@ def build_report(
     eob_map: dict[str, str] | None = None,
     corrections: dict[str, Correction] | None = None,
     generated_at: str | None = None,
+    snapshot: InvoiceSnapshot | None = None,
+    now: datetime | None = None,
 ) -> BacklogReport:
-    """Build the whole bulk-review artifact from a loaded ledger."""
+    """Build the whole bulk-review artifact from a loaded ledger.
+
+    ``snapshot`` is the invoice side. When given, the matcher and the aging
+    watchdog BOTH run here — one production path, in the required order: the
+    matcher's proposals feed :func:`~alfred.reconcile.aging.find_late` so a
+    proposed invoice stops being chased. Passing them in pre-computed was the
+    alternative and it was worse: two callers could then run them in the
+    wrong order, or run one and not the other, and the report would look
+    complete either way.
+
+    ``None`` means no invoice side was configured, and the report says so
+    explicitly rather than rendering a page that silently answers only half
+    the question.
+    """
     stamp = generated_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
     classifications_list = classify_all(
         contents.claim_lines, eob_map=eob_map, corrections=corrections
@@ -597,6 +846,16 @@ def build_report(
     flagged = sum(1 for c in classifications_list if c.needs_attention)
     proposals = propose_eob_mappings(corrections or {}, eob_map=eob_map)
 
+    match: MatchReport | None = None
+    aging: AgingReport | None = None
+    if snapshot is not None:
+        match = match_snapshot(contents.claim_lines, snapshot)
+        aging = find_late(
+            snapshot,
+            matched_invoice_nos=match.matched_invoice_nos,
+            now=now,
+        )
+
     report = BacklogReport(
         csv_text=build_csv(contents.claim_lines, by_key),
         summary_text=build_summary(
@@ -606,12 +865,18 @@ def build_report(
             flagged_lines=flagged,
             proposals=proposals,
             generated_at=stamp,
+            snapshot=snapshot,
+            match=match,
+            aging=aging,
         ),
         class_counts=counts,
         statement_totals=totals,
         flagged_lines=flagged,
         total_lines=len(contents.claim_lines),
         proposals=proposals,
+        snapshot=snapshot,
+        match=match,
+        aging=aging,
     )
 
     log.info(
@@ -620,12 +885,22 @@ def build_report(
         flagged=report.flagged_lines,
         statements=len(totals),
         discrepancies=sum(1 for t in totals if _is_discrepant(t)),
+        invoice_side=snapshot is not None,
+        late=len(aging.late) if aging else 0,
+        match_proposals=len(match.proposals) if match else 0,
         detail=(
             "ledger is empty — the report states that rather than rendering "
             "blank sections"
             if not report.total_lines else ""
         ),
     )
+    if snapshot is None:
+        log.info(
+            "reconcile.report.no_invoice_side",
+            detail="no invoice export was supplied, so the report covers "
+                   "only what the provider answered — no late detection and "
+                   "no payment matching. This is stated on the report too.",
+        )
     return report
 
 

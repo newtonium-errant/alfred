@@ -49,6 +49,12 @@ from alfred.common.instance_paths import (
     configured_logging_dir,
     instance_slug,
 )
+# The reader's half of the landing path. Imported from the dependency-free
+# module rather than from the transport receiver that writes it: the receiver
+# needs aiohttp (the optional ``voice`` extra) and reconcile is base-install,
+# so importing the writer here would break a base install. The segment is
+# never spelled on this side — see :mod:`alfred.common.rrts_export`.
+from alfred.common.rrts_export import export_path_for
 
 from .attention import ALL_CLASSES, normalise_eob
 from .money import DATE_ORDERS
@@ -89,6 +95,13 @@ class ReconcileConfig:
     #: be worse than shipping none.
     eob_classes: dict[str, str] = field(default_factory=dict)
     min_correction_support: int = DEFAULT_MIN_CORRECTION_SUPPORT
+    #: Where RRTS's invoice snapshot lands, derived through the ONE shared
+    #: helper the receiver also uses. Empty when no data dir anchors it —
+    #: which reads as "no invoice side configured", a real and reportable
+    #: state, not a reason to guess the cwd. An explicit
+    #: ``reconcile.invoices_path`` always wins, for the same reason
+    #: ``store_dir`` does.
+    invoices_path: str = ""
 
     def __post_init__(self) -> None:
         """Normalise, validate, and fail SAFE when there is nowhere to write.
@@ -217,6 +230,24 @@ def load_from_unified(raw: dict[str, Any]) -> ReconcileConfig:
         known["store_dir"] = _default_store_dir(raw, instance)
     else:
         known["store_dir"] = store_dir.strip()
+
+    # The invoice side. NOT instance-slugged, and deliberately not: the
+    # receiver writes through ``export_path_for`` and this must resolve to
+    # the SAME file. Slugging it here would be a second, divergent opinion
+    # about where the snapshot lives — the exact failure the shared
+    # derivation exists to prevent. Per-instance separation already comes
+    # from ``logging.dir`` differing per instance.
+    #
+    # The segment itself is deliberately not spelled anywhere in this file;
+    # a source-level pin in tests/test_rrts_wiring.py enforces that, and it
+    # counts PROSE as a spelling — correctly, because a comment naming the
+    # path is how the next edit copies it into code.
+    invoices_path = known.get("invoices_path")
+    if not (isinstance(invoices_path, str) and invoices_path.strip()):
+        data_dir = configured_logging_dir(raw)
+        known["invoices_path"] = export_path_for(data_dir) if data_dir else ""
+    else:
+        known["invoices_path"] = invoices_path.strip()
 
     eob = known.get("eob_classes")
     if not isinstance(eob, dict):
