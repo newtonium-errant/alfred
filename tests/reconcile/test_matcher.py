@@ -29,7 +29,22 @@ from alfred.reconcile.ledger import ClaimLine
 from alfred.reconcile.matcher import (
     AMOUNT_AGREES,
     AMOUNT_DISAGREES,
+    AMOUNT_OTHER_BASIS,
     AMOUNT_UNCOMPARABLE,
+    BAND_MEDIUM_AT,
+    BASIS_CLASS_LABELS,
+    BASIS_INCL_TAX,
+    BASIS_SENTENCES,
+    BASIS_TAX_LINE,
+    HST_RATIO,
+    RATIO_TOLERANCE,
+    TAX_LINE_STEP,
+    CLASS_SEPARATION,
+    SMALLEST_INVOICE_AMOUNT,
+    WEIGHT_AMOUNT_OTHER_BASIS,
+    _band,
+    worst_case_ratio_deviation,
+    recognise_basis,
     BAND_HIGH,
     BAND_LOW,
     BAND_MEDIUM,
@@ -40,6 +55,7 @@ from alfred.reconcile.matcher import (
     CITATION_UNCONFIRMABLE,
     MATCHABLE_STATUSES,
     PENALTY_AMBIGUOUS_SURNAME,
+    PENALTY_AMOUNT_DISAGREES,
     WEIGHT_AMOUNT_AGREES,
     WEIGHT_BUCKET,
     build_accounting_index,
@@ -124,7 +140,10 @@ def test_a_clean_single_candidate_is_proposed_at_high_confidence() -> None:
     assert p.amount_outcome == AMOUNT_AGREES
     assert p.amount_delta == Decimal("0")
     assert p.band == BAND_HIGH
-    assert p.confidence == WEIGHT_BUCKET + WEIGHT_AMOUNT_AGREES
+    # LITERAL, never recomputed from the constants under test: a pin that
+    # derives its expectation from the thing it guards moves WITH it and
+    # can never detect a change to it.
+    assert p.confidence == 0.90
     assert p.citation_status == CITATION_NONE
     assert not report.ambiguous
     assert not report.unmatched
@@ -284,9 +303,7 @@ def test_an_ambiguous_surname_split_is_weighted_down_and_stated() -> None:
     assert len(report.proposals) == 1
     p = report.proposals[0]
     assert p.ambiguous_name is True
-    assert p.confidence == (
-        WEIGHT_BUCKET + WEIGHT_AMOUNT_AGREES - PENALTY_AMBIGUOUS_SURNAME
-    )
+    assert p.confidence == 0.70  # literal, not recomputed from the weights
     assert p.band == BAND_MEDIUM, (
         "an ambiguous split must not read as high confidence — a confident "
         "wrong join is the specific harm this penalty exists for"
@@ -327,9 +344,7 @@ def test_a_citation_matching_the_rrts_number_is_marked_unconfirmable() -> None:
     p = report.proposals[0]
     assert p.citation == "487"
     assert p.citation_status == CITATION_UNCONFIRMABLE
-    assert p.confidence == round(
-        WEIGHT_BUCKET + WEIGHT_AMOUNT_AGREES + BOOST_CITATION_UNCONFIRMABLE, 4
-    )
+    assert p.confidence == 0.95  # literal, not recomputed from the weights
     reason = " ".join(p.basis)
     assert "CANNOT be confirmed" in reason
     assert "ACCOUNTING REFERENCE" in reason
@@ -661,3 +676,465 @@ def test_the_matched_log_carries_the_counts_that_make_it_greppable() -> None:
     assert event["invoices"] == 1
     assert event["proposals"] == 1
     assert event["detail"] == ""
+
+
+# --- the fourth outcome: recognised delta classes ----------------------------
+#
+# Ratified constraint: a recognised delta class is AGREEMENT ON A KNOWN OTHER
+# BASIS — its own amount_outcome, its own basis sentence, its own weight
+# constant beside the others, never a branch inside the disagreement path.
+# Exactly two classes ship; the once-observed 0.7826 stays unrecognised,
+# because one example is not a class.
+
+
+def test_a_tax_inclusive_ledger_row_reconciles_rather_than_disagreeing() -> None:
+    """x1.14 — the HST factor, which appeared in the data rather than being
+    asserted into the module."""
+    report = match_snapshot(
+        [_line(billed="342.00")],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    )
+
+    p = report.proposals[0]
+    assert p.amount_outcome == AMOUNT_OTHER_BASIS
+    assert p.basis_class == BASIS_INCL_TAX
+    assert p.amount_delta == Decimal("42.00"), "the delta is still stated"
+    assert p.confidence == 0.75  # literal, not recomputed from the weights
+    sentence = " ".join(p.basis)
+    assert "RECONCILE" in sentence
+    assert "not a disagreement that has been forgiven" in sentence
+    assert "DISAGREE" not in sentence, (
+        "the fourth outcome must not render the disagreement's words — that "
+        "would tell the operator the opposite of what the data shows"
+    )
+
+
+def test_a_tax_line_shape_reconciles_on_its_own_class() -> None:
+    report = match_snapshot(
+        [_line(billed="42.00")],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    )
+    p = report.proposals[0]
+    assert p.amount_outcome == AMOUNT_OTHER_BASIS
+    assert p.basis_class == BASIS_TAX_LINE
+    assert "RECONCILE" in " ".join(p.basis)
+
+
+def test_the_once_observed_ratio_stays_unrecognised() -> None:
+    """0.7826 was seen ONCE. One example is not a class, and a vocabulary
+    that admits a guess is how a heuristic starts laundering coincidences
+    into confidence. POSITIVE CONTROL in the same test: the two measured
+    classes ARE recognised, so this is the recogniser discriminating rather
+    than recognising nothing."""
+    outlier = match_snapshot(
+        [_line(billed="234.78")],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    ).proposals[0]
+    assert outlier.amount_outcome == AMOUNT_DISAGREES
+    assert outlier.basis_class == ""
+    assert outlier.band == BAND_LOW
+
+    assert recognise_basis(Decimal("342.00"), Decimal("300.00")) == BASIS_INCL_TAX
+    assert recognise_basis(Decimal("42.00"), Decimal("300.00")) == BASIS_TAX_LINE
+
+
+def test_the_unrecognised_bucket_is_the_discovery_channel() -> None:
+    """A recogniser that absorbed everything would close the loop that
+    produced it. An unrecognised ratio must stay a plain, visible
+    disagreement — with its delta and a line saying no class matched."""
+    p = match_snapshot(
+        [_line(billed="345.00")],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    ).proposals[0]
+    assert p.amount_outcome == AMOUNT_DISAGREES
+    assert p.amount_delta == Decimal("45.00")
+    assert "no recognised basis class" in " ".join(p.basis)
+
+
+# --- the tolerance, bounded at BOTH ends -------------------------------------
+
+
+def test_the_tolerance_absorbs_cent_rounding_at_the_small_end() -> None:
+    """Lower bound. Both figures come from independently rounded documents;
+    at the smallest amounts these carry, the induced ratio error is ~0.00094,
+    so a tighter tolerance would reject genuine members for rounding alone."""
+    # 10.00 * 1.14 = 11.40 exactly; the neighbouring cents must still land.
+    for billed in ("11.39", "11.40", "11.41"):
+        assert recognise_basis(Decimal(billed), Decimal("10.00")) == (
+            BASIS_INCL_TAX
+        ), billed
+
+
+def test_the_two_classes_cannot_collide_at_the_shipped_tolerance() -> None:
+    """Upper bound, and the reason precedence is currently non-binding.
+
+    1.14 is NOT an exact multiple of 0.14 — the nearest is 1.12, a gap of
+    0.02, twenty times the tolerance. Pinned rather than assumed, because
+    the whole classification rests on it.
+    """
+    gap = abs(HST_RATIO - Decimal("8") * TAX_LINE_STEP)
+    assert gap == Decimal("0.02")
+    assert gap == CLASS_SEPARATION, "the derived separation must equal the gap"
+    assert RATIO_TOLERANCE * 10 <= gap, (
+        "the tolerance has grown far enough that the two classes could claim "
+        "the same row — precedence would then be doing real work and must be "
+        "re-argued, not left to branch order"
+    )
+    # The neighbouring 0.14-multiple is NOT read as the HST class...
+    assert recognise_basis(Decimal("336.00"), Decimal("300.00")) == (
+        BASIS_TAX_LINE
+    ), "1.12 is a tax-line multiple, not the HST ratio"
+    # ...and the HST ratio is NOT read as a tax-line multiple.
+    assert recognise_basis(Decimal("342.00"), Decimal("300.00")) == (
+        BASIS_INCL_TAX
+    )
+
+
+def test_a_ratio_just_outside_the_tolerance_is_not_recognised() -> None:
+    """The tolerance is a width, not a wish — something must fall outside
+    it, or 'within tolerance' would be a check that cannot fail."""
+    # 300 * 1.145 = 343.50, which is 0.005 off the HST ratio — 5x tolerance.
+    assert recognise_basis(Decimal("343.50"), Decimal("300.00")) == ""
+
+
+# --- defensive shapes --------------------------------------------------------
+
+
+def test_signs_must_agree_before_a_ratio_means_anything() -> None:
+    """A pair whose signs differ is not on another basis, it is on the other
+    side of the ledger — calling that a tax shape would explain away a real
+    finding. A reversal (negative on BOTH sides) is a genuine ratio."""
+    assert recognise_basis(Decimal("-342.00"), Decimal("300.00")) == ""
+    assert recognise_basis(Decimal("342.00"), Decimal("-300.00")) == ""
+    assert recognise_basis(Decimal("-342.00"), Decimal("-300.00")) == (
+        BASIS_INCL_TAX
+    )
+
+
+def test_a_zero_on_either_side_has_no_ratio() -> None:
+    assert recognise_basis(Decimal("342.00"), Decimal("0.00")) == ""
+    assert recognise_basis(Decimal("0.00"), Decimal("300.00")) == ""
+
+
+def test_every_recognised_class_has_a_sentence_and_a_label() -> None:
+    """Exhaustive by construction: a class added without a sentence would
+    KeyError at render time, and one without a label would print its raw
+    identifier at the operator."""
+    classes = {BASIS_INCL_TAX, BASIS_TAX_LINE}
+    assert set(BASIS_SENTENCES) == classes
+    assert set(BASIS_CLASS_LABELS) == classes
+    for text in BASIS_SENTENCES.values():
+        assert "RECONCILE" in text, (
+            "a basis sentence must say the figures reconcile — that is what "
+            "distinguishes this outcome from a forgiven disagreement"
+        )
+
+
+# --- confidence: the headroom rule holds under the new outcome ---------------
+
+
+def test_a_recognised_basis_never_reaches_full_confidence() -> None:
+    """Full stays reserved for exact agreement plus a confirmed crosswalk.
+    The tuning must not widen what counts as certainty."""
+    ceiling = (
+        WEIGHT_BUCKET + WEIGHT_AMOUNT_OTHER_BASIS + BOOST_CITATION_CROSSWALK
+    )
+    assert ceiling < 1.0, (
+        "recognised-other-basis plus a crosswalk must stay below full"
+    )
+    assert WEIGHT_AMOUNT_OTHER_BASIS < WEIGHT_AMOUNT_AGREES, (
+        "an inference about which basis a row is on must not outrank a raw "
+        "agreement"
+    )
+    assert WEIGHT_BUCKET + WEIGHT_AMOUNT_AGREES + BOOST_CITATION_CROSSWALK >= 1.0
+
+
+def test_a_recognised_class_rises_out_of_the_low_band() -> None:
+    """The point of the tuning, asserted as a band movement rather than as a
+    number: the same pair scored LOW before the class existed."""
+    p = match_snapshot(
+        [_line(billed="342.00")],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    ).proposals[0]
+    assert p.band == BAND_MEDIUM
+
+    # The before-figure as a LITERAL: this pair scored 0.30 (LOW) before the
+    # class existed. Recomputing it from the weights would make the pin
+    # follow any change to them and prove nothing.
+    scored_as_plain_disagreement = 0.30
+    assert scored_as_plain_disagreement < BAND_MEDIUM_AT, (
+        "before the class existed this pair scored into the low band — that "
+        "is the before-figure this tuning moves"
+    )
+    assert p.confidence > scored_as_plain_disagreement
+
+
+# --- discrimination: exact still outranks a recognised class -----------------
+
+
+def test_an_exact_agreement_outranks_a_recognised_other_basis() -> None:
+    report = match_snapshot(
+        [_line(billed="300.00")],
+        _snapshot(
+            _invoice("INV-EXACT", amount="300.00"),
+            _invoice("INV-BASIS", amount="263.16"),  # 300/1.14
+        ),
+    )
+    assert [p.invoice_no for p in report.proposals] == ["INV-EXACT"]
+
+
+def test_a_sole_recognised_basis_wins_when_nothing_agrees_exactly() -> None:
+    report = match_snapshot(
+        [_line(billed="342.00")],
+        _snapshot(
+            _invoice("INV-BASIS", amount="300.00"),   # x1.14
+            _invoice("INV-NOISE", amount="511.00"),   # no class
+        ),
+    )
+    assert [p.invoice_no for p in report.proposals] == ["INV-BASIS"]
+
+    # POSITIVE CONTROL: two recognised candidates cannot be split, and the
+    # matcher refuses rather than picking.
+    twins = match_snapshot(
+        [_line(billed="342.00")],
+        _snapshot(
+            _invoice("INV-A", amount="300.00"),
+            _invoice("INV-B", amount="300.00"),
+        ),
+    )
+    assert not twins.proposals
+    assert len(twins.ambiguous) == 1
+    assert "recognised other basis" in twins.ambiguous[0].reason
+
+
+def test_two_exact_agreements_are_not_broken_by_a_recognised_basis() -> None:
+    """The guard the precedence actually lives in, reached on purpose.
+
+    The obvious precedence pin — one exact candidate beside one other-basis
+    candidate — CANNOT fire against a broken guard: the sole-exact branch
+    settles it and returns before the guard is ever consulted. Dropping the
+    ``not agreeing`` condition scored ZERO against that pin, and only the
+    mutation figure showed it.
+
+    The reaching case is TWO exact agreements plus a recognised other basis.
+    The amount cannot single one out, so the bucket is ambiguous; a guard
+    that only asked ``len(on_basis) == 1`` would hand the payment to the
+    other-basis invoice while two better candidates sat tied beside it.
+    """
+    report = match_snapshot(
+        [_line(billed="300.00")],
+        _snapshot(
+            _invoice("INV-EXACT-A", amount="300.00"),
+            _invoice("INV-EXACT-B", amount="300.00"),
+            _invoice("INV-BASIS", amount="263.16"),  # 300 / 1.14
+        ),
+    )
+    assert not report.proposals, (
+        "two tied exact agreements must leave the bucket unresolved — the "
+        "recognised-basis candidate must not win by being the only one of "
+        "its kind"
+    )
+    assert len(report.ambiguous) == 1
+    assert "INV-BASIS" in report.ambiguous[0].candidate_invoice_nos
+
+    # POSITIVE CONTROL: with the tie broken, the exact agreement wins and the
+    # recognised-basis candidate still does not.
+    broken_tie = match_snapshot(
+        [_line(billed="300.00")],
+        _snapshot(
+            _invoice("INV-EXACT-A", amount="300.00"),
+            _invoice("INV-BASIS", amount="263.16"),
+        ),
+    )
+    assert [p.invoice_no for p in broken_tie.proposals] == ["INV-EXACT-A"]
+
+
+# --- gate-1 pre-registered criteria ------------------------------------------
+
+
+def test_the_cannot_compare_population_stays_medium() -> None:
+    """A KNIFE EDGE, pinned because nobody editing the disagree path is
+    looking at it.
+
+    A proposal resting on client and date alone adds nothing to the base, so
+    it scores exactly WEIGHT_BUCKET — which happens to EQUAL BAND_MEDIUM_AT,
+    and `_band` compares with `>=`. The whole cannot-compare population is
+    therefore MEDIUM by the boundary and nothing else. Drop WEIGHT_BUCKET by
+    a hundredth, or add any penalty to that path, and every one of them
+    silently becomes LOW — collateral from a change aimed somewhere else
+    entirely.
+
+    Pinned as a BAND, not as a number, so the pin survives a deliberate
+    re-tune that keeps the intent and fails a change that does not.
+    """
+    uncomparable = match_snapshot(
+        [_line(billed=None)],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    ).proposals[0]
+    assert uncomparable.amount_outcome == AMOUNT_UNCOMPARABLE
+    assert uncomparable.band == BAND_MEDIUM, (
+        "the cannot-compare population dropped out of MEDIUM. If that was "
+        "intended, say so here; if it was collateral from a weight change "
+        "aimed at the disagreement path, this is the pin catching it"
+    )
+
+    # The edge itself, stated so the next reader sees WHY this is fragile.
+    # LITERALS on both sides. Written as _band(0.55)/_band(0.54) rather
+    # than _band(WEIGHT_BUCKET)/_band(WEIGHT_BUCKET - 0.01) precisely so
+    # that moving WEIGHT_BUCKET or BAND_MEDIUM_AT is DETECTED here instead
+    # of being tracked silently.
+    assert _band(0.55) == BAND_MEDIUM
+    assert _band(0.54) == BAND_LOW, (
+        "one hundredth below the base flips the whole population — that is "
+        "the margin this pin is protecting"
+    )
+
+
+def test_a_recognised_class_is_never_a_match_claim() -> None:
+    """Gate-explicit form of the ratified constraint: a recognised class must
+    be distinguishable from AGREEMENT in BOTH score and words.
+
+    x1.14 recognised is *a disagreement with an explanation*. It must never
+    present as a match — not at the agreement score, not in the HIGH band,
+    and not with a sentence a reader could mistake for one.
+    """
+    agree = match_snapshot(
+        [_line(billed="300.00")], _snapshot(_invoice("INV-1", amount="300.00"))
+    ).proposals[0]
+    basis = match_snapshot(
+        [_line(billed="342.00")], _snapshot(_invoice("INV-1", amount="300.00"))
+    ).proposals[0]
+
+    # Score: strictly between the disagree and agree paths, never equal to
+    # the agreement score, never HIGH.
+    assert -PENALTY_AMOUNT_DISAGREES < WEIGHT_AMOUNT_OTHER_BASIS
+    assert WEIGHT_AMOUNT_OTHER_BASIS < WEIGHT_AMOUNT_AGREES
+    assert basis.confidence < agree.confidence
+    assert basis.band == BAND_MEDIUM and agree.band == BAND_HIGH
+    assert basis.band != BAND_HIGH
+
+    # Words: the basis line names WHICH class, not merely that some basis
+    # applied — and it still carries the delta, because the figures did not
+    # match and the report must not imply they did.
+    sentence = " ".join(basis.basis)
+    assert "1.14" in sentence and "HST" in sentence
+    assert str(basis.amount_delta) in sentence
+    assert basis.basis_class == BASIS_INCL_TAX
+
+    # The two classes are distinguishable from EACH OTHER in words too.
+    tax_line = match_snapshot(
+        [_line(billed="42.00")], _snapshot(_invoice("INV-1", amount="300.00"))
+    ).proposals[0]
+    assert "tax-line" in " ".join(tax_line.basis)
+    assert " ".join(tax_line.basis) != sentence
+
+
+def test_the_unrecognised_outlier_lands_audibly() -> None:
+    """Not merely 'not recognised' — SAID. A ratio that matched no class
+    must announce that it matched none, or the operator cannot tell a
+    considered miss from a check that never ran."""
+    p = match_snapshot(
+        [_line(billed="234.78")],
+        _snapshot(_invoice("INV-1", amount="300.00")),
+    ).proposals[0]
+
+    assert p.amount_outcome == AMOUNT_DISAGREES
+    assert p.basis_class == ""
+    sentence = " ".join(p.basis)
+    assert "no recognised basis class" in sentence, (
+        "the miss must be audible — silence here is indistinguishable from a "
+        "recogniser that never ran"
+    )
+    assert "how the next class gets found" in sentence
+    assert str(p.amount_delta) in sentence
+
+
+def test_the_tolerance_sits_inside_both_of_its_bounds() -> None:
+    """The RELATIONSHIP, not the literal — a literal cannot notice that its
+    own justification stopped being true.
+
+    THE BUG THIS REPLACES, because it shipped: the first bound computed
+    ``0.005/invoice + 0.005/ledger``, which is the RELATIVE error ``dr/r``,
+    and compared it against an ABSOLUTE tolerance. That reads a factor of
+    ``ratio`` too small — 0.00094 where the truth is 0.00107 — so the stated
+    width was violated by the very worked example the docstring cited, and a
+    genuine x1.14 member at the smallest amount would have been rejected for
+    rounding alone. The failure was SAFE (the row stayed audibly
+    unrecognised) and it was still a bound that lied.
+
+    Both directions are asserted, because a one-directional bound is the
+    original gap wearing a pin's clothes.
+    """
+    worst = worst_case_ratio_deviation(SMALLEST_INVOICE_AMOUNT)
+    assert worst == Decimal("0.00107"), (
+        "the worst-case rounding deviation moved; re-derive the bound rather "
+        "than re-fitting the number to it"
+    )
+
+    # LOWER: strictly above the worst rounding error at the smallest amount
+    # the data carries. At or below it, genuine members are rejected.
+    assert RATIO_TOLERANCE > worst
+
+    # UPPER: a 10x margin under the class separation. Bare `< separation` is
+    # NOT enough — 0.015 satisfies that while sitting close enough to make
+    # the classes neighbours, which is why the relation carries the margin.
+    assert RATIO_TOLERANCE * 10 <= CLASS_SEPARATION
+
+    # And the relation must actually be able to fail, in BOTH directions.
+    too_tight = Decimal("0.0005")
+    too_wide = Decimal("0.015")
+    assert not (too_tight > worst), (
+        "0.0005 must fail the LOWER relation — it rejects genuine members"
+    )
+    assert not (too_wide * 10 <= CLASS_SEPARATION), (
+        "0.015 must fail the UPPER relation — bare '< 0.02' would pass it, "
+        "which is exactly the gap the margin closes"
+    )
+
+
+def test_the_widening_admits_nothing_new_in_the_fixtures() -> None:
+    """The tolerance fold is a PRODUCTION change — it widens what gets
+    recognised — so its reach is measured rather than assumed.
+
+    Every ratio these fixtures exercise is checked for whether it sits in
+    the newly-admitted band between the old width and the new one. None
+    does: the nearest non-member is 1.145 (deviation 0.005, still outside),
+    and the 0.7826 outlier's nearest class centre is 0.84 (deviation
+    0.0574). So the widening changes no classification here — it restores
+    the members the wrong bound would have rejected at the small end.
+    """
+    old_width = Decimal("0.001")
+    fixtures = [
+        ("clean x1.14", Decimal("342.00"), Decimal("300.00")),
+        ("small x1.14", Decimal("11.40"), Decimal("10.00")),
+        ("cent low", Decimal("11.39"), Decimal("10.00")),
+        ("cent high", Decimal("11.41"), Decimal("10.00")),
+        ("tax line 0.14", Decimal("42.00"), Decimal("300.00")),
+        ("tax line 0.28", Decimal("84.00"), Decimal("300.00")),
+        ("just outside", Decimal("343.50"), Decimal("300.00")),
+        ("the 0.7826 outlier", Decimal("234.78"), Decimal("300.00")),
+        ("plain disagreement", Decimal("345.00"), Decimal("300.00")),
+    ]
+    newly_admitted = []
+    for label, ledger, invoice in fixtures:
+        ratio = ledger / invoice
+        steps = (ratio / TAX_LINE_STEP).to_integral_value()
+        deviation = min(
+            abs(ratio - HST_RATIO),
+            abs(ratio - steps * TAX_LINE_STEP) if steps >= 1 else Decimal("99"),
+        )
+        if old_width < deviation <= RATIO_TOLERANCE:
+            newly_admitted.append((label, deviation))
+
+    assert newly_admitted == [], (
+        f"the widening changed classification for {newly_admitted} — that is "
+        f"a real behaviour change and must be stated, not discovered"
+    )
+
+    # POSITIVE CONTROL: the band the check looks at is not empty by
+    # construction — a ratio placed inside it IS detected.
+    planted = HST_RATIO + Decimal("0.0015")
+    assert old_width < abs(planted - HST_RATIO) <= RATIO_TOLERANCE, (
+        "the newly-admitted band must be non-empty, or the assertion above "
+        "is vacuous"
+    )

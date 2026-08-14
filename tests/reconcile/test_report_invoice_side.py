@@ -27,6 +27,7 @@ from alfred.reconcile import cli as rcli
 from alfred.reconcile.config import ReconcileConfig, load_from_unified
 from alfred.reconcile.invoices import InvoiceSnapshot, load_snapshot
 from alfred.reconcile.ledger import ClaimLine, LedgerContents, Statement
+from alfred.reconcile.matcher import AMOUNT_DISAGREES, BAND_LOW, BAND_MEDIUM
 from alfred.reconcile.report import build_report
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -522,3 +523,92 @@ def test_the_cli_payload_carries_the_invoice_side_figures(tmp_path, capsys):
     assert payload["invoices_stale"] is False
     assert payload["unknown_statuses"] == {"mystery_status": 1}
     assert payload["late"] == 1
+
+
+# --- the delta-class vocabulary on the report --------------------------------
+
+
+def _basis_export(n_exact: int, n_incl_tax: int, n_noise: int) -> tuple:
+    """A population shaped like the measured one: some pairs exact, some on
+    the tax-inclusive basis, some matching no class. Invented figures."""
+    invoices, lines = [], []
+    idx = 0
+    for kind, count in (
+        ("exact", n_exact), ("incl", n_incl_tax), ("noise", n_noise)
+    ):
+        for _ in range(count):
+            idx += 1
+            surname = f"Claimant{idx}"
+            invoices.append(_export_invoice(
+                f"INV-{idx}", client_name=f"Given{idx} {surname}",
+                amount="300.00",
+            ))
+            billed = {
+                "exact": Decimal("300.00"),
+                "incl": Decimal("342.00"),
+                "noise": Decimal("345.00"),
+            }[kind]
+            line = _line(surname=surname)
+            line.claim_no = f"C-{idx}"
+            line.first_name = f"Given{idx}"
+            line.total_billed = billed
+            lines.append(line)
+    return invoices, lines
+
+
+def test_the_report_names_the_recognised_classes_and_the_remainder(
+    tmp_path,
+) -> None:
+    invoices, lines = _basis_export(n_exact=1, n_incl_tax=2, n_noise=1)
+    snap = _snapshot_from(_export_document(invoices=invoices), tmp_path)
+    report = build_report(_contents(*lines), snapshot=snap, now=_NOW)
+
+    assert len(report.match.proposals) == 4
+    text = report.summary_text
+    assert "2 reconcile on a recognised other basis" in text
+    assert "tax-inclusive ledger row (x1.14): 2" in text
+    assert "1 carry a delta matching no recognised class" in text
+    assert "how the next class gets found" in text
+
+
+def test_the_report_states_when_the_vocabulary_recognised_nothing(
+    tmp_path,
+) -> None:
+    """ILB. 'The recogniser ran and matched none of them' is a finding about
+    the population; an empty section would be indistinguishable from a
+    vocabulary that never ran."""
+    invoices, lines = _basis_export(n_exact=0, n_incl_tax=0, n_noise=2)
+    snap = _snapshot_from(_export_document(invoices=invoices), tmp_path)
+    text = build_report(_contents(*lines), snapshot=snap, now=_NOW).summary_text
+
+    assert "matching no recognised basis class" in text
+    assert "not an empty check" in text
+    assert "recognised other basis (" not in text
+
+
+def test_the_recognised_rows_rise_out_of_low_without_silencing_the_rest(
+    tmp_path,
+) -> None:
+    """The before/after the tuning is judged on, asserted in BOTH directions.
+
+    A tuning that lifted the recognised rows AND emptied the unrecognised
+    bucket would be a regression wearing an improvement's figures: the
+    unrecognised bucket is the discovery channel that produced these classes.
+    """
+    invoices, lines = _basis_export(n_exact=0, n_incl_tax=3, n_noise=2)
+    snap = _snapshot_from(_export_document(invoices=invoices), tmp_path)
+    match = build_report(_contents(*lines), snapshot=snap, now=_NOW).match
+
+    recognised = [p for p in match.proposals if p.basis_class]
+    unrecognised = [
+        p for p in match.proposals if p.amount_outcome == AMOUNT_DISAGREES
+    ]
+    assert len(recognised) == 3
+    assert len(unrecognised) == 2, "the discovery channel must NOT go quiet"
+
+    assert all(p.band == BAND_MEDIUM for p in recognised), (
+        "recognised rows rise out of the low band"
+    )
+    assert all(p.band == BAND_LOW for p in unrecognised), (
+        "unrecognised rows stay exactly where they were"
+    )
