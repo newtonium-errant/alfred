@@ -273,13 +273,34 @@ describe('/share stays warm — the regression the seam exists to prevent', () =
     // The warm chrome is STILL THERE on the straddler — it is the unmarked
     // default, not a leftover. If a later hand converted it to console tokens
     // this reds, which is the exact regression the finding predicted.
-    const panel = src('components/ingest/ProvenancePreview.tsx');
-    expect(panel).toContain('bg-honeydew-100');
-    expect(panel).toContain('border-honeydew-300');
-    expect(panel).toContain('ui-panel');
-    // Same for the other straddler's disc.
-    expect(src('components/EmptyState.tsx')).toContain('ui-panel flex h-11 w-11');
-    expect(src('components/EmptyState.tsx')).toContain('bg-honeydew-100');
+    // RENDERED, not grepped — reviewer-g2's WARN-1. This block was the THIRD
+    // string-grep in this file that a COMMENT could satisfy: the straddlers'
+    // source explains the marker in prose, so `toContain('ui-panel')` passed on
+    // the explanation rather than on the class. The vacuity control above had
+    // already been converted for exactly this; the same confession applies here,
+    // and one instance fixed while its sibling stays is how a species survives.
+    const { container: panel } = render(
+      <ProvenancePreview
+        target={undefined}
+        recordType="document"
+        title=""
+        source=""
+        ingestedBy="andrew"
+        originInstance="Salem"
+      />,
+    );
+    const panelRoot = panel.querySelector('.ui-panel');
+    expect(panelRoot).not.toBeNull();
+    // The WARM chrome is on the SAME element as the marker — that adjacency is
+    // the whole contract: unmarked default plus opt-in reach, so /share (which
+    // sets no data-surface) renders it exactly as it always did.
+    expect(panelRoot?.className).toContain('bg-honeydew-100');
+    expect(panelRoot?.className).toContain('border-honeydew-300');
+
+    const { container: empty } = render(<EmptyState icon="💬" message="nothing here" />);
+    const disc = empty.querySelector('.ui-panel');
+    expect(disc).not.toBeNull();
+    expect(disc?.className).toContain('bg-honeydew-100');
   });
 
   it('the straddlers are NOT in the token-adopted set — the two treatments stay apart', () => {

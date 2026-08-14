@@ -34,20 +34,30 @@ afterEach(() => {
 });
 
 describe('readPushPolicy', () => {
-  it('defaults to the strictest gate when unset', () => {
-    expect(readPushPolicy()).toBe('email_urgent_override');
-  });
-
-  it('parses the two widening values', () => {
-    process.env.PUSH_POLICY = 'email_urgent_all';
-    expect(readPushPolicy()).toBe('email_urgent_all');
-    process.env.PUSH_POLICY = 'needs_you';
+  it('defaults to needs_you when unset — the operator ruling', () => {
+    // REVERSED from #27 slice 3's strictest-default. That default was set before
+    // anything had rung, when the risk worth managing was a doorbell that cried
+    // wolf. The ruling: reminders, urgent email and anything dealt
+    // needs-you/decide RING; routine cards wait silently. Gating inside the
+    // needs-you set was suppressing the very items the operator asked to be
+    // interrupted for.
     expect(readPushPolicy()).toBe('needs_you');
   });
 
-  it('falls back to the strict default on an unrecognized value (never silently widens)', () => {
-    process.env.PUSH_POLICY = 'everything';
+  it('parses the two NARROWING values', () => {
+    process.env.PUSH_POLICY = 'email_urgent_all';
+    expect(readPushPolicy()).toBe('email_urgent_all');
+    process.env.PUSH_POLICY = 'email_urgent_override';
     expect(readPushPolicy()).toBe('email_urgent_override');
+  });
+
+  it('falls back to the DEFAULT on an unrecognized value — a typo widens, never silences', () => {
+    // The direction is deliberate and it flipped with the default. A mistyped
+    // flag now fails toward "you were told about something" rather than toward a
+    // doorbell that quietly stopped — silence is the failure mode nobody notices,
+    // which is the whole reason this codebase distinguishes idle from broken.
+    process.env.PUSH_POLICY = 'everything';
+    expect(readPushPolicy()).toBe('needs_you');
   });
 
   it('trims surrounding whitespace', () => {
