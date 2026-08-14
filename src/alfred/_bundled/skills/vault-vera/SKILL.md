@@ -45,7 +45,7 @@ NOT drift from it (both gates enforce it; the SKILL must MIRROR it):
     (assumption / constraint / contradiction / synthesis), canonical/PHI
     types (person / org / location / event), any DB access, delete, move.
 
-PHI POSTURE — RE-SCOPED PER-CHANNEL 2026-06-29 (SovServ decision + QA
+PHI POSTURE — RE-SCOPED PER-INTAKE (was per-channel; see 2026-06-29 SovServ decision + QA
 catch). The hold is NOT global. The forward-guard the RRTS-intake build
 adds (ticket_forward.py) only EXCLUDES `origin == 'rrts' AND
 de_phi_status != 'cleared'`; Telegram-origin tickets forward to GitHub
@@ -66,10 +66,12 @@ So PHI handling depends on the VOUCHED INTAKE (`role: rrts_intake`), not on the 
   CHANNEL SIGNAL (2026-06-29, builder shipped): the `## Current message
   sender` block (telegram/conversation.py `_build_sender_identity_text`)
   now carries an EXPLICIT `channel: web|telegram` marker (plus a line
-  "This message arrived via the **<channel>** channel."). VERA keys the
-  per-channel PHI rule on that marker DURING the conversation — `web`
-  (RRTS bug widget / relay) = capture faithfully + held; `telegram`
-  (default, the bot) = minimize. The ticket's `origin` frontmatter is
+  "This message arrived via the **<channel>** channel."), alongside the
+  sender's `role:`. VERA keys the PHI rule on the ROLE during the
+  conversation — `role: rrts_intake` (the vouched bug widget) = capture
+  faithfully + held; ANYTHING ELSE = minimize, including ordinary
+  `channel: web` conversation, which carries no hold. The channel names
+  the arrival surface, not the hold. The ticket's `origin` frontmatter is
   set at file-time (too late to steer in-conversation PHI behaviour), so
   the marker is the in-conversation signal. See the body PHI section.
   VERA still cannot QUERY the RRTS patient database (separate gated
@@ -756,7 +758,7 @@ If more than one ticket could match Ben's reference ("the schedule one" when the
 
 ## PHI — depends on the vouched intake: only bug-widget reports are held, everything else is not
 
-VERA's vault (**Dame-Bluebird**) is held at security parity with RRTS, so PHI *stored in VERA's vault* is compliance-covered. **But only ONE channel is held before a ticket reaches GitHub, so how you handle PHI depends on where the report came from.** Get this right — it's the difference between a captured-and-held report and a PHI leak to a public issue tracker.
+VERA's vault (**Dame-Bluebird**) is held at security parity with RRTS, so PHI *stored in VERA's vault* is compliance-covered. **But only ONE intake is held before a ticket reaches GitHub, so how you handle PHI depends on how the report was filed, not which surface it arrived on.** Get this right — it's the difference between a captured-and-held report and a PHI leak to a public issue tracker.
 
 **Web bug-widget reports (RRTS-origin) — capture PHI faithfully, don't scrub.** A report that comes through the **RRTS web bug widget** is an RRTS-origin ticket: it is **HELD** — it cannot leave VERA, and a separate **de-PHI step runs downstream before anything is forwarded to GitHub**. For these, capture what the reporter actually hit — a patient name in a screenshot, a chart page that crashed, a booking tied to a real person — **faithfully**. Do NOT redact names, swap in placeholders, decline the report, or lecture about PHI. The hold is automatic and enforced at the code layer (the RRTS-intake interlock), NOT something you do in conversation. A complete report is more useful, and it's safe *because it's held*.
 
