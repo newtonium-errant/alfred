@@ -64,7 +64,13 @@ from .attention import (
 )
 from .invoices import STALE_AFTER_HOURS, InvoiceSnapshot
 from .ledger import ClaimLine, LedgerContents, Statement, group_by_statement
-from .matcher import BAND_HIGH, MatchReport, match_snapshot
+from .matcher import (
+    AMOUNT_DISAGREES,
+    BAND_HIGH,
+    BASIS_CLASS_LABELS,
+    MatchReport,
+    match_snapshot,
+)
 from .parser import DATE_SOURCE_CAPTURE
 from .money import format_money
 
@@ -501,6 +507,41 @@ def _invoice_side_sections(
         out.append(
             f"{len(match.proposals)} proposal(s), {high} at high confidence."
         )
+        # The delta-class vocabulary, stated either way. If it recognised
+        # nothing, that is a finding about the population and not an empty
+        # line — and if the UNrecognised count ever reached zero it would
+        # mean the discovery channel had gone quiet, which is the thing to
+        # notice rather than to celebrate.
+        by_class: dict[str, int] = {}
+        for p in match.proposals:
+            if p.basis_class:
+                by_class[p.basis_class] = by_class.get(p.basis_class, 0) + 1
+        unrecognised = sum(
+            1 for p in match.proposals
+            if p.amount_outcome == AMOUNT_DISAGREES
+        )
+        if by_class:
+            named = ", ".join(
+                f"{BASIS_CLASS_LABELS.get(c, c)}: {n}"
+                for c, n in sorted(by_class.items())
+            )
+            out.append("")
+            out.append(
+                f"Of these, {sum(by_class.values())} reconcile on a "
+                f"recognised other basis ({named}) — agreement once the "
+                f"basis is named, not a forgiven disagreement. "
+                f"{unrecognised} carry a delta matching no recognised class "
+                f"and stay visible as plain disagreements, which is how the "
+                f"next class gets found."
+            )
+        elif unrecognised:
+            out.append("")
+            out.append(
+                f"_{unrecognised} proposal(s) carry a delta matching no "
+                f"recognised basis class. The vocabulary ran and recognised "
+                f"none of them — a finding about this population, not an "
+                f"empty check._"
+            )
         out.append("")
         out.append(
             "| Invoice | Claimant | Service date | Ledger billed | "

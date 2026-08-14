@@ -240,6 +240,7 @@ def test_the_segment_is_spelled_in_exactly_one_place() -> None:
     day they were written and diverge later — which is precisely why this
     asserts on the source rather than on a resolved path.
     """
+    import alfred
     from alfred.common import rrts_export
     from alfred.reconcile import config as reconcile_config
     from alfred.transport import routes_rrts
@@ -254,16 +255,43 @@ def test_the_segment_is_spelled_in_exactly_one_place() -> None:
     # occurrence in total": the home file names it in the constant AND in
     # the docstrings that explain it, and counting those would make the pin
     # fail on prose.
-    home = Path(rrts_export.__file__)
-    # BOTH ends are now covered, which is the point of the move: the writer
-    # (routes_rrts) and the reader (reconcile.config) are the two files most
-    # able to grow a private copy, and neither may spell it.
-    others = [
-        Path(routes_rrts.__file__),
-        Path(reconcile_config.__file__),
-        Path(transport_server.__file__),
-        Path(telegram_daemon.__file__),
-    ]
+    #
+    # THE DENOMINATOR IS THE TREE, NOT A HAND-LIST. This walked four modules
+    # I picked by hand, and the gate proved why that is not a check: a stray
+    # planted in `invoices.py` — a file edited in the very commit that wrote
+    # this pin, and still not on the list — sailed straight through. The
+    # pin's REACH was defined by the same judgement that would omit a file,
+    # which is the probe-defines-denominator failure sitting inside the pin
+    # built to prevent duplication. Strengthening what a check ASSERTS is
+    # not the same as fixing what it REACHES.
+    home = Path(rrts_export.__file__).resolve()
+    package_root = Path(alfred.__file__).resolve().parent
+    walked = sorted(
+        p for p in package_root.rglob("*.py") if p.resolve() != home
+    )
+
+    # The walk is itself pinned, because a glob that silently matched
+    # nothing would make everything below vacuously green — the exact shape
+    # this rewrite exists to kill. Positive control on the DENOMINATOR: the
+    # files most able to grow a private copy must demonstrably be in it,
+    # including the one the hand-list missed.
+    must_reach = {
+        Path(routes_rrts.__file__).resolve(),
+        Path(reconcile_config.__file__).resolve(),
+        Path(transport_server.__file__).resolve(),
+        Path(telegram_daemon.__file__).resolve(),
+        (package_root / "reconcile" / "invoices.py").resolve(),
+    }
+    walked_set = {p.resolve() for p in walked}
+    missing = sorted(str(p) for p in must_reach - walked_set)
+    assert not missing, (
+        f"the walk did not reach files it must cover, so a stray in any of "
+        f"them would pass unseen:\n  " + "\n  ".join(missing)
+    )
+    assert len(walked) > 100, (
+        f"the walk reached only {len(walked)} file(s) — a broken glob would "
+        f"make this pin pass while checking almost nothing"
+    )
 
     assert "rrts-export" in home.read_text(encoding="utf-8"), (
         "the segment vanished from its home — the constant was renamed or "
@@ -271,13 +299,18 @@ def test_the_segment_is_spelled_in_exactly_one_place() -> None:
     )
 
     strays: list[str] = []
-    for f in others:
-        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+    for f in walked:
+        for i, line in enumerate(
+            f.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
             if "rrts-export" in line:
-                strays.append(f"{f.name}:{i}: {line.strip()[:70]}")
+                strays.append(
+                    f"{f.relative_to(package_root)}:{i}: {line.strip()[:70]}"
+                )
     assert not strays, (
-        "the directory segment is spelled outside alfred/common/rrts_export.py, "
-        "which is how a writer and a reader land on different files while both "
+        f"the directory segment is spelled outside "
+        f"alfred/common/rrts_export.py ({len(walked)} file(s) walked), which "
+        f"is how a writer and a reader land on different files while both "
         f"look correct:\n  " + "\n  ".join(strays)
     )
 
