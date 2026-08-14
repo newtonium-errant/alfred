@@ -27,6 +27,7 @@ behaviour it controls is there.
 from __future__ import annotations
 
 import ast
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,7 @@ from alfred.daily_sync.action_router import (
     actions_for,
 )
 from alfred.daily_sync.config import DailySyncConfig
-from alfred.feed import FeedEmitHandle, FeedStore
+from alfred.feed import FeedEmitHandle, FeedItem, FeedStore
 from alfred.feed.model import (
     ATTENTION_NEEDS_YOU,
     KIND_DEFAULTS,
@@ -805,6 +806,88 @@ class TestContainment:
         denials = _events(captured, "vault.containment.escape_denied")
         assert len(denials) == 1
         assert denials[0]["reason"] == "outside_vault_root"
+
+    async def test_malformed_evidence_holds_the_card_and_never_wedges_the_tick(
+        self, vault, handle, store,
+    ) -> None:
+        """``evidence`` is typed as a dict and is not guaranteed to be one.
+
+        The store folds whatever a writer wrote — ``from_dict`` filters unknown
+        FIELDS, never their types — so one malformed line hands the sweep a
+        string. A bare ``.get`` on it raises AttributeError, and the raise would
+        travel out of the sweep and out of ``_tick``, taking that tick's
+        PENDING-QUEUE DRAIN with it on every tick until the line is removed.
+        That is the property asserted here: the card is held, and the drain (an
+        unrelated scheduler leg) still runs.
+        """
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(store.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ev": "upsert", "ts": _now().isoformat(),
+                "item": {
+                    "id": f"{KIND_REMINDER_RETURNED}:task/Bad.md|{FIXED_REMIND_AT}",
+                    "kind": KIND_REMINDER_RETURNED,
+                    "title": "Malformed card",
+                    "state": STATE_OPEN,
+                    "evidence": "not-a-dict",
+                },
+            }) + "\n")
+        bad_id = f"{KIND_REMINDER_RETURNED}:task/Bad.md|{FIXED_REMIND_AT}"
+
+        # A queued send parked for the past — the leg that must survive.
+        config, state, sent, send = _env(vault)
+        state.pending_queue.append({
+            "id": "pending-1", "user_id": 42, "text": "parked message",
+            "dedupe_key": "pending-1",
+            "scheduled_at": (_now() - timedelta(minutes=1)).isoformat(),
+        })
+
+        with structlog.testing.capture_logs() as captured:
+            await _tick(config, state, send, vault, 42, feed_handle=handle)
+
+        assert store.load()[bad_id].state == STATE_OPEN, "held, not retired"
+        assert sent == ["parked message"], "the pending drain ran"
+        assert not _events(captured, "transport.scheduler.tick_error")
+        # WHICH mechanism handled it, not merely that something did. The
+        # per-card belt would produce an identical card state and an identical
+        # drain, so without this the pin is equally green against a build with
+        # no type guard at all — the belt catching the AttributeError every
+        # tick, forever, on a card that can never be verified.
+        assert not _events(captured, "transport.scheduler.return_card_verdict_failed"), (
+            "the evidence type guard should have handled this, not the belt"
+        )
+
+    def test_an_unexpected_verdict_fault_holds_the_card(
+        self, vault, handle, store, monkeypatch,
+    ) -> None:
+        """The belt itself, exercised rather than assumed: whatever the verdict
+        path raises, that ONE card is held and the sweep still completes."""
+        from alfred.transport import returns_feed
+
+        _write_task(vault, "Fix the gate")
+        card = FeedItem.create(
+            kind=KIND_REMINDER_RETURNED,
+            stable_key=return_card_stable_key("task/Fix the gate.md", FIXED_REMIND_AT),
+            instance="Salem", title="Held card",
+            evidence={
+                "record_path": "task/Fix the gate.md", "remind_at": FIXED_REMIND_AT,
+            },
+        )
+        store.upsert(card)
+
+        def _boom(*a: Any, **kw: Any) -> None:
+            raise RuntimeError("verdict exploded")
+
+        monkeypatch.setattr(returns_feed, "_refresh_or_retire", _boom)
+
+        with structlog.testing.capture_logs() as captured:
+            counts = sweep_return_cards(handle, vault, _now())
+
+        assert store.load()[card.id].state == STATE_OPEN
+        assert counts is not None, "the sweep completed despite the fault"
+        faults = _events(captured, "transport.scheduler.return_card_verdict_failed")
+        assert len(faults) == 1
+        assert faults[0]["error_type"] == "RuntimeError"
 
     def test_a_card_with_no_record_path_is_held(self, vault, handle, store) -> None:
         from alfred.feed import FeedItem

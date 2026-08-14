@@ -203,20 +203,24 @@ def emit_return_card(
 
 
 def _rebuild_entry(
-    stored: FeedItem, abs_path: Path, meta: dict[str, Any],
+    evidence: dict[str, Any], abs_path: Path, meta: dict[str, Any],
 ) -> "DueReminder | None":
     """Rebuild the ``DueReminder`` a stored card was built from, or ``None``.
 
     The ``remind_at`` comes from the CARD (the record's was cleared by the fire
     that produced the card); everything else comes from the LIVE record, which
     is what makes the refresh a refresh.
+
+    Takes the caller's ALREADY-GUARDED evidence dict rather than the item, so
+    the type belt lives in exactly one place instead of being re-derived (or
+    forgotten) per reader.
     """
     from .scheduler import DueReminder, _parse_iso, _str_or_none
 
-    remind_at = _parse_iso(stored.evidence.get(EVIDENCE_REMIND_AT))
+    remind_at = _parse_iso(evidence.get(EVIDENCE_REMIND_AT))
     if remind_at is None:
         return None
-    rel_path = str(stored.evidence.get(EVIDENCE_RECORD_PATH) or "")
+    rel_path = str(evidence.get(EVIDENCE_RECORD_PATH) or "")
     title = str(meta.get("name") or meta.get("subject") or abs_path.stem).strip()
     return DueReminder(
         abs_path=abs_path,
@@ -282,7 +286,17 @@ def _refresh_or_retire(
 
     from .scheduler import _ELIGIBLE_STATUSES, _parse_iso
 
-    rel_path = str(stored.evidence.get(EVIDENCE_RECORD_PATH) or "").strip()
+    # ``evidence`` is TYPED as a dict and is not GUARANTEED to be one. The store
+    # folds whatever a writer wrote: ``FeedItem.from_dict`` filters unknown
+    # FIELDS but never coerces their types, so one malformed line — an older or
+    # newer writer, a hand-edited store — hands us a string here, and a bare
+    # ``.get`` would raise AttributeError straight through the sweep and out of
+    # the scheduler tick, taking that tick's pending-queue drain with it on
+    # every tick until the line is removed. ``snapshot_fingerprint`` carries the
+    # same read-belt for the same reason.
+    evidence = stored.evidence if isinstance(stored.evidence, dict) else {}
+
+    rel_path = str(evidence.get(EVIDENCE_RECORD_PATH) or "").strip()
     if not rel_path:
         log.warning(
             "transport.scheduler.return_card_unkeyed",
@@ -322,13 +336,13 @@ def _refresh_or_retire(
         retired.append((stored.id, RETIRE_TASK_CLOSED))
         return None
 
-    card_remind_at = _parse_iso(stored.evidence.get(EVIDENCE_REMIND_AT))
+    card_remind_at = _parse_iso(evidence.get(EVIDENCE_REMIND_AT))
     record_remind_at = _parse_iso(meta.get("remind_at"))
     if record_remind_at is not None and record_remind_at != card_remind_at:
         retired.append((stored.id, RETIRE_RE_ARMED))
         return None
 
-    entry = _rebuild_entry(stored, abs_path, meta)
+    entry = _rebuild_entry(evidence, abs_path, meta)
     if entry is None:
         log.warning(
             "transport.scheduler.return_card_unkeyed",
@@ -403,9 +417,29 @@ def sweep_return_cards(
     retired: list[tuple[str, str]] = []
     open_items: list[FeedItem] = []
     for stored in sorted(live, key=lambda i: i.id):
-        verdict = _refresh_or_retire(
-            stored, vault_path, now, instance=handle.instance, retired=retired,
-        )
+        try:
+            verdict = _refresh_or_retire(
+                stored, vault_path, now, instance=handle.instance, retired=retired,
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad card, not the tick
+            # PER-CARD, and the scope is the point. Anything raising out of here
+            # would leave the sweep, leave ``_tick``, and be caught only by the
+            # loop-level handler in ``run`` — which means the pending-queue
+            # drain at the bottom of that tick never runs, every tick, for as
+            # long as the offending card sits in the store. A feed fault taking
+            # down a scheduler leg is exactly what ``feed/belt.py`` exists to
+            # make impossible.
+            #
+            # The card is HELD, matching every other doubt path here: a card we
+            # could not judge is not a card we may retire.
+            log.warning(
+                "transport.scheduler.return_card_verdict_failed",
+                feed_id=stored.id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                detail="card held open — could not be verified this sweep",
+            )
+            verdict = _held(stored)
         if verdict is not None:
             open_items.append(verdict)
 
