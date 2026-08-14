@@ -72,3 +72,36 @@
   outline: 2px solid var(--comms-affirm);
   outline-offset: 2px;
 }
+
+/* --- the comms surface's CONTROLS -----------------------------------------
+ *
+ * Same marker seam and the same reason as crt.css — see that file's header for
+ * the specificity argument. Comms-grade, NOT quoted: the composer, the pickers
+ * and every voice affordance stay in the proportional face. Only an assistant
+ * TURN speaks in the borrowed monospace-phosphor voice, and `.comms-quoted`
+ * remains the only rule in this file that reads the quoted vocabulary — which
+ * commsQuotation.test.tsx pins. */
+[data-surface='comms'] .ui-field {
+  background-color: var(--comms-panel);
+  border-color: var(--comms-edge);
+  color: var(--comms-ink);
+}
+
+[data-surface='comms'] .ui-field::placeholder {
+  color: var(--comms-ink-dim);
+}
+
+[data-surface='comms'] .ui-field:focus-visible {
+  outline: 2px solid var(--comms-affirm);
+  outline-offset: 1px;
+}
+
+[data-surface='comms'] .ui-label {
+  color: var(--comms-ink-dim);
+}
+
+[data-surface='comms'] .ui-btn {
+  background-color: var(--comms-panel);
+  border-color: var(--comms-edge);
+  color: var(--comms-ink);
+}

@@ -9,10 +9,14 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        primary: 'bg-honeydew-500 text-white hover:bg-honeydew-600 disabled:bg-honeydew-400 disabled:hover:bg-honeydew-400',
+        // The three NEUTRAL variants carry `ui-btn` and take their register's
+        // chrome. `destructive` deliberately does NOT: it is a role-coloured
+        // control, and a register restyles chrome, never a verdict. That
+        // omission is asserted, not assumed — see consoleRegisters' role pin.
+        primary: 'ui-btn bg-honeydew-500 text-white hover:bg-honeydew-600 disabled:bg-honeydew-400 disabled:hover:bg-honeydew-400',
         outline:
-          'border border-honeydew-300 bg-white text-honeydew-700 hover:bg-honeydew-50',
-        ghost: 'bg-transparent text-honeydew-700 hover:bg-honeydew-100',
+          'ui-btn border border-honeydew-300 bg-white text-honeydew-700 hover:bg-honeydew-50',
+        ghost: 'ui-btn bg-transparent text-honeydew-700 hover:bg-honeydew-100',
         destructive:
           'border border-honeydew-300 bg-white text-danger hover:bg-danger-bg',
       },
