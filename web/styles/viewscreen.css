@@ -1,0 +1,76 @@
+/*
+ * The home shell's register — the tactical viewscreen.
+ *
+ * WHAT THIS FILE IS FOR. Home already RENDERS console-grammar modules (rings,
+ * the three slots, deck-dealt cards) inside warm page chrome. This file is the
+ * chrome joining what it already contains. It adds no new colour: every value
+ * below re-points at the shared `--console-*` layer, exactly as sensorLog.css
+ * does, so there is one place in the app where a hue is decided.
+ *
+ * DEFINITIONS ONLY IN THE ATTRIBUTE BLOCK — deliberately inert.
+ * Custom properties inherit and paint nothing, so that block is safe on the
+ * Layout ROOT, which is where `data-surface` lives. Everything that PAINTS is
+ * on `.viewscreen-deck`, the page's own content element inside <main>. That
+ * split is the ratified adoption default and it is not cosmetic: a root-level
+ * painting rule reaches the nav, the header and the bug-report FAB, which are
+ * shared chrome this surface does not own. Shell stays chrome; the viewscreen
+ * paints only its own content.
+ *
+ * Pinned by viewscreenShell.test.tsx (the attribute rule is inert) and
+ * consoleRegisters.test.ts (every alias resolves, no rule escapes its scope).
+ */
+
+/* --- definitions: inert, safe on the shell ------------------------------- */
+[data-surface='viewscreen'] {
+  /* Ground. The viewscreen sits at hull depth — the same ground the deck and
+     the sensor log use, because they are the same instrument seen from
+     different stations. */
+  --viewscreen-hull: var(--console-hull);
+  --viewscreen-panel: var(--console-panel);
+  --viewscreen-raise: var(--console-raise);
+
+  /* Structure. */
+  --viewscreen-edge: var(--console-edge);
+  --viewscreen-edge-bright: var(--console-edge-bright);
+
+  /* Type. `ink-faint` is UPPERCASE micro-labels only — at ~4.2:1 on panel it
+     reads as a tracked-out caps label and is NOT legible enough for body copy.
+     Restated here rather than assumed, because the next person to reach for a
+     dim ink will reach for the faintest one. */
+  --viewscreen-ink: var(--console-ink);
+  --viewscreen-ink-dim: var(--console-ink-dim);
+  --viewscreen-ink-faint: var(--console-ink-faint);
+
+  /* Function roles. Aliased UNCHANGED — the register restyles chrome, never a
+     verdict. An operator who learned "amber means look at this" on the deck
+     must read the same amber here. */
+  --viewscreen-affirm: var(--console-affirm);
+  --viewscreen-caution: var(--console-caution);
+  --viewscreen-negative: var(--console-negative);
+  --viewscreen-info: var(--console-info);
+}
+
+/* --- painting: the page's own content, never the shell ------------------- */
+.viewscreen-deck {
+  background-color: var(--viewscreen-hull);
+  color: var(--viewscreen-ink);
+}
+
+/* Focus stays visible on the dark ground — the warm honeydew ring disappears
+   against it. Scoped to the CONTENT, not the surface: the bug-report FAB is
+   rendered by Layout outside <main> and carries its own warm ring, and this
+   file loads after globals so a surface-level rule would have won and
+   retargeted it. Same shell-reacher sensorLog.css documents. */
+.viewscreen-deck :focus-visible {
+  outline: 2px solid var(--viewscreen-affirm);
+  outline-offset: 2px;
+}
+
+/* The micro-label register shared with the console: tracked-out caps, faint. */
+.viewscreen-label {
+  color: var(--viewscreen-ink-faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}

@@ -7,6 +7,9 @@ import {
   type SurfaceIdentity,
 } from '../lib/algernon/consoleTokens';
 import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
+import { VIEWSCREEN_SURFACE } from '../lib/algernon/viewscreenSurface';
+import { CRT_SURFACE } from '../lib/algernon/crtSurface';
+import { COMMS_SURFACE } from '../lib/algernon/commsSurface';
 import { ReportBugFab } from './ReportBugFab';
 
 // One frontend deployment targets ONE instance (blueprint §5). The instance's
@@ -149,7 +152,14 @@ const CONSOLE_CHROME: SurfaceClasses = {
  * HERE keeps that true while still giving the entry a compile-time home — and
  * the literal still exists in exactly one place.
  */
-const SURFACE: Record<KnownSurface | typeof SENSOR_SURFACE, SurfaceClasses> = {
+const SURFACE: Record<
+  | KnownSurface
+  | typeof SENSOR_SURFACE
+  | typeof VIEWSCREEN_SURFACE
+  | typeof CRT_SURFACE
+  | typeof COMMS_SURFACE,
+  SurfaceClasses
+> = {
   warm: {
     root: 'min-h-screen bg-honeydew-50',
     header: 'sticky top-0 z-10 border-b border-honeydew-200 bg-honeydew-50/90 backdrop-blur',
@@ -176,6 +186,21 @@ const SURFACE: Record<KnownSurface | typeof SENSOR_SURFACE, SurfaceClasses> = {
   // chrome table says so, NOT because the sensor stylesheet leaked upward, which
   // is the distinction `sensorLogShell.test.tsx` exists to keep true.
   [SENSOR_SURFACE]: CONSOLE_CHROME,
+  // The console-completion registers. All three share the deck's HULL by
+  // REFERENCE, not by copy — `isConsole` below is an identity test against this
+  // object, so sharing the reference is what brings the elbow and the rail
+  // spacer with it. A copied-out duplicate would look identical and silently
+  // lose both.
+  //
+  // Sharing chrome is also the ruling itself: deck, feed, home, the utility
+  // rooms and chat are stations on ONE instrument, so the shell is the same
+  // shell everywhere and each surface's identity lives in its CONTENT register
+  // (styles/{viewscreen,crt,comms}.css). The shell going dark here is why it
+  // goes dark — never because a surface stylesheet leaked upward, which is the
+  // distinction the *Shell inertness pins exist to keep true.
+  [VIEWSCREEN_SURFACE]: CONSOLE_CHROME,
+  [CRT_SURFACE]: CONSOLE_CHROME,
+  [COMMS_SURFACE]: CONSOLE_CHROME,
 };
 
 /**

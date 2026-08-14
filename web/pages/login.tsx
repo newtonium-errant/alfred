@@ -8,6 +8,7 @@ import { Label } from '../components/ui/label';
 import { authApi } from '../lib/algernon/authClient';
 import { ApiError } from '../lib/algernon/http';
 import { safeNextPath } from '../lib/algernon/safeNextPath';
+import { CRT_SURFACE } from '../lib/algernon/crtSurface';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
@@ -220,7 +221,16 @@ export default function LoginPage() {
       <Head>
         <title>Sign in · {INSTANCE_NAME}</title>
       </Head>
-      <div className="flex min-h-screen flex-col items-center justify-center bg-honeydew-50 px-5 py-10">
+      {/* The utility rooms' register, set HERE rather than via Layout: login is
+          deliberately Layout-less (a pre-auth page must not render nav, the
+          sign-out control, or the bug-report FAB), so there is no shared
+          emission point to inherit. The attribute and the painting class sit on
+          the same element because this page IS its own content — there is no
+          shell above it for a root-level rule to reach. */}
+      <div
+        data-surface={CRT_SURFACE}
+        className="crt-room flex min-h-screen flex-col items-center justify-center px-5 py-10"
+      >
         <div className="mb-6 flex items-center gap-2 text-2xl font-extrabold text-honeydew-700">
           <span aria-hidden="true">✦</span> {INSTANCE_NAME}
         </div>

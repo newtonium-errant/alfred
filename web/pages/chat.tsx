@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import Head from 'next/head';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
+import { COMMS_SURFACE } from '../lib/algernon/commsSurface';
 import { NotificationList } from '../components/NotificationList';
 import { ChatThread } from '../components/chat/ChatThread';
 import { ChatTargetPicker } from '../components/chat/ChatTargetPicker';
@@ -122,7 +123,7 @@ export default function ChatPage() {
         <Head>
           <title>Chat · {INSTANCE_NAME}</title>
         </Head>
-        <Layout showNav={false}>
+        <Layout showNav={false} surface={COMMS_SURFACE}>
           <p data-testid="auth-gate" className={subtle}>
             Loading…
           </p>
@@ -143,6 +144,7 @@ export default function ChatPage() {
         onSignOut={() => void handleSignOut()}
         unreadCount={unread}
         viewedInstance={instance}
+        surface={COMMS_SURFACE}
       >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">

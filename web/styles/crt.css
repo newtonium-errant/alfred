@@ -1,0 +1,78 @@
+/*
+ * The utility rooms' register — phosphor terminal. Ingest, batch, login.
+ *
+ * ONE register, THREE pages, on purpose: these are rooms the operator enters to
+ * do a job and leave, and arriving in any of them should read as "you are at a
+ * terminal" rather than as three unrelated screens.
+ *
+ * THE HARD CONSTRAINT, stated where it will be read before it is broken:
+ * **the four function roles keep their hues inside CRT.** The ground goes
+ * near-black and the running text goes phosphor, but affirm/negative/caution/
+ * info alias the shared layer UNCHANGED. A register restyles chrome; it never
+ * restyles a verdict, because an operator who has learned one colour vocabulary
+ * must not re-learn it per room. Pinned by consoleRegisters.test.ts, which
+ * asserts each role alias resolves to its own `--console-<role>` and to nothing
+ * else — so "make the errors green too, it looks more terminal" fails loudly
+ * rather than shipping.
+ *
+ * Same definitions-inert / painting-on-content split as viewscreen.css; see
+ * that file's header for why the attribute block must not paint.
+ */
+
+/* --- definitions: inert, safe on the shell ------------------------------- */
+[data-surface='crt'] {
+  /* Ground. Deeper than the hull — a terminal is a darker room than a bridge. */
+  --crt-void: var(--console-void);
+  --crt-hull: var(--console-void);
+  --crt-panel: var(--console-hull);
+  --crt-edge: var(--console-edge);
+
+  /* Type. The phosphor IS the affirm signal — one hue, used as running text,
+     which is what makes the room read as a terminal rather than as a dark
+     theme. `dim` and `faint` step down through the shared ink ramp so body
+     copy keeps its contrast; only the accent line is phosphor. */
+  --crt-phosphor: var(--console-affirm);
+  --crt-ink: var(--console-ink);
+  --crt-ink-dim: var(--console-ink-dim);
+  --crt-ink-faint: var(--console-ink-faint);
+
+  /* Function roles — UNCHANGED aliases. See the header. */
+  --crt-affirm: var(--console-affirm);
+  --crt-negative: var(--console-negative);
+  --crt-caution: var(--console-caution);
+  --crt-info: var(--console-info);
+
+  /* The terminal type stack, shared with the comms register's quotation. */
+  --crt-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+/* --- painting: the room's own content, never the shell ------------------- */
+.crt-room {
+  background-color: var(--crt-hull);
+  color: var(--crt-ink);
+}
+
+/* The terminal voice: labels, prompts and headings, not body copy. Body stays
+   in the proportional face — a whole page of monospace is a costume, not a
+   register, and it is measurably slower to read. */
+.crt-line {
+  color: var(--crt-phosphor);
+  font-family: var(--crt-mono);
+  letter-spacing: 0.02em;
+}
+
+.crt-label {
+  color: var(--crt-ink-faint);
+  font-family: var(--crt-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+/* Focus on the near-black ground. Content-scoped for the same reason
+   viewscreen.css gives — the FAB and the nav are not this room's to restyle. */
+.crt-room :focus-visible {
+  outline: 2px solid var(--crt-phosphor);
+  outline-offset: 2px;
+}

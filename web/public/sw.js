@@ -24,7 +24,13 @@
 // v5: Phase C — home's top module became the Duty/Rhythm/Fuel day board. `/` is
 //     a SHELL_ROUTE, so its precached HTML (the offline boot, and the fallback
 //     for any unmatched navigation) is exactly what changed shape here.
-const CACHE_VERSION = 'v5';
+// v6: the console-completion registers. Home, chat and the two utility rooms
+//     took surface registers, so Layout renders the console hull as their
+//     chrome — the SHELL's own shape, on three of the four SHELL_ROUTES (`/`,
+//     `/login`, `/ingest`). The trigger here is the RENDER change, not an edit
+//     to this file: precached HTML carrying the old warm chrome would boot the
+//     app into a shell the running code no longer paints.
+const CACHE_VERSION = 'v6';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.

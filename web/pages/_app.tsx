@@ -6,6 +6,13 @@ import '../styles/globals.css';
 // unconditionally restyles nothing that has not asked for it.
 import '../styles/console.css';
 import '../styles/sensorLog.css'; // feed surface skin + token seam; see that file's header
+// The console-completion registers. Same contract as the two above: each is
+// additive and opt-in, defines no rule that is not scoped under its own
+// `data-surface` attribute or an owned class, and re-points at the shared
+// `--console-*` layer rather than holding hexes of its own.
+import '../styles/viewscreen.css';
+import '../styles/crt.css';
+import '../styles/comms.css';
 import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { Nunito } from 'next/font/google';
