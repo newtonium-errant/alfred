@@ -35,6 +35,7 @@ from .contact_state import (
     DEFAULT_PATTERN_SAME_CONTEXT_REQUIRED,
     DEFAULT_PATTERN_THRESHOLD_RATIO,
     DEFAULT_PATTERN_WINDOW_DAYS,
+    DEFAULT_REROUTE_MIN_MINUTES,
     RULE_ORDER,
     UNARMED_RULE_REASONS,
     WebContactStore,
@@ -158,6 +159,11 @@ def levers_from_args(args: dict[str, Any]) -> dict[str, float]:
         ),
         "brief_read_decay_hours": _float_or(
             raw.get("brief_read_decay_hours"), DEFAULT_BRIEF_READ_DECAY_HOURS
+        ),
+        # Read from the same record as its siblings, so a Hypatia-side edit
+        # tunes it with no deploy — the whole reason the levers live there.
+        "reroute_min_minutes": _float_or(
+            raw.get("reroute_min_minutes"), DEFAULT_REROUTE_MIN_MINUTES
         ),
     }
 
@@ -324,6 +330,13 @@ def compute_day_state(
         and (at - brief_ts).total_seconds() / 3600.0 < decay_hours
     )
 
+    # Minutes since the router last routed — the CONTACT log alone, not the
+    # blended "last session" above. Chat activity is not a routing event, and
+    # counting it would make a long conversation suppress the next real open.
+    minutes_since_contact = (
+        (at - last_contact).total_seconds() / 60.0 if last_contact is not None else None
+    )
+
     last_surface = contact_store.last_landed_surface(user_key) if contact_store else ""
     adopted = contact_store.adopted_for(user_key) if contact_store else {}
 
@@ -346,6 +359,11 @@ def compute_day_state(
         "unresolved_flagged_notifications": unresolved,
         "first_unresolved_notification_id": first_unresolved,
         "last_active_surface": last_surface,
+        # `None` = never routed for this identity, which the client reads as
+        # "route" — a first-ever contact is a new visit by definition.
+        "minutes_since_last_contact": (
+            round(minutes_since_contact, 4) if minutes_since_contact is not None else None
+        ),
         # Which rungs are live, and why the rest are not.
         "rule_order": list(RULE_ORDER),
         "armed_rules": list(ARMED_RULES),
@@ -376,6 +394,9 @@ def compute_day_state(
             round(hours_since, 2) if hours_since is not None else None
         ),
         last_active_surface=last_surface or "(none)",
+        minutes_since_last_contact=(
+            round(minutes_since_contact, 1) if minutes_since_contact is not None else None
+        ),
         levers_source=levers_source,
         armed=len(ARMED_RULES),
     )

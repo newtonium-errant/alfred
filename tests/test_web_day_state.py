@@ -386,6 +386,51 @@ class TestBriefReadToday:
 # ---------------------------------------------------------------------------
 
 
+class TestSameVisitWindow:
+    """The server half of the once-guard: how long since the router last routed.
+
+    A React ref cannot answer this — it resets on every mount of `/`, which is
+    what bounced the operator off the page he had just navigated to. Browser
+    storage cannot answer it either without lying across an iOS PWA resume. The
+    contact log can, and it is here.
+    """
+
+    def test_minutes_since_the_last_contact_is_served(self, tmp_path):
+        store = WebContactStore.create(tmp_path / "c.json")
+        store.record_contact(
+            "u1", rule=RULE_DEFAULT, surface=SURFACE_CHAT,
+            now=NOW - timedelta(minutes=7),
+        )
+        assert _compute(contact_store=store)["minutes_since_last_contact"] == 7.0
+
+    def test_never_routed_is_None_not_zero(self, tmp_path):
+        store = WebContactStore.create(tmp_path / "c.json")
+        assert _compute(contact_store=store)["minutes_since_last_contact"] is None
+
+    def test_it_counts_CONTACTS_not_chat_activity(self, tmp_path):
+        """A long conversation is not a routing event. Counting chat here would
+        let talking suppress the next real open — the opposite of the bug."""
+        store = WebContactStore.create(tmp_path / "c.json")
+        mgr = _StateMgr({
+            "active_sessions": {"u1": {"last_message_at": NOW.isoformat()}},
+            "closed_sessions": [],
+        })
+        state = _compute(contact_store=store, state_mgr=mgr)
+        # Chat is a moment ago...
+        assert state["time_since_last_session_hours"] == 0.0
+        # ...but the router has never routed.
+        assert state["minutes_since_last_contact"] is None
+
+    def test_the_lever_defaults_and_reads_from_the_record(self, tmp_path):
+        assert _compute()["levers"]["reroute_min_minutes"] == 30.0
+        body = RECORD.replace(
+            "      brief_read_decay_hours: 4",
+            "      brief_read_decay_hours: 4\n      reroute_min_minutes: 90",
+        )
+        state = _compute(vault_path=_vault(tmp_path, body=body))
+        assert state["levers"]["reroute_min_minutes"] == 90.0
+
+
 class TestPayloadShape:
     def test_rule_1s_fields_are_absent_not_false(self):
         state = _compute()

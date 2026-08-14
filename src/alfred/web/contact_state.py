@@ -133,6 +133,19 @@ SURFACES: tuple[str, ...] = (
 # record is the only place either number is set.
 DEFAULT_GAP_HOURS_NEW_DAY = 6.0
 DEFAULT_BRIEF_READ_DECAY_HOURS = 12.0
+# How recently the router must have ALREADY routed for this contact to be
+# treated as the same visit rather than a new one.
+#
+# The mount-guard alone cannot answer this: it is a React ref, so it resets
+# whenever `/` mounts — and tapping the logo to go home remounts it. The
+# operator got bounced off the page he had deliberately navigated to, with a
+# fresh toast, minutes after the open it was about.
+#
+# Server state answers it and browser storage cannot: sessionStorage survives an
+# iOS PWA resume, so a genuine next-morning open would stop routing; the contact
+# log is the truth and it is on this side. The shape rhymes with the spec's own
+# `first_contact_after_gap` one level up — a gap decides what counts as new.
+DEFAULT_REROUTE_MIN_MINUTES = 30.0
 
 # Spec defaults for pattern-surfacing.
 DEFAULT_PATTERN_ENABLED = True

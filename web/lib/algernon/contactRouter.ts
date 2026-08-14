@@ -88,6 +88,8 @@ export function isContactSurface(raw: unknown): raw is ContactSurface {
 export interface DayStateLevers {
   gap_hours_new_day: number;
   brief_read_decay_hours: number;
+  /** Below this many minutes since the last route, treat it as the same visit. */
+  reroute_min_minutes: number;
 }
 
 /**
@@ -103,6 +105,8 @@ export interface DayState {
   unresolved_flagged_notifications: number;
   first_unresolved_notification_id: string | null;
   last_active_surface: string;
+  /** Minutes since the router last routed, or null when it never has. */
+  minutes_since_last_contact: number | null;
   rule_order: string[];
   armed_rules: string[];
   unarmed_rules: Record<string, string>;
@@ -170,6 +174,25 @@ function ruleFires(rule: ContactRule, state: DayState): boolean {
  */
 export function evaluateRoute(state: DayState | null): RouteDecision | null {
   if (!state || !state.configured) return null;
+
+  // SAME VISIT? — asked before any rule, and answered from SERVER state.
+  //
+  // The hook's once-guard is a React ref, so it resets whenever `/` mounts, and
+  // tapping the logo to go home remounts it: the operator was bounced off the
+  // page he had deliberately navigated to, with a fresh toast, minutes after the
+  // open it described. The mount-guard stays as the in-pageview belt; this is
+  // the question it structurally cannot answer.
+  //
+  // Server state rather than browser storage, deliberately: sessionStorage
+  // survives an iOS PWA resume, so a genuine next-morning open would stop
+  // routing. The contact log is the truth and it lives on the other side.
+  //
+  // `null` = never routed for this identity = a new visit by definition. And
+  // the failure direction is the quiet one: too-recent reads as stay-put, so a
+  // wrong answer costs a routing opportunity rather than yanking the operator
+  // off the surface they chose.
+  const since = state.minutes_since_last_contact;
+  if (since !== null && since < state.levers.reroute_min_minutes) return null;
 
   const armed = new Set(state.armed_rules);
   // The SERVER's order, not this file's: the priority order lives in the policy,
