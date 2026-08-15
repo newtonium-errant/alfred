@@ -25,7 +25,6 @@ import {
   MAX_BATCH_INSTRUCTION_CHARS,
   MAX_BATCH_TOTAL_BYTES,
   buildBatchForm,
-  friendlyBatchError,
   keyForStagedBatch,
   mib,
   prepareBatch,

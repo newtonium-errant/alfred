@@ -3,12 +3,19 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 // The #97 deploy gate, through the REAL /chat page.
 //
-// The promise being pinned is "INERT until the operator turns it on": with
-// NEXT_PUBLIC_UNIFIED_COMPOSER unset, /chat renders the composer that has been
-// live all along and a send is byte-identical on the wire. That is not a claim a
-// unit test of the flag helper can make — the flag is read in the page, and a
-// page that reads it and then mounts both, or neither, would pass a helper test
-// perfectly.
+// The promise being pinned is that the flag SELECTS, in both directions: with
+// NEXT_PUBLIC_UNIFIED_COMPOSER unset /chat renders the legacy composer and a
+// send is byte-identical on the wire; with it set, the unified one. That is not
+// a claim a unit test of the flag helper can make — the flag is read in the
+// page, and a page that reads it and then mounts both, or neither, would pass a
+// helper test perfectly.
+//
+// WHICH SIDE IS LIVE HAS FLIPPED. The variable is baked ON in the box build, so
+// the flag-OFF assertions here now guard the ROLLBACK door rather than the
+// shipped one. They are kept exactly as they were and are not weaker for it: a
+// rollback nobody pins is not a rollback. Rolling back is a REBUILD — the value
+// is inlined at build time — so these tests describe a door that is one
+// rebuild away, not one env edit away.
 //
 // It also carries the #95 watch-item: the bug-report FAB mounts from Layout
 // gated on `showBugReport ?? showNav`, so ANY change to how a page is wrapped
