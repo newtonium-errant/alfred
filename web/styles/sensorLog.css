@@ -187,6 +187,30 @@
    still uses each class listed here, and fails with a pointer back to this file
    if either drifts. Update both together or not at all. */
 
+/* --- FENCED BLOCKS (the `ui-code` marker) ----------------------------------
+ *
+ * THE FIRST MARKER RULE THIS SHEET CLAIMS, and it is claimed because a member
+ * is genuinely reachable rather than for symmetry: a feed row's evidence body
+ * renders through `EvidenceBody` → `FencedText`, so a fenced block on the
+ * sensor log is a real render, pinned by driving one through that component
+ * rather than asserted. (crt.css deliberately gets NO `ui-code` rule for the
+ * mirror-image reason — it claims `ui-panel`, but no FencedText consumer
+ * reaches a crt surface, and a rule nothing can reach is dead CSS.)
+ *
+ * Its own marker rather than `ui-panel`: that rule's ink is a DESCENDANT
+ * selector and a fence carries ink and background on the same `<pre>`. RAISE
+ * depth — the fence sits inside the row.
+ */
+[data-surface='sensor-log'] .ui-code {
+  background-color: var(--sensor-raise);
+  border-color: var(--sensor-edge);
+  color: var(--sensor-ink);
+}
+
+[data-surface='sensor-log'] .ui-code-label {
+  color: var(--sensor-ink-dim);
+}
+
 [data-surface='sensor-log'] [data-testid='feed-row'],
 [data-surface='sensor-log'] [data-testid='feed-snoozed-row'] {
   background-color: var(--sensor-panel);

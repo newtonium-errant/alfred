@@ -142,6 +142,32 @@
   color: var(--comms-ink);
 }
 
+/* --- FENCED BLOCKS (the `ui-code` marker) ----------------------------------
+ *
+ * A fenced block (the ```csv the ingest path writes, a TAF the brief quotes)
+ * rendered as a bright cream slab on the dark hull — the operator photographed
+ * it in the brief's weather section, and the chat-bubbles adoption is what made
+ * the contrast obvious: once the hull went dark, the block stayed light.
+ *
+ * ITS OWN MARKER RATHER THAN `ui-panel`, for a mechanical reason. `ui-panel`'s
+ * ink rules are DESCENDANT selectors, and a fence carries its ink on the same
+ * element as its background (the `<pre>`), so a descendant selector cannot
+ * reach it — the slab would adopt and the text on it would stay dark. The
+ * semantics agree: this ink is CONTENT the operator reads, not chrome.
+ *
+ * RAISE, not panel: a fence always sits inside something already at panel
+ * depth — here, an assistant's turn.
+ */
+[data-surface='comms'] .ui-code {
+  background-color: var(--comms-raise);
+  border-color: var(--comms-edge);
+  color: var(--comms-ink);
+}
+
+[data-surface='comms'] .ui-code-label {
+  color: var(--comms-ink-dim);
+}
+
 /* --- ADOPTED PANELS (the `ui-panel` marker) --------------------------------
  *
  * The THIRD element class to reach a register through an opt-in marker, after

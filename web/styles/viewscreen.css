@@ -90,6 +90,28 @@
  * verdict inside an adopted panel is out of reach by construction — the same
  * guarantee `.ui-btn` has, for the same reason, checked by the same pin.
  */
+/* --- FENCED BLOCKS (the `ui-code` marker) ----------------------------------
+ *
+ * The brief quotes TAF weather in fenced blocks, and they rendered as bright
+ * cream slabs on this dark hull — half of what the operator reported when he
+ * said the brief was unreadable (the other half was the prose ink, fixed with
+ * the document's own adoption).
+ *
+ * Its own marker rather than `ui-panel`: that rule's ink is a DESCENDANT
+ * selector, and a fence carries ink and background on the same `<pre>`, so
+ * `ui-panel` would light the slab and leave the text dark on it. RAISE depth —
+ * a fence sits inside the document panel, not beside it.
+ */
+[data-surface='viewscreen'] .ui-code {
+  background-color: var(--viewscreen-raise);
+  border-color: var(--viewscreen-edge);
+  color: var(--viewscreen-ink);
+}
+
+[data-surface='viewscreen'] .ui-code-label {
+  color: var(--viewscreen-ink-dim);
+}
+
 [data-surface='viewscreen'] .ui-panel {
   background-color: var(--viewscreen-panel);
   border-color: var(--viewscreen-edge);
