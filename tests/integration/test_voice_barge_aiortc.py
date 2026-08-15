@@ -81,6 +81,11 @@ from alfred.web.keys import KEY_WEB_STATE_MGR
 from alfred.web.routes_chat import register_web_routes
 from alfred.web.state import WebAuthState
 
+from tests._barge_frames import (
+    generated_past,
+    loud_generated_past,
+    split_by_generation,
+)
 from tests.telegram.test_run_turn_streaming import (
     _FinalMsg,
     _TextBlk,
@@ -308,7 +313,11 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
 
     pc = RTCPeerConnection()
     events: list[dict] = []              # every DC frame, in arrival order
-    frame_peaks: list[tuple[float, int]] = []   # (recv_time, |peak|) per audio frame
+    # (recv_time, pts, |peak|) per audio frame. ``pts`` is the SERVER's own
+    # monotonic sample counter carried on the wire, so it says WHEN a frame was
+    # GENERATED — the only clock that survives a receive-path stall. Everything
+    # below classifies on it; see tests/_barge_frames for the measurements.
+    frame_peaks: list[tuple[float, int, int]] = []
     barge_at: list[float] = []           # recv time of speaking_done{barged_in}
     got_barge = asyncio.Event()
     got_t2_final = asyncio.Event()
@@ -360,8 +369,11 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
                 while True:
                     frame = await track.recv()
                     arr = frame.to_ndarray()
-                    frame_peaks.append(
-                        (asyncio.get_event_loop().time(), int(np.abs(arr).max())))
+                    frame_peaks.append((
+                        asyncio.get_event_loop().time(),
+                        int(frame.pts),
+                        int(np.abs(arr).max()),
+                    ))
             except Exception as exc:  # noqa: BLE001 — track ends on teardown
                 consumer_stopped.append((
                     type(exc).__name__, str(exc)[:200],
@@ -404,9 +416,17 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
         # and then hoped; this returns as soon as the window is genuinely
         # judgeable, and its ceiling exists to bound the failure, not to buy
         # more room for the race.
+        #
+        # The condition counts frames GENERATED past the band, not RECEIVED
+        # past it. That distinction is the other half of this fix and not a
+        # refinement of it: a receive-path stall delivers a backlog burst that
+        # satisfies a received-frame count instantly while nothing has been
+        # generated in the window at all, so the assertions below would then
+        # judge an empty set. Measured on the captures in
+        # tests/fixtures/voice_barge: 4 of 10 loaded runs.
         deadline = asyncio.get_event_loop().time() + 8.0
         while asyncio.get_event_loop().time() < deadline:
-            if sum(1 for (t, _) in frame_peaks if t > barge_time + 1.0) >= 10:
+            if generated_past(frame_peaks, barge_time + 1.0) >= 10:
                 break
             if consumer_stopped:
                 break     # the track died — fail fast WITH the reason below
@@ -449,28 +469,33 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
         assert len(t2_finals) == 1
 
         # --- outbound audio: T1 heard, flush stops it, NO stale T1 tone ----
-        pre = [p for (t, p) in frame_peaks if t < barge_time]
-        post = [p for (t, p) in frame_peaks if t > barge_time + 1.0]
+        # Split on GENERATION time. Receive time was the original defect: under
+        # load aiortc's receive path stalls (measured 2.61-2.73 s) and then
+        # delivers the backlog at once, so T1 tone generated BEFORE the flush
+        # landed after `barge_time + 1.0` and was scored as leakage — 8 of 20
+        # loaded runs. The product was clean in all 20; see tests/_barge_frames.
+        pre, post = split_by_generation(frame_peaks, barge_time)
         # #73 — the evidence the old one-liner never carried. When this fires
         # again, the message says whether the track DIED (and with what) or
         # merely ran dry, and where the frames actually landed relative to the
         # barge. Built lazily-ish but unconditionally: it is a handful of
         # arithmetic on a list the test already holds.
-        last_frame_at = max((t for (t, _) in frame_peaks), default=None)
+        last_frame_at = max((t for (t, _, _) in frame_peaks), default=None)
         evidence = (
             f"frames={len(frame_peaks)} pre={len(pre)} post={len(post)} "
             f"barge_at={barge_time:.3f} "
             f"last_frame_at={last_frame_at if last_frame_at is None else round(last_frame_at, 3)} "
             f"last_frame_rel_barge="
             f"{None if last_frame_at is None else round(last_frame_at - barge_time, 3)} "
+            f"generated_past_band={generated_past(frame_peaks, barge_time + 1.0)} "
             f"consumer_stopped={consumer_stopped or 'no'}"
         )
         assert pre and max(pre) > 500, f"T1 never spoke on the outbound track — {evidence}"
-        assert post, f"no audio frames captured after the barge — {evidence}"
+        assert post, f"no audio frames generated after the barge — {evidence}"
         # The flush dropped T1's queued tone; T2 is silent — so a full second+
         # after the barge the track must be silent. A leaked T1 frame (gen-gate
         # miss) would ring at the ~440 Hz tone's amplitude here.
-        assert max(post) < 500, f"stale T1 audio after the flush: peak={max(post)}"
+        assert max(post) < 500, f"stale T1 audio after the flush: peak={max(post)} — {evidence}"
     finally:
         await pc.close()
 
@@ -494,7 +519,7 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
 
     pc = RTCPeerConnection()
     events: list[dict] = []
-    frame_peaks: list[tuple[float, int]] = []
+    frame_peaks: list[tuple[float, int, int]] = []   # (recv_time, pts, |peak|)
     barge_at: list[float] = []
     got_barge = asyncio.Event()
     got_t2_final = asyncio.Event()
@@ -523,8 +548,11 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
                 while True:
                     frame = await track.recv()
                     arr = frame.to_ndarray()
-                    frame_peaks.append(
-                        (asyncio.get_event_loop().time(), int(np.abs(arr).max())))
+                    frame_peaks.append((
+                        asyncio.get_event_loop().time(),
+                        int(frame.pts),
+                        int(np.abs(arr).max()),
+                    ))
             except Exception:  # noqa: BLE001 — track ends on teardown
                 pass
 
@@ -561,7 +589,13 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
         # a generous ceiling. A genuinely dead pump (the av-resampler EOF this
         # test pins) never reaches 20 → the ceiling expires → the SAME assertion
         # below fails with the SAME diagnostic. Same facts pinned, waited for.
-        loud_floor = barge_time + 1.0
+        #
+        # …and the count is of frames GENERATED past the band, not received past
+        # it. This pin asserts loud audio is PRESENT, so the receive-path stall
+        # hurts it in the opposite direction from its sibling: late-delivered T1
+        # tone would be credited to T2 and could mask the very resampler death
+        # this test exists to catch. Generation time admits none of it.
+        loud_cut = barge_time + 1.0
 
         def _t2_spoke() -> bool:
             starts = [e for e in events if e["type"] == "speaking_started"]
@@ -573,7 +607,7 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
                        for e in events)
 
         def _loud_count() -> int:
-            return sum(1 for (t, p) in frame_peaks if t > loud_floor and p > 500)
+            return len(loud_generated_past(frame_peaks, loud_cut))
 
         deadline = asyncio.get_event_loop().time() + 20.0
         while asyncio.get_event_loop().time() < deadline:
@@ -591,8 +625,8 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
         # THE PIN: sustained non-silent audio AFTER the barge = T2's tone made it
         # through the real resampler + playout. A pump killed by the resampler
         # EOF would leave this window silent (speaking_started fired, then dead).
-        post = [p for (t, p) in frame_peaks if t > loud_floor]
-        loud = [p for p in post if p > 500]
+        _, post = split_by_generation(frame_peaks, barge_time)
+        loud = loud_generated_past(frame_peaks, loud_cut)
         assert len(loud) >= 20, (
             "T2 produced no sustained audio after the barge (av-resampler EOF "
             f"would kill the pump): {len(loud)} loud of {len(post)} frames")
