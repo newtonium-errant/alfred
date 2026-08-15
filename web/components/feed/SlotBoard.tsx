@@ -99,6 +99,18 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     [items, stageOf, now, grace.optimisticallyDone],
   );
   const balanced = boardSlotsWithADone(stacks);
+  // Which unrecorded rows are still reachable on this board — read from the
+  // STACKS rather than from `items`, so the sentence is about what the operator
+  // can actually get to rather than about what the fetch returned.
+  const onBoard = useMemo(() => {
+    const ids = new Set<string>();
+    for (const s of stacks) {
+      for (const bucket of [s.today, s.carryover, s.candidates, s.done, s.overflow]) {
+        for (const it of bucket) ids.add(it.id);
+      }
+    }
+    return ids;
+  }, [stacks]);
   // The residue stack exists only when something went unclassified — see the
   // ILB line below for what renders in its place when it doesn't.
   const hasResidue = stacks.some((s) => s.key === BOARD_UNSLOTTED);
@@ -127,6 +139,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     const compBusy = completion.busy(it.id);
     const acceptBusy = accept.busy(it.id);
     const itemError = completion.errorFor(it.id) ?? accept.errorFor(it.id);
+    const unrecordedHere = grace.unrecordedIds.has(it.id);
     const notice = completion.noticeFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
@@ -221,12 +234,29 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           )}
         </div>
 
-        {itemError && (
+        {/* A row carrying an unrecorded ✓ shows THAT and not the transient error
+            line, which reports the same failure in weaker words and disappears
+            at the next poll (the shared hook supersedes its own overrides once
+            a render answers them). Same call the deck made when it stopped
+            toasting a refusal: one statement of a failure, and the durable one
+            wins. The line below is the sentence; the notice above the board
+            carries the server's own words and the row's name. */}
+        {itemError && !unrecordedHere && (
           <p data-testid="board-item-error" role="alert" className="mt-1 pl-4 text-[11px] text-danger">
             {itemError}
           </p>
         )}
-        {!itemError && notice && (
+        {unrecordedHere && (
+          // Said HERE, at the point of decision, because the notice above is
+          // read once and then the operator is looking at rows — and the thing
+          // they must know before moving on is that this one didn't take.
+          // Permission-granting, not a nag: the row is still tappable, and when
+          // they get to it is their business.
+          <p data-testid="board-item-unrecorded" className="mt-1 pl-4 text-[11px] text-negative">
+            Your ✓ wasn&rsquo;t recorded — mark it again whenever you like.
+          </p>
+        )}
+        {!itemError && !unrecordedHere && notice && (
           <p data-testid="board-item-notice" className="mt-1 pl-4 text-[11px] text-console-ink-dim">
             {notice}
           </p>
@@ -403,6 +433,64 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
 
   return (
     <section aria-label="Your day" data-testid="slot-board">
+      {/* THE UNRECORDED-COMPLETION NOTICE — the honest half of a held write.
+          FIRST on the board, above even the coverage caveat: everything else
+          here describes the day, and this describes something the system failed
+          to do with what the operator already decided.
+
+          A LIST, not a toast, for the reason the deck's is (see `Deck.tsx`): a
+          burst is the normal shape of this failure, and one line shown for three
+          and a half seconds could report exactly one of them. It accumulates,
+          NAMES each row, says in plain words that the ✓ was not recorded, and
+          stays until the operator says they have read it.
+
+          It renders NOTHING when there is no debt — including on the server,
+          where the ledger is unreadable by construction, so `/`'s precached
+          shell HTML is the same shape it was. */}
+      {grace.unrecorded.length > 0 && (
+        <div
+          role="alert"
+          data-testid="board-unrecorded"
+          className="mb-2 rounded-xl border-l-2 border-negative bg-negative-wash px-3 py-2.5"
+        >
+          <div className="mb-1.5 flex items-baseline justify-between gap-3">
+            <p className="text-sm font-bold text-negative">
+              {grace.unrecorded.length === 1
+                ? 'A completion wasn’t recorded.'
+                : `${grace.unrecorded.length} completions weren’t recorded.`}
+            </p>
+            <button
+              type="button"
+              data-testid="board-unrecorded-ack"
+              onClick={grace.acknowledgeUnrecorded}
+              className="shrink-0 text-[11px] font-bold uppercase tracking-[0.14em] text-negative underline underline-offset-4"
+            >
+              Acknowledge
+            </button>
+          </div>
+          <ul className="flex max-h-40 flex-col gap-1 overflow-y-auto">
+            {grace.unrecorded.map((u) => (
+              <li key={u.id} data-testid="board-unrecorded-row" className="text-sm text-console-ink">
+                <span className="font-semibold">{u.title || u.id}</span>
+                {' — your ✓ didn’t stick'}
+                {u.reason ? `: ${u.reason}` : ''}
+                {'. '}
+                {/* WHICH ROWS CAN BE MARKED AGAIN, said per row. Telling the
+                    operator to re-tap something that is no longer on the board
+                    would be a wrong steer dressed as a helpful one — and a row
+                    that aged out is precisely the one they have no other way to
+                    hear about. */}
+                <span className="text-console-ink-dim">
+                  {onBoard.has(u.id)
+                    ? 'It’s still on the board.'
+                    : 'It’s not on the board now — nothing was recorded.'}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {coverageLow && (
         // COVERAGE FLOOR (operator-ratified 0.80). When too much of the day went
         // unclassified, the module says so BEFORE he reads any of it — a

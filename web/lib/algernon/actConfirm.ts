@@ -75,6 +75,46 @@ export const ACT_UNCONFIRMED_MESSAGE =
   "That didn't confirm in time — the next sync will reconcile it.";
 
 /**
+ * WHY an act did not stick, in the words a ledger row appends after a colon.
+ *
+ * The server's OWN words first (`detail` — the resolver's message, e.g. "aged
+ * out of the last batch"), then its error code, then a last-resort line. On the
+ * throw path `detail` is the only part of the `FeedActResult` that survives:
+ * `http.ts` builds `ApiError` from `{error, detail}`, so a transport 409 whose
+ * body is an ActResult arrives with `code === 'request_failed'` and its machine
+ * `status` dropped. Reaching for `code` before `detail` would therefore print
+ * "request_failed" at the operator in the single commonest case there is.
+ *
+ * Shared because two ledgers now render this string into the same sentence
+ * shape ("your X did not stick: <reason>"), and two spellings of it would read
+ * as two different systems talking about one failure.
+ */
+export function refusalReason(e: ApiError): string {
+  return e.detail || e.code || 'the server refused it';
+}
+
+/**
+ * The reason for the one refusal the SERVER never worded: an inconclusive
+ * failure whose verify came back `not_landed`.
+ *
+ * There is no `detail` to quote — the request died before an answer — so the
+ * line states the OBSERVATION that made this a definite refusal rather than
+ * inventing a server voice for it. `unknown` deliberately gets no reason at all,
+ * because it is not a refusal (#62's rule: claiming a failure we did not observe
+ * is the original bug in a new place).
+ */
+export const VERIFIED_NOT_LANDED_REASON = 'the server still shows it open';
+
+/**
+ * The reason for a 401 during a deferred write.
+ *
+ * A definite non-landing — the request was rejected before it reached the store
+ * — but the operator is being logged out, so `refusalReason` would hand them the
+ * machine code `invalid_session` as an explanation. This says the fact instead.
+ */
+export const SESSION_EXPIRED_REASON = 'your session expired before it was sent';
+
+/**
  * The verify's OWN request budget, deliberately far below the 70s browser
  * default (#62 gate, WARN-2).
  *
