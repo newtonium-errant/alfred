@@ -9,6 +9,7 @@ import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { arrivedVerbless, isDeckDealt } from '../lib/algernon/feedConstants';
 import { readDeckSnoozed, writeDeckSnoozed } from '../lib/algernon/deckSnooze';
 import { ApiError } from '../lib/algernon/http';
+import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
 import { useSession } from '../lib/algernon/useSession';
 import { CONSOLE_LABEL } from '../lib/algernon/consoleTokens';
 
@@ -39,28 +40,37 @@ export default function DeckPage() {
     }
   }, [sessionLoading, user, unauthenticated, router]);
 
+  // Named (rather than inline in the effect) so the mount and the RESUME share
+  // one loader — the shape `pages/feed.tsx` and `pages/index.tsx` already use.
+  const loadDeck = useCallback(async () => {
+    try {
+      const res = await feedApi.list({ state: 'open', mode: 'decide' });
+      const snoozed = readSnoozed();
+      setItems(res.items.filter((it) => !snoozed.has(it.id)));
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        setUnauthenticated(true);
+        return;
+      }
+      setError('Could not load the deck. Try refreshing.');
+    }
+  }, []);
+
   useEffect(() => {
     if (!authed) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = await feedApi.list({ state: 'open', mode: 'decide' });
-        if (cancelled) return;
-        const snoozed = readSnoozed();
-        setItems(res.items.filter((it) => !snoozed.has(it.id)));
-      } catch (e) {
-        if (cancelled) return;
-        if (e instanceof ApiError && e.status === 401) {
-          setUnauthenticated(true);
-          return;
-        }
-        setError('Could not load the deck. Try refreshing.');
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [authed]);
+    void loadDeck();
+  }, [authed, loadDeck]);
+
+  // #62 defect (3): an iOS PWA resumes with its heap intact — same tree, same
+  // cards, no mount and no fetch. The deck was the surface the incident was
+  // PHOTOGRAPHED on (an 11:43 screenshot of a deck rendered at 23:43) and was
+  // the one member of this family never wired to the fix.
+  //
+  // It is also what makes the deck's own honesty copy true. A verdict lost to a
+  // timeout is told "the next sync will reconcile it" — and until this line, on
+  // this page, there was no next sync to do it: /deck fetched once, on mount,
+  // and never again. The sentence was a promise the surface did not keep.
+  useResumeRefetch(() => { if (authed) void loadDeck(); });
 
   const onSnoozePersist = useCallback((id: string) => {
     const p = readSnoozed();
@@ -108,6 +118,35 @@ export default function DeckPage() {
   );
   const verblessCount = useMemo(() => notDealt.filter(arrivedVerbless).length, [notDealt]);
   const worklistCount = notDealt.length - verblessCount;
+
+  // THE CURSOR ACROSS A REFETCH — required by the line above it, not decoration.
+  //
+  // The deck is the only member of the resume-refetch family that walks an INDEX
+  // into its items array; the feed and the home composer render lists and have no
+  // cursor to lose. Until the refetch was wired, /deck fetched once and that array
+  // never changed underneath the index — so nothing had ever had to be true here.
+  //
+  // Wiring the refetch alone REGRESSES: decide three of five, background the app,
+  // come back, and the server (correctly) serves only the two still open. The
+  // index is still 3, the queue is now length 2, and the deck reports "Deck
+  // clear." over two cards nobody has decided. Measured, not reasoned — that is
+  // exactly what the probe printed before this line existed.
+  //
+  // Keying on the dealable id SET makes the cursor's meaning explicit: it is a
+  // position within one dealing. A dealing whose cards changed is a different
+  // dealing and starts at the top; a refetch that returns the same cards — the
+  // common resume, where the operator merely glanced away — produces the same key
+  // and does not disturb the cursor at all. Both halves are pinned, because a
+  // remount on EVERY refetch would "fix" the first at the cost of throwing away
+  // the operator's progress every time the app lost focus.
+  //
+  // What a re-deal costs is the in-memory session state (the snoozed drill-down,
+  // this dealing's returned cards). Both have persistent backing that survives
+  // it: the snooze hide-list in sessionStorage keeps those cards out of the new
+  // dealing, and the unrecorded-verdict ledger in localStorage re-marks a refused
+  // card in the fresh list. That the honesty mechanism survives a remount is a
+  // property of having put it in storage rather than in state — pinned.
+  const dealKey = actionable.map((it) => it.id).join('|');
 
   if (!authed) {
     return (
@@ -202,6 +241,7 @@ export default function DeckPage() {
           // clearance out of the card instead of out of the page.
           <div className="mt-4 flex flex-col" style={{ minHeight: DECK_COLUMN_MIN_PX }}>
             <Deck
+              key={dealKey}
               items={actionable}
               onAuthExpired={onAuthExpired}
               onSnoozePersist={onSnoozePersist}

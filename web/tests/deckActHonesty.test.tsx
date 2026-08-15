@@ -152,6 +152,10 @@ describe('a refused verdict RETURNS the card (softeners 1 + 2)', () => {
 
     expect(result.current.current?.id).toBe('c'); // the thumb's card is untouched
     expect(result.current.ahead.map((i) => i.id)).toEqual(['a']); // a waits behind it
+    // NOTE: with ONE returned card, head and tail are the same position — this
+    // pin proves the card does not land ON the cursor, not that returns are
+    // ordered. The ORDERING property is pinned by the burst tests below, which
+    // assert ['a','c','e'] in the sequence they were refused.
   });
 
   it('a refused SNOOZE un-persists the hide-list, or the return dies at reload', async () => {

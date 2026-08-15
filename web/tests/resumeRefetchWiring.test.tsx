@@ -50,6 +50,15 @@ vi.mock('../lib/algernon/dayClient', () => ({
 
 import FeedPage from '../pages/feed';
 import HomePage from '../pages/index';
+// The THIRD member, added 2026-08-15. The family had two while the surface that
+// the #62 incident was actually photographed on — an 11:43 screenshot of a deck
+// rendered at 23:43 — was never in it. A pin that exists because a deletion
+// once stayed green has to grow with the family, or it protects the members it
+// happened to be written for and reports nothing about the one that arrived
+// later. `/deck` is also the page whose own copy PROMISES a next sync ("the
+// next sync will reconcile it" on an inconclusive act), which was false on this
+// surface until the hook was wired here.
+import DeckPage from '../pages/deck';
 
 function setVisibility(state: 'visible' | 'hidden') {
   Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
@@ -65,6 +74,7 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 describe.each([
   ['the feed page', () => <FeedPage />],
   ['the home composer', () => <HomePage />],
+  ['the deck', () => <DeckPage />],
 ])('%s refetches when the PWA resumes', (_label, renderPage) => {
   it('calls the feed again on visibilitychange', async () => {
     render(renderPage());
