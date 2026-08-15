@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from alfred.feed import FeedItem
+from alfred.feed.model import ATTENTION_FYI, ATTENTION_NEEDS_YOU
 from alfred.health.types import Status
 
 from .utils import get_logger
@@ -59,6 +60,39 @@ def _slot_is_candidate(source: str, confirmed: Any) -> bool:
     (operator-added, or a confirmed auto-T1) is NOT a candidate → the router
     refuses ``accept`` on it (the provenance guard)."""
     return source in _AUTO_CANDIDATE_SOURCES and confirmed is not True
+
+
+def _health_attention(status: str) -> str:
+    """Attention tier for a health card of per-tool BIT ``status``.
+
+    ``fail`` → needs-you; everything else that reaches a card (``warn``, and any
+    unrecognised status, which :func:`~.health_section.is_attention_status`
+    already let through) → the kind's FYI default.
+
+    WHY THE SPLIT LIVES HERE AND THE JUDGEMENT DOES NOT. This module does not
+    decide severity — the docstring below says so, and the health checks own it.
+    What this adds is the missing half of that contract: before 2026-08-15 the
+    health layer could distinguish warn from fail perfectly well and it made no
+    difference on the operator's surfaces, because every health card was born
+    FYI. A sustained agent-backend outage (curator quota-limited for days, email
+    intake stopped) rendered as an FYI glance card and the operator found it by
+    noticing an empty deck. So ``fail`` is now addressed to someone; ``warn``
+    keeps its glance semantics, which is what stops this from becoming a second,
+    noisier version of the skip-card incident.
+
+    **MODE IS DELIBERATELY NOT PROMOTED, and that is load-bearing.** Attention
+    alone is enough to reach the operator: ``isNeedsYouItem`` (web) is
+    ``attention === 'needs_you' || mode === 'decide'``, so the needs-you column
+    and the push doorbell (``pushNotifier.fetchNeedsYouItems`` under the default
+    ``needs_you`` policy) both pick this up. Promoting MODE to ``decide`` would
+    additionally BREAK the card: ``health`` has no entry in
+    ``daily_sync.action_router.FEED_ACTIONS``, so it advertises no verbs, and
+    the only dismiss path it has is the universal ack — which is gated on
+    ``item.mode != MODE_FYI`` and would start answering ``invalid_action``.
+    The result would be an unclearable card that rings every morning: the
+    2026-08-03 undismissable-health-card incident again, with a doorbell.
+    """
+    return ATTENTION_NEEDS_YOU if (status or "").strip().lower() == Status.FAIL.value else ATTENTION_FYI
 
 
 def health_feed_items(
@@ -129,6 +163,10 @@ def health_feed_items(
             instance=instance,
             title=title,
             evidence={"tool": tool, "status": status, "detail": detail},
+            # FAIL is needs-you; WARN stays the FYI glance the kind defaults to.
+            # See :func:`_health_attention` — the severity decision is the health
+            # layer's, and this only maps it onto the attention surface.
+            attention=_health_attention(status),
             source_ref=dict(_SOURCE_REF, record=str(record)),
         ))
     if quiet:
