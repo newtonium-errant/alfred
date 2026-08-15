@@ -53,6 +53,7 @@ from alfred.daily_sync.corpus import append_correction
 from alfred.daily_sync.feed_producer import _FAMILIES, _as_dict
 from alfred.feed.model import (
     ATTENTION_NEEDS_YOU,
+    KIND_REMINDER_RETURNED,
     MODE_DECIDE,
     MODE_FYI,
     STATE_ACKED,
@@ -131,6 +132,20 @@ STATUS_ALREADY_DONE = "already_done"
 # = deciding it (the operator has seen the interrupt); there is no resolver and no
 # last_batch (it was never part of a sync batch).
 URGENT_KIND = "email_urgent"
+
+# reminder_returned (T2-1) — a snoozed/waiting task's reminder came due and the
+# transport scheduler dealt a card for it. Same SHAPE as email_urgent and for
+# the same reasons: MODE_DECIDE (it deals into the deck and rings the phone),
+# emitted per-item by something that is not a sync producer (so there is no
+# last_batch to re-derive from), and its only verb is ``ack`` → acted.
+#
+# It carries the generic defer verbs and — unlike email_urgent — that is a
+# promise it can keep: ``transport.returns_feed.sweep_return_cards`` reconciles
+# this kind on every scheduler tick, and a reconcile is the ONE thing that
+# returns a lapsed defer (``_revival_suppressed`` is called from nowhere else).
+# The name is the feed's own (imported at the top of this module), so the kind
+# has one spelling across the three packages that have to say it.
+RETURN_KIND = KIND_REMINDER_RETURNED
 
 # (kind, action_id) → the kwargs that synthesize the owning resolver's
 # ``ReplyCorrection``. THIS MAP IS THE CAPABILITY CEILING — a pair absent here
@@ -271,6 +286,18 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "adopt": {},
         "ignore": {},
     },
+    # reminder_returned (T2-1) — ack-only, same shape as email_urgent's entry
+    # above: kwargs UNUSED, no ReplyCorrection, no last_batch, intercepted in
+    # :func:`_act_locked` (see the RETURN_KIND block). Acking = "seen, dealt
+    # with" → acted, not the FYI ``acked`` state.
+    #
+    # ONE verb, deliberately. The operator's real moves on a returned reminder
+    # are moves on the TASK — finish it, push it again — and both retire the
+    # card by themselves through the sweep. A card verb that also wrote the
+    # record would be a second writer for a state the record already owns.
+    RETURN_KIND: {
+        "ack": {},
+    },
 }
 
 # The generic defer capability, folded into the ceiling for every eligible kind.
@@ -370,6 +397,15 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
         "accept": {"label": "Take it", "weight": "light", "gesture": _GESTURE_AFFIRM},
     },
     "email_urgent": {
+        "ack": {"label": "Got it", "weight": "light", "gesture": _GESTURE_AFFIRM},
+    },
+    # reminder_returned (T2-1). LIGHT and affirm-gestured: the ack writes
+    # nothing outside the feed store — the task record is untouched — so there
+    # is nothing for an arm stage to show. Without this entry the card would
+    # still be advertised (the ceiling is the authority), but with a raw-id
+    # label and NO gesture, which the deck reads as "not a swipe verb": the
+    # card would be dealt with no way to clear it.
+    RETURN_KIND: {
         "ack": {"label": "Got it", "weight": "light", "gesture": _GESTURE_AFFIRM},
     },
     "pattern_surfaced": {
@@ -1919,6 +1955,23 @@ def _act_locked(
                 f"'{action_id}' is not a valid action for a {kind} item",
                 feed_item_id, action_id,
             )
+        feed_store.set_state(feed_item_id, STATE_ACTED, action=ACK_ACTION)
+        log.info("feed.act.acted", id=feed_item_id, kind=kind, action=action_id)
+        return ActResult(True, STATUS_ACTED, "acknowledged", feed_item_id, action_id)
+
+    # reminder_returned (T2-1) — the same interception the urgent ack needs, for
+    # the same reason: this kind is MODE_DECIDE, so the universal gate below
+    # would refuse its ``ack``, and it has no resolver and no last_batch.
+    #
+    # GATED ON THE VERB, not on the kind alone, and that difference is
+    # load-bearing. A kind-only intercept swallows EVERY verb the ceiling
+    # admits — including the auto-folded defer family — and answers them all
+    # with ``acted``, which turns "later" into "decided" at the one moment the
+    # operator said the opposite. Testing ``action_id == ACK_ACTION`` lets a
+    # defer fall through to its own dispatcher below, and anything else fall
+    # through to the generic ceiling check (which returns invalid_action for
+    # this kind's closed set of ack + defer).
+    if kind == RETURN_KIND and action_id == ACK_ACTION:
         feed_store.set_state(feed_item_id, STATE_ACTED, action=ACK_ACTION)
         log.info("feed.act.acted", id=feed_item_id, kind=kind, action=action_id)
         return ActResult(True, STATUS_ACTED, "acknowledged", feed_item_id, action_id)
