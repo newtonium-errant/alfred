@@ -51,13 +51,21 @@ describe('narrationSlides', () => {
 });
 
 describe('slideDeepLink', () => {
-  it('day_state → /feed, day_plan → /deck, everything else (incl. unknown) → the on-page brief anchor — never a dead link', () => {
+  it('day_state → /feed, day_plan → /deck, everything else → NO destination', () => {
+    // CHANGED CONDITION, not an appeasement. Unmapped sections used to fall back
+    // to `#brief-text`, which was honest while the brief's full text rendered
+    // always-on below the player. The operator retired that render on 2026-08-15
+    // ("if we're just retiring the old written brief and keeping the player then
+    // no need to fix it before removing it"), and the text now renders only when
+    // the player CANNOT play — i.e. never while a slide is on screen to be
+    // tapped. The anchor would have pointed every unmapped section of a working
+    // briefing at the Daily Sync, so the caller now renders no link at all.
     expect(slideDeepLink('day_state')).toBe('/feed');
     expect(slideDeepLink('day_plan')).toBe('/deck');
-    expect(slideDeepLink('health')).toBe('#brief-text');
-    expect(slideDeepLink('weather')).toBe('#brief-text');
-    expect(slideDeepLink('sign_off')).toBe('#brief-text');
-    expect(slideDeepLink('mystery')).toBe('#brief-text');
+    expect(slideDeepLink('health')).toBeNull();
+    expect(slideDeepLink('weather')).toBeNull();
+    expect(slideDeepLink('sign_off')).toBeNull();
+    expect(slideDeepLink('mystery')).toBeNull();
   });
 });
 

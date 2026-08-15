@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { SECTION_DEEP_LINK_FALLBACK, slideDeepLink } from '../lib/algernon/player';
+import { slideDeepLink } from '../lib/algernon/player';
 import { SURFACE_PATHS } from '../lib/algernon/contactRouter';
 
 // `/brief` IS RETIRED — the player replaces it (console-completion arc,
@@ -105,26 +105,38 @@ describe('what the page carried moved with it', () => {
 });
 
 describe('the slide fallback is a decision, not a leftover', () => {
-  it('unmapped sections land on the brief text on THIS page', () => {
-    // Not home: home renders a summary card from the brief's `date` and never
-    // its markdown, so a cross-page link there would be the retirement's
-    // self-loop wearing a fix's clothes. The player carries both BriefViews, so
-    // the honest destination for "the rest of this section" is just below.
-    expect(SECTION_DEEP_LINK_FALLBACK).toBe('#brief-text');
-    expect(slideDeepLink('mystery')).toBe('#brief-text');
-    expect(slideDeepLink('health')).toBe('#brief-text');
+  // THE CONDITION THIS PIN WAS REGISTERED AGAINST HAS CHANGED, and the flip is
+  // deliberate rather than an appeasement. The old premise was that the player
+  // carries the brief's full text always-on, which made "just below" the honest
+  // destination for an unmapped section. The operator retired that always-on
+  // render on 2026-08-15 ("if we're just retiring the old written brief and
+  // keeping the player then no need to fix it before removing it"), so the text
+  // now renders ONLY when the player cannot play.
+  //
+  // That inverts the fallback's truth condition rather than merely moving it: a
+  // slide link exists only while slides exist, and slides exist only while the
+  // narration works — precisely when the brief text is NOT rendered. The anchor
+  // would therefore have pointed every unmapped section of a WORKING briefing at
+  // a region holding only the Daily Sync. So the fallback is gone and unmapped
+  // sections have no destination at all.
+  it('an unmapped section has NO destination', () => {
+    expect(slideDeepLink('mystery')).toBeNull();
+    expect(slideDeepLink('health')).toBeNull();
+    expect(slideDeepLink('weather')).toBeNull();
   });
 
-  it('the anchor it points at actually EXISTS on the player', () => {
-    // The half that makes the fallback a destination rather than a string. An
-    // anchor with no matching id is a dead link that no type checker can see.
+  it('the anchor still exists for the links that DO fire', () => {
+    // The id survives the fallback's removal because the two "Full text below ↓"
+    // affordances still point at it — and they render only in the states where
+    // the document renders, which is what keeps them true.
     const player = read('pages', 'player.tsx');
-    expect(player).toContain(`id="${SECTION_DEEP_LINK_FALLBACK.slice(1)}"`);
+    expect(player).toContain('id="brief-text"');
+    expect(player).toContain('href="#brief-text"');
   });
 
-  it('the mapped sections still win over the fallback', () => {
-    // Vacuity control: a broken map would return the fallback for everything
-    // and the assertion above would still pass.
+  it('the mapped sections still have theirs', () => {
+    // Vacuity control: a map that returned null for everything would satisfy the
+    // assertion above while having deleted the feature.
     expect(slideDeepLink('day_state')).toBe('/feed');
     expect(slideDeepLink('day_plan')).toBe('/deck');
   });

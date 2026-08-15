@@ -85,29 +85,33 @@ export function narrationSlides(n: BriefNarration | null | undefined): PlayerSli
 
 // Where a slide's deep-link (tap the slide element) lands — the REAL surface for that
 // section, per the design. day_state (goal rings) → the feed; day_plan (slots) → the
-// deck (accept/complete); everything else → the brief text on this page (see below).
+// deck (accept/complete). Everything else has NO destination, and null is that answer.
 //
-// THE FALLBACK IS THE PLAYER'S OWN BRIEF TEXT, and it is a decision rather than a
-// leftover. It used to be `/brief`, which is retired. It is deliberately NOT home:
-// home renders a summary CARD built from the brief's `date` and never renders its
-// markdown, so sending "here is the rest of this section" to the home screen would
-// be a cross-page link to a card — the same self-loop the retirement was supposed to
-// remove, wearing a fix's clothes.
+// THE ANCHOR FALLBACK IS GONE, and its removal is the point rather than a tidy-up.
+// It used to be `#brief-text` — the brief's own full text, rendered below the player,
+// which made the player self-contained for brief content. The operator has since ruled
+// that always-on document render off the surface (2026-08-15: "if we're just retiring
+// the old written brief and keeping the player then no need to fix it before removing
+// it"), so the brief text now renders ONLY when the player cannot play.
 //
-// Since both `BriefView`s now render on `/player`, the player is SELF-CONTAINED for
-// brief content, and the most truthful destination for an unmapped section is the
-// full text immediately below it. An in-page anchor, not a route.
+// That inverts the fallback's truth condition. A slide link only exists while slides
+// exist, and slides only exist while the narration works — which is exactly when the
+// brief text is NOT rendered. So the anchor would have pointed, on every unmapped
+// section of a perfectly working briefing, at a region containing someone else's
+// artifact (the Daily Sync, which stays). A link that always lands somewhere wrong is
+// worse than no link: the operator learns the affordance is untrustworthy and stops
+// reading the ones that DO work.
 //
-// Pinned by player.test.ts + briefRetired.test.ts. A future section that wants a real
-// CROSS-SURFACE destination has to add a row to the map consciously; inheriting the
-// anchor by accident is exactly what the pin stops.
-export const SECTION_DEEP_LINK_FALLBACK = '#brief-text';
+// Returning null is therefore the honest answer, and the caller renders no link at all
+// for those sections. A future section that wants a real destination adds a row to the
+// map consciously — the same discipline the old fallback pin protected, now without an
+// anchor to inherit by accident.
 const SECTION_DEEP_LINK: Record<string, string> = {
   day_state: '/feed',
   day_plan: '/deck',
 };
-export function slideDeepLink(sectionId: string): string {
-  return SECTION_DEEP_LINK[sectionId] ?? SECTION_DEEP_LINK_FALLBACK;
+export function slideDeepLink(sectionId: string): string | null {
+  return SECTION_DEEP_LINK[sectionId] ?? null;
 }
 
 /**
