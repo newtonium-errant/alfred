@@ -317,3 +317,88 @@ def test_the_first_render_announces_that_it_is_a_baseline(tmp_path: Path) -> Non
     matches = [c for c in captured if c.get("event") == "ops_notable.baseline_recorded"]
     assert len(matches) == 1, captured
     assert matches[0]["instance"] == "salem"
+
+
+# --- the recovery predicate is SHARED, not mirrored (reviewer-g2 fold) -------
+#
+# `_active_agent_failure_kind` used to implement its own `last_run >= fail_ts`
+# on the RAW STRINGS under a docstring saying it "mirrors the BIT recovery
+# rule" — a citation that behaved as a copy. It was the THIRD spelling of
+# "recovered" in the tree, and it agreed with the real rule only while every
+# timestamp shared one ISO spelling.
+#
+# These are the disagreeing pairs, MEASURED by driving both functions on the
+# same inputs across the three forms this codebase tolerates. Uniform-spelling
+# pairs always agreed, which is why the divergence stayed invisible: curator
+# writes `datetime.now(timezone.utc).isoformat()` everywhere, so production
+# only ever produced the agreeing cases. The pin uses the pairs that BITE —
+# the ones that appear the day any writer changes timestamp format.
+
+_SAME_INSTANT = [
+    # (fail_ts, last_run) — identical instants, mixed spellings. The old string
+    # compare called each of these STILL-FAILING because "Z" (0x5A) sorts above
+    # "+" (0x2B) and above the naive form's end-of-string.
+    ("2026-08-15T00:31:00Z", "2026-08-15T00:31:00+00:00"),
+    ("2026-08-15T00:31:00+00:00", "2026-08-15T00:31:00"),
+    ("2026-08-15T00:31:00Z", "2026-08-15T00:31:00"),
+]
+
+
+def test_mixed_spelling_recovery_reads_as_recovered() -> None:
+    """A success at the SAME INSTANT as the failure is a recovery, whatever
+    spelling either timestamp arrived in.
+
+    Direction matters: every one of these previously read as still-failing, so
+    the bug was a STUCK ops_notable card naming a quota outage that had already
+    cleared — noise rather than silence, but wrong, and it would have outlived
+    the outage it described.
+    """
+    from alfred.brief.ops_notable import _active_agent_failure_kind
+
+    for fail_ts, last_run in _SAME_INSTANT:
+        state = {
+            "last_agent_failure": {"kind": "quota_limited", "ts": fail_ts},
+            "last_run": last_run,
+        }
+        assert _active_agent_failure_kind(state) is None, (
+            f"fail_ts={fail_ts!r} last_run={last_run!r} should read as recovered"
+        )
+
+
+def test_mixed_spelling_active_failure_still_cards() -> None:
+    """The positive control for the pin above, in the same spellings.
+
+    Without it, "returns None" would pass just as well against a function that
+    returns None for everything — which is precisely the mode a recovery
+    predicate must never fail into, because it would swallow live outages.
+    """
+    from alfred.brief.ops_notable import _active_agent_failure_kind
+
+    for fail_ts, last_run in _SAME_INSTANT:
+        # Same spellings, but the success is a full day BEFORE the failure.
+        state = {
+            "last_agent_failure": {"kind": "quota_limited", "ts": fail_ts},
+            "last_run": last_run.replace("2026-08-15", "2026-08-14"),
+        }
+        assert _active_agent_failure_kind(state) == "quota_limited", (
+            f"fail_ts={fail_ts!r} last_run={last_run!r} should still be active"
+        )
+
+
+def test_ops_notable_asks_the_one_canonical_recovery_predicate() -> None:
+    """The fold itself: this module must CONSUME the shared predicate rather
+    than re-spell it. Patching the canonical helper has to change this
+    function's answer — if it does not, a fourth spelling has grown back.
+    """
+    from unittest.mock import patch
+
+    from alfred.brief import ops_notable
+
+    state = {
+        "last_agent_failure": {"kind": "auth", "ts": "2026-08-15T00:31:00+00:00"},
+        "last_run": "2026-08-14T00:00:00+00:00",  # genuinely still failing
+    }
+    assert ops_notable._active_agent_failure_kind(state) == "auth"
+
+    with patch.object(ops_notable, "failure_superseded_by_success", return_value=True):
+        assert ops_notable._active_agent_failure_kind(state) is None

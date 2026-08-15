@@ -26,6 +26,7 @@ from alfred.curator.health import (
     _read_curator_last_agent_failure,
     health_check,
 )
+from alfred.health.agent_failure import SUSTAINED_FAILURE_STREAK
 from alfred.health.types import Status
 
 INCIDENT_MESSAGE = "Exit code 1: stdout: You've hit your weekly limit · resets 4am (UTC)"
@@ -173,6 +174,185 @@ def test_unparseable_failure_ts_still_surfaces(tmp_path: Path) -> None:
     )
     r = _check_agent_failure_kind(_raw(sp))
     assert r.status is Status.WARN
+
+
+# ---------------------------------------------------------------------------
+# SUSTAINED outage escalates WARN → FAIL (2026-08-15)
+# ---------------------------------------------------------------------------
+#
+# The severity IS the escalation: ``brief.feed_producer.health_feed_items``
+# promotes a FAIL health card to needs-you attention, so this boundary is what
+# decides whether a multi-day agent-backend outage reaches the operator or sits
+# in the brief as an FYI glance line. Both sides of the threshold are pinned —
+# an escalation that fires one failure early is a doorbell for every hiccup.
+
+
+def _quota_failure(streak: int, *, since_minutes: float = 240) -> dict[str, Any]:
+    return {
+        "ts": _iso(1),
+        "kind": "quota_limited",
+        "summary_tail": INCIDENT_MESSAGE,
+        "consecutive": streak,
+        "since": _iso(since_minutes / 60.0),
+    }
+
+
+def test_streak_one_below_threshold_stays_warn(tmp_path: Path) -> None:
+    """N-1 is a hiccup. The lower half of the boundary."""
+    sp = tmp_path / "curator_state.json"
+    _write_state(
+        sp,
+        last_run=_iso(72),
+        last_agent_failure=_quota_failure(SUSTAINED_FAILURE_STREAK - 1),
+    )
+    r = _check_agent_failure_kind(_raw(sp))
+    assert r.status is Status.WARN
+    assert r.data["sustained"] is False
+
+
+def test_streak_at_threshold_fails(tmp_path: Path) -> None:
+    """N is an outage. The upper half of the same boundary."""
+    sp = tmp_path / "curator_state.json"
+    _write_state(
+        sp,
+        last_run=_iso(72),
+        last_agent_failure=_quota_failure(SUSTAINED_FAILURE_STREAK),
+    )
+    r = _check_agent_failure_kind(_raw(sp))
+    assert r.status is Status.FAIL
+    assert r.data["sustained"] is True
+    assert r.data["consecutive"] == SUSTAINED_FAILURE_STREAK
+
+
+def test_sustained_card_body_names_class_and_consequence(tmp_path: Path) -> None:
+    """The operator-facing copy. This IS the deliverable of the escalation —
+    the card has to say what broke, what it costs, and (via the CLI tail) when
+    it resets, or a needs-you ring just says 'something is wrong'."""
+    sp = tmp_path / "curator_state.json"
+    _write_state(
+        sp,
+        last_run=_iso(72),
+        last_agent_failure=_quota_failure(4),
+    )
+    detail = _check_agent_failure_kind(_raw(sp)).detail
+    assert "quota-limited" in detail                    # the failure CLASS
+    assert "4 consecutive agent failures" in detail     # why it is an outage
+    assert "email intake is stopped" in detail          # the CONSEQUENCE
+    assert "quarantined" in detail                      # ...and that mail is not lost
+    assert "You've hit your weekly limit" in detail     # the reset date rides the tail
+
+
+def test_sustained_other_kind_also_escalates(tmp_path: Path) -> None:
+    """Escalation is STRUCTURAL — it keys on the streak, not on the error text.
+
+    An unclassified backend failure repeating N times is as much an outage as a
+    recognised quota banner; only the wording differs.
+    """
+    sp = tmp_path / "curator_state.json"
+    _write_state(
+        sp,
+        last_run=_iso(72),
+        last_agent_failure={
+            "ts": _iso(1), "kind": "other", "summary_tail": "Exit code 1: connection reset",
+            "consecutive": SUSTAINED_FAILURE_STREAK, "since": _iso(4),
+        },
+    )
+    r = _check_agent_failure_kind(_raw(sp))
+    assert r.status is Status.FAIL
+    assert "failing (other)" in r.detail
+    assert "email intake is stopped" in r.detail
+
+
+def test_sustained_streak_recovered_by_success_is_ok(tmp_path: Path) -> None:
+    """Recovery DOWNGRADES: a success after the outage clears it to OK, which
+    makes the card go absent and lets reconcile retire it.
+
+    Positive control is the pin above — same streak, same kind; the only
+    difference is that ``last_run`` now post-dates the failure.
+    """
+    sp = tmp_path / "curator_state.json"
+    _write_state(
+        sp,
+        last_run=_iso(0.5),  # success AFTER the failure below
+        last_agent_failure={
+            "ts": _iso(1), "kind": "quota_limited", "summary_tail": INCIDENT_MESSAGE,
+            "consecutive": SUSTAINED_FAILURE_STREAK + 5, "since": _iso(72),
+        },
+    )
+    r = _check_agent_failure_kind(_raw(sp))
+    assert r.status is Status.OK
+    assert "predates last success" in r.detail
+
+
+def test_legacy_record_without_streak_stays_warn(tmp_path: Path) -> None:
+    """A pre-amendment record evidences ONE failure → transient, not an outage.
+
+    The upgrade must not re-read old state as an instant outage; the streak
+    rebuilds from live traffic.
+    """
+    sp = tmp_path / "curator_state.json"
+    _write_state(
+        sp,
+        last_run=_iso(72),
+        last_agent_failure={"ts": _iso(1), "kind": "quota_limited", "summary_tail": INCIDENT_MESSAGE},
+    )
+    r = _check_agent_failure_kind(_raw(sp))
+    assert r.status is Status.WARN
+    assert r.data["consecutive"] == 1
+
+
+def test_corrupt_streak_degrades_downward(tmp_path: Path) -> None:
+    """A corrupt count must not manufacture an outage (nor crash the sweep)."""
+    for bad in ("many", None, [9], -4):
+        sp = tmp_path / "curator_state.json"
+        _write_state(
+            sp,
+            last_run=_iso(72),
+            last_agent_failure={
+                "ts": _iso(1), "kind": "quota_limited",
+                "summary_tail": INCIDENT_MESSAGE, "consecutive": bad,
+            },
+        )
+        r = _check_agent_failure_kind(_raw(sp))
+        assert r.status is Status.WARN, f"corrupt streak {bad!r} escalated"
+
+
+def test_since_reports_streak_start_not_latest_failure(tmp_path: Path) -> None:
+    """"failing since X" must mean since. The bug this replaces rendered the
+    NEWEST failure's timestamp, so a three-day outage read as minutes old."""
+    sp = tmp_path / "curator_state.json"
+    streak_start = _iso(72 * 60)  # 72 hours ago
+    _write_state(
+        sp,
+        last_run=_iso(96 * 60),
+        last_agent_failure={
+            "ts": _iso(1), "kind": "quota_limited", "summary_tail": INCIDENT_MESSAGE,
+            "consecutive": SUSTAINED_FAILURE_STREAK, "since": streak_start,
+        },
+    )
+    r = _check_agent_failure_kind(_raw(sp))
+    assert f"since {streak_start}" in r.detail
+    assert r.data["since"] == streak_start
+
+
+def test_auth_failure_still_fails_at_streak_one(tmp_path: Path) -> None:
+    """The streak ADDS an escalation path; it must not gate the existing one.
+
+    ``auth`` means the pipeline is down on the first failure — waiting for a
+    third would delay a FAIL the probe already knew about in 2026-07.
+    """
+    sp = tmp_path / "curator_state.json"
+    _write_state(
+        sp,
+        last_run=_iso(72),
+        last_agent_failure={
+            "ts": _iso(1), "kind": "auth",
+            "summary_tail": "Exit code 1: not logged in", "consecutive": 1,
+        },
+    )
+    r = _check_agent_failure_kind(_raw(sp))
+    assert r.status is Status.FAIL
+    assert "DOWN" in r.detail
 
 
 # ---------------------------------------------------------------------------

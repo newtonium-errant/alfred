@@ -8,9 +8,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from alfred.health.agent_failure import (
+    SUSTAINED_FAILURE_STREAK,
+    failure_superseded_by_success,
+)
+
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+# A ``last_agent_failure`` written before the streak amendment carries no
+# ``consecutive`` key. It records ONE observed failure, so it reads as a streak
+# of exactly 1 — the schema-tolerant default that keeps an in-flight outage's
+# count monotonic across a deploy instead of restarting it at 0.
+_LEGACY_STREAK = 1
 
 
 @dataclass
@@ -92,29 +103,126 @@ class State:
             # ``last_run`` is the last SUCCESSFUL process, and the curator's
             # ``agent-failure-kind`` probe reads it as exactly that: a
             # ``last_run >= failure_ts`` comparison is how it tells a recovered
-            # pipeline from an active outage (``curator/health.py:385``).
-            # Bumping it on a failure path makes every failure look recovered
-            # on the very next probe — which is precisely the multi-day quota
-            # outage the probe was built to catch.
+            # pipeline from an active outage. Bumping it on a failure path
+            # makes every failure look recovered on the very next probe —
+            # which is precisely the multi-day quota outage the probe was
+            # built to catch.
+            self._log_recovery_if_sustained()
             self.last_run = datetime.now(timezone.utc).isoformat()
         # Success clears any accumulated failure count (a transient failure that
         # later self-heals must not carry stale attempts toward the cap).
         self.failed_attempts.pop(filename, None)
 
+    def _log_recovery_if_sustained(self) -> None:
+        """Emit the recovery counterpart of ``curator.agent_failure_sustained``.
+
+        Called from :meth:`mark_processed` BEFORE ``last_run`` is bumped —
+        the order matters and is the whole trick: once ``last_run`` moves past
+        the failure, :func:`failure_superseded_by_success` answers True and the
+        outage is no longer active, so this fires exactly once, on the FIRST
+        success that ends it. No "already logged" flag to persist.
+
+        Silent on every ordinary success (nothing was down) and on recovery
+        from a SHORT streak (a hiccup that resolved is not news). Pairing this
+        with the escalation line is the ILB half that matters operationally:
+        without it the log shows an outage beginning and never ending, which
+        reads identically to an outage that never ended.
+        """
+        failure = self.last_agent_failure
+        if not isinstance(failure, dict):
+            return
+        if failure_superseded_by_success(failure.get("ts"), self.last_run):
+            return  # already recovered — this is just another ordinary success
+        try:
+            streak = int(failure.get("consecutive", _LEGACY_STREAK))
+        except (TypeError, ValueError):
+            streak = _LEGACY_STREAK
+        if streak < SUSTAINED_FAILURE_STREAK:
+            return
+        log.info(
+            "curator.agent_failure_recovered",
+            kind=failure.get("kind", "other"),
+            consecutive=streak,
+            since=failure.get("since") or failure.get("ts"),
+        )
+
     def record_agent_failure(self, kind: str, summary: str) -> None:
-        """Stamp the most recent agent (``claude -p``) failure.
+        """Stamp the most recent agent (``claude -p``) failure, and its STREAK.
 
         Called from the daemon's ``result.success is False`` branch. Does
         NOT touch ``last_run`` — that stays the last SUCCESSFUL process, so
         the BIT probe can compare the two to tell an active outage from a
         recovered one. ``summary`` is already bounded by
         ``build_failure_summary`` (<=300 chars); we store its tail defensively.
+
+        **``consecutive`` is the STRUCTURAL outage signal** (2026-08-15), and
+        it is deliberately structural rather than a re-read of the error text:
+        ``kind`` already carries the classifier's opinion about WHAT failed,
+        while the streak carries HOW LONG it has been failing, and only the
+        second distinguishes one bad run from the multi-day agent-backend
+        outage that quarantines the whole intake. A quota banner on a single
+        call is a hiccup; the same banner on the third call in a row is an
+        outage with a daily cost.
+
+        Reset-vs-extend asks the ONE recovery predicate the BIT probe asks
+        (:func:`~alfred.health.agent_failure.failure_superseded_by_success`):
+        a success recorded at-or-after the stored failure broke the streak, so
+        this failure starts a fresh one at 1; otherwise it extends. Sharing the
+        predicate is what keeps the counter and the probe's severity from
+        disagreeing about the same state file.
+
+        ``since`` is the FIRST failure of the current streak, carried forward
+        while it runs. The probe's operator-facing copy says "failing since X",
+        and before this it passed ``ts`` — the most RECENT failure — which made
+        a three-day outage read as if it had started moments ago.
         """
+        now = datetime.now(timezone.utc).isoformat()
+        prior = self.last_agent_failure
+
+        streak = 1
+        since = now
+        if isinstance(prior, dict) and not failure_superseded_by_success(
+            prior.get("ts"), self.last_run
+        ):
+            try:
+                prior_streak = int(prior.get("consecutive", _LEGACY_STREAK))
+            except (TypeError, ValueError):
+                # A hand-edited / corrupt count must not crash the daemon's
+                # failure path — the streak is an observability signal, not a
+                # correctness invariant. Fall back to the legacy reading.
+                prior_streak = _LEGACY_STREAK
+            streak = max(prior_streak, 0) + 1
+            # An older record has no ``since``; its own ``ts`` is the earliest
+            # failure we can evidence, so the streak starts there rather than
+            # claiming it began now.
+            prior_since = prior.get("since") or prior.get("ts")
+            if isinstance(prior_since, str) and prior_since:
+                since = prior_since
+
         self.last_agent_failure = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": now,
             "kind": kind or "other",
             "summary_tail": (summary or "")[-300:],
+            "consecutive": streak,
+            "since": since,
         }
+
+        if streak == SUSTAINED_FAILURE_STREAK:
+            # ILB, and once per outage: logged on the CROSSING (``==``, not
+            # ``>=``) so the log carries the moment the backend went from
+            # flaky to down, rather than one line per failure for the rest of
+            # a multi-day outage. The probe re-derives ``sustained`` from the
+            # streak on every sweep, so nothing depends on this line being
+            # seen — it exists so the transition has a timestamp in the log an
+            # operator can grep back to when asking "when did intake stop?".
+            log.warning(
+                "curator.agent_failure_sustained",
+                kind=kind or "other",
+                consecutive=streak,
+                since=since,
+                threshold=SUSTAINED_FAILURE_STREAK,
+                summary_tail=(summary or "")[-300:],
+            )
 
     def failed_count(self, filename: str) -> int:
         return self.failed_attempts.get(filename, 0)

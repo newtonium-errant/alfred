@@ -25,6 +25,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from alfred.health.agent_failure import (
+    SUSTAINED_FAILURE_STREAK,
+    failure_superseded_by_success,
+)
 from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth, resolve_api_key
 from alfred.health.claude_cli_auth import check_claude_cli_auth, resolve_claude_command
@@ -302,24 +306,6 @@ def _check_last_successful_process(raw: dict[str, Any]) -> CheckResult:
     )
 
 
-def _parse_iso_utc(value: str | None) -> datetime | None:
-    """Parse an ISO timestamp to an aware UTC datetime, or None if unparseable.
-
-    Tolerates the trailing-``Z`` form alongside the explicit-offset form and
-    treats a naive timestamp as UTC (curator writes UTC everywhere).
-    """
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
-        dt = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 def _read_curator_last_agent_failure(state_path: Path) -> dict[str, Any] | None:
     """Read curator state's top-level ``last_agent_failure`` dict.
 
@@ -339,6 +325,27 @@ def _read_curator_last_agent_failure(state_path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _failure_streak(failure: dict[str, Any]) -> int:
+    """How many CONSECUTIVE agent failures the recorded streak stands at.
+
+    Reads ``consecutive``, written by ``curator.state.record_agent_failure``.
+    A record written before the streak amendment has no such key and evidences
+    exactly ONE failure, so it reads as 1 — the same schema-tolerant default
+    the writer uses, and it keeps a pre-deploy outage from being re-read as
+    zero failures (which would silently un-escalate a live one).
+
+    A non-integer / negative value degrades to 1 rather than raising: this is a
+    severity input, and a corrupt count must not take the whole BIT run down
+    mid-sweep. Degrading DOWNWARD is the safe direction — it can only delay an
+    escalation by one more failure, never manufacture one.
+    """
+    try:
+        streak = int(failure.get("consecutive", 1))
+    except (TypeError, ValueError):
+        return 1
+    return streak if streak >= 1 else 1
+
+
 def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
     """Surface the most recent ``claude -p`` agent failure, if it's still active.
 
@@ -355,8 +362,19 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
       * failure OLDER-or-equal to the last success    → OK  (pipeline recovered)
       * active failure, ``kind == auth``              → FAIL (pipeline is DOWN — mirrors
                                                         the claude-cli-auth severity)
+      * active failure, SUSTAINED (streak >= 3)       → FAIL (an outage, not a hiccup)
       * active failure, ``kind == quota_limited``     → WARN (intake failing + quarantining)
       * active failure, ``kind == other`` / unknown   → WARN (surface the CLI tail)
+
+    **Why SUSTAINED is a FAIL and not a louder WARN** (2026-08-15). Severity is
+    the health layer's call — the feed producer says so explicitly and refuses
+    to make it — and FAIL is the only lever here that reaches the operator: the
+    brief's health card is an FYI-attention glance item at WARN, and
+    ``brief.feed_producer.health_feed_items`` promotes a FAIL to needs-you
+    attention, which is what puts it in the needs-you column and rings the push
+    doorbell. So this line is the whole escalation; a WARN with more alarming
+    prose changes nothing an operator would notice, which is exactly what the
+    2026-08-15 outage demonstrated over several days.
 
     Per ``feedback_intentionally_left_blank.md`` the no-failure case emits an
     explicit OK line so "healthy" is never silent absence.
@@ -372,17 +390,16 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
             data={"state_path": str(state_path)},
         )
 
-    fail_ts = _parse_iso_utc(failure.get("ts"))
-    last_run_dt = _parse_iso_utc(_read_curator_last_run(state_path))
+    last_run_raw = _read_curator_last_run(state_path)
     kind = failure.get("kind", "other") or "other"
     tail = failure.get("summary_tail", "") or ""
     ts_display = failure.get("ts", "unknown")
 
     # A success AT-OR-AFTER the recorded failure means the pipeline recovered —
-    # the stale failure is history, not an active outage. (If the failure ts is
-    # unparseable we can't prove recovery, so we treat it as active and surface
-    # it rather than swallow it.)
-    if fail_ts is not None and last_run_dt is not None and last_run_dt >= fail_ts:
+    # the stale failure is history, not an active outage. (If either timestamp
+    # is unparseable we can't PROVE recovery, so the shared predicate answers
+    # False and we surface the failure rather than swallow it.)
+    if failure_superseded_by_success(failure.get("ts"), last_run_raw):
         return CheckResult(
             name="agent-failure-kind",
             status=Status.OK,
@@ -390,15 +407,26 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
             data={
                 "state_path": str(state_path),
                 "last_agent_failure": failure,
-                "last_run": _read_curator_last_run(state_path),
+                "last_run": last_run_raw,
             },
         )
+
+    streak = _failure_streak(failure)
+    # The streak's FIRST failure, not its most recent — "failing since" has to
+    # mean since, or a multi-day outage reads as minutes old. Older records
+    # (pre-streak schema) carry no ``since`` and fall back to ``ts``, which is
+    # the earliest failure they can evidence.
+    since_display = failure.get("since") or ts_display
+    sustained = streak >= SUSTAINED_FAILURE_STREAK
 
     payload: dict[str, Any] = {
         "state_path": str(state_path),
         "kind": kind,
         "ts": ts_display,
         "summary_tail": tail,
+        "consecutive": streak,
+        "since": since_display,
+        "sustained": sustained,
     }
 
     if kind == "auth":
@@ -406,8 +434,26 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
             name="agent-failure-kind",
             status=Status.FAIL,
             detail=(
-                f"claude -p auth failure since {ts_display} — structuring pipeline is DOWN; "
+                f"claude -p auth failure since {since_display} — structuring pipeline is DOWN; "
                 f"last CLI message: {tail}"
+            ),
+            data=payload,
+        )
+    if sustained:
+        # The card body an operator reads at 6am. It names the failure CLASS
+        # (so "quota-limited" is on the face rather than buried in a tail) and
+        # its CONSEQUENCE — email intake is stopped, and the emails are being
+        # quarantined rather than lost. The CLI tail rides along because that
+        # is where the reset date lives ("resets Aug 20"), which is the one
+        # fact that tells the operator whether to wait or to act.
+        what = "quota-limited" if kind == "quota_limited" else f"failing ({kind})"
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.FAIL,
+            detail=(
+                f"claude -p {what} since {since_display} — {streak} consecutive agent "
+                f"failures, no success in between: email intake is stopped and new mail "
+                f"is being quarantined. Last CLI message: {tail}"
             ),
             data=payload,
         )
@@ -416,7 +462,7 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
             name="agent-failure-kind",
             status=Status.WARN,
             detail=(
-                f"claude -p quota-limited since {ts_display} — intake failing + quarantining; "
+                f"claude -p quota-limited since {since_display} — intake failing + quarantining; "
                 f"last CLI message: {tail}"
             ),
             data=payload,
@@ -424,7 +470,7 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
     return CheckResult(
         name="agent-failure-kind",
         status=Status.WARN,
-        detail=f"claude -p failing ({kind}) since {ts_display}; last CLI message: {tail}",
+        detail=f"claude -p failing ({kind}) since {since_display}; last CLI message: {tail}",
         data=payload,
     )
 

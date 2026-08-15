@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from alfred.feed import FeedItem
+from alfred.health.agent_failure import failure_superseded_by_success
 
 from .utils import get_logger
 
@@ -194,14 +195,32 @@ def _curator_failed_file_count(curator_state: dict[str, Any]) -> int:
 
 def _active_agent_failure_kind(curator_state: dict[str, Any]) -> str | None:
     """The kind of the most recent agent failure, when it has NOT been
-    superseded by a later success. Mirrors the BIT ``agent-failure-kind``
-    recovery rule: a failure at-or-before the last success is history."""
+    superseded by a later success.
+
+    Asks :func:`~alfred.health.agent_failure.failure_superseded_by_success` —
+    THE recovery predicate, the same one the curator BIT probe and the
+    consecutive-failure counter ask. This used to say it "mirrors the BIT
+    recovery rule" while implementing its own ``last_run >= fail_ts`` on the
+    RAW STRINGS, and a docstring promising a mirror is exactly how a third
+    spelling hides: it reads as a citation and behaves as a copy.
+
+    The string compare agreed with the real rule only while every timestamp
+    shared one spelling. Measured across same-instant pairs drawn from the
+    three ISO forms this codebase tolerates (``+00:00``, ``Z``, naive), three
+    of nine disagreed — e.g. ``fail_ts="...Z"`` against
+    ``last_run="...+00:00"``: identical instants, but ``"Z" > "+"`` byte-wise,
+    so the compare called a recovered pipeline still-failing. Uniform
+    direction, and the safe one (a STUCK card naming an outage that already
+    cleared, never a MISSED outage) — but wrong, and latent only because
+    curator writes ``datetime.now(timezone.utc).isoformat()`` everywhere
+    today. It stops being latent the day one writer changes format.
+    """
     failure = curator_state.get("last_agent_failure")
     if not isinstance(failure, dict):
         return None
-    fail_ts = str(failure.get("ts", "") or "")
-    last_run = str(curator_state.get("last_run", "") or "")
-    if fail_ts and last_run and last_run >= fail_ts:
+    if failure_superseded_by_success(
+        failure.get("ts"), curator_state.get("last_run")
+    ):
         return None  # recovered
     kind = failure.get("kind") or "other"
     return str(kind)
