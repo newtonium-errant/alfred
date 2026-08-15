@@ -234,6 +234,36 @@ describe('removing a paste-derived chip gives the text back', () => {
     expect(box.value).toContain(LONG);
   });
 
+  it('a real file NAMED “Pasted text.md” is still file-backed — the console control', async () => {
+    // THE COLLISION CASE, and the reason the chip stores its body rather than
+    // sniffing its filename. `fileFromPastedText` names its artifact
+    // `PASTED_TEXT_FILENAME`, so a filename test would call this upload a
+    // paste-derived chip — and Remove would then dump a file the operator
+    // picked from disk into their message as text, while promising to.
+    //
+    // The distinction is PROVENANCE (`pastedBody !== null`), which a real file
+    // cannot fake. The control that proves it has to use the exact colliding
+    // name; `notes.md` below tests the easy half.
+    const user = userEvent.setup();
+    mount();
+
+    await user.upload(screen.getByTestId('unified-file-input'), [
+      new File(['# genuinely from disk'], PASTED_TEXT_FILENAME, { type: 'text/markdown' }),
+    ]);
+    const chip = await screen.findByTestId('unified-chip-doc-0');
+    // Same name the paste artifact carries — so the chip LOOKS identical.
+    expect(chip.textContent).toContain(PASTED_TEXT_FILENAME);
+    // …and carries no promise, because it is not the same kind of thing.
+    expect(screen.queryByTestId('unified-doc-0-paste-promise')).toBeNull();
+
+    await user.click(screen.getByTestId('unified-doc-0-remove'));
+
+    // Removed freely: nothing restored into the box, nothing claimed.
+    expect((screen.getByTestId('unified-input') as HTMLTextAreaElement).value).toBe('');
+    expect(screen.queryByTestId('unified-paste-restored')).toBeNull();
+    expect(screen.queryByTestId('unified-chip-doc-0')).toBeNull();
+  });
+
   it('a FILE-backed chip removes freely and restores nothing — the control', async () => {
     // Without this the pins above pass identically against a build that dumped
     // every removed attachment into the message, which would be its own bug.

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { refusalReason } from './actConfirm';
 import { chatApi } from './client';
+import { ApiError } from './http';
 import type { NotificationItem } from './types';
 
 // Notification tray hook (parity #22, POLL / READ-ON-REQUEST slice).
@@ -17,8 +19,35 @@ import type { NotificationItem } from './types';
 // Poll failures are swallowed (the tray is an enhancement — a flaky poll must
 // never surface as a chat error); the next tick retries. Ack is optimistic on
 // success only (state updates from the server's authoritative unread count).
+//
+// ── A POLL MAY BE SWALLOWED. AN ACT MAY NOT. ────────────────────────────────
+// The two are opposite cases and the distinction is the whole of the fix below.
+// A poll is the system asking on its own initiative: no one is waiting on the
+// answer, a stale tray is harmless, and the next tick fixes it. An ACK or a
+// DISMISS is the OPERATOR asking, once, by tapping — and both used to end in a
+// bare `catch {}`. The pill stayed unread, the row stayed on screen, and
+// nothing said why: indistinguishable from a control that does not work, which
+// is how an operator learns to stop trusting one.
+//
+// So a failed act now records a per-id line the tray renders in place. Same
+// honesty as the deck's ledger and the board's notice, at the scale this
+// surface needs — and DELIBERATELY smaller. Those two write to storage because
+// their write is DEFERRED and its answer can arrive after the component is
+// gone; nothing here is deferred (the operator is looking at the row they
+// tapped when the answer lands), so hook state is the honest scale and a store
+// would be machinery for a failure mode this surface does not have.
 
 export const NOTIFICATIONS_POLL_MS = 60_000;
+
+/**
+ * WHY an act did not stick, in the server's own words where it had any.
+ *
+ * Shared with the deck, the board and the batch door (`refusalReason`), so a
+ * refusal reads the same wherever the operator meets it.
+ */
+function why(e: unknown): string {
+  return e instanceof ApiError ? refusalReason(e) : 'the request did not get through';
+}
 
 export interface UseNotifications {
   notifications: NotificationItem[];
@@ -29,6 +58,15 @@ export interface UseNotifications {
   dismiss: (ids: string[]) => Promise<void>;
   /** Re-fetch the tray now (bootstrap / after-turn hook-in). */
   refresh: () => Promise<void>;
+  /**
+   * The acts that failed, by notification id — ACCUMULATED, not replaced.
+   *
+   * Keyed per id rather than held as one "last error" because the tray offers
+   * a bulk Dismiss-all: one tap can fail for twenty rows, and a single shared
+   * line would report that as one problem while nineteen rows sat there
+   * unexplained. An entry clears when the same id is acted on again and lands.
+   */
+  failures: Record<string, string>;
 }
 
 export function useNotifications({ enabled }: { enabled: boolean }): UseNotifications {
@@ -69,35 +107,75 @@ export function useNotifications({ enabled }: { enabled: boolean }): UseNotifica
     return () => clearInterval(timer);
   }, [enabled, refresh]);
 
-  const ack = useCallback(async (ids: string[]) => {
-    if (!ids.length) return;
-    try {
-      const r = await chatApi.ackNotifications(ids);
-      if (!alive.current) return;
-      setUnread(r.unread);
-      setNotifications((prev) =>
-        prev.map((n) => (ids.includes(n.id) ? { ...n, read: true } : n)),
-      );
-    } catch {
-      /* best-effort — the entry stays unread and can be re-acked */
-    }
+  const [failures, setFailures] = useState<Record<string, string>>({});
+
+  // One sentence, applied to every id the failed call covered.
+  const noteFailure = useCallback((ids: string[], sentence: string) => {
+    setFailures((prev) => {
+      const next = { ...prev };
+      for (const id of ids) next[id] = sentence;
+      return next;
+    });
   }, []);
 
-  const dismiss = useCallback(async (ids: string[]) => {
-    if (!ids.length) return;
-    try {
-      const r = await chatApi.dismissNotifications(ids);
-      if (!alive.current) return;
-      setUnread(r.unread);
-      // REMOVED locally, not flagged. The server has already stopped listing
-      // these, so leaving them on screen until the next poll would show the
-      // operator a row that no longer exists — and this whole feature is about
-      // a row that would not go away.
-      setNotifications((prev) => prev.filter((n) => !ids.includes(n.id)));
-    } catch {
-      /* best-effort — the entry stays and can be re-dismissed */
-    }
+  // The act landed this time — the debt those rows were carrying is settled.
+  // Written as a no-op-preserving update so a success on rows that never failed
+  // does not churn state on every tap.
+  const clearFailures = useCallback((ids: string[]) => {
+    setFailures((prev) => {
+      if (!ids.some((id) => id in prev)) return prev;
+      const next = { ...prev };
+      for (const id of ids) delete next[id];
+      return next;
+    });
   }, []);
 
-  return { notifications, unread, ack, dismiss, refresh };
+  const ack = useCallback(
+    async (ids: string[]) => {
+      if (!ids.length) return;
+      try {
+        const r = await chatApi.ackNotifications(ids);
+        if (!alive.current) return;
+        setUnread(r.unread);
+        setNotifications((prev) =>
+          prev.map((n) => (ids.includes(n.id) ? { ...n, read: true } : n)),
+        );
+        clearFailures(ids);
+      } catch (e) {
+        if (!alive.current) return;
+        // The row is untouched — it is still unread and still tappable — and
+        // now it SAYS so. The old comment here promised exactly this ("can be
+        // re-acked") to a reader of the source; the operator was told nothing.
+        noteFailure(ids, `Couldn’t mark that read: ${why(e)}. It’s still unread — try again.`);
+      }
+    },
+    [clearFailures, noteFailure],
+  );
+
+  const dismiss = useCallback(
+    async (ids: string[]) => {
+      if (!ids.length) return;
+      try {
+        const r = await chatApi.dismissNotifications(ids);
+        if (!alive.current) return;
+        setUnread(r.unread);
+        // REMOVED locally, not flagged. The server has already stopped listing
+        // these, so leaving them on screen until the next poll would show the
+        // operator a row that no longer exists — and this whole feature is about
+        // a row that would not go away.
+        setNotifications((prev) => prev.filter((n) => !ids.includes(n.id)));
+        clearFailures(ids);
+      } catch (e) {
+        if (!alive.current) return;
+        // NOT removed, and that is the point: the row stays because the server
+        // still lists it. On this surface — the one built because a row would
+        // not go away — a dismiss that silently fails is the original complaint
+        // wearing the fix's clothes.
+        noteFailure(ids, `Couldn’t clear that: ${why(e)}. It’s still here — try again.`);
+      }
+    },
+    [clearFailures, noteFailure],
+  );
+
+  return { notifications, unread, ack, dismiss, refresh, failures };
 }

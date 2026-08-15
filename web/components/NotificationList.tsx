@@ -30,10 +30,13 @@ function NotificationRow({
   n,
   onAck,
   onDismiss,
+  failure,
 }: {
   n: NotificationItem;
   onAck: (ids: string[]) => void;
   onDismiss: (ids: string[]) => void;
+  /** Why this row's last act didn't stick, or undefined. */
+  failure?: string;
 }) {
   // Per-row, because expansion is transient per-row UI — nothing outside this
   // row needs to know, and hoisting it would make one card's tap open another's.
@@ -92,6 +95,21 @@ function NotificationRow({
           </button>
         )}
       </div>
+
+      {failure && (
+        // DANGER-RED, deliberately, on a surface whose own header reserves it
+        // for "true system errors" — because that is exactly what this is. The
+        // pill's calm wash reports what the system has to SAY; this reports
+        // that the system failed to DO what the operator asked. Reading it in
+        // the same calm grey would be the swallow again, one shade quieter.
+        <p
+          role="alert"
+          data-testid="notification-failure"
+          className="mt-1 text-xs font-normal text-danger"
+        >
+          {failure}
+        </p>
+      )}
 
       {expandable && (
         <button
@@ -154,10 +172,22 @@ export function NotificationList({
   notifications,
   onAck,
   onDismiss,
+  failures = {},
 }: {
   notifications: NotificationItem[];
   onAck: (ids: string[]) => void;
   onDismiss: (ids: string[]) => void;
+  /**
+   * Why each row's last act didn't stick, by id (`useNotifications.failures`).
+   *
+   * Defaulted so the existing TEST mounts keep compiling — there is exactly one
+   * production mount (`pages/chat.tsx`) and it threads this. The default is the
+   * HAZARD, not the convenience: an unthreaded caller renders a tray that
+   * silently swallows again, which is the exact bug this prop exists to end, and
+   * every pin would stay green while it did. That is why the pin for this lives
+   * on the real page rather than on a direct mount of this component.
+   */
+  failures?: Record<string, string>;
 }) {
   // WHY READ ENTRIES COLLAPSE (#86 — the UI half of the operator's report).
   //
@@ -202,7 +232,13 @@ export function NotificationList({
       {unread.length > 0 ? (
         <ul data-testid="notification-list" className="flex flex-col gap-2">
           {unread.map((n) => (
-            <NotificationRow key={n.id} n={n} onAck={onAck} onDismiss={onDismiss} />
+            <NotificationRow
+              key={n.id}
+              n={n}
+              onAck={onAck}
+              onDismiss={onDismiss}
+              failure={failures[n.id]}
+            />
           ))}
         </ul>
       ) : (
@@ -235,6 +271,7 @@ export function NotificationList({
                     n={n}
                     onAck={onAck}
                     onDismiss={onDismiss}
+                    failure={failures[n.id]}
                   />
                 ))}
               </ul>

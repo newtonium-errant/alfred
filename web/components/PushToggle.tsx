@@ -5,7 +5,7 @@ import { usePush } from '../lib/algernon/usePush';
 // so it never shows a dead control. When available it's a single enable/disable
 // toggle; a blocked-permissions state explains how to recover.
 export function PushToggle() {
-  const { status, busy, enable, disable } = usePush();
+  const { status, busy, note, enable, disable } = usePush();
 
   // Inert / not-yet-known states render nothing — no dead control.
   if (status === 'checking' || status === 'unsupported' || status === 'unconfigured') {
@@ -13,7 +13,7 @@ export function PushToggle() {
   }
 
   return (
-    <div data-testid="push-toggle" className="mt-6 flex items-center justify-between gap-3 rounded-xl border border-console-edge bg-console-panel px-4 py-3 text-sm shadow-soft">
+    <div data-testid="push-toggle" className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-console-edge bg-console-panel px-4 py-3 text-sm shadow-soft">
       <div className="min-w-0">
         <p className="font-semibold text-console-ink">Push notifications</p>
         <p className="text-console-ink-dim">
@@ -44,6 +44,23 @@ export function PushToggle() {
         >
           {busy ? '…' : status === 'on' ? 'Turn off' : 'Turn on'}
         </button>
+      )}
+      {note && (
+        // WHAT THE SWITCH ACTUALLY DID, when that is not what the switch
+        // implies. Full-width under both the copy and the button, because it
+        // qualifies the pair of them: the sentence above says what the state
+        // means, and this says whether getting there fully worked.
+        //
+        // `negative` is the function role for a failed verdict on this console
+        // surface — the same red the deck and the board spend — so an operator
+        // who has learned what that colour means reads it the same way here.
+        <p
+          role="alert"
+          data-testid="push-toggle-note"
+          className="w-full text-xs text-negative"
+        >
+          {note}
+        </p>
       )}
     </div>
   );

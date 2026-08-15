@@ -58,6 +58,20 @@ export function useFeedBoard(opts: UseFeedBoardOptions): UseFeedBoardResult {
   // up at the next fetch — the producer re-derives the tier from the vault entry's
   // own contested flag — so this only has to hold for the current render.
   const [contestedIds, setContestedIds] = useState<ReadonlySet<string>>(() => new Set());
+  // ADJUDICATED OUT OF THE DECK'S SWALLOW CLASS (sibling census, 003f6cce).
+  // This toast REPLACES rather than accumulates — a second failure overwrites
+  // the first — which on the deck was one of the four softeners. It is not one
+  // here, and the difference is the ROW: every failure path below calls
+  // `restore(id)`, so the item itself comes back onto the board and stays
+  // there. The operator is told by the board even when a later toast has
+  // overwritten the words, so no verdict can go unreported the way a swiped
+  // card's could.
+  //
+  // Written down HERE because the ruling lived only in a commit message, where
+  // the next auditor reading this line would have to re-derive it — and would
+  // reasonably reach for the deck's ledger, which this surface does not need.
+  // If a failure path is ever added that does NOT restore, this stops being
+  // true and the class question reopens.
   const [toast, setToast] = useState<FeedBoardToast | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
 
