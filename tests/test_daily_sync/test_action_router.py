@@ -674,7 +674,28 @@ def test_stale_item_not_in_store(tmp_path: Path) -> None:
     assert result.status == STATUS_STALE_ITEM
 
 
-def test_stale_item_aged_out_of_last_batch(tmp_path: Path) -> None:
+def test_aged_out_of_last_batch_falls_back_to_the_cards_evidence(
+    tmp_path: Path,
+) -> None:
+    """DELIBERATE FLIP (P1, 2026-08-15). This pin used to assert the opposite.
+
+    Its premise was that an aged-out batch leaves the verdict unresolvable, so
+    refusing was the only honest answer. That premise is false: the producer
+    stamps ``evidence=d`` verbatim from the same dict the resolver consumes, so
+    the card carries everything the correction needs. The premise failing is
+    the flip condition, stated here rather than left for a reader to infer from
+    a changed assertion.
+
+    What made it urgent: on 2026-08-15 the operator swiped five email cards and
+    every act 409'd here, then the next reconcile would have retired them as
+    ``acted`` — recording as decided the decisions this branch had just refused.
+
+    The genuine stale cases are still pinned: no card in the store at all
+    (``test_stale_item_not_in_store`` above) and a card whose evidence is
+    unusable (``test_act_evidence_fallback.py``), which also owns the full
+    treatment — both verb classes, resident-batch precedence, and the two
+    safety claims the fallback rides on.
+    """
     cfg = _ds_config(tmp_path)
     store = _store(tmp_path)
     item = _email_item(priority="medium")
@@ -683,9 +704,11 @@ def test_stale_item_aged_out_of_last_batch(tmp_path: Path) -> None:
 
     result = _call(store, cfg, fid, "confirm")
 
-    assert result.ok is False
-    assert result.status == STATUS_STALE_ITEM
-    assert list(iter_corrections(cfg.corpus.path)) == []  # no mutation
+    assert result.ok is True
+    assert result.status == STATUS_ACTED
+    rows = list(iter_corrections(cfg.corpus.path))
+    assert len(rows) == 1
+    assert rows[0].andrew_priority == "medium"  # the card's own classifier tier
 
 
 # ---------------------------------------------------------------------------

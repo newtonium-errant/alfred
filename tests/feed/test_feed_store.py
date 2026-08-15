@@ -533,3 +533,36 @@ def test_acked_peer_digest_revives_when_truncation_changes(tmp_path: Path) -> No
 
     assert s.load()["peer_digest:kalle|2026-08-04"].state == STATE_OPEN
     assert counts["suppressed"] == 0
+
+
+def test_retirement_names_the_ids_it_retired(tmp_path: Path) -> None:
+    """ILB — WHICH cards were retired, not just how many (P1 follow-on).
+
+    The belt already logs an ``acted`` COUNT, which cannot answer the question
+    that mattered on 2026-08-15: five email cards were dealt against a stale
+    ``last_batch``, every verdict the operator gave was refused, and the next
+    reconcile would have retired them here as "decided elsewhere" — recording
+    as decided the decisions the system had just declined to accept. The act
+    path is fixed; this is what makes the retirement itself identifiable if a
+    sibling case ever appears.
+
+    Paired with a control: a fire that retires nothing must stay silent, or the
+    line is noise on every reconcile rather than a signal about retirement.
+    """
+    import structlog
+
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
+
+    with structlog.testing.capture_logs() as cap:
+        s.reconcile("proposal", [_item("proposal", "c1")])
+    hits = [c for c in cap if c.get("event") == "feed.store.retired_absent"]
+    assert len(hits) == 1
+    assert hits[0]["kind"] == "proposal"
+    assert hits[0]["count"] == 1
+    assert hits[0]["ids"] == ["proposal:c2"]
+
+    # Control: nothing absent this fire → no line.
+    with structlog.testing.capture_logs() as quiet:
+        s.reconcile("proposal", [_item("proposal", "c1")])
+    assert [c for c in quiet if c.get("event") == "feed.store.retired_absent"] == []

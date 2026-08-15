@@ -430,18 +430,42 @@ async def fire_once(
         body, user_id, today_iso, dedupe_key=dedupe_key,
     )
 
-    # Persist the batch to the state file ONLY when we actually have
-    # items + message_ids. An empty-Daily-Sync push has no items to
-    # match replies against — Andrew can still chat, but there's
-    # nothing to calibrate. Any of email / attribution / proposals /
-    # pending is enough to persist the batch (the dispatcher routes
-    # per-item).
+    # Persist the batch to the state file whenever we actually have ITEMS.
+    # An empty Daily Sync has nothing to match a reply or an act against;
+    # any of email / attribution / proposals / pending is enough (the
+    # dispatcher routes per-item).
+    #
+    # NOT gated on ``message_ids`` — that gate was a live P1 (2026-08-15).
+    # ``last_batch`` is the AUTHORITY every feed act re-derives against
+    # (``action_router._load_batch_item``), while the deck cards are emitted
+    # unconditionally by ``emit_sync_feed`` below. Gating only the authority
+    # write on a TELEGRAM result meant the two disagreed the moment the push
+    # stopped returning ids, and the deck dealt cards whose verbs could never
+    # succeed: every act re-derived an id absent from a stale ``last_batch``
+    # and 409'd ``aged_out_of_last_batch``. The operator swiped five email
+    # cards and all five verdicts were refused.
+    #
+    # The trigger was Salem going WEB-ONLY: ``send_batch`` logs
+    # ``telegram_send_skipped detail='web-only mode (no bot_token)'`` and
+    # returns no ids — a deliberate SKIP that reads here exactly like a
+    # failure. Same silent-consumption shape infra flagged at the quiesce
+    # recon and that the returns lane closed for REMINDERS; the sibling one
+    # subsystem over was never swept. Hence the gate goes rather than gaining
+    # a web-only special case: an authority write must not depend on whether
+    # a DIFFERENT delivery channel happened to be configured.
+    #
+    # ``message_ids`` is still STORED (possibly empty) because the Telegram
+    # reply path keys off it — ``reply_dispatch._last_batch_message_ids``
+    # feeds ``is_reply_to_daily_sync`` and the smart-routing synthetic parent.
+    # An empty list degrades those to "no thread to route to", which is the
+    # correct answer for a batch that was never pushed to Telegram, and they
+    # keep working unchanged wherever the bot is still live.
     state = load_state(config.state.path)
     if (
         items or attribution_items or proposal_items
         or pending_items or radar_items or friction_items
         or routine_match_items or demotion_items or capture_close_items
-    ) and message_ids:
+    ):
         state["last_batch"] = _build_state_payload(
             today_iso,
             items,
