@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { hasExactToken } from './_exactToken';
 import { render, screen, waitFor } from '@testing-library/react';
 import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 
@@ -109,12 +110,16 @@ describe('sensor-log adoption — the attribute covers the shell, the paint does
     const found: string[] = [];
     for (const { selector } of rules()) {
       for (const reacher of reachers) {
-        if (!selector.includes(reacher)) continue;
+        // Exact token: a future `.text-danger-strong` must not be counted as
+        // `.text-danger`. Latent today, one sibling away — and sibling-adding
+        // is what this arc does. See `_exactToken.ts`.
+        if (!hasExactToken(selector, reacher)) continue;
         found.push(selector);
         // A row-scoped spelling is fine — that is inside the content by
         // construction. Otherwise it must be `.sensor-console`-scoped.
         const contained =
-          selector.includes('.sensor-console') || selector.includes("[data-testid='feed-row']");
+          hasExactToken(selector, '.sensor-console') ||
+          selector.includes("[data-testid='feed-row']");
         expect(contained, `"${selector}" can reach the shell from the surface attribute`).toBe(true);
       }
     }

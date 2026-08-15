@@ -133,6 +133,58 @@ describe('reachability, driven through the real components', () => {
   });
 });
 
+describe('the deck really does pass its surface', () => {
+  it('DeckCard renders EvidenceBody with the CONSOLE skin, not the warm default', async () => {
+    // NOTE-2, closed. The reachability pin above is named "console (DeckCard
+    // passes surface)" and proved only that `EvidenceBody` honours a surface it
+    // is HANDED — it passed `surface="console"` itself. Nothing checked the
+    // claim in its own name, so the day DeckCard stopped passing the prop, the
+    // deck's evidence would silently fall back to the warm skin (honeydew on a
+    // near-black card) and that pin would stay green.
+    //
+    // DRIVEN, NOT GREPPED. A source-assert for `surface="console"` at the call
+    // site is what this file family has been burned by three times: the comment
+    // above a marker contains the marker's name, so `toContain` passes on prose.
+    // `skinFor` returns different CLASS STRINGS per surface, so the DOM answers
+    // the question directly.
+    const { DeckCard } = await import('../components/feed/DeckCard');
+    const { withServedActions } = await import('./helpers/servedActions');
+    render(
+      <DeckCard
+        item={
+          withServedActions({
+            id: 'email_tier:note/A.md',
+            kind: 'email_tier',
+            instance: 'salem',
+            title: 'Email tier: a@b.com — Subject',
+            mode: 'decide',
+            attention: 'needs_you',
+            evidence: { body: FENCE },
+            actions: [],
+            state: 'open',
+            created_at: '2026-07-30T00:00:00Z',
+            acted_at: null,
+            expires_at: null,
+            source_ref: {},
+          }) as never
+        }
+        depth={0}
+        expanded
+        confirming={false}
+        onToggleEvidence={() => {}}
+        onConfirmHeavy={() => {}}
+        onCancelHeavy={() => {}}
+      />,
+    );
+
+    const frame = screen.getByTestId('evidence-body').firstElementChild as HTMLElement;
+    // The console skin's frame, and NOT the warm one — both directions, because
+    // asserting only the presence would pass if the element carried both.
+    expect(frame.className).toContain('bg-console-void');
+    expect(frame.className).not.toContain('bg-honeydew-50');
+  });
+});
+
 describe('the registers that must NOT claim it', () => {
   it('crt defines no ui-code rule — no consumer reaches a crt surface', () => {
     // The tiebreaker cutting the other way, and the reason this is a pin rather
@@ -141,6 +193,19 @@ describe('the registers that must NOT claim it', () => {
     // FencedText consumer ever lands on batch / ingest / login, this fails and
     // the rule gets added deliberately.
     expect(sheet('crt.css')).toContain('.ui-panel'); // positive control: the file IS a marker sheet
+    // DELIBERATELY `includes`, NOT `exactToken` — the one site in this sweep
+    // that keeps the substring match, because here the substring makes the
+    // assertion STRICTER rather than weaker. This is an ABSENCE check: matching
+    // loosely means `.ui-code-label`, `.ui-code-anything` and `.ui-code` itself
+    // all count as the rule appearing, so the assertion fails on any of them.
+    // Tightening it to an exact token would NARROW an absence check — crt could
+    // then grow a `.ui-code-label` rule and this would still pass.
+    //
+    // The general form, since it is the part worth carrying: exact-token is
+    // right for PRESENCE and reach ("is this specific rule here / does this
+    // selector target that class"), and wrong for ABSENCE of a family ("has
+    // anything from this family appeared"). Direction of the assertion decides,
+    // not the shape of the string.
     expect(sheet('crt.css').includes('.ui-code')).toBe(false);
   });
 });

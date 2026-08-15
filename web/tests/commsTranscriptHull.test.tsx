@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
+import { hasExactToken } from './_exactToken';
 import { MessageBubble } from '../components/chat/MessageBubble';
 import { TypingIndicator } from '../components/chat/TypingIndicator';
 import {
@@ -101,7 +102,7 @@ describe('the hull rules are real, and scoped', () => {
       // Markup and stylesheet cannot share a symbol, so this is what keeps the
       // two spellings equal — a hull styled by a class no rule matches is
       // invisible, and every DOM assertion above would still pass.
-      const matching = rules().filter((r) => r.sel.includes(`.${hull}`));
+      const matching = rules().filter((r) => hasExactToken(r.sel, `.${hull}`));
       expect(matching.length).toBeGreaterThan(0);
       for (const rule of matching) {
         expect(rule.sel).toContain(`[data-surface='${COMMS_SURFACE}']`);
@@ -114,7 +115,7 @@ describe('the hull rules are real, and scoped', () => {
     (hull) => {
       // An adopted hull whose background was a hex literal would look right
       // today and drift the moment the ramp moves. It must spend a token.
-      const rule = rules().find((r) => r.sel.includes(`.${hull}`));
+      const rule = rules().find((r) => hasExactToken(r.sel, `.${hull}`));
       expect(rule).toBeTruthy();
       expect(rule!.body).toMatch(/background-color:\s*var\(--comms-/);
       expect(rule!.body).not.toMatch(/#[0-9a-fA-F]{3,8}/);
@@ -127,7 +128,7 @@ describe('the hull rules are real, and scoped', () => {
     // appearance, which is the flattening this is meant to prevent.
     const bg = (hull: string) =>
       rules()
-        .find((r) => r.sel.includes(`.${hull}`))
+        .find((r) => hasExactToken(r.sel, `.${hull}`))
         ?.body.match(/background-color:\s*(var\([^)]*\))/)?.[1];
     const assistantBg = bg(COMMS_TURN_ASSISTANT_CLASS);
     const operatorBg = bg(COMMS_TURN_OPERATOR_CLASS);

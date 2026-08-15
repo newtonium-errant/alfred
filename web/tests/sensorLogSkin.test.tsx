@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { hasExactToken } from './_exactToken';
 import { render, screen } from '@testing-library/react';
 import { FeedRow } from '../components/feed/FeedRow';
 import type { FeedItem } from '../lib/algernon/feed';
@@ -156,7 +157,12 @@ describe('sensor-log skin — the shared row still presents the hooks the CSS ta
 
   it('every class the skin targets is still emitted by the markup THAT selector reaches', () => {
     const orphans = skinBindings()
-      .filter(({ cls, sources }) => !sources.some((rel) => sourceText(rel).includes(cls)))
+      // EXACT TOKEN, not `includes`. This is the LIVE instance of the substring
+      // weakness: `.ui-code` was satisfied by the text inside `ui-code-label`,
+      // so a genuinely orphaned `.ui-code` rule would have been reported as
+      // covered by its own sibling. See `_exactToken.ts` for the other three
+      // costumes the same bug wore this week.
+      .filter(({ cls, sources }) => !sources.some((rel) => hasExactToken(sourceText(rel), cls)))
       // The message is the point on failure: it names the selector, so the fix
       // is obvious without re-deriving which rule went stale.
       .map(({ cls, selector }) => `.${cls} — orphaned, targeted by: ${selector}`);

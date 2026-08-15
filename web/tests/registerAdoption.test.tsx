@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { exactToken } from './_exactToken';
 import { render } from '@testing-library/react';
 import { ProvenancePreview } from '../components/ingest/ProvenancePreview';
 import { EmptyState } from '../components/EmptyState';
@@ -254,7 +255,7 @@ const FAMILY_PAIRS = MARKER_FAMILY.flatMap(({ marker, registers }) =>
  * renamed-selector mutation lower than a deletion on this very family.
  */
 function bareRule(marker: string): RegExp {
-  return new RegExp(`^\\s*\\.${marker}(?![\\w-])`);
+  return new RegExp(`^\\s*${exactToken(`.${marker}`).source}`);
 }
 
 /**
@@ -269,7 +270,7 @@ function bareRule(marker: string): RegExp {
  * `ui-code-*` member would fold into that row invisibly.
  */
 function scopedRule(surface: string, marker: string): RegExp {
-  return new RegExp(`\\[data-surface='${surface}'\\]\\s+\\.${marker}(?![\\w-])`);
+  return new RegExp(`\\[data-surface='${surface}'\\]\\s+${exactToken(`.${marker}`).source}`);
 }
 
 const MARKED_PANELS = [
