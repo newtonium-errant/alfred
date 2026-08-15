@@ -352,3 +352,53 @@ def test_a_held_snooze_emits_no_card_at_all(tmp_path: Path) -> None:
     )
     items = slot_suggestion_feed_items(vault, NOW, _TierDefaults(store), instance="salem")
     assert items == []
+
+
+# --- PY-B item 1: the overdue task reaches the PRODUCER ----------------------
+#
+# The unit pins live in tests/tier/test_compute.py. This is the integration
+# leg: a compute-layer reason that never reaches the feed producer is a fix
+# nobody sees. Note the module docstring above has claimed "auto-T1 overdue
+# (task + routine)" coverage since this file was written — the routine half
+# existed, the task half did not, and no fixture here was actually overdue.
+
+
+def test_overdue_task_reaches_the_slot_suggestion_producer(tmp_path: Path) -> None:
+    """An open task 3 days past due becomes a T1 slot_suggestion card."""
+    vault = _vault(tmp_path)
+    _task(
+        vault, "Submit Documents to Clutch",
+        "type: task\nstatus: todo\nname: Submit Documents to Clutch\n"
+        "due: 2026-05-25\n",
+    )
+    items = _items(vault)
+    assert len(items) == 1
+    it = items[0]
+    assert it.id == "slot_suggestion:task:task/Submit Documents to Clutch.md"
+    assert it.kind == "slot_suggestion"
+    assert it.evidence["tier"] == 1
+    assert it.evidence["surface_reason"] == "overdue by 3d"
+
+
+def test_overdue_done_task_produces_no_card(tmp_path: Path) -> None:
+    """The exclusion, driven through the producer rather than the computer —
+    a closed task must not reappear as a card by aging."""
+    vault = _vault(tmp_path)
+    _task(
+        vault, "Finished",
+        "type: task\nstatus: done\nname: Finished\ndue: 2026-05-20\n",
+    )
+    assert _items(vault) == []
+
+
+def test_a_due_today_task_still_produces_its_card(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the two above: the producer is demonstrably
+    capable of emitting, so "no card" means excluded, not broken."""
+    vault = _vault(tmp_path)
+    _task(
+        vault, "Today",
+        "type: task\nstatus: todo\nname: Today\ndue: 2026-05-28\n",
+    )
+    items = _items(vault)
+    assert len(items) == 1
+    assert items[0].evidence["surface_reason"] == "due today"

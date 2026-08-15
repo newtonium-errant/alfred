@@ -364,19 +364,36 @@ def test_auto_t1_unparseable_due_excluded(tmp_path: Path) -> None:
     assert result == []
 
 
-def test_auto_t1_overdue_does_not_surface_via_this_path(
+def test_auto_t1_overdue_surfaces_here_because_nowhere_else_does(
     tmp_path: Path,
 ) -> None:
-    """Past-due tasks are handled by a separate "overdue" surface in
-    Ship 2's brief, not by the auto-T1 candidate path. This function
-    surfaces ONLY today/tomorrow/window — overdue is its own layer."""
+    """PREMISE REVERSED, deliberately — this pin used to assert the opposite.
+
+    It read: "Past-due tasks are handled by a separate 'overdue' surface in
+    Ship 2's brief, not by the auto-T1 candidate path." That premise was
+    checked against the source when the branch below was added, and **no such
+    surface exists**. Every ``overdue`` in ``src/alfred`` is one of: the
+    ROUTINE branch's own retention (``overdue_effective_due``), the
+    ``overdue_ratio`` soft-cadence ranking for self-care (a different concept
+    entirely — no ``due:`` date involved), or ``tier/snooze.py`` reading
+    overdue-ness to decide snooze breakthrough. Nothing surfaces a past-due
+    dated TASK.
+
+    So the old pin did not merely encode stale behaviour; it asserted the hole
+    was intentional and named a compensating layer that was never built. That
+    is what kept it from being fixed — anyone who noticed dated tasks going
+    quiet after their due date would read this test and conclude it was
+    handled elsewhere.
+
+    Kept (rather than deleted) as the marker for exactly that."""
     vault = _make_vault_with_task(
         tmp_path,
         "Overdue.md",
         "type: task\nstatus: todo\nname: Overdue\ndue: 2026-05-20\n",
     )
     result = compute_auto_t1_candidates(vault, NOW)
-    assert result == []
+    assert len(result) == 1
+    assert result[0].surface_reason == "overdue by 8d"
 
 
 def test_auto_t1_results_sorted_by_due_then_name(tmp_path: Path) -> None:
@@ -2291,3 +2308,118 @@ def test_q3_default_does_not_resurrect_optout_via_surface_only_default() -> None
     assert _classify(
         due_pattern=_DP_THU, default_escalate_at_days=3,
     ).tier is None
+
+
+# ===========================================================================
+# PY-B item 1 — the overdue hole
+# ===========================================================================
+#
+# Every branch in this function asked "is the deadline NEAR?", and a deadline
+# in the PAST answered no to all of them: not today, not tomorrow, and
+# ``2 <= days_to_due`` is false for a negative number. So an open dated task
+# fell to ``reason = None`` and vanished from the producer THE DAY AFTER its
+# due date — visible while there was still time, silent once it was late.
+#
+# The mutation that reds this block: delete the ``due < today_local`` branch
+# from ``compute_auto_t1_candidates``.
+
+
+def test_auto_t1_overdue_task_surfaces_with_day_count(tmp_path: Path) -> None:
+    """An open task 3 days past due surfaces, and the reason SAYS how late."""
+    vault = _make_vault_with_task(
+        tmp_path,
+        "Submit Documents to Clutch.md",
+        "type: task\nstatus: todo\nname: Submit Documents to Clutch\n"
+        "due: 2026-05-25\n",
+    )
+    result = compute_auto_t1_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].name == "Submit Documents to Clutch"
+    assert result[0].surface_reason == "overdue by 3d"
+    assert result[0].due_iso == "2026-05-25"
+
+
+def test_auto_t1_one_day_overdue_is_the_day_after_due(tmp_path: Path) -> None:
+    """THE EXACT DAY THE BUG BIT. Due yesterday: surfaced the day before as
+    "due today", then disappeared. One day is the whole gap."""
+    vault = _make_vault_with_task(
+        tmp_path,
+        "Yesterday.md",
+        "type: task\nstatus: todo\nname: Yesterday\ndue: 2026-05-27\n",
+    )
+    result = compute_auto_t1_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].surface_reason == "overdue by 1d"
+
+
+def test_auto_t1_due_today_is_not_reported_as_overdue(tmp_path: Path) -> None:
+    """BOUNDARY, unchanged. ``due == today`` keeps "due today" — the new
+    branch is strictly ``<``, so it cannot claim "overdue by 0d"."""
+    vault = _make_vault_with_task(
+        tmp_path,
+        "Boundary.md",
+        "type: task\nstatus: todo\nname: Boundary\ndue: 2026-05-28\n",
+    )
+    result = compute_auto_t1_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].surface_reason == "due today"
+    assert "overdue" not in result[0].surface_reason
+
+
+def test_auto_t1_overdue_closed_statuses_still_excluded(tmp_path: Path) -> None:
+    """The upstream skips must still bite. A done or cancelled task does not
+    become visible again by aging past its due date — otherwise this fix
+    resurrects every closed task in the vault, forever."""
+    vault = tmp_path / "vault"
+    task_dir = vault / "task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "Done Overdue.md").write_text(
+        "---\ntype: task\nstatus: done\nname: Done\ndue: 2026-05-20\n---\n",
+        encoding="utf-8",
+    )
+    (task_dir / "Cancelled Overdue.md").write_text(
+        "---\ntype: task\nstatus: cancelled\nname: X\ndue: 2026-05-20\n---\n",
+        encoding="utf-8",
+    )
+    result = compute_auto_t1_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_t1_overdue_alfred_triage_still_excluded(tmp_path: Path) -> None:
+    """The other upstream skip, on the new branch."""
+    vault = _make_vault_with_task(
+        tmp_path,
+        "Triage Overdue.md",
+        "type: task\nstatus: todo\nname: Triage Overdue\n"
+        "due: 2026-05-20\nalfred_triage: true\n",
+    )
+    assert compute_auto_t1_candidates(vault, NOW) == []
+
+
+def test_auto_t1_overdue_blocked_task_surfaces(tmp_path: Path) -> None:
+    """``blocked`` is an OPEN status, so a blocked overdue task is exactly the
+    thing the operator most needs to see — it is late AND stuck."""
+    vault = _make_vault_with_task(
+        tmp_path,
+        "Blocked Overdue.md",
+        "type: task\nstatus: blocked\nname: Blocked Overdue\ndue: 2026-05-26\n",
+    )
+    result = compute_auto_t1_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].surface_reason == "overdue by 2d"
+
+
+def test_auto_t1_escalate_window_unaffected_by_the_overdue_branch(
+    tmp_path: Path,
+) -> None:
+    """POSITIVE CONTROL for the branch ordering: a FUTURE due inside the
+    escalate window still reports the escalate reason, not an overdue one."""
+    vault = _make_vault_with_task(
+        tmp_path,
+        "Future.md",
+        "type: task\nstatus: todo\nname: Future\n"
+        "due: 2026-05-31\nescalate_at_days: 3\n",
+    )
+    result = compute_auto_t1_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].surface_reason == "escalate window (3d before due)"
