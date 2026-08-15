@@ -200,10 +200,16 @@ async def _request(
         # 4xx — no retry.
         if 400 <= resp.status_code < 500:
             body_text = resp.text[:500]
+            # ``reason`` is carried on BOTH non-2xx branches so the one event
+            # name has one field set. It is usually "" here — 4xx bodies are
+            # ``{"error": ...}``-shaped — and that is the point: a field that
+            # appears only on some emissions of an event is the drift that
+            # makes `grep`-by-field silently incomplete.
             log.warning(
                 "transport.client.nonzero_response",
                 code=resp.status_code,
                 body=body_text,
+                reason=_reason_of(resp),
                 response_summary=(
                     f"Status {resp.status_code}: {body_text[:200] or '(no body)'}"
                 ),

@@ -997,3 +997,55 @@ async def test_health_labels_the_inferred_value_when_unwired(client):  # type: i
     body = await (await client.get("/health")).json()
     assert body["telegram_connected"] is True
     assert body["telegram_connected_source"] == "send_fn_registered"
+
+
+# --- NIT-1: the skip body names no row, because it wrote none --------------
+
+
+async def test_skipped_send_body_carries_no_id(dark_client):  # type: ignore[no-untyped-def]
+    """PREMISE: an id in this body would be a false affordance. Every other
+    response here carries one because it names a row the caller can fetch;
+    this path deliberately writes no row, so an id would resolve to a 404 that
+    reads as "we lost it" rather than "it never happened".
+
+    Recording a row so the id resolves is the WRONG fix and this pin is why:
+    it would put the first exception into the invariant the whole lane rests
+    on — that nothing before the skip's early return writes to state."""
+    resp = await dark_client.post(
+        "/outbound/send", json={"user_id": 1, "text": "hi"}, headers=_auth(),
+    )
+    body = await resp.json()
+    assert "id" not in body
+    # ...and the reason the id is absent is still asserted, so this cannot be
+    # satisfied by a handler that simply stopped answering.
+    assert body["status"] == "skipped"
+    assert dark_client.app["_test_state"].send_log == []
+
+
+async def test_skipped_batch_body_carries_no_id(dark_client):  # type: ignore[no-untyped-def]
+    resp = await dark_client.post(
+        "/outbound/send_batch",
+        json={"user_id": 1, "chunks": ["a"]},
+        headers=_auth(),
+    )
+    body = await resp.json()
+    assert "id" not in body
+    assert body["status"] == "skipped"
+    assert dark_client.app["_test_state"].send_log == []
+
+
+async def test_a_delivered_send_still_carries_a_resolvable_id(client):  # type: ignore[no-untyped-def]
+    """POSITIVE CONTROL for both pins above. "No id" is equally true of a
+    handler that stopped issuing ids at all — so prove the id survives where it
+    MEANS something, and prove it resolves: the status route finds the row."""
+    send = await client.post(
+        "/outbound/send", json={"user_id": 1, "text": "hi"}, headers=_auth(),
+    )
+    body = await send.json()
+    assert body["id"]
+
+    lookup = await client.get(
+        f"/outbound/status/{body['id']}", headers=_auth(),
+    )
+    assert lookup.status == 200
+    assert (await lookup.json())["status"] == "sent"

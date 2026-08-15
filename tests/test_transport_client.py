@@ -312,6 +312,12 @@ async def test_failure_log_has_subprocess_contract_fields(
     assert entry["code"] == 400
     assert "user_id_and_text_required" in entry["body"]
     assert entry["response_summary"].startswith("Status 400")
+    # ONE EVENT NAME, ONE FIELD SET. ``reason`` is present here even though a
+    # 4xx body rarely names one — the value is "", the KEY is the contract. A
+    # field that appears on only some emissions of an event makes grep-by-field
+    # silently incomplete, which is how the 5xx-only spelling read at base.
+    assert "reason" in entry
+    assert entry["reason"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -531,3 +537,29 @@ async def test_the_batch_path_maps_the_skip_too(
     with pytest.raises(TelegramUnavailable):
         await client_mod.send_outbound_batch(user_id=1, chunks=["a"])
     assert len(seen) == 1
+
+
+async def test_the_5xx_branch_carries_the_same_field_set(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """The other half of NIT-2's unification, and the positive control for the
+    ``reason == ""`` assertion on the 4xx pin: the SAME event name on the 5xx
+    path carries the SAME key, populated. Without this, "reason is always
+    present" is satisfied by a build that emits it as a constant empty."""
+    handlers, _ = patch_httpx
+    handlers.append(lambda req: httpx.Response(503, json={
+        "status": "skipped", "reason": "telegram_unavailable",
+    }))
+
+    with structlog.testing.capture_logs() as captured:
+        with pytest.raises(TelegramUnavailable):
+            await client_mod.send_outbound(user_id=1, text="hi")
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "transport.client.nonzero_response"
+    ]
+    assert len(matches) == 1
+    assert "reason" in matches[0]
+    assert matches[0]["reason"] == "telegram_unavailable"
+    assert matches[0]["code"] == 503

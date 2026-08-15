@@ -363,9 +363,16 @@ async def _handle_send(request: web.Request) -> web.StreamResponse:
             reason=TELEGRAM_UNAVAILABLE_REASON,
             detail="nothing was delivered; no dedupe record written",
         )
+        # NO ``id`` IN THIS BODY. Every other response here carries one because
+        # it names a row the caller can later fetch; this path deliberately
+        # writes no row, so an id would name nothing and
+        # GET /outbound/status/{id} would 404 — reading as "we lost it" rather
+        # than "it never happened", inside the one lane about that distinction.
+        # The alternative (record a row so the id resolves) is worse: it would
+        # put the first exception into the invariant the fix rests on, which is
+        # that NOTHING before this return has written to state.
         return web.json_response(
             {
-                "id": new_id,
                 "status": "skipped",
                 "delivered": False,
                 "reason": TELEGRAM_UNAVAILABLE_REASON,
@@ -496,9 +503,9 @@ async def _handle_send_batch(request: web.Request) -> web.StreamResponse:
             reason=TELEGRAM_UNAVAILABLE_REASON,
             detail="nothing was delivered; no dedupe record written",
         )
+        # No ``id`` — same rule and same reason as the single-send skip above.
         return web.json_response(
             {
-                "id": new_id,
                 "status": "skipped",
                 "delivered": False,
                 "reason": TELEGRAM_UNAVAILABLE_REASON,
