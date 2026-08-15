@@ -8,7 +8,9 @@ from pathlib import Path
 
 from alfred.daily_sync.email_section import SENDER_PLACEHOLDER
 from alfred.daily_sync.feed_producer import _SENDER_ABSENT, build_feed_items, emit_sync_feed
-from alfred.feed import STATE_ACTED, STATE_OPEN, FeedStore
+import structlog
+
+from alfred.feed import STATE_ACTED, STATE_OPEN, STATE_RETIRED, FeedStore
 
 
 class _Item:
@@ -117,14 +119,55 @@ def test_emit_sync_feed_decided_detection(tmp_path: Path) -> None:
     emit_sync_feed(store, "salem", proposal_items=[_Item(correlation_id="c1")])
     folded = store.load()
     assert folded["proposal:c1"].state == STATE_OPEN
-    assert folded["proposal:c2"].state == STATE_ACTED
+    assert folded["proposal:c2"].state == STATE_RETIRED
 
 
 def test_emit_reconciles_every_family_even_empty(tmp_path: Path) -> None:
+    """An EMPTY family still reconciles — ``[]`` means the caller read its
+    source and there was nothing, so a cleared queue retires normally.
+
+    The empty list is now passed EXPLICITLY. It used to rely on the argument's
+    ``None`` default, which under the failure-vs-emptiness contract means the
+    opposite thing (could-not-read → skip). Same two characters on the page,
+    two opposite instructions — which is exactly the distinction the contract
+    exists to draw, and this test is the one that would notice it being lost.
+    """
     store = FeedStore(tmp_path / "feed.jsonl")
-    # Open a pending item, then a fire with NO pending items → it goes acted
-    # (empty family this fire = the queue cleared).
     emit_sync_feed(store, "salem", pending_items=[_Item(id="u1")])
     assert store.load()["pending:u1"].state == STATE_OPEN
-    emit_sync_feed(store, "salem")  # nothing this fire
-    assert store.load()["pending:u1"].state == STATE_ACTED
+    emit_sync_feed(store, "salem", pending_items=[])  # read it; nothing there
+    assert store.load()["pending:u1"].state == STATE_RETIRED
+
+
+def test_a_family_reported_UNREADABLE_is_skipped_not_emptied(
+    tmp_path: Path,
+) -> None:
+    """THE CAUSE-LAYER CONTRACT, and the reason the lane touched this producer.
+
+    ``None`` means the section could not be read. Its cards must be left ALONE
+    — reconciling it to nothing would let one failed read terminalize the
+    operator's open cards for that kind, which is the property the operator
+    ratified against.
+
+    Mutation that reds this: drop the ``if raw is None: continue`` guard so a
+    None family falls through to ``build_feed_items`` and reconciles empty."""
+    store = FeedStore(tmp_path / "feed.jsonl")
+    emit_sync_feed(store, "salem", pending_items=[_Item(id="u1")])
+    assert store.load()["pending:u1"].state == STATE_OPEN
+
+    with structlog.testing.capture_logs() as captured:
+        emit_sync_feed(store, "salem", pending_items=None)
+
+    # Untouched — not retired, not refused, simply not reconciled.
+    assert store.load()["pending:u1"].state == STATE_OPEN
+    # Filtered to THIS kind: every family defaults to None, so a call naming
+    # only ``pending`` legitimately reports the other six as unreadable too.
+    # That default is the safe reading — a caller that says nothing about a
+    # family has vouched for nothing — and production passes all seven.
+    matches = [
+        c for c in captured
+        if c.get("event") == "feed.producer.family_unreadable"
+        and c.get("kind") == "pending"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["log_level"] == "warning"

@@ -19,7 +19,14 @@ from alfred.brief import daemon as brief_daemon
 from alfred.brief import feed_producer as bfp
 from alfred.brief.config import BriefConfig
 from alfred.brief.section_result import SectionResult
-from alfred.feed import STATE_ACTED, STATE_OPEN, FeedConfig, FeedItem, FeedStore
+from alfred.feed import (
+    STATE_ACTED,
+    STATE_OPEN,
+    STATE_RETIRED,
+    FeedConfig,
+    FeedItem,
+    FeedStore,
+)
 
 TODAY = date(2026, 7, 30)
 NOW = datetime(2026, 7, 30, 6, 0, 0, tzinfo=timezone.utc)
@@ -74,7 +81,7 @@ def test_genuine_empty_still_reconciles_to_acted(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(bfp, "slot_suggestion_feed_items", lambda *a, **k: [])  # genuine empty read
     _emit(cfg)
     # Empty read → reconcile → the previously-open slot goes acted (decided).
-    assert store.load()["slot_suggestion:task:task/X.md"].state == STATE_ACTED
+    assert store.load()["slot_suggestion:task:task/X.md"].state == STATE_RETIRED
 
 
 # --- item 3: event extractor threads operator prefs into _collect_items ------

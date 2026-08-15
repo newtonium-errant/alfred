@@ -363,7 +363,14 @@ def _emit_brief_feed(
                 log.warning("brief.feed_extractor_failed", kind=section.feed_kind, reason="no_read")
                 continue
             section.feed_items = items
-            try_feed_reconcile(store, section.feed_kind, items)
+            # ADOPTED — and this producer is where the contract came from.
+            # The guard above already refuses to reconcile a kind whose
+            # extractor RAISED or returned None ("couldn't read the source"),
+            # so by this line an empty ``items`` means genuinely nothing.
+            try_feed_reconcile(
+                store, section.feed_kind, items,
+                empty_is_authoritative=True,
+            )
     except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the brief
         log.warning(
             "brief.feed_emit_failed",

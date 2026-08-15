@@ -17,6 +17,7 @@ from alfred.feed.model import (
     ACTION_RETIRED,
     STATE_ACKED,
     STATE_ACTED,
+    STATE_RETIRED,
     STATE_EXPIRED,
     STATE_OPEN,
     FeedItem,
@@ -171,17 +172,19 @@ def test_reconcile_upserts_and_marks_absent_acted(tmp_path: Path) -> None:
     s = _store(tmp_path)
     # Fire 1: two proposals open.
     counts1 = s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
-    assert counts1 == {"open": 2, "acted": 0, "suppressed": 0,
+    assert counts1 == {"open": 2, "acted": 0, "retired": 0, "refused": 0,
+                       "suppressed": 0,
                        "deferred_held": 0, "defer_returned": 0}
     assert {i for i, it in s.load().items() if it.state == STATE_OPEN} == {"proposal:c1", "proposal:c2"}
 
     # Fire 2: c1 still open, c2 gone (decided elsewhere) → c2 becomes acted.
     counts2 = s.reconcile("proposal", [_item("proposal", "c1")])
-    assert counts2 == {"open": 1, "acted": 1, "suppressed": 0,
+    assert counts2 == {"open": 1, "acted": 1, "retired": 1, "refused": 0,
+                       "suppressed": 0,
                        "deferred_held": 0, "defer_returned": 0}
     folded = s.load()
     assert folded["proposal:c1"].state == STATE_OPEN
-    assert folded["proposal:c2"].state == STATE_ACTED
+    assert folded["proposal:c2"].state == STATE_RETIRED
 
 
 def test_reconcile_only_touches_its_own_kind(tmp_path: Path) -> None:
@@ -189,9 +192,9 @@ def test_reconcile_only_touches_its_own_kind(tmp_path: Path) -> None:
     s.reconcile("proposal", [_item("proposal", "c1")])
     s.reconcile("pending", [_item("pending", "u1")])
     # Reconciling proposal with an empty set acts c1 but must NOT touch pending.
-    s.reconcile("proposal", [])
+    s.reconcile("proposal", [], empty_is_authoritative=True)
     folded = s.load()
-    assert folded["proposal:c1"].state == STATE_ACTED
+    assert folded["proposal:c1"].state == STATE_RETIRED
     assert folded["pending:u1"].state == STATE_OPEN
 
 
@@ -218,8 +221,8 @@ def test_acted_then_reappears_is_new_episode_with_fresh_created_at(tmp_path: Pat
     s = _store(tmp_path)
     s.reconcile("proposal", [FeedItem.create(kind="proposal", stable_key="c1", instance="salem",
                                              title="v1", created_at="2026-07-30T00:00:00+00:00")])
-    s.reconcile("proposal", [])  # c1 → acted
-    assert s.load()["proposal:c1"].state == STATE_ACTED
+    s.reconcile("proposal", [], empty_is_authoritative=True)  # c1 → acted
+    assert s.load()["proposal:c1"].state == STATE_RETIRED
     # Reappears — the authority re-opened it → new episode, fresh created_at.
     s.reconcile("proposal", [FeedItem.create(kind="proposal", stable_key="c1", instance="salem",
                                              title="v2", created_at="2026-08-01T00:00:00+00:00")])
@@ -244,7 +247,8 @@ def test_reconcile_idempotent_rerun(tmp_path: Path) -> None:
     s.reconcile("routine_match", open_set)
     first = {i: it.state for i, it in s.load().items()}
     counts = s.reconcile("routine_match", open_set)  # same set again
-    assert counts == {"open": 2, "acted": 0, "suppressed": 0,
+    assert counts == {"open": 2, "acted": 0, "retired": 0, "refused": 0,
+                      "suppressed": 0,
                       "deferred_held": 0, "defer_returned": 0}
     assert {i: it.state for i, it in s.load().items()} == first  # folded state unchanged
 
@@ -412,7 +416,7 @@ def test_absent_event_still_goes_acted(tmp_path: Path) -> None:
     s.reconcile("event", [_event("2026-08-10|Dentist"), _event("2026-08-11|Vet")])
     counts = s.reconcile("event", [_event("2026-08-10|Dentist")])
     assert counts["acted"] == 1
-    assert s.load()["event:2026-08-11|Vet"].state == STATE_ACTED
+    assert s.load()["event:2026-08-11|Vet"].state == STATE_RETIRED
 
 
 def test_prechange_event_without_evidence_still_revives(tmp_path: Path) -> None:
@@ -591,7 +595,12 @@ def test_reconcile_retirement_stamps_the_retired_verb(tmp_path: Path) -> None:
 
     folded = s.load()
     retired = folded["proposal:c2"]
-    assert retired.state == STATE_ACTED  # STATE UNCHANGED — the whole point
+    # PREMISE REPLACED by the operator's A+C ruling. This line read
+    # ``== STATE_ACTED  # STATE UNCHANGED — the whole point`` when the verb
+    # shipped alone: the verb annotated the record while the state kept
+    # calling a retirement a decision. The state IS the point now.
+    assert retired.state == STATE_RETIRED
+    assert retired.state != STATE_ACTED  # nobody decided this
     assert retired.acted_action == ACTION_RETIRED
     assert retired.acted_at
     # The survivor is untouched and carries NO verb — it was never acted.
@@ -609,7 +618,7 @@ def test_an_operator_verb_is_not_overwritten_by_the_retirement_verb(
     s = _store(tmp_path)
     s.reconcile("proposal", [_item("proposal", "c1")])
     s.set_state("proposal:c1", STATE_ACTED, action="accept")
-    s.reconcile("proposal", [])
+    s.reconcile("proposal", [], empty_is_authoritative=True)
 
     it = s.load()["proposal:c1"]
     assert it.acted_action == "accept"
@@ -628,7 +637,11 @@ def test_the_retired_verb_is_inert_for_every_current_reader(tmp_path: Path) -> N
     retirement to ``done`` before, and sends ``retired`` to ``done`` now."""
     s = _store(tmp_path)
     s.reconcile("slot_suggestion", [_item("slot_suggestion", "task:task/X.md")])
-    s.reconcile("slot_suggestion", [])
+    # ``empty_is_authoritative=True`` because this test is about the VERB, and
+    # without the declaration the breaker refuses the wipe and there is no
+    # retirement to inspect — the test would pass its ``not in {...}`` checks
+    # against a card that simply never retired.
+    s.reconcile("slot_suggestion", [], empty_is_authoritative=True)
 
     verb = s.load()["slot_suggestion:task:task/X.md"].acted_action
     assert verb == ACTION_RETIRED
@@ -636,36 +649,72 @@ def test_the_retired_verb_is_inert_for_every_current_reader(tmp_path: Path) -> N
     assert verb is not None  # it IS stamped — not a no-op dressed as one
 
 
-def test_tripwire_fires_when_an_empty_open_set_would_retire_everything(
-    tmp_path: Path,
-) -> None:
-    """The mass-retirement event stops being silent. Semantics UNCHANGED —
-    the retirement still happens; only the silence is fixed.
+def test_a_non_authoritative_wholesale_wipe_is_REFUSED(tmp_path: Path) -> None:
+    """PREMISE UPGRADED by the operator's A+C ruling. This test used to end
+    "...and the reconcile proceeded exactly as before" — the tripwire observed
+    the mass retirement and then allowed it, because the refusal half was
+    unratified. It is ratified; the observation is now a refusal.
 
-    Mutation that reds this: delete the ``if not open_items and
-    previously_present`` warn from ``reconcile``."""
+    A caller that has not declared ``empty_is_authoritative`` cannot tell a
+    failed read from a quiet day, so its wholesale wipe is not obeyed.
+
+    Mutation that reds this: delete the breaker from ``reconcile``."""
     s = _store(tmp_path)
     s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
 
     with structlog.testing.capture_logs() as captured:
-        s.reconcile("proposal", [])
+        counts = s.reconcile("proposal", [])
 
     matches = [
         c for c in captured
-        if c.get("event") == "feed.store.reconcile_would_retire_all_open"
+        if c.get("event") == "feed.store.retirement_refused"
     ]
     assert len(matches) == 1
     assert matches[0]["log_level"] == "warning"
     assert matches[0]["kind"] == "proposal"
     assert matches[0]["count"] == 2
     assert matches[0]["ids"] == ["proposal:c1", "proposal:c2"]
-    # ...and the reconcile proceeded exactly as before.
+    assert matches[0]["reason"] == "empty_open_set_not_authoritative"
+    # THE CARDS SURVIVE — that is the refusal, not just its announcement.
     folded = s.load()
-    assert folded["proposal:c1"].state == STATE_ACTED
-    assert folded["proposal:c2"].state == STATE_ACTED
+    assert folded["proposal:c1"].state == STATE_OPEN
+    assert folded["proposal:c2"].state == STATE_OPEN
+    # And the counts SAY it was a refusal rather than a quiet fire: two
+    # identical-looking zeros ("nothing retired") with opposite meanings.
+    assert counts["retired"] == 0
+    assert counts["refused"] == 2
 
 
-def test_tripwire_silent_on_a_partial_retirement(tmp_path: Path) -> None:
+def test_an_AUTHORITATIVE_wholesale_wipe_RETIRES(tmp_path: Path) -> None:
+    """THE IMMORTAL-CARD HAZARD, pinned. A caller that separates failure from
+    emptiness is believed, and a genuinely cleared kind retires normally — a
+    free day clearing every slot suggestion is the lifecycle working.
+
+    Without this the breaker would be a card-immortality machine: refuse, next
+    fire refuses again, forever, and a kind that legitimately empties never
+    clears. That is a worse failure than the one the breaker prevents.
+
+    Mutation that reds this: make the breaker refuse authoritative empties too
+    (drop the ``not empty_is_authoritative`` clause)."""
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
+
+    with structlog.testing.capture_logs() as captured:
+        counts = s.reconcile("proposal", [], empty_is_authoritative=True)
+
+    folded = s.load()
+    assert folded["proposal:c1"].state == STATE_RETIRED
+    assert folded["proposal:c2"].state == STATE_RETIRED
+    assert counts["retired"] == 2
+    assert counts["refused"] == 0
+    # No refusal was announced — the caller was believed, silently.
+    assert [
+        c for c in captured
+        if c.get("event") == "feed.store.retirement_refused"
+    ] == []
+
+
+def test_no_refusal_on_a_partial_retirement(tmp_path: Path) -> None:
     """POSITIVE CONTROL. A normal reconcile that retires SOME items must not
     warn — a tripwire that fires on ordinary traffic is one the operator
     learns to ignore, which is the same as not having it."""
@@ -677,12 +726,12 @@ def test_tripwire_silent_on_a_partial_retirement(tmp_path: Path) -> None:
 
     assert [
         c for c in captured
-        if c.get("event") == "feed.store.reconcile_would_retire_all_open"
+        if c.get("event") == "feed.store.retirement_refused"
     ] == []
     assert s.load()["proposal:c2"].acted_action == ACTION_RETIRED  # it DID retire
 
 
-def test_tripwire_silent_when_there_was_nothing_open(tmp_path: Path) -> None:
+def test_no_refusal_when_there_was_nothing_open(tmp_path: Path) -> None:
     """The other quiet case: an empty producer against an empty store retires
     nothing, so there is nothing to announce."""
     s = _store(tmp_path)
@@ -690,13 +739,28 @@ def test_tripwire_silent_when_there_was_nothing_open(tmp_path: Path) -> None:
         s.reconcile("proposal", [])
     assert [
         c for c in captured
-        if c.get("event") == "feed.store.reconcile_would_retire_all_open"
+        if c.get("event") == "feed.store.retirement_refused"
     ] == []
 
 
-def test_tripwire_fires_once_per_episode_not_every_sweep(tmp_path: Path) -> None:
-    """THE PROPERTY THAT MAKES IT USEFUL RATHER THAN NOISE, pinned rather than
-    merely asserted in a comment two tests up.
+def test_the_refusal_repeats_every_sweep_while_the_fault_persists(
+    tmp_path: Path,
+) -> None:
+    """PREMISE INVERTED, deliberately, and the inversion is the ratification.
+
+    As a TRIPWIRE this pinned the opposite: fires once per episode, never every
+    sweep. That was correct THEN and is wrong NOW, and the reason is the whole
+    difference between observing and refusing. The tripwire let the retirement
+    proceed, so its own condition cleared — everything went terminal and the
+    next empty fire found nothing present. The breaker REFUSES, so the cards
+    stay open and the condition is still true on the next fire.
+
+    Which means the warning repeats for as long as the producer stays broken —
+    and that is what it should do. A refusal is an ONGOING fault, not an
+    episode: a breaker that tripped silently from its second fire onward would
+    be a fault going quiet while it was still actively suppressing
+    retirements. The noise stops when the producer is fixed or adopts the
+    contract, which is exactly the right lever.
 
     A producer that stays broken reconciles empty on every sweep. If the
     tripwire fired each time, it would be a warning every few minutes forever —
@@ -717,7 +781,11 @@ def test_tripwire_fires_once_per_episode_not_every_sweep(tmp_path: Path) -> None
     with structlog.testing.capture_logs() as third:
         s.reconcile("proposal", [])
 
-    ev = "feed.store.reconcile_would_retire_all_open"
+    ev = "feed.store.retirement_refused"
     assert len([c for c in first if c.get("event") == ev]) == 1
-    assert [c for c in second if c.get("event") == ev] == []
-    assert [c for c in third if c.get("event") == ev] == []
+    assert len([c for c in second if c.get("event") == ev]) == 1
+    assert len([c for c in third if c.get("event") == ev]) == 1
+    # ...and the cards are still open every time, which is WHY it repeats.
+    folded = s.load()
+    assert folded["proposal:c1"].state == STATE_OPEN
+    assert folded["proposal:c2"].state == STATE_OPEN

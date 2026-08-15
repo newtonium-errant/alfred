@@ -275,7 +275,7 @@ def test_a_deferred_item_resolved_elsewhere_does_not_become_immortal(
     # 'a' vanishes from the producer's set; 'b' is still emitted.
     store.reconcile("proposal", [_proposal("b", "Second")])
     items = store.load()
-    assert items["proposal:a"].state == "acted"
+    assert items["proposal:a"].state == "retired"
     assert items["proposal:b"].state == STATE_DEFERRED
 
 

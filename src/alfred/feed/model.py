@@ -43,6 +43,38 @@ STATE_EXPIRED = "expired"
 # consumer re-derives "is this still deferred" and drifts.
 STATE_DEFERRED = "deferred"
 
+# RETIRED (operator ruling "Ratify A+C", 2026-08-15) — the item left its
+# producer's open set and was terminalized for that reason ALONE. Nobody judged
+# it.
+#
+# WHY IT IS A STATE AND NOT ONLY A VERB. PY-B gave retirements the
+# ``acted_action='retired'`` verb, which made them auditable going forward but
+# left them sharing ``state='acted'`` with the operator's own decisions. Every
+# consumer that asks the coarse question — "was this decided?" — still got
+# "yes" for something he never decided, and the deck's own gate answered an act
+# on one with ``already_acted``, which is a sentence about him that is not true.
+# The verb annotated the record; the state is what the consumers actually read.
+#
+# NO RETROACTIVE MIGRATION. Retirements already on disk keep ``state='acted'``
+# and their verb. Rewriting history to make a past record legible is how the
+# record stops being a record — the census annotates them separately.
+STATE_RETIRED = "retired"
+
+# The states from which an item does not return by itself. Consumers asking
+# "is this finished with?" read THIS rather than comparing against ``acted``,
+# which is the drift that let a retirement pass for a decision.
+#
+# ``deferred`` is deliberately NOT here: a defer is a promise to come back, and
+# the moment it is filed under "terminal" the promise is broken. ``open`` is
+# obviously not. Adding a future state means adding it here — that is the point
+# of the set existing rather than each caller keeping its own tuple.
+TERMINAL_STATES: frozenset[str] = frozenset({
+    STATE_ACTED,
+    STATE_ACKED,
+    STATE_EXPIRED,
+    STATE_RETIRED,
+})
+
 # --- snapshot kinds: per-kind revival policy ---------------------------------
 #
 # Most kinds are EPISODE-shaped: the producer emits an item when a condition

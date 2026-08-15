@@ -80,7 +80,16 @@ def sweep_urgent_cards(handle: FeedEmitHandle | None) -> dict[str, int] | None:
         # class pin can verify this module really is the return path it is
         # declared to be. See feed/sweep.py's docstring for why the shared
         # helper stops one line short of making this call itself.
-        return try_feed_reconcile(store, URGENT_KIND, prepared.open_items)
+        # ADOPTED, same contract as the returns sweep: a load fault yields
+        # ``prepared.empty`` and returns above, so nothing that reaches here
+        # is a failed read. This kind passes no refresh hook, so every live
+        # card is kept and ``open_items`` cannot actually be empty at this
+        # line — the declaration is still correct and is made explicitly so
+        # that adding a hook later does not silently start getting refused.
+        return try_feed_reconcile(
+            store, URGENT_KIND, prepared.open_items,
+            empty_is_authoritative=True,
+        )
     except Exception as exc:  # noqa: BLE001 — the feed can never break its host
         log.warning(
             "curator.urgent_sweep_failed",

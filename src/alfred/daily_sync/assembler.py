@@ -77,6 +77,20 @@ class _ProviderEntry:
 # registry between cases.
 _REGISTRY: list[_ProviderEntry] = []
 
+# Provider names that RAISED during the most recent ``assemble_message``.
+#
+# WHY THIS EXISTS. A provider that raises is caught below, its failure is
+# rendered into the message text, and its section's batch holder is left as it
+# was — empty. Downstream, ``consume_last_batch()`` then returns ``[]``, which
+# is byte-identical to the quiet-day answer. So "this section broke" and "this
+# section had nothing" arrive at the feed producer as the same value, and the
+# feed reconciles the family to nothing on the strength of a fault.
+#
+# The information exists here and only here, at the one place that sees the
+# exception. This records it so the caller can pass ``None`` (could-not-read)
+# rather than ``[]`` (genuinely empty) for exactly those families.
+_FAILED_SECTIONS: set[str] = set()
+
 
 def register_provider(
     name: str,
@@ -115,6 +129,18 @@ def registered_providers() -> list[str]:
 def clear_providers() -> None:
     """Reset the registry. Test helper — never called in production."""
     _REGISTRY.clear()
+    _FAILED_SECTIONS.clear()
+
+
+def failed_sections() -> frozenset[str]:
+    """Provider names that raised during the most recent ``assemble_message``.
+
+    READ-ONLY and non-consuming, unlike the sections' ``consume_last_batch``:
+    more than one downstream may need to ask, and a consuming read would let
+    whoever asked first silently decide the answer for everyone else. Cleared
+    at the START of each assemble run, so it always describes the latest one.
+    """
+    return frozenset(_FAILED_SECTIONS)
 
 
 def _provider_accepts_start_index(provider: SectionProvider) -> bool:
@@ -150,6 +176,7 @@ def assemble_message(
     """
     sections: list[str] = []
     next_index = 1
+    _FAILED_SECTIONS.clear()
     for entry in _REGISTRY:
         try:
             if _provider_accepts_start_index(entry.provider):
@@ -160,6 +187,10 @@ def assemble_message(
             sections.append(
                 f"[{entry.name}] section provider failed: {exc.__class__.__name__}: {exc}"
             )
+            # The failure is rendered above for the operator; recorded here for
+            # the FEED, which must not read this section's empty batch as a
+            # genuine emptiness. See ``_FAILED_SECTIONS``.
+            _FAILED_SECTIONS.add(entry.name)
             continue
         if result is None:
             continue

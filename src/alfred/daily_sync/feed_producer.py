@@ -16,10 +16,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+import structlog
+
 from alfred.feed import FeedItem, FeedStore, try_feed_reconcile
 from alfred.feed.model import ATTENTION_NEEDS_YOU, MODE_DECIDE
 
 from .tier_override import TierOverrides
+
+log = structlog.get_logger(__name__)
 
 _SOURCE_REF = {"producer": "daily_sync"}
 
@@ -108,6 +112,26 @@ _FAMILIES: dict[str, tuple[Callable[[dict], str], Callable[[dict], str]]] = {
     "routine_match": (_routine_match_key, _routine_match_title),
     "radar": (lambda d: _s(d, "record_path", "event_id"), _radar_title),
     "friction": (lambda d: _s(d, "event_id", "record_path"), _friction_title),
+}
+
+
+#: Which registered section provider feeds which feed family.
+#:
+#: The two vocabularies are NOT the same words — four of the seven differ
+#: (``email_calibration``→``email_tier``, ``attribution_audit``→``attribution``,
+#: ``canonical_proposals``→``proposal``, ``pending_items``→``pending``) — so the
+#: correspondence has to be written down somewhere. Written down means it can
+#: drift, which is why ``test_provider_family_map_covers_every_family`` pins it
+#: against BOTH ends: every family has a provider, and every registered provider
+#: maps to a family.
+PROVIDER_FOR_FAMILY: dict[str, str] = {
+    "email_tier": "email_calibration",
+    "attribution": "attribution_audit",
+    "proposal": "canonical_proposals",
+    "pending": "pending_items",
+    "routine_match": "routine_match",
+    "radar": "radar",
+    "friction": "friction",
 }
 
 
@@ -224,7 +248,22 @@ def emit_sync_feed(
     tier_overrides: TierOverrides | None = None,
 ) -> None:
     """Reconcile every daily-sync family into the feed store. Belt-guarded per
-    family; reconciled every fire (empty family → prior open items go acted).
+    family.
+
+    FAILURE IS NOT EMPTINESS — the contract this producer adopted from the brief
+    producer, which has enforced it since it shipped:
+
+      * a family passed as ``None`` means COULD NOT READ. Its reconcile is
+        SKIPPED entirely, leaving that kind's feed state untouched. A blip must
+        never be able to terminalize an operator's open cards.
+      * a family passed as a LIST — including ``[]`` — means the caller read its
+        source and this is what was there. It reconciles, and a genuine 100%
+        clear retires normally, because that is the lifecycle working.
+
+    Passing a list is therefore a DECLARATION, and it is what earns
+    ``empty_is_authoritative=True`` on the call below. The caller must not pass
+    ``[]`` for a section it failed to read — see ``fire_once``, which asks
+    ``assembler.failed_sections()`` rather than guessing.
 
     ``tier_overrides`` (#72) carries the operator's approved per-kind tier
     decisions. Threaded from the daemon's ONE production call site in the same
@@ -241,7 +280,25 @@ def emit_sync_feed(
         "friction": friction_items,
     }
     for kind in _FAMILIES:
+        raw = by_family[kind]
+        if raw is None:
+            # ILB: a skipped kind must announce itself. "The feed did nothing
+            # for this family" and "this family had nothing" are the two states
+            # this whole contract exists to separate, so they cannot share a
+            # silence.
+            log.warning(
+                "feed.producer.family_unreadable",
+                kind=kind,
+                detail=(
+                    "family reported COULD-NOT-READ — reconcile skipped, this "
+                    "kind's feed state left untouched. Open cards stay open; a "
+                    "healthy next fire reconciles them normally."
+                ),
+            )
+            continue
         feed_items = build_feed_items(
-            kind, by_family[kind], instance, tier_overrides=tier_overrides,
+            kind, raw, instance, tier_overrides=tier_overrides,
         )
-        try_feed_reconcile(store, kind, feed_items)
+        try_feed_reconcile(
+            store, kind, feed_items, empty_is_authoritative=True,
+        )
