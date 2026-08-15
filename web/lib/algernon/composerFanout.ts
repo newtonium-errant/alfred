@@ -223,6 +223,43 @@ export function fileFromPastedText(text: string): File {
 }
 
 /**
+ * Put a pasted body back in the message — the exact inverse of accepting.
+ *
+ * WHY THERE IS AN INVERSE AT ALL. Accepting moves the body message→chip, and
+ * for every OTHER attachment that is safe because a file on disk is still the
+ * real copy: removing the chip discards a reference. A paste-derived chip holds
+ * the ONLY copy, so the same Remove button that is harmless everywhere else
+ * would silently destroy the operator's text. Restoring on removal means no
+ * content ever has a single owner with a quiet destroy button.
+ *
+ * THE MERGE RULE, stated because it is a judgement and not an accident:
+ *
+ *   * An EMPTY box (or whitespace only) takes the body verbatim. That is the
+ *     round trip — paste, accept, change your mind, and the message is exactly
+ *     what you pasted.
+ *   * A box the operator has TYPED IN since accepting keeps their words first
+ *     and the body appended after a blank line. Their text is never moved,
+ *     reordered or truncated to make room.
+ *
+ * It appends rather than reinserting at the original position because that
+ * position is not recoverable: accepting ran a forward `replace` and stored no
+ * offset. Appending is the honest backward operation; guessing an insertion
+ * point would sometimes split a sentence the operator wrote.
+ */
+export function restorePastedBody(current: string, body: string): string {
+  if (current.trim() === '') return body;
+  return `${current.trimEnd()}\n\n${body}`;
+}
+
+/** Told to the operator BEFORE the remove, on the chip itself. */
+export const PASTED_CHIP_REMOVAL_PROMISE =
+  'This was pasted, so removing it puts the text back in your message rather than discarding it.';
+
+/** Told to the operator AFTER the remove, when the text has landed back. */
+export const PASTED_BODY_RESTORED_MESSAGE =
+  'That text is back in your message — nothing was lost.';
+
+/**
  * The offer, naming the length and what filing would do with it.
  *
  * States the CAP as well as the count: an operator who has just pasted a report

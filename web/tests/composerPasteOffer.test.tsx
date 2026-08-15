@@ -177,6 +177,85 @@ describe('accepting the offer', () => {
   });
 });
 
+describe('removing a paste-derived chip gives the text back', () => {
+  // THE INVERSE OF ACCEPT. Every other doc chip is a reference to a file on
+  // disk, so Remove drops a reference; a paste-derived chip holds the only
+  // copy, and the same button would otherwise destroy the operator's own words.
+  // These are the pins for the one path that could lose data.
+
+  it('paste → accept → remove puts the text back VERBATIM', async () => {
+    const user = userEvent.setup();
+    mount();
+
+    await pasteInto(user, LONG);
+    await user.click(await screen.findByTestId('unified-paste-offer-accept'));
+    await screen.findByTestId('unified-chip-doc-0');
+    // Precondition: the body really did leave the box, or the round trip below
+    // would pass against a build that never moved it in the first place.
+    expect((screen.getByTestId('unified-input') as HTMLTextAreaElement).value).toBe('');
+
+    await user.click(screen.getByTestId('unified-doc-0-remove'));
+
+    expect((screen.getByTestId('unified-input') as HTMLTextAreaElement).value).toBe(LONG);
+    expect(screen.queryByTestId('unified-chip-doc-0')).toBeNull();
+  });
+
+  it('says so out loud — a reversible action that looks destructive', async () => {
+    const user = userEvent.setup();
+    mount();
+
+    await pasteInto(user, LONG);
+    await user.click(await screen.findByTestId('unified-paste-offer-accept'));
+    // BEFORE: the promise is on the chip while the operator is deciding.
+    const promise = await screen.findByTestId('unified-doc-0-paste-promise');
+    expect(promise.textContent).toBeTruthy();
+
+    await user.click(screen.getByTestId('unified-doc-0-remove'));
+
+    // AFTER: and the outcome is stated rather than left to be inferred.
+    expect(screen.getByTestId('unified-paste-restored').textContent).toBeTruthy();
+  });
+
+  it('keeps words typed AFTER accepting, and appends the body', async () => {
+    // The merge rule. The operator's own text is never moved or clobbered to
+    // make room for a body coming back.
+    const user = userEvent.setup();
+    mount();
+
+    await pasteInto(user, LONG);
+    await user.click(await screen.findByTestId('unified-paste-offer-accept'));
+    await screen.findByTestId('unified-chip-doc-0');
+
+    const box = screen.getByTestId('unified-input') as HTMLTextAreaElement;
+    await user.type(box, 'what does this say about the roof?');
+    await user.click(screen.getByTestId('unified-doc-0-remove'));
+
+    expect(box.value.startsWith('what does this say about the roof?')).toBe(true);
+    expect(box.value).toContain(LONG);
+  });
+
+  it('a FILE-backed chip removes freely and restores nothing — the control', async () => {
+    // Without this the pins above pass identically against a build that dumped
+    // every removed attachment into the message, which would be its own bug.
+    const user = userEvent.setup();
+    mount();
+
+    await user.upload(screen.getByTestId('unified-file-input'), [
+      new File(['# notes from disk'], 'notes.md', { type: 'text/markdown' }),
+    ]);
+    await screen.findByTestId('unified-chip-doc-0');
+    // A file-backed chip carries no promise, because Remove means something
+    // different on it.
+    expect(screen.queryByTestId('unified-doc-0-paste-promise')).toBeNull();
+
+    await user.click(screen.getByTestId('unified-doc-0-remove'));
+
+    expect((screen.getByTestId('unified-input') as HTMLTextAreaElement).value).toBe('');
+    expect(screen.queryByTestId('unified-chip-doc-0')).toBeNull();
+    expect(screen.queryByTestId('unified-paste-restored')).toBeNull();
+  });
+});
+
 describe('declining, and going stale', () => {
   it('declining dismisses the offer and keeps the text', async () => {
     const user = userEvent.setup();

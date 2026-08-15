@@ -147,9 +147,18 @@ describe('the composer reaches the SAME lifted wire call', () => {
     expect(init.body).toBeInstanceOf(FormData);
   });
 
-  it('the two consumers agree on the cap they are enforcing', () => {
-    // Both spend the same constants from the lifted module; a per-surface copy
-    // of a cap is the drift this whole lift is against.
+  it('the batch door holds more than one turn can carry', () => {
+    // Renamed from a name that claimed the two SURFACES agree at runtime, which
+    // is not what this reads — each surface's enforcement is already pinned by
+    // batchForm.test.tsx and unifiedComposer.test.tsx, and asserting it a third
+    // time here would duplicate that coverage while leaving the misleading name
+    // on whichever copy drifts.
+    //
+    // What it actually guards is the relation between the two CONSTANTS, and
+    // that relation is load-bearing: it is what makes a batch default coherent
+    // at all. If the batch door ever held no more than a single turn, routing a
+    // set to it because it was too big for a turn would be routing it somewhere
+    // that cannot take it either.
     expect(MAX_BATCH_IMAGES).toBeGreaterThan(MAX_IMAGES_PER_TURN);
   });
 });

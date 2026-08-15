@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   FILED_CONTEXT_MAX_PATHS,
   MAX_INLINE_DOC_CHARS,
+  PASTED_BODY_RESTORED_MESSAGE,
+  PASTED_CHIP_REMOVAL_PROMISE,
   PASTED_TEXT_FILENAME,
   buildFiledContextLine,
   canInline,
@@ -15,6 +17,7 @@ import {
   pasteWantsIngest,
   prepareDoc,
   preparedFromTranscript,
+  restorePastedBody,
   runFanout,
   turnOverLimitMessage,
   type FanoutJob,
@@ -457,5 +460,42 @@ describe('a long paste is offered the ingest door', () => {
     // Not a new refusal: the synthesised file rides `prepareUpload`, so the
     // paste door inherits the ingest door's gates rather than restating them.
     expect(pasteWantsIngest(' '.repeat(MAX_INLINE_DOC_CHARS + 1))).toBe(true);
+  });
+});
+
+describe('putting a pasted body back', () => {
+  // The inverse of accept. The merge rule is a judgement, so it is pinned on
+  // both branches rather than described in a comment.
+
+  it('an EMPTY box takes the body verbatim — the round trip', () => {
+    expect(restorePastedBody('', 'the whole document')).toBe('the whole document');
+    // Whitespace-only counts as empty: the operator has typed nothing worth
+    // preserving, and returning " \n \n" + body would be a worse message.
+    expect(restorePastedBody('   \n  ', 'the whole document')).toBe('the whole document');
+  });
+
+  it('a TYPED box keeps the words first and appends the body', () => {
+    const merged = restorePastedBody('what about the roof?', 'BODY');
+    expect(merged.startsWith('what about the roof?')).toBe(true);
+    expect(merged).toContain('BODY');
+    // Separated, so the operator's question and the document do not run together
+    // into one paragraph.
+    expect(merged).toBe('what about the roof?\n\nBODY');
+  });
+
+  it('never truncates or reorders what the operator wrote', () => {
+    // The property the merge rule exists to guarantee, asserted directly rather
+    // than inferred from the two shapes above.
+    const typed = 'first line\nsecond line';
+    const merged = restorePastedBody(typed, 'BODY');
+    expect(merged.indexOf(typed)).toBe(0);
+    expect(merged.length).toBeGreaterThan(typed.length);
+  });
+
+  it('the two operator-facing sentences are not silently empty', () => {
+    // Both are shown on a path that would otherwise look destructive; an empty
+    // string would render as no reassurance at all while every DOM pin passed.
+    expect(PASTED_CHIP_REMOVAL_PROMISE.trim().length).toBeGreaterThan(0);
+    expect(PASTED_BODY_RESTORED_MESSAGE.trim().length).toBeGreaterThan(0);
   });
 });
