@@ -21,6 +21,18 @@ VERIFIED against the named source below) or sit in ``DEFER_EXCLUDED_KINDS`` —
 never both, never neither. A kind added to ``FEED_ACTIONS`` gains the verbs by
 the auto-fold and fails here until its author answers the question, which is the
 only form of this check that a future producer cannot walk past.
+
+WHY TO TRUST THIS RULE RATHER THAN MERELY OBEY IT. The partition was not
+shaped around tonight's answer, and the evidence is a kind nobody had this
+rule in mind for: ``pattern_surfaced`` was excluded long before this pin
+existed, for a reason of its own — its ``ignore`` verb is a windowed
+set-aside written to the contact router's suppression map, and a second,
+unconsulted set-aside beside it would be a promise broken. It ALSO happens
+to have no reconciler, so it satisfies "reconciler OR excluded" through the
+second branch without anyone arranging it. A rule the existing membership
+already satisfies, with no carve-out written for it, is a rule that was
+discovered rather than invented; ``email_urgent`` turning out to be the ONLY
+residue when the whole ceiling was swept is the other half of that evidence.
 """
 
 from __future__ import annotations
@@ -87,6 +99,18 @@ def _reconciled_kinds_by_ast(module: ModuleType) -> tuple[set[str], int]:
     reads it). A loop variable or an attribute is UNRESOLVED and reported as
     such rather than guessed at — an unresolved call is why the feed_producer
     verifier reads a registry instead.
+
+    WHAT THIS PROVES, AND WHAT IT DOES NOT. Presence in the SOURCE, not
+    execution. The walk finds the call, so a declaration naming the wrong kind
+    IS caught — but a call sitting under ``if False:``, or behind any branch
+    that never runs, reads as present and this returns it. Reachability at
+    runtime is the producer lane's own tests to establish, not this one's:
+    ``reminder_returned``'s reconcile is exercised by the returns-ring sweep
+    tests (a card whose task closes really does go ``acted``), which is where
+    that question belongs and where it is already answered. This file's
+    standard for the other half is that a verifier nobody wrote is a claim
+    nobody checked; its sibling is that a verifier which cannot see dead code
+    has to say so.
     """
     source = Path(inspect.getfile(module)).read_text(encoding="utf-8")
     found: set[str] = set()
