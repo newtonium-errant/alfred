@@ -299,3 +299,68 @@ def test_resident_batch_act_does_not_announce_a_fallback(tmp_path: Path) -> None
 
     assert result.ok is True, "premise: the resident-batch act must succeed"
     assert [c for c in cap if c.get("event") == "feed.act.resolved_from_evidence"] == []
+
+
+# ---------------------------------------------------------------------------
+# PY-B item 2b — the resolver success path stamps the operator's VERB
+# ---------------------------------------------------------------------------
+#
+# Before this, a resolver success appended a VERBLESS ``acted`` event — byte
+# identical to the one ``reconcile`` writes when an item merely falls out of a
+# producer's open set. "He confirmed it" and "it was auto-retired" were the
+# same line, so the day's history could not distinguish an operator decision
+# from a producer's silence. FORWARD ONLY: events already on disk stay
+# verbless and stay ambiguous, which is precisely why this ships now.
+
+
+def test_the_operators_verb_is_recorded_on_the_acted_event(
+    tmp_path: Path,
+) -> None:
+    """Mutation that reds this: drop ``action=action_id`` from the
+    ``feed_store.set_state`` call on the resolver success path."""
+    cfg = _cfg(tmp_path)
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    fid = _publish(store, _email(priority="medium"))
+    _aged_out(cfg)
+
+    assert _call(store, cfg, fid, "spam").status == STATUS_ACTED
+
+    item = store.load()[fid]
+    assert item.state == "acted"          # STATE UNCHANGED
+    assert item.acted_action == "spam"    # ...the VERB is what is new
+
+
+def test_a_different_verb_records_differently(tmp_path: Path) -> None:
+    """POSITIVE CONTROL, and the point of the field: two operator decisions on
+    the same kind must be distinguishable from each other, not merely from
+    absence. A stamp that recorded a constant would pass the test above."""
+    cfg = _cfg(tmp_path)
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    fid = _publish(store, _email(priority="medium"))
+    _aged_out(cfg)
+
+    assert _call(store, cfg, fid, "confirm").status == STATUS_ACTED
+    assert store.load()[fid].acted_action == "confirm"
+
+
+def test_an_operator_decision_is_distinguishable_from_a_retirement(
+    tmp_path: Path,
+) -> None:
+    """THE WHOLE LANE, in one assertion. These two outcomes were byte-identical
+    verbless ``acted`` events; now the log says which is which."""
+    from alfred.feed.model import ACTION_RETIRED
+
+    cfg = _cfg(tmp_path)
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    decided = _publish(store, _email(priority="medium", path="email/Decided.md"))
+    _aged_out(cfg)
+    assert _call(store, cfg, decided, "spam").status == STATUS_ACTED
+
+    retired = _publish(store, _email(priority="medium", path="email/Retired.md"))
+    store.reconcile(store.load()[retired].kind, [])
+
+    folded = store.load()
+    assert folded[decided].state == folded[retired].state == "acted"
+    assert folded[decided].acted_action == "spam"
+    assert folded[retired].acted_action == ACTION_RETIRED
+    assert folded[decided].acted_action != folded[retired].acted_action

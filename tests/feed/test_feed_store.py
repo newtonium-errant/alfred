@@ -10,8 +10,11 @@ import threading
 import time
 from pathlib import Path
 
+import structlog
+
 from alfred.common.file_lock import file_rmw_lock
 from alfred.feed.model import (
+    ACTION_RETIRED,
     STATE_ACKED,
     STATE_ACTED,
     STATE_EXPIRED,
@@ -566,3 +569,126 @@ def test_retirement_names_the_ids_it_retired(tmp_path: Path) -> None:
     with structlog.testing.capture_logs() as quiet:
         s.reconcile("proposal", [_item("proposal", "c1")])
     assert [c for c in quiet if c.get("event") == "feed.store.retired_absent"] == []
+
+
+# ===========================================================================
+# PY-B items 2a + 3 — the retirement verb, and the would-retire-all tripwire
+# ===========================================================================
+#
+# A reconcile retirement (item left the producer's open set) and an operator
+# decision both appended a byte-identical VERBLESS ``state=acted`` event, so
+# the log could not tell "he judged it" from "it stopped being emitted". The
+# verb splits them. STATE IS UNCHANGED — ``acted`` stays ``acted``; this is
+# the forward-compatible half of the pending retire-vs-decided ratification.
+
+
+def test_reconcile_retirement_stamps_the_retired_verb(tmp_path: Path) -> None:
+    """Mutation that reds this: drop ``"action": ACTION_RETIRED`` from the
+    absent-set events in ``reconcile``."""
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
+    s.reconcile("proposal", [_item("proposal", "c1")])
+
+    folded = s.load()
+    retired = folded["proposal:c2"]
+    assert retired.state == STATE_ACTED  # STATE UNCHANGED — the whole point
+    assert retired.acted_action == ACTION_RETIRED
+    assert retired.acted_at
+    # The survivor is untouched and carries NO verb — it was never acted.
+    assert folded["proposal:c1"].state == STATE_OPEN
+    assert folded["proposal:c1"].acted_action is None
+
+
+def test_an_operator_verb_is_not_overwritten_by_the_retirement_verb(
+    tmp_path: Path,
+) -> None:
+    """POSITIVE CONTROL + the ordering that matters. An item the operator
+    ACTED on carries his verb; it is already absent from the next open set,
+    but it is also no longer OPEN, so reconcile's absent-set never includes it
+    and cannot overwrite ``accept`` with ``retired``."""
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1")])
+    s.set_state("proposal:c1", STATE_ACTED, action="accept")
+    s.reconcile("proposal", [])
+
+    it = s.load()["proposal:c1"]
+    assert it.acted_action == "accept"
+    assert it.acted_action != ACTION_RETIRED
+
+
+def test_the_retired_verb_is_inert_for_every_current_reader(tmp_path: Path) -> None:
+    """WHY THIS IS SAFE TO SHIP AHEAD OF THE STATE RULING. Every reader of
+    ``acted_action`` (Python and web) compares it for EQUALITY against a
+    specific verb — ``accept`` / ``done`` / ``snooze`` — and nothing anywhere
+    tests it for ABSENCE. So a fourth value changes no branch: what used to
+    read as "not accept" still reads as "not accept".
+
+    ``rings.ts`` is the case worth naming, since it renders from this field:
+    ``item.acted_action === 'accept' ? 'planned' : 'done'`` sent a verbless
+    retirement to ``done`` before, and sends ``retired`` to ``done`` now."""
+    s = _store(tmp_path)
+    s.reconcile("slot_suggestion", [_item("slot_suggestion", "task:task/X.md")])
+    s.reconcile("slot_suggestion", [])
+
+    verb = s.load()["slot_suggestion:task:task/X.md"].acted_action
+    assert verb == ACTION_RETIRED
+    assert verb not in {"accept", "done", "snooze"}
+    assert verb is not None  # it IS stamped — not a no-op dressed as one
+
+
+def test_tripwire_fires_when_an_empty_open_set_would_retire_everything(
+    tmp_path: Path,
+) -> None:
+    """The mass-retirement event stops being silent. Semantics UNCHANGED —
+    the retirement still happens; only the silence is fixed.
+
+    Mutation that reds this: delete the ``if not open_items and
+    previously_present`` warn from ``reconcile``."""
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
+
+    with structlog.testing.capture_logs() as captured:
+        s.reconcile("proposal", [])
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "feed.store.reconcile_would_retire_all_open"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["log_level"] == "warning"
+    assert matches[0]["kind"] == "proposal"
+    assert matches[0]["count"] == 2
+    assert matches[0]["ids"] == ["proposal:c1", "proposal:c2"]
+    # ...and the reconcile proceeded exactly as before.
+    folded = s.load()
+    assert folded["proposal:c1"].state == STATE_ACTED
+    assert folded["proposal:c2"].state == STATE_ACTED
+
+
+def test_tripwire_silent_on_a_partial_retirement(tmp_path: Path) -> None:
+    """POSITIVE CONTROL. A normal reconcile that retires SOME items must not
+    warn — a tripwire that fires on ordinary traffic is one the operator
+    learns to ignore, which is the same as not having it."""
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
+
+    with structlog.testing.capture_logs() as captured:
+        s.reconcile("proposal", [_item("proposal", "c1")])
+
+    assert [
+        c for c in captured
+        if c.get("event") == "feed.store.reconcile_would_retire_all_open"
+    ] == []
+    assert s.load()["proposal:c2"].acted_action == ACTION_RETIRED  # it DID retire
+
+
+def test_tripwire_silent_when_there_was_nothing_open(tmp_path: Path) -> None:
+    """The other quiet case: an empty producer against an empty store retires
+    nothing, so there is nothing to announce."""
+    s = _store(tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        s.reconcile("proposal", [])
+    assert [
+        c for c in captured
+        if c.get("event") == "feed.store.reconcile_would_retire_all_open"
+    ] == []
