@@ -170,6 +170,27 @@ body:has([data-surface='console']) {
 /* globals.css sets a honeydew focus ring app-wide. On the console ground
    that is off-identity, so re-point it INSIDE the console surface only.
    Keeps the ring (never remove a keyboard affordance) — changes its colour. */
+/* --- FENCED BLOCKS (the `ui-code` marker) ----------------------------------
+ *
+ * The deck reaches a fence the same way the feed does — `DeckCard` renders
+ * `EvidenceBody` (passing `surface="console"`), which renders `FencedText`. That
+ * second consumer is why this is FOUR registers rather than the three the lane
+ * was briefed as: the deck is its own surface, not the sensor log.
+ *
+ * Its own marker rather than `ui-panel`: that rule's ink is a DESCENDANT
+ * selector and a fence carries ink and background on the same `<pre>`. RAISE
+ * depth — the fence sits inside a card that is already panel.
+ */
+[data-surface='console'] .ui-code {
+  background-color: var(--console-raise);
+  border-color: var(--console-edge);
+  color: var(--console-ink);
+}
+
+[data-surface='console'] .ui-code-label {
+  color: var(--console-ink-dim);
+}
+
 [data-surface='console'] :focus-visible {
   outline: 2px solid var(--console-affirm);
   outline-offset: 2px;

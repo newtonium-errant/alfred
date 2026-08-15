@@ -201,6 +201,77 @@ const PANEL_REGISTERS = [
   { surface: 'comms', prefix: 'comms', file: 'comms.css' },
 ] as const;
 
+// The registers a FENCED BLOCK can reach — a different set from the panel's,
+// because reachability is per-marker rather than per-seam. `EvidenceBody` is
+// rendered by both `FeedRow` (feed / sensor-log) and `DeckCard` (deck /
+// console), which is why this list is four long where the panel's is three, and
+// why crt is absent from it: crt claims `.ui-panel`, but no FencedText consumer
+// renders on batch / ingest / login.
+const CODE_REGISTERS = [
+  { surface: 'comms', prefix: 'comms', file: 'comms.css' },
+  { surface: 'viewscreen', prefix: 'viewscreen', file: 'viewscreen.css' },
+  { surface: 'sensor-log', prefix: 'sensor', file: 'sensorLog.css' },
+  { surface: 'console', prefix: 'console', file: 'console.css' },
+] as const;
+
+// ── THE MARKER FAMILY ───────────────────────────────────────────────────────
+//
+// THE LIST IS THE GUARD. Everything below is parametrised over MARKER × REGISTER
+// rather than over registers alone, so a new marker inherits all three seam
+// rules by being added here — one line — instead of by someone remembering to
+// copy three assertions.
+//
+// This file already carried the family-hole lesson in its own header, and the
+// fenced-seam lane then added two markers to the seam without adding them here.
+// The guard read as if it covered the seam; it covered `ui-panel`. Painting
+// `ui-code` with `--console-affirm` and `ui-code-label` with `--console-negative`
+// left the suite fully green — role hues were inviolate by COMMENT on the two
+// newest members. That is the family hole reappearing one file from the sentence
+// describing it, which is the argument for a list over a local assertion: a spot
+// fix would have closed these two and left the third member to repeat it.
+//
+// Each member names its OWN reachable registers. Completeness is measured
+// against what is REACHABLE — the other half of this file's lesson, and the
+// reason `sensor-log` is absent from the panel row and crt from the code rows.
+const MARKER_FAMILY = [
+  { marker: 'ui-panel', registers: PANEL_REGISTERS },
+  { marker: 'ui-code', registers: CODE_REGISTERS },
+  { marker: 'ui-code-label', registers: CODE_REGISTERS },
+] as const;
+
+/** Every (marker, register) pair the family claims, flattened for `describe.each`. */
+const FAMILY_PAIRS = MARKER_FAMILY.flatMap(({ marker, registers }) =>
+  registers.map((r) => ({ marker, ...r })),
+);
+
+/**
+ * A bare (unscoped) declaration of exactly this marker.
+ *
+ * EXACT TOKEN, not a prefix. `\b` matches between `e` and `-`, so `\.ui-code\b`
+ * reads `.ui-code-label` as a bare `.ui-code` — a marker's own sibling would be
+ * reported as its violation. The negative lookahead is what makes the check
+ * about the class it names; the same substring trap scored a reviewer's
+ * renamed-selector mutation lower than a deletion on this very family.
+ */
+function bareRule(marker: string): RegExp {
+  return new RegExp(`^\\s*\\.${marker}(?![\\w-])`);
+}
+
+/**
+ * The scoped rule for exactly this marker on this surface.
+ *
+ * EXACT TOKEN for the same reason as `bareRule`, and it is worth stating why
+ * this one needed it too: an `includes()` filter here matches `.ui-code-label`
+ * when extracting `.ui-code`, because the sibling's selector CONTAINS the
+ * member's. Spending a role hue on the label then reddened the block's row as
+ * well — over-reporting rather than missing, but a row that fails for its
+ * sibling's fault names the wrong rule to whoever reads it, and the next
+ * `ui-code-*` member would fold into that row invisibly.
+ */
+function scopedRule(surface: string, marker: string): RegExp {
+  return new RegExp(`\\[data-surface='${surface}'\\]\\s+\\.${marker}(?![\\w-])`);
+}
+
 const MARKED_PANELS = [
   ['components/ingest/ProvenancePreview.tsx', 'ui-panel'],
   ['components/EmptyState.tsx', 'ui-panel'],
@@ -210,33 +281,39 @@ function css(file: string): string {
   return readFileSync(join(ROOT, 'styles', file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
 }
 
-describe.each(PANEL_REGISTERS)('$surface reaches adopted panels', ({ surface, prefix, file }) => {
+describe.each(FAMILY_PAIRS)('$surface reaches .$marker', ({ marker, surface, prefix, file }) => {
   const sheet = css(file);
 
-  it('declares a .ui-panel rule under its own attribute', () => {
-    expect(sheet).toContain(`[data-surface='${surface}'] .ui-panel`);
-    // Scoped, never bare: an unscoped `.ui-panel` would repaint the marker on
-    // every surface including the warm ones, which is the defect the seam exists
-    // to avoid rather than a shortcut to it.
-    const bare = sheet.split('\n').filter((l) => /^\s*\.ui-panel\b/.test(l));
+  it('declares the rule under its own attribute', () => {
+    expect(sheet).toContain(`[data-surface='${surface}'] .${marker}`);
+    // Scoped, never bare: an unscoped marker rule would repaint it on every
+    // surface including the warm ones, which is the defect the seam exists to
+    // avoid rather than a shortcut to it.
+    const bare = sheet.split('\n').filter((l) => bareRule(marker).test(l));
     expect(bare).toEqual([]);
   });
 
   it('spends only its OWN tokens, and never a role', () => {
+    // THE ASSERTION THE TWO NEWEST MARKERS WERE MISSING. A register restyles
+    // chrome, never a verdict — so `raise`/`panel`/`edge`/`ink` only, and no
+    // affirm/negative/caution/info from any prefix.
     const block = sheet
       .split('}')
-      .filter((c) => c.includes(`[data-surface='${surface}'] .ui-panel`))
+      .filter((c) => scopedRule(surface, marker).test(c))
       .join('}');
     const vars = [...block.matchAll(/var\(--([a-z-]+)\)/g)].map((m) => m[1]);
     expect(vars.length).toBeGreaterThan(0); // positive control: there ARE declarations
     for (const v of vars) {
       expect(v.startsWith(`${prefix}-`)).toBe(true);
-      // A register restyles chrome, never a verdict — the same guarantee ui-btn
-      // has. `panel`/`edge`/`ink` only; no affirm/negative/caution/info.
       expect(/-(affirm|negative|caution|info)/.test(v)).toBe(false);
     }
   });
+});
 
+describe.each(PANEL_REGISTERS)('$surface reaches adopted panels', () => {
+  // The sheet-level assertions moved to the MARKER_FAMILY block above; what
+  // stays here is the marker-specific DOM control, which is about
+  // ProvenancePreview and EmptyState carrying `.ui-panel` at all.
   it('has a marked panel to reach — the vacuity control', () => {
     // RENDERED, not grepped. This pin's first form was `src(file).toContain
     // ('ui-panel')`, and removing the marker from ProvenancePreview did not red

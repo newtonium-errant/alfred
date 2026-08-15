@@ -67,7 +67,7 @@ function Fence({
       <div className="mb-1 flex items-center justify-between gap-2">
         <span
           data-testid="fenced-block-lang"
-          className="text-[11px] font-semibold uppercase tracking-wide text-honeydew-600"
+          className="ui-code-label text-[11px] font-semibold uppercase tracking-wide text-honeydew-600"
         >
           {lang || 'text'}
         </span>
@@ -81,10 +81,24 @@ function Fence({
           {downloadLabelForLang(lang)}
         </Button>
       </div>
+      {/* THE MARKER, not a repaint. `ui-code` is a sibling of `ui-field` /
+          `ui-btn` / `ui-panel`: the warm classes below stay as the UNMARKED
+          DEFAULT and a register reaches in only under its own attribute, so a
+          consumer on a warm route keeps today's look byte-for-byte.
+
+          WHY NOT `ui-panel`. Its ink rules are descendant selectors
+          (`.ui-panel .text-honeydew-900`), and this block's ink is on the
+          `<pre>` ITSELF alongside its background — a descendant selector cannot
+          reach the element carrying the marker, so the hull would adopt and the
+          text would stay dark. The semantics agree: a fence's ink is CONTENT,
+          monospace data the operator reads, not the chrome ink `ui-panel`
+          restyles. Depth is RAISE rather than panel because a fence always sits
+          inside something that is already a panel — a bubble, a card, a
+          document. */}
       <pre
         data-testid="fenced-block-content"
         className={cn(
-          'max-h-64 overflow-auto whitespace-pre rounded-lg border border-honeydew-300',
+          'ui-code max-h-64 overflow-auto whitespace-pre rounded-lg border border-honeydew-300',
           'bg-honeydew-100 px-3 py-2 font-mono text-xs leading-relaxed text-honeydew-800',
           bodyClassName,
         )}

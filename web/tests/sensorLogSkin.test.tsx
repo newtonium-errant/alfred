@@ -41,7 +41,17 @@ const CSS_PATH = join(WEB_ROOT, 'styles', 'sensorLog.css');
 // exact failure guarded — and the union lookup would still find the string in a
 // file that selector cannot match. Per-source is the fix: a class is verified
 // against the markup its own selector reaches, and nowhere else.
-const ROW_SOURCES = ['components/feed/FeedRow.tsx', 'components/feed/EvidenceBody.tsx'];
+// `FencedText.tsx` is in this list because the row RENDERS it: EvidenceBody
+// passes the evidence body straight through it, so a fenced block inside a feed
+// row is markup this surface's selectors genuinely reach. The list models what
+// the row renders, not only what it declares directly — a transitive child that
+// emits a skinned class is exactly as reachable as one written inline, and
+// leaving it out would report a live rule as orphaned (it did, for `.ui-code`).
+const ROW_SOURCES = [
+  'components/feed/FeedRow.tsx',
+  'components/feed/EvidenceBody.tsx',
+  'components/markdown/FencedText.tsx',
+];
 const SNOOZED_ROW_SOURCES = ['pages/feed.tsx'];
 // A console-level rule (no testid qualifier) can match anywhere on the surface.
 const CONSOLE_SOURCES = [...ROW_SOURCES, ...SNOOZED_ROW_SOURCES];
