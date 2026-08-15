@@ -8,7 +8,6 @@ import type { BatchTarget, BatchTargetsResponse } from '../../lib/algernon/types
 import { prepareImageForUpload } from '../../lib/algernon/imagePrepare';
 import {
   ALLOWED_BATCH_MEDIA_TYPES,
-  BATCH_IDEMPOTENCY_HEADER,
   BATCH_UPLOAD_ACCEPT,
   MAX_BATCH_IMAGES,
   MAX_BATCH_IMAGE_BYTES,
@@ -21,6 +20,7 @@ import {
   mib,
   prepareBatch,
   stagedBatchSignature,
+  submitBatch,
   type BatchSubmitResponse,
   type StagedBatchKey,
 } from '../../lib/algernon/batchSubmit';
@@ -147,31 +147,15 @@ export function BatchForm({
     );
     idempotencyRef.current = staged;
     try {
-      // The target rides the QUERY STRING: the body is raw multipart bytes the
-      // BFF relays without parsing, so a form field would force it to parse.
-      const res = await fetch(
-        `/api/batch/submit?target=${encodeURIComponent(target)}`,
-        {
-          method: 'POST',
-          // The idempotency key rides a HEADER for the same reason — and a
-          // header is safe here where Content-Type is not: only Content-Type
-          // carries the generated multipart boundary.
-          headers: { [BATCH_IDEMPOTENCY_HEADER]: staged.key },
-          // NO Content-Type header: the browser must set it so the multipart
-          // boundary is generated. Setting it by hand produces a body the box
-          // cannot parse — a boundary-less multipart is unreadable, and the
-          // failure looks like an empty batch rather than a malformed request.
-          body: buildBatchForm(instruction.trim(), files),
-        },
+      // `submitBatch` owns the wire call for both batch surfaces — the query
+      // -string target, the absent Content-Type and the header-borne key are
+      // its three load-bearing details, stated once there rather than here.
+      const body = await submitBatch(
+        target,
+        buildBatchForm(instruction.trim(), files),
+        staged.key,
       );
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const err = new ApiError(res.status, body?.error ?? 'network_error');
-        if (res.status === 401) onUnauthenticated?.();
-        setSubmitError(friendlyBatchError(err));
-        return;
-      }
-      setResult(body as BatchSubmitResponse);
+      setResult(body);
       // RETIRE the key on success. Without this, an operator who deliberately
       // re-picks the same scans with the same instruction would rebuild the
       // same signature, resend the same key, and be handed the first batch's
@@ -181,8 +165,15 @@ export function BatchForm({
       setFiles([]);
       setTotalBytes(0);
       setInstruction('');
-    } catch {
-      setSubmitError(friendlyBatchError(new ApiError(0, 'network_error')));
+    } catch (e) {
+      // A relayed refusal keeps its OWN code so it keeps its own sentence and
+      // its own remedy; anything else (the fetch itself failed) is the network
+      // case, which reads differently on purpose — "not submitted, try again"
+      // rather than the generic apology.
+      if (e instanceof ApiError && e.status === 401) onUnauthenticated?.();
+      setSubmitError(
+        friendlyBatchError(e instanceof ApiError ? e : new ApiError(0, 'network_error')),
+      );
     } finally {
       setSubmitting(false);
     }

@@ -274,6 +274,46 @@ export function buildBatchForm(instruction: string, files: File[], title = ''): 
 }
 
 /**
+ * POST one staged batch. The single wire call both batch surfaces make.
+ *
+ * LIFTED HERE because there are two callers, not one: the standalone /batch
+ * page and the unified composer's image chip. It was written out twice when the
+ * composer arrived (#97) — same URL, same header, same three reasons below —
+ * which is one place for the two to drift apart on a detail whose failure mode
+ * is a body the box cannot parse. `buildBatchForm` above is the other half of
+ * this call; they belong together.
+ *
+ * Three things about this request are load-bearing and none are obvious:
+ *
+ *   * The target rides the QUERY STRING. The body is raw multipart bytes the
+ *     BFF relays without parsing, so a form field would force it to parse.
+ *   * NO Content-Type header. The browser must set it so the multipart boundary
+ *     is generated; setting it by hand produces a boundary-less body the box
+ *     cannot read, and the failure looks like an empty batch rather than a
+ *     malformed request.
+ *   * The idempotency key (#100) rides a header, which is safe for exactly the
+ *     reason Content-Type is not: only Content-Type carries the boundary.
+ *
+ * Throws `ApiError` so each caller maps the outcome its own way — the composer
+ * marks one chip and leaves the others alone, the page shows a banner and
+ * bounces a 401 to /login. Both spend `friendlyBatchError` for the words.
+ */
+export async function submitBatch(
+  target: string,
+  form: FormData,
+  idempotencyKey?: string,
+): Promise<BatchSubmitResponse> {
+  const res = await fetch(`/api/batch/submit?target=${encodeURIComponent(target)}`, {
+    method: 'POST',
+    ...(idempotencyKey ? { headers: { [BATCH_IDEMPOTENCY_HEADER]: idempotencyKey } } : {}),
+    body: form,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, body?.error ?? 'network_error');
+  return body as BatchSubmitResponse;
+}
+
+/**
  * Map a relayed refusal to the sentence the operator reads.
  *
  * EXPORTED so the suite can pin the wording, the same reason `friendlyError`

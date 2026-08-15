@@ -20,7 +20,6 @@ import {
 } from '../../lib/algernon/schemas';
 import {
   ALLOWED_BATCH_MEDIA_TYPES,
-  BATCH_IDEMPOTENCY_HEADER,
   MAX_BATCH_IMAGES,
   MAX_BATCH_IMAGE_BYTES,
   MAX_BATCH_INSTRUCTION_CHARS,
@@ -31,6 +30,7 @@ import {
   mib,
   prepareBatch,
   stagedBatchSignature,
+  submitBatch,
   type BatchSubmitResponse,
   type StagedBatchKey,
 } from '../../lib/algernon/batchSubmit';
@@ -58,13 +58,19 @@ import {
 } from '../../lib/algernon/composerRouting';
 import {
   FILED_CONTEXT_DEFERRED_MESSAGE,
+  PASTED_BODY_RESTORED_MESSAGE,
+  PASTED_CHIP_REMOVAL_PROMISE,
   canInline,
   composeTurnMessage,
+  fileFromPastedText,
   inlineDocBlock,
   inlineTooLongMessage,
   ingestPayloadFor,
+  pasteIngestOfferMessage,
+  pasteWantsIngest,
   prepareDoc,
   preparedFromTranscript,
+  restorePastedBody,
   runFanout,
   turnOverLimitMessage,
   type FanoutJob,
@@ -127,6 +133,17 @@ interface DocChip {
   /** The note / refusal / result sentence. Never silently empty. */
   message: string | null;
   detailOpen: boolean;
+  /**
+   * The pasted text this chip was built from, or null for a file-backed chip.
+   *
+   * PROVENANCE THAT IS ALSO THE PAYLOAD — deliberately not a boolean beside a
+   * filename check. A paste-derived chip holds the ONLY copy of its body, so
+   * removing it must put the text back; keeping the marker and the restorable
+   * text as one field means they cannot disagree, and there is no filename to
+   * match against (a file the operator happened to name "Pasted text.md" is
+   * still file-backed and still freely removable).
+   */
+  pastedBody: string | null;
 }
 
 export interface UnifiedComposerProps {
@@ -154,28 +171,6 @@ export interface UnifiedComposerProps {
   onUnauthenticated?: () => void;
 }
 
-/** The real batch submit — a multipart POST relayed byte-for-byte by the BFF. */
-async function defaultSubmitBatch(
-  target: string,
-  form: FormData,
-  idempotencyKey?: string,
-): Promise<BatchSubmitResponse> {
-  // The target rides the QUERY STRING: the body is raw multipart bytes the BFF
-  // relays without parsing, so a form field would force it to parse. NO
-  // Content-Type header — the browser must set it so the multipart boundary is
-  // generated; setting it by hand produces a body the box cannot parse. The
-  // idempotency key (#100) rides a header, which is safe for the same reason
-  // Content-Type is not: only Content-Type carries the boundary.
-  const res = await fetch(`/api/batch/submit?target=${encodeURIComponent(target)}`, {
-    method: 'POST',
-    ...(idempotencyKey ? { headers: { [BATCH_IDEMPOTENCY_HEADER]: idempotencyKey } } : {}),
-    body: form,
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ApiError(res.status, body?.error ?? 'network_error');
-  return body as BatchSubmitResponse;
-}
-
 async function defaultTranscribe(file: File): Promise<string> {
   const r = await sttClient.transcribe(file);
   return r.transcript || '';
@@ -189,7 +184,7 @@ export function UnifiedComposer({
   instance,
   instanceLabel,
   submitIngest = ingestApi.submit,
-  submitBatchRequest = defaultSubmitBatch,
+  submitBatchRequest = submitBatch,
   transcribe = defaultTranscribe,
   onUnauthenticated,
 }: UnifiedComposerProps) {
@@ -221,6 +216,15 @@ export function UnifiedComposer({
   // turn rather than being dropped (see `composeTurnMessage`'s order of
   // sacrifice). Held across sends on purpose.
   const [filedPaths, setFiledPaths] = useState<string[]>([]);
+
+  // The pasted chunk currently being OFFERED the ingest door — held, not acted
+  // on. Null once it has been accepted or declined.
+  const [pasteOffer, setPasteOffer] = useState<string | null>(null);
+  // Said out loud after a paste-derived chip is removed and its body has landed
+  // back in the box. The text reappearing is itself visible, but a destructive-
+  // looking action that turns out to be reversible should SAY so rather than
+  // leave the operator inferring it.
+  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
 
   const [ingestTargets, setIngestTargets] = useState<IngestTarget[]>([]);
   const [batchTargets, setBatchTargets] = useState<BatchTarget[]>([]);
@@ -298,7 +302,17 @@ export function UnifiedComposer({
   );
 
   const addDoc = useCallback(
-    async (file: File, kind: Exclude<AttachmentKind, 'image'>) => {
+    async (
+      file: File,
+      kind: Exclude<AttachmentKind, 'image'>,
+      /**
+       * Set ONLY by the paste path, which is the one caller whose chip holds
+       * the sole copy of its body. Both production call sites are explicit:
+       * `addFiles` omits it (file-backed, freely removable) and
+       * `acceptPasteOffer` passes the body (removal restores it).
+       */
+      pastedBody: string | null = null,
+    ) => {
       const id = nextChipId();
       const name = file.name.trim();
       setDocs((prev) => [
@@ -307,6 +321,7 @@ export function UnifiedComposer({
           id,
           kind,
           file,
+          pastedBody,
           intent: defaultDocIntent(),
           // Filename as the title, extension stripped, and as the source
           // verbatim — the same defaults the ingest form fills in, so a document
@@ -363,8 +378,10 @@ export function UnifiedComposer({
       setPickError(null);
       setSendError(null);
       // A new attachment starts a new send — last send's receipts stop being
-      // about what is now on screen.
+      // about what is now on screen, and neither is a restore that has already
+      // happened.
       setResults([]);
+      setRestoreNotice(null);
       const pickedImages: File[] = [];
       const rejected: string[] = [];
       for (const file of list) {
@@ -381,6 +398,25 @@ export function UnifiedComposer({
     [addDoc, addImages],
   );
 
+  // Accepting the offer moves the pasted body OUT of the message and into a
+  // document chip. It becomes an ordinary attachment from here — same chip,
+  // same Details fields, same ingest route, same refusals — and like any
+  // attachment, removing the chip discards it.
+  const acceptPasteOffer = useCallback(() => {
+    if (pasteOffer === null) return;
+    setPasteOffer(null);
+    setRestoreNotice(null);
+    // Take the pasted chunk back out of the message — that chunk only, so
+    // whatever the operator typed around it stays exactly where it was. Read
+    // from the CURRENT value rather than a snapshot taken at paste time: a
+    // paste that replaced a selection should not resurrect what it replaced.
+    text.setValue(text.value.replace(pasteOffer, ''));
+    // The body rides ALONG to the chip, which is what makes removal reversible.
+    void addDoc(fileFromPastedText(pasteOffer), 'doc', pasteOffer);
+  }, [pasteOffer, text, addDoc]);
+
+  const declinePasteOffer = useCallback(() => setPasteOffer(null), []);
+
   const removeImages = useCallback(() => {
     setImages([]);
     setImageBytes(0);
@@ -389,9 +425,23 @@ export function UnifiedComposer({
     setPickError(null);
   }, []);
 
-  const removeDoc = useCallback((id: string) => {
-    setDocs((prev) => prev.filter((d) => d.id !== id));
-  }, []);
+  // THE INVERSE OF ACCEPT. Accepting moved the body message→chip; removing
+  // moves it chip→message. For a file-backed chip this does nothing, because
+  // the file on disk is still the real copy and the chip was only a reference —
+  // but a paste-derived chip holds the ONLY copy, and discarding it with the
+  // same one-line filter would destroy the operator's own text behind a button
+  // that looks identical to the harmless case.
+  const removeDoc = useCallback(
+    (id: string) => {
+      const doomed = docs.find((d) => d.id === id);
+      if (doomed?.pastedBody != null) {
+        text.setValue(restorePastedBody(text.value, doomed.pastedBody));
+        setRestoreNotice(PASTED_BODY_RESTORED_MESSAGE);
+      }
+      setDocs((prev) => prev.filter((d) => d.id !== id));
+    },
+    [docs, text],
+  );
 
   // --- intent flips ---------------------------------------------------------
 
@@ -437,6 +487,20 @@ export function UnifiedComposer({
   );
 
   // --- sending --------------------------------------------------------------
+
+  // The offer is shown only while the chunk it describes is STILL IN THE BOX,
+  // and that is DERIVED rather than stored. Two reasons, both learned here:
+  // an effect that cleared the offer raced the paste itself (the offer is set
+  // in the paste event, one render before the textarea's value commits, so the
+  // effect saw an empty box and withdrew an offer that had just been made);
+  // and once the text is gone — sent, deleted, or edited down — a panel still
+  // quoting its character count would be describing a paste that no longer
+  // exists. Deriving answers both without a second source of truth. The length
+  // test short-circuits the common exits before the substring scan.
+  const showPasteOffer =
+    pasteOffer !== null &&
+    text.value.length >= pasteOffer.length &&
+    text.value.includes(pasteOffer);
 
   const hasAttachments = images.length > 0 || docs.length > 0;
   // The message doubles as the batch instruction when a batch is staged, so an
@@ -672,7 +736,16 @@ export function UnifiedComposer({
     if (pasted.length > 0) {
       e.preventDefault();
       void addFiles(pasted);
+      return;
     }
+    // A long TEXT paste is offered the ingest door — the design's third route
+    // in. The paste is NOT intercepted: it lands in the box exactly as it
+    // always has, and the offer appears beside it. Converting it silently
+    // would be the routing-without-consent this whole surface is shaped
+    // against, and it would do it to the operator's own words rather than to
+    // a file they chose to attach.
+    const pastedText = e.clipboardData?.getData('text') ?? '';
+    if (pasteWantsIngest(pastedText)) setPasteOffer(pastedText);
   }
 
   function onDrop(e: DragEvent<HTMLTextAreaElement>) {
@@ -892,6 +965,18 @@ export function UnifiedComposer({
             {intentDescription(doc.intent, instanceLabel)}
           </p>
 
+          {/* Said BEFORE the destructive-looking action, not after it. Remove
+              on this chip is not the same button it is on a file-backed one —
+              here it returns the text rather than dropping a reference — and
+              the operator should know that while deciding, not discover it by
+              risking their own words. Derived from the chip's provenance rather
+              than folded into `message`, which the intent flip resets. */}
+          {doc.pastedBody !== null && (
+            <p className={subtle} data-testid={`unified-doc-${index}-paste-promise`}>
+              {PASTED_CHIP_REMOVAL_PROMISE}
+            </p>
+          )}
+
           {/* The ingest fields, folded away behind Details with sensible
               defaults already filled in — the operator files a document without
               typing anything, and can still fix the title before it is written. */}
@@ -980,6 +1065,52 @@ export function UnifiedComposer({
             : `${filedPaths.length} records just filed`}
           .
         </p>
+      )}
+
+      {restoreNotice && (
+        <p
+          role="status"
+          data-testid="unified-paste-restored"
+          className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
+        >
+          {restoreNotice}
+        </p>
+      )}
+
+      {/* The long-paste offer. A PROPOSAL, not a routing: the text is still in
+          the box behind this, and declining leaves it there. Calm styling
+          rather than danger-red on purpose — nothing has gone wrong, and a
+          paste bigger than a message is a normal thing to have done. */}
+      {showPasteOffer && pasteOffer !== null && (
+        <section
+          role="status"
+          data-testid="unified-paste-offer"
+          aria-label="Long paste"
+          className="flex flex-col gap-2 rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
+        >
+          <p data-testid="unified-paste-offer-message">
+            {pasteIngestOfferMessage(pasteOffer.length)}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              data-testid="unified-paste-offer-accept"
+              disabled={disabled || busy}
+              onClick={acceptPasteOffer}
+            >
+              File it as a document
+            </Button>
+            <button
+              type="button"
+              data-testid="unified-paste-offer-decline"
+              onClick={declinePasteOffer}
+              className="text-xs font-semibold text-honeydew-700 underline"
+            >
+              Keep it in the message
+            </button>
+          </div>
+        </section>
       )}
 
       {pickError && (
