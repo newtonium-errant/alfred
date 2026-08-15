@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isNeedsYouItem } from '../lib/algernon/feedNeedsYou';
 import { isPushEligible, readPushPolicy } from '../lib/algernon/pushPolicy';
 import { pushDeepLink } from '../lib/algernon/pushPayload';
+import { arrivedVerbless, isDeckDealt } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
 
 // 2026-08-15 — THE PIN THAT A SUSTAINED AGENT-BACKEND OUTAGE REACHES THE PHONE.
@@ -97,5 +98,36 @@ describe('a sustained-outage health card reaches the doorbell', () => {
   it('routes the operator to the deck-side surface, not the FYI feed', () => {
     expect(pushDeepLink(outageHealthCard())).toBe('/deck');
     expect(pushDeepLink(warnHealthCard())).toBe('/feed');
+  });
+
+  it('does NOT inflate the "N decisions waiting" count', () => {
+    // The sibling hazard this escalation newly creates. Before 2026-08-15 no
+    // health card was ever needs-you, so "needs-you but not deck-dealable" only
+    // ever arose from a genuine upstream fault. This design makes it a PERMANENT,
+    // intended state, so the two consequences have to be checked rather than
+    // assumed:
+    //
+    //   1. the feed's banner counts `needsYou.filter(isDeckDealt)`, so a card
+    //      that cannot be dealt must not be counted — otherwise the operator is
+    //      told "1 decision waiting" and sent to an empty deck. That is the
+    //      promise-a-trip-to-a-wall bug his 2026-08-12 screenshots caught, and
+    //      an empty deck is exactly how he found the outage in the first place.
+    //   2. the deck reports verbless arrivals as an upstream FAULT. The health
+    //      card is verbless BY DESIGN (no FEED_ACTIONS entry), so it must never
+    //      reach that accounting — which it cannot, because the deck fetches
+    //      `mode: 'decide'` and this card is `mode: 'fyi'`. Pinned here because
+    //      the day someone promotes the mode, this is the second thing to break
+    //      and the one nobody would think to look at.
+    const card = outageHealthCard();
+    expect(isDeckDealt(card)).toBe(false);
+    expect(arrivedVerbless(card)).toBe(true);
+    expect(card.mode).not.toBe('decide'); // ...so the deck never fetches it
+
+    // Positive control: an item that IS deck-dealable counts, so the assertions
+    // above are not just describing a predicate that returns false for everything.
+    const dealable = { ...card, kind: 'email_urgent', mode: 'decide',
+      actions: [{ verb: 'ack', label: 'Got it', weight: 'light', gesture: 'affirm' }] } as FeedItem;
+    expect(isDeckDealt(dealable)).toBe(true);
+    expect(arrivedVerbless(dealable)).toBe(false);
   });
 });
