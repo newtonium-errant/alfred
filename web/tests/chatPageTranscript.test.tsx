@@ -36,6 +36,9 @@ vi.mock('../components/chat/VoiceCapture', () => ({
       mock-stt
     </button>
   ),
+  // `UnifiedComposer` imports this beside the component. Both doors pass the
+  // same `idPrefix`, so the button above is reachable under either.
+  sttErrorMessage: () => 'Couldn’t transcribe that.',
 }));
 
 import ChatPage from '../pages/chat';
@@ -76,6 +79,11 @@ function installFetch(opts: { streamable?: boolean } = {}) {
   const streamable = opts.streamable ?? true;
   fetchSpy = vi.fn(async (url: string, init?: RequestInit) => {
     if (url.startsWith('/api/chat/targets')) return jsonOk({ targets: [] });
+    // The unified door asks for these on mount. Empty is the honest answer for
+    // this fixture — nothing here files or batches — and an unrouted fetch would
+    // otherwise fall through to the catch-all below.
+    if (url.startsWith('/api/ingest/targets')) return jsonOk({ targets: [] });
+    if (url.startsWith('/api/batch/targets')) return jsonOk({ targets: [] });
     if (url.startsWith('/api/chat/open')) return jsonOk({ session_key: 'sess-1' });
     if (url.startsWith('/api/chat/history')) return jsonOk({ turns: [] });
     if (url.startsWith('/api/chat/notifications')) return jsonOk({ notifications: [], unread: 0 });
@@ -112,7 +120,12 @@ beforeEach(() => {
   installFetch();
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  // The flag-ON block below stubs env; without this the stub would leak into
+  // whatever test ran next and silently move it to the other door.
+  vi.unstubAllEnvs();
+});
 
 describe('/chat — a voice-seeded send carries the transcript to the wire', () => {
   it('the STREAM body carries the raw transcript alongside the edited message', async () => {
@@ -192,5 +205,82 @@ describe('/chat — a voice-seeded send carries the transcript to the wire', () 
     const said = String(warn.mock.calls[0][0]);
     expect(said).toContain('transcript dropped');
     expect(said).toContain(String(MAX_TRANSCRIPT_CHARS));
+  });
+});
+
+// THE SAME THREAD, THROUGH THE DOOR PRODUCTION ACTUALLY USES.
+//
+// Everything above renders /chat with the flag unset, which is the LEGACY
+// composer. Since #97 went live (NEXT_PUBLIC_UNIFIED_COMPOSER baked ON in the
+// box build) that is the rollback door, not the live one — so the end-to-end
+// pin whose entire reason for existing is "a parameter threaded through four
+// layers can be dropped at any join, silently, and type-check fine" was, for
+// the composer the operator actually types into, not being made at all.
+//
+// The join is genuinely different on this side, which is exactly why the pin
+// cannot be assumed to carry: `UnifiedComposer.submit` reaches `onSend` through
+// its own fanout, and its transcript argument is passed from a DIFFERENT call
+// site than the legacy composer's. Same wire, same assertion, different code.
+//
+// The legacy block above is kept as-is. That door is the rollback, and the
+// bake window is not over.
+describe('/chat under the flag — the unified door carries the transcript too', () => {
+  async function readyUnifiedPage() {
+    vi.stubEnv('NEXT_PUBLIC_UNIFIED_COMPOSER', '1');
+    render(<ChatPage />);
+    await waitFor(() => expect(screen.queryByTestId('unified-input')).not.toBeNull());
+    // The door under test, asserted rather than assumed: if the flag ever stops
+    // selecting this composer, these tests must fail as "the wrong door" rather
+    // than quietly re-pin the legacy one a second time.
+    expect(screen.queryByTestId('composer-input')).toBeNull();
+  }
+
+  it('the STREAM body carries the raw transcript alongside the edited message', async () => {
+    await readyUnifiedPage();
+    const input = screen.getByTestId('unified-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('clean the chicken tracker'));
+    fireEvent.change(input, { target: { value: 'clean the chicken tractor' } });
+    fireEvent.click(screen.getByTestId('unified-send'));
+
+    await waitFor(() => expect(lastBodyTo('/api/chat/stream')).not.toBeNull());
+    const body = lastBodyTo('/api/chat/stream')!;
+    expect(body.message).toBe('clean the chicken tractor');
+    expect(body.transcript).toBe('clean the chicken tracker');
+    expect(body.kind).toBe('voice');
+  });
+
+  it('the buffered TURN body carries it too (the stream-fallback entry point)', async () => {
+    installFetch({ streamable: false });
+    await readyUnifiedPage();
+    const input = screen.getByTestId('unified-input') as HTMLTextAreaElement;
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    await waitFor(() => expect(input.value).toBe('clean the chicken tracker'));
+    fireEvent.change(input, { target: { value: 'clean the chicken tractor' } });
+    fireEvent.click(screen.getByTestId('unified-send'));
+
+    await waitFor(() => expect(lastBodyTo('/api/chat/turn')).not.toBeNull());
+    const body = lastBodyTo('/api/chat/turn')!;
+    expect(body.message).toBe('clean the chicken tractor');
+    expect(body.transcript).toBe('clean the chicken tracker');
+    expect(body.kind).toBe('voice');
+  });
+
+  it('a TYPED send is byte-identical to the pre-feature body — absent, not null', async () => {
+    // The control the two pins above need. Without it "transcript is present"
+    // proves nothing about the threading: a composer that hard-coded the field
+    // on every send would satisfy them both and be wrong in the commonest case.
+    await readyUnifiedPage();
+    const input = screen.getByTestId('unified-input') as HTMLTextAreaElement;
+
+    fireEvent.change(input, { target: { value: 'just typing' } });
+    fireEvent.click(screen.getByTestId('unified-send'));
+
+    await waitFor(() => expect(lastBodyTo('/api/chat/stream')).not.toBeNull());
+    const body = lastBodyTo('/api/chat/stream')!;
+    expect('transcript' in body).toBe(false);
+    expect(body.kind).toBe('text');
   });
 });

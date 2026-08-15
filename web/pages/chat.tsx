@@ -258,12 +258,16 @@ export default function ChatPage() {
               from what the operator corrected. A typed send passes nothing.
 
               #97: with NEXT_PUBLIC_UNIFIED_COMPOSER on, the universal composer
-              mounts here instead — the same `onSend` contract, plus attachment
-              routing to the ingest and batch doors. OFF (the default, and the
-              shipped state until the operator has walked the chip defaults) this
-              renders exactly what it always did. The two are alternatives, never
+              mounts here — the same `onSend` contract, plus attachment routing
+              to the ingest and batch doors. IT IS ON IN THE BOX BUILD, so the
+              unified branch is what /chat serves today and the OFF branch below
+              is the ROLLBACK, not the default. The two are alternatives, never
               layered, so "flag off" is the old component itself rather than the
-              new one in a quiet mode. */}
+              new one in a quiet mode.
+
+              Rolling back is a REBUILD, not an env edit: NEXT_PUBLIC_* is
+              inlined at build time, so clearing the variable on a running box
+              changes nothing until the bundle is rebuilt. */}
           {unifiedComposerEnabled() ? (
             <UnifiedComposer
               onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}

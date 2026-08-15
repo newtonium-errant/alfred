@@ -18,6 +18,10 @@ import userEvent from '@testing-library/user-event';
 
 vi.mock('../components/chat/VoiceCapture', () => ({
   VoiceCapture: () => <button type="button">mock-stt</button>,
+  // `UnifiedComposer` imports this alongside the component; without it the
+  // mocked module has no such export and the import is `undefined` at call
+  // time. Harmless for the legacy door, which never reads it.
+  sttErrorMessage: () => 'Couldn’t transcribe that.',
 }));
 
 // The marker: a distinct byte pattern and a distinct media type, so both
@@ -51,6 +55,7 @@ function sized(file: File, bytes: number): File {
 }
 
 import { Composer } from '../components/chat/Composer';
+import { UnifiedComposer } from '../components/chat/UnifiedComposer';
 import { MAX_IMAGE_BYTES } from '../lib/algernon/schemas';
 
 function imageFile(name = 'scan.png', type = 'image/png', size = 4096): File {
@@ -103,6 +108,93 @@ describe('Composer → imageDownscale wiring', () => {
     await user.upload(screen.getByTestId('composer-file-input'), imageFile('scan.png', 'image/png'));
     await screen.findByTestId('composer-image-preview');
     await user.click(screen.getByTestId('composer-send'));
+
+    expect(onSend.mock.calls[0][2][0].media_type).toBe('image/jpeg');
+  });
+});
+
+// THE SAME PIN, ON THE DOOR PRODUCTION ACTUALLY USES.
+//
+// Everything above drives `Composer`. Since #97 went live
+// (NEXT_PUBLIC_UNIFIED_COMPOSER baked ON in the box build) the composer an
+// operator's images pass through on /chat is `UnifiedComposer` — so the pin
+// that exists to catch "the helper ships and nothing calls it" was, for the
+// live door, doing nothing at all. The legacy pins stay: that door is the
+// rollback, and a rollback nobody guards is not a rollback.
+//
+// The route differs and the promise does not. Legacy calls the downscaler from
+// `addFiles`; the unified door calls `prepareBatch(picked, prepareImageForUpload)`
+// at PICK time — one preparation per file, whichever chip the operator ends up
+// choosing — and the conversation path then passes those already-prepared files
+// through untouched. So the marker still has exactly one way to reach `onSend`:
+// production called the downscaler.
+describe('UnifiedComposer → imageDownscale wiring (the live door)', () => {
+  // The composer asks for its ingest/batch targets on mount. Neither matters to
+  // this pin — an image kept on the `discuss` chip goes to `onSend`, not to a
+  // route — but an unmocked fetch would be a real network call in a unit test.
+  function stubTargets() {
+    (globalThis as unknown as { fetch: unknown }).fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ targets: [] }),
+    }));
+  }
+
+  function renderUnified(onSend = vi.fn()) {
+    stubTargets();
+    render(
+      <UnifiedComposer
+        onSend={onSend}
+        instance="salem"
+        instanceLabel="Salem"
+        submitIngest={vi.fn()}
+        submitBatchRequest={vi.fn()}
+      />,
+    );
+    return onSend;
+  }
+
+  it('passes every attached image through downscaleImage', async () => {
+    downscaleImage.mockClear();
+    const user = userEvent.setup();
+    renderUnified();
+
+    await user.upload(screen.getByTestId('unified-file-input'), imageFile());
+    await screen.findByTestId('unified-chip-images');
+
+    expect(downscaleImage).toHaveBeenCalledTimes(1);
+    expect((downscaleImage.mock.calls[0][0] as File).name).toBe('scan.png');
+  });
+
+  it('sends the DOWNSCALED bytes, not the originally-picked file', async () => {
+    // The load-bearing assertion, and the one the live door was missing. Remove
+    // the downscale from the unified pick path and this reddens, because the
+    // originally-picked bytes would reach onSend instead.
+    downscaleImage.mockClear();
+    const user = userEvent.setup();
+    const onSend = renderUnified();
+
+    await user.upload(screen.getByTestId('unified-file-input'), imageFile());
+    await screen.findByTestId('unified-chip-images');
+    // A single image defaults to the `discuss` chip — the conversation route,
+    // which is the one that carries bytes to `onSend`.
+    expect(screen.getByTestId('unified-images-intent-discuss').getAttribute('aria-pressed')).toBe('true');
+    await user.click(screen.getByTestId('unified-send'));
+
+    const images = onSend.mock.calls[0][2];
+    expect(images).toHaveLength(1);
+    const expected = btoa(String.fromCharCode(...MARKER_BYTES));
+    expect(images[0].data).toBe(expected);
+  });
+
+  it('carries the re-encoded media type, not the picked one', async () => {
+    downscaleImage.mockClear();
+    const user = userEvent.setup();
+    const onSend = renderUnified();
+
+    await user.upload(screen.getByTestId('unified-file-input'), imageFile('scan.png', 'image/png'));
+    await screen.findByTestId('unified-chip-images');
+    await user.click(screen.getByTestId('unified-send'));
 
     expect(onSend.mock.calls[0][2][0].media_type).toBe('image/jpeg');
   });

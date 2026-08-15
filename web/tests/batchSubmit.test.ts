@@ -10,6 +10,7 @@ import {
   buildBatchForm,
   friendlyBatchError,
   prepareBatch,
+  submitBatch,
 } from '../lib/algernon/batchSubmit';
 
 // #83 item 6 — the client half of bulk scan upload.
@@ -188,10 +189,76 @@ describe('friendlyBatchError', () => {
     expect(say('something_new_entirely')).toBe('Something went wrong. Please try again.');
   });
 
+  it('prefers the SERVER’S OWN WORDS over the generic line on an unknown code', () => {
+    // The other half of the fallback above, and the one the operator actually
+    // needed: the box words its refusals, and answering "Something went wrong"
+    // over the top of a sentence it wrote is the honesty gap this closes. The
+    // pin above stays exactly as it was — an unknown code with NO detail still
+    // gets the generic line — so the two together say the whole rule.
+    const detailed = friendlyBatchError(
+      new ApiError(422, 'something_new_entirely', 'the campaign for that target is paused'),
+    );
+    expect(detailed).toBe('the campaign for that target is paused');
+  });
+
+  it('does NOT let a detail override a curated cap remedy', () => {
+    // A known code keeps its own sentence, which carries a REMEDY the raw
+    // detail does not. Preferring the server here would trade "try a
+    // lower-resolution scan" for a restatement of the failure.
+    const msg = friendlyBatchError(
+      new ApiError(413, 'image_too_large', 'image exceeds the per-image byte cap'),
+    );
+    expect(msg).toContain('lower-resolution');
+  });
+
   it('says the scans were NOT submitted when the instance is unreachable', () => {
     // The operator must know whether to re-pick 30 files. "Try again shortly"
     // alone leaves them guessing whether a partial batch landed.
     expect(say('transport_unreachable')).toContain('were not submitted');
+  });
+});
+
+describe('submitBatch carries the refusal INTACT', () => {
+  // The wire half of the pair above. `friendlyBatchError` preferring the
+  // server's words is worth nothing if the throw site never carried them — the
+  // two halves have to be pinned separately, because each is green on its own
+  // while the operator still reads "Something went wrong."
+  function stubFetch(status: number, body: unknown) {
+    (globalThis as unknown as { fetch: unknown }).fetch = vi.fn(async () => ({
+      ok: false,
+      status,
+      json: async () => body,
+    }));
+  }
+
+  it('puts the box’s detail on the ApiError, not just the code', async () => {
+    stubFetch(422, { error: 'campaign_paused', detail: 'the campaign for that target is paused' });
+    await expect(submitBatch('salem', new FormData())).rejects.toMatchObject({
+      status: 422,
+      code: 'campaign_paused',
+      detail: 'the campaign for that target is paused',
+    });
+  });
+
+  it('and the two halves meet: an unknown code reaches the operator in the box’s words', async () => {
+    // END TO END across the seam, because that is the claim being made. Pinning
+    // the throw and the mapper separately leaves the join untested, which is the
+    // failure shape this project keeps shipping.
+    stubFetch(422, { error: 'campaign_paused', detail: 'the campaign for that target is paused' });
+    const said = await submitBatch('salem', new FormData()).then(
+      () => 'it resolved, which is the bug',
+      (e) => friendlyBatchError(e),
+    );
+    expect(said).toBe('the campaign for that target is paused');
+  });
+
+  it('a refusal with no detail still gets the generic line (control)', async () => {
+    stubFetch(500, { error: 'something_new_entirely' });
+    const said = await submitBatch('salem', new FormData()).then(
+      () => 'it resolved, which is the bug',
+      (e) => friendlyBatchError(e),
+    );
+    expect(said).toBe('Something went wrong. Please try again.');
   });
 });
 

@@ -309,7 +309,13 @@ export async function submitBatch(
     body: form,
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ApiError(res.status, body?.error ?? 'network_error');
+  // `detail` is CARRIED, not dropped. The box sends `{error, detail}` and this
+  // used to keep only the code — so a refusal the box had worded for the
+  // operator arrived here as a bare machine string, and every code the switch
+  // below does not know became "Something went wrong." The deck and the board
+  // both reach for the server's own words first for exactly this reason; this
+  // seam is the one that had nothing to reach for.
+  if (!res.ok) throw new ApiError(res.status, body?.error ?? 'network_error', body?.detail);
   return body as BatchSubmitResponse;
 }
 
@@ -365,9 +371,21 @@ export function friendlyBatchError(e: unknown): string {
       case 'transport_misconfigured':
         return 'Bulk upload isn’t configured on this instance yet.';
       default:
-        return 'Something went wrong. Please try again.';
+        // A code this switch does not know, which is the ONLY branch the
+        // server's own words can improve on — every case above has a curated
+        // remedy that beats a raw detail, and none of them changes here.
+        //
+        // Reaching for `detail` before the generic line is the deck/board
+        // pattern (`refusalReason`): the box worded the refusal for the
+        // operator, and answering "Something went wrong" over the top of it
+        // throws that away at the one moment they most need it. Absent detail
+        // still falls through to the generic sentence, so the unknown-code
+        // contract is unchanged for a refusal that carried no words.
+        return e.detail || 'Something went wrong. Please try again.';
     }
   }
+  // NOT an ApiError — there is no server voice here to prefer, so this one
+  // stays generic on purpose.
   return 'Something went wrong. Please try again.';
 }
 
