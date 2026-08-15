@@ -451,9 +451,59 @@ class TestEmailUrgentCanNowKeepThePromise:
         passed = calls[0].args[0]
         assert isinstance(passed, ast.Name), ast.dump(passed)
         assert passed.id == "feed_handle"
-        # The cadence guard is the daemon's, not the sweep's: without it the
-        # 5-second poll would fold the whole store every tick.
-        assert "SWEEP_INTERVAL_SECONDS" in source
+    def test_the_sweep_is_throttled_rather_than_run_every_poll(self) -> None:
+        """The cadence guard, checked as a GUARD rather than as a substring.
+
+        This assertion was ``"SWEEP_INTERVAL_SECONDS" in source`` — which the
+        IMPORT LINE satisfies. The reviewer deleted the entire throttle, leaving
+        the sweep to fold the whole store on every 5-second poll, and the pin
+        stayed green: a source-substring standing in for a runtime claim, which
+        is the same family as a line-anchored grep over wrapped prose and an AST
+        reader that proves presence rather than execution.
+
+        So the check walks to the innermost ``if`` ENCLOSING the call and
+        requires its CONDITION to be about the interval. A deleted guard leaves
+        the call with no enclosing ``if`` and reds; a guard rewritten to test
+        something else reds too. Parent tracking is explicit rather than
+        ``ast.walk`` over each ``If`` body, because that would also match an
+        OUTER ``if`` that merely contains the call somewhere beneath it — and
+        would therefore pass on a guard testing the wrong thing.
+        """
+        from alfred.curator import daemon as curator_daemon
+
+        tree = ast.parse(
+            Path(inspect.getfile(curator_daemon)).read_text(encoding="utf-8")
+        )
+
+        def _is_sweep_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "sweep_urgent_cards"
+            )
+
+        guards: list[ast.If] = []
+
+        def _visit(node: ast.AST, ancestors: list[ast.AST]) -> None:
+            if _is_sweep_call(node):
+                for parent in reversed(ancestors):
+                    if isinstance(parent, ast.If):
+                        guards.append(parent)
+                        break
+            for child in ast.iter_child_nodes(node):
+                _visit(child, ancestors + [node])
+
+        _visit(tree, [])
+
+        assert len(guards) == 1, (
+            "the sweep call must sit inside exactly one enclosing `if` — the "
+            "cadence guard. Found none: it fires on every 5s poll."
+        )
+        condition = ast.unparse(guards[0].test)
+        assert "SWEEP_INTERVAL_SECONDS" in condition, condition
+        # …and against the clock, not some unrelated flag that happens to
+        # mention the constant.
+        assert "monotonic" in condition, condition
 
     def test_the_sweep_is_silent_with_nothing_live(self, tmp_path: Path) -> None:
         from alfred.curator.urgent_feed import sweep_urgent_cards
