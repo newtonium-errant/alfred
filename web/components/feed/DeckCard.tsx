@@ -99,10 +99,19 @@ export interface DeckCardProps {
   onReTierOpen?: () => void;
   /** Open the correction picker (#13) — routine_match top card only; absent elsewhere. */
   onCorrectOpen?: () => void;
+  /**
+   * This card came BACK because the server refused the last verdict given on it.
+   *
+   * Marked on the card face, not only in the notice above the stack, because the
+   * notice is read once and the decision is made here — the operator needs to
+   * know, at the moment they are about to swipe, that their last swipe on this
+   * card did not stick.
+   */
+  unrecorded?: boolean;
 }
 
 export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckCard(
-  { item, depth, expanded, confirming, confirmingVerdict = 'affirm', onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen },
+  { item, depth, expanded, confirming, confirmingVerdict = 'affirm', onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen, unrecorded = false },
   ref,
 ) {
   const verbs = verbsFromActions(item);
@@ -167,6 +176,14 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
           <span className={`${CHIP_BASE} border-console-edge-bright text-console-ink-faint`}>
             {kindLabel(item.kind)}
           </span>
+          {unrecorded && (
+            // The card came back: the server refused the last verdict given on
+            // it. The alert role, because this is the one chip on the face that
+            // reports a FAILURE OF THE SYSTEM rather than a property of the item.
+            <span data-testid="deck-unrecorded-mark" className={`${CHIP_BASE} ${roleChipClass('negative')}`}>
+              Not recorded
+            </span>
+          )}
           {urgent && (
             // The interrupt signal, on the face — the alert role, so it reads
             // distinct from the calibration card at a glance ("needs you NOW",
@@ -210,6 +227,16 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         <h2 className="mb-1.5 shrink-0 text-[19px] font-medium leading-snug tracking-[-0.005em] text-console-ink">
           {item.title || item.id}
         </h2>
+
+        {unrecorded && (
+          // The chip above is the glance; this is the sentence. Said HERE, at the
+          // point of decision, because the notice over the stack is read once and
+          // then the operator is looking at cards — and the thing they must know
+          // before swiping is that their last swipe on this one did not stick.
+          <p data-testid="deck-unrecorded-note" className="mb-1.5 shrink-0 text-xs text-negative">
+            Your last verdict on this card wasn&rsquo;t recorded. Decide it again.
+          </p>
+        )}
 
         {/* D7 — an item that carries a real interval renders as its EXTENT.
             Draws nothing at all when the item has no time dimension. */}

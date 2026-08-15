@@ -40,11 +40,18 @@ function item(overrides: Partial<FeedItem> = {}): FeedItem {
 beforeEach(() => {
   mockAct.mockReset();
   mockAct.mockResolvedValue({ ok: true, status: 'acted' });
+  // The unrecorded-verdict ledger is PERSISTENT by design (it has to outlive the
+  // deck's own unmount), so a test that refuses an act leaves a real entry
+  // behind and the next `renderHook` hydrates from it. That is the feature in
+  // production and contamination here — same shape as the dispatcher env-var
+  // bleed rule. Any test file that can produce a refusal must clear it.
+  window.localStorage.clear();
   vi.useFakeTimers();
 });
 afterEach(() => {
   vi.runOnlyPendingTimers();
   vi.useRealTimers();
+  window.localStorage.clear();
 });
 
 describe('useDeck — delayed act', () => {
@@ -265,11 +272,36 @@ describe('useDeck — error routing (card already dismissed → toast/banner)', 
     });
   }
 
-  it('409 stale_item → a benign "moved on" toast', async () => {
+  it('409 stale_item → the card COMES BACK, and no toast speaks for it', async () => {
+    // This pin used to assert the opposite — a "moved on" toast and nothing else
+    // — and that was the 2026-08-15 P1: the deferred act's failure arrived while
+    // a LATER card was on screen, so the one line it produced named no card and
+    // was replaced by the next. A refusal is an answer; the verdict is
+    // definitely unrecorded; the card returns. Full behaviour in
+    // `deckActHonesty.test.tsx`; this is the routing half.
     const { result } = renderHook(() => useDeck({ items: [item({ id: 'a' })] }));
     await commitAndFlush(result, new ApiError(409, 'stale_item'));
-    expect(result.current.toast?.message).toContain('moved on');
+    expect(result.current.current?.id).toBe('a');
+    expect(result.current.unrecorded.map((u) => u.id)).toEqual(['a']);
+    expect(result.current.toast).toBeNull();
     expect(result.current.banner).toBeNull();
+  });
+
+  it('the "moved on" toast is still LIVE on the immediate paths (dealNow)', async () => {
+    // The copy did not die with the pin above; it moved to where a toast is
+    // attributable — a caller whose card is in front of it. dealNow's un-snooze
+    // is that caller, and a pin that only deleted the old assertion would have
+    // left this branch unguarded.
+    const { result } = renderHook(() => useDeck({ items: [slotItem()] }));
+    act(() => result.current.snooze('snooze_1d'));
+    act(() => vi.advanceTimersByTime(UNDO_MS)); // the snooze POST lands
+    mockAct.mockRejectedValueOnce(new ApiError(409, 'stale_item'));
+    await act(async () => {
+      result.current.dealNow(result.current.snoozed[0]);
+      await Promise.resolve();
+    });
+    expect(result.current.toast?.message).toContain('moved on');
+    expect(result.current.unrecorded).toHaveLength(0); // not a swiped verdict
   });
 
   it('502 feed_upstream_unavailable → a fatal server-config banner (never a logout)', async () => {

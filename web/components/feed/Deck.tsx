@@ -29,6 +29,7 @@ import {
   ROLE_TEXT_CLASS,
   roleChipClass,
 } from '../../lib/algernon/consoleTokens';
+import { verdictNoun } from '../../lib/algernon/deckUnrecorded';
 import { useDeck } from './useDeck';
 import {
   DeckCard,
@@ -408,12 +409,71 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   const stack: Array<{ item: FeedItem; depth: number }> = [];
   if (current) stack.push({ item: current, depth: 0 });
   upcoming.forEach((item, i) => stack.push({ item, depth: i + 1 }));
+  // What the operator can still reach: the card in front plus everything behind
+  // it. Derived from the SAME queue and cursor the deck deals from (`current` +
+  // `ahead`), so the notice cannot promise a card the deck will never show — the
+  // returned-card case and the it-is-not-in-this-batch case are the same question
+  // asked of one source.
+  const inDeck = new Set<string>(deck.ahead.map((it) => it.id));
+  if (current) inDeck.add(current.id);
 
   return (
     <div data-testid="deck" className="flex flex-1 flex-col" onKeyDown={onKeyDown}>
       {banner && (
         <div role="alert" data-testid="deck-banner" className="mb-3 rounded-sm border-l-2 border-negative bg-negative-wash px-3 py-2 text-sm text-negative">
           {banner}
+        </div>
+      )}
+
+      {/* THE UNRECORDED-VERDICT NOTICE — the thing the operator was owed on
+          2026-08-15 and did not get.
+
+          A LIST, not a toast, and the difference is the whole point: a toast
+          shows one thing for three and a half seconds and is replaced by the
+          next, so five refusals in a burst rendered at most one unnamed line
+          while a different card was on screen. This accumulates, NAMES each
+          card, says in plain words that the verdict was not recorded, and stays
+          until the operator says they have read it. */}
+      {deck.unrecorded.length > 0 && (
+        <div
+          role="alert"
+          data-testid="deck-unrecorded"
+          className="mb-3 rounded-sm border-l-2 border-negative bg-negative-wash px-3 py-2.5"
+        >
+          <div className="mb-1.5 flex items-baseline justify-between gap-3">
+            <p className="text-sm font-bold text-negative">
+              {deck.unrecorded.length === 1
+                ? 'A verdict was not recorded.'
+                : `${deck.unrecorded.length} verdicts were not recorded.`}
+            </p>
+            <button
+              type="button"
+              data-testid="deck-unrecorded-ack"
+              onClick={deck.acknowledgeUnrecorded}
+              className="shrink-0 text-[11px] font-bold uppercase tracking-[0.14em] text-negative underline underline-offset-4"
+            >
+              Acknowledge
+            </button>
+          </div>
+          <ul className="console-accreted flex max-h-40 flex-col gap-1 overflow-y-auto">
+            {deck.unrecorded.map((u) => (
+              <li key={u.id} data-testid="deck-unrecorded-row" className="text-sm text-console-ink">
+                <span className="font-semibold">{u.title || u.id}</span>
+                {' — your '}
+                {verdictNoun(u.verdict)}
+                {' did not stick'}
+                {u.reason ? `: ${u.reason}` : ''}
+                {'. '}
+                {/* WHICH CARDS CAN BE RE-DECIDED, said per row. A returned card is
+                    back in the deck; one whose item is no longer served cannot be,
+                    and telling the operator to swipe a card that isn't there would
+                    be a wrong steer dressed as a helpful one. */}
+                <span className="text-console-ink-dim">
+                  {inDeck.has(u.id) ? "It's back in the deck." : 'It is not in this batch — nothing was recorded.'}
+                </span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
@@ -465,6 +525,10 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             onCancelHeavy={deck.cancelHeavy}
             onReTierOpen={depth === 0 ? () => setReTierOpen(true) : undefined}
             onCorrectOpen={depth === 0 ? () => setCorrectOpen(true) : undefined}
+            // Every depth, not just the top: a returned card is usually behind
+            // one or two others when it comes back, and the mark is what makes it
+            // recognisable on the way up the stack.
+            unrecorded={deck.unrecordedIds.has(item.id)}
           />
         ))}
 

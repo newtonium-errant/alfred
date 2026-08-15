@@ -17,6 +17,14 @@ import {
 } from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
 import { ACT_UNCONFIRMED_MESSAGE, isInconclusive } from '../../lib/algernon/actConfirm';
+import {
+  clearAllUnrecorded,
+  clearUnrecorded,
+  readUnrecorded,
+  recordUnrecorded,
+  verdictNoun,
+  type UnrecordedVerdict,
+} from '../../lib/algernon/deckUnrecorded';
 
 // The deck state machine — deliberately DOM-free so the intricate parts (the
 // delayed act, the two-step heavy confirm, snooze, undo, and error routing) are
@@ -32,15 +40,87 @@ import { ACT_UNCONFIRMED_MESSAGE, isInconclusive } from '../../lib/algernon/actC
 // actionId. A HEAVY VERB's FIRST swipe does not commit — either direction — it
 // reveals a confirm-tap showing what that verb will write (D4).
 //
-// Because the card is already dismissed by the time a deferred POST resolves,
-// outcomes surface as a TOAST (benign: stale / timeout — next list poll
-// reconciles truth) or a fatal BANNER (server-config 502/503 — never a logout),
-// not a card flip. A genuine 401 (the BFF's own invalid_session — the transport's
-// wrong-peer 401 is mapped to 502 by the BFF) routes to onAuthExpired.
+// THE CARD COMES BACK WHEN THE VERDICT DOESN'T LAND (the 2026-08-15 incident).
+// The deferral above is deliberate and stays — but it used to mean the advance
+// never consulted the POST at all, so a refused act left the operator's verdict
+// recorded nowhere while the deck sailed past. Five swipes, five 409s, five
+// verdicts gone, and at most ONE toast that named no card. So a definite
+// server refusal now RETURNS the card to the queue and writes the verdict into
+// the unrecorded ledger (`deckUnrecorded`), which names it on screen and
+// survives the deck's own unmount.
+//
+// What is returned and what is not turns on ONE distinction, inherited from #62:
+// did the server ANSWER? A 4xx/5xx is an answer — the verdict definitely did not
+// land, so the card comes back. A timeout or a dropped connection is NOT an
+// answer — the act may well have committed, and handing the card back would
+// invite a second, duplicate verdict on a decision that already stuck. Those keep
+// the reconcile toast and nothing else. A genuine 401 (the BFF's own
+// invalid_session — the transport's wrong-peer 401 is mapped to 502 by the BFF)
+// routes to onAuthExpired; the session is ending and there is no deck to return
+// a card to.
+//
+// Benign/system outcomes still surface as a TOAST (timeout — the next list poll
+// reconciles truth) or a fatal BANNER (server-config 502/503 — never a logout).
+// A returned card does NOT toast: the toast is what failed the operator here
+// (one line, no name, replaced by the next one), and the notice that names the
+// card is what replaces it.
 
 export interface DeckToast {
   message: string;
   canUndo: boolean;
+}
+
+/** The status the store answers when an act arrives after the item was decided. */
+const STATUS_ALREADY_ACTED = 'already_acted';
+
+/**
+ * A server-config failure the operator can do nothing about.
+ *
+ * One local owner for the ladder that was written inline. The same five terms
+ * are ALSO spelled out twice in `useFeedBoard`; consolidating across files is a
+ * separate lane, but this file no longer has two chances to drift from itself.
+ */
+function isFatalTransport(e: ApiError): boolean {
+  return (
+    e.status === 502 ||
+    e.status === 503 ||
+    e.code === 'feed_upstream_unavailable' ||
+    e.code === 'transport_unreachable' ||
+    e.code === 'not_configured'
+  );
+}
+
+/**
+ * What KIND of failure this was — and, decisively, whether the server answered.
+ *
+ * `refused` is the one that returns a card: the server heard us and said no, so
+ * the verdict is definitely unrecorded. `inconclusive` deliberately does NOT
+ * return one (see the header) — that is #62's rule, and inverting it here would
+ * turn "we never heard back" into a duplicate act on a decision that landed.
+ */
+type ActFailure = 'auth' | 'fatal' | 'inconclusive' | 'refused' | 'unknown';
+
+function classifyActFailure(e: unknown): ActFailure {
+  if (!(e instanceof ApiError)) return 'unknown';
+  if (e.status === 401) return 'auth';
+  if (isFatalTransport(e)) return 'fatal';
+  if (isInconclusive(e)) return 'inconclusive';
+  return 'refused';
+}
+
+/**
+ * The operator-facing reason a verdict did not stick.
+ *
+ * The server's OWN words first (`detail` — the resolver's message, e.g. "aged
+ * out of the last batch"), then its error code, then a last-resort line. On the
+ * throw path `detail` is the only part of the `FeedActResult` that survives:
+ * `http.ts` builds `ApiError` from `{error, detail}`, so a transport 409 whose
+ * body is an ActResult arrives with `code === 'request_failed'` and its machine
+ * `status` dropped. Reaching for `code` before `detail` would therefore print
+ * "request_failed" at the operator in the single commonest case there is.
+ */
+function refusalReason(e: ApiError): string {
+  return e.detail || e.code || 'the server refused it';
 }
 
 /**
@@ -98,6 +178,19 @@ export interface UseDeckResult {
   confirmingVerdict: 'affirm' | 'reject' | null;
   toast: DeckToast | null;
   banner: string | null;
+  /**
+   * Every verdict the server refused and has not been settled since — oldest
+   * first, ACCUMULATED rather than replaced.
+   *
+   * A burst is the normal shape of this failure (one dead classifier batch
+   * refuses every card in it), and the toast this replaces could show exactly
+   * one of them. Five refusals must read as five.
+   */
+  unrecorded: UnrecordedVerdict[];
+  /** The ids in `unrecorded` — the cards that carry the verdict-unrecorded mark. */
+  unrecordedIds: Set<string>;
+  /** The operator has read the list: clear it (the cards stay in the deck). */
+  acknowledgeUnrecorded: () => void;
   cleared: boolean;
   affirm: () => void;
   reject: () => void;
@@ -144,8 +237,11 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   // The this-session snoozed cards, RETAINED (not just counted) so the snoozed
   // drill-down can list them (title + kind) + deal them back. undo un-snoozes the last.
   const [snoozed, setSnoozed] = useState<FeedItem[]>([]);
-  // Cards dealt back from the snoozed view — re-appended to the tail of the deck queue
-  // so an un-snoozed card re-enters the deck immediately without disturbing the index.
+  // Cards re-entering the deck behind the cursor — re-appended to the tail of the queue
+  // so one becomes dealable immediately without disturbing the index. TWO sources, and
+  // they share the mechanism because they are the same question: a card dealt back from
+  // the snoozed drill (`dealNow`), and a card whose verdict the server refused
+  // (`returnCard`). The `__deckKey` prefix says which.
   const [readded, setReadded] = useState<FeedItem[]>([]);
   // The re-tier action_id in flight for the current email card (#28), or null. Unlike a
   // swipe (optimistic advance + deferred POST), a re-tier AWAITS the act and only flips
@@ -156,10 +252,31 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   // the server before the card leaves, because the server is the only thing that
   // knows whether the pick was a real routine item.
   const [correcting, setCorrecting] = useState<string | null>(null);
+  // The unrecorded-verdict ledger, mirrored from `deckUnrecorded` storage. The
+  // STORE is the source of truth (it is what survives unmount and tab close);
+  // this is the render copy.
+  const [unrecorded, setUnrecorded] = useState<UnrecordedVerdict[]>([]);
+
+  // Hydrate the ledger on mount — NOT as lazy `useState(readUnrecorded)`, which
+  // would read storage during the first client render and disagree with the
+  // server's HTML (no notice) that React is hydrating against. An effect runs
+  // after that reconciliation, so the notice appears without a mismatch.
+  //
+  // This is also the SECOND HALF of the unmount path: a failure whose answer
+  // arrived when there was no deck left wrote itself to storage from a dead
+  // closure, and this is where it comes back into view.
+  useEffect(() => {
+    const stored = readUnrecorded();
+    if (stored.length > 0) setUnrecorded(stored);
+  }, []);
 
   const pendingRef = useRef<Pending | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const readdSeqRef = useRef(0);
+  // The ledger as of this render, readable from an async outcome handler without
+  // making it a dependency (which would re-create the dispatcher on every debt).
+  const unrecordedRef = useRef(unrecorded);
+  unrecordedRef.current = unrecorded;
 
   const clearTimer = () => {
     if (timerRef.current !== null) {
@@ -168,54 +285,166 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     }
   };
 
+  // The IMMEDIATE paths' error routing (dealNow's un-snooze, and the awaited
+  // re-tier / correct). Unchanged in behaviour: those callers still have their
+  // card in front of them, so a toast is attributable there in the way it is
+  // not for a deferred act.
   const routeError = useCallback(
     (e: unknown) => {
-      if (e instanceof ApiError) {
-        if (e.status === 401) {
+      switch (classifyActFailure(e)) {
+        case 'auth':
           onAuthExpired?.();
           return;
-        }
-        if (e.status === 409 || e.code === 'stale_item') {
-          setToast({ message: "That one had already moved on — it'll resurface at the next sync.", canUndo: false });
-          return;
-        }
-        if (e.status === 502 || e.status === 503 || e.code === 'feed_upstream_unavailable' || e.code === 'transport_unreachable' || e.code === 'not_configured') {
+        case 'fatal':
           setBanner("The deck can't reach Algernon right now — this is a server-side issue, not your session.");
           return;
-        }
         // #62: shared predicate, one owner. The act MAY have landed — the deck's
         // own reconciliation is its list poll plus the resume refetch, and the
         // message below is only true because those now actually run.
-        if (isInconclusive(e)) {
+        case 'inconclusive':
           setToast({ message: ACT_UNCONFIRMED_MESSAGE, canUndo: false });
           return;
+        case 'refused': {
+          const err = e as ApiError;
+          if (err.status === 409 || err.code === 'stale_item') {
+            setToast({ message: "That one had already moved on — it'll resurface at the next sync.", canUndo: false });
+            return;
+          }
+          setToast({ message: refusalReason(err), canUndo: false });
+          return;
         }
-        setToast({ message: e.detail || e.code || 'That action failed.', canUndo: false });
-        return;
+        default:
+          setToast({ message: 'That action failed.', canUndo: false });
       }
-      setToast({ message: 'That action failed.', canUndo: false });
     },
     [onAuthExpired],
   );
+
+  // HAND THE CARD BACK. The deferred act for `p` did not land, so the verdict is
+  // unrecorded: ledger it (storage first — see below), and re-enter the card.
+  //
+  // RE-ENTERED AT THE TAIL, not at the index it left from. The failure arrives
+  // while a LATER card is under the operator's thumb — that is the whole shape of
+  // the deferral — and materialising a card at the cursor would put a different
+  // card under a gesture already in motion. That is the same class of harm this
+  // lane exists to fix: a verdict landing somewhere the operator did not aim it.
+  // The tail is the audited mechanism `dealNow` already uses for re-entry.
+  //
+  // The ledger write comes FIRST and is a plain storage call, so it works
+  // identically from a live render and from the unmount closure, where the
+  // setState calls below are no-ops and there is no component left to tell.
+  const returnCard = useCallback(
+    (p: Pending, reason: string) => {
+      const ledger = recordUnrecorded({
+        id: p.item.id,
+        title: p.item.title,
+        verdict: p.verdict,
+        actionId: p.actionId ?? '',
+        reason,
+        at: Date.now(),
+      });
+      setUnrecorded(ledger);
+      // A defer that did not land is not a defer. Undo the session set-aside AND
+      // the client-side hide-list — `deckSnooze` is applied at the next load, so
+      // leaving it would filter out the very card being handed back, and the
+      // return would survive exactly until the operator reloaded.
+      if (p.restoreSnooze) {
+        setSnoozed((prev) => prev.filter((it) => it.id !== p.item.id));
+        onUnsnoozePersist?.(p.item.id);
+      }
+      const seq = readdSeqRef.current++;
+      setReadded((prev) => [...prev, { ...p.item, __deckKey: `unrecorded-${seq}` } as FeedItem]);
+    },
+    [onUnsnoozePersist],
+  );
+
+  // Fire ONE deferred act and account for its outcome — the accounting the
+  // advance never used to do.
+  //
+  // TWO-ARGUMENT `.then(onOk, onErr)`, deliberately, not `.then().catch()`: with
+  // a trailing catch, a throw from inside the SUCCESS handler would be caught by
+  // the failure handler and hand back a card whose act had actually landed. The
+  // operator would then re-decide a decision that stuck. Splitting the handlers
+  // makes that structurally impossible rather than merely unlikely.
+  const dispatchAct = useCallback(
+    (p: Pending) => {
+      if (p.actionId === null) return; // set-aside → no POST
+      feedApi.act(p.item.id, p.actionId).then(
+        (res) => {
+          if (!res.ok) {
+            // A refusal that arrived on a 2xx. The transport maps every current
+            // ok=false status to a non-2xx, so this is the defensive half of the
+            // same contract rather than a live path — and it is the half that
+            // matters if the server lane ever answers a refusal with a 200,
+            // because `FeedActResult.ok` is what both sides agree on.
+            returnCard(p, res.detail || res.status);
+            return;
+          }
+          if (res.status === STATUS_ALREADY_ACTED) {
+            // ILB: the act was a no-op because the item was already decided.
+            // NAMED, because it lands while another card is on screen — and NOT
+            // returned, because the server's answer would be the same forever.
+            setToast({
+              message: `“${p.item.title}” was already decided — your ${verdictNoun(p.verdict)} didn't change it.`,
+              canUndo: false,
+            });
+            return;
+          }
+          // It landed. Settle any debt this card was carrying from an earlier
+          // refusal — the operator re-gave the verdict and it stuck this time.
+          // Gated on the ref rather than done inside a state updater: clearing
+          // writes to storage, and a state updater is not a place for that.
+          if (unrecordedRef.current.some((u) => u.id === p.item.id)) {
+            setUnrecorded(clearUnrecorded(p.item.id));
+          }
+        },
+        (e) => {
+          // Only a REFUSAL and a FATAL are answers ("no", and "not from here");
+          // both mean the verdict is definitely unrecorded. 'inconclusive' and
+          // 'unknown' are the ABSENCE of an answer and must not be dressed as one.
+          const kind = classifyActFailure(e);
+          if (kind === 'refused') {
+            // No toast. The toast is what failed the operator in the incident —
+            // unnamed, late, and overwritten by the next one — and the notice
+            // that names the card now carries this.
+            returnCard(p, refusalReason(e as ApiError));
+            return;
+          }
+          routeError(e); // auth → expire · fatal → banner · otherwise → toast
+          if (kind === 'fatal') returnCard(p, refusalReason(e as ApiError));
+        },
+      );
+    },
+    [returnCard, routeError],
+  );
+
+  // The unmount path needs the CURRENT dispatcher, but must not re-register the
+  // cleanup on every render (that would fire the pending act on each re-render).
+  // A ref holds the latest; the effect below stays mount-scoped.
+  const dispatchRef = useRef(dispatchAct);
+  dispatchRef.current = dispatchAct;
 
   // Fire the deferred POST for the current pending commit (if any), in order.
   const flushPending = useCallback(() => {
     clearTimer();
     const p = pendingRef.current;
     pendingRef.current = null;
-    if (!p || p.actionId === null) return; // set-aside (or nothing) → no POST
-    feedApi.act(p.item.id, p.actionId).catch(routeError);
-  }, [routeError]);
+    if (!p) return;
+    dispatchAct(p);
+  }, [dispatchAct]);
 
   // Flush on unmount so a pending act isn't silently dropped when leaving /deck.
+  //
+  // This used to end in `.catch(() => {})` — the most complete of the four
+  // silences, because the LAST card of a session always leaves by this door. It
+  // now goes through the same dispatcher: there is no component left to show a
+  // notice, so the ledger write is the whole point, and the next mount reads it.
   useEffect(() => {
     return () => {
       const p = pendingRef.current;
       clearTimer();
       pendingRef.current = null;
-      if (p && p.actionId !== null) {
-        feedApi.act(p.item.id, p.actionId).catch(() => {});
-      }
+      if (p) dispatchRef.current(p);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -488,6 +717,16 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
 
   const dismissToast = useCallback(() => setToast(null), []);
 
+  // The ONE control on the notice. It clears the list AND the marks on the cards,
+  // because a single control that means one thing beats two that the operator has
+  // to tell apart mid-burst — and because a "hide" that kept the ledger would
+  // strand any entry whose card is no longer in the served batch, which is
+  // exactly the entry with no other way to be settled. The cards themselves stay
+  // in the deck either way; acknowledging is reading, not deciding.
+  const acknowledgeUnrecorded = useCallback(() => {
+    setUnrecorded(clearAllUnrecorded());
+  }, []);
+
   const remaining = Math.max(0, queue.length - index);
   const upcoming = queue.slice(index + 1, index + 3);
   const ahead = queue.slice(index + 1);
@@ -504,6 +743,9 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     confirmingVerdict: confirming?.verdict ?? null,
     toast,
     banner,
+    unrecorded,
+    unrecordedIds: new Set(unrecorded.map((u) => u.id)),
+    acknowledgeUnrecorded,
     cleared,
     affirm,
     reject,
