@@ -194,6 +194,28 @@ class TestIgnore:
         contacts.load()
         assert contacts.adopted_for(USER) == {}
 
+    def test_it_records_IGNORE_as_the_verb_not_merely_a_verb(self, tmp_path):
+        """VERB FIDELITY, which the site pin above cannot reach.
+
+        ``TestAdopt.test_it_flips_the_card_with_the_verb_recorded`` proves the
+        stamp EXISTS — revert `action=action_id` in `_dispatch_contact_pattern`
+        and it reds. What no pin covered is that the stamp is the verb the
+        operator actually used: substituting the CONSTANT `PATTERN_ADOPT` for
+        `action_id` there passes 1001 tests, so an `ignore` recorded as `adopt`
+        was invisible. Both verbs flow through that one line, so only the second
+        verb can catch a constant.
+
+        Measured, not supposed — that substitution was run before this was
+        written. Same reasoning as `test_a_different_verb_records_differently`
+        on the `_act_locked` site; this is its missing sibling.
+        """
+        store, feed_id = _seed(tmp_path)
+        _call(store, _cfg(_instance_config(tmp_path)), feed_id, PATTERN_IGNORE)
+        item = store.load()[feed_id]
+        assert item.state == "acted"
+        assert item.acted_action == PATTERN_IGNORE
+        assert item.acted_action != PATTERN_ADOPT
+
 
 # ---------------------------------------------------------------------------
 # Refusals

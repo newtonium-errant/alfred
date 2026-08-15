@@ -590,7 +590,24 @@ def compute_auto_t1_candidates(
             continue
 
         reason: str | None = None
-        if due == today_local:
+        if due < today_local:
+            # OVERDUE RETENTION — the asymmetry this closes. Every other
+            # branch below asks "is the deadline near?", and a deadline in
+            # the PAST answers no to all of them: not today, not tomorrow,
+            # and ``2 <= days_to_due`` is false for a negative number. So an
+            # open task fell to ``reason = None`` and vanished from the
+            # producer THE DAY AFTER its due date — it surfaced while there
+            # was still time to do it, then went quiet once it was late.
+            #
+            # The routine branch has had this retention since Phase 2C C1
+            # (``classify_routine_item`` via ``overdue_effective_due``);
+            # tasks were the half that never got it. Same shape, minus the
+            # cycle-completion clause, which is routine-only.
+            #
+            # Made "Submit Documents to Clutch" (accepted, never done)
+            # invisible, and set up the Pete Tong auto-retirement.
+            reason = f"overdue by {(today_local - due).days}d"
+        elif due == today_local:
             reason = "due today"
         elif due == tomorrow_local:
             reason = "due tomorrow"

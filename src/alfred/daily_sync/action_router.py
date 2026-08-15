@@ -2226,6 +2226,16 @@ def _act_locked(
         )
         return ActResult(False, STATUS_ERROR, err, feed_item_id, action_id)
 
-    feed_store.set_state(feed_item_id, STATE_ACTED)
+    # Stamp the VERB the operator actually used. Before this, a resolver
+    # success appended a verbless ``acted`` event — byte-identical to the one
+    # ``reconcile`` writes when an item merely falls out of a producer's open
+    # set. So "the operator confirmed this" and "this was auto-retired" were
+    # the same line in the log, and the day's history could not distinguish
+    # them. ``set_state`` has carried the optional ``action`` since the
+    # snooze verb; this is the general path finally passing it.
+    #
+    # FORWARD ONLY, and that is the point: events already on disk stay
+    # verbless and stay ambiguous. The record becomes auditable from here.
+    feed_store.set_state(feed_item_id, STATE_ACTED, action=action_id)
     log.info("feed.act.acted", id=feed_item_id, kind=kind, action=action_id)
     return ActResult(True, STATUS_ACTED, detail, feed_item_id, action_id)

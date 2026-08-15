@@ -11,6 +11,7 @@ from .belt import try_feed_reconcile
 from .config import FeedConfig, load_from_unified
 from .emit import FeedEmitHandle
 from .model import (
+    ACTION_RETIRED,
     ATTENTION_FYI,
     ATTENTION_NEEDS_YOU,
     KIND_DEFAULTS,
@@ -28,6 +29,7 @@ from .model import (
 from .store import DEFAULT_COMPACT_THRESHOLD_BYTES, FeedStore
 
 __all__ = [
+    "ACTION_RETIRED",
     "ATTENTION_FYI",
     "ATTENTION_NEEDS_YOU",
     "DEFAULT_COMPACT_THRESHOLD_BYTES",

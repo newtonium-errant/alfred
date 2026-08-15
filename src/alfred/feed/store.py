@@ -27,6 +27,7 @@ import structlog
 from alfred.common.file_lock import file_rmw_lock
 
 from .model import (
+    ACTION_RETIRED,
     STATE_ACKED,
     STATE_ACTED,
     STATE_DEFERRED,
@@ -346,8 +347,46 @@ class FeedStore:
                     {"ev": "upsert", "ts": ts,
                      "item": self._episode_merged_payload(item, current)}
                 )
+            # THE WOULD-RETIRE-EVERYTHING TRIPWIRE. A producer that returns an
+            # empty open set while the store holds open items retires ALL of
+            # them, and today that happens in total silence — the same silence
+            # whether the operator cleared the deck or the producer broke.
+            # This announces it BEFORE the events are written, so the warning
+            # survives even if the append below raises.
+            #
+            # OBSERVATION ONLY: the reconcile proceeds exactly as it always
+            # has. The refusal half of the circuit breaker awaits the
+            # operator's ratification; shipping the loud half first costs
+            # nothing and means the next occurrence is greppable rather than
+            # reconstructed. Deliberately inside the lock, unlike this
+            # method's other log lines, because "before proceeding" is the
+            # whole point of it.
+            if not open_items and previously_present:
+                log.warning(
+                    "feed.store.reconcile_would_retire_all_open",
+                    kind=kind,
+                    count=len(previously_present),
+                    ids=sorted(previously_present, key=str),
+                    detail=(
+                        "producer returned an EMPTY open set while the store "
+                        "held open items — every one of them is being retired "
+                        "as acted. Semantics unchanged; this is the signal "
+                        "that a producer fault and an emptied deck look "
+                        "identical from here."
+                    ),
+                )
             events.extend(
-                {"ev": "state", "ts": ts, "id": item_id, "state": STATE_ACTED}
+                # ``action`` marks these as RETIREMENTS — acted because the
+                # item left the producer's open set, not because the operator
+                # judged it. Without the verb both outcomes are byte-identical
+                # verbless events and the distinction is unrecoverable from
+                # the log. State is deliberately unchanged: ``acted`` stays
+                # ``acted``, and every current reader compares the verb for
+                # equality against accept/done/snooze, so a fourth value is
+                # inert (see ``ACTION_RETIRED``). Auditability starts the day
+                # this ships and does not reach backwards.
+                {"ev": "state", "ts": ts, "id": item_id,
+                 "state": STATE_ACTED, "action": ACTION_RETIRED}
                 # ``key=str`` because the fold does not coerce types: one item
                 # carrying a non-string id makes a bare sort's own comparison
                 # raise TypeError, and the belt then refuses the whole

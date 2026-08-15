@@ -117,6 +117,26 @@ def snapshot_fingerprint(kind: str, evidence: dict[str, Any] | None) -> str | No
 # into a half-migration.
 KIND_REMINDER_RETURNED = "reminder_returned"
 
+# The verb stamped on a retirement — an item marked ``acted`` by
+# :meth:`FeedStore.reconcile` because it left the producer's open set, NOT
+# because the operator judged it. Until this existed both outcomes appended a
+# byte-identical verbless ``state=acted`` event, so "the operator decided this"
+# and "the producer stopped emitting it" were indistinguishable in the log
+# forever after — which is how an auto-retirement reads as a decision.
+#
+# A NAMED constant for the same reason as the kind above: it is written in
+# ``feed.store`` and read by tests and future auditors outside this package.
+#
+# STATE IS UNCHANGED — ``acted`` stays ``acted``. This distinguishes the two
+# only by VERB, which is forward-compatible with the pending retire-vs-decided
+# ratification and inert until then: every current reader of ``acted_action``
+# (Python and web) compares it for equality against a specific verb
+# (``accept`` / ``done`` / ``snooze``), and NOTHING anywhere tests it for
+# absence — so a fourth verb changes no branch. ``rings.ts`` is the case worth
+# naming: ``acted_action === 'accept' ? 'planned' : 'done'`` sent verbless
+# retirements to ``done`` before and sends ``retired`` to ``done`` now.
+ACTION_RETIRED = "retired"
+
 # Every kind the feed can carry (step-2 contract + brief peer_digest). Kept as a
 # frozenset so producers/tests can assert membership without importing the dict.
 KINDS: frozenset[str] = frozenset({
