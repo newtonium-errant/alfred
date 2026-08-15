@@ -165,6 +165,74 @@ export function canInline(doc: PreparedDoc): boolean {
   return doc.ok === true && doc.format === 'text' && doc.body.length <= MAX_INLINE_DOC_CHARS;
 }
 
+// --- a pasted body ----------------------------------------------------------
+//
+// The design's third door: "attach a document (.md/.txt/.csv/.pdf) OR PASTE A
+// LONG BODY → ingest mode folds out". The system already believed this in two
+// places before it had a surface that could act on it — `schemas.ts` sets the
+// Shortcuts cap because "a voice capture is short; a whole-document paste
+// belongs on ingest/submit", and `turnOverLimitMessage` below already offers
+// "file the attached text to the vault instead of quoting it" to an operator
+// whose only way of taking that advice was to leave and find another page.
+
+/**
+ * Whether a pasted body is long enough to be offered the ingest door.
+ *
+ * NO NEW NUMBER, deliberately. This is `MAX_INLINE_DOC_CHARS` — the length at
+ * which a FILE's body stops being quotable into a turn — asked of unnamed text.
+ * A pasted body and an uploaded .txt are the same bytes bound for the same two
+ * doors, so the length at which one stops being a message is the length at
+ * which the other does. Two constants here would eventually disagree about the
+ * same paragraph: the same file uploaded would be offered filing while pasted
+ * it would not, which is the kind of difference an operator experiences as the
+ * surface being arbitrary. `tests/composerFanout.test.ts` pins the agreement
+ * against `canInline` rather than against the value, so drift on either side
+ * reds rather than only drift here.
+ *
+ * The threshold is where the OFFER appears, never where a refusal does — the
+ * paste stays in the box and the operator decides. Above `MAX_MESSAGE_CHARS`
+ * the send would be refused outright by `composeTurnMessage`, so up there this
+ * offer is the remedy for a refusal rather than a choice between two goods.
+ */
+export function pasteWantsIngest(text: string): boolean {
+  return text.length > MAX_INLINE_DOC_CHARS;
+}
+
+/**
+ * The name a pasted body wears once it becomes an attachment.
+ *
+ * `.md` because `prepareUpload` passes markdown through VERBATIM — a paste is
+ * whatever the operator copied and must not be reshaped. (`.csv` would get
+ * fenced, which would be a guess about content that arrived without a name.)
+ * The extension is stripped for the chip's title, so the operator sees "Pasted
+ * text" in a field they can edit before it is written.
+ */
+export const PASTED_TEXT_FILENAME = 'Pasted text.md';
+
+/**
+ * A pasted body as a `File`, so it enters the EXISTING document path.
+ *
+ * Synthesising the file rather than adding a parallel paste pipeline is what
+ * buys the ingest character ceiling, the empty-body refusal, the chip, the
+ * title/source/type fields and the whole fanout without one new branch in any
+ * of them — a paste becomes a document by BEING one. It also means every pin
+ * those paths already carry covers this door too.
+ */
+export function fileFromPastedText(text: string): File {
+  return new File([text], PASTED_TEXT_FILENAME, { type: 'text/markdown' });
+}
+
+/**
+ * The offer, naming the length and what filing would do with it.
+ *
+ * States the CAP as well as the count: an operator who has just pasted a report
+ * is being told a fact about this surface, and "longer than a message can
+ * carry" without the number is the kind of vague refusal that teaches nothing.
+ */
+export function pasteIngestOfferMessage(chars: number): string {
+  return `That paste is ${chars.toLocaleString()} characters — longer than the ${MAX_INLINE_DOC_CHARS.toLocaleString()} a message can carry. File it to the vault as a document instead, and this message can ask about it.`;
+}
+
 /** How many paths the filed-record line names before it summarises. */
 export const FILED_CONTEXT_MAX_PATHS = 10;
 

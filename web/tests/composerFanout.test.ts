@@ -2,13 +2,17 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   FILED_CONTEXT_MAX_PATHS,
   MAX_INLINE_DOC_CHARS,
+  PASTED_TEXT_FILENAME,
   buildFiledContextLine,
   canInline,
   composeTurnMessage,
+  fileFromPastedText,
   ingestPayloadFor,
   ingestSuccessMessage,
   inlineDocBlock,
   inlineTooLongMessage,
+  pasteIngestOfferMessage,
+  pasteWantsIngest,
   prepareDoc,
   preparedFromTranscript,
   runFanout,
@@ -16,6 +20,7 @@ import {
   type FanoutJob,
   type PreparedTextDoc,
 } from '../lib/algernon/composerFanout';
+import { classifyAttachment } from '../lib/algernon/composerRouting';
 import { MAX_MESSAGE_CHARS } from '../lib/algernon/schemas';
 import { ApiError } from '../lib/algernon/http';
 import type { IngestSubmitResponse } from '../lib/algernon/types';
@@ -387,5 +392,70 @@ describe('ingestPayloadFor', () => {
     expect(payload.body_b64).toBe('JVBERg==');
     expect('body' in payload).toBe(false);
     expect(payload.record_type).toBe('source');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A pasted body — the design's third door in
+// ---------------------------------------------------------------------------
+
+describe('a long paste is offered the ingest door', () => {
+  it('offers at exactly the length a FILE stops being quotable — and not below it', () => {
+    // The pair IS the pin: a body one character under the line is a message,
+    // one character over it is a document. Asserting only the second would pass
+    // against a build that offered the door to every paste.
+    expect(pasteWantsIngest('x'.repeat(MAX_INLINE_DOC_CHARS))).toBe(false);
+    expect(pasteWantsIngest('x'.repeat(MAX_INLINE_DOC_CHARS + 1))).toBe(true);
+  });
+
+  it('agrees with canInline about the same body — the DRIFT pin', () => {
+    // Pinned as a RELATIONSHIP, not a number. A paste and an uploaded .txt are
+    // the same bytes bound for the same two doors, so the length at which one
+    // stops being a message must be the length at which the other does. If
+    // either side is ever given its own constant, this reds — which a pin
+    // written against 7000 would not.
+    for (const len of [0, 1, 500, MAX_INLINE_DOC_CHARS - 1, MAX_INLINE_DOC_CHARS, MAX_INLINE_DOC_CHARS + 1, MAX_INLINE_DOC_CHARS * 2]) {
+      const body = 'x'.repeat(len);
+      expect(pasteWantsIngest(body)).toBe(!canInline({ ok: true, format: 'text', body, note: null }));
+    }
+  });
+
+  it('an empty or ordinary paste is left alone', () => {
+    expect(pasteWantsIngest('')).toBe(false);
+    expect(pasteWantsIngest('two down, one to go')).toBe(false);
+  });
+
+  it('the offer names the count AND the cap', () => {
+    const msg = pasteIngestOfferMessage(12345);
+    expect(msg).toContain('12,345');
+    expect(msg).toContain(MAX_INLINE_DOC_CHARS.toLocaleString());
+    // The remedy, not just the refusal — and it says the message survives.
+    expect(msg).toContain('vault');
+    expect(msg).toContain('ask about it');
+  });
+
+  it('the synthesised file is one the CLASSIFIER accepts as a document', () => {
+    // The paste enters the existing document path by BEING a document. If the
+    // filename ever changes to something `classifyAttachment` does not take,
+    // the chip would be built for a file the picker would have rejected.
+    const file = fileFromPastedText('body text');
+    expect(file.name).toBe(PASTED_TEXT_FILENAME);
+    expect(classifyAttachment(file)).toBe('doc');
+  });
+
+  it('the synthesised file carries the pasted bytes VERBATIM', async () => {
+    // Markdown is passed through unreshaped by `prepareUpload` — a paste must
+    // arrive in the vault as what was copied, not as something fenced or
+    // trimmed on a guess about content that arrived without a name.
+    const body = '# Notes\n\n- one, two\n- "quoted", ```fenced```\n';
+    const prepared = await prepareDoc(fileFromPastedText(body));
+    expect(prepared.ok).toBe(true);
+    expect(prepared.ok === true && prepared.format === 'text' && prepared.body).toBe(body);
+  });
+
+  it('a whitespace-only paste is refused by the existing empty-body gate', () => {
+    // Not a new refusal: the synthesised file rides `prepareUpload`, so the
+    // paste door inherits the ingest door's gates rather than restating them.
+    expect(pasteWantsIngest(' '.repeat(MAX_INLINE_DOC_CHARS + 1))).toBe(true);
   });
 });
