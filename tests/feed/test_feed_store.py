@@ -692,3 +692,32 @@ def test_tripwire_silent_when_there_was_nothing_open(tmp_path: Path) -> None:
         c for c in captured
         if c.get("event") == "feed.store.reconcile_would_retire_all_open"
     ] == []
+
+
+def test_tripwire_fires_once_per_episode_not_every_sweep(tmp_path: Path) -> None:
+    """THE PROPERTY THAT MAKES IT USEFUL RATHER THAN NOISE, pinned rather than
+    merely asserted in a comment two tests up.
+
+    A producer that stays broken reconciles empty on every sweep. If the
+    tripwire fired each time, it would be a warning every few minutes forever —
+    which is the failure mode that trains an operator to ignore it, i.e. the
+    same as not having it.
+
+    It is self-limiting by construction: ``previously_present`` filters to
+    OPEN/DEFERRED, so once the first empty reconcile has retired everything to
+    ACTED, the second finds nothing present and says nothing. The mutation that
+    reds this is widening that filter to include acted items."""
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1"), _item("proposal", "c2")])
+
+    with structlog.testing.capture_logs() as first:
+        s.reconcile("proposal", [])
+    with structlog.testing.capture_logs() as second:
+        s.reconcile("proposal", [])
+    with structlog.testing.capture_logs() as third:
+        s.reconcile("proposal", [])
+
+    ev = "feed.store.reconcile_would_retire_all_open"
+    assert len([c for c in first if c.get("event") == ev]) == 1
+    assert [c for c in second if c.get("event") == ev] == []
+    assert [c for c in third if c.get("event") == ev] == []
