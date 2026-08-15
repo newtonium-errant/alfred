@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 
@@ -32,6 +33,7 @@ import { SlotBoard } from '../components/feed/SlotBoard';
 import { useRingCompletion } from '../components/feed/useRingCompletion';
 import { UNDO_MS } from '../lib/algernon/feedConstants';
 import { ApiError } from '../lib/algernon/http';
+import { SESSION_EXPIRED_REASON } from '../lib/algernon/actConfirm';
 import { BOARD_UNRECORDED_KEY, readBoardUnrecorded } from '../lib/algernon/boardUnrecorded';
 import { DECK_UNRECORDED_KEY, readUnrecorded } from '../lib/algernon/deckUnrecorded';
 import type { FeedItem } from '../lib/algernon/feed';
@@ -81,11 +83,33 @@ function staleItem409(): ApiError {
   return new ApiError(409, 'request_failed', 'aged out of the last batch');
 }
 
-// The one completion instance the home page owns, so the board under test
-// behaves exactly as it does on home.
-function Harness({ items, now = NOW }: { items: FeedItem[] | null; now?: Date }) {
-  const completion = useRingCompletion({});
-  return <SlotBoard items={items} completion={completion} now={now} />;
+/**
+ * The board as home actually mounts it.
+ *
+ * Two things here are the PAGE's job, not the board's, and both are load-bearing
+ * for the durability pin below. The page owns the ONE completion instance, and
+ * the page — not `SlotBoard` — runs `completion.reconcile(items)` on every feed
+ * render (`pages/index.tsx`, the effect keyed on `items`). `SlotBoard` runs only
+ * `grace.reconcile`. A harness that omitted the page's half would drive a poll
+ * that supersedes nothing, and a "it survives the poll" pin standing on it would
+ * be prose asserting a property its own fixture never exercises — the exact
+ * shape this lane exists to stop shipping.
+ */
+function Harness({
+  items,
+  now = NOW,
+  onAuthExpired,
+}: {
+  items: FeedItem[] | null;
+  now?: Date;
+  onAuthExpired?: () => void;
+}) {
+  const completion = useRingCompletion({ onAuthExpired });
+  useEffect(() => {
+    if (items) completion.reconcile(items);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items]);
+  return <SlotBoard items={items} completion={completion} now={now} onAuthExpired={onAuthExpired} />;
 }
 
 /**
@@ -225,9 +249,68 @@ describe('the mounted path — it shows in place, and five read as five', () => 
     expect(screen.getByTestId('board-item').getAttribute('data-stage')).not.toBe('done');
     // …it is back in its own stack, tappable again…
     expect(screen.getByTestId('board-today-duty').textContent).toContain('Pay Eastlink');
-    // …and it says what happened, durably.
+    // …and it says what happened, IN PLACE. This test asserts visibility at the
+    // moment of refusal and nothing beyond it: no poll runs here, so it may not
+    // be read as evidence of durability. That claim needs a render to survive,
+    // and it is made — and driven — by the poll pin below.
     expect(screen.getByTestId('board-item-unrecorded')).toBeTruthy();
     expect(screen.getByTestId('board-unrecorded').textContent).toContain('Pay Eastlink');
+  });
+
+  it('the debt SURVIVES the next feed poll, where the transient error line does not', async () => {
+    // THE DURABILITY PIN. The shared hook's `supersede` retires an override once
+    // a render has answered the question it was standing in for — right for a
+    // transient error line, fatal for a debt. That is exactly why the ledger is a
+    // STORE with its own mirror rather than another override, and this drives the
+    // distinction instead of asserting it in prose.
+    //
+    // THE CONTRAST NEEDS TWO ROWS, because on ONE row these two never coexist:
+    // `SlotBoard` deliberately suppresses the error line on a ledgered row (one
+    // statement of a failure, and the durable one wins). So the transient half is
+    // shown on a row whose failure was NOT an answer — a plain throw, which is
+    // 'unknown' and correctly ledgers nothing. That row is also the positive
+    // control: it proves the poll genuinely supersedes, so "the debt survived"
+    // means the ledger resisted a live supersession rather than that nothing
+    // happened.
+    //
+    // It holds by construction today. The pin exists for the change that would
+    // break it: any future move of the `unrecorded` mirror under supersede's
+    // reach, or a reconcile that "tidies up" the ledger alongside the overrides.
+    vi.useFakeTimers();
+    mockAct
+      .mockRejectedValueOnce(new Error('boom')) // row a — not an answer, not a debt
+      .mockRejectedValueOnce(staleItem409()); // row b — an answer, a debt
+    const items = () => [
+      slot({ id: 'a', title: 'Card a' }, { slot: 'duty' }),
+      slot({ id: 'b', title: 'Pay Eastlink' }, { slot: 'rhythm' }),
+    ];
+    const { rerender } = render(<Harness items={items()} />);
+
+    for (const btn of screen.getAllByTestId('board-complete')) fireEvent.click(btn);
+    await act(async () => { vi.advanceTimersByTime(UNDO_MS); });
+    await settle();
+
+    // At the moment of refusal: a transient line on a, a debt on b.
+    expect(screen.getByTestId('board-item-error')).toBeTruthy();
+    expect(readBoardUnrecorded().map((u) => u.id)).toEqual(['b']);
+    expect(screen.getByTestId('board-unrecorded')).toBeTruthy();
+
+    // The next feed render lands — a NEW array, which is what drives both
+    // reconcile effects (the page's, over the completion overrides; the board's,
+    // over its own optimistic flags). Both rows come back still open, because
+    // they are: neither ✓ was recorded.
+    await act(async () => {
+      rerender(<Harness items={items()} />);
+    });
+    await settle();
+
+    // The transient line is GONE — superseded, correctly, by server truth…
+    expect(screen.queryByTestId('board-item-error')).toBeNull();
+    // …and the debt is still here, named, with the server's own words.
+    expect(screen.getByTestId('board-unrecorded').textContent).toContain('Pay Eastlink');
+    expect(screen.getByTestId('board-unrecorded').textContent).toContain('aged out of the last batch');
+    expect(screen.getByTestId('board-item-unrecorded')).toBeTruthy();
+    expect(readBoardUnrecorded().map((u) => u.id)).toEqual(['b']);
   });
 
   it('a burst renders one notice row per refused ✓, not one line total', async () => {
@@ -355,6 +438,66 @@ describe('the boundary — a debt is an ANSWER, never the absence of one', () =>
     // No server words to quote, so the row states what was OBSERVED rather than
     // inventing a server voice for it.
     expect(stored[0].reason).toBe('the server still shows it open');
+  });
+
+  it('a 401 on the held write is a debt, and says the session expired', async () => {
+    // THE DIVERGENCE FROM THE DECK, PINNED. The deck does not hand a CARD back
+    // on auth — there is no deck left to hand it to — and this lane read that as
+    // a rule about card affordance rather than about whether the debt exists. A
+    // 401 IS an answer: the request was rejected before it reached the store, so
+    // the ✓ definitely did not land.
+    //
+    // It is also the case where the operator is guaranteed to be interrupted
+    // (they are being logged out mid-tap) and least likely to remember what they
+    // had just marked — so it is the debt with the strongest claim on being
+    // written down, not the weakest.
+    vi.useFakeTimers();
+    const onAuthExpired = vi.fn();
+    mockAct.mockRejectedValue(new ApiError(401, 'invalid_session'));
+    render(<Harness items={[slot({ id: 'r', title: 'Pay Eastlink' })]} onAuthExpired={onAuthExpired} />);
+
+    fireEvent.click(screen.getByTestId('board-complete'));
+    await act(async () => { vi.advanceTimersByTime(UNDO_MS); });
+    await settle();
+
+    // The existing 401 routing is untouched — the session still expires.
+    expect(onAuthExpired).toHaveBeenCalledTimes(1);
+    // EXACTLY ONE debt, and it says the true thing rather than 'invalid_session'.
+    const stored = readBoardUnrecorded();
+    expect(stored).toHaveLength(1);
+    expect(stored[0].id).toBe('r');
+    expect(stored[0].reason).toBe(SESSION_EXPIRED_REASON);
+    expect(screen.getByTestId('board-unrecorded').textContent).toContain('your session expired before it was sent');
+  });
+
+  it('re-marking the row after re-login settles the 401 debt', async () => {
+    // The other half: a debt the operator can never discharge is a nag, not a
+    // ledger. The re-login is a fresh mount — which is also the only path by
+    // which this particular debt can ever be seen, since the 401 unmounts the
+    // page it was incurred on.
+    vi.useFakeTimers();
+    mockAct.mockRejectedValueOnce(new ApiError(401, 'invalid_session'));
+    const first = render(<Harness items={[slot({ id: 'r', title: 'Pay Eastlink' })]} onAuthExpired={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('board-complete'));
+    await act(async () => { vi.advanceTimersByTime(UNDO_MS); });
+    await settle();
+    expect(readBoardUnrecorded()).toHaveLength(1);
+    first.unmount();
+
+    // …re-login: a fresh board, and the debt is waiting on it.
+    mockAct.mockResolvedValue({ ok: true, status: 'acted' });
+    render(<Harness items={[slot({ id: 'r', title: 'Pay Eastlink' })]} />);
+    await settle();
+    expect(screen.getByTestId('board-unrecorded').textContent).toContain('Pay Eastlink');
+
+    // Mark it again; this time it lands.
+    fireEvent.click(screen.getByTestId('board-complete'));
+    await act(async () => { vi.advanceTimersByTime(UNDO_MS); });
+    await settle();
+
+    expect(readBoardUnrecorded()).toHaveLength(0);
+    expect(screen.queryByTestId('board-unrecorded')).toBeNull();
+    expect(screen.queryByTestId('board-item-unrecorded')).toBeNull();
   });
 
   it('re-marking a row settles the debt it was carrying', async () => {
