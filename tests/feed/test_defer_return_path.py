@@ -39,11 +39,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
+import structlog
 
 from alfred.daily_sync import feed_producer
 from alfred.daily_sync.action_router import (
@@ -56,7 +58,8 @@ from alfred.daily_sync.action_router import (
 )
 from alfred.daily_sync.config import DailySyncConfig
 from alfred.feed import FeedItem, FeedStore
-from alfred.feed.model import STATE_OPEN
+from alfred.feed.model import STATE_ACTED, STATE_DEFERRED, STATE_OPEN
+from alfred.curator import urgent_feed
 from alfred.transport import returns_feed
 
 
@@ -173,6 +176,11 @@ def verify_declaration(kind: str, module_path: str) -> str | None:
         if kind not in found:
             return f"{kind!r} is not reconciled in {module_path} (found {sorted(found)})"
         return None
+    if module_path == "alfred.curator.urgent_feed":
+        found, _unresolved = _reconciled_kinds_by_ast(urgent_feed)
+        if kind not in found:
+            return f"{kind!r} is not reconciled in {module_path} (found {sorted(found)})"
+        return None
     if module_path == "alfred.brief.daemon":
         if kind not in _brief_section_kinds():
             return f"{kind!r} is not a brief section feed_kind"
@@ -280,6 +288,7 @@ class TestTheDeclarationsAreVerifiedNotTrusted:
         assert verify_declaration("weather", "alfred.daily_sync.feed_producer")
         assert verify_declaration("email_tier", "alfred.transport.returns_feed")
         assert verify_declaration("reminder_returned", "alfred.brief.daemon")
+        assert verify_declaration("email_tier", "alfred.curator.urgent_feed")
         # An unwritten verifier is a failure, not a pass.
         assert verify_declaration("email_tier", "alfred.some.new.producer")
 
@@ -297,6 +306,11 @@ class TestTheDeclarationsAreVerifiedNotTrusted:
         producer_found, producer_unresolved = _reconciled_kinds_by_ast(feed_producer)
         assert producer_found == set()
         assert producer_unresolved >= 1
+        # The second per-item producer resolves the same way the first does —
+        # its call site keeps the kind literal precisely so this can read it.
+        urgent_found, urgent_unresolved = _reconciled_kinds_by_ast(urgent_feed)
+        assert urgent_found == {"email_urgent"}, urgent_found
+        assert urgent_unresolved == 0
 
 
 # --- email_urgent: the kind this lane closed ---------------------------------
@@ -312,18 +326,31 @@ def _act(store: FeedStore, tmp_path: Path, feed_id: str, verb: str) -> Any:
     )
 
 
-class TestEmailUrgentIsClosed:
-    def test_it_is_excluded_and_carries_no_defer_verb(self) -> None:
-        assert "email_urgent" in DEFER_EXCLUDED_KINDS
-        assert not any(v in FEED_ACTIONS["email_urgent"] for v in DEFER_ACTIONS)
-        assert set(FEED_ACTIONS["email_urgent"]) == {"ack"}
+class TestEmailUrgentCanNowKeepThePromise:
+    """The DELIBERATE FLIP of this file's previous expectations.
 
-    def test_a_defer_is_refused_and_leaves_the_card_open(self, tmp_path: Path) -> None:
-        """The behavioural close, through the real act path. BEFORE this lane
-        the same call returned ok=True with the item ``acted`` and
-        ``acted_action='ack'`` — the operator said "later" and the system
-        recorded a decision they never made. An honest refusal is the fix
-        available tonight; the reconciler that lets the verb work is boarded."""
+    The pins here asserted the fail-safe close: email_urgent excluded, its
+    defers refused. That close was explicitly not the fix — it withheld a verb
+    because nothing could honour it. The reconciler now exists, so the same
+    tests assert the opposite, and the argument is unchanged in both
+    directions: a kind may carry a defer exactly when something brings it back.
+    """
+
+    def test_it_passes_the_partition_by_DOOR_ONE_not_door_two(self) -> None:
+        """Declared with a VERIFIED return path, not excluded — and the
+        distinction is the whole point of the class pin. Door 2 (exclusion)
+        would also make the partition green while the operator still could not
+        defer an urgent card."""
+        assert "email_urgent" not in DEFER_EXCLUDED_KINDS
+        assert DEFER_RETURN_PATH["email_urgent"] == "alfred.curator.urgent_feed"
+        assert verify_declaration("email_urgent", DEFER_RETURN_PATH["email_urgent"]) is None
+        assert all(v in FEED_ACTIONS["email_urgent"] for v in DEFER_ACTIONS)
+
+    def test_a_defer_is_accepted_and_lands_deferred(self, tmp_path: Path) -> None:
+        """Through the real act path. Two failure modes are excluded at once:
+        the pre-#102 refusal (ok=False) and the defer→ack lie (state=acted,
+        acted_action='ack'), which is what this call did before the verb-gate.
+        """
         store = FeedStore(str(tmp_path / "feed.jsonl"))
         item = FeedItem.create(
             kind="email_urgent", stable_key="note/Urgent.md", instance="salem",
@@ -332,19 +359,111 @@ class TestEmailUrgentIsClosed:
         )
         store.upsert(item)
 
-        for verb in DEFER_ACTIONS:
-            result = _act(store, tmp_path, item.id, verb)
-            assert result.ok is False, verb
-            assert result.status == STATUS_INVALID_ACTION, verb
-            stored = store.load()[item.id]
-            assert stored.state == STATE_OPEN, verb
-            assert stored.acted_action is None, verb
+        result = _act(store, tmp_path, item.id, "defer_3d")
 
-        # Positive control in the same test: the verb it DOES have still works,
-        # so the refusals above are the gate and not a dead act path.
-        ok = _act(store, tmp_path, item.id, "ack")
-        assert ok.ok is True
-        assert store.load()[item.id].acted_action == "ack"
+        assert result.ok is True
+        stored = store.load()[item.id]
+        assert stored.state == STATE_DEFERRED
+        assert stored.deferred_until
+        assert stored.acted_action is None, "a defer is not a decision"
+
+    def test_the_sweep_returns_it_when_the_window_lapses(self, tmp_path: Path) -> None:
+        """THE PROMISE KEPT — the property that did not exist before this lane.
+
+        Held while the window holds, back in the open set once it lapses. The
+        window is expressed relative to the real clock because ``reconcile``
+        judges it against its own, and a test clock it does not read would pin
+        nothing.
+        """
+        from alfred.curator.urgent_feed import sweep_urgent_cards
+        from alfred.feed import FeedEmitHandle
+
+        handle = FeedEmitHandle(
+            store_path=str(tmp_path / "feed.jsonl"), instance="salem", enabled=True,
+        )
+        store = FeedStore(handle.store_path)
+        item = FeedItem.create(
+            kind="email_urgent", stable_key="note/U.md", instance="salem",
+            title="Urgent email", evidence={"record_path": "note/U.md"},
+        )
+        store.upsert(item)
+        _act(store, tmp_path, item.id, "defer_7d")
+        assert store.load()[item.id].state == STATE_DEFERRED
+
+        with structlog.testing.capture_logs() as captured:
+            sweep_urgent_cards(handle)
+        assert store.load()[item.id].state == STATE_DEFERRED, "still inside the window"
+        assert [c for c in captured if c.get("event") == "feed.store.defer_held"]
+
+        store.defer(item.id, until=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
+        with structlog.testing.capture_logs() as captured:
+            sweep_urgent_cards(handle)
+        assert store.load()[item.id].state == STATE_OPEN, "the window lapsed — it returns"
+        assert [c for c in captured if c.get("event") == "feed.store.defer_returned"]
+
+    def test_the_sweep_never_revives_a_decided_card(self, tmp_path: Path) -> None:
+        """The groundhog guard, inherited from the shared mechanics rather than
+        re-implemented — and pinned HERE too, because a shared helper is exactly
+        where a second consumer stops testing what it depends on."""
+        from alfred.curator.urgent_feed import sweep_urgent_cards
+        from alfred.feed import FeedEmitHandle
+
+        handle = FeedEmitHandle(
+            store_path=str(tmp_path / "feed.jsonl"), instance="salem", enabled=True,
+        )
+        store = FeedStore(handle.store_path)
+        item = FeedItem.create(
+            kind="email_urgent", stable_key="note/Acked.md", instance="salem",
+            title="Urgent email", evidence={"record_path": "note/Acked.md"},
+        )
+        store.upsert(item)
+        _act(store, tmp_path, item.id, "ack")
+        assert store.load()[item.id].state == STATE_ACTED
+
+        for _ in range(3):
+            sweep_urgent_cards(handle)
+
+        assert store.load()[item.id].state == STATE_ACTED
+
+    def test_the_curator_daemon_actually_calls_the_sweep(self) -> None:
+        """THREADING, which is a property of the code that was already there
+        rather than of the code this lane wrote.
+
+        A sweep nothing calls is a return path that exists only in tests: every
+        assertion above stays green while a deferred card never comes back in
+        the field. That is the standing default-None trap in its purest form,
+        and the only place it can be caught is the CALL SITE. Source
+        inspection, brittle by design — a refactor that moves the call must
+        re-establish it or this reds.
+        """
+        from alfred.curator import daemon as curator_daemon
+
+        source = Path(inspect.getfile(curator_daemon)).read_text(encoding="utf-8")
+        calls = [
+            node for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "sweep_urgent_cards"
+        ]
+        assert len(calls) == 1, "expected exactly one sweep call site in the daemon"
+        # …and it is handed the daemon's resolved handle, not a None literal
+        # that would satisfy the call while sweeping nothing.
+        passed = calls[0].args[0]
+        assert isinstance(passed, ast.Name), ast.dump(passed)
+        assert passed.id == "feed_handle"
+        # The cadence guard is the daemon's, not the sweep's: without it the
+        # 5-second poll would fold the whole store every tick.
+        assert "SWEEP_INTERVAL_SECONDS" in source
+
+    def test_the_sweep_is_silent_with_nothing_live(self, tmp_path: Path) -> None:
+        from alfred.curator.urgent_feed import sweep_urgent_cards
+        from alfred.feed import FeedEmitHandle
+
+        handle = FeedEmitHandle(
+            store_path=str(tmp_path / "feed.jsonl"), instance="salem", enabled=True,
+        )
+        assert sweep_urgent_cards(handle) is None
+        assert sweep_urgent_cards(None) is None
 
 
 class TestTheInterceptRefusesIndependently:

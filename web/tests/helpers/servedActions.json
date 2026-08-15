@@ -272,6 +272,27 @@
         "label": "Got it",
         "weight": "light",
         "gesture": "affirm"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
       }
     ],
     "pattern_surfaced": [

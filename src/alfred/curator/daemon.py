@@ -35,6 +35,7 @@ from .config import CuratorConfig
 from .context import build_vault_context, extract_sender_email, gather_sender_context
 from .pipeline import _apply_inbox_preference_filter
 from .state import StateManager
+from .urgent_feed import SWEEP_INTERVAL_SECONDS, sweep_urgent_cards
 from .utils import get_logger
 from .watcher import InboxWatcher
 from .writer import mark_filtered, mark_processed, quarantine
@@ -832,6 +833,12 @@ async def run(
     import time
     last_rescan = time.monotonic()
     rescan_interval = config.watcher.rescan_interval
+    # email_urgent's defer-return sweep. Rides this loop because this daemon
+    # hosts the classifier that emits the kind, but on its OWN interval: the
+    # poll is 5s and a sweep folds the whole feed store, which is a steep price
+    # for a question whose finest answer is a day. Same monotonic shape as the
+    # rescan above it rather than a second pattern for the same idea.
+    last_urgent_sweep = time.monotonic()
     _processing: set[str] = set()  # guard against concurrent processing
 
     try:
@@ -849,6 +856,13 @@ async def run(
             _maybe_emit_daily_filter_summary(config.vault.vault_path)
 
             ready = watcher.collect_ready()
+
+            # email_urgent defer-return sweep, on its own cadence. Belted
+            # inside — it answers None on any fault and can never reach the
+            # inbox processing below it.
+            if time.monotonic() - last_urgent_sweep >= SWEEP_INTERVAL_SECONDS:
+                last_urgent_sweep = time.monotonic()
+                sweep_urgent_cards(feed_handle)
 
             # Periodic full_scan fallback (inotify may not work on all kernels/mounts)
             now = time.monotonic()
