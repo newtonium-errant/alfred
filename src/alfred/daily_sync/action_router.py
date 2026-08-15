@@ -2119,17 +2119,58 @@ def _act_locked(
             feed_store=feed_store, config=config, vault_path=vault_path,
         )
 
-    # Authoritative item from last_batch — re-derived, never ordinal/evidence.
+    # Authoritative item from last_batch — re-derived by id, never by ordinal.
     batch_item = _load_batch_item(kind, feed_item_id, config)
     if batch_item is None:
+        # FALL BACK TO THE CARD'S OWN STAMPED EVIDENCE rather than refuse.
+        #
+        # THE OPERATOR'S VERDICT IS VALID REGARDLESS OF BATCH AGE, and this
+        # branch used to throw it away: on 2026-08-15 he swiped five email
+        # cards and all five 409'd, two spam and three confirm verdicts gone.
+        # Worse than a visible refusal, the next reconcile then records those
+        # cards ``acted`` on the reasoning that absence means "decided
+        # elsewhere" — so a decision he was asked for and REFUSED becomes a
+        # decision on the record.
+        #
+        # This is sound because the evidence IS the batch item: the producer
+        # stamps ``evidence=d`` verbatim from the same dict this resolver
+        # consumes (``daily_sync.feed_producer.build_feed_items``), and
+        # ``FeedStore.reconcile`` re-upserts every still-open card each fire,
+        # refreshing evidence rather than freezing it at first sight. The
+        # precedent is explicit: the slot dispatchers already act on the feed
+        # item's own stamped evidence, ruled "same trust class as last_batch".
+        # The wire cannot reach this — an act carries only an id and a verb.
+        #
+        # NOT a weaker gate. The ``NOT by ordinal`` half of the original rule
+        # is untouched: identity still re-derives through the id. What is
+        # dropped is only the requirement that the batch still be RESIDENT,
+        # which was never what made the act correct.
+        #
+        # Idempotency is unaffected because it never lived here: the
+        # folded-state check above admits only ``open`` items (an applied
+        # verdict has already moved to ``acted``), and ``_per_item_lock``
+        # serializes same-id acts across the executor's threads. Both are
+        # pinned; neither reads ``last_batch``.
+        evidence = dict(getattr(item, "evidence", None) or {})
+        if not evidence:
+            log.info(
+                "feed.act.stale_item", id=feed_item_id, action=action_id,
+                reason="aged_out_of_last_batch_and_no_evidence",
+            )
+            return ActResult(
+                False, STATUS_STALE_ITEM,
+                "this batch has moved on — it'll resurface at the next sync",
+                feed_item_id, action_id,
+            )
+        batch_item = evidence
+        # ILB: the act SUCCEEDED on a path the operator can't see. Without this
+        # line, "resolved from the card" is indistinguishable in the log from
+        # the resident-batch case, and the next quota outage would leave no
+        # trace that the fallback is what carried the day's verdicts.
         log.info(
-            "feed.act.stale_item", id=feed_item_id, action=action_id,
+            "feed.act.resolved_from_evidence",
+            id=feed_item_id, kind=kind, action=action_id,
             reason="aged_out_of_last_batch",
-        )
-        return ActResult(
-            False, STATUS_STALE_ITEM,
-            "this batch has moved on — it'll resurface at the next sync",
-            feed_item_id, action_id,
         )
 
     # #63a attribution contest — intercepted AFTER the authoritative batch item

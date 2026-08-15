@@ -691,8 +691,16 @@ def maybe_smart_route_reply(
 
     message_ids = sorted(_last_batch_message_ids(config))
     if not message_ids:
-        # No batch persisted — nothing to route to. Don't flip the
-        # flag; nothing to flip.
+        # No TELEGRAM thread to route to. Don't flip the flag; nothing to flip.
+        #
+        # This used to read "no batch persisted", which was true while the
+        # batch write was itself gated on ``message_ids``. Since 2026-08-15 it
+        # is not: a batch persists whenever the fire had items, so a batch can
+        # exist with NO ids — a web-only instance (Salem: ``send_batch`` skips
+        # with ``telegram_send_skipped``), or a push that failed. The empty
+        # answer is still correct and for the sharper reason: there is no
+        # Telegram thread a reply could have arrived on. Those fires are acted
+        # through the feed/deck instead.
         return None
 
     # Optimistically flip the flag BEFORE running the dispatcher so a

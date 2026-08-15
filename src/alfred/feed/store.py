@@ -379,6 +379,31 @@ class FeedStore:
                 detail="still inside the defer window — suppressed this fire, will return",
             )
 
+        if absent:
+            # ILB, and the half the belt's ``acted`` COUNT cannot serve: WHICH
+            # cards were retired. Same shape as the two defer logs above, for
+            # the same reason — a card vanishing needs a line that explains it.
+            #
+            # Read the wording carefully, because it is doing real work.
+            # Retirement here means only "the producer stopped emitting this";
+            # the decided-elsewhere reading is an INFERENCE, correct for the
+            # case this was designed for and wrong for at least one other. On
+            # 2026-08-15 five email_tier cards were dealt against a stale
+            # ``last_batch``, the operator's verdicts were all refused, and the
+            # next reconcile would have retired them as ``acted`` — recording
+            # as decided the very decisions the system had just declined to
+            # accept. The act path is fixed; whether an operator-facing decide
+            # kind should retire to a state that does not CLAIM a decision is a
+            # design question left open deliberately, and boarded rather than
+            # answered here. Until then these ids are how that case is found.
+            log.info(
+                "feed.store.retired_absent",
+                kind=kind,
+                count=len(absent),
+                ids=sorted(absent, key=str),
+                detail="absent from the producer's open set this fire — retired",
+            )
+
         return {
             "open": len(open_items),
             "acted": len(absent),
