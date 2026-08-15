@@ -53,6 +53,7 @@ from .config import (
     TransportConfig,
     host_is_loopback,
 )
+from .exceptions import TELEGRAM_UNAVAILABLE_REASON, TelegramUnavailable
 from .state import TransportState
 from .utils import get_logger
 
@@ -61,7 +62,9 @@ log = get_logger(__name__)
 
 # Type alias for the send callable the talker registers. Contract:
 # raises on transport error, returns a list of Telegram message IDs on
-# success. ``dedupe_key`` is passed through so the callable can stamp
+# success — and raises :class:`TelegramUnavailable` when the instance has
+# no bot at all, which is a NON-DELIVERY and never an empty success.
+# ``dedupe_key`` is passed through so the callable can stamp
 # it onto Telegram metadata if useful; today it's ignored at the
 # Telegram layer.
 SendCallable = Callable[
@@ -77,6 +80,12 @@ SendCallable = Callable[
 _KEY_CONFIG = "transport.config"
 _KEY_STATE = "transport.state"
 _KEY_SEND_FN = "transport.send_fn"
+# Whether a Telegram BOT exists on this instance — a bool or a zero-arg
+# predicate, wired by the daemon. Distinct from ``_KEY_SEND_FN``, which
+# only says a callable was registered: on every instance since
+# 2026-08-14/15 a callable IS registered and it has no bot behind it, so
+# /health answered ``telegram_connected: true`` for a dark channel.
+_KEY_TELEGRAM_AVAILABLE = "transport.telegram_available"
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +274,9 @@ async def _handle_send(request: web.Request) -> web.StreamResponse:
     Returns:
         200 {"id": <str>, "status": "scheduled"|"sent", "telegram_message_id": <int?>}
         503 {"reason": "telegram_not_configured"} when no send callable is registered
+        503 {"status": "skipped", "reason": "telegram_unavailable"} when the
+            instance has no Telegram bot — NOTHING was delivered, and no
+            dedupe record is written (see the handler's skip branch)
         400 on schema errors
     """
     try:
@@ -334,6 +346,32 @@ async def _handle_send(request: web.Request) -> web.StreamResponse:
             user_id=user_id,
             text=text,
             dedupe_key=dedupe_key or None,
+        )
+    except TelegramUnavailable as exc:
+        # THE SKIP. Answer "skipped", never "sent", and — the load-bearing
+        # half — record NO dedupe row. A 24h dedupe entry for a message that
+        # was never delivered would suppress the very retry that could
+        # deliver it once the channel came back, which is the original sting
+        # relocated one layer up. Nothing before this point has written to
+        # state, so the early return IS the guarantee.
+        log.warning(
+            "transport.server.send_skipped_no_telegram",
+            user_id=user_id,
+            dedupe_key=dedupe_key,
+            client=request.get("transport_client"),
+            peer=request.get("transport_peer"),
+            reason=TELEGRAM_UNAVAILABLE_REASON,
+            detail="nothing was delivered; no dedupe record written",
+        )
+        return web.json_response(
+            {
+                "id": new_id,
+                "status": "skipped",
+                "delivered": False,
+                "reason": TELEGRAM_UNAVAILABLE_REASON,
+                "detail": str(exc),
+            },
+            status=503,
         )
     except Exception as exc:  # noqa: BLE001 — surface upstream
         log.warning(
@@ -440,6 +478,35 @@ async def _handle_send_batch(request: web.Request) -> web.StreamResponse:
                 dedupe_key=dedupe_key or None,
             )
             all_msg_ids.extend(ids or [])
+    except TelegramUnavailable as exc:
+        # Same rule as the single-send skip: "skipped", never a sent_count,
+        # and NO dedupe row. ``sent_before_skip`` is 0 on a web-only instance
+        # (the condition is fixed for the process lifetime, so the first chunk
+        # raises) — it is reported anyway because a nonzero value would mean a
+        # partially-delivered batch, and a dedupe row would then strand the
+        # undelivered remainder behind an idempotent "duplicate".
+        log.warning(
+            "transport.server.batch_send_skipped_no_telegram",
+            user_id=user_id,
+            dedupe_key=dedupe_key,
+            chunks=len(chunks),
+            sent_before_skip=len(all_msg_ids),
+            client=request.get("transport_client"),
+            peer=request.get("transport_peer"),
+            reason=TELEGRAM_UNAVAILABLE_REASON,
+            detail="nothing was delivered; no dedupe record written",
+        )
+        return web.json_response(
+            {
+                "id": new_id,
+                "status": "skipped",
+                "delivered": False,
+                "reason": TELEGRAM_UNAVAILABLE_REASON,
+                "sent_before_skip": len(all_msg_ids),
+                "detail": str(exc),
+            },
+            status=503,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "transport.server.batch_send_failed",
@@ -518,15 +585,39 @@ async def _handle_health(request: web.Request) -> web.StreamResponse:
         {
           "status": "ok",
           "telegram_connected": <bool>,
+          "telegram_connected_source": "bot" | "send_fn_registered",
+          "send_fn_registered": <bool>,
           "queue_depth": <int>,
           "dead_letter_depth": <int>
         }
+
+    ``telegram_connected`` used to mean "a send callable is registered",
+    which on every instance since 2026-08-14/15 was true of a channel that
+    delivered nothing — the probe most likely to be consulted about exactly
+    this failure was the one asserting it could not happen. It now reports
+    the BOT's existence when the daemon wired that fact, and says which of
+    the two it is via ``telegram_connected_source`` so a reader can tell a
+    measured value from an inferred one. ``send_fn_registered`` is kept as
+    its own field: an unregistered callable is a different fault (503
+    ``telegram_not_configured``) and stayed diagnosable.
     """
     state: TransportState = request.app[_KEY_STATE]
     send_fn = request.app.get(_KEY_SEND_FN)
+    available = request.app.get(_KEY_TELEGRAM_AVAILABLE)
+    if available is None:
+        # Not wired — a test app, or a caller that builds the app directly.
+        # Fall back to the old inference rather than fail the probe, and
+        # label it so nobody reads a guess as a measurement.
+        connected = send_fn is not None
+        source = "send_fn_registered"
+    else:
+        connected = bool(available() if callable(available) else available)
+        source = "bot"
     return web.json_response({
         "status": "ok",
-        "telegram_connected": send_fn is not None,
+        "telegram_connected": connected,
+        "telegram_connected_source": source,
+        "send_fn_registered": send_fn is not None,
         "queue_depth": len(state.pending_queue),
         "dead_letter_depth": len(state.dead_letter),
     })
@@ -663,6 +754,21 @@ def register_send_callable(
     app[_KEY_SEND_FN] = send_fn
 
 
+def register_telegram_available(
+    app: web.Application,
+    available: bool | Callable[[], bool],
+) -> None:
+    """Wire whether this instance actually HAS a Telegram bot.
+
+    Registering a send callable is not evidence of a bot — since
+    2026-08-14/15 every instance registers one over ``app is None``. This
+    is the separate fact /health reports. Must be called before the app
+    starts (aiohttp forbids new keys on a started application);
+    :func:`wire_transport_app` runs well before ``run_server``.
+    """
+    app[_KEY_TELEGRAM_AVAILABLE] = available
+
+
 # ---------------------------------------------------------------------------
 # Centralized wiring — `wire_transport_app`
 # ---------------------------------------------------------------------------
@@ -705,6 +811,7 @@ def wire_transport_app(
     instance_alias: str = "",
     vault_path: Path | None = None,
     send_fn: SendCallable | None = None,
+    telegram_available: bool | Callable[[], bool] | None = None,
     pending_items_aggregate_path: str | Path | None = None,
     pending_items_resolve_callable: _PendingItemsResolveCallable | None = None,
     peer_inbox_callable: _PeerInboxCallable | None = None,
@@ -950,6 +1057,29 @@ def wire_transport_app(
         log.debug(
             "transport.wire_transport_app.send_fn_skipped",
             reason="no send_fn passed (outbound/send will return 503)",
+        )
+
+    if telegram_available is not None:
+        register_telegram_available(app, telegram_available)
+        # At INFO, not DEBUG: on a web-only instance this line is the
+        # startup-time statement that the outbound Telegram leg is dark,
+        # and a startup honesty signal below the production log level is
+        # silence wearing a log statement.
+        log.info(
+            "transport.wire_transport_app.telegram_available_registered",
+            telegram_available=bool(
+                telegram_available()
+                if callable(telegram_available)
+                else telegram_available
+            ),
+        )
+    else:
+        log.info(
+            "transport.wire_transport_app.telegram_available_unwired",
+            detail=(
+                "/health will infer telegram_connected from send_fn "
+                "registration, which is NOT evidence of a bot"
+            ),
         )
 
     if pending_items_aggregate_path is not None:

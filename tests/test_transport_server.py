@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 from aiohttp.test_utils import TestClient, TestServer
 
+from alfred.transport.exceptions import TelegramUnavailable
 from alfred.transport.config import (
     AuthConfig,
     AuthTokenEntry,
@@ -22,7 +24,11 @@ from alfred.transport.config import (
     StateConfig,
     TransportConfig,
 )
-from alfred.transport.server import build_app, register_send_callable
+from alfred.transport.server import (
+    build_app,
+    register_send_callable,
+    register_telegram_available,
+)
 from alfred.transport.state import TransportState
 
 
@@ -790,3 +796,204 @@ async def test_multiple_peer_tokens_each_authenticate_independently(
         },
     )
     assert bad.status == 401
+
+
+# ---------------------------------------------------------------------------
+# PY-A — a skipped send is not a send
+#
+# The send callable raises ``TelegramUnavailable`` when the instance has no
+# bot (every instance since 2026-08-14/15). The server used to see ``[]``
+# instead and answer ``status: "sent"`` with a 24h dedupe row behind it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def dark_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """A wired app whose send callable has no bot behind it."""
+    config = _build_config()
+    state = _build_state(tmp_path)
+
+    async def _dark(user_id: int, text: str, dedupe_key: str | None = None) -> list[int]:
+        raise TelegramUnavailable("no Telegram bot on this instance (web-only)")
+
+    app = build_app(config, state, send_fn=_dark)
+    app["_test_state"] = state
+    tc: TestClient = await aiohttp_client(app)
+    return tc
+
+
+def _auth() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {DUMMY_TRANSPORT_TEST_TOKEN}",
+        "X-Alfred-Client": "scheduler",
+    }
+
+
+async def test_skipped_send_answers_skipped_never_sent(dark_client):  # type: ignore[no-untyped-def]
+    resp = await dark_client.post(
+        "/outbound/send", json={"user_id": 1, "text": "hi"}, headers=_auth(),
+    )
+    assert resp.status == 503
+    body = await resp.json()
+    assert body["status"] == "skipped"
+    assert body["status"] != "sent"
+    assert body["delivered"] is False
+    assert body["reason"] == "telegram_unavailable"
+
+
+async def test_a_live_send_still_answers_sent(client):  # type: ignore[no-untyped-def]
+    """POSITIVE CONTROL for the skip pins above — without it they are equally
+    satisfied by a build whose /outbound/send never delivers anything."""
+    resp = await client.post(
+        "/outbound/send", json={"user_id": 1, "text": "hi"}, headers=_auth(),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"] == "sent"
+    assert body["telegram_message_id"] == 1001
+
+
+async def test_skipped_send_writes_no_dedupe_row(dark_client):  # type: ignore[no-untyped-def]
+    """THE LOAD-BEARING HALF. A dedupe row for an undelivered message
+    suppresses the retry that could deliver it — the original sting moved one
+    layer up. So the second attempt must skip again, not answer "duplicate"."""
+    payload = {"user_id": 1, "text": "hi", "dedupe_key": "same-key"}
+    first = await dark_client.post("/outbound/send", json=payload, headers=_auth())
+    assert (await first.json())["status"] == "skipped"
+    assert dark_client.app["_test_state"].send_log == []
+
+    second = await dark_client.post("/outbound/send", json=payload, headers=_auth())
+    body = await second.json()
+    assert body["status"] == "skipped"
+    assert body["status"] != "duplicate"
+    assert dark_client.app["_test_state"].send_log == []
+
+
+async def test_a_live_send_does_record_and_dedupe(client):  # type: ignore[no-untyped-def]
+    """POSITIVE CONTROL for the no-dedupe pin: the mechanism it asserts is
+    absent must demonstrably be present on the delivering path."""
+    payload = {"user_id": 1, "text": "hi", "dedupe_key": "same-key"}
+    first = await client.post("/outbound/send", json=payload, headers=_auth())
+    assert (await first.json())["status"] == "sent"
+    assert len(client.app["_test_state"].send_log) == 1
+
+    second = await client.post("/outbound/send", json=payload, headers=_auth())
+    assert (await second.json())["status"] == "duplicate"
+    assert len(client.app["_test_state"].send_log) == 1
+
+
+async def test_skipped_batch_answers_skipped_and_records_nothing(dark_client):  # type: ignore[no-untyped-def]
+    resp = await dark_client.post(
+        "/outbound/send_batch",
+        json={"user_id": 1, "chunks": ["a", "b"], "dedupe_key": "brief-2026-08-15"},
+        headers=_auth(),
+    )
+    assert resp.status == 503
+    body = await resp.json()
+    assert body["status"] == "skipped"
+    assert body["delivered"] is False
+    assert body["reason"] == "telegram_unavailable"
+    assert body["sent_before_skip"] == 0
+    assert "sent_count" not in body
+    assert dark_client.app["_test_state"].send_log == []
+
+
+async def test_a_live_batch_still_reports_sent_count(client):  # type: ignore[no-untyped-def]
+    resp = await client.post(
+        "/outbound/send_batch",
+        json={"user_id": 1, "chunks": ["a", "b"]},
+        headers=_auth(),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["sent_count"] == 2
+    assert len(client.app["_test_state"].send_log) == 1
+
+
+async def test_the_skip_is_logged_with_its_reason(dark_client):  # type: ignore[no-untyped-def]
+    with structlog.testing.capture_logs() as captured:
+        await dark_client.post(
+            "/outbound/send",
+            json={"user_id": 7, "text": "hi", "dedupe_key": "k"},
+            headers=_auth(),
+        )
+    matches = [
+        c for c in captured
+        if c.get("event") == "transport.server.send_skipped_no_telegram"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["user_id"] == 7
+    assert matches[0]["dedupe_key"] == "k"
+    assert matches[0]["reason"] == "telegram_unavailable"
+    # And NOT the generic failure line — a dark channel is not a send fault.
+    assert [c for c in captured if c.get("event") == "transport.server.send_failed"] == []
+
+
+async def test_a_real_send_fault_still_answers_502(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """The sibling must survive: a genuine send failure keeps its own status
+    code and event, or this fix trades one blind spot for another."""
+    config = _build_config()
+    state = _build_state(tmp_path)
+
+    async def _boom(user_id: int, text: str, dedupe_key: str | None = None) -> list[int]:
+        raise RuntimeError("429 Too Many Requests")
+
+    tc: TestClient = await aiohttp_client(build_app(config, state, send_fn=_boom))
+    resp = await tc.post(
+        "/outbound/send", json={"user_id": 1, "text": "hi"}, headers=_auth(),
+    )
+    assert resp.status == 502
+    assert (await resp.json())["error"] == "send_failed"
+
+
+# --- /health tells the truth about the bot ---------------------------------
+
+
+async def test_health_reports_the_bot_not_the_registration(
+    aiohttp_client, tmp_path,  # type: ignore[no-untyped-def]
+):
+    """The probe an operator consults about a dark channel used to assert the
+    channel was fine: ``telegram_connected`` meant "a callable is registered",
+    and one always is."""
+    config = _build_config()
+    state = _build_state(tmp_path)
+
+    async def _dark(user_id: int, text: str, dedupe_key: str | None = None) -> list[int]:
+        raise TelegramUnavailable("no bot")
+
+    app = build_app(config, state, send_fn=_dark)
+    register_telegram_available(app, False)
+    tc: TestClient = await aiohttp_client(app)
+
+    body = await (await tc.get("/health")).json()
+    assert body["telegram_connected"] is False
+    assert body["telegram_connected_source"] == "bot"
+    # The registration fact is still available — it is a DIFFERENT fault.
+    assert body["send_fn_registered"] is True
+
+
+async def test_health_reports_connected_when_the_bot_is_there(
+    aiohttp_client, tmp_path,  # type: ignore[no-untyped-def]
+):
+    """POSITIVE CONTROL: the honest field must still be able to say True."""
+    config = _build_config()
+    state = _build_state(tmp_path)
+
+    async def _live(user_id: int, text: str, dedupe_key: str | None = None) -> list[int]:
+        return [1]
+
+    app = build_app(config, state, send_fn=_live)
+    register_telegram_available(app, True)
+    tc: TestClient = await aiohttp_client(app)
+
+    body = await (await tc.get("/health")).json()
+    assert body["telegram_connected"] is True
+    assert body["telegram_connected_source"] == "bot"
+
+
+async def test_health_labels_the_inferred_value_when_unwired(client):  # type: ignore[no-untyped-def]
+    """An app built without the wiring falls back to the old inference — and
+    says so, so nobody reads a guess as a measurement."""
+    body = await (await client.get("/health")).json()
+    assert body["telegram_connected"] is True
+    assert body["telegram_connected_source"] == "send_fn_registered"

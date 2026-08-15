@@ -20,7 +20,10 @@ Callers can override when the detection doesn't match the allowlist.
 
 Retry policy: one retry on 5xx/timeout/ConnectionRefused with
 0.5s → 2s backoff. 4xx never retries (client error — re-sending
-won't help). Every failure path adheres to builder.md's
+won't help), and neither do the terminal 503 reasons in
+``_TERMINAL_503_REASONS`` — a server that ANSWERED "there is no
+Telegram here" will answer the same thing 2.5s later.
+Every failure path adheres to builder.md's
 subprocess-failure-contract shape: a ``response_summary`` field with
 status + truncated body so grep-by-error works.
 """
@@ -35,6 +38,8 @@ from typing import Any
 import httpx
 
 from .exceptions import (
+    TELEGRAM_UNAVAILABLE_REASON,
+    TelegramUnavailable,
     TransportAuthMissing,
     TransportError,
     TransportRejected,
@@ -56,6 +61,28 @@ DEFAULT_PORT = 8891
 # (the talker comes back up in under 2s); the second buys one more
 # chance for a transient aiohttp hiccup.
 _RETRY_BACKOFFS: tuple[float, ...] = (0.5, 2.0)
+
+# 503 ``reason`` values that are TERMINAL: the server answered, so it is up,
+# and the condition it reported cannot change between now and the retry. Both
+# mean "there is no Telegram on that instance" — one because no callable was
+# registered, one because the callable has no bot behind it. Retrying spends
+# 2.5s of backoff to be told the same thing, and on a web-only instance that
+# is every outbound send the system makes.
+_TERMINAL_503_REASONS: frozenset[str] = frozenset({
+    TELEGRAM_UNAVAILABLE_REASON,
+    "telegram_not_configured",
+})
+
+
+def _reason_of(resp: httpx.Response) -> str:
+    """Best-effort ``reason`` field from an error body. "" when absent."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("reason") or "")
 # COUPLING NOTE: the propose-create handler's per-phase GCal deadline
 # (``transport/peer_handlers.py`` ``_GCAL_CONFLICT_DEADLINE_S`` +
 # ``_GCAL_SYNC_DEADLINE_S``, 6.0 each) is tuned so
@@ -187,18 +214,34 @@ async def _request(
                 body=body_text,
             )
 
-        # 5xx — one retry only.
+        # 5xx — one retry only, except the terminal reasons.
         if 500 <= resp.status_code < 600:
             body_text = resp.text[:500]
+            reason = _reason_of(resp)
             log.warning(
                 "transport.client.nonzero_response",
                 code=resp.status_code,
                 body=body_text,
                 attempt=attempt_num,
+                reason=reason,
                 response_summary=(
                     f"Status {resp.status_code}: {body_text[:200] or '(no body)'}"
                 ),
             )
+            if reason in _TERMINAL_503_REASONS:
+                # Raise immediately and NARROWLY. The narrow type is what
+                # lets a consumer record "dark channel, do not retry, use the
+                # other leg" instead of the "transport hiccup, try later" its
+                # generic handler would infer.
+                exc_cls = (
+                    TelegramUnavailable
+                    if reason == TELEGRAM_UNAVAILABLE_REASON
+                    else TransportUnavailable
+                )
+                raise exc_cls(
+                    f"HTTP {resp.status_code} from {path} "
+                    f"({reason}): {body_text[:200]}"
+                )
             last_exc = TransportUnavailable(
                 f"HTTP {resp.status_code} from {path}: {body_text[:200]}"
             )
@@ -253,12 +296,18 @@ async def send_outbound(
             header. Detected from ``sys.argv[0]`` by default.
 
     Returns:
-        The server's JSON response dict — ``{"id", "status", ...}``.
+        The server's JSON response dict — ``{"id", "status", ...}``. A
+        returned dict always means the message was ACCEPTED (sent,
+        scheduled, or deduped); a non-delivery is always an exception.
 
     Raises:
         :class:`TransportAuthMissing`: ``ALFRED_TRANSPORT_TOKEN`` unset.
         :class:`TransportServerDown`: server unreachable.
         :class:`TransportRejected`: 4xx — caller must fix request.
+        :class:`TelegramUnavailable`: the instance has no Telegram bot —
+            NOTHING was delivered and no dedupe row was written. Catch
+            this before :class:`TransportUnavailable` when the caller
+            has a second delivery leg or must stay un-resolved.
         :class:`TransportUnavailable`: 5xx / telegram_not_configured.
     """
     body: dict[str, Any] = {"user_id": user_id, "text": text}

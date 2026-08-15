@@ -5,9 +5,23 @@ base :class:`TransportError` or narrow to a specific subclass when a
 more targeted recovery is warranted (e.g. the brief daemon catches
 only :class:`TransportUnavailable` for "log and continue", and lets
 :class:`TransportAuthMissing` propagate so misconfiguration is loud).
+
+One member, :class:`TelegramUnavailable`, is dual-role: it is raised
+IN-PROCESS by the talker's send callable (``alfred.telegram.send``) and
+again CLIENT-SIDE when the server reports the same condition over HTTP.
+One definition, so the in-process consumers (transport server handlers,
+scheduler, peer relay) and the over-the-wire consumers (pending items,
+email classifier, brief, CLI) spell the same condition the same way.
 """
 
 from __future__ import annotations
+
+
+# The single spelling of "this instance has no Telegram bot". Shared by the
+# exception below, the server's 503 body, the client's no-retry set, the
+# scheduler's dead-letter reason, and the peer relay's ACK — lifted to one
+# constant BEFORE the second consumer existed, because there are six.
+TELEGRAM_UNAVAILABLE_REASON = "telegram_unavailable"
 
 
 class TransportError(Exception):
@@ -55,3 +69,32 @@ class TransportUnavailable(TransportError):
     dispatch catches this category to log-and-continue — the brief is
     still in the vault, it just didn't push out.
     """
+
+
+class TelegramUnavailable(TransportUnavailable):
+    """There is no Telegram bot on this instance — NOTHING was delivered.
+
+    Raised by the talker's send callable when the instance runs web-only
+    (``bot_token: ""``, which is every instance since 2026-08-14/15), and
+    raised again client-side when the transport server answers
+    ``503 {"status": "skipped", "reason": "telegram_unavailable"}``.
+
+    WHY IT IS AN EXCEPTION AND NOT A RETURN VALUE. The send path used to
+    answer ``[]`` for this case, which is indistinguishable from a
+    successful send with zero recipients — so seven consumers read a
+    non-delivery as a delivery, and one of them destroyed the content it
+    was recovering. A value that means "nothing happened" will eventually
+    be read as "nothing went wrong"; a raise cannot be.
+
+    WHY IT SUBCLASSES ``TransportUnavailable``. Every consumer that
+    already caught ``TransportError`` fails CLOSED the day this ships —
+    it records a non-delivery without knowing this class exists. The
+    narrow type is then how a consumer that CARES tells a CONFIGURED-DARK
+    channel from a broken one, and the difference is load-bearing: dark
+    is permanent for the process lifetime, so retrying cannot help and
+    re-parking forever is worse than dead-lettering honestly.
+    """
+
+    #: Machine-readable discriminator; mirrored in the server's 503 body,
+    #: the scheduler's dead-letter reason, and the relay ACK.
+    reason = TELEGRAM_UNAVAILABLE_REASON

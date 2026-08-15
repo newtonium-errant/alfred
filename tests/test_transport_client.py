@@ -15,7 +15,9 @@ import structlog
 
 from alfred.transport import client as client_mod
 from alfred.transport.exceptions import (
+    TelegramUnavailable,
     TransportAuthMissing,
+    TransportError,
     TransportRejected,
     TransportServerDown,
     TransportUnavailable,
@@ -424,3 +426,108 @@ async def test_peer_propose_event_4xx_other_than_409_still_raises(
             self_name="hypatia",
         )
     assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# PY-A — the client's half of the skip contract
+#
+# The server answers 503 ``{"status": "skipped", "reason":
+# "telegram_unavailable"}`` for a send that was never delivered. Client-side
+# that must become a NARROW exception, and it must not spend the retry
+# budget: the server ANSWERED, so it is up, and the fact it reported cannot
+# change in 2.5s. On a web-only instance this is every outbound send.
+# ---------------------------------------------------------------------------
+
+
+async def test_skip_maps_to_telegram_unavailable_without_retrying(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    handlers, seen = patch_httpx
+    # ONE handler queued on purpose: a retry would pop an empty queue and
+    # raise AssertionError, so this pins the no-retry behaviour rather than
+    # merely describing it.
+    handlers.append(lambda req: httpx.Response(503, json={
+        "status": "skipped", "delivered": False,
+        "reason": "telegram_unavailable",
+    }))
+
+    with pytest.raises(TelegramUnavailable):
+        await client_mod.send_outbound(user_id=1, text="hi")
+    assert len(seen) == 1
+
+
+async def test_the_skip_is_catchable_as_a_plain_transport_error(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """THE FAIL-CLOSED PROPERTY. Consumers written before this lane catch
+    ``TransportError`` and record a non-delivery — correct, on day one,
+    without knowing the narrow class exists."""
+    handlers, _ = patch_httpx
+    handlers.append(lambda req: httpx.Response(503, json={
+        "reason": "telegram_unavailable",
+    }))
+
+    with pytest.raises(TransportError):
+        await client_mod.send_outbound(user_id=1, text="hi")
+
+
+async def test_telegram_not_configured_is_also_terminal(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """The sibling reason. Same fact ("there is no Telegram there"), reached
+    by a different route (no callable registered) — so it gets the same
+    no-retry treatment, but NOT the narrow type: nothing is dark, the wiring
+    is missing."""
+    handlers, seen = patch_httpx
+    handlers.append(lambda req: httpx.Response(503, json={
+        "reason": "telegram_not_configured",
+    }))
+
+    with pytest.raises(TransportUnavailable) as exc:
+        await client_mod.send_outbound(user_id=1, text="hi")
+    assert not isinstance(exc.value, TelegramUnavailable)
+    assert len(seen) == 1
+
+
+async def test_an_ordinary_5xx_still_retries(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """POSITIVE CONTROL for the two pins above: the retry budget they assert
+    is skipped must demonstrably still exist for the transient case."""
+    handlers, seen = patch_httpx
+    handlers.append(lambda req: httpx.Response(503, json={"reason": "tmp"}))
+    handlers.append(lambda req: httpx.Response(200, json={"id": "ok", "status": "sent"}))
+
+    result = await client_mod.send_outbound(user_id=1, text="hi")
+    assert result["id"] == "ok"
+    assert len(seen) == 2
+
+
+async def test_a_5xx_with_no_reason_field_still_retries(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """The terminal set is an ALLOWLIST of known-terminal reasons, so an
+    unrecognised or absent reason falls through to the retry — unknown fails
+    toward trying again, not toward giving up."""
+    handlers, seen = patch_httpx
+    handlers.append(lambda req: httpx.Response(500, text="upstream exploded"))
+    handlers.append(lambda req: httpx.Response(200, json={"id": "ok", "status": "sent"}))
+
+    result = await client_mod.send_outbound(user_id=1, text="hi")
+    assert result["id"] == "ok"
+    assert len(seen) == 2
+
+
+async def test_the_batch_path_maps_the_skip_too(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """Brief and pending-items both go through the batch call — the two
+    consumers whose failure modes cost the most."""
+    handlers, seen = patch_httpx
+    handlers.append(lambda req: httpx.Response(503, json={
+        "status": "skipped", "reason": "telegram_unavailable",
+    }))
+
+    with pytest.raises(TelegramUnavailable):
+        await client_mod.send_outbound_batch(user_id=1, chunks=["a"])
+    assert len(seen) == 1
