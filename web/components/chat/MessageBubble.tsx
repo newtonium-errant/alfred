@@ -1,7 +1,11 @@
 import { FencedText } from '../markdown/FencedText';
 import { cn, formatMessageTime } from '../../lib/utils';
 import type { ChatRole } from '../../lib/algernon/types';
-import { COMMS_QUOTED_CLASS } from '../../lib/algernon/commsSurface';
+import {
+  COMMS_QUOTED_CLASS,
+  COMMS_TURN_ASSISTANT_CLASS,
+  COMMS_TURN_OPERATOR_CLASS,
+} from '../../lib/algernon/commsSurface';
 
 // One chat message. Text is rendered as escaped React children (never
 // dangerouslySetInnerHTML) — the untrusted-data discipline: model + vault text
@@ -24,12 +28,22 @@ export function MessageBubble({
       className={cn('flex', isUser ? 'justify-end' : 'justify-start')}
       data-testid={`msg-${role}`}
     >
+      {/* THE HULL, as distinct from the voice. The warm utilities stay as the
+          unmarked default and the comms class is what the register reaches —
+          the `ui-panel` lesson, applied without the marker because the
+          transcript does not straddle a warm route (ChatThread renders only on
+          the comms surface). The two hulls differ on the register's depth axis
+          so operator and computer stay tellable apart by more than alignment;
+          the FACE distinction below is the other half and is untouched. */}
       <div
         className={cn(
           'max-w-[85%] break-words rounded-2xl px-4 py-2.5 text-base',
           isUser
-            ? 'bg-honeydew-500 text-white'
-            : 'border border-honeydew-200 bg-cream text-honeydew-900'
+            ? cn('bg-honeydew-500 text-white', COMMS_TURN_OPERATOR_CLASS)
+            : cn(
+                'border border-honeydew-200 bg-cream text-honeydew-900',
+                COMMS_TURN_ASSISTANT_CLASS,
+              )
         )}
       >
         {/* #85: a ```csv block in a reply becomes downloadable. The pre-wrap

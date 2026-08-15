@@ -1,3 +1,6 @@
+import { cn } from '../../lib/utils';
+import { COMMS_TURN_ASSISTANT_CLASS } from '../../lib/algernon/commsSurface';
+
 // A calm "assistant is thinking" bubble shown while a turn is in flight. The
 // animation is motion-safe gated (per the motion-accessibility contract);
 // reduced-motion users see static dots + the sr-only announcement, never a dead
@@ -8,8 +11,15 @@ export function TypingIndicator({ label }: { label?: string | null } = {}) {
   const announce = label && label.trim() ? label : 'The assistant is typing…';
   return (
     <div className="flex justify-start" data-testid="typing-indicator">
+      {/* Same hull as the reply it precedes — this IS the assistant's turn,
+          before the words arrive. Adopting the bubble and not this one would
+          leave a bright slab flashing between every message and its reply: a
+          fix that looks done at rest and is visibly wrong in motion. */}
       <div
-        className="flex items-center gap-2 rounded-2xl border border-honeydew-200 bg-cream px-4 py-3"
+        className={cn(
+          'flex items-center gap-2 rounded-2xl border border-honeydew-200 bg-cream px-4 py-3',
+          COMMS_TURN_ASSISTANT_CLASS,
+        )}
         aria-live="polite"
       >
         <span className="sr-only">{announce}</span>

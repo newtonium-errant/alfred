@@ -58,6 +58,42 @@
   letter-spacing: 0.01em;
 }
 
+/* --- THE TRANSCRIPT'S HULLS -----------------------------------------------
+ *
+ * The panel a turn is spoken FROM, as distinct from the voice it is spoken IN.
+ * The quotation above adopted the voice and left the hull warm: `bg-cream`
+ * under monospace phosphor, which is the bright slab the operator reported.
+ *
+ * NOT PART OF THE QUOTATION, and that is structural rather than careful. These
+ * read the surface's ordinary depth ramp and never `--comms-quoted-*`, so the
+ * rule that exactly one selector borrows the CRT vocabulary holds by
+ * construction — commsQuotation.test.tsx would fail the moment that stopped
+ * being true, including for these.
+ *
+ * SCOPED, so warm stays the unmarked default. The transcript renders only on
+ * this surface today (ChatThread has one call site, `pages/chat.tsx`, which
+ * passes `surface='comms'`), so the scope costs nothing now and means a future
+ * shell that remounts a bubble off-surface gets the warm chrome rather than a
+ * dark panel on a light page — the lesson `ui-panel` was built from. The warm
+ * utilities stay in the markup as that default; these outrank them.
+ *
+ * TWO HULLS, because operator and computer must stay tellable apart. The text
+ * face already carries that (proportional vs the borrowed monospace) and is
+ * untouched here; the hull carries it on the depth axis — the computer speaks
+ * from a pane face, the operator from the control resting on it.
+ */
+[data-surface='comms'] .comms-turn-assistant {
+  background-color: var(--comms-panel);
+  border-color: var(--comms-edge);
+  color: var(--comms-ink);
+}
+
+[data-surface='comms'] .comms-turn-operator {
+  background-color: var(--comms-raise);
+  border-color: var(--comms-edge);
+  color: var(--comms-ink);
+}
+
 .comms-label {
   color: var(--comms-ink-faint);
   font-size: 10px;

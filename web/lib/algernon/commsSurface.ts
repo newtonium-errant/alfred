@@ -30,3 +30,25 @@ export const COMMS_SURFACE = 'comms';
  * name the exception by importing it rather than by restating a string.
  */
 export const COMMS_QUOTED_CLASS = 'comms-quoted';
+
+/**
+ * The transcript's two hulls — the panel a turn is spoken from.
+ *
+ * The QUOTATION (above) reached the assistant's words while the hull they sit
+ * on stayed warm: `bg-cream` under monospace phosphor, which is what the
+ * operator photographed and called bright. These adopt the hull, and they are
+ * deliberately NOT part of the quotation — they read the surface's ordinary
+ * depth tokens, never `--comms-quoted-*`, so the boundary that says exactly one
+ * selector may borrow the CRT voice stays true by construction rather than by
+ * remembering.
+ *
+ * TWO CLASSES, BECAUSE THE DISTINCTION IS THE POINT. Operator and computer must
+ * stay tellable apart, and the existing grammar carries that in the TEXT FACE —
+ * proportional for the operator, monospace-phosphor for the computer. That is
+ * untouched. The hull carries the same distinction on the register's own depth
+ * axis: the computer speaks from a pane face, the operator from the control
+ * resting on it. Flattening both to one hull would leave the register legible
+ * and the conversation harder to read at a glance.
+ */
+export const COMMS_TURN_ASSISTANT_CLASS = 'comms-turn-assistant';
+export const COMMS_TURN_OPERATOR_CLASS = 'comms-turn-operator';
