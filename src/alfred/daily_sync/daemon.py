@@ -35,6 +35,10 @@ from alfred.common.schedule import (
     should_catchup_today,
     sleep_until,
 )
+from alfred.telegram.captured_tasks_view import (
+    CAPTURED_TASKS_VIEW_REL,
+    regenerate_captured_tasks_view,
+)
 
 from . import (
     attribution_section,
@@ -373,6 +377,47 @@ async def fire_once(
             date=today_iso,
             error_type=exc.__class__.__name__,
             error=str(exc),
+        )
+
+    # Captured-Tasks registry reconcile — the belt to the per-close regen.
+    #
+    # The confirm resolver now regenerates the view when IT closes a task, but
+    # that is one writer among many: the operator editing the record, a slot
+    # ``done``, the janitor, the talker. Any of those leaves the view claiming
+    # a finished task is open, with nothing scheduled to notice. This is the
+    # once-a-day reconcile that makes the staleness self-healing rather than
+    # dependent on remembering every close path forever.
+    #
+    # ONLY REFRESHES AN EXISTING VIEW — never creates one. Capture is what
+    # brings the file into being; without this gate a daily fire would mint
+    # ``process/Captured Tasks.md`` reading "(none)" in EVERY instance's vault,
+    # including the ones that have never captured anything and did not ask for
+    # the file. The gate also respects a deliberate deletion: removing the view
+    # is a legible way to say you do not want it, and a daily job that put it
+    # back would be overruling that.
+    view_path = vault_path / CAPTURED_TASKS_VIEW_REL
+    if view_path.exists():
+        try:
+            regenerated = regenerate_captured_tasks_view(vault_path)
+            log.info(
+                "daily_sync.captured_tasks_view.reconciled",
+                date=today_iso, written=regenerated,
+            )
+        except Exception as exc:  # noqa: BLE001 — decoration never sinks the fire
+            log.warning(
+                "daily_sync.captured_tasks_view.reconcile_failed",
+                date=today_iso,
+                error_type=exc.__class__.__name__,
+                error=str(exc),
+            )
+    else:
+        # ILB: "no view here" is a state, not a fault — say so once a day at
+        # DEBUG so an operator hunting a missing view can tell this branch
+        # from the reconcile silently erroring.
+        log.debug(
+            "daily_sync.captured_tasks_view.absent",
+            date=today_iso, path=str(view_path),
+            detail="no Captured Tasks view in this vault — nothing to reconcile",
         )
 
     body = assemble_message(config, today)
