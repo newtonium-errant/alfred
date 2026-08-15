@@ -401,6 +401,16 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
 
         # utterance-1 (~2 s of tone) → T1; utterance-2 (~2 s later, mid-playout)
         # → the barge. Generous headroom for ICE + media flow.
+        # WATCH ITEM — if this line raises asyncio.TimeoutError, read this
+        # before filing it against the generation-fix. ONE observation
+        # (90b88fdf's control set), NOT reproduced in the 18 control runs;
+        # that run took 59.8 s against a ~35 s norm. Its signature is DISTINCT
+        # from the recv-stall artifact this file's pins were rebuilt around:
+        # the stall DELIVERS LATE (2.61-2.73 s backlog burst, frames arrive in
+        # one lump), whereas here the barge event NEVER ARRIVES AT ALL —
+        # upstream of every line the generation-scoring commit touched.
+        # A recurrence is therefore NOT evidence that the generation fix
+        # regressed; it is a second data point on an open, unexplained item.
         await asyncio.wait_for(got_barge.wait(), timeout=30)
         barge_time = barge_at[0]
         # T2 (empty reply) completes fast after the barge.
@@ -572,6 +582,16 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
         await pc.setRemoteDescription(
             RTCSessionDescription(sdp=body["sdp"], type="answer"))
 
+        # WATCH ITEM — if this line raises asyncio.TimeoutError, read this
+        # before filing it against the generation-fix. ONE observation
+        # (90b88fdf's control set), NOT reproduced in the 18 control runs;
+        # that run took 59.8 s against a ~35 s norm. Its signature is DISTINCT
+        # from the recv-stall artifact this file's pins were rebuilt around:
+        # the stall DELIVERS LATE (2.61-2.73 s backlog burst, frames arrive in
+        # one lump), whereas here the barge event NEVER ARRIVES AT ALL —
+        # upstream of every line the generation-scoring commit touched.
+        # A recurrence is therefore NOT evidence that the generation fix
+        # regressed; it is a second data point on an open, unexplained item.
         await asyncio.wait_for(got_barge.wait(), timeout=30)
         barge_time = barge_at[0]
         await asyncio.wait_for(got_t2_final.wait(), timeout=15)
