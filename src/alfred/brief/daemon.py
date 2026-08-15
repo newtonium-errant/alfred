@@ -107,7 +107,11 @@ async def _push_brief_to_telegram(
     # Local imports so the brief module doesn't drag transport into
     # tools that don't need it (e.g. when telegram isn't configured).
     from alfred.transport.client import send_outbound_batch
-    from alfred.transport.exceptions import TransportError
+    from alfred.transport.exceptions import (
+        TELEGRAM_UNAVAILABLE_REASON,
+        TelegramUnavailable,
+        TransportError,
+    )
     from alfred.transport.utils import chunk_for_telegram
 
     try:
@@ -126,6 +130,22 @@ async def _push_brief_to_telegram(
             date=today,
             chunks=len(chunks),
             user_id=user_id,
+        )
+    except TelegramUnavailable:
+        # ``brief.pushed`` is below the await, so the raise already prevents
+        # the false claim. This branch exists to say the true thing: the
+        # brief is in the vault and spooled for the web read route, and the
+        # Telegram copy was never sent. Logged separately from
+        # ``brief.push_failed`` because a dark channel needs no
+        # investigation and a failed push does.
+        log.info(
+            "brief.push_skipped_no_telegram",
+            date=today,
+            reason=TELEGRAM_UNAVAILABLE_REASON,
+            detail=(
+                "no Telegram bot on this instance — the brief was NOT pushed. "
+                "The vault record and the web outbound spool are unaffected."
+            ),
         )
     except TransportError as exc:
         log.warning(

@@ -98,9 +98,20 @@ def cmd_send_test(
     text: str,
     wants_json: bool = False,
 ) -> int:
-    """Direct smoke test via the client — emits a real outbound send."""
+    """Direct smoke test via the client — emits a real outbound send.
+
+    Exit codes: 0 delivered, 1 transport error, 2 SKIPPED (no Telegram bot
+    on this instance — nothing was delivered). 2 is its own code because
+    this is the command an operator runs to ANSWER the question "did that
+    go out?", and a diagnostic that prints "Sent:" and exits 0 on a channel
+    that delivered nothing is worse than no diagnostic at all.
+    """
     from alfred.transport.client import send_outbound
-    from alfred.transport.exceptions import TransportError
+    from alfred.transport.exceptions import (
+        TELEGRAM_UNAVAILABLE_REASON,
+        TelegramUnavailable,
+        TransportError,
+    )
 
     try:
         result = asyncio.run(
@@ -108,6 +119,22 @@ def cmd_send_test(
                 user_id=user_id, text=text, client_name="cli",
             ),
         )
+    except TelegramUnavailable as exc:
+        if wants_json:
+            print(json.dumps({
+                "status": "skipped",
+                "delivered": False,
+                "reason": TELEGRAM_UNAVAILABLE_REASON,
+                "detail": str(exc),
+            }, indent=2))
+        else:
+            print("SKIPPED: nothing was delivered.")
+            print(
+                "  This instance has no Telegram bot (web-only). "
+                "The transport is healthy; the channel is dark.",
+            )
+            print(f"  detail: {exc}")
+        return 2
     except TransportError as exc:
         if wants_json:
             print(json.dumps({"error": str(exc), "type": exc.__class__.__name__}, indent=2))

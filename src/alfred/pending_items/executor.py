@@ -246,6 +246,11 @@ async def _execute_deliver_text(
       * session record not found
       * turn_index out of range
       * transport send fails
+      * this instance has no Telegram bot (``TelegramUnavailable``) — the
+        send was SKIPPED, nothing was delivered, and the item must stay
+        pending. Distinct from a transport failure because it is permanent
+        rather than transient, and it is the case that runs on every
+        instance today.
 
     Success returns ``executed=True`` plus the transport's response
     summary so the operator can correlate.
@@ -291,7 +296,11 @@ async def _execute_deliver_text(
     # for chunked replies. Dedupe key includes the session id + turn
     # so an accidental double-execute is server-side-deduped.
     from alfred.transport.client import send_outbound_batch
-    from alfred.transport.exceptions import TransportError
+    from alfred.transport.exceptions import (
+        TELEGRAM_UNAVAILABLE_REASON,
+        TelegramUnavailable,
+        TransportError,
+    )
     from alfred.transport.utils import chunk_for_telegram
 
     chunks = chunk_for_telegram(text)
@@ -311,6 +320,36 @@ async def _execute_deliver_text(
             dedupe_key=dedupe_key,
             client_name="pending_items",
         )
+    except TelegramUnavailable:
+        # THE ONE THAT DESTROYED CONTENT. ``deliver_text`` is the RECOVERY
+        # path for a message that already failed to deliver once, resolving
+        # is irreversible (``mark_resolved``), and there is no second leg —
+        # so reporting "delivered" for a send that never left took the
+        # operator's only copy of the failure with it.
+        #
+        # ``executed=False`` is the whole fix: ``resolve_local_item`` gates
+        # ``mark_resolved`` on it, so the item stays PENDING and stays on the
+        # deck (pending items are a needs-you feed kind), which is the leg
+        # that survives on a web-only instance.
+        log.warning(
+            "pending_items.deliver_text_skipped_no_telegram",
+            session_id=short_session,
+            turn_index=turn_index,
+            chunks=len(chunks),
+            reason=TELEGRAM_UNAVAILABLE_REASON,
+            detail=(
+                "nothing was delivered; the item stays pending so the "
+                "content is not lost"
+            ),
+        )
+        return {
+            "executed": False,
+            "summary": (
+                "not delivered — this instance has no Telegram bot; "
+                "the item stays pending"
+            ),
+            "error": TELEGRAM_UNAVAILABLE_REASON,
+        }
     except TransportError as exc:
         return {
             "executed": False,
