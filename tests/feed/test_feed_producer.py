@@ -171,3 +171,206 @@ def test_a_family_reported_UNREADABLE_is_skipped_not_emptied(
     ]
     assert len(matches) == 1
     assert matches[0]["log_level"] == "warning"
+
+
+# --- PROVIDER_FOR_FAMILY: the two ends that are actually true (Task 0) --------
+#
+# The map's own comment used to claim this pin held it "against BOTH ends:
+# every family has a provider, and every registered provider maps to a family."
+# The second half is FALSE and could not be written: seven of the fourteen
+# registered providers (capture_close, contracts_awaiting, demotion_proposals,
+# tier_recurrence, stt_vocab, ticket_notify, triage_queue) feed no feed family
+# at all, and correctly so. A pin written to the comment as it stood would have
+# been RED against correct code. The comment has been corrected to match these.
+
+
+def _register_every_section() -> list[str]:
+    """Register all production section providers and return their names.
+
+    Drives the REAL ``register()`` of each module rather than a hand-kept list,
+    which is the whole point: a hand-kept list would drift in exactly the way
+    this pin exists to catch. ``daemon.py`` calls these fourteen
+    unconditionally (each provider self-gates by returning ``None`` when its
+    instance hasn't opted in), so this is the production registry.
+    """
+    from alfred.daily_sync import (
+        assembler,
+        attribution_section,
+        canonical_proposals_section,
+        capture_close_section,
+        contracts_awaiting_section,
+        demotion_section,
+        email_section,
+        friction_section,
+        pending_items_section,
+        radar_section,
+        recurrence_section,
+        routine_match_section,
+        stt_vocab_section,
+        ticket_notify_section,
+        triage_section,
+    )
+
+    assembler.clear_providers()
+    for mod in (
+        email_section, attribution_section, canonical_proposals_section,
+        demotion_section, capture_close_section, contracts_awaiting_section,
+        pending_items_section, radar_section, friction_section, triage_section,
+        routine_match_section, stt_vocab_section, recurrence_section,
+        ticket_notify_section,
+    ):
+        mod.register()
+    return assembler.registered_providers()
+
+
+def test_provider_family_map_covers_every_family() -> None:
+    """END ONE — every feed family has a provider, and the map names no family
+    that isn't one.
+
+    This is the KeyError end. ``daemon.fire_once`` does a bare
+    ``PROVIDER_FOR_FAMILY[kind]`` for each family, so a family added to
+    ``_FAMILIES`` without a map entry raises mid-fire; a map entry for a family
+    that no longer exists is dead weight that reads as coverage. Asserting SET
+    EQUALITY rather than a subset closes both directions at once.
+
+    Mutation that reds this: delete any entry from either dict.
+    """
+    from alfred.daily_sync.feed_producer import _FAMILIES, PROVIDER_FOR_FAMILY
+
+    assert set(PROVIDER_FOR_FAMILY) == set(_FAMILIES)
+    # Positive control: the sets are non-empty, so the equality above is a real
+    # correspondence and not two empties agreeing about nothing.
+    assert len(_FAMILIES) == 7
+
+
+def test_every_mapped_provider_is_actually_registered() -> None:
+    """END TWO — every provider NAME the map points at is one a section module
+    really registers.
+
+    This is the end with teeth, and it is the silent one. The map's values are
+    matched against ``assembler.failed_sections()`` to decide which families
+    are passed as ``None`` (could-not-read). A provider renamed in its own
+    module and not here does not raise anything: the lookup simply stops
+    matching, the failure signal goes permanently dark, and every existing test
+    stays green while a broken section is once again indistinguishable from a
+    quiet one.
+
+    Mutation that reds this: rename a value, e.g. ``"attribution":
+    "attribution_audit"`` → ``"attribution_audit_v2"``.
+    """
+    from alfred.daily_sync import assembler
+    from alfred.daily_sync.feed_producer import PROVIDER_FOR_FAMILY
+
+    try:
+        registered = set(_register_every_section())
+        assert set(PROVIDER_FOR_FAMILY.values()) <= registered
+        # POSITIVE CONTROL for the subset above: a subset assertion passes
+        # vacuously if the left side is empty AND says nothing about whether
+        # ``registered`` was really populated. Both are pinned here, so the
+        # subset is load-bearing.
+        assert len(PROVIDER_FOR_FAMILY) == 7
+        assert len(registered) == 14
+    finally:
+        # The registry is module-global; leaving it populated would leak into
+        # every later test in the session.
+        assembler.clear_providers()
+
+
+def test_seven_registered_providers_deliberately_feed_no_family() -> None:
+    """The NEGATIVE half, asserted rather than assumed — and the reason the
+    map's original comment was wrong.
+
+    Most registered providers are not feed families: they render a section for
+    the operator to read and emit no cards. Naming them here means a future
+    provider that SHOULD have had a family shows up as a diff on this list
+    instead of silently joining the unmapped majority.
+    """
+    from alfred.daily_sync import assembler
+    from alfred.daily_sync.feed_producer import PROVIDER_FOR_FAMILY
+
+    try:
+        unmapped = set(_register_every_section()) - set(PROVIDER_FOR_FAMILY.values())
+        assert unmapped == {
+            "capture_close", "contracts_awaiting", "demotion_proposals",
+            "tier_recurrence", "stt_vocab", "ticket_notify", "triage_queue",
+        }
+    finally:
+        assembler.clear_providers()
+
+
+# --- item 4: retirement is not a dark stratum --------------------------------
+
+
+def test_retirement_summary_reports_the_kind_that_retired(tmp_path: Path) -> None:
+    """The count line carries the BREAKDOWN, not just a total — "3 cards went
+    away" without saying from where is a number the operator can't act on.
+
+    Mutation that reds this: drop ``by_kind`` from the log call, or stop
+    accumulating ``retired_by_kind``.
+    """
+    store = FeedStore(tmp_path / "feed.jsonl")
+    emit_sync_feed(store, "salem", pending_items=[_Item(id="u1"), _Item(id="u2")])
+
+    with structlog.testing.capture_logs() as captured:
+        emit_sync_feed(store, "salem", pending_items=[_Item(id="u1")])
+
+    [summary] = [
+        c for c in captured
+        if c.get("event") == "feed.producer.retirement_summary"
+    ]
+    assert summary["retired"] == 1
+    assert summary["by_kind"] == {"pending": 1}
+    assert "1 card(s) left their producer's open set" in summary["detail"]
+
+
+def test_retirement_summary_fires_on_a_quiet_fire_too(tmp_path: Path) -> None:
+    """ILB, and the case that makes this surface worth having.
+
+    The all-zero fire is the COMMON one. If the line only appeared when
+    something retired, then "nothing retired" and "the summary never ran"
+    would be the same silence — which is the exact ambiguity item 4 was
+    ratified to close, reintroduced at the surface built to close it.
+
+    Mutation that reds this: guard the log call behind ``if total_retired:``.
+    """
+    store = FeedStore(tmp_path / "feed.jsonl")
+
+    with structlog.testing.capture_logs() as captured:
+        emit_sync_feed(store, "salem", pending_items=[])
+
+    [summary] = [
+        c for c in captured
+        if c.get("event") == "feed.producer.retirement_summary"
+    ]
+    assert summary["retired"] == 0
+    assert summary["by_kind"] == {}
+    assert summary["detail"] == "no cards retired this fire"
+
+
+def test_summary_distinguishes_a_quiet_zero_from_an_unreadable_one(
+    tmp_path: Path,
+) -> None:
+    """THE POSITIVE CONTROL for the zero above, and the reason all four
+    outcomes are on the line.
+
+    Both fires retire nothing. One is healthy; in the other a family could not
+    be read at all and its cards were deliberately left alone. A summary that
+    reported only ``retired=0`` would render those identically — two
+    identical-looking zeros with opposite meanings, one level up from the
+    counts split that item 3 shipped to prevent exactly that.
+    """
+    store = FeedStore(tmp_path / "feed.jsonl")
+    emit_sync_feed(store, "salem", pending_items=[_Item(id="u1")])
+
+    with structlog.testing.capture_logs() as captured:
+        emit_sync_feed(store, "salem", pending_items=None)  # could-not-read
+
+    [summary] = [
+        c for c in captured
+        if c.get("event") == "feed.producer.retirement_summary"
+    ]
+    assert summary["retired"] == 0
+    assert "pending" in summary["families_unreadable"]
+    # The card it declined to retire is still open — the zero is explained by
+    # the skip, and the skip is visible on the same line.
+    assert store.load()["pending:u1"].state == STATE_OPEN

@@ -56,7 +56,16 @@ def try_feed_reconcile(
         # fire, INCLUDING any items suppressed below. It is not the count of
         # items written, and not the store's resulting open count.
         open=counts["open"],
+        # ``acted`` keeps its name for wire compatibility — operator greps are
+        # written against it — and ``retired`` is the honest alias emitted
+        # beside it. Equal by construction; a pin holds them so.
+        #
+        # BOTH, deliberately. The alias shipped with item 3 and this was its
+        # only consumer, so logging ``acted`` alone would have left the honest
+        # name with no reader anywhere — a field that exists and is never
+        # emitted is indistinguishable from one that was never added.
         acted=counts["acted"],
+        retired=counts.get("retired", counts["acted"]),
         # Non-zero only when the breaker refused a wholesale wipe. Emitted
         # always, including 0, for the same ILB reason as ``suppressed``: a
         # kind that stops retiring must be explicable as "refused, and here is

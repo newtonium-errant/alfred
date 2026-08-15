@@ -121,9 +121,26 @@ _FAMILIES: dict[str, tuple[Callable[[dict], str], Callable[[dict], str]]] = {
 #: (``email_calibration``→``email_tier``, ``attribution_audit``→``attribution``,
 #: ``canonical_proposals``→``proposal``, ``pending_items``→``pending``) — so the
 #: correspondence has to be written down somewhere. Written down means it can
-#: drift, which is why ``test_provider_family_map_covers_every_family`` pins it
-#: against BOTH ends: every family has a provider, and every registered provider
-#: maps to a family.
+#: drift, so it is pinned — but NOT symmetrically, and the asymmetry is the
+#: point rather than an omission:
+#:
+#:   * ``test_provider_family_map_covers_every_family`` — this map's keys and
+#:     ``_FAMILIES`` are the SAME SET. The KeyError end: ``fire_once`` does a
+#:     bare ``PROVIDER_FOR_FAMILY[kind]`` per family, so a family added there
+#:     and not here raises mid-fire.
+#:   * ``test_every_mapped_provider_is_actually_registered`` — every VALUE here
+#:     is a name some section module really registers. The SILENT end, and the
+#:     one with teeth: rename a provider in its own module and this lookup
+#:     merely stops matching ``failed_sections()``. Nothing raises, every test
+#:     stays green, and the could-not-read signal goes dark — which is exactly
+#:     the failure this map was added to prevent.
+#:
+#: The converse — "every registered provider maps to a family" — is FALSE, and
+#: an earlier version of this comment claimed the pin held it. Seven of the
+#: fourteen registered providers feed no family at all (they render a section to
+#: read and emit no cards); ``test_seven_registered_providers_deliberately_feed
+#: _no_family`` asserts that list, so a provider that SHOULD have had a family
+#: arrives as a diff instead of joining the unmapped majority unnoticed.
 PROVIDER_FOR_FAMILY: dict[str, str] = {
     "email_tier": "email_calibration",
     "attribution": "attribution_audit",
@@ -279,6 +296,13 @@ def emit_sync_feed(
         "radar": radar_items,
         "friction": friction_items,
     }
+    # ITEM 4 — retirement must not be a dark stratum. Accumulated across the
+    # whole fire and reported once below; see that log line for why the three
+    # non-retiring outcomes are counted alongside it.
+    retired_by_kind: dict[str, int] = {}
+    refused_by_kind: dict[str, int] = {}
+    unreadable: list[str] = []
+    belt_failed: list[str] = []
     for kind in _FAMILIES:
         raw = by_family[kind]
         if raw is None:
@@ -286,6 +310,7 @@ def emit_sync_feed(
             # for this family" and "this family had nothing" are the two states
             # this whole contract exists to separate, so they cannot share a
             # silence.
+            unreadable.append(kind)
             log.warning(
                 "feed.producer.family_unreadable",
                 kind=kind,
@@ -299,6 +324,54 @@ def emit_sync_feed(
         feed_items = build_feed_items(
             kind, raw, instance, tier_overrides=tier_overrides,
         )
-        try_feed_reconcile(
+        counts = try_feed_reconcile(
             store, kind, feed_items, empty_is_authoritative=True,
         )
+        if counts is None:
+            # The belt swallowed a store fault. It logged its own line; recorded
+            # here too because from the SWEEP's point of view this is a fourth
+            # reason a kind retired nothing, and the summary below is only
+            # honest if it can name all four.
+            belt_failed.append(kind)
+            continue
+        if counts.get("retired"):
+            retired_by_kind[kind] = counts["retired"]
+        if counts.get("refused"):
+            refused_by_kind[kind] = counts["refused"]
+
+    # THE COUNT LINE (item 4, the ratified minimum). One line per fire, ALWAYS
+    # emitted — including the all-zero fire, which is the common case and the
+    # whole reason this exists. A retirement is the one state transition no
+    # operator ever asked for, so it is the one that most needs a place it can
+    # be read; before this, a card that vanished overnight left nothing at this
+    # altitude to read at all.
+    #
+    # NO CHEAPER SURFACE EXISTED. The transport serves ``/feed/items`` and
+    # ``/feed/act`` only — no counts endpoint to extend — and the belt's
+    # per-kind ``feed.reconcile`` line is per-RECONCILE, so reading retirements
+    # off it means correlating seven lines and knowing which fire they came
+    # from. This aggregates what already crossed the wire rather than
+    # recomputing anything.
+    #
+    # ALL FOUR OUTCOMES, because a zero here is ambiguous in exactly the way
+    # the counts were split to prevent. "Nothing retired" can mean: nothing left
+    # any open set (quiet, healthy); the breaker REFUSED a wholesale wipe (a
+    # producer is faulting and its cards are being held open); a family could
+    # not be read at all (skipped upstream); or the belt swallowed a store
+    # fault. Reporting only the first would make the three failures look like
+    # the healthy case — the identical-looking-zeros problem, one level up.
+    total_retired = sum(retired_by_kind.values())
+    log.info(
+        "feed.producer.retirement_summary",
+        retired=total_retired,
+        by_kind=dict(sorted(retired_by_kind.items())),
+        refused=sum(refused_by_kind.values()),
+        refused_by_kind=dict(sorted(refused_by_kind.items())),
+        families_unreadable=sorted(unreadable),
+        families_belt_failed=sorted(belt_failed),
+        detail=(
+            "no cards retired this fire"
+            if not total_retired
+            else f"{total_retired} card(s) left their producer's open set this fire"
+        ),
+    )

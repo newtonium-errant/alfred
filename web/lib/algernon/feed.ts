@@ -18,12 +18,21 @@ export type FeedAttention = 'needs_you' | 'fyi';
  * session-local set-aside that writes nothing, and its copy says so. Wiring the
  * defer verbs per kind is its own lane; this type is the contract half, landed
  * first so that lane cannot be written against a union missing its own state.
+ *
+ * `retired` is the store's sixth state (`alfred.feed.model.STATE_RETIRED`), and
+ * it is NOT a flavour of `acted`. An item is retired when it left its
+ * producer's open set — the section that was offering it stopped — so nobody
+ * decided it. It is terminal, but a consumer asking "did the operator deal with
+ * this?" must not read it as yes; that conflation is exactly what the backend
+ * state was split to end, and a closed union missing the member would have let
+ * TS narrow a retired card into the wrong arm of every `state === 'acted'`
+ * check on this side of the wire.
  */
-export type FeedState = 'open' | 'acted' | 'acked' | 'expired' | 'deferred';
+export type FeedState = 'open' | 'acted' | 'acked' | 'expired' | 'deferred' | 'retired';
 
 /** Every state the store can hold — the runtime twin of `FeedState`. */
 export const FEED_STATES: readonly FeedState[] = [
-  'open', 'acted', 'acked', 'expired', 'deferred',
+  'open', 'acted', 'acked', 'expired', 'deferred', 'retired',
 ] as const;
 
 /**
@@ -119,8 +128,15 @@ export interface FeedListResponse {
 }
 
 // POST /api/feed/act result (the B1 ActResult.to_dict shape). `status` is the
-// machine code (acted | acked | already_acted | stale_item | invalid_action |
-// error); `detail` is the human line (the resolver's own message where it has one).
+// machine code (acted | acked | already_acted | retired | stale_item |
+// invalid_action | error); `detail` is the human line (the resolver's own
+// message where it has one).
+//
+// `retired` relays as a 409 — the operator acted on a card its producer had
+// withdrawn. It is NOT `already_acted`: nobody acted on it. The deck needs no
+// branch of its own, because `useDeck.routeError` already treats a 409 as
+// "that one had already moved on — it'll resurface at the next sync", which is
+// true of a retired card in both halves.
 //
 // `render` is the C2 slot-ACCEPT committed payload — present ONLY on an accept
 // success (the router sets it in _dispatch_slot_confirm and to_dict emits it only

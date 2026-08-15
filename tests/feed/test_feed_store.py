@@ -789,3 +789,159 @@ def test_the_refusal_repeats_every_sweep_while_the_fault_persists(
     folded = s.load()
     assert folded["proposal:c1"].state == STATE_OPEN
     assert folded["proposal:c2"].state == STATE_OPEN
+
+
+# --- item 5: what a retired card does NEXT -----------------------------------
+
+
+def test_a_retired_card_revives_when_its_producer_offers_it_again(
+    tmp_path: Path,
+) -> None:
+    """The RESURFACE half of item 2's operator-facing sentence, pinned where it
+    is actually decided.
+
+    ``_act_locked`` tells the operator a withdrawn card "will come back on its
+    own if it turns up again". That is a promise made by the router about
+    behaviour owned by the store, so it is pinned here rather than trusted:
+    reconcile upserts at ``state=open`` and ``_apply_event`` replaces the
+    folded item wholesale.
+
+    Mutation that reds this: make ``_revival_suppressed`` return True for
+    ``STATE_RETIRED``.
+    """
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1")], empty_is_authoritative=True)
+    s.reconcile("proposal", [], empty_is_authoritative=True)
+    assert s.load()["proposal:c1"].state == STATE_RETIRED
+
+    s.reconcile("proposal", [_item("proposal", "c1")], empty_is_authoritative=True)
+
+    assert s.load()["proposal:c1"].state == STATE_OPEN
+
+
+def test_a_retired_snapshot_card_revives_where_an_ACKED_one_stays_suppressed(
+    tmp_path: Path,
+) -> None:
+    """The BEHAVIOUR CHANGE item 1 made here, asserted so it is deliberate
+    rather than incidental — and its positive control in the same test.
+
+    ``_revival_suppressed`` keeps a DECISION sticky on snapshot kinds: an acked
+    appointment must not come back every morning. Before retirement was its own
+    state it was stored as ``acted``, so a withdrawn-then-re-offered snapshot
+    card was suppressed by that same rule — silently terminal forever, on the
+    strength of a decision nobody made.
+
+    Now ``retired`` falls through and revives, while ``acked`` still suppresses.
+    Both halves are asserted here because either alone is passable by a broken
+    build: pin only the revival and a build that suppresses NOTHING is green
+    (re-opening the groundhog bug); pin only the suppression and item 1's change
+    is invisible.
+    """
+    ev = {"date_iso": "2026-08-20", "name": "Dentist", "rec_type": "appt",
+          "time_display": "09:00"}
+
+    # ACKED — the decision is kept sticky. Unchanged behaviour, the control.
+    s1 = _store(tmp_path / "acked")
+    e1 = FeedItem.create(kind="event", stable_key="2026-08-20|Dentist",
+                         instance="salem", title="Dentist", evidence=ev)
+    s1.reconcile("event", [e1], empty_is_authoritative=True)
+    s1.set_state(e1.id, STATE_ACKED)
+    s1.reconcile("event", [e1], empty_is_authoritative=True)
+    assert s1.load()[e1.id].state == STATE_ACKED, "an acked snapshot must stay acked"
+
+    # RETIRED — no decision to keep sticky, so it comes back.
+    s2 = _store(tmp_path / "retired")
+    e2 = FeedItem.create(kind="event", stable_key="2026-08-20|Dentist",
+                         instance="salem", title="Dentist", evidence=ev)
+    s2.reconcile("event", [e2], empty_is_authoritative=True)
+    s2.reconcile("event", [], empty_is_authoritative=True)
+    assert s2.load()[e2.id].state == STATE_RETIRED
+    s2.reconcile("event", [e2], empty_is_authoritative=True)
+    assert s2.load()[e2.id].state == STATE_OPEN, (
+        "a retirement is not a decision — there is nothing to keep sticky"
+    )
+
+
+def test_belt_logs_the_retired_alias_beside_acted(tmp_path: Path) -> None:
+    """Item 3 shipped ``retired`` in the counts; this is the pin that it has a
+    READER.
+
+    A returned field nobody emits is indistinguishable from one that was never
+    added, and the belt's ``feed.reconcile`` line was the counts' only consumer.
+    Both names are asserted, and asserted EQUAL, because that equality is the
+    migration contract the alias was shipped under.
+
+    Mutation that reds this: drop ``retired=`` from the belt's log call.
+    """
+    from alfred.feed.belt import try_feed_reconcile
+
+    s = _store(tmp_path)
+    s.reconcile("proposal", [_item("proposal", "c1")], empty_is_authoritative=True)
+
+    with structlog.testing.capture_logs() as captured:
+        counts = try_feed_reconcile(s, "proposal", [], empty_is_authoritative=True)
+
+    assert counts is not None and counts["retired"] == 1
+    [line] = [c for c in captured if c.get("event") == "feed.reconcile"]
+    assert line["retired"] == 1
+    assert line["acted"] == line["retired"]
+
+
+def test_sweep_excludes_a_retired_card_but_still_collects_an_open_one(
+    tmp_path: Path,
+) -> None:
+    """``collect_live_cards`` filters to OPEN/DEFERRED. Item 5 asked whether a
+    retired card can regress that; this is the answer, run rather than reasoned.
+
+    It cannot, and the reason is worth pinning: the filter is an ALLOWLIST, so a
+    state it has never been taught about is excluded by construction. Including
+    one would be the groundhog bug — the sweep hands its result to a reconcile
+    that upserts at ``state=open``, so a terminal card collected here would be
+    resurrected on the next tick, and the one after.
+
+    The open card is the POSITIVE CONTROL: without it, "retired is excluded"
+    passes identically against a build whose sweep returns nothing at all.
+    """
+    from alfred.feed.sweep import collect_live_cards
+
+    s = _store(tmp_path)
+    s.upsert(_item("proposal", "gone"))
+    s.upsert(_item("proposal", "live"))
+    s.set_state("proposal:gone", STATE_RETIRED, action=ACTION_RETIRED)
+
+    prepared = collect_live_cards(s, "proposal")
+
+    assert [i.id for i in prepared.open_items] == ["proposal:live"]
+    assert prepared.empty is False
+
+
+def test_a_legacy_retirement_on_disk_still_loads(tmp_path: Path) -> None:
+    """SCHEMA TOLERANCE across the item-1 boundary — the no-migration half of
+    the ruling.
+
+    Retirements written BEFORE the state existed are on disk as
+    ``state=acted`` carrying ``acted_action=retired``, and the ruling was
+    explicitly not to rewrite them. So the old shape must keep folding, and it
+    must keep reading as ``acted`` rather than being silently reinterpreted —
+    the record is the record.
+
+    The unknown-field half is asserted in the same test because a state file
+    from a NEWER build is the other direction of the same contract
+    (``from_dict`` filters to known fields).
+    """
+    path = tmp_path / "feed.jsonl"
+    legacy = FeedItem.create(kind="proposal", stable_key="old", instance="salem",
+                             title="t").to_dict()
+    legacy["a_field_from_a_future_build"] = "ignored"
+    path.write_text(
+        json.dumps({"ev": "upsert", "ts": "2026-08-01T00:00:00Z", "item": legacy}) + "\n"
+        + json.dumps({"ev": "state", "ts": "2026-08-01T00:00:01Z",
+                      "id": "proposal:old", "state": STATE_ACTED,
+                      "action": ACTION_RETIRED}) + "\n",
+        encoding="utf-8",
+    )
+
+    folded = FeedStore(path).load()
+
+    assert folded["proposal:old"].state == STATE_ACTED
+    assert folded["proposal:old"].acted_action == ACTION_RETIRED

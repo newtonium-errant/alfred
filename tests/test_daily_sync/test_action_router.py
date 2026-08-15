@@ -35,6 +35,7 @@ from alfred.daily_sync.action_router import (
     STATUS_ACTED,
     STATUS_ALREADY_ACTED,
     STATUS_INVALID_ACTION,
+    STATUS_RETIRED,
     STATUS_STALE_ITEM,
     act,
 )
@@ -44,10 +45,12 @@ from alfred.daily_sync.corpus import iter_corrections
 from alfred.daily_sync.feed_producer import _FAMILIES, build_feed_items
 from alfred.feed import FeedStore
 from alfred.feed.model import (
+    ACTION_RETIRED,
     STATE_ACKED,
     STATE_ACTED,
     STATE_DEFERRED,
     STATE_OPEN,
+    STATE_RETIRED,
     FeedItem,
     defer_window_open,
     make_id,
@@ -1145,3 +1148,107 @@ def test_a_defer_verb_on_the_EXCLUDED_kind_is_REFUSED_AT_RUNTIME(
     efid = _publish(store, "email_tier", email)
     _seed_batch(cfg, items=[email])
     assert _call(store, cfg, efid, "defer_1d").ok is True
+
+
+# ---------------------------------------------------------------------------
+# retired — the folded-state gate's honest answer (PY-C item 2)
+# ---------------------------------------------------------------------------
+
+
+def test_act_on_a_retired_card_is_never_already_acted(tmp_path: Path) -> None:
+    """THE ITEM-2 PIN, and the sentence it exists to stop saying.
+
+    A retired card left its producer's open set. Nobody decided it. Telling the
+    operator ``already_acted`` is a claim about HIM that is false, and it was
+    what this gate said for as long as a retirement was stored as ``acted``.
+
+    Asserted NEGATIVELY as well as positively on purpose: ``!= already_acted``
+    is the regression that would actually recur (a future refactor folding the
+    branch back into the generic one), and a test that only asserted the new
+    status would still pass if both branches somehow returned it.
+
+    Mutation that reds this: delete the ``if item.state == STATE_RETIRED``
+    branch in ``_act_locked`` — the generic branch below then answers
+    ``already_acted`` again.
+    """
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+    # Exactly what reconcile's absent leg writes.
+    store.set_state(fid, STATE_RETIRED, action=ACTION_RETIRED)
+
+    with structlog.testing.capture_logs() as captured:
+        result = _call(store, cfg, fid, "high")
+
+    assert result.status == STATUS_RETIRED
+    assert result.status != STATUS_ALREADY_ACTED
+    # NOT ok: the act did not apply and the operator's intent went unrecorded.
+    # ``already_acted`` is ok=True precisely because the desired end state
+    # already holds; here it does not.
+    assert result.ok is False
+    # The human half names the producer's absence AND the way back, because a
+    # terminal-sounding sentence with no way back reads as "gone forever".
+    assert "withdrawn" in result.detail
+    assert "come back" in result.detail
+
+    # The resolver never ran — the corpus is the proof, same as the
+    # already_acted pin above.
+    assert list(iter_corrections(cfg.corpus.path)) == []
+    # And the store was not touched: a refused act writes nothing.
+    assert store.load()[fid].state == STATE_RETIRED
+
+    # The machine half. A refusal that only asserts "it refused" is green
+    # against a build with no branch at all when the refusal has another cause,
+    # so the LOGGED REASON is what distinguishes this from every other
+    # non-open answer.
+    matches = [c for c in captured if c.get("event") == "feed.act.retired"]
+    assert len(matches) == 1
+    assert matches[0]["reason"] == "producer_withdrew_item"
+    assert matches[0]["state"] == STATE_RETIRED
+    assert matches[0]["action"] == "high"
+    # The OLD event must not also fire — one occurrence, one line.
+    assert [c for c in captured if c.get("event") == "feed.act.already_acted"] == []
+
+
+def test_acted_card_still_answers_already_acted(tmp_path: Path) -> None:
+    """THE POSITIVE CONTROL for the pin above — its nearest admissible
+    neighbour.
+
+    Without this, "retired → not already_acted" passes identically against a
+    build where the gate answers ``retired`` for EVERY non-open state, which
+    would be a worse lie than the one being fixed (it would tell the operator
+    his own decisions were withdrawn by a producer).
+    """
+    cfg = _ds_config(tmp_path)
+    store = _store(tmp_path)
+    item = _email_item(priority="medium")
+    fid = _publish(store, "email_tier", item)
+    _seed_batch(cfg, items=[item])
+    store.set_state(fid, STATE_ACTED)
+
+    result = _call(store, cfg, fid, "high")
+
+    assert result.status == STATUS_ALREADY_ACTED
+    assert result.ok is True
+
+
+def test_retired_status_maps_to_409_not_the_ok_false_fallback() -> None:
+    """The THREADING pin — the half that lives in another package.
+
+    ``routes_feed`` resolves an ActResult status through a dict with the
+    fallback ``200 if result.ok else 400``. A retired act is ok=False, so
+    WITHOUT an explicit entry it relays as 400 — the code meaning "you sent a
+    bad action" — about a card the operator did nothing wrong with. The status
+    constant and the map entry are one contract across two modules, and this is
+    the only thing holding them together.
+
+    Mutation that reds this: delete the ``"retired": 409`` line.
+    """
+    from alfred.transport.routes_feed import _HTTP_STATUS_BY_STATUS
+
+    assert _HTTP_STATUS_BY_STATUS[STATUS_RETIRED] == 409
+    # Same code as its nearest sibling — both mean "the item moved on without
+    # you", and the deck's 409 branch already says exactly that.
+    assert _HTTP_STATUS_BY_STATUS[STATUS_STALE_ITEM] == 409

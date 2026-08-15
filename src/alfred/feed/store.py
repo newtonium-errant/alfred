@@ -58,9 +58,20 @@ def _revival_suppressed(
     appointment came back the next morning, and the next, forever.
 
     Suppress only when ALL of:
-      * the item is stored and already decided (``acted`` / ``acked``) —
+      * the item is stored and already DECIDED (``acted`` / ``acked``) —
         an open item is not being revived, and ``expired`` keeps its existing
         behaviour rather than acquiring a new one here;
+
+        ``retired`` is deliberately absent from that pair, and it is the one
+        member of this list that changed meaning when retirement became its own
+        state. This suppression exists to keep a DECISION sticky — the operator
+        acked an appointment, so stop asking. A retirement is precisely not a
+        decision: nobody judged the card, its producer withdrew it. There is
+        nothing to keep sticky, so a re-offered retired card revives like any
+        other new episode. (Before the state existed, a retirement was stored as
+        ``acted`` and DID suppress here — a withdrawn-then-re-offered snapshot
+        card stayed silently terminal. Falling through is the fix, not a
+        side effect.)
       * the kind is a snapshot kind (see ``SNAPSHOT_FINGERPRINT_FIELDS``);
       * both fingerprints are computable AND equal — content is unchanged, so
         there is nothing new to tell the operator.
@@ -240,10 +251,14 @@ class FeedStore:
             Resetting first-seen on return would erase that he has been carrying
             this for a week and make a long-deferred item read as brand new —
             precisely the age signal an attention policy needs most;
-          * stored item was ``acted`` / ``acked`` / ``expired`` and the same key
-            reappears in the open set → a NEW episode: keep the incoming fresh
-            ``created_at``, and the upsert (state=open) legitimately REVIVES it —
-            the authoritative store re-opened it, so it IS open again;
+          * stored item was TERMINAL (``acted`` / ``acked`` / ``expired`` /
+            ``retired``) and the same key reappears in the open set → a NEW
+            episode: keep the incoming fresh ``created_at``, and the upsert
+            (state=open) legitimately REVIVES it — the authoritative store
+            re-opened it, so it IS open again. ``retired`` belongs in that list
+            and not in the preserve-``created_at`` one above: a card the
+            producer withdrew and later offers again is a new episode, not a
+            continuing one;
           * no stored item → first sighting, keep the incoming ``created_at``.
         """
         payload = item.to_dict()
