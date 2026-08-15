@@ -68,11 +68,19 @@ export function BriefView({ title, date, markdown, emptyMessage, testId }: Brief
           {/* #85: fenced blocks (the ```csv the ingest path writes) get their
               own panel + a download button; everything else keeps the exact
               pre-wrap treatment it had. Still escaped text children only. */}
+          {/* INK FROM THE REGISTER, not a literal. `text-neutral-800` was dark
+              ink on `bg-console-panel` (#131d21) — the operator's "most of the
+              brief text is unreadable in that colour", and the reason it was
+              invisible is that the panel adopted the dark register while the
+              text it holds never did. `text-console-ink` is the reading rung of
+              the same ramp the panel spends, so the two cannot drift apart
+              again. This component renders only on the player, so there is no
+              warm route to preserve. */}
           <FencedText
             data-testid={`${testId}-content`}
             text={stripFrontmatter(markdown)}
             nameHint={testId}
-            className="whitespace-pre-wrap break-words text-sm leading-relaxed text-neutral-800"
+            className="whitespace-pre-wrap break-words text-sm leading-relaxed text-console-ink"
           />
         </div>
       )}

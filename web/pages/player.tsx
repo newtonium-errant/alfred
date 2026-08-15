@@ -278,6 +278,16 @@ export default function PlayerPage() {
 
   const loaded = narration != null && audio != null && !error;
   const narrationState = narration && 'state' in narration ? narration.state : null;
+  // The brief's document render fires exactly when THERE IS NOTHING TO PLAY.
+  //
+  // Stated as the absence of slides rather than as a list of state names on
+  // purpose. Every state that cannot play — no_brief, narration_unavailable, an
+  // empty narration — produces zero slides, so one predicate covers all three
+  // and, more importantly, covers the NEXT one: a degradation state added later
+  // inherits the reading fallback automatically instead of silently shipping
+  // without it. The failure direction is showing the operator his brief when he
+  // might not have needed it, never hiding the only copy he has left.
+  const showBriefDocument = loaded && slideCount === 0;
 
   return (
     <>
@@ -375,13 +385,20 @@ export default function PlayerPage() {
                 </p>
                 <h2 className="mt-1 text-lg font-extrabold leading-snug text-console-ink">{currentSlide.title}</h2>
                 <p className="mt-2 break-words text-sm text-console-ink-dim">{currentSlide.text}</p>
-                <Link
-                  href={slideDeepLink(currentSlide.sectionId)}
-                  data-testid="player-slide-link"
-                  className="mt-3 inline-block text-xs font-semibold text-console-ink-dim underline underline-offset-2"
-                >
-                  Open →
-                </Link>
+                {/* Only sections with a REAL surface get an affordance. The old
+                    fallback pointed every other slide at the brief text below,
+                    which is no longer rendered while the player is playing — so
+                    the link would have landed on the Daily Sync every time. No
+                    link is the honest answer; see `slideDeepLink`. */}
+                {slideDeepLink(currentSlide.sectionId) && (
+                  <Link
+                    href={slideDeepLink(currentSlide.sectionId) as string}
+                    data-testid="player-slide-link"
+                    className="mt-3 inline-block text-xs font-semibold text-console-ink-dim underline underline-offset-2"
+                  >
+                    Open →
+                  </Link>
+                )}
               </div>
             )}
 
@@ -524,12 +541,27 @@ export default function PlayerPage() {
             )}
           </section>
         )}
-        {/* The reading surfaces the retired /brief page carried. Below the
-            player because the player is the headline of this surface and the
-            text is the fallback — but ON this surface, because after the
-            retirement there is nowhere else either artifact can be read. */}
+        {/* The reading surfaces. Still ON this surface, because after the /brief
+            retirement there is nowhere else either artifact can be read — but no
+            longer both always-on.
+
+            THE MORNING BRIEF IS NOW A DEGRADATION RENDER (operator, 2026-08-15:
+            "if we're just retiring the old written brief and keeping the player
+            then no need to fix it before removing it"). The slides and the audio
+            ARE the brief now, so a wall of raw markdown under a working player is
+            the defect he photographed, not a feature. It renders only in the two
+            states where the player CANNOT play — which is also what keeps both
+            "Full text below ↓" links honest: they fire in exactly those states
+            and nowhere else.
+
+            THE DAILY SYNC STAYS UNCONDITIONALLY, and that is not an inconsistency.
+            It has no narration, no slides and no audio — `/api/brief/narration`
+            takes no `kind` and speaks only the brief — so this render is its ONLY
+            reachable form in the PWA. Retiring it here would silently undo the
+            reachability move `pages/brief.tsx` was retired to make, one day after
+            it was made. */}
         <div id="brief-text" className="mt-10 flex flex-col gap-8">
-          {brief && (
+          {brief && showBriefDocument && (
             <BriefView
               testId="brief-view"
               title="Morning Brief"
