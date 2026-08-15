@@ -140,8 +140,40 @@ def test_talker_daemon_wires_send_fn_into_transport_app():
     assert "send_fn=_send_via_telegram" in source, (
         "wire_transport_app must receive send_fn=_send_via_telegram. "
         "Without it, /outbound/send returns 503 telegram_not_configured "
-        "for every immediate-send request (the closure has the PTB Bot "
+        "for every immediate-send request (the callable has the PTB Bot "
         "reference; nothing else can deliver)."
+    )
+
+
+def test_talker_daemon_builds_the_send_callable_from_the_factory():
+    """The send leg must come from ``build_send_via_telegram``.
+
+    An inline re-implementation would re-open the hole this lane closed:
+    the factory is where ``app is None`` raises ``TelegramUnavailable``
+    instead of answering ``[]``, and ``[]`` is what every consumer read as
+    a successful send with zero recipients.
+    """
+    source = _daemon_source()
+    assert "build_send_via_telegram(" in source, (
+        "the daemon must build its send callable via "
+        "alfred.telegram.send.build_send_via_telegram, which is where the "
+        "no-bot case becomes a raise rather than an empty list."
+    )
+
+
+def test_talker_daemon_wires_telegram_available_from_the_bot():
+    """/health's ``telegram_connected`` must be told about the BOT.
+
+    Unwired, the handler falls back to inferring it from send-callable
+    registration — which is true on every instance since 2026-08-14/15,
+    including the ones whose channel delivers nothing. The probe an
+    operator would consult about a dark channel would assert it was fine.
+    """
+    source = _daemon_source()
+    assert "telegram_available=app is not None" in source, (
+        "wire_transport_app must receive telegram_available=app is not None. "
+        "Without it /health reports telegram_connected from send_fn "
+        "registration, which is not evidence of a bot."
     )
 
 

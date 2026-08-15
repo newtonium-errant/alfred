@@ -739,50 +739,22 @@ async def run(
         from alfred.transport import scheduler as transport_scheduler
         from alfred.transport import server as transport_server_mod
 
+        from .send import build_send_via_telegram, relay_to_operator
+
         transport_config = load_transport(raw)
         transport_state = TransportState.create(transport_config.state.path)
         transport_state.load()
 
-        async def _send_via_telegram(
-            user_id: int, text: str, dedupe_key: str | None = None,
-        ) -> list[int]:
-            """Dispatch one Telegram message, enforcing a 250ms per-chat floor.
-
-            Telegram rate-limits per-chat at ~1 msg/sec. We enforce a
-            250ms floor under an asyncio.Lock keyed by chat_id so
-            bursts (batch sends, scheduler drains) don't trip 429.
-            """
-            if app is None:
-                # Web-only mode (bit d) — no Telegram bot. Not reached in
-                # practice (empty allowed_users → no scheduler; web-only
-                # instances don't push to Telegram), but guard so a stray
-                # call no-ops loudly instead of raising on ``app.bot``.
-                log.warning(
-                    "talker.daemon.telegram_send_skipped",
-                    detail="web-only mode (no bot_token)",
-                    user_id=user_id,
-                )
-                return []
-            lock = send_lock_map.setdefault(user_id, asyncio.Lock())
-            async with lock:
-                try:
-                    msg = await app.bot.send_message(
-                        chat_id=user_id, text=text,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # 429 / retry_after surfaces as a TelegramError.
-                    log.warning(
-                        "talker.daemon.telegram_send_failed",
-                        user_id=user_id,
-                        error=str(exc),
-                        response_summary=(
-                            f"{exc.__class__.__name__}: {exc}"
-                        ),
-                    )
-                    raise
-                # 250ms inter-message floor per chat.
-                await asyncio.sleep(0.25)
-                return [msg.message_id]
+        # The send leg. ``app is None`` is the web-only instance (every
+        # instance since 2026-08-14/15) and the returned callable RAISES
+        # ``TelegramUnavailable`` there rather than answering ``[]`` — see
+        # ``alfred.telegram.send`` for the contract and the seven consumers
+        # that used to read that ``[]`` as a delivery. Built by a module-level
+        # factory rather than defined inline so the contract has a home and a
+        # test that does not need a daemon.
+        _send_via_telegram = build_send_via_telegram(
+            app, send_lock_map=send_lock_map,
+        )
 
         # Build the bare app — no resources wired yet.
         transport_app = build_transport_app(
@@ -1444,24 +1416,19 @@ async def run(
                     correlation_id=correlation_id,
                 )
                 return {"relayed": False, "kind": kind, "precedence": precedence}
-            try:
-                msg_ids = await _send_via_telegram(
-                    int(primary_user_id), f"{prefix}{text}",
-                )
-                return {
-                    "relayed": True, "kind": kind, "precedence": precedence,
-                    "message_ids": msg_ids,
-                }
-            except Exception as exc:  # noqa: BLE001 — relay failure still acks the sender
-                log.warning(
-                    "talker.daemon.peer_inbox_relay_failed",
-                    kind=kind, precedence=precedence, from_peer=from_peer,
-                    error=str(exc), correlation_id=correlation_id,
-                )
-                return {
-                    "relayed": False, "kind": kind, "precedence": precedence,
-                    "error": str(exc),
-                }
+            # The ACK is the SENDING peer's only evidence — see
+            # ``relay_to_operator`` for why the dark case must not answer
+            # ``relayed: True`` with an empty id list, which is what this
+            # ACKed on every web-only instance before the skip was typed.
+            return await relay_to_operator(
+                _send_via_telegram,
+                int(primary_user_id),
+                f"{prefix}{text}",
+                kind=kind,
+                precedence=precedence,
+                from_peer=from_peer,
+                correlation_id=correlation_id,
+            )
 
         # ---- NL-broker LLM callable (LLM-mediated opt-in lane) ----------
         # ``kind=query_nl`` needs a constrained one-shot completion for
@@ -1786,6 +1753,14 @@ async def run(
             # field rather than repurposing aliases[0].
             vault_path=Path(config.vault.path),
             send_fn=_send_via_telegram,
+            # Threaded at THE production call site in the same commit that
+            # added the kwarg: a default-None gate that only tests pass is a
+            # live write side with a dead read side. ``app`` is bound long
+            # before this line (None ⇒ web-only, no bot_token) and never
+            # rebound, so the bool is a fact rather than a snapshot. Without
+            # it /health reports telegram_connected from send_fn registration
+            # — true on every instance, and true of a dark channel.
+            telegram_available=app is not None,
             pending_items_aggregate_path=pending_items_aggregate_path,
             pending_items_resolve_callable=pending_items_resolver_fn,
             gcal_client=gcal_client,

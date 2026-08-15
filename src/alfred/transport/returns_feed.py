@@ -5,10 +5,16 @@ came due did exactly two things: it rewrote its own record (``reminded_at``,
 the ruled ``slot:``) and it sent a Telegram message. The record write is
 invisible until the operator opens the day plan, and the Telegram leg only
 exists on instances whose bot still lives — on a web-only instance
-``_send_via_telegram`` returns ``[]``, which the scheduler reads as SUCCESS and
-stamps. So the return was CONSUMED and the operator was never told. This module
-is the leg that rings: one feed card per fire, dealt into the deck and pushed to
-the phone by the existing needs-you doorbell.
+``_send_via_telegram`` used to return ``[]``, which the scheduler read as
+SUCCESS and stamped. So the return was CONSUMED and the operator was never
+told. This module is the leg that rings: one feed card per fire, dealt into the
+deck and pushed to the phone by the existing needs-you doorbell.
+
+SINCE PY-A (2026-08-15) the send RAISES ``TelegramUnavailable`` on a botless
+instance instead of answering ``[]``, and the scheduler consumes the return
+only when THIS module's card actually landed — so the ring is no longer merely
+the better leg, it is the one the stamp depends on. See
+:func:`emit_return_card`'s return value, which the scheduler now reads.
 
 THE EMISSION IS NOT THE SEND'S DEPENDENT. :func:`emit_return_card` is called
 BEFORE ``send_fn`` and shares no failure exit with it — an emit fault logs loud

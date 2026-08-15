@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 import frontmatter
 
 from .config import TransportConfig
+from .exceptions import TELEGRAM_UNAVAILABLE_REASON, TelegramUnavailable
 from .returns_feed import emit_return_card, sweep_return_cards
 from .state import TransportState
 from .utils import get_logger
@@ -727,8 +728,8 @@ async def _tick(
         # make it un-returned. Putting the emit below ``send_fn`` would put it
         # behind that call's failure ``continue``, which is precisely the
         # consumed-as-sent hazard this leg exists to close: on an instance with
-        # no Telegram bot the send returns ``[]`` — read as success — so the
-        # return was stamped and the operator was told nothing at all.
+        # no Telegram bot the send used to return ``[]`` — read as success — so
+        # the return was stamped and the operator was told nothing at all.
         #
         # The two legs share NO failure exit. ``emit_return_card`` never raises
         # (it logs loud and answers False), so a feed fault cannot cost the
@@ -736,10 +737,16 @@ async def _tick(
         # because the card's key is the (record, remind_at) pair — the retry
         # tick re-derives the same id and folds to a no-op.
         #
+        # PY-A (2026-08-15) made the return value LOAD-BEARING rather than
+        # advisory: the send now raises ``TelegramUnavailable`` on a botless
+        # instance, and the handler for that raise consumes the return only if
+        # ``card_dealt`` is True. That is this comment's own rule — "consumed
+        # once the operator has been told" — applied one case earlier than T4.
+        #
         # WHEN T4 REMOVES THE SEND LEG: the stamp moves up to follow the EMIT,
         # not the send. The ordering intent is that a return is consumed once
         # the operator has been told, and after T4 the card IS the telling.
-        emit_return_card(feed_handle, entry, now=now)
+        card_dealt = emit_return_card(feed_handle, entry, now=now)
 
         text = format_reminder(entry)
         dedupe_key = (
@@ -749,6 +756,49 @@ async def _tick(
             await send_fn(
                 user_id=user_id, text=text, dedupe_key=dedupe_key,
             )
+        except TelegramUnavailable:
+            # The Telegram leg is DARK — not failing, absent. That is a
+            # different question from the ``except`` below, and it gets a
+            # different answer, because the rule this file already states is
+            # "a return is consumed once the operator has been TOLD" and on a
+            # web-only instance the RING above is the telling.
+            #
+            # So: consume iff the card actually landed. Treating the dark case
+            # as a failure instead would leave ``remind_at`` armed on every
+            # instance we run, re-firing the same reminder every tick forever
+            # — a regression against the pre-lane behaviour, which at least
+            # consumed the return (dishonestly). Treating it as a SUCCESS is
+            # what shipped, and it stamped ``sent_at`` rows for sends that
+            # never happened.
+            #
+            # No ``state.record_send`` on either branch: nothing was sent, so
+            # nothing may claim a sent_at row or hold a 24h dedupe slot.
+            log.warning(
+                "transport.scheduler.reminder_returned_no_telegram",
+                path=entry.rel_path,
+                title=entry.title,
+                kind=kind,
+                remind_at=entry.remind_at.isoformat(),
+                ring_dealt=card_dealt,
+                consumed=card_dealt,
+                reason=TELEGRAM_UNAVAILABLE_REASON,
+                detail=(
+                    "no Telegram bot on this instance; the returned-reminder "
+                    "feed card is the delivery. Consumed only if that card "
+                    "landed — otherwise the reminder stays armed so a fixed "
+                    "feed config re-fires it."
+                ),
+            )
+            if not card_dealt:
+                continue
+            try:
+                clear_remind_at_and_stamp(entry, now)
+            except OSError:
+                log.exception(
+                    "transport.scheduler.stamp_failed",
+                    path=entry.rel_path,
+                )
+            continue
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "transport.scheduler.send_failed",
@@ -799,6 +849,7 @@ async def _tick(
 
     # 2) Pending-queue drain.
     due_scheduled = state.pop_due(now)
+    dark_dead_lettered = 0
     for pending_entry in due_scheduled:
         text = pending_entry.get("text", "")
         target_user = int(pending_entry.get("user_id") or user_id)
@@ -809,6 +860,31 @@ async def _tick(
                 text=text,
                 dedupe_key=dedupe_key or None,
             )
+        except TelegramUnavailable:
+            # Dead-letter rather than re-park. ``TelegramUnavailable`` is
+            # raised on ``app is None``, which is fixed for the lifetime of
+            # this process — so the re-park below would put the entry back on
+            # a queue that can never drain, growing without bound and
+            # re-logging every tick forever. Dead-lettering preserves the
+            # payload, names the cause, and is already an inspectable state
+            # (``alfred transport dead-letter``, GET /outbound/status/{id}).
+            # Nothing was sent, so no ``record_send``.
+            state.append_dead_letter(pending_entry, TELEGRAM_UNAVAILABLE_REASON)
+            dark_dead_lettered += 1
+            log.warning(
+                "transport.scheduler.pending_dead_lettered_no_telegram",
+                id=pending_entry.get("id"),
+                user_id=target_user,
+                dedupe_key=dedupe_key,
+                scheduled_at=pending_entry.get("scheduled_at"),
+                reason=TELEGRAM_UNAVAILABLE_REASON,
+                detail=(
+                    "scheduled send could not be delivered: this instance has "
+                    "no Telegram bot. NOT retried — the condition is fixed "
+                    "for the process lifetime."
+                ),
+            )
+            continue
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "transport.scheduler.pending_send_failed",
@@ -827,6 +903,23 @@ async def _tick(
             "dedupe_key": dedupe_key,
             "sent_at": now.isoformat(),
         })
+
+    # One summary line when a botless instance ate scheduled sends. The
+    # per-entry warnings above are the record; this is the number an operator
+    # can act on, and it exists because "the queue quietly stopped draining"
+    # has no signature of its own.
+    if dark_dead_lettered:
+        log.warning(
+            "transport.scheduler.pending_queue_no_telegram",
+            count=dark_dead_lettered,
+            dead_letter_depth=len(state.dead_letter),
+            reason=TELEGRAM_UNAVAILABLE_REASON,
+            detail=(
+                "scheduled sends were dead-lettered because this instance has "
+                "no Telegram bot. They were NOT delivered and will not retry; "
+                "inspect with `alfred transport dead-letter`."
+            ),
+        )
 
     # Save state once at end of tick — fewer disk writes, atomic.
     if due or stale or due_scheduled:

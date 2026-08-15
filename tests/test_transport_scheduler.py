@@ -39,6 +39,7 @@ from alfred.transport.scheduler import (
     resolve_return_slot,
     _tick,
 )
+from alfred.transport.exceptions import TelegramUnavailable
 from alfred.transport.state import TransportState
 
 
@@ -1250,3 +1251,213 @@ def test_format_reminder_delegates_to_the_shared_renderer() -> None:
         _entry(reminder_text="Verbatim", title="Ignored"),
     ):
         assert format_reminder(entry) == render_return_line(entry)
+
+
+# ---------------------------------------------------------------------------
+# PY-A — the scheduler's two skip consumers
+#
+# Both used to read the botless send's ``[]`` as success: the reminder loop
+# stamped ``reminded_at`` and wrote a ``sent_at`` row for a message nobody
+# got, and the pending drain did the same for every scheduled send. They get
+# DIFFERENT answers because they are different situations — the reminder has
+# a second delivery leg (the returned-reminder feed card) and the queued send
+# does not.
+# ---------------------------------------------------------------------------
+
+
+async def _dark_send(user_id: int, text: str, dedupe_key: str | None = None) -> list[int]:
+    raise TelegramUnavailable("no Telegram bot on this instance (web-only)")
+
+
+def _feed_handle(tmp_path: Path, *, enabled: bool = True):  # type: ignore[no-untyped-def]
+    from alfred.feed import FeedEmitHandle
+
+    return FeedEmitHandle(
+        store_path=str(tmp_path / "feed.jsonl"), instance="Salem", enabled=enabled,
+    )
+
+
+class TestReminderFireOnADarkInstance:
+    """The rule the scheduler already states — "a return is consumed once the
+    operator has been TOLD" — decides this: on a botless instance the feed
+    card IS the telling, so the stamp follows the CARD, not the send."""
+
+    async def test_a_ring_that_landed_consumes_the_return(
+        self, tmp_task_vault: Path, tmp_path: Path,
+    ) -> None:
+        import structlog
+
+        fresh = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        _write_task(tmp_task_vault / "task", "Renew the insurance", remind_at=fresh)
+        config, state, _, _ = _tick_env(tmp_task_vault)
+
+        with structlog.testing.capture_logs() as captured:
+            await _tick(
+                config, state, _dark_send, tmp_task_vault, user_id=42,
+                feed_handle=_feed_handle(tmp_path),
+            )
+
+        matches = _events(captured, "transport.scheduler.reminder_returned_no_telegram")
+        assert len(matches) == 1
+        assert matches[0]["ring_dealt"] is True
+        assert matches[0]["consumed"] is True
+        assert matches[0]["reason"] == "telegram_unavailable"
+        # Consumed: the record is stamped, so it does not re-fire every tick.
+        text = (tmp_task_vault / "task" / "Renew the insurance.md").read_text(
+            encoding="utf-8",
+        )
+        assert "reminded_at" in text
+        assert "remind_at:" not in text
+        # But NOTHING may claim a send: no sent_at row, no 24h dedupe slot.
+        assert state.send_log == []
+
+    async def test_no_ring_leaves_the_reminder_armed(
+        self, tmp_task_vault: Path, tmp_path: Path,
+    ) -> None:
+        """Feed disabled AND no Telegram: nothing told anyone, so the return
+        is NOT consumed — a fixed feed config re-fires it next tick. This is
+        the branch that makes ``consumed`` mean something."""
+        import structlog
+
+        fresh = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        _write_task(tmp_task_vault / "task", "Call the school", remind_at=fresh)
+        config, state, _, _ = _tick_env(tmp_task_vault)
+
+        with structlog.testing.capture_logs() as captured:
+            await _tick(
+                config, state, _dark_send, tmp_task_vault, user_id=42,
+                feed_handle=_feed_handle(tmp_path, enabled=False),
+            )
+
+        matches = _events(captured, "transport.scheduler.reminder_returned_no_telegram")
+        assert len(matches) == 1
+        assert matches[0]["ring_dealt"] is False
+        assert matches[0]["consumed"] is False
+        text = (tmp_task_vault / "task" / "Call the school.md").read_text(
+            encoding="utf-8",
+        )
+        assert "remind_at:" in text
+        assert "reminded_at" not in text
+        assert state.send_log == []
+
+    async def test_a_live_send_still_fires_and_records(
+        self, tmp_task_vault: Path,
+    ) -> None:
+        """POSITIVE CONTROL. Without it, every assertion above holds equally
+        against a scheduler that fires nothing at all."""
+        fresh = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        _write_task(tmp_task_vault / "task", "Water the plants", remind_at=fresh)
+        config, state, sent, send = _tick_env(tmp_task_vault)
+
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+        assert len(sent) == 1
+        assert len(state.send_log) == 1
+        text = (tmp_task_vault / "task" / "Water the plants.md").read_text(
+            encoding="utf-8",
+        )
+        assert "reminded_at" in text
+
+    async def test_a_transient_failure_still_leaves_it_armed(
+        self, tmp_task_vault: Path,
+    ) -> None:
+        """The sibling this fix must not eat: a send that FAILED is retried
+        next tick, unstamped, exactly as before."""
+        fresh = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        _write_task(tmp_task_vault / "task", "Pay the bill", remind_at=fresh)
+        config, state, _, _ = _tick_env(tmp_task_vault)
+
+        async def _boom(user_id: int, text: str, dedupe_key: str | None = None):
+            raise RuntimeError("429 Too Many Requests")
+
+        await _tick(config, state, _boom, tmp_task_vault, user_id=42)
+
+        text = (tmp_task_vault / "task" / "Pay the bill.md").read_text(encoding="utf-8")
+        assert "remind_at:" in text
+        assert "reminded_at" not in text
+        assert state.send_log == []
+
+
+class TestPendingDrainOnADarkInstance:
+    """A queued send has no second leg, and ``TelegramUnavailable`` is fixed
+    for the process lifetime — so re-parking puts it back on a queue that can
+    never drain. Dead-letter names the cause and stops the loop."""
+
+    def _queue_one(self, state, when: str) -> None:  # type: ignore[no-untyped-def]
+        state.enqueue({
+            "id": "sched-1",
+            "user_id": 42,
+            "text": "the scheduled thing",
+            "dedupe_key": "k1",
+            "scheduled_at": when,
+        })
+
+    async def test_a_dark_drain_dead_letters_with_a_reason(
+        self, tmp_task_vault: Path,
+    ) -> None:
+        import structlog
+
+        config, state, _, _ = _tick_env(tmp_task_vault)
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        self._queue_one(state, past)
+
+        with structlog.testing.capture_logs() as captured:
+            await _tick(config, state, _dark_send, tmp_task_vault, user_id=42)
+
+        assert len(state.dead_letter) == 1
+        assert state.dead_letter[0]["dead_letter_reason"] == "telegram_unavailable"
+        assert state.dead_letter[0]["text"] == "the scheduled thing"
+        # NOT re-parked (that queue could never drain) and NOT recorded sent.
+        assert state.pending_queue == []
+        assert state.send_log == []
+
+        per_entry = _events(
+            captured, "transport.scheduler.pending_dead_lettered_no_telegram",
+        )
+        assert len(per_entry) == 1
+        assert per_entry[0]["id"] == "sched-1"
+        summary = _events(captured, "transport.scheduler.pending_queue_no_telegram")
+        assert len(summary) == 1
+        assert summary[0]["count"] == 1
+
+    async def test_a_live_drain_still_sends_and_records(
+        self, tmp_task_vault: Path,
+    ) -> None:
+        """POSITIVE CONTROL for the dead-letter pin."""
+        config, state, sent, send = _tick_env(tmp_task_vault)
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        self._queue_one(state, past)
+
+        await _tick(config, state, send, tmp_task_vault, user_id=42)
+
+        assert len(sent) == 1
+        assert len(state.send_log) == 1
+        assert state.dead_letter == []
+
+    async def test_a_transient_failure_still_re_parks(
+        self, tmp_task_vault: Path,
+    ) -> None:
+        """The sibling: a genuine outage keeps the retry, because THAT one can
+        succeed on the next tick."""
+        config, state, _, _ = _tick_env(tmp_task_vault)
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        self._queue_one(state, past)
+
+        async def _boom(user_id: int, text: str, dedupe_key: str | None = None):
+            raise RuntimeError("connection reset")
+
+        await _tick(config, state, _boom, tmp_task_vault, user_id=42)
+
+        assert len(state.pending_queue) == 1
+        assert state.dead_letter == []
+
+    async def test_an_empty_queue_says_nothing(self, tmp_task_vault: Path) -> None:
+        """The summary line must fire on the condition, not on every tick —
+        a warning every 30s on an idle queue is noise that trains the operator
+        to ignore the one that matters."""
+        import structlog
+
+        config, state, _, _ = _tick_env(tmp_task_vault)
+        with structlog.testing.capture_logs() as captured:
+            await _tick(config, state, _dark_send, tmp_task_vault, user_id=42)
+        assert _events(captured, "transport.scheduler.pending_queue_no_telegram") == []

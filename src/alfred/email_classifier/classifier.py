@@ -924,8 +924,8 @@ async def _push_high_priority_email(
 
     Returns True when ``send_outbound`` returned successfully (operator
     will see the Telegram message in their queue). False on every
-    failure path: no ``primary_telegram_user_id`` configured, transport
-    error, or unexpected exception.
+    failure path: no ``primary_telegram_user_id`` configured, no Telegram
+    bot on this instance, transport error, or unexpected exception.
 
     Failure tolerance: every ``TransportError`` subclass is caught and
     logged via ``email_classifier.high_push_failed``; the function
@@ -949,7 +949,11 @@ async def _push_high_priority_email(
     # transport dependency at module-load time (relevant for unit tests
     # that don't exercise this code path).
     from alfred.transport.client import send_outbound
-    from alfred.transport.exceptions import TransportError
+    from alfred.transport.exceptions import (
+        TELEGRAM_UNAVAILABLE_REASON,
+        TelegramUnavailable,
+        TransportError,
+    )
 
     message = _render_c5_message(
         note_rel_path=note_rel_path,
@@ -966,6 +970,32 @@ async def _push_high_priority_email(
             text=message,
             dedupe_key=dedupe_key,
         )
+    except TelegramUnavailable:
+        # A DARK CHANNEL IS NOT AN OUTAGE. Logging this as
+        # ``high_push_failed`` would send an operator hunting a transport
+        # fault that does not exist; and returning True (what ``[]`` used to
+        # produce) stamped ``pushed_to_telegram: true`` onto the record —
+        # the exact field the calibration UI greps to find "mail that
+        # triggered an active operator notification".
+        #
+        # The severity is moderate rather than high ONLY because the
+        # ``email_urgent`` feed card is a live operator-facing leg on
+        # web-only instances: it is emitted from this same classify pass,
+        # independent of this push's gate, and it is a decide/needs-you kind
+        # so it deals to the deck and rings the push doorbell.
+        log.warning(
+            "email_classifier.high_push_skipped_no_bot",
+            path=note_rel_path,
+            user_id=user_id,
+            dedupe_key=dedupe_key,
+            reason=TELEGRAM_UNAVAILABLE_REASON,
+            detail=(
+                "no Telegram bot on this instance — the c5 push was NOT "
+                "delivered. The email_urgent feed card is the operator-"
+                "facing leg here."
+            ),
+        )
+        return False
     except TransportError as exc:
         log.warning(
             "email_classifier.high_push_failed",
