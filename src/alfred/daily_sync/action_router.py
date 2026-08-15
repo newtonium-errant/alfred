@@ -191,9 +191,55 @@ DEFER_ACTIONS: tuple[str, ...] = (DEFER_NEXT_RENDER, *DEFER_DURATIONS)
 #: would be a second set-aside that the detector does not consult — the card
 #: would return on the next override regardless, which is a promise broken
 #: rather than a rung offered.
+#: ``email_urgent`` is excluded for a THIRD reason, and it is the one the other
+#: two make obvious in hindsight: NOTHING RECONCILES IT. The curator upserts an
+#: urgent card per-item at classify time and no producer ever calls
+#: ``reconcile`` for the kind, so ``_revival_suppressed`` — the only code that
+#: consults ``defer_window_open`` — is never reached for it, and ``/feed/items``
+#: filters state by exact string. A deferred urgent card is therefore TERMINAL:
+#: off every open query, with nothing left that could bring it back. The model's
+#: own words for that shape are "a defer that never returns is a silent drop
+#: wearing a politer name".
+#:
+#: It is a fail-safe close, not the fix. The proper answer is a reconciler for
+#: the kind, which is boarded as its own lane; until it exists, refusing the verb
+#: is honest and offering it is not. Removing the verbs also makes the ceiling
+#: check inside the ``URGENT_KIND`` intercept reject a defer outright (verified
+#: by running it, not by reading it) instead of converting it to an ``ack`` —
+#: an error the operator can see beats a decision they never made.
 DEFER_EXCLUDED_KINDS: frozenset[str] = frozenset(
-    {"slot_suggestion", "pattern_surfaced"}
+    {"slot_suggestion", "pattern_surfaced", "email_urgent"}
 )
+
+#: WHERE A DEFERRED CARD OF THIS KIND COMES BACK FROM — the other half of the
+#: partition, and the reason a future producer cannot repeat #102's mistake by
+#: accident.
+#:
+#: A defer is a PROMISE: the item is not judged, only moved, so it MUST return.
+#: The only mechanism that returns one is a ``reconcile`` pass over the kind
+#: (``_revival_suppressed`` holds the item while ``defer_window_open`` is true
+#: and the upsert returns it when the window lapses). A kind that carries the
+#: defer verbs with no reconciler makes a promise the system cannot keep — which
+#: is exactly what shipped for ``email_urgent`` and is now excluded above.
+#:
+#: So every kind carrying the verbs must name its return path here, and
+#: ``tests/feed/test_defer_return_path.py`` VERIFIES each claim against the
+#: named source rather than trusting it: the ``feed_producer`` entries against
+#: the live ``_FAMILIES`` registry, the ``brief`` entries against the
+#: ``feed_kind=`` literals in that module, ``transport.returns_feed`` against the
+#: ``try_feed_reconcile`` call it really makes. The partition itself — every
+#: defer-carrying kind is either declared here or excluded above, never both and
+#: never neither — is asserted by the same test, so a kind added to
+#: ``FEED_ACTIONS`` (which gains the verbs by the auto-fold below) fails until
+#: its author has answered the question.
+DEFER_RETURN_PATH: dict[str, str] = {
+    "email_tier": "alfred.daily_sync.feed_producer",
+    "attribution": "alfred.daily_sync.feed_producer",
+    "proposal": "alfred.daily_sync.feed_producer",
+    "pending": "alfred.daily_sync.feed_producer",
+    "routine_match": "alfred.daily_sync.feed_producer",
+    "reminder_returned": "alfred.transport.returns_feed",
+}
 
 
 FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
@@ -1944,7 +1990,22 @@ def _act_locked(
     # capability ceiling: any action other than ``ack`` is invalid. This block
     # touches ONLY email_urgent — the universal FYI-ack gate is byte-unchanged,
     # so every other decide kind's ack still returns invalid_action there.
-    if kind == URGENT_KIND:
+    #
+    # GATED ON THE VERB as well as the kind, matching the ``RETURN_KIND`` block
+    # below, and the difference is defence in depth rather than tidiness. The
+    # membership test on the next line already rejects a defer now that
+    # ``email_urgent`` is excluded — but that rejection is CONTINGENT ON THE
+    # CEILING'S CONTENTS, and the whole point of the boarded reconciler lane is
+    # to put those verbs back. On the day it does, a kind-only gate would
+    # silently resume converting every defer into an ``acted``/``ack`` — the
+    # operator saying "later" and the system recording "decided" — because this
+    # block sits ABOVE the defer dispatcher and would answer first.
+    #
+    # Testing the verb makes the refusal a property of THIS block instead of a
+    # side effect of what the ceiling happens to hold, so a defer falls through
+    # to its own dispatcher whenever the ceiling admits one. Verified by running
+    # both shapes, not by reading them.
+    if kind == URGENT_KIND and action_id == ACK_ACTION:
         if action_id not in FEED_ACTIONS.get(URGENT_KIND, {}):
             log.info(
                 "feed.act.invalid_action", id=feed_item_id, kind=kind,
