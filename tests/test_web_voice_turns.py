@@ -114,16 +114,102 @@ def _deps(state, *, rts, in_flight=None, key=_KEY, reply_guidance="") -> TurnDep
 
 
 async def _wait_for(ch: FakeChannel, types: set[str], timeout: float = 1.0) -> dict:
-    """Wait until a frame of one of ``types`` appears; return it."""
+    """Wait until a frame of one of ``types`` appears; return it.
+
+    SCAN, THEN CHECK THE DEADLINE, THEN SLEEP — in that order, and the order is
+    the whole fix. The previous shape checked the clock at the TOP of the loop,
+    so a frame arriving during the final ``sleep(0.005)`` was never scanned: the
+    next iteration's deadline test exited first and the helper raised about a
+    frame that was sitting in ``ch.sent`` the entire time. Under a loaded run
+    that last-interval arrival is ordinary, which is why this presented as a
+    flake rather than as a bug.
+
+    Restructured, every arrival gets at least one scan after it lands, and the
+    only failure left is the honest one: the frame really never came. Note this
+    is NOT a widened timeout — the deadline is unchanged. Waiting longer would
+    have hidden the race by making it rarer; scanning last removes it.
+    """
     deadline = asyncio.get_event_loop().time() + timeout
     seen = 0
-    while asyncio.get_event_loop().time() < deadline:
+    while True:
         for frame in ch.sent[seen:]:
             if frame.get("type") in types or frame.get("state") in types:
                 return frame
         seen = len(ch.sent)
+        if asyncio.get_event_loop().time() >= deadline:
+            break
         await asyncio.sleep(0.005)
     raise AssertionError(f"no frame of {types} within {timeout}s; got {ch.sent}")
+
+
+# ---------------------------------------------------------------------------
+# The helper's own race — pinned deterministically
+# ---------------------------------------------------------------------------
+
+
+async def test_wait_for_sees_a_frame_that_lands_in_the_final_interval() -> None:
+    """A frame arriving during the LAST poll sleep must still be found.
+
+    THE RACE THIS PINS, which cost a full-suite run tonight: the helper used to
+    check its deadline at the TOP of the loop, so a frame that landed during the
+    final ``sleep`` was never scanned — the next deadline test exited first and
+    it raised about a frame already sitting in ``ch.sent``. Under load that
+    last-interval arrival is ordinary, so it presented as a flake in a test that
+    had nothing to do with timing.
+
+    PROVEN WITHOUT A CLOCK, deliberately. A timing-based proof of a timing fix
+    is the same species the fix is removing: it would pass or fail on how busy
+    the machine is, which is exactly the property under repair. So the loop's
+    clock and its sleep are both substituted — the frame lands DURING the sleep
+    and the deadline passes in the same step, which is the race's shape made
+    exact. Pre-fix this raises AssertionError; post-fix it returns the frame,
+    and neither outcome depends on wall-clock time.
+    """
+    ch = FakeChannel()
+
+    class _Clock:
+        """Just enough event loop for the helper's two calls."""
+
+        def __init__(self) -> None:
+            self.t = 0.0
+
+        def time(self) -> float:
+            return self.t
+
+    clock = _Clock()
+    real_sleep = asyncio.sleep
+
+    async def _sleep_that_delivers(_delay: float) -> None:
+        # The frame arrives while we are asleep …
+        ch.sent.append({"v": 1, "type": "error", "code": "no_such_session"})
+        # … and the deadline passes before we wake. Ordering is the point: the
+        # helper must scan once more before it is allowed to give up.
+        clock.t += 999.0
+        await real_sleep(0)
+
+    original_get_loop = asyncio.get_event_loop
+    original_asyncio_sleep = asyncio.sleep
+    asyncio.get_event_loop = lambda: clock  # type: ignore[assignment]
+    asyncio.sleep = _sleep_that_delivers  # type: ignore[assignment]
+    try:
+        frame = await _wait_for(ch, {"error"}, timeout=0.01)
+    finally:
+        asyncio.get_event_loop = original_get_loop  # type: ignore[assignment]
+        asyncio.sleep = original_asyncio_sleep  # type: ignore[assignment]
+
+    assert frame["code"] == "no_such_session"
+
+
+async def test_wait_for_still_fails_when_the_frame_never_comes() -> None:
+    """The positive control for the fix: it must still be able to FAIL.
+
+    A scan-after-deadline restructure that accidentally looped forever, or one
+    that returned something falsy, would make every consumer of this helper
+    vacuous. The honest failure has to survive the repair.
+    """
+    ch = FakeChannel()
+    with pytest.raises(AssertionError, match="no frame of"):
+        await _wait_for(ch, {"error"}, timeout=0.02)
 
 
 def _hello(driver: VoiceTurnDriver) -> None:
