@@ -348,7 +348,13 @@ class FeedStore:
                 )
             events.extend(
                 {"ev": "state", "ts": ts, "id": item_id, "state": STATE_ACTED}
-                for item_id in sorted(absent)
+                # ``key=str`` because the fold does not coerce types: one item
+                # carrying a non-string id makes a bare sort's own comparison
+                # raise TypeError, and the belt then refuses the whole
+                # reconcile — every kind's retirement blocked by one malformed
+                # line. The order is only the sequence of appended log events,
+                # so rendering the key costs nothing semantic.
+                for item_id in sorted(absent, key=str)
             )
             self._append_lines_locked(events)
             self._maybe_compact_locked()

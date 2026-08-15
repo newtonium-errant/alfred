@@ -869,16 +869,17 @@ class TestContainment:
         rather than raw. Asserted through ``_tick`` because what is actually at
         stake is the leg below it: the pending-queue drain.
 
-        WHAT THIS TEST ALSO RECORDS, because it is the honest answer rather than
-        the one I set out to write: the same mixed-type comparison reappears
-        DOWNSTREAM, in ``FeedStore.reconcile``'s own ``sorted(absent)`` when two
-        or more items of the kind are absent. That is shared store code with
-        every producer behind it, so this lane does not touch it. The belt
-        (``try_feed_reconcile``) catches it, says so as ``feed.reconcile_failed``,
-        and the tick continues — retirement for this kind is BLOCKED until the
-        malformed line leaves the store, loudly rather than silently. Asserted
-        here so the degradation is documented where someone will find it; if the
-        shared sort is ever made total, this expectation flips deliberately.
+        THE FLIP THIS TEST'S DOCSTRING PROMISED. It used to record a
+        degradation: the same mixed-type comparison reappeared downstream in
+        ``FeedStore.reconcile``'s own ``sorted(absent)``, the belt caught it as
+        ``feed.reconcile_failed``, and retirement for the kind was BLOCKED until
+        the malformed line left the store. That was shared store code with every
+        producer behind it, so the lane that found it deliberately did not touch
+        it and wrote down the condition for changing the expectation instead.
+        The shared sort is now total (``sorted(absent, key=str)``), so the
+        assertions below are the ones the old docstring said they would become:
+        the reconcile SUCCEEDS and the cards retire. The red test was the fix
+        lane's instruction, which is what a documented degradation is for.
         """
         good = FeedItem.create(
             kind=KIND_REMINDER_RETURNED,
@@ -920,11 +921,11 @@ class TestContainment:
         assert len(retired) == 1
         assert {r["reason"] for r in retired[0]["retired"]} == {RETIRE_RECORD_GONE}
         assert len(retired[0]["retired"]) == 2
-        # …and the documented degradation: the shared reconcile's own sort over
-        # the absent set hits the same mixed-type comparison, so the WRITE is
-        # refused by the belt and the cards stay open. Loud, not silent.
-        assert _events(captured, "feed.reconcile_failed")
-        assert store.load()[good.id].state == STATE_OPEN
+        # …and the reconcile now COMPLETES over the mixed-type id set, so the
+        # retirement actually lands. No belt refusal, and the card whose record
+        # does not exist goes acted.
+        assert not _events(captured, "feed.reconcile_failed")
+        assert store.load()[good.id].state == STATE_ACTED
 
     def test_the_outer_belt_keeps_a_sweep_fault_off_the_rest_of_the_tick(
         self, vault, handle, store, monkeypatch,

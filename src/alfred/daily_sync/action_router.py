@@ -191,24 +191,17 @@ DEFER_ACTIONS: tuple[str, ...] = (DEFER_NEXT_RENDER, *DEFER_DURATIONS)
 #: would be a second set-aside that the detector does not consult — the card
 #: would return on the next override regardless, which is a promise broken
 #: rather than a rung offered.
-#: ``email_urgent`` is excluded for a THIRD reason, and it is the one the other
-#: two make obvious in hindsight: NOTHING RECONCILES IT. The curator upserts an
-#: urgent card per-item at classify time and no producer ever calls
-#: ``reconcile`` for the kind, so ``_revival_suppressed`` — the only code that
-#: consults ``defer_window_open`` — is never reached for it, and ``/feed/items``
-#: filters state by exact string. A deferred urgent card is therefore TERMINAL:
-#: off every open query, with nothing left that could bring it back. The model's
-#: own words for that shape are "a defer that never returns is a silent drop
-#: wearing a politer name".
-#:
-#: It is a fail-safe close, not the fix. The proper answer is a reconciler for
-#: the kind, which is boarded as its own lane; until it exists, refusing the verb
-#: is honest and offering it is not. Removing the verbs also makes the ceiling
-#: check inside the ``URGENT_KIND`` intercept reject a defer outright (verified
-#: by running it, not by reading it) instead of converting it to an ``ack`` —
-#: an error the operator can see beats a decision they never made.
+#: ``email_urgent`` WAS excluded here, for a third reason the other two make
+#: obvious in hindsight: nothing reconciled it, so a deferred urgent card was
+#: terminal — off every open query with nothing left to bring it back. That was
+#: a fail-safe close, explicitly not the fix. The fix now exists
+#: (``alfred.curator.urgent_feed``, swept on the curator tick that hosts the
+#: classifier), so the verbs return and the kind moves to the OTHER branch of
+#: the partition below. The withdrawal and the re-admission are the same
+#: argument read in two directions: a kind may carry a defer exactly when
+#: something can bring it back.
 DEFER_EXCLUDED_KINDS: frozenset[str] = frozenset(
-    {"slot_suggestion", "pattern_surfaced", "email_urgent"}
+    {"slot_suggestion", "pattern_surfaced"}
 )
 
 #: WHERE A DEFERRED CARD OF THIS KIND COMES BACK FROM — the other half of the
@@ -233,6 +226,7 @@ DEFER_EXCLUDED_KINDS: frozenset[str] = frozenset(
 #: ``FEED_ACTIONS`` (which gains the verbs by the auto-fold below) fails until
 #: its author has answered the question.
 DEFER_RETURN_PATH: dict[str, str] = {
+    "email_urgent": "alfred.curator.urgent_feed",
     "email_tier": "alfred.daily_sync.feed_producer",
     "attribution": "alfred.daily_sync.feed_producer",
     "proposal": "alfred.daily_sync.feed_producer",

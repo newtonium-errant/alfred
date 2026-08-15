@@ -52,7 +52,7 @@ from alfred.feed import (
     FeedStore,
     try_feed_reconcile,
 )
-from alfred.feed.model import STATE_DEFERRED, STATE_OPEN
+from alfred.feed.sweep import as_open, collect_live_cards
 
 from .utils import get_logger
 
@@ -249,9 +249,12 @@ def _held(stored: FeedItem) -> FeedItem:
     and can be dismissed, while a card that vanishes because a file briefly
     failed to parse takes the operator's notification with it and leaves no
     trace to ask about.
+
+    The normalization itself is :func:`alfred.feed.sweep.as_open`, shared with
+    every other sweep; the NAME stays here because "held" is this module's word
+    for the decision, and the decision is what the call sites are about.
     """
-    return replace(stored, state=STATE_OPEN, deferred_until=None,
-                   acted_at=None, acted_action=None)
+    return as_open(stored)
 
 
 def _refresh_or_retire(
@@ -426,51 +429,36 @@ def _sweep_locked(
     vault_path: Path,
     now: datetime,
 ) -> dict[str, int] | None:
-    """The sweep body. See :func:`sweep_return_cards` for the contract."""
+    """The sweep body. See :func:`sweep_return_cards` for the contract.
+
+    The MECHANICS — live filter, as-open normalization, decided-card exclusion,
+    per-card belt, id ordering — now live in :func:`alfred.feed.sweep.collect_live_cards`,
+    because ``email_urgent`` grew a sweep of its own and two copies of five
+    invariants is how one of them gets fixed and the other does not. What stays
+    here is what is genuinely this kind's: the per-card question below, and the
+    ``try_feed_reconcile`` call itself — see that module's docstring for why the
+    call may not be hoisted (the class pin resolves the kind argument AT this
+    call site to verify the declaration).
+    """
     store = FeedStore(handle.store_path)
-    stored_items = store.load()
-
-    live = [
-        item for item in stored_items.values()
-        if item.kind == KIND_REMINDER_RETURNED
-        and item.state in (STATE_OPEN, STATE_DEFERRED)
-    ]
-    if not live:
-        return None
-
     retired: list[tuple[str, str]] = []
-    open_items: list[FeedItem] = []
-    # ``str(i.id)`` rather than ``i.id``: the fold does not coerce types either
-    # (the same forward-compat property that let a string arrive as evidence), so
-    # one card carrying a non-string id would make this sort raise TypeError on
-    # the COMPARISON — outside the per-card belt, taking the whole sweep with it.
-    # Sorting the rendered key is total over every id shape.
-    for stored in sorted(live, key=lambda i: str(i.id)):
-        try:
-            verdict = _refresh_or_retire(
-                stored, vault_path, now, instance=handle.instance, retired=retired,
-            )
-        except Exception as exc:  # noqa: BLE001 — one bad card, not the tick
-            # PER-CARD, and the scope is the point. Anything raising out of here
-            # would leave the sweep, leave ``_tick``, and be caught only by the
-            # loop-level handler in ``run`` — which means the pending-queue
-            # drain at the bottom of that tick never runs, every tick, for as
-            # long as the offending card sits in the store. A feed fault taking
-            # down a scheduler leg is exactly what ``feed/belt.py`` exists to
-            # make impossible.
-            #
-            # The card is HELD, matching every other doubt path here: a card we
-            # could not judge is not a card we may retire.
-            log.warning(
-                "transport.scheduler.return_card_verdict_failed",
-                feed_id=stored.id,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                detail="card held open — could not be verified this sweep",
-            )
-            verdict = _held(stored)
-        if verdict is not None:
-            open_items.append(verdict)
+
+    def _verdict(stored: FeedItem) -> FeedItem | None:
+        return _refresh_or_retire(
+            stored, vault_path, now, instance=handle.instance, retired=retired,
+        )
+
+    prepared = collect_live_cards(
+        store, KIND_REMINDER_RETURNED,
+        refresh=_verdict,
+        # The EXACT event names this module shipped with. The mechanics moved;
+        # the operator's grep strings did not.
+        load_failed_event="transport.scheduler.return_card_sweep_failed",
+        card_failed_event="transport.scheduler.return_card_verdict_failed",
+    )
+    if prepared.empty:
+        return None
+    open_items = prepared.open_items
 
     counts = try_feed_reconcile(store, KIND_REMINDER_RETURNED, open_items)
     if retired:
