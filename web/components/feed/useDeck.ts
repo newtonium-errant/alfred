@@ -16,7 +16,7 @@ import {
   type Verdict,
 } from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
-import { ACT_UNCONFIRMED_MESSAGE, isInconclusive } from '../../lib/algernon/actConfirm';
+import { ACT_UNCONFIRMED_MESSAGE, isInconclusive, refusalReason } from '../../lib/algernon/actConfirm';
 import {
   clearAllUnrecorded,
   clearUnrecorded,
@@ -106,21 +106,6 @@ function classifyActFailure(e: unknown): ActFailure {
   if (isFatalTransport(e)) return 'fatal';
   if (isInconclusive(e)) return 'inconclusive';
   return 'refused';
-}
-
-/**
- * The operator-facing reason a verdict did not stick.
- *
- * The server's OWN words first (`detail` — the resolver's message, e.g. "aged
- * out of the last batch"), then its error code, then a last-resort line. On the
- * throw path `detail` is the only part of the `FeedActResult` that survives:
- * `http.ts` builds `ApiError` from `{error, detail}`, so a transport 409 whose
- * body is an ActResult arrives with `code === 'request_failed'` and its machine
- * `status` dropped. Reaching for `code` before `detail` would therefore print
- * "request_failed" at the operator in the single commonest case there is.
- */
-function refusalReason(e: ApiError): string {
-  return e.detail || e.code || 'the server refused it';
 }
 
 /**

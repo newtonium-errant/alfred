@@ -1,6 +1,7 @@
 import type { Verdict } from './feedConstants';
+import { createUnrecordedLedger, type UnrecordedAct } from './unrecordedLedger';
 
-// The deck's UNRECORDED-VERDICT ledger — the verdicts the operator gave that the
+// The DECK's unrecorded-verdict ledger — the verdicts the operator gave that the
 // server refused, held until the operator has actually seen them.
 //
 // ## The incident this exists to prevent
@@ -9,39 +10,25 @@ import type { Verdict } from './feedConstants';
 // two spam, three confirm. Every act came back 409 `stale_item`
 // (`aged_out_of_last_batch`: the classifier was quota-dead and its batch had
 // aged out). The deck advanced past all five anyway, because the POST is
-// deferred behind the undo window and the advance never consults it. His five
+// deferred behind the undo window and the advance never consulted it. His five
 // verdicts were recorded nowhere. The same five cards greeted him on the feed
 // banner. The only thing he got was, at most, ONE toast — "That one had already
 // moved on — it'll resurface at the next sync" — which named no card, arrived
 // while a DIFFERENT card was on screen, and never said the words that mattered:
 // your verdict was not recorded.
 //
-// ## Why a STORE and not just React state
+// ## What lives here, and what moved
 //
-// The failure can arrive after the deck is gone. The last card's act fires from
-// the unmount cleanup, and its answer lands when there is no component left to
-// tell. That path used to be `.catch(() => {})` — a deliberate discard, and the
-// most silent of the four softeners. A ledger that lives only in hook state
-// cannot fix it, because the state is already unmounted when the truth arrives.
-// So the WRITE side is a plain function call that touches storage and nothing
-// else: it works identically from a live render and from a dead closure.
+// The STORAGE MECHANISM — localStorage over sessionStorage, the unbounded list,
+// the degrade-toward-saying-less read, replace-not-append — is now
+// `unrecordedLedger`, shared with the board's grace flush, which is the same
+// deferred-write shape with the same silence at its unmount. Its reasoning lives
+// there in full. THIS file keeps what is the deck's alone: its key, the
+// `verdict` its entries carry, and the words for that verdict.
 //
-// ## localStorage, deliberately — NOT sessionStorage
-//
-// Its sibling `deckSnooze` is session-scoped on purpose (a client-side snooze
-// means "not in this sitting", so it should die with the tab). This is the
-// opposite kind of fact. An unrecorded verdict is a DEBT: the operator decided
-// something and the system failed to keep it. Closing the tab does not settle a
-// debt, and a ledger that forgets on tab close would re-run the incident with an
-// extra step. It survives until the verdict is re-given and lands, or until the
-// operator acknowledges it.
-//
-// Deliberately UNBOUNDED. A cap would have to drop something, and every
-// candidate for dropping is a verdict the operator gave and has not yet seen
-// reported — which is the bug. In practice the list is bounded by the deck's own
-// size and drains as entries are re-acted or acknowledged; a storage quota
-// failure degrades to in-memory-only for the session (below), never to a silent
-// trim.
+// The key and the entry shape are UNCHANGED by that lift. There are live
+// entries in production browsers written by the pre-lift code, and a ledger that
+// forgot them on deploy would drop exactly the debts it exists to keep.
 
 /** The `localStorage` key. Exported so a test can seed it the way the deck does. */
 export const DECK_UNRECORDED_KEY = 'algernon_deck_unrecorded';
@@ -49,87 +36,24 @@ export const DECK_UNRECORDED_KEY = 'algernon_deck_unrecorded';
 /**
  * One verdict the server refused.
  *
- * `reason` is the server's OWN words where it had any (`FeedActResult.detail`,
- * e.g. "aged out of the last batch"), else its machine status. `title` is
- * carried because the notice must be able to NAME the card even when that card
- * is no longer in the served batch — which is precisely the case in the
- * incident, and the case where the operator has the least other way to find out.
+ * The base fields are the shared ledger's (see `UnrecordedAct` for why `reason`
+ * and `title` are carried). `verdict` is the deck's own: it is WHAT the operator
+ * decided, and the notice has to say it back to them.
  */
-export interface UnrecordedVerdict {
-  id: string;
-  title: string;
+export interface UnrecordedVerdict extends UnrecordedAct {
   verdict: Verdict;
-  actionId: string;
-  reason: string;
-  at: number;
 }
 
-function isEntry(x: unknown): x is UnrecordedVerdict {
-  if (typeof x !== 'object' || x === null) return false;
-  const e = x as Record<string, unknown>;
-  return typeof e.id === 'string' && typeof e.title === 'string' && typeof e.actionId === 'string';
-}
+const ledger = createUnrecordedLedger<UnrecordedVerdict>(DECK_UNRECORDED_KEY);
 
-/**
- * The ledger, oldest first. Empty on the server, on a parse failure, or when
- * `localStorage` is unavailable.
- *
- * Degrading to EMPTY is the only safe direction here, and it is the opposite
- * trade from the snooze hide-list: a hide-list that cannot be read must hide
- * nothing (hiding everything would blank the deck), and a ledger that cannot be
- * read must claim nothing (inventing a debt would send the operator to re-decide
- * a card that was decided correctly). Both degrade toward saying less.
- */
-export function readUnrecorded(): UnrecordedVerdict[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = window.localStorage.getItem(DECK_UNRECORDED_KEY);
-    const arr = raw ? (JSON.parse(raw) as unknown) : [];
-    return Array.isArray(arr) ? arr.filter(isEntry) : [];
-  } catch {
-    return [];
-  }
-}
-
-function write(entries: UnrecordedVerdict[]): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(DECK_UNRECORDED_KEY, JSON.stringify(entries));
-  } catch {
-    /* storage unavailable / quota → the session's in-memory ledger still shows
-       it; the persistence is what degrades, never the notice on screen. */
-  }
-}
-
-/**
- * Record one refused verdict, replacing any earlier entry for the same card.
- *
- * REPLACE, not append: the operator swiping the same card twice and being
- * refused twice has ONE unpaid debt, not two, and a list that grew a row per
- * retry would bury the other four cards it is supposed to be naming.
- *
- * Callable from a dead closure (the unmount flush) — it touches storage only.
- * Returns the new ledger so a live caller can mirror it into React state without
- * a second read.
- */
-export function recordUnrecorded(entry: UnrecordedVerdict): UnrecordedVerdict[] {
-  const next = [...readUnrecorded().filter((e) => e.id !== entry.id), entry];
-  write(next);
-  return next;
-}
-
+/** The ledger, oldest first. Empty when storage is unreadable — never invented. */
+export const readUnrecorded = ledger.read;
+/** Record one refused verdict, replacing any earlier entry for the same card. */
+export const recordUnrecorded = ledger.record;
 /** Drop one card's entry — it was re-given and landed. Returns the new ledger. */
-export function clearUnrecorded(id: string): UnrecordedVerdict[] {
-  const next = readUnrecorded().filter((e) => e.id !== id);
-  write(next);
-  return next;
-}
-
+export const clearUnrecorded = ledger.clear;
 /** The operator has SEEN the list. Returns the new (empty) ledger. */
-export function clearAllUnrecorded(): UnrecordedVerdict[] {
-  write([]);
-  return [];
-}
+export const clearAllUnrecorded = ledger.clearAll;
 
 /**
  * What the operator DID, as a noun, for copy that has to say it back to them.
