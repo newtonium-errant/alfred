@@ -60,20 +60,33 @@ STATE_DEFERRED = "deferred"
 # record stops being a record — the census annotates them separately.
 STATE_RETIRED = "retired"
 
-# The states from which an item does not return by itself. Consumers asking
-# "is this finished with?" read THIS rather than comparing against ``acted``,
-# which is the drift that let a retirement pass for a decision.
+# NO ``TERMINAL_STATES`` SET LIVES HERE, and that is a decision rather than an
+# omission — it was defined in this lane, found to have no consumer, and removed
+# before it could acquire one.
 #
-# ``deferred`` is deliberately NOT here: a defer is a promise to come back, and
-# the moment it is filed under "terminal" the promise is broken. ``open`` is
-# obviously not. Adding a future state means adding it here — that is the point
-# of the set existing rather than each caller keeping its own tuple.
-TERMINAL_STATES: frozenset[str] = frozenset({
-    STATE_ACTED,
-    STATE_ACKED,
-    STATE_EXPIRED,
-    STATE_RETIRED,
-})
+# The idea was that consumers asking "is this finished with?" would read one
+# frozenset instead of hand-comparing against ``acted``. Every site that looked
+# like its caller turned out to be one of two things it must not be turned into:
+#
+#   * an ALLOWLIST whose allowlist-ness IS its safety property. The router's
+#     folded-state gate admits ``open`` alone; ``deferred`` is non-open but NOT
+#     terminal, so a terminal-denylist there would make an act sail past a card
+#     the operator explicitly parked. The sweep and the reconcile admit
+#     ``(open, deferred)``, and phrasing those as "not terminal" would flip an
+#     unknown FUTURE state from excluded-by-construction to included — handed to
+#     a reconcile that upserts at ``state=open``, i.e. revived every tick, which
+#     is the groundhog bug arriving through the tidy-up meant to prevent it.
+#   * a deliberate PROPER SUBSET that has to stay one. ``_revival_suppressed``
+#     gates on (acted, acked) — DECIDED, deliberately excluding expired and
+#     retired. ``_apply_event``'s verb branch gates on (acted, retired) —
+#     terminal-WITH-VERB, deliberately excluding acked and expired. Both would
+#     be wrong if widened to all four.
+#
+# So the explicit comparisons stay explicit: each encodes a different question,
+# and the set that answered none of them was a claim about a job it was not
+# doing — the same shape as the docstring in feed_producer that named a test
+# nobody had written. Keeping it against a future consumer would have been that
+# same bet placed twice.
 
 # --- snapshot kinds: per-kind revival policy ---------------------------------
 #
