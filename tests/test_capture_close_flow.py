@@ -510,7 +510,7 @@ async def test_a_view_write_fault_does_not_fail_the_close(
     assert matches[0]["error_type"] == "RuntimeError"
 
 
-async def test_reject_does_not_touch_the_view(
+async def test_reject_leaves_the_task_listed_open_in_the_view(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POSITIVE CONTROL for the pin above, in the opposite direction: a reject
@@ -538,7 +538,7 @@ async def test_reject_does_not_touch_the_view(
 
     assert _status(vault) == "todo"
     after = _view_text(vault)
-    assert PROMISE in after.split("## Open")[1]
+    assert PROMISE in after.split("## Open")[1].split("## Closed")[0]
     assert "## Closed" not in after
 
 
@@ -560,7 +560,7 @@ async def test_the_daily_fire_reconciles_a_view_gone_stale_out_of_band(
     cfg = _config(tmp_path)
     _patch_transport(monkeypatch)
     _seed_view(vault)
-    assert PROMISE in _view_text(vault).split("## Open")[1]
+    assert PROMISE in _view_text(vault).split("## Open")[1].split("## Closed")[0]
 
     # An out-of-band close: rewrite the record directly, as an operator editing
     # the file in Obsidian would. Nothing tells the view.
@@ -572,7 +572,9 @@ async def test_the_daily_fire_reconciles_a_view_gone_stale_out_of_band(
         encoding="utf-8",
     )
     assert _status(vault) == "done"
-    assert PROMISE in _view_text(vault).split("## Open")[1]  # still stale
+    # still stale — and read from the Open section proper, not merely "somewhere
+    # after the Open heading", which a later Closed listing would also satisfy.
+    assert PROMISE in _view_text(vault).split("## Open")[1].split("## Closed")[0]
 
     with structlog.testing.capture_logs() as captured:
         await _fire(cfg, vault)
@@ -598,7 +600,8 @@ async def test_the_daily_fire_never_CREATES_the_view(
     view is a legible way to say you do not want it, and a daily job that put
     it back would be overruling the operator.
 
-    Mutation that reds this: drop the ``if view_path.exists()`` guard.
+    Mutations that red this: drop the ``if view_path.exists()`` guard; delete
+    the ``else`` branch's ``log.debug``; delete the whole reconcile block.
     """
     vault = _vault(tmp_path)
     cfg = _config(tmp_path)
@@ -606,12 +609,28 @@ async def test_the_daily_fire_never_CREATES_the_view(
     view = vault / CAPTURED_TASKS_VIEW_REL
     assert not view.exists()  # premise, asserted
 
-    await _fire(cfg, vault)
+    with structlog.testing.capture_logs() as captured:
+        await _fire(cfg, vault)
 
     assert not view.exists(), (
         "the daily fire created a Captured Tasks view in a vault that never "
         "had one — the gate is gone"
     )
+    # …AND THE ELSE-BRANCH WAS REACHED. The absence assertion above is a null
+    # result on its own: it is satisfied just as well by a fire that never got
+    # near the reconcile at all, so deleting the entire block leaves it green
+    # and it cannot tell "the gate held" from "the code is gone". The ILB event
+    # is the positive observation that distinguishes them — it can only be
+    # emitted by the branch this test exists to protect. It doubles as the only
+    # coverage that signal has.
+    absent = _events(captured, "daily_sync.captured_tasks_view.absent")
+    assert len(absent) == 1, (
+        "the daily fire did not report an absent view — either the else-branch "
+        "never ran (so the no-create assertion above proved nothing) or the ILB "
+        "signal is gone and an operator hunting a missing view can no longer "
+        "tell this branch from a silently failing reconcile"
+    )
+    assert absent[0]["path"].endswith(CAPTURED_TASKS_VIEW_REL)
 
 
 async def test_a_reconcile_fault_does_not_sink_the_daily_fire(
