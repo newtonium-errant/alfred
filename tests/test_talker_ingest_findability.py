@@ -43,13 +43,20 @@ CHAT_SCOPES = ("talker", "kalle", "hypatia", "vera")
 #: where "findable but not authorable" is the claim being made.
 AUTHORSHIP_CLOSED_SCOPES = ("talker", "kalle", "vera")
 
-#: Per-scope realistic shapes: distinct vault roots and record names on
-#: purpose. ``vera``'s row is the real record that landed on the box.
+#: Per-scope shapes: distinct vault roots and record names on purpose, so the
+#: pins demonstrate the mechanism rather than one instance's paths.
+#:
+#: THESE NAMES ARE INVENTED, and that is a rule rather than an accident. The
+#: shape production writes is what a fixture should model; the VALUES
+#: production holds are not. A real record here would put an operator's
+#: business identifier into the repository permanently, for a string no
+#: assertion even reads — the fixtures below key on the vault root and the
+#: name they are handed, never on either one's content.
 SCOPE_SHAPES: dict[str, tuple[str, str]] = {
-    "talker": ("Salem", "RBC Statement"),
+    "talker": ("Salem", "Quarterly Statement"),
     "kalle": ("aftermath-lab", "Runbook Export"),
     "hypatia": ("Hypatia", "Paper Draft"),
-    "vera": ("Dame-Bluebird", "3335556 Bank Records"),
+    "vera": ("Dame-Bluebird", "Statement Export"),
 }
 
 
@@ -59,14 +66,20 @@ def _ingested_vault(tmp_path: Path, scope: str) -> tuple[Path, str]:
     vault = tmp_path / root_name
     (vault / "document").mkdir(parents=True)
     (vault / "source").mkdir(parents=True)
+    # PRODUCTION SHAPE, both fields deliberate. The ingest writes
+    # ``ingested_via`` (transport/routes_ingest.py:369) — ``ingested_from`` is
+    # not a field this system has ever had. And ``document`` / ``source`` carry
+    # ``statuses=None`` in the registry, so a raw-ingest record has NO status
+    # at all; stamping one here would model a lifecycle the type does not have,
+    # in the very fixture whose job is to teach the shape.
     (vault / "document" / f"{record_name}.md").write_text(
-        f"---\ntype: document\nname: {record_name}\nstatus: active\n"
-        f"ingested_from: web\n---\n\n# {record_name}\n",
+        f"---\ntype: document\nname: {record_name}\n"
+        f"ingested_via: web\n---\n\n# {record_name}\n",
         encoding="utf-8",
     )
     (vault / "source" / f"{record_name} Portal.md").write_text(
-        f"---\ntype: source\nname: {record_name} Portal\nstatus: active\n"
-        f"---\n\n# {record_name} Portal\n",
+        f"---\ntype: source\nname: {record_name} Portal\n"
+        f"ingested_via: web\n---\n\n# {record_name} Portal\n",
         encoding="utf-8",
     )
     return vault, record_name

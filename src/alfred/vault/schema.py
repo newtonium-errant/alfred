@@ -716,13 +716,37 @@ _DEFINITIONS: list[TypeDefinition] = [
         # Salem -> talker, KAL-LE -> kalle, Hypatia -> hypatia, VERA -> vera.
         # ``hypatia`` was already tagged, so this adds the other three.
         #
-        # This opens gate 1 ONLY, and gate 1 has exactly two call sites:
-        # ``vault_list`` and ``vault_create``. Create stays refused under
-        # every one of these scopes because each has its own gate-2
-        # create allowlist and none includes ``document``; delete and the
-        # body-mutation verbs stay refused by their own gate-2 rules. So the
-        # read side opens and the write side does not move — asserted per
-        # scope rather than assumed symmetric.
+        # On the CREATE path this opens gate 1 only — ``_validate_type`` is
+        # called from exactly two places, ``vault_list`` and ``vault_create``.
+        # Create stays refused under every one of these scopes because each
+        # has its own gate-2 create allowlist and none includes ``document``;
+        # delete and the body-mutation verbs stay refused by their own gate-2
+        # rules. So on that path the read side opens and the write side does
+        # not move — asserted per scope rather than assumed symmetric.
+        #
+        # BUT ``available_in_scopes`` IS NOT A GATE-1-ONLY KNOB, and reading it
+        # as one understates the blast radius. ``known_types(scope)`` /
+        # ``KNOWN_TYPES_BY_SCOPE`` feed two further consumers, so tagging a
+        # type here widens all three surfaces at once:
+        #
+        #   * ``vault/retype.py`` ``_scoped_known_types`` (:469) — the retype
+        #     path contains NO ``check_scope`` call at all. There is no gate 2
+        #     behind it. For talker->document the refusal therefore did not
+        #     stay put; it MOVED to the ``FIELD_MAPPINGS`` feature gate, which
+        #     is a different question ("is this conversion defined?") from the
+        #     one scope policy asks ("may you author this?"). Adding a
+        #     ``(note, document)`` mapping entry would permit a retype INTO
+        #     document with nothing consulting scope policy.
+        #   * ``transport/config.py`` (:1331) — the peer recall allowlist is
+        #     built from ``known_types(instance_scope)``, so these types become
+        #     recall-eligible across the peer protocol. Latent today (no live
+        #     recall config selects them) but it is a real widening, not a
+        #     no-op.
+        #
+        # Neither is ruled a problem here and neither is changed by this lane.
+        # They are named because the next person to tag a type will read this
+        # comment to learn what tagging costs, and "gate 1 only" would have
+        # sent them looking in one place out of three.
         available_in_scopes=frozenset(
             {"hypatia", "web_ingest", "talker", "kalle", "vera"}
         ),
