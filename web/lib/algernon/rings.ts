@@ -82,6 +82,16 @@ export const SNOOZE_ACTED_VERB = 'snooze';
  * `kind === 'slot_suggestion'`. That gating is at the CALL SITES, not in here,
  * which is exactly why the fallback below is not decoration.
  *
+ * :2239 IS NOT THE ONLY GENERIC STAMP — named here so the next auditor meets the
+ * surprise instead of re-deriving it. `action_router.py:1075`
+ * (`_dispatch_contact_pattern`) is a second
+ * `set_state(..., STATE_ACTED, action=action_id)`, stamping `adopt` / `ignore`.
+ * The claim above survives it: that dispatcher serves the `pattern_surfaced`
+ * kind ONLY and is reached through a kind gate at :2075, so no slot can arrive
+ * there and neither verb can land on an item this function sees. Verified at
+ * source, not assumed — and it is the reason the enumeration above is phrased as
+ * "the verbs that can PERSIST on a slot", not "the verbs the router can stamp".
+ *
  * ADDING A VERB: add it HERE, with its stage. Do not re-introduce a branch.
  */
 export const ACTED_VERB_STAGE: Readonly<Record<string, RingItemStage>> = {

@@ -322,6 +322,17 @@ export function RingsHeader({
             suggestedCount > 0 ? `${suggestedCount} suggested` : null,
             snoozedItems.length > 0 ? `${snoozedItems.length} snoozed` : null,
           ].filter((p): p is string => p !== null);
+          // EMPTY BUCKET. `uncommittedParts` is empty exactly when the tier holds
+          // nothing at all: a non-empty uncommitted tier is made of suggested and
+          // snoozed rows, and both counts feed the list above, so the only way to
+          // reach zero parts is zero items. Left bare, the h3 rendered "T2 · " —
+          // a separator introducing nothing, which is the ILB principle pointing
+          // backwards: the panel went quiet at precisely the moment it should say
+          // what it is. Base said "0 suggested" here, and this restores that word
+          // for word rather than inventing new empty-state copy, so the lane's
+          // visible delta stays the snooze behaviour it exists for.
+          const uncommittedLabel =
+            uncommittedParts.length > 0 ? uncommittedParts.join(' · ') : '0 suggested';
           return (
             <div data-testid={`ring-panel-${activeBucket.key}`} className="mt-2 rounded-xl border border-console-edge bg-console-panel p-3 shadow-soft">
               {/* Honest header: the committed ratio ("T2 · 1/2 done"), or — when nothing
@@ -330,7 +341,7 @@ export function RingsHeader({
                 {activeBucket.label} ·{' '}
                 {committedCount > 0
                   ? `${doneItems.length}/${committedCount} done`
-                  : uncommittedParts.join(' · ')}
+                  : uncommittedLabel}
               </h3>
 
               {bucketItems.length === 0 ? (

@@ -198,10 +198,17 @@ describe('RingsHeader (controlled render)', () => {
     expect(screen.queryByTestId('ring-complete')).not.toBeNull(); // still actionable
   });
 
-  it('an empty bucket panel shows its own ILB line', () => {
+  it('an empty bucket panel shows its own ILB line, and a HEADER that says something', () => {
     render(<RingsHeader items={[]} />);
     fireEvent.click(screen.getByTestId('ring-2'));
     expect(screen.queryByTestId('ring-panel-empty')).not.toBeNull();
+    // The header too, because this test exercised the empty bucket without ever
+    // reading it — which is how "T2 · " (a separator introducing nothing) shipped
+    // green. The parts-built header returns '' when the tier holds no items, so
+    // the assertion is on the RENDERED TEXT, not on the parts.
+    const heading = screen.getByTestId('ring-panel-2').querySelector('h3');
+    expect(heading?.textContent).toBe('T2 · 0 suggested');
+    expect(heading?.textContent?.trimEnd()).not.toMatch(/·$/); // no dangling separator
   });
 });
 
