@@ -5180,11 +5180,31 @@ def _cmd_push_trial(args: argparse.Namespace) -> None:
     arrive". That distinction IS the trial — see ``push_trial`` for why.
     """
     from alfred.push_trial import (
-        RulingError, build_status, record_ruling, render_status, trial_path,
+        RulingError, build_status, record_conclusion, record_ruling,
+        render_status, trial_path,
     )
 
     path = trial_path()
     cmd = getattr(args, "push_trial_cmd", None)
+
+    if cmd == "conclude":
+        # THE STOP VERB. Writes the marker only; the web sender retires the
+        # remaining slots as `cancelled` on its next heartbeat, because it owns
+        # the schedule. Idempotent — concluding twice is not an error, and the
+        # first ending stands.
+        try:
+            status = record_conclusion(path, getattr(args, "reason", "") or "")
+        except RulingError as exc:
+            print(f"Refused: {exc}")
+            raise SystemExit(2)
+        print(f"Trial concluded {status.concluded_ts[:19]}.")
+        if status.concluded_reason:
+            print(f"Reason: {status.concluded_reason}")
+        print(
+            "Remaining slots will be recorded as cancelled (not sent) on the "
+            "sender's next pass — they are a decision, not an outage."
+        )
+        return
 
     if cmd == "rule":
         # The ONLY write this surface makes, and it writes the operator's
@@ -7329,6 +7349,17 @@ def build_parser() -> argparse.ArgumentParser:
         "verdict", choices=["arrived", "missed"],
         help="arrived = it reached the phone (you just didn't tap); "
              "missed = it never showed up",
+    )
+    # The STOP verb. A seven-day schedule with no early end left only bad
+    # options once the question was answered: keep buzzing for days it no longer
+    # needed, or switch the sender off and leave the remaining slots looking
+    # like an instrument outage. This ends it and SAYS so.
+    ptrial_conclude = ptrial_sub.add_parser(
+        "conclude",
+        help="End the trial early — remaining slots are cancelled, not skipped")
+    ptrial_conclude.add_argument(
+        "--reason", default="",
+        help="Why you're ending it (recorded on every cancelled slot)",
     )
 
     # #72 — the tier-override escape hatch. `clear` only: putting a kind INTO

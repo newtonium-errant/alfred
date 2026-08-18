@@ -89,9 +89,11 @@ def test_full_counts() -> None:
         STATE_NOT_SENT: 1,
         STATE_PENDING: 2,
         # Present-and-zero rather than absent: a reader that branches on these
-        # keys must not KeyError on a trial nobody has ruled yet.
+        # keys must not KeyError on a trial nobody has ruled yet — nor on one
+        # nobody has concluded, which is why `cancelled` is here too.
         "ruled_arrived": 0,
         "ruled_missed": 0,
+        "cancelled": 0,
     }
 
 

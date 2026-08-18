@@ -57,9 +57,19 @@ ROW_SCHEDULED = "scheduled"
 ROW_SENT = "sent"
 ROW_SEND_FAILED = "send_failed"
 ROW_RECEIPT = "receipt"
-#: The operator's after-the-fact answer about an unknown slot. The ONE row type
-#: written from this side; every other type comes from the web sender.
+#: The operator's after-the-fact answer about an unknown slot. Written from this
+#: side, like :data:`ROW_CONCLUDED`; the rest come from the web sender.
 ROW_RULING = "ruling"
+#: The operator ended the trial early. Written from this side
+#: (``alfred push-trial conclude``) and READ by the web sender, which stops
+#: sending the moment it sees one. Trial-level, so its ``push_id`` is EMPTY —
+#: present-but-blank rather than absent, because :func:`read_rows` treats a row
+#: without a ``push_id`` as malformed and would count the stop marker into
+#: ``skipped_rows``, i.e. report a deliberate ending as ledger corruption.
+ROW_CONCLUDED = "concluded"
+#: A scheduled slot the conclusion retired without sending. Written by the web
+#: sender, one row per remaining slot.
+ROW_CANCELLED = "cancelled"
 
 VERDICT_ARRIVED = "arrived"
 VERDICT_MISSED = "missed"
@@ -80,6 +90,15 @@ STATE_RULED_ARRIVED = "ruled_arrived"
 #: The operator says it never reached the phone. THE finding the trial is for —
 #: this is the only state that is a genuine delivery failure.
 STATE_RULED_MISSED = "ruled_missed"
+#: Deliberately retired unsent because the trial was concluded early.
+#:
+#: A SEPARATE STATE FROM ``not_sent``, and that separation is the whole reason
+#: this constant exists. Without it a cancelled slot has no sent row and no
+#: error, so it falls through to "due passed, no attempt" — INSTRUMENT DOWN —
+#: and a trial the operator deliberately stopped would report a week of phantom
+#: outages. That is precisely the false signal this module was commissioned to
+#: eliminate, arriving through the feature meant to end the trial cleanly.
+STATE_CANCELLED = "cancelled"
 
 #: States a ruling may be applied to: the SENT-BUT-UNTAPPED family — a slot that
 #: is still unknown, and one already ruled (he is allowed to correct himself;
@@ -101,6 +120,11 @@ class SlotStatus:
     due_ts: str = ""
     sent_ts: str = ""
     received_ts: str = ""
+    #: ISO — when an early conclusion retired this slot unsent.
+    cancelled_ts: str = ""
+    #: WHY it was retired, carried from the conclusion so a slot read on its own
+    #: says why it never fired rather than merely that it didn't.
+    cancel_reason: str = ""
     error: str = ""
     state: str = STATE_PENDING
     #: Seconds between send and tap. ``None`` unless both are known — and never
@@ -129,6 +153,8 @@ class SlotStatus:
             "ruling": self.ruling,
             "ruled_ts": self.ruled_ts,
             "is_ruled": self.is_ruled,
+            "cancelled_ts": self.cancelled_ts,
+            "cancel_reason": self.cancel_reason,
         }
 
 
@@ -142,6 +168,15 @@ class TrialStatus:
     orphan_ids: list[str] = field(default_factory=list)
     unreadable: bool = False
     skipped_rows: int = 0
+    #: ISO — when the operator ended the trial early ("" if he never did).
+    #: Always present so "still running" is a value, not an absence.
+    concluded_ts: str = ""
+    #: His stated reason, "" when he gave none.
+    concluded_reason: str = ""
+
+    @property
+    def is_concluded(self) -> bool:
+        return bool(self.concluded_ts)
 
     @property
     def counts(self) -> dict[str, int]:
@@ -149,6 +184,7 @@ class TrialStatus:
             STATE_PENDING: 0, STATE_NOT_SENT: 0, STATE_SEND_FAILED: 0,
             STATE_UNKNOWN: 0, STATE_RECEIVED: 0,
             STATE_RULED_ARRIVED: 0, STATE_RULED_MISSED: 0,
+            STATE_CANCELLED: 0,
         }
         for s in self.slots:
             out[s.state] = out.get(s.state, 0) + 1
@@ -160,6 +196,9 @@ class TrialStatus:
             "orphan_ids": list(self.orphan_ids),
             "unreadable": self.unreadable,
             "skipped_rows": self.skipped_rows,
+            "concluded_ts": self.concluded_ts,
+            "concluded_reason": self.concluded_reason,
+            "is_concluded": self.is_concluded,
             "slots": [s.to_dict() for s in self.slots],
         }
 
@@ -243,6 +282,15 @@ def build_status(
         rtype = row.get("type")
         if rtype == ROW_SCHEDULED:
             continue
+        if rtype == ROW_CONCLUDED:
+            # TRIAL-LEVEL, not slot-level — handled before the slot lookup so its
+            # empty push_id is never mistaken for a row about a slot that was
+            # never scheduled. FIRST wins: the trial stopped when he said it did,
+            # and a second marker cannot move that moment.
+            if not status.concluded_ts:
+                status.concluded_ts = str(row.get("concluded_ts") or "")
+                status.concluded_reason = str(row.get("reason") or "")
+            continue
         slot = slots.get(pid)
         if slot is None:
             if pid not in status.orphan_ids:
@@ -255,6 +303,9 @@ def build_status(
             slot.error = str(row.get("error") or "")
         elif rtype == ROW_RECEIPT:
             slot.received_ts = str(row.get("received_ts") or "")
+        elif rtype == ROW_CANCELLED:
+            slot.cancelled_ts = str(row.get("cancelled_ts") or "")
+            slot.cancel_reason = str(row.get("reason") or "")
         elif rtype == ROW_RULING:
             # LATER RULING WINS, by replaying the append-only log in order. He
             # can correct himself ("actually that one did come through") and the
@@ -289,6 +340,13 @@ def build_status(
                 slot.state = STATE_RULED_MISSED
             else:
                 slot.state = STATE_UNKNOWN
+        elif slot.cancelled_ts:
+            # ORDERED BELOW `sent` DELIBERATELY. A slot that was sent and then
+            # (somehow) cancelled is a SENT slot — the push left the server and
+            # may have arrived, so the delivery datum survives; a later
+            # cancellation cannot retract an observation. Only a slot with no
+            # send at all reads as cancelled.
+            slot.state = STATE_CANCELLED
         elif due is not None and due <= when:
             slot.state = STATE_NOT_SENT
         else:
@@ -391,6 +449,66 @@ def record_ruling(
     return next(s for s in build_status(path, now=when).slots if s.push_id == push_id)
 
 
+def record_conclusion(
+    path: str | Path,
+    reason: str = "",
+    *,
+    now: datetime | None = None,
+) -> TrialStatus:
+    """End the trial early. Appends the ``concluded`` marker; returns the status.
+
+    THE STOP VERB THIS INSTRUMENT DID NOT HAVE. A seven-day schedule with no way
+    to end it early leaves only bad options once the question is answered: let it
+    keep buzzing for days it no longer needs, or switch the sender off and leave
+    the remaining slots looking like an instrument outage. This is the third
+    option, and the only honest one — the trial STOPS and the ledger SAYS it
+    stopped.
+
+    THIS SIDE ONLY WRITES THE MARKER. Retiring the individual slots is the
+    sender's job (`pushTrial.ts` writes one ``cancelled`` row per remaining slot
+    the next time its heartbeat runs), because the sender owns the schedule and
+    re-deriving it here would be the two-implementations trap this module's
+    docstring exists to refuse.
+
+    IDEMPOTENT, AND FIRST WINS. Concluding twice is not an error — the operator
+    should not have to remember whether he already did — but the second call
+    changes nothing and the original moment stands. A conclusion is an EVENT; a
+    ruling is an opinion, which is why that one is later-wins and this is not.
+    """
+    when = now or datetime.now(timezone.utc)
+    status = build_status(path, now=when)
+    if status.unreadable:
+        raise RulingError(
+            "the ledger could not be read — refusing to append to a store whose "
+            "current contents are unknown"
+        )
+    if status.is_concluded:
+        log.info(
+            "push_trial.conclude_noop", concluded_ts=status.concluded_ts,
+            detail="already concluded — the original ending stands",
+        )
+        return status
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "type": ROW_CONCLUDED,
+        # Present-but-empty: a trial-level row still has to satisfy the reader's
+        # push_id requirement or it is counted as a malformed line.
+        "push_id": "",
+        "concluded_ts": when.isoformat(),
+        "reason": (reason or "").strip(),
+    }
+    with target.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    log.info(
+        "push_trial.concluded", reason=(reason or "").strip(),
+        detail="the operator ended the trial early — the sender will retire "
+               "every remaining slot as cancelled on its next pass",
+    )
+    return build_status(path, now=when)
+
+
 def _rerule_hint(status: TrialStatus) -> str:
     """Name a slot the operator could rule next. Empty when there are none."""
     for s in status.slots:
@@ -421,6 +539,14 @@ def render_status(status: TrialStatus, path: str) -> str:
             lines.append(f"  {status.skipped_rows} unparseable row(s) skipped.")
         return "\n".join(lines)
 
+    if status.is_concluded:
+        # Stated up front: every count below is a final tally, not a running one,
+        # and a reader who missed that would treat cancelled slots as pending
+        # work the instrument still owes.
+        why = f" — {status.concluded_reason}" if status.concluded_reason else ""
+        lines.append(f"  CONCLUDED {status.concluded_ts[:19]}{why}")
+        lines.append("  (the trial was ended early; remaining slots were cancelled)")
+
     c = status.counts
     lines.append("")
     lines.append(f"  {'slot':<16} {'due':<20} {'state':<14} evidence")
@@ -430,6 +556,8 @@ def render_status(status: TrialStatus, path: str) -> str:
         # the envelope decision gets read off.
         if s.latency_s is not None:
             evidence = f"tapped +{s.latency_s:.0f}s"
+        elif s.state == STATE_CANCELLED:
+            evidence = s.cancel_reason[:28] or "concluded early"
         elif s.is_ruled:
             evidence = f"ruled {s.ruled_ts[:10]}"
         else:
@@ -450,6 +578,8 @@ def render_status(status: TrialStatus, path: str) -> str:
     lines.append( "                      was down; says nothing about delivery.")
     lines.append(f"  send failed    {c[STATE_SEND_FAILED]:>3}  — the send itself errored (instrument-side).")
     lines.append(f"  pending        {c[STATE_PENDING]:>3}  — still in the future.")
+    lines.append(f"  cancelled      {c[STATE_CANCELLED]:>3}  — retired unsent when the trial was concluded")
+    lines.append( "                      early. A DECISION, not an outage.")
     if status.orphan_ids:
         lines.append("")
         lines.append(f"  ! {len(status.orphan_ids)} row(s) reference slots this ledger never")
@@ -473,8 +603,12 @@ def render_status(status: TrialStatus, path: str) -> str:
 __all__ = [
     "DEFAULT_TRIAL_PATH",
     "RULABLE_STATES",
+    "ROW_CANCELLED",
+    "ROW_CONCLUDED",
     "ROW_RULING",
     "RulingError",
+    "STATE_CANCELLED",
+    "record_conclusion",
     "STATE_RULED_ARRIVED",
     "STATE_RULED_MISSED",
     "VALID_VERDICTS",
