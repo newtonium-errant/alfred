@@ -94,6 +94,61 @@ def test_parse_log_line_returns_none_on_non_log_lines():
     assert parse_log_line("\n") is None
 
 
+def _render_real(event: str, **fields: object) -> str:
+    """Render through the ACTUAL ConsoleRenderer the daemons install.
+
+    Hand-built fixture strings can drift from the renderer; these cannot. The
+    ``level`` key is what makes ConsoleRenderer emit the ``[info     ]``
+    bracket, and every in-tree ``setup_logging`` adds it via
+    ``structlog.stdlib.add_log_level`` — so this is the production shape.
+    """
+    payload = {
+        "event": event,
+        "timestamp": f"{BASE_TS}Z",
+        "level": "info",
+        **fields,
+    }
+    return structlog.dev.ConsoleRenderer(colors=False)(None, "info", payload) + "\n"
+
+
+def test_parses_ids_the_real_renderer_quotes(tmp_path: Path):
+    """PRODUCTION SHAPE. A routine slot id is
+    ``slot_suggestion:routine/Self Care.md`` — it CONTAINS A SPACE, so
+    ConsoleRenderer wraps it in single quotes. If the parser did not unwrap
+    that, the join would fail on exactly the routine lane and the repair would
+    silently match nothing there.
+    """
+    spaced_id = "slot_suggestion:routine/Self Care.md"
+    rendered = _render_real("feed.act.slot.done", id=spaced_id, lane="routine")
+    assert f"'{spaced_id}'" in rendered, "fixture is not exercising the quoted shape"
+
+    parsed = parse_log_line(rendered)
+    assert parsed is not None
+    assert parsed.fields["id"] == spaced_id  # quotes stripped, space preserved
+
+    log_path = tmp_path / "talker.log"
+    log_path.write_text(rendered, encoding="utf-8")
+    plan = build_plan(
+        {spaced_id: _acted_item(spaced_id)}, collect_act_events([log_path]), []
+    )
+    assert [(b.item_id, b.verb) for b in plan.backfills] == [(spaced_id, VERB_DONE)]
+
+
+def test_parses_a_line_with_no_level_bracket():
+    """The bracket only appears when a ``level`` key is present. A caller that
+    logs without ``add_log_level`` must not make this parser go blind."""
+    renderer = structlog.dev.ConsoleRenderer(colors=False)
+    rendered = renderer(
+        None, "info", {"event": "feed.act.acked", "timestamp": f"{BASE_TS}Z", "id": "i9"}
+    )
+    assert "[info" not in rendered, "fixture is not exercising the bracket-less shape"
+
+    parsed = parse_log_line(rendered + "\n")
+    assert parsed is not None
+    assert parsed.event == "feed.act.acked"
+    assert parsed.fields["id"] == "i9"
+
+
 def test_all_four_act_shapes_yield_their_verb(tmp_path: Path):
     """The four act-success shapes, including the one whose verb is in the
     EVENT NAME rather than an ``action=`` field."""

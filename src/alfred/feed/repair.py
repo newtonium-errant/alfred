@@ -86,9 +86,17 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # structlog ConsoleRenderer shape, after ANSI strip:
 #   2026-05-15T14:22:11.123456Z [info     ] feed.act.acted   id=abc action=done
+#
+# The LEVEL BRACKET IS OPTIONAL, and that is a measurement rather than a
+# courtesy: ConsoleRenderer only emits ``[info     ]`` when a ``level`` key is
+# in the event dict, which every in-tree ``setup_logging`` arranges via
+# ``structlog.stdlib.add_log_level``. Rendering both shapes through the real
+# renderer showed a bracket-less line failing a bracket-required pattern
+# outright, so the optional group costs nothing and removes a way for this
+# parser to go silently blind if a caller ever logs without that processor.
 _LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)"
-    r"\s+\[\s*\w+\s*\]\s+"
+    r"\s+(?:\[\s*\w+\s*\]\s+)?"
     r"(?P<event>\S+)"
     r"(?P<rest>.*)$"
 )
