@@ -69,6 +69,7 @@ export default function ChatPage() {
     ack: ackNotifications,
     dismiss: dismissNotifications,
     refresh: refreshNotifications,
+    failures: notificationFailures,
   } = useNotifications({ enabled: authed });
   const wasSending = useRef(false);
   useEffect(() => {
@@ -218,6 +219,10 @@ export default function ChatPage() {
               notifications={notifications}
               onAck={(ids) => void ackNotifications(ids)}
               onDismiss={(ids) => void dismissNotifications(ids)}
+              // The `void` above discards the promise, which is correct — the
+              // hook owns the outcome — but it is also exactly why a failure had
+              // nowhere to go. This is where it lands now.
+              failures={notificationFailures}
             />
           </section>
 
