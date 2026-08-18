@@ -1262,6 +1262,28 @@ def _dispatch_slot_completion(
                 "to undo (un-accept via chat)",
                 feed_item_id, action_id,
             )
+        # A SNOOZE is a delay, not a completion — but it is stamped
+        # ``state=acted, action=snooze`` (see :func:`_slot_snooze`), so the
+        # ``state == STATE_ACTED`` half of ``is_done`` below reads it as done
+        # and would route it to the completion-undo writer. That writer would
+        # find no completion logged and flip a merely-postponed item to open,
+        # silently erasing the operator's snooze.
+        #
+        # This is the same verb-guard shape as the accept case above, and it
+        # has to be its own refusal rather than falling through to "isn't
+        # marked done": the item HAS a live snooze, and the honest answer names
+        # it and points at the action that actually reverses it.
+        if getattr(item, "acted_action", None) == SNOOZE_ACTED_VERB:
+            log.info(
+                "feed.act.slot.undo_on_snoozed", id=feed_item_id, lane=lane,
+                action=action_id,
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                "this item is snoozed, not done — there's nothing to undo "
+                "(use unsnooze to bring it back today)",
+                feed_item_id, action_id,
+            )
         # Undo only when the item is CURRENTLY done — freshly board-acted
         # (state=acted) OR still-open-but-done-in-vault (evidence.done: completed
         # via the talker, or a reconcile revived a board-acted item back to open
