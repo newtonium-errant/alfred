@@ -337,20 +337,48 @@ def test_vault_create_kalle_principle_succeeds(tmp_path) -> None:
     assert (tmp_path / result["path"]).exists()
 
 
-def test_vault_create_hypatia_type_under_kalle_scope_fails(tmp_path) -> None:
-    """Cross-scope leak: Hypatia's ``document`` is unknown under scope='kalle'.
+def test_vault_create_document_under_kalle_scope_fails(tmp_path) -> None:
+    """Cross-scope authorship: KAL-LE may not CREATE a ``document``.
 
-    Under the kalle scope, ``_validate_type`` allows ``KNOWN_TYPES |
-    KNOWN_TYPES_KALLE`` — ``document`` is in neither set. The error
-    fires at the type gate, not at ``check_scope``'s allowlist; we
-    assert on the type-error message to pin which gate caught it.
+    THE GATE MOVED, THE REFUSAL DID NOT (2026-08-18). This pin has always
+    been about which gate catches the cross-scope create, and it used to be
+    gate 1: ``document`` was unknown under scope='kalle', so
+    ``_validate_type`` raised ``VaultError: Unknown type``.
+
+    The web ingest writes documents into every instance's vault, so ``kalle``
+    now tags ``document`` for FINDABILITY and gate 1 admits the word. The
+    create therefore falls through to gate 2, which refuses it on policy:
+    ``KALLE_CREATE_TYPES`` does not contain ``document``.
+
+    That is the SAFER of the two refusals and the pin is updated rather than
+    relaxed. Gate 1 refused out of ignorance — the registry had never heard
+    of the type — and an ignorance-based refusal evaporates the moment the
+    word is learned for any unrelated reason, which is exactly what happened
+    here. Gate 2 refuses because someone decided KAL-LE does not author
+    documents. Only the second survives the vocabulary growing.
+
+    The claim under test is unchanged and is asserted more strictly than
+    before: refused, by policy, with nothing written to disk.
     """
-    with pytest.raises(VaultError) as exc_info:
+    with pytest.raises(ScopeError) as exc_info:
         vault_create(
             tmp_path, "document", "Test Document", scope="kalle",
         )
-    assert "Unknown type" in str(exc_info.value)
-    assert "kalle" in str(exc_info.value)
+    assert "can only create kalle types" in str(exc_info.value)
+    assert not (tmp_path / "document" / "Test Document.md").exists()
+
+
+def test_vault_create_source_under_kalle_scope_fails(tmp_path) -> None:
+    """The sibling of the above: ``source`` gained the same kalle tag in the
+    same commit, so it needs the same gate-2 refusal pinned. Adding a member
+    to a shared family means covering the whole family, not just the one that
+    happened to have a test."""
+    with pytest.raises(ScopeError) as exc_info:
+        vault_create(
+            tmp_path, "source", "Test Source", scope="kalle",
+        )
+    assert "can only create kalle types" in str(exc_info.value)
+    assert not (tmp_path / "source" / "Test Source.md").exists()
 
 
 def test_vault_create_kalle_type_under_hypatia_scope_fails(tmp_path) -> None:
