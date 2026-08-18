@@ -699,7 +699,22 @@ _DEFINITIONS: list[TypeDefinition] = [
         # auto-derives, so tagging here is the ONLY edit needed (do NOT touch
         # a KNOWN_TYPES_BY_SCOPE literal). Gate 2 (web_ingest_types_only)
         # enforces the {document, note, source} create policy.
-        available_in_scopes=frozenset({"hypatia", "web_ingest"}),
+        #
+        # ``talker`` (2026-08-18) — FINDABILITY, not authorship. A document
+        # the web ingest wrote was invisible to the talker's own natural move:
+        # ``vault list document`` died on gate 1 with "Unknown type 'document'
+        # under scope 'talker'" while search-by-grep, search-by-glob and READ
+        # of the same path all worked, so the record existed and could be
+        # opened but could not be ENUMERATED. (Before this tag ``talker`` was
+        # not a KNOWN_TYPES_BY_SCOPE key at all, so it took the
+        # ``.get(scope, KNOWN_TYPES)`` fallback to the canonical set.)
+        #
+        # This opens gate 1 ONLY, and gate 1 has exactly two call sites:
+        # ``vault_list`` and ``vault_create``. Create stays refused because
+        # gate 2's ``TALKER_CREATE_TYPES`` excludes ``document``; delete and
+        # the body-mutation verbs stay refused by their own gate-2 rules. So
+        # the read side opens and the write side does not move.
+        available_in_scopes=frozenset({"hypatia", "web_ingest", "talker"}),
     ),
     TypeDefinition(
         name="concept",
@@ -719,7 +734,15 @@ _DEFINITIONS: list[TypeDefinition] = [
         # "Unknown type under scope 'jeeves'" BEFORE gate 2's
         # ``jeeves_types_only`` policy ever runs. Gate 2 remains the
         # create-policy ceiling; this tag only opens gate 1.
-        available_in_scopes=frozenset({"hypatia", "web_ingest", "jeeves"}),
+        #
+        # ``talker`` (2026-08-18) — findability, same reasoning as the
+        # ``document`` note above and shipped with it: a ``source`` the web
+        # ingest wrote could be read but not enumerated from the talker.
+        # ``TALKER_CREATE_TYPES`` excludes ``source``, so authorship stays
+        # where it was.
+        available_in_scopes=frozenset(
+            {"hypatia", "web_ingest", "jeeves", "talker"}
+        ),
     ),
     TypeDefinition(
         name="citation",
