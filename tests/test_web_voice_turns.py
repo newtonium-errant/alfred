@@ -147,7 +147,9 @@ async def _wait_for(ch: FakeChannel, types: set[str], timeout: float = 1.0) -> d
 # ---------------------------------------------------------------------------
 
 
-async def test_wait_for_sees_a_frame_that_lands_in_the_final_interval() -> None:
+async def test_wait_for_sees_a_frame_that_lands_in_the_final_interval(
+    monkeypatch,
+) -> None:
     """A frame arriving during the LAST poll sleep must still be found.
 
     THE RACE THIS PINS, which cost a full-suite run tonight: the helper used to
@@ -187,15 +189,12 @@ async def test_wait_for_sees_a_frame_that_lands_in_the_final_interval() -> None:
         clock.t += 999.0
         await real_sleep(0)
 
-    original_get_loop = asyncio.get_event_loop
-    original_asyncio_sleep = asyncio.sleep
-    asyncio.get_event_loop = lambda: clock  # type: ignore[assignment]
-    asyncio.sleep = _sleep_that_delivers  # type: ignore[assignment]
-    try:
-        frame = await _wait_for(ch, {"error"}, timeout=0.01)
-    finally:
-        asyncio.get_event_loop = original_get_loop  # type: ignore[assignment]
-        asyncio.sleep = original_asyncio_sleep  # type: ignore[assignment]
+    # ``real_sleep`` above is captured BEFORE these patches on purpose —
+    # ``_sleep_that_delivers`` calls it, and patching first would recurse.
+    monkeypatch.setattr(asyncio, "get_event_loop", lambda: clock)
+    monkeypatch.setattr(asyncio, "sleep", _sleep_that_delivers)
+
+    frame = await _wait_for(ch, {"error"}, timeout=0.01)
 
     assert frame["code"] == "no_such_session"
 

@@ -1664,6 +1664,35 @@ def _resolve_capture_close_correction(
 
     _learn(VERDICT_CONFIRMED)
 
+    # The task is closed; the registry that LISTS it is not. Until this call,
+    # ``process/Captured Tasks.md`` had exactly one writer — capture time — so
+    # a task closed here stayed in the view's "Open" section until the next
+    # unrelated capture happened to regenerate it. That is the "25 open, 2
+    # done" staleness: a view whose numbers disagree with the records it is a
+    # view OF, in the direction that makes finished work look outstanding.
+    #
+    # BELTED, not because the regen is fragile but because of WHERE it sits.
+    # Everything after the close is bookkeeping, and this function's rule is
+    # that a bookkeeping fault must not turn a successful close into a
+    # reported failure — the same reason ``_learn`` swallows and
+    # ``resolve_proposal`` below only warns. The regen's own guarantee covers
+    # OSError only, so the caller supplies the rest; this mirrors the belt at
+    # the capture-time caller (``capture_batch``), which wraps it identically
+    # and for the same reason ("view is decoration").
+    try:
+        from alfred.telegram.captured_tasks_view import (
+            regenerate_captured_tasks_view,
+        )
+
+        regenerate_captured_tasks_view(vault_path)
+    except Exception as exc:  # noqa: BLE001 — the close stands regardless
+        log.warning(
+            "daily_sync.capture_close.captured_tasks_view_unhandled",
+            proposal_id=proposal_id, task_path=task_path,
+            error_type=exc.__class__.__name__, error=str(exc),
+            detail="the task WAS closed; only the Captured Tasks view is stale",
+        )
+
     try:
         resolve_proposal(
             cc.queue_path, proposal_id, STATE_ACCEPTED, resolved_at=ts,
