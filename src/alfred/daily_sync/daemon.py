@@ -56,6 +56,7 @@ from . import (
     ticket_notify_section,
     triage_section,
 )
+from . import assembler
 from .assembler import assemble_message
 from .config import DailySyncConfig
 from .confidence import (
@@ -545,8 +546,24 @@ async def fire_once(
 
             feed_cfg = _load_feed_config(raw_config)
             if feed_cfg.enabled:
-                from .feed_producer import emit_sync_feed
+                from .feed_producer import PROVIDER_FOR_FAMILY, emit_sync_feed
                 from .tier_override import load_overrides as load_tier_overrides
+
+                # FAILURE IS NOT EMPTINESS. ``assemble_message`` above catches a
+                # section provider's exception, renders it for the operator, and
+                # moves on — leaving that section's batch holder empty. So a
+                # BROKEN section and a QUIET one both reach here as ``[]``, and
+                # reconciling on that would let one bad fire terminalize the
+                # operator's open cards for that kind.
+                #
+                # ``failed_sections()`` is the only place that difference
+                # survives. A family whose provider raised is passed as ``None``
+                # — could-not-read — and the producer skips it rather than
+                # reconciling it to nothing.
+                _failed = assembler.failed_sections()
+
+                def _family(kind: str, items: list[Any]) -> list[Any] | None:
+                    return None if PROVIDER_FOR_FAMILY[kind] in _failed else items
 
                 emit_sync_feed(
                     FeedStore(
@@ -557,13 +574,13 @@ async def fire_once(
                     # always fell back to "talker" and mislabelled the chip; use
                     # the canonical display name (matches the brief producer).
                     instance_name_from_raw(raw_config),
-                    email_items=items,
-                    attribution_items=attribution_items,
-                    proposal_items=proposal_items,
-                    pending_items=pending_items,
-                    routine_match_items=routine_match_items,
-                    radar_items=radar_items,
-                    friction_items=friction_items,
+                    email_items=_family("email_tier", items),
+                    attribution_items=_family("attribution", attribution_items),
+                    proposal_items=_family("proposal", proposal_items),
+                    pending_items=_family("pending", pending_items),
+                    routine_match_items=_family("routine_match", routine_match_items),
+                    radar_items=_family("radar", radar_items),
+                    friction_items=_family("friction", friction_items),
                     # #72 — the operator's approved per-kind tier decisions,
                     # re-read every fire. Read here rather than inside the
                     # producer so the whole feed emit still sits under the one

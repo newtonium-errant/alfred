@@ -357,10 +357,16 @@ def test_an_operator_decision_is_distinguishable_from_a_retirement(
     assert _call(store, cfg, decided, "spam").status == STATUS_ACTED
 
     retired = _publish(store, _email(priority="medium", path="email/Retired.md"))
-    store.reconcile(store.load()[retired].kind, [])
+    # Authoritative: this test's subject is the RETIREMENT, so it must happen.
+    store.reconcile(
+        store.load()[retired].kind, [], empty_is_authoritative=True,
+    )
 
     folded = store.load()
-    assert folded[decided].state == folded[retired].state == "acted"
+    # A+C: they no longer share a state either. The verb distinguished them;
+    # the STATE is what consumers read, and it now says which is which.
+    assert folded[decided].state == "acted"
+    assert folded[retired].state == "retired"
     assert folded[decided].acted_action == "spam"
     assert folded[retired].acted_action == ACTION_RETIRED
     assert folded[decided].acted_action != folded[retired].acted_action

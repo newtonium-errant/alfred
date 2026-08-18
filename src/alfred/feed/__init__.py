@@ -23,6 +23,7 @@ from .model import (
     STATE_ACTED,
     STATE_EXPIRED,
     STATE_OPEN,
+    STATE_RETIRED,
     FeedItem,
     make_id,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "STATE_ACTED",
     "STATE_EXPIRED",
     "STATE_OPEN",
+    "STATE_RETIRED",
     "load_from_unified",
     "make_id",
     "try_feed_reconcile",

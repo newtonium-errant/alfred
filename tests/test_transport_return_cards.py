@@ -55,6 +55,7 @@ from alfred.feed.model import (
     STATE_ACTED,
     STATE_DEFERRED,
     STATE_OPEN,
+    STATE_RETIRED,
 )
 from alfred.tier.compute import compute_returned_task_candidates
 from alfred.transport.config import (
@@ -559,7 +560,14 @@ class TestRetirement:
         with structlog.testing.capture_logs() as captured:
             sweep_return_cards(handle, vault, _now())
 
-        assert store.load()[feed_id].state == STATE_ACTED
+        # RETIRED, not ACTED — the premise of this assertion and its six
+        # siblings in this file INVERTED when retirement became its own state
+        # (PY-C item 1). The sweep found the task closed and withdrew the card;
+        # the operator never touched it, and that is precisely the distinction
+        # the state was split to make. The genuinely-acted assertions in this
+        # file — the ``_act(..., "ack")`` ones — still read STATE_ACTED, and the
+        # difference between the two groups is the whole point.
+        assert store.load()[feed_id].state == STATE_RETIRED
         retired = _events(captured, "transport.scheduler.return_cards_retired")
         assert len(retired) == 1
         # WHY, not just that: "he finished two tasks" and "two records went
@@ -571,7 +579,7 @@ class TestRetirement:
         _write_task(vault, "Fix the gate", status="cancelled", remind_at=None,
                     reminded_at=_now().isoformat())
         sweep_return_cards(handle, vault, _now())
-        assert store.load()[feed_id].state == STATE_ACTED
+        assert store.load()[feed_id].state == STATE_RETIRED
 
     async def test_a_re_snoozed_task_retires_its_old_card(
         self, vault, handle, store,
@@ -586,7 +594,7 @@ class TestRetirement:
         with structlog.testing.capture_logs() as captured:
             sweep_return_cards(handle, vault, _now())
 
-        assert store.load()[feed_id].state == STATE_ACTED
+        assert store.load()[feed_id].state == STATE_RETIRED
         assert _events(captured, "transport.scheduler.return_cards_retired")[0][
             "retired"
         ] == [{"id": feed_id, "reason": RETIRE_RE_ARMED}]
@@ -617,7 +625,7 @@ class TestRetirement:
         with structlog.testing.capture_logs() as captured:
             sweep_return_cards(handle, vault, _now())
 
-        assert store.load()[feed_id].state == STATE_ACTED
+        assert store.load()[feed_id].state == STATE_RETIRED
         assert _events(captured, "transport.scheduler.return_cards_retired")[0][
             "retired"
         ] == [{"id": feed_id, "reason": RETIRE_RECORD_GONE}]
@@ -770,7 +778,7 @@ class TestDeferReturns:
                     reminded_at=_now().isoformat())
         sweep_return_cards(handle, vault, _now() + timedelta(days=1))
 
-        assert store.load()[feed_id].state == STATE_ACTED
+        assert store.load()[feed_id].state == STATE_RETIRED
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +933,7 @@ class TestContainment:
         # retirement actually lands. No belt refusal, and the card whose record
         # does not exist goes acted.
         assert not _events(captured, "feed.reconcile_failed")
-        assert store.load()[good.id].state == STATE_ACTED
+        assert store.load()[good.id].state == STATE_RETIRED
 
     def test_the_outer_belt_keeps_a_sweep_fault_off_the_rest_of_the_tick(
         self, vault, handle, store, monkeypatch,
@@ -1018,5 +1026,5 @@ class TestContainment:
 
         folded = store.load()
         assert folded[other.id].state == STATE_OPEN  # untouched
-        assert folded[mine.id].state == STATE_ACTED  # its record never existed
+        assert folded[mine.id].state == STATE_RETIRED  # its record never existed
         assert folded[other.id].state != STATE_ACKED

@@ -59,6 +59,15 @@ _HTTP_STATUS_BY_STATUS: dict[str, int] = {
     "already_acted": 200,
     "undone": 200,
     "stale_item": 409,
+    # PY-C item 2. 409 alongside ``stale_item`` because it is the same answer
+    # from the operator's side — the card moved on without him — and the deck's
+    # ``routeError`` already reads a 409 as exactly that.
+    #
+    # THIS ENTRY IS LOAD-BEARING, not decoration. The lookup below falls back to
+    # ``200 if result.ok else 400``, and a retired act is ok=False, so without
+    # this line it would relay as 400 — the "you sent a bad action" code — about
+    # a card the operator did nothing wrong with. Pinned.
+    "retired": 409,
     "invalid_action": 400,
     "unsupported_item": 422,
     "error": 422,

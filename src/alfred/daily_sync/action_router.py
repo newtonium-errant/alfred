@@ -59,6 +59,7 @@ from alfred.feed.model import (
     STATE_ACKED,
     STATE_ACTED,
     STATE_OPEN,
+    STATE_RETIRED,
     make_id,
 )
 from alfred.telegram.capture_sections import is_known_section
@@ -96,6 +97,20 @@ STATUS_UNSUPPORTED_ITEM = "unsupported_item"  # lane has no completion writer (t
 # It needs its own status because every other successful act ends the item's
 # life (acted/acked); this one reopens the question instead.
 STATUS_CONTESTED = "contested"
+# PY-C item 2 — the operator acted on a card its PRODUCER withdrew.
+#
+# It needs its own status for the reason the state does: ``already_acted`` is a
+# sentence ABOUT HIM ("you already dealt with this"), and for a retirement it is
+# false — nobody dealt with it, the section that was offering it stopped. Until
+# ``retired`` was its own state this gate could not tell the two apart, because
+# a retirement was stored as ``acted``; now it can, so the answer stops lying.
+#
+# NOT ok. ``ok=True`` is documented on :class:`ActResult` as the applied paths
+# plus the idempotent noop — an act that could not apply and left the operator's
+# intent unrecorded is neither. The transport maps it to 409 (see
+# ``routes_feed._HTTP_STATUS_BY_STATUS``), the same code as ``stale_item``,
+# which is the same class of answer: the item moved on without him.
+STATUS_RETIRED = "retired"
 
 # #63a attribution contest. The door out of the FYI tier: "don't decide this one
 # for me." Attribution's verb alone — see the ceiling entry below.
@@ -1855,6 +1870,8 @@ def act(
       1. Load the feed item from the store; not present → ``stale_item``.
       2. Not ``open`` → ``already_acted`` (ok-noop; resolvers are idempotent,
          but we don't re-run them — the store already reflects a decision).
+         EXCEPT ``retired`` → ``retired`` (NOT ok): the store reflects the
+         producer withdrawing the card, which is not a decision at all.
       3. Kind comes from ``item.kind`` (defense-in-depth), with an id-prefix
          consistency guard — a mismatch is data corruption → ``error``.
       4. Universal ``ack`` for FYI items → set ``acked`` directly, no resolver.
@@ -1923,7 +1940,8 @@ def _act_locked(
 
     # Folded-state check FIRST — only OPEN items are actionable. An acted/acked/
     # expired item is an idempotent ok-noop (the deck may double-tap or race a
-    # reconcile); we never re-drive a resolver for it.
+    # reconcile); we never re-drive a resolver for it. A ``retired`` one is the
+    # exception that is NOT a noop — see the branch below.
     #
     # EXCEPTION 1: ``undo_done`` on a slot_suggestion acts on an item that is
     # DONE — i.e. already ``acted`` (the board's done set it). It must reach the
@@ -1948,6 +1966,36 @@ def _act_locked(
         and getattr(item, "acted_action", None) == ACCEPT_ACTION
     )
     if item.state != STATE_OPEN and not (_is_slot_undo or _is_slot_done_on_accepted):
+        # RETIRED IS NOT ALREADY-ACTED, and the difference is the operator's.
+        # A retired card left its producer's open set — the section stopped
+        # offering it — which is a fact about the producer and not a decision by
+        # him. Answering ``already_acted`` here tells him he dealt with
+        # something he never saw the end of; it is the sentence PY-C exists to
+        # stop saying. Checked BEFORE the generic branch so the honest answer
+        # wins whenever the state is known.
+        #
+        # The wire split, as established: ``reason`` on the log line is the
+        # machine fact (a grep for producer-withdrawn acts), ``detail`` is the
+        # sentence the operator reads.
+        #
+        # The resurface half of that sentence is a CHECKED claim, not a
+        # comforting one: reconcile upserts re-offered items at ``state=open``,
+        # ``_apply_event`` replaces the folded item wholesale, and
+        # ``_revival_suppressed`` gates on ``acted``/``acked`` only — so a
+        # retired card genuinely returns to open when its producer offers it
+        # again.
+        if item.state == STATE_RETIRED:
+            log.info(
+                "feed.act.retired", id=feed_item_id, action=action_id,
+                state=item.state, reason="producer_withdrew_item",
+            )
+            return ActResult(
+                False, STATUS_RETIRED,
+                "this one was withdrawn — whatever was offering it stopped, so "
+                "there's nothing here to act on. It'll come back on its own if "
+                "it turns up again.",
+                feed_item_id, action_id,
+            )
         log.info(
             "feed.act.already_acted", id=feed_item_id, action=action_id,
             state=item.state,

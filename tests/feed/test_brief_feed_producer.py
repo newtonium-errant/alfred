@@ -201,9 +201,12 @@ def test_stale_warn_clears_through_reconcile_on_a_skip_bearing_instance(
     _write_bit_lines(vault, _KALLE_SUMMARY)
     day2 = health_feed_items(vault, instance="kalle")
     assert day2 == []
-    result = store.reconcile("health", day2)
-    assert result["acted"] == 1
-    assert _states(store)["health:surveyor2"] == "acted"
+    # Authoritative: ``health_feed_items`` is a pure read of the BIT lines,
+    # so an empty result is a FACT (every check ok/skip), not a failed read.
+    # Brief's producer declares the same at its own call site.
+    result = store.reconcile("health", day2, empty_is_authoritative=True)
+    assert result["retired"] == 1
+    assert _states(store)["health:surveyor2"] == "retired"
 
 
 def test_warn_that_becomes_skip_clears_instead_of_staying_open(tmp_path: Path) -> None:
@@ -225,9 +228,15 @@ def test_warn_that_becomes_skip_clears_instead_of_staying_open(tmp_path: Path) -
 
     # The tool is unconfigured out of the instance → its check now SKIPs.
     _write_bit_lines(vault, "[SKIP] surveyor\n")
-    result = store.reconcile("health", health_feed_items(vault, instance="kalle"))
-    assert result["acted"] == 1
-    assert _states(store)["health:surveyor"] == "acted"
+    # Authoritative: ``health_feed_items`` is a pure read of the BIT lines,
+    # so an empty result is a FACT (every check ok/skip), not a failed read.
+    # Brief's producer declares the same at its own call site.
+    result = store.reconcile(
+        "health", health_feed_items(vault, instance="kalle"),
+        empty_is_authoritative=True,
+    )
+    assert result["retired"] == 1
+    assert _states(store)["health:surveyor"] == "retired"
 
 
 def test_skip_cards_cannot_groundhog_because_none_are_created(tmp_path: Path) -> None:

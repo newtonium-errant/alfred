@@ -24,11 +24,21 @@ def try_feed_reconcile(
     store: FeedStore,
     kind: str,
     open_items: list[FeedItem],
+    *,
+    empty_is_authoritative: bool = False,
 ) -> dict[str, int] | None:
     """Reconcile ``kind``'s open set through the belt. Returns the counts on
-    success, ``None`` on failure — and NEVER raises into the caller."""
+    success, ``None`` on failure — and NEVER raises into the caller.
+
+    ``empty_is_authoritative`` passes straight through to
+    :meth:`FeedStore.reconcile` — see there for what the caller is declaring.
+    It is a property of the CALLER (does it separate a failed read from a
+    genuinely empty one before reaching here?), not of the kind, which is why
+    it rides on the call rather than living in a per-kind table."""
     try:
-        counts = store.reconcile(kind, open_items)
+        counts = store.reconcile(
+            kind, open_items, empty_is_authoritative=empty_is_authoritative,
+        )
     except Exception as exc:  # noqa: BLE001 — the whole point: the feed can't break the producer
         log.warning(
             "feed.reconcile_failed",
@@ -46,7 +56,21 @@ def try_feed_reconcile(
         # fire, INCLUDING any items suppressed below. It is not the count of
         # items written, and not the store's resulting open count.
         open=counts["open"],
+        # ``acted`` keeps its name for wire compatibility — operator greps are
+        # written against it — and ``retired`` is the honest alias emitted
+        # beside it. Equal by construction; a pin holds them so.
+        #
+        # BOTH, deliberately. The alias shipped with item 3 and this was its
+        # only consumer, so logging ``acted`` alone would have left the honest
+        # name with no reader anywhere — a field that exists and is never
+        # emitted is indistinguishable from one that was never added.
         acted=counts["acted"],
+        retired=counts.get("retired", counts["acted"]),
+        # Non-zero only when the breaker refused a wholesale wipe. Emitted
+        # always, including 0, for the same ILB reason as ``suppressed``: a
+        # kind that stops retiring must be explicable as "refused, and here is
+        # the count" rather than looking like the producer went quiet.
+        refused=counts.get("refused", 0),
         # Snapshot items whose decision was kept sticky because their content
         # is unchanged (per-kind revival policy). Always emitted, including 0:
         # a card that stops re-appearing must be explicable as "we chose not to

@@ -14,7 +14,12 @@ from alfred.feed.store import FeedStore
 
 
 class _RaisingStore(FeedStore):
-    def reconcile(self, kind, open_items):  # type: ignore[override]
+    # Signature must track ``FeedStore.reconcile``: the belt now passes
+    # ``empty_is_authoritative``, and a fake that rejects it swallows a
+    # TypeError from its own staleness instead of the fault under test —
+    # green for the wrong reason, in the one test whose whole subject is
+    # WHICH exception the belt caught.
+    def reconcile(self, kind, open_items, *, empty_is_authoritative=False):  # type: ignore[override]
         raise RuntimeError("disk on fire")
 
 
@@ -26,7 +31,8 @@ def test_success_returns_counts_and_logs_ok(tmp_path: Path) -> None:
     store = FeedStore(tmp_path / "feed.jsonl")
     with structlog.testing.capture_logs() as cap:
         counts = try_feed_reconcile(store, "proposal", [_item("proposal", "c1")])
-    assert counts == {"open": 1, "acted": 0, "suppressed": 0,
+    assert counts == {"open": 1, "acted": 0, "retired": 0, "refused": 0,
+                      "suppressed": 0,
                       "deferred_held": 0, "defer_returned": 0}
     ok = [c for c in cap if c.get("event") == "feed.reconcile"]
     assert len(ok) == 1

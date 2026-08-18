@@ -81,12 +81,18 @@ def collect_live_cards(
 ) -> SweepSet:
     """The live open/deferred cards of ``kind``, prepared for a reconcile.
 
-    DECIDED CARDS ARE EXCLUDED, and this is the load-bearing line rather than a
-    filter for tidiness: ``reconcile`` upserts everything it is handed at
-    ``state=open``, so including an ``acted``/``acked`` card would revive it on
-    the next sweep, and the one after, forever. That is the groundhog bug this
-    codebase has already fixed twice, and it is one comprehension away at all
-    times.
+    TERMINAL CARDS ARE EXCLUDED, and this is the load-bearing line rather than
+    a filter for tidiness: ``reconcile`` upserts everything it is handed at
+    ``state=open``, so including an ``acted``/``acked``/``expired``/``retired``
+    card would revive it on the next sweep, and the one after, forever. That is
+    the groundhog bug this codebase has already fixed twice, and it is one
+    comprehension away at all times.
+
+    The filter is written as an OPEN/DEFERRED allowlist rather than a terminal
+    denylist on purpose, which is why ``retired`` needed no change here when it
+    was added: a state nobody has taught this function about is excluded by
+    default, so a future one fails toward leaving cards alone instead of toward
+    resurrecting them.
 
     ``refresh`` is the per-kind question — "is this card's subject still in the
     state that justified it?" — and is belted PER CARD: whatever it raises costs

@@ -466,7 +466,20 @@ def _sweep_locked(
         return None
     open_items = prepared.open_items
 
-    counts = try_feed_reconcile(store, KIND_REMINDER_RETURNED, open_items)
+    # ADOPTED: ``collect_live_cards`` above returns ``empty=True`` on a load
+    # FAULT and this function returns before reaching here, so a failed read
+    # never arrives as an empty list. An empty ``open_items`` at this line
+    # therefore means every live card's verdict was retire — a genuinely
+    # cleared kind, which must retire normally rather than be refused.
+    #
+    # This kind NEEDS the declaration rather than merely tolerating it: the
+    # refresh hook retires cards by returning None, so 'all of them resolved'
+    # is an ordinary outcome, and refusing it would strand every returned
+    # reminder open forever.
+    counts = try_feed_reconcile(
+        store, KIND_REMINDER_RETURNED, open_items,
+        empty_is_authoritative=True,
+    )
     if retired:
         # The reconcile's ``acted`` count says how many; this says WHY, per
         # record. "He finished two tasks" and "two records went missing" are the

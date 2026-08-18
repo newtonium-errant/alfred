@@ -32,6 +32,7 @@ from .model import (
     STATE_ACTED,
     STATE_DEFERRED,
     STATE_OPEN,
+    STATE_RETIRED,
     FeedItem,
     _now_iso,
     defer_window_open,
@@ -57,9 +58,20 @@ def _revival_suppressed(
     appointment came back the next morning, and the next, forever.
 
     Suppress only when ALL of:
-      * the item is stored and already decided (``acted`` / ``acked``) —
+      * the item is stored and already DECIDED (``acted`` / ``acked``) —
         an open item is not being revived, and ``expired`` keeps its existing
         behaviour rather than acquiring a new one here;
+
+        ``retired`` is deliberately absent from that pair, and it is the one
+        member of this list that changed meaning when retirement became its own
+        state. This suppression exists to keep a DECISION sticky — the operator
+        acked an appointment, so stop asking. A retirement is precisely not a
+        decision: nobody judged the card, its producer withdrew it. There is
+        nothing to keep sticky, so a re-offered retired card revives like any
+        other new episode. (Before the state existed, a retirement was stored as
+        ``acted`` and DID suppress here — a withdrawn-then-re-offered snapshot
+        card stayed silently terminal. Falling through is the fix, not a
+        side effect.)
       * the kind is a snapshot kind (see ``SNAPSHOT_FINGERPRINT_FIELDS``);
       * both fingerprints are computable AND equal — content is unchanged, so
         there is nothing new to tell the operator.
@@ -167,16 +179,25 @@ class FeedStore:
             existing.deferred_until = (
                 event.get("deferred_until") if new_state == STATE_DEFERRED else None
             )
-            if new_state == STATE_ACTED:
-                # ``acted_action`` tracks the VERB of the LATEST acted event
+            if new_state in (STATE_ACTED, STATE_RETIRED):
+                # ``acted_action`` tracks the VERB of the LATEST terminal event
                 # (newest wins: an accept then a later done ends "done"). A
-                # legacy / verbless acted event (e.g. reconcile-decided) → None.
+                # legacy / verbless acted event → None.
+                #
+                # RETIRED IS HERE ON PURPOSE, and leaving it out is a live bug
+                # rather than a nicety: the ``else`` below clears the verb, so a
+                # ``state=retired, action=retired`` event would fold to a
+                # retired item carrying NO verb — the store writing the reason
+                # down and immediately erasing it. The two states share this
+                # branch because they share the property it serves: both are
+                # terminal, and both record HOW they got there.
                 existing.acted_action = event.get("action")
                 if not existing.acted_at:
                     existing.acted_at = event.get("ts") or _now_iso()
             else:
-                # Non-acted transition (open via undo/revival, acked, expired) —
-                # the item is no longer acted, so clear the verb.
+                # Non-terminal transition (open via undo/revival) or a terminal
+                # one that carries no verb (acked, expired) — either way the
+                # item is no longer holding a verb, so clear it.
                 existing.acted_action = None
         # Unknown ev → deliberately skipped (forward-compat).
 
@@ -230,10 +251,14 @@ class FeedStore:
             Resetting first-seen on return would erase that he has been carrying
             this for a week and make a long-deferred item read as brand new —
             precisely the age signal an attention policy needs most;
-          * stored item was ``acted`` / ``acked`` / ``expired`` and the same key
-            reappears in the open set → a NEW episode: keep the incoming fresh
-            ``created_at``, and the upsert (state=open) legitimately REVIVES it —
-            the authoritative store re-opened it, so it IS open again;
+          * stored item was TERMINAL (``acted`` / ``acked`` / ``expired`` /
+            ``retired``) and the same key reappears in the open set → a NEW
+            episode: keep the incoming fresh ``created_at``, and the upsert
+            (state=open) legitimately REVIVES it — the authoritative store
+            re-opened it, so it IS open again. ``retired`` belongs in that list
+            and not in the preserve-``created_at`` one above: a card the
+            producer withdrew and later offers again is a new episode, not a
+            continuing one;
           * no stored item → first sighting, keep the incoming ``created_at``.
         """
         payload = item.to_dict()
@@ -296,19 +321,46 @@ class FeedStore:
         with file_rmw_lock(self.path):
             self._rewrite_locked(self._fold_from_disk())
 
-    def reconcile(self, kind: str, open_items: list[FeedItem]) -> dict[str, int]:
+    def reconcile(
+        self,
+        kind: str,
+        open_items: list[FeedItem],
+        *,
+        empty_is_authoritative: bool = False,
+    ) -> dict[str, int]:
         """The workhorse: make the store's OPEN set for ``kind`` exactly
         ``open_items``.
 
-        Upserts every currently-open item (refreshing evidence/title), and marks
-        any item of this kind that was open in the store but is ABSENT from
-        ``open_items`` as ``acted`` — the authoritative store decided it
-        elsewhere (decided-detection for free, no decided-store reads).
+        Upserts every currently-open item (refreshing evidence/title), and
+        RETIRES any item of this kind that was open in the store but is ABSENT
+        from ``open_items`` — ``state=retired``, ``action=retired``. Retired is
+        terminal but it is NOT ``acted``: the item left its producer's open set,
+        which is a fact about the producer, not a decision by the operator.
 
         Load + compute + append happen under ONE lock acquisition so the absent
         set is computed against the same state the writes extend. Idempotent in
         RESULT: re-running with the same open set re-appends upserts but folds to
         the identical state.
+
+        ``empty_is_authoritative`` — THE CALLER'S DECLARATION, and it is about
+        the CALLER rather than about the kind.
+
+        A producer that separates FAILURE from EMPTINESS before it gets here
+        (raises / returns None → it does not call reconcile at all) can say so,
+        and then an empty ``open_items`` genuinely means "there is nothing", so
+        a 100% clear retires normally — a free day clearing every slot
+        suggestion is the lifecycle working, not an incident.
+
+        A producer that has NOT adopted that contract cannot distinguish the
+        two, so an empty list from it might be a failed read wearing the shape
+        of a quiet day. For those callers a wholesale wipe is REFUSED: no
+        terminal events are written, the cards stay open, and the refusal is
+        logged loud. A healthy next fire re-emits and nothing is lost.
+
+        Default ``False`` — fail toward refusing and flagging. An unadopted or
+        future caller that mass-wipes gets surfaced as unadopted rather than
+        silently obeyed, which is the same denylist direction the health-status
+        rule takes: unknown fails toward noise, never toward silence.
         """
         with file_rmw_lock(self.path):
             current = self._fold_from_disk()
@@ -347,46 +399,55 @@ class FeedStore:
                     {"ev": "upsert", "ts": ts,
                      "item": self._episode_merged_payload(item, current)}
                 )
-            # THE WOULD-RETIRE-EVERYTHING TRIPWIRE. A producer that returns an
-            # empty open set while the store holds open items retires ALL of
-            # them, and today that happens in total silence — the same silence
-            # whether the operator cleared the deck or the producer broke.
-            # This announces it BEFORE the events are written, so the warning
-            # survives even if the append below raises.
+            # THE CIRCUIT BREAKER (Candidate C). A wholesale wipe from a caller
+            # that cannot vouch for its own emptiness is refused outright.
             #
-            # OBSERVATION ONLY: the reconcile proceeds exactly as it always
-            # has. The refusal half of the circuit breaker awaits the
-            # operator's ratification; shipping the loud half first costs
-            # nothing and means the next occurrence is greppable rather than
-            # reconstructed. Deliberately inside the lock, unlike this
-            # method's other log lines, because "before proceeding" is the
-            # whole point of it.
-            if not open_items and previously_present:
+            # This is PY-B's tripwire grown up: that warning fired on the same
+            # condition and then proceeded anyway, because the refusal half was
+            # unratified. It is now the refusal's own log line rather than a
+            # separate one — one event for one occurrence, at the moment the
+            # decision is made. Kept inside the lock for the same reason the
+            # tripwire was: the announcement must precede the write it is about.
+            #
+            # ``refused`` is returned in the counts so a caller can tell "no
+            # retirements because nothing left the open set" from "no
+            # retirements because I was not trusted to say so".
+            refused = 0
+            if absent and not open_items and not empty_is_authoritative:
                 log.warning(
-                    "feed.store.reconcile_would_retire_all_open",
+                    "feed.store.retirement_refused",
                     kind=kind,
-                    count=len(previously_present),
-                    ids=sorted(previously_present, key=str),
+                    count=len(absent),
+                    ids=sorted(absent, key=str),
+                    reason="empty_open_set_not_authoritative",
                     detail=(
-                        "producer returned an EMPTY open set while the store "
-                        "held open items — every one of them is being retired "
-                        "as acted. Semantics unchanged; this is the signal "
-                        "that a producer fault and an emptied deck look "
-                        "identical from here."
+                        "a caller that has NOT declared empty_is_authoritative "
+                        "returned an empty open set while the store held open "
+                        "items. Refusing to terminalize all of them: an empty "
+                        "list from such a caller is indistinguishable from a "
+                        "failed read. The cards stay OPEN and a healthy next "
+                        "fire re-emits them — nothing is lost. If this caller "
+                        "genuinely separates failure from emptiness, it should "
+                        "be passing empty_is_authoritative=True."
                     ),
                 )
+                refused = len(absent)
+                absent = set()
             events.extend(
-                # ``action`` marks these as RETIREMENTS — acted because the
-                # item left the producer's open set, not because the operator
-                # judged it. Without the verb both outcomes are byte-identical
-                # verbless events and the distinction is unrecoverable from
-                # the log. State is deliberately unchanged: ``acted`` stays
-                # ``acted``, and every current reader compares the verb for
-                # equality against accept/done/snooze, so a fourth value is
-                # inert (see ``ACTION_RETIRED``). Auditability starts the day
-                # this ships and does not reach backwards.
+                # RETIRED, in both fields. The verb (PY-B) made these auditable
+                # going forward; the STATE is what consumers actually read, and
+                # while it said ``acted`` every coarse "was this decided?"
+                # question answered yes about something the operator never
+                # decided — including the deck's own gate, which told him an
+                # item was ``already_acted`` when he had never acted on it.
+                #
+                # The verb stays alongside the state deliberately rather than
+                # being made redundant by it: ``state`` is what this item IS,
+                # ``action`` is what put it there, and the pair keeps reading
+                # correctly if a future path ever retires something for a
+                # different reason.
                 {"ev": "state", "ts": ts, "id": item_id,
-                 "state": STATE_ACTED, "action": ACTION_RETIRED}
+                 "state": STATE_RETIRED, "action": ACTION_RETIRED}
                 # ``key=str`` because the fold does not coerce types: one item
                 # carrying a non-string id makes a bare sort's own comparison
                 # raise TypeError, and the belt then refuses the whole
@@ -445,7 +506,18 @@ class FeedStore:
 
         return {
             "open": len(open_items),
+            # ``acted`` keeps its NAME for wire compatibility — the belt logs it
+            # and callers read it — but what it counts is retirements, which is
+            # what it always counted. ``retired`` is the honest alias shipped
+            # alongside it so consumers can migrate; they are the same number by
+            # construction, and a pin holds them equal.
             "acted": len(absent),
+            "retired": len(absent),
+            # Non-zero ONLY when the breaker refused a wholesale wipe. Lets a
+            # caller tell "nothing left the open set" (0 retired, 0 refused)
+            # from "I was not trusted to say the set was empty" (0 retired, N
+            # refused) — two identical-looking zeros with opposite meanings.
+            "refused": refused,
             "suppressed": suppressed,
             "deferred_held": len(held),
             "defer_returned": len(returned),
