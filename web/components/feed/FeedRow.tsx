@@ -85,6 +85,15 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
   const stage: RingItemStage | null = completion ? effectiveStageOf(item, completion, accept) : null;
   const done = stage === 'done';
   const suggested = stage === 'suggested';
+  // DELAYED. This surface's ladder has to be TOTAL over the stage union, not
+  // total over the stages that can reach it today: both pages that mount a
+  // completion-bearing row filter to `state === 'open'` first, so a
+  // server-snoozed (state=acted) item does not arrive here at present. That is a
+  // fetch-level gate one filter away from this file, and without this branch a
+  // snoozed row would fall through `done`/`suggested` into the `completable` arm
+  // and render a live "✓ Done" — offering completion on something the operator
+  // had just pushed out of today, which is this lane's bug wearing a button.
+  const snoozed = stage === 'snoozed';
   const busy = completion ? completion.busy(item.id) : false;
   const acceptBusy = accept ? accept.busy(item.id) : false;
   const completable = completion ? ringItemCompletable(item) : false;
@@ -95,7 +104,13 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
   // row's affordance is Unsnooze, which the staged section draws instead.
   const snoozeBusy = snooze ? snooze.busy(item.id) : false;
   const snoozeError = snooze ? snooze.errorFor(item.id) : null;
-  const snoozeOffered = !!snooze && snoozeIsBacked(item) && !done && !snooze.snoozed(item.id);
+  // `!snoozed` joins `!done` for the same reason and from the other direction:
+  // the session-local hook only knows about a snooze THIS session performed, so
+  // on a reload it reports false while the stamped verb still says snoozed.
+  // Without this conjunct the row would offer "Snooze" on an already-snoozed
+  // item — the router refuses it, but the dead control would have promised.
+  const snoozeOffered =
+    !!snooze && snoozeIsBacked(item) && !done && !snoozed && !snooze.snoozed(item.id);
   return (
     <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
       <div className="flex items-start justify-between gap-3">
@@ -145,6 +160,17 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
                 </button>
               )}
             </div>
+          ) : snoozed ? (
+            // SNOOZED — a STATEMENT, not a control, exactly as on the rings panel
+            // and the day board. Unsnooze is drawn by the staged section that owns
+            // the hook; a second one here would be a control with no writer behind
+            // it. Same words on all three surfaces so one gesture reads one way.
+            <span
+              data-testid="feed-row-snoozed"
+              className="shrink-0 self-center text-[10px] font-bold uppercase tracking-wider text-caution"
+            >
+              Snoozed
+            </span>
           ) : suggested ? (
             // SUGGESTED — an auto-surfaced candidate not yet on the plan. The one
             // affordance is Accept (commit it); NO ✓. Optimistic candidate→planned on

@@ -527,8 +527,17 @@ export type SnoozeAction = (typeof SNOOZE_ACTIONS)[number];
 // urgency delta breaks it through, which fires on undated entries too).
 export const SNOOZE_INDEFINITE_ACTION: SnoozeAction = 'snooze_until_i_say';
 export const UNSNOOZE_ACTION = 'unsnooze';
-/** The verb the store stamps on a snoozed item (`acted_action`) — the staged list reads it. */
-export const SNOOZE_ACTED_VERB = 'snooze';
+/**
+ * The verb the store stamps on a snoozed item (`acted_action`).
+ *
+ * RE-EXPORTED, NOT DECLARED: it now lives in `rings.ts`, beside the verb→stage map
+ * that is its only real consumer. It was declared HERE, with a docstring claiming
+ * "the staged list reads it", and read by nothing at all — the staged list keys off
+ * the session-local `useSnooze` hook instead. A verb constant shipped without being
+ * threaded into the stage seam is exactly how a snoozed item went on rendering as
+ * DONE across two surfaces; keeping one owner is what stops it recurring.
+ */
+export { SNOOZE_ACTED_VERB } from './rings';
 
 export const SNOOZE_LABELS: Record<SnoozeAction, string> = {
   snooze_1d: '1 day',

@@ -66,6 +66,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
   const grace = useBoardGrace(completion);
   const now = useMemo(() => nowProp ?? new Date(), [nowProp]);
   const [openDone, setOpenDone] = useState<ReadonlySet<string>>(() => new Set());
+  const [openSnoozed, setOpenSnoozed] = useState<ReadonlySet<string>>(() => new Set());
   const [openBrowse, setOpenBrowse] = useState<ReadonlySet<string>>(() => new Set());
   const [openItemId, setOpenItemId] = useState<string | null>(null);
 
@@ -105,7 +106,10 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
   const onBoard = useMemo(() => {
     const ids = new Set<string>();
     for (const s of stacks) {
-      for (const bucket of [s.today, s.carryover, s.candidates, s.done, s.overflow]) {
+      // `snoozed` included: this set answers "can he still get to this row?", and
+      // a snoozed row IS on the board (one drill in). Omitting it would tell him
+      // an unrecorded ✓ "isn't on the board now" about a row sitting right there.
+      for (const bucket of [s.today, s.carryover, s.candidates, s.done, s.snoozed, s.overflow]) {
         for (const it of bucket) ids.add(it.id);
       }
     }
@@ -133,6 +137,12 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     const stage = stageOf(it);
     const done = stage === 'done';
     const suggested = stage === 'suggested';
+    // DELAYED, and rendered as delayed. Not struck through (the strikethrough
+    // below is gated on `done` alone), not counted, and — the part that matters
+    // most on a row — carrying no ✓ control, because offering "mark it done" on
+    // something the operator just pushed out of today is the same claim the
+    // struck-through row was making, in a button.
+    const snoozed = stage === 'snoozed';
     const pending = grace.pendingId === it.id;
     const completable = ringItemCompletable(it);
     const undoable = ringItemUndoable(it);
@@ -143,7 +153,13 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     const notice = completion.noticeFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
-    const dot = done ? 'bg-status-done-fg' : suggested ? 'bg-console-ink-faint' : 'bg-status-progress-fg';
+    const dot = done
+      ? 'bg-status-done-fg'
+      : snoozed
+        ? 'bg-caution'
+        : suggested
+          ? 'bg-console-ink-faint'
+          : 'bg-status-progress-fg';
 
     return (
       <li
@@ -196,6 +212,19 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                 </button>
               )}
             </div>
+          ) : snoozed ? (
+            // A STATEMENT, not a control. The board has no snooze hook wired, so
+            // there is nothing here that could take the tap back — and a live-
+            // looking button with no writer behind it is the dead-control failure
+            // this surface was built to end. Unsnooze lives on the feed's staged
+            // list, which does hold the hook. Wiring it here too is a follow-up,
+            // declared rather than faked.
+            <span
+              data-testid="board-item-snoozed"
+              className="shrink-0 text-[10px] font-bold uppercase tracking-wider text-caution"
+            >
+              Snoozed
+            </span>
           ) : suggested ? (
             <button
               type="button"
@@ -279,12 +308,18 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
   const renderStack = (stack: BoardStack) => {
     const residue = stack.key === BOARD_UNSLOTTED;
     const showDone = openDone.has(stack.key);
+    const showSnoozed = openSnoozed.has(stack.key);
     const browsing = openBrowse.has(stack.key);
+    // `snoozed` is in this conjunction for the same reason it is in
+    // `boardStackSize`: a stack holding three pushed duties is not an empty one,
+    // and rendering SLOT_EMPTY_COPY ("Nothing owed today.") over them would erase
+    // three real items — the same lie as "✓ Done", told by omission instead.
     const nothing =
       stack.today.length === 0 &&
       stack.carryover.length === 0 &&
       stack.candidates.length === 0 &&
       stack.done.length === 0 &&
+      stack.snoozed.length === 0 &&
       stack.overflow.length === 0;
 
     return (
@@ -380,9 +415,27 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
               // differed by one word. Overflow cannot be present here — an empty
               // carryover means `carriedAll` was empty, so its post-cap slice is
               // too, and likewise for candidates — so "all done" is exact.
-              <p data-testid={`board-stack-clear-${stack.key}`} className="mt-2 text-xs font-semibold text-status-done-fg">
-                All done here today.
-              </p>
+              //
+              // …EXACT ONLY WHEN NOTHING WAS SNOOZED, and that is the sentence
+              // this lane came for. On 2026-08-16 the operator snoozed three
+              // overdue duties and read "All done here today." underneath them.
+              // A stack emptied by DELAY has not been finished, so the claim is
+              // gated on `stack.snoozed` being empty and the delay gets its own
+              // sentence naming what actually happened. Both branches are
+              // reachable with `done` non-empty: some finished, some pushed still
+              // may not claim "all done".
+              stack.snoozed.length > 0 ? (
+                <p
+                  data-testid={`board-stack-snoozed-clear-${stack.key}`}
+                  className="mt-2 text-xs font-semibold text-caution"
+                >
+                  Nothing left here today — {stack.snoozed.length} snoozed for later.
+                </p>
+              ) : (
+                <p data-testid={`board-stack-clear-${stack.key}`} className="mt-2 text-xs font-semibold text-status-done-fg">
+                  All done here today.
+                </p>
+              )
             )}
 
             {stack.done.length > 0 && (
@@ -399,6 +452,35 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                 {showDone && (
                   <ul data-testid={`board-done-${stack.key}`} className="mt-2 flex flex-col gap-2">
                     {stack.done.map((it) => renderRow(it))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            {stack.snoozed.length > 0 && (
+              // THE SNOOZED DRILL — the same shape as the done drill above and
+              // deliberately NOT inside it. Collapsed by default (the board reads
+              // as remaining work), reachable in one tap, and labelled with the
+              // word the operator's own gesture used.
+              //
+              // It exists because a delay has to stay VISIBLE and DISTINCT. The
+              // bug this lane closes had these rows inside the done drill wearing
+              // "✓ Done"; hiding them entirely would have been the same erasure
+              // with better manners — he would have had no way to see what he
+              // moved, or to notice he had moved something by accident.
+              <div className="mt-3">
+                <button
+                  type="button"
+                  data-testid={`board-show-snoozed-${stack.key}`}
+                  onClick={() => toggle(setOpenSnoozed, stack.key)}
+                  aria-expanded={showSnoozed}
+                  className="text-[11px] font-semibold uppercase tracking-wider text-caution underline underline-offset-2"
+                >
+                  {showSnoozed ? 'Hide snoozed' : `Show snoozed (${stack.snoozed.length})`}
+                </button>
+                {showSnoozed && (
+                  <ul data-testid={`board-snoozed-${stack.key}`} className="mt-2 flex flex-col gap-2">
+                    {stack.snoozed.map((it) => renderRow(it))}
                   </ul>
                 )}
               </div>

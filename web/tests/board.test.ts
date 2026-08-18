@@ -15,6 +15,7 @@ import {
   boardIsOverdue,
   boardSlotOf,
   boardSlotsWithADone,
+  boardStackSize,
   boardStacks,
   carryoverRank,
   carryoverReason,
@@ -112,6 +113,57 @@ describe('boardStacks — shape and the honest residue', () => {
   it('drops non-slot kinds', () => {
     const notASlot = slot({ id: 'e1', kind: 'email_tier' }, { slot: 'duty' });
     expect(stackFor([notASlot], 'duty')?.today).toEqual([]);
+  });
+});
+
+// ── SNOOZE HONESTY: the board's populations and its ratio ────────────────────
+describe('boardStacks — a SNOOZED item is delayed, not finished', () => {
+  // The reported morning, reconstructed: three overdue T1 duties, all snoozed.
+  const snoozed = (id: string) =>
+    slot({ id, state: 'acted', acted_action: 'snooze', acted_at: '2026-08-12T14:00:00Z' }, { slot: 'duty' });
+  const doneItem = (id: string) =>
+    slot({ id, state: 'acted', acted_action: 'done', acted_at: '2026-08-12T14:00:00Z' }, { slot: 'duty' });
+  const plannedItem = (id: string) => slot({ id }, { slot: 'duty' });
+
+  it('lands in its OWN bucket, not in `done` and not in the worklist', () => {
+    const st = stackFor([snoozed('s1')], 'duty');
+    expect(st?.snoozed.map((i) => i.id)).toEqual(['s1']);
+    expect(st?.done).toEqual([]);
+    expect(st?.today).toEqual([]);
+    expect(st?.carryover).toEqual([]);
+    expect(st?.candidates).toEqual([]);
+  });
+
+  it('leaves BOTH halves of the ratio — with done/planned as the controls', () => {
+    // The tally the operator read as "3/3 done". Snoozed is in neither half, so
+    // three snoozed duties produce no ratio at all rather than a full one.
+    const allSnoozed = stackFor([snoozed('s1'), snoozed('s2'), snoozed('s3')], 'duty');
+    expect(allSnoozed?.doneCount).toBe(0);
+    expect(allSnoozed?.committedCount).toBe(0);
+    // CONTROLS in the same test — without these, the assertions above pass
+    // identically against a build whose counters never increment at all.
+    const mixed = stackFor([snoozed('s1'), doneItem('d1'), plannedItem('p1')], 'duty');
+    expect(mixed?.doneCount).toBe(1); //      the done one counts
+    expect(mixed?.committedCount).toBe(2); // done + planned, snoozed excluded
+  });
+
+  it('still EXISTS on the board — a delay must not vanish', () => {
+    // The opposite failure, and the reason snoozed is in `boardStackSize` even
+    // though it is out of the ratio. A stack holding three pushed duties is not
+    // an empty one: it must not render "Nothing owed today." over them, and
+    // `boardCoverage`'s denominator must not deflate.
+    const st = stackFor([snoozed('s1'), snoozed('s2'), snoozed('s3')], 'duty');
+    expect(st && boardStackSize(st)).toBe(3);
+    const cov = boardCoverage(boardStacks([snoozed('s1')], stageOf, NOW));
+    expect(cov.total).toBe(1);
+    expect(cov.slotted).toBe(1);
+  });
+
+  it('does NOT earn a slot its "something done" mark', () => {
+    // `boardSlotsWithADone` is the balanced-day scoreline. A snoozed duty is not
+    // progress; a done one is (the control).
+    expect(boardSlotsWithADone(boardStacks([snoozed('s1')], stageOf, NOW))).toBe(0);
+    expect(boardSlotsWithADone(boardStacks([doneItem('d1')], stageOf, NOW))).toBe(1);
   });
 });
 

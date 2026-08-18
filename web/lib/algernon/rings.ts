@@ -48,31 +48,103 @@ export const RING_ACTION_UNDO = 'undo_done';
 // are all board-completable now, so none of them surface this note.
 export const COMPLETION_UNAVAILABLE_HINT = "Completion isn't available for this item";
 
-// --- C2 slot lifecycle stage (suggested → planned → done) --------------------
-export type RingItemStage = 'suggested' | 'planned' | 'done';
+// --- slot lifecycle stage (suggested → planned → done | snoozed) -------------
+export type RingItemStage = 'suggested' | 'planned' | 'done' | 'snoozed';
+
+/** The verb the store stamps on a snoozed item (`acted_action`). */
+export const SNOOZE_ACTED_VERB = 'snooze';
 
 /**
- * The C2 lifecycle stage of a slot_suggestion — the single choke-point (one seam)
- * that drives which verbs each surface shows. Precedence DONE > SUGGESTED > PLANNED.
+ * THE VERB → STAGE MAP. The whole point of this table is that it is a LOOKUP and
+ * not a binary: the bug it replaces was
+ * `acted_action === 'accept' ? 'planned' : 'done'`, which routed every verb that
+ * was not `accept` — including `snooze` — into the DONE rendering. On 2026-08-16
+ * the operator snoozed three overdue T1 duties and the home page struck them
+ * through as "✓ DONE", "3/3 done", "All done here today": a delay recorded as a
+ * completion, on the surface he reads first every morning.
  *
- * The `state==='acted'` OVERLOAD (a C1b completion AND a C2 accept both set acted) is
- * resolved by the VERB stamped on the state event — `item.acted_action`
- * ("accept" | "done" | absent-legacy), added in the C2 backend round:
- *   1. evidence.done === true                 → DONE  (vault-completed, still emitted)
- *   2. acted && acted_action === 'accept'     → PLANNED (accepted/committed — ✓ ENABLED
- *        so the operator can complete what he accepted this morning; NO undo rendered)
- *   3. acted otherwise (done / absent-legacy) → DONE  (a completion; C1b unchanged)
- *   4. open + candidate === true              → SUGGESTED; open otherwise → PLANNED
- * `candidate` does NOT discriminate acted items: the backend gate allows ✓ done on an
- * acted-by-accept item, and the dispatcher never mutates evidence, so a genuinely
- * done-after-accept item keeps `candidate=true` — keying on it would misread it as
- * PLANNED (the exact flow the verb stamp exists for). ABSENT acted_action degrades to
- * legacy DONE (same never-a-guess discipline as the render-present accept gating).
+ * THE VERB SPACE, enumerated from the source rather than from memory. The
+ * capability ceiling for `slot_suggestion` is `FEED_ACTIONS['slot_suggestion']`
+ * (daily_sync/action_router.py) — exactly: done, undo_done, accept, snooze_1d,
+ * snooze_3d, snooze_7d, snooze_until_i_say, unsnooze. Of those, the verbs that can
+ * PERSIST as `acted_action` are only these three:
+ *   - `done`   → DONE     (action_router.py:1357/1388/1412, DONE_ACTION)
+ *   - `accept` → PLANNED  (action_router.py:1610, ACCEPT_ACTION — committed, not
+ *                          completed; ✓ stays ENABLED so he can finish what he
+ *                          accepted this morning, and no undo is rendered)
+ *   - `snooze` → SNOOZED  (action_router.py:1164; ALL FOUR duration rungs collapse
+ *                          to this one verb at the stamp site)
+ * `undo_done` and `unsnooze` never appear here: both set STATE_OPEN, and a
+ * non-acted transition clears the verb (feed/store.py:180). The generic act path
+ * (action_router.py:2239) stamps other kinds' verbs — ack / confirm / reject /
+ * spam / adopt / … — but no non-slot kind reaches this function today: every
+ * `FeedRow` call site that supplies a completion hook is gated on
+ * `kind === 'slot_suggestion'`. That gating is at the CALL SITES, not in here,
+ * which is exactly why the fallback below is not decoration.
+ *
+ * :2239 IS NOT THE ONLY GENERIC STAMP — named here so the next auditor meets the
+ * surprise instead of re-deriving it. `action_router.py:1075`
+ * (`_dispatch_contact_pattern`) is a second
+ * `set_state(..., STATE_ACTED, action=action_id)`, stamping `adopt` / `ignore`.
+ * The claim above survives it: that dispatcher serves the `pattern_surfaced`
+ * kind ONLY and is reached through a kind gate at :2075, so no slot can arrive
+ * there and neither verb can land on an item this function sees. Verified at
+ * source, not assumed — and it is the reason the enumeration above is phrased as
+ * "the verbs that can PERSIST on a slot", not "the verbs the router can stamp".
+ *
+ * ADDING A VERB: add it HERE, with its stage. Do not re-introduce a branch.
+ */
+export const ACTED_VERB_STAGE: Readonly<Record<string, RingItemStage>> = {
+  accept: 'planned',
+  done: 'done',
+  [SNOOZE_ACTED_VERB]: 'snoozed',
+};
+
+/**
+ * The ruled default for an acted verb this map does not know — a future verb, or
+ * a non-slot kind reaching a surface that grew a completion hook.
+ *
+ * IT IS NOT 'done', AND THAT IS THE RULING. An unknown verb rendering as
+ * completion is precisely the 2026-08-16 bug for a verb that does not exist yet:
+ * the failure would be silent, would land on the morning surface, and would claim
+ * the operator finished something he did not. PLANNED is the honest degrade —
+ * "something happened to this and it is not finished" — and it fails toward
+ * showing work rather than toward erasing it.
+ */
+export const ACTED_VERB_FALLBACK_STAGE: RingItemStage = 'planned';
+
+/**
+ * ABSENT `acted_action` — distinct from an unknown verb, and deliberately still
+ * DONE. This is the pre-verb-stamp legacy shape (feed/store.py: "A legacy /
+ * verbless acted event (e.g. reconcile-decided) → None"), which C1b has always
+ * read as a completion; the verb stamp is FORWARD ONLY, so old events on disk are
+ * verbless and stay so. `null`/`undefined` is detectably different from a string
+ * this map has not heard of, so the two cases do not have to share a default.
+ */
+export const ACTED_LEGACY_STAGE: RingItemStage = 'done';
+
+/**
+ * The lifecycle stage of a slot_suggestion — the single choke-point (one seam)
+ * that drives which verbs each surface shows, and whether a row renders as
+ * finished. Precedence DONE > (verb) > SUGGESTED > PLANNED:
+ *   1. evidence.done === true  → DONE (vault-completed, still emitted)
+ *   2. acted                   → ACTED_VERB_STAGE[verb], with the two ruled
+ *                                defaults above for absent / unknown verbs
+ *   3. open + candidate        → SUGGESTED; open otherwise → PLANNED
+ *
+ * `candidate` does NOT discriminate acted items: the backend gate allows ✓ done on
+ * an acted-by-accept item, and the dispatcher never mutates evidence, so a
+ * genuinely done-after-accept item keeps `candidate=true` — keying on it would
+ * misread it as PLANNED (the exact flow the verb stamp exists for).
  */
 export function ringItemStage(item: FeedItem): RingItemStage {
   const ev = (item.evidence as Record<string, unknown> | null | undefined) ?? {};
   if (ev.done === true) return 'done';
-  if (item.state === 'acted') return item.acted_action === 'accept' ? 'planned' : 'done';
+  if (item.state === 'acted') {
+    const verb = item.acted_action;
+    if (verb == null) return ACTED_LEGACY_STAGE;
+    return ACTED_VERB_STAGE[verb] ?? ACTED_VERB_FALLBACK_STAGE;
+  }
   return ev.candidate === true ? 'suggested' : 'planned';
 }
 
@@ -84,8 +156,31 @@ export function ringItemStage(item: FeedItem): RingItemStage {
  *   3. base ringItemStage, with an optimistic UNDO (raw base 'done' but completion overrode
  *      it not-done) returning the item to PLANNED, not falling through to the raw 'done'.
  * The hooks are structural + optional so the rings panel (both present) and a feed row
- * (either absent) share this single implementation. This MUST stay the only copy — a 4th
+ * (either absent) share this single implementation. This MUST stay the only copy — a 5th
  * stage or a precedence change lands HERE, once, and both surfaces move in lockstep.
+ *
+ * SNOOZED OUTRANKS THE ACCEPT OPTIMISM, and that ordering is load-bearing rather
+ * than incidental. `accept.accepted` is a SESSION-LOCAL set of ids the operator
+ * accepted since page load; `snoozed` comes from the verb the SERVER stamped. Both
+ * can be true of one item, and the sequence that does it is ordinary: accept a
+ * candidate (it becomes planned, and a planned row is exactly what the Snooze
+ * control is offered on), then snooze it. With the accept check first, that item
+ * rendered PLANNED again — the snooze erased, back in the committed denominator,
+ * offering ✓ Done on something just pushed out of today. That is this lane's bug
+ * reappearing inside its own fix, one seam below where it was found.
+ *
+ * The rule the order encodes: the accept optimism is a stand-in for a server stamp
+ * that has not arrived yet, so it must never outrank a stamp that HAS arrived. The
+ * accept necessarily happened EARLIER than the snooze — you cannot snooze a row you
+ * have not yet put on the plan — so the newer fact wins.
+ *
+ * `completion.effectiveDone` stays above both: it is a genuine completion the
+ * operator just performed. The two cannot legitimately co-occur anyway (the router
+ * refuses a snooze on a done item, and no snoozed row renders a ✓), so this is the
+ * safe direction on an unreachable pair rather than a live precedence.
+ *
+ * The one way to become snoozed is the stamped verb, and the one way to stop being
+ * snoozed is `unsnooze`, which returns the item to `open` server-side.
  */
 export function effectiveStageOf(
   item: FeedItem,
@@ -93,8 +188,9 @@ export function effectiveStageOf(
   accept: { accepted: (id: string) => boolean } | null | undefined,
 ): RingItemStage {
   if (completion.effectiveDone(item)) return 'done';
-  if (accept?.accepted(item.id)) return 'planned';
   const base = ringItemStage(item);
+  if (base === 'snoozed') return 'snoozed';
+  if (accept?.accepted(item.id)) return 'planned';
   return base === 'done' ? 'planned' : base;
 }
 
@@ -104,6 +200,11 @@ export function effectiveStageOf(
  * `state==='acted' || evidence.done`; the ONLY behaviour change is that an
  * acted-but-still-candidate item — a just-accepted, not-yet-reconciled slot — reads
  * as NOT done, since accept means committed/planned, not completed.)
+ *
+ * A SNOOZED item is NOT done. That is the whole fix: every green tick, every
+ * strikethrough and every done tally on every surface reads this one predicate (or
+ * the stage behind it), so a delay stops being reported as a completion in one
+ * place rather than in nine.
  */
 export function ringItemDone(item: FeedItem): boolean {
   return ringItemStage(item) === 'done';
@@ -114,9 +215,29 @@ export function ringItemSuggested(item: FeedItem): boolean {
   return ringItemStage(item) === 'suggested';
 }
 
-/** A COMMITTED slot — on today's plan (planned or done). The ring COUNT tallies these; candidates are excluded. */
+/**
+ * A SNOOZED slot — the operator pushed it to a later day. It is neither work owed
+ * today nor anything he finished, so it is excluded from BOTH sides of every
+ * done/total ratio (see `ringItemCommitted`), and it renders with its own
+ * treatment rather than borrowing done's.
+ */
+export function ringItemSnoozed(item: FeedItem): boolean {
+  return ringItemStage(item) === 'snoozed';
+}
+
+/**
+ * A COMMITTED slot — on today's plan (planned or done). The ring COUNT tallies
+ * these; candidates are excluded.
+ *
+ * SNOOZED IS EXCLUDED TOO, and it is excluded from the DENOMINATOR on purpose. A
+ * snoozed item is not owed today — the operator decided that himself — so counting
+ * it would produce "0/3 done" for a morning he deliberately cleared, which is a nag
+ * dressed as a fact. Counting it in the numerator would be the original bug. It
+ * belongs to neither half of the ratio, so it leaves the ratio entirely.
+ */
 export function ringItemCommitted(item: FeedItem): boolean {
-  return ringItemStage(item) !== 'suggested';
+  const stage = ringItemStage(item);
+  return stage !== 'suggested' && stage !== 'snoozed';
 }
 
 /**
