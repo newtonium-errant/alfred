@@ -77,14 +77,33 @@ describe('segment colouring', () => {
     expect(all.size).toBe(3);
   });
 
-  it('C2 segmentStageClass maps all three stages to distinct colours (suggested = muted)', () => {
+  it('segmentStageClass maps every stage to a distinct colour (suggested = muted, snoozed = caution)', () => {
     expect(segmentStageClass('done')).toBe(RING_STROKE_CLASS.done);
     expect(segmentStageClass('planned')).toBe(RING_STROKE_CLASS.planned);
     expect(segmentStageClass('suggested')).toBe(RING_STROKE_CLASS.suggested);
+    expect(segmentStageClass('snoozed')).toBe(RING_STROKE_CLASS.snoozed);
     expect(RING_STROKE_CLASS.suggested).toBe('text-honeydew-400');
-    // Four distinct classes across the full stage + empty set (no colour collision).
-    const all = new Set([RING_STROKE_CLASS.done, RING_STROKE_CLASS.planned, RING_STROKE_CLASS.suggested, RING_STROKE_CLASS.empty]);
-    expect(all.size).toBe(4);
+    // `caution` is the RATIFIED role for the defer family, not a fresh hue picked
+    // here: styles/console.css states it "deliberately covers BOTH the defer
+    // family (swipe-up, snooze) and the heavy-verb arm stage … Do not split them
+    // into two hues without re-ratifying". Snooze IS the defer verb.
+    expect(RING_STROKE_CLASS.snoozed).toBe('text-caution');
+    // FIVE distinct classes across the full stage + empty set. Parametrized over
+    // the WHOLE family rather than bolted onto the new member: the guard added
+    // for snoozed has to cover the incumbents it was not written for.
+    const all = new Set(Object.values(RING_STROKE_CLASS));
+    expect(all.size).toBe(Object.keys(RING_STROKE_CLASS).length);
+    expect(all.size).toBe(5);
+  });
+
+  it('a snoozed segment is NOT the done colour — the ring stops painting a delay green', () => {
+    // The glance-surface half of the 2026-08-16 report. The panel below the ring
+    // said "3/3 done"; the ring itself painted three GREEN segments, because every
+    // non-accept verb reached `segmentStageClass('done')`.
+    expect(segmentStageClass('snoozed')).not.toBe(segmentStageClass('done'));
+    // And it is not silently borrowing planned's paint either — "moved" and "still
+    // owed today" are different facts and the ring has to be able to say both.
+    expect(segmentStageClass('snoozed')).not.toBe(segmentStageClass('planned'));
   });
 
   it('segmentStroke(done) delegates to the stage class (2-way completion helper)', () => {

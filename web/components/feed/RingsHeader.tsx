@@ -72,6 +72,7 @@ export function RingsHeader({
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [openItemId, setOpenItemId] = useState<string | null>(null);
   const [showDone, setShowDone] = useState(false);
+  const [showSnoozed, setShowSnoozed] = useState(false);
   // Hooks can't be conditional, so the internal instance is always constructed and
   // simply unused when the host supplies one. Still ONE implementation either way.
   const ownCompletion = useRingCompletion({ onAuthExpired });
@@ -121,6 +122,9 @@ export function RingsHeader({
   const toggleRing = useCallback((key: string) => {
     setOpenItemId(null);
     setShowDone(false);
+    // Reset alongside `showDone` — both drills are per-panel, and leaving one
+    // latched open would carry a previous tier's disclosure into the next ring.
+    setShowSnoozed(false);
     setOpenKey((cur) => (cur === key ? null : key));
   }, []);
   const toggleItem = useCallback((id: string) => {
@@ -134,6 +138,8 @@ export function RingsHeader({
     const stage = effectiveStage(it);
     const done = stage === 'done';
     const suggested = stage === 'suggested';
+    // DELAYED — see rings.ts. No strikethrough (gated on `done`), no ✓ control.
+    const snoozed = stage === 'snoozed';
     const completable = ringItemCompletable(it);
     const undoable = ringItemUndoable(it);
     const compBusy = completion.busy(it.id);
@@ -141,7 +147,13 @@ export function RingsHeader({
     const itemError = completion.errorFor(it.id) ?? accept.errorFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
-    const dotClass = done ? 'bg-status-done-fg' : suggested ? 'bg-console-ink-faint' : 'bg-status-progress-fg';
+    const dotClass = done
+      ? 'bg-status-done-fg'
+      : snoozed
+        ? 'bg-caution'
+        : suggested
+          ? 'bg-console-ink-faint'
+          : 'bg-status-progress-fg';
     return (
       <li key={it.id} data-testid="ring-panel-item" data-done={done} data-stage={stage} className="border-t border-dashed border-console-edge pt-2 first:border-0 first:pt-0">
         <div className="flex items-start justify-between gap-2">
@@ -178,6 +190,17 @@ export function RingsHeader({
                 </button>
               )}
             </div>
+          ) : snoozed ? (
+            // SNOOZED — pushed to a later day. A statement, not a control: the
+            // rings panel holds no snooze hook, and Unsnooze lives on the feed's
+            // staged list. Rendering a live-looking ✓ here would re-assert the
+            // completion this whole change exists to stop asserting.
+            <span
+              data-testid="ring-item-snoozed"
+              className="shrink-0 text-[10px] font-bold uppercase tracking-wider text-caution"
+            >
+              Snoozed
+            </span>
           ) : suggested ? (
             // SUGGESTED — an auto-surfaced candidate NOT yet on the plan. The one
             // affordance is Accept (commit it); NO ✓ (candidates aren't completable
@@ -275,15 +298,39 @@ export function RingsHeader({
         (() => {
           const bucketItems = activeBucket.items;
           const doneItems = bucketItems.filter((it) => effectiveStage(it) === 'done');
-          const notDone = bucketItems.filter((it) => effectiveStage(it) !== 'done');
-          // COMMITTED = planned + done (the count denominator); SUGGESTED excluded.
-          const committedCount = bucketItems.filter((it) => effectiveStage(it) !== 'suggested').length;
+          const snoozedItems = bucketItems.filter((it) => effectiveStage(it) === 'snoozed');
+          // THE WORKLIST — what is still live in this tier. Named for what it holds
+          // rather than as "notDone": a snoozed item is also not done, and calling
+          // this set by a negation is how it would quietly acquire one. Snoozed rows
+          // have their own drill below; they are not remaining work.
+          const worklist = bucketItems.filter((it) => {
+            const s = effectiveStage(it);
+            return s !== 'done' && s !== 'snoozed';
+          });
+          // COMMITTED = planned + done (the count denominator); SUGGESTED excluded,
+          // and SNOOZED excluded — it is in neither half of the ratio (rings.ts).
+          const committedCount = bucketItems.filter((it) => {
+            const s = effectiveStage(it);
+            return s !== 'suggested' && s !== 'snoozed';
+          }).length;
+          const suggestedCount = bucketItems.length - committedCount - snoozedItems.length;
+          // The header when nothing is committed. Built from PARTS so a tier holding
+          // both candidates and snoozed rows reports both — the old single-branch
+          // fallback called every uncommitted item "suggested", which would have
+          // relabelled three snoozed duties as offers the operator had not answered.
+          const uncommittedParts = [
+            suggestedCount > 0 ? `${suggestedCount} suggested` : null,
+            snoozedItems.length > 0 ? `${snoozedItems.length} snoozed` : null,
+          ].filter((p): p is string => p !== null);
           return (
             <div data-testid={`ring-panel-${activeBucket.key}`} className="mt-2 rounded-xl border border-console-edge bg-console-panel p-3 shadow-soft">
               {/* Honest header: the committed ratio ("T2 · 1/2 done"), or — when nothing
                   is committed yet, only candidates — the suggested count. */}
               <h3 className="text-xs font-bold uppercase tracking-wider text-console-ink">
-                {activeBucket.label} · {committedCount > 0 ? `${doneItems.length}/${committedCount} done` : `${bucketItems.length} suggested`}
+                {activeBucket.label} ·{' '}
+                {committedCount > 0
+                  ? `${doneItems.length}/${committedCount} done`
+                  : uncommittedParts.join(' · ')}
               </h3>
 
               {bucketItems.length === 0 ? (
@@ -293,15 +340,25 @@ export function RingsHeader({
                 </p>
               ) : (
                 <>
-                  {notDone.length > 0 ? (
+                  {worklist.length > 0 ? (
                     // The WORKLIST — remaining (suggested + planned) items, by default.
                     <ul data-testid="ring-panel-worklist" className="mt-2 flex flex-col gap-2">
-                      {notDone.map(renderItem)}
+                      {worklist.map(renderItem)}
                     </ul>
-                  ) : (
+                  ) : committedCount > 0 ? (
                     // A WIN — everything committed is done (no suggested, no planned left).
+                    // Gated on `committedCount`: with the tier emptied by SNOOZING
+                    // instead, this line read "All 0 done ✓" — a congratulation for a
+                    // completion that never happened, which is the tier-level twin of
+                    // the board's "All done here today."
                     <p data-testid="ring-panel-all-done" className="mt-2 text-xs font-semibold text-status-done-fg">
                       All {committedCount} done ✓
+                    </p>
+                  ) : (
+                    // Nothing committed and nothing live — the tier holds only snoozed
+                    // rows. Say that, rather than claiming a win or going silent.
+                    <p data-testid="ring-panel-all-snoozed" className="mt-2 text-xs font-semibold text-caution">
+                      Nothing left in this tier — {snoozedItems.length} snoozed for later.
                     </p>
                   )}
 
@@ -320,6 +377,36 @@ export function RingsHeader({
                       {showDone && (
                         <ul data-testid="ring-panel-done" className="mt-2 flex flex-col gap-2">
                           {doneItems.map(renderItem)}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+
+                  {snoozedItems.length > 0 && (
+                    // THE SNOOZED DRILL — beside the done drill and never inside
+                    // it, the same ruling this panel's twin (SlotBoard) makes.
+                    //
+                    // Without it, `showSnoozed` was dead state and snoozed rows
+                    // rendered NOWHERE: filtered out of the worklist, absent from
+                    // the done drill, present only as a number in the header. The
+                    // operator could see that three things had moved and not
+                    // WHICH three — so an accidental snooze would be unfindable,
+                    // and a delay he wanted to reverse had no row to reverse it
+                    // from. Hiding them entirely is the same erasure as calling
+                    // them done, with better manners.
+                    <div className="mt-2">
+                      <button
+                        type="button"
+                        data-testid="ring-show-snoozed"
+                        onClick={() => setShowSnoozed((s) => !s)}
+                        aria-expanded={showSnoozed}
+                        className="text-[11px] font-semibold uppercase tracking-wider text-caution underline underline-offset-2"
+                      >
+                        {showSnoozed ? 'Hide snoozed' : `Show snoozed (${snoozedItems.length})`}
+                      </button>
+                      {showSnoozed && (
+                        <ul data-testid="ring-panel-snoozed" className="mt-2 flex flex-col gap-2">
+                          {snoozedItems.map(renderItem)}
                         </ul>
                       )}
                     </div>

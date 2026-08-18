@@ -290,11 +290,20 @@ export interface BoardStack {
   candidates: FeedItem[];
   /** Completed (any stage-done item visible today). Behind the done drill. */
   done: FeedItem[];
+  /**
+   * DELAYED — pushed to a later day and due back. Behind its own drill, beside
+   * the done one and never inside it: "I finished this" and "I moved this" are
+   * opposite facts about the day, and the whole reason this bucket exists is that
+   * they were being rendered as the same one.
+   */
+  snoozed: FeedItem[];
   /** The long tail the caps demoted — browse-on-swap. */
   overflow: FeedItem[];
   /**
    * The committed denominator: everything on the plan today, capped or not,
    * done or not. Candidates are excluded — a candidate is not a commitment.
+   * Snoozed items are excluded too: they are no longer owed today, so they are
+   * in neither half of the ratio (see `ringItemCommitted`).
    */
   committedCount: number;
   /** How many of `committedCount` are done. */
@@ -360,6 +369,7 @@ export function boardStacks(
     // `inPlace` holds the rows that render where they already were: everything
     // not yet done, PLUS anything completed on this board this session.
     const done: FeedItem[] = [];
+    const snoozed: FeedItem[] = [];
     const inPlace: FeedItem[] = [];
     const suggested: FeedItem[] = [];
     let committedCount = 0;
@@ -368,6 +378,15 @@ export function boardStacks(
       const stage = stageOf(it);
       if (stage === 'suggested') {
         suggested.push(it);
+        continue;
+      }
+      // SNOOZED leaves the ratio entirely — before `committedCount` is bumped,
+      // which is the line that matters. A delayed item is not owed today (so it
+      // is not the denominator) and certainly not finished (so it is not the
+      // numerator). It still renders, in its own drill, because an item that
+      // vanished the moment it was moved would be a lost commitment.
+      if (stage === 'snoozed') {
+        snoozed.push(it);
         continue;
       }
       // Committed = on today's plan, done or not. Counted before the display
@@ -405,6 +424,7 @@ export function boardStacks(
       carryover,
       candidates,
       done,
+      snoozed,
       overflow,
       committedCount,
       doneCount,
@@ -434,13 +454,23 @@ export function boardSlotsWithADone(stacks: BoardStack[]): number {
   return stacks.filter((s) => SLOT_ORDER.includes(s.key) && s.doneCount > 0).length;
 }
 
-/** Every item a stack holds, across all of its sections. One owner for the sum. */
+/**
+ * Every item a stack holds, across all of its sections. One owner for the sum.
+ *
+ * `snoozed` is counted here — this is EXISTENCE, not the done ratio. A snoozed
+ * item leaves the tally (`committedCount`/`doneCount`) but it has not left the
+ * board: it is on screen, one drill in, and it is reachable. Omitting it would
+ * make a morning with three pushed duties report "Nothing on the board yet today"
+ * and would deflate `boardCoverage`'s denominator — trading the bug this lane
+ * fixes for a quieter one in the same sentence.
+ */
 export function boardStackSize(stack: BoardStack): number {
   return (
     stack.today.length +
     stack.carryover.length +
     stack.candidates.length +
     stack.done.length +
+    stack.snoozed.length +
     stack.overflow.length
   );
 }

@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ACTED_LEGACY_STAGE,
+  ACTED_VERB_FALLBACK_STAGE,
+  ACTED_VERB_STAGE,
+  SNOOZE_ACTED_VERB,
   effectiveStageOf,
   isTodayInstanceTz,
   ringItemCommitted,
   ringItemCompletable,
   ringItemDone,
+  ringItemSnoozed,
   ringItemStage,
   ringItemSuggested,
   ringItemUndoable,
@@ -12,6 +17,9 @@ import {
   ringTierOf,
   tierRingBuckets,
 } from '../lib/algernon/rings';
+// Imported under an alias from its OTHER home so the one-owner pin below is
+// comparing two real import paths, not a constant against itself.
+import { SNOOZE_ACTED_VERB as FEED_CONSTANTS_SNOOZE_VERB } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
 import { withServedActions } from './helpers/servedActions';
 
@@ -106,6 +114,135 @@ describe('ringItemStage — C2 lifecycle (suggested → planned → done), VERB-
     expect(ringItemCommitted(cand)).toBe(false);
     expect(ringItemCommitted(accepted)).toBe(true); // accepted = planned = committed
     expect(ringItemCommitted(done)).toBe(true);
+  });
+});
+
+// ── SNOOZE HONESTY: the verb→stage map ───────────────────────────────────────
+// 2026-08-16, operator-reported and screenshot-verified: he snoozed three overdue
+// T1 duties and home's DUTY section rendered all three struck through "✓ DONE",
+// "3/3 done", "All done here today." The site was the binary this map replaced —
+// `acted_action === 'accept' ? 'planned' : 'done'` — which routed EVERY verb that
+// was not `accept` into the done rendering, `snooze` included.
+describe('ringItemStage — the acted-verb map (snooze honesty)', () => {
+  const snoozedItem = () =>
+    slot({ state: 'acted', acted_action: 'snooze', evidence: { tier: 1, candidate: true } });
+
+  it('ACTED + acted_action="snooze" → snoozed (NOT done — the 2026-08-16 bug)', () => {
+    expect(ringItemStage(snoozedItem())).toBe('snoozed');
+    // The claim that actually reached the operator's eyes, pinned directly:
+    // every strikethrough, green tick and done tally on every surface reads this.
+    expect(ringItemDone(snoozedItem())).toBe(false);
+    expect(ringItemSnoozed(snoozedItem())).toBe(true);
+  });
+
+  it('an UNKNOWN acted verb degrades to PLANNED, never to done', () => {
+    // The ruled default. A future verb rendering as a completion is the same bug
+    // for a verb that does not exist yet — silent, on the morning surface, and
+    // claiming he finished something he did not. "Not finished" is the honest
+    // degrade, and it fails toward showing work rather than erasing it.
+    const unknown = slot({ state: 'acted', acted_action: 'reticulate', evidence: { tier: 1 } });
+    expect(ringItemStage(unknown)).toBe('planned');
+    expect(ringItemDone(unknown)).toBe(false);
+    expect(ACTED_VERB_FALLBACK_STAGE).toBe('planned');
+  });
+
+  it('ABSENT acted_action still degrades to DONE — legacy, and distinct from unknown', () => {
+    // null/undefined is detectably different from a string the map has not heard
+    // of, so the two cases do not share a default. Pre-verb-stamp events on disk
+    // are verbless forever (the stamp is forward-only) and C1b has always read
+    // them as completions. BOTH null and undefined, because the store's absent
+    // verb arrives as either depending on the serialisation path.
+    expect(ringItemStage(slot({ state: 'acted', evidence: { tier: 1 } }))).toBe('done');
+    expect(ringItemStage(slot({ state: 'acted', acted_action: null, evidence: { tier: 1 } }))).toBe('done');
+    expect(ACTED_LEGACY_STAGE).toBe('done');
+  });
+
+  it('the map is EXACTLY the three verbs that can persist as acted_action', () => {
+    // Enumerated from the source, not from memory: of the capability ceiling for
+    // slot_suggestion (done, undo_done, accept, snooze_1d/3d/7d/until_i_say,
+    // unsnooze), only these three PERSIST — `undo_done` and `unsnooze` both set
+    // STATE_OPEN, and a non-acted transition clears the verb. All four snooze
+    // rungs collapse to the single verb `snooze` at the stamp site.
+    // A total-enumeration pin: adding a verb without ruling its stage reds here.
+    expect(Object.keys(ACTED_VERB_STAGE).sort()).toEqual(['accept', 'done', 'snooze']);
+    expect(ACTED_VERB_STAGE.accept).toBe('planned');
+    expect(ACTED_VERB_STAGE.done).toBe('done');
+    expect(ACTED_VERB_STAGE[SNOOZE_ACTED_VERB]).toBe('snoozed');
+  });
+
+  it('ONE OWNER for the snooze verb — the feedConstants spelling IS the rings one', () => {
+    // feedConstants re-exports rather than re-declaring. A second literal that
+    // drifted is how the FE would stop recognising a snooze without any test
+    // noticing; this pin is the only thing standing between the two spellings.
+    expect(FEED_CONSTANTS_SNOOZE_VERB).toBe(SNOOZE_ACTED_VERB);
+    expect(SNOOZE_ACTED_VERB).toBe('snooze');
+  });
+
+  it('SNOOZED leaves BOTH halves of the ratio — with planned/done as the control', () => {
+    // The exclusion assertion is worthless alone: it passes identically if
+    // `ringItemCommitted` returned false for everything. The neighbours that MUST
+    // still count are asserted in the same test.
+    const snoozedI = snoozedItem();
+    const planned = slot({ state: 'open', evidence: { tier: 1 } });
+    const done = slot({ state: 'acted', acted_action: 'done', evidence: { tier: 1 } });
+    expect(ringItemCommitted(snoozedI)).toBe(false); // not the denominator
+    expect(ringItemDone(snoozedI)).toBe(false); //      not the numerator
+    expect(ringItemCommitted(planned)).toBe(true); //   ← controls: the ratio still works
+    expect(ringItemCommitted(done)).toBe(true);
+    expect(ringItemDone(done)).toBe(true);
+  });
+
+  it('SNOOZED is not SUGGESTED either — it never sprouts an Accept', () => {
+    expect(ringItemSuggested(snoozedItem())).toBe(false);
+  });
+
+  it('the ACCEPT optimism cannot erase a snooze (accept-then-snooze, one session)', () => {
+    // The reachable sequence, not a hypothetical: accept a candidate (it becomes
+    // planned — and a planned row is exactly what Snooze is offered on), then
+    // snooze it. Its id stays in the session-local accepted set while the server
+    // stamps `snooze`. With the accept check ordered first this rendered PLANNED:
+    // the snooze erased, back in the denominator, ✓ Done offered on it.
+    const s = snoozedItem();
+    expect(effectiveStageOf(s, { effectiveDone: () => false }, { accepted: () => true })).toBe('snoozed');
+    // Control — the accept optimism still works on the stage it is FOR. Without
+    // this the pin above would pass against a build where `accepted` was ignored
+    // entirely, which would break the accept flow instead of fixing anything.
+    const candidate = slot({ state: 'open', evidence: { tier: 1, candidate: true } });
+    expect(effectiveStageOf(candidate, { effectiveDone: () => false }, { accepted: () => false })).toBe('suggested');
+    expect(effectiveStageOf(candidate, { effectiveDone: () => false }, { accepted: () => true })).toBe('planned');
+  });
+
+  it('a snooze survives the overlay with no hooks firing; a real completion still wins', () => {
+    const s = snoozedItem();
+    expect(effectiveStageOf(s, { effectiveDone: () => false }, { accepted: () => false })).toBe('snoozed');
+    expect(effectiveStageOf(s, { effectiveDone: () => false }, null)).toBe('snoozed');
+    // Stated rather than left implicit: a genuine completion recorded through the
+    // hook outranks a snooze. The pair is unreachable in practice (the router
+    // refuses a snooze on a done item, and no snoozed row renders a ✓) — this
+    // pins the safe direction on it, not a live precedence.
+    expect(effectiveStageOf(s, { effectiveDone: () => true }, { accepted: () => false })).toBe('done');
+  });
+
+  it('the Case-B dedup drops only ACCEPT phantoms — a snoozed item survives its open sibling', () => {
+    // `tierRingBuckets` filters on `acted_action === 'accept'` specifically, and
+    // that narrowness is the correct ruling rather than an oversight: the dedup
+    // exists for the spent accept phantom the T3/5%-task re-emit leaves behind.
+    // A snoozed item is not a phantom — dropping it would delete the operator's
+    // own decision from the day.
+    const snoozedI = slot({
+      id: 'snoozed-old', state: 'acted', acted_action: 'snooze', acted_at: new Date().toISOString(),
+      evidence: { tier: 1, name: 'Pay rent' },
+    });
+    const openSibling = slot({ id: 'open-new', state: 'open', evidence: { tier: 1, name: 'Pay rent' } });
+    const acceptPhantom = slot({
+      id: 'accept-old', state: 'acted', acted_action: 'accept', acted_at: new Date().toISOString(),
+      evidence: { tier: 1, name: 'Pay rent' },
+    });
+    const t1 = (items: FeedItem[]) => tierRingBuckets(items)[0].items.map((i) => i.id);
+    expect(t1([snoozedI, openSibling]).sort()).toEqual(['open-new', 'snoozed-old']);
+    // The control proving the dedup is alive at all and the pin above is not
+    // passing because nothing is ever dropped:
+    expect(t1([acceptPhantom, openSibling])).toEqual(['open-new']);
   });
 });
 

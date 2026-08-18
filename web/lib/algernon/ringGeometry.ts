@@ -73,17 +73,49 @@ export function arcPath(cx: number, cy: number, r: number, a0: number, a1: numbe
 //               third visual class, tentative; rendered as a segment for legibility
 //               but excluded from the done/total COUNT. Colour-only for v1; a dashed
 //               stroke is a possible enhancement, operator eyes on first cut.)
+//   snoozed   → caution (a DELAYED item — acted on, but pushed to a later day and
+//               due back. See below for why it paints a segment at all.)
 //   empty     → red    (an empty ring: nothing in the bucket)
-export type SegmentStatus = 'done' | 'planned' | 'suggested';
+//
+// WHY SNOOZED PAINTS A SEGMENT RATHER THAN NOTHING (the ruling, in one sentence):
+// dropping it would make a morning where three duties were PUSHED look identical
+// to one where they never existed, which erases the operator's own decision from
+// the only glance surface he has — so the segment stays and says *moved*, never
+// *finished*. (The item leaves on its own the next day, via
+// `ringItemVisibleToday`'s acted_at check; this is its one visible day.)
+//
+// WHY `caution` AND NOT A NEW HUE: styles/console.css states the role contract
+// outright — "`caution` deliberately covers BOTH the defer family (swipe-up,
+// snooze) and the heavy-verb arm stage … Do not split them into two hues without
+// re-ratifying". Snooze IS the defer verb, so amber is the ratified answer and
+// picking a fresh colour here would be an unratified split.
+//
+// The consequence, stated rather than left to be discovered: `caution` (#c99a4c)
+// and `planned`'s `status-progress-fg` (#92611a) are the same amber FAMILY, which
+// is semantically right (both mean "not finished") and is a legibility question on
+// a 3.5px stroke. They differ substantially in luminance so they are separable,
+// and the distinctness pin in tests/ringGeometry.test.ts asserts all five classes
+// are distinct STRINGS — a string pin cannot speak for the eye. Flagged for
+// operator eyes on first cut, exactly as `suggested` was.
+export type SegmentStatus = 'done' | 'planned' | 'suggested' | 'snoozed';
 
 export const RING_STROKE_CLASS = {
   done: 'text-status-done-fg',
   planned: 'text-status-progress-fg',
   suggested: 'text-honeydew-400',
+  snoozed: 'text-caution',
   empty: 'text-danger',
 } as const;
 
-/** The colour class for one segment given its C2 stage (done → green, planned → amber, suggested → muted). */
+/**
+ * The colour class for one segment given its stage (done → green, planned → amber,
+ * suggested → muted, snoozed → caution amber).
+ *
+ * TOTAL over `SegmentStatus` by construction: it indexes the record rather than
+ * branching, so a new stage cannot be added to the union without a colour — the
+ * type checker names the omission at this line. That totality is the reason a
+ * snoozed segment could not silently inherit another stage's paint.
+ */
 export function segmentStageClass(stage: SegmentStatus): string {
   return RING_STROKE_CLASS[stage];
 }
