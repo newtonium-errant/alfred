@@ -2932,9 +2932,10 @@ async def _dispatch_routine_undone(
 def _resolve_tier_timezone(config: TalkerConfig | None) -> str:
     """The IANA tz used to resolve 'today' for the tier done-state.
 
-    Prefers the tier surface's own ``today_command.timezone`` (the same
-    tz ``/today`` + the tier compute use, so tier_done's date boundary
-    matches what the operator sees rendered). Falls back to
+    Prefers the tier surface's own ``today_command.timezone`` (the tz
+    the tier compute uses, so tier_done's date boundary matches what the
+    operator sees rendered; the block outlived its namesake /today
+    command — retired T5 2026-08-19). Falls back to
     :data:`_DEFAULT_INSTANCE_TIMEZONE` (``America/Halifax``, Salem's tz)
     when the ``today_command`` block is absent.
     """

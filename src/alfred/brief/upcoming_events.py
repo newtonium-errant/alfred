@@ -22,10 +22,10 @@ Buckets depend on the caller-supplied ``scope`` kwarg on
 - **This Week** — ``today < date <= today + 7d``
 - **Later** — ``today + 7d < date <= today + max_days_ahead``
 
-``scope="today_tomorrow"`` (used by the ``/today`` Telegram slash
-command since 2026-05-30 — operator wanted only the immediate calendar
-slice in the glance-view; the morning brief retains the full 7-day
-window):
+``scope="today_tomorrow"`` (the glance-view slice — built 2026-05-30
+for the ``/today`` Telegram slash command, which died with the
+Telegram retirement in T5 2026-08-19; the mode is kept as a tested
+narrow-view of this shared renderer with no production caller today):
 - **Today** — ``date == today``
 - **Tomorrow** — ``date == today + 1d``
 

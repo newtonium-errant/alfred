@@ -443,32 +443,25 @@ class FictionConfig:
 
 @dataclass
 class TodayCommandConfig:
-    """Per-instance gate for the ``/today`` slash command (Tier Phase 2A,
-    2026-05-28).
+    """Config block for the RETIRED ``/today`` slash command (Tier Phase
+    2A, 2026-05-28; command died with the Telegram retirement, T5
+    2026-08-19 — ``today_command.py`` is deleted).
 
-    Default ``False`` so no instance accidentally registers the command —
-    Salem opts in via ``telegram.today_command.enabled: true`` in
-    ``config.yaml`` because the surface composes Salem-specific sections
-    (tier, routines, upcoming events). KAL-LE / Hypatia leave the block
-    absent.
-
-    The command is a glance-view mini-brief: composes the tier section,
-    today's routines, and upcoming events as a single Telegram reply.
-    Read-only — no vault writes, no session record.
-
-    Mirror of :class:`FictionConfig` + :class:`VoiceTrainConfig`
-    shape — same default-off-by-block-absence convention so health probes
-    can distinguish "block absent" from "block present, command disabled".
+    The dataclass is KEPT because ``timezone`` outlived the command: it
+    is the instance timezone the tier surface still resolves through
+    ``conversation._resolve_tier_timezone`` (prefers
+    ``today_command.timezone``, falls back to Salem's tz), so Salem's
+    configured block keeps steering the tier done-state date boundary.
+    ``enabled`` is inert — nothing registers a command any more.
 
     ``timezone`` defaults to ``America/Halifax`` (Salem's tz) since the
-    talker config doesn't carry a system timezone today. Operator-tunable
-    per instance for future opt-ins.
+    talker config doesn't carry a system timezone today.
     """
 
     enabled: bool = False
-    #: IANA timezone for the ``now`` instant used by the tier compute
-    #: + routines/upcoming-events date selection. Defaults to Salem's
-    #: tz since Phase 2A is Salem-only.
+    #: IANA timezone for the tier compute's 'today' boundary — consumed
+    #: by ``conversation._resolve_tier_timezone``. Defaults to Salem's
+    #: tz since Phase 2A was Salem-only.
     timezone: str = "America/Halifax"
 
 
@@ -622,11 +615,10 @@ class TalkerConfig:
     # only opt-in; Salem/KAL-LE adoption is a config flip when their
     # workflows need it.
     voice_train: VoiceTrainConfig | None = None
-    # Today-command gate — see :class:`TodayCommandConfig`. Default-OFF
-    # / None sentinel matching the fiction + voice_train shape. Salem is
-    # Tier Phase 2A's only opt-in; the /today command composed the
-    # brief's tier + upcoming-events sections as a glance-view
-    # mini-brief. KAL-LE / Hypatia leave the block absent.
+    # Today-command block — see :class:`TodayCommandConfig`. The /today
+    # command is retired (T5 2026-08-19); the block survives because
+    # ``conversation._resolve_tier_timezone`` reads its ``timezone``.
+    # Salem populates it; KAL-LE / Hypatia leave it absent (None).
     today_command: TodayCommandConfig | None = None
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
@@ -779,11 +771,12 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     voice_train_raw = tool.get("voice_train")
     if isinstance(voice_train_raw, dict) and voice_train_raw:
         built.voice_train = _build(VoiceTrainConfig, voice_train_raw)
-    # Today command — defaulted-OFF / None sentinel. Same shape as
-    # fiction + voice_train. A ``telegram.moc_suggestions`` or
-    # ``telegram.inventory_views`` block in an old YAML is silently
-    # ignored (their gates died with the Telegram retirement, T5
-    # 2026-08-19); this loader only reads the keys it names.
+    # Today command — defaulted-OFF / None sentinel. Kept for its
+    # ``timezone`` (see :class:`TodayCommandConfig`). A
+    # ``telegram.moc_suggestions`` or ``telegram.inventory_views`` block
+    # in an old YAML is silently ignored (their gates died with the
+    # Telegram retirement, T5 2026-08-19); this loader only reads the
+    # keys it names.
     today_command_raw = tool.get("today_command")
     if isinstance(today_command_raw, dict) and today_command_raw:
         built.today_command = _build(

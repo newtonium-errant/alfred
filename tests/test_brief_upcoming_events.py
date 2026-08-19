@@ -732,14 +732,15 @@ def test_event_with_start_as_yaml_datetime_value(vault: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# scope="today_tomorrow" — /today Telegram slash-command surface
+# scope="today_tomorrow" — glance-view mode of the shared renderer
 #
-# Per the 2026-05-30 scope refinement (mirrors the same-day curated-only
-# tier surface narrowing): /today renders Upcoming Events with
-# ``scope="today_tomorrow"`` so the glance-view shows only today +
-# tomorrow. The morning brief retains the full 7-day window — only
-# /today is narrowed. Operator framing: "what's on my plate immediately"
-# vs "what's on the schedule for the next week".
+# Historically the /today Telegram slash-command surface (2026-05-30
+# scope refinement); /today died with the Telegram retirement (T5,
+# 2026-08-19) and the mode currently has no production caller. The
+# tests below are module-direct coverage of the KEPT shared renderer
+# (brief/upcoming_events.py) — per the T4/T5 pattern, module-direct
+# coverage of kept code stays. Operator framing preserved: "what's on
+# my plate immediately" vs "what's on the schedule for the next week".
 #
 # Tests cover:
 #   1. Today + tomorrow buckets render; +3d / +7d events absent.
@@ -982,59 +983,11 @@ def test_today_tomorrow_scope_only_tomorrow_renders_tomorrow_header_only(
 
 
 # ---------------------------------------------------------------------------
-# compose_today_reply smoke — pin the call-site wiring
-#
-# The today_command.compose_today_reply composer is the only production
-# call site that uses scope="today_tomorrow". Smoke test asserts the
-# render output's events section contains only the narrow-scope
-# headers + never the brief-scope headers. Keeps the wiring honest
-# against a future refactor that drops the kwarg.
+# (compose_today_reply smoke — deleted in T5 2026-08-19 with
+# telegram/today_command.py, its subject. The scope="today_tomorrow"
+# mode it drove remains covered by the module-direct tests above; the
+# mode currently has no production caller — see the T5 declaration.)
 # ---------------------------------------------------------------------------
-
-
-def test_compose_today_reply_uses_today_tomorrow_scope(
-    vault: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End-to-end: ``compose_today_reply`` renders the Upcoming Events
-    section with today_tomorrow scope — output contains ``### Today``
-    and/or ``### Tomorrow`` but NEVER ``### This Week`` or ``### Later``.
-
-    Fixture loads events on today, tomorrow, +3d, +7d. Without the
-    scope wiring, the brief-scope render would surface "This Week"
-    header (the +3d event lands there).
-    """
-    from datetime import datetime
-
-    from alfred.telegram.today_command import compose_today_reply
-
-    # Set up the directory shape compose_today_reply expects.
-    (vault / "daily").mkdir(exist_ok=True)
-    # No daily curation file → tier section renders the empty-curation
-    # sentinel. That's fine; we're testing the upcoming-events section
-    # wiring, not the tier section.
-
-    # Events across the brief-scope buckets.
-    _write_event(vault, "Today Lunch", TODAY.isoformat())
-    _write_event(vault, "Tomorrow Standup", (TODAY + timedelta(days=1)).isoformat())
-    _write_event(vault, "Three Days Out", (TODAY + timedelta(days=3)).isoformat())
-    _write_event(vault, "Seven Days Out", (TODAY + timedelta(days=7)).isoformat())
-
-    # Compose at TODAY's instant — pass a `now` datetime matching TODAY.
-    now = datetime(TODAY.year, TODAY.month, TODAY.day, 9, 0, 0)
-    out = compose_today_reply(vault, now)
-
-    # Today-tomorrow scope headers present.
-    assert "### Today" in out
-    assert "### Tomorrow" in out
-    # Brief-scope headers NEVER appear — the regression pin.
-    assert "### This Week" not in out
-    assert "### Later" not in out
-    # +3d and +7d events absent from output.
-    assert "Three Days Out" not in out
-    assert "Seven Days Out" not in out
-    # Today + Tomorrow events present.
-    assert "Today Lunch" in out
-    assert "Tomorrow Standup" in out
 
 
 # ---------------------------------------------------------------------------

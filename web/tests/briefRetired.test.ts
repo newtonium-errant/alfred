@@ -6,7 +6,8 @@ import { SURFACE_PATHS } from '../lib/algernon/contactRouter';
 
 // `/brief` IS RETIRED — the player replaces it (console-completion arc,
 // operator-ratified 2026-08-14). This is the re-introduction pin, modelled on
-// `tests/telegram/test_today_command.py`'s routines-section pin: assert the
+// the routines-section pin that lived in `tests/telegram/test_today_command.py`
+// (deleted with its module in T5, 2026-08-19 — the pattern outlives it): assert the
 // OUTPUT is gone AND the WIRING is gone, because the two fail at different
 // moments. A nav link restored while the redirect still stands would pass an
 // output-only check and ship a menu entry that bounces.
