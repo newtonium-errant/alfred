@@ -113,12 +113,35 @@ const FILES = ROOTS.flatMap((r) => walk(join(WEB, r)));
  * LINES ARE PRESERVED, not removed: the census reports `file:line`, and a
  * stripper that collapsed lines would move every finding off its own coordinates.
  *
- * ERROR DIRECTION, CHOSEN DELIBERATELY. The scanner tracks strings and template
+ * TWO CALL SITES, AND THEY ARE NOT EQUALLY GUILTY — measured, because the first
+ * telling of this got it wrong and the correction is the more useful record.
+ *
+ *   · The ROW CLASSIFIER (`MARKER_NEARBY`, below) was DEMONSTRABLY LIVE. Its
+ *     window regex is `\bui-panel\b`, and a word boundary matches straight
+ *     through a backtick, so ordinary prose fooled it. Proven by mutation.
+ *   · `registersCarrying` — which decides the whole hole/dead-CSS matrix — is
+ *     LATENT. Its regex requires a quote-or-whitespace boundary, and all SIX
+ *     comment-only marker mentions in the tree are backticked, so ZERO of them
+ *     would have fooled it. Stripping changed its output for 0 of 8 markers;
+ *     the matrix did not move.
+ *
+ * The tell originally offered as proof for the second — this file's own census
+ * table listing `ReportBugFab` as carrying `ui-panel`, when the FAB carries no
+ * marker by design — belongs to the FIRST. Same file, same comment, two regexes,
+ * one of which the backtick happens to stop. It is kept here because "the
+ * evidence was one altitude off" is exactly the error this file exists to catch,
+ * and because the second fix is still worth having: it is defence in depth
+ * against a comment written without backticks, not a hole anyone had fallen in.
+ *
+ * ERROR DIRECTION, CHOSEN DELIBERATELY — the ILB principle applied to an
+ * INSTRUMENT rather than to a feature. The scanner tracks strings and template
  * literals but does not parse regex literals, so a regex containing an escaped
  * `//` can start a phantom line comment and blank the rest of that line. That
- * fails toward OVER-stripping, which hides a real marker and makes the census
- * report the row as unruled — loud, and fixed by adding the row. Under-stripping
- * is the silent direction and is the defect being closed here.
+ * fails toward OVER-stripping: a real marker is hidden and the census reports
+ * the row as UNRULED, which is loud and is fixed by looking at the row.
+ * Under-stripping is the silent direction — it returns a green suite for a
+ * regression — and is precisely the defect being closed. When a measuring
+ * instrument must be wrong, it should be wrong in the direction that speaks up.
  */
 function stripComments(text: string): string {
   let out = '';
