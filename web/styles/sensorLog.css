@@ -59,7 +59,10 @@
    reach the app shell from a root-level attribute — the root paint (nav
    included), the focus ring (the bug FAB renders outside <main> and this file
    loads after globals, so it would have won), and the danger descendants.
-   Shell stays warm.
+   THIS FILE stays off the shell. (It used to say "shell stays warm", which is
+   no longer the same claim: Layout's chrome table dresses the shell — nav,
+   header and the bug FAB — in the hull on every dark surface. What this file
+   promises is about its own reach, not about the shell's colour.)
 
    The ROW rules stay attribute-scoped on purpose: `FeedRow` / `RingsHeader` are
    shared with `pages/index.tsx` — the BRIEF, a different canonical surface — and
@@ -77,7 +80,10 @@
  * ratified adoption default and it is not cosmetic: a selector audit found 3 of
  * this file's 28 rules would reach the app shell from a root-level attribute —
  * this block (repainting the nav via background/color), the focus ring, and the
- * danger descendants. Shell stays warm; the console paints only its own content.
+ * danger descendants. THIS FILE stays off the shell; the console paints only its
+ * own content. (Not "the shell stays warm" — it no longer does. Layout's chrome
+ * table dresses nav, header and the bug FAB in the hull on every dark surface.
+ * The promise here is about this file's REACH, which is unchanged.)
  *
  * The names are the SURFACE'S vocabulary; the values are the shared layer's.
  * They were renamed off their old hue spellings in the same commit that
@@ -302,10 +308,120 @@
 
 /* Focus stays visible on the dark ground — the warm honeydew ring disappears
    against it. Scoped to the console CONTENT, not the surface: the bug-report
-   FAB is rendered by Layout outside <main> and carries its own warm ring, and
-   this file loads after globals so a surface-level rule would have won and
-   retargeted it. One of the three shell-reachers the selector audit found. */
+   FAB is rendered by Layout outside <main>, and this file loads after globals
+   so a surface-level rule would have won and retargeted it. One of the three
+   shell-reachers the selector audit found.
+
+   THE FAB'S RING IS NOT WARM ANY MORE, and the reason this rule still must not
+   reach it is the stronger one. It was a white circle with a honeydew ring on
+   every dark surface in the app until Layout's chrome table grew a `fab` entry;
+   the button now wears the hull, ring included. So the shell is no longer
+   "warm" — it is chrome, owned by the chrome table, and a register reaching in
+   would be two writers on one element rather than one writer on an unclaimed
+   one. Same rule, sounder footing. */
 .sensor-console :focus-visible {
   outline: 2px solid var(--sensor-affirm);
   outline-offset: 2px;
 }
+
+/* --- THE MARKER MATRIX, COMPLETED -------------------------------------------
+ *
+ * WHY THESE ARRIVE NOW, together, on a register that has been dark for months.
+ *
+ * This sheet skinned the feed row the hard way — `[data-testid='feed-row']` plus
+ * the exact honeydew utilities that component emits, a coupling its own header
+ * states plainly and pins. That worked, and it hid something: because /feed
+ * looked right, nobody asked whether the SAME components looked right on the
+ * other dark registers, and they did not. The marker seam (`ui-panel`,
+ * `ui-field`, `ui-btn`, `ui-label`) is the general answer the testid block is a
+ * special case of, and this register carried only `ui-code` of the set — so a
+ * `Button` or a `Textarea` rendered on the feed was a white pill on this hull,
+ * exactly as it was on home.
+ *
+ * These rules and the testid block above are NOT redundant. The testid block
+ * reaches utilities on elements that carry no marker and never will (a row's
+ * inner labels, its dashed rules); these reach components that opted in and
+ * render on four registers. Where both could apply to one element they agree —
+ * both resolve to this register's own depth ramp — so the cascade's outcome is
+ * the same value whichever wins.
+ */
+[data-surface='sensor-log'] .ui-panel {
+  background-color: var(--sensor-panel);
+  border-color: var(--sensor-edge);
+}
+
+[data-surface='sensor-log'] .ui-panel.text-honeydew-900,
+[data-surface='sensor-log'] .ui-panel .text-honeydew-900,
+[data-surface='sensor-log'] .ui-panel.text-honeydew-800,
+[data-surface='sensor-log'] .ui-panel .text-honeydew-800,
+[data-surface='sensor-log'] .ui-panel.text-honeydew-700,
+[data-surface='sensor-log'] .ui-panel .text-honeydew-700 {
+  color: var(--sensor-ink);
+}
+
+/* `-500` is deliberately absent where its siblings carry it: no markup this
+   selector reaches emits it, and sensorLogSkin.test.tsx reports a targeted-but-
+   unemitted class as an orphan. Same rule that keeps `ui-code` out of crt.css —
+   a register carries only what it can reach. */
+[data-surface='sensor-log'] .ui-panel.text-honeydew-600,
+[data-surface='sensor-log'] .ui-panel .text-honeydew-600 {
+  color: var(--sensor-ink-dim);
+}
+
+[data-surface='sensor-log'] .ui-panel.border-honeydew-200,
+[data-surface='sensor-log'] .ui-panel .border-honeydew-200,
+[data-surface='sensor-log'] .ui-panel.border-honeydew-300,
+[data-surface='sensor-log'] .ui-panel .border-honeydew-300,
+[data-surface='sensor-log'] .ui-panel.border-honeydew-400,
+[data-surface='sensor-log'] .ui-panel .border-honeydew-400 {
+  border-color: var(--sensor-edge);
+}
+
+[data-surface='sensor-log'] .ui-field {
+  background-color: var(--sensor-panel);
+  border-color: var(--sensor-edge);
+  color: var(--sensor-ink);
+}
+
+[data-surface='sensor-log'] .ui-field::placeholder {
+  color: var(--sensor-ink-dim);
+}
+
+[data-surface='sensor-log'] .ui-field:focus-visible {
+  outline: 2px solid var(--sensor-affirm);
+  outline-offset: 1px;
+}
+
+/* The NEUTRAL button variants only — `destructive` carries a role colour and
+   deliberately does not take the marker. */
+[data-surface='sensor-log'] .ui-btn {
+  background-color: var(--sensor-panel);
+  border-color: var(--sensor-edge);
+  color: var(--sensor-ink);
+}
+
+/* A control resting ON a panel sits one rung up, or it disappears into it.
+   See comms.css for the long form. */
+[data-surface='sensor-log'] .ui-panel .ui-btn {
+  background-color: var(--sensor-raise);
+}
+
+/* --- ALERTS (the `ui-alert` marker) ----------------------------------------
+ *
+ * The named form of what `.sensor-console .bg-danger-bg` above already does for
+ * this register — the precedent every other register's `ui-alert` rule was
+ * lifted from. Both are kept: the utility rule reaches danger grounds inside the
+ * console that carry no marker, this one reaches the banners that now do, and
+ * they resolve to the same two values so an element matched by both cannot
+ * disagree with itself.
+ */
+[data-surface='sensor-log'] .ui-alert {
+  background-color: var(--sensor-negative-wash);
+  border-color: var(--sensor-negative);
+  color: var(--sensor-negative);
+}
+
+/* No `.ui-alert .border-danger` counterpart here, unlike its siblings: this
+   register's alerts are the feed's two banners, and neither carries a retry
+   control. The rule arrives with the first one that does. */
+

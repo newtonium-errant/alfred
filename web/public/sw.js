@@ -30,7 +30,23 @@
 //     `/login`, `/ingest`). The trigger here is the RENDER change, not an edit
 //     to this file: precached HTML carrying the old warm chrome would boot the
 //     app into a shell the running code no longer paints.
-const CACHE_VERSION = 'v6';
+// v7: the bright-slab sweep. TWO triggers, both MEASURED by building the tree
+//     at the merge base and at this commit and diffing the prerendered HTML
+//     with build ids and asset hashes normalised:
+//       * `/login` is a SHELL_ROUTE and its precached markup CHANGED — the
+//         sign-in card took the `ui-panel` marker, so a v6 shell serves a card
+//         the crt register can no longer reach.
+//       * every route's stylesheet URL changed, and that is the bigger one.
+//         The marker rules this lane added live ENTIRELY in that stylesheet,
+//         `/_next/static/*` is cache-first here, and precached HTML names the
+//         file by hash — so a v6 client would pair old HTML with the old CSS
+//         and render precisely the bright slabs this lane exists to remove.
+//     WHAT DID NOT CHANGE, checked rather than assumed: the markup of `/`,
+//     `/ingest` and `/share` is byte-identical after normalisation, as are the
+//     404/500 controls. Every authed route prerenders its pre-auth branch, so
+//     the restyled components are not in the prerendered output at all. The
+//     bump is owed by the two facts above, not by the whole shell moving.
+const CACHE_VERSION = 'v7';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.

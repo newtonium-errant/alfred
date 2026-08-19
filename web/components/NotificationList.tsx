@@ -48,7 +48,18 @@ function NotificationRow({
     <li
       data-testid="notification-item"
       className={cn(
-        'rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-700',
+        // `ui-panel` — the tray card is a PANEL, not a verdict. The operator
+        // photographed it as a pale mint slab with a white button on it, sitting
+        // in the middle of /chat's dark hull. The marker is what lets the comms
+        // register reach it; the honeydew classes stay as the warm default, so a
+        // tray rendered on a warm surface is byte-identical to what it was.
+        //
+        // The ink class is on THIS element rather than a child, which is exactly
+        // the case `.ui-panel`'s descendant ink rules could not reach — the
+        // registers carry a same-element compound twin for it now. Left here
+        // rather than pushed down into a wrapper: moving it would have made the
+        // markup answer for a limitation of the stylesheet.
+        'ui-panel rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-700',
         !n.read && 'font-semibold',
       )}
     >
@@ -79,7 +90,7 @@ function NotificationRow({
             type="button"
             data-testid="notification-ack"
             onClick={() => onAck([n.id])}
-            className="shrink-0 rounded-lg border border-honeydew-300 bg-white px-2 py-1 text-xs font-semibold text-honeydew-700 hover:bg-honeydew-50"
+            className="ui-btn shrink-0 rounded-lg border border-honeydew-300 bg-white px-2 py-1 text-xs font-semibold text-honeydew-700 hover:bg-honeydew-50"
           >
             Mark read
           </button>
@@ -89,7 +100,7 @@ function NotificationRow({
             data-testid="notification-dismiss"
             aria-label={`Dismiss notification: ${n.text}`}
             onClick={() => onDismiss([n.id])}
-            className="shrink-0 rounded-lg border border-honeydew-300 bg-white px-2 py-1 text-xs font-semibold text-honeydew-700 hover:bg-honeydew-50"
+            className="ui-btn shrink-0 rounded-lg border border-honeydew-300 bg-white px-2 py-1 text-xs font-semibold text-honeydew-700 hover:bg-honeydew-50"
           >
             Dismiss
           </button>

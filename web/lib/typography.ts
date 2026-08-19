@@ -37,4 +37,4 @@ export const subtle = 'text-sm text-honeydew-600/80';
 // no shadow, no hard contrast. Keep nesting shallow (card -> at most one inner
 // panel).
 export const innerPanel =
-  'rounded-xl border border-honeydew-300 bg-honeydew-100 px-3 py-2';
+  'ui-panel rounded-xl border border-honeydew-300 bg-honeydew-100 px-3 py-2';

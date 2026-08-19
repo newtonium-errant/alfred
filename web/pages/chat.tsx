@@ -230,7 +230,7 @@ export default function ChatPage() {
             <div
               role="alert"
               data-testid="chat-error"
-              className="flex items-center justify-between gap-3 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+              className="ui-alert flex items-center justify-between gap-3 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
             >
               <span>{error}</span>
               {retryable && (

@@ -23,9 +23,9 @@ function voiceDisplayEnabled(): boolean {
 }
 
 const DONE_PILL =
-  'inline-flex items-center gap-1 rounded-full bg-status-done px-2.5 py-1 text-sm font-semibold text-status-done-fg';
+  'ui-wash-affirm inline-flex items-center gap-1 rounded-full bg-status-done px-2.5 py-1 text-sm font-semibold text-status-done-fg';
 const PROGRESS_PILL =
-  'inline-flex items-center gap-1 rounded-full bg-status-progress px-2.5 py-1 text-sm font-semibold text-status-progress-fg';
+  'ui-wash-caution inline-flex items-center gap-1 rounded-full bg-status-progress px-2.5 py-1 text-sm font-semibold text-status-progress-fg';
 
 export function VoicePanel({
   instance,
@@ -340,7 +340,7 @@ export function VoicePanel({
             <div
               role="alert"
               data-testid="voice-error"
-              className="flex items-center justify-between gap-3 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+              className="ui-alert flex items-center justify-between gap-3 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
             >
               <span>{error.message}</span>
               <button

@@ -265,7 +265,7 @@ export function RingsHeader({
   if (error) {
     return (
       <section aria-label="Today's tier rings" data-testid="rings-header">
-        <div role="alert" data-testid="rings-error" className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
+        <div role="alert" data-testid="rings-error" className="ui-alert rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
           {error}
         </div>
       </section>

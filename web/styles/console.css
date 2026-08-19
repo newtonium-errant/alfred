@@ -243,3 +243,77 @@ body:has([data-surface='console']) {
   );
 }
 
+/* --- THE MARKER MATRIX, COMPLETED -------------------------------------------
+ *
+ * The deck was the FIRST dark surface and it grew its identity in its own
+ * markup — every card, pill and button on it names console tokens directly — so
+ * it never needed the marker seam its siblings were built around, and it
+ * carried only `.ui-code` of the set.
+ *
+ * That is fine for what the deck writes itself and wrong for what it BORROWS.
+ * `Button`, `Textarea` and `EmptyState` all carry their markers already and all
+ * reach this surface, so a neutral control here was a white pill on the hull
+ * while the identical control on /chat was correctly dark. The component was
+ * never the variable; this file's coverage was.
+ *
+ * Scoped to `[data-surface='console']` like everything else here, so nothing
+ * that has not opted in is touched.
+ */
+[data-surface='console'] .ui-panel {
+  background-color: var(--console-panel);
+  border-color: var(--console-edge);
+}
+
+[data-surface='console'] .ui-panel.text-honeydew-900,
+[data-surface='console'] .ui-panel .text-honeydew-900,
+[data-surface='console'] .ui-panel.text-honeydew-800,
+[data-surface='console'] .ui-panel .text-honeydew-800,
+[data-surface='console'] .ui-panel.text-honeydew-700,
+[data-surface='console'] .ui-panel .text-honeydew-700 {
+  color: var(--console-ink);
+}
+
+[data-surface='console'] .ui-panel.text-honeydew-600,
+[data-surface='console'] .ui-panel .text-honeydew-600,
+[data-surface='console'] .ui-panel.text-honeydew-500,
+[data-surface='console'] .ui-panel .text-honeydew-500 {
+  color: var(--console-ink-dim);
+}
+
+[data-surface='console'] .ui-panel.border-honeydew-200,
+[data-surface='console'] .ui-panel .border-honeydew-200,
+[data-surface='console'] .ui-panel.border-honeydew-300,
+[data-surface='console'] .ui-panel .border-honeydew-300,
+[data-surface='console'] .ui-panel.border-honeydew-400,
+[data-surface='console'] .ui-panel .border-honeydew-400 {
+  border-color: var(--console-edge);
+}
+
+[data-surface='console'] .ui-field {
+  background-color: var(--console-panel);
+  border-color: var(--console-edge);
+  color: var(--console-ink);
+}
+
+[data-surface='console'] .ui-field::placeholder {
+  color: var(--console-ink-dim);
+}
+
+[data-surface='console'] .ui-field:focus-visible {
+  outline: 2px solid var(--console-affirm);
+  outline-offset: 1px;
+}
+
+/* The NEUTRAL button variants only — `destructive` carries a role colour and
+   deliberately does not take the marker. */
+[data-surface='console'] .ui-btn {
+  background-color: var(--console-panel);
+  border-color: var(--console-edge);
+  color: var(--console-ink);
+}
+
+/* A control resting ON a panel sits one rung up, or it disappears into it. */
+[data-surface='console'] .ui-panel .ui-btn {
+  background-color: var(--console-raise);
+}
+

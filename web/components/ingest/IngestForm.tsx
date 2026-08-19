@@ -279,7 +279,7 @@ export function IngestForm({
   if (status === 'done' && result) {
     return (
       <div data-testid="ingest-success" className="flex flex-col gap-3">
-        <p className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800">
+        <p className="ui-panel rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800">
           {result.status === 'exists' ? 'Already present' : 'Ingested'} to{' '}
           <span className="font-semibold">{result.instance}</span> as{' '}
           <span className="font-semibold">{result.record_type}</span> —{' '}
@@ -359,7 +359,7 @@ export function IngestForm({
           <p
             role="alert"
             data-testid="ingest-upload-error"
-            className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+            className="ui-alert rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
           >
             {uploadError}
           </p>
@@ -394,7 +394,7 @@ export function IngestForm({
           <p
             role="alert"
             data-testid="ingest-body-over-limit"
-            className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+            className="ui-alert rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
           >
             The body is {(body.length - MAX_INGEST_CHARS).toLocaleString()} characters over the{' '}
             {MAX_INGEST_CHARS.toLocaleString()}-character ingest limit — trim it before ingesting.
@@ -416,7 +416,7 @@ export function IngestForm({
         <p
           role="alert"
           data-testid="ingest-error"
-          className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+          className="ui-alert rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
         >
           {error}
         </p>

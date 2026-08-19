@@ -42,6 +42,14 @@
   --crt-caution: var(--console-caution);
   --crt-info: var(--console-info);
 
+  /* The negative role's GROUND, for `.ui-alert`. A wash is not a fifth role:
+     it is the same negative hue at ground lightness, which is what lets an
+     alert keep its meaning on a near-black ground instead of arriving as the
+     warm palette's pink slab. */
+  --crt-negative-wash: var(--console-negative-wash);
+  --crt-affirm-wash: var(--console-affirm-wash);
+  --crt-caution-wash: var(--console-caution-wash);
+
   /* The terminal type stack, shared with the comms register's quotation. */
   --crt-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
 }
@@ -140,19 +148,84 @@
   border-color: var(--crt-edge);
 }
 
+[data-surface='crt'] .ui-panel.text-honeydew-900,
 [data-surface='crt'] .ui-panel .text-honeydew-900,
+[data-surface='crt'] .ui-panel.text-honeydew-800,
 [data-surface='crt'] .ui-panel .text-honeydew-800,
+[data-surface='crt'] .ui-panel.text-honeydew-700,
 [data-surface='crt'] .ui-panel .text-honeydew-700 {
   color: var(--crt-ink);
 }
 
+[data-surface='crt'] .ui-panel.text-honeydew-600,
 [data-surface='crt'] .ui-panel .text-honeydew-600,
+[data-surface='crt'] .ui-panel.text-honeydew-500,
 [data-surface='crt'] .ui-panel .text-honeydew-500 {
   color: var(--crt-ink-dim);
 }
 
+[data-surface='crt'] .ui-panel.border-honeydew-200,
 [data-surface='crt'] .ui-panel .border-honeydew-200,
+[data-surface='crt'] .ui-panel.border-honeydew-300,
 [data-surface='crt'] .ui-panel .border-honeydew-300,
+[data-surface='crt'] .ui-panel.border-honeydew-400,
 [data-surface='crt'] .ui-panel .border-honeydew-400 {
   border-color: var(--crt-edge);
+}
+
+/* --- ALERTS (the `ui-alert` marker) ----------------------------------------
+ *
+ * The ROLE-BEARING marker — comms.css carries the design note (why an alert
+ * cannot be handed to `ui-panel`, and how the role guard was widened so a
+ * role-bearing marker is checked exactly as `.text-danger` is).
+ *
+ * In this room it reaches the ingest and batch forms' failure banners, which
+ * were the warm palette's pale pink on near-black.
+ */
+[data-surface='crt'] .ui-alert {
+  background-color: var(--crt-negative-wash);
+  border-color: var(--crt-negative);
+  color: var(--crt-negative);
+}
+
+[data-surface='crt'] .ui-alert .border-danger {
+  border-color: var(--crt-negative);
+}
+
+/* A control on a panel must be TELLABLE APART from it, or it disappears —
+   `.ui-panel` and `.ui-btn` both resolve to `--crt-panel` otherwise.
+
+   THIS ROOM SEPARATES THEM DOWNWARD, and that is a real difference from its
+   siblings rather than a typo. comms and viewscreen step a control UP to
+   `raise`; this register's ramp has no rung above `panel` (it is deliberately
+   two-deep: `void` for the room, `panel` for what sits in it), so the control is
+   INSET into the panel instead. A terminal reads that way anyway — a key
+   pressed into a console rather than a card lifted off one. */
+[data-surface='crt'] .ui-panel .ui-btn {
+  background-color: var(--crt-void);
+}
+
+/* --- ROLE GROUNDS (the `ui-wash-*` markers) ---------------------------------
+ *
+ * Role-bearing, like `ui-alert`, and for the same reason: on these elements the
+ * COLOUR IS THE REPORT. A filled status pill that said "done" in panel-grey
+ * would have stopped saying anything, which is worse than saying it in the warm
+ * palette's mint.
+ *
+ * Named for the token they resolve to rather than for a shape (`pill` was the
+ * first name and it was wrong within a day — the same ground is wanted by a
+ * full-width notice panel as by a pill). ONE MARKER PER ROLE, because a single
+ * marker cannot tell done from in-progress and one that had to be told by a
+ * second class is just these two with an extra step.
+ *
+ * ONLY CAUTION'S IS DEFINED HERE. The affirm ground has no reader in these
+ * rooms — the batch form's "saved, not submitted" notice is the one role ground
+ * that renders on this register — and a rule nothing can reach is dead CSS, the
+ * same reason this file deliberately carries no `ui-code`. It arrives the day
+ * something needs it.
+ */
+
+[data-surface='crt'] .ui-wash-caution {
+  background-color: var(--crt-caution-wash);
+  color: var(--crt-caution);
 }

@@ -390,23 +390,39 @@ describe('/share stays warm — the regression the seam exists to prevent', () =
   });
 });
 
-describe('sensor-log deliberately has no panel rules', () => {
-  it('declares none, because no marked panel is reachable from /feed', () => {
-    // The REASON is the assertion. Stating "sensor-log has no ui-panel rule"
-    // alone would be satisfied by an oversight; pairing it with the reachability
-    // fact makes it a decision that reds if either half changes — if a marked
-    // panel ever lands on the feed, the second expectation fails and the missing
-    // rule becomes visible instead of staying quietly absent.
-    expect(css('sensorLog.css')).not.toContain('.ui-panel');
+describe('sensor-log DOES have panel rules — the premise flipped', () => {
+  it('declares them, because a marked panel is now reachable from /feed', () => {
+    // THIS PIN USED TO ASSERT THE OPPOSITE, and it was right when it was
+    // written. It read: "sensor-log deliberately has no panel rules — declares
+    // none, because no marked panel is reachable from /feed", and it paired the
+    // absence with the reachability fact precisely so that it would red rather
+    // than quietly persist if a marked panel ever landed on the feed.
+    //
+    // IT DID. The chat-polish lane put `ui-panel` on `FeedRow` itself — the feed
+    // row IS the marked panel now, and it renders on /feed and on home. So the
+    // rule this pin guarded the absence of is owed, and the pin is FLIPPED with
+    // the new premise recorded rather than deleted: a deleted pin takes the
+    // reasoning with it, and the next person to wonder why sensor-log carries
+    // panel rules would find nothing.
+    //
+    // The teeth are unchanged and still point both ways — the rule must exist
+    // AND the reachability fact that makes it non-dead must hold.
+    expect(css('sensorLog.css')).toContain('.ui-panel');
 
+    // The reachability half, asserted rather than asserted-about: the row that
+    // renders on /feed carries the marker.
+    expect(src('components/feed/FeedRow.tsx')).toContain('ui-panel');
+    expect(src('pages/feed.tsx')).toContain('<FeedRow');
+
+    // POSITIVE CONTROL, in the direction that can still go wrong. The two
+    // ORIGINAL marked panels are ingest-side and are still NOT on the feed, so
+    // this register's new rules are earned by FeedRow specifically and not by a
+    // marker that has quietly spread everywhere.
     const feedSurfaces = [src('pages/feed.tsx'), src('components/feed/FeedRow.tsx')].join('\n');
     for (const [rel] of MARKED_PANELS) {
       const component = rel.split('/').pop()!.replace('.tsx', '');
       expect(feedSurfaces).not.toContain(`<${component}`);
     }
-    // POSITIVE CONTROL: the marked panels exist and are reachable SOMEWHERE, so
-    // "not on the feed" is a fact about the feed rather than about a marker
-    // nobody applied.
     expect(src('components/ingest/IngestForm.tsx')).toContain('<ProvenancePreview');
   });
 });

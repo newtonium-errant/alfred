@@ -313,7 +313,7 @@ export function ReportBugModal({
         aria-modal="true"
         aria-labelledby="report-bug-title"
         data-testid="report-bug-modal"
-        className="flex max-h-[90vh] w-full max-w-lg flex-col overflow-y-auto rounded-t-2xl border border-honeydew-200 bg-white p-5 shadow-lg sm:rounded-2xl"
+        className="ui-panel flex max-h-[90vh] w-full max-w-lg flex-col overflow-y-auto rounded-t-2xl border border-honeydew-200 bg-white p-5 shadow-lg sm:rounded-2xl"
       >
         <div className="flex items-start justify-between gap-3">
           <h2 id="report-bug-title" className="text-lg font-bold text-honeydew-700">
@@ -325,7 +325,7 @@ export function ReportBugModal({
             aria-label="Close"
             onClick={onClose}
             disabled={submitting}
-            className="-mr-1 -mt-1 rounded-lg px-2 py-1 text-lg leading-none text-honeydew-600 hover:bg-honeydew-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-honeydew-600 disabled:opacity-70"
+            className="ui-btn -mr-1 -mt-1 rounded-lg px-2 py-1 text-lg leading-none text-honeydew-600 hover:bg-honeydew-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-honeydew-600 disabled:opacity-70"
           >
             <span aria-hidden="true">✕</span>
           </button>
