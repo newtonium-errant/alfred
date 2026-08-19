@@ -202,8 +202,8 @@ def build_existing_mocs_index(
     bullets; the wikilink targets become the MOC's
     ``contents_members``. The parsing is best-effort — a malformed
     bullet drops out of the set silently rather than failing the
-    whole MOC. Per-bullet failure isolation matches the per-record
-    failure isolation in :func:`alfred.telegram.inventory_views.collect_records`.
+    whole MOC. Per-bullet failure isolation matches the per-line
+    failure isolation in :func:`moc_suggestion_queue.load_queue`.
 
     Failure-isolated: any exception parsing a single MOC file logs
     a warning and skips that MOC; never raises to the caller.

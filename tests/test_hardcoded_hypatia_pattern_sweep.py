@@ -10,8 +10,10 @@ config wasn't fully resolved (per
     keyword-only across:
       - ``vault/zettel_hooks.py`` (7 helpers)
       - ``telegram/capture_source_anchor.py`` (5 helpers)
-      - ``telegram/moc_suggestion_views.py`` (``apply_accept``)
       - ``transport/client.py`` (``peer_propose_event.self_name``)
+      - (Historical) ``telegram/moc_suggestion_views.py``
+        (``apply_accept``) — module deleted in T5 (2026-08-19), its
+        Layer-3 pin deleted with it.
 
   * Replaced ``scope=scope or "hypatia"`` fallbacks in ``ops.py``
     (10 call sites within ``vault_create`` / ``vault_edit`` zettel-
@@ -227,41 +229,10 @@ def test_append_re_encounter_observation_requires_scope() -> None:
 
 
 # ===========================================================================
-# Layer 3 — telegram/moc_suggestion_views.py: scope is required
+# (Layer 3 — telegram/moc_suggestion_views.py — deleted in T5 2026-08-19
+# together with the module it pinned; the required-scope pattern it
+# guarded lives on in the Layer-2 and Layer-4 pins around it.)
 # ===========================================================================
-
-
-def test_apply_accept_requires_scope() -> None:
-    """``apply_accept`` no longer defaults scope — caller must supply.
-
-    Callers must supply scope explicitly; test fixtures
-    (test_moc_suggestion_views.py) pass ``scope="hypatia"``. (The last
-    production caller — the Telegram /accept-moc handler — died with
-    bot.py 2026-08-19; the required-kwarg contract is what this pins.)
-    """
-    from alfred.telegram.moc_suggestion_views import apply_accept
-    from alfred.surveyor.moc_suggester import MocSuggestion
-    from pathlib import Path as _P
-    suggestion = MocSuggestion(
-        id="ms-test",
-        cluster_id_at_proposal=0,
-        cluster_tags=["x"],
-        cluster_member_paths=[],
-        target_moc_rel_path="MOC/X.md",
-        proposed_new_moc_name=None,
-        mapping_signal="x",
-        mapping_score=0.0,
-        candidate_members_to_add=[],
-        reasoning="x",
-        created="2026-05-20T00:00:00+00:00",
-        status="pending",
-    )
-    with pytest.raises(TypeError, match="scope"):
-        apply_accept(  # type: ignore[call-arg]
-            suggestion=suggestion,
-            queue_path=_P("/tmp/nonexistent.jsonl"),
-            vault_path=_P("/tmp/nonexistent_vault"),
-        )
 
 
 # ===========================================================================
