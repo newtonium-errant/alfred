@@ -112,7 +112,7 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
   const snoozeOffered =
     !!snooze && snoozeIsBacked(item) && !done && !snoozed && !snooze.snoozed(item.id);
   return (
-    <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
+    <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="ui-panel rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="mb-1 flex flex-wrap gap-1.5">
@@ -180,7 +180,7 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
               data-testid="feed-row-accept"
               disabled={acceptBusy || !accept}
               onClick={() => accept?.accept(item)}
-              className="shrink-0 rounded-lg border border-honeydew-500 bg-honeydew-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
+              className="ui-btn shrink-0 rounded-lg border border-honeydew-500 bg-honeydew-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
             >
               {acceptBusy ? '…' : 'Accept'}
             </button>

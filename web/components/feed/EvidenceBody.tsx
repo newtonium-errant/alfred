@@ -42,7 +42,7 @@ import { WARM_SURFACE, type KnownSurface, type SurfaceIdentity } from '../../lib
 // neither works.
 const SKIN: Record<KnownSurface, { frame: string; text: string; note: string; link: string }> = {
   warm: {
-    frame: 'max-h-64 overflow-y-auto rounded-lg border border-honeydew-200 bg-honeydew-50 px-3 py-2',
+    frame: 'ui-panel max-h-64 overflow-y-auto rounded-lg border border-honeydew-200 bg-honeydew-50 px-3 py-2',
     text: 'whitespace-pre-wrap break-words text-xs leading-relaxed text-honeydew-700',
     note: 'mt-1 text-[11px] italic text-honeydew-600/80',
     link: 'mt-2 inline-block text-xs font-semibold text-honeydew-700 underline underline-offset-2',

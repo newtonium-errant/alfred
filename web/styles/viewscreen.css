@@ -48,6 +48,12 @@
   --viewscreen-caution: var(--console-caution);
   --viewscreen-negative: var(--console-negative);
   --viewscreen-info: var(--console-info);
+
+  /* The negative role's GROUND, for `.ui-alert` below. A wash is not a fifth
+     role and does not loosen the rule above: it is the same negative hue at
+     ground lightness, which is what lets an alert keep its meaning on a dark
+     hull instead of arriving as a pink slab. */
+  --viewscreen-negative-wash: var(--console-negative-wash);
 }
 
 /* --- painting: the page's own content, never the shell ------------------- */
@@ -58,9 +64,14 @@
 
 /* Focus stays visible on the dark ground — the warm honeydew ring disappears
    against it. Scoped to the CONTENT, not the surface: the bug-report FAB is
-   rendered by Layout outside <main> and carries its own warm ring, and this
-   file loads after globals so a surface-level rule would have won and
-   retargeted it. Same shell-reacher sensorLog.css documents. */
+   rendered by Layout outside <main>, and this file loads after globals so a
+   surface-level rule would have won and retargeted it. Same shell-reacher
+   sensorLog.css documents.
+
+   THE FAB'S RING IS NOT WARM ANY MORE (see sensorLog.css for the long version):
+   Layout's chrome table now dresses the button in the hull, ring included, so
+   the reason to stay off it is that it HAS an owner rather than that it has
+   none. */
 .viewscreen-deck :focus-visible {
   outline: 2px solid var(--viewscreen-affirm);
   outline-offset: 2px;
@@ -117,19 +128,94 @@
   border-color: var(--viewscreen-edge);
 }
 
+[data-surface='viewscreen'] .ui-panel.text-honeydew-900,
 [data-surface='viewscreen'] .ui-panel .text-honeydew-900,
+[data-surface='viewscreen'] .ui-panel.text-honeydew-800,
 [data-surface='viewscreen'] .ui-panel .text-honeydew-800,
+[data-surface='viewscreen'] .ui-panel.text-honeydew-700,
 [data-surface='viewscreen'] .ui-panel .text-honeydew-700 {
   color: var(--viewscreen-ink);
 }
 
+[data-surface='viewscreen'] .ui-panel.text-honeydew-600,
 [data-surface='viewscreen'] .ui-panel .text-honeydew-600,
+[data-surface='viewscreen'] .ui-panel.text-honeydew-500,
 [data-surface='viewscreen'] .ui-panel .text-honeydew-500 {
   color: var(--viewscreen-ink-dim);
 }
 
+[data-surface='viewscreen'] .ui-panel.border-honeydew-200,
 [data-surface='viewscreen'] .ui-panel .border-honeydew-200,
+[data-surface='viewscreen'] .ui-panel.border-honeydew-300,
 [data-surface='viewscreen'] .ui-panel .border-honeydew-300,
+[data-surface='viewscreen'] .ui-panel.border-honeydew-400,
 [data-surface='viewscreen'] .ui-panel .border-honeydew-400 {
   border-color: var(--viewscreen-edge);
 }
+
+/* --- THE CONTROLS (`ui-field` / `ui-btn` / `ui-label`) ----------------------
+ *
+ * ADDED BECAUSE THE MATRIX WAS HOLED, not because a new component arrived.
+ * `Button`, `Input` and `Textarea` all carry their markers already and all three
+ * render on this surface — so until now every neutral control on home and the
+ * player was a white pill on the dark hull, while the identical control on /chat
+ * and /ingest was correctly dark. The component was never the variable; the
+ * register's coverage was. Same shape as the FeedRow slab the operator DID
+ * photograph — sensorLog.css has restyled that row for months, this register
+ * never had the rule — which is why this lane closed the matrix rather than the
+ * three surfaces that were reported.
+ *
+ * Same containment as every other register: markers only, never a bare element
+ * tail, and role-coloured markup carries no marker so a verdict is out of reach
+ * by construction.
+ */
+[data-surface='viewscreen'] .ui-field {
+  background-color: var(--viewscreen-panel);
+  border-color: var(--viewscreen-edge);
+  color: var(--viewscreen-ink);
+}
+
+[data-surface='viewscreen'] .ui-field::placeholder {
+  /* `ink-faint` is the micro-label rung — too quiet for a placeholder someone
+     has to read. `ink-dim` is the reading rung. */
+  color: var(--viewscreen-ink-dim);
+}
+
+[data-surface='viewscreen'] .ui-field:focus-visible {
+  outline: 2px solid var(--viewscreen-affirm);
+  outline-offset: 1px;
+}
+
+/* The NEUTRAL button variants only — `destructive` carries a role colour and
+   deliberately does not take the marker. */
+[data-surface='viewscreen'] .ui-btn {
+  background-color: var(--viewscreen-panel);
+  border-color: var(--viewscreen-edge);
+  color: var(--viewscreen-ink);
+}
+
+/* A control resting ON a panel sits one rung up, or it disappears into it.
+   See comms.css for the long form. */
+[data-surface='viewscreen'] .ui-panel .ui-btn {
+  background-color: var(--viewscreen-raise);
+}
+
+/* --- ALERTS (the `ui-alert` marker) ----------------------------------------
+ *
+ * The ROLE-BEARING marker — see comms.css for the design note on why an alert
+ * cannot be handed to `ui-panel` (an error painted notice-grey is an error
+ * nobody sees) and on how the role guard was widened to check it.
+ *
+ * On this surface it reaches the composer's feed banner and the rings' error
+ * line; on the player, its load failure. All three were pale pink slabs.
+ */
+[data-surface='viewscreen'] .ui-alert {
+  background-color: var(--viewscreen-negative-wash);
+  border-color: var(--viewscreen-negative);
+  color: var(--viewscreen-negative);
+}
+
+[data-surface='viewscreen'] .ui-alert .border-danger {
+  border-color: var(--viewscreen-negative);
+}
+

@@ -758,9 +758,9 @@ export function UnifiedComposer({
   // --- render ---------------------------------------------------------------
 
   const chipStateClass = (state: ChipState): string => {
-    if (state === 'failed' || state === 'blocked') return 'border-danger bg-danger-bg';
-    if (state === 'done') return 'border-honeydew-300 bg-honeydew-100';
-    return 'border-honeydew-300 bg-white';
+    if (state === 'failed' || state === 'blocked') return 'ui-alert border-danger bg-danger-bg';
+    if (state === 'done') return 'ui-panel border-honeydew-300 bg-honeydew-100';
+    return 'ui-panel border-honeydew-300 bg-white';
   };
 
   function IntentButtons({
@@ -804,8 +804,8 @@ export function UnifiedComposer({
                 active
                   ? 'bg-honeydew-600 text-white'
                   : available
-                    ? 'border border-honeydew-300 bg-white text-honeydew-700 hover:bg-honeydew-50'
-                    : 'border border-honeydew-200 bg-honeydew-50 text-honeydew-400'
+                    ? 'ui-btn border border-honeydew-300 bg-white text-honeydew-700 hover:bg-honeydew-50'
+                    : 'ui-btn border border-honeydew-200 bg-honeydew-50 text-honeydew-400'
               }`}
             >
               {intentLabel(intent)}
@@ -1008,7 +1008,7 @@ export function UnifiedComposer({
                   value={doc.recordType}
                   disabled={disabled || busy}
                   onChange={(e) => patchDoc(doc.id, { recordType: e.target.value })}
-                  className="rounded-xl border border-honeydew-300 bg-white px-3 py-2 text-sm text-honeydew-800"
+                  className="ui-field rounded-xl border border-honeydew-300 bg-white px-3 py-2 text-sm text-honeydew-800"
                 >
                   {(matchTarget(instance, ingestTargets)?.recordTypes ?? ['document']).map(
                     (t) => (
@@ -1046,7 +1046,7 @@ export function UnifiedComposer({
             <li
               key={i}
               data-testid={`unified-result-${i}`}
-              className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
+              className="ui-panel rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
             >
               {line}
             </li>
@@ -1070,7 +1070,7 @@ export function UnifiedComposer({
         <p
           role="status"
           data-testid="unified-paste-restored"
-          className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
+          className="ui-panel rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
         >
           {restoreNotice}
         </p>
@@ -1085,7 +1085,7 @@ export function UnifiedComposer({
           role="status"
           data-testid="unified-paste-offer"
           aria-label="Long paste"
-          className="flex flex-col gap-2 rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
+          className="ui-panel flex flex-col gap-2 rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
         >
           <p data-testid="unified-paste-offer-message">
             {pasteIngestOfferMessage(pasteOffer.length)}

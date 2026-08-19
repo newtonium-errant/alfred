@@ -193,8 +193,8 @@ export function BatchForm({
         <p
           className={
             result.status === 'saved'
-              ? 'rounded-xl bg-amber-100 px-3 py-2 text-sm text-amber-900'
-              : 'rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800'
+              ? 'ui-wash-caution rounded-xl bg-amber-100 px-3 py-2 text-sm text-amber-900'
+              : 'ui-panel rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800'
           }
         >
           {batchSuccessMessage(result)}
@@ -275,7 +275,7 @@ export function BatchForm({
           <p
             role="alert"
             data-testid="batch-pick-error"
-            className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+            className="ui-alert rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
           >
             {pickError}
           </p>
@@ -296,7 +296,7 @@ export function BatchForm({
               {files.map((f, i) => (
                 <li
                   key={`${f.name}-${i}`}
-                  className="flex items-center justify-between gap-2 rounded-lg bg-honeydew-50 px-2 py-1 text-sm"
+                  className="ui-panel flex items-center justify-between gap-2 rounded-lg bg-honeydew-50 px-2 py-1 text-sm"
                 >
                   <span className="truncate font-mono text-xs">{f.name}</span>
                   <span className="flex shrink-0 items-center gap-2">
@@ -349,7 +349,7 @@ export function BatchForm({
           <p
             role="alert"
             data-testid="batch-instruction-over-limit"
-            className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+            className="ui-alert rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
           >
             The instruction is{' '}
             {(instruction.length - MAX_BATCH_INSTRUCTION_CHARS).toLocaleString()}{' '}
@@ -362,7 +362,7 @@ export function BatchForm({
         <p
           role="alert"
           data-testid="batch-error"
-          className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+          className="ui-alert rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
         >
           {submitError}
         </p>

@@ -10,7 +10,7 @@ import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 import { VIEWSCREEN_SURFACE } from '../lib/algernon/viewscreenSurface';
 import { CRT_SURFACE } from '../lib/algernon/crtSurface';
 import { COMMS_SURFACE } from '../lib/algernon/commsSurface';
-import { ReportBugFab } from './ReportBugFab';
+import { FAB_SAFE_PAD_CLASS, ReportBugFab } from './ReportBugFab';
 
 // One frontend deployment targets ONE instance (blueprint §5). The instance's
 // display name is config-driven, NOT hardcoded — per the codebase's
@@ -141,6 +141,16 @@ const CONSOLE_CHROME: SurfaceClasses = {
   mobileSignOut:
     'console-railseg bg-console-raise px-3.5 py-2.5 text-left text-[11px] font-bold uppercase tracking-[0.14em] text-console-ink-faint',
   main: 'mx-auto px-3 py-4 sm:px-4',
+  // The bug-report FAB, wearing the hull. It is the one piece of chrome no
+  // register can reach — every register's stylesheet keeps its painting rules
+  // off the shell on purpose, and the FAB is mounted outside <main> — so it
+  // stayed a white circle on every dark surface in the app until the chrome
+  // table grew this entry.
+  //
+  // `affirm` rather than a neutral ink: this is the console's one floating
+  // control, and the hull's grammar spends affirm on the affordance that acts.
+  // It is not a verdict, so no function-role rule is being bent.
+  fab: 'border border-console-edge-bright bg-console-panel text-affirm hover:bg-affirm-wash focus-visible:ring-affirm',
 };
 
 /**
@@ -176,6 +186,11 @@ const SURFACE: Record<
     mobileSignOut:
       'rounded-xl border border-honeydew-300 bg-white px-3 py-2 text-left text-sm font-semibold text-honeydew-700 hover:bg-honeydew-50',
     main: 'mx-auto px-5 py-8',
+    // The warm skin is the same string ReportBugFab falls back to when Layout
+    // passes nothing. Stated here anyway so the table is TOTAL over its own
+    // keys: a chrome table with a hole reads as "this surface has no FAB", and
+    // the next reader would have to open another file to find out otherwise.
+    fab: 'border border-honeydew-300 bg-white text-honeydew-700 hover:bg-honeydew-50 focus-visible:ring-honeydew-600 focus-visible:ring-offset-2',
   },
   console: CONSOLE_CHROME,
   // The Awareness feed wears the same HULL as the deck — the designed path the
@@ -375,8 +390,25 @@ export function Layout({
           </nav>
         )}
       </header>
-      <main className={cn(s.main, maxWidthClassName)}>{children}</main>
-      {(showBugReport ?? showNav) && <ReportBugFab viewedInstance={viewedInstance} />}
+      {/* THE FAB'S RESERVATION, and why it is conditional on the same
+          expression that mounts the FAB.
+
+          The button is `fixed`, so it is out of flow and the page's last row has
+          no idea it is there — on /chat at phone width that row is the COMPOSER,
+          and the operator photographed the caterpillar sitting on the send
+          button. Reserving the footprint on <main> is what puts in-flow content
+          out of its reach, and it is the fix for every surface at once rather
+          than for the one that was photographed.
+
+          GATED, because an unconditional reserve would put 96px of dead space
+          under the sign-in screen, which has no FAB to clear. Reading the SAME
+          expression (rather than re-deriving "is this authed") is what stops the
+          two drifting: a surface that gains or loses the button gains or loses
+          the space with it, in one place. */}
+      <main className={cn(s.main, maxWidthClassName, (showBugReport ?? showNav) && FAB_SAFE_PAD_CLASS)}>
+        {children}
+      </main>
+      {(showBugReport ?? showNav) && <ReportBugFab viewedInstance={viewedInstance} className={s.fab} />}
     </div>
   );
 }

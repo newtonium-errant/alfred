@@ -298,7 +298,7 @@ export default function PlayerPage() {
         <h1 className={display}>Your briefing</h1>
 
         {error && (
-          <div role="alert" data-testid="player-error" className="mt-6 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
+          <div role="alert" data-testid="player-error" className="ui-alert mt-6 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
             {error}
           </div>
         )}

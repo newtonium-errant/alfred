@@ -36,6 +36,14 @@
   --comms-caution: var(--console-caution);
   --comms-info: var(--console-info);
 
+  /* The negative role's GROUND, for `.ui-alert` below. A wash is not a fifth
+     role and does not loosen the rule above: it is the same negative hue at
+     ground lightness, which is what lets an alert keep its meaning on a dark
+     hull instead of arriving as a pink slab. */
+  --comms-negative-wash: var(--console-negative-wash);
+  --comms-affirm-wash: var(--console-affirm-wash);
+  --comms-caution-wash: var(--console-caution-wash);
+
   /* The quotation's two values, named in THIS surface's vocabulary even though
      they resolve to the CRT register's. Naming them here is what keeps the
      borrowing explicit: a reader of comms.css can see the whole quotation
@@ -188,19 +196,106 @@
   border-color: var(--comms-edge);
 }
 
+[data-surface='comms'] .ui-panel.text-honeydew-900,
 [data-surface='comms'] .ui-panel .text-honeydew-900,
+[data-surface='comms'] .ui-panel.text-honeydew-800,
 [data-surface='comms'] .ui-panel .text-honeydew-800,
+[data-surface='comms'] .ui-panel.text-honeydew-700,
 [data-surface='comms'] .ui-panel .text-honeydew-700 {
   color: var(--comms-ink);
 }
 
+[data-surface='comms'] .ui-panel.text-honeydew-600,
 [data-surface='comms'] .ui-panel .text-honeydew-600,
+[data-surface='comms'] .ui-panel.text-honeydew-500,
 [data-surface='comms'] .ui-panel .text-honeydew-500 {
   color: var(--comms-ink-dim);
 }
 
+[data-surface='comms'] .ui-panel.border-honeydew-200,
 [data-surface='comms'] .ui-panel .border-honeydew-200,
+[data-surface='comms'] .ui-panel.border-honeydew-300,
 [data-surface='comms'] .ui-panel .border-honeydew-300,
+[data-surface='comms'] .ui-panel.border-honeydew-400,
 [data-surface='comms'] .ui-panel .border-honeydew-400 {
   border-color: var(--comms-edge);
+}
+
+/* --- ALERTS (the `ui-alert` marker) ----------------------------------------
+ *
+ * THE FOURTH ELEMENT CLASS TO REACH A REGISTER THROUGH A MARKER, and the FIRST
+ * that is ROLE-BEARING rather than chrome. That difference is the whole design
+ * note, so it is stated before the rule.
+ *
+ * `ui-field` / `ui-btn` / `ui-panel` are chrome markers, and the containment
+ * that makes them safe is that role-coloured markup never carries one — a
+ * destructive button deliberately has no `ui-btn`, so a register cannot repaint
+ * a verdict even by accident. `ui-alert` is the opposite case: the element IS
+ * the verdict. The operator photographed /chat's busy-guard banner as a pale
+ * pink slab on the dark hull, and the two available fixes were both wrong —
+ * leave it bright (the bug), or hand it to `ui-panel` (which would paint an
+ * error the same grey as a notice, and an error that reads as body copy is an
+ * error nobody sees).
+ *
+ * So this marker RE-EXPRESSES the negative role rather than replacing it: the
+ * negative hue at ground lightness for the slab, the negative hue itself for
+ * ink and edge. Meaning preserved, hue preserved, expressed in the register's
+ * own vocabulary. It is the same move `sensorLog.css` already ratified for
+ * `.bg-danger-bg`, lifted to a named marker so it is greppable and so it
+ * survives a rename of the Tailwind utility it used to be coupled to.
+ *
+ * BECAUSE IT IS ROLE-BEARING, IT IS GUARDED LIKE A ROLE. `registerRoleInviolate`
+ * walks the alias chain of every rule whose selector names a role class; that
+ * matcher was widened to know `ui-alert` is negative's, so these rules are
+ * checked exactly as `.text-danger` is. A role-bearing marker the role guard
+ * cannot see would be a hole with a name.
+ */
+[data-surface='comms'] .ui-alert {
+  background-color: var(--comms-negative-wash);
+  border-color: var(--comms-negative);
+  color: var(--comms-negative);
+}
+
+/* The retry control inside an alert. Its warm border is a role class, so it is
+   re-expressed to the same role rather than to an edge token. */
+[data-surface='comms'] .ui-alert .border-danger {
+  border-color: var(--comms-negative);
+}
+
+/* --- DEPTH: a control resting ON a panel -----------------------------------
+ *
+ * `.ui-panel` and `.ui-btn` both resolve to PANEL depth, so a button on an
+ * adopted panel disappears into it — flat-on-flat, its only remaining edge the
+ * hairline the panel's own border rule just dimmed. The notification tray is
+ * where this shows: a row is a panel, and Mark read / Dismiss sit on it.
+ *
+ * One rung up, stated as the general fact rather than patched per component:
+ * the surface ramp exists so depth can carry structure, and a control resting
+ * on something is the case it was built for.
+ */
+[data-surface='comms'] .ui-panel .ui-btn {
+  background-color: var(--comms-raise);
+}
+
+/* --- ROLE GROUNDS (the `ui-wash-*` markers) ---------------------------------
+ *
+ * Role-bearing, like `ui-alert`, and for the same reason: on these elements the
+ * COLOUR IS THE REPORT. A filled status pill that said "done" in panel-grey
+ * would have stopped saying anything, which is worse than saying it in the warm
+ * palette's mint.
+ *
+ * Named for the token they resolve to rather than for a shape (`pill` was the
+ * first name and it was wrong within a day — the same ground is wanted by a
+ * full-width notice panel as by a pill). ONE MARKER PER ROLE, because a single
+ * marker cannot tell done from in-progress and one that had to be told by a
+ * second class is just these two with an extra step.
+ */
+[data-surface='comms'] .ui-wash-affirm {
+  background-color: var(--comms-affirm-wash);
+  color: var(--comms-affirm);
+}
+
+[data-surface='comms'] .ui-wash-caution {
+  background-color: var(--comms-caution-wash);
+  color: var(--comms-caution);
 }

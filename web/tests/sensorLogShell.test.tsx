@@ -117,9 +117,25 @@ describe('sensor-log adoption — the attribute covers the shell, the paint does
         found.push(selector);
         // A row-scoped spelling is fine — that is inside the content by
         // construction. Otherwise it must be `.sensor-console`-scoped.
+        //
+        // A MARKER-GATED SPELLING IS ALSO FINE, and this is the third
+        // containment argument rather than a hole punched for convenience. A
+        // `ui-*` rule can only paint an element that OPTED IN by carrying the
+        // marker, so "reachable from the attribute" and "reachable to the
+        // shell" come apart: the shell's chrome carries no marker, which is a
+        // fact about the markup rather than about this selector — so the test
+        // below ASSERTS it by rendering the shell, and this allowance is void
+        // the moment that assertion goes red.
+        //
+        // The distinction the guard still enforces is the one it was built for:
+        // a BARE painting rule under the attribute (`[data-surface='…'] {…}`,
+        // or a bare-element tail) reaches every matching node whether it asked
+        // or not. That is what repainted the nav in the original audit, and it
+        // still fails here.
         const contained =
           hasExactToken(selector, '.sensor-console') ||
-          selector.includes("[data-testid='feed-row']");
+          selector.includes("[data-testid='feed-row']") ||
+          /\.ui-[a-z-]+/.test(selector);
         expect(contained, `"${selector}" can reach the shell from the surface attribute`).toBe(true);
       }
     }
@@ -149,6 +165,45 @@ describe('sensor-log adoption — the attribute covers the shell, the paint does
       // Both facts at once: the attribute is above BOTH (it is the surface), the
       // paint is above only one.
       expect(navLink.closest(`[data-surface="${SENSOR_SURFACE}"]`)).not.toBeNull();
+    });
+  });
+
+  it('the SHELL CHROME carries no `ui-*` marker — what earns the marker allowance', () => {
+    // THE PIN THAT PAYS FOR THE THIRD CONTAINMENT ARGUMENT ABOVE.
+    //
+    // That branch lets a `.ui-*` rule sit under the bare attribute on the
+    // grounds that a marker-gated rule can only paint what opted in, and the
+    // shell's chrome never does. That is a claim about MARKUP, and the selector
+    // scan cannot see markup — so without this it would be an assertion the
+    // guard makes about itself. Here it is checked against the real shell.
+    //
+    // NOT A SWEEP OVER THE WHOLE TREE, deliberately. The bug-report DIALOG is
+    // Layout-mounted too and it does carry markers (`ui-panel`, and `ui-btn` /
+    // `ui-field` through the Button and Textarea it composes) — that predates
+    // this lane and it is correct: a full-surface overlay covering a dark page
+    // should be dark, which is exactly what an opt-in marker is for. The claim
+    // being earned is narrower and it is the one the original audit was about:
+    // the persistent chrome — nav, header, sign-out, hamburger, the FAB itself
+    // — takes no marker, so no register can repaint it.
+    render(<FeedPage />);
+    return waitFor(() => {
+      expect(screen.getByTestId('nav-feed')).toBeTruthy();
+    }).then(() => {
+      const chrome = ['nav-feed', 'nav-chat', 'nav-signout', 'nav-menu-button', 'report-bug-fab'];
+      const seen: string[] = [];
+      for (const id of chrome) {
+        const el = document.querySelector(`[data-testid="${id}"]`);
+        if (!el) continue;
+        seen.push(id);
+        expect(
+          /(^|\s)ui-[a-z-]+/.test(el.className),
+          `shell chrome "${id}" carries a ui-* marker — a register can now repaint it, ` +
+            'and the marker allowance in the selector scan above is no longer true',
+        ).toBe(false);
+      }
+      // Vacuity control: an empty sweep proves nothing, and every id above is
+      // one `showNav` change away from vanishing.
+      expect(seen.length).toBeGreaterThanOrEqual(3);
     });
   });
 });

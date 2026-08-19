@@ -356,12 +356,12 @@ export default function FeedPage() {
           </div>
 
         {board.banner && (
-          <div role="alert" data-testid="feed-banner" className="mt-4 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
+          <div role="alert" data-testid="feed-banner" className="ui-alert mt-4 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
             {board.banner}
           </div>
         )}
         {error && (
-          <div role="alert" data-testid="feed-error" className="mt-6 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
+          <div role="alert" data-testid="feed-error" className="ui-alert mt-6 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
             {error}
           </div>
         )}
@@ -511,7 +511,7 @@ export default function FeedPage() {
                   <li
                     key={it.id}
                     data-testid="feed-snoozed-row"
-                    className="flex items-center gap-2 rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft"
+                    className="ui-panel flex items-center gap-2 rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft"
                   >
                     <span className="min-w-0 flex-1 truncate text-sm text-honeydew-700 opacity-70">{it.title || it.id}</span>
                     <button

@@ -304,7 +304,7 @@ export default function HomePage() {
         {mode === 'feed' && (
           <section data-testid="compose-feed" className="mt-6">
             {board.banner && (
-              <div role="alert" data-testid="composer-feed-banner" className="mb-4 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
+              <div role="alert" data-testid="composer-feed-banner" className="ui-alert mb-4 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger">
                 {board.banner}
               </div>
             )}
