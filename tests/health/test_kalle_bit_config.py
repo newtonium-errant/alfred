@@ -72,13 +72,12 @@ def _kalle_raw(tmp_path: Path) -> dict[str, Any]:
         "agent": {"backend": "openclaw"},  # skip anthropic-auth network call
         "logging": {"dir": str(data_dir)},
         "telegram": {
-            # Bot token only — talker probe substitutes env vars then
-            # surfaces FAIL on unresolved placeholders. A literal-shape
-            # token short-circuits to OK at probe level for the bot-
-            # token check, but the anthropic-auth sub-probe will FAIL
-            # without an api_key. We tolerate that — the test asserts
-            # on the SKIP behavior of absent-section tools, not on
-            # talker's full OK rollup.
+            # Bot token only — post-retirement (2026-08-19) a resolvable
+            # literal on a non-web-only shape FAILs the bot-token probe
+            # (revoked arm), and the anthropic-auth sub-probe FAILs
+            # without an api_key. We tolerate both — the test asserts
+            # on the SKIP behavior of absent-section tools, and the
+            # no-FAIL assertion below explicitly exempts talker.
             "bot_token": "fake-token-for-test",
             "allowed_users": [1],
             "instance": {"name": "kal-le"},

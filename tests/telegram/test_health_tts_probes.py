@@ -110,8 +110,15 @@ async def test_elevenlabs_auth_skip_when_key_missing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_health_check_without_tts_section_does_not_fail(monkeypatch) -> None:
-    """No tts section → tts-key + elevenlabs-auth SKIP, overall unaffected."""
+async def test_health_check_without_tts_section_tts_probes_skip(monkeypatch) -> None:
+    """No tts section → tts-key + elevenlabs-auth SKIP, and neither is a
+    FAIL source.
+
+    (Formerly asserted the whole rollup != FAIL; since the 2026-08-19
+    retirement semantics, this standard-shape fixture's resolvable
+    bot_token FAILs the rollup by design — the pin here is that the tts
+    probes are not the reason.)
+    """
     raw = {
         "telegram": {
             "bot_token": "test-token-not-empty",
@@ -140,8 +147,12 @@ async def test_health_check_without_tts_section_does_not_fail(monkeypatch) -> No
     assert by_name["capture-handler-registered"].status == Status.OK
     assert by_name["elevenlabs-auth"].status == Status.SKIP
 
-    # Overall status shouldn't be FAIL just because of missing opt-in tts.
-    assert result.status != Status.FAIL
+    # Missing opt-in tts must never be a FAIL source. (The rollup itself
+    # DOES fail on this standard-shape fixture — the resolvable bot_token
+    # hits the post-retirement revoked arm — so assert attribution, not
+    # the rollup: every FAIL present is the bot-token one.)
+    failing = [r.name for r in result.results if r.status == Status.FAIL]
+    assert failing == ["bot-token"]
 
 
 @pytest.mark.asyncio
