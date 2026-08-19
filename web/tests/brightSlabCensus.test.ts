@@ -32,6 +32,27 @@ import { SENSOR_SURFACE } from '../lib/algernon/sensorSurface';
 // tomorrow lands in a component this graph already reaches, and the test names
 // the file and line rather than waiting for a screenshot.
 //
+// THE SPLIT, as measured at the commit that added this paragraph:
+//
+//   72 light-literal rows reachable from a dark register
+//     57  genuinely marked — a `ui-*` marker (or a transcript-hull constant) on
+//         the element, found in source with COMMENTS STRIPPED
+//     15  rule-covered — 13 rows of Layout's warm chrome table across 3
+//         literals, plus the FAB's 2 warm-fallback literals; five RULED_LIGHT
+//         keys between them
+//
+// AN EARLIER TELLING OF THIS SAID 59 + 14 = 73, AND ALL THREE NUMBERS WERE
+// WRONG IN THE SAME DIRECTION: the marker check was reading raw source, so two
+// FAB rows counted as marked on the strength of a docstring, and one row was
+// not a row at all — `commsSurface.ts` quotes `bg-cream` in PROSE while
+// explaining the very bug this lane fixed. Stripping comments moves the two and
+// deletes the third, which is why the denominator falls by one rather than the
+// halves simply trading. Anyone reconciling against a 16 is reconciling against
+// a subtraction from the old total; the prose row is the difference.
+//
+// The counts are stated because they are checkable, and re-derivable by running
+// this file — not because they are load-bearing. Nothing below asserts them.
+//
 // WHAT IT CANNOT CLAIM. jsdom evaluates no stylesheet, so nothing here reads a
 // real cascade — these are source-text facts, exactly as the register guards
 // next door are. The marker/utility adjacency check uses a line WINDOW around
@@ -70,7 +91,73 @@ function walk(dir: string, out: string[] = []): string[] {
 }
 
 const FILES = ROOTS.flatMap((r) => walk(join(WEB, r)));
-const SRC = new Map(FILES.map((f) => [f, readFileSync(f, 'utf8')]));
+
+/**
+ * Source with COMMENTS BLANKED and line structure preserved.
+ *
+ * THE LABEL-VS-THING DEFECT, AT THE SOURCE ALTITUDE. Every marker question this
+ * file asks — is this literal marked, can this register render this marker — was
+ * asked of RAW text, so PROSE ABOUT a marker answered as well as the marker.
+ * Proven, not suspected: stripping the real `ui-panel` off NotificationList's
+ * tray row left this suite fully green, because a comment four lines above the
+ * className says the word. The census would have watched the reported bug get
+ * reinstated and reported nothing.
+ *
+ * It is the same defect the matrix guard was already fixed for one altitude up
+ * (there, `.ui-panel.text-honeydew-900` in the ink rules answered for the paint
+ * rule) — which is the tell that it is a CLASS, not two accidents: this file
+ * reads two languages, and it was only taught to discount prose in one of them.
+ * `SHEET` has stripped stylesheet comments since the first cut; source got no
+ * such treatment.
+ *
+ * LINES ARE PRESERVED, not removed: the census reports `file:line`, and a
+ * stripper that collapsed lines would move every finding off its own coordinates.
+ *
+ * ERROR DIRECTION, CHOSEN DELIBERATELY. The scanner tracks strings and template
+ * literals but does not parse regex literals, so a regex containing an escaped
+ * `//` can start a phantom line comment and blank the rest of that line. That
+ * fails toward OVER-stripping, which hides a real marker and makes the census
+ * report the row as unruled — loud, and fixed by adding the row. Under-stripping
+ * is the silent direction and is the defect being closed here.
+ */
+function stripComments(text: string): string {
+  let out = '';
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (c === '/' && next === '/') {
+      while (i < n && text[i] !== '\n') { out += ' '; i += 1; }
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      while (i < n && !(text[i] === '*' && text[i + 1] === '/')) {
+        out += text[i] === '\n' ? '\n' : ' ';
+        i += 1;
+      }
+      out += '  ';
+      i += 2;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') {
+      const quote = c;
+      out += c; i += 1;
+      while (i < n) {
+        if (text[i] === '\\') { out += text.slice(i, i + 2); i += 2; continue; }
+        out += text[i];
+        if (text[i] === quote) { i += 1; break; }
+        i += 1;
+      }
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+const SRC = new Map(FILES.map((f) => [f, stripComments(readFileSync(f, 'utf8'))]));
 
 function resolveImport(from: string, spec: string): string | null {
   if (!spec.startsWith('.')) return null;
@@ -286,6 +373,32 @@ const MARKER_NEARBY = new RegExp(
  * an entry with an empty string fails the shape check below, because "someone
  * added a key to make the test pass" is exactly the drift this list would
  * otherwise invite.
+ *
+ * EVERY KEY HERE IS CONSULTED. That is not decoration — an exception nothing
+ * asks for is a standing licence, and it swallows the very change it was
+ * written next to. Six keys were removed once the comment-strip above made the
+ * classification trustworthy, and they failed in three distinct ways worth
+ * naming, because "unused" hid all three:
+ *
+ *   · `EvidenceBody.tsx:bg-honeydew-50` — REDUNDANT AND DANGEROUS. The marker
+ *     sits on the same string as the literal, so the row was already marked and
+ *     this key never fired. But it would have fired the moment someone deleted
+ *     the marker, silently excusing exactly the regression the census exists to
+ *     catch. A marker must be load-bearing; an exception standing behind it
+ *     makes it decorative.
+ *   · `ui/badge.tsx` ×4 — OUT OF THE DENOMINATOR ENTIRELY. Nothing imports
+ *     badge.tsx, so the graph excludes it before this list is consulted. The
+ *     keys documented a real fact about the wrong layer.
+ *   · `commsSurface.ts:bg-cream` — SUPERSEDED BY MECHANISM. It excused PROSE: a
+ *     docstring quoting the class while explaining the bug. Stripping comments
+ *     removes that row from the census by construction, which is strictly better
+ *     than an entry asking a reader to trust that someone checked.
+ *
+ * The two `ReportBugFab` keys went the other way and are the reason a trim by
+ * eye would have been wrong: before the strip they LOOKED marked (the prop
+ * docstring says "a `ui-*` marker"), and only afterwards did they become
+ * genuinely used. Deleting them on the pre-strip reading would have removed
+ * real coverage.
  */
 const RULED_LIGHT: Record<string, string> = {
   'components/Layout.tsx:bg-honeydew-50':
@@ -299,19 +412,6 @@ const RULED_LIGHT: Record<string, string> = {
     'keeps one: /share is a warm route and renders this button. The dark surfaces take ' +
     'their skin from the chrome table (`s.fab`), not from this fallback.',
   'components/ReportBugFab.tsx:bg-honeydew-50': 'Same — the warm fallback skin\'s hover state.',
-  'components/feed/EvidenceBody.tsx:bg-honeydew-50':
-    'The `warm` entry of this component\'s own per-surface SKIN map. It carries ui-panel ' +
-    'so a dark register reaches it; the literal is the warm default underneath.',
-  'components/ui/badge.tsx:bg-status-todo':
-    'Dead component — `git grep` finds no importer of ui/badge.tsx anywhere in web/. ' +
-    'It renders on no surface, dark or warm.',
-  'components/ui/badge.tsx:bg-status-progress': 'Same — ui/badge.tsx has no importer anywhere in web/.',
-  'components/ui/badge.tsx:bg-status-blocked': 'Same — ui/badge.tsx has no importer anywhere in web/.',
-  'components/ui/badge.tsx:bg-status-done': 'Same — ui/badge.tsx has no importer anywhere in web/.',
-  'lib/algernon/commsSurface.ts:bg-cream':
-    'PROSE, not a class. The docstring quotes `bg-cream` while explaining which slab the ' +
-    'operator photographed. The scan reads source text and cannot tell a quoted class from ' +
-    'a rendered one; this entry is that distinction, written down.',
 };
 
 type Row = { file: string; line: number; literal: string; marked: boolean; registers: string[] };
