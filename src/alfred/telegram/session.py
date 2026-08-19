@@ -1335,9 +1335,12 @@ def append_document(
     ``mime_type`` is recorded so a future allowlist widening doesn't
     need a backfill pass to identify which records had which type.
 
-    ``kind`` (2026-06-06 P8 — universal filetype bundle) is the
-    short tag from :data:`alfred.telegram.attachments.SUPPORTED_DOCUMENT_MIME`
-    (``pdf``, ``docx``, ``text``, ``csv``, ``ics``, ``audio``).
+    ``kind`` (2026-06-06 P8 — universal filetype bundle) is the short
+    tag the retired bot-side attachment handler derived from its
+    MIME allowlist (``pdf``, ``docx``, ``text``, ``csv``, ``ics``,
+    ``audio`` — the canonical list lived in
+    ``telegram/attachments.py``, deleted with the Telegram retirement,
+    T5 2026-08-19; existing session records keep these values).
     Recorded alongside ``mime_type`` because the kind is the
     operational grouping consumers care about ("what audio has Andrew
     shared this week?") whereas the MIME is the wire-level identifier.

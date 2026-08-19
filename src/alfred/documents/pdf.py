@@ -98,8 +98,10 @@ class DocumentExtractError(Exception):
     exists to prevent — so the distinction rides alongside the message rather
     than inside it.
 
-    ``alfred.telegram.attachments.AttachmentExtractError`` is an ALIAS of this
-    class, so every existing ``except AttachmentExtractError`` still catches.
+    (``alfred.telegram.attachments.AttachmentExtractError`` was an ALIAS of
+    this class so the bot-side handlers kept catching across the #57 lift;
+    the wrapper module and its alias were deleted with the Telegram
+    retirement, T5 2026-08-19 — this class is the only spelling now.)
     """
 
     def __init__(self, message: str, *, reason: str = REASON_UNREADABLE) -> None:

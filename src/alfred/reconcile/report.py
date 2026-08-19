@@ -32,10 +32,11 @@ all: the operator asks the instance to show him the report, the talker reads
 the file, and the web surface's existing fenced-text rendering supplies the
 download affordance. That seam is deliberately not built here — pushing a
 file outward is an auth decision, and this module's job ends at producing
-the artifact. There is NO Python CSV-export path in the tree to ride; the
-only CSV code that exists is inbound (``telegram.attachments`` decoding an
-UPLOADED CSV into a Markdown table for a prompt), which is the opposite
-direction and shares nothing with this.
+the artifact. There is NO Python CSV-export path in the tree to ride (the
+one inbound CSV decoder — ``telegram/attachments.py`` turning an UPLOADED
+CSV into a Markdown table for a prompt — was the opposite direction, shared
+nothing with this, and was deleted with the Telegram retirement, T5
+2026-08-19).
 """
 
 from __future__ import annotations
