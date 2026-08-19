@@ -14,6 +14,7 @@ import {
   isPdfFilename,
   mergeTypedWithUpload,
   mergedUploadNote,
+  pdfWouldClearTypedBodyMessage,
   prepareUpload,
   preparePdfUpload,
   readFailedMessage,
@@ -156,11 +157,31 @@ export function IngestForm({
             setUploadError(prepared.message);
             return;
           }
+          // THE PDF ARM OF THE CLOBBER GUARD — a REFUSAL, because this is the
+          // one case keep-both cannot serve: the browser never reads a PDF, so
+          // there is no text to merge, and `handleSubmit` sends `body_b64` and
+          // drops `body` entirely.
+          //
+          // Placed AFTER `preparePdfUpload` deliberately. A scanned or oversize
+          // PDF is refused on its own terms first, so the operator is never told
+          // to clear his notes only to clear them and then hit "this PDF is too
+          // big" — two round trips for one pick.
+          //
+          // Nothing else is touched, and that is the message: the form is
+          // exactly as he left it. (The `setUploadNote(null)` every other
+          // refusal path carries would be a no-op here — a hand-typed body means
+          // `onBodyEdited` already cleared it.)
+          if (body.trim() !== '' && !bodyIsUploadedText) {
+            setUploadError(pdfWouldClearTypedBodyMessage(name));
+            return;
+          }
           setUploadError(null);
           setUploadNote(prepared.note);
-          // Staging a PDF clears any typed body: only one of them can be what
-          // gets written, and leaving stale text on screen beside a staged file
-          // is the ambiguity this pairing exists to avoid.
+          // Staging a PDF clears the body: only one of them can be what gets
+          // written, and leaving stale text on screen beside a staged file is
+          // the ambiguity this pairing exists to avoid. Reachable only when the
+          // body is empty or holds text a previous UPLOAD put there — the guard
+          // above is what keeps hand-typed notes out of this line.
           setBody('');
           setBodyIsUploadedText(false);
           setPdfUpload({ b64: prepared.bodyB64, filename: name, bytes: prepared.bytes });

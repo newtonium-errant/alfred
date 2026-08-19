@@ -273,3 +273,114 @@ describe('the behaviours the guard must not have moved', () => {
     expect(field('ingest-body').value).toContain(TYPED);
   });
 });
+
+// --- the PDF arm: a REFUSAL, because keep-both cannot serve it ---------------
+//
+// A PDF is the one collision the merge cannot resolve: the browser never reads
+// it, so there is no text to merge, and `handleSubmit` sends `body_b64` and
+// drops `body` entirely. Staging and typed notes are genuinely exclusive.
+//
+// The form has always said only one of them can be what gets written. What
+// changed is WHO decides: the old code decided by clearing the body, so the
+// operator's typing lost to a file pick and he was never asked. These pin the
+// same exclusivity, enforced in the direction that keeps his work.
+
+/**
+ * Bytes over an EXPLICIT ArrayBuffer — `new Uint8Array([...])` infers
+ * `ArrayBufferLike` under TS 5.7 and `BlobPart` rejects it, because
+ * `ArrayBufferLike` admits `SharedArrayBuffer`. Same reason, same fix, as the
+ * helper in ingestForm.test.tsx.
+ */
+function pdfBytes(values: number[]): Uint8Array<ArrayBuffer> {
+  const view = new Uint8Array(new ArrayBuffer(values.length));
+  view.set(values);
+  return view;
+}
+const PDF = pdfBytes([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a, 0x25]);
+
+async function uploadPdf(name: string, bytes: Uint8Array<ArrayBuffer>) {
+  const snapshot = () =>
+    JSON.stringify([
+      (screen.getByTestId('ingest-body') as HTMLTextAreaElement).value,
+      screen.queryByTestId('ingest-upload-error')?.textContent ?? '',
+      screen.queryByTestId('ingest-upload-note')?.textContent ?? '',
+    ]);
+  const before = snapshot();
+  fireEvent.change(screen.getByTestId('ingest-file') as HTMLInputElement, {
+    target: { files: [new File([bytes], name, { type: 'application/pdf' })] },
+  });
+  await waitFor(() => {
+    if (snapshot() === before) throw new Error('pdf upload not settled');
+  });
+}
+
+describe('a PDF picked over typed notes is REFUSED, not silently swapped', () => {
+  it('leaves the body intact and says why, naming the file', async () => {
+    // THE MUTATION THIS PIN EXISTS FOR: delete the guard and `setBody('')`
+    // destroys the notes again — the reported bug, one file type over.
+    renderForm();
+    type(TYPED);
+    await uploadPdf('statement.pdf', PDF);
+
+    expect(field('ingest-body').value).toBe(TYPED);
+    const msg = screen.getByTestId('ingest-upload-error').textContent ?? '';
+    expect(msg).toContain('statement.pdf');
+    // The two things a refusal owes: what the collision IS, and what to do.
+    expect(msg.toLowerCase()).toContain('replaces the body');
+    expect(msg.toLowerCase()).toContain('clear those notes');
+  });
+
+  it('stages NOTHING — the submit is still about the notes, not the file', async () => {
+    // The body-intact assertion above passes just as well against a form that
+    // kept the text on screen AND staged the PDF underneath, which would submit
+    // body_b64 and drop the notes at the door: the same loss, one step later.
+    renderForm();
+    type(TYPED);
+    await uploadPdf('statement.pdf', PDF);
+    // BOTH fields by hand. The refused pick auto-filled neither — which the test
+    // above asserts and this one relies on: submit is gated on `source`, so a
+    // fixture that filled only the title would find the button disabled and
+    // report "spy called 0 times", which reads as a routing bug and is not one.
+    fireEvent.change(field('ingest-title'), { target: { value: 'My notes' } });
+    fireEvent.change(field('ingest-source'), { target: { value: 'typed by hand' } });
+    fireEvent.click(screen.getByTestId('ingest-submit'));
+
+    expect(submitMock).toHaveBeenCalledTimes(1);
+    const sent = submitMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(sent.body).toBe(TYPED);
+    expect(sent.body_format).toBeUndefined();
+    expect(sent.body_b64).toBeUndefined();
+  });
+
+  it('does not derive title or source from a file it refused', async () => {
+    // The auto-fill sits below the guard. A fix written one line too low would
+    // refuse the PDF and still stamp its filename over the form.
+    renderForm();
+    type(TYPED);
+    fireEvent.change(field('ingest-title'), { target: { value: '' } });
+    await uploadPdf('statement.pdf', PDF);
+    expect(field('ingest-title').value).toBe('');
+    expect(field('ingest-source').value).toBe('');
+  });
+
+  it('an EMPTY body still stages the PDF normally — the positive control', async () => {
+    // Without this, every assertion above is satisfied by a form that refuses
+    // EVERY PDF, which would take the whole #57 path out on the way past.
+    renderForm();
+    await uploadPdf('statement.pdf', PDF);
+    expect(screen.queryByTestId('ingest-upload-error')).toBeNull();
+    expect(screen.getByTestId('ingest-upload-note').textContent).toContain('statement.pdf');
+    expect((screen.getByTestId('ingest-submit') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('an UPLOAD-loaded body still stages the PDF — only hand work is protected', async () => {
+    // The same discrimination the text arm makes, on the PDF arm. A body that a
+    // previous upload put there is not the operator's typing, and clearing it
+    // is the ratified exclusivity doing its job.
+    renderForm();
+    await upload('notes.md', '# from a file\n', 'text/markdown');
+    await uploadPdf('statement.pdf', PDF);
+    expect(screen.queryByTestId('ingest-upload-error')).toBeNull();
+    expect(field('ingest-body').value).toBe('');
+  });
+});

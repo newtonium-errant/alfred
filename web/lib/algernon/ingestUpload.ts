@@ -160,6 +160,31 @@ export function csvUploadNote(filename: string, rows: number): string {
 }
 
 /**
+ * What the form says when a PDF is picked while hand-typed notes are in the body.
+ *
+ * THE ONE CASE KEEP-BOTH CANNOT SERVE. Everywhere else the guard merges, because
+ * both halves are text and both can be written. A PDF is not text here: the
+ * browser never reads it, the bytes are relayed, and `handleSubmit` sends
+ * `body_b64` and drops `body` entirely — so a staged PDF and a typed body are
+ * genuinely exclusive, and there is no third state where both survive.
+ *
+ * REFUSING ENFORCES THAT EXCLUSIVITY; IT DOES NOT REVERSE IT. The form's own
+ * comment has always said only one of them can be what gets written, and that
+ * is still true — what changed is WHO decides which. The old code decided by
+ * clearing the body, so the operator's most deliberate action lost to a file
+ * pick and he was never asked. The rule was one-of-them-gets-written; it was
+ * never text-dies-silently. So: say what the collision is, name the remedy, and
+ * leave the form exactly as it was for him to resolve.
+ *
+ * Do not "restore" the wholesale clear on the strength of that older comment.
+ * They agree — this is the same rule, enforced in the direction that keeps his
+ * work.
+ */
+export function pdfWouldClearTypedBodyMessage(filename: string): string {
+  return `${filename} was not attached — a PDF replaces the body entirely, and you have notes typed there. Submit or clear those notes first, then attach it.`;
+}
+
+/**
  * THE CLOBBER GUARD — what separates text the operator TYPED from the file they
  * then attached, when both end up in one body.
  *
