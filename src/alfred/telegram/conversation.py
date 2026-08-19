@@ -2222,14 +2222,23 @@ def _build_sender_identity_text(
     dynamic-per-message, NOT a static SKILL template var.
 
     ``channel`` (2026-06-29, RRTS bug-report → VERA lane) surfaces the
-    EXPLICIT arrival channel — ``"web"`` (the web bug widget / relay) or
-    ``"telegram"`` — as ``channel: <value>`` in the sender parenthetical
-    PLUS a one-line statement. This is the in-conversation signal VERA's
-    SKILL keys its per-channel PHI rule on (web reports = capture PHI
-    faithfully and hold; telegram = minimize). It must be available DURING
-    the conversation — the ticket's ``origin`` frontmatter field is set at
-    file-time, too late to steer in-conversation PHI behaviour. ``None`` /
-    empty omits the channel clause (back-compat).
+    EXPLICIT arrival channel — ``"web"`` (the web bug widget / relay) or,
+    historically, ``"telegram"`` — as ``channel: <value>`` in the sender
+    parenthetical PLUS a one-line statement. NOTE the marker's job CHANGED
+    on 2026-08-19 (post-Telegram-retirement re-teach; see
+    vault-vera/SKILL.md "PHI POSTURE — RE-TAUGHT AS A DATA BOUNDARY"): the
+    per-channel PHI regime this block used to feed (web = capture PHI
+    faithfully and hold; telegram = minimize) is SUPERSEDED — the PHI rule
+    is now UNIFORM and channel-independent (business data in-bounds
+    everywhere; clinical PHI zero on every surface), so the marker no
+    longer selects a PHI regime and an absent or unclear marker changes
+    nothing about PHI. What the marker still steers is the CLOSING: the
+    role/channel pair is how the SKILL tells a vouched, HELD bug-widget
+    report (capture-and-queue closing, no pipeline promises) from ordinary
+    chat, with a missing/ambiguous marker falling to the conservative
+    closing. It must be available DURING the conversation — the ticket's
+    ``origin`` frontmatter field is set at file-time, too late to steer
+    the closing. ``None`` / empty omits the channel clause (back-compat).
 
     Callers gate on ``user_name`` being non-None (see ``run_turn``): the
     block is omitted entirely on single-user instances so their behaviour

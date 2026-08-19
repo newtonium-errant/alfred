@@ -4369,6 +4369,62 @@ def _cmd_scribe_presets(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_telegram(args: argparse.Namespace) -> None:
+    """Retired-Telegram hygiene subcommands (T4 C6, 2026-08-19).
+
+    The surface is gone; what remains under ``alfred telegram`` is cleanup
+    tooling. ``scrub-logs`` rewrites historical bot tokens in local log
+    files to a placeholder — the tokens are revoked (2026-08-18), so this
+    is hygiene against scanner-bait and copy-paste, not secrecy. The
+    production box run is an operator step (this repo's machine is dev).
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="telegram")
+
+    subcmd = getattr(args, "telegram_cmd", None)
+    if subcmd == "scrub-logs":
+        from alfred.common.instance_paths import instance_data_dir
+        from alfred.telegram.scrub_logs import PLACEHOLDER, scrub_logs
+
+        log_dir = Path(instance_data_dir(raw))
+        report = scrub_logs(
+            log_dir,
+            extra_paths=tuple(Path(p) for p in args.path),
+            extra_tokens=tuple(args.token),
+            dry_run=args.dry_run,
+        )
+        mode = "DRY RUN — nothing written" if args.dry_run else "rewritten in place"
+        print(f"Scrub of {log_dir} ({mode}):")
+        for f in report.files:
+            if f.skipped_reason:
+                print(f"  SKIP  {f.path} — {f.skipped_reason}")
+            elif f.matches:
+                verb = "would scrub" if args.dry_run else "scrubbed"
+                print(f"  MATCH {f.path} — {verb} {f.matches} token(s) -> {PLACEHOLDER}")
+            else:
+                print(f"  clean {f.path}")
+        if report.total_matches == 0:
+            # Intentionally-left-blank: a clean scan says so explicitly.
+            print(
+                f"Scanned {report.scanned} file(s): no bot tokens found — "
+                "nothing to scrub."
+            )
+        else:
+            outcome = (
+                "found — DRY RUN, nothing written"
+                if args.dry_run
+                else "rewritten in place"
+            )
+            print(
+                f"Scanned {report.scanned} file(s): {report.total_matches} "
+                f"token occurrence(s) {outcome}."
+            )
+        return
+
+    print("Usage: alfred telegram scrub-logs [--dry-run] [--path FILE]... [--token LITERAL]...")
+    sys.exit(1)
+
+
 def cmd_mail(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="mail")
@@ -7035,6 +7091,37 @@ def build_parser() -> argparse.ArgumentParser:
     status_all.add_argument("--json", action="store_true", default=False, help=argparse.SUPPRESS)
 
     # mail
+    telegram_p = sub.add_parser(
+        "telegram",
+        help="Retired-Telegram hygiene subcommands (surface removed 2026-08-19)",
+    )
+    telegram_sub = telegram_p.add_subparsers(dest="telegram_cmd")
+    tg_scrub = telegram_sub.add_parser(
+        "scrub-logs",
+        help=(
+            "Rewrite historical bot tokens in local log files to a "
+            "placeholder (tokens are revoked — hygiene, not secrecy). "
+            "Scans <logging.dir>/*.log* plus any --path. Run with daemons "
+            "stopped for live files: the rewrite is atomic per file but a "
+            "write landing between read and rename would be lost."
+        ),
+    )
+    tg_scrub.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Report what would change; write nothing",
+    )
+    tg_scrub.add_argument(
+        "--path", action="append", default=[],
+        help="Extra file to scrub (repeatable; beyond the log dir walk)",
+    )
+    tg_scrub.add_argument(
+        "--token", action="append", default=[],
+        help=(
+            "Exact token literal to scrub in addition to the generic "
+            "<digits>:<secret> pattern (repeatable)"
+        ),
+    )
+
     mail_p = sub.add_parser("mail", help="Email fetcher subcommands")
     mail_sub = mail_p.add_subparsers(dest="mail_cmd")
     mail_fetch = mail_sub.add_parser("fetch", help="Fetch new emails from configured accounts")
@@ -7499,6 +7586,7 @@ def main() -> None:
         "tui": cmd_tui,
         "brief": cmd_brief,
         "mail": cmd_mail,
+        "telegram": cmd_telegram,
         "scribe": cmd_scribe,
         "instance": cmd_instance,
         "talker": cmd_talker,

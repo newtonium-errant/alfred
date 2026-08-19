@@ -27,7 +27,8 @@
 #   alfred --config config.kalle.yaml up --only talker,transport,instructor
 #
 # Required environment variables (add to ~/alfred/.env):
-#   TELEGRAM_KALLE_BOT_TOKEN       — from @BotFather for KAL-LE's own bot
+#   (TELEGRAM_*_BOT_TOKEN is RETIRED — Telegram surface gone 2026-08-18,
+#    tokens revoked; bot_token ships empty below and nothing reads the var)
 #   ALFRED_KALLE_TRANSPORT_TOKEN   — shared secret for KAL-LE's inbound transport
 #   ALFRED_KALLE_PEER_TOKEN        — token Salem uses when reaching KAL-LE
 #   ALFRED_SALEM_PEER_TOKEN        — token KAL-LE uses when reaching Salem
@@ -176,11 +177,15 @@ instructor:
     path: "/home/andrew/.alfred/kalle/data/instructor_state.json"
 
 # ---------------------------------------------------------------------------
-# Talker — KAL-LE's Telegram bot, Opus default, longer session gap
+# Talker — KAL-LE's chat engine (web-only; Telegram retired 2026-08-18),
+# Opus default, longer session gap
 # ---------------------------------------------------------------------------
 telegram:
-  bot_token: "${TELEGRAM_KALLE_BOT_TOKEN}"
-  # Andrew's Telegram user_id (same as Salem's allowlist).
+  # RETIRED: keep empty — a non-empty value builds nothing and logs
+  # ``telegram_retired_bot_token_ignored`` at daemon start.
+  bot_token: ""
+  # NOT dead Telegram config: entry [0] is the transport SCHEDULER's
+  # operator id (reminders + drains). Emptying it stops the scheduler.
   allowed_users: []
   primary_users:
     - "person/Andrew Newton"

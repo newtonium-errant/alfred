@@ -424,13 +424,14 @@ class WebConfig:
     # (per the load() schema-tolerance contract's "default state paths must
     # be tool-scoped" rule). Overridable per-instance.
     state_path: str = "./data/web_auth_state.json"
-    # Web-only daemon mode (bit d). DEFAULT-OFF. When ``enabled`` AND
-    # ``web_only`` are both true, the talker daemon mounts the PWA web surface
-    # WITHOUT a Telegram bot — the Telegram prerequisites (bot_token /
-    # allowed_users / stt.api_key) become optional at the config gate. ``vault``
-    # + ``anthropic`` stay required (the agent needs both) and ``instance.name``
-    # still fails loud at talker-config load. Absent / false → today's behavior
-    # byte-for-byte (every Telegram prerequisite required).
+    # Web-only daemon mode (bit d). DEFAULT-OFF. Historically this relaxed
+    # the talker's Telegram prerequisites at the config gate; since the
+    # Telegram retirement (T4 C6, 2026-08-19) those prerequisites are
+    # retired OUTRIGHT — the daemon's gate requires only vault + anthropic
+    # regardless of this flag, and ``instance.name`` still fails loud at
+    # talker-config load. The flag remains meaningful where mode still
+    # matters: telegram/health SKIPs its Telegram probes under it (a
+    # web-only instance's empty bot_token is posture, not a fault).
     web_only: bool = False
 
 

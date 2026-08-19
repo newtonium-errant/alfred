@@ -535,50 +535,68 @@ async def test_F_unmovable_quarantine_not_recounted(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_notify_fires_when_enabled(tmp_path, monkeypatch):
+async def test_notify_enabled_logs_the_retired_skip(tmp_path):
+    """T4 C6: the delivery leg is deleted; an ENABLED knob must produce an
+    explicit per-tick skip (a dead knob may not be silent), and no
+    notified/notify_failed event can exist any more. This is the positive
+    control for the disabled test below — the gate demonstrably works in
+    the direction where it fires."""
     cfg = _config(tmp_path, notify_telegram=True)
     _drop(Path(cfg.spool_path), _record(id="msg-n"))
-    sent = []
-    monkeypatch.setattr(
-        router_mod, "_telegram_send",
-        lambda token, chat_id, text: sent.append((token, chat_id, text)),
-    )
     raw = {"telegram": {"bot_token": "DUMMY_TG_TOKEN", "allowed_users": [123]}}
-    await run_route_once(cfg, raw)
-    assert len(sent) == 1
-    assert "aftermath-lab" in sent[0][2]
-
-
-async def test_notify_silent_when_disabled(tmp_path, monkeypatch):
-    cfg = _config(tmp_path, notify_telegram=False)   # gate off
-    _drop(Path(cfg.spool_path), _record(id="msg-n"))
-    sent = []
-    monkeypatch.setattr(
-        router_mod, "_telegram_send",
-        lambda *a, **k: sent.append(a),
-    )
-    await run_route_once(cfg, {"telegram": {"bot_token": "t", "allowed_users": [1]}})
-    assert sent == []
-
-
-async def test_H_notify_failure_does_not_log_token(tmp_path, monkeypatch):
-    """QA-H: a notify failure logs error_type ONLY — never str(exc), which
-    on an httpx error can embed the /bot<token>/ URL."""
-    cfg = _config(tmp_path, notify_telegram=True)
-    _drop(Path(cfg.spool_path), _record(id="msg-n"))
-
-    def _boom(token, chat_id, text):
-        raise RuntimeError(f"connect to https://api.telegram.org/bot{token}/sendMessage failed")
-
-    monkeypatch.setattr(router_mod, "_telegram_send", _boom)
-    raw = {"telegram": {"bot_token": "SECRET_TG_TOKEN", "allowed_users": [123]}}
     with structlog.testing.capture_logs() as captured:
         await run_route_once(cfg, raw)
-    fails = _log_events(captured, "msgbus.route.notify_failed")
-    assert len(fails) == 1
-    assert "error" not in fails[0]                # str(exc) NOT logged
-    assert fails[0]["error_type"] == "RuntimeError"
-    assert "SECRET_TG_TOKEN" not in json.dumps(fails[0])
+    skips = _log_events(captured, "msgbus.route.notify_skipped")
+    assert len(skips) == 1
+    assert skips[0]["reason"] == "telegram_retired"
+    assert "aftermath-lab" in json.dumps(skips[0]["by_destination"])
+    assert _log_events(captured, "msgbus.route.notified") == []
+    assert _log_events(captured, "msgbus.route.notify_failed") == []
+
+
+async def test_notify_silent_when_disabled(tmp_path):
+    """Gate off → no notify events of ANY kind, skip included (paired with
+    the enabled test above as its positive control)."""
+    cfg = _config(tmp_path, notify_telegram=False)   # gate off
+    _drop(Path(cfg.spool_path), _record(id="msg-n"))
+    with structlog.testing.capture_logs() as captured:
+        await run_route_once(
+            cfg, {"telegram": {"bot_token": "t", "allowed_users": [1]}},
+        )
+    assert _log_events(captured, "msgbus.route.notify_skipped") == []
+    assert _log_events(captured, "msgbus.route.notified") == []
+
+
+async def test_H_notify_delivery_machinery_stays_deleted(tmp_path):
+    """T4 C6 omitted-behavior pin, successor to QA-H (which pinned that a
+    notify FAILURE never logged the /bot<token>/ URL — a failure mode that
+    died with the delivery code). AST sweep, referents not prose: the
+    router module must contain no api.telegram.org string constant and no
+    httpx attribute use. Its live-path positive control is the enabled-skip
+    test above — the module imports, routes, and emits; these assertions
+    are about what that RUNNING module no longer contains."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(router_mod))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if "api.telegram.org" in node.value:
+                offenders.append(f"line {node.lineno}: telegram URL constant")
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
+            if "httpx" in names:
+                offenders.append(f"line {node.lineno}: httpx import")
+    assert offenders == [], (
+        f"Telegram delivery machinery reappeared in msgbus.router: {offenders}"
+    )
+    # And the deleted sender must not come back under its old name.
+    assert not hasattr(router_mod, "_telegram_send")
 
 
 # ---------------------------------------------------------------------------

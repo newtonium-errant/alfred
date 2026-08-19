@@ -753,13 +753,13 @@ transport:
 # --- Login instance (Salem) — session mode ---
 # web:
 #   enabled: true
-#   # Web-only daemon mode (PWA-only instances, no Telegram bot). DEFAULT-OFF.
-#   # When true (AND enabled: true) the talker daemon mounts this web surface
-#   # WITHOUT a Telegram bot — telegram.bot_token / allowed_users AND
-#   # telegram.stt.api_key become OPTIONAL (a text-chat-only PWA has no STT).
-#   # vault + telegram.anthropic.api_key STAY required (the agent needs both),
-#   # and telegram.instance.name still fails loud. Leave unset for a normal
-#   # instance (every Telegram prerequisite required, byte-for-byte).
+#   # Web-only daemon mode. Historically this relaxed the Telegram
+#   # prerequisites at the daemon's config gate; since the Telegram
+#   # retirement (2026-08-19) those prerequisites are retired outright —
+#   # the gate requires only vault + telegram.anthropic.api_key on every
+#   # instance, and telegram.instance.name still fails loud. The flag still
+#   # steers health (Telegram probes SKIP under it) — every real instance
+#   # runs with it true.
 #   # web_only: false
 #   # Single-use magic-link nonce store (tool-scoped default shown).
 #   state_path: "./data/web_auth_state.json"
@@ -1020,10 +1020,18 @@ transport:
 #         enabled: true
 
 telegram:
-  # Telegram bot token from @BotFather
-  bot_token: "${TELEGRAM_BOT_TOKEN}"
-  # Whitelist of Telegram user IDs allowed to talk to this bot.
-  # Single-user wk1: your own Telegram user ID only.
+  # RETIRED (2026-08-18): the Telegram surface is gone — every BotFather
+  # token was revoked and the bot code was deleted (T4, 2026-08-19). Keep
+  # this empty; a non-empty value builds nothing and logs
+  # ``telegram_retired_bot_token_ignored`` at daemon start. (The section
+  # name ``telegram:`` survives as the talker's config home — instance
+  # identity, anthropic, session, tts, voice_train etc. all live here.)
+  bot_token: ""
+  # NOT dead Telegram config — do not remove when sweeping retired knobs.
+  # Historically the bot's user allowlist; entry [0] is the transport
+  # SCHEDULER's operator id (who reminders address and drains deliver to),
+  # and the pending-items / bugreport surfaces read it too. Emptying it
+  # stops the scheduler (``scheduler_no_user`` at startup).
   allowed_users: []
   # Which person/ records the talker treats as primary-user calibration
   # targets. Single-user wk1: just the vault owner.
@@ -1949,7 +1957,10 @@ scaffold:
 #   state:
 #     path: "/home/andrew/.alfred/kalle/data/message_bus_state.json"
 #   notify:
-#     telegram: true                       # optional operator ping on new inbound
+#     telegram: true                       # RETIRED knob (Telegram gone 2026-08-18):
+#                                          # still parses; when enabled each tick logs
+#                                          # notify_skipped reason=telegram_retired
+#                                          # instead of pushing. Disable to silence.
 #   projects:
 #     - name: alfred
 #       inbox_path: "/home/andrew/alfred/.msgbus/inbox"

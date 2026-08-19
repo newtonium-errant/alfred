@@ -136,32 +136,30 @@ def _reconcile_left_collapse_group(
 # --- Validation -----------------------------------------------------------
 
 
-def _missing_config_reasons(
-    config: TalkerConfig, *, web_only: bool = False
-) -> list[str]:
+def _missing_config_reasons(config: TalkerConfig) -> list[str]:
     """Return human-readable reasons why config is incomplete (or []).
 
-    Anything that would crash the daemon on first use counts — a missing
-    bot token leaves us unable to build the Application; an empty allowlist
-    means no one can talk to us; missing API keys make the first message
-    500 the user.
+    Anything that would crash the daemon on first use counts: missing API
+    keys make the first message 500 the user; no vault path means the agent
+    has nothing to ground in. ``instance.name`` still fails loud upstream at
+    ``load_from_unified``.
 
-    ``web_only`` (bit d): a PWA-only instance mounts the web surface with NO
-    Telegram bot. When set, the Telegram-specific prerequisites (``bot_token``
-    / ``allowed_users`` / ``stt.api_key``) are NOT required — but ``vault.path``
-    and ``anthropic.api_key`` (the agent needs both) stay required, and
-    ``instance.name`` still fails loud upstream at ``load_from_unified``.
-    Default ``False`` → today's five checks byte-for-byte (order preserved).
+    Telegram retirement (T4 C6, 2026-08-19): the three PTB-era requirements
+    this gate used to impose on non-web-only configs — ``bot_token`` /
+    ``allowed_users`` / ``stt.api_key`` — are RETIRED. Their referent (a
+    boot-blocking prerequisite for building + serving a Telegram bot) no
+    longer exists: there is no Application to build, and every real
+    instance already ran with these relaxed via ``web_only``. Behaviour
+    change is latent-only: a legacy config WITHOUT ``web.web_only`` now
+    boots instead of refusing — and gets the loud signals instead
+    (``telegram_retired_bot_token_ignored`` when a token is set;
+    ``scheduler_no_user`` when ``allowed_users`` is empty, since entry [0]
+    is still the transport scheduler's operator-id source; health's
+    ``_check_bot_token`` stays as-is and will surface the fossil shape).
     """
     reasons: list[str] = []
-    if not web_only and not config.bot_token:
-        reasons.append("telegram.bot_token is empty")
-    if not web_only and not config.allowed_users:
-        reasons.append("telegram.allowed_users is empty")
     if not config.anthropic.api_key:
         reasons.append("telegram.anthropic.api_key is empty")
-    if not web_only and not config.stt.api_key:
-        reasons.append("telegram.stt.api_key is empty")
     if not config.vault.path:
         reasons.append("vault.path is empty")
     return reasons
@@ -617,35 +615,15 @@ async def run(
         backup_count=_backup_count,
     )
 
-    # Web-only mode (bit d): a PWA-only instance may run the web surface with
-    # no Telegram bot. Opt-in + EXPLICIT — web.enabled AND web.web_only — so a
-    # standard instance (either flag absent) keeps every Telegram prerequisite
-    # required, byte-for-byte. Any web-config parse issue fails toward the
-    # strict default (web_only stays False → today's behavior).
-    web_only = False
-    try:
-        from alfred.web.config import load_from_unified as _load_web_cfg
-        _wc_probe = _load_web_cfg(raw)
-        web_only = bool(_wc_probe.enabled and _wc_probe.web_only)
-    except Exception:  # noqa: BLE001 — never let a web-config issue block boot
-        log.exception("talker.daemon.web_only_probe_failed")
-        web_only = False
-
-    reasons = _missing_config_reasons(config, web_only=web_only)
+    # Telegram retirement (T4 C6): the config gate no longer branches on
+    # web-only mode — the PTB-era prerequisites it used to relax are retired
+    # outright (see _missing_config_reasons). The ``web.web_only`` flag
+    # itself remains meaningful elsewhere (health SKIPs its Telegram probes
+    # under it), but the daemon no longer needs to probe it at boot.
+    reasons = _missing_config_reasons(config)
     if reasons:
         log.error("talker.daemon.missing_config", reasons=reasons)
         return _MISSING_CONFIG_EXIT
-
-    if web_only and not config.bot_token:
-        # Intentionally-left-blank: an explicit "running without Telegram"
-        # signal so a bot-less daemon is distinguishable from a broken one.
-        log.info(
-            "talker.daemon.web_only_mode",
-            detail=(
-                "web.web_only=true and no bot_token — Telegram bot disabled; "
-                "serving the web surface + transport only"
-            ),
-        )
 
     log.info("talker.daemon.starting", model=config.anthropic.model)
 
