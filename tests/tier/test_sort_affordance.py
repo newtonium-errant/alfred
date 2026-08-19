@@ -699,3 +699,70 @@ def test_the_web_sort_map_matches_the_backend_ceiling() -> None:
     # silently matched an empty block cannot make the comparison vacuous.
     assert len(web_map) == 3, web_map
     assert {v: k for k, v in SORT_ACTION_BY_SLOT.items()} == web_map
+
+
+# ---------------------------------------------------------------------------
+# 6. The SECOND operator surface — the morning brief moves too
+# ---------------------------------------------------------------------------
+
+
+def test_the_brief_stops_saying_not_sorted_for_a_dated_task(tmp_path: Path) -> None:
+    """The board is not the only surface reading this projection.
+
+    ``brief/tier_section`` renders the SAME ``compute_today_view``, groups by the
+    same slot axis, and prints ``— due <date>`` off ``due_iso``. So hydration
+    changes the MORNING BRIEF's text as well, and that is an operator-visible
+    change that deserves a pin rather than a discovery.
+
+    MEASURED before it was written (probe: render the section with hydration
+    live, then with it monkeypatched out, and diff):
+
+        - ### Duty
+        - *(nothing in Duty today)*
+        - ### Not sorted yet
+        - - [T2] [[task/Call Carfax]]
+        + ### Duty
+        + - [T2] [[task/Call Carfax]] — due Fri Aug 21
+
+    Both halves are asserted, because the interesting claim is not just that the
+    item reached Duty — it is that the brief STOPPED printing a "Not sorted yet"
+    heading for an item whose record answered the question all along. That
+    heading in the operator's morning read is the same sentence his screenshot
+    was complaining about, on a different surface.
+    """
+    from alfred.brief.tier_section import render_tier_section
+
+    vault = _vault(tmp_path)
+    _task(vault, "Call Carfax", f"due: {FRIDAY}\n")
+    _curate_t2_tasks(vault, "Call Carfax")
+
+    rendered = render_tier_section(vault, NOW, None)
+
+    assert "### Duty" in rendered
+    assert "[[task/Call Carfax]]" in rendered
+    # The item is under Duty, not under the residue heading.
+    duty_block = rendered.split("### Duty", 1)[1].split("###", 1)[0]
+    assert "Call Carfax" in duty_block
+    assert "Not sorted yet" not in rendered
+
+
+def test_the_brief_still_says_not_sorted_when_nothing_answers(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the test above, and the honesty half.
+
+    An undated task with no slot signal must STILL reach the "Not sorted yet"
+    heading. Without this, the assertion above would pass identically against a
+    build that had simply deleted the residue section from the brief — which
+    would hide the problem instead of solving it, and would be a strictly worse
+    outcome than the one the operator reported.
+    """
+    from alfred.brief.tier_section import render_tier_section
+
+    vault = _vault(tmp_path)
+    _task(vault, "Someday thing", "")
+    _curate_t2_tasks(vault, "Someday thing")
+
+    rendered = render_tier_section(vault, NOW, None)
+
+    assert "Not sorted yet" in rendered
+    residue_block = rendered.split("Not sorted yet", 1)[1]
+    assert "Someday thing" in residue_block

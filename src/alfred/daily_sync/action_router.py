@@ -500,9 +500,12 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
         #      and the others the alternatives — the priority stack the taxonomy
         #      explicitly is not. There is no honest two-way reading of a
         #      three-way co-equal choice.
-        #   2. `slot_suggestion` already ships seven of its eight verbs
-        #      gesture-free for exactly this reason (they belong to the board
-        #      and the hold menu, not to a swipe). These are the same case.
+        #   2. `slot_suggestion` already ships EVERY verb but `accept`
+        #      gesture-free (they belong to the board and the hold menu, not to
+        #      a swipe). These are the same case, for a different reason.
+        #      Deliberately not stated as a count: the first draft of this line
+        #      said "seven of its eight", which the three verbs directly below
+        #      it made false in the same commit.
         #
         # LIGHT, not heavy: a sort is reversible by re-sorting, writes one
         # frontmatter field, and destroys nothing — an arm stage would spend a
