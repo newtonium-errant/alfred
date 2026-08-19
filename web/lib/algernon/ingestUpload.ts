@@ -159,6 +159,73 @@ export function csvUploadNote(filename: string, rows: number): string {
   return `${filename} — ${rows.toLocaleString()} rows (newline count, header included), fenced in the body`;
 }
 
+/**
+ * What the form says when a PDF is picked while hand-typed notes are in the body.
+ *
+ * THE ONE CASE KEEP-BOTH CANNOT SERVE. Everywhere else the guard merges, because
+ * both halves are text and both can be written. A PDF is not text here: the
+ * browser never reads it, the bytes are relayed, and `handleSubmit` sends
+ * `body_b64` and drops `body` entirely — so a staged PDF and a typed body are
+ * genuinely exclusive, and there is no third state where both survive.
+ *
+ * REFUSING ENFORCES THAT EXCLUSIVITY; IT DOES NOT REVERSE IT. The form's own
+ * comment has always said only one of them can be what gets written, and that
+ * is still true — what changed is WHO decides which. The old code decided by
+ * clearing the body, so the operator's most deliberate action lost to a file
+ * pick and he was never asked. The rule was one-of-them-gets-written; it was
+ * never text-dies-silently. So: say what the collision is, name the remedy, and
+ * leave the form exactly as it was for him to resolve.
+ *
+ * Do not "restore" the wholesale clear on the strength of that older comment.
+ * They agree — this is the same rule, enforced in the direction that keeps his
+ * work.
+ */
+export function pdfWouldClearTypedBodyMessage(filename: string): string {
+  return `${filename} was not attached — a PDF replaces the body entirely, and you have notes typed there. Submit or clear those notes first, then attach it.`;
+}
+
+/**
+ * THE CLOBBER GUARD — what separates text the operator TYPED from the file they
+ * then attached, when both end up in one body.
+ *
+ * WHY THERE IS ANYTHING TO SEPARATE. The upload path used to do `setBody(...)`
+ * WHOLESALE, so notes typed before attaching a file were silently replaced. The
+ * operator hit this on 2026-08-18: he described what he wanted done with a CSV,
+ * attached it, and the description never left the browser — the stored record
+ * was the CSV alone. The form already guarded the MIRROR case (a text upload
+ * un-stages a staged PDF) with a comment naming the exact principle — "the
+ * operator's most recent, most deliberate action silently losing to the earlier
+ * one" — and this direction was simply never covered.
+ *
+ * A HORIZONTAL RULE, not a labelled banner. The merged body is written verbatim
+ * into a vault record, so anything added here is content the operator did not
+ * write and will read forever afterwards. A rule is the smallest mark that
+ * survives markdown rendering as a real division; a sentence explaining what the
+ * form did belongs in the FORM, where it is read once and then gone, and that is
+ * where it is (the upload note). Not at the top of the body: a leading `---`
+ * would sit exactly where a YAML frontmatter fence goes.
+ */
+export const UPLOAD_MERGE_SEPARATOR = '\n\n---\n\n';
+
+/**
+ * Typed text first, then the file — because the typed text is almost always an
+ * INSTRUCTION ABOUT the file ("summarise the Q3 column", "this is the budget
+ * one"), which reads as a preamble and, at the top, is not buried under a
+ * thousand-row CSV.
+ */
+export function mergeTypedWithUpload(typed: string, uploaded: string): string {
+  return `${typed.trimEnd()}${UPLOAD_MERGE_SEPARATOR}${uploaded}`;
+}
+
+/**
+ * What the form says when it kept both. The operator must be told, or a body
+ * that quietly grew is its own small mystery — and this is the sentence that
+ * lets them delete one half on purpose rather than wonder.
+ */
+export function mergedUploadNote(filename: string): string {
+  return `${filename} was added BELOW the notes you had already typed — both are in the body. Delete either half if you meant to replace it.`;
+}
+
 export function emptyUploadMessage(filename: string): string {
   return `${filename} is empty — there is nothing to ingest. Pick a different file, or compose the body here.`;
 }

@@ -12,6 +12,9 @@ import { MAX_INGEST_CHARS } from '../../lib/algernon/schemas';
 import {
   INGEST_UPLOAD_ACCEPT,
   isPdfFilename,
+  mergeTypedWithUpload,
+  mergedUploadNote,
+  pdfWouldClearTypedBodyMessage,
   prepareUpload,
   preparePdfUpload,
   readFailedMessage,
@@ -78,6 +81,25 @@ export function IngestForm({
   const [pdfUpload, setPdfUpload] = useState<
     { b64: string; filename: string; bytes: number } | null
   >(null);
+  // Does the body hold EXACTLY what a text upload put there, untouched since?
+  //
+  // This is the whole clobber guard: an upload replacing an earlier UPLOAD is
+  // the ratified behaviour and must stay, while an upload replacing text the
+  // operator TYPED is the bug. The two are indistinguishable from `body` alone.
+  //
+  // IT IS NOT PARALLEL STATE — that was the first design and it was wrong for a
+  // reason worth recording. `uploadNote` looks like it already answers this, and
+  // it does not: `prepareUpload` returns a note ONLY for a CSV ("a .md/.txt body
+  // is verbatim and needs no annotation"), so after a .md upload the note is
+  // null and an upload-loaded body is indistinguishable from a typed one. A
+  // guard derived from it would have fired on md-upload-then-upload, breaking
+  // the ratified case for the commonest file type.
+  //
+  // So this rides the invalidation that ALREADY exists rather than adding a
+  // second lifecycle: every site that clears `uploadNote` — `onBodyEdited`,
+  // `appendTranscript`, `startAnother` — is precisely the event "the body is now
+  // hand-touched", and each one clears this too. One event, two consequences.
+  const [bodyIsUploadedText, setBodyIsUploadedText] = useState(false);
 
   // Default the picker to the first configured target once targets load.
   useEffect(() => {
@@ -135,12 +157,33 @@ export function IngestForm({
             setUploadError(prepared.message);
             return;
           }
+          // THE PDF ARM OF THE CLOBBER GUARD — a REFUSAL, because this is the
+          // one case keep-both cannot serve: the browser never reads a PDF, so
+          // there is no text to merge, and `handleSubmit` sends `body_b64` and
+          // drops `body` entirely.
+          //
+          // Placed AFTER `preparePdfUpload` deliberately. A scanned or oversize
+          // PDF is refused on its own terms first, so the operator is never told
+          // to clear his notes only to clear them and then hit "this PDF is too
+          // big" — two round trips for one pick.
+          //
+          // Nothing else is touched, and that is the message: the form is
+          // exactly as he left it. (The `setUploadNote(null)` every other
+          // refusal path carries would be a no-op here — a hand-typed body means
+          // `onBodyEdited` already cleared it.)
+          if (body.trim() !== '' && !bodyIsUploadedText) {
+            setUploadError(pdfWouldClearTypedBodyMessage(name));
+            return;
+          }
           setUploadError(null);
           setUploadNote(prepared.note);
-          // Staging a PDF clears any typed body: only one of them can be what
-          // gets written, and leaving stale text on screen beside a staged file
-          // is the ambiguity this pairing exists to avoid.
+          // Staging a PDF clears the body: only one of them can be what gets
+          // written, and leaving stale text on screen beside a staged file is
+          // the ambiguity this pairing exists to avoid. Reachable only when the
+          // body is empty or holds text a previous UPLOAD put there — the guard
+          // above is what keeps hand-typed notes out of this line.
           setBody('');
+          setBodyIsUploadedText(false);
           setPdfUpload({ b64: prepared.bodyB64, filename: name, bytes: prepared.bytes });
           if (!title.trim()) setTitle(stripExt(name));
           if (!source.trim()) setSource(name);
@@ -166,8 +209,46 @@ export function IngestForm({
           return;
         }
         setUploadError(null);
-        setUploadNote(prepared.note);
-        setBody(prepared.body);
+        // THE CLOBBER GUARD. Hand-typed body + a file that loads = KEEP BOTH.
+        //
+        // This used to be `setBody(prepared.body)` wholesale, and it cost the
+        // operator a budget instruction on 2026-08-18: he typed what he wanted
+        // done with a CSV, attached it, and the description never left the
+        // browser. The mirror case ten lines below has been guarded since it was
+        // written, with a comment naming the principle exactly — "the operator's
+        // most recent, most deliberate action silently losing to the earlier
+        // one". This direction is the same sentence read the other way.
+        //
+        // KEEP-BOTH RATHER THAN A CONFIRM, for two reasons. This form has no
+        // modal anywhere — its whole grammar is notes and refusals in words —
+        // and a merge is RECOVERABLE where a confirm is not: the operator
+        // deletes the half they did not want, whereas a mis-tapped "replace"
+        // destroys the text a second time and this time on purpose.
+        //
+        // AN UPLOAD REPLACING AN UPLOAD STILL REPLACES. That is the ratified
+        // behaviour and it is what `bodyIsUploadedText` is for; only text the
+        // operator could have authored earns the merge.
+        const typedByHand = body.trim() !== '' && !bodyIsUploadedText;
+        if (typedByHand) {
+          setBody(mergeTypedWithUpload(body, prepared.body));
+          // The merged body now contains hand-typed text again, so the NEXT
+          // upload must merge too. Accepted deliberately: picking a wrong file
+          // and then the right one leaves both, which is visible and one delete
+          // away. Silent loss is neither, and it is the bug being fixed.
+          setBodyIsUploadedText(false);
+          // Both notes when a CSV was also reshaped — the merge and the fence
+          // are two different things done to the body, and reporting only one
+          // would leave the other as the operator's puzzle.
+          setUploadNote(
+            prepared.note
+              ? `${mergedUploadNote(name)} ${prepared.note}`
+              : mergedUploadNote(name),
+          );
+        } else {
+          setBody(prepared.body);
+          setBodyIsUploadedText(true);
+          setUploadNote(prepared.note);
+        }
         // A successful TEXT upload un-stages any PDF. The two paths share one
         // picker, so staging must not be sticky: without this, picking a .md
         // after a .pdf loaded the markdown into the body and still submitted
@@ -188,7 +269,7 @@ export function IngestForm({
       };
       reader.readAsText(file);
     },
-    [title, source],
+    [title, source, body, bodyIsUploadedText],
   );
 
   // Any hand-edit of the body invalidates both upload messages. A refusal must
@@ -199,6 +280,8 @@ export function IngestForm({
     setBody(next);
     setUploadNote(null);
     setUploadError(null);
+    // The body is hand-touched now, so the next upload must not replace it.
+    setBodyIsUploadedText(false);
     // Typing a body un-stages a PDF. Without this the operator could type over
     // a staged file and submit — with the typed text silently discarded in
     // favour of the PDF, which is the worst possible resolution of the two.
@@ -212,6 +295,8 @@ export function IngestForm({
     setBody((prev) => (prev.trim() ? `${prev}\n\n${t}` : t));
     setUploadNote(null);
     setUploadError(null);
+    // The body is hand-touched now, so the next upload must not replace it.
+    setBodyIsUploadedText(false);
     setPdfUpload(null);
   }, []);
 
@@ -249,6 +334,7 @@ export function IngestForm({
     setBody('');
     setSource('');
     setUploadNote(null);
+    setBodyIsUploadedText(false);
     setUploadError(null);
     setPdfUpload(null);
     reset();
