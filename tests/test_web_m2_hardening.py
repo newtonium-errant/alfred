@@ -4,8 +4,11 @@ Three merge-inert / default-safe bits:
   * (b) /auth/login rate-limit — ``_LoginRateLimiter`` sliding-window.
   * (c) magic-link deep-link — ``safe_next_path`` + ``_build_magic_link``
         (the load-bearing open-redirect allowlist).
-  * (d) web-only daemon mode — ``_missing_config_reasons(web_only=...)`` +
+  * (d) the daemon config gate — ``_missing_config_reasons`` +
         ``web.web_only`` config load + preserved instance.name fail-loud.
+        (T4 C6, 2026-08-19: the gate's ``web_only`` parameter is GONE —
+        the PTB-era prerequisites it relaxed are retired outright, so the
+        relaxed shape is now the only shape.)
 
 Integration coverage (real transport app / handler wiring) for (b) + (c)
 lives alongside the existing suite in ``tests/test_web_routes_auth.py``.
@@ -260,44 +263,52 @@ def _talker(
     )
 
 
-def test_missing_config_flag_unset_is_byte_for_byte() -> None:
-    # Default (flag UNSET) → today's five reasons, EXACT text + order.
+def test_missing_config_all_empty_is_exactly_the_two_agent_reasons() -> None:
+    # T4 C6: the PTB-era reasons (bot_token / allowed_users / stt.api_key)
+    # are RETIRED — an all-empty config trips ONLY the agent prerequisites,
+    # EXACT text + order. This is the lockstep rewrite of the old
+    # byte-for-byte five-reason pin.
     reasons = _missing_config_reasons(_talker())
     assert reasons == [
-        "telegram.bot_token is empty",
-        "telegram.allowed_users is empty",
         "telegram.anthropic.api_key is empty",
-        "telegram.stt.api_key is empty",
         "vault.path is empty",
     ]
 
 
-def test_missing_config_web_only_relaxes_telegram_prereqs() -> None:
-    # web_only + agent prereqs present, Telegram bits empty → nothing blocks.
-    cfg = _talker(anthropic_key="k", vault_path="/v")
-    assert _missing_config_reasons(cfg, web_only=True) == []
-
-
-def test_missing_config_web_only_still_requires_anthropic() -> None:
+def test_missing_config_still_requires_anthropic() -> None:
     cfg = _talker(vault_path="/v")  # anthropic empty
-    assert _missing_config_reasons(cfg, web_only=True) == [
+    assert _missing_config_reasons(cfg) == [
         "telegram.anthropic.api_key is empty"
     ]
 
 
-def test_missing_config_web_only_still_requires_vault() -> None:
+def test_missing_config_still_requires_vault() -> None:
     cfg = _talker(anthropic_key="k")  # vault empty
-    assert _missing_config_reasons(cfg, web_only=True) == ["vault.path is empty"]
+    assert _missing_config_reasons(cfg) == ["vault.path is empty"]
 
 
-def test_missing_config_web_only_bot_and_stt_optional() -> None:
-    # The exact PIN shape: web-only + no bot_token + no stt.api_key + no
-    # allowed_users, but agent prereqs present → daemon does NOT early-exit.
+def test_missing_config_ptb_era_prereqs_retired() -> None:
+    # The exact PIN shape: no bot_token + no stt.api_key + no allowed_users,
+    # agent prereqs present → daemon does NOT early-exit. Positive control:
+    # the same call with the agent prereqs ALSO empty does refuse (proving
+    # the gate is alive, not that validation stopped running).
     cfg = _talker(anthropic_key="k", vault_path="/v")
     assert cfg.bot_token == ""
     assert cfg.stt.api_key == ""
     assert cfg.allowed_users == []
-    assert _missing_config_reasons(cfg, web_only=True) == []
+    assert _missing_config_reasons(cfg) == []
+    assert _missing_config_reasons(_talker()) != []
+
+
+def test_missing_config_gate_has_no_web_only_parameter() -> None:
+    # Omitted-parameter pin: the relaxation is unconditional now; a
+    # resurrected ``web_only=`` kwarg would mean the per-mode gate grew
+    # back without its referent.
+    import inspect
+
+    assert "web_only" not in inspect.signature(
+        _missing_config_reasons
+    ).parameters
 
 
 # ---- web.web_only config load --------------------------------------------

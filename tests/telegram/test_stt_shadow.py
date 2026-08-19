@@ -66,24 +66,6 @@ class _FakeEngine:
         return self._result
 
 
-class _GatedEngine:
-    """An engine whose transcribe blocks on an asyncio.Event until the test
-    releases it — lets a test hold a capture task in-flight to assert it is
-    strong-referenced (GC-protected) before completion."""
-
-    def __init__(self, backend_id: str, text: str, gate: "asyncio.Event") -> None:
-        self.backend_id = backend_id
-        self.timeout_s = 10.0
-        self._text = text
-        self._gate = gate
-        self.calls = 0
-
-    async def transcribe(self, audio, mime, vocab):
-        self.calls += 1
-        await self._gate.wait()
-        return _res(self._text, self.backend_id)
-
-
 def _res(text: str, backend_id: str, *, latency_ms: int = 100) -> SttResult:
     return SttResult(
         text=text, backend_id=backend_id, tier="comparable",
@@ -280,100 +262,6 @@ async def test_capture_top_level_failure_swallowed_and_logged(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _reset_counter():
-    heartbeat.reset()
-    yield
-    heartbeat.reset()
-
-
-class _FakeVoiceFile:
-    async def download_as_bytearray(self) -> bytearray:
-        return bytearray(b"FAKE-OGG-BYTES")
-
-
-class _FakeVoice:
-    def __init__(self, duration: int = 3) -> None:
-        self.duration = duration
-
-    async def get_file(self) -> _FakeVoiceFile:
-        return _FakeVoiceFile()
-
-
-def _build_update_and_ctx(talker_config, *, user_id: int = 1):
-    reply = AsyncMock()
-    update = type("U", (), {})()
-    update.message = type("M", (), {})()
-    update.message.voice = _FakeVoice()
-    update.message.reply_text = reply
-    update.effective_chat = type("C", (), {"id": 1})()
-    update.effective_user = type("EU", (), {"id": user_id})()
-
-    ctx = type("Ctx", (), {})()
-    ctx.application = type("App", (), {"bot_data": {
-        "config": talker_config,
-        "state_mgr": None,
-        "anthropic_client": None,
-        "system_prompt": "",
-        "vault_context_str": "",
-        "chat_locks": {},
-    }})()
-    ctx.bot = type("B", (), {})()
-    return update, ctx, reply
-
-
-def _patch_router(monkeypatch, return_value):
-    from alfred.telegram import bot
-
-    async def _fake_router(*args: Any, **kwargs: Any):
-        return return_value
-
-    monkeypatch.setattr(bot.stt_backends, "build_chain", lambda cfg: [])
-    monkeypatch.setattr(
-        bot.stt_backends, "transcribe_with_fallback", _fake_router,
-    )
-
-
-async def test_on_voice_shadow_exception_does_not_break_served_turn(
-    talker_config, monkeypatch,
-):
-    """THE load-bearing isolation pin: even when shadow-capture raises, the
-    served Groq transcript still reaches handle_message and the user gets no
-    error — the capture is fire-and-forget + fully isolated."""
-    from alfred.telegram import bot
-
-    captured: dict[str, Any] = {}
-
-    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
-        captured["kwargs"] = kwargs
-
-    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
-    _patch_router(monkeypatch, SttResult(
-        text="walk the dog", backend_id="groq-whisper", tier="comparable",
-    ))
-
-    async def _boom(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("shadow disk on fire")
-
-    monkeypatch.setattr(bot.stt_shadow, "capture", _boom)
-
-    update, ctx, reply = _build_update_and_ctx(talker_config)
-    with structlog.testing.capture_logs() as cap:
-        await bot.on_voice(update, ctx)
-        # Drain the fire-and-forget task + its done-callback.
-        for _ in range(5):
-            await asyncio.sleep(0)
-
-    # The served turn proceeded normally despite the shadow blowing up.
-    assert captured.get("kwargs", {}).get("text") == "walk the dog"
-    assert captured["kwargs"]["voice"] is True
-    reply.assert_not_called()
-    # The done-callback surfaced the orphaned task's exception.
-    errs = [c for c in cap if c.get("event") == "stt.shadow_capture_task_error"]
-    assert len(errs) == 1
-    assert errs[0]["error_type"] == "RuntimeError"
-
-
 # ---------------------------------------------------------------------------
 # 5. disabled → no-op (no files, build_chain not called); on_voice back-compat
 # ---------------------------------------------------------------------------
@@ -401,101 +289,10 @@ async def test_capture_disabled_is_noop(tmp_path, monkeypatch):
     assert not [c for c in cap if c.get("event", "").startswith("stt.shadow")]
 
 
-async def test_on_voice_disabled_shadow_back_compat(talker_config, monkeypatch):
-    """With shadow-capture absent/disabled (the talker_config default), the
-    served turn behaves EXACTLY as today and nothing is written."""
-    from alfred.telegram import bot
-
-    assert talker_config.stt.shadow_capture.enabled is False  # fixture default
-
-    captured: dict[str, Any] = {}
-
-    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
-        captured["kwargs"] = kwargs
-
-    # Spy the real capture path: it should be invoked but be a no-op.
-    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
-    _patch_router(monkeypatch, SttResult(
-        text="hello there", backend_id="groq-whisper", tier="comparable",
-    ))
-
-    update, ctx, reply = _build_update_and_ctx(talker_config)
-    await bot.on_voice(update, ctx)
-    for _ in range(5):
-        await asyncio.sleep(0)
-
-    assert captured["kwargs"]["text"] == "hello there"
-    assert captured["kwargs"]["voice"] is True
-    reply.assert_not_called()
-    # Default dir is relative to cwd; disabled capture never touches it.
-    assert not (Path(talker_config.stt.shadow_capture.dir) / "corpus.jsonl").exists()
-
-
 # ---------------------------------------------------------------------------
 # 5b. KEEP-ALIVE (reviewer WARN fix): the reprompt-path capture must NOT be
 #     GC-dropped — the task is strong-ref'd while in-flight and completes.
 # ---------------------------------------------------------------------------
-
-
-async def test_reprompt_path_capture_not_gc_dropped(
-    talker_config, monkeypatch, tmp_path,
-):
-    """The exposed path (reviewer WARN): on the REPROMPT branch (NoTranscript /
-    served-empty) on_voice replies + RETURNS while the shadow Deepgram call is
-    still in flight. Without a strong ref the loop's weak ref could GC the
-    task and silently drop the most valuable (failure/silence) divergence
-    clips. Pin: the in-flight task is held in ``_SHADOW_TASKS`` until done, and
-    the reprompt-path capture COMPLETES (corpus line written, ref discarded)."""
-    from alfred.telegram import bot
-
-    talker_config.stt.shadow_capture = SttShadowCaptureConfig(
-        enabled=True, dir=str(tmp_path / "corpus"),
-    )
-
-    # Reprompt path: router returns NoTranscript → on_voice replies + returns.
-    _patch_router(monkeypatch, NoTranscript(reason="all_failed"))
-
-    handle_called = {"n": 0}
-
-    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
-        handle_called["n"] += 1
-
-    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
-
-    # Both engines block on the gate so the capture task stays in-flight after
-    # on_voice returns — capture runs BOTH fresh (served_result=None).
-    gate = asyncio.Event()
-    groq = _GatedEngine("groq-whisper", "groq heard this", gate)
-    dg = _GatedEngine("deepgram", "deepgram heard this", gate)
-    monkeypatch.setattr(stt_shadow, "build_chain", lambda cfg: [groq, dg])
-
-    bot._SHADOW_TASKS.clear()  # isolate the module-level keep-alive set
-
-    update, ctx, reply = _build_update_and_ctx(talker_config)
-    await bot.on_voice(update, ctx)
-
-    # Reprompt fired and on_voice returned; the capture is still gated and
-    # MUST be strong-referenced (the GC-protection property).
-    assert handle_called["n"] == 0
-    reply.assert_called_once()
-    assert len(bot._SHADOW_TASKS) == 1, "in-flight capture must be strong-ref'd"
-
-    # Release the engines; let the capture finish.
-    gate.set()
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if not bot._SHADOW_TASKS:
-            break
-
-    # Completed → ref discarded AND the reprompt-path capture was NOT dropped.
-    assert bot._SHADOW_TASKS == set(), "completed task must be discarded"
-    jsonl = tmp_path / "corpus" / "corpus.jsonl"
-    assert jsonl.exists(), "reprompt-path capture must still write its line"
-    rows = [json.loads(line) for line in jsonl.read_text().splitlines() if line.strip()]
-    assert len(rows) == 1
-    assert rows[0]["groq"]["text"] == "groq heard this"
-    assert rows[0]["deepgram"]["text"] == "deepgram heard this"
-    assert groq.calls == 1 and dg.calls == 1  # both ran fresh (NoTranscript)
 
 
 # ---------------------------------------------------------------------------

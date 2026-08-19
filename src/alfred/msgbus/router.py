@@ -668,55 +668,43 @@ def registry_names(config: MessageBusConfig) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Operator notification (optional, best-effort) — Telegram push
+# Operator notification (retired delivery) — the knob survives, the push
+# does not
 # ---------------------------------------------------------------------------
 
 
-def _telegram_send(token: str, chat_id: str, text: str) -> None:
-    """Best-effort Telegram sendMessage (module-level so tests mock it).
-
-    Synchronous httpx POST with a short timeout; the caller swallows
-    failures (a notify failure never kills the routing tick)."""
-    import httpx
-
-    httpx.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": text},
-        timeout=10.0,
-    )
-
-
 def _notify_operator(by_destination: dict[str, int], raw: dict[str, Any]) -> None:
-    """Push a "project X has N inbound message(s)" ping to the operator.
+    """Log that a notify WOULD have fired — the Telegram push is retired.
 
-    Gated behind ``message_bus.notify.telegram`` by the caller. Best-effort:
-    a missing token / chat id or any send error logs + is swallowed."""
-    tel = raw.get("telegram") or {}
-    token = str(tel.get("bot_token", "") or "")
-    allowed = tel.get("allowed_users") or []
-    chat_id = str(allowed[0]) if isinstance(allowed, list) and allowed else ""
-    if not token or "${" in token or not chat_id:
-        log.info(
-            "msgbus.route.notify_skipped",
-            reason="no_bot_token_or_chat_id",
-            by_destination=by_destination,
-        )
-        return
-    lines = [
-        f"{proj}: {n} inbound message(s)"
-        for proj, n in sorted(by_destination.items())
-    ]
-    text = "📬 Inter-project bus routed:\n" + "\n".join(lines)
-    try:
-        _telegram_send(token, chat_id, text)
-        log.info("msgbus.route.notified", by_destination=by_destination)
-    except Exception as exc:  # noqa: BLE001 — never kills the tick
-        # Log error_type ONLY — str(exc) on an httpx error can embed the
-        # request URL, which carries the bot token (/bot<token>/sendMessage).
-        log.warning(
-            "msgbus.route.notify_failed",
-            error_type=exc.__class__.__name__,
-        )
+    Historically this pushed a "project X has N inbound message(s)" ping via
+    a raw HTTP POST to the Telegram Bot API (``_telegram_send``, deleted in
+    T4 C6, 2026-08-19; the endpoint URL is deliberately not spelled here —
+    the deletion pin sweeps this module's AST constants, docstrings
+    included). That leg was the last Telegram-delivery code path in the
+    repo — it survived the C3/C4 cut because it never imported PTB, and
+    it was already double-dead in the field: every instance config carries
+    ``bot_token: ""`` (the leg skipped), and the BotFather tokens are
+    revoked (the API would refuse). Deleting it makes CLAUDE.md's "no code
+    path can deliver a Telegram message" true by construction repo-wide.
+
+    The ``message_bus.notify.telegram`` knob still PARSES (schema tolerance
+    — existing configs carry it) and still gates the call to this function,
+    so an operator who has it enabled gets an explicit per-tick skip line
+    (``feedback_intentionally_left_blank``: a dead knob must be loud, not
+    silent) rather than a notification that quietly never arrives. Unused
+    ``raw`` is kept for signature stability at the call site.
+    """
+    del raw  # historically carried telegram.bot_token — nothing to read now
+    log.info(
+        "msgbus.route.notify_skipped",
+        reason="telegram_retired",
+        detail=(
+            "message_bus.notify.telegram is enabled but the Telegram "
+            "surface is retired (2026-08-18) — no ping was sent. Disable "
+            "the knob to silence this line."
+        ),
+        by_destination=by_destination,
+    )
 
 
 __all__ = [

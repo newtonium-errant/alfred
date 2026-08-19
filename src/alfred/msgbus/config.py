@@ -34,6 +34,11 @@ class MessageBusConfig:
     interval_minutes: int = 5
     spool_path: str = DEFAULT_SPOOL_PATH
     state_path: str = DEFAULT_MESSAGE_BUS_STATE_PATH
+    # RETIRED KNOB (Telegram retirement, T4 C6 2026-08-19): still parsed —
+    # existing configs carry it — but the delivery leg is deleted; when
+    # enabled, each routing tick with placed messages logs an explicit
+    # ``msgbus.route.notify_skipped reason=telegram_retired`` instead of
+    # pushing. See router._notify_operator.
     notify_telegram: bool = False
     projects: list[ProjectEntry] = field(default_factory=list)
 

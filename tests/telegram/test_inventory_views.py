@@ -28,13 +28,12 @@ Coverage:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import frontmatter
 import pytest
 import structlog
 
-from alfred.telegram import bot, inventory_views
+from alfred.telegram import inventory_views
 from alfred.telegram.inventory_views import (
     _UNCATEGORIZED_GROUP_KEY,
     _normalize_moc_key,
@@ -489,180 +488,9 @@ def test_end_to_end_five_questions_two_mocs_plus_uncat(
 # ---------------------------------------------------------------------------
 
 
-def _make_update_mock(chat_id: int = 42, user_id: int = 42) -> MagicMock:
-    update = MagicMock()
-    update.message = MagicMock()
-    update.message.reply_text = AsyncMock()
-    update.effective_chat = MagicMock()
-    update.effective_chat.id = chat_id
-    update.effective_user = MagicMock()
-    update.effective_user.id = user_id
-    return update
-
-
-def _make_ctx_mock(
-    vault_path: Path,
-    *,
-    allowed_user_id: int = 42,
-    inventory_views_enabled: bool = True,
-    per_group_cap: int = 20,
-) -> MagicMock:
-    """Build a minimal ctx mock for inventory-view handler smoke tests."""
-    config = MagicMock()
-    config.allowed_users = [allowed_user_id]
-    config.vault = MagicMock()
-    config.vault.path = str(vault_path)
-    if inventory_views_enabled:
-        config.inventory_views = MagicMock()
-        config.inventory_views.per_group_cap = per_group_cap
-    else:
-        config.inventory_views = None
-    ctx = MagicMock()
-    ctx.application.bot_data = {bot._KEY_CONFIG: config}
-    return ctx
-
-
-@pytest.mark.asyncio
-async def test_handler_questions_smoke(hypatia_vault: Path) -> None:
-    """/questions handler renders some open questions."""
-    _seed_question(
-        hypatia_vault, "Q1", status="open",
-        mocs=["[[MOC/Stoicism]]"],
-    )
-
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(hypatia_vault)
-
-    await bot.on_questions(update, ctx)
-
-    update.message.reply_text.assert_called_once()
-    reply = update.message.reply_text.call_args[0][0]
-    assert "📋 Open Questions (1 total)" in reply
-    assert "[[question/Q1]]" in reply
-
-
-@pytest.mark.asyncio
-async def test_handler_research_pointers_smoke(
-    hypatia_vault: Path,
-) -> None:
-    """/research-pointers handler renders some open pointers."""
-    _seed_research_pointer(
-        hypatia_vault, "RP1", status="open",
-        mocs=["[[MOC/Stoicism]]"],
-    )
-
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(hypatia_vault)
-
-    await bot.on_research_pointers(update, ctx)
-
-    update.message.reply_text.assert_called_once()
-    reply = update.message.reply_text.call_args[0][0]
-    assert "📋 Open Research Pointers (1 total)" in reply
-    assert "[[research-pointer/RP1]]" in reply
-
-
-@pytest.mark.asyncio
-async def test_handler_unauthorized_user_silent_drop(
-    hypatia_vault: Path,
-) -> None:
-    """Unknown user → no reply (matches existing handler convention)."""
-    update = _make_update_mock(user_id=999)
-    ctx = _make_ctx_mock(hypatia_vault, allowed_user_id=42)
-
-    await bot.on_questions(update, ctx)
-
-    update.message.reply_text.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handler_empty_state_message(hypatia_vault: Path) -> None:
-    """No qualifying records → empty-state message."""
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(hypatia_vault)
-
-    await bot.on_questions(update, ctx)
-
-    reply = update.message.reply_text.call_args[0][0]
-    assert "No open" in reply
-
-
-@pytest.mark.asyncio
-async def test_handler_failure_isolation(
-    hypatia_vault: Path, monkeypatch,
-) -> None:
-    """If collect_records raises, the handler emits an error reply
-    rather than crashing."""
-    def boom(*args, **kwargs):
-        raise RuntimeError("simulated vault read failure")
-
-    monkeypatch.setattr(
-        inventory_views, "collect_records", boom,
-    )
-
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(hypatia_vault)
-
-    await bot.on_questions(update, ctx)
-
-    reply = update.message.reply_text.call_args[0][0]
-    assert "❌ Could not load" in reply
-    assert "RuntimeError" in reply
-
-
 # ---------------------------------------------------------------------------
 # Log emission pins (per feedback_log_emission_test_pattern)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_log_inventory_view_done_on_success(
-    hypatia_vault: Path,
-) -> None:
-    _seed_question(hypatia_vault, "Q1", status="open")
-
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(hypatia_vault)
-
-    with structlog.testing.capture_logs() as captured:
-        await bot.on_questions(update, ctx)
-
-    matches = [
-        c for c in captured
-        if c.get("event") == "talker.bot.inventory_view_done"
-    ]
-    assert len(matches) == 1
-    assert matches[0]["command"] == "/questions"
-    assert matches[0]["record_type"] == "question"
-    assert matches[0]["record_count"] == 1
-    assert matches[0]["truncated"] is False
-
-
-@pytest.mark.asyncio
-async def test_log_inventory_view_failed(
-    hypatia_vault: Path, monkeypatch,
-) -> None:
-    def boom(*args, **kwargs):
-        raise RuntimeError("simulated failure")
-
-    monkeypatch.setattr(
-        inventory_views, "collect_records", boom,
-    )
-
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(hypatia_vault)
-
-    with structlog.testing.capture_logs() as captured:
-        await bot.on_questions(update, ctx)
-
-    matches = [
-        c for c in captured
-        if c.get("event") == "talker.bot.inventory_view_failed"
-    ]
-    assert len(matches) == 1
-    assert matches[0]["command"] == "/questions"
-    assert matches[0]["record_type"] == "question"
-    assert "simulated failure" in matches[0]["error"]
 
 
 # ---------------------------------------------------------------------------

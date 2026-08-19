@@ -36,12 +36,11 @@ command names, so the actual registrations are ``end_zettel`` /
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import frontmatter
 import pytest
 
-from alfred.telegram import bot, capture_batch, capture_extract, session
+from alfred.telegram import capture_batch, capture_extract, session
 from tests.telegram.conftest import (
     FakeAnthropicClient, FakeBlock, FakeResponse,
 )
@@ -89,72 +88,6 @@ def test_snapshot_extract_override_coerces_non_string() -> None:
 
 
 # --- _stamp_extract_target_override_on_active ----------------------------
-
-
-def _make_update_mock(chat_id: int = 42, user_id: int = 42) -> MagicMock:
-    """Build a Telegram-Update-shape mock with the minimum surface the
-    stamp helper consults: ``message.reply_text`` (awaitable),
-    ``effective_user.id`` (for _is_allowed), ``effective_chat.id``."""
-    update = MagicMock()
-    update.message = MagicMock()
-    update.message.reply_text = AsyncMock()
-    update.effective_chat = MagicMock()
-    update.effective_chat.id = chat_id
-    update.effective_user = MagicMock()
-    update.effective_user.id = user_id
-    return update
-
-
-def _make_ctx_mock(state_mgr, *, allowed_user_id: int = 42) -> MagicMock:
-    """Build a Telegram-context-shape mock with the bot_data the stamp
-    helper consults: config (allowed_users + primary_users), state_mgr."""
-    config = MagicMock()
-    config.allowed_users = [allowed_user_id]
-    config.primary_users = ["person/Andrew Newton"]
-    ctx = MagicMock()
-    ctx.application.bot_data = {
-        bot._KEY_CONFIG: config,
-        bot._KEY_STATE: state_mgr,
-    }
-    return ctx
-
-
-@pytest.mark.asyncio
-async def test_stamp_override_writes_to_active(state_mgr) -> None:
-    """The helper writes the override to the active dict + persists."""
-    # Seed an active session.
-    state_mgr.state.setdefault("active_sessions", {})["42"] = {
-        "session_id": "abc-uuid",
-        "chat_id": 42,
-        "started_at": "2026-05-16T10:00:00+00:00",
-        "transcript": [{"role": "user", "content": "hi"}],
-    }
-    state_mgr.save()
-
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(state_mgr)
-
-    applied = await bot._stamp_extract_target_override_on_active(
-        update, ctx, override="zettel",
-    )
-    assert applied is True
-
-    active = state_mgr.get_active(42)
-    assert active is not None
-    assert active["_extract_target_override"] == "zettel"
-
-
-@pytest.mark.asyncio
-async def test_stamp_override_no_active_session_replies(state_mgr) -> None:
-    """No active session → False return + 'no active session' reply."""
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(state_mgr)
-
-    applied = await bot._stamp_extract_target_override_on_active(
-        update, ctx, override="zettel",
-    )
-    assert applied is False
-    update.message.reply_text.assert_awaited_once_with("no active session.")
 
 
 # --- process_capture_session writes override to frontmatter --------------
@@ -509,23 +442,3 @@ async def test_end_to_end_end_note_override_drives_extract(
 # --- Slash-command handlers exist + are registered -----------------------
 
 
-def test_on_end_zettel_exists() -> None:
-    """Public-surface pin: the slash-command handlers exist as coroutines."""
-    assert callable(bot.on_end_zettel)
-    assert callable(bot.on_end_note)
-
-
-def test_end_zettel_end_note_registered_in_build_app() -> None:
-    """The CommandHandler registrations for /end_zettel and /end_note
-    are present in build_app.
-
-    Indirect check via source inspection — building a real app needs
-    a full TalkerConfig + token + so on, which is overkill for a
-    registration pin. Reading the bot.py source for the literal
-    ``CommandHandler("end_zettel"`` substring catches the
-    "registration accidentally removed" failure mode.
-    """
-    import inspect
-    src = inspect.getsource(bot)
-    assert 'CommandHandler("end_zettel", on_end_zettel)' in src
-    assert 'CommandHandler("end_note", on_end_note)' in src

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from alfred.telegram import bot, conversation, session_types
+from alfred.telegram import conversation
 from alfred.telegram.session import Session
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
@@ -169,50 +169,3 @@ async def test_run_turn_threads_pushback_level_into_system_blocks(
     assert system[-1]["text"].startswith("## Today")
 
 
-@pytest.mark.asyncio
-async def test_open_session_with_stash_records_pushback_level(
-    state_mgr, talker_config
-) -> None:
-    """``_open_session_with_stash`` persists ``_pushback_level`` on the active dict."""
-    bot._open_session_with_stash(
-        state_mgr,
-        chat_id=1,
-        config=talker_config,
-        session_type="journal",
-        pushback_level=4,
-    )
-    active = state_mgr.get_active(1)
-    assert active is not None
-    assert active["_pushback_level"] == 4
-
-
-@pytest.mark.asyncio
-async def test_routed_open_stashes_type_pushback_level(
-    state_mgr, talker_config
-) -> None:
-    """``_open_routed_session`` pulls pushback from the session-type default."""
-    from tests.telegram.conftest import FakeBlock, FakeResponse
-
-    client = FakeAnthropicClient([
-        FakeResponse(content=[FakeBlock(
-            type="text",
-            text=(
-                '{"session_type": "journal", "continues_from": null, '
-                '"reasoning": "reflective"}'
-            ),
-        )]),
-    ])
-
-    await bot._open_routed_session(
-        state_mgr,
-        talker_config,
-        client,
-        chat_id=7,
-        first_message="I want to think through something.",
-    )
-
-    active = state_mgr.get_active(7)
-    assert active is not None
-    # journal → level 4 per the defaults table.
-    assert active["_pushback_level"] == session_types.defaults_for("journal").pushback_level
-    assert active["_pushback_level"] == 4

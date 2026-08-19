@@ -5,17 +5,17 @@ Wires together:
     * :class:`StateManager` + the startup stale-session sweep
     * An ``anthropic.AsyncAnthropic`` client
     * SKILL.md system prompt + vault context snapshot
-    * The Telegram :class:`Application` (long-poll mode for wk1)
+    * The transport server + scheduler (the outbound-push surface)
     * A background task that ticks every 60s and closes any sessions that
       have exceeded ``session.gap_timeout_seconds``.
 
-PTB lifecycle note:
-    :meth:`Application.run_polling` assumes it owns the event loop (it sets
-    up SIGTERM handlers, closes the loop at exit). That collides with our
-    own signal handler + sweeper task, so we use the manual lifecycle:
-    ``initialize()`` → ``start()`` → ``updater.start_polling()`` → wait on a
-    shutdown event → ``updater.stop() / stop() / shutdown()``. Clean
-    integration, SIGTERM closes sessions, no orphaned polling task.
+Telegram retirement note (2026-08-18, code removal 2026-08-19):
+    This daemon historically also built and polled a python-telegram-bot
+    ``Application`` (``alfred.telegram.bot``, deleted). Every instance is
+    web-only — ``bot_token: ""`` + ``web.web_only: true`` — and the
+    BotFather tokens are revoked, so there is no Telegram surface to
+    build. The send leg raises ``TelegramUnavailable`` by construction
+    (see :mod:`alfred.telegram.send`).
 
 Returns a non-zero exit code (``_MISSING_CONFIG_EXIT``) when required
 config is missing — matches orchestrator convention so commit 5 can route
@@ -31,9 +31,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import anthropic
-from telegram import Update
 
-from . import bot, capture_batch, heartbeat, session
+from . import capture_batch, heartbeat, session
 from .config import TalkerConfig, load_from_unified
 from .state import StateManager
 from .utils import get_logger, setup_logging
@@ -137,32 +136,30 @@ def _reconcile_left_collapse_group(
 # --- Validation -----------------------------------------------------------
 
 
-def _missing_config_reasons(
-    config: TalkerConfig, *, web_only: bool = False
-) -> list[str]:
+def _missing_config_reasons(config: TalkerConfig) -> list[str]:
     """Return human-readable reasons why config is incomplete (or []).
 
-    Anything that would crash the daemon on first use counts — a missing
-    bot token leaves us unable to build the Application; an empty allowlist
-    means no one can talk to us; missing API keys make the first message
-    500 the user.
+    Anything that would crash the daemon on first use counts: missing API
+    keys make the first message 500 the user; no vault path means the agent
+    has nothing to ground in. ``instance.name`` still fails loud upstream at
+    ``load_from_unified``.
 
-    ``web_only`` (bit d): a PWA-only instance mounts the web surface with NO
-    Telegram bot. When set, the Telegram-specific prerequisites (``bot_token``
-    / ``allowed_users`` / ``stt.api_key``) are NOT required — but ``vault.path``
-    and ``anthropic.api_key`` (the agent needs both) stay required, and
-    ``instance.name`` still fails loud upstream at ``load_from_unified``.
-    Default ``False`` → today's five checks byte-for-byte (order preserved).
+    Telegram retirement (T4 C6, 2026-08-19): the three PTB-era requirements
+    this gate used to impose on non-web-only configs — ``bot_token`` /
+    ``allowed_users`` / ``stt.api_key`` — are RETIRED. Their referent (a
+    boot-blocking prerequisite for building + serving a Telegram bot) no
+    longer exists: there is no Application to build, and every real
+    instance already ran with these relaxed via ``web_only``. Behaviour
+    change is latent-only: a legacy config WITHOUT ``web.web_only`` now
+    boots instead of refusing — and gets the loud signals instead
+    (``telegram_retired_bot_token_ignored`` when a token is set;
+    ``scheduler_no_user`` when ``allowed_users`` is empty, since entry [0]
+    is still the transport scheduler's operator-id source; health's
+    ``_check_bot_token`` stays as-is and will surface the fossil shape).
     """
     reasons: list[str] = []
-    if not web_only and not config.bot_token:
-        reasons.append("telegram.bot_token is empty")
-    if not web_only and not config.allowed_users:
-        reasons.append("telegram.allowed_users is empty")
     if not config.anthropic.api_key:
         reasons.append("telegram.anthropic.api_key is empty")
-    if not web_only and not config.stt.api_key:
-        reasons.append("telegram.stt.api_key is empty")
     if not config.vault.path:
         reasons.append("vault.path is empty")
     return reasons
@@ -184,9 +181,10 @@ def _load_system_prompt(skills_dir: Path, skill_bundle: str = "vault-talker") ->
     take effect without a daemon restart — closes the "same-cycle
     SKILL ship" gap from QA 2026-05-04 (Hypatia ran a conversation
     with the old SKILL after the new SKILL committed but before
-    restart). The provider is invoked from ``bot.update_handler``
-    which python-telegram-bot fires per inbound message, NOT once
-    per logical conversation; the historical commit message
+    restart). The provider is invoked once per inbound chat turn
+    (historically by the retired Telegram update handler; today by
+    the web/transport chat path the daemon threads it into), NOT
+    once per logical conversation; the historical commit message
     ``be53673`` and earlier comments named this "per-conversation"
     inaccurately. The per-turn read is the actual behaviour and is
     fine performance-wise (see file-system cost note below).
@@ -223,11 +221,12 @@ def build_system_prompt_provider(
 ) -> Callable[[], str]:
     """Return a zero-arg callable that reads SKILL.md fresh + templates it.
 
-    Used by ``bot.build_app`` to wire per-turn SKILL.md hot-reload —
-    instead of stashing a static string in ``bot_data``, the bot
-    stashes this provider and invokes it per turn (i.e. every
-    inbound Telegram message). SKILL edits on disk take effect on
-    the next user turn; no daemon restart needed.
+    Wires per-turn SKILL.md hot-reload: instead of a static string,
+    consumers hold this provider and invoke it per chat turn. SKILL
+    edits on disk take effect on the next user turn; no daemon restart
+    needed. (Historically stashed in the Telegram bot's ``bot_data``;
+    since the Telegram retirement the daemon threads it into the
+    transport/web chat wiring instead.)
 
     Closure captures ``skills_dir`` + ``config`` (both immutable for
     the daemon's lifetime). Templating reads ``config.instance.name``
@@ -236,7 +235,7 @@ def build_system_prompt_provider(
     SKILL.md content itself.
 
     Errors degrade to empty string per ``_load_system_prompt``'s
-    contract (file-missing → warning + empty); the bot's downstream
+    contract (file-missing → warning + empty); the downstream
     Anthropic call still works on an empty system prompt (just with
     no instance-specific guidance — better than crashing the turn).
     """
@@ -524,7 +523,8 @@ async def _finalize_swept_capture(
     1. Substance-slug rename (opt-in). CRITICAL: ``maybe_apply_substance_slug``
        returns a possibly-RENAMED rel_path (it MOVES the file on disk when the
        slug fires), so we REASSIGN ``meta["rel_path"]`` from its return — exactly
-       as ``bot.on_end`` does (``bot.py:1816``). Discarding the return here was
+       as the retired Telegram ``/end`` handler did (historically
+       ``bot.on_end``, bot.py:1816; module deleted 2026-08-19). Discarding the return here was
        the clinic-capture Piece-1 fast-follow bug: with both
        ``derive_slug_from_substance`` AND ``auto_structure_on_close`` enabled
        (Hypatia's posture), the file was renamed first and then structuring was
@@ -615,35 +615,15 @@ async def run(
         backup_count=_backup_count,
     )
 
-    # Web-only mode (bit d): a PWA-only instance may run the web surface with
-    # no Telegram bot. Opt-in + EXPLICIT — web.enabled AND web.web_only — so a
-    # standard instance (either flag absent) keeps every Telegram prerequisite
-    # required, byte-for-byte. Any web-config parse issue fails toward the
-    # strict default (web_only stays False → today's behavior).
-    web_only = False
-    try:
-        from alfred.web.config import load_from_unified as _load_web_cfg
-        _wc_probe = _load_web_cfg(raw)
-        web_only = bool(_wc_probe.enabled and _wc_probe.web_only)
-    except Exception:  # noqa: BLE001 — never let a web-config issue block boot
-        log.exception("talker.daemon.web_only_probe_failed")
-        web_only = False
-
-    reasons = _missing_config_reasons(config, web_only=web_only)
+    # Telegram retirement (T4 C6): the config gate no longer branches on
+    # web-only mode — the PTB-era prerequisites it used to relax are retired
+    # outright (see _missing_config_reasons). The ``web.web_only`` flag
+    # itself remains meaningful elsewhere (health SKIPs its Telegram probes
+    # under it), but the daemon no longer needs to probe it at boot.
+    reasons = _missing_config_reasons(config)
     if reasons:
         log.error("talker.daemon.missing_config", reasons=reasons)
         return _MISSING_CONFIG_EXIT
-
-    if web_only and not config.bot_token:
-        # Intentionally-left-blank: an explicit "running without Telegram"
-        # signal so a bot-less daemon is distinguishable from a broken one.
-        log.info(
-            "talker.daemon.web_only_mode",
-            detail=(
-                "web.web_only=true and no bot_token — Telegram bot disabled; "
-                "serving the web surface + transport only"
-            ),
-        )
 
     log.info("talker.daemon.starting", model=config.anthropic.model)
 
@@ -702,21 +682,20 @@ async def run(
     )
     vault_context_str = _build_vault_context_str(config)
 
-    # Web-only mode (bit d): with no bot_token there is no Telegram
-    # Application to build — ``Application.builder().token("").build()`` raises
-    # InvalidToken, so we skip the build entirely. Every ``app.*`` touchpoint
-    # below is guarded on ``app is not None``. When a bot_token IS present (the
-    # only path a standard instance ever takes, since an empty token without
-    # web_only already early-returned above) this is byte-for-byte unchanged.
-    app = None
+    # Telegram retirement (2026-08-19): there is no bot Application to build
+    # — ``alfred.telegram.bot`` is deleted and every instance runs web-only.
+    # A configured ``bot_token`` is a dead knob, and per
+    # ``feedback_intentionally_left_blank`` a dead knob must not be a silent
+    # one: an operator who sets it should learn from the log that nothing
+    # will be built, not from the absence of traffic.
     if config.bot_token:
-        app = bot.build_app(
-            config=config,
-            state_mgr=state_mgr,
-            anthropic_client=client,
-            system_prompt_provider=system_prompt_provider,
-            vault_context_str=vault_context_str,
-            raw_config=raw,
+        log.warning(
+            "talker.daemon.telegram_retired_bot_token_ignored",
+            detail=(
+                "telegram.bot_token is set but the Telegram surface is "
+                "retired (BotFather tokens revoked 2026-08-18) — no bot is "
+                "built; this instance serves the web surface + transport only."
+            ),
         )
 
     # ---- Outbound-push transport --------------------------------------
@@ -728,7 +707,6 @@ async def run(
     transport_app = None
     transport_state = None
     transport_config = None
-    send_lock_map: dict[int, asyncio.Lock] = {}
     try:
         from alfred.transport.config import load_from_unified as load_transport
         from alfred.transport.server import (
@@ -745,16 +723,13 @@ async def run(
         transport_state = TransportState.create(transport_config.state.path)
         transport_state.load()
 
-        # The send leg. ``app is None`` is the web-only instance (every
-        # instance since 2026-08-14/15) and the returned callable RAISES
-        # ``TelegramUnavailable`` there rather than answering ``[]`` — see
-        # ``alfred.telegram.send`` for the contract and the seven consumers
-        # that used to read that ``[]`` as a delivery. Built by a module-level
-        # factory rather than defined inline so the contract has a home and a
-        # test that does not need a daemon.
-        _send_via_telegram = build_send_via_telegram(
-            app, send_lock_map=send_lock_map,
-        )
+        # The send leg. Telegram is retired, so the returned callable RAISES
+        # ``TelegramUnavailable`` on every call rather than answering ``[]``
+        # — see ``alfred.telegram.send`` for the contract and the seven
+        # consumers that used to read that ``[]`` as a delivery. Built by a
+        # module-level factory rather than defined inline so the contract has
+        # a home and a test that does not need a daemon.
+        _send_via_telegram = build_send_via_telegram()
 
         # Build the bare app — no resources wired yet.
         transport_app = build_transport_app(
@@ -1755,12 +1730,11 @@ async def run(
             send_fn=_send_via_telegram,
             # Threaded at THE production call site in the same commit that
             # added the kwarg: a default-None gate that only tests pass is a
-            # live write side with a dead read side. ``app`` is bound long
-            # before this line (None ⇒ web-only, no bot_token) and never
-            # rebound, so the bool is a fact rather than a snapshot. Without
+            # live write side with a dead read side. Constant ``False`` since
+            # the Telegram retirement — there is no bot to connect. Without
             # it /health reports telegram_connected from send_fn registration
             # — true on every instance, and true of a dark channel.
-            telegram_available=app is not None,
+            telegram_available=False,
             pending_items_aggregate_path=pending_items_aggregate_path,
             pending_items_resolve_callable=pending_items_resolver_fn,
             gcal_client=gcal_client,
@@ -2054,31 +2028,6 @@ async def run(
     ):
         from . import voice_train as _voice_train
 
-        async def _voice_train_dm(chat_id: int, text: str) -> None:
-            """Best-effort DM to the operator on extraction completion / failure.
-
-            Wraps ``app.bot.send_message`` with the same per-chat lock
-            shape the transport uses (avoids double-fire if a transport
-            send raced with us). Failure is logged + swallowed — the
-            structured record landed regardless of whether the DM made it.
-            """
-            if app is None:
-                # Web-only mode (bit d) — no Telegram bot to DM through.
-                return
-            lock = send_lock_map.setdefault(chat_id, asyncio.Lock())
-            async with lock:
-                try:
-                    await app.bot.send_message(chat_id=chat_id, text=text)
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "talker.daemon.voice_train_dm_failed",
-                        chat_id=chat_id,
-                    )
-                # 250ms inter-message floor mirrors the transport
-                # rate-limit pattern. Cheap insurance against bursts
-                # if the worker processes multiple jobs in one tick.
-                await asyncio.sleep(0.25)
-
         queue_path = (
             Path(config.voice_train.queue_path)
             if config.voice_train.queue_path
@@ -2094,7 +2043,13 @@ async def run(
                 scope=scope,
                 instance=config.instance.name or "",
                 poll_seconds=config.voice_train.worker_poll_seconds,
-                dm_callback=_voice_train_dm,
+                # Telegram retirement: the completion DM used to go out via
+                # ``app.bot.send_message``; there is no DM channel any more.
+                # ``None`` is the worker's own documented "no DM" contract
+                # (every DM site guards ``dm_callback is not None``) — the
+                # structured record + ``voice_train.extraction_completed``
+                # log line are the surviving completion signals.
+                dm_callback=None,
                 shutdown_event=shutdown_event,
             ),
             name="talker-voice-train-worker",
@@ -2208,61 +2163,31 @@ async def run(
                 detail="allowed_users empty — scheduler not started",
             )
 
-    # ---- PTB lifecycle ---------------------------------------------------
-    # Manual initialize/start/start_polling to coexist with our own loop.
-    # We track whether each stage completed so the finally block only
-    # tears down what was actually set up — a bad token raises during
-    # initialize() and leaves updater/start in an undefined state.
-    initialised = False
-    started = False
-    polling = False
+    # ---- Serve until shutdown --------------------------------------------
+    # Telegram retirement: the PTB manual lifecycle (initialize → start →
+    # start_polling → reverse teardown) that used to live here is gone with
+    # the bot. The transport + web server tasks started above are the whole
+    # serving surface; this coroutine just waits for the shutdown signal.
     exit_code = 0
     try:
-        if app is not None:
-            await app.initialize()
-            initialised = True
-            await app.start()
-            started = True
-            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            polling = True
-            log.info("talker.daemon.polling")
-        else:
-            # Web-only mode (bit d): no Telegram polling. The transport + web
-            # server tasks started above serve until SIGTERM; the finally
-            # block's PTB teardown is fully skipped (initialised/started/
-            # polling all stay False). Intentionally-left-blank: an explicit
-            # "serving without Telegram" signal.
-            log.info(
-                "talker.daemon.web_only_serving",
-                detail="no Telegram polling — transport + web surface only",
-            )
+        # Intentionally-left-blank: the explicit "serving without Telegram"
+        # signal. Same event name as the historical web-only branch so
+        # operator greps keep working — it is now the unconditional
+        # steady-state line, not a mode indicator.
+        log.info(
+            "talker.daemon.web_only_serving",
+            detail="no Telegram polling — transport + web surface only",
+        )
         await shutdown_event.wait()
-    except Exception as exc:  # noqa: BLE001 — top-level: log and exit cleanly
-        # InvalidToken / network failures during init are config-class
-        # errors — return the missing-config exit code so the orchestrator
-        # routes to "don't retry" rather than burning restart budget.
+    except Exception:  # noqa: BLE001 — top-level: log and exit cleanly
+        # Historically this also mapped PTB InvalidToken onto
+        # ``_MISSING_CONFIG_EXIT``; with no PTB lifecycle left the only
+        # things that can raise here are the wait itself / signal plumbing,
+        # which are not config-class errors.
         log.exception("talker.daemon.lifecycle_error")
-        exit_code = _MISSING_CONFIG_EXIT if "token" in str(exc).lower() else 1
+        exit_code = 1
     finally:
         log.info("talker.daemon.stopping")
-        # Tear PTB down in reverse order — only what was set up.
-        if polling:
-            try:
-                if app.updater and app.updater.running:
-                    await app.updater.stop()
-            except Exception:  # noqa: BLE001
-                log.exception("talker.daemon.updater_stop_error")
-        if started:
-            try:
-                if app.running:
-                    await app.stop()
-            except Exception:  # noqa: BLE001
-                log.exception("talker.daemon.app_stop_error")
-        if initialised:
-            try:
-                await app.shutdown()
-            except Exception:  # noqa: BLE001
-                log.exception("talker.daemon.app_shutdown_error")
 
         # Stop the sweeper.
         shutdown_event.set()

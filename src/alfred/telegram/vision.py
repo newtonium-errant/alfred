@@ -99,8 +99,9 @@ async def download_photo_bytes(photo_size: Any) -> bytes:
     PTB's ``PhotoSize.get_file()`` returns a ``File`` object whose
     ``download_as_bytearray()`` coroutine fetches the actual bytes
     from Telegram's servers. We bytes-cast the result so the caller
-    receives a plain ``bytes`` object (mirrors the voice-handler
-    pattern in :func:`alfred.telegram.bot.on_voice`).
+    receives a plain ``bytes`` object (mirrored the voice-handler
+    pattern in the retired Telegram bot's ``on_voice``; module deleted
+    2026-08-19).
 
     Raises:
         VisionDownloadError: Wraps any exception from the PTB / HTTP

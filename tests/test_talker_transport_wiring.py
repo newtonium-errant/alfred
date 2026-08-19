@@ -161,19 +161,32 @@ def test_talker_daemon_builds_the_send_callable_from_the_factory():
     )
 
 
-def test_talker_daemon_wires_telegram_available_from_the_bot():
-    """/health's ``telegram_connected`` must be told about the BOT.
+def test_talker_daemon_wires_telegram_available_explicitly_false():
+    """/health's ``telegram_connected`` must be told the channel is dark.
 
     Unwired, the handler falls back to inferring it from send-callable
-    registration — which is true on every instance since 2026-08-14/15,
-    including the ones whose channel delivers nothing. The probe an
-    operator would consult about a dark channel would assert it was fine.
+    registration — which is true on every instance, including the ones
+    whose channel delivers nothing. The probe an operator would consult
+    about a dark channel would assert it was fine.
+
+    Telegram retirement (2026-08-19): the bot is deleted, so the honest
+    threaded value is the constant ``False`` — there is no ``app`` left
+    to inspect. The pin still guards the same failure mode as its
+    pre-retirement form (``telegram_available=app is not None``): the
+    kwarg must be threaded EXPLICITLY at the production call site, never
+    left to the send_fn-registration fallback.
     """
     source = _daemon_source()
-    assert "telegram_available=app is not None" in source, (
-        "wire_transport_app must receive telegram_available=app is not None. "
-        "Without it /health reports telegram_connected from send_fn "
+    assert "telegram_available=False" in source, (
+        "wire_transport_app must receive telegram_available=False (the "
+        "Telegram surface is retired — no bot exists). Without the "
+        "explicit kwarg /health reports telegram_connected from send_fn "
         "registration, which is not evidence of a bot."
+    )
+    assert "telegram_available=app" not in source, (
+        "daemon.py must not resurrect an ``app``-derived telegram_available "
+        "— the PTB Application is gone; a reference to one means dead code "
+        "came back."
     )
 
 

@@ -451,12 +451,61 @@ def _guard_is_live() -> bool:
     return socket.socket.connect is _OUR_CONNECT_HOOK
 
 
+# ---------------------------------------------------------------------------
+# No-PTB import blocker (T4 C5) — python-telegram-bot must stay gone.
+# ---------------------------------------------------------------------------
+#
+# Telegram retired 2026-08-18; bot surface deleted 2026-08-19 (T4 C3/C4); the
+# ``python-telegram-bot`` dependency left pyproject's ``voice`` extra in C5.
+# But dropping a dep from pyproject UNINSTALLS NOTHING — a dev venv that once
+# installed the extra still carries PTB, so a reintroduced ``import telegram``
+# would work on every machine that matters until it hit a fresh install in the
+# field. The suite therefore behaves as if PTB is not installed: a meta_path
+# finder refuses ``telegram`` and ``telegram.*`` (NEVER ``alfred.telegram`` —
+# our package shares the word, not the namespace) with an ImportError that
+# names the retirement. Static + declared pins live in
+# ``tests/test_no_ptb_regression.py``, which also carries this blocker's
+# positive and negative controls.
+
+
+class _PtbImportBlocker:
+    """meta_path finder that refuses python-telegram-bot imports."""
+
+    _MESSAGE = (
+        "import of {name!r} blocked by the test suite: python-telegram-bot "
+        "is retired from this codebase (Telegram surface deleted 2026-08-19, "
+        "T4). If PTB is genuinely needed again, that is a platform decision "
+        "— see tests/test_no_ptb_regression.py — not a one-import fix."
+    )
+
+    def find_spec(self, name, path=None, target=None):  # noqa: ANN001, ARG002
+        if name == "telegram" or name.startswith("telegram."):
+            raise ImportError(self._MESSAGE.format(name=name))
+        return None
+
+
+def _install_no_ptb_blocker() -> None:
+    import sys
+
+    # Fail loudly if PTB reached sys.modules before the blocker could act —
+    # a collection-time import would otherwise slip under the runtime guard.
+    if "telegram" in sys.modules:
+        raise RuntimeError(
+            "python-telegram-bot was imported before the no-PTB blocker "
+            "installed (probably a module-level import during collection). "
+            "The Telegram surface is retired; find and remove the import."
+        )
+    if not any(isinstance(f, _PtbImportBlocker) for f in sys.meta_path):
+        sys.meta_path.insert(0, _PtbImportBlocker())
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "live_network: test INTENTIONALLY reaches a real network service "
         "(key-gated integration runs). Exempt from the suite egress guard.",
     )
+    _install_no_ptb_blocker()
 
 
 # ---------------------------------------------------------------------------
