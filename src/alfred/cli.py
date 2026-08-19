@@ -1718,7 +1718,7 @@ def cmd_voice(args: argparse.Namespace) -> None:
 
     if subcmd == "train" and train_cmd == "backfill":
         from alfred.telegram import voice_train as _voice_train
-        from alfred.telegram.bot import _resolve_queue_path
+        from alfred.telegram.voice_train import resolve_queue_path
         from alfred.telegram.config import load_from_unified as talker_cfg_loader
 
         config = talker_cfg_loader(raw)
@@ -1736,7 +1736,7 @@ def cmd_voice(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         instance_name = config.instance.name or ""
-        queue_path = _resolve_queue_path(config)
+        queue_path = resolve_queue_path(config)
 
         jobs, skipped_voice, skipped_method = (
             _voice_train.collect_backfill_jobs(

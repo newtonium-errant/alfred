@@ -3606,39 +3606,13 @@ async def _finalize_method_source_paste(
         )
 
 
-def _voice_train_scope_for(config: TalkerConfig) -> str:
-    """Return the vault scope string for voice_train writes.
-
-    Phase 1: hardcoded mapping by ``instance.tool_set`` so a Hypatia
-    daemon writes under the ``hypatia`` scope (admits the new ``essay``
-    / ``voice`` / ``voice-cluster`` / ``method`` types via
-    HYPATIA_CREATE_TYPES). A future Salem/KAL-LE adoption would extend
-    TALKER_CREATE_TYPES / KALLE_CREATE_TYPES with the same types and
-    flip the mapping below — config-flippable, not a refactor.
-    """
-    tool_set = (config.instance.tool_set or "").lower()
-    if tool_set == "hypatia":
-        return "hypatia"
-    if tool_set == "kalle":
-        return "kalle"
-    return "talker"
-
-
-def _resolve_queue_path(config: TalkerConfig) -> Path:
-    """Resolve the JSONL queue path, honouring the per-instance default.
-
-    Defaults to ``./data/<instance-slug>/extraction_queue.jsonl`` when
-    the operator hasn't set ``voice_train.queue_path`` in config. The
-    per-instance subdirectory keeps Salem / Hypatia / KAL-LE queues
-    isolated even when they share a working directory.
-    """
-    if config.voice_train is not None and config.voice_train.queue_path:
-        return Path(config.voice_train.queue_path)
-    instance_slug = (
-        (config.instance.name or "default").strip().lower()
-        .replace(" ", "-").replace(".", "")
-    )
-    return Path("./data") / instance_slug / "extraction_queue.jsonl"
+# MOVED to ``voice_train.py`` (T4). Both are pipeline concerns, not bot-surface
+# ones: the queue path is read by the extraction worker and by ``alfred talker
+# voice train backfill``, neither of which involves Telegram. These aliases are
+# a SHIM that exists only so this module's remaining call sites keep resolving
+# until the module itself is deleted — do not add new callers.
+_resolve_queue_path = voice_train.resolve_queue_path
+_voice_train_scope_for = voice_train.voice_train_scope_for
 
 
 # --- Daily Sync slash commands (email-surfacing c2) -----------------------

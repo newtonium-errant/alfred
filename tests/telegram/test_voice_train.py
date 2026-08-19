@@ -885,13 +885,13 @@ def test_voice_train_config_block_absent_default_none() -> None:
 
 def test_voice_train_scope_for_hypatia(tmp_path: Path) -> None:
     config = _make_hypatia_config(tmp_path)
-    assert bot._voice_train_scope_for(config) == "hypatia"
+    assert voice_train.voice_train_scope_for(config) == "hypatia"
 
 
 def test_voice_train_scope_for_kalle(tmp_path: Path) -> None:
     config = _make_hypatia_config(tmp_path)
     config.instance.tool_set = "kalle"
-    assert bot._voice_train_scope_for(config) == "kalle"
+    assert voice_train.voice_train_scope_for(config) == "kalle"
 
 
 def test_voice_train_scope_for_salem_falls_through_to_talker(
@@ -899,7 +899,7 @@ def test_voice_train_scope_for_salem_falls_through_to_talker(
 ) -> None:
     config = _make_hypatia_config(tmp_path)
     config.instance.tool_set = ""
-    assert bot._voice_train_scope_for(config) == "talker"
+    assert voice_train.voice_train_scope_for(config) == "talker"
 
 
 # ---------------------------------------------------------------------------
@@ -915,7 +915,7 @@ def test_resolve_queue_path_explicit(tmp_path: Path) -> None:
             queue_path=str(tmp_path / "custom_queue.jsonl"),
         ),
     )
-    resolved = bot._resolve_queue_path(config)
+    resolved = voice_train.resolve_queue_path(config)
     assert resolved == tmp_path / "custom_queue.jsonl"
 
 
@@ -925,8 +925,89 @@ def test_resolve_queue_path_per_instance_default(tmp_path: Path) -> None:
         tmp_path,
         voice_train_config=VoiceTrainConfig(command_enabled=True),
     )
-    resolved = bot._resolve_queue_path(config)
+    resolved = voice_train.resolve_queue_path(config)
     assert resolved == Path("./data") / "hypatia" / "extraction_queue.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Threading pins for the T4 relocation
+# ---------------------------------------------------------------------------
+#
+# `resolve_queue_path` / `voice_train_scope_for` moved here from bot.py so they
+# would outlive the Telegram bot's deletion. The pins ABOVE prove the functions
+# compute correctly; they say nothing about whether PRODUCTION still reaches
+# them, and that is the gap worth pinning. Neither production caller is
+# reachable from this suite — no test invokes `alfred.cli.cmd_voice`, and the
+# daemon's extraction-worker startup needs a live daemon — so if either call
+# site still pointed at the deleted `bot` helpers, every test here would stay
+# GREEN while `alfred talker voice train backfill` raised ImportError in the
+# operator's hands. That is the standing threading trap in its exact shape: the
+# tests thread the new API, production keeps the old one, the suite says fine.
+# Source inspection is the only altitude available without standing up a CLI or
+# a daemon; the idiom follows tests/test_talker_transport_wiring.py, which pins
+# the daemon's send-leg wiring the same way for the same reason.
+
+
+def test_cli_backfill_threads_queue_path_through_voice_train(
+    tmp_path: Path,
+) -> None:
+    """The backfill CLI must resolve its queue path via voice_train, not bot."""
+    import inspect
+
+    import alfred.cli
+
+    source = inspect.getsource(alfred.cli.cmd_voice)
+    assert (
+        "from alfred.telegram.voice_train import resolve_queue_path" in source
+    ), (
+        "alfred.cli.cmd_voice must import resolve_queue_path from "
+        "alfred.telegram.voice_train. It used to come from "
+        "alfred.telegram.bot, which T4 deletes — leaving that import in "
+        "place breaks `alfred talker voice train backfill` at runtime while "
+        "this suite stays green."
+    )
+    assert "alfred.telegram.bot" not in source, (
+        "alfred.cli.cmd_voice must not reach into the Telegram bot module "
+        "at all; the bot surface is retired and the CLI backfill path is "
+        "web-era code."
+    )
+    # POSITIVE CONTROL, in the same test: the symbol the call site names is
+    # live and computes. Without this the two assertions above would pass
+    # identically against a build where resolve_queue_path did not exist —
+    # a check that cannot fail on a broken subject is not a check.
+    config = _make_hypatia_config(tmp_path)
+    assert voice_train.resolve_queue_path(config) == (
+        Path("./data") / "hypatia" / "extraction_queue.jsonl"
+    )
+
+
+def test_daemon_worker_threads_queue_and_scope_through_voice_train() -> None:
+    """The extraction worker must take queue path + scope from voice_train."""
+    import inspect
+
+    from alfred.telegram import daemon as talker_daemon
+
+    source = inspect.getsource(talker_daemon.run)
+    assert "_voice_train.resolve_queue_path(" in source, (
+        "the daemon's extraction-worker startup must resolve its queue path "
+        "via voice_train.resolve_queue_path."
+    )
+    assert "_voice_train.voice_train_scope_for(" in source, (
+        "the daemon's extraction-worker startup must resolve its vault scope "
+        "via voice_train.voice_train_scope_for."
+    )
+    # The bot alias this call site used to go through. Asserted by its OWN
+    # name rather than by "bot" — daemon.py legitimately still imports bot
+    # for build_app until T4 C3, so a bare "bot" exclusion would be a false
+    # pin today and a silently-vacuous one after the deletion.
+    assert "_bot_mod" not in source, (
+        "the daemon must not reach voice-train helpers through the bot "
+        "module; that import existed only to borrow them and was removed "
+        "when they moved to voice_train."
+    )
+    # POSITIVE CONTROL: both named symbols exist and are callable.
+    assert callable(voice_train.resolve_queue_path)
+    assert callable(voice_train.voice_train_scope_for)
 
 
 # ---------------------------------------------------------------------------

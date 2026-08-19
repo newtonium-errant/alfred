@@ -104,9 +104,56 @@ import structlog
 from alfred.vault import ops
 
 from alfred._anthropic_compat import messages_create_kwargs
+from .config import TalkerConfig
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-instance queue + scope resolution
+# ---------------------------------------------------------------------------
+#
+# These two lived in ``bot.py`` while the only caller was a slash-command
+# handler. They are NOT bot-surface concerns: the queue path is read by the
+# extraction WORKER (an asyncio task in the talker daemon, which runs
+# web-only) and by ``alfred talker voice train backfill`` on the CLI. Both
+# outlive the Telegram bot, so they live with the pipeline they belong to.
+
+
+def resolve_queue_path(config: TalkerConfig) -> Path:
+    """Resolve the JSONL queue path, honouring the per-instance default.
+
+    Defaults to ``./data/<instance-slug>/extraction_queue.jsonl`` when
+    the operator hasn't set ``voice_train.queue_path`` in config. The
+    per-instance subdirectory keeps Salem / Hypatia / KAL-LE queues
+    isolated even when they share a working directory.
+    """
+    if config.voice_train is not None and config.voice_train.queue_path:
+        return Path(config.voice_train.queue_path)
+    instance_slug = (
+        (config.instance.name or "default").strip().lower()
+        .replace(" ", "-").replace(".", "")
+    )
+    return Path("./data") / instance_slug / "extraction_queue.jsonl"
+
+
+def voice_train_scope_for(config: TalkerConfig) -> str:
+    """Return the vault scope string for voice_train writes.
+
+    Phase 1: hardcoded mapping by ``instance.tool_set`` so a Hypatia
+    daemon writes under the ``hypatia`` scope (admits the new ``essay``
+    / ``voice`` / ``voice-cluster`` / ``method`` types via
+    HYPATIA_CREATE_TYPES). A future Salem/KAL-LE adoption would extend
+    TALKER_CREATE_TYPES / KALLE_CREATE_TYPES with the same types and
+    flip the mapping below — config-flippable, not a refactor.
+    """
+    tool_set = (config.instance.tool_set or "").lower()
+    if tool_set == "hypatia":
+        return "hypatia"
+    if tool_set == "kalle":
+        return "kalle"
+    return "talker"
 
 
 # ---------------------------------------------------------------------------
@@ -2065,9 +2112,11 @@ __all__ = [
     "maybe_rebuild_overall",
     "parse_method_source_args",
     "parse_train_args",
+    "resolve_queue_path",
     "run_worker",
     "save_raw_essay",
     "save_raw_source",
     "slug_from_text",
     "title_from_text",
+    "voice_train_scope_for",
 ]

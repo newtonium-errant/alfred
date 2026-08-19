@@ -2053,7 +2053,6 @@ async def run(
         and config.voice_train.command_enabled
     ):
         from . import voice_train as _voice_train
-        from . import bot as _bot_mod
 
         async def _voice_train_dm(chat_id: int, text: str) -> None:
             """Best-effort DM to the operator on extraction completion / failure.
@@ -2083,9 +2082,9 @@ async def run(
         queue_path = (
             Path(config.voice_train.queue_path)
             if config.voice_train.queue_path
-            else _bot_mod._resolve_queue_path(config)
+            else _voice_train.resolve_queue_path(config)
         )
-        scope = _bot_mod._voice_train_scope_for(config)
+        scope = _voice_train.voice_train_scope_for(config)
         voice_train_task = asyncio.create_task(
             _voice_train.run_worker(
                 queue_path=queue_path,
@@ -2158,6 +2157,16 @@ async def run(
             shutdown_event.set()
 
         transport_server_task.add_done_callback(_on_transport_server_done)
+        # ``allowed_users`` IS NOT DEAD TELEGRAM CONFIG — do not remove it.
+        # This is the transport SCHEDULER's operator-id source, and it is
+        # independent of the retired Telegram surface: entry [0] is what the
+        # scheduler addresses reminders and drains to, so emptying the list
+        # stops the scheduler on every instance (see the else-branch below,
+        # which logs ``scheduler_no_user``). The field reads like a Telegram
+        # allowlist because that is what it originally was, which is exactly
+        # why it needs this note — the next reader sweeping for retired
+        # Telegram config would otherwise delete a live dependency.
+        #
         # VERA MVP: tolerate AllowedUser or bare-int entry (see the
         # pending-items resolver site above for the getattr rationale).
         _sched_first_user = (
