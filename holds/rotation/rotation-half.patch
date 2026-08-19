@@ -1,0 +1,342 @@
+diff --git a/src/alfred/brief/config.py b/src/alfred/brief/config.py
+index 7ad6929b..20243624 100644
+--- a/src/alfred/brief/config.py
++++ b/src/alfred/brief/config.py
+@@ -9,6 +9,7 @@ from typing import Any
+ 
+ from alfred.common.schedule import ScheduleConfig
+ from alfred.feed import FeedConfig, load_from_unified as _load_feed_config
++from alfred.tier.sort_rotation import DEFAULT_ROTATION_CAP
+ 
+ from .utils import get_logger
+ 
+@@ -149,6 +150,30 @@ class StaycNegationRelayConfig:
+     staleness_hours: float = 25.0
+ 
+ 
++@dataclass
++class SortRotationConfig:
++    """``brief.sort_rotation`` — the deck rotation over unslotted items.
++
++    ``enabled`` DEFAULTS TO TRUE, and that is a per-instance-defaults decision
++    worth stating rather than a shrug. The alternative on the table was "Salem
++    only", which in code would mean an instance-name literal — the exact
++    hardcoding the naming discipline forbids, and it would make the feature
++    invisible on every instance the operator later starts using the board on.
++    What makes ``True`` safe instead of noisy is that the rotation is gated by
++    its POPULATION, not by its instance: an instance whose tier lanes hold
++    nothing unslotted deals nothing and says so in the rotation's ILB line. An
++    instance that genuinely does not want it sets ``enabled: false``.
++
++    ``cap`` is the ratified "2-3/day"; see
++    :func:`alfred.tier.sort_rotation.select_rotation` for why deferred cards are
++    carried outside it. Values below 1 deal nothing while still preserving
++    parked defers, so turning the dial to 0 is a mute, never a data loss.
++    """
++
++    enabled: bool = True
++    cap: int = DEFAULT_ROTATION_CAP
++
++
+ @dataclass
+ class WatchItemConfig:
+     """One ``brief.watches`` entry — a config-driven upstream check.
+@@ -271,6 +296,12 @@ class BriefConfig:
+     # compact_threshold_bytes). Loaded from the unified ``feed:`` block so the
+     # brief's producer #2 writes the SAME store the daily-sync producer does.
+     feed: FeedConfig = field(default_factory=FeedConfig)
++
++    # The sort rotation (2026-08-19) — deck cards for items the slot classifier
++    # refused to guess at. Its own block rather than a bare pair of keys so the
++    # cap and the switch stay together, and so a future rung (a per-slot cap, a
++    # weekday schedule) has somewhere to land.
++    sort_rotation: "SortRotationConfig" = field(default_factory=lambda: SortRotationConfig())
+     # Instance slug stamped into feed items (from telegram.instance.name, lowercased).
+     instance_name: str = ""
+ 
+@@ -334,6 +365,17 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
+             primary=s.get("primary", False),
+         ))
+ 
++    # The sort rotation block. Hand-rolled like every other block in this loader
++    # (this module builds its dataclasses explicitly rather than through the
++    # ``_build`` key-name dispatcher, so the collision footgun does not apply).
++    # A missing block keeps the dataclass defaults; a present-but-blank one does
++    # too, via the ``or {}``.
++    rotation_raw = section.get("sort_rotation") or {}
++    sort_rotation = SortRotationConfig(
++        enabled=bool(rotation_raw.get("enabled", True)),
++        cap=int(rotation_raw.get("cap", DEFAULT_ROTATION_CAP)),
++    )
++
+     weather_raw = section.get("weather", {})
+     weather = WeatherConfig(
+         stations=stations,
+@@ -536,6 +578,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
+         quarantine_dir_name=quarantine_dir_name,
+         tier_defaults=tier_defaults,
+         feed=_load_feed_config(raw),
++        sort_rotation=sort_rotation,
+         # Drip campaigns (#44b). Built from the top-level ``drip:`` block by
+         # drip's own loader, so the brief and ``alfred drip`` read one config
+         # surface rather than two parsers that can disagree. Absent block ⇒ no
+diff --git a/src/alfred/brief/daemon.py b/src/alfred/brief/daemon.py
+index 7af20f02..cb1cb32b 100644
+--- a/src/alfred/brief/daemon.py
++++ b/src/alfred/brief/daemon.py
+@@ -371,6 +371,17 @@ def _emit_brief_feed(
+                 store, section.feed_kind, items,
+                 empty_is_authoritative=True,
+             )
++
++        # --- the sort rotation (2026-08-19) ---------------------------------
++        # NOT a section extractor, because it has no brief section: its whole
++        # surface is the deck and the board, and inventing a markdown section to
++        # reach the emit loop would put text in the operator's morning read that
++        # nothing asked for. Same belt discipline, applied here directly.
++        #
++        # It is emitted AFTER the section loop on purpose. The rotation's
++        # selection reads the store to find what it already has parked, so it
++        # must see the state the rest of this fire has finished writing.
++        _emit_sort_rotation(config, store, now_local, instance=instance)
+     except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the brief
+         log.warning(
+             "brief.feed_emit_failed",
+@@ -379,6 +390,78 @@ def _emit_brief_feed(
+         )
+ 
+ 
++def _emit_sort_rotation(
++    config: BriefConfig, store, now_local, *, instance: str,
++) -> None:
++    """Reconcile the sort rotation's cards into the feed store.
++
++    Belt-swallowed like every other kind: a rotation failure must never break
++    the brief, and it must never mass-retire its own kind either — a raise or a
++    ``None`` skips the reconcile entirely, leaving whatever the store holds.
++
++    Disabled instances emit an explicit line rather than returning in silence:
++    "the rotation is off here" and "the rotation is broken here" are the two
++    readings of no cards, and only one of them is fine.
++    """
++    from alfred.feed import try_feed_reconcile
++    from alfred.tier.sort_rotation import SORT_KIND
++
++    from .feed_producer import sort_suggestion_feed_items
++
++    rotation = config.sort_rotation
++    if not rotation.enabled:
++        log.info(
++            "brief.sort_rotation_disabled",
++            instance=instance,
++            reason="brief.sort_rotation.enabled is false — no sort cards are "
++                   "dealt on this instance; unslotted items stay unsortable "
++                   "from the deck",
++        )
++        return
++
++    # THE STORE READ THAT KEEPS DEFERS ALIVE. ``reconcile`` retires any item of
++    # this kind absent from the emitted list, and a deferred item counts as
++    # present for that test — so the selection must be told what is parked or it
++    # will quietly destroy the operator's own defer windows. Narrowed to this
++    # kind here rather than inside the producer so the producer stays a pure
++    # function of (vault, tracked-states).
++    try:
++        tracked = {
++            item_id: item.state
++            for item_id, item in store.load().items()
++            if item.kind == SORT_KIND
++        }
++    except Exception as exc:  # noqa: BLE001 — an unreadable store must not reconcile
++        log.warning(
++            "brief.sort_rotation_store_unreadable",
++            instance=instance, error=str(exc), error_type=type(exc).__name__,
++            consequence="rotation skipped this fire — no cards dealt, none retired",
++        )
++        return
++
++    try:
++        items = sort_suggestion_feed_items(
++            config.vault_path, now_local, config.tier_defaults,
++            instance=instance, tracked=tracked, cap=rotation.cap,
++        )
++    except Exception as exc:  # noqa: BLE001 — a rotation blip must not touch feed state
++        log.warning(
++            "brief.feed_extractor_failed",
++            kind=SORT_KIND, error=str(exc), error_type=type(exc).__name__,
++        )
++        return
++    if items is None:
++        log.warning("brief.feed_extractor_failed", kind=SORT_KIND, reason="no_read")
++        return
++
++    # ADOPTED. The two guards above are exactly the failure/emptiness separation
++    # ``empty_is_authoritative`` asks the caller to vouch for: a raise and a
++    # ``None`` both return before this line, so an empty list here means the
++    # projection genuinely found nothing left to sort — which is the rotation's
++    # goal state, and its cards should clear.
++    try_feed_reconcile(store, SORT_KIND, items, empty_is_authoritative=True)
++
++
+ def _render_drip_body(config: BriefConfig, today_local: date) -> str | None:
+     """The Campaigns section body, or ``None`` to omit the section entirely.
+ 
+diff --git a/src/alfred/brief/feed_producer.py b/src/alfred/brief/feed_producer.py
+index 3f190cb7..83dae524 100644
+--- a/src/alfred/brief/feed_producer.py
++++ b/src/alfred/brief/feed_producer.py
+@@ -462,6 +462,98 @@ def slot_suggestion_feed_items(
+     return out
+ 
+ 
++def sort_suggestion_feed_items(
++    vault_path: str | Path,
++    now,
++    tier_defaults: Any,
++    *,
++    instance: str,
++    tracked: dict[str, str],
++    cap: int,
++) -> list[FeedItem] | None:
++    """The sort rotation — up to ``cap`` cards asking the operator to place an
++    item the classifier honestly refused to guess at.
++
++    The population is the SAME ``compute_today_view`` projection the board reads,
++    filtered to entries the projection itself stamped ``unslotted`` — see
++    :mod:`alfred.tier.sort_rotation` on why that is a read of the classifier's
++    verdict rather than a second copy of its rules. Empty day, or a day where
++    every item already has a slot → ``[]`` (a genuine empty; the rotation's ILB
++    line still fires). Projection failure → ``None`` (don't reconcile).
++
++    ``tracked`` maps this kind's feed item ids to their stored states. It is
++    REQUIRED rather than defaulted because it is what keeps a deferred card
++    alive: ``reconcile`` retires anything absent from the returned list, so the
++    selection has to know what the store is already holding. A defaulted empty
++    dict would make the read side silently dead on the one caller that matters —
++    the standing optional-gate trap — and the symptom would be defer windows
++    quietly evaporating overnight.
++
++    ``cap`` is likewise required and comes from config; see
++    :func:`~alfred.tier.sort_rotation.select_rotation` for why held items are
++    carried OUTSIDE it.
++    """
++    from alfred.feed.model import make_id
++    from alfred.tier.compute import compute_today_view
++    from alfred.tier.sort_rotation import (
++        SORT_KIND,
++        log_rotation,
++        select_rotation,
++        unslotted_entries,
++    )
++
++    try:
++        # A SECOND projection this fire — ``slot_suggestion_feed_items`` already
++        # computed one. Deliberately not shared: the extractors are independent
++        # by construction (each is a lambda the belt can fail in isolation), and
++        # threading one view through them would couple every kind's failure to
++        # every other's. The brief fires once a day, so the cost is one extra
++        # vault read per morning.
++        view = compute_today_view(Path(vault_path), now, tier_defaults)
++    except Exception:  # noqa: BLE001 — source failure → don't reconcile (belt also logs)
++        return None
++
++    sortable, unwritable = unslotted_entries(view)
++    selection = select_rotation(
++        sortable, tracked, cap=cap,
++        key_of=lambda e: make_id(SORT_KIND, _slot_stable_key(e)),
++    )
++    log_rotation(selection, unwritable=unwritable, cap=cap, instance=instance)
++
++    out: list[FeedItem] = []
++    for entry in selection.emitted:
++        key = _slot_stable_key(entry)
++        if not key:
++            continue
++        out.append(FeedItem.create(
++            kind=SORT_KIND,
++            stable_key=key,
++            instance=instance,
++            title=f"Sort: {entry.name}",
++            evidence={
++                # The writer's addressing fields — the trusted-producer class
++                # the sibling board writers already read. ``assign_slot`` takes
++                # exactly these and composes no path of its own.
++                "origin": getattr(entry, "origin", ""),
++                "name": entry.name,
++                "path": getattr(entry, "path", ""),
++                "routine_record": getattr(entry, "routine_record", None),
++                "item_text": getattr(entry, "item_text", None),
++                # Context for the face. ``slot_rule`` is carried even though it
++                # is always ``no_signal`` for this population: the card should be
++                # able to say WHY nothing fired, and hardcoding the answer on the
++                # face would make it a caption instead of a reading.
++                "tier": entry.tier,
++                "slot": getattr(entry, "slot", "unslotted"),
++                "slot_rule": getattr(entry, "slot_rule", "no_signal"),
++                "due_iso": getattr(entry, "due_iso", None),
++                "surface_reason": getattr(entry, "surface_reason", None),
++            },
++            source_ref=dict(_SOURCE_REF),
++        ))
++    return out
++
++
+ # The peer-digest card renders ``evidence.body`` as readable prose, so the
+ # extractor must EMIT the digest body (the record already holds it — this is
+ # emission, not new gathering). Bounded because the feed store is append-only
+diff --git a/src/alfred/feed/model.py b/src/alfred/feed/model.py
+index 831df82b..1a7a402d 100644
+--- a/src/alfred/feed/model.py
++++ b/src/alfred/feed/model.py
+@@ -162,6 +162,14 @@ def snapshot_fingerprint(kind: str, evidence: dict[str, Any] | None) -> str | No
+ # into a half-migration.
+ KIND_REMINDER_RETURNED = "reminder_returned"
+ 
++# The sort rotation (2026-08-19). A NAMED constant for the same reason as the
++# kind above: three packages outside ``alfred.feed`` have to spell it — the
++# rotation selects (``tier.sort_rotation``), the brief emits
++# (``brief.feed_producer``) and the router gates (``daily_sync.action_router``).
++# The canonical spelling lives in ``tier.sort_rotation.SORT_KIND``; this is the
++# feed package's import-free copy, and a test pins them equal.
++KIND_SORT_SUGGESTION = "sort_suggestion"
++
+ # The verb stamped on a retirement — an item marked ``acted`` by
+ # :meth:`FeedStore.reconcile` because it left the producer's open set, NOT
+ # because the operator judged it. Until this existed both outcomes appended a
+@@ -189,7 +197,7 @@ KINDS: frozenset[str] = frozenset({
+     "recurrence", "contract", "slot_suggestion", "routing", "health", "weather",
+     "event", "ops_notable", "ticket_notice", "radar", "friction",
+     "notegen_readout", "peer_digest", "pattern_surfaced",
+-    KIND_REMINDER_RETURNED,
++    KIND_REMINDER_RETURNED, KIND_SORT_SUGGESTION,
+ })
+ 
+ # Static per-kind (mode, attention) defaults, seeded from the step-2 severity map
+@@ -243,6 +251,27 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
+     "friction": (MODE_FYI, ATTENTION_FYI),
+     "notegen_readout": (MODE_FYI, ATTENTION_FYI),
+     "peer_digest": (MODE_FYI, ATTENTION_FYI),
++    # The sort rotation. A sort card ASKS the operator something, so by the
++    # seeding rule above it reads like a decide kind — and it is deliberately
++    # NOT one, for a measured reason rather than a preference.
++    #
++    # ``feedNeedsYou.isNeedsYouItem`` is ``attention === 'needs_you' || mode ===
++    # 'decide'`` (web), the push poller fetches by that predicate with NO kind
++    # allowlist, and the default ``needs_you`` policy admits everything it is
++    # handed. So MODE_DECIDE rings the phone REGARDLESS of attention: there is
++    # no decide/fyi combination that stays quiet. The operator killed the
++    # notification flood, and a backlog-grooming card is the last thing that
++    # earns a doorbell — it is work he chose to defer, by definition.
++    #
++    # FYI costs the card nothing it needs. ``isDeckDealt`` deals any non-slot
++    # kind that has a wired verb, whatever its mode, so the rotation still
++    # reaches the deck; ``attribution`` is the shipped precedent (FYI/FYI, three
++    # verbs, deck-dealt). What FYI DOES add is the universal ack
++    # (``action_router`` gates ack on ``mode == MODE_FYI``): acking a card that
++    # is still unslotted revives it on the next fire, because this is an episode
++    # kind. That is honest — it IS still unsorted — but the defer verbs are the
++    # intended "not now", and they are the ones that hold.
++    KIND_SORT_SUGGESTION: (MODE_FYI, ATTENTION_FYI),
+ }
+ 
+ 
