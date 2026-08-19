@@ -267,11 +267,37 @@ def test_known_types_global_is_set_with_canonical_types():
 
 
 def test_known_types_disjoint_from_scope_extensions():
-    # The three sets must be pairwise disjoint — that's the underlying
-    # invariant the union-based ``KNOWN_TYPES_BY_SCOPE`` relies on.
+    # CANONICAL vs each extension set is the invariant the union-based
+    # ``KNOWN_TYPES_BY_SCOPE`` actually relies on: each entry is
+    # ``canonical | types_in_scope(scope)``, so a type appearing on both
+    # sides would make the union ambiguous about where it came from.
     assert KNOWN_TYPES.isdisjoint(KNOWN_TYPES_HYPATIA)
     assert KNOWN_TYPES.isdisjoint(KNOWN_TYPES_KALLE)
-    assert KNOWN_TYPES_HYPATIA.isdisjoint(KNOWN_TYPES_KALLE)
+
+
+def test_extension_sets_overlap_only_on_the_shared_ingest_types():
+    """The extension sets are NO LONGER pairwise disjoint, and that is a
+    decision (2026-08-18) rather than drift.
+
+    They were incidentally disjoint while every extension type belonged to
+    exactly one instance. `document` and `source` broke that on purpose: the
+    web ingest writes them into EVERY instance's vault, so every instance's
+    chat scope has to be able to enumerate them. A type genuinely shared by
+    several instances cannot also be exclusive to one.
+
+    Nothing functional depended on the old property — the per-scope union
+    needs only the canonical-disjointness pinned above, and
+    ``KNOWN_TYPES_KALLE`` has no functional consumer at all (scope.py imports
+    it and mentions it in one comment; ``KALLE_CREATE_TYPES`` is a
+    hand-written literal, not derived from it).
+
+    So the assertion is narrowed rather than deleted: the overlap is pinned to
+    EXACTLY the shared ingest pair, and any future accidental collision
+    between the two instance sets still reds here.
+    """
+    overlap = KNOWN_TYPES_HYPATIA & KNOWN_TYPES_KALLE
+
+    assert overlap == {"document", "source"}
 
 
 def test_known_types_by_scope_unions_canonical_plus_extension():

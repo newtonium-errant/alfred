@@ -699,7 +699,57 @@ _DEFINITIONS: list[TypeDefinition] = [
         # auto-derives, so tagging here is the ONLY edit needed (do NOT touch
         # a KNOWN_TYPES_BY_SCOPE literal). Gate 2 (web_ingest_types_only)
         # enforces the {document, note, source} create policy.
-        available_in_scopes=frozenset({"hypatia", "web_ingest"}),
+        #
+        # ``talker`` / ``kalle`` / ``vera`` (2026-08-18) — FINDABILITY, not
+        # authorship. A document the web ingest wrote was invisible to the
+        # chat surface's own natural move: ``vault list document`` died on
+        # gate 1 with "Unknown type 'document' under scope 'talker'" while
+        # search-by-grep, search-by-glob and READ of the same path all
+        # worked, so the record existed and could be opened but could not be
+        # ENUMERATED. (Before this, none of these three was a
+        # KNOWN_TYPES_BY_SCOPE key at all, so each took the
+        # ``.get(scope, KNOWN_TYPES)`` fallback to the canonical set.)
+        #
+        # ALL FOUR instances run a web_ingest peer, so all four can hold a
+        # record of this type and all four must be able to find it. The chat
+        # scope per instance is config-driven (``instance.tool_set``):
+        # Salem -> talker, KAL-LE -> kalle, Hypatia -> hypatia, VERA -> vera.
+        # ``hypatia`` was already tagged, so this adds the other three.
+        #
+        # On the CREATE path this opens gate 1 only — ``_validate_type`` is
+        # called from exactly two places, ``vault_list`` and ``vault_create``.
+        # Create stays refused under every one of these scopes because each
+        # has its own gate-2 create allowlist and none includes ``document``;
+        # delete and the body-mutation verbs stay refused by their own gate-2
+        # rules. So on that path the read side opens and the write side does
+        # not move — asserted per scope rather than assumed symmetric.
+        #
+        # BUT ``available_in_scopes`` IS NOT A GATE-1-ONLY KNOB, and reading it
+        # as one understates the blast radius. ``known_types(scope)`` /
+        # ``KNOWN_TYPES_BY_SCOPE`` feed two further consumers, so tagging a
+        # type here widens all three surfaces at once:
+        #
+        #   * ``vault/retype.py`` ``_scoped_known_types`` (:469) — the retype
+        #     path contains NO ``check_scope`` call at all. There is no gate 2
+        #     behind it. For talker->document the refusal therefore did not
+        #     stay put; it MOVED to the ``FIELD_MAPPINGS`` feature gate, which
+        #     is a different question ("is this conversion defined?") from the
+        #     one scope policy asks ("may you author this?"). Adding a
+        #     ``(note, document)`` mapping entry would permit a retype INTO
+        #     document with nothing consulting scope policy.
+        #   * ``transport/config.py`` (:1331) — the peer recall allowlist is
+        #     built from ``known_types(instance_scope)``, so these types become
+        #     recall-eligible across the peer protocol. Latent today (no live
+        #     recall config selects them) but it is a real widening, not a
+        #     no-op.
+        #
+        # Neither is ruled a problem here and neither is changed by this lane.
+        # They are named because the next person to tag a type will read this
+        # comment to learn what tagging costs, and "gate 1 only" would have
+        # sent them looking in one place out of three.
+        available_in_scopes=frozenset(
+            {"hypatia", "web_ingest", "talker", "kalle", "vera"}
+        ),
     ),
     TypeDefinition(
         name="concept",
@@ -719,7 +769,19 @@ _DEFINITIONS: list[TypeDefinition] = [
         # "Unknown type under scope 'jeeves'" BEFORE gate 2's
         # ``jeeves_types_only`` policy ever runs. Gate 2 remains the
         # create-policy ceiling; this tag only opens gate 1.
-        available_in_scopes=frozenset({"hypatia", "web_ingest", "jeeves"}),
+        #
+        # ``talker`` / ``kalle`` / ``vera`` (2026-08-18) — findability, same
+        # reasoning as the ``document`` note above and shipped with it: a
+        # ``source`` the web ingest wrote could be read but not enumerated
+        # from the chat surface. None of the three create allowlists includes
+        # ``source``, so authorship stays where it was.
+        #
+        # ``jeeves`` stays a capture-only scope and is deliberately NOT
+        # extended here — the garage appliance runs no web ingest, and its
+        # {note, source} set is curated rather than incidental.
+        available_in_scopes=frozenset(
+            {"hypatia", "web_ingest", "jeeves", "talker", "kalle", "vera"}
+        ),
     ),
     TypeDefinition(
         name="citation",

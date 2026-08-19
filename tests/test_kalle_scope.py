@@ -177,21 +177,38 @@ def test_kalle_create_types_shape():
 # ---------------------------------------------------------------------------
 
 
+#: KAL-LE's OWN extension types — the ones no other instance claims.
+#: ``architecture`` added 2026-05-04 (see test_kalle_create_types_shape).
+KALLE_ONLY_TYPES = {"pattern", "principle", "architecture"}
+
+#: Types KAL-LE shares with other instances because the SAME record can
+#: legitimately exist on several. ``ticket`` (2026-06-11, pipeline c2) is
+#: shared with the VERA scopes; ``document`` / ``source`` (2026-08-18) are
+#: written into every instance's vault by the web ingest.
+KALLE_SHARED_TYPES = {"ticket", "document", "source"}
+
+
 def test_known_types_kalle_is_separate_set():
-    """Pattern + principle + architecture + ticket are NOT in the core
-    KNOWN_TYPES (extension types, per the per-instance principle).
-    ``architecture`` added 2026-05-04 — see test_kalle_create_types_shape
-    for the rationale. ``ticket`` added 2026-06-11 (pipeline c2): the
-    kalle tag on the shared ``ticket`` TypeDefinition lands it in
-    ``types_in_scope("kalle")`` — shared with the VERA scopes, still
-    not canonical."""
-    assert schema.KNOWN_TYPES_KALLE == {
-        "pattern", "principle", "architecture", "ticket",
-    }
-    assert "pattern" not in schema.KNOWN_TYPES
-    assert "principle" not in schema.KNOWN_TYPES
-    assert "architecture" not in schema.KNOWN_TYPES
-    assert "ticket" not in schema.KNOWN_TYPES
+    """The kalle extension set is KAL-LE-only types PLUS the types it
+    legitimately shares — and none of it is canonical.
+
+    This was an exact-four assertion until 2026-08-18. It is split rather
+    than loosened: the membership is still pinned exactly, but in two named
+    groups, so the next reader can tell "KAL-LE owns this" from "KAL-LE and
+    others both hold this" instead of reading one flat set that silently
+    mixed them. An accidental addition to EITHER group still reds here.
+
+    ``document`` / ``source`` joined the shared group because the web ingest
+    writes them into every instance's vault, so every instance's chat scope
+    must be able to enumerate them. A type several instances hold cannot also
+    be exclusive to one — and exclusivity was never what this pin protected:
+    the load-bearing claim is the not-canonical one below, which is what the
+    per-scope union (canonical | extension) actually depends on.
+    """
+    assert schema.KNOWN_TYPES_KALLE == KALLE_ONLY_TYPES | KALLE_SHARED_TYPES
+
+    for extension_type in KALLE_ONLY_TYPES | KALLE_SHARED_TYPES:
+        assert extension_type not in schema.KNOWN_TYPES
 
 
 # ---------------------------------------------------------------------------
