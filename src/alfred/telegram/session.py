@@ -57,7 +57,9 @@ class Session:
     Anthropic-format message dicts (``role`` + ``content``).
 
     Wk3 commit 8: ``opening_model`` records the model the session was
-    *opened* on (via the router + calibration overrides). ``model`` may
+    *opened* on (historically chosen by the opening-cue router +
+    calibration overrides; the router died with the Telegram retirement,
+    T5 2026-08-19). ``model`` may
     be flipped mid-session by ``/opus`` / ``/sonnet`` / implicit
     escalation; ``opening_model`` stays fixed. The diff between the two
     at close time is the "session escalated" signal the model-preference
@@ -1563,8 +1565,8 @@ def close_session(
     # empty" is distinguishable from "close failed"; that log line IS the
     # audit trail. We pop the active session but do NOT append a
     # ``closed_sessions`` entry — an empty session produced no record, so a
-    # ``record_path: ""`` entry would only pollute the router's continuation
-    # history and ``alfred talker history``. Returns ``""`` so callers skip
+    # ``record_path: ""`` entry would only pollute the closed-session
+    # continuation history and ``alfred talker history``. Returns ``""`` so callers skip
     # post-close work (substance-slug rename, capture-structuring) that would
     # have no target record.
     if not (
@@ -1642,10 +1644,11 @@ def close_session(
     rel_path = result["path"]
 
     # State cleanup: pop active, append closed-summary, save once.
-    # ``session_type`` / ``continues_from`` land here so the router can look up
-    # the most recent article/journal/brainstorm session from state alone in
-    # wk2 (plan open question #5 — state-only continuation for wk2; body-parser
-    # fallback is a wk3 task).
+    # ``session_type`` / ``continues_from`` land here so continuation
+    # lookups can find the most recent article/journal/brainstorm session
+    # from state alone (wk2 plan open question #5; originally consumed by
+    # the opening-cue router, which died with the Telegram retirement —
+    # the fields remain part of the closed-session state contract).
     state.pop_active(chat_id)
     state.append_closed({
         "session_id": session.session_id,

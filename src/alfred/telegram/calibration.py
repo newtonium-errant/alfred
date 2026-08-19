@@ -75,8 +75,8 @@ def read_calibration(vault_path: Path, user_rel_path: str) -> str | None:
 
     # Normalise: allow callers to pass either ``person/Andrew Newton`` or
     # ``person/Andrew Newton.md``. Keeps the call site simple regardless
-    # of where the path came from (config stores stems, the router emits
-    # wikilink-friendly paths).
+    # of where the path came from (config stores stems; other callers
+    # emit wikilink-friendly paths).
     rel = user_rel_path.strip()
     if not rel.endswith(".md"):
         rel = f"{rel}.md"
@@ -564,7 +564,7 @@ def _append_to_subsection(inner: str, sub: str, bullets: str) -> str:
 
 
 def _extract_text(response: Any) -> str:
-    """Pull concatenated text from an Anthropic response (shared with router.py)."""
+    """Pull concatenated text from an Anthropic response."""
     content = getattr(response, "content", None) or []
     parts: list[str] = []
     for block in content:

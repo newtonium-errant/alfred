@@ -1719,13 +1719,14 @@ async def run(
             transport_config,
             instance_name=config.instance.name,
             peer_inbox_callable=_peer_inbox_handler,
-            # instance_alias deliberately omitted — InstanceConfig.aliases is a
-            # router accept-list (case-insensitive variant matching like
-            # "Salem"→S.A.L.E.M., "Pat"→Hypatia), not a display alias.
-            # Picking aliases[0] would advertise a router variant as a primary
-            # name (e.g. "Kali" for KAL-LE). When a real consumer needs a
-            # display alias, add an explicit InstanceConfig.display_alias
-            # field rather than repurposing aliases[0].
+            # instance_alias deliberately omitted — InstanceConfig.aliases was
+            # the retired opening-cue router's accept-list (case-insensitive
+            # variant matching like "Salem"→S.A.L.E.M., "Pat"→Hypatia), not a
+            # display alias. Picking aliases[0] would advertise an accept-list
+            # variant as a primary name (e.g. "Kali" for KAL-LE). When a real
+            # consumer needs a display alias, add an explicit
+            # InstanceConfig.display_alias field rather than repurposing
+            # aliases[0].
             vault_path=Path(config.vault.path),
             send_fn=_send_via_telegram,
             # Threaded at THE production call site in the same commit that

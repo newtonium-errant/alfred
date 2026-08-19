@@ -6276,11 +6276,12 @@ async def run_turn(
     context) and vault mutations are recorded against the session.
 
     Model resolution (wk3 commit 5 bug fix): the API call uses
-    ``session.model`` — which the session-open router and the
-    ``/opus`` / ``/sonnet`` command handlers write — not
+    ``session.model`` — the per-session field that session-open writes
+    (historically also the opening-cue router + ``/opus`` / ``/sonnet``
+    bot handlers, all retired with Telegram) — not
     ``config.anthropic.model``. Wk2 accidentally read from config, which
-    meant the router's model choice and explicit switches were silently
-    ignored on every turn after open. Regression-tested in
+    meant the session's model choice was silently ignored on every turn
+    after open. Regression-tested in
     ``tests/telegram/test_run_turn_session_model.py``.
     """
     # Shared per-turn setup (user-turn append, capture short-circuit,

@@ -337,10 +337,12 @@ class InstanceConfig:
     ``name`` is the casual, greeting-friendly form ("Salem", "KAL-LE",
     "Hypatia"). ``canonical`` is the formal form used once in the SKILL's
     identity paragraph ("S.A.L.E.M.", "K.A.L.L.E.", "H.Y.P.A.T.I.A.").
-    ``aliases`` is the multi-instance router's case-insensitive accept
-    list so phone-autocorrect / voice-transcription variants still route
-    correctly (``"Salem"`` → S.A.L.E.M., ``"Pat"`` → Hypatia) without a
-    code change.
+    ``aliases`` was the multi-instance opening-cue router's
+    case-insensitive accept list (phone-autocorrect / voice-transcription
+    variants: ``"Salem"`` → S.A.L.E.M., ``"Pat"`` → Hypatia). The router
+    died with the Telegram retirement (T5, 2026-08-19); the field stays
+    for config compatibility (instance YAMLs carry it) and for any
+    future name-matching consumer.
 
     ``name`` is **required** (no default). "Alfred" is the project /
     architecture name, never an instance name — defaulting to it
