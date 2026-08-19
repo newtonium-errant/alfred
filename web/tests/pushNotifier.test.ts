@@ -99,9 +99,15 @@ describe('runPollOnce', () => {
     expect(r.reason).toBe('sent');
     expect(r.sent).toBe(2); // one item × two subs
     expect(sendPush).toHaveBeenCalledTimes(2);
-    // payload carries the title/kind/url, not the raw item.
+    // payload carries the title/kind/url, not the raw item — plus the collapse
+    // TAG, added when the digest landed. Keyed per item so one notification can
+    // never silently replace another in the tray (the worker's fallback tag was
+    // the deep link, and every needs-you push resolves to the same one).
     const payload = JSON.parse(sendPush.mock.calls[0][1] as string);
-    expect(Object.keys(payload).sort()).toEqual(['kind', 'title', 'url']);
+    expect(Object.keys(payload).sort()).toEqual(['kind', 'tag', 'title', 'url']);
+    expect(payload.tag).toBe('item:new1');
+    // Still no evidence-derived field: the lock-screen privacy rule is unchanged.
+    expect(payload).not.toHaveProperty('evidence');
     expect(writeSeenIds).toHaveBeenCalledTimes(1);
     expect(writeSeenIds.mock.calls[0][0]).toContain('new1');
   });
@@ -116,9 +122,34 @@ describe('runPollOnce', () => {
       sendPush,
     });
     const r = await runPollOnce(deps);
+    // ONE notification: the already-seen item did not earn one of its own. That
+    // is the property this test has always defended; what changed underneath it
+    // is the SHAPE of the notification, not the diff.
     expect(r.sent).toBe(1);
+    expect(r.notifications).toBe(1);
+    // Both items are outstanding, so the one notification is the digest — and it
+    // COUNTS the seen item, deliberately. The digest rolls on a fixed tag, each
+    // one replacing the last, so it has to state everything that is waiting;
+    // counting only the fresh arrival would under-report what is on the deck.
     const pushedTitles = sendPush.mock.calls.map((c) => JSON.parse(c[1] as string).title);
-    expect(pushedTitles).toEqual(['Item fresh']);
+    expect(pushedTitles).toEqual(['2 emails need you']);
+  });
+
+  it('a lone fresh item still rings AS ITSELF, title intact', async () => {
+    // The other side of the rule above, kept explicit: collapsing starts at two.
+    // A "digest" of one would trade the item's title for the word "1" and buy no
+    // reduction in interruptions.
+    process.env.PUSH_POLICY = 'needs_you';
+    const sendPush = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      readSubscriptions: vi.fn().mockResolvedValue([sub('https://p/a')]),
+      fetchNeedsYouItems: vi.fn().mockResolvedValue([item('fresh')]),
+      readSeenIds: vi.fn().mockResolvedValue(new Set<string>()),
+      sendPush,
+    });
+    const r = await runPollOnce(deps);
+    expect(r.notifications).toBe(1);
+    expect(JSON.parse(sendPush.mock.calls[0][1] as string).title).toBe('Item fresh');
   });
 
   it('prunes a subscription the push service reports Gone (410)', async () => {

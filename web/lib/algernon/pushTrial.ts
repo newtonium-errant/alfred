@@ -71,7 +71,35 @@ export const TRIAL_WINDOW_SPREAD_MIN = 90;
 // ledger row this side silently ignored, and `dueSlots` in particular must keep
 // treating a ruled slot as already attempted (it filters on sent/send_failed,
 // so it does — pinned rather than assumed).
-export type TrialRowType = 'scheduled' | 'sent' | 'send_failed' | 'receipt' | 'ruling';
+// `concluded` and `cancelled` are the EARLY END (below). `concluded` is written
+// from the operator's side (`alfred push-trial conclude`), like `ruling`;
+// `cancelled` is written HERE, one row per slot the conclusion spends.
+export type TrialRowType =
+  | 'scheduled'
+  | 'sent'
+  | 'send_failed'
+  | 'receipt'
+  | 'ruling'
+  | 'concluded'
+  | 'cancelled';
+
+/** The trial-level stop marker. Written once; the sender checks for it before
+ * every send. */
+export const ROW_CONCLUDED = 'concluded';
+/** A slot the conclusion retired without sending. */
+export const ROW_CANCELLED = 'cancelled';
+
+/**
+ * The `push_id` on a `concluded` row.
+ *
+ * The row is about the TRIAL, not a slot, but the field is present and empty
+ * rather than absent — both readers require `push_id` to be a string and treat a
+ * row without one as MALFORMED (the Python reader counts it into `skipped`,
+ * which is its corruption signal). An always-present field carrying an empty
+ * value is the shape the house rule asks for; a conditionally-present one would
+ * make "the trial was stopped" indistinguishable from "the ledger is damaged".
+ */
+export const CONCLUDED_PUSH_ID = '';
 
 export interface TrialRow {
   type: TrialRowType;
@@ -87,6 +115,14 @@ export interface TrialRow {
   verdict?: string;
   /** ISO — when he ruled. Present on `ruling`. */
   ruled_ts?: string;
+  /** ISO — when the trial was concluded. Present on `concluded`. */
+  concluded_ts?: string;
+  /** ISO — when the slot was retired unsent. Present on `cancelled`. */
+  cancelled_ts?: string;
+  /** WHY, in the operator's words. Present on `concluded` and copied onto every
+   * `cancelled` row it spends, so a slot read on its own still says why it never
+   * fired instead of merely that it didn't. */
+  reason?: string;
 }
 
 export interface TrialConfig {
@@ -213,11 +249,15 @@ export interface TrialDeps {
 }
 
 export interface TrialResult {
-  reason: 'disabled' | 'materialised' | 'no_due_slots' | 'sent';
+  reason: 'disabled' | 'materialised' | 'no_due_slots' | 'sent' | 'concluded';
   materialised: number;
   due: number;
   sent: number;
   failed: number;
+  /** Slots retired unsent by an early conclusion. Always present (0 when none),
+   * so a reader never has to tell "no cancellations" apart from "this build
+   * predates cancellation". */
+  cancelled: number;
 }
 
 /** Slots whose time has come and which have not been attempted yet.
@@ -228,10 +268,37 @@ export interface TrialResult {
  * delivery at 19:47 attributed to a 19:07 slot is not the datum it claims). The
  * failure is recorded and the slot is spent. */
 export function dueSlots(schedule: TrialSlot[], rows: TrialRow[], nowMs: number): TrialSlot[] {
-  const attempted = new Set(
-    rows.filter((r) => r.type === 'sent' || r.type === 'send_failed').map((r) => r.push_id),
+  return schedule.filter((s) => s.dueMs <= nowMs && !spentIds(rows).has(s.push_id));
+}
+
+/**
+ * Slots that are SPENT — already attempted, or retired by a conclusion. One
+ * definition, because "has this slot had its turn?" is asked in two places and
+ * two spellings of it would drift.
+ *
+ * `cancelled` belongs here for the same reason `send_failed` does: the slot is
+ * over. Omitting it would make the poller re-cancel every remaining slot on
+ * every 60-second heartbeat, writing a fresh row each time — an append-only
+ * ledger growing without bound to record a decision that was made once.
+ */
+export function spentIds(rows: TrialRow[]): Set<string> {
+  return new Set(
+    rows
+      .filter((r) => r.type === 'sent' || r.type === 'send_failed' || r.type === ROW_CANCELLED)
+      .map((r) => r.push_id),
   );
-  return schedule.filter((s) => s.dueMs <= nowMs && !attempted.has(s.push_id));
+}
+
+/**
+ * The conclusion row, if the operator ended the trial early.
+ *
+ * FIRST one wins: the trial stopped when he said so, and a second marker cannot
+ * un-stop it or move the moment it happened. (A `ruling` is the opposite — later
+ * wins, because he is allowed to correct a recollection. A conclusion is an
+ * EVENT, not an opinion, so it does not get re-decided.)
+ */
+export function concludedRow(rows: TrialRow[]): TrialRow | null {
+  return rows.find((r) => r.type === ROW_CONCLUDED) ?? null;
 }
 
 /**
@@ -245,7 +312,7 @@ export function dueSlots(schedule: TrialSlot[], rows: TrialRow[], nowMs: number)
 export async function runTrialOnce(deps: TrialDeps): Promise<TrialResult> {
   const cfg = deps.config();
   if (!cfg) {
-    return { reason: 'disabled', materialised: 0, due: 0, sent: 0, failed: 0 };
+    return { reason: 'disabled', materialised: 0, due: 0, sent: 0, failed: 0, cancelled: 0 };
   }
   const schedule = buildSchedule(cfg);
   let rows = await deps.readRows();
@@ -265,6 +332,50 @@ export async function runTrialOnce(deps: TrialDeps): Promise<TrialResult> {
     console.log(`[push:trial] schedule materialised slots=${materialised} days=${cfg.days}`);
   }
 
+  // THE EARLY END. Checked before anything is sent, because the whole value of a
+  // stop verb is that the next send does not happen.
+  //
+  // It retires EVERY unspent slot, not only the ones currently due. A check that
+  // only guarded the due ones would leave future slots sitting in the ledger as
+  // `pending` — a status surface would go on promising sends that will never
+  // come, and the operator would have to keep the poller's internals in his head
+  // to know that. One pass, and every remaining slot states its own outcome.
+  //
+  // CANCELLED, NOT SKIPPED. A silently skipped slot is indistinguishable from an
+  // instrument that stopped — which is the exact ambiguity this module was
+  // commissioned to destroy (see the three-state rule above). The cancelled row
+  // carries the reason so the ledger says why, not just that.
+  const concluded = concludedRow(rows);
+  if (concluded) {
+    const spent = spentIds(rows);
+    const remaining = schedule.filter((s) => !spent.has(s.push_id));
+    const at = new Date(deps.now()).toISOString();
+    for (const slot of remaining) {
+      await deps.appendRow({
+        type: ROW_CANCELLED,
+        push_id: slot.push_id,
+        cancelled_ts: at,
+        reason: concluded.reason || 'trial concluded early',
+      });
+    }
+    // ILB on BOTH branches: the pass that does the cancelling says how many it
+    // retired, and every later pass says it is standing down and why. A concluded
+    // trial that simply went quiet would look exactly like a dead poller.
+    console.log(
+      remaining.length > 0
+        ? `[push:trial] concluded — cancelled remaining slots=${remaining.length} reason=${concluded.reason || '(none given)'}`
+        : `[push:trial] concluded — no slots left to cancel (instrument alive, nothing owed)`,
+    );
+    return {
+      reason: 'concluded',
+      materialised,
+      due: 0,
+      sent: 0,
+      failed: 0,
+      cancelled: remaining.length,
+    };
+  }
+
   const due = dueSlots(schedule, rows, deps.now());
   if (due.length === 0) {
     console.log(
@@ -272,7 +383,7 @@ export async function runTrialOnce(deps: TrialDeps): Promise<TrialResult> {
     );
     return {
       reason: materialised ? 'materialised' : 'no_due_slots',
-      materialised, due: 0, sent: 0, failed: 0,
+      materialised, due: 0, sent: 0, failed: 0, cancelled: 0,
     };
   }
 
@@ -293,5 +404,5 @@ export async function runTrialOnce(deps: TrialDeps): Promise<TrialResult> {
       console.warn(`[push:trial] send_failed push_id=${slot.push_id} err=${err}`);
     }
   }
-  return { reason: 'sent', materialised, due: due.length, sent, failed };
+  return { reason: 'sent', materialised, due: due.length, sent, failed, cancelled: 0 };
 }

@@ -126,10 +126,21 @@ self.addEventListener('push', (event) => {
   const title = (data && typeof data.title === 'string' && data.title) || 'Algernon';
   const kind = (data && typeof data.kind === 'string' && data.kind) || '';
   const url = sanitizeDeepLink(data && data.url);
+  // A server-supplied body wins; without one the worker composes its own from
+  // the kind, exactly as before. The digest needs this because "digest · needs
+  // you" says less than nothing.
+  const body =
+    (data && typeof data.body === 'string' && data.body) || (kind ? `${kind} · needs you` : 'needs you');
+  // COLLAPSE KEY. The fallback is the deep link, which is what this always used
+  // — and that was the bug: every needs-you push resolves to `/deck`, so each
+  // one silently REPLACED the last in the tray. The sender now names the tag, so
+  // a digest rolls (one live summary) while an item that must ring alone carries
+  // its own id and cannot be overwritten by the next digest.
+  const tag = (data && typeof data.tag === 'string' && data.tag) || url;
   event.waitUntil(
     self.registration.showNotification(title, {
-      body: kind ? `${kind} · needs you` : 'needs you',
-      tag: url, // collapse repeats to the same surface
+      body,
+      tag,
       data: { url },
       icon: '/icon-192.png',
       badge: '/icon-192.png',

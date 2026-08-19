@@ -14,6 +14,21 @@ export interface PushPayload {
   kind: string;
   /** Same-origin deep link — /deck for a decision, /feed for a glance item. */
   url: string;
+  /**
+   * OPTIONAL notification body. Absent on a per-item push, where the worker
+   * composes "<kind> · needs you" itself; present on a digest, which needs to
+   * say something the kind cannot. Still subject to the privacy rule above —
+   * whatever is put here must be derivable from title/kind/counts, NEVER from
+   * `evidence`.
+   */
+  body?: string;
+  /**
+   * OPTIONAL collapse key. Notifications sharing a tag replace one another, so
+   * this decides what survives in the tray. Omitted, the worker falls back to
+   * the deep link — which is what every push used to key on, meaning they ALL
+   * shared `/deck` and quietly overwrote each other. Set it deliberately.
+   */
+  tag?: string;
 }
 
 /** The deep link for an item: decisions open the deck, everything else the feed. */

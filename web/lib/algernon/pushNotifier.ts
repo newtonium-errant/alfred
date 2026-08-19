@@ -2,7 +2,13 @@ import webpush from 'web-push';
 import type { FeedItem } from './feed';
 import { isNeedsYouItem } from './feedNeedsYou';
 import { isPushEnabled, readVapidConfig } from './pushConfig';
-import { pushPayloadFor } from './pushPayload';
+import {
+  DIGEST_MIN_ITEMS,
+  digestPayloadFor,
+  partitionForPush,
+  pushTagFor,
+} from './pushDigest';
+import { pushPayloadFor, type PushPayload } from './pushPayload';
 import { isPushEligible, readPushPolicy } from './pushPolicy';
 import {
   readSeenIds,
@@ -71,6 +77,44 @@ export function boundSeen(seen: Set<string>, openIds: Set<string>, max = SEEN_MA
   return [...keptGone, ...open];
 }
 
+/**
+ * The notifications one poll batch produces — PURE, so the collapse rule is
+ * pinnable without a store, a network, or a clock.
+ *
+ * `fresh` decides WHETHER anything rings (only newly-seen items do).
+ * `outstanding` decides what the digest SAYS. They are different sets on
+ * purpose: the digest carries a rolling tag, so each one replaces the last, and
+ * a replacing notification has to describe everything that is waiting. Summarise
+ * only the new arrivals and a second batch overwrites "3 things need you" with
+ * "2 things need you" while five are outstanding — collapsing into an
+ * under-report, which is worse than the noise this set out to fix.
+ *
+ * Three outcomes, and the boundaries between them are the design:
+ *   - every `email_urgent` item rings ALONE, with its own tag (ratified);
+ *   - a lone digestable item rings AS ITSELF — a "digest" of one is just that
+ *     item with its title replaced by the word "1", which loses information for
+ *     no reduction in interruptions;
+ *   - two or more collapse into a single counted summary.
+ */
+export function composeBatch(fresh: FeedItem[], outstanding: FeedItem[]): PushPayload[] {
+  const { individual, digestable } = partitionForPush(fresh);
+  // Tagged per item so one urgent email can never be replaced in the tray by the
+  // next one — or by the digest, which is what the shared `/deck` tag used to do.
+  const out: PushPayload[] = individual.map((it) => ({
+    ...pushPayloadFor(it),
+    tag: pushTagFor(it),
+  }));
+  if (digestable.length === 0) return out;
+  const outstandingDigestable = partitionForPush(outstanding).digestable;
+  if (outstandingDigestable.length >= DIGEST_MIN_ITEMS) {
+    out.push(digestPayloadFor(outstandingDigestable));
+    return out;
+  }
+  // Fewer than the digest floor outstanding: ring the new one(s) as themselves.
+  for (const it of digestable) out.push({ ...pushPayloadFor(it), tag: pushTagFor(it) });
+  return out;
+}
+
 function isGoneError(e: unknown): boolean {
   // web-push rejects with a statusCode; 404/410 = the browser dropped the sub.
   const code = (e as { statusCode?: number } | null)?.statusCode;
@@ -106,6 +150,12 @@ export interface PollDeps {
 export interface PollResult {
   reason: 'no_subscriptions' | 'no_new_items' | 'sent';
   fresh: number;
+  /** Distinct notifications composed for this batch — the digest's whole point.
+   * Reported ALONGSIDE `sent` rather than instead of it: `sent` counts delivery
+   * attempts (notifications × live subscriptions), so with one subscriber the
+   * two look identical and with two they do not. Collapsing them into one number
+   * would hide exactly the ratio this change exists to move. */
+  notifications: number;
   sent: number;
   pruned: number;
 }
@@ -116,7 +166,7 @@ export async function runPollOnce(deps: PollDeps): Promise<PollResult> {
   if (subs.length === 0) {
     // ILB: ran, nothing to send to.
     console.log('[push:poll] ran subs=0 (no subscriptions — nothing to send)');
-    return { reason: 'no_subscriptions', fresh: 0, sent: 0, pruned: 0 };
+    return { reason: 'no_subscriptions', fresh: 0, notifications: 0, sent: 0, pruned: 0 };
   }
 
   const items = await deps.fetchNeedsYouItems();
@@ -142,14 +192,21 @@ export async function runPollOnce(deps: PollDeps): Promise<PollResult> {
     console.log(
       `[push:poll] ran subs=${subs.length} needs_you=${items.length} policy=${policy} eligible=${eligible.length} fresh=0 (nothing new)`,
     );
-    return { reason: 'no_new_items', fresh: 0, sent: 0, pruned: 0 };
+    return { reason: 'no_new_items', fresh: 0, notifications: 0, sent: 0, pruned: 0 };
   }
+
+  // COMPOSE, then deliver. The batch decides how many notifications exist before
+  // a single one is sent, which is the whole of the digest change: one push per
+  // poll batch instead of one per item (the operator got 6+ buzzes from a single
+  // brief fire). Keeping composition pure and separate is also what makes the
+  // collapse rule testable without a network.
+  const notifications = composeBatch(fresh, eligible);
 
   let sent = 0;
   let pruned = 0;
   let liveSubs = subs;
-  for (const item of fresh) {
-    const payload = JSON.stringify(pushPayloadFor(item));
+  for (const notification of notifications) {
+    const payload = JSON.stringify(notification);
     for (const sub of liveSubs) {
       try {
         await deps.sendPush(sub, payload);
@@ -164,8 +221,12 @@ export async function runPollOnce(deps: PollDeps): Promise<PollResult> {
         }
       }
     }
-    seen.add(item.id);
   }
+  // EVERY fresh item is marked seen, whether it rang alone or was folded into a
+  // count. The seen-set answers "has this been announced?", and an item summarised
+  // in a digest HAS been — leaving it unseen would make the next poll treat it as
+  // new and ring again, which is the bug wearing a different hat.
+  for (const item of fresh) seen.add(item.id);
 
   // Persist the bounded seen-set (open ids pinned so a still-open item never
   // re-rings after the cap rolls over). Pin the ELIGIBLE open ids — those are
@@ -173,9 +234,9 @@ export async function runPollOnce(deps: PollDeps): Promise<PollResult> {
   const openIds = new Set(eligible.map((i) => i.id));
   await deps.writeSeenIds(boundSeen(seen, openIds, SEEN_MAX));
   console.log(
-    `[push:poll] ran subs=${subs.length} needs_you=${items.length} policy=${policy} eligible=${eligible.length} fresh=${fresh.length} sent=${sent} pruned=${pruned}`,
+    `[push:poll] ran subs=${subs.length} needs_you=${items.length} policy=${policy} eligible=${eligible.length} fresh=${fresh.length} notifications=${notifications.length} sent=${sent} pruned=${pruned}`,
   );
-  return { reason: 'sent', fresh: fresh.length, sent, pruned };
+  return { reason: 'sent', fresh: fresh.length, notifications: notifications.length, sent, pruned };
 }
 
 // --- the real deps + the singleton ------------------------------------------
