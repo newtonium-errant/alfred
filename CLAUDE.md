@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Algernon** is the system name for the multi-instance AI platform — a Python monorepo containing five AI-powered tools for managing an Obsidian vault, deployable as multiple independent instances (Salem, KAL-LE, Hypatia) that talk to each other over a peer protocol. Each instance is its own daemon set with its own vault, config, and Telegram bot slot, but they share one codebase. **Telegram retirement is in progress as of 2026-08-14:** Salem's bot is live; Hypatia, VERA and KAL-LE run web-only.
+**Algernon** is the system name for the multi-instance AI platform — a Python monorepo containing five AI-powered tools for managing an Obsidian vault, deployable as multiple independent instances (Salem, KAL-LE, Hypatia) that talk to each other over a peer protocol. Each instance is its own daemon set with its own vault and config, but they share one codebase. **Telegram is fully retired as of 2026-08-18:** all four bots went dark on 2026-08-14/15 (`bot_token: ""` + `web.web_only: true`) and the operator revoked every BotFather token on 2026-08-18, so the tokens are cryptographically dead. Every instance runs web-only. No code path can deliver a Telegram message; the send leg raises `TelegramUnavailable` by construction (see `src/alfred/telegram/send.py`).
 
 The codebase itself is still named `alfred` (package, CLI entry point `alfred`, default config `config.yaml`, env vars `ALFRED_*`) — that's a legacy name kept for stability; **Algernon** is the operator-facing platform name. When talking about the system as a concept (architecture, deployment, multi-instance behavior), call it Algernon. When referring to the codebase, CLI, or any specific identifier, use the existing `alfred` form. Instance names (Salem, KAL-LE, Hypatia) are unchanged.
 
@@ -16,7 +16,7 @@ All tools share one config (`config.yaml` per instance), one CLI entry point (`a
 | **Janitor** | Scans vault for structural issues (broken links, invalid frontmatter, orphans) and fixes them |
 | **Distiller** | Extracts latent knowledge (assumptions, decisions, constraints) from operational records |
 | **Surveyor** | Embeds vault content, clusters semantically, labels clusters, discovers relationships |
-| **Talker** | Voice/text chat with Alfred, vault-grounded — web app on every instance, plus Telegram where that bot is still live (Salem only) |
+| **Talker** | Voice/text chat with Alfred, vault-grounded — web app on every instance (Telegram retired 2026-08-18) |
 
 ## Install & Run
 
