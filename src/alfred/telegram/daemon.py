@@ -2053,7 +2053,6 @@ async def run(
         and config.voice_train.command_enabled
     ):
         from . import voice_train as _voice_train
-        from . import bot as _bot_mod
 
         async def _voice_train_dm(chat_id: int, text: str) -> None:
             """Best-effort DM to the operator on extraction completion / failure.
@@ -2083,9 +2082,9 @@ async def run(
         queue_path = (
             Path(config.voice_train.queue_path)
             if config.voice_train.queue_path
-            else _bot_mod._resolve_queue_path(config)
+            else _voice_train.resolve_queue_path(config)
         )
-        scope = _bot_mod._voice_train_scope_for(config)
+        scope = _voice_train.voice_train_scope_for(config)
         voice_train_task = asyncio.create_task(
             _voice_train.run_worker(
                 queue_path=queue_path,

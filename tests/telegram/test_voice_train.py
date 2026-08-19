@@ -885,13 +885,13 @@ def test_voice_train_config_block_absent_default_none() -> None:
 
 def test_voice_train_scope_for_hypatia(tmp_path: Path) -> None:
     config = _make_hypatia_config(tmp_path)
-    assert bot._voice_train_scope_for(config) == "hypatia"
+    assert voice_train.voice_train_scope_for(config) == "hypatia"
 
 
 def test_voice_train_scope_for_kalle(tmp_path: Path) -> None:
     config = _make_hypatia_config(tmp_path)
     config.instance.tool_set = "kalle"
-    assert bot._voice_train_scope_for(config) == "kalle"
+    assert voice_train.voice_train_scope_for(config) == "kalle"
 
 
 def test_voice_train_scope_for_salem_falls_through_to_talker(
@@ -899,7 +899,7 @@ def test_voice_train_scope_for_salem_falls_through_to_talker(
 ) -> None:
     config = _make_hypatia_config(tmp_path)
     config.instance.tool_set = ""
-    assert bot._voice_train_scope_for(config) == "talker"
+    assert voice_train.voice_train_scope_for(config) == "talker"
 
 
 # ---------------------------------------------------------------------------
@@ -915,7 +915,7 @@ def test_resolve_queue_path_explicit(tmp_path: Path) -> None:
             queue_path=str(tmp_path / "custom_queue.jsonl"),
         ),
     )
-    resolved = bot._resolve_queue_path(config)
+    resolved = voice_train.resolve_queue_path(config)
     assert resolved == tmp_path / "custom_queue.jsonl"
 
 
@@ -925,7 +925,7 @@ def test_resolve_queue_path_per_instance_default(tmp_path: Path) -> None:
         tmp_path,
         voice_train_config=VoiceTrainConfig(command_enabled=True),
     )
-    resolved = bot._resolve_queue_path(config)
+    resolved = voice_train.resolve_queue_path(config)
     assert resolved == Path("./data") / "hypatia" / "extraction_queue.jsonl"
 
 
