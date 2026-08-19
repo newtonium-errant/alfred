@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { UNDO_MS } from '../../lib/algernon/feedConstants';
+import { SLOT_LABELS, SLOT_ORDER, UNDO_MS, type BoardSlot } from '../../lib/algernon/feedConstants';
 import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import {
   BOARD_UNSLOTTED,
   boardCoverage,
   boardCoverageIsLow,
+  boardSlotOf,
   boardSlotsWithADone,
   boardStackSize,
   boardStacks,
@@ -25,6 +26,7 @@ import { RingsHeader } from './RingsHeader';
 import { useBoardGrace } from './useBoardGrace';
 import type { UseRingCompletionResult } from './useRingCompletion';
 import { useSlotAccept } from './useSlotAccept';
+import { useSort } from './useSort';
 
 // ═══════════ THE DAY BOARD — home's top module (Phase C, lane C1) ═══════════
 //
@@ -63,7 +65,12 @@ export interface SlotBoardProps {
 
 export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: SlotBoardProps) {
   const accept = useSlotAccept({ onAuthExpired });
+  const sorter = useSort({ onAuthExpired });
   const grace = useBoardGrace(completion);
+  // Which row has its slot picker open. Per-board rather than per-row so a
+  // second tap elsewhere closes the first — the picker is a choice in
+  // progress, and two open at once would offer two answers to one question.
+  const [sortingId, setSortingId] = useState<string | null>(null);
   const now = useMemo(() => nowProp ?? new Date(), [nowProp]);
   const [openDone, setOpenDone] = useState<ReadonlySet<string>>(() => new Set());
   const [openSnoozed, setOpenSnoozed] = useState<ReadonlySet<string>>(() => new Set());
@@ -89,6 +96,15 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items]);
 
+  // The board's slot seam: a row sorted THIS SESSION groups under the slot the
+  // operator just chose, not under the `evidence.slot` it still carries (the
+  // producer re-emits tomorrow morning). Falls through to `boardSlotOf` for
+  // every row nobody has sorted, so an untouched board is byte-identical.
+  const slotOf = useCallback(
+    (it: FeedItem): string => sorter.sortedInto(it.id) ?? boardSlotOf(it),
+    [sorter],
+  );
+
   // A row completed HERE stays where it is (green, struck) rather than jumping
   // into the collapsed done drill — completion is a stage, not a disappearance,
   // and during the grace window the row the operator may want back must be on
@@ -96,8 +112,11 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
   // session"; once a fresh render confirms it, reconcile drops the flag and the
   // item settles into the drill.
   const stacks = useMemo(
-    () => boardStacks(items ?? [], stageOf, now, { stayInPlace: grace.optimisticallyDone }),
-    [items, stageOf, now, grace.optimisticallyDone],
+    () => boardStacks(items ?? [], stageOf, now, {
+      stayInPlace: grace.optimisticallyDone,
+      slotOf,
+    }),
+    [items, stageOf, now, grace.optimisticallyDone, slotOf],
   );
   const balanced = boardSlotsWithADone(stacks);
   // Which unrecorded rows are still reachable on this board — read from the
@@ -133,7 +152,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     });
   };
 
-  const renderRow = (it: FeedItem, opts: { reason?: string | null } = {}) => {
+  const renderRow = (it: FeedItem, opts: { reason?: string | null; sortable?: boolean } = {}) => {
     const stage = stageOf(it);
     const done = stage === 'done';
     const suggested = stage === 'suggested';
@@ -148,7 +167,8 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     const undoable = ringItemUndoable(it);
     const compBusy = completion.busy(it.id);
     const acceptBusy = accept.busy(it.id);
-    const itemError = completion.errorFor(it.id) ?? accept.errorFor(it.id);
+    const itemError = completion.errorFor(it.id) ?? accept.errorFor(it.id) ?? sorter.errorFor(it.id);
+    const sortBusy = sorter.busy(it.id);
     const unrecordedHere = grace.unrecordedIds.has(it.id);
     const notice = completion.noticeFor(it.id);
     const rows = evidenceRows(it.evidence);
@@ -263,6 +283,67 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           )}
         </div>
 
+        {/* THE SORT AFFORDANCE (2026-08-19). Rendered on residue rows only —
+            the operator's report was that these rows had DONE and nothing else,
+            so "not sorted" was a permanent state rather than a question.
+
+            SINGLE TAP, NO ARM STAGE, and that is a judgement about the verb
+            rather than a shortcut. The arm-then-confirm rule governs verbs whose
+            effect is hard to take back; a sort writes one frontmatter field and
+            is undone by sorting again, which the picker below makes as cheap as
+            the first choice. Arming it would spend a tap protecting a decision
+            the operator can simply remake.
+
+            THREE CO-EQUAL BUTTONS, in `SLOT_ORDER`, with no default and no
+            pre-selection: the slots are a permission system, not a priority
+            stack, and a picker whose first option is visually the "main" one
+            would encode exactly the ranking the taxonomy denies. This is also
+            why the deck's swipe carries none of them — see `ACTION_META`. */}
+        {opts.sortable && (
+          <div className="mt-1 pl-4">
+            {sortingId === it.id ? (
+              <div data-testid="board-sort-picker" className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-console-ink-dim">
+                  Where does this go?
+                </span>
+                {SLOT_ORDER.map((slot) => (
+                  <button
+                    key={slot}
+                    type="button"
+                    data-testid={`board-sort-${slot}`}
+                    disabled={sortBusy}
+                    onClick={() => {
+                      sorter.sort(it, slot as BoardSlot);
+                      setSortingId(null);
+                    }}
+                    className="rounded-lg border border-console-edge-bright bg-console-raise px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
+                  >
+                    {SLOT_LABELS[slot] ?? slot}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  data-testid="board-sort-cancel"
+                  onClick={() => setSortingId(null)}
+                  className="rounded-lg px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink-dim"
+                >
+                  Not now
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                data-testid="board-sort-open"
+                disabled={sortBusy}
+                onClick={() => setSortingId(it.id)}
+                className="rounded-lg border border-console-edge px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink-dim disabled:opacity-50"
+              >
+                {sortBusy ? '…' : 'Sort →'}
+              </button>
+            )}
+          </div>
+        )}
+
         {/* A row carrying an unrecorded ✓ shows THAT and not the transient error
             line, which reports the same failure in weaker words and disappears
             at the next poll (the shared hook supersedes its own overrides once
@@ -376,7 +457,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
           <>
             {stack.today.length > 0 && (
               <ul data-testid={`board-today-${stack.key}`} className="mt-2 flex flex-col gap-2">
-                {stack.today.map((it) => renderRow(it))}
+                {stack.today.map((it) => renderRow(it, { sortable: residue }))}
               </ul>
             )}
 
@@ -386,7 +467,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                   Carried over
                 </p>
                 <ul data-testid={`board-carryover-${stack.key}`} className="mt-1.5 flex flex-col gap-2">
-                  {stack.carryover.map((it) => renderRow(it, { reason: carryoverReason(it, now) }))}
+                  {stack.carryover.map((it) => renderRow(it, { reason: carryoverReason(it, now), sortable: residue }))}
                 </ul>
               </div>
             )}
@@ -400,7 +481,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                   If you want
                 </p>
                 <ul data-testid={`board-candidates-${stack.key}`} className="mt-1.5 flex flex-col gap-2">
-                  {stack.candidates.map((it) => renderRow(it))}
+                  {stack.candidates.map((it) => renderRow(it, { sortable: residue }))}
                 </ul>
               </div>
             )}
@@ -502,7 +583,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
                 </button>
                 {browsing && (
                   <ul data-testid={`board-overflow-${stack.key}`} className="mt-2 flex flex-col gap-2">
-                    {stack.overflow.map((it) => renderRow(it, { reason: carryoverReason(it, now) }))}
+                    {stack.overflow.map((it) => renderRow(it, { reason: carryoverReason(it, now), sortable: residue }))}
                   </ul>
                 )}
               </div>

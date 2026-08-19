@@ -658,3 +658,44 @@ def test_the_free_text_refusal_reaches_the_operator_as_a_sentence(
     assert result.ok is False
     assert result.status == "unsupported_item"
     assert "no record behind it" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# 5. Cross-language drift — the client's copy of the verb map
+# ---------------------------------------------------------------------------
+
+
+def test_the_web_sort_map_matches_the_backend_ceiling() -> None:
+    """CROSS-SURFACE DRIFT PIN, server half.
+
+    The PWA hardcodes its own ``SORT_ACTION_BY_SLOT`` because TypeScript cannot
+    import a Python dict AND because the tap has to name a verb before any
+    response exists to derive it from — the same reason the snooze ladder keeps
+    a copy. So the two can drift in silence, and neither side can notice alone:
+    a verb here the client never sends is a capability nobody can reach, and a
+    verb the client sends that the ceiling refuses 400s in the operator's hand.
+
+    Deliberately PARSED from the other language's source rather than restated —
+    writing the expected pairs here would create a third copy to drift. Both
+    directions are asserted: same slots, same verbs, no extras either way.
+
+    Mutation: rename a verb on either side alone → this reds and names it.
+    """
+    import re
+
+    from alfred.daily_sync.action_router import SORT_ACTION_BY_SLOT
+
+    ts = (
+        Path(__file__).resolve().parents[2]
+        / "web" / "lib" / "algernon" / "feedConstants.ts"
+    ).read_text(encoding="utf-8")
+    block = re.search(
+        r"export const SORT_ACTION_BY_SLOT[^=]*=\s*\{(.*?)\}", ts, re.S,
+    )
+    assert block, "SORT_ACTION_BY_SLOT not found in feedConstants.ts"
+    web_map = dict(re.findall(r"(\w+):\s*'([^']+)'", block.group(1)))
+
+    # Positive control: the parse really found something, so an expression that
+    # silently matched an empty block cannot make the comparison vacuous.
+    assert len(web_map) == 3, web_map
+    assert {v: k for k, v in SORT_ACTION_BY_SLOT.items()} == web_map

@@ -648,3 +648,28 @@ export const SLOT_LABELS: Record<string, string> = {
   fuel: 'Fuel',
 };
 export const SLOT_ORDER: readonly string[] = ['duty', 'rhythm', 'fuel'];
+
+/** A canonical slot key — the three, and never `unslotted`. */
+export type BoardSlot = 'duty' | 'rhythm' | 'fuel';
+
+/**
+ * Slot → the `action_id` that records it (2026-08-19, the sort affordance).
+ *
+ * MIRRORS `SORT_ACTION_BY_SLOT` in `daily_sync/action_router.py`, which is the
+ * ceiling and therefore the authority. TypeScript cannot import a Python dict,
+ * so this is a hand-kept copy of the kind the house normally deletes — and it
+ * is kept here for the same reason the snooze ladder's copy is: the tap has to
+ * name a verb before any response comes back, so there is nothing on the wire
+ * to derive it from at the moment it is needed. A cross-language drift pin
+ * reads the OTHER language's source rather than duplicating the expectation a
+ * third time (`tests/tier/test_sort_affordance.py`).
+ *
+ * The verb ids carry the slot rather than taking it as a parameter because the
+ * ceiling is a STATIC map: a single `sort` verb would need its target as
+ * per-request data, which `FEED_ACTIONS` cannot express.
+ */
+export const SORT_ACTION_BY_SLOT: Record<BoardSlot, string> = {
+  duty: 'sort_duty',
+  rhythm: 'sort_rhythm',
+  fuel: 'sort_fuel',
+};
