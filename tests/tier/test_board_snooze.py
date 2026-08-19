@@ -485,12 +485,52 @@ def test_snooze_dispatch_imports_no_completion_writer() -> None:
 
 
 def test_snooze_ceiling_admits_exactly_the_ratified_verbs() -> None:
+    """The board kind's ceiling is a CLOSED set — a verb arriving here without a
+    deliberate edit to this list is the silent-widening this pin exists to stop.
+
+    Widened once, on 2026-08-19, for the three sort verbs (the operator's "these
+    items have no way of being sorted" report). The list is spelled out verbatim
+    rather than composed from the router's own constants: importing
+    ``SORT_ACTIONS`` to build the expectation would make the pin agree with any
+    future change to that tuple, which is precisely the property a ceiling pin
+    must not have.
+    """
     from alfred.daily_sync.action_router import FEED_ACTIONS
 
     assert set(FEED_ACTIONS["slot_suggestion"]) == {
         "done", "undo_done", "accept", "snooze_1d", "snooze_3d", "snooze_7d",
         "snooze_until_i_say", "unsnooze",
+        "sort_duty", "sort_rhythm", "sort_fuel",
     }
+
+
+def test_the_sort_verbs_carry_no_gesture() -> None:
+    """The three slots are CO-EQUAL, and this is the pin that keeps them so.
+
+    ``verbsFromActions`` (web) promotes a served verb to a SWIPE verb by the
+    presence of a ``gesture`` field and nothing else. A swipe surface has an
+    affirm and a reject, so gesturing one of Duty / Rhythm / Fuel would make it
+    the "yes" and the other two its alternatives — the priority stack
+    ``tier/slots.py`` and the board's voice doctrine both say these are not.
+
+    The failure this guards against is silent in the worst way: adding a gesture
+    is a one-word edit that breaks no test, changes no Python behaviour, and
+    reshapes an operator-ratified taxonomy on a surface no Python reader looks
+    at. Asserted over ACTION_META (the presentation table) because that is where
+    a gesture would be added.
+
+    Positive control in the same test: ``accept`` DOES carry a gesture, so this
+    is not passing merely because the lookup is empty or the kind is missing.
+    """
+    from alfred.daily_sync.action_router import ACTION_META, SORT_ACTIONS
+
+    meta = ACTION_META["slot_suggestion"]
+    assert meta["accept"].get("gesture") == "affirm"
+    for verb in SORT_ACTIONS:
+        assert verb in meta, verb
+        assert "gesture" not in meta[verb], verb
+        # Labelled, because an unlabelled ceiling verb ships under its raw id.
+        assert meta[verb]["label"] and meta[verb]["label"] != verb, verb
 
 
 def test_the_web_ladder_matches_the_backend_ladder() -> None:

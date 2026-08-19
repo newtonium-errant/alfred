@@ -223,12 +223,18 @@ function servedActions(item: FeedItem): ServedAction[] {
  *
  * GESTURE-DRIVEN, and this is the load-bearing part. The deck is a two-way swipe
  * surface; a served verb becomes a swipe verb ONLY by carrying a `gesture`. That
- * is not a shortcut, it is the contract: `ACTION_META` gives `slot_suggestion`
- * exactly one presentation entry (`accept`), and its other seven ceiling verbs
- * (done, undo_done, the four snoozes, unsnooze) ship with raw-id labels and NO
- * gesture BY DESIGN, because they belong to the board and the hold menu rather
- * than to a swipe. Mapping by position or by name instead would hand the deck
- * five-to-seven verbs on a surface that renders one.
+ * is not a shortcut, it is the contract: of `slot_suggestion`'s ceiling verbs,
+ * exactly ONE (`accept`) carries a gesture. Every other one is gesture-free BY
+ * DESIGN, in two groups for two different reasons — the board/hold-menu verbs
+ * (done, undo_done, the snoozes, unsnooze) because they belong to those surfaces
+ * rather than to a swipe, and the sort verbs because the three slots are
+ * CO-EQUAL and gesturing one would make it the "yes" (see `ACTION_META`).
+ *
+ * A LABEL IS NOT A GESTURE, and the distinction is the whole rule: the sort
+ * verbs ship labelled and still do not swipe, while the board verbs ship under
+ * raw ids. Presentation and gesture are independent, and only the gesture makes
+ * a swipe verb. Mapping by position or by name instead would hand the deck every
+ * verb the kind has, on a surface that renders one.
  *
  * Returns null when the item was served no gesture-bearing verb at all — an FYI
  * kind, a kind the ceiling does not know, or a degraded payload. Null means "no
@@ -648,3 +654,28 @@ export const SLOT_LABELS: Record<string, string> = {
   fuel: 'Fuel',
 };
 export const SLOT_ORDER: readonly string[] = ['duty', 'rhythm', 'fuel'];
+
+/** A canonical slot key — the three, and never `unslotted`. */
+export type BoardSlot = 'duty' | 'rhythm' | 'fuel';
+
+/**
+ * Slot → the `action_id` that records it (2026-08-19, the sort affordance).
+ *
+ * MIRRORS `SORT_ACTION_BY_SLOT` in `daily_sync/action_router.py`, which is the
+ * ceiling and therefore the authority. TypeScript cannot import a Python dict,
+ * so this is a hand-kept copy of the kind the house normally deletes — and it
+ * is kept here for the same reason the snooze ladder's copy is: the tap has to
+ * name a verb before any response comes back, so there is nothing on the wire
+ * to derive it from at the moment it is needed. A cross-language drift pin
+ * reads the OTHER language's source rather than duplicating the expectation a
+ * third time (`tests/tier/test_sort_affordance.py`).
+ *
+ * The verb ids carry the slot rather than taking it as a parameter because the
+ * ceiling is a STATIC map: a single `sort` verb would need its target as
+ * per-request data, which `FEED_ACTIONS` cannot express.
+ */
+export const SORT_ACTION_BY_SLOT: Record<BoardSlot, string> = {
+  duty: 'sort_duty',
+  rhythm: 'sort_rhythm',
+  fuel: 'sort_fuel',
+};

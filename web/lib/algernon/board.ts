@@ -331,6 +331,23 @@ export interface BoardStackOptions {
    * confirms it has come back.
    */
   stayInPlace?: (item: FeedItem) => boolean;
+  /**
+   * The slot an item belongs to, OVERRIDING `boardSlotOf` — the optimistic seam
+   * for the sort affordance, and the exact counterpart of `stageOf` above.
+   *
+   * A sort writes the operator's ruling to the backing record, and the item does
+   * not carry its new `evidence.slot` until the next producer emit — which for
+   * this kind is tomorrow morning. Without this seam the row would sit under
+   * "Not sorted yet" for the rest of the day after he had just told the system
+   * where it goes, which reads as the tap having done nothing. That is the same
+   * failure the whole affordance exists to remove, so the override belongs here
+   * rather than in the component: this is the GROUPING choke-point, and a
+   * component that re-bucketed rows after the model had bucketed them would be a
+   * second opinion about the axis.
+   *
+   * Defaults to `boardSlotOf`, so a caller with no overrides is byte-identical.
+   */
+  slotOf?: (item: FeedItem) => string;
 }
 
 /**
@@ -353,6 +370,7 @@ export function boardStacks(
   opts: BoardStackOptions = {},
 ): BoardStack[] {
   const stayInPlace = opts.stayInPlace ?? (() => false);
+  const slotOf = opts.slotOf ?? boardSlotOf;
   const visible = items.filter(
     (it) => it.kind === 'slot_suggestion' && ringItemVisibleToday(it, now),
   );
@@ -360,7 +378,7 @@ export function boardStacks(
   const bySlot = new Map<string, FeedItem[]>();
   for (const key of SLOT_ORDER) bySlot.set(key, []);
   for (const it of visible) {
-    const key = boardSlotOf(it);
+    const key = slotOf(it);
     if (!bySlot.has(key)) bySlot.set(key, []);
     bySlot.get(key)?.push(it);
   }

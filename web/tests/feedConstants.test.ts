@@ -72,10 +72,13 @@ describe('slot verbs, READ FROM THE WIRE — Accept / Skip (#102 1b-ii)', () => 
 
   it('a COMMITTED slot is offered NO swipe verb — the server withheld its accept', () => {
     // The per-item narrowing, seen from the client end: `actions_for_item` drops
-    // `accept` for a non-candidate, and the slot's other seven ceiling verbs
-    // (done / undo_done / the snoozes) carry no gesture, so nothing is left to
-    // swipe. This is why `isDeckDealt` can stop dealing it without the client
-    // knowing anything about slot lifecycle rules beyond its stage.
+    // `accept` for a non-candidate, and EVERY other ceiling verb this kind has
+    // (done / undo_done / the snoozes / the sort verbs) carries no gesture, so
+    // nothing is left to swipe. This is why `isDeckDealt` can stop dealing it
+    // without the client knowing anything about slot lifecycle rules beyond its
+    // stage. Stated as "every other" rather than as a count on purpose — the
+    // count expired the first time the ceiling grew (2026-08-19, the sort
+    // verbs), and the invariant is what the assertion below actually rests on.
     expect(verbsFromActions(feedItem('slot_suggestion', { tier: 1 }))).toBeNull();
   });
 

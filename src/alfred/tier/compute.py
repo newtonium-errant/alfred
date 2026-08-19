@@ -2061,6 +2061,30 @@ def compute_today_view(
     # STAGE 1 CONTRACT: this stamps and reports. It does NOT feed
     # ``_compute_daily_goal`` (still tier-based) and the rings still group by
     # tier. Nothing operator-visible changes except the coverage line.
+    # HYDRATE CURATED ENTRIES FIRST — without this the classifier is blind on
+    # every operator-curated row, and rule 1 ("the operator's word is final") is
+    # DEAD for them.
+    #
+    # ``_curated_to_tier_entry`` builds from a ``daily_curation`` entry, which
+    # carries only the item's identity (a wikilink, or a record+text pair) — it
+    # has no due date, no ``slot:``, no ``self_care``, no ``due_pattern``,
+    # because those live on the BACKING RECORD and the curation block never
+    # copied them. Every auto lane reads them off the record; the curated
+    # converter was the one construction site that did not, so a curated entry
+    # arrived here with all four classifier inputs empty and classified
+    # ``unslotted / no_signal`` no matter what its record said.
+    #
+    # MEASURED, 2026-08-19: a task with ``due: 2026-08-21`` AND ``slot: duty``
+    # written on it, curated into T2, reported ``slot='unslotted',
+    # slot_rule='no_signal'``. That is the operator's screenshot — four dated
+    # tasks under "NOT SORTED YET" — and it is also why writing a slot from the
+    # board would have appeared to do nothing.
+    #
+    # Hydration is CONSERVATIVE: it fills only fields the curated entry left
+    # empty, so a value the converter did set still wins, and it is a pure read
+    # of the record. It cannot change any already-slotted row.
+    _hydrate_curated_entries(vault_path, (t1, t2, t3))
+
     _slot_verdicts: list[slots.SlotVerdict] = []
     for _lane in (t1, t2, t3):
         for _entry in _lane:
@@ -2101,6 +2125,80 @@ def compute_today_view(
         daily_goal=daily_goal,
         slot_coverage=slot_coverage,
     )
+
+
+def _hydrate_curated_entries(vault_path: Path, lanes) -> None:
+    """Fill a curated entry's missing classifier inputs from its backing record.
+
+    In place, and only where the entry is EMPTY — an auto-built entry already
+    read these off the record, and a curated entry that somehow carries a value
+    keeps it. Reading, never writing: the slot axis is a producer-time overlay
+    and this is part of computing it.
+
+    Which fields, and why exactly these four: they are the inputs
+    :func:`alfred.tier.slots.classify_slot` reads — ``explicit_slot`` (rule 1),
+    ``self_care`` (rule 3), ``has_due_pattern`` (rule 4) and ``due_iso``
+    (rule 6). ``target_cadence_days`` (rule 5) is deliberately NOT hydrated
+    here: it is a per-ITEM routine field rather than a record-level one, and
+    guessing it from the record would place a habit anchor in Rhythm on the
+    strength of a sibling item's cadence.
+
+    Task-origin entries only. A curated ROUTINE-origin entry names a record and
+    an item text, and the per-item fields would have to be located inside the
+    record's ``items`` list — a different read with a different failure mode
+    (a renamed item silently hydrating from nothing). That is worth doing and
+    is deliberately not smuggled in here; the entry keeps its current behaviour.
+
+    Failure is silent BY DESIGN: an unreadable or absent record leaves the entry
+    exactly as it was, which is the pre-existing behaviour. A projection that
+    raised because one task file was mid-write would take the whole morning
+    board down over a field that is, at worst, a missing hint.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    from alfred.routine.config import _coerce_self_care
+
+    cache: dict[str, dict] = {}
+
+    def _fm_for(rel_path: str) -> dict:
+        if rel_path not in cache:
+            cache[rel_path] = {}
+            try:
+                post = frontmatter.load(str(vault_path / rel_path))
+                cache[rel_path] = dict(post.metadata or {})
+            except Exception:  # noqa: BLE001 — a hint is never worth the board
+                pass
+        return cache[rel_path]
+
+    for lane in lanes:
+        for entry in lane:
+            if entry.origin != "task":
+                continue
+            # Only CURATED entries reach here empty on all four; an auto entry
+            # populated them at construction. Testing the fields rather than the
+            # source string keeps this correct if a new curated source appears.
+            needs = (
+                entry.explicit_slot is None
+                or not entry.due_iso
+                or not entry.self_care
+                or not entry.has_due_pattern
+            )
+            if not needs:
+                continue
+            rel = (entry.path or "").strip()
+            if not rel:
+                continue
+            fm = _fm_for(rel)
+            if not fm:
+                continue
+            if entry.explicit_slot is None and fm.get("slot") is not None:
+                entry.explicit_slot = str(fm["slot"]).strip()
+            if not entry.due_iso and fm.get("due"):
+                entry.due_iso = str(fm["due"]).strip()
+            if not entry.self_care:
+                entry.self_care = _coerce_self_care(fm.get("self_care", False))
+            if not entry.has_due_pattern and fm.get("due_pattern"):
+                entry.has_due_pattern = True
 
 
 def _entry_key(entry: TierEntry, task_key, routine_key) -> str:

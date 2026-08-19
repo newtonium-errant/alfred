@@ -1,6 +1,6 @@
 {
   "README": [
-    "GENERATED FROM THE SERVER, then guarded by a pin — do not hand-edit.",
+    "GENERATED FROM THE SERVER, then guarded by a pin \u2014 do not hand-edit.",
     "Source of truth: alfred.daily_sync.action_router.actions_for(kind).",
     "Regenerate when the ceiling changes; tests/feed/test_feed_advertised_actions.py",
     "::TestTheFEFixtureMatchesWhatIsServed reds if this drifts from actions_for.",
@@ -263,6 +263,21 @@
       {
         "verb": "unsnooze",
         "label": "unsnooze",
+        "weight": "light"
+      },
+      {
+        "verb": "sort_duty",
+        "label": "Duty",
+        "weight": "light"
+      },
+      {
+        "verb": "sort_rhythm",
+        "label": "Rhythm",
+        "weight": "light"
+      },
+      {
+        "verb": "sort_fuel",
+        "label": "Fuel",
         "weight": "light"
       }
     ],
