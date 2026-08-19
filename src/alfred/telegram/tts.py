@@ -97,13 +97,16 @@ async def synthesize(
     turns that into a text-fallback reply).
 
     ``speed`` — optional 0.7-1.2 float. When provided, forwarded to
-    ElevenLabs as ``voice_settings.speed``. Callers resolve the
-    preference via :func:`speed_pref.resolve_tts_speed` before calling
-    so each TTS path consistently respects the user's calibration. When
-    ``None``, the setting is omitted and ElevenLabs uses its own
-    default (currently 1.0). Range validation is the caller's
-    responsibility — this function does NOT clamp or reject out-of-
-    range values so the caller can surface meaningful errors earlier.
+    ElevenLabs as ``voice_settings.speed``. The live caller
+    (``web/routes_brief_audio.py``) threads the client-supplied
+    ``?speed=`` query param; the vault-persisted per-user preference
+    lookup this originally paired with (``speed_pref``, fed by the
+    Telegram ``/speed`` command) was deleted with the retirement — T5
+    2026-08-19. When ``None``, the setting is omitted and ElevenLabs
+    uses its own default (currently 1.0). Range validation is the
+    caller's responsibility — this function does NOT clamp or reject
+    out-of-range values so the caller can surface meaningful errors
+    earlier.
     """
     if not cfg.api_key:
         raise TtsNotConfigured("elevenlabs api_key is empty")

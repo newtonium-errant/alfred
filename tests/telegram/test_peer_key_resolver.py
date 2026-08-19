@@ -182,11 +182,15 @@ def test_normalize_instance_name_behaviour_is_frozen(
 ) -> None:
     """``_normalize_instance_name`` output is a STORE KEY — do not change.
 
-    ``speed_pref`` persists per-instance TTS preferences under this
-    function's output. Widening its collapse rule (e.g. to also strip
-    dashes, as ``collapse_peer_name`` does) would orphan every stored
-    preference on the box. #30 deliberately added a SEPARATE helper
-    rather than changing this one; this pin guards that decision.
+    ``routine/config.py`` keys per-instance match-calibration state
+    files under this function's output, and ``orchestrator.py`` derives
+    PI-daemon instance names through it (the original citation here —
+    ``speed_pref``'s preference store — was deleted in T5 2026-08-19;
+    the frozen contract outlives it). Widening the collapse rule (e.g.
+    to also strip dashes, as ``collapse_peer_name`` does) would orphan
+    state keyed under ``kal-le`` on the box. #30 deliberately added a
+    SEPARATE helper rather than changing this one; this pin guards that
+    decision.
     """
     assert _normalize_instance_name(raw) == expected
 
