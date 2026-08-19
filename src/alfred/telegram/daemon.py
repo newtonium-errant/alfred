@@ -2157,6 +2157,16 @@ async def run(
             shutdown_event.set()
 
         transport_server_task.add_done_callback(_on_transport_server_done)
+        # ``allowed_users`` IS NOT DEAD TELEGRAM CONFIG — do not remove it.
+        # This is the transport SCHEDULER's operator-id source, and it is
+        # independent of the retired Telegram surface: entry [0] is what the
+        # scheduler addresses reminders and drains to, so emptying the list
+        # stops the scheduler on every instance (see the else-branch below,
+        # which logs ``scheduler_no_user``). The field reads like a Telegram
+        # allowlist because that is what it originally was, which is exactly
+        # why it needs this note — the next reader sweeping for retired
+        # Telegram config would otherwise delete a live dependency.
+        #
         # VERA MVP: tolerate AllowedUser or bare-int entry (see the
         # pending-items resolver site above for the getattr rationale).
         _sched_first_user = (
