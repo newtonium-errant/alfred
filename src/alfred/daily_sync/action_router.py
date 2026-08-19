@@ -63,6 +63,7 @@ from alfred.feed.model import (
     make_id,
 )
 from alfred.telegram.capture_sections import is_known_section
+from alfred.tier import slots
 from alfred.vault.attribution import contest_marker
 from alfred.vault.paths import VaultContainmentError, resolve_in_vault
 
@@ -92,6 +93,12 @@ STATUS_INVALID_ACTION = "invalid_action"
 STATUS_ERROR = "error"
 # Phase C slice 1 (board DONE path) — the slot-completion vocabulary.
 STATUS_UNDONE = "undone"  # undo_done succeeded → item back to open
+# A sort applied. ITS OWN STATUS rather than ``acted``, because the feed item's
+# state is deliberately unchanged: the operator told the system where an item
+# belongs, which is not the same act as deciding the card. Reusing ``acted``
+# would make every coarse "was this decided?" reader — including the deck's own
+# gate — answer yes about a card still sitting on the board awaiting a ✓.
+STATUS_SORTED = "sorted"
 STATUS_UNSUPPORTED_ITEM = "unsupported_item"  # lane has no completion writer (task/unknown)
 # #63a — a contested attribution item goes BACK to needs-you and stays OPEN.
 # It needs its own status because every other successful act ends the item's
@@ -127,6 +134,32 @@ UNDO_DONE_ACTION = "undo_done"
 # invalid_action, the provenance guard).
 ACCEPT_ACTION = "accept"
 SLOT_KIND = "slot_suggestion"
+
+# slot_suggestion SORT actions (2026-08-19 — the operator's "no way of being
+# sorted" report). Three verbs because the slots are three, and CO-EQUAL because
+# the taxonomy says so: ``tier/slots.py`` and the board's voice doctrine both
+# state that Duty / Rhythm / Fuel are a permission system rather than a priority
+# stack. So there is no "yes" among them and none of them takes a gesture — see
+# the ACTION_META entry below, where that decision is made visible.
+#
+# DISTINCT FROM ``accept``, and the distinction is the same one DEFER_ACTIONS
+# draws against ``snooze_*``: ``accept`` commits an item to today's tier list
+# (``confirm_slot_candidate`` writes ``tier_curation`` and assigns NO slot);
+# a sort writes the SLOT axis onto the item's backing record and touches the day
+# plan not at all. Tier and slot are orthogonal — one verb meaning both would be
+# the same-concept-divergent-constants trap wearing sorting clothes.
+#
+# The verb id carries the slot so the ceiling stays a static map: a single
+# ``sort`` verb would need the target slot as per-request data, which the
+# ceiling cannot express (the ``correct``/``correction_target`` exception exists
+# precisely because that shape is awkward, and it is not worth repeating for a
+# closed set of three).
+SORT_ACTION_BY_SLOT: dict[str, str] = {
+    "sort_duty": slots.SLOT_DUTY,
+    "sort_rhythm": slots.SLOT_RHYTHM,
+    "sort_fuel": slots.SLOT_FUEL,
+}
+SORT_ACTIONS: tuple[str, ...] = tuple(SORT_ACTION_BY_SLOT)
 
 # R3 board snooze. Imported from the tier layer so the duration ladder has ONE
 # definition — the ceiling above, this dispatch, and the store all read it.
@@ -307,6 +340,12 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # ``snooze_until_i_say`` is #14's fourth rung — the old board Park, now a
     # duration choice on the one defer verb rather than a second verb with its
     # own semantics. Same dispatcher, same store, no end date.
+    # sort_duty / sort_rhythm / sort_fuel: kwargs UNUSED like every other slot
+    # verb, intercepted by :func:`_dispatch_slot_sort` — a THIRD dispatcher
+    # beside completion and snooze, for the same structural reason those two are
+    # separate: no completion, accept or snooze writer is reachable from a sort
+    # under any input, so "sorting never fakes a commitment" holds by
+    # construction rather than by convention.
     "slot_suggestion": {
         "done": {},
         "undo_done": {},
@@ -316,6 +355,7 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "snooze_7d": {},
         "snooze_until_i_say": {},
         "unsnooze": {},
+        **{_verb: {} for _verb in SORT_ACTIONS},
     },
     # email_urgent (#27 slice 1) — ack-only capability ceiling. Like slot's, the
     # kwargs are UNUSED: an ``email_urgent`` ack does NOT synthesize a
@@ -450,6 +490,26 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
     },
     "slot_suggestion": {
         "accept": {"label": "Take it", "weight": "light", "gesture": _GESTURE_AFFIRM},
+        # The sort verbs. LABELLED so they do not ship under raw ids, and
+        # deliberately GESTURE-FREE — which on this surface means "menu verb,
+        # not swipe verb" (`verbsFromActions`). Two reasons, and the first is
+        # the operator's own ruling rather than a UI convenience:
+        #
+        #   1. The three slots are CO-EQUAL. A swipe surface has an affirm and a
+        #      reject, so putting one slot on a gesture would make it the "yes"
+        #      and the others the alternatives — the priority stack the taxonomy
+        #      explicitly is not. There is no honest two-way reading of a
+        #      three-way co-equal choice.
+        #   2. `slot_suggestion` already ships seven of its eight verbs
+        #      gesture-free for exactly this reason (they belong to the board
+        #      and the hold menu, not to a swipe). These are the same case.
+        #
+        # LIGHT, not heavy: a sort is reversible by re-sorting, writes one
+        # frontmatter field, and destroys nothing — an arm stage would spend a
+        # tap protecting a decision the operator can simply make again.
+        "sort_duty": {"label": "Duty", "weight": "light"},
+        "sort_rhythm": {"label": "Rhythm", "weight": "light"},
+        "sort_fuel": {"label": "Fuel", "weight": "light"},
     },
     "email_urgent": {
         "ack": {"label": "Got it", "weight": "light", "gesture": _GESTURE_AFFIRM},
@@ -1576,6 +1636,123 @@ def _tier_writer_detail(kind: str, item_text: str) -> str:
     return f"could not record completion for '{item_text}'"
 
 
+# --- slot_suggestion sort (the "Not sorted yet" path) ------------------------
+
+
+def _dispatch_slot_sort(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    vault_path: Path | None,
+) -> ActResult:
+    """Apply a slot_suggestion sort — record the operator's slot ruling on the
+    item's backing record via :func:`alfred.tier.sort_writer.assign_slot`.
+
+    The operator's 2026-08-19 report is the whole brief: an item the classifier
+    honestly refused to place had DONE as its only affordance, so "not sorted"
+    was a permanent state rather than a question. This dispatcher is the answer
+    to the question.
+
+    **IT DOES NOT TOUCH FEED STATE, and that is the design rather than an
+    omission.** A sort is orthogonal to the card's lifecycle: the item is still
+    on today's board, still completable, still acceptable if it was a candidate.
+    Marking it ``acted`` would clear it off the board as though the operator had
+    decided it — turning "I told you where this belongs" into "I dealt with
+    this", which is the same lying-affordance class the lane is closing. What
+    changes instead is the RECORD, and the next projection re-emits the item
+    with its new ``evidence.slot``; the board then draws it in its slot because
+    that is the only thing the board ever read.
+
+    Acts on the feed item's OWN stamped evidence (the trusted-producer class the
+    sibling slot dispatchers read), never ``last_batch``. Runs inside the
+    caller's per-item mutex.
+    """
+    target_slot = SORT_ACTION_BY_SLOT.get(action_id)
+    if target_slot is None:
+        # Unreachable through the ceiling, which already refused any unmapped
+        # verb. Kept because this function is one refactor away from a caller
+        # that forgets, and guessing a slot is the one thing it must never do.
+        log.info(
+            "feed.act.slot.sort_unknown_verb", id=feed_item_id, action=action_id,
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            f"'{action_id}' is not a sort action", feed_item_id, action_id,
+        )
+
+    if vault_path is None:
+        return ActResult(
+            False, STATUS_ERROR,
+            "vault not configured — can't sort this item",
+            feed_item_id, action_id,
+        )
+
+    from alfred.tier.sort_writer import assign_slot
+
+    evidence = dict(getattr(item, "evidence", None) or {})
+    result = assign_slot(
+        Path(vault_path),
+        origin=str(evidence.get("origin") or ""),
+        slot=target_slot,
+        path=str(evidence.get("path") or ""),
+        routine_record=evidence.get("routine_record"),
+        item_text=evidence.get("item_text"),
+    )
+
+    if result.ok:
+        log.info(
+            "feed.act.slot.sorted", id=feed_item_id, action=action_id,
+            slot=result.slot, origin=result.origin, target=result.target,
+            changed=result.changed,
+        )
+        return ActResult(
+            True, STATUS_SORTED,
+            f"sorted into {result.slot}", feed_item_id, action_id,
+            # The FE's optimistic flip: the board moves the row into this stack
+            # without waiting for the next producer emit. ``idempotent_noop``
+            # renders identically on purpose — the operator asked for this slot
+            # and this slot is where it is, whether or not a byte changed.
+            render={"slot": result.slot, "sorted": True},
+        )
+
+    log.info(
+        "feed.act.slot.sort_failed", id=feed_item_id, action=action_id,
+        slot=target_slot, kind=result.kind, origin=result.origin,
+    )
+    return ActResult(
+        False,
+        # A record that isn't there / an item text that no longer matches is the
+        # card having moved on, not a bad request — the same reading
+        # ``unsupported_item`` carries for a lane with no writer.
+        STATUS_UNSUPPORTED_ITEM,
+        _sort_writer_detail(result.kind),
+        feed_item_id, action_id,
+    )
+
+
+def _sort_writer_detail(kind: str) -> str:
+    """Human detail for a sort refusal. Each branch names WHAT could not be
+    done, never what the operator did wrong."""
+    from alfred.tier.sort_writer import (
+        SORT_KIND_THIN_EVIDENCE,
+        SORT_KIND_UNKNOWN_ITEM,
+        SORT_KIND_UNKNOWN_RECORD,
+    )
+
+    if kind == SORT_KIND_UNKNOWN_RECORD:
+        return "the record behind this one isn't there anymore — nothing to sort"
+    if kind == SORT_KIND_UNKNOWN_ITEM:
+        return "this item isn't on its record under that name anymore — nothing to sort"
+    if kind == SORT_KIND_THIN_EVIDENCE:
+        return (
+            "this one is a free-text note with no record behind it, so there's "
+            "nowhere to keep a slot for it"
+        )
+    return "could not sort this item"
+
+
 # --- slot_suggestion accept (board day-planning path) ------------------------
 
 
@@ -1981,13 +2158,34 @@ def _act_locked(
     # done-acted item stays the idempotent already_acted noop.
     #
     # Every other (kind, action) on a non-open item is the noop.
+    #
+    # EXCEPTION 3 (2026-08-19): a SORT verb on a slot item. Sorting is
+    # orthogonal to the card's decision lifecycle — it writes the slot axis on
+    # the backing record and changes nothing about whether the item is planned
+    # or finished. An accepted item is ``state=acted`` and is still ON THE BOARD
+    # (``ringItemVisibleToday`` keeps today's acted items visible), so it can sit
+    # in the "Not sorted yet" stack exactly like an open one, and refusing to
+    # sort it would rebuild the very dead end this lane exists to remove.
+    #
+    # RETIRED IS DELIBERATELY NOT EXEMPT. A retired card left its producer's open
+    # set, which for this kind means the entry is no longer in today's projection
+    # at all — its backing record may be closed, renamed or gone. Writing a slot
+    # onto that is a guess about something the system has stopped tracking, and
+    # the honest refusal below is the better answer.
     _is_slot_undo = item.kind == SLOT_KIND and action_id == UNDO_DONE_ACTION
     _is_slot_done_on_accepted = (
         item.kind == SLOT_KIND
         and action_id == DONE_ACTION
         and getattr(item, "acted_action", None) == ACCEPT_ACTION
     )
-    if item.state != STATE_OPEN and not (_is_slot_undo or _is_slot_done_on_accepted):
+    _is_slot_sort = (
+        item.kind == SLOT_KIND
+        and action_id in SORT_ACTION_BY_SLOT
+        and item.state != STATE_RETIRED
+    )
+    if item.state != STATE_OPEN and not (
+        _is_slot_undo or _is_slot_done_on_accepted or _is_slot_sort
+    ):
         # RETIRED IS NOT ALREADY-ACTED, and the difference is the operator's.
         # A retired card left its producer's open set — the section stopped
         # offering it — which is a fact about the producer and not a decision by
@@ -2173,6 +2371,15 @@ def _act_locked(
             return _dispatch_slot_snooze(
                 feed_item_id, action_id, item,
                 feed_store=feed_store, config=config,
+            )
+        if action_id in SORT_ACTION_BY_SLOT:
+            # The SORT path. Intercepted alongside the snooze and before the
+            # completion dispatcher for the same structural reason: no
+            # completion, accept or snooze writer is reachable from a sort under
+            # any input, so a sort can never fake a commitment or a done.
+            return _dispatch_slot_sort(
+                feed_item_id, action_id, item,
+                feed_store=feed_store, vault_path=vault_path,
             )
         if action_id == ACCEPT_ACTION:
             # Board day-planning: commit an auto-surfaced candidate onto today's

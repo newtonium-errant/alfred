@@ -58,6 +58,11 @@ _HTTP_STATUS_BY_STATUS: dict[str, int] = {
     "acked": 200,
     "already_acted": 200,
     "undone": 200,
+    # A sort applied (the item's slot ruling was written). Listed explicitly
+    # even though the ok=True fallback below would also yield 200: the fallback
+    # is a safety net for statuses nobody thought about, and a status this map
+    # stays silent on reads as one of those.
+    "sorted": 200,
     "stale_item": 409,
     # PY-C item 2. 409 alongside ``stale_item`` because it is the same answer
     # from the operator's side — the card moved on without him — and the deck's
