@@ -46,7 +46,24 @@
 //     404/500 controls. Every authed route prerenders its pre-auth branch, so
 //     the restyled components are not in the prerendered output at all. The
 //     bump is owed by the two facts above, not by the whole shell moving.
-const CACHE_VERSION = 'v7';
+// v8: the composer deletion. ONE trigger, and it is the stylesheet URL again —
+//     no markup moved this time. Deleting `components/chat/Composer.tsx` took
+//     with it the Tailwind classes only that component used, so the generated
+//     stylesheet shrank (29556 → 29379 bytes, `npx tailwindcss -c
+//     tailwind.config.cjs -i styles/globals.css --minify`) and its content hash
+//     changed with it. All FOUR SHELL_ROUTES name that file by hash in their
+//     precached HTML, so a v7 client pairs its cached shells with a stylesheet
+//     URL this build no longer serves.
+//     THE NOISE FLOOR WAS ESTABLISHED FIRST, because without it this diff
+//     proves nothing: the base tree was built TWICE and the two outputs
+//     compared. Across identical source the per-page chunk hashes DO move
+//     (`chunks/pages/index-*.js`) while the stylesheet hash does NOT. So the
+//     chunk churn carries no signal and the CSS hash carries all of it.
+//     WHAT DID NOT CHANGE, checked rather than assumed: the prerendered <body>
+//     of all four SHELL_ROUTES is byte-identical, and so is `/chat`'s — which
+//     is prerendered but is NOT a SHELL_ROUTE, and prerenders its pre-auth
+//     branch, where no composer of either kind has ever appeared.
+const CACHE_VERSION = 'v8';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.

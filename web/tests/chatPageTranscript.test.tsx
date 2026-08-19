@@ -4,7 +4,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 // #54 — the FE thread, END TO END through the real page.
 //
 // WHY THIS TEST EXISTS AND WHY IT IS NOT A UNIT TEST. `transcript` is an
-// optional parameter threaded through four layers (Composer → chat.tsx →
+// optional parameter threaded through four layers (UnifiedComposer → chat.tsx →
 // useChat → chatApi) before it reaches the wire. Every one of those layers can
 // be pinned in isolation and still drop the value at the join: a call site that
 // forgets the argument type-checks fine (passing fewer arguments is legal TS),
@@ -36,8 +36,8 @@ vi.mock('../components/chat/VoiceCapture', () => ({
       mock-stt
     </button>
   ),
-  // `UnifiedComposer` imports this beside the component. Both doors pass the
-  // same `idPrefix`, so the button above is reachable under either.
+  // `UnifiedComposer` imports this beside the component; without it the mocked
+  // module has no such export and the import is `undefined` at call time.
   sttErrorMessage: () => 'Couldn’t transcribe that.',
 }));
 
@@ -107,12 +107,6 @@ function lastBodyTo(url: string): Record<string, unknown> | null {
   return JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
 }
 
-async function readyPage() {
-  render(<ChatPage />);
-  // The composer only appears once bootstrap resolves a session.
-  await waitFor(() => expect(screen.queryByTestId('composer-input')).not.toBeNull());
-}
-
 beforeEach(() => {
   spoken.text = 'clean the chicken tracker';
   mockReplace.mockReset();
@@ -122,117 +116,21 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
-  // The flag-ON block below stubs env; without this the stub would leak into
-  // whatever test ran next and silently move it to the other door.
-  vi.unstubAllEnvs();
 });
 
+// ONE DOOR. This file used to make every assertion below TWICE — once against
+// the legacy composer /chat rendered with NEXT_PUBLIC_UNIFIED_COMPOSER unset,
+// once against the unified one it rendered with the flag on. The
+// composer-deletion lane removed the flag and the legacy component, so the
+// duplicate half went with them.
+//
+// Only one pin was unique to that half and it is kept, ported below: the
+// over-long transcript drop. Everything else the legacy block asserted is
+// asserted here about the door that actually serves /chat.
 describe('/chat — a voice-seeded send carries the transcript to the wire', () => {
-  it('the STREAM body carries the raw transcript alongside the edited message', async () => {
-    await readyPage();
-    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
-
-    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
-    await waitFor(() => expect(input.value).toBe('clean the chicken tracker'));
-    // The operator fixes the mis-hearing before sending — the whole point of the
-    // loop. The SENT text is the correction; the TRANSCRIPT is what was heard.
-    fireEvent.change(input, { target: { value: 'clean the chicken tractor' } });
-    fireEvent.click(screen.getByTestId('composer-send'));
-
-    await waitFor(() => expect(lastBodyTo('/api/chat/stream')).not.toBeNull());
-    const body = lastBodyTo('/api/chat/stream')!;
-    expect(body.message).toBe('clean the chicken tractor');
-    expect(body.transcript).toBe('clean the chicken tracker');
-    expect(body.kind).toBe('voice');
-  });
-
-  it('the buffered TURN body carries it too (the stream-fallback entry point)', async () => {
-    // Two entry points, two pins: the /chat/turn relay is a separate handler
-    // box-side, and a transcript threaded onto only one of them is half a feature.
-    installFetch({ streamable: false });
-    await readyPage();
-    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
-
-    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
-    await waitFor(() => expect(input.value).toBe('clean the chicken tracker'));
-    fireEvent.change(input, { target: { value: 'clean the chicken tractor' } });
-    fireEvent.click(screen.getByTestId('composer-send'));
-
-    await waitFor(() => expect(lastBodyTo('/api/chat/turn')).not.toBeNull());
-    const body = lastBodyTo('/api/chat/turn')!;
-    expect(body.message).toBe('clean the chicken tractor');
-    expect(body.transcript).toBe('clean the chicken tracker');
-    expect(body.kind).toBe('voice');
-  });
-
-  it('a TYPED send is byte-identical to the pre-feature body — absent, not null', async () => {
-    await readyPage();
-    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
-
-    fireEvent.change(input, { target: { value: 'just typing' } });
-    fireEvent.click(screen.getByTestId('composer-send'));
-
-    await waitFor(() => expect(lastBodyTo('/api/chat/stream')).not.toBeNull());
-    const body = lastBodyTo('/api/chat/stream')!;
-    // ABSENT, not `transcript: null` / `transcript: ""` — a present-but-empty key
-    // is a different wire shape, and the backend's "an older client" branch keys
-    // on the field simply not being there.
-    expect('transcript' in body).toBe(false);
-    expect(body.kind).toBe('text');
-  });
-
-  it('an over-long transcript is dropped, and the turn still sends', async () => {
-    // Capture is telemetry. If an oversized transcript rode along it would fail
-    // the BFF's zod bound and 400 the whole turn — the operator would lose a
-    // message he spoke, to a learning feature. Dropping it is the honest trade.
-    spoken.text = 'x'.repeat(MAX_TRANSCRIPT_CHARS + 1);
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    await readyPage();
-
-    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
-    const input = screen.getByTestId('composer-input') as HTMLTextAreaElement;
-    await waitFor(() => expect(input.value.length).toBe(MAX_TRANSCRIPT_CHARS + 1));
-    fireEvent.change(input, { target: { value: 'short after all' } });
-    fireEvent.click(screen.getByTestId('composer-send'));
-
-    await waitFor(() => expect(lastBodyTo('/api/chat/stream')).not.toBeNull());
-    const body = lastBodyTo('/api/chat/stream')!;
-    expect(body.message).toBe('short after all');
-    expect('transcript' in body).toBe(false);
-    // ILB: the drop is announced, never silent — a missing transcript otherwise
-    // looks identical to a broken capture. Lengths only, never the words.
-    expect(warn).toHaveBeenCalledTimes(1);
-    const said = String(warn.mock.calls[0][0]);
-    expect(said).toContain('transcript dropped');
-    expect(said).toContain(String(MAX_TRANSCRIPT_CHARS));
-  });
-});
-
-// THE SAME THREAD, THROUGH THE DOOR PRODUCTION ACTUALLY USES.
-//
-// Everything above renders /chat with the flag unset, which is the LEGACY
-// composer. Since #97 went live (NEXT_PUBLIC_UNIFIED_COMPOSER baked ON in the
-// box build) that is the rollback door, not the live one — so the end-to-end
-// pin whose entire reason for existing is "a parameter threaded through four
-// layers can be dropped at any join, silently, and type-check fine" was, for
-// the composer the operator actually types into, not being made at all.
-//
-// The join is genuinely different on this side, which is exactly why the pin
-// cannot be assumed to carry: `UnifiedComposer.submit` reaches `onSend` through
-// its own fanout, and its transcript argument is passed from a DIFFERENT call
-// site than the legacy composer's. Same wire, same assertion, different code.
-//
-// The legacy block above is kept as-is. That door is the rollback, and the
-// bake window is not over.
-describe('/chat under the flag — the unified door carries the transcript too', () => {
   async function readyUnifiedPage() {
-    vi.stubEnv('NEXT_PUBLIC_UNIFIED_COMPOSER', '1');
     render(<ChatPage />);
     await waitFor(() => expect(screen.queryByTestId('unified-input')).not.toBeNull());
-    // The door under test, asserted rather than assumed: if the flag ever stops
-    // selecting this composer, these tests must fail as "the wrong door" rather
-    // than quietly re-pin the legacy one a second time.
-    expect(screen.queryByTestId('composer-input')).toBeNull();
   }
 
   it('the STREAM body carries the raw transcript alongside the edited message', async () => {
@@ -272,6 +170,10 @@ describe('/chat under the flag — the unified door carries the transcript too',
     // The control the two pins above need. Without it "transcript is present"
     // proves nothing about the threading: a composer that hard-coded the field
     // on every send would satisfy them both and be wrong in the commonest case.
+    //
+    // ABSENT, not `transcript: null` / `transcript: ""` — a present-but-empty
+    // key is a different wire shape, and the backend's "an older client" branch
+    // keys on the field simply not being there.
     await readyUnifiedPage();
     const input = screen.getByTestId('unified-input') as HTMLTextAreaElement;
 
@@ -282,5 +184,35 @@ describe('/chat under the flag — the unified door carries the transcript too',
     const body = lastBodyTo('/api/chat/stream')!;
     expect('transcript' in body).toBe(false);
     expect(body.kind).toBe('text');
+  });
+
+  it('an over-long transcript is dropped, and the turn still sends', async () => {
+    // PORTED FROM THE DELETED LEGACY BLOCK — the one pin that half made and this
+    // one did not. Capture is telemetry. If an oversized transcript rode along
+    // it would fail the BFF's zod bound and 400 the whole turn: the operator
+    // would lose a message he spoke, to a learning feature. Dropping it is the
+    // honest trade, and it is made END TO END here rather than at the hook
+    // (`useComposerText.test.tsx` pins the drop itself) because what this asks
+    // is whether the TURN still reaches the wire without it.
+    spoken.text = 'x'.repeat(MAX_TRANSCRIPT_CHARS + 1);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await readyUnifiedPage();
+
+    fireEvent.click(screen.getByTestId('composer-voice-mock-use'));
+    const input = screen.getByTestId('unified-input') as HTMLTextAreaElement;
+    await waitFor(() => expect(input.value.length).toBe(MAX_TRANSCRIPT_CHARS + 1));
+    fireEvent.change(input, { target: { value: 'short after all' } });
+    fireEvent.click(screen.getByTestId('unified-send'));
+
+    await waitFor(() => expect(lastBodyTo('/api/chat/stream')).not.toBeNull());
+    const body = lastBodyTo('/api/chat/stream')!;
+    expect(body.message).toBe('short after all');
+    expect('transcript' in body).toBe(false);
+    // ILB: the drop is announced, never silent — a missing transcript otherwise
+    // looks identical to a broken capture. Lengths only, never the words.
+    expect(warn).toHaveBeenCalledTimes(1);
+    const said = String(warn.mock.calls[0][0]);
+    expect(said).toContain('transcript dropped');
+    expect(said).toContain(String(MAX_TRANSCRIPT_CHARS));
   });
 });

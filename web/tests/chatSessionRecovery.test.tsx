@@ -5,11 +5,47 @@ import { friendlyError } from '../lib/algernon/useChat';
 
 vi.mock('../components/chat/VoiceCapture', () => ({
   VoiceCapture: () => <button type="button">mock-stt</button>,
+  // `UnifiedComposer` imports this alongside the component; without it the
+  // mocked module has no such export and the import is `undefined` at call time.
+  sttErrorMessage: () => 'Couldn’t transcribe that.',
 }));
 
-import { Composer } from '../components/chat/Composer';
+import { UnifiedComposer } from '../components/chat/UnifiedComposer';
 
 // #94 (c)+(d) — the operator's words survive, and the copy tells the truth.
+//
+// THE SEED PINS BELOW MOVED DOORS. They were written against the legacy
+// `Composer`, which the composer-deletion lane removed; they now drive
+// `UnifiedComposer`, which is what /chat renders. The property is unchanged and
+// so are the assertions — what changed is that they are now made about the
+// composer an operator's held text actually comes back into. The rule itself
+// lives in `useComposerText` and is pinned there directly
+// (`useComposerText.test.tsx`); these pins are the door's half of it, and the
+// two are not redundant: a door that stopped passing `seedText` through would
+// leave every hook pin green and lose the text in the field.
+
+/** The composer asks for its ingest/batch targets on mount; keep it off the network. */
+function stubTargets() {
+  (globalThis as unknown as { fetch: unknown }).fetch = vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ targets: [] }),
+  }));
+}
+
+function renderComposer(props: Partial<React.ComponentProps<typeof UnifiedComposer>> = {}) {
+  stubTargets();
+  return render(
+    <UnifiedComposer
+      onSend={vi.fn()}
+      instance="salem"
+      instanceLabel="Salem"
+      submitIngest={vi.fn()}
+      submitBatchRequest={vi.fn()}
+      {...props}
+    />,
+  );
+}
 
 describe('honest copy (#94d)', () => {
   it('turn_in_flight says what is happening, not "something went wrong"', () => {
@@ -43,29 +79,39 @@ describe('honest copy (#94d)', () => {
 });
 
 describe('composed text survives a dead session (#94c)', () => {
-  it('seeds the composer with the held text', () => {
+  it('seeds the composer with the held text', async () => {
     const onSeedConsumed = vi.fn();
-    render(
-      <Composer onSend={vi.fn()} seedText="the reply I had composed" onSeedConsumed={onSeedConsumed} />,
-    );
-    const box = screen.getByTestId('composer-input') as HTMLTextAreaElement;
-    expect(box.value).toBe('the reply I had composed');
+    renderComposer({ seedText: 'the reply I had composed', onSeedConsumed });
+
+    const box = screen.getByTestId('unified-input') as HTMLTextAreaElement;
+    await waitFor(() => expect(box.value).toBe('the reply I had composed'));
     expect(onSeedConsumed).toHaveBeenCalled();
   });
 
-  it('does NOT clobber text the operator has already started rewriting', () => {
+  it('does NOT clobber text the operator has already started rewriting', async () => {
     // Re-composing is a visible choice; overwriting it would be the same loss
     // pointed the other way.
-    const { rerender } = render(<Composer onSend={vi.fn()} seedText={null} />);
-    const box = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+    const { rerender } = renderComposer({ seedText: null });
+    const box = screen.getByTestId('unified-input') as HTMLTextAreaElement;
     fireEvent.change(box, { target: { value: 'already rewriting this' } });
-    rerender(<Composer onSend={vi.fn()} seedText="the old held text" />);
-    expect(box.value).toBe('already rewriting this');
+
+    rerender(
+      <UnifiedComposer
+        onSend={vi.fn()}
+        instance="salem"
+        instanceLabel="Salem"
+        submitIngest={vi.fn()}
+        submitBatchRequest={vi.fn()}
+        seedText="the old held text"
+      />,
+    );
+
+    await waitFor(() => expect(box.value).toBe('already rewriting this'));
   });
 
   it('a null seed leaves the composer empty', async () => {
-    render(<Composer onSend={vi.fn()} seedText={null} />);
-    const box = screen.getByTestId('composer-input') as HTMLTextAreaElement;
+    renderComposer({ seedText: null });
+    const box = screen.getByTestId('unified-input') as HTMLTextAreaElement;
     await waitFor(() => expect(box.value).toBe(''));
   });
 });
