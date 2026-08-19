@@ -729,7 +729,6 @@ async def run(
     transport_app = None
     transport_state = None
     transport_config = None
-    send_lock_map: dict[int, asyncio.Lock] = {}
     try:
         from alfred.transport.config import load_from_unified as load_transport
         from alfred.transport.server import (
@@ -752,9 +751,7 @@ async def run(
         # consumers that used to read that ``[]`` as a delivery. Built by a
         # module-level factory rather than defined inline so the contract has
         # a home and a test that does not need a daemon.
-        _send_via_telegram = build_send_via_telegram(
-            None, send_lock_map=send_lock_map,
-        )
+        _send_via_telegram = build_send_via_telegram()
 
         # Build the bare app — no resources wired yet.
         transport_app = build_transport_app(

@@ -5,23 +5,19 @@ dep) so the call surface stays tiny and testable. Tests mock the
 module-level :func:`synthesize` function directly — no httpx transport
 mock required.
 
-Telegram voice-message upload uses PTB's ``Bot.send_voice`` with the
-audio bytes wrapped as an ``InputFile``. The audio format ElevenLabs
-returns for Turbo v2.5 is ``audio/mpeg`` (``.mp3``), which Telegram
-accepts both as voice-messages (via ``send_voice``) and as document
-uploads (via ``send_document``) for the oversize-fallback path.
-
-Size caps:
-    * Telegram voice-message limit: ~50 MB (Bot API), but playback is
-      clean up to ~20 MB. We use the 50 MB threshold as the
-      hard fallback — above it, we upload as a document instead.
-    * A 300-word summary at Turbo v2.5 rates to roughly 2-4 MB of MP3,
-      comfortably under any practical cap.
+Telegram retirement note (2026-08-19, T4 C4): this module used to also
+carry the Telegram upload leg (``send_voice_to_telegram`` — PTB
+``Bot.send_voice`` with an ``InputFile``-wrapped payload, 50 MB
+document-fallback). Its only production caller was the deleted
+``alfred.telegram.bot`` /brief handler, so it went with the surface. The
+SYNTHESIS side of this module is live and channel-independent — the web
+brief-audio route (``alfred.web.routes_brief_audio``) and
+``alfred.web.tts_elevenlabs`` consume :func:`synthesize` /
+:func:`resolve_voice_id` today.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Final
 
 import httpx
@@ -55,11 +51,6 @@ _VOICE_NAME_TO_ID: Final[dict[str, str]] = {
     "Josh": "TxGEqnHWrfWFTfGW9XjX",
     "Sam": "yoZ06aMxZJJ28mfd3POQ",
 }
-
-
-# Hard upper bound for Telegram sendVoice. Above this, we upload as a
-# document instead (PTB ``send_document``). 50 MB is the Bot API cap.
-_VOICE_MAX_BYTES: Final[int] = 50 * 1024 * 1024
 
 
 # --- Exceptions -----------------------------------------------------------
@@ -167,61 +158,6 @@ async def synthesize(
     return audio
 
 
-# --- Telegram side-effect helpers ----------------------------------------
-
-
-@dataclass(frozen=True)
-class _TelegramSendResult:
-    """Result of a Telegram send. Used by tests to assert behaviour."""
-
-    mode: str  # "voice" or "document"
-    size_bytes: int
-
-
-async def send_voice_to_telegram(
-    bot: Any,
-    chat_id: int,
-    audio_bytes: bytes,
-    caption: str = "",
-    filename: str = "brief.mp3",
-) -> _TelegramSendResult:
-    """Upload the audio to Telegram as a voice-message (or document fallback).
-
-    For audio <50 MB we use ``send_voice`` which renders as a voice
-    bubble in the Telegram UI. Above 50 MB we fall back to
-    ``send_document`` so the user still receives the file — they can
-    play it via their device's player.
-
-    ``bot`` is a PTB ``Bot`` instance (``ctx.bot``). We import PTB's
-    ``InputFile`` lazily so this module stays importable without the
-    telegram SDK on systems where PTB isn't installed (for example,
-    the CI-free voice extras path).
-    """
-    from io import BytesIO
-    from telegram import InputFile
-
-    size = len(audio_bytes)
-    if size > _VOICE_MAX_BYTES:
-        log.info(
-            "talker.tts.document_fallback",
-            chat_id=chat_id,
-            size_bytes=size,
-        )
-        await bot.send_document(
-            chat_id=chat_id,
-            document=InputFile(BytesIO(audio_bytes), filename=filename),
-            caption=caption or None,
-        )
-        return _TelegramSendResult(mode="document", size_bytes=size)
-
-    await bot.send_voice(
-        chat_id=chat_id,
-        voice=InputFile(BytesIO(audio_bytes), filename=filename),
-        caption=caption or None,
-    )
-    return _TelegramSendResult(mode="voice", size_bytes=size)
-
-
 # --- Summary compression --------------------------------------------------
 
 # Used by /brief to shrink a ``## Structured Summary`` block to ~300 words
@@ -292,6 +228,5 @@ __all__ = [
     "TtsNotConfigured",
     "resolve_voice_id",
     "synthesize",
-    "send_voice_to_telegram",
     "compress_summary_for_tts",
 ]

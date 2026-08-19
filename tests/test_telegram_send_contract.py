@@ -4,34 +4,46 @@ THE BUG THIS LANE CLOSES. ``_send_via_telegram`` answered ``[]`` when the
 instance had no Telegram bot. ``[]`` is also what a successful send with zero
 recipients returns, so ``[]`` meant two things and every consumer picked the
 wrong one. On 2026-08-15 that cost five operator verdicts (a batch-authority
-write gated on ``message_ids`` met the dark bot and the retries 409'd). Every
-instance has been web-only since 2026-08-14/15, so the branch the old comment
-called "not reached in practice" is the only branch that runs.
+write gated on ``message_ids`` met the dark bot and the retries 409'd).
 
 THE FIX IS A CONTRACT, not seven patches: a send DELIVERS (non-empty message
 ids) or it RAISES :class:`TelegramUnavailable`. Nothing returnable means
 "nothing was delivered".
 
-THIS FILE PINS THE CONTRACT ITSELF — the send callable and the peer-inbox
-relay that calls it in-process. The seven downstream consumers are pinned in
-``test_telegram_skip_consumers.py`` (over the HTTP client) and in the transport
-server / scheduler files (in-process). The mutation that reds THIS file is the
-shipped behaviour: restore ``return []`` in place of the raise in
-``build_send_via_telegram``.
+TELEGRAM RETIREMENT (T4 C4, 2026-08-19). The delivering branch is DELETED —
+tokens revoked, ``alfred.telegram.bot`` gone, ``build_send_via_telegram()``
+takes no ``app`` and the callable raises on every call. The contract is
+unchanged; the DELIVER arm just stopped being reachable through Telegram.
+Consequences for this file:
 
-EVERY REFUSAL PIN HERE CARRIES ITS POSITIVE CONTROL. "Dark instance ⇒ no
-delivery recorded" passes just as well against a build where nothing works at
-all, so each test that asserts a skip also proves its nearest admissible
-neighbour — the same call with a live bot — still delivers.
+  * The send callable's live-delivery tests are retired WITH the branch —
+    there is no live path left to control against. The positive controls
+    move down a level: the pins below prove the raise is the TYPED raise
+    (not an import error, not a crashed factory), that the skip log fires
+    with its fields, and that ``relay_to_operator`` still produces all
+    THREE ack shapes (its delivered shape driven by a stub ``send_fn``,
+    which is honest — relay accepts any conforming callable).
+  * New omitted-behavior pins hold the deletion itself: the module must
+    not regrow a delivery arm (no ``send_message`` call, no ``app``
+    parameter), and per the deletion-pin rule they sit NEXT TO live-path
+    proof so a dead import can't green them vacuously.
+
+The mutation that reds this file is still the shipped behaviour: replace the
+``raise`` in ``build_send_via_telegram`` with ``return []``.
+
+The seven downstream consumers are pinned in
+``test_telegram_skip_consumers.py`` (over the HTTP client) and in the
+transport server / scheduler files (in-process).
 """
 
 from __future__ import annotations
 
-from typing import Any
+import inspect
 
 import pytest
 import structlog
 
+import alfred.telegram.send as send_mod
 from alfred.telegram.send import build_send_via_telegram, relay_to_operator
 from alfred.transport.exceptions import (
     TELEGRAM_UNAVAILABLE_REASON,
@@ -45,36 +57,21 @@ from alfred.transport.exceptions import (
 # ---------------------------------------------------------------------------
 
 
-class _FakeMessage:
-    def __init__(self, message_id: int) -> None:
-        self.message_id = message_id
-
-
-class _FakeBot:
-    def __init__(self) -> None:
-        self.sent: list[dict[str, Any]] = []
-
-    async def send_message(self, chat_id: int, text: str) -> _FakeMessage:
-        self.sent.append({"chat_id": chat_id, "text": text})
-        return _FakeMessage(700 + len(self.sent))
-
-
-class _FakeApp:
-    """Stands in for the PTB ``Application`` — the send path only touches
-    ``app.bot.send_message``."""
-
-    def __init__(self) -> None:
-        self.bot = _FakeBot()
-
-
-def _live_send():  # type: ignore[no-untyped-def]
-    """The positive control: an instance whose bot exists."""
-    return build_send_via_telegram(_FakeApp(), floor_seconds=0.0)
-
-
 def _dark_send():  # type: ignore[no-untyped-def]
-    """The instance under test: ``bot_token: ""`` ⇒ no app was ever built."""
-    return build_send_via_telegram(None)
+    """The only send there is: Telegram retired, every call raises."""
+    return build_send_via_telegram()
+
+
+async def _stub_delivering_send(
+    user_id: int, text: str, dedupe_key: str | None = None,
+) -> list[int]:
+    """A conforming DELIVERING callable for relay_to_operator's live shape.
+
+    Not a Telegram path — there is none — but the relay contract is defined
+    over any ``TelegramSendCallable``, and its delivered ACK shape must stay
+    pinned or a regression in relay logic hides behind the dark channel.
+    """
+    return [701]
 
 
 def _events(captured: list[dict], name: str) -> list[dict]:
@@ -90,14 +87,17 @@ class TestTheSendContract:
     """Mutation that reds this class: put ``return []`` back in place of the
     ``raise`` in ``build_send_via_telegram``."""
 
-    async def test_a_dark_instance_raises_rather_than_answering_empty(self) -> None:
+    async def test_every_send_raises_rather_than_answering_empty(self) -> None:
         with pytest.raises(TelegramUnavailable):
             await _dark_send()(42, "the message nobody got")
 
-    async def test_a_live_instance_returns_real_message_ids(self) -> None:
-        """POSITIVE CONTROL for the whole file. Without this, every assertion
-        above is equally true of a build where sending is simply broken."""
-        assert await _live_send()(42, "hello") == [701]
+    async def test_the_raise_is_typed_and_names_the_recipient(self) -> None:
+        """POSITIVE CONTROL for the deletion pins below: the factory builds a
+        LIVE callable whose refusal carries the user id — proving the path
+        executes (a broken import or a crashed factory could not produce
+        this), which is what licenses the source-level absence assertions."""
+        with pytest.raises(TelegramUnavailable, match="user_id=42"):
+            await _dark_send()(42, "hello")
 
     async def test_an_unaware_consumer_still_fails_closed(self) -> None:
         """THE SAFETY PROPERTY behind the type choice. ``TelegramUnavailable``
@@ -111,7 +111,8 @@ class TestTheSendContract:
     async def test_the_skip_is_never_silent(self) -> None:
         """``feedback_intentionally_left_blank``: a non-delivery needs a
         signature of its own, at WARNING (production log level), carrying who
-        it was for."""
+        it was for. Event name + detail phrasing are a stable grep surface —
+        daily_sync's authority-write comment references them."""
         with structlog.testing.capture_logs() as captured:
             with pytest.raises(TelegramUnavailable):
                 await _dark_send()(4242, "hi")
@@ -121,26 +122,47 @@ class TestTheSendContract:
         assert matches[0]["log_level"] == "warning"
         assert "NOTHING WAS DELIVERED" in matches[0]["detail"]
 
-    async def test_a_live_send_does_not_log_a_skip(self) -> None:
-        with structlog.testing.capture_logs() as captured:
-            await _live_send()(42, "hi")
-        assert _events(captured, "talker.daemon.telegram_send_skipped") == []
 
-    async def test_an_api_failure_is_still_its_own_thing(self) -> None:
-        """A dark channel and a broken one must stay distinguishable — that is
-        the whole reason the skip is a NARROW type rather than a bare raise."""
-        app = _FakeApp()
+# ---------------------------------------------------------------------------
+# THE DELETION — the delivering branch must stay deleted (T4 C4)
+# ---------------------------------------------------------------------------
 
-        async def _boom(chat_id: int, text: str):  # type: ignore[no-untyped-def]
-            raise RuntimeError("429 Too Many Requests")
 
-        app.bot.send_message = _boom  # type: ignore[assignment]
-        send = build_send_via_telegram(app, floor_seconds=0.0)
-        with pytest.raises(RuntimeError):
-            await send(42, "hi")
-        # ...and it is NOT swallowed into the skip type.
-        with pytest.raises(RuntimeError):
-            await send(42, "hi")
+class TestTheDeliveringBranchStaysDeleted:
+    """Omitted-behavior pins. Their live-path positive control is
+    ``test_the_raise_is_typed_and_names_the_recipient`` above — the module
+    imports, the factory runs, the callable executes; these assertions are
+    about what that RUNNING module no longer contains."""
+
+    def test_the_factory_takes_no_app(self) -> None:
+        """Signature pin: a resurrected ``app`` / lock-map / floor parameter
+        is the delivery arm growing back."""
+        params = inspect.signature(build_send_via_telegram).parameters
+        assert len(params) == 0, (
+            f"build_send_via_telegram grew parameters {list(params)} — the "
+            "delivering branch was deleted in T4 C4; a send app has no home "
+            "here any more."
+        )
+
+    def test_the_module_contains_no_delivery_code(self) -> None:
+        """AST sweep, not a raw-source grep: the module docstring is ALLOWED
+        to mention ``send_message`` as history (it does), so the pin matches
+        code referents — attribute accesses and names — never prose."""
+        import ast
+
+        tree = ast.parse(inspect.getsource(send_mod))
+        forbidden: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in (
+                "send_message", "Lock",
+            ):
+                forbidden.append(f"line {node.lineno}: .{node.attr}")
+            if isinstance(node, ast.Name) and node.id == "SEND_FLOOR_SECONDS":
+                forbidden.append(f"line {node.lineno}: SEND_FLOOR_SECONDS")
+        assert forbidden == [], (
+            "delivery machinery reappeared in alfred.telegram.send "
+            f"(deleted in T4 C4): {forbidden}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +171,10 @@ class TestTheSendContract:
 
 
 class TestPeerRelayAck:
-    """The ACK is the sending instance's only evidence. Shipped behaviour:
-    ``{"relayed": True, "message_ids": []}`` on a dark bot — a delivery
-    recorded for a message the operator never saw."""
+    """The ACK is the sending instance's only evidence. Three outcomes,
+    three shapes — all three still pinned: dark through the real collapsed
+    send, delivered through a stub ``send_fn`` (see its docstring), broken
+    through a raising stub."""
 
     async def test_a_dark_relay_acks_not_relayed_with_a_reason(self) -> None:
         ack = await relay_to_operator(
@@ -162,9 +185,13 @@ class TestPeerRelayAck:
         assert ack["reason"] == TELEGRAM_UNAVAILABLE_REASON
         assert "message_ids" not in ack
 
-    async def test_a_live_relay_still_acks_relayed(self) -> None:
+    async def test_a_delivering_send_fn_still_acks_relayed(self) -> None:
+        """POSITIVE CONTROL for the relay's dark shape: the same relay code
+        with a delivering callable ACKs ``relayed: True`` + the ids — so the
+        dark assertions above cannot be satisfied by a relay that answers
+        ``relayed: False`` to everything."""
         ack = await relay_to_operator(
-            _live_send(), 42, "S.A.L.E.M.: the roof is on fire",
+            _stub_delivering_send, 42, "S.A.L.E.M.: the roof is on fire",
             kind="notice", precedence="R", from_peer="salem",
         )
         assert ack["relayed"] is True

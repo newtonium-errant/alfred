@@ -1,23 +1,16 @@
-"""Tests for wk2b commit 5 — ElevenLabs TTS synthesis + /brief command.
+"""Tests for the ElevenLabs TTS synthesis surface (originally wk2b /brief).
 
-Happy-path tests. Failure-mode tests live in ``test_tts_failure.py``.
-
-Covers:
+Covers what survives the Telegram retirement (2026-08-19 — the /brief
+handler, its failure-mode file ``test_tts_failure.py``, and the
+``send_voice_to_telegram`` upload leg all died with the surface):
     * ``resolve_voice_id`` friendly-name → id mapping.
     * ``synthesize`` posts to the right URL with the xi-api-key header
       (httpx transport mocked via httpx.MockTransport).
     * ``compress_summary_for_tts`` returns the assistant text.
-    * ``send_voice_to_telegram`` uses ``send_voice`` when under 50MB.
-    * ``on_brief`` end-to-end: loads session, compresses, synthesises,
-      sends voice message.
     * Config shape: TtsConfig defaults, optional absence on TalkerConfig.
 """
 
 from __future__ import annotations
-
-from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -111,49 +104,6 @@ async def test_compress_summary_returns_assistant_text() -> None:
     assert out == "compressed prose"
     # One call, model threaded through.
     assert client.messages.calls[0]["model"] == "claude-sonnet-4-6"
-
-
-# --- send_voice_to_telegram ----------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_send_voice_uses_send_voice_under_cap() -> None:
-    bot_mock = MagicMock()
-    bot_mock.send_voice = AsyncMock()
-    bot_mock.send_document = AsyncMock()
-
-    result = await tts.send_voice_to_telegram(
-        bot=bot_mock,
-        chat_id=123,
-        audio_bytes=b"small" * 100,  # tiny audio
-        caption="cap",
-        filename="x.mp3",
-    )
-    assert result.mode == "voice"
-    bot_mock.send_voice.assert_called_once()
-    bot_mock.send_document.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_send_voice_falls_back_to_document_when_oversize() -> None:
-    bot_mock = MagicMock()
-    bot_mock.send_voice = AsyncMock()
-    bot_mock.send_document = AsyncMock()
-
-    huge = b"\x00" * (tts._VOICE_MAX_BYTES + 10)
-    result = await tts.send_voice_to_telegram(
-        bot=bot_mock,
-        chat_id=123,
-        audio_bytes=huge,
-        caption="huge",
-        filename="big.mp3",
-    )
-    assert result.mode == "document"
-    bot_mock.send_document.assert_called_once()
-    bot_mock.send_voice.assert_not_called()
-
-
-# --- /brief command end-to-end --------------------------------------------
 
 
 # --- Config shape --------------------------------------------------------
