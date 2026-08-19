@@ -23,6 +23,21 @@ Atomic per file: stream lines to ``<name>.tmp`` in the same directory, then
 this repo. Files with no matches are left untouched (no rewrite, no mtime
 churn). ``--dry-run`` reports what WOULD change and writes nothing.
 
+LIVE-LOG WARNING — run ``alfred down`` first. ``os.replace`` swaps the
+directory entry, not the file a running daemon already holds open: a daemon
+whose FileHandler points at the pre-scrub inode keeps writing to that now
+UNLINKED inode, so every log line it emits after the scrub is LOST until
+its next rotation or restart — not just a line that races the rewrite
+window. On a 24/7-daemon machine (the box), stop the daemons before
+scrubbing, or knowingly accept losing the live file's tail until restart.
+
+Encoding caveat: files are read with ``errors="replace"``, so a NON-UTF8
+log that contains a token gets rewritten with every undecodable byte in
+the whole file replaced by U+FFFD — the collateral extends beyond the
+token itself. Clean-scan files are never rewritten, so only token-bearing
+non-UTF8 files pay this; the per-file report line is your record that a
+rewrite happened.
+
 Intentionally-left-blank: the scan reports every file it looked at, including
 "0 tokens" files, and emits an explicit "nothing to scrub" summary when the
 whole scan is clean — a clean run must be distinguishable from a run that

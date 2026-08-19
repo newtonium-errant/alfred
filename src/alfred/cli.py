@@ -7101,9 +7101,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Rewrite historical bot tokens in local log files to a "
             "placeholder (tokens are revoked — hygiene, not secrecy). "
-            "Scans <logging.dir>/*.log* plus any --path. Run with daemons "
-            "stopped for live files: the rewrite is atomic per file but a "
-            "write landing between read and rename would be lost."
+            "Scans <logging.dir>/*.log* plus any --path. RUN `alfred down` "
+            "FIRST: the rewrite replaces the file's inode, and a daemon "
+            "holding the old one open keeps writing to the unlinked inode "
+            "— EVERY line it logs after the scrub is lost until its next "
+            "rotation/restart, not just a racing write."
         ),
     )
     tg_scrub.add_argument(
