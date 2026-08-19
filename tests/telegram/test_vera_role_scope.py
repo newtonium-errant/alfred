@@ -26,11 +26,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from alfred.telegram import bot, conversation
+from alfred.telegram import conversation
 from alfred.telegram.config import (
     AllowedUser,
     AnthropicConfig,
@@ -161,73 +160,6 @@ def test_vera_scopes_exist_in_scope_rules():
 # ---------------------------------------------------------------------------
 # _role_for / _require_owner
 # ---------------------------------------------------------------------------
-
-
-def _update_from_user(user_id: int):
-    """Minimal Update stand-in carrying an effective_user with an id."""
-    return SimpleNamespace(effective_user=SimpleNamespace(id=user_id))
-
-
-def _vera_config() -> TalkerConfig:
-    return load_from_unified(_base_unified([
-        {"id": 111, "role": "owner"},
-        {"id": 222, "role": "ops"},
-    ]))
-
-
-def test_role_for_owner():
-    cfg = _vera_config()
-    assert bot._role_for(_update_from_user(111), cfg) == "owner"
-
-
-def test_role_for_ops():
-    cfg = _vera_config()
-    assert bot._role_for(_update_from_user(222), cfg) == "ops"
-
-
-def test_role_for_unmatched_defaults_owner():
-    # An allowed-but-unmatched (or absent) user defaults to owner —
-    # back-compat for flat-list instances.
-    cfg = _vera_config()
-    assert bot._role_for(_update_from_user(999), cfg) == "owner"
-
-
-def test_role_for_bare_int_entry_is_owner():
-    # Direct-construct fixture with a bare int still resolves to owner.
-    # ``instance=InstanceConfig(name=...)`` is required — TalkerConfig's
-    # default InstanceConfig has no default ``name`` (fail-loud-on-
-    # missing-name guarantee, feedback_hardcoding_and_alfred_naming.md).
-    cfg = TalkerConfig(
-        allowed_users=[111],
-        instance=InstanceConfig(name="V.E.R.A."),
-    )
-    assert bot._role_for(_update_from_user(111), cfg) == "owner"
-
-
-def test_require_owner_true_for_owner():
-    cfg = _vera_config()
-    assert bot._require_owner(_update_from_user(111), cfg, "/status") is True
-
-
-def test_require_owner_false_for_ops():
-    cfg = _vera_config()
-    assert bot._require_owner(_update_from_user(222), cfg, "/status") is False
-
-
-def test_is_allowed_matches_both_shapes():
-    # AllowedUser entries.
-    cfg = _vera_config()
-    assert bot._is_allowed(_update_from_user(111), cfg) is True
-    assert bot._is_allowed(_update_from_user(222), cfg) is True
-    assert bot._is_allowed(_update_from_user(999), cfg) is False
-    # Bare-int direct-construct fixture still matches. ``instance`` is
-    # required (no default name — see test_role_for_bare_int_entry_is_owner).
-    flat = TalkerConfig(
-        allowed_users=[111],
-        instance=InstanceConfig(name="V.E.R.A."),
-    )
-    assert bot._is_allowed(_update_from_user(111), flat) is True
-    assert bot._is_allowed(_update_from_user(222), flat) is False
 
 
 # ---------------------------------------------------------------------------
@@ -436,84 +368,6 @@ async def test_vera_default_role_is_owner_when_unset(tmp_path):
 # ``ops`` user out of /calibrate, /brief, /status, etc.).
 
 
-def _fake_ctx(config: TalkerConfig) -> SimpleNamespace:
-    """Minimal ContextTypes stand-in carrying config under _KEY_CONFIG.
-
-    Mirrors the shape ``owner_only._wrapped`` reads:
-    ``ctx.application.bot_data[_KEY_CONFIG]``.
-    """
-    return SimpleNamespace(
-        application=SimpleNamespace(bot_data={bot._KEY_CONFIG: config}),
-    )
-
-
-@pytest.mark.asyncio
-async def test_owner_only_decorator_blocks_ops_user(tmp_path):
-    """ops user → decorated handler's inner body is NOT invoked (silent drop)."""
-    config = _make_vera_config(tmp_path)  # 111=owner, 222=ops
-
-    calls: list[str] = []
-
-    @bot.owner_only
-    async def fake_handler(update, ctx) -> None:
-        calls.append("ran")
-
-    await fake_handler(_update_from_user(222), _fake_ctx(config))
-
-    # The inner handler must NOT have run — the decorator dropped it.
-    assert calls == [], (
-        "owner_only let an ops user through to the wrapped handler"
-    )
-
-
-@pytest.mark.asyncio
-async def test_owner_only_decorator_allows_owner_user(tmp_path):
-    """owner user → decorated handler's inner body IS invoked."""
-    config = _make_vera_config(tmp_path)  # 111=owner, 222=ops
-
-    calls: list[str] = []
-
-    @bot.owner_only
-    async def fake_handler(update, ctx) -> None:
-        calls.append("ran")
-
-    await fake_handler(_update_from_user(111), _fake_ctx(config))
-
-    # The inner handler ran exactly once for the owner.
-    assert calls == ["ran"], (
-        "owner_only failed to invoke the wrapped handler for an owner user"
-    )
-
-
-@pytest.mark.asyncio
-async def test_owner_only_on_status_blocks_ops_via_decorator(tmp_path):
-    """End-to-end through the SHIPPED decorated handler ``on_status``.
-
-    Pins that ``on_status`` is actually wrapped by ``owner_only`` (not
-    just that the decorator works on a synthetic handler): an ops user
-    hitting /status gets dropped before the handler's body runs. We
-    assert via the role-deny log emission rather than a reply, since
-    the handler short-circuits before any ``update.message`` access —
-    so a bare SimpleNamespace update (no .message) is safe here.
-    """
-    import structlog
-
-    config = _make_vera_config(tmp_path)  # 222 = ops
-    with structlog.testing.capture_logs() as captured:
-        await bot.on_status(_update_from_user(222), _fake_ctx(config))
-
-    denied = [
-        c for c in captured
-        if c.get("event") == "talker.bot.role_denied"
-    ]
-    assert len(denied) == 1, (
-        f"expected on_status to drop an ops user via owner_only "
-        f"(role_denied log); captured={[c.get('event') for c in captured]!r}"
-    )
-    assert denied[0]["role"] == "ops"
-    assert denied[0]["command"] == "on_status"
-
-
 # ---------------------------------------------------------------------------
 # AllowedUser.name — loader parse (VERA reporter follow-up)
 # ---------------------------------------------------------------------------
@@ -563,55 +417,6 @@ def test_allowed_user_name_defaults_none_on_direct_construct():
 # ---------------------------------------------------------------------------
 # _name_for — sender display-name resolution
 # ---------------------------------------------------------------------------
-
-
-def _vera_named_config() -> TalkerConfig:
-    return load_from_unified(_base_unified([
-        {"id": 111, "role": "owner", "name": "Andrew"},
-        {"id": 222, "role": "ops", "name": "Ben"},
-        {"id": 333, "role": "ops"},  # nameless ops entry
-    ]))
-
-
-def test_name_for_owner():
-    cfg = _vera_named_config()
-    assert bot._name_for(_update_from_user(111), cfg) == "Andrew"
-
-
-def test_name_for_ops():
-    cfg = _vera_named_config()
-    assert bot._name_for(_update_from_user(222), cfg) == "Ben"
-
-
-def test_name_for_nameless_entry_returns_none():
-    """A matched entry WITHOUT a name → None (role-fallback territory)."""
-    cfg = _vera_named_config()
-    assert bot._name_for(_update_from_user(333), cfg) is None
-
-
-def test_name_for_unmatched_user_returns_none():
-    cfg = _vera_named_config()
-    assert bot._name_for(_update_from_user(999), cfg) is None
-
-
-def test_name_for_bare_int_entry_returns_none():
-    """Direct-construct fixture with a bare int → None (no name)."""
-    cfg = TalkerConfig(
-        allowed_users=[111],
-        instance=InstanceConfig(name="V.E.R.A."),
-    )
-    assert bot._name_for(_update_from_user(111), cfg) is None
-
-
-def test_name_for_single_user_flat_instance_returns_none():
-    """Flat-list (Salem-shape) config → name is None for every user.
-
-    This is the inert/back-compat guarantee at the resolution layer:
-    a single-user instance never produces a sender name, so the
-    downstream sender-identity block is never injected.
-    """
-    cfg = load_from_unified(_base_unified([8661018406]))
-    assert bot._name_for(_update_from_user(8661018406), cfg) is None
 
 
 # ---------------------------------------------------------------------------

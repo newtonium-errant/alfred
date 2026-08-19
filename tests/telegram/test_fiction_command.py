@@ -24,26 +24,13 @@ Coverage:
 
 from __future__ import annotations
 
-import tempfile
 from datetime import date
 from pathlib import Path
 
 import frontmatter
 import pytest
 
-from alfred.telegram import bot, fiction
-from alfred.telegram.config import (
-    AnthropicConfig,
-    FictionConfig,
-    InstanceConfig,
-    LoggingConfig,
-    SessionConfig,
-    STTConfig,
-    TalkerConfig,
-    VaultConfig,
-)
-
-
+from alfred.telegram import fiction
 # ---------------------------------------------------------------------------
 # Slug derivation
 # ---------------------------------------------------------------------------
@@ -316,89 +303,6 @@ def test_scaffold_titles_with_same_slug_collide(vault_root, fake_today):
 # ---------------------------------------------------------------------------
 # Config gate — /fiction registration
 # ---------------------------------------------------------------------------
-
-
-def _make_config(
-    tmp_path: Path,
-    *,
-    fiction_config: FictionConfig | None = None,
-) -> TalkerConfig:
-    """Build a minimal TalkerConfig for handler-registration tests."""
-    vault_dir = tmp_path / "vault"
-    vault_dir.mkdir(exist_ok=True)
-    return TalkerConfig(
-        bot_token="test-token",
-        allowed_users=[1],
-        primary_users=["person/Andrew Newton"],
-        anthropic=AnthropicConfig(
-            api_key="test-key", model="claude-sonnet-4-6",
-        ),
-        stt=STTConfig(api_key="test-stt", model="whisper-large-v3"),
-        session=SessionConfig(
-            gap_timeout_seconds=1800,
-            state_path=str(tmp_path / "state.json"),
-        ),
-        vault=VaultConfig(path=str(vault_dir)),
-        logging=LoggingConfig(file=str(tmp_path / "talker.log")),
-        instance=InstanceConfig(name="Hypatia", canonical="Hypatia"),
-        fiction=fiction_config,
-    )
-
-
-def _build_app_and_get_commands(config: TalkerConfig) -> set[str]:
-    """Construct an Application from the config + return the set of
-    registered CommandHandler names (the strings in ``handler.commands``)."""
-    from alfred.telegram import state as state_mod
-
-    with tempfile.TemporaryDirectory() as tmp:
-        mgr = state_mod.StateManager(Path(tmp) / "s.json")
-        mgr.load()
-        app = bot.build_app(
-            config=config,
-            state_mgr=mgr,
-            anthropic_client=None,
-            system_prompt="",
-            vault_context_str="",
-        )
-        commands: set[str] = set()
-        for group in app.handlers.values():
-            for h in group:
-                cmds = getattr(h, "commands", None)
-                if cmds:
-                    commands.update(cmds)
-        return commands
-
-
-def test_fiction_command_not_registered_when_block_absent(tmp_path):
-    """Default config (no fiction block at all) → /fiction NOT
-    registered. Salem-style instances see no surface."""
-    config = _make_config(tmp_path, fiction_config=None)
-    commands = _build_app_and_get_commands(config)
-    assert "fiction" not in commands, (
-        f"/fiction must NOT be registered without explicit opt-in. "
-        f"Registered commands: {sorted(commands)}"
-    )
-
-
-def test_fiction_command_not_registered_when_disabled(tmp_path):
-    """Explicit ``enabled=False`` block → /fiction NOT registered."""
-    config = _make_config(
-        tmp_path, fiction_config=FictionConfig(command_enabled=False),
-    )
-    commands = _build_app_and_get_commands(config)
-    assert "fiction" not in commands
-
-
-def test_fiction_command_registered_when_enabled(tmp_path):
-    """Hypatia opts in → /fiction shows up as a CommandHandler."""
-    config = _make_config(
-        tmp_path, fiction_config=FictionConfig(command_enabled=True),
-    )
-    commands = _build_app_and_get_commands(config)
-    assert "fiction" in commands, (
-        f"/fiction must be registered when fiction.command_enabled=True. "
-        f"Registered commands: {sorted(commands)}"
-    )
 
 
 def test_fiction_config_loaded_from_unified():

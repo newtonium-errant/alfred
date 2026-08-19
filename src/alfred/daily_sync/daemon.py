@@ -13,10 +13,11 @@ the brief daemon's shape (see ``src/alfred/brief/daemon.py``):
      parser can resolve "item 2" → record path.
   7. Loop.
 
-The daemon does NOT consume replies — that's the talker bot's job (it
-already owns the Telegram long-poll loop). This daemon is push-only;
-replies feed back through the ``/calibrate``-aware reply parser in
-:mod:`alfred.telegram.bot`.
+The daemon does NOT consume replies. This daemon is push-only;
+historically replies fed back through the Telegram bot's
+``/calibrate``-aware reply parser (``alfred.telegram.bot``, deleted with
+the Telegram retirement 2026-08-19) — today the reply path is the web
+surface's reply dispatch.
 """
 
 from __future__ import annotations

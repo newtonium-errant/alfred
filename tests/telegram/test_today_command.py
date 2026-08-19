@@ -29,17 +29,13 @@ Coverage:
 
 from __future__ import annotations
 
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
-import structlog
 
-from alfred.telegram import bot
 from alfred.telegram.config import (
     TodayCommandConfig,
     load_from_unified,
@@ -321,132 +317,6 @@ def test_compose_both_renders_failing_emits_combined_sentinels(
 # ---------------------------------------------------------------------------
 
 
-def _make_update_mock(chat_id: int = 42, user_id: int = 42) -> MagicMock:
-    """Mirror the inventory-views test helper shape."""
-    update = MagicMock()
-    update.message = MagicMock()
-    update.message.reply_text = AsyncMock()
-    update.effective_chat = MagicMock()
-    update.effective_chat.id = chat_id
-    update.effective_user = MagicMock()
-    update.effective_user.id = user_id
-    return update
-
-
-def _make_ctx_mock(
-    vault_path: Path,
-    *,
-    allowed_user_id: int = 42,
-    today_command_enabled: bool = True,
-) -> MagicMock:
-    """Build a minimal ctx mock for /today handler smoke tests.
-
-    Mirrors the inventory-views test helper shape; the gate-knob is
-    ``today_command_enabled`` instead of ``inventory_views_enabled``.
-    """
-    config = MagicMock()
-    config.allowed_users = [allowed_user_id]
-    config.vault = MagicMock()
-    config.vault.path = str(vault_path)
-    if today_command_enabled:
-        config.today_command = MagicMock()
-        config.today_command.enabled = True
-        config.today_command.timezone = "America/Halifax"
-    else:
-        config.today_command = None
-    ctx = MagicMock()
-    ctx.application.bot_data = {bot._KEY_CONFIG: config}
-    return ctx
-
-
-@pytest.mark.asyncio
-async def test_handler_dispatches_when_enabled(salem_vault: Path) -> None:
-    """/today fires when ``today_command.enabled=True`` + user is
-    allowlisted → reply_text is called exactly once."""
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(salem_vault)
-    await bot.on_today(update, ctx)
-    update.message.reply_text.assert_called_once()
-    reply = update.message.reply_text.call_args[0][0]
-    # Composed reply carries the TWO section headers (Ship 3 scope
-    # refinement, 2026-05-29 — routines dropped from /today; lives
-    # in the morning brief or via the routine CLI surface).
-    assert "## Today's Plan" in reply
-    assert "## Upcoming Events" in reply
-    # Parallel scope-refinement pin: routines section MUST NOT
-    # appear in the handler-dispatched reply. Mirrors the
-    # test_compose_excludes_routines_section_header pin —
-    # belt-and-suspenders covering both the pure composer + the
-    # end-to-end handler dispatch path.
-    assert "## Today's Routines" not in reply
-
-
-@pytest.mark.asyncio
-async def test_handler_no_op_when_disabled(salem_vault: Path) -> None:
-    """``today_command=None`` (block absent in YAML) → handler no-ops
-    silently. Defensive in-handler gate matches the
-    ``build_app`` registration gate's semantics.
-
-    Even if a future routing layer dispatches without checking the
-    registration gate, the handler's own gate prevents accidental
-    Salem-only behaviour on non-Salem instances."""
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(salem_vault, today_command_enabled=False)
-    await bot.on_today(update, ctx)
-    update.message.reply_text.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handler_silent_drop_on_non_allowlisted_user(
-    salem_vault: Path,
-) -> None:
-    """Unknown user → no reply (matches existing handler convention).
-
-    Access control parity with the rest of the bot handlers — every
-    handler reads ``config.allowed_users`` and silent-drops anything
-    not in the list."""
-    update = _make_update_mock(user_id=999)
-    ctx = _make_ctx_mock(salem_vault, allowed_user_id=42)
-    await bot.on_today(update, ctx)
-    update.message.reply_text.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handler_reply_under_telegram_cap(salem_vault: Path) -> None:
-    """Handler reply stays under the Telegram per-message body cap.
-    Sanity check the composition's defensive truncation works
-    end-to-end through the handler."""
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(salem_vault)
-    await bot.on_today(update, ctx)
-    reply = update.message.reply_text.call_args[0][0]
-    assert len(reply) < 4000
-
-
-@pytest.mark.asyncio
-async def test_handler_logs_today_command_done_with_reply_chars(
-    salem_vault: Path,
-) -> None:
-    """Per builder.md rule #9: pin the success log emission via
-    structlog.testing.capture_logs. ``talker.bot.today_command_done``
-    MUST carry ``reply_chars`` + ``date`` so the operator can grep
-    for ``/today`` activity + characterise reply-size distribution."""
-    update = _make_update_mock()
-    ctx = _make_ctx_mock(salem_vault)
-    with structlog.testing.capture_logs() as captured:
-        await bot.on_today(update, ctx)
-    done_events = [
-        c for c in captured
-        if c.get("event") == "talker.bot.today_command_done"
-    ]
-    assert len(done_events) == 1
-    event = done_events[0]
-    assert "reply_chars" in event
-    assert "date" in event
-    assert isinstance(event["reply_chars"], int)
-    assert event["reply_chars"] > 0
-
-
 # ---------------------------------------------------------------------------
 # Handler registration in build_app — drive-the-prod-call shape
 # ---------------------------------------------------------------------------
@@ -461,98 +331,6 @@ async def test_handler_logs_today_command_done_with_reply_chars(
 # Mirror of the canonical patterns at
 # ``test_voice_train.py:_build_app_and_get_commands`` and
 # ``test_moc_suggestion_command_registration.py:_registered_command_names``.
-
-
-def _build_app_today_and_get_commands(raw: dict[str, Any]) -> set[str]:
-    """Build a TalkerConfig from ``raw`` unified config dict, run
-    ``bot.build_app``, and return the set of command names registered
-    on the PTB Application.
-
-    Drives the actual production code path (build_app's gate
-    predicate + CommandHandler registration). A refactor that moves
-    the today_command gate without changing the registration outcome
-    correctly stays green; a refactor that breaks the registration
-    surfaces here.
-
-    Mirrors the canonical shape used elsewhere in the telegram test
-    suite (voice_train, moc_suggestions, model_switch, implicit_
-    escalation) — single inspection idiom across the registration
-    test surface.
-    """
-    from alfred.telegram import state as state_mod
-
-    cfg = load_from_unified(raw)
-    with tempfile.TemporaryDirectory() as tmp:
-        mgr = state_mod.StateManager(Path(tmp) / "s.json")
-        mgr.load()
-        app = bot.build_app(
-            config=cfg,
-            state_mgr=mgr,
-            anthropic_client=None,
-            system_prompt_provider="",
-            vault_context_str="",
-        )
-        commands: set[str] = set()
-        for group in app.handlers.values():
-            for h in group:
-                cmds = getattr(h, "commands", None)
-                if cmds:
-                    commands.update(cmds)
-        return commands
-
-
-def test_build_app_registers_today_handler_when_enabled() -> None:
-    """When ``today_command.enabled=True``, ``build_app`` registers
-    the /today CommandHandler. Drive-the-prod-call shape: actually
-    build the PTB Application + inspect ``app.handlers`` for the
-    ``today`` CommandHandler.
-
-    Pinned per task #12 sweep (2026-05-29): the prior predicate-
-    mimic shape (re-evaluating ``cfg.today_command is not None and
-    cfg.today_command.enabled`` inline) would silently pass if a
-    refactor moved the gate from build_app to the handler itself
-    while keeping the predicate shape. The drive-the-prod-call shape
-    catches that refactor class."""
-    raw: dict[str, Any] = {
-        "telegram": {
-            "bot_token": "DUMMY_BOT_TOKEN_PLACEHOLDER",
-            "allowed_users": [42],
-            "instance": {"name": "Salem"},
-            "today_command": {"enabled": True},
-        },
-    }
-    commands = _build_app_today_and_get_commands(raw)
-    assert "today" in commands, (
-        f"/today CommandHandler must be registered when "
-        f"today_command.enabled=True; got commands={commands}"
-    )
-
-
-def test_build_app_skips_today_handler_when_block_absent() -> None:
-    """``today_command`` block absent → ``build_app`` does NOT
-    register the /today CommandHandler. The non-Salem instance
-    convention.
-
-    Drive-the-prod-call shape: actually build the PTB Application +
-    inspect ``app.handlers`` for the absence of the ``today``
-    CommandHandler. Falls through to Telegram's unknown-command
-    behaviour for any user who types /today on a non-Salem instance
-    — matches the inventory_views + moc_suggestions + voice_train
-    conditional-registration pattern."""
-    raw: dict[str, Any] = {
-        "telegram": {
-            "bot_token": "DUMMY_BOT_TOKEN_PLACEHOLDER",
-            "allowed_users": [42],
-            "instance": {"name": "KAL-LE"},
-            # today_command block intentionally absent
-        },
-    }
-    commands = _build_app_today_and_get_commands(raw)
-    assert "today" not in commands, (
-        f"/today CommandHandler must NOT be registered when the "
-        f"today_command block is absent (non-Salem instance "
-        f"convention); got commands={commands}"
-    )
 
 
 # ===========================================================================

@@ -16,11 +16,10 @@ See:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from alfred.telegram import bot, daemon
+from alfred.telegram import daemon
 from alfred.telegram.config import (
     AnthropicConfig,
     InstanceConfig,
@@ -267,43 +266,3 @@ def test_skill_peer_routing_survives_salem_templating(
     assert "You are **S.A.L.E.M.**" in prompt
 
 
-@pytest.mark.asyncio
-async def test_bot_start_greeting_uses_instance_name(
-    talker_config: TalkerConfig,
-) -> None:
-    """``/start`` greeting reads from ``config.instance.name``.
-
-    The greeting is the only user-facing string outside the SKILL where
-    the persona name appears. A literal "this is Alfred." hard-coded in
-    bot.py would contradict the SKILL-level identity on every other
-    instance — catch the regression here.
-    """
-    talker_config.instance = InstanceConfig(
-        name="Salem",
-        canonical="S.A.L.E.M.",
-        aliases=["Salem"],
-    )
-
-    update = MagicMock()
-    update.effective_user.id = 1
-    update.message.reply_text = AsyncMock()
-
-    ctx = MagicMock()
-    ctx.application.bot_data = {
-        "config": talker_config,
-        "state_mgr": MagicMock(),
-        "anthropic_client": MagicMock(),
-        "system_prompt": "sys",
-        "vault_context_str": "",
-        "chat_locks": {},
-    }
-
-    await bot.on_start(update, ctx)
-
-    update.message.reply_text.assert_called_once()
-    reply = update.message.reply_text.call_args.args[0]
-    assert "Salem" in reply, f"greeting should mention the instance name: {reply!r}"
-    assert "Alfred" not in reply, (
-        "Salem greeting should not also include the default Alfred name: "
-        f"{reply!r}"
-    )

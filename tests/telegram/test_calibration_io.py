@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from alfred.telegram import bot, calibration, conversation
+from alfred.telegram import calibration, conversation
 from alfred.telegram.session import Session
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
@@ -148,73 +148,6 @@ def test_build_system_blocks_calibration_none_skips_block() -> None:
 
 
 # --- Session-open stash ----------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_routed_open_stashes_calibration_snapshot(
-    state_mgr, talker_config
-) -> None:
-    """Calibration is read once at session open and stashed for the session."""
-    # Prepare a user record with a calibration block.
-    vault_path = Path(talker_config.vault.path)
-    (vault_path / "person").mkdir(exist_ok=True)
-    user_rel = talker_config.primary_users[0]
-    inner = "## Communication Style\n- test block"
-    (vault_path / f"{user_rel}.md").write_text(
-        "---\ntype: person\nname: Andrew Newton\n---\n\n"
-        f"{calibration.CALIBRATION_MARKER_START}\n{inner}\n"
-        f"{calibration.CALIBRATION_MARKER_END}\n",
-        encoding="utf-8",
-    )
-
-    client = FakeAnthropicClient([
-        FakeResponse(content=[FakeBlock(
-            type="text",
-            text='{"session_type": "note", "continues_from": null, '
-                 '"reasoning": "quick capture"}',
-        )]),
-    ])
-
-    await bot._open_routed_session(
-        state_mgr,
-        talker_config,
-        client,
-        chat_id=11,
-        first_message="quick reminder",
-    )
-
-    active = state_mgr.get_active(11)
-    assert active is not None
-    assert active["_calibration_snapshot"] == inner
-
-
-@pytest.mark.asyncio
-async def test_routed_open_stashes_none_when_no_calibration_block(
-    state_mgr, talker_config
-) -> None:
-    """No calibration block on the person record → snapshot is ``None``."""
-    # The user record doesn't exist at all — the stash value should still
-    # land on the active dict (as None) so the bot can detect wk3+ opens.
-    client = FakeAnthropicClient([
-        FakeResponse(content=[FakeBlock(
-            type="text",
-            text='{"session_type": "note", "continues_from": null, '
-                 '"reasoning": "quick capture"}',
-        )]),
-    ])
-
-    await bot._open_routed_session(
-        state_mgr,
-        talker_config,
-        client,
-        chat_id=12,
-        first_message="quick reminder",
-    )
-
-    active = state_mgr.get_active(12)
-    assert active is not None
-    assert "_calibration_snapshot" in active
-    assert active["_calibration_snapshot"] is None
 
 
 # --- run_turn threading ----------------------------------------------------

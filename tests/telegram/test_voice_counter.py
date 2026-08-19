@@ -9,15 +9,16 @@ These tests assert:
     1. ``run_turn`` threads ``user_kind`` onto the user turn as ``_kind``.
     2. ``_count_message_kinds`` returns the right tallies from a mixed
        transcript.
-    3. ``_open_session_with_stash`` no longer initialises the two redundant
-       counters on the active dict (they'd be stale the moment a turn ran).
+    (A third pin — the bot-side ``_open_session_with_stash`` not
+    initialising the redundant counters — died with ``alfred.telegram.bot``,
+    2026-08-19.)
 """
 
 from __future__ import annotations
 
 import pytest
 
-from alfred.telegram import bot, conversation
+from alfred.telegram import conversation
 from alfred.telegram.session import Session
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
@@ -87,15 +88,3 @@ async def test_run_turn_stamps_user_kind_on_the_user_turn(
     assert "_ts" in user_turns[0]
 
 
-def test_open_session_with_stash_does_not_set_state_dict_counters(
-    state_mgr, talker_config
-) -> None:
-    """Active dict must not carry the wk1 ``voice_messages`` / ``text_messages`` keys."""
-    bot._open_session_with_stash(state_mgr, chat_id=1, config=talker_config)
-    active = state_mgr.get_active(1)
-    assert active is not None
-    assert "voice_messages" not in active
-    assert "text_messages" not in active
-    # The wk2 stashed fields MUST still be present — guards against over-trim.
-    assert active["_session_type"] == "note"
-    assert "_vault_path_root" in active

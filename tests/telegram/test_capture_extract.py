@@ -16,11 +16,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from alfred.telegram import bot, capture_batch, capture_extract
+from alfred.telegram import capture_batch, capture_extract
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
 
@@ -308,79 +307,3 @@ async def test_extract_implicit_structuring_when_summary_missing(
 # --- Inline-command dispatch ---------------------------------------------
 
 
-def test_inline_detect_extract_with_arg() -> None:
-    """``Note: /extract abc123`` fires inline detection with extract command."""
-    assert bot._detect_inline_command("Note: /extract abc123") == "extract"
-
-
-def test_inline_detect_extract_at_end_of_line_with_arg() -> None:
-    """End-of-line form ``Good. /extract abc123`` detects."""
-    assert bot._detect_inline_command("Good. /extract abc12345") == "extract"
-
-
-def test_parse_short_id_from_command_args() -> None:
-    """CommandHandler path: ctx.args list takes priority."""
-    assert bot._parse_short_id_arg("/extract abc", ["abc"]) == "abc"
-
-
-def test_parse_short_id_from_inline_text() -> None:
-    """Inline path: None args → regex-parse from the message text."""
-    assert bot._parse_short_id_arg("Note: /extract abc123", None) == "abc123"
-    # Start-of-message form also resolves through the with-arg fallback.
-    assert bot._parse_short_id_arg("/extract abc123 now", None) == "abc123"
-
-
-def test_parse_short_id_empty_when_no_arg() -> None:
-    """Bare /extract with no arg → empty string."""
-    assert bot._parse_short_id_arg("/extract", None) == ""
-    assert bot._parse_short_id_arg("/extract", []) == ""
-
-
-@pytest.mark.asyncio
-async def test_inline_extract_dispatches_handler(
-    state_mgr, talker_config, tmp_path,
-) -> None:
-    """``Note: /extract abc12345`` routes to on_extract via inline dispatch."""
-    rel = _write_session_record(
-        Path(talker_config.vault.path),
-        "Voice Session — 2026-04-20 1004 inl12345",
-    )
-    _make_closed_session(state_mgr, "inl12345", rel)
-
-    client = FakeAnthropicClient([
-        FakeResponse(
-            content=[_tool_use_note_block("Inline Test Note", "body")],
-            stop_reason="tool_use",
-        )
-    ])
-
-    update = MagicMock()
-    update.effective_user.id = 1
-    update.effective_chat.id = 1
-    update.message.text = "Note: /extract inl12345"
-    update.message.voice = None
-    update.message.message_id = 99
-    update.message.reply_text = AsyncMock()
-
-    ctx = MagicMock()
-    ctx.application.bot_data = {
-        "config": talker_config,
-        "state_mgr": state_mgr,
-        "anthropic_client": client,
-        "system_prompt": "sys",
-        "vault_context_str": "",
-        "chat_locks": {},
-    }
-    ctx.args = None  # inline path has no args
-    ctx.bot.send_chat_action = AsyncMock()
-    ctx.bot.set_message_reaction = AsyncMock()
-
-    await bot.handle_message(
-        update, ctx, text="Note: /extract inl12345", voice=False,
-    )
-
-    # Handler replied with extraction outcome.
-    update.message.reply_text.assert_called_once()
-    reply = update.message.reply_text.call_args.args[0]
-    assert "Extracted 1 notes" in reply
-    assert "note/" in reply

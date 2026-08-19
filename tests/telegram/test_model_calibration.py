@@ -18,10 +18,9 @@ from pathlib import Path
 
 import pytest
 
-from alfred.telegram import bot, calibration, model_calibration
+from alfred.telegram import calibration, model_calibration
 from alfred.telegram import session as talker_session
 from alfred.telegram.session import Session
-from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
 
 # --- parse_model_preferences ----------------------------------------------
@@ -261,76 +260,3 @@ def test_close_session_writes_opening_and_closing_model(
 # --- _open_routed_session honours Model Preferences -----------------------
 
 
-@pytest.mark.asyncio
-async def test_routed_open_honours_model_preference_override(
-    state_mgr, talker_config
-) -> None:
-    """Calibration has ``journal → opus`` preference → journal opens on Opus.
-
-    The router would normally open journal on Sonnet (per session-type
-    defaults). Commit 8 says: if the calibration block records a learned
-    preference, use it instead.
-    """
-    vault_path = Path(talker_config.vault.path)
-    (vault_path / "person").mkdir(exist_ok=True)
-    user_rel = talker_config.primary_users[0]
-    cal = (
-        f"{calibration.CALIBRATION_MARKER_START}\n"
-        "## Model Preferences (learned)\n"
-        "- journal: claude-opus-4-7\n"
-        f"{calibration.CALIBRATION_MARKER_END}\n"
-    )
-    (vault_path / f"{user_rel}.md").write_text(
-        "---\ntype: person\nname: Andrew Newton\n---\n\n" + cal,
-        encoding="utf-8",
-    )
-
-    client = FakeAnthropicClient([
-        FakeResponse(content=[FakeBlock(
-            type="text",
-            text=(
-                '{"session_type": "journal", "continues_from": null, '
-                '"reasoning": "reflective"}'
-            ),
-        )]),
-    ])
-
-    sess = await bot._open_routed_session(
-        state_mgr,
-        talker_config,
-        client,
-        chat_id=77,
-        first_message="I want to think through something.",
-    )
-
-    # Router would pick Sonnet for journal; calibration overrides to Opus.
-    assert sess.model == "claude-opus-4-7"
-    assert sess.opening_model == "claude-opus-4-7"
-
-
-@pytest.mark.asyncio
-async def test_routed_open_no_preference_uses_router_default(
-    state_mgr, talker_config
-) -> None:
-    """Empty/missing preference → router's default stands."""
-    client = FakeAnthropicClient([
-        FakeResponse(content=[FakeBlock(
-            type="text",
-            text=(
-                '{"session_type": "journal", "continues_from": null, '
-                '"reasoning": "reflective"}'
-            ),
-        )]),
-    ])
-
-    sess = await bot._open_routed_session(
-        state_mgr,
-        talker_config,
-        client,
-        chat_id=78,
-        first_message="I want to think through something.",
-    )
-
-    # Journal's default is Sonnet; no calibration override present.
-    assert sess.model == "claude-sonnet-4-6"
-    assert sess.opening_model == "claude-sonnet-4-6"

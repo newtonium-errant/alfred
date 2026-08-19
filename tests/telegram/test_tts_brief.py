@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from alfred.telegram import bot, capture_batch, capture_extract, tts
+from alfred.telegram import tts
 from alfred.telegram.config import TtsConfig
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
@@ -154,127 +154,6 @@ async def test_send_voice_falls_back_to_document_when_oversize() -> None:
 
 
 # --- /brief command end-to-end --------------------------------------------
-
-
-def _seed_closed_session(state_mgr, short_id: str, rel_path: str) -> None:
-    state_mgr.state.setdefault("closed_sessions", []).append({
-        "session_id": f"{short_id}-full-uuid",
-        "chat_id": 1,
-        "started_at": "2026-04-20T10:00:00+00:00",
-        "ended_at":   "2026-04-20T10:30:00+00:00",
-        "reason": "explicit",
-        "record_path": rel_path,
-        "message_count": 5,
-        "vault_ops": 0,
-        "session_type": "capture",
-        "continues_from": None,
-        "opening_model": "claude-sonnet-4-6",
-        "closing_model": "claude-sonnet-4-6",
-    })
-    state_mgr.save()
-
-
-def _write_capture_session(vault_path: Path, name: str) -> str:
-    (vault_path / "session").mkdir(exist_ok=True, parents=True)
-    rel = f"session/{name}.md"
-    body = (
-        f"{capture_batch.SUMMARY_MARKER_START}\n\n"
-        "## Structured Summary\n\n### Topics\n- a\n\n"
-        f"{capture_batch.SUMMARY_MARKER_END}\n\n"
-        "# Transcript\n\n**Andrew** (10:00 · voice): hi\n"
-    )
-    (vault_path / rel).write_text(
-        "---\ntype: session\nstatus: completed\n"
-        f"name: {name}\ncreated: '2026-04-20'\n"
-        "session_type: capture\n---\n\n" + body,
-        encoding="utf-8",
-    )
-    return rel
-
-
-@pytest.mark.asyncio
-async def test_brief_happy_path_sends_voice_message(
-    state_mgr, talker_config, monkeypatch,
-) -> None:
-    """End-to-end /brief — compresses, synthesises, sends as voice message."""
-    rel = _write_capture_session(
-        Path(talker_config.vault.path),
-        "Voice Session — 2026-04-20 1000 bri12345",
-    )
-    _seed_closed_session(state_mgr, "bri12345", rel)
-
-    # Configure TTS.
-    talker_config.tts = TtsConfig(
-        api_key="DUMMY_ELEVENLABS_TEST_KEY",
-        voice_id="Rachel",
-        model="eleven_turbo_v2_5",
-        summary_word_target=300,
-    )
-
-    # Compress returns this prose; synthesize returns fake audio.
-    client = FakeAnthropicClient([
-        FakeResponse(content=[FakeBlock(type="text", text="compressed prose")]),
-    ])
-
-    async def _fake_synth(text: str, cfg: TtsConfig, *, speed=None) -> bytes:
-        assert text == "compressed prose"
-        return b"FAKE-MP3"
-    monkeypatch.setattr(tts, "synthesize", _fake_synth)
-
-    update = MagicMock()
-    update.effective_user.id = 1
-    update.effective_chat.id = 1
-    update.message.text = "/brief bri12345"
-    update.message.message_id = 1
-    update.message.reply_text = AsyncMock()
-
-    ctx = MagicMock()
-    ctx.application.bot_data = {
-        "config": talker_config,
-        "state_mgr": state_mgr,
-        "anthropic_client": client,
-        "system_prompt": "sys",
-        "vault_context_str": "",
-        "chat_locks": {},
-    }
-    ctx.args = ["bri12345"]
-    ctx.bot.send_voice = AsyncMock()
-    ctx.bot.send_document = AsyncMock()
-
-    await bot.on_brief(update, ctx)
-
-    ctx.bot.send_voice.assert_called_once()
-    # Text reply was NOT used — the voice upload replaces it.
-    update.message.reply_text.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_brief_usage_message_when_short_id_missing(
-    state_mgr, talker_config,
-) -> None:
-    talker_config.tts = TtsConfig(api_key="test-key", voice_id="Rachel")
-
-    update = MagicMock()
-    update.effective_user.id = 1
-    update.effective_chat.id = 1
-    update.message.text = "/brief"
-    update.message.reply_text = AsyncMock()
-
-    ctx = MagicMock()
-    ctx.application.bot_data = {
-        "config": talker_config,
-        "state_mgr": state_mgr,
-        "anthropic_client": FakeAnthropicClient([]),
-        "system_prompt": "sys",
-        "vault_context_str": "",
-        "chat_locks": {},
-    }
-    ctx.args = None
-
-    await bot.on_brief(update, ctx)
-    update.message.reply_text.assert_called_once()
-    reply = update.message.reply_text.call_args.args[0]
-    assert reply.startswith("usage:")
 
 
 # --- Config shape --------------------------------------------------------

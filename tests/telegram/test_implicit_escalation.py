@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from alfred.telegram import bot, conversation
+from alfred.telegram import conversation
 from alfred.telegram.session import Session
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
@@ -31,7 +31,7 @@ def _empty_session() -> Session:
         chat_id=1,
         started_at=datetime.now(timezone.utc),
         last_message_at=datetime.now(timezone.utc),
-        model=bot._SONNET_MODEL,
+        model="claude-sonnet-4-6",
     )
 
 
@@ -121,7 +121,7 @@ def test_should_offer_false_when_disabled_flag_set() -> None:
 
 def test_should_offer_false_when_already_on_opus() -> None:
     sess = _empty_session()
-    sess.model = bot._OPUS_MODEL
+    sess.model = "claude-opus-4-7"
     assert conversation._should_offer_escalation({}, sess) is False
 
 
@@ -155,7 +155,7 @@ async def test_run_turn_appends_escalation_suffix_on_keyword(
         chat_id=1,
         started_at=datetime.now(timezone.utc),
         last_message_at=datetime.now(timezone.utc),
-        model=bot._SONNET_MODEL,
+        model="claude-sonnet-4-6",
     )
     state_mgr.set_active(1, sess.to_dict())
 
@@ -186,7 +186,7 @@ async def test_run_turn_no_suffix_when_already_on_opus(
         chat_id=2,
         started_at=datetime.now(timezone.utc),
         last_message_at=datetime.now(timezone.utc),
-        model=bot._OPUS_MODEL,
+        model="claude-opus-4-7",
     )
     state_mgr.set_active(2, sess.to_dict())
 
@@ -214,7 +214,7 @@ async def test_run_turn_no_suffix_when_auto_escalate_disabled(
         chat_id=3,
         started_at=datetime.now(timezone.utc),
         last_message_at=datetime.now(timezone.utc),
-        model=bot._SONNET_MODEL,
+        model="claude-sonnet-4-6",
     )
     active = sess.to_dict()
     active["_auto_escalate_disabled"] = True
@@ -245,7 +245,7 @@ async def test_run_turn_cooldown_prevents_rapid_re_offer(
         chat_id=4,
         started_at=datetime.now(timezone.utc),
         last_message_at=datetime.now(timezone.utc),
-        model=bot._SONNET_MODEL,
+        model="claude-sonnet-4-6",
     )
     state_mgr.set_active(4, sess.to_dict())
 
@@ -274,31 +274,3 @@ async def test_run_turn_cooldown_prevents_rapid_re_offer(
 # --- /no-auto-escalate registration ----------------------------------------
 
 
-def test_build_app_registers_no_auto_escalate_handler(talker_config) -> None:
-    """``/no_auto_escalate`` lands on the Application as a CommandHandler.
-
-    Note: PTB only accepts ``[a-z0-9_]`` in command names, so the wk3 plan's
-    ``/no-auto-escalate`` (with hyphens) is implemented as
-    ``/no_auto_escalate``. Documented in the session note.
-    """
-    from alfred.telegram import state as state_mod
-    from pathlib import Path
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as tmp:
-        mgr = state_mod.StateManager(Path(tmp) / "s.json")
-        mgr.load()
-        app = bot.build_app(
-            config=talker_config,
-            state_mgr=mgr,
-            anthropic_client=None,
-            system_prompt="",
-            vault_context_str="",
-        )
-        commands = set()
-        for group in app.handlers.values():
-            for h in group:
-                cmds = getattr(h, "commands", None)
-                if cmds:
-                    commands.update(cmds)
-        assert "no_auto_escalate" in commands

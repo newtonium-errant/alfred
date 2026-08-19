@@ -22,41 +22,13 @@ from typing import Any
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _block_telegram_api(monkeypatch):
-    """Stub the Bot API transport so no test in this package dials Telegram.
-
-    ``tests/telegram/test_idle_tick.py`` drives a REAL ``Application`` through
-    ``process_update`` to prove the group=-1 pre-pass bumps the heartbeat
-    counter. That is the right test — but the text handler opens with a typing
-    indicator, so four of those tests reached ``api.telegram.org`` for real
-    (measured: ``sendChatAction`` x4, resolving to 149.154.166.110 and
-    2001:67c:4e8:f004::9). The file already avoided ``app.initialize()`` to dodge
-    ``getMe``, so the network cost was known — just not this path.
-
-    ``do_request`` is the single choke point every Bot API call funnels through
-    (``post`` → ``_request_wrapper`` → ``do_request``) and is PTB's documented
-    extension point for custom transports, so one patch covers every endpoint
-    without reaching into per-method internals.
-
-    **Shape caveat, deliberate:** this returns the boolean-success envelope
-    (``{"ok": true, "result": true}``) — correct for the action/flag methods the
-    suite actually calls, and the only response it can honestly synthesise. A
-    test that needs a structured result (a real ``Message`` from
-    ``send_message``) must patch that specific ``Bot`` method itself rather than
-    lean on this transport stub inventing an object. Nothing in the package does
-    today; no test references the request layer at all.
-
-    Autouse and package-wide on purpose: hermetic-by-default. A per-file fixture
-    is what let this leak survive — the anthropic stub in the health package had
-    exactly that shape and protected exactly one file.
-    """
-    from telegram.request import HTTPXRequest
-
-    async def _stubbed_do_request(self, url, method, request_data=None, **kwargs):  # noqa: ANN001, ARG001
-        return 200, b'{"ok": true, "result": true}'
-
-    monkeypatch.setattr(HTTPXRequest, "do_request", _stubbed_do_request)
+# Telegram retirement (2026-08-19): the ``_block_telegram_api`` autouse
+# fixture that used to live here stubbed PTB's ``HTTPXRequest.do_request`` so
+# no test in this package could dial api.telegram.org. With
+# ``alfred.telegram.bot`` deleted and the PTB dependency dropped there is no
+# Bot API transport left to stub — the protection is structural now (no PTB
+# code exists to make the call), and the suite-wide egress guard in
+# ``tests/conftest.py`` still refuses api.telegram.org for anything else.
 
 from alfred.telegram.config import (
     AnthropicConfig,

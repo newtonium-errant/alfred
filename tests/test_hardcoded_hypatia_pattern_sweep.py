@@ -18,9 +18,9 @@ config wasn't fully resolved (per
     hook dispatch blocks) with explicit fail-loud-skip-with-log when
     ``scope is None``.
 
-  * Made ``bot.py`` ``/accept-moc`` handler fail-loud via
-    ``RuntimeError`` when ``config.instance.name`` is missing,
-    instead of silently substituting ``"hypatia"``.
+  * (Historical) made the Telegram ``/accept-moc`` handler fail-loud
+    when ``config.instance.name`` was missing — that handler and its
+    Layer-6 pins died with ``alfred.telegram.bot`` (2026-08-19).
 
 These pins exercise:
 
@@ -31,8 +31,6 @@ These pins exercise:
      ``vault.zettel_hooks.dispatch_skipped_no_scope`` log event and
      skip the hook dispatch (no crash, no silent ``"hypatia"``
      substitution).
-  3. ``bot.on_accept_moc`` raises ``RuntimeError`` when the running
-     instance has no name configured.
 
 The pin tests would catch a future drift back toward defaulting,
 which is the antipattern named in the feedback memo.
@@ -40,9 +38,7 @@ which is the antipattern named in the feedback memo.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog.testing
@@ -238,10 +234,10 @@ def test_append_re_encounter_observation_requires_scope() -> None:
 def test_apply_accept_requires_scope() -> None:
     """``apply_accept`` no longer defaults scope — caller must supply.
 
-    Production callers (bot.py /accept-moc handler) pass the running
-    instance's scope; test fixtures (test_moc_suggestion_views.py)
-    pass ``scope="hypatia"``. The pin catches a future drift back
-    toward defaulting.
+    Callers must supply scope explicitly; test fixtures
+    (test_moc_suggestion_views.py) pass ``scope="hypatia"``. (The last
+    production caller — the Telegram /accept-moc handler — died with
+    bot.py 2026-08-19; the required-kwarg contract is what this pins.)
     """
     from alfred.telegram.moc_suggestion_views import apply_accept
     from alfred.surveyor.moc_suggester import MocSuggestion
@@ -430,227 +426,5 @@ def test_vault_edit_non_zettel_type_unaffected_by_no_scope_guard(
     assert len(matches) == 0
 
 
-# ===========================================================================
-# Layer 6 — bot.py: /accept-moc fails loud when config.instance.name missing
-# ===========================================================================
 
 
-def _make_update_mock(*, chat_id: int = 42, user_id: int = 42, text: str = "") -> MagicMock:
-    update = MagicMock()
-    update.message = MagicMock()
-    update.message.text = text
-    update.message.reply_text = AsyncMock()
-    update.effective_chat = MagicMock()
-    update.effective_chat.id = chat_id
-    update.effective_user = MagicMock()
-    update.effective_user.id = user_id
-    return update
-
-
-def _make_ctx_mock(
-    vault_path: Path,
-    *,
-    queue_path: Path,
-    allowed_user_id: int = 42,
-    instance: object = "MISSING",  # sentinel: don't set
-) -> MagicMock:
-    from alfred.telegram import bot
-    config = MagicMock()
-    config.allowed_users = [allowed_user_id]
-    config.vault = MagicMock()
-    config.vault.path = str(vault_path)
-    if instance == "MISSING":
-        # Leave config.instance as the MagicMock default — we'll
-        # override per-test.
-        pass
-    else:
-        config.instance = instance
-    config.moc_suggestions = MagicMock()
-    config.moc_suggestions.command_enabled = True
-    config.moc_suggestions.queue_path = str(queue_path)
-    ctx = MagicMock()
-    ctx.application.bot_data = {bot._KEY_CONFIG: config}
-    return ctx
-
-
-def _seed_zettel(vault: Path, name: str) -> str:
-    (vault / "zettel").mkdir(exist_ok=True)
-    rel = f"zettel/{name}.md"
-    body = (
-        "---\ntype: zettel\nname: " + name + "\n"
-        "created: 2026-05-20\nmocs: []\n---\n\n"
-        "# Premise\n\n# Notes\n\n# Tags\n\n# Indexing & MOCs\n"
-    )
-    (vault / rel).write_text(body, encoding="utf-8")
-    return rel
-
-
-def _write_queue(queue_path: Path, suggestions: list) -> None:
-    queue_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(queue_path, "w", encoding="utf-8") as f:
-        for s in suggestions:
-            f.write(json.dumps(s.to_dict(), separators=(",", ":")) + "\n")
-
-
-@pytest.mark.asyncio
-async def test_on_accept_moc_fails_loud_when_instance_name_missing(
-    tmp_path: Path,
-) -> None:
-    """The /accept-moc handler raises RuntimeError instead of silently
-    substituting ``"hypatia"`` when ``config.instance.name`` is None.
-
-    Per ``feedback_hardcoding_and_alfred_naming.md``: the fail-loud
-    guarantee on instance.name preserves the contract that any
-    deployment without explicit ``instance.name`` fails LOUDLY at the
-    first vault-scope-required call site rather than silently routing
-    through a single-instance literal.
-    """
-    from alfred.surveyor.moc_suggester import MocSuggestion
-    from alfred.telegram import bot
-
-    # Build vault + queue.
-    vault = tmp_path / "vault"
-    vault.mkdir()
-    (vault / "zettel").mkdir()
-    (vault / "MOC").mkdir()
-    (vault / "MOC" / "Stoicism MOC.md").write_text(
-        "---\ntype: MOC\nname: Stoicism MOC\ncreated: 2026-05-20\n---\n\n"
-        "# Premise\n\n# Contents\n\n# Tags\n",
-        encoding="utf-8",
-    )
-    rel = _seed_zettel(vault, "FailLoudTest")
-    qp = tmp_path / "queue.jsonl"
-    suggestion = MocSuggestion(
-        id="ms-failloud-1",
-        cluster_id_at_proposal=7,
-        cluster_tags=["x"],
-        cluster_member_paths=[rel],
-        target_moc_rel_path="MOC/Stoicism MOC.md",
-        proposed_new_moc_name=None,
-        mapping_signal="member_overlap",
-        mapping_score=0.6,
-        candidate_members_to_add=[rel],
-        reasoning="r",
-        created="2026-05-20T14:00:00+00:00",
-        status="pending",
-    )
-    _write_queue(qp, [suggestion])
-
-    update = _make_update_mock(text="/accept_moc ms-failloud-1")
-    ctx = _make_ctx_mock(vault, queue_path=qp)
-    # Set config.instance.name to falsy explicitly.
-    ctx.application.bot_data[bot._KEY_CONFIG].instance = MagicMock()
-    ctx.application.bot_data[bot._KEY_CONFIG].instance.name = ""
-
-    with pytest.raises(RuntimeError, match="config.instance.name required"):
-        await bot.on_accept_moc(update, ctx)
-
-
-@pytest.mark.asyncio
-async def test_on_accept_moc_fails_loud_when_instance_is_none(
-    tmp_path: Path,
-) -> None:
-    """Mirror of the previous test — when ``config.instance`` is
-    entirely None (not just name unset), the same RuntimeError
-    fires. Two failure modes; both pin the fail-loud contract.
-    """
-    from alfred.surveyor.moc_suggester import MocSuggestion
-    from alfred.telegram import bot
-
-    vault = tmp_path / "vault"
-    vault.mkdir()
-    (vault / "zettel").mkdir()
-    (vault / "MOC").mkdir()
-    (vault / "MOC" / "Stoicism MOC.md").write_text(
-        "---\ntype: MOC\nname: Stoicism MOC\ncreated: 2026-05-20\n---\n\n"
-        "# Premise\n\n# Contents\n\n# Tags\n",
-        encoding="utf-8",
-    )
-    rel = _seed_zettel(vault, "InstanceNoneTest")
-    qp = tmp_path / "queue.jsonl"
-    suggestion = MocSuggestion(
-        id="ms-instnone-1",
-        cluster_id_at_proposal=7,
-        cluster_tags=["x"],
-        cluster_member_paths=[rel],
-        target_moc_rel_path="MOC/Stoicism MOC.md",
-        proposed_new_moc_name=None,
-        mapping_signal="member_overlap",
-        mapping_score=0.6,
-        candidate_members_to_add=[rel],
-        reasoning="r",
-        created="2026-05-20T14:00:00+00:00",
-        status="pending",
-    )
-    _write_queue(qp, [suggestion])
-
-    update = _make_update_mock(text="/accept_moc ms-instnone-1")
-    ctx = _make_ctx_mock(vault, queue_path=qp)
-    ctx.application.bot_data[bot._KEY_CONFIG].instance = None
-
-    with pytest.raises(RuntimeError, match="config.instance.name required"):
-        await bot.on_accept_moc(update, ctx)
-
-
-@pytest.mark.asyncio
-async def test_on_accept_moc_uses_instance_name_lowered_as_scope(
-    tmp_path: Path,
-) -> None:
-    """Sanity / contract check: when ``config.instance.name`` IS set
-    to "Hypatia" (capital-H, mirror of real config), the handler
-    derives scope ``"hypatia"`` via ``.lower()``. Catches a future
-    regression that drops the ``.lower()`` call.
-
-    Asserts via the ``moc_suggestion_views.apply_success`` log event
-    rather than mocking apply_accept directly — the scope reaches the
-    vault layer correctly when apply succeeds.
-    """
-    from alfred.surveyor.moc_suggester import MocSuggestion
-    from alfred.telegram import bot
-
-    vault = tmp_path / "vault"
-    vault.mkdir()
-    (vault / "zettel").mkdir()
-    (vault / "MOC").mkdir()
-    (vault / "MOC" / "Stoicism MOC.md").write_text(
-        "---\ntype: MOC\nname: Stoicism MOC\ncreated: 2026-05-20\n---\n\n"
-        "# Premise\n\n# Contents\n\n# Tags\n",
-        encoding="utf-8",
-    )
-    rel = _seed_zettel(vault, "ScopeReachesVault")
-    qp = tmp_path / "queue.jsonl"
-    suggestion = MocSuggestion(
-        id="ms-scope-reaches-1",
-        cluster_id_at_proposal=7,
-        cluster_tags=["x"],
-        cluster_member_paths=[rel],
-        target_moc_rel_path="MOC/Stoicism MOC.md",
-        proposed_new_moc_name=None,
-        mapping_signal="member_overlap",
-        mapping_score=0.6,
-        candidate_members_to_add=[rel],
-        reasoning="r",
-        created="2026-05-20T14:00:00+00:00",
-        status="pending",
-    )
-    _write_queue(qp, [suggestion])
-
-    update = _make_update_mock(text="/accept_moc ms-scope-reaches-1")
-    ctx = _make_ctx_mock(vault, queue_path=qp)
-    ctx.application.bot_data[bot._KEY_CONFIG].instance = MagicMock()
-    ctx.application.bot_data[bot._KEY_CONFIG].instance.name = "Hypatia"
-
-    with structlog.testing.capture_logs() as captured:
-        await bot.on_accept_moc(update, ctx)
-
-    # apply succeeded → scope was valid → "Hypatia".lower() = "hypatia"
-    # reached vault scope check successfully.
-    apply_logs = [
-        c for c in captured
-        if c.get("event") == "moc_suggestion_views.apply_success"
-    ]
-    assert len(apply_logs) == 1, (
-        f"expected apply_success; all events: "
-        f"{[c.get('event') for c in captured]}"
-    )
-    assert apply_logs[0]["suggestion_id"] == "ms-scope-reaches-1"

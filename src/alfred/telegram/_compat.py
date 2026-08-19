@@ -1,8 +1,9 @@
 """Telegram-package compatibility shims — cross-module helpers that
 multiple call sites need but should not duplicate.
 
-Currently houses the instance-name normaliser shared between
-:mod:`alfred.telegram.bot` (peer-route self-target check) and
+Currently houses the instance-name normaliser historically shared
+between the retired Telegram bot (peer-route self-target check; module
+deleted 2026-08-19) and
 :mod:`alfred.telegram.speed_pref` (per-instance TTS speed lookup). The
 two modules used to carry independent copies; the bug surface that
 created (any divergence between the two normalisations would break the
