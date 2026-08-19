@@ -5610,6 +5610,34 @@ def cmd_reconcile(args: argparse.Namespace) -> None:
     sys.exit(code)
 
 
+def cmd_feed(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred feed`` subcommands.
+
+    One-shot maintenance only. ``repair`` is DRY-RUN BY DEFAULT — it prints
+    the plan and writes nothing unless ``--apply`` is passed.
+    """
+    raw = _load_unified_config(args.config)
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(raw, tool="feed", suppress_stdout=wants_json)
+
+    from alfred.feed import cli as fcli
+
+    subcmd = getattr(args, "feed_cmd", None)
+
+    if subcmd == "repair":
+        code = fcli.cmd_repair(
+            raw,
+            apply=bool(getattr(args, "apply", False)),
+            wants_json=wants_json,
+            log_dir=getattr(args, "log_dir", None),
+        )
+    else:
+        print("Usage: alfred feed repair [--apply] [--json] [--log-dir <dir>]")
+        code = 1
+
+    sys.exit(code)
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -7211,6 +7239,39 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # feed — one-shot maintenance on the feed store.
+    feed_p = sub.add_parser(
+        "feed",
+        help=(
+            "Feed store maintenance. ``repair`` re-derives the missing verb "
+            "on legacy verbless-acted items from the daemon logs. Dry-run by "
+            "default; nothing is written without --apply."
+        ),
+    )
+    feed_sub = feed_p.add_subparsers(dest="feed_cmd")
+
+    feed_repair = feed_sub.add_parser(
+        "repair",
+        help=(
+            "Re-derive and stamp the acting VERB on legacy verbless-acted "
+            "items. Idempotent: a second run finds nothing to do. Refuses the "
+            "whole plan (exit 1) if the log join is over-matching."
+        ),
+    )
+    feed_repair.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the events. Without this the command only prints the plan.",
+    )
+    feed_repair.add_argument(
+        "--log-dir",
+        default=None,
+        help="Override the directory the logs are read from (default: logging.dir).",
+    )
+    feed_repair.add_argument(
+        "--json", action="store_true", help="Emit the plan as JSON."
+    )
+
     # reconcile — remittance reconciliation, statement side (P1).
     # Ledger is truth, note is a render. NO vault writes in P1: ``render``
     # prints the regenerated text and stops there.
@@ -7446,6 +7507,7 @@ def main() -> None:
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
         "routine": cmd_routine,
+        "feed": cmd_feed,
         "reconcile": cmd_reconcile,
         "stt-vocab": _cmd_stt_vocab,
         "tier-override": _cmd_tier_override,

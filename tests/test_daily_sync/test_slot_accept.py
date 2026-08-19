@@ -869,6 +869,108 @@ def test_undo_on_accepted_emits_named_log(tmp_path: Path) -> None:
     assert len(events) == 1
 
 
+def _snoozing_config(tmp_path: Path) -> DailySyncConfig:
+    """``_ds_config`` with the board-snooze sidecar wired, so a snooze act runs
+    for real instead of returning ``not_configured``."""
+    cfg = _ds_config(tmp_path)
+    # ``_snooze_store_path`` reads ``tier.snooze.path`` out of the instance's
+    # OWN config file threaded via ``config_path`` — so the fixture has to
+    # provide a real one rather than set an attribute the dataclass lacks.
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        f"tier:\n  snooze:\n    path: {tmp_path / 'board_snooze.json'}\n",
+        encoding="utf-8",
+    )
+    cfg.config_path = str(config_file)
+    return cfg
+
+
+def test_undo_on_snoozed_routine_lane_binds_the_guard(tmp_path: Path) -> None:
+    """SECURITY PIN — the snooze sibling of the accept guard, on the lane where
+    it is load-bearing.
+
+    A snooze is stamped ``state=acted, action=snooze`` (``_slot_snooze``), so
+    the ``state == STATE_ACTED`` half of ``is_done`` reads a merely-postponed
+    item as done. Guard off, ``mark_routine_item_undone`` on a never-completed
+    item returns ``not_logged`` with ``.ok=True`` → ``_slot_undo`` flips the
+    item acted→open, CLEARS acted_action, and reports "undone": the operator's
+    snooze silently erased.
+
+    The TASK lane cannot bind this (undo there is already unsupported_item from
+    C1b, so a task-lane fixture stays green with the guard deleted) — the same
+    vacuity the accept guard's routine-lane pin was written to close.
+
+    Paired positive control below: the nearest ADMISSIBLE neighbour — a
+    genuinely done-acted item on this same lane — still undoes. Without it,
+    this refusal would pass identically against a guard that refuses
+    everything.
+    """
+    vault = _vault(tmp_path)
+    record = _routine_selfcare(vault)
+    store, cfg = _store(tmp_path), _snoozing_config(tmp_path)
+    item = [it for it in _slot_items(vault) if it.evidence.get("routine_record")][0]
+    store.upsert(item)
+
+    snoozed = _act(store, cfg, vault, item.id, "snooze_1d")
+    assert snoozed.ok, f"fixture failed to snooze: {snoozed.status} {snoozed.detail}"
+    assert store.load()[item.id].acted_action == "snooze"
+
+    undo = _act(store, cfg, vault, item.id, "undo_done")
+
+    assert not undo.ok and undo.status == STATUS_INVALID_ACTION
+    assert "snoozed" in undo.detail and "unsnooze" in undo.detail
+    folded = store.load()[item.id]
+    assert folded.state == STATE_ACTED      # NOT flipped to open (guard off → open)
+    assert folded.acted_action == "snooze"  # NOT cleared (guard off → None)
+    # And no completion was reversed in the vault (nothing was ever logged).
+    cl = dict(frontmatter.load(str(record)).metadata.get("completion_log") or {})
+    assert cl.get("Meditate") in (None, [])
+
+
+def test_undo_on_done_acted_still_undoes_with_the_snooze_guard_in_place(
+    tmp_path: Path,
+) -> None:
+    """The paired positive control: the snooze guard is verb-scoped, so a
+    genuinely done-acted item on the same lane still reverses normally. This is
+    what makes the refusal above a discriminator rather than a blanket."""
+    vault = _vault(tmp_path)
+    _routine_selfcare(vault)
+    store, cfg = _store(tmp_path), _snoozing_config(tmp_path)
+    item = [it for it in _slot_items(vault) if it.evidence.get("routine_record")][0]
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "done")  # acted_action=done, really completed
+
+    undo = _act(store, cfg, vault, item.id, "undo_done")
+
+    assert undo.ok and undo.status == STATUS_UNDONE
+    cl = dict(
+        frontmatter.load(str(vault / "routine" / "Self Care.md")).metadata.get(
+            "completion_log"
+        )
+        or {}
+    )
+    assert cl.get("Meditate") == []  # completion date removed
+
+
+def test_undo_on_snoozed_emits_named_log(tmp_path: Path) -> None:
+    """The refusal is greppable, and the event names WHY it refused — a bare
+    ``ok=False`` is indistinguishable from an unrelated denial."""
+    vault = _vault(tmp_path)
+    _routine_selfcare(vault)
+    store, cfg = _store(tmp_path), _snoozing_config(tmp_path)
+    item = [it for it in _slot_items(vault) if it.evidence.get("routine_record")][0]
+    store.upsert(item)
+    _act(store, cfg, vault, item.id, "snooze_1d")
+
+    with structlog.testing.capture_logs() as cap:
+        _act(store, cfg, vault, item.id, "undo_done")
+
+    events = [c for c in cap if c.get("event") == "feed.act.slot.undo_on_snoozed"]
+    assert len(events) == 1
+    assert events[0]["id"] == item.id
+    assert events[0]["action"] == "undo_done"
+
+
 def test_done_stamps_acted_action_done(tmp_path: Path) -> None:
     """The done dispatches stamp acted_action="done" (all slot lanes) — pinned
     on the routine lane."""
