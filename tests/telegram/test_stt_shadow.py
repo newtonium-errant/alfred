@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock
 
 import structlog
 
-from alfred.telegram import heartbeat, stt_shadow
+from alfred.telegram import stt_shadow
 from alfred.telegram.config import (
     STTConfig,
     SttShadowCaptureConfig,
