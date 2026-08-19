@@ -330,10 +330,27 @@ describe('a PDF picked over typed notes is REFUSED, not silently swapped', () =>
     expect(msg.toLowerCase()).toContain('clear those notes');
   });
 
-  it('stages NOTHING — the submit is still about the notes, not the file', async () => {
+  it('stages NOTHING — no pdfUpload residue, so the staging cannot half-happen', async () => {
     // The body-intact assertion above passes just as well against a form that
     // kept the text on screen AND staged the PDF underneath, which would submit
     // body_b64 and drop the notes at the door: the same loss, one step later.
+    //
+    // THIS IS THE NO-RESIDUE CHECK, and the submit payload is the ONLY place it
+    // can be made. `pdfUpload` has exactly two observable consequences:
+    //
+    //   1. `hasContent` treats a staged PDF as satisfying the body requirement.
+    //      UNOBSERVABLE HERE — the notes are non-empty, so `hasContent` is true
+    //      either way and the submit button's state discriminates nothing. The
+    //      obvious fix (clear the body, then check the button went disabled)
+    //      does not work either: clearing the body runs `onBodyEdited`, which
+    //      clears `pdfUpload` — the act of observing destroys the residue.
+    //   2. `handleSubmit` swaps the payload to body_format/body_b64. Observable,
+    //      and asserted below.
+    //
+    // Verified by mutation rather than argued: staging the PDF and THEN
+    // returning from the refusal — the half-happen, exactly — reds this test and
+    // only this test, reporting that `body` arrived undefined because body_b64
+    // went in its place.
     renderForm();
     type(TYPED);
     await uploadPdf('statement.pdf', PDF);
