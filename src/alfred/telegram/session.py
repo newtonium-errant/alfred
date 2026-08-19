@@ -1658,10 +1658,14 @@ def close_session(
         "vault_ops": len(session.vault_ops),
         "session_type": session_type,
         "continues_from": continues_from,
-        # Wk3 commit 8: record the opening and closing model so
-        # model_calibration.propose_default_flip can detect mid-session
-        # escalation. ``opening_model`` falls back to current ``model``
-        # for wk2 records being written during transition.
+        # Wk3 commit 8: record the opening and closing model. Originally
+        # for model_calibration.propose_default_flip's mid-session
+        # escalation detection (module deleted in T5, 2026-08-19); the
+        # fields stay as per-session model provenance in the
+        # closed-session state contract (pinned by
+        # tests/telegram/test_session_model_fields.py). ``opening_model``
+        # falls back to current ``model`` for wk2 records written during
+        # the transition.
         "opening_model": session.opening_model or session.model,
         "closing_model": session.model,
     })
