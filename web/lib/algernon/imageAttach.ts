@@ -2,13 +2,15 @@
  * Turning picked images into carried chat attachments — the caps, the copy, and
  * the preparation, in ONE place (#97).
  *
- * Lifted verbatim out of the chat Composer's `addFiles` when the unified
- * composer became a second door onto the same conversation route. Both doors
- * feed the identical backend field (`images` on the turn body), so a second
- * implementation would be two answers to "which images may ride a message" —
- * exactly the drift `imagePrepare` was extracted to prevent one layer down, and
- * the drift `batchSubmit` names when it says the composer runs the identical
- * preparation.
+ * Lifted verbatim out of the legacy chat composer's `addFiles` when the unified
+ * composer became a second door onto the same conversation route. That legacy
+ * door has since been deleted and `UnifiedComposer` is the only one left, so
+ * the drift this module was extracted to prevent is no longer live — but the
+ * consolidation is kept rather than inlined, because the caps and their refusal
+ * sentences are the answer to "which images may ride a message" and that
+ * question is asked from more than the composer. It is the same argument
+ * `imagePrepare` makes one layer down, and the one `batchSubmit` names when it
+ * says the composer runs the identical preparation.
  *
  * The REFUSAL SENTENCES live here too, not just the numbers. A cap enforced in
  * two places with two wordings is a cap the operator learns twice, and the

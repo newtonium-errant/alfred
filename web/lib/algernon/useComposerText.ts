@@ -6,9 +6,12 @@ import type { ChatKind } from './types';
  * The text half of a composer: the typed value, the held-back unsent text
  * (#94c), and the raw-STT transcript a voice-seeded send carries (#54).
  *
- * Extracted from `Composer.tsx` when the unified composer (#97) became a second
- * composer that must behave IDENTICALLY on all three. These are not cosmetic
- * rules — each encodes an incident:
+ * Extracted from the legacy `Composer.tsx` when the unified composer (#97)
+ * became a second composer that must behave IDENTICALLY on all three. That
+ * legacy component has since been deleted, so this is no longer shared BETWEEN
+ * composers — it is simply where the rules live, and where they are pinned
+ * (`tests/useComposerText.test.tsx`). These are not cosmetic rules — each
+ * encodes an incident:
  *
  *   * APPEND, never replace. The original `setValue(t)` destroyed whatever the
  *     operator had already typed. That is the clobber that was reported.
@@ -22,7 +25,9 @@ import type { ChatKind } from './types';
  *     rewriting, their current words win.
  *
  * A second hand-written copy of those four rules is a second chance to get one
- * of them backwards, silently, in the composer nobody re-tested.
+ * of them backwards, silently, in the composer nobody re-tested. That was the
+ * argument for extracting it while two composers existed; with one left it is
+ * the argument for not folding it back in.
  */
 export interface ComposerText {
   /** The textarea's value. */

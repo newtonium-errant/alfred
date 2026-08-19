@@ -531,8 +531,9 @@ describe('refusals at the picker', () => {
     mount();
     // A .zip can reach the composer by paste/drop, past the picker's `accept`.
     // `fireEvent.change` bypasses user-event's own accept filtering to drive the
-    // shared classification gate directly — the convention composer.test.tsx
-    // already uses for the same reason.
+    // shared classification gate directly. (The convention was inherited from
+    // composer.test.tsx, which the composer-deletion lane retired along with the
+    // component it drove; the reason for it is unchanged.)
     fireEvent.change(screen.getByTestId('unified-file-input'), {
       target: {
         files: [

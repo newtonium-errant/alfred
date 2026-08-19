@@ -6,10 +6,8 @@ import { COMMS_SURFACE } from '../lib/algernon/commsSurface';
 import { NotificationList } from '../components/NotificationList';
 import { ChatThread } from '../components/chat/ChatThread';
 import { ChatTargetPicker } from '../components/chat/ChatTargetPicker';
-import { Composer } from '../components/chat/Composer';
 import { UnifiedComposer } from '../components/chat/UnifiedComposer';
 import { VoicePanel } from '../components/chat/VoicePanel';
-import { unifiedComposerEnabled } from '../lib/algernon/composerFlag';
 import { Button } from '../components/ui/button';
 import { authApi } from '../lib/algernon/authClient';
 import { chatApi } from '../lib/algernon/client';
@@ -262,35 +260,22 @@ export default function ChatPage() {
               from — threaded through to the turn body so the backend can learn
               from what the operator corrected. A typed send passes nothing.
 
-              #97: with NEXT_PUBLIC_UNIFIED_COMPOSER on, the universal composer
-              mounts here — the same `onSend` contract, plus attachment routing
-              to the ingest and batch doors. IT IS ON IN THE BOX BUILD, so the
-              unified branch is what /chat serves today and the OFF branch below
-              is the ROLLBACK, not the default. The two are alternatives, never
-              layered, so "flag off" is the old component itself rather than the
-              new one in a quiet mode.
-
-              Rolling back is a REBUILD, not an env edit: NEXT_PUBLIC_* is
-              inlined at build time, so clearing the variable on a running box
-              changes nothing until the bundle is rebuilt. */}
-          {unifiedComposerEnabled() ? (
-            <UnifiedComposer
-              onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
-              disabled={booting || sending}
-              seedText={unsentText}
-              onSeedConsumed={clearUnsent}
-              instance={instance}
-              instanceLabel={activeLabel}
-              onUnauthenticated={() => router.replace(`/login?next=${encodeURIComponent('/chat')}`)}
-            />
-          ) : (
-            <Composer
-              onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
-              disabled={booting || sending}
-              seedText={unsentText}
-              onSeedConsumed={clearUnsent}
-            />
-          )}
+              #97: the universal composer — the same `onSend` contract, plus
+              attachment routing to the ingest and batch doors. It mounted
+              behind NEXT_PUBLIC_UNIFIED_COMPOSER through the bake window; the
+              flag and the legacy composer it selected against are both DELETED
+              now, so this is simply what /chat renders. There is no longer a
+              rollback door in the tree — reverting means reverting the commit,
+              not rebuilding with a variable cleared. */}
+          <UnifiedComposer
+            onSend={(t, kind, images, transcript) => void send(t, kind, images, transcript)}
+            disabled={booting || sending}
+            seedText={unsentText}
+            onSeedConsumed={clearUnsent}
+            instance={instance}
+            instanceLabel={activeLabel}
+            onUnauthenticated={() => router.replace(`/login?next=${encodeURIComponent('/chat')}`)}
+          />
         </div>
       </Layout>
     </>

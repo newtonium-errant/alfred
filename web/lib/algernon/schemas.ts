@@ -101,8 +101,9 @@ export type PlayerPrimerBody = z.infer<typeof playerPrimerSchema>;
 // surface for no learning.
 //
 // The composer DROPS an over-long transcript rather than sending it (see
-// Composer.tsx): capture is telemetry and must never cost the operator their
-// turn, which a 400 here would. This bound is therefore the trust-boundary
+// `useComposerText.takeTranscript` — that is where the drop lives now that the
+// legacy Composer.tsx is deleted): capture is telemetry and must never cost the
+// operator their turn, which a 400 here would. This bound is therefore the trust-boundary
 // guard against a hostile or buggy client, not the operator's everyday limit —
 // the same edge-guard-vs-UX split `images` already uses.
 export const MAX_TRANSCRIPT_CHARS = MAX_MESSAGE_CHARS;
