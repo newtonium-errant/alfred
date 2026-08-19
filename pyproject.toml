@@ -103,7 +103,10 @@ surveyor = [
     "openai>=1.30",
 ]
 voice = [
-    "python-telegram-bot>=21.0",
+    # python-telegram-bot REMOVED 2026-08-19 (T4 C5): the Telegram surface
+    # is retired — bot.py deleted, tokens revoked, every instance web-only.
+    # tests/test_no_ptb_regression.py pins the dependency's absence; do not
+    # re-add without the platform decision that pin describes.
     "anthropic>=0.40",
     # wk2b c5: ElevenLabs TTS for the /brief audio summary command.
     # The implementation uses httpx directly (no SDK import-time dep in
@@ -111,16 +114,17 @@ voice = [
     # want to swap to SDK-based calls later without another pip install.
     "elevenlabs>=1.0",
     # Outbound-push transport (c1+): async HTTP server hosted inside the
-    # talker daemon, delivering messages from scheduler / brief / other
-    # tools via Telegram. aiohttp is lighter than FastAPI and shares
+    # talker daemon, carrying messages from scheduler / brief / other
+    # tools (historically delivered via Telegram; web/push surfaces now).
+    # aiohttp is lighter than FastAPI and shares
     # the talker's event loop cleanly. Pulled in under ``voice`` because
     # the server only runs when the talker is active.
     "aiohttp>=3.10",
     # 2026-06-06 c1 (PDF document handler): pure-Python PDF text
-    # extraction for ``bot.on_document``. The handler routes Telegram
-    # ``document`` updates with mime ``application/pdf`` through
-    # ``pypdf.PdfReader`` and threads the extracted text into the
-    # conversation. Anthropic's native PDF document block is
+    # extraction, originally for the Telegram bot's on_document handler
+    # (retired 2026-08-19); ``alfred.documents.pdf`` +
+    # ``telegram/attachments.py`` still route PDF payloads through
+    # ``pypdf.PdfReader``. Anthropic's native PDF document block is
     # model-family-specific (a quirk-centralisation surface we don't
     # need yet); text extraction is backend-agnostic and works across
     # every model the talker can route to. Lives under ``voice``
