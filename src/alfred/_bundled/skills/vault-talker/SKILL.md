@@ -459,9 +459,9 @@ The morning brief has a section titled exactly `Today's Plan` (single source of 
 ### Duty
 - [T1] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
 - [T2] [[task/Connect QBO API — RRTS]] *(carried from yesterday)*
+- [T2] Water the plants (from [[routine/Weekly Chores]]) — due Fri Aug 14
 
 ### Rhythm
-- [T2] Water the plants (from [[routine/Weekly Chores]]) — due Fri Aug 14
 
 *Today's rhythm items:*
 
@@ -482,6 +482,8 @@ The morning brief has a section titled exactly `Today's Plan` (single source of 
 ```
 
 **Read the arrangement correctly.** The `###` subsections are **rings**, not tiers — and every row carries its own `[Tn]` tag, because the arrangement is by ring while the daily goal is still counted by tier. So a row's heading tells you what kind of claim it makes, and its tag tells you how hard it presses. `ROLLOVER_HEADER` still renders, but its scope narrowed in Phase C: carried items now appear in their own ring above (marked `(carried from yesterday)`) rather than being listed again underneath.
+
+**Note where the plant-watering row landed.** It is a *routine* item, but it carries a recurring deadline, so it derives **Duty** — not Rhythm — and it sits under Duty at `[T2]`, a full ring away from the tier its tag names. That is rule 4 doing its job, and it is the most common surprise in this section: a routine with a `due_pattern` is a scheduled obligation, and being routine-shaped does not make it Rhythm. If Andrew wants a deadline-bearing routine item to live in Rhythm anyway, it needs an explicit `slot: rhythm` — same escape as a dated task.
 
 **The empty-bucket prompt strings, rollover header, pool header, and routine-T2 affordances are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`, plus the Ship B addition `T2_ROUTINE_CONFIRM_PROMPT` (see **Routine-origin tier entries** above for the routine-specific shapes). Salem recognises these strings in the brief to know which reply pattern is expected. **All of the above are still rendered and still verbatim — the Phase C restructure changed the section's title and the arrangement of its rows, not one byte of any reply affordance.** The one exception is `T2_AUTO_ROUTINE_HEADER`, which is still defined but no longer rendered (see above), so it is no longer a string to recognise in a brief. If any string changes at the code layer, this SKILL needs a follow-up sweep.
 
@@ -1259,6 +1261,7 @@ The two escalation fields have similar names and **count completely different th
 
 | Field | What it counts | Effect |
 |---|---|---|
+| `due_pattern: {...}` | — | A recurring deadline. **Its ring is Duty** (rule 4) — a scheduled obligation, however routine-shaped the item is. Overridden only by an explicit `slot:`. |
 | `escalate_at_days: N` | Days **BEFORE DUE**. Requires a `due_pattern`. | T1 when `days_to_due` is in `[0, N]` (negative/overdue admitted). `N: 0` = T1 on the due date itself; `N: 1` = T1 the day before. |
 | `surface_at_days: M` | Days **BEFORE DUE**. Requires a `due_pattern`. | T2 when `escalate_at_days < days_to_due <= M`. Only meaningful when `M > N`. |
 | `escalate_after_gap_days: M` | Days **SINCE LAST COMPLETION**. Requires **NO** `due_pattern`. | At `gap >= M` the item goes T1 and **visits Duty** for the day. Below M it keeps its quiet behaviour, unchanged. |
@@ -1282,7 +1285,7 @@ Three things follow, and the third is a live constraint:
 2. **The default reaches ONLY an explicit `slot: fuel`** that Andrew wrote himself — never a ring the classifier derived. A guess must not conscript an item into escalation. So an item that *behaves* like fuel but has no `slot:` gets nothing; if he wants the rule to cover it, write `slot: fuel`.
 3. **A NON-default threshold is currently hard to set — say so rather than silently failing.** The per-item `escalate_after_gap_days` overrides the default, but it cannot be written through the `routine_item` tool today (the tool drops it silently while reporting success — see **The `routine_item` tool** below). If Andrew wants a fuel item at something other than three days, or wants gap escalation on a NON-fuel item, the only path is `vault_edit` on the routine record, with the list-replacement hazard below. **Never claim to have set a custom threshold through `routine_item`.** If you can't set it cleanly, tell him the threshold is still the three-day default and offer the `vault_edit` route.
 
-**If he asks why a neglected item never escalated:** check whether it actually carries `slot: fuel`. A fuel-slotted item on this instance escalates at three days by default, so the usual answer is that the item was never slotted fuel — not that the feature is broken.
+**If he asks why a neglected item never escalated:** check whether it actually carries `slot: fuel`. A fuel-slotted item on this instance escalates at three days by default, so the usual answer is that the item was never slotted fuel.
 
 **INVALID COMBO — never write `escalate_after_gap_days` together with a `due_pattern`.** A completion gap is undefined under a deadline item's cycle-based doneness. If both are present, `due_pattern` wins, **the gap field is silently ignored**, and a `gap_escalation_conflict` warn fires at Andrew. If he asks for both behaviours on one item, that's the ask-back case — the two are different questions and one item can only answer one of them.
 
@@ -1294,9 +1297,16 @@ Write `slot:` when Andrew tells you where something belongs, especially when it 
 
 **On this instance `slot: fuel` is doubly load-bearing** — it is both the ring and the switch that arms his three-day neglect rule (see the default below). So writing it is not a cosmetic label, and *failing* to write it on something he called fuel means the rule silently doesn't cover it. When he describes a thing as fuelling him, setting `slot: fuel` is the whole encoding.
 
+**The two cases where a deadline silently overrides the ring Andrew named.** Both derive Duty from structure, and in both the fix is the same one word:
+
+- **A routine item with a `due_pattern`** (rule 4) — *"water the plants every Friday, but that's part of my rhythm, not a duty."* The recurring deadline wins and it lands in Duty unless you write `slot: rhythm`.
+- **A task with any `due` date** (rule 6) — *"this is due the 10th but it's not urgent."* Every dated task reads as Duty regardless of how far off the date is, unless you write `slot:`.
+
+In both cases the deadline still drives the **tier**, so the item keeps climbing the attention band as the date nears — the `slot:` only stops it from claiming to be an obligation today. **Whenever Andrew names a ring and a deadline in the same breath, he is describing this case**, so write the `slot:` he said out loud rather than letting the structure overrule him. If you write the deadline and skip the `slot:`, the item lands somewhere he did not ask for and nothing reports that it happened.
+
 #### STATE IT BACK before you write a scheduling encoding
 
-**Before writing any item that carries a cadence, deadline, or escalation field, say in plain ring-and-behaviour terms what the record will actually do — then write it.** No jargon, no field names: describe the days.
+**Before writing any item that carries a cadence, deadline, or escalation field, say in plain ring-and-behaviour terms what the record will actually do — then write it once he confirms.** No jargon, no field names: describe the days.
 
 > *"So this will sit quietly in Rhythm each day, and if three days go by without you checking it, it becomes a Duty item for that day until you do. Sound right?"*
 
