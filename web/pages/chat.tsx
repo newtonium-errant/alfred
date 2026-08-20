@@ -4,6 +4,7 @@ import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
 import { COMMS_SURFACE } from '../lib/algernon/commsSurface';
 import { NotificationList } from '../components/NotificationList';
+import { CaptureBar } from '../components/chat/CaptureBar';
 import { ChatThread } from '../components/chat/ChatThread';
 import { ChatTargetPicker } from '../components/chat/ChatTargetPicker';
 import { UnifiedComposer } from '../components/chat/UnifiedComposer';
@@ -52,6 +53,13 @@ export default function ChatPage() {
     endChat,
     sessionKey,
     refreshFromHistory,
+    captureActive,
+    captureBusy,
+    toggleCapture,
+    extractionOffer,
+    extracting,
+    acceptExtraction,
+    dismissExtraction,
   } = useChat({
     enabled: authed,
     instance,
@@ -189,7 +197,15 @@ export default function ChatPage() {
                 Loading the conversation…
               </p>
             ) : (
-              <ChatThread messages={messages} sending={sending} workingLabel={working} />
+              // While CAPTURING, the typing indicator is suppressed: no
+              // reply is coming and pretending one is would contradict the
+              // capture indicator (the received mark on the bubble is the
+              // whole ack).
+              <ChatThread
+                messages={messages}
+                sending={sending && !captureActive}
+                workingLabel={working}
+              />
             )}
           </div>
 
@@ -254,6 +270,24 @@ export default function ChatPage() {
             instance={instance}
             sessionKey={sessionKey}
             onTurnFinal={refreshFromHistory}
+          />
+
+          {/* The unobtrusive capture toggle (R1): a quiet row directly above
+              the composer — near it, never in its primary action path (the
+              form row), and never the FAB's bottom-right square. While ON,
+              the persistent indicator strip is the ILB signal that the
+              assistant's silence is deliberate; toggling off surfaces the
+              quiet extraction-offer chip. */}
+          <CaptureBar
+            active={captureActive}
+            busy={captureBusy}
+            disabled={booting}
+            instanceLabel={activeLabel}
+            offer={extractionOffer}
+            extracting={extracting}
+            onToggle={() => void toggleCapture()}
+            onExtract={() => void acceptExtraction()}
+            onDismissOffer={dismissExtraction}
           />
 
           {/* `transcript` (#54) is the raw STT text a voice-seeded send was built

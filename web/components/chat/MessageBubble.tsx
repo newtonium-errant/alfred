@@ -16,10 +16,14 @@ export function MessageBubble({
   role,
   text,
   ts,
+  captured,
 }: {
   role: ChatRole;
   text: string;
   ts: string;
+  /** Capture toggle (R1): this user message was RECEIVED as capture
+   *  material — a quiet received mark renders instead of a reply following. */
+  captured?: boolean;
 }) {
   const isUser = role === 'user';
   const time = formatMessageTime(ts);
@@ -75,6 +79,17 @@ export function MessageBubble({
           >
             {time}
           </time>
+        )}
+        {captured && isUser && (
+          // The client-side received indicator (R1): the whole ack a
+          // captured turn gets — no model call happened, so nothing else
+          // will follow this bubble. Same muted styling as the time stamp.
+          <span
+            data-testid="msg-captured"
+            className="mt-1 block text-xs opacity-60"
+          >
+            ✓ Captured
+          </span>
         )}
       </div>
     </div>

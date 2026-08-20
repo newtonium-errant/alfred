@@ -5409,16 +5409,22 @@ def _should_offer_escalation(
 
 # --- Silent-capture sentinel ---------------------------------------------
 
-# Returned by ``run_turn`` when the session is a capture-type session.
+# Returned by ``run_turn`` when the turn runs in capture mode.
 # Capture mode suppresses the conversational LLM call entirely: the
-# user's message is appended to the transcript so downstream /extract
-# and /brief have data to work with, but no assistant turn is generated.
+# user's message is appended to the transcript so downstream extraction
+# has data to work with, but no assistant turn is generated.
 #
-# The bot layer (``bot.handle_message``) interprets this sentinel as
-# "do not send a text reply — post a receipt-ack emoji reaction
-# instead". Kept as a module-level string constant so both sides compare
-# against the same literal, not a duplicated magic value. Leading
-# underscore signals "internal protocol, not model output".
+# Historically the Telegram bot layer read this sentinel and posted a
+# receipt-ack emoji instead of a text reply (whole-session ``/capture``
+# sessions; bot deleted with the Telegram retirement). The live consumer
+# is the web capture TOGGLE (R1 2026-08-20): ``routes_chat`` threads
+# ``session_type="capture"`` per-turn while ``_capture_active`` is set on
+# the session (see ``telegram/capture_spans.py``) and translates the
+# sentinel into a ``captured: true`` receipt payload — the sentinel
+# itself never reaches the wire. Kept as a module-level string constant
+# so both sides compare against the same literal, not a duplicated magic
+# value. Leading underscore signals "internal protocol, not model
+# output".
 CAPTURE_SENTINEL: Final[str] = "__ALFRED_CAPTURE_SILENT__"
 
 
@@ -5542,12 +5548,14 @@ def _prepare_turn(
     user_content = build_user_content(user_message, image_blocks)
     append_turn(state, session, "user", user_content, kind=user_kind)
 
-    # wk2b c2: capture-mode short-circuit. A ``capture`` session is silent
-    # mid-session — the user's message has been appended to the transcript
-    # (so /extract and /brief can see it later) but we DO NOT call the
-    # LLM, DO NOT generate an assistant turn, and DO NOT run escalation
-    # detection. The bot layer recognises the sentinel and posts a
-    # receipt-ack emoji reaction instead of a text reply.
+    # wk2b c2: capture-mode short-circuit. A capture turn is silent —
+    # the user's message has been appended to the transcript (so span
+    # extraction can see it later) but we DO NOT call the LLM, DO NOT
+    # generate an assistant turn, and DO NOT run escalation detection.
+    # Originally the whole-session Telegram ``/capture`` path; now the
+    # reuse seam for the web capture TOGGLE (R1 2026-08-20 — routes_chat
+    # threads ``session_type="capture"`` per-turn while capture is ON and
+    # turns the sentinel into a receipt payload).
     if session_type == "capture":
         log.info(
             "talker.capture.silent_turn",

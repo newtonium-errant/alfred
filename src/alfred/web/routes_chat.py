@@ -11,6 +11,8 @@ Route surface (M1, non-streaming):
     POST /chat/open                  → { session_key }
     POST /chat/turn                  → { reply, session_key }
     GET  /chat/history/{session_key} → { turns: [...] }
+    POST /chat/capture               → { capture_active, spans, closed_span }
+    POST /chat/capture/extract       → { ok, record, notes, skipped_reason }
 
 Auth layering: every non-``/health`` route is gated by the transport
 ``auth_middleware`` (Layer 1, peer token — "this front-end may talk to
@@ -20,9 +22,17 @@ me"). Layer 2 resolves the *verified named user* via the mode-aware
 * ``session`` mode (the login instance, e.g. Salem) — an instance-signed
   ``X-Alfred-Session`` token (``require_web_session``).
 * ``relay`` mode (cross-instance targets, e.g. KAL-LE / Hypatia / VERA) —
-  an asserted ``X-Alfred-User`` header (verified NAME only, gated by the
-  Layer-1 ``web`` peer token), re-resolved against THIS instance's own
-  ``web.users``. Mirrors the ``/vault/ingest`` relay-auth model.
+  an asserted ``X-Alfred-User`` header (verified NAME only, gated at
+  Layer 1 by the ``web`` peer token or the vouched ``rrts_relay`` one —
+  the two peers ``_resolve_relay_identity`` admits), re-resolved against
+  THIS instance's own ``web.users``. Mirrors the ``/vault/ingest``
+  relay-auth model.
+
+The two ``/chat/capture*`` routes are the ONE exception to that two-peer
+admit: they peer-pin ``web`` alone (:func:`_resolve_capture_identity`,
+401 ``wrong_peer``) because span extraction drives vault writes outside
+the scope machinery that bounds a vouched reporter. See that helper's
+docstring for the derivation.
 
 M1 deferral (NOTE-1): web turns do NOT inject ``calibration_str`` /
 ``pushback_level`` — those are populated by the Telegram session-type
@@ -56,12 +66,13 @@ from alfred.telegram.api_errors import (
 )
 from alfred.vault.scope import RRTS_INTAKE_ROLE
 
-from .auth import resolve_web_identity
+from .auth import WEB_CHAT_PEER, resolve_web_identity
 from .config import WebConfig, resolve_signing_secret
-from .identity import check_synthetic_id_collisions
+from .identity import WebIdentity, check_synthetic_id_collisions
 from .keys import (
     KEY_WEB_ANTHROPIC,
     KEY_WEB_AUTH_STATE,
+    KEY_WEB_CAPTURE_EXTRACTING,
     KEY_WEB_CONFIG,
     KEY_WEB_CONTACT_FEED,
     KEY_WEB_CONTACT_STORE,
@@ -539,6 +550,10 @@ def _build_turn_payload(
     user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
     payload: dict[str, Any] = {
         "reply": reply,
+        # Always-present (capture toggle, R1 2026-08-20): False on every
+        # normal turn so the shape never branches; the capture receipt
+        # (:func:`_build_capture_receipt`) is the True case.
+        "captured": False,
         "session_key": session_key,
         "ts": assistant_ts,
         "user_ts": user_ts,
@@ -550,6 +565,37 @@ def _build_turn_payload(
         payload["ticket_uid"] = filed["ticket_uid"]
         payload["title"] = filed.get("title", "")
     return payload
+
+
+def _build_capture_receipt(
+    session_obj: Any,
+    pre_len: int,
+    session_key: str,
+    *,
+    deduped: bool = False,
+) -> dict[str, Any]:
+    """The captured-turn response — a RECEIPT, not a reply (R1 capture mode).
+
+    While capture is ON the engine's ``session_type == "capture"``
+    short-circuit persists the user turn and returns ``CAPTURE_SENTINEL``
+    without any model call — there IS no assistant turn, so
+    :func:`_build_turn_payload`'s ``transcript[-1]`` read would misreport
+    the user's own turn as the assistant stamp. This builder is the
+    captured shape: same always-present fields (``reply`` empty, ``ts``
+    empty — no assistant turn exists), ``captured: True``, and the
+    ``user_ts`` of the just-persisted turn so the client can stamp its
+    received indicator. The sentinel itself NEVER reaches the wire.
+    """
+    transcript = session_obj.transcript or []
+    user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
+    return {
+        "reply": "",
+        "captured": True,
+        "session_key": session_key,
+        "ts": "",
+        "user_ts": user_ts,
+        "deduped": deduped,
+    }
 
 
 def _user_name_for(identity: Any, web_config: WebConfig) -> str | None:
@@ -613,6 +659,9 @@ def _cached_turn_payload(
     """
     return {
         "reply": cached.get("reply", ""),
+        # A retried CAPTURED turn must dedup to a captured receipt, not a
+        # blank normal reply — the flag rides the idempotency cache.
+        "captured": bool(cached.get("captured", False)),
         "session_key": session_key,
         "ts": cached.get("ts", ""),
         "user_ts": cached.get("user_ts", ""),
@@ -676,17 +725,31 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
     # Clinic-capture arc: the incident this fixes is a clinician's dictated
     # capture SILENTLY lost when the PWA reopened the session — closed via
     # web_session_reopened with no structuring and no signal. Web sessions are
-    # always session_type=="conversation" (no web /capture, no web /end), so we
+    # always session_type=="conversation" (the bot-era /capture and /end
+    # openers are gone; the web CAPTURE TOGGLE, R1 2026-08-20, is a MODE
+    # with explicit spans, not a session type), so with no spans present we
     # detect capture-worthiness deterministically (``is_capture_candidate``) and
     # (a) close_session UNCONDITIONALLY stamps ``capture_structured: pending``,
     # (b) auto-run structuring when enabled, and (c) surface a ``prior_capture``
     # signal on the response (no server-push channel exists — this is the
     # intentionally-left-blank signal for the web user, read on the next open).
+    # When explicit spans DO exist they are the operator's own declaration of
+    # the capture material — the heuristic is suppressed and the span
+    # finalizer owns the close-time backstop (branch below).
     prior_capture: dict[str, Any] | None = None
     if existing:
+        from alfred.telegram import capture_spans
+
         prior_type = existing.get("_session_type") or "conversation"
         prior_session = Session.from_dict(existing)
-        candidate = is_capture_candidate(prior_session, prior_type)
+        # Explicit capture spans (toggle R1) suppress the whole-session
+        # heuristic — same mutual-exclusion rule as close_session: the
+        # spans own the capture material, and running both would
+        # structure it twice.
+        prior_spans = capture_spans.normalized_spans(existing)
+        candidate = (not prior_spans) and is_capture_candidate(
+            prior_session, prior_type
+        )
         rel_path: str | None = None
         try:
             primary_users = getattr(talker_config, "primary_users", None) or []
@@ -715,7 +778,60 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
                 error_type=type(exc).__name__,
                 detail="proceeding to open a fresh session anyway",
             )
-        if candidate and rel_path:
+        if prior_spans and rel_path:
+            # Close-time backstop (toggle R1): any span the operator never
+            # accepted the extraction offer for is finalized now, against
+            # the just-written parent record. Detached task (retained by
+            # the module's own set); the record's ``extracted: false``
+            # rows are the fail-safe if it never runs.
+            from pathlib import Path as _Path
+
+            from alfred.audit import agent_slug_for
+
+            pending = [
+                s for s in prior_spans if not bool(s.get("extracted"))
+            ]
+            anchor_scope = (
+                "hypatia"
+                if (talker_config.instance.tool_set or "").lower() == "hypatia"
+                else ""
+            )
+            open_primary = getattr(talker_config, "primary_users", None) or []
+            task = None
+            if pending:
+                task = capture_spans.schedule_span_finalization(
+                    client=request.app[KEY_WEB_ANTHROPIC],
+                    vault_path=_Path(talker_config.vault.path),
+                    active_snapshot=existing,
+                    parent_rel_path=rel_path,
+                    model=talker_config.anthropic.model or "claude-sonnet-4-6",
+                    agent_slug=agent_slug_for(talker_config),
+                    anchor_scope=anchor_scope,
+                    tool_set=talker_config.instance.tool_set or "",
+                    user_vault_path=open_primary[0] if open_primary else "",
+                )
+            prior_capture = {
+                "record": rel_path,
+                "status": (
+                    "spans_extracting" if (pending and task is not None)
+                    else "spans_recorded"
+                ),
+                "turns": sum(
+                    int(s["end"]) - int(s["start"]) for s in prior_spans
+                ),
+                "spans": len(prior_spans),
+                "unextracted": len(pending),
+            }
+            log.info(
+                "web.chat.prior_capture_spans",
+                user=identity.user,
+                synthetic_chat_id=identity.synthetic_chat_id,
+                record=rel_path,
+                status=prior_capture["status"],
+                spans=len(prior_spans),
+                unextracted=len(pending),
+            )
+        elif candidate and rel_path:
             scheduled = False
             if getattr(talker_config.session, "auto_structure_on_close", False):
                 from pathlib import Path as _Path
@@ -833,8 +949,14 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
 
-    from alfred.telegram.conversation import run_turn
+    from alfred.telegram import capture_spans
+    from alfred.telegram.conversation import CAPTURE_SENTINEL, run_turn
     from alfred.telegram.session import Session, record_turn_idempotency
+
+    # Capture mode is SERVER truth (R1): the turn path consults the state
+    # the toggle wrote, never a client-asserted flag — a stale client
+    # cannot bypass an active capture, and a refreshed one resumes it.
+    capture_on = capture_spans.capture_active(active_dict)
 
     session_obj = Session.from_dict(active_dict)
 
@@ -941,6 +1063,11 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 user_name=user_name,
                 channel="web",
                 image_blocks=image_blocks,
+                # Capture mode (R1): drives the engine's preserved
+                # ``session_type == "capture"`` short-circuit — the turn is
+                # persisted as span material, NO model call happens, and
+                # the sentinel comes back instead of a reply.
+                session_type="capture" if capture_on else None,
             )
         except Exception as exc:  # noqa: BLE001 — surface engine errors as 502
             classified = classify_engine_error(exc)
@@ -966,36 +1093,58 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 status=502,
             )
 
-        # Assemble the response via the shared helper so the buffered body
-        # is byte-identical to the stream's terminal ``done`` frame.
-        payload = _build_turn_payload(
-            session_obj, pre_len, reply, session_key, deduped=False
-        )
+        # Assemble the response via the shared helpers so the buffered body
+        # is byte-identical to the stream's terminal ``done`` frame. A
+        # captured turn gets the RECEIPT shape (no assistant turn exists;
+        # the sentinel never reaches the wire).
+        if reply == CAPTURE_SENTINEL:
+            payload = _build_capture_receipt(
+                session_obj, pre_len, session_key, deduped=False
+            )
+        else:
+            payload = _build_turn_payload(
+                session_obj, pre_len, reply, session_key, deduped=False
+            )
 
-        # Cache for retry-safe dedup (only when a key was supplied).
+        # Cache for retry-safe dedup (only when a key was supplied). A
+        # captured turn caches the RECEIPT (blank reply + captured flag),
+        # so a retry dedups to the same receipt without re-appending the
+        # user turn.
         if idempotency_key:
             record_turn_idempotency(
                 state_mgr,
                 session_obj,
                 key=idempotency_key,
                 result={
-                    "reply": reply,
+                    "reply": payload["reply"],
+                    "captured": payload["captured"],
                     "ts": payload["ts"],
                     "user_ts": payload["user_ts"],
                     "msg_hash": _msg_hash(message),
                 },
             )
 
-        log.info(
-            "web.chat.turn_complete",
-            user=identity.user,
-            session_key=session_key,
-            user_kind=kind,
-            reply_chars=len(reply or ""),
-            assistant_ts=payload["ts"],
-            user_ts=payload["user_ts"],
-            deduped=False,
-        )
+        if payload["captured"]:
+            log.info(
+                "web.chat.turn_captured",
+                user=identity.user,
+                session_key=session_key,
+                user_kind=kind,
+                user_ts=payload["user_ts"],
+                detail="capture on — turn persisted as span material, no "
+                       "model call, receipt returned",
+            )
+        else:
+            log.info(
+                "web.chat.turn_complete",
+                user=identity.user,
+                session_key=session_key,
+                user_kind=kind,
+                reply_chars=len(reply or ""),
+                assistant_ts=payload["ts"],
+                user_ts=payload["user_ts"],
+                deduped=False,
+            )
         return web.json_response(payload)
     finally:
         in_flight.discard(session_key)
@@ -1062,8 +1211,12 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
 
-    from alfred.telegram.conversation import run_turn
+    from alfred.telegram import capture_spans
+    from alfred.telegram.conversation import CAPTURE_SENTINEL, run_turn
     from alfred.telegram.session import Session, record_turn_idempotency
+
+    # Capture mode is SERVER truth (R1) — same consult as /chat/turn.
+    capture_on = capture_spans.capture_active(active_dict)
 
     session_obj = Session.from_dict(active_dict)
 
@@ -1189,6 +1342,8 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
             channel="web",
             image_blocks=image_blocks,
             on_event=_on_event,
+            # Capture mode (R1): same server-truth threading as /chat/turn.
+            session_type="capture" if capture_on else None,
         )
     )
 
@@ -1261,34 +1416,55 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
                 pass
         return resp
 
-    payload = _build_turn_payload(
-        session_obj, pre_len, reply, session_key, deduped=False
-    )
+    # Captured turn → the RECEIPT shape as the terminal ``done`` frame —
+    # byte-identical to /chat/turn's captured body (shared builder).
+    if reply == CAPTURE_SENTINEL:
+        payload = _build_capture_receipt(
+            session_obj, pre_len, session_key, deduped=False
+        )
+    else:
+        payload = _build_turn_payload(
+            session_obj, pre_len, reply, session_key, deduped=False
+        )
 
-    # Cache for retry-safe dedup (only when a key was supplied).
+    # Cache for retry-safe dedup (only when a key was supplied). Captured
+    # turns cache the receipt (blank reply + captured flag), same as
+    # /chat/turn.
     if idempotency_key:
         record_turn_idempotency(
             state_mgr,
             session_obj,
             key=idempotency_key,
             result={
-                "reply": reply,
+                "reply": payload["reply"],
+                "captured": payload["captured"],
                 "ts": payload["ts"],
                 "user_ts": payload["user_ts"],
                 "msg_hash": _msg_hash(message),
             },
         )
 
-    log.info(
-        "web.chat.stream_complete",
-        user=identity.user,
-        session_key=session_key,
-        user_kind=kind,
-        reply_chars=len(reply or ""),
-        assistant_ts=payload["ts"],
-        user_ts=payload["user_ts"],
-        deduped=False,
-    )
+    if payload["captured"]:
+        log.info(
+            "web.chat.stream_captured",
+            user=identity.user,
+            session_key=session_key,
+            user_kind=kind,
+            user_ts=payload["user_ts"],
+            detail="capture on — turn persisted as span material, no "
+                   "model call, receipt frame emitted",
+        )
+    else:
+        log.info(
+            "web.chat.stream_complete",
+            user=identity.user,
+            session_key=session_key,
+            user_kind=kind,
+            reply_chars=len(reply or ""),
+            assistant_ts=payload["ts"],
+            user_ts=payload["user_ts"],
+            deduped=False,
+        )
     if not client_gone["v"]:
         try:
             await _sse_write_event(resp, "done", payload)
@@ -1351,11 +1527,302 @@ async def _handle_chat_active(request: web.Request) -> web.StreamResponse:
     return web.json_response({"session_key": session_key, "turns": turns})
 
 
+# ---------------------------------------------------------------------------
+# Capture toggle + span extraction (R1, 2026-08-20)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_capture_identity(
+    request: web.Request,
+) -> tuple[WebIdentity | None, web.Response | None]:
+    """Auth spine for BOTH capture routes — ``(identity, error_response)``.
+
+    Exactly one of the pair is non-``None``. ONE helper rather than two
+    copies: the two routes are halves of one act (open a span, extract
+    it), and a second spelling of this gate is how one endpoint ends up
+    admitting a peer the other refuses.
+
+    Ordering is load-bearing (CLAUDE.md "Relay / asserted-identity routes
+    — peer-pin requirement"):
+
+    1. **Peer-pin FIRST** — ``transport_peer`` must be the dedicated chat
+       ``web`` peer (:data:`alfred.web.auth.WEB_CHAT_PEER`), checked
+       BEFORE identity resolution and before ANY session read or write,
+       so a refused request touches nothing.
+    2. **Identity** — :func:`resolve_web_identity`, fail-closed 401
+       ``invalid_session``, unchanged from the other ``/chat/*`` routes.
+
+    Why the pin is NARROWER here than on ``/chat/turn``. The chat routes
+    admit two peers (``web`` and the vouched ``rrts_relay``) and that is
+    safe because every chat turn is scope-mediated: ``run_turn`` /
+    ``resolve_scope`` map an ``RRTS_INTAKE_ROLE`` identity to the fixed,
+    heavily-restricted ``rrts_intake`` scope, so a leaked ``rrts_relay``
+    token is bounded. ``/chat/capture/extract`` does NOT go through that
+    machinery — it drives ``vault_create`` + structuring (task emission)
+    + note extraction DIRECTLY off ``talker_config``, i.e. at the
+    instance's own authority. So the bound that makes ``rrts_relay`` safe
+    for chat does not exist on this surface, and a leaked reporter token
+    could otherwise turn reporter-controlled content into vault notes and
+    tasks. The pin is what keeps ``auth.py``'s "bounded — cannot escalate
+    scope" property TRUE.
+
+    Peer-pin (401 ``wrong_peer``) rather than the role-refusal (403
+    ``forbidden``) shape used by ``routes_notify`` / ``routes_day``: those
+    refuse a reporter because the DATA is the operator's (a recipient
+    question, and the caller is authenticated-but-not-entitled). Here the
+    question is what the TOKEN may authorise — a route performing
+    unmediated vault writes requires the chat peer's authority — which is
+    the ``routes_brief`` / ``routes_brief_audio`` single-peer shape, and
+    it refuses one layer earlier. It is also closed-by-default: a future
+    third peer added to ``_resolve_relay_identity`` is refused here until
+    somebody widens THIS list on purpose.
+    """
+    peer = request.get("transport_peer", "")
+    if peer != WEB_CHAT_PEER:
+        log.warning(
+            "web.chat.capture_wrong_peer",
+            reason="wrong_peer",
+            peer=peer or "(none)",
+            expected=WEB_CHAT_PEER,
+            detail="capture toggle / span extraction drives unmediated "
+                   "vault writes — it requires the dedicated chat 'web' "
+                   "peer token, not rrts_relay / web_ingest — rejecting "
+                   "(401)",
+        )
+        return None, web.json_response({"error": "wrong_peer"}, status=401)
+
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    identity = resolve_web_identity(request, web_config)
+    if identity is None:
+        return None, web.json_response({"error": "invalid_session"}, status=401)
+    return identity, None
+
+
+async def _handle_chat_capture(request: web.Request) -> web.StreamResponse:
+    """POST /chat/capture — toggle capture mode ON/OFF for the live session.
+
+    R1 (2026-08-20): the unobtrusive capture toggle. Body:
+    ``{"session_key": "...", "on": true|false}``.
+
+    SERVER truth: the toggle writes ``_capture_active`` +
+    ``_capture_spans`` onto the active-session dict (capture_spans
+    module), and the turn handlers consult THAT state — never a
+    client-asserted flag. So a refresh mid-capture resumes capturing, and
+    span boundaries are decided by request arrival order at the server:
+    the turn that arrived one tick before toggle-on is NOT captured; the
+    toggle-on turn onward is.
+
+    Refused while a turn is in flight (409 ``turn_in_flight``): a span
+    boundary stamped mid-append could land on either side of the turn
+    being processed, and an exact boundary is the whole contract. The
+    composer disables during a send, so the operator never meets this in
+    normal use.
+
+    Toggling OFF returns ``closed_span`` (``{"index", "turns"}``) for the
+    just-closed non-empty span — the extraction offer's data — or
+    ``null`` when the span was empty (discarded, logged) or capture was
+    already off. Both directions are idempotent.
+
+    Auth is :func:`_resolve_capture_identity` — the chat ``web`` peer-pin
+    (401 ``wrong_peer``) BEFORE identity, then the usual mode-aware
+    identity resolution. NOT the plain ``/chat/*`` spine: this route is
+    the door onto span extraction, so it admits one peer, not two.
+    """
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+
+    identity, err = _resolve_capture_identity(request)
+    if err is not None:
+        return err
+    assert identity is not None  # exactly one of the pair is non-None
+
+    body = await _read_json_body(request)
+    if isinstance(body, web.Response):
+        return body
+    session_key = body.get("session_key")
+    on = body.get("on")
+    if not isinstance(on, bool):
+        return web.json_response(
+            {"error": "on_required",
+             "detail": "body must carry on: true|false"},
+            status=400,
+        )
+
+    active_dict = state_mgr.get_active(identity.synthetic_chat_id)
+    if active_dict is None or active_dict.get("session_id") != session_key:
+        return web.json_response({"error": "no_such_session"}, status=404)
+
+    in_flight = request.app[KEY_WEB_INFLIGHT]
+    if session_key in in_flight:
+        log.warning(
+            "web.chat.capture_toggle_in_flight",
+            user=identity.user,
+            session_key=session_key,
+            on=on,
+            detail="a turn is running — span boundary would be ambiguous; "
+                   "rejecting the toggle",
+        )
+        return web.json_response({"error": "turn_in_flight"}, status=409)
+
+    from alfred.telegram import capture_spans
+
+    closed_span: dict[str, Any] | None = None
+    if on:
+        state = capture_spans.begin_capture(
+            state_mgr, identity.synthetic_chat_id
+        )
+    else:
+        state, closed_span = capture_spans.end_capture(
+            state_mgr, identity.synthetic_chat_id
+        )
+    log.info(
+        "web.chat.capture_toggled",
+        user=identity.user,
+        session_key=session_key,
+        on=on,
+        spans=len(state["spans"]),
+        closed_span_turns=(closed_span or {}).get("turns"),
+    )
+    return web.json_response({
+        "session_key": session_key,
+        "capture_active": state["capture_active"],
+        "spans": state["spans"],
+        # Always present — null is the explicit "no span closed" signal
+        # (empty span discarded, or an idempotent repeat), so the client
+        # never has to distinguish a missing field from an absent offer.
+        "closed_span": closed_span,
+    })
+
+
+async def _handle_chat_capture_extract(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /chat/capture/extract — run extraction on one closed span.
+
+    R1: the extraction offer's accept path. Body: ``{"session_key",
+    "span_index"}``. Drives the preserved capture machinery against the
+    span (``capture_spans.extract_capture_span``): span session record,
+    structuring (memo branch included), note/zettel extraction per the
+    existing per-instance rules, state marked extracted.
+
+    Awaited IN the handler (two LLM calls — seconds, not minutes): the
+    client shows a quiet "Extracting…" until the created records come
+    back. Refusals are named: 404 ``no_such_session`` /
+    ``span_not_found``, 409 ``span_open`` / ``already_extracted`` (the
+    latter carrying the existing record + notes) / 409
+    ``extraction_in_flight`` on a double-tap.
+
+    Auth is :func:`_resolve_capture_identity` — the chat ``web`` peer-pin
+    (401 ``wrong_peer``) BEFORE identity or any state read. This handler
+    is the reason that pin is narrower than the chat spine's: the work
+    below runs ``vault_create`` + structuring + note extraction off
+    ``talker_config`` directly, OUTSIDE the ``run_turn`` / ``resolve_scope``
+    machinery that bounds a vouched ``rrts_relay`` identity everywhere
+    else in this file.
+    """
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+    talker_config = request.app[KEY_WEB_TALKER_CONFIG]
+
+    identity, err = _resolve_capture_identity(request)
+    if err is not None:
+        return err
+    assert identity is not None  # exactly one of the pair is non-None
+
+    body = await _read_json_body(request)
+    if isinstance(body, web.Response):
+        return body
+    session_key = body.get("session_key")
+    span_index = body.get("span_index")
+    if not isinstance(span_index, int) or isinstance(span_index, bool):
+        return web.json_response(
+            {"error": "span_index_required",
+             "detail": "body must carry an integer span_index"},
+            status=400,
+        )
+
+    active_dict = state_mgr.get_active(identity.synthetic_chat_id)
+    if active_dict is None or active_dict.get("session_id") != session_key:
+        return web.json_response({"error": "no_such_session"}, status=404)
+
+    extracting: set = request.app[KEY_WEB_CAPTURE_EXTRACTING]
+    guard_key = (session_key, span_index)
+    if guard_key in extracting:
+        return web.json_response(
+            {"error": "extraction_in_flight"}, status=409
+        )
+    extracting.add(guard_key)
+    try:
+        from pathlib import Path as _Path
+
+        from alfred.audit import agent_slug_for
+        from alfred.telegram import capture_spans
+
+        anchor_scope = (
+            "hypatia"
+            if (talker_config.instance.tool_set or "").lower() == "hypatia"
+            else ""
+        )
+        primary = getattr(talker_config, "primary_users", None) or []
+        result = await capture_spans.extract_capture_span(
+            request.app[KEY_WEB_ANTHROPIC],
+            state_mgr,
+            _Path(talker_config.vault.path),
+            identity.synthetic_chat_id,
+            span_index,
+            model=talker_config.anthropic.model or "claude-sonnet-4-6",
+            agent_slug=agent_slug_for(talker_config),
+            anchor_scope=anchor_scope,
+            tool_set=talker_config.instance.tool_set or "",
+            user_vault_path=primary[0] if primary else "",
+        )
+    finally:
+        extracting.discard(guard_key)
+
+    if result.skipped_reason == "span_not_found":
+        return web.json_response({"error": "span_not_found"}, status=404)
+    if result.skipped_reason == "span_open":
+        return web.json_response(
+            {"error": "span_open",
+             "detail": "toggle capture off before extracting"},
+            status=409,
+        )
+    if result.skipped_reason == "already_extracted":
+        return web.json_response(
+            {"error": "already_extracted",
+             "record": result.record,
+             "notes": result.notes},
+            status=409,
+        )
+    log.info(
+        "web.chat.capture_span_extracted",
+        user=identity.user,
+        session_key=session_key,
+        span_index=span_index,
+        record=result.record,
+        notes=len(result.notes),
+        skipped_reason=result.skipped_reason,
+    )
+    return web.json_response({
+        "ok": bool(result.record),
+        "session_key": session_key,
+        "span_index": span_index,
+        "record": result.record,
+        "notes": result.notes,
+        # "" on clean success, "memo" on the ≤1-message branch, or the
+        # extractor's own named degradation — always present.
+        "skipped_reason": result.skipped_reason,
+    })
+
+
 async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
     """GET /chat/history/{session_key} — current active session transcript.
 
     M1 surfaces the CURRENT active session only (closed-session / vault-
     record history is a later milestone). Tool plumbing is flattened out.
+
+    Capture toggle (R1): the response also carries ``capture_active`` +
+    ``capture_spans`` (always present) — history is the one endpoint every
+    bootstrap path ends on, so this is where a refreshed client learns it
+    is still capturing (server truth, not client memory).
     """
     web_config: WebConfig = request.app[KEY_WEB_CONFIG]
     state_mgr = request.app[KEY_WEB_STATE_MGR]
@@ -1379,7 +1846,13 @@ async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
             user=identity.user,
             session_key=session_key,
         )
-    return web.json_response({"turns": turns})
+    from alfred.telegram import capture_spans
+
+    return web.json_response({
+        "turns": turns,
+        "capture_active": capture_spans.capture_active(active_dict),
+        "capture_spans": capture_spans.spans_summary(active_dict),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1469,10 +1942,16 @@ def register_web_routes(
     # Per-app concurrent-turn guard set (NOT module-global — concurrent test
     # apps in one process must not share in-flight state).
     app[KEY_WEB_INFLIGHT] = set()
+    # Per-app in-flight span-extraction guard (capture toggle R1).
+    app[KEY_WEB_CAPTURE_EXTRACTING] = set()
 
     app.router.add_post("/chat/open", _handle_chat_open)
     app.router.add_post("/chat/turn", _handle_chat_turn)
     app.router.add_post("/chat/stream", _handle_chat_stream)
+    app.router.add_post("/chat/capture", _handle_chat_capture)
+    app.router.add_post(
+        "/chat/capture/extract", _handle_chat_capture_extract
+    )
     app.router.add_get("/chat/history/{session_key}", _handle_chat_history)
     app.router.add_get("/chat/active", _handle_chat_active)
 
@@ -1481,6 +1960,8 @@ def register_web_routes(
         "/chat/active",
         "/chat/turn",
         "/chat/stream",
+        "/chat/capture",
+        "/chat/capture/extract",
         "/chat/history/{session_key}",
     ]
 

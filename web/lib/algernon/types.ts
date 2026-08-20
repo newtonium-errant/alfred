@@ -32,6 +32,47 @@ export interface ChatTurnResponse {
   // for a repeated idempotency_key instead of re-running the turn. Optional —
   // absent on a fresh turn and on old backends.
   deduped?: boolean;
+  // Capture toggle (R1 2026-08-20): true when capture mode RECEIVED the turn
+  // without replying — `reply`/`ts` are '' (no assistant turn exists) and the
+  // client renders a received mark, never a reply bubble. Always present on
+  // the new backend; optional here so an old backend's absent field reads as
+  // a normal answered turn.
+  captured?: boolean;
+}
+
+// --- Capture toggle (R1 2026-08-20) ------------------------------------------
+// One span row as the backend summarises it: `end` is null while the span is
+// OPEN (capture currently on); `turns` counts captured turns so far/total.
+export interface CaptureSpanSummary {
+  index: number;
+  start: number;
+  end: number | null;
+  turns: number;
+  extracted: boolean;
+}
+
+// POST /chat/capture { session_key, on } → the toggle outcome. `closed_span`
+// is the just-closed non-empty span on a toggle-off (the extraction offer's
+// data) — explicitly null when nothing closed (empty span discarded, or an
+// idempotent repeat), never merely absent.
+export interface ChatCaptureResponse {
+  session_key: string;
+  capture_active: boolean;
+  spans: CaptureSpanSummary[];
+  closed_span: { index: number; turns: number } | null;
+}
+
+// POST /chat/capture/extract { session_key, span_index } → the offer's accept
+// path. `notes` are vault-relative created-record paths (the memo branch puts
+// the memo record here); `skipped_reason` is '' on clean success, 'memo' on
+// the ≤1-message branch, else the extractor's named degradation.
+export interface ChatCaptureExtractResponse {
+  ok: boolean;
+  session_key: string;
+  span_index: number;
+  record: string;
+  notes: string[];
+  skipped_reason: string;
 }
 
 // --- Streamed turn (SSE) — CONTRACT §1 --------------------------------------
@@ -63,9 +104,14 @@ export interface ChatActiveResponse {
   turns: number;
 }
 
-// GET /chat/history/{session_key} → { turns: [...] }
+// GET /chat/history/{session_key} → { turns: [...] }. The capture fields (R1)
+// are always present on the new backend — history is the endpoint every
+// bootstrap path ends on, so it is where a refreshed client learns it is
+// still capturing (server truth). Optional here for old backends.
 export interface ChatHistoryResponse {
   turns: HistoryTurn[];
+  capture_active?: boolean;
+  capture_spans?: CaptureSpanSummary[];
 }
 
 // --- Cross-instance chat (multi-instance switcher, Model B) ------------------
@@ -159,6 +205,10 @@ export interface ChatMessage {
   role: ChatRole;
   text: string;
   ts: string;
+  // Capture toggle (R1): true on a user message that was RECEIVED as span
+  // material (no reply followed) — the bubble carries the quiet received
+  // mark instead of the thread waiting on an answer.
+  captured?: boolean;
 }
 
 // The signed-in user, DISPLAY ONLY. Authorization is the instance-signed session

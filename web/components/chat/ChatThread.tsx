@@ -36,7 +36,13 @@ export function ChatThread({
   return (
     <div className="flex flex-col gap-3" data-testid="chat-thread">
       {messages.map((m) => (
-        <MessageBubble key={m.id} role={m.role} text={m.text} ts={m.ts} />
+        <MessageBubble
+          key={m.id}
+          role={m.role}
+          text={m.text}
+          ts={m.ts}
+          captured={m.captured}
+        />
       ))}
       {sending && <TypingIndicator label={workingLabel} />}
       <div ref={endRef} />

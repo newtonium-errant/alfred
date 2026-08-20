@@ -471,10 +471,18 @@ def is_capture_candidate(
 
     The second clause is what catches the WEB/PWA case, which is the incident
     this fixes: web sessions are ALWAYS ``session_type=="conversation"`` —
-    ``open_session`` takes no session_type and only the Telegram ``/capture``
-    opener (``bot.py``) ever stamps ``_session_type`` — so a clinician's dictated
-    action-item dump on the PWA carries NO capture flag. Substance is the only
-    deterministic, pre-structuring signal available.
+    ``open_session`` takes no session_type and only the retired Telegram
+    ``/capture`` opener ever stamped ``_session_type`` — so a clinician's
+    dictated action-item dump on the PWA carries NO capture flag, and
+    substance is the deterministic pre-structuring signal for it.
+
+    NO LONGER THE ONLY SIGNAL (capture toggle R1, 2026-08-20): a session
+    may carry EXPLICIT capture spans (``_capture_spans``, see
+    ``capture_spans.py``) — the operator's own declaration of the capture
+    material. This predicate does NOT read them; the close paths
+    (``close_session`` / ``check_timeouts_with_meta`` / the web reopen
+    handler) SUPPRESS this heuristic when spans exist, because the span
+    pipeline owns that material and running both would structure it twice.
 
     ASYMMETRIC BIAS (deliberate — mirrors the endpoint-hold error-bias): err
     toward True. A false-positive costs a benign ``capture_structured: pending``
@@ -1470,7 +1478,13 @@ def check_timeouts_with_meta(
         # Capture-candidacy decided here (single source of truth — the same
         # ``is_capture_candidate`` used for the close-time fail-safe marker), so
         # the daemon sweeper reuses the verdict instead of re-deriving it.
-        capture_candidate = is_capture_candidate(
+        # Explicit capture SPANS suppress the heuristic (same rule as
+        # ``close_session`` — spans own the capture material); the spans
+        # snapshot rides the meta so the sweeper can finalize them.
+        from . import capture_spans as _capture_spans
+
+        spans_snapshot = _capture_spans.normalized_spans(raw)
+        capture_candidate = (not spans_snapshot) and is_capture_candidate(
             Session.from_dict(raw), raw.get("_session_type"),
         )
         try:
@@ -1510,6 +1524,11 @@ def check_timeouts_with_meta(
             # ``close_session`` above regardless of this flag.
             "session_type": raw.get("_session_type", "note"),
             "capture_candidate": capture_candidate,
+            # Explicit capture spans (toggle R1) — normalized (open span
+            # closed at the transcript end), always present so the
+            # sweeper's finalizer gate never branches on field absence.
+            "capture_spans": spans_snapshot,
+            "user_vault_path": raw.get("_user_vault_path") or "",
         })
     return closed_meta
 
@@ -1609,6 +1628,19 @@ def close_session(
     )
     body = _build_session_body(session)
 
+    # Capture spans (toggle R1, 2026-08-20). A session that carried
+    # explicit capture spans stamps them on the record — the open span (if
+    # capture was still ON at close) is closed at the transcript end by
+    # ``normalized_spans``, so an idle-timeout mid-dictation loses
+    # nothing. Rows with ``extracted: false`` are the discoverable signal
+    # the post-close finalizer (``capture_spans.finalize_spans_post_close``,
+    # scheduled by the close CALLERS — web reopen + daemon sweep) drains.
+    from . import capture_spans as _capture_spans
+
+    spans_fm = _capture_spans.spans_frontmatter(active_dict)
+    if spans_fm:
+        fm["capture_spans"] = spans_fm
+
     # Fail-safe capture marker (UNCONDITIONAL — safety invariant, NOT gated by
     # ``auto_structure_on_close``). A capture candidate that closes on ANY path
     # (web reopen, timeout, shutdown, /end, CLI) is stamped
@@ -1620,7 +1652,23 @@ def close_session(
     # never flips is the intentionally-left-blank signal that structuring did not
     # run. No code path gates on the field, so a heuristic false-positive is
     # benign (see ``is_capture_candidate``'s asymmetric-bias note).
-    if is_capture_candidate(session, session_type):
+    #
+    # SUPPRESSED when explicit capture spans exist (R1): the heuristic is
+    # a GUESS for sessions with no capture signal; a span is the
+    # operator's explicit declaration of what the capture material was,
+    # and running both would structure the same material twice (duplicate
+    # task emission included). Logged so the suppression is a visible
+    # decision, not silence.
+    if spans_fm:
+        log.info(
+            "talker.capture.heuristic_suppressed_spans_present",
+            chat_id=chat_id,
+            session_id=session.session_id,
+            spans=len(spans_fm),
+            detail="explicit capture spans own this session's capture "
+                   "material — whole-session candidate marker skipped",
+        )
+    elif is_capture_candidate(session, session_type):
         fm["capture_structured"] = "pending"
         log.info(
             "talker.capture.candidate_marked",

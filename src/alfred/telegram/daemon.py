@@ -518,7 +518,7 @@ async def _finalize_swept_capture(
 ) -> None:
     """Post-close finalization for ONE timeout-swept session.
 
-    Two steps, in order, each failure-isolated:
+    Three steps, in order, each failure-isolated:
 
     1. Substance-slug rename (opt-in). CRITICAL: ``maybe_apply_substance_slug``
        returns a possibly-RENAMED rel_path (it MOVES the file on disk when the
@@ -533,6 +533,9 @@ async def _finalize_swept_capture(
        CURRENT (possibly-renamed) ``meta["rel_path"]``. No Telegram push (the
        sweeper has no chat context); the ``capture_structured: pending`` marker
        written at close is the fail-safe if this never runs.
+    3. Capture-span finalization (toggle R1) — unextracted explicit spans
+       run through the preserved machinery; mutually exclusive with step 2
+       by the check_timeouts candidate gate.
     """
     try:
         meta["rel_path"] = await session.maybe_apply_substance_slug(
@@ -573,6 +576,47 @@ async def _finalize_swept_capture(
         except Exception:  # noqa: BLE001
             log.exception(
                 "talker.daemon.sweep_structuring_failed",
+                chat_id=meta.get("chat_id"),
+            )
+
+    # 3. Capture-span finalization (toggle R1, 2026-08-20). A session
+    #    swept with unextracted spans — the operator toggled capture on,
+    #    dictated, and let the session idle out without ever accepting the
+    #    extraction offer — gets its spans run through the preserved
+    #    machinery here, against the CURRENT (possibly-renamed) rel_path.
+    #    ``capture_candidate`` is mutually exclusive with spans (the
+    #    check_timeouts gate suppresses the heuristic when spans exist),
+    #    so this never double-structures the same material. Failure-
+    #    isolated like the two steps above.
+    spans = meta.get("capture_spans") or []
+    if any(not s.get("extracted") for s in spans):
+        try:
+            from alfred.audit import agent_slug_for
+            from alfred.telegram import capture_spans as _capture_spans
+            anchor_scope = (
+                "hypatia"
+                if (config.instance.tool_set or "").lower() == "hypatia"
+                else ""
+            )
+            _capture_spans.schedule_span_finalization(
+                client=client,
+                vault_path=Path(meta["vault_path_root"]),
+                active_snapshot={
+                    "transcript": meta["transcript"],
+                    _capture_spans.CAPTURE_SPANS_KEY: spans,
+                    "session_id": meta.get("session_id") or "",
+                    "chat_id": meta.get("chat_id") or 0,
+                },
+                parent_rel_path=meta["rel_path"],
+                model=config.anthropic.model or "claude-sonnet-4-6",
+                agent_slug=agent_slug_for(config),
+                anchor_scope=anchor_scope,
+                tool_set=config.instance.tool_set or "",
+                user_vault_path=meta.get("user_vault_path") or "",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.daemon.sweep_span_finalize_failed",
                 chat_id=meta.get("chat_id"),
             )
 

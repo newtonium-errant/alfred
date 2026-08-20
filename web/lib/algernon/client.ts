@@ -1,5 +1,7 @@
 import { getJson, postJson } from './http';
 import type {
+  ChatCaptureExtractResponse,
+  ChatCaptureResponse,
   ChatHistoryResponse,
   ChatKind,
   ChatActiveResponse,
@@ -73,6 +75,30 @@ export const chatApi = {
       ...(opts.primer ? { primer: opts.primer } : {}),
       // Learned-vocabulary capture (#54) — voice-seeded sends only.
       ...(opts.transcript ? { transcript: opts.transcript } : {}),
+    }),
+  // Capture toggle (R1 2026-08-20). Server truth: the response IS the state —
+  // the client renders what came back, never what it asked for.
+  capture: (
+    sessionKey: string,
+    on: boolean,
+    instance?: string,
+  ): Promise<ChatCaptureResponse> =>
+    postJson<ChatCaptureResponse>('/api/chat/capture', {
+      session_key: sessionKey,
+      on,
+      ...(instance ? { instance } : {}),
+    }),
+  // The extraction offer's accept path (R1). Long-ish call (two LLM passes);
+  // the caller shows a quiet "Extracting…" until it settles.
+  captureExtract: (
+    sessionKey: string,
+    spanIndex: number,
+    instance?: string,
+  ): Promise<ChatCaptureExtractResponse> =>
+    postJson<ChatCaptureExtractResponse>('/api/chat/capture/extract', {
+      session_key: sessionKey,
+      span_index: spanIndex,
+      ...(instance ? { instance } : {}),
     }),
   history: (sessionKey: string, instance?: string): Promise<ChatHistoryResponse> =>
     getJson<ChatHistoryResponse>(
