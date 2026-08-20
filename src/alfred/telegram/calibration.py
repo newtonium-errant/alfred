@@ -10,11 +10,34 @@ user, stored as a marker-wrapped body block on the user's `person` record:
     - ...
     <!-- END ALFRED:CALIBRATION -->
 
-The read side (``read_calibration``) is invoked at session open by the
-bot; the write side (``propose_updates`` + ``apply_proposals``) runs at
-session close. Keeping both ends in one module is deliberate — they
-share the marker strings and block regex, and drift between them would
-silently produce duplicate blocks or unreadable records.
+ORPHANED BUT KEPT — REWIRE FLAG R4 (XS-BATCH9 item 5 adjudication,
+2026-08-20; the eleventh orphan the T5 lane found and left for its own
+verdict). Both doors died with the Telegram retirement: the read side
+(``read_calibration``) was invoked at session open by the bot, the write
+side (``propose_updates`` + ``apply_proposals``) at bot session close,
+and bot.py was deleted in T4 C3 (50460499). Nothing in src imports this
+module today (re-derived census: absolute AND relative imports; dynamic
+loaders — health's KNOWN_TOOL_MODULES and temporal's schedule-file
+loader name no calibration module; entry point ``alfred.cli:main`` only;
+no config key loads it — the ``calibration_*`` / ``voice_calibration``
+config keys are email-classifier and STT-telemetry NAMESAKES, different
+referents). KEPT rather than deleted because the consumer half of the
+loop is still live and waiting: ``run_turn`` retains its
+``calibration_str`` parameter and system-prompt injection
+(conversation.py — currently fed None by every live caller), and
+routes_chat.py's module docstring records an explicit later-milestone
+deferral ("web turns do NOT inject ``calibration_str``"). The natural
+new doors are the web session open (read) and close (propose/apply);
+the module is already transport-neutral — stdlib + _anthropic_compat +
+utils, no PTB import — so rewiring is wiring, not porting. If the
+operator rules DELETE instead, the four module-direct test files at
+tests/telegram/test_calibration_{io,writes,attribution,
+per_instance_attribution}.py (plus this module's row in
+test_temperature_strip_call_sites.py) follow, per the T4/T5 partition.
+
+Keeping both ends in one module is deliberate — they share the marker
+strings and block regex, and drift between them would silently produce
+duplicate blocks or unreadable records.
 
 The distiller strips this block before extracting learnings (wk3 commit 4
 adds the pattern to :mod:`alfred.distiller.parser`). That's the whole
@@ -136,6 +159,15 @@ KNOWN_SUBSECTIONS: Final[tuple[str, ...]] = (
     "Workflow Preferences",
     "Current Priorities",
     "What Alfred Is Still Unsure About",
+    # Adjudicated with the module's R4 rewire flag (XS-BATCH9 item 5):
+    # this bucket's dedicated writer was model_calibration, deleted in T5
+    # (5183938f) — today no code writes or reads the subsection (the
+    # distiller strips the whole block via its OWN regex in
+    # distiller/parser.py; the only remaining reader is the operator's
+    # eyes on the person record, where boxes still carry the heading).
+    # The entry survives as merge-bucket taxonomy for apply_proposals:
+    # dropping it would reroute any future model-preference proposal into
+    # the catch-all "Notes" heading for no gain.
     "Model Preferences (learned)",
 )
 

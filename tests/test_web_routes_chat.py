@@ -1761,7 +1761,10 @@ async def test_normal_turn_has_no_completion_signal(web_client) -> None:
 async def test_chat_turn_carries_image_to_vision(web_client) -> None:
     """A carried image becomes a vision content-block on the user turn
     (image reaches run_turn) AND is persisted to the inbox (sovereign audit
-    trail). Session mode is used (vision works in both modes)."""
+    trail) AND the model-visible turn text names the REAL saved path in the
+    declared banner format (XS-BATCH9 item 3 pin (a) — the builder+tuner
+    contract the SKILL teaches to). Session mode is used (vision works in
+    both modes)."""
     headers = _session_headers()
     sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
     r = await web_client.post(
@@ -1782,22 +1785,47 @@ async def test_chat_turn_carries_image_to_vision(web_client) -> None:
     assert any(b.get("type") == "image" for b in content)
 
     inbox = Path(web_client.app["_t_talker_config"].vault.path) / "inbox"
-    assert list(inbox.glob("screenshot-*")), "screenshot not persisted to inbox"
+    files = list(inbox.glob("screenshot-*"))
+    assert files, "screenshot not persisted to inbox"
+    assert len(files) == 1
+    # Pin (a): what the model reads is the transcript's text block — the
+    # route was driven end-to-end and run_turn composed this content. Full
+    # string equality pins the exact surfaced format: banner line naming
+    # the on-disk file's vault-relative path, blank line, operator's words.
+    [text_block] = [b for b in content if b.get("type") == "text"]
+    assert text_block["text"] == (
+        f"[Screenshot attached: inbox/{files[0].name}]\n\nwhat's broken here?"
+    )
 
 
 async def test_chat_turn_without_images_stays_bare_string(web_client) -> None:
     """Regression: no images → the user turn is a bare string (byte-identical
-    to the pre-feature path), not a content-block list."""
+    to the pre-feature path), not a content-block list.
+
+    XS-BATCH9 item 3 pin (b): the model-visible text is EXACTLY the
+    operator's message — no banner, no path, nothing invented (string
+    equality is the strongest form of that exclusion). Positive control in
+    the same test: the assistant reply landed on the transcript, so the
+    absence above is the composer declining on a LIVE turn, not a dead
+    route."""
     headers = _session_headers()
     sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
-    await web_client.post(
+    r = await web_client.post(
         "/chat/turn",
         json={"session_key": sk, "message": "no image here"},
         headers=headers,
     )
+    assert r.status == 200
     state_mgr = web_client.app["_t_state_mgr"]
     active = state_mgr.get_active(synthetic_chat_id("andrew"))
     assert isinstance(active["transcript"][0]["content"], str)
+    assert active["transcript"][0]["content"] == "no image here"
+    assert len(active["transcript"]) == 2  # user + assistant — the turn ran
+    [assistant_text] = [
+        b["text"] for b in active["transcript"][1]["content"]
+        if b.get("type") == "text"
+    ]
+    assert assistant_text == "hello from salem"
 
 
 async def test_chat_turn_rejects_bad_base64(web_client) -> None:
@@ -1895,6 +1923,103 @@ async def test_chat_turn_image_save_failure_is_nonfatal_and_logged(
     ]
     assert len(matches) == 1
     assert matches[0]["action"] == "continuing_to_llm_in_memory_only"
+
+    # XS-BATCH9 item 3 pin (d): a FAILED save contributes no banner — the
+    # model must never be handed a path the filesystem cannot honour (the
+    # invented-path defect the banner feature exists to close). The image
+    # block itself still reached the turn (in-memory bytes), so the text
+    # block exists and equals the operator's words exactly.
+    state_mgr = web_client.app["_t_state_mgr"]
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    content = active["transcript"][0]["content"]
+    assert isinstance(content, list)  # image still carried in-memory
+    assert any(b.get("type") == "image" for b in content)
+    [text_block] = [b for b in content if b.get("type") == "text"]
+    assert text_block["text"] == "look"
+
+
+async def test_chat_turn_multi_image_banners_every_saved_path_in_order(
+    web_client,
+) -> None:
+    """XS-BATCH9 item 3 pin (c): a multi-image turn's model-visible text
+    lists EVERY saved path, one banner line per image, in wire order.
+
+    The two images differ in decoded byte LENGTH (67 vs 68), so which
+    on-disk file belongs to which wire slot is proven from ``stat()``
+    without re-deriving the production naming scheme (content hashes are
+    read off the disk, not recomputed here)."""
+    png1 = base64.b64decode(TINY_PNG_B64)
+    png2 = png1 + b"\x00"
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk,
+            "message": "two screens",
+            "images": [
+                {"media_type": "image/png", "data": TINY_PNG_B64},
+                {
+                    "media_type": "image/png",
+                    "data": base64.b64encode(png2).decode("ascii"),
+                },
+            ],
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+
+    inbox = Path(web_client.app["_t_talker_config"].vault.path) / "inbox"
+    files = list(inbox.glob("screenshot-*"))
+    assert len(files) == 2
+    by_size = {f.stat().st_size: f.name for f in files}
+    assert set(by_size) == {len(png1), len(png2)}
+
+    state_mgr = web_client.app["_t_state_mgr"]
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    content = active["transcript"][0]["content"]
+    assert sum(1 for b in content if b.get("type") == "image") == 2
+    [text_block] = [b for b in content if b.get("type") == "text"]
+    assert text_block["text"] == (
+        f"[Screenshot attached: inbox/{by_size[len(png1)]}]\n"
+        f"[Screenshot attached: inbox/{by_size[len(png2)]}]\n\n"
+        "two screens"
+    )
+
+
+async def test_chat_stream_image_turn_banners_saved_path(web_client) -> None:
+    """XS-BATCH9 item 3, stream route: /chat/stream composes the SAME
+    saved-path banner into the model-visible turn text as /chat/turn —
+    the contract holds on both production entry points, not just the one
+    the pin family grew up on."""
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    resp = await web_client.post(
+        "/chat/stream",
+        json={
+            "session_key": sk,
+            "message": "streamed screen",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_B64}],
+        },
+        headers=headers,
+    )
+    assert resp.status == 200
+    events = await _read_sse(resp)
+    done = [d for (e, d) in events if e == "done"]
+    assert len(done) == 1  # the turn genuinely ran to completion
+
+    inbox = Path(web_client.app["_t_talker_config"].vault.path) / "inbox"
+    files = list(inbox.glob("screenshot-*"))
+    assert len(files) == 1
+
+    state_mgr = web_client.app["_t_state_mgr"]
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    content = active["transcript"][0]["content"]
+    assert isinstance(content, list)
+    [text_block] = [b for b in content if b.get("type") == "text"]
+    assert text_block["text"] == (
+        f"[Screenshot attached: inbox/{files[0].name}]\n\nstreamed screen"
+    )
 
 
 async def test_chat_turn_vision_disabled_rejects_images(web_client) -> None:
