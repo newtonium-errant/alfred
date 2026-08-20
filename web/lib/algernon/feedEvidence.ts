@@ -64,13 +64,19 @@ const HIDDEN_KEYS: ReadonlySet<string> = new Set([
   // The MOC reader's plumbing (2026-08-20). Same class as `proposal_shape`
   // above: keys the CLIENT needs and the operator does not.
   //
-  // ENUMERATED, not sampled — the producer stamps 14 evidence keys and each
-  // was classified against its readers. The other 11 stay VISIBLE because
+  // ENUMERATED, not sampled — the producer stamps 16 evidence keys and each
+  // was classified against its readers. The other 13 stay VISIBLE because
   // they are the suggester's case for itself, which is exactly what a
-  // proposal card owes the operator: `reasoning`, `mapping_signal`,
-  // `mapping_score`, `cluster_tags`, `cluster_size`, `members`,
-  // `applicable_count`, `ineligible_count`, `already_applied_count`,
-  // `partial_retry`, `last_apply_error`.
+  // proposal card owes the operator: `members`, `applicable_count`,
+  // `ineligible_count`, `already_count`, `unreadable_count`,
+  // `already_applied_count`, `mapping_signal`, `mapping_score`, `reasoning`,
+  // `cluster_tags`, `cluster_size`, `partial_retry`, `last_apply_error`.
+  //
+  // The count moved 14 -> 16 when `ineligible_count` was returned to meaning
+  // TYPE-ineligible (its name's meaning) and the two classes it had absorbed
+  // — `already_count` and `unreadable_count` — were given their own rows.
+  // Both are operator-facing rather than plumbing, and `unreadable_count` is
+  // the one worth the row: it is the tell that a candidate record MOVED.
   //
   // `suggestion_id` — the queue row's internal id. Plumbing by definition.
   'suggestion_id',

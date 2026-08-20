@@ -483,12 +483,23 @@ def test_a_partial_apply_keeps_the_row_and_the_card(tmp_path: Path) -> None:
 
     # THE RETRY SKIPS WHAT LANDED. The next deal drops the applied member
     # from the card's remaining set.
-    # THE RETRY. The applied member is settled and the vanished one is not
-    # dealable, so the row's remaining work is empty — the producer settles
-    # the row rather than dealing a card for a member that cannot be read.
+    # THE RETRY — AND THIS PIN IS FLIPPED, with its old premise recorded
+    # because the old premise was the defect.
+    #
+    # It asserted ``status == "applied"``: the vanished member left no
+    # applicable work, so the producer settled the row. That is a PERMANENT
+    # LOSS path. ``applied`` is terminal and ``upsert_proposals`` no-ops on a
+    # non-pending id, so a row retired this way can never come back — and the
+    # member had merely VANISHED, which in this vault most often means MOVED
+    # or RENAMED (the janitor holds move rights). The suggestion would be
+    # destroyed on the strength of a record that still exists elsewhere.
+    #
+    # Correct behaviour: still NOT DEALT (nothing is noisy — there is no
+    # applicable member), but the row stays PENDING so it is re-evaluated
+    # once the record reappears under its new path.
     again = _deal(vault, queue, store)
     assert again == []
-    assert load_queue(queue)[0].status == "applied"
+    assert load_queue(queue)[0].status == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -753,3 +764,84 @@ def test_the_card_stamps_no_duplicate_or_dead_evidence_keys(
     assert card.evidence["proposed_target"] == target
     assert card.evidence["members"] == ["zettel/Memento Mori.md"]
     assert card.evidence["moc_choices"][0]["target"] == target
+
+
+def test_settle_distinguishes_its_three_causes(tmp_path: Path) -> None:
+    """The three ways a row can have no applicable member are NOT the same
+    answer, and treating them alike both stated a false reason in the log and
+    opened a permanent-loss path.
+
+    ALREADY-CITES settles (the work is genuinely done). INELIGIBLE-TYPE and
+    UNREADABLE do NOT — neither means the membership was applied, and an
+    unreadable member is most often a moved record."""
+    import structlog
+
+    vault = _vault(tmp_path)
+    queue = tmp_path / "moc_suggestions.jsonl"
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+
+    # (a) already-cites → SETTLES.
+    done = _member(vault, "Already There")
+    from alfred.surveyor.moc_apply import apply_membership
+
+    apply_membership(vault, member_rel_paths=[done], target_moc_rel_path=target)
+    _row(queue, suggestion_id="ms-done", target=target, members=[done])
+
+    # (b) ineligible type → stays pending.
+    _row(queue, suggestion_id="ms-type", target=target,
+         members=[_member(vault, "Wrong Type", record_type="note")])
+
+    # (c) unreadable (the moved-record case) → stays pending.
+    _row(queue, suggestion_id="ms-gone", target=target,
+         members=["zettel/Moved Away.md"])
+
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    with structlog.testing.capture_logs() as captured:
+        assert _deal(vault, queue, store) == []
+
+    rows = {r.id: r.status for r in load_queue(queue)}
+    assert rows["ms-done"] == "applied"    # settled — work really is done
+    assert rows["ms-type"] == "pending"    # NOT retired
+    assert rows["ms-gone"] == "pending"    # NOT retired — may have moved
+
+    # The logs state which cause applies rather than asserting the common one.
+    settled = [c for c in captured
+               if c.get("event") == "brief.moc_suggestion.settled_already_applied"]
+    withheld = [c for c in captured
+                if c.get("event") == "brief.moc_suggestion.withheld_not_settled"]
+    assert len(settled) == 1 and settled[0]["settled"] == 1
+    assert settled[0]["already_cites"] == 1
+    assert len(withheld) == 1 and withheld[0]["withheld"] == 2
+    assert withheld[0]["ineligible_type"] == 1
+    assert withheld[0]["unreadable"] == 1
+    assert "moved or renamed" in withheld[0]["reason"]
+
+
+def test_the_card_counts_each_non_applicable_class_by_its_own_name(
+    tmp_path: Path,
+) -> None:
+    """``ineligible_count`` means TYPE-ineligible, which is what its name
+    says. It briefly counted every non-applicable class, so an eligible
+    zettel that merely already carried the target reported as "ineligible"
+    on a row the operator reads."""
+    vault = _vault(tmp_path)
+    queue = tmp_path / "moc_suggestions.jsonl"
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    work = _member(vault, "Real Work")
+    wrong = _member(vault, "Wrong Type", record_type="note")
+    cites = _member(vault, "Already Cites")
+    from alfred.surveyor.moc_apply import apply_membership
+
+    apply_membership(vault, member_rel_paths=[cites], target_moc_rel_path=target)
+    _row(queue, suggestion_id="ms-1", target=target,
+         members=[work, wrong, cites, "zettel/Gone.md"])
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    card = _deal(vault, queue, store)[0]
+
+    assert card.title == "Add 1 note to Roman Philosophy MOC?"
+    assert card.evidence["applicable_count"] == 1
+    assert card.evidence["ineligible_count"] == 1    # the note — TYPE only
+    assert card.evidence["already_count"] == 1       # not folded into above
+    assert card.evidence["unreadable_count"] == 1    # the moved-record signal

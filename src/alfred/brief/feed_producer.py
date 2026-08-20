@@ -20,6 +20,7 @@ the section's own record (not the whole markdown).
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -736,7 +737,9 @@ def moc_suggestion_feed_items(
     from alfred.feed.model import make_id
     from alfred.surveyor.moc_apply import (
         MEMBER_ALREADY_CITES,
+        MEMBER_INELIGIBLE_TYPE,
         MEMBER_PENDING_WORK,
+        MEMBER_UNREADABLE,
         classify_member,
     )
     from alfred.surveyor.moc_suggester import build_existing_mocs_index
@@ -814,7 +817,8 @@ def moc_suggestion_feed_items(
 
     out: list[FeedItem] = []
     skipped_no_family = 0
-    settled: list[tuple[str, int]] = []
+    settled: list[tuple[str, Counter]] = []
+    withheld: list[tuple[str, Counter]] = []
     for shim in [*selection.visible, *selection.held]:
         row = shim.row
         target = str(row.target_moc_rel_path or "")
@@ -845,22 +849,38 @@ def moc_suggestion_feed_items(
             )
             for m in remaining
         }
+        counts = Counter(classified.values())
         applicable = [
             m for m, s in classified.items() if s == MEMBER_PENDING_WORK
         ]
-        stale = [m for m, s in classified.items() if s == MEMBER_ALREADY_CITES]
 
         if not applicable:
-            # NOTHING LEFT TO DO. Exactly parallel to the no-choice-family
-            # rule below: a card the operator cannot usefully act on is not
-            # dealt. This also closes the "Add 0 notes to X?" face by
-            # construction — that card can no longer be built.
+            # NOTHING TO DEAL. Exactly parallel to the no-choice-family rule
+            # below: a card the operator cannot usefully act on is not dealt,
+            # which also closes the "Add 0 notes to X?" face by construction.
             #
-            # SETTLED rather than left pending, because a row whose work is
-            # done would otherwise be re-evaluated every fire forever while
-            # never being dealt — silent, and indistinguishable from a
-            # reader that has stopped running.
-            settled.append((row.id, len(stale)))
+            # BUT NOT-DEALT AND SETTLED ARE DIFFERENT ANSWERS, and conflating
+            # them was a permanent-loss path. Settling marks the row
+            # ``applied`` — terminal, and ``upsert_proposals`` no-ops on a
+            # non-pending id, so there is NO WAY BACK. That is only honest
+            # when every member genuinely carries the membership already.
+            #
+            # A member that merely MOVED or was RENAMED reads as
+            # ``unreadable``, and this vault moves records (the janitor holds
+            # move rights). Retiring its row as "applied" having applied
+            # nothing would destroy the suggestion permanently, at exactly
+            # the moment the feature becomes useful.
+            #
+            # So: settle ONLY on all-already-cites. Everything else stays
+            # PENDING — still not dealt, so nothing gets noisy, and the row
+            # survives to be re-evaluated once the record reappears. The
+            # ``all()`` is vacuously true when ``remaining`` is empty, which
+            # is the right answer for a row whose members were all applied
+            # by an earlier act.
+            if all(s == MEMBER_ALREADY_CITES for s in classified.values()):
+                settled.append((row.id, counts))
+            else:
+                withheld.append((row.id, counts))
             continue
 
         out.append(FeedItem.create(
@@ -880,9 +900,16 @@ def moc_suggestion_feed_items(
                 # OPERATOR-FACING: which notes this would touch.
                 "members": applicable,
                 "applicable_count": len(applicable),
-                "ineligible_count": len(
-                    [s for s in classified.values() if s != MEMBER_PENDING_WORK],
-                ),
+                # TYPE-ineligible ONLY — the meaning its name states. It
+                # briefly counted every non-applicable class, so a perfectly
+                # eligible zettel that merely already carried the target
+                # reported as "ineligible" on a visible row. The other two
+                # classes get their own counts rather than being folded in:
+                # "already has it" and "couldn't be read" are different facts
+                # and the second is a MOVED-RECORD signal worth surfacing.
+                "ineligible_count": counts[MEMBER_INELIGIBLE_TYPE],
+                "already_count": counts[MEMBER_ALREADY_CITES],
+                "unreadable_count": counts[MEMBER_UNREADABLE],
                 "already_applied_count": len(already),
                 # The suggester's evidence, legible on the face — WHY it
                 # thinks so, in its own terms rather than a caption.
@@ -911,19 +938,48 @@ def moc_suggestion_feed_items(
             source_ref=dict(_SOURCE_REF),
         ))
 
+    if withheld:
+        # ILB — the row is not dealt AND not settled. It has no applicable
+        # member, but at least one member is ineligible or unreadable rather
+        # than already-citing, so retiring it would throw the suggestion away
+        # on the strength of a record that may simply have moved. The
+        # breakdown is carried so the line states which cause actually
+        # applies instead of asserting the common one.
+        totals = Counter()
+        for _id, c in withheld:
+            totals.update(c)
+        log.info(
+            "brief.moc_suggestion.withheld_not_settled",
+            instance=instance,
+            withheld=len(withheld),
+            already_cites=totals[MEMBER_ALREADY_CITES],
+            ineligible_type=totals[MEMBER_INELIGIBLE_TYPE],
+            unreadable=totals[MEMBER_UNREADABLE],
+            reason="no applicable member, but not every member already "
+                   "carries the target — an unreadable member may be a "
+                   "moved or renamed record, so the row stays PENDING "
+                   "rather than retiring as applied-having-applied-nothing",
+        )
+
     if settled:
-        # ILB, and a THIRD distinct silence: these rows were actionable when
-        # proposed and their work has since been done — by an earlier card in
+        # ILB, and a distinct silence: every candidate member already carries
+        # the target, so the row's work really is done — by an earlier card in
         # this same sitting, or by the operator's own hand-edit.
+        totals = Counter()
+        for _id, c in settled:
+            totals.update(c)
         log.info(
             "brief.moc_suggestion.settled_already_applied",
             instance=instance,
             settled=len(settled),
-            reason="every candidate member already cites the target — the "
+            already_cites=totals[MEMBER_ALREADY_CITES],
+            ineligible_type=totals[MEMBER_INELIGIBLE_TYPE],
+            unreadable=totals[MEMBER_UNREADABLE],
+            reason="every candidate member already carries the target — the "
                    "row's work is done, so it is retired rather than dealt "
                    "as a card proposing work already complete",
         )
-        for suggestion_id, _n in settled:
+        for suggestion_id, _counts in settled:
             try:
                 from alfred.surveyor.moc_suggestion_queue import update_status
 
