@@ -1404,8 +1404,10 @@ def test_register_web_routes_enabled_mounts_chat_and_auth(tmp_path) -> None:
         "/chat/turn",
         "/chat/stream",
         # R1 (2026-08-20) — the capture toggle: capture as a mode within
-        # any conversation, server-truth span state.
+        # any conversation, server-truth span state; /extract is the
+        # offer's accept path.
         "/chat/capture",
+        "/chat/capture/extract",
         "/chat/history/{session_key}",
         # #94(c) — the read-only probe that lets a stale key RESUME the live
         # session instead of opening over the top of it.

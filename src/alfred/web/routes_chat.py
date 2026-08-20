@@ -62,6 +62,7 @@ from .identity import check_synthetic_id_collisions
 from .keys import (
     KEY_WEB_ANTHROPIC,
     KEY_WEB_AUTH_STATE,
+    KEY_WEB_CAPTURE_EXTRACTING,
     KEY_WEB_CONFIG,
     KEY_WEB_CONTACT_FEED,
     KEY_WEB_CONTACT_STORE,
@@ -722,9 +723,18 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
     # intentionally-left-blank signal for the web user, read on the next open).
     prior_capture: dict[str, Any] | None = None
     if existing:
+        from alfred.telegram import capture_spans
+
         prior_type = existing.get("_session_type") or "conversation"
         prior_session = Session.from_dict(existing)
-        candidate = is_capture_candidate(prior_session, prior_type)
+        # Explicit capture spans (toggle R1) suppress the whole-session
+        # heuristic — same mutual-exclusion rule as close_session: the
+        # spans own the capture material, and running both would
+        # structure it twice.
+        prior_spans = capture_spans.normalized_spans(existing)
+        candidate = (not prior_spans) and is_capture_candidate(
+            prior_session, prior_type
+        )
         rel_path: str | None = None
         try:
             primary_users = getattr(talker_config, "primary_users", None) or []
@@ -753,7 +763,60 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
                 error_type=type(exc).__name__,
                 detail="proceeding to open a fresh session anyway",
             )
-        if candidate and rel_path:
+        if prior_spans and rel_path:
+            # Close-time backstop (toggle R1): any span the operator never
+            # accepted the extraction offer for is finalized now, against
+            # the just-written parent record. Detached task (retained by
+            # the module's own set); the record's ``extracted: false``
+            # rows are the fail-safe if it never runs.
+            from pathlib import Path as _Path
+
+            from alfred.audit import agent_slug_for
+
+            pending = [
+                s for s in prior_spans if not bool(s.get("extracted"))
+            ]
+            anchor_scope = (
+                "hypatia"
+                if (talker_config.instance.tool_set or "").lower() == "hypatia"
+                else ""
+            )
+            open_primary = getattr(talker_config, "primary_users", None) or []
+            task = None
+            if pending:
+                task = capture_spans.schedule_span_finalization(
+                    client=request.app[KEY_WEB_ANTHROPIC],
+                    vault_path=_Path(talker_config.vault.path),
+                    active_snapshot=existing,
+                    parent_rel_path=rel_path,
+                    model=talker_config.anthropic.model or "claude-sonnet-4-6",
+                    agent_slug=agent_slug_for(talker_config),
+                    anchor_scope=anchor_scope,
+                    tool_set=talker_config.instance.tool_set or "",
+                    user_vault_path=open_primary[0] if open_primary else "",
+                )
+            prior_capture = {
+                "record": rel_path,
+                "status": (
+                    "spans_extracting" if (pending and task is not None)
+                    else "spans_recorded"
+                ),
+                "turns": sum(
+                    int(s["end"]) - int(s["start"]) for s in prior_spans
+                ),
+                "spans": len(prior_spans),
+                "unextracted": len(pending),
+            }
+            log.info(
+                "web.chat.prior_capture_spans",
+                user=identity.user,
+                synthetic_chat_id=identity.synthetic_chat_id,
+                record=rel_path,
+                status=prior_capture["status"],
+                spans=len(prior_spans),
+                unextracted=len(pending),
+            )
+        elif candidate and rel_path:
             scheduled = False
             if getattr(talker_config.session, "auto_structure_on_close", False):
                 from pathlib import Path as _Path
@@ -1543,6 +1606,118 @@ async def _handle_chat_capture(request: web.Request) -> web.StreamResponse:
     })
 
 
+async def _handle_chat_capture_extract(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /chat/capture/extract — run extraction on one closed span.
+
+    R1: the extraction offer's accept path. Body: ``{"session_key",
+    "span_index"}``. Drives the preserved capture machinery against the
+    span (``capture_spans.extract_capture_span``): span session record,
+    structuring (memo branch included), note/zettel extraction per the
+    existing per-instance rules, state marked extracted.
+
+    Awaited IN the handler (two LLM calls — seconds, not minutes): the
+    client shows a quiet "Extracting…" until the created records come
+    back. Refusals are named: 404 ``no_such_session`` /
+    ``span_not_found``, 409 ``span_open`` / ``already_extracted`` (the
+    latter carrying the existing record + notes) / 409
+    ``extraction_in_flight`` on a double-tap.
+    """
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+    talker_config = request.app[KEY_WEB_TALKER_CONFIG]
+
+    identity = resolve_web_identity(request, web_config)
+    if identity is None:
+        return web.json_response({"error": "invalid_session"}, status=401)
+
+    body = await _read_json_body(request)
+    if isinstance(body, web.Response):
+        return body
+    session_key = body.get("session_key")
+    span_index = body.get("span_index")
+    if not isinstance(span_index, int) or isinstance(span_index, bool):
+        return web.json_response(
+            {"error": "span_index_required",
+             "detail": "body must carry an integer span_index"},
+            status=400,
+        )
+
+    active_dict = state_mgr.get_active(identity.synthetic_chat_id)
+    if active_dict is None or active_dict.get("session_id") != session_key:
+        return web.json_response({"error": "no_such_session"}, status=404)
+
+    extracting: set = request.app[KEY_WEB_CAPTURE_EXTRACTING]
+    guard_key = (session_key, span_index)
+    if guard_key in extracting:
+        return web.json_response(
+            {"error": "extraction_in_flight"}, status=409
+        )
+    extracting.add(guard_key)
+    try:
+        from pathlib import Path as _Path
+
+        from alfred.audit import agent_slug_for
+        from alfred.telegram import capture_spans
+
+        anchor_scope = (
+            "hypatia"
+            if (talker_config.instance.tool_set or "").lower() == "hypatia"
+            else ""
+        )
+        primary = getattr(talker_config, "primary_users", None) or []
+        result = await capture_spans.extract_capture_span(
+            request.app[KEY_WEB_ANTHROPIC],
+            state_mgr,
+            _Path(talker_config.vault.path),
+            identity.synthetic_chat_id,
+            span_index,
+            model=talker_config.anthropic.model or "claude-sonnet-4-6",
+            agent_slug=agent_slug_for(talker_config),
+            anchor_scope=anchor_scope,
+            tool_set=talker_config.instance.tool_set or "",
+            user_vault_path=primary[0] if primary else "",
+        )
+    finally:
+        extracting.discard(guard_key)
+
+    if result.skipped_reason == "span_not_found":
+        return web.json_response({"error": "span_not_found"}, status=404)
+    if result.skipped_reason == "span_open":
+        return web.json_response(
+            {"error": "span_open",
+             "detail": "toggle capture off before extracting"},
+            status=409,
+        )
+    if result.skipped_reason == "already_extracted":
+        return web.json_response(
+            {"error": "already_extracted",
+             "record": result.record,
+             "notes": result.notes},
+            status=409,
+        )
+    log.info(
+        "web.chat.capture_span_extracted",
+        user=identity.user,
+        session_key=session_key,
+        span_index=span_index,
+        record=result.record,
+        notes=len(result.notes),
+        skipped_reason=result.skipped_reason,
+    )
+    return web.json_response({
+        "ok": bool(result.record),
+        "session_key": session_key,
+        "span_index": span_index,
+        "record": result.record,
+        "notes": result.notes,
+        # "" on clean success, "memo" on the ≤1-message branch, or the
+        # extractor's own named degradation — always present.
+        "skipped_reason": result.skipped_reason,
+    })
+
+
 async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
     """GET /chat/history/{session_key} — current active session transcript.
 
@@ -1672,11 +1847,16 @@ def register_web_routes(
     # Per-app concurrent-turn guard set (NOT module-global — concurrent test
     # apps in one process must not share in-flight state).
     app[KEY_WEB_INFLIGHT] = set()
+    # Per-app in-flight span-extraction guard (capture toggle R1).
+    app[KEY_WEB_CAPTURE_EXTRACTING] = set()
 
     app.router.add_post("/chat/open", _handle_chat_open)
     app.router.add_post("/chat/turn", _handle_chat_turn)
     app.router.add_post("/chat/stream", _handle_chat_stream)
     app.router.add_post("/chat/capture", _handle_chat_capture)
+    app.router.add_post(
+        "/chat/capture/extract", _handle_chat_capture_extract
+    )
     app.router.add_get("/chat/history/{session_key}", _handle_chat_history)
     app.router.add_get("/chat/active", _handle_chat_active)
 
@@ -1686,6 +1866,7 @@ def register_web_routes(
         "/chat/turn",
         "/chat/stream",
         "/chat/capture",
+        "/chat/capture/extract",
         "/chat/history/{session_key}",
     ]
 

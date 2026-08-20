@@ -35,13 +35,8 @@ from tests.test_web_routes_chat import (
 )
 
 
-@pytest.fixture
-async def capture_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
-    """A web-routes transport app whose fake Anthropic client is EXPOSED.
-
-    Returns ``(client, fake)`` so tests can read ``fake.messages.calls`` —
-    the no-model-call instrument every capture pin leans on.
-    """
+def _build_capture_app(tmp_path, responses):  # type: ignore[no-untyped-def]
+    """A web-routes transport app whose fake Anthropic client is EXPOSED."""
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
 
@@ -50,12 +45,7 @@ async def capture_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-d
     talker_config = _make_talker_config(tmp_path)
     web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
     web_auth_state.load()
-    fake = FakeAnthropicClient(
-        [
-            FakeResponse(content=[FakeBlock(type="text", text="a real reply")])
-            for _ in range(6)
-        ]
-    )
+    fake = FakeAnthropicClient(responses)
     register_web_routes(
         app,
         web_config=_web_config(),
@@ -68,8 +58,77 @@ async def capture_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-d
         allowed_user_ids=[1],
     )
     app["_t_state_mgr"] = state_mgr
+    app["_t_talker_config"] = talker_config
+    return app, fake
+
+
+@pytest.fixture
+async def capture_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """``(client, fake)`` — fake pre-loaded with plain text replies.
+
+    ``fake.messages.calls`` is the no-model-call instrument every capture
+    pin leans on.
+    """
+    app, fake = _build_capture_app(
+        tmp_path,
+        [
+            FakeResponse(content=[FakeBlock(type="text", text="a real reply")])
+            for _ in range(6)
+        ],
+    )
     client = await aiohttp_client(app)
     return client, fake
+
+
+@pytest.fixture
+async def capture_client_factory(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Factory variant: tests choose the fake's response script (the
+    extraction e2e needs tool_use responses in a specific order)."""
+
+    async def _make(responses):
+        app, fake = _build_capture_app(tmp_path, responses)
+        client = await aiohttp_client(app)
+        return client, fake
+
+    return _make
+
+
+def _batch_summary_response(**overrides):
+    """A canned ``emit_structured_summary`` tool_use (structuring pass)."""
+    tool_input = {
+        "topics": ["stoicism reading"],
+        "decisions": [],
+        "open_questions": [],
+        "action_items": [],
+        "key_insights": ["dichotomy of control is foundational"],
+        "raw_contradictions": [],
+    }
+    tool_input.update(overrides)
+    return FakeResponse(
+        content=[
+            FakeBlock(
+                type="tool_use",
+                id="toolu_batch",
+                name="emit_structured_summary",
+                input=tool_input,
+            )
+        ],
+        stop_reason="tool_use",
+    )
+
+
+def _extract_note_response(*notes):
+    """A canned ``create_note`` tool_use response (extraction pass)."""
+    blocks = [
+        FakeBlock(
+            type="tool_use",
+            id=f"toolu_note_{i}",
+            name="create_note",
+            input=note,
+        )
+        for i, note in enumerate(notes)
+    ]
+    return FakeResponse(content=blocks, stop_reason="tool_use")
 
 
 async def _open(client, headers) -> str:
@@ -490,3 +549,312 @@ async def test_capture_accepts_voice_kind_and_counts_it(capture_client) -> None:
     turn = active["transcript"][0]
     assert turn["_kind"] == "voice"
     assert capture_spans.spans_summary(active)[0]["turns"] == 1
+
+
+# ---------------------------------------------------------------------------
+# C2 — span extraction: the preserved machinery, end to end
+# ---------------------------------------------------------------------------
+
+
+async def test_extract_span_end_to_end_via_preserved_machinery(
+    capture_client_factory, tmp_path
+) -> None:
+    """The dispatch's e2e pin: a REAL span through /chat/capture/extract —
+    span session record + structuring + note with the editor-tone/anchor
+    properties the existing capture_extract tests define (blockquote,
+    ``_Source:`` attribution, inline ``(p.23)`` annotation, queryable
+    ``source_anchor`` + ``created_by_capture`` frontmatter)."""
+    import frontmatter as fmlib
+
+    client, fake = await capture_client_factory([
+        FakeResponse(
+            content=[FakeBlock(type="text", text="a normal pre-span reply")]
+        ),
+        _batch_summary_response(),
+        _extract_note_response({
+            "name": "Dichotomy Of Control As Foundation",
+            "body": "Marcus grounds the whole practice in the dichotomy "
+                    "of control.",
+            "confidence_tier": "high",
+            "source_quote": "the dichotomy of control is foundational",
+            "source_anchor": "p.23",
+        }),
+    ])
+    headers = _session_headers()
+    key = await _open(client, headers)
+    # A NORMAL pre-span exchange first (transcript turns 0+1) — extraction
+    # must consume THE SPAN, so this text must never reach the span record.
+    r = await client.post(
+        "/chat/turn",
+        json={"session_key": key,
+              "message": "ordinary pre-span conversation about groceries"},
+        headers=headers,
+    )
+    assert (await r.json())["captured"] is False
+    await _toggle(client, headers, key, True)
+    for msg in (
+        "Marcus on page 23 talks about the dichotomy of control",
+        "the dichotomy of control is foundational to everything after",
+    ):
+        r = await client.post(
+            "/chat/turn", json={"session_key": key, "message": msg},
+            headers=headers,
+        )
+        assert (await r.json())["captured"] is True
+    assert len(fake.messages.calls) == 1  # only the pre-span turn called
+    state = await _toggle(client, headers, key, False)
+    assert state["closed_span"] == {"index": 0, "turns": 2}
+
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 0},
+        headers=headers,
+    )
+    assert r.status == 200, await r.text()
+    body = await r.json()
+    assert body["ok"] is True
+    assert body["skipped_reason"] == ""
+    assert len(body["notes"]) == 1
+    # Exactly the two preserved-machinery calls on top of the pre-span
+    # turn: structuring + extraction.
+    assert len(fake.messages.calls) == 3
+
+    vault = tmp_path / "vault"
+    # The span became its own session record, capture-shaped, covering
+    # EXACTLY the span (turns 2-4) — never the pre-span conversation.
+    span_rel = body["record"]
+    assert span_rel.startswith("session/capture-")
+    assert "-s2" in span_rel
+    span_post = fmlib.load(vault / span_rel)
+    assert span_post["session_type"] == "capture"
+    assert span_post["capture_span_range"] == "2-4"
+    assert span_post["capture_span_parent"]  # the parent session id
+    assert span_post["capture_structured"] == "true"
+    assert "# Transcript" in span_post.content
+    assert "dichotomy of control" in span_post.content
+    assert "groceries" not in span_post.content  # span, not conversation
+    assert "## Structured Summary" in span_post.content
+    assert span_post["derived_notes"] == [f"[[{body['notes'][0]}]]"]
+
+    # The note: preserved editor-tone + anchor properties.
+    note_post = fmlib.load(vault / body["notes"][0])
+    assert note_post["created_by_capture"] is True
+    assert note_post["confidence_tier"] == "high"
+    assert note_post["source_anchor"] == "p.23"
+    assert note_post["source_session"] == f"[[{span_rel}]]"
+    assert "> the dichotomy of control is foundational" in note_post.content
+    assert f"_Source: [[{span_rel}]]_" in note_post.content
+    assert note_post.content.startswith("(p.23) ")
+
+    # State marked extracted — visible on the wire.
+    r = await client.get(f"/chat/history/{key}", headers=headers)
+    hist = await r.json()
+    assert hist["capture_spans"][0]["extracted"] is True
+
+
+async def test_extract_refusals_are_named_with_positive_control(
+    capture_client_factory,
+) -> None:
+    """Deny-pins with their admissible neighbour: span_open refused while
+    capture is ON; the SAME span extracts fine once closed; a second
+    extract refuses already_extracted CARRYING the first run's outputs;
+    span_not_found / span_index validation named."""
+    client, fake = await capture_client_factory([
+        _batch_summary_response(),
+        _extract_note_response({
+            "name": "One Good Note",
+            "body": "A single idea worth keeping.",
+            "confidence_tier": "medium",
+            "source_quote": "worth keeping",
+        }),
+    ])
+    headers = _session_headers()
+    key = await _open(client, headers)
+    await _toggle(client, headers, key, True)
+    await client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "an idea worth keeping"},
+        headers=headers,
+    )
+
+    # OPEN span → named refusal, no LLM call, nothing written.
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 0},
+        headers=headers,
+    )
+    assert r.status == 409
+    assert (await r.json())["error"] == "span_open"
+    assert len(fake.messages.calls) == 0
+
+    # Bad index / non-int index → named refusals.
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 7},
+        headers=headers,
+    )
+    assert r.status == 404
+    assert (await r.json())["error"] == "span_not_found"
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": "0"},
+        headers=headers,
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "span_index_required"
+
+    # POSITIVE CONTROL: close the span — the same index now extracts.
+    await _toggle(client, headers, key, False)
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 0},
+        headers=headers,
+    )
+    assert r.status == 200
+    first = await r.json()
+    assert first["ok"] is True and len(first["notes"]) == 1
+
+    # Second extract on the same span: named refusal CARRYING the record.
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 0},
+        headers=headers,
+    )
+    assert r.status == 409
+    dup = await r.json()
+    assert dup["error"] == "already_extracted"
+    assert dup["record"] == first["record"]
+    assert dup["notes"] == first["notes"]
+    # No third LLM call happened for the refusal.
+    assert len(fake.messages.calls) == 2
+
+
+async def test_reopen_close_backstop_extracts_unextracted_spans(
+    capture_client_factory, tmp_path
+) -> None:
+    """The close-time backstop: a span the operator never extracted is
+    finalized when the session closes (web reopen path) — parent record
+    stamps capture_spans, the heuristic is SUPPRESSED (spans own the
+    material), and the post-close finalizer patches the parent rows."""
+    import frontmatter as fmlib
+
+    client, fake = await capture_client_factory([
+        _batch_summary_response(),
+        _extract_note_response({
+            "name": "Backstop Note",
+            "body": "Material rescued at close.",
+            "confidence_tier": "medium",
+            "source_quote": "rescued at close",
+        }),
+    ])
+    headers = _session_headers()
+    key = await _open(client, headers)
+    await _toggle(client, headers, key, True)
+    # Three substantial turns — WOULD make the whole-session heuristic
+    # fire (is_substantive: >=3 turns, >=150 chars) if spans didn't
+    # suppress it. That is what makes the suppression assertion below
+    # non-vacuous.
+    for i in range(3):
+        await client.post(
+            "/chat/turn",
+            json={"session_key": key,
+                  "message": f"substantial dictated capture line {i} — "
+                             f"enough characters to cross the substance bar"},
+            headers=headers,
+        )
+    # Capture still ON at close — the open span must be closed at the
+    # transcript end by the close path, not lost.
+
+    with structlog.testing.capture_logs() as captured:
+        r = await client.post("/chat/open", json={}, headers=headers)
+    body = await r.json()
+    prior = body.get("prior_capture")
+    assert prior is not None
+    assert prior["status"] == "spans_extracting"
+    assert prior["spans"] == 1
+    assert prior["unextracted"] == 1
+    assert prior["turns"] == 3
+    suppressed = [
+        c for c in captured
+        if c.get("event") == "talker.capture.heuristic_suppressed_spans_present"
+    ]
+    assert len(suppressed) == 1
+
+    # Drain the detached finalization task.
+    for _ in range(100):
+        if not capture_spans._FINALIZE_TASKS:
+            break
+        await asyncio.sleep(0.01)
+    assert not capture_spans._FINALIZE_TASKS
+
+    vault = tmp_path / "vault"
+    parent_rel = prior["record"]
+    parent_post = fmlib.load(vault / parent_rel)
+    # Heuristic suppressed: no capture_structured marker on the parent.
+    assert parent_post.get("capture_structured") is None
+    rows = parent_post["capture_spans"]
+    assert len(rows) == 1
+    assert rows[0]["span"] == "0-3"
+    assert rows[0]["turns"] == 3
+    # The finalizer patched the parent row with the outcome.
+    assert rows[0]["extracted"] is True
+    assert rows[0]["record"].startswith("[[session/capture-")
+    # And the span record + note really exist.
+    span_rel = rows[0]["record"].strip("[]") + ".md"
+    span_post = fmlib.load(vault / span_rel)
+    assert span_post["capture_structured"] == "true"
+    assert span_post["capture_span_range"] == "0-3"
+    note_paths = span_post["derived_notes"]
+    assert len(note_paths) == 1
+    assert len(fake.messages.calls) == 2
+
+
+async def test_reopen_without_spans_keeps_heuristic_path(
+    capture_client,
+) -> None:
+    """POSITIVE CONTROL for the suppression: the same reopen with NO spans
+    still walks the existing whole-session capture-candidate path (the
+    clinic-capture contract is untouched)."""
+    client, fake = capture_client
+    headers = _session_headers()
+    key = await _open(client, headers)
+    for i in range(3):
+        await client.post(
+            "/chat/turn",
+            json={"session_key": key,
+                  "message": f"dictated action item number {i} with enough "
+                             f"substance to cross the candidate bar easily"},
+            headers=headers,
+        )
+    with structlog.testing.capture_logs() as captured:
+        r = await client.post("/chat/open", json={}, headers=headers)
+    body = await r.json()
+    prior = body.get("prior_capture")
+    assert prior is not None
+    assert prior["status"] == "held_unstructured"
+    held = [
+        c for c in captured
+        if c.get("event") == "web.chat.prior_capture_held"
+    ]
+    assert len(held) == 1
+
+
+async def test_extract_requires_auth(capture_client) -> None:
+    client, fake = capture_client
+    headers = _session_headers()
+    key = await _open(client, headers)
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 0},
+    )
+    assert r.status == 401
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 0},
+        headers={
+            "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
+            "X-Alfred-Client": "web",
+            USER_HEADER: "andrew",
+        },
+    )
+    assert r.status == 401

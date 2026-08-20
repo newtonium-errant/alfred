@@ -507,6 +507,40 @@ async def extract_notes_from_capture(
         )
         return ExtractResult(created_paths=[], skipped_reason="no_session")
 
+    return await extract_notes_from_record(
+        client,
+        vault_path,
+        session_rel,
+        model,
+        max_notes,
+        agent_slug=agent_slug,
+        anchor_scope=anchor_scope,
+        operator_override=operator_override,
+    )
+
+
+async def extract_notes_from_record(
+    client: Any,
+    vault_path: Path,
+    session_rel: str,
+    model: str,
+    max_notes: int = DEFAULT_MAX_NOTES,
+    *,
+    agent_slug: str = "salem",
+    anchor_scope: str = "",
+    operator_override: str | None = None,
+) -> ExtractResult:
+    """Extraction core against a KNOWN session-record path.
+
+    Split out of :func:`extract_notes_from_capture` (capture toggle R1,
+    2026-08-20) so callers that already hold a record path — the span
+    pipeline in ``capture_spans``, whose span records never appear in the
+    ``closed_sessions`` state — can drive the SAME preserved machinery
+    (implicit structuring chain, three-tier target discriminator, anchor
+    preservation, cross-link pass, ``derived_notes`` idempotency) without
+    the short-id resolution. Behaviour is byte-identical for the legacy
+    entry point, which now resolves the short id and delegates here.
+    """
     post = _load_session_record(vault_path, session_rel)
     if post is None:
         return ExtractResult(created_paths=[], skipped_reason="no_record")

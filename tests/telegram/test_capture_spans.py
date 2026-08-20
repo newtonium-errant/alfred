@@ -149,6 +149,75 @@ def test_mark_span_extracted_missing_session_or_span(mgr) -> None:
     )
 
 
+def test_timeout_sweep_carries_spans_and_suppresses_heuristic(
+    mgr, tmp_path
+) -> None:
+    """The idle-timeout close path: spans ride the sweeper meta, the
+    whole-session capture heuristic is suppressed when spans exist (and
+    fires when they don't — the positive control), the record stamps
+    ``capture_spans`` with the open span closed at the transcript end."""
+    import frontmatter as fmlib
+    from datetime import timedelta
+
+    from alfred.telegram.session import (
+        check_timeouts_with_meta,
+        stash_close_contract_metadata,
+    )
+
+    vault = tmp_path / "vault"
+    (vault / "session").mkdir(parents=True)
+
+    def _make(chat_id: int, with_span: bool) -> None:
+        session = open_session(mgr, chat_id, model="claude-sonnet-4-6")
+        stash_close_contract_metadata(
+            mgr, chat_id,
+            vault_path_root=str(vault),
+            user_vault_path="person/Andrew Newton",
+            stt_model_used="",
+            session_type="conversation",
+            tool_set="talker",
+        )
+        # Refresh the dataclass AFTER the stash so _persist keeps the _* keys.
+        session = Session.from_dict(mgr.get_active(chat_id))
+        if with_span:
+            capture_spans.begin_capture(mgr, chat_id)
+            session = Session.from_dict(mgr.get_active(chat_id))
+        for i in range(3):
+            append_turn(
+                mgr, session, "user",
+                f"substantial dictated line {i} carrying well over fifty "
+                f"characters of real content for the substance gate",
+            )
+
+    _make(1, with_span=True)   # capture left ON — open span at close
+    _make(2, with_span=False)  # the heuristic's positive control
+
+    from datetime import datetime, timezone
+    later = datetime.now(timezone.utc) + timedelta(hours=2)
+    meta = check_timeouts_with_meta(mgr, later, gap_seconds=1800)
+    by_chat = {m["chat_id"]: m for m in meta}
+    assert set(by_chat) == {1, 2}
+
+    spanned = by_chat[1]
+    assert spanned["capture_candidate"] is False  # suppressed by spans
+    assert spanned["capture_spans"] == [
+        {"start": 0, "end": 3, "extracted": False, "record": "", "notes": []}
+    ]
+    assert spanned["user_vault_path"] == "person/Andrew Newton"
+    post = fmlib.load(vault / spanned["rel_path"])
+    assert post.get("capture_structured") is None
+    assert post["capture_spans"] == [
+        {"span": "0-3", "turns": 3, "extracted": False, "record": ""}
+    ]
+
+    plain = by_chat[2]
+    assert plain["capture_candidate"] is True
+    assert plain["capture_spans"] == []
+    post2 = fmlib.load(vault / plain["rel_path"])
+    assert post2["capture_structured"] == "pending"
+    assert post2.get("capture_spans") is None
+
+
 def test_spans_frontmatter_shape(mgr) -> None:
     session = _session_with_turns(mgr, 0)
     capture_spans.begin_capture(mgr, 1)
