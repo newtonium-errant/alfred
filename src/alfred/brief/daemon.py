@@ -38,6 +38,12 @@ from .utils import get_logger
 from .ops_notable import render_ops_notable_section
 from .upcoming_events import render_upcoming_events_section
 from alfred.drip.brief_line import SECTION_HEADER as DRIP_SECTION_HEADER
+# MODULE-LEVEL on purpose (its siblings import feed lazily): this name is the
+# argument of the sort rotation's ``try_feed_reconcile`` call, which is the
+# kind's declared defer return path — the partition test's AST verifier
+# resolves the NAME through this module's namespace, and a function-scope
+# import would read as unresolved (a claim nobody checked).
+from alfred.feed.model import KIND_SORT_SUGGESTION
 from .watches import check_and_format_watches
 from .weather import fetch_and_format, fetch_and_format_collect
 
@@ -371,12 +377,106 @@ def _emit_brief_feed(
                 store, section.feed_kind, items,
                 empty_is_authoritative=True,
             )
+
+        # --- the sort rotation (2026-08-19) ---------------------------------
+        # NOT a section extractor, because it has no brief section: its whole
+        # surface is the deck and the board, and inventing a markdown section to
+        # reach the emit loop would put text in the operator's morning read that
+        # nothing asked for. Same belt discipline, applied here directly.
+        #
+        # It is emitted AFTER the section loop on purpose. The rotation's
+        # selection reads the store to find what it already has parked, so it
+        # must see the state the rest of this fire has finished writing.
+        _emit_sort_rotation(config, store, now_local, instance=instance)
     except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the brief
         log.warning(
             "brief.feed_emit_failed",
             error=str(exc),
             error_type=exc.__class__.__name__,
         )
+
+
+def _emit_sort_rotation(
+    config: BriefConfig, store, now_local, *, instance: str,
+) -> None:
+    """Reconcile the sort rotation's cards into the feed store.
+
+    Belt-swallowed like every other kind: a rotation failure must never break
+    the brief, and it must never mass-retire its own kind either — a raise or a
+    ``None`` skips the reconcile entirely, leaving whatever the store holds.
+
+    Disabled instances emit an explicit line rather than returning in silence:
+    "the rotation is off here" and "the rotation is broken here" are the two
+    readings of no cards, and only one of them is fine.
+
+    THE KIND IS SPELLED ``KIND_SORT_SUGGESTION`` (module-level import) at the
+    reconcile call, deliberately: this call IS the kind's declared defer return
+    path (``action_router.DEFER_RETURN_PATH``), and the partition test's AST
+    verifier resolves the argument NAME through this module's namespace — a
+    function-scope import would read as unresolved and the declaration would be
+    a claim nobody checked. ``tier.sort_rotation.SORT_KIND`` is pinned equal.
+    """
+    from alfred.feed import try_feed_reconcile
+    from alfred.tier.sort_proposal import corrections_path_for
+
+    from .feed_producer import sort_suggestion_feed_items
+
+    rotation = config.sort_rotation
+    if not rotation.enabled:
+        log.info(
+            "brief.sort_rotation_disabled",
+            instance=instance,
+            reason="brief.sort_rotation.enabled is false — no sort cards are "
+                   "dealt on this instance; unslotted items stay unsortable "
+                   "from the deck",
+        )
+        return
+
+    # THE STORE READ THAT KEEPS DEFERS ALIVE. ``reconcile`` retires any item of
+    # this kind absent from the emitted list, and a deferred item counts as
+    # present for that test — so the selection must be told what is parked or it
+    # will quietly destroy the operator's own defer windows. Narrowed to this
+    # kind here rather than inside the producer so the producer stays a pure
+    # function of (vault, tracked-states).
+    try:
+        tracked = {
+            item_id: item.state
+            for item_id, item in store.load().items()
+            if item.kind == KIND_SORT_SUGGESTION
+        }
+    except Exception as exc:  # noqa: BLE001 — an unreadable store must not reconcile
+        log.warning(
+            "brief.sort_rotation_store_unreadable",
+            instance=instance, error=str(exc), error_type=type(exc).__name__,
+            consequence="rotation skipped this fire — no cards dealt, none retired",
+        )
+        return
+
+    try:
+        items = sort_suggestion_feed_items(
+            config.vault_path, now_local, config.tier_defaults,
+            instance=instance, tracked=tracked, cap=rotation.cap,
+            # The proposer's learning store, derived from the feed store's OWN
+            # path — the same one-derivation helper the act router uses, so the
+            # read and write sides cannot resolve to different files.
+            corrections_path=corrections_path_for(store.path),
+        )
+    except Exception as exc:  # noqa: BLE001 — a rotation blip must not touch feed state
+        log.warning(
+            "brief.feed_extractor_failed",
+            kind=KIND_SORT_SUGGESTION, error=str(exc), error_type=type(exc).__name__,
+        )
+        return
+    if items is None:
+        log.warning("brief.feed_extractor_failed", kind=KIND_SORT_SUGGESTION, reason="no_read")
+        return
+
+    # ADOPTED. The two guards above are exactly the failure/emptiness separation
+    # ``empty_is_authoritative`` asks the caller to vouch for: a raise and a
+    # ``None`` both return before this line, so an empty list here means the
+    # projection genuinely found nothing left to sort — which is the rotation's
+    # goal state, and its cards should clear.
+    try_feed_reconcile(store, KIND_SORT_SUGGESTION, items, empty_is_authoritative=True)
 
 
 def _render_drip_body(config: BriefConfig, today_local: date) -> str | None:

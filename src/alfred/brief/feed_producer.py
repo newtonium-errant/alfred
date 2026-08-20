@@ -462,6 +462,125 @@ def slot_suggestion_feed_items(
     return out
 
 
+def sort_suggestion_feed_items(
+    vault_path: str | Path,
+    now,
+    tier_defaults: Any,
+    *,
+    instance: str,
+    tracked: dict[str, str],
+    cap: int,
+    corrections_path: str | Path | None,
+) -> list[FeedItem] | None:
+    """The sort rotation — up to ``cap`` cards asking the operator to place an
+    item the classifier honestly refused to guess at.
+
+    The population is the SAME ``compute_today_view`` projection the board reads,
+    filtered to entries the projection itself stamped ``unslotted`` — see
+    :mod:`alfred.tier.sort_rotation` on why that is a read of the classifier's
+    verdict rather than a second copy of its rules. Empty day, or a day where
+    every item already has a slot → ``[]`` (a genuine empty; the rotation's ILB
+    line still fires). Projection failure → ``None`` (don't reconcile).
+
+    ``tracked`` maps this kind's feed item ids to their stored states. It is
+    REQUIRED rather than defaulted because it is what keeps a deferred card
+    alive: ``reconcile`` retires anything absent from the returned list, so the
+    selection has to know what the store is already holding. A defaulted empty
+    dict would make the read side silently dead on the one caller that matters —
+    the standing optional-gate trap — and the symptom would be defer windows
+    quietly evaporating overnight.
+
+    ``cap`` is likewise required and comes from config; see
+    :func:`~alfred.tier.sort_rotation.select_rotation` for why held items are
+    carried OUTSIDE it.
+
+    ``corrections_path`` is the proposer's learning store (REQUIRED for the same
+    optional-gate reason as ``tracked`` — a defaulted ``None`` would ship the
+    write side live and the read side dead, and the learned overrides would
+    never reach a card). ``None`` is still a legal VALUE — an instance with no
+    store yet proposes from the static table alone, which is what
+    ``load_tally(None)`` degrades to.
+    """
+    from alfred.feed.model import make_id
+    from alfred.tier.compute import compute_today_view
+    from alfred.tier.sort_proposal import load_tally, propose_slot, shape_of
+    from alfred.tier.sort_rotation import (
+        SORT_KIND,
+        log_rotation,
+        select_rotation,
+        unslotted_entries,
+    )
+
+    try:
+        # A SECOND projection this fire — ``slot_suggestion_feed_items`` already
+        # computed one. Deliberately not shared: the extractors are independent
+        # by construction (each is a lambda the belt can fail in isolation), and
+        # threading one view through them would couple every kind's failure to
+        # every other's. The brief fires once a day, so the cost is one extra
+        # vault read per morning.
+        view = compute_today_view(Path(vault_path), now, tier_defaults)
+    except Exception:  # noqa: BLE001 — source failure → don't reconcile (belt also logs)
+        return None
+
+    sortable, unwritable = unslotted_entries(view)
+    selection = select_rotation(
+        sortable, tracked, cap=cap,
+        key_of=lambda e: make_id(SORT_KIND, _slot_stable_key(e)),
+    )
+    log_rotation(selection, unwritable=unwritable, cap=cap, instance=instance)
+
+    # The proposer's learned layer, loaded ONCE per fire. Belt-swallowed inside
+    # load_tally: a corrupt learning store degrades to the static table, never
+    # to a failed fire.
+    tally = load_tally(corrections_path)
+
+    out: list[FeedItem] = []
+    for entry in selection.emitted:
+        key = _slot_stable_key(entry)
+        if not key:
+            continue
+        # EVERY card carries a proposal — the table is total by construction,
+        # and a card without one would deal a swipe surface with no affirm (the
+        # accepted-then-ignored shape). The SHAPE is stamped at deal time so the
+        # act path records the ruling against the exact key this proposal was
+        # made under, rather than re-deriving one that could drift.
+        proposal = propose_slot(entry, tally)
+        out.append(FeedItem.create(
+            kind=SORT_KIND,
+            stable_key=key,
+            instance=instance,
+            title=f"Sort: {entry.name}",
+            evidence={
+                # The writer's addressing fields — the trusted-producer class
+                # the sibling board writers already read. ``assign_slot`` takes
+                # exactly these and composes no path of its own.
+                "origin": getattr(entry, "origin", ""),
+                "name": entry.name,
+                "path": getattr(entry, "path", ""),
+                "routine_record": getattr(entry, "routine_record", None),
+                "item_text": getattr(entry, "item_text", None),
+                # Context for the face. ``slot_rule`` is carried even though it
+                # is always ``no_signal`` for this population: the card should be
+                # able to say WHY nothing fired, and hardcoding the answer on the
+                # face would make it a caption instead of a reading.
+                "tier": entry.tier,
+                "slot": getattr(entry, "slot", "unslotted"),
+                "slot_rule": getattr(entry, "slot_rule", "no_signal"),
+                "due_iso": getattr(entry, "due_iso", None),
+                "surface_reason": getattr(entry, "surface_reason", None),
+                # The PROPOSAL (2026-08-19 gesture-grammar ruling). The serve
+                # side stamps the affirm gesture onto exactly this slot's verb
+                # (``actions_for_item``), the face renders it as the suggestion,
+                # and the act path scores the operator's choice against it.
+                "proposed_slot": proposal.slot,
+                "proposed_rule": proposal.rule,
+                "proposal_shape": shape_of(entry),
+            },
+            source_ref=dict(_SOURCE_REF),
+        ))
+    return out
+
+
 # The peer-digest card renders ``evidence.body`` as readable prose, so the
 # extractor must EMIT the digest body (the record already holds it — this is
 # emission, not new gathering). Bounded because the feed store is append-only
