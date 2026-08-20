@@ -43,7 +43,7 @@ from alfred.drip.brief_line import SECTION_HEADER as DRIP_SECTION_HEADER
 # kind's declared defer return path — the partition test's AST verifier
 # resolves the NAME through this module's namespace, and a function-scope
 # import would read as unresolved (a claim nobody checked).
-from alfred.feed.model import KIND_SORT_SUGGESTION
+from alfred.feed.model import KIND_MOC_SUGGESTION, KIND_SORT_SUGGESTION
 from .watches import check_and_format_watches
 from .weather import fetch_and_format, fetch_and_format_collect
 
@@ -388,6 +388,11 @@ def _emit_brief_feed(
         # selection reads the store to find what it already has parked, so it
         # must see the state the rest of this fire has finished writing.
         _emit_sort_rotation(config, store, now_local, instance=instance)
+        # --- the MOC reader (2026-08-20) ------------------------------------
+        # Same shape and the same reason as the rotation above: no brief
+        # section, deck-only surface, emitted after the section loop so its
+        # selection sees the state this fire has finished writing.
+        _emit_moc_suggestions(config, store, instance=instance)
     except Exception as exc:  # noqa: BLE001 — the feed can NEVER break the brief
         log.warning(
             "brief.feed_emit_failed",
@@ -477,6 +482,110 @@ def _emit_sort_rotation(
     # projection genuinely found nothing left to sort — which is the rotation's
     # goal state, and its cards should clear.
     try_feed_reconcile(store, KIND_SORT_SUGGESTION, items, empty_is_authoritative=True)
+
+
+def _emit_moc_suggestions(config: BriefConfig, store, *, instance: str) -> None:
+    """Reconcile the MOC reader's cards into the feed store.
+
+    Belt-swallowed like every other kind: a reader failure must never break
+    the brief, and it must never mass-retire its own kind either — a raise or
+    a ``None`` skips the reconcile entirely, leaving whatever the store holds.
+
+    THE KIND IS SPELLED ``KIND_MOC_SUGGESTION`` (module-level import) at the
+    reconcile call for the same reason the rotation spells its own that way:
+    this call IS the kind's declared defer return path
+    (``action_router.DEFER_RETURN_PATH``), and the partition test's AST
+    verifier resolves the argument NAME through this module's namespace — a
+    function-scope import would read as unresolved and the declaration would
+    be a claim nobody checked.
+
+    NOT GATED BY A CONFIG FLAG, and that is a per-instance-defaults decision
+    rather than an omission: the reader is gated by its POPULATION. An
+    instance whose surveyor never enqueued a suggestion has an empty (or
+    absent) queue and deals nothing, saying so in the readout line. Adding an
+    ``enabled`` dial would mean an instance-name literal or a flag nobody
+    sets — and Hypatia is the only instance with ``moc_suggestion.enabled``
+    on, so the producer already decides where this applies.
+    """
+    from alfred.feed import try_feed_reconcile
+
+    from .feed_producer import MOC_SUGGESTION_CAP, moc_suggestion_feed_items
+
+    queue_path = _moc_queue_path_for(config)
+    if queue_path is None:
+        log.info(
+            "brief.moc_suggestion_no_queue_path",
+            instance=instance,
+            reason="surveyor state/queue path unresolved in this config — no "
+                   "MOC cards are dealt on this instance",
+        )
+        return
+
+    # THE STORE READ THAT KEEPS DEFERS ALIVE — identical discipline to the
+    # rotation's. ``reconcile`` retires any item of this kind absent from the
+    # emitted list, and a deferred item counts as present for that test, so
+    # the selection must be told what is parked or it will quietly destroy
+    # the operator's own defer windows.
+    try:
+        tracked = {
+            item_id: item.state
+            for item_id, item in store.load().items()
+            if item.kind == KIND_MOC_SUGGESTION
+        }
+    except Exception as exc:  # noqa: BLE001 — an unreadable store must not reconcile
+        log.warning(
+            "brief.moc_suggestion_store_unreadable",
+            instance=instance, error=str(exc), error_type=type(exc).__name__,
+            consequence="reader skipped this fire — no cards dealt, none retired",
+        )
+        return
+
+    try:
+        items = moc_suggestion_feed_items(
+            config.vault_path, instance=instance, tracked=tracked,
+            cap=MOC_SUGGESTION_CAP, queue_path=queue_path,
+        )
+    except Exception as exc:  # noqa: BLE001 — a blip must not touch feed state
+        log.warning(
+            "brief.feed_extractor_failed",
+            kind=KIND_MOC_SUGGESTION, error=str(exc), error_type=type(exc).__name__,
+        )
+        return
+    if items is None:
+        log.warning(
+            "brief.feed_extractor_failed", kind=KIND_MOC_SUGGESTION, reason="no_read",
+        )
+        return
+
+    # The two guards above are the failure/emptiness separation
+    # ``empty_is_authoritative`` asks the caller to vouch for: a raise and a
+    # ``None`` both return before this line, so an empty list here means the
+    # queue genuinely holds nothing actionable — and those cards should clear.
+    try_feed_reconcile(
+        store, KIND_MOC_SUGGESTION, items, empty_is_authoritative=True,
+    )
+
+
+def _moc_queue_path_for(config: BriefConfig):
+    """The queue path, derived from the surveyor's own config.
+
+    Mirrors the act router's ``_moc_queue_path`` deliberately — the read side
+    and the write side must resolve to ONE file. Both prefer the explicit
+    ``queue_path`` and fall back to the surveyor state path's sibling, which
+    is exactly what the surveyor daemon does when it enqueues.
+    """
+    from alfred.surveyor.moc_suggestion_queue import derive_default_queue_path
+
+    surveyor = getattr(config, "surveyor", None)
+    moc_cfg = getattr(surveyor, "moc_suggestion", None) if surveyor else None
+    explicit = getattr(moc_cfg, "queue_path", None) if moc_cfg else None
+    if explicit:
+        return Path(str(explicit))
+    state = getattr(surveyor, "state", None) if surveyor else None
+    state_path = getattr(state, "path", None) if state else None
+    if state_path:
+        return derive_default_queue_path(str(state_path))
+    return None
 
 
 def _render_drip_body(config: BriefConfig, today_local: date) -> str | None:

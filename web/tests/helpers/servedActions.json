@@ -1,6 +1,6 @@
 {
   "README": [
-    "GENERATED FROM THE SERVER, then guarded by a pin \u2014 do not hand-edit.",
+    "GENERATED FROM THE SERVER, then guarded by a pin — do not hand-edit.",
     "Source of truth: alfred.daily_sync.action_router.actions_for(kind).",
     "Regenerate when the ceiling changes; tests/feed/test_feed_advertised_actions.py",
     "::TestTheFEFixtureMatchesWhatIsServed reds if this drifts from actions_for.",
@@ -391,6 +391,36 @@
         "label": "Fuel",
         "weight": "light",
         "group": "slot"
+      },
+      {
+        "verb": "defer",
+        "label": "Not now",
+        "weight": "light",
+        "gesture": "reject"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
+    ],
+    "moc_suggestion": [
+      {
+        "verb": "moc_apply",
+        "label": "Add",
+        "weight": "light",
+        "gesture": "affirm",
+        "group": "moc"
       },
       {
         "verb": "defer",

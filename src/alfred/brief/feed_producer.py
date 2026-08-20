@@ -20,12 +20,17 @@ the section's own record (not the whole markdown).
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from alfred.feed import FeedItem
-from alfred.feed.model import ATTENTION_FYI, ATTENTION_NEEDS_YOU
+from alfred.feed.model import (
+    ATTENTION_FYI,
+    ATTENTION_NEEDS_YOU,
+    KIND_MOC_SUGGESTION,
+)
 from alfred.health.types import Status
 
 from .utils import get_logger
@@ -652,4 +657,386 @@ def peer_digest_feed_items(
             },
             source_ref=dict(_SOURCE_REF),
         ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# MOC suggestion cards (2026-08-20 — the MOC reader, operator ruling R3)
+# ---------------------------------------------------------------------------
+#
+# The surveyor has been enqueueing cluster->MOC suggestions to
+# ``moc_suggestions.jsonl`` on every sweep since Phase 5 D1, and the READER
+# died with bot.py in the T5 deletion. The queue has been accumulating with
+# nothing consuming it. This is the consumer; the producer keeps writing.
+#
+# THE CARD IS QUIET, AND THAT IS LOAD-BEARING RATHER THAN A PREFERENCE.
+# ``feedNeedsYou.isNeedsYouItem`` is ``attention === 'needs_you' || mode ===
+# 'decide'``, the push poller fetches on that predicate with NO kind
+# allowlist, and the default policy admits everything it is handed. So
+# MODE_DECIDE rings the phone REGARDLESS of attention — there is no
+# decide/fyi combination that stays silent. A proposal must never ring, so
+# the kind is (FYI, FYI) in KIND_DEFAULTS and a web pin guards the pair.
+#
+# WHICH MEANS THE HOLD FAMILY IS WHAT MAKES THE CARD EXIST AT ALL. A quiet
+# card reaches the deck only through ``isDeckCandidate = mode === 'decide'
+# || hasSuggestedChoice`` — so without co-equal choices this card would be
+# served an apply verb and rendered on no surface that offers one (the FYI
+# glance row gets ack/contest and no verbs). That is the accepted-then-
+# ignored wall by another door, which is why ``moc_choices`` below is not a
+# nicety: a row that cannot offer >= 2 targets is NOT EMITTED, and says so.
+#
+# V1 IS ADD-TO-AN-EXISTING-MOC ONLY (2026-08-20 ruling), and THAT — not the
+# signal's name — is the discriminator the filter below actually applies. It
+# admits a row with a real ``target_moc_rel_path`` and excludes one without,
+# which is the create-vs-add question asked directly. ``propose_new`` is the
+# signal that produces the excluded shape today, so naming it here as the
+# rule would describe a symptom: a future signal that also proposed creating
+# a MOC would be excluded by this filter and unmentioned by this comment.
+# Those rows propose a ``vault_create`` plus N edits and have no target to
+# substitute an alternate FOR, so they need their own matrix. But
+# a reader that silently reads a fraction of the queue is a reader that lies
+# about it, so the count of queued-but-not-actionable rows is emitted on
+# every fire (ILB), always present, at zero as readily as at five.
+
+#: Cap on MOC cards per fire. THREE, matching the sort rotation's ratified
+#: "2-3/day" — the same operator, the same deck, the same appetite for
+#: backlog grooming in one sitting. Deferred cards are carried OUTSIDE it
+#: (see ``select_rotation``), because retiring a parked card would destroy
+#: the defer window the operator is relying on.
+MOC_SUGGESTION_CAP = 3
+
+#: How many alternate targets a card offers. Bounded because the selector is
+#: a sheet the operator reads, not a directory listing — and because the
+#: whole vault's MOC list on every card would bury the proposal it is meant
+#: to modify. The proposed target is always first and always present.
+MOC_MAX_CHOICES = 6
+
+
+def moc_suggestion_feed_items(
+    vault_path: str | Path,
+    *,
+    instance: str,
+    tracked: dict[str, str],
+    cap: int,
+    queue_path: str | Path,
+) -> list[FeedItem] | None:
+    """Cards for pending MOC-membership suggestions the operator can act on.
+
+    Returns ``None`` on a source failure (don't reconcile — a blip must never
+    mass-retire the kind), ``[]`` on a genuine empty (nothing pending, or
+    nothing actionable), and up to ``cap`` cards otherwise plus every held
+    card outside the cap.
+
+    ``tracked`` and ``cap`` are REQUIRED for the same reason the rotation's
+    are: a defaulted ``tracked`` would ship the read side dead on the one
+    caller that matters and defer windows would quietly evaporate, and a
+    defaulted cap would hide the dial. ``queue_path`` is required because
+    there is no honest default — the queue is per-instance and the surveyor
+    derives its path from that instance's own state path.
+    """
+    from alfred.feed.model import make_id
+    from alfred.surveyor.moc_apply import (
+        MEMBER_ALREADY_CITES,
+        MEMBER_INELIGIBLE_TYPE,
+        MEMBER_PENDING_WORK,
+        MEMBER_UNREADABLE,
+        classify_member,
+    )
+    from alfred.surveyor.moc_suggester import build_existing_mocs_index
+    from alfred.surveyor.moc_suggestion_queue import load_queue
+    from alfred.tier.sort_rotation import select_rotation
+
+    try:
+        rows = load_queue(queue_path)
+    except Exception:  # noqa: BLE001 — source failure → don't reconcile
+        return None
+    try:
+        mocs_index, moc_dir_exists = build_existing_mocs_index(Path(vault_path))
+    except Exception:  # noqa: BLE001 — same
+        return None
+
+    pending = [r for r in rows if r.status == "pending"]
+    actionable = [
+        r for r in pending
+        if r.mapping_signal != "propose_new" and r.target_moc_rel_path
+    ]
+    deferred_new = [r for r in pending if r.mapping_signal == "propose_new"]
+
+    # ILB — the deliberate v1 gap, counted on every fire. A reader that reads
+    # 4 of 9 rows in silence is indistinguishable from one that is broken, so
+    # the not-yet-actionable population is NAMED rather than merely omitted.
+    # Every field present at zero.
+    log.info(
+        "brief.moc_suggestion.queue_readout",
+        instance=instance,
+        pending=len(pending),
+        actionable=len(actionable),
+        deferred_propose_new=len(deferred_new),
+        mocs_on_disk=len(mocs_index),
+        moc_dir_exists=moc_dir_exists,
+        reason=(
+            "propose_new rows are queued and NOT actionable in v1 — they "
+            "propose creating a new MOC (a vault_create plus N edits), which "
+            "is a separate shape and matrix. They stay pending; nothing is "
+            "wiped." if deferred_new else "no propose_new rows queued"
+        ),
+    )
+
+    if not actionable:
+        return []
+
+    # The choice population — every non-inventory MOC on disk. The index
+    # builder already filters inventory MOCs, which is why this needs no
+    # second filter: they can never be a target OR an alternate.
+    all_targets = sorted(mocs_index)
+
+    def _key_of_row(row) -> str:
+        return make_id(KIND_MOC_SUGGESTION, row.id)
+
+    # A shim so the shared band logic can order rows: ``select_rotation``
+    # sorts within each band by ``name`` then id, and a MocSuggestion has no
+    # name. Carrying ``created`` as the sort name makes the ordering
+    # OLDEST-FIRST — backlog semantics, where the longest-stuck row is the
+    # one that has waited longest to be answered. ISO-8601 sorts
+    # lexicographically, so no date parsing is needed to get chronological
+    # order. The band logic itself (held / continuing / fresh) is reused
+    # rather than re-derived: it is what keeps a deferred card alive.
+    class _Row:
+        __slots__ = ("row", "name")
+
+        def __init__(self, row) -> None:
+            self.row = row
+            self.name = str(row.created or "")
+
+    selection = select_rotation(
+        [_Row(r) for r in actionable],
+        tracked,
+        cap=cap,
+        key_of=lambda shim: _key_of_row(shim.row),
+    )
+
+    out: list[FeedItem] = []
+    skipped_no_family = 0
+    settled: list[tuple[str, Counter]] = []
+    withheld: list[tuple[str, Counter]] = []
+    for shim in [*selection.visible, *selection.held]:
+        row = shim.row
+        target = str(row.target_moc_rel_path or "")
+        choices = _moc_choices(target, all_targets, mocs_index)
+        if len(choices) < 2:
+            # A selector of ONE is a confirm stage wearing a menu, which the
+            # affirm-with-hold pattern forbids — and a quiet card with no
+            # co-equal family is not a deck candidate at all. Emitting it
+            # would serve an apply verb onto a surface with no gesture. The
+            # honest answer is not to deal it, and to say why.
+            skipped_no_family += 1
+            continue
+
+        members = list(row.candidate_members_to_add or [])
+        already = set(row.applied_members or [])
+        remaining = [m for m in members if m not in already]
+
+        # THE DEAL-TIME STALENESS CHECK. ``candidate_members_to_add`` is a
+        # snapshot from the sweep that proposed the row, and the vault moves
+        # underneath it — most sharply WITHIN ONE SITTING, because rows
+        # overlap: the same member legitimately appears in several rows
+        # aimed at the same MOC, so applying one row makes its siblings
+        # no-ops. Asking the RECORD, not the snapshot, is the only honest
+        # basis for "is there work here?".
+        classified = {
+            m: classify_member(
+                Path(vault_path), m, target_moc_rel_path=target,
+            )
+            for m in remaining
+        }
+        counts = Counter(classified.values())
+        applicable = [
+            m for m, s in classified.items() if s == MEMBER_PENDING_WORK
+        ]
+
+        if not applicable:
+            # NOTHING TO DEAL. Exactly parallel to the no-choice-family rule
+            # below: a card the operator cannot usefully act on is not dealt,
+            # which also closes the "Add 0 notes to X?" face by construction.
+            #
+            # BUT NOT-DEALT AND SETTLED ARE DIFFERENT ANSWERS, and conflating
+            # them was a permanent-loss path. Settling marks the row
+            # ``applied`` — terminal, and ``upsert_proposals`` no-ops on a
+            # non-pending id, so there is NO WAY BACK. That is only honest
+            # when every member genuinely carries the membership already.
+            #
+            # A member that merely MOVED or was RENAMED reads as
+            # ``unreadable``, and this vault moves records (the janitor holds
+            # move rights). Retiring its row as "applied" having applied
+            # nothing would destroy the suggestion permanently, at exactly
+            # the moment the feature becomes useful.
+            #
+            # So: settle ONLY on all-already-cites. Everything else stays
+            # PENDING — still not dealt, so nothing gets noisy, and the row
+            # survives to be re-evaluated once the record reappears. The
+            # ``all()`` is vacuously true when ``remaining`` is empty, which
+            # is the right answer for a row whose members were all applied
+            # by an earlier act.
+            if all(s == MEMBER_ALREADY_CITES for s in classified.values()):
+                settled.append((row.id, counts))
+            else:
+                withheld.append((row.id, counts))
+            continue
+
+        out.append(FeedItem.create(
+            kind=KIND_MOC_SUGGESTION,
+            stable_key=row.id,
+            instance=instance,
+            # N ON THE FACE, before the swipe (2026-08-20 ruling): a write
+            # that touches this many records must never be a surprise.
+            title=_moc_card_title(len(applicable), mocs_index.get(target), target),
+            evidence={
+                # The writer's addressing fields — trusted-producer class,
+                # read by the act dispatcher and by nothing else.
+                # PLUMBING the act path reads. Hidden from the rendered
+                # evidence rows (web ``feedEvidence.HIDDEN_KEYS``) — an
+                # internal queue id is not information for the operator.
+                "suggestion_id": row.id,
+                # OPERATOR-FACING: which notes this would touch.
+                "members": applicable,
+                "applicable_count": len(applicable),
+                # TYPE-ineligible ONLY — the meaning its name states. It
+                # briefly counted every non-applicable class, so a perfectly
+                # eligible zettel that merely already carried the target
+                # reported as "ineligible" on a visible row. The other two
+                # classes get their own counts rather than being folded in:
+                # "already has it" and "couldn't be read" are different facts
+                # and the second is a MOVED-RECORD signal worth surfacing.
+                "ineligible_count": counts[MEMBER_INELIGIBLE_TYPE],
+                "already_count": counts[MEMBER_ALREADY_CITES],
+                "unreadable_count": counts[MEMBER_UNREADABLE],
+                "already_applied_count": len(already),
+                # The suggester's evidence, legible on the face — WHY it
+                # thinks so, in its own terms rather than a caption.
+                "mapping_signal": row.mapping_signal,
+                "mapping_score": row.mapping_score,
+                "reasoning": row.reasoning,
+                "cluster_tags": list(row.cluster_tags or []),
+                "cluster_size": len(row.cluster_member_paths or []),
+                "partial_retry": bool(already),
+                "last_apply_error": row.last_apply_error or "",
+                # THE PROPOSAL + THE OPEN CHOICE SET. The proposed target is
+                # the affirm; the rest are the hold selector's co-equal
+                # family. Served as DATA because the target set is open —
+                # a static verb per MOC is not expressible in the ceiling.
+                # PLUMBING, both hidden. ``proposed_target`` is the act
+                # path's scoring coordinate and the selector's suggested
+                # member; the operator already reads it in HUMAN form in the
+                # card's own title ("Add 2 notes to Roman Philosophy MOC?"),
+                # so a raw ``MOC/Roman Philosophy MOC.md`` row would restate
+                # the title in a machine spelling and nothing more.
+                # ``moc_choices`` IS the hold selector — it renders as the
+                # sheet, never as a key:value row.
+                "proposed_target": target,
+                "moc_choices": choices,
+            },
+            source_ref=dict(_SOURCE_REF),
+        ))
+
+    if withheld:
+        # ILB — the row is not dealt AND not settled. It has no applicable
+        # member, but at least one member is ineligible or unreadable rather
+        # than already-citing, so retiring it would throw the suggestion away
+        # on the strength of a record that may simply have moved. The
+        # breakdown is carried so the line states which cause actually
+        # applies instead of asserting the common one.
+        totals = Counter()
+        for _id, c in withheld:
+            totals.update(c)
+        log.info(
+            "brief.moc_suggestion.withheld_not_settled",
+            instance=instance,
+            withheld=len(withheld),
+            already_cites=totals[MEMBER_ALREADY_CITES],
+            ineligible_type=totals[MEMBER_INELIGIBLE_TYPE],
+            unreadable=totals[MEMBER_UNREADABLE],
+            reason="no applicable member, but not every member already "
+                   "carries the target — an unreadable member may be a "
+                   "moved or renamed record, so the row stays PENDING "
+                   "rather than retiring as applied-having-applied-nothing",
+        )
+
+    if settled:
+        # ILB, and a distinct silence: every candidate member already carries
+        # the target, so the row's work really is done — by an earlier card in
+        # this same sitting, or by the operator's own hand-edit.
+        totals = Counter()
+        for _id, c in settled:
+            totals.update(c)
+        log.info(
+            "brief.moc_suggestion.settled_already_applied",
+            instance=instance,
+            settled=len(settled),
+            already_cites=totals[MEMBER_ALREADY_CITES],
+            ineligible_type=totals[MEMBER_INELIGIBLE_TYPE],
+            unreadable=totals[MEMBER_UNREADABLE],
+            reason="every candidate member already carries the target — the "
+                   "row's work is done, so it is retired rather than dealt "
+                   "as a card proposing work already complete",
+        )
+        for suggestion_id, _counts in settled:
+            try:
+                from alfred.surveyor.moc_suggestion_queue import update_status
+
+                update_status(queue_path, suggestion_id, "accepted")
+                update_status(queue_path, suggestion_id, "applied")
+            except Exception as exc:  # noqa: BLE001 — bookkeeping never fails a fire
+                log.warning(
+                    "brief.moc_suggestion.settle_failed",
+                    instance=instance, suggestion_id=suggestion_id,
+                    error=str(exc), error_type=type(exc).__name__,
+                    consequence="row stays pending and will be re-evaluated "
+                                "next fire; no card is dealt for it either way",
+                )
+
+    if skipped_no_family:
+        # ILB again, and a DIFFERENT silence from the one above: these rows
+        # ARE actionable, and are being withheld for a structural reason the
+        # operator cannot otherwise see.
+        log.info(
+            "brief.moc_suggestion.skipped_no_choice_family",
+            instance=instance,
+            skipped=skipped_no_family,
+            mocs_on_disk=len(all_targets),
+            reason="fewer than 2 non-inventory MOCs on disk, so the card has "
+                   "no co-equal alternate to offer; a quiet card without a "
+                   "hold family is not dealt to the deck at all",
+        )
+    return out
+
+
+def _moc_card_title(count: int, moc, target: str) -> str:
+    """The face, stating N before the swipe."""
+    name = getattr(moc, "name", "") or getattr(moc, "stem", "") or target
+    if count == 1:
+        return f"Add 1 note to {name}?"
+    return f"Add {count} notes to {name}?"
+
+
+def _moc_choices(target: str, all_targets: list[str], mocs_index: dict) -> list[dict]:
+    """The co-equal target family — proposed first, then the alternates.
+
+    Bounded by ``MOC_MAX_CHOICES``. The proposed target is ALWAYS included
+    even if it somehow fell out of the index (a MOC deleted between propose
+    and deal), because the card's own proposal must be answerable.
+    """
+    ordered: list[str] = []
+    if target:
+        ordered.append(target)
+    for rel in all_targets:
+        if rel != target:
+            ordered.append(rel)
+    out: list[dict] = []
+    for rel in ordered[:MOC_MAX_CHOICES]:
+        moc = mocs_index.get(rel)
+        out.append({
+            "target": rel,
+            "label": getattr(moc, "name", "") or getattr(moc, "stem", "") or rel,
+            "suggested": rel == target,
+        })
     return out

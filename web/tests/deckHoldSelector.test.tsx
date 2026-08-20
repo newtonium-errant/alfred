@@ -298,3 +298,96 @@ describe('the not-now reject', () => {
     expect(selectorOpen()).toBe(false); // and not the selector either — wrong axis
   });
 });
+
+// --- the OPEN-SET arm (the MOC reader, 2026-08-20) -----------------------------
+//
+// This family drove only STATIC families until now, which is exactly why the
+// duplicate-key defect below reached a gate: every static member is a distinct
+// verb, so keying rows on the verb was correct for every card that existed.
+// An open-set family's members all share ONE verb and differ only by target.
+
+function mocCard(over: Partial<FeedItem> = {}): FeedItem {
+  return withServedActions({
+    id: 'moc_suggestion:ms-1',
+    kind: 'moc_suggestion',
+    instance: 'hypatia',
+    title: 'Add 2 notes to Roman Philosophy MOC?',
+    mode: 'fyi',
+    attention: 'fyi',
+    evidence: {
+      suggestion_id: 'ms-1',
+      proposed_target: 'MOC/Roman Philosophy MOC.md',
+      moc_choices: [
+        { target: 'MOC/Roman Philosophy MOC.md', label: 'Roman Philosophy MOC', suggested: true },
+        { target: 'MOC/Stoicism MOC.md', label: 'Stoicism MOC', suggested: false },
+        { target: 'MOC/Ethics MOC.md', label: 'Ethics MOC', suggested: false },
+      ],
+    },
+    ...over,
+  } as FeedItem);
+}
+
+describe('the open-set hold-selector', () => {
+  it('renders one ADDRESSABLE row per target — not three rows sharing a key', () => {
+    // THE REGRESSION PIN. All three choices carry verb `moc_apply`, so keying
+    // on the verb gave every row the same key and the same testid: React
+    // logged a duplicate-key warning and `getByTestId` could not name a row.
+    const warn = vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(<Deck items={[mocCard()]} />);
+    down();
+    move(IN_BAND_X);
+    act(() => vi.advanceTimersByTime(GESTURE_HOLD_MS));
+    expect(selectorOpen()).toBe(true);
+
+    // Each target is individually addressable.
+    expect(screen.getByTestId('deck-hold-choice-MOC/Roman Philosophy MOC.md')).toBeTruthy();
+    expect(screen.getByTestId('deck-hold-choice-MOC/Stoicism MOC.md')).toBeTruthy();
+    expect(screen.getByTestId('deck-hold-choice-MOC/Ethics MOC.md')).toBeTruthy();
+    // And the proposed one is MARKED, not promoted.
+    expect(
+      screen
+        .getByTestId('deck-hold-choice-MOC/Roman Philosophy MOC.md')
+        .querySelector('[data-testid="deck-hold-suggested"]'),
+    ).not.toBeNull();
+
+    // No duplicate-key warning. Asserted on the real console, because that is
+    // the only place the old defect ever showed.
+    const dupes = warn.mock.calls.filter((c) =>
+      String(c[0] ?? '').includes('same key'),
+    );
+    expect(dupes).toEqual([]);
+    warn.mockRestore();
+  });
+
+  it('picking a NON-suggested target POSTs that target with the one verb', () => {
+    render(<Deck items={[mocCard()]} />);
+    down();
+    move(IN_BAND_X);
+    act(() => vi.advanceTimersByTime(GESTURE_HOLD_MS));
+    act(() => {
+      fireEvent.click(screen.getByTestId('deck-hold-choice-MOC/Stoicism MOC.md'));
+    });
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    // ONE verb, the CHOSEN target as the third argument.
+    expect(mockAct).toHaveBeenCalledWith(
+      'moc_suggestion:ms-1',
+      'moc_apply',
+      'MOC/Stoicism MOC.md',
+    );
+  });
+
+  it('a plain → swipe NAMES the proposed target rather than omitting it', () => {
+    // The server refuses an apply with no target rather than defaulting, so
+    // the quick affirm has to carry the proposal explicitly.
+    render(<Deck items={[mocCard()]} />);
+    down();
+    move(ORIGIN_X + SWIPE_X_THRESHOLD + 40);
+    up(ORIGIN_X + SWIPE_X_THRESHOLD + 40);
+    act(() => vi.advanceTimersByTime(UNDO_MS));
+    expect(mockAct).toHaveBeenCalledWith(
+      'moc_suggestion:ms-1',
+      'moc_apply',
+      'MOC/Roman Philosophy MOC.md',
+    );
+  });
+});

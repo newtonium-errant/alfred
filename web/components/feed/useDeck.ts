@@ -4,6 +4,7 @@ import {
   CORRECT_ACTION,
   DEFER_QUICK_ACTION,
   holdChoicesFor,
+  holdChoicesForVerb,
   isHeavyVerb,
   ONE_OFF_ACTION,
   ROUTINE_MATCH_KIND,
@@ -188,7 +189,7 @@ export interface UseDeckResult {
    * own served co-equal choices (`holdChoicesFor`) — anything else is a no-op,
    * because a POST the wire never offered is a 400 in the operator's hand.
    */
-  affirmWith: (verb: string) => void;
+  affirmWith: (verb: string, target?: string) => void;
   reject: () => void;
   /** Defer the top card. No argument = the indefinite rung (a full ↑ swipe). */
   snooze: (action?: SnoozeAction) => void;
@@ -216,6 +217,23 @@ interface Pending {
   verdict: Verdict;
   restoreIndex: number;
   restoreSnooze: boolean;
+  // The open-set family's pick, sent as `correction_target`. Undefined for
+  // every static-family verdict, which is every pre-2026-08-20 kind.
+  target?: string;
+}
+
+/**
+ * The target the SUGGESTED member of an open-set family carries, or undefined
+ * when this item has no such family (every static-family kind).
+ *
+ * Derived through `holdChoicesForVerb` rather than by reading evidence here,
+ * so the plain affirm and the hold selector cannot disagree about what the
+ * proposal is — one derivation, two callers.
+ */
+function suggestedTargetFor(item: FeedItem, verb: string): string | undefined {
+  const choices = holdChoicesForVerb(item, verb);
+  if (!choices) return undefined;
+  return choices.find((c) => c.suggested)?.target;
 }
 
 export function useDeck(opts: UseDeckOptions): UseDeckResult {
@@ -365,7 +383,16 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   const dispatchAct = useCallback(
     (p: Pending) => {
       if (p.actionId === null) return; // set-aside → no POST
-      feedApi.act(p.item.id, p.actionId).then(
+      // The target is passed ONLY when there is one. `act(id, verb, undefined)`
+      // and `act(id, verb)` are identical to the function and NOT identical to
+      // its callers' pins, which assert the argument list — and the shipped
+      // consumers' pins must stay green UNMODIFIED, so the pre-existing call
+      // shape is preserved exactly for every static-family kind rather than
+      // widened for all of them to serve one new one.
+      (p.target === undefined
+        ? feedApi.act(p.item.id, p.actionId)
+        : feedApi.act(p.item.id, p.actionId, p.target)
+      ).then(
         (res) => {
           if (!res.ok) {
             // A refusal that arrived on a 2xx. The transport maps every current
@@ -446,7 +473,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   }, []);
 
   const commit = useCallback(
-    (verdict: Verdict, actionId: string | null, item: FeedItem) => {
+    (verdict: Verdict, actionId: string | null, item: FeedItem, target?: string) => {
       flushPending(); // fire the previous deferred act BEFORE starting a new one
       const restoreIndex = index;
       // Both defer verdicts set the card aside for the session; only their
@@ -460,7 +487,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
       }
       setConfirming(null);
       setIndex((i) => i + 1);
-      pendingRef.current = { item, actionId, verdict, restoreIndex, restoreSnooze: defers };
+      pendingRef.current = { item, actionId, verdict, restoreIndex, restoreSnooze: defers, target };
       setToast({
         message:
           verdict === 'snooze'
@@ -503,7 +530,14 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
       setConfirming({ id: current.id, verdict: 'affirm' });
       return;
     }
-    commit('affirm', verbs.affirm, current);
+    // An open-set card's plain affirm still NAMES its target: the server
+    // refuses an apply with no target rather than defaulting to the card's
+    // proposal, because defaulting would tell the operator their choice was
+    // taken while writing something they might not have picked. The suggested
+    // member IS the proposal, so the quick affirm's MEANING is unchanged —
+    // and on every static-family kind this resolves to undefined, which is
+    // exactly the payload those kinds sent before.
+    commit('affirm', verbs.affirm, current, suggestedTargetFor(current, verbs.affirm));
   }, [current, confirming, commit]);
 
   // The hold-selector's commit. Deliberately NOT routed through `affirm` (which
@@ -514,11 +548,19 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
   // arise here (a co-equal choice is light by the pattern's contract — the
   // selector IS the deliberate step), so there is no arm stage on this path.
   const affirmWith = useCallback(
-    (verb: string) => {
+    (verb: string, target?: string) => {
       if (!current) return;
       const choices = holdChoicesFor(current, 'affirm');
-      if (!choices || !choices.some((c) => c.verb === verb)) return;
-      commit('affirm', verb, current);
+      if (!choices) return;
+      // The guard matches on BOTH axes, because an open-set family's members
+      // all share ONE verb and are told apart only by target. Matching on the
+      // verb alone — which was sufficient while every family was static —
+      // would let a stale sheet post any target it still happened to hold.
+      const picked = choices.find(
+        (c) => c.verb === verb && (target === undefined ? !c.target : c.target === target),
+      );
+      if (!picked) return;
+      commit('affirm', verb, current, picked.target);
     },
     [current, commit],
   );
@@ -538,7 +580,14 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
       return;
     }
     if (verbs.affirm === null) return;
-    commit('affirm', verbs.affirm, current);
+    // An open-set card's plain affirm still NAMES its target: the server
+    // refuses an apply with no target rather than defaulting to the card's
+    // proposal, because defaulting would tell the operator their choice was
+    // taken while writing something they might not have picked. The suggested
+    // member IS the proposal, so the quick affirm's MEANING is unchanged —
+    // and on every static-family kind this resolves to undefined, which is
+    // exactly the payload those kinds sent before.
+    commit('affirm', verbs.affirm, current, suggestedTargetFor(current, verbs.affirm));
   }, [current, confirming, commit]);
 
   const cancelHeavy = useCallback(() => setConfirming(null), []);

@@ -128,6 +128,25 @@ class MocSuggestion:
     decided_at: str | None = None
     applied_at: str | None = None
     last_apply_error: str | None = None  #: set when applied→failed re-flip occurs
+    #: Members that now carry the membership — written THIS apply or already
+    #: citing the target. The PARTIAL-APPLY state (2026-08-20 ruling): a row
+    #: whose apply partly failed does NOT retire; it re-flips to ``pending``
+    #: with this list populated, so a retry skips what already landed and the
+    #: operator sees how far it got. Status stays ``pending`` rather than
+    #: gaining a fourth spelling — "still actionable" is exactly what pending
+    #: already means, and the existing ``accepted → pending`` re-flip was
+    #: designed for precisely the apply-failed case. Reading a partial row is
+    #: ``status == "pending" and applied_members`` (see :meth:`is_partial`).
+    #:
+    #: Additive with a default, so the load-time schema-tolerance filter
+    #: backfills it on every pre-2026-08-20 queue file — the existing backlog
+    #: loads unchanged rather than needing a migration.
+    applied_members: list[str] = field(default_factory=list)
+
+    @property
+    def is_partial(self) -> bool:
+        """A previous apply landed some members and failed others."""
+        return self.status == "pending" and bool(self.applied_members)
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-safe dict for queue persistence."""

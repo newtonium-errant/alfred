@@ -360,6 +360,14 @@ export interface HoldChoice {
   verb: string;
   label: string;
   suggested: boolean;
+  /**
+   * The chosen TARGET, for an open-set family (see `holdChoicesForVerb`'s
+   * dynamic arm). Absent on a static family, where the VERB is the choice.
+   * When present it rides to the server as `correction_target` alongside the
+   * one verb — the shape `action_router` already carries for
+   * (routine_match, correct).
+   */
+  target?: string;
 }
 
 /**
@@ -415,12 +423,70 @@ export function holdChoicesForVerb(item: FeedItem, anchorVerb: string): HoldChoi
   const anchor = served.find((a) => a.verb === anchorVerb);
   if (!anchor?.group) return null;
   const family = served.filter((a) => a.group === anchor.group);
-  if (family.length < 2) return null;
-  return family.map((a) => ({
-    verb: a.verb,
-    label: a.label,
-    suggested: a.verb === anchor.verb,
+  if (family.length >= 2) {
+    return family.map((a) => ({
+      verb: a.verb,
+      label: a.label,
+      suggested: a.verb === anchor.verb,
+    }));
+  }
+  // THE DYNAMIC ARM (the MOC reader, 2026-08-20) — the primitive's evolution
+  // to OPEN choice sets. Reached only when the STATIC family is too small to
+  // be one, so every existing consumer's derivation above is untouched: sort
+  // and the when-family both return from the branch above and never see this.
+  //
+  // WHY IT HAS TO EXIST. A static family's members ARE verb ids, drawn from
+  // the import-time `FEED_ACTIONS` ceiling, and `actions_for_item` only ever
+  // NARROWS that set. That is exactly right for a closed set (three slots,
+  // four backdate rungs) and cannot express an open one: the MOC targets are
+  // every non-inventory MOC in a vault that grows. A verb per MOC is not a
+  // ceiling entry, so the family rides as per-item DATA and the single verb
+  // carries the operator's pick as `correction_target` — the shape
+  // `action_router` chose for (routine_match, correct) and named in its own
+  // comment as the alternative to a verb-per-value.
+  //
+  // Same contract as the static arm in every other respect: the anchor is
+  // the SUGGESTED member, a family of one is still no family, and choosing
+  // IS the affirm (one interaction, no confirm stage).
+  const dynamic = dynamicChoices(item);
+  if (!dynamic || dynamic.length < 2) return null;
+  return dynamic.map((c) => ({
+    verb: anchor.verb,
+    label: c.label,
+    suggested: c.suggested,
+    target: c.target,
   }));
+}
+
+/**
+ * The per-item open-set choices, read from `evidence.moc_choices`.
+ *
+ * Kept private and shape-validated for the same reason `servedActions` is:
+ * `evidence` is relayed verbatim from the transport and nothing between here
+ * and the producer validates it, so a malformed entry is DROPPED rather than
+ * coerced — a choice we cannot read is a choice we must not offer.
+ *
+ * The field is read by NAME rather than by a generic "any array on evidence"
+ * rule: a card's evidence carries many arrays (members, cluster tags), and
+ * guessing which one is a choice list is exactly the private opinion about
+ * payloads the wire-derived design removed.
+ */
+function dynamicChoices(item: FeedItem): HoldChoice[] | null {
+  const raw: unknown = (item as { evidence?: Record<string, unknown> }).evidence?.moc_choices;
+  if (!Array.isArray(raw)) return null;
+  const out: HoldChoice[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.target !== 'string' || !e.target) continue;
+    out.push({
+      verb: '',
+      label: typeof e.label === 'string' && e.label ? e.label : e.target,
+      suggested: e.suggested === true,
+      target: e.target,
+    });
+  }
+  return out.length ? out : null;
 }
 
 /**

@@ -167,11 +167,16 @@ def upsert_proposals(
     Idempotency:
       * Existing non-pending entry (rejected / applied / archived)
         with matching id → no-op. Negative-learning preserved.
-      * Existing pending entry with matching id → refresh
-        ``cluster_id_at_proposal`` + ``cluster_tags`` +
-        ``reasoning`` (the forensic fields). ``created`` + ``id``
-        + ``cluster_member_paths`` + ``target_moc_rel_path`` stay
-        stable.
+      * Existing pending entry with matching id → refresh the
+        forensic fields: ``cluster_id_at_proposal``, ``cluster_tags``,
+        ``reasoning``, ``mapping_signal``, ``mapping_score`` AND
+        ``candidate_members_to_add`` (the last because members drop
+        out of the candidate set as they gain the target between
+        sweeps). ``created`` + ``id`` + ``cluster_member_paths`` +
+        ``target_moc_rel_path`` stay stable, and so does
+        ``applied_members`` — a refresh must never blank the record
+        of what an earlier partial apply landed, or the retry would
+        rewrite those members.
       * No existing entry → add (subject to caps).
 
     File-write strategy:
@@ -283,17 +288,28 @@ def update_status(
     new_status: str,
     *,
     last_apply_error: str | None = None,
+    applied_members: list[str] | None = None,
 ) -> bool:
     """Flip a single suggestion's status under exclusive lock.
 
-    D2 + bot accept/reject handlers consume this. Status transitions
-    permitted:
+    The deck's MOC-suggestion act consumes this (2026-08-20); the D2 bot
+    handlers that were its original callers died in the T5 deletion. Status
+    transitions permitted:
 
       pending → accepted
       accepted → applied         (vault_edit succeeded)
       accepted → pending         (apply failed; ``last_apply_error`` set)
       pending → rejected
       applied → archived         (compaction cron; future ship)
+
+    ``applied_members`` rides ALONG a transition rather than getting its own
+    entry point, because it is only ever written at the moment a status flips
+    on an apply outcome — a separate setter would be a second writer for one
+    fact. It is recorded on BOTH the success flip (``applied``) and the
+    partial re-flip (``pending``): on a partial the list is what makes the
+    retry idempotent, and on a success it is the record of what the apply
+    touched. Passing ``None`` leaves the existing value untouched, so a
+    reject/archive transition cannot silently blank it.
 
     Returns True on success; False if suggestion_id absent or
     transition denied. Full-rewrite under flock.
@@ -340,6 +356,8 @@ def update_status(
                     s.last_apply_error = None
                 if new_status == "pending" and last_apply_error is not None:
                     s.last_apply_error = last_apply_error
+                if applied_members is not None:
+                    s.applied_members = list(applied_members)
                 _rewrite_locked(qp, existing)
                 log.info(
                     "surveyor.moc_suggestion.status_updated",

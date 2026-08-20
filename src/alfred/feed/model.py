@@ -170,6 +170,11 @@ KIND_REMINDER_RETURNED = "reminder_returned"
 # feed package's import-free copy, and a test pins them equal.
 KIND_SORT_SUGGESTION = "sort_suggestion"
 
+# The MOC reader (2026-08-20). Named for the same reason as the kind above:
+# spelled outside ``alfred.feed`` by the brief (emits), the action router
+# (gates + dispatches) and the surveyor-side queue reader.
+KIND_MOC_SUGGESTION = "moc_suggestion"
+
 # The verb stamped on a retirement — an item marked ``acted`` by
 # :meth:`FeedStore.reconcile` because it left the producer's open set, NOT
 # because the operator judged it. Until this existed both outcomes appended a
@@ -197,7 +202,7 @@ KINDS: frozenset[str] = frozenset({
     "recurrence", "contract", "slot_suggestion", "routing", "health", "weather",
     "event", "ops_notable", "ticket_notice", "radar", "friction",
     "notegen_readout", "peer_digest", "pattern_surfaced",
-    KIND_REMINDER_RETURNED, KIND_SORT_SUGGESTION,
+    KIND_REMINDER_RETURNED, KIND_SORT_SUGGESTION, KIND_MOC_SUGGESTION,
 })
 
 # Static per-kind (mode, attention) defaults, seeded from the step-2 severity map
@@ -272,6 +277,22 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     # kind. That is honest — it IS still unsorted — but the defer verbs are the
     # intended "not now", and they are the ones that hold.
     KIND_SORT_SUGGESTION: (MODE_FYI, ATTENTION_FYI),
+    # The MOC reader (2026-08-20). QUIET FOR THE SAME MEASURED REASON as the
+    # rotation above, and the reasoning is worth repeating rather than
+    # cross-referencing because getting it wrong is silent: MODE_DECIDE rings
+    # the phone REGARDLESS of attention (``isNeedsYouItem`` is
+    # ``attention === 'needs_you' || mode === 'decide'``, and the push poller
+    # fetches on that predicate with no kind allowlist). There is no
+    # decide/fyi combination that stays silent. A suggestion the surveyor
+    # generated on its own schedule is the last thing that earns a doorbell.
+    #
+    # FYI costs this card NOTHING it needs, because it carries a co-equal
+    # choice group: ``isDeckCandidate`` admits a quiet card precisely when
+    # ``hasSuggestedChoice`` holds. That coupling is not incidental here — it
+    # is what makes the card exist at all, and the producer refuses to emit a
+    # row that cannot offer two targets rather than deal a verb onto a
+    # surface with no gesture.
+    KIND_MOC_SUGGESTION: (MODE_FYI, ATTENTION_FYI),
 }
 
 
