@@ -162,6 +162,14 @@ def snapshot_fingerprint(kind: str, evidence: dict[str, Any] | None) -> str | No
 # into a half-migration.
 KIND_REMINDER_RETURNED = "reminder_returned"
 
+# The sort rotation (2026-08-19). A NAMED constant for the same reason as the
+# kind above: three packages outside ``alfred.feed`` have to spell it — the
+# rotation selects (``tier.sort_rotation``), the brief emits
+# (``brief.feed_producer``) and the router gates (``daily_sync.action_router``).
+# The canonical spelling lives in ``tier.sort_rotation.SORT_KIND``; this is the
+# feed package's import-free copy, and a test pins them equal.
+KIND_SORT_SUGGESTION = "sort_suggestion"
+
 # The verb stamped on a retirement — an item marked ``acted`` by
 # :meth:`FeedStore.reconcile` because it left the producer's open set, NOT
 # because the operator judged it. Until this existed both outcomes appended a
@@ -189,7 +197,7 @@ KINDS: frozenset[str] = frozenset({
     "recurrence", "contract", "slot_suggestion", "routing", "health", "weather",
     "event", "ops_notable", "ticket_notice", "radar", "friction",
     "notegen_readout", "peer_digest", "pattern_surfaced",
-    KIND_REMINDER_RETURNED,
+    KIND_REMINDER_RETURNED, KIND_SORT_SUGGESTION,
 })
 
 # Static per-kind (mode, attention) defaults, seeded from the step-2 severity map
@@ -243,6 +251,27 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     "friction": (MODE_FYI, ATTENTION_FYI),
     "notegen_readout": (MODE_FYI, ATTENTION_FYI),
     "peer_digest": (MODE_FYI, ATTENTION_FYI),
+    # The sort rotation. A sort card ASKS the operator something, so by the
+    # seeding rule above it reads like a decide kind — and it is deliberately
+    # NOT one, for a measured reason rather than a preference.
+    #
+    # ``feedNeedsYou.isNeedsYouItem`` is ``attention === 'needs_you' || mode ===
+    # 'decide'`` (web), the push poller fetches by that predicate with NO kind
+    # allowlist, and the default ``needs_you`` policy admits everything it is
+    # handed. So MODE_DECIDE rings the phone REGARDLESS of attention: there is
+    # no decide/fyi combination that stays quiet. The operator killed the
+    # notification flood, and a backlog-grooming card is the last thing that
+    # earns a doorbell — it is work he chose to defer, by definition.
+    #
+    # FYI costs the card nothing it needs. ``isDeckDealt`` deals any non-slot
+    # kind that has a wired verb, whatever its mode, so the rotation still
+    # reaches the deck; ``attribution`` is the shipped precedent (FYI/FYI, three
+    # verbs, deck-dealt). What FYI DOES add is the universal ack
+    # (``action_router`` gates ack on ``mode == MODE_FYI``): acking a card that
+    # is still unslotted revives it on the next fire, because this is an episode
+    # kind. That is honest — it IS still unsorted — but the defer verbs are the
+    # intended "not now", and they are the ones that hold.
+    KIND_SORT_SUGGESTION: (MODE_FYI, ATTENTION_FYI),
 }
 
 
