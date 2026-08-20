@@ -4988,10 +4988,16 @@ async def _execute_tool(
             # ``rrts_intake`` scope, deterministically stamp the held-state
             # provenance + mint the file-time ticket_uid. These are NOT
             # LLM-set: ``origin`` / ``de_phi_status`` are infra provenance
-            # (the SovServ boundary marker), ``source: web`` records the web
-            # channel (the VERA SKILL keeps ``source`` Telegram-only and
-            # routes web provenance to ``origin`` — cross-agent contract
-            # 2026-06-29; ``source`` is a soft field, not gate-enforced),
+            # (the SovServ boundary marker), ``source: web`` records the
+            # vouched-widget lane (current cross-agent contract, post the
+            # 2026-08-18 Telegram retirement: the VERA SKILL teaches that
+            # the agent never sets ``source`` on any new ticket — the
+            # ``telegram-*`` values are retired history, never minted anew,
+            # and an ordinary web-chat ticket carries no ``source`` at all
+            # — so the widget lane's web provenance is stamped HERE, by the
+            # system at file-time; ``source`` stays a soft field in the
+            # ratified ticket contract, agent-writable at the gate and
+            # forbidden only by the SKILL's teaching, not gate-enforced),
             # ``reporter`` is the vouched name (provenance, never authz), and
             # ``ticket_uid`` is the pipeline dedupe key the forwarder REUSES
             # (never re-mints — see ticket_forward.run_forward_once). 🔒
