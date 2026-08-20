@@ -1517,6 +1517,21 @@ routine:
   state:
     path: "./data/routine_state.json"
     max_history: 30
+  # Global tier-window defaults for routine items. ALL optional — an absent
+  # key means no default, and existing per-item fields always win.
+  # tier_defaults:
+  #   escalate_at_days: 1           # due-window T1 default for items that opted
+  #   surface_at_days: 5            # into tiering but omit the specific field
+  #   # Fuel escalates to Duty after this many days without a completion.
+  #   # The operator's standing rule (ratified 2026-08-20), his words:
+  #   # "Fuel daily is important. Not adding that fuel three days in a row
+  #   # becomes a more critical issue." Applies ONLY to items the operator
+  #   # explicitly marked ``slot: fuel`` (never a classifier-derived slot);
+  #   # a per-item ``escalate_after_gap_days`` overrides; absent = no gap
+  #   # escalation on this instance. The escalated item VISITS Duty for the
+  #   # day — nothing is written to the record, and it returns to Fuel the
+  #   # moment a completion closes the gap.
+  #   fuel_escalate_after_gap_days: 3
 
 surveyor:
   watcher:

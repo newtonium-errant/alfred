@@ -217,6 +217,30 @@ class Item:
     ``routine.item_both_cadence_modes``. Parse-side we accept both;
     the precedence rule lives at the consumer.
 
+    FUEL-ESCALATION extension (2026-08-20, operator model ratified):
+      * ``escalate_after_gap_days`` — neglect-gap escalation threshold
+        for NO-deadline items (sibling of ``warn_after_gap_days``:
+        warn at gap N is an annotation; escalate at gap M is a tier
+        move). When ``days_since_last_completion >= M`` the item
+        classifies T1 and slots DUTY for the day (a visit — overlay
+        only, its home slot on the record is untouched). Below M the
+        item keeps its quiet behaviour (T3 cadence / self-care /
+        routine section). Deliberately DISTINCT from
+        ``escalate_at_days``, which is days-BEFORE-DUE on
+        ``due_pattern`` items — overloading one field with both
+        meanings was rejected scope-first; the pair
+        ``warn_after_gap_days`` / ``escalate_after_gap_days`` keeps
+        the gap axis symmetrical and the due axis unoverloaded.
+
+    ``escalate_after_gap_days`` + ``due_pattern`` both set is operator
+    confusion (a deadline item's doneness is cycle-based, so a raw
+    completion gap is undefined semantics there): ``due_pattern`` wins,
+    the gap field is ignored, and the aggregator voices a once-per-pass
+    ``routine.item_gap_escalation_with_due_pattern`` warn — same
+    validator pattern as ``routine.item_both_cadence_modes``. The full
+    field-combination table lives on
+    :func:`alfred.tier.compute.classify_routine_item`.
+
     See module docstring for the T1/T2 window math + the three
     operator-stated semantics combinations. The T3 soft-cadence
     surface is documented in
@@ -231,6 +255,10 @@ class Item:
     surface_at_days: int | None = None
     escalate_at_days: int | None = None
     target_cadence_days: int | None = None
+    # FUEL-ESCALATION (2026-08-20): neglect-gap escalation threshold for
+    # no-deadline items — see the class docstring. Default ``None`` per the
+    # dataclass-default extension backward-compat contract.
+    escalate_after_gap_days: int | None = None
     # Q2 (2026-06-26): the dedicated self-care lane. An item flagged
     # ``self_care: true`` surfaces to the T3 lane as an intrinsic
     # classification (not deadline-driven, never escalates) — the daily
@@ -312,6 +340,15 @@ class Item:
             )
         except (TypeError, ValueError):
             target_cadence_days = None
+        # FUEL-ESCALATION (2026-08-20): neglect-gap escalation threshold.
+        # Same defensive coercion as its siblings above.
+        gap_escalate_raw = data.get("escalate_after_gap_days")
+        try:
+            escalate_after_gap_days = (
+                int(gap_escalate_raw) if gap_escalate_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            escalate_after_gap_days = None
         # Q2 (2026-06-26): self_care flag → T3 lane. Shared coercion
         # (``_coerce_self_care``) so the truthy-string handling can't
         # drift across the three readers of the field.
@@ -325,6 +362,7 @@ class Item:
             surface_at_days=surface_at_days,
             escalate_at_days=escalate_at_days,
             target_cadence_days=target_cadence_days,
+            escalate_after_gap_days=escalate_after_gap_days,
             self_care=self_care,
             # Raw pass-through — validated by ``tier.slots.normalize_slot`` at
             # classification time, so a typo degrades to the structural rules
@@ -379,10 +417,23 @@ class TierDefaultsConfig:
 
     Both default ``None`` (no global default configured) — the opt-out
     semantics are then exactly as before this knob existed.
+
+    ``fuel_escalate_after_gap_days`` (FUEL-ESCALATION, 2026-08-20) is the
+    operator's standing rule as config: items whose EXPLICIT ``slot:`` is
+    ``fuel`` escalate to Duty after this many days without a completion.
+    His words, verbatim: "Fuel daily is important. Not adding that fuel
+    three days in a row becomes a more critical issue" — hence the
+    Salem-box value 3. A per-item ``escalate_after_gap_days`` always
+    overrides; ``None`` (absent config) = no default, so instances that
+    never configure it see zero behaviour change. Explicit-slot-only BY
+    DESIGN: the default is a standing rule about items the operator has
+    personally marked fuel, not about anything a classifier GUESSES is
+    fuel — a derived slot must never conscript an item into escalation.
     """
 
     escalate_at_days: int | None = None
     surface_at_days: int | None = None
+    fuel_escalate_after_gap_days: int | None = None
     # Board snooze store (R3). NOT parsed by from_raw — it lives under
     # ``tier.snooze.path``, not ``routine.tier_defaults`` — it is stamped on by
     # whoever loads the unified config (see brief/config.py).
@@ -419,6 +470,9 @@ class TierDefaultsConfig:
         return cls(
             escalate_at_days=_opt_int(block.get("escalate_at_days")),
             surface_at_days=_opt_int(block.get("surface_at_days")),
+            fuel_escalate_after_gap_days=_opt_int(
+                block.get("fuel_escalate_after_gap_days")
+            ),
         )
 
 

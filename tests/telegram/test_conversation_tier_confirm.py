@@ -310,7 +310,9 @@ async def test_confirm_preserves_valid_t1_source(tmp_path):
 def test_sanitize_source_vocab():
     """Unit: known vocab passes; everything else → operator."""
     for ok in ("auto-due", "auto-escalate", "auto-due-routine",
-               "auto-surface-routine", "auto-cadence-routine", "self-care", "operator"):
+               "auto-surface-routine", "auto-cadence-routine",
+               "auto-gap-escalated",  # FUEL-ESCALATION (2026-08-20)
+               "self-care", "operator"):
         assert sanitize_source(ok) == ok
     for bad in ("due today", "totally-invented", "", "  ", "rollover", "operator-adhoc"):
         assert sanitize_source(bad) == "operator"

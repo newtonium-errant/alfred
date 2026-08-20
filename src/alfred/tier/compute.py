@@ -182,26 +182,47 @@ class RoutineItemClassification:
         flag; the compute/render path reads it silently (it runs
         per-brief-fire + per-/today and would spam the log). The
         WARN-VOICING lives at the caller; the DECISION lives here.
+      * ``gap_escalated`` — ``True`` iff this T1 placement came from the
+        neglect-gap escalation (FUEL-ESCALATION, 2026-08-20) rather than
+        a due window. The slot classifier reads it (rule 0 → Duty visit);
+        the T1 surfaces read it to pick the ``auto-gap-escalated``
+        source and to accept the absent ``effective_due`` (a gap
+        escalation has no due date). Always ``False`` on every other
+        placement.
+      * ``gap_escalation_conflict`` — ``True`` when the item carries BOTH
+        ``due_pattern`` and a per-item ``escalate_after_gap_days`` (a
+        completion GAP is undefined semantics under cycle-based
+        doneness; ``due_pattern`` wins, the gap field is ignored). The
+        aggregator voices the once-per-pass
+        ``routine.item_gap_escalation_with_due_pattern`` warn on this
+        flag; compute/render paths read it silently — the exact
+        ``both_modes_conflict`` pattern, second instance.
     """
 
     tier: int | None
     reason: str | None = None
     effective_due: date | None = None
     both_modes_conflict: bool = False
+    gap_escalated: bool = False
+    gap_escalation_conflict: bool = False
 
 
-def _tier_default_values(tier_defaults: Any) -> tuple[int | None, int | None]:
-    """Extract ``(default_escalate_at_days, default_surface_at_days)`` from
-    a ``TierDefaultsConfig``-like object (or ``None``).
+def _tier_default_values(
+    tier_defaults: Any,
+) -> tuple[int | None, int | None, int | None]:
+    """Extract ``(default_escalate_at_days, default_surface_at_days,
+    default_fuel_escalate_after_gap_days)`` from a
+    ``TierDefaultsConfig``-like object (or ``None``).
 
     Duck-typed (``getattr``) so the compute layer doesn't import the
-    routine config dataclass — ``None`` → ``(None, None)`` (no defaults).
+    routine config dataclass — ``None`` → all-``None`` (no defaults).
     """
     if tier_defaults is None:
-        return None, None
+        return None, None, None
     return (
         getattr(tier_defaults, "escalate_at_days", None),
         getattr(tier_defaults, "surface_at_days", None),
+        getattr(tier_defaults, "fuel_escalate_after_gap_days", None),
     )
 
 
@@ -218,8 +239,65 @@ def classify_routine_item(
     self_care: bool = False,
     default_escalate_at_days: int | None = None,
     default_surface_at_days: int | None = None,
+    escalate_after_gap_days: int | None = None,
+    explicit_slot: Any = None,
+    default_fuel_escalate_after_gap_days: int | None = None,
 ) -> RoutineItemClassification:
     """Classify one routine item into a tier placement (T1/T2/T3/none).
+
+    Field-combination table (FUEL-ESCALATION, 2026-08-20 — scope-first;
+    every combination's behaviour, stated before the mechanism):
+
+    =============================================  ==============================
+    Fields on the item                             Behaviour
+    =============================================  ==============================
+    ``due_pattern`` + ``escalate_at_days`` (/       Deadline windows, days-BEFORE-
+    ``surface_at_days``)                            due: T1 ``[0, esc]`` (negative
+                                                    admitted), T2 ``(esc, surf]``.
+                                                    UNTOUCHED by this extension.
+    ``target_cadence_days`` only                    Soft cadence: T3 at gap >=
+                                                    target; never T1/T2 by itself.
+    ``warn_after_gap_days``                         Routine-section ANNOTATION
+                                                    threshold only (aggregator
+                                                    render); independent of every
+                                                    escalation axis, both ways.
+    ``escalate_after_gap_days`` (per-item)          Neglect-gap escalation on
+                                                    NO-``due_pattern`` items:
+                                                    gap >= M → tier 1 +
+                                                    ``gap_escalated=True`` (slot
+                                                    classifier rule 0 → Duty
+                                                    visit). Below M → the item's
+                                                    quiet behaviour, unchanged.
+    config ``fuel_escalate_after_gap_days``         Default M for items whose
+    (via ``default_fuel_escalate_after_gap_days``)  EXPLICIT ``slot:`` is fuel.
+                                                    Per-item value always wins;
+                                                    ``None`` = no default (zero
+                                                    change off-instance). Never
+                                                    applied to a derived slot.
+    ``escalate_after_gap_days`` + ``due_pattern``   INVALID combo: a completion
+                                                    gap is undefined under
+                                                    cycle-based doneness.
+                                                    ``due_pattern`` wins, gap
+                                                    field ignored,
+                                                    ``gap_escalation_conflict``
+                                                    flagged (aggregator voices
+                                                    the warn).
+    never-completed item + gap threshold            NO escalation (a gap needs a
+                                                    completion to measure from;
+                                                    a freshly-added fuel item
+                                                    must not open in Duty). The
+                                                    cadence branch still ranks
+                                                    it max-overdue in T3.
+    aspirational + gap threshold                    ESCALATES. The aspirational
+                                                    skip is about deadline
+                                                    pressure; the gap ruling is
+                                                    the operator's explicit word
+                                                    that neglected fuel becomes
+                                                    Duty, and fuel items are
+                                                    commonly aspirational —
+                                                    gating would kill the
+                                                    feature on its own targets.
+    =============================================  ==============================
 
     THE single window-math predicate for routine items. Encapsulates,
     in this order:
@@ -235,8 +313,22 @@ def classify_routine_item(
          rule, enforced once.
       2. **Both-modes precedence.** ``due_pattern`` + ``target_cadence_days``
          both set → ``due_pattern`` wins; ``both_modes_conflict=True`` so
-         the caller can emit the operator warn.
-      3. **T3 self-care branch** (``due_pattern`` absent, ``self_care``
+         the caller can emit the operator warn. Likewise
+         ``due_pattern`` + ``escalate_after_gap_days`` →
+         ``gap_escalation_conflict=True``, gap field ignored.
+      3. **Neglect-gap escalation** (``due_pattern`` absent, effective
+         gap threshold present): FUEL-ESCALATION, 2026-08-20. The
+         effective threshold is the per-item ``escalate_after_gap_days``,
+         else the config ``fuel_escalate_after_gap_days`` when the
+         item's EXPLICIT ``slot:`` normalises to fuel. When the item has
+         at least one completion and ``days_since >= threshold`` →
+         tier 1, ``gap_escalated=True``, reason
+         ``"neglected Nd (escalates at Md gap)"``. Fires BEFORE the
+         self-care and cadence branches so a neglected fuel item
+         escalates instead of surfacing quietly in T3; NOT gated by the
+         aspirational skip (see the field table). Never-completed items
+         do not escalate.
+      4. **T3 self-care branch** (``due_pattern`` absent, ``self_care``
          true): the dedicated self-care lane (operator decision Q2,
          2026-06-26). An intrinsic classification — NOT deadline-driven,
          never escalates. Surfaces to T3 when NOT completed today (the
@@ -245,12 +337,12 @@ def classify_routine_item(
          necessary." Composes with ``target_cadence_days``: a self_care
          item ALSO carrying a cadence target surfaces if EITHER overdue
          against cadence OR not-done-today.
-      4. **T3 soft-cadence branch** (``due_pattern`` absent,
+      5. **T3 soft-cadence branch** (``due_pattern`` absent,
          ``target_cadence_days`` present): surface (tier 3) when
          ``days_since_last_completed >= target_cadence_days`` (inclusive),
          OR when never completed (max overdue). Within window → no
          handoff (tier None).
-      5. **T1/T2 deadline branch** (``due_pattern`` + ``escalate_at_days``
+      6. **T1/T2 deadline branch** (``due_pattern`` + ``escalate_at_days``
          present): completion-aware suppression
          (``completion_satisfies_current_cycle``) → tier None; else
          overdue-retention-aware effective due → T1 when
@@ -284,6 +376,15 @@ def classify_routine_item(
     both_modes_conflict = (
         due_pattern is not None and target_cadence_days is not None
     )
+    # FUEL-ESCALATION (2026-08-20): a completion GAP is undefined semantics
+    # under cycle-based doneness (completion_satisfies_current_cycle owns
+    # "done" for deadline items), so a per-item gap threshold on a
+    # deadline-bearing item is operator confusion. due_pattern wins; the
+    # aggregator voices the warn on this flag (same pattern as
+    # both_modes_conflict, one line up).
+    gap_escalation_conflict = (
+        due_pattern is not None and escalate_after_gap_days is not None
+    )
 
     # ---- Aspirational skip (T1/T2 only) --------------------------
     # An aspirational item with due_pattern does NOT take the T1/T2
@@ -291,6 +392,69 @@ def classify_routine_item(
     # deadline-driven work). It still falls through to the T3 branch
     # below if it carries target_cadence_days.
     aspirational = (priority or "").lower() == "aspirational"
+
+    # ---- Neglect-gap escalation (FUEL-ESCALATION, 2026-08-20) ----
+    # The operator's model, his words: "Fuel and rhythm are equals, and
+    # Duty is mostly for anything that is escalated from either of those"
+    # + "Not adding that fuel three days in a row becomes a more critical
+    # issue." Mechanism: on a NO-deadline item, when the completion gap
+    # reaches the effective threshold, the item classifies T1 and carries
+    # ``gap_escalated=True`` — the slot classifier's rule 0 then slots it
+    # Duty for the day (a VISIT: overlay only, recomputed every
+    # projection; the record's own slot is untouched and the item goes
+    # home the moment the gap closes).
+    #
+    # Placed BEFORE the self-care and cadence branches on purpose: both
+    # would otherwise answer T3 first and the escalation would be
+    # unreachable. NOT gated by the aspirational skip — that skip is
+    # about deadline pressure, and fuel items are commonly aspirational
+    # (gating here would kill the feature on exactly its targets; see
+    # the field table). Never-completed items never escalate: a gap
+    # needs a completion to measure from, and a freshly-added fuel item
+    # must not open in Duty (the cadence branch still ranks it
+    # max-overdue in T3).
+    if due_pattern is None:
+        gap_threshold = escalate_after_gap_days
+        if (
+            gap_threshold is None
+            and default_fuel_escalate_after_gap_days is not None
+            and slots.normalize_slot(explicit_slot, warn_unrecognized=False)
+            == slots.SLOT_FUEL
+        ):
+            # The config default reaches ONLY items the operator
+            # explicitly marked ``slot: fuel`` — never a derived slot
+            # (a guess must not conscript an item into escalation).
+            # Quiet normalisation: this predicate is contractually
+            # no-log; the SAME raw value is read loudly by
+            # ``classify_slot`` (rule 1) in the same projection, so a
+            # typo still warns exactly once.
+            gap_threshold = default_fuel_escalate_after_gap_days
+        if isinstance(gap_threshold, int) and gap_threshold > 0:
+            log_dict = (
+                completion_log if isinstance(completion_log, dict) else {}
+            )
+            gap_completion_dates = _parse_item_completion_dates(
+                log_dict.get(item_text, [])
+            )
+            if gap_completion_dates:
+                days_since = (today - max(gap_completion_dates)).days
+                if days_since < 0:
+                    # Future-dated completion (operator hand-edit) → clamp,
+                    # mirroring the cadence branch below.
+                    days_since = 0
+                if days_since >= gap_threshold:
+                    return RoutineItemClassification(
+                        tier=1,
+                        # Stable contract string (new member of the reason
+                        # vocabulary): change here = update the brief render
+                        # + SKILL quoting in lockstep, per the module rule.
+                        reason=(
+                            f"neglected {days_since}d "
+                            f"(escalates at {gap_threshold}d gap)"
+                        ),
+                        both_modes_conflict=both_modes_conflict,
+                        gap_escalated=True,
+                    )
 
     # ---- T3 self-care branch (Q2, 2026-06-26) --------------------
     # The dedicated self-care lane: a non-deadline item flagged
@@ -375,9 +539,14 @@ def classify_routine_item(
             surface_at_days = default_surface_at_days
 
     # ---- T1/T2 deadline branch -----------------------------------
+    # From here down every return threads ``gap_escalation_conflict``:
+    # the flag requires ``due_pattern``, so the T3-region returns above
+    # provably carry its default False, while any deadline-region exit
+    # may be the one the aggregator reads the warn flag from.
     if due_pattern is None or escalate_at_days is None:
         return RoutineItemClassification(
             tier=None, both_modes_conflict=both_modes_conflict,
+            gap_escalation_conflict=gap_escalation_conflict,
         )
     if aspirational:
         # Aspirational + deadline-bearing: never T1/T2. (No T3 either —
@@ -386,6 +555,7 @@ def classify_routine_item(
         # section.)
         return RoutineItemClassification(
             tier=None, both_modes_conflict=both_modes_conflict,
+            gap_escalation_conflict=gap_escalation_conflict,
         )
 
     # Phase 2C C1 completion-aware suppression: a completion covering
@@ -397,6 +567,7 @@ def classify_routine_item(
     ):
         return RoutineItemClassification(
             tier=None, both_modes_conflict=both_modes_conflict,
+            gap_escalation_conflict=gap_escalation_conflict,
         )
 
     # Phase 2C C1 overdue retention: effective_due = prev_due when the
@@ -407,6 +578,7 @@ def classify_routine_item(
     if effective_due is None:
         return RoutineItemClassification(
             tier=None, both_modes_conflict=both_modes_conflict,
+            gap_escalation_conflict=gap_escalation_conflict,
         )
     days_to_due = (effective_due - today).days
 
@@ -427,6 +599,7 @@ def classify_routine_item(
             reason=reason,
             effective_due=effective_due,
             both_modes_conflict=both_modes_conflict,
+            gap_escalation_conflict=gap_escalation_conflict,
         )
     if (
         surface_at_days is not None
@@ -438,9 +611,11 @@ def classify_routine_item(
             reason=f"surface window ({days_to_due}d before due)",
             effective_due=effective_due,
             both_modes_conflict=both_modes_conflict,
+            gap_escalation_conflict=gap_escalation_conflict,
         )
     return RoutineItemClassification(
         tier=None, both_modes_conflict=both_modes_conflict,
+        gap_escalation_conflict=gap_escalation_conflict,
     )
 
 
@@ -530,6 +705,12 @@ class AutoT1Candidate:
     # producer stamps it into slot evidence; the serve side filters the
     # ``done_Nd`` rungs by it so no offered rung can refuse when pressed.
     backdate_limit_days: int = 0
+    # --- neglect-gap escalation (FUEL-ESCALATION, 2026-08-20) ----------------
+    # ``True`` iff this T1 candidacy came from ``classify_routine_item``'s
+    # gap branch (no due date — ``due_iso`` is ""). Threaded onto the
+    # TierEntry so the slot classifier's rule 0 sends the item visiting
+    # Duty and the view stamps the ``auto-gap-escalated`` source.
+    gap_escalated: bool = False
 
 
 def compute_auto_t1_candidates(
@@ -865,7 +1046,9 @@ def _compute_auto_routine(
             # all live in ``classify_routine_item`` — the SAME predicate
             # the aggregator's ``_decide_tier_handoff`` now delegates to.
             # No hand-mirrored copy here; the two layers cannot drift.
-            _def_esc, _def_surf = _tier_default_values(tier_defaults)
+            _def_esc, _def_surf, _def_fuel_gap = _tier_default_values(
+                tier_defaults,
+            )
             classification = classify_routine_item(
                 priority=item.priority,
                 due_pattern=item.due_pattern,
@@ -878,20 +1061,30 @@ def _compute_auto_routine(
                 self_care=item.self_care,
                 default_escalate_at_days=_def_esc,
                 default_surface_at_days=_def_surf,
+                escalate_after_gap_days=item.escalate_after_gap_days,
+                explicit_slot=item.slot,
+                default_fuel_escalate_after_gap_days=_def_fuel_gap,
             )
 
             want_tier = 1 if window == "t1" else 2
             if classification.tier != want_tier:
                 continue
-            # T1/T2 classifications always carry a reason + effective_due
-            # (the classifier only omits them for T3 / no-handoff).
+            # T1/T2 classifications always carry a reason; a due date is
+            # guaranteed except for the one T1 shape that HAS none — the
+            # neglect-gap escalation (FUEL-ESCALATION, 2026-08-20), which
+            # surfaces with ``due_iso=""`` like the self-care lane.
             assert classification.reason is not None
-            assert classification.effective_due is not None
+            assert (
+                classification.effective_due is not None
+                or classification.gap_escalated
+            )
 
             # Backdated-completion depth (2026-08-20): the credit window's
             # reach, from the SAME recurrence arithmetic the classifier
             # credits by (one owner — alfred.routine.recurrence). Lazy import
-            # beside ``Item`` for the same circular-hazard reason.
+            # beside ``Item`` for the same circular-hazard reason. A
+            # gap-escalated item has no due_pattern → window None → 0
+            # (measured: ``backdate_credit_window(None, ...) is None``).
             from alfred.routine.due import backdate_credit_window
 
             credit_window = backdate_credit_window(
@@ -904,7 +1097,11 @@ def _compute_auto_routine(
             candidates.append(AutoT1Candidate(
                 path=rel_path,
                 name=item.text,
-                due_iso=classification.effective_due.isoformat(),
+                due_iso=(
+                    classification.effective_due.isoformat()
+                    if classification.effective_due is not None
+                    else ""
+                ),
                 surface_reason=classification.reason,
                 origin="routine",
                 routine_record=record_name,
@@ -916,6 +1113,7 @@ def _compute_auto_routine(
                 explicit_slot=item.slot,
                 has_due_pattern=item.due_pattern is not None,
                 backdate_limit_days=backdate_limit,
+                gap_escalated=classification.gap_escalated,
             ))
 
     candidates.sort(key=lambda c: (c.due_iso, c.name.lower()))
@@ -1068,10 +1266,21 @@ class AutoT3Candidate:
 
 def compute_auto_t3_candidates(
     vault_path: Path, now: datetime,
+    tier_defaults: Any = None,
 ) -> list[AutoT3Candidate]:
     """Walk ``vault/routine/*.md`` and return routine items
     auto-suggesting as T3 candidates (overdue against their soft
     cadence target).
+
+    ``tier_defaults`` (FUEL-ESCALATION, 2026-08-20): the SAME defaults
+    bundle the T1/T2 surfaces read, threaded here so this surface sees
+    the SAME classification. A fuel item at/past its escalation gap
+    classifies tier 1 in the shared predicate, and this surface's
+    ``tier != 3`` gate then excludes it — without the threading it
+    would classify 3 HERE and 1 THERE, double-rendering the item and
+    breaking the exactly-one-lane invariant. (The due-window defaults
+    in the bundle remain inert on this surface: the cadence branch
+    never reads them.)
 
     Filter logic (in this exact order — short-circuits on first
     rejection per item):
@@ -1162,6 +1371,9 @@ def compute_auto_t3_candidates(
             # surface gate, then compute the sort-only metadata
             # (``days_since`` / ``overdue_ratio``) locally; those fields
             # aren't part of the handoff decision so they stay here.
+            _def_esc, _def_surf, _def_fuel_gap = _tier_default_values(
+                tier_defaults,
+            )
             classification = classify_routine_item(
                 priority=item.priority,
                 due_pattern=item.due_pattern,
@@ -1172,6 +1384,11 @@ def compute_auto_t3_candidates(
                 item_text=item.text,
                 today=today_local,
                 self_care=item.self_care,
+                default_escalate_at_days=_def_esc,
+                default_surface_at_days=_def_surf,
+                escalate_after_gap_days=item.escalate_after_gap_days,
+                explicit_slot=item.slot,
+                default_fuel_escalate_after_gap_days=_def_fuel_gap,
             )
             if classification.tier != 3:
                 continue
@@ -1237,9 +1454,17 @@ def compute_auto_t3_candidates(
 
 def compute_self_care_candidates(
     vault_path: Path, now: datetime,
+    tier_defaults: Any = None,
 ) -> list[AutoT1Candidate]:
     """Walk ``vault/routine/*.md`` and return ``self_care``-flagged items
     that surface to the T3 self-care lane (Q2, 2026-06-26).
+
+    ``tier_defaults`` (FUEL-ESCALATION, 2026-08-20): threaded for the
+    same exactly-one-lane reason as
+    :func:`compute_auto_t3_candidates` — a self-care fuel item at/past
+    its escalation gap classifies tier 1 in the shared predicate, and
+    this surface's ``tier != 3`` gate excludes it rather than
+    double-rendering it as the daily floor.
 
     The dedicated self-care lane: items flagged ``self_care: true`` (no
     ``due_pattern``) surface to T3 when not completed today — the daily
@@ -1301,6 +1526,9 @@ def compute_self_care_candidates(
             # this surface is the self_care-ONLY (no-cadence) floor.
             if item.target_cadence_days is not None:
                 continue
+            _def_esc, _def_surf, _def_fuel_gap = _tier_default_values(
+                tier_defaults,
+            )
             classification = classify_routine_item(
                 priority=item.priority,
                 due_pattern=item.due_pattern,
@@ -1311,6 +1539,11 @@ def compute_self_care_candidates(
                 item_text=item.text,
                 today=today_local,
                 self_care=item.self_care,
+                default_escalate_at_days=_def_esc,
+                default_surface_at_days=_def_surf,
+                escalate_after_gap_days=item.escalate_after_gap_days,
+                explicit_slot=item.slot,
+                default_fuel_escalate_after_gap_days=_def_fuel_gap,
             )
             if classification.tier != 3:
                 continue
@@ -1633,6 +1866,15 @@ class TierEntry:
     # curated entry). The feed producer copies it into slot evidence; the
     # serve side filters the ``done_Nd`` rungs by it.
     backdate_limit_days: int = 0
+    # --- neglect-gap escalation (FUEL-ESCALATION, 2026-08-20) ----------------
+    # ``True`` iff this row's T1 placement came from the neglect-gap
+    # escalation. The slot classifier's rule 0 reads it (Duty visit,
+    # outranking the record's own ``slot: fuel`` — see tier/slots.py's
+    # precedence note). Like ``backdate_limit_days`` it is a FACT about the
+    # item's current completion state, so the view stamps it onto the curated
+    # copy of the same item too — an accepted escalation stays in Duty while
+    # the gap persists and goes home when it closes.
+    gap_escalated: bool = False
 
 
 @dataclass
@@ -1808,11 +2050,19 @@ def compute_today_view(
     auto_t2_routine = compute_auto_routine_t2_candidates(
         vault_path, now, tier_defaults,
     )
-    auto_t3_routine = compute_auto_t3_candidates(vault_path, now)
+    # ``tier_defaults`` threaded (FUEL-ESCALATION, 2026-08-20) so the T3 +
+    # self-care surfaces see the SAME classification the T1 surface does —
+    # an escalated fuel item excludes itself from T3 here rather than
+    # double-rendering (exactly-one-lane invariant).
+    auto_t3_routine = compute_auto_t3_candidates(vault_path, now, tier_defaults)
     # Q2 (2026-06-26): self_care-flagged items (no cadence target) →
     # the dedicated T3 self-care lane (daily floor). Both routine-item
-    # and task origins.
-    self_care_routine = compute_self_care_candidates(vault_path, now)
+    # and task origins. (Gap escalation never fires for TASK origins:
+    # completion gaps are measured from a routine record's
+    # ``completion_log``, which tasks do not have.)
+    self_care_routine = compute_self_care_candidates(
+        vault_path, now, tier_defaults,
+    )
     self_care_task = compute_self_care_task_candidates(vault_path, now)
     # Phase 2c+h: snooze returns and waiting-chases whose reminder has
     # fired and not been acted on. Without this THREADING the reader
@@ -1857,11 +2107,14 @@ def compute_today_view(
         auto_reason_by_t1_key[k] = c.surface_reason
         auto_due_by_t1_key[k] = c.due_iso
     auto_backdate_by_t1_key: dict[str, int] = {}
+    auto_gap_escalated_t1_keys: set[str] = set()
     for c in auto_t1_routine:
         k = _routine_key(c.routine_record, c.item_text)
         auto_reason_by_t1_key[k] = c.surface_reason
         auto_due_by_t1_key[k] = c.due_iso
         auto_backdate_by_t1_key[k] = c.backdate_limit_days
+        if c.gap_escalated:
+            auto_gap_escalated_t1_keys.add(k)
 
     # 1. Curated entries first (authoritative). Annotate with the auto
     # reason/due when the same item also auto-surfaces (so the render is
@@ -1880,6 +2133,11 @@ def compute_today_view(
                 # the operator's accept-then-backdate flow lives on exactly
                 # this entry (an accepted candidate re-projects as curated).
                 entry.backdate_limit_days = auto_backdate_by_t1_key.get(k, 0)
+                # Same unconditional stamp for the neglect-escalation fact
+                # (FUEL-ESCALATION): an ACCEPTED escalated item re-projects
+                # as curated, and without this it would fall back to its
+                # home slot mid-neglect. False the moment the gap closes.
+                entry.gap_escalated = k in auto_gap_escalated_t1_keys
                 t1.append(entry)
                 t1_keys.add(k)
         for e in curation.t2:
@@ -1947,7 +2205,10 @@ def compute_today_view(
         ))
         t1_keys.add(key)
 
-    # 3. Auto-T1 routine candidates.
+    # 3. Auto-T1 routine candidates. A neglect-gap escalation carries its
+    # own source (distinct provenance: "Duty because neglected" and "Duty
+    # because due" are different claims — the #102 distinct-ids rule) and
+    # the ``gap_escalated`` fact the slot classifier's rule 0 reads.
     for c in auto_t1_routine:
         key = _routine_key(c.routine_record, c.item_text)
         if key in t1_keys:
@@ -1955,11 +2216,16 @@ def compute_today_view(
         t1.append(TierEntry(
             tier=1, origin="routine_item", name=c.name, path=c.path,
             due_iso=c.due_iso, surface_reason=c.surface_reason,
-            source="auto-due-routine", confirmed=False,
+            source=(
+                "auto-gap-escalated" if c.gap_escalated
+                else "auto-due-routine"
+            ),
+            confirmed=False,
             routine_record=c.routine_record, item_text=c.item_text,
             self_care=c.self_care, explicit_slot=c.explicit_slot,
             has_due_pattern=c.has_due_pattern,
             backdate_limit_days=c.backdate_limit_days,
+            gap_escalated=c.gap_escalated,
         ))
         t1_keys.add(key)
 
@@ -2364,12 +2630,13 @@ def _collect_routine_today(
         _iter_routine_records,
     )
 
-    _def_esc, _def_surf = _tier_default_values(tier_defaults)
+    _def_esc, _def_surf, _def_fuel_gap = _tier_default_values(tier_defaults)
     records = _iter_routine_records(vault_path)
     items, _contributing, _critical = _collect_items_for_today(
         records, today, quiet=True,
         default_escalate_at_days=_def_esc,
         default_surface_at_days=_def_surf,
+        default_fuel_escalate_after_gap_days=_def_fuel_gap,
     )
     out: list[RoutineLine] = []
     for it in items:

@@ -134,6 +134,10 @@ T1_T2_SOURCES: frozenset[str] = frozenset({
     "auto-escalate",
     "auto-due-routine",
     "auto-surface-routine",
+    # FUEL-ESCALATION (2026-08-20): a confirmed gap-escalated T1 persists
+    # its original auto source into the curation block (the T1 confirm
+    # contract), so the loader must know it or log spurious drift.
+    "auto-gap-escalated",
     "operator",
     "rollover",
 })

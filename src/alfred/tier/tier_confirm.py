@@ -110,6 +110,9 @@ KNOWN_CONFIRM_SOURCES: frozenset[str] = frozenset({
     "auto-due-routine",
     "auto-surface-routine",
     "auto-cadence-routine",
+    # FUEL-ESCALATION (2026-08-20): a confirmed T1 preserves its original
+    # auto source, so the gap-escalation source must be confirmable.
+    "auto-gap-escalated",
     "self-care",
     _COMMITTED_SOURCE,  # "operator"
 })
