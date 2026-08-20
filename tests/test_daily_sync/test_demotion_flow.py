@@ -50,7 +50,28 @@ from alfred.feed.model import (
     MODE_DECIDE,
 )
 
-NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+# DERIVED FROM WALL CLOCK, never a literal — every contest row in this file
+# hangs off NOW, and the window that judges those rows is evaluated against
+# REAL time, not a fixture instant: `demotion_proposals_section` →
+# `build_batch` → `run_trigger(config)` with NO `now=` (demotion_section.py)
+# → `attribution_quality_stats(..., now=None)` → `when = now or
+# datetime.now(timezone.utc)` (attribution_quality.py) — the same unthreaded
+# funnel as the attribution quality-line provider. The first draft froze NOW
+# at 2026-08-10T12:00Z with rows 1–3 days back, a dated suite regression set
+# to red at 2026-08-22T12:00Z, when the 2026-08-08 row's exit from the
+# 14-day wall-clock window would drop the contest count below threshold 2
+# and 12 of these tests would fail over CORRECT production behavior.
+# Derived, the offsets keep their meaning forever: days 1–3 sit inside the
+# 14-day window, days 30–31 outside. Windows in wall-clock-predicate tests
+# are derived, never literal (gate rule, 2026-08-19).
+#
+# A function rather than a module constant ON PURPOSE: the derivation must
+# read the SAME clock the predicate reads, at the same altitude — call time.
+# A module-level `NOW = datetime.now(...)` binds at import, and any clock
+# instrumentation that starts after import (freezegun census drives — see
+# the lane-clock-bombs commit body) splits the two reads apart again.
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _config(tmp_path: Path, *, threshold: int = 2, window: int = 14) -> DailySyncConfig:
@@ -101,7 +122,7 @@ def test_the_section_renders_nothing_and_logs_why_on_a_healthy_instance(
     """The steady state. ILB lives in the trigger event, not in a daily
     "nothing pending" line the operator would learn to skip past."""
     cfg = _config(tmp_path)
-    _contest(cfg, marker="m1", when=NOW - timedelta(days=1), via="timeout_24h")
+    _contest(cfg, marker="m1", when=_now() - timedelta(days=1), via="timeout_24h")
 
     with structlog.testing.capture_logs() as captured:
         body = demotion_section.demotion_proposals_section(cfg, date(2026, 8, 10))
@@ -129,7 +150,7 @@ def test_raising_the_card_moves_no_tier_and_touches_nothing_else(
     """
     cfg = _config(tmp_path, threshold=2)
     for i in range(3):
-        _contest(cfg, marker=f"m{i}", when=NOW - timedelta(days=i + 1),
+        _contest(cfg, marker=f"m{i}", when=_now() - timedelta(days=i + 1),
                  via="timeout_24h")
     before = {p for p in tmp_path.rglob("*") if p.is_file()}
 
@@ -187,7 +208,7 @@ def test_enough_contests_produce_a_numbered_card_naming_the_evidence(
     act of faith."""
     cfg = _config(tmp_path, threshold=2)
     for i in range(3):
-        _contest(cfg, marker=f"m{i}", when=NOW - timedelta(days=i + 1),
+        _contest(cfg, marker=f"m{i}", when=_now() - timedelta(days=i + 1),
                  via="timeout_24h")
 
     body = demotion_section.demotion_proposals_section(
@@ -214,7 +235,7 @@ def test_only_timeout_confirms_count_toward_the_card(tmp_path: Path) -> None:
     """
     cfg = _config(tmp_path, threshold=2)
     for i, via in enumerate(("operator", "backfill", "")):
-        _contest(cfg, marker=f"m{i}", when=NOW - timedelta(days=i + 1), via=via)
+        _contest(cfg, marker=f"m{i}", when=_now() - timedelta(days=i + 1), via=via)
 
     assert demotion_section.demotion_proposals_section(cfg, date(2026, 8, 10)) is None
     assert demotion_section.consume_last_batch() == []
@@ -223,7 +244,7 @@ def test_only_timeout_confirms_count_toward_the_card(tmp_path: Path) -> None:
 def test_contests_outside_the_window_do_not_raise_a_card(tmp_path: Path) -> None:
     cfg = _config(tmp_path, threshold=2, window=14)
     for i in range(4):
-        _contest(cfg, marker=f"old{i}", when=NOW - timedelta(days=30 + i),
+        _contest(cfg, marker=f"old{i}", when=_now() - timedelta(days=30 + i),
                  via="timeout_24h")
     assert demotion_section.demotion_proposals_section(cfg, date(2026, 8, 10)) is None
 
@@ -264,7 +285,7 @@ def test_the_section_registers_at_24_directly_above_attribution() -> None:
 def _pending_item(cfg: DailySyncConfig, num: int = 7) -> dict[str, Any]:
     """Raise a real proposal through the section, return its numbered item."""
     for i in range(3):
-        _contest(cfg, marker=f"m{i}", when=NOW - timedelta(days=i + 1),
+        _contest(cfg, marker=f"m{i}", when=_now() - timedelta(days=i + 1),
                  via="timeout_24h")
     demotion_section.demotion_proposals_section(cfg, date(2026, 8, 10), start_index=num)
     items = demotion_section.consume_last_batch()

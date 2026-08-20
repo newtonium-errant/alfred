@@ -58,16 +58,33 @@ def _rows(path: Path, rows: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
 
-def _row(action: str, *, days_ago: float = 1, via: str = "", section: str = "") -> dict:
+def _row(
+    action: str,
+    *,
+    days_ago: float = 1,
+    via: str = "",
+    section: str = "",
+    base: datetime = NOW,
+) -> dict:
+    """``base`` is the clock the row's offsets hang from.
+
+    The default (the frozen fixture ``NOW``) is correct ONLY for tests that
+    thread ``now=NOW`` into ``attribution_quality_stats`` — there the fixture
+    clock and the row clock are the same clock and the dates cancel out. The
+    provider tests must pass ``base=datetime.now(timezone.utc)`` instead,
+    because their window is judged by WALL CLOCK (see the comments at those
+    tests). A frozen-``NOW`` row handed to a wall-clock predicate is a dated
+    suite regression: it detonates the day real time crosses the cutoff.
+    """
     return {
         "type": f"attribution_{action}",
         "marker_id": f"m-{action}-{days_ago}-{via}-{section}",
         "record_path": "session/A.md",
         "agent": "salem",
         "section_title": "Structured Summary",
-        "marker_date": _iso(NOW - timedelta(days=days_ago + 1)),
+        "marker_date": _iso(base - timedelta(days=days_ago + 1)),
         "andrew_action": action,
-        "action_at": _iso(NOW - timedelta(days=days_ago)),
+        "action_at": _iso(base - timedelta(days=days_ago)),
         "confirmed_via": via,
         "section": section,
     }
@@ -274,7 +291,21 @@ def test_the_section_provider_renders_the_line_end_to_end(tmp_path: Path) -> Non
     vault = tmp_path / "vault"
     (vault / "note").mkdir(parents=True)
     corpus = tmp_path / "corpus.jsonl"
-    _rows(corpus, [_row("auto_confirm", days_ago=1, via="timeout_24h")])
+    # DERIVED FROM WALL CLOCK, never the frozen fixture NOW — the provider's
+    # window is judged by REAL time, not this file's NOW:
+    # `attribution_audit_section` calls `attribution_quality_stats(corpus_path,
+    # window_days=window)` with NO `now=` (attribution_section.py — the
+    # provider has no clock parameter at all), so the helper falls through to
+    # `when = now or datetime.now(timezone.utc)` (attribution_quality.py).
+    # The first draft hung this row off frozen NOW (2026-08-09T12:00Z), a
+    # dated suite regression set to red at 2026-08-23T12:00Z when the 14-day
+    # wall-clock cutoff crossed it. Windows in wall-clock-predicate tests are
+    # derived, never literal (gate rule, 2026-08-19; third instance fixed
+    # 2026-08-20).
+    _rows(corpus, [
+        _row("auto_confirm", days_ago=1, via="timeout_24h",
+             base=datetime.now(timezone.utc)),
+    ])
 
     cfg = DailySyncConfig(enabled=True, batch_size=5)
     cfg.state.path = str(tmp_path / "state.json")
@@ -299,7 +330,20 @@ def test_the_config_window_reaches_the_provider(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     (vault / "note").mkdir(parents=True)
     corpus = tmp_path / "corpus.jsonl"
-    _rows(corpus, [_row("contest", days_ago=20, via="timeout_24h")])
+    # DERIVED FROM WALL CLOCK, never the frozen fixture NOW — same real-clock
+    # chain as the e2e test above (`attribution_audit_section` →
+    # `attribution_quality_stats(..., window_days=window)` with no `now=` →
+    # `when = now or datetime.now(timezone.utc)`, attribution_quality.py).
+    # This row at wall-now minus 20d sits OUTSIDE the 14-day window and INSIDE
+    # the 30-day one — the offsets the knob test needs — forever. The first
+    # draft hung it off frozen NOW (action_at 2026-07-21T12:00Z), and the
+    # 30-day wall-clock cutoff crossed it at 2026-08-20T12:00Z: the fired bomb
+    # this lane was opened for. Windows in wall-clock-predicate tests are
+    # derived, never literal (gate rule, 2026-08-19).
+    _rows(corpus, [
+        _row("contest", days_ago=20, via="timeout_24h",
+             base=datetime.now(timezone.utc)),
+    ])
 
     def _render(window: int) -> str:
         cfg = DailySyncConfig(enabled=True, batch_size=5)
