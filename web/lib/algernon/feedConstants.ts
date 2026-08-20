@@ -70,6 +70,11 @@ export function swipeActsFor(verbs: DeckVerbs | null, verdict: Verdict): boolean
 // over (STAMP_FADE_START → SNOOZE_Y_THRESHOLD). Holding where the stamp is
 // already visible is what makes the affordance self-explanatory — the operator
 // is looking at the word Snooze when the menu arrives.
+//
+// The FAMILY clock: the #14 hold turned out to be the first member of the
+// affirm-with-hold-modifier family, and GESTURE_HOLD_MS (below) ALIASES this
+// constant — one number serves every hold, and this name stays for its
+// existing consumers.
 export const SNOOZE_HOLD_MS = 450;
 // How far the finger may drift and still count as "held". Generous enough for a
 // thumb that isn't a tripod, tight enough that a slow full swipe reads as a
@@ -90,6 +95,49 @@ export function inSnoozeHoldBand(dx: number, dy: number): boolean {
 export function stampOpacity(distance: number): number {
   if (distance <= STAMP_FADE_START) return 0;
   return Math.min((distance - STAMP_FADE_START) / STAMP_FADE_RANGE, 1);
+}
+
+// --- the gesture hold band, direction-general (affirm-with-hold-modifier) -----
+// The platform pattern the operator ratified 2026-08-19: a gesture commits its
+// DEFAULT on release, and HOLDING a partial swipe in the band where that
+// gesture's stamp is already fading in opens the alternatives — "affirm as
+// suggested, or swipe hold to change the suggestion while affirming".
+//
+// DIRECTION IS A PARAMETER, not baked-in affirm-ness: the same band shape holds
+// on every axis (primary-axis distance between STAMP_FADE_START and that axis's
+// commit threshold, cross-axis drift bounded). Only the AFFIRM direction is
+// WIRED this lane; 'reject' is defined here because the geometry is one rule
+// (ratified-in-principle, not built — nothing arms it), and 'snooze' delegates
+// to the shipped #14 band, which is PRIOR ART of this same family (default = the
+// indefinite rung, held-open alternatives = the duration menu). Convergence
+// note: the snooze band's detection mechanics are identical in shape and are a
+// converge candidate; its MENU content stays client-constant today because the
+// snooze rungs ship unlabelled and ungrouped on the wire (see SNOOZE_ACTIONS).
+export type HoldDirection = 'affirm' | 'reject' | 'snooze';
+
+// One clock for the whole family — a true ALIAS of the #14 hold constant
+// (never a second literal): existing consumers keep SNOOZE_HOLD_MS, new
+// consumers of the pattern take the family name, and there is one number.
+export const GESTURE_HOLD_MS = SNOOZE_HOLD_MS;
+
+// Cross-axis tolerance for the HORIZONTAL bands. STAMP_FADE_START on purpose:
+// the snooze band claims |dy| ≥ STAMP_FADE_START (its `up` lower bound), so
+// bounding the horizontal bands' |dy| STRICTLY BELOW it makes the bands
+// disjoint BY CONSTRUCTION — no (dx, dy) can arm two holds at once. Pinned.
+export const HOLD_CROSS_TOLERANCE = STAMP_FADE_START;
+
+/**
+ * Whether a live drag sits in `direction`'s hold band. Same self-explanatory
+ * affordance as the #14 band: the operator is looking at that direction's
+ * stamp (it starts fading in at STAMP_FADE_START) when the alternatives
+ * arrive, and every in-band coordinate sits strictly inside every
+ * `verdictForDrag` threshold, so a release in-band resolves to null — the
+ * hold can never race a commit.
+ */
+export function inGestureHoldBand(direction: HoldDirection, dx: number, dy: number): boolean {
+  if (direction === 'snooze') return inSnoozeHoldBand(dx, dy);
+  const along = direction === 'affirm' ? dx : -dx;
+  return along >= STAMP_FADE_START && along <= SWIPE_X_THRESHOLD && Math.abs(dy) < HOLD_CROSS_TOLERANCE;
 }
 
 // --- the deck's verbs, READ FROM THE WIRE ------------------------------------
@@ -169,13 +217,22 @@ const SLOT_KIND = 'slot_suggestion';
 const GESTURE_AFFIRM = 'affirm';
 const GESTURE_REJECT = 'reject';
 
-/** One served verb, as it arrives in `item.actions` (§4 + the gesture field). */
+/** One served verb, as it arrives in `item.actions` (§4 + the gesture field,
+ *  + the `group` field — the affirm-with-hold-modifier amendment). */
 interface ServedAction {
   verb: string;
   label: string;
   weight: VerbWeight;
   gesture?: string;
   note?: string;
+  /**
+   * A CO-EQUAL CHOICE GROUP (the affirm-with-hold-modifier pattern,
+   * operator-ratified 2026-08-19). Verbs sharing a group are alternatives of
+   * one decision; the gesture-bearing member is the SUGGESTED one. The
+   * hold-selector's option list derives from this — wire-served, never a
+   * client per-kind map (the 1b-ii lesson, kept).
+   */
+  group?: string;
 }
 
 /**
@@ -204,6 +261,7 @@ function servedActions(item: FeedItem): ServedAction[] {
       weight: e.weight === 'heavy' ? 'heavy' : 'light',
       gesture: typeof e.gesture === 'string' ? e.gesture : undefined,
       note: typeof e.note === 'string' && e.note ? e.note : undefined,
+      group: typeof e.group === 'string' && e.group ? e.group : undefined,
     });
   }
   return out;
@@ -292,6 +350,85 @@ export function verbsFromActions(item: FeedItem): DeckVerbs | null {
  */
 export function arrivedVerbless(item: FeedItem): boolean {
   return servedActions(item).length === 0;
+}
+
+// --- the hold-selector's choices (affirm-with-hold-modifier, wire-derived) ----
+
+/** One option in a hold-selector: a co-equal alternative that COMMITS when
+ *  chosen. `suggested` marks the one the plain gesture would have committed. */
+export interface HoldChoice {
+  verb: string;
+  label: string;
+  suggested: boolean;
+}
+
+/**
+ * The co-equal choices behind `direction`'s hold, or null when the gesture has
+ * none (no gestured verb, no group on it, or a group of one — a selector with
+ * one option is a confirm stage wearing a menu, which this pattern forbids).
+ *
+ * DERIVED FROM THE WIRE and from nothing else: the gestured verb's `group`
+ * names the family, the family is every served verb sharing it. A future
+ * suggestion-bearing kind gets the selector by serving a group — no client
+ * change, no per-kind map (the 1b-ii lesson).
+ *
+ * THE ONE-INTERACTION INVARIANT (operator ruling): choosing from the selector
+ * IS the gesture's commit — same verb wire, same delayed-act path, never
+ * choose-then-confirm. Consumers route a pick through the SAME commit the
+ * gesture uses (`useDeck.affirmWith`), and nothing may put a second
+ * confirmation between the pick and the act.
+ *
+ * `direction` is 'affirm' | 'reject' only: the ↑ snooze menu is this family's
+ * prior art but its rungs ship ungrouped (see the band note above), so it
+ * keeps its own door until the wire serves them as a group.
+ */
+export function holdChoicesFor(item: FeedItem, direction: 'affirm' | 'reject'): HoldChoice[] | null {
+  const served = servedActions(item);
+  const wanted = direction === 'affirm' ? GESTURE_AFFIRM : GESTURE_REJECT;
+  const gestured = served.find((a) => a.gesture === wanted);
+  if (!gestured?.group) return null;
+  const family = served.filter((a) => a.group === gestured.group);
+  if (family.length < 2) return null;
+  return family.map((a) => ({
+    verb: a.verb,
+    label: a.label,
+    suggested: a.verb === gestured.verb,
+  }));
+}
+
+/**
+ * Whether this item's AFFIRM is a suggested choice — the mark of a suggestion
+ * card (the deck rotation's sort card is the first; any kind serving a grouped
+ * affirm is one).
+ */
+export function hasSuggestedChoice(item: FeedItem): boolean {
+  return holdChoicesFor(item, 'affirm') !== null;
+}
+
+/**
+ * The deck's CANDIDATE population — the page-level question, distinct from
+ * `isDeckDealt` (can this item be dealt) below.
+ *
+ * Decide-mode items are candidates as they always were. A QUIET suggestion
+ * card (fyi/fyi, grouped affirm) is ALSO a candidate: its home is the deck —
+ * the suggestion grammar exists for deck gestures — while its tier keeps the
+ * phone silent (`isNeedsYouItem` and the push predicate are untouched; this
+ * widens what the deck deals, never what rings). MEASURED necessity, not
+ * taste: the deck page fetched `mode=decide` and the board partition is
+ * needs-you-only, so without this predicate a quiet suggestion card would be
+ * produced, served, verb-carrying — and rendered nowhere a gesture exists
+ * (the accepted-then-ignored wall the 85aed5a5 measurements closed the lane
+ * over). Deliberately NOT `isDeckDealt ∧ fyi`: an fyi attribution row also
+ * serves gestured verbs, and dealing every glance row would undo the
+ * operator's own demotion ruling — the suggestion GROUP is what marks a card
+ * as deck-homed.
+ *
+ * All three deck surfaces (the /deck fetch, the feed page's deck link, the
+ * home pill) compose their counts from this ONE predicate, so the link counts
+ * exactly what the deck deals.
+ */
+export function isDeckCandidate(item: FeedItem): boolean {
+  return item.mode === 'decide' || hasSuggestedChoice(item);
 }
 
 /**
@@ -427,6 +564,7 @@ export const KIND_LABELS: Record<string, string> = {
   pending: 'Pending',
   routine_match: 'Routine match',
   slot_suggestion: 'Slot',
+  sort_suggestion: 'Sort',
   health: 'Health',
   event: 'Event',
   ticket_notice: 'Ticket',
@@ -445,6 +583,16 @@ export function kindLabel(kind: string): string {
 
 // The universal FYI ack action (feed page + FYI rows) — sets the item `acked`.
 export const ACK_ACTION = 'ack';
+
+// The QUICK defer verb id — `action_router.DEFER_NEXT_RENDER`'s spelling. A
+// hand-kept cross-language copy of the kind the house normally deletes, held
+// for the same reason as SORT_ACTION_BY_SLOT's: the client needs it BEFORE any
+// response exists — here, to say the honest sentence after a reject gesture
+// whose served verb is a defer ("not now — it comes back", never "Rejected.",
+// which would claim a judgment the operator did not make). A cross-language
+// drift pin reads THIS constant from the Python side
+// (tests/feed/test_sort_suggestion_act.py). Do not add a third copy.
+export const DEFER_QUICK_ACTION = 'defer';
 
 // --- attribution contest (#63a) ----------------------------------------------
 // The operator ruled attribution confirmations down to the FYI/glance tier: they

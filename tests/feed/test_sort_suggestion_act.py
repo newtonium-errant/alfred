@@ -392,6 +392,25 @@ def test_the_per_item_stamp_does_not_leak_into_the_kind_table() -> None:
     assert [v for v in kind_level if v.get("gesture") == "affirm"] == []
 
 
+def test_the_web_defer_quick_constant_matches_the_router() -> None:
+    """CROSS-LANGUAGE DRIFT PIN, server half — the SORT_ACTION_BY_SLOT pin's
+    shape (tests/tier/test_sort_affordance.py). The client keeps a hand-typed
+    copy of the quick defer's id (`DEFER_QUICK_ACTION`) because it needs the
+    spelling BEFORE any response exists — to say the honest 'not now' toast
+    instead of 'Rejected.'. Parsed from the TS source, never restated here."""
+    import re
+
+    from alfred.daily_sync.action_router import DEFER_NEXT_RENDER
+
+    ts = (
+        Path(__file__).resolve().parents[2]
+        / "web" / "lib" / "algernon" / "feedConstants.ts"
+    ).read_text(encoding="utf-8")
+    match = re.search(r"export const DEFER_QUICK_ACTION = '([^']+)';", ts)
+    assert match, "DEFER_QUICK_ACTION not found in feedConstants.ts"
+    assert match.group(1) == DEFER_NEXT_RENDER
+
+
 # --- the operator surface (part 3 of the standard) ----------------------------
 
 

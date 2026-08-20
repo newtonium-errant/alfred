@@ -14,7 +14,7 @@ import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
 import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { useSnooze } from '../components/feed/useSnooze';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { contestableItem, isDeckDealt } from '../lib/algernon/feedConstants';
+import { contestableItem, isDeckCandidate, isDeckDealt } from '../lib/algernon/feedConstants';
 import { readDeckSnoozed } from '../lib/algernon/deckSnooze';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
@@ -193,10 +193,16 @@ export default function FeedPage() {
   // has already set it aside — the promise-a-trip-to-a-wall bug his 2026-08-12
   // screenshots caught ("2 decisions waiting" → "DECK CLEAR — 2 snoozed").
   const setAside = (it: FeedItem) => snooze.snoozed(it.id) || deckHidden.has(it.id);
-  const deckable = activeNeedsYou.filter((it) => isDeckDealt(it) && !setAside(it));
+  // …PLUS the quiet suggestion cards (affirm-with-hold-modifier): fyi/fyi by
+  // design (they must never ring), so they live in the glance partition — and
+  // their home is the deck, so the deck link must count them or it promises
+  // fewer cards than /deck deals. `isDeckCandidate` is the same predicate the
+  // /deck page and the home pill use — one composition, no drift.
+  const deckCandidates = [...activeNeedsYou, ...board.fyi.filter(isDeckCandidate)];
+  const deckable = deckCandidates.filter((it) => isDeckDealt(it) && !setAside(it));
   // What the deck is holding rather than dealing — counted so the zero case can
   // explain itself instead of going quiet.
-  const setAsideDeckable = activeNeedsYou.filter((it) => isDeckDealt(it) && setAside(it));
+  const setAsideDeckable = deckCandidates.filter((it) => isDeckDealt(it) && setAside(it));
   const pendingRows = activeNeedsYou.filter(
     (it) => it.kind === 'slot_suggestion' && !snooze.snoozed(it.id),
   );

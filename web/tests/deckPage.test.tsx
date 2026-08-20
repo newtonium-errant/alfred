@@ -104,6 +104,48 @@ describe('DeckPage — deals only actionable kinds', () => {
     expect(screen.queryByTestId('deck-unactionable')).toBeNull();
     expect(screen.queryByTestId('deck-card')).toBeNull();
   });
+
+  it('deals a QUIET suggestion card — fyi/fyi reaches the deck without ringing', async () => {
+    // THE PAGE-LAYER WALL THIS LANE MEASURED AND CLOSED: the fetch was
+    // mode=decide, so an fyi/fyi rotation card was produced, served,
+    // verb-carrying — and rendered nowhere a gesture exists. `isDeckCandidate`
+    // is the fix; this drives it through the page. The fyi WEATHER row in the
+    // same payload is the positive control for the other direction: quiet
+    // glance rows still never deal (the operator's demotion rulings hold).
+    function sortCard(id: string): FeedItem {
+      return withServedActions({
+        ...item('sort_suggestion', id),
+        mode: 'fyi',
+        attention: 'fyi',
+        evidence: { proposed_slot: 'duty', proposal_shape: 'task|due:n|t2' },
+        actions: [],
+      });
+    }
+    const fyiWeather = { ...item('weather', 'w1'), mode: 'fyi', attention: 'fyi', actions: [] };
+    mockList.mockResolvedValue({ items: [sortCard('r1'), fyiWeather], count: 2 });
+    render(<DeckPage />);
+    await waitFor(() => expect(screen.queryByTestId('deck-card')).not.toBeNull());
+    expect(screen.getByTestId('deck-count').textContent).toBe('1 card');
+    expect(screen.getByTestId('deck-card').getAttribute('data-kind')).toBe('sort_suggestion');
+    expect(document.querySelector('[data-kind="weather"]')).toBeNull();
+  });
+
+  it('a degraded sort card (no proposal) is not a candidate — no deal, no fault claim', async () => {
+    // Its affirm gesture never arrives (the proposal is the gesture), so it is
+    // neither dealable nor a candidate: the page reads genuinely empty rather
+    // than inventing a worklist or a fault for a card the feed still shows.
+    const degraded = withServedActions({
+      ...item('sort_suggestion', 'r2'),
+      mode: 'fyi',
+      attention: 'fyi',
+      evidence: {},
+      actions: [],
+    });
+    mockList.mockResolvedValue({ items: [degraded], count: 1 });
+    render(<DeckPage />);
+    await waitFor(() => expect(screen.queryByTestId('deck-empty')).not.toBeNull());
+    expect(screen.queryByTestId('deck-card')).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

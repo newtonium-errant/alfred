@@ -1,6 +1,6 @@
 import { forwardRef } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { affirmLabelFor, armNoteFor, emailPriority, isHeavyVerb, kindLabel, verbLabelFor, verbsFromActions, type EmailPriority } from '../../lib/algernon/feedConstants';
+import { affirmLabelFor, armNoteFor, emailPriority, holdChoicesFor, isHeavyVerb, kindLabel, verbLabelFor, verbsFromActions, type EmailPriority } from '../../lib/algernon/feedConstants';
 import {
   CONSOLE_LABEL,
   ROLE_TEXT_CLASS,
@@ -100,6 +100,13 @@ export interface DeckCardProps {
   /** Open the correction picker (#13) — routine_match top card only; absent elsewhere. */
   onCorrectOpen?: () => void;
   /**
+   * Open the hold-selector (affirm-with-hold-modifier) — the accessible door
+   * to the gesture's alternatives, top card only. Rendered ONLY when the item
+   * actually serves a co-equal choice group (`holdChoicesFor`), so the door
+   * cannot exist where it opens onto nothing.
+   */
+  onHoldOpen?: () => void;
+  /**
    * This card came BACK because the server refused the last verdict given on it.
    *
    * Marked on the card face, not only in the notice above the stack, because the
@@ -111,10 +118,14 @@ export interface DeckCardProps {
 }
 
 export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckCard(
-  { item, depth, expanded, confirming, confirmingVerdict = 'affirm', onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen, unrecorded = false },
+  { item, depth, expanded, confirming, confirmingVerdict = 'affirm', onToggleEvidence, onConfirmHeavy, onCancelHeavy, onReTierOpen, onCorrectOpen, onHoldOpen, unrecorded = false },
   ref,
 ) {
   const verbs = verbsFromActions(item);
+  // A suggestion card (affirm-with-hold-modifier): its affirm is one member of
+  // a served co-equal group. Drives the on-face suggestion line, the "Change…"
+  // door, and the affirm stamp's label — all derived from the wire, no kinds.
+  const holdChoices = holdChoicesFor(item, 'affirm');
   // PER-DIRECTION. A card is no longer heavy or light as a whole: an attribution
   // confirm is light and its reject is heavy, and a badge that averaged the two
   // would be wrong in both directions at once.
@@ -246,6 +257,31 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
           // The WHY, on the face (surface_reason) — the card's own claim for being here.
           <p data-testid="deck-slot-why" className="mb-1.5 shrink-0 text-xs italic text-console-ink-dim">
             {whyText}
+          </p>
+        )}
+
+        {holdChoices && (
+          // THE PROPOSAL, ON THE FACE (the ruling: each dealt card PROPOSES).
+          // The suggested member by name, so the affirm swipe's meaning is
+          // stated where the decision is made — plus the accessible door to
+          // the alternatives (top card only): a selector reachable only by
+          // holding a drag is a selector no keyboard or assistive pointer can
+          // reach. The ↑ button precedent, as an on-face control.
+          <p data-testid="deck-suggested" className="mb-1.5 shrink-0 text-xs text-console-ink-dim">
+            Suggested:{' '}
+            <span className="font-semibold text-console-ink">
+              {holdChoices.find((c) => c.suggested)?.label ?? '—'}
+            </span>
+            {depth === 0 && onHoldOpen && (
+              <button
+                type="button"
+                data-testid="deck-hold-open"
+                onClick={onHoldOpen}
+                className={`ml-2 ${CONSOLE_LABEL} ${ROLE_TEXT_CLASS.caution} underline underline-offset-4`}
+              >
+                Change…
+              </button>
+            )}
           </p>
         )}
 
@@ -398,7 +434,7 @@ export const DeckCard = forwardRef<HTMLDivElement, DeckCardProps>(function DeckC
         data-stamp="affirm"
         className={`pointer-events-none absolute right-4 top-4 rotate-[-8deg] rounded-sm border-2 px-2.5 py-1 text-sm font-extrabold uppercase tracking-[0.18em] opacity-0 ${roleChipClass('affirm')}`}
       >
-        {priority ? priority : urgent ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : affirmHeavy ? 'Review' : 'Yes'}
+        {priority ? priority : urgent ? affirmLabel : item.kind === 'slot_suggestion' ? 'Take it' : holdChoices ? affirmLabel : affirmHeavy ? 'Review' : 'Yes'}
       </span>
       <span
         data-stamp="reject"
