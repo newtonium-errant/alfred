@@ -1708,7 +1708,7 @@ Located at `~/.alfred/<instance>/data/moc_suggestions.jsonl` (Hypatia: `/home/an
 | `mapping_signal` | `"member_overlap"` \| `"fuzzy_label"` \| `"propose_new"` | which of the three signals fired |
 | `mapping_score` | float | overlap fraction for member_overlap, Jaccard for fuzzy_label, 0.0 for propose_new |
 | `candidate_members_to_add` | list[str] | members NOT already citing the target — what would actually get appended on accept (subset of `cluster_member_paths`) |
-| `reasoning` | str | human-readable "why this suggestion" — rides on the deck card's evidence, so Andrew sees the surveyor's own reasoning on the card face |
+| `reasoning` | str | human-readable "why this suggestion" — rides in the card's evidence, one tap behind the deck's "Show details" control. NOT on the card face, which carries only the "Add N notes to `<MOC>`?" title. If Andrew hasn't expanded the card, he hasn't seen it |
 | `created` | ISO-8601 UTC | proposal time |
 | `status` | `"pending"` \| `"accepted"` \| `"applied"` \| `"rejected"` \| `"archived"` | lifecycle (see below) |
 | `decided_at` | ISO-8601 OR `None` | timestamp of last status transition |
