@@ -806,6 +806,28 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
     # firing rhythm or rename the record via this path. Those land
     # in separate ships (rename) or are covered by the broader
     # ``talker`` scope's general edit (alfred_tags via surveyor).
+    # MOC-reader apply scope (2026-08-20). The full matrix + its rationale
+    # live at MOC_APPLY_FIELDS above; this entry is the enforcement.
+    #
+    # Body surfaces are OFF here, and that is defence-in-depth rather than
+    # the provenance lock: on a marked record a body write refuses TWICE,
+    # for two different reasons. The pins assert WHICH refusal fired —
+    # a scope refusal and a provenance refusal are indistinguishable by
+    # outcome, so the body-lock direction is pinned on a body-capable
+    # scope where only the provenance lock can be the cause.
+    "moc_apply": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "moc_apply_only",
+        "move": False,
+        "delete": False,
+        "allow_body_writes": False,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     "talker_routine_item": {
         "read": True,
         "search": True,
@@ -1757,6 +1779,51 @@ TALKER_ROUTINE_ITEM_TYPES: set[str] = {"routine"}
 TALKER_ROUTINE_ITEM_FIELDS: set[str] = {"items", "completion_log"}
 
 
+# MOC-reader apply scope (2026-08-20) — the deck's MOC-suggestion card.
+#
+# THE MATRIX, stated here because the scope IS the design (scope-first,
+# CLAUDE.md "Scope-first design for new vault capabilities"):
+#
+#   | op                | moc_apply | why                                    |
+#   |-------------------|-----------|----------------------------------------|
+#   | read/search/list  | True      | the writer reads each member's current |
+#   |                   |           | ``mocs`` to append idempotently        |
+#   | create            | False     | v1 is member_overlap (add-to-EXISTING) |
+#   |                   |           | only; ``propose_new`` needs MOC        |
+#   |                   |           | creation and is a separate v2 lane     |
+#   | edit              | narrow    | ``moc_apply_only``: type-gated to      |
+#   |                   |           | MOC_APPLY_TYPES, field-gated to        |
+#   |                   |           | MOC_APPLY_FIELDS, both fail-closed     |
+#   | move/delete       | False     | a membership is additive; nothing      |
+#   |                   |           | about it relocates or removes a record |
+#   | body surfaces     | False     | the membership lives entirely in       |
+#   |                   |           | frontmatter; the ``# Contents`` mirror |
+#   |                   |           | is written by the Sub-arc A hook under |
+#   |                   |           | its own authority, not by this scope   |
+#
+# TYPE GATE = THE HOOK'S TRIGGER SET, deliberately. ``mocs`` on a record
+# outside ``zettel_hooks._MOC_TRIGGER_TYPES`` would be a membership the
+# ``# Contents`` mirror never performs — a half-applied membership that
+# reads as done on the member and is invisible on the MOC. That is not
+# hypothetical: the Hypatia SKILL documents a live queue row whose four
+# candidate members are ``session/`` records, and the fossil backlog
+# carries it. Refusing at the scope gate is what makes the writer's
+# per-member skip honest rather than silent.
+#
+# PROVENANCE-LOCK COMPOSITION (train 21). ``mocs`` is NOT one of the five
+# INGEST_PROVENANCE_LOCKED_FIELDS, so a web-ingested record (one carrying
+# ``ingested_via``) accepts a MOC membership while its BODY stays locked —
+# "body locked, frontmatter open" working as ratified. This is load-bearing
+# rather than theoretical: ``source`` is both a MOC trigger type AND a type
+# the web ingest stamps, so the composition is on the live path. Pinned both
+# directions in tests/test_moc_apply_scope.py.
+MOC_APPLY_FIELDS: set[str] = {"mocs"}
+#: Mirrors ``zettel_hooks._MOC_TRIGGER_TYPES``. NOT re-spelled from memory —
+#: imported and asserted equal by a premise pin, so the two cannot drift into
+#: a membership this scope permits and the hook declines to mirror.
+MOC_APPLY_TYPES: set[str] = {"zettel", "source", "question", "research-pointer"}
+
+
 # Stage 3.5: record types KAL-LE may create. Superset of talker
 # minus operational types (task, event) — KAL-LE is the coding
 # instance, not an operational one — plus the kalle-only types
@@ -2511,6 +2578,47 @@ def check_scope(
                 f"completion path narrows to ``completion_log`` only; "
                 f"Phase 2B B3 will widen this for general conversational "
                 f"editing."
+            )
+        return
+
+    if permission == "moc_apply_only":
+        # MOC-reader apply gate (2026-08-20). Same three-check shape as the
+        # two routine gates below/above — type-restriction, fail-closed on a
+        # missing field list, field-allowlist subset — because that shape is
+        # the house pattern for a narrow act-driven write and re-inventing it
+        # here would be a fourth spelling of one idea.
+        #
+        # Fail-CLOSED on a missing type for the same reason the routine gates
+        # do (2026-06-12 review WARN-3): an empty record_type must never skip
+        # the type restriction into "this scope may edit mocs on anything".
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'moc_apply_only' is type-restricted "
+                f"but the record type is unavailable (empty) — failing "
+                f"closed. Callers must pass record_type (vault_edit parses "
+                f"it from the target record's frontmatter)."
+            )
+        if record_type not in MOC_APPLY_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit record types "
+                f"({', '.join(sorted(MOC_APPLY_TYPES))}). Got: "
+                f"'{record_type}'. That set is the topic-MOC member hook's "
+                f"trigger set: writing 'mocs' on any other type would claim "
+                f"a membership the MOC's '# Contents' mirror never performs."
+            )
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(MOC_APPLY_FIELDS))}); caller did not "
+                f"supply the field list."
+            )
+        rejected = [f for f in fields if f not in MOC_APPLY_FIELDS]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(MOC_APPLY_FIELDS))}). Rejected: "
+                f"{', '.join(rejected)}. The MOC apply path writes the "
+                f"membership field and nothing else."
             )
         return
 
