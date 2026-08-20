@@ -840,6 +840,37 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
+    # Voice-calibration apply scope (2026-08-20, R4). The full matrix + its
+    # rationale live at CALIBRATION_APPLY_FIELDS above; this entry is the
+    # enforcement.
+    #
+    # This scope exists because ``apply_proposals`` previously wrote with
+    # ``scope=None`` — unrestricted. The learning loop's whole contract is
+    # learn -> propose -> operator approves, and an unrestricted writer at
+    # the end of it means the approval gesture authorised strictly less
+    # than the write could do.
+    "calibration_apply": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "calibration_apply_only",
+        "move": False,
+        "delete": False,
+        # TRUE, and NOT a widening — the narrowing lives in the gate. Stated
+        # EXPLICITLY rather than omitted because ``allow_body_writes``
+        # defaults to True when the key is absent, so silence here would
+        # read as an oversight rather than a decision.
+        "allow_body_writes": True,
+        # The mid-document surfaces stay shut. The calibration block is
+        # rewritten by the writer's own marker-fenced rewriter; nothing on
+        # this path inserts at an offset or replaces a whole body. Keeping
+        # these ``{}`` also keeps this scope out of the reachable set that
+        # ``tests/test_scope_gcal_remedy.py`` pins by exact equality.
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     "talker_routine_item": {
         "read": True,
         "search": True,
@@ -1883,6 +1914,107 @@ def _derive_moc_mirror_type() -> str:
 MOC_MIRROR_TYPE: str = _derive_moc_mirror_type()
 
 
+# Voice-calibration apply scope (2026-08-20, R4) — the learning loop's
+# ONLY write door.
+#
+# THE MATRIX, stated here because the scope IS the design (scope-first,
+# CLAUDE.md "Scope-first design for new vault capabilities"):
+#
+#   | op                 | calibration_apply | why                            |
+#   |--------------------|-------------------|--------------------------------|
+#   | read/search/list/  | True              | the writer reads the target's  |
+#   |   context          |                   | existing ``attribution_audit`` |
+#   |                    |                   | list to merge new entries      |
+#   |                    |                   | forward rather than clobber    |
+#   | create             | False             | calibration APPENDS to the     |
+#   |                    |                   | operator's own profile record; |
+#   |                    |                   | a loop that can MINT a person  |
+#   |                    |                   | record could write its notes   |
+#   |                    |                   | somewhere nobody reads         |
+#   | edit               | narrow            | ``calibration_apply_only``:    |
+#   |                    |                   | type-gated to                  |
+#   |                    |                   | CALIBRATION_APPLY_TYPES,       |
+#   |                    |                   | field-gated to                 |
+#   |                    |                   | CALIBRATION_APPLY_FIELDS,      |
+#   |                    |                   | both fail-closed               |
+#   | move/delete        | False             | a calibration bullet is        |
+#   |                    |                   | additive; nothing about it     |
+#   |                    |                   | relocates or removes a record  |
+#   | body_append/       | TRUE, on the      | ``apply_proposals`` rewrites   |
+#   |   rewriter         | target type only, | the ALFRED:CALIBRATION block   |
+#   |                    | WITH the audit    | via ``body_rewriter`` AND sets |
+#   |                    | field riding      | ``attribution_audit`` in the   |
+#   |                    | along             | SAME edit — see DIVERGENCE     |
+#   | body_insert_at/    | {}                | the block rewrite is a         |
+#   |   body_replace     |                   | marker-fenced surgical edit by |
+#   |                    |                   | the writer's own rewriter;     |
+#   |                    |                   | nothing here inserts at an     |
+#   |                    |                   | offset or replaces a body      |
+#
+# DIVERGENCE FROM ``moc_apply`` ARM 1, stated because it is the one place
+# this gate deliberately does the OPPOSITE of the precedent it copies.
+# MOC's mirror arm refuses frontmatter riding along with a body write
+# (``if fields: raise``). Calibration REQUIRES it: ``vault_edit`` performs
+# a single ``write_text`` of frontmatter+body together (ops.py), so the
+# block rewrite and its ``attribution_audit`` entry land atomically in ONE
+# call. Splitting them into two edits would mean a crash between them
+# leaves agent-inferred prose on the operator's own profile with NO
+# provenance entry — precisely the unattributed-write the audit contract
+# exists to prevent. So this is ONE COMBINED ARM, not MOC's mutually
+# exclusive pair: a body write is admitted only on the target type, and
+# only when every field riding along is in CALIBRATION_APPLY_FIELDS.
+#
+# WHY THE FIELD GATE IS NOT REDUNDANT WITH THE TYPE GATE: ``vault_edit``
+# builds ``fields`` from the set/append/unset keys, so a PURE body write
+# arrives with ``fields == []`` — an empty LIST, not ``None``. That value
+# passes a ``fields is None`` fail-closed check and passes a subset check
+# vacuously. The ``stayc_clinical_attest_only`` gate documents this as its
+# security-critical case; the same shape applies here, which is why the
+# body branch below tests ``if fields:`` rather than ``fields is not None``.
+#
+# OPERATOR-REACHABLE: adding this key makes ``calibration_apply``
+# selectable from ``alfred vault --scope`` and ``ALFRED_VAULT_SCOPE``
+# (cli.py validates against ``SCOPE_RULES``). That is intended — the CLI
+# approve verb is one of the two approval doors — but no agent-facing
+# prompt should ever select it: the scope is set by the approval handler,
+# never by a create/edit path an agent drives.
+#
+#: The frontmatter field the calibration writer may set. ``attribution_audit``
+#: is the provenance list every inferred-prose writer appends to; nothing
+#: else on the profile record is calibration's business.
+CALIBRATION_APPLY_FIELDS: set[str] = {"attribution_audit"}
+
+#: The directory the calibration target record lives in. Named so the
+#: derivation below reads against a registry fact rather than a spelling.
+CALIBRATION_DIRECTORY: str = "person"
+
+
+#: The record type calibration writes to — DERIVED FROM THE REGISTRY, NOT
+#: RE-SPELLED. This is the discipline the MOC lane learned the hard way one
+#: commit earlier: ``MOC_MIRROR_TYPE`` shipped as the literal ``"moc"`` and
+#: survived 34 green pins because every FIXTURE minted the same non-existent
+#: lowercase spelling, while the registry says ``MOC``. Deriving by DIRECTORY
+#: means this constant follows the registry if the type is ever renamed, and
+#: the import-time failure below is louder than any test.
+def _derive_calibration_target_type() -> str:
+    matches = sorted(
+        name for name, directory in TYPE_DIRECTORY.items()
+        if directory == CALIBRATION_DIRECTORY
+    )
+    if len(matches) != 1:
+        # Fail LOUD at import rather than silently picking one: an ambiguous
+        # or absent target type means this gate cannot know what it guards,
+        # and a gate that does not know its subject is a gate that admits.
+        raise RuntimeError(
+            f"expected exactly one record type in the "
+            f"'{CALIBRATION_DIRECTORY}/' directory; registry has {matches!r}"
+        )
+    return matches[0]
+
+
+CALIBRATION_APPLY_TYPES: set[str] = {_derive_calibration_target_type()}
+
+
 # Stage 3.5: record types KAL-LE may create. Superset of talker
 # minus operational types (task, event) — KAL-LE is the coding
 # instance, not an operational one — plus the kalle-only types
@@ -2706,6 +2838,67 @@ def check_scope(
             )
         return
 
+    if permission == "calibration_apply_only":
+        # ONE COMBINED ARM — deliberately NOT the mutually-exclusive pair
+        # ``moc_apply_only`` uses directly above. The calibration writer
+        # rewrites the ALFRED:CALIBRATION block AND stamps its
+        # ``attribution_audit`` provenance entry in a SINGLE ``vault_edit``,
+        # because that call performs one atomic ``write_text`` of
+        # frontmatter+body. Refusing the frontmatter (MOC arm 1's rule)
+        # would force two calls and put a crash window between inferred
+        # prose and its provenance. Full reasoning at the matrix above.
+        #
+        # Order matters: the type fence comes FIRST and applies to every
+        # edit, body or not. ``body_rewriter`` edits arrive here as
+        # ``operation == "edit"`` and NEVER pass through
+        # ``_check_body_mutation_allowed`` — so ``_BODY_MUTATE_DENIED_TYPES``
+        # never sees them and this branch is the ONLY type fence standing
+        # between this scope and any record in the vault.
+        #
+        # Fail-CLOSED on a missing type, same as every sibling gate.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'calibration_apply_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass record_type "
+                f"(vault_edit parses it from the target record's "
+                f"frontmatter)."
+            )
+        if record_type not in CALIBRATION_APPLY_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit "
+                f"{', '.join(sorted(CALIBRATION_APPLY_TYPES))} records "
+                f"(the calibration target is the operator's own profile). "
+                f"Got: '{record_type}'."
+            )
+        # A PURE body write arrives with ``fields == []`` — an empty list,
+        # not None. ``if fields:`` is therefore the correct emptiness test:
+        # ``fields is not None`` would let the subset check below pass
+        # vacuously on exactly the case that matters. This is the
+        # ``stayc_clinical_attest_only`` lesson applied one gate over.
+        if fields:
+            rejected = [f for f in fields if f not in CALIBRATION_APPLY_FIELDS]
+            if rejected:
+                raise ScopeError(
+                    f"Scope '{scope}' may only edit fields in the allowlist "
+                    f"({', '.join(sorted(CALIBRATION_APPLY_FIELDS))}). "
+                    f"Rejected: {', '.join(rejected)}. The calibration apply "
+                    f"path writes the provenance field and the marker-fenced "
+                    f"block, and nothing else."
+                )
+            return
+        # No fields at all. A pure body write is the legitimate shape only
+        # when a body write was actually requested; an edit that changes
+        # NOTHING is a caller bug and vault_edit's own no-op gate refuses it
+        # earlier, but refusing here too keeps this gate self-contained
+        # rather than resting on an upstream check it does not control.
+        if not body_write:
+            raise ScopeError(
+                f"Scope '{scope}' received an edit with no fields and no "
+                f"body write — nothing to authorise. Failing closed."
+            )
+        return
+
     if permission == "talker_routine_item_only":
         # Phase 2B B3 (2026-05-30) — Conversational item-CRUD gate.
         # Same three-check shape as ``talker_routine_completion_only``
@@ -3380,3 +3573,27 @@ def check_scope(
                 f"'alfred_triage: true' set in frontmatter."
             )
         return
+
+    # FAIL-CLOSED TAIL (2026-08-20, R4). Until this existed, an unrecognised
+    # permission string fell off the end of the chain and returned None —
+    # i.e. ALLOW. A scope declaring ``"edit": "calibraiton_apply_only"`` (or
+    # any other typo, or a handler deleted in a refactor while its
+    # SCOPE_RULES entry survived) therefore permitted EVERY field on EVERY
+    # type, and did so silently: no error, no log, and the scope's own tests
+    # would keep passing because they assert on the allowed direction.
+    #
+    # MEASURED SAFE BEFORE ADDING, not assumed: at the commit that introduced
+    # this, the permission strings declared across SCOPE_RULES and the
+    # ``permission ==`` branches above were the SAME 27-element set — zero
+    # declared-but-unhandled, zero handled-but-never-declared. So no shipped
+    # scope reached this line, and nothing changes behaviour today. What
+    # changes is the failure DIRECTION for the next author: a mistyped or
+    # orphaned gate name now refuses loudly instead of admitting silently.
+    # ``tests/test_scope_fail_closed_tail.py`` pins both halves.
+    raise ScopeError(
+        f"Scope '{scope}' declares operation '{operation}' with permission "
+        f"'{permission}', which has no handler in check_scope — failing "
+        f"closed. This is a code defect: either the handler was removed "
+        f"while the SCOPE_RULES entry survived, or the permission string is "
+        f"misspelled."
+    )
