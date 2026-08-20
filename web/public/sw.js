@@ -63,7 +63,25 @@
 //     of all four SHELL_ROUTES is byte-identical, and so is `/chat`'s — which
 //     is prerendered but is NOT a SHELL_ROUTE, and prerenders its pre-auth
 //     branch, where no composer of either kind has ever appeared.
-const CACHE_VERSION = 'v8';
+// v9: the deck rotation's components. ONE trigger, the stylesheet URL again —
+//     the sort-rotation lane's new deck components (HoldSelector and the
+//     suggestion-card face work) brought new Tailwind utility classes, so the
+//     generated stylesheet GREW (29379 → 29403 bytes, same instrument as v8:
+//     `npx tailwindcss -c tailwind.config.cjs -i styles/globals.css
+//     --minify`; content hash 89abe9c5 → 62f9ad9c) and every SHELL_ROUTE's
+//     precached HTML names that file by hash — a v8 client would pair its
+//     cached shells with a stylesheet URL this build no longer serves.
+//     METHOD (noise-floor, the v8 discipline): master at 2f9a23b9 rebuilt to
+//     the standing baseline hash EXACTLY (29379 / 89abe9c5, stable through
+//     trains 14-17), so the whole delta is this lane's; the lane figure was
+//     reproduced independently on the lane tree (29403 / 62f9ad9c, md5
+//     8-char prefix).
+//     WHAT DID NOT CHANGE, checked rather than assumed: no SHELL_ROUTE's
+//     markup — the lane's page edits (`/` among them) all sit behind the
+//     pre-auth early-return (verified at pages/index.tsx:178: the deck-pill
+//     composition feeds only the post-auth branch), so the prerendered
+//     pre-auth HTML the shell precaches carries none of the new components.
+const CACHE_VERSION = 'v9';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.
