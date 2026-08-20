@@ -28,6 +28,7 @@ import pytest
 
 from alfred.vault.scope import (
     CALIBRATION_APPLY_FIELDS,
+    CALIBRATION_APPLY_SCOPE,
     CALIBRATION_APPLY_TYPES,
     CALIBRATION_DIRECTORY,
     SCOPE_RULES,
@@ -223,3 +224,87 @@ class TestScopeGate:
         """The neighbour that proves the refusals above are not blanket."""
         for op in ("read", "search", "list", "context"):
             check_scope(SCOPE, op, record_type=_target_type())
+
+
+# --- the writer is actually GATED, not merely gate-capable -------------------
+
+
+def test_premise_the_scope_constant_matches_the_registry_key() -> None:
+    """One intent, two spellings — pinned rather than trusted.
+
+    ``SCOPE_RULES`` is built at import, before CALIBRATION_APPLY_SCOPE is
+    defined, so the key is a literal and the constant is separate. That is
+    the ``jeeves`` arrangement, and "stated in two places that cannot drift
+    apart" is a claim about a MECHANISM: either a pin enforces the equality
+    or the two WILL drift.
+    """
+    assert CALIBRATION_APPLY_SCOPE == SCOPE
+    assert CALIBRATION_APPLY_SCOPE in SCOPE_RULES
+
+
+def test_the_writer_defaults_to_the_scope_not_to_none() -> None:
+    """THE THREADING PIN — the direction that makes the gate load-bearing.
+
+    ``apply_proposals`` used to write with ``scope=None`` (unrestricted).
+    Had the gate been added as an optional parameter defaulting to ``None``,
+    this lane would have reproduced the standing trap: tests thread it,
+    production never does, every pin stays green, feature accepted-then-
+    ignored. Defaulting to the restrictive scope inverts that — an
+    unrestricted write now requires a visible opt-out.
+
+    Read from the SIGNATURE rather than by calling, so this pin cannot be
+    satisfied by a call site that happens to pass the right value.
+    """
+    import inspect
+
+    from alfred.telegram.calibration import apply_proposals
+
+    default = inspect.signature(apply_proposals).parameters["scope"].default
+    assert default == CALIBRATION_APPLY_SCOPE, (
+        "apply_proposals must default to the restrictive scope; a None "
+        "default is an ungated production write with green tests"
+    )
+
+
+def test_the_writer_refuses_a_foreign_type_end_to_end(tmp_path) -> None:
+    """Driven through the real writer, not through check_scope directly.
+
+    A per-layer unit pin cannot catch an unthreaded gate; only a call
+    through the production entry point can. The positive control runs FIRST
+    so a failure to write for any unrelated reason cannot masquerade as the
+    gate firing.
+    """
+    from alfred.telegram.calibration import (
+        CALIBRATION_MARKER_END,
+        CALIBRATION_MARKER_START,
+        Proposal,
+        apply_proposals,
+    )
+
+    block = f"{CALIBRATION_MARKER_START}\n## Communication Style\n\n- existing\n\n{CALIBRATION_MARKER_END}\n"
+    proposals = [Proposal(subsection="Communication Style", bullet="prefers terse replies")]
+
+    # POSITIVE CONTROL — the admissible neighbour really writes.
+    (tmp_path / "person").mkdir()
+    (tmp_path / "person" / "Owner.md").write_text(
+        f"---\ntype: {_target_type()}\nname: Owner\n---\n\n{block}", encoding="utf-8",
+    )
+    ok = apply_proposals(tmp_path, "person/Owner", proposals, "session/S")
+    assert ok["written"] is True, ok
+    assert "prefers terse replies" in (tmp_path / "person" / "Owner.md").read_text()
+
+    # THE REFUSAL — same call, same fields, only the record TYPE differs.
+    (tmp_path / "note").mkdir()
+    (tmp_path / "note" / "Decoy.md").write_text(
+        f"---\ntype: note\nname: Decoy\n---\n\n{block}", encoding="utf-8",
+    )
+    before = (tmp_path / "note" / "Decoy.md").read_text()
+    refused = apply_proposals(tmp_path, "note/Decoy", proposals, "session/S")
+
+    assert refused["written"] is False
+    # Assert WHY it refused. A denial for an unrelated cause (missing record,
+    # no marker block) reads identically to the guard firing.
+    assert "vault_edit_failed" in refused["reason"]
+    assert "may only edit" in refused["reason"]
+    # And that it touched NOTHING out there — not merely that the write failed.
+    assert (tmp_path / "note" / "Decoy.md").read_text() == before

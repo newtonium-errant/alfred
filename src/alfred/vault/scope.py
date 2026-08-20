@@ -849,6 +849,11 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
     # learn -> propose -> operator approves, and an unrestricted writer at
     # the end of it means the approval gesture authorised strictly less
     # than the write could do.
+    # NOTE: spelled as a literal here because SCOPE_RULES is built at import,
+    # long before CALIBRATION_APPLY_SCOPE is defined further down (the same
+    # arrangement ``jeeves`` has). Two spellings of one intent WILL drift, so
+    # the equality is not left to good intentions —
+    # ``test_premise_the_scope_constant_matches_the_registry_key`` pins it.
     "calibration_apply": {
         "read": True,
         "search": True,
@@ -1979,6 +1984,12 @@ MOC_MIRROR_TYPE: str = _derive_moc_mirror_type()
 # prompt should ever select it: the scope is set by the approval handler,
 # never by a create/edit path an agent drives.
 #
+#: The scope name, as a constant rather than a bare literal (the ``jeeves``
+#: precedent). The calibration writer defaults to this scope, its tests pin
+#: it, and ``SCOPE_RULES`` is keyed by it — one definition, so the writer and
+#: the gate cannot drift into two spellings of the same intent.
+CALIBRATION_APPLY_SCOPE: str = "calibration_apply"
+
 #: The frontmatter field the calibration writer may set. ``attribution_audit``
 #: is the provenance list every inferred-prose writer appends to; nothing
 #: else on the profile record is calibration's business.
