@@ -374,7 +374,8 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # declaration. Unlike the five families above, the kwargs here are UNUSED: a
     # slot completion/accept does NOT synthesize a ReplyCorrection or read
     # last_batch. It is intercepted by :func:`_dispatch_slot_completion`
-    # (done/undo_done) or :func:`_dispatch_slot_confirm` (accept) right after
+    # (the done family — done + the dated done_Nd rungs — and undo_done) or
+    # :func:`_dispatch_slot_confirm` (accept) right after
     # this ceiling check, which call the per-lane writer directly against the
     # feed item's OWN stamped evidence (origin/routine_record/tier/item_text).
     # snooze_* / unsnooze (R3): kwargs UNUSED, same as done/accept. Intercepted
@@ -1439,9 +1440,9 @@ def _dispatch_slot_completion(
     config: Any,
     vault_path: Path | None,
 ) -> ActResult:
-    """Apply a slot_suggestion ``done`` / ``undo_done`` via the per-lane
-    completion writer — the SAME functions the talker uses (single writer per
-    lane). Acts on the feed item's OWN stamped ``evidence`` (never last_batch,
+    """Apply a slot_suggestion completion-family verb (``done`` / a dated
+    ``done_Nd`` rung) or ``undo_done`` via the per-lane completion writer —
+    the SAME functions the talker uses (single writer per lane). Acts on the feed item's OWN stamped ``evidence`` (never last_batch,
     never a re-derived key). Runs inside the caller's per-item mutex.
     """
     evidence = dict(getattr(item, "evidence", None) or {})
