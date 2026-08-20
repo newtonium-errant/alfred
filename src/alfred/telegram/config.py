@@ -222,14 +222,19 @@ class SttShadowCaptureConfig:
       * LOUD and dominant — ``load_from_unified`` raises, so the talker
         DAEMON fails to start (``telegram/daemon.py`` imports it and calls
         it in ``run``) along with the talker CLI paths.
-      * QUIET and misattributing — ``skill_audit``'s ``except TypeError``
+      * LOUD on the health surface too, as of 2026-08-20 — and this arm
+        USED TO BE the quiet one. ``skill_audit``'s ``except TypeError``
         around ``load_talker_config`` is documented for the missing
-        ``instance.name`` case, but it catches THIS TypeError too and
-        returns ``instance_missing`` with reason "telegram.instance config
-        incomplete (...)" even when ``instance.name`` is present and fine.
-        ``_check_skill_capability_audit`` then reports SKIP, and SKIP is a
-        QUIET health status, so the health surface raises no attention
-        card. Measured: control OK -> mutant SKIP.
+        ``instance.name`` case but caught THIS TypeError as well, returning
+        ``instance_missing`` with reason "telegram.instance config
+        incomplete (...)" even when ``instance.name`` was present and fine.
+        ``_check_skill_capability_audit`` reported SKIP, a QUIET health
+        status, so the surface raised no attention card AND blamed the
+        wrong thing. ``audit_skill`` now discriminates on the CONFIG SHAPE
+        (is the ``name`` key absent?) rather than on the exception class,
+        so this shape returns ``config_error`` and the probe WARNs.
+        Re-measured after the fix, same field-removal mutant: control OK ->
+        mutant WARN.
       * NOT the health-aggregator swallow. An earlier draft of this note
         blamed ``_load_tool_checks`` dropping the talker probe; that is
         FALSE and is corrected here where the next reader meets it —

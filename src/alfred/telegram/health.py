@@ -353,6 +353,12 @@ def _check_skill_capability_audit(raw: dict[str, Any]) -> CheckResult:
     findings every BIT cycle automatically.
 
     Status mapping:
+        * No talker instance configured (no ``telegram`` section, or an
+          ``instance`` block with no ``name``) → ``SKIP``. Nothing to
+          audit; quiet is correct.
+        * Config present and named but FAILED TO LOAD → ``WARN``.
+          Deliberately not SKIP: the audit never ran, and quiet would
+          hide it. See ``skill_audit.audit_skill``'s discriminator.
         * No missing advertisements → ``OK`` with an explicit
           "tools advertised" summary (per
           ``feedback_intentionally_left_blank.md``).
@@ -372,6 +378,27 @@ def _check_skill_capability_audit(raw: dict[str, Any]) -> CheckResult:
             name="skill-capability-audit",
             status=Status.WARN,
             detail=f"audit raised: {exc.__class__.__name__}: {exc}",
+        )
+    if result.config_error:
+        # WARN, deliberately NOT SKIP. The config failed to load while the
+        # instance block was present and named, so the audit never ran —
+        # and the instance's talker daemon is almost certainly down with
+        # it. SKIP is in ``QUIET_HEALTH_STATUSES``, so routing this here
+        # (as the code did until 2026-08-20, by catching every TypeError
+        # as "instance config incomplete") produced a health surface that
+        # was both SILENT and WRONG about the reason.
+        #
+        # WARN rather than FAIL is the deliberate ceiling: this probe's
+        # subject is SKILL advertisement, and claiming FAIL would assert
+        # more about daemon liveness than this probe measures. The
+        # daemon-down condition surfaces loudly through its own probes.
+        # What matters for the bug being fixed is that WARN is NOT quiet,
+        # so the operator gets a card.
+        return CheckResult(
+            name="skill-capability-audit",
+            status=Status.WARN,
+            detail=f"audit did not run — {result.config_error_reason}",
+            data={"config_error": True},
         )
     if result.instance_missing:
         # SKIP cascades cleanly through the rollup — matches other

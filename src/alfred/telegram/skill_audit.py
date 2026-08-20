@@ -83,6 +83,21 @@ class AuditResult:
     # instance vs update SKILL).
     instance_missing: bool = False
     instance_missing_reason: str = ""
+    # ``config_error`` is the LOUD sibling of ``instance_missing``, and the
+    # two exist separately because they used to be conflated. Both arrive
+    # as a ``TypeError`` out of ``load_talker_config``; only one of them
+    # means "nothing to audit."
+    #
+    #   * ``instance_missing`` — the operator hasn't configured a talker
+    #     instance. Genuinely nothing to audit → SKIP (quiet).
+    #   * ``config_error`` — the instance block is FINE but the config
+    #     failed to load anyway (a deployed YAML carrying a key whose
+    #     dataclass field no longer exists; ``_build`` has no unknown-key
+    #     filter, so it hands every key to the constructor). This
+    #     instance's talker daemon is DOWN. It must NOT be quiet — see
+    #     ``audit_skill`` for the discriminator and the incident.
+    config_error: bool = False
+    config_error_reason: str = ""
     registered_tools: list[str] = field(default_factory=list)
     advertised: list[str] = field(default_factory=list)
     missing_advertisements: list[str] = field(default_factory=list)
@@ -95,7 +110,14 @@ class AuditResult:
         Treats ``instance_missing`` as "clean" — there's nothing to
         audit. CLI exit-code uses this; BIT probe uses
         ``instance_missing`` directly to pick SKIP vs OK/WARN.
+
+        ``config_error`` is explicitly NOT clean: the config failed to
+        load, so the audit could not run at all. Reporting that as clean
+        would exit 0 and tell an operator script the SKILL is in sync
+        when nothing was compared.
         """
+        if self.config_error:
+            return False
         if self.instance_missing:
             return True
         return not self.missing_advertisements and not self.skill_missing
@@ -108,6 +130,10 @@ class AuditResult:
         is indistinguishable from broken. The audit MUST emit this
         even when there are no findings.
         """
+        if self.config_error:
+            return (
+                f"skill-audit: NOT RUN — {self.config_error_reason}"
+            )
         if self.instance_missing:
             return (
                 f"skill-audit: skipped — {self.instance_missing_reason}"
@@ -226,6 +252,10 @@ def audit_skill(raw: dict[str, Any]) -> AuditResult:
         * ``telegram`` section absent or ``instance.name`` missing →
           returns ``instance_missing=True`` (nothing to audit; caller
           surfaces as SKIP).
+        * Config fails to load for ANY OTHER reason while the instance
+          block is present and named → returns ``config_error=True``
+          (caller surfaces as WARN, deliberately NOT the quiet SKIP —
+          see the discriminator comment in the body).
         * Resolved ``SKILL.md`` doesn't exist → ``skill_missing=True``
           and every registered tool ends up in
           ``missing_advertisements`` (worst-case: nothing is
@@ -247,20 +277,87 @@ def audit_skill(raw: dict[str, Any]) -> AuditResult:
     try:
         config = load_talker_config(raw)
     except TypeError as exc:
-        # ``InstanceConfig.name`` is a required field with no default
-        # (per ``feedback_hardcoding_and_alfred_naming.md`` — we won't
-        # silently default to "Alfred"). A config without
-        # ``telegram.instance.name`` raises TypeError at load time;
-        # surface as instance_missing rather than blowing up.
+        # TWO very different failures both arrive here as TypeError, and
+        # telling them apart is the entire job of this branch.
+        #
+        # DOCUMENTED CASE — ``InstanceConfig.name`` is a required field
+        # with no default (per ``feedback_hardcoding_and_alfred_naming.md``
+        # — we won't silently default to "Alfred"), so a config whose
+        # ``telegram.instance`` block omits ``name`` raises TypeError at
+        # load. There is genuinely nothing to audit: SKIP is honest.
+        #
+        # EVERY OTHER TypeError is config DRIFT — a deployed YAML still
+        # carrying a key whose dataclass field no longer exists.
+        # ``_build`` has no unknown-key filter (it assigns every key
+        # straight through, then calls ``cls(**kwargs)``), so a retired
+        # field turns into ``TypeError: got an unexpected keyword
+        # argument``. That instance's talker DAEMON is down.
+        #
+        # Until 2026-08-20 this branch caught both and reported both as
+        # ``instance_missing``, asserting "telegram.instance config
+        # incomplete" about an instance block that was perfectly fine —
+        # and because ``_check_skill_capability_audit`` maps
+        # ``instance_missing`` to SKIP, and SKIP is in
+        # ``QUIET_HEALTH_STATUSES``, the health surface raised NO
+        # attention card. A misattribution generator on a health surface:
+        # the quiet outcome and the false reason reinforced each other.
+        #
+        # THE DISCRIMINATOR IS THE CONFIG SHAPE, NOT THE EXCEPTION'S
+        # MESSAGE. Matching on the TypeError text would re-break the
+        # moment CPython rewords its constructor errors. It is inspected
+        # only AFTER a TypeError has actually fired, which is why this is
+        # safe: a config that loads never reaches here at all.
+        #
+        # Driven across eight config shapes rather than reasoned about
+        # (``instance`` absent / present-without-name / name present /
+        # name present + drift / name "" / name None / name non-str /
+        # instance not-a-dict). The ``name``-KEY test is the exact
+        # trigger: an empty, None, or non-str name LOADS successfully
+        # and falls through to the ``"(unnamed)"`` path below, so none of
+        # those may be treated as absent. A non-dict ``instance`` block
+        # is malformed rather than "incomplete", so it takes the LOUD
+        # branch — unknown shapes fail OPEN into a card, matching the
+        # health-status denylist direction in ``CLAUDE.md``.
+        telegram_raw = raw.get("telegram")
+        instance_raw = (
+            telegram_raw.get("instance") if isinstance(telegram_raw, dict) else None
+        )
+        # ``load_from_unified`` coerces a falsy block with
+        # ``tool.get("instance", {}) or {}``, so absent / None / empty all
+        # mean the same thing here: no instance block at all.
+        instance_raw = instance_raw or {}
+        name_key_absent = isinstance(instance_raw, dict) and "name" not in instance_raw
+        if name_key_absent:
+            return AuditResult(
+                instance_name="",
+                tool_set="",
+                skill_bundle="",
+                skill_path=Path(""),
+                skill_missing=False,
+                instance_missing=True,
+                # Wording deliberately UNCHANGED by the 2026-08-20 fix. This
+                # phrase is TRUE for this arm — the instance config really is
+                # incomplete — and it is pinned by
+                # ``test_audit_skip_when_instance_name_missing``. The bug was
+                # never this string; it was this string being applied to the
+                # OTHER arm, where it is false.
+                instance_missing_reason=(
+                    f"telegram.instance config incomplete ({exc})"
+                ),
+            )
+        # Instance block is fine — this TypeError is something else, and
+        # the reason string says so instead of blaming the instance.
         return AuditResult(
             instance_name="",
             tool_set="",
             skill_bundle="",
             skill_path=Path(""),
             skill_missing=False,
-            instance_missing=True,
-            instance_missing_reason=(
-                f"telegram.instance config incomplete ({exc})"
+            config_error=True,
+            config_error_reason=(
+                f"talker config failed to load, so no audit ran "
+                f"(telegram.instance is present and named; this is not an "
+                f"instance-config problem) — {exc.__class__.__name__}: {exc}"
             ),
         )
     instance_name = (
@@ -336,6 +433,15 @@ def render_audit(result: AuditResult) -> str:
           SKILL bundle.
     """
     lines: list[str] = [result.summary_line]
+    if result.config_error:
+        # Summary line already carries the reason; add the explicit
+        # "no comparison happened" line so a reader can't mistake a
+        # finding-free render for a clean audit.
+        lines.append(
+            "CONFIG ERROR: the talker config did not load, so NO tool was "
+            "compared against any SKILL. This is not a clean result."
+        )
+        return "\n".join(lines)
     if result.instance_missing:
         # Summary line already conveys the SKIP reason — no extra lines.
         return "\n".join(lines)

@@ -20,12 +20,18 @@ What that failure looks like, DRIVEN against the field-removed mutant with an
 unmutated control rather than reasoned about:
   * LOUD, and this is the dominant half — ``load_from_unified`` raises, so the
     talker DAEMON fails to start, as do the talker CLI paths.
-  * QUIET, and misattributing — ``skill_audit``'s ``except TypeError`` around
-    ``load_talker_config`` exists for the missing-``instance.name`` case but
-    catches this one too, reporting ``instance_missing`` ("telegram.instance
-    config incomplete") when the instance config is perfectly fine.
-    ``_check_skill_capability_audit`` then returns SKIP, a QUIET health
-    status, so no attention card is raised. Control OK -> mutant SKIP.
+  * ALSO LOUD on the health surface, as of 2026-08-20 — this arm used to be
+    the QUIET one, and the correction is recorded here because this docstring
+    is where the next reader meets the claim. ``skill_audit``'s
+    ``except TypeError`` around ``load_talker_config`` exists for the
+    missing-``instance.name`` case but caught this one too, reporting
+    ``instance_missing`` ("telegram.instance config incomplete") when the
+    instance config was perfectly fine; ``_check_skill_capability_audit``
+    then returned SKIP, a QUIET health status, so no attention card was
+    raised. ``audit_skill`` now discriminates on the CONFIG SHAPE rather
+    than the exception class and returns ``config_error``, which the probe
+    maps to WARN. Re-measured against the same field-removal mutant after
+    the fix: control OK -> mutant WARN.
   * NOT the health-aggregator swallow. An earlier draft of this module
     blamed ``_load_tool_checks`` dropping the talker probe; that was FALSE —
     under the mutation ``alfred.telegram.health`` still imports and ``talker``
