@@ -614,7 +614,7 @@ def test_a_sort_can_never_reach_a_completion_or_accept_writer() -> None:
 
     "Sorting never fakes a commitment" is enforced by the dispatcher being
     separate, not by convention — so this reads the dispatcher's own code object
-    and asserts none of the completion/accept writers is reachable from it.
+    and asserts none of the completion/accept writers is referenced by it.
     """
     from alfred.daily_sync.action_router import _dispatch_slot_sort
 
