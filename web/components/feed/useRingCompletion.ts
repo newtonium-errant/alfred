@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { feedApi, type FeedItem } from '../../lib/algernon/feed';
+import { holdChoicesForVerb } from '../../lib/algernon/feedConstants';
 import { ApiError } from '../../lib/algernon/http';
 import { RING_ACTION_DONE, RING_ACTION_UNDO, ringItemDone } from '../../lib/algernon/rings';
 import {
@@ -85,6 +86,16 @@ export interface UseRingCompletionResult {
    * beyond this hook's own error line — see `ActOutcomeReporter`.
    */
   complete: (item: FeedItem, onOutcome?: ActOutcomeReporter) => void;
+  /**
+   * Complete an item WITH a chosen when-family verb — the ✓-hold selector's
+   * commit (backdated completion, 2026-08-20). ONE INTERACTION: same optimistic
+   * flip, same status map, same error routing as `complete`, with the chosen
+   * rung in place of the plain verb; never a second confirm. The verb must be
+   * one of the item's own served when-choices (`holdChoicesForVerb`) — anything
+   * else is a no-op, because a POST the wire never offered is a 400 in the
+   * operator's hand (the deck's `affirmWith` guard, same reasoning).
+   */
+  completeWith: (item: FeedItem, verb: string, onOutcome?: ActOutcomeReporter) => void;
   /** Undo a completed item. */
   undo: (item: FeedItem) => void;
   /**
@@ -256,6 +267,14 @@ export function useRingCompletion(opts: UseRingCompletionOptions = {}): UseRingC
     (item: FeedItem, onOutcome?: ActOutcomeReporter) => run(item, RING_ACTION_DONE, true, onOutcome),
     [run],
   );
+  const completeWith = useCallback(
+    (item: FeedItem, verb: string, onOutcome?: ActOutcomeReporter) => {
+      const choices = holdChoicesForVerb(item, RING_ACTION_DONE);
+      if (!choices || !choices.some((c) => c.verb === verb)) return;
+      run(item, verb, true, onOutcome);
+    },
+    [run],
+  );
   const undo = useCallback((item: FeedItem) => run(item, RING_ACTION_UNDO, false), [run]);
 
   const effectiveDone = useCallback(
@@ -282,5 +301,5 @@ export function useRingCompletion(opts: UseRingCompletionOptions = {}): UseRingC
   const errorFor = useCallback((id: string) => overrides[id]?.error ?? null, [overrides]);
   const noticeFor = useCallback((id: string) => overrides[id]?.notice ?? null, [overrides]);
 
-  return { effectiveDone, busy, errorFor, noticeFor, complete, undo, reconcile };
+  return { effectiveDone, busy, errorFor, noticeFor, complete, completeWith, undo, reconcile };
 }

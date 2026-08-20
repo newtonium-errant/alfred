@@ -1,12 +1,15 @@
 import { useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { CONTEST_SECTIONS, SNOOZE_ACTIONS, SNOOZE_LABELS, contestSectionSlug, kindLabel, snoozeIsBacked } from '../../lib/algernon/feedConstants';
+import { CONTEST_SECTIONS, SNOOZE_ACTIONS, SNOOZE_LABELS, contestSectionSlug, holdChoicesForVerb, kindLabel, snoozeIsBacked } from '../../lib/algernon/feedConstants';
 import { evidenceBody, evidenceExternalLink, evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
-import { COMPLETION_UNAVAILABLE_HINT, effectiveStageOf, ringItemCompletable, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
+import { COMPLETION_UNAVAILABLE_HINT, RING_ACTION_DONE, effectiveStageOf, ringItemCompletable, ringItemUndoable, type RingItemStage } from '../../lib/algernon/rings';
 import type { UseRingCompletionResult } from './useRingCompletion';
 import type { UseSlotAcceptResult } from './useSlotAccept';
 import type { UseSnoozeResult } from './useSnooze';
 import { EvidenceBody } from './EvidenceBody';
+import { HoldPressButton } from './HoldPressButton';
+import { HoldSelector } from './HoldSelector';
+import { WHEN_SELECTOR_NOTE, WHEN_SELECTOR_TITLE } from './whenSelector';
 
 // One feed row. Content is escaped React text only (evidence is untrusted display
 // data — no innerHTML, no href). The right-hand affordance is one of: an Ack
@@ -71,6 +74,9 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
   // The row's own duration menu. Local because it is per-row transient UI, not
   // board state — nothing outside this row needs to know it's open.
   const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
+  // The ✓-hold when-selector (backdated completion). Same per-row-transient
+  // reasoning as the snooze menu above.
+  const [whenOpen, setWhenOpen] = useState(false);
   // Same reasoning for the #72 section picker: transient, per-row, never lifted.
   const [sectionPickerOpen, setSectionPickerOpen] = useState(false);
   const rows = evidenceRows(item.evidence);
@@ -111,8 +117,14 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
   // item — the router refuses it, but the dead control would have promised.
   const snoozeOffered =
     !!snooze && snoozeIsBacked(item) && !done && !snoozed && !snooze.snoozed(item.id);
+  // The ✓-hold's when-family, wire-derived (null = no family served → the ✓
+  // stays a plain button). Computed only where a live ✓ can render.
+  const whenChoices =
+    completion && completable && !done && !snoozed && !suggested
+      ? holdChoicesForVerb(item, RING_ACTION_DONE)
+      : null;
   return (
-    <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="ui-panel rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
+    <li data-testid="feed-row" data-kind={item.kind} data-done={done} className="ui-panel relative rounded-xl border border-honeydew-200 bg-cream p-3 shadow-soft">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="mb-1 flex flex-wrap gap-1.5">
@@ -185,15 +197,18 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
               {acceptBusy ? '…' : 'Accept'}
             </button>
           ) : completable ? (
-            <button
-              type="button"
+            // Quick tap = done TODAY, unchanged. HOLDING the ✓ opens the
+            // when-selector when the wire served a when-family (backdated
+            // completion) — no family, plain button, no behaviour change.
+            <HoldPressButton
               data-testid="feed-row-complete"
               disabled={busy}
-              onClick={() => completion.complete(item)}
+              onTap={() => completion.complete(item)}
+              onHold={whenChoices ? () => setWhenOpen(true) : null}
               className="shrink-0 rounded-lg border border-honeydew-400 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-700 disabled:opacity-50"
             >
               {busy ? '…' : '✓ Done'}
-            </button>
+            </HoldPressButton>
           ) : (
             // Unknown / unstamped-origin lane — honest note, NO button (task is
             // completable now; only a slot with no writer-able origin lands here).
@@ -343,6 +358,24 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
             </dl>
           )}
         </div>
+      )}
+
+      {/* The when-selector — the ✓-hold's co-equal alternatives (backdated
+          completion). Choosing IS the completion: same hook path as the quick
+          tap with the chosen rung, one interaction, never a confirm. The
+          sheet anchors to this row (the li is `relative`), reading as part of
+          the held gesture like the deck's. */}
+      {whenOpen && whenChoices && (
+        <HoldSelector
+          title={WHEN_SELECTOR_TITLE}
+          note={WHEN_SELECTOR_NOTE}
+          choices={whenChoices}
+          onPick={(verb) => {
+            setWhenOpen(false);
+            completion?.completeWith(item, verb);
+          }}
+          onCancel={() => setWhenOpen(false)}
+        />
       )}
     </li>
   );

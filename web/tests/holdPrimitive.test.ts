@@ -15,6 +15,7 @@ import {
   SWIPE_X_THRESHOLD,
   hasSuggestedChoice,
   holdChoicesFor,
+  holdChoicesForVerb,
   inGestureHoldBand,
   inSnoozeHoldBand,
   isDeckCandidate,
@@ -205,5 +206,65 @@ describe('DEFER_QUICK_ACTION', () => {
     const rejectVerb = served.find((a) => a.gesture === 'reject');
     expect(rejectVerb?.verb).toBe(DEFER_QUICK_ACTION);
     expect(rejectVerb?.label).toBe('Not now');
+  });
+});
+
+// --- the verb-anchored evolution (backdated completion, 2026-08-20) ----------
+
+function slotItem(evidence: Record<string, unknown> = {}): FeedItem {
+  return withServedActions({
+    id: 'slot_suggestion:routine:Waste::Garbage Day',
+    kind: 'slot_suggestion',
+    instance: 'salem',
+    title: 'T1: Garbage Day',
+    mode: 'fyi',
+    attention: 'needs_you',
+    evidence: { tier: 1, routine_record: 'Waste', item_text: 'Garbage Day', ...evidence },
+    actions: [],
+    state: 'open',
+    created_at: '2026-08-20T00:00:00Z',
+    acted_at: null,
+    expires_at: null,
+    source_ref: {},
+  });
+}
+
+describe('holdChoicesForVerb — the ✓ anchor (a button has no swipe direction)', () => {
+  it('derives the when-family from the REAL wire fixture, anchor suggested', () => {
+    const choices = holdChoicesForVerb(slotItem({ backdate_limit_days: 3 }), 'done');
+    expect(choices).not.toBeNull();
+    expect(choices!.map((c) => c.verb)).toEqual(['done', 'done_1d', 'done_2d', 'done_3d']);
+    expect(choices!.map((c) => c.label)).toEqual(['Today', 'Yesterday', '2 days ago', '3 days ago']);
+    // The anchor — the plain control's own commit — is the suggested member.
+    expect(choices!.filter((c) => c.suggested).map((c) => c.verb)).toEqual(['done']);
+  });
+
+  it('a partially-served family keeps only the wire-admitted rungs', () => {
+    const choices = holdChoicesForVerb(slotItem({ backdate_limit_days: 1 }), 'done');
+    expect(choices!.map((c) => c.verb)).toEqual(['done', 'done_1d']);
+  });
+
+  it('a family of one is no family (limit 0 strips every rung)', () => {
+    expect(holdChoicesForVerb(slotItem({ backdate_limit_days: 0 }), 'done')).toBeNull();
+    expect(holdChoicesForVerb(slotItem({}), 'done')).toBeNull();
+  });
+
+  it('an anchor the wire never served, or one without a group, is null', () => {
+    expect(holdChoicesForVerb(slotItem({ backdate_limit_days: 3 }), 'no_such_verb')).toBeNull();
+    // `unsnooze` is served but carries no group.
+    expect(holdChoicesForVerb(slotItem({ backdate_limit_days: 3 }), 'unsnooze')).toBeNull();
+  });
+
+  it('holdChoicesFor is now the gesture-resolving wrapper — same family, one derivation', () => {
+    const item = sortItem({ proposed_slot: 'duty' });
+    expect(holdChoicesFor(item, 'affirm')).toEqual(holdChoicesForVerb(item, 'sort_duty'));
+  });
+
+  it('the deck slot card is untouched: its affirm (accept) anchors NO family', () => {
+    // The guard the gesture-free serving buys: a candidate's swipe stays
+    // Take-it, and holding it opens nothing — the when-family hangs off the
+    // BOARD's ✓, not the deck's affirm.
+    const candidate = slotItem({ candidate: true, backdate_limit_days: 3 });
+    expect(holdChoicesFor(candidate, 'affirm')).toBeNull();
   });
 });

@@ -37,9 +37,23 @@ export interface HoldSelectorProps {
   onPick: (verb: string) => void;
   /** Close without committing anything; the frozen card springs back. */
   onCancel: () => void;
+  /**
+   * The footer's undo promise, overridable because it is SURFACE truth, not
+   * pattern truth: the deck's picks ride the delayed-act cancel window, while
+   * the board's ✓-hold posts straight away with a real reversing Undo on the
+   * row — same one-interaction commit, different way back, and the sentence
+   * must say the one that is true where it renders.
+   */
+  note?: string;
 }
 
-export function HoldSelector({ title, choices, onPick, onCancel }: HoldSelectorProps) {
+export function HoldSelector({
+  title,
+  choices,
+  onPick,
+  onCancel,
+  note = 'Choosing records it straight away — same undo window as a swipe.',
+}: HoldSelectorProps) {
   return (
     <div
       data-testid="deck-hold-selector"
@@ -86,7 +100,7 @@ export function HoldSelector({ title, choices, onPick, onCancel }: HoldSelectorP
         ))}
       </div>
       <p className="mt-2 text-[11px] italic text-console-ink-faint">
-        Choosing records it straight away — same undo window as a swipe.
+        {note}
       </p>
     </div>
   );

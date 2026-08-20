@@ -65,15 +65,27 @@ export const SNOOZE_ACTED_VERB = 'snooze';
  *
  * THE VERB SPACE, enumerated from the source rather than from memory. The
  * capability ceiling for `slot_suggestion` is `FEED_ACTIONS['slot_suggestion']`
- * (daily_sync/action_router.py) — exactly: done, undo_done, accept, snooze_1d,
- * snooze_3d, snooze_7d, snooze_until_i_say, unsnooze. Of those, the verbs that can
- * PERSIST as `acted_action` are only these three:
- *   - `done`   → DONE     (action_router.py:1357/1388/1412, DONE_ACTION)
- *   - `accept` → PLANNED  (action_router.py:1610, ACCEPT_ACTION — committed, not
+ * (daily_sync/action_router.py) — exactly: done, done_1d, done_2d, done_3d,
+ * undo_done, accept, snooze_1d, snooze_3d, snooze_7d, snooze_until_i_say,
+ * unsnooze, and the three sort verbs (which never persist — the board sort
+ * dispatcher deliberately touches no state). Of those, the verbs that can
+ * PERSIST as `acted_action` are these:
+ *   - `done`   → DONE     (DONE_ACTION — the plain ✓, done today)
+ *   - `done_1d` / `done_2d` / `done_3d`
+ *              → DONE     (BACKDATE_DONE_ACTIONS, 2026-08-20 — the when-family
+ *                          rungs. The stamp is the TRUE verb, NOT collapsed to
+ *                          `done` like the snooze rungs, because the undo path
+ *                          derives the date to remove from it. A completed-
+ *                          yesterday item is exactly as finished as a
+ *                          completed-today one.)
+ *   - `accept` → PLANNED  (ACCEPT_ACTION — committed, not
  *                          completed; ✓ stays ENABLED so he can finish what he
  *                          accepted this morning, and no undo is rendered)
- *   - `snooze` → SNOOZED  (action_router.py:1164; ALL FOUR duration rungs collapse
- *                          to this one verb at the stamp site)
+ *   - `snooze` → SNOOZED  (ALL FOUR duration rungs collapse
+ *                          to this one verb at the stamp site — the durations
+ *                          differ but the STATE is one, and the until lives in
+ *                          the sidecar; the done rungs are the opposite call
+ *                          because their writes genuinely differ)
  * `undo_done` and `unsnooze` never appear here: both set STATE_OPEN, and a
  * non-acted transition clears the verb (feed/store.py:180). The generic act path
  * (action_router.py:2239) stamps other kinds' verbs — ack / confirm / reject /
@@ -97,6 +109,12 @@ export const SNOOZE_ACTED_VERB = 'snooze';
 export const ACTED_VERB_STAGE: Readonly<Record<string, RingItemStage>> = {
   accept: 'planned',
   done: 'done',
+  // The backdated rungs (2026-08-20). Absent from this map, the PLANNED
+  // fallback below would hand a just-backdated item a live ✓ — completion
+  // offered on something already complete, the accepted-then-ignored wall.
+  done_1d: 'done',
+  done_2d: 'done',
+  done_3d: 'done',
   [SNOOZE_ACTED_VERB]: 'snoozed',
 };
 

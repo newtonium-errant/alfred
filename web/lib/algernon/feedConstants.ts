@@ -386,13 +386,40 @@ export function holdChoicesFor(item: FeedItem, direction: 'affirm' | 'reject'): 
   const served = servedActions(item);
   const wanted = direction === 'affirm' ? GESTURE_AFFIRM : GESTURE_REJECT;
   const gestured = served.find((a) => a.gesture === wanted);
-  if (!gestured?.group) return null;
-  const family = served.filter((a) => a.group === gestured.group);
+  if (!gestured) return null;
+  return holdChoicesForVerb(item, gestured.verb);
+}
+
+/**
+ * The co-equal choices behind a HOLD anchored on a VERB — the primitive's
+ * verb-anchored evolution (backdated completion, 2026-08-20), of which
+ * `holdChoicesFor` above is now the gesture-resolving wrapper.
+ *
+ * WHY A SECOND ANCHOR EXISTS: the board's ✓ complete control is a BUTTON, and
+ * a button has no swipe direction to resolve a gestured verb from — its
+ * anchor IS its own verb (`done`). Direction stays a parameter of the band
+ * geometry above; verb-anchoring joins it as the family-derivation seam, and
+ * both produce the same wire-derived co-equal family: the anchor's `group`
+ * names it, every served verb sharing the group is in it, the anchor is the
+ * SUGGESTED member (the plain control's own commit — quick semantics
+ * unchanged), and a family of one is no family (a selector with one option is
+ * a confirm stage wearing a menu, which the pattern forbids).
+ *
+ * Same one-interaction invariant, same no-per-kind-map rule: the when-family
+ * arrives from the wire (`ACTION_META`'s `group: "when"` on `done`/`done_Nd`,
+ * per-item filtered by the server's `backdate_limit_days` stamp) — the client
+ * holds no rung table and no depth arithmetic.
+ */
+export function holdChoicesForVerb(item: FeedItem, anchorVerb: string): HoldChoice[] | null {
+  const served = servedActions(item);
+  const anchor = served.find((a) => a.verb === anchorVerb);
+  if (!anchor?.group) return null;
+  const family = served.filter((a) => a.group === anchor.group);
   if (family.length < 2) return null;
   return family.map((a) => ({
     verb: a.verb,
     label: a.label,
-    suggested: a.verb === gestured.verb,
+    suggested: a.verb === anchor.verb,
   }));
 }
 

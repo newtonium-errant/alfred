@@ -59,9 +59,21 @@ export function servedActionsForItem(
   kind: string,
   evidence: Record<string, unknown> = {},
 ): ServedActionFixture[] {
-  const verbs = servedActionsFor(kind);
-  if (kind === 'slot_suggestion' && evidence.candidate !== true) {
-    return verbs.filter((a) => a.verb !== 'accept');
+  let verbs = servedActionsFor(kind);
+  if (kind === 'slot_suggestion') {
+    if (evidence.candidate !== true) {
+      verbs = verbs.filter((a) => a.verb !== 'accept');
+    }
+    // The backdate-rung narrowing, mirroring the server's
+    // `backdate_limit_days` filter: a rung deeper than the item's stamped
+    // credit window is never served, so a fixture serving one would be a
+    // payload the server never sends. The depth map here is the MIRROR'S
+    // copy (this helper's whole job); the production client holds no such
+    // table — it derives the family purely from the served `group`.
+    const raw = evidence.backdate_limit_days;
+    const limit = typeof raw === 'number' && Number.isInteger(raw) ? raw : 0;
+    const depth: Record<string, number> = { done_1d: 1, done_2d: 2, done_3d: 3 };
+    verbs = verbs.filter((a) => !(a.verb in depth) || depth[a.verb] <= limit);
   }
   if (kind === 'sort_suggestion') {
     const proposedVerb = `sort_${String(evidence.proposed_slot ?? '')}`;

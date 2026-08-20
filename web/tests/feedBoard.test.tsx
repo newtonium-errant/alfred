@@ -163,6 +163,7 @@ function fakeCompletion(over: Partial<UseRingCompletionResult> = {}): UseRingCom
     errorFor: () => null,
     noticeFor: () => null,
     complete: vi.fn(),
+    completeWith: vi.fn(),
     undo: vi.fn(),
     reconcile: vi.fn(),
     ...over,
@@ -305,5 +306,107 @@ describe('FeedRow — C2 SUGGESTED stage (accept)', () => {
       <FeedRow item={suggested()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion()} accept={fakeAccept({ errorFor: () => "That's already on today's plan." })} />,
     );
     expect(screen.getByTestId('feed-row-completion-error').textContent).toContain('already on');
+  });
+});
+
+// --- the ✓-hold when-selector (backdated completion, 2026-08-20) -------------
+
+import { GESTURE_HOLD_MS } from '../lib/algernon/feedConstants';
+import { withServedActions } from './helpers/servedActions';
+
+describe('FeedRow — ✓-hold opens the when-selector', () => {
+  // A PLANNED routine row whose wire serves the when-family (limit 3). The
+  // fixture routes through withServedActions so the actions are the payload
+  // the server actually sends, never invented verbs.
+  const backdatable = (limit = 3) =>
+    withServedActions(
+      slot({
+        id: 'slot_suggestion:routine:Waste::Garbage Day',
+        title: 'T1: Garbage Day',
+        evidence: {
+          tier: 1, origin: 'routine_item', routine_record: 'Waste',
+          item_text: 'Garbage Day', backdate_limit_days: limit,
+        },
+      }),
+    );
+
+  const hold = (el: Element) => {
+    fireEvent.pointerDown(el, { button: 0 });
+    act(() => { vi.advanceTimersByTime(GESTURE_HOLD_MS); });
+    fireEvent.pointerUp(el);
+    fireEvent.click(el); // the browser's trailing click — must be swallowed
+  };
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('holding the ✓ opens the selector; the trailing click does NOT quick-complete', () => {
+    const complete = vi.fn();
+    const completeWith = vi.fn();
+    render(
+      <FeedRow item={backdatable()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion({ complete, completeWith })} />,
+    );
+    hold(screen.getByTestId('feed-row-complete'));
+    expect(screen.queryByTestId('deck-hold-selector')).not.toBeNull();
+    expect(screen.getByTestId('deck-hold-choice-done_1d').textContent).toContain('Yesterday');
+    // The suggested member is the plain verb — quick semantics unchanged.
+    expect(screen.getByTestId('deck-hold-choice-done').textContent).toContain('Today');
+    expect(complete).not.toHaveBeenCalled();
+    expect(completeWith).not.toHaveBeenCalled();
+  });
+
+  it('picking Yesterday IS the completion — one interaction, the chosen verb, sheet closed', () => {
+    const complete = vi.fn();
+    const completeWith = vi.fn();
+    render(
+      <FeedRow item={backdatable()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion({ complete, completeWith })} />,
+    );
+    hold(screen.getByTestId('feed-row-complete'));
+    fireEvent.click(screen.getByTestId('deck-hold-choice-done_1d'));
+    expect(completeWith).toHaveBeenCalledTimes(1);
+    expect(completeWith.mock.calls[0][1]).toBe('done_1d');
+    expect(complete).not.toHaveBeenCalled(); // never the quick verb on a pick
+    expect(screen.queryByTestId('deck-hold-selector')).toBeNull();
+  });
+
+  it('cancel commits nothing and closes the sheet', () => {
+    const complete = vi.fn();
+    const completeWith = vi.fn();
+    render(
+      <FeedRow item={backdatable()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion({ complete, completeWith })} />,
+    );
+    hold(screen.getByTestId('feed-row-complete'));
+    fireEvent.click(screen.getByTestId('deck-hold-cancel'));
+    expect(screen.queryByTestId('deck-hold-selector')).toBeNull();
+    expect(complete).not.toHaveBeenCalled();
+    expect(completeWith).not.toHaveBeenCalled();
+  });
+
+  it('a quick tap still quick-completes — today semantics unchanged (regression)', () => {
+    const complete = vi.fn();
+    render(
+      <FeedRow item={backdatable()} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion({ complete })} />,
+    );
+    fireEvent.pointerDown(screen.getByTestId('feed-row-complete'), { button: 0 });
+    fireEvent.pointerUp(screen.getByTestId('feed-row-complete')); // released before the hold clock
+    fireEvent.click(screen.getByTestId('feed-row-complete'));
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('deck-hold-selector')).toBeNull();
+  });
+
+  it('no when-family served (limit 0) → the ✓ is a plain button; holding opens nothing', () => {
+    const complete = vi.fn();
+    render(
+      <FeedRow item={backdatable(0)} expanded={false} onToggleEvidence={() => {}} completion={fakeCompletion({ complete })} />,
+    );
+    const btn = screen.getByTestId('feed-row-complete');
+    fireEvent.pointerDown(btn, { button: 0 });
+    act(() => { vi.advanceTimersByTime(GESTURE_HOLD_MS); });
+    fireEvent.pointerUp(btn);
+    expect(screen.queryByTestId('deck-hold-selector')).toBeNull();
+    // The positive control that the plain button still works after the hold
+    // attempt: no armed timer means the click is a click.
+    fireEvent.click(btn);
+    expect(complete).toHaveBeenCalledTimes(1);
   });
 });
