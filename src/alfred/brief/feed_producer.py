@@ -48,6 +48,9 @@ _AUTO_CANDIDATE_SOURCES = frozenset({
     "auto-due-routine",
     "auto-surface-routine",
     "auto-cadence-routine",
+    # FUEL-ESCALATION (2026-08-20): neglect-gap escalation into Duty.
+    # Auto-surfaced like its siblings — the operator still accepts it.
+    "auto-gap-escalated",
     "self-care",
 })
 

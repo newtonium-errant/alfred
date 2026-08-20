@@ -288,6 +288,9 @@ def _decide_tier_handoff(
     self_care: bool = False,
     default_escalate_at_days: int | None = None,
     default_surface_at_days: int | None = None,
+    escalate_after_gap_days: int | None = None,
+    explicit_slot: Any = None,
+    default_fuel_escalate_after_gap_days: int | None = None,
 ) -> int | None:
     """Decide if the item should be handed off to the tier section.
 
@@ -372,6 +375,11 @@ def _decide_tier_handoff(
         self_care=self_care,
         default_escalate_at_days=default_escalate_at_days,
         default_surface_at_days=default_surface_at_days,
+        escalate_after_gap_days=escalate_after_gap_days,
+        explicit_slot=explicit_slot,
+        default_fuel_escalate_after_gap_days=(
+            default_fuel_escalate_after_gap_days
+        ),
     )
 
     # Mutually-exclusive validator: both cadence modes set → warn +
@@ -397,6 +405,29 @@ def _decide_tier_handoff(
             ),
         )
 
+    # FUEL-ESCALATION (2026-08-20): per-item gap threshold on a
+    # deadline-bearing item — the second instance of the validator
+    # pattern directly above. Voiced HERE (the once-per-aggregate-pass
+    # call site) for the same no-spam reason; compute paths read the
+    # flag silently.
+    if classification.gap_escalation_conflict:
+        log.warning(
+            "routine.item_gap_escalation_with_due_pattern",
+            routine_record=routine_record,
+            item_text=item_text,
+            due_pattern_type=getattr(due_pattern, "type", None),
+            escalate_after_gap_days=escalate_after_gap_days,
+            detail=(
+                "item carries BOTH ``due_pattern`` (deadline-bearing, "
+                "cycle-based doneness) AND ``escalate_after_gap_days`` "
+                "(completion-gap escalation for no-deadline items). A "
+                "completion gap is undefined under cycle semantics; "
+                "``due_pattern`` wins and the gap field is ignored. "
+                "Operator should remove one of the two — deadline items "
+                "escalate via ``escalate_at_days`` (days before due)."
+            ),
+        )
+
     return classification.tier
 
 
@@ -407,6 +438,7 @@ def _collect_items_for_today(
     quiet: bool = False,
     default_escalate_at_days: int | None = None,
     default_surface_at_days: int | None = None,
+    default_fuel_escalate_after_gap_days: int | None = None,
 ) -> tuple[list[dict], list[str], list[str]]:
     """Group items by priority for today.
 
@@ -532,6 +564,17 @@ def _collect_items_for_today(
             # Q2 (2026-06-26): parse self_care for the dedicated T3
             # self-care lane. Shared coercion (no drift across readers).
             self_care = _coerce_self_care(raw_item.get("self_care", False))
+            # FUEL-ESCALATION (2026-08-20): neglect-gap escalation
+            # threshold — same defensive coercion as its siblings above.
+            gap_escalate_raw = raw_item.get("escalate_after_gap_days")
+            try:
+                escalate_after_gap_days = (
+                    int(gap_escalate_raw)
+                    if gap_escalate_raw is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                escalate_after_gap_days = None
 
             # T1/T2 handoff path: only Critical/Tracked items with
             # due_pattern. T3 handoff path: any item with
@@ -555,10 +598,31 @@ def _collect_items_for_today(
             # the tier render path. Regression-pinned by
             # ``tests/tier/test_compute.py::test_mirror_aspirational_t1_predicate_matches_aggregator``
             # per ``feedback_two_layer_window_math_mirror``.
+            # FUEL-ESCALATION (2026-08-20): a NO-deadline item can now hand
+            # off via the neglect-gap escalation — per-item threshold, or
+            # the fuel-slot config default. The check-gate must admit those
+            # shapes or the aggregator (which SUPPRESSES handed-off items)
+            # and the compute path (which SURFACES them, and calls the
+            # classifier on every item) would disagree — the double-render
+            # the mirror pins exist for. ``due_pattern is None`` is
+            # load-bearing here: gap escalation is a no-deadline mechanism,
+            # and widening the gate for due_pattern items would hand
+            # ASPIRATIONAL deadline items to the classifier, whose adapter
+            # passes ``priority=None`` (the call-site filter is the
+            # operative aspirational gate — see _decide_tier_handoff's
+            # NOTE). When the default is configured but the item is not
+            # fuel-slotted, the classifier resolves no threshold and
+            # answers exactly as before — one extra cheap call, zero
+            # behaviour change.
+            gap_escalation_possible = due_pattern is None and (
+                escalate_after_gap_days is not None
+                or default_fuel_escalate_after_gap_days is not None
+            )
             should_check_handoff = (
                 (due_pattern is not None and priority != "aspirational")
                 or target_cadence_days is not None
                 or self_care
+                or gap_escalation_possible
             )
             if should_check_handoff:
                 handoff_tier = _decide_tier_handoff(
@@ -573,6 +637,11 @@ def _collect_items_for_today(
                     self_care=self_care,
                     default_escalate_at_days=default_escalate_at_days,
                     default_surface_at_days=default_surface_at_days,
+                    escalate_after_gap_days=escalate_after_gap_days,
+                    explicit_slot=raw_item.get("slot"),
+                    default_fuel_escalate_after_gap_days=(
+                        default_fuel_escalate_after_gap_days
+                    ),
                 )
                 if handoff_tier is not None:
                     # Compute days_to_due for the log only when
@@ -860,6 +929,9 @@ def run_aggregator_once(
         records, today,
         default_escalate_at_days=getattr(_td, "escalate_at_days", None),
         default_surface_at_days=getattr(_td, "surface_at_days", None),
+        default_fuel_escalate_after_gap_days=getattr(
+            _td, "fuel_escalate_after_gap_days", None,
+        ),
     )
     no_routines_overall = not items
     if no_routines_overall and records:

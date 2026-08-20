@@ -33,6 +33,7 @@ answer rather than a default bucket.
 ===  =========================================  ============  ==================
  #   Rule                                       Slot          Basis
 ===  =========================================  ============  ==================
+ 0   ``gap_escalated`` (neglect escalation)     Duty          The operator's standing ruling — see below
  1   Explicit ``slot:`` on the item/record      *as written*  Operator's word is final
  2   Learned override for this identity         *as learned*  DEFERRED — see below
  3   ``self_care: true``                        Fuel          Already means "intrinsic"
@@ -41,6 +42,20 @@ answer rather than a default bucket.
  6   ``origin == "task"`` WITH a due date       Duty          A dated task is an obligation
  7   anything else                              unslotted     Refuse to guess
 ===  =========================================  ============  ==================
+
+**Rule 0 outranks rule 1 on purpose, and it is not a violation of "the
+operator's word is final" — it is a COLLISION of two of his words, resolved
+toward the more specific one.** ``gap_escalated`` is stamped by
+``classify_routine_item`` when a no-deadline item's days-since-last-completion
+crosses its escalation threshold (the FUEL-ESCALATION model, operator-ratified
+2026-08-20: "Duty is mostly for anything that is escalated from either of
+those" — fuel and rhythm). The record's ``slot: fuel`` says what the item IS;
+the escalation ruling says where a NEGLECTED one presses today. Precedent:
+:func:`resolve_effective_slot` already lets an ``escalate_to`` boundary outrank
+``return_slot`` for returning tasks — same shape, same direction. The visit is
+an overlay like every other verdict here: nothing is written to the record, so
+the item's home slot is untouched and it returns to it on the projection after
+the gap closes.
 
 Rules 4 and 5 are mutually exclusive at the semantic level (``routine/config``
 prefers ``due_pattern`` when an item carries both), so their order matters only
@@ -118,6 +133,7 @@ ALL_SLOT_VALUES: frozenset[str] = frozenset(CANONICAL_SLOTS) | {SLOT_UNSLOTTED}
 # that is Duty because the operator wrote ``slot: duty`` and one that is Duty
 # because it is a dated task are the same answer for different reasons, and the
 # coverage telemetry is far less useful if it cannot tell them apart.
+RULE_GAP_ESCALATED = "gap_escalated"
 RULE_EXPLICIT = "explicit"
 RULE_LEARNED = "learned"
 RULE_SELF_CARE = "self_care"
@@ -146,7 +162,7 @@ SLOT_ALIASES: dict[str, str] = {
 }
 
 
-def normalize_slot(raw: Any) -> str | None:
+def normalize_slot(raw: Any, *, warn_unrecognized: bool = True) -> str | None:
     """Coerce an operator-written ``slot:`` value to a canonical key, or None.
 
     Case- and whitespace-insensitive, because this reads hand-edited
@@ -164,6 +180,15 @@ def normalize_slot(raw: Any) -> str | None:
     ``return_slot`` would otherwise present as "the operator's ruling quietly
     did nothing". Absent and blank values are NOT logged: they mean "not set",
     which is ordinary.
+
+    ``warn_unrecognized=False`` is for the ONE caller that is contractually a
+    no-log pure predicate — ``tier.compute.classify_routine_item`` resolves the
+    fuel-slot escalation default through here, and it runs per-brief-fire +
+    per-``/today`` with ``capture_logs`` pins asserting silence. Quieting THIS
+    read hides nothing: the same raw value is read loudly by
+    :func:`classify_slot` (rule 1) in the same projection, so a typo still gets
+    exactly one warning per projection instead of two. The normalisation itself
+    stays one owner either way — the flag gates the log line, never the answer.
     """
     if not isinstance(raw, str):
         return None
@@ -173,7 +198,7 @@ def normalize_slot(raw: Any) -> str | None:
     aliased = SLOT_ALIASES.get(value)
     if aliased is not None:
         return aliased
-    if value:
+    if value and warn_unrecognized:
         log.warning(
             "tier.slots.unrecognized_slot_value",
             value=value,
@@ -335,10 +360,11 @@ def classify_slot(entry: Any, *, learned: SlotOverrides) -> SlotVerdict:
     """Classify one ``TierEntry`` into a slot. Never raises, never guesses.
 
     ``entry`` is duck-typed rather than imported to keep ``tier.compute`` →
-    ``tier.slots`` a one-way dependency; the fields read are ``explicit_slot``,
-    ``self_care``, ``has_due_pattern``, ``target_cadence_days``, ``origin`` and
-    ``due_iso``, each accessed defensively so an older entry shape degrades to
-    ``unslotted`` rather than crashing the whole projection.
+    ``tier.slots`` a one-way dependency; the fields read are ``gap_escalated``,
+    ``explicit_slot``, ``self_care``, ``has_due_pattern``,
+    ``target_cadence_days``, ``origin`` and ``due_iso``, each accessed
+    defensively so an older entry shape degrades to ``unslotted`` rather than
+    crashing the whole projection.
 
     Note the deliberate split between ``entry.explicit_slot`` (the operator's
     frontmatter value — an INPUT, rule 1) and ``entry.slot`` (this function's
@@ -349,6 +375,20 @@ def classify_slot(entry: Any, *, learned: SlotOverrides) -> SlotVerdict:
     ``learned`` is required — see the module docstring on the optional-gate
     trap.
     """
+    # Rule 0 — neglect escalation (FUEL-ESCALATION, 2026-08-20). A no-deadline
+    # item whose completion gap crossed its escalation threshold is VISITING
+    # Duty by the operator's own standing ruling ("Duty is mostly for anything
+    # that is escalated"). Outranks rule 1 because the record's ``slot: fuel``
+    # and the escalation ruling are both his words, and the ruling is the more
+    # specific one about a neglected item's today — see the module docstring's
+    # rule-0 note (and ``resolve_effective_slot``'s identical direction for
+    # returning tasks). ``gap_escalated`` is a producer-stamped FACT from
+    # ``classify_routine_item``, never operator frontmatter, so this cannot be
+    # forged from a record — and it is recomputed every projection, so the item
+    # returns to its home slot the moment the gap closes.
+    if bool(getattr(entry, "gap_escalated", False)):
+        return SlotVerdict(SLOT_DUTY, RULE_GAP_ESCALATED)
+
     # Rule 1 — the operator's own word, on the record. Outranks everything,
     # including a learned override: an explicit field is a more recent and more
     # deliberate statement than an accumulated one.
@@ -460,6 +500,7 @@ __all__ = [
     "RULE_DATED_TASK",
     "RULE_DUE_PATTERN",
     "RULE_EXPLICIT",
+    "RULE_GAP_ESCALATED",
     "RULE_LEARNED",
     "RULE_NONE",
     "RULE_SELF_CARE",
