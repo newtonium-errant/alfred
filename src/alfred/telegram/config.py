@@ -189,25 +189,39 @@ class SttBackendConfig:
 
 @dataclass
 class SttShadowCaptureConfig:
-    """STT shadow-capture — R1-baseline corpus builder (STT test series,
-    ``algernon-stt-test-series-2026-06-27``).
+    """RETIRED capability's config block — KEPT FOR YAML BACK-COMPAT ONLY.
 
-    DEFAULT-OFF, additive, fully isolated from the served voice turn. When
-    ``enabled`` every voice note runs BOTH engines (Groq still serves the
-    user via the M1 chain; the second engine is the only extra call) and the
-    audio + both transcripts + their word-level divergence are appended to a
-    replayable corpus under ``dir``. The corpus.jsonl is shaped to be
-    consumed directly by the replay harness (``stt_replay.py`` modes
-    ``divergences`` / ``score``) — the live capture IS R1's data, no replay
-    pass needed.
+    This block once configured the BATCH STT shadow-capture (R1-baseline
+    corpus builder, ``algernon-stt-test-series-2026-06-27``): when enabled,
+    every Telegram voice note ran BOTH engines and appended the audio + both
+    transcripts + their divergence to a replayable corpus. Its only door was
+    ``bot.py``'s ``on_voice``, deleted in T4 C3 (50460499); the operator
+    ruled "agreed retire" and ``telegram/stt_shadow.py`` was DELETED in R2
+    (2026-08-20). **Nothing reads these fields.** Setting ``enabled: true``
+    does nothing at all.
 
-    Back-compat: an instance with NO ``shadow_capture:`` block loads with
-    ``enabled=False`` and behaves EXACTLY as today (no extra call, no files).
+    The STREAMING twin is alive and unaffected: ``web/voice_stt_shadow.py``
+    on the WebRTC path, configured by the SEPARATE
+    ``web.voice.stt.shadow_capture`` block (``WebSttShadowCaptureConfig`` in
+    ``web/config.py``). Same concept, different referent — the two
+    ``config.yaml.example`` ``shadow_capture:`` blocks (:911, :1006) are
+    BOTH that web one; this Telegram block was never in the example file.
 
-    Only meaningful with a 2-engine ``chain:`` configured (Groq + Deepgram):
-    a 1-engine legacy single-Groq chain records ``deepgram={error:
-    "not_in_chain"}`` and ``divergence=1.0`` every note (no second engine to
-    compare). All current production configs carry the 2-engine chain.
+    WHY THE DATACLASS SURVIVES ITS MODULE (the T5 pattern —
+    ``TodayCommandConfig`` feca775f, ``InstanceConfig.aliases`` 656d1a87):
+    ``_build`` has NO unknown-key filter — it assigns every key straight
+    through and calls ``cls(**kwargs)``. A deployed YAML still carrying
+    ``telegram: stt: shadow_capture:`` would therefore raise ``TypeError``
+    at load the instant this field stopped existing, and that failure is
+    NOT loud: ``health/aggregator._load_tool_checks`` swallows the import
+    error and silently drops the talker probe from the registry. Verified
+    empirically, both directions, by
+    ``tests/telegram/test_stt_shadow_config_compat.py`` — whose
+    ``test_unknown_stt_key_still_raises`` is the positive control proving
+    the tolerance is THIS FIELD and not loader permissiveness.
+
+    Removing this block is therefore a config-migration task (drop the key
+    from every deployed YAML first), not a code cleanup.
     """
 
     enabled: bool = False
@@ -241,7 +255,8 @@ class STTConfig:
     #
     # ``vocab_learning_enabled`` gates CAPTURE ONLY and defaults OFF, per the
     # convention every other judgment surface follows (routine_match,
-    # tier_recurrence, shadow_capture). Default-OFF is not timidity here: capture
+    # tier_recurrence; the batch shadow_capture was a fourth until R2 retired
+    # it 2026-08-20). Default-OFF is not timidity here: capture
     # writes the operator's own message text to a new file, and Hypatia's voice
     # traffic is CLINICAL. An instance opts in deliberately; it is never decided
     # for them by a default.
@@ -256,7 +271,10 @@ class STTConfig:
     #: is live even when capture is off, so a term approved before an instance
     #: disabled capture keeps biasing.
     vocab_decided_path: str = DEFAULT_STT_VOCAB_DECIDED_PATH
-    # --- shadow-capture (R1-baseline corpus builder; default-OFF) ---
+    # --- shadow-capture: RETIRED (R2, 2026-08-20) ---
+    # Kept ONLY so a deployed YAML carrying the block still loads; no code
+    # reads it. See SttShadowCaptureConfig's docstring for why removing it
+    # is a config migration, not a cleanup.
     shadow_capture: SttShadowCaptureConfig = field(
         default_factory=SttShadowCaptureConfig
     )
@@ -643,11 +661,15 @@ _DATACLASS_MAP: dict[str, type] = {
     "vault": VaultConfig,
     "anthropic": AnthropicConfig,
     "stt": STTConfig,
-    # ``shadow_capture`` is a sub-block of ``stt`` — its name is unique (no
-    # other dataclass has a field by this key), so registering it here lets
-    # ``_build`` recurse stt.shadow_capture → SttShadowCaptureConfig without
-    # the collision footgun. All its fields default, so the empty-dict trap
-    # is moot (omitted block → enabled=False).
+    # ``shadow_capture`` is a sub-block of ``stt`` — its name is unique
+    # WITHIN THIS MAP (web's same-named block is hand-rolled by
+    # ``web/config.py:_build_shadow_capture`` and never reaches here), so
+    # registering it lets ``_build`` recurse stt.shadow_capture →
+    # SttShadowCaptureConfig without the collision footgun. All its fields
+    # default, so the empty-dict trap is moot (omitted block → enabled=False).
+    # RETIRED capability (R2, 2026-08-20) — this entry is load-bearing for
+    # BACK-COMPAT ONLY: without it a YAML carrying the block builds a plain
+    # dict into the field instead of the dataclass. Kept with the field.
     "shadow_capture": SttShadowCaptureConfig,
     "session": SessionConfig,
     "logging": LoggingConfig,
