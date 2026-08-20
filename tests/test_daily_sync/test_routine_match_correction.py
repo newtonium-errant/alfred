@@ -24,6 +24,7 @@ importantly, everything the resolver must REFUSE:
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -415,9 +416,24 @@ def test_one_off_needs_no_vault(tmp_path: Path) -> None:
 
 
 def _pending(query: str, matched_to: str, *, record: str = "Weekly") -> mc.PendingMatch:
+    # DERIVED FROM WALL CLOCK, never a literal — the age-out drop in
+    # `filter_pending_for_review` is judged against REAL time when no `today=`
+    # is threaded (`today = today or date.today()`, match_calibration.py), and
+    # the callers in this file thread none. The first draft froze
+    # captured_at at 2026-08-04, a dated suite regression set to red on
+    # 2026-08-26 when the 21-day `DEFAULT_PENDING_MAX_AGE_DAYS` window
+    # crossed it: test_plain_reject_does_not_suppress_a_different_candidate
+    # would lose its row to `aged_out` and fail over CORRECT production
+    # behavior (its one-off sibling survives only because that drop is
+    # checked before the age check). Derived at one day back, the row stays
+    # "recently captured, well inside the window" forever. Windows in
+    # wall-clock-predicate tests are derived, never literal (gate rule,
+    # 2026-08-19).
+    captured = datetime.now(timezone.utc) - timedelta(days=1)
     return mc.PendingMatch(
         query=query, matched_to=matched_to, record=record, confidence=0.4,
-        completion_date="2026-08-04", captured_at="2026-08-04T09:00:00+00:00",
+        completion_date=captured.date().isoformat(),
+        captured_at=captured.isoformat(),
     )
 
 
