@@ -1232,6 +1232,9 @@ def test_build_turn_payload_is_deterministic() -> None:
     assert a == b
     assert a == {
         "reply": "yo",
+        # Always-present since the capture toggle (R1 2026-08-20): a
+        # normal turn is captured: False by shape, never by absence.
+        "captured": False,
         "session_key": "sess-1",
         "ts": "2026-06-29T00:00:01Z",
         "user_ts": "2026-06-29T00:00:00Z",
@@ -1248,6 +1251,7 @@ def test_build_turn_payload_empty_transcript_defaults_blank() -> None:
     payload = _build_turn_payload(session, 0, "reply", "sess-1")
     assert payload == {
         "reply": "reply",
+        "captured": False,
         "session_key": "sess-1",
         "ts": "",
         "user_ts": "",
@@ -1399,6 +1403,9 @@ def test_register_web_routes_enabled_mounts_chat_and_auth(tmp_path) -> None:
         "/chat/open",
         "/chat/turn",
         "/chat/stream",
+        # R1 (2026-08-20) — the capture toggle: capture as a mode within
+        # any conversation, server-truth span state.
+        "/chat/capture",
         "/chat/history/{session_key}",
         # #94(c) — the read-only probe that lets a stale key RESUME the live
         # session instead of opening over the top of it.

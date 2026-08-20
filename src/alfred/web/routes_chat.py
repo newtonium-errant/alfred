@@ -539,6 +539,10 @@ def _build_turn_payload(
     user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
     payload: dict[str, Any] = {
         "reply": reply,
+        # Always-present (capture toggle, R1 2026-08-20): False on every
+        # normal turn so the shape never branches; the capture receipt
+        # (:func:`_build_capture_receipt`) is the True case.
+        "captured": False,
         "session_key": session_key,
         "ts": assistant_ts,
         "user_ts": user_ts,
@@ -550,6 +554,37 @@ def _build_turn_payload(
         payload["ticket_uid"] = filed["ticket_uid"]
         payload["title"] = filed.get("title", "")
     return payload
+
+
+def _build_capture_receipt(
+    session_obj: Any,
+    pre_len: int,
+    session_key: str,
+    *,
+    deduped: bool = False,
+) -> dict[str, Any]:
+    """The captured-turn response — a RECEIPT, not a reply (R1 capture mode).
+
+    While capture is ON the engine's ``session_type == "capture"``
+    short-circuit persists the user turn and returns ``CAPTURE_SENTINEL``
+    without any model call — there IS no assistant turn, so
+    :func:`_build_turn_payload`'s ``transcript[-1]`` read would misreport
+    the user's own turn as the assistant stamp. This builder is the
+    captured shape: same always-present fields (``reply`` empty, ``ts``
+    empty — no assistant turn exists), ``captured: True``, and the
+    ``user_ts`` of the just-persisted turn so the client can stamp its
+    received indicator. The sentinel itself NEVER reaches the wire.
+    """
+    transcript = session_obj.transcript or []
+    user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
+    return {
+        "reply": "",
+        "captured": True,
+        "session_key": session_key,
+        "ts": "",
+        "user_ts": user_ts,
+        "deduped": deduped,
+    }
 
 
 def _user_name_for(identity: Any, web_config: WebConfig) -> str | None:
@@ -613,6 +648,9 @@ def _cached_turn_payload(
     """
     return {
         "reply": cached.get("reply", ""),
+        # A retried CAPTURED turn must dedup to a captured receipt, not a
+        # blank normal reply — the flag rides the idempotency cache.
+        "captured": bool(cached.get("captured", False)),
         "session_key": session_key,
         "ts": cached.get("ts", ""),
         "user_ts": cached.get("user_ts", ""),
@@ -833,8 +871,14 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
 
-    from alfred.telegram.conversation import run_turn
+    from alfred.telegram import capture_spans
+    from alfred.telegram.conversation import CAPTURE_SENTINEL, run_turn
     from alfred.telegram.session import Session, record_turn_idempotency
+
+    # Capture mode is SERVER truth (R1): the turn path consults the state
+    # the toggle wrote, never a client-asserted flag — a stale client
+    # cannot bypass an active capture, and a refreshed one resumes it.
+    capture_on = capture_spans.capture_active(active_dict)
 
     session_obj = Session.from_dict(active_dict)
 
@@ -941,6 +985,11 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 user_name=user_name,
                 channel="web",
                 image_blocks=image_blocks,
+                # Capture mode (R1): drives the engine's preserved
+                # ``session_type == "capture"`` short-circuit — the turn is
+                # persisted as span material, NO model call happens, and
+                # the sentinel comes back instead of a reply.
+                session_type="capture" if capture_on else None,
             )
         except Exception as exc:  # noqa: BLE001 — surface engine errors as 502
             classified = classify_engine_error(exc)
@@ -966,36 +1015,58 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 status=502,
             )
 
-        # Assemble the response via the shared helper so the buffered body
-        # is byte-identical to the stream's terminal ``done`` frame.
-        payload = _build_turn_payload(
-            session_obj, pre_len, reply, session_key, deduped=False
-        )
+        # Assemble the response via the shared helpers so the buffered body
+        # is byte-identical to the stream's terminal ``done`` frame. A
+        # captured turn gets the RECEIPT shape (no assistant turn exists;
+        # the sentinel never reaches the wire).
+        if reply == CAPTURE_SENTINEL:
+            payload = _build_capture_receipt(
+                session_obj, pre_len, session_key, deduped=False
+            )
+        else:
+            payload = _build_turn_payload(
+                session_obj, pre_len, reply, session_key, deduped=False
+            )
 
-        # Cache for retry-safe dedup (only when a key was supplied).
+        # Cache for retry-safe dedup (only when a key was supplied). A
+        # captured turn caches the RECEIPT (blank reply + captured flag),
+        # so a retry dedups to the same receipt without re-appending the
+        # user turn.
         if idempotency_key:
             record_turn_idempotency(
                 state_mgr,
                 session_obj,
                 key=idempotency_key,
                 result={
-                    "reply": reply,
+                    "reply": payload["reply"],
+                    "captured": payload["captured"],
                     "ts": payload["ts"],
                     "user_ts": payload["user_ts"],
                     "msg_hash": _msg_hash(message),
                 },
             )
 
-        log.info(
-            "web.chat.turn_complete",
-            user=identity.user,
-            session_key=session_key,
-            user_kind=kind,
-            reply_chars=len(reply or ""),
-            assistant_ts=payload["ts"],
-            user_ts=payload["user_ts"],
-            deduped=False,
-        )
+        if payload["captured"]:
+            log.info(
+                "web.chat.turn_captured",
+                user=identity.user,
+                session_key=session_key,
+                user_kind=kind,
+                user_ts=payload["user_ts"],
+                detail="capture on — turn persisted as span material, no "
+                       "model call, receipt returned",
+            )
+        else:
+            log.info(
+                "web.chat.turn_complete",
+                user=identity.user,
+                session_key=session_key,
+                user_kind=kind,
+                reply_chars=len(reply or ""),
+                assistant_ts=payload["ts"],
+                user_ts=payload["user_ts"],
+                deduped=False,
+            )
         return web.json_response(payload)
     finally:
         in_flight.discard(session_key)
@@ -1062,8 +1133,12 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
 
-    from alfred.telegram.conversation import run_turn
+    from alfred.telegram import capture_spans
+    from alfred.telegram.conversation import CAPTURE_SENTINEL, run_turn
     from alfred.telegram.session import Session, record_turn_idempotency
+
+    # Capture mode is SERVER truth (R1) — same consult as /chat/turn.
+    capture_on = capture_spans.capture_active(active_dict)
 
     session_obj = Session.from_dict(active_dict)
 
@@ -1189,6 +1264,8 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
             channel="web",
             image_blocks=image_blocks,
             on_event=_on_event,
+            # Capture mode (R1): same server-truth threading as /chat/turn.
+            session_type="capture" if capture_on else None,
         )
     )
 
@@ -1261,34 +1338,55 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
                 pass
         return resp
 
-    payload = _build_turn_payload(
-        session_obj, pre_len, reply, session_key, deduped=False
-    )
+    # Captured turn → the RECEIPT shape as the terminal ``done`` frame —
+    # byte-identical to /chat/turn's captured body (shared builder).
+    if reply == CAPTURE_SENTINEL:
+        payload = _build_capture_receipt(
+            session_obj, pre_len, session_key, deduped=False
+        )
+    else:
+        payload = _build_turn_payload(
+            session_obj, pre_len, reply, session_key, deduped=False
+        )
 
-    # Cache for retry-safe dedup (only when a key was supplied).
+    # Cache for retry-safe dedup (only when a key was supplied). Captured
+    # turns cache the receipt (blank reply + captured flag), same as
+    # /chat/turn.
     if idempotency_key:
         record_turn_idempotency(
             state_mgr,
             session_obj,
             key=idempotency_key,
             result={
-                "reply": reply,
+                "reply": payload["reply"],
+                "captured": payload["captured"],
                 "ts": payload["ts"],
                 "user_ts": payload["user_ts"],
                 "msg_hash": _msg_hash(message),
             },
         )
 
-    log.info(
-        "web.chat.stream_complete",
-        user=identity.user,
-        session_key=session_key,
-        user_kind=kind,
-        reply_chars=len(reply or ""),
-        assistant_ts=payload["ts"],
-        user_ts=payload["user_ts"],
-        deduped=False,
-    )
+    if payload["captured"]:
+        log.info(
+            "web.chat.stream_captured",
+            user=identity.user,
+            session_key=session_key,
+            user_kind=kind,
+            user_ts=payload["user_ts"],
+            detail="capture on — turn persisted as span material, no "
+                   "model call, receipt frame emitted",
+        )
+    else:
+        log.info(
+            "web.chat.stream_complete",
+            user=identity.user,
+            session_key=session_key,
+            user_kind=kind,
+            reply_chars=len(reply or ""),
+            assistant_ts=payload["ts"],
+            user_ts=payload["user_ts"],
+            deduped=False,
+        )
     if not client_gone["v"]:
         try:
             await _sse_write_event(resp, "done", payload)
@@ -1351,11 +1449,110 @@ async def _handle_chat_active(request: web.Request) -> web.StreamResponse:
     return web.json_response({"session_key": session_key, "turns": turns})
 
 
+async def _handle_chat_capture(request: web.Request) -> web.StreamResponse:
+    """POST /chat/capture — toggle capture mode ON/OFF for the live session.
+
+    R1 (2026-08-20): the unobtrusive capture toggle. Body:
+    ``{"session_key": "...", "on": true|false}``.
+
+    SERVER truth: the toggle writes ``_capture_active`` +
+    ``_capture_spans`` onto the active-session dict (capture_spans
+    module), and the turn handlers consult THAT state — never a
+    client-asserted flag. So a refresh mid-capture resumes capturing, and
+    span boundaries are decided by request arrival order at the server:
+    the turn that arrived one tick before toggle-on is NOT captured; the
+    toggle-on turn onward is.
+
+    Refused while a turn is in flight (409 ``turn_in_flight``): a span
+    boundary stamped mid-append could land on either side of the turn
+    being processed, and an exact boundary is the whole contract. The
+    composer disables during a send, so the operator never meets this in
+    normal use.
+
+    Toggling OFF returns ``closed_span`` (``{"index", "turns"}``) for the
+    just-closed non-empty span — the extraction offer's data — or
+    ``null`` when the span was empty (discarded, logged) or capture was
+    already off. Both directions are idempotent.
+
+    Auth is the shared web-chat spine (``resolve_web_identity``) on the
+    existing mount, so it inherits the ``WEB_CHAT_PEER`` pin from
+    ``auth_middleware`` — no new asserted-identity surface.
+    """
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+
+    identity = resolve_web_identity(request, web_config)
+    if identity is None:
+        return web.json_response({"error": "invalid_session"}, status=401)
+
+    body = await _read_json_body(request)
+    if isinstance(body, web.Response):
+        return body
+    session_key = body.get("session_key")
+    on = body.get("on")
+    if not isinstance(on, bool):
+        return web.json_response(
+            {"error": "on_required",
+             "detail": "body must carry on: true|false"},
+            status=400,
+        )
+
+    active_dict = state_mgr.get_active(identity.synthetic_chat_id)
+    if active_dict is None or active_dict.get("session_id") != session_key:
+        return web.json_response({"error": "no_such_session"}, status=404)
+
+    in_flight = request.app[KEY_WEB_INFLIGHT]
+    if session_key in in_flight:
+        log.warning(
+            "web.chat.capture_toggle_in_flight",
+            user=identity.user,
+            session_key=session_key,
+            on=on,
+            detail="a turn is running — span boundary would be ambiguous; "
+                   "rejecting the toggle",
+        )
+        return web.json_response({"error": "turn_in_flight"}, status=409)
+
+    from alfred.telegram import capture_spans
+
+    closed_span: dict[str, Any] | None = None
+    if on:
+        state = capture_spans.begin_capture(
+            state_mgr, identity.synthetic_chat_id
+        )
+    else:
+        state, closed_span = capture_spans.end_capture(
+            state_mgr, identity.synthetic_chat_id
+        )
+    log.info(
+        "web.chat.capture_toggled",
+        user=identity.user,
+        session_key=session_key,
+        on=on,
+        spans=len(state["spans"]),
+        closed_span_turns=(closed_span or {}).get("turns"),
+    )
+    return web.json_response({
+        "session_key": session_key,
+        "capture_active": state["capture_active"],
+        "spans": state["spans"],
+        # Always present — null is the explicit "no span closed" signal
+        # (empty span discarded, or an idempotent repeat), so the client
+        # never has to distinguish a missing field from an absent offer.
+        "closed_span": closed_span,
+    })
+
+
 async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
     """GET /chat/history/{session_key} — current active session transcript.
 
     M1 surfaces the CURRENT active session only (closed-session / vault-
     record history is a later milestone). Tool plumbing is flattened out.
+
+    Capture toggle (R1): the response also carries ``capture_active`` +
+    ``capture_spans`` (always present) — history is the one endpoint every
+    bootstrap path ends on, so this is where a refreshed client learns it
+    is still capturing (server truth, not client memory).
     """
     web_config: WebConfig = request.app[KEY_WEB_CONFIG]
     state_mgr = request.app[KEY_WEB_STATE_MGR]
@@ -1379,7 +1576,13 @@ async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
             user=identity.user,
             session_key=session_key,
         )
-    return web.json_response({"turns": turns})
+    from alfred.telegram import capture_spans
+
+    return web.json_response({
+        "turns": turns,
+        "capture_active": capture_spans.capture_active(active_dict),
+        "capture_spans": capture_spans.spans_summary(active_dict),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1473,6 +1676,7 @@ def register_web_routes(
     app.router.add_post("/chat/open", _handle_chat_open)
     app.router.add_post("/chat/turn", _handle_chat_turn)
     app.router.add_post("/chat/stream", _handle_chat_stream)
+    app.router.add_post("/chat/capture", _handle_chat_capture)
     app.router.add_get("/chat/history/{session_key}", _handle_chat_history)
     app.router.add_get("/chat/active", _handle_chat_active)
 
@@ -1481,6 +1685,7 @@ def register_web_routes(
         "/chat/active",
         "/chat/turn",
         "/chat/stream",
+        "/chat/capture",
         "/chat/history/{session_key}",
     ]
 
