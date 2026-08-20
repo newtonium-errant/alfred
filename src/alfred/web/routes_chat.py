@@ -11,6 +11,8 @@ Route surface (M1, non-streaming):
     POST /chat/open                  → { session_key }
     POST /chat/turn                  → { reply, session_key }
     GET  /chat/history/{session_key} → { turns: [...] }
+    POST /chat/capture               → { capture_active, spans, closed_span }
+    POST /chat/capture/extract       → { ok, record, notes, skipped_reason }
 
 Auth layering: every non-``/health`` route is gated by the transport
 ``auth_middleware`` (Layer 1, peer token — "this front-end may talk to
@@ -20,9 +22,17 @@ me"). Layer 2 resolves the *verified named user* via the mode-aware
 * ``session`` mode (the login instance, e.g. Salem) — an instance-signed
   ``X-Alfred-Session`` token (``require_web_session``).
 * ``relay`` mode (cross-instance targets, e.g. KAL-LE / Hypatia / VERA) —
-  an asserted ``X-Alfred-User`` header (verified NAME only, gated by the
-  Layer-1 ``web`` peer token), re-resolved against THIS instance's own
-  ``web.users``. Mirrors the ``/vault/ingest`` relay-auth model.
+  an asserted ``X-Alfred-User`` header (verified NAME only, gated at
+  Layer 1 by the ``web`` peer token or the vouched ``rrts_relay`` one —
+  the two peers ``_resolve_relay_identity`` admits), re-resolved against
+  THIS instance's own ``web.users``. Mirrors the ``/vault/ingest``
+  relay-auth model.
+
+The two ``/chat/capture*`` routes are the ONE exception to that two-peer
+admit: they peer-pin ``web`` alone (:func:`_resolve_capture_identity`,
+401 ``wrong_peer``) because span extraction drives vault writes outside
+the scope machinery that bounds a vouched reporter. See that helper's
+docstring for the derivation.
 
 M1 deferral (NOTE-1): web turns do NOT inject ``calibration_str`` /
 ``pushback_level`` — those are populated by the Telegram session-type
@@ -56,9 +66,9 @@ from alfred.telegram.api_errors import (
 )
 from alfred.vault.scope import RRTS_INTAKE_ROLE
 
-from .auth import resolve_web_identity
+from .auth import WEB_CHAT_PEER, resolve_web_identity
 from .config import WebConfig, resolve_signing_secret
-from .identity import check_synthetic_id_collisions
+from .identity import WebIdentity, check_synthetic_id_collisions
 from .keys import (
     KEY_WEB_ANTHROPIC,
     KEY_WEB_AUTH_STATE,
@@ -1517,6 +1527,77 @@ async def _handle_chat_active(request: web.Request) -> web.StreamResponse:
     return web.json_response({"session_key": session_key, "turns": turns})
 
 
+# ---------------------------------------------------------------------------
+# Capture toggle + span extraction (R1, 2026-08-20)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_capture_identity(
+    request: web.Request,
+) -> tuple[WebIdentity | None, web.Response | None]:
+    """Auth spine for BOTH capture routes — ``(identity, error_response)``.
+
+    Exactly one of the pair is non-``None``. ONE helper rather than two
+    copies: the two routes are halves of one act (open a span, extract
+    it), and a second spelling of this gate is how one endpoint ends up
+    admitting a peer the other refuses.
+
+    Ordering is load-bearing (CLAUDE.md "Relay / asserted-identity routes
+    — peer-pin requirement"):
+
+    1. **Peer-pin FIRST** — ``transport_peer`` must be the dedicated chat
+       ``web`` peer (:data:`alfred.web.auth.WEB_CHAT_PEER`), checked
+       BEFORE identity resolution and before ANY session read or write,
+       so a refused request touches nothing.
+    2. **Identity** — :func:`resolve_web_identity`, fail-closed 401
+       ``invalid_session``, unchanged from the other ``/chat/*`` routes.
+
+    Why the pin is NARROWER here than on ``/chat/turn``. The chat routes
+    admit two peers (``web`` and the vouched ``rrts_relay``) and that is
+    safe because every chat turn is scope-mediated: ``run_turn`` /
+    ``resolve_scope`` map an ``RRTS_INTAKE_ROLE`` identity to the fixed,
+    heavily-restricted ``rrts_intake`` scope, so a leaked ``rrts_relay``
+    token is bounded. ``/chat/capture/extract`` does NOT go through that
+    machinery — it drives ``vault_create`` + structuring (task emission)
+    + note extraction DIRECTLY off ``talker_config``, i.e. at the
+    instance's own authority. So the bound that makes ``rrts_relay`` safe
+    for chat does not exist on this surface, and a leaked reporter token
+    could otherwise turn reporter-controlled content into vault notes and
+    tasks. The pin is what keeps ``auth.py``'s "bounded — cannot escalate
+    scope" property TRUE.
+
+    Peer-pin (401 ``wrong_peer``) rather than the role-refusal (403
+    ``forbidden``) shape used by ``routes_notify`` / ``routes_day``: those
+    refuse a reporter because the DATA is the operator's (a recipient
+    question, and the caller is authenticated-but-not-entitled). Here the
+    question is what the TOKEN may authorise — a route performing
+    unmediated vault writes requires the chat peer's authority — which is
+    the ``routes_brief`` / ``routes_brief_audio`` single-peer shape, and
+    it refuses one layer earlier. It is also closed-by-default: a future
+    third peer added to ``_resolve_relay_identity`` is refused here until
+    somebody widens THIS list on purpose.
+    """
+    peer = request.get("transport_peer", "")
+    if peer != WEB_CHAT_PEER:
+        log.warning(
+            "web.chat.capture_wrong_peer",
+            reason="wrong_peer",
+            peer=peer or "(none)",
+            expected=WEB_CHAT_PEER,
+            detail="capture toggle / span extraction drives unmediated "
+                   "vault writes — it requires the dedicated chat 'web' "
+                   "peer token, not rrts_relay / web_ingest — rejecting "
+                   "(401)",
+        )
+        return None, web.json_response({"error": "wrong_peer"}, status=401)
+
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    identity = resolve_web_identity(request, web_config)
+    if identity is None:
+        return None, web.json_response({"error": "invalid_session"}, status=401)
+    return identity, None
+
+
 async def _handle_chat_capture(request: web.Request) -> web.StreamResponse:
     """POST /chat/capture — toggle capture mode ON/OFF for the live session.
 
@@ -1542,16 +1623,17 @@ async def _handle_chat_capture(request: web.Request) -> web.StreamResponse:
     ``null`` when the span was empty (discarded, logged) or capture was
     already off. Both directions are idempotent.
 
-    Auth is the shared web-chat spine (``resolve_web_identity``) on the
-    existing mount, so it inherits the ``WEB_CHAT_PEER`` pin from
-    ``auth_middleware`` — no new asserted-identity surface.
+    Auth is :func:`_resolve_capture_identity` — the chat ``web`` peer-pin
+    (401 ``wrong_peer``) BEFORE identity, then the usual mode-aware
+    identity resolution. NOT the plain ``/chat/*`` spine: this route is
+    the door onto span extraction, so it admits one peer, not two.
     """
-    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
     state_mgr = request.app[KEY_WEB_STATE_MGR]
 
-    identity = resolve_web_identity(request, web_config)
-    if identity is None:
-        return web.json_response({"error": "invalid_session"}, status=401)
+    identity, err = _resolve_capture_identity(request)
+    if err is not None:
+        return err
+    assert identity is not None  # exactly one of the pair is non-None
 
     body = await _read_json_body(request)
     if isinstance(body, web.Response):
@@ -1628,14 +1710,22 @@ async def _handle_chat_capture_extract(
     ``span_not_found``, 409 ``span_open`` / ``already_extracted`` (the
     latter carrying the existing record + notes) / 409
     ``extraction_in_flight`` on a double-tap.
+
+    Auth is :func:`_resolve_capture_identity` — the chat ``web`` peer-pin
+    (401 ``wrong_peer``) BEFORE identity or any state read. This handler
+    is the reason that pin is narrower than the chat spine's: the work
+    below runs ``vault_create`` + structuring + note extraction off
+    ``talker_config`` directly, OUTSIDE the ``run_turn`` / ``resolve_scope``
+    machinery that bounds a vouched ``rrts_relay`` identity everywhere
+    else in this file.
     """
-    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
     state_mgr = request.app[KEY_WEB_STATE_MGR]
     talker_config = request.app[KEY_WEB_TALKER_CONFIG]
 
-    identity = resolve_web_identity(request, web_config)
-    if identity is None:
-        return web.json_response({"error": "invalid_session"}, status=401)
+    identity, err = _resolve_capture_identity(request)
+    if err is not None:
+        return err
+    assert identity is not None  # exactly one of the pair is non-None
 
     body = await _read_json_body(request)
     if isinstance(body, web.Response):

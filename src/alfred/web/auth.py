@@ -87,6 +87,15 @@ WEB_CHAT_PEER = "web"
 # ``telegram/conversation.py::resolve_scope``). A leaked ``rrts_relay`` token
 # can spoof a reporter name on a HELD ticket — bounded; it cannot escalate
 # scope or reach GitHub (the de-PHI/forward interlock holds).
+#
+# That bound is a property of SCOPE-MEDIATED routes, not of the peer: it holds
+# because every ``rrts_relay`` request that reaches the engine goes through
+# ``run_turn`` / ``resolve_scope``. A route that acts at the INSTANCE's own
+# authority instead — ``/chat/capture/extract`` drives ``vault_create`` +
+# structuring + note extraction directly off ``talker_config`` — is outside
+# the bound and must peer-pin ``WEB_CHAT_PEER`` alone
+# (``routes_chat._resolve_capture_identity``). Any future unmediated route
+# resolving identity through this module owes the same pin.
 RRTS_RELAY_PEER = "rrts_relay"
 
 
@@ -432,7 +441,11 @@ def _resolve_relay_identity(
       keys a per-reporter session so each staff member has an independent
       thread. (Security: a leaked ``rrts_relay`` token can spoof a reporter
       name on a HELD ticket — bounded; it cannot escalate scope or reach
-      GitHub.)
+      GitHub. The bound is SCOPE-MEDIATION, not the peer — it holds for
+      every route whose work runs through ``run_turn`` / ``resolve_scope``.
+      A route acting at the instance's own authority instead must pin
+      ``WEB_CHAT_PEER`` alone and refuse this peer; the ``/chat/capture*``
+      routes do exactly that, which is what keeps this sentence true.)
 
     Fail-closed (→ the handler emits a 401):
 

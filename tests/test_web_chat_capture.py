@@ -18,6 +18,13 @@ import structlog
 
 from alfred.telegram import capture_spans
 from alfred.telegram.state import StateManager
+from alfred.transport.config import (
+    AuthConfig,
+    AuthTokenEntry,
+    ServerConfig,
+    StateConfig,
+    TransportConfig,
+)
 from alfred.transport.server import build_app
 from alfred.transport.state import TransportState
 from alfred.web.auth import USER_HEADER
@@ -27,12 +34,18 @@ from alfred.web.state import WebAuthState
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 from tests.test_web_routes_chat import (
     DUMMY_WEB_INGEST_TOKEN,
+    DUMMY_WEB_PEER_TOKEN,
     _make_talker_config,
     _parse_sse,
+    _relay_web_config,
     _session_headers,
     _transport_config,
     _web_config,
 )
+
+# Obviously-fake fixture credential (no realistic provider prefix — the
+# GitGuardian rule); mirrors ``tests/test_web_notify.py``'s constant.
+DUMMY_RRTS_RELAY_TOKEN = "DUMMY_RRTS_RELAY_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234"
 
 
 def _build_capture_app(tmp_path, responses):  # type: ignore[no-untyped-def]
@@ -49,6 +62,65 @@ def _build_capture_app(tmp_path, responses):  # type: ignore[no-untyped-def]
     register_web_routes(
         app,
         web_config=_web_config(),
+        web_auth_state=web_auth_state,
+        anthropic_client=fake,
+        state_mgr=state_mgr,
+        talker_config=talker_config,
+        system_prompt_provider=lambda: "SYSTEM PROMPT",
+        vault_context_str="VAULT CONTEXT",
+        allowed_user_ids=[1],
+    )
+    app["_t_state_mgr"] = state_mgr
+    app["_t_talker_config"] = talker_config
+    return app, fake
+
+
+def _relay_transport_config() -> TransportConfig:
+    """Transport config with the chat ``web`` peer AND the vouched
+    ``rrts_relay`` peer — BOTH carrying ``allowed_clients: [web]``.
+
+    That sharing is the whole point (same shape as the ``web_ingest``
+    fixture in ``tests/test_web_routes_chat.py``): an ``rrts_relay``
+    request clears Layer 1 cleanly, so a 401 on a capture route can ONLY
+    have come from the Layer-2 peer-pin under test — never from
+    ``auth_middleware`` refusing the client name.
+    """
+    return TransportConfig(
+        server=ServerConfig(),
+        auth=AuthConfig(
+            tokens={
+                "web": AuthTokenEntry(
+                    token=DUMMY_WEB_PEER_TOKEN, allowed_clients=["web"],
+                ),
+                "rrts_relay": AuthTokenEntry(
+                    token=DUMMY_RRTS_RELAY_TOKEN, allowed_clients=["web"],
+                ),
+            }
+        ),
+        state=StateConfig(),
+    )
+
+
+def _build_relay_capture_app(tmp_path, responses):  # type: ignore[no-untyped-def]
+    """RELAY-mode twin of :func:`_build_capture_app`.
+
+    Relay mode is where the escalation is reachable: the ``rrts_relay``
+    identity only RESOLVES on the asserted-header path, so a session-mode
+    app would refuse it at Layer 2 for the wrong reason and the pin would
+    be vacuous.
+    """
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_relay_transport_config(), tstate)
+
+    state_mgr = StateManager(tmp_path / "talker_state.json")
+    state_mgr.load()
+    talker_config = _make_talker_config(tmp_path)
+    web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
+    web_auth_state.load()
+    fake = FakeAnthropicClient(responses)
+    register_web_routes(
+        app,
+        web_config=_relay_web_config(),
         web_auth_state=web_auth_state,
         anthropic_client=fake,
         state_mgr=state_mgr,
@@ -505,21 +577,160 @@ async def test_capture_route_auth_gates(capture_client) -> None:
     )
     assert r.status == 401
 
-    # Valid Layer-1 web_ingest token + asserted user — must NOT clear the
-    # web-chat identity spine (WEB_CHAT_PEER pin).
-    r = await client.post(
-        "/chat/capture",
-        json={"session_key": key, "on": True},
-        headers={
-            "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
-            "X-Alfred-Client": "web",
-            USER_HEADER: "andrew",
-        },
-    )
+    # Valid Layer-1 web_ingest token + asserted user — refused by the
+    # WEB_CHAT_PEER pin. The REASON is asserted, not just the status: a
+    # 401 with error=invalid_session would mean the identity layer
+    # happened to refuse it and the peer-pin could be absent entirely.
+    with structlog.testing.capture_logs() as captured:
+        r = await client.post(
+            "/chat/capture",
+            json={"session_key": key, "on": True},
+            headers={
+                "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
+                "X-Alfred-Client": "web",
+                USER_HEADER: "andrew",
+            },
+        )
     assert r.status == 401
+    assert (await r.json())["error"] == "wrong_peer"
+    events = [
+        c for c in captured
+        if c.get("event") == "web.chat.capture_wrong_peer"
+    ]
+    assert len(events) == 1
+    assert events[0]["reason"] == "wrong_peer"
+    assert events[0]["peer"] == "web_ingest"
     # POSITIVE CONTROL: the real headers still work after the refusals.
     state = await _toggle(client, headers, key, True)
     assert state["capture_active"] is True
+
+
+async def test_capture_routes_peer_pinned_against_rrts_relay(
+    aiohttp_client, tmp_path
+) -> None:
+    """LOAD-BEARING peer-pin (CLAUDE.md "Relay / asserted-identity routes").
+
+    The vouched ``rrts_relay`` peer is a FIRST-CLASS caller of
+    ``/chat/turn`` — ``_resolve_relay_identity`` admits it and
+    ``_user_name_for`` threads its reporter name into ``run_turn``. That
+    is safe there ONLY because ``resolve_scope`` maps it to the fixed
+    ``rrts_intake`` scope. ``/chat/capture/extract`` runs ``vault_create``
+    + structuring + note extraction off ``talker_config`` directly,
+    outside that machinery, so a leaked reporter token would otherwise
+    turn reporter-controlled content into the operator's notes and tasks.
+
+    Driven in RELAY mode (where the reporter identity actually resolves),
+    both routes, both directions:
+
+    * the reporter is refused 401 ``wrong_peer`` on BOTH routes, with the
+      logged reason — not merely "some 401";
+    * NOTHING is touched by the refusal (no model call, no vault record,
+      the operator's own span state byte-unchanged);
+    * POSITIVE CONTROL on the LIVE path: the ``web`` peer, over the same
+      wire, in the same relay mode, on the SAME span, extracts to a real
+      record — so the pin discriminates the PEER, not relay mode, and not
+      "the route refuses everyone".
+    """
+    import frontmatter as fmlib
+
+    app, fake = _build_relay_capture_app(tmp_path, [
+        _batch_summary_response(),
+        _extract_note_response({
+            "name": "Reporter Boundary Holds",
+            "body": "The capture door admits one peer.",
+            "confidence_tier": "high",
+            "source_quote": "the pin is what keeps the bound true",
+        }),
+    ])
+    client = await aiohttp_client(app)
+
+    owner = {
+        "Authorization": f"Bearer {DUMMY_WEB_PEER_TOKEN}",
+        "X-Alfred-Client": "web",
+        USER_HEADER: "andrew",
+    }
+    reporter = {
+        "Authorization": f"Bearer {DUMMY_RRTS_RELAY_TOKEN}",
+        "X-Alfred-Client": "web",
+        USER_HEADER: "Dana Dispatcher",
+    }
+
+    # Operator opens a session and closes one real span (relay mode).
+    key = await _open(client, owner)
+    await _toggle(client, owner, key, True)
+    for msg in (
+        "the pin is what keeps the bound true for the relay peer",
+        "span extraction runs outside resolve_scope entirely",
+    ):
+        r = await client.post(
+            "/chat/turn", json={"session_key": key, "message": msg},
+            headers=owner,
+        )
+        assert (await r.json())["captured"] is True
+    state = await _toggle(client, owner, key, False)
+    assert state["closed_span"] == {"index": 0, "turns": 2}
+    assert len(fake.messages.calls) == 0  # capture made no model call
+
+    vault = tmp_path / "vault"
+    sessions_before = sorted(p.name for p in (vault / "session").iterdir())
+    r = await client.get(f"/chat/history/{key}", headers=owner)
+    spans_before = (await r.json())["capture_spans"]
+
+    # ---- the escalation drive: BOTH routes, the reporter peer ----
+    with structlog.testing.capture_logs() as captured:
+        r = await client.post(
+            "/chat/capture", json={"session_key": key, "on": True},
+            headers=reporter,
+        )
+        assert r.status == 401
+        assert (await r.json())["error"] == "wrong_peer"
+
+        r = await client.post(
+            "/chat/capture/extract",
+            json={"session_key": key, "span_index": 0},
+            headers=reporter,
+        )
+        assert r.status == 401
+        assert (await r.json())["error"] == "wrong_peer"
+
+    events = [
+        c for c in captured
+        if c.get("event") == "web.chat.capture_wrong_peer"
+    ]
+    assert len(events) == 2  # one per route — the WHY, not just the 401
+    assert {e["reason"] for e in events} == {"wrong_peer"}
+    assert {e["peer"] for e in events} == {"rrts_relay"}
+    assert {e["expected"] for e in events} == {"web"}
+    # The reporter's asserted name never became an identity: the pin
+    # fires BEFORE resolve_web_identity, so the vouched-identity log the
+    # relay path would otherwise emit is absent.
+    assert not [
+        c for c in captured
+        if c.get("event") == "web.auth.relay_vouched_identity"
+    ]
+
+    # ---- nothing out there was touched by the refusals ----
+    assert len(fake.messages.calls) == 0
+    assert sorted(p.name for p in (vault / "session").iterdir()) == (
+        sessions_before
+    )
+    r = await client.get(f"/chat/history/{key}", headers=owner)
+    assert (await r.json())["capture_spans"] == spans_before
+
+    # ---- POSITIVE CONTROL: the web peer extracts the SAME span ----
+    r = await client.post(
+        "/chat/capture/extract",
+        json={"session_key": key, "span_index": 0},
+        headers=owner,
+    )
+    assert r.status == 200, await r.text()
+    body = await r.json()
+    assert body["ok"] is True
+    assert body["record"].startswith("session/capture-")
+    assert len(body["notes"]) == 1
+    span_post = fmlib.load(vault / body["record"])
+    assert span_post["session_type"] == "capture"
+    assert "resolve_scope" in span_post.content
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +1051,14 @@ async def test_reopen_without_spans_keeps_heuristic_path(
 
 
 async def test_extract_requires_auth(capture_client) -> None:
+    """All three gates, each named by its own reason — a bare ``401``
+    cannot tell them apart, and a peer-pin asserted only by status is
+    green against a build that has no peer-pin at all:
+
+    * no bearer at all  → Layer 1 ``missing_bearer``;
+    * chat ``web`` peer, no session token → identity ``invalid_session``;
+    * valid ``web_ingest`` peer token → the peer-pin ``wrong_peer``.
+    """
     client, fake = capture_client
     headers = _session_headers()
     key = await _open(client, headers)
@@ -848,13 +1067,32 @@ async def test_extract_requires_auth(capture_client) -> None:
         json={"session_key": key, "span_index": 0},
     )
     assert r.status == 401
+    assert (await r.json())["error"] == "missing_bearer"
     r = await client.post(
         "/chat/capture/extract",
         json={"session_key": key, "span_index": 0},
         headers={
-            "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
+            "Authorization": f"Bearer {DUMMY_WEB_PEER_TOKEN}",
             "X-Alfred-Client": "web",
-            USER_HEADER: "andrew",
         },
     )
     assert r.status == 401
+    assert (await r.json())["error"] == "invalid_session"
+    with structlog.testing.capture_logs() as captured:
+        r = await client.post(
+            "/chat/capture/extract",
+            json={"session_key": key, "span_index": 0},
+            headers={
+                "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
+                "X-Alfred-Client": "web",
+                USER_HEADER: "andrew",
+            },
+        )
+    assert r.status == 401
+    assert (await r.json())["error"] == "wrong_peer"
+    events = [
+        c for c in captured
+        if c.get("event") == "web.chat.capture_wrong_peer"
+    ]
+    assert len(events) == 1
+    assert events[0]["peer"] == "web_ingest"
