@@ -79,12 +79,21 @@ export function HoldSelector({
           Cancel
         </button>
       </div>
+      {/*
+        KEYED ON THE TARGET WHEN THERE IS ONE. A STATIC family's members are
+        distinct verbs, so the verb identifies the row. An OPEN-SET family's
+        members all share one verb (the anchor's) and differ only by target —
+        so keying on the verb gives every row the SAME key and the SAME
+        testid: React logs a duplicate-key warning and no test can address an
+        individual row. `c.target ?? c.verb` is the identity of a choice on
+        either arm.
+      */}
       <div className="flex flex-col gap-2">
         {choices.map((c) => (
           <button
-            key={c.verb}
+            key={c.target ?? c.verb}
             type="button"
-            data-testid={`deck-hold-choice-${c.verb}`}
+            data-testid={`deck-hold-choice-${c.target ?? c.verb}`}
             onClick={() => onPick(c.verb, c.target)}
             className="flex items-baseline justify-between rounded-sm border border-console-edge-bright bg-console-raise px-3 py-2 text-left text-sm font-semibold text-console-ink hover:border-affirm hover:text-affirm"
           >

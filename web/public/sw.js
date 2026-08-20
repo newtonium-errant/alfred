@@ -110,7 +110,7 @@
 //     deck-only feature reaches a SHELL_ROUTE's precached HTML, which is
 //     exactly why this is measured rather than reasoned.
 //     MEASURED, SAME-DIRECTORY: chunk `867-b471888c356fa567` ->
-//     `867-1464b291153f86bb`, the ONLY line that moves across all four
+//     `867-52f99e0323a97329`, the ONLY line that moves across all four
 //     SHELL_ROUTES' chunk refs — it appears in `/` alone, while `/login`,
 //     `/ingest` and `/share` are byte-identical. Ruled CAUSAL.
 //     WHAT DID NOT CHANGE, checked rather than assumed: the global

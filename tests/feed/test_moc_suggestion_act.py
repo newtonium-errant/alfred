@@ -28,6 +28,7 @@ from alfred.feed.model import STATE_ACTED, STATE_DEFERRED, STATE_OPEN
 from alfred.surveyor.moc_suggester import MocSuggestion
 from alfred.surveyor.moc_suggestion_queue import load_queue, upsert_proposals
 from alfred.tier.sort_proposal import corrections_path_for
+from alfred.vault.scope import MOC_MIRROR_TYPE
 
 
 def _vault(tmp_path: Path) -> Path:
@@ -40,8 +41,11 @@ def _vault(tmp_path: Path) -> Path:
 
 
 def _moc(vault: Path, stem: str) -> str:
+    # ``MOC``, NOT ``moc`` — see the note in tests/test_moc_apply_scope.py.
+    # Sourced from the derived constant so the fixture cannot drift from the
+    # registry the production gate reads.
     (vault / "MOC" / f"{stem}.md").write_text(
-        f"---\ntype: moc\nname: {stem}\ncreated: 2026-08-20\n---\n\n# Contents\n\n",
+        f"---\ntype: {MOC_MIRROR_TYPE}\nname: {stem}\ncreated: 2026-08-20\n---\n\n# Contents\n\n",
         encoding="utf-8",
     )
     return f"MOC/{stem}.md"
@@ -229,7 +233,7 @@ def test_the_mirror_arm_does_not_open_a_general_body_surface(
     # A body write on a MEMBER record is refused, and for the mirror reason.
     with pytest.raises(ScopeError) as exc:
         vault_edit(vault, member, body_append="TAMPER", scope="moc_apply")
-    assert "may only write bodies on 'moc' records" in str(exc.value)
+    assert f"may only write bodies on '{MOC_MIRROR_TYPE}' records" in str(exc.value)
     assert "TAMPER" not in (vault / member).read_text(encoding="utf-8")
 
     # Frontmatter may not ride along with a mirror write.
@@ -447,11 +451,20 @@ def test_a_partial_apply_keeps_the_row_and_the_card(tmp_path: Path) -> None:
     target = _moc(vault, "Roman Philosophy MOC")
     _moc(vault, "Stoicism MOC")
     good = _member(vault, "Memento Mori")
-    missing = "zettel/Vanished.md"
-    _row(queue, suggestion_id="ms-1", target=target, members=[good, missing])
+    doomed = _member(vault, "Vanishes Mid Sitting")
+    _row(queue, suggestion_id="ms-1", target=target, members=[good, doomed])
     store = FeedStore(str(tmp_path / "feed.jsonl"))
     cfg = _ds_config(tmp_path, queue)
     card = _deal(vault, queue, store)[0]
+
+    # THE REAL RACE, and the only route to a partial now that the deal-time
+    # predicate exists: both members were readable and eligible when the card
+    # was dealt, and one disappears before the operator's tap lands. A member
+    # that was ALREADY missing at deal time is no longer dealt as work at all
+    # — which is the BLOCK-3 fix, and it means this pin had to be rewritten
+    # around a genuine deal-then-vanish rather than a card that should never
+    # have been built.
+    (vault / doomed).unlink()
 
     result = _act(store, cfg, card.id, MOC_APPLY_ACTION, vault, target=target)
 
@@ -470,9 +483,12 @@ def test_a_partial_apply_keeps_the_row_and_the_card(tmp_path: Path) -> None:
 
     # THE RETRY SKIPS WHAT LANDED. The next deal drops the applied member
     # from the card's remaining set.
+    # THE RETRY. The applied member is settled and the vanished one is not
+    # dealable, so the row's remaining work is empty — the producer settles
+    # the row rather than dealing a card for a member that cannot be read.
     again = _deal(vault, queue, store)
-    assert again[0].evidence["members"] == [missing]
-    assert again[0].evidence["already_applied_count"] == 1
+    assert again == []
+    assert load_queue(queue)[0].status == "applied"
 
 
 # ---------------------------------------------------------------------------
@@ -579,3 +595,161 @@ def test_a_row_with_no_alternate_is_not_dealt_and_says_why(
     # POSITIVE CONTROL: add a SECOND MOC and the same row deals.
     _moc(vault, "Stoicism MOC")
     assert len(_deal(vault, queue, store)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Deal-time classification (WARN-4) + the sibling-overlap staleness (BLOCK-3)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_member_names_all_four_states(tmp_path: Path) -> None:
+    """The predicate the card's face and the not-emitted rule both rest on.
+    It had ZERO coverage when it was a directory-prefix guess, which is how
+    the sibling-overlap defect below reached a gate."""
+    from alfred.surveyor.moc_apply import (
+        MEMBER_ALREADY_CITES,
+        MEMBER_INELIGIBLE_TYPE,
+        MEMBER_PENDING_WORK,
+        MEMBER_UNREADABLE,
+        classify_member,
+    )
+
+    vault = _vault(tmp_path)
+    target = _moc(vault, "Roman Philosophy MOC")
+    work = _member(vault, "Real Work")
+    wrong_type = _member(vault, "Wrong Type", record_type="note")
+
+    def c(rel):
+        return classify_member(vault, rel, target_moc_rel_path=target)
+
+    assert c(work) == MEMBER_PENDING_WORK
+    assert c(wrong_type) == MEMBER_INELIGIBLE_TYPE
+    assert c("zettel/Nope.md") == MEMBER_UNREADABLE
+
+    # And after the apply, the SAME member reads as already-cited.
+    from alfred.surveyor.moc_apply import apply_membership
+
+    apply_membership(vault, member_rel_paths=[work], target_moc_rel_path=target)
+    assert c(work) == MEMBER_ALREADY_CITES
+
+
+def test_the_type_is_read_from_frontmatter_not_the_directory(
+    tmp_path: Path,
+) -> None:
+    """The retired heuristic guessed the type from the rel_path's folder. A
+    record whose type disagrees with its folder is exactly what it could not
+    see — and the count on the operator's card face is what it got wrong."""
+    from alfred.surveyor.moc_apply import MEMBER_INELIGIBLE_TYPE, classify_member
+
+    vault = _vault(tmp_path)
+    target = _moc(vault, "Roman Philosophy MOC")
+    # Lives in zettel/ (an eligible-looking folder), is really a note.
+    (vault / "zettel" / "Folder Lies.md").write_text(
+        "---\ntype: note\nname: Folder Lies\ncreated: 2026-08-20\n---\n\n# x\n",
+        encoding="utf-8",
+    )
+    assert classify_member(
+        vault, "zettel/Folder Lies.md", target_moc_rel_path=target,
+    ) == MEMBER_INELIGIBLE_TYPE
+
+
+def test_a_sibling_row_is_settled_not_dealt_as_already_done_work(
+    tmp_path: Path,
+) -> None:
+    """BLOCK-3, driven on the real queue's own shape: rows OVERLAP — one
+    member legitimately appears in several rows aimed at the same MOC — so
+    applying one row makes its siblings no-ops IN THE SAME SITTING. Before
+    the deal-time predicate, the sibling dealt "Add 1 note to X?" for work
+    just done, the affirm returned ok with "added 0", and the row retired
+    having changed nothing."""
+    vault = _vault(tmp_path)
+    queue = tmp_path / "moc_suggestions.jsonl"
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    shared = _member(vault, "Meditations")
+    other = _member(vault, "Discourses")
+    # Two rows, overlapping on `shared` — the real queue's exact shape.
+    _row(queue, suggestion_id="ms-1", target=target, members=[shared, other],
+         created="2026-06-01T00:00:00+00:00")
+    _row(queue, suggestion_id="ms-2", target=target, members=[shared],
+         created="2026-06-02T00:00:00+00:00")
+
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    cfg = _ds_config(tmp_path, queue)
+    cards = _deal(vault, queue, store)
+    assert len(cards) == 2
+
+    # Apply the FIRST row — which covers ms-2's only member.
+    first = next(c for c in cards if c.evidence["suggestion_id"] == "ms-1")
+    assert _act(store, cfg, first.id, MOC_APPLY_ACTION, vault, target=target).ok
+
+    # THE NEXT DEAL. ms-2 has no work left: it is SETTLED, not dealt.
+    import structlog
+
+    with structlog.testing.capture_logs() as captured:
+        again = _deal(vault, queue, store)
+    assert [c.evidence["suggestion_id"] for c in again] == []
+    settled = [
+        c for c in captured
+        if c.get("event") == "brief.moc_suggestion.settled_already_applied"
+    ]
+    assert len(settled) == 1
+    assert settled[0]["settled"] == 1
+    rows = {r.id: r for r in load_queue(queue)}
+    assert rows["ms-2"].status == "applied"
+
+
+def test_a_row_whose_members_are_all_ineligible_is_not_dealt(
+    tmp_path: Path,
+) -> None:
+    """The "Add 0 notes to X?" face, closed by construction — the SAME
+    predicate, so it cannot be built rather than being suppressed at render.
+    The SKILL documents a live backlog row whose members are session/
+    records, which is this case."""
+    vault = _vault(tmp_path)
+    queue = tmp_path / "moc_suggestions.jsonl"
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    bad = _member(vault, "Not A Zettel", record_type="note")
+    _row(queue, suggestion_id="ms-1", target=target, members=[bad])
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+
+    assert _deal(vault, queue, store) == []
+
+    # POSITIVE CONTROL: one ELIGIBLE member in the same row and it deals,
+    # with the ineligible one counted on the face rather than hidden.
+    good = _member(vault, "Real Zettel")
+    _row(queue, suggestion_id="ms-2", target=target, members=[bad, good])
+    cards = _deal(vault, queue, store)
+    assert [c.evidence["suggestion_id"] for c in cards] == ["ms-2"]
+    assert cards[0].evidence["applicable_count"] == 1
+    assert cards[0].evidence["ineligible_count"] == 1
+    assert cards[0].title == "Add 1 note to Roman Philosophy MOC?"
+
+
+def test_the_card_stamps_no_duplicate_or_dead_evidence_keys(
+    tmp_path: Path,
+) -> None:
+    """OMITTED-FIELD PIN. Three keys were dropped as dead weight — each had
+    ZERO readers and duplicated another: ``target_moc_rel_path`` (same value
+    as ``proposed_target``), ``applicable_members`` (same list as
+    ``members`` once the deal-time filter landed), and ``choice_group`` (the
+    client reads the group from the SERVED action, never from evidence).
+    Pinned absent so they cannot drift back as a second spelling."""
+    vault = _vault(tmp_path)
+    queue = tmp_path / "moc_suggestions.jsonl"
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    _row(queue, suggestion_id="ms-1", target=target,
+         members=[_member(vault, "Memento Mori")])
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    card = _deal(vault, queue, store)[0]
+
+    for dead in ("target_moc_rel_path", "applicable_members", "choice_group"):
+        assert dead not in card.evidence, dead
+    # POSITIVE CONTROL on the LIVE path — the keys that replaced them are
+    # present and carry the values the act path actually reads, so this pin
+    # proves the fields are GONE rather than proving the producer is dead.
+    assert card.evidence["proposed_target"] == target
+    assert card.evidence["members"] == ["zettel/Memento Mori.md"]
+    assert card.evidence["moc_choices"][0]["target"] == target

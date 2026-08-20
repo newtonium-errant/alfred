@@ -167,11 +167,16 @@ def upsert_proposals(
     Idempotency:
       * Existing non-pending entry (rejected / applied / archived)
         with matching id → no-op. Negative-learning preserved.
-      * Existing pending entry with matching id → refresh
-        ``cluster_id_at_proposal`` + ``cluster_tags`` +
-        ``reasoning`` (the forensic fields). ``created`` + ``id``
-        + ``cluster_member_paths`` + ``target_moc_rel_path`` stay
-        stable.
+      * Existing pending entry with matching id → refresh the
+        forensic fields: ``cluster_id_at_proposal``, ``cluster_tags``,
+        ``reasoning``, ``mapping_signal``, ``mapping_score`` AND
+        ``candidate_members_to_add`` (the last because members drop
+        out of the candidate set as they gain the target between
+        sweeps). ``created`` + ``id`` + ``cluster_member_paths`` +
+        ``target_moc_rel_path`` stay stable, and so does
+        ``applied_members`` — a refresh must never blank the record
+        of what an earlier partial apply landed, or the retry would
+        rewrite those members.
       * No existing entry → add (subject to caps).
 
     File-write strategy:

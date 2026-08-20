@@ -19,8 +19,14 @@ THE MATRIX (scope × type × op) — stated here AND at
   * **type** — ``MOC_APPLY_TYPES``, which mirrors the Sub-arc A hook's
     ``_MOC_TRIGGER_TYPES``. A membership on any other type is refused
     rather than half-applied; see the module-level premise pin.
-  * **op** — ``edit`` with ``set_fields={"mocs": ...}`` only. No create
-    (v1 excludes ``propose_new``), no move, no delete, no body surface.
+  * **op** — ``edit``. Two shapes, because ONE gesture writes TWO records:
+    ``set_fields={"mocs": ...}`` on the MEMBER, and the ``# Contents``
+    mirror on the MOC — the latter written by the Sub-arc A hook, which
+    calls ``vault_edit`` UNDER THIS SCOPE rather than under its own
+    authority. This docstring asserted the opposite until the end-to-end
+    pin disproved it, and the scope's arm 1 is the narrowing that keeps
+    the body surface honest: MOC records only, no frontmatter riding
+    along. No create (v1 excludes ``propose_new``), no move, no delete.
 
 WHAT ONE APPLY DOES. A queue row is ``N members → one MOC``, so one
 operator affirm applies the whole row (operator ruling, 2026-08-20:
@@ -49,6 +55,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -150,7 +157,6 @@ def apply_membership(
         return result
 
     canonical_target = _canonicalize_target_to_wikilink(target_moc_rel_path)
-    target_normalized = _normalize_single_moc_entry(canonical_target)
 
     for member_rel_path in member_rel_paths:
         try:
@@ -180,10 +186,7 @@ def apply_membership(
             continue
 
         existing_verbatim = _normalize_mocs_list(fm.get("mocs"))
-        existing_normalized = {
-            _normalize_single_moc_entry(e) for e in existing_verbatim
-        }
-        if target_normalized in existing_normalized:
+        if cites_target(fm.get("mocs"), target_moc_rel_path):
             result.already.append(member_rel_path)
             continue
 
@@ -220,6 +223,78 @@ def apply_membership(
         partial=result.partial,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Deal-time classification — the producer's half of "is there work here?"
+# ---------------------------------------------------------------------------
+
+#: A member the apply would genuinely change.
+MEMBER_PENDING_WORK = "pending_work"
+#: A member that already carries the target (in any operator-typo shape).
+MEMBER_ALREADY_CITES = "already_cites"
+#: A member whose real frontmatter type is not a MOC trigger type.
+MEMBER_INELIGIBLE_TYPE = "ineligible_type"
+#: A member that could not be read at all (moved, deleted, malformed).
+MEMBER_UNREADABLE = "unreadable"
+
+
+def classify_member(
+    vault_path: Path,
+    member_rel_path: str,
+    *,
+    target_moc_rel_path: str,
+) -> str:
+    """Answer, for ONE member, whether applying the target is real work.
+
+    THE DEAL-TIME PREDICATE, and the producer's only honest basis for
+    deciding whether a card is worth dealing. The queue row's
+    ``candidate_members_to_add`` was computed WHEN THE SURVEYOR SWEPT, and
+    the vault moves between sweeps — most sharply within a single sitting,
+    because the real queue's rows OVERLAP (one member can appear in several
+    rows targeting the same MOC). Applying one row then makes its siblings
+    no-ops, and without this check the deck deals "Add 1 note to X?" for
+    work the operator just did, the affirm returns ok with "added 0", and
+    the row retires having changed nothing.
+
+    Reads the member's REAL frontmatter type rather than guessing from its
+    directory prefix. The guess was cheaper and wrong in the direction that
+    matters: it put an inaccurate count on the operator's card face, and it
+    could not see a record whose type disagrees with its folder.
+
+    Failure-isolated: an unreadable member is reported as such, never
+    raised — the producer must not fail a whole fire over one bad path.
+    """
+    from alfred.vault import ops as _ops
+    from alfred.vault.scope import MOC_APPLY_TYPES
+
+    try:
+        record = _ops.vault_read(vault_path, member_rel_path)
+    except Exception:  # noqa: BLE001 — one bad member must not fail the fire
+        return MEMBER_UNREADABLE
+    fm = dict(record.get("frontmatter") or {})
+    if str(fm.get("type") or "") not in MOC_APPLY_TYPES:
+        return MEMBER_INELIGIBLE_TYPE
+    if cites_target(fm.get("mocs"), target_moc_rel_path):
+        return MEMBER_ALREADY_CITES
+    return MEMBER_PENDING_WORK
+
+
+def cites_target(mocs_value: Any, target_moc_rel_path: str) -> bool:
+    """Whether a raw ``mocs`` frontmatter value already cites the target.
+
+    ONE definition of "already cites", shared by the writer's idempotence
+    skip and the producer's deal-time check — lifted to a helper at the
+    moment the second consumer appeared, so the two cannot drift into
+    disagreeing about what a duplicate membership is.
+    """
+    target = _normalize_single_moc_entry(
+        _canonicalize_target_to_wikilink(target_moc_rel_path),
+    )
+    return target in {
+        _normalize_single_moc_entry(e)
+        for e in _normalize_mocs_list(mocs_value)
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +361,14 @@ def _is_inventory_moc_path(rel_path: str) -> bool:
 
 
 __all__ = [
+    "MEMBER_ALREADY_CITES",
+    "MEMBER_INELIGIBLE_TYPE",
+    "MEMBER_PENDING_WORK",
+    "MEMBER_UNREADABLE",
     "MOC_APPLY_SCOPE",
     "ApplyResult",
     "MemberOutcome",
     "apply_membership",
+    "cites_target",
+    "classify_member",
 ]

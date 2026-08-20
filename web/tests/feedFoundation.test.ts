@@ -341,6 +341,32 @@ describe('evidence flattening (defensive, untrusted display data)', () => {
     expect(keys).toContain('proposed_rule');
     expect(keys).not.toContain('proposal_shape'); // hidden plumbing
   });
+  it("hides the MOC card's plumbing but keeps the suggester's case", () => {
+    // Same class as `proposal_shape` above. The POSITIVE CONTROL is the
+    // point: the operator-facing half must still render, or this pin passes
+    // identically against a build that suppressed the whole card's evidence.
+    const rows = evidenceRows({
+      suggestion_id: 'ms-20260601-abc12345',
+      proposed_target: 'MOC/Roman Philosophy MOC.md',
+      moc_choices: [{ target: 'MOC/Roman Philosophy MOC.md', label: 'Roman' }],
+      reasoning: '3 of 5 cluster members already cite this MOC.',
+      mapping_signal: 'member_overlap',
+      mapping_score: 0.8,
+      applicable_count: 2,
+      ineligible_count: 1,
+    });
+    const keys = rows.map((r) => r.key);
+    // Hidden plumbing.
+    expect(keys).not.toContain('suggestion_id');
+    expect(keys).not.toContain('moc_choices');
+    expect(keys).not.toContain('proposed_target');
+    // The suggester's case for itself — visible.
+    expect(keys).toContain('reasoning');
+    expect(keys).toContain('mapping_signal');
+    expect(keys).toContain('mapping_score');
+    expect(keys).toContain('applicable_count');
+    expect(keys).toContain('ineligible_count');
+  });
   it('never treats a non-object as evidence', () => {
     expect(evidenceRows(null)).toEqual([]);
     expect(evidenceRows('nope')).toEqual([]);

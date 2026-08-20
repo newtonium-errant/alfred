@@ -39,6 +39,8 @@ from alfred.vault.ops import vault_create, vault_edit, vault_read
 from alfred.vault.scope import (
     MOC_APPLY_FIELDS,
     MOC_APPLY_TYPES,
+    MOC_DIRECTORY,
+    MOC_MIRROR_TYPE,
     ScopeError,
 )
 
@@ -87,8 +89,16 @@ def _mint_moc(tmp_vault: Path, stem: str) -> str:
     moc_dir = tmp_vault / "MOC"
     moc_dir.mkdir(exist_ok=True)
     path = moc_dir / f"{stem}.md"
+    # ``MOC``, NOT ``moc`` — the canonical registry name, and the ONLY
+    # non-lowercase canonical type (schema.py preserves the operator's
+    # ``Practical Stoicism MOC.md`` convention). This fixture minted
+    # ``moc`` until the gate caught it: a record shape ``vault_create``
+    # would REJECT, invisible behind 34 green pins because the fixture and
+    # the assertion agreed with each other and with nothing else.
     path.write_text(
-        "---\ntype: moc\nname: "
+        "---\ntype: "
+        + MOC_MIRROR_TYPE
+        + "\nname: "
         + stem
         + "\ncreated: 2026-08-20\ntags: []\nrelated: []\n---\n\n# Contents\n\n",
         encoding="utf-8",
@@ -118,6 +128,35 @@ def test_premise_moc_apply_types_equals_the_hook_trigger_set() -> None:
     from alfred.vault.zettel_hooks import _MOC_TRIGGER_TYPES
 
     assert MOC_APPLY_TYPES == set(_MOC_TRIGGER_TYPES)
+
+
+def test_premise_moc_mirror_type_is_a_CANONICAL_type() -> None:
+    """PREMISE PIN, and the one this lane most needed.
+
+    ``MOC_MIRROR_TYPE`` shipped as the literal ``"moc"`` — which is not a
+    canonical type at all: ``schema.py`` defines ``TypeDefinition(name="MOC")``,
+    the only non-lowercase canonical type, preserved for the operator's
+    ``Practical Stoicism MOC.md`` filename convention. Every fixture minted
+    that non-existent shape by hand, so 34 pins and two mutation batteries
+    agreed with each other and with nothing else.
+
+    Deriving the constant from the registry fixed the value but NOT the
+    blind spot: the fixtures now derive from the same constant, so forcing
+    it back to ``"moc"`` moves fixtures and assertions together and every
+    pin stays green (measured — that mutation scored RED 0 until this test
+    existed). Only a check against an INDEPENDENT source can see it, which
+    is what makes this a premise pin rather than another self-consistent
+    assertion."""
+    from alfred.vault.schema import KNOWN_TYPES_BY_SCOPE, TYPE_DIRECTORY
+
+    # It is a real type Hypatia's scope can address...
+    assert MOC_MIRROR_TYPE in KNOWN_TYPES_BY_SCOPE["hypatia"]
+    # ...and it is the type that OWNS the MOC directory, which is the
+    # relationship the mirror arm actually depends on.
+    assert TYPE_DIRECTORY[MOC_MIRROR_TYPE] == MOC_DIRECTORY
+    # The lowercase spelling that shipped is NOT canonical — pinned
+    # explicitly so the regression cannot return as "well, both work".
+    assert "moc" not in KNOWN_TYPES_BY_SCOPE["hypatia"]
 
 
 def test_premise_mocs_is_not_a_locked_provenance_field() -> None:

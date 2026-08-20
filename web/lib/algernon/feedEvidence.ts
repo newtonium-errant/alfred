@@ -61,6 +61,30 @@ const HIDDEN_KEYS: ReadonlySet<string> = new Set([
   // survives the empty-value filter — every uncontested attribution card would
   // otherwise carry a "Contested: false" row saying nothing.
   'contested',
+  // The MOC reader's plumbing (2026-08-20). Same class as `proposal_shape`
+  // above: keys the CLIENT needs and the operator does not.
+  //
+  // ENUMERATED, not sampled — the producer stamps 14 evidence keys and each
+  // was classified against its readers. The other 11 stay VISIBLE because
+  // they are the suggester's case for itself, which is exactly what a
+  // proposal card owes the operator: `reasoning`, `mapping_signal`,
+  // `mapping_score`, `cluster_tags`, `cluster_size`, `members`,
+  // `applicable_count`, `ineligible_count`, `already_applied_count`,
+  // `partial_retry`, `last_apply_error`.
+  //
+  // `suggestion_id` — the queue row's internal id. Plumbing by definition.
+  'suggestion_id',
+  // `moc_choices` — the hold selector's option list. It RENDERS, as the
+  // sheet; a raw row would print the same options a second time as JSON.
+  'moc_choices',
+  // `proposed_target` — the act path's scoring coordinate. Judgement call,
+  // and it goes the same way as `proposal_shape` for a different reason:
+  // not that the value is machine noise, but that the operator already
+  // reads it in HUMAN form on the card's own face ("Add 2 notes to Roman
+  // Philosophy MOC?"). A `MOC/Roman Philosophy MOC.md` row would restate
+  // the title in a machine spelling. Suppressed rather than relabelled
+  // because a relabelled row would be a SECOND rendering of the title.
+  'proposed_target',
 ]);
 
 // Digest/long-form body is capped at 4000 chars by the producer; mirror that as a

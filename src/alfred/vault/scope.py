@@ -1808,10 +1808,19 @@ TALKER_ROUTINE_ITEM_FIELDS: set[str] = {"items", "completion_log"}
 #   |                   |           | MOC_APPLY_FIELDS, both fail-closed     |
 #   | move/delete       | False     | a membership is additive; nothing      |
 #   |                   |           | about it relocates or removes a record |
-#   | body surfaces     | False     | the membership lives entirely in       |
-#   |                   |           | frontmatter; the ``# Contents`` mirror |
-#   |                   |           | is written by the Sub-arc A hook under |
-#   |                   |           | its own authority, not by this scope   |
+#   | body_append/      | TRUE, on  | ONE gesture writes TWO records. The    |
+#   |   rewriter        | MOC only  | Sub-arc A hook mirrors the membership  |
+#   |                   |           | into the MOC's ``# Contents`` by       |
+#   |                   |           | calling ``vault_edit`` UNDER THIS      |
+#   |                   |           | SCOPE — not under its own authority,   |
+#   |                   |           | which is what this row claimed until   |
+#   |                   |           | the end-to-end pin disproved it. Arm 1 |
+#   |                   |           | of ``moc_apply_only`` is the narrowing:|
+#   |                   |           | body writes ONLY on a MOC record, and  |
+#   |                   |           | never with frontmatter riding along.   |
+#   | body_insert_at/   | {}        | the mirror is a section append by the  |
+#   |   body_replace    |           | hook's own rewriter; nothing here      |
+#   |                   |           | inserts at an offset or replaces a body|
 #
 # TYPE GATE = THE HOOK'S TRIGGER SET, deliberately. ``mocs`` on a record
 # outside ``zettel_hooks._MOC_TRIGGER_TYPES`` would be a membership the
@@ -1835,11 +1844,43 @@ MOC_APPLY_FIELDS: set[str] = {"mocs"}
 #: a membership this scope permits and the hook declines to mirror.
 MOC_APPLY_TYPES: set[str] = {"zettel", "source", "question", "research-pointer"}
 
+#: The vault folder every MOC lives in. Spelled here because the suggester
+#: (``moc_suggester.build_existing_mocs_index``) and the Sub-arc A hook
+#: (``zettel_hooks._resolve_moc_target``) both root their paths at it.
+MOC_DIRECTORY: str = "MOC"
+
 #: The record type the ``# Contents`` mirror is written ON. Distinct from
 #: MOC_APPLY_TYPES (the MEMBER types): one gesture writes a member's
 #: frontmatter AND the MOC's body, and conflating the two sets would let the
 #: membership field be written onto MOC records themselves.
-MOC_MIRROR_TYPE: str = "moc"
+#:
+#: DERIVED FROM THE REGISTRY, NOT RE-SPELLED — the same discipline
+#: MOC_APPLY_TYPES already gets from its premise pin, and the one place this
+#: lane failed to apply it. It shipped as the literal ``"moc"``, which is not
+#: a canonical type AT ALL: ``schema.py`` defines ``TypeDefinition(name="MOC")``
+#: — the ONLY non-lowercase canonical type, preserved per the operator's
+#: ``Practical Stoicism MOC.md`` filename convention. A lowercase literal
+#: therefore named a record shape ``vault_create`` would reject, and it
+#: survived 34 green pins and two mutation batteries because the FIXTURES
+#: minted the same non-existent shape by hand. Deriving by DIRECTORY (rather
+#: than comparing case-insensitively, which would admit a non-canonical
+#: spelling) means the constant follows the registry if the name ever moves.
+def _derive_moc_mirror_type() -> str:
+    matches = sorted(
+        name for name, directory in TYPE_DIRECTORY.items()
+        if directory == MOC_DIRECTORY
+    )
+    if len(matches) != 1:
+        # Fail LOUD at import rather than silently picking one: an ambiguous
+        # or absent MOC type means the mirror arm cannot know what it guards.
+        raise RuntimeError(
+            f"expected exactly one record type in the '{MOC_DIRECTORY}/' "
+            f"directory; registry has {matches!r}"
+        )
+    return matches[0]
+
+
+MOC_MIRROR_TYPE: str = _derive_moc_mirror_type()
 
 
 # Stage 3.5: record types KAL-LE may create. Superset of talker

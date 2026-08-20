@@ -684,9 +684,15 @@ def peer_digest_feed_items(
 # ignored wall by another door, which is why ``moc_choices`` below is not a
 # nicety: a row that cannot offer >= 2 targets is NOT EMITTED, and says so.
 #
-# V1 IS ``member_overlap`` ONLY (2026-08-20 ruling). ``propose_new`` rows
-# propose CREATING a MOC — a vault_create plus N edits, with no target to
-# substitute an alternate for — and deserve their own shape and matrix. But
+# V1 IS ADD-TO-AN-EXISTING-MOC ONLY (2026-08-20 ruling), and THAT — not the
+# signal's name — is the discriminator the filter below actually applies. It
+# admits a row with a real ``target_moc_rel_path`` and excludes one without,
+# which is the create-vs-add question asked directly. ``propose_new`` is the
+# signal that produces the excluded shape today, so naming it here as the
+# rule would describe a symptom: a future signal that also proposed creating
+# a MOC would be excluded by this filter and unmentioned by this comment.
+# Those rows propose a ``vault_create`` plus N edits and have no target to
+# substitute an alternate FOR, so they need their own matrix. But
 # a reader that silently reads a fraction of the queue is a reader that lies
 # about it, so the count of queued-but-not-actionable rows is emitted on
 # every fire (ILB), always present, at zero as readily as at five.
@@ -697,12 +703,6 @@ def peer_digest_feed_items(
 #: (see ``select_rotation``), because retiring a parked card would destroy
 #: the defer window the operator is relying on.
 MOC_SUGGESTION_CAP = 3
-
-#: The co-equal choice group the hold selector derives its family from. The
-#: client reads "every served verb sharing the affirm verb's group"; for an
-#: OPEN target set the family members are dynamic and ride as
-#: ``evidence.moc_choices`` instead (see the act router's dynamic arm).
-MOC_CHOICE_GROUP = "moc"
 
 #: How many alternate targets a card offers. Bounded because the selector is
 #: a sheet the operator reads, not a directory listing — and because the
@@ -734,11 +734,14 @@ def moc_suggestion_feed_items(
     derives its path from that instance's own state path.
     """
     from alfred.feed.model import make_id
-    from alfred.surveyor.moc_apply import MOC_APPLY_SCOPE  # noqa: F401 (declared writer)
+    from alfred.surveyor.moc_apply import (
+        MEMBER_ALREADY_CITES,
+        MEMBER_PENDING_WORK,
+        classify_member,
+    )
     from alfred.surveyor.moc_suggester import build_existing_mocs_index
     from alfred.surveyor.moc_suggestion_queue import load_queue
     from alfred.tier.sort_rotation import select_rotation
-    from alfred.vault.scope import MOC_APPLY_TYPES
 
     try:
         rows = load_queue(queue_path)
@@ -811,6 +814,7 @@ def moc_suggestion_feed_items(
 
     out: list[FeedItem] = []
     skipped_no_family = 0
+    settled: list[tuple[str, int]] = []
     for shim in [*selection.visible, *selection.held]:
         row = shim.row
         target = str(row.target_moc_rel_path or "")
@@ -827,7 +831,37 @@ def moc_suggestion_feed_items(
         members = list(row.candidate_members_to_add or [])
         already = set(row.applied_members or [])
         remaining = [m for m in members if m not in already]
-        applicable = [m for m in remaining if _member_type_ok(m, MOC_APPLY_TYPES)]
+
+        # THE DEAL-TIME STALENESS CHECK. ``candidate_members_to_add`` is a
+        # snapshot from the sweep that proposed the row, and the vault moves
+        # underneath it — most sharply WITHIN ONE SITTING, because rows
+        # overlap: the same member legitimately appears in several rows
+        # aimed at the same MOC, so applying one row makes its siblings
+        # no-ops. Asking the RECORD, not the snapshot, is the only honest
+        # basis for "is there work here?".
+        classified = {
+            m: classify_member(
+                Path(vault_path), m, target_moc_rel_path=target,
+            )
+            for m in remaining
+        }
+        applicable = [
+            m for m, s in classified.items() if s == MEMBER_PENDING_WORK
+        ]
+        stale = [m for m, s in classified.items() if s == MEMBER_ALREADY_CITES]
+
+        if not applicable:
+            # NOTHING LEFT TO DO. Exactly parallel to the no-choice-family
+            # rule below: a card the operator cannot usefully act on is not
+            # dealt. This also closes the "Add 0 notes to X?" face by
+            # construction — that card can no longer be built.
+            #
+            # SETTLED rather than left pending, because a row whose work is
+            # done would otherwise be re-evaluated every fire forever while
+            # never being dealt — silent, and indistinguishable from a
+            # reader that has stopped running.
+            settled.append((row.id, len(stale)))
+            continue
 
         out.append(FeedItem.create(
             kind=KIND_MOC_SUGGESTION,
@@ -839,12 +873,16 @@ def moc_suggestion_feed_items(
             evidence={
                 # The writer's addressing fields — trusted-producer class,
                 # read by the act dispatcher and by nothing else.
+                # PLUMBING the act path reads. Hidden from the rendered
+                # evidence rows (web ``feedEvidence.HIDDEN_KEYS``) — an
+                # internal queue id is not information for the operator.
                 "suggestion_id": row.id,
-                "target_moc_rel_path": target,
-                "members": remaining,
-                "applicable_members": applicable,
+                # OPERATOR-FACING: which notes this would touch.
+                "members": applicable,
                 "applicable_count": len(applicable),
-                "ineligible_count": len(remaining) - len(applicable),
+                "ineligible_count": len(
+                    [s for s in classified.values() if s != MEMBER_PENDING_WORK],
+                ),
                 "already_applied_count": len(already),
                 # The suggester's evidence, legible on the face — WHY it
                 # thinks so, in its own terms rather than a caption.
@@ -859,12 +897,46 @@ def moc_suggestion_feed_items(
                 # the affirm; the rest are the hold selector's co-equal
                 # family. Served as DATA because the target set is open —
                 # a static verb per MOC is not expressible in the ceiling.
+                # PLUMBING, both hidden. ``proposed_target`` is the act
+                # path's scoring coordinate and the selector's suggested
+                # member; the operator already reads it in HUMAN form in the
+                # card's own title ("Add 2 notes to Roman Philosophy MOC?"),
+                # so a raw ``MOC/Roman Philosophy MOC.md`` row would restate
+                # the title in a machine spelling and nothing more.
+                # ``moc_choices`` IS the hold selector — it renders as the
+                # sheet, never as a key:value row.
                 "proposed_target": target,
                 "moc_choices": choices,
-                "choice_group": MOC_CHOICE_GROUP,
             },
             source_ref=dict(_SOURCE_REF),
         ))
+
+    if settled:
+        # ILB, and a THIRD distinct silence: these rows were actionable when
+        # proposed and their work has since been done — by an earlier card in
+        # this same sitting, or by the operator's own hand-edit.
+        log.info(
+            "brief.moc_suggestion.settled_already_applied",
+            instance=instance,
+            settled=len(settled),
+            reason="every candidate member already cites the target — the "
+                   "row's work is done, so it is retired rather than dealt "
+                   "as a card proposing work already complete",
+        )
+        for suggestion_id, _n in settled:
+            try:
+                from alfred.surveyor.moc_suggestion_queue import update_status
+
+                update_status(queue_path, suggestion_id, "accepted")
+                update_status(queue_path, suggestion_id, "applied")
+            except Exception as exc:  # noqa: BLE001 — bookkeeping never fails a fire
+                log.warning(
+                    "brief.moc_suggestion.settle_failed",
+                    instance=instance, suggestion_id=suggestion_id,
+                    error=str(exc), error_type=type(exc).__name__,
+                    consequence="row stays pending and will be re-evaluated "
+                                "next fire; no card is dealt for it either way",
+                )
 
     if skipped_no_family:
         # ILB again, and a DIFFERENT silence from the one above: these rows
@@ -880,19 +952,6 @@ def moc_suggestion_feed_items(
                    "hold family is not dealt to the deck at all",
         )
     return out
-
-
-def _member_type_ok(rel_path: str, allowed: set[str]) -> bool:
-    """Whether a member's DIRECTORY implies a MOC-trigger type.
-
-    Reads the type from the rel_path prefix rather than opening the record:
-    this runs per member per card on every brief fire, and the directory IS
-    the type by the vault's own layout convention. A wrong guess here costs
-    an inaccurate count on the face, never a wrong write — the writer reads
-    the real frontmatter type and the scope gate refuses on that.
-    """
-    head = str(rel_path).split("/", 1)[0]
-    return head in allowed
 
 
 def _moc_card_title(count: int, moc, target: str) -> str:
