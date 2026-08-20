@@ -32,6 +32,14 @@ class ScopeError(Exception):
 # future means extending this matrix — not bolting another tool on
 # top.
 #
+# NOTE (2026-08-18 ruling): the per-type allowlists below are further
+# narrowed by the INGEST-PROVENANCE LOCK — a record whose frontmatter
+# carries ``ingested_via`` refuses every body surface for every scoped
+# caller regardless of these cells ("body locked, frontmatter open";
+# see ``_check_ingest_provenance_lock`` and its matrix further down).
+# E.g. hypatia's ``document: True`` cells govern her AUTHORED documents
+# only; a web-ingested document refuses.
+#
 # Per-instance × per-type matrix (the principal artifact):
 #
 # | Caller        | append    | insert_at                        | replace                       |
@@ -179,6 +187,181 @@ def _delete_target_class(rel_path: str) -> tuple[str | None, bool]:
     return matched, is_unsafe
 
 
+# ---------------------------------------------------------------------------
+# Ingest-provenance lock — "body locked, frontmatter open" (ratified
+# 2026-08-18, EDIT-SURFACE lane)
+# ---------------------------------------------------------------------------
+#
+# PROVENANCE-BASED lock on web-ingested verbatim records. The ingest
+# pipeline (``transport/routes_ingest.py``, scope ``web_ingest``) files
+# operator artifacts VERBATIM and stamps ``ingested_via`` (+ the other
+# provenance fields below) at create time. Once filed, that body is the
+# operator's source-of-truth copy — agent curation may organise the
+# record but never rewrite what was filed.
+#
+# The per-scope × per-record-class × per-op matrix (the principal
+# artifact — every cell is a decision):
+#
+# | Caller (scope)          | body_append/rewriter/     | frontmatter:        | frontmatter: provenance   | write ``ingested_via``    | delete    |
+# |                         | insert_at/replace on P    | title/related/tags  | fields on P               | on ANY record (edit path) |           |
+# |-------------------------|---------------------------|---------------------|---------------------------|---------------------------|-----------|
+# | talker / kalle /        | REFUSED (provenance lock) | existing rules      | REFUSED (provenance lock) | REFUSED (forge guard)     | unchanged |
+# |   hypatia / vera /      |                           | (chat: allowed)     |                           |                           | (refused  |
+# |   vera_ops / rrts_intake|                           |                     |                           |                           | as-is)    |
+# | curator / janitor /     | REFUSED (provenance lock; | existing rules      | REFUSED                   | REFUSED                   | unchanged |
+# |   janitor_enrich /      | pipelines never owned     |                     |                           |                           |           |
+# |   distiller / surveyor  | verbatim ingest bodies)   |                     |                           |                           |           |
+# | vera_batch              | body_replace EXEMPT from  | counters via its    | REFUSED (not in its field | REFUSED                   | unchanged |
+# |                         | this lock → the OWNERSHIP | own gate            | allowlist anyway)         |                           |           |
+# |                         | gate below governs (own   |                     |                           |                           |           |
+# |                         | batch note only); other   |                     |                           |                           |           |
+# |                         | body ops REFUSED          |                     |                           |                           |           |
+# | scope=None (operator    | unrestricted (unchanged — | unchanged           | unchanged                 | unchanged                 | unchanged |
+# |   CLI / pipeline        | ``check_scope`` returns   |                     |                           |                           |           |
+# |   internals)            | early on no scope)        |                     |                           |                           |           |
+#
+# Record classes:
+#   P (provenance-locked): on-disk frontmatter carries a truthy
+#     ``ingested_via`` marker. The ruling names ``document``/``source``
+#     records carrying ``ingested_via: web``; the lock keys on the
+#     MARKER'S PRESENCE (any type, any via value) because (a) the
+#     web-ingest route can also mint verbatim ``note`` records with the
+#     same marker (``WEB_INGEST_CREATE_TYPES``), (b) a type-keyed lock
+#     would be escapable by retype-via-edit (``set_fields={"type": ...}``
+#     is an acknowledged edit shape), and (c) the ruling's own exemption
+#     discriminator is the marker's ABSENCE. Derived-conservative from
+#     the ruling's principle; flagged in the lane declaration.
+#   A (authored/unmarked): no ``ingested_via`` marker — e.g. Hypatia's
+#     own-authored Zettelkasten documents. FULLY EDITABLE under existing
+#     rules; this lock never fires. The exemption IS the absence.
+#
+# The ``vera_batch`` exemption is safe by composition: the batch-carried
+# record (``routes_batch.py``) is a machine-regenerated RENDER of the
+# sidecar ledger (not a verbatim ingest artifact) that happens to carry
+# the marker; its ``body_replace`` falls through to the OWNERSHIP gate
+# (``BATCH_OWNER_FIELD`` required) + the per-type allowlist ({note}),
+# so the exemption cannot reach a web-ingested document.
+INGEST_PROVENANCE_MARKER_FIELD = "ingested_via"
+
+# The ruling's five locked provenance fields — contract-pinned in
+# tests/test_ingest_provenance_lock.py; widening or narrowing this set
+# is a deliberate act that updates the pin in the same commit.
+INGEST_PROVENANCE_LOCKED_FIELDS: frozenset[str] = frozenset({
+    "ingested_at",
+    "ingested_by",
+    "ingested_via",
+    "ingest_correlation_id",
+    "source",
+})
+
+
+def _ingest_provenance_marker(
+    record_type: str, existing_frontmatter: dict | None,
+) -> str | None:
+    """Return the ``ingested_via`` marker when the record is provenance-
+    locked, else None.
+
+    Reads the record's OWN on-disk frontmatter (threaded by the caller);
+    an absent / empty / whitespace marker means "authored record — not
+    locked". ``record_type`` is accepted for signature symmetry with the
+    other gates but the marker itself is the discriminator.
+    """
+    del record_type  # the marker's presence decides; type does not narrow it
+    if not isinstance(existing_frontmatter, dict):
+        return None
+    marker = existing_frontmatter.get(INGEST_PROVENANCE_MARKER_FIELD)
+    if marker is None:
+        return None
+    text = str(marker).strip()
+    return text or None
+
+
+def _check_ingest_provenance_lock(
+    *,
+    operation: str,
+    scope: str,
+    rel_path: str,
+    record_type: str,
+    fields: list[str] | None,
+    body_write: bool,
+    body_op: str | None,
+    existing_frontmatter: dict | None,
+) -> None:
+    """The "body locked, frontmatter open" gate (see the matrix above).
+
+    Fires for ``edit`` (via ``check_scope``'s edit branch, covering
+    body_append / body_rewriter / any frontmatter write) and for
+    ``body_insert_at`` / ``body_replace`` (via
+    ``_check_body_mutation_allowed``, covering direct drives of those
+    ops). Three refusals, most specific first:
+
+      1. BODY LOCK — any body-mutation surface on a marked record
+         refuses (except vera_batch body_replace, which falls through
+         to its ownership gate).
+      2. PROVENANCE-FIELD LOCK — set/append/unset touching any of
+         ``INGEST_PROVENANCE_LOCKED_FIELDS`` on a marked record refuses.
+      3. FORGE GUARD — writing ``ingested_via`` via an agent edit on an
+         UNMARKED record refuses (stamping it would forge provenance or
+         lock an authored record); the marker is written by the ingest
+         pipeline at create time, never by an agent edit.
+
+    Every refusal names the rule and the operator alternative — a
+    refused agent proposes the change to the operator instead. Reads
+    the record's own frontmatter only; callers that cannot thread it
+    (missing file — vault_edit fail-louds separately) fall outside the
+    lock, matching the gcal carve-out's threading posture.
+    """
+    fields_touched = set(fields or [])
+    marker = _ingest_provenance_marker(record_type, existing_frontmatter)
+    target = f"'{rel_path}'" if rel_path else (
+        f"this '{record_type}' record" if record_type else "this record"
+    )
+    if marker is None:
+        if INGEST_PROVENANCE_MARKER_FIELD in fields_touched:
+            raise ScopeError(
+                f"Scope '{scope}' may not write "
+                f"'{INGEST_PROVENANCE_MARKER_FIELD}' on {target} — the "
+                f"ingest-provenance marker is stamped by the ingest "
+                f"pipeline at create time and never by an agent edit "
+                f"(writing it would forge provenance on an authored "
+                f"record, or lock one). If this record's provenance is "
+                f"genuinely wrong, propose the change to the operator "
+                f"instead."
+            )
+        return
+
+    concrete_op = body_op or (operation if operation != "edit" else None)
+    body_touch = body_write or operation in ("body_insert_at", "body_replace")
+    if body_touch and not (
+        scope == "vera_batch" and concrete_op == "body_replace"
+    ):
+        raise ScopeError(
+            f"Scope '{scope}' may not alter the body of {target} — the "
+            f"record carries '{INGEST_PROVENANCE_MARKER_FIELD}: "
+            f"{marker}', marking it a verbatim ingested artifact "
+            f"(provenance lock: body locked, frontmatter open). The "
+            f"filed body is the operator's source-of-truth copy; "
+            f"curation may retitle, relate and tag the record, but "
+            f"never rewrite what was filed. If the body genuinely "
+            f"needs changing, propose the change to the operator "
+            f"instead — the operator can edit the file directly."
+        )
+    locked_touch = fields_touched & INGEST_PROVENANCE_LOCKED_FIELDS
+    if locked_touch:
+        raise ScopeError(
+            f"Scope '{scope}' may not edit provenance field(s) "
+            f"{', '.join(sorted(locked_touch))} on {target} — the "
+            f"record carries '{INGEST_PROVENANCE_MARKER_FIELD}: "
+            f"{marker}' and its ingest provenance "
+            f"({', '.join(sorted(INGEST_PROVENANCE_LOCKED_FIELDS))}) "
+            f"is locked alongside the body (provenance lock: body "
+            f"locked, frontmatter open — except provenance). Other "
+            f"frontmatter curation (retitle, related links, tags) "
+            f"stays open. To correct provenance, propose the change "
+            f"to the operator instead."
+        )
+
+
 def _check_body_mutation_allowed(
     *,
     operation: str,
@@ -186,6 +369,7 @@ def _check_body_mutation_allowed(
     record_type: str,
     allowlist: dict[str, bool] | None,
     existing_frontmatter: dict | None,
+    rel_path: str = "",
 ) -> None:
     """Shared gate for body_insert_at and body_replace.
 
@@ -212,6 +396,23 @@ def _check_body_mutation_allowed(
     Raises ``ScopeError`` with a message naming the rule + the
     operator-actionable next step.
     """
+    # --- ingest-provenance lock (FIRST — strongest rule, no per-type
+    # carve-outs; see the matrix + ``_check_ingest_provenance_lock``).
+    # Covers DIRECT drives of body_insert_at / body_replace through
+    # ``check_scope`` as well as vault_edit's own per-op calls; the
+    # vera_batch body_replace exemption inside the lock falls through
+    # to the ownership gate further down. A marked record refuses here
+    # regardless of what the per-type allowlist would say.
+    _check_ingest_provenance_lock(
+        operation=operation,
+        scope=scope,
+        rel_path=rel_path,
+        record_type=record_type,
+        fields=None,
+        body_write=True,
+        body_op=operation,
+        existing_frontmatter=existing_frontmatter,
+    )
     # --- clinical_note: status-aware anti-spoliation gate (scribe P3-a) ------
     # The medico-legal body freeze moves from CREATE (P2) to ATTEST (P3). While
     # the note is a LIVE, unattested ``ai_draft`` the checkpoint co-pilot
@@ -2069,6 +2270,26 @@ def check_scope(
     if rules is None:
         raise ScopeError(f"Unknown scope: '{scope}'")
 
+    # Ingest-provenance lock — "body locked, frontmatter open" (ratified
+    # 2026-08-18). Fires BEFORE the generic body-write / permission
+    # gates so a refused tamper names the SPECIFIC rule rather than a
+    # generic denial. The ``edit`` branch covers body_append /
+    # body_rewriter (via ``body_write`` + ``body_op``) AND every
+    # frontmatter surface (set/append/unset ride in ``fields``);
+    # body_insert_at / body_replace reach the same lock through
+    # ``_check_body_mutation_allowed`` below.
+    if operation == "edit":
+        _check_ingest_provenance_lock(
+            operation=operation,
+            scope=scope,
+            rel_path=rel_path,
+            record_type=record_type,
+            fields=fields,
+            body_write=body_write,
+            body_op=body_op,
+            existing_frontmatter=existing_frontmatter,
+        )
+
     # Body-write gate — applied independently of the operation-level
     # permission because ``edit`` may succeed under an allowlist while
     # still needing to refuse body writes. Default True preserves
@@ -2103,6 +2324,7 @@ def check_scope(
             record_type=record_type,
             allowlist=allowlist,  # type: ignore[arg-type]
             existing_frontmatter=existing_frontmatter,
+            rel_path=rel_path,
         )
         return
 

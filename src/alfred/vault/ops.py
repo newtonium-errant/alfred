@@ -1423,7 +1423,11 @@ def vault_edit(
     call):
 
       * ``body_append: str`` — add to end of doc. Universal across
-        all instances; gated by ``allow_body_writes``.
+        all instances; gated by ``allow_body_writes`` AND the ingest-
+        provenance lock (a record whose frontmatter carries
+        ``ingested_via`` refuses EVERY body surface for scoped callers
+        — "body locked, frontmatter open"; see
+        ``scope._check_ingest_provenance_lock``).
       * ``body_rewriter: Callable[[str], str]`` — function that takes
         the current body and returns a new body. Used by the telegram
         calibration writer for marker-fenced surgical rewrites; not
