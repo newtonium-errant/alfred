@@ -9,7 +9,6 @@ function the board's sort verbs call; its own semantics are pinned in
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 
 import frontmatter
@@ -31,8 +30,6 @@ from alfred.feed.model import (
     STATE_OPEN,
 )
 from alfred.tier.sort_proposal import corrections_path_for, load_tally
-
-NOW = datetime(2026, 8, 19, 13, 0, 0, tzinfo=timezone.utc)
 
 
 def _vault(tmp_path: Path) -> Path:

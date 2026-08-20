@@ -9,7 +9,7 @@ green here (the accepted-then-ignored trap this repo keeps closing).
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
@@ -221,7 +221,17 @@ def test_a_deferred_cards_window_survives_the_next_fire(tmp_path: Path) -> None:
     cfg, store = _cfg(tmp_path)
     _emit(cfg)  # deal it
     card_id = f"{KIND_SORT_SUGGESTION}:task:task/Fix shed door.md"
-    until = "2026-08-25T06:00:00+00:00"  # beyond NOW — window open at next fire
+    # DERIVED FROM WALL CLOCK, never a literal — and the clock named here is
+    # the one that actually judges the window: defer revival is evaluated
+    # against REAL time, not this file's fixture NOW (`FeedStore.reconcile`
+    # passes `_now_iso()` into `_revival_suppressed` → `defer_window_open`;
+    # store.py / model.py). The first draft hardcoded a future instant with a
+    # comment naming the wrong clock ("beyond NOW"), which made this a dated
+    # suite regression: the day real time crossed it, the reconcile would
+    # rightly revive the card and this test would red over CORRECT production
+    # behavior. Windows in wall-clock-predicate tests are derived, never
+    # literal (gate rule, 2026-08-19).
+    until = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
     store.defer(card_id, until=until)
 
     _emit(cfg)  # the next morning's fire
