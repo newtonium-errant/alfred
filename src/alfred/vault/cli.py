@@ -374,6 +374,30 @@ def cmd_edit(args: argparse.Namespace) -> None:
     # Detect whether a body write was requested so scope can veto.
     body_write_requested = bool(args.body_stdin or args.body_append)
 
+    # Thread the target's on-disk frontmatter into the scope check so
+    # frontmatter-keyed gates can see it — specifically the ingest-
+    # provenance lock ("body locked, frontmatter open"), which reads the
+    # record's OWN ``ingested_via`` marker. Without this, the CLI edit
+    # path (the agent path — curator/janitor/distiller subprocess agents
+    # run ``alfred vault edit`` with ALFRED_VAULT_SCOPE) would scope-
+    # check blind to the marker and the lock would never fire here, the
+    # exact default-None-gate-parameter trap: threaded in tests, dead in
+    # production. Best-effort read: a missing or unparseable target
+    # yields None (the lock then cannot fire) and ``vault_edit`` below
+    # fail-louds on the real problem — a parse failure here must not
+    # invent a NEW refusal surface. Unscoped calls skip the read; no
+    # gate consumes it.
+    existing_fm: dict | None = None
+    if scope:
+        try:
+            from .ops import _parse_record, _resolve_vault_path
+
+            existing_fm, _ = _parse_record(
+                _resolve_vault_path(vault, args.path)
+            )
+        except Exception:
+            existing_fm = None
+
     # When the caller is doing a pure body write (no --set / --append /
     # --unset), skip the field allowlist check — there are no fields
     # to validate and the allowlist rule would otherwise fail closed
@@ -385,6 +409,7 @@ def cmd_edit(args: argparse.Namespace) -> None:
                 rel_path=args.path,
                 fields=fields_list,
                 body_write=body_write_requested,
+                existing_frontmatter=existing_fm,
             )
         else:
             # Frontmatter untouched — validate the operation itself and
@@ -397,6 +422,7 @@ def cmd_edit(args: argparse.Namespace) -> None:
                 rel_path=args.path,
                 fields=[],
                 body_write=body_write_requested,
+                existing_frontmatter=existing_fm,
             )
     except ScopeError as e:
         _error(str(e))
