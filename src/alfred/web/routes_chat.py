@@ -296,28 +296,71 @@ def _parse_image_blocks(
     return blocks, raws, None
 
 
+#: Model-visible saved-path banner — the builder half of a builder+tuner
+#: CONTRACT (XS-BATCH9 item 3; the vault-vera SKILL teaches TO this exact
+#: format). One line per persisted screenshot, ``{path}`` filled with the
+#: VAULT-RELATIVE inbox path (``inbox/screenshot-<UTCstamp>-<hash8>.<ext>``).
+#: The bracketed-system-line family is recovered from the retired bot's
+#: attachment banner (``[PDF attached: <filename>]``, bot.py at 34a4dfbf^);
+#: vault-relative matches the bug-widget lane's convention
+#: (routes_bugreport: "Saved at `<rel>` (relative to the vault root)") and
+#: keeps box-absolute paths out of vault records. Change ONLY in lockstep
+#: with the SKILL's screenshots teaching — the agent copies these paths
+#: verbatim into ticket ``screenshots`` fields.
+IMAGE_SAVED_BANNER: str = "[Screenshot attached: {path}]"
+
+
+def _with_image_banners(message: str, saved_rels: list[str]) -> str:
+    """Prepend one saved-path banner per persisted image to the turn text.
+
+    Banner block first, one blank line, then the operator's words — the
+    header-then-caption order the retired bot's document banner used. No
+    saved paths (no images carried, or every save failed) → the message is
+    returned UNCHANGED: a text-only turn stays byte-identical to the
+    pre-banner path, and a failed save never yields a path the filesystem
+    cannot honour (the invented-path defect this helper exists to close).
+    """
+    if not saved_rels:
+        return message
+    banners = "\n".join(
+        IMAGE_SAVED_BANNER.format(path=rel) for rel in saved_rels
+    )
+    return f"{banners}\n\n{message}"
+
+
 def _persist_web_images(
     raws: list[tuple[str, bytes]],
     vault_path: str,
     *,
     user: str,
     session_key: str,
-) -> None:
-    """Persist carried screenshots to VERA's inbox (sovereign audit trail).
+) -> list[str]:
+    """Persist carried screenshots to the inbox; return their vault paths.
 
-    Mirrors the Telegram photo handler's best-effort inbox save (the model
-    can still see the image from in-memory bytes even if persistence fails,
-    so a save error never blocks the turn). The file_unique_id is a content
-    hash so a retransmit dedupes to the same filename. Intake-only — the
-    image is stored in VERA's own vault; it is NOT egressed.
+    Returns the VAULT-RELATIVE path (``inbox/<filename>``) of every image
+    that persisted, in wire order. The caller threads these into the
+    model-visible turn text via :func:`_with_image_banners` — before this,
+    the saved ``Path`` was DISCARDED here, so the SKILL instructed the
+    agent to write a ``screenshots:`` path it was never given (invented
+    paths were the live risk). ``inbox/<name>`` is exact by construction:
+    ``vision.storage_path`` always writes ``<vault>/inbox/<name>``.
+
+    Persistence stays best-effort, mirroring the retired Telegram photo
+    handler (the model can still see the image from in-memory bytes even
+    if persistence fails, so a save error never blocks the turn — the
+    failed image simply contributes NO path). The file_unique_id is a
+    content hash so a retransmit dedupes to the same filename, and hence
+    to the same banner. Intake-only — the image is stored in the
+    instance's own vault; it is NOT egressed.
     """
     from alfred.telegram import vision
 
+    saved_rels: list[str] = []
     for media_type, raw in raws:
         ext = _IMAGE_EXT_BY_MEDIA_TYPE.get(media_type, "img")
         unique_id = hashlib.sha256(raw).hexdigest()[:8]
         try:
-            vision.save_image_to_inbox(
+            dest = vision.save_image_to_inbox(
                 raw, vault_path, unique_id, extension=ext,
             )
         except Exception as exc:  # noqa: BLE001 — audit trail is best-effort
@@ -334,6 +377,9 @@ def _persist_web_images(
                 vault_path=vault_path,
                 action="continuing_to_llm_in_memory_only",
             )
+            continue
+        saved_rels.append(f"inbox/{dest.name}")
+    return saved_rels
 
 
 def _validate_turn_images(
@@ -844,9 +890,13 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
         user_name = _user_name_for(identity, web_config)
 
         # Persist carried screenshots to the inbox (sovereign audit trail,
-        # best-effort) BEFORE the turn — mirrors the Telegram photo handler.
+        # best-effort) BEFORE the turn — mirrors the retired Telegram photo
+        # handler — and keep the saved paths: they become the model-visible
+        # banner lines below, which is where the SKILL-taught ticket
+        # ``screenshots`` field gets its real values.
+        saved_image_rels: list[str] = []
         if image_raws:
-            _persist_web_images(
+            saved_image_rels = _persist_web_images(
                 image_raws, talker_config.vault.path,
                 user=identity.user, session_key=session_key,
             )
@@ -863,9 +913,12 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
         from alfred.brief.player_primer import PlayerContextPrimer
 
         primer = PlayerContextPrimer.from_dict(body.get("primer"))
-        turn_message = message
+        # Saved-path banners compose AFTER the dedup check for the same
+        # reason the primer does: ``_dedup_check`` keyed on the RAW
+        # operator message above, and it must stay keyed on it.
+        turn_message = _with_image_banners(message, saved_image_rels)
         if primer.valid:
-            turn_message = f"{primer.context_line()}\n\n{message}"
+            turn_message = f"{primer.context_line()}\n\n{turn_message}"
             log.info(
                 "web.chat.primer_grounded",
                 user=identity.user,
@@ -1063,10 +1116,13 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
 
     # Persist carried screenshots to the inbox (sovereign audit trail,
     # best-effort) BEFORE launching the turn task — mirrors /chat/turn +
-    # the Telegram photo handler. Skipped on a dedup HIT (run_turn never
-    # fires there; the original turn already persisted).
+    # the retired Telegram photo handler. Skipped on a dedup HIT (run_turn
+    # never fires there; the original turn already persisted). The saved
+    # paths become the model-visible banner lines on the turn text below,
+    # same contract as /chat/turn.
+    saved_image_rels: list[str] = []
     if image_raws and status != "hit":
-        _persist_web_images(
+        saved_image_rels = _persist_web_images(
             image_raws, talker_config.vault.path,
             user=identity.user, session_key=session_key,
         )
@@ -1123,7 +1179,7 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
             client=client,
             state=state_mgr,
             session=session_obj,
-            user_message=message,
+            user_message=_with_image_banners(message, saved_image_rels),
             config=talker_config,
             vault_context_str=vault_context_str,
             system_prompt=system_prompt_provider(),
