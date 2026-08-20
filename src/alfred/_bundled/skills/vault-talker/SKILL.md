@@ -458,7 +458,7 @@ The morning brief has a section titled exactly `Today's Plan` (single source of 
 
 ### Duty
 - [T1] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
-- [T2] [[task/Connect QBO API — RRTS]] *(carried from yesterday)*
+- [T2] [[task/Connect QBO API — RRTS]] — due Mon Aug 24 *(carried from yesterday)*
 - [T2] Water the plants (from [[routine/Weekly Chores]]) — due Fri Aug 14
 
 ### Rhythm
@@ -484,6 +484,8 @@ The morning brief has a section titled exactly `Today's Plan` (single source of 
 **Read the arrangement correctly.** The `###` subsections are **rings**, not tiers — and every row carries its own `[Tn]` tag, because the arrangement is by ring while the daily goal is still counted by tier. So a row's heading tells you what kind of claim it makes, and its tag tells you how hard it presses. `ROLLOVER_HEADER` still renders, but its scope narrowed in Phase C: carried items now appear in their own ring above (marked `(carried from yesterday)`) rather than being listed again underneath.
 
 **Note where the plant-watering row landed.** It is a *routine* item, but it carries a recurring deadline, so it derives **Duty** — not Rhythm — and it sits under Duty at `[T2]`, a full ring away from the tier its tag names. That is rule 4 doing its job, and it is the most common surprise in this section: a routine with a `due_pattern` is a scheduled obligation, and being routine-shaped does not make it Rhythm. If Andrew wants a deadline-bearing routine item to live in Rhythm anyway, it needs an explicit `slot: rhythm` — same escape as a dated task.
+
+**Note also that every task row above carries a date.** That is not decoration — it is *why* those rows have a ring at all. An **undated** task matches no derived rule: not rule 6 (which needs a due date), not rule 4 or 5 (routine-only), so it falls to rule 7 and comes out **`unslotted`**. An unslotted item does not appear under any ring heading; it is excluded from the balanced-day denominator and dealt as a sort card instead (see **The deck's sort rotation** above). So when you read a brief, do not infer that a task under a ring must have earned it structurally — and when you *write* a task Andrew wants on a specific ring without giving it a date, `slot:` is the only thing that will put it there.
 
 **The empty-bucket prompt strings, rollover header, pool header, and routine-T2 affordances are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`, plus the Ship B addition `T2_ROUTINE_CONFIRM_PROMPT` (see **Routine-origin tier entries** above for the routine-specific shapes). Salem recognises these strings in the brief to know which reply pattern is expected. **All of the above are still rendered and still verbatim — the Phase C restructure changed the section's title and the arrangement of its rows, not one byte of any reply affordance.** The one exception is `T2_AUTO_ROUTINE_HEADER`, which is still defined but no longer rendered (see above), so it is no longer a string to recognise in a brief. If any string changes at the code layer, this SKILL needs a follow-up sweep.
 
@@ -1261,7 +1263,7 @@ The two escalation fields have similar names and **count completely different th
 
 | Field | What it counts | Effect |
 |---|---|---|
-| `due_pattern: {...}` | — | A recurring deadline. **Its ring is Duty** (rule 4) — a scheduled obligation, however routine-shaped the item is. Overridden only by an explicit `slot:`. |
+| `due_pattern: {...}` | — | A recurring deadline. **Its ring is Duty** (rule 4) — a scheduled obligation, however routine-shaped the item is. Overridden by `self_care: true` (rule 3) or an explicit `slot:` (rule 1). |
 | `escalate_at_days: N` | Days **BEFORE DUE**. Requires a `due_pattern`. | T1 when `days_to_due` is in `[0, N]` (negative/overdue admitted). `N: 0` = T1 on the due date itself; `N: 1` = T1 the day before. |
 | `surface_at_days: M` | Days **BEFORE DUE**. Requires a `due_pattern`. | T2 when `escalate_at_days < days_to_due <= M`. Only meaningful when `M > N`. |
 | `escalate_after_gap_days: M` | Days **SINCE LAST COMPLETION**. Requires **NO** `due_pattern`. | At `gap >= M` the item goes T1 and **visits Duty** for the day. Below M it keeps its quiet behaviour, unchanged. |
