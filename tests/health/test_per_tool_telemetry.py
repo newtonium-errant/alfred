@@ -514,7 +514,19 @@ class TestTalkerHealth:
         ath = next(r for r in result.results if r.name == "anthropic-auth")
         assert ath.status == Status.FAIL
 
-    async def test_happy_path_ok(self, monkeypatch) -> None:
+    async def test_fully_configured_standard_instance_rolls_fail_post_retirement(
+        self, monkeypatch,
+    ) -> None:
+        """Formerly ``test_happy_path_ok``. T5 ledger item B re-premise:
+        this fixture — a fully-configured NON-web-only Telegram instance —
+        was the happy path until the 2026-08-18 retirement revoked every
+        BotFather token. The same shape is now a double fossil, and the
+        e2e-through-``health_check`` pin asserts the bot-token probe FAILs
+        with the revoked-token detail (not the empty/placeholder details —
+        the WHY matters) and drags the rollup to FAIL. The post-retirement
+        healthy shape is web-only, pinned by
+        ``test_health_web_only.py::test_health_check_quiets_the_three_on_a_web_only_instance``.
+        """
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
         raw = {
             "telegram": {
@@ -522,9 +534,9 @@ class TestTalkerHealth:
                 "allowed_users": [1, 2],
                 "anthropic": {"api_key": "test-anthropic-key", "model": "claude-sonnet-4-6"},
                 "stt": {"provider": "groq", "api_key": "test-stt-key"},
-                # wk2b c6: include tts section so the new tts-key +
-                # elevenlabs-auth probes don't SKIP (which would bubble
-                # up to mark the rollup SKIP rather than OK).
+                # wk2b c6: tts present so every sibling probe reports OK —
+                # which is the positive control here: the rollup FAIL below
+                # is attributable to bot-token alone.
                 "tts": {"api_key": "test-tts-key"},
                 # #80 (2026-05-12): include instance block so the new
                 # skill-capability-audit probe doesn't SKIP (which would
@@ -540,12 +552,20 @@ class TestTalkerHealth:
         # Quick mode so the remote elevenlabs probe isn't attempted.
         result = await talker_health.health_check(raw, mode="quick")
         assert result.tool == "talker"
-        assert result.status == Status.OK
+        assert result.status == Status.FAIL
+        bot = next(r for r in result.results if r.name == "bot-token")
+        assert bot.status == Status.FAIL
+        assert "revoked" in bot.detail
+        # Attribution control: bot-token is the ONLY failing probe, so the
+        # rollup FAIL is this arm's doing and not an accident of fixture rot.
+        failing = [r.name for r in result.results if r.status == Status.FAIL]
+        assert failing == ["bot-token"]
 
     async def test_env_var_placeholders_are_expanded(self, monkeypatch) -> None:
-        """Regression: bot_token / stt.api_key / anthropic.api_key all
-        supplied via ``${VAR}`` placeholders must resolve to OK when the
-        env vars are set.
+        """Regression: ``${VAR}`` placeholders must be substituted before
+        the probes inspect the config (stt.api_key resolves to OK; the
+        resolved bot_token hits the post-retirement revoked arm rather
+        than the placeholder arm — either way, substitution ran first).
 
         Before the 2026-04-19 hotfix, the talker health check inspected
         the pre-substitution raw config, so a user with
@@ -560,6 +580,12 @@ class TestTalkerHealth:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "DUMMY_ANTHROPIC_TEST_KEY")
         monkeypatch.setenv("ELEVENLABS_API_KEY", "DUMMY_ELEVENLABS_TEST_KEY")
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
+        # T5 ledger item B note: post-retirement the RESOLVED bot token
+        # FAILs (revoked arm), so this regression pin now proves the
+        # substitution happened by asserting which ARM fired — a resolved
+        # token hits the revoked detail, an unsubstituted one would hit
+        # the "placeholder" detail. The stt-key OK assertion below keeps a
+        # substitution-proves-OK leg alive too.
 
         raw = {
             "telegram": {
@@ -584,7 +610,11 @@ class TestTalkerHealth:
         result = await talker_health.health_check(raw, mode="quick")
 
         bot = next(r for r in result.results if r.name == "bot-token")
-        assert bot.status == Status.OK
+        assert bot.status == Status.FAIL
+        # The resolved-token (revoked) arm fired — NOT the placeholder arm,
+        # which is what an unsubstituted config would produce.
+        assert "revoked" in bot.detail
+        assert "placeholder" not in bot.detail
         assert "DUMMY_TELEGRAM_TEST_TOKEN" not in bot.detail  # secret shouldn't leak into detail
         stt = next(r for r in result.results if r.name == "stt-key")
         assert stt.status == Status.OK
@@ -593,7 +623,12 @@ class TestTalkerHealth:
         # wk2b c6: tts-key probe resolves the ELEVENLABS_API_KEY env var.
         tts = next(r for r in result.results if r.name == "tts-key")
         assert tts.status == Status.OK
-        assert result.status == Status.OK
+        # Rollup: FAIL, attributable to bot-token alone (every other probe
+        # above proved OK from its resolved env var — the substitution
+        # regression this test pins would surface as additional FAILs).
+        assert result.status == Status.FAIL
+        failing = [r.name for r in result.results if r.status == Status.FAIL]
+        assert failing == ["bot-token"]
 
 
 # ---------------------------------------------------------------------------

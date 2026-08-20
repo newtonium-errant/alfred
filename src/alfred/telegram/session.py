@@ -57,7 +57,9 @@ class Session:
     Anthropic-format message dicts (``role`` + ``content``).
 
     Wk3 commit 8: ``opening_model`` records the model the session was
-    *opened* on (via the router + calibration overrides). ``model`` may
+    *opened* on (historically chosen by the opening-cue router +
+    calibration overrides; the router died with the Telegram retirement,
+    T5 2026-08-19). ``model`` may
     be flipped mid-session by ``/opus`` / ``/sonnet`` / implicit
     escalation; ``opening_model`` stays fixed. The diff between the two
     at close time is the "session escalated" signal the model-preference
@@ -1333,9 +1335,12 @@ def append_document(
     ``mime_type`` is recorded so a future allowlist widening doesn't
     need a backfill pass to identify which records had which type.
 
-    ``kind`` (2026-06-06 P8 — universal filetype bundle) is the
-    short tag from :data:`alfred.telegram.attachments.SUPPORTED_DOCUMENT_MIME`
-    (``pdf``, ``docx``, ``text``, ``csv``, ``ics``, ``audio``).
+    ``kind`` (2026-06-06 P8 — universal filetype bundle) is the short
+    tag the retired bot-side attachment handler derived from its
+    MIME allowlist (``pdf``, ``docx``, ``text``, ``csv``, ``ics``,
+    ``audio`` — the canonical list lived in
+    ``telegram/attachments.py``, deleted with the Telegram retirement,
+    T5 2026-08-19; existing session records keep these values).
     Recorded alongside ``mime_type`` because the kind is the
     operational grouping consumers care about ("what audio has Andrew
     shared this week?") whereas the MIME is the wire-level identifier.
@@ -1563,8 +1568,8 @@ def close_session(
     # empty" is distinguishable from "close failed"; that log line IS the
     # audit trail. We pop the active session but do NOT append a
     # ``closed_sessions`` entry — an empty session produced no record, so a
-    # ``record_path: ""`` entry would only pollute the router's continuation
-    # history and ``alfred talker history``. Returns ``""`` so callers skip
+    # ``record_path: ""`` entry would only pollute the closed-session
+    # continuation history and ``alfred talker history``. Returns ``""`` so callers skip
     # post-close work (substance-slug rename, capture-structuring) that would
     # have no target record.
     if not (
@@ -1642,10 +1647,11 @@ def close_session(
     rel_path = result["path"]
 
     # State cleanup: pop active, append closed-summary, save once.
-    # ``session_type`` / ``continues_from`` land here so the router can look up
-    # the most recent article/journal/brainstorm session from state alone in
-    # wk2 (plan open question #5 — state-only continuation for wk2; body-parser
-    # fallback is a wk3 task).
+    # ``session_type`` / ``continues_from`` land here so continuation
+    # lookups can find the most recent article/journal/brainstorm session
+    # from state alone (wk2 plan open question #5; originally consumed by
+    # the opening-cue router, which died with the Telegram retirement —
+    # the fields remain part of the closed-session state contract).
     state.pop_active(chat_id)
     state.append_closed({
         "session_id": session.session_id,
@@ -1658,10 +1664,14 @@ def close_session(
         "vault_ops": len(session.vault_ops),
         "session_type": session_type,
         "continues_from": continues_from,
-        # Wk3 commit 8: record the opening and closing model so
-        # model_calibration.propose_default_flip can detect mid-session
-        # escalation. ``opening_model`` falls back to current ``model``
-        # for wk2 records being written during transition.
+        # Wk3 commit 8: record the opening and closing model. Originally
+        # for model_calibration.propose_default_flip's mid-session
+        # escalation detection (module deleted in T5, 2026-08-19); the
+        # fields stay as per-session model provenance in the
+        # closed-session state contract (pinned by
+        # tests/telegram/test_session_model_fields.py). ``opening_model``
+        # falls back to current ``model`` for wk2 records written during
+        # the transition.
         "opening_model": session.opening_model or session.model,
         "closing_model": session.model,
     })

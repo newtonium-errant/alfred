@@ -13,8 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from alfred.telegram import calibration, capture_batch, capture_extract, router, tts
-from alfred.telegram.session_types import ROUTER_MODEL
+from alfred.telegram import calibration, capture_batch, capture_extract, tts
 from tests.telegram.conftest import FakeAnthropicClient, FakeBlock, FakeResponse
 
 
@@ -165,27 +164,7 @@ async def test_tts_compress_keeps_temperature_on_sonnet() -> None:
     assert call["temperature"] == 0.5
 
 
-# --- router.classify_opening_cue ------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_router_keeps_temperature_on_sonnet() -> None:
-    """Router model is pinned to Sonnet — but the helper application is
-    a contract pin: if ROUTER_MODEL ever flips to Opus, temperature
-    will silently drop and the router will keep working."""
-    payload = '{"session_type": "note", "continues_from": null, "reasoning": "ok"}'
-    client = FakeAnthropicClient([
-        FakeResponse(content=[FakeBlock(type="text", text=payload)])
-    ])
-    await router.classify_opening_cue(
-        client=client,
-        first_message="hello",
-        recent_sessions=[],
-        self_name="Salem",
-        self_display_name="Salem",
-        has_reply_context=False,
-    )
-    call = client.messages.calls[0]
-    assert call["model"] == ROUTER_MODEL
-    assert ROUTER_MODEL.startswith("claude-sonnet-")
-    assert call["temperature"] == 0.2
+# --- (router.classify_opening_cue — call site deleted in T5 2026-08-19
+#      with telegram/router.py; its member of this guarded family died
+#      with the call site it pinned. The family still covers every
+#      surviving telegram-package SDK caller above.) ---------------------

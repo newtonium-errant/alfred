@@ -2,7 +2,10 @@
 
 Probes:
   * telegram section present (SKIP when absent)
-  * bot_token set (FAIL when empty or unresolved placeholder)
+  * bot_token — SKIP under ``web_only``; FAIL on every non-web-only
+    shape (empty, unresolved placeholder, or a resolvable token — the
+    last because Telegram is retired and every BotFather token was
+    revoked 2026-08-18, so a present token can never again mean OK)
   * allowed_users populated — WARN on empty list (talker would ignore
     every inbound message otherwise)
   * anthropic auth (shared probe)
@@ -91,11 +94,31 @@ def _check_bot_token(token: str, *, web_only: bool) -> CheckResult:
     Required means a missed call site is a TypeError at import, not a
     silent FAIL on a quiesced instance.
 
-    BOTH failure branches skip, not just the empty one. If only the empty
-    branch were quieted, re-commenting the token line without setting the
-    env var — the ordinary way an operator half-removes a bot — would
-    resolve to a ``${...}`` placeholder and restore the daily noise on an
-    instance that is still, by declaration, web-only.
+    ALL non-web-only branches skip under ``web_only``, and — post-
+    retirement — ALL non-web-only branches FAIL. There is no OK arm any
+    more: Telegram was retired 2026-08-18 and the operator revoked every
+    BotFather token platform-wide, so a token that resolves is a
+    cryptographically dead credential, not a working one. Reporting
+    "token present (N chars) — OK" on a double-fossil config (an old
+    non-web-only YAML whose env var still resolves) would bless exactly
+    the config shape the retirement made impossible. The three FAIL
+    details stay distinct on purpose (empty vs placeholder vs
+    present-but-revoked) so the operator can tell which fossil they are
+    holding; the fix is the same for all three — declare
+    ``web.enabled + web.web_only`` (or drop the telegram section).
+
+    Status table per config shape (post-retirement semantics)::
+
+        web_only (web.enabled AND web.web_only)      -> SKIP  (steady state)
+        non-web-only, token empty                    -> FAIL  "is empty"
+        non-web-only, unresolved ${...} placeholder  -> FAIL  "placeholder"
+        non-web-only, resolvable token               -> FAIL  "revoked"
+                                                        (was OK pre-2026-08-19)
+
+    Only the existing ``ok|warn|fail|skip`` statuses are used, so the
+    ``is_attention_status`` / ``QUIET_HEALTH_STATUSES`` consumers are
+    untouched; the FAIL fires only on fossil (non-web-only) configs and
+    clears when the config is fixed — no undismissable steady-state card.
     """
     if web_only:
         return CheckResult(
@@ -117,8 +140,13 @@ def _check_bot_token(token: str, *, web_only: bool) -> CheckResult:
         )
     return CheckResult(
         name="bot-token",
-        status=Status.OK,
-        detail=f"token present ({len(token)} chars)",
+        status=Status.FAIL,
+        detail=(
+            f"bot_token resolves ({len(token)} chars) but Telegram is "
+            "retired — every BotFather token was revoked 2026-08-18, so a "
+            "present token can never be OK; set web.enabled + "
+            "web.web_only (or remove the telegram bot_token)"
+        ),
         data={"length": len(token)},
     )
 

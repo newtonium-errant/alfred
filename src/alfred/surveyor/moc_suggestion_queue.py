@@ -90,7 +90,8 @@ def load_queue(queue_path: str | Path) -> list[MocSuggestion]:
 
     Per-line failure isolation: a single corrupt line logs +
     skips; the rest of the queue still loads. Same defensive
-    shape as :func:`alfred.telegram.inventory_views.collect_records`.
+    shape as the per-bullet isolation in ``moc_suggester``'s
+    MOC-contents parser.
     """
     qp = Path(queue_path)
     if not qp.exists():

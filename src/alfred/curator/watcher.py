@@ -5,13 +5,16 @@ and the startup ``full_scan`` — run every candidate through the SAME
 predicate (:func:`is_ingestable`), because the two paths admitting different
 things is precisely how a file gets processed by one and not the other.
 
-The filter exists for a measured reason. Three attachment savers write
+The filter exists for a measured reason. Three attachment savers wrote
 BINARIES into this watched directory: ``telegram.vision.save_image_to_inbox``
-(``screenshot-*``), ``telegram.attachments.save_document_to_inbox``
-(``document-*``) and ``save_audio_to_inbox`` (``audio-*``). With no
-extension filter, every screenshot, PDF and voice note the operator sent was
-picked up here and pushed through ``claude -p`` a SECOND time — paid LLM
-spend producing junk records from a file the talker had already handled.
+(``screenshot-*``, still live via the web image path) plus the retired
+bot-side ``save_document_to_inbox`` (``document-*``) and
+``save_audio_to_inbox`` (``audio-*``) from ``telegram/attachments.py``
+(deleted with the Telegram retirement, T5 2026-08-19; their files persist
+in inboxes). With no extension filter, every screenshot, PDF and voice
+note the operator sent was picked up here and pushed through ``claude -p``
+a SECOND time — paid LLM spend producing junk records from a file the
+talker had already handled.
 (#83's batch lane already dodged this by siting its scans OUTSIDE the vault;
 ``batch/paths.py`` documents the same hazard.)
 

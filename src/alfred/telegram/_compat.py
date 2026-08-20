@@ -1,14 +1,23 @@
 """Telegram-package compatibility shims — cross-module helpers that
 multiple call sites need but should not duplicate.
 
-Currently houses the instance-name normaliser historically shared
-between the retired Telegram bot (peer-route self-target check; module
-deleted 2026-08-19) and
-:mod:`alfred.telegram.speed_pref` (per-instance TTS speed lookup). The
-two modules used to carry independent copies; the bug surface that
-created (any divergence between the two normalisations would break the
-``(instance, user)`` key match across the dispatch path) is exactly the
-sort of drift the canonical-helper pattern exists to prevent.
+Houses the canonical instance-name normaliser
+(:func:`_normalize_instance_name`) — live consumers today are
+``orchestrator.py`` (PI-daemon instance naming) and
+``routine/config.py`` (per-instance match-calibration store keys), so
+its collapse rule is FROZEN: widening it would orphan state keyed by
+its output (pinned in ``tests/telegram/test_peer_key_resolver.py``).
+Its original in-package consumers — the Telegram bot's peer-route
+self-target check and ``speed_pref``'s ``(instance, user)`` key — died
+with the retirement (T4/T5, 2026-08-19); the helper predates and
+outlives them.
+
+Also houses the peer-name identity helpers
+(:func:`collapse_peer_name` / :func:`resolve_peer_key`, #30) — no src
+consumer since the opening-cue router's deletion (T5), kept as pure,
+directly-pinned infra because the peer-alias divergence they close
+(VERA's ``kalle`` vs the canonical ``kal-le``) still exists in live
+``transport.peers`` configs.
 
 Distinct from the root Anthropic-SDK helper
 (:mod:`alfred._anthropic_compat`), which targets SDK-level model-family

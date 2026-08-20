@@ -58,7 +58,8 @@ _SPEED_MIN, _SPEED_MAX = 0.7, 1.2
 def _resolve_speed(raw: str | None) -> float | None:
     """Parse + clamp the ``speed`` query param to the valid TTS range, or None
     (provider default) when absent/unparseable. The FE passes the operator's
-    /speed pref; we clamp defensively rather than 400 on a stray value."""
+    speed preference (client-held; the Telegram /speed command's vault store
+    is retired); we clamp defensively rather than 400 on a stray value."""
     if not raw:
         return None
     try:

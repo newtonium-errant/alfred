@@ -124,9 +124,36 @@ def test_bot_token_still_fails_both_branches_when_not_web_only() -> None:
     )
 
 
-def test_bot_token_ok_path_untouched_when_not_web_only() -> None:
+def test_bot_token_resolvable_token_fails_post_retirement() -> None:
+    """T5 ledger item B: the former OK arm. A resolvable token on a
+    non-web-only config is a double fossil — Telegram was retired and
+    every BotFather token revoked 2026-08-18, so "token present" can
+    never again mean OK. The refusal-pin discipline applies: assert the
+    WHY (the revoked-token detail), not just the FAIL, because a FAIL
+    with the empty-token detail would be a different (wrong) arm firing.
+    """
+    # Token-shaped fixture value: this test exercises the arm that fires
+    # on a RESOLVABLE (non-empty, non-placeholder) token, matching the
+    # pre-existing wire-shape fixture in the deleted OK-arm pin.
     r = _check_bot_token("1234567:realish-looking-value", web_only=False)
-    assert r.status is Status.OK
+    assert r.status is Status.FAIL
+    # WHY: this arm names the revocation, and is distinct from both
+    # sibling FAIL arms.
+    assert "revoked" in r.detail
+    empty_detail = _check_bot_token("", web_only=False).detail
+    placeholder_detail = _check_bot_token(
+        "${TELEGRAM_BOT_TOKEN}", web_only=False,
+    ).detail
+    assert r.detail != empty_detail
+    assert r.detail != placeholder_detail
+    # The raw token value must not leak into the detail (length only).
+    assert "realish-looking-value" not in r.detail
+    # Positive control in the same test: the same token under web_only
+    # still SKIPs — the retirement FAIL is scoped to fossil configs.
+    assert (
+        _check_bot_token("1234567:realish-looking-value", web_only=True).status
+        is Status.SKIP
+    )
 
 
 def test_allowed_users_skips_under_web_only_and_warns_otherwise() -> None:

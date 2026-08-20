@@ -337,10 +337,12 @@ class InstanceConfig:
     ``name`` is the casual, greeting-friendly form ("Salem", "KAL-LE",
     "Hypatia"). ``canonical`` is the formal form used once in the SKILL's
     identity paragraph ("S.A.L.E.M.", "K.A.L.L.E.", "H.Y.P.A.T.I.A.").
-    ``aliases`` is the multi-instance router's case-insensitive accept
-    list so phone-autocorrect / voice-transcription variants still route
-    correctly (``"Salem"`` → S.A.L.E.M., ``"Pat"`` → Hypatia) without a
-    code change.
+    ``aliases`` was the multi-instance opening-cue router's
+    case-insensitive accept list (phone-autocorrect / voice-transcription
+    variants: ``"Salem"`` → S.A.L.E.M., ``"Pat"`` → Hypatia). The router
+    died with the Telegram retirement (T5, 2026-08-19); the field stays
+    for config compatibility (instance YAMLs carry it) and for any
+    future name-matching consumer.
 
     ``name`` is **required** (no default). "Alfred" is the project /
     architecture name, never an instance name — defaulting to it
@@ -442,100 +444,26 @@ class FictionConfig:
 
 
 @dataclass
-class InventoryViewsConfig:
-    """Per-instance gate for the ``/questions`` + ``/research-pointers``
-    slash commands (Phase 4 Sub-arc C, 2026-05-18).
-
-    Default ``False`` so Salem (and any other operational-vault instance)
-    never accidentally registers the commands. Hypatia opts in via
-    ``telegram.inventory_views.command_enabled: true`` in
-    ``config.hypatia.yaml`` because her vault layout has the
-    ``question/`` + ``research-pointer/`` directories these commands
-    surface.
-
-    Conditional registration: when ``command_enabled=False`` (or the
-    ``inventory_views`` block is absent entirely), neither slash
-    command is registered — Telegram's "unknown command" behaviour
-    fires for instances that legitimately don't surface inventory MOCs.
-
-    Mirror of :class:`FictionConfig` + :class:`VoiceTrainConfig` shape —
-    same Hypatia-only-by-default convention. See
-    ``project_hypatia_zettelkasten_redesign.md`` Sub-arc C for the
-    arc spec.
-    """
-
-    command_enabled: bool = False
-    # Per-MOC-group cap on rendered bullets. Default 20 — anything
-    # higher and the Telegram-side rendering starts to scroll past the
-    # operator's attention. Operator-tunable for low-density vaults
-    # that want everything in one view; high-density vaults can keep
-    # the default and rely on the MOC/_*.md inventory MOC for full
-    # state (the slash command is a glance-view, not exhaustive).
-    per_group_cap: int = 20
-
-
-@dataclass
-class MocSuggestionsConfig:
-    """Per-instance gate for the ``/moc-suggestions`` + ``/accept-moc`` +
-    ``/reject-moc`` slash commands (Phase 5 Sub-arc D2, 2026-05-19).
-
-    Default ``False`` so Salem + KAL-LE never accidentally register the
-    commands. Hypatia opts in via
-    ``telegram.moc_suggestions.command_enabled: true`` in
-    ``config.hypatia.yaml`` because her vault is the only one running
-    the surveyor MOC-suggestion stage (D1 ship; ``surveyor.moc_suggestion.enabled=true``
-    in her config).
-
-    Conditional registration: when ``command_enabled=False`` (or the
-    ``moc_suggestions`` block is absent entirely), none of the three
-    slash commands are registered — Telegram's "unknown command"
-    behaviour fires for instances that legitimately don't have a queue.
-
-    Mirror of :class:`InventoryViewsConfig` + :class:`FictionConfig` +
-    :class:`VoiceTrainConfig` shape — same Hypatia-only-by-default
-    convention. See ``project_hypatia_zettelkasten_redesign.md`` Phase 5
-    Sub-arc D for the arc spec.
-    """
-
-    command_enabled: bool = False
-    #: Path to the surveyor's MOC suggestion JSONL queue. None means
-    #: derive from a sensible default at handler-call time — but the
-    #: handler needs an explicit hint because the bot doesn't have a
-    #: direct reference to the surveyor's state path. Operator sets
-    #: this in config.hypatia.yaml to match her surveyor.state.path
-    #: parent. Same pattern as :class:`VoiceTrainConfig.queue_path` —
-    #: explicit JSONL path operator-set per instance.
-    queue_path: str | None = None
-
-
-@dataclass
 class TodayCommandConfig:
-    """Per-instance gate for the ``/today`` slash command (Tier Phase 2A,
-    2026-05-28).
+    """Config block for the RETIRED ``/today`` slash command (Tier Phase
+    2A, 2026-05-28; command died with the Telegram retirement, T5
+    2026-08-19 — ``today_command.py`` is deleted).
 
-    Default ``False`` so no instance accidentally registers the command —
-    Salem opts in via ``telegram.today_command.enabled: true`` in
-    ``config.yaml`` because the surface composes Salem-specific sections
-    (tier, routines, upcoming events). KAL-LE / Hypatia leave the block
-    absent.
-
-    The command is a glance-view mini-brief: composes the tier section,
-    today's routines, and upcoming events as a single Telegram reply.
-    Read-only — no vault writes, no session record.
-
-    Mirror of :class:`InventoryViewsConfig` + :class:`VoiceTrainConfig`
-    shape — same default-off-by-block-absence convention so health probes
-    can distinguish "block absent" from "block present, command disabled".
+    The dataclass is KEPT because ``timezone`` outlived the command: it
+    is the instance timezone the tier surface still resolves through
+    ``conversation._resolve_tier_timezone`` (prefers
+    ``today_command.timezone``, falls back to Salem's tz), so Salem's
+    configured block keeps steering the tier done-state date boundary.
+    ``enabled`` is inert — nothing registers a command any more.
 
     ``timezone`` defaults to ``America/Halifax`` (Salem's tz) since the
-    talker config doesn't carry a system timezone today. Operator-tunable
-    per instance for future opt-ins.
+    talker config doesn't carry a system timezone today.
     """
 
     enabled: bool = False
-    #: IANA timezone for the ``now`` instant used by the tier compute
-    #: + routines/upcoming-events date selection. Defaults to Salem's
-    #: tz since Phase 2A is Salem-only.
+    #: IANA timezone for the tier compute's 'today' boundary — consumed
+    #: by ``conversation._resolve_tier_timezone``. Defaults to Salem's
+    #: tz since Phase 2A was Salem-only.
     timezone: str = "America/Halifax"
 
 
@@ -689,25 +617,10 @@ class TalkerConfig:
     # only opt-in; Salem/KAL-LE adoption is a config flip when their
     # workflows need it.
     voice_train: VoiceTrainConfig | None = None
-    # Inventory views gate — see :class:`InventoryViewsConfig`.
-    # Default-OFF / None sentinel matching fiction + voice_train shape.
-    # Hypatia is Phase 4 Sub-arc C's only opt-in; the /questions +
-    # /research-pointers commands surface her question/ and
-    # research-pointer/ records (types Salem + KAL-LE don't have).
-    inventory_views: InventoryViewsConfig | None = None
-    # MOC suggestions gate — see :class:`MocSuggestionsConfig`.
-    # Default-OFF / None sentinel matching the inventory_views shape.
-    # Hypatia is Phase 5 Sub-arc D2's only opt-in; the
-    # /moc-suggestions + /accept-moc + /reject-moc commands consume
-    # the JSONL queue written by surveyor's Stage 8 (D1 ship). Salem +
-    # KAL-LE leave this block absent.
-    moc_suggestions: MocSuggestionsConfig | None = None
-    # Today-command gate — see :class:`TodayCommandConfig`. Default-OFF
-    # / None sentinel matching the inventory_views + moc_suggestions
-    # shape. Salem is Tier Phase 2A's only opt-in; the /today command
-    # composes the brief's tier + routines + upcoming-events sections
-    # as a glance-view mini-brief. KAL-LE / Hypatia leave the block
-    # absent.
+    # Today-command block — see :class:`TodayCommandConfig`. The /today
+    # command is retired (T5 2026-08-19); the block survives because
+    # ``conversation._resolve_tier_timezone`` reads its ``timezone``.
+    # Salem populates it; KAL-LE / Hypatia leave it absent (None).
     today_command: TodayCommandConfig | None = None
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
@@ -745,8 +658,6 @@ _DATACLASS_MAP: dict[str, type] = {
     "vision": VisionConfig,
     "fiction": FictionConfig,
     "voice_train": VoiceTrainConfig,
-    "inventory_views": InventoryViewsConfig,
-    "moc_suggestions": MocSuggestionsConfig,
     "today_command": TodayCommandConfig,
 }
 
@@ -862,27 +773,12 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     voice_train_raw = tool.get("voice_train")
     if isinstance(voice_train_raw, dict) and voice_train_raw:
         built.voice_train = _build(VoiceTrainConfig, voice_train_raw)
-    # Inventory views — defaulted-OFF / None sentinel. Same shape as
-    # fiction + voice_train. Block-absent means the /questions +
-    # /research-pointers commands are NOT registered.
-    inventory_views_raw = tool.get("inventory_views")
-    if isinstance(inventory_views_raw, dict) and inventory_views_raw:
-        built.inventory_views = _build(
-            InventoryViewsConfig, inventory_views_raw,
-        )
-    # MOC suggestions — defaulted-OFF / None sentinel. Same shape as
-    # inventory_views. Block-absent means the /moc-suggestions +
-    # /accept-moc + /reject-moc commands are NOT registered.
-    moc_suggestions_raw = tool.get("moc_suggestions")
-    if isinstance(moc_suggestions_raw, dict) and moc_suggestions_raw:
-        built.moc_suggestions = _build(
-            MocSuggestionsConfig, moc_suggestions_raw,
-        )
-    # Today command — defaulted-OFF / None sentinel. Same shape as
-    # inventory_views + moc_suggestions. Block-absent means the
-    # /today command is NOT registered. Tier Phase 2A is Salem-only;
-    # KAL-LE / Hypatia leave the block absent and Telegram's
-    # unknown-command behaviour fires.
+    # Today command — defaulted-OFF / None sentinel. Kept for its
+    # ``timezone`` (see :class:`TodayCommandConfig`). A
+    # ``telegram.moc_suggestions`` or ``telegram.inventory_views`` block
+    # in an old YAML is silently ignored (their gates died with the
+    # Telegram retirement, T5 2026-08-19); this loader only reads the
+    # keys it names.
     today_command_raw = tool.get("today_command")
     if isinstance(today_command_raw, dict) and today_command_raw:
         built.today_command = _build(

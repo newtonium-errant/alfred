@@ -801,8 +801,9 @@ def is_stayc_peer_name(name: str) -> bool:
     both directions (§1/§3 of the recall federation design). This is the
     single source of truth for "is this the fenced instance," normalizing
     over the spellings that appear in configs / peer keys (``stay-c`` is
-    the canonical peer key per ``telegram.router._VALID_PEER_TARGETS``,
-    but ``stayc`` / ``stay_c`` / casing variants are all fenced too).
+    the canonical peer-key spelling used across ``transport.peers``
+    configs, but ``stayc`` / ``stay_c`` / casing variants are all fenced
+    too).
     """
     normalized = (name or "").strip().casefold().replace("-", "").replace("_", "")
     return normalized == "stayc"

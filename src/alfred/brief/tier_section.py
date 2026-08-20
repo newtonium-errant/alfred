@@ -139,7 +139,8 @@ log = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Section header — referenced by ``brief/daemon.py`` + ``today_command.py``.
+# Section header — referenced by ``brief/daemon.py`` (``today_command.py``,
+# its other consumer, died with the Telegram retirement — T5 2026-08-19).
 # Single source of truth so a rename here propagates without grep-replace.
 #
 # Renamed from "Open Tasks by Tier" in Phase C (2026-08-12). Two reasons, both
@@ -1262,10 +1263,15 @@ def render_curated_tier_section_for_today(
     vault_path: Path | None = None,
     today: date | None = None,
 ) -> str:
-    """Render the ``/today`` curated-only tier section body.
+    """Render the curated-only tier section body (the ``/today`` view).
 
-    Operator-committed view for the ``/today`` slash command (2026-05-30
-    scope refinement). Renders ONLY the operator-curated T1/T2/T3
+    Built as the operator-committed view for the ``/today`` slash command
+    (2026-05-30 scope refinement). The /today command died with the
+    Telegram retirement (T5, 2026-08-19); this renderer is KEPT as a
+    tested mode of the shared tier surface with no production caller
+    today — the ``/today`` mentions below describe its historical
+    consumer's contract, which any future glance-view door inherits.
+    Renders ONLY the operator-curated T1/T2/T3
     shortlists from the daily_curation block — no auto-T1 candidates,
     no T2 selection pool, no auto-T2-routine subsection, no rollover,
     no confirm prompts. Operator already committed; the view's purpose

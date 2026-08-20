@@ -9,7 +9,9 @@ on disk keyed by ``(brief_date, narration_content_hash, speed)``:
     same-day brief REGEN with changed content re-renders (new hash → cache miss)
     while an unchanged brief always hits (zero synth). Content-keyed, not just
     date-keyed, so the cache never serves stale audio for a regenerated brief.
-  * ``speed`` — the operator's /speed pref (each speed is a distinct render).
+  * ``speed`` — the operator's speed preference, client-supplied via the
+    ``?speed=`` query param (each speed is a distinct render; the Telegram
+    ``/speed`` command that originated the concept is retired).
 
 A cache hit returns bytes and the route serves them WITHOUT calling ElevenLabs —
 the mutation-pinned credit guard. The store is a flat dir of ``.mp3`` files under

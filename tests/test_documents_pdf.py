@@ -8,8 +8,10 @@ Two things are under test here and they are worth naming separately:
    against an extractor that collapsed them all back into one.
 2. **The LIFT** — this module moved out of ``alfred.telegram.attachments`` in
    #57 so the web ingest route could share it. The talker's behaviour had to
-   survive that move byte-for-byte, so the pins below hold the re-exports, the
-   error-class ALIAS, and the truncation default that the talker relies on.
+   survive that move byte-for-byte, so pins held the re-exports and the
+   error-class ALIAS until ``telegram/attachments.py`` (the bot-side wrapper)
+   was deleted in T5 (2026-08-19); the wording + cap pins below outlive it
+   because the web ingest door consumes them directly.
 """
 
 from __future__ import annotations
@@ -215,35 +217,11 @@ def test_the_log_prefix_is_caller_scoped() -> None:
 
 
 # ---------------------------------------------------------------------------
-# the LIFT — the talker's surface must be unchanged
+# (the LIFT re-export pins — deleted in T5 2026-08-19 with
+# telegram/attachments.py itself: the alias + re-export surface existed
+# for the bot's on_document handler and test_attachments.py, both gone.
+# The lifted module below is the ONLY spelling now.)
 # ---------------------------------------------------------------------------
-
-
-def test_attachment_extract_error_is_an_alias_not_a_subclass() -> None:
-    """Load-bearing, and the reason is subtle: the shared module raises
-    ``DocumentExtractError``. Every existing talker handler catches
-    ``AttachmentExtractError``. If that name were a SUBCLASS, those handlers
-    would silently stop catching — the raise would sail past an ``except`` that
-    still looks correct in the diff. Aliasing is what makes them the same
-    class, so this identity is the pin."""
-    from alfred.telegram import attachments
-
-    assert attachments.AttachmentExtractError is DocumentExtractError
-
-    with pytest.raises(attachments.AttachmentExtractError):
-        extract_pdf_text(scanned_pdf())
-
-
-def test_the_talker_module_still_exposes_the_lifted_names() -> None:
-    """The re-exports. ``tests/telegram/test_attachments.py`` reads these off
-    the ``attachments`` module, and so does the on_document handler."""
-    from alfred.telegram import attachments
-
-    assert attachments.MAX_PDF_BYTES == MAX_PDF_BYTES
-    assert attachments.MAX_EXTRACTED_CHARS == MAX_EXTRACTED_CHARS
-    assert attachments.TRUNCATION_MARKER == TRUNCATION_MARKER
-    assert attachments.extract_pdf_text is extract_pdf_text
-    assert attachments.MAX_BYTES_BY_KIND["pdf"] == MAX_PDF_BYTES
 
 
 def test_the_talker_message_wording_is_unchanged_by_the_lift() -> None:

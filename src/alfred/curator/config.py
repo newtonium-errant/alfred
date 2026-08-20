@@ -116,12 +116,15 @@ class WatcherConfig:
     # Before this existed, admission was "every file that is not hidden, a
     # .lock, or in a small skip-name set" — no extension filter at all. That
     # is a real, measured spend-burner rather than a theoretical one: THREE
-    # attachment savers write BINARIES into this same watched directory —
-    # ``telegram.vision.save_image_to_inbox`` (``screenshot-*``),
-    # ``telegram.attachments.save_document_to_inbox`` (``document-*``) and
-    # ``save_audio_to_inbox`` (``audio-*``) — so every screenshot, PDF and
-    # voice attachment was picked up and pushed through ``claude -p`` a
-    # second time, minting junk records. (#83's batch lane already dodged
+    # attachment savers wrote BINARIES into this same watched directory —
+    # ``telegram.vision.save_image_to_inbox`` (``screenshot-*``, still
+    # live via the web image path) plus the retired bot-side
+    # ``save_document_to_inbox`` (``document-*``) and
+    # ``save_audio_to_inbox`` (``audio-*``) from ``telegram/attachments.py``
+    # (deleted with the Telegram retirement, T5 2026-08-19; their files
+    # persist in inboxes) — so every screenshot, PDF and voice attachment
+    # was picked up and pushed through ``claude -p`` a second time,
+    # minting junk records. (#83's batch lane already dodged
     # this by siting its scans OUTSIDE the vault; see ``batch/paths.py``,
     # which documents the same hazard.)
     #

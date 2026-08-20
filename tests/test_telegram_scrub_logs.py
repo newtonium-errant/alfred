@@ -168,3 +168,103 @@ def test_clean_scan_says_so_out_loud(tmp_path: Path) -> None:
         c for c in captured if c.get("event") == "telegram.scrub_logs.file"
     ]
     assert len(file_events) == 1
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch (T5 ledger item A) — through ``alfred.cli.main``
+#
+# The 10 pins above are module-level; none of them would notice a broken
+# ``alfred telegram scrub-logs`` wire (parser not registered, handler not
+# routed, instance_data_dir not resolved, an argparse flag renamed without
+# its plumbing). This drives the REAL entry point exactly as a shell does —
+# the e2e-through-a-production-entry-point class that per-layer unit pins
+# structurally cannot give.
+# ---------------------------------------------------------------------------
+
+
+def _run_cli(argv: list[str]) -> int:
+    """Install argv and call ``alfred.cli.main`` (it takes no arguments).
+
+    Mirrors ``tests/reconcile/test_cli.py::_run`` — the established idiom
+    for dispatch pins in this repo.
+    """
+    import sys
+
+    from alfred.cli import main
+
+    original = sys.argv
+    sys.argv = ["alfred", *argv]
+    try:
+        main()
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    finally:
+        sys.argv = original
+    return 0
+
+
+def test_cli_dispatch_scrub_logs_end_to_end(tmp_path: Path, capsys) -> None:
+    """argparse wiring + instance_data_dir resolution + arg plumbing.
+
+    Phase 1 (--dry-run): the handler runs, names the config-resolved data
+    dir and both files in its report, and writes NOTHING (dry-run plumbed).
+    Phase 2 (wet): the token in the log-dir file and the --token literal in
+    the --path file are both rewritten — positive proof the config's
+    ``logging.dir`` reached ``scrub_logs`` as the scan root and that
+    ``--path`` / ``--token`` reached their keyword arguments.
+    """
+    import yaml
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    log_file = data_dir / "talker.log"
+    _write_log(log_file, f"token={FAKE_TOKEN}", "neighbour line stays")
+
+    # Outside the log-dir walk: reachable only via --path; its content is
+    # NOT token-shaped, so it is only scrubbed if --token plumbed through.
+    extra = tmp_path / "elsewhere" / "notes.txt"
+    extra.parent.mkdir()
+    extra.write_text("pasted TOKENXYZ once\n", encoding="utf-8")
+
+    cfg = tmp_path / "config.test.yaml"
+    cfg.write_text(
+        yaml.safe_dump({
+            "logging": {"dir": str(data_dir)},
+            "telegram": {"instance": {"name": "Testbed"}},
+        }),
+        encoding="utf-8",
+    )
+
+    argv = [
+        "--config", str(cfg),
+        "telegram", "scrub-logs",
+        "--path", str(extra),
+        "--token", "TOKENXYZ",
+    ]
+
+    # --- Phase 1: dry run ---------------------------------------------
+    code = _run_cli([*argv[:4], "--dry-run", *argv[4:]])
+    assert code == 0
+    out = capsys.readouterr().out
+    # instance_data_dir resolution surfaced in the report header.
+    assert str(data_dir) in out
+    assert "DRY RUN" in out
+    # Both files reached the report (log-dir walk + --path plumbing).
+    assert str(log_file) in out
+    assert str(extra) in out
+    # ...and nothing was written.
+    assert FAKE_TOKEN in log_file.read_text(encoding="utf-8")
+    assert "TOKENXYZ" in extra.read_text(encoding="utf-8")
+
+    # --- Phase 2: wet run ---------------------------------------------
+    code = _run_cli(argv)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "rewritten in place" in out
+    scrubbed_log = log_file.read_text(encoding="utf-8")
+    assert FAKE_TOKEN not in scrubbed_log
+    assert PLACEHOLDER in scrubbed_log
+    assert "neighbour line stays" in scrubbed_log
+    scrubbed_extra = extra.read_text(encoding="utf-8")
+    assert "TOKENXYZ" not in scrubbed_extra
+    assert PLACEHOLDER in scrubbed_extra

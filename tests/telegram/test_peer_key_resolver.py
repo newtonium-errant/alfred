@@ -23,8 +23,16 @@ literal membership test on VERA.
 
 ``collapse_peer_name`` + ``resolve_peer_key`` close both. See
 ``_compat.py`` for why ``_normalize_instance_name`` itself is FROZEN
-(its output is the ``speed_pref`` store key — changing its collapse rule
-would orphan every stored preference; pinned below).
+(its output is a per-instance STORE key — changing its collapse rule
+would orphan stored data keyed by it; pinned below).
+
+T5 note (2026-08-19): the opening-cue router — the original consumer of
+``resolve_peer_key`` — died with the Telegram retirement, and its two
+integration tests here died with it. The helpers are KEPT as pure,
+directly-pinned infra: the peer-alias divergence they close (VERA's
+``kalle`` vs the canonical ``kal-le``) still exists in the live
+``transport.peers`` configs, so any future peer-name matcher should
+resolve through them rather than re-deriving a literal comparison.
 """
 
 from __future__ import annotations
@@ -33,7 +41,6 @@ from typing import Any
 
 import pytest
 
-from alfred.telegram import router
 from alfred.telegram._compat import (
     _normalize_instance_name,
     collapse_peer_name,
@@ -175,68 +182,27 @@ def test_normalize_instance_name_behaviour_is_frozen(
 ) -> None:
     """``_normalize_instance_name`` output is a STORE KEY — do not change.
 
-    ``speed_pref`` persists per-instance TTS preferences under this
-    function's output. Widening its collapse rule (e.g. to also strip
-    dashes, as ``collapse_peer_name`` does) would orphan every stored
-    preference on the box. #30 deliberately added a SEPARATE helper
-    rather than changing this one; this pin guards that decision.
+    ``routine/config.py`` keys per-instance match-calibration state
+    files under this function's output, and ``orchestrator.py`` derives
+    PI-daemon instance names through it (the original citation here —
+    ``speed_pref``'s preference store — was deleted in T5 2026-08-19;
+    the frozen contract outlives it). Widening the collapse rule (e.g.
+    to also strip dashes, as ``collapse_peer_name`` does) would orphan
+    state keyed under ``kal-le`` on the box. #30 deliberately added a
+    SEPARATE helper rather than changing this one; this pin guards that
+    decision.
     """
     assert _normalize_instance_name(raw) == expected
 
 
 # --------------------------------------------------------------------
-# Router — acceptance must be identity-based, not literal
+# (Router integration section — deleted in T5 2026-08-19 with
+# telegram/router.py: three tests drove _decision_from_parsed
+# (divergent-alias acceptance, fail-closed refusal, self-target guard).
+# Their helper-level substance survives above: resolve_peer_key against
+# VERA_PEERS / HYPATIA_PEERS, and test_collapse_converges_every_
+# kalle_spelling for the self-vs-target identity comparison. The E2E
+# section that once followed drove bot.py's _dispatch_peer_route and
+# was emptied in T4 when that entry point died.)
 # --------------------------------------------------------------------
-
-def test_router_accepts_canonical_emission_against_divergent_alias() -> None:
-    """On VERA, a ``kal-le`` classification must survive the router gate.
-
-    Before #30 this failed a literal ``in`` against ``{salem, kalle}``
-    and silently degraded to a local ``note`` — the peer route never ran.
-    """
-    decision = router._decision_from_parsed(
-        {"session_type": "peer_route", "target": "kal-le"},
-        recent=[],
-        self_name="vera",
-        valid_peer_targets=VERA_PEERS,
-    )
-    assert decision.session_type == "peer_route"
-    assert decision.target == "kalle"  # VERA's own configured key
-
-
-def test_router_still_refuses_an_unconfigured_peer() -> None:
-    """Fail-closed is preserved: Hypatia has no KAL-LE peer."""
-    decision = router._decision_from_parsed(
-        {"session_type": "peer_route", "target": "kal-le"},
-        recent=[],
-        self_name="hypatia",
-        valid_peer_targets=HYPATIA_PEERS,
-    )
-    assert decision.session_type == "note"
-    assert decision.target is None
-
-
-def test_router_self_target_guard_survives_spelling_mismatch() -> None:
-    """A dotted self-name vs a dashed target must still read as SELF.
-
-    ``_normalize_instance_name`` would give ``kalle`` vs ``kal-le`` here
-    and let the self-route through; the collapsed comparison catches it.
-    """
-    decision = router._decision_from_parsed(
-        {"session_type": "peer_route", "target": "kal-le"},
-        recent=[],
-        self_name="kalle",
-        valid_peer_targets={"kal-le"},
-    )
-    assert decision.session_type == "note"
-    assert decision.target is None
-
-
-# --------------------------------------------------------------------
-# E2E through the production entry point (_dispatch_peer_route)
-# --------------------------------------------------------------------
-#
-# This is the pin class that catches the unthreaded-gate trap: per-layer
-# unit pins above would all stay green if the resolver were never wired
-# into the dispatcher. These drive the real function body.
 
