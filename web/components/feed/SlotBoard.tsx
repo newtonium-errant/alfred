@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FeedItem } from '../../lib/algernon/feed';
-import { SLOT_LABELS, SLOT_ORDER, UNDO_MS, type BoardSlot } from '../../lib/algernon/feedConstants';
+import { SLOT_LABELS, SLOT_ORDER, UNDO_MS, holdChoicesForVerb, type BoardSlot } from '../../lib/algernon/feedConstants';
 import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import {
   BOARD_UNSLOTTED,
@@ -17,16 +17,20 @@ import {
 } from '../../lib/algernon/board';
 import {
   COMPLETION_UNAVAILABLE_HINT,
+  RING_ACTION_DONE,
   effectiveStageOf,
   ringItemCompletable,
   ringItemUndoable,
   type RingItemStage,
 } from '../../lib/algernon/rings';
+import { HoldPressButton } from './HoldPressButton';
+import { HoldSelector } from './HoldSelector';
 import { RingsHeader } from './RingsHeader';
 import { useBoardGrace } from './useBoardGrace';
 import type { UseRingCompletionResult } from './useRingCompletion';
 import { useSlotAccept } from './useSlotAccept';
 import { useSort } from './useSort';
+import { WHEN_SELECTOR_NOTE, WHEN_SELECTOR_TITLE } from './whenSelector';
 
 // ═══════════ THE DAY BOARD — home's top module (Phase C, lane C1) ═══════════
 //
@@ -71,6 +75,9 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
   // second tap elsewhere closes the first — the picker is a choice in
   // progress, and two open at once would offer two answers to one question.
   const [sortingId, setSortingId] = useState<string | null>(null);
+  // Which row has its ✓-hold when-selector open (backdated completion). Same
+  // per-board one-at-a-time reasoning as the sort picker above.
+  const [whenForId, setWhenForId] = useState<string | null>(null);
   const now = useMemo(() => nowProp ?? new Date(), [nowProp]);
   const [openDone, setOpenDone] = useState<ReadonlySet<string>>(() => new Set());
   const [openSnoozed, setOpenSnoozed] = useState<ReadonlySet<string>>(() => new Set());
@@ -173,6 +180,12 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
     const notice = completion.noticeFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
+    // The ✓-hold's when-family, wire-derived (null = plain ✓, no behaviour
+    // change). Only where a live ✓ renders.
+    const whenChoices =
+      completable && !done && !snoozed && !suggested
+        ? holdChoicesForVerb(it, RING_ACTION_DONE)
+        : null;
     const dot = done
       ? 'bg-status-done-fg'
       : snoozed
@@ -187,7 +200,7 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
         data-testid="board-item"
         data-stage={stage}
         data-pending={pending}
-        className="border-t border-dashed border-console-edge pt-2 first:border-0 first:pt-0"
+        className="relative border-t border-dashed border-console-edge pt-2 first:border-0 first:pt-0"
       >
         <div className="flex items-start justify-between gap-2">
           <button
@@ -256,15 +269,19 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
               {acceptBusy ? '…' : 'Accept'}
             </button>
           ) : completable ? (
-            <button
-              type="button"
+            // Quick tap = done TODAY through the grace window, unchanged.
+            // HOLDING the ✓ opens the when-selector when the wire served a
+            // when-family (backdated completion); the pick posts directly —
+            // a deliberately chosen date needs no grace window.
+            <HoldPressButton
               data-testid="board-complete"
               disabled={compBusy}
-              onClick={() => grace.tap(it)}
+              onTap={() => grace.tap(it)}
+              onHold={whenChoices ? () => setWhenForId(it.id) : null}
               className="shrink-0 rounded-lg border border-console-edge-bright px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
             >
               {compBusy ? '…' : '✓ Done'}
-            </button>
+            </HoldPressButton>
           ) : (
             // Honestly DISABLED — an unknown / unstamped lane has no writer, and a
             // control that looks live and does nothing is the failure this whole
@@ -381,6 +398,23 @@ export function SlotBoard({ items, completion, onAuthExpired, now: nowProp }: Sl
               </div>
             ))}
           </dl>
+        )}
+
+        {/* The when-selector — the ✓-hold's alternatives (backdated
+            completion). Choosing IS the completion, one interaction; the pick
+            posts directly through completeWith (a deliberately chosen date
+            needs no grace window). Anchors to this row (li is relative). */}
+        {whenForId === it.id && whenChoices && (
+          <HoldSelector
+            title={WHEN_SELECTOR_TITLE}
+            note={WHEN_SELECTOR_NOTE}
+            choices={whenChoices}
+            onPick={(verb) => {
+              setWhenForId(null);
+              completion.completeWith(it, verb);
+            }}
+            onCancel={() => setWhenForId(null)}
+          />
         )}
       </li>
     );

@@ -129,6 +129,28 @@ CONTEST_ACTION = "contest"
 # the ReplyCorrection/last_batch path — the writers are called directly).
 DONE_ACTION = "done"
 UNDO_DONE_ACTION = "undo_done"
+# Backdated completion rungs (operator ruling 2026-08-20: "have yesterday be
+# the default 'previously done' option, with ability to backdate further as
+# needed") — verb id → days BACK from the act's today. A STATIC CLOSED SET per
+# the sort-verbs precedent directly below: the ceiling cannot express
+# per-request data, and three rungs cover the daily/weekly shapes the
+# ±half-cycle bound admits (see ``routine.recurrence.backdate_credit_window``).
+# Longer cycles (monthly, ~15d half-cycle) wait on the LEDGERED pick-a-date
+# wire extension; the ``backdate_limit_days`` producer stamp is the seam it
+# plugs into.
+BACKDATE_DONE_ACTIONS: dict[str, int] = {
+    "done_1d": 1,
+    "done_2d": 2,
+    "done_3d": 3,
+}
+# The completion FAMILY — the plain verb plus its dated rungs. Every gate that
+# asks "is this act a completion?" or "was this item completed from the
+# board?" consults THIS, never ``DONE_ACTION`` alone: a rung IS a completion
+# (same writer, same lane, a different date), and a family member missed by a
+# ``== DONE_ACTION`` comparison is a gate silently gone dark for backdates —
+# the accepted-item exception and the snooze-on-done refusal both route
+# through it below.
+DONE_FAMILY: tuple[str, ...] = (DONE_ACTION, *BACKDATE_DONE_ACTIONS)
 # slot_suggestion ACCEPT action (Phase C slice 2 — board day-planning). Commits
 # an auto-surfaced candidate onto today's tier list via the tier_confirm writer.
 # Gated: accept ONLY when ``evidence.candidate is True`` (a committed item →
@@ -352,7 +374,8 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # declaration. Unlike the five families above, the kwargs here are UNUSED: a
     # slot completion/accept does NOT synthesize a ReplyCorrection or read
     # last_batch. It is intercepted by :func:`_dispatch_slot_completion`
-    # (done/undo_done) or :func:`_dispatch_slot_confirm` (accept) right after
+    # (the done family — done + the dated done_Nd rungs — and undo_done) or
+    # :func:`_dispatch_slot_confirm` (accept) right after
     # this ceiling check, which call the per-lane writer directly against the
     # feed item's OWN stamped evidence (origin/routine_record/tier/item_text).
     # snooze_* / unsnooze (R3): kwargs UNUSED, same as done/accept. Intercepted
@@ -371,6 +394,14 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # construction rather than by convention.
     "slot_suggestion": {
         "done": {},
+        # The backdated rungs, in menu order right after the plain verb — the
+        # when-family the hold-selector renders (done = Today is the suggested
+        # member). kwargs UNUSED like every slot verb; intercepted by
+        # :func:`_dispatch_slot_completion`, which maps the verb to its offset,
+        # enforces the credit-window bound, and calls the SAME per-lane writer
+        # with the chosen date. Routine lane only in v1 — the bound derives
+        # from the recurrence grammar, which the task/tier lanes don't carry.
+        **{_verb: {} for _verb in BACKDATE_DONE_ACTIONS},
         "undo_done": {},
         "accept": {},
         "snooze_1d": {},
@@ -524,6 +555,26 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
     },
     "slot_suggestion": {
         "accept": {"label": "Take it", "weight": "light", "gesture": _GESTURE_AFFIRM},
+        # The completion WHEN-family (backdated completion, 2026-08-20). Group
+        # marks the co-equal choice set the board's ✓-hold selector renders:
+        # Today is the plain verb's answer (the suggested member — quick tap
+        # semantics unchanged), the dated rungs are the "previously done"
+        # alternatives the operator ruled for.
+        #
+        # NO GESTURE ON ANY MEMBER, and that absence is load-bearing twice
+        # over: (1) ``verbsFromActions`` promotes the FIRST gesture-matching
+        # served verb to the deck's swipe — ``done`` precedes ``accept`` in
+        # ceiling order, so a gesture here would silently hijack the slot
+        # card's affirm from Take-it to Done; (2) the family's anchor on the
+        # board is a BUTTON, not a swipe direction — the client derives the
+        # selector by VERB (``holdChoicesForVerb('done')``), the
+        # verb-anchored evolution of the train-18 hold primitive. LIGHT: a
+        # co-equal choice commits on pick (the selector IS the deliberate
+        # step), and undo_done reverses it.
+        "done": {"label": "Today", "weight": "light", "group": "when"},
+        "done_1d": {"label": "Yesterday", "weight": "light", "group": "when"},
+        "done_2d": {"label": "2 days ago", "weight": "light", "group": "when"},
+        "done_3d": {"label": "3 days ago", "weight": "light", "group": "when"},
         # The sort verbs. LABELLED so they do not ship under raw ids, and
         # deliberately GESTURE-FREE — which on this surface means "menu verb,
         # not swipe verb" (`verbsFromActions`). Two reasons, and the first is
@@ -725,6 +776,24 @@ def actions_for_item(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         evidence = item.get("evidence") or {}
         if not isinstance(evidence, Mapping) or evidence.get("candidate") is not True:
             verbs = [v for v in verbs if v.get("verb") != ACCEPT_ACTION]
+        # Backdated rungs are served only where they are HONEST: the producer
+        # stamps ``backdate_limit_days`` — how many days back this item's
+        # credit window reaches (``routine.recurrence.backdate_credit_window``,
+        # computed against the item's own due_pattern + completion_log at emit
+        # time) — and a rung deeper than the stamp would be a control that
+        # refuses when pressed. Task/tier lanes and unstamped/old payloads
+        # carry 0, so they serve no rungs and the ✓ has no hold family (a
+        # selector of one is forbidden by the pattern). Matched by TYPE like
+        # the candidate flag above: a non-int stamp is no stamp. The act-time
+        # bound in ``_dispatch_slot_completion`` stays the real gate — this
+        # narrows what is OFFERED, defence stays at the door.
+        raw_limit = evidence.get("backdate_limit_days") if isinstance(evidence, Mapping) else 0
+        limit = raw_limit if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) else 0
+        verbs = [
+            v for v in verbs
+            if v.get("verb") not in BACKDATE_DONE_ACTIONS
+            or BACKDATE_DONE_ACTIONS[str(v.get("verb"))] <= limit
+        ]
     if kind == SORT_SUGGESTION_KIND:
         # THE PROPOSAL BECOMES THE GESTURE (2026-08-19 ruling). The kind-level
         # table serves the three sort verbs gesture-free — co-equal, no static
@@ -1316,7 +1385,10 @@ def _dispatch_slot_snooze(
     # Refuse a snooze on something already done — parking a finished item is
     # meaningless, and accepting the tap silently would be the exact
     # gesture-accepted-then-ignored failure this design rules out.
-    if bool(evidence.get("done")) or getattr(item, "acted_action", None) == DONE_ACTION:
+    # Family membership, not ``== DONE_ACTION``: an item completed via a
+    # backdated rung is exactly as finished as one completed via the plain
+    # verb, and parking it would be the same meaningless accept-and-ignore.
+    if bool(evidence.get("done")) or getattr(item, "acted_action", None) in DONE_FAMILY:
         log.info(
             "board.snooze.refused_already_done", id=feed_item_id, action=action_id,
         )
@@ -1368,9 +1440,9 @@ def _dispatch_slot_completion(
     config: Any,
     vault_path: Path | None,
 ) -> ActResult:
-    """Apply a slot_suggestion ``done`` / ``undo_done`` via the per-lane
-    completion writer — the SAME functions the talker uses (single writer per
-    lane). Acts on the feed item's OWN stamped ``evidence`` (never last_batch,
+    """Apply a slot_suggestion completion-family verb (``done`` / a dated
+    ``done_Nd`` rung) or ``undo_done`` via the per-lane completion writer —
+    the SAME functions the talker uses (single writer per lane). Acts on the feed item's OWN stamped ``evidence`` (never last_batch,
     never a re-derived key). Runs inside the caller's per-item mutex.
     """
     evidence = dict(getattr(item, "evidence", None) or {})
@@ -1462,18 +1534,171 @@ def _dispatch_slot_completion(
                 "this item isn't marked done — nothing to undo",
                 feed_item_id, action_id,
             )
+        # A backdated completion logged a PAST date, and its acted verb says
+        # which (``done_1d`` → today-1 at act time). Undo must aim at THAT
+        # date, not today — ``undo_done`` after a ``done_1d`` with today's
+        # date would find nothing logged, answer ok, and leave the record
+        # still satisfied: an undo that silently undoes nothing. Deriving the
+        # offset from the stamped verb against the UNDO day's today keeps the
+        # same-day undo (the whole undo surface: the row button, the
+        # optimistic flip) exact; a cross-midnight undo degrades to the same
+        # honest not_logged no-op the plain verb has always had.
+        undo_offset = BACKDATE_DONE_ACTIONS.get(
+            getattr(item, "acted_action", "") or "", 0,
+        )
         return _slot_undo(
             feed_item_id, action_id, lane=lane, evidence=evidence,
             feed_store=feed_store, vault_path=vault_path,
             item_text=item_text, today=today,
+            completion_date=today - timedelta(days=undo_offset),
         )
 
-    # action_id == DONE_ACTION (the ceiling admits only done/undo_done).
+    # action_id is in the DONE FAMILY (the ceiling admits done / done_Nd /
+    # undo_done here). The rung decides the date; the plain verb is offset 0.
+    backdate_days = BACKDATE_DONE_ACTIONS.get(action_id, 0)
+    completion_date = today - timedelta(days=backdate_days)
+    when_shape = ""
+    if backdate_days:
+        refusal, when_shape = _check_backdate_admissible(
+            feed_item_id, action_id, lane=lane, evidence=evidence,
+            vault_path=Path(vault_path), item_text=item_text,
+            chosen=completion_date, today=today,
+        )
+        if refusal is not None:
+            return refusal
     return _slot_done(
         feed_item_id, action_id, lane=lane, evidence=evidence,
         feed_store=feed_store, vault_path=vault_path,
-        item_text=item_text, today=today,
+        item_text=item_text, today=today, completion_date=completion_date,
+        when_shape=when_shape,
     )
+
+
+def _check_backdate_admissible(
+    feed_item_id: str,
+    action_id: str,
+    *,
+    lane: str,
+    evidence: dict[str, Any],
+    vault_path: Path,
+    item_text: str,
+    chosen: _date,
+    today: _date,
+) -> "tuple[ActResult | None, str]":
+    """The act-time bound for a backdated completion.
+
+    Returns ``(refusal, shape)``: ``(None, <recurrence type>)`` when the
+    backdate is admissible — the shape rides back so the when-ruling capture
+    can record its learnable discriminator without a second record read — and
+    ``(<ActResult>, "")`` on a refusal.
+
+    Enforces the ratified rule (2026-08-20): a 'previously done' date must lie
+    inside the item's CURRENT credit window (±half-cycle around its effective
+    due, strictly before today — ``routine.recurrence.backdate_credit_window``,
+    the single owner of that arithmetic). The serve side already filters the
+    rungs by the producer's ``backdate_limit_days`` stamp; this is the door
+    itself, for stale clients, stale stamps, and hand-crafted POSTs.
+
+    ROUTINE LANE ONLY in v1: the bound derives from the recurrence grammar,
+    which the task and free-text T3 lanes don't carry — an unbounded backdate
+    there would be a claim with no window to check it against, so those lanes
+    refuse honestly rather than guess. Every refusal logs a named event with a
+    ``reason`` field (the refusal-pin contract: WHY, not just that).
+
+    TOCTOU note: this reads the record outside the writer's ``file_rmw_lock``;
+    the per-item act mutex serializes board taps, and a concurrent CLI
+    completion landing between check and write costs at worst one extra logged
+    date — undoable, never a corruption.
+    """
+    if lane != "routine":
+        log.info(
+            "feed.act.slot.backdate_refused",
+            id=feed_item_id, action=action_id, lane=lane,
+            reason="unsupported_lane",
+        )
+        return ActResult(
+            False, STATUS_UNSUPPORTED_ITEM,
+            "backdating is only available for routine items so far — "
+            "the plain ✓ still records it as done today",
+            feed_item_id, action_id,
+        ), ""
+
+    rel = str(evidence.get("path") or "").strip()
+    if not rel:
+        return ActResult(
+            False, STATUS_STALE_ITEM,
+            "routine item is missing its record path — it'll resurface at the next sync",
+            feed_item_id, action_id,
+        ), ""
+    record_path, refusal = _contained_record_path(
+        vault_path, rel, feed_item_id=feed_item_id,
+        action_id=action_id, lane=lane, writer="feed.act.slot.backdate.routine",
+    )
+    if refusal is not None:
+        return refusal, ""
+
+    try:
+        fm = dict(frontmatter.load(str(record_path)).metadata or {})
+    except Exception:  # noqa: BLE001 — unreadable record → honest error
+        log.info(
+            "feed.act.slot.backdate_refused",
+            id=feed_item_id, action=action_id, lane=lane,
+            reason="record_unreadable", path=str(record_path),
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "the routine record could not be read",
+            feed_item_id, action_id,
+        ), ""
+
+    due_pattern = None
+    raw_items = fm.get("items") or []
+    if isinstance(raw_items, list):
+        for raw_item in raw_items:
+            if isinstance(raw_item, dict) and str(raw_item.get("text") or "").strip() == item_text:
+                due_pattern = raw_item.get("due_pattern")
+                break
+    if not isinstance(due_pattern, dict):
+        # No recurrence grammar on the item (cadence/self-care shapes, or the
+        # item moved) → no window to credit → no honest backdate. The plain
+        # verb still works; a cadence-item backdate bound is a ledgered
+        # follow-up ruling, not a silent admit.
+        log.info(
+            "feed.act.slot.backdate_refused",
+            id=feed_item_id, action=action_id, lane=lane,
+            reason="no_due_pattern", item=item_text,
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            f"'{item_text}' has no recurring deadline to credit — "
+            "the plain ✓ records it as done today",
+            feed_item_id, action_id,
+        ), ""
+
+    from alfred.routine.recurrence import backdate_credit_window
+
+    completion_log = fm.get("completion_log")
+    window = backdate_credit_window(
+        due_pattern,
+        completion_log if isinstance(completion_log, dict) else {},
+        item_text, today,
+    )
+    if window is None or not (window[0] <= chosen <= window[1]):
+        log.info(
+            "feed.act.slot.backdate_refused",
+            id=feed_item_id, action=action_id, lane=lane,
+            reason="beyond_window", item=item_text,
+            chosen=chosen.isoformat(),
+            window_start=window[0].isoformat() if window else "",
+            window_end=window[1].isoformat() if window else "",
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            f"{chosen.isoformat()} is outside the window this completion "
+            f"could credit for '{item_text}' — nothing was written",
+            feed_item_id, action_id,
+        ), ""
+    return None, str(due_pattern.get("type") or "")
 
 
 def _contained_record_path(
@@ -1530,10 +1755,19 @@ def _slot_done(
     vault_path: Path,
     item_text: str,
     today: _date,
+    completion_date: _date,
+    when_shape: str = "",
 ) -> ActResult:
-    """Route a slot ``done`` to the lane's completion writer; on the non-error
-    end-state set the feed item ``acted`` (optimistic-green). Idempotent: a
-    re-done maps to the same ``acted`` (the writer's own idempotent_noop)."""
+    """Route a slot ``done`` (or a dated ``done_Nd`` rung) to the lane's
+    completion writer; on the non-error end-state set the feed item ``acted``
+    (optimistic-green). Idempotent: a re-done maps to the same ``acted`` (the
+    writer's own idempotent_noop).
+
+    ``completion_date`` is the date the completion CLAIMS — ``today`` for the
+    plain verb, ``today - N`` for a rung (already bound-checked by the
+    dispatcher; only the routine lane can receive a rung). ``when_shape`` is
+    the recurrence type the bound check read, carried for the when-ruling
+    capture."""
     if lane == "routine":
         from alfred.routine import completion as _completion
 
@@ -1551,15 +1785,52 @@ def _slot_done(
         if refusal is not None:
             return refusal
         result = _completion.mark_routine_item_done(
-            record_path, item_text, today.isoformat(), vault_path=Path(vault_path),
+            record_path, item_text, completion_date.isoformat(),
+            vault_path=Path(vault_path),
         )
         if result.ok:
-            feed_store.set_state(feed_item_id, STATE_ACTED, action=DONE_ACTION)
+            # Stamp the TRUE verb (``done_1d``, not a collapsed ``done``): the
+            # undo path derives the date to remove from it, and the stage map
+            # on the web reads the family (rings.ts ACTED_VERB_STAGE). The
+            # plain verb is byte-unchanged — action_id IS ``done`` there.
+            feed_store.set_state(feed_item_id, STATE_ACTED, action=action_id)
+            backdated = action_id in BACKDATE_DONE_ACTIONS
+            if backdated and result.changed:
+                # Self-correcting capture: the operator answered the WHEN
+                # question with a non-default. BELTED — the completion must
+                # land even when the learning store cannot.
+                try:
+                    from alfred.routine.when_corrections import (
+                        record_when_ruling,
+                        when_corrections_path_for,
+                    )
+
+                    record_when_ruling(
+                        when_corrections_path_for(feed_store.path),
+                        shape=when_shape,
+                        item=item_text,
+                        record=str(evidence.get("routine_record") or ""),
+                        proposed=today.isoformat(),
+                        chosen=completion_date.isoformat(),
+                        feed_item_id=feed_item_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 — capture is best-effort
+                    log.warning(
+                        "routine.completion.when_ruling_capture_failed",
+                        id=feed_item_id, error=type(exc).__name__,
+                    )
             log.info(
                 "feed.act.slot.done", id=feed_item_id, lane=lane,
                 kind=result.kind, item=item_text,
+                date=completion_date.isoformat(),
             )
-            return ActResult(True, STATUS_ACTED, f"marked done: {item_text}", feed_item_id, action_id)
+            # ILB: a backdated confirmation NAMES the chosen day — "marked
+            # done" alone would read as today, the exact claim the operator
+            # chose this rung to avoid making.
+            detail = f"marked done: {item_text}"
+            if backdated:
+                detail += f" — {_backdate_phrase(BACKDATE_DONE_ACTIONS[action_id])}"
+            return ActResult(True, STATUS_ACTED, detail, feed_item_id, action_id)
         log.info(
             "feed.act.slot.writer_error", id=feed_item_id, lane=lane,
             kind=result.kind, item=item_text,
@@ -1625,6 +1896,12 @@ def _slot_done(
     )
 
 
+def _backdate_phrase(days_back: int) -> str:
+    """The operator-facing name of a backdate offset ("yesterday" / "N days
+    ago") — the confirmation surface's vocabulary, one owner."""
+    return "yesterday" if days_back == 1 else f"{days_back} days ago"
+
+
 def _slot_undo(
     feed_item_id: str,
     action_id: str,
@@ -1635,9 +1912,14 @@ def _slot_undo(
     vault_path: Path,
     item_text: str,
     today: _date,
+    completion_date: _date,
 ) -> ActResult:
     """Route a slot ``undo_done`` to the lane's inverse writer; on the non-error
-    end-state set the feed item back to ``open`` (the completion is reversed)."""
+    end-state set the feed item back to ``open`` (the completion is reversed).
+
+    ``completion_date`` is the date the undo aims at — today for a plain done,
+    the acted rung's derived date for a backdated one (see the dispatcher's
+    ``undo_offset`` note)."""
     if lane == "task":
         # v1 task lane is DONE-ONLY — the prior open status isn't cleanly
         # restorable (a done task could have been todo/active/blocked; restoring
@@ -1667,15 +1949,23 @@ def _slot_undo(
         if refusal is not None:
             return refusal
         result = _completion.mark_routine_item_undone(
-            record_path, item_text, today.isoformat(), vault_path=Path(vault_path),
+            record_path, item_text, completion_date.isoformat(),
+            vault_path=Path(vault_path),
         )
         if result.ok:
             feed_store.set_state(feed_item_id, STATE_OPEN)
             log.info(
                 "feed.act.slot.undone", id=feed_item_id, lane=lane,
                 kind=result.kind, item=item_text,
+                date=completion_date.isoformat(),
             )
-            return ActResult(True, STATUS_UNDONE, f"undone: {item_text}", feed_item_id, action_id)
+            # ILB: undoing a BACKDATED completion names the date it removed —
+            # "undone" alone would read as today's, which is not what was
+            # logged and not what just changed.
+            detail = f"undone: {item_text}"
+            if completion_date != today:
+                detail += f" ({completion_date.isoformat()})"
+            return ActResult(True, STATUS_UNDONE, detail, feed_item_id, action_id)
         log.info(
             "feed.act.slot.writer_error", id=feed_item_id, lane=lane,
             kind=result.kind, item=item_text,
@@ -2409,9 +2699,15 @@ def _act_locked(
     # onto that is a guess about something the system has stopped tracking, and
     # the honest refusal below is the better answer.
     _is_slot_undo = item.kind == SLOT_KIND and action_id == UNDO_DONE_ACTION
+    # The WHOLE done family, not DONE_ACTION alone: the operator's
+    # accept-then-backdate flow ("took it this morning, then remembered he did
+    # it yesterday") is exactly a ``done_1d`` on an accept-acted item — a
+    # ``== DONE_ACTION`` comparison here would swallow it as already_acted,
+    # which is the friction this exception was carved for, back again wearing
+    # a date.
     _is_slot_done_on_accepted = (
         item.kind == SLOT_KIND
-        and action_id == DONE_ACTION
+        and action_id in DONE_FAMILY
         and getattr(item, "acted_action", None) == ACCEPT_ACTION
     )
     _is_slot_sort = (

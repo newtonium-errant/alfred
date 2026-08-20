@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { feedApi, type FeedItem } from '../../lib/algernon/feed';
 import { ApiError } from '../../lib/algernon/http';
+import { holdChoicesForVerb } from '../../lib/algernon/feedConstants';
 import { evidenceLabel, evidenceRows } from '../../lib/algernon/feedEvidence';
 import {
   arcPath,
@@ -14,6 +15,7 @@ import {
 } from '../../lib/algernon/ringGeometry';
 import {
   COMPLETION_UNAVAILABLE_HINT,
+  RING_ACTION_DONE,
   effectiveStageOf,
   ringItemCompletable,
   ringItemUndoable,
@@ -21,8 +23,11 @@ import {
   type RingBucket,
   type RingItemStage,
 } from '../../lib/algernon/rings';
+import { HoldPressButton } from './HoldPressButton';
+import { HoldSelector } from './HoldSelector';
 import { useRingCompletion, type UseRingCompletionResult } from './useRingCompletion';
 import { useSlotAccept } from './useSlotAccept';
+import { WHEN_SELECTOR_NOTE, WHEN_SELECTOR_TITLE } from './whenSelector';
 
 // The segmented "balanced day" rings header. Three tier rings (T1/T2/T3) from
 // `slot_suggestion` items (see lib/algernon/rings.ts for why tier). Tap a ring to
@@ -73,6 +78,9 @@ export function RingsHeader({
   const [openItemId, setOpenItemId] = useState<string | null>(null);
   const [showDone, setShowDone] = useState(false);
   const [showSnoozed, setShowSnoozed] = useState(false);
+  // Which row has its ✓-hold when-selector open (backdated completion).
+  // Per-panel, one at a time — the sort picker's reasoning.
+  const [whenForId, setWhenForId] = useState<string | null>(null);
   // Hooks can't be conditional, so the internal instance is always constructed and
   // simply unused when the host supplies one. Still ONE implementation either way.
   const ownCompletion = useRingCompletion({ onAuthExpired });
@@ -147,6 +155,12 @@ export function RingsHeader({
     const itemError = completion.errorFor(it.id) ?? accept.errorFor(it.id);
     const rows = evidenceRows(it.evidence);
     const expanded = openItemId === it.id;
+    // The ✓-hold's when-family, wire-derived (null = plain ✓). Only where a
+    // live ✓ renders.
+    const whenChoices =
+      completable && !done && !snoozed && !suggested
+        ? holdChoicesForVerb(it, RING_ACTION_DONE)
+        : null;
     const dotClass = done
       ? 'bg-status-done-fg'
       : snoozed
@@ -155,7 +169,7 @@ export function RingsHeader({
           ? 'bg-console-ink-faint'
           : 'bg-status-progress-fg';
     return (
-      <li key={it.id} data-testid="ring-panel-item" data-done={done} data-stage={stage} className="border-t border-dashed border-console-edge pt-2 first:border-0 first:pt-0">
+      <li key={it.id} data-testid="ring-panel-item" data-done={done} data-stage={stage} className="relative border-t border-dashed border-console-edge pt-2 first:border-0 first:pt-0">
         <div className="flex items-start justify-between gap-2">
           <button
             type="button"
@@ -215,16 +229,18 @@ export function RingsHeader({
               {acceptBusy ? '…' : 'Accept'}
             </button>
           ) : completable ? (
-            // PLANNED + a wired writer — a LIVE ✓.
-            <button
-              type="button"
+            // PLANNED + a wired writer — a LIVE ✓. Quick tap = done TODAY,
+            // unchanged; HOLDING opens the when-selector when the wire served
+            // a when-family (backdated completion).
+            <HoldPressButton
               data-testid="ring-complete"
               disabled={compBusy}
-              onClick={() => completion.complete(it)}
+              onTap={() => completion.complete(it)}
+              onHold={whenChoices ? () => setWhenForId(it.id) : null}
               className="shrink-0 rounded-lg border border-console-edge-bright px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-console-ink disabled:opacity-50"
             >
               {compBusy ? '…' : '✓ Done'}
-            </button>
+            </HoldPressButton>
           ) : (
             // PLANNED, non-completable lane (unknown / unstamped origin) — honestly
             // DISABLED. The `disabled` attr AND `opacity-50` are pinned together so
@@ -257,6 +273,21 @@ export function RingsHeader({
               </div>
             ))}
           </dl>
+        )}
+
+        {/* The when-selector — the ✓-hold's alternatives (backdated
+            completion). Choosing IS the completion, one interaction. */}
+        {whenForId === it.id && whenChoices && (
+          <HoldSelector
+            title={WHEN_SELECTOR_TITLE}
+            note={WHEN_SELECTOR_NOTE}
+            choices={whenChoices}
+            onPick={(verb) => {
+              setWhenForId(null);
+              completion.completeWith(it, verb);
+            }}
+            onCancel={() => setWhenForId(null)}
+          />
         )}
       </li>
     );

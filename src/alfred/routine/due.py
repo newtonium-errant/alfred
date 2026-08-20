@@ -36,6 +36,9 @@ from .recurrence import (
     Recurrence,
 )
 from .recurrence import (
+    backdate_credit_window as _rec_backdate_credit_window,
+)
+from .recurrence import (
     completion_satisfies_current_cycle as _rec_completion_satisfies,
 )
 from .recurrence import (
@@ -145,7 +148,22 @@ def overdue_effective_due(
     )
 
 
+def backdate_credit_window(
+    due_pattern: DuePattern | None,
+    completion_log: dict | None,
+    item_text: str,
+    today: date,
+) -> "tuple[date, date] | None":
+    """The honest 'previously done' date range — compat shim over the unified
+    helper (:func:`alfred.routine.recurrence.backdate_credit_window`), on the
+    :class:`DuePattern` spelling like its four siblings above."""
+    return _rec_backdate_credit_window(
+        _to_recurrence(due_pattern), completion_log, item_text, today,
+    )
+
+
 __all__ = [
+    "backdate_credit_window",
     "completion_satisfies_current_cycle",
     "is_done_in_current_cycle",
     "overdue_effective_due",

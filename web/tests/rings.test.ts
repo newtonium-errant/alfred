@@ -157,14 +157,20 @@ describe('ringItemStage — the acted-verb map (snooze honesty)', () => {
     expect(ACTED_LEGACY_STAGE).toBe('done');
   });
 
-  it('the map is EXACTLY the three verbs that can persist as acted_action', () => {
-    // Enumerated from the source, not from memory: of the capability ceiling for
-    // slot_suggestion (done, undo_done, accept, snooze_1d/3d/7d/until_i_say,
-    // unsnooze), only these three PERSIST — `undo_done` and `unsnooze` both set
-    // STATE_OPEN, and a non-acted transition clears the verb. All four snooze
-    // rungs collapse to the single verb `snooze` at the stamp site.
+  it('the map is EXACTLY the verbs that can persist as acted_action', () => {
+    // Enumerated from the source, not from memory: of the capability ceiling
+    // for slot_suggestion (done, done_1d/2d/3d, undo_done, accept,
+    // snooze_1d/3d/7d/until_i_say, unsnooze, the three sort verbs), only these
+    // PERSIST — `undo_done` and `unsnooze` both set STATE_OPEN, a non-acted
+    // transition clears the verb, and the sort dispatcher touches no state.
+    // All four snooze rungs collapse to the single verb `snooze` at the stamp
+    // site; the DONE rungs deliberately do NOT collapse (the undo path derives
+    // the date to remove from the stamped verb — backdated completion,
+    // 2026-08-20, updated in lockstep per the contract-pin rule).
     // A total-enumeration pin: adding a verb without ruling its stage reds here.
-    expect(Object.keys(ACTED_VERB_STAGE).sort()).toEqual(['accept', 'done', 'snooze']);
+    expect(Object.keys(ACTED_VERB_STAGE).sort()).toEqual([
+      'accept', 'done', 'done_1d', 'done_2d', 'done_3d', 'snooze',
+    ]);
     expect(ACTED_VERB_STAGE.accept).toBe('planned');
     expect(ACTED_VERB_STAGE.done).toBe('done');
     expect(ACTED_VERB_STAGE[SNOOZE_ACTED_VERB]).toBe('snoozed');
@@ -442,5 +448,21 @@ describe('ringItemVisibleToday — completion is a STAGE, not a disappearance', 
     expect(
       ringItemVisibleToday(slot({ state: 'acted', acted_at: '2026-07-31T16:00:00Z', acted_action: 'done', evidence: { tier: 1 } }), now),
     ).toBe(true);
+  });
+});
+
+describe('ACTED_VERB_STAGE — the backdated rungs read as DONE', () => {
+  it('done_1d / done_2d / done_3d map to done (a backdated completion is as finished as a plain one)', () => {
+    for (const verb of ['done_1d', 'done_2d', 'done_3d']) {
+      expect(ACTED_VERB_STAGE[verb]).toBe('done');
+      expect(
+        ringItemStage(slot({ state: 'acted', acted_action: verb, evidence: { tier: 1 } })),
+      ).toBe('done');
+    }
+    // The control that gives the family assertion its teeth: an UNKNOWN verb
+    // still degrades to planned — the rungs are mapped, not the fallback moved.
+    expect(
+      ringItemStage(slot({ state: 'acted', acted_action: 'done_9d', evidence: { tier: 1 } })),
+    ).toBe(ACTED_VERB_FALLBACK_STAGE);
   });
 });

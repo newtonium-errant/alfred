@@ -874,9 +874,68 @@ def overdue_effective_due(
     return prev_due
 
 
+def backdate_credit_window(
+    recurrence: Any,
+    completion_log: dict | None,
+    item_text: str,
+    today: date,
+) -> tuple[date, date] | None:
+    """The inclusive date range a *previously done* completion may honestly
+    claim for this item, or ``None`` when no backdate is admissible.
+
+    THE BOUND for backdated completions (operator ruling 2026-08-20: "have
+    yesterday be the default 'previously done' option, with ability to
+    backdate further as needed" — bounded here to the dates that actually PAY
+    the debt being surfaced). Derived entirely from this module's own credit
+    arithmetic, never a second opinion of it:
+
+      * the due being nagged about is :func:`overdue_effective_due`'s answer
+        (``prev_due`` on a recently-lapsed unsatisfied cycle — the operator's
+        Garbage-Day shape — else ``current_due``);
+      * a completion covers a cycle within ±half-cycle of its due — the SAME
+        window :func:`completion_satisfies_current_cycle` and
+        ``_completion_satisfies_prev_cycle`` judge by, so a date admitted here
+        is by construction a date whose write clears the surfacing;
+      * a backdate is strictly BEFORE today — "done today" is the plain
+        completion verb, not a backdate.
+
+    So: ``[effective_due - half_cycle, min(effective_due + half_cycle,
+    today - 1)]``, and ``None`` when that range is empty (item too far from
+    its due — e.g. mid-escalate-window with the prior cycle already paid or
+    long lapsed: "previously done" would be a claim about a window this
+    completion cannot credit, which is a different claim than the one the
+    verb makes). A ``None``/malformed pattern is ``None`` — no due grammar,
+    no honest bound.
+    """
+    if recurrence is None:
+        return None
+    rec = recurrence if isinstance(recurrence, Recurrence) else Recurrence.from_dict(recurrence)
+    if rec is None:
+        return None
+    effective_due = overdue_effective_due(rec, completion_log, item_text, today)
+    if effective_due is None:
+        return None
+    current_due = _safe_next_due(rec, today)
+    if current_due is None:
+        return None
+    prev_due = _previous_cycle_due_date(rec, current_due)
+    if prev_due is None:
+        return None
+    cycle_length = (current_due - prev_due).days
+    if cycle_length <= 0:
+        return None
+    half_cycle = max(1, cycle_length // 2)
+    start = effective_due - timedelta(days=half_cycle)
+    end = min(effective_due + timedelta(days=half_cycle), today - timedelta(days=1))
+    if end < start:
+        return None
+    return (start, end)
+
+
 __all__ = [
     "CadenceError",
     "Recurrence",
+    "backdate_credit_window",
     "completion_satisfies_current_cycle",
     "fires_on",
     "is_done_in_current_cycle",

@@ -520,6 +520,16 @@ class AutoT1Candidate:
     self_care: bool = False
     explicit_slot: str | None = None
     has_due_pattern: bool = False
+    # --- backdated completion (2026-08-20) -----------------------------------
+    # How many days BACK a "previously done" completion may honestly reach for
+    # this item — ``(today - window_start).days`` over
+    # ``routine.recurrence.backdate_credit_window`` (±half-cycle around the
+    # item's current effective due), computed HERE because this scan is the
+    # one place the pattern + completion_log + today are all in hand. 0 =
+    # no admissible backdate (no due_pattern, mid-window, paid cycle). The
+    # producer stamps it into slot evidence; the serve side filters the
+    # ``done_Nd`` rungs by it so no offered rung can refuse when pressed.
+    backdate_limit_days: int = 0
 
 
 def compute_auto_t1_candidates(
@@ -878,6 +888,19 @@ def _compute_auto_routine(
             assert classification.reason is not None
             assert classification.effective_due is not None
 
+            # Backdated-completion depth (2026-08-20): the credit window's
+            # reach, from the SAME recurrence arithmetic the classifier
+            # credits by (one owner — alfred.routine.recurrence). Lazy import
+            # beside ``Item`` for the same circular-hazard reason.
+            from alfred.routine.due import backdate_credit_window
+
+            credit_window = backdate_credit_window(
+                item.due_pattern, completion_log, item.text, today_local,
+            )
+            backdate_limit = (
+                (today_local - credit_window[0]).days if credit_window else 0
+            )
+
             candidates.append(AutoT1Candidate(
                 path=rel_path,
                 name=item.text,
@@ -892,6 +915,7 @@ def _compute_auto_routine(
                 self_care=item.self_care,
                 explicit_slot=item.slot,
                 has_due_pattern=item.due_pattern is not None,
+                backdate_limit_days=backdate_limit,
             ))
 
     candidates.sort(key=lambda c: (c.due_iso, c.name.lower()))
@@ -1600,6 +1624,15 @@ class TierEntry:
     # ``tier_done``. Lets ``_entry_done`` count it toward the daily goal
     # and the render layer strike / drop it.
     done_at: str | None = None
+    # --- backdated completion (2026-08-20) -----------------------------------
+    # How many days back a "previously done" completion may honestly reach —
+    # threaded from ``AutoT1Candidate.backdate_limit_days`` (see there for the
+    # derivation) on routine due-pattern entries; 0 everywhere else. A FACT
+    # about the item's recurrence state, stamped onto the curated copy of the
+    # same item too (the operator's accept-then-backdate flow rides the
+    # curated entry). The feed producer copies it into slot evidence; the
+    # serve side filters the ``done_Nd`` rungs by it.
+    backdate_limit_days: int = 0
 
 
 @dataclass
@@ -1823,10 +1856,12 @@ def compute_today_view(
         k = _task_key(c.name)
         auto_reason_by_t1_key[k] = c.surface_reason
         auto_due_by_t1_key[k] = c.due_iso
+    auto_backdate_by_t1_key: dict[str, int] = {}
     for c in auto_t1_routine:
         k = _routine_key(c.routine_record, c.item_text)
         auto_reason_by_t1_key[k] = c.surface_reason
         auto_due_by_t1_key[k] = c.due_iso
+        auto_backdate_by_t1_key[k] = c.backdate_limit_days
 
     # 1. Curated entries first (authoritative). Annotate with the auto
     # reason/due when the same item also auto-surfaces (so the render is
@@ -1839,6 +1874,12 @@ def compute_today_view(
                 if entry.surface_reason is None and k in auto_reason_by_t1_key:
                     entry.surface_reason = auto_reason_by_t1_key[k]
                     entry.due_iso = auto_due_by_t1_key.get(k)
+                # UNCONDITIONAL (unlike the reason/due annotation above): the
+                # backdate depth is a fact about the item's recurrence state,
+                # not a presentation the curated copy may already carry — and
+                # the operator's accept-then-backdate flow lives on exactly
+                # this entry (an accepted candidate re-projects as curated).
+                entry.backdate_limit_days = auto_backdate_by_t1_key.get(k, 0)
                 t1.append(entry)
                 t1_keys.add(k)
         for e in curation.t2:
@@ -1918,6 +1959,7 @@ def compute_today_view(
             routine_record=c.routine_record, item_text=c.item_text,
             self_care=c.self_care, explicit_slot=c.explicit_slot,
             has_due_pattern=c.has_due_pattern,
+            backdate_limit_days=c.backdate_limit_days,
         ))
         t1_keys.add(key)
 
@@ -1936,6 +1978,7 @@ def compute_today_view(
             routine_record=c.routine_record, item_text=c.item_text,
             self_care=c.self_care, explicit_slot=c.explicit_slot,
             has_due_pattern=c.has_due_pattern,
+            backdate_limit_days=c.backdate_limit_days,
         ))
         t2_keys.add(key)
 

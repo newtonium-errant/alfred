@@ -260,3 +260,30 @@ describe('#62 an override must not outlive the question it answered', () => {
     expect(result.current.busy(it0.id)).toBe(false);
   });
 });
+
+describe('useRingCompletion — completeWith (the ✓-hold pick)', () => {
+  it('posts the CHOSEN rung through the same machinery, optimistic green on acted', async () => {
+    const { result } = renderHook(() => useRingCompletion());
+    const item = slot({ evidence: { tier: 1, routine_record: 'Waste', item_text: 'Garbage Day', backdate_limit_days: 3 } });
+    act(() => result.current.completeWith(item, 'done_1d'));
+    expect(result.current.busy(item.id)).toBe(true);
+    await flush();
+    expect(result.current.effectiveDone(item)).toBe(true);
+    expect(mockAct).toHaveBeenCalledWith(item.id, 'done_1d');
+  });
+
+  it('a verb outside the item\'s served when-family is a NO-OP (never a POST the wire did not offer)', async () => {
+    const { result } = renderHook(() => useRingCompletion());
+    // limit 2 → done_3d was never served to this item.
+    const narrow = slot({ evidence: { tier: 1, routine_record: 'Waste', item_text: 'Garbage Day', backdate_limit_days: 2 } });
+    act(() => result.current.completeWith(narrow, 'done_3d'));
+    // And an item with NO family at all (limit absent) refuses every rung.
+    const bare = slot();
+    act(() => result.current.completeWith(bare, 'done_1d'));
+    // A verb served but OUTSIDE the when-family is refused too.
+    act(() => result.current.completeWith(narrow, 'unsnooze'));
+    await flush();
+    expect(mockAct).not.toHaveBeenCalled();
+    expect(result.current.busy(narrow.id)).toBe(false);
+  });
+});
