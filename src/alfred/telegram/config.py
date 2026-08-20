@@ -203,19 +203,41 @@ class SttShadowCaptureConfig:
     The STREAMING twin is alive and unaffected: ``web/voice_stt_shadow.py``
     on the WebRTC path, configured by the SEPARATE
     ``web.voice.stt.shadow_capture`` block (``WebSttShadowCaptureConfig`` in
-    ``web/config.py``). Same concept, different referent — the two
-    ``config.yaml.example`` ``shadow_capture:`` blocks (:911, :1006) are
-    BOTH that web one; this Telegram block was never in the example file.
+    ``web/config.py``). Same concept, different referent — EVERY
+    ``shadow_capture:`` block in ``config.yaml.example`` sits under a
+    ``web:`` section and configures that web one (two of them at the time
+    of writing, :911 and :1006 — grep rather than trust the coordinates);
+    this Telegram block was never in the example file at all.
 
     WHY THE DATACLASS SURVIVES ITS MODULE (the T5 pattern —
     ``TodayCommandConfig`` feca775f, ``InstanceConfig.aliases`` 656d1a87):
     ``_build`` has NO unknown-key filter — it assigns every key straight
     through and calls ``cls(**kwargs)``. A deployed YAML still carrying
-    ``telegram: stt: shadow_capture:`` would therefore raise ``TypeError``
-    at load the instant this field stopped existing, and that failure is
-    NOT loud: ``health/aggregator._load_tool_checks`` swallows the import
-    error and silently drops the talker probe from the registry. Verified
-    empirically, both directions, by
+    ``telegram: stt: shadow_capture:`` therefore raises ``TypeError`` at
+    talker config load the instant this field stops existing, and the box
+    carries the block on all four instances.
+
+    The blast radius, DRIVEN against the field-removed mutant rather than
+    reasoned (control vs mutant, both legs run):
+      * LOUD and dominant — ``load_from_unified`` raises, so the talker
+        DAEMON fails to start (``telegram/daemon.py`` imports it and calls
+        it in ``run``) along with the talker CLI paths.
+      * QUIET and misattributing — ``skill_audit``'s ``except TypeError``
+        around ``load_talker_config`` is documented for the missing
+        ``instance.name`` case, but it catches THIS TypeError too and
+        returns ``instance_missing`` with reason "telegram.instance config
+        incomplete (...)" even when ``instance.name`` is present and fine.
+        ``_check_skill_capability_audit`` then reports SKIP, and SKIP is a
+        QUIET health status, so the health surface raises no attention
+        card. Measured: control OK -> mutant SKIP.
+      * NOT the health-aggregator swallow. An earlier draft of this note
+        blamed ``_load_tool_checks`` dropping the talker probe; that is
+        FALSE and is corrected here where the next reader meets it —
+        under the mutation ``alfred.telegram.health`` still imports and
+        ``talker`` still registers, because removing a dataclass field is
+        not an ImportError and that except-branch is never entered.
+
+    Verified empirically, both directions, by
     ``tests/telegram/test_stt_shadow_config_compat.py`` — whose
     ``test_unknown_stt_key_still_raises`` is the positive control proving
     the tolerance is THIS FIELD and not loader permissiveness.
