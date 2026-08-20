@@ -411,9 +411,28 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
         # upstream of every line the generation-scoring commit touched.
         # A recurrence is therefore NOT evidence that the generation fix
         # regressed; it is a second data point on an open, unexplained item.
-        await asyncio.wait_for(got_barge.wait(), timeout=30)
+        #
+        # Budget rule (XS-BATCH9 item 4): ceiling >= 3x the worst measured
+        # QUIET wall time of the whole test, rounded up. The barge event
+        # arrives strictly before the test completes, so the whole-test
+        # figure upper-bounds this wait. Measured quiet wall times: ~32 s
+        # twice (m8's diagnosis runs — the old 30 s budget sat INSIDE its
+        # own test's quiet range, so any load at all could breach it),
+        # ~35 s norm per the 90b88fdf control set cited above, and 18.62 s
+        # call / 19.52 s wall on 2026-08-19 (PYTHONPATH=<tree>/src
+        # .venv/bin/python -m pytest tests/integration/
+        # test_voice_barge_aiortc.py::test_barge_full_loop_flushes_audio_and_runs_t2
+        # -q --durations=0, solo, machine otherwise idle). 3 x 35 = 105 →
+        # 100 with the barge-earlier-than-completion slack. The ceiling
+        # bounds a HANG — a dead plane fails instead of hanging — and
+        # asserts nothing about latency: the pass path returns the moment
+        # the event fires, so widening it costs green runs nothing.
+        await asyncio.wait_for(got_barge.wait(), timeout=100)
         barge_time = barge_at[0]
-        # T2 (empty reply) completes fast after the barge.
+        # T2 (empty reply) completes fast after the barge. Left at 10 s
+        # deliberately (XS-BATCH9 item 4 touched only the diagnosed barge
+        # budget): this clock starts AFTER the barge lands and covers only
+        # an empty-reply turn — no measured breach on record.
         await asyncio.wait_for(got_t2_final.wait(), timeout=10)
 
         # Fill the post-barge window: this is where T1's FLUSHED tone would
@@ -592,7 +611,14 @@ async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> Non
         # upstream of every line the generation-scoring commit touched.
         # A recurrence is therefore NOT evidence that the generation fix
         # regressed; it is a second data point on an open, unexplained item.
-        await asyncio.wait_for(got_barge.wait(), timeout=30)
+        #
+        # Same 100 s ceiling as the full-loop test above — identical
+        # pre-barge pipeline (ICE + T1 + playout start), identical load
+        # sensitivity, and the same 30 s knife-edge; its own quiet wall
+        # time measured 15.99 s call / 16.79 s wall solo on 2026-08-19
+        # (same invocation shape, this test's node id). Rule and
+        # measurements at the full-loop test's wait.
+        await asyncio.wait_for(got_barge.wait(), timeout=100)
         barge_time = barge_at[0]
         await asyncio.wait_for(got_t2_final.wait(), timeout=15)
 
