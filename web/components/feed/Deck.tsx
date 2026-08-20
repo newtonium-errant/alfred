@@ -401,10 +401,10 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   // forbids choose-then-confirm, so nothing sits between this and the act).
   // Mirrors onPickSnooze's shape, which is this family's prior art.
   const onPickHold = useCallback(
-    (verb: string) => {
+    (verb: string, target?: string) => {
       setHoldSelectorOpen(false);
       gestureConsumedRef.current = false;
-      deck.affirmWith(verb);
+      deck.affirmWith(verb, target);
     },
     [deck],
   );

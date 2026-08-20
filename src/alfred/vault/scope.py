@@ -824,7 +824,19 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "edit": "moc_apply_only",
         "move": False,
         "delete": False,
-        "allow_body_writes": False,
+        # TRUE, and NOT a widening — see arm 1 of ``moc_apply_only``. The
+        # Sub-arc A hook mirrors the membership into the MOC's ``# Contents``
+        # by calling ``vault_edit(body_rewriter=...)`` UNDER THE CALLER'S
+        # SCOPE, so the mirror arrives here as a body write. With this False
+        # the member's frontmatter landed and the mirror silently failed —
+        # exactly the half-applied membership the type gate exists to
+        # prevent, arriving through the other door. The narrowing lives in
+        # the gate: body writes are admitted ONLY on a ``moc`` record and
+        # ONLY with no frontmatter riding along.
+        "allow_body_writes": True,
+        # The mid-document surfaces stay shut. The mirror is an append into
+        # a named section performed by the hook's own rewriter; nothing on
+        # this path inserts at an offset or replaces a whole body.
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
@@ -1823,6 +1835,12 @@ MOC_APPLY_FIELDS: set[str] = {"mocs"}
 #: a membership this scope permits and the hook declines to mirror.
 MOC_APPLY_TYPES: set[str] = {"zettel", "source", "question", "research-pointer"}
 
+#: The record type the ``# Contents`` mirror is written ON. Distinct from
+#: MOC_APPLY_TYPES (the MEMBER types): one gesture writes a member's
+#: frontmatter AND the MOC's body, and conflating the two sets would let the
+#: membership field be written onto MOC records themselves.
+MOC_MIRROR_TYPE: str = "moc"
+
 
 # Stage 3.5: record types KAL-LE may create. Superset of talker
 # minus operational types (task, event) — KAL-LE is the coding
@@ -2582,6 +2600,31 @@ def check_scope(
         return
 
     if permission == "moc_apply_only":
+        # TWO ARMS, because ONE operator gesture legitimately writes TWO
+        # records: the member's ``mocs`` frontmatter, and the MOC's
+        # ``# Contents`` body — the latter written by the Sub-arc A hook
+        # under this same scope. Splitting them here keeps each narrow
+        # instead of widening one gate to cover both.
+        #
+        # ARM 1 — THE MIRROR. A body write, only on a ``moc`` record, only
+        # with no frontmatter riding along. Verified by driving the real
+        # hook: a docstring claiming the mirror ran "under its own
+        # authority" was WRONG, and the end-to-end pin caught it.
+        if body_write:
+            if record_type != MOC_MIRROR_TYPE:
+                raise ScopeError(
+                    f"Scope '{scope}' may only write bodies on "
+                    f"'{MOC_MIRROR_TYPE}' records (the '# Contents' mirror). "
+                    f"Got: '{record_type or '(none)'}'."
+                )
+            if fields:
+                raise ScopeError(
+                    f"Scope '{scope}' may not change frontmatter in the same "
+                    f"edit as the '# Contents' mirror. Rejected: "
+                    f"{', '.join(sorted(fields))}."
+                )
+            return
+        # ARM 2 — THE MEMBERSHIP.
         # MOC-reader apply gate (2026-08-20). Same three-check shape as the
         # two routine gates below/above — type-restriction, fail-closed on a
         # missing field list, field-allowlist subset — because that shape is

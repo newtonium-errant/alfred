@@ -103,7 +103,31 @@
 //     only already-emitted utilities; and `/chat` (not a SHELL_ROUTE)
 //     prerenders its pre-auth branch, which carries none of the capture
 //     components.
-const CACHE_VERSION = 'v10';
+// v11: the MOC reader's open-set hold selector. ONE trigger, and it is a
+//     CHUNK this time rather than the stylesheet: the lane edited
+//     `lib/algernon/feedConstants.ts`, and `/` imports that module
+//     (isDeckCandidate / isDeckDealt for the deck pill count) — so a
+//     deck-only feature reaches a SHELL_ROUTE's precached HTML, which is
+//     exactly why this is measured rather than reasoned.
+//     MEASURED, SAME-DIRECTORY: chunk `867-b471888c356fa567` ->
+//     `867-1464b291153f86bb`, the ONLY line that moves across all four
+//     SHELL_ROUTES' chunk refs — it appears in `/` alone, while `/login`,
+//     `/ingest` and `/share` are byte-identical. Ruled CAUSAL.
+//     WHAT DID NOT CHANGE, checked rather than assumed: the global
+//     stylesheet is byte-identical (same name 8168ae01473a3649.css AND same
+//     content sha 3e259226…) — the lane adds no utilities; every other chunk
+//     on `/` (560/651/743/872/932, framework, main, polyfills, webpack) is
+//     unchanged.
+//     BOTH DOCUMENTED ARTIFACTS BIT ON THE WAY TO THIS NUMBER, and the notes
+//     above are what caught them. Artifact 1 (buildId): an identical-source
+//     rebuild pair moved the prerendered HTML's own sha (8791e3a1 ->
+//     8a0e480c) while every chunk ref held — the HTML sha is not the
+//     instrument, the chunk refs are. Artifact 2 (cross-directory): the first
+//     attempt built HEAD in a scratch git-archive dir against the lane in the
+//     worktree, and EVERY chunk hash moved INCLUDING `framework` — a chunk no
+//     application diff can touch, which is the tell. Discarded and re-run
+//     with both builds in the SAME directory.
+const CACHE_VERSION = 'v11';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.

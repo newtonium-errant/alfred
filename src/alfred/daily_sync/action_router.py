@@ -54,6 +54,7 @@ from alfred.daily_sync.feed_producer import _FAMILIES, _as_dict
 from alfred.feed.model import (
     ATTENTION_NEEDS_YOU,
     KIND_REMINDER_RETURNED,
+    KIND_MOC_SUGGESTION,
     KIND_SORT_SUGGESTION,
     MODE_DECIDE,
     MODE_FYI,
@@ -232,6 +233,22 @@ RETURN_KIND = KIND_REMINDER_RETURNED
 # ``acted`` where the board one deliberately touches nothing.
 SORT_SUGGESTION_KIND = KIND_SORT_SUGGESTION
 
+# The MOC reader (2026-08-20). ONE verb, and the target rides as PER-REQUEST
+# DATA — the shape this module's own sort comment named and declined:
+#
+#   "a single ``sort`` verb would need the target slot as per-request data,
+#    which the ceiling cannot express (the ``correct``/``correction_target``
+#    exception exists precisely because that shape is awkward, and it is not
+#    worth repeating FOR A CLOSED SET OF THREE)."
+#
+# MOC targets are an OPEN set — every non-inventory MOC in the vault, and the
+# vault grows — which is the condition that comment carved out. A verb per MOC
+# is not expressible in a static ceiling at all, so this kind takes the
+# correction_target shape rather than the sort shape. The ceiling stays honest:
+# ONE verb id, ONE capability, and the open set lives in data where it belongs.
+MOC_SUGGESTION_KIND = KIND_MOC_SUGGESTION
+MOC_APPLY_ACTION = "moc_apply"
+
 # (kind, action_id) → the kwargs that synthesize the owning resolver's
 # ``ReplyCorrection``. THIS MAP IS THE CAPABILITY CEILING — a pair absent here
 # can never reach a resolver. A fresh ReplyCorrection is built per call (never a
@@ -326,6 +343,10 @@ DEFER_RETURN_PATH: dict[str, str] = {
     # would let reconcile retire it and destroy its window), and a lapsed
     # window revives through the same upsert every other kind uses.
     KIND_SORT_SUGGESTION: "alfred.brief.daemon",
+    # Same emitter, same reconcile-carries-held-cards discipline as the
+    # rotation above — ``moc_suggestion_feed_items`` carries every deferred
+    # row OUTSIDE its cap, so a parked card keeps its window.
+    KIND_MOC_SUGGESTION: "alfred.brief.daemon",
 }
 
 
@@ -457,6 +478,17 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # DEFER_RETURN_PATH, verified by the partition test).
     SORT_SUGGESTION_KIND: {
         **{_verb: {} for _verb in SORT_ACTIONS},
+    },
+    # moc_suggestion (the MOC reader) — ONE verb, intercepted by
+    # :func:`_dispatch_moc_apply` (kwargs UNUSED, no ReplyCorrection, no
+    # last_batch — the brief emits per-item like the rotation). The chosen
+    # MOC arrives as ``correction_target``; see the scoping block in
+    # :func:`_act_locked`, which admits the payload for exactly this pair.
+    # Deliberately NOT in DEFER_EXCLUDED_KINDS: a reject-swipe on a
+    # suggestion card MEANS "not now", and the defer store keeps that
+    # promise (return path declared in DEFER_RETURN_PATH).
+    MOC_SUGGESTION_KIND: {
+        MOC_APPLY_ACTION: {},
     },
 }
 
@@ -654,6 +686,39 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
         "sort_rhythm": {"label": "Rhythm", "weight": "light", "group": "slot"},
         "sort_fuel": {"label": "Fuel", "weight": "light", "group": "slot"},
     },
+    # moc_suggestion (the MOC reader) — the affirm-with-hold pattern's SECOND
+    # consumer, and its first OPEN-SET one.
+    #
+    # THE GESTURE IS ON THE VERB, unlike the rotation. There, three co-equal
+    # slots meant no verb could be the kind-level "yes", so the affirm was
+    # stamped per item onto whichever verb matched the proposal. Here there is
+    # exactly ONE verb and the co-equal family lives in per-item DATA, so the
+    # affirm is a property of the kind and can be declared statically. The
+    # pattern's grammar is unchanged — affirm accepts the suggestion, hold
+    # changes it, choosing IS the affirm — only the family's carrier moved.
+    #
+    # ``group`` still marks the co-equal choice group, and the client still
+    # derives "every served verb sharing the affirm verb's group". A family of
+    # one is no family, so on THIS kind that static derivation yields nothing
+    # and the client falls through to the dynamic arm (``evidence.moc_choices``).
+    # The static path is untouched for every existing consumer.
+    #
+    # LIGHT, and that is the pattern's contract rather than a risk assessment:
+    # a co-equal choice is light because the SELECTOR is the deliberate step
+    # (``useDeck.affirmWith`` has no arm stage by construction). Making the
+    # plain affirm heavy would give one control two different safety levels
+    # depending on which route reached it. What protects a multi-record write
+    # instead is the face — the card states N before the swipe — and the
+    # deferred act: the POST fires 3.5s after the gesture and UNDO cancels it
+    # outright, so a mistaken apply inside the window writes nothing at all.
+    MOC_SUGGESTION_KIND: {
+        MOC_APPLY_ACTION: {
+            "label": "Add",
+            "weight": "light",
+            "gesture": _GESTURE_AFFIRM,
+            "group": "moc",
+        },
+    },
 }
 
 # Defer presentation, applied to every kind the ceiling widened. Light in every
@@ -687,6 +752,16 @@ del _kind, _verb, _slot, _entry
 # carries the defer verb rather than sharing a card with it. The dated rungs
 # keep their fold presentation (menu verbs, no gesture).
 ACTION_META[SORT_SUGGESTION_KIND][DEFER_NEXT_RENDER] = {
+    "label": "Not now",
+    "weight": "light",
+    "gesture": _GESTURE_REJECT,
+}
+
+# Same ruling, same shape, same reason on the MOC card: its left swipe means
+# ONLY "not now" (there is no decline — an unapplied membership is unapplied
+# either way), so the reject gesture carries the defer verb. Overridden AFTER
+# the fold for the same one-author reason as the rotation's copy.
+ACTION_META[MOC_SUGGESTION_KIND][DEFER_NEXT_RENDER] = {
     "label": "Not now",
     "weight": "light",
     "gesture": _GESTURE_REJECT,
@@ -2279,6 +2354,234 @@ def _dispatch_sort_ruling(
     )
 
 
+# --- moc_suggestion apply (the MOC reader) -----------------------------------
+
+
+def _dispatch_moc_apply(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    vault_path: Path | None,
+    config: Any,
+    chosen_target: str | None,
+) -> ActResult:
+    """Apply a MOC-membership suggestion — the operator's affirm, with the
+    chosen target arriving as per-request data.
+
+    THE TARGET GATE IS FAIL-CLOSED, TWICE, and both refusals are named:
+
+      * **Missing target.** Refused rather than defaulted to the card's own
+        proposal. Defaulting would be the silent-downgrade the ``correct``
+        gate already forbids one shape over: it would tell the operator their
+        choice was taken while writing something they may not have picked.
+      * **Unknown target.** The chosen MOC must be one of the card's OWN
+        served ``moc_choices``. A hand-crafted POST naming any other path —
+        or a stale sheet naming a MOC that has since left the vault — is
+        refused. This is the open-set analogue of the ceiling's job: the
+        ceiling bounds the VERBS, and for a verb whose target is data,
+        something has to bound the TARGETS. The card's served choices are
+        that bound, and they are producer-stamped.
+
+    Runs inside the caller's per-item mutex, on the item's OWN stamped
+    evidence (trusted-producer class), like its rotation sibling.
+
+    ITS WRITER SET, one level deep: :func:`apply_membership` and the queue's
+    :func:`update_status`, plus ``feed_store.set_state`` to decide the card.
+    No completion, accept, snooze or sort writer is referenced from this
+    function's code object. As with the sibling pins, that is a direct-
+    reference check rather than a transitive reachability proof.
+    """
+    from alfred.surveyor.moc_apply import apply_membership
+
+    evidence = dict(getattr(item, "evidence", None) or {})
+    proposed = str(evidence.get("proposed_target") or "")
+    choices = evidence.get("moc_choices") or []
+    valid_targets = {
+        str(c.get("target")) for c in choices
+        if isinstance(c, Mapping) and c.get("target")
+    }
+
+    chosen = (chosen_target or "").strip()
+    if not chosen:
+        log.info(
+            "feed.act.moc.invalid_action", id=feed_item_id, action=action_id,
+            reason="apply_without_target",
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            "an apply needs the MOC you meant", feed_item_id, action_id,
+        )
+    if chosen not in valid_targets:
+        log.info(
+            "feed.act.moc.invalid_action", id=feed_item_id, action=action_id,
+            reason="target_not_offered", chosen=chosen[:120],
+            offered=len(valid_targets),
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            "that MOC isn't one of this card's choices", feed_item_id, action_id,
+        )
+
+    if vault_path is None:
+        return ActResult(
+            False, STATUS_ERROR,
+            "vault not configured — can't apply this membership",
+            feed_item_id, action_id,
+        )
+
+    members = [
+        str(m) for m in (evidence.get("members") or []) if str(m).strip()
+    ]
+    if not members:
+        # ILB: a card with nothing left to apply is a real answer, not an
+        # error. It happens when the operator applied the members by hand
+        # between the deal and the tap.
+        log.info(
+            "feed.act.moc.nothing_to_apply", id=feed_item_id, target=chosen,
+            reason="card carries no remaining members",
+        )
+        feed_store.set_state(feed_item_id, STATE_ACTED, action=action_id)
+        return ActResult(
+            True, STATUS_ACTED, "nothing left to add", feed_item_id, action_id,
+        )
+
+    result = apply_membership(
+        Path(vault_path), member_rel_paths=members,
+        target_moc_rel_path=chosen,
+    )
+
+    suggestion_id = str(evidence.get("suggestion_id") or "")
+    queue_path = _moc_queue_path(config)
+
+    # THE CORRECTION SIGNAL (self-correcting standard, part 1), captured
+    # BEFORE the queue bookkeeping so a queue failure cannot cost the
+    # learning. Scored against the card's stamped proposal: a quick affirm
+    # lands with proposed == chosen (a confirmation), a hold-selector pick
+    # lands with a different one (a correction). Same ruling-row shape and
+    # the SAME writer as the sort rotation's — one spelling of "the operator
+    # was proposed X and chose Y".
+    #
+    # BELT-SWALLOWED: a learning-store failure must never cost the operator
+    # the apply, and the skip is NAMED so a reader that silently stopped
+    # learning stays diagnosable.
+    if proposed:
+        try:
+            from alfred.tier.sort_proposal import corrections_path_for, record_ruling
+
+            record_ruling(
+                corrections_path_for(feed_store.path),
+                shape=f"moc:{evidence.get('mapping_signal') or 'unknown'}",
+                proposed=proposed,
+                chosen=chosen,
+                proposed_rule=str(evidence.get("mapping_signal") or ""),
+                feed_item_id=feed_item_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — learning never costs the apply
+            log.warning(
+                "feed.act.moc.capture_failed",
+                id=feed_item_id, error=str(exc), error_type=type(exc).__name__,
+                consequence="membership applied but NOT recorded — the "
+                            "suggester learns nothing from this one",
+            )
+    else:
+        log.info(
+            "feed.act.moc.capture_skipped", id=feed_item_id,
+            reason="card carries no scoreable proposal (degraded payload)",
+        )
+
+    # QUEUE BOOKKEEPING. The lifecycle is pending -> accepted -> applied, and
+    # a PARTIAL re-flips accepted -> pending carrying ``applied_members`` so
+    # the retry skips what landed. Belt-swallowed for the same reason as the
+    # capture: the vault is the source of truth and the write already
+    # happened, so a queue blip must not report failure to the operator.
+    if suggestion_id and queue_path:
+        try:
+            from alfred.surveyor.moc_suggestion_queue import update_status
+
+            update_status(queue_path, suggestion_id, "accepted")
+            if result.ok:
+                update_status(
+                    queue_path, suggestion_id, "applied",
+                    applied_members=result.touched,
+                )
+            else:
+                update_status(
+                    queue_path, suggestion_id, "pending",
+                    last_apply_error=result.first_error[:200],
+                    applied_members=result.touched,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "feed.act.moc.queue_update_failed",
+                id=feed_item_id, suggestion_id=suggestion_id,
+                error=str(exc), error_type=type(exc).__name__,
+                consequence="membership applied but the queue row still reads "
+                            "pending — it will be re-proposed",
+            )
+    else:
+        log.info(
+            "feed.act.moc.queue_update_skipped", id=feed_item_id,
+            suggestion_id=suggestion_id or "(none)",
+            queue_path=str(queue_path or "(unresolved)"),
+            reason="no suggestion id on the card, or no queue path in config",
+        )
+
+    log.info(
+        "feed.act.moc.applied", id=feed_item_id, target=chosen,
+        proposed=proposed or "(none)",
+        confirmed=(chosen == proposed) if proposed else None,
+        applied=len(result.applied), already=len(result.already),
+        ineligible=len(result.ineligible), failed=len(result.failed),
+        ok=result.ok, partial=result.partial,
+    )
+
+    if not result.ok:
+        # A PARTIAL DOES NOT DECIDE THE CARD (2026-08-20 ruling). The row
+        # stays actionable with its failures visible, and the card is left
+        # open so the operator can retry it — retiring it would strand the
+        # members that did not land.
+        return ActResult(
+            False, STATUS_ERROR,
+            f"added {len(result.applied)}, {len(result.failed)} failed — "
+            f"the card stays for a retry",
+            feed_item_id, action_id,
+        )
+
+    feed_store.set_state(feed_item_id, STATE_ACTED, action=action_id)
+    moc_label = chosen.split("/")[-1].removesuffix(".md")
+    return ActResult(
+        True, STATUS_ACTED,
+        f"added {len(result.applied)} to {moc_label}",
+        feed_item_id, action_id,
+    )
+
+
+def _moc_queue_path(config: Any) -> Path | None:
+    """Resolve the suggestion queue from the surveyor's own config.
+
+    ONE derivation, shared with the producer's read side by construction:
+    the explicit ``queue_path`` when set, otherwise the surveyor state
+    path's sibling — exactly what ``daemon.py`` does when it enqueues. A
+    second spelling here would let the reader and the writer resolve to
+    different files, which is the failure the sort rotation's
+    ``corrections_path_for`` helper exists to prevent.
+    """
+    from alfred.surveyor.moc_suggestion_queue import derive_default_queue_path
+
+    surveyor = getattr(config, "surveyor", None) or {}
+    moc_cfg = getattr(surveyor, "moc_suggestion", None)
+    explicit = getattr(moc_cfg, "queue_path", None) if moc_cfg else None
+    if explicit:
+        return Path(str(explicit))
+    state = getattr(surveyor, "state", None)
+    state_path = getattr(state, "path", None) if state else None
+    if state_path:
+        return derive_default_queue_path(str(state_path))
+    return None
+
+
 # --- slot_suggestion accept (board day-planning path) ------------------------
 
 
@@ -2900,6 +3203,33 @@ def _act_locked(
             feed_store=feed_store, vault_path=vault_path,
         )
 
+    # moc_suggestion (the MOC reader) — same interception shape as the
+    # rotation directly above: emitted per-item by the brief, no sync batch,
+    # no resolver. Ceiling check FIRST so an unmapped verb is
+    # ``invalid_action``. The FYI ``ack`` and the generic defer family were
+    # both intercepted ABOVE this block, so what arrives here is ``moc_apply``.
+    #
+    # This is where ``correction_target`` joins the second (kind, action) pair
+    # in the codebase — passed explicitly rather than folded into
+    # ``action_kwargs``, because this dispatcher synthesizes no
+    # ReplyCorrection at all.
+    if kind == MOC_SUGGESTION_KIND:
+        if action_id not in FEED_ACTIONS.get(MOC_SUGGESTION_KIND, {}):
+            log.info(
+                "feed.act.invalid_action", id=feed_item_id, kind=kind,
+                action=action_id, reason="moc_unmapped_verb",
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                f"'{action_id}' is not a valid action for a {kind} item",
+                feed_item_id, action_id,
+            )
+        return _dispatch_moc_apply(
+            feed_item_id, action_id, item,
+            feed_store=feed_store, vault_path=vault_path,
+            config=config, chosen_target=correction_target,
+        )
+
     # The (kind, action) map is the capability ceiling.
     kind_actions = FEED_ACTIONS.get(kind)
     if kind_actions is None or action_id not in kind_actions:
@@ -3021,13 +3351,20 @@ def _act_locked(
             contested_section=contested_section or "",
         )
 
-    # #13 — the ONLY place a per-request payload joins the static ceiling kwargs.
-    # Scoped to (routine_match, correct) so no other action can carry a target:
-    # a `correction_target` posted alongside `confirm`, or alongside any other
+    # #13 — a per-request payload joining the static ceiling kwargs. Scoped to
+    # (routine_match, correct) so no other action can carry a target: a
+    # `correction_target` posted alongside `confirm`, or alongside any other
     # kind, is dropped here and never reaches a resolver. A `correct` with no
     # target is refused rather than degraded into a plain reject — silently
     # downgrading would tell the operator their answer was taken when the deck
     # learned nothing.
+    #
+    # NO LONGER THE ONLY SUCH PLACE (2026-08-20): (moc_suggestion, moc_apply)
+    # takes the same payload, and is intercepted EARLIER — see the
+    # MOC_SUGGESTION_KIND block above, which never reaches this line. The
+    # discipline travels with the shape: that gate refuses a missing target
+    # AND a target absent from the card's own served choices, both fail-closed
+    # with a named reason, rather than defaulting to the proposal.
     action_kwargs = dict(kind_actions[action_id])
     if kind == ROUTINE_MATCH_KIND and action_id == CORRECT_ACTION:
         chosen = (correction_target or "").strip()

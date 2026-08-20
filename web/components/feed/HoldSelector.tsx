@@ -34,7 +34,11 @@ export interface HoldSelectorProps {
   /** The co-equal choices, suggested member marked (from `holdChoicesFor`). */
   choices: HoldChoice[];
   /** Commit THIS choice — the one interaction. */
-  onPick: (verb: string) => void;
+  /**
+   * Commit the pick. ``target`` is the open-set family's chosen value and is
+   * undefined for a static family, where the VERB is the whole choice.
+   */
+  onPick: (verb: string, target?: string) => void;
   /** Close without committing anything; the frozen card springs back. */
   onCancel: () => void;
   /**
@@ -81,7 +85,7 @@ export function HoldSelector({
             key={c.verb}
             type="button"
             data-testid={`deck-hold-choice-${c.verb}`}
-            onClick={() => onPick(c.verb)}
+            onClick={() => onPick(c.verb, c.target)}
             className="flex items-baseline justify-between rounded-sm border border-console-edge-bright bg-console-raise px-3 py-2 text-left text-sm font-semibold text-console-ink hover:border-affirm hover:text-affirm"
           >
             <span>{c.label}</span>
