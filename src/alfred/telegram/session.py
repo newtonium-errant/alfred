@@ -471,10 +471,18 @@ def is_capture_candidate(
 
     The second clause is what catches the WEB/PWA case, which is the incident
     this fixes: web sessions are ALWAYS ``session_type=="conversation"`` —
-    ``open_session`` takes no session_type and only the Telegram ``/capture``
-    opener (``bot.py``) ever stamps ``_session_type`` — so a clinician's dictated
-    action-item dump on the PWA carries NO capture flag. Substance is the only
-    deterministic, pre-structuring signal available.
+    ``open_session`` takes no session_type and only the retired Telegram
+    ``/capture`` opener ever stamped ``_session_type`` — so a clinician's
+    dictated action-item dump on the PWA carries NO capture flag, and
+    substance is the deterministic pre-structuring signal for it.
+
+    NO LONGER THE ONLY SIGNAL (capture toggle R1, 2026-08-20): a session
+    may carry EXPLICIT capture spans (``_capture_spans``, see
+    ``capture_spans.py``) — the operator's own declaration of the capture
+    material. This predicate does NOT read them; the close paths
+    (``close_session`` / ``check_timeouts_with_meta`` / the web reopen
+    handler) SUPPRESS this heuristic when spans exist, because the span
+    pipeline owns that material and running both would structure it twice.
 
     ASYMMETRIC BIAS (deliberate — mirrors the endpoint-hold error-bias): err
     toward True. A false-positive costs a benign ``capture_structured: pending``

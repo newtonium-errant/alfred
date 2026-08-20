@@ -715,12 +715,17 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
     # Clinic-capture arc: the incident this fixes is a clinician's dictated
     # capture SILENTLY lost when the PWA reopened the session — closed via
     # web_session_reopened with no structuring and no signal. Web sessions are
-    # always session_type=="conversation" (no web /capture, no web /end), so we
+    # always session_type=="conversation" (the bot-era /capture and /end
+    # openers are gone; the web CAPTURE TOGGLE, R1 2026-08-20, is a MODE
+    # with explicit spans, not a session type), so with no spans present we
     # detect capture-worthiness deterministically (``is_capture_candidate``) and
     # (a) close_session UNCONDITIONALLY stamps ``capture_structured: pending``,
     # (b) auto-run structuring when enabled, and (c) surface a ``prior_capture``
     # signal on the response (no server-push channel exists — this is the
     # intentionally-left-blank signal for the web user, read on the next open).
+    # When explicit spans DO exist they are the operator's own declaration of
+    # the capture material — the heuristic is suppressed and the span
+    # finalizer owns the close-time backstop (branch below).
     prior_capture: dict[str, Any] | None = None
     if existing:
         from alfred.telegram import capture_spans
