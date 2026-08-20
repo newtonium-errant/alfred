@@ -35,13 +35,26 @@ the scope machinery that bounds a vouched reporter. See that helper's
 docstring for the derivation.
 
 M1 deferral (NOTE-1): web turns do NOT inject ``calibration_str`` /
-``pushback_level`` — those are populated by the Telegram session-type
+``pushback_level`` — those were populated by the Telegram session-type
 router at open (``_calibration_snapshot`` / ``_pushback_level`` on the
-active dict), which is out of M1 scope, and calibration is keyed to a
-per-user person-record path that ``web.users`` don't carry. Web chat thus
-lacks operator voice-calibration + challenge-tuning until a later
-milestone — flagged so the capability audit doesn't claim parity it
-doesn't have.
+active dict), which was out of M1 scope. Web chat thus lacks operator
+voice-calibration + challenge-tuning — flagged so the capability audit
+doesn't claim parity it doesn't have.
+
+CORRECTION (2026-08-20, R4), recorded here because this note is what a
+builder reads before wiring the read side, and its stated BLOCKER was
+wrong. This used to add "and calibration is keyed to a per-user
+person-record path that ``web.users`` don't carry". True about
+``web.users``, but irrelevant: calibration was NEVER keyed to the web
+identity. The dead bot resolved its target from
+``config.primary_users[0]`` — an INSTANCE-level talker config key whose
+own ``config.yaml.example`` comment calls those records "primary-user
+calibration targets" — and THIS MODULE ALREADY RESOLVES IT, at four
+sites (the reopen close, the span finalizer, ``open_session``, and the
+capture path). So the identity seam for a future rewire is present and
+live; what is missing is only the read call itself. Stating the blocker
+as an identity problem sent the R4 reconnaissance looking for a
+per-user mapping that never existed.
 
 Opt-in inertness: :func:`register_web_routes` mounts NOTHING when the
 ``web`` config is absent / disabled — the transport server stays

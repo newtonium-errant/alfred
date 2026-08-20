@@ -10,6 +10,18 @@ user, stored as a marker-wrapped body block on the user's `person` record:
     - ...
     <!-- END ALFRED:CALIBRATION -->
 
+STILL ORPHANED, NOW GATED — R4 in progress (2026-08-20).
+
+STATUS, so the census below is not read as current: the write side now
+runs under the ``calibration_apply`` vault scope by DEFAULT
+(``apply_proposals(scope=...)``), replacing the unrestricted
+``scope=None`` write it shipped with. That is the guardrail half of R4.
+The module still has NO production caller — the capture, propose-surface
+and apply doors are not yet wired — so the "nothing in src imports this"
+line below remains true of CALLERS and is now false of imports: this
+module imports ``alfred.vault.scope`` at load. The remaining R4 work is
+the three doors, not the gate.
+
 ORPHANED BUT KEPT — REWIRE FLAG R4 (XS-BATCH9 item 5 adjudication,
 2026-08-20; the eleventh orphan the T5 lane found and left for its own
 verdict). Both doors died with the Telegram retirement: the read side
