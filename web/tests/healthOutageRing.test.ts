@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isNeedsYouItem } from '../lib/algernon/feedNeedsYou';
 import { isPushEligible, readPushPolicy } from '../lib/algernon/pushPolicy';
 import { pushDeepLink } from '../lib/algernon/pushPayload';
-import { arrivedVerbless, isDeckDealt } from '../lib/algernon/feedConstants';
+import { arrivedVerbless, isDeckCandidate, isDeckDealt } from '../lib/algernon/feedConstants';
 import type { FeedItem } from '../lib/algernon/feed';
 
 // 2026-08-15 — THE PIN THAT A SUSTAINED AGENT-BACKEND OUTAGE REACHES THE PHONE.
@@ -114,14 +114,20 @@ describe('a sustained-outage health card reaches the doorbell', () => {
     //      an empty deck is exactly how he found the outage in the first place.
     //   2. the deck reports verbless arrivals as an upstream FAULT. The health
     //      card is verbless BY DESIGN (no FEED_ACTIONS entry), so it must never
-    //      reach that accounting — which it cannot, because the deck fetches
-    //      `mode: 'decide'` and this card is `mode: 'fyi'`. Pinned here because
-    //      the day someone promotes the mode, this is the second thing to break
-    //      and the one nobody would think to look at.
+    //      reach that accounting — which it cannot, because only DECK
+    //      CANDIDATES reach it (`isDeckCandidate`: decide-mode, or a served
+    //      suggestion group) and this card is fyi with no served verbs at all.
+    //      The mechanism MOVED on 2026-08-19 (this comment used to say "the
+    //      deck fetches mode:'decide'" — the deck-rotation lane widened the
+    //      fetch to state:open and made the gate this predicate), which is
+    //      exactly the promotion this pin predicted would break things: the
+    //      isDeckCandidate assertion below is the pin catching up to the gate
+    //      that now does the work.
     const card = outageHealthCard();
     expect(isDeckDealt(card)).toBe(false);
+    expect(isDeckCandidate(card)).toBe(false); // ...never a candidate, so never in the fault accounting
     expect(arrivedVerbless(card)).toBe(true);
-    expect(card.mode).not.toBe('decide'); // ...so the deck never fetches it
+    expect(card.mode).not.toBe('decide');
 
     // Positive control: an item that IS deck-dealable counts, so the assertions
     // above are not just describing a predicate that returns false for everything.

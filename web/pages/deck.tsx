@@ -23,8 +23,10 @@ const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 const readSnoozed = readDeckSnoozed;
 const writeSnoozed = writeDeckSnoozed;
 
-// The Decide deck: open decide-mode feed items as swipeable cards. Auth-gated
-// like the brief page (signed-out → /login?next=/deck).
+// The deck: open DECK CANDIDATES as swipeable cards — decide-mode decisions
+// plus quiet suggestion cards (isDeckCandidate; the affirm-with-hold-modifier
+// kinds are fyi/fyi so they deal here without ringing). Auth-gated like the
+// brief page (signed-out → /login?next=/deck).
 export default function DeckPage() {
   const router = useRouter();
   const { user, loading: sessionLoading } = useSession();
