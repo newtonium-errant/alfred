@@ -81,7 +81,29 @@
 //     pre-auth early-return (verified at pages/index.tsx:178: the deck-pill
 //     composition feeds only the post-auth branch), so the prerendered
 //     pre-auth HTML the shell precaches carries none of the new components.
-const CACHE_VERSION = 'v9';
+// v10: the capture toggle (R1). ONE trigger, and for the first time it is a
+//     JS CHUNK, not the stylesheet: the lane's edits to shared lib modules
+//     (`lib/algernon/schemas.ts` + `client.ts`, which the ingest/share
+//     bundles also import) moved shared chunk 847's content hash
+//     (b1cb2233… → 708d9f00…), and `/ingest` + `/share` — BOTH precached
+//     SHELL_ROUTES — name that chunk by hash in their prerendered HTML. A
+//     v9 client would pair its cached shells with a chunk URL this build no
+//     longer serves; `/_next/static/*` is cache-first here.
+//     METHOD (the v8 noise-floor discipline, plus two instrument artifacts
+//     named): the SAME worktree was built at baseline content (C3 stashed)
+//     and at C3, same absolute path, and the prerendered shell-route asset
+//     refs diffed. Artifact 1: `_buildManifest`/`_ssgManifest` carry a
+//     random per-build id — excluded (an identical-source rebuild pair
+//     proved chunk refs otherwise stable). Artifact 2: a CROSS-DIRECTORY
+//     build comparison moves EVERY chunk hash (path-dependent hashing —
+//     the lane-vs-main-repo diff was pure noise and was discarded).
+//     WHAT DID NOT CHANGE, checked rather than assumed: `/` and `/login`
+//     asset refs are identical; the global stylesheet is byte-identical
+//     (tailwind CLI over both trees, same hash 8168ae01…) — the new UI uses
+//     only already-emitted utilities; and `/chat` (not a SHELL_ROUTE)
+//     prerenders its pre-auth branch, which carries none of the capture
+//     components.
+const CACHE_VERSION = 'v10';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.

@@ -5,6 +5,7 @@ import { HOME_INSTANCE_NAME } from './instance';
 import { createSseParser } from './sse';
 import type { ImageAttachment } from './schemas';
 import type {
+  ChatHistoryResponse,
   ChatKind,
   ChatMessage,
   HistoryTurn,
@@ -183,6 +184,13 @@ export interface UseChatOptions {
   instance?: string;
 }
 
+// The extraction offer surfaced after a toggle-off (or re-surfaced on
+// bootstrap for a closed-but-unextracted span): which span, how much is in it.
+export interface ExtractionOffer {
+  spanIndex: number;
+  turns: number;
+}
+
 export interface UseChat {
   messages: ChatMessage[];
   status: ChatStatus;
@@ -231,6 +239,23 @@ export interface UseChat {
    * drop the optimistic user bubble. Returns true iff the thread was updated.
    */
   refreshFromHistory: () => Promise<boolean>;
+  // --- Capture toggle (R1 2026-08-20) ---------------------------------------
+  /** SERVER-truth capture state — set from toggle responses, history
+   *  bootstraps, and captured receipts; never from what the client asked. */
+  captureActive: boolean;
+  /** True while a toggle round-trip is in flight (the button disables). */
+  captureBusy: boolean;
+  /** Flip capture. On→off surfaces the extraction offer for the closed span. */
+  toggleCapture: () => Promise<void>;
+  /** The quiet extraction offer, or null (no chip). */
+  extractionOffer: ExtractionOffer | null;
+  /** True while an accepted extraction runs (the chip shows "Extracting…"). */
+  extracting: boolean;
+  /** Accept the offer — run extraction; outcome lands in `notice`. */
+  acceptExtraction: () => Promise<void>;
+  /** Put the offer away. Nothing is lost: an unextracted span is finalized
+   *  by the backend when the conversation closes. */
+  dismissExtraction: () => void;
 }
 
 // Floor copy for `image_too_large` when the response carried no detail. Kept
@@ -275,6 +300,11 @@ export function friendlyError(e: unknown): string {
         // truth across this switch, usePlayerAsk, and the Telegram reply. The
         // literal is only the floor for a response that lost its detail.
         return e.detail || IMAGE_TOO_LARGE_FALLBACK;
+      case 'span_open':
+        // Capture toggle (R1): extraction asked while capture is still on.
+        return 'Capture is still on — turn it off before extracting.';
+      case 'extraction_in_flight':
+        return 'That capture is already being extracted — give it a moment.';
       case 'transport_unreachable':
       case 'network_error':
         return "Can't reach the assistant right now. Try again shortly.";
@@ -314,6 +344,19 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   const [sessionKey, setSessionKey] = useState<string | null>(null);
   const sessionKeyRef = useRef<string | null>(null);
   const pendingRef = useRef<PendingTurn | null>(null);
+  // Capture toggle (R1). State + a synchronous mirror for async send flows —
+  // same pattern as sessionKeyRef. Server truth: every setter below writes
+  // what the BACKEND said, never what the client intended.
+  const [captureActive, setCaptureActiveState] = useState(false);
+  const captureActiveRef = useRef(false);
+  const setCaptureActive = useCallback((v: boolean) => {
+    captureActiveRef.current = v;
+    setCaptureActiveState(v);
+  }, []);
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [extractionOffer, setExtractionOffer] =
+    useState<ExtractionOffer | null>(null);
+  const [extracting, setExtracting] = useState(false);
   // The in-flight streamed turn's AbortController — aborted on unmount or when a
   // re-bootstrap (instance switch) supersedes the turn, tearing down the
   // browser→BFF fetch (the backend detaches and keeps run_turn running, S4).
@@ -339,12 +382,36 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     setSessionKey(k);
   }, []);
 
+  // Adopt server-truth capture state off a history payload (R1). Every
+  // bootstrap path ends on history, so this is how a refreshed client
+  // resumes capturing — and how a closed-but-unextracted span gets its
+  // offer BACK instead of silently losing it to a reload.
+  const adoptCaptureState = useCallback(
+    (h: ChatHistoryResponse) => {
+      setCaptureActive(!!h.capture_active);
+      const spans = h.capture_spans || [];
+      const pendingSpan = [...spans]
+        .reverse()
+        .find((s) => s.end !== null && !s.extracted);
+      setExtractionOffer(
+        pendingSpan
+          ? { spanIndex: pendingSpan.index, turns: pendingSpan.turns }
+          : null,
+      );
+    },
+    [setCaptureActive],
+  );
+
   const openFresh = useCallback(async () => {
     const { session_key } = await chatApi.open(instance);
     setKey(session_key);
     writeStored(instance, session_key);
     setMessages([]);
-  }, [instance, setKey]);
+    // A fresh session starts with capture off and no offer (server truth:
+    // open_session writes no span state).
+    setCaptureActive(false);
+    setExtractionOffer(null);
+  }, [instance, setKey, setCaptureActive]);
 
   const bootstrap = useCallback(async () => {
     // Supersede any in-flight turn from the previous instance/thread.
@@ -360,9 +427,10 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       const stored = readStored(instance);
       if (stored) {
         try {
-          const { turns } = await chatApi.history(stored, instance);
+          const h = await chatApi.history(stored, instance);
           setKey(stored);
-          setMessages(turns.map(turnToMessage));
+          setMessages(h.turns.map(turnToMessage));
+          adoptCaptureState(h);
           setStatus('ready');
           return;
         } catch (e) {
@@ -380,10 +448,11 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       try {
         const { session_key: live } = await chatApi.active(instance);
         if (live) {
-          const { turns } = await chatApi.history(live, instance);
+          const h = await chatApi.history(live, instance);
           setKey(live);
           writeStored(instance, live);
-          setMessages(turns.map(turnToMessage));
+          setMessages(h.turns.map(turnToMessage));
+          adoptCaptureState(h);
           setStatus('ready');
           return;
         }
@@ -397,7 +466,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     } catch (e) {
       fail(e);
     }
-  }, [instance, openFresh, fail, setKey]);
+  }, [instance, openFresh, fail, setKey, adoptCaptureState]);
 
   // Re-bootstrap whenever the active instance changes — each instance has its own
   // independent thread (per-instance session key).
@@ -440,13 +509,31 @@ export function useChat(options: UseChatOptions = {}): UseChat {
 
   // Finalise the optimistic bubbles from the terminal `done` payload (patch the
   // user-turn ts + append the assistant reply) — identical to the buffered path.
-  const finalizeReply = useCallback((userId: string, d: StreamDoneEvent) => {
-    setMessages((prev) => [
-      ...prev.map((m) => (m.id === userId ? { ...m, ts: d.user_ts || '' } : m)),
-      { id: nextId(), role: 'assistant', text: d.reply, ts: d.ts || '' },
-    ]);
-    setStatus('ready');
-  }, []);
+  // A CAPTURED receipt (R1) appends NO assistant bubble: the user bubble gets
+  // its real ts + the received mark, and capture state resyncs to server truth
+  // (a client that didn't know capture was on learns it from the receipt).
+  const finalizeReply = useCallback(
+    (userId: string, d: StreamDoneEvent) => {
+      if (d.captured) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === userId
+              ? { ...m, ts: d.user_ts || '', captured: true }
+              : m,
+          ),
+        );
+        setCaptureActive(true);
+        setStatus('ready');
+        return;
+      }
+      setMessages((prev) => [
+        ...prev.map((m) => (m.id === userId ? { ...m, ts: d.user_ts || '' } : m)),
+        { id: nextId(), role: 'assistant', text: d.reply, ts: d.ts || '' },
+      ]);
+      setStatus('ready');
+    },
+    [setCaptureActive],
+  );
 
   // Run (or re-run) one logical turn. Streaming primary, buffered fallback, with
   // the S5 reconcile so a completed-but-lost turn never dead-errors. Outcome
@@ -678,6 +765,78 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     }
   }, [openFresh, fail]);
 
+  // --- Capture toggle (R1 2026-08-20) ---------------------------------------
+
+  const toggleCapture = useCallback(async () => {
+    const key = sessionKeyRef.current;
+    if (!key) return;
+    setCaptureBusy(true);
+    setNotice(null);
+    try {
+      const res = await chatApi.capture(key, !captureActiveRef.current, instance);
+      // Render what the SERVER said, not what we asked for.
+      setCaptureActive(res.capture_active);
+      if (!res.capture_active) {
+        // The offer follows a real closed span; an empty span closed to
+        // null and offers nothing (the backend discarded it, logged).
+        setExtractionOffer(
+          res.closed_span
+            ? {
+                spanIndex: res.closed_span.index,
+                turns: res.closed_span.turns,
+              }
+            : null,
+        );
+      }
+    } catch (e) {
+      if (isUnauthenticated(e)) setUnauthenticated(true);
+      // A refused toggle is a calm sentence, not a thread-level failure —
+      // the conversation itself is fine (e.g. 409 while a turn runs).
+      setNotice(friendlyError(e));
+    } finally {
+      setCaptureBusy(false);
+    }
+  }, [instance, setCaptureActive]);
+
+  const acceptExtraction = useCallback(async () => {
+    const key = sessionKeyRef.current;
+    const offer = extractionOffer;
+    if (!key || !offer || extracting) return;
+    setExtracting(true);
+    setNotice(null);
+    try {
+      const res = await chatApi.captureExtract(key, offer.spanIndex, instance);
+      setExtractionOffer(null);
+      const n = res.notes.length;
+      // ILB copy: "ran, nothing worth keeping" is a real outcome and says
+      // so — never a silent chip disappearance.
+      setNotice(
+        n > 0
+          ? `Extracted ${n} record${n === 1 ? '' : 's'} from the capture.`
+          : 'Extraction ran — nothing stood out enough to keep this time.',
+      );
+    } catch (e) {
+      if (isUnauthenticated(e)) setUnauthenticated(true);
+      if (e instanceof ApiError && e.code === 'already_extracted') {
+        // Someone (a retry, the close backstop) beat us to it — the offer
+        // is stale, the material is safe.
+        setExtractionOffer(null);
+        setNotice('That capture was already extracted.');
+      } else {
+        // Keep the offer so the operator can try again.
+        setNotice(friendlyError(e));
+      }
+    } finally {
+      setExtracting(false);
+    }
+  }, [instance, extractionOffer, extracting]);
+
+  const dismissExtraction = useCallback(() => {
+    // Client-side only, and SAFE by design: an unextracted span is
+    // finalized by the backend when the conversation closes.
+    setExtractionOffer(null);
+  }, []);
+
   return {
     messages,
     status,
@@ -695,5 +854,12 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     endChat,
     sessionKey,
     refreshFromHistory,
+    captureActive,
+    captureBusy,
+    toggleCapture,
+    extractionOffer,
+    extracting,
+    acceptExtraction,
+    dismissExtraction,
   };
 }

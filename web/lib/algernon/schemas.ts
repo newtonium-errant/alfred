@@ -142,6 +142,23 @@ export const chatOpenBodySchema = z.object({
 // A session_key path/param must be a non-empty string (the backend issues uuids).
 export const sessionKeySchema = z.string().min(1).max(200);
 
+// POST /api/chat/capture body (capture toggle R1) — the boundary guard for the
+// toggle relay. `on` must be a real boolean (the backend refuses anything
+// else with its own named 400; this is the BFF's trust-boundary mirror).
+export const chatCaptureBodySchema = z.object({
+  session_key: sessionKeySchema,
+  on: z.boolean(),
+  instance: chatInstanceSchema.optional(),
+});
+
+// POST /api/chat/capture/extract body (R1) — span_index is a small
+// non-negative integer (span lists are per-session and short).
+export const chatCaptureExtractBodySchema = z.object({
+  session_key: sessionKeySchema,
+  span_index: z.number().int().min(0).max(9999),
+  instance: chatInstanceSchema.optional(),
+});
+
 // --- Notifications (parity #22, poll slice) ----------------------------------
 // Typed mirror of the backend notification entry
 // (src/alfred/web/notify_state.py — the backend is the authority). Used to
