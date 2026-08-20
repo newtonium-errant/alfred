@@ -47,6 +47,11 @@ const HIDDEN_KEYS: ReadonlySet<string> = new Set([
   // #27 email_urgent: `high_source` renders as the on-face provenance chip
   // ("Priority sender" / "Classifier: high"), never as a raw key:value row.
   'high_source',
+  // The deck rotation's proposal-learning key (`task|due:n|t2`) — the machine
+  // coordinate the act path scores rulings under. Plumbing, not information:
+  // the operator-facing halves (`proposed_slot`, `proposed_rule`) stay visible
+  // rows, because "why this guess" is honest context and this string is not.
+  'proposal_shape',
   // #63a attribution: `contested` drives the card's TIER (a contested inference
   // sits under needs-you rather than in the glance pile) and the presence of the
   // "Not right" door. It is plumbing, not information.

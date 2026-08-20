@@ -1186,6 +1186,17 @@ brief:
     # peer_canonical_names: # optional override for the section header
     #   kalle: "K.A.L.L.E."  # default uppercases the peer key
   #
+  # Sort rotation (2026-08-19) — deck cards for items the slot classifier
+  # refused to guess at ("Not sorted yet"). Each brief fire deals up to
+  # ``cap`` cards proposing a slot; affirm accepts, swipe-hold opens the
+  # co-equal chooser, reject defers ("not now"). Enabled by default —
+  # gated by its POPULATION (an instance with nothing unslotted deals
+  # nothing and says so in the tier.sort.rotation log line); a card's
+  # rulings feed the proposer's learning store (alfred tier-sort-learning).
+  # sort_rotation:
+  #   enabled: true          # set false to deal no sort cards on this instance
+  #   cap: 3                 # cards per fire (deferred cards ride outside it)
+  #
   # STAY-C Bug Relay — Salem-only, opt-in. STAY-C uses NO Telegram and its
   # clinical sandbox can't egress, so a bug filed on the STAY-C PWA is a
   # silent sink unless a box watcher OUTSIDE the clinical unit surfaces it.

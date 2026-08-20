@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { feedApi, type FeedActResult, type FeedItem } from '../../lib/algernon/feed';
 import {
   CORRECT_ACTION,
+  DEFER_QUICK_ACTION,
+  holdChoicesFor,
   isHeavyVerb,
   ONE_OFF_ACTION,
   ROUTINE_MATCH_KIND,
@@ -178,6 +180,15 @@ export interface UseDeckResult {
   acknowledgeUnrecorded: () => void;
   cleared: boolean;
   affirm: () => void;
+  /**
+   * Affirm the top card WITH a chosen alternative — the hold-selector's commit
+   * (affirm-with-hold-modifier). ONE INTERACTION: this is the same optimistic
+   * commit + undo window as `affirm`, with the chosen verb in place of the
+   * suggested one; never a second confirm. The verb must be one of the card's
+   * own served co-equal choices (`holdChoicesFor`) — anything else is a no-op,
+   * because a POST the wire never offered is a 400 in the operator's hand.
+   */
+  affirmWith: (verb: string) => void;
   reject: () => void;
   /** Defer the top card. No argument = the indefinite rung (a full ↑ swipe). */
   snooze: (action?: SnoozeAction) => void;
@@ -457,7 +468,14 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
             : verdict === 'skip'
               ? 'Skipped — it may resurface at the next sync.'
               : verdict === 'reject'
-                ? 'Rejected.'
+                // A reject whose SERVED verb is the quick defer (the rotation
+                // card's "Not now") is a postponement, not a judgment — saying
+                // "Rejected." over it would claim a decision the operator
+                // deliberately did not make. The server's own detail for this
+                // verb is the model: set aside, back at the next sync.
+                ? actionId === DEFER_QUICK_ACTION
+                  ? 'Not now — it comes back at the next sync.'
+                  : 'Rejected.'
                 : 'Confirmed.',
         canUndo: true,
       });
@@ -487,6 +505,23 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     }
     commit('affirm', verbs.affirm, current);
   }, [current, confirming, commit]);
+
+  // The hold-selector's commit. Deliberately NOT routed through `affirm` (which
+  // reads the suggested verb) and deliberately identical in shape to it: same
+  // `commit`, same verdict, same undo window. Choices are the wire's own — the
+  // guard drops any verb the item's served group does not carry, so a stale
+  // sheet can no-op but can never post an unoffered verb. Heavy weights don't
+  // arise here (a co-equal choice is light by the pattern's contract — the
+  // selector IS the deliberate step), so there is no arm stage on this path.
+  const affirmWith = useCallback(
+    (verb: string) => {
+      if (!current) return;
+      const choices = holdChoicesFor(current, 'affirm');
+      if (!choices || !choices.some((c) => c.verb === verb)) return;
+      commit('affirm', verb, current);
+    },
+    [current, commit],
+  );
 
   const confirmHeavy = useCallback(() => {
     if (!current || confirming?.id !== current.id) return;
@@ -733,6 +768,7 @@ export function useDeck(opts: UseDeckOptions): UseDeckResult {
     acknowledgeUnrecorded,
     cleared,
     affirm,
+    affirmWith,
     reject,
     snooze,
     confirmHeavy,

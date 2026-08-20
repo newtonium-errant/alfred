@@ -6,11 +6,13 @@ import {
   ONE_OFF_ACTION,
   ROUTINE_MATCH_KIND,
   SNOOZE_ACTIONS,
+  GESTURE_HOLD_MS,
   SNOOZE_HOLD_MOVE_TOLERANCE,
-  SNOOZE_HOLD_MS,
   SNOOZE_LABELS,
   UNDO_MS,
+  holdChoicesFor,
   isHeavyVerb,
+  inGestureHoldBand,
   inSnoozeHoldBand,
   snoozeIsBacked,
   type SnoozeAction,
@@ -33,11 +35,12 @@ import { verdictNoun } from '../../lib/algernon/deckUnrecorded';
 import { useDeck } from './useDeck';
 import {
   DeckCard,
-  DECK_CARD_BASE_Z,
   DECK_CARD_DEPTH_OFFSET_PX,
   DECK_CARD_SHADOW_REACH_PX,
   DECK_MAX_VISIBLE_DEPTH,
 } from './DeckCard';
+import { HoldSelector } from './HoldSelector';
+import { OVERLAY_Z_INDEX } from './deckOverlay';
 
 // CLEARANCE BETWEEN THE STACK AND THE VERB BUTTONS.
 //
@@ -72,11 +75,8 @@ export const DECK_STACK_RESERVE_PX =
 // it gained. Exported so the page cannot re-type the number and get that wrong.
 export const DECK_COLUMN_MIN_PX = 460 + DECK_STACK_RESERVE_PX;
 
-// Overlays (the snoozed drill, the re-tier picker) must sit ABOVE the whole card stack —
-// the top card is at DECK_CARD_BASE_Z, so an overlay below it opens invisibly behind the
-// card and reads as a dead tap (the #28 re-tier bug). Derived from the card base so it
-// can't drift below. Inline (not a Tailwind z-class) so the ordering is jsdom-testable.
-const OVERLAY_Z_INDEX = DECK_CARD_BASE_Z + 10;
+// Overlay stacking lives in ./deckOverlay (shared with HoldSelector — one
+// derivation, no cycle). See that module for the #28 story.
 
 // The three full-card overlays (snoozed drill, re-tier picker, correction
 // picker) are the same object wearing different content, so they share one set
@@ -129,12 +129,21 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   // The snooze duration menu (#14) — opened by HOLDING a partial ↑ swipe in the
   // stamp band, or by the ↑ button / ArrowUp on a card the backend can snooze.
   const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
+  // The hold-selector (affirm-with-hold-modifier) — opened by HOLDING a partial
+  // affirm swipe in ITS stamp band, or by the card's on-face "Change…" door on
+  // a suggestion card. Same family as the snooze menu above; different band,
+  // different sheet, one timer.
+  const [holdSelectorOpen, setHoldSelectorOpen] = useState(false);
   const topRef = useRef<HTMLDivElement>(null);
-  // The in-band hold timer, and the flag that says this gesture already spent
-  // itself opening the menu. Without the flag the pointerup that ends the hold
-  // would ALSO resolve a verdict, so one gesture would both open the menu and
-  // act on the card behind it.
+  // The in-band hold timer, the BAND it is currently armed in ('snooze' |
+  // 'affirm' — the two wired members of the hold family; the bands are
+  // geometrically disjoint, pinned in feedConstants.test.ts, so one gesture
+  // can only ever be counting toward one sheet), and the flag that says this
+  // gesture already spent itself opening a menu. Without the flag the
+  // pointerup that ends the hold would ALSO resolve a verdict, so one gesture
+  // would both open the menu and act on the card behind it.
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const holdBandRef = useRef<'snooze' | 'affirm' | null>(null);
   const gestureConsumedRef = useRef(false);
 
   // Collapse the evidence expand + close every picker whenever the top card changes.
@@ -143,6 +152,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     setReTierOpen(false);
     setCorrectOpen(false);
     setSnoozeMenuOpen(false);
+    setHoldSelectorOpen(false);
     gestureConsumedRef.current = false;
   }, [current?.id]);
 
@@ -170,12 +180,18 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     releaseFrozenCard();
   }, [releaseFrozenCard]);
 
+  const closeHoldSelector = useCallback(() => {
+    setHoldSelectorOpen(false);
+    releaseFrozenCard();
+  }, [releaseFrozenCard]);
+
   const confirming = current != null && confirmingId === current.id;
   // Any open overlay (snoozed drill, re-tier picker, correction picker) blocks deck swipe +
   // keyboard input, so a gesture can't act on the card hidden underneath (the snoozed-panel
   // guard lesson). Every new overlay MUST join this list — an overlay that doesn't gate
   // input reads as a card acting on its own.
-  const inputBlocked = snoozedOpen || reTierOpen || correctOpen || snoozeMenuOpen;
+  const inputBlocked =
+    snoozedOpen || reTierOpen || correctOpen || snoozeMenuOpen || holdSelectorOpen;
 
   // Imperative pointer drag on the top card — no React re-render per move. The
   // DISCRETE outcome (verdictForDrag → deck handler) is what the unit tests pin.
@@ -198,6 +214,11 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     // Keep both — the pin defends the property, and the property is what the
     // operator experiences.
     const durationsAvailable = snoozeIsBacked(current);
+    // The affirm-hold's choices (affirm-with-hold-modifier). Non-null ONLY on
+    // a card whose served affirm belongs to a co-equal group — the same
+    // no-menu-without-meaning gate `durationsAvailable` is for the ↑ band, so
+    // the hold never arms toward a sheet with nothing to offer.
+    const holdChoices = holdChoicesFor(current, 'affirm');
     let sx = 0;
     let sy = 0;
     let dx = 0;
@@ -210,6 +231,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
         clearTimeout(holdTimerRef.current);
         holdTimerRef.current = null;
       }
+      holdBandRef.current = null;
     };
     const stamps = el.querySelectorAll<HTMLElement>('[data-stamp]');
     const setStamp = (name: string, v: number) => {
@@ -239,27 +261,47 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
       setStamp('affirm', dx > 0 ? stampOpacity(dx) : 0);
       setStamp('reject', dx < 0 ? stampOpacity(-dx) : 0);
       setStamp('snooze', dy < 0 && Math.abs(dx) < 60 ? stampOpacity(-dy) : 0);
-      // HOLD-IN-BAND (#14) — a partial ↑ held still opens the duration menu.
-      // Additive to the release-time verdict: verdictForDrag still decides what a
-      // RELEASE means, and this only fires while the finger is down and steady.
-      if (!durationsAvailable) return;
-      if (!inSnoozeHoldBand(dx, dy)) {
+      // HOLD-IN-BAND — the hold family's two wired members on ONE timer. #14's
+      // snooze band (a partial ↑, on a duration-backed card) and the affirm
+      // band (a partial →, on a suggestion card) are geometrically DISJOINT
+      // (the horizontal bands bound |dy| strictly below the ↑ band's floor —
+      // pinned), so a live drag is counting toward at most one sheet, and the
+      // band it armed in travels on `holdBandRef`. Additive to the
+      // release-time verdict: verdictForDrag still decides what a RELEASE
+      // means, and this only fires while the finger is down and steady.
+      const activeBand =
+        durationsAvailable && inSnoozeHoldBand(dx, dy)
+          ? ('snooze' as const)
+          : holdChoices && inGestureHoldBand('affirm', dx, dy)
+            ? ('affirm' as const)
+            : null;
+      if (activeBand === null) {
         clearHold();
         return;
       }
       if (holdTimerRef.current !== null) {
         // Already counting. Drift past the tolerance means this is a slow swipe,
         // not a hold — RE-ANCHOR rather than fire, so the menu can't ambush a
-        // finger that is still travelling toward the full-swipe threshold.
-        if (Math.abs(dx - holdX) <= SNOOZE_HOLD_MOVE_TOLERANCE && Math.abs(dy - holdY) <= SNOOZE_HOLD_MOVE_TOLERANCE) {
+        // finger that is still travelling toward the full-swipe threshold. A
+        // band CHANGE re-anchors the same way (unreachable while the bands are
+        // disjoint; kept so a future band edit degrades to a restart, never to
+        // a timer firing the wrong sheet).
+        if (
+          holdBandRef.current === activeBand &&
+          Math.abs(dx - holdX) <= SNOOZE_HOLD_MOVE_TOLERANCE &&
+          Math.abs(dy - holdY) <= SNOOZE_HOLD_MOVE_TOLERANCE
+        ) {
           return;
         }
         clearHold();
       }
       holdX = dx;
       holdY = dy;
+      holdBandRef.current = activeBand;
       holdTimerRef.current = setTimeout(() => {
         holdTimerRef.current = null;
+        const firedBand = holdBandRef.current;
+        holdBandRef.current = null;
         // Spend the gesture: the card FREEZES where it was held (we simply stop
         // updating it), and the release that follows must not spring it back.
         //
@@ -282,8 +324,9 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
         // delete the guard that actually matters.
         gestureConsumedRef.current = true;
         dragging = false;
-        setSnoozeMenuOpen(true);
-      }, SNOOZE_HOLD_MS);
+        if (firedBand === 'affirm') setHoldSelectorOpen(true);
+        else setSnoozeMenuOpen(true);
+      }, GESTURE_HOLD_MS);
     };
     const onUp = () => {
       clearHold();
@@ -353,6 +396,19 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     [deck],
   );
 
+  // Pick from the hold-selector: ONE INTERACTION — the pick IS the affirm
+  // (same optimistic commit, same undo window as the plain gesture; the ruling
+  // forbids choose-then-confirm, so nothing sits between this and the act).
+  // Mirrors onPickSnooze's shape, which is this family's prior art.
+  const onPickHold = useCallback(
+    (verb: string) => {
+      setHoldSelectorOpen(false);
+      gestureConsumedRef.current = false;
+      deck.affirmWith(verb);
+    },
+    [deck],
+  );
+
   // Keyboard alternates (accessibility): ← reject · → affirm · ↑ snooze · ↓ details.
   // While an overlay (snoozed drill OR re-tier picker) is open it blocks pointer input on
   // the hidden card, so the keyboard MUST be gated too — otherwise an arrow key acts on
@@ -390,6 +446,10 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
   );
 
   const verbs = current ? verbsFromActions(current) : null;
+  // The top card's co-equal affirm choices (affirm-with-hold-modifier) — null
+  // on every non-suggestion card, which is what keeps the selector and its
+  // on-face door from existing where they mean nothing.
+  const holdChoices = current ? holdChoicesFor(current, 'affirm') : null;
   // The current email card's assigned tier (#28) — the picker offers the OTHERS.
   const assignedTier = current ? emailPriority(current) : null;
   // The #13 pick-list: every active routine item MINUS the one this card proposed
@@ -525,6 +585,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
             onCancelHeavy={deck.cancelHeavy}
             onReTierOpen={depth === 0 ? () => setReTierOpen(true) : undefined}
             onCorrectOpen={depth === 0 ? () => setCorrectOpen(true) : undefined}
+            onHoldOpen={depth === 0 ? () => setHoldSelectorOpen(true) : undefined}
             // Every depth, not just the top: a returned card is usually behind
             // one or two others when it comes back, and the mark is what makes it
             // recognisable on the way up the stack.
@@ -805,6 +866,22 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
               it is now.
             </p>
           </div>
+        )}
+
+        {/* The hold-selector (affirm-with-hold-modifier) — the co-equal
+            alternatives behind a held affirm. Reached by HOLDING a partial →
+            swipe in the band where the affirm stamp is already showing, or by
+            the card's on-face "Change…" door (the accessible route — a menu
+            reachable only by holding a drag is a menu no keyboard can reach;
+            the ↑ button precedent). The card underneath stays frozen at the
+            held offset, exactly like the snooze menu above. */}
+        {holdSelectorOpen && current && holdChoices && (
+          <HoldSelector
+            title={`${kindLabel(current.kind)} — choose`}
+            choices={holdChoices}
+            onPick={onPickHold}
+            onCancel={closeHoldSelector}
+          />
         )}
       </div>
 

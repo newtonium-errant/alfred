@@ -327,6 +327,20 @@ describe('evidence flattening (defensive, untrusted display data)', () => {
     expect(keys).not.toContain('subject'); // empty
     expect(keys).not.toContain('item_number'); // hidden
   });
+  it("hides the sort card's learning key but keeps the proposal's why", () => {
+    // `proposal_shape` is the act path's machine coordinate — plumbing. The
+    // proposal itself (`proposed_slot` + `proposed_rule`) stays a visible row:
+    // "why this guess" is the card's honest context.
+    const rows = evidenceRows({
+      proposed_slot: 'duty',
+      proposed_rule: 'default_duty',
+      proposal_shape: 'task|due:n|t2',
+    });
+    const keys = rows.map((r) => r.key);
+    expect(keys).toContain('proposed_slot');
+    expect(keys).toContain('proposed_rule');
+    expect(keys).not.toContain('proposal_shape'); // hidden plumbing
+  });
   it('never treats a non-object as evidence', () => {
     expect(evidenceRows(null)).toEqual([]);
     expect(evidenceRows('nope')).toEqual([]);

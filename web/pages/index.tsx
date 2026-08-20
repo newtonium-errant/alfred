@@ -22,7 +22,7 @@ import {
   type ComposeMode,
 } from '../lib/algernon/composer';
 import { useComposerLog } from '../lib/algernon/composerLog';
-import { contestableItem, isDeckDealt } from '../lib/algernon/feedConstants';
+import { contestableItem, isDeckCandidate, isDeckDealt } from '../lib/algernon/feedConstants';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
@@ -151,7 +151,11 @@ export default function HomePage() {
   const needsYouCount = board.needsYou.filter(
     (it) => !(it.kind === 'slot_suggestion' && completion.effectiveDone(it)),
   ).length;
-  const deckableCount = board.needsYou.filter(isDeckDealt).length;
+  // The pill counts the SAME composition /deck deals: needs-you decisions
+  // plus the glance partition's quiet suggestion cards (isDeckCandidate —
+  // shared with feed.tsx and the /deck page, so the promise can't drift).
+  const deckableCount = [...board.needsYou, ...board.fyi.filter(isDeckCandidate)]
+    .filter(isDeckDealt).length;
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {

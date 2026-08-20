@@ -48,9 +48,12 @@ export function servedActionsFor(kind: string): ServedActionFixture[] {
 }
 
 /**
- * The per-ITEM narrowing, mirroring the server's `actions_for_item`: a slot that
- * is not a genuine candidate is not offered the `accept` the router would refuse.
- * Use this wherever a fixture's slot stage matters.
+ * The per-ITEM narrowing, mirroring the server's `actions_for_item`: a slot
+ * that is not a genuine candidate is not offered the `accept` the router would
+ * refuse, and a sort_suggestion card's affirm gesture is stamped onto the verb
+ * matching its own `evidence.proposed_slot` (the proposal becomes the gesture
+ * — no proposal, no affirm gesture). Use this wherever a fixture's per-item
+ * stage matters.
  */
 export function servedActionsForItem(
   kind: string,
@@ -59,6 +62,12 @@ export function servedActionsForItem(
   const verbs = servedActionsFor(kind);
   if (kind === 'slot_suggestion' && evidence.candidate !== true) {
     return verbs.filter((a) => a.verb !== 'accept');
+  }
+  if (kind === 'sort_suggestion') {
+    const proposedVerb = `sort_${String(evidence.proposed_slot ?? '')}`;
+    for (const a of verbs) {
+      if (a.verb === proposedVerb) a.gesture = 'affirm';
+    }
   }
   return verbs;
 }

@@ -207,8 +207,17 @@ async def tier_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
 
 
 async def _deck_ids(client) -> set[str]:  # type: ignore[no-untyped-def]
-    """The ids the DECK would deal — the exact query `deck.tsx` issues
-    (`feedApi.list({ state: 'open', mode: 'decide' })`)."""
+    """The route's decide-mode slice — the API capability under test here.
+
+    HISTORY, because this docstring used to claim more: until 2026-08-19 this
+    was verbatim "the exact query deck.tsx issues". The deck-rotation lane then
+    widened the deck's fetch to ``state=open`` and moved its gate client-side
+    (``isDeckCandidate``: decide-mode OR a served suggestion group), so the
+    deck no longer issues ``mode=decide`` at all. The route's mode filter stays
+    a real, pinned API capability — these tests hold it on its own terms — and
+    the deck-exclusion duty the filter used to carry now lives in the web pins
+    (holdPrimitive.test.ts's attribution counterexample + deckPage.test.tsx's
+    candidate filtering)."""
     resp = await client.get("/feed/items?state=open&mode=decide", headers=_FEED_HEADERS)
     assert resp.status == 200
     return {i["id"] for i in (await resp.json())["items"]}
@@ -220,10 +229,17 @@ async def test_the_deck_query_excludes_the_demoted_attribution_card(tier_client)
     This crosses the boundary on purpose. The producer only stamps
     ``mode=fyi``; asserting that alongside ``MODE_FYI != MODE_DECIDE`` is a fact
     about two constants that stays true whether or not anything filters on it,
-    so a producer-side pin cannot see the mechanism break. What actually keeps
-    attribution out of the deck is the ``it.mode != q_mode`` branch in
-    ``_handle_feed_items`` — delete that branch and the demoted card is dealt
-    again. Only a request that goes through the handler goes red.
+    so a producer-side pin cannot see the mechanism break. The ``it.mode !=
+    q_mode`` branch in ``_handle_feed_items`` is what a mode-filtered request
+    exercises — delete that branch and this query deals the demoted card again.
+    Only a request that goes through the handler goes red.
+
+    SINCE 2026-08-19 this branch is no longer what keeps attribution out of the
+    LIVE deck (the deck fetches unfiltered and gates client-side via
+    ``isDeckCandidate`` — an fyi row with no served suggestion group is not a
+    candidate, pinned web-side with attribution as the named counterexample).
+    The route filter remains a real API capability and this test holds it on
+    its own terms.
 
     The decide-card assertion is half the pin: without it, a filter that
     returned nothing at all would pass just as happily as a correct one.

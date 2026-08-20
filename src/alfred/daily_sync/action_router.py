@@ -54,6 +54,7 @@ from alfred.daily_sync.feed_producer import _FAMILIES, _as_dict
 from alfred.feed.model import (
     ATTENTION_NEEDS_YOU,
     KIND_REMINDER_RETURNED,
+    KIND_SORT_SUGGESTION,
     MODE_DECIDE,
     MODE_FYI,
     STATE_ACKED,
@@ -195,6 +196,20 @@ URGENT_KIND = "email_urgent"
 # has one spelling across the three packages that have to say it.
 RETURN_KIND = KIND_REMINDER_RETURNED
 
+# sort_suggestion (the deck rotation, 2026-08-19) — the card that PROPOSES a
+# slot for an item the classifier refused to guess at, dealt by the brief's
+# rotation (``brief.daemon._emit_sort_rotation``). Same one-spelling discipline
+# as RETURN_KIND: the feed model owns the string.
+#
+# ITS VERBS ARE THE SAME THREE SORT VERBS the board's slot_suggestion carries —
+# same ids, same writer (``tier.sort_writer.assign_slot``), because both
+# surfaces record the same ruling on the same record field. What differs is the
+# LIFECYCLE: a board sort is orthogonal to its card (the item stays open, still
+# completable), while a rotation card's WHOLE question is "where does this
+# belong?" — answering it decides the card, so the rotation dispatcher sets
+# ``acted`` where the board one deliberately touches nothing.
+SORT_SUGGESTION_KIND = KIND_SORT_SUGGESTION
+
 # (kind, action_id) → the kwargs that synthesize the owning resolver's
 # ``ReplyCorrection``. THIS MAP IS THE CAPABILITY CEILING — a pair absent here
 # can never reach a resolver. A fresh ReplyCorrection is built per call (never a
@@ -281,6 +296,14 @@ DEFER_RETURN_PATH: dict[str, str] = {
     "pending": "alfred.daily_sync.feed_producer",
     "routine_match": "alfred.daily_sync.feed_producer",
     "reminder_returned": "alfred.transport.returns_feed",
+    # The deck rotation (2026-08-19). Its defer IS the operator's "not now"
+    # (the ruling maps the reject swipe onto the quick defer), so the return
+    # promise is load-bearing here, not incidental: ``_emit_sort_rotation``
+    # reconciles the kind every brief fire, carries every still-deferred card
+    # in its emit OUTSIDE the cap (the selection's held band — omitting one
+    # would let reconcile retire it and destroy its window), and a lapsed
+    # window revives through the same upsert every other kind uses.
+    KIND_SORT_SUGGESTION: "alfred.brief.daemon",
 }
 
 
@@ -392,6 +415,17 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # record would be a second writer for a state the record already owns.
     RETURN_KIND: {
         "ack": {},
+    },
+    # sort_suggestion (the deck rotation) — the SAME three sort verbs as the
+    # board's slot_suggestion, intercepted by :func:`_dispatch_sort_ruling`
+    # (kwargs UNUSED, no ReplyCorrection, no last_batch — the brief's rotation
+    # emits per-item). The auto-fold below adds the generic defer family: this
+    # kind is deliberately NOT in DEFER_EXCLUDED_KINDS, because the operator's
+    # reject-swipe on a rotation card MEANS "not now", and the defer store is
+    # the mechanism that keeps that promise (return path declared in
+    # DEFER_RETURN_PATH, verified by the partition test).
+    SORT_SUGGESTION_KIND: {
+        **{_verb: {} for _verb in SORT_ACTIONS},
     },
 }
 
@@ -546,6 +580,29 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
             "gesture": _GESTURE_REJECT,
         },
     },
+    # sort_suggestion (the deck rotation) — the affirm-with-hold-modifier
+    # pattern's first consumer (operator ratification, 2026-08-19: "affirm as
+    # suggested, or swipe hold to change the suggestion while affirming").
+    #
+    # NO GESTURE HERE, and that absence is the taxonomy holding: the three
+    # slots are CO-EQUAL, so no verb may be the kind-level "yes". The affirm
+    # gesture is stamped PER ITEM by :func:`actions_for_item`, onto whichever
+    # verb matches that card's own ``evidence.proposed_slot`` — the "yes" is
+    # THE PROPOSAL, never a slot. LIGHT for the same reasons as the board's
+    # copy of these verbs: reversible by re-sorting, one frontmatter field,
+    # destroys nothing.
+    #
+    # ``group`` is the §4 amendment this pattern adds (mirroring how the deck's
+    # two-way surface needed ``gesture``): it marks a CO-EQUAL CHOICE GROUP.
+    # The client derives the hold-selector's option list as "every served verb
+    # sharing the affirm verb's group" — so a future suggestion-bearing kind
+    # gets the selector by serving a group, with no client change and no
+    # per-kind map (the 1b-ii lesson, kept).
+    SORT_SUGGESTION_KIND: {
+        "sort_duty": {"label": "Duty", "weight": "light", "group": "slot"},
+        "sort_rhythm": {"label": "Rhythm", "weight": "light", "group": "slot"},
+        "sort_fuel": {"label": "Fuel", "weight": "light", "group": "slot"},
+    },
 }
 
 # Defer presentation, applied to every kind the ceiling widened. Light in every
@@ -569,6 +626,20 @@ for _kind in FEED_ACTIONS:
             _entry["gesture"] = _GESTURE_DEFER
         _slot[_verb] = _entry
 del _kind, _verb, _slot, _entry
+
+# The rotation card's REJECT is its quick defer (operator ruling, 2026-08-19:
+# "reject swipe = not now"). Overridden AFTER the fold on purpose — the fold is
+# the family's one author and this is a per-kind presentation of a verb the
+# fold already granted, not a second grant. The #14 one-control-one-meaning
+# rule holds: on this kind the left swipe means ONLY "not now" (there is no
+# decline — an unsorted item stays unsorted either way), so the reject gesture
+# carries the defer verb rather than sharing a card with it. The dated rungs
+# keep their fold presentation (menu verbs, no gesture).
+ACTION_META[SORT_SUGGESTION_KIND][DEFER_NEXT_RENDER] = {
+    "label": "Not now",
+    "weight": "light",
+    "gesture": _GESTURE_REJECT,
+}
 
 
 def actions_for(kind: str) -> list[dict[str, Any]]:
@@ -601,6 +672,12 @@ def actions_for(kind: str) -> list[dict[str, Any]]:
         note = entry.get("note")
         if note:
             advertised["note"] = note
+        # A co-equal choice group (the affirm-with-hold-modifier pattern). Same
+        # passthrough shape as gesture/note: presentation the ceiling entry
+        # cannot know, carried only when declared.
+        group = entry.get("group")
+        if group:
+            advertised["group"] = group
         out.append(advertised)
     return out
 
@@ -648,6 +725,29 @@ def actions_for_item(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         evidence = item.get("evidence") or {}
         if not isinstance(evidence, Mapping) or evidence.get("candidate") is not True:
             verbs = [v for v in verbs if v.get("verb") != ACCEPT_ACTION]
+    if kind == SORT_SUGGESTION_KIND:
+        # THE PROPOSAL BECOMES THE GESTURE (2026-08-19 ruling). The kind-level
+        # table serves the three sort verbs gesture-free — co-equal, no static
+        # "yes" — and each ITEM's affirm gesture is stamped here onto exactly
+        # the verb matching its own ``evidence.proposed_slot``. So the swipe's
+        # meaning is "accept the proposal", which is a fact about the card,
+        # never a ranking among the slots.
+        #
+        # A card with a missing or unrecognised proposal gets NO affirm gesture
+        # — it still serves its verbs (menu-reachable, honest) but the deck
+        # will not deal a swipe whose meaning it cannot state. The producer
+        # stamps a proposal on every card (the table is total), so this arm is
+        # the degraded-payload belt, not a live path.
+        evidence = item.get("evidence") or {}
+        proposed = (
+            evidence.get("proposed_slot") if isinstance(evidence, Mapping) else None
+        )
+        verb_for_slot = {v: k for k, v in SORT_ACTION_BY_SLOT.items()}
+        proposed_verb = verb_for_slot.get(str(proposed or ""))
+        if proposed_verb is not None:
+            for advertised in verbs:
+                if advertised.get("verb") == proposed_verb:
+                    advertised["gesture"] = _GESTURE_AFFIRM
     return verbs
 
 
@@ -1756,6 +1856,139 @@ def _sort_writer_detail(kind: str) -> str:
     return "could not sort this item"
 
 
+def _dispatch_sort_ruling(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    vault_path: Path | None,
+) -> ActResult:
+    """Apply a sort verb on a ROTATION card (``sort_suggestion``) — record the
+    ruling via the SAME writer the board uses (:func:`tier.sort_writer
+    .assign_slot`), score it against the card's own proposal, and DECIDE the
+    card.
+
+    Three deliberate differences from :func:`_dispatch_slot_sort`, its board
+    sibling, and one likeness worth stating:
+
+    * **It sets feed state.** The rotation card's whole question is "where does
+      this belong?" — a successful sort answers it, so the card goes ``acted``
+      (stamped with the sort verb) and leaves the deck. The board card stays
+      untouched there because sorting is orthogonal to ITS lifecycle; here it
+      is the lifecycle.
+    * **It captures the correction signal** (the self-correcting standard's
+      part 1): the operator's chosen slot against the card's stamped
+      ``proposed_slot``, keyed by the ``proposal_shape`` stamped at deal time.
+      BELT-SWALLOWED — a learning-store failure must never cost the operator
+      the sort itself, so the write lands first and the capture failure is a
+      logged, named degradation. A reject/defer records nothing (the operator
+      declined to judge), which the defer dispatcher enforces by never coming
+      here.
+    * **Its writer set is the same, minus nothing:** no completion, accept or
+      snooze writer is referenced from this function's own code object — the
+      structural pin mirrors the board sibling's, with ``set_state`` allowed
+      here (and asserted THERE) because deciding the card is this dispatcher's
+      contract. As with the sibling pin, the check is one level deep (direct
+      references), not a transitive reachability proof.
+
+    Runs inside the caller's per-item mutex, on the item's OWN stamped
+    evidence (trusted-producer class).
+    """
+    target_slot = SORT_ACTION_BY_SLOT.get(action_id)
+    if target_slot is None:
+        # Unreachable through the ceiling; kept for the same one-refactor
+        # reason as the sibling — guessing a slot is the one forbidden thing.
+        log.info(
+            "feed.act.sort.unknown_verb", id=feed_item_id, action=action_id,
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            f"'{action_id}' is not a sort action", feed_item_id, action_id,
+        )
+
+    if vault_path is None:
+        return ActResult(
+            False, STATUS_ERROR,
+            "vault not configured — can't sort this item",
+            feed_item_id, action_id,
+        )
+
+    from alfred.tier.sort_writer import assign_slot
+
+    evidence = dict(getattr(item, "evidence", None) or {})
+    result = assign_slot(
+        Path(vault_path),
+        origin=str(evidence.get("origin") or ""),
+        slot=target_slot,
+        path=str(evidence.get("path") or ""),
+        routine_record=evidence.get("routine_record"),
+        item_text=evidence.get("item_text"),
+    )
+
+    if not result.ok:
+        log.info(
+            "feed.act.sort.failed", id=feed_item_id, action=action_id,
+            slot=target_slot, kind=result.kind, origin=result.origin,
+        )
+        return ActResult(
+            False, STATUS_UNSUPPORTED_ITEM, _sort_writer_detail(result.kind),
+            feed_item_id, action_id,
+        )
+
+    # THE CORRECTION SIGNAL (self-correcting standard, part 1). Scored against
+    # the proposal stamped at DEAL time — quick affirm lands here with the
+    # proposed verb (confirmation), a hold-selector pick lands with a different
+    # one (correction). Belt: the ruling write may fail without failing the
+    # sort, and the skip is NAMED so a rotation that silently stopped learning
+    # stays diagnosable (ILB).
+    proposed = str(evidence.get("proposed_slot") or "")
+    shape = str(evidence.get("proposal_shape") or "")
+    if proposed in slots.CANONICAL_SLOTS and shape:
+        try:
+            from alfred.tier.sort_proposal import corrections_path_for, record_ruling
+
+            record_ruling(
+                corrections_path_for(feed_store.path),
+                shape=shape,
+                proposed=proposed,
+                chosen=target_slot,
+                proposed_rule=str(evidence.get("proposed_rule") or ""),
+                feed_item_id=feed_item_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — learning must never cost the sort
+            log.warning(
+                "feed.act.sort.capture_failed",
+                id=feed_item_id, error=str(exc), error_type=type(exc).__name__,
+                consequence="ruling applied but NOT recorded — the proposer "
+                            "learns nothing from this one",
+            )
+    else:
+        log.info(
+            "feed.act.sort.capture_skipped",
+            id=feed_item_id, proposed=proposed or "(none)", shape=shape or "(none)",
+            reason="card carries no scoreable proposal (degraded/legacy payload)",
+        )
+
+    # The card is DECIDED — its question is answered. Stamped with the sort
+    # verb so the fold (and the audit trail) can tell a sorted card from every
+    # other acted shape.
+    feed_store.set_state(feed_item_id, STATE_ACTED, action=action_id)
+    log.info(
+        "feed.act.sort.ruled", id=feed_item_id, action=action_id,
+        slot=result.slot, origin=result.origin, target=result.target,
+        changed=result.changed, proposed=proposed or "(none)",
+        confirmed=(proposed == target_slot) if proposed else None,
+    )
+    return ActResult(
+        True, STATUS_SORTED,
+        f"sorted into {result.slot}", feed_item_id, action_id,
+        # The same server-confirmed render contract as the board sort — the
+        # FE's optimistic flip fires only when this is present.
+        render={"slot": result.slot, "sorted": True},
+    )
+
+
 # --- slot_suggestion accept (board day-planning path) ------------------------
 
 
@@ -2345,6 +2578,30 @@ def _act_locked(
             )
         return _dispatch_contact_pattern(
             feed_item_id, action_id, item, feed_store=feed_store, config=config,
+        )
+
+    # sort_suggestion (the deck rotation) — intercepted for the same reason as
+    # pattern_surfaced directly above: emitted per-item by the brief's
+    # rotation, so there is no sync batch and no resolver, and falling through
+    # to ``_load_batch_item`` would end at "no resolver for kind". Ceiling
+    # check FIRST so an unmapped verb is still ``invalid_action``. What can
+    # actually arrive here is exactly the three sort verbs: the FYI ``ack``
+    # and the generic defer family were both intercepted ABOVE this block, and
+    # the dispatcher's own unknown-verb guard backstops the remainder.
+    if kind == SORT_SUGGESTION_KIND:
+        if action_id not in FEED_ACTIONS.get(SORT_SUGGESTION_KIND, {}):
+            log.info(
+                "feed.act.invalid_action", id=feed_item_id, kind=kind,
+                action=action_id, reason="sort_unmapped_verb",
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                f"'{action_id}' is not a valid action for a {kind} item",
+                feed_item_id, action_id,
+            )
+        return _dispatch_sort_ruling(
+            feed_item_id, action_id, item,
+            feed_store=feed_store, vault_path=vault_path,
         )
 
     # The (kind, action) map is the capability ceiling.

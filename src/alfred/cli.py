@@ -5666,6 +5666,58 @@ def cmd_reconcile(args: argparse.Namespace) -> None:
     sys.exit(code)
 
 
+def _cmd_tier_sort_learning(args: argparse.Namespace) -> None:
+    """``alfred tier-sort-learning [--json]`` — the sort proposer's readout.
+
+    Part (3) of the self-correcting standard for the deck rotation's proposer:
+    the accumulated correction signal, surfaced for the operator. Chosen as a
+    CLI readout (the cheapest honest surface — the sibling of ``tier-override
+    list``) rather than a brief line: the tally changes at the pace of deck
+    answers, and a daily prose line about a store with three rows in it would
+    be noise the morning read never asked for.
+
+    READ-ONLY by construction: there is no verb here that edits the store. The
+    learning enters through deck rulings and nothing else — a CLI that could
+    write tallies would be a second door onto the correction signal.
+    """
+    from alfred.feed import load_from_unified as load_feed_config
+    from alfred.tier.sort_proposal import corrections_path_for, learning_summary
+
+    raw = _load_unified_config(args.config)
+    path = corrections_path_for(load_feed_config(raw).store_path)
+    summary = learning_summary(path)
+
+    if getattr(args, "json", False):
+        print(json.dumps({"path": str(path), **summary}, indent=2))
+        return
+
+    print(f"Sort-proposal learning ({path}):")
+    if summary["rulings"] == 0:
+        # ILB: an empty store is a real, reportable state — the rotation has
+        # not been answered on this instance (or is disabled/not dealt yet).
+        print("  no rulings recorded yet — the deck rotation hasn't been "
+              "answered on this instance.")
+        return
+    rate = summary["correction_rate"]
+    print(
+        f"  rulings: {summary['rulings']}   corrected: {summary['corrected']}"
+        f"   correction rate: {rate:.0%}"
+    )
+    for shape, counts in summary["shapes"].items():
+        chosen = ", ".join(f"{slot}×{n}" for slot, n in sorted(counts.items()))
+        print(f"  {shape}: {chosen}")
+    if summary["active_overrides"]:
+        print("  active overrides (learned proposal displaces the rule table):")
+        for o in summary["active_overrides"]:
+            print(
+                f"    {o['shape']} → proposes {o['proposes']} "
+                f"(was {o['displaces']} via {o['displaced_rule']}, "
+                f"{o['rulings']} rulings)"
+            )
+    else:
+        print("  no active overrides — the static rule table stands everywhere.")
+
+
 def cmd_feed(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred feed`` subcommands.
 
@@ -7527,6 +7579,14 @@ def build_parser() -> argparse.ArgumentParser:
         "clear", help="Undo an override — the kind returns to its KIND_DEFAULTS tier")
     tovr_clear.add_argument("kind", help="Feed kind, e.g. attribution")
 
+    # The deck rotation's proposer readout (2026-08-19) — read-only; see the
+    # handler's docstring for why there is no write verb.
+    tsl_p = sub.add_parser(
+        "tier-sort-learning",
+        help="Show what the sort-proposal learner has accumulated (deck rotation)",
+    )
+    tsl_p.add_argument("--json", action="store_true", help="Machine-readable output")
+
     # #20 P5 — ad-hoc-T3 recurrence→promote review + decision.
     trec_p = sub.add_parser(
         "tier-recurrence",
@@ -7603,6 +7663,7 @@ def main() -> None:
         "tier-override": _cmd_tier_override,
         "push-trial": _cmd_push_trial,
         "tier-recurrence": _cmd_tier_recurrence,
+        "tier-sort-learning": _cmd_tier_sort_learning,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,
         "contract": cmd_contract,

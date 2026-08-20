@@ -9,6 +9,7 @@ from typing import Any
 
 from alfred.common.schedule import ScheduleConfig
 from alfred.feed import FeedConfig, load_from_unified as _load_feed_config
+from alfred.tier.sort_rotation import DEFAULT_ROTATION_CAP
 
 from .utils import get_logger
 
@@ -150,6 +151,30 @@ class StaycNegationRelayConfig:
 
 
 @dataclass
+class SortRotationConfig:
+    """``brief.sort_rotation`` — the deck rotation over unslotted items.
+
+    ``enabled`` DEFAULTS TO TRUE, and that is a per-instance-defaults decision
+    worth stating rather than a shrug. The alternative on the table was "Salem
+    only", which in code would mean an instance-name literal — the exact
+    hardcoding the naming discipline forbids, and it would make the feature
+    invisible on every instance the operator later starts using the board on.
+    What makes ``True`` safe instead of noisy is that the rotation is gated by
+    its POPULATION, not by its instance: an instance whose tier lanes hold
+    nothing unslotted deals nothing and says so in the rotation's ILB line. An
+    instance that genuinely does not want it sets ``enabled: false``.
+
+    ``cap`` is the ratified "2-3/day"; see
+    :func:`alfred.tier.sort_rotation.select_rotation` for why deferred cards are
+    carried outside it. Values below 1 deal nothing while still preserving
+    parked defers, so turning the dial to 0 is a mute, never a data loss.
+    """
+
+    enabled: bool = True
+    cap: int = DEFAULT_ROTATION_CAP
+
+
+@dataclass
 class WatchItemConfig:
     """One ``brief.watches`` entry — a config-driven upstream check.
 
@@ -271,6 +296,12 @@ class BriefConfig:
     # compact_threshold_bytes). Loaded from the unified ``feed:`` block so the
     # brief's producer #2 writes the SAME store the daily-sync producer does.
     feed: FeedConfig = field(default_factory=FeedConfig)
+
+    # The sort rotation (2026-08-19) — deck cards for items the slot classifier
+    # refused to guess at. Its own block rather than a bare pair of keys so the
+    # cap and the switch stay together, and so a future rung (a per-slot cap, a
+    # weekday schedule) has somewhere to land.
+    sort_rotation: "SortRotationConfig" = field(default_factory=lambda: SortRotationConfig())
     # Instance slug stamped into feed items (from telegram.instance.name, lowercased).
     instance_name: str = ""
 
@@ -333,6 +364,17 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
             name=s.get("name", ""),
             primary=s.get("primary", False),
         ))
+
+    # The sort rotation block. Hand-rolled like every other block in this loader
+    # (this module builds its dataclasses explicitly rather than through the
+    # ``_build`` key-name dispatcher, so the collision footgun does not apply).
+    # A missing block keeps the dataclass defaults; a present-but-blank one does
+    # too, via the ``or {}``.
+    rotation_raw = section.get("sort_rotation") or {}
+    sort_rotation = SortRotationConfig(
+        enabled=bool(rotation_raw.get("enabled", True)),
+        cap=int(rotation_raw.get("cap", DEFAULT_ROTATION_CAP)),
+    )
 
     weather_raw = section.get("weather", {})
     weather = WeatherConfig(
@@ -536,6 +578,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         quarantine_dir_name=quarantine_dir_name,
         tier_defaults=tier_defaults,
         feed=_load_feed_config(raw),
+        sort_rotation=sort_rotation,
         # Drip campaigns (#44b). Built from the top-level ``drip:`` block by
         # drip's own loader, so the brief and ``alfred drip`` read one config
         # surface rather than two parsers that can disagree. Absent block ⇒ no

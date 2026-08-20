@@ -6,7 +6,7 @@ import { Deck, DECK_COLUMN_MIN_PX } from '../components/feed/Deck';
 import { authApi } from '../lib/algernon/authClient';
 import Link from 'next/link';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { arrivedVerbless, isDeckDealt } from '../lib/algernon/feedConstants';
+import { arrivedVerbless, isDeckCandidate, isDeckDealt } from '../lib/algernon/feedConstants';
 import { readDeckSnoozed, writeDeckSnoozed } from '../lib/algernon/deckSnooze';
 import { ApiError } from '../lib/algernon/http';
 import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
@@ -23,8 +23,10 @@ const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 const readSnoozed = readDeckSnoozed;
 const writeSnoozed = writeDeckSnoozed;
 
-// The Decide deck: open decide-mode feed items as swipeable cards. Auth-gated
-// like the brief page (signed-out → /login?next=/deck).
+// The deck: open DECK CANDIDATES as swipeable cards — decide-mode decisions
+// plus quiet suggestion cards (isDeckCandidate; the affirm-with-hold-modifier
+// kinds are fyi/fyi so they deal here without ringing). Auth-gated like the
+// brief page (signed-out → /login?next=/deck).
 export default function DeckPage() {
   const router = useRouter();
   const { user, loading: sessionLoading } = useSession();
@@ -44,7 +46,14 @@ export default function DeckPage() {
   // one loader — the shape `pages/feed.tsx` and `pages/index.tsx` already use.
   const loadDeck = useCallback(async () => {
     try {
-      const res = await feedApi.list({ state: 'open', mode: 'decide' });
+      // ALL open items, narrowed client-side by `isDeckCandidate` below. This
+      // WAS `mode: 'decide'` server-side — which was exactly the wall that
+      // kept a quiet (fyi/fyi) suggestion card produced, served, verb-carrying
+      // and rendered nowhere: the mode filter dropped it before any predicate
+      // could deal it. The candidate question is richer than one field
+      // (decide-mode OR a served suggestion group), so it is asked where the
+      // served actions are visible.
+      const res = await feedApi.list({ state: 'open' });
       const snoozed = readSnoozed();
       setItems(res.items.filter((it) => !snoozed.has(it.id)));
     } catch (e) {
@@ -93,17 +102,25 @@ export default function DeckPage() {
     router.replace('/login');
   }, [router]);
 
-  // The deck deals only isDeckDealt items — classic decisions + SUGGESTED slots (C2).
-  // A non-deck-dealt decide item (a PLANNED slot — committed, awaiting its ✓) is a
-  // worklist item, not a deck card; it lives on the Feed / rings. Filter client-side;
-  // the API contract is untouched.
-  const actionable = useMemo(
-    () => (items ?? []).filter(isDeckDealt),
+  // THE CANDIDATE POPULATION (one predicate, shared with the feed link and the
+  // home pill so the counts cannot disagree): decide-mode decisions + quiet
+  // suggestion cards (affirm-with-hold-modifier — fyi/fyi, so they deal here
+  // without ever ringing the phone). Glance FYI rows are not candidates and
+  // never reach either list below.
+  const candidates = useMemo(
+    () => (items ?? []).filter(isDeckCandidate),
     [items],
   );
-  // The non-dealt items, SPLIT BY CAUSE — because the two causes are opposite
-  // and need opposite copy. This list is decide-mode only (see the fetch), so
-  // there are exactly two ways to be here:
+  // The deck deals only isDeckDealt candidates — classic decisions + SUGGESTED
+  // slots (C2) + suggestion cards. A non-deck-dealt decide item (a PLANNED slot
+  // — committed, awaiting its ✓) is a worklist item, not a deck card; it lives
+  // on the Feed / rings. Filter client-side; the API contract is untouched.
+  const actionable = useMemo(
+    () => candidates.filter(isDeckDealt),
+    [candidates],
+  );
+  // The non-dealt candidates, SPLIT BY CAUSE — because the two causes are
+  // opposite and need opposite copy. Two ways to be here:
   //   worklist — a committed slot, carrying board verbs but no swipe verb. This
   //              is the system working; the Feed really can action it.
   //   verbless — nothing arrived at all. A fault upstream (a half-deployed box,
@@ -113,8 +130,8 @@ export default function DeckPage() {
   // ILB: absence has to be legible as deliberate vs broken, and "N on your
   // worklist" is precisely the deliberate-sounding sentence.
   const notDealt = useMemo(
-    () => (items ?? []).filter((it) => !isDeckDealt(it)),
-    [items],
+    () => candidates.filter((it) => !isDeckDealt(it)),
+    [candidates],
   );
   const verblessCount = useMemo(() => notDealt.filter(arrivedVerbless).length, [notDealt]);
   const worklistCount = notDealt.length - verblessCount;
