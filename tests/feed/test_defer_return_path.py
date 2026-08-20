@@ -182,8 +182,19 @@ def verify_declaration(kind: str, module_path: str) -> str | None:
             return f"{kind!r} is not reconciled in {module_path} (found {sorted(found)})"
         return None
     if module_path == "alfred.brief.daemon":
-        if kind not in _brief_section_kinds():
-            return f"{kind!r} is not a brief section feed_kind"
+        # TWO shapes of brief reconciler: the section loop (feed_kind=
+        # literals at SectionResult construction) and a direct
+        # ``try_feed_reconcile`` call (the sort rotation), whose kind argument
+        # the AST reader resolves through the module namespace — which is why
+        # ``KIND_SORT_SUGGESTION`` is a MODULE-LEVEL import in the daemon.
+        from alfred.brief import daemon as brief_daemon
+
+        found, _unresolved = _reconciled_kinds_by_ast(brief_daemon)
+        if kind not in (_brief_section_kinds() | found):
+            return (
+                f"{kind!r} is neither a brief section feed_kind nor a kind "
+                f"the brief daemon reconciles directly (found {sorted(found)})"
+            )
         return None
     return (
         f"no verifier for {module_path!r} — write one so the declaration for "

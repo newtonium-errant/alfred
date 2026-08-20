@@ -353,6 +353,47 @@
         "label": "7 days",
         "weight": "light"
       }
+    ],
+    "sort_suggestion": [
+      {
+        "verb": "sort_duty",
+        "label": "Duty",
+        "weight": "light",
+        "group": "slot"
+      },
+      {
+        "verb": "sort_rhythm",
+        "label": "Rhythm",
+        "weight": "light",
+        "group": "slot"
+      },
+      {
+        "verb": "sort_fuel",
+        "label": "Fuel",
+        "weight": "light",
+        "group": "slot"
+      },
+      {
+        "verb": "defer",
+        "label": "Not now",
+        "weight": "light",
+        "gesture": "reject"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
     ]
   }
 }
