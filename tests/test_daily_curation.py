@@ -60,6 +60,9 @@ def test_t1_t2_sources_pinned() -> None:
         "auto-escalate",
         "auto-due-routine",
         "auto-surface-routine",
+        # FUEL-ESCALATION (2026-08-20): neglect-gap escalation into Duty.
+        # A confirmed gap-escalated T1 persists this source verbatim.
+        "auto-gap-escalated",
         "operator",
         "rollover",
     })

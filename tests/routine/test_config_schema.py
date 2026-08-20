@@ -321,3 +321,54 @@ def test_routine_config_tier_defaults_default_empty() -> None:
     })
     assert cfg.tier_defaults.escalate_at_days is None
     assert cfg.tier_defaults.surface_at_days is None
+
+# ---------------------------------------------------------------------------
+# FUEL-ESCALATION (2026-08-20) — escalate_after_gap_days parse +
+# fuel_escalate_after_gap_days config default
+# ---------------------------------------------------------------------------
+
+
+def test_item_from_dict_parses_escalate_after_gap_days() -> None:
+    item = Item.from_dict({
+        "text": "Walk Fergus",
+        "priority": "aspirational",
+        "slot": "fuel",
+        "target_cadence_days": 1,
+        "escalate_after_gap_days": 3,
+    })
+    assert item is not None
+    assert item.escalate_after_gap_days == 3
+
+
+def test_item_from_dict_escalate_after_gap_days_defaults_none() -> None:
+    """Absent field → None (backward-compat: existing records unchanged)."""
+    item = Item.from_dict({"text": "X", "priority": "tracked"})
+    assert item is not None
+    assert item.escalate_after_gap_days is None
+
+
+def test_item_from_dict_escalate_after_gap_days_coerces_and_drops() -> None:
+    coerced = Item.from_dict({"text": "X", "escalate_after_gap_days": "3"})
+    assert coerced is not None and coerced.escalate_after_gap_days == 3
+    malformed = Item.from_dict({"text": "X", "escalate_after_gap_days": "abc"})
+    assert malformed is not None and malformed.escalate_after_gap_days is None
+
+
+def test_tier_defaults_fuel_gap_absent_is_none() -> None:
+    """The other-instance guarantee at the parse layer: absent key → None
+    → no default anywhere downstream."""
+    td = TierDefaultsConfig.from_raw({"escalate_at_days": 3})
+    assert td.fuel_escalate_after_gap_days is None
+    assert TierDefaultsConfig.from_raw(None).fuel_escalate_after_gap_days is None
+
+
+def test_tier_defaults_fuel_gap_parses_coerces_drops() -> None:
+    assert TierDefaultsConfig.from_raw(
+        {"fuel_escalate_after_gap_days": 3},
+    ).fuel_escalate_after_gap_days == 3
+    assert TierDefaultsConfig.from_raw(
+        {"fuel_escalate_after_gap_days": "3"},
+    ).fuel_escalate_after_gap_days == 3
+    assert TierDefaultsConfig.from_raw(
+        {"fuel_escalate_after_gap_days": "abc"},
+    ).fuel_escalate_after_gap_days is None
