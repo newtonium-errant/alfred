@@ -501,6 +501,10 @@ def test_snooze_ceiling_admits_exactly_the_ratified_verbs() -> None:
         "done", "undo_done", "accept", "snooze_1d", "snooze_3d", "snooze_7d",
         "snooze_until_i_say", "unsnooze",
         "sort_duty", "sort_rhythm", "sort_fuel",
+        # Backdated completion rungs (2026-08-20) — the when-family behind the
+        # board ✓ hold; deliberate widening, updated in lockstep per the
+        # contract-pin rule.
+        "done_1d", "done_2d", "done_3d",
     }
 
 

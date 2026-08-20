@@ -456,6 +456,18 @@ def slot_suggestion_feed_items(
                 "routine_record": getattr(entry, "routine_record", None),
                 "item_text": getattr(entry, "item_text", None),
                 "done": done,
+                # Backdated completion (2026-08-20): how many days back a
+                # "previously done" completion may honestly reach — computed
+                # by the tier layer from the item's own recurrence state
+                # (AutoT1Candidate.backdate_limit_days), NEVER re-derived
+                # here. ALWAYS PRESENT (0 = no admissible backdate: task/tier
+                # lanes, cadence items, mid-window, paid cycle) per the
+                # ILB data-shape rule — an absent field cannot be told apart
+                # from a producer that predates the feature. The serve side
+                # (``actions_for_item``) filters the ``done_Nd`` rungs by it;
+                # evidence-only, the brief render never reads it, so
+                # byte-parity holds (the ``done``/``confirmed`` precedent).
+                "backdate_limit_days": getattr(entry, "backdate_limit_days", 0) or 0,
             },
             source_ref=dict(_SOURCE_REF),
         ))

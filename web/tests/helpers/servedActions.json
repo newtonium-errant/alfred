@@ -226,8 +226,27 @@
     "slot_suggestion": [
       {
         "verb": "done",
-        "label": "done",
-        "weight": "light"
+        "label": "Today",
+        "weight": "light",
+        "group": "when"
+      },
+      {
+        "verb": "done_1d",
+        "label": "Yesterday",
+        "weight": "light",
+        "group": "when"
+      },
+      {
+        "verb": "done_2d",
+        "label": "2 days ago",
+        "weight": "light",
+        "group": "when"
+      },
+      {
+        "verb": "done_3d",
+        "label": "3 days ago",
+        "weight": "light",
+        "group": "when"
       },
       {
         "verb": "undo_done",
