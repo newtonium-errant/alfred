@@ -1,6 +1,8 @@
 """Web voice STT shadow-capture — Increment 1 of the Groq-Whisper-hybrid arc.
 
-Mirrors the proven Telegram ``telegram/stt_shadow.py`` but for the WebRTC voice
+Modelled on the batch Telegram ``telegram/stt_shadow.py`` (RETIRED 2026-08-20,
+R2 — this streaming twin is the surviving shadow-capture and is unaffected: it
+never imported that module) but for the WebRTC voice
 path, and is SIMPLER on the Deepgram side: the Deepgram STREAMING final is
 already in hand (the served turn's text), so there is exactly ONE extra call —
 Groq batch on the fed PCM — per captured utterance. The audio + both transcripts
@@ -15,7 +17,8 @@ and returns. And per ``project_stt_test_series``: a bare ``create_task`` is held
 only by a weak ref and can be GC'd mid-flight — every task is retained in the
 module-level ``_SHADOW_TASKS`` set with a discard-in-done-callback.
 
-Corpus contract (matches ``stt_replay.py`` + ``telegram/stt_shadow`` records):
+Corpus contract (matches ``stt_replay.py`` records; the retired
+``telegram/stt_shadow`` wrote the same shape, so old corpora stay readable):
 ``corpus.jsonl`` lines carry ``audio_file`` (replay input), the literal ``groq``
 / ``deepgram`` result slots, and ``divergence`` (computed via the byte-identical
 :func:`divergence` copied from the harness). Web-specific additions:
@@ -62,13 +65,16 @@ _SHADOW_TASKS: set[asyncio.Task] = set()
 
 # ---------------------------------------------------------------------------
 # Divergence metric — copied byte-identically from the replay harness
-# (aftermath-honeydew-review/teams/honeydew-review/stt_replay.py) via
-# telegram/stt_shadow.py, so the live-captured number == the replay number.
+# (aftermath-honeydew-review/teams/honeydew-review/stt_replay.py), so the
+# live-captured number == the replay number. (It arrived here via the batch
+# telegram/stt_shadow.py, which was RETIRED 2026-08-20 — R2, operator ruling
+# "agreed retire". This module is unaffected: it never imported that one.)
 #
 # KEEP IN SYNC with stt_replay.py:divergence (vendored copy — no shared source
-# until the harness is repo-vendored). If the harness formula changes, update
-# _norm/_edit_distance/divergence here AND in telegram/stt_shadow.py, else the
-# live divergence silently stops matching the replay-computed one.
+# until the harness is repo-vendored). The vendored family is now TWO, not
+# three: the harness and THIS file. If the harness formula changes, update
+# _norm/_edit_distance/divergence here, else the live divergence silently
+# stops matching the replay-computed one.
 # ---------------------------------------------------------------------------
 
 
