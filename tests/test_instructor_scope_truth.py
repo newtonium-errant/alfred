@@ -99,25 +99,85 @@ def test_instructor_create_and_move_also_omit_scope() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_predispatch_gate_is_live_and_denies_delete() -> None:
-    """The one scope check that DOES fire on the instructor path.
+def test_predispatch_gate_cannot_deny_any_reachable_op() -> None:
+    """THE GATE IS DEFENCE-IN-DEPTH, NOT A LIVE CONTROL — pinned so that
+    stops being silently true.
 
-    This is why the ``scope="instructor"`` label on the mutation-log row
-    is not a claim about a gate that never ran: an op-level gate really
-    does run. Asserting the REASON, not just the refusal — a bare
-    ``pytest.raises(ScopeError)`` would pass against a build whose gate
-    denied for some unrelated cause.
+    ``_TOOL_TO_OP`` is the complete set of ops a directive can reach, and
+    every one of them is ``True`` for instructor, so ``check_scope`` can
+    refuse nothing on this path today. Measured: neutering the gate reds
+    0 of these 55 pins and 0 of 1168 across all instructor-touching test
+    files — live, unpinned code.
+
+    This pin is the tripwire. Map a denied op into ``_TOOL_TO_OP`` (or
+    flip any reachable op to False) and it goes red, at which point the
+    executor module docstring's "cannot currently deny anything"
+    paragraph must be rewritten.
+
+    The CONTROL is the ``delete`` half: the scope entry really does carry
+    a False, so this test is asserting an all-True *reachable* set rather
+    than an all-True dict — without it the pin would pass on a scope
+    whose every key was True.
     """
-    with pytest.raises(scope.ScopeError) as exc:
-        scope.check_scope("instructor", "delete", rel_path="task/x.md", record_type="task")
-    msg = str(exc.value)
-    assert "delete" in msg and "instructor" in msg, (
-        f"refusal did not name the op and scope: {msg!r}"
+    from alfred.instructor.executor import _TOOL_TO_OP
+
+    rules = scope.SCOPE_RULES["instructor"]
+    reachable = sorted(set(_TOOL_TO_OP.values()))
+    denied_but_reachable = [op for op in reachable if rules.get(op) is not True]
+    assert not denied_but_reachable, (
+        f"these reachable ops are no longer all-allow: {denied_but_reachable}. "
+        "The pre-dispatch gate can now refuse something — rewrite the "
+        "'cannot currently deny anything' paragraph in executor.py's "
+        "module docstring, which this pin exists to keep honest."
+    )
+    # CONTROL — the scope entry is not vacuously all-True.
+    assert rules.get("delete") is False, "instructor scope no longer denies delete"
+    assert "delete" not in reachable, (
+        "'delete' became reachable via _TOOL_TO_OP — the gate now has "
+        "something to refuse, and the docstring is stale."
     )
 
-    # POSITIVE CONTROL — the gate is not a blanket deny.
-    scope.check_scope("instructor", "edit", rel_path="task/x.md", record_type="task")
-    scope.check_scope("instructor", "create", rel_path="task/x.md", record_type="task")
+
+def test_vault_delete_is_refused_by_the_tool_lookup_not_the_scope_gate() -> None:
+    """ROUTE-LEVEL pin — drives ``_dispatch_tool`` rather than calling the
+    predicate inline.
+
+    The earlier version of this pin called
+    ``check_scope("instructor","delete")`` directly, saw it raise, and
+    concluded the gate protects the delete path. It does not: there is no
+    ``vault_delete`` key in ``_TOOL_TO_OP``, so the tool LOOKUP refuses
+    first and the gate is never consulted. Calling a predicate inline and
+    inferring route behaviour is the same mistake this lane fixed twice
+    elsewhere (the skill_audit discriminator, and its own rider) — pinned
+    at the route so it cannot recur here.
+
+    Positive control in the same test: a MAPPED tool executes past the
+    lookup, proving the probe reaches the dispatch body at all.
+    """
+    import json
+
+    from alfred.instructor.executor import _dispatch_tool
+
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        (vault / "task").mkdir(parents=True)
+        (vault / "task" / "x.md").write_text(
+            "---\ntype: task\nname: X\n---\n\nbody\n", encoding="utf-8")
+
+        refused = json.loads(_dispatch_tool(
+            "vault_delete", {"path": "task/x.md"}, vault, False, None, []))
+        assert refused.get("error", "").startswith("Unknown tool"), (
+            f"expected the LOOKUP to refuse vault_delete, got {refused!r}"
+        )
+        # The file is untouched — the refusal is real, not cosmetic.
+        assert (vault / "task" / "x.md").exists()
+
+        # POSITIVE CONTROL — a mapped tool runs the dispatch body.
+        ok = json.loads(_dispatch_tool(
+            "vault_read", {"path": "task/x.md"}, vault, False, None, []))
+        assert "frontmatter" in ok, (
+            f"CONTROL FAILED: vault_read did not execute: {ok!r}"
+        )
 
 
 def test_vault_edit_tool_schema_has_no_type_so_predispatch_type_is_always_blank() -> None:
@@ -150,8 +210,13 @@ def test_vault_edit_tool_schema_has_no_type_so_predispatch_type_is_always_blank(
 
 def test_daemon_call_site_does_not_pass_session_path() -> None:
     """GAP PIN — the sole production caller omits ``session_path``, so
-    every ``log_mutation`` in ``_execute_tool`` is a no-op and instructor
+    every ``log_mutation`` in ``_dispatch_tool`` is a no-op and instructor
     mutations are ABSENT from the trail.
+
+    "Sole caller" is exact: ``instructor/cli.py::cmd_run`` imports
+    ``daemon.run`` as ``run_daemon`` and calls it, and that function
+    contains the one ``execute_and_record`` call — so the CLI-foreground
+    path funnels through the same site rather than being a second one.
 
     Control: the parameter exists and defaults to None (so the omission
     is meaningful rather than a misspelling), and the detector finds the
@@ -247,6 +312,19 @@ def _edit(rtype: str, sc: str | None, extra_fm: str = "", **kwargs):
 
 
 # The deny-set members that a directive could plausibly be parked on.
+#
+# DELIBERATE SUBSET, named as such: _BODY_MUTATE_DENIED_TYPES has 13
+# members and the refusal applies to both body_replace and body_insert_at,
+# so the full matrix is 13 x 2 = 26 combinations. DIRECTION-1 below drives
+# body_replace across these 5 (plus one body_insert_at row in the earlier
+# enumeration), i.e. a sampled 5 of 26 — chosen as the shapes an operator
+# would plausibly park a directive on (a transcript, a learning atom, an
+# operator-canonical commitment, a rendered-body record). The remaining
+# combinations are covered by the same single code path
+# (``_check_body_mutation_allowed``'s membership test, whose input is the
+# frozenset pinned in the premise test below), so this is UNDER-PINNING BY
+# CHOICE, not a claim that only 5 are refused. Widen here if that path
+# ever grows a per-type branch.
 _DENIED = ["session", "conversation", "decision", "preference", "routine"]
 
 
@@ -307,10 +385,11 @@ def test_threading_scope_would_still_allow_every_skill_advertised_surface(
     safe, and the half a one-directional battery would miss.
 
     ``vault-instructor/SKILL.md`` advertises vault_edit as
-    ``{path, set_fields?, append_fields?, body_append?}``. All three
-    stay ALLOWED under ``scope="instructor"`` on every type probed,
-    INCLUDING the body-mutate-denied ones — so threading refuses nothing
-    the SKILL instructs the instructor to do.
+    ``{path, set_fields?, append_fields?, body_append?}``. All three stay
+    ALLOWED under ``scope="instructor"``, INCLUDING on the body-mutate-
+    denied types — so threading refuses nothing the SKILL instructs the
+    instructor to do. Coverage of THIS pin, stated exactly: 8 types x 3
+    surfaces = 24 rows (5 deny-set members + note/project/task).
 
     THAT IS NOT THE WHOLE RISK, and the difference is why the threading
     proposal stops for an operator ruling instead of shipping here: the

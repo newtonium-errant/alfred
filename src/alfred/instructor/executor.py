@@ -14,8 +14,28 @@ The executor:
    narrow tool surface (``vault_read``, ``vault_edit``, ``vault_create``,
    ``vault_move``, ``vault_list``, ``vault_search``, ``vault_context``).
    Each tool call is gated through ``check_scope("instructor", ...)``
-   in ``_execute_tool`` before dispatch, so even a jailbreak attempt
-   can't request a denied OP (``delete`` is refused there — driven).
+   in ``_dispatch_tool`` before dispatch.
+
+   THAT GATE CANNOT CURRENTLY DENY ANYTHING — it is DEFENCE-IN-DEPTH
+   for a future tool mapping, not a live control. Driven at the ROUTE
+   (not by calling the predicate inline, which is what produced the
+   earlier wrong claim here): ``_TOOL_TO_OP`` maps exactly seven tools
+   to read / search / list / context / create / edit / move, and ALL
+   SEVEN are ``True`` in ``SCOPE_RULES["instructor"]``, so no reachable
+   op can be refused. ``delete`` IS ``False`` in that scope entry, but
+   it is UNREACHABLE: there is no ``vault_delete`` key in
+   ``_TOOL_TO_OP``, so ``_dispatch_tool("vault_delete", ...)`` returns
+   ``{"error": "Unknown tool: vault_delete"}`` from the LOOKUP above,
+   before the gate is ever consulted. A jailbreak asking for deletion
+   is stopped by the tool surface, NOT by the scope gate — attributing
+   it to the gate misplaces the protection.
+
+   Measured: neutering this gate entirely reds NOTHING — 0 of the 55
+   pins in ``tests/test_instructor_scope_truth.py``, and 1168 passed /
+   0 failed across every instructor-touching test file. It is live but
+   unpinned code, which is exactly why the two pins named below exist:
+   the day someone maps a denied op into ``_TOOL_TO_OP``, the all-allow
+   pin turns red and this paragraph stops being true.
 
    SCOPE OF THAT GATE — it is an OP-LEVEL gate only. The pre-dispatch
    call is the ONLY ``check_scope`` on this path: ``ops.vault_edit`` /
@@ -68,12 +88,14 @@ The executor:
 
 Mutation logging — READ THIS BEFORE TRUSTING THE AUDIT TRAIL.
 
-``_execute_tool`` calls ``mutation_log.log_mutation(session_path, ...,
+``_dispatch_tool`` calls ``mutation_log.log_mutation(session_path, ...,
 scope="instructor")`` after every create / edit / move. Those calls are
 INERT ON THE PRODUCTION PATH: ``log_mutation`` returns immediately when
 ``session_path`` is falsy, ``session_path`` defaults to ``None`` on both
 ``execute`` and ``execute_and_record``, and the daemon's only call site
-(``daemon.py``, the sole caller in ``src/``) does not pass it. So a
+(``daemon.py``, the sole caller in ``src/``; ``instructor/cli.py::cmd_run``
+delegates to the same ``run_daemon``, so the CLI-foreground path goes
+through that one site too) does not pass it. So a
 daemon-executed directive writes NO mutation-log row at all — instructor
 vault mutations are absent from the trail rather than mislabelled in it.
 Tests that pass ``session_path`` explicitly DO produce rows, which is why
@@ -383,9 +405,13 @@ def _dispatch_tool(
     body_write = bool(body) or bool(body_append)
 
     # ---- Scope gate — OP-LEVEL, and the ONLY check_scope on this path.
-    # Instructor has broad access, but gating each op means a future
-    # scope tightening can't silently grant something the SKILL relies
-    # on. This DOES fire (``delete`` denies here).
+    # It RUNS on every dispatch but CANNOT CURRENTLY REFUSE ANYTHING:
+    # every op ``_TOOL_TO_OP`` can produce is True for instructor. It is
+    # defence-in-depth for a future tool mapping, so that adding a
+    # denied op to the map cannot silently grant it. Do NOT read the
+    # ``delete: False`` in the scope entry as protection for this path —
+    # ``vault_delete`` is refused by the ``_TOOL_TO_OP`` lookup ABOVE
+    # (``Unknown tool``), before this gate is reached.
     #
     # What it does NOT reach, because ``ops.vault_*`` below are called
     # without ``scope=`` and every in-ops check sits behind ``if scope is
