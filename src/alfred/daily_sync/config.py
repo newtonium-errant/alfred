@@ -570,6 +570,21 @@ class DailySyncConfig:
     # commit 420364b — same bug class, two more sites.
     config_path: str | None = None
 
+    # The MOC suggestion queue this instance's surveyor enqueues into, resolved
+    # ONCE at load time from the ``surveyor:`` block (see
+    # ``surveyor.config.resolve_moc_queue_path``). Empty string = this config
+    # has no ``surveyor:`` block, so no queue exists to write back to.
+    #
+    # A DECLARED FIELD, which is the fix rather than a detail of it. The act
+    # router used to reach for ``getattr(config, "surveyor", None)`` on this
+    # dataclass, which never had a ``surveyor`` field — the lookup could not
+    # raise, so it returned ``None`` for every config forever and the ledger
+    # write-back was dead on every instance. Being declared here means the
+    # brief's reader and this router resolve through ONE call on the SAME raw
+    # dict; being read as an attribute (not via ``getattr`` with a default)
+    # means a rename fails loudly instead of degrading to a plausible silence.
+    moc_queue_path: str = ""
+
 
 _DATACLASS_MAP: dict[str, type] = {
     "schedule": ScheduleConfig,
@@ -784,6 +799,17 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
     ):
         if not _explicit("capture_close", _field):
             setattr(cfg.capture_close, _field, instance_data_path(raw, _stem))
+
+    # THE write-side resolution point for the MOC queue, exactly once, through
+    # the surveyor's own helper — the same call the brief's loader makes on the
+    # same raw dict, so the side that DEALS a card and the side that flips its
+    # ledger row to ``applied`` cannot land on different files. Stamped
+    # unconditionally, OUTSIDE the ``if not section`` branch above: an instance
+    # with no ``daily_sync:`` block still serves ``POST /feed/act`` (the route
+    # loads this config regardless), so gating it on that block would leave the
+    # ledger write dead on exactly the instances the feature runs on.
+    from alfred.surveyor.config import resolve_moc_queue_path
+    cfg.moc_queue_path = str(resolve_moc_queue_path(raw) or "")
     return cfg
 
 

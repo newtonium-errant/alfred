@@ -77,6 +77,39 @@ def derive_default_queue_path(state_path: str | Path) -> Path:
     return parent / "moc_suggestions.jsonl"
 
 
+def derive_queue_path(
+    *, explicit: str | None, state_path: str | Path | None,
+) -> Path | None:
+    """THE derivation of the queue file, for every side that touches it.
+
+    NAMED ``derive_*`` rather than ``resolve_queue_path`` deliberately:
+    ``alfred.telegram.voice_train`` already exports a ``resolve_queue_path``
+    for an unrelated queue (voice-training extractions), and ``alfred.cli``
+    imports THAT one unqualified. Two functions with one name about two
+    different queues would make every future grep for it a referent question
+    and would let an unqualified import of one shadow the other.
+
+    Three sides read this queue and they must land on ONE file: the surveyor
+    daemon that ENQUEUES (Stage 8), the brief that DEALS the cards, and the act
+    router that FLIPS a row to ``applied``. Each of those used to spell the
+    same two-branch rule itself, which is how the read and write sides can
+    resolve differently without anything going red — a suggestion written where
+    nothing reads it, or a vault write whose ledger update lands in another
+    file.
+
+    The rule: an explicit ``moc_suggestion.queue_path`` wins; otherwise the
+    queue is the state file's sibling. ``None`` ONLY when there is no state
+    path to derive from, which for a real config means no ``surveyor:`` block
+    at all — see :func:`alfred.surveyor.config.resolve_moc_queue_path`, which
+    applies the surveyor's own defaults before calling this.
+    """
+    if explicit:
+        return Path(str(explicit))
+    if state_path:
+        return derive_default_queue_path(state_path)
+    return None
+
+
 def load_queue(queue_path: str | Path) -> list[MocSuggestion]:
     """Load + parse the full JSONL queue. Returns [] if file is
     missing (no proposals yet).
@@ -432,6 +465,7 @@ def _rewrite_locked(queue_path: Path, entries: list[MocSuggestion]) -> None:
 
 __all__ = [
     "derive_default_queue_path",
+    "derive_queue_path",
     "load_queue",
     "upsert_proposals",
     "update_status",

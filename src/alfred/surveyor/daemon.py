@@ -1380,16 +1380,29 @@ class Daemon:
             propose_moc_suggestions,
         )
         from .moc_suggestion_queue import (
-            derive_default_queue_path,
+            derive_queue_path,
             upsert_proposals,
         )
-        from pathlib import Path as _Path
 
-        # Resolve queue path — config override OR derived from state.
-        if cfg.queue_path:
-            queue_path = _Path(cfg.queue_path)
-        else:
-            queue_path = derive_default_queue_path(self.cfg.state.path)
+        # Resolve queue path — config override OR derived from state. THE
+        # shared derivation, not a local spelling of it: the brief's reader and
+        # the act router's ledger write resolve through the same function (via
+        # ``config.resolve_moc_queue_path``), so the file this stage writes is
+        # the file they read by construction rather than by three functions
+        # happening to agree.
+        #
+        # ``state.path`` carries a dataclass default, so this resolves for
+        # every config an operator is likely to write. It is NOT a guarantee:
+        # an explicitly blanked ``surveyor.state.path`` yields ``None`` here,
+        # and the ``upsert_proposals`` call below is inside this stage's
+        # try/except, so that lands as a logged stage failure rather than a
+        # crash. The predecessor of this line silently wrote the queue to a
+        # CWD-relative file in that case, which on a box where every instance
+        # shares one working directory is one queue for all of them — failing
+        # is the better of the two.
+        queue_path = derive_queue_path(
+            explicit=cfg.queue_path, state_path=self.cfg.state.path,
+        )
 
         # Build the MOC index ONCE per sweep (vault read).
         # ``build_existing_mocs_index`` returns ``(index, moc_dir_exists)``.

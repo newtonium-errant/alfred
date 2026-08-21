@@ -513,11 +513,32 @@ def _emit_moc_suggestions(config: BriefConfig, store, *, instance: str) -> None:
 
     queue_path = _moc_queue_path_for(config)
     if queue_path is None:
+        # ILB, WITH A REASON THAT IS ACTUALLY TRUE — and the distinction is the
+        # point. The predecessor of this line fired on every instance saying
+        # "queue path unresolved in this config", which reads as a healthy
+        # opt-out ("this instance just isn't set up for MOCs") and is
+        # indistinguishable from the resolver being broken. It WAS broken, and
+        # the idle signal is what made the silence believable for as long as it
+        # lasted. A positive idle signal separates idle from broken only while
+        # the reason it gives is true.
+        #
+        # What makes this one true: ``moc_queue_path`` is empty for exactly one
+        # reason — the loader found no ``surveyor:`` block. A block that is
+        # present always resolves, because ``StateConfig.path`` carries a
+        # default (pinned in tests/brief/test_moc_queue_path_wiring.py), so
+        # there is no config shape that reaches this line while a queue exists.
+        # The claim is CHECKABLE rather than merely asserted: grep the
+        # instance's config for ``surveyor:``, which is what ``check`` names.
         log.info(
-            "brief.moc_suggestion_no_queue_path",
+            "brief.moc_suggestion_no_surveyor",
             instance=instance,
-            reason="surveyor state/queue path unresolved in this config — no "
-                   "MOC cards are dealt on this instance",
+            surveyor_configured=False,
+            check="grep '^surveyor:' on this instance's config",
+            reason="no surveyor: block in this instance's config, so nothing "
+                   "ever enqueues a MOC suggestion and there is no queue to "
+                   "read — NOT a queue that resolved and came back empty "
+                   "(that case reaches brief.moc_suggestion.queue_readout and "
+                   "names the file it read)",
         )
         return
 
@@ -566,26 +587,24 @@ def _emit_moc_suggestions(config: BriefConfig, store, *, instance: str) -> None:
     )
 
 
-def _moc_queue_path_for(config: BriefConfig):
-    """The queue path, derived from the surveyor's own config.
+def _moc_queue_path_for(config: BriefConfig) -> Path | None:
+    """The queue path this instance's surveyor enqueues into, or ``None``.
 
-    Mirrors the act router's ``_moc_queue_path`` deliberately — the read side
-    and the write side must resolve to ONE file. Both prefer the explicit
-    ``queue_path`` and fall back to the surveyor state path's sibling, which
-    is exactly what the surveyor daemon does when it enqueues.
+    Reads the DECLARED ``moc_queue_path`` field, which the brief's loader
+    stamps once via ``surveyor.config.resolve_moc_queue_path`` — the same call
+    the act router's loader makes on the same raw dict, so the side that deals
+    a card and the side that flips its ledger row cannot resolve differently.
+
+    THIS FUNCTION USED TO WALK ``getattr(config, "surveyor", None)`` and never
+    once returned a path in production. ``BriefConfig`` has no ``surveyor``
+    field and never had one, so the lookup could not raise: it manufactured
+    ``None`` for every config on every instance, ``_emit_moc_suggestions``
+    short-circuited before the producer was ever called, and the MOC reader
+    shipped dead. Reading a declared attribute is the fix — a rename or a
+    dropped field now fails loudly here instead of degrading into a permanent
+    and entirely plausible "not configured on this instance".
     """
-    from alfred.surveyor.moc_suggestion_queue import derive_default_queue_path
-
-    surveyor = getattr(config, "surveyor", None)
-    moc_cfg = getattr(surveyor, "moc_suggestion", None) if surveyor else None
-    explicit = getattr(moc_cfg, "queue_path", None) if moc_cfg else None
-    if explicit:
-        return Path(str(explicit))
-    state = getattr(surveyor, "state", None) if surveyor else None
-    state_path = getattr(state, "path", None) if state else None
-    if state_path:
-        return derive_default_queue_path(str(state_path))
-    return None
+    return Path(config.moc_queue_path) if config.moc_queue_path else None
 
 
 def _render_drip_body(config: BriefConfig, today_local: date) -> str | None:

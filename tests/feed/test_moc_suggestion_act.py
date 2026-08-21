@@ -20,6 +20,7 @@ from pathlib import Path
 
 import frontmatter
 import pytest
+import structlog
 
 from alfred.brief.feed_producer import moc_suggestion_feed_items
 from alfred.daily_sync.action_router import MOC_APPLY_ACTION, act
@@ -88,23 +89,58 @@ def _row(
 
 
 def _ds_config(tmp_path: Path, queue: Path):
-    """A config carrying the surveyor queue path, exactly as the act router's
-    ``_moc_queue_path`` reads it — the read and write sides must resolve to
-    one file, so the test supplies the real shape rather than a stub."""
-    from alfred.daily_sync.config import DailySyncConfig
+    """A config built by the PRODUCTION loader from a real unified dict.
 
-    cfg = DailySyncConfig(enabled=True, batch_size=5)
-    cfg.corpus.path = str(tmp_path / "corpus.jsonl")
-    cfg.state.path = str(tmp_path / "state.json")
+    THIS HELPER USED TO BUILD A STUB, and the stub is why the feature shipped
+    dead. It did:
 
-    class _MocCfg:
-        queue_path = str(queue)
+        cfg = DailySyncConfig(...)
+        class _Surveyor:
+            moc_suggestion = _MocCfg()   # carrying queue_path
+            state = None
+        cfg.surveyor = _Surveyor()
 
-    class _Surveyor:
-        moc_suggestion = _MocCfg()
-        state = None
+    ``DailySyncConfig`` is not frozen, so that assignment SUCCEEDED and glued
+    on a ``surveyor`` attribute the class never declares. The router's
+    ``getattr(config, "surveyor", None)`` then found it and resolved a path —
+    on a config shape production cannot produce. Every test in this file was
+    green while the router returned ``None`` for every real config on every
+    instance, and the vault-write-without-its-ledger-update bug six lines below
+    it was unreachable from here. A fixture that manufactures the one field
+    whose absence IS the defect cannot see the defect.
 
-    cfg.surveyor = _Surveyor()
+    Two things changed. The config now comes from ``load_from_unified`` on a
+    real unified dict, so it is the same object the transport builds for
+    ``POST /feed/act``; and the queue is reached through the FALLBACK branch
+    (``surveyor.state.path``'s sibling), which is the branch live configs
+    actually use — the old stub set an explicit ``queue_path``, so the branch
+    under test was the one that never fires in the field.
+    """
+    from alfred.daily_sync.config import load_from_unified
+
+    # Deliberately NO ``moc_suggestion.queue_path``: the queue is derived as
+    # the state file's sibling, which is how Hypatia is configured.
+    cfg = load_from_unified({
+        "vault": {"path": str(tmp_path / "vault")},
+        "telegram": {"instance": {"name": "Hypatia"}},
+        "logging": {"dir": str(tmp_path)},
+        "surveyor": {
+            "state": {"path": str(queue.parent / "surveyor_state.json")},
+            "moc_suggestion": {"enabled": True},
+        },
+        "daily_sync": {
+            "enabled": True,
+            "batch_size": 5,
+            "corpus": {"path": str(tmp_path / "corpus.jsonl")},
+            "state": {"path": str(tmp_path / "state.json")},
+        },
+    })
+    # Premise pin AT the fixture: the derivation must land on the very file
+    # these tests write their rows into. Asserting it here means a drift in
+    # the shared resolver fails as "the fixture no longer describes the
+    # queue" rather than as a puzzling refusal several frames downstream.
+    from alfred.daily_sync.action_router import _moc_queue_path
+    assert _moc_queue_path(cfg) == queue
     return cfg
 
 
@@ -845,3 +881,244 @@ def test_the_card_counts_each_non_applicable_class_by_its_own_name(
     assert card.evidence["ineligible_count"] == 1    # the note — TYPE only
     assert card.evidence["already_count"] == 1       # not folded into above
     assert card.evidence["unreadable_count"] == 1    # the moved-record signal
+
+
+# ---------------------------------------------------------------------------
+# THE WRITE ORDERING — a vault write must not outlive its ledger update
+# ---------------------------------------------------------------------------
+
+
+def _ds_config_without_surveyor(tmp_path: Path):
+    """The same production loader, on a config with NO ``surveyor:`` block.
+
+    This is the shape whose queue path cannot resolve. Built through
+    ``load_from_unified`` rather than by blanking a field, so the config is one
+    the loader can actually produce.
+    """
+    from alfred.daily_sync.config import load_from_unified
+
+    cfg = load_from_unified({
+        "vault": {"path": str(tmp_path / "vault")},
+        "telegram": {"instance": {"name": "Hypatia"}},
+        "logging": {"dir": str(tmp_path)},
+        "daily_sync": {"enabled": True, "batch_size": 5},
+    })
+    assert cfg.moc_queue_path == ""
+    return cfg
+
+
+def test_an_unresolvable_queue_refuses_BEFORE_the_vault_is_touched(
+    tmp_path: Path,
+) -> None:
+    """The data-integrity fix, pinned on the side that used to lose.
+
+    ``apply_membership`` ran SIX LINES ABOVE the queue-path resolution, so an
+    affirm on a config whose queue could not resolve wrote every member's
+    ``mocs:`` and then skipped the row flip — the record and its ledger
+    diverging, and the divergence announced by an INFO line that read as a
+    benign skip. A missing ledger row is worse than a wrong one: the row stays
+    ``pending`` and the card comes back proposing work already done.
+
+    The refusal is asserted BY ITS REASON, not merely by its falsity. A
+    ``moc_apply`` can refuse for causes that have nothing to do with the
+    queue — an unoffered target, a card with no members left — and all of them
+    produce the same ``ok=False`` and the same untouched vault. Only the
+    logged event distinguishes "the guard fired" from "something else said no
+    first", so a pin that checked the refusal alone would be green against a
+    build with no guard at all.
+    """
+    vault = _vault(tmp_path)
+    queue = tmp_path / "moc_suggestions.jsonl"
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    member = _member(vault, "On Duty")
+    _row(queue, suggestion_id="ms-1", target=target, members=[member])
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    card = _deal(vault, queue, store)[0]
+    assert card.evidence["suggestion_id"] == "ms-1"
+
+    before_member = (vault / member).read_text(encoding="utf-8")
+    before_moc = (vault / target).read_text(encoding="utf-8")
+    before_tree = sorted(p.relative_to(vault).as_posix() for p in vault.rglob("*"))
+
+    with structlog.testing.capture_logs() as captured:
+        res = _act(
+            store, _ds_config_without_surveyor(tmp_path),
+            card.id, MOC_APPLY_ACTION, vault, target=target,
+        )
+
+    assert res.ok is False
+
+    # WHY it refused — the guard, not some other gate that happened to answer.
+    refusals = [
+        c for c in captured if c.get("event") == "feed.act.moc.queue_unresolved"
+    ]
+    assert len(refusals) == 1
+    assert refusals[0]["suggestion_id"] == "ms-1"
+    assert "strand the row at pending" in refusals[0]["reason"]
+
+    # And it refused BEFORE the write: not "did it write the file" but "did it
+    # touch anything out there". Content AND tree membership.
+    assert (vault / member).read_text(encoding="utf-8") == before_member
+    assert (vault / target).read_text(encoding="utf-8") == before_moc
+    assert sorted(
+        p.relative_to(vault).as_posix() for p in vault.rglob("*")
+    ) == before_tree
+
+    # The ledger and the records still agree — which is the whole point.
+    assert [r.status for r in load_queue(queue)] == ["pending"]
+
+
+def test_a_resolvable_queue_applies_and_flips_the_row(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the refusal above, on the LIVE path.
+
+    Without this, the refusal pin passes identically against a build that
+    refuses every apply. Same card, same members, same call — the only
+    difference is a config whose ``surveyor:`` block resolves.
+    """
+    vault = _vault(tmp_path)
+    queue = tmp_path / "moc_suggestions.jsonl"
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    member = _member(vault, "On Duty")
+    _row(queue, suggestion_id="ms-1", target=target, members=[member])
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    card = _deal(vault, queue, store)[0]
+
+    res = _act(
+        store, _ds_config(tmp_path, queue),
+        card.id, MOC_APPLY_ACTION, vault, target=target,
+    )
+
+    assert res.ok is True
+    assert "Roman Philosophy MOC" in _mocs_of(vault, member)[0]
+    # The ledger moved WITH the record — the invariant the ordering protects.
+    assert [r.status for r in load_queue(queue)] == ["applied"]
+
+
+def test_a_card_without_a_suggestion_id_still_applies(tmp_path: Path) -> None:
+    """The refusal is scoped to cards that HAVE a ledger row to lose.
+
+    A card carrying no ``suggestion_id`` has nothing to flip, so an
+    unresolvable queue costs it nothing and it must proceed — otherwise the
+    integrity fix would become a blanket outage on any instance without a
+    surveyor block. Pinned so a future tightening of the guard cannot quietly
+    widen into that.
+    """
+    import dataclasses
+
+    vault = _vault(tmp_path)
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    member = _member(vault, "On Duty")
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+
+    queue = tmp_path / "moc_suggestions.jsonl"
+    _row(queue, suggestion_id="ms-1", target=target, members=[member])
+    # Build through the real producer, then strip the id the producer stamped
+    # BEFORE the card ever reaches the store — so the store holds exactly one
+    # event and the fold cannot be what makes this pass.
+    produced = moc_suggestion_feed_items(
+        vault, instance="hypatia", tracked={}, cap=3, queue_path=queue,
+    )
+    assert produced is not None and len(produced) == 1
+    stripped = dict(produced[0].evidence)
+    stripped.pop("suggestion_id")
+    card = dataclasses.replace(produced[0], evidence=stripped)
+    store.upsert(card)
+
+    with structlog.testing.capture_logs() as captured:
+        res = _act(
+            store, _ds_config_without_surveyor(tmp_path),
+            card.id, MOC_APPLY_ACTION, vault, target=target,
+        )
+
+    assert res.ok is True
+    assert "Roman Philosophy MOC" in _mocs_of(vault, member)[0]
+    assert not [
+        c for c in captured if c.get("event") == "feed.act.moc.queue_unresolved"
+    ]
+    skipped = [
+        c for c in captured
+        if c.get("event") == "feed.act.moc.queue_update_skipped"
+    ]
+    assert len(skipped) == 1
+    assert "no suggestion_id" in skipped[0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# END TO END — the surveyor's file, the brief's reader, the router's write
+# ---------------------------------------------------------------------------
+
+
+def test_the_brief_deals_from_the_file_the_surveyor_writes(tmp_path: Path) -> None:
+    """THE regression pin for "shipped but never executed".
+
+    Every other test in this file hands the producer a ``queue_path``
+    directly, which is exactly the shape that stayed green while the brief's
+    caller returned before ever calling it. This one drives
+    ``_emit_moc_suggestions`` — the production entry point — with a
+    ``BriefConfig`` built by the production loader from ONE raw dict, and then
+    acts on the resulting card with a ``DailySyncConfig`` built by the OTHER
+    production loader from the SAME raw dict.
+
+    Nothing here is told where the queue is. The surveyor's ``state.path``
+    decides, both loaders derive it, and the assertion is that a row written
+    at the surveyor's location comes back as a card and its ledger flips. A
+    mirrored resolver bug fails this even though both sides agree with each
+    other, because the ROW is placed by the surveyor's own derivation.
+    """
+    from alfred.brief.config import load_from_unified as load_brief
+    from alfred.brief.daemon import _emit_moc_suggestions
+    from alfred.daily_sync.config import load_from_unified as load_ds
+    from alfred.surveyor.config import load_from_unified as load_surveyor
+    from alfred.surveyor.moc_suggestion_queue import derive_queue_path
+
+    vault = _vault(tmp_path)
+    target = _moc(vault, "Roman Philosophy MOC")
+    _moc(vault, "Stoicism MOC")
+    member = _member(vault, "On Duty")
+
+    raw = {
+        "vault": {"path": str(vault)},
+        "telegram": {"instance": {"name": "Hypatia"}},
+        "logging": {"dir": str(tmp_path)},
+        "brief": {"schedule": {"time": "06:00"}},
+        "daily_sync": {"enabled": True},
+        "surveyor": {
+            "state": {"path": str(tmp_path / "hypatia-data" / "surveyor_state.json")},
+            "moc_suggestion": {"enabled": True},
+        },
+    }
+
+    # Where the SURVEYOR would enqueue, derived from the surveyor's own typed
+    # config — not from either consumer's view of it.
+    sv = load_surveyor(raw)
+    queue = derive_queue_path(
+        explicit=sv.moc_suggestion.queue_path, state_path=sv.state.path,
+    )
+    queue.parent.mkdir(parents=True, exist_ok=True)
+    _row(queue, suggestion_id="ms-1", target=target, members=[member])
+
+    store = FeedStore(str(tmp_path / "feed.jsonl"))
+    with structlog.testing.capture_logs() as captured:
+        _emit_moc_suggestions(load_brief(raw), store, instance="hypatia")
+
+    # The producer RAN — the readout names the file it consulted, which is the
+    # observation that was missing for the whole time this was dead.
+    readouts = [
+        c for c in captured
+        if c.get("event") == "brief.moc_suggestion.queue_readout"
+    ]
+    assert len(readouts) == 1
+    assert readouts[0]["queue_path"] == str(queue)
+    assert readouts[0]["queue_exists"] is True
+    assert readouts[0]["actionable"] == 1
+
+    cards = [i for i in store.load().values() if i.kind == "moc_suggestion"]
+    assert len(cards) == 1
+
+    res = _act(store, load_ds(raw), cards[0].id, MOC_APPLY_ACTION, vault, target=target)
+    assert res.ok is True
+    assert "Roman Philosophy MOC" in _mocs_of(vault, member)[0]
+    assert [r.status for r in load_queue(queue)] == ["applied"]
