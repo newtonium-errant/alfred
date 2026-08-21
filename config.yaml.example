@@ -1075,8 +1075,33 @@ telegram:
     # chain (Whisper prompt= / Deepgram keywords) AND the live web/PWA Deepgram
     # stream (keyterm on nova-3 / keywords on nova-2 — clinic-capture Piece 2a).
     # Override PER INSTANCE — do NOT push instance-specific vocab into the shared
-    # default. A CLINIC instance (e.g. Hypatia) should seed its NON-PHI clinical
-    # + administrative vocab so dictated action items transcribe cleanly.
+    # default. Seed the stable proper nouns and domain terms THAT instance
+    # actually hears; the example below is practice-ADMINISTRATION vocab
+    # (agencies, benefit programs, software, medication BRAND names), all
+    # NON-PHI, so dictated action items transcribe cleanly.
+    #
+    # INSTANCE ATTRIBUTION (corrected 2026-08-21). This previously read "A CLINIC
+    # instance (e.g. Hypatia)". Hypatia is the scholar/scribe instance and does
+    # NOT do clinical work — ALL clinical work is STAY-C's
+    # (``config.stayc-clinical.yaml``, the ``stayc_clinical`` scope family). Do
+    # NOT "fix" this by re-pointing the example AT STAY-C either: STAY-C cannot
+    # carry this block at all — ``telegram`` is in ``EGRESS_CONFIG_SECTIONS`` and
+    # absent from the fail-closed ``SOVEREIGN_ALLOWED_SECTIONS``
+    # (``sovereign/boundary.py``), so a sovereign config carrying a ``telegram``
+    # block refuses at load.
+    #
+    # WHY THE SETTINGS NAMING HYPATIA STAY — read this before sweeping them. The
+    # ``- "Hypatia"`` entry below is the instance's own NAME (a proper noun the
+    # STT must transcribe); the PHI-egress guards elsewhere in this file that
+    # name Hypatia (``shadow_capture: enabled: false``) are DEFENCE-IN-DEPTH
+    # after a real 2026-07-08 incident — a patient-PHI clinic conversation
+    # transited Hypatia's cloud STT — NOT a claim that Hypatia does clinical
+    # work. They target REAL CROSSOVER (clinical WORK routed to a non-clinical
+    # instance; bulk or systematic PHI reaching a cloud surface). They are NOT a
+    # zero-tolerance scrub: an INCIDENTAL non-work mention during ordinary use is
+    # an ACCEPTED RESIDUAL at this stage of development. "All clinical work is
+    # STAY-C" describes intended WORKFLOW; guards exist for when workflow DRIFTS,
+    # which is what the incident was — so do not relax them on this correction.
     # NEVER seed patient names or any PHI — bias only stable non-PHI terms:
     #   vocab_terms:
     #     - "Hypatia"
