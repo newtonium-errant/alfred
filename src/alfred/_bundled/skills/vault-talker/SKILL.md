@@ -415,24 +415,31 @@ Window boundaries (verified against the module docstring):
 
 ##### Routine-origin render shapes the operator will see
 
-The brief's T1 bucket renders routine-origin entries inline with task-origin entries. Each routine-origin T1 line carries the item text, the formatted due date, the reason, and the originating routine record:
+The brief renders routine-origin entries inside their **ring**, inline with task-origin entries. Each routine-origin line carries the item text, a link to its owning routine record, the formatted due date, the reason, and the reply affordance.
+
+> **These two samples are DERIVED, not copied.** Every character was produced by running the real emitters: `_render_plan_row` (`brief/tier_section.py:774`, composing `_row_head` L707 + `_row_annotation` L725 + `_row_affordance` L753), the date form by `_format_due_date` (L446), the reason strings by `classify_routine_item` (`tier/compute.py:594` for `due tomorrow`, `tier/compute.py:611` for `surface window (Nd before due)`), and the ring by `slots.classify_slot` (`tier/slots.py:359`). If any of those change, **re-derive from the function** — never from a sample copied out of a docstring or another SKILL, which is exactly how these lines went stale before.
 
 > **Note on the `[[routine/Recurring Bills + Admin]]` references below**: this record is created by the Ship E migration (the operator-run step closing the Routine Phase 2A arc) and holds the four migrated items `Pay Clinic Rental to Hussein Rafih`, `Garbage Day`, `RRTS Invoicing`, `RRTS Payroll`. Pre-Ship-E it does NOT exist in the vault — the examples below describe the post-Ship-E render state. If the operator references one of these items pre-migration, consult before creating a new routine record (see the **DO NOT create one-shot `task` records for recurring items** call-out below for the operator-confirm protocol).
 
-```
-### T1 — Imminent deadlines (auto-surfaced — confirm or drop)
-- [ ] Garbage Day — due Fri May 29 (escalate window (1d before due), from [[routine/Recurring Bills + Admin]])  *(confirm? reply "T1 confirm")*
-```
-
-The brief's T2 bucket has a **new dedicated subsection** for routine-origin auto-T2 candidates, rendered BELOW the curated T2 entries and ABOVE the `T2_POOL_HEADER`:
+An auto-surfaced **T1** routine candidate — `Garbage Day` is weekly-Friday with `escalate_at_days: 1`, seen on the Thursday. It classifies **Duty** on rule 4 (it carries a `due_pattern`), so it renders under the Duty ring, not under any tier heading:
 
 ```
-### T2 — On the radar
-*(empty — reply "T2 add <items from selection pool below or anywhere>")*
+### Duty
 
-#### Auto-surfaced (from routines)
-- [ ] Pay Clinic Rental to Hussein Rafih — due Mon Jun 1 (surface window (5d before due), from [[routine/Recurring Bills + Admin]])  *(reply "T2 confirm" to keep on today's list)*
+- [T1] Garbage Day (from [[routine/Recurring Bills + Admin]]) — due Fri May 29 (due tomorrow)  *(confirm? reply "T1 confirm")*
 ```
+
+> **Why the reason reads `due tomorrow` and not `escalate window (1d before due)`.** The reason ladder in `classify_routine_item` (`tier/compute.py:585-596`) answers the near cases by NAME first — overdue at `compute.py:588`, `due today` at `:592`, `due tomorrow` at `:594` — and only falls through to the `escalate window (Nd before due)` wording at `compute.py:596` when `days_to_due >= 2`. Since that whole arm requires `days_to_due <= escalate_at_days` (`compute.py:585`), **an `escalate_at_days` of 1 can never produce an escalate-window string**; the smallest value that can is `2`, and it reads `escalate window (2d before due)`. (Driven across every offset from 2 days overdue to 5 days out.) `escalate_at_days: 1` is still doing its job — it is what admits the item on Thursday at all — it just gets named by the friendlier branch.
+
+An auto-surfaced **T2** routine candidate — its `surface_at_days` window is open but `escalate_at_days` has not been reached. Same record, same ring: the tier moved, the ring did not:
+
+```
+### Duty
+
+- [T2] Pay Clinic Rental to Hussein Rafih (from [[routine/Recurring Bills + Admin]]) — due Mon Jun 1 (surface window (5d before due))  *(reply "T2 confirm" to keep on today's list)*
+```
+
+**Three shape facts worth holding, because the pre-Phase-C form is still in old transcripts.** (1) The row opens `- [Tn]`, never a `- [ ]` checkbox. (2) The `(from [[routine/…]])` sits in the line HEAD, *before* the em-dash — it is part of what the item IS, not part of why it surfaced; the parenthetical after the due date holds the reason ALONE. (3) There is no tier heading to read: rows are arranged by ring. A line shaped `- [ ] Garbage Day — due Fri May 29 (due tomorrow, from [[routine/…]])` is the retired form and is not emitted — recognise it when reading history, never pattern-match on it for today's brief.
 
 **Two new exported constants** (Ship B, in `alfred.brief.tier_section`):
 - `T2_AUTO_ROUTINE_HEADER = "#### Auto-surfaced (from routines)"` — **defined but NO LONGER RENDERED as of Phase C.** The constant still exists in `tier_section` (and its value is still pinned), but the slot-arranged `Today's Plan` emits no such subsection: auto-surfaced routine items now appear inside their slot. Do not look for this heading in a brief, and do not tell Andrew to look for it. Regression pins assert it is absent from the rendered body.
@@ -453,33 +460,51 @@ The verb grammar is the same as task-origin — `T1 confirm <item text>` and `T2
 
 The morning brief has a section titled exactly `Today's Plan` (single source of truth in `alfred.brief.tier_section.SECTION_HEADER` — renamed from `Open Tasks by Tier` in Phase C; the constant also titled the first section of the retired `/today` glance while that surface existed). Its rows are now **arranged by slot** (Duty / Rhythm / Fuel), while the daily goal it leads with is still **measured by tier** — group by slot, measure by tier, and never describe the goal as slot-based. It leads with the **daily-goal status line** (see **The daily goal — a balanced day** below), then three subsections of curated shortlists followed by materials:
 
+> **What this sample is authority for, and what it is not.** It is authority for **RENDER SHAPE** — every line below was produced by running the real emitters over a real projection, not written out as plausible prose. It is **NOT authority for RING ASSIGNMENT**: which ring a row lands in is decided by `slots.classify_slot` (`tier/slots.py:359`) and by nothing else, so these headers are just where these particular rows happen to fall. Read the rule ladder there before concluding anything about *why* a row is under a heading. If any formatter changes, **re-derive this block from the formatters** — copying it out of a docstring or another sample is the exact mechanism that made it wrong before.
+>
+> Derivation, per surface: the goal line from `render_daily_goal_line` (`brief/tier_section.py:927`); each row from `_render_plan_row` (L774) composing `_row_head` (L707) + `_row_annotation` (L725) + `_row_affordance` (L753); dates from `_format_due_date` (L446); the habit-anchor line from `_render_routine_line` (L803) over the routine aggregator's annotation (`routine/aggregator.py:230`); the headers, blank lines, empty sentinels and block order from `_render_slot_group` (L821) + `_render_day_plan` (L891) + `_render_unplaced_carryover` (L847); and the whole composition from `render_tier_section` (L1216, `parts = [goal_line, "", day_plan_md, "---", "", pool]`).
+
 ```
-**Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1
+**Daily goal — balanced day:** not yet · T1 0/1 · T2 0/2 · T3 0/0
 
 ### Duty
-- [T1] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
-- [T2] [[task/Connect QBO API — RRTS]] — due Mon Aug 24 *(carried from yesterday)*
+
+- [T2] [[task/Connect QBO API — RRTS]] — due Mon Aug 24  *(carried from yesterday)*
 - [T2] Water the plants (from [[routine/Weekly Chores]]) — due Fri Aug 14
+- [T1] [[task/Steph Yang ROE]] — due Wed Aug 12 (due today)  *(confirm? reply "T1 confirm")*
 
 ### Rhythm
 
 *Today's rhythm items:*
 
-- Morning pages *(3 days since last)*
+- Morning pages *(3d since last; target every 5d)*
 
 ### Fuel
+
 *(nothing in Fuel today)*
+
+### Rollover from yesterday (incomplete)
+
+*(everything carried over is on today's plan above, marked where it sits)*
+
+*(empty — pick from Aspirational routines below or add new — reply "T3 add walk Fergus")*
 
 ---
 
 ### T2 selection pool
 (open `todo`/`active` tasks, NOT auto-T1, NOT alfred_triage)
+
 - [[task/RRTS Bug List — Burn Through]]
 - [[task/Set Up QuickBooks Online Developer Access for RRTS Website]]
-
-### Rollover from yesterday (incomplete)
-*(everything carried over is on today's plan above, marked where it sits)*
 ```
+
+**Five things in that block that are easy to get wrong, all of them derived above.**
+
+1. **Row order inside a ring is carryover → committed → suggestions** (`SlotGroup.rows`, `tier/day_plan.py:180`), NOT tier order. That is why the `[T2]` carried row prints above the `[T1]` candidate. The thing that already cost Andrew a day leads; the yes/no offers come last.
+2. **A deadline-bearing row shows BOTH the date and the reason.** `_row_annotation`'s first branch fires whenever the entry has a `due_iso` AND a `surface_reason`, and the auto-surface path always sets them together (`tier/compute.py:779-841` — every reason branch sits inside the `if due is None: continue` arm, so a row that has a reason necessarily has a date). So the shape is `— due Wed Aug 12 (due today)`. A bare `— due today` is not a shape this renderer can emit.
+3. **There are two different cadence annotations, and they are not interchangeable.** The habit anchors under `*Today's rhythm items:*` use the aggregator's short form, `*(3d since last; target every 5d)*` (`routine/aggregator.py:273`). A *tier row* driven by soft cadence uses `T3_AUTO_ANNOTATION_TEMPLATE` — the long form, `*(4 days since last; target every 3d)*` (`brief/tier_section.py:308`). **Both always carry the `; target every Nd` clause**; an annotation without it matches no formatter in the codebase.
+4. **The empty-tier prompts render at the BOTTOM of the plan body**, after the rollover block, not under a tier heading — tiers no longer have headings to be empty under (`_render_day_plan` L916-923). Here T3 has no rows so its prompt fires; T2 has two rows so its prompt does not.
+5. **The rollover block sits ABOVE the `---` separator**, between the last ring and the selection pool. The pool is the last thing in the section.
 
 **Read the arrangement correctly.** The `###` subsections are **rings**, not tiers — and every row carries its own `[Tn]` tag, because the arrangement is by ring while the daily goal is still counted by tier. So a row's heading tells you what kind of claim it makes, and its tag tells you how hard it presses. `ROLLOVER_HEADER` still renders, but its scope narrowed in Phase C: carried items now appear in their own ring above (marked `(carried from yesterday)`) rather than being listed again underneath.
 
@@ -493,7 +518,7 @@ The morning brief has a section titled exactly `Today's Plan` (single source of 
 
 The **point** of the three tiers isn't to clear the urgent lane — it's a **balanced day**. The daily goal is to finish **at least one item from each of T1, T2, and T3** (urgent + medium + self-care), ideally with all T1 done. The brief renders this as a status line at the **top** of the `Today's Plan` section. Note the deliberate asymmetry: that section ARRANGES its rows by slot, but this goal is still counted across T1/T2/T3, so the balanced-day claim keys to tiers. Do not restate it as "one in every slot" — the flip of this metric to the slot axis is a separate gated change and has not happened. The exact strings (verbatim from `alfred.brief.tier_section.render_daily_goal_line`):
 
-- Goal met: `**Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 0/1`
+- Goal met: `**Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 1/1` — note the T3 lane shows a *done* item. `✓ achieved` is not free-standing copy: `balanced_day` is `t1_done >= 1 and t2_done >= 1 and t3_done >= 1` (`tier/compute.py:2807`), so `✓ achieved` alongside a `0/…` lane is a line this renderer cannot emit.
 - Goal not yet met: `**Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1`
 - All T1 also done (the ideal): a ` · all T1 done` suffix is appended (e.g. `... · T3 1/1 · all T1 done`)
 - No tier items today at all: `**Daily goal:** no tier items yet today.`
@@ -571,7 +596,7 @@ Two sub-patterns share this example because the call differs only in the `source
 
 #### Worked example D — Routine T1 confirm
 
-> Andrew (Wednesday morning after seeing this morning's brief render a routine-origin auto-T1 line, e.g.: *"- [ ] Garbage Day — due Thu May 29 (escalate window (1d before due), from [[routine/Recurring Bills + Admin]])  *(confirm? reply "T1 confirm")*"*): *"T1 confirm Garbage Day"*
+> Andrew (Thursday morning after seeing this morning's brief render a routine-origin auto-T1 line under Duty, e.g.: *"- [T1] Garbage Day (from [[routine/Recurring Bills + Admin]]) — due Fri May 29 (due tomorrow)  *(confirm? reply "T1 confirm")*"*): *"T1 confirm Garbage Day"*
 >
 > Salem (internal): The brief surface tells Salem the originating routine is `Recurring Bills + Admin` and the item text is `Garbage Day` — read those off the rendered line, not from a vault lookup, and pass them verbatim: `tier_confirm tier=1 origin="routine_item" routine_record="Recurring Bills + Admin" item_text="Garbage Day" source="auto-due-routine"`. T1 preserves the brief-stated source and stamps `confirmed: true`, so the committed entry is:
 >
@@ -587,7 +612,7 @@ Two sub-patterns share this example because the call differs only in the `source
 
 #### Worked example E — Routine T2 confirm
 
-> Andrew (5 days before clinic rent due, seeing the brief's `#### Auto-surfaced (from routines)` subsection under T2): *"T2 confirm Pay Clinic Rental"*
+> Andrew (Wed May 27, 5 days before clinic rent is due on Mon Jun 1, seeing the auto-T2 routine line inside the **Duty** ring — *"- [T2] Pay Clinic Rental to Hussein Rafih (from [[routine/Recurring Bills + Admin]]) — due Mon Jun 1 (surface window (5d before due))  *(reply "T2 confirm" to keep on today's list)*"*): *"T2 confirm Pay Clinic Rental"*
 >
 > Salem (internal): The brief's auto-T2-routine line shows `from [[routine/Recurring Bills + Admin]]` — Salem reads the originating routine off the line. The operator said "Pay Clinic Rental" (loose match against the rendered item text "Pay Clinic Rental to Hussein Rafih"); resolve to the candidate's FULL rendered text before calling — the tool doesn't fuzzy-match. Then: `tier_confirm tier=2 origin="routine_item" routine_record="Recurring Bills + Admin" item_text="Pay Clinic Rental to Hussein Rafih"` (`source` omitted). The committed entry is:
 >
@@ -922,11 +947,15 @@ This is the second new grammar in this section. The brief surfaces auto-T3 candi
 > ```
 > ### Rhythm
 >
-> - [ ] [[routine/Self Care]] — Practice guitar *(never done; target every 7d)*
-> - [ ] [[routine/Self Care]] — Walk dog *(4 days since last; target every 3d)*
->
-> *(reply "T3 confirm <item>" to add to today's T3)*
+> - [T3] Practice guitar (from [[routine/Self Care]]) *(never done; target every 7d)*  *(reply "T3 confirm <item>" to add to today's T3)*
+> - [T3] Walk dog (from [[routine/Self Care]]) *(4 days since last; target every 3d)*  *(reply "T3 confirm <item>" to add to today's T3)*
 > ```
+
+Three things about that shape, each derived from the emitter rather than from the older sample it replaces:
+
+- **The confirm affordance is PER ROW, not a footer.** `_row_affordance` (`brief/tier_section.py:753`) returns it for each tier-3 candidate carrying a `target_cadence_days`, and `_render_plan_row` appends it to that row. It is never a standalone line under the block.
+- **The row head is `<item text> (from [[routine/<Record>]])`** — `_row_head` (L707) puts the item text first and the owning routine in parentheses after it. `- [ ] [[routine/Self Care]] — Practice guitar` is the retired form: link-first, checkbox, em-dash.
+- **These land in Rhythm because they carry a cadence target and NOT `self_care: true`** (rule 5, `tier/slots.py:419`). `self_care` is a **per-item** field (`routine/config.py:355`), so the routine RECORD being named `Self Care` sets nothing by itself. If an item there does carry `self_care: true`, rule 3 outranks rule 5 and the same row renders under **Fuel** instead — a self-care item that also has a cadence is Fuel that happens to be scheduled, not a practice that happens to be pleasant. Driven both ways: identical row text, `rhythm/target_cadence_days` without the flag, `fuel/self_care` with it. The annotation does not change; only the ring does.
 
 When Andrew confirms an auto-T3 candidate, the grammar mirrors T1/T2 confirms but writes to `tier_curation.t3` instead. Recognise:
 
