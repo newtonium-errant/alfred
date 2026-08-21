@@ -210,14 +210,27 @@ def test_no_coordinate_citations_anywhere_in_the_talker_skill():
     Second — this round — the full-form regex was bound to ``tier_section.py``
     while the SKILL carried coordinates into EIGHT other files and none at all
     into ``tier_section.py``, so the pin was watching the one door nothing was
-    coming through. Measured at ``c4983e20``: 28 coordinates total — 22
-    full-form across those eight files, plus 6 shorthand — of which 16 pointed
-    into ``telegram/attachments.py`` and ``telegram/bot.py``, both DELETED
-    (12 full-form + 4 shorthand). Re-measuring yields NINE path spellings
-    rather than eight files: ``compute.py`` and ``tier/compute.py`` are the
-    same file cited two ways — itself a small argument for names over paths.
-    A pin bound to one filename cannot see a citation into a file that no
-    longer exists, which is the case that most needs seeing.
+    coming through. Measured at ``c4983e20``, and mind the BOUND on the
+    figure: **28 IN THE THREE SPELLINGS THIS SCANNER ENUMERATES** — 22
+    full-form across those eight files, plus 6 shorthand — of which 16
+    pointed into ``telegram/attachments.py`` and ``telegram/bot.py``, both
+    DELETED (12 full-form + 4 shorthand).
+
+    Under the full REFERENT the baseline was **29, with 17 into deleted
+    files**. The 29th wore a FOURTH spelling this scanner does not catch: a
+    parenthesised ``(lines 7-12)`` trailing a backticked path to the deleted
+    ``attachments.py``. The 2026-08-21 sweep removed it along with the
+    paragraph it sat in, so the file is clean under the referent and not
+    merely under these regexes — but it is a live demonstration that the
+    KNOWN LIMIT below is real rather than ceremonial, found by a gate widening
+    the net AFTER the three-spelling sweep reported zero. Quote the 28 only
+    with "in three spellings" attached, or quote the 29.
+
+    Re-measuring the FILES yields NINE path spellings rather than eight:
+    ``compute.py`` and ``tier/compute.py`` are the same file cited two ways —
+    itself a small argument for names over paths. A pin bound to one filename
+    cannot see a citation into a file that no longer exists, which is the case
+    that most needs seeing.
 
     The board is gone with them. It previously tolerated 6 shorthand hits on
     ``compute.py``/``attachments.py`` lines; the 2026-08-21 sweep cleared
