@@ -593,19 +593,28 @@ def test_accepted_escalation_stays_in_duty_while_gap_persists(
 
 def test_accepted_escalation_goes_home_when_gap_closes(tmp_path: Path) -> None:
     """Completion today closes the gap: the curated copy loses the visit
-    (``gap_escalated`` restamped False). It lands UNSLOTTED, not Fuel —
-    the pre-existing ``_hydrate_curated_entries`` gap (task-origin-only
-    hydration) means a curated routine_item's ``slot:`` frontmatter is
-    not read; that limitation predates this lane and is pinned here as
-    the CURRENT contract, not endorsed as the right one."""
+    (``gap_escalated`` restamped False) and goes HOME to Fuel — the slot
+    its own record names.
+
+    FLIPPED 2026-08-21, premise reversed rather than deleted. This pin
+    previously asserted ``UNSLOTTED`` and said so in its own docstring:
+    "the pre-existing ``_hydrate_curated_entries`` gap (task-origin-only
+    hydration) ... pinned here as the CURRENT contract, not endorsed as
+    the right one." That limitation is now closed — the hydrator reads a
+    curated routine row's item out of its record's ``items`` list — so the
+    assertion that recorded it would otherwise have the suite DEFENDING
+    the bug. The reversed premise is the whole point of keeping the test:
+    "goes home when the gap closes" is only a meaningful claim once there
+    is a home to go to."""
     vault = _fergus_vault(tmp_path, last_done="2026-08-20")  # done today
     _write_daily_with_curation(vault)
     view = compute_today_view(vault, NOW, FUEL_DEFAULTS)
     entry = _entry(view, "Walk Fergus")
     assert entry.confirmed is True
     assert entry.gap_escalated is False
-    assert entry.slot != slots.SLOT_DUTY
-    assert entry.slot == slots.SLOT_UNSLOTTED  # hydration gap, pre-existing
+    assert entry.slot != slots.SLOT_DUTY  # the visit is over
+    assert entry.slot == slots.SLOT_FUEL  # ...and it went home, not nowhere
+    assert entry.slot_rule == slots.RULE_EXPLICIT
     # Positive control for every "not in routine_today" above: the
     # complement path CAN see this record — done-today, unescalated,
     # the item renders as a routine line (in Fuel, by its own word).
