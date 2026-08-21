@@ -17,6 +17,58 @@ Coverage:
     --from-date YYYY-MM-DD --json``
   * Daemon: source-pin confirms the GCal hook closures + registration
     calls live in the talker daemon's GCal init block
+
+THE 2099 DATES ARE DELIBERATE FAR-FUTURE SENTINELS — NOT CLOCK BOMBS TO FIX
+==========================================================================
+Every ``2099-06-01`` / ``2099-06-27`` in this file is intentional, and the
+general rule would tell you to remove it. ``cmd_backfill`` resolves
+``cutoff = date.today()`` (``integrations/gcal_cli.py``, the ``else`` branch
+of the ``--from-date`` resolution), then skips any event starting before it.
+These fixtures need an event that is reliably AFTER the cutoff on every run,
+which is exactly what a far-future literal buys. Deriving the window from the
+clock — the standing rule for wall-clock-evaluated predicates — would destroy
+the semantics under test here, so the literals stay.
+
+Declared, not fixed, by the repo-wide clock-bomb census at ``d99216be``
+("DECLARED FAR-FUTURE SENTINELS (wall-clock-met, NOT fixed; flagged for
+sentinel semantics)"). Marker comments sit at each site so this does not have
+to be rediscovered; a reader meeting a 2099 date here should NOT re-file it as
+a bomb or re-run a census to exonerate it.
+
+WHICH SITES ACTUALLY DEPEND ON IT — determined by DRIVING the file, not by
+reading it, because the two groups are indistinguishable on inspection.
+Substituting ``2099`` -> ``2020`` throughout (substitution count 20; selection
+``pytest tests/test_integrations_gcal_backfill.py -q``) moves the suite from
+76 passed to 5 failed / 71 passed. So the sentinel is LOAD-BEARING in exactly
+five tests, and incidental in the other six:
+
+  LOAD-BEARING (a past date breaks these; they would genuinely fail after
+  2099-06-01, which is their detonation date):
+    * test_backfill_dry_run_works_without_calendar_id
+    * test_backfill_records_failures
+    * test_backfill_human_output_synced_lines
+    * test_backfill_with_infer_times_dry_run_inferred
+    * test_backfill_with_infer_times_live_writes_back_then_syncs
+
+  INCIDENTAL (the record is skipped for an unrelated reason — already
+  synced / no time / naive datetime / unparseable time — before the cutoff
+  can matter, so these pass at any date):
+    * test_backfill_skips_already_synced
+    * test_backfill_skips_no_time
+    * test_backfill_skips_naive_datetime
+    * test_backfill_without_infer_times_skips_legacy_records
+    * test_backfill_with_infer_times_unparseable_time_skipped
+    * test_backfill_with_infer_times_no_time_string_skipped
+
+CORRECTION TO THE CENSUS RECORD, stated here because this file is where the
+next reader meets the claim. ``d99216be`` lists this file as
+``:137,193,213,255``. That enumeration is a SAMPLE, not the set, and it is
+wrong in both directions: the file was already carrying all 20 of its 2099
+lines at the census base (it is unchanged since), yet three of the four listed
+lines (193, 213, 255) are in the INCIDENTAL group, while four of the five
+load-bearing tests are not listed at all. The census's CLASSIFICATION
+(deliberate sentinel, keep) stands and is what matters; only its line list was
+under-enumerated. Re-derive from the marker comments below, not from that list.
 """
 
 from __future__ import annotations
@@ -134,6 +186,10 @@ def test_backfill_dry_run_works_without_calendar_id(tmp_path, capsys):
     _seed_event(
         tmp_path, name="Future Event",
         fields={
+            # FAR-FUTURE SENTINEL — deliberate, LOAD-BEARING here. Must stay after
+            # ``cmd_backfill``'s ``cutoff = date.today()``; a past date fails this
+            # test. Declared by clock-bomb census d99216be — do NOT 'fix' it. See
+            # the module docstring for the measured load-bearing/incidental split.
             "start": "2099-06-01T14:00:00-03:00",
             "end": "2099-06-01T15:00:00-03:00",
         },
@@ -190,6 +246,10 @@ def test_backfill_skips_already_synced(tmp_path, capsys):
     _seed_event(
         tmp_path, name="Already Synced",
         fields={
+            # FAR-FUTURE SENTINEL — deliberate, but INCIDENTAL here: this record is
+            # skipped for an unrelated reason before the ``cutoff = date.today()``
+            # comparison can matter, so the date does not gate this test. Declared
+            # by clock-bomb census d99216be — do NOT 'fix' it. See module docstring.
             "start": "2099-06-01T14:00:00-03:00",
             "end": "2099-06-01T15:00:00-03:00",
             "gcal_event_id": "existing-id-1",
@@ -210,6 +270,10 @@ def test_backfill_skips_no_time(tmp_path, capsys):
 
     _seed_event(
         tmp_path, name="Date Only",
+        # FAR-FUTURE SENTINEL — deliberate, but INCIDENTAL here: this record is
+        # skipped for an unrelated reason before the ``cutoff = date.today()``
+        # comparison can matter, so the date does not gate this test. Declared
+        # by clock-bomb census d99216be — do NOT 'fix' it. See module docstring.
         fields={"date": "2099-06-01"},  # no start/end
     )
     rc = gcal_cli.cmd_backfill(
@@ -252,6 +316,10 @@ def test_backfill_skips_naive_datetime(tmp_path, capsys):
     _seed_event(
         tmp_path, name="Naive",
         fields={
+            # FAR-FUTURE SENTINEL — deliberate, but INCIDENTAL here: this record is
+            # skipped for an unrelated reason before the ``cutoff = date.today()``
+            # comparison can matter, so the date does not gate this test. Declared
+            # by clock-bomb census d99216be — do NOT 'fix' it. See module docstring.
             "start": "2099-06-01T14:00:00",  # no tz
             "end": "2099-06-01T15:00:00",
         },
@@ -405,6 +473,10 @@ def test_backfill_records_failures(tmp_path, capsys):
     _seed_event(
         tmp_path, name="Fails To Sync",
         fields={
+            # FAR-FUTURE SENTINEL — deliberate, LOAD-BEARING here. Must stay after
+            # ``cmd_backfill``'s ``cutoff = date.today()``; a past date fails this
+            # test. Declared by clock-bomb census d99216be — do NOT 'fix' it. See
+            # the module docstring for the measured load-bearing/incidental split.
             "start": "2099-06-01T14:00:00-03:00",
             "end": "2099-06-01T15:00:00-03:00",
         },
@@ -451,6 +523,10 @@ def test_backfill_human_output_synced_lines(tmp_path, capsys):
     _seed_event(
         tmp_path, name="Future One",
         fields={
+            # FAR-FUTURE SENTINEL — deliberate, LOAD-BEARING here. Must stay after
+            # ``cmd_backfill``'s ``cutoff = date.today()``; a past date fails this
+            # test. Declared by clock-bomb census d99216be — do NOT 'fix' it. See
+            # the module docstring for the measured load-bearing/incidental split.
             "start": "2099-06-01T14:00:00-03:00",
             "end": "2099-06-01T15:00:00-03:00",
         },
@@ -747,6 +823,10 @@ def test_backfill_without_infer_times_skips_legacy_records(tmp_path, capsys):
 
     _seed_event(
         tmp_path, name="Legacy",
+        # FAR-FUTURE SENTINEL — deliberate, but INCIDENTAL here: this record is
+        # skipped for an unrelated reason before the ``cutoff = date.today()``
+        # comparison can matter, so the date does not gate this test. Declared
+        # by clock-bomb census d99216be — do NOT 'fix' it. See module docstring.
         fields={"date": "2099-06-27", "time": "4:00 PM"},
     )
     rc = gcal_cli.cmd_backfill(
@@ -765,6 +845,10 @@ def test_backfill_with_infer_times_dry_run_inferred(tmp_path, capsys):
 
     file_path = _seed_event(
         tmp_path, name="Halifax Music Fest 2026 — Weezer",
+        # FAR-FUTURE SENTINEL — deliberate, LOAD-BEARING here. Must stay after
+        # ``cmd_backfill``'s ``cutoff = date.today()``; a past date fails this
+        # test. Declared by clock-bomb census d99216be — do NOT 'fix' it. See
+        # the module docstring for the measured load-bearing/incidental split.
         fields={"date": "2099-06-27", "time": "7:00 PM"},
     )
     rc = gcal_cli.cmd_backfill(
@@ -799,6 +883,10 @@ def test_backfill_with_infer_times_live_writes_back_then_syncs(tmp_path, capsys)
 
     file_path = _seed_event(
         tmp_path, name="Halifax Music Fest 2026 — Weezer",
+        # FAR-FUTURE SENTINEL — deliberate, LOAD-BEARING here. Must stay after
+        # ``cmd_backfill``'s ``cutoff = date.today()``; a past date fails this
+        # test. Declared by clock-bomb census d99216be — do NOT 'fix' it. See
+        # the module docstring for the measured load-bearing/incidental split.
         fields={"date": "2099-06-27", "time": "7:00 PM"},
     )
     fake_client = MagicMock()
@@ -829,6 +917,10 @@ def test_backfill_with_infer_times_unparseable_time_skipped(tmp_path, capsys):
 
     _seed_event(
         tmp_path, name="Bad Time Event",
+        # FAR-FUTURE SENTINEL — deliberate, but INCIDENTAL here: this record is
+        # skipped for an unrelated reason before the ``cutoff = date.today()``
+        # comparison can matter, so the date does not gate this test. Declared
+        # by clock-bomb census d99216be — do NOT 'fix' it. See module docstring.
         fields={"date": "2099-06-27", "time": "totally not a time"},
     )
     rc = gcal_cli.cmd_backfill(
@@ -854,6 +946,10 @@ def test_backfill_with_infer_times_no_time_string_skipped(tmp_path, capsys):
 
     _seed_event(
         tmp_path, name="Date Only Legacy",
+        # FAR-FUTURE SENTINEL — deliberate, but INCIDENTAL here: this record is
+        # skipped for an unrelated reason before the ``cutoff = date.today()``
+        # comparison can matter, so the date does not gate this test. Declared
+        # by clock-bomb census d99216be — do NOT 'fix' it. See module docstring.
         fields={"date": "2099-06-27"},  # no time
     )
     rc = gcal_cli.cmd_backfill(

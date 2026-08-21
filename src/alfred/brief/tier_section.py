@@ -34,18 +34,27 @@ while the metric is tier-based.
 Render shape (the section body — the brief renderer wraps it under
 ``## Today's Plan``):
 
+THIS SAMPLE IS AUTHORITY FOR RENDER SHAPE, NOT FOR RING ASSIGNMENT. Which
+slot a row belongs to is decided by :func:`alfred.tier.slots.classify_slot`
+and by nothing else — read the rule ladder there. Two prompt lanes have lifted
+rows out of this block as if the headers were the rule; they are not, they are
+just where these particular example rows happen to land. Every row below was
+DRIVEN through the real ``classify_slot`` and the real row renderers (see the
+note after the block), so it is verified output rather than plausible prose.
+Blank lines between a slot header and its rows are elided here for compactness;
+``_render_slot_group`` emits them.
+
     **Today's goal:** T1 0/2 · T2 1/1 ✓ · T3 0/1 — one to go for a balanced day
 
     ### Duty
-    - [T1] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
-    - [T2] [[task/Connect QBO API — RRTS]] *(carried from yesterday)*
-
-    ### Rhythm
+    - [T1] [[task/Steph Yang ROE]] — due Wed Aug 12 (due today)  *(confirm? reply "T1 confirm")*
+    - [T2] [[task/Connect QBO API — RRTS]] — due Tue Aug 11  *(carried from yesterday)*
     - [T2] Water the plants (from [[routine/Weekly Chores]]) — due Fri Aug 14
 
+    ### Rhythm
     *Today's rhythm items:*
 
-    - Morning pages *(3 days since last)*
+    - Morning pages *(3d since last; target every 5d)*
 
     ### Fuel
     *(nothing in Fuel today)*
@@ -58,6 +67,39 @@ Render shape (the section body — the brief renderer wraps it under
     ### T2 selection pool
     (open ``todo``/``active`` tasks, NOT auto-T1, NOT alfred_triage)
     - [[task/RRTS Bug List — Burn Through]]
+
+Per-row enumeration for the block above — how each row's shape was DETERMINED,
+because the rows do not state their own shapes and an earlier version of this
+sample got half of them wrong. Every row was reconstructed from what its
+rendered text necessarily implies, then run through the real ``classify_slot``:
+
+  * ``[T1] [[task/Steph Yang ROE]]`` — wikilink into ``task/`` so
+    ``origin='task'``; a deadline-bearing entry carries BOTH ``due_iso`` and
+    ``surface_reason`` (``compute.AutoT1Candidate``), which is why the
+    annotation is the reason-and-due branch of :func:`_row_annotation` and not
+    a bare "— due today". Classifies **duty/dated_task** (rule 6).
+  * ``[T2] [[task/Connect QBO API — RRTS]]`` — ``origin='task'``, carried.
+    :func:`_row_annotation` ALWAYS emits an annotation when ``due_iso`` is set,
+    so a row printed without one is a row with no due date — and an undated
+    task classifies **unslotted/no_signal**, not Duty. It carries a due date
+    here for exactly that reason. Classifies **duty/dated_task** (rule 6).
+  * ``[T2] Water the plants (from [[routine/Weekly Chores]])`` — the
+    ``(from [[routine/...]])`` head means ``origin='routine_item'``, and a
+    routine carrying a HARD due date is a ``due_pattern`` firing. That is
+    **duty/due_pattern** (rule 4) — a recurring hard deadline is a scheduled
+    obligation. This row sits under Duty, NOT under Rhythm, and it is the
+    surprising one worth keeping in the sample.
+  * ``Morning pages`` — a habit anchor under ``ROUTINES_SUBHEADER``, rendered
+    by :func:`_render_routine_line` off the routine aggregator's soft-cadence
+    annotation (``*(Nd since last; target every Nd)*`` — note the aggregator's
+    ``Nd`` form differs from the plan-row ``T3_AUTO_ANNOTATION_TEMPLATE``'s
+    ``N days`` form). Cadence target, no due pattern → rule 5, which emits
+    **rhythm/target_cadence_days** (the rule string is ``RULE_CADENCE``'s
+    VALUE, ``"target_cadence_days"`` — not the constant's name).
+
+Note the Rhythm slot here has habit anchors but no tier rows. That is a real
+render: ``SlotGroup.is_empty`` is ``not rows and not routines``, so a slot with
+only anchors renders them rather than the empty sentinel.
 
 Read path (Step 2c, 2026-06-26 — the SINGLE computed view + materials):
 

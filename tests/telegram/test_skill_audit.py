@@ -428,6 +428,121 @@ def test_bit_probe_fail_when_skill_missing(
     assert check.data["missing_count"] == 1
 
 
+# --- TypeError attribution: drift is NOT "instance incomplete" -------------
+#
+# The bug (fixed 2026-08-20): ``audit_skill`` wrapped ``load_talker_config``
+# in an ``except TypeError`` documented for the missing-``instance.name``
+# case, but it caught EVERY TypeError — including the unknown-keyword kind
+# raised by config drift — and reported all of them as ``instance_missing``
+# with the reason "telegram.instance config incomplete". The probe then
+# returned SKIP, and SKIP is in ``QUIET_HEALTH_STATUSES``, so a talker whose
+# daemon could not start produced a health surface that was simultaneously
+# SILENT and WRONG about the cause.
+#
+# These four pins drive BOTH arms. The two arms are near neighbours by
+# construction — same exception TYPE out of the same call — which is exactly
+# why "did it refuse" is not a sufficient assertion here and each pin asserts
+# the REASON.
+
+
+def _drift_raw_config() -> dict[str, Any]:
+    """A config whose ``instance`` block is FINE but which fails to load.
+
+    The unknown-key spelling is SAMPLED, not minted: it is the same literal
+    ``tests/telegram/test_stt_shadow_config_compat.py`` uses for its
+    ``test_unknown_stt_key_still_raises`` positive control, which is the
+    established probe for "``_build`` hands unknown keys to the constructor".
+
+    A synthetic unknown key (rather than a really-retired field) is the
+    correct instrument here: the real drift shape — a deployed YAML carrying
+    ``telegram.stt.shadow_capture`` after that field is removed — cannot be
+    reproduced while the field still exists, and the TypeError this raises is
+    the identical shape (``got an unexpected keyword argument``).
+    """
+    raw = _base_raw_config(tool_set="talker", instance_name="Salem")
+    raw["telegram"]["stt"] = {"shadow_capture_retired_probe": {"enabled": True}}
+    return raw
+
+
+def test_config_drift_premise_the_loader_really_raises() -> None:
+    """PREMISE PIN for the three pins below: this config raises at load.
+
+    Everything below asserts how a TypeError is ATTRIBUTED. If ``_build``
+    ever grows an unknown-key filter, this config would load cleanly and the
+    pins below would be asserting attribution of an exception that no longer
+    happens. This pin makes that failure legible instead of mysterious.
+    """
+    from alfred.telegram.config import load_from_unified as load_talker_config
+
+    with pytest.raises(TypeError, match="shadow_capture_retired_probe"):
+        load_talker_config(_drift_raw_config())
+
+
+def test_config_drift_is_not_misattributed_to_instance_missing() -> None:
+    """Drift → ``config_error``, and the reason does NOT blame the instance.
+
+    Asserting the WHY, not merely that the audit declined to run: before the
+    fix this returned ``instance_missing=True`` with an
+    "instance config incomplete" reason, which is indistinguishable from the
+    genuine missing-name case if you only check that no audit happened.
+    """
+    result = skill_audit.audit_skill(_drift_raw_config())
+
+    assert result.config_error is True
+    assert result.instance_missing is False
+    # The specific false claim the bug emitted. Its ABSENCE is the fix.
+    assert "instance config incomplete" not in result.config_error_reason
+    # And the reason names the real cause.
+    assert "TypeError" in result.config_error_reason
+    assert "shadow_capture_retired_probe" in result.config_error_reason
+    # A failed load is NOT a clean audit — the CLI exits non-zero on this.
+    assert result.is_clean is False
+
+
+def test_bit_probe_config_drift_is_not_quiet() -> None:
+    """Drift → WARN, and WARN is an ATTENTION status by the canonical predicate.
+
+    The load-bearing property is not the literal ``WARN`` — it is that the
+    status is NOT in ``QUIET_HEALTH_STATUSES``. Asserted through
+    ``is_attention_status`` (the canonical predicate per CLAUDE.md's
+    health-status rule) rather than a re-localized ``!= "ok"`` comparison, so
+    this pin keeps its meaning if the severity is ever retuned.
+    """
+    from alfred.brief.health_section import is_attention_status
+
+    check = _check_skill_capability_audit(_drift_raw_config())
+
+    assert check.status == Status.WARN
+    assert is_attention_status(check.status.value) is True
+    assert "did not run" in check.detail
+    assert "instance config incomplete" not in check.detail
+
+
+def test_bit_probe_missing_instance_name_still_skips_quietly() -> None:
+    """POSITIVE CONTROL — the documented case still SKIPs, and stays quiet.
+
+    Without this leg the pins above would read identically against a build
+    that had simply made EVERY TypeError loud, which would be a different
+    bug: an unconfigured instance is genuinely nothing to audit, and turning
+    it into a daily attention card is the noise the SKIP status exists to
+    prevent. This is the nearest admissible neighbour of the drift case —
+    same exception type, same call site, opposite correct outcome.
+    """
+    from alfred.brief.health_section import is_attention_status
+
+    raw = _base_raw_config(tool_set="talker", instance_name="Salem")
+    # Remove ONLY the name key — the trigger the except-branch documents.
+    del raw["telegram"]["instance"]["name"]
+
+    result = skill_audit.audit_skill(raw)
+    assert result.instance_missing is True
+    assert result.config_error is False
+
+    check = _check_skill_capability_audit(raw)
+    assert check.status == Status.SKIP
+    assert is_attention_status(check.status.value) is False
+
+
 # --- Live regression — bundled SKILLs match registered tools ---------------
 
 

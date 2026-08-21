@@ -1589,6 +1589,12 @@ def cmd_talker(args: argparse.Namespace) -> None:
                 "registered_tools": list(result.registered_tools),
                 "advertised": list(result.advertised),
                 "missing_advertisements": list(result.missing_advertisements),
+                # ``config_error`` rides in the JSON because it is the one
+                # non-clean outcome with NO findings to explain it: without
+                # this field a consumer sees is_clean=false, an empty
+                # missing_advertisements list, and no reason at all.
+                "config_error": result.config_error,
+                "config_error_reason": result.config_error_reason,
                 "is_clean": result.is_clean,
             }
             print(json.dumps(payload, indent=2))
