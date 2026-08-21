@@ -40,8 +40,10 @@ authority for RING ASSIGNMENT: which slot a row belongs to is decided by
 :func:`alfred.tier.slots.classify_slot` and by nothing else, so these headers
 are only where these particular example rows happen to land. Read the rule
 ladder in ``slots.py`` before concluding anything about WHY a row sits under a
-heading. THREE separate lanes have now lifted rows out of this block as if the
-headers were the rule — if you are reaching for one, this sentence is for you.
+heading. TWO prompt lanes have lifted rows out of this block as if the headers
+were the rule, and this is the THIRD round of defects found in it — two counts,
+deliberately kept apart, because collapsing them is the same overstatement this
+block keeps being fixed for. If you are reaching for a row, this is for you.
 
 BYTE-VERIFIED OUTPUT, not a transcription. The block was produced by projecting
 a :class:`~alfred.tier.compute.TodayView` (built over the four inputs named in
@@ -53,8 +55,11 @@ it through :func:`render_daily_goal_line`, :func:`_render_day_plan` and
 line below is REAL: an earlier revision elided them "for compactness", which is
 indistinguishable from never having verified them. If any formatter changes,
 RE-DERIVE from the emitters — do not copy this block, and do not copy it INTO
-another surface. Copy-propagation between this docstring and the vault-talker
-SKILL is how three rounds of defects got here.
+another surface. Two mechanisms have produced defects here, and they are
+different: READING a sample instead of driving it, and COPY-PROPAGATION between
+this docstring and the vault-talker SKILL (the SKILL's own derivation note
+records the second, having found a near-copy of this block carrying two of its
+render-shape defects).
 
     **Daily goal — balanced day:** not yet · T1 0/1 · T2 0/2 · T3 0/0
 
