@@ -112,7 +112,13 @@ def test_predispatch_gate_cannot_deny_any_reachable_op() -> None:
     This pin is the tripwire. Map a denied op into ``_TOOL_TO_OP`` (or
     flip any reachable op to False) and it goes red, at which point the
     executor module docstring's "cannot currently deny anything"
-    paragraph must be rewritten.
+    paragraph must be rewritten — AND a route-level refusal pin must land
+    in the same commit. A TRIPWIRE SAYS "GO LOOK", NOT "THE GATE WORKS":
+    all this one can see is the SHAPE of ``_TOOL_TO_OP`` × ``SCOPE_RULES``.
+    It never drives a directive, so it cannot tell a gate that refuses from
+    a gate that was rewired around. Rewriting the docstring alone would
+    leave the first real refusal on this path unpinned. See the failure
+    message for what that pin owes.
 
     The CONTROL is the ``delete`` half: the scope entry really does carry
     a False, so this test is asserting an all-True *reachable* set rather
@@ -126,15 +132,28 @@ def test_predispatch_gate_cannot_deny_any_reachable_op() -> None:
     denied_but_reachable = [op for op in reachable if rules.get(op) is not True]
     assert not denied_but_reachable, (
         f"these reachable ops are no longer all-allow: {denied_but_reachable}. "
-        "The pre-dispatch gate can now refuse something — rewrite the "
-        "'cannot currently deny anything' paragraph in executor.py's "
-        "module docstring, which this pin exists to keep honest."
+        "The pre-dispatch gate can now refuse something. TWO things are owed "
+        "in the SAME commit, not one. (1) Rewrite the 'cannot currently deny "
+        "anything' paragraph in executor.py's module docstring, which this "
+        "pin exists to keep honest. (2) ADD A REFUSAL PIN AT THE ROUTE: a "
+        "test that drives a directive for one of these ops through the "
+        "executor and asserts the gate ACTUALLY REFUSES it — asserting the "
+        "refusal's REASON (the logged denial event and its reason field), not "
+        "merely that something raised and the target went untouched, because "
+        "a denial for an unrelated cause (unknown record, type-gate, bad "
+        "path) reads identically and would leave the pin green against a "
+        "build with no gate at all. This tripwire says GO LOOK; it does not "
+        "say THE GATE WORKS."
     )
     # CONTROL — the scope entry is not vacuously all-True.
     assert rules.get("delete") is False, "instructor scope no longer denies delete"
     assert "delete" not in reachable, (
         "'delete' became reachable via _TOOL_TO_OP — the gate now has "
-        "something to refuse, and the docstring is stale."
+        "something to refuse, and the docstring is stale. Same two "
+        "obligations as above, and this half is the likelier one to fire: "
+        "the commit that makes delete reachable owes a route-level pin "
+        "driving a delete directive and asserting the REASON it was refused, "
+        "not just a docstring edit."
     )
 
 
@@ -316,15 +335,30 @@ def _edit(rtype: str, sc: str | None, extra_fm: str = "", **kwargs):
 # DELIBERATE SUBSET, named as such: _BODY_MUTATE_DENIED_TYPES has 13
 # members and the refusal applies to both body_replace and body_insert_at,
 # so the full matrix is 13 x 2 = 26 combinations. DIRECTION-1 below drives
-# body_replace across these 5 (plus one body_insert_at row in the earlier
-# enumeration), i.e. a sampled 5 of 26 — chosen as the shapes an operator
-# would plausibly park a directive on (a transcript, a learning atom, an
-# operator-canonical commitment, a rendered-body record). The remaining
-# combinations are covered by the same single code path
-# (``_check_body_mutation_allowed``'s membership test, whose input is the
-# frozenset pinned in the premise test below), so this is UNDER-PINNING BY
-# CHOICE, not a claim that only 5 are refused. Widen here if that path
-# ever grows a per-type branch.
+# body_replace across these 5 — a sampled 5 of 26 — chosen as the shapes an
+# operator would plausibly park a directive on (a transcript, a learning
+# atom, an operator-canonical commitment, a rendered-body record).
+#
+# NO body_insert_at row is driven ANYWHERE in this file. That surface
+# appears here only in prose and in the SKILL-absence premise check below;
+# there is no ``body_insert_at=`` kwarg in any drive. An earlier revision of
+# this comment claimed "plus one body_insert_at row in the earlier
+# enumeration" — false, and self-contradicting, since "5 of 26" is the right
+# arithmetic only if no such row exists. Worth naming plainly: a comment
+# written to state coverage HONESTLY is exactly where this lane's own defect
+# class landed, so it now gets the same treatment as the pins it describes —
+# every figure in it was recounted against the file and the registry rather
+# than read. (13 = len(_BODY_MUTATE_DENIED_TYPES); 5 = len(_DENIED), each a
+# member of it; both pinned in the premise test below.)
+#
+# The remaining combinations are covered by the same single code path:
+# ``_check_body_mutation_allowed``'s membership test against that frozenset.
+# That path does carry one per-type branch (``clinical_note``, itself a
+# deny-set member), but it is gated on ``scope == "stayc_clinical"``, so
+# under ``scope="instructor"`` it falls through to the same universal deny as
+# every other member. Widen here if a per-type branch ever becomes REACHABLE
+# FROM THIS SCOPE. This is UNDER-PINNING BY CHOICE, not a claim that only 5
+# are refused.
 _DENIED = ["session", "conversation", "decision", "preference", "routine"]
 
 
