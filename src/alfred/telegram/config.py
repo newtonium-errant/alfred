@@ -293,10 +293,29 @@ class STTConfig:
     # ``vocab_learning_enabled`` gates CAPTURE ONLY and defaults OFF, per the
     # convention every other judgment surface follows (routine_match,
     # tier_recurrence; the batch shadow_capture was a fourth until R2 retired
-    # it 2026-08-20). Default-OFF is not timidity here: capture
-    # writes the operator's own message text to a new file, and Hypatia's voice
-    # traffic is CLINICAL. An instance opts in deliberately; it is never decided
-    # for them by a default.
+    # it 2026-08-20). Default-OFF is not timidity here: capture writes the
+    # operator's own message text to a new file. That alone is the reason —
+    # an instance opts in deliberately; it is never decided for them by a
+    # default.
+    #
+    # INSTANCE ATTRIBUTION (corrected 2026-08-21). This comment previously
+    # read "Hypatia's voice traffic is CLINICAL"; that is wrong, and the
+    # ``CalibrationConfig`` docstring was copied from it. The clinical
+    # instance is STAY-C (``config.stayc-clinical.yaml``, the
+    # ``stayc_clinical`` scope family); Hypatia is the scholar/scribe
+    # instance and is NOT clinical. STAY-C cannot reach this switch at all:
+    # ``telegram`` is catalogued in ``EGRESS_CONFIG_SECTIONS`` and is absent
+    # from the fail-closed ``SOVEREIGN_ALLOWED_SECTIONS``
+    # (``sovereign/boundary.py``), so a sovereign config carrying a
+    # ``telegram`` block refuses at load.
+    #
+    # POSTURE — stated precisely, because it is easy to over-read in both
+    # directions. Reducing PHI exposure is an ACTIVE, ONGOING policy, not a
+    # finished migration; and it is NOT a no-cloud rule — cloud LLM use
+    # continues and has been improved. So do NOT relax the conservative
+    # PHI-egress guards that name Hypatia elsewhere (``config.yaml.example``
+    # ``shadow_capture``) on the strength of this correction: "Hypatia is not
+    # the clinical instance" does not mean "Hypatia may egress freely".
     #
     # The two paths are instance-neutral (each instance has its own ``data/``),
     # so no per-instance literal is baked in — see the hardcoding rule.
@@ -353,7 +372,7 @@ class SessionConfig:
     # reopen, the daemon timeout sweeper) auto-runs the capture structuring pass
     # so a dictated action-item dump is never lost. Defaults OFF to preserve
     # Salem's current behaviour (Salem captures structure via Telegram /end);
-    # flipped ON for Hypatia, whose clinician captures land on the PWA (always
+    # flipped ON for Hypatia, whose captures land on the PWA (always
     # session_type="conversation", no web /end). The fail-safe
     # ``capture_structured: pending`` marker is written UNCONDITIONALLY at close
     # regardless of this flag — the flag only governs the auto-LLM pass.
@@ -625,13 +644,17 @@ class CalibrationConfig:
     """R4 — the voice-calibration learning loop (capture → propose → approve → inject).
 
     TWO SWITCHES, BOTH DEFAULT-OFF, and they are genuinely different decisions —
-    the same split ``SttConfig.vocab_learning_enabled`` / ``SttVocabConfig.enabled``
+    the same split ``STTConfig.vocab_learning_enabled`` / ``SttVocabConfig.enabled``
     already draws for the vocabulary loop:
 
       * ``capture_enabled`` gates the ANALYZER at web session close. It costs an
         LLM call per closed session and it reads the operator's transcript, so an
-        instance opts in deliberately. Hypatia's voice traffic is CLINICAL — this
-        is never decided for an instance by a default.
+        instance opts in deliberately — reading the operator's own words is
+        reason enough on its own, and this is never decided for an instance by
+        a default. (This bullet previously asserted "Hypatia's voice traffic is
+        CLINICAL". It is not: STAY-C is the clinical instance, Hypatia is the
+        scholar/scribe one. See the INSTANCE ATTRIBUTION note on
+        ``STTConfig.vocab_learning_enabled``, the split this one mirrors.)
       * ``inject_enabled`` gates the READ side: whether the approved calibration
         block is injected into the model's system prompt
         (``run_turn(calibration_str=...)``). Separate because "may it learn about
