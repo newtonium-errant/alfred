@@ -44,6 +44,18 @@ export interface UseFeedBoardResult {
    * than something to be nagged out of the operator.
    */
   contest: (id: string, section?: string) => void;
+  /**
+   * R4 — rule on a voice-calibration proposal from its feed card.
+   *
+   * `action` is `CALIBRATION_APPLY_ACTION` or `CALIBRATION_DISCARD_ACTION`, and
+   * it is a PARAMETER rather than two hooks because the two verbs differ only
+   * in which id they post: both remove the row optimistically and both restore
+   * it on failure. Two near-identical closures would be two places for that
+   * restore logic to drift, and the restore is the load-bearing half — a
+   * refused apply leaves the proposal PENDING server-side, so the card has to
+   * come back.
+   */
+  calibrationRule: (id: string, action: string) => void;
   dismissToast: () => void;
 }
 
@@ -163,5 +175,42 @@ export function useFeedBoard(opts: UseFeedBoardOptions): UseFeedBoardResult {
 
   const dismissToast = useCallback(() => setToast(null), []);
 
-  return { needsYou, fyi, toast, banner, ack, contest, dismissToast };
+  const calibrationRule = useCallback(
+    (id: string, action: string) => {
+      // Optimistic remove — a ruled calibration proposal leaves the board
+      // either way, exactly like an ack. It reuses `ackedIds` deliberately: the
+      // set means "rows this session has resolved", not "rows this session
+      // acked", and a second set with identical semantics is a second thing to
+      // keep in sync with `restore`.
+      setAckedIds((prev) => new Set(prev).add(id));
+      feedApi.act(id, action).catch((e: unknown) => {
+        if (e instanceof ApiError) {
+          if (e.status === 401) {
+            onAuthExpired?.();
+            return; // leave the redirect to the caller; don't restore mid-nav
+          }
+          if (e.status === 502 || e.status === 503 || e.code === 'feed_upstream_unavailable' || e.code === 'transport_unreachable' || e.code === 'not_configured') {
+            setBanner("The feed can't reach Algernon right now — this is a server-side issue, not your session.");
+            restore(id);
+            return;
+          }
+          if (e.status === 409 || e.code === 'stale_item') {
+            // Already decided at the source — the optimistic remove was right.
+            return;
+          }
+        }
+        // ANY other failure restores the row, and that matters more here than
+        // on an ack: the server refuses a calibration apply for real, nameable
+        // reasons (no person record configured, no calibration block on it, the
+        // proposal already decided). The proposal stays PENDING in the store in
+        // every one of those cases, so the card must come back or the operator
+        // is left with a pending item he can no longer reach.
+        setToast({ message: "Couldn't record that — it's back; try again." });
+        restore(id);
+      });
+    },
+    [onAuthExpired, restore],
+  );
+
+  return { needsYou, fyi, toast, banner, ack, contest, calibrationRule, dismissToast };
 }

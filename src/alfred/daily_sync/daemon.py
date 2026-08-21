@@ -443,6 +443,7 @@ async def fire_once(
     friction_items = friction_section.consume_last_batch()
     triage_items = triage_section.consume_last_batch()
     routine_match_items = routine_match_section.consume_last_batch()
+    calibration_items = calibration_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
@@ -592,6 +593,7 @@ async def fire_once(
                     routine_match_items=_family("routine_match", routine_match_items),
                     radar_items=_family("radar", radar_items),
                     friction_items=_family("friction", friction_items),
+                    calibration_items=_family("calibration", calibration_items),
                     # #72 — the operator's approved per-kind tier decisions,
                     # re-read every fire. Read here rather than inside the
                     # producer so the whole feed emit still sits under the one

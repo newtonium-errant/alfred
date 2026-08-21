@@ -175,6 +175,11 @@ KIND_SORT_SUGGESTION = "sort_suggestion"
 # (gates + dispatches) and the surveyor-side queue reader.
 KIND_MOC_SUGGESTION = "moc_suggestion"
 
+# The voice-calibration review card (R4, 2026-08-21). Named for the same reason
+# as the kinds above: spelled outside ``alfred.feed`` by the daily-sync producer
+# (emits), the action router (gates + dispatches) and the web client.
+KIND_CALIBRATION = "calibration"
+
 # The verb stamped on a retirement — an item marked ``acted`` by
 # :meth:`FeedStore.reconcile` because it left the producer's open set, NOT
 # because the operator judged it. Until this existed both outcomes appended a
@@ -203,6 +208,7 @@ KINDS: frozenset[str] = frozenset({
     "event", "ops_notable", "ticket_notice", "radar", "friction",
     "notegen_readout", "peer_digest", "pattern_surfaced",
     KIND_REMINDER_RETURNED, KIND_SORT_SUGGESTION, KIND_MOC_SUGGESTION,
+    KIND_CALIBRATION,
 })
 
 # Static per-kind (mode, attention) defaults, seeded from the step-2 severity map
@@ -306,6 +312,43 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     # row that cannot offer two targets rather than deal a verb onto a
     # surface with no gesture.
     KIND_MOC_SUGGESTION: (MODE_FYI, ATTENTION_FYI),
+    # The voice-calibration review card (R4, 2026-08-21). QUIET, and this pair is
+    # the whole of why — so it is recorded here rather than in a commit message.
+    #
+    # THE SEEDING RULE POINTS THE OTHER WAY AND IS OVERRULED DELIBERATELY. A
+    # calibration card ASKS the operator something ("should Alfred believe this
+    # about you?"), which by the rule above reads like a decide kind. It is not
+    # one, for a MEASURED reason:
+    #
+    #   ``feedNeedsYou.isNeedsYouItem`` is ``attention === 'needs_you' || mode
+    #   === 'decide'``, and the push poller fetches on that predicate with NO
+    #   kind allowlist. So MODE_DECIDE rings the phone REGARDLESS of attention —
+    #   there is no decide/fyi combination that stays quiet. A wording
+    #   observation drafted by an analyzer on its own schedule is the last thing
+    #   that earns a doorbell.
+    #
+    # AND IT MUST NOT GAIN A SUGGESTED CHOICE GROUP, which is the non-obvious
+    # half. ``isDeckCandidate`` is ``mode === 'decide' || hasSuggestedChoice``,
+    # so a grouped affirm would make this card deck-eligible — and the deck is a
+    # needs-you surface. The card reaches the operator through the FEED BOARD's
+    # FYI column via a per-kind affordance (the attribution contest door's
+    # shape), NOT through the deck.
+    #
+    # PRECISELY: it takes a group shared by BOTH verbs, because
+    # ``holdChoicesForVerb`` requires ``family.length >= 2`` ("a family of one is
+    # no family"). A group on one verb alone is inert. This sentence was
+    # initially written as the stronger "give either verb a group and you re-arm
+    # the doorbell", which is FALSE — the web pin's positive control measured it
+    # and the claim is corrected here, where the next reader meets it, rather
+    # than only in commit history.
+    #
+    # PINNED IN TWO PLACES, on purpose. ``web/tests/calibrationCardQuiet.test.ts``
+    # drives the REAL web predicates against a card built from this table (a
+    # Python test asserting "the tuple says fyi" would only restate the line it
+    # guards); ``tests/feed/test_calibration_card_is_quiet.py`` holds the
+    # Python-side facts the web cannot see — this seed's membership and the
+    # absence of a ``group`` in ACTION_META.
+    KIND_CALIBRATION: (MODE_FYI, ATTENTION_FYI),
 }
 
 

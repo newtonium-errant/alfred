@@ -47,6 +47,24 @@ export interface FeedRowProps {
    */
   onContest?: (section?: string) => void;
   /**
+   * Present → this FYI row offers the R4 voice-calibration pair (Confirm /
+   * Reject). Supplied only for calibration rows (see `calibrationActionable`),
+   * the one kind the backend admits `calibration_apply` / `calibration_discard`
+   * for.
+   *
+   * Rendered INSTEAD OF the Ack rather than alongside it, which is the
+   * difference from the contest door above and is deliberate. Ack means "seen,
+   * fine" and leaves the board — on a calibration card that would be a third
+   * outcome meaning neither yes nor no, and the proposal would sit pending
+   * forever while the card vanished. The operator's two honest answers here are
+   * "believe this" and "don't", so those are the two controls.
+   *
+   * Confirm APPLIES (it writes the line to the person record via the same
+   * store path the CLI verb uses); it does not merely dismiss.
+   */
+  onCalibrationConfirm?: () => void;
+  onCalibrationReject?: () => void;
+  /**
    * Present → this is a slot row: render the per-STAGE affordance (SUGGESTED→Accept /
    * PLANNED→✓ / DONE→marker+undo) driven by the SHARED hooks (the identical per-lane
    * logic the rings panel uses). Takes precedence over onAck.
@@ -70,7 +88,7 @@ export interface FeedRowProps {
   snooze?: UseSnoozeResult;
 }
 
-export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, completion, accept, snooze }: FeedRowProps) {
+export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, onCalibrationConfirm, onCalibrationReject, completion, accept, snooze }: FeedRowProps) {
   // The row's own duration menu. Local because it is per-row transient UI, not
   // board state — nothing outside this row needs to know it's open.
   const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
@@ -216,6 +234,29 @@ export function FeedRow({ item, expanded, onToggleEvidence, onAck, onContest, co
               {COMPLETION_UNAVAILABLE_HINT}
             </span>
           )
+        ) : onCalibrationConfirm && onCalibrationReject ? (
+          // The R4 calibration pair. Takes precedence over the Ack branch below
+          // — see the prop docs for why this row has no third "seen" outcome.
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              data-testid="feed-row-calibration-reject"
+              aria-label={`Reject calibration proposal: ${item.title || item.id}`}
+              onClick={onCalibrationReject}
+              className="rounded-lg border border-honeydew-300 px-2 py-1.5 text-[11px] font-bold uppercase tracking-wider text-honeydew-600"
+            >
+              Reject
+            </button>
+            <button
+              type="button"
+              data-testid="feed-row-calibration-confirm"
+              aria-label={`Confirm calibration proposal: ${item.title || item.id}`}
+              onClick={onCalibrationConfirm}
+              className="rounded-lg border border-honeydew-400 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-honeydew-700"
+            >
+              Confirm
+            </button>
+          </div>
         ) : onAck ? (
           <div className="flex shrink-0 items-center gap-1.5">
             {onContest && (

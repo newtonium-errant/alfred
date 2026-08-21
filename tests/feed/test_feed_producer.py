@@ -177,7 +177,7 @@ def test_a_family_reported_UNREADABLE_is_skipped_not_emptied(
 #
 # The map's own comment used to claim this pin held it "against BOTH ends:
 # every family has a provider, and every registered provider maps to a family."
-# The second half is FALSE and could not be written: seven of the fourteen
+# The second half is FALSE and could not be written: seven of the fifteen
 # registered providers (capture_close, contracts_awaiting, demotion_proposals,
 # tier_recurrence, stt_vocab, ticket_notify, triage_queue) feed no feed family
 # at all, and correctly so. A pin written to the comment as it stood would have
@@ -241,7 +241,7 @@ def test_provider_family_map_covers_every_family() -> None:
     assert set(PROVIDER_FOR_FAMILY) == set(_FAMILIES)
     # Positive control: the sets are non-empty, so the equality above is a real
     # correspondence and not two empties agreeing about nothing.
-    assert len(_FAMILIES) == 7
+    assert len(_FAMILIES) == 8
 
 
 def test_every_mapped_provider_is_actually_registered() -> None:
@@ -269,7 +269,7 @@ def test_every_mapped_provider_is_actually_registered() -> None:
         # vacuously if the left side is empty AND says nothing about whether
         # ``registered`` was really populated. Both are pinned here, so the
         # subset is load-bearing.
-        assert len(PROVIDER_FOR_FAMILY) == 7
+        assert len(PROVIDER_FOR_FAMILY) == 8
         assert len(registered) == 15
     finally:
         # The registry is module-global; leaving it populated would leak into
@@ -277,7 +277,7 @@ def test_every_mapped_provider_is_actually_registered() -> None:
         assembler.clear_providers()
 
 
-def test_eight_registered_providers_deliberately_feed_no_family() -> None:
+def test_seven_registered_providers_deliberately_feed_no_family() -> None:
     """The NEGATIVE half, asserted rather than assumed — and the reason the
     map's original comment was wrong.
 
@@ -291,31 +291,14 @@ def test_eight_registered_providers_deliberately_feed_no_family() -> None:
 
     try:
         unmapped = set(_register_every_section()) - set(PROVIDER_FOR_FAMILY.values())
+        # ``calibration_review`` is NOT in this set (R4, 2026-08-21). It briefly
+        # was, while its feed card was blocked; the card now exists, so the
+        # provider MAPS and the set is back to its original seven. Recorded here
+        # because the intermediate state is what a reader of the history will
+        # find, and it should read as resolved rather than as a regression.
         assert unmapped == {
             "capture_close", "contracts_awaiting", "demotion_proposals",
             "tier_recurrence", "stt_vocab", "ticket_notify", "triage_queue",
-            # R4 (2026-08-21) — DELIBERATELY UNMAPPED, AND UNLIKE ITS SEVEN
-            # NEIGHBOURS THIS ONE IS EXPECTED TO MOVE. The operator ruled the
-            # calibration loop should have BOTH a feed card and a CLI + Daily
-            # Sync surface. The CLI + section half shipped; the feed card is
-            # BLOCKED on an operator decision, not on effort:
-            #
-            #   A quiet (fyi/fyi) card carrying plain confirm/reject verbs is
-            #   produced, served and verb-carrying — and its verbs render
-            #   NOWHERE. ``FeedRow``'s FYI affordance is an Ack (plus the
-            #   attribution-only contest door); the board dispatches exactly two
-            #   verbs (``ack`` / ``contest``, see ``useFeedBoard``); and generic
-            #   verbs are dispatched only from the DECK, which admits an item
-            #   via ``isDeckCandidate = mode === 'decide' || hasSuggestedChoice``
-            #   — and ``hasSuggestedChoice`` needs a co-equal choice GROUP of
-            #   >= 2 members, which a yes/no confirm is not.
-            #
-            # So the three options are: ring the phone (MODE_DECIDE), invent a
-            # choice group the operator did not ask for, or widen the FYI row's
-            # contract for every kind. All three are his call, so the card is
-            # not built rather than built wrong — and this entry is the diff
-            # that will surface when it is.
-            "calibration_review",
         }
     finally:
         assembler.clear_providers()
