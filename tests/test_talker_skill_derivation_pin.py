@@ -13,11 +13,25 @@ Two DIFFERENT failure modes are pinned here, and they are not interchangeable:
      ``test_unqualified_derivation_names_live_in_tier_section``). The SKILL
      tells a model to RE-DERIVE FROM THE FUNCTION. If a cited construct is
      renamed away, that instruction points at nothing and the model invents.
-     This is not hypothetical: the SKILL carried ``_render_rollover_section``
-     for months after it was split into ``compute_rollover`` +
-     ``_render_unplaced_carryover``, and nothing caught it, because the only
-     check anyone ran was on the LINE NUMBERS, which were being renumbered
-     against a function that no longer existed.
+
+     This is not hypothetical, and the REAL history matters because it decides
+     what this file has to catch. The SKILL cited
+     ``brief/tier_section.py::_render_rollover_section`` from 2026-05-31
+     (``156b2687``/``88126989``), when the function was two days old and the
+     citation was CORRECT. The function was born ``33660aa2`` (2026-05-29) and
+     died ``10134f3c`` (2026-08-12), split into ``compute_rollover`` +
+     ``_render_unplaced_carryover``. So it was dead for NINE DAYS, not months,
+     and — per ``git log -S`` on that exact string — the SKILL line was NEVER
+     renumbered: only the commit that wrote it and the one that removed it ever
+     touched it. Nothing decayed. **The code renamed out from under a correct
+     citation, and the same-cycle SKILL audit never ran for ``10134f3c``.**
+
+     That is why the citation pins below are keyed to NAMES RESOLVING rather
+     than to coordinates looking tidy: the failure was a rename nobody swept,
+     not a renumbering pass gone stale. An earlier draft of this file told the
+     renumbering story, and that false story is exactly what scoped its
+     line-number pin to the one spelling a renumbering pass would produce —
+     missing the file's dominant bare ``L707`` form. Wrong history, wrong pin.
 
   2. SAMPLE DRIFT (``test_sample_block_matches_emitters``). The block is
      asserted to be byte-identical to what the real emitters produce.
@@ -45,10 +59,23 @@ from alfred.tier.compute import DailyGoalState, TierEntry
 
 SKILL_PATH = get_skills_dir() / "vault-talker" / "SKILL.md"
 
-#: Names the derivation note uses BARE, under its own standing sentence
-#: ("every name below is in ``alfred.brief.tier_section`` unless qualified").
-#: A bare name cannot be auto-resolved without knowing that default module, so
-#: it is enumerated. Adding a bare name to the note means adding it here.
+#: Constructs the SKILL refers to by BARE name (no module path), relying on the
+#: derivation note's standing sentence — "every name below is in
+#: ``alfred.brief.tier_section`` unless qualified otherwise". The dotted scan
+#: cannot reach these: with no module path there is nothing to import, so they
+#: are enumerated here instead.
+#:
+#: HONEST SCOPE, because an earlier comment overstated it: this is a SUPERSET of
+#: the derivation note's own bare names. 11 come from that note; the rest are
+#: bare elsewhere in the SKILL (the reply-affordance contracts, the rollover
+#: pair), and ``_render_t2_selection_pool`` is named in NO prose at all — it is
+#: here because the byte-pin below calls it, so a rename must red this file
+#: rather than only erroring at import.
+#:
+#: MAINTENANCE RULE: add a name here when the SKILL refers to any
+#: ``tier_section`` construct WITHOUT a module path, ANYWHERE in the file — not
+#: only inside the derivation note. A superset is safe; a subset silently
+#: stops covering the citation it was added for.
 UNQUALIFIED_TIER_SECTION_NAMES = (
     "render_daily_goal_line",
     "_render_plan_row",
@@ -140,17 +167,66 @@ def test_unqualified_derivation_names_live_in_tier_section():
     )
 
 
-def test_no_line_number_citations_into_tier_section():
-    """The note's citations stay NAME-based.
+#: Files whose coordinate citations are KNOWN-STALE and deliberately BOARDED,
+#: not fixed in this lane. The shorthand `:N` continuation form is tolerated
+#: only on a line that also names one of these — and the tolerated count is
+#: pinned below, so the board cannot quietly grow.
+BOARDED_COORDINATE_FILES = ("compute.py", "attachments.py")
+#: 2 on the ``classify_routine_item`` reason-ladder line (compute.py) + 4 on the
+#: per-kind caps line (attachments.py). Deliberately NOT recorded as SKILL line
+#: numbers: this lane exists because coordinates rot, and an earlier draft of
+#: this very comment named lines 432/2845 — which my own edit immediately moved
+#: to 432/2847. The tolerance test keys on the FILE NAMED ON THE LINE, so it is
+#: line-number-independent by construction.
+BOARDED_SHORTHAND_COUNT = 6
 
-    A line number reintroduced here would rot on the next parallel lane, which
-    is the exact defect this contract was rewritten to remove.
+
+def test_no_line_number_citations_into_tier_section():
+    """The note's citations stay NAME-based — in ALL THREE spellings.
+
+    This SKILL writes coordinates three different ways, and an earlier version
+    of this pin only knew one of them:
+
+      * full     ``brief/tier_section.py:774``   (4 instances at master)
+      * bare     ``(L707)``                      (18 at master — the DOMINANT form)
+      * shorthand ``` `:592` ```                 (6, all on boarded-file lines)
+
+    A pin bound to the full form alone passes while the bare form — the one
+    this SKILL actually preferred — walks straight through. Bound to the
+    STRUCTURE meant (a coordinate, however spelled), not to one spelling.
     """
     text = _skill_text()
-    offenders = re.findall(r"tier_section\.py:\d+", text)
-    assert not offenders, (
-        "line-number citations into tier_section.py reappeared in the talker "
-        f"SKILL: {offenders}. Cite the CONSTRUCT, not the coordinate."
+
+    full = re.findall(r"tier_section\.py:\d+", text)
+    assert not full, (
+        f"full-form coordinates into tier_section.py reappeared: {full}. "
+        "Cite the CONSTRUCT, not the coordinate."
+    )
+
+    bare = re.findall(r"\bL\d{2,4}\b", text)
+    assert not bare, (
+        f"bare L<N> coordinates reappeared in the talker SKILL: {bare}. "
+        "This was the dominant form before the 2026-08-21 sweep and is the "
+        "one a full-form-only pin misses. Cite the CONSTRUCT."
+    )
+
+    # Shorthand `:N` is legitimate ONLY as a continuation of an explicit
+    # citation to a BOARDED file on the same line.
+    stray, tolerated = [], 0
+    for i, line in enumerate(text.splitlines(), 1):
+        for m in re.finditer(r"`:\d+(?:-\d+)?`", line):
+            if any(f in line for f in BOARDED_COORDINATE_FILES):
+                tolerated += 1
+            else:
+                stray.append(f"SKILL L{i}: {m.group(0)}")
+    assert not stray, (
+        f"shorthand `:N` coordinates outside the boarded files: {stray}. "
+        "Cite the CONSTRUCT."
+    )
+    assert tolerated == BOARDED_SHORTHAND_COUNT, (
+        f"boarded shorthand count moved: expected {BOARDED_SHORTHAND_COUNT}, "
+        f"found {tolerated}. If the boarded sweep landed, LOWER the constant; "
+        "if this grew, a new coordinate was added under cover of the board."
     )
 
 
