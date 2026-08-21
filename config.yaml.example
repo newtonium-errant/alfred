@@ -908,6 +908,11 @@ transport:
 #       # Groq key is unresolvable. Score later with alfred.web.stt_shadow_score.
 #       # EGRESS: enabling this sends buffered mic PCM to api.groq.com — do NOT
 #       # enable on any PHI/sovereign instance (VERA/Hypatia).
+#       # WHY HYPATIA IS NAMED — do NOT sweep on "Hypatia isn't clinical". All
+#       # clinical work is STAY-C's; this is defence-in-depth after a REAL
+#       # 2026-07-08 PHI-egress incident, not a claim about Hypatia's workload.
+#       # Targets REAL crossover, not incidental mention (an accepted residual).
+#       # Full note: "WHY THE SETTINGS NAMING HYPATIA STAY", telegram.stt below.
 #       shadow_capture:
 #         enabled: false
 #         dir: "./data/stt_corpus"    # audio .wav + corpus.jsonl (under LUKS /data)
@@ -1003,6 +1008,11 @@ transport:
 #       # EGRESS: assistant STT streams continuous mic audio to the cloud STT
 #       # provider — a per-instance decision. Do NOT enable cloud voice on a
 #       # PHI/sovereign instance (VERA has NO web.voice block, ever).
+#       # WHY HYPATIA IS NAMED BELOW — do NOT sweep on "Hypatia isn't clinical".
+#       # All clinical work is STAY-C's; the exclusion is defence-in-depth after
+#       # a REAL 2026-07-08 PHI-egress incident, not a claim about Hypatia's
+#       # workload. Targets REAL crossover, not incidental mention (an accepted
+#       # residual). Full note: "WHY THE SETTINGS NAMING HYPATIA STAY" below.
 #       shadow_capture:
 #         enabled: false              # LOAD-BEARING off: shadow_capture streams
 #                                     # raw mic PCM to Groq — FORBIDDEN on any
@@ -1126,7 +1136,12 @@ telegram:
     #
     # DEFAULT OFF, and deliberately so: capture writes YOUR OWN MESSAGE TEXT to
     # a file on disk. A CLINIC instance must think before enabling it — voice
-    # traffic there is clinical, and the corpus would hold it.
+    # traffic there is clinical, and the corpus would hold it. (That instance is
+    # STAY-C, NOT Hypatia — do not "fix" this by naming Hypatia. And STAY-C
+    # cannot reach this switch at all: ``telegram`` is absent from the
+    # fail-closed ``SOVEREIGN_ALLOWED_SECTIONS`` (``sovereign/boundary.py``), so
+    # a sovereign config carrying it refuses at load. The caution is retained
+    # for any FUTURE clinic-capable instance, not for a current reader.)
     # vocab_learning_enabled: false
     # vocab_corpus_path: "./data/stt_corrections.jsonl"     # the (transcript, sent) pairs
     # vocab_decided_path: "./data/stt_vocab_decided.jsonl"  # your approve/reject verdicts
@@ -1158,7 +1173,9 @@ telegram:
   # TWO SWITCHES, BOTH DEFAULT OFF, because they are different permissions:
   #   capture_enabled — may it LEARN about me (an LLM call per closed session,
   #                     reading your transcript). A CLINIC instance should think
-  #                     hard here, same as vocab capture above.
+  #                     hard here, same as vocab capture above — and the same
+  #                     note applies: that instance is STAY-C, NOT Hypatia, and
+  #                     it cannot carry a ``telegram`` block at all.
   #   inject_enabled  — may it ACT on what it learned (inject the approved block
   #                     into the system prompt). You can accumulate approved
   #                     calibration and turn the behaviour change on later.

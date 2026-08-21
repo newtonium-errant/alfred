@@ -261,7 +261,11 @@ brief_digest_push:
 # Uncomment if this instance ingests email. Requires a `mail` block too
 # (see config.yaml.example for the shape). Cue groups are per-instance:
 # Salem's cues are Andrew-facing; a clinic instance would seed clinical
-# signals instead.
+# signals instead. (That instance is STAY-C, NOT Hypatia — do not "fix" this
+# by naming Hypatia. STAY-C cannot carry this block either: `email_classifier`
+# is absent from the fail-closed `SOVEREIGN_ALLOWED_SECTIONS`
+# (`sovereign/boundary.py`), so this line illustrates per-instance cue
+# variation rather than describing a configuration anyone can load today.)
 #
 # email_classifier:
 #   enabled: true
