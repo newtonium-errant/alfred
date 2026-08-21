@@ -43,6 +43,7 @@ from alfred.telegram.captured_tasks_view import (
 
 from . import (
     attribution_section,
+    calibration_section,
     canonical_proposals_section,
     capture_close_section,
     contracts_awaiting_section,
@@ -348,6 +349,15 @@ async def fire_once(
     recurrence_section.set_vault_path(vault_path)
     recurrence_section.register()
 
+    # R4 — voice-calibration proposals (PROPOSE-ONLY, read-only). Registered
+    # unconditionally; the provider returns None when
+    # ``calibration_review.enabled`` is False. Needs no vault path and no raw
+    # config — both stores are plain JSONL paths derived from
+    # ``telegram.calibration`` at config load time. Mutation is the CLI's
+    # (``alfred voice-calibration approve|reject``), so rendering this card can
+    # never change what the talker is told about the operator.
+    calibration_section.register()
+
     # #22b — KAL-LE ticket → PWA-notify observability surface (READ-ONLY,
     # FAIL-LOUD). Registered unconditionally — the provider returns None
     # (section omitted) unless ``daily_sync.ticket_notify.enabled`` is true
@@ -433,6 +443,7 @@ async def fire_once(
     friction_items = friction_section.consume_last_batch()
     triage_items = triage_section.consume_last_batch()
     routine_match_items = routine_match_section.consume_last_batch()
+    calibration_items = calibration_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
@@ -582,6 +593,7 @@ async def fire_once(
                     routine_match_items=_family("routine_match", routine_match_items),
                     radar_items=_family("radar", radar_items),
                     friction_items=_family("friction", friction_items),
+                    calibration_items=_family("calibration", calibration_items),
                     # #72 — the operator's approved per-kind tier decisions,
                     # re-read every fire. Read here rather than inside the
                     # producer so the whole feed emit still sits under the one

@@ -127,7 +127,34 @@
 //     worktree, and EVERY chunk hash moved INCLUDING `framework` — a chunk no
 //     application diff can touch, which is the tell. Discarded and re-run
 //     with both builds in the SAME directory.
-const CACHE_VERSION = 'v11';
+// v12: the voice-calibration card (R4). ONE trigger, a CHUNK again rather than
+//     the stylesheet, and it is v11's mechanism repeating exactly: the lane
+//     edited `lib/algernon/feedConstants.ts` (adding CALIBRATION_KIND, the two
+//     action ids and `calibrationActionable`), and `/` imports that module for
+//     the deck pill count — so a FEED-BOARD feature reaches a SHELL_ROUTE's
+//     precached HTML. `/feed` is NOT a SHELL_ROUTE and its own markup is
+//     irrelevant here; the shared chunk is the whole path.
+//     MEASURED, SAME-DIRECTORY: `chunks/283-baf723239742e603` ->
+//     `283-fc95c1db68ec9664` AND `chunks/901-f18b58843ea6a8e6` ->
+//     `901-83ba1d2b8c2bffcc`. TWO chunks, both on `/` alone; `/login`,
+//     `/ingest` and `/share` are byte-identical once buildId-keyed
+//     `_buildManifest`/`_ssgManifest` refs are stripped (those move on every
+//     build and are the documented artifact-1 noise).
+//     WHAT DID NOT CHANGE, checked rather than assumed: the global stylesheet
+//     is byte-identical (`8168ae01473a3649.css` on all four routes, both
+//     builds) — the lane adds no Tailwind utilities, every class it uses
+//     already occurring elsewhere in `web/` (text-honeydew-700 x54,
+//     text-[11px] x55, gap-1.5 x22, border-honeydew-300 x26). Artifact 2 did
+//     NOT fire: `framework-b3f1d81911dc87d2.js` is identical across both
+//     builds, which is the tell that the two-build comparison was sound.
+//     THE PREDICTION WAS WRITTEN BEFORE THE BUILD and is recorded because the
+//     miss is instructive: it named the route and the mechanism correctly and
+//     said "ONE chunk ref". Two moved. Right about where and why, off by one
+//     about how many — so the falsifier earned its keep even on a confirmed
+//     call. The lane's first answer, reached by REASONING ("a row component
+//     and a page body, not the Layout shell, so no bump"), was WRONG; the
+//     instrument this file documents is what corrected it.
+const CACHE_VERSION = 'v12';
 const CACHE_NAME = `algernon-shell-${CACHE_VERSION}`;
 
 // SPA shell routes — cached at install so the app boots offline after first visit.

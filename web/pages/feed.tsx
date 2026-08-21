@@ -14,7 +14,7 @@ import { useResumeRefetch } from '../lib/algernon/useResumeRefetch';
 import { useSlotAccept } from '../components/feed/useSlotAccept';
 import { useSnooze } from '../components/feed/useSnooze';
 import { feedApi, type FeedItem } from '../lib/algernon/feed';
-import { contestableItem, isDeckCandidate, isDeckDealt } from '../lib/algernon/feedConstants';
+import { CALIBRATION_APPLY_ACTION, CALIBRATION_DISCARD_ACTION, calibrationActionable, contestableItem, isDeckCandidate, isDeckDealt } from '../lib/algernon/feedConstants';
 import { readDeckSnoozed } from '../lib/algernon/deckSnooze';
 import { ApiError } from '../lib/algernon/http';
 import { useSession } from '../lib/algernon/useSession';
@@ -256,6 +256,12 @@ export default function FeedPage() {
             {...common}
             onAck={() => board.ack(it.id)}
             onContest={contestableItem(it) ? (section?: string) => board.contest(it.id, section) : undefined}
+            // R4 — wired HERE as well as in the list, per this renderer's own
+            // contract two comments up: "neither view has verbs the other
+            // lacks". Wiring only the list would have given the timeline a
+            // calibration row that renders with no way to answer it.
+            onCalibrationConfirm={calibrationActionable(it) ? () => board.calibrationRule(it.id, CALIBRATION_APPLY_ACTION) : undefined}
+            onCalibrationReject={calibrationActionable(it) ? () => board.calibrationRule(it.id, CALIBRATION_DISCARD_ACTION) : undefined}
           />
         );
       }
@@ -588,6 +594,11 @@ export default function FeedPage() {
                   onToggleEvidence={() => toggleExpanded(it.id)}
                   onAck={() => board.ack(it.id)}
                   onContest={contestableItem(it) ? (section?: string) => board.contest(it.id, section) : undefined}
+                  // R4 — per-kind, exactly like the contest door above. A
+                  // non-calibration row passes undefined for both and renders
+                  // its Ack as it always did.
+                  onCalibrationConfirm={calibrationActionable(it) ? () => board.calibrationRule(it.id, CALIBRATION_APPLY_ACTION) : undefined}
+                  onCalibrationReject={calibrationActionable(it) ? () => board.calibrationRule(it.id, CALIBRATION_DISCARD_ACTION) : undefined}
                 />
               ))}
             </ul>

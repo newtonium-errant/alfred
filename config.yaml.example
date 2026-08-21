@@ -1108,6 +1108,41 @@ telegram:
     #
     # Nothing is ever added silently: approval is a human step by construction,
     # and a rejected term is never proposed again.
+
+  # VOICE CALIBRATION (R4) — Alfred's running model of how YOU like to be
+  # talked to, and the loop that lets it improve from being wrong.
+  #
+  # At web session close an analyzer reads the transcript and drafts
+  # observations ("prefers bottom-line-up-front", "batches review into the
+  # morning") into a PENDING store. They sit there, applied to nothing, until
+  # you approve them:
+  #     alfred voice-calibration list
+  #     alfred voice-calibration approve <id> --operator <you>
+  #     alfred voice-calibration reject  <id> --operator <you>
+  # Approving appends the line to the ALFRED:CALIBRATION block on your
+  # `primary_users` person record; rejecting records the verdict and the
+  # observation is never proposed again. THERE IS NO TIMEOUT — an unreviewed
+  # proposal stays pending forever rather than being confirmed by a clock.
+  # (Deliberately unlike the attribution-audit card, which auto-confirms after
+  # 24h. Applying someone's voice profile on a timeout is opt-OUT, and this is
+  # the one surface where that is the wrong direction.)
+  #
+  # Requires `primary_users` above — there is no default person record, and an
+  # approve refuses rather than guessing where to write.
+  #
+  # TWO SWITCHES, BOTH DEFAULT OFF, because they are different permissions:
+  #   capture_enabled — may it LEARN about me (an LLM call per closed session,
+  #                     reading your transcript). A CLINIC instance should think
+  #                     hard here, same as vocab capture above.
+  #   inject_enabled  — may it ACT on what it learned (inject the approved block
+  #                     into the system prompt). You can accumulate approved
+  #                     calibration and turn the behaviour change on later.
+  # calibration:
+  #   capture_enabled: false
+  #   inject_enabled: false
+  #   pending_path: "./data/calibration_pending.jsonl"   # drafts awaiting your thumb
+  #   decided_path: "./data/calibration_decided.jsonl"   # your approve/reject verdicts
+  #   max_proposals_per_session: 5   # cap on drafts from one session; the cap is logged
   # wk2b: opt-in text-to-speech for /brief command. If this section is
   # absent, /brief replies "not configured". Default voice is "Rachel"
   # (ElevenLabs library default); model is Turbo v2.5 for low latency.
@@ -1317,6 +1352,20 @@ daily_sync:
   # at load time, so the side that writes and the side that reads cannot drift.
   # Override any of them here only if you genuinely want them split.
   # stt_vocab:
+  #   enabled: false
+  # Voice-calibration review (R4) — READ-ONLY proposal card. Lists what the
+  # analyzer has noticed about how you like to be talked to, awaiting your
+  # approve/reject from the CLI (`alfred voice-calibration list|approve|reject`).
+  # Rendering this card never changes what the talker is told about you, and
+  # nothing here expires — see `telegram.calibration` for the full loop.
+  #
+  # A SEPARATE switch from `telegram.calibration.capture_enabled`, which gates
+  # CAPTURE — same two-decisions split as `stt_vocab` above.
+  #
+  # Both store paths are DERIVED from `telegram.calibration` at load time, so
+  # the side that writes and the side that reads cannot drift. Override here
+  # only if you genuinely want them split.
+  # calibration_review:
   #   enabled: false
   # Capture-born task propose-close (#64) — the other half of proactive capture.
   # When you say "I'm going to attach some screenshots of workout plans", capture

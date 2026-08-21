@@ -103,6 +103,18 @@ def _friction_title(d: dict[str, Any]) -> str:
     return f"Friction: {_s(d, 'event_id') or 'event'}"
 
 
+def _calibration_title(d: dict[str, Any]) -> str:
+    """The card's one line: the proposed observation itself.
+
+    The BULLET rather than a summary or a count, because the whole decision the
+    operator is being asked to make is "is this sentence true of me?" — a title
+    that said "1 calibration proposal" would put the actual question one tap
+    deeper for no gain.
+    """
+    bullet = _s(d, "bullet")
+    return f"Calibration: {bullet}" if bullet else "Calibration proposal"
+
+
 # kind → (stable_key_fn, title_fn). The batch-list argument name maps 1:1.
 _FAMILIES: dict[str, tuple[Callable[[dict], str], Callable[[dict], str]]] = {
     "email_tier": (_email_key, _email_title),
@@ -112,6 +124,10 @@ _FAMILIES: dict[str, tuple[Callable[[dict], str], Callable[[dict], str]]] = {
     "routine_match": (_routine_match_key, _routine_match_title),
     "radar": (lambda d: _s(d, "record_path", "event_id"), _radar_title),
     "friction": (lambda d: _s(d, "event_id", "record_path"), _friction_title),
+    # calibration (R4). Keyed on the CONTENT-derived proposal_id, so the same
+    # observation re-drafted across sessions reconciles onto one card instead of
+    # dealing a duplicate every morning.
+    "calibration": (lambda d: _s(d, "proposal_id"), _calibration_title),
 }
 
 
@@ -137,7 +153,7 @@ _FAMILIES: dict[str, tuple[Callable[[dict], str], Callable[[dict], str]]] = {
 #:
 #: The converse — "every registered provider maps to a family" — is FALSE, and
 #: an earlier version of this comment claimed the pin held it. Seven of the
-#: fourteen registered providers feed no family at all (they render a section to
+#: fifteen registered providers feed no family at all (they render a section to
 #: read and emit no cards); ``test_seven_registered_providers_deliberately_feed
 #: _no_family`` asserts that list, so a provider that SHOULD have had a family
 #: arrives as a diff instead of joining the unmapped majority unnoticed.
@@ -149,6 +165,7 @@ PROVIDER_FOR_FAMILY: dict[str, str] = {
     "routine_match": "routine_match",
     "radar": "radar",
     "friction": "friction",
+    "calibration": "calibration_review",
 }
 
 
@@ -262,6 +279,7 @@ def emit_sync_feed(
     routine_match_items: list[Any] | None = None,
     radar_items: list[Any] | None = None,
     friction_items: list[Any] | None = None,
+    calibration_items: list[Any] | None = None,
     tier_overrides: TierOverrides | None = None,
 ) -> None:
     """Reconcile every daily-sync family into the feed store. Belt-guarded per
@@ -295,6 +313,7 @@ def emit_sync_feed(
         "routine_match": routine_match_items,
         "radar": radar_items,
         "friction": friction_items,
+        "calibration": calibration_items,
     }
     # ITEM 4 — retirement must not be a dark stratum. Accumulated across the
     # whole fire and reported once below; see that log line for why the three

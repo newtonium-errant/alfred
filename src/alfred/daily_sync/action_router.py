@@ -53,6 +53,7 @@ from alfred.daily_sync.corpus import append_correction
 from alfred.daily_sync.feed_producer import _FAMILIES, _as_dict
 from alfred.feed.model import (
     ATTENTION_NEEDS_YOU,
+    KIND_CALIBRATION,
     KIND_REMINDER_RETURNED,
     KIND_MOC_SUGGESTION,
     KIND_SORT_SUGGESTION,
@@ -249,6 +250,49 @@ SORT_SUGGESTION_KIND = KIND_SORT_SUGGESTION
 MOC_SUGGESTION_KIND = KIND_MOC_SUGGESTION
 MOC_APPLY_ACTION = "moc_apply"
 
+# Voice calibration (R4, 2026-08-21). The operator's ruling was "a feed-family
+# card with plain confirm/reject", and the LABELS are exactly that — but the
+# VERB IDS are kind-specific, following ``moc_apply`` rather than borrowing
+# ``attribution``'s / ``proposal``'s ``confirm``/``reject``.
+#
+# WHY DISTINCT IDS. Those two kinds' ``confirm``/``reject`` fall through to the
+# ReplyCorrection synthesis at the bottom of ``_act_locked``; calibration's do
+# not — they are intercepted and routed straight into the store's approve/reject.
+# Sharing an id would leave exactly one edit (a mis-ordered interception) between
+# a calibration confirm and a code path that reads ``last_batch`` and synthesizes
+# a correction for a different subsystem. A distinct id makes that unreachable
+# through the ceiling itself rather than through the ordering of if-statements.
+#
+# DELIBERATELY NOT ``CONTEST_ACTION``, which is shaped like a reject and means
+# something else: a contest carries ``contested_section`` bound to
+# ``CONTEST_SECTIONS`` (drift-pinned to ``telegram.capture_sections
+# .SUMMARY_SECTIONS``) and says "this inference is wrong, and THIS capture
+# section produced it". A wording proposal has no capture section, so borrowing
+# it would drag a meaningless picker onto the card. Shape is not meaning.
+CALIBRATION_KIND = KIND_CALIBRATION
+#: NOT the same thing as ``vault.scope.CALIBRATION_APPLY_SCOPE`` (scope.py),
+#: despite the shared words. This is a FEED VERB ID — a member of the
+#: ``FEED_ACTIONS`` capability ceiling, matched against an inbound act's
+#: ``action_id``. That is a VAULT SCOPE NAME, matched against ``SCOPE_RULES``
+#: when the write finally happens. Two registries, two match sites, no code path
+#: compares them, and neither would do the other's job if swapped. They are
+#: parallel names for the two ends of one feature — the tap and the write — and
+#: the parallelism is deliberate; an equivalence between them is not.
+CALIBRATION_APPLY_ACTION = "calibration_apply"
+CALIBRATION_DISCARD_ACTION = "calibration_discard"
+
+#: The operator identity recorded when a ruling arrives from the FEED CARD
+#: rather than from the CLI's ``--operator``.
+#:
+#: A literal rather than a blank, and rather than a fabricated person name. The
+#: store REFUSES a blank operator by design — that guard is what keeps anonymous
+#: calibration writes impossible — so the card has to supply something, and what
+#: it supplies should say honestly which door the decision came through. A card
+#: act is already authenticated (it arrives on a web session token), so this is
+#: provenance, not a bypass: nobody typed a name, and the row should not claim
+#: they did.
+FEED_CARD_OPERATOR = "feed_card"
+
 # (kind, action_id) → the kwargs that synthesize the owning resolver's
 # ``ReplyCorrection``. THIS MAP IS THE CAPABILITY CEILING — a pair absent here
 # can never reach a resolver. A fresh ReplyCorrection is built per call (never a
@@ -347,6 +391,12 @@ DEFER_RETURN_PATH: dict[str, str] = {
     # rotation above — ``moc_suggestion_feed_items`` carries every deferred
     # row OUTSIDE its cap, so a parked card keeps its window.
     KIND_MOC_SUGGESTION: "alfred.brief.daemon",
+    # calibration (R4) — the daily-sync producer re-emits the PENDING store
+    # every fire, so a deferred card returns when its window lapses exactly as
+    # the other daily-sync families do. The promise is keepable because the
+    # store is durable: a proposal is removed from the open set only by an
+    # operator decision, never by time.
+    KIND_CALIBRATION: "alfred.daily_sync.feed_producer",
 }
 
 
@@ -489,6 +539,18 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
     # promise (return path declared in DEFER_RETURN_PATH).
     MOC_SUGGESTION_KIND: {
         MOC_APPLY_ACTION: {},
+    },
+    # calibration (R4) — TWO verbs, the operator's plain confirm/reject. kwargs
+    # UNUSED like the four kinds above: intercepted by
+    # :func:`_dispatch_calibration_ruling`, which synthesizes no ReplyCorrection
+    # and reads no last_batch. The apply verb routes into the SAME
+    # ``calibration_store.approve_proposal`` the CLI verb uses — one store, two
+    # front doors, and in particular the same no-blank-operator and
+    # no-calibration-block refusals. There is no third verb: a calibration card
+    # has no "which part was wrong" question to ask.
+    CALIBRATION_KIND: {
+        CALIBRATION_APPLY_ACTION: {},
+        CALIBRATION_DISCARD_ACTION: {},
     },
 }
 
@@ -717,6 +779,42 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
             "weight": "light",
             "gesture": _GESTURE_AFFIRM,
             "group": "moc",
+        },
+    },
+    # calibration (R4). The operator's words are the LABELS; the ids beneath
+    # them are kind-specific (see the constants block).
+    #
+    # NO ``group`` ON EITHER VERB, and that absence is the load-bearing part of
+    # this entry rather than an omission. ``hasSuggestedChoice`` is
+    # ``holdChoicesFor(item,'affirm') !== null``, and ``isDeckCandidate`` is
+    # ``mode === 'decide' || hasSuggestedChoice`` — so a suggested choice group
+    # would make this card DECK-ELIGIBLE, and the deck is a needs-you surface.
+    # This card's home is the feed board's FYI column via a per-kind affordance.
+    #
+    # It takes a group shared by BOTH verbs to do it: ``holdChoicesForVerb``
+    # requires ``family.length >= 2``, so one grouped verb is inert. Measured by
+    # ``web/tests/calibrationCardQuiet.test.ts``, which pins both directions —
+    # the grouped PAIR becomes deck-eligible, the lone grouped verb does not.
+    #
+    # HEAVY on the apply, light on the discard, matching ``attribution``'s
+    # asymmetry for the same reason read in the other direction: the apply
+    # WRITES the operator's own person record (a body edit plus an audit entry),
+    # while the discard writes one JSONL row and destroys nothing recoverable —
+    # the observation is already in the analyzer's reach if it recurs.
+    CALIBRATION_KIND: {
+        CALIBRATION_APPLY_ACTION: {
+            "label": "Confirm",
+            "weight": "heavy",
+            "gesture": _GESTURE_AFFIRM,
+            "note": (
+                "Adds this line to the calibration block on your person record "
+                "and stamps an attribution-audit entry."
+            ),
+        },
+        CALIBRATION_DISCARD_ACTION: {
+            "label": "Reject",
+            "weight": "light",
+            "gesture": _GESTURE_REJECT,
         },
     },
 }
@@ -2221,6 +2319,113 @@ def _sort_writer_detail(kind: str) -> str:
     return "could not sort this item"
 
 
+def _dispatch_calibration_ruling(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    vault_path: Path | None,
+    config: Any,
+    raw_config: dict[str, Any] | None,
+) -> ActResult:
+    """Rule on a voice-calibration proposal from the FEED CARD — the operator's
+    second front door onto the store the CLI verb already opens.
+
+    ONE STORE, TWO FRONT DOORS, and the point of this function is that it adds
+    no third policy. Confirm calls ``calibration_store.approve_proposal`` and
+    reject calls ``reject_proposal`` — the SAME functions
+    ``alfred voice-calibration`` calls, so both surfaces inherit the same
+    guards: the named-operator requirement, the no-default-target refusal, the
+    already-decided refusal, and the no-calibration-block precondition. A second
+    implementation here would be a second place for those to drift, and the
+    guarantee this feature rests on is that there is exactly one writer.
+
+    THE OPERATOR IDENTITY IS THE TAP. A card act reaches this function only
+    through the authenticated web session, so the tap IS the thumb-crossing the
+    self-correcting guardrail requires; it is recorded as ``feed_card`` so the
+    decision row says which door it came through rather than implying someone
+    typed a name. This is deliberately NOT anonymous — ``approve_proposal``
+    would refuse a blank, and passing a literal keeps that refusal live for the
+    CLI while giving the card an honest provenance.
+
+    ITS WRITER SET, one level deep: ``approve_proposal`` / ``reject_proposal``
+    plus ``feed_store.set_state`` to decide the card. No completion, accept,
+    snooze, sort or MOC writer is referenced from this function's code object.
+    """
+    from alfred.audit import instance_name_from_raw
+    from alfred.telegram import calibration_store
+
+    evidence = dict(getattr(item, "evidence", None) or {})
+    proposal_id_ = str(evidence.get("proposal_id") or "")
+    if not proposal_id_:
+        # The producer stamps this on every card it emits, so an absent id means
+        # a hand-crafted or corrupted item. Refuse rather than guess.
+        log.info(
+            "feed.act.calibration.invalid_action", id=feed_item_id,
+            action=action_id, reason="no_proposal_id",
+        )
+        return ActResult(
+            False, STATUS_INVALID_ACTION,
+            "this calibration card carries no proposal id",
+            feed_item_id, action_id,
+        )
+
+    cal = getattr(config, "calibration_review", None)
+    if cal is None:
+        return ActResult(
+            False, STATUS_ERROR,
+            "calibration review is not configured on this instance",
+            feed_item_id, action_id,
+        )
+
+    if action_id == CALIBRATION_DISCARD_ACTION:
+        result = calibration_store.reject_proposal(
+            cal, proposal_id_, operator=FEED_CARD_OPERATOR,
+        )
+    else:
+        if vault_path is None:
+            return ActResult(
+                False, STATUS_ERROR,
+                "no vault path wired — cannot apply calibration",
+                feed_item_id, action_id,
+            )
+        telegram_raw = (raw_config or {}).get("telegram")
+        primary = (
+            telegram_raw.get("primary_users") if isinstance(telegram_raw, dict) else None
+        ) or []
+        result = calibration_store.approve_proposal(
+            Path(vault_path), cal, proposal_id_,
+            operator=FEED_CARD_OPERATOR,
+            user_rel_path=str(primary[0]) if primary else "",
+            agent_slug=(instance_name_from_raw(raw_config) or "salem").lower(),
+        )
+
+    if "error" in result:
+        # The card stays OPEN. A refused ruling must remain re-tappable once the
+        # operator fixes what the message named — retiring it here would hide a
+        # pending proposal behind a card he can no longer reach.
+        log.info(
+            "feed.act.calibration.refused", id=feed_item_id, action=action_id,
+            proposal_id=proposal_id_, reason=result["error"],
+        )
+        return ActResult(
+            False, STATUS_ERROR, result["error"], feed_item_id, action_id,
+        )
+
+    feed_store.set_state(feed_item_id, STATE_ACTED, action=action_id)
+    log.info(
+        "feed.act.calibration.ruled", id=feed_item_id, action=action_id,
+        proposal_id=proposal_id_,
+    )
+    detail = (
+        "calibration line added to your profile"
+        if action_id == CALIBRATION_APPLY_ACTION
+        else "calibration proposal discarded"
+    )
+    return ActResult(True, STATUS_OK, detail, feed_item_id, action_id)
+
+
 def _dispatch_sort_ruling(
     feed_item_id: str,
     action_id: str,
@@ -3228,6 +3433,34 @@ def _act_locked(
             feed_item_id, action_id, item,
             feed_store=feed_store, vault_path=vault_path,
             config=config, chosen_target=correction_target,
+        )
+
+    # calibration (R4) — same interception shape as the three kinds above:
+    # ceiling check FIRST so an unmapped verb is ``invalid_action``, then route
+    # to the store. The FYI ``ack`` and the generic defer family were both
+    # intercepted ABOVE this block, so what arrives here is one of the two
+    # calibration verbs.
+    #
+    # It is intercepted rather than allowed to fall through for the reason the
+    # distinct verb ids exist: the tail of this function synthesizes a
+    # ReplyCorrection and reads ``last_batch``, and a calibration ruling must do
+    # neither — its authority is the pending store, keyed by the proposal id the
+    # producer stamped on the card.
+    if kind == CALIBRATION_KIND:
+        if action_id not in FEED_ACTIONS.get(CALIBRATION_KIND, {}):
+            log.info(
+                "feed.act.invalid_action", id=feed_item_id, kind=kind,
+                action=action_id, reason="calibration_unmapped_verb",
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                f"'{action_id}' is not a valid action for a {kind} item",
+                feed_item_id, action_id,
+            )
+        return _dispatch_calibration_ruling(
+            feed_item_id, action_id, item,
+            feed_store=feed_store, vault_path=vault_path,
+            config=config, raw_config=raw_config,
         )
 
     # The (kind, action) map is the capability ceiling.

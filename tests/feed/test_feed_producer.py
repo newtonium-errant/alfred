@@ -177,7 +177,7 @@ def test_a_family_reported_UNREADABLE_is_skipped_not_emptied(
 #
 # The map's own comment used to claim this pin held it "against BOTH ends:
 # every family has a provider, and every registered provider maps to a family."
-# The second half is FALSE and could not be written: seven of the fourteen
+# The second half is FALSE and could not be written: seven of the fifteen
 # registered providers (capture_close, contracts_awaiting, demotion_proposals,
 # tier_recurrence, stt_vocab, ticket_notify, triage_queue) feed no feed family
 # at all, and correctly so. A pin written to the comment as it stood would have
@@ -189,13 +189,14 @@ def _register_every_section() -> list[str]:
 
     Drives the REAL ``register()`` of each module rather than a hand-kept list,
     which is the whole point: a hand-kept list would drift in exactly the way
-    this pin exists to catch. ``daemon.py`` calls these fourteen
+    this pin exists to catch. ``daemon.py`` calls these fifteen
     unconditionally (each provider self-gates by returning ``None`` when its
     instance hasn't opted in), so this is the production registry.
     """
     from alfred.daily_sync import (
         assembler,
         attribution_section,
+        calibration_section,
         canonical_proposals_section,
         capture_close_section,
         contracts_awaiting_section,
@@ -217,7 +218,7 @@ def _register_every_section() -> list[str]:
         demotion_section, capture_close_section, contracts_awaiting_section,
         pending_items_section, radar_section, friction_section, triage_section,
         routine_match_section, stt_vocab_section, recurrence_section,
-        ticket_notify_section,
+        ticket_notify_section, calibration_section,
     ):
         mod.register()
     return assembler.registered_providers()
@@ -240,7 +241,7 @@ def test_provider_family_map_covers_every_family() -> None:
     assert set(PROVIDER_FOR_FAMILY) == set(_FAMILIES)
     # Positive control: the sets are non-empty, so the equality above is a real
     # correspondence and not two empties agreeing about nothing.
-    assert len(_FAMILIES) == 7
+    assert len(_FAMILIES) == 8
 
 
 def test_every_mapped_provider_is_actually_registered() -> None:
@@ -268,8 +269,8 @@ def test_every_mapped_provider_is_actually_registered() -> None:
         # vacuously if the left side is empty AND says nothing about whether
         # ``registered`` was really populated. Both are pinned here, so the
         # subset is load-bearing.
-        assert len(PROVIDER_FOR_FAMILY) == 7
-        assert len(registered) == 14
+        assert len(PROVIDER_FOR_FAMILY) == 8
+        assert len(registered) == 15
     finally:
         # The registry is module-global; leaving it populated would leak into
         # every later test in the session.
@@ -290,6 +291,11 @@ def test_seven_registered_providers_deliberately_feed_no_family() -> None:
 
     try:
         unmapped = set(_register_every_section()) - set(PROVIDER_FOR_FAMILY.values())
+        # ``calibration_review`` is NOT in this set (R4, 2026-08-21). It briefly
+        # was, while its feed card was blocked; the card now exists, so the
+        # provider MAPS and the set is back to its original seven. Recorded here
+        # because the intermediate state is what a reader of the history will
+        # find, and it should read as resolved rather than as a regression.
         assert unmapped == {
             "capture_close", "contracts_awaiting", "demotion_proposals",
             "tier_recurrence", "stt_vocab", "ticket_notify", "triage_queue",

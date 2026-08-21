@@ -443,6 +443,42 @@
         "label": "7 days",
         "weight": "light"
       }
+    ],
+    "calibration": [
+      {
+        "verb": "calibration_apply",
+        "label": "Confirm",
+        "weight": "heavy",
+        "gesture": "affirm",
+        "note": "Adds this line to the calibration block on your person record and stamps an attribution-audit entry."
+      },
+      {
+        "verb": "calibration_discard",
+        "label": "Reject",
+        "weight": "light",
+        "gesture": "reject"
+      },
+      {
+        "verb": "defer",
+        "label": "Later",
+        "weight": "light",
+        "gesture": "defer"
+      },
+      {
+        "verb": "defer_1d",
+        "label": "1 day",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_3d",
+        "label": "3 days",
+        "weight": "light"
+      },
+      {
+        "verb": "defer_7d",
+        "label": "7 days",
+        "weight": "light"
+      }
     ]
   }
 }

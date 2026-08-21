@@ -54,6 +54,8 @@ from alfred.routine.match_calibration import (
     DEFAULT_PENDING_PATH as _ROUTINE_MATCH_PENDING_DEFAULT,
 )
 from alfred.telegram.config import (
+    DEFAULT_CALIBRATION_DECIDED_PATH as _CALIBRATION_DECIDED_DEFAULT,
+    DEFAULT_CALIBRATION_PENDING_PATH as _CALIBRATION_PENDING_DEFAULT,
     DEFAULT_STT_VOCAB_CORPUS_PATH as _STT_VOCAB_CORPUS_DEFAULT,
     DEFAULT_STT_VOCAB_DECIDED_PATH as _STT_VOCAB_DECIDED_DEFAULT,
     DEFAULT_STT_VOCAB_TERMS as _STT_VOCAB_TERMS_DEFAULT,
@@ -429,6 +431,37 @@ class TierRecurrenceConfig:
 
 
 @dataclass
+class CalibrationReviewConfig:
+    """R4 — voice-calibration proposal review surface (Daily Sync).
+
+    ``enabled`` defaults OFF like every other judgment surface, and it is a
+    SEPARATE switch from ``telegram.calibration.capture_enabled``: that one gates
+    CAPTURE (drafting proposals at session close), this one gates the morning
+    REVIEW section. An instance that captures but has not turned this on simply
+    accumulates pending proposals until it does — nothing is lost, and the CLI
+    (``alfred voice-calibration list``) reads the same queue meanwhile.
+
+    READ-ONLY, and that is structural rather than a promise: this section renders
+    the pending queue and directs to the CLI. The apply path is
+    ``calibration_store.approve_proposal``, which this module never imports. In
+    particular the section does NOT route through ``handle_daily_sync_reply`` —
+    that dispatcher has had zero production callers since ``bot.py`` was deleted,
+    which is why four existing sections render text nobody can reply to. The CLI
+    verb is the mutation path, exactly as ``recurrence_section`` does it.
+
+    SINGLE-SOURCED FROM THE TALKER CONFIG, the same contract ``SttVocabConfig``
+    holds: the web session-close WRITES ``pending`` and the CLI WRITES
+    ``decided``; this section READS both, so they MUST be the same files.
+    :func:`load_from_unified` derives both from ``telegram.calibration`` at load
+    time. An explicit ``daily_sync.calibration_review.<field>`` still wins.
+    """
+
+    enabled: bool = False
+    pending_path: str = _CALIBRATION_PENDING_DEFAULT
+    decided_path: str = _CALIBRATION_DECIDED_DEFAULT
+
+
+@dataclass
 class TicketNotifyConfig:
     """#22b — KAL-LE ticket → PWA-notify observability surface (Daily Sync).
 
@@ -503,6 +536,12 @@ class DailySyncConfig:
     tier_recurrence: TierRecurrenceConfig = field(
         default_factory=TierRecurrenceConfig,
     )
+    # R4 — voice-calibration proposal review. Defaulted-OFF; an instance opts in
+    # via ``daily_sync.calibration_review.enabled: true``. Store paths are
+    # derived from ``telegram.calibration`` at load time (see the class).
+    calibration_review: CalibrationReviewConfig = field(
+        default_factory=CalibrationReviewConfig,
+    )
     # #22b — KAL-LE ticket → PWA-notify observability surface. Defaulted-OFF;
     # Salem opts in via ``daily_sync.ticket_notify.enabled: true`` (it hosts
     # the web notify store the pipeline fans into). Read-only fail-loud.
@@ -542,6 +581,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "thresholds": FrictionThresholdsConfig,
     "routine_match": RoutineMatchConfig,
     "stt_vocab": SttVocabConfig,
+    "calibration_review": CalibrationReviewConfig,
     "tier_recurrence": TierRecurrenceConfig,
     "ticket_notify": TicketNotifyConfig,
     "capture_close": CaptureCloseConfig,
@@ -686,6 +726,30 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
         if _sv_explicit(_field):
             continue  # an explicit daily_sync override wins
         setattr(cfg.stt_vocab, _field, _talker_stt.get(_field, _default))
+
+    # R4 — the SAME single-source contract, one block over. The web session-close
+    # WRITES ``pending`` and the CLI WRITES ``decided``, both off
+    # ``telegram.calibration``; this section READS both, so a drift here would
+    # show the operator an empty review list while capture filled a different
+    # file. Read the BLOCK directly for the reason spelled out above (building a
+    # TalkerConfig raises without ``instance.name``, and the except-fallback
+    # would be exactly the silent divergence this prevents). An explicit
+    # ``daily_sync.calibration_review.<field>`` still wins.
+    cr_section = section.get("calibration_review") if isinstance(section, dict) else None
+
+    def _cr_explicit(field_name: str) -> bool:
+        return isinstance(cr_section, dict) and field_name in cr_section
+
+    _talker_cal = (_telegram.get("calibration") if isinstance(_telegram, dict) else None) or {}
+    if not isinstance(_talker_cal, dict):
+        _talker_cal = {}
+    for _field, _default in (
+        ("pending_path", _CALIBRATION_PENDING_DEFAULT),
+        ("decided_path", _CALIBRATION_DECIDED_DEFAULT),
+    ):
+        if _cr_explicit(_field):
+            continue
+        setattr(cfg.calibration_review, _field, _talker_cal.get(_field, _default))
     # Synthetic ``_config_path`` key — set by the CLI in
     # ``_load_unified_config`` before handing ``raw`` to the
     # orchestrator, carried through ``multiprocessing`` pickling to

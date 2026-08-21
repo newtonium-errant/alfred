@@ -720,6 +720,41 @@ export function contestableItem(item: FeedItem): boolean {
   return !(item.attention === 'needs_you' || item.mode === 'decide');
 }
 
+// --- voice calibration (R4) ---------------------------------------------------
+// The operator's ruling was "a feed-family card with plain confirm/reject". This
+// is that card's affordance, and it is PER-KIND for the same reason the contest
+// door above is: the backend's capability ceiling admits these two verbs for
+// `calibration` alone, so drawing them anywhere else would be a button that 400s
+// in the operator's hand.
+//
+// WHY A DEDICATED PAIR RATHER THAN REUSING THE CONTEST DOOR. A contest is shaped
+// like a reject and means something else — it carries `contested_section` bound
+// to CONTEST_SECTIONS and says "this inference is wrong, and THIS capture
+// section produced it". A wording proposal has no capture section, so reusing it
+// would drag a meaningless picker onto the card. Shape is not meaning.
+//
+// AND WHY NOT THE DECK. This card is deliberately fyi/fyi and deliberately
+// carries NO suggested-choice group, so `isDeckCandidate` is false and
+// `isNeedsYouItem` is false — it never deals and never rings. The feed board's
+// FYI column is its only home, which is exactly why it needs an affordance here:
+// without one it would be served, verb-carrying, and rendered nowhere.
+export const CALIBRATION_KIND = 'calibration';
+export const CALIBRATION_APPLY_ACTION = 'calibration_apply';
+export const CALIBRATION_DISCARD_ACTION = 'calibration_discard';
+
+/**
+ * Whether this row should offer the calibration confirm/reject pair.
+ *
+ * Kind-gated only. Unlike `contestableItem` there is no tier clause: a
+ * calibration card has no needs-you form to fall back to — the pair IS how it is
+ * answered, on the one surface it renders on. Gating on tier would produce a
+ * card that can be seen and not answered, which is the failure this affordance
+ * exists to prevent.
+ */
+export function calibrationActionable(item: FeedItem): boolean {
+  return item.kind === CALIBRATION_KIND;
+}
+
 // --- which section was wrong (#72 item 4) ------------------------------------
 // A contest says "this inference is wrong". This says WHICH PART of the capture
 // summary produced it, so the per-section statistic can answer "which section
