@@ -147,7 +147,11 @@ BLOCK-LEVEL claims — the ones no per-row drive can see:
     (``SlotGroup.rows``), NOT tier order and not authoring order. That is why
     the carried ``[T2]`` prints ABOVE the ``[T1]`` candidate: the thing that
     already cost a day leads, and the yes/no offers come last. Rounds 1 and 2
-    both printed these same three rows in tier order.
+    BOTH printed the ``[T1]`` candidate above the ``[T2]`` carryover — round 1
+    with two rows in this slot, round 2 with three — so the order defect
+    survived the round that ADDED a row to the slot without being noticed. An
+    ordering bug is invisible to a per-row check by construction, at any
+    length.
   * THE GOAL LINE is :func:`render_daily_goal_line` over
     ``TodayView.daily_goal``; see that function's own docstring for the full
     shape enumeration. Its counts here are consistent with the rows shown BY
