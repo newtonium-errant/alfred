@@ -32,74 +32,170 @@ See :mod:`alfred.tier.day_plan`: no copy anywhere may claim a slot-based goal
 while the metric is tier-based.
 
 Render shape (the section body — the brief renderer wraps it under
-``## Today's Plan``):
+``## Today's Plan``: :mod:`alfred.brief.renderer` emits ``f"## {section_name}"``
+over this module's :data:`SECTION_HEADER`):
 
-THIS SAMPLE IS AUTHORITY FOR RENDER SHAPE, NOT FOR RING ASSIGNMENT. Which
-slot a row belongs to is decided by :func:`alfred.tier.slots.classify_slot`
-and by nothing else — read the rule ladder there. Two prompt lanes have lifted
-rows out of this block as if the headers were the rule; they are not, they are
-just where these particular example rows happen to land. Every row below was
-DRIVEN through the real ``classify_slot`` and the real row renderers (see the
-note after the block), so it is verified output rather than plausible prose.
-Blank lines between a slot header and its rows are elided here for compactness;
-``_render_slot_group`` emits them.
+WHAT THIS BLOCK IS AUTHORITY FOR — RENDER SHAPE, AND NOTHING ELSE. It is NOT
+authority for RING ASSIGNMENT: which slot a row belongs to is decided by
+:func:`alfred.tier.slots.classify_slot` and by nothing else, so these headers
+are only where these particular example rows happen to land. Read the rule
+ladder in ``slots.py`` before concluding anything about WHY a row sits under a
+heading. TWO prompt lanes have lifted rows out of this block as if the headers
+were the rule, and this is the THIRD round of defects found in it — two counts,
+deliberately kept apart, because collapsing them is the same overstatement this
+block keeps being fixed for. If you are reaching for a row, this is for you.
 
-    **Today's goal:** T1 0/2 · T2 1/1 ✓ · T3 0/1 — one to go for a balanced day
+BYTE-VERIFIED OUTPUT, not a transcription. The block was produced by projecting
+a :class:`~alfred.tier.compute.TodayView` (built over the four inputs named in
+the enumeration) through :func:`alfred.tier.day_plan.build_day_plan`, rendering
+it through :func:`render_daily_goal_line`, :func:`_render_day_plan` and
+:func:`_render_t2_selection_pool`, joining those exactly as
+:func:`render_tier_section` does (``parts = [goal_line, "", day_plan_md, "---",
+"", pool]``), and byte-comparing the result against these lines. Every blank
+line below is REAL: an earlier revision elided them "for compactness", which is
+indistinguishable from never having verified them. If any formatter changes,
+RE-DERIVE from the emitters — do not copy this block, and do not copy it INTO
+another surface. Two mechanisms have produced defects here, and they are
+different: READING a sample instead of driving it, and COPY-PROPAGATION between
+this docstring and the vault-talker SKILL (the SKILL's own derivation note
+records the second, having found a near-copy of this block carrying two of its
+render-shape defects).
+
+    **Daily goal — balanced day:** not yet · T1 0/1 · T2 0/2 · T3 0/0
 
     ### Duty
-    - [T1] [[task/Steph Yang ROE]] — due Wed Aug 12 (due today)  *(confirm? reply "T1 confirm")*
+
     - [T2] [[task/Connect QBO API — RRTS]] — due Tue Aug 11  *(carried from yesterday)*
     - [T2] Water the plants (from [[routine/Weekly Chores]]) — due Fri Aug 14
+    - [T1] [[task/Steph Yang ROE]] — due Wed Aug 12 (due today)  *(confirm? reply "T1 confirm")*
 
     ### Rhythm
+
     *Today's rhythm items:*
 
     - Morning pages *(3d since last; target every 5d)*
 
     ### Fuel
+
     *(nothing in Fuel today)*
 
     ### Rollover from yesterday (incomplete)
+
     *(everything carried over is on today's plan above, marked where it sits)*
+
+    *(empty — pick from Aspirational routines below or add new — reply "T3 add walk Fergus")*
 
     ---
 
     ### T2 selection pool
-    (open ``todo``/``active`` tasks, NOT auto-T1, NOT alfred_triage)
+    (open `todo`/`active` tasks, NOT auto-T1, NOT alfred_triage)
+
     - [[task/RRTS Bug List — Burn Through]]
 
-Per-row enumeration for the block above — how each row's shape was DETERMINED,
-because the rows do not state their own shapes and an earlier version of this
-sample got half of them wrong. Every row was reconstructed from what its
-rendered text necessarily implies, then run through the real ``classify_slot``:
+Enumeration — EVERY claim the block makes, and how each was determined. The
+rows do not state their own shapes, which is why READING them has failed three
+times; each claim below was DRIVEN instead. Note the shape of the failure: a
+per-row enumeration that truthfully covered every ROW is still blind to a
+property of the BLOCK, so the row drives come first and the block-level claims
+that no row drive can see come after them.
 
-  * ``[T1] [[task/Steph Yang ROE]]`` — wikilink into ``task/`` so
-    ``origin='task'``; a deadline-bearing entry carries BOTH ``due_iso`` and
-    ``surface_reason`` (``compute.AutoT1Candidate``), which is why the
-    annotation is the reason-and-due branch of :func:`_row_annotation` and not
-    a bare "— due today". Classifies **duty/dated_task** (rule 6).
-  * ``[T2] [[task/Connect QBO API — RRTS]]`` — ``origin='task'``, carried.
+INPUTS, and the ring each DERIVES (run through the real ``classify_slot`` with
+the real ``NoOverrides``; verdicts quoted as ``slot/slot_rule``):
+
+  * ``[T1] [[task/Steph Yang ROE]]`` — ``origin='task'`` (the ``task/``
+    wikilink), ``due_iso='2026-08-12'``, ``surface_reason='due today'``,
+    ``source='auto-due'``, unconfirmed. A deadline-bearing entry carries BOTH
+    ``due_iso`` and ``surface_reason``, which is why the annotation takes the
+    reason-and-due branch of :func:`_row_annotation` — ``— due Wed Aug 12 (due
+    today)`` — and not a bare ``— due today``, which no formatter can emit.
+    Unconfirmed + an ``auto-*`` source makes it a CANDIDATE, which is what
+    earns it the :data:`T1_CONFIRM_PROMPT`. → **duty/dated_task** (rule 6).
+  * ``[T2] [[task/Connect QBO API — RRTS]]`` — ``origin='task'``,
+    ``due_iso='2026-08-11'``, ``source='operator'``, and present in the
+    rollover by record name, so ``build_day_plan`` marks it ``carryover``.
     :func:`_row_annotation` ALWAYS emits an annotation when ``due_iso`` is set,
-    so a row printed without one is a row with no due date — and an undated
-    task classifies **unslotted/no_signal**, not Duty. It carries a due date
-    here for exactly that reason. Classifies **duty/dated_task** (rule 6).
+    so a row printed without one is a row with NO due date — and an undated
+    task classifies **unslotted/no_signal** (rule 7), not Duty. It carries a
+    due date for exactly that reason. → **duty/dated_task** (rule 6).
   * ``[T2] Water the plants (from [[routine/Weekly Chores]])`` — the
-    ``(from [[routine/...]])`` head means ``origin='routine_item'``, and a
-    routine carrying a HARD due date is a ``due_pattern`` firing. That is
-    **duty/due_pattern** (rule 4) — a recurring hard deadline is a scheduled
-    obligation. This row sits under Duty, NOT under Rhythm, and it is the
-    surprising one worth keeping in the sample.
-  * ``Morning pages`` — a habit anchor under ``ROUTINES_SUBHEADER``, rendered
-    by :func:`_render_routine_line` off the routine aggregator's soft-cadence
-    annotation (``*(Nd since last; target every Nd)*`` — note the aggregator's
-    ``Nd`` form differs from the plan-row ``T3_AUTO_ANNOTATION_TEMPLATE``'s
-    ``N days`` form). Cadence target, no due pattern → rule 5, which emits
+    ``(from [[routine/...]])`` head means ``origin='routine_item'`` with
+    ``routine_record='Weekly Chores'``; ``has_due_pattern=True``, and
+    ``source='operator'`` makes it COMMITTED rather than offered, which is why
+    it carries no affordance. A routine with a hard recurring deadline is a
+    scheduled obligation, so it sits under Duty, NOT under Rhythm. →
+    **duty/due_pattern** (rule 4). The surprising one, and the reason it stays.
+  * ``Morning pages`` — not a tier row at all but a
+    :class:`~alfred.tier.compute.RoutineLine` habit anchor, rendered under
+    :data:`ROUTINES_SUBHEADER` by :func:`_render_routine_line` off the routine
+    aggregator's soft-cadence annotation. The aggregator's ``*(Nd since last;
+    target every Nd)*`` SHORT form differs from the plan-row
+    :data:`T3_AUTO_ANNOTATION_TEMPLATE`'s ``N days`` LONG form; they are not
+    interchangeable. Cadence target, no due pattern → rule 5, emitting
     **rhythm/target_cadence_days** (the rule string is ``RULE_CADENCE``'s
-    VALUE, ``"target_cadence_days"`` — not the constant's name).
+    VALUE, not the constant's name).
 
-Note the Rhythm slot here has habit anchors but no tier rows. That is a real
-render: ``SlotGroup.is_empty`` is ``not rows and not routines``, so a slot with
-only anchors renders them rather than the empty sentinel.
+  CONTROLS on those four verdicts, so "every row lands where it is printed" is
+  distinguishable from a classifier that answers Duty to everything: strip the
+  QBO row's ``due_iso`` and it returns **unslotted/no_signal**; strip the
+  plants row's ``has_due_pattern`` and it returns **unslotted/no_signal** too
+  (rule 6 cannot rescue it — a routine item is not a ``task``). Both controls
+  move, and the four verdicts span two different slots.
+
+BLOCK-LEVEL claims — the ones no per-row drive can see:
+
+  * ROW ORDER inside a slot is **carryover → committed → suggestions**
+    (``SlotGroup.rows``), NOT tier order and not authoring order. That is why
+    the carried ``[T2]`` prints ABOVE the ``[T1]`` candidate: the thing that
+    already cost a day leads, and the yes/no offers come last.
+
+    The history here is stated in SHAs rather than in "rounds", because TWO
+    successive corrections to this very bullet were each wrong about which
+    round was which — the labels are the part that kept being false, so they
+    are gone. Measured: at ``50f05b73^`` this slot held 2 rows (the plants row
+    sat under Rhythm); ``50f05b73`` moved plants in, making it 3 in tier
+    order; and ``c01d119d`` is byte-identical to ``50f05b73`` on this file
+    (``git log 50f05b73..c01d119d -- src/alfred/brief/tier_section.py`` is
+    empty). The ``[T1]`` candidate printed above the ``[T2]`` carryover at ALL
+    THREE trees. So the order defect survived the very commit that ADDED a row
+    to this slot — which is the strongest available evidence for the point:
+    an ordering bug is invisible to a per-row check by construction, at any
+    length.
+  * THE GOAL LINE is :func:`render_daily_goal_line` over
+    ``TodayView.daily_goal``; see that function's own docstring for the full
+    shape enumeration. Its counts here are consistent with the rows shown BY
+    CONSTRUCTION — one T1 row, two T2 rows, no T3 row, nothing done ⇒
+    ``T1 0/1 · T2 0/2 · T3 0/0``. Earlier revisions printed a
+    ``**Today's goal:** … ✓ … — one to go for a balanced day`` line, which is
+    producible by NO emitter in this repo. The vault-talker SKILL had this
+    right while this docstring was stale — the SECOND claim in this one block
+    where the prompt layer held the correct copy, so do not assume this file
+    wins a disagreement with it.
+  * WHICH LINES EXIST AT ALL. The :data:`T3_EMPTY_PROMPT` line near the bottom
+    is not decoration: :func:`_render_day_plan` appends it whenever the plan
+    holds no T3 row, AFTER the rollover block, at the BOTTOM of the plan body
+    — tiers no longer have headings to be empty under.
+    :data:`T2_EMPTY_PROMPT` is absent because T2 has two rows.
+  * HEADERS AND BLANK LINES. :func:`_render_slot_group` emits
+    ``["### {label}", ""]`` unconditionally — hence a blank line after EVERY
+    slot header, including the empty one — plus a trailing ``""`` closing each
+    group. Fuel renders its :data:`SLOT_EMPTY_TEMPLATE` line because it is
+    empty; Rhythm renders anchors with no tier rows because
+    ``SlotGroup.is_empty`` is ``not rows and not routines``, so a slot holding
+    only anchors is not empty. The ``unslotted`` residue group is absent
+    because nothing landed in it.
+  * THE ROLLOVER BLOCK sits ABOVE the ``---`` separator, between the last slot
+    and the pool. It renders the "everything carried over is on today's plan
+    above" sentinel rather than a list because the one rollover ref MATCHED a
+    row on today's board, leaving ``plan.unplaced_carryover`` empty. Its three
+    states are distinct — see :func:`_render_unplaced_carryover`.
+  * THE POOL prints its parenthetical with SINGLE backticks and a blank line
+    after it: ``_render_t2_selection_pool``'s ``out`` literal opens
+    ``[T2_POOL_HEADER, "(open `todo`/`active` …)", ""]``. Those backticks are
+    emitted bytes — do not "fix" them into RST double backticks, which an
+    earlier revision did. This block is a verbatim sample, not prose.
+  * TWO SPACES precede both the affordance and the carryover marker:
+    :func:`_render_plan_row` joins its parts on ``" "`` while the affordance
+    and marker parts are THEMSELVES ``f" {…}"``.
 
 Read path (Step 2c, 2026-06-26 — the SINGLE computed view + materials):
 
@@ -938,11 +1034,32 @@ def render_daily_goal_line(goal: DailyGoalState) -> str:
     ALWAYS emits a line, even on an empty day ("no tier items yet
     today"), so the goal signal is never a silent absence.
 
-    Shape (per-lane ``done/available`` ticks + a balanced-day marker):
+    Shape — the COMPLETE producible set. Every line below was emitted by
+    this function and byte-compared against it, not written out:
 
-        **Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 0/1
+        **Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 1/1
         **Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1
+        **Daily goal — balanced day:** ✓ achieved · T1 2/2 · T2 1/1 · T3 1/1 · all T1 done
+        **Daily goal — balanced day:** not yet · T1 2/2 · T2 0/1 · T3 0/1 · all T1 done
         **Daily goal:** no tier items yet today.
+
+    That is the whole space: the empty-day sentinel, then the cross-product
+    of two INDEPENDENT branches — ``status`` (off ``balanced_day``) and
+    ``ideal`` (off ``t1_available > 0 and all_t1_done``). Five shapes, five
+    lines, no sixth.
+
+    ``✓ achieved`` IS NOT FREE-STANDING COPY, and this is the trap that has
+    already been sprung here. ``balanced_day`` is produced as ``t1_done >= 1
+    and t2_done >= 1 and t3_done >= 1`` (in
+    :func:`alfred.tier.compute.compute_today_view`, alongside the
+    ``all_t1_done`` it ships with), so ``✓ achieved`` printed beside ANY
+    ``0/n`` lane is a line this function CANNOT emit. An earlier revision of
+    this very block printed ``✓ achieved · T1 1/2 · T2 1/1 · T3 0/1`` — a
+    non-producible line sitting in the docstring that other surfaces read as
+    the authority on this line's shapes. Pinned in
+    ``tests/test_brief_tier_section.py`` (the shape-set pin drives all five
+    states through this function and asserts the impossible pairing never
+    appears).
     """
     total = (
         goal.t1_available + goal.t2_available + goal.t3_available
