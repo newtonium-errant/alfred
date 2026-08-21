@@ -192,8 +192,17 @@ def test_no_line_number_citations_into_tier_section():
       * shorthand ``` `:592` ```                 (6, all on boarded-file lines)
 
     A pin bound to the full form alone passes while the bare form — the one
-    this SKILL actually preferred — walks straight through. Bound to the
-    STRUCTURE meant (a coordinate, however spelled), not to one spelling.
+    this SKILL actually preferred — walks straight through.
+
+    KNOWN LIMIT, stated rather than papered over. Markdown has no AST, so a
+    coordinate here IS a textual form and this pin can only enumerate the forms
+    that exist. It binds to three. A FOURTH spelling — ``line 774``,
+    ``#L774``, ``at 774`` — would evade it exactly as the bare form evaded the
+    previous version. That is the same failure one level up, and naming it is
+    the only honest guard available: if you add a citation style to this SKILL,
+    add it here in the same commit. The referent is "a coordinate into
+    tier_section.py, however written"; the three regexes below are an
+    enumeration of that referent, not a definition of it.
     """
     text = _skill_text()
 
