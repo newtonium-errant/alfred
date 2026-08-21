@@ -2416,3 +2416,315 @@ def test_curated_for_today_done_filter_not_applied_without_today() -> None:
     assert len(matches) == 1
     assert matches[0]["t3_done_filter_applied"] is False
     assert matches[0]["t3_done_filtered"] == 0
+
+
+# ---------------------------------------------------------------------------
+# XS-BATCH11 item 1 — the module docstring's render sample, pinned to the
+# EMITTERS rather than to a reader's eye.
+#
+# Three separate lanes have now shipped a wrong version of that sample. Rounds
+# 1 and 2 each fixed what they were handed and each missed more, because the
+# instrument was READING. These two pins make the sample a derived artifact:
+# it is the emitters' output or the suite is red.
+# ---------------------------------------------------------------------------
+
+
+def _docstring_render_sample() -> str:
+    """Extract the indented render sample from ``tier_section``'s module
+    docstring, dedented.
+
+    Bounded by the goal line at the top and the ``Enumeration —`` prose that
+    follows the block, so it moves with the docstring rather than with line
+    numbers (a coordinate in a test is a fact with an expiry date)."""
+    from alfred.brief import tier_section as ts
+
+    doc = (ts.__doc__ or "").split("\n")
+    starts = [
+        i for i, ln in enumerate(doc)
+        if ln.startswith("    **Daily goal — balanced day:**")
+    ]
+    ends = [i for i, ln in enumerate(doc) if ln.startswith("Enumeration —")]
+    assert len(starts) == 1, f"sample start markers found: {len(starts)}"
+    assert len(ends) == 1, f"sample end markers found: {len(ends)}"
+    block = doc[starts[0]:ends[0]]
+    return "\n".join(ln[4:] if ln.startswith("    ") else ln for ln in block).rstrip("\n")
+
+
+def _production_render_of_the_sample() -> str:
+    """Re-run the exact projection the module docstring documents, through
+    the real emitters, composed by ``render_tier_section``'s own literal."""
+    from dataclasses import replace
+
+    from alfred.brief import tier_section as ts
+    from alfred.tier import slots
+    from alfred.tier.compute import (
+        DailyGoalState as _G, RoutineLine, TierEntry, TodayView,
+    )
+    from alfred.tier.day_plan import RolloverRef, build_day_plan
+
+    steph = TierEntry(
+        tier=1, origin="task", name="Steph Yang ROE",
+        path="task/Steph Yang ROE.md", due_iso="2026-08-12",
+        surface_reason="due today", source="auto-due", confirmed=None,
+    )
+    qbo = TierEntry(
+        tier=2, origin="task", name="Connect QBO API — RRTS",
+        path="task/Connect QBO API — RRTS.md", due_iso="2026-08-11",
+        source="operator",
+    )
+    plants = TierEntry(
+        tier=2, origin="routine_item", name="Water the plants",
+        path="routine/Weekly Chores.md", due_iso="2026-08-14",
+        source="operator", routine_record="Weekly Chores",
+        item_text="Water the plants", has_due_pattern=True,
+    )
+    anchor = RoutineLine(
+        text="Morning pages", priority="normal",
+        annotation="*(3d since last; target every 5d)*",
+        target_cadence_days=5,
+    )
+
+    learned = slots.NoOverrides()
+    stamped = []
+    for e in (steph, qbo, plants):
+        v = slots.classify_slot(e, learned=learned)
+        stamped.append(replace(e, slot=v.slot, slot_rule=v.rule))
+    av = slots.classify_slot(anchor, learned=learned)
+    anchor = replace(anchor, slot=av.slot, slot_rule=av.rule)
+
+    view = TodayView(
+        t1=[stamped[0]], t2=[stamped[1], stamped[2]], t3=[],
+        routine_today=[anchor],
+        daily_goal=_G(
+            t1_available=1, t2_available=2, t3_available=0,
+            t1_done=0, t2_done=0, t3_done=0,
+            balanced_day=False, all_t1_done=False,
+        ),
+    )
+    rollover = [RolloverRef(
+        tier_label="T2", wikilink="[[task/Connect QBO API — RRTS]]",
+        record_name="Connect QBO API — RRTS",
+    )]
+    plan = build_day_plan(view, rollover=rollover, is_done=lambda _e: False)
+
+    goal_line = render_daily_goal_line(plan.daily_goal)
+    day_plan_md = ts._render_day_plan(plan, rollover)
+    pool = ts._render_t2_selection_pool(
+        [(Path("task/RRTS Bug List — Burn Through.md"),
+          {"status": "todo"}, "RRTS Bug List — Burn Through")],
+        set(), set(), set(),
+    )
+    # render_tier_section's own composition literal.
+    return "\n".join(
+        [goal_line, "", day_plan_md, "---", "", pool]
+    ).rstrip("\n")
+
+
+def test_module_docstring_sample_is_byte_identical_to_the_emitters() -> None:
+    """THE ROUND-4 STOP. The module docstring's render sample must BE the
+    emitters' output, byte for byte.
+
+    Normalisation is trailing newlines only: the render's terminator is the
+    pool's closing blank line, the docstring's is the prose after it. Nothing
+    inside the block is normalised — the two-space gaps before the affordance
+    and the carryover marker, the blank line after every ``###`` header, the
+    single-backtick pool parenthetical and the ``T3_EMPTY_PROMPT`` line all
+    have to match exactly.
+
+    If this goes red, a formatter moved: RE-DERIVE the docstring block from
+    the emitters. Do not hand-edit the sample toward green, and do not copy it
+    from the vault-talker SKILL — copy-propagation between those two surfaces
+    is what produced three rounds of defects.
+    """
+    # PREMISE PIN — this comparison reaches OUTSIDE brief/ and tier/.
+    # ``build_day_plan`` asks ``feed_producer._slot_is_candidate`` whether a
+    # row is an offer, and the answer decides BOTH the Steph row's confirm
+    # affordance and its position (suggestions sort last). So a change to the
+    # feed's candidate-source set silently rewrites this docstring's sample.
+    # Asserted here by name so that arrives as a diagnosis instead of an
+    # unexplained byte diff.
+    from alfred.brief.feed_producer import _AUTO_CANDIDATE_SOURCES
+    assert "auto-due" in _AUTO_CANDIDATE_SOURCES, (
+        "the feed's candidate-source set no longer contains 'auto-due' — the "
+        "sample's T1 row stops being an offer, loses its confirm affordance "
+        "and moves out of the suggestions bucket. RE-DERIVE the module "
+        "docstring's block; do not edit it toward green."
+    )
+
+    sample = _docstring_render_sample()
+    # CONTROL on the EXTRACTOR — a broken extractor returning "" would make
+    # any comparison below vacuous, and an empty string is exactly what a
+    # renamed marker yields.
+    assert sample, "extractor returned an empty sample"
+    assert "### Duty" in sample, "extractor did not capture the slot headers"
+    assert sample.count("\n") > 10, f"sample implausibly short: {sample!r}"
+
+    assert sample == _production_render_of_the_sample()
+
+
+def test_module_docstring_sample_rows_classify_where_they_are_printed() -> None:
+    """The sample is authority for RENDER SHAPE, not ring assignment — but a
+    sample whose rows do not classify under their own headers is misleading
+    anyway, which is the defect rounds 1 and 2 shipped.
+
+    Drives the printed ring against the real ``classify_slot`` and carries
+    its own control: a classifier that answered Duty to everything would pass
+    the first half, so the second half strips each row's ring signal and
+    requires the verdict to MOVE.
+    """
+    from dataclasses import replace
+
+    from alfred.tier import slots
+    from alfred.tier.compute import RoutineLine, TierEntry
+
+    qbo = TierEntry(
+        tier=2, origin="task", name="Connect QBO API — RRTS",
+        path="task/Connect QBO API — RRTS.md", due_iso="2026-08-11",
+    )
+    plants = TierEntry(
+        tier=2, origin="routine_item", name="Water the plants",
+        path="routine/Weekly Chores.md", due_iso="2026-08-14",
+        routine_record="Weekly Chores", item_text="Water the plants",
+        has_due_pattern=True,
+    )
+    anchor = RoutineLine(
+        text="Morning pages", priority="normal", target_cadence_days=5,
+    )
+    learned = slots.NoOverrides()
+
+    assert slots.classify_slot(qbo, learned=learned).rule == slots.RULE_DATED_TASK
+    assert slots.classify_slot(qbo, learned=learned).slot == slots.SLOT_DUTY
+    # The surprising row: a routine with a HARD due_pattern is Duty, not Rhythm.
+    assert slots.classify_slot(plants, learned=learned).slot == slots.SLOT_DUTY
+    assert slots.classify_slot(plants, learned=learned).rule == slots.RULE_DUE_PATTERN
+    assert slots.classify_slot(anchor, learned=learned).slot == slots.SLOT_RHYTHM
+
+    # CONTROLS — strip each ring signal; every verdict must move.
+    assert slots.classify_slot(
+        replace(qbo, due_iso=None), learned=learned,
+    ).slot == slots.SLOT_UNSLOTTED
+    assert slots.classify_slot(
+        replace(plants, has_due_pattern=False), learned=learned,
+    ).slot == slots.SLOT_UNSLOTTED
+    assert slots.classify_slot(
+        replace(anchor, target_cadence_days=None), learned=learned,
+    ).slot == slots.SLOT_UNSLOTTED
+
+
+def test_daily_goal_line_achieved_never_pairs_with_a_zero_lane() -> None:
+    """The ``:943`` defect, pinned. ``✓ achieved`` beside a ``0/n`` lane is
+    NOT a line this renderer can emit, because no PRODUCIBLE state pairs them.
+
+    The premise — ``balanced_day = t1_done >= 1 and t2_done >= 1 and t3_done
+    >= 1`` — is read out of ``tier/compute.py`` by AST rather than restated
+    here, so this pin takes its expectation from a source the docstring it
+    guards cannot touch. If that expression changes, the extraction below
+    changes with it and the shapes get re-derived rather than silently
+    inheriting a stale claim.
+
+    POSITIVE CONTROL, and it is the load-bearing half: the renderer itself
+    does NOT refuse the pairing — hand-forge the impossible state and it
+    prints happily. So the impossibility lives entirely in the PRODUCER, and
+    a docstring that prints the pairing is documenting a state the system
+    cannot reach.
+    """
+    import ast
+    import itertools
+
+    from alfred.tier.compute import DailyGoalState as _G
+
+    # --- premise, extracted from source -----------------------------------
+    compute_src = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "alfred" / "tier" / "compute.py"
+    ).read_text(encoding="utf-8")
+    exprs = [
+        ast.unparse(n.value)
+        for n in ast.walk(ast.parse(compute_src))
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "id", None) == "balanced_day" for t in n.targets)
+    ]
+    assert len(exprs) == 1, f"balanced_day assignments in compute.py: {exprs}"
+    balanced_expr = exprs[0]
+    assert "t3_done" in balanced_expr, (
+        f"balanced_day no longer reads t3_done: {balanced_expr!r} — "
+        "re-derive render_daily_goal_line's shape block."
+    )
+
+    # --- drive every producible state --------------------------------------
+    forbidden = 0
+    seen_achieved = 0
+    for a1, a2, a3 in itertools.product(range(3), repeat=3):
+        for d1, d2, d3 in itertools.product(
+            range(a1 + 1), range(a2 + 1), range(a3 + 1),
+        ):
+            balanced = eval(  # noqa: S307 — expression came from our own source
+                balanced_expr,
+                {"t1_done": d1, "t2_done": d2, "t3_done": d3},
+            )
+            line = render_daily_goal_line(_G(
+                t1_available=a1, t2_available=a2, t3_available=a3,
+                t1_done=d1, t2_done=d2, t3_done=d3,
+                balanced_day=balanced,
+                all_t1_done=(a1 == 0) or (d1 == a1),
+            ))
+            if "✓ achieved" not in line:
+                continue
+            seen_achieved += 1
+            if "0/" in line:
+                forbidden += 1
+    assert seen_achieved > 0, (
+        "CONTROL FAILED: no producible state rendered '✓ achieved' at all — "
+        "the sweep proves nothing about a pairing it never reached."
+    )
+    assert forbidden == 0, f"{forbidden} producible states paired ✓ with a 0/ lane"
+
+    # --- POSITIVE CONTROL: the renderer does not refuse the pairing ---------
+    forged = render_daily_goal_line(_G(
+        t1_available=2, t2_available=1, t3_available=1,
+        t1_done=1, t2_done=1, t3_done=0,
+        balanced_day=True, all_t1_done=False,
+    ))
+    assert "✓ achieved" in forged and "T3 0/1" in forged, (
+        "CONTROL FAILED: the renderer refuses the impossible pairing, so the "
+        "sweep above was not testing what it claims"
+    )
+
+
+def test_daily_goal_line_shape_set_is_complete_and_matches_the_docstring() -> None:
+    """The five lines in ``render_daily_goal_line``'s docstring ARE its
+    complete producible output set — five, not three, and each one emitted.
+
+    The branch space is the empty-day early return plus the cross-product of
+    two independent branches (``balanced_day`` × the ideal suffix), so a
+    docstring showing fewer than five is showing a sample, not a set.
+    """
+    from alfred.brief.tier_section import render_daily_goal_line as _R
+    from alfred.tier.compute import DailyGoalState as _G
+
+    states = [
+        _G(t1_available=2, t2_available=1, t3_available=1,
+           t1_done=1, t2_done=1, t3_done=1, balanced_day=True, all_t1_done=False),
+        _G(t1_available=2, t2_available=1, t3_available=1,
+           t1_done=0, t2_done=0, t3_done=0, balanced_day=False, all_t1_done=False),
+        _G(t1_available=2, t2_available=1, t3_available=1,
+           t1_done=2, t2_done=1, t3_done=1, balanced_day=True, all_t1_done=True),
+        _G(t1_available=2, t2_available=1, t3_available=1,
+           t1_done=2, t2_done=0, t3_done=0, balanced_day=False, all_t1_done=True),
+        _G(),
+    ]
+    produced = [_R(s) for s in states]
+    assert len(set(produced)) == 5, f"branch space collapsed: {produced}"
+
+    doc = (_R.__doc__ or "")
+    for line in produced:
+        assert line in doc, (
+            f"render_daily_goal_line's docstring is missing a producible "
+            f"shape: {line!r}"
+        )
+    # CONTROL — the detector can see an ABSENT line, so "all five present" is
+    # not a check that passes on any string.
+    assert "**Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 0/1" \
+        not in doc, (
+            "the non-producible ✓-with-a-0-lane line is back in the docstring"
+        )
