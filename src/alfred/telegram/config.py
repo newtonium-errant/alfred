@@ -644,7 +644,7 @@ class CalibrationConfig:
     """R4 — the voice-calibration learning loop (capture → propose → approve → inject).
 
     TWO SWITCHES, BOTH DEFAULT-OFF, and they are genuinely different decisions —
-    the same split ``SttConfig.vocab_learning_enabled`` / ``SttVocabConfig.enabled``
+    the same split ``STTConfig.vocab_learning_enabled`` / ``SttVocabConfig.enabled``
     already draws for the vocabulary loop:
 
       * ``capture_enabled`` gates the ANALYZER at web session close. It costs an
@@ -654,7 +654,7 @@ class CalibrationConfig:
         a default. (This bullet previously asserted "Hypatia's voice traffic is
         CLINICAL". It is not: STAY-C is the clinical instance, Hypatia is the
         scholar/scribe one. See the INSTANCE ATTRIBUTION note on
-        ``SttConfig.vocab_learning_enabled``, the split this one mirrors.)
+        ``STTConfig.vocab_learning_enabled``, the split this one mirrors.)
       * ``inject_enabled`` gates the READ side: whether the approved calibration
         block is injected into the model's system prompt
         (``run_turn(calibration_str=...)``). Separate because "may it learn about
