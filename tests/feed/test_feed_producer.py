@@ -189,13 +189,14 @@ def _register_every_section() -> list[str]:
 
     Drives the REAL ``register()`` of each module rather than a hand-kept list,
     which is the whole point: a hand-kept list would drift in exactly the way
-    this pin exists to catch. ``daemon.py`` calls these fourteen
+    this pin exists to catch. ``daemon.py`` calls these fifteen
     unconditionally (each provider self-gates by returning ``None`` when its
     instance hasn't opted in), so this is the production registry.
     """
     from alfred.daily_sync import (
         assembler,
         attribution_section,
+        calibration_section,
         canonical_proposals_section,
         capture_close_section,
         contracts_awaiting_section,
@@ -217,7 +218,7 @@ def _register_every_section() -> list[str]:
         demotion_section, capture_close_section, contracts_awaiting_section,
         pending_items_section, radar_section, friction_section, triage_section,
         routine_match_section, stt_vocab_section, recurrence_section,
-        ticket_notify_section,
+        ticket_notify_section, calibration_section,
     ):
         mod.register()
     return assembler.registered_providers()
@@ -269,14 +270,14 @@ def test_every_mapped_provider_is_actually_registered() -> None:
         # ``registered`` was really populated. Both are pinned here, so the
         # subset is load-bearing.
         assert len(PROVIDER_FOR_FAMILY) == 7
-        assert len(registered) == 14
+        assert len(registered) == 15
     finally:
         # The registry is module-global; leaving it populated would leak into
         # every later test in the session.
         assembler.clear_providers()
 
 
-def test_seven_registered_providers_deliberately_feed_no_family() -> None:
+def test_eight_registered_providers_deliberately_feed_no_family() -> None:
     """The NEGATIVE half, asserted rather than assumed — and the reason the
     map's original comment was wrong.
 
@@ -293,6 +294,28 @@ def test_seven_registered_providers_deliberately_feed_no_family() -> None:
         assert unmapped == {
             "capture_close", "contracts_awaiting", "demotion_proposals",
             "tier_recurrence", "stt_vocab", "ticket_notify", "triage_queue",
+            # R4 (2026-08-21) — DELIBERATELY UNMAPPED, AND UNLIKE ITS SEVEN
+            # NEIGHBOURS THIS ONE IS EXPECTED TO MOVE. The operator ruled the
+            # calibration loop should have BOTH a feed card and a CLI + Daily
+            # Sync surface. The CLI + section half shipped; the feed card is
+            # BLOCKED on an operator decision, not on effort:
+            #
+            #   A quiet (fyi/fyi) card carrying plain confirm/reject verbs is
+            #   produced, served and verb-carrying — and its verbs render
+            #   NOWHERE. ``FeedRow``'s FYI affordance is an Ack (plus the
+            #   attribution-only contest door); the board dispatches exactly two
+            #   verbs (``ack`` / ``contest``, see ``useFeedBoard``); and generic
+            #   verbs are dispatched only from the DECK, which admits an item
+            #   via ``isDeckCandidate = mode === 'decide' || hasSuggestedChoice``
+            #   — and ``hasSuggestedChoice`` needs a co-equal choice GROUP of
+            #   >= 2 members, which a yes/no confirm is not.
+            #
+            # So the three options are: ring the phone (MODE_DECIDE), invent a
+            # choice group the operator did not ask for, or widen the FYI row's
+            # contract for every kind. All three are his call, so the card is
+            # not built rather than built wrong — and this entry is the diff
+            # that will surface when it is.
+            "calibration_review",
         }
     finally:
         assembler.clear_providers()

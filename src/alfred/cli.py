@@ -5613,6 +5613,82 @@ def _cmd_tier_recurrence(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def _cmd_voice_calibration(args: argparse.Namespace) -> None:
+    """``alfred voice-calibration {list [--json] | approve <id> --operator <name>
+    | reject <id> --operator <name>}`` — the operator decision that closes the R4
+    voice-calibration loop.
+
+    THIS IS THE APPLY DOOR. ``approve`` is the only CLI path in the tree that
+    writes the calibration block on the person record; ``reject`` records the
+    verdict and touches no vault. Both refuse without ``--operator``, and the
+    refusal lives in :func:`calibration_store.approve_proposal` rather than here,
+    so a second door (a feed-card dispatcher) inherits it instead of restating it.
+
+    Nothing here is time-based: an unreviewed proposal stays pending forever.
+    """
+    from alfred.telegram.config import load_from_unified as load_talker_config
+    from alfred.telegram import calibration_store as store
+
+    raw = _load_unified_config(args.config)
+    talker = load_talker_config(raw)
+    cal = talker.calibration
+    vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+    primary = talker.primary_users or []
+    user_rel_path = primary[0] if primary else ""
+    cmd = getattr(args, "voice_calibration_cmd", None)
+
+    if cmd == "list":
+        pending = store.open_proposals(cal.pending_path, cal.decided_path)
+        if getattr(args, "json", False):
+            from dataclasses import asdict
+            print(json.dumps([asdict(p) for p in pending], indent=2))
+            return
+        if not pending:
+            # ILB — an empty review list is the steady state, and it must be
+            # distinguishable from a capture door that never ran. The capture
+            # switch is named so the reader can tell which of the two it is.
+            state = "on" if cal.capture_enabled else "OFF (nothing is being captured)"
+            print(f"No calibration proposals pending. Capture is {state}.")
+            return
+        print(f"{len(pending)} calibration proposal(s) pending review:\n")
+        for p in pending:
+            src = p.source_session_rel or "(unknown session)"
+            print(f"  {p.proposal_id}  [{p.subsection}] (confidence {p.confidence:.2f})")
+            print(f"      {p.bullet}")
+            print(f"      — from {src}")
+        target = user_rel_path or "(NO primary_users configured — approve will refuse)"
+        print(f"\nApproving writes to: {target}")
+        print("Approve: alfred voice-calibration approve <id> --operator <you>")
+        print("Reject:  alfred voice-calibration reject <id> --operator <you>")
+        return
+
+    operator = getattr(args, "operator", "") or ""
+    if not operator:
+        print(json.dumps({"error": "--operator <name> is required (the decider identity)"}))
+        sys.exit(1)
+    pid = getattr(args, "proposal_id", "")
+
+    if cmd == "reject":
+        res = store.reject_proposal(cal, pid, operator=operator)
+        print(json.dumps(res, indent=2))
+        sys.exit(1 if "error" in res else 0)
+
+    if cmd == "approve":
+        from alfred.audit import agent_slug_for
+        res = store.approve_proposal(
+            vault_path, cal, pid,
+            operator=operator,
+            user_rel_path=user_rel_path,
+            agent_slug=agent_slug_for(talker),
+        )
+        print(json.dumps(res, indent=2))
+        sys.exit(1 if "error" in res else 0)
+
+    print("Usage: alfred voice-calibration {list [--json] | approve <id> --operator <name> "
+          "| reject <id> --operator <name>}")
+    sys.exit(1)
+
+
 def cmd_reconcile(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred reconcile`` subcommands.
 
@@ -7613,6 +7689,29 @@ def build_parser() -> argparse.ArgumentParser:
     trec_reject.add_argument("proposal_id")
     trec_reject.add_argument("--operator", required=True, help="Rejecter identity (recorded)")
 
+    # R4 — the voice-calibration learning loop's approval door.
+    #
+    # NAMED ``voice-calibration``, NOT ``calibration``, and the disambiguation is
+    # deliberate rather than decorative: this repo already carries two unrelated
+    # "calibration" referents — the email-tier calibration corpus
+    # (``daily_sync.corpus`` / ``email_calibration``) and the STT telemetry's
+    # ``calibration_ok``. ``alfred calibration`` would read as either.
+    vcal_p = sub.add_parser(
+        "voice-calibration",
+        help="Review + approve/reject what Alfred has learned about your voice (R4)",
+    )
+    vcal_sub = vcal_p.add_subparsers(dest="voice_calibration_cmd")
+    vcal_list = vcal_sub.add_parser("list", help="List pending calibration proposals")
+    vcal_list.add_argument("--json", action="store_true", help="Machine-readable output")
+    vcal_approve = vcal_sub.add_parser(
+        "approve",
+        help="Apply a proposal to your person record's calibration block")
+    vcal_approve.add_argument("proposal_id")
+    vcal_approve.add_argument("--operator", required=True, help="Approver identity (recorded)")
+    vcal_reject = vcal_sub.add_parser("reject", help="Reject a proposal (never re-surfaces)")
+    vcal_reject.add_argument("proposal_id")
+    vcal_reject.add_argument("--operator", required=True, help="Rejecter identity (recorded)")
+
     return parser
 
 
@@ -7669,6 +7768,7 @@ def main() -> None:
         "tier-override": _cmd_tier_override,
         "push-trial": _cmd_push_trial,
         "tier-recurrence": _cmd_tier_recurrence,
+        "voice-calibration": _cmd_voice_calibration,
         "tier-sort-learning": _cmd_tier_sort_learning,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,

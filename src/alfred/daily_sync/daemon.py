@@ -43,6 +43,7 @@ from alfred.telegram.captured_tasks_view import (
 
 from . import (
     attribution_section,
+    calibration_section,
     canonical_proposals_section,
     capture_close_section,
     contracts_awaiting_section,
@@ -347,6 +348,15 @@ async def fire_once(
     # pending queue on render (idempotent); B2 wires the approve/reject reply routing.
     recurrence_section.set_vault_path(vault_path)
     recurrence_section.register()
+
+    # R4 — voice-calibration proposals (PROPOSE-ONLY, read-only). Registered
+    # unconditionally; the provider returns None when
+    # ``calibration_review.enabled`` is False. Needs no vault path and no raw
+    # config — both stores are plain JSONL paths derived from
+    # ``telegram.calibration`` at config load time. Mutation is the CLI's
+    # (``alfred voice-calibration approve|reject``), so rendering this card can
+    # never change what the talker is told about the operator.
+    calibration_section.register()
 
     # #22b — KAL-LE ticket → PWA-notify observability surface (READ-ONLY,
     # FAIL-LOUD). Registered unconditionally — the provider returns None

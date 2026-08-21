@@ -628,6 +628,43 @@ def _user_name_for(identity: Any, web_config: WebConfig) -> str | None:
     return identity.user if len(web_config.users) > 1 else None
 
 
+def _calibration_str_for(talker_config: Any) -> str | None:
+    """R4 READ DOOR — the approved calibration block, or ``None``.
+
+    This is the consumer half of the loop the module docstring above describes
+    as "still live and waiting": ``run_turn`` has always carried
+    ``calibration_str`` and every live caller has fed it ``None`` since the bot
+    died. Both web ``run_turn`` call sites now resolve it through THIS ONE
+    helper — lifted before the second consumer rather than after, so the two
+    turn paths cannot drift into injecting different things.
+
+    Returns ``None`` (byte-identical prompt to today) when:
+      * ``telegram.calibration.inject_enabled`` is off — the default;
+      * no ``primary_users`` record is configured to read from;
+      * the record has no calibration block, or an empty one.
+
+    What it reads is ONLY ever operator-approved text: the block is written
+    exclusively by ``calibration_store.approve_proposal``. Never raises —
+    ``read_calibration`` swallows a missing/malformed record by contract, and a
+    chat turn must not fail because a profile record moved.
+    """
+    cal_config = getattr(talker_config, "calibration", None)
+    if not getattr(cal_config, "inject_enabled", False):
+        return None
+    primary = getattr(talker_config, "primary_users", None) or []
+    if not primary:
+        log.info(
+            "web.chat.calibration_not_injected",
+            reason="inject_enabled but no telegram.primary_users configured",
+        )
+        return None
+    from pathlib import Path as _CalPath
+
+    from alfred.telegram.calibration import read_calibration
+
+    return read_calibration(_CalPath(talker_config.vault.path), primary[0])
+
+
 # ---------------------------------------------------------------------------
 # Turn idempotency (retry-safe dedup) + concurrent-turn guard
 # ---------------------------------------------------------------------------
@@ -880,6 +917,37 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
                 turns=prior_capture["turns"],
             )
 
+        # R4 CAPTURE DOOR — the calibration learning loop's first door, and the
+        # one that ends the module docstring's "what is missing is only the read
+        # call itself" state above.
+        #
+        # OUTSIDE the capture branches on purpose: this is about the operator's
+        # STYLE, which every closed conversation carries, whereas the branches
+        # above are about dictated capture MATERIAL, which most sessions have
+        # none of. Gating it on ``candidate`` would have meant the loop only ever
+        # learned from dictation sessions.
+        #
+        # Detached + swallowed like the span finalizer beside it: a calibration
+        # draft must never delay or wedge the reopen. It PROPOSES only — the
+        # write to the person record happens exclusively on
+        # ``calibration_store.approve_proposal``, behind a named operator.
+        if rel_path:
+            from pathlib import Path as _CalPath
+
+            from alfred.telegram.calibration_capture import (
+                schedule_calibration_capture,
+            )
+
+            cal_primary = getattr(talker_config, "primary_users", None) or []
+            schedule_calibration_capture(
+                client=request.app[KEY_WEB_ANTHROPIC],
+                vault_path=_CalPath(talker_config.vault.path),
+                session_rel_path=rel_path,
+                calibration_config=talker_config.calibration,
+                user_rel_path=cal_primary[0] if cal_primary else "",
+                session_type=prior_type,
+            )
+
     session_obj = open_session(
         state_mgr,
         identity.synthetic_chat_id,
@@ -1071,6 +1139,9 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 config=talker_config,
                 vault_context_str=vault_context_str,
                 system_prompt=system_prompt_provider(),
+                # R4 read door — operator-approved calibration only; ``None``
+                # unless the instance opted in (see ``_calibration_str_for``).
+                calibration_str=_calibration_str_for(talker_config),
                 user_kind=kind,
                 user_role=identity.role,
                 user_name=user_name,
@@ -1349,6 +1420,9 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
             config=talker_config,
             vault_context_str=vault_context_str,
             system_prompt=system_prompt_provider(),
+            # R4 read door — same helper as /chat/turn, so the streaming and
+            # non-streaming paths cannot inject different calibration.
+            calibration_str=_calibration_str_for(talker_config),
             user_kind=kind,
             user_role=identity.role,
             user_name=user_name,

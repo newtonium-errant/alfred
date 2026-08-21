@@ -155,6 +155,16 @@ DEFAULT_STT_VOCAB_CORPUS_PATH = "./data/stt_corrections.jsonl"
 DEFAULT_STT_VOCAB_DECIDED_PATH = "./data/stt_vocab_decided.jsonl"
 
 
+# R4 calibration-loop stores. Same single-source contract as the two above and
+# for the same reason: the web session-close CAPTURES into ``pending``, the CLI
+# approve/reject WRITES ``decided``, and the Daily Sync review section READS
+# both. ``daily_sync.config.CalibrationReviewConfig`` derives these rather than
+# holding independently-defaulted duplicates.
+# Instance-neutral literals (every instance has its own ``data/``).
+DEFAULT_CALIBRATION_PENDING_PATH = "./data/calibration_pending.jsonl"
+DEFAULT_CALIBRATION_DECIDED_PATH = "./data/calibration_decided.jsonl"
+
+
 #: Backward-compatible private alias. Existing tests import the underscored
 #: name; the public one exists because ``daily_sync.config`` now derives the
 #: review surface's term list from it (one source, two readers).
@@ -611,6 +621,54 @@ class BashExecConfig:
 
 
 @dataclass
+class CalibrationConfig:
+    """R4 — the voice-calibration learning loop (capture → propose → approve → inject).
+
+    TWO SWITCHES, BOTH DEFAULT-OFF, and they are genuinely different decisions —
+    the same split ``SttConfig.vocab_learning_enabled`` / ``SttVocabConfig.enabled``
+    already draws for the vocabulary loop:
+
+      * ``capture_enabled`` gates the ANALYZER at web session close. It costs an
+        LLM call per closed session and it reads the operator's transcript, so an
+        instance opts in deliberately. Hypatia's voice traffic is CLINICAL — this
+        is never decided for an instance by a default.
+      * ``inject_enabled`` gates the READ side: whether the approved calibration
+        block is injected into the model's system prompt
+        (``run_turn(calibration_str=...)``). Separate because "may it learn about
+        me" and "may it act on what it learned" are different permissions, and an
+        instance can legitimately accumulate approved calibration before turning
+        the behaviour change on.
+
+    Neither switch can apply anything on its own: the APPLY door is
+    ``calibration_store.approve_proposal`` and it requires a named operator. There
+    is deliberately no ``auto_confirm_hours`` field here — see that module's
+    docstring for why routing this through the attribution-audit timeout was
+    refused.
+
+    The two store paths are instance-neutral and single-sourced; the Daily Sync
+    review section derives them rather than re-defaulting them.
+    """
+
+    capture_enabled: bool = False
+    inject_enabled: bool = False
+    #: Analyzer drafts awaiting a thumb. Written by capture, read by review.
+    pending_path: str = DEFAULT_CALIBRATION_PENDING_PATH
+    #: Operator verdicts. Written by approve/reject, read by review + capture
+    #: (the re-proposal exclusion).
+    decided_path: str = DEFAULT_CALIBRATION_DECIDED_PATH
+    #: The model the analyzer runs on. Matches ``calibration.propose_updates``'
+    #: own default rather than restating a different one.
+    model: str = "claude-sonnet-4-6"
+    #: How much of the closed transcript the analyzer reads.
+    transcript_tail_turns: int = 20
+    #: Hard cap on drafts accepted from ONE session. A prompt-injected or
+    #: malfunctioning analyzer returning fifty proposals must not be able to
+    #: flood the operator's review queue; the cap bites in the log, never
+    #: silently.
+    max_proposals_per_session: int = 5
+
+
+@dataclass
 class TalkerConfig:
     bot_token: str = ""
     # VERA MVP (2026-06-09): role-bearing allowlist. Each entry is an
@@ -630,6 +688,10 @@ class TalkerConfig:
     precedence_label_style: str = "words"
     anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
     stt: STTConfig = field(default_factory=STTConfig)
+    # R4 calibration loop — see :class:`CalibrationConfig`. Both switches
+    # default OFF, so an absent block leaves the loop dormant exactly as it was
+    # before the doors were built.
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     vault: VaultConfig = field(default_factory=VaultConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -688,6 +750,10 @@ _DATACLASS_MAP: dict[str, type] = {
     "vault": VaultConfig,
     "anthropic": AnthropicConfig,
     "stt": STTConfig,
+    # R4. Unique within this map (no other block carries a ``calibration``
+    # sub-field), so ``_build`` recurses it without the collision footgun; every
+    # field defaults, so the empty-dict-into-required-field trap is moot.
+    "calibration": CalibrationConfig,
     # ``shadow_capture`` is a sub-block of ``stt`` — its name is unique
     # WITHIN THIS MAP (web's same-named block is hand-rolled by
     # ``web/config.py:_build_shadow_capture`` and never reaches here), so
@@ -788,6 +854,9 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
         ),
         "anthropic": tool.get("anthropic", {}) or {},
         "stt": tool.get("stt", {}) or {},
+        # R4 — an absent block builds the all-defaults dataclass (both switches
+        # off), so the loop stays dormant for every instance that hasn't opted in.
+        "calibration": tool.get("calibration", {}) or {},
         "session": tool.get("session", {}) or {},
         "vault": vault_raw,
         "logging": log_raw,
